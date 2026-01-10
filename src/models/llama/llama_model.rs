@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use serde::Deserialize;
 use std::fs::File;
 use std::path::Path;
@@ -14,6 +14,7 @@ use crate::core::memory::Memory;
 use crate::core::kv_cache::KVCache;
 use crate::layers::llama_layer::LlamaLayer;
 use crate::layers::workspace::LayerWorkspace;
+use crate::memory::galloc::Galloc;
 
 #[derive(Debug, Deserialize)]
 pub struct LlamaConfig {
@@ -53,6 +54,11 @@ impl LlamaModel {
         let mmap = unsafe { MmapOptions::new().map(&st_file)? };
         let tensors = SafeTensors::deserialize(&mmap)?;
 
+        // Use CPU memory for loading
+        let cpu_memory = Galloc::new();
+        let cpu_backend = Arc::new(crate::backend::cpu::CpuBackend::new()); 
+
+
         // Helper to load a specific tensor by name
         let load_tensor = |name: &str, quantize: bool| -> Result<Tensor> {
            let tensor_view = match tensors.tensor(name) {
@@ -64,6 +70,8 @@ impl LlamaModel {
            };
            let shape = Shape::new(tensor_view.shape().to_vec());
            let num_elements: usize = tensor_view.shape().iter().product();
+           
+           // Using captured cpu_memory and cpu_backend
            
            // Read F32 data first
            let mut f32_data = vec![0.0f32; num_elements];
@@ -101,25 +109,18 @@ impl LlamaModel {
 
            if quantize {
                // Quantize to Q4_0
-               // Assumption: shape is [Out, In] or [In, Out]?
-               // Llama linear weights are [Out, In].
-               // Row-wise quantization usually.
-               // K = In.
-               // We need N (rows) and K (cols).
-               // Shape is [N, K].
                let rows = shape.dims()[0];
                let cols = shape.dims()[1];
                
-               // Reuse the helper logic:
                let nb_k = cols / crate::core::quant::QK4_0;
-               // Ensure divisibility?
                if cols % crate::core::quant::QK4_0 != 0 {
-                    // Fallback to F32 if not compatible
-                    let buffer = memory.alloc(num_elements * 4, DType::F32)?;
+                    // Fallback to F32
+                    let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
                     unsafe {
                         std::ptr::copy_nonoverlapping(f32_data.as_ptr(), buffer.as_mut_ptr() as *mut f32, num_elements);
                     }
-                    return Ok(Tensor::new(shape, buffer, backend.clone()));
+                    let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
+                    return backend.copy_from(&cpu_tensor);
                }
 
                use crate::core::quant::{BlockQ4_0, QK4_0};
@@ -149,18 +150,20 @@ impl LlamaModel {
                }
                
                let size_bytes = blocks.len() * std::mem::size_of::<BlockQ4_0>();
-               let buffer = memory.alloc(size_bytes, DType::Q4_0)?;
+               let buffer = cpu_memory.alloc(size_bytes, DType::Q4_0)?;
                unsafe {
                     std::ptr::copy_nonoverlapping(blocks.as_ptr(), buffer.as_mut_ptr() as *mut BlockQ4_0, blocks.len());
                }
-               Ok(Tensor::new(shape, buffer, backend.clone()))
+               let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
+               backend.copy_from(&cpu_tensor)
 
            } else {
-               let buffer = memory.alloc(num_elements * 4, DType::F32)?;
+               let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
                unsafe {
                    std::ptr::copy_nonoverlapping(f32_data.as_ptr(), buffer.as_mut_ptr() as *mut f32, num_elements);
                }
-               Ok(Tensor::new(shape, buffer, backend.clone()))
+               let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
+               backend.copy_from(&cpu_tensor)
            }
         };
 
@@ -191,49 +194,7 @@ impl LlamaModel {
         } else {
              // Tied weights: embed_tokens is F32, quantize to Q4_0 for lm_head
              println!("lm_head not found, quantizing embed_tokens for lm_head...");
-             let f32_data = embed_tokens.as_slice::<f32>();
-             let shape = embed_tokens.shape().clone();
-             let rows = shape.dims()[0]; // vocab_size
-             let cols = shape.dims()[1]; // hidden_size
-             
-             use crate::core::quant::{BlockQ4_0, QK4_0};
-             use half::f16;
-             
-             let nb_k = cols / QK4_0;
-             if cols % QK4_0 != 0 {
-                 // Fallback to F32 if not compatible
-                 embed_tokens.clone()
-             } else {
-                 let mut blocks = Vec::with_capacity(rows * nb_k);
-                 for j in 0..rows {
-                     for bi in 0..nb_k {
-                         let offset = j * cols + bi * QK4_0;
-                         let src = &f32_data[offset..offset+QK4_0];
-                         let mut block = BlockQ4_0 { d: f16::from_f32(0.0), qs: [0; 16] };
-                         
-                         let max_val = src.iter().map(|v| v.abs()).fold(0.0f32, |x, y| x.max(y));
-                         let d = max_val / 7.0;
-                         let id = if d == 0.0 { 0.0 } else { 1.0 / d };
-                         
-                         block.d = f16::from_f32(d);
-                         for z in 0..16 {
-                             let v0 = (src[z] * id).round().clamp(-8.0, 7.0) as i8;
-                             let v1 = (src[z + 16] * id).round().clamp(-8.0, 7.0) as i8;
-                             let b0 = (v0 + 8) as u8;
-                             let b1 = (v1 + 8) as u8;
-                             block.qs[z] = b0 | (b1 << 4);
-                         }
-                         blocks.push(block);
-                     }
-                 }
-                 
-                 let size_bytes = blocks.len() * std::mem::size_of::<BlockQ4_0>();
-                 let buffer = memory.alloc(size_bytes, DType::Q4_0)?;
-                 unsafe {
-                     std::ptr::copy_nonoverlapping(blocks.as_ptr(), buffer.as_mut_ptr() as *mut BlockQ4_0, blocks.len());
-                 }
-                 Tensor::new(shape, buffer, backend.clone())
-             }
+             load_tensor("model.embed_tokens.weight", true)?
         };
 
         Ok(Self {
@@ -276,17 +237,9 @@ impl LlamaModel {
             backend.clone()
         );
         
-        let tokens = input_tokens.as_slice::<u32>(); // Assuming U32/I32 indices
-        let embed_data = self.embed_tokens.as_slice::<f32>();
-        let x_data = x.as_mut_slice::<f32>();
-        
-        // Parallel copy?
-        // For each token, copy hidden_size vector.
-        for (i, &token_id) in tokens.iter().enumerate() {
-            let offset = token_id as usize * hidden_size;
-            let target_offset = i * hidden_size;
-            x_data[target_offset..target_offset+hidden_size].copy_from_slice(&embed_data[offset..offset+hidden_size]);
-        }
+        // Use gather for embedding lookup
+        // input_tokens should be on the same backend as embed_tokens
+        backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
 
         // Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -332,6 +285,7 @@ impl LlamaModel {
         x_gen: Option<&mut Tensor>,
         mut workspace: Option<&mut LayerWorkspace>,
     ) -> Result<()> {
+
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
         let hidden_size = self.config.hidden_size;
@@ -350,15 +304,10 @@ impl LlamaModel {
             Tensor::new(Shape::new(vec![batch_size, seq_len, hidden_size]), x_buf, backend.clone())
         };
 
-        let tokens = input_tokens.as_slice::<u32>();
-        let embed_data = self.embed_tokens.as_slice::<f32>();
-        let x_data = x.as_mut_slice::<f32>();
-        
-        for (i, &token_id) in tokens.iter().enumerate() {
-            let offset = token_id as usize * hidden_size;
-            let target_offset = i * hidden_size;
-            x_data[target_offset..target_offset+hidden_size].copy_from_slice(&embed_data[offset..offset+hidden_size]);
-        }
+        // Use gather
+
+        backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
+
 
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -372,13 +321,17 @@ impl LlamaModel {
                 self.config.rope_theta as f32,
                 workspace.as_deref_mut() // Pass workspace if provided (only for seq_len=1)
             )?;
+
         }
         
         // 3. Final Norm
+
         backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
         
         // 4. Head
+
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+
         
         Ok(())
     }

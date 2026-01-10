@@ -1,6 +1,7 @@
 #[cfg(feature = "opencl")]
 use ocl::core::Mem;
 use crate::core::buffer::{Buffer, DType};
+use std::any::Any;
 use anyhow::Result;
 
 #[derive(Debug)]
@@ -20,6 +21,10 @@ impl SharedBuffer {
 }
 
 impl Buffer for SharedBuffer {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+    
     fn dtype(&self) -> DType {
         self.dtype
     }

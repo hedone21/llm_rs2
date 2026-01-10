@@ -24,8 +24,12 @@ impl DType {
     }
 }
 
+use std::any::Any;
+
 /// Buffer Trait: Physical Memory Layer
 pub trait Buffer: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     /// Returns the data type
     fn dtype(&self) -> DType;
 

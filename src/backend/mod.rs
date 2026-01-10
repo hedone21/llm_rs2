@@ -1,4 +1,4 @@
 pub mod cpu;
 
 // Optional OpenCL
-// pub mod opencl;
+pub mod opencl;
