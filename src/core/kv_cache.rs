@@ -51,13 +51,14 @@ impl KVCache {
         // k_buffer layout: [MaxSeq, Heads, Dim] (collapsed batch)
         // copy target offset = current_pos * Heads * Dim
         
-        let offset = self.current_pos * heads * dim;
-        let count = seq_len * heads * dim;
+        let height = heads * dim;
+        let offset = self.current_pos * height;
+        let count = seq_len * height;
         
-        unsafe {
-            std::ptr::copy_nonoverlapping(new_k_ptr, k_ptr.add(offset), count);
-            std::ptr::copy_nonoverlapping(new_v_ptr, v_ptr.add(offset), count);
-        }
+        // Use backend copy_slice for safe handling of both CPU and GPU buffers
+        let backend = self.k_buffer.backend().clone(); // Clone Arc to drop borrow of self
+        backend.copy_slice(new_k, &mut self.k_buffer, 0, offset, count)?;
+        backend.copy_slice(new_v, &mut self.v_buffer, 0, offset, count)?;
         
         self.current_pos += seq_len;
         

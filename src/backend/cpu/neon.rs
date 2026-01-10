@@ -18,6 +18,9 @@ impl CpuBackendNeon {
 }
 
 impl Backend for CpuBackendNeon {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &str {
         "CPU (NEON)"
     }

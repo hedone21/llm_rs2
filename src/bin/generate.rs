@@ -23,6 +23,9 @@ struct Args {
     
     #[arg(short, long, default_value_t = 20)]
     num_tokens: usize,
+
+    #[arg(short, long, default_value = "cpu")]
+    backend: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -36,9 +39,19 @@ fn main() -> anyhow::Result<()> {
     
     // 1. Setup
     println!("Loading model from {}", model_path);
-    let backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
-    let memory = Galloc::new();
-    let model = LlamaModel::load(model_path, backend.clone(), &memory)?;
+    let backend: Arc<dyn Backend> = match args.backend.as_str() {
+        "cpu" => Arc::new(CpuBackend::new()),
+        "opencl" => Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?),
+        _ => anyhow::bail!("Unknown backend: {}", args.backend),
+    };
+    let memory: Box<dyn Memory> = if args.backend == "opencl" {
+        let ocl_backend = backend.as_any().downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+            .ok_or(anyhow::anyhow!("Failed into cast to OpenCLBackend"))?;
+        Box::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(ocl_backend.context.clone(), ocl_backend.queue.clone()))
+    } else {
+        Box::new(Galloc::new())
+    };
+    let model = LlamaModel::load(model_path, backend.clone(), &*memory)?;
     
     // 2. Tokenizer
     let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
@@ -83,7 +96,7 @@ fn main() -> anyhow::Result<()> {
     // Pre-allocate generation buffers
     let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
     let mut logits = Tensor::new(Shape::new(vec![1, 1, vocab_size]), logits_buf, backend.clone());
-    let gen_indices_buf = memory.alloc(4, DType::U8)?;
+    // gen_indices_buf removed (will use CPU tensor)
     
     // Cache EOS token ID
     let eos_id = tokenizer.get_vocab(true).get("</s>").copied().unwrap_or(u32::MAX);
@@ -91,13 +104,14 @@ fn main() -> anyhow::Result<()> {
     // === PREFILL PHASE ===
     {
         let process_len = tokens.len();
-        let indices_buf = memory.alloc(process_len * 4, DType::U8)?;
+        // Create CPU tensor for input
+        let cpu_indices_buf = Galloc::new().alloc(process_len * 4, DType::U8)?;
         unsafe {
-            let ptr = indices_buf.as_mut_ptr() as *mut u32;
+            let ptr = cpu_indices_buf.as_mut_ptr() as *mut u32;
             std::ptr::copy_nonoverlapping(tokens.as_ptr(), ptr, process_len);
         }
-        
-        let input_tensor = Tensor::new(Shape::new(vec![1, process_len]), indices_buf, backend.clone());
+        let cpu_input_tensor = Tensor::new(Shape::new(vec![1, process_len]), cpu_indices_buf, Arc::new(CpuBackend::new()));
+        let input_tensor = backend.copy_from(&cpu_input_tensor)?;
         
         let prefill_logits_buf = memory.alloc(process_len * vocab_size * 4, DType::F32)?;
         let mut prefill_logits = Tensor::new(
@@ -106,10 +120,18 @@ fn main() -> anyhow::Result<()> {
             backend.clone()
         );
         
-        model.forward_into(&input_tensor, start_pos, &mut kv_caches, &backend, &memory, &mut prefill_logits, None, None)?;
+        model.forward_into(&input_tensor, start_pos, &mut kv_caches, &backend, memory.as_ref(), &mut prefill_logits, None, None)?;
         
         // Argmax on last token
-        let logits_data = prefill_logits.as_slice::<f32>();
+        // Read logits to CPU
+        let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
+        unsafe {
+             let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+             let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
+             backend.read_buffer(&prefill_logits, slice)?;
+        }
+        let logits_data = &logits_cpu;
+        
         let last_logits = &logits_data[(process_len - 1) * vocab_size..process_len * vocab_size];
         
         let next_token_id = last_logits
@@ -138,23 +160,37 @@ fn main() -> anyhow::Result<()> {
         let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), x_gen_buf, backend.clone());
         
         let mut gen_ws = LayerWorkspace::new(
-            1, hidden_size, q_dim, k_dim, v_dim, ffn_hidden, max_seq_len, &memory, backend.clone()
+            1, hidden_size, q_dim, k_dim, v_dim, ffn_hidden, max_seq_len, memory.as_ref(), backend.clone()
         )?;
         
-        let gen_input_tensor = Tensor::new(Shape::new(vec![1, 1]), gen_indices_buf.clone(), backend.clone());
-        
+        // Single token CPU tensor for generation loop
+        let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
+        let cpu_gen_input = Tensor::new(Shape::new(vec![1, 1]), cpu_gen_indices_buf, Arc::new(CpuBackend::new()));
+
+        // Streaming setup
+        use std::io::Write;
+        let mut stdout = std::io::stdout();
+        let mut printed_len = 0;
+
         // Generation loop
         for _ in 0..(args.num_tokens - 1) {
             let last_token = tokens[tokens.len() - 1];
             unsafe {
-                let ptr = gen_indices_buf.as_mut_ptr() as *mut u32;
-                *ptr = last_token;
+                *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
             }
+            let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
             
-            model.forward_into(&gen_input_tensor, start_pos, &mut kv_caches, &backend, &memory, &mut logits, Some(&mut x_gen), Some(&mut gen_ws))?;
+            model.forward_into(&gen_input_tensor, start_pos, &mut kv_caches, &backend, memory.as_ref(), &mut logits, Some(&mut x_gen), Some(&mut gen_ws))?;
             
             // Argmax
-            let logits_data = logits.as_slice::<f32>();
+            // Read logits
+            let mut logits_cpu = vec![0.0f32; vocab_size];
+            unsafe {
+                 let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+                 let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
+                 backend.read_buffer(&logits, slice)?;
+            }
+            let logits_data = &logits_cpu;
             let next_token_id = logits_data
                 .iter()
                 .enumerate()
@@ -170,6 +206,14 @@ fn main() -> anyhow::Result<()> {
             tokens.push(next_token_id);
             start_pos += 1;
             
+            // Streaming print
+            let current_text = tokenizer.decode(&tokens[input_ids.len()..], true).unwrap_or_default();
+            if current_text.len() > printed_len {
+                print!("{}", &current_text[printed_len..]);
+                stdout.flush().ok();
+                printed_len = current_text.len();
+            }
+
             if next_token_id == eos_id {
                 break;
             }

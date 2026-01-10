@@ -17,6 +17,9 @@ impl CpuBackendAVX2 {
 }
 
 impl Backend for CpuBackendAVX2 {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &str {
         "CPU (AVX2)"
     }

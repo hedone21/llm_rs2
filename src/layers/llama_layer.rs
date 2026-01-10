@@ -5,6 +5,8 @@ use crate::core::kv_cache::KVCache;
 use crate::core::shape::Shape;
 use crate::core::buffer::DType;
 use anyhow::Result;
+use crate::memory::galloc::Galloc;
+use crate::backend::cpu::CpuBackend;
 use std::sync::Arc;
 
 pub struct LlamaLayer {
@@ -87,63 +89,97 @@ impl LlamaLayer {
         
         let mut out_attn = self.alloc_temp(vec![batch_size, seq_len, q_dim], memory, backend)?;
         
-        let q_data = q_rope.as_slice::<f32>();
-        let k_data = k_cache.as_slice::<f32>();
-        let v_data = v_cache.as_slice::<f32>();
-        let out_ptr = out_attn.as_mut_slice::<f32>();
-        
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        
-        for b in 0..batch_size {
-            for h in 0..n_heads_q {
-                let kv_h = h / (n_heads_q / n_heads_kv); 
-                
-                for t in 0..seq_len {
-                     let q_off = ((b * seq_len + t) * n_heads_q + h) * head_dim;
-                     let q_vec = &q_data[q_off..q_off + head_dim];
-                     
-                     let mut scores = vec![0.0; cache_seq_len];
-                     for ct in 0..cache_seq_len {
-                         let global_q_pos = start_pos + t;
-                         let global_k_pos = ct;
+        let is_opencl = backend.name() == "OpenCL";
+        let mut out_vec = Vec::new();
+
+        {
+            // Helper to cast slice
+            fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
+                unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+            }
+    
+            let mut q_vec = Vec::new();
+            let mut k_vec = Vec::new();
+            let mut v_vec = Vec::new();
+    
+            let (q_data, k_data, v_data, out_ptr) = if is_opencl {
+                q_vec.resize(q_rope.size() / 4, 0.0);
+                k_vec.resize(k_cache.size() / 4, 0.0);
+                v_vec.resize(v_cache.size() / 4, 0.0);
+                out_vec.resize(out_attn.size() / 4, 0.0);
+    
+                backend.read_buffer(&q_rope, as_u8_mut(&mut q_vec))?;
+                backend.read_buffer(&k_cache, as_u8_mut(&mut k_vec))?;
+                backend.read_buffer(&v_cache, as_u8_mut(&mut v_vec))?;
+    
+                (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
+            } else {
+                 (q_rope.as_slice::<f32>(), k_cache.as_slice::<f32>(), v_cache.as_slice::<f32>(), out_attn.as_mut_slice::<f32>())
+            };
+            
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            
+            for b in 0..batch_size {
+                for h in 0..n_heads_q {
+                    let kv_h = h / (n_heads_q / n_heads_kv); 
+                    
+                    for t in 0..seq_len {
+                         let q_off = ((b * seq_len + t) * n_heads_q + h) * head_dim;
+                         let q_vec = &q_data[q_off..q_off + head_dim];
                          
-                         if global_k_pos > global_q_pos {
-                             scores[ct] = f32::NEG_INFINITY;
-                             continue;
+                         let mut scores = vec![0.0; cache_seq_len];
+                         for ct in 0..cache_seq_len {
+                             let global_q_pos = start_pos + t;
+                             let global_k_pos = ct;
+                             
+                             if global_k_pos > global_q_pos {
+                                 scores[ct] = f32::NEG_INFINITY;
+                                 continue;
+                             }
+                             
+                             let k_off = ((b * kv_cache.max_seq_len + ct) * n_heads_kv + kv_h) * head_dim;
+                             let k_vec = &k_data[k_off..k_off + head_dim];
+                             
+                             let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
+                             scores[ct] = score * scale;
                          }
                          
-                         let k_off = ((b * kv_cache.max_seq_len + ct) * n_heads_kv + kv_h) * head_dim;
-                         let k_vec = &k_data[k_off..k_off + head_dim];
+                         let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                         let mut sum_exp = 0.0;
+                         for s in scores.iter_mut() {
+                             *s = (*s - max_val).exp();
+                             sum_exp += *s;
+                         }
+                         for s in scores.iter_mut() { *s /= sum_exp; }
                          
-                         let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
-                         scores[ct] = score * scale;
-                     }
-                     
-                     let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                     let mut sum_exp = 0.0;
-                     for s in scores.iter_mut() {
-                         *s = (*s - max_val).exp();
-                         sum_exp += *s;
-                     }
-                     for s in scores.iter_mut() { *s /= sum_exp; }
-                     
-                     let mut out_vec = vec![0.0; head_dim];
-                     for ct in 0..cache_seq_len {
-                         let weight = scores[ct];
-                         let v_off = ((b * kv_cache.max_seq_len + ct) * n_heads_kv + kv_h) * head_dim;
-                         let v_vec = &v_data[v_off..v_off + head_dim];
+                         let mut out_vec = vec![0.0; head_dim];
+                         for ct in 0..cache_seq_len {
+                             let weight = scores[ct];
+                             let v_off = ((b * kv_cache.max_seq_len + ct) * n_heads_kv + kv_h) * head_dim;
+                             let v_vec = &v_data[v_off..v_off + head_dim];
+                             
+                             for d in 0..head_dim {
+                                 out_vec[d] += weight * v_vec[d];
+                             }
+                         }
                          
+                         let out_off = ((b * seq_len + t) * n_heads_q + h) * head_dim;
                          for d in 0..head_dim {
-                             out_vec[d] += weight * v_vec[d];
+                             out_ptr[out_off + d] = out_vec[d];
                          }
-                     }
-                     
-                     let out_off = ((b * seq_len + t) * n_heads_q + h) * head_dim;
-                     for d in 0..head_dim {
-                         out_ptr[out_off + d] = out_vec[d];
-                     }
+                    }
                 }
             }
+        }
+
+        if is_opencl {
+             // Create temp CPU tensor from result and copy back
+             // Using Galloc directly
+             let size_bytes = out_vec.len() * 4;
+             let buf = Galloc::new().alloc(size_bytes, DType::F32)?;
+             unsafe { std::ptr::copy_nonoverlapping(out_vec.as_ptr(), buf.as_mut_ptr() as *mut f32, out_vec.len()); }
+             let cpu_out = Tensor::new(out_attn.shape().clone(), buf, Arc::new(CpuBackend::new()));
+             out_attn = backend.copy_from(&cpu_out)?;
         }
         
         let mut attn_out_projected = self.alloc_temp(vec![batch_size, seq_len, dim], memory, backend)?;
@@ -194,17 +230,20 @@ impl LlamaLayer {
         let head_dim = 64;
         
         // 1. Attention Norm
-        let x_data = x.as_slice::<f32>();
-        let residual_data = ws.residual.as_mut_slice::<f32>();
-        residual_data.copy_from_slice(x_data);
+        // x and ws.residual are tensors. Use copy_from for OpenCL compatibility (allocs new buffer but correct)
+
+        ws.residual = backend.copy_from(x)?;
+
         backend.rms_norm(x, &self.attention_norm, rms_norm_eps)?;
         
         // 2. QKV Projections
+
         backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
         backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
         backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
         
         // 3. RoPE
+
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
         let n_heads_q = q_dim / head_dim;
@@ -225,80 +264,126 @@ impl LlamaLayer {
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
         
         // 4. KV Cache Update
+
         kv_cache.update(&k_rope, &ws.v)?;
         
         // 5. Attention
+        // 5. Attention
         let cache_seq_len = kv_cache.current_pos;
         let (k_cache, v_cache) = kv_cache.get_view(0);
+
+        let is_opencl = backend.name() == "OpenCL";
+        let mut out_vec = Vec::new();
+
+
+        {
+             // Helper to cast slice
+            fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
+                unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+            }
+    
+            let mut q_vec = Vec::new();
+            let mut k_vec = Vec::new();
+            let mut v_vec = Vec::new();
+    
+            let (q_data, k_data, v_data, out_ptr) = if is_opencl {
+
+                q_vec.resize(q_rope.size() / 4, 0.0);
+                k_vec.resize(k_cache.size() / 4, 0.0);
+                v_vec.resize(v_cache.size() / 4, 0.0);
+                out_vec.resize(ws.out_attn.size() / 4, 0.0);
+    
+                backend.read_buffer(&q_rope, as_u8_mut(&mut q_vec))?;
+                backend.read_buffer(&k_cache, as_u8_mut(&mut k_vec))?;
+                backend.read_buffer(&v_cache, as_u8_mut(&mut v_vec))?;
+
+    
+                (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
+            } else {
+                 (q_rope.as_slice::<f32>(), k_cache.as_slice::<f32>(), v_cache.as_slice::<f32>(), ws.out_attn.as_mut_slice::<f32>())
+            };
         
-        let q_data = q_rope.as_slice::<f32>();
-        let k_data = k_cache.as_slice::<f32>();
-        let v_data = v_cache.as_slice::<f32>();
-        let out_ptr = ws.out_attn.as_mut_slice::<f32>();
-        
-        let scale = 1.0 / (head_dim as f32).sqrt();
-        
-        for h in 0..n_heads_q {
-            let kv_h = h / (n_heads_q / n_heads_kv);
-            let q_off = h * head_dim;
-            let q_vec = &q_data[q_off..q_off + head_dim];
-            
-            let scores = &mut ws.scores[..cache_seq_len];
-            for ct in 0..cache_seq_len {
-                let k_off = (ct * n_heads_kv + kv_h) * head_dim;
-                let k_vec = &k_data[k_off..k_off + head_dim];
+            let scale = 1.0 / (head_dim as f32).sqrt();
+
+            for h in 0..n_heads_q {
+                let kv_h = h / (n_heads_q / n_heads_kv);
+                let q_off = h * head_dim;
+                let q_vec = &q_data[q_off..q_off + head_dim];
                 
-                let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
-                scores[ct] = score * scale;
-            }
-            
-            let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-            let mut sum_exp = 0.0;
-            for s in scores.iter_mut() {
-                *s = (*s - max_val).exp();
-                sum_exp += *s;
-            }
-            for s in scores.iter_mut() { *s /= sum_exp; }
-            
-            let out_off = h * head_dim;
-            for d in 0..head_dim {
-                out_ptr[out_off + d] = 0.0;
-            }
-            for ct in 0..cache_seq_len {
-                let weight = scores[ct];
-                let v_off = (ct * n_heads_kv + kv_h) * head_dim;
-                let v_vec = &v_data[v_off..v_off + head_dim];
-                
-                for d in 0..head_dim {
-                    out_ptr[out_off + d] += weight * v_vec[d];
+                let scores = &mut ws.scores[..cache_seq_len];
+                for ct in 0..cache_seq_len {
+                    let k_off = (ct * n_heads_kv + kv_h) * head_dim;
+                    let k_vec = &k_data[k_off..k_off + head_dim];
+                    
+                    let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
+                    scores[ct] = score * scale;
                 }
-            }
+                
+                let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let mut sum_exp = 0.0;
+                for s in scores.iter_mut() {
+                    *s = (*s - max_val).exp();
+                    sum_exp += *s;
+                }
+                for s in scores.iter_mut() { *s /= sum_exp; }
+                
+                let out_off = h * head_dim;
+                for d in 0..head_dim {
+                    out_ptr[out_off + d] = 0.0;
+                }
+                for ct in 0..cache_seq_len {
+                    let weight = scores[ct];
+                    let v_off = (ct * n_heads_kv + kv_h) * head_dim;
+                    let v_vec = &v_data[v_off..v_off + head_dim];
+                    
+                    for d in 0..head_dim {
+                        out_ptr[out_off + d] += weight * v_vec[d];
+                    }
+                }
+            } // end h loop
+        } // end borrow scope
+        
+
+        if is_opencl {
+             // copy back
+
+             let size_bytes = out_vec.len() * 4;
+             let buf = Galloc::new().alloc(size_bytes, DType::F32)?;
+             unsafe { std::ptr::copy_nonoverlapping(out_vec.as_ptr(), buf.as_mut_ptr() as *mut f32, out_vec.len()); }
+             let cpu_out = Tensor::new(ws.out_attn.shape().clone(), buf, Arc::new(CpuBackend::new()));
+             ws.out_attn = backend.copy_from(&cpu_out)?;
         }
         
         // 6. Output Projection
+
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
         
         // 7. Residual 1
+
         backend.add_assign(&mut ws.attn_out, &ws.residual)?;
         
         // Copy to x for next stage
-        x.as_mut_slice::<f32>().copy_from_slice(ws.attn_out.as_slice::<f32>());
+        *x = backend.copy_from(&ws.attn_out)?;
         
         // 8. FFN Norm
-        ws.residual.as_mut_slice::<f32>().copy_from_slice(x.as_slice::<f32>());
+
+        ws.residual = backend.copy_from(x)?;
         backend.rms_norm(x, &self.ffn_norm, rms_norm_eps)?;
         
         // 9. FFN
+
         backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
         backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
         backend.silu_mul(&mut ws.gate, &ws.up)?;
         backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
         
         // 10. Residual 2
+
         backend.add_assign(&mut ws.down, &ws.residual)?;
         
         // Copy to x for next layer
-        x.as_mut_slice::<f32>().copy_from_slice(ws.down.as_slice::<f32>());
+        *x = backend.copy_from(&ws.down)?;
+
         
         Ok(())
     }
