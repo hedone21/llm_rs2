@@ -305,7 +305,6 @@ impl LlamaModel {
         };
 
         // Use gather
-
         backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
 
 
@@ -321,15 +320,12 @@ impl LlamaModel {
                 self.config.rope_theta as f32,
                 workspace.as_deref_mut() // Pass workspace if provided (only for seq_len=1)
             )?;
-
         }
         
         // 3. Final Norm
-
         backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
         
         // 4. Head
-
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
         

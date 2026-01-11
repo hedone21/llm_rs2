@@ -169,38 +169,54 @@ fn print_comparison_table(results: &[TestResult], backends: &[Arc<dyn Backend>])
            .insert(res.backend.clone(), (res.duration, res.error, res.status.clone()));
     }
 
-    println!("\n{:=<160}", "");
+    println!("\n{:=<200}", "");
     print!("{:<18} | {:<16} | {:<6} |", "Op", "Shape", "DTy");
     for backend in backends {
         let short_name = backend.name().replace("CPU (", "").replace(")", "").replace("Auto - ", ""); 
-        print!(" {:^24} |", short_name);
+        print!(" {:^32} |", short_name);
     }
     println!("");
     
     print!("{:<18} | {:<16} | {:<6} |", "", "", "");
     for _ in backends {
-        print!(" {:<10} | {:<11} |", "Duration", "Error");
+        print!(" {:<18} | {:<11} |", "Duration", "Error");
     }
-    println!("\n{:-<160}", "");
+    println!("\n{:-<200}", "");
 
     for (key, backend_map) in map {
         print!("{:<18} | {:<16} | {:<6} |", key.op.to_string(), key.shape, key.dtype);
         
+        let ref_dur_secs = backend_map.get("CPU (Scalar)").map(|(d, _, _)| d.as_secs_f64());
+
         for backend in backends {
             let b_name = backend.name();
             if let Some((dur, err, status)) = backend_map.get(b_name) {
                 if status == "PASS" {
-                    print!(" {:>10} | {:<11.6} |", format!("{:?}", dur).replace("ms", "ms"), err);
+                    let dur_secs = dur.as_secs_f64();
+                    let dur_ms = dur_secs * 1000.0;
+                    
+                    let speedup_str = if let Some(ref_secs) = ref_dur_secs {
+                        if dur_secs > 0.0 {
+                            format!("(x{:.2})", ref_secs / dur_secs)
+                        } else {
+                            "(x0.00)".to_string()
+                        }
+                    } else {
+                        "".to_string()
+                    };
+                    
+                    let dur_display = format!("{:.2}ms {}", dur_ms, speedup_str);
+                    print!(" {:>18} | {:<11.6} |", dur_display, err);
                 } else {
-                     print!(" {:^24} |", status);
+                     print!(" {:^32} |", status);
                 }
             } else {
-                 print!(" {:^24} |", "N/A");
+                 print!(" {:^32} |", "N/A");
             }
         }
         println!("");
     }
-    println!("{:=<160}", "");
+    println!("{:=<200}", "");
 }
 
 fn run_matmul_test(
