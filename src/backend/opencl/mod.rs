@@ -19,6 +19,9 @@ pub struct OpenCLBackend {
     pub simple_ops_program: Program,
     pub q4_0_program: Program,
     pub get_rows_program: Program,
+    pub rms_norm_program: Program,
+    pub softmax_program: Program,
+    pub silu_program: Program,
 }
 
 impl OpenCLBackend {
@@ -88,6 +91,48 @@ impl OpenCLBackend {
             .cmplr_opt("-cl-std=CL2.0")
             .build(&context)?;
 
+        // Load llama.cpp rms_norm kernel
+        let rms_norm_src = include_str!("../../../kernels/rms_norm.cl");
+        let rms_norm_program = match Program::builder()
+            .devices(device)
+            .src(rms_norm_src)
+            .cmplr_opt("-cl-std=CL2.0")
+            .build(&context) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("WARN: Failed to compile rms_norm kernel: {}. Using simple_ops fallback.", e);
+                    simple_ops_program.clone()
+                }
+            };
+
+        // Load llama.cpp softmax kernel
+        let softmax_src = include_str!("../../../kernels/softmax_f32.cl");
+        let softmax_program = match Program::builder()
+            .devices(device)
+            .src(softmax_src)
+            .cmplr_opt("-cl-std=CL2.0")
+            .build(&context) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("WARN: Failed to compile softmax kernel: {}. Using simple_ops fallback.", e);
+                    simple_ops_program.clone()
+                }
+            };
+
+        // Load llama.cpp silu kernel
+        let silu_src = include_str!("../../../kernels/silu.cl");
+        let silu_program = match Program::builder()
+            .devices(device)
+            .src(silu_src)
+            .cmplr_opt("-cl-std=CL2.0")
+            .build(&context) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("WARN: Failed to compile silu kernel: {}. Using simple_ops fallback.", e);
+                    simple_ops_program.clone()
+                }
+            };
+
         Ok(Self {
             context,
             queue,
@@ -96,14 +141,22 @@ impl OpenCLBackend {
             simple_ops_program,
             q4_0_program,
             get_rows_program,
+            rms_norm_program,
+            softmax_program,
+            silu_program,
         })
     }
 
     pub fn matmul_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
-        let m = a_dims[0];
-        let k = a_dims[1];
+        
+        // Handle 3D tensors: e.g., [batch, seq, K] -> M = batch*seq, K = K
+        let (m, k) = if a_dims.len() == 3 {
+            (a_dims[0] * a_dims[1], a_dims[2])
+        } else {
+            (a_dims[0], a_dims[1])
+        };
         let n = b_dims[0]; // b is [N, K]
         
         // Kernel signature:
@@ -210,6 +263,9 @@ impl Backend for OpenCLBackend {
             simple_ops_program: self.simple_ops_program.clone(),
             q4_0_program: self.q4_0_program.clone(),
             get_rows_program: self.get_rows_program.clone(),
+            rms_norm_program: self.rms_norm_program.clone(),
+            softmax_program: self.softmax_program.clone(),
+            silu_program: self.silu_program.clone(),
         }));
 
         // Case 1: Source is OpenCL Tensor (Device-to-Device Copy)
@@ -274,8 +330,12 @@ impl Backend for OpenCLBackend {
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
         
-        let m = a_dims[0];  // A rows
-        let k = a_dims[1];  // A cols = B cols (inner dimension)
+        // Handle 3D tensors: e.g., [batch, seq, K] -> M = batch*seq, K = K
+        let (m, k) = if a_dims.len() == 3 {
+            (a_dims[0] * a_dims[1], a_dims[2])
+        } else {
+            (a_dims[0], a_dims[1])
+        };
         let n = b_dims[0];  // B rows (output cols)
         
         // Verify dimensions
@@ -394,31 +454,46 @@ impl Backend for OpenCLBackend {
 
     fn rms_norm(&self, x: &mut Tensor, weight: &Tensor, epsilon: f32) -> Result<()> {
         let dims = x.shape().dims();
-        let rows = if dims.len() > 1 { dims[0] } else { 1 };
+        // For 3D tensor [batch, seq, dim], rows = batch * seq
         let dim = dims[dims.len() - 1];
+        let rows: usize = dims[..dims.len()-1].iter().product();
         
         let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
             .ok_or(anyhow!("X is not OpenCL buffer"))?;
         let w_buf = weight.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
             .ok_or(anyhow!("Weight is not OpenCL buffer"))?;
         
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_rms_norm_simple")?;
+        // Use optimized kernel with workgroup reduction
+        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_rms_norm_opt")?;
+        let local_size = 64usize; // Adreno subgroup size
+        let local_mem_size = local_size * std::mem::size_of::<f32>(); // scratch memory
+        
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(w_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?; // output = x (inplace)
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&(dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&epsilon))?;
+            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&epsilon))?;
+            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[rows, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            // One workgroup per row, local_size threads per workgroup
+            let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+            
+            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &global_work_size, Some(local_work_size), None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
 
     fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
         let dims = x.shape().dims();
-        let total_elements = dims.iter().product::<usize>();
-        let head_dim = dims[dims.len() - 1];
+        // Expect [batch, seq, num_heads, head_dim] or [batch*seq, num_heads, head_dim]
+        let (seq_len, num_heads, head_dim) = if dims.len() == 4 {
+            (dims[1], dims[2], dims[3])
+        } else if dims.len() == 3 {
+            (dims[0], dims[1], dims[2])
+        } else {
+            return Err(anyhow!("RoPE expects 3 or 4 dims"));
+        };
         
         let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
             .ok_or(anyhow!("X is not OpenCL buffer"))?;
@@ -427,10 +502,13 @@ impl Backend for OpenCLBackend {
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(start_pos as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&theta))?;
+            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(num_heads as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&(seq_len as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&(start_pos as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&theta))?;
             
-            let work_size = total_elements / 2;  // pairs
+            // Work size = seq_len * num_heads * (head_dim/2) = total pairs
+            let work_size = seq_len * num_heads * (head_dim / 2);
             ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[work_size, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
@@ -498,19 +576,28 @@ impl Backend for OpenCLBackend {
 
     fn softmax(&self, x: &mut Tensor) -> Result<()> {
         let dims = x.shape().dims();
-        let rows = if dims.len() > 1 { dims[0] } else { 1 };
+        // For 3D tensor [batch, seq, dim], rows = batch * seq
         let dim = dims[dims.len() - 1];
+        let rows: usize = dims[..dims.len()-1].iter().product();
         
         let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
             .ok_or(anyhow!("X is not OpenCL buffer"))?;
         
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_softmax_simple")?;
+        // Use optimized kernel with workgroup reduction
+        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_softmax_opt")?;
+        let local_size = 64usize;
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
+        
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?; // output = x (inplace)
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[rows, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            // One workgroup per row
+            let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+            
+            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &global_work_size, Some(local_work_size), None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
