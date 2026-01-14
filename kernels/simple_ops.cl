@@ -379,3 +379,102 @@ kernel void kernel_silu_mul_simple(
         x[i] = val * sigmoid * y[i];
     }
 }
+
+//------------------------------------------------------------------------------
+// Single-Query Attention Kernel for Generation (GQA-aware)
+// Q: [num_heads_q, head_dim] - single query token
+// K: [cache_seq_len, num_heads_kv, head_dim] - key cache
+// V: [cache_seq_len, num_heads_kv, head_dim] - value cache  
+// O: [num_heads_q, head_dim] - output
+// Each workgroup processes one query head
+//------------------------------------------------------------------------------
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_attn_gen(
+    global float * Q,            // [num_heads_q, head_dim]
+    global float * K,            // [cache_seq_len, num_heads_kv, head_dim]
+    global float * V,            // [cache_seq_len, num_heads_kv, head_dim]
+    global float * O,            // [num_heads_q, head_dim]
+    int head_dim,
+    int num_heads_q,
+    int num_heads_kv,
+    int cache_seq_len,
+    float scale,
+    local float * scratch        // size = local_size
+) {
+    int head_idx = get_group_id(0);    // which Q head
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+    
+    // GQA: map Q head to KV head
+    int gqa_ratio = num_heads_q / num_heads_kv;
+    int kv_head = head_idx / gqa_ratio;
+    
+    // Pointers
+    global float * q_ptr = Q + head_idx * head_dim;
+    
+    // Phase 1: Compute scores and find max (for numerical stability)
+    float my_max = -INFINITY;
+    for (int t = lid; t < cache_seq_len; t += local_size) {
+        global float * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q_ptr[d] * k_ptr[d];
+        }
+        score *= scale;
+        my_max = fmax(my_max, score);
+    }
+    
+    // Reduce max across workgroup
+    scratch[lid] = my_max;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] = fmax(scratch[lid], scratch[lid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float max_score = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Phase 2: Compute exp(score - max) and sum
+    float my_sum = 0.0f;
+    for (int t = lid; t < cache_seq_len; t += local_size) {
+        global float * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q_ptr[d] * k_ptr[d];
+        }
+        score = exp(score * scale - max_score);
+        scratch[lid] = score; // temp store per thread (overwritten each iter, ok for sum)
+        my_sum += score;
+    }
+    
+    // Reduce sum
+    scratch[lid] = my_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float total_sum = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Phase 3: Compute weighted V sum
+    // Each thread computes partial output for subset of head_dim elements
+    for (int d = lid; d < head_dim; d += local_size) {
+        float out_val = 0.0f;
+        for (int t = 0; t < cache_seq_len; t++) {
+            // Recompute score for this t
+            global float * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+            float score = 0.0f;
+            for (int dd = 0; dd < head_dim; dd++) {
+                score += q_ptr[dd] * k_ptr[dd];
+            }
+            float weight = exp(score * scale - max_score) / total_sum;
+            
+            global float * v_ptr = V + (t * num_heads_kv + kv_head) * head_dim;
+            out_val += weight * v_ptr[d];
+        }
+        O[head_idx * head_dim + d] = out_val;
+    }
+}

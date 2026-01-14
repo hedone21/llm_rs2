@@ -26,6 +26,10 @@ struct Args {
 
     #[arg(short, long, default_value = "cpu")]
     backend: String,
+
+    /// Use zero-copy shared memory (slower but enables CPU-GPU sharing)
+    #[arg(long, default_value_t = false)]
+    zero_copy: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -47,7 +51,11 @@ fn main() -> anyhow::Result<()> {
     let memory: Box<dyn Memory> = if args.backend == "opencl" {
         let ocl_backend = backend.as_any().downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
             .ok_or(anyhow::anyhow!("Failed into cast to OpenCLBackend"))?;
-        Box::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(ocl_backend.context.clone(), ocl_backend.queue.clone()))
+        Box::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+            ocl_backend.context.clone(), 
+            ocl_backend.queue.clone(),
+            args.zero_copy
+        ))
     } else {
         Box::new(Galloc::new())
     };
