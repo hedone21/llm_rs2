@@ -23,6 +23,53 @@ pub trait Backend: Send + Sync {
     // Rotate
     fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()>;
 
+    // Single-query attention for generation (GQA-aware)
+    // Q: [num_heads_q, head_dim], K/V cache: [cache_seq_len, num_heads_kv, head_dim]
+    // Output: [num_heads_q, head_dim]
+    fn attention_gen(&self, q: &Tensor, k_cache: &Tensor, v_cache: &Tensor, out: &mut Tensor, 
+                     num_heads_q: usize, num_heads_kv: usize, head_dim: usize, cache_seq_len: usize) -> Result<()> {
+        // Default CPU implementation  
+        let q_data = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const f32, q.size()/4) };
+        let k_data = unsafe { std::slice::from_raw_parts(k_cache.as_ptr() as *const f32, k_cache.size()/4) };
+        let v_data = unsafe { std::slice::from_raw_parts(v_cache.as_ptr() as *const f32, v_cache.size()/4) };
+        let out_data = unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, out.size()/4) };
+        
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = num_heads_q / num_heads_kv;
+        
+        for h in 0..num_heads_q {
+            let kv_h = h / gqa_ratio;
+            let q_off = h * head_dim;
+            let q_vec = &q_data[q_off..q_off + head_dim];
+            
+            // Compute scores
+            let mut scores = vec![0.0f32; cache_seq_len];
+            for t in 0..cache_seq_len {
+                let k_off = (t * num_heads_kv + kv_h) * head_dim;
+                let k_vec = &k_data[k_off..k_off + head_dim];
+                let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
+                scores[t] = score * scale;
+            }
+            
+            // Softmax
+            let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+            let mut sum_exp = 0.0;
+            for s in scores.iter_mut() { *s = (*s - max_val).exp(); sum_exp += *s; }
+            for s in scores.iter_mut() { *s /= sum_exp; }
+            
+            // Weighted sum of V
+            let out_off = h * head_dim;
+            for d in 0..head_dim { out_data[out_off + d] = 0.0; }
+            for t in 0..cache_seq_len {
+                let weight = scores[t];
+                let v_off = (t * num_heads_kv + kv_h) * head_dim;
+                let v_vec = &v_data[v_off..v_off + head_dim];
+                for d in 0..head_dim { out_data[out_off + d] += weight * v_vec[d]; }
+            }
+        }
+        Ok(())
+    }
+
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {

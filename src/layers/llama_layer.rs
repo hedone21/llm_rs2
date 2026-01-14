@@ -267,42 +267,21 @@ impl LlamaLayer {
 
         kv_cache.update(&k_rope, &ws.v)?;
         
-        // 5. Attention
-        // 5. Attention
+        // 5. Attention - use GPU kernel for OpenCL
         let cache_seq_len = kv_cache.current_pos;
         let (k_cache, v_cache) = kv_cache.get_view(0);
 
-        let is_opencl = backend.name() == "OpenCL";
-        let mut out_vec = Vec::new();
-
-
-        {
-             // Helper to cast slice
-            fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
-                unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
-            }
-    
-            let mut q_vec = Vec::new();
-            let mut k_vec = Vec::new();
-            let mut v_vec = Vec::new();
-    
-            let (q_data, k_data, v_data, out_ptr) = if is_opencl {
-
-                q_vec.resize(q_rope.size() / 4, 0.0);
-                k_vec.resize(k_cache.size() / 4, 0.0);
-                v_vec.resize(v_cache.size() / 4, 0.0);
-                out_vec.resize(ws.out_attn.size() / 4, 0.0);
-    
-                backend.read_buffer(&q_rope, as_u8_mut(&mut q_vec))?;
-                backend.read_buffer(&k_cache, as_u8_mut(&mut k_vec))?;
-                backend.read_buffer(&v_cache, as_u8_mut(&mut v_vec))?;
-
-    
-                (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
-            } else {
-                 (q_rope.as_slice::<f32>(), k_cache.as_slice::<f32>(), v_cache.as_slice::<f32>(), ws.out_attn.as_mut_slice::<f32>())
-            };
-        
+        if backend.name() == "OpenCL" {
+            // GPU attention - no data transfer!
+            backend.attention_gen(&q_rope, &k_cache, &v_cache, &mut ws.out_attn,
+                                  n_heads_q, n_heads_kv, head_dim, cache_seq_len)?;
+        } else {
+            // CPU attention path
+            let q_data = q_rope.as_slice::<f32>();
+            let k_data = k_cache.as_slice::<f32>();
+            let v_data = v_cache.as_slice::<f32>();
+            let out_ptr = ws.out_attn.as_mut_slice::<f32>();
+            
             let scale = 1.0 / (head_dim as f32).sqrt();
 
             for h in 0..n_heads_q {
@@ -340,18 +319,7 @@ impl LlamaLayer {
                         out_ptr[out_off + d] += weight * v_vec[d];
                     }
                 }
-            } // end h loop
-        } // end borrow scope
-        
-
-        if is_opencl {
-             // copy back
-
-             let size_bytes = out_vec.len() * 4;
-             let buf = Galloc::new().alloc(size_bytes, DType::F32)?;
-             unsafe { std::ptr::copy_nonoverlapping(out_vec.as_ptr(), buf.as_mut_ptr() as *mut f32, out_vec.len()); }
-             let cpu_out = Tensor::new(ws.out_attn.shape().clone(), buf, Arc::new(CpuBackend::new()));
-             ws.out_attn = backend.copy_from(&cpu_out)?;
+            }
         }
         
         // 6. Output Projection

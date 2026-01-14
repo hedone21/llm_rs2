@@ -51,4 +51,24 @@ pub trait Buffer: Send + Sync {
 
     /// Ensure data is synced to the desired device
     fn sync_device(&self) -> Result<()>;
+
+    // --- Zero-Copy Shared Memory Support ---
+
+    /// Map buffer for CPU access (makes GPU access invalid until unmapped).
+    /// Default implementation is no-op for CPU-only buffers.
+    fn map_for_cpu(&self) -> Result<()> {
+        Ok(()) // No-op for regular buffers
+    }
+
+    /// Unmap buffer for GPU access (makes CPU pointer invalid).
+    /// Default implementation is no-op for CPU-only buffers.
+    fn unmap_for_gpu(&self) -> Result<()> {
+        Ok(()) // No-op for regular buffers
+    }
+
+    /// Check if buffer is currently mapped for CPU access.
+    /// Default: true (CPU-only buffers are always "mapped").
+    fn is_mapped(&self) -> bool {
+        true
+    }
 }

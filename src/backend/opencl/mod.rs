@@ -1,27 +1,79 @@
 use anyhow::{Result, anyhow};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
 use crate::core::memory::Memory;
-use ocl::{Context, Device, Platform, Queue, Program, Kernel, flags};
+use ocl::{Context, Device, Platform, Queue, Program, flags};
+use ocl::core::Kernel as CoreKernel;
 use crate::core::buffer::DType;
 use crate::core::buffer::Buffer;
+use crate::buffer::unified_buffer::UnifiedBuffer;
 
 pub mod buffer;
 pub mod memory;
 
-#[derive(Debug)]
+/// Helper function to get the OpenCL memory handle from a tensor buffer.
+/// Works with both UnifiedBuffer and legacy OpenCLBuffer.
+fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
+    // First try UnifiedBuffer
+    if let Some(unified) = buf.as_any().downcast_ref::<UnifiedBuffer>() {
+        return Ok(unified.cl_buffer().as_core());
+    }
+    // Then try legacy OpenCLBuffer
+    if let Some(ocl_buf) = buf.as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>() {
+        return Ok(ocl_buf.buffer.as_core());
+    }
+    Err(anyhow!("Buffer is not an OpenCL buffer type"))
+}
+
+// Compiler optimization flags for fast math (matching llama.cpp)
+const CL_FAST_MATH_OPTS: &str = "-cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
+
+/// Cached kernel objects wrapped in a struct for interior mutability.
+/// Uses Mutex to make the raw kernel pointers thread-safe.
+struct KernelCache {
+    kernel_mul_mat_f32_f32: CoreKernel,
+    kernel_mul_mat_q4_0_f32: CoreKernel,
+    kernel_rms_norm_opt: CoreKernel,
+    kernel_softmax_opt: CoreKernel,
+    kernel_rope_simple: CoreKernel,
+    kernel_silu_mul_simple: CoreKernel,
+    kernel_add_assign_simple: CoreKernel,
+    kernel_scale_simple: CoreKernel,
+    kernel_get_rows_q4_0: CoreKernel,
+    kernel_get_rows_f32: CoreKernel,
+    kernel_attn_gen: CoreKernel,
+}
+
+// SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
+// when protected by a mutex. The underlying cl_kernel is not mutated by these operations,
+// only the kernel arguments are set before each call.
+unsafe impl Send for KernelCache {}
+unsafe impl Sync for KernelCache {}
+
+/// OpenCL Backend with cached kernel objects for performance.
+/// Kernels are created once during initialization and reused across all calls.
 pub struct OpenCLBackend {
     pub context: Context,
     pub queue: Queue,
     pub device: Device,
+    // Programs
     pub program: Program,
     pub simple_ops_program: Program,
     pub q4_0_program: Program,
     pub get_rows_program: Program,
-    pub rms_norm_program: Program,
-    pub softmax_program: Program,
-    pub silu_program: Program,
+    
+    // Cached kernels protected by mutex for thread safety
+    kernels: Mutex<KernelCache>,
+}
+
+// Manual Debug impl
+impl std::fmt::Debug for OpenCLBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenCLBackend")
+            .field("device", &self.device)
+            .finish()
+    }
 }
 
 impl OpenCLBackend {
@@ -41,12 +93,12 @@ impl OpenCLBackend {
 
         log::info!("Initialized OpenCL Backend on device: {}", device.name()?);
 
-        // Load matmul kernel
+        // Load matmul kernel with fast math
         let matmul_src = include_str!("../../../kernels/mul_mv_f32_f32.cl");
         let program = match Program::builder()
             .devices(device)
             .src(matmul_src)
-            .cmplr_opt("-cl-std=CL2.0")
+            .cmplr_opt(CL_FAST_MATH_OPTS)
             .build(&context) {
                 Ok(p) => p,
                 Err(e) => {
@@ -58,19 +110,20 @@ impl OpenCLBackend {
                 }
             };
         
-        // Load simple ops kernel
+        // Load simple ops kernel with fast math
         let simple_ops_src = include_str!("../../../kernels/simple_ops.cl");
         let simple_ops_program = Program::builder()
             .devices(device)
             .src(simple_ops_src)
+            .cmplr_opt(CL_FAST_MATH_OPTS)
             .build(&context)?;
         
-        // Load Q4_0 matmul kernel
+        // Load Q4_0 matmul kernel with fast math
         let q4_0_src = include_str!("../../../kernels/mul_mv_q4_0_f32.cl");
         let q4_0_program = match Program::builder()
             .devices(device)
             .src(q4_0_src)
-            .cmplr_opt("-cl-std=CL2.0")
+            .cmplr_opt(CL_FAST_MATH_OPTS)
             .build(&context) {
                 Ok(p) => p,
                 Err(e) => {
@@ -82,56 +135,30 @@ impl OpenCLBackend {
                 }
             };
 
-
-        // Load get_rows kernel
+        // Load get_rows kernel with fast math
         let get_rows_src = include_str!("../../../kernels/get_rows.cl");
         let get_rows_program = Program::builder()
             .devices(device)
             .src(get_rows_src)
-            .cmplr_opt("-cl-std=CL2.0")
+            .cmplr_opt(CL_FAST_MATH_OPTS)
             .build(&context)?;
 
-        // Load llama.cpp rms_norm kernel
-        let rms_norm_src = include_str!("../../../kernels/rms_norm.cl");
-        let rms_norm_program = match Program::builder()
-            .devices(device)
-            .src(rms_norm_src)
-            .cmplr_opt("-cl-std=CL2.0")
-            .build(&context) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("WARN: Failed to compile rms_norm kernel: {}. Using simple_ops fallback.", e);
-                    simple_ops_program.clone()
-                }
-            };
+        // Create and cache all kernel objects once
+        let kernel_cache = KernelCache {
+            kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
+            kernel_mul_mat_q4_0_f32: ocl::core::create_kernel(&q4_0_program, "kernel_mul_mat_q4_0_f32")?,
+            kernel_rms_norm_opt: ocl::core::create_kernel(&simple_ops_program, "kernel_rms_norm_opt")?,
+            kernel_softmax_opt: ocl::core::create_kernel(&simple_ops_program, "kernel_softmax_opt")?,
+            kernel_rope_simple: ocl::core::create_kernel(&simple_ops_program, "kernel_rope_simple")?,
+            kernel_silu_mul_simple: ocl::core::create_kernel(&simple_ops_program, "kernel_silu_mul_simple")?,
+            kernel_add_assign_simple: ocl::core::create_kernel(&simple_ops_program, "kernel_add_assign_simple")?,
+            kernel_scale_simple: ocl::core::create_kernel(&simple_ops_program, "kernel_scale_simple")?,
+            kernel_get_rows_q4_0: ocl::core::create_kernel(&get_rows_program, "kernel_get_rows_q4_0")?,
+            kernel_get_rows_f32: ocl::core::create_kernel(&get_rows_program, "kernel_get_rows_f32")?,
+            kernel_attn_gen: ocl::core::create_kernel(&simple_ops_program, "kernel_attn_gen")?,
+        };
 
-        // Load llama.cpp softmax kernel
-        let softmax_src = include_str!("../../../kernels/softmax_f32.cl");
-        let softmax_program = match Program::builder()
-            .devices(device)
-            .src(softmax_src)
-            .cmplr_opt("-cl-std=CL2.0")
-            .build(&context) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("WARN: Failed to compile softmax kernel: {}. Using simple_ops fallback.", e);
-                    simple_ops_program.clone()
-                }
-            };
-
-        // Load llama.cpp silu kernel
-        let silu_src = include_str!("../../../kernels/silu.cl");
-        let silu_program = match Program::builder()
-            .devices(device)
-            .src(silu_src)
-            .cmplr_opt("-cl-std=CL2.0")
-            .build(&context) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("WARN: Failed to compile silu kernel: {}. Using simple_ops fallback.", e);
-                    simple_ops_program.clone()
-                }
-            };
+        log::info!("OpenCL kernels cached successfully");
 
         Ok(Self {
             context,
@@ -141,9 +168,7 @@ impl OpenCLBackend {
             simple_ops_program,
             q4_0_program,
             get_rows_program,
-            rms_norm_program,
-            softmax_program,
-            silu_program,
+            kernels: Mutex::new(kernel_cache),
         })
     }
 
@@ -151,80 +176,58 @@ impl OpenCLBackend {
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
         
-        // Handle 3D tensors: e.g., [batch, seq, K] -> M = batch*seq, K = K
         let (m, k) = if a_dims.len() == 3 {
             (a_dims[0] * a_dims[1], a_dims[2])
         } else {
             (a_dims[0], a_dims[1])
         };
-        let n = b_dims[0]; // b is [N, K]
-        
-        // Kernel signature:
-        // kernel void kernel_mul_mat_q4_0_f32( ... )
+        let n = b_dims[0];
 
-        let a_buf = a.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("A is not OpenCL buffer"))?;
-        let b_buf = b.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("B is not OpenCL buffer"))?;
-        let out_buf = out.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref())
+            .map_err(|_| anyhow!("A is not OpenCL buffer"))?;
+        let b_buf = get_cl_mem(b.buffer().as_ref())
+            .map_err(|_| anyhow!("B is not OpenCL buffer"))?;
+        let out_buf = get_cl_mem(out.buffer().as_ref())
+            .map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
 
-        let kernel = ocl::core::create_kernel(&self.q4_0_program, "kernel_mul_mat_q4_0_f32")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_mul_mat_q4_0_f32;
         
         let ne00 = k as i32;
         let ne01 = n as i32;
         let ne02 = 1;
-        
-        let ne10 = k as i32; // Stride of A in elements (float)
+        let ne10 = k as i32;
         let ne12 = (k * m) as i32;
-        
-        let ne0 = n as i32; // Stride of Out in elements? dst[r1*ne0 + ...]
+        let ne0 = n as i32;
         let ne1 = (n * m) as i32;
-        
         let r2 = 1;
         let r3 = 1;
 
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(b_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(a_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(out_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(b_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(a_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
             
-            ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
-            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
-            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
-            
-            ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&ne10))?;
-            ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&ne12))?;
-            
-            ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&ne0))?;
-            ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&ne1))?;
-            ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
-            ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&ne10))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&ne12))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&ne0))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&ne1))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            // Work size
-            // dim 0: (N + 3) / 4 * 64
-            // dim 1: M
-            // dim 2: 1
             let local_work_size: [usize; 3] = [64, 1, 1];
             let group_size_0 = (n + 3) / 4;
-            let global_work_size: [usize; 3] = [
-                group_size_0 * local_work_size[0],
-                m,
-                1
-            ];
+            let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], m, 1];
 
             ocl::core::enqueue_kernel(
-                &self.queue,
-                &kernel,
-                3,
-                None,
-                &global_work_size,
-                Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>
+                &self.queue, kernel, 3, None, &global_work_size, Some(local_work_size),
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>
             )?;
         }
         Ok(())
@@ -237,23 +240,40 @@ impl Backend for OpenCLBackend {
     }
 
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
-        let buf = t.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-             .ok_or(anyhow::anyhow!("Not OpenCL buffer"))?;
-        buf.buffer.read(dst).queue(&self.queue).enq()?;
+        let buf = get_cl_mem(t.buffer().as_ref())
+             .map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;
+        unsafe {
+            ocl::core::enqueue_read_buffer(&self.queue, buf, true, 0, dst,
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+        }
         Ok(())
     }
-    fn name(&self) -> &str {
-        "OpenCL"
-    }
-
-    fn device(&self) -> &str {
-        "GPU"
-    }
+    
+    fn name(&self) -> &str { "OpenCL" }
+    fn device(&self) -> &str { "GPU" }
 
     fn copy_from(&self, src: &Tensor) -> Result<Tensor> {
         let size = src.size();
-        let memory = crate::backend::opencl::memory::OpenCLMemory::new(self.context.clone(), self.queue.clone());
+        // Use device-only memory for copies (faster)
+        let memory = crate::backend::opencl::memory::OpenCLMemory::new(self.context.clone(), self.queue.clone(), false);
         let buffer = memory.alloc(size, src.dtype())?;
+        
+        // Create new kernel cache by cloning kernel objects
+        let src_kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel_cache = KernelCache {
+            kernel_mul_mat_f32_f32: src_kernels.kernel_mul_mat_f32_f32.clone(),
+            kernel_mul_mat_q4_0_f32: src_kernels.kernel_mul_mat_q4_0_f32.clone(),
+            kernel_rms_norm_opt: src_kernels.kernel_rms_norm_opt.clone(),
+            kernel_softmax_opt: src_kernels.kernel_softmax_opt.clone(),
+            kernel_rope_simple: src_kernels.kernel_rope_simple.clone(),
+            kernel_silu_mul_simple: src_kernels.kernel_silu_mul_simple.clone(),
+            kernel_add_assign_simple: src_kernels.kernel_add_assign_simple.clone(),
+            kernel_scale_simple: src_kernels.kernel_scale_simple.clone(),
+            kernel_get_rows_q4_0: src_kernels.kernel_get_rows_q4_0.clone(),
+            kernel_get_rows_f32: src_kernels.kernel_get_rows_f32.clone(),
+            kernel_attn_gen: src_kernels.kernel_attn_gen.clone(),
+        };
+        drop(src_kernels); // Release lock before potentially blocking operations
         
         let new_tensor = Tensor::new(src.shape().clone(), buffer.clone(), Arc::new(Self {
             context: self.context.clone(),
@@ -263,56 +283,35 @@ impl Backend for OpenCLBackend {
             simple_ops_program: self.simple_ops_program.clone(),
             q4_0_program: self.q4_0_program.clone(),
             get_rows_program: self.get_rows_program.clone(),
-            rms_norm_program: self.rms_norm_program.clone(),
-            softmax_program: self.softmax_program.clone(),
-            silu_program: self.silu_program.clone(),
+            kernels: Mutex::new(kernel_cache),
         }));
 
-        // Case 1: Source is OpenCL Tensor (Device-to-Device Copy)
-        if let Some(src_buf_ocl) = src.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>() {
-            if let Some(dst_buf_ocl) = buffer.as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>() {
-                 unsafe {
-                     ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
-                        &self.queue,
-                        src_buf_ocl.buffer.as_core(),
-                        dst_buf_ocl.buffer.as_core(),
-                        0,
-                        0,
-                        src_buf_ocl.size(), // bytes
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>
-                     )?;
-                 }
-                 // Synchronize to ensure copy is done (debugging stability)
-                 self.queue.finish()?; 
-                 return Ok(new_tensor);
-            }
+        // Device-to-Device Copy - try using get_cl_mem for both buffer types
+        if let (Ok(src_mem), Ok(dst_mem)) = (get_cl_mem(src.buffer().as_ref()), get_cl_mem(buffer.as_ref())) {
+             unsafe {
+                 ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                    &self.queue, src_mem, dst_mem,
+                    0, 0, size,
+                    None::<&ocl::core::Event>, None::<&mut ocl::core::Event>
+                 )?;
+             }
+             return Ok(new_tensor);
         }
 
-        // Case 2: Source is CPU Tensor (Host-to-Device Copy)
+        // Host-to-Device Copy - source is CPU, destination is GPU
         let src_ptr = src.as_ptr();
         if !src_ptr.is_null() {
             let src_slice = unsafe { std::slice::from_raw_parts(src_ptr, size) };
-            if let Some(ocl_buf) = buffer.as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>() {
+            if let Ok(dst_mem) = get_cl_mem(buffer.as_ref()) {
                  unsafe {
                      ocl::core::enqueue_write_buffer(
-                        &self.queue,
-                        ocl_buf.buffer.as_core(),
-                        true, // blocking write
-                        0,
-                        src_slice,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>
+                        &self.queue, dst_mem, true, 0, src_slice,
+                        None::<&ocl::core::Event>, None::<&mut ocl::core::Event>
                      )?;
                  }
             } else {
-                 return Err(anyhow!("Failed to downcast buffer in copy_from"));
+                 return Err(anyhow!("Failed to get cl_mem handle for destination buffer"));
             }
-        } else {
-             // If source pointer is null and it wasn't an OpenCL buffer, we might have an issue.
-             // But for now, we assume if as_ptr is null, it might be some other backend we don't support or unmapped.
-             // Warn?
-             // log::warn!("copy_from called with null pointer and not OpenCL buffer");
         }
         
         Ok(new_tensor)
@@ -324,192 +323,159 @@ impl Backend for OpenCLBackend {
     }
     
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-        // For matmul_transposed: A[M,K] * B^T[N,K] = C[M,N]
-        // B is stored as [N, K] (already transposed)
-        // llama.cpp kernel: src0=B[N,K], src1=A[M,K], dst=C[M,N]
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
         
-        // Handle 3D tensors: e.g., [batch, seq, K] -> M = batch*seq, K = K
-        let (m, k) = if a_dims.len() == 3 {
-            (a_dims[0] * a_dims[1], a_dims[2])
-        } else {
-            (a_dims[0], a_dims[1])
-        };
-        let n = b_dims[0];  // B rows (output cols)
+        let (m, k) = if a_dims.len() == 3 { (a_dims[0] * a_dims[1], a_dims[2]) } else { (a_dims[0], a_dims[1]) };
+        let n = b_dims[0];
         
-        // Verify dimensions
-        if b_dims[1] != k {
-            return Err(anyhow!("Dimension mismatch: A[{},{}] * B^T[{},{}]", m, k, n, b_dims[1]));
-        }
+        if b_dims[1] != k { return Err(anyhow!("Dimension mismatch: A[{},{}] * B^T[{},{}]", m, k, n, b_dims[1])); }
 
-        let a_buf = a.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("A is not OpenCL buffer"))?;
-        let b_buf = b.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("B is not OpenCL buffer"))?;
-        let c_buf = out.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Out is not OpenCL buffer"))?;
+        let a_buf = get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
+        let b_buf = get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
+        let c_buf = get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
             
-        // Kernel args for llama.cpp mul_mv_f32_f32:
-        // src0 = B[N, K], src1 = A[M, K], dst = C[M, N]
-        // ne00 = K (inner dim), ne01 = N (src0 rows), ne02 = 1 (batch)
-        // ne10 = K, ne11 = M (src1 rows), ne12 = 1
-        // ne0 = N (output cols), ne1 = M (output rows)
-        
-        let ne00 = k as i32;
-        let ne01 = n as i32;
-        let ne02 = 1i32;
-        let nb00 = 4u64;                    // sizeof(float)
-        let nb01 = k as u64 * 4;            // stride between B rows
-        let nb02 = n as u64 * k as u64 * 4; // batch stride
-        let nb03 = nb02;
-        
-        let ne10 = k as i32;
-        let ne11 = m as i32;
-        let ne12 = 1i32;
-        let nb10 = 4u64;
-        let nb11 = k as u64 * 4;            // stride between A rows
-        let nb12 = m as u64 * k as u64 * 4;
-        let nb13 = nb12;
-        
-        let ne0 = n as i32;  // output cols
-        let ne1 = m as i32;  // output rows
-        let r2 = 1i32;
-        let r3 = 1i32;
+        let ne00 = k as i32; let ne01 = n as i32; let ne02 = 1i32;
+        let nb00 = 4u64; let nb01 = k as u64 * 4; let nb02 = n as u64 * k as u64 * 4; let nb03 = nb02;
+        let ne10 = k as i32; let ne11 = m as i32; let ne12 = 1i32;
+        let nb10 = 4u64; let nb11 = k as u64 * 4; let nb12 = m as u64 * k as u64 * 4; let nb13 = nb12;
+        let ne0 = n as i32; let ne1 = m as i32; let r2 = 1i32; let r3 = 1i32;
 
-        let kernel = ocl::core::create_kernel(&self.program, "kernel_mul_mat_f32_f32")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_mul_mat_f32_f32;
         
         unsafe {
-            let b_mem = b_buf.buffer.as_core();
-            let a_mem = a_buf.buffer.as_core();
-            let c_mem = c_buf.buffer.as_core();
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(b_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(a_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(c_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
             
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(b_mem))?;  // src0 = B
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(a_mem))?;  // src1 = A
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(c_mem))?;  // dst = C
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&nb00))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&nb01))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&nb02))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&nb03))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&ne10))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&ne11))?;
+            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&ne12))?;
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&nb10))?;
+            ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::scalar(&nb11))?;
+            ocl::core::set_kernel_arg(kernel, 18, ocl::core::ArgVal::scalar(&nb12))?;
+            ocl::core::set_kernel_arg(kernel, 19, ocl::core::ArgVal::scalar(&nb13))?;
+            ocl::core::set_kernel_arg(kernel, 20, ocl::core::ArgVal::scalar(&ne0))?;
+            ocl::core::set_kernel_arg(kernel, 21, ocl::core::ArgVal::scalar(&ne1))?;
+            ocl::core::set_kernel_arg(kernel, 22, ocl::core::ArgVal::scalar(&r2))?;
+            ocl::core::set_kernel_arg(kernel, 23, ocl::core::ArgVal::scalar(&r3))?;
             
-            ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
-            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
-            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
-            ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&nb00))?;
-            ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&nb01))?;
-            ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&nb02))?;
-            ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&nb03))?;
-            
-            ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&ne10))?;
-            ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&ne11))?;
-            ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&ne12))?;
-            ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&nb10))?;
-            ocl::core::set_kernel_arg(&kernel, 17, ocl::core::ArgVal::scalar(&nb11))?;
-            ocl::core::set_kernel_arg(&kernel, 18, ocl::core::ArgVal::scalar(&nb12))?;
-            ocl::core::set_kernel_arg(&kernel, 19, ocl::core::ArgVal::scalar(&nb13))?;
-            
-            ocl::core::set_kernel_arg(&kernel, 20, ocl::core::ArgVal::scalar(&ne0))?;
-            ocl::core::set_kernel_arg(&kernel, 21, ocl::core::ArgVal::scalar(&ne1))?;
-            ocl::core::set_kernel_arg(&kernel, 22, ocl::core::ArgVal::scalar(&r2))?;
-            ocl::core::set_kernel_arg(&kernel, 23, ocl::core::ArgVal::scalar(&r3))?;
-            
-            // Global work size:
-            // - dim 0: n work groups (one per B row), each with local_size threads
-            // - dim 1: ceil(m/4) work groups (4 A rows per work group)
-            // - dim 2: 1 (batch)
-            // Each work group processes one B row against 4 A rows
-            // llama.cpp uses local size = subgroup size (64 for Adreno)
-            let local_size = 64usize;  // Adreno subgroup size
-            let global_work_size: [usize; 3] = [
-                n * local_size,  // one group per B row
-                (m + 3) / 4,     // ceil(M/4) groups
-                1
-            ];
+            let local_size = 64usize;
+            let global_work_size: [usize; 3] = [n * local_size, (m + 3) / 4, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
             
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                &kernel,
-                3,
-                None,
-                &global_work_size,
-                Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>
-            )?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 3, None, &global_work_size, Some(local_work_size),
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
-
         Ok(())
     }
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-         if b.dtype() == DType::Q4_0 {
-             return self.matmul_q4_0(a, b, out);
-         }
-         // The mul_mv_f32_f32 kernel expects B to be transposed already [N, K],
-         // which matches matmul_transposed semantics. Delegate to matmul.
+         if b.dtype() == DType::Q4_0 { return self.matmul_q4_0(a, b, out); }
          self.matmul(a, b, out)
     }
 
-
-
     fn rms_norm(&self, x: &mut Tensor, weight: &Tensor, epsilon: f32) -> Result<()> {
         let dims = x.shape().dims();
-        // For 3D tensor [batch, seq, dim], rows = batch * seq
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len()-1].iter().product();
         
-        let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("X is not OpenCL buffer"))?;
-        let w_buf = weight.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Weight is not OpenCL buffer"))?;
+        let x_buf = get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
+        let w_buf = get_cl_mem(weight.buffer().as_ref()).map_err(|_| anyhow!("Weight is not OpenCL buffer"))?;
         
-        // Use optimized kernel with workgroup reduction
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_rms_norm_opt")?;
-        let local_size = 64usize; // Adreno subgroup size
-        let local_mem_size = local_size * std::mem::size_of::<f32>(); // scratch memory
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_rms_norm_opt;
+        let local_size = 64usize;
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
         
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(w_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&epsilon))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(w_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&epsilon))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
             
-            // One workgroup per row, local_size threads per workgroup
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &global_work_size, Some(local_work_size), None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &global_work_size, Some(local_work_size), 
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
 
     fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
         let dims = x.shape().dims();
-        // Expect [batch, seq, num_heads, head_dim] or [batch*seq, num_heads, head_dim]
-        let (seq_len, num_heads, head_dim) = if dims.len() == 4 {
-            (dims[1], dims[2], dims[3])
-        } else if dims.len() == 3 {
-            (dims[0], dims[1], dims[2])
-        } else {
-            return Err(anyhow!("RoPE expects 3 or 4 dims"));
-        };
+        let (seq_len, num_heads, head_dim) = if dims.len() == 4 { (dims[1], dims[2], dims[3]) } 
+            else if dims.len() == 3 { (dims[0], dims[1], dims[2]) }
+            else { return Err(anyhow!("RoPE expects 3 or 4 dims")); };
         
-        let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("X is not OpenCL buffer"))?;
+        let x_buf = get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
         
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_rope_simple")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_rope_simple;
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(num_heads as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&(seq_len as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&(start_pos as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&theta))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(num_heads as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(seq_len as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(start_pos as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&theta))?;
             
-            // Work size = seq_len * num_heads * (head_dim/2) = total pairs
             let work_size = seq_len * num_heads * (head_dim / 2);
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[work_size, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &[work_size, 1, 1], None::<[usize; 3]>,
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+        }
+        Ok(())
+    }
+
+    fn attention_gen(&self, q: &Tensor, k_cache: &Tensor, v_cache: &Tensor, out: &mut Tensor,
+                     num_heads_q: usize, num_heads_kv: usize, head_dim: usize, cache_seq_len: usize) -> Result<()> {
+        let q_buf = get_cl_mem(q.buffer().as_ref())
+            .map_err(|_| anyhow!("Q is not OpenCL buffer"))?;
+        let k_buf = get_cl_mem(k_cache.buffer().as_ref())
+            .map_err(|_| anyhow!("K is not OpenCL buffer"))?;
+        let v_buf = get_cl_mem(v_cache.buffer().as_ref())
+            .map_err(|_| anyhow!("V is not OpenCL buffer"))?;
+        let o_buf = get_cl_mem(out.buffer().as_ref())
+            .map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let local_size = 64usize;  // Adreno subgroup size
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
+        
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_attn_gen;
+        
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(k_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(v_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(o_buf))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&(num_heads_kv as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&(cache_seq_len as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            
+            // One workgroup per Q head
+            let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+            
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &global_work_size, Some(local_work_size),
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
@@ -517,18 +483,18 @@ impl Backend for OpenCLBackend {
     fn silu_mul(&self, x: &mut Tensor, y: &Tensor) -> Result<()> {
         let size = x.shape().dims().iter().product::<usize>();
         
-        let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("X is not OpenCL buffer"))?;
-        let y_buf = y.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Y is not OpenCL buffer"))?;
+        let x_buf = get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
+        let y_buf = get_cl_mem(y.buffer().as_ref()).map_err(|_| anyhow!("Y is not OpenCL buffer"))?;
         
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_silu_mul_simple")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_silu_mul_simple;
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(y_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[size, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &[size, 1, 1], None::<[usize; 3]>,
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
@@ -536,252 +502,187 @@ impl Backend for OpenCLBackend {
     fn add_assign(&self, x: &mut Tensor, y: &Tensor) -> Result<()> {
         let size = x.shape().dims().iter().product::<usize>();
         
-        let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("X is not OpenCL buffer"))?;
-        let y_buf = y.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Y is not OpenCL buffer"))?;
+        let x_buf = get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
+        let y_buf = get_cl_mem(y.buffer().as_ref()).map_err(|_| anyhow!("Y is not OpenCL buffer"))?;
         
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_add_assign_simple")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_add_assign_simple;
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(y_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[size, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &[size, 1, 1], None::<[usize; 3]>,
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
 
     fn matmul_slice(&self, a: &Tensor, b: &Tensor, _rows: usize, _cols: usize, out: &mut Tensor) -> Result<()> {
-        // For now, delegate to matmul_transposed
         self.matmul_transposed(a, b, out)
     }
 
     fn scale(&self, x: &mut Tensor, val: f32) -> Result<()> {
         let size = x.shape().dims().iter().product::<usize>();
         
-        let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("X is not OpenCL buffer"))?;
+        let x_buf = get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
         
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_scale_simple")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_scale_simple;
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&val))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&val))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &[size, 1, 1], None::<[usize; 3]>, None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &[size, 1, 1], None::<[usize; 3]>,
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
 
     fn softmax(&self, x: &mut Tensor) -> Result<()> {
         let dims = x.shape().dims();
-        // For 3D tensor [batch, seq, dim], rows = batch * seq
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len()-1].iter().product();
         
-        let x_buf = x.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("X is not OpenCL buffer"))?;
+        let x_buf = get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
         
-        // Use optimized kernel with workgroup reduction
-        let kernel = ocl::core::create_kernel(&self.simple_ops_program, "kernel_softmax_opt")?;
+        let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_softmax_opt;
         let local_size = 64usize;
         let local_mem_size = local_size * std::mem::size_of::<f32>();
         
         unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf.buffer.as_core()))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&(dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
             
-            // One workgroup per row
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
             
-            ocl::core::enqueue_kernel(&self.queue, &kernel, 1, None, &global_work_size, Some(local_work_size), None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+            ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &global_work_size, Some(local_work_size),
+                None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
         }
         Ok(())
     }
 
     fn gather(&self, src: &Tensor, indices: &Tensor, dst: &mut Tensor) -> Result<()> {
-         // Check if input is Q4_0 or F32
          let dims = src.shape().dims();
-         let k = dims[dims.len() - 1]; // Hidden size
+         let k = dims[dims.len() - 1];
          
-         let src_buf = src.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Src is not OpenCL buffer"))?;
-         let idx_buf = indices.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Indices is not OpenCL buffer"))?;
-         let dst_buf = dst.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>()
-            .ok_or(anyhow!("Dst is not OpenCL buffer"))?;
+         let src_buf = get_cl_mem(src.buffer().as_ref()).map_err(|_| anyhow!("Src is not OpenCL buffer"))?;
+         let idx_buf = get_cl_mem(indices.buffer().as_ref()).map_err(|_| anyhow!("Indices is not OpenCL buffer"))?;
+         let dst_buf = get_cl_mem(dst.buffer().as_ref()).map_err(|_| anyhow!("Dst is not OpenCL buffer"))?;
             
-         // Kernel arguments
-         // src0, off0, src1, off1, dst, offd, ne00, nb01, nb02, nb03, ne10, nb10, nb11, nb12, nb1, nb2, nb3
-         
          let ne00 = k as i32;
          let nb01 = match src.dtype() {
              DType::F32 => (k * 4) as u64,
-             DType::Q4_0 => (k / 32 * 18) as u64, // 18 bytes per block
+             DType::Q4_0 => (k / 32 * 18) as u64,
              _ => return Err(anyhow!("Unsupported src dtype for gather: {:?}", src.dtype())),
          };
          let nb02 = nb01 * dims[0] as u64; 
          let nb03 = nb02;
-
          let ne10 = indices.size() as i32; 
-         // src1 indices strides
-         let nb10 = 4u64; // int32
+         let nb10 = 4u64;
          let nb11 = nb10 * ne10 as u64;
          let nb12 = nb11;
-         
-         // dst strides
-         let nb1 = (k * 4) as u64; // F32
+         let nb1 = (k * 4) as u64;
          let nb2 = nb1 * ne10 as u64; 
          let nb3 = nb2;
 
-         let kernel_name = match src.dtype() {
-             DType::Q4_0 => "kernel_get_rows_q4_0",
-             DType::F32 => "kernel_get_rows_f32",
+         let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+         let kernel = match src.dtype() {
+             DType::Q4_0 => &kernels.kernel_get_rows_q4_0,
+             DType::F32 => &kernels.kernel_get_rows_f32,
              _ => return Err(anyhow!("Unsupported dtype")),
          };
-
-         let kernel = ocl::core::create_kernel(&self.get_rows_program, kernel_name)?;
          
          unsafe {
-             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(src_buf.buffer.as_core()))?;
-             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
-             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(idx_buf.buffer.as_core()))?;
-             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
-             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(dst_buf.buffer.as_core()))?;
-             ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
-             
-             ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
-             ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&nb01))?;
-             ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&nb02))?;
-             ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&nb03))?;
-             
-             ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&ne10))?;
-             ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&nb10))?;
-             ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&nb11))?;
-             ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&nb12))?;
-             
-             ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&nb1))?;
-             ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&nb2))?;
-             ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&nb3))?;
+             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(src_buf))?;
+             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
+             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(idx_buf))?;
+             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
+             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(dst_buf))?;
+             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
+             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+             ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&nb01))?;
+             ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&nb02))?;
+             ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&nb03))?;
+             ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&ne10))?;
+             ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&nb10))?;
+             ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&nb11))?;
+             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&nb12))?;
+             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&nb1))?;
+             ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&nb2))?;
+             ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&nb3))?;
 
-             // Work size
              let local_size = 64usize;
              let num_indices = indices.size();
              let global_work_size: [usize; 3] = [num_indices * local_size, 1, 1];
              let local_work_size: [usize; 3] = [local_size, 1, 1];
              
-             ocl::core::enqueue_kernel(
-                 &self.queue, &kernel, 1, None, &global_work_size, Some(local_work_size), 
-                 None::<&ocl::core::Event>, None::<&mut ocl::core::Event>
-             )?;
+             ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &global_work_size, Some(local_work_size), 
+                 None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
          }
          Ok(())
     }
 
     fn copy_slice(&self, src: &Tensor, dst: &mut Tensor, src_offset: usize, dst_offset: usize, count: usize) -> Result<()> {
-         // Identify element size
          let type_size = match src.dtype() {
-            DType::F32 => 4,
-            DType::F16 => 2,
-            DType::U8 => 1,
-            // For Q4_0, since it's blocks, offsets/count are in BLOCKS not float elements?
-            // KVCache is usually F32 or F16.
-            // If DType is Q4_0, sizeof(BlockQ4_0).
-             DType::Q4_0 => 18, // 32/2 + 2 = 18 bytes
+            DType::F32 => 4, DType::F16 => 2, DType::U8 => 1, DType::Q4_0 => 18,
              _ => return Err(anyhow!("Unsupported dtype for copy_slice: {:?}", src.dtype())),
          };
          
-         let src_buf = src.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>();
-         let dst_buf = dst.buffer().as_any().downcast_ref::<crate::backend::opencl::buffer::OpenCLBuffer>();
+         let src_m = get_cl_mem(src.buffer().as_ref());
+         let dst_m = get_cl_mem(dst.buffer().as_ref());
          
-         if let (Some(sb), Some(db)) = (src_buf, dst_buf) {
-             // Device to Device copy
+         if let (Ok(sb), Ok(db)) = (src_m.as_ref(), dst_m.as_ref()) {
              let src_byte_off = src_offset * type_size;
              let dst_byte_off = dst_offset * type_size;
              let byte_len = count * type_size;
              
              unsafe {
                  ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
-                     &self.queue,
-                     sb.buffer.as_core(),
-                     db.buffer.as_core(),
-                     src_byte_off,
-                     dst_byte_off,
-                     byte_len,
-                     None::<&ocl::core::Event>,
-                     None::<&mut ocl::core::Event>
+                     &self.queue, *sb, *db,
+                     src_byte_off, dst_byte_off, byte_len,
+                     None::<&ocl::core::Event>, None::<&mut ocl::core::Event>
                  )?;
              }
-             self.queue.finish()?; // Sync for safety
              return Ok(());
          }
          
-         // Fallback to default CPU copy likely fails if buffers are NULL, but try default if not both OpenCL
-         // Actually default calls as_ptr(), if that returns null calling default will error.
-         // Let's implement Host <-> Device copy here if needed, or error out?
-         // KVCache new_k (src) might be CPU if we didn't put it on device? 
-         // In forward_gen, k_rope IS on device. So it should be dev->dev.
-         
-         // If one is CPU and other is GPU?
-         // If src is CPU and dst is GPU: enqueue_write_buffer
-         // If src is GPU and dst is CPU: enqueue_read_buffer
-         
-         if let Some(db) = dst_buf {
-             // Host to Device
+         if let Ok(db) = dst_m {
              let src_ptr = src.as_ptr();
              if !src_ptr.is_null() {
                  let src_byte_off = src_offset * type_size;
                  let dst_byte_off = dst_offset * type_size;
                  let byte_len = count * type_size;
-                 
                  unsafe {
                      let src_u8 = src_ptr as *const u8;
-                     ocl::core::enqueue_write_buffer(
-                         &self.queue,
-                         db.buffer.as_core(),
-                         true,
-                         dst_byte_off,
+                     ocl::core::enqueue_write_buffer(&self.queue, db, true, dst_byte_off,
                          std::slice::from_raw_parts(src_u8.add(src_byte_off), byte_len),
-                         None::<&ocl::core::Event>,
-                         None::<&mut ocl::core::Event>
-                     )?;
+                         None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
                  }
                  return Ok(());
              }
          }
          
-         if let Some(sb) = src_buf {
-             // Device to Host
+         if let Ok(sb) = src_m {
              let dst_ptr = dst.as_mut_ptr();
              if !dst_ptr.is_null() {
                  let src_byte_off = src_offset * type_size;
                  let dst_byte_off = dst_offset * type_size;
                  let byte_len = count * type_size;
-
                  unsafe {
                      let dst_u8 = dst_ptr as *mut u8;
-                     ocl::core::enqueue_read_buffer(
-                         &self.queue,
-                         sb.buffer.as_core(),
-                         true,
-                         src_byte_off,
+                     ocl::core::enqueue_read_buffer(&self.queue, sb, true, src_byte_off,
                          std::slice::from_raw_parts_mut(dst_u8.add(dst_byte_off), byte_len),
-                         None::<&ocl::core::Event>,
-                         None::<&mut ocl::core::Event>
-                     )?;
+                         None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
                  }
                  return Ok(());
              }
          }
 
-         // Delegate to default (which will likely fail if pointers are null)
-         // We can't easily call default implementation from here without a helper or trait setup, 
-         // but we can copy the logic.
-         
          Err(anyhow!("Unsupported copy_slice combination in OpenCL backend or null pointers"))
     }
 }
-
