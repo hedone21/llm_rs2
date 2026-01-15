@@ -188,6 +188,10 @@ fn main() -> anyhow::Result<()> {
     let kv_heads = model.config.num_key_value_heads;
     let head_dim = model.config.head_dim;
     let num_layers = model.config.num_hidden_layers;
+    println!(
+        "Model config: layers={}, kv_heads={}, head_dim={}, max_seq_len={}",
+        num_layers, kv_heads, head_dim, max_seq_len
+    );
 
     let mut kv_caches = Vec::new();
     for _ in 0..num_layers {
