@@ -251,7 +251,8 @@ impl LlamaModel {
                 memory, 
                 self.config.rms_norm_eps as f32, 
                 self.config.rope_theta as f32,
-                None // No workspace for standard forward
+                None, // No workspace for standard forward
+                true  // Always use GPU attention in standard forward
             )?;
         }
         
@@ -284,6 +285,7 @@ impl LlamaModel {
         logits_out: &mut Tensor,
         x_gen: Option<&mut Tensor>,
         mut workspace: Option<&mut LayerWorkspace>,
+        use_gpu_attn: bool,
     ) -> Result<()> {
 
         let batch_size = input_tokens.shape().dims()[0];
@@ -318,7 +320,8 @@ impl LlamaModel {
                 memory, 
                 self.config.rms_norm_eps as f32, 
                 self.config.rope_theta as f32,
-                workspace.as_deref_mut() // Pass workspace if provided (only for seq_len=1)
+                workspace.as_deref_mut(), // Pass workspace if provided (only for seq_len=1)
+                use_gpu_attn
             )?;
         }
         
