@@ -182,6 +182,7 @@ fn main() -> anyhow::Result<()> {
         .encode(prompt.as_str(), true)
         .map_err(|e| anyhow::anyhow!(e))?;
     let input_ids: Vec<u32> = encoding.get_ids().to_vec();
+    println!("Token Length: {}", input_ids.len());
 
     // 4. Prepare KV Cache
     let max_seq_len = args.max_seq_len; // Use argument
