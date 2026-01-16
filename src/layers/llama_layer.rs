@@ -37,6 +37,7 @@ impl LlamaLayer {
         rms_norm_eps: f32,
         rope_theta: f32,
         workspace: Option<&mut super::workspace::LayerWorkspace>,
+        use_gpu_attn: bool,
     ) -> Result<()> {
         let batch_size = x.shape().dims()[0];
         let seq_len = x.shape().dims()[1];
@@ -45,7 +46,7 @@ impl LlamaLayer {
 
         if seq_len == 1 {
             if let Some(ws) = workspace {
-                return self.forward_gen(x, kv_cache, start_pos, backend, ws, rms_norm_eps, rope_theta);
+                return self.forward_gen(x, kv_cache, start_pos, backend, ws, rms_norm_eps, rope_theta, use_gpu_attn);
             }
         }
 
@@ -225,6 +226,7 @@ impl LlamaLayer {
         ws: &mut super::workspace::LayerWorkspace,
         rms_norm_eps: f32,
         rope_theta: f32,
+        use_gpu_attn: bool,
     ) -> Result<()> {
         let batch_size = x.shape().dims()[0];
         let head_dim = 64;
@@ -271,7 +273,7 @@ impl LlamaLayer {
         let cache_seq_len = kv_cache.current_pos;
         let (k_cache, v_cache) = kv_cache.get_view(0);
 
-        if backend.name() == "OpenCL" {
+        if backend.name() == "OpenCL" && use_gpu_attn {
             // GPU attention - no data transfer!
             backend.attention_gen(&q_rope, &k_cache, &v_cache, &mut ws.out_attn,
                                   n_heads_q, n_heads_kv, head_dim, cache_seq_len)?;

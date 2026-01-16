@@ -48,6 +48,10 @@ struct Args {
 
     #[arg(long, default_value_t = 64)]
     repetition_window: usize,
+
+    /// Use GPU kernel for attention computation (OpenCL only)
+    #[arg(long, default_value_t = false)]
+    gpu_attn: bool,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -283,6 +287,7 @@ fn main() -> anyhow::Result<()> {
             &mut prefill_logits,
             None,
             None,
+            args.gpu_attn,
         )?;
 
         // Sample last token
@@ -375,6 +380,7 @@ fn main() -> anyhow::Result<()> {
                 &mut logits,
                 Some(&mut x_gen),
                 Some(&mut gen_ws),
+                args.gpu_attn,
             )?;
 
             // Sample
