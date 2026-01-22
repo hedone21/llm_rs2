@@ -1,0 +1,214 @@
+   Compiling llm_rs2 v0.1.0 (/home/go/Workspace/llm_rs2)
+warning: unused imports: `Result` and `anyhow`
+ --> src/backend/cpu/mod.rs:1:14
+  |
+1 | use anyhow::{Result, anyhow};
+  |              ^^^^^^  ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::core::backend::Backend`
+ --> src/backend/cpu/mod.rs:2:5
+  |
+2 | use crate::core::backend::Backend;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::core::tensor::Tensor`
+ --> src/backend/cpu/mod.rs:3:5
+  |
+3 | use crate::core::tensor::Tensor;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `crate::core::buffer::DType`
+ --> src/backend/cpu/mod.rs:4:5
+  |
+4 | use crate::core::buffer::DType;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `BlockQ8_0`
+   --> src/backend/cpu/common.rs:340:34
+    |
+340 |         use crate::core::quant::{BlockQ8_0, QK8_0};
+    |                                  ^^^^^^^^^
+
+warning: unused import: `BlockQ8_0`
+   --> src/backend/cpu/common.rs:364:34
+    |
+364 |         use crate::core::quant::{BlockQ8_0, QK8_0};
+    |                                  ^^^^^^^^^
+
+warning: unused imports: `BlockQ4_1` and `QK4_1`
+ --> src/backend/cpu/x86.rs:6:37
+  |
+6 | use crate::core::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
+  |                                     ^^^^^^^^^         ^^^^^
+
+warning: unused variable: `other`
+  --> src/core/tensor.rs:71:26
+   |
+71 |     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+   |                          ^^^^^ help: if this is intentional, prefix it with an underscore: `_other`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `batch_size`
+  --> src/core/kv_cache.rs:22:13
+   |
+22 |         let batch_size = new_k.shape().dims()[0]; // Assuming [Batch, Seq, Head, Dim] or similar? 
+   |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_batch_size`
+
+warning: unused variable: `elem_size`
+  --> src/core/kv_cache.rs:39:13
+   |
+39 |         let elem_size = std::mem::size_of::<f32>(); // Assuming F32 for cache now
+   |             ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_elem_size`
+
+warning: unused variable: `seq_len`
+  --> src/core/kv_cache.rs:67:28
+   |
+67 |     pub fn get_view(&self, seq_len: usize) -> (Tensor, Tensor) {
+   |                            ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_seq_len`
+
+warning: unused variable: `rows`
+  --> src/backend/cpu/common.rs:66:52
+   |
+66 |     fn matmul_slice(&self, a: &Tensor, b: &Tensor, rows: usize, cols: usize, out: &mut Tensor) -> Result<()> {
+   |                                                    ^^^^ help: if this is intentional, prefix it with an underscore: `_rows`
+
+warning: unused variable: `cols`
+  --> src/backend/cpu/common.rs:66:65
+   |
+66 |     fn matmul_slice(&self, a: &Tensor, b: &Tensor, rows: usize, cols: usize, out: &mut Tensor) -> Result<()> {
+   |                                                                 ^^^^ help: if this is intentional, prefix it with an underscore: `_cols`
+
+warning: unnecessary `unsafe` block
+   --> src/backend/cpu/common.rs:290:42
+    |
+290 |                         let b_row_node = unsafe { b.as_ptr() as *const BlockQ4_0 };
+    |                                          ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `rows`
+  --> src/backend/cpu/x86.rs:44:52
+   |
+44 |     fn matmul_slice(&self, a: &Tensor, b: &Tensor, rows: usize, cols: usize, out: &mut Tensor) -> Result<()> {
+   |                                                    ^^^^ help: if this is intentional, prefix it with an underscore: `_rows`
+
+warning: unused variable: `cols`
+  --> src/backend/cpu/x86.rs:44:65
+   |
+44 |     fn matmul_slice(&self, a: &Tensor, b: &Tensor, rows: usize, cols: usize, out: &mut Tensor) -> Result<()> {
+   |                                                                 ^^^^ help: if this is intentional, prefix it with an underscore: `_cols`
+
+warning: unnecessary `unsafe` block
+   --> src/backend/cpu/x86.rs:124:33
+    |
+ 94 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+124 |                     let a_ptr = unsafe { a_data.as_ptr().add(i * k) };
+    |                                 ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/backend/cpu/x86.rs:125:33
+    |
+ 94 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+125 |                     let b_ptr = unsafe { b_data.as_ptr().add(j * k) };
+    |                                 ^^^^^^ unnecessary `unsafe` block
+
+warning: unnecessary `unsafe` block
+   --> src/backend/cpu/x86.rs:129:21
+    |
+ 94 |         unsafe {
+    |         ------ because it's nested under this `unsafe` block
+...
+129 |                     unsafe {
+    |                     ^^^^^^ unnecessary `unsafe` block
+
+warning: value assigned to `sum` is never read
+   --> src/backend/cpu/x86.rs:295:31
+    |
+295 |                 let mut sum = 0.0;
+    |                               ^^^
+    |
+    = help: maybe it is overwritten before being read?
+    = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: method `matmul_transposed_q4_0_serial` is never used
+   --> src/backend/cpu/x86.rs:391:8
+    |
+ 82 | impl CpuBackendAVX2 {
+    | ------------------- method in this implementation
+...
+391 |     fn matmul_transposed_q4_0_serial(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `llm_rs2` (lib) generated 21 warnings (run `cargo fix --lib -p llm_rs2` to apply 15 suggestions)
+warning: variant `MatMul` is never constructed
+  --> src/bin/test_backend.rs:26:5
+   |
+25 | enum OpType {
+   |      ------ variant in this enum
+26 |     MatMul,
+   |     ^^^^^^
+   |
+   = note: `OpType` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `msg` is never read
+  --> src/bin/test_backend.rs:49:5
+   |
+41 | struct TestResult {
+   |        ---------- field in this struct
+...
+49 |     msg: String,
+   |     ^^^
+   |
+   = note: `TestResult` has a derived impl for the trait `Debug`, but this is intentionally ignored during dead code analysis
+
+warning: `llm_rs2` (bin "test_backend") generated 2 warnings
+    Finished `release` profile [optimized] target(s) in 1.07s
+     Running `/home/go/Workspace/llm_rs2/target/release/test_backend --backends scalar,avx2`
+=== LLM RS2 Backend Test Suite (Expanded) ===
+
+--- Running Tests for Backend: CPU (Scalar) ---
+
+--- Running Tests for Backend: CPU (AVX2) ---
+
+================================================================================================================================================================
+Op                 | Shape            | DTy    |          Scalar          |           AVX2           |
+                   |                  |        | Duration   | Error       | Duration   | Error       |
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+MatMulTransposed   | [1, 256, 128]    | F32    | 1.759311ms | 0.000000    |  586.152µs | 0.000000    |
+MatMulTransposed   | [1, 256, 128]    | Q4_0   |  192.026µs | 0.001504    |  147.458µs | 0.001504    |
+MatMulTransposed   | [1, 4096, 4096]  | F32    | 455.328163ms | 0.000000    | 37.348834ms | 0.000005    |
+MatMulTransposed   | [1, 4096, 4096]  | Q4_0   | 60.800231ms | 0.008854    | 42.511331ms | 0.000003    |
+MatMulTransposed   | [32, 256, 128]   | F32    | 2.523276ms | 0.000000    | 2.902359ms | 0.000000    |
+MatMulTransposed   | [32, 256, 128]   | Q4_0   | 2.505898ms | 0.000001    | 2.537156ms | 0.000001    |
+MatMulTransposed   | [32, 4096, 4096] | F32    | 907.794809ms | 0.000000    | 951.407805ms | 0.000000    |
+MatMulTransposed   | [32, 4096, 4096] | Q4_0   | 730.177617ms | 0.000009    | 720.598221ms | 0.000009    |
+MatMulTransposed   | [4, 256, 128]    | F32    | 1.790572ms | 0.000000    | 4.306986ms | 0.000001    |
+MatMulTransposed   | [4, 256, 128]    | Q4_0   | 1.374662ms | 0.000003    |  2.88849ms | 0.000003    |
+MatMulTransposed   | [64, 256, 128]   | F32    | 3.746055ms | 0.000000    | 15.697636ms | 0.000000    |
+MatMulTransposed   | [64, 256, 128]   | Q4_0   |  4.02631ms | 0.000001    | 4.247599ms | 0.000001    |
+MatMulTransposed   | [8, 256, 128]    | F32    | 1.751104ms | 0.000000    | 1.701094ms | 0.000000    |
+MatMulTransposed   | [8, 256, 128]    | Q4_0   | 1.553721ms | 0.000000    | 1.882526ms | 0.000000    |
+MatMulSlice        | [1, 256, 128]    | F32    |  747.405µs | 0.000000    |  576.646µs | 0.000000    |
+MatMulSlice        | [1, 4096, 4096]  | F32    | 452.601419ms | 0.000000    | 38.592647ms | 0.000005    |
+MatMulSlice        | [32, 256, 128]   | F32    | 2.563255ms | 0.000000    | 2.771479ms | 0.000000    |
+MatMulSlice        | [32, 4096, 4096] | F32    | 903.630232ms | 0.000000    | 901.355638ms | 0.000000    |
+MatMulSlice        | [4, 256, 128]    | F32    | 1.413658ms | 0.000000    | 3.008149ms | 0.000001    |
+MatMulSlice        | [64, 256, 128]   | F32    | 3.829209ms | 0.000000    | 15.692607ms | 0.000000    |
+MatMulSlice        | [8, 256, 128]    | F32    | 1.685171ms | 0.000000    | 1.747541ms | 0.000000    |
+Softmax            | [1, 4096, 4096]  | F32    |  473.476µs | 0.000244    |   594.83µs | 0.000244    |
+Softmax            | [32, 4096, 4096] | F32    | 3.444394ms | 0.000244    | 4.224006ms | 0.000244    |
+RMSNorm            | [1, 4096, 4096]  | F32    |   97.103µs | 0.000000    |  102.452µs | 0.000000    |
+RMSNorm            | [32, 4096, 4096] | F32    | 1.803763ms | 0.000000    | 2.226569ms | 0.000000    |
+RoPE               | [1, 4096, 4096]  | F32    |   506.93µs | 0.000000    |  580.359µs | 0.000000    |
+RoPE               | [32, 4096, 4096] | F32    | 23.095971ms | 0.000000    | 23.458047ms | 0.000000    |
+================================================================================================================================================================

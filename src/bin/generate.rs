@@ -334,6 +334,7 @@ fn main() -> anyhow::Result<()> {
             k_dim,
             v_dim,
             ffn_hidden,
+            model.config.num_attention_heads, // n_heads
             max_seq_len,
             memory.as_ref(),
             backend.clone(),
