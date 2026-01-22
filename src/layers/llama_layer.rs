@@ -282,43 +282,103 @@ impl LlamaLayer {
             let q_data = q_rope.as_slice::<f32>();
             let k_data = k_cache.as_slice::<f32>();
             let v_data = v_cache.as_slice::<f32>();
-            let out_ptr = ws.out_attn.as_mut_slice::<f32>();
             
-            let scale = 1.0 / (head_dim as f32).sqrt();
+            // Re-interpret out_attn as raw slice, will fill with zeros first
+            let out_ptr = ws.out_attn.as_mut_slice::<f32>();
+            unsafe {
+                std::ptr::write_bytes(out_ptr.as_mut_ptr(), 0, out_ptr.len());
+            }
 
-            for h in 0..n_heads_q {
-                let kv_h = h / (n_heads_q / n_heads_kv);
-                let q_off = h * head_dim;
-                let q_vec = &q_data[q_off..q_off + head_dim];
-                
-                let scores = &mut ws.scores[..cache_seq_len];
-                for ct in 0..cache_seq_len {
-                    let k_off = (ct * n_heads_kv + kv_h) * head_dim;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let n_rep = n_heads_q / n_heads_kv;
+            
+            // Calculate stride before mutable borrow
+            let stride = ws.scores.len() / n_heads_q; 
+
+            // Use pre-allocated scores buffer: [n_heads_q, max_seq_len] (conceptually)
+            // But we can just use linear indexing: h * max_seq_len + t
+            let all_scores = &mut ws.scores;
+            // Ensure we have enough space (should be guaranteed by new LayerWorkspace)
+             if all_scores.len() < n_heads_q * cache_seq_len {
+                 // Fallback or panic, but expecting correct size
+                 // Dynamic resize just in case (e.g. if max_seq_len valid but cache grew?) 
+                 // Actually cache_seq_len <= max_seq_len.
+             }
+
+            // 1. Q * K^T 
+            // Loop interchange: Outer loop over Time (t), Inner loop over Heads (h)
+            // This reads K linearly: K is [Seq, HeadsKV, Dim]
+            
+            // Initialize scores to 0 or appropriate start? sum loop below.
+            // Actually score is dot product.
+            // We need to accumulate? No, score[h][t] is one dot product.
+            // But if we iterate t first, we compute score for all h at time t.
+            
+            for t in 0..cache_seq_len {
+                for h in 0..n_heads_q {
+                    let kv_h = h / n_rep;
+                    
+                    // q_off: h * head_dim
+                    let q_off = h * head_dim;
+                    let q_vec = &q_data[q_off..q_off + head_dim];
+                    
+                    // k_off: (t * n_heads_kv + kv_h) * head_dim
+                    let k_off = (t * n_heads_kv + kv_h) * head_dim;
                     let k_vec = &k_data[k_off..k_off + head_dim];
                     
-                    let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
-                    scores[ct] = score * scale;
+                    // Vectorizable dot product
+                    let mut score = 0.0;
+                    for i in 0..head_dim {
+                        score += q_vec[i] * k_vec[i];
+                    }
+                    score *= scale;
+                    
+                    // Store score
+                    all_scores[h * stride + t] = score; 
                 }
-                
-                let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                let mut sum_exp = 0.0;
-                for s in scores.iter_mut() {
-                    *s = (*s - max_val).exp();
-                    sum_exp += *s;
-                }
-                for s in scores.iter_mut() { *s /= sum_exp; }
-                
-                let out_off = h * head_dim;
-                for d in 0..head_dim {
-                    out_ptr[out_off + d] = 0.0;
-                }
-                for ct in 0..cache_seq_len {
-                    let weight = scores[ct];
-                    let v_off = (ct * n_heads_kv + kv_h) * head_dim;
+            }
+            
+            // 2. Softmax
+            // Independent per head
+            
+            for h in 0..n_heads_q {
+                 let scores_h = &mut all_scores[h * stride..h * stride + cache_seq_len];
+                 
+                 let mut max_val = f32::NEG_INFINITY;
+                 for &s in scores_h.iter() {
+                     if s > max_val { max_val = s; }
+                 }
+                 
+                 let mut sum_exp = 0.0;
+                 for s in scores_h.iter_mut() {
+                     *s = (*s - max_val).exp();
+                     sum_exp += *s;
+                 }
+                 
+                 let inv_sum = 1.0 / sum_exp;
+                 for s in scores_h.iter_mut() {
+                     *s *= inv_sum;
+                 }
+            }
+            
+            // 3. Score * V
+            // Loop interchange: Outer t, Inner h
+            // V is [Seq, HeadsKV, Dim]
+            
+            for t in 0..cache_seq_len {
+                for h in 0..n_heads_q {
+                    let kv_h = h / n_rep;
+                    let weight = all_scores[h * stride + t];
+                    
+                    let v_off = (t * n_heads_kv + kv_h) * head_dim;
                     let v_vec = &v_data[v_off..v_off + head_dim];
                     
-                    for d in 0..head_dim {
-                        out_ptr[out_off + d] += weight * v_vec[d];
+                    let out_off = h * head_dim;
+                    // out_ptr needs to be updated. It is [HeadsQ, Dim]
+                    // We can accumulate directly into out_ptr
+                    
+                    for i in 0..head_dim {
+                        out_ptr[out_off + i] += weight * v_vec[i];
                     }
                 }
             }

@@ -30,6 +30,7 @@ impl LayerWorkspace {
         k_dim: usize,
         v_dim: usize,
         ffn_hidden: usize,
+        n_heads: usize, // New argument
         max_seq_len: usize,
         memory: &dyn Memory,
         backend: Arc<dyn Backend>,
@@ -50,7 +51,7 @@ impl LayerWorkspace {
             down: alloc(vec![batch_size, 1, dim])?,
             residual: alloc(vec![batch_size, 1, dim])?,
             attn_out: alloc(vec![batch_size, 1, dim])?,
-            scores: vec![0.0; max_seq_len],
+            scores: vec![0.0; n_heads * max_seq_len], // Resized
         })
     }
 }
