@@ -59,6 +59,11 @@ cargo build --target aarch64-linux-android --release
 cargo build --target aarch64-linux-android --release --bin generate
 ```
 
+### Usage Guidelines
+> [!IMPORTANT]
+> **GPU Attention (`--gpu-attn` / `--attn-gen`) Policy**:
+> Do NOT use the `--gpu-attn` (or `--attn-gen`) option when running with the GPU backend unless EXPLICITLY instructed by the user. Default to standard OpenCL execution.
+
 ### Deploy & Run (Android)
 Use `adb` to push artifacts to `/data/local/tmp/`.
 
@@ -77,6 +82,15 @@ adb shell "chmod +x /data/local/tmp/generate && \
   -b opencl \
   -n 128 \
   --temperature 0"
+  -b opencl \
+  -n 128 \
+  --temperature 0"
+
+# Run with prompt file (useful for eval/ files)
+adb shell "/data/local/tmp/generate \
+  --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b \
+  --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt \
+  -n 128"
 ```
 
 #### 3. Run Verification
