@@ -44,10 +44,20 @@ def main():
         print("Error: No timeseries data found.")
         sys.exit(1)
 
+    events = data.get("events", [])
+    parsed_events = {}
+    for e in events:
+        parsed_events[e["name"]] = parse_time(e["timestamp"])
+        
+    cpu_models = meta.get("cpu_models", [])
+
     # Prepare Data
     timestamps = [parse_time(x.get("timestamp")) for x in timeseries]
     temps = [x.get("temp_c", 0) for x in timeseries]
     gpu_freqs_mhz = [x.get("gpu_freq_hz", 0) / 1e6 for x in timeseries]
+    mem_used = [x.get("mem_used_mb", 0) for x in timeseries]
+    gpu_load = [x.get("gpu_load_percent", 0) for x in timeseries]
+    cpu_load = [x.get("cpu_load_percent", 0) for x in timeseries]
     
     # Handle variable number of CPU cores
     # cpu_freqs_khz is list of ints
@@ -63,7 +73,8 @@ def main():
             cpu_freqs[i].append(val / 1e6) # GHz
 
     # Plotting
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(10, 12), sharex=True)
+    fig, axes = plt.subplots(6, 1, figsize=(10, 18), sharex=True)
+    (ax1, ax2, ax3, ax4, ax5, ax6) = axes
     
     # Title with Metadata
     title_str = (f"Benchmark Profile: {meta.get('model', 'Unknown')} ({meta.get('backend', 'Unknown')})\n"
@@ -72,17 +83,24 @@ def main():
 
     # 1. Temperature
     ax1.plot(timestamps, temps, 'r-', label="Battery Temp")
-    ax1.set_ylabel("Temperature (°C)")
+    ax1.set_ylabel("Temp (°C)")
     ax1.grid(True)
     ax1.legend(loc="upper left")
     
     # 2. CPU Freqs
-    # Often 8 cores. Plotting them all can be messy. Group by cluster potentially?
-    # For now, plot all but separate colors.
+    # 2. CPU Freqs
     for i in range(num_cores):
         # Heuristic: Core 7 is usually prime, 4-6 big, 0-3 little
-        linestyle = '-' if i >= num_cores - 1 else ('--' if i >= num_cores - 4 else ':')
-        ax2.plot(timestamps, cpu_freqs[i], label=f"CPU{i}", linestyle=linestyle)
+        core_label = f"CPU{i}"
+        if i < len(cpu_models):
+            core_label += f" ({cpu_models[i]})"
+            
+        linestyle = '-' if "Gold" in core_label else ('--' if "Big" in core_label else ':')
+        # Fallback if no models detected
+        if not cpu_models:
+             linestyle = '-' if i >= num_cores - 1 else ('--' if i >= num_cores - 4 else ':')
+             
+        ax2.plot(timestamps, cpu_freqs[i], label=core_label, linestyle=linestyle)
     
     ax2.set_ylabel("CPU Freq (GHz)")
     ax2.grid(True)
@@ -91,13 +109,61 @@ def main():
     # 3. GPU Freq
     ax3.plot(timestamps, gpu_freqs_mhz, 'g-', label="GPU Freq")
     ax3.set_ylabel("GPU Freq (MHz)")
-    ax3.set_xlabel("Time")
     ax3.grid(True)
     ax3.legend(loc="upper left")
+    
+    # 4. Memory Usage
+    ax4.plot(timestamps, mem_used, 'b-', label="Mem Used")
+    ax4.set_ylabel("Memory (MB)")
+    ax4.grid(True)
+    ax4.legend(loc="upper left")
+    
+    # 5. CPU Load
+    ax5.plot(timestamps, cpu_load, 'm-', label="CPU Load")
+    ax5.set_ylabel("CPU Load (%)")
+    ax5.set_ylim(0, 105)
+    ax5.grid(True)
+    ax5.legend(loc="upper left")
+    
+    # 6. GPU Load
+    ax6.plot(timestamps, gpu_load, 'c-', label="GPU Load")
+    ax6.set_ylabel("GPU Load (%)")
+    ax6.set_xlabel("Time")
+    ax6.set_ylim(0, 105)
+    ax6.grid(True)
+    ax6.legend(loc="upper left")
 
     # Format Date Axis
     # Use auto formatter
     fig.autofmt_xdate()
+
+    # Add Event Markers to all plots
+    axes_list = [ax1, ax2, ax3, ax4, ax5, ax6]
+    
+    # Define regions
+    # ModelLoadStart -> PrefillStart (Load)
+    # PrefillStart -> DecodingStart (Prefill)
+    # DecodingStart -> End (Decode)
+    
+    regions = [
+        ("ModelLoadStart", "PrefillStart", "Load", "gray", 0.1),
+        ("PrefillStart", "DecodingStart", "Prefill", "orange", 0.1),
+        ("DecodingStart", "End", "Decode", "green", 0.1),
+    ]
+    
+    for start_evt, end_evt, label, color, alpha in regions:
+        if start_evt in parsed_events and end_evt in parsed_events:
+            start_t = parsed_events[start_evt]
+            end_t = parsed_events[end_evt]
+            # Convert to matplotlib date format if needed, but plot takes datetime objects directly usually
+            for ax in axes_list:
+                ax.axvspan(start_t, end_t, color=color, alpha=alpha, label=label if ax == ax1 else "")
+                
+    # Re-legend ax1 to include regions
+    handles, labels = ax1.get_legend_handles_labels()
+    # Deduplicate
+    by_label = dict(zip(labels, handles))
+    ax1.legend(by_label.values(), by_label.keys(), loc="upper left")
 
     plt.tight_layout()
 
