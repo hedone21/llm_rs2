@@ -18,6 +18,10 @@ struct Args {
     #[arg(short, long, default_value = "models/llama3.2-1b")]
     model_path: String,
 
+    /// Path to a file containing the prompt. Overrides --prompt if set.
+    #[arg(long)]
+    prompt_file: Option<String>,
+
     #[arg(short, long, default_value = "Hello, world! I am a")]
     prompt: String,
 
@@ -179,7 +183,12 @@ fn main() -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!(e))?;
 
     // 3. Prompt
-    let prompt = &args.prompt;
+    let prompt = if let Some(path) = &args.prompt_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read prompt file {}: {}", path, e))?
+    } else {
+        args.prompt.clone()
+    };
     println!("Prompt: {}", prompt);
 
     let encoding = tokenizer
@@ -406,9 +415,24 @@ fn main() -> anyhow::Result<()> {
             // Streaming print
             let current_text = tokenizer.decode(&tokens, true).unwrap_or_default();
             if current_text.len() > printed_len {
-                print!("{}", &current_text[printed_len..]);
-                stdout.flush().ok();
-                printed_len = current_text.len();
+                 // Check if we are at a valid char boundary. 
+                 // If not (e.g. we are in the middle of a multi-byte char sequence from previous partial decode?), 
+                 // we might need to be careful. 
+                 // However, tokenizer.decode should return valid strings. 
+                 // The issue is likely that `printed_len` (bytes) might not align with `current_text` if decoding changed slightly?
+                 // Or `printed_len` was set from a previous string.
+                 
+                 // Safe slicing:
+                 if let Some(substring) = current_text.get(printed_len..) {
+                     print!("{}", substring);
+                     stdout.flush().ok();
+                     printed_len = current_text.len();
+                 } else {
+                     // Verify if printed_len is valid. 
+                     // Often tokenizers re-decode slightly differently or we accumulate.
+                     // A safer way is: just print what's new from this round's decode, but we need to track bytes.
+                     // Let's just catch the case where we can't slice.
+                 }
             }
 
             if next_token_id == eos_id {

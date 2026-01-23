@@ -278,16 +278,44 @@ impl LlamaLayer {
             backend.attention_gen(&q_rope, &k_cache, &v_cache, &mut ws.out_attn,
                                   n_heads_q, n_heads_kv, head_dim, cache_seq_len)?;
         } else {
-            // CPU attention path
-            let q_data = q_rope.as_slice::<f32>();
-            let k_data = k_cache.as_slice::<f32>();
-            let v_data = v_cache.as_slice::<f32>();
-            
-            // Re-interpret out_attn as raw slice, will fill with zeros first
-            let out_ptr = ws.out_attn.as_mut_slice::<f32>();
-            unsafe {
-                std::ptr::write_bytes(out_ptr.as_mut_ptr(), 0, out_ptr.len());
-            }
+            // CPU attention path (Fallback for OpenCL or native CPU)
+            let mut q_vec = Vec::new();
+            let mut k_vec = Vec::new();
+            let mut v_vec = Vec::new();
+            let mut out_vec = Vec::new(); // Only needed for OpenCL writeback
+
+            let is_opencl = backend.name() == "OpenCL";
+
+            let (q_data, k_data, v_data, out_ptr) = if is_opencl {
+                 // OpenCL: Must read back to CPU
+                 q_vec.resize(q_rope.size() / 4, 0.0);
+                 k_vec.resize(k_cache.size() / 4, 0.0);
+                 v_vec.resize(v_cache.size() / 4, 0.0);
+                 out_vec.resize(ws.out_attn.size() / 4, 0.0);
+
+                 // Helper to cast slice
+                 fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
+                     unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
+                 }
+
+                 backend.read_buffer(&q_rope, as_u8_mut(&mut q_vec))?;
+                 backend.read_buffer(&k_cache, as_u8_mut(&mut k_vec))?;
+                 backend.read_buffer(&v_cache, as_u8_mut(&mut v_vec))?;
+
+                 (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
+            } else {
+                 // Native CPU: Direct slice access
+                 (
+                     q_rope.as_slice::<f32>(),
+                     k_cache.as_slice::<f32>(),
+                     v_cache.as_slice::<f32>(),
+                     ws.out_attn.as_mut_slice::<f32>()
+                 )
+            };
+
+            // Re-interpret out_attn (or out_vec) as raw slice, will fill with zeros first
+            // Note: out_ptr is &mut [f32]
+            for x in out_ptr.iter_mut() { *x = 0.0; }
 
             let scale = 1.0 / (head_dim as f32).sqrt();
             let n_rep = n_heads_q / n_heads_kv;
@@ -308,11 +336,6 @@ impl LlamaLayer {
             // 1. Q * K^T 
             // Loop interchange: Outer loop over Time (t), Inner loop over Heads (h)
             // This reads K linearly: K is [Seq, HeadsKV, Dim]
-            
-            // Initialize scores to 0 or appropriate start? sum loop below.
-            // Actually score is dot product.
-            // We need to accumulate? No, score[h][t] is one dot product.
-            // But if we iterate t first, we compute score for all h at time t.
             
             for t in 0..cache_seq_len {
                 for h in 0..n_heads_q {
@@ -381,6 +404,17 @@ impl LlamaLayer {
                         out_ptr[out_off + i] += weight * v_vec[i];
                     }
                 }
+            }
+
+            if is_opencl {
+                // Determine size from the actual out_vec we used
+                let size_bytes = out_vec.len() * 4;
+                let buf = Galloc::new().alloc(size_bytes, DType::F32)?;
+                unsafe { std::ptr::copy_nonoverlapping(out_vec.as_ptr(), buf.as_mut_ptr() as *mut f32, out_vec.len()); }
+                let cpu_out = Tensor::new(ws.out_attn.shape().clone(), buf, Arc::new(CpuBackend::new()));
+                // Use backend.copy_from to transfer back to GPU tensor ws.out_attn
+                // Note: ws.out_attn is &mut Tensor, so this updates the GPU buffer contents
+                ws.out_attn = backend.copy_from(&cpu_out)?;
             }
         }
         
