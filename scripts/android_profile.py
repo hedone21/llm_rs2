@@ -246,6 +246,7 @@ def main():
         print(f"[Results] TTFT: {benchmark_results.get('ttft_ms', 'N/A')} ms")
     
     final_data = {
+        "version": 1,
         "metadata": metadata,
         "baseline": baseline_stats,
         "benchmark_results": benchmark_results,
