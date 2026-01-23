@@ -27,6 +27,7 @@ class DeviceMonitor:
         self.data_buffer = []
         self.gpu_path = self.find_gpu_clk_path()
         self.gpu_load_path = self.find_gpu_load_path()
+        self.last_cpu_stats = None
         
     def find_gpu_clk_path(self):
         paths = [
@@ -62,6 +63,33 @@ class DeviceMonitor:
             return freqs
         except:
             return []
+
+    def get_cpu_usage(self):
+        try:
+            output = run_adb_command('shell "cat /proc/stat"')
+            # cpu  2239 0 2125 102938 ...
+            first_line = output.splitlines()[0]
+            if not first_line.startswith('cpu '): return 0.0
+            
+            parts = [int(p) for p in first_line.split()[1:]]
+            # user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+            
+            idle = parts[3] + (parts[4] if len(parts) > 4 else 0)
+            non_idle = parts[0] + parts[1] + parts[2] + (parts[5] if len(parts) > 5 else 0) + (parts[6] if len(parts) > 6 else 0) + (parts[7] if len(parts) > 7 else 0)
+            total = idle + non_idle
+            
+            usage = 0.0
+            if self.last_cpu_stats:
+                prev_idle, prev_total = self.last_cpu_stats
+                total_d = total - prev_total
+                idle_d = idle - prev_idle
+                if total_d > 0:
+                    usage = (total_d - idle_d) / total_d * 100.0
+            
+            self.last_cpu_stats = (idle, total)
+            return usage
+        except:
+             return 0.0
 
     def get_gpu_freq(self):
         if not self.gpu_path: return 0
@@ -115,11 +143,17 @@ class DeviceMonitor:
         temp = self.get_temperature()
         cpu_freqs = self.get_cpu_freqs()
         gpu_freq = self.get_gpu_freq()
+        mem_used = self.get_memory_info()
+        gpu_load = self.get_gpu_load()
+        cpu_load = self.get_cpu_usage()
         return {
             "timestamp": timestamp,
             "temp_c": temp,
             "gpu_freq_hz": gpu_freq,
-            "cpu_freqs_khz": cpu_freqs
+            "cpu_freqs_khz": cpu_freqs,
+            "mem_used_mb": mem_used,
+            "gpu_load_percent": gpu_load,
+            "cpu_load_percent": cpu_load
         }
 
     def capture_baseline(self, duration=5.0):
@@ -146,6 +180,38 @@ class DeviceMonitor:
             "avg_gpu_load_percent": round(avg_gpu, 2),
             "avg_start_temp_c": round(avg_temp, 2)
         }
+
+    def get_cpu_core_info(self):
+        try:
+            # Get max freqs for all cores
+            output = run_adb_command('shell "cat /sys/devices/system/cpu/cpu*/cpufreq/cpuinfo_max_freq"')
+            freqs = [int(f) for f in output.split()]
+            if not freqs: return []
+            
+            # Simple clustering
+            unique_freqs = sorted(list(set(freqs)))
+            
+            # Label based on rank
+            # 1 cluster: All same
+            # 2 clusters: Little, Big
+            # 3 clusters: Little, Big, Gold
+            
+            mapping = {}
+            if len(unique_freqs) == 1:
+                mapping[unique_freqs[0]] = "Core"
+            elif len(unique_freqs) == 2:
+                mapping[unique_freqs[0]] = "Little"
+                mapping[unique_freqs[1]] = "Big"
+            elif len(unique_freqs) >= 3:
+                mapping[unique_freqs[0]] = "Little"
+                # If more than 3, map intermediates to Big, max to Gold
+                for f in unique_freqs[1:-1]:
+                    mapping[f] = "Big"
+                mapping[unique_freqs[-1]] = "Gold"
+            
+            return [mapping.get(f, "Unknown") for f in freqs]
+        except:
+            return []
 
     def start(self):
         self.stop_event.clear()
@@ -219,37 +285,79 @@ def main():
     # 2. Capture Baseline
     baseline_stats = monitor.capture_baseline(duration=5.0)
     
-    # 3. Running Benchmark
+    # 3. Running Benchmark & Real-time Parsing
     monitor.start()
     print(f"[Runner] Executing: {args.cmd}")
     
+    events = []
+    full_stdout = []
+    return_code = 0
+    start_t = time.time()
+    
     try:
-        start_t = time.time()
         full_cmd = f'adb shell "{args.cmd}"'
-        proc = subprocess.run(full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(
+            full_cmd, 
+            shell=True, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE, 
+            text=True,
+            bufsize=1, # Line buffered
+            universal_newlines=True
+        )
+        
+        # Read stdout line by line
+        for line in proc.stdout:
+            print(line, end='') # Echo output
+            full_stdout.append(line)
+            
+            # Check for events
+            # [Profile] Event: ModelLoadStart
+            if "[Profile] Event:" in line:
+                parts = line.strip().split(":", 1)
+                if len(parts) == 2:
+                    event_name = parts[1].strip()
+                    events.append({
+                        "name": event_name,
+                        "timestamp": datetime.now().isoformat()
+                    })
+
+        proc.wait()
+        return_code = proc.returncode
         duration = time.time() - start_t
         
-        print(f"[Runner] Finished in {duration:.2f}s (Exit: {proc.returncode})")
-        if proc.returncode != 0:
-            print(f"[Error] Stderr: {proc.stderr}")
+        print(f"[Runner] Finished in {duration:.2f}s (Exit: {return_code})")
+        
+        if return_code != 0:
+             # Stderr needs to be read separately if we care, 
+             # but Popen consumes stdout. stderr might block? 
+             # For simple usage, we just assume stderr isn't huge or let Popen handle buffering.
+             stderr_out = proc.stderr.read()
+             if stderr_out: print(f"[Error] Stderr: {stderr_out}")
             
     except KeyboardInterrupt:
         print("\n[Runner] Interrupted.")
-        proc = None
+        if 'proc' in locals(): proc.terminate()
+        return_code = -1
     finally:
         monitor.stop()
 
     # 4. Parse Results & Construct JSON
     benchmark_results = {}
-    if proc and proc.returncode == 0:
-        benchmark_results = parse_results(proc.stdout)
+    if return_code == 0:
+        stdout_str = "".join(full_stdout)
+        benchmark_results = parse_results(stdout_str)
         print(f"[Results] TTFT: {benchmark_results.get('ttft_ms', 'N/A')} ms")
+    
+    cpu_models = monitor.get_cpu_core_info()
+    metadata['cpu_models'] = cpu_models
     
     final_data = {
         "version": 1,
         "metadata": metadata,
         "baseline": baseline_stats,
         "benchmark_results": benchmark_results,
+        "events": events,
         "timeseries": monitor.data_buffer
     }
     

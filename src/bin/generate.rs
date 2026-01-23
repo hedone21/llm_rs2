@@ -157,6 +157,7 @@ fn main() -> anyhow::Result<()> {
     let model_path = &args.model_path;
 
     // 1. Setup
+    println!("[Profile] Event: ModelLoadStart");
     println!("Loading model from {}", model_path);
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "cpu" => Arc::new(CpuBackend::new()),
@@ -258,6 +259,7 @@ fn main() -> anyhow::Result<()> {
 
     // === PREFILL PHASE ===
     {
+        println!("[Profile] Event: PrefillStart");
         let process_len = tokens.len();
         if process_len > max_seq_len {
             anyhow::bail!(
@@ -323,6 +325,7 @@ fn main() -> anyhow::Result<()> {
 
     // === GENERATION PHASE ===
     {
+        println!("[Profile] Event: DecodingStart");
         // Pre-allocate workspace for generation
         let q_dim = hidden_size;
         let k_dim = hidden_size / 4;
@@ -443,6 +446,7 @@ fn main() -> anyhow::Result<()> {
 
     // 6. Output results
     println!("\nDone.");
+    println!("[Profile] Event: End");
     // let full_text = tokenizer.decode(&tokens[input_ids.len()..], true).map_err(|e| anyhow::anyhow!(e))?;
     // println!("Generated: {}", full_text);
     println!("TTFT: {:.2} ms", ttft_ms);
