@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "metadata": {
+    "model": "llama3.2-1b",
+    "num_tokens": 2048,
+    "backend": "opencl",
+    "prefill_type": "short_len",
+    "date": "2026-01-29T08:10:36.086246",
+    "command": "/data/local/tmp/generate --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt --num-tokens 2048 -b opencl",
+    "cpu_models": []
+  },
+  "baseline": {
+    "avg_memory_used_mb": 0.0,
+    "avg_gpu_load_percent": 0.0,
+    "avg_start_temp_c": 0.0
+  },
+  "benchmark_results": {},
+  "events": [],
+  "timeseries": [
+    {
+      "timestamp": "2026-01-29T08:10:41.197364",
+      "temp_c": 0.0,
+      "gpu_freq_hz": 0,
+      "cpu_freqs_khz": [],
+      "mem_used_mb": 0.0,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 0.0
+    }
+  ]
+}
