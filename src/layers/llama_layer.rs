@@ -8,6 +8,7 @@ use anyhow::Result;
 use crate::memory::galloc::Galloc;
 use crate::backend::cpu::CpuBackend;
 use std::sync::Arc;
+use rayon::prelude::*;
 
 pub struct LlamaLayer {
     // Attention
@@ -333,18 +334,30 @@ impl LlamaLayer {
                  // Actually cache_seq_len <= max_seq_len.
              }
 
-            // 1. Q * K^T 
-            // Loop interchange: Outer loop over Time (t), Inner loop over Heads (h)
-            // This reads K linearly: K is [Seq, HeadsKV, Dim]
+
+            // Parallelize over heads
+            // 1. Prepare mutable slices for scores and output
+            //    scores: [n_heads_q, max_seq_len] -> split into chunks of max_seq_len
+            //    out:    [n_heads_q, head_dim] -> split into chunks of head_dim
             
-            for t in 0..cache_seq_len {
-                for h in 0..n_heads_q {
-                    let kv_h = h / n_rep;
-                    
-                    // q_off: h * head_dim
-                    let q_off = h * head_dim;
-                    let q_vec = &q_data[q_off..q_off + head_dim];
-                    
+            // Ensure we only process up to n_heads_q chunks (in case buffer is larger)
+            let scores_chunks = ws.scores.par_chunks_mut(stride).take(n_heads_q);
+            let out_chunks = out_ptr.par_chunks_mut(head_dim).take(n_heads_q);
+
+            scores_chunks.zip(out_chunks).enumerate().for_each(|(h, (scores_h, out_h))| {
+                let kv_h = h / n_rep;
+                
+                // --- Step 1: Q * K^T ---
+                
+                // q_off: h * head_dim
+                let q_off = h * head_dim;
+                let q_vec = &q_data[q_off..q_off + head_dim];
+                
+                // We only need to compute scores up to cache_seq_len
+                // The scores buffer might be larger (max_seq_len), but we only touch the active part
+                // scores_h is of size stride (= max_seq_len probably)
+                
+                for t in 0..cache_seq_len {
                     // k_off: (t * n_heads_kv + kv_h) * head_dim
                     let k_off = (t * n_heads_kv + kv_h) * head_dim;
                     let k_vec = &k_data[k_off..k_off + head_dim];
@@ -356,55 +369,47 @@ impl LlamaLayer {
                     }
                     score *= scale;
                     
-                    // Store score
-                    all_scores[h * stride + t] = score; 
+                    scores_h[t] = score; 
                 }
-            }
-            
-            // 2. Softmax
-            // Independent per head
-            
-            for h in 0..n_heads_q {
-                 let scores_h = &mut all_scores[h * stride..h * stride + cache_seq_len];
-                 
-                 let mut max_val = f32::NEG_INFINITY;
-                 for &s in scores_h.iter() {
-                     if s > max_val { max_val = s; }
-                 }
-                 
-                 let mut sum_exp = 0.0;
-                 for s in scores_h.iter_mut() {
-                     *s = (*s - max_val).exp();
-                     sum_exp += *s;
-                 }
-                 
-                 let inv_sum = 1.0 / sum_exp;
-                 for s in scores_h.iter_mut() {
-                     *s *= inv_sum;
-                 }
-            }
-            
-            // 3. Score * V
-            // Loop interchange: Outer t, Inner h
-            // V is [Seq, HeadsKV, Dim]
-            
-            for t in 0..cache_seq_len {
-                for h in 0..n_heads_q {
-                    let kv_h = h / n_rep;
-                    let weight = all_scores[h * stride + t];
+                
+                // --- Step 2: Softmax ---
+                
+                // Only consider the valid part of scores_h
+                let active_scores = &mut scores_h[0..cache_seq_len];
+                
+                let mut max_val = f32::NEG_INFINITY;
+                for &s in active_scores.iter() {
+                    if s > max_val { max_val = s; }
+                }
+                
+                let mut sum_exp = 0.0;
+                for s in active_scores.iter_mut() {
+                    *s = (*s - max_val).exp();
+                    sum_exp += *s;
+                }
+                
+                let inv_sum = 1.0 / sum_exp;
+                for s in active_scores.iter_mut() {
+                    *s *= inv_sum;
+                }
+
+                // --- Step 3: Score * V ---
+                
+                // out_h should be zeroed before accumulation? 
+                // The previous serial code did: for x in out_ptr.iter_mut() { *x = 0.0; } BEFORE the loop.
+                // So out_h is already zeroed.
+                
+                for t in 0..cache_seq_len {
+                    let weight = active_scores[t];
                     
                     let v_off = (t * n_heads_kv + kv_h) * head_dim;
                     let v_vec = &v_data[v_off..v_off + head_dim];
                     
-                    let out_off = h * head_dim;
-                    // out_ptr needs to be updated. It is [HeadsQ, Dim]
-                    // We can accumulate directly into out_ptr
-                    
                     for i in 0..head_dim {
-                        out_ptr[out_off + i] += weight * v_vec[i];
+                        out_h[i] += weight * v_vec[i];
                     }
                 }
-            }
+            });
 
             if is_opencl {
                 // Determine size from the actual out_vec we used
