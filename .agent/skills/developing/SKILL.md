@@ -85,12 +85,29 @@ Run this script before verification to ensure code style and linting are correct
 ## 5. Development Tips
 
 ### Kernel Development (OpenCL)
+> [!WARNING]
+> **DO NOT modify `.cl` kernel files unless explicitly instructed by the user.** These are highly optimized and stable.
+
 - `.cl` files are in `kernels/`.
 - Embedded into the binary at build time.
 - **Workflow**: Modify `.cl` -> Build `test_backend` -> Push -> Run on device.
 - **Debugging**: Use `printf` inside OpenCL kernels (requires flushing stdout) or check `test_backend` output for mismatches.
 
-## 6. Cheat Sheet
+## 6. Finalizing (Definition of Done)
+
+ALWAYS perform these steps before marking a task as complete:
+1.  **Update Documentation**: Reflect any architectural changes, new commands, or findings in `PROJECT_CONTEXT.md` or relevant `GUIDE.md` files.
+2.  **Update Artifacts**: Ensure `task.md` and `walkthrough.md` are up to date.
+
+    **Update Artifacts**: Ensure `task.md` and `walkthrough.md` are up to date.
+
+## 7. Version Control & Commits
+
+If the user requests to commit changes:
+1.  **Scope**: Commit **only** the changes relevant to the current task. Stage files selectively (`git add <file>`).
+2.  **Style**: Always check `git log` first to follow the project's existing commit message conventions.
+
+## 8. Cheat Sheet
 
 | Action | Command |
 | :--- | :--- |
