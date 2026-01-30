@@ -66,6 +66,7 @@ def analyze_json(filepath):
         "model": meta.get("model", "?"),
         "input": meta.get("prefill_type", "?"),
         "n_tokens": meta.get("num_tokens", "?"),
+        "foreground_app": meta.get("foreground_app", "-"),
         "ttft": f"{ttft:.1f}" if isinstance(ttft, (int, float)) else ttft,
         "tbt": f"{tbt:.2f}" if isinstance(tbt, (int, float)) else tbt,
         "tps": f"{tps:.1f}" if isinstance(tps, (int, float)) else tps,
@@ -86,12 +87,13 @@ def generate_markdown(records):
     md += "- **Recent Run**: {}\n\n".format(records[0]["date"] if records else "N/A")
     
     md += "## Detailed Results\n\n"
-    md += "| Date | Model | Backend | Input | Tokens | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Data | Plot |\n"
-    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    md += "| Date | Model | Backend | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Data | Plot |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
     
     for r in records:
         link = f"[JSON](data/{r['filename']})"
-        row = f"| {r['date']} | {r['model']} | {r['backend']} | {r['input']} | {r['n_tokens']} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {link} | {r.get('plot_link', '-')} |\n"
+        fg_app = r.get('foreground_app', '-')
+        row = f"| {r['date']} | {r['model']} | {r['backend']} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {link} | {r.get('plot_link', '-')} |\n"
         md += row
         
     md += "\n\n## Graphical Analysis\n"

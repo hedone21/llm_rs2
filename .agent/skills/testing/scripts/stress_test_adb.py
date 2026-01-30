@@ -65,7 +65,7 @@ def main():
     run_adb_command("shell input keyevent KEYCODE_MENU") # Unlock if no password
 
     # 1. Start the main workload in the background
-    bg_cmd = f"shell \"nohup {args.cmd} > /data/local/tmp/stress_output.log 2>&1 & echo \$!\""
+    bg_cmd = f"shell \"nohup {args.cmd} > /data/local/tmp/stress_output.log 2>&1 & echo $!\""
     pid = run_adb_command(bg_cmd)
     
     if not pid:
@@ -84,9 +84,9 @@ def main():
     try:
         while time.time() - start_time < args.duration:
             # Check if process is still running
-            check_cmd = f"shell \"ps -p {pid}\""
+            check_cmd = f"shell \"ps | grep {pid}\""
             res = run_adb_command(check_cmd)
-            if pid not in res:
+            if res is None or pid not in res:
                 print(f"[Stress] Process {pid} finished early or crashed.")
                 break
             time.sleep(1)
