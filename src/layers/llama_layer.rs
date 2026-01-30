@@ -119,58 +119,54 @@ impl LlamaLayer {
                  (q_rope.as_slice::<f32>(), k_cache.as_slice::<f32>(), v_cache.as_slice::<f32>(), out_attn.as_mut_slice::<f32>())
             };
             
-            let scale = 1.0 / (head_dim as f32).sqrt();
-            
-            for b in 0..batch_size {
-                for h in 0..n_heads_q {
-                    let kv_h = h / (n_heads_q / n_heads_kv); 
-                    
-                    for t in 0..seq_len {
-                         let q_off = ((b * seq_len + t) * n_heads_q + h) * head_dim;
-                         let q_vec = &q_data[q_off..q_off + head_dim];
-                         
-                         let mut scores = vec![0.0; cache_seq_len];
-                         for ct in 0..cache_seq_len {
-                             let global_q_pos = start_pos + t;
-                             let global_k_pos = ct;
-                             
-                             if global_k_pos > global_q_pos {
-                                 scores[ct] = f32::NEG_INFINITY;
-                                 continue;
-                             }
-                             
-                             let k_off = ((b * kv_cache.max_seq_len + ct) * n_heads_kv + kv_h) * head_dim;
-                             let k_vec = &k_data[k_off..k_off + head_dim];
-                             
-                             let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
-                             scores[ct] = score * scale;
-                         }
-                         
-                         let max_val = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                         let mut sum_exp = 0.0;
-                         for s in scores.iter_mut() {
-                             *s = (*s - max_val).exp();
-                             sum_exp += *s;
-                         }
-                         for s in scores.iter_mut() { *s /= sum_exp; }
-                         
-                         let mut out_vec = vec![0.0; head_dim];
-                         for ct in 0..cache_seq_len {
-                             let weight = scores[ct];
-                             let v_off = ((b * kv_cache.max_seq_len + ct) * n_heads_kv + kv_h) * head_dim;
-                             let v_vec = &v_data[v_off..v_off + head_dim];
-                             
-                             for d in 0..head_dim {
-                                 out_vec[d] += weight * v_vec[d];
-                             }
-                         }
-                         
-                         let out_off = ((b * seq_len + t) * n_heads_q + h) * head_dim;
-                         for d in 0..head_dim {
-                             out_ptr[out_off + d] = out_vec[d];
-                         }
-                    }
-                }
+            use crate::layers::attention::flash_attention_forward;
+
+            let chunk_q_stride = seq_len * n_heads_q * head_dim;
+            let chunk_out_stride = seq_len * n_heads_q * head_dim;
+            // KV Cache is strided by max_seq_len because it is allocated as [Batch, MaxSeq, ...]
+            let chunk_k_stride = kv_cache.max_seq_len * n_heads_kv * head_dim; 
+
+            // Iterate over batch. 
+            // We use chunks_mut for out_ptr to satisfy borrow checker.
+            for (b, out_batch) in out_ptr.chunks_mut(chunk_out_stride).enumerate() {
+                 let q_start = b * chunk_q_stride;
+                 let k_start = b * chunk_k_stride;
+                 let v_start = b * chunk_k_stride; // V has same layout as K in cache (usually)
+
+                 let q_slice = &q_data[q_start..q_start + chunk_q_stride];
+                 
+                 // K/V Cache: We only want the VALID part [0..cache_seq_len]
+                 // But the buffer for this batch is huge (max_seq_len).
+                 // We pass the slice covering valid data.
+                 // Strides passed to flash_attention must match this slice logic.
+                 // If we pass a slice starting at k_start, the "row 0" is k_data[k_start].
+                 // The "row 1" is k_data[k_start + k_stride].
+                 // k_stride = n_heads_kv * head_dim.
+                 // This matches the cache layout (dense in seq dimension).
+                 // The valid data length is cache_seq_len.
+                 
+                 let k_valid_len = cache_seq_len * n_heads_kv * head_dim;
+                 let k_slice = &k_data[k_start..k_start + k_valid_len];
+                 let v_slice = &v_data[v_start..v_start + k_valid_len];
+
+                 flash_attention_forward(
+                     q_slice,
+                     k_slice,
+                     v_slice,
+                     out_batch,
+                     n_heads_q,
+                     n_heads_kv,
+                     seq_len,
+                     cache_seq_len,
+                     head_dim,
+                     n_heads_q * head_dim, // q_stride
+                     n_heads_kv * head_dim, // k_stride
+                     n_heads_kv * head_dim, // v_stride
+                     n_heads_q * head_dim, // out_stride
+                     start_pos, // q_start_pos for causal mask
+                     32, // br
+                     32, // bc
+                 );
             }
         }
 
