@@ -1,0 +1,267 @@
+{
+  "version": 1,
+  "metadata": {
+    "model": "llama3.2-1b",
+    "num_tokens": 128,
+    "backend": "opencl",
+    "prefill_type": "short_len",
+    "date": "2026-01-30T14:27:21.671325",
+    "command": "/data/local/tmp/generate --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt --num-tokens 128 -b opencl",
+    "cpu_models": [
+      "Little",
+      "Little",
+      "Little",
+      "Little",
+      "Little",
+      "Little",
+      "Big",
+      "Big"
+    ]
+  },
+  "baseline": {
+    "avg_memory_used_mb": 3486.83,
+    "avg_gpu_load_percent": 0.0,
+    "avg_start_temp_c": 41.58
+  },
+  "benchmark_results": {
+    "ttft_ms": 212.53,
+    "tbt_ms": 52.7,
+    "tokens_per_sec": 19.0
+  },
+  "events": [
+    {
+      "name": "ModelLoadStart",
+      "timestamp": "2026-01-30T14:27:27.135264"
+    },
+    {
+      "name": "PrefillStart",
+      "timestamp": "2026-01-30T14:27:33.160598"
+    },
+    {
+      "name": "DecodingStart",
+      "timestamp": "2026-01-30T14:27:33.343438"
+    },
+    {
+      "name": "End",
+      "timestamp": "2026-01-30T14:27:40.037207"
+    }
+  ],
+  "timeseries": [
+    {
+      "timestamp": "2026-01-30T14:27:27.096962",
+      "temp_c": 41.5,
+      "gpu_freq_hz": 734000000,
+      "cpu_freqs_khz": [
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 3513.53515625,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 0.0
+    },
+    {
+      "timestamp": "2026-01-30T14:27:28.239435",
+      "temp_c": 41.5,
+      "gpu_freq_hz": 734000000,
+      "cpu_freqs_khz": [
+        3072000,
+        3072000,
+        3072000,
+        3072000,
+        3072000,
+        3072000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 3665.50390625,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 12.442922374429223
+    },
+    {
+      "timestamp": "2026-01-30T14:27:29.343717",
+      "temp_c": 41.5,
+      "gpu_freq_hz": 734000000,
+      "cpu_freqs_khz": [
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 3934.91015625,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 12.557603686635947
+    },
+    {
+      "timestamp": "2026-01-30T14:27:30.434464",
+      "temp_c": 41.5,
+      "gpu_freq_hz": 734000000,
+      "cpu_freqs_khz": [
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 4074.35546875,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 12.100456621004566
+    },
+    {
+      "timestamp": "2026-01-30T14:27:31.528945",
+      "temp_c": 41.5,
+      "gpu_freq_hz": 734000000,
+      "cpu_freqs_khz": [
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 7002.12890625,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 17.31651376146789
+    },
+    {
+      "timestamp": "2026-01-30T14:27:32.621059",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 734000000,
+      "cpu_freqs_khz": [
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5125.140625,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 16.173120728929387
+    },
+    {
+      "timestamp": "2026-01-30T14:27:33.718685",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 900000000,
+      "cpu_freqs_khz": [
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        3532800,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5330.0,
+      "gpu_load_percent": 0.0,
+      "cpu_load_percent": 12.356979405034325
+    },
+    {
+      "timestamp": "2026-01-30T14:27:34.817654",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 967000000,
+      "cpu_freqs_khz": [
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5296.9453125,
+      "gpu_load_percent": 52.713732481434505,
+      "cpu_load_percent": 13.40782122905028
+    },
+    {
+      "timestamp": "2026-01-30T14:27:35.943694",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 967000000,
+      "cpu_freqs_khz": [
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5299.49609375,
+      "gpu_load_percent": 42.31732815943639,
+      "cpu_load_percent": 13.504464285714285
+    },
+    {
+      "timestamp": "2026-01-30T14:27:37.073302",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 900000000,
+      "cpu_freqs_khz": [
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5306.12109375,
+      "gpu_load_percent": 40.82612948633324,
+      "cpu_load_percent": 13.785310734463277
+    },
+    {
+      "timestamp": "2026-01-30T14:27:38.186473",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 832000000,
+      "cpu_freqs_khz": [
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5311.046875,
+      "gpu_load_percent": 44.83085247648354,
+      "cpu_load_percent": 13.023782559456398
+    },
+    {
+      "timestamp": "2026-01-30T14:27:39.302669",
+      "temp_c": 40.9,
+      "gpu_freq_hz": 900000000,
+      "cpu_freqs_khz": [
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        2400000,
+        1017600,
+        1017600
+      ],
+      "mem_used_mb": 5303.453125,
+      "gpu_load_percent": 42.44364616611037,
+      "cpu_load_percent": 13.534675615212526
+    }
+  ]
+}
