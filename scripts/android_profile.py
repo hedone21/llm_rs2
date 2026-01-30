@@ -273,6 +273,7 @@ def main():
     parser.add_argument("--interval", type=float, default=1.0, help="Profiling interval in seconds")
     parser.add_argument("--output-dir", default=".", help="Directory to save JSON output")
     parser.add_argument("--name", help="Custom name for output file (optional)")
+    parser.add_argument("--foreground-app", help="Foreground app context (e.g., 'YouTube', 'Chrome', 'idle')")
     
     args = parser.parse_args()
 
@@ -281,6 +282,8 @@ def main():
     metadata = extract_metadata(args.cmd)
     metadata['date'] = datetime.now().isoformat()
     metadata['command'] = args.cmd
+    if args.foreground_app:
+        metadata['foreground_app'] = args.foreground_app
     
     # 2. Capture Baseline
     baseline_stats = monitor.capture_baseline(duration=5.0)
