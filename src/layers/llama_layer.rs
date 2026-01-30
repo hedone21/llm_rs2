@@ -336,76 +336,309 @@ impl LlamaLayer {
             //    scores: [n_heads_q, max_seq_len] -> split into chunks of max_seq_len
             //    out:    [n_heads_q, head_dim] -> split into chunks of head_dim
             
-            // Ensure we only process up to n_heads_q chunks (in case buffer is larger)
-            let scores_chunks = ws.scores.par_chunks_mut(stride).take(n_heads_q);
-            let out_chunks = out_ptr.par_chunks_mut(head_dim).take(n_heads_q);
+            // Parallelize over heads for longer sequences, Serial for short (to avoid overhead)
+            let use_parallel = cache_seq_len >= 256;
+            
+            if use_parallel {
+                let scores_chunks = ws.scores.par_chunks_mut(stride).take(n_heads_q);
+                let out_chunks = out_ptr.par_chunks_mut(head_dim).take(n_heads_q);
 
-            scores_chunks.zip(out_chunks).enumerate().for_each(|(h, (scores_h, out_h))| {
-                let kv_h = h / n_rep;
-                
-                // --- Step 1: Q * K^T ---
-                
-                // q_off: h * head_dim
-                let q_off = h * head_dim;
-                let q_vec = &q_data[q_off..q_off + head_dim];
-                
-                // We only need to compute scores up to cache_seq_len
-                // The scores buffer might be larger (max_seq_len), but we only touch the active part
-                // scores_h is of size stride (= max_seq_len probably)
-                
-                for t in 0..cache_seq_len {
-                    // k_off: (t * n_heads_kv + kv_h) * head_dim
-                    let k_off = (t * n_heads_kv + kv_h) * head_dim;
-                    let k_vec = &k_data[k_off..k_off + head_dim];
+                scores_chunks.zip(out_chunks).enumerate().for_each(|(h, (scores_h, out_h))| {
+                    let kv_h = h / n_rep;
                     
-                    // Vectorizable dot product
-                    let mut score = 0.0;
-                    for i in 0..head_dim {
-                        score += q_vec[i] * k_vec[i];
-                    }
-                    score *= scale;
-                    
-                    scores_h[t] = score; 
-                }
-                
-                // --- Step 2: Softmax ---
-                
-                // Only consider the valid part of scores_h
-                let active_scores = &mut scores_h[0..cache_seq_len];
-                
-                let mut max_val = f32::NEG_INFINITY;
-                for &s in active_scores.iter() {
-                    if s > max_val { max_val = s; }
-                }
-                
-                let mut sum_exp = 0.0;
-                for s in active_scores.iter_mut() {
-                    *s = (*s - max_val).exp();
-                    sum_exp += *s;
-                }
-                
-                let inv_sum = 1.0 / sum_exp;
-                for s in active_scores.iter_mut() {
-                    *s *= inv_sum;
-                }
+                    // Unsafe access for performance
+                    unsafe {
+                        let q_off = h * head_dim;
+                        let q_ptr = q_data.as_ptr().add(q_off);
+                        
+                        // --- Step 1: Q * K^T (NEON Vectorized) ---
+                        for t in 0..cache_seq_len {
+                            let k_off = (t * n_heads_kv + kv_h) * head_dim;
+                            let k_ptr = k_data.as_ptr().add(k_off);
+                            
+                            #[cfg(target_arch = "aarch64")]
+                            let score = {
+                                use std::arch::aarch64::*;
+                                let mut sum_v = vdupq_n_f32(0.0);
+                                
+                                // head_dim = 64, process 16 elements per iteration (4 unrolled)
+                                let mut i = 0;
+                                while i + 16 <= head_dim {
+                                    let q0 = vld1q_f32(q_ptr.add(i));
+                                    let k0 = vld1q_f32(k_ptr.add(i));
+                                    sum_v = vfmaq_f32(sum_v, q0, k0);
+                                    
+                                    let q1 = vld1q_f32(q_ptr.add(i + 4));
+                                    let k1 = vld1q_f32(k_ptr.add(i + 4));
+                                    sum_v = vfmaq_f32(sum_v, q1, k1);
+                                    
+                                    let q2 = vld1q_f32(q_ptr.add(i + 8));
+                                    let k2 = vld1q_f32(k_ptr.add(i + 8));
+                                    sum_v = vfmaq_f32(sum_v, q2, k2);
+                                    
+                                    let q3 = vld1q_f32(q_ptr.add(i + 12));
+                                    let k3 = vld1q_f32(k_ptr.add(i + 12));
+                                    sum_v = vfmaq_f32(sum_v, q3, k3);
+                                    
+                                    i += 16;
+                                }
+                                
+                                // Tail (if head_dim not multiple of 16)
+                                while i + 4 <= head_dim {
+                                    let q0 = vld1q_f32(q_ptr.add(i));
+                                    let k0 = vld1q_f32(k_ptr.add(i));
+                                    sum_v = vfmaq_f32(sum_v, q0, k0);
+                                    i += 4;
+                                }
+                                
+                                // Horizontal reduction
+                                let mut score = vaddvq_f32(sum_v);
+                                
+                                // Scalar tail
+                                while i < head_dim {
+                                    score += *q_ptr.add(i) * *k_ptr.add(i);
+                                    i += 1;
+                                }
+                                score
+                            };
+                            
+                            #[cfg(not(target_arch = "aarch64"))]
+                            let score = {
+                                let mut score = 0.0;
+                                for i in 0..head_dim {
+                                    score += *q_ptr.add(i) * *k_ptr.add(i);
+                                }
+                                score
+                            };
+                            
+                            *scores_h.get_unchecked_mut(t) = score * scale;
+                        }
+                        
+                        // --- Step 2: Softmax ---
+                        let active_scores = &mut scores_h[0..cache_seq_len];
+                        
+                        let mut max_val = f32::NEG_INFINITY;
+                        for i in 0..cache_seq_len {
+                            let s = *active_scores.get_unchecked(i);
+                            if s > max_val { max_val = s; }
+                        }
+                        
+                        let mut sum_exp = 0.0;
+                        for i in 0..cache_seq_len {
+                             let s = (*active_scores.get_unchecked(i) - max_val).exp();
+                             *active_scores.get_unchecked_mut(i) = s;
+                             sum_exp += s;
+                        }
+                        
+                        let inv_sum = 1.0 / sum_exp;
+                        for i in 0..cache_seq_len {
+                            *active_scores.get_unchecked_mut(i) *= inv_sum;
+                        }
 
-                // --- Step 3: Score * V ---
-                
-                // out_h should be zeroed before accumulation? 
-                // The previous serial code did: for x in out_ptr.iter_mut() { *x = 0.0; } BEFORE the loop.
-                // So out_h is already zeroed.
-                
-                for t in 0..cache_seq_len {
-                    let weight = active_scores[t];
-                    
-                    let v_off = (t * n_heads_kv + kv_h) * head_dim;
-                    let v_vec = &v_data[v_off..v_off + head_dim];
-                    
-                    for i in 0..head_dim {
-                        out_h[i] += weight * v_vec[i];
+                        // --- Step 3: Score * V (NEON Vectorized) ---
+                        // Zero out output
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            use std::arch::aarch64::*;
+                            let zero = vdupq_n_f32(0.0);
+                            let mut i = 0;
+                            while i + 4 <= head_dim {
+                                vst1q_f32(out_h.as_mut_ptr().add(i), zero);
+                                i += 4;
+                            }
+                            while i < head_dim {
+                                *out_h.get_unchecked_mut(i) = 0.0;
+                                i += 1;
+                            }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        for x in out_h.iter_mut() { *x = 0.0; }
+                        
+                        for t in 0..cache_seq_len {
+                            let weight = *active_scores.get_unchecked(t);
+                            let v_off = (t * n_heads_kv + kv_h) * head_dim;
+                            let v_ptr = v_data.as_ptr().add(v_off);
+                            let out_ptr_h = out_h.as_mut_ptr();
+                            
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                use std::arch::aarch64::*;
+                                let w = vdupq_n_f32(weight);
+                                
+                                let mut i = 0;
+                                while i + 16 <= head_dim {
+                                    let v0 = vld1q_f32(v_ptr.add(i));
+                                    let o0 = vld1q_f32(out_ptr_h.add(i));
+                                    vst1q_f32(out_ptr_h.add(i), vfmaq_f32(o0, w, v0));
+                                    
+                                    let v1 = vld1q_f32(v_ptr.add(i + 4));
+                                    let o1 = vld1q_f32(out_ptr_h.add(i + 4));
+                                    vst1q_f32(out_ptr_h.add(i + 4), vfmaq_f32(o1, w, v1));
+                                    
+                                    let v2 = vld1q_f32(v_ptr.add(i + 8));
+                                    let o2 = vld1q_f32(out_ptr_h.add(i + 8));
+                                    vst1q_f32(out_ptr_h.add(i + 8), vfmaq_f32(o2, w, v2));
+                                    
+                                    let v3 = vld1q_f32(v_ptr.add(i + 12));
+                                    let o3 = vld1q_f32(out_ptr_h.add(i + 12));
+                                    vst1q_f32(out_ptr_h.add(i + 12), vfmaq_f32(o3, w, v3));
+                                    
+                                    i += 16;
+                                }
+                                
+                                while i + 4 <= head_dim {
+                                    let v0 = vld1q_f32(v_ptr.add(i));
+                                    let o0 = vld1q_f32(out_ptr_h.add(i));
+                                    vst1q_f32(out_ptr_h.add(i), vfmaq_f32(o0, w, v0));
+                                    i += 4;
+                                }
+                                
+                                while i < head_dim {
+                                    *out_h.get_unchecked_mut(i) += weight * *v_ptr.add(i);
+                                    i += 1;
+                                }
+                            }
+                            
+                            #[cfg(not(target_arch = "aarch64"))]
+                            for i in 0..head_dim {
+                                *out_h.get_unchecked_mut(i) += weight * *v_ptr.add(i);
+                            }
+                        }
                     }
-                }
-            });
+                });
+            } else {
+                // Serial execution for short sequences
+                let scores_chunks = ws.scores.chunks_mut(stride).take(n_heads_q);
+                let out_chunks = out_ptr.chunks_mut(head_dim).take(n_heads_q);
+
+                scores_chunks.zip(out_chunks).enumerate().for_each(|(h, (scores_h, out_h))| {
+                    let kv_h = h / n_rep;
+                     unsafe {
+                        let q_off = h * head_dim;
+                        let q_ptr = q_data.as_ptr().add(q_off);
+                        
+                        // --- Step 1: Q * K^T (NEON Vectorized) ---
+                        for t in 0..cache_seq_len {
+                            let k_off = (t * n_heads_kv + kv_h) * head_dim;
+                            let k_ptr = k_data.as_ptr().add(k_off);
+                            
+                            #[cfg(target_arch = "aarch64")]
+                            let score = {
+                                use std::arch::aarch64::*;
+                                let mut sum_v = vdupq_n_f32(0.0);
+                                let mut i = 0;
+                                while i + 16 <= head_dim {
+                                    let q0 = vld1q_f32(q_ptr.add(i));
+                                    let k0 = vld1q_f32(k_ptr.add(i));
+                                    sum_v = vfmaq_f32(sum_v, q0, k0);
+                                    let q1 = vld1q_f32(q_ptr.add(i + 4));
+                                    let k1 = vld1q_f32(k_ptr.add(i + 4));
+                                    sum_v = vfmaq_f32(sum_v, q1, k1);
+                                    let q2 = vld1q_f32(q_ptr.add(i + 8));
+                                    let k2 = vld1q_f32(k_ptr.add(i + 8));
+                                    sum_v = vfmaq_f32(sum_v, q2, k2);
+                                    let q3 = vld1q_f32(q_ptr.add(i + 12));
+                                    let k3 = vld1q_f32(k_ptr.add(i + 12));
+                                    sum_v = vfmaq_f32(sum_v, q3, k3);
+                                    i += 16;
+                                }
+                                while i + 4 <= head_dim {
+                                    let q0 = vld1q_f32(q_ptr.add(i));
+                                    let k0 = vld1q_f32(k_ptr.add(i));
+                                    sum_v = vfmaq_f32(sum_v, q0, k0);
+                                    i += 4;
+                                }
+                                let mut score = vaddvq_f32(sum_v);
+                                while i < head_dim {
+                                    score += *q_ptr.add(i) * *k_ptr.add(i);
+                                    i += 1;
+                                }
+                                score
+                            };
+                            #[cfg(not(target_arch = "aarch64"))]
+                            let score = {
+                                let mut score = 0.0;
+                                for i in 0..head_dim { score += *q_ptr.add(i) * *k_ptr.add(i); }
+                                score
+                            };
+                            *scores_h.get_unchecked_mut(t) = score * scale;
+                        }
+                        
+                        // --- Step 2: Softmax ---
+                        let active_scores = &mut scores_h[0..cache_seq_len];
+                        let mut max_val = f32::NEG_INFINITY;
+                        for i in 0..cache_seq_len {
+                            let s = *active_scores.get_unchecked(i);
+                            if s > max_val { max_val = s; }
+                        }
+                        let mut sum_exp = 0.0;
+                        for i in 0..cache_seq_len {
+                             let s = (*active_scores.get_unchecked(i) - max_val).exp();
+                             *active_scores.get_unchecked_mut(i) = s;
+                             sum_exp += s;
+                        }
+                        let inv_sum = 1.0 / sum_exp;
+                        for i in 0..cache_seq_len {
+                            *active_scores.get_unchecked_mut(i) *= inv_sum;
+                        }
+
+                        // --- Step 3: Score * V (NEON Vectorized) ---
+                        #[cfg(target_arch = "aarch64")]
+                        {
+                            use std::arch::aarch64::*;
+                            let zero = vdupq_n_f32(0.0);
+                            let mut i = 0;
+                            while i + 4 <= head_dim { vst1q_f32(out_h.as_mut_ptr().add(i), zero); i += 4; }
+                            while i < head_dim { *out_h.get_unchecked_mut(i) = 0.0; i += 1; }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        for x in out_h.iter_mut() { *x = 0.0; }
+                        
+                        for t in 0..cache_seq_len {
+                            let weight = *active_scores.get_unchecked(t);
+                            let v_off = (t * n_heads_kv + kv_h) * head_dim;
+                            let v_ptr = v_data.as_ptr().add(v_off);
+                            let out_ptr_h = out_h.as_mut_ptr();
+                            
+                            #[cfg(target_arch = "aarch64")]
+                            {
+                                use std::arch::aarch64::*;
+                                let w = vdupq_n_f32(weight);
+                                let mut i = 0;
+                                while i + 16 <= head_dim {
+                                    let v0 = vld1q_f32(v_ptr.add(i));
+                                    let o0 = vld1q_f32(out_ptr_h.add(i));
+                                    vst1q_f32(out_ptr_h.add(i), vfmaq_f32(o0, w, v0));
+                                    let v1 = vld1q_f32(v_ptr.add(i + 4));
+                                    let o1 = vld1q_f32(out_ptr_h.add(i + 4));
+                                    vst1q_f32(out_ptr_h.add(i + 4), vfmaq_f32(o1, w, v1));
+                                    let v2 = vld1q_f32(v_ptr.add(i + 8));
+                                    let o2 = vld1q_f32(out_ptr_h.add(i + 8));
+                                    vst1q_f32(out_ptr_h.add(i + 8), vfmaq_f32(o2, w, v2));
+                                    let v3 = vld1q_f32(v_ptr.add(i + 12));
+                                    let o3 = vld1q_f32(out_ptr_h.add(i + 12));
+                                    vst1q_f32(out_ptr_h.add(i + 12), vfmaq_f32(o3, w, v3));
+                                    i += 16;
+                                }
+                                while i + 4 <= head_dim {
+                                    let v0 = vld1q_f32(v_ptr.add(i));
+                                    let o0 = vld1q_f32(out_ptr_h.add(i));
+                                    vst1q_f32(out_ptr_h.add(i), vfmaq_f32(o0, w, v0));
+                                    i += 4;
+                                }
+                                while i < head_dim {
+                                    *out_h.get_unchecked_mut(i) += weight * *v_ptr.add(i);
+                                    i += 1;
+                                }
+                            }
+                            #[cfg(not(target_arch = "aarch64"))]
+                            for i in 0..head_dim {
+                                *out_h.get_unchecked_mut(i) += weight * *v_ptr.add(i);
+                            }
+                        }
+                    }
+                });
+            } // End of: if use_parallel { ... } else { ... }
 
             if is_opencl {
                 // Determine size from the actual out_vec we used
