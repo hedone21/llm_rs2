@@ -26,9 +26,15 @@ const Presenter = (() => {
     };
 
     const EVENT_COLORS = {
-        Load: 'rgba(156,163,175,0.12)',
-        Prefill: 'rgba(245,158,11,0.12)',
-        Decode: 'rgba(34,197,94,0.12)',
+        Load: 'rgba(156,163,175,0.22)',
+        Prefill: 'rgba(245,158,11,0.22)',
+        Decode: 'rgba(34,197,94,0.22)',
+    };
+
+    const EVENT_LABEL_COLORS = {
+        Load: '#9ca3af',
+        Prefill: '#f59e0b',
+        Decode: '#22c55e',
     };
 
     // CPU core color palette
@@ -51,23 +57,25 @@ const Presenter = (() => {
     }
 
     /**
-     * Parse events into region spans for Plotly shapes.
+     * Parse events into region spans (shapes) and labels (annotations)
+     * using relative-second x coordinates.
      */
-    function buildEventShapes(events, timestamps) {
+    function buildEventShapesAndAnnotations(events, t0ms) {
         const evMap = {};
         for (const e of events) {
-            evMap[e.name] = e.timestamp;
+            evMap[e.name] = (new Date(e.timestamp).getTime() - t0ms) / 1000;
         }
 
         const regions = [
-            { start: 'ModelLoadStart', end: 'PrefillStart', label: 'Load', color: EVENT_COLORS.Load },
-            { start: 'PrefillStart', end: 'DecodingStart', label: 'Prefill', color: EVENT_COLORS.Prefill },
-            { start: 'DecodingStart', end: 'End', label: 'Decode', color: EVENT_COLORS.Decode },
+            { start: 'ModelLoadStart', end: 'PrefillStart', label: 'Load', color: EVENT_COLORS.Load, labelColor: EVENT_LABEL_COLORS.Load },
+            { start: 'PrefillStart', end: 'DecodingStart', label: 'Prefill', color: EVENT_COLORS.Prefill, labelColor: EVENT_LABEL_COLORS.Prefill },
+            { start: 'DecodingStart', end: 'End', label: 'Decode', color: EVENT_COLORS.Decode, labelColor: EVENT_LABEL_COLORS.Decode },
         ];
 
         const shapes = [];
+        const annotations = [];
         for (const r of regions) {
-            if (evMap[r.start] && evMap[r.end]) {
+            if (evMap[r.start] != null && evMap[r.end] != null) {
                 shapes.push({
                     type: 'rect',
                     xref: 'x', yref: 'paper',
@@ -75,11 +83,20 @@ const Presenter = (() => {
                     y0: 0, y1: 1,
                     fillcolor: r.color,
                     line: { width: 0 },
-                    label: { text: r.label, font: { size: 10, color: '#8b8fa3' } },
+                });
+                // Label annotation centered in the region, at top
+                annotations.push({
+                    x: (evMap[r.start] + evMap[r.end]) / 2,
+                    y: 1.0,
+                    xref: 'x', yref: 'paper',
+                    text: `<b>${r.label}</b>`,
+                    showarrow: false,
+                    font: { size: 11, color: r.labelColor },
+                    yanchor: 'bottom',
                 });
             }
         }
-        return shapes;
+        return { shapes, annotations };
     }
 
     /**
@@ -95,9 +112,12 @@ const Presenter = (() => {
             return;
         }
 
-        const timestamps = timeseries.map(s => s.timestamp);
+        // Convert to relative seconds for a clean x-axis
+        const t0ms = new Date(timeseries[0].timestamp).getTime();
+        const relSeconds = timeseries.map(s => (new Date(s.timestamp).getTime() - t0ms) / 1000);
+
         const groups = groupFields(field_descriptors);
-        const shapes = buildEventShapes(events, timestamps);
+        const { shapes, annotations } = buildEventShapesAndAnnotations(events, t0ms);
 
         // Determine subplot order
         const groupOrder = ['thermal', 'cpu_freq', 'gpu_freq', 'memory', 'cpu_load', 'gpu_load'];
@@ -117,6 +137,7 @@ const Presenter = (() => {
             height: numSubplots * 180 + 60,
             grid: { rows: numSubplots, columns: 1, pattern: 'independent', roworder: 'top to bottom' },
             shapes: [],
+            annotations: [],
         };
 
         sortedGroups.forEach((groupName, idx) => {
@@ -132,6 +153,8 @@ const Presenter = (() => {
                 ...PLOTLY_LAYOUT_DEFAULTS.xaxis,
                 showticklabels: idx === numSubplots - 1,
                 matches: idx > 0 ? 'x' : undefined,
+                title: idx === numSubplots - 1 ? { text: 'Time (s)', font: { size: 11 } } : undefined,
+                tickfont: { size: 10 },
             };
             layout[`yaxis${axisIdx}`] = {
                 ...PLOTLY_LAYOUT_DEFAULTS.yaxis,
@@ -146,6 +169,16 @@ const Presenter = (() => {
                     yref: `${yAxisKey} domain`,
                 });
             }
+            // Add labels only to the first subplot
+            if (idx === 0) {
+                for (const ann of annotations) {
+                    layout.annotations.push({
+                        ...ann,
+                        xref: xAxisKey,
+                        yref: `${yAxisKey} domain`,
+                    });
+                }
+            }
 
             for (const field of fields) {
                 if (field.chart === 'multi_line') {
@@ -156,7 +189,7 @@ const Presenter = (() => {
 
                     for (let c = 0; c < numCores; c++) {
                         traces.push({
-                            x: timestamps,
+                            x: relSeconds,
                             y: timeseries.map(s => {
                                 const arr = s[field.key];
                                 return arr && arr[c] != null ? arr[c] : null;
@@ -174,7 +207,7 @@ const Presenter = (() => {
                 } else {
                     // Standard line trace
                     traces.push({
-                        x: timestamps,
+                        x: relSeconds,
                         y: timeseries.map(s => s[field.key]),
                         name: field.label,
                         type: 'scatter',
@@ -357,6 +390,6 @@ const Presenter = (() => {
         PLOTLY_LAYOUT_DEFAULTS,
         CORE_COLORS,
         EVENT_COLORS,
-        buildEventShapes,
+        buildEventShapesAndAnnotations,
     };
 })();
