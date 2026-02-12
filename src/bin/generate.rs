@@ -348,7 +348,7 @@ fn main() -> anyhow::Result<()> {
                 v_dim,
                 ffn_hidden,
                 n_heads: model.config.num_attention_heads,
-                max_seq_len: args.num_tokens + 1, // +1 for safety
+                max_seq_len: args.max_seq_len, // Use context window size
             },
             memory.as_ref(),
             backend.clone(),
