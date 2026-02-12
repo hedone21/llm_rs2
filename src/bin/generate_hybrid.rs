@@ -238,7 +238,7 @@ fn main() -> anyhow::Result<()> {
             workspace: None,
             use_gpu_attn: false,
             cache_manager: None,
-        })?;
+        })?.ok_or(()).ok(); // No eviction configured
 
         // Sample last token
         let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
@@ -406,7 +406,7 @@ fn main() -> anyhow::Result<()> {
             workspace: gen_ws.as_mut(),
             use_gpu_attn: is_gpu,
             cache_manager: None,
-        })?;
+        })?.ok_or(()).ok(); // No eviction configured
 
         // Sample
         let mut logits_cpu = vec![0.0f32; vocab_size];

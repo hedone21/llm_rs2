@@ -291,7 +291,7 @@ impl LlamaModel {
     
     /// Comprehensive forward pass that writes logits into a pre-allocated buffer.
     /// Optionally accepts x_gen and workspace for memory optimization during generation.
-    pub fn forward_into(&self, args: LlamaModelForwardArgs) -> Result<()> {
+    pub fn forward_into(&self, args: LlamaModelForwardArgs) -> Result<Option<crate::core::cache_manager::EvictionResult>> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
         let kv_caches = args.kv_caches;
@@ -340,7 +340,7 @@ impl LlamaModel {
         }
 
         // 2.5 Dynamic KV cache eviction (if configured)
-        if let Some(cm) = args.cache_manager {
+        let eviction_result = if let Some(cm) = args.cache_manager {
             let result = cm.maybe_evict(kv_caches)?;
             if result.evicted {
                 log::info!(
@@ -348,8 +348,13 @@ impl LlamaModel {
                     result.tokens_removed,
                     result.new_pos
                 );
+                Some(result)
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         
         // 3. Final Norm
         backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
@@ -358,6 +363,6 @@ impl LlamaModel {
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
         
-        Ok(())
+        Ok(eviction_result)
     }
 }

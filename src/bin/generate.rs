@@ -379,7 +379,7 @@ fn main() -> anyhow::Result<()> {
             workspace: None,
             use_gpu_attn: args.gpu_attn,
             cache_manager: cm_ref,
-        })?;
+        })?.ok_or(()).ok(); // Eviction during prefill is unlikely, ignore result
 
         // Sample last token
         // Read logits to CPU
@@ -455,7 +455,8 @@ fn main() -> anyhow::Result<()> {
 
         // Generation loop
         for _ in 0..(args.num_tokens - 1) {
-            if start_pos >= max_seq_len {
+            // Check physical cache capacity (not start_pos, which is logical RoPE position)
+            if kv_caches[0].current_pos >= max_seq_len {
                 println!("\n[Stopped: Max context length reached]");
                 break;
             }
@@ -466,7 +467,7 @@ fn main() -> anyhow::Result<()> {
             }
             let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
 
-            model.forward_into(LlamaModelForwardArgs {
+            let eviction_result = model.forward_into(LlamaModelForwardArgs {
                 input_tokens: &gen_input_tensor,
                 start_pos,
                 kv_caches: &mut kv_caches,
@@ -496,6 +497,12 @@ fn main() -> anyhow::Result<()> {
 
             last_token_time = now;
             tokens.push(next_token_id);
+
+            // start_pos tracks the LOGICAL position for RoPE encoding.
+            // It must always increment, even after eviction. Eviction changes the
+            // physical cache layout (current_pos), but keys retain their original
+            // RoPE positions. The query must continue with the next sequential
+            // position to maintain correct relative distances.
             start_pos += 1;
 
             // Streaming print
