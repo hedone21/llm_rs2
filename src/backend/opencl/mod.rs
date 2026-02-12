@@ -1,3 +1,4 @@
+#![allow(unused_unsafe)]
 use anyhow::{Result, anyhow};
 use std::sync::{Arc, Mutex};
 use crate::core::backend::Backend;

@@ -12,7 +12,7 @@ use crate::core::shape::Shape;
 use crate::core::buffer::DType;
 use crate::core::memory::Memory;
 use crate::core::kv_cache::KVCache;
-use crate::layers::llama_layer::LlamaLayer;
+use crate::layers::llama_layer::{LlamaLayer, LlamaLayerForwardArgs};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::galloc::Galloc;
 
@@ -37,11 +37,23 @@ pub struct LlamaModel {
     pub lm_head: Tensor,
 }
 
+pub struct LlamaModelForwardArgs<'a> {
+    pub input_tokens: &'a Tensor,
+    pub start_pos: usize,
+    pub kv_caches: &'a mut [KVCache],
+    pub backend: &'a Arc<dyn Backend>,
+    pub memory: &'a dyn Memory,
+    pub logits_out: &'a mut Tensor,
+    pub x_gen: Option<&'a mut Tensor>,
+    pub workspace: Option<&'a mut LayerWorkspace>,
+    pub use_gpu_attn: bool,
+}
+
 impl LlamaModel {
      pub fn load(
         model_path: &str, 
         backend: Arc<dyn Backend>, 
-        memory: &dyn Memory
+        _memory: &dyn Memory
     ) -> Result<Self> {
         let path = Path::new(model_path);
         
@@ -243,17 +255,17 @@ impl LlamaModel {
 
         // Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward(
-                &mut x, 
-                &mut kv_caches[i], 
-                start_pos, 
-                backend, 
-                memory, 
-                self.config.rms_norm_eps as f32, 
-                self.config.rope_theta as f32,
-                None, // No workspace for standard forward
-                true  // Always use GPU attention in standard forward
-            )?;
+            layer.forward(LlamaLayerForwardArgs {
+                x: &mut x,
+                kv_cache: &mut kv_caches[i],
+                start_pos,
+                backend,
+                memory,
+                rms_norm_eps: self.config.rms_norm_eps as f32,
+                rope_theta: self.config.rope_theta as f32,
+                workspace: None,
+                use_gpu_attn: true
+            })?;
         }
         
         // Final Norm
@@ -275,18 +287,16 @@ impl LlamaModel {
     
     /// Comprehensive forward pass that writes logits into a pre-allocated buffer.
     /// Optionally accepts x_gen and workspace for memory optimization during generation.
-    pub fn forward_into(
-        &self,
-        input_tokens: &Tensor,
-        start_pos: usize,
-        kv_caches: &mut [KVCache],
-        backend: &Arc<dyn Backend>,
-        memory: &dyn Memory,
-        logits_out: &mut Tensor,
-        x_gen: Option<&mut Tensor>,
-        mut workspace: Option<&mut LayerWorkspace>,
-        use_gpu_attn: bool,
-    ) -> Result<()> {
+    pub fn forward_into(&self, args: LlamaModelForwardArgs) -> Result<()> {
+        let input_tokens = args.input_tokens;
+        let start_pos = args.start_pos;
+        let kv_caches = args.kv_caches;
+        let backend = args.backend;
+        let memory = args.memory;
+        let logits_out = args.logits_out;
+        let x_gen = args.x_gen;
+        let mut workspace = args.workspace;
+        let use_gpu_attn = args.use_gpu_attn;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -296,7 +306,7 @@ impl LlamaModel {
         // Use provided x_gen buffer if available and seq_len == 1
         let mut x = if seq_len == 1 {
             if let Some(xb) = x_gen {
-                xb.clone()
+                (*xb).clone()
             } else {
                 let x_buf = memory.alloc(batch_size * seq_len * hidden_size * 4, DType::F32)?;
                 Tensor::new(Shape::new(vec![batch_size, seq_len, hidden_size]), x_buf, backend.clone())
@@ -312,17 +322,17 @@ impl LlamaModel {
 
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
-            layer.forward(
-                &mut x, 
-                &mut kv_caches[i], 
-                start_pos, 
-                backend, 
-                memory, 
-                self.config.rms_norm_eps as f32, 
-                self.config.rope_theta as f32,
-                workspace.as_deref_mut(), // Pass workspace if provided (only for seq_len=1)
+            layer.forward(LlamaLayerForwardArgs {
+                x: &mut x,
+                kv_cache: &mut kv_caches[i],
+                start_pos,
+                backend,
+                memory,
+                rms_norm_eps: self.config.rms_norm_eps as f32,
+                rope_theta: self.config.rope_theta as f32,
+                workspace: workspace.as_deref_mut(),
                 use_gpu_attn
-            )?;
+            })?;
         }
         
         // 3. Final Norm

@@ -23,18 +23,7 @@ pub struct LayerWorkspace {
 }
 
 impl LayerWorkspace {
-    pub fn new(
-        batch_size: usize,
-        dim: usize,
-        q_dim: usize,
-        k_dim: usize,
-        v_dim: usize,
-        ffn_hidden: usize,
-        n_heads: usize, // New argument
-        max_seq_len: usize,
-        memory: &dyn Memory,
-        backend: Arc<dyn Backend>,
-    ) -> Result<Self> {
+    pub fn new(config: WorkspaceConfig, memory: &dyn Memory, backend: Arc<dyn Backend>) -> Result<Self> {
         let alloc = |shape: Vec<usize>| -> Result<Tensor> {
             let size: usize = shape.iter().product();
             let buf = memory.alloc(size * 4, DType::F32)?;
@@ -42,16 +31,27 @@ impl LayerWorkspace {
         };
 
         Ok(Self {
-            q: alloc(vec![batch_size, 1, q_dim])?,
-            k: alloc(vec![batch_size, 1, k_dim])?,
-            v: alloc(vec![batch_size, 1, v_dim])?,
-            out_attn: alloc(vec![batch_size, 1, q_dim])?,
-            gate: alloc(vec![batch_size, 1, ffn_hidden])?,
-            up: alloc(vec![batch_size, 1, ffn_hidden])?,
-            down: alloc(vec![batch_size, 1, dim])?,
-            residual: alloc(vec![batch_size, 1, dim])?,
-            attn_out: alloc(vec![batch_size, 1, dim])?,
-            scores: vec![0.0; n_heads * max_seq_len], // Resized
+            q: alloc(vec![config.batch_size, 1, config.q_dim])?,
+            k: alloc(vec![config.batch_size, 1, config.k_dim])?,
+            v: alloc(vec![config.batch_size, 1, config.v_dim])?,
+            out_attn: alloc(vec![config.batch_size, 1, config.q_dim])?,
+            gate: alloc(vec![config.batch_size, 1, config.ffn_hidden])?,
+            up: alloc(vec![config.batch_size, 1, config.ffn_hidden])?,
+            down: alloc(vec![config.batch_size, 1, config.dim])?,
+            residual: alloc(vec![config.batch_size, 1, config.dim])?,
+            attn_out: alloc(vec![config.batch_size, 1, config.dim])?,
+            scores: vec![0.0; config.n_heads * config.max_seq_len],
         })
     }
+}
+
+pub struct WorkspaceConfig {
+    pub batch_size: usize,
+    pub dim: usize,
+    pub q_dim: usize,
+    pub k_dim: usize,
+    pub v_dim: usize,
+    pub ffn_hidden: usize,
+    pub n_heads: usize,
+    pub max_seq_len: usize,
 }

@@ -6,9 +6,9 @@ use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::tensor::Tensor;
-use llm_rs2::layers::workspace::LayerWorkspace;
+use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::llama::llama_model::LlamaModel;
+use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -289,17 +289,17 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         );
 
-        model.forward_into(
-            &input_tensor,
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
             start_pos,
-            &mut kv_caches,
-            &backend,
-            memory.as_ref(),
-            &mut prefill_logits,
-            None,
-            None,
-            args.gpu_attn,
-        )?;
+            kv_caches: &mut kv_caches,
+            backend: &backend,
+            memory: memory.as_ref(),
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: args.gpu_attn,
+        })?;
 
         // Sample last token
         // Read logits to CPU
@@ -340,14 +340,16 @@ fn main() -> anyhow::Result<()> {
         );
 
         let mut gen_ws = LayerWorkspace::new(
-            1,
-            hidden_size,
-            q_dim,
-            k_dim,
-            v_dim,
-            ffn_hidden,
-            model.config.num_attention_heads, // n_heads
-            max_seq_len,
+            WorkspaceConfig {
+                batch_size: 1,
+                dim: model.config.hidden_size,
+                q_dim,
+                k_dim,
+                v_dim,
+                ffn_hidden,
+                n_heads: model.config.num_attention_heads,
+                max_seq_len: args.num_tokens + 1, // +1 for safety
+            },
             memory.as_ref(),
             backend.clone(),
         )?;
@@ -384,17 +386,17 @@ fn main() -> anyhow::Result<()> {
             }
             let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
 
-            model.forward_into(
-                &gen_input_tensor,
+            model.forward_into(LlamaModelForwardArgs {
+                input_tokens: &gen_input_tensor,
                 start_pos,
-                &mut kv_caches,
-                &backend,
-                memory.as_ref(),
-                &mut logits,
-                Some(&mut x_gen),
-                Some(&mut gen_ws),
-                args.gpu_attn,
-            )?;
+                kv_caches: &mut kv_caches,
+                backend: &backend,
+                memory: memory.as_ref(),
+                logits_out: &mut logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                use_gpu_attn: args.gpu_attn,
+            })?;
 
             // Sample
             // Read logits
@@ -418,24 +420,24 @@ fn main() -> anyhow::Result<()> {
             // Streaming print
             let current_text = tokenizer.decode(&tokens, true).unwrap_or_default();
             if current_text.len() > printed_len {
-                 // Check if we are at a valid char boundary. 
-                 // If not (e.g. we are in the middle of a multi-byte char sequence from previous partial decode?), 
-                 // we might need to be careful. 
-                 // However, tokenizer.decode should return valid strings. 
-                 // The issue is likely that `printed_len` (bytes) might not align with `current_text` if decoding changed slightly?
-                 // Or `printed_len` was set from a previous string.
-                 
-                 // Safe slicing:
-                 if let Some(substring) = current_text.get(printed_len..) {
-                     print!("{}", substring);
-                     stdout.flush().ok();
-                     printed_len = current_text.len();
-                 } else {
-                     // Verify if printed_len is valid. 
-                     // Often tokenizers re-decode slightly differently or we accumulate.
-                     // A safer way is: just print what's new from this round's decode, but we need to track bytes.
-                     // Let's just catch the case where we can't slice.
-                 }
+                // Check if we are at a valid char boundary.
+                // If not (e.g. we are in the middle of a multi-byte char sequence from previous partial decode?),
+                // we might need to be careful.
+                // However, tokenizer.decode should return valid strings.
+                // The issue is likely that `printed_len` (bytes) might not align with `current_text` if decoding changed slightly?
+                // Or `printed_len` was set from a previous string.
+
+                // Safe slicing:
+                if let Some(substring) = current_text.get(printed_len..) {
+                    print!("{}", substring);
+                    stdout.flush().ok();
+                    printed_len = current_text.len();
+                } else {
+                    // Verify if printed_len is valid.
+                    // Often tokenizers re-decode slightly differently or we accumulate.
+                    // A safer way is: just print what's new from this round's decode, but we need to track bytes.
+                    // Let's just catch the case where we can't slice.
+                }
             }
 
             if next_token_id == eos_id {

@@ -28,18 +28,17 @@ pub struct LlamaLayer {
 }
 
 impl LlamaLayer {
-    pub fn forward(
-        &self,
-        x: &mut Tensor,
-        kv_cache: &mut KVCache,
-        start_pos: usize,
-        backend: &Arc<dyn Backend>,
-        memory: &dyn Memory,
-        rms_norm_eps: f32,
-        rope_theta: f32,
-        workspace: Option<&mut super::workspace::LayerWorkspace>,
-        use_gpu_attn: bool,
-    ) -> Result<()> {
+    pub fn forward(&self, args: LlamaLayerForwardArgs) -> Result<()> {
+        let x = args.x;
+        let kv_cache = args.kv_cache;
+        let start_pos = args.start_pos;
+        let backend = args.backend;
+        let memory = args.memory;
+        let rms_norm_eps = args.rms_norm_eps;
+        let rope_theta = args.rope_theta;
+        let workspace = args.workspace;
+        let use_gpu_attn = args.use_gpu_attn;
+
         let batch_size = x.shape().dims()[0];
         let seq_len = x.shape().dims()[1];
         let dim = x.shape().dims()[2];
@@ -47,7 +46,16 @@ impl LlamaLayer {
 
         if seq_len == 1 {
             if let Some(ws) = workspace {
-                return self.forward_gen(x, kv_cache, start_pos, backend, ws, rms_norm_eps, rope_theta, use_gpu_attn);
+                return self.forward_gen(LlamaForwardGenArgs {
+                    x,
+                    kv_cache,
+                    start_pos,
+                    backend,
+                    ws,
+                    rms_norm_eps,
+                    rope_theta,
+                    use_gpu_attn,
+                });
             }
         }
 
@@ -214,17 +222,16 @@ impl LlamaLayer {
     }
 
     /// Fast path for single token generation using pre-allocated workspace.
-    fn forward_gen(
-        &self,
-        x: &mut Tensor,
-        kv_cache: &mut KVCache,
-        start_pos: usize,
-        backend: &Arc<dyn Backend>,
-        ws: &mut super::workspace::LayerWorkspace,
-        rms_norm_eps: f32,
-        rope_theta: f32,
-        use_gpu_attn: bool,
-    ) -> Result<()> {
+    fn forward_gen(&self, args: LlamaForwardGenArgs) -> Result<()> {
+        let x = args.x;
+        let kv_cache = args.kv_cache;
+        let start_pos = args.start_pos;
+        let backend = args.backend;
+        let ws = args.ws;
+        let rms_norm_eps = args.rms_norm_eps;
+        let rope_theta = args.rope_theta;
+        let use_gpu_attn = args.use_gpu_attn;
+
         let batch_size = x.shape().dims()[0];
         let head_dim = 64;
         
@@ -458,6 +465,7 @@ impl LlamaLayer {
                             let weight = *active_scores.get_unchecked(t);
                             let v_off = (t * n_heads_kv + kv_h) * head_dim;
                             let v_ptr = v_data.as_ptr().add(v_off);
+                            #[cfg(target_arch = "aarch64")]
                             let out_ptr_h = out_h.as_mut_ptr();
                             
                             #[cfg(target_arch = "aarch64")]
@@ -598,6 +606,7 @@ impl LlamaLayer {
                             let weight = *active_scores.get_unchecked(t);
                             let v_off = (t * n_heads_kv + kv_h) * head_dim;
                             let v_ptr = v_data.as_ptr().add(v_off);
+                            #[cfg(target_arch = "aarch64")]
                             let out_ptr_h = out_h.as_mut_ptr();
                             
                             #[cfg(target_arch = "aarch64")]
@@ -685,4 +694,27 @@ impl LlamaLayer {
         
         Ok(())
     }
+}
+
+pub struct LlamaForwardGenArgs<'a> {
+    pub x: &'a mut Tensor,
+    pub kv_cache: &'a mut KVCache,
+    pub start_pos: usize,
+    pub backend: &'a Arc<dyn Backend>,
+    pub ws: &'a mut super::workspace::LayerWorkspace,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub use_gpu_attn: bool,
+}
+
+pub struct LlamaLayerForwardArgs<'a> {
+    pub x: &'a mut Tensor,
+    pub kv_cache: &'a mut KVCache,
+    pub start_pos: usize,
+    pub backend: &'a Arc<dyn Backend>,
+    pub memory: &'a dyn Memory,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub workspace: Option<&'a mut super::workspace::LayerWorkspace>,
+    pub use_gpu_attn: bool,
 }

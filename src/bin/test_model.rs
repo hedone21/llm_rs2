@@ -1,7 +1,7 @@
-use llm_rs2::core::backend::Backend;
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::memory::galloc::Galloc;
+use llm_rs2::core::backend::Backend;
 use llm_rs2::core::memory::Memory;
+use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::llama::llama_model::LlamaModel;
 use std::sync::Arc;
 use std::time::Instant;
@@ -24,7 +24,10 @@ fn main() -> anyhow::Result<()> {
     println!("Config: {:?}", model.config);
     println!("Number of layers: {}", model.layers.len());
     println!("Vocab size: {}", model.config.vocab_size);
-    println!("Embed Tokens Shape: {:?}", model.embed_tokens.shape().dims());
+    println!(
+        "Embed Tokens Shape: {:?}",
+        model.embed_tokens.shape().dims()
+    );
 
     Ok(())
 }

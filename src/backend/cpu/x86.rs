@@ -1,3 +1,4 @@
+#![allow(unused_unsafe, unused_variables)]
 use anyhow::{Result, anyhow};
 use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
