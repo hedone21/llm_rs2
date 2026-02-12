@@ -327,7 +327,23 @@ def extract_metadata(cmd_str):
         meta['prefill_type'] = os.path.basename(p_match.group(1)).replace('.txt', '')
     else:
         meta['prefill_type'] = "custom_prompt"
-        
+
+    # Extract eviction policy
+    ev_match = re.search(r'--eviction-policy\s+([^\s]+)', cmd_str)
+    meta['eviction_policy'] = ev_match.group(1) if ev_match else 'none'
+
+    # Extract eviction window
+    ew_match = re.search(r'--eviction-window\s+(\d+)', cmd_str)
+    if ew_match: meta['eviction_window'] = int(ew_match.group(1))
+
+    # Extract protected prefix
+    pp_match = re.search(r'--protected-prefix\s+(\d+)', cmd_str)
+    if pp_match: meta['protected_prefix'] = int(pp_match.group(1))
+
+    # Extract memory threshold
+    mt_match = re.search(r'--memory-threshold-mb\s+(\d+)', cmd_str)
+    if mt_match: meta['memory_threshold_mb'] = int(mt_match.group(1))
+
     return meta
 
 def parse_results(stdout):
@@ -342,6 +358,14 @@ def parse_results(stdout):
     
     tps = re.search(r'\(([\d\.]+)\s*tokens/sec\)', stdout)
     if tps: results['tokens_per_sec'] = float(tps.group(1))
+
+    # Eviction: policy=sliding, window=1024, prefix=64, threshold=256MB
+    ev_match = re.search(r'Eviction:\s*policy=([^,]+),\s*window=(\d+),\s*prefix=(\d+),\s*threshold=(\d+)MB', stdout)
+    if ev_match:
+        results['eviction_policy'] = ev_match.group(1)
+        results['eviction_window'] = int(ev_match.group(2))
+        results['eviction_prefix'] = int(ev_match.group(3))
+        results['eviction_threshold_mb'] = int(ev_match.group(4))
     
     return results
 
@@ -447,12 +471,13 @@ def main():
         filename = args.name
         if not filename.endswith('.json'): filename += ".json"
     else:
-        # Auto-name: profile_{backend}_{prefill}_{tokens}_{date}.json
+        # Auto-name: profile_{backend}_{prefill}_{tokens}_{eviction}_{date}.json
         date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
         backend = metadata.get('backend', 'unknown')
         prefill = metadata.get('prefill_type', 'custom')
         tokens = metadata.get('num_tokens', '0')
-        filename = f"profile_{backend}_{prefill}_{tokens}_{date_str}.json"
+        eviction = metadata.get('eviction_policy', 'none')
+        filename = f"profile_{backend}_{prefill}_{tokens}_{eviction}_{date_str}.json"
     
     out_path = os.path.join(args.output_dir, filename)
     with open(out_path, 'w') as f:

@@ -17,10 +17,24 @@ declare -A SCENARIOS=(
 
 BACKEND="cpu"  # or "opencl"
 NUM_TOKENS=128
+EVICTION_POLICY="none"  # none, sliding, or snapkv
+EVICTION_WINDOW=1024
+PROTECTED_PREFIX=0
+MEMORY_THRESHOLD_MB=256
+
+# Build eviction flags
+EVICTION_FLAGS=""
+if [ "$EVICTION_POLICY" != "none" ]; then
+    EVICTION_FLAGS="--eviction-policy $EVICTION_POLICY --eviction-window $EVICTION_WINDOW --memory-threshold-mb $MEMORY_THRESHOLD_MB"
+    if [ "$PROTECTED_PREFIX" -gt 0 ]; then
+        EVICTION_FLAGS="$EVICTION_FLAGS --protected-prefix $PROTECTED_PREFIX"
+    fi
+fi
 
 echo "=== Foreground App Impact Test ==="
 echo "Backend: $BACKEND"
 echo "Tokens: $NUM_TOKENS"
+echo "Eviction: $EVICTION_POLICY (window=$EVICTION_WINDOW, prefix=$PROTECTED_PREFIX)"
 echo ""
 
 for scenario in "${!SCENARIOS[@]}"; do
@@ -30,7 +44,7 @@ for scenario in "${!SCENARIOS[@]}"; do
     if [ -z "$apps" ]; then
         # Idle test - no foreground app switching
         echo "Running in IDLE mode (no foreground apps)..."
-        device_cmd="$GENERATE_BIN --model-path $MODEL_PATH --prompt-file $PROMPT_FILE --num-tokens $NUM_TOKENS -b $BACKEND"
+        device_cmd="$GENERATE_BIN --model-path $MODEL_PATH --prompt-file $PROMPT_FILE --num-tokens $NUM_TOKENS -b $BACKEND $EVICTION_FLAGS"
         
         python3 scripts/android_profile.py \
             --cmd "$device_cmd" \
@@ -39,7 +53,7 @@ for scenario in "${!SCENARIOS[@]}"; do
     else
         # Stress test with foreground app switching
         echo "Running with foreground apps: $apps"
-        device_cmd="$GENERATE_BIN --model-path $MODEL_PATH --prompt-file $PROMPT_FILE --num-tokens $NUM_TOKENS -b $BACKEND"
+        device_cmd="$GENERATE_BIN --model-path $MODEL_PATH --prompt-file $PROMPT_FILE --num-tokens $NUM_TOKENS -b $BACKEND $EVICTION_FLAGS"
         
         python3 "$STRESS_SCRIPT" \
             --cmd "$device_cmd" \

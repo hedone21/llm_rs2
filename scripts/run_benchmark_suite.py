@@ -64,9 +64,15 @@ def run_suite(args):
     # Existing prompt files
     existing_prompts = ["short_len"] 
     
-    decode_lengths = [128, 256] 
+    decode_lengths = [128, 256]
+
+    # Eviction policies to test
+    if args.skip_eviction:
+        eviction_policies = ["none"]
+    else:
+        eviction_policies = ["none", "sliding"]
     
-    total_runs = len(backends) * (len(synthetic_prefills) + len(existing_prompts)) * len(decode_lengths)
+    total_runs = len(backends) * (len(synthetic_prefills) + len(existing_prompts)) * len(decode_lengths) * len(eviction_policies)
     current_run = 0
 
     results_dir = "results/data"
@@ -78,15 +84,28 @@ def run_suite(args):
             prompt_file_remote = f"{EVAL_DIR}/prefill_{prefill}.txt"
             
             for decode in decode_lengths:
+              for eviction in eviction_policies:
                 current_run += 1
-                print(f"\n[Suite] Run {current_run}/{total_runs}: Backend={backend}, Prefill={prefill}, Decode={decode}")
+                eviction_label = f", Eviction={eviction}" if eviction != "none" else ""
+                print(f"\n[Suite] Run {current_run}/{total_runs}: Backend={backend}, Prefill={prefill}, Decode={decode}{eviction_label}")
                 
+                eviction_flags = ""
+                if eviction != "none":
+                    eviction_flags = (
+                        f" --eviction-policy {eviction}"
+                        f" --eviction-window {args.eviction_window}"
+                        f" --memory-threshold-mb {args.memory_threshold}"
+                    )
+                    if args.protected_prefix > 0:
+                        eviction_flags += f" --protected-prefix {args.protected_prefix}"
+
                 device_cmd = (
                     f"{GENERATE_BIN_REMOTE} "
                     f"--model-path {MODEL_PATH} "
                     f"--prompt-file {prompt_file_remote} "
                     f"--num-tokens {decode} "
                     f"-b {backend}"
+                    f"{eviction_flags}"
                 )
                 
                 profile_cmd = (
@@ -104,15 +123,28 @@ def run_suite(args):
             prompt_file_remote = f"{EVAL_DIR}/{prompt_name}.txt"
             
             for decode in decode_lengths:
+              for eviction in eviction_policies:
                 current_run += 1
-                print(f"\n[Suite] Run {current_run}/{total_runs}: Backend={backend}, Prefill={prompt_name}, Decode={decode}")
+                eviction_label = f", Eviction={eviction}" if eviction != "none" else ""
+                print(f"\n[Suite] Run {current_run}/{total_runs}: Backend={backend}, Prefill={prompt_name}, Decode={decode}{eviction_label}")
                 
+                eviction_flags = ""
+                if eviction != "none":
+                    eviction_flags = (
+                        f" --eviction-policy {eviction}"
+                        f" --eviction-window {args.eviction_window}"
+                        f" --memory-threshold-mb {args.memory_threshold}"
+                    )
+                    if args.protected_prefix > 0:
+                        eviction_flags += f" --protected-prefix {args.protected_prefix}"
+
                 device_cmd = (
                     f"{GENERATE_BIN_REMOTE} "
                     f"--model-path {MODEL_PATH} "
                     f"--prompt-file {prompt_file_remote} "
                     f"--num-tokens {decode} "
                     f"-b {backend}"
+                    f"{eviction_flags}"
                 )
                 
                 profile_cmd = (
@@ -130,6 +162,10 @@ def main():
     parser.add_argument("--skip-build", action="store_true", help="Skip cargo build")
     parser.add_argument("--skip-push", action="store_true", help="Skip adb push")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running")
+    parser.add_argument("--skip-eviction", action="store_true", help="Skip eviction policy runs (only test none)")
+    parser.add_argument("--eviction-window", type=int, default=1024, help="Eviction window size (tokens)")
+    parser.add_argument("--protected-prefix", type=int, default=0, help="Protected prefix tokens")
+    parser.add_argument("--memory-threshold", type=int, default=256, help="Memory threshold (MB)")
     args = parser.parse_args()
 
     # 1. Local Setup

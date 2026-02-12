@@ -59,6 +59,17 @@ def analyze_json(filepath):
     plot_path = os.path.join(PLOTS_DIR, plot_filename)
     has_plot = os.path.exists(plot_path)
     
+    # Eviction info
+    eviction = meta.get('eviction_policy', 'none')
+    eviction_detail = eviction
+    if eviction != 'none':
+        window = meta.get('eviction_window', results.get('eviction_window', '-'))
+        prefix = meta.get('protected_prefix', results.get('eviction_prefix', 0))
+        eviction_detail = f"{eviction} (w={window}"
+        if prefix and int(prefix) > 0:
+            eviction_detail += f", p={prefix}"
+        eviction_detail += ")"
+
     return {
         "date": date_str,
         "filename": filename,
@@ -67,6 +78,7 @@ def analyze_json(filepath):
         "input": meta.get("prefill_type", "?"),
         "n_tokens": meta.get("num_tokens", "?"),
         "foreground_app": meta.get("foreground_app", "-"),
+        "eviction": eviction_detail,
         "ttft": f"{ttft:.1f}" if isinstance(ttft, (int, float)) else ttft,
         "tbt": f"{tbt:.2f}" if isinstance(tbt, (int, float)) else tbt,
         "tps": f"{tps:.1f}" if isinstance(tps, (int, float)) else tps,
@@ -88,13 +100,14 @@ def generate_markdown(records):
     md += "- **Recent Run**: {}\n\n".format(records[0]["date"] if records else "N/A")
     
     md += "## Detailed Results\n\n"
-    md += "| Date | Model | Backend | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Proc Mem (MB) | Data | Plot |\n"
-    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    md += "| Date | Model | Backend | Eviction | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Proc Mem (MB) | Data | Plot |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
     
     for r in records:
         link = f"[JSON](data/{r['filename']})"
         fg_app = r.get('foreground_app', '-')
-        row = f"| {r['date']} | {r['model']} | {r['backend']} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {r.get('proc_mem', '-')} | {link} | {r.get('plot_link', '-')} |\n"
+        eviction = r.get('eviction', 'none')
+        row = f"| {r['date']} | {r['model']} | {r['backend']} | {eviction} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {r.get('proc_mem', '-')} | {link} | {r.get('plot_link', '-')} |\n"
         md += row
         
     md += "\n\n## Graphical Analysis\n"
