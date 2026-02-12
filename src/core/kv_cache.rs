@@ -28,9 +28,15 @@ impl KVCache {
         let shape = self.k_buffer.shape().dims();
         let heads = shape[2];
         let dim = shape[3];
-        let height = heads * dim;
-        let offset = self.current_pos * height;
-        let count = seq_len * height;
+        
+        // For Q4_0, offsets/counts are in block units (each block = 32 elements = 18 bytes)
+        let (offset, count) = if self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0 {
+            let blocks_per_pos = heads * dim / crate::core::quant::QK4_0;
+            (self.current_pos * blocks_per_pos, seq_len * blocks_per_pos)
+        } else {
+            let height = heads * dim;
+            (self.current_pos * height, seq_len * height)
+        };
         
         let backend = self.k_buffer.backend().clone();
         backend.copy_slice(new_k, &mut self.k_buffer, 0, offset, count)?;

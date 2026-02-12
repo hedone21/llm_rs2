@@ -57,8 +57,8 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gpu_attn: bool,
 
-    /// KV cache data type (f32 or f16)
-    #[arg(long, default_value = "f16")]
+    /// KV cache data type (f32, f16, or q4)
+    #[arg(long, default_value = "q4")]
     kv_type: String,
 }
 
@@ -215,15 +215,24 @@ fn main() -> anyhow::Result<()> {
     let kv_type = match args.kv_type.as_str() {
         "f32" => DType::F32,
         "f16" => DType::F16,
-        _ => anyhow::bail!("Unsupported KV type: {}. Use f32 or f16.", args.kv_type),
+        "q4" => DType::Q4_0,
+        _ => anyhow::bail!("Unsupported KV type: {}. Use f32, f16, or q4.", args.kv_type),
     };
-    let kv_elem_size = kv_type.size();
-    println!("KV cache type: {:?} ({}B per element)", kv_type, kv_elem_size);
+    // Calculate buffer size per KV cache
+    let n_values = max_seq_len * kv_heads * head_dim;
+    let kv_buf_size = match kv_type {
+        DType::Q4_0 => {
+            use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
+            (n_values / QK4_0) * std::mem::size_of::<BlockQ4_0>()
+        },
+        _ => n_values * kv_type.size(),
+    };
+    println!("KV cache type: {:?} ({}B total per layer)", kv_type, kv_buf_size);
 
     let mut kv_caches = Vec::new();
     for _ in 0..num_layers {
-        let k_buf = memory.alloc(max_seq_len * kv_heads * head_dim * kv_elem_size, kv_type)?;
-        let v_buf = memory.alloc(max_seq_len * kv_heads * head_dim * kv_elem_size, kv_type)?;
+        let k_buf = memory.alloc(kv_buf_size, kv_type)?;
+        let v_buf = memory.alloc(kv_buf_size, kv_type)?;
 
         let k = Tensor::new(
             Shape::new(vec![1, max_seq_len, kv_heads, head_dim]),

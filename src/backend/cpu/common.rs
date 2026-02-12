@@ -223,6 +223,27 @@ impl Backend for CpuBackendCommon {
                 });
                 Ok(())
             },
+            (DType::F32, DType::Q4_0) => {
+                use crate::core::quant::{BlockQ4_0, QK4_0};
+                let s = src.as_slice::<f32>();
+                let n_elements = s.len();
+                assert!(n_elements % QK4_0 == 0, "F32->Q4_0 cast: element count must be multiple of {}", QK4_0);
+                let n_blocks = n_elements / QK4_0;
+                let d = unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut BlockQ4_0, n_blocks) };
+                for bi in 0..n_blocks {
+                    let src_block = &s[bi * QK4_0..(bi + 1) * QK4_0];
+                    let max_val = src_block.iter().map(|v| v.abs()).fold(0.0f32, |x, y| x.max(y));
+                    let scale = max_val / 7.0;
+                    let inv_scale = if scale == 0.0 { 0.0 } else { 1.0 / scale };
+                    d[bi].d = half::f16::from_f32(scale);
+                    for z in 0..16 {
+                        let v0 = (src_block[z] * inv_scale).round().clamp(-8.0, 7.0) as i8;
+                        let v1 = (src_block[z + 16] * inv_scale).round().clamp(-8.0, 7.0) as i8;
+                        d[bi].qs[z] = (v0 + 8) as u8 | (((v1 + 8) as u8) << 4);
+                    }
+                }
+                Ok(())
+            },
             _ => Err(anyhow!("Unsupported cast: {:?} -> {:?}", src.dtype(), dst.dtype())),
         }
     }
@@ -324,6 +345,95 @@ impl Backend for CpuBackendCommon {
                         let v_row = &v_data[off..off + head_dim];
                         for d in 0..head_dim { kv_f32[d] = v_row[d].to_f32(); }
 
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            use std::arch::aarch64::*;
+                            let v_ptr = kv_f32.as_ptr();
+                            let o_ptr = out_h.as_mut_ptr();
+                            let w_v = vdupq_n_f32(w);
+                            let mut i = 0;
+                            while i + 16 <= head_dim {
+                                vst1q_f32(o_ptr.add(i), vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, vld1q_f32(v_ptr.add(i))));
+                                vst1q_f32(o_ptr.add(i+4), vfmaq_f32(vld1q_f32(o_ptr.add(i+4)), w_v, vld1q_f32(v_ptr.add(i+4))));
+                                vst1q_f32(o_ptr.add(i+8), vfmaq_f32(vld1q_f32(o_ptr.add(i+8)), w_v, vld1q_f32(v_ptr.add(i+8))));
+                                vst1q_f32(o_ptr.add(i+12), vfmaq_f32(vld1q_f32(o_ptr.add(i+12)), w_v, vld1q_f32(v_ptr.add(i+12))));
+                                i += 16;
+                            }
+                            while i + 4 <= head_dim {
+                                vst1q_f32(o_ptr.add(i), vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, vld1q_f32(v_ptr.add(i))));
+                                i += 4;
+                            }
+                            while i < head_dim { *o_ptr.add(i) += w * *v_ptr.add(i); i += 1; }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        for d in 0..head_dim { out_h[d] += w * kv_f32[d]; }
+                    }
+                });
+            },
+            DType::Q4_0 => {
+                use crate::core::quant::{BlockQ4_0, QK4_0};
+                let k_raw = unsafe { std::slice::from_raw_parts(k_cache.as_ptr() as *const BlockQ4_0, k_cache.size() / std::mem::size_of::<BlockQ4_0>()) };
+                let v_raw = unsafe { std::slice::from_raw_parts(v_cache.as_ptr() as *const BlockQ4_0, v_cache.size() / std::mem::size_of::<BlockQ4_0>()) };
+                let blocks_per_row = head_dim / QK4_0; // e.g. 64/32 = 2 blocks
+                out_data.par_chunks_mut(head_dim).enumerate().for_each(|(h, out_h)| {
+                    let kv_h = h / gqa_ratio;
+                    let q_off = h * head_dim;
+                    let q_vec = &q_data[q_off..q_off + head_dim];
+                    let mut scores = vec![0.0f32; cache_seq_len];
+                    let mut kv_f32 = vec![0.0f32; head_dim];
+
+                    // Q * K^T: dequantize K row, then dot
+                    for t in 0..cache_seq_len {
+                        let block_off = (t * num_heads_kv + kv_h) * blocks_per_row;
+                        // Dequantize K row into kv_f32
+                        for bi in 0..blocks_per_row {
+                            let mut tmp = [0.0f32; QK4_0];
+                            k_raw[block_off + bi].dequantize(&mut tmp);
+                            kv_f32[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                        }
+                        #[cfg(target_arch = "aarch64")]
+                        let score = unsafe {
+                            use std::arch::aarch64::*;
+                            let q_ptr = q_vec.as_ptr();
+                            let k_ptr = kv_f32.as_ptr();
+                            let mut sum_v = vdupq_n_f32(0.0);
+                            let mut i = 0;
+                            while i + 16 <= head_dim {
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i)), vld1q_f32(k_ptr.add(i)));
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i+4)), vld1q_f32(k_ptr.add(i+4)));
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i+8)), vld1q_f32(k_ptr.add(i+8)));
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i+12)), vld1q_f32(k_ptr.add(i+12)));
+                                i += 16;
+                            }
+                            while i + 4 <= head_dim {
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i)), vld1q_f32(k_ptr.add(i)));
+                                i += 4;
+                            }
+                            let mut s = vaddvq_f32(sum_v);
+                            while i < head_dim { s += *q_ptr.add(i) * *k_ptr.add(i); i += 1; }
+                            s
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let score: f32 = q_vec.iter().zip(kv_f32.iter()).map(|(a, b)| a * b).sum();
+                        scores[t] = score * scale;
+                    }
+
+                    // Softmax
+                    let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum_e = 0.0;
+                    for s in scores.iter_mut() { *s = (*s - max_v).exp(); sum_e += *s; }
+                    for s in scores.iter_mut() { *s /= sum_e; }
+
+                    // Weighted V sum: dequantize V row, then NEON FMA
+                    for d in 0..head_dim { out_h[d] = 0.0; }
+                    for t in 0..cache_seq_len {
+                        let w = scores[t];
+                        let block_off = (t * num_heads_kv + kv_h) * blocks_per_row;
+                        for bi in 0..blocks_per_row {
+                            let mut tmp = [0.0f32; QK4_0];
+                            v_raw[block_off + bi].dequantize(&mut tmp);
+                            kv_f32[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                        }
                         #[cfg(target_arch = "aarch64")]
                         unsafe {
                             use std::arch::aarch64::*;

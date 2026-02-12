@@ -93,16 +93,22 @@ impl LlamaLayer {
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
 
-        // Cast to F16 if KV cache is F16
-        if kv_cache.k_buffer.dtype() != DType::F32 {
+        // Cast to target dtype if KV cache is not F32
+        let kv_dtype = kv_cache.k_buffer.dtype();
+        if kv_dtype != DType::F32 {
             let n_elem = seq_len * n_heads_kv * head_dim;
-            let k_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
-            let mut k_f16 = Tensor::new(k_rope.shape().clone(), k_f16_buf, backend.clone());
-            backend.cast(&k_rope, &mut k_f16)?;
-            let v_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
-            let mut v_f16 = Tensor::new(v.shape().clone(), v_f16_buf, backend.clone());
-            backend.cast(&v, &mut v_f16)?;
-            kv_cache.update(&k_f16, &v_f16)?;
+            let buf_size = match kv_dtype {
+                DType::F16 => n_elem * 2,
+                DType::Q4_0 => (n_elem / crate::core::quant::QK4_0) * std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+                _ => n_elem * 4,
+            };
+            let k_cast_buf = memory.alloc(buf_size, kv_dtype)?;
+            let mut k_cast = Tensor::new(k_rope.shape().clone(), k_cast_buf, backend.clone());
+            backend.cast(&k_rope, &mut k_cast)?;
+            let v_cast_buf = memory.alloc(buf_size, kv_dtype)?;
+            let mut v_cast = Tensor::new(v.shape().clone(), v_cast_buf, backend.clone());
+            backend.cast(&v, &mut v_cast)?;
+            kv_cache.update(&k_cast, &v_cast)?;
         } else {
             kv_cache.update(&k_rope, &v)?;
         }
@@ -136,6 +142,35 @@ impl LlamaLayer {
                 backend.read_buffer(&v_cache, as_u8_mut(&mut v_vec))?;
     
                 (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
+            } else if k_cache.dtype() == DType::Q4_0 {
+                // Q4_0: dequantize KV cache to F32 temp buffers
+                use crate::core::quant::{BlockQ4_0, QK4_0};
+                let n_elems = cache_seq_len * n_heads_kv * head_dim;
+                let n_blocks = n_elems / QK4_0;
+                let k_blocks = unsafe { std::slice::from_raw_parts(k_cache.as_ptr() as *const BlockQ4_0, n_blocks) };
+                let v_blocks = unsafe { std::slice::from_raw_parts(v_cache.as_ptr() as *const BlockQ4_0, n_blocks) };
+                k_vec.resize(n_elems, 0.0f32);
+                v_vec.resize(n_elems, 0.0f32);
+                for bi in 0..n_blocks {
+                    let mut tmp = [0.0f32; QK4_0];
+                    k_blocks[bi].dequantize(&mut tmp);
+                    k_vec[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                    v_blocks[bi].dequantize(&mut tmp);
+                    v_vec[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                }
+                (q_rope.as_slice::<f32>(), &k_vec[..], &v_vec[..], out_attn.as_mut_slice::<f32>())
+            } else if k_cache.dtype() == DType::F16 {
+                // F16: convert KV cache to F32 temp buffers
+                let n_elems = cache_seq_len * n_heads_kv * head_dim;
+                let k_f16 = k_cache.as_slice::<half::f16>();
+                let v_f16 = v_cache.as_slice::<half::f16>();
+                k_vec.resize(n_elems, 0.0f32);
+                v_vec.resize(n_elems, 0.0f32);
+                for i in 0..n_elems {
+                    k_vec[i] = k_f16[i].to_f32();
+                    v_vec[i] = v_f16[i].to_f32();
+                }
+                (q_rope.as_slice::<f32>(), &k_vec[..], &v_vec[..], out_attn.as_mut_slice::<f32>())
             } else {
                  (q_rope.as_slice::<f32>(), k_cache.as_slice::<f32>(), v_cache.as_slice::<f32>(), out_attn.as_mut_slice::<f32>())
             };
@@ -283,19 +318,25 @@ impl LlamaLayer {
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
         
-        // 4. KV Cache Update - cast to F16 if needed
-        if kv_cache.k_buffer.dtype() != DType::F32 {
+        // 4. KV Cache Update - cast to target dtype if needed
+        let kv_dtype = kv_cache.k_buffer.dtype();
+        if kv_dtype != DType::F32 {
             let n_elem = n_heads_kv * head_dim;
-            let k_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
-            let mut k_f16 = Tensor::new(k_rope.shape().clone(), k_f16_buf, backend.clone());
-            backend.cast(&k_rope, &mut k_f16)?;
-            let v_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
-            let mut v_f16 = Tensor::new(
+            let buf_size = match kv_dtype {
+                DType::F16 => n_elem * 2,
+                DType::Q4_0 => (n_elem / crate::core::quant::QK4_0) * std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+                _ => n_elem * 4, // fallback
+            };
+            let k_cast_buf = memory.alloc(buf_size, kv_dtype)?;
+            let mut k_cast = Tensor::new(k_rope.shape().clone(), k_cast_buf, backend.clone());
+            backend.cast(&k_rope, &mut k_cast)?;
+            let v_cast_buf = memory.alloc(buf_size, kv_dtype)?;
+            let mut v_cast = Tensor::new(
                 Shape::new(vec![batch_size, 1, n_heads_kv, head_dim]),
-                v_f16_buf, backend.clone()
+                v_cast_buf, backend.clone()
             );
-            backend.cast(&ws.v, &mut v_f16)?;
-            kv_cache.update(&k_f16, &v_f16)?;
+            backend.cast(&ws.v, &mut v_cast)?;
+            kv_cache.update(&k_cast, &v_cast)?;
         } else {
             kv_cache.update(&k_rope, &ws.v)?;
         }
