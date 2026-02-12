@@ -28,6 +28,19 @@ class DeviceMonitor:
         self.gpu_path = self.find_gpu_clk_path()
         self.gpu_load_path = self.find_gpu_load_path()
         self.last_cpu_stats = None
+        self.target_pid = None
+        self.last_proc_cpu_stats = None # (utime+stime, timestamp)
+        
+    def find_target_pid(self, process_name="generate"):
+        try:
+            # Simple pidof
+            output = run_adb_command(f'shell "pidof {process_name}"', check=False)
+            if output and output.strip().isdigit():
+                self.target_pid = int(output.strip().split()[0]) # Take first if multiple
+                print(f"[Monitor] Found target process '{process_name}': {self.target_pid}")
+                return self.target_pid
+        except: pass
+        return None
         
     def find_gpu_clk_path(self):
         paths = [
@@ -137,7 +150,57 @@ class DeviceMonitor:
             used = mem_total - (mem_avail if mem_avail > 0 else mem_free)
             return used / 1024.0 # MB
         except: return 0.0
+    def get_process_mem_usage(self):
+        if not self.target_pid: return 0.0
+        try:
+            # VmRSS in /proc/[pid]/status or statm
+            # statm: size resident shared text lib data dt
+            # resident * 4KB (usually)
+            output = run_adb_command(f'shell "cat /proc/{self.target_pid}/statm"', check=False)
+            if output:
+                parts = output.split()
+                if len(parts) >= 2:
+                    rss_pages = int(parts[1])
+                    return (rss_pages * 4) / 1024.0 # MB (Assuming 4KB pages)
+        except: pass
+        return 0.0
 
+    def get_process_cpu_usage(self):
+        if not self.target_pid: return 0.0
+        try:
+            # /proc/[pid]/stat
+            # 14 (utime), 15 (stime)
+            output = run_adb_command(f'shell "cat /proc/{self.target_pid}/stat"', check=False)
+            if not output: return 0.0
+            
+            parts = output.split()
+            if len(parts) < 16: return 0.0
+            
+            # User + System time in clock ticks
+            utime = int(parts[13])
+            stime = int(parts[14])
+            total_time = utime + stime
+            
+            now = time.time()
+            usage = 0.0
+            
+            if self.last_proc_cpu_stats:
+                prev_total, prev_time = self.last_proc_cpu_stats
+                
+                delta_ticks = total_time - prev_total
+                delta_time = now - prev_time
+                
+                # We need SC_CLK_TCK. Usually 100 on Android/Linux arm64.
+                # usage % = (delta_ticks / clk_tck) / delta_time * 100
+                # Using 100 as heuristic for now. accurately finding it requires `getconf CLK_TCK`
+                clk_tck = 100.0 
+                
+                if delta_time > 0:
+                    usage = (delta_ticks / clk_tck) / delta_time * 100.0
+            
+            self.last_proc_cpu_stats = (total_time, now)
+            return usage
+        except: return 0.0
     def capture_snapshot(self):
         timestamp = datetime.now().isoformat()
         temp = self.get_temperature()
@@ -146,6 +209,14 @@ class DeviceMonitor:
         mem_used = self.get_memory_info()
         gpu_load = self.get_gpu_load()
         cpu_load = self.get_cpu_usage()
+        
+        # Process Specific
+        # Try to find PID if not found yet (it might start late)
+        if not self.target_pid: self.find_target_pid()
+        
+        proc_mem = self.get_process_mem_usage()
+        proc_cpu = self.get_process_cpu_usage()
+        
         return {
             "timestamp": timestamp,
             "temp_c": temp,
@@ -153,7 +224,9 @@ class DeviceMonitor:
             "cpu_freqs_khz": cpu_freqs,
             "mem_used_mb": mem_used,
             "gpu_load_percent": gpu_load,
-            "cpu_load_percent": cpu_load
+            "cpu_load_percent": cpu_load,
+            "process_mem_mb": proc_mem,
+            "process_cpu_percent": proc_cpu
         }
 
     def capture_baseline(self, duration=5.0):

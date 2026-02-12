@@ -1,15 +1,16 @@
 # 📊 LLM Research Benchmark Log
 
-Last Updated: 2026-02-12 13:06:42
+Last Updated: 2026-02-12 13:20:30
 
 ## Executive Summary
-- **Total Benchmarks**: 92
-- **Recent Run**: 2026-01-30 16:55
+- **Total Benchmarks**: 93
+- **Recent Run**: 2026-02-12 13:19
 
 ## Detailed Results
 
 | Date | Model | Backend | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Data | Plot |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| 2026-02-12 13:19 | llama3.2-1b | cpu | short_len | 128 | - | **N/A** | N/A | N/A | 28.9 -> 28.9 (Max 28.9) | 4787 | [JSON](data/profile_cpu_process_test.json) | [Graph](plots/profile_cpu_process_test.png) |
 | 2026-01-30 16:55 | llama3.2-1b | cpu | short_len | 128 | Chrome | **331.0** | 66.63 | 15.0 | 37.8 -> 38.2 (Max 38.2) | 4204 | [JSON](data/profile_cpu_short_len_128_fg_chrome_20260130_165512.json) | - |
 | 2026-01-30 16:55 | llama3.2-1b | cpu | short_len | 128 | YouTube | **414.3** | 79.64 | 12.6 | 38.6 -> 38.7 (Max 38.7) | 4376 | [JSON](data/profile_cpu_short_len_128_fg_youtube_20260130_165547.json) | - |
 | 2026-01-30 16:54 | llama3.2-1b | opencl | short_len | 128 | YouTube | **219.2** | 50.03 | 20.0 | 35.6 -> 35.8 (Max 35.8) | 4522 | [JSON](data/profile_opencl_short_len_128_fg_youtube_20260130_165438.json) | - |

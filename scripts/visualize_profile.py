@@ -58,6 +58,8 @@ def main():
     mem_used = [x.get("mem_used_mb", 0) for x in timeseries]
     gpu_load = [x.get("gpu_load_percent", 0) for x in timeseries]
     cpu_load = [x.get("cpu_load_percent", 0) for x in timeseries]
+    proc_cpu = [x.get("process_cpu_percent", 0) for x in timeseries]
+    proc_mem = [x.get("process_mem_mb", 0) for x in timeseries]
     
     # Handle variable number of CPU cores
     # cpu_freqs_khz is list of ints
@@ -113,15 +115,19 @@ def main():
     ax3.legend(loc="upper left")
     
     # 4. Memory Usage
-    ax4.plot(timestamps, mem_used, 'b-', label="Mem Used")
+    ax4.plot(timestamps, mem_used, 'b-', label="System Mem")
+    if any(proc_mem):
+        ax4.plot(timestamps, proc_mem, 'b--', label="Process Mem", alpha=0.7)
     ax4.set_ylabel("Memory (MB)")
     ax4.grid(True)
     ax4.legend(loc="upper left")
     
     # 5. CPU Load
-    ax5.plot(timestamps, cpu_load, 'm-', label="CPU Load")
+    ax5.plot(timestamps, cpu_load, 'm-', label="System Load")
+    if any(proc_cpu):
+        ax5.plot(timestamps, proc_cpu, 'm--', label="Process Load", alpha=0.7)
     ax5.set_ylabel("CPU Load (%)")
-    ax5.set_ylim(0, 105)
+    ax5.set_ylim(0, 105 + (max(proc_cpu) if proc_cpu else 0)) # Process load can exceed 100% on multi-core
     ax5.grid(True)
     ax5.legend(loc="upper left")
     
