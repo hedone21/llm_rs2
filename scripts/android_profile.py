@@ -30,6 +30,8 @@ class DeviceMonitor:
         self.last_cpu_stats = None
         self.target_pid = None
         self.last_proc_cpu_stats = None # (utime+stime, timestamp)
+        self.num_cores = len(self.get_cpu_freqs())
+        print(f"[Monitor] Detected {self.num_cores} CPU cores for normalization.")
         
     def find_target_pid(self, process_name="generate"):
         try:
@@ -197,6 +199,9 @@ class DeviceMonitor:
                 
                 if delta_time > 0:
                     usage = (delta_ticks / clk_tck) / delta_time * 100.0
+                    # Normalize by num_cores to match system-wide % (0-100 total)
+                    if self.num_cores > 0:
+                        usage /= self.num_cores
             
             self.last_proc_cpu_stats = (total_time, now)
             return usage

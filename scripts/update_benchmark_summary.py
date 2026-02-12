@@ -72,6 +72,7 @@ def analyze_json(filepath):
         "tps": f"{tps:.1f}" if isinstance(tps, (int, float)) else tps,
         "temp": temp_str,
         "mem": f"{baseline.get('avg_memory_used_mb', 0):.0f}",
+        "proc_mem": f"{sum(x.get('process_mem_mb', 0) for x in timeseries) / len(timeseries) if timeseries else 0:.0f}",
         "plot_link": f"[Graph](plots/{plot_filename})" if has_plot else "-"
     }
 
@@ -87,13 +88,13 @@ def generate_markdown(records):
     md += "- **Recent Run**: {}\n\n".format(records[0]["date"] if records else "N/A")
     
     md += "## Detailed Results\n\n"
-    md += "| Date | Model | Backend | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Data | Plot |\n"
-    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    md += "| Date | Model | Backend | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Proc Mem (MB) | Data | Plot |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
     
     for r in records:
         link = f"[JSON](data/{r['filename']})"
         fg_app = r.get('foreground_app', '-')
-        row = f"| {r['date']} | {r['model']} | {r['backend']} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {link} | {r.get('plot_link', '-')} |\n"
+        row = f"| {r['date']} | {r['model']} | {r['backend']} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {r.get('proc_mem', '-')} | {link} | {r.get('plot_link', '-')} |\n"
         md += row
         
     md += "\n\n## Graphical Analysis\n"
