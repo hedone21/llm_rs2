@@ -1,124 +1,205 @@
 <!DOCTYPE html>
 <html lang="en">
-
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LLM Benchmark Dashboard</title>
+    <meta name="description" content="Interactive dashboard for LLM benchmark profiling and analysis">
+
+    <!-- Plotly.js -->
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+
     <link rel="stylesheet" href="/static/css/style.css">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
-
 <body>
-    <div class="app-container">
-        <header>
-            <h1>LLM Benchmark Dashboard</h1>
-            <div class="actions">
-                <button id="refresh-btn">Refresh</button>
-                <button id="new-run-btn" class="primary">New Run</button>
+    <!-- Header -->
+    <header id="app-header">
+        <div class="header-left">
+            <h1>📊 LLM Benchmark Dashboard</h1>
+            <span class="header-subtitle" id="profile-count-badge">—</span>
+        </div>
+        <nav id="main-nav">
+            <button class="nav-btn active" data-tab="overview">Overview</button>
+            <button class="nav-btn" data-tab="table">Table</button>
+            <button class="nav-btn" data-tab="detail">Detail</button>
+            <button class="nav-btn" data-tab="compare">Compare</button>
+            <button class="nav-btn" data-tab="trends">Trends</button>
+            <button class="nav-btn" data-tab="runner">Run ⚡</button>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main id="app-main">
+
+        <!-- ── Overview Tab ──────────────────────────── -->
+        <section id="tab-overview" class="tab-panel active">
+            <div class="summary-cards" id="overview-cards"></div>
+            <div class="overview-grid">
+                <div class="card">
+                    <h3>Performance by Backend</h3>
+                    <div id="chart-backend-perf"></div>
+                </div>
+                <div class="card">
+                    <h3>Token Scaling</h3>
+                    <div id="chart-token-scaling"></div>
+                </div>
+                <div class="card">
+                    <h3>Thermal vs Performance</h3>
+                    <div id="chart-thermal-perf"></div>
+                </div>
+                <div class="card">
+                    <h3>Recent Benchmarks</h3>
+                    <div id="recent-list"></div>
+                </div>
             </div>
-        </header>
+        </section>
 
-        <main>
-            <section id="dashboard-view" class="view active">
-                <div class="stats-cards">
-                    <div class="card">
-                        <h3>Total Runs</h3>
-                        <span id="total-runs">0</span>
-                    </div>
-                    <div class="card">
-                        <h3>Latest Run</h3>
-                        <span id="latest-run-date">-</span>
-                    </div>
+        <!-- ── Table Tab ─────────────────────────────── -->
+        <section id="tab-table" class="tab-panel">
+            <div class="table-controls">
+                <div class="filter-group">
+                    <label>Backend</label>
+                    <select id="filter-backend">
+                        <option value="">All</option>
+                        <option value="cpu">CPU</option>
+                        <option value="opencl">OpenCL</option>
+                    </select>
                 </div>
-
-                <div class="table-container">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Date</th>
-                                <th>Model</th>
-                                <th>Backend</th>
-                                <th>Input</th>
-                                <th>Tokens</th>
-                                <th>TTFT (ms)</th>
-                                <th>TBT (ms)</th>
-                                <th>TPS</th>
-                                <th>Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="runs-table-body">
-                            <!-- Rows will be injected by JS -->
-                        </tbody>
-                    </table>
+                <div class="filter-group">
+                    <label>Prefill</label>
+                    <select id="filter-prefill"></select>
                 </div>
-            </section>
-
-            <section id="detail-view" class="view hidden">
-                <div class="detail-header">
-                    <button class="back-btn">&larr; Back</button>
-                    <h2 id="detail-title">Run Details</h2>
+                <div class="filter-group">
+                    <label>Tokens</label>
+                    <select id="filter-tokens"></select>
                 </div>
-
-                <div class="detail-content">
-                    <!-- Chart Section (Primary) -->
-                    <div class="card chart-container">
-                        <h3>Performance Metrics (Temperature & Memory)</h3>
-                        <canvas id="metricsChart"></canvas>
-                    </div>
-
-                    <!-- Metrics Summary Grid -->
-                    <div class="stats-cards" id="detail-metrics">
-                        <!-- Injected JS -->
-                    </div>
-
-                    <!-- JSON Viewer (Collapsible) -->
-                    <div class="card json-viewer">
-                        <details>
-                            <summary>Raw JSON Data & Configuration</summary>
-                            <pre id="detail-json"></pre>
-                        </details>
-                    </div>
+                <div class="filter-group">
+                    <label>Search</label>
+                    <input type="text" id="filter-search" placeholder="Filter by name...">
                 </div>
-            </section>
-        </main>
+                <div class="filter-group">
+                    <button class="btn btn-secondary" id="btn-clear-filters">Clear</button>
+                </div>
+            </div>
+            <div class="table-wrapper">
+                <table id="profile-table">
+                    <thead>
+                        <tr>
+                            <th data-sort="select"><input type="checkbox" id="select-all"></th>
+                            <th data-sort="date">Date ↕</th>
+                            <th data-sort="backend">Backend ↕</th>
+                            <th data-sort="prefill">Prefill ↕</th>
+                            <th data-sort="tokens">Tokens ↕</th>
+                            <th data-sort="ttft">TTFT (ms) ↕</th>
+                            <th data-sort="tbt">TBT (ms) ↕</th>
+                            <th data-sort="tps">T/s ↕</th>
+                            <th data-sort="temp">Temp (°C) ↕</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="profile-table-body"></tbody>
+                </table>
+            </div>
+            <div class="table-footer">
+                <span id="table-status"></span>
+                <div>
+                    <button class="btn btn-primary" id="btn-compare-selected" disabled>Compare Selected</button>
+                    <button class="btn btn-primary" id="btn-view-selected" disabled>View Detail</button>
+                </div>
+            </div>
+        </section>
 
-        <!-- Modal for New Run -->
-        <div id="run-modal" class="modal hidden">
-            <div class="modal-content">
-                <span class="close-modal">&times;</span>
-                <h2>Start New Benchmark</h2>
-                <form id="run-form">
-                    <div class="form-group">
+        <!-- ── Detail Tab ────────────────────────────── -->
+        <section id="tab-detail" class="tab-panel">
+            <div id="detail-header" class="detail-header">
+                <p class="placeholder-text">Select a profile from the Table view to see details.</p>
+            </div>
+            <div id="detail-meta" class="detail-meta"></div>
+            <div id="detail-charts"></div>
+        </section>
+
+        <!-- ── Compare Tab ───────────────────────────── -->
+        <section id="tab-compare" class="tab-panel">
+            <div id="compare-header" class="compare-header">
+                <p class="placeholder-text">Select 2+ profiles from the Table view and click "Compare Selected".</p>
+            </div>
+            <div id="compare-summary"></div>
+            <div id="compare-charts"></div>
+        </section>
+
+        <!-- ── Trends Tab ────────────────────────────── -->
+        <section id="tab-trends" class="tab-panel">
+            <div class="trends-controls">
+                <div class="filter-group">
+                    <label>Backend</label>
+                    <select id="trends-backend">
+                        <option value="">All</option>
+                        <option value="cpu">CPU</option>
+                        <option value="opencl">OpenCL</option>
+                    </select>
+                </div>
+                <div class="filter-group">
+                    <label>Metric</label>
+                    <select id="trends-metric">
+                        <option value="tokens_per_sec">Tokens/sec</option>
+                        <option value="tbt_ms">Avg TBT (ms)</option>
+                        <option value="ttft_ms">TTFT (ms)</option>
+                    </select>
+                </div>
+            </div>
+            <div id="trends-chart"></div>
+        </section>
+
+        <!-- ── Runner Tab ────────────────────────────── -->
+        <section id="tab-runner" class="tab-panel">
+            <div class="runner-form card">
+                <h3>⚡ Run Benchmark</h3>
+                <div class="form-row">
+                    <div class="filter-group">
                         <label>Backend</label>
-                        <select name="backend">
+                        <select id="run-backend">
                             <option value="cpu">CPU</option>
                             <option value="opencl">OpenCL</option>
                         </select>
                     </div>
-                    <div class="form-group">
-                        <label>Options</label>
-                        <div class="checkbox-group">
-                            <input type="checkbox" name="dry_run" id="dry_run"> <label for="dry_run">Dry Run</label>
-                            <input type="checkbox" name="skip_build" id="skip_build" checked> <label
-                                for="skip_build">Skip Build</label>
-                            <input type="checkbox" name="skip_push" id="skip_push" checked> <label for="skip_push">Skip
-                                Push</label>
-                        </div>
+                    <div class="filter-group">
+                        <label>Prefill Type</label>
+                        <select id="run-prefill">
+                            <option value="short_len">short_len</option>
+                            <option value="prefill_128">prefill_128</option>
+                            <option value="prefill_512">prefill_512</option>
+                            <option value="prefill_1024">prefill_1024</option>
+                            <option value="med_len">med_len</option>
+                        </select>
                     </div>
-                    <div class="form-actions">
-                        <button type="submit" class="primary">Start Run</button>
+                    <div class="filter-group">
+                        <label>Tokens</label>
+                        <input type="number" id="run-tokens" value="128" min="16" max="4096" step="16">
                     </div>
-                </form>
-
-                <div id="run-terminal" class="terminal hidden">
-                    <pre id="terminal-output"></pre>
                 </div>
+                <button class="btn btn-primary btn-run" id="btn-run-benchmark">▶ Start Benchmark</button>
             </div>
-        </div>
-    </div>
+            <div class="runner-status card" id="runner-status-panel" style="display:none;">
+                <h3>Execution Status</h3>
+                <div class="status-indicator" id="runner-indicator">
+                    <span class="status-dot"></span>
+                    <span class="status-text" id="runner-status-text">—</span>
+                </div>
+                <pre class="log-output" id="runner-log"></pre>
+            </div>
+        </section>
 
-    <script src="/static/js/main.js"></script>
+    </main>
+
+    <!-- Scripts -->
+    <script src="/static/js/presenter.js"></script>
+    <script src="/static/js/table.js"></script>
+    <script src="/static/js/compare.js"></script>
+    <script src="/static/js/runner.js"></script>
+    <script src="/static/js/app.js"></script>
 </body>
-
 </html>
