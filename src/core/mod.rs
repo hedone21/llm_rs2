@@ -5,3 +5,6 @@ pub mod shape;
 pub mod tensor;
 pub mod kv_cache;
 pub mod quant;
+pub mod sys_monitor;
+pub mod eviction;
+pub mod cache_manager;

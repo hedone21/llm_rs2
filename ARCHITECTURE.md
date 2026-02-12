@@ -34,6 +34,8 @@ graph TB
         Memory["Memory Interface"]
         Buffer["Buffer Interface"]
         KVCache["KV Cache"]
+        CacheManager["Cache Manager"]
+        EvictionPolicy["Eviction Policy"]
         Tensor["Tensor"]
         Layer["Layer"]
     end
@@ -59,6 +61,9 @@ graph TB
     OpenCL_Backend -->|implements| Backend
 
     SharedBuffer -->|implements| Buffer
+
+    CacheManager -->|uses| EvictionPolicy
+    CacheManager -->|manages| KVCache
 ```
 
 ### Key Components
