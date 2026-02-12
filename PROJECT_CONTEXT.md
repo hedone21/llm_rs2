@@ -106,20 +106,20 @@ adb shell "/data/local/tmp/micro_bench"
 For comprehensive performance analysis (CPU/GPU load, Thermal Throttling, Memory), use the dedicated Python scripts.
 
 > [!TIP]
-> **Detailed Instructions**: See [benchmarks/GUIDE.md](benchmarks/GUIDE.md) for the complete end-to-end workflow.
-> **Research Log**: See [benchmarks/README.md](benchmarks/README.md) for historical results and plots.
+> **Detailed Instructions**: See [results/GUIDE.md](results/GUIDE.md) for the complete end-to-end workflow.
+> **Research Log**: See [results/README.md](results/README.md) for historical results and plots.
 
 ### Quick Commands
 ```bash
 # 1. Profile (CPU 128 Tokens)
 python3 scripts/android_profile.py \
     --cmd "/data/local/tmp/generate --model-path ... -n 128 -b cpu" \
-    --output-dir benchmarks/data
+    --output-dir results/data
 
 # 2. Visualize
 python3 scripts/visualize_profile.py \
-    benchmarks/data/profile_latest.json \
-    --output benchmarks/plots/profile_latest.png
+    results/data/profile_latest.json \
+    --output results/plots/profile_latest.png
 
 # 3. Update Log
 python3 scripts/update_benchmark_summary.py

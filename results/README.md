@@ -1,6 +1,6 @@
 # 📊 LLM Research Benchmark Log
 
-Last Updated: 2026-01-30 16:56:10
+Last Updated: 2026-02-12 13:06:42
 
 ## Executive Summary
 - **Total Benchmarks**: 92
@@ -105,4 +105,4 @@ Last Updated: 2026-01-30 16:56:10
 
 
 ## Graphical Analysis
-Plots available in `benchmarks/plots/`. (Manually added below)
+Plots available in `results/plots/`. (Manually added below)

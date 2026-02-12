@@ -3,7 +3,7 @@ import json
 import glob
 from datetime import datetime
 
-BENCHMARK_DIR = "benchmarks"
+BENCHMARK_DIR = "results"
 DATA_DIR = os.path.join(BENCHMARK_DIR, "data")
 PLOTS_DIR = os.path.join(BENCHMARK_DIR, "plots")
 README_PATH = os.path.join(BENCHMARK_DIR, "README.md")
@@ -97,7 +97,7 @@ def generate_markdown(records):
         md += row
         
     md += "\n\n## Graphical Analysis\n"
-    md += "Plots available in `benchmarks/plots/`. (Manually added below)\n"
+    md += "Plots available in `results/plots/`. (Manually added below)\n"
     # Auto-add existing plots?
     # plots = glob.glob(os.path.join(PLOTS_DIR, "*.png"))
     # for p in plots:

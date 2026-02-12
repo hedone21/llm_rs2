@@ -59,7 +59,7 @@ python3 scripts/android_profile.py \
         --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt \
         --num-tokens 128 \
         -b cpu" \
-    --output-dir benchmarks/data
+    --output-dir results/data
 ```
 
 **Example: GPU (OpenCL) Short Prefill**
@@ -68,7 +68,7 @@ python3 scripts/android_profile.py \
     --cmd "/data/local/tmp/generate \
         ... \
         -b opencl" \
-    --output-dir benchmarks/data
+    --output-dir results/data
 ```
 
 ### Step 4: Visualize Results
@@ -83,19 +83,19 @@ Generate a PNG plot from the profiling JSON. The plot includes:
 
 ```bash
 python3 scripts/visualize_profile.py \
-    benchmarks/data/profile_name.json \
-    --output benchmarks/plots/profile_name.png
+    results/data/profile_name.json \
+    --output results/plots/profile_name.png
 ```
 
 ### Step 5: Update Research Log
 
-Update the consolidated `benchmarks/README.md` table with the new results.
+Update the consolidated `results/README.md` table with the new results.
 
 ```bash
 python3 scripts/update_benchmark_summary.py
 ```
 
-This script scans `benchmarks/data/` and `benchmarks/plots/` to auto-generate the summary table.
+This script scans `results/data/` and `results/plots/` to auto-generate the summary table.
 
 ## 4. Output Data Structure
 

@@ -31,7 +31,7 @@ Use the `auto_profile.sh` script to Run -> Visualize -> Update Log in one step.
 ```
 
 ### 2. Manual Profiling (Legacy)
-If you need granular control, refer to `benchmarks/GUIDE.md` for individual script usage (`android_profile.py`, `visualize_profile.py`, etc.).
+If you need granular control, refer to `results/GUIDE.md` for individual script usage (`android_profile.py`, `visualize_profile.py`, etc.).
 
 ## Best Practices
 - **Build First**: Ensure the binary is built and pushed (use `testing` skill for this).

@@ -42,12 +42,12 @@ echo ""
 echo "[1/3] Running On-Device Profiling..."
 # Note: we use existing android_profile.py
 # Using a temp output dir initially or direct to benchmarks/data?
-# Best practice: direct to benchmarks/data as per GUIDE
-python3 scripts/android_profile.py --cmd "$CMD" --output-dir benchmarks/data
+# Best practice: direct to results/data as per GUIDE
+python3 scripts/android_profile.py --cmd "$CMD" --output-dir results/data
 
 # Find the generated file. android_profile.py generates a timestamped filename.
-# We need to find the most recent one in benchmarks/data
-LATEST_JSON=$(ls -t benchmarks/data/*.json | head -n 1)
+# We need to find the most recent one in results/data
+LATEST_JSON=$(ls -t results/data/*.json | head -n 1)
 echo "Captured Profile: $LATEST_JSON"
 
 # 2. Visualize
@@ -55,7 +55,7 @@ echo ""
 echo "[2/3] Generating Visualization..."
 # Construct output PNG path
 BASENAME=$(basename "$LATEST_JSON" .json)
-PNG_PATH="benchmarks/plots/${BASENAME}.png"
+PNG_PATH="results/plots/${BASENAME}.png"
 
 python3 scripts/visualize_profile.py "$LATEST_JSON" --output "$PNG_PATH"
 echo "Saved Plot: $PNG_PATH"
@@ -67,4 +67,4 @@ python3 scripts/update_benchmark_summary.py
 
 echo "=========================================="
 echo "✅ Profiling Pipeline Complete!"
-echo "Check benchmarks/README.md for the new entry."
+echo "Check results/README.md for the new entry."
