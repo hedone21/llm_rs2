@@ -1,2 +1,10 @@
 /models
 /target
+__pycache__/
+*.pyc
+.venv/
+.env
+.DS_Store
+*.egg-info/
+dist/
+build/
