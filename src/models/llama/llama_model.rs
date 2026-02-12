@@ -12,6 +12,7 @@ use crate::core::shape::Shape;
 use crate::core::buffer::DType;
 use crate::core::memory::Memory;
 use crate::core::kv_cache::KVCache;
+use crate::core::cache_manager::CacheManager;
 use crate::layers::llama_layer::{LlamaLayer, LlamaLayerForwardArgs};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::galloc::Galloc;
@@ -47,6 +48,9 @@ pub struct LlamaModelForwardArgs<'a> {
     pub x_gen: Option<&'a mut Tensor>,
     pub workspace: Option<&'a mut LayerWorkspace>,
     pub use_gpu_attn: bool,
+    /// Optional cache manager for dynamic KV cache eviction.
+    /// When provided, `maybe_evict()` is called after the layer pass.
+    pub cache_manager: Option<&'a CacheManager>,
 }
 
 impl LlamaModel {
@@ -333,6 +337,18 @@ impl LlamaModel {
                 workspace: workspace.as_deref_mut(),
                 use_gpu_attn
             })?;
+        }
+
+        // 2.5 Dynamic KV cache eviction (if configured)
+        if let Some(cm) = args.cache_manager {
+            let result = cm.maybe_evict(kv_caches)?;
+            if result.evicted {
+                log::info!(
+                    "[CacheManager] Evicted {} tokens, new_pos={}",
+                    result.tokens_removed,
+                    result.new_pos
+                );
+            }
         }
         
         // 3. Final Norm

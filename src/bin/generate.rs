@@ -2,9 +2,14 @@ use clap::Parser;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
+use llm_rs2::core::cache_manager::CacheManager;
+use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
+use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
+use llm_rs2::core::eviction::snap_kv::SnapKVPolicy;
 use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
+use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
@@ -60,6 +65,22 @@ struct Args {
     /// KV cache data type (f32, f16, or q4)
     #[arg(long, default_value = "q4")]
     kv_type: String,
+
+    /// Eviction policy for KV cache management (none, sliding, snapkv)
+    #[arg(long, default_value = "none")]
+    eviction_policy: String,
+
+    /// Window size for sliding window / snapkv eviction (tokens)
+    #[arg(long, default_value_t = 1024)]
+    eviction_window: usize,
+
+    /// Number of prefix tokens to protect from eviction (e.g., system prompt)
+    #[arg(long, default_value_t = 0)]
+    protected_prefix: usize,
+
+    /// Memory threshold in MB below which eviction triggers
+    #[arg(long, default_value_t = 256)]
+    memory_threshold_mb: usize,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -263,6 +284,43 @@ fn main() -> anyhow::Result<()> {
     let mut ttft_ms = 0.0;
     let mut tbt_values = Vec::new();
 
+    // 4.5 Setup CacheManager
+    let cache_manager = {
+        let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args.eviction_policy.as_str() {
+            "none" => Box::new(NoEvictionPolicy::new()),
+            "sliding" => Box::new(SlidingWindowPolicy::new(
+                args.eviction_window,
+                args.protected_prefix,
+            )),
+            "snapkv" => Box::new(SnapKVPolicy::new(
+                args.eviction_window,
+                0.5,
+                args.protected_prefix,
+            )),
+            other => anyhow::bail!(
+                "Unknown eviction policy: '{}'. Use: none, sliding, snapkv",
+                other
+            ),
+        };
+        let monitor = Box::new(LinuxSystemMonitor);
+        let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
+        CacheManager::new(policy, monitor, threshold_bytes, 0.75)
+    };
+
+    if args.eviction_policy != "none" {
+        println!(
+            "Eviction: policy={}, window={}, prefix={}, threshold={}MB",
+            args.eviction_policy, args.eviction_window, args.protected_prefix, args.memory_threshold_mb
+        );
+    }
+
+    // Determine whether to pass cache_manager
+    let cm_ref = if args.eviction_policy == "none" {
+        None
+    } else {
+        Some(&cache_manager)
+    };
+
     // Pre-allocate generation buffers
     let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
     let mut logits = Tensor::new(
@@ -320,6 +378,7 @@ fn main() -> anyhow::Result<()> {
             x_gen: None,
             workspace: None,
             use_gpu_attn: args.gpu_attn,
+            cache_manager: cm_ref,
         })?;
 
         // Sample last token
@@ -417,6 +476,7 @@ fn main() -> anyhow::Result<()> {
                 x_gen: Some(&mut x_gen),
                 workspace: Some(&mut gen_ws),
                 use_gpu_attn: args.gpu_attn,
+                cache_manager: cm_ref,
             })?;
 
             // Sample
