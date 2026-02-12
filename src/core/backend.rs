@@ -81,6 +81,9 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    // Type casting (e.g. F32 → F16)
+    fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()>;
+
     // Synchronization (for benchmarking)
     fn synchronize(&self) -> Result<()> { Ok(()) }
     

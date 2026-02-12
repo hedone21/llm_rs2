@@ -504,3 +504,117 @@ kernel void kernel_attn_gen(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 }
+
+// ============================================================
+// F16 KV Cache Support Kernels
+// ============================================================
+
+// Convert F32 buffer to F16 buffer element-wise
+kernel void kernel_cast_f32_to_f16(
+    global float * src,
+    global half * dst,
+    int count
+) {
+    int gid = get_global_id(0);
+    if (gid < count) {
+        dst[gid] = (half)src[gid];
+    }
+}
+
+// Attention generation kernel with F16 KV cache
+// Q is F32, K/V cache is F16, output is F32
+kernel void kernel_attn_gen_half(
+    global float * Q,            // [num_heads_q, head_dim]
+    global half * K,             // [cache_seq_len, num_heads_kv, head_dim]
+    global half * V,             // [cache_seq_len, num_heads_kv, head_dim]
+    global float * O,            // [num_heads_q, head_dim]
+    int head_dim,
+    int num_heads_q,
+    int num_heads_kv,
+    int cache_seq_len,
+    float scale,
+    local float * scratch        // size = local_size
+) {
+    int head_idx = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    int gqa_ratio = num_heads_q / num_heads_kv;
+    int kv_head = head_idx / gqa_ratio;
+
+    global float * q_ptr = Q + head_idx * head_dim;
+
+    // === PASS 1: Compute max score ===
+    float my_max = -INFINITY;
+    for (int t = lid; t < cache_seq_len; t += local_size) {
+        global half * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q_ptr[d] * vload_half(d, k_ptr);
+        }
+        score *= scale;
+        my_max = fmax(my_max, score);
+    }
+
+    scratch[lid] = my_max;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] = fmax(scratch[lid], scratch[lid + s]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float max_score = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Compute exp sum
+    float my_sum = 0.0f;
+    for (int t = lid; t < cache_seq_len; t += local_size) {
+        global half * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q_ptr[d] * vload_half(d, k_ptr);
+        }
+        my_sum += exp(score * scale - max_score);
+    }
+
+    scratch[lid] = my_sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float total_sum = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // === PASS 2: Weighted V sum ===
+    float out_local[64];
+    for (int d = 0; d < head_dim; d++) {
+        out_local[d] = 0.0f;
+    }
+
+    for (int t = lid; t < cache_seq_len; t += local_size) {
+        global half * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        float score = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            score += q_ptr[d] * vload_half(d, k_ptr);
+        }
+        float weight = exp(score * scale - max_score) / total_sum;
+
+        global half * v_ptr = V + (t * num_heads_kv + kv_head) * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            out_local[d] += weight * vload_half(d, v_ptr);
+        }
+    }
+
+    for (int d = 0; d < head_dim; d++) {
+        scratch[lid] = out_local[d];
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int s = local_size / 2; s > 0; s >>= 1) {
+            if (lid < s) scratch[lid] += scratch[lid + s];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) {
+            O[head_idx * head_dim + d] = scratch[0];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+}

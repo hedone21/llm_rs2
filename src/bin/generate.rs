@@ -56,6 +56,10 @@ struct Args {
     /// Use GPU kernel for attention computation (OpenCL only)
     #[arg(long, default_value_t = false)]
     gpu_attn: bool,
+
+    /// KV cache data type (f32 or f16)
+    #[arg(long, default_value = "f16")]
+    kv_type: String,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -208,10 +212,18 @@ fn main() -> anyhow::Result<()> {
         num_layers, kv_heads, head_dim, max_seq_len
     );
 
+    let kv_type = match args.kv_type.as_str() {
+        "f32" => DType::F32,
+        "f16" => DType::F16,
+        _ => anyhow::bail!("Unsupported KV type: {}. Use f32 or f16.", args.kv_type),
+    };
+    let kv_elem_size = kv_type.size();
+    println!("KV cache type: {:?} ({}B per element)", kv_type, kv_elem_size);
+
     let mut kv_caches = Vec::new();
     for _ in 0..num_layers {
-        let k_buf = memory.alloc(max_seq_len * kv_heads * head_dim * 4, DType::F32)?;
-        let v_buf = memory.alloc(max_seq_len * kv_heads * head_dim * 4, DType::F32)?;
+        let k_buf = memory.alloc(max_seq_len * kv_heads * head_dim * kv_elem_size, kv_type)?;
+        let v_buf = memory.alloc(max_seq_len * kv_heads * head_dim * kv_elem_size, kv_type)?;
 
         let k = Tensor::new(
             Shape::new(vec![1, max_seq_len, kv_heads, head_dim]),

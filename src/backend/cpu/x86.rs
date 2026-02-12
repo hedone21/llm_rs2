@@ -81,6 +81,15 @@ impl Backend for CpuBackendAVX2 {
     fn copy_from(&self, t: &Tensor) -> Result<Tensor> {
         CpuBackendCommon::new().copy_from(t)
     }
+
+    fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        CpuBackendCommon::new().cast(src, dst)
+    }
+
+    fn attention_gen(&self, q: &Tensor, k_cache: &Tensor, v_cache: &Tensor, out: &mut Tensor,
+                     num_heads_q: usize, num_heads_kv: usize, head_dim: usize, cache_seq_len: usize) -> Result<()> {
+        CpuBackendCommon::new().attention_gen(q, k_cache, v_cache, out, num_heads_q, num_heads_kv, head_dim, cache_seq_len)
+    }
 }
 
 impl CpuBackendAVX2 {

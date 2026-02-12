@@ -44,6 +44,8 @@ struct KernelCache {
     kernel_get_rows_q4_0: CoreKernel,
     kernel_get_rows_f32: CoreKernel,
     kernel_attn_gen: CoreKernel,
+    kernel_cast_f32_to_f16: CoreKernel,
+    kernel_attn_gen_half: CoreKernel,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -157,6 +159,8 @@ impl OpenCLBackend {
             kernel_get_rows_q4_0: ocl::core::create_kernel(&get_rows_program, "kernel_get_rows_q4_0")?,
             kernel_get_rows_f32: ocl::core::create_kernel(&get_rows_program, "kernel_get_rows_f32")?,
             kernel_attn_gen: ocl::core::create_kernel(&simple_ops_program, "kernel_attn_gen")?,
+            kernel_cast_f32_to_f16: ocl::core::create_kernel(&simple_ops_program, "kernel_cast_f32_to_f16")?,
+            kernel_attn_gen_half: ocl::core::create_kernel(&simple_ops_program, "kernel_attn_gen_half")?,
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -273,6 +277,8 @@ impl Backend for OpenCLBackend {
             kernel_get_rows_q4_0: src_kernels.kernel_get_rows_q4_0.clone(),
             kernel_get_rows_f32: src_kernels.kernel_get_rows_f32.clone(),
             kernel_attn_gen: src_kernels.kernel_attn_gen.clone(),
+            kernel_cast_f32_to_f16: src_kernels.kernel_cast_f32_to_f16.clone(),
+            kernel_attn_gen_half: src_kernels.kernel_attn_gen_half.clone(),
         };
         drop(src_kernels); // Release lock before potentially blocking operations
         
@@ -441,6 +447,29 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        match (src.dtype(), dst.dtype()) {
+            (DType::F32, DType::F16) => {
+                let src_buf = get_cl_mem(src.buffer().as_ref())?;
+                let dst_buf = get_cl_mem(dst.buffer().as_ref())?;
+                let num_elements: usize = src.shape().dims().iter().product();
+                let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+                let kernel = &kernels.kernel_cast_f32_to_f16;
+                unsafe {
+                    ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(src_buf))?;
+                    ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(dst_buf))?;
+                    ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(num_elements as i32)))?;
+                    let gws: [usize; 3] = [((num_elements + 63) / 64) * 64, 1, 1];
+                    let lws: [usize; 3] = [64, 1, 1];
+                    ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &gws, Some(lws),
+                        None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+                }
+                Ok(())
+            },
+            _ => Err(anyhow!("OpenCL cast: unsupported {:?} -> {:?}", src.dtype(), dst.dtype())),
+        }
+    }
+
     fn attention_gen(&self, q: &Tensor, k_cache: &Tensor, v_cache: &Tensor, out: &mut Tensor,
                      num_heads_q: usize, num_heads_kv: usize, head_dim: usize, cache_seq_len: usize) -> Result<()> {
         let q_buf = get_cl_mem(q.buffer().as_ref())
@@ -453,11 +482,16 @@ impl Backend for OpenCLBackend {
             .map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
         
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let local_size = 64usize;  // Adreno subgroup size
+        let local_size = 64usize;
         let local_mem_size = local_size * std::mem::size_of::<f32>();
         
         let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
-        let kernel = &kernels.kernel_attn_gen;
+        
+        // Select kernel based on KV cache dtype
+        let kernel = match k_cache.dtype() {
+            DType::F16 => &kernels.kernel_attn_gen_half,
+            _ => &kernels.kernel_attn_gen,
+        };
         
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
@@ -471,7 +505,6 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
             ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
             
-            // One workgroup per Q head
             let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
             

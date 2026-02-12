@@ -51,6 +51,7 @@ impl LlamaLayer {
                     kv_cache,
                     start_pos,
                     backend,
+                    memory,
                     ws,
                     rms_norm_eps,
                     rope_theta,
@@ -92,7 +93,19 @@ impl LlamaLayer {
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
 
-        kv_cache.update(&k_rope, &v)?;
+        // Cast to F16 if KV cache is F16
+        if kv_cache.k_buffer.dtype() != DType::F32 {
+            let n_elem = seq_len * n_heads_kv * head_dim;
+            let k_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
+            let mut k_f16 = Tensor::new(k_rope.shape().clone(), k_f16_buf, backend.clone());
+            backend.cast(&k_rope, &mut k_f16)?;
+            let v_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
+            let mut v_f16 = Tensor::new(v.shape().clone(), v_f16_buf, backend.clone());
+            backend.cast(&v, &mut v_f16)?;
+            kv_cache.update(&k_f16, &v_f16)?;
+        } else {
+            kv_cache.update(&k_rope, &v)?;
+        }
         
         let cache_seq_len = kv_cache.current_pos; 
         let (k_cache, v_cache) = kv_cache.get_view(0); 
@@ -227,6 +240,7 @@ impl LlamaLayer {
         let kv_cache = args.kv_cache;
         let start_pos = args.start_pos;
         let backend = args.backend;
+        let memory = args.memory;
         let ws = args.ws;
         let rms_norm_eps = args.rms_norm_eps;
         let rope_theta = args.rope_theta;
@@ -269,35 +283,46 @@ impl LlamaLayer {
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
         
-        // 4. KV Cache Update
-
-        kv_cache.update(&k_rope, &ws.v)?;
+        // 4. KV Cache Update - cast to F16 if needed
+        if kv_cache.k_buffer.dtype() != DType::F32 {
+            let n_elem = n_heads_kv * head_dim;
+            let k_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
+            let mut k_f16 = Tensor::new(k_rope.shape().clone(), k_f16_buf, backend.clone());
+            backend.cast(&k_rope, &mut k_f16)?;
+            let v_f16_buf = memory.alloc(n_elem * 2, DType::F16)?;
+            let mut v_f16 = Tensor::new(
+                Shape::new(vec![batch_size, 1, n_heads_kv, head_dim]),
+                v_f16_buf, backend.clone()
+            );
+            backend.cast(&ws.v, &mut v_f16)?;
+            kv_cache.update(&k_f16, &v_f16)?;
+        } else {
+            kv_cache.update(&k_rope, &ws.v)?;
+        }
         
         // 5. Attention - use GPU kernel for OpenCL
         let cache_seq_len = kv_cache.current_pos;
         let (k_cache, v_cache) = kv_cache.get_view(0);
 
-        if backend.name() == "OpenCL" && use_gpu_attn {
-            // GPU attention - no data transfer!
+        if (backend.name() == "OpenCL" && use_gpu_attn) || k_cache.dtype() != DType::F32 {
+            // GPU attention or F16 KV cache - use backend's dtype-aware implementation
             backend.attention_gen(&q_rope, &k_cache, &v_cache, &mut ws.out_attn,
                                   n_heads_q, n_heads_kv, head_dim, cache_seq_len)?;
         } else {
-            // CPU attention path (Fallback for OpenCL or native CPU)
+            // CPU attention path (Fallback for OpenCL or native CPU F32)
             let mut q_vec = Vec::new();
             let mut k_vec = Vec::new();
             let mut v_vec = Vec::new();
-            let mut out_vec = Vec::new(); // Only needed for OpenCL writeback
+            let mut out_vec = Vec::new();
 
             let is_opencl = backend.name() == "OpenCL";
 
             let (q_data, k_data, v_data, out_ptr) = if is_opencl {
-                 // OpenCL: Must read back to CPU
                  q_vec.resize(q_rope.size() / 4, 0.0);
                  k_vec.resize(k_cache.size() / 4, 0.0);
                  v_vec.resize(v_cache.size() / 4, 0.0);
                  out_vec.resize(ws.out_attn.size() / 4, 0.0);
 
-                 // Helper to cast slice
                  fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
                      unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, v.len() * 4) }
                  }
@@ -308,7 +333,6 @@ impl LlamaLayer {
 
                  (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
             } else {
-                 // Native CPU: Direct slice access
                  (
                      q_rope.as_slice::<f32>(),
                      k_cache.as_slice::<f32>(),
@@ -701,6 +725,7 @@ pub struct LlamaForwardGenArgs<'a> {
     pub kv_cache: &'a mut KVCache,
     pub start_pos: usize,
     pub backend: &'a Arc<dyn Backend>,
+    pub memory: &'a dyn Memory,
     pub ws: &'a mut super::workspace::LayerWorkspace,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,

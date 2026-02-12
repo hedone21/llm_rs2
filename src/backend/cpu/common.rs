@@ -204,6 +204,155 @@ impl Backend for CpuBackendCommon {
         // User might mix implementations, but tensor belongs to a backend instance.
         Ok(Tensor::new(t.shape().clone(), Arc::new(new_buf), Arc::new(CpuBackendCommon)))
     }
+
+    fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        match (src.dtype(), dst.dtype()) {
+            (DType::F32, DType::F16) => {
+                let s = src.as_slice::<f32>();
+                let d = dst.as_mut_slice::<half::f16>();
+                d.par_iter_mut().zip(s.par_iter()).for_each(|(d_val, s_val)| {
+                    *d_val = half::f16::from_f32(*s_val);
+                });
+                Ok(())
+            },
+            (DType::F16, DType::F32) => {
+                let s = src.as_slice::<half::f16>();
+                let d = dst.as_mut_slice::<f32>();
+                d.par_iter_mut().zip(s.par_iter()).for_each(|(d_val, s_val)| {
+                    *d_val = s_val.to_f32();
+                });
+                Ok(())
+            },
+            _ => Err(anyhow!("Unsupported cast: {:?} -> {:?}", src.dtype(), dst.dtype())),
+        }
+    }
+
+    fn attention_gen(&self, q: &Tensor, k_cache: &Tensor, v_cache: &Tensor, out: &mut Tensor,
+                     num_heads_q: usize, num_heads_kv: usize, head_dim: usize, cache_seq_len: usize) -> Result<()> {
+        let q_data = q.as_slice::<f32>();
+        let out_data = out.as_mut_slice::<f32>();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = num_heads_q / num_heads_kv;
+
+        match k_cache.dtype() {
+            DType::F32 => {
+                let k_data = k_cache.as_slice::<f32>();
+                let v_data = v_cache.as_slice::<f32>();
+                out_data.par_chunks_mut(head_dim).enumerate().for_each(|(h, out_h)| {
+                    let kv_h = h / gqa_ratio;
+                    let q_off = h * head_dim;
+                    let q_vec = &q_data[q_off..q_off + head_dim];
+                    let mut scores = vec![0.0f32; cache_seq_len];
+                    for t in 0..cache_seq_len {
+                        let off = (t * num_heads_kv + kv_h) * head_dim;
+                        let k_vec = &k_data[off..off + head_dim];
+                        let s: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
+                        scores[t] = s * scale;
+                    }
+                    // softmax
+                    let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum_e = 0.0;
+                    for s in scores.iter_mut() { *s = (*s - max_v).exp(); sum_e += *s; }
+                    for s in scores.iter_mut() { *s /= sum_e; }
+                    // weighted sum
+                    for d in 0..head_dim { out_h[d] = 0.0; }
+                    for t in 0..cache_seq_len {
+                        let w = scores[t];
+                        let off = (t * num_heads_kv + kv_h) * head_dim;
+                        let v_vec = &v_data[off..off + head_dim];
+                        for d in 0..head_dim { out_h[d] += w * v_vec[d]; }
+                    }
+                });
+            },
+            DType::F16 => {
+                let k_data = k_cache.as_slice::<half::f16>();
+                let v_data = v_cache.as_slice::<half::f16>();
+                out_data.par_chunks_mut(head_dim).enumerate().for_each(|(h, out_h)| {
+                    let kv_h = h / gqa_ratio;
+                    let q_off = h * head_dim;
+                    let q_vec = &q_data[q_off..q_off + head_dim];
+                    let mut scores = vec![0.0f32; cache_seq_len];
+                    // Thread-local F32 buffer for converted F16 data
+                    let mut kv_f32 = vec![0.0f32; head_dim];
+
+                    // Q * K^T: convert K row to F32, then NEON dot
+                    for t in 0..cache_seq_len {
+                        let off = (t * num_heads_kv + kv_h) * head_dim;
+                        let k_row = &k_data[off..off + head_dim];
+                        // Bulk F16→F32 conversion (compiler auto-vectorizes on aarch64)
+                        for d in 0..head_dim { kv_f32[d] = k_row[d].to_f32(); }
+
+                        #[cfg(target_arch = "aarch64")]
+                        let score = unsafe {
+                            use std::arch::aarch64::*;
+                            let q_ptr = q_vec.as_ptr();
+                            let k_ptr = kv_f32.as_ptr();
+                            let mut sum_v = vdupq_n_f32(0.0);
+                            let mut i = 0;
+                            while i + 16 <= head_dim {
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i)), vld1q_f32(k_ptr.add(i)));
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i+4)), vld1q_f32(k_ptr.add(i+4)));
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i+8)), vld1q_f32(k_ptr.add(i+8)));
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i+12)), vld1q_f32(k_ptr.add(i+12)));
+                                i += 16;
+                            }
+                            while i + 4 <= head_dim {
+                                sum_v = vfmaq_f32(sum_v, vld1q_f32(q_ptr.add(i)), vld1q_f32(k_ptr.add(i)));
+                                i += 4;
+                            }
+                            let mut s = vaddvq_f32(sum_v);
+                            while i < head_dim { s += *q_ptr.add(i) * *k_ptr.add(i); i += 1; }
+                            s
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let score: f32 = q_vec.iter().zip(kv_f32.iter()).map(|(a, b)| a * b).sum();
+
+                        scores[t] = score * scale;
+                    }
+
+                    // Softmax
+                    let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum_e = 0.0;
+                    for s in scores.iter_mut() { *s = (*s - max_v).exp(); sum_e += *s; }
+                    for s in scores.iter_mut() { *s /= sum_e; }
+
+                    // Weighted V sum: convert V row to F32, then NEON FMA
+                    for d in 0..head_dim { out_h[d] = 0.0; }
+                    for t in 0..cache_seq_len {
+                        let w = scores[t];
+                        let off = (t * num_heads_kv + kv_h) * head_dim;
+                        let v_row = &v_data[off..off + head_dim];
+                        for d in 0..head_dim { kv_f32[d] = v_row[d].to_f32(); }
+
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            use std::arch::aarch64::*;
+                            let v_ptr = kv_f32.as_ptr();
+                            let o_ptr = out_h.as_mut_ptr();
+                            let w_v = vdupq_n_f32(w);
+                            let mut i = 0;
+                            while i + 16 <= head_dim {
+                                vst1q_f32(o_ptr.add(i), vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, vld1q_f32(v_ptr.add(i))));
+                                vst1q_f32(o_ptr.add(i+4), vfmaq_f32(vld1q_f32(o_ptr.add(i+4)), w_v, vld1q_f32(v_ptr.add(i+4))));
+                                vst1q_f32(o_ptr.add(i+8), vfmaq_f32(vld1q_f32(o_ptr.add(i+8)), w_v, vld1q_f32(v_ptr.add(i+8))));
+                                vst1q_f32(o_ptr.add(i+12), vfmaq_f32(vld1q_f32(o_ptr.add(i+12)), w_v, vld1q_f32(v_ptr.add(i+12))));
+                                i += 16;
+                            }
+                            while i + 4 <= head_dim {
+                                vst1q_f32(o_ptr.add(i), vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, vld1q_f32(v_ptr.add(i))));
+                                i += 4;
+                            }
+                            while i < head_dim { *o_ptr.add(i) += w * *v_ptr.add(i); i += 1; }
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        for d in 0..head_dim { out_h[d] += w * kv_f32[d]; }
+                    }
+                });
+            },
+            _ => return Err(anyhow!("Unsupported KV cache dtype for attention: {:?}", k_cache.dtype())),
+        }
+        Ok(())
+    }
 }
 
 impl CpuBackendCommon {
