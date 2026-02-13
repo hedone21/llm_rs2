@@ -374,7 +374,7 @@ def main():
     parser.add_argument("--cmd", required=True, help="Command to run via ADB shell")
     parser.add_argument("--interval", type=float, default=1.0, help="Profiling interval in seconds")
     parser.add_argument("--output-dir", default=".", help="Directory to save JSON output")
-    parser.add_argument("--name", help="Custom name for output file (optional)")
+    parser.add_argument("--output-name", help="Specific filename for the output JSON (optional)")
     parser.add_argument("--foreground-app", help="Foreground app context (e.g., 'YouTube', 'Chrome', 'idle')")
     
     args = parser.parse_args()
@@ -467,8 +467,8 @@ def main():
     }
     
     # 5. Save Output
-    if args.name:
-        filename = args.name
+    if args.output_name:
+        filename = args.output_name
         if not filename.endswith('.json'): filename += ".json"
     else:
         # Auto-name: profile_{backend}_{prefill}_{tokens}_{eviction}_{date}.json
