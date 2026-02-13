@@ -46,6 +46,7 @@ struct KernelCache {
     kernel_attn_gen: CoreKernel,
     kernel_cast_f32_to_f16: CoreKernel,
     kernel_attn_gen_half: CoreKernel,
+    kernel_quantize_f32_to_q4_0: CoreKernel,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -64,6 +65,7 @@ pub struct OpenCLBackend {
     pub program: Program,
     pub simple_ops_program: Program,
     pub q4_0_program: Program,
+    pub quant_q4_0_program: Program,
     pub get_rows_program: Program,
     
     // Cached kernels protected by mutex for thread safety
@@ -146,6 +148,14 @@ impl OpenCLBackend {
             .cmplr_opt(CL_FAST_MATH_OPTS)
             .build(&context)?;
 
+        // Load quantize Q4_0 kernel
+        let q4_quant_src = include_str!("../../../kernels/quantize_q4_0.cl");
+        let quant_q4_0_program = Program::builder()
+            .devices(device)
+            .src(q4_quant_src)
+            .cmplr_opt(CL_FAST_MATH_OPTS)
+            .build(&context)?;
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -161,6 +171,7 @@ impl OpenCLBackend {
             kernel_attn_gen: ocl::core::create_kernel(&simple_ops_program, "kernel_attn_gen")?,
             kernel_cast_f32_to_f16: ocl::core::create_kernel(&simple_ops_program, "kernel_cast_f32_to_f16")?,
             kernel_attn_gen_half: ocl::core::create_kernel(&simple_ops_program, "kernel_attn_gen_half")?,
+            kernel_quantize_f32_to_q4_0: ocl::core::create_kernel(&quant_q4_0_program, "kernel_quantize_f32_to_q4_0")?,
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -172,6 +183,7 @@ impl OpenCLBackend {
             program,
             simple_ops_program,
             q4_0_program,
+            quant_q4_0_program,
             get_rows_program,
             kernels: Mutex::new(kernel_cache),
         })
@@ -279,6 +291,7 @@ impl Backend for OpenCLBackend {
             kernel_attn_gen: src_kernels.kernel_attn_gen.clone(),
             kernel_cast_f32_to_f16: src_kernels.kernel_cast_f32_to_f16.clone(),
             kernel_attn_gen_half: src_kernels.kernel_attn_gen_half.clone(),
+            kernel_quantize_f32_to_q4_0: src_kernels.kernel_quantize_f32_to_q4_0.clone(),
         };
         drop(src_kernels); // Release lock before potentially blocking operations
         
@@ -289,6 +302,7 @@ impl Backend for OpenCLBackend {
             program: self.program.clone(),
             simple_ops_program: self.simple_ops_program.clone(),
             q4_0_program: self.q4_0_program.clone(),
+            quant_q4_0_program: self.quant_q4_0_program.clone(),
             get_rows_program: self.get_rows_program.clone(),
             kernels: Mutex::new(kernel_cache),
         }));
@@ -462,6 +476,32 @@ impl Backend for OpenCLBackend {
                     let gws: [usize; 3] = [((num_elements + 63) / 64) * 64, 1, 1];
                     let lws: [usize; 3] = [64, 1, 1];
                     ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &gws, Some(lws),
+                        None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
+                }
+                Ok(())
+            },
+            (DType::F32, DType::Q4_0) => {
+                let src_buf = get_cl_mem(src.buffer().as_ref())?;
+                let dst_buf = get_cl_mem(dst.buffer().as_ref())?;
+                let num_elements: usize = src.shape().dims().iter().product();
+                
+                if num_elements % 32 != 0 {
+                    return Err(anyhow!("Q4_0 cast requires size multiple of 32"));
+                }
+                
+                let kernels = self.kernels.lock().map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+                let kernel = &kernels.kernel_quantize_f32_to_q4_0;
+                let num_blocks = num_elements / 32;
+                
+                unsafe {
+                    ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(src_buf))?;
+                    ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(dst_buf))?;
+                    ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(num_elements as i32)))?;
+                    
+                    let local_size = 64;
+                    let global_size = ((num_blocks + local_size - 1) / local_size) * local_size;
+                    
+                    ocl::core::enqueue_kernel(&self.queue, kernel, 1, None, &[global_size, 1, 1], Some([local_size, 1, 1]),
                         None::<&ocl::core::Event>, None::<&mut ocl::core::Event>)?;
                 }
                 Ok(())

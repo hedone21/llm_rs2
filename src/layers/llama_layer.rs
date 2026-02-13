@@ -132,14 +132,37 @@ impl LlamaLayer {
             let mut v_vec = Vec::new();
     
             let (q_data, k_data, v_data, out_ptr) = if is_opencl {
-                q_vec.resize(q_rope.size() / 4, 0.0);
-                k_vec.resize(k_cache.size() / 4, 0.0);
-                v_vec.resize(v_cache.size() / 4, 0.0);
-                out_vec.resize(out_attn.size() / 4, 0.0);
-    
-                backend.read_buffer(&q_rope, as_u8_mut(&mut q_vec))?;
-                backend.read_buffer(&k_cache, as_u8_mut(&mut k_vec))?;
-                backend.read_buffer(&v_cache, as_u8_mut(&mut v_vec))?;
+                // Helper to read tensor to F32 vec, handling Dequantization if needed
+                let mut read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
+                    if t.dtype() == DType::Q4_0 {
+                         use crate::core::quant::{BlockQ4_0, QK4_0};
+                         let numel = t.numel();
+                         let n_blocks = numel / QK4_0;
+                         let byte_size = n_blocks * std::mem::size_of::<BlockQ4_0>();
+                         
+                         let mut byte_vec = vec![0u8; byte_size];
+                         backend.read_buffer(t, &mut byte_vec)?;
+                         
+                         vec.resize(numel, 0.0);
+                         let blocks = unsafe { std::slice::from_raw_parts(byte_vec.as_ptr() as *const BlockQ4_0, n_blocks) };
+                         
+                         for i in 0..n_blocks {
+                             let mut tmp = [0.0f32; QK4_0];
+                             blocks[i].dequantize(&mut tmp);
+                             vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
+                         }
+                    } else {
+                         vec.resize(t.numel(), 0.0);
+                         backend.read_buffer(t, as_u8_mut(vec))?;
+                    }
+                    Ok(())
+                };
+
+                read_to_f32(&q_rope, &mut q_vec)?;
+                read_to_f32(&k_cache, &mut k_vec)?;
+                read_to_f32(&v_cache, &mut v_vec)?;
+                
+                out_vec.resize(out_attn.numel(), 0.0);
     
                 (&q_vec[..], &k_vec[..], &v_vec[..], &mut out_vec[..])
             } else if k_cache.dtype() == DType::Q4_0 {
