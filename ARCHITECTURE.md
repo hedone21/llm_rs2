@@ -132,7 +132,7 @@ sequenceDiagram
     loop Each Token
         User->>Model: forward_into(token, start_pos)
         loop Each Layer
-            Model->>Layer: forward_gen(x, kv_cache, start_pos)
+            Model->>Layer: forward(x, kv_cache, start_pos)
             Layer->>Backend: rms_norm, matmul (QKV), rope
             Layer->>Cache: update(K, V) at current_pos
             Layer->>Backend: attention_gen (single Q vs cache)
@@ -161,7 +161,7 @@ sequenceDiagram
 ## Memory Model & Data Flow
 
 ### Zero-copy Mechanism
-`Galloc`은 OpenCL의 `CL_MEM_ALLOC_HOST_PTR`을 사용하여 CPU와 GPU가 물리적으로 동일한 메모리 주소를 가리키도록 `SharedBuffer`를 생성합니다. ARM SoC의 통합 메모리(UMA)에서는 별도의 `memcpy` 없이 백엔드가 즉시 연산을 수행할 수 있습니다.
+`Galloc`은 CPU 메모리 할당을 담당하며, OpenCL 파이프라인에서는 `OpenCLMemory`가 `CL_MEM_ALLOC_HOST_PTR`을 사용하여 CPU와 GPU가 물리적으로 동일한 메모리 주소를 가리키도록 지원합니다. ARM SoC의 통합 메모리(UMA)에서는 별도의 `memcpy` 없이 백엔드가 즉시 연산을 수행할 수 있습니다.
 
 ```mermaid
 graph LR
@@ -354,7 +354,7 @@ llm_rs2/
 │   │   │   ├── neon.rs       # ARM64 NEON SIMD 최적화
 │   │   │   └── x86.rs        # x86 SSE/AVX fallback
 │   │   └── opencl/
-│   │       ├── mod.rs        # OpenCLBackend (35,000+ lines)
+│   │       ├── mod.rs        # OpenCLBackend struct & implementation
 │   │       ├── buffer.rs     # OpenCL용 SharedBuffer 확장
 │   │       └── memory.rs     # OpenCL용 Galloc (CL_MEM_ALLOC_HOST_PTR)
 │   │
@@ -400,6 +400,7 @@ llm_rs2/
 | `test_backend` | 백엔드 정합성 검증 | CPU vs OpenCL 결과 비교 |
 | `test_model` | 모델 로딩 검증 | `--model-path` |
 | `repro_attention` | attention 버그 재현 | 디버깅용 |
+| `reproduce_opencl_cast` | OpenCL cast 버그 재현 | 디버깅용 |
 
 `generate` 바이너리의 eviction 관련 CLI 옵션:
 ```
@@ -440,7 +441,9 @@ const _: () = assert!(std::mem::size_of::<BlockQ4_0>() == 20);
 | `F32` | 4B | 활성화, 중간 연산, CPU attention |
 | `F16` | 2B | GPU KV 캐시, 가중치 |
 | `BF16` | 2B | 가중치 로딩 (safetensors) |
-| `Q4_0` | 20B/32elem | 모델 가중치 양자화 |
+| `Q4_0` | 20B/32elem | 모델 가중치 양자화 (메인) |
+| `Q4_1` | 24B/32elem | 모델 가중치 양자화 (실험적/레거시) |
+| `Q8_0` | 34B/32elem | 모델 가중치 양자화 (실험적/레거시) |
 | `U8` | 1B | 범용 바이트 버퍼 |
 
 ---
