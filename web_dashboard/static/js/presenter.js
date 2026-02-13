@@ -11,7 +11,7 @@ const Presenter = (() => {
         paper_bgcolor: '#1c1f2e',
         plot_bgcolor: '#161822',
         font: { family: 'Inter, sans-serif', color: '#8b8fa3', size: 11 },
-        margin: { l: 60, r: 20, t: 30, b: 40 },
+        margin: { l: 60, r: 60, t: 30, b: 40 },
         hovermode: 'x unified',
         showlegend: true,
         legend: { orientation: 'h', y: -0.15, font: { size: 10 } },
@@ -140,6 +140,26 @@ const Presenter = (() => {
             annotations: [],
         };
 
+        // Calculate max time from both timeseries and events
+        let maxRelTime = relSeconds[relSeconds.length - 1];
+        events.forEach(e => {
+            const t = (new Date(e.timestamp).getTime() - t0ms) / 1000;
+            if (t > maxRelTime) maxRelTime = t;
+        });
+
+        // Add a dummy invisible trace to force the x-axis range to cover all events
+        traces.push({
+            x: [0, maxRelTime * 1.05], // 5% padding
+            y: [0, 0],
+            mode: 'markers',
+            marker: { opacity: 0 },
+            showlegend: false,
+            hoverinfo: 'skip',
+            xaxis: 'x', // Use the first x-axis (master)
+            yaxis: 'y',
+        });
+
+
         sortedGroups.forEach((groupName, idx) => {
             const fields = groups[groupName];
             const axisIdx = idx + 1;
@@ -149,8 +169,12 @@ const Presenter = (() => {
             // Find axis label from first field with one
             const axisLabel = fields.find(f => f.axis_label)?.axis_label || groupName;
 
-            layout[`xaxis${axisIdx}`] = {
+            // Plotly expects 'xaxis' for the first axis, and 'xaxis2', 'xaxis3', etc. for others
+            const key = axisIdx === 1 ? 'xaxis' : `xaxis${axisIdx}`;
+
+            layout[key] = {
                 ...PLOTLY_LAYOUT_DEFAULTS.xaxis,
+                type: 'linear', // Force linear axis to prevent categorical inference
                 showticklabels: idx === numSubplots - 1,
                 matches: idx > 0 ? 'x' : undefined,
                 title: idx === numSubplots - 1 ? { text: 'Time (s)', font: { size: 11 } } : undefined,
