@@ -113,7 +113,8 @@ const App = (() => {
                     <span class="badge badge-${meta.foreground_app ? 'fg' : 'idle'}">${envLabel}</span>
                 </h2>
                 <p style="color:var(--text-secondary);font-size:13px;">
-                    ${meta.date || ''} · ${meta.prefill_type || ''} · ${meta.num_tokens || '?'} tokens
+                <p style="color:var(--text-secondary);font-size:13px;">
+                    ${meta.date || ''} · ${meta.prefill_type || ''} · ${meta.eviction_policy ? meta.eviction_policy + ' · ' : ''} ${meta.num_tokens || '?'} tokens
                 </p>
             `;
 
@@ -122,6 +123,7 @@ const App = (() => {
                 { label: 'TTFT', value: results.ttft_ms != null ? `${results.ttft_ms.toFixed(1)}` : 'N/A', unit: 'ms' },
                 { label: 'Avg TBT', value: results.tbt_ms != null ? `${results.tbt_ms.toFixed(2)}` : 'N/A', unit: 'ms' },
                 { label: 'Tokens/sec', value: results.tokens_per_sec != null ? `${results.tokens_per_sec.toFixed(1)}` : 'N/A', unit: 'tok/s' },
+                { label: 'Eviction', value: meta.eviction_policy || '—', unit: '' },
                 { label: 'Start Temp', value: profile.thermal?.start_temp ?? '—', unit: '°C' },
                 { label: 'Max Temp', value: profile.thermal?.max_temp ?? '—', unit: '°C' },
                 { label: 'Baseline Memory', value: profile.baseline?.avg_memory_used_mb != null ? `${profile.baseline.avg_memory_used_mb.toFixed(0)}` : '—', unit: 'MB' },

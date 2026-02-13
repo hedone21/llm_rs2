@@ -82,6 +82,7 @@ def load_profile_summary(filepath):
             "backend": meta.get("backend", "unknown"),
             "num_tokens": meta.get("num_tokens"),
             "prefill_type": meta.get("prefill_type"),
+            "eviction_policy": meta.get("eviction_policy"),
             "foreground_app": meta.get("foreground_app"),
         },
         "results": {

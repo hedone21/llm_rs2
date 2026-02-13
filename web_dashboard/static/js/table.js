@@ -94,6 +94,7 @@ const Table = (() => {
             case 'backend': return p.metadata.backend || '';
             case 'env': return _getEnvLabel(p);
             case 'prefill': return p.metadata.prefill_type || '';
+            case 'eviction': return p.metadata.eviction_policy || '';
             case 'tokens': return p.metadata.num_tokens || 0;
             case 'ttft': return p.results.ttft_ms ?? 999999;
             case 'tbt': return p.results.tbt_ms ?? 999999;
@@ -144,6 +145,7 @@ const Table = (() => {
                 <td>${backendBadge}</td>
                 <td>${envBadge}</td>
                 <td>${p.metadata.prefill_type || '—'}</td>
+                <td>${p.metadata.eviction_policy || '—'}</td>
                 <td>${p.metadata.num_tokens ?? '—'}</td>
                 <td>${p.results.ttft_ms != null ? p.results.ttft_ms.toFixed(1) : 'N/A'}</td>
                 <td>${p.results.tbt_ms != null ? p.results.tbt_ms.toFixed(2) : 'N/A'}</td>
