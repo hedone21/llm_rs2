@@ -83,10 +83,16 @@ const Table = (() => {
         applyFilters();
     }
 
+    function _getEnvLabel(p) {
+        const fg = p.metadata.foreground_app;
+        return fg ? fg : 'Idle';
+    }
+
     function _getSortValue(p) {
         switch (_sortKey) {
             case 'date': return p.metadata.date || '';
             case 'backend': return p.metadata.backend || '';
+            case 'env': return _getEnvLabel(p);
             case 'prefill': return p.metadata.prefill_type || '';
             case 'tokens': return p.metadata.num_tokens || 0;
             case 'ttft': return p.results.ttft_ms ?? 999999;
@@ -123,6 +129,11 @@ const Table = (() => {
                 ? `<span class="badge badge-${p.metadata.backend}">${p.metadata.backend}</span>`
                 : '—';
 
+            const envLabel = _getEnvLabel(p);
+            const envBadge = envLabel === 'Idle'
+                ? `<span class="badge badge-idle">Idle</span>`
+                : `<span class="badge badge-fg">${envLabel}</span>`;
+
             const tempStr = p.thermal.start_temp != null
                 ? `${p.thermal.start_temp} → ${p.thermal.max_temp}`
                 : '—';
@@ -131,6 +142,7 @@ const Table = (() => {
                 <td><input type="checkbox" class="row-select" data-id="${p.id}" ${_selected.has(p.id) ? 'checked' : ''}></td>
                 <td>${date}</td>
                 <td>${backendBadge}</td>
+                <td>${envBadge}</td>
                 <td>${p.metadata.prefill_type || '—'}</td>
                 <td>${p.metadata.num_tokens ?? '—'}</td>
                 <td>${p.results.ttft_ms != null ? p.results.ttft_ms.toFixed(1) : 'N/A'}</td>

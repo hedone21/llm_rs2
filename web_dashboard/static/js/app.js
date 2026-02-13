@@ -106,9 +106,11 @@ const App = (() => {
             const meta = profile.metadata || {};
             const results = profile.results || {};
 
+            const envLabel = meta.foreground_app ? meta.foreground_app : 'Idle';
             headerEl.innerHTML = `
                 <h2>${meta.model || 'Unknown Model'}
                     <span class="badge badge-${meta.backend || ''}">${meta.backend || '?'}</span>
+                    <span class="badge badge-${meta.foreground_app ? 'fg' : 'idle'}">${envLabel}</span>
                 </h2>
                 <p style="color:var(--text-secondary);font-size:13px;">
                     ${meta.date || ''} · ${meta.prefill_type || ''} · ${meta.num_tokens || '?'} tokens
