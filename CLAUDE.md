@@ -71,7 +71,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `scripts/android_profile.py` — On-device profiling with JSON output
 - `scripts/visualize_profile.py` — Generate performance graphs
 - `web_dashboard/` — Flask dashboard for benchmark visualization (`cd web_dashboard && python app.py`)
-- Results stored in `results/data/` (JSON), plots in `results/plots/`
+- Results stored in `results/data/` (JSON) — **committed to repo as test data**, plots in `results/plots/` (gitignored)
 
 ## Key Documentation
 

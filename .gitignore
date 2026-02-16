@@ -8,3 +8,22 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+
+# Generated results
+results/plots/
+results/micro_bench_results.txt
+
+# Reference code
+reference/
+
+# Build artifacts
+build_log*.txt
+*.docx
+
+# Benchmark artifacts
+benchmarks/data/
+benchmarks/plots/
+
+# Misc
+kernels/kernels
+llama.cpp-kernels/
