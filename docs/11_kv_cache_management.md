@@ -1,6 +1,8 @@
-# Chapter 6: KV Cache 관리 전략
+# Chapter 11: KV Cache 관리 전략
 
-## 6.1 Overview
+> **이전**: [10. 모델 추론](10_model_inference.md) | **다음**: [12. 하이브리드 추론](12_hybrid_inference.md)
+
+## 11.1 Overview
 
 LLM 추론 시 KV Cache는 시퀀스 길이에 비례하여 메모리를 차지합니다. 모바일/엣지 환경에서는 긴 시퀀스 생성 시 메모리 부족(OOM)이 발생할 수 있으며, 이를 동적으로 관리하기 위한 확장 가능한 캐시 관리 전략이 필요합니다.
 
@@ -11,7 +13,7 @@ LLM 추론 시 KV Cache는 시퀀스 길이에 비례하여 메모리를 차지�
 
 ---
 
-## 6.2 아키텍처
+## 11.2 아키텍처
 
 ### 컴포넌트 다이어그램
 
@@ -60,9 +62,9 @@ graph TB
 
 ---
 
-## 6.3 핵심 인터페이스
+## 11.3 핵심 인터페이스
 
-### 6.3.1 EvictionPolicy Trait
+### 11.3.1 EvictionPolicy Trait
 
 ```rust
 // core/eviction/mod.rs
@@ -79,7 +81,7 @@ pub trait EvictionPolicy: Send + Sync {
 }
 ```
 
-### 6.3.2 CacheManager
+### 11.3.2 CacheManager
 
 ```rust
 // core/cache_manager.rs
@@ -106,9 +108,9 @@ pub struct EvictionResult {
 
 ---
 
-## 6.4 Eviction 전략
+## 11.4 Eviction 전략
 
-### 6.4.1 NoEvictionPolicy (기본값)
+### 11.4.1 NoEvictionPolicy (기본값)
 
 아무것도 하지 않는 전략. `should_evict()`가 항상 `false`를 반환합니다.
 기존 동작과 완전히 동일하며, 캐시가 가득 차면 에러를 반환합니다.
@@ -117,7 +119,7 @@ pub struct EvictionResult {
 [토큰 0][토큰 1][토큰 2]...[토큰 N]  → 변화 없음
 ```
 
-### 6.4.2 SlidingWindowPolicy (Moving Window)
+### 11.4.2 SlidingWindowPolicy (Moving Window)
 
 가장 최근 `window_size`개의 토큰만 유지하고, 나머지는 앞에서부터 제거합니다.
 `protected_prefix`를 설정하면 시스템 프롬프트 등 앞부분 토큰을 보호할 수 있습니다.
@@ -136,7 +138,7 @@ After (current_pos = 1088):
 
 **구현 핵심**: `KVCache::prune_prefix(count)` → `memmove`로 데이터를 앞으로 이동
 
-### 6.4.3 SnapKVPolicy (Attention-based)
+### 11.4.3 SnapKVPolicy (Attention-based)
 
 Attention score를 기반으로 중요한 토큰을 선택적으로 유지하는 전략입니다.
 자주 attention 되는 토큰은 보존하고, 거의 참조되지 않는 토큰을 제거합니다.
@@ -157,7 +159,7 @@ After (keep_ratio=0.5, 상위 50% 유지):
 
 ---
 
-## 6.5 KVCache 확장
+## 11.5 KVCache 확장
 
 기존 `KVCache`에 eviction 지원 메서드를 추가합니다.
 
@@ -190,7 +192,7 @@ KV Buffer: [Batch, MaxSeqLen, KVHeads, HeadDim]
 
 ---
 
-## 6.6 동적 메모리 감지
+## 11.6 동적 메모리 감지
 
 ### SystemMonitor + MemoryPressure
 
@@ -214,7 +216,7 @@ Linux/Android에서는 `/proc/meminfo`를 파싱하여 `MemAvailable`을 읽습�
 
 ---
 
-## 6.7 파일 구조
+## 11.7 파일 구조
 
 ```
 src/core/
@@ -231,7 +233,7 @@ src/core/
 
 ---
 
-## 6.8 통합 흐름
+## 11.8 통합 흐름
 
 ### CLI 옵션
 
@@ -276,7 +278,7 @@ sequenceDiagram
 
 ---
 
-## 6.9 새로운 전략 추가 가이드
+## 11.9 새로운 전략 추가 가이드
 
 SOLID의 Open/Closed 원칙에 따라, 새 전략 추가 시 기존 코드를 수정할 필요가 없습니다.
 
@@ -325,7 +327,7 @@ pub use my_policy::MyCustomPolicy;
 
 ---
 
-## 6.10 향후 확장 계획
+## 11.10 향후 확장 계획
 
 | 항목 | 설명 | 의존성 |
 |------|------|--------|

@@ -1,5 +1,7 @@
 # Architecture
 
+> **상세 구현 가이드**: 이 프로젝트를 처음부터 구현하려면 [`docs/00_build_guide.md`](docs/00_build_guide.md)를 참조하세요. 설계 결정의 근거는 [`docs/01_design_rationale.md`](docs/01_design_rationale.md)에 있습니다.
+
 ## Overview
 
 ### Background & Goals
@@ -377,12 +379,20 @@ llm_rs2/
 │   └── visualize_profile.py  # 프로파일 데이터 시각화
 │
 ├── docs/                     # 상세 기술 문서
-│   ├── 01_opencl_backend.md
-│   ├── 02_kernel_implementation.md
-│   ├── 03_memory_management.md
-│   ├── 04_attention_mechanism.md
-│   ├── 05_model_inference.md
-│   └── 06_kv_cache_management.md
+│   ├── 00_build_guide.md
+│   ├── 01_design_rationale.md
+│   ├── 02_core_abstractions.md
+│   ├── 03_cpu_backend.md
+│   ├── 04_model_loading.md
+│   ├── 05_tokenizer_and_sampling.md
+│   ├── 06_opencl_backend.md
+│   ├── 07_kernel_implementation.md
+│   ├── 08_memory_management.md
+│   ├── 09_attention_mechanism.md
+│   ├── 10_model_inference.md
+│   ├── 11_kv_cache_management.md
+│   ├── 12_hybrid_inference.md
+│   └── 13_testing_and_benchmarks.md
 │
 ├── web_dashboard/            # 벤치마크 시각화 웹 대시보드
 ├── benchmarks/               # 벤치마크 데이터 및 분석 스크립트

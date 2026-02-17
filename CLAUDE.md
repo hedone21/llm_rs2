@@ -77,4 +77,17 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 
 - `ARCHITECTURE.md` — Detailed component design, trait interfaces, execution flow
 - `PROJECT_CONTEXT.md` — Implementation status and development cheat sheet
-- `docs/06_kv_cache_management.md` — KV cache and eviction system details
+- `docs/00_build_guide.md` — Step-by-step implementation guide (build order)
+- `docs/01_design_rationale.md` — Why decisions were made (Rust, OpenCL, Q4_0, etc.)
+- `docs/02_core_abstractions.md` — Tensor, Buffer, Shape, DType, KVCache details
+- `docs/03_cpu_backend.md` — CPU scalar + NEON SIMD + AVX2 implementation
+- `docs/04_model_loading.md` — Safetensors loading, HF name mapping, Q4_0 quantization
+- `docs/05_tokenizer_and_sampling.md` — Tokenizer integration and sampling algorithm
+- `docs/06_opencl_backend.md` — OpenCL backend struct, init, kernel dispatch
+- `docs/07_kernel_implementation.md` — OpenCL kernel algorithms and Adreno optimizations
+- `docs/08_memory_management.md` — Buffer types, zero-copy, transfer patterns
+- `docs/09_attention_mechanism.md` — GPU attention kernel, GQA, performance
+- `docs/10_model_inference.md` — Llama 3.2 config, forward pass, LayerWorkspace
+- `docs/11_kv_cache_management.md` — KV cache eviction system design
+- `docs/12_hybrid_inference.md` — CPU→GPU dynamic switching strategy
+- `docs/13_testing_and_benchmarks.md` — Oracle testing, micro_bench, profiling

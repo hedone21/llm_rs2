@@ -14,4 +14,24 @@
 
 시스템 아키텍처, 데이터 레이아웃, 인터페이스 정의 및 메모리 모델에 대한 상세한 내용은 아래 문서를 참조하십시오.
 
-* **[ARCHITECTURE.md](https://www.google.com/search?q=./ARCHITECTURE.md)**: 하이레벨/로레벨 컴포넌트 설계, Zero-copy 메커니즘, 양자화 포맷 및 Trait 정의 상세 설명
+* **[ARCHITECTURE.md](ARCHITECTURE.md)** — 하이레벨/로레벨 컴포넌트 설계, Zero-copy 메커니즘, 양자화 포맷 및 Trait 정의
+* **[PROJECT_CONTEXT.md](PROJECT_CONTEXT.md)** — 개발 치트시트 (빌드, 배포, 테스트 명령어)
+
+### docs/ 상세 문서
+
+| # | 문서 | 내용 |
+|---|------|------|
+| 00 | [Build Guide](docs/00_build_guide.md) | 프로젝트를 처음부터 구현하는 단계별 가이드 |
+| 01 | [Design Rationale](docs/01_design_rationale.md) | 설계 결정의 근거 (Rust, OpenCL, Q4_0 등) |
+| 02 | [Core Abstractions](docs/02_core_abstractions.md) | Tensor, Buffer, Shape, DType, KVCache 상세 |
+| 03 | [CPU Backend](docs/03_cpu_backend.md) | CPU 스칼라 + NEON SIMD + AVX2 구현 |
+| 04 | [Model Loading](docs/04_model_loading.md) | Safetensors 로딩, HF 이름 매핑, Q4_0 양자화 |
+| 05 | [Tokenizer & Sampling](docs/05_tokenizer_and_sampling.md) | 토크나이저 통합 및 샘플링 알고리즘 |
+| 06 | [OpenCL Backend](docs/06_opencl_backend.md) | OpenCL 백엔드 초기화, 커널 디스패치 |
+| 07 | [Kernel Implementation](docs/07_kernel_implementation.md) | OpenCL 커널 알고리즘, Adreno 최적화 |
+| 08 | [Memory Management](docs/08_memory_management.md) | 버퍼 타입, Zero-copy, 전송 패턴 |
+| 09 | [Attention Mechanism](docs/09_attention_mechanism.md) | GPU 어텐션 커널, GQA, 성능 분석 |
+| 10 | [Model Inference](docs/10_model_inference.md) | Llama 3.2 설정, Forward pass, LayerWorkspace |
+| 11 | [KV Cache Management](docs/11_kv_cache_management.md) | KV 캐시 Eviction 시스템 설계 |
+| 12 | [Hybrid Inference](docs/12_hybrid_inference.md) | CPU→GPU 동적 전환 전략 |
+| 13 | [Testing & Benchmarks](docs/13_testing_and_benchmarks.md) | Oracle 테스트, micro_bench, 프로파일링 |
