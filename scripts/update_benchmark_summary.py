@@ -73,8 +73,9 @@ def analyze_json(filepath):
     return {
         "date": date_str,
         "filename": filename,
-        "backend": meta.get("backend", "?"),
         "model": meta.get("model", "?"),
+        "backend": meta.get("backend", "?"),
+        "device": meta.get("device", "Galaxy S25" if 'local' not in filename else "Local PC"),
         "input": meta.get("prefill_type", "?"),
         "n_tokens": meta.get("num_tokens", "?"),
         "foreground_app": meta.get("foreground_app", "-"),
@@ -100,14 +101,14 @@ def generate_markdown(records):
     md += "- **Recent Run**: {}\n\n".format(records[0]["date"] if records else "N/A")
     
     md += "## Detailed Results\n\n"
-    md += "| Date | Model | Backend | Eviction | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Proc Mem (MB) | Data | Plot |\n"
-    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
+    md += "| Date | Model | Backend | Device | Eviction | Input | Tokens | FG App | TTFT (ms) | TBT (ms) | T/s | Temp (°C) | Mem (MB) | Proc Mem (MB) | Data | Plot |\n"
+    md += "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |\n"
     
     for r in records:
         link = f"[JSON](data/{r['filename']})"
         fg_app = r.get('foreground_app', '-')
         eviction = r.get('eviction', 'none')
-        row = f"| {r['date']} | {r['model']} | {r['backend']} | {eviction} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {r.get('proc_mem', '-')} | {link} | {r.get('plot_link', '-')} |\n"
+        row = f"| {r['date']} | {r['model']} | {r['backend']} | {r['device']} | {eviction} | {r['input']} | {r['n_tokens']} | {fg_app} | **{r['ttft']}** | {r['tbt']} | {r['tps']} | {r['temp']} | {r['mem']} | {r.get('proc_mem', '-')} | {link} | {r.get('plot_link', '-')} |\n"
         md += row
         
     md += "\n\n## Graphical Analysis\n"
