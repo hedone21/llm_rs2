@@ -5,17 +5,18 @@ import time
 import sys
 import threading
 
-def run_adb_command(cmd):
+def run_adb_command(cmd, serial=None):
     """Runs an adb command and returns the output."""
-    full_cmd = f"adb {cmd}"
+    serial_str = f"-s {serial} " if serial else ""
+    full_cmd = f"adb {serial_str}{cmd}"
     try:
         result = subprocess.run(full_cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        print(f"Error running adb command '{cmd}': {e.stderr}")
+        print(f"Error running adb command '{full_cmd}': {e.stderr}")
         return None
 
-def switch_apps(apps, interval, stop_event):
+def switch_apps(apps, interval, stop_event, serial=None):
     """Periodically switches between provided apps/intents to simulate load."""
     if not apps:
         print("[Stress] No background apps provided to switch. Running only main command.")
@@ -38,7 +39,7 @@ def switch_apps(apps, interval, stop_event):
             # Just package name
             cmd = f"shell monkey -p {app} -c android.intent.category.LAUNCHER 1"
 
-        run_adb_command(cmd)
+        run_adb_command(cmd, serial)
         
         idx += 1
         time.sleep(interval)
@@ -50,6 +51,7 @@ def main():
     parser.add_argument("--switch-interval", type=int, default=10, help="Interval in seconds to switch foreground apps.")
     parser.add_argument("--background-apps", default="com.android.settings", 
                         help="Comma-separated list of package names or URLs to switch between. Default: com.android.settings")
+    parser.add_argument("--serial", default=None, help="Specific ADB device serial to target.")
     
     args = parser.parse_args()
 
@@ -61,12 +63,12 @@ def main():
 
     # 0. Wake up screen
     print("[Stress] Waking up device...")
-    run_adb_command("shell input keyevent KEYCODE_WAKEUP")
-    run_adb_command("shell input keyevent KEYCODE_MENU") # Unlock if no password
+    run_adb_command("shell input keyevent KEYCODE_WAKEUP", args.serial)
+    run_adb_command("shell input keyevent KEYCODE_MENU", args.serial) # Unlock if no password
 
     # 1. Start the main workload in the background
     bg_cmd = f"shell \"nohup {args.cmd} > /data/local/tmp/stress_output.log 2>&1 & echo $!\""
-    pid = run_adb_command(bg_cmd)
+    pid = run_adb_command(bg_cmd, args.serial)
     
     if not pid:
         print("Failed to start background process.")
@@ -76,7 +78,7 @@ def main():
 
     # 2. Start App Switching Thread
     stop_event = threading.Event()
-    switcher_thread = threading.Thread(target=switch_apps, args=(apps_list, args.switch_interval, stop_event))
+    switcher_thread = threading.Thread(target=switch_apps, args=(apps_list, args.switch_interval, stop_event, args.serial))
     switcher_thread.start()
 
     # 3. Monitor
@@ -85,7 +87,7 @@ def main():
         while time.time() - start_time < args.duration:
             # Check if process is still running
             check_cmd = f"shell \"ps | grep {pid}\""
-            res = run_adb_command(check_cmd)
+            res = run_adb_command(check_cmd, args.serial)
             if res is None or pid not in res:
                 print(f"[Stress] Process {pid} finished early or crashed.")
                 break
@@ -99,11 +101,11 @@ def main():
     switcher_thread.join()
     
     print("[Stress] Stopping background process...")
-    run_adb_command(f"shell kill {pid}")
+    run_adb_command(f"shell kill {pid}", args.serial)
     
     # Check output
     print(f"[Stress] processing output log size...")
-    run_adb_command(f"shell ls -lh /data/local/tmp/stress_output.log")
+    run_adb_command(f"shell ls -lh /data/local/tmp/stress_output.log", args.serial)
     print("[Stress] Done. You can check /data/local/tmp/stress_output.log on device.")
 
 if __name__ == "__main__":

@@ -1,8 +1,15 @@
 #!/bin/bash
 set -e
 
-# Usage: ./run_android.sh <binary_name> [args...]
-# Example: ./run_android.sh generate --model ...
+# Usage: ./run_android.sh [-s <serial>] <binary_name> [args...]
+# Example: ./run_android.sh -s 12345678 generate --model ...
+
+SERIAL_PARAM=""
+if [ "$1" == "-s" ]; then
+    SERIAL_PARAM="-s $2"
+    shift
+    shift
+fi
 
 BIN_NAME=$1
 shift
@@ -26,11 +33,11 @@ cargo build --target aarch64-linux-android --release --bin "$BIN_NAME"
 echo "[3/4] Pushing to device..."
 LOCAL_PATH="target/aarch64-linux-android/release/$BIN_NAME"
 REMOTE_PATH="/data/local/tmp/$BIN_NAME"
-adb push "$LOCAL_PATH" "$REMOTE_PATH"
-adb shell "chmod +x $REMOTE_PATH"
+adb $SERIAL_PARAM push "$LOCAL_PATH" "$REMOTE_PATH"
+adb $SERIAL_PARAM shell "chmod +x $REMOTE_PATH"
 
 # 4. Run
 echo "[4/4] Executing on device..."
 echo "Command: $REMOTE_PATH $ARGS"
 echo "----------------------------------------"
-adb shell "LD_LIBRARY_PATH=/data/local/tmp $REMOTE_PATH $ARGS"
+adb $SERIAL_PARAM shell "LD_LIBRARY_PATH=/data/local/tmp $REMOTE_PATH $ARGS"
