@@ -29,6 +29,7 @@ class DeviceMonitor:
         self.last_cpu_stats = None
         self.last_proc_cpu_stats = None
         self.num_cores = os.cpu_count() or 1
+        self.temp_path = self.find_thermal_path()
         print(f"[Monitor] Detected {self.num_cores} CPU cores for normalization.")
         
     def find_target_pid(self, process_name="generate"):
@@ -78,11 +79,47 @@ class DeviceMonitor:
     def get_gpu_load(self):
         return 0.0
 
-    def get_temperature(self):
+    def find_thermal_path(self):
+        """Scans /sys/class/thermal/ for the most relevant thermal zone."""
+        # Priorities for PC/Embedded Linux:
+        # 1. x86_pkg_temp / coretemp (Intel/AMD Package)
+        # 2. cpu-thermal (Raspberry Pi / BCM)
+        # 3. k10temp (AMD)
+        # 4. Fallback to thermal_zone0
+        
+        target_types = ['x86_pkg_temp', 'coretemp', 'cpu-thermal', 'k10temp']
+        base_dir = "/sys/class/thermal"
+        fallback = f"{base_dir}/thermal_zone0/temp"
+        
         try:
-            output = run_local_command('cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | head -n 1')
-            if output.isdigit():
-                return float(output) / 1000.0
+            if not os.path.exists(base_dir):
+                return None
+            
+            for tz in sorted(os.listdir(base_dir)):
+                if not tz.startswith("thermal_zone"): continue
+                
+                type_path = os.path.join(base_dir, tz, "type")
+                if os.path.exists(type_path):
+                    with open(type_path, 'r') as f:
+                        tz_type = f.read().strip()
+                        
+                        if any(t in tz_type for t in target_types):
+                            print(f"[Monitor] Matched thermal zone '{tz_type}' at {tz}")
+                            return os.path.join(base_dir, tz, "temp")
+                            
+            if os.path.exists(fallback):
+                print(f"[Monitor] Using fallback thermal zone at thermal_zone0")
+                return fallback
+        except: pass
+        return None
+
+    def get_temperature(self):
+        if not self.temp_path: return 0.0
+        try:
+            with open(self.temp_path, 'r') as f:
+                val = f.read().strip()
+                if val.isdigit():
+                    return float(val) / 1000.0
         except: pass
         return 0.0
         

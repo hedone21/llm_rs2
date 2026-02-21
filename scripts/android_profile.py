@@ -27,6 +27,7 @@ class DeviceMonitor:
         self.data_buffer = []
         self.gpu_path = self.find_gpu_clk_path()
         self.gpu_load_path = self.find_gpu_load_path()
+        self.temp_path = self.find_thermal_path()
         self.last_cpu_stats = None
         self.target_pid = None
         self.last_proc_cpu_stats = None # (utime+stime, timestamp)
@@ -128,12 +129,47 @@ class DeviceMonitor:
         except: pass
         return 0.0
 
+    def find_thermal_path(self):
+        """Scans /sys/class/thermal/ for SoC temps, returns path if found."""
+        # Common SoC/AP thermal zone types on Android
+        target_types = ['tsens_tz_sensor', 'soc_thermal', 'mtktsc', 'ap_thermal']
+        base_dir = "/sys/class/thermal"
+        
+        try:
+            # First check if we can list the directory (requires permissions, often readable though)
+            output = run_adb_command(f'shell "ls -1 {base_dir} 2>/dev/null"', check=False)
+            zones = [z for z in output.splitlines() if z.startswith('thermal_zone')]
+            
+            for tz in zones:
+                type_cmd = f'shell "cat {base_dir}/{tz}/type 2>/dev/null"'
+                tz_type = run_adb_command(type_cmd, check=False)
+                
+                if tz_type and any(t in tz_type for t in target_types):
+                    # Check if we can actually read the temp file
+                    temp_path = f"{base_dir}/{tz}/temp"
+                    test_read = run_adb_command(f'shell "cat {temp_path} 2>/dev/null"', check=False)
+                    if test_read and test_read.strip().isdigit():
+                        print(f"[Monitor] Matched thermal zone '{tz_type}' at {tz}")
+                        return temp_path
+        except: pass
+        print("[Monitor] No readable SoC thermal zone found. Will fallback to battery temp.")
+        return None
+
     def get_temperature(self):
+        # Tier 1: thermal_zone temp path
+        if self.temp_path:
+            try:
+                output = run_adb_command(f'shell "cat {self.temp_path} 2>/dev/null"', check=False)
+                if output and output.isdigit():
+                    return float(output) / 1000.0  # Usually millidegrees
+            except: pass
+            
+        # Tier 2 Fallback: dumpsys battery
         try:
             output = run_adb_command('shell "dumpsys battery | grep temperature"')
             match = re.search(r'temperature:\s*(\d+)', output)
             if match:
-                return float(match.group(1)) / 10.0
+                return float(match.group(1)) / 10.0 # Battery temp is in tenths of a degree
         except: pass
         return 0.0
         
