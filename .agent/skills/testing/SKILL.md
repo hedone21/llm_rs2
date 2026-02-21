@@ -7,6 +7,10 @@ description: Run tests and benchmarks for the llm_rs2 project, specifically focu
 
 Use this skill when the user wants to run tests, benchmarks, or verify functionality on Android devices or locally.
 
+## Terminology (User Preference)
+- **"테스트" (Test)**: Running the model inference via the provided scripts (e.g., `generate`), which also implies producing benchmark results/logs that can be viewed on the Dashboard.
+- **"유닛테스트" (Unit Test)**: Standard unit tests or backend verification via `test_backend`.
+
 ## Capabilities
 
 ### 1. Android Run (Automated)

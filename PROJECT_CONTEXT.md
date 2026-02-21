@@ -36,6 +36,11 @@
 - **Supported**: `F32`, `F16`, `BF16`, `Q4_0`, `Q4_1`, `U8`.
 
 ## 4. Testing & Verification Strategy
+
+### Terminology (User Preference)
+- **"Test" (테스트)**: Running the model inference via the provided scripts (e.g., `generate`), including generating the benchmark results/logs and making them visible on the Dashboard.
+- **"Unit Test" (유닛테스트)**: Standard Rust unit tests or backend verification logic (e.g., `test_backend`).
+
 ### Testing Philosophy
 1.  **Correctness First**: Ensure `test_backend` passes on target device before optimizing.
 2.  **Performance Check**: Use `micro_bench` for hot-path analysis.
