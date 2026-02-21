@@ -110,6 +110,7 @@ const App = (() => {
             headerEl.innerHTML = `
                 <h2>${meta.model || 'Unknown Model'}
                     <span class="badge badge-${meta.backend || ''}">${meta.backend || '?'}</span>
+                    <span class="badge" style="background:var(--bg-card-hover);color:var(--text);border:1px solid var(--border);">${meta.device || 'Unknown'}</span>
                     <span class="badge badge-${meta.foreground_app ? 'fg' : 'idle'}">${envLabel}</span>
                 </h2>
                 <p style="color:var(--text-secondary);font-size:13px;">
@@ -192,8 +193,9 @@ const App = (() => {
         document.getElementById('recent-list').innerHTML = recent.map(p => {
             const tps = p.results.tokens_per_sec != null ? `${p.results.tokens_per_sec.toFixed(1)} tok/s` : 'N/A';
             const badge = `<span class="badge badge-${p.metadata.backend || ''}">${p.metadata.backend || '?'}</span>`;
+            const devBadge = `<span class="badge" style="background:transparent;color:var(--text-secondary);border:1px solid var(--border);">${p.metadata.device || 'Unknown'}</span>`;
             return `<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--border);font-size:12px;">
-                <span>${badge} ${p.metadata.prefill_type || '?'} / ${p.metadata.num_tokens || '?'}tok</span>
+                <span>${badge} ${devBadge} ${p.metadata.prefill_type || '?'} / ${p.metadata.num_tokens || '?'}tok</span>
                 <span style="font-family:var(--font-mono);color:var(--text-secondary)">${tps}</span>
             </div>`;
         }).join('');

@@ -31,7 +31,7 @@ const Compare = (() => {
 
     function _renderSummaryTable(container, profiles) {
         let html = `<table class="compare-table"><thead><tr>
-            <th>Profile</th><th>Backend</th><th>Prefill</th><th>Tokens</th>
+            <th>Profile</th><th>Backend</th><th>Device</th><th>Prefill</th><th>Tokens</th>
             <th>TTFT (ms)</th><th>TBT (ms)</th><th>T/s</th><th>Start Temp</th><th>Max Temp</th>
         </tr></thead><tbody>`;
 
@@ -42,6 +42,7 @@ const Compare = (() => {
             html += `<tr>
                 <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;" title="${p.id}">${p.id.substring(0, 30)}...</td>
                 <td><span class="badge badge-${m.backend || ''}">${m.backend || '—'}</span></td>
+                <td><span class="badge" style="background:transparent;color:var(--text);border:1px solid var(--border);">${m.device || 'Unknown'}</span></td>
                 <td>${m.prefill_type || '—'}</td>
                 <td>${m.num_tokens ?? '—'}</td>
                 <td>${r.ttft_ms != null ? r.ttft_ms.toFixed(1) : 'N/A'}</td>

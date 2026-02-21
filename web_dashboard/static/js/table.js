@@ -92,6 +92,7 @@ const Table = (() => {
         switch (_sortKey) {
             case 'date': return p.metadata.date || '';
             case 'backend': return p.metadata.backend || '';
+            case 'device': return p.metadata.device || '';
             case 'env': return _getEnvLabel(p);
             case 'prefill': return p.metadata.prefill_type || '';
             case 'eviction': return p.metadata.eviction_policy || '';
@@ -143,6 +144,7 @@ const Table = (() => {
                 <td><input type="checkbox" class="row-select" data-id="${p.id}" ${_selected.has(p.id) ? 'checked' : ''}></td>
                 <td>${date}</td>
                 <td>${backendBadge}</td>
+                <td>${p.metadata.device || 'Unknown'}</td>
                 <td>${envBadge}</td>
                 <td>${p.metadata.prefill_type || '—'}</td>
                 <td>${p.metadata.eviction_policy || '—'}</td>

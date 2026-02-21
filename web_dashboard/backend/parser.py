@@ -80,6 +80,7 @@ def load_profile_summary(filepath):
             "date": meta.get("date"),
             "model": meta.get("model", "unknown"),
             "backend": meta.get("backend", "unknown"),
+            "device": meta.get("device", "Galaxy S25" if "local" not in filename else "Local PC"),
             "num_tokens": meta.get("num_tokens"),
             "prefill_type": meta.get("prefill_type"),
             "eviction_policy": meta.get("eviction_policy"),
@@ -153,7 +154,10 @@ def load_profile_full(filepath):
         "id": profile_id,
         "filename": filename,
         "version": data.get("version", 0),
-        "metadata": meta,
+        "metadata": {
+            **meta,
+            "device": meta.get("device", "Galaxy S25" if "local" not in filename else "Local PC")
+        },
         "results": results,
         "baseline": baseline,
         "events": events,
