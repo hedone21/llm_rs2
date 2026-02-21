@@ -32,6 +32,7 @@ pub struct SnapKVPolicy {
 
 impl SnapKVPolicy {
     pub fn new(observation_window: usize, keep_ratio: f32, protected_prefix: usize) -> Self {
+        let protected_prefix = protected_prefix.max(4);
         Self {
             observation_window,
             keep_ratio: keep_ratio.clamp(0.0, 1.0),
@@ -50,9 +51,9 @@ impl EvictionPolicy for SnapKVPolicy {
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
         let current = cache.current_pos;
-        let keep = target_len.min(
-            ((current as f32) * self.keep_ratio) as usize + self.protected_prefix,
-        );
+        let max_keep = ((current as f32) * self.keep_ratio) as usize + self.protected_prefix;
+        let min_keep = (self.protected_prefix + 16).min(max_keep);
+        let keep = target_len.clamp(min_keep, max_keep);
 
         if current <= keep {
             return Ok(());
@@ -156,22 +157,27 @@ mod tests {
     #[test]
     fn test_evict_stub_falls_back_to_sliding() {
         let _ = env_logger::try_init();
-        let policy = SnapKVPolicy::new(5, 0.5, 0);
+        let policy = SnapKVPolicy::new(5, 0.5, 0); // prefix=4
         let mut cache = make_cache(20);
 
-        // target_len = 10, keep = min(10, 20*0.5+0) = 10
+        // max_keep = 10 + 4 = 14
+        // min_keep = min(4 + 16, 14) = 14
+        // keep = 10.clamp(14, 14) = 14
         policy.evict(&mut cache, 10).unwrap();
-        assert_eq!(cache.current_pos, 10);
+        assert_eq!(cache.current_pos, 14);
     }
 
     #[test]
     fn test_evict_with_prefix() {
-        let policy = SnapKVPolicy::new(5, 0.5, 3);
+        let policy = SnapKVPolicy::new(5, 0.5, 3); // prefix=4
         let mut cache = make_cache(20);
 
-        // target_len = 13, keep = min(13, 20*0.5+3) = 13
+        // target_len = 13
+        // max_keep = 10 + 4 = 14
+        // min_keep = min(4 + 16, 14) = 14
+        // keep = 14
         policy.evict(&mut cache, 13).unwrap();
-        assert_eq!(cache.current_pos, 13);
+        assert_eq!(cache.current_pos, 14);
     }
 
     #[test]

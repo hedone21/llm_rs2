@@ -26,6 +26,8 @@ pub struct SlidingWindowPolicy {
 
 impl SlidingWindowPolicy {
     pub fn new(window_size: usize, protected_prefix: usize) -> Self {
+        // Enforce a minimum protected prefix of 4 to act as an Attention Sink
+        let protected_prefix = protected_prefix.max(4);
         Self {
             window_size,
             protected_prefix,
@@ -40,9 +42,10 @@ impl EvictionPolicy for SlidingWindowPolicy {
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
         let current = cache.current_pos;
-        // Determine how many tokens to keep: min of target_len and window_size + protected
+        // Determine how many tokens to keep
         let max_keep = self.window_size + self.protected_prefix;
-        let keep = target_len.min(max_keep);
+        let min_keep = (self.protected_prefix + 16).min(max_keep);
+        let keep = target_len.clamp(min_keep, max_keep);
 
         if current <= keep {
             return Ok(());
@@ -158,12 +161,12 @@ mod tests {
 
     #[test]
     fn test_should_evict() {
-        let policy = SlidingWindowPolicy::new(10, 0);
+        let policy = SlidingWindowPolicy::new(10, 0); // prefix becomes 4
         let mut cache = make_cache_with_data(8);
-        assert!(!policy.should_evict(&cache, 0));
+        assert!(!policy.should_evict(&cache, 0)); // 8 <= 14
 
-        cache.current_pos = 11;
-        assert!(policy.should_evict(&cache, 0));
+        cache.current_pos = 15;
+        assert!(policy.should_evict(&cache, 0)); // 15 > 14
     }
 
     #[test]
@@ -178,37 +181,44 @@ mod tests {
 
     #[test]
     fn test_evict_no_prefix() {
-        let policy = SlidingWindowPolicy::new(5, 0);
-        let mut cache = make_cache_with_data(10);
-        // 10 tokens, window=5, should keep last 5
-
+        // window=10, prefix defaults to 4
+        // target=15, min_keep = 4+16=20, max_keep = 14
+        // Wait, max_keep < min_keep -> min_keep is clamped to max_keep=14.
+        // So keep=14.
+        let policy = SlidingWindowPolicy::new(10, 0); 
+        let mut cache = make_cache_with_data(20);
+        // prune_count = 20 - 14 = 6. 
+        // We prune from index 4 to 9. (6 tokens)
+        
         policy.evict(&mut cache, 5).unwrap();
-        assert_eq!(cache.current_pos, 5);
+        assert_eq!(cache.current_pos, 14);
 
-        // Verify data: position 0 should now be old position 5 (value=6.0)
+        // Verify data: position 0..3 should be protected 
         let k_data = cache.k_buffer.as_slice::<f32>();
-        assert_eq!(k_data[0], 6.0);
-        assert_eq!(k_data[4], 7.0);
+        assert_eq!(k_data[0], 1.0);
+        assert_eq!(k_data[12], 4.0);
+        
+        // position 4 should now be old position 10 (value=11.0)
+        assert_eq!(k_data[16], 11.0);
     }
 
     #[test]
     fn test_evict_with_protected_prefix() {
-        let policy = SlidingWindowPolicy::new(4, 2);
-        let mut cache = make_cache_with_data(10);
-        // 10 tokens, window=4, prefix=2 → keep 6 total
-        // Remove tokens at positions 2..5 (indices 2,3,4,5), keep 0,1 + 6,7,8,9
-
+        let policy = SlidingWindowPolicy::new(4, 4); // window=4, prefix=4 => max=8
+        let mut cache = make_cache_with_data(12);
+        // min_keep = min(4+16=20, 8) = 8.
+        // keep = 8. Removing 4 tokens (indices 4..7).
+        
         policy.evict(&mut cache, 6).unwrap();
-        assert_eq!(cache.current_pos, 6);
+        assert_eq!(cache.current_pos, 8);
 
-        // Position 0,1 should be unchanged (protected)
         let k_data = cache.k_buffer.as_slice::<f32>();
         assert_eq!(k_data[0], 1.0); // Original pos 0
-        assert_eq!(k_data[4], 2.0); // Original pos 1
+        assert_eq!(k_data[12], 4.0); // Original pos 3
 
-        // Position 2 should now be old position 6 (value=7.0)
-        assert_eq!(k_data[8], 7.0);
-        assert_eq!(k_data[12], 8.0);
+        // Position 4 should now be old position 8 (value=9.0)
+        assert_eq!(k_data[16], 9.0);
+        assert_eq!(k_data[28], 12.0);
     }
 
     #[test]

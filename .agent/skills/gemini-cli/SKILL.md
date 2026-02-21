@@ -20,7 +20,9 @@ When working on tasks related to the architecture, build system, or testing stra
 1. **Read `CLAUDE.md`**: Treat `CLAUDE.md` as primary context alongside `PROJECT_CONTEXT.md` and `ARCHITECTURE.md`. It holds valuable cheat codes for Android cross-compilation, OpenCL backend specifics, and zero-copy semantics.
 2. **Follow constraints**: Adhere strictly to the constraints outlined in `CLAUDE.md` (e.g., Do NOT modify `.cl` kernel files unless requested, use standard testing procedures).
 3. **Respect Claude's domain**: Do not modify files inside the `.claude/` directory unless specifically instructed to migrate or delete them.
-4. **Translate Output**: Always provide answers and explanations translated into Korean at the end of your interactions unless specifically instructed otherwise.
+4. **Communication Guidelines**: 
+   - **Language Preference**: Please provide explanations, summaries, and walkthroughs (e.g. `walkthrough.md`) in **Korean**, translating technical details appropriately.
+   - **Proof of Work**: When explaining a fix or optimization, you MUST include comparative test results (e.g., Before vs. After logs or benchmark numbers) to clearly demonstrate that the objective was successfully met.
 
 ## Usage Example
 

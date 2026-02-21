@@ -74,13 +74,17 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     eviction_window: usize,
 
-    /// Number of prefix tokens to protect from eviction (e.g., system prompt)
-    #[arg(long, default_value_t = 0)]
-    protected_prefix: usize,
+    /// Number of prefix tokens to protect from eviction (defaults to the entire prompt length)
+    #[arg(long)]
+    protected_prefix: Option<usize>,
 
     /// Memory threshold in MB below which eviction triggers
     #[arg(long, default_value_t = 256)]
     memory_threshold_mb: usize,
+
+    /// Target ratio of cache to keep when evicting (0.1 to 0.99)
+    #[arg(long, default_value_t = 0.75)]
+    eviction_target_ratio: f32,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -285,17 +289,19 @@ fn main() -> anyhow::Result<()> {
     let mut tbt_values = Vec::new();
 
     // 4.5 Setup CacheManager
+    let actual_protected_prefix = args.protected_prefix.unwrap_or(input_ids.len());
+
     let cache_manager = {
         let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args.eviction_policy.as_str() {
             "none" => Box::new(NoEvictionPolicy::new()),
             "sliding" => Box::new(SlidingWindowPolicy::new(
                 args.eviction_window,
-                args.protected_prefix,
+                actual_protected_prefix,
             )),
             "snapkv" => Box::new(SnapKVPolicy::new(
                 args.eviction_window,
                 0.5,
-                args.protected_prefix,
+                actual_protected_prefix,
             )),
             other => anyhow::bail!(
                 "Unknown eviction policy: '{}'. Use: none, sliding, snapkv",
@@ -304,13 +310,13 @@ fn main() -> anyhow::Result<()> {
         };
         let monitor = Box::new(LinuxSystemMonitor);
         let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
-        CacheManager::new(policy, monitor, threshold_bytes, 0.75)
+        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
 
     if args.eviction_policy != "none" {
         println!(
-            "Eviction: policy={}, window={}, prefix={}, threshold={}MB",
-            args.eviction_policy, args.eviction_window, args.protected_prefix, args.memory_threshold_mb
+            "Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
+            args.eviction_policy, args.eviction_window, actual_protected_prefix, args.eviction_target_ratio, args.memory_threshold_mb
         );
     }
 
