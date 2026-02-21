@@ -26,6 +26,13 @@ TIMESERIES_FIELDS = {
         "chart": "line",
         "axis_label": "Temperature (°C)",
     },
+    "temps": {
+        "label": "Thermal Sensors",
+        "unit": "°C",
+        "group": "thermal",
+        "chart": "multi_line_dict",
+        "axis_label": "Temperature (°C)",
+    },
 
     # ── CPU Frequency ────────────────────────────────────────
     "cpu_freqs_khz": {

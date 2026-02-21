@@ -228,6 +228,36 @@ const Presenter = (() => {
                             showlegend: idx === sortedGroups.indexOf('cpu_freq'),
                         });
                     }
+                } else if (field.chart === 'multi_line_dict') {
+                    // E.g., temps -> { cpu: 70, gpu: 60 }
+                    // Collect all unique dict keys across the timeseries
+                    const allKeys = new Set();
+                    timeseries.forEach(s => {
+                        const obj = s[field.key];
+                        if (obj) {
+                            Object.keys(obj).forEach(k => allKeys.add(k));
+                        }
+                    });
+
+                    let c = 0;
+                    for (const k of Array.from(allKeys).sort()) {
+                        traces.push({
+                            x: relSeconds,
+                            y: timeseries.map(s => {
+                                const obj = s[field.key];
+                                return obj && obj[k] != null ? obj[k] : null;
+                            }),
+                            name: k,
+                            type: 'scatter',
+                            mode: 'lines',
+                            line: { color: CORE_COLORS[c % CORE_COLORS.length], width: 1.5 },
+                            xaxis: xAxisKey,
+                            yaxis: yAxisKey,
+                            legendgroup: field.group,
+                            showlegend: idx === sortedGroups.indexOf(field.group),
+                        });
+                        c++;
+                    }
                 } else {
                     // Standard line trace
                     traces.push({

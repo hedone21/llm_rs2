@@ -32,12 +32,83 @@ def _safe_float(val, default=None):
         return default
 
 
+def _categorize_sensor(sensor_name):
+    """Categorizes a thermal sensor into CPU, GPU, SYS, or BAT slots."""
+    sn = sensor_name.lower()
+    
+    # 1. CPU
+    if any(k in sn for k in ['cpu', 'pkg', 'core', 'tsens', 'k10temp']):
+        return "cpu"
+    # 2. GPU
+    elif any(k in sn for k in ['gpu', 'amdgpu', 'nouveau', 'npu']):
+        return "gpu"
+    # 4. Battery / External
+    elif any(k in sn for k in ['battery', 'nvme', 'bat', 'charger']):
+        return "bat"
+    # 3. System / Board (Fallback for other soc/acpi/pch)
+    else:
+        return "sys"
+
 def _extract_temp_range(timeseries):
-    """Extract start, end, and max temperature from timeseries."""
-    temps = [s.get("temp_c") for s in timeseries if s.get("temp_c") is not None]
-    if not temps:
-        return None, None, None
-    return temps[0], temps[-1], max(temps)
+    """
+    Extract start, end, and max temperatures for all sensors.
+    Maps into 4 representative slots: cpu, gpu, sys, bat.
+    Returns: (legacy_start, legacy_end, legacy_max, slots_dict)
+    """
+    if not timeseries:
+        return None, None, None, {}
+
+    # Backward compatibility with single temp_c
+    if "temp_c" in timeseries[0]:
+        temps = [s.get("temp_c") for s in timeseries if s.get("temp_c") is not None]
+        if not temps:
+            return None, None, None, {}
+        
+        start, end, mx = temps[0], temps[-1], max(temps)
+        # For legacy, treat the single temp as "sys" or "cpu" generally, let's put it in "sys" for safety
+        slots = {"sys": {"start": start, "end": end, "max": mx}}
+        return start, end, mx, slots
+        
+    # Modern approach with "temps" dictionary
+    if "temps" in timeseries[0]:
+        slots_data = {"cpu": [], "gpu": [], "sys": [], "bat": []}
+        
+        # Aggregate all readings by slot across the timeseries
+        for sample in timeseries:
+            temps_dict = sample.get("temps", {})
+            
+            # Find the max temp within each slot for this given timestamp
+            # E.g. if we have 3 CPU sensors, we take the hottest one at time T
+            slot_curr_max = {"cpu": None, "gpu": None, "sys": None, "bat": None}
+            
+            for sensor_name, val in temps_dict.items():
+                slot = _categorize_sensor(sensor_name)
+                if val is not None:
+                    if slot_curr_max[slot] is None or val > slot_curr_max[slot]:
+                        slot_curr_max[slot] = val
+                        
+            # Record the max temperature representative for that slot at this timestamp
+            for slot in slots_data.keys():
+                if slot_curr_max[slot] is not None:
+                    slots_data[slot].append(slot_curr_max[slot])
+                    
+        # Calculate start, end, max for each slot
+        final_slots = {}
+        for slot, readings in slots_data.items():
+            if readings:
+                final_slots[slot] = {
+                    "start": readings[0],
+                    "end": readings[-1],
+                    "max": max(readings)
+                }
+                
+        # For the dashboard's high-level summary (to not break old tables entirely immediately), 
+        # we can pick "cpu" or "sys" as the primary fallback max_temp
+        primary_list = slots_data["cpu"] or slots_data["sys"] or slots_data["bat"] or slots_data["gpu"]
+        if primary_list:
+             return primary_list[0], primary_list[-1], max(primary_list), final_slots
+             
+    return None, None, None, {}
 
 
 def _detect_timeseries_fields(timeseries):
@@ -67,7 +138,7 @@ def load_profile_summary(filepath):
     baseline = data.get("baseline", {})
     timeseries = data.get("timeseries", [])
 
-    start_temp, end_temp, max_temp = _extract_temp_range(timeseries)
+    start_temp, end_temp, max_temp, slots = _extract_temp_range(timeseries)
 
     filename = os.path.basename(filepath)
     profile_id = os.path.splitext(filename)[0]
@@ -95,11 +166,13 @@ def load_profile_summary(filepath):
             "start_temp": start_temp,
             "end_temp": end_temp,
             "max_temp": max_temp,
+            "slots": slots
         },
         "baseline": {
             "avg_memory_used_mb": _safe_float(baseline.get("avg_memory_used_mb")),
             "avg_gpu_load_percent": _safe_float(baseline.get("avg_gpu_load_percent")),
-            "avg_start_temp_c": _safe_float(baseline.get("avg_start_temp_c")),
+            # baseline avg_start_temp might be a float or dict now, but we just pass it along
+            "avg_start_temp": baseline.get("avg_start_temp_c") or baseline.get("avg_start_temps")
         },
         "timeseries_count": len(timeseries),
     }
@@ -148,7 +221,7 @@ def load_profile_full(filepath):
     filename = os.path.basename(filepath)
     profile_id = os.path.splitext(filename)[0]
 
-    start_temp, end_temp, max_temp = _extract_temp_range(timeseries)
+    start_temp, end_temp, max_temp, slots = _extract_temp_range(timeseries)
 
     return {
         "id": profile_id,
@@ -165,6 +238,7 @@ def load_profile_full(filepath):
             "start_temp": start_temp,
             "end_temp": end_temp,
             "max_temp": max_temp,
+            "slots": slots
         },
         "timeseries": transformed_timeseries,
         "field_descriptors": field_descriptors,

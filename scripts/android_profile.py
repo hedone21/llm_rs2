@@ -27,7 +27,7 @@ class DeviceMonitor:
         self.data_buffer = []
         self.gpu_path = self.find_gpu_clk_path()
         self.gpu_load_path = self.find_gpu_load_path()
-        self.temp_path = self.find_thermal_path()
+        self.thermal_paths = self.find_thermal_paths()
         self.last_cpu_stats = None
         self.target_pid = None
         self.last_proc_cpu_stats = None # (utime+stime, timestamp)
@@ -129,14 +129,13 @@ class DeviceMonitor:
         except: pass
         return 0.0
 
-    def find_thermal_path(self):
-        """Scans /sys/class/thermal/ for SoC temps, returns path if found."""
-        # Common SoC/AP thermal zone types on Android
-        target_types = ['tsens_tz_sensor', 'soc_thermal', 'mtktsc', 'ap_thermal']
+    def find_thermal_paths(self):
+        """Scans /sys/class/thermal/ to find all available and readable thermal zones."""
         base_dir = "/sys/class/thermal"
+        paths_dict = {}
         
         try:
-            # First check if we can list the directory (requires permissions, often readable though)
+            # First check if we can list the directory
             output = run_adb_command(f'shell "ls -1 {base_dir} 2>/dev/null"', check=False)
             zones = [z for z in output.splitlines() if z.startswith('thermal_zone')]
             
@@ -144,34 +143,38 @@ class DeviceMonitor:
                 type_cmd = f'shell "cat {base_dir}/{tz}/type 2>/dev/null"'
                 tz_type = run_adb_command(type_cmd, check=False)
                 
-                if tz_type and any(t in tz_type for t in target_types):
+                if tz_type and tz_type not in paths_dict:
                     # Check if we can actually read the temp file
                     temp_path = f"{base_dir}/{tz}/temp"
                     test_read = run_adb_command(f'shell "cat {temp_path} 2>/dev/null"', check=False)
                     if test_read and test_read.strip().isdigit():
-                        print(f"[Monitor] Matched thermal zone '{tz_type}' at {tz}")
-                        return temp_path
+                        paths_dict[tz_type] = temp_path
         except: pass
-        print("[Monitor] No readable SoC thermal zone found. Will fallback to battery temp.")
-        return None
+        
+        print(f"[Monitor] Discovered readable thermal sensors: {list(paths_dict.keys())}")
+        return paths_dict
 
-    def get_temperature(self):
-        # Tier 1: thermal_zone temp path
-        if self.temp_path:
+    def get_temperatures(self):
+        """Returns a dictionary of {sensor_name: temperature_c}."""
+        temps = {}
+        
+        # 1. Read all sysfs thermal zones
+        for tz_type, path in self.thermal_paths.items():
             try:
-                output = run_adb_command(f'shell "cat {self.temp_path} 2>/dev/null"', check=False)
+                output = run_adb_command(f'shell "cat {path} 2>/dev/null"', check=False)
                 if output and output.isdigit():
-                    return float(output) / 1000.0  # Usually millidegrees
+                    temps[tz_type] = float(output) / 1000.0  # Usually millidegrees
             except: pass
             
-        # Tier 2 Fallback: dumpsys battery
+        # 2. Add dumpsys battery as a fallback/additional sensor
         try:
             output = run_adb_command('shell "dumpsys battery | grep temperature"')
             match = re.search(r'temperature:\s*(\d+)', output)
             if match:
-                return float(match.group(1)) / 10.0 # Battery temp is in tenths of a degree
+                temps["battery"] = float(match.group(1)) / 10.0 # Battery temp is in tenths of a degree
         except: pass
-        return 0.0
+        
+        return temps
         
     def get_memory_info(self):
         try:
@@ -244,7 +247,7 @@ class DeviceMonitor:
         except: return 0.0
     def capture_snapshot(self):
         timestamp = datetime.now().isoformat()
-        temp = self.get_temperature()
+        temps = self.get_temperatures()
         cpu_freqs = self.get_cpu_freqs()
         gpu_freq = self.get_gpu_freq()
         mem_used = self.get_memory_info()
@@ -260,7 +263,7 @@ class DeviceMonitor:
         
         return {
             "timestamp": timestamp,
-            "temp_c": temp,
+            "temps": temps,
             "gpu_freq_hz": gpu_freq,
             "cpu_freqs_khz": cpu_freqs,
             "mem_used_mb": mem_used,
@@ -278,7 +281,7 @@ class DeviceMonitor:
             samples.append({
                 "mem_used_mb": self.get_memory_info(),
                 "gpu_load": self.get_gpu_load(),
-                "temp": self.get_temperature()
+                "temps": self.get_temperatures()
             })
             time.sleep(1.0)
             
@@ -287,12 +290,21 @@ class DeviceMonitor:
         
         avg_mem = sum(s["mem_used_mb"] for s in samples) / len(samples)
         avg_gpu = sum(s["gpu_load"] for s in samples) / len(samples)
-        avg_temp = sum(s["temp"] for s in samples) / len(samples)
+        
+        avg_temps = {}
+        for s in samples:
+            for k, v in s["temps"].items():
+                avg_temps[k] = avg_temps.get(k, 0.0) + v
+                
+        if samples:
+            for k in avg_temps:
+                avg_temps[k] /= len(samples)
+                avg_temps[k] = round(avg_temps[k], 2)
         
         return {
             "avg_memory_used_mb": round(avg_mem, 2),
             "avg_gpu_load_percent": round(avg_gpu, 2),
-            "avg_start_temp_c": round(avg_temp, 2)
+            "avg_start_temps": avg_temps
         }
 
     def get_cpu_core_info(self):

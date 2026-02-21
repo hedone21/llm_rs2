@@ -29,7 +29,7 @@ class DeviceMonitor:
         self.last_cpu_stats = None
         self.last_proc_cpu_stats = None
         self.num_cores = os.cpu_count() or 1
-        self.temp_path = self.find_thermal_path()
+        self.thermal_paths = self.find_thermal_paths()
         print(f"[Monitor] Detected {self.num_cores} CPU cores for normalization.")
         
     def find_target_pid(self, process_name="generate"):
@@ -79,49 +79,55 @@ class DeviceMonitor:
     def get_gpu_load(self):
         return 0.0
 
-    def find_thermal_path(self):
-        """Scans /sys/class/thermal/ for the most relevant thermal zone."""
-        # Priorities for PC/Embedded Linux:
-        # 1. x86_pkg_temp / coretemp (Intel/AMD Package)
-        # 2. cpu-thermal (Raspberry Pi / BCM)
-        # 3. k10temp (AMD)
-        # 4. Fallback to thermal_zone0
-        
-        target_types = ['x86_pkg_temp', 'coretemp', 'cpu-thermal', 'k10temp']
+    def find_thermal_paths(self):
+        """Scans /sys/class/thermal/ to find all available and readable thermal zones."""
         base_dir = "/sys/class/thermal"
-        fallback = f"{base_dir}/thermal_zone0/temp"
+        paths_dict = {}
         
         try:
             if not os.path.exists(base_dir):
-                return None
+                return paths_dict
             
             for tz in sorted(os.listdir(base_dir)):
                 if not tz.startswith("thermal_zone"): continue
                 
                 type_path = os.path.join(base_dir, tz, "type")
-                if os.path.exists(type_path):
+                temp_path = os.path.join(base_dir, tz, "temp")
+                if os.path.exists(type_path) and os.path.exists(temp_path):
                     with open(type_path, 'r') as f:
                         tz_type = f.read().strip()
-                        
-                        if any(t in tz_type for t in target_types):
-                            print(f"[Monitor] Matched thermal zone '{tz_type}' at {tz}")
-                            return os.path.join(base_dir, tz, "temp")
+                        # Avoid duplicates by appending ID if needed, though usually type is unique enough
+                        # or we can just keep the first one we find per type
+                        if tz_type not in paths_dict:
+                            # Test read
+                            try:
+                                with open(temp_path, 'r') as tf:
+                                    val = tf.read().strip()
+                                    if val.isdigit():
+                                        paths_dict[tz_type] = temp_path
+                            except: pass
                             
-            if os.path.exists(fallback):
-                print(f"[Monitor] Using fallback thermal zone at thermal_zone0")
-                return fallback
+            if not paths_dict:
+                fallback = f"{base_dir}/thermal_zone0/temp"
+                if os.path.exists(fallback):
+                    paths_dict["thermal_zone0"] = fallback
+                    
         except: pass
-        return None
+        
+        print(f"[Monitor] Discovered thermal sensors: {list(paths_dict.keys())}")
+        return paths_dict
 
-    def get_temperature(self):
-        if not self.temp_path: return 0.0
-        try:
-            with open(self.temp_path, 'r') as f:
-                val = f.read().strip()
-                if val.isdigit():
-                    return float(val) / 1000.0
-        except: pass
-        return 0.0
+    def get_temperatures(self):
+        """Returns a dictionary of {sensor_name: temperature_c}."""
+        temps = {}
+        for tz_type, path in self.thermal_paths.items():
+            try:
+                with open(path, 'r') as f:
+                    val = f.read().strip()
+                    if val.isdigit():
+                        temps[tz_type] = float(val) / 1000.0
+            except: pass
+        return temps
         
     def get_memory_info(self):
         try:
@@ -183,7 +189,7 @@ class DeviceMonitor:
         
         return {
             "timestamp": timestamp,
-            "temp_c": self.get_temperature(),
+            "temps": self.get_temperatures(),
             "gpu_freq_hz": self.get_gpu_freq(),
             "cpu_freqs_khz": self.get_cpu_freqs(),
             "mem_used_mb": self.get_memory_info(),
@@ -201,19 +207,29 @@ class DeviceMonitor:
             samples.append({
                 "mem_used_mb": self.get_memory_info(),
                 "gpu_load": self.get_gpu_load(),
-                "temp": self.get_temperature()
+                "temps": self.get_temperatures()
             })
             time.sleep(1.0)
             
         if not samples: return {}
         avg_mem = sum(s["mem_used_mb"] for s in samples) / len(samples)
         avg_gpu = sum(s["gpu_load"] for s in samples) / len(samples)
-        avg_temp = sum(s["temp"] for s in samples) / len(samples)
+        
+        # Average each sensor if temps is a dict
+        avg_temps = {}
+        for s in samples:
+            for k, v in s["temps"].items():
+                avg_temps[k] = avg_temps.get(k, 0.0) + v
+                
+        if samples:
+            for k in avg_temps:
+                avg_temps[k] /= len(samples)
+                avg_temps[k] = round(avg_temps[k], 2)
         
         return {
             "avg_memory_used_mb": round(avg_mem, 2),
             "avg_gpu_load_percent": round(avg_gpu, 2),
-            "avg_start_temp_c": round(avg_temp, 2)
+            "avg_start_temps": avg_temps
         }
 
     def get_cpu_core_info(self):

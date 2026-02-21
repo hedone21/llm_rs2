@@ -136,9 +136,20 @@ const Table = (() => {
                 ? `<span class="badge badge-idle">Idle</span>`
                 : `<span class="badge badge-fg">${envLabel}</span>`;
 
-            const tempStr = p.thermal.start_temp != null
-                ? `${p.thermal.start_temp} → ${p.thermal.max_temp}`
-                : '—';
+            let tempHtml = '—';
+            if (p.thermal.slots && Object.keys(p.thermal.slots).length > 0) {
+                // Render a compact badge for each slot: C:45° G:-- S:50° B:35°
+                const s = p.thermal.slots;
+                const badges = [];
+                if (s.cpu) badges.push(`<span title="CPU Temp" class="t-badge c">C:${s.cpu.max.toFixed(0)}°</span>`);
+                if (s.gpu) badges.push(`<span title="GPU Temp" class="t-badge g">G:${s.gpu.max.toFixed(0)}°</span>`);
+                if (s.sys) badges.push(`<span title="SYS Temp" class="t-badge s">S:${s.sys.max.toFixed(0)}°</span>`);
+                if (s.bat) badges.push(`<span title="BAT Temp" class="t-badge b">B:${s.bat.max.toFixed(0)}°</span>`);
+                tempHtml = `<div class="temp-slots">${badges.join(' ')}</div>`;
+            } else if (p.thermal.max_temp != null) {
+                // Fallback for extremely old format
+                tempHtml = `${p.thermal.max_temp.toFixed(0)}°C`;
+            }
 
             tr.innerHTML = `
                 <td><input type="checkbox" class="row-select" data-id="${p.id}" ${_selected.has(p.id) ? 'checked' : ''}></td>
@@ -152,7 +163,7 @@ const Table = (() => {
                 <td>${p.results.ttft_ms != null ? p.results.ttft_ms.toFixed(1) : 'N/A'}</td>
                 <td>${p.results.tbt_ms != null ? p.results.tbt_ms.toFixed(2) : 'N/A'}</td>
                 <td>${p.results.tokens_per_sec != null ? p.results.tokens_per_sec.toFixed(1) : 'N/A'}</td>
-                <td>${tempStr}</td>
+                <td>${tempHtml}</td>
                 <td><button class="btn btn-sm btn-secondary btn-view" data-id="${p.id}">View</button></td>
             `;
 
