@@ -200,10 +200,25 @@ mod tests {
     use super::*;
     use ocl::{Platform, Device, Context, Queue};
 
+    use std::panic;
+
     fn create_test_queue() -> Result<Queue> {
-        // Use try to avoid panic when no OpenCL is available
-        let platform = Platform::list().into_iter().next()
+        // Platform::list() panics natively in the ocl crate if no platform is found.
+        // We use catch_unwind to intercept this panic and convert it to an Err.
+        let platform_result = panic::catch_unwind(|| {
+            // Some ocl versions return Result from list(), others panic. We handle both.
+            let res = Platform::list();
+            res
+        });
+        
+        let platform_list = match platform_result {
+            Ok(list) => list,
+            Err(_) => return Err(anyhow!("No OpenCL platform available or panic occurred")),
+        };
+
+        let platform = platform_list.into_iter().next()
             .ok_or_else(|| anyhow!("No OpenCL platform available"))?;
+            
         let device = Device::first(platform)?;
         let context = Context::builder()
             .platform(platform)
@@ -217,7 +232,7 @@ mod tests {
     fn test_alloc_unified_buffer() {
         let queue = match create_test_queue() {
             Ok(q) => q,
-            Err(_) => return, // Skip if no OpenCL device
+            Err(_) => panic!("[SKIPPED] No OpenCL device"),
         };
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
@@ -229,7 +244,7 @@ mod tests {
     fn test_map_returns_valid_ptr() {
         let queue = match create_test_queue() {
             Ok(q) => q,
-            Err(_) => return,
+            Err(_) => panic!("[SKIPPED] No OpenCL device"),
         };
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
@@ -246,7 +261,7 @@ mod tests {
     fn test_unmap_and_remap() {
         let queue = match create_test_queue() {
             Ok(q) => q,
-            Err(_) => return,
+            Err(_) => panic!("[SKIPPED] No OpenCL device"),
         };
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
@@ -267,7 +282,7 @@ mod tests {
     fn test_map_write_unmap_cycle() {
         let queue = match create_test_queue() {
             Ok(q) => q,
-            Err(_) => return,
+            Err(_) => panic!("[SKIPPED] No OpenCL device"),
         };
 
         let buffer = UnifiedBuffer::new(queue, 256, DType::F32).unwrap();

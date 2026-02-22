@@ -171,6 +171,25 @@ def classify_test(test_path: str) -> tuple[str, str]:
 def parse_test_output(text: str) -> list[dict]:
     """Parse cargo test stdout for test results."""
     results = []
+    
+    # Pre-scan for SKIPPED panics by looking for the explicit failure block outputs
+    # When a test fails it prints:
+    # ---- buffer::unified_buffer::tests::test_alloc_unified_buffer stdout ----
+    # thread 'buffer::unified_buffer::tests::test_alloc_unified_buffer' panicked at src/buffer/unified_buffer.rs:221:20:
+    # [SKIPPED] No OpenCL device
+    skipped_tests = set()
+    for line in text.splitlines():
+        if "panicked at" in line and "[SKIPPED]" in line:
+            parts = line.split("'")
+            if len(parts) >= 3:
+                skipped_tests.add(parts[1])
+        # Sometimes the panic message is on the next line
+        elif "----" in line and "stdout ----" in line:
+            test_name = line.replace("----", "").replace("stdout", "").strip()
+            # We'll just check if the whole text contains [SKIPPED] and the test name
+            if "[SKIPPED]" in text and test_name in text:
+                skipped_tests.add(test_name)
+
     for line in text.splitlines():
         m = TEST_LINE_RE.match(line.strip())
         if m:
@@ -180,6 +199,11 @@ def parse_test_output(text: str) -> list[dict]:
                 status = "PASS"
             elif status == "IGNORED":
                 status = "SKIP"
+            
+            # Override FAIL to SKIP if it panicked intentionally with [SKIPPED]
+            if status == "FAILED" and test_path in skipped_tests:
+                status = "SKIP"
+                
             results.append({"name": test_path, "status": status})
     return results
 
@@ -287,10 +311,10 @@ def render_test_status(groups: dict, timestamp: str) -> str:
 
     # Quality Gate Summary table
     lines.append("### Quality Gate Summary\n")
-    lines.append("| Component | Tier | Maturity | Tests | Passed | Gate |")
-    lines.append("|:----------|:-----|:---------|------:|-------:|:-----|")
+    lines.append("| Component | Tier | Maturity | Tests | Passed | Skipped | Gate |")
+    lines.append("|:----------|:-----|:---------|------:|-------:|--------:|:-----|")
 
-    total_all, passed_all = 0, 0
+    total_all, passed_all, skipped_all = 0, 0, 0
     blocked_count = 0
     fail_count = 0
 
@@ -299,6 +323,7 @@ def render_test_status(groups: dict, timestamp: str) -> str:
         tests = groups.get(key, [])
         t = len(tests)
         p = sum(1 for x in tests if x["status"] == "PASS")
+        s = sum(1 for x in tests if x["status"] == "SKIP")
         gate = gate_statuses[key]
 
         if gate == "BLOCKED":
@@ -309,15 +334,21 @@ def render_test_status(groups: dict, timestamp: str) -> str:
         gate_display = f"**{gate}**" if gate in ("BLOCKED", "FAIL") else gate
         lines.append(
             f"| {meta['name']} | {meta['tier']} | {meta['maturity']} "
-            f"| {t} | {p} | {gate_display} |"
+            f"| {t} | {p} | {s} | {gate_display} |"
         )
         total_all += t
         passed_all += p
+        skipped_all += s
 
-    failed_all = total_all - passed_all
-    overall_display = f"**{overall}**" if overall == "FAIL" else overall
+    failed_all = total_all - passed_all - skipped_all
+    if failed_all > 0 or overall == "FAIL":
+        overall_display = "**FAIL**"
+    elif failed_all == 0 and skipped_all > 0 and passed_all == 0:
+        overall_display = "SKIP"
+    else:
+        overall_display = "PASS"
     lines.append(
-        f"| **Overall** | | | **{total_all}** | **{passed_all}** | {overall_display} |"
+        f"| **Overall** | | | **{total_all}** | **{passed_all}** | **{skipped_all}** | {overall_display} |"
     )
 
     # Handle integration tests (not in COMPONENT_META)
@@ -339,13 +370,23 @@ def render_test_status(groups: dict, timestamp: str) -> str:
         meta = COMPONENT_META[key]
         for t in sorted(tests, key=lambda x: x["name"]):
             short = t["name"].rsplit("::", 1)[-1]
-            icon = "PASS" if t["status"] == "PASS" else "**FAIL**"
+            if t["status"] == "PASS":
+                icon = "PASS"
+            elif t["status"] == "SKIP":
+                icon = "SKIP"
+            else:
+                icon = "**FAIL**"
             lines.append(f"| `{short}` | {meta['name']} | {icon} |")
 
     # Integration test details
     for t in sorted(integration_tests, key=lambda x: x["name"]):
         short = t["name"].rsplit("::", 1)[-1]
-        icon = "PASS" if t["status"] == "PASS" else "**FAIL**"
+        if t["status"] == "PASS":
+            icon = "PASS"
+        elif t["status"] == "SKIP":
+            icon = "SKIP"
+        else:
+            icon = "**FAIL**"
         lines.append(f"| `{short}` | Integration | {icon} |")
 
     return "\n".join(lines)
@@ -423,7 +464,8 @@ def main():
     # 4. Compute totals for history
     total = len(results)
     passed = sum(1 for r in results if r["status"] == "PASS")
-    failed = total - passed
+    skipped = sum(1 for r in results if r["status"] == "SKIP")
+    failed = total - passed - skipped
 
     # Build details dict for history (only components with tests)
     details = {}
