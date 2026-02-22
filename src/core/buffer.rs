@@ -72,3 +72,40 @@ pub trait Buffer: Send + Sync {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DummyBuffer;
+    impl Buffer for DummyBuffer {
+        fn as_any(&self) -> &dyn Any { self }
+        fn dtype(&self) -> DType { DType::F32 }
+        fn size(&self) -> usize { 1024 }
+        fn as_ptr(&self) -> *const u8 { std::ptr::null() }
+        fn as_mut_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+        #[cfg(feature = "opencl")]
+        fn cl_mem(&self) -> Option<&ocl::core::Mem> { None }
+        #[cfg(not(feature = "opencl"))]
+        fn cl_mem(&self) -> Option<()> { None }
+        fn sync_device(&self) -> Result<()> { Ok(()) }
+    }
+
+    #[test]
+    fn test_dtype_size() {
+        assert_eq!(DType::F32.size(), 4);
+        assert_eq!(DType::F16.size(), 2);
+        assert_eq!(DType::BF16.size(), 2);
+        assert_eq!(DType::U8.size(), 1);
+        assert_eq!(DType::Q4_0.size(), 1); // 1 byte reported per struct/type enum representation although mapped as blocks
+        assert_eq!(DType::Q4_1.size(), 1); 
+    }
+
+    #[test]
+    fn test_buffer_default_impls() {
+        let buffer = DummyBuffer;
+        assert!(buffer.map_for_cpu().is_ok());
+        assert!(buffer.unmap_for_gpu().is_ok());
+        assert!(buffer.is_mapped()); // Defaults to true
+    }
+}
