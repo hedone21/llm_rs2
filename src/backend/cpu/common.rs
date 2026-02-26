@@ -723,3 +723,588 @@ impl CpuBackendCommon {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::core::backend::Backend;
+    use crate::core::buffer::DType;
+    use crate::core::memory::Memory;
+    use crate::core::quant::{BlockQ4_0, BlockQ4_1, QK4_0, QK4_1};
+    use crate::core::shape::Shape;
+    use crate::core::tensor::Tensor;
+    use crate::memory::galloc::Galloc;
+    use std::sync::Arc;
+
+    // ---- Helpers ----
+
+    fn make_f32_tensor(backend: &Arc<dyn Backend>, shape: Vec<usize>, data: &[f32]) -> Tensor {
+        let memory = Galloc::new();
+        let numel: usize = shape.iter().product();
+        assert_eq!(data.len(), numel, "data length must match shape");
+        let buf = memory.alloc(numel * 4, DType::F32).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr() as *mut f32, numel);
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    fn make_f32_tensor_zeros(backend: &Arc<dyn Backend>, shape: Vec<usize>) -> Tensor {
+        let memory = Galloc::new();
+        let numel: usize = shape.iter().product();
+        let buf = memory.alloc(numel * 4, DType::F32).unwrap();
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    fn make_f16_tensor_zeros(backend: &Arc<dyn Backend>, shape: Vec<usize>) -> Tensor {
+        let memory = Galloc::new();
+        let numel: usize = shape.iter().product();
+        let buf = memory.alloc(numel * 2, DType::F16).unwrap();
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    /// Generate deterministic pseudo-random data
+    fn gen_data(n: usize, seed: u32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let v = ((i as u32).wrapping_mul(seed).wrapping_add(17)) % 1000;
+                (v as f32 * 0.001) - 0.5
+            })
+            .collect()
+    }
+
+    /// Quantize f32 data to Q4_0 blocks (row-major, row_len must be multiple of 32)
+    fn quantize_q4_0(data: &[f32], n_rows: usize, row_len: usize) -> Vec<u8> {
+        let nb = row_len / QK4_0;
+        let mut blocks = Vec::with_capacity(n_rows * nb);
+        for row in 0..n_rows {
+            for bi in 0..nb {
+                let offset = row * row_len + bi * QK4_0;
+                let src = &data[offset..offset + QK4_0];
+                let max_val = src.iter().map(|v| v.abs()).fold(0.0f32, |x, y| x.max(y));
+                let d = max_val / 7.0;
+                let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+                let mut block = BlockQ4_0 {
+                    d: half::f16::from_f32(d),
+                    qs: [0; 16],
+                };
+                for z in 0..16 {
+                    let v0 = (src[z] * id).round().clamp(-8.0, 7.0) as i8;
+                    let v1 = (src[z + 16] * id).round().clamp(-8.0, 7.0) as i8;
+                    block.qs[z] = (v0 + 8) as u8 | (((v1 + 8) as u8) << 4);
+                }
+                blocks.push(block);
+            }
+        }
+        // Convert to raw bytes
+        let byte_len = blocks.len() * std::mem::size_of::<BlockQ4_0>();
+        let mut bytes = vec![0u8; byte_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                blocks.as_ptr() as *const u8,
+                bytes.as_mut_ptr(),
+                byte_len,
+            );
+        }
+        bytes
+    }
+
+    /// Quantize f32 data to Q4_1 blocks
+    fn quantize_q4_1(data: &[f32], n_rows: usize, row_len: usize) -> Vec<u8> {
+        let nb = row_len / QK4_1;
+        let mut blocks = Vec::with_capacity(n_rows * nb);
+        for row in 0..n_rows {
+            for bi in 0..nb {
+                let offset = row * row_len + bi * QK4_1;
+                let src = &data[offset..offset + QK4_1];
+                let min_val = src.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                let max_val = src.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let d = (max_val - min_val) / 15.0;
+                let m_val = min_val;
+                let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+                let mut block = BlockQ4_1 {
+                    d: half::f16::from_f32(d),
+                    m: half::f16::from_f32(m_val),
+                    qs: [0; 16],
+                };
+                for z in 0..16 {
+                    let v0 = ((src[z] - m_val) * id).round().clamp(0.0, 15.0) as u8;
+                    let v1 = ((src[z + 16] - m_val) * id).round().clamp(0.0, 15.0) as u8;
+                    block.qs[z] = v0 | (v1 << 4);
+                }
+                blocks.push(block);
+            }
+        }
+        let byte_len = blocks.len() * std::mem::size_of::<BlockQ4_1>();
+        let mut bytes = vec![0u8; byte_len];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                blocks.as_ptr() as *const u8,
+                bytes.as_mut_ptr(),
+                byte_len,
+            );
+        }
+        bytes
+    }
+
+    fn make_q4_0_tensor(
+        backend: &Arc<dyn Backend>,
+        shape: Vec<usize>,
+        f32_data: &[f32],
+    ) -> Tensor {
+        let memory = Galloc::new();
+        let n_rows = shape[0];
+        let row_len = shape[1];
+        let bytes = quantize_q4_0(f32_data, n_rows, row_len);
+        let buf = memory.alloc(bytes.len(), DType::Q4_0).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), bytes.len());
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    fn make_q4_1_tensor(
+        backend: &Arc<dyn Backend>,
+        shape: Vec<usize>,
+        f32_data: &[f32],
+    ) -> Tensor {
+        let memory = Galloc::new();
+        let n_rows = shape[0];
+        let row_len = shape[1];
+        let bytes = quantize_q4_1(f32_data, n_rows, row_len);
+        let buf = memory.alloc(bytes.len(), DType::Q4_1).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), bytes.len());
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    fn assert_close(a: &[f32], b: &[f32], tol: f32, msg: &str) {
+        assert_eq!(a.len(), b.len(), "{}: length mismatch {} vs {}", msg, a.len(), b.len());
+        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (va - vb).abs();
+            assert!(
+                diff <= tol,
+                "{}: element [{}] differs: {} vs {}, diff={}, tol={}",
+                msg, i, va, vb, diff, tol
+            );
+        }
+    }
+
+    fn scalar_backend() -> Arc<dyn Backend> {
+        Arc::new(CpuBackendCommon::new())
+    }
+
+    fn auto_backend() -> Arc<dyn Backend> {
+        Arc::new(CpuBackend::new())
+    }
+
+    // ---- T3 Oracle Tests ----
+
+    #[test]
+    fn test_matmul_transposed_f32_oracle() {
+        let (m, k, n) = (1, 128, 64);
+        let a_data = gen_data(m * k, 42);
+        let b_data = gen_data(n * k, 137);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let a_s = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_s = make_f32_tensor(&scalar, vec![n, k], &b_data);
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![m, n]);
+
+        let a_a = make_f32_tensor(&auto, vec![m, k], &a_data);
+        let b_a = make_f32_tensor(&auto, vec![n, k], &b_data);
+        let mut out_a = make_f32_tensor_zeros(&auto, vec![m, n]);
+
+        scalar.matmul_transposed(&a_s, &b_s, &mut out_s).unwrap();
+        auto.matmul_transposed(&a_a, &b_a, &mut out_a).unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-4,
+            "matmul_transposed_f32 [1,128]x[64,128]",
+        );
+    }
+
+    #[test]
+    fn test_matmul_transposed_f32_large_oracle() {
+        let (m, k, n) = (8, 256, 128);
+        let a_data = gen_data(m * k, 53);
+        let b_data = gen_data(n * k, 97);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let a_s = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_s = make_f32_tensor(&scalar, vec![n, k], &b_data);
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![m, n]);
+
+        let a_a = make_f32_tensor(&auto, vec![m, k], &a_data);
+        let b_a = make_f32_tensor(&auto, vec![n, k], &b_data);
+        let mut out_a = make_f32_tensor_zeros(&auto, vec![m, n]);
+
+        scalar.matmul_transposed(&a_s, &b_s, &mut out_s).unwrap();
+        auto.matmul_transposed(&a_a, &b_a, &mut out_a).unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-4,
+            "matmul_transposed_f32 [8,256]x[128,256]",
+        );
+    }
+
+    #[test]
+    fn test_matmul_transposed_q4_0_oracle() {
+        let (m, k, n) = (1, 128, 64);
+        let a_data = gen_data(m * k, 42);
+        let b_data_f32 = gen_data(n * k, 137);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let a_s = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_s = make_q4_0_tensor(&scalar, vec![n, k], &b_data_f32);
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![m, n]);
+
+        let a_a = make_f32_tensor(&auto, vec![m, k], &a_data);
+        let b_a = make_q4_0_tensor(&auto, vec![n, k], &b_data_f32);
+        let mut out_a = make_f32_tensor_zeros(&auto, vec![m, n]);
+
+        scalar.matmul_transposed(&a_s, &b_s, &mut out_s).unwrap();
+        auto.matmul_transposed(&a_a, &b_a, &mut out_a).unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-2,
+            "matmul_transposed_q4_0",
+        );
+    }
+
+    #[test]
+    fn test_matmul_transposed_q4_1_oracle() {
+        let (m, k, n) = (1, 128, 64);
+        let a_data = gen_data(m * k, 42);
+        let b_data_f32 = gen_data(n * k, 137);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let a_s = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_s = make_q4_1_tensor(&scalar, vec![n, k], &b_data_f32);
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![m, n]);
+
+        let a_a = make_f32_tensor(&auto, vec![m, k], &a_data);
+        let b_a = make_q4_1_tensor(&auto, vec![n, k], &b_data_f32);
+        let mut out_a = make_f32_tensor_zeros(&auto, vec![m, n]);
+
+        scalar.matmul_transposed(&a_s, &b_s, &mut out_s).unwrap();
+        auto.matmul_transposed(&a_a, &b_a, &mut out_a).unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-2,
+            "matmul_transposed_q4_1",
+        );
+    }
+
+    #[test]
+    fn test_matmul_slice_f32_oracle() {
+        let (m, k, n) = (4, 128, 64);
+        let a_data = gen_data(m * k, 31);
+        let b_data = gen_data(n * k, 71);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let a_s = make_f32_tensor(&scalar, vec![m, k], &a_data);
+        let b_s = make_f32_tensor(&scalar, vec![n, k], &b_data);
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![m, n]);
+
+        let a_a = make_f32_tensor(&auto, vec![m, k], &a_data);
+        let b_a = make_f32_tensor(&auto, vec![n, k], &b_data);
+        let mut out_a = make_f32_tensor_zeros(&auto, vec![m, n]);
+
+        scalar.matmul_slice(&a_s, &b_s, m, n, &mut out_s).unwrap();
+        auto.matmul_slice(&a_a, &b_a, m, n, &mut out_a).unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-4,
+            "matmul_slice_f32",
+        );
+    }
+
+    #[test]
+    fn test_rms_norm_oracle() {
+        let (rows, dim) = (4, 64);
+        let x_data = gen_data(rows * dim, 19);
+        let w_data: Vec<f32> = (0..dim).map(|i| 0.5 + (i as f32 * 0.01)).collect();
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut x_s = make_f32_tensor(&scalar, vec![rows, dim], &x_data);
+        let w_s = make_f32_tensor(&scalar, vec![dim], &w_data);
+        let mut x_a = make_f32_tensor(&auto, vec![rows, dim], &x_data);
+        let w_a = make_f32_tensor(&auto, vec![dim], &w_data);
+
+        scalar.rms_norm(&mut x_s, &w_s, 1e-5).unwrap();
+        auto.rms_norm(&mut x_a, &w_a, 1e-5).unwrap();
+
+        assert_close(
+            x_s.as_slice::<f32>(),
+            x_a.as_slice::<f32>(),
+            1e-5,
+            "rms_norm",
+        );
+    }
+
+    #[test]
+    fn test_softmax_oracle() {
+        let (rows, dim) = (4, 32);
+        let x_data = gen_data(rows * dim, 23);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut x_s = make_f32_tensor(&scalar, vec![rows, dim], &x_data);
+        let mut x_a = make_f32_tensor(&auto, vec![rows, dim], &x_data);
+
+        scalar.softmax(&mut x_s).unwrap();
+        auto.softmax(&mut x_a).unwrap();
+
+        let result_s = x_s.as_slice::<f32>();
+        let result_a = x_a.as_slice::<f32>();
+
+        assert_close(result_s, result_a, 1e-5, "softmax");
+
+        // Verify rows sum to 1.0
+        for r in 0..rows {
+            let sum: f32 = result_a[r * dim..(r + 1) * dim].iter().sum();
+            assert!(
+                (sum - 1.0).abs() < 1e-5,
+                "softmax row {} sum = {}, expected 1.0",
+                r,
+                sum
+            );
+        }
+    }
+
+    #[test]
+    fn test_rope_oracle() {
+        let (batch, seq, heads, dim) = (1, 4, 2, 64);
+        let n = batch * seq * heads * dim;
+        let x_data = gen_data(n, 37);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut x_s = make_f32_tensor(&scalar, vec![batch, seq, heads, dim], &x_data);
+        let mut x_a = make_f32_tensor(&auto, vec![batch, seq, heads, dim], &x_data);
+
+        scalar.rope_inplace(&mut x_s, 0, 10000.0).unwrap();
+        auto.rope_inplace(&mut x_a, 0, 10000.0).unwrap();
+
+        assert_close(
+            x_s.as_slice::<f32>(),
+            x_a.as_slice::<f32>(),
+            1e-5,
+            "rope_inplace",
+        );
+    }
+
+    #[test]
+    fn test_silu_mul_oracle() {
+        let n = 128;
+        let a_data = gen_data(n, 11);
+        let b_data = gen_data(n, 29);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut a_s = make_f32_tensor(&scalar, vec![1, n], &a_data);
+        let b_s = make_f32_tensor(&scalar, vec![1, n], &b_data);
+        let mut a_a = make_f32_tensor(&auto, vec![1, n], &a_data);
+        let b_a = make_f32_tensor(&auto, vec![1, n], &b_data);
+
+        scalar.silu_mul(&mut a_s, &b_s).unwrap();
+        auto.silu_mul(&mut a_a, &b_a).unwrap();
+
+        assert_close(
+            a_s.as_slice::<f32>(),
+            a_a.as_slice::<f32>(),
+            1e-5,
+            "silu_mul",
+        );
+    }
+
+    #[test]
+    fn test_add_assign_oracle() {
+        let n = 64;
+        let a_data = gen_data(n, 7);
+        let b_data = gen_data(n, 13);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut a_s = make_f32_tensor(&scalar, vec![1, n], &a_data);
+        let b_s = make_f32_tensor(&scalar, vec![1, n], &b_data);
+        let mut a_a = make_f32_tensor(&auto, vec![1, n], &a_data);
+        let b_a = make_f32_tensor(&auto, vec![1, n], &b_data);
+
+        scalar.add_assign(&mut a_s, &b_s).unwrap();
+        auto.add_assign(&mut a_a, &b_a).unwrap();
+
+        assert_close(
+            a_s.as_slice::<f32>(),
+            a_a.as_slice::<f32>(),
+            1e-7,
+            "add_assign",
+        );
+    }
+
+    #[test]
+    fn test_scale_oracle() {
+        let n = 64;
+        let x_data = gen_data(n, 41);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut x_s = make_f32_tensor(&scalar, vec![1, n], &x_data);
+        let mut x_a = make_f32_tensor(&auto, vec![1, n], &x_data);
+
+        scalar.scale(&mut x_s, 0.5).unwrap();
+        auto.scale(&mut x_a, 0.5).unwrap();
+
+        assert_close(
+            x_s.as_slice::<f32>(),
+            x_a.as_slice::<f32>(),
+            1e-7,
+            "scale",
+        );
+    }
+
+    #[test]
+    fn test_cast_f32_to_f16_oracle() {
+        let n = 64;
+        let src_data = gen_data(n, 59);
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let src_s = make_f32_tensor(&scalar, vec![n], &src_data);
+        let mut dst_s = make_f16_tensor_zeros(&scalar, vec![n]);
+        let src_a = make_f32_tensor(&auto, vec![n], &src_data);
+        let mut dst_a = make_f16_tensor_zeros(&auto, vec![n]);
+
+        scalar.cast(&src_s, &mut dst_s).unwrap();
+        auto.cast(&src_a, &mut dst_a).unwrap();
+
+        // Compare as F16 bytes
+        let s_data = dst_s.as_slice::<half::f16>();
+        let a_data = dst_a.as_slice::<half::f16>();
+        for i in 0..n {
+            assert_eq!(
+                s_data[i].to_bits(),
+                a_data[i].to_bits(),
+                "cast F32→F16 element [{}] differs",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_gather_oracle() {
+        let (vocab, dim) = (8, 32);
+        let embed_data = gen_data(vocab * dim, 67);
+        let indices: Vec<u32> = vec![0, 3, 5, 7];
+        let n_idx = indices.len();
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let memory = Galloc::new();
+
+        // Embedding table
+        let src_s = make_f32_tensor(&scalar, vec![vocab, dim], &embed_data);
+        let src_a = make_f32_tensor(&auto, vec![vocab, dim], &embed_data);
+
+        // Indices tensor (stored as U8 buffer holding u32 data)
+        let idx_buf_s = memory.alloc(n_idx * 4, DType::U8).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr() as *const u8,
+                idx_buf_s.as_mut_ptr(),
+                n_idx * 4,
+            );
+        }
+        let idx_s = Tensor::new(Shape::new(vec![n_idx]), idx_buf_s, scalar.clone());
+
+        let idx_buf_a = memory.alloc(n_idx * 4, DType::U8).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                indices.as_ptr() as *const u8,
+                idx_buf_a.as_mut_ptr(),
+                n_idx * 4,
+            );
+        }
+        let idx_a = Tensor::new(Shape::new(vec![n_idx]), idx_buf_a, auto.clone());
+
+        // Output
+        let mut dst_s = make_f32_tensor_zeros(&scalar, vec![n_idx, dim]);
+        let mut dst_a = make_f32_tensor_zeros(&auto, vec![n_idx, dim]);
+
+        scalar.gather(&src_s, &idx_s, &mut dst_s).unwrap();
+        auto.gather(&src_a, &idx_a, &mut dst_a).unwrap();
+
+        assert_close(
+            dst_s.as_slice::<f32>(),
+            dst_a.as_slice::<f32>(),
+            1e-7,
+            "gather",
+        );
+
+        // Also verify correctness: first output row should equal embed row 0
+        let out_data = dst_a.as_slice::<f32>();
+        for d in 0..dim {
+            assert!(
+                (out_data[d] - embed_data[d]).abs() < 1e-7,
+                "gather correctness: row 0 mismatch at [{}]",
+                d
+            );
+        }
+    }
+
+    #[test]
+    fn test_copy_from_identity() {
+        let n = 64;
+        let data = gen_data(n, 73);
+
+        let auto = auto_backend();
+        let src = make_f32_tensor(&auto, vec![1, n], &data);
+
+        let copied = auto.copy_from(&src).unwrap();
+
+        assert_close(
+            src.as_slice::<f32>(),
+            copied.as_slice::<f32>(),
+            0.0, // exact match
+            "copy_from identity",
+        );
+        // Ensure different buffers (deep copy)
+        assert_ne!(
+            src.as_ptr(),
+            copied.as_ptr(),
+            "copy_from must allocate new buffer"
+        );
+    }
+}
