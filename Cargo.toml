@@ -36,9 +36,17 @@ env_logger = "0.11"
 # OpenCl
 ocl = { version = "0.19", optional = true }
 
+# D-Bus IPC (resilience)
+zbus = { version = "5", optional = true, default-features = false, features = ["blocking-api", "async-io"] }
+
 [features]
 default = ["opencl"]
 opencl = ["ocl"]
+resilience = ["zbus"]
+
+[[bin]]
+name = "mock_manager"
+required-features = ["resilience"]
 
 [profile.release]
 lto = "fat"

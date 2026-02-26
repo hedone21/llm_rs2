@@ -4,3 +4,6 @@ pub mod memory;
 pub mod buffer;
 pub mod models;
 pub mod layers;
+
+#[cfg(feature = "resilience")]
+pub mod resilience;
