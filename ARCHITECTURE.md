@@ -299,8 +299,9 @@ Next token: K gets RoPE(8), stored at slot 5
 | `ocl` | 0.19 | OpenCL 바인딩 (feature-gated) |
 | `rand` | 0.9 | 토큰 샘플링 |
 | `log` / `env_logger` | 0.4/0.11 | 로깅 |
+| `zbus` | 5 | D-Bus IPC (feature-gated: `resilience`) |
 
-- **Features**: `opencl` (기본 활성), `ocl` crate에 의존
+- **Features**: `opencl` (기본 활성), `resilience` (optional, `zbus` 의존)
 - **LLM Model Format**: HuggingFace Safetensors (`model.safetensors` + `config.json` + `tokenizer.json`)
 - **Release Profile**: `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`
 
@@ -360,6 +361,19 @@ llm_rs2/
 │   │       ├── buffer.rs     # OpenCL용 SharedBuffer 확장
 │   │       └── memory.rs     # OpenCL용 Galloc (CL_MEM_ALLOC_HOST_PTR)
 │   │
+│   ├── resilience/                  # Resilience Manager (feature-gated)
+│   │   ├── mod.rs                   # 모듈 선언 + re-exports
+│   │   ├── manager.rs               # ResilienceManager (poll, execute_action)
+│   │   ├── signal.rs                # SystemSignal, Level, enum types
+│   │   ├── state.rs                 # OperatingMode (Normal/Degraded/Minimal/Suspended)
+│   │   ├── dbus_listener.rs         # DbusListener (zbus blocking, separate thread)
+│   │   └── strategy/                # Signal reaction strategies
+│   │       ├── mod.rs               # ResilienceAction, resolve_conflicts()
+│   │       ├── memory.rs            # MemoryStrategy
+│   │       ├── thermal.rs           # ThermalStrategy
+│   │       ├── energy.rs            # EnergyStrategy
+│   │       └── compute.rs           # ComputeStrategy
+│   │
 │   ├── memory/galloc.rs      # Galloc (CPU 전용 메모리 할당)
 │   └── buffer/shared_buffer.rs  # SharedBuffer 구현
 │
@@ -392,7 +406,12 @@ llm_rs2/
 │   ├── 10_model_inference.md
 │   ├── 11_kv_cache_management.md
 │   ├── 12_hybrid_inference.md
-│   └── 13_testing_and_benchmarks.md
+│   ├── 13_testing_and_benchmarks.md
+│   ├── 20_dbus_ipc_spec.md          # D-Bus IPC 명세
+│   ├── 21_resilience_architecture.md # Resilience 아키텍처 + 전략 패턴
+│   ├── 22_resilience_integration.md  # Phase 3 generate.rs 통합 설계
+│   ├── 23_resilience_test_strategy.md # Resilience 테스트 전략
+│   └── 24_resilience_usage_guide.md  # Resilience 사용 가이드
 │
 ├── web_dashboard/            # 벤치마크 시각화 웹 대시보드
 ├── benchmarks/               # 벤치마크 데이터 및 분석 스크립트
@@ -404,7 +423,7 @@ llm_rs2/
 
 | Binary | 용도 | 주요 옵션 |
 |:-------|:----|:---------|
-| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--eviction-policy`, `--eviction-window` |
+| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--eviction-policy`, `--eviction-window`, `--enable-resilience` |
 | `generate_hybrid` | CPU↔GPU 동적 전환 추론 | `--switch-threshold`, `--warmup-tokens` |
 | `micro_bench` | 개별 연산자 벤치마크 | 연산별 크기 지정 |
 | `test_backend` | 백엔드 정합성 검증 | CPU vs OpenCL 결과 비교 |
@@ -537,7 +556,78 @@ pub struct MemoryStats {
 
 ---
 
-## 6. LlamaLayer Forward Paths
+## 6. Resilience Subsystem
+
+### 개요
+
+D-Bus 시스템 신호(메모리/CPU/온도/에너지)에 따라 추론 동작을 자동 조절하는 적응형 추론 시스템. Feature-gated (`--features resilience`), opt-in (`--enable-resilience`).
+
+### Component Diagram
+
+```mermaid
+graph TB
+    subgraph SystemBus ["D-Bus System Bus"]
+        Manager["org.llm.Manager1"]
+    end
+
+    subgraph ResilienceModule ["Resilience Module (src/resilience/)"]
+        DbusListener["DbusListener<br/>(std::thread)"]
+        RM["ResilienceManager"]
+        MS["MemoryStrategy"]
+        TS["ThermalStrategy"]
+        ES["EnergyStrategy"]
+        CS["ComputeStrategy"]
+        RC["resolve_conflicts()"]
+    end
+
+    subgraph InferenceLoop ["generate.rs"]
+        Poll["rm.poll()"]
+        Exec["execute_action()"]
+        Evict["kv_cache.prune_prefix()"]
+    end
+
+    Manager -->|"signals"| DbusListener
+    DbusListener -->|"mpsc::channel"| RM
+    RM --> MS
+    RM --> TS
+    RM --> ES
+    RM --> CS
+    MS --> RC
+    TS --> RC
+    ES --> RC
+    CS --> RC
+    RC --> Poll
+    Poll --> Exec
+    Poll --> Evict
+```
+
+### Operating Modes
+
+| Mode | Trigger | 동작 |
+|:-----|:--------|:-----|
+| **Normal** | 모든 신호 Normal | 제한 없음 |
+| **Degraded** | Warning ≥ 1 | 백엔드 전환 권고 |
+| **Minimal** | Critical ≥ 1 | Evict + Throttle + LimitTokens |
+| **Suspended** | Emergency ≥ 1 | 추론 중단 (`break`) |
+
+### 데이터 흐름
+
+```
+D-Bus Signal → DbusListener (blocking recv, 별도 스레드)
+  → mpsc::channel (unbounded)
+  → ResilienceManager.poll() (토큰 루프 내, try_recv, 비블로킹)
+  → Strategy.react() → Vec<ResilienceAction>
+  → resolve_conflicts() → 최종 액션 리스트
+  → execute_action() / prune_prefix()
+```
+
+**설계 원칙**: Fail-open (Manager/D-Bus 불가 시 추론 정상 지속), No tokio (std::thread + mpsc만 사용).
+
+상세 설계: [`docs/22_resilience_integration.md`](docs/22_resilience_integration.md) | 사용 가이드: [`docs/24_resilience_usage_guide.md`](docs/24_resilience_usage_guide.md)
+
+---
+
+## 7. LlamaLayer Forward Paths
 
 `LlamaLayer`에는 **두 가지 forward 경로**가 있습니다:
 
@@ -568,7 +658,7 @@ CPU Fallback은 ARM64에서 NEON 4-way unrolled dot product로 최적화되며, 
 
 ---
 
-## 7. Development Workflows
+## 8. Development Workflows
 
 자세한 빌드/테스트/배포 절차는 `.agent/skills/`와 `.agent/workflows/`를 참조하세요.
 
@@ -578,7 +668,7 @@ CPU Fallback은 ARM64에서 NEON 4-way unrolled dot product로 최적화되며, 
 | `/pre_push` | 포맷/린트/테스트 체크 | `.agent/workflows/pre_push.md` |
 | `/dashboard` | 벤치마크 대시보드 실행 | `.agent/workflows/dashboard.md` |
 
-### 7.1. 로컬 PC 테스트 (CPU only)
+### 8.1. 로컬 PC 테스트 (CPU only)
 ```bash
 cargo build --release --bin generate
 ./target/release/generate \
@@ -587,7 +677,7 @@ cargo build --release --bin generate
   --backend cpu --kv-type f32
 ```
 
-### 7.2. Eviction 테스트
+### 8.2. Eviction 테스트
 ```bash
 ./target/release/generate \
   --model-path /path/to/model \
@@ -597,7 +687,19 @@ cargo build --release --bin generate
   --memory-threshold-mb 1  # 강제 트리거용
 ```
 
-### 7.3. Android 디바이스 테스트
+### 8.3. Resilience 테스트
+```bash
+# Resilience 통합 테스트
+cargo test --features resilience --test test_resilience_integration
+
+# Resilience 활성화 추론
+./target/release/generate \
+  --model-path /path/to/model \
+  --prompt "Hello" -n 200 \
+  --enable-resilience
+```
+
+### 8.4. Android 디바이스 테스트
 ```bash
 source android.source
 cargo build --target aarch64-linux-android --release --bin generate --features opencl
@@ -607,7 +709,7 @@ adb shell /data/local/tmp/generate --model-path /data/local/tmp/model --backend 
 
 ---
 
-## 8. Design Decisions & Known Limitations
+## 9. Design Decisions & Known Limitations
 
 ### Design Decisions
 1. **Backend trait에 기본 구현 제공**: `attention_gen`, `gather`, `copy_slice` 등은 trait에 CPU 기반 기본 구현이 있어 새 백엔드 추가 시 최소한의 메서드만 구현하면 동작합니다.

@@ -6,7 +6,7 @@
 ---
 
 ## [P1] Resilience Phase 1 통합 가이드 작성
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 아키텍트의 Resilience 통합 설계 완료
 - **Description**: Resilience 시스템의 Phase 1 통합 내용을 문서화. D-Bus 리스너 설정, 시스템 모니터 구성, generate.rs 통합 방법, 설정 옵션, 트러블슈팅 가이드 포함
@@ -14,7 +14,7 @@
 - **Notes**: `docs/` 시리즈에 추가 (번호 할당은 PM 승인 필요)
 
 ## [P1] ARCHITECTURE.md에 resilience 흐름 추가
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 아키텍트의 Resilience 통합 설계 완료
 - **Description**: ARCHITECTURE.md에 resilience 모듈의 위치, 데이터 흐름, 다른 모듈과의 상호작용을 추가. 기존 아키텍처 다이어그램 업데이트
