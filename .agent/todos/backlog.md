@@ -13,7 +13,7 @@
 - **Notes**: Rust 개발자에게 배정 예정
 
 ## [P2] 미커밋 파일 정리
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: eviction_memory_test 관련 미커밋 파일 3개 처리 (results/data/eviction_memory_test.json, scripts/plot_eviction_memory.py, tests/test_eviction_memory.rs). 커밋 또는 .gitignore 추가 결정 필요
