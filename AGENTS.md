@@ -99,3 +99,18 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/11_kv_cache_management.md` — KV cache eviction system design
 - `docs/12_hybrid_inference.md` — CPU→GPU dynamic switching strategy
 - `docs/13_testing_and_benchmarks.md` — Oracle testing, micro_bench, profiling
+- `docs/20_dbus_ipc_spec.md` — D-Bus IPC specification for Resilience Manager
+- `docs/21_resilience_architecture.md` — Resilience system architecture and strategy patterns
+- `docs/22_resilience_integration.md` — Phase 3 generate.rs integration design spec
+
+## Web Dashboard
+
+```bash
+cd web_dashboard && .venv/bin/python app.py   # http://localhost:5000
+```
+
+Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoints under `/api/`. Dashboard uses Flask + Plotly.js, venv at `web_dashboard/.venv/`.
+
+## TODO System
+
+Team task tracking in `.agent/todos/` — see `.agent/todos/README.md` for format, roles, and workflow rules. View in dashboard via Todos tab or `curl http://localhost:5000/api/todos`.
