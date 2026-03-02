@@ -241,7 +241,10 @@ fn main() -> anyhow::Result<()> {
         "f32" => DType::F32,
         "f16" => DType::F16,
         "q4" => DType::Q4_0,
-        _ => anyhow::bail!("Unsupported KV type: {}. Use f32, f16, or q4.", args.kv_type),
+        _ => anyhow::bail!(
+            "Unsupported KV type: {}. Use f32, f16, or q4.",
+            args.kv_type
+        ),
     };
     // Calculate buffer size per KV cache
     let n_values = max_seq_len * kv_heads * head_dim;
@@ -249,10 +252,13 @@ fn main() -> anyhow::Result<()> {
         DType::Q4_0 => {
             use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
             (n_values / QK4_0) * std::mem::size_of::<BlockQ4_0>()
-        },
+        }
         _ => n_values * kv_type.size(),
     };
-    println!("KV cache type: {:?} ({}B total per layer)", kv_type, kv_buf_size);
+    println!(
+        "KV cache type: {:?} ({}B total per layer)",
+        kv_type, kv_buf_size
+    );
 
     let mut kv_caches = Vec::new();
     for _ in 0..num_layers {
@@ -292,22 +298,23 @@ fn main() -> anyhow::Result<()> {
     let actual_protected_prefix = args.protected_prefix.unwrap_or(input_ids.len());
 
     let cache_manager = {
-        let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args.eviction_policy.as_str() {
-            "none" => Box::new(NoEvictionPolicy::new()),
-            "sliding" => Box::new(SlidingWindowPolicy::new(
-                args.eviction_window,
-                actual_protected_prefix,
-            )),
-            "snapkv" => Box::new(SnapKVPolicy::new(
-                args.eviction_window,
-                0.5,
-                actual_protected_prefix,
-            )),
-            other => anyhow::bail!(
-                "Unknown eviction policy: '{}'. Use: none, sliding, snapkv",
-                other
-            ),
-        };
+        let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> =
+            match args.eviction_policy.as_str() {
+                "none" => Box::new(NoEvictionPolicy::new()),
+                "sliding" => Box::new(SlidingWindowPolicy::new(
+                    args.eviction_window,
+                    actual_protected_prefix,
+                )),
+                "snapkv" => Box::new(SnapKVPolicy::new(
+                    args.eviction_window,
+                    0.5,
+                    actual_protected_prefix,
+                )),
+                other => anyhow::bail!(
+                    "Unknown eviction policy: '{}'. Use: none, sliding, snapkv",
+                    other
+                ),
+            };
         let monitor = Box::new(LinuxSystemMonitor);
         let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
@@ -316,7 +323,11 @@ fn main() -> anyhow::Result<()> {
     if args.eviction_policy != "none" {
         println!(
             "Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
-            args.eviction_policy, args.eviction_window, actual_protected_prefix, args.eviction_target_ratio, args.memory_threshold_mb
+            args.eviction_policy,
+            args.eviction_window,
+            actual_protected_prefix,
+            args.eviction_target_ratio,
+            args.memory_threshold_mb
         );
     }
 
@@ -374,18 +385,21 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         );
 
-        model.forward_into(LlamaModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend: &backend,
-            memory: memory.as_ref(),
-            logits_out: &mut prefill_logits,
-            x_gen: None,
-            workspace: None,
-            use_gpu_attn: args.gpu_attn,
-            cache_manager: cm_ref,
-        })?.ok_or(()).ok(); // Eviction during prefill is unlikely, ignore result
+        model
+            .forward_into(LlamaModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend: &backend,
+                memory: memory.as_ref(),
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                use_gpu_attn: args.gpu_attn,
+                cache_manager: cm_ref,
+            })?
+            .ok_or(())
+            .ok(); // Eviction during prefill is unlikely, ignore result
 
         // Sample last token
         // Read logits to CPU

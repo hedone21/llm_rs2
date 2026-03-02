@@ -16,12 +16,7 @@ pub enum OperatingMode {
 impl OperatingMode {
     /// Determine operating mode from the 4 signal levels.
     /// The most severe signal determines the mode.
-    pub fn from_levels(
-        memory: Level,
-        compute: Level,
-        thermal: Level,
-        energy: Level,
-    ) -> Self {
+    pub fn from_levels(memory: Level, compute: Level, thermal: Level, energy: Level) -> Self {
         let worst = memory.max(compute).max(thermal).max(energy);
         match worst {
             Level::Normal => OperatingMode::Normal,
@@ -38,23 +33,15 @@ mod tests {
 
     #[test]
     fn test_all_normal_yields_normal_mode() {
-        let mode = OperatingMode::from_levels(
-            Level::Normal,
-            Level::Normal,
-            Level::Normal,
-            Level::Normal,
-        );
+        let mode =
+            OperatingMode::from_levels(Level::Normal, Level::Normal, Level::Normal, Level::Normal);
         assert_eq!(mode, OperatingMode::Normal);
     }
 
     #[test]
     fn test_single_warning_yields_degraded() {
-        let mode = OperatingMode::from_levels(
-            Level::Normal,
-            Level::Warning,
-            Level::Normal,
-            Level::Normal,
-        );
+        let mode =
+            OperatingMode::from_levels(Level::Normal, Level::Warning, Level::Normal, Level::Normal);
         assert_eq!(mode, OperatingMode::Degraded);
     }
 

@@ -1,7 +1,7 @@
-use anyhow::{Result, anyhow};
 use crate::core::backend::Backend;
-use crate::core::tensor::Tensor;
 use crate::core::buffer::DType;
+use crate::core::tensor::Tensor;
+use anyhow::{Result, anyhow};
 
 pub mod common;
 pub use common::CpuBackendCommon;
@@ -24,4 +24,3 @@ pub type CpuBackend = CpuBackendNeon;
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 pub type CpuBackend = CpuBackendCommon;
-

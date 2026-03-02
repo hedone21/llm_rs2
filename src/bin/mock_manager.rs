@@ -244,10 +244,7 @@ fn emit_single(
     args: &Args,
     signal_name: &str,
 ) -> anyhow::Result<()> {
-    let level = args
-        .level
-        .as_deref()
-        .unwrap_or("normal");
+    let level = args.level.as_deref().unwrap_or("normal");
 
     match signal_name {
         "MemoryPressure" => {

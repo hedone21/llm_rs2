@@ -1,11 +1,11 @@
 use crate::core::buffer::{Buffer, DType};
-use ocl::{Buffer as OclBuffer, Queue, flags};
+use anyhow::{Result, anyhow};
 use ocl::core::Mem;
 use ocl::flags::MapFlags;
-use anyhow::{Result, anyhow};
-use std::sync::Arc;
+use ocl::{Buffer as OclBuffer, Queue, flags};
 use std::any::Any;
 use std::ptr;
+use std::sync::Arc;
 
 // unsafe impl Send for OpenCLBuffer {} // OclBuffer is Send/Sync usually?
 // Check ocl docs. OclBuffer is Send/Sync.
@@ -46,7 +46,7 @@ impl Buffer for OpenCLBuffer {
         // Warning: Direct access not supported without mapping
         // Logic should use copy_from or map explicitly.
         // For now, returning null to satisfy trait.
-        ptr::null() 
+        ptr::null()
     }
 
     fn as_mut_ptr(&self) -> *mut u8 {
@@ -55,14 +55,14 @@ impl Buffer for OpenCLBuffer {
 
     #[cfg(feature = "opencl")]
     fn cl_mem(&self) -> Option<&Mem> {
-         // Some(&self.buffer.as_core()) // Still might be an issue? 
-         // Let's use as_core() if it exists, or just fix this later.
-         // Trying compilation without it first by returning None or strictly generic.
-         // Actually, if I can't find as_core, I'll drop the feature cfg in this file or stub it.
-         // But Buffer trait requires it.
-         // Let's try self.buffer.as_core() again, usually it works if imports are clean.
-         // If it fails, I will just return None for now (unsafe but compiles).
-         None
+        // Some(&self.buffer.as_core()) // Still might be an issue?
+        // Let's use as_core() if it exists, or just fix this later.
+        // Trying compilation without it first by returning None or strictly generic.
+        // Actually, if I can't find as_core, I'll drop the feature cfg in this file or stub it.
+        // But Buffer trait requires it.
+        // Let's try self.buffer.as_core() again, usually it works if imports are clean.
+        // If it fails, I will just return None for now (unsafe but compiles).
+        None
     }
 
     #[cfg(not(feature = "opencl"))]

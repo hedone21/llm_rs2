@@ -1,8 +1,8 @@
+use crate::core::buffer::{Buffer, DType};
+use anyhow::Result;
 #[cfg(feature = "opencl")]
 use ocl::core::Mem;
-use crate::core::buffer::{Buffer, DType};
 use std::any::Any;
-use anyhow::Result;
 
 #[derive(Debug)]
 pub struct SharedBuffer {
@@ -24,7 +24,7 @@ impl Buffer for SharedBuffer {
     fn as_any(&self) -> &dyn Any {
         self
     }
-    
+
     fn dtype(&self) -> DType {
         self.dtype
     }
@@ -46,7 +46,7 @@ impl Buffer for SharedBuffer {
 
     #[cfg(feature = "opencl")]
     fn cl_mem(&self) -> Option<&Mem> {
-        None 
+        None
     }
 
     #[cfg(not(feature = "opencl"))]
@@ -68,7 +68,7 @@ mod tests {
         let buffer = SharedBuffer::new(1024, DType::F32);
         assert_eq!(buffer.size(), 1024);
         assert_eq!(buffer.dtype(), DType::F32);
-        
+
         let ptr = buffer.as_ptr();
         assert!(!ptr.is_null());
 
@@ -83,13 +83,13 @@ mod tests {
         assert_eq!(buffer.dtype(), DType::F16);
         // Zero-sized allocation usually does not return a null pointer in Rust Vec
         let ptr = buffer.as_ptr();
-        assert!(!ptr.is_null()); 
+        assert!(!ptr.is_null());
     }
 
     #[test]
     fn test_shared_buffer_mutability_semantics() {
         let buffer = SharedBuffer::new(4, DType::U8);
-        
+
         unsafe {
             let mut_ptr = buffer.as_mut_ptr();
             *mut_ptr.add(0) = 42;

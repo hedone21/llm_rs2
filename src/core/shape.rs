@@ -52,7 +52,7 @@ mod tests {
         assert_eq!(empty_shape.ndim(), 0);
         let empty_slice: &[usize] = &[];
         assert_eq!(empty_shape.dims(), empty_slice);
-        assert_eq!(empty_shape.numel(), 0); 
+        assert_eq!(empty_shape.numel(), 0);
     }
 
     #[test]

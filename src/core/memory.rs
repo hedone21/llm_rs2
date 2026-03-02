@@ -1,6 +1,6 @@
+use crate::core::buffer::{Buffer, DType};
 use anyhow::Result;
 use std::sync::Arc;
-use crate::core::buffer::{Buffer, DType};
 
 pub trait Memory: Send + Sync {
     /// Allocate a buffer of specific size and type

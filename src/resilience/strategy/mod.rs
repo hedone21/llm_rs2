@@ -1,15 +1,15 @@
 use super::signal::{RecommendedBackend, SystemSignal};
 use super::state::OperatingMode;
 
-pub mod memory;
 pub mod compute;
-pub mod thermal;
 pub mod energy;
+pub mod memory;
+pub mod thermal;
 
-pub use memory::MemoryStrategy;
 pub use compute::ComputeStrategy;
-pub use thermal::ThermalStrategy;
 pub use energy::EnergyStrategy;
+pub use memory::MemoryStrategy;
+pub use thermal::ThermalStrategy;
 
 /// Action to be executed by the inference loop in response to a signal.
 #[derive(Debug, Clone)]
@@ -35,11 +35,7 @@ pub enum ResilienceAction {
 pub trait ResilienceStrategy: Send + Sync {
     /// Receive signal and return list of actions to execute.
     /// Returns empty Vec if no action needed.
-    fn react(
-        &mut self,
-        signal: &SystemSignal,
-        mode: OperatingMode,
-    ) -> Vec<ResilienceAction>;
+    fn react(&mut self, signal: &SystemSignal, mode: OperatingMode) -> Vec<ResilienceAction>;
 
     /// Strategy name (for logging).
     fn name(&self) -> &str;
@@ -122,7 +118,9 @@ pub fn resolve_conflicts(actions: Vec<ResilienceAction>) -> Vec<ResilienceAction
         });
     }
     if max_delay > 0 {
-        resolved.push(ResilienceAction::Throttle { delay_ms: max_delay });
+        resolved.push(ResilienceAction::Throttle {
+            delay_ms: max_delay,
+        });
     }
     if has_reject {
         resolved.push(ResilienceAction::RejectNew);

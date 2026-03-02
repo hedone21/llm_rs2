@@ -227,18 +227,21 @@ fn main() -> anyhow::Result<()> {
             cpu_backend.clone(),
         );
 
-        model.forward_into(LlamaModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend: &current_backend,
-            memory: cpu_memory.as_ref(),
-            logits_out: &mut prefill_logits,
-            x_gen: None,
-            workspace: None,
-            use_gpu_attn: false,
-            cache_manager: None,
-        })?.ok_or(()).ok(); // No eviction configured
+        model
+            .forward_into(LlamaModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend: &current_backend,
+                memory: cpu_memory.as_ref(),
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                use_gpu_attn: false,
+                cache_manager: None,
+            })?
+            .ok_or(())
+            .ok(); // No eviction configured
 
         // Sample last token
         let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
@@ -391,22 +394,25 @@ fn main() -> anyhow::Result<()> {
             Tensor::new(Shape::new(vec![1, 1]), cpu_indices_buf, cpu_backend.clone())
         };
 
-        model.forward_into(LlamaModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend: &current_backend,
-            memory: if is_gpu {
-                gpu_memory.as_ref()
-            } else {
-                cpu_memory.as_ref()
-            },
-            logits_out: &mut logits,
-            x_gen: x_gen.as_mut(),
-            workspace: gen_ws.as_mut(),
-            use_gpu_attn: is_gpu,
-            cache_manager: None,
-        })?.ok_or(()).ok(); // No eviction configured
+        model
+            .forward_into(LlamaModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend: &current_backend,
+                memory: if is_gpu {
+                    gpu_memory.as_ref()
+                } else {
+                    cpu_memory.as_ref()
+                },
+                logits_out: &mut logits,
+                x_gen: x_gen.as_mut(),
+                workspace: gen_ws.as_mut(),
+                use_gpu_attn: is_gpu,
+                cache_manager: None,
+            })?
+            .ok_or(())
+            .ok(); // No eviction configured
 
         // Sample
         let mut logits_cpu = vec![0.0f32; vocab_size];

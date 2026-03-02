@@ -1,8 +1,8 @@
+use crate::buffer::shared_buffer::SharedBuffer;
+use crate::core::buffer::{Buffer, DType};
+use crate::core::memory::Memory;
 use anyhow::Result;
 use std::sync::Arc;
-use crate::core::memory::Memory;
-use crate::core::buffer::{Buffer, DType};
-use crate::buffer::shared_buffer::SharedBuffer;
 
 pub struct Galloc;
 
@@ -30,14 +30,14 @@ mod tests {
     #[test]
     fn test_galloc_allocation() {
         let allocator = Galloc::new();
-        
+
         let buffer_result = allocator.alloc(1024, DType::F32);
         assert!(buffer_result.is_ok());
-        
+
         let buffer = buffer_result.unwrap();
         assert_eq!(buffer.size(), 1024);
         assert_eq!(buffer.dtype(), DType::F32);
-        
+
         let ptr = buffer.as_ptr();
         assert!(!ptr.is_null());
     }

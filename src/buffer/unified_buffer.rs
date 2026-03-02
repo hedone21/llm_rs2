@@ -1,30 +1,30 @@
 use crate::core::buffer::{Buffer, DType};
-use ocl::{Buffer as OclBuffer, Queue, flags};
-use ocl::core::Mem;
 use anyhow::{Result, anyhow};
+use ocl::core::Mem;
+use ocl::{Buffer as OclBuffer, Queue, flags};
 use std::any::Any;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::ptr;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// UnifiedBuffer: CPU-GPU Zero-Copy Shared Memory
-/// 
+///
 /// Uses CL_MEM_ALLOC_HOST_PTR to allocate memory that can be accessed
 /// by both CPU and GPU without explicit data copies.
-/// 
+///
 /// # Usage Pattern
 /// ```ignore
 /// // 1. Create buffer (starts mapped for CPU initialization)
 /// let buffer = UnifiedBuffer::new(...)?;
-/// 
+///
 /// // 2. Write data via as_mut_ptr() while mapped
 /// let ptr = buffer.as_mut_ptr();
 /// // ... CPU operations ...
-/// 
+///
 /// // 3. Unmap for GPU access
 /// buffer.unmap_for_gpu()?;
 /// // ... GPU kernel execution ...
-/// 
+///
 /// // 4. Map again for CPU reads
 /// buffer.map_for_cpu()?;
 /// ```
@@ -71,13 +71,17 @@ impl UnifiedBuffer {
     pub fn map(&self) -> Result<*mut u8> {
         // Check if already mapped
         if self.is_mapped.load(Ordering::Acquire) {
-            let guard = self.mapped_ptr.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+            let guard = self
+                .mapped_ptr
+                .lock()
+                .map_err(|_| anyhow!("Mutex poisoned"))?;
             return Ok(*guard);
         }
 
         // Map the buffer using high-level API
         let mapped = unsafe {
-            self.cl_buffer.map()
+            self.cl_buffer
+                .map()
                 .read()
                 .write()
                 .len(self.size)
@@ -89,7 +93,10 @@ impl UnifiedBuffer {
         // Forget the MemMap to keep the mapping alive
         std::mem::forget(mapped);
 
-        let mut guard = self.mapped_ptr.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let mut guard = self
+            .mapped_ptr
+            .lock()
+            .map_err(|_| anyhow!("Mutex poisoned"))?;
         *guard = raw_ptr;
         self.is_mapped.store(true, Ordering::Release);
 
@@ -103,9 +110,12 @@ impl UnifiedBuffer {
             return Ok(()); // Already unmapped
         }
 
-        let mut guard = self.mapped_ptr.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        let mut guard = self
+            .mapped_ptr
+            .lock()
+            .map_err(|_| anyhow!("Mutex poisoned"))?;
         let ptr = *guard;
-        
+
         if ptr.is_null() {
             return Ok(());
         }
@@ -198,7 +208,7 @@ impl Drop for UnifiedBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocl::{Platform, Device, Context, Queue};
+    use ocl::{Context, Device, Platform, Queue};
 
     use std::panic;
 
@@ -210,15 +220,17 @@ mod tests {
             let res = Platform::list();
             res
         });
-        
+
         let platform_list = match platform_result {
             Ok(list) => list,
             Err(_) => return Err(anyhow!("No OpenCL platform available or panic occurred")),
         };
 
-        let platform = platform_list.into_iter().next()
+        let platform = platform_list
+            .into_iter()
+            .next()
             .ok_or_else(|| anyhow!("No OpenCL platform available"))?;
-            
+
         let device = Device::first(platform)?;
         let context = Context::builder()
             .platform(platform)
@@ -249,10 +261,10 @@ mod tests {
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
         let ptr = buffer.as_mut_ptr();
-        
+
         assert!(!ptr.is_null());
         assert!(buffer.is_mapped());
-        
+
         buffer.unmap().unwrap();
         assert!(!buffer.is_mapped());
     }
@@ -265,14 +277,14 @@ mod tests {
         };
 
         let buffer = UnifiedBuffer::new(queue, 1024, DType::F32).unwrap();
-        
+
         // Initially mapped
         assert!(buffer.is_mapped());
-        
+
         // Unmap
         buffer.unmap().unwrap();
         assert!(!buffer.is_mapped());
-        
+
         // Remap
         buffer.map().unwrap();
         assert!(buffer.is_mapped());
@@ -286,7 +298,7 @@ mod tests {
         };
 
         let buffer = UnifiedBuffer::new(queue, 256, DType::F32).unwrap();
-        
+
         // Write while mapped
         let ptr = buffer.as_mut_ptr();
         unsafe {
@@ -295,10 +307,10 @@ mod tests {
                 *f32_ptr.add(i) = i as f32;
             }
         }
-        
+
         // Unmap (simulating GPU access)
         buffer.unmap().unwrap();
-        
+
         // Map again and verify
         let ptr = buffer.map().unwrap();
         unsafe {

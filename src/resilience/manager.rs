@@ -3,8 +3,8 @@ use std::sync::mpsc;
 use super::signal::{Level, SystemSignal};
 use super::state::OperatingMode;
 use super::strategy::{
-    resolve_conflicts, ComputeStrategy, EnergyStrategy, MemoryStrategy, ResilienceAction,
-    ResilienceStrategy, ThermalStrategy,
+    ComputeStrategy, EnergyStrategy, MemoryStrategy, ResilienceAction, ResilienceStrategy,
+    ThermalStrategy, resolve_conflicts,
 };
 
 /// Cache of latest levels for each signal type.
@@ -116,15 +116,11 @@ impl ResilienceManager {
 
         // 3. Delegate to corresponding strategy
         let strategy_actions = match signal {
-            SystemSignal::MemoryPressure { .. } => {
-                self.strategies.memory.react(signal, self.mode)
-            }
+            SystemSignal::MemoryPressure { .. } => self.strategies.memory.react(signal, self.mode),
             SystemSignal::ComputeGuidance { .. } => {
                 self.strategies.compute.react(signal, self.mode)
             }
-            SystemSignal::ThermalAlert { .. } => {
-                self.strategies.thermal.react(signal, self.mode)
-            }
+            SystemSignal::ThermalAlert { .. } => self.strategies.thermal.react(signal, self.mode),
             SystemSignal::EnergyConstraint { .. } => {
                 self.strategies.energy.react(signal, self.mode)
             }
@@ -147,7 +143,10 @@ pub fn execute_action(action: &ResilienceAction, ctx: &mut InferenceContext) {
     match action {
         ResilienceAction::Evict { target_ratio } => {
             // Phase 3a: integrate with CacheManager
-            log::info!("[Resilience] Evict requested: target_ratio={}", target_ratio);
+            log::info!(
+                "[Resilience] Evict requested: target_ratio={}",
+                target_ratio
+            );
         }
         ResilienceAction::SwitchBackend { to } => {
             // Phase 3b: integrate with generate_hybrid backend switching
@@ -207,7 +206,11 @@ mod tests {
         let actions = mgr.poll();
         assert!(!actions.is_empty());
         assert_eq!(mgr.mode(), OperatingMode::Minimal);
-        assert!(actions.iter().any(|a| matches!(a, ResilienceAction::Evict { .. })));
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, ResilienceAction::Evict { .. }))
+        );
     }
 
     #[test]

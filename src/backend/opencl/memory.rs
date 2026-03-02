@@ -1,12 +1,11 @@
-use crate::core::memory::Memory;
-use crate::core::buffer::{Buffer, DType};
-use crate::buffer::unified_buffer::UnifiedBuffer;
 use super::buffer::OpenCLBuffer;
-use ocl::{Context, Queue};
-use ocl::flags::MemFlags;
+use crate::buffer::unified_buffer::UnifiedBuffer;
+use crate::core::buffer::{Buffer, DType};
+use crate::core::memory::Memory;
 use anyhow::Result;
+use ocl::flags::MemFlags;
+use ocl::{Context, Queue};
 use std::sync::{Arc, Mutex};
-
 
 pub struct OpenCLMemory {
     context: Context,
@@ -40,9 +39,14 @@ impl Memory for OpenCLMemory {
                 .flags(MemFlags::new().read_write())
                 .len(size)
                 .build()?;
-            Arc::new(OpenCLBuffer::new(self.queue.clone(), ocl_buffer, size, dtype)?)
+            Arc::new(OpenCLBuffer::new(
+                self.queue.clone(),
+                ocl_buffer,
+                size,
+                dtype,
+            )?)
         };
-        
+
         {
             let mut mem = self.used_memory.lock().unwrap();
             *mem += size;

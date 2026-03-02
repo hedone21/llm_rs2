@@ -1,8 +1,6 @@
 use std::sync::mpsc;
 
-use super::signal::{
-    ComputeReason, EnergyReason, Level, RecommendedBackend, SystemSignal,
-};
+use super::signal::{ComputeReason, EnergyReason, Level, RecommendedBackend, SystemSignal};
 
 /// D-Bus well-known name for the LLM resource manager.
 const MANAGER_DEST: &str = "org.llm.Manager1";
@@ -41,8 +39,7 @@ impl DbusListener {
         let conn = zbus::blocking::Connection::system()?;
 
         // 2. Create proxy for org.llm.Manager1
-        let proxy =
-            zbus::blocking::Proxy::new(&conn, MANAGER_DEST, MANAGER_PATH, MANAGER_IFACE)?;
+        let proxy = zbus::blocking::Proxy::new(&conn, MANAGER_DEST, MANAGER_PATH, MANAGER_IFACE)?;
 
         log::info!("D-Bus listener connected to {}", MANAGER_DEST);
 
@@ -133,12 +130,8 @@ fn parse_compute_guidance(msg: &zbus::Message) -> anyhow::Result<SystemSignal> {
 /// Parse ThermalAlert signal: (level: s, temperature_mc: i, throttling_active: b, throttle_ratio: d)
 fn parse_thermal_alert(msg: &zbus::Message) -> anyhow::Result<SystemSignal> {
     let body = msg.body();
-    let (level_str, temperature_mc, throttling_active, throttle_ratio): (
-        String,
-        i32,
-        bool,
-        f64,
-    ) = body.deserialize()?;
+    let (level_str, temperature_mc, throttling_active, throttle_ratio): (String, i32, bool, f64) =
+        body.deserialize()?;
 
     let level = Level::from_dbus_str(&level_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid level: {}", level_str))?;
@@ -154,8 +147,7 @@ fn parse_thermal_alert(msg: &zbus::Message) -> anyhow::Result<SystemSignal> {
 /// Parse EnergyConstraint signal: (level: s, reason: s, power_budget_mw: u)
 fn parse_energy_constraint(msg: &zbus::Message) -> anyhow::Result<SystemSignal> {
     let body = msg.body();
-    let (level_str, reason_str, power_budget_mw): (String, String, u32) =
-        body.deserialize()?;
+    let (level_str, reason_str, power_budget_mw): (String, String, u32) = body.deserialize()?;
 
     let level = Level::from_dbus_str(&level_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid level: {}", level_str))?;
