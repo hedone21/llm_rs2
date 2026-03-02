@@ -35,6 +35,7 @@
             <button class="nav-btn" data-tab="runner">Run ⚡</button>
             <button class="nav-btn" data-tab="gates">Gates</button>
             <button class="nav-btn" data-tab="todos">Todos</button>
+            <button class="nav-btn" data-tab="resilience">Resilience</button>
         </nav>
     </header>
 
@@ -259,6 +260,54 @@
             </div>
         </section>
 
+        <!-- ── Resilience Tab ──────────────────────────── -->
+        <section id="tab-resilience" class="tab-panel">
+            <div class="summary-cards" id="resilience-cards"></div>
+
+            <div class="card" style="margin-bottom:16px;">
+                <h3>Operating Modes</h3>
+                <div class="res-modes-grid" id="resilience-modes"></div>
+            </div>
+
+            <div class="card" style="margin-bottom:16px;">
+                <h3>Strategy Matrix — Signal x Level → Actions</h3>
+                <div class="table-wrapper">
+                    <table id="resilience-matrix">
+                        <thead><tr>
+                            <th>Signal</th><th>Level</th><th>Actions</th>
+                        </tr></thead>
+                        <tbody id="resilience-matrix-body"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:16px;">
+                <div class="card">
+                    <h3>D-Bus Signals</h3>
+                    <div class="table-wrapper">
+                        <table>
+                            <thead><tr><th>Signal</th><th>Parameters</th><th>Description</th></tr></thead>
+                            <tbody id="resilience-signals-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+                <div class="card">
+                    <h3>Action Reference</h3>
+                    <div class="table-wrapper">
+                        <table>
+                            <thead><tr><th>Action</th><th>Target</th><th>Description</th></tr></thead>
+                            <tbody id="resilience-actions-body"></tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <h3>Conflict Resolution Rules</h3>
+                <div id="resilience-rules" style="font-size:13px;color:var(--text-secondary);"></div>
+            </div>
+        </section>
+
     </main>
 
     <!-- Scripts -->
@@ -268,6 +317,7 @@
     <script src="/static/js/runner.js"></script>
     <script src="/static/js/gates.js"></script>
     <script src="/static/js/todos.js"></script>
+    <script src="/static/js/resilience.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 

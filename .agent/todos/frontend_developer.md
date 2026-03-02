@@ -14,7 +14,7 @@
 - **Notes**: results/data/component_gates.json → /api/gates → Gates.load()
 
 ## [P1] Resilience 신호 시각화 UI 추가
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: Rust 개발자의 Resilience Manager 통합 완료 (JSON 출력 스키마 확정)
 - **Description**: 대시보드에 resilience 신호 시각화 추가. 온도, 메모리 사용량, CPU 부하 등 시스템 메트릭을 실시간 차트로 표시. 백엔드 전환 이벤트, 배치 크기 조정 이벤트를 타임라인에 마킹

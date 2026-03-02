@@ -9,6 +9,7 @@ from .schema_registry import TIMESERIES_FIELDS, BENCHMARK_RESULT_FIELDS, METADAT
 from .runner import BenchmarkRunner
 from .gate_parser import load_gate_status
 from .todos_parser import load_todos
+from .resilience_parser import load_resilience_data
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -133,4 +134,12 @@ def get_todos():
     data = load_todos()
     if data is None:
         return jsonify({"error": "No TODO data. Check .agent/todos/ directory."}), 404
+    return jsonify(data)
+
+
+# ── Resilience endpoint ───────────────────────────────
+
+@api.route("/resilience")
+def get_resilience():
+    data = load_resilience_data()
     return jsonify(data)

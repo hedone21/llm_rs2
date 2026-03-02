@@ -771,3 +771,90 @@ body {
         flex-wrap: wrap;
     }
 }
+
+/* ═══════════════════════════════════════════════════════════
+   Resilience Tab
+   ═══════════════════════════════════════════════════════════ */
+
+/* Operating mode cards */
+.res-modes-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+}
+
+.res-mode-card {
+    background: var(--bg-card);
+    border-radius: 8px;
+    padding: 14px 16px;
+}
+
+.res-mode-name {
+    font-weight: 600;
+    font-size: 16px;
+    margin-bottom: 4px;
+}
+
+.res-mode-cond {
+    font-size: 11px;
+    color: var(--text-secondary);
+    margin-bottom: 6px;
+    font-family: var(--font-mono);
+}
+
+.res-mode-desc {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Strategy matrix */
+.res-signal-cell {
+    font-weight: 600;
+    vertical-align: middle;
+    border-right: 2px solid var(--border);
+}
+
+.res-detail {
+    font-size: 10px;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+/* Action badges */
+.badge-res-evict { background: #dc2626; color: #fff; }
+.badge-res-switch { background: #7c3aed; color: #fff; }
+.badge-res-limit { background: #d97706; color: #fff; }
+.badge-res-throttle { background: #2563eb; color: #fff; }
+.badge-res-suspend { background: #6b7280; color: #fff; }
+.badge-res-reject { background: #be185d; color: #fff; }
+.badge-res-restore { background: #059669; color: #fff; }
+.badge-res-default { background: var(--bg-card-hover); color: var(--text); }
+.badge-res-implemented { background: #059669; color: #fff; }
+
+/* Conflict rules */
+#resilience-rules ul {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+}
+
+#resilience-rules li {
+    padding: 6px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+#resilience-rules li:last-child {
+    border-bottom: none;
+}
+
+#resilience-rules li::before {
+    content: "→ ";
+    color: var(--accent);
+    font-weight: 500;
+}
+
+@media (max-width: 900px) {
+    .res-modes-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}

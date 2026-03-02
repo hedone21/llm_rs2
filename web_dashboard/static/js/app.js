@@ -16,6 +16,7 @@ const App = (() => {
         Runner.init();
         Gates.load();
         Todos.load();
+        Resilience.load();
 
         await reload();
 
@@ -66,6 +67,7 @@ const App = (() => {
         // Load data when switching to specific tabs
         if (tabName === 'gates') Gates.load();
         if (tabName === 'todos') Todos.load();
+        if (tabName === 'resilience') Resilience.load();
 
         // Trigger resize for Plotly charts
         setTimeout(() => window.dispatchEvent(new Event('resize')), 50);
