@@ -120,7 +120,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-02 23:50:06_
+_Last updated: 2026-03-02 23:52:33_
 
 ### Quality Gate Summary
 
@@ -148,8 +148,8 @@ _Last updated: 2026-03-02 23:50:06_
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 0 | 0 | 0 | N/A |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
-| **Overall** | | | **86** | **85** | **0** | **FAIL** |
+| UnifiedBuffer | T4 | Stable | 3 | 0 | 0 | **FAIL** |
+| **Overall** | | | **88** | **85** | **0** | **FAIL** |
 
 ### Test Details
 
@@ -240,7 +240,9 @@ _Last updated: 2026-03-02 23:50:06_
 | `test_workspace_scores_size` | LayerWorkspace | PASS |
 | `test_workspace_small_config` | LayerWorkspace | PASS |
 | `test_workspace_tensors_writable` | LayerWorkspace | PASS |
+| `test_alloc_unified_buffer` | UnifiedBuffer | **FAIL** |
 | `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
+| `test_unmap_and_remap` | UnifiedBuffer | **FAIL** |
 <!-- AUTO-GENERATED:TEST_STATUS:END -->
 
 ---
@@ -250,7 +252,6 @@ _Last updated: 2026-03-02 23:50:06_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-02T23:48:37 | 87 | 85 | 2 | 97.7% |
 | 2026-03-02T23:48:42 | 87 | 85 | 2 | 97.7% |
 | 2026-03-02T23:48:47 | 88 | 85 | 3 | 96.6% |
 | 2026-03-02T23:48:51 | 86 | 85 | 1 | 98.8% |
@@ -270,4 +271,5 @@ _Last updated: 2026-03-02 23:50:06_
 | 2026-03-02T23:49:57 | 88 | 85 | 3 | 96.6% |
 | 2026-03-02T23:50:01 | 86 | 85 | 1 | 98.8% |
 | 2026-03-02T23:50:06 | 86 | 85 | 1 | 98.8% |
+| 2026-03-02T23:52:33 | 88 | 85 | 3 | 96.6% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->

@@ -1,5 +1,5 @@
 {
-  "timestamp": "2026-03-02T23:50:06.341630",
+  "timestamp": "2026-03-02T23:52:33.315216",
   "overall_gate": "FAIL",
   "summary": {
     "total_components": 23,
@@ -253,9 +253,9 @@
           "name": "UnifiedBuffer",
           "module": "buffer::unified_buffer",
           "maturity": "Stable",
-          "total_tests": 1,
+          "total_tests": 3,
           "passed": 0,
-          "failed": 1,
+          "failed": 3,
           "skipped": 0,
           "gate": "FAIL"
         }
@@ -423,6 +423,13 @@
       "passed": 85,
       "failed": 1,
       "pass_rate": 98.8
+    },
+    {
+      "date": "2026-03-02T23:52:33",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
     }
   ]
 }
