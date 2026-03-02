@@ -8,6 +8,7 @@ from . import parser
 from .schema_registry import TIMESERIES_FIELDS, BENCHMARK_RESULT_FIELDS, METADATA_FIELDS
 from .runner import BenchmarkRunner
 from .gate_parser import load_gate_status
+from .todos_parser import load_todos
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -122,4 +123,14 @@ def get_gates():
     data = load_gate_status()
     if data is None:
         return jsonify({"error": "No gate data. Run update_test_status.py first."}), 404
+    return jsonify(data)
+
+
+# ── Todos status endpoint ──────────────────────────────
+
+@api.route("/todos")
+def get_todos():
+    data = load_todos()
+    if data is None:
+        return jsonify({"error": "No TODO data. Check .agent/todos/ directory."}), 404
     return jsonify(data)

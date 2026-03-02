@@ -34,6 +34,7 @@
             <button class="nav-btn" data-tab="trends">Trends</button>
             <button class="nav-btn" data-tab="runner">Run ⚡</button>
             <button class="nav-btn" data-tab="gates">Gates</button>
+            <button class="nav-btn" data-tab="todos">Todos</button>
         </nav>
     </header>
 
@@ -222,6 +223,42 @@
             </div>
         </section>
 
+        <!-- ── Todos Tab ───────────────────────────────── -->
+        <section id="tab-todos" class="tab-panel">
+            <div class="summary-cards" id="todos-cards"></div>
+            <div class="card" style="margin-bottom:16px;" id="todos-progress"></div>
+            <div class="card" style="margin-bottom:16px;">
+                <h3>Task Board</h3>
+                <div class="table-controls">
+                    <div class="filter-group">
+                        <label>Role</label>
+                        <select id="todo-filter-role"></select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Status</label>
+                        <select id="todo-filter-status"></select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Sprint</label>
+                        <select id="todo-filter-sprint"></select>
+                    </div>
+                    <div class="filter-group">
+                        <label>Priority</label>
+                        <select id="todo-filter-priority"></select>
+                    </div>
+                </div>
+                <div class="table-wrapper">
+                    <table id="todos-table">
+                        <thead><tr>
+                            <th>Priority</th><th>Status</th><th>Sprint</th>
+                            <th>Title</th><th>Dependencies</th><th>Description</th>
+                        </tr></thead>
+                        <tbody id="todos-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
     </main>
 
     <!-- Scripts -->
@@ -230,6 +267,7 @@
     <script src="/static/js/compare.js"></script>
     <script src="/static/js/runner.js"></script>
     <script src="/static/js/gates.js"></script>
+    <script src="/static/js/todos.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 

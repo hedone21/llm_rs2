@@ -655,6 +655,107 @@ body {
     letter-spacing: 0.5px;
 }
 
+/* ── Todos ───────────────────────────────────────────────── */
+/* Status badges */
+.badge-todo-done { background: rgba(34,197,94,0.15); color: #22c55e; }
+.badge-todo-progress { background: rgba(6,182,212,0.15); color: #22d3ee; }
+.badge-todo-blocked { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.badge-todo-default { background: rgba(139,143,163,0.12); color: #8b8fa3; }
+
+/* Priority badges */
+.badge-p0 { background: rgba(239,68,68,0.15); color: #ef4444; }
+.badge-p1 { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.badge-p2 { background: rgba(234,179,8,0.15); color: #eab308; }
+.badge-p3 { background: rgba(139,143,163,0.12); color: #8b8fa3; }
+
+/* Progress bar */
+.progress-bar-track {
+    width: 100%;
+    height: 8px;
+    background: var(--bg-primary);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.progress-bar-fill {
+    height: 100%;
+    border-radius: 4px;
+    transition: width 0.4s ease;
+}
+
+.progress-bar-label {
+    display: block;
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+/* Todos table */
+#todos-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+#todos-table thead {
+    background: var(--bg-secondary);
+}
+
+#todos-table th {
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+}
+
+#todos-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+}
+
+#todos-table tbody tr:hover {
+    background: var(--bg-hover);
+}
+
+.todo-title {
+    font-weight: 500;
+    color: var(--text-primary);
+    max-width: 300px;
+}
+
+.todo-deps {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    max-width: 200px;
+}
+
+.todo-desc {
+    color: var(--text-secondary);
+    font-size: 11px;
+    max-width: 400px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Role group headers (reuse tier-header pattern) */
+.role-header td {
+    font-weight: 700;
+    color: var(--accent);
+    background: rgba(79,108,247,0.06);
+    border-bottom: 2px solid var(--accent);
+    padding: 10px 12px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
 /* ── Responsive ──────────────────────────────────────────── */
 @media (max-width: 1024px) {
     .overview-grid {
