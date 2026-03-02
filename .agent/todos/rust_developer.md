@@ -30,7 +30,7 @@
 - **Notes**: tokio 사용 금지 — std::thread + std::sync 사용
 
 ## [P2] 컴파일러 경고 수정
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: 현재 컴파일 시 발생하는 경고 수정. 대상: x86.rs (unused imports), kv_cache.rs (dead code), tensor.rs (unused variables), sys_monitor.rs (unused fields), buffer.rs (unused methods) 등

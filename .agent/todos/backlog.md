@@ -5,7 +5,7 @@
 ---
 
 ## [P2] 컴파일러 경고 정리
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: unused imports, dead code 등 컴파일러 경고 수정. 대상 파일: x86.rs, kv_cache.rs, tensor.rs, sys_monitor.rs, buffer.rs 등 약 6개 파일
