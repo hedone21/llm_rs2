@@ -8,7 +8,7 @@ This file provides guidance to AI coding agents when working with code in this r
 
 ## Project Overview
 
-Antigravity (llm_rs2) — a high-performance on-device LLM inference framework in Rust, targeting ARM64 Android/edge devices. Supports Llama 3.2 models in HuggingFace Safetensors format with Q4_0/Q8_0 quantization and OpenCL GPU acceleration.
+llm.rs (repo: llm_rs2) — a high-performance on-device LLM inference framework in Rust, targeting ARM64 Android/edge devices. Supports Llama 3.2 models in HuggingFace Safetensors format with Q4_0/Q8_0 quantization and OpenCL GPU acceleration.
 
 ## Build Commands
 
@@ -73,7 +73,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 ## Workflow Rules
 
 - **Auto-commit on completion**: When finishing a task, automatically commit the changes without asking. Do not leave uncommitted work.
-- **Desktop notification on completion**: After completing a task, send a desktop notification via `notify-send "Antigravity" "<task summary>"` so the user knows work is done.
+- **Desktop notification on completion**: After completing a task, send a desktop notification via `notify-send "llm.rs" "<task summary>"` so the user knows work is done.
 
 ## Profiling & Benchmarks
 
