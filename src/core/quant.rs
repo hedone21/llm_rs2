@@ -66,8 +66,8 @@ const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
 impl BlockQ8_0 {
     pub fn dequantize(&self, out: &mut [f32; QK8_0]) {
         let d = self.d.to_f32();
-        for i in 0..QK8_0 {
-            out[i] = self.qs[i] as f32 * d;
+        for (i, o) in out.iter_mut().enumerate().take(QK8_0) {
+            *o = self.qs[i] as f32 * d;
         }
     }
 }

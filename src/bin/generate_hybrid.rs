@@ -314,7 +314,7 @@ fn main() -> anyhow::Result<()> {
             println!("\n\n[Hybrid] Switching to GPU at token {}...", start_pos);
 
             // 1. Migrate KV Cache
-            for (_i, kv) in kv_caches.iter_mut().enumerate() {
+            for kv in kv_caches.iter_mut() {
                 // Read from CPU
                 let k_size = max_seq_len * kv_heads * head_dim * 4;
                 let mut k_data = vec![0u8; k_size];
@@ -326,22 +326,14 @@ fn main() -> anyhow::Result<()> {
                 // Create CPU Tensor from data
                 let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        k_data.as_ptr(),
-                        k_cpu_buf.as_mut_ptr() as *mut u8,
-                        k_size,
-                    );
+                    std::ptr::copy_nonoverlapping(k_data.as_ptr(), k_cpu_buf.as_mut_ptr(), k_size);
                 }
                 let k_cpu_tensor =
                     Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
 
                 let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        v_data.as_ptr(),
-                        v_cpu_buf.as_mut_ptr() as *mut u8,
-                        k_size,
-                    );
+                    std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_cpu_buf.as_mut_ptr(), k_size);
                 }
                 let v_cpu_tensor =
                     Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());

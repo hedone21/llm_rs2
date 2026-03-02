@@ -15,6 +15,12 @@ pub trait SystemMonitor: Send + Sync {
 
 pub struct LinuxSystemMonitor;
 
+impl Default for LinuxSystemMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LinuxSystemMonitor {
     pub fn new() -> Self {
         Self

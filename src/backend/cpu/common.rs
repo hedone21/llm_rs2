@@ -8,6 +8,12 @@ use rayon::prelude::*;
 
 pub struct CpuBackendCommon;
 
+impl Default for CpuBackendCommon {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl CpuBackendCommon {
     pub fn new() -> Self {
         Self
@@ -297,6 +303,7 @@ impl Backend for CpuBackendCommon {
         }
     }
 
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -752,6 +759,7 @@ impl CpuBackendCommon {
         Ok(())
     }
 
+    #[allow(clippy::needless_range_loop)]
     pub fn matmul_transposed_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_shape = a.shape().dims();
         let b_shape = b.shape().dims();
@@ -858,6 +866,7 @@ impl CpuBackendCommon {
         Ok(())
     }
 
+    #[allow(clippy::needless_range_loop)]
     pub fn quantize_row_q8_0(&self, x: &[f32], y: &mut [crate::core::quant::BlockQ8_0], k: usize) {
         use crate::core::quant::QK8_0;
         assert!(k % QK8_0 == 0);
@@ -882,6 +891,9 @@ impl CpuBackendCommon {
         }
     }
 
+    /// # Safety
+    /// `vx` and `vy` must point to valid `BlockQ4_0` / `BlockQ8_0` arrays of length `n / QK8_0`.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn vec_dot_q4_0_q8_0(
         &self,
         n: usize,
@@ -912,6 +924,7 @@ impl CpuBackendCommon {
         *s = sumf;
     }
 
+    #[allow(clippy::needless_range_loop)]
     pub fn matmul_transposed_q4_1(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_shape = a.shape().dims();
         let b_shape = b.shape().dims();

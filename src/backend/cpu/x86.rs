@@ -11,6 +11,12 @@ use std::arch::x86_64::*;
 
 pub struct CpuBackendAVX2;
 
+impl Default for CpuBackendAVX2 {
+    fn default() -> Self {
+        Self
+    }
+}
+
 impl CpuBackendAVX2 {
     pub fn new() -> Self {
         Self
@@ -130,6 +136,7 @@ impl CpuBackendAVX2 {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[allow(clippy::needless_range_loop)]
     fn matmul_transposed_f32(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         if !is_x86_feature_detected!("avx2") {
             return CpuBackendCommon::new().matmul_transposed_f32(a, b, out);
@@ -356,6 +363,8 @@ impl CpuBackendAVX2 {
     // Core Kernel
     // -------------------------------------------------------------------------
 
+    /// # Safety
+    /// Caller must ensure `vx` and `vy` point to valid blocks and `n` is a multiple of `QK8_0`.
     #[target_feature(enable = "avx2", enable = "fma")]
     pub unsafe fn vec_dot_q4_0_q8_0(
         &self,
@@ -403,6 +412,9 @@ impl CpuBackendAVX2 {
     // AVX2 Quantization Kernel
     // -------------------------------------------------------------------------
 
+    /// # Safety
+    /// Caller must ensure `k` is a multiple of `QK8_0` and slices are large enough.
+    #[allow(clippy::needless_range_loop)]
     #[target_feature(enable = "avx2")]
     pub unsafe fn quantize_row_q8_0(&self, x: &[f32], y: &mut [BlockQ8_0], k: usize) {
         assert!(k % QK8_0 == 0);
@@ -555,10 +567,10 @@ impl CpuBackendAVX2 {
                     }
                     *out_val = sum;
                 });
-            return Ok(());
+            Ok(())
         } else {
             // For M >= 4, use common implementation which handles larger matrices well.
-            return CpuBackendCommon::new().matmul_transposed_q4_0(a, b, out);
+            CpuBackendCommon::new().matmul_transposed_q4_0(a, b, out)
         }
     }
 

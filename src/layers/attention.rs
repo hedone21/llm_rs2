@@ -71,6 +71,7 @@ pub fn naive_attention_head(
 /// Arguments:
 /// - `q_stride`, `k_stride`, `v_stride`, `out_stride`: Stride (in elements) between consecutive rows (tokens).
 /// - `q_start_pos`: The global position of the first query token (for causal masking check `c <= r + q_start_pos`).
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn flash_attention_head(
     q: &[f32],
     q_stride: usize,
@@ -88,8 +89,8 @@ pub fn flash_attention_head(
     bc: usize,
 ) {
     let scale = 1.0 / (head_dim as f32).sqrt();
-    let tr = (q_len + br - 1) / br;
-    let tc = (kv_len + bc - 1) / bc;
+    let tr = q_len.div_ceil(br);
+    let tc = kv_len.div_ceil(bc);
 
     for i in 0..tr {
         let r_start = i * br;
@@ -202,6 +203,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 /// - `stride_q`, `stride_k`, `stride_v`, `stride_out`: Stride in elements between consecutive sequence tokens.
 ///   For [Seq, Heads, Dim] layout, stride is (Heads * Dim).
 ///   For [Heads, Seq, Dim] layout, stride is (Dim).
+#[allow(clippy::too_many_arguments)]
 pub fn flash_attention_forward(
     q: &[f32],
     k: &[f32],

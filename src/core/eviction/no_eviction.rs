@@ -12,6 +12,12 @@ impl NoEvictionPolicy {
     }
 }
 
+impl Default for NoEvictionPolicy {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EvictionPolicy for NoEvictionPolicy {
     fn should_evict(&self, _cache: &KVCache, _mem_available: usize) -> bool {
         false

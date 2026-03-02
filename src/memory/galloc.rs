@@ -12,6 +12,12 @@ impl Galloc {
     }
 }
 
+impl Default for Galloc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Memory for Galloc {
     fn alloc(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
         let buf = SharedBuffer::new(size, dtype);

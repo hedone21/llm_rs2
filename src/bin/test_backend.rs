@@ -239,7 +239,7 @@ fn print_comparison_table(results: &[TestResult], backends: &[Arc<dyn Backend>])
             .replace("Auto - ", "");
         print!(" {:^32} |", short_name);
     }
-    println!("");
+    println!();
 
     print!("{:<18} | {:<16} | {:<6} |", "", "", "");
     for _ in backends {
@@ -285,11 +285,12 @@ fn print_comparison_table(results: &[TestResult], backends: &[Arc<dyn Backend>])
                 print!(" {:^32} |", "N/A");
             }
         }
-        println!("");
+        println!();
     }
     println!("{:=<200}", "");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_matmul_test(
     results: &mut Vec<TestResult>,
     backend: Arc<dyn Backend>,
@@ -344,8 +345,8 @@ fn perform_matmul_test(
     let a_size = m * k * 4;
     let buf_a = memory.alloc(a_size, DType::F32)?;
     let mut a_vec = vec![0.0f32; m * k];
-    for i in 0..a_vec.len() {
-        a_vec[i] = ((i % 100) as f32 * 0.01) - 0.5;
+    for (i, v) in a_vec.iter_mut().enumerate() {
+        *v = ((i % 100) as f32 * 0.01) - 0.5;
     }
     unsafe {
         std::ptr::copy_nonoverlapping(a_vec.as_ptr(), buf_a.as_mut_ptr() as *mut f32, a_vec.len());
@@ -353,8 +354,8 @@ fn perform_matmul_test(
     let a = Tensor::new(Shape::new(vec![m, k]), buf_a, backend.clone());
 
     let mut b_vec_f32 = vec![0.0f32; n * k];
-    for i in 0..b_vec_f32.len() {
-        b_vec_f32[i] = ((i % 123) as f32 * 0.01) - 0.5;
+    for (i, v) in b_vec_f32.iter_mut().enumerate() {
+        *v = ((i % 123) as f32 * 0.01) - 0.5;
     }
 
     // Helpers to hold blocks for verification if needed

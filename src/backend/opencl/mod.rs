@@ -372,7 +372,7 @@ impl Backend for OpenCLBackend {
             Arc::new(Self {
                 context: self.context.clone(),
                 queue: self.queue.clone(),
-                device: self.device.clone(),
+                device: self.device,
                 program: self.program.clone(),
                 simple_ops_program: self.simple_ops_program.clone(),
                 q4_0_program: self.q4_0_program.clone(),
@@ -681,7 +681,7 @@ impl Backend for OpenCLBackend {
                     )?;
 
                     let local_size = 64;
-                    let global_size = ((num_blocks + local_size - 1) / local_size) * local_size;
+                    let global_size = num_blocks.div_ceil(local_size) * local_size;
 
                     ocl::core::enqueue_kernel(
                         &self.queue,
@@ -1050,13 +1050,12 @@ impl Backend for OpenCLBackend {
                 let dst_byte_off = dst_offset * type_size;
                 let byte_len = count * type_size;
                 unsafe {
-                    let src_u8 = src_ptr as *const u8;
                     ocl::core::enqueue_write_buffer(
                         &self.queue,
                         db,
                         true,
                         dst_byte_off,
-                        std::slice::from_raw_parts(src_u8.add(src_byte_off), byte_len),
+                        std::slice::from_raw_parts(src_ptr.add(src_byte_off), byte_len),
                         None::<&ocl::core::Event>,
                         None::<&mut ocl::core::Event>,
                     )?;
@@ -1072,13 +1071,12 @@ impl Backend for OpenCLBackend {
                 let dst_byte_off = dst_offset * type_size;
                 let byte_len = count * type_size;
                 unsafe {
-                    let dst_u8 = dst_ptr as *mut u8;
                     ocl::core::enqueue_read_buffer(
                         &self.queue,
                         sb,
                         true,
                         src_byte_off,
-                        std::slice::from_raw_parts_mut(dst_u8.add(dst_byte_off), byte_len),
+                        std::slice::from_raw_parts_mut(dst_ptr.add(dst_byte_off), byte_len),
                         None::<&ocl::core::Event>,
                         None::<&mut ocl::core::Event>,
                     )?;

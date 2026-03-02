@@ -33,6 +33,7 @@ pub trait Backend: Send + Sync {
     // Single-query attention for generation (GQA-aware)
     // Q: [num_heads_q, head_dim], K/V cache: [cache_seq_len, num_heads_kv, head_dim]
     // Output: [num_heads_q, head_dim]
+    #[allow(clippy::too_many_arguments)]
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -65,6 +66,7 @@ pub trait Backend: Send + Sync {
 
             // Compute scores
             let mut scores = vec![0.0f32; cache_seq_len];
+            #[allow(clippy::needless_range_loop)]
             for t in 0..cache_seq_len {
                 let k_off = (t * num_heads_kv + kv_h) * head_dim;
                 let k_vec = &k_data[k_off..k_off + head_dim];
@@ -88,6 +90,7 @@ pub trait Backend: Send + Sync {
             for d in 0..head_dim {
                 out_data[out_off + d] = 0.0;
             }
+            #[allow(clippy::needless_range_loop)]
             for t in 0..cache_seq_len {
                 let weight = scores[t];
                 let v_off = (t * num_heads_kv + kv_h) * head_dim;
@@ -103,7 +106,7 @@ pub trait Backend: Send + Sync {
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
-        let src_ptr = t.buffer().as_ptr() as *const u8;
+        let src_ptr = t.buffer().as_ptr();
         if src_ptr.is_null() {
             anyhow::bail!("Cannot read null buffer (not mapped)");
         }
@@ -183,17 +186,14 @@ pub trait Backend: Send + Sync {
         }
 
         unsafe {
-            let src_u8 = src_ptr as *const u8;
-            let dst_u8 = dst_ptr as *mut u8;
-
             // Calculate byte offsets
             let src_byte_offset = src_offset * type_size;
             let dst_byte_offset = dst_offset * type_size;
             let byte_count = count * type_size;
 
             std::ptr::copy_nonoverlapping(
-                src_u8.add(src_byte_offset),
-                dst_u8.add(dst_byte_offset),
+                src_ptr.add(src_byte_offset),
+                dst_ptr.add(dst_byte_offset),
                 byte_count,
             );
         }
