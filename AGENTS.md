@@ -70,6 +70,10 @@ Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fi
 
 Conventional Commits: `type(scope): subject` — imperative present tense. Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
 
+## Workflow Rules
+
+- **Auto-commit on completion**: When finishing a task, automatically commit the changes without asking. Do not leave uncommitted work.
+
 ## Profiling & Benchmarks
 
 - `scripts/android_profile.py` — On-device profiling with JSON output

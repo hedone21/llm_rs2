@@ -1,0 +1,413 @@
+{
+  "name": "memory_pressure_eviction",
+  "description": "KV cache memory under progressive memory pressure signals",
+  "config": {
+    "num_layers": 16,
+    "num_kv_heads": 8,
+    "head_dim": 64,
+    "max_seq_len": 2048,
+    "per_token_bytes": 65536
+  },
+  "data": [
+    {
+      "step": 0,
+      "event": "fill",
+      "tokens": 10,
+      "memory_kb": 640.0,
+      "memory_mb": 0.625,
+      "level": "normal"
+    },
+    {
+      "step": 1,
+      "event": "fill",
+      "tokens": 20,
+      "memory_kb": 1280.0,
+      "memory_mb": 1.25,
+      "level": "normal"
+    },
+    {
+      "step": 2,
+      "event": "fill",
+      "tokens": 30,
+      "memory_kb": 1920.0,
+      "memory_mb": 1.875,
+      "level": "normal"
+    },
+    {
+      "step": 3,
+      "event": "fill",
+      "tokens": 40,
+      "memory_kb": 2560.0,
+      "memory_mb": 2.5,
+      "level": "normal"
+    },
+    {
+      "step": 4,
+      "event": "fill",
+      "tokens": 50,
+      "memory_kb": 3200.0,
+      "memory_mb": 3.125,
+      "level": "normal"
+    },
+    {
+      "step": 5,
+      "event": "fill",
+      "tokens": 60,
+      "memory_kb": 3840.0,
+      "memory_mb": 3.75,
+      "level": "normal"
+    },
+    {
+      "step": 6,
+      "event": "fill",
+      "tokens": 70,
+      "memory_kb": 4480.0,
+      "memory_mb": 4.375,
+      "level": "normal"
+    },
+    {
+      "step": 7,
+      "event": "fill",
+      "tokens": 80,
+      "memory_kb": 5120.0,
+      "memory_mb": 5.0,
+      "level": "normal"
+    },
+    {
+      "step": 8,
+      "event": "fill",
+      "tokens": 90,
+      "memory_kb": 5760.0,
+      "memory_mb": 5.625,
+      "level": "normal"
+    },
+    {
+      "step": 9,
+      "event": "fill",
+      "tokens": 100,
+      "memory_kb": 6400.0,
+      "memory_mb": 6.25,
+      "level": "normal"
+    },
+    {
+      "step": 10,
+      "event": "fill",
+      "tokens": 110,
+      "memory_kb": 7040.0,
+      "memory_mb": 6.875,
+      "level": "normal"
+    },
+    {
+      "step": 11,
+      "event": "fill",
+      "tokens": 120,
+      "memory_kb": 7680.0,
+      "memory_mb": 7.5,
+      "level": "normal"
+    },
+    {
+      "step": 12,
+      "event": "fill",
+      "tokens": 130,
+      "memory_kb": 8320.0,
+      "memory_mb": 8.125,
+      "level": "normal"
+    },
+    {
+      "step": 13,
+      "event": "fill",
+      "tokens": 140,
+      "memory_kb": 8960.0,
+      "memory_mb": 8.75,
+      "level": "normal"
+    },
+    {
+      "step": 14,
+      "event": "fill",
+      "tokens": 150,
+      "memory_kb": 9600.0,
+      "memory_mb": 9.375,
+      "level": "normal"
+    },
+    {
+      "step": 15,
+      "event": "fill",
+      "tokens": 160,
+      "memory_kb": 10240.0,
+      "memory_mb": 10.0,
+      "level": "normal"
+    },
+    {
+      "step": 16,
+      "event": "fill",
+      "tokens": 170,
+      "memory_kb": 10880.0,
+      "memory_mb": 10.625,
+      "level": "normal"
+    },
+    {
+      "step": 17,
+      "event": "fill",
+      "tokens": 180,
+      "memory_kb": 11520.0,
+      "memory_mb": 11.25,
+      "level": "normal"
+    },
+    {
+      "step": 18,
+      "event": "fill",
+      "tokens": 190,
+      "memory_kb": 12160.0,
+      "memory_mb": 11.875,
+      "level": "normal"
+    },
+    {
+      "step": 19,
+      "event": "fill",
+      "tokens": 200,
+      "memory_kb": 12800.0,
+      "memory_mb": 12.5,
+      "level": "normal"
+    },
+    {
+      "step": 20,
+      "event": "pre_eviction_warning",
+      "tokens": 200,
+      "memory_kb": 12800.0,
+      "memory_mb": 12.5,
+      "level": "warning"
+    },
+    {
+      "step": 21,
+      "event": "post_eviction_warning",
+      "tokens": 170,
+      "memory_kb": 10880.0,
+      "memory_mb": 10.625,
+      "level": "warning"
+    },
+    {
+      "step": 22,
+      "event": "fill",
+      "tokens": 180,
+      "memory_kb": 11520.0,
+      "memory_mb": 11.25,
+      "level": "warning"
+    },
+    {
+      "step": 23,
+      "event": "fill",
+      "tokens": 190,
+      "memory_kb": 12160.0,
+      "memory_mb": 11.875,
+      "level": "warning"
+    },
+    {
+      "step": 24,
+      "event": "fill",
+      "tokens": 200,
+      "memory_kb": 12800.0,
+      "memory_mb": 12.5,
+      "level": "warning"
+    },
+    {
+      "step": 25,
+      "event": "fill",
+      "tokens": 210,
+      "memory_kb": 13440.0,
+      "memory_mb": 13.125,
+      "level": "warning"
+    },
+    {
+      "step": 26,
+      "event": "fill",
+      "tokens": 220,
+      "memory_kb": 14080.0,
+      "memory_mb": 13.75,
+      "level": "warning"
+    },
+    {
+      "step": 27,
+      "event": "fill",
+      "tokens": 230,
+      "memory_kb": 14720.0,
+      "memory_mb": 14.375,
+      "level": "warning"
+    },
+    {
+      "step": 28,
+      "event": "fill",
+      "tokens": 240,
+      "memory_kb": 15360.0,
+      "memory_mb": 15.0,
+      "level": "warning"
+    },
+    {
+      "step": 29,
+      "event": "fill",
+      "tokens": 250,
+      "memory_kb": 16000.0,
+      "memory_mb": 15.625,
+      "level": "warning"
+    },
+    {
+      "step": 30,
+      "event": "fill",
+      "tokens": 260,
+      "memory_kb": 16640.0,
+      "memory_mb": 16.25,
+      "level": "warning"
+    },
+    {
+      "step": 31,
+      "event": "fill",
+      "tokens": 270,
+      "memory_kb": 17280.0,
+      "memory_mb": 16.875,
+      "level": "warning"
+    },
+    {
+      "step": 32,
+      "event": "pre_eviction_critical",
+      "tokens": 270,
+      "memory_kb": 17280.0,
+      "memory_mb": 16.875,
+      "level": "critical"
+    },
+    {
+      "step": 33,
+      "event": "post_eviction_critical",
+      "tokens": 135,
+      "memory_kb": 8640.0,
+      "memory_mb": 8.4375,
+      "level": "critical"
+    },
+    {
+      "step": 34,
+      "event": "fill",
+      "tokens": 145,
+      "memory_kb": 9280.0,
+      "memory_mb": 9.0625,
+      "level": "critical"
+    },
+    {
+      "step": 35,
+      "event": "fill",
+      "tokens": 155,
+      "memory_kb": 9920.0,
+      "memory_mb": 9.6875,
+      "level": "critical"
+    },
+    {
+      "step": 36,
+      "event": "fill",
+      "tokens": 165,
+      "memory_kb": 10560.0,
+      "memory_mb": 10.3125,
+      "level": "critical"
+    },
+    {
+      "step": 37,
+      "event": "fill",
+      "tokens": 175,
+      "memory_kb": 11200.0,
+      "memory_mb": 10.9375,
+      "level": "critical"
+    },
+    {
+      "step": 38,
+      "event": "fill",
+      "tokens": 185,
+      "memory_kb": 11840.0,
+      "memory_mb": 11.5625,
+      "level": "critical"
+    },
+    {
+      "step": 39,
+      "event": "fill",
+      "tokens": 195,
+      "memory_kb": 12480.0,
+      "memory_mb": 12.1875,
+      "level": "critical"
+    },
+    {
+      "step": 40,
+      "event": "fill",
+      "tokens": 205,
+      "memory_kb": 13120.0,
+      "memory_mb": 12.8125,
+      "level": "critical"
+    },
+    {
+      "step": 41,
+      "event": "fill",
+      "tokens": 215,
+      "memory_kb": 13760.0,
+      "memory_mb": 13.4375,
+      "level": "critical"
+    },
+    {
+      "step": 42,
+      "event": "pre_eviction_emergency",
+      "tokens": 215,
+      "memory_kb": 13760.0,
+      "memory_mb": 13.4375,
+      "level": "emergency"
+    },
+    {
+      "step": 43,
+      "event": "post_eviction_emergency",
+      "tokens": 53,
+      "memory_kb": 3392.0,
+      "memory_mb": 3.3125,
+      "level": "emergency"
+    },
+    {
+      "step": 44,
+      "event": "fill",
+      "tokens": 63,
+      "memory_kb": 4032.0,
+      "memory_mb": 3.9375,
+      "level": "normal"
+    },
+    {
+      "step": 45,
+      "event": "fill",
+      "tokens": 73,
+      "memory_kb": 4672.0,
+      "memory_mb": 4.5625,
+      "level": "normal"
+    },
+    {
+      "step": 46,
+      "event": "fill",
+      "tokens": 83,
+      "memory_kb": 5312.0,
+      "memory_mb": 5.1875,
+      "level": "normal"
+    },
+    {
+      "step": 47,
+      "event": "fill",
+      "tokens": 93,
+      "memory_kb": 5952.0,
+      "memory_mb": 5.8125,
+      "level": "normal"
+    },
+    {
+      "step": 48,
+      "event": "fill",
+      "tokens": 103,
+      "memory_kb": 6592.0,
+      "memory_mb": 6.4375,
+      "level": "normal"
+    },
+    {
+      "step": 49,
+      "event": "fill",
+      "tokens": 113,
+      "memory_kb": 7232.0,
+      "memory_mb": 7.0625,
+      "level": "normal"
+    }
+  ]
+}
