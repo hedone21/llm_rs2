@@ -120,7 +120,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-02 22:16:58_
+_Last updated: 2026-03-02 23:50:06_
 
 ### Quality Gate Summary
 
@@ -136,16 +136,20 @@ _Last updated: 2026-03-02 22:16:58_
 | CacheManager | T2 | Stable | 7 | 7 | 0 | PASS |
 | KVCache | T2 | Stable | 8 | 8 | 0 | PASS |
 | NoEvictionPolicy | T2 | Stable | 3 | 3 | 0 | PASS |
+| OperatingMode | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
+| ResilienceManager | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
+| Signal/Level | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
 | SlidingWindowPolicy | T2 | Stable | 7 | 7 | 0 | PASS |
 | SnapKVPolicy | T2 | Stub | 6 | 6 | 0 | PASS |
+| Strategy | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
 | SystemMonitor | T2 | Stable | 3 | 3 | 0 | PASS |
 | CpuBackend | T3 | Stable | 14 | 14 | 0 | PASS |
 | OpenCLBackend | T3 | Stable | 0 | 0 | 0 | N/A |
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 0 | 0 | 0 | N/A |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 4 | 0 | 4 | SKIP |
-| **Overall** | | | **89** | **85** | **4** | PASS |
+| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
+| **Overall** | | | **86** | **85** | **0** | **FAIL** |
 
 ### Test Details
 
@@ -236,10 +240,7 @@ _Last updated: 2026-03-02 22:16:58_
 | `test_workspace_scores_size` | LayerWorkspace | PASS |
 | `test_workspace_small_config` | LayerWorkspace | PASS |
 | `test_workspace_tensors_writable` | LayerWorkspace | PASS |
-| `test_alloc_unified_buffer` | UnifiedBuffer | SKIP |
-| `test_map_returns_valid_ptr` | UnifiedBuffer | SKIP |
-| `test_map_write_unmap_cycle` | UnifiedBuffer | SKIP |
-| `test_unmap_and_remap` | UnifiedBuffer | SKIP |
+| `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
 <!-- AUTO-GENERATED:TEST_STATUS:END -->
 
 ---
@@ -249,6 +250,24 @@ _Last updated: 2026-03-02 22:16:58_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-02T22:07:45 | 70 | 66 | 0 | 94.3% |
-| 2026-03-02T22:16:58 | 89 | 85 | 0 | 95.5% |
+| 2026-03-02T23:48:37 | 87 | 85 | 2 | 97.7% |
+| 2026-03-02T23:48:42 | 87 | 85 | 2 | 97.7% |
+| 2026-03-02T23:48:47 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:48:51 | 86 | 85 | 1 | 98.8% |
+| 2026-03-02T23:48:56 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:01 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:05 | 85 | 85 | 0 | 100.0% |
+| 2026-03-02T23:49:10 | 85 | 85 | 0 | 100.0% |
+| 2026-03-02T23:49:14 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:19 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:24 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:28 | 85 | 85 | 0 | 100.0% |
+| 2026-03-02T23:49:33 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:37 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:42 | 85 | 85 | 0 | 100.0% |
+| 2026-03-02T23:49:47 | 85 | 85 | 0 | 100.0% |
+| 2026-03-02T23:49:52 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:49:57 | 88 | 85 | 3 | 96.6% |
+| 2026-03-02T23:50:01 | 86 | 85 | 1 | 98.8% |
+| 2026-03-02T23:50:06 | 86 | 85 | 1 | 98.8% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->

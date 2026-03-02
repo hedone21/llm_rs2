@@ -1,0 +1,65 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════
+# Pre-commit Quality Gate
+#
+# Blocks commits if any of the following fail:
+#   1. cargo fmt --check (formatting)
+#   2. cargo clippy (lint warnings)
+#   3. cargo test (unit tests)
+#   4. cargo test --features resilience (if resilience files changed)
+#
+# Skip with: git commit --no-verify (use sparingly!)
+# ═══════════════════════════════════════════════════════════
+
+set -e
+
+echo "══════════════════════════════════════════"
+echo "  Pre-commit Quality Gate"
+echo "══════════════════════════════════════════"
+
+# ── 1. Format check ───────────────────────────────────
+echo ""
+echo "[1/3] Checking formatting..."
+if ! cargo fmt -- --check 2>/dev/null; then
+    echo "FAIL: Code formatting issues found."
+    echo "  Run: cargo fmt"
+    exit 1
+fi
+echo "  PASS"
+
+# ── 2. Clippy lint ────────────────────────────────────
+echo "[2/3] Running clippy..."
+if ! cargo clippy --quiet -- -D warnings 2>/dev/null; then
+    echo "FAIL: Clippy warnings found."
+    echo "  Fix warnings and try again."
+    exit 1
+fi
+echo "  PASS"
+
+# ── 3. Unit tests ────────────────────────────────────
+# Skip GPU-dependent tests (unified_buffer) that SIGSEGV without hardware
+echo "[3/3] Running tests..."
+if ! cargo test --quiet -- --skip unified_buffer 2>/dev/null; then
+    # Re-run verbose on failure to show what failed
+    echo "FAIL: Tests failed. Details:"
+    cargo test -- --skip unified_buffer 2>&1 | grep -E "(FAILED|test result)" | head -10
+    exit 1
+fi
+echo "  PASS"
+
+# ── 4. Resilience tests (conditional) ────────────────
+# Only run if resilience-related files were staged
+STAGED=$(git diff --cached --name-only)
+if echo "$STAGED" | grep -qE "(resilience|generate\.rs)"; then
+    echo "[+] Running resilience integration tests..."
+    if ! cargo test --features resilience --test test_resilience_integration --quiet 2>/dev/null; then
+        echo "FAIL: Resilience integration tests failed."
+        exit 1
+    fi
+    echo "  PASS"
+fi
+
+echo ""
+echo "══════════════════════════════════════════"
+echo "  All gates passed"
+echo "══════════════════════════════════════════"

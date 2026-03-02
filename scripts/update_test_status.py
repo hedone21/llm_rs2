@@ -142,6 +142,31 @@ COMPONENT_META = {
         "tier": "T4",
         "maturity": "Stable",
     },
+    # Resilience (feature-gated, T2 level)
+    "resilience::manager": {
+        "component": "Resilience",
+        "name": "ResilienceManager",
+        "tier": "T2",
+        "maturity": "Stable",
+    },
+    "resilience::signal": {
+        "component": "Resilience",
+        "name": "Signal/Level",
+        "tier": "T2",
+        "maturity": "Stable",
+    },
+    "resilience::state": {
+        "component": "Resilience",
+        "name": "OperatingMode",
+        "tier": "T2",
+        "maturity": "Stable",
+    },
+    "resilience::strategy": {
+        "component": "Resilience",
+        "name": "Strategy",
+        "tier": "T2",
+        "maturity": "Stable",
+    },
 }
 
 # Test result line pattern: test module::path::test_name ... ok/FAILED
@@ -536,13 +561,19 @@ def main():
         action="store_true",
         help="Read cargo test output from stdin instead of running cargo test",
     )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress progress output (for use in git hooks)",
+    )
     args = parser.parse_args()
 
     # 1. Get test output
     if args.stdin:
         output = sys.stdin.read()
     else:
-        print("Running cargo test...")
+        if not args.quiet:
+            print("Running cargo test...")
         output = run_cargo_test()
 
     # 2. Parse results
@@ -602,20 +633,21 @@ def main():
     blocked = sum(1 for s in gate_statuses.values() if s == "BLOCKED")
     gate_fails = sum(1 for s in gate_statuses.values() if s == "FAIL")
 
-    print(f"Tests: {total} total, {passed} passed, {failed} failed ({rate}%)")
+    if not args.quiet:
+        print(f"Tests: {total} total, {passed} passed, {failed} failed ({rate}%)")
 
-    reasons = []
-    if blocked:
-        reasons.append(f"{blocked} components BLOCKED")
-    if gate_fails:
-        reasons.append(f"{gate_fails} components FAIL")
-    if reasons:
-        print(f"Gate: {overall} ({', '.join(reasons)})")
-    else:
-        print(f"Gate: {overall}")
+        reasons = []
+        if blocked:
+            reasons.append(f"{blocked} components BLOCKED")
+        if gate_fails:
+            reasons.append(f"{gate_fails} components FAIL")
+        if reasons:
+            print(f"Gate: {overall} ({', '.join(reasons)})")
+        else:
+            print(f"Gate: {overall}")
 
-    print(f"Updated: {DOC_PATH.relative_to(PROJECT_ROOT)}")
-    print(f"History: {HISTORY_PATH.relative_to(PROJECT_ROOT)} ({len(history)} entries)")
+        print(f"Updated: {DOC_PATH.relative_to(PROJECT_ROOT)}")
+        print(f"History: {HISTORY_PATH.relative_to(PROJECT_ROOT)} ({len(history)} entries)")
 
 
 if __name__ == "__main__":

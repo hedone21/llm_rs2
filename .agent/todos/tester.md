@@ -30,7 +30,7 @@
 - **Notes**: `stress_test_adb.py` 확장 필요
 
 ## [P2] CI 자동화 훅 설정
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: T1/T2 테스트 안정화
 - **Description**: cargo test를 CI 파이프라인에 통합. pre-commit 또는 PR 단위로 T1 테스트 자동 실행, 결과 리포트 자동 생성

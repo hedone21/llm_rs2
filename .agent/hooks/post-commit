@@ -1,0 +1,34 @@
+#!/bin/bash
+# ═══════════════════════════════════════════════════════════
+# Post-commit: Auto-update Quality Gates
+#
+# Runs update_test_status.py in background after each commit
+# to keep docs/14_component_status.md and
+# results/data/component_gates.json in sync.
+#
+# This is non-blocking — commit completes immediately.
+# ═══════════════════════════════════════════════════════════
+
+SCRIPT="scripts/update_test_status.py"
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+
+# Prevent recursive triggers: skip if we're already in a post-commit hook
+if [ -n "$LLM_RS2_POST_COMMIT_RUNNING" ]; then
+    exit 0
+fi
+export LLM_RS2_POST_COMMIT_RUNNING=1
+
+if [ -f "$PROJECT_ROOT/$SCRIPT" ]; then
+    (
+        cd "$PROJECT_ROOT"
+        python3 "$SCRIPT" --quiet 2>/dev/null
+
+        # Auto-stage updated gate files if they changed
+        if git diff --quiet -- docs/14_component_status.md results/data/component_gates.json 2>/dev/null; then
+            : # No changes
+        else
+            git add docs/14_component_status.md results/data/component_gates.json docs/test_history.json 2>/dev/null
+            git commit --no-verify -m "chore(gates): auto-update quality gates" 2>/dev/null || true
+        fi
+    ) &
+fi

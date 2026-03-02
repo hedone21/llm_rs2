@@ -1,14 +1,14 @@
 {
-  "timestamp": "2026-03-02T22:16:58.300353",
-  "overall_gate": "PASS",
+  "timestamp": "2026-03-02T23:50:06.341630",
+  "overall_gate": "FAIL",
   "summary": {
-    "total_components": 19,
+    "total_components": 23,
     "pass": 15,
-    "fail": 0,
-    "blocked": 0,
-    "skip": 1,
+    "fail": 1,
+    "blocked": 4,
+    "skip": 0,
     "na": 3,
-    "pass_rate": 93.8
+    "pass_rate": 75.0
   },
   "tiers": {
     "T1": {
@@ -120,6 +120,36 @@
           "gate": "PASS"
         },
         {
+          "name": "OperatingMode",
+          "module": "resilience::state",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "BLOCKED"
+        },
+        {
+          "name": "ResilienceManager",
+          "module": "resilience::manager",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "BLOCKED"
+        },
+        {
+          "name": "Signal/Level",
+          "module": "resilience::signal",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "BLOCKED"
+        },
+        {
           "name": "SlidingWindowPolicy",
           "module": "core::eviction::sliding_window",
           "maturity": "Stable",
@@ -138,6 +168,16 @@
           "failed": 0,
           "skipped": 0,
           "gate": "PASS"
+        },
+        {
+          "name": "Strategy",
+          "module": "resilience::strategy",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "BLOCKED"
         },
         {
           "name": "SystemMonitor",
@@ -213,11 +253,11 @@
           "name": "UnifiedBuffer",
           "module": "buffer::unified_buffer",
           "maturity": "Stable",
-          "total_tests": 4,
+          "total_tests": 1,
           "passed": 0,
-          "failed": 0,
-          "skipped": 4,
-          "gate": "SKIP"
+          "failed": 1,
+          "skipped": 0,
+          "gate": "FAIL"
         }
       ]
     }
@@ -236,6 +276,153 @@
       "passed": 85,
       "failed": 0,
       "pass_rate": 95.5
+    },
+    {
+      "date": "2026-03-02T23:37:47",
+      "total": 213,
+      "passed": 207,
+      "failed": 6,
+      "pass_rate": 97.2
+    },
+    {
+      "date": "2026-03-02T23:48:37",
+      "total": 87,
+      "passed": 85,
+      "failed": 2,
+      "pass_rate": 97.7
+    },
+    {
+      "date": "2026-03-02T23:48:42",
+      "total": 87,
+      "passed": 85,
+      "failed": 2,
+      "pass_rate": 97.7
+    },
+    {
+      "date": "2026-03-02T23:48:47",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:48:51",
+      "total": 86,
+      "passed": 85,
+      "failed": 1,
+      "pass_rate": 98.8
+    },
+    {
+      "date": "2026-03-02T23:48:56",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:01",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:05",
+      "total": 85,
+      "passed": 85,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-02T23:49:10",
+      "total": 85,
+      "passed": 85,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-02T23:49:14",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:19",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:24",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:28",
+      "total": 85,
+      "passed": 85,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-02T23:49:33",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:37",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:42",
+      "total": 85,
+      "passed": 85,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-02T23:49:47",
+      "total": 85,
+      "passed": 85,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-02T23:49:52",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:49:57",
+      "total": 88,
+      "passed": 85,
+      "failed": 3,
+      "pass_rate": 96.6
+    },
+    {
+      "date": "2026-03-02T23:50:01",
+      "total": 86,
+      "passed": 85,
+      "failed": 1,
+      "pass_rate": 98.8
+    },
+    {
+      "date": "2026-03-02T23:50:06",
+      "total": 86,
+      "passed": 85,
+      "failed": 1,
+      "pass_rate": 98.8
     }
   ]
 }

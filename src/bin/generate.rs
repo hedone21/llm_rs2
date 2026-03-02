@@ -539,8 +539,7 @@ fn main() -> anyhow::Result<()> {
 
                 for action in rm.poll() {
                     if let ResilienceAction::Evict { target_ratio } = &action {
-                        let target_len =
-                            (kv_caches[0].current_pos as f32 * target_ratio) as usize;
+                        let target_len = (kv_caches[0].current_pos as f32 * target_ratio) as usize;
                         let remove = kv_caches[0].current_pos.saturating_sub(target_len);
                         if remove > 0 {
                             for cache in kv_caches.iter_mut() {

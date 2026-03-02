@@ -9,11 +9,9 @@
 
 use std::sync::mpsc;
 
-use llm_rs2::resilience::{
-    InferenceContext, ResilienceAction, ResilienceManager, execute_action,
-};
 use llm_rs2::resilience::signal::{EnergyReason, Level, SystemSignal};
 use llm_rs2::resilience::state::OperatingMode;
+use llm_rs2::resilience::{InferenceContext, ResilienceAction, ResilienceManager, execute_action};
 
 // ── Helpers ───────────────────────────────────────────────
 
@@ -53,15 +51,23 @@ fn test_resilience_eviction_flow() {
     );
 
     let actions = mgr.poll();
-    assert!(!actions.is_empty(), "Should produce actions for Critical memory");
+    assert!(
+        !actions.is_empty(),
+        "Should produce actions for Critical memory"
+    );
 
     // Find the Evict action
-    let evict = actions.iter().find(|a| matches!(a, ResilienceAction::Evict { .. }));
+    let evict = actions
+        .iter()
+        .find(|a| matches!(a, ResilienceAction::Evict { .. }));
     assert!(evict.is_some(), "Should contain an Evict action");
 
     if let Some(ResilienceAction::Evict { target_ratio }) = evict {
-        assert!(*target_ratio > 0.0 && *target_ratio < 1.0,
-            "target_ratio should be between 0 and 1, got {}", target_ratio);
+        assert!(
+            *target_ratio > 0.0 && *target_ratio < 1.0,
+            "target_ratio should be between 0 and 1, got {}",
+            target_ratio
+        );
 
         // Simulate KV cache eviction (like generate.rs does)
         let current_pos: usize = 500;
@@ -70,7 +76,10 @@ fn test_resilience_eviction_flow() {
         assert!(remove > 0, "Should remove some tokens");
 
         let new_pos = current_pos - remove;
-        assert!(new_pos < current_pos, "Position should decrease after eviction");
+        assert!(
+            new_pos < current_pos,
+            "Position should decrease after eviction"
+        );
     }
 }
 
@@ -99,7 +108,12 @@ fn test_resilience_throttle_flow() {
     let mut throttle_delay_ms = 0u64;
     let mut suspended = false;
     let mut reject_new = false;
-    let mut ctx = make_ctx(&mut num_tokens, &mut throttle_delay_ms, &mut suspended, &mut reject_new);
+    let mut ctx = make_ctx(
+        &mut num_tokens,
+        &mut throttle_delay_ms,
+        &mut suspended,
+        &mut reject_new,
+    );
 
     for action in &actions {
         if !matches!(action, ResilienceAction::Evict { .. }) {
@@ -107,7 +121,11 @@ fn test_resilience_throttle_flow() {
         }
     }
 
-    assert!(throttle_delay_ms > 0, "Throttle delay should be set, got {}", throttle_delay_ms);
+    assert!(
+        throttle_delay_ms > 0,
+        "Throttle delay should be set, got {}",
+        throttle_delay_ms
+    );
     assert!(!suspended, "Should not be suspended on Warning");
 }
 
@@ -136,13 +154,21 @@ fn test_resilience_suspend_flow() {
     let mut throttle_delay_ms = 0u64;
     let mut suspended = false;
     let mut reject_new = false;
-    let mut ctx = make_ctx(&mut num_tokens, &mut throttle_delay_ms, &mut suspended, &mut reject_new);
+    let mut ctx = make_ctx(
+        &mut num_tokens,
+        &mut throttle_delay_ms,
+        &mut suspended,
+        &mut reject_new,
+    );
 
     for action in &actions {
         execute_action(action, &mut ctx);
     }
 
-    assert!(suspended, "Should be suspended after Emergency energy signal");
+    assert!(
+        suspended,
+        "Should be suspended after Emergency energy signal"
+    );
 }
 
 // ── Test: Disabled resilience is noop ────────────────────
@@ -160,7 +186,10 @@ fn test_resilience_disabled_noop() {
         throttle_delay_ms = 999;
     }
 
-    assert_eq!(throttle_delay_ms, 0, "Disabled resilience should not affect state");
+    assert_eq!(
+        throttle_delay_ms, 0,
+        "Disabled resilience should not affect state"
+    );
 }
 
 // ── Test: RestoreDefaults clears constraints ─────────────
@@ -188,7 +217,12 @@ fn test_resilience_restore_defaults_flow() {
     let mut reject_new = false;
 
     {
-        let mut ctx = make_ctx(&mut num_tokens, &mut throttle_delay_ms, &mut suspended, &mut reject_new);
+        let mut ctx = make_ctx(
+            &mut num_tokens,
+            &mut throttle_delay_ms,
+            &mut suspended,
+            &mut reject_new,
+        );
         for action in &actions {
             if !matches!(action, ResilienceAction::Evict { .. }) {
                 execute_action(action, &mut ctx);
@@ -210,13 +244,21 @@ fn test_resilience_restore_defaults_flow() {
 
     let actions = mgr.poll();
     {
-        let mut ctx = make_ctx(&mut num_tokens, &mut throttle_delay_ms, &mut suspended, &mut reject_new);
+        let mut ctx = make_ctx(
+            &mut num_tokens,
+            &mut throttle_delay_ms,
+            &mut suspended,
+            &mut reject_new,
+        );
         for action in &actions {
             execute_action(action, &mut ctx);
         }
     }
 
-    assert_eq!(throttle_delay_ms, 0, "RestoreDefaults should clear throttle");
+    assert_eq!(
+        throttle_delay_ms, 0,
+        "RestoreDefaults should clear throttle"
+    );
     assert!(!reject_new, "RestoreDefaults should clear reject_new");
 }
 
@@ -259,14 +301,24 @@ fn test_resilience_limit_tokens_takes_minimum() {
     let mut reject_new = false;
 
     {
-        let mut ctx = make_ctx(&mut num_tokens, &mut throttle_delay_ms, &mut suspended, &mut reject_new);
+        let mut ctx = make_ctx(
+            &mut num_tokens,
+            &mut throttle_delay_ms,
+            &mut suspended,
+            &mut reject_new,
+        );
         execute_action(&ResilienceAction::LimitTokens { max_tokens: 100 }, &mut ctx);
     }
     assert_eq!(num_tokens, 100);
 
     // Applying a higher limit should not increase
     {
-        let mut ctx = make_ctx(&mut num_tokens, &mut throttle_delay_ms, &mut suspended, &mut reject_new);
+        let mut ctx = make_ctx(
+            &mut num_tokens,
+            &mut throttle_delay_ms,
+            &mut suspended,
+            &mut reject_new,
+        );
         execute_action(&ResilienceAction::LimitTokens { max_tokens: 300 }, &mut ctx);
     }
     assert_eq!(num_tokens, 100, "Should keep the lower limit");

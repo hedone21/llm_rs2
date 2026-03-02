@@ -335,6 +335,7 @@ mod tests {
         // Simple case: Strid = head_dim (Contiguous row major)
         let stride = head_dim;
 
+        #[allow(non_snake_case)]
         fn causal_naive(q: &[f32], k: &[f32], v: &[f32], out: &mut [f32], N: usize, D: usize) {
             let scale = 1.0 / (D as f32).sqrt();
             for i in 0..N {
