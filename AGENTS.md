@@ -73,6 +73,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 ## Workflow Rules
 
 - **Auto-commit on completion**: When finishing a task, automatically commit the changes without asking. Do not leave uncommitted work.
+- **Desktop notification on completion**: After completing a task, send a desktop notification via `notify-send "Antigravity" "<task summary>"` so the user knows work is done.
 
 ## Profiling & Benchmarks
 
