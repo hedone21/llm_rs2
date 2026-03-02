@@ -17,6 +17,11 @@ use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
+#[cfg(feature = "resilience")]
+use llm_rs2::resilience::{
+    DbusListener, InferenceContext, ResilienceAction, ResilienceManager, execute_action,
+};
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -85,6 +90,10 @@ struct Args {
     /// Target ratio of cache to keep when evicting (0.1 to 0.99)
     #[arg(long, default_value_t = 0.75)]
     eviction_target_ratio: f32,
+
+    /// Enable D-Bus resilience manager for adaptive inference
+    #[arg(long, default_value_t = false)]
+    enable_resilience: bool,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -182,7 +191,8 @@ fn main() -> anyhow::Result<()> {
         .build_global()
         .unwrap();
 
-    let args = Args::parse();
+    #[allow(unused_mut)]
+    let mut args = Args::parse();
     let model_path = &args.model_path;
 
     // 1. Setup
@@ -279,7 +289,21 @@ fn main() -> anyhow::Result<()> {
         kv_caches.push(KVCache::new(k, v, max_seq_len));
     }
 
-    // 5. Inference Loop
+    // 5. Resilience Manager (optional)
+    #[cfg(feature = "resilience")]
+    let mut resilience_manager = if args.enable_resilience {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let listener = DbusListener::new(tx);
+        let _listener_handle = listener.spawn();
+        eprintln!("[Resilience] Manager enabled — listening for D-Bus signals");
+        Some(ResilienceManager::new(rx))
+    } else {
+        None
+    };
+    #[cfg(feature = "resilience")]
+    let mut throttle_delay_ms: u64 = 0;
+
+    // 6. Inference Loop
     let mut tokens = input_ids.clone();
     let mut start_pos = 0;
     let vocab_size = model.config.vocab_size;
@@ -499,6 +523,55 @@ fn main() -> anyhow::Result<()> {
                 use_gpu_attn: args.gpu_attn,
                 cache_manager: cm_ref,
             })?;
+
+            // ── Resilience checkpoint ─────────────────────────
+            #[cfg(feature = "resilience")]
+            if let Some(rm) = &mut resilience_manager {
+                let mut suspended = false;
+                let mut reject_new = false;
+                let mut num_tokens = args.num_tokens;
+                let mut ctx = InferenceContext {
+                    max_tokens: &mut num_tokens,
+                    throttle_delay_ms: &mut throttle_delay_ms,
+                    suspended: &mut suspended,
+                    reject_new: &mut reject_new,
+                };
+
+                for action in rm.poll() {
+                    if let ResilienceAction::Evict { target_ratio } = &action {
+                        let target_len =
+                            (kv_caches[0].current_pos as f32 * target_ratio) as usize;
+                        let remove = kv_caches[0].current_pos.saturating_sub(target_len);
+                        if remove > 0 {
+                            for cache in kv_caches.iter_mut() {
+                                if let Err(e) = cache.prune_prefix(remove) {
+                                    eprintln!("[Resilience] Eviction error: {}", e);
+                                }
+                            }
+                            eprintln!(
+                                "[Resilience] Evicted {} tokens (pos: {} → {})",
+                                remove,
+                                kv_caches[0].current_pos + remove,
+                                kv_caches[0].current_pos
+                            );
+                        }
+                    } else {
+                        execute_action(&action, &mut ctx);
+                    }
+                }
+
+                args.num_tokens = num_tokens;
+
+                if suspended {
+                    eprintln!("\n[Resilience] Inference suspended by system signal");
+                    break;
+                }
+
+                if throttle_delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
+                }
+            }
+            // ── End Resilience checkpoint ─────────────────────
 
             // Sample
             // Read logits
