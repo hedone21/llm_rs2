@@ -77,8 +77,8 @@ impl Backend for CpuBackendCommon {
         &self,
         a: &Tensor,
         b: &Tensor,
-        rows: usize,
-        cols: usize,
+        _rows: usize,
+        _cols: usize,
         out: &mut Tensor,
     ) -> Result<()> {
         // Reuse matmul_transposed logic as implemented in CPU backend
@@ -807,29 +807,12 @@ impl CpuBackendCommon {
                     let j = idx % n;
 
                     let b_offset = j * nb_k;
-                    let b_row_node = unsafe { b.as_ptr() as *const BlockQ4_0 };
+                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
                     let b_row_ptr = unsafe { b_row_node.add(b_offset) };
 
                     let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
 
                     let mut sum = 0.0;
-                    unsafe {
-                        // We need to call self.vec_dot...
-                        // But self is &CpuBackendCommon. Sync.
-                        // However, vec_dot is method.
-                        // Since we are in closure, we capture &self.
-                        // But to call method on self, we need type info.
-                        // Just implement the loop inline or use Self::vec_dot syntax if possible.
-                        // Or assume self is captured.
-                        // Actually, vec_dot_q4_0_q8_0 is stateless (pure fn).
-                        // We can call it.
-
-                        // Re-implementing explicitly to avoid 'self' borrow issues if any,
-                        // although 'self' is shared ref so it should be fine.
-                        // But wait, the function is pub now.
-                        // Let's call it.
-                        // We need to access 'self' inside parallel closure.
-                    }
                     // Since self is &CpuBackendCommon, it is Copy? No. Reference is Copy.
                     // But we can't call methods easily if borrow checker complains.
                     // Let's rely on the method being available.
@@ -876,7 +859,7 @@ impl CpuBackendCommon {
     }
 
     pub fn quantize_row_q8_0(&self, x: &[f32], y: &mut [crate::core::quant::BlockQ8_0], k: usize) {
-        use crate::core::quant::{BlockQ8_0, QK8_0};
+        use crate::core::quant::QK8_0;
         assert!(k % QK8_0 == 0);
         let nb = k / QK8_0;
 
@@ -906,7 +889,7 @@ impl CpuBackendCommon {
         vx: *const BlockQ4_0,
         vy: *const crate::core::quant::BlockQ8_0,
     ) {
-        use crate::core::quant::{BlockQ8_0, QK8_0};
+        use crate::core::quant::QK8_0;
         let nb = n / QK8_0;
         let mut sumf = 0.0;
 

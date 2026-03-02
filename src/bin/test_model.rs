@@ -1,6 +1,4 @@
 use llm_rs2::backend::cpu::CpuBackend;
-use llm_rs2::core::backend::Backend;
-use llm_rs2::core::memory::Memory;
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::llama::llama_model::LlamaModel;
 use std::sync::Arc;

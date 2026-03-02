@@ -290,8 +290,8 @@ fn main() -> anyhow::Result<()> {
         max_seq_len, args.temperature, args.top_p, args.top_k
     );
     let start_time = std::time::Instant::now();
-    let mut last_token_time = start_time;
-    let mut ttft_ms = 0.0;
+    let mut _last_token_time = start_time;
+    let mut _ttft_ms = 0.0;
     let mut tbt_values = Vec::new();
 
     // 4.5 Setup CacheManager
@@ -416,8 +416,8 @@ fn main() -> anyhow::Result<()> {
 
         let next_token_id = sample(&mut last_logits, &tokens, vocab_size, &args);
 
-        ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
-        last_token_time = std::time::Instant::now();
+        _ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        _last_token_time = std::time::Instant::now();
 
         tokens.push(next_token_id);
         start_pos += process_len;
@@ -465,12 +465,12 @@ fn main() -> anyhow::Result<()> {
         // Streaming setup
         use std::io::Write;
         let mut stdout = std::io::stdout();
-        let mut printed_len = 0;
+        let mut _printed_len = 0;
 
         // Print initial tokens (prompt + first generated)
         let initial_text = tokenizer.decode(&tokens, true).unwrap_or_default();
         print!("{}", initial_text);
-        printed_len = initial_text.len();
+        _printed_len = initial_text.len();
         stdout.flush().ok();
 
         // Generation loop
@@ -487,7 +487,7 @@ fn main() -> anyhow::Result<()> {
             }
             let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
 
-            let eviction_result = model.forward_into(LlamaModelForwardArgs {
+            let _eviction_result = model.forward_into(LlamaModelForwardArgs {
                 input_tokens: &gen_input_tensor,
                 start_pos,
                 kv_caches: &mut kv_caches,
@@ -512,10 +512,10 @@ fn main() -> anyhow::Result<()> {
             let next_token_id = sample(&mut logits_cpu, &tokens, vocab_size, &args);
 
             let now = std::time::Instant::now();
-            let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
+            let tbt = now.duration_since(_last_token_time).as_secs_f64() * 1000.0;
             tbt_values.push(tbt);
 
-            last_token_time = now;
+            _last_token_time = now;
             tokens.push(next_token_id);
 
             // start_pos tracks the LOGICAL position for RoPE encoding.
@@ -527,21 +527,21 @@ fn main() -> anyhow::Result<()> {
 
             // Streaming print
             let current_text = tokenizer.decode(&tokens, true).unwrap_or_default();
-            if current_text.len() > printed_len {
+            if current_text.len() > _printed_len {
                 // Check if we are at a valid char boundary.
                 // If not (e.g. we are in the middle of a multi-byte char sequence from previous partial decode?),
                 // we might need to be careful.
                 // However, tokenizer.decode should return valid strings.
-                // The issue is likely that `printed_len` (bytes) might not align with `current_text` if decoding changed slightly?
-                // Or `printed_len` was set from a previous string.
+                // The issue is likely that `_printed_len` (bytes) might not align with `current_text` if decoding changed slightly?
+                // Or `_printed_len` was set from a previous string.
 
                 // Safe slicing:
-                if let Some(substring) = current_text.get(printed_len..) {
+                if let Some(substring) = current_text.get(_printed_len..) {
                     print!("{}", substring);
                     stdout.flush().ok();
-                    printed_len = current_text.len();
+                    _printed_len = current_text.len();
                 } else {
-                    // Verify if printed_len is valid.
+                    // Verify if _printed_len is valid.
                     // Often tokenizers re-decode slightly differently or we accumulate.
                     // A safer way is: just print what's new from this round's decode, but we need to track bytes.
                     // Let's just catch the case where we can't slice.
@@ -559,7 +559,7 @@ fn main() -> anyhow::Result<()> {
     println!("[Profile] Event: End");
     // let full_text = tokenizer.decode(&tokens[input_ids.len()..], true).map_err(|e| anyhow::anyhow!(e))?;
     // println!("Generated: {}", full_text);
-    println!("TTFT: {:.2} ms", ttft_ms);
+    println!("TTFT: {:.2} ms", _ttft_ms);
     if !tbt_values.is_empty() {
         let avg_tbt: f64 = tbt_values.iter().sum::<f64>() / tbt_values.len() as f64;
         println!(

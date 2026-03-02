@@ -2,7 +2,7 @@
 use crate::backend::cpu::common::CpuBackendCommon;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
-use crate::core::quant::{BlockQ4_0, BlockQ4_1, BlockQ8_0, QK4_0, QK4_1, QK8_0};
+use crate::core::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
 use crate::core::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
@@ -598,6 +598,7 @@ impl CpuBackendAVX2 {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn matmul_transposed_q4_0_serial(
         &self,
         a: &Tensor,

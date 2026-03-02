@@ -47,7 +47,7 @@ impl KVCache {
         Ok(())
     }
 
-    pub fn get_view(&self, seq_len: usize) -> (Tensor, Tensor) {
+    pub fn get_view(&self, _seq_len: usize) -> (Tensor, Tensor) {
         // Return view of the active cache for the current step + history
         // Actually KVCache is passed to attention. Attention usually needs all previous tokens.
         // For simple testing, we might not need to slice *tensor objects* explicitly struct-wise if the kernel knows `current_pos`.

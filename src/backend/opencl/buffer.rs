@@ -1,11 +1,9 @@
 use crate::core::buffer::{Buffer, DType};
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use ocl::core::Mem;
-use ocl::flags::MapFlags;
-use ocl::{Buffer as OclBuffer, Queue, flags};
+use ocl::{Buffer as OclBuffer, Queue};
 use std::any::Any;
 use std::ptr;
-use std::sync::Arc;
 
 // unsafe impl Send for OpenCLBuffer {} // OclBuffer is Send/Sync usually?
 // Check ocl docs. OclBuffer is Send/Sync.

@@ -25,6 +25,7 @@ struct Args {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum OpType {
+    #[allow(dead_code)]
     MatMul,
     MatMulTransposed,
     MatMulSlice,
@@ -48,6 +49,7 @@ struct TestResult {
     backend: String,
     duration: Duration,
     error: f32,
+    #[allow(dead_code)]
     msg: String,
 }
 
@@ -493,7 +495,6 @@ fn perform_matmul_test(
     let c_data: Vec<f32> = if is_opencl {
         #[cfg(feature = "opencl")]
         {
-            use llm_rs2::core::buffer::Buffer;
             let buf = c_gpu.buffer();
             if let Some(cl_buf) = buf
                 .as_any()

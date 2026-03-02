@@ -1,6 +1,6 @@
 use llm_rs2::core::quant::{BlockQ4_0, BlockQ8_0, QK4_0, QK8_0};
 use rand::Rng;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use llm_rs2::backend::cpu::common::CpuBackendCommon;
 #[cfg(target_arch = "aarch64")]

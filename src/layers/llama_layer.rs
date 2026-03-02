@@ -136,7 +136,7 @@ impl LlamaLayer {
 
             let (q_data, k_data, v_data, out_ptr) = if is_opencl {
                 // Helper to read tensor to F32 vec, handling Dequantization if needed
-                let mut read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
+                let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                     if t.dtype() == DType::Q4_0 {
                         use crate::core::quant::{BlockQ4_0, QK4_0};
                         let numel = t.numel();

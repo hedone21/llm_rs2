@@ -2,7 +2,7 @@ use clap::Parser;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::backend::opencl::OpenCLBackend;
 use llm_rs2::core::backend::Backend;
-use llm_rs2::core::buffer::{Buffer, DType};
+use llm_rs2::core::buffer::DType;
 use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
@@ -191,7 +191,7 @@ fn main() -> anyhow::Result<()> {
 
     // Logits buffer (re-allocated if backend changes)
     let vocab_size = model.config.vocab_size;
-    let mut logits_buf = cpu_memory.alloc(vocab_size * 4, DType::F32)?;
+    let logits_buf = cpu_memory.alloc(vocab_size * 4, DType::F32)?;
     let mut logits = Tensor::new(
         Shape::new(vec![1, 1, vocab_size]),
         logits_buf,
@@ -261,8 +261,8 @@ fn main() -> anyhow::Result<()> {
     // === GENERATION ===
     println!("[Hybrid] decoding...");
     let hidden_size = model.config.hidden_size;
-    let mut x_gen = None; // Optimization tensors
-    let mut gen_ws = None;
+    let mut _x_gen = None; // Optimization tensors
+    let mut _gen_ws = None;
 
     // Helper to setup workspace for current backend
     let setup_workspace = |backend: &Arc<dyn Backend>,
@@ -293,8 +293,8 @@ fn main() -> anyhow::Result<()> {
 
     // Setup initial CPU workspace
     let (cpu_x_gen, cpu_ws) = setup_workspace(&cpu_backend, cpu_memory.as_ref())?;
-    x_gen = Some(cpu_x_gen);
-    gen_ws = Some(cpu_ws);
+    _x_gen = Some(cpu_x_gen);
+    _gen_ws = Some(cpu_ws);
 
     // Initial print
     print!(
@@ -314,16 +314,14 @@ fn main() -> anyhow::Result<()> {
             println!("\n\n[Hybrid] Switching to GPU at token {}...", start_pos);
 
             // 1. Migrate KV Cache
-            for (i, kv) in kv_caches.iter_mut().enumerate() {
+            for (_i, kv) in kv_caches.iter_mut().enumerate() {
                 // Read from CPU
                 let k_size = max_seq_len * kv_heads * head_dim * 4;
                 let mut k_data = vec![0u8; k_size];
                 let mut v_data = vec![0u8; k_size];
 
-                unsafe {
-                    cpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
-                    cpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
-                }
+                cpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
+                cpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
 
                 // Create CPU Tensor from data
                 let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
@@ -368,8 +366,8 @@ fn main() -> anyhow::Result<()> {
             );
 
             let (gpu_x_gen, gpu_ws) = setup_workspace(&gpu_backend, gpu_memory.as_ref())?;
-            x_gen = Some(gpu_x_gen);
-            gen_ws = Some(gpu_ws);
+            _x_gen = Some(gpu_x_gen);
+            _gen_ws = Some(gpu_ws);
 
             is_gpu = true;
             println!("[Hybrid] Switched to GPU successfully.");
@@ -406,8 +404,8 @@ fn main() -> anyhow::Result<()> {
                     cpu_memory.as_ref()
                 },
                 logits_out: &mut logits,
-                x_gen: x_gen.as_mut(),
-                workspace: gen_ws.as_mut(),
+                x_gen: _x_gen.as_mut(),
+                workspace: _gen_ws.as_mut(),
                 use_gpu_attn: is_gpu,
                 cache_manager: None,
             })?

@@ -72,7 +72,7 @@ impl Tensor {
     }
 
     // Operations delegated to backend
-    pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
+    pub fn matmul(&self, _other: &Tensor) -> Result<Tensor> {
         // Implementation would need an output tensor created via backend/memory
         // For now, this requires a way to allocate output.
         // We usually pass 'out' or create it.

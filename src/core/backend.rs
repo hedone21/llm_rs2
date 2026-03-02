@@ -103,7 +103,7 @@ pub trait Backend: Send + Sync {
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
-        let src_ptr = unsafe { t.buffer().as_ptr() as *const u8 };
+        let src_ptr = t.buffer().as_ptr() as *const u8;
         if src_ptr.is_null() {
             anyhow::bail!("Cannot read null buffer (not mapped)");
         }

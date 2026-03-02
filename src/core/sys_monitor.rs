@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::BufReader;
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryStats {
@@ -56,11 +56,11 @@ impl LinuxSystemMonitor {
 impl SystemMonitor for LinuxSystemMonitor {
     fn mem_stats(&self) -> Result<MemoryStats> {
         let file = File::open("/proc/meminfo")?;
-        let reader = BufReader::new(file);
+        let _reader = BufReader::new(file);
 
         // Read file into string for parsing (or stream parsing)
         // Since /proc/meminfo is small, reading to string is fine.
-        let mut content = String::new();
+        let _content = String::new();
         // We only need the first few lines essentially, but reading all is safe.
         // Actually BufReader is good.
         // Let's reuse the static parsing function to make it testable

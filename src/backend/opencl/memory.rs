@@ -8,6 +8,7 @@ use ocl::{Context, Queue};
 use std::sync::{Arc, Mutex};
 
 pub struct OpenCLMemory {
+    #[allow(dead_code)]
     context: Context,
     queue: Queue,
     used_memory: Mutex<usize>,
