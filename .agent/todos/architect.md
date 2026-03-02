@@ -6,7 +6,7 @@
 ---
 
 ## [P1] Resilience 시스템 generate.rs 통합 설계
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음
 - **Description**: Resilience Manager (D-Bus 기반 시스템 모니터링)를 generate.rs 메인 추론 루프에 통합하기 위한 설계. 신호 수신 → 의사결정 → 동작(백엔드 전환, 배치 축소, 캐시 정리) 흐름 정의. 스레드 모델, 에러 핸들링, fallback 전략 포함
