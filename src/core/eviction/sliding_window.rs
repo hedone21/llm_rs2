@@ -185,19 +185,19 @@ mod tests {
         // target=15, min_keep = 4+16=20, max_keep = 14
         // Wait, max_keep < min_keep -> min_keep is clamped to max_keep=14.
         // So keep=14.
-        let policy = SlidingWindowPolicy::new(10, 0); 
+        let policy = SlidingWindowPolicy::new(10, 0);
         let mut cache = make_cache_with_data(20);
-        // prune_count = 20 - 14 = 6. 
+        // prune_count = 20 - 14 = 6.
         // We prune from index 4 to 9. (6 tokens)
-        
+
         policy.evict(&mut cache, 5).unwrap();
         assert_eq!(cache.current_pos, 14);
 
-        // Verify data: position 0..3 should be protected 
+        // Verify data: position 0..3 should be protected
         let k_data = cache.k_buffer.as_slice::<f32>();
         assert_eq!(k_data[0], 1.0);
         assert_eq!(k_data[12], 4.0);
-        
+
         // position 4 should now be old position 10 (value=11.0)
         assert_eq!(k_data[16], 11.0);
     }
@@ -208,7 +208,7 @@ mod tests {
         let mut cache = make_cache_with_data(12);
         // min_keep = min(4+16=20, 8) = 8.
         // keep = 8. Removing 4 tokens (indices 4..7).
-        
+
         policy.evict(&mut cache, 6).unwrap();
         assert_eq!(cache.current_pos, 8);
 
@@ -234,5 +234,34 @@ mod tests {
     fn test_name() {
         let policy = SlidingWindowPolicy::new(10, 0);
         assert_eq!(policy.name(), "sliding_window");
+    }
+
+    #[test]
+    fn test_minimum_protected_prefix_enforced() {
+        // Even when constructed with prefix=0, 1, 2, 3, the internal value is .max(4) = 4
+        for input_prefix in 0..=3 {
+            let policy = SlidingWindowPolicy::new(10, input_prefix);
+            // Threshold for eviction is window_size + protected_prefix = 10 + 4 = 14
+            let mut cache = make_cache_with_data(14);
+            assert!(
+                !policy.should_evict(&cache, 0),
+                "prefix={}: 14 should NOT trigger eviction (threshold=14)",
+                input_prefix
+            );
+
+            cache.current_pos = 15;
+            assert!(
+                policy.should_evict(&cache, 0),
+                "prefix={}: 15 should trigger eviction (threshold=14)",
+                input_prefix
+            );
+        }
+
+        // prefix=5 stays as 5 (already >= 4)
+        let policy = SlidingWindowPolicy::new(10, 5);
+        let mut cache = make_cache_with_data(15);
+        assert!(!policy.should_evict(&cache, 0)); // 15 <= 10+5
+        cache.current_pos = 16;
+        assert!(policy.should_evict(&cache, 0)); // 16 > 15
     }
 }

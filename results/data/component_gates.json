@@ -1,0 +1,241 @@
+{
+  "timestamp": "2026-03-02T22:16:58.300353",
+  "overall_gate": "PASS",
+  "summary": {
+    "total_components": 19,
+    "pass": 15,
+    "fail": 0,
+    "blocked": 0,
+    "skip": 1,
+    "na": 3,
+    "pass_rate": 93.8
+  },
+  "tiers": {
+    "T1": {
+      "name": "Foundation",
+      "components": [
+        {
+          "name": "Buffer/DType",
+          "module": "core::buffer",
+          "maturity": "Stable",
+          "total_tests": 5,
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "Galloc",
+          "module": "memory::galloc",
+          "maturity": "Stable",
+          "total_tests": 3,
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "Quant",
+          "module": "core::quant",
+          "maturity": "Stable",
+          "total_tests": 6,
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "Shape",
+          "module": "core::shape",
+          "maturity": "Stable",
+          "total_tests": 3,
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "SharedBuffer",
+          "module": "buffer::shared_buffer",
+          "maturity": "Stable",
+          "total_tests": 5,
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "Tensor",
+          "module": "core::tensor",
+          "maturity": "Stable",
+          "total_tests": 6,
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        }
+      ]
+    },
+    "T2": {
+      "name": "Algorithm",
+      "components": [
+        {
+          "name": "Attention",
+          "module": "layers::attention",
+          "maturity": "Stable",
+          "total_tests": 5,
+          "passed": 5,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "CacheManager",
+          "module": "core::cache_manager",
+          "maturity": "Stable",
+          "total_tests": 7,
+          "passed": 7,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "KVCache",
+          "module": "core::kv_cache",
+          "maturity": "Stable",
+          "total_tests": 8,
+          "passed": 8,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "NoEvictionPolicy",
+          "module": "core::eviction::no_eviction",
+          "maturity": "Stable",
+          "total_tests": 3,
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "SlidingWindowPolicy",
+          "module": "core::eviction::sliding_window",
+          "maturity": "Stable",
+          "total_tests": 7,
+          "passed": 7,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "SnapKVPolicy",
+          "module": "core::eviction::snap_kv",
+          "maturity": "Stub",
+          "total_tests": 6,
+          "passed": 6,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "SystemMonitor",
+          "module": "core::sys_monitor",
+          "maturity": "Stable",
+          "total_tests": 3,
+          "passed": 3,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        }
+      ]
+    },
+    "T3": {
+      "name": "Backend",
+      "components": [
+        {
+          "name": "CpuBackend",
+          "module": "backend::cpu",
+          "maturity": "Stable",
+          "total_tests": 14,
+          "passed": 14,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "OpenCLBackend",
+          "module": "backend::opencl",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "N/A"
+        }
+      ]
+    },
+    "T4": {
+      "name": "Integration",
+      "components": [
+        {
+          "name": "LayerWorkspace",
+          "module": "layers::workspace",
+          "maturity": "Stable",
+          "total_tests": 4,
+          "passed": 4,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "PASS"
+        },
+        {
+          "name": "LlamaLayer",
+          "module": "layers::llama_layer",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "N/A"
+        },
+        {
+          "name": "LlamaModel",
+          "module": "models::llama",
+          "maturity": "Stable",
+          "total_tests": 0,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 0,
+          "gate": "N/A"
+        },
+        {
+          "name": "UnifiedBuffer",
+          "module": "buffer::unified_buffer",
+          "maturity": "Stable",
+          "total_tests": 4,
+          "passed": 0,
+          "failed": 0,
+          "skipped": 4,
+          "gate": "SKIP"
+        }
+      ]
+    }
+  },
+  "history": [
+    {
+      "date": "2026-03-02T22:07:45",
+      "total": 70,
+      "passed": 66,
+      "failed": 0,
+      "pass_rate": 94.3
+    },
+    {
+      "date": "2026-03-02T22:16:58",
+      "total": 89,
+      "passed": 85,
+      "failed": 0,
+      "pass_rate": 95.5
+    }
+  ]
+}

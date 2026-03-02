@@ -184,4 +184,29 @@ mod tests {
     fn test_name() {
         assert_eq!(SnapKVPolicy::new(5, 0.5, 0).name(), "snap_kv");
     }
+
+    #[test]
+    fn test_keep_ratio_clamping() {
+        // keep_ratio > 1.0 should be clamped to 1.0
+        let policy = SnapKVPolicy::new(5, 2.0, 0);
+        let cache = make_cache(20);
+        // keep = 20 * 1.0 = 20, effective = 20 + 4 = 24, 20 > 24 + 5? false
+        assert!(!policy.should_evict(&cache, 0));
+
+        // keep_ratio < 0.0 should be clamped to 0.0
+        let policy_neg = SnapKVPolicy::new(5, -1.0, 0);
+        let cache2 = make_cache(20);
+        // keep = 20 * 0.0 = 0, effective = 0 + 4 = 4, 20 > 4 + 5 = 9 → true
+        assert!(policy_neg.should_evict(&cache2, 0));
+    }
+
+    #[test]
+    fn test_evict_below_threshold_noop() {
+        let policy = SnapKVPolicy::new(5, 0.9, 0);
+        let mut cache = make_cache(10);
+        // max_keep = 10 * 0.9 = 9 + 4 = 13
+        // current=10 <= keep → no-op
+        policy.evict(&mut cache, 10).unwrap();
+        assert_eq!(cache.current_pos, 10); // unchanged
+    }
 }

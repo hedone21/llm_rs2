@@ -71,7 +71,10 @@ impl CacheManager {
 
         // Check if any cache needs eviction
         let representative_cache = &caches[0];
-        if !self.policy.should_evict(representative_cache, mem_available) {
+        if !self
+            .policy
+            .should_evict(representative_cache, mem_available)
+        {
             // Also check memory threshold
             if mem_available >= self.threshold_bytes {
                 return Ok(EvictionResult {
@@ -96,8 +99,7 @@ impl CacheManager {
         }
 
         log::info!(
-            "[CacheManager] Memory pressure detected (available: {} MB, threshold: {} MB). "
-                ,
+            "[CacheManager] Memory pressure detected (available: {} MB, threshold: {} MB). ",
             mem_available / (1024 * 1024),
             self.threshold_bytes / (1024 * 1024),
         );
@@ -258,5 +260,59 @@ mod tests {
             0.75,
         );
         assert_eq!(cm.policy_name(), "sliding_window");
+    }
+
+    /// Mock monitor that always returns an error
+    struct ErrorMonitor;
+    impl SystemMonitor for ErrorMonitor {
+        fn mem_stats(&self) -> Result<MemoryStats> {
+            Err(anyhow::anyhow!("simulated monitor failure"))
+        }
+    }
+
+    #[test]
+    fn test_monitor_error_skips_eviction() {
+        let cm = CacheManager::new(
+            Box::new(SlidingWindowPolicy::new(10, 0)),
+            Box::new(ErrorMonitor),
+            256 * 1024 * 1024,
+            0.75,
+        );
+        let mut caches = make_caches(4, 50);
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        // Should not evict when monitor fails
+        assert!(!result.evicted);
+        assert_eq!(result.new_pos, 50);
+    }
+
+    #[test]
+    fn test_target_ratio_clamping() {
+        // target_ratio below 0.1 should be clamped to 0.1
+        let cm = CacheManager::new(
+            Box::new(SlidingWindowPolicy::new(10, 0)),
+            Box::new(MockMonitor { available: 10 }),
+            256 * 1024 * 1024,
+            0.01, // should clamp to 0.1
+        );
+        let mut caches = make_caches(1, 50);
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        // target = 50 * 0.1 = 5, but sliding_window max_keep = 14
+        // So keep = clamp(5, min_keep, 14)
+        assert!(result.evicted);
+        // The result should have new_pos > 0 (at least 1)
+        assert!(caches[0].current_pos > 0);
+
+        // target_ratio above 0.99 should be clamped to 0.99
+        let cm2 = CacheManager::new(
+            Box::new(SlidingWindowPolicy::new(10, 0)),
+            Box::new(MockMonitor { available: 10 }),
+            256 * 1024 * 1024,
+            5.0, // should clamp to 0.99
+        );
+        let mut caches2 = make_caches(1, 50);
+        let result2 = cm2.maybe_evict(&mut caches2).unwrap();
+        // target = 50 * 0.99 = 49, but max_keep=14, so keep=14
+        // Since eviction still happens (50 > 14 because threshold triggers)
+        assert!(result2.evicted);
     }
 }

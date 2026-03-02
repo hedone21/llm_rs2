@@ -120,37 +120,122 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-02-22 22:22:44_
+_Last updated: 2026-03-02 22:16:58_
 
 ### Quality Gate Summary
 
 | Component | Tier | Maturity | Tests | Passed | Skipped | Gate |
 |:----------|:-----|:---------|------:|-------:|--------:|:-----|
-| Buffer/DType | T1 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| Galloc | T1 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| Quant | T1 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| Shape | T1 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| SharedBuffer | T1 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| Tensor | T1 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| Attention | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| CacheManager | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| KVCache | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| NoEvictionPolicy | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| SlidingWindowPolicy | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| SnapKVPolicy | T2 | Stub | 0 | 0 | 0 | **BLOCKED** |
-| SystemMonitor | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
-| CpuBackend | T3 | Stable | 0 | 0 | 0 | N/A |
+| Buffer/DType | T1 | Stable | 5 | 5 | 0 | PASS |
+| Galloc | T1 | Stable | 3 | 3 | 0 | PASS |
+| Quant | T1 | Stable | 6 | 6 | 0 | PASS |
+| Shape | T1 | Stable | 3 | 3 | 0 | PASS |
+| SharedBuffer | T1 | Stable | 5 | 5 | 0 | PASS |
+| Tensor | T1 | Stable | 6 | 6 | 0 | PASS |
+| Attention | T2 | Stable | 5 | 5 | 0 | PASS |
+| CacheManager | T2 | Stable | 7 | 7 | 0 | PASS |
+| KVCache | T2 | Stable | 8 | 8 | 0 | PASS |
+| NoEvictionPolicy | T2 | Stable | 3 | 3 | 0 | PASS |
+| SlidingWindowPolicy | T2 | Stable | 7 | 7 | 0 | PASS |
+| SnapKVPolicy | T2 | Stub | 6 | 6 | 0 | PASS |
+| SystemMonitor | T2 | Stable | 3 | 3 | 0 | PASS |
+| CpuBackend | T3 | Stable | 14 | 14 | 0 | PASS |
 | OpenCLBackend | T3 | Stable | 0 | 0 | 0 | N/A |
-| LayerWorkspace | T4 | Stable | 0 | 0 | 0 | N/A |
+| LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 0 | 0 | 0 | N/A |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
 | UnifiedBuffer | T4 | Stable | 4 | 0 | 4 | SKIP |
-| **Overall** | | | **4** | **0** | **4** | **FAIL** |
+| **Overall** | | | **89** | **85** | **4** | PASS |
 
 ### Test Details
 
 | Test | Component | Result |
 |:-----|:----------|:------:|
+| `test_buffer_default_impls` | Buffer/DType | PASS |
+| `test_buffer_metadata_accessors` | Buffer/DType | PASS |
+| `test_dtype_all_variant_sizes` | Buffer/DType | PASS |
+| `test_dtype_equality_and_copy` | Buffer/DType | PASS |
+| `test_dtype_size` | Buffer/DType | PASS |
+| `test_galloc_allocation` | Galloc | PASS |
+| `test_galloc_used_memory` | Galloc | PASS |
+| `test_galloc_zero_size_allocation` | Galloc | PASS |
+| `test_block_q4_0_dequantize` | Quant | PASS |
+| `test_block_q4_0_zero_scale` | Quant | PASS |
+| `test_block_q4_1_dequantize` | Quant | PASS |
+| `test_block_q4_1_zero_scale` | Quant | PASS |
+| `test_block_q8_0_dequantize` | Quant | PASS |
+| `test_struct_sizes` | Quant | PASS |
+| `test_empty_shape_scalar` | Shape | PASS |
+| `test_one_dimensional_empty` | Shape | PASS |
+| `test_shape_creation_and_metadata` | Shape | PASS |
+| `test_cl_mem_with_feature_opencl` | SharedBuffer | PASS |
+| `test_shared_buffer_creation` | SharedBuffer | PASS |
+| `test_shared_buffer_mutability_semantics` | SharedBuffer | PASS |
+| `test_shared_buffer_zero_size` | SharedBuffer | PASS |
+| `test_sync_device` | SharedBuffer | PASS |
+| `test_tensor_as_slice_bounds` | Tensor | PASS |
+| `test_tensor_clone_shares_buffer` | Tensor | PASS |
+| `test_tensor_creation_and_metadata` | Tensor | PASS |
+| `test_tensor_matmul_unimplemented` | Tensor | PASS |
+| `test_tensor_to_device` | Tensor | PASS |
+| `test_tensor_to_device_different_backend` | Tensor | PASS |
+| `test_flash_attention_decode_causal_mask` | Attention | PASS |
+| `test_flash_attention_single_token` | Attention | PASS |
+| `test_flash_attention_vs_naive` | Attention | PASS |
+| `test_identity_qk_reproduces_v` | Attention | PASS |
+| `test_naive_attention_sanity` | Attention | PASS |
+| `test_empty_caches` | CacheManager | PASS |
+| `test_eviction_across_all_layers` | CacheManager | PASS |
+| `test_monitor_error_skips_eviction` | CacheManager | PASS |
+| `test_no_eviction_with_plenty_memory` | CacheManager | PASS |
+| `test_policy_name` | CacheManager | PASS |
+| `test_sliding_window_with_memory_pressure` | CacheManager | PASS |
+| `test_target_ratio_clamping` | CacheManager | PASS |
+| `test_cache_creation` | KVCache | PASS |
+| `test_get_view` | KVCache | PASS |
+| `test_memory_usage_bytes` | KVCache | PASS |
+| `test_prune_prefix_all` | KVCache | PASS |
+| `test_prune_prefix_basic` | KVCache | PASS |
+| `test_prune_prefix_over_count` | KVCache | PASS |
+| `test_prune_prefix_zero` | KVCache | PASS |
+| `test_update_overflow` | KVCache | PASS |
+| `test_no_eviction_evict_is_noop` | NoEvictionPolicy | PASS |
+| `test_no_eviction_name` | NoEvictionPolicy | PASS |
+| `test_no_eviction_never_evicts` | NoEvictionPolicy | PASS |
+| `test_evict_no_action_needed` | SlidingWindowPolicy | PASS |
+| `test_evict_no_prefix` | SlidingWindowPolicy | PASS |
+| `test_evict_with_protected_prefix` | SlidingWindowPolicy | PASS |
+| `test_minimum_protected_prefix_enforced` | SlidingWindowPolicy | PASS |
+| `test_name` | SlidingWindowPolicy | PASS |
+| `test_should_evict` | SlidingWindowPolicy | PASS |
+| `test_should_evict_with_prefix` | SlidingWindowPolicy | PASS |
+| `test_evict_below_threshold_noop` | SnapKVPolicy | PASS |
+| `test_evict_stub_falls_back_to_sliding` | SnapKVPolicy | PASS |
+| `test_evict_with_prefix` | SnapKVPolicy | PASS |
+| `test_keep_ratio_clamping` | SnapKVPolicy | PASS |
+| `test_name` | SnapKVPolicy | PASS |
+| `test_should_evict` | SnapKVPolicy | PASS |
+| `test_linux_monitor_parsing` | SystemMonitor | PASS |
+| `test_parse_meminfo_bad_format_error` | SystemMonitor | PASS |
+| `test_parse_meminfo_missing_field_error` | SystemMonitor | PASS |
+| `test_add_assign_oracle` | CpuBackend | PASS |
+| `test_cast_f32_to_f16_oracle` | CpuBackend | PASS |
+| `test_copy_from_identity` | CpuBackend | PASS |
+| `test_gather_oracle` | CpuBackend | PASS |
+| `test_matmul_slice_f32_oracle` | CpuBackend | PASS |
+| `test_matmul_transposed_f32_large_oracle` | CpuBackend | PASS |
+| `test_matmul_transposed_f32_oracle` | CpuBackend | PASS |
+| `test_matmul_transposed_q4_0_oracle` | CpuBackend | PASS |
+| `test_matmul_transposed_q4_1_oracle` | CpuBackend | PASS |
+| `test_rms_norm_oracle` | CpuBackend | PASS |
+| `test_rope_oracle` | CpuBackend | PASS |
+| `test_scale_oracle` | CpuBackend | PASS |
+| `test_silu_mul_oracle` | CpuBackend | PASS |
+| `test_softmax_oracle` | CpuBackend | PASS |
+| `test_workspace_allocation_shapes` | LayerWorkspace | PASS |
+| `test_workspace_scores_size` | LayerWorkspace | PASS |
+| `test_workspace_small_config` | LayerWorkspace | PASS |
+| `test_workspace_tensors_writable` | LayerWorkspace | PASS |
 | `test_alloc_unified_buffer` | UnifiedBuffer | SKIP |
 | `test_map_returns_valid_ptr` | UnifiedBuffer | SKIP |
 | `test_map_write_unmap_cycle` | UnifiedBuffer | SKIP |
@@ -164,17 +249,6 @@ _Last updated: 2026-02-22 22:22:44_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-02-22T08:55:52 | 30 | 26 | 4 | 86.7% |
-| 2026-02-22T09:57:31 | 30 | 26 | 4 | 86.7% |
-| 2026-02-22T10:07:30 | 30 | 26 | 4 | 86.7% |
-| 2026-02-22T10:38:52 | 52 | 48 | 4 | 92.3% |
-| 2026-02-22T10:39:04 | 52 | 48 | 4 | 92.3% |
-| 2026-02-22T10:39:41 | 52 | 48 | 4 | 92.3% |
-| 2026-02-22T22:17:00 | 4 | 0 | 4 | 0.0% |
-| 2026-02-22T22:18:19 | 4 | 0 | 4 | 0.0% |
-| 2026-02-22T22:19:32 | 0 | 0 | 0 | 0.0% |
-| 2026-02-22T22:19:54 | 0 | 0 | 0 | 0.0% |
-| 2026-02-22T22:20:51 | 4 | 1 | 3 | 25.0% |
-| 2026-02-22T22:21:34 | 4 | 0 | 4 | 0.0% |
-| 2026-02-22T22:22:44 | 4 | 0 | 0 | 0.0% |
+| 2026-03-02T22:07:45 | 70 | 66 | 0 | 94.3% |
+| 2026-03-02T22:16:58 | 89 | 85 | 0 | 95.5% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->

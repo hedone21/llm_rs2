@@ -89,4 +89,26 @@ Buffers:          123456 kB
         assert_eq!(stats.available, 12345678 * 1024);
         assert_eq!(stats.free, 4567890 * 1024);
     }
+
+    #[test]
+    fn test_parse_meminfo_missing_field_error() {
+        // MemAvailable is missing → should error
+        let incomplete = "MemTotal:  1024 kB\nMemFree:  512 kB\n";
+        let result = LinuxSystemMonitor::parse_meminfo(incomplete);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("MemAvailable"),
+            "expected MemAvailable error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_parse_meminfo_bad_format_error() {
+        // Non-numeric value should cause parse error
+        let bad = "MemTotal:  not_a_number kB\nMemFree:  512 kB\nMemAvailable:  256 kB\n";
+        let result = LinuxSystemMonitor::parse_meminfo(bad);
+        assert!(result.is_err());
+    }
 }

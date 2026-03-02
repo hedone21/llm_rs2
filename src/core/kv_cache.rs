@@ -1,5 +1,5 @@
-use anyhow::Result;
 use crate::core::tensor::Tensor;
+use anyhow::Result;
 
 pub struct KVCache {
     pub k_buffer: Tensor,
@@ -20,15 +20,15 @@ impl KVCache {
 
     pub fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
         let seq_len = new_k.shape().dims()[1];
-        
+
         if self.current_pos + seq_len > self.max_seq_len {
             return Err(anyhow::anyhow!("KV Cache overflow"));
         }
-        
+
         let shape = self.k_buffer.shape().dims();
         let heads = shape[2];
         let dim = shape[3];
-        
+
         // For Q4_0, offsets/counts are in block units (each block = 32 elements = 18 bytes)
         let (offset, count) = if self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0 {
             let blocks_per_pos = heads * dim / crate::core::quant::QK4_0;
@@ -37,13 +37,13 @@ impl KVCache {
             let height = heads * dim;
             (self.current_pos * height, seq_len * height)
         };
-        
+
         let backend = self.k_buffer.backend().clone();
         backend.copy_slice(new_k, &mut self.k_buffer, 0, offset, count)?;
         backend.copy_slice(new_v, &mut self.v_buffer, 0, offset, count)?;
-        
+
         self.current_pos += seq_len;
-        
+
         Ok(())
     }
 
@@ -52,10 +52,10 @@ impl KVCache {
         // Actually KVCache is passed to attention. Attention usually needs all previous tokens.
         // For simple testing, we might not need to slice *tensor objects* explicitly struct-wise if the kernel knows `current_pos`.
         // But if we must return Tensors:
-        
+
         // Stub: return references to full buffers, but updated logic uses `current_pos` and indices.
-        // To be correct, we should return a "Slice" tensor. 
-        // For this task, let's just cheat and return the whole buffer, 
+        // To be correct, we should return a "Slice" tensor.
+        // For this task, let's just cheat and return the whole buffer,
         // and the attention layer manages indices using `current_pos`.
         (self.k_buffer.clone(), self.v_buffer.clone())
     }
@@ -99,7 +99,9 @@ impl KVCache {
             let k_ptr = self.k_buffer.as_mut_ptr();
             let v_ptr = self.v_buffer.as_mut_ptr();
             if k_ptr.is_null() || v_ptr.is_null() {
-                return Err(anyhow::anyhow!("Cannot prune: null buffer pointers (GPU-only buffers not supported for prune)"));
+                return Err(anyhow::anyhow!(
+                    "Cannot prune: null buffer pointers (GPU-only buffers not supported for prune)"
+                ));
             }
             unsafe {
                 std::ptr::copy(k_ptr.add(src_byte_offset), k_ptr, move_bytes);
@@ -114,7 +116,9 @@ impl KVCache {
             let k_ptr = self.k_buffer.as_mut_ptr();
             let v_ptr = self.v_buffer.as_mut_ptr();
             if k_ptr.is_null() || v_ptr.is_null() {
-                return Err(anyhow::anyhow!("Cannot prune: null buffer pointers (GPU-only buffers not supported for prune)"));
+                return Err(anyhow::anyhow!(
+                    "Cannot prune: null buffer pointers (GPU-only buffers not supported for prune)"
+                ));
             }
             unsafe {
                 std::ptr::copy(k_ptr.add(src_byte_offset), k_ptr, move_bytes);
@@ -251,5 +255,49 @@ mod tests {
         cache.current_pos = 10;
         // 10 positions * 2 heads * 64 dim * 4 bytes (F32) * 2 (K+V)
         assert_eq!(cache.memory_usage_bytes(), 10 * 2 * 64 * 4 * 2);
+    }
+
+    #[test]
+    fn test_cache_creation() {
+        let cache = make_cache(64, 4, 8);
+        assert_eq!(cache.current_pos, 0);
+        assert_eq!(cache.max_seq_len, 64);
+        assert_eq!(cache.k_buffer.shape().dims(), &[1, 64, 4, 8]);
+        assert_eq!(cache.v_buffer.shape().dims(), &[1, 64, 4, 8]);
+    }
+
+    #[test]
+    fn test_update_overflow() {
+        let mut cache = make_cache(4, 1, 4);
+        let backend = Arc::new(CpuBackend::new());
+
+        // Fill to capacity
+        for _ in 0..4 {
+            let buf = Arc::new(SharedBuffer::new(4 * 4, DType::F32));
+            let t = Tensor::new(Shape::new(vec![1, 1, 1, 4]), buf, backend.clone());
+            let vbuf = Arc::new(SharedBuffer::new(4 * 4, DType::F32));
+            let vt = Tensor::new(Shape::new(vec![1, 1, 1, 4]), vbuf, backend.clone());
+            cache.update(&t, &vt).unwrap();
+        }
+        assert_eq!(cache.current_pos, 4);
+
+        // One more should overflow
+        let buf = Arc::new(SharedBuffer::new(4 * 4, DType::F32));
+        let t = Tensor::new(Shape::new(vec![1, 1, 1, 4]), buf, backend.clone());
+        let vbuf = Arc::new(SharedBuffer::new(4 * 4, DType::F32));
+        let vt = Tensor::new(Shape::new(vec![1, 1, 1, 4]), vbuf, backend.clone());
+        assert!(cache.update(&t, &vt).is_err());
+    }
+
+    #[test]
+    fn test_get_view() {
+        let mut cache = make_cache(100, 2, 4);
+        cache.current_pos = 10;
+        let (k_view, v_view) = cache.get_view(10);
+        // get_view returns clones of the full buffer tensors
+        assert_eq!(k_view.shape().dims(), &[1, 100, 2, 4]);
+        assert_eq!(v_view.shape().dims(), &[1, 100, 2, 4]);
+        assert_eq!(k_view.dtype(), DType::F32);
+        assert_eq!(v_view.dtype(), DType::F32);
     }
 }

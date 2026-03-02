@@ -7,6 +7,7 @@ from flask import Blueprint, jsonify, request
 from . import parser
 from .schema_registry import TIMESERIES_FIELDS, BENCHMARK_RESULT_FIELDS, METADATA_FIELDS
 from .runner import BenchmarkRunner
+from .gate_parser import load_gate_status
 
 api = Blueprint("api", __name__, url_prefix="/api")
 
@@ -112,3 +113,13 @@ def run_benchmark():
 def benchmark_status():
     """Return current benchmark execution status."""
     return jsonify(_runner.get_status())
+
+
+# ── Gate status endpoint ─────────────────────────────────
+
+@api.route("/gates")
+def get_gates():
+    data = load_gate_status()
+    if data is None:
+        return jsonify({"error": "No gate data. Run update_test_status.py first."}), 404
+    return jsonify(data)

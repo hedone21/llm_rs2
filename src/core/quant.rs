@@ -30,7 +30,7 @@ impl BlockQ4_0 {
             let b = self.qs[i];
             let v0 = (b & 0x0F) as i8 - 8;
             let v1 = (b >> 4) as i8 - 8;
-            
+
             out[i] = v0 as f32 * d;
             out[i + QK4_0 / 2] = v1 as f32 * d;
         }
@@ -45,7 +45,7 @@ impl BlockQ4_1 {
             let b = self.qs[i];
             let v0 = (b & 0x0F) as f32;
             let v1 = (b >> 4) as f32;
-            
+
             out[i] = v0 * d + m;
             out[i + QK4_1 / 2] = v1 * d + m;
         }
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn test_block_q4_0_dequantize() {
         let mut out = [0.0; QK4_0];
-        
+
         // Scale = 2.0 (f16 corresponding to 2.0 is roughly 0x4000)
         let mut block = BlockQ4_0 {
             d: f16::from_f32(2.0),
@@ -91,12 +91,12 @@ mod tests {
         // v0 = 0x0A (10) -> 10 - 8 = 2
         // v1 = 0x01 (1) -> 1 - 8 = -7
         block.qs[0] = 0x1A;
-        
+
         // Max nibble: 0xFF
         // v0 = 15 - 8 = 7
         // v1 = 15 - 8 = 7
         block.qs[1] = 0xFF;
-        
+
         // Min nibble: 0x00
         // v0 = 0 - 8 = -8
         // v1 = 0 - 8 = -8
@@ -107,17 +107,17 @@ mod tests {
         // Verification for qs[0] -> block 0 and 16
         assert_eq!(out[0], 2.0 * 2.0); // 4.0
         assert_eq!(out[16], -7.0 * 2.0); // -14.0
-        
+
         // Verification for qs[1] -> block 1 and 17
         assert_eq!(out[1], 7.0 * 2.0); // 14.0
         assert_eq!(out[17], 7.0 * 2.0); // 14.0
-        
+
         // Verification for qs[2] -> block 2 and 18
         assert_eq!(out[2], -8.0 * 2.0); // -16.0
         assert_eq!(out[18], -8.0 * 2.0); // -16.0
-        
+
         // Unset ones should be (0 - 8) * 2.0 = -16.0
-        assert_eq!(out[3], -16.0); 
+        assert_eq!(out[3], -16.0);
     }
 
     #[test]
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn test_block_q4_1_dequantize() {
         let mut out = [0.0; QK4_1];
-        
+
         // Scale = 2.0, Min = -5.0
         let mut block = BlockQ4_1 {
             d: f16::from_f32(2.0),
@@ -157,11 +157,11 @@ mod tests {
         assert_eq!(out[0], 15.0);
         assert_eq!(out[16], -3.0);
     }
-    
+
     #[test]
     fn test_block_q8_0_dequantize() {
         let mut out = [0.0; QK8_0];
-        
+
         let mut block = BlockQ8_0 {
             d: f16::from_f32(0.5),
             qs: [0; QK8_0],
@@ -170,7 +170,7 @@ mod tests {
         block.qs[0] = 10;
         block.qs[1] = -5;
         block.qs[31] = 127; // max i8
-        
+
         block.dequantize(&mut out);
 
         assert_eq!(out[0], 5.0);
@@ -183,5 +183,23 @@ mod tests {
         assert_eq!(std::mem::size_of::<BlockQ4_0>(), 18);
         assert_eq!(std::mem::size_of::<BlockQ4_1>(), 20);
         assert_eq!(std::mem::size_of::<BlockQ8_0>(), 34);
+    }
+
+    #[test]
+    fn test_block_q4_1_zero_scale() {
+        let mut out = [0.0; QK4_1];
+        let block = BlockQ4_1 {
+            d: f16::from_f32(0.0),
+            m: f16::from_f32(3.0),
+            qs: [0xAB; QK4_1 / 2], // Non-zero nibbles
+        };
+        block.dequantize(&mut out);
+        // With d=0, all values should equal m (=3.0): v * 0.0 + 3.0 = 3.0
+        for val in out {
+            assert_eq!(
+                val, 3.0,
+                "Q4_1 zero scale should produce m for all elements"
+            );
+        }
     }
 }

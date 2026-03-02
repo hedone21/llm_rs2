@@ -435,6 +435,100 @@ def update_document(test_status_md: str, history_md: str) -> None:
     DOC_PATH.write_text(content)
 
 
+GATE_JSON_PATH = PROJECT_ROOT / "results" / "data" / "component_gates.json"
+
+TIER_NAMES = {
+    "T1": "Foundation",
+    "T2": "Algorithm",
+    "T3": "Backend",
+    "T4": "Integration",
+}
+
+
+def write_gate_json(gate_statuses, groups, results, overall_gate):
+    """Write gate status data to results/data/component_gates.json for the web dashboard."""
+    timestamp = datetime.now().isoformat()
+
+    # Build per-tier component lists
+    tiers = {}
+    for tier_key in ("T1", "T2", "T3", "T4"):
+        tiers[tier_key] = {
+            "name": TIER_NAMES[tier_key],
+            "components": [],
+        }
+
+    for key in SORTED_KEYS:
+        meta = COMPONENT_META[key]
+        tests = groups.get(key, [])
+        t = len(tests)
+        p = sum(1 for x in tests if x["status"] == "PASS")
+        f = sum(1 for x in tests if x["status"] == "FAILED")
+        s = sum(1 for x in tests if x["status"] == "SKIP")
+        gate = gate_statuses.get(key, "N/A")
+
+        component_item = {
+            "name": meta["name"],
+            "module": key,
+            "maturity": meta["maturity"],
+            "total_tests": t,
+            "passed": p,
+            "failed": f,
+            "skipped": s,
+            "gate": gate,
+        }
+        tiers[meta["tier"]]["components"].append(component_item)
+
+    # Summary counts
+    total_components = len(COMPONENT_META)
+    pass_count = sum(1 for s in gate_statuses.values() if s == "PASS")
+    fail_count = sum(1 for s in gate_statuses.values() if s == "FAIL")
+    blocked_count = sum(1 for s in gate_statuses.values() if s == "BLOCKED")
+    skip_count = sum(1 for s in gate_statuses.values() if s == "SKIP")
+    na_count = sum(1 for s in gate_statuses.values() if s == "N/A")
+
+    # Pass rate: components that PASS out of those that are not N/A
+    countable = total_components - na_count
+    pass_rate = round(pass_count / countable * 100, 1) if countable > 0 else 0.0
+
+    summary = {
+        "total_components": total_components,
+        "pass": pass_count,
+        "fail": fail_count,
+        "blocked": blocked_count,
+        "skip": skip_count,
+        "na": na_count,
+        "pass_rate": pass_rate,
+    }
+
+    # Load history from docs/test_history.json
+    history = []
+    if HISTORY_PATH.exists():
+        try:
+            raw_history = json.loads(HISTORY_PATH.read_text())
+            for entry in raw_history:
+                history.append({
+                    "date": entry["date"],
+                    "total": entry["total"],
+                    "passed": entry["passed"],
+                    "failed": entry["failed"],
+                    "pass_rate": entry["pass_rate"],
+                })
+        except (json.JSONDecodeError, IOError, KeyError):
+            history = []
+
+    gate_data = {
+        "timestamp": timestamp,
+        "overall_gate": overall_gate,
+        "summary": summary,
+        "tiers": tiers,
+        "history": history,
+    }
+
+    GATE_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
+    GATE_JSON_PATH.write_text(json.dumps(gate_data, indent=2, ensure_ascii=False) + "\n")
+    print(f"Gate JSON: {GATE_JSON_PATH.relative_to(PROJECT_ROOT)}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Update test status document")
     parser.add_argument(
@@ -486,6 +580,14 @@ def main():
 
     # 7. Update document
     update_document(test_status_md, history_md)
+
+    # 7b. Write gate JSON for web dashboard
+    gate_statuses = {}
+    for key in SORTED_KEYS:
+        tests = groups.get(key, [])
+        gate_statuses[key] = compute_gate_status(key, tests)
+    overall = compute_overall_gate(gate_statuses)
+    write_gate_json(gate_statuses, groups, results, overall)
 
     # 8. Print summary with gate status
     rate = f"{passed/total*100:.1f}" if total > 0 else "0.0"

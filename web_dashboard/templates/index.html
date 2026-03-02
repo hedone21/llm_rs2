@@ -33,6 +33,7 @@
             <button class="nav-btn" data-tab="compare">Compare</button>
             <button class="nav-btn" data-tab="trends">Trends</button>
             <button class="nav-btn" data-tab="runner">Run ⚡</button>
+            <button class="nav-btn" data-tab="gates">Gates</button>
         </nav>
     </header>
 
@@ -200,6 +201,27 @@
             </div>
         </section>
 
+        <!-- ── Gates Tab ─────────────────────────────── -->
+        <section id="tab-gates" class="tab-panel">
+            <div class="summary-cards" id="gates-cards"></div>
+            <div class="card" style="margin-bottom:16px;">
+                <h3>Component Quality Gates</h3>
+                <div class="table-wrapper">
+                    <table id="gates-table">
+                        <thead><tr>
+                            <th>Component</th><th>Tier</th><th>Maturity</th>
+                            <th>Tests</th><th>Passed</th><th>Failed</th><th>Gate</th>
+                        </tr></thead>
+                        <tbody id="gates-table-body"></tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card">
+                <h3>Pass Rate History</h3>
+                <div id="gates-history-chart"></div>
+            </div>
+        </section>
+
     </main>
 
     <!-- Scripts -->
@@ -207,6 +229,7 @@
     <script src="/static/js/table.js"></script>
     <script src="/static/js/compare.js"></script>
     <script src="/static/js/runner.js"></script>
+    <script src="/static/js/gates.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 

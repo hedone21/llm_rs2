@@ -1,8 +1,8 @@
-use std::sync::Arc;
-use anyhow::{Result, anyhow};
-use crate::core::shape::Shape;
-use crate::core::buffer::{Buffer, DType};
 use crate::core::backend::Backend;
+use crate::core::buffer::{Buffer, DType};
+use crate::core::shape::Shape;
+use anyhow::{Result, anyhow};
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Tensor {
@@ -13,7 +13,11 @@ pub struct Tensor {
 
 impl Tensor {
     pub fn new(shape: Shape, buffer: Arc<dyn Buffer>, backend: Arc<dyn Backend>) -> Self {
-        Self { shape, buffer, backend }
+        Self {
+            shape,
+            buffer,
+            backend,
+        }
     }
 
     pub fn shape(&self) -> &Shape {
@@ -23,7 +27,7 @@ impl Tensor {
     pub fn buffer(&self) -> &Arc<dyn Buffer> {
         &self.buffer
     }
-    
+
     pub fn backend(&self) -> &Arc<dyn Backend> {
         &self.backend
     }
@@ -70,19 +74,19 @@ impl Tensor {
     // Operations delegated to backend
     pub fn matmul(&self, other: &Tensor) -> Result<Tensor> {
         // Implementation would need an output tensor created via backend/memory
-        // For now, this requires a way to allocate output. 
-        // We usually pass 'out' or create it. 
+        // For now, this requires a way to allocate output.
+        // We usually pass 'out' or create it.
         // Let's assume we'll use a lower-level API or the user creates 'out'.
         // Or we can add a helper if Backend supports allocation (it usually doesn't directly, Memory does).
         Err(anyhow!("Use backend.matmul directly for now"))
     }
-    
+
     pub fn to_device(&mut self, backend: Arc<dyn Backend>) -> Result<()> {
         // If current backend is same, no-op
         if self.backend.name() == backend.name() {
             return Ok(());
         }
-        
+
         // Use new backend to copy
         let new_tensor = backend.copy_from(self)?;
         *self = new_tensor;
@@ -100,55 +104,112 @@ mod tests {
     struct DummyBuffer {
         size: usize,
         dtype: DType,
-        data: Vec<u8>
+        data: Vec<u8>,
     }
     impl DummyBuffer {
         fn new(size: usize, dtype: DType) -> Self {
-            Self { size, dtype, data: vec![0; size] }
+            Self {
+                size,
+                dtype,
+                data: vec![0; size],
+            }
         }
     }
     impl Buffer for DummyBuffer {
-        fn as_any(&self) -> &dyn Any { self }
-        fn dtype(&self) -> DType { self.dtype }
-        fn size(&self) -> usize { self.size }
-        fn as_ptr(&self) -> *const u8 { self.data.as_ptr() }
-        fn as_mut_ptr(&self) -> *mut u8 { 
-            // This is meant as a dummy buffer, so we cast to mut ptr. 
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn dtype(&self) -> DType {
+            self.dtype
+        }
+        fn size(&self) -> usize {
+            self.size
+        }
+        fn as_ptr(&self) -> *const u8 {
+            self.data.as_ptr()
+        }
+        fn as_mut_ptr(&self) -> *mut u8 {
+            // This is meant as a dummy buffer, so we cast to mut ptr.
             // Safe enough for these tests which don't actually mutate.
-            self.data.as_ptr() as *mut u8 
+            self.data.as_ptr() as *mut u8
         }
         #[cfg(feature = "opencl")]
-        fn cl_mem(&self) -> Option<&ocl::core::Mem> { None }
+        fn cl_mem(&self) -> Option<&ocl::core::Mem> {
+            None
+        }
         #[cfg(not(feature = "opencl"))]
-        fn cl_mem(&self) -> Option<()> { None }
-        fn sync_device(&self) -> Result<()> { Ok(()) }
-        fn map_for_cpu(&self) -> Result<()> { Ok(()) }
-        fn unmap_for_gpu(&self) -> Result<()> { Ok(()) }
+        fn cl_mem(&self) -> Option<()> {
+            None
+        }
+        fn sync_device(&self) -> Result<()> {
+            Ok(())
+        }
+        fn map_for_cpu(&self) -> Result<()> {
+            Ok(())
+        }
+        fn unmap_for_gpu(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     // Dummy Backend for testing
     struct DummyBackend;
     impl Backend for DummyBackend {
-        fn as_any(&self) -> &dyn Any { self }
-        fn name(&self) -> &str { "dummy" }
-        fn device(&self) -> &str { "cpu" }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        fn device(&self) -> &str {
+            "cpu"
+        }
         // Basic Math
-        fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> { Ok(()) }
-        fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> { Ok(()) }
-        fn matmul_slice(&self, _a: &Tensor, _b: &Tensor, _rows: usize, _cols: usize, _out: &mut Tensor) -> Result<()> { Ok(()) }
+        fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn matmul_slice(
+            &self,
+            _a: &Tensor,
+            _b: &Tensor,
+            _rows: usize,
+            _cols: usize,
+            _out: &mut Tensor,
+        ) -> Result<()> {
+            Ok(())
+        }
         // In-place operations
-        fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> { Ok(()) }
-        fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> { Ok(()) }
+        fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> {
+            Ok(())
+        }
         // Activation & Norm
-        fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> { Ok(()) }
-        fn rms_norm(&self, _x: &mut Tensor, _weight: &Tensor, _epsilon: f32) -> Result<()> { Ok(()) }
-        fn softmax(&self, _x: &mut Tensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn rms_norm(&self, _x: &mut Tensor, _weight: &Tensor, _epsilon: f32) -> Result<()> {
+            Ok(())
+        }
+        fn softmax(&self, _x: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
         // Rotate
-        fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> { Ok(()) }
+        fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> {
+            Ok(())
+        }
         // Memory Ops
-        fn copy_from(&self, _source: &Tensor) -> Result<Tensor> { Ok(_source.clone()) }
+        fn copy_from(&self, _source: &Tensor) -> Result<Tensor> {
+            Ok(_source.clone())
+        }
         // Type casting
-        fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> { Ok(()) }
+        fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -159,7 +220,7 @@ mod tests {
         let backend = Arc::new(DummyBackend);
 
         let tensor = Tensor::new(shape, buffer, backend);
-        
+
         assert_eq!(tensor.shape().dims(), &[2, 3]);
         assert_eq!(tensor.dtype(), DType::F32);
         assert_eq!(tensor.size(), 24);
@@ -174,16 +235,16 @@ mod tests {
         let backend = Arc::new(DummyBackend);
 
         let mut tensor = Tensor::new(shape, buffer, backend);
-        
+
         let slice = tensor.as_slice::<f32>();
         // Even with null pointers, internally it slices from the raw ptr with len = 20 / 4 = 5
         // We can't actually read from it, but we can verify the length of the slice representation.
         assert_eq!(slice.len(), 5);
-        
+
         let mut_slice = tensor.as_mut_slice::<f32>();
         assert_eq!(mut_slice.len(), 5);
     }
-    
+
     #[test]
     fn test_tensor_matmul_unimplemented() {
         let shape = Shape::new(vec![2, 2]);
@@ -191,32 +252,67 @@ mod tests {
         let backend = Arc::new(DummyBackend);
         let tensor1 = Tensor::new(shape.clone(), buffer.clone(), backend.clone());
         let tensor2 = Tensor::new(shape, buffer, backend);
-        
+
         assert!(tensor1.matmul(&tensor2).is_err());
     }
 
     struct DummyBackendSameName;
     impl Backend for DummyBackendSameName {
-        fn as_any(&self) -> &dyn Any { self }
-        fn name(&self) -> &str { "dummy" }
-        fn device(&self) -> &str { "cpu" }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        fn device(&self) -> &str {
+            "cpu"
+        }
         // Basic Math
-        fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> { Ok(()) }
-        fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> { Ok(()) }
-        fn matmul_slice(&self, _a: &Tensor, _b: &Tensor, _rows: usize, _cols: usize, _out: &mut Tensor) -> Result<()> { Ok(()) }
+        fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn matmul_slice(
+            &self,
+            _a: &Tensor,
+            _b: &Tensor,
+            _rows: usize,
+            _cols: usize,
+            _out: &mut Tensor,
+        ) -> Result<()> {
+            Ok(())
+        }
         // In-place operations
-        fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> { Ok(()) }
-        fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> { Ok(()) }
+        fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> {
+            Ok(())
+        }
         // Activation & Norm
-        fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> { Ok(()) }
-        fn rms_norm(&self, _x: &mut Tensor, _weight: &Tensor, _epsilon: f32) -> Result<()> { Ok(()) }
-        fn softmax(&self, _x: &mut Tensor) -> Result<()> { Ok(()) }
+        fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
+            Ok(())
+        }
+        fn rms_norm(&self, _x: &mut Tensor, _weight: &Tensor, _epsilon: f32) -> Result<()> {
+            Ok(())
+        }
+        fn softmax(&self, _x: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
         // Rotate
-        fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> { Ok(()) }
+        fn rope_inplace(&self, _x: &mut Tensor, _start_pos: usize, _theta: f32) -> Result<()> {
+            Ok(())
+        }
         // Memory Ops
-        fn copy_from(&self, _source: &Tensor) -> Result<Tensor> { Err(anyhow::anyhow!("Should not be called")) }
+        fn copy_from(&self, _source: &Tensor) -> Result<Tensor> {
+            Err(anyhow::anyhow!("Should not be called"))
+        }
         // Type casting
-        fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> { Ok(()) }
+        fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -228,5 +324,92 @@ mod tests {
 
         let same_backend = Arc::new(DummyBackendSameName);
         assert!(tensor.to_device(same_backend).is_ok()); // Should return Ok(()) without calling copy_from
+    }
+
+    #[test]
+    fn test_tensor_clone_shares_buffer() {
+        let shape = Shape::new(vec![4]);
+        let buffer = Arc::new(DummyBuffer::new(16, DType::F32));
+        let backend = Arc::new(DummyBackend);
+        let tensor = Tensor::new(shape, buffer, backend);
+        let cloned = tensor.clone();
+
+        // Clone shares the same Arc'd buffer (same pointer)
+        assert_eq!(tensor.as_ptr(), cloned.as_ptr());
+        assert_eq!(tensor.shape().dims(), cloned.shape().dims());
+        assert_eq!(tensor.dtype(), cloned.dtype());
+        assert_eq!(tensor.size(), cloned.size());
+    }
+
+    #[test]
+    fn test_tensor_to_device_different_backend() {
+        // When names differ, copy_from is called and the tensor is replaced
+        // copy_from returns a new tensor using the source buffer but the target backend
+        struct OtherBackend;
+        impl Backend for OtherBackend {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn name(&self) -> &str {
+                "other"
+            }
+            fn device(&self) -> &str {
+                "cpu"
+            }
+            fn matmul(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
+                Ok(())
+            }
+            fn matmul_transposed(&self, _a: &Tensor, _b: &Tensor, _out: &mut Tensor) -> Result<()> {
+                Ok(())
+            }
+            fn matmul_slice(
+                &self,
+                _a: &Tensor,
+                _b: &Tensor,
+                _rows: usize,
+                _cols: usize,
+                _out: &mut Tensor,
+            ) -> Result<()> {
+                Ok(())
+            }
+            fn add_assign(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
+                Ok(())
+            }
+            fn scale(&self, _x: &mut Tensor, _v: f32) -> Result<()> {
+                Ok(())
+            }
+            fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
+                Ok(())
+            }
+            fn rms_norm(&self, _x: &mut Tensor, _w: &Tensor, _e: f32) -> Result<()> {
+                Ok(())
+            }
+            fn softmax(&self, _x: &mut Tensor) -> Result<()> {
+                Ok(())
+            }
+            fn rope_inplace(&self, _x: &mut Tensor, _s: usize, _t: f32) -> Result<()> {
+                Ok(())
+            }
+            fn copy_from(&self, _source: &Tensor) -> Result<Tensor> {
+                Err(anyhow::anyhow!("copy_from called on OtherBackend"))
+            }
+            fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let shape = Shape::new(vec![2, 2]);
+        let buffer = Arc::new(DummyBuffer::new(16, DType::F32));
+        let backend = Arc::new(DummyBackend);
+        let mut tensor = Tensor::new(shape, buffer, backend);
+
+        assert_eq!(tensor.backend().name(), "dummy");
+        // Attempting to_device with a different-named backend triggers copy_from
+        let other: Arc<dyn Backend> = Arc::new(OtherBackend);
+        let result = tensor.to_device(other);
+        // OtherBackend's copy_from returns Err, so to_device should fail
+        assert!(result.is_err());
+        // Tensor remains unchanged on failure
+        assert_eq!(tensor.backend().name(), "dummy");
     }
 }

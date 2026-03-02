@@ -602,6 +602,59 @@ body {
     background: var(--text-muted);
 }
 
+/* ── Gate Status ─────────────────────────────────────────── */
+/* Gate status badges */
+.badge-pass { background: rgba(34,197,94,0.15); color: #22c55e; }
+.badge-fail { background: rgba(239,68,68,0.15); color: #ef4444; }
+.badge-blocked { background: rgba(245,158,11,0.15); color: #f59e0b; }
+.badge-skip { background: rgba(139,143,163,0.12); color: #8b8fa3; }
+.badge-na { background: rgba(92,96,120,0.12); color: #5c6078; }
+
+/* Gates table */
+#gates-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+#gates-table thead {
+    background: var(--bg-secondary);
+}
+
+#gates-table th {
+    padding: 10px 12px;
+    text-align: left;
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    border-bottom: 1px solid var(--border);
+}
+
+#gates-table td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-family: var(--font-mono);
+    font-size: 12px;
+}
+
+#gates-table tbody tr:hover {
+    background: var(--bg-hover);
+}
+
+/* Tier group headers */
+.tier-header td {
+    font-weight: 700;
+    color: var(--accent);
+    background: rgba(79,108,247,0.06);
+    border-bottom: 2px solid var(--accent);
+    padding: 10px 12px;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
 /* ── Responsive ──────────────────────────────────────────── */
 @media (max-width: 1024px) {
     .overview-grid {

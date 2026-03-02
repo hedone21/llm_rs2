@@ -14,6 +14,7 @@ const App = (() => {
         _bindNavigation();
         _bindTableActions();
         Runner.init();
+        Gates.load();
 
         await reload();
 
@@ -60,6 +61,9 @@ const App = (() => {
         document.querySelectorAll('.tab-panel').forEach(p => {
             p.classList.toggle('active', p.id === `tab-${tabName}`);
         });
+
+        // Load gates data when switching to gates tab
+        if (tabName === 'gates') Gates.load();
 
         // Trigger resize for Plotly charts
         setTimeout(() => window.dispatchEvent(new Event('resize')), 50);

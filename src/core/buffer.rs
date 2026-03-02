@@ -79,16 +79,32 @@ mod tests {
 
     struct DummyBuffer;
     impl Buffer for DummyBuffer {
-        fn as_any(&self) -> &dyn Any { self }
-        fn dtype(&self) -> DType { DType::F32 }
-        fn size(&self) -> usize { 1024 }
-        fn as_ptr(&self) -> *const u8 { std::ptr::null() }
-        fn as_mut_ptr(&self) -> *mut u8 { std::ptr::null_mut() }
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+        fn dtype(&self) -> DType {
+            DType::F32
+        }
+        fn size(&self) -> usize {
+            1024
+        }
+        fn as_ptr(&self) -> *const u8 {
+            std::ptr::null()
+        }
+        fn as_mut_ptr(&self) -> *mut u8 {
+            std::ptr::null_mut()
+        }
         #[cfg(feature = "opencl")]
-        fn cl_mem(&self) -> Option<&ocl::core::Mem> { None }
+        fn cl_mem(&self) -> Option<&ocl::core::Mem> {
+            None
+        }
         #[cfg(not(feature = "opencl"))]
-        fn cl_mem(&self) -> Option<()> { None }
-        fn sync_device(&self) -> Result<()> { Ok(()) }
+        fn cl_mem(&self) -> Option<()> {
+            None
+        }
+        fn sync_device(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -98,7 +114,7 @@ mod tests {
         assert_eq!(DType::BF16.size(), 2);
         assert_eq!(DType::U8.size(), 1);
         assert_eq!(DType::Q4_0.size(), 1); // 1 byte reported per struct/type enum representation although mapped as blocks
-        assert_eq!(DType::Q4_1.size(), 1); 
+        assert_eq!(DType::Q4_1.size(), 1);
     }
 
     #[test]
@@ -107,5 +123,47 @@ mod tests {
         assert!(buffer.map_for_cpu().is_ok());
         assert!(buffer.unmap_for_gpu().is_ok());
         assert!(buffer.is_mapped()); // Defaults to true
+    }
+
+    #[test]
+    fn test_dtype_all_variant_sizes() {
+        // Exhaustive match ensures we cover every DType variant
+        let variants = [
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::F16,
+            DType::BF16,
+            DType::F32,
+            DType::U8,
+        ];
+        let expected = [1, 1, 2, 2, 4, 1];
+        for (dt, exp) in variants.iter().zip(expected.iter()) {
+            assert_eq!(dt.size(), *exp, "DType::{:?} size mismatch", dt);
+        }
+    }
+
+    #[test]
+    fn test_dtype_equality_and_copy() {
+        let a = DType::F32;
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_eq!(a, DType::F32);
+        assert_ne!(a, DType::F16);
+        assert_ne!(DType::Q4_0, DType::Q4_1);
+
+        // Clone produces identical value
+        let c = a.clone();
+        assert_eq!(a, c);
+    }
+
+    #[test]
+    fn test_buffer_metadata_accessors() {
+        let buffer = DummyBuffer;
+        assert_eq!(buffer.dtype(), DType::F32);
+        assert_eq!(buffer.size(), 1024);
+        assert!(buffer.as_ptr().is_null());
+        assert!(buffer.as_mut_ptr().is_null());
+        assert!(buffer.cl_mem().is_none());
+        assert!(buffer.sync_device().is_ok());
     }
 }
