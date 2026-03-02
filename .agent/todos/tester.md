@@ -14,7 +14,7 @@
 - **Notes**: Rust 개발자 완료 후 즉시 착수
 
 ## [P1] Resilience 모듈 통합 테스트 설계
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 아키텍트의 Resilience 통합 설계
 - **Description**: Resilience Manager 통합 후 통합 테스트 설계. 시나리오: 정상 동작, 온도 경고 시 반응, 메모리 부족 시 반응, D-Bus 연결 실패 시 fallback, 다중 신호 동시 수신
