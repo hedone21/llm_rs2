@@ -22,7 +22,7 @@
 - **Notes**: 테스터가 결과 검증 예정
 
 ## [P1] Resilience Manager generate.rs 통합 구현
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 아키텍트의 통합 설계 완료
 - **Description**: 아키텍트의 설계에 따라 Resilience Manager를 generate.rs 메인 루프에 통합. D-Bus 신호 수신 스레드, 의사결정 로직, 백엔드 전환/배치 조정/캐시 정리 동작 구현
