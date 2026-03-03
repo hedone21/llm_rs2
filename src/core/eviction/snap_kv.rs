@@ -62,8 +62,7 @@ impl EvictionPolicy for SnapKVPolicy {
             let shape = cache.k_buffer.shape().dims();
             let heads = shape[2];
             let dim = shape[3];
-            let is_q4 =
-                cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+            let is_q4 = cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
 
             let (src_off, dst_off, move_count) = if is_q4 {
                 let bpp = heads * dim / crate::core::quant::QK4_0;
@@ -134,8 +133,7 @@ impl EvictionPolicy for SnapKVPolicy {
         let shape = cache.k_buffer.shape().dims();
         let heads = shape[2];
         let dim = shape[3];
-        let is_q4 =
-            cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+        let is_q4 = cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
         let units_per_pos = if is_q4 {
             heads * dim / crate::core::quant::QK4_0
         } else {

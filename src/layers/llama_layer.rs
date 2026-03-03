@@ -44,7 +44,9 @@ impl LlamaLayer {
         let dim = x.shape().dims()[2];
         let head_dim = 64;
 
-        if seq_len == 1 && let Some(ws) = workspace {
+        if seq_len == 1
+            && let Some(ws) = workspace
+        {
             return self.forward_gen(LlamaForwardGenArgs {
                 x,
                 kv_cache,

@@ -30,8 +30,35 @@ fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 
-// Compiler optimization flags for fast math (matching llama.cpp)
-const CL_FAST_MATH_OPTS: &str = "-cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
+// Fast math flags (excluding -cl-std which is determined at runtime)
+const CL_FAST_MATH_FLAGS: &str =
+    "-cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
+
+/// Build compiler options string based on device's OpenCL C version.
+/// Checks CL_DEVICE_OPENCL_C_VERSION (e.g. "OpenCL C 1.2") instead of the API version,
+/// since a device can report OpenCL 3.0 API while only supporting CL C 1.2.
+fn build_cl_opts(device: &Device) -> String {
+    let cl_c_version_str = device
+        .info(ocl::core::DeviceInfo::OpenclCVersion)
+        .map(|v| v.to_string())
+        .unwrap_or_default();
+    // Parse "OpenCL C X.Y ..." → extract major.minor
+    let supports_cl_c_2 = cl_c_version_str
+        .split_whitespace()
+        .nth(2) // "X.Y"
+        .and_then(|ver| {
+            let mut parts = ver.split('.');
+            let major: u32 = parts.next()?.parse().ok()?;
+            let minor: u32 = parts.next()?.parse().ok()?;
+            Some((major, minor) >= (2, 0))
+        })
+        .unwrap_or(false);
+    if supports_cl_c_2 {
+        format!("-cl-std=CL2.0 {}", CL_FAST_MATH_FLAGS)
+    } else {
+        CL_FAST_MATH_FLAGS.to_string()
+    }
+}
 
 /// Cached kernel objects wrapped in a struct for interior mutability.
 /// Uses Mutex to make the raw kernel pointers thread-safe.
@@ -86,11 +113,68 @@ impl std::fmt::Debug for OpenCLBackend {
 
 impl OpenCLBackend {
     pub fn new() -> Result<Self> {
-        let platform = Platform::default();
-        let device = Device::list(platform, Some(flags::DEVICE_TYPE_GPU))?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| Device::first(platform).expect("No OpenCL devices found"));
+        // --- Platform selection via OCL_PLATFORM env var ---
+        let platform = if let Ok(name) = std::env::var("OCL_PLATFORM") {
+            let name_lower = name.to_lowercase();
+            Platform::list()
+                .into_iter()
+                .find(|p| {
+                    p.name()
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&name_lower)
+                })
+                .ok_or_else(|| anyhow!("No OpenCL platform matching '{}'", name))?
+        } else {
+            Platform::default()
+        };
+
+        // --- Device type selection via OCL_DEVICE_TYPE env var ---
+        let device_type = match std::env::var("OCL_DEVICE_TYPE").as_deref().unwrap_or("gpu") {
+            "cpu" => Some(flags::DEVICE_TYPE_CPU),
+            "all" => None,
+            _ => Some(flags::DEVICE_TYPE_GPU),
+        };
+
+        let device = if let Some(dtype) = device_type {
+            Device::list(platform, Some(dtype))?
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| Device::first(platform).expect("No OpenCL devices found"))
+        } else {
+            Device::first(platform)?
+        };
+
+        // --- Log platform/device info ---
+        let platform_name = platform.name().unwrap_or_else(|_| "unknown".into());
+        let device_name = device.name().unwrap_or_else(|_| "unknown".into());
+        let device_version = device
+            .version()
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        let cl_c_version = device
+            .info(ocl::core::DeviceInfo::OpenclCVersion)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        let extensions = device
+            .info(ocl::core::DeviceInfo::Extensions)
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let has_khr_subgroups = extensions.contains("cl_khr_subgroups");
+        let has_intel_subgroups = extensions.contains("cl_intel_subgroups");
+
+        log::info!("OpenCL Platform: {}", platform_name);
+        log::info!(
+            "OpenCL Device: {} (API {}, CL C: {})",
+            device_name,
+            device_version,
+            cl_c_version
+        );
+        log::info!(
+            "Subgroup support: cl_khr_subgroups={}, cl_intel_subgroups={}",
+            has_khr_subgroups,
+            has_intel_subgroups
+        );
 
         let context = Context::builder()
             .platform(platform)
@@ -99,70 +183,139 @@ impl OpenCLBackend {
 
         let queue = Queue::new(&context, device, None)?;
 
-        log::info!("Initialized OpenCL Backend on device: {}", device.name()?);
+        // --- Build compiler options based on device CL version ---
+        let cl_opts = build_cl_opts(&device);
+        log::info!("OpenCL compiler options: {}", cl_opts);
 
-        // Load matmul kernel with fast math
+        // === Load kernel programs with fallback ===
+
+        // Matmul F32: try original, fallback to nosub, then dummy
         let matmul_src = include_str!("../../../kernels/mul_mv_f32_f32.cl");
+        let matmul_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f32_f32_nosub.cl");
         let program = match Program::builder()
             .devices(device)
             .src(matmul_src)
-            .cmplr_opt(CL_FAST_MATH_OPTS)
+            .cmplr_opt(&cl_opts)
             .build(&context)
         {
             Ok(p) => p,
             Err(e) => {
-                eprintln!(
-                    "WARN: Failed to compile matmul kernel: {}. Falling back to dummy.",
+                log::warn!("mul_mv_f32_f32.cl failed: {}. Trying fallback.", e);
+                match Program::builder()
+                    .devices(device)
+                    .src(matmul_fallback_src)
+                    .cmplr_opt(&cl_opts)
+                    .build(&context)
+                {
+                    Ok(p) => {
+                        log::info!("Using fallback/mul_mv_f32_f32_nosub.cl");
+                        p
+                    }
+                    Err(e2) => {
+                        log::warn!("Fallback matmul also failed: {}. Using dummy.", e2);
+                        Program::builder()
+                            .devices(device)
+                            .src("__kernel void kernel_mul_mat_f32_f32() {}")
+                            .build(&context)?
+                    }
+                }
+            }
+        };
+
+        // Simple ops: try original, fallback to nosub file
+        let simple_ops_src = include_str!("../../../kernels/simple_ops.cl");
+        let simple_ops_fallback_src = include_str!("../../../kernels/fallback/simple_ops_nosub.cl");
+        let simple_ops_program = match Program::builder()
+            .devices(device)
+            .src(simple_ops_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("simple_ops.cl compiled (subgroup path)");
+                p
+            }
+            Err(e) => {
+                log::warn!(
+                    "simple_ops.cl failed: {}. Using fallback/simple_ops_nosub.cl",
                     e
                 );
                 Program::builder()
                     .devices(device)
-                    .src("__kernel void kernel_mul_mat_f32_f32() {}")
+                    .src(simple_ops_fallback_src)
+                    .cmplr_opt(&cl_opts)
                     .build(&context)?
             }
         };
 
-        // Load simple ops kernel with fast math
-        let simple_ops_src = include_str!("../../../kernels/simple_ops.cl");
-        let simple_ops_program = Program::builder()
-            .devices(device)
-            .src(simple_ops_src)
-            .cmplr_opt(CL_FAST_MATH_OPTS)
-            .build(&context)?;
-
-        // Load Q4_0 matmul kernel with fast math
+        // Q4_0 matmul: try original, fallback to nosub, then dummy
         let q4_0_src = include_str!("../../../kernels/mul_mv_q4_0_f32.cl");
+        let q4_0_fallback_src = include_str!("../../../kernels/fallback/mul_mv_q4_0_f32_nosub.cl");
         let q4_0_program = match Program::builder()
             .devices(device)
             .src(q4_0_src)
-            .cmplr_opt(CL_FAST_MATH_OPTS)
+            .cmplr_opt(&cl_opts)
             .build(&context)
         {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("WARN: Failed to compile Q4_0 kernel: {}. Using dummy.", e);
+                log::warn!("mul_mv_q4_0_f32.cl failed: {}. Trying fallback.", e);
+                match Program::builder()
+                    .devices(device)
+                    .src(q4_0_fallback_src)
+                    .cmplr_opt(&cl_opts)
+                    .build(&context)
+                {
+                    Ok(p) => {
+                        log::info!("Using fallback/mul_mv_q4_0_f32_nosub.cl");
+                        p
+                    }
+                    Err(e2) => {
+                        log::warn!("Fallback Q4_0 also failed: {}. Using dummy.", e2);
+                        Program::builder()
+                            .devices(device)
+                            .src("__kernel void kernel_mul_mat_q4_0_f32() {}")
+                            .build(&context)?
+                    }
+                }
+            }
+        };
+
+        // Get rows: try original, fallback to dummy
+        let get_rows_src = include_str!("../../../kernels/get_rows.cl");
+        let get_rows_program = match Program::builder()
+            .devices(device)
+            .src(get_rows_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("get_rows.cl failed: {}. Using dummy.", e);
                 Program::builder()
                     .devices(device)
-                    .src("__kernel void kernel_mul_mat_q4_0_f32() {}")
+                    .src("__kernel void kernel_get_rows_q4_0() {} __kernel void kernel_get_rows_f32() {}")
                     .build(&context)?
             }
         };
 
-        // Load get_rows kernel with fast math
-        let get_rows_src = include_str!("../../../kernels/get_rows.cl");
-        let get_rows_program = Program::builder()
-            .devices(device)
-            .src(get_rows_src)
-            .cmplr_opt(CL_FAST_MATH_OPTS)
-            .build(&context)?;
-
-        // Load quantize Q4_0 kernel
+        // Quantize Q4_0: try original, fallback to dummy
         let q4_quant_src = include_str!("../../../kernels/quantize_q4_0.cl");
-        let quant_q4_0_program = Program::builder()
+        let quant_q4_0_program = match Program::builder()
             .devices(device)
             .src(q4_quant_src)
-            .cmplr_opt(CL_FAST_MATH_OPTS)
-            .build(&context)?;
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("quantize_q4_0.cl failed: {}. Using dummy.", e);
+                Program::builder()
+                    .devices(device)
+                    .src("__kernel void kernel_quantize_f32_to_q4_0() {}")
+                    .build(&context)?
+            }
+        };
 
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
@@ -1037,7 +1190,12 @@ impl Backend for OpenCLBackend {
             DType::F16 => 2,
             DType::U8 => 1,
             DType::Q4_0 => 18, // sizeof(BlockQ4_0)
-            _ => return Err(anyhow!("Unsupported dtype for buffer_shift: {:?}", tensor.dtype())),
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported dtype for buffer_shift: {:?}",
+                    tensor.dtype()
+                ));
+            }
         };
 
         let src_byte = src_offset * type_size;
@@ -1045,8 +1203,7 @@ impl Backend for OpenCLBackend {
         let byte_count = count * type_size;
 
         // Check for overlap
-        let no_overlap =
-            (src_byte + byte_count <= dst_byte) || (dst_byte + byte_count <= src_byte);
+        let no_overlap = (src_byte + byte_count <= dst_byte) || (dst_byte + byte_count <= src_byte);
 
         if no_overlap {
             // No overlap: direct in-place copy
