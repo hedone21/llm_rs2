@@ -1183,13 +1183,16 @@ impl Backend for OpenCLBackend {
             return Ok(());
         }
 
-        // GPU path: use cl_mem
+        // GPU path: use enqueue_copy_buffer via cl_mem handle.
+        // No queue.finish() after enqueue — the in-order command queue guarantees
+        // that subsequent kernel dispatches on the same queue are serialized after
+        // this copy, so explicit synchronization would stall the GPU pipeline.
         let buf_mem = get_cl_mem(tensor.buffer().as_ref())?;
         let type_size = match tensor.dtype() {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => 18, // sizeof(BlockQ4_0)
+            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
             _ => {
                 return Err(anyhow!(
                     "Unsupported dtype for buffer_shift: {:?}",
@@ -1202,11 +1205,11 @@ impl Backend for OpenCLBackend {
         let dst_byte = dst_offset * type_size;
         let byte_count = count * type_size;
 
-        // Check for overlap
+        // OpenCL spec: clEnqueueCopyBuffer with overlapping src/dst regions in the
+        // same buffer is undefined behavior. Detect overlap and use a temp buffer.
         let no_overlap = (src_byte + byte_count <= dst_byte) || (dst_byte + byte_count <= src_byte);
 
         if no_overlap {
-            // No overlap: direct in-place copy
             unsafe {
                 ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
                     &self.queue,
@@ -1220,7 +1223,9 @@ impl Backend for OpenCLBackend {
                 )?;
             }
         } else {
-            // Overlap: copy via temporary buffer
+            // Overlap: 2-pass copy via temporary GPU buffer.
+            // Safe to drop temp after enqueue: clReleaseMemObject defers deallocation
+            // until pending commands referencing this buffer complete (OpenCL spec).
             let temp = ocl::Buffer::<u8>::builder()
                 .queue(self.queue.clone())
                 .len(byte_count)
@@ -1228,7 +1233,6 @@ impl Backend for OpenCLBackend {
             let temp_mem = temp.as_core();
 
             unsafe {
-                // src → temp
                 ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
                     &self.queue,
                     buf_mem,
@@ -1239,7 +1243,6 @@ impl Backend for OpenCLBackend {
                     None::<&ocl::core::Event>,
                     None::<&mut ocl::core::Event>,
                 )?;
-                // temp → dst
                 ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
                     &self.queue,
                     temp_mem,
@@ -1251,7 +1254,6 @@ impl Backend for OpenCLBackend {
                     None::<&mut ocl::core::Event>,
                 )?;
             }
-            // temp is dropped here, freeing the GPU buffer
         }
 
         Ok(())
@@ -1269,7 +1271,7 @@ impl Backend for OpenCLBackend {
             DType::F32 => 4,
             DType::F16 => 2,
             DType::U8 => 1,
-            DType::Q4_0 => 18,
+            DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
             _ => {
                 return Err(anyhow!(
                     "Unsupported dtype for copy_slice: {:?}",
@@ -1346,5 +1348,245 @@ impl Backend for OpenCLBackend {
         Err(anyhow!(
             "Unsupported copy_slice combination in OpenCL backend or null pointers"
         ))
+    }
+}
+
+#[cfg(test)]
+mod gpu_buffer_shift_tests {
+    use super::*;
+    use crate::core::shape::Shape;
+
+    fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
+        OpenCLBackend::new().ok().map(Arc::new)
+    }
+
+    /// Allocate a GPU-only (non-zero-copy) buffer, write data, return Tensor.
+    fn make_gpu_tensor(backend: &Arc<OpenCLBackend>, data: &[f32], shape: Vec<usize>) -> Tensor {
+        let byte_len = data.len() * 4;
+        let mem = memory::OpenCLMemory::new(
+            backend.context.clone(),
+            backend.queue.clone(),
+            false, // device-only
+        );
+        let buf = mem.alloc(byte_len, DType::F32).unwrap();
+        let tensor = Tensor::new(Shape::new(shape), buf, backend.clone());
+
+        // Write data to GPU buffer
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        tensor
+    }
+
+    /// Read f32 data back from a GPU tensor.
+    fn read_gpu_tensor(backend: &Arc<OpenCLBackend>, tensor: &Tensor) -> Vec<f32> {
+        let n = tensor.buffer().size() / 4;
+        let mut result = vec![0.0f32; n];
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, n * 4),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        result
+    }
+
+    #[test]
+    fn test_buffer_shift_gpu_no_overlap_f32() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // [1, 2, 3, 4, 5, 6, 7, 8] — shift elements [4..8] to [0..4] (no overlap)
+        let data: Vec<f32> = (1..=8).map(|x| x as f32).collect();
+        let mut tensor = make_gpu_tensor(&backend, &data, vec![8]);
+
+        // src_offset=4, dst_offset=0, count=4 → no overlap (count <= src_offset)
+        backend.buffer_shift(&mut tensor, 4, 0, 4).unwrap();
+
+        let result = read_gpu_tensor(&backend, &tensor);
+        assert_eq!(&result[0..4], &[5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_buffer_shift_gpu_overlap_f32() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // [1, 2, 3, 4, 5, 6, 7, 8] — shift [2..8] to [0..6] (overlap: count=6 > src=2)
+        let data: Vec<f32> = (1..=8).map(|x| x as f32).collect();
+        let mut tensor = make_gpu_tensor(&backend, &data, vec![8]);
+
+        backend.buffer_shift(&mut tensor, 2, 0, 6).unwrap();
+
+        let result = read_gpu_tensor(&backend, &tensor);
+        assert_eq!(&result[0..6], &[3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_buffer_shift_gpu_zero_count() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        let data: Vec<f32> = (1..=4).map(|x| x as f32).collect();
+        let mut tensor = make_gpu_tensor(&backend, &data, vec![4]);
+
+        // No-op
+        backend.buffer_shift(&mut tensor, 2, 0, 0).unwrap();
+
+        let result = read_gpu_tensor(&backend, &tensor);
+        assert_eq!(&result[..], &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_buffer_shift_gpu_same_offset() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        let data: Vec<f32> = (1..=4).map(|x| x as f32).collect();
+        let mut tensor = make_gpu_tensor(&backend, &data, vec![4]);
+
+        // src == dst → no-op
+        backend.buffer_shift(&mut tensor, 1, 1, 2).unwrap();
+
+        let result = read_gpu_tensor(&backend, &tensor);
+        assert_eq!(&result[..], &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_prune_prefix_opencl_buffer() {
+        use crate::core::kv_cache::KVCache;
+
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        let heads = 1;
+        let dim = 4;
+        let max_seq = 16;
+        let mem = memory::OpenCLMemory::new(backend.context.clone(), backend.queue.clone(), false);
+
+        let k_buf = mem.alloc(max_seq * heads * dim * 4, DType::F32).unwrap();
+        let v_buf = mem.alloc(max_seq * heads * dim * 4, DType::F32).unwrap();
+        let k = Tensor::new(
+            Shape::new(vec![1, max_seq, heads, dim]),
+            k_buf,
+            backend.clone() as Arc<dyn Backend>,
+        );
+        let v = Tensor::new(
+            Shape::new(vec![1, max_seq, heads, dim]),
+            v_buf,
+            backend.clone() as Arc<dyn Backend>,
+        );
+        let mut cache = KVCache::new(k, v, max_seq);
+
+        // Fill 8 positions: pos i → all values = (i+1) as f32
+        let cpu_mem = crate::buffer::shared_buffer::SharedBuffer::new(heads * dim * 4, DType::F32);
+        for i in 0..8 {
+            let val = (i + 1) as f32;
+            let kb = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+                heads * dim * 4,
+                DType::F32,
+            ));
+            let vb = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+                heads * dim * 4,
+                DType::F32,
+            ));
+            unsafe {
+                let kp = kb.as_mut_ptr() as *mut f32;
+                let vp = vb.as_mut_ptr() as *mut f32;
+                for j in 0..(heads * dim) {
+                    *kp.add(j) = val;
+                    *vp.add(j) = val * 10.0;
+                }
+            }
+            let kt = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                kb,
+                backend.clone() as Arc<dyn Backend>,
+            );
+            let vt = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                vb,
+                backend.clone() as Arc<dyn Backend>,
+            );
+            cache.update(&kt, &vt).unwrap();
+        }
+        assert_eq!(cache.current_pos, 8);
+
+        // Prune first 3 tokens
+        cache.prune_prefix(3).unwrap();
+        assert_eq!(cache.current_pos, 5);
+
+        // Read K buffer back and verify: pos 0 should be old pos 3 (value 4.0)
+        let k_data = {
+            let cl_mem = get_cl_mem(cache.k_buffer.buffer().as_ref()).unwrap();
+            let n = 8 * heads * dim; // read enough elements
+            let mut buf = vec![0.0f32; n];
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &backend.queue,
+                    cl_mem,
+                    true,
+                    0,
+                    std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, n * 4),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )
+                .unwrap();
+            }
+            buf
+        };
+
+        // pos 0 = old pos 3 = value 4.0
+        assert_eq!(k_data[0], 4.0);
+        // pos 1 = old pos 4 = value 5.0
+        assert_eq!(k_data[dim], 5.0);
+        // pos 4 = old pos 7 = value 8.0
+        assert_eq!(k_data[4 * dim], 8.0);
+
+        drop(cpu_mem); // suppress unused warning
     }
 }

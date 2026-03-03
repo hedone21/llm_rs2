@@ -53,14 +53,7 @@ impl Buffer for OpenCLBuffer {
 
     #[cfg(feature = "opencl")]
     fn cl_mem(&self) -> Option<&Mem> {
-        // Some(&self.buffer.as_core()) // Still might be an issue?
-        // Let's use as_core() if it exists, or just fix this later.
-        // Trying compilation without it first by returning None or strictly generic.
-        // Actually, if I can't find as_core, I'll drop the feature cfg in this file or stub it.
-        // But Buffer trait requires it.
-        // Let's try self.buffer.as_core() again, usually it works if imports are clean.
-        // If it fails, I will just return None for now (unsafe but compiles).
-        None
+        Some(self.buffer.as_core())
     }
 
     #[cfg(not(feature = "opencl"))]
