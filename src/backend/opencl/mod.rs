@@ -286,7 +286,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
             let local_work_size: [usize; 3] = [64, 1, 1];
-            let group_size_0 = (n + 3) / 4;
+            let group_size_0 = n.div_ceil(4);
             let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], m, 1];
 
             ocl::core::enqueue_kernel(
@@ -514,7 +514,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 23, ocl::core::ArgVal::scalar(&r3))?;
 
             let local_size = 64usize;
-            let global_work_size: [usize; 3] = [n * local_size, (m + 3) / 4, 1];
+            let global_work_size: [usize; 3] = [n * local_size, m.div_ceil(4), 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
             ocl::core::enqueue_kernel(
@@ -640,7 +640,7 @@ impl Backend for OpenCLBackend {
                         2,
                         ocl::core::ArgVal::scalar(&(num_elements as i32)),
                     )?;
-                    let gws: [usize; 3] = [((num_elements + 63) / 64) * 64, 1, 1];
+                    let gws: [usize; 3] = [num_elements.div_ceil(64) * 64, 1, 1];
                     let lws: [usize; 3] = [64, 1, 1];
                     ocl::core::enqueue_kernel(
                         &self.queue,
@@ -660,7 +660,7 @@ impl Backend for OpenCLBackend {
                 let dst_buf = get_cl_mem(dst.buffer().as_ref())?;
                 let num_elements: usize = src.shape().dims().iter().product();
 
-                if num_elements % 32 != 0 {
+                if !num_elements.is_multiple_of(32) {
                     return Err(anyhow!("Q4_0 cast requires size multiple of 32"));
                 }
 

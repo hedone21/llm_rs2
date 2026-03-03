@@ -190,7 +190,7 @@ impl Backend for CpuBackendCommon {
         // Flatten batch if exists
         let _batch = if dims.len() == 4 { dims[0] } else { 1 };
 
-        if head_dim % 2 != 0 {
+        if !head_dim.is_multiple_of(2) {
             return Err(anyhow!("Head dim must be even for RoPE"));
         }
 
@@ -270,7 +270,7 @@ impl Backend for CpuBackendCommon {
                 let s = src.as_slice::<f32>();
                 let n_elements = s.len();
                 assert!(
-                    n_elements % QK4_0 == 0,
+                    n_elements.is_multiple_of(QK4_0),
                     "F32->Q4_0 cast: element count must be multiple of {}",
                     QK4_0
                 );
@@ -772,7 +772,7 @@ impl CpuBackendCommon {
         if k != k_b {
             return Err(anyhow!("Shape mismatch"));
         }
-        if k % QK4_0 != 0 {
+        if !k.is_multiple_of(QK4_0) {
             return Err(anyhow!("K divisible by black size"));
         }
 
@@ -792,7 +792,7 @@ impl CpuBackendCommon {
         // This mirrors the NEON path but scalar.
         if m < 4 {
             let nb_k_q8 = k / QK8_0;
-            if k % QK8_0 == 0 {
+            if k.is_multiple_of(QK8_0) {
                 // Ensure divisibility
                 let total_q8_blocks = m * nb_k_q8;
                 let mut a_q8 = vec![
@@ -869,7 +869,7 @@ impl CpuBackendCommon {
     #[allow(clippy::needless_range_loop)]
     pub fn quantize_row_q8_0(&self, x: &[f32], y: &mut [crate::core::quant::BlockQ8_0], k: usize) {
         use crate::core::quant::QK8_0;
-        assert!(k % QK8_0 == 0);
+        assert!(k.is_multiple_of(QK8_0));
         let nb = k / QK8_0;
 
         for i in 0..nb {

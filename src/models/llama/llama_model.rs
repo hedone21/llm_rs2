@@ -6,6 +6,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::cache_manager::CacheManager;
@@ -51,6 +52,9 @@ pub struct LlamaModelForwardArgs<'a> {
     /// Optional cache manager for dynamic KV cache eviction.
     /// When provided, `maybe_evict()` is called after the layer pass.
     pub cache_manager: Option<&'a CacheManager>,
+    /// Optional attention score accumulator for SnapKV-style eviction.
+    /// When active, post-softmax scores are captured from tracked layers.
+    pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
 }
 
 impl LlamaModel {
@@ -127,7 +131,7 @@ impl LlamaModel {
                 let cols = shape.dims()[1];
 
                 let nb_k = cols / crate::core::quant::QK4_0;
-                if cols % crate::core::quant::QK4_0 != 0 {
+                if !cols.is_multiple_of(crate::core::quant::QK4_0) {
                     // Fallback to F32
                     let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
                     unsafe {
@@ -323,6 +327,8 @@ impl LlamaModel {
         let mut workspace = args.workspace;
         let use_gpu_attn = args.use_gpu_attn;
 
+        let mut score_accumulator = args.score_accumulator;
+
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
         let hidden_size = self.config.hidden_size;
@@ -354,6 +360,18 @@ impl LlamaModel {
 
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
+            // When SnapKV accumulator is tracking this layer, force CPU attention
+            // so scores are written to ws.scores (GPU attention discards them).
+            let layer_gpu_attn = if let Some(ref acc) = score_accumulator {
+                if acc.should_track_layer(i) {
+                    false
+                } else {
+                    use_gpu_attn
+                }
+            } else {
+                use_gpu_attn
+            };
+
             layer.forward(LlamaLayerForwardArgs {
                 x: &mut x,
                 kv_cache: &mut kv_caches[i],
@@ -363,19 +381,41 @@ impl LlamaModel {
                 rms_norm_eps: self.config.rms_norm_eps as f32,
                 rope_theta: self.config.rope_theta as f32,
                 workspace: workspace.as_deref_mut(),
-                use_gpu_attn,
+                use_gpu_attn: layer_gpu_attn,
             })?;
+
+            // Capture attention scores for SnapKV accumulator
+            if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
+                && acc.should_track_layer(i)
+            {
+                let cache_seq_len = kv_caches[i].current_pos;
+                let n_heads_q = self.config.num_attention_heads;
+                let stride = ws.scores.len() / n_heads_q;
+                acc.accumulate_layer(&ws.scores, stride, cache_seq_len, n_heads_q);
+            }
         }
 
         // 2.5 Dynamic KV cache eviction (if configured)
         let eviction_result = if let Some(cm) = args.cache_manager {
-            let result = cm.maybe_evict(kv_caches)?;
+            let result = if let Some(ref acc) = score_accumulator {
+                if acc.is_active() {
+                    cm.maybe_evict_with_scores(kv_caches, acc.importance_scores())?
+                } else {
+                    cm.maybe_evict(kv_caches)?
+                }
+            } else {
+                cm.maybe_evict(kv_caches)?
+            };
             if result.evicted {
                 log::info!(
                     "[CacheManager] Evicted {} tokens, new_pos={}",
                     result.tokens_removed,
                     result.new_pos
                 );
+                // Reset accumulator after eviction so importance rebuilds
+                if let Some(ref mut acc) = score_accumulator {
+                    acc.reset();
+                }
                 Some(result)
             } else {
                 None

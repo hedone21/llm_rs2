@@ -474,7 +474,7 @@ fn perform_matmul_test(
             OpType::RoPE => {
                 let head_dim = 128;
                 let num_heads = n / head_dim;
-                if n % head_dim != 0 {
+                if !n.is_multiple_of(head_dim) {
                     backend.rope_inplace(&mut c_gpu, 0, 10000.0)?;
                 } else {
                     let r_shape = Shape::new(vec![1, m, num_heads, head_dim]);

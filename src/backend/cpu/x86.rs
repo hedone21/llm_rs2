@@ -417,7 +417,7 @@ impl CpuBackendAVX2 {
     #[allow(clippy::needless_range_loop)]
     #[target_feature(enable = "avx2")]
     pub unsafe fn quantize_row_q8_0(&self, x: &[f32], y: &mut [BlockQ8_0], k: usize) {
-        assert!(k % QK8_0 == 0);
+        assert!(k.is_multiple_of(QK8_0));
         let nb = k / QK8_0;
 
         let x_ptr = x.as_ptr();
