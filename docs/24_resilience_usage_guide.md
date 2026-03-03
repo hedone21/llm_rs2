@@ -2,6 +2,8 @@
 
 > Resilience Manager를 활성화하여 시스템 자원 압박에 자동 대응하는 추론을 실행하는 방법.
 
+**다음**: [25. Troubleshooting Guide](25_troubleshooting.md) | [26. API Reference](26_api_reference.md)
+
 ---
 
 ## 1. 개요

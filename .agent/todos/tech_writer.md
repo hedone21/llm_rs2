@@ -22,7 +22,7 @@
 - **Notes**: 아키텍트와 긴밀히 협업
 
 ## [P2] 트러블슈팅 가이드 작성
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: T1/T2 테스트 완료, Resilience 통합 완료
 - **Description**: 빌드 오류, 런타임 오류, 디바이스 이슈 등 자주 발생하는 문제와 해결 방법 문서화. OpenCL 초기화 실패, 메모리 부족, D-Bus 연결 오류 등 포함
@@ -30,7 +30,7 @@
 - **Notes**: 테스터와 Rust 개발자로부터 이슈 수집
 
 ## [P2] API 레퍼런스 업데이트
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: Resilience 통합 완료
 - **Description**: Backend trait 변경사항, 새 resilience API, 설정 옵션 등 API 레퍼런스 업데이트. `docs/02_core_abstractions.md` 등 관련 문서 갱신

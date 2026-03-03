@@ -14,7 +14,7 @@
 - **Notes**: Rust 개발자의 구현과 테스터의 통합 테스트에 선행
 
 ## [P2] SnapKV attention score 노출 인터페이스 설계
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: 현재 attention 계산에서 score를 외부로 노출하는 인터페이스 설계. SnapKV가 attention score를 기반으로 중요 KV 엔트리를 판별하기 위해 필요. Backend trait 또는 별도 trait로 노출할지 결정

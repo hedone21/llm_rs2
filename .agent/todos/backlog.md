@@ -21,12 +21,12 @@
 - **Notes**: PM 결정 필요 — 커밋 vs gitignore
 
 ## [P1] SnapKV 완전 구현
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
-- **Dependencies**: 아키텍트의 attention score 노출 인터페이스 설계
+- **Dependencies**: 아키텍트의 attention score 노출 인터페이스 설계 (DONE)
 - **Description**: 현재 stub 상태인 SnapKV를 실제 attention score 기반으로 완전 구현. 중요도 낮은 KV 엔트리를 선택적으로 제거하는 지능형 캐시 관리
 - **Acceptance Criteria**: attention score 기반 KV 엔트리 선택/제거 동작, 유닛 테스트 통과
-- **Notes**: 아키텍트 설계 완료 후 Rust 개발자에게 배정
+- **Notes**: AttentionScoreAccumulator + evict_with_scores 구현 완료. 인터페이스 설계 + 구현 모두 완료됨
 
 ## [P2] GPU 전용 버퍼 prune_prefix 지원
 - **Status**: TODO
