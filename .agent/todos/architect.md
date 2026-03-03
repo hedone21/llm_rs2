@@ -22,9 +22,9 @@
 - **Notes**: backlog의 "SnapKV 완전 구현"의 선행 작업
 
 ## [P2] GPU 버퍼 prune_prefix 전략 설계
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: OpenCL 전용 버퍼(CL_MEM_ALLOC_HOST_PTR 미사용)에서 prune_prefix를 지원하기 위한 전략 설계. GPU 커널 기반 데이터 이동 vs 재할당, 메모리 관리 방안
 - **Acceptance Criteria**: 설계 문서, 선택한 접근법과 근거, 구현 가이드
-- **Notes**: backlog의 "GPU 전용 버퍼 prune_prefix"의 선행 작업
+- **Notes**: enqueue_copy_buffer + 오버랩 시 temp 버퍼 방식 채택. cl_mem() 버그 수정, GPU 테스트 5개 추가, docs/11 문서화 완료

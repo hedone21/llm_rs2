@@ -29,9 +29,9 @@
 - **Notes**: AttentionScoreAccumulator + evict_with_scores 구현 완료. 인터페이스 설계 + 구현 모두 완료됨
 
 ## [P2] GPU 전용 버퍼 prune_prefix 지원
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: backlog
-- **Dependencies**: 아키텍트의 GPU 버퍼 전략 설계
+- **Dependencies**: 아키텍트의 GPU 버퍼 전략 설계 (DONE)
 - **Description**: OpenCL 전용 버퍼에서 prune_prefix 연산 지원. 현재 CPU 매핑 가능 버퍼만 지원
 - **Acceptance Criteria**: GPU 전용 버퍼에서 prune_prefix 정상 동작, 메모리 누수 없음
-- **Notes**: 아키텍트 설계 완료 후 Rust 개발자에게 배정
+- **Notes**: buffer_shift GPU 경로 (5acf4be)에서 구현 완료. cl_mem() 버그 수정, GPU 테스트 5개 통과, docs/11 문서화 완료 (372aa16)
