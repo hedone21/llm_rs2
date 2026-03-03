@@ -153,6 +153,40 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Shift data within a single tensor (overlap-safe, like memmove).
+    /// Offsets and count are in element units (Q4_0: 1 element = 1 block = 18 bytes).
+    /// Default implementation uses CPU memmove via `std::ptr::copy`.
+    fn buffer_shift(
+        &self,
+        tensor: &mut Tensor,
+        src_offset: usize,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        let type_size = match tensor.dtype() {
+            crate::core::buffer::DType::F32 => 4,
+            crate::core::buffer::DType::F16 => 2,
+            crate::core::buffer::DType::U8 => 1,
+            crate::core::buffer::DType::Q4_0 => {
+                std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            }
+            _ => 1,
+        };
+
+        let ptr = tensor.as_mut_ptr();
+        if ptr.is_null() {
+            anyhow::bail!("Null pointer in buffer_shift (default impl)");
+        }
+        unsafe {
+            std::ptr::copy(
+                ptr.add(src_offset * type_size),
+                ptr.add(dst_offset * type_size),
+                count * type_size,
+            );
+        }
+        Ok(())
+    }
+
     // New API: Copy slice from src to dst
     // src_offset/dst_offset are ELEMENT offsets (not bytes) if Tensor is typed, but here for simplicity let's assume they are ELEMENT offsets relative to Tensor's DType?
     // Actually, Tensors are somewhat untyped regarding pointer arithmetic in this trait unless we know DType size.

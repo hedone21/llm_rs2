@@ -75,33 +75,32 @@ impl EvictionPolicy for SlidingWindowPolicy {
         if self.protected_prefix == 0 {
             cache.prune_prefix(prune_count)?;
         } else {
-            // For protected prefix scenario:
-            // We need to move [protected_prefix+prune_count .. current_pos] to [protected_prefix ..]
-            // This is a more targeted shift within the buffer.
+            // Move [protected_prefix+prune_count .. current_pos] to [protected_prefix ..]
             let shape = cache.k_buffer.shape().dims();
             let heads = shape[2];
             let dim = shape[3];
-            let type_size = cache.k_buffer.dtype().size();
-            let elems_per_pos = heads * dim;
-            let bytes_per_pos = elems_per_pos * type_size;
+            let is_q4 =
+                cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
 
-            let src_start = (self.protected_prefix + prune_count) * bytes_per_pos;
-            let dst_start = self.protected_prefix * bytes_per_pos;
-            let move_bytes = (current - self.protected_prefix - prune_count) * bytes_per_pos;
+            let (src_off, dst_off, move_count) = if is_q4 {
+                let bpp = heads * dim / crate::core::quant::QK4_0;
+                (
+                    (self.protected_prefix + prune_count) * bpp,
+                    self.protected_prefix * bpp,
+                    (current - self.protected_prefix - prune_count) * bpp,
+                )
+            } else {
+                let epp = heads * dim;
+                (
+                    (self.protected_prefix + prune_count) * epp,
+                    self.protected_prefix * epp,
+                    (current - self.protected_prefix - prune_count) * epp,
+                )
+            };
 
-            let k_ptr = cache.k_buffer.as_mut_ptr();
-            let v_ptr = cache.v_buffer.as_mut_ptr();
-
-            if k_ptr.is_null() || v_ptr.is_null() {
-                return Err(anyhow::anyhow!(
-                    "Cannot evict: null buffer pointers (GPU-only buffers not supported)"
-                ));
-            }
-
-            unsafe {
-                std::ptr::copy(k_ptr.add(src_start), k_ptr.add(dst_start), move_bytes);
-                std::ptr::copy(v_ptr.add(src_start), v_ptr.add(dst_start), move_bytes);
-            }
+            let backend = cache.k_buffer.backend().clone();
+            backend.buffer_shift(&mut cache.k_buffer, src_off, dst_off, move_count)?;
+            backend.buffer_shift(&mut cache.v_buffer, src_off, dst_off, move_count)?;
 
             cache.current_pos -= prune_count;
         }

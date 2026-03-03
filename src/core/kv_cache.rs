@@ -89,42 +89,17 @@ impl KVCache {
 
         let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
 
-        if is_q4 {
-            let blocks_per_pos = heads * dim / crate::core::quant::QK4_0;
-            let block_size = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
-            let src_byte_offset = count * blocks_per_pos * block_size;
-            let move_bytes = remaining * blocks_per_pos * block_size;
-
-            // memmove for K buffer
-            let k_ptr = self.k_buffer.as_mut_ptr();
-            let v_ptr = self.v_buffer.as_mut_ptr();
-            if k_ptr.is_null() || v_ptr.is_null() {
-                return Err(anyhow::anyhow!(
-                    "Cannot prune: null buffer pointers (GPU-only buffers not supported for prune)"
-                ));
-            }
-            unsafe {
-                std::ptr::copy(k_ptr.add(src_byte_offset), k_ptr, move_bytes);
-                std::ptr::copy(v_ptr.add(src_byte_offset), v_ptr, move_bytes);
-            }
+        let (src_offset, move_count) = if is_q4 {
+            let bpp = heads * dim / crate::core::quant::QK4_0;
+            (count * bpp, remaining * bpp)
         } else {
-            let elems_per_pos = heads * dim;
-            let type_size = self.k_buffer.dtype().size();
-            let src_byte_offset = count * elems_per_pos * type_size;
-            let move_bytes = remaining * elems_per_pos * type_size;
+            let epp = heads * dim;
+            (count * epp, remaining * epp)
+        };
 
-            let k_ptr = self.k_buffer.as_mut_ptr();
-            let v_ptr = self.v_buffer.as_mut_ptr();
-            if k_ptr.is_null() || v_ptr.is_null() {
-                return Err(anyhow::anyhow!(
-                    "Cannot prune: null buffer pointers (GPU-only buffers not supported for prune)"
-                ));
-            }
-            unsafe {
-                std::ptr::copy(k_ptr.add(src_byte_offset), k_ptr, move_bytes);
-                std::ptr::copy(v_ptr.add(src_byte_offset), v_ptr, move_bytes);
-            }
-        }
+        let backend = self.k_buffer.backend().clone();
+        backend.buffer_shift(&mut self.k_buffer, src_offset, 0, move_count)?;
+        backend.buffer_shift(&mut self.v_buffer, src_offset, 0, move_count)?;
 
         self.current_pos = remaining;
         Ok(())

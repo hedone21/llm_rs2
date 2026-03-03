@@ -999,6 +999,107 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn buffer_shift(
+        &self,
+        tensor: &mut Tensor,
+        src_offset: usize,
+        dst_offset: usize,
+        count: usize,
+    ) -> Result<()> {
+        if src_offset == dst_offset || count == 0 {
+            return Ok(());
+        }
+
+        // If CPU pointer is available, use CPU memmove (SharedBuffer, mapped UnifiedBuffer)
+        let ptr = tensor.as_mut_ptr();
+        if !ptr.is_null() {
+            let type_size = match tensor.dtype() {
+                DType::F32 => 4,
+                DType::F16 => 2,
+                DType::U8 => 1,
+                DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
+                _ => 1,
+            };
+            unsafe {
+                std::ptr::copy(
+                    ptr.add(src_offset * type_size),
+                    ptr.add(dst_offset * type_size),
+                    count * type_size,
+                );
+            }
+            return Ok(());
+        }
+
+        // GPU path: use cl_mem
+        let buf_mem = get_cl_mem(tensor.buffer().as_ref())?;
+        let type_size = match tensor.dtype() {
+            DType::F32 => 4,
+            DType::F16 => 2,
+            DType::U8 => 1,
+            DType::Q4_0 => 18, // sizeof(BlockQ4_0)
+            _ => return Err(anyhow!("Unsupported dtype for buffer_shift: {:?}", tensor.dtype())),
+        };
+
+        let src_byte = src_offset * type_size;
+        let dst_byte = dst_offset * type_size;
+        let byte_count = count * type_size;
+
+        // Check for overlap
+        let no_overlap =
+            (src_byte + byte_count <= dst_byte) || (dst_byte + byte_count <= src_byte);
+
+        if no_overlap {
+            // No overlap: direct in-place copy
+            unsafe {
+                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                    &self.queue,
+                    buf_mem,
+                    buf_mem,
+                    src_byte,
+                    dst_byte,
+                    byte_count,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        } else {
+            // Overlap: copy via temporary buffer
+            let temp = ocl::Buffer::<u8>::builder()
+                .queue(self.queue.clone())
+                .len(byte_count)
+                .build()?;
+            let temp_mem = temp.as_core();
+
+            unsafe {
+                // src → temp
+                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                    &self.queue,
+                    buf_mem,
+                    temp_mem,
+                    src_byte,
+                    0,
+                    byte_count,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+                // temp → dst
+                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                    &self.queue,
+                    temp_mem,
+                    buf_mem,
+                    0,
+                    dst_byte,
+                    byte_count,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+            // temp is dropped here, freeing the GPU buffer
+        }
+
+        Ok(())
+    }
+
     fn copy_slice(
         &self,
         src: &Tensor,
