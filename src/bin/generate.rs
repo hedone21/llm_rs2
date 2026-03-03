@@ -1,5 +1,6 @@
 use clap::Parser;
 use llm_rs2::backend::cpu::CpuBackend;
+use llm_rs2::core::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
 use llm_rs2::core::cache_manager::CacheManager;
@@ -344,6 +345,21 @@ fn main() -> anyhow::Result<()> {
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
 
+    // Setup AttentionScoreAccumulator for SnapKV
+    let mut score_accumulator = if args.eviction_policy == "snapkv" {
+        let mut acc = AttentionScoreAccumulator::new(
+            max_seq_len,
+            model.config.num_attention_heads,
+            model.config.num_hidden_layers,
+            3,   // track last 3 layers
+            0.1, // 10% decay per step
+        );
+        acc.set_active(true);
+        Some(acc)
+    } else {
+        None
+    };
+
     if args.eviction_policy != "none" {
         println!(
             "Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
@@ -421,6 +437,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: None,
                 use_gpu_attn: args.gpu_attn,
                 cache_manager: cm_ref,
+                score_accumulator: None, // No score tracking during prefill
             })?
             .ok_or(())
             .ok(); // Eviction during prefill is unlikely, ignore result
@@ -511,6 +528,11 @@ fn main() -> anyhow::Result<()> {
             }
             let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
 
+            // Apply decay to accumulated importance scores before this step
+            if let Some(ref mut acc) = score_accumulator {
+                acc.begin_step();
+            }
+
             let _eviction_result = model.forward_into(LlamaModelForwardArgs {
                 input_tokens: &gen_input_tensor,
                 start_pos,
@@ -522,6 +544,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: Some(&mut gen_ws),
                 use_gpu_attn: args.gpu_attn,
                 cache_manager: cm_ref,
+                score_accumulator: score_accumulator.as_mut(),
             })?;
 
             // ── Resilience checkpoint ─────────────────────────

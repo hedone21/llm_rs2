@@ -19,6 +19,18 @@ pub trait EvictionPolicy: Send + Sync {
 
     /// Returns the name of this policy (for logging/debugging).
     fn name(&self) -> &str;
+
+    /// Performs eviction using per-token importance scores.
+    /// Default implementation ignores scores and delegates to `evict()`.
+    /// Override in score-aware policies like SnapKV.
+    fn evict_with_scores(
+        &self,
+        cache: &mut KVCache,
+        target_len: usize,
+        _importance: &[f32],
+    ) -> Result<()> {
+        self.evict(cache, target_len)
+    }
 }
 
 pub mod no_eviction;

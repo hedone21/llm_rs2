@@ -125,6 +125,82 @@ impl CacheManager {
         })
     }
 
+    /// Check memory pressure and evict using importance scores.
+    ///
+    /// Same logic as `maybe_evict()`, but passes importance scores to the policy
+    /// via `evict_with_scores()`. Used when `AttentionScoreAccumulator` is active.
+    pub fn maybe_evict_with_scores(
+        &self,
+        caches: &mut [KVCache],
+        importance: &[f32],
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        let mem_available = match self.monitor.mem_stats() {
+            Ok(stats) => stats.available,
+            Err(e) => {
+                log::warn!("Failed to read memory stats: {}, skipping eviction", e);
+                return Ok(EvictionResult {
+                    evicted: false,
+                    tokens_removed: 0,
+                    new_pos: caches[0].current_pos,
+                });
+            }
+        };
+
+        let representative_cache = &caches[0];
+        if !self
+            .policy
+            .should_evict(representative_cache, mem_available)
+            && mem_available >= self.threshold_bytes
+        {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: representative_cache.current_pos,
+            });
+        }
+
+        let current_pos = representative_cache.current_pos;
+        let target_len = ((current_pos as f32) * self.target_ratio) as usize;
+        let target_len = target_len.max(1);
+
+        if current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+
+        log::info!(
+            "[CacheManager] Evicting with policy '{}' (score-aware): {} → {} tokens",
+            self.policy.name(),
+            current_pos,
+            target_len
+        );
+
+        let tokens_removed = current_pos - target_len;
+        for cache in caches.iter_mut() {
+            self.policy
+                .evict_with_scores(cache, target_len, importance)?;
+        }
+
+        let new_pos = caches[0].current_pos;
+
+        Ok(EvictionResult {
+            evicted: true,
+            tokens_removed,
+            new_pos,
+        })
+    }
+
     /// Returns the name of the active policy.
     pub fn policy_name(&self) -> &str {
         self.policy.name()
@@ -283,6 +359,57 @@ mod tests {
         // Should not evict when monitor fails
         assert!(!result.evicted);
         assert_eq!(result.new_pos, 50);
+    }
+
+    #[test]
+    fn test_maybe_evict_with_scores_triggers() {
+        use crate::core::eviction::snap_kv::SnapKVPolicy;
+
+        let cm = CacheManager::new(
+            Box::new(SnapKVPolicy::new(5, 0.3, 0)), // prefix=4, keep_ratio=0.3
+            Box::new(MockMonitor {
+                available: 10 * 1024 * 1024,
+            }),
+            256 * 1024 * 1024,
+            0.5,
+        );
+        let mut caches = make_caches(4, 40);
+
+        let mut importance = vec![0.0f32; 100];
+        // Give some tokens high importance
+        importance[10] = 10.0;
+        importance[20] = 9.0;
+        importance[30] = 8.0;
+
+        let result = cm
+            .maybe_evict_with_scores(&mut caches, &importance)
+            .unwrap();
+        assert!(result.evicted);
+        // All layers should have the same position
+        let pos = caches[0].current_pos;
+        for cache in &caches {
+            assert_eq!(cache.current_pos, pos);
+        }
+    }
+
+    #[test]
+    fn test_maybe_evict_with_scores_no_eviction_needed() {
+        let cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor {
+                available: 1024 * 1024 * 1024,
+            }),
+            256 * 1024 * 1024,
+            0.75,
+        );
+        let mut caches = make_caches(4, 50);
+        let importance = vec![1.0f32; 100];
+
+        let result = cm
+            .maybe_evict_with_scores(&mut caches, &importance)
+            .unwrap();
+        assert!(!result.evicted);
+        assert_eq!(caches[0].current_pos, 50);
     }
 
     #[test]

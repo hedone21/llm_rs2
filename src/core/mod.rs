@@ -1,3 +1,4 @@
+pub mod attention_scores;
 pub mod backend;
 pub mod buffer;
 pub mod cache_manager;

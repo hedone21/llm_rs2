@@ -239,6 +239,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: None,
                 use_gpu_attn: false,
                 cache_manager: None,
+                score_accumulator: None,
             })?
             .ok_or(())
             .ok(); // No eviction configured
@@ -400,6 +401,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: _gen_ws.as_mut(),
                 use_gpu_attn: is_gpu,
                 cache_manager: None,
+                score_accumulator: None,
             })?
             .ok_or(())
             .ok(); // No eviction configured
