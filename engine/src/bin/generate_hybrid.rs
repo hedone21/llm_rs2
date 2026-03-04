@@ -16,8 +16,17 @@ use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
+use llm_rs2::resilience::signal::RecommendedBackend;
+use llm_rs2::resilience::{
+    InferenceContext, ResilienceAction, ResilienceManager, SignalListener, execute_action,
+};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
+
+#[cfg(feature = "resilience")]
+use llm_rs2::resilience::DbusTransport;
+#[cfg(unix)]
+use llm_rs2::resilience::UnixSocketTransport;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -72,6 +81,14 @@ struct Args {
     /// Target ratio of cache to keep when evicting (0.1 to 0.99)
     #[arg(long, default_value_t = 0.75)]
     eviction_target_ratio: f32,
+
+    /// Enable resilience manager for adaptive inference
+    #[arg(long, default_value_t = false)]
+    enable_resilience: bool,
+
+    /// Resilience signal transport: "dbus" or "unix:<path>"
+    #[arg(long, default_value = "dbus")]
+    resilience_transport: String,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -149,7 +166,7 @@ fn main() -> anyhow::Result<()> {
         .build_global()
         .unwrap();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     let model_path = &args.model_path;
 
     println!("[Hybrid] Starting hybrid generation...");
@@ -280,6 +297,32 @@ fn main() -> anyhow::Result<()> {
     } else {
         Some(&cache_manager)
     };
+
+    // Resilience Manager (optional)
+    let mut resilience_manager = if args.enable_resilience {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let _listener_handle = match args.resilience_transport.as_str() {
+            #[cfg(feature = "resilience")]
+            "dbus" => SignalListener::new(DbusTransport::new(), tx).spawn(),
+            #[cfg(unix)]
+            s if s.starts_with("unix:") => {
+                let path = std::path::PathBuf::from(&s[5..]);
+                SignalListener::new(UnixSocketTransport::new(path), tx).spawn()
+            }
+            other => {
+                eprintln!("[Hybrid/Resilience] Unknown transport: {}", other);
+                return Ok(());
+            }
+        };
+        eprintln!(
+            "[Hybrid/Resilience] Manager enabled — transport: {}",
+            args.resilience_transport
+        );
+        Some(ResilienceManager::new(rx))
+    } else {
+        None
+    };
+    let mut throttle_delay_ms: u64 = 0;
 
     let mut tokens_generated = Vec::new();
     tokens_generated.extend_from_slice(&tokens);
@@ -521,6 +564,206 @@ fn main() -> anyhow::Result<()> {
             })?
             .ok_or(())
             .ok();
+
+        // ── Resilience checkpoint ─────────────────────────
+        if let Some(rm) = &mut resilience_manager {
+            let mut suspended = false;
+            let mut reject_new = false;
+            let mut num_tokens = args.num_tokens;
+            let mut ctx = InferenceContext {
+                max_tokens: &mut num_tokens,
+                throttle_delay_ms: &mut throttle_delay_ms,
+                suspended: &mut suspended,
+                reject_new: &mut reject_new,
+            };
+
+            for action in rm.poll() {
+                match &action {
+                    ResilienceAction::Evict { target_ratio } => {
+                        let target_len =
+                            (kv_caches[0].current_pos as f32 * target_ratio) as usize;
+                        let remove = kv_caches[0].current_pos.saturating_sub(target_len);
+                        if remove > 0 {
+                            for cache in kv_caches.iter_mut() {
+                                if let Err(e) = cache.prune_prefix(remove) {
+                                    eprintln!("[Hybrid/Resilience] Eviction error: {}", e);
+                                }
+                            }
+                            eprintln!(
+                                "[Hybrid/Resilience] Evicted {} tokens (pos: {} → {})",
+                                remove,
+                                kv_caches[0].current_pos + remove,
+                                kv_caches[0].current_pos
+                            );
+                        }
+                    }
+                    ResilienceAction::SwitchBackend { to } => match to {
+                        RecommendedBackend::Cpu if is_gpu => {
+                            eprintln!(
+                                "[Hybrid/Resilience] Switching GPU → CPU at token {}",
+                                start_pos
+                            );
+                            // 1. Migrate KV Cache GPU→CPU
+                            for kv in kv_caches.iter_mut() {
+                                let current_capacity = kv.capacity();
+                                let saved_pos = kv.current_pos;
+                                let k_size = current_capacity * kv_heads * head_dim * 4;
+                                let mut k_data = vec![0u8; k_size];
+                                let mut v_data = vec![0u8; k_size];
+                                gpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
+                                gpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
+
+                                let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        k_data.as_ptr(),
+                                        k_cpu_buf.as_mut_ptr(),
+                                        k_size,
+                                    );
+                                }
+                                let k_tensor = Tensor::new(
+                                    kv.k_buffer.shape().clone(),
+                                    k_cpu_buf,
+                                    cpu_backend.clone(),
+                                );
+
+                                let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        v_data.as_ptr(),
+                                        v_cpu_buf.as_mut_ptr(),
+                                        k_size,
+                                    );
+                                }
+                                let v_tensor = Tensor::new(
+                                    kv.v_buffer.shape().clone(),
+                                    v_cpu_buf,
+                                    cpu_backend.clone(),
+                                );
+
+                                let mut new_kv = KVCache::new_dynamic(
+                                    k_tensor,
+                                    v_tensor,
+                                    current_capacity,
+                                    max_seq_len,
+                                    kv_heads,
+                                    head_dim,
+                                    cpu_memory.clone(),
+                                );
+                                new_kv.current_pos = saved_pos;
+                                *kv = new_kv;
+                            }
+
+                            // 2. Switch Backend
+                            current_backend = cpu_backend.clone();
+
+                            // 3. Re-allocate Logits & Workspace on CPU
+                            let logits_cpu_buf =
+                                cpu_memory.alloc(vocab_size * 4, DType::F32)?;
+                            logits = Tensor::new(
+                                Shape::new(vec![1, 1, vocab_size]),
+                                logits_cpu_buf,
+                                cpu_backend.clone(),
+                            );
+                            let (new_x_gen, new_ws) =
+                                setup_workspace(&cpu_backend, cpu_memory.as_ref())?;
+                            _x_gen = Some(new_x_gen);
+                            _gen_ws = Some(new_ws);
+
+                            is_gpu = false;
+                            eprintln!("[Hybrid/Resilience] Switched to CPU successfully.");
+                        }
+                        RecommendedBackend::Gpu if !is_gpu => {
+                            eprintln!(
+                                "[Hybrid/Resilience] Switching CPU → GPU at token {}",
+                                start_pos
+                            );
+                            // Reuse same CPU→GPU migration logic
+                            for kv in kv_caches.iter_mut() {
+                                let current_capacity = kv.capacity();
+                                let saved_pos = kv.current_pos;
+                                let k_size = current_capacity * kv_heads * head_dim * 4;
+                                let mut k_data = vec![0u8; k_size];
+                                let mut v_data = vec![0u8; k_size];
+                                cpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
+                                cpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
+
+                                let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        k_data.as_ptr(),
+                                        k_cpu_buf.as_mut_ptr(),
+                                        k_size,
+                                    );
+                                }
+                                let k_cpu_tensor = Tensor::new(
+                                    kv.k_buffer.shape().clone(),
+                                    k_cpu_buf,
+                                    cpu_backend.clone(),
+                                );
+
+                                let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        v_data.as_ptr(),
+                                        v_cpu_buf.as_mut_ptr(),
+                                        k_size,
+                                    );
+                                }
+                                let v_cpu_tensor = Tensor::new(
+                                    kv.v_buffer.shape().clone(),
+                                    v_cpu_buf,
+                                    cpu_backend.clone(),
+                                );
+
+                                let mut new_kv = KVCache::new_dynamic(
+                                    gpu_backend.copy_from(&k_cpu_tensor)?,
+                                    gpu_backend.copy_from(&v_cpu_tensor)?,
+                                    current_capacity,
+                                    max_seq_len,
+                                    kv_heads,
+                                    head_dim,
+                                    gpu_memory.clone(),
+                                );
+                                new_kv.current_pos = saved_pos;
+                                *kv = new_kv;
+                            }
+
+                            current_backend = gpu_backend.clone();
+
+                            let logits_gpu_buf =
+                                gpu_memory.alloc(vocab_size * 4, DType::F32)?;
+                            logits = Tensor::new(
+                                Shape::new(vec![1, 1, vocab_size]),
+                                logits_gpu_buf,
+                                gpu_backend.clone(),
+                            );
+                            let (new_x_gen, new_ws) =
+                                setup_workspace(&gpu_backend, gpu_memory.as_ref())?;
+                            _x_gen = Some(new_x_gen);
+                            _gen_ws = Some(new_ws);
+
+                            is_gpu = true;
+                            eprintln!("[Hybrid/Resilience] Switched to GPU successfully.");
+                        }
+                        _ => {} // Already on requested backend
+                    },
+                    _ => execute_action(&action, &mut ctx),
+                }
+            }
+
+            args.num_tokens = num_tokens;
+
+            if suspended {
+                eprintln!("\n[Hybrid/Resilience] Inference suspended by system signal");
+                break;
+            }
+
+            if throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
+            }
+        }
+        // ── End Resilience checkpoint ─────────────────────
 
         // Sample
         let mut logits_cpu = vec![0.0f32; vocab_size];
