@@ -1,5 +1,5 @@
 # NDK 경로 설정 (예시)
-export NDK_HOME=/home/go/.opt/android-ndk-r27d
+export NDK_HOME=/opt/android-ndk
 # 호스트 OS (Linux의 경우 linux-x86_64, Mac의 경우 darwin-x86_64)
 export HOST_TAG=linux-x86_64
 export TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG

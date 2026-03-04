@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "type": "stress_test_summary",
+  "metadata": {
+    "date": "2026-03-04T12:04:53.689918",
+    "device": "SM-S931N",
+    "total_duration_sec": 367.4,
+    "phases_run": [
+      3
+    ],
+    "git_commit": "5cd6c93"
+  },
+  "overall_verdict": "FAIL",
+  "phases": {
+    "memory": {
+      "verdict": "FAIL",
+      "tests": {
+        "no_eviction_opencl": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 51.4,
+          "rss_start_mb": 949.3,
+          "rss_peak_mb": 4930.0,
+          "rss_end_mb": 189.3,
+          "rss_delta_mb": -759.9,
+          "eviction_triggered": false,
+          "ttft_ms": 7940.63,
+          "tbt_ms": 36.68,
+          "verdict": "FAIL"
+        },
+        "eviction_sliding_opencl": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 95.3,
+          "rss_start_mb": 1014.2,
+          "rss_peak_mb": 4782.4,
+          "rss_end_mb": 1764.9,
+          "rss_delta_mb": 750.7,
+          "eviction_triggered": true,
+          "ttft_ms": 8046.73,
+          "tbt_ms": 39.69,
+          "verdict": "FAIL"
+        },
+        "eviction_large_prefill_opencl": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 77.9,
+          "rss_start_mb": 806.7,
+          "rss_peak_mb": 4902.7,
+          "rss_end_mb": 1759.2,
+          "rss_delta_mb": 952.5,
+          "eviction_triggered": true,
+          "ttft_ms": 22246.31,
+          "tbt_ms": 49.69,
+          "verdict": "FAIL"
+        },
+        "no_eviction_cpu": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 114.3,
+          "rss_start_mb": 1109.1,
+          "rss_peak_mb": 5161.4,
+          "rss_end_mb": 1736.6,
+          "rss_delta_mb": 627.5,
+          "eviction_triggered": false,
+          "ttft_ms": 11184.29,
+          "tbt_ms": 95.25,
+          "verdict": "FAIL"
+        }
+      }
+    }
+  }
+}
