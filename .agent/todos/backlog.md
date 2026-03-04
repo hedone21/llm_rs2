@@ -4,34 +4,30 @@
 
 ---
 
-## [P2] 컴파일러 경고 정리
+## [P1] IPC Transport 추상화 설계
 - **Status**: DONE
+- **Sprint**: current
+- **Description**: D-Bus 외에 Android용 Unix Domain Socket 전송 계층 지원. `SignalTransport` trait 정의
+- **Notes**: 커밋 c2b7c64에서 구현 완료. 아키텍트/Rust 개발자 TODO에서도 DONE 처리됨
+
+## [P2] Manager 서비스 프로젝트 스캐폴딩
+- **Status**: DONE
+- **Sprint**: next
+- **Description**: Manager 서비스용 Rust 프로젝트 생성. signal 타입 공유 crate 분리, Cargo workspace 구성
+- **Notes**: 커밋 95af0a3에서 구현 완료. `manager/`, `shared/` crate 생성, mock_manager 이전
+
+## [P2] Device Registry 시스템
+- **Status**: TODO
 - **Sprint**: next
 - **Dependencies**: 없음
-- **Description**: unused imports, dead code 등 컴파일러 경고 수정. 대상 파일: x86.rs, kv_cache.rs, tensor.rs, sys_monitor.rs, buffer.rs 등 약 6개 파일
-- **Acceptance Criteria**: `cargo check 2>&1 | grep warning` 결과 0건
-- **Notes**: Rust 개발자에게 배정 예정
+- **Description**: TOML 기반 디바이스 목록 관리 (이름, 연결방식, SoC, 메모리, GPU, 지원 기능). 테스트 스크립트에서 참조하여 자동 배포/테스트 수행
+- **Acceptance Criteria**: devices.toml 스키마 정의, 파서 구현, 기존 run_android.sh와 연동
+- **Notes**: Part 3 기초 작업
 
-## [P2] 미커밋 파일 정리
-- **Status**: DONE
-- **Sprint**: next
-- **Dependencies**: 없음
-- **Description**: eviction_memory_test 관련 미커밋 파일 3개 처리 (results/data/eviction_memory_test.json, scripts/plot_eviction_memory.py, tests/test_eviction_memory.rs). 커밋 또는 .gitignore 추가 결정 필요
-- **Acceptance Criteria**: `git status`에서 untracked 파일 0건
-- **Notes**: PM 결정 필요 — 커밋 vs gitignore
-
-## [P1] SnapKV 완전 구현
-- **Status**: DONE
-- **Sprint**: next
-- **Dependencies**: 아키텍트의 attention score 노출 인터페이스 설계 (DONE)
-- **Description**: 현재 stub 상태인 SnapKV를 실제 attention score 기반으로 완전 구현. 중요도 낮은 KV 엔트리를 선택적으로 제거하는 지능형 캐시 관리
-- **Acceptance Criteria**: attention score 기반 KV 엔트리 선택/제거 동작, 유닛 테스트 통과
-- **Notes**: AttentionScoreAccumulator + evict_with_scores 구현 완료. 인터페이스 설계 + 구현 모두 완료됨
-
-## [P2] GPU 전용 버퍼 prune_prefix 지원
-- **Status**: DONE
+## [P3] 다중 모델 사이즈 검증 테스트 매트릭스
+- **Status**: TODO
 - **Sprint**: backlog
-- **Dependencies**: 아키텍트의 GPU 버퍼 전략 설계 (DONE)
-- **Description**: OpenCL 전용 버퍼에서 prune_prefix 연산 지원. 현재 CPU 매핑 가능 버퍼만 지원
-- **Acceptance Criteria**: GPU 전용 버퍼에서 prune_prefix 정상 동작, 메모리 누수 없음
-- **Notes**: buffer_shift GPU 경로 (5acf4be)에서 구현 완료. cl_mem() 버그 수정, GPU 테스트 5개 통과, docs/11 문서화 완료 (372aa16)
+- **Dependencies**: 다중 디바이스 포팅 완료
+- **Description**: Llama 3.2 1B/3B 및 향후 7B/8B 모델에 대한 디바이스별 테스트 매트릭스 정의
+- **Acceptance Criteria**: 매트릭스 문서, 디바이스별 최대 지원 모델 크기 명시
+- **Notes**: 실제 테스트는 디바이스 확보 후 진행

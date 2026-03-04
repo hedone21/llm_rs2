@@ -1,30 +1,38 @@
 # Architect TODO
 
 > **역할**: 시스템 설계, 트레이트/인터페이스 정의, 모듈 간 의존성 관리, 기술 결정
-> **소유 영역**: `src/core/`, `ARCHITECTURE.md`, 모듈 구조
+> **소유 영역**: `engine/src/core/`, `shared/`, Cargo workspace 구조, `ARCHITECTURE.md`
 
 ---
 
-## [P1] Resilience 시스템 generate.rs 통합 설계
+## [P1] IPC Transport 추상화 설계
 - **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음
-- **Description**: Resilience Manager (D-Bus 기반 시스템 모니터링)를 generate.rs 메인 추론 루프에 통합하기 위한 설계. 신호 수신 → 의사결정 → 동작(백엔드 전환, 배치 축소, 캐시 정리) 흐름 정의. 스레드 모델, 에러 핸들링, fallback 전략 포함
-- **Acceptance Criteria**: 통합 설계 문서 완성, 시퀀스 다이어그램, Rust 개발자가 구현 가능한 수준의 명세
-- **Notes**: Rust 개발자의 구현과 테스터의 통합 테스트에 선행
+- **Description**: `SignalTransport` trait 설계. D-Bus(Linux)/Unix Domain Socket(Android)/Mock(테스트) 3종 전송 계층 추상화
+- **Acceptance Criteria**: trait 시그니처, 메시지 포맷 명세, 플랫폼 선택 로직 설계 문서
+- **Notes**: 커밋 c2b7c64에서 구현 완료. `engine/src/resilience/transport.rs`에 SignalTransport trait + UnixSocketTransport + MockTransport 존재
 
-## [P2] SnapKV attention score 노출 인터페이스 설계
+## [P2] Cargo workspace 구조 설계 (Manager 서비스)
 - **Status**: DONE
 - **Sprint**: next
-- **Dependencies**: 없음
-- **Description**: 현재 attention 계산에서 score를 외부로 노출하는 인터페이스 설계. SnapKV가 attention score를 기반으로 중요 KV 엔트리를 판별하기 위해 필요. Backend trait 또는 별도 trait로 노출할지 결정
-- **Acceptance Criteria**: 인터페이스 설계 문서, trait 시그니처 제안, 성능 영향 분석
-- **Notes**: backlog의 "SnapKV 완전 구현"의 선행 작업
+- **Dependencies**: IPC Transport 추상화 설계
+- **Description**: llm_rs2와 Manager 서비스 간 signal 타입 공유를 위한 Cargo workspace 구조 설계
+- **Acceptance Criteria**: 프로젝트 구조 설계 문서, 의존성 그래프
+- **Notes**: 커밋 95af0a3에서 구현 완료. engine/shared/manager 3-crate workspace 구조 확립
 
-## [P2] GPU 버퍼 prune_prefix 전략 설계
-- **Status**: DONE
-- **Sprint**: next
+## [P1] Hybrid 추론 + Eviction/Resilience 통합 설계
+- **Status**: TODO
+- **Sprint**: current
 - **Dependencies**: 없음
-- **Description**: OpenCL 전용 버퍼(CL_MEM_ALLOC_HOST_PTR 미사용)에서 prune_prefix를 지원하기 위한 전략 설계. GPU 커널 기반 데이터 이동 vs 재할당, 메모리 관리 방안
-- **Acceptance Criteria**: 설계 문서, 선택한 접근법과 근거, 구현 가이드
-- **Notes**: enqueue_copy_buffer + 오버랩 시 temp 버퍼 방식 채택. cl_mem() 버그 수정, GPU 테스트 5개 추가, docs/11 문서화 완료
+- **Description**: `engine/src/bin/generate_hybrid.rs`에 CacheManager(eviction), Resilience checkpoint, GPU→CPU 역방향 전환 통합 설계. 현재 hybrid는 eviction/resilience 미지원 상태
+- **Acceptance Criteria**: 통합 설계 문서, 역방향 전환 시퀀스, 변경 범위 명세
+- **Notes**: generate.rs 통합 패턴을 hybrid에 확장. 블로커 없음 → current로 승격
+
+## [P3] 디바이스-모델 호환성 프로파일 설계
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: 향후 다중 모델/디바이스 확장 시 자동 설정 결정을 위한 프로파일 시스템 설계
+- **Acceptance Criteria**: 프로파일 스키마, 메모리 산출 공식 문서
+- **Notes**: 당장 구현 불필요, 디바이스/모델 조합이 늘어날 때 착수
