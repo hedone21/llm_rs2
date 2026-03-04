@@ -5,8 +5,8 @@
   "device": "Galaxy S25 (Snapdragon 8 Elite, Adreno 830)",
   "model": "Llama 3.2 1B (Q4_0)",
   "summary": {
-    "total_tests": 8,
-    "passed": 7,
+    "total_tests": 9,
+    "passed": 8,
     "inconclusive": 1,
     "failed": 0,
     "verdict": "PASS"
@@ -127,9 +127,10 @@
     },
     {
       "id": "T7",
-      "name": "Memory Comparison (Q4_0)",
+      "name": "Memory Comparison (Q4_0, max_seq_len=2048)",
       "backend": "opencl",
       "initial_capacity": "2048 vs auto (128)",
+      "max_seq_len": 2048,
       "tokens": 128,
       "eviction": "none",
       "kv_type": "q4",
@@ -145,9 +146,10 @@
     },
     {
       "id": "T7b",
-      "name": "Memory Comparison (F32)",
+      "name": "Memory Comparison (F32, max_seq_len=2048)",
       "backend": "opencl",
       "initial_capacity": "2048 vs auto (128)",
+      "max_seq_len": 2048,
       "tokens": 512,
       "eviction": "none",
       "kv_type": "f32",
@@ -161,7 +163,30 @@
         "peak_savings_mb": 160,
         "static_kv_total_mb": 64,
         "dynamic_kv_initial_mb": 4,
-        "note": "F32 KV cache at 2048 tokens = 64MB (16 layers × 4MB). Dynamic allocation saves ~295MB RSS measured during generation. Confirms grow-on-demand delivers real memory savings when KV cache is large enough."
+        "note": "F32 KV cache at 2048 tokens = 64MB (16 layers × 4MB). Dynamic allocation saves ~295MB RSS measured during generation."
+      }
+    },
+    {
+      "id": "T7c",
+      "name": "Memory Comparison (Q4_0, max_seq_len=32768)",
+      "backend": "opencl",
+      "initial_capacity": "32768 vs auto (128)",
+      "max_seq_len": 32768,
+      "tokens": 512,
+      "eviction": "none",
+      "kv_type": "q4",
+      "result": "PASS",
+      "details": {
+        "static_vmrss_kb": 2346528,
+        "dynamic_vmrss_kb": 1645924,
+        "static_vmpeak_kb": 14296848,
+        "dynamic_vmpeak_kb": 14270016,
+        "rss_savings_mb": 684,
+        "static_kv_per_layer_mb": 9.0,
+        "static_kv_total_mb": 144,
+        "dynamic_kv_initial_per_layer_kb": 36,
+        "dynamic_kv_initial_total_mb": 0.6,
+        "note": "Q4_0 KV cache at 32768 tokens = ~144MB (16 layers × 9MB). Dynamic allocation saves ~684MB RSS. Even Q4_0 shows large savings when context window is extended."
       }
     }
   ],
@@ -170,8 +195,7 @@
     "Output quality is identical between static and dynamic allocation (verified with temperature=0 greedy decoding)",
     "Growth events follow expected power-of-2 doubling pattern (32->64->128->256->512)",
     "Dynamic cache + sliding window eviction interoperate correctly without crashes",
-    "Memory savings confirmed with F32 KV cache: ~295MB RSS reduction (dynamic vs static 2048)",
-    "Q4_0 KV cache too small (~9.4MB) for RSS-level savings observation",
+    "Memory savings scale with KV cache size: Q4_0@2048 ~0MB, F32@2048 ~295MB, Q4_0@32768 ~684MB",
     "Dynamic allocation provides faster TTFT on OpenCL (526ms vs 571ms) due to smaller initial buffer",
     "All 16 layers grow independently and correctly"
   ]
