@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "metadata": {
+    "test_type": "stress_correctness",
+    "backend": "auto,opencl",
+    "date": "2026-03-04T11:14:50.499500"
+  },
+  "baseline": {},
+  "benchmark_results": {
+    "pass_count": 88,
+    "fail_count": 4,
+    "max_error": 0.008854
+  },
+  "events": [],
+  "timeseries": []
+}

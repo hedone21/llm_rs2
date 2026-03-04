@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "type": "stress_test_summary",
+  "metadata": {
+    "date": "2026-03-04T11:04:43.838819",
+    "device": "SM-S931N",
+    "total_duration_sec": 459.8,
+    "phases_run": [
+      1
+    ],
+    "git_commit": "8bf7774"
+  },
+  "overall_verdict": "FAIL",
+  "phases": {
+    "thermal": {
+      "verdict": "FAIL",
+      "runs": [
+        {
+          "run": 1,
+          "exit_code": 0,
+          "duration_sec": 75.7,
+          "start_temp_c": 36.5,
+          "max_temp_c": 84.6,
+          "delta_temp_c": 48.1,
+          "ttft_ms": 118.91,
+          "tbt_ms": 34.02,
+          "tokens_per_sec": 29.4,
+          "timeseries_samples": 24
+        },
+        {
+          "run": 2,
+          "exit_code": 0,
+          "duration_sec": 86.8,
+          "start_temp_c": 36.9,
+          "max_temp_c": 68.0,
+          "delta_temp_c": 31.1,
+          "ttft_ms": 123.97,
+          "tbt_ms": 38.63,
+          "tokens_per_sec": 25.9,
+          "timeseries_samples": 25
+        },
+        {
+          "run": 3,
+          "exit_code": 0,
+          "duration_sec": 101.1,
+          "start_temp_c": 37.6,
+          "max_temp_c": 62.3,
+          "delta_temp_c": 24.7,
+          "ttft_ms": 117.72,
+          "tbt_ms": 46.3,
+          "tokens_per_sec": 21.6,
+          "timeseries_samples": 29
+        }
+      ],
+      "summary": {
+        "worst_max_temp_c": 84.6,
+        "throttle_ratio": 1.361,
+        "tbt_cv_pct": 12.8,
+        "temp_verdict": "FAIL",
+        "throttle_verdict": "FAIL"
+      }
+    }
+  }
+}

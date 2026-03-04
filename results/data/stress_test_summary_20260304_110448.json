@@ -1,0 +1,181 @@
+{
+  "version": 1,
+  "type": "stress_test_summary",
+  "metadata": {
+    "date": "2026-03-04T11:10:38.528692",
+    "device": "SM-S931N",
+    "total_duration_sec": 350.2,
+    "phases_run": [
+      2
+    ],
+    "git_commit": "8bf7774"
+  },
+  "overall_verdict": "WARN",
+  "phases": {
+    "sustainability": {
+      "verdict": "WARN",
+      "backends": {
+        "opencl": {
+          "iterations": [
+            {
+              "iteration": 1,
+              "exit_code": 0,
+              "ttft_ms": 122.28,
+              "tbt_ms": 20.95,
+              "tokens_per_sec": 47.7
+            },
+            {
+              "iteration": 2,
+              "exit_code": 0,
+              "ttft_ms": 124.68,
+              "tbt_ms": 21.01,
+              "tokens_per_sec": 47.6
+            },
+            {
+              "iteration": 3,
+              "exit_code": 0,
+              "ttft_ms": 126.46,
+              "tbt_ms": 20.91,
+              "tokens_per_sec": 47.8
+            },
+            {
+              "iteration": 4,
+              "exit_code": 0,
+              "ttft_ms": 129.1,
+              "tbt_ms": 20.84,
+              "tokens_per_sec": 48.0
+            },
+            {
+              "iteration": 5,
+              "exit_code": 0,
+              "ttft_ms": 128.44,
+              "tbt_ms": 20.86,
+              "tokens_per_sec": 47.9
+            },
+            {
+              "iteration": 6,
+              "exit_code": 0,
+              "ttft_ms": 126.61,
+              "tbt_ms": 20.9,
+              "tokens_per_sec": 47.9
+            },
+            {
+              "iteration": 7,
+              "exit_code": 0,
+              "ttft_ms": 126.27,
+              "tbt_ms": 20.81,
+              "tokens_per_sec": 48.0
+            },
+            {
+              "iteration": 8,
+              "exit_code": 0,
+              "ttft_ms": 126.88,
+              "tbt_ms": 21.06,
+              "tokens_per_sec": 47.5
+            },
+            {
+              "iteration": 9,
+              "exit_code": 0,
+              "ttft_ms": 128.2,
+              "tbt_ms": 20.64,
+              "tokens_per_sec": 48.4
+            },
+            {
+              "iteration": 10,
+              "exit_code": 0,
+              "ttft_ms": 126.57,
+              "tbt_ms": 20.8,
+              "tokens_per_sec": 48.1
+            }
+          ],
+          "tbt_cv_pct": 0.5,
+          "ttft_cv_pct": 1.5,
+          "first_vs_last_ratio": 0.993,
+          "avg_tbt_ms": 20.9,
+          "avg_ttft_ms": 126.5,
+          "verdict": "PASS"
+        },
+        "cpu": {
+          "iterations": [
+            {
+              "iteration": 1,
+              "exit_code": 0,
+              "ttft_ms": 147.05,
+              "tbt_ms": 69.84,
+              "tokens_per_sec": 14.3
+            },
+            {
+              "iteration": 2,
+              "exit_code": 0,
+              "ttft_ms": 160.32,
+              "tbt_ms": 76.85,
+              "tokens_per_sec": 13.0
+            },
+            {
+              "iteration": 3,
+              "exit_code": 0,
+              "ttft_ms": 131.98,
+              "tbt_ms": 57.66,
+              "tokens_per_sec": 17.3
+            },
+            {
+              "iteration": 4,
+              "exit_code": 0,
+              "ttft_ms": 157.7,
+              "tbt_ms": 76.64,
+              "tokens_per_sec": 13.0
+            },
+            {
+              "iteration": 5,
+              "exit_code": 0,
+              "ttft_ms": 154.3,
+              "tbt_ms": 64.92,
+              "tokens_per_sec": 15.4
+            },
+            {
+              "iteration": 6,
+              "exit_code": 0,
+              "ttft_ms": 154.58,
+              "tbt_ms": 46.12,
+              "tokens_per_sec": 21.7
+            },
+            {
+              "iteration": 7,
+              "exit_code": 0,
+              "ttft_ms": 152.68,
+              "tbt_ms": 72.37,
+              "tokens_per_sec": 13.8
+            },
+            {
+              "iteration": 8,
+              "exit_code": 0,
+              "ttft_ms": 148.47,
+              "tbt_ms": 71.1,
+              "tokens_per_sec": 14.1
+            },
+            {
+              "iteration": 9,
+              "exit_code": 0,
+              "ttft_ms": 123.62,
+              "tbt_ms": 60.99,
+              "tokens_per_sec": 16.4
+            },
+            {
+              "iteration": 10,
+              "exit_code": 0,
+              "ttft_ms": 144.56,
+              "tbt_ms": 57.07,
+              "tokens_per_sec": 17.5
+            }
+          ],
+          "tbt_cv_pct": 14.3,
+          "ttft_cv_pct": 7.5,
+          "first_vs_last_ratio": 0.817,
+          "avg_tbt_ms": 65.4,
+          "avg_ttft_ms": 147.5,
+          "verdict": "WARN"
+        }
+      }
+    }
+  }
+}

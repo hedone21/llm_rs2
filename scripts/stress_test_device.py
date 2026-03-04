@@ -51,11 +51,11 @@ def run_command(cmd, check=True, dry_run=False):
 
 def run_device_inference(device_cmd, timeout=600):
     """Run generate on device via adb shell. Returns (exit_code, stdout_text, duration_sec)."""
-    full_cmd = f'adb shell "LD_LIBRARY_PATH=/data/local/tmp {device_cmd}"'
+    adb_args = ["adb", "shell", f"LD_LIBRARY_PATH=/data/local/tmp {device_cmd}"]
     start = time.time()
     try:
         result = subprocess.run(
-            full_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            adb_args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=timeout,
         )
         duration = time.time() - start
@@ -194,7 +194,7 @@ def phase_thermal(monitor, args, timestamp):
     runs = []
     device_cmd = (
         f"{GENERATE_BIN_REMOTE} --model-path {MODEL_PATH} "
-        f'--prompt "Hello world" -n 2048 -b opencl --temperature 0'
+        f'--prompt Hello -n 2048 -b opencl --temperature 0'
     )
 
     for i in range(1, 4):
@@ -310,7 +310,7 @@ def phase_sustainability(monitor, args, timestamp):
         print(f"\n  --- Backend: {backend} ---")
         device_cmd = (
             f"{GENERATE_BIN_REMOTE} --model-path {MODEL_PATH} "
-            f'--prompt "Hello world" -n 128 -b {backend} --temperature 0'
+            f'--prompt Hello -n 128 -b {backend} --temperature 0'
         )
 
         iterations = []
@@ -558,14 +558,29 @@ def phase_correctness(monitor, args, timestamp):
             "device_temp_at_test_c": round(device_temp, 1),
         }
 
-    # Parse PASS/FAIL from output
-    pass_count = len(re.findall(r'\bPASS\b', stdout))
-    fail_count = len(re.findall(r'\bFAIL\b', stdout))
-    error_count = len(re.findall(r'\bERROR\b', stdout))
+    # Parse results from the table format:
+    # Each row has columns: Op | Shape | DType | Backend1 result | Backend2 result
+    # Successful: "0.23ms  | 0.000000"   Failed: "FAIL"   Error: "ERROR"
+    pass_count = 0
+    fail_count = 0
+    error_count = 0
+    max_error = 0.0
 
-    # Extract max numerical error
-    errors = re.findall(r'err=\s*([\d.eE+-]+)', stdout)
-    max_error = max((float(e) for e in errors), default=0.0) if errors else 0.0
+    for line in stdout.splitlines():
+        line_stripped = line.strip()
+        # Count FAIL/ERROR columns in table rows (each row can have 2 backend results)
+        if "|" in line_stripped and any(
+            op in line_stripped for op in ["MatMul", "Softmax", "RMSNorm", "RoPE"]
+        ):
+            # Count occurrences in this row
+            fail_count += line_stripped.count("FAIL")
+            error_count += line_stripped.count("ERROR")
+            # Count successful results (has "ms  |" pattern with error value)
+            successes = re.findall(r'([\d.]+)ms\s+\|\s+([\d.]+)', line_stripped)
+            pass_count += len(successes)
+            for _, err_str in successes:
+                err_val = float(err_str)
+                max_error = max(max_error, err_val)
 
     result = {
         "exit_code": exit_code,

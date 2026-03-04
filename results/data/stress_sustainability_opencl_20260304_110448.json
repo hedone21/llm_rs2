@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "metadata": {
+    "model": "llama3.2-1b",
+    "num_tokens": 128,
+    "backend": "opencl",
+    "prefill_type": "custom_prompt",
+    "eviction_policy": "none",
+    "test_type": "stress_sustainability",
+    "iterations": 10,
+    "date": "2026-03-04T11:07:14.138299"
+  },
+  "baseline": {},
+  "benchmark_results": {
+    "ttft_ms": 126.5,
+    "tbt_ms": 20.9,
+    "tokens_per_sec": 47.8
+  },
+  "events": [],
+  "timeseries": []
+}
