@@ -19,8 +19,11 @@ use std::sync::Arc;
 use tokenizers::Tokenizer;
 
 #[cfg(feature = "resilience")]
+use llm_rs2::resilience::DbusTransport;
+#[cfg(unix)]
+use llm_rs2::resilience::UnixSocketTransport;
 use llm_rs2::resilience::{
-    DbusListener, InferenceContext, ResilienceAction, ResilienceManager, execute_action,
+    InferenceContext, ResilienceAction, ResilienceManager, SignalListener, execute_action,
 };
 
 #[derive(Parser, Debug)]
@@ -96,9 +99,13 @@ struct Args {
     #[arg(long, default_value_t = 0.75)]
     eviction_target_ratio: f32,
 
-    /// Enable D-Bus resilience manager for adaptive inference
+    /// Enable resilience manager for adaptive inference
     #[arg(long, default_value_t = false)]
     enable_resilience: bool,
+
+    /// Resilience signal transport: "dbus" or "unix:<path>"
+    #[arg(long, default_value = "dbus")]
+    resilience_transport: String,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -315,17 +322,29 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 5. Resilience Manager (optional)
-    #[cfg(feature = "resilience")]
     let mut resilience_manager = if args.enable_resilience {
         let (tx, rx) = std::sync::mpsc::channel();
-        let listener = DbusListener::new(tx);
-        let _listener_handle = listener.spawn();
-        eprintln!("[Resilience] Manager enabled — listening for D-Bus signals");
+        let _listener_handle = match args.resilience_transport.as_str() {
+            #[cfg(feature = "resilience")]
+            "dbus" => SignalListener::new(DbusTransport::new(), tx).spawn(),
+            #[cfg(unix)]
+            s if s.starts_with("unix:") => {
+                let path = std::path::PathBuf::from(&s[5..]);
+                SignalListener::new(UnixSocketTransport::new(path), tx).spawn()
+            }
+            other => {
+                eprintln!("[Resilience] Unknown transport: {}", other);
+                return Ok(());
+            }
+        };
+        eprintln!(
+            "[Resilience] Manager enabled — transport: {}",
+            args.resilience_transport
+        );
         Some(ResilienceManager::new(rx))
     } else {
         None
     };
-    #[cfg(feature = "resilience")]
     let mut throttle_delay_ms: u64 = 0;
 
     // 6. Inference Loop
@@ -572,7 +591,6 @@ fn main() -> anyhow::Result<()> {
             })?;
 
             // ── Resilience checkpoint ─────────────────────────
-            #[cfg(feature = "resilience")]
             if let Some(rm) = &mut resilience_manager {
                 let mut suspended = false;
                 let mut reject_new = false;

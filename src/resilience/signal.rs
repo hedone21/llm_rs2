@@ -1,6 +1,9 @@
+use serde::{Deserialize, Serialize};
+
 /// Common severity level shared by all signals.
 /// Ordered by severity: Normal < Warning < Critical < Emergency.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Level {
     Normal,
     Warning,
@@ -9,7 +12,8 @@ pub enum Level {
 }
 
 /// Recommended compute backend from Manager.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum RecommendedBackend {
     Cpu,
     Gpu,
@@ -17,7 +21,8 @@ pub enum RecommendedBackend {
 }
 
 /// Reason for compute guidance signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ComputeReason {
     CpuBottleneck,
     GpuBottleneck,
@@ -28,13 +33,15 @@ pub enum ComputeReason {
 }
 
 /// Reason for energy constraint signal.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EnergyReason {
     BatteryLow,
     BatteryCritical,
     PowerLimit,
     ThermalPower,
     Charging,
+    #[serde(rename = "none")]
     None,
 }
 
@@ -93,8 +100,9 @@ impl EnergyReason {
     }
 }
 
-/// System signal received from D-Bus Manager (`org.llm.Manager1`).
-#[derive(Debug, Clone)]
+/// System signal received from the resource manager.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SystemSignal {
     MemoryPressure {
         level: Level,
@@ -243,6 +251,75 @@ mod tests {
             Some(EnergyReason::None)
         );
         assert_eq!(EnergyReason::from_dbus_str("solar"), None);
+    }
+
+    #[test]
+    fn test_level_serde_roundtrip() {
+        for level in [
+            Level::Normal,
+            Level::Warning,
+            Level::Critical,
+            Level::Emergency,
+        ] {
+            let json = serde_json::to_string(&level).unwrap();
+            let back: Level = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, level);
+        }
+    }
+
+    #[test]
+    fn test_system_signal_memory_serde() {
+        let sig = SystemSignal::MemoryPressure {
+            level: Level::Critical,
+            available_bytes: 1024,
+            reclaim_target_bytes: 512,
+        };
+        let json = serde_json::to_string(&sig).unwrap();
+        let back: SystemSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.level(), Level::Critical);
+    }
+
+    #[test]
+    fn test_system_signal_all_variants_serde() {
+        let signals = vec![
+            SystemSignal::MemoryPressure {
+                level: Level::Warning,
+                available_bytes: 1000,
+                reclaim_target_bytes: 500,
+            },
+            SystemSignal::ComputeGuidance {
+                level: Level::Normal,
+                recommended_backend: RecommendedBackend::Gpu,
+                reason: ComputeReason::GpuAvailable,
+                cpu_usage_pct: 30.0,
+                gpu_usage_pct: 10.0,
+            },
+            SystemSignal::ThermalAlert {
+                level: Level::Critical,
+                temperature_mc: 80000,
+                throttling_active: true,
+                throttle_ratio: 0.5,
+            },
+            SystemSignal::EnergyConstraint {
+                level: Level::Emergency,
+                reason: EnergyReason::BatteryCritical,
+                power_budget_mw: 0,
+            },
+        ];
+        for sig in &signals {
+            let json = serde_json::to_string(sig).unwrap();
+            let back: SystemSignal = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.level(), sig.level());
+        }
+    }
+
+    #[test]
+    fn test_energy_reason_none_serde() {
+        let reason = EnergyReason::None;
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(json, "\"none\"");
+        let back: EnergyReason = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, EnergyReason::None);
     }
 
     #[test]

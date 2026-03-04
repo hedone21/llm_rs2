@@ -1,6 +1,5 @@
-use std::sync::mpsc;
-
 use super::signal::{ComputeReason, EnergyReason, Level, RecommendedBackend, SystemSignal};
+use super::transport::{Transport, TransportError};
 
 /// D-Bus well-known name for the LLM resource manager.
 const MANAGER_DEST: &str = "org.llm.Manager1";
@@ -9,45 +8,57 @@ const MANAGER_PATH: &str = "/org/llm/Manager1";
 /// D-Bus interface for the LLM resource manager.
 const MANAGER_IFACE: &str = "org.llm.Manager1";
 
-/// D-Bus listener running in a separate thread.
-/// Connects to System Bus and receives signals from `org.llm.Manager1`.
-pub struct DbusListener {
-    tx: mpsc::Sender<SystemSignal>,
+/// D-Bus transport that connects to `org.llm.Manager1` on the System Bus.
+pub struct DbusTransport {
+    conn: Option<zbus::blocking::Connection>,
+    proxy: Option<zbus::blocking::Proxy<'static>>,
+    signals: Option<Box<dyn Iterator<Item = zbus::Message> + Send>>,
 }
 
-impl DbusListener {
-    pub fn new(tx: mpsc::Sender<SystemSignal>) -> Self {
-        Self { tx }
+impl DbusTransport {
+    pub fn new() -> Self {
+        Self {
+            conn: None,
+            proxy: None,
+            signals: None,
+        }
+    }
+}
+
+impl Transport for DbusTransport {
+    fn connect(&mut self) -> Result<(), TransportError> {
+        let conn = zbus::blocking::Connection::system()
+            .map_err(|e| TransportError::ConnectionFailed(format!("D-Bus system bus: {}", e)))?;
+
+        let proxy = zbus::blocking::Proxy::new(&conn, MANAGER_DEST, MANAGER_PATH, MANAGER_IFACE)
+            .map_err(|e| TransportError::ConnectionFailed(format!("D-Bus proxy: {}", e)))?;
+
+        let signals = proxy.receive_all_signals().map_err(|e| {
+            TransportError::ConnectionFailed(format!("D-Bus signal iterator: {}", e))
+        })?;
+
+        // Store connection and proxy to keep them alive.
+        // Use 'static lifetime by leaking the connection (it lives for the process lifetime).
+        self.conn = Some(conn);
+        self.proxy = Some(proxy);
+        self.signals = Some(Box::new(signals));
+
+        log::info!("D-Bus transport connected to {}", MANAGER_DEST);
+        Ok(())
     }
 
-    /// Start D-Bus signal reception loop in a separate thread.
-    /// If Manager unavailable or D-Bus connection fails,
-    /// logs a warning and exits gracefully — LLM continues without resilience.
-    pub fn spawn(self) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            if let Err(e) = self.run() {
-                log::warn!(
-                    "D-Bus listener exited: {}. LLM continues without resilience.",
-                    e
-                );
-            }
-        })
-    }
+    fn recv(&mut self) -> Result<SystemSignal, TransportError> {
+        let signals = self
+            .signals
+            .as_mut()
+            .ok_or_else(|| TransportError::ConnectionFailed("not connected".into()))?;
 
-    fn run(&self) -> anyhow::Result<()> {
-        // 1. Connect to System Bus (blocking)
-        let conn = zbus::blocking::Connection::system()?;
+        loop {
+            let msg = match signals.next() {
+                Some(msg) => msg,
+                None => return Err(TransportError::Disconnected),
+            };
 
-        // 2. Create proxy for org.llm.Manager1
-        let proxy = zbus::blocking::Proxy::new(&conn, MANAGER_DEST, MANAGER_PATH, MANAGER_IFACE)?;
-
-        log::info!("D-Bus listener connected to {}", MANAGER_DEST);
-
-        // 3. Receive all signals via blocking iterator
-        let signals = proxy.receive_all_signals()?;
-
-        // 4. Signal reception loop
-        for msg in signals {
             let header = msg.header();
             let member = match header.member() {
                 Some(m) => m.to_owned(),
@@ -60,27 +71,17 @@ impl DbusListener {
                 "ThermalAlert" => parse_thermal_alert(&msg),
                 "EnergyConstraint" => parse_energy_constraint(&msg),
                 _ => {
-                    log::debug!("Unknown signal: {}", member);
+                    log::debug!("Unknown D-Bus signal: {}", member);
                     continue;
                 }
             };
 
-            match result {
-                Ok(sys_signal) => {
-                    log::debug!("Received D-Bus signal: {:?}", sys_signal);
-                    if self.tx.send(sys_signal).is_err() {
-                        log::info!("Receiver dropped. Stopping D-Bus listener.");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("Failed to parse signal {}: {}", member, e);
-                }
-            }
+            return result.map_err(|e| TransportError::ParseError(format!("{}: {}", member, e)));
         }
+    }
 
-        log::info!("D-Bus listener stopped.");
-        Ok(())
+    fn name(&self) -> &str {
+        "D-Bus"
     }
 }
 
