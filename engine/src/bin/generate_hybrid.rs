@@ -1,11 +1,17 @@
 use clap::Parser;
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::backend::opencl::OpenCLBackend;
+use llm_rs2::core::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
+use llm_rs2::core::cache_manager::CacheManager;
+use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
+use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
+use llm_rs2::core::eviction::snap_kv::SnapKVPolicy;
 use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
+use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
@@ -46,6 +52,26 @@ struct Args {
 
     #[arg(long, default_value_t = 64)]
     repetition_window: usize,
+
+    /// Eviction policy for KV cache management (none, sliding, snapkv)
+    #[arg(long, default_value = "none")]
+    eviction_policy: String,
+
+    /// Window size for sliding window / snapkv eviction (tokens)
+    #[arg(long, default_value_t = 1024)]
+    eviction_window: usize,
+
+    /// Number of prefix tokens to protect from eviction (defaults to prompt length)
+    #[arg(long)]
+    protected_prefix: Option<usize>,
+
+    /// Memory threshold in MB below which eviction triggers
+    #[arg(long, default_value_t = 256)]
+    memory_threshold_mb: usize,
+
+    /// Target ratio of cache to keep when evicting (0.1 to 0.99)
+    #[arg(long, default_value_t = 0.75)]
+    eviction_target_ratio: f32,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -197,6 +223,64 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
+    // Setup CacheManager
+    let actual_protected_prefix = args.protected_prefix.unwrap_or(tokens.len());
+
+    let cache_manager = {
+        let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> =
+            match args.eviction_policy.as_str() {
+                "none" => Box::new(NoEvictionPolicy::new()),
+                "sliding" => Box::new(SlidingWindowPolicy::new(
+                    args.eviction_window,
+                    actual_protected_prefix,
+                )),
+                "snapkv" => Box::new(SnapKVPolicy::new(
+                    args.eviction_window,
+                    0.5,
+                    actual_protected_prefix,
+                )),
+                other => anyhow::bail!(
+                    "Unknown eviction policy: '{}'. Use: none, sliding, snapkv",
+                    other
+                ),
+            };
+        let monitor = Box::new(LinuxSystemMonitor);
+        let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
+        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
+    };
+
+    // Setup AttentionScoreAccumulator for SnapKV
+    let mut score_accumulator = if args.eviction_policy == "snapkv" {
+        let mut acc = AttentionScoreAccumulator::new(
+            max_seq_len,
+            model.config.num_attention_heads,
+            model.config.num_hidden_layers,
+            3,
+            0.1,
+        );
+        acc.set_active(true);
+        Some(acc)
+    } else {
+        None
+    };
+
+    if args.eviction_policy != "none" {
+        println!(
+            "[Hybrid] Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
+            args.eviction_policy,
+            args.eviction_window,
+            actual_protected_prefix,
+            args.eviction_target_ratio,
+            args.memory_threshold_mb
+        );
+    }
+
+    let cm_ref = if args.eviction_policy == "none" {
+        None
+    } else {
+        Some(&cache_manager)
+    };
+
     let mut tokens_generated = Vec::new();
     tokens_generated.extend_from_slice(&tokens);
     let mut start_pos = 0;
@@ -250,11 +334,11 @@ fn main() -> anyhow::Result<()> {
                 x_gen: None,
                 workspace: None,
                 use_gpu_attn: false,
-                cache_manager: None,
+                cache_manager: cm_ref,
                 score_accumulator: None,
             })?
             .ok_or(())
-            .ok(); // No eviction configured
+            .ok();
 
         // Sample last token
         let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
@@ -322,6 +406,12 @@ fn main() -> anyhow::Result<()> {
     let mut is_gpu = false;
 
     for _ in 0..(args.num_tokens - 1) {
+        // Check physical cache capacity
+        if kv_caches[0].current_pos >= max_seq_len {
+            println!("\n[Hybrid] Stopped: Max context length reached");
+            break;
+        }
+
         // CHECK THRESHOLD AND SWITCH
         if !is_gpu && start_pos >= args.switch_threshold {
             println!("\n\n[Hybrid] Switching to GPU at token {}...", start_pos);
@@ -406,6 +496,11 @@ fn main() -> anyhow::Result<()> {
             Tensor::new(Shape::new(vec![1, 1]), cpu_indices_buf, cpu_backend.clone())
         };
 
+        // Apply decay to accumulated importance scores before this step
+        if let Some(ref mut acc) = score_accumulator {
+            acc.begin_step();
+        }
+
         model
             .forward_into(LlamaModelForwardArgs {
                 input_tokens: &input_tensor,
@@ -421,11 +516,11 @@ fn main() -> anyhow::Result<()> {
                 x_gen: _x_gen.as_mut(),
                 workspace: _gen_ws.as_mut(),
                 use_gpu_attn: is_gpu,
-                cache_manager: None,
-                score_accumulator: None,
+                cache_manager: cm_ref,
+                score_accumulator: score_accumulator.as_mut(),
             })?
             .ok_or(())
-            .ok(); // No eviction configured
+            .ok();
 
         // Sample
         let mut logits_cpu = vec![0.0f32; vocab_size];
