@@ -1,9 +1,9 @@
 # llm_rs2 디바이스 스트레스 테스트 리포트
 
 **테스트 일시**: 2026-03-04 10:57 ~ 11:15 KST
-**디바이스**: Samsung Galaxy S24 (SM-S931N)
-**SoC**: Qualcomm Snapdragon 8 Gen 3 (SM8750)
-**RAM**: 12GB | **GPU**: Adreno 750
+**디바이스**: Samsung Galaxy S25 (SM-S931N)
+**SoC**: Qualcomm Snapdragon 8 Elite (SM8750)
+**RAM**: 12GB | **GPU**: Adreno 830
 **모델**: Llama 3.2 1B (Q4_0)
 **바이너리 빌드**: 2026-03-04 (commit `5cd6c93`, GPU buffer_shift 수정 포함)
 **총 테스트 시간**: ~18분 (Phase 1-4), Phase 3 재검증 ~6분, Phase 3+5 추가 검증 ~20분
@@ -42,7 +42,7 @@ OpenCL 백엔드로 2048 토큰 생성을 3회 반복하여 열 스로틀링을 
 
 ### 분석
 
-Snapdragon 8 Gen 3의 Adreno 750 GPU는 초기 cold 상태에서 84.6°C까지 급등하며, 이후 DVFS(Dynamic Voltage and Frequency Scaling)가 적극 개입하여 2~3차 실행에서는 온도가 낮아지는 대신 성능이 크게 저하됩니다.
+Snapdragon 8 Elite의 Adreno 830 GPU는 초기 cold 상태에서 84.6°C까지 급등하며, 이후 DVFS(Dynamic Voltage and Frequency Scaling)가 적극 개입하여 2~3차 실행에서는 온도가 낮아지는 대신 성능이 크게 저하됩니다.
 
 **1차 → 3차 실행 간 성능 변화**:
 - 처리량: 29.4 → 21.6 tok/s (**-26.5%**)
