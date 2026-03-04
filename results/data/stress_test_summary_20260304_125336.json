@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "type": "stress_test_summary",
+  "metadata": {
+    "date": "2026-03-04T12:59:23.441948",
+    "device": "SM-S931N",
+    "total_duration_sec": 347.1,
+    "phases_run": [
+      5
+    ],
+    "git_commit": "bc7f35d"
+  },
+  "overall_verdict": "PASS",
+  "phases": {
+    "quality": {
+      "verdict": "PASS",
+      "tests": {
+        "baseline_no_eviction": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 85.4,
+          "ttft_ms": 25365.25,
+          "tbt_ms": 55.06,
+          "generated_text_len": 5181,
+          "generated_word_count": 726,
+          "eviction_count": 0
+        },
+        "mild_eviction": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 89.0,
+          "ttft_ms": 26061.29,
+          "tbt_ms": 55.55,
+          "generated_text_len": 5142,
+          "generated_word_count": 721,
+          "eviction_count": 0
+        },
+        "aggressive_eviction": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 77.0,
+          "ttft_ms": 26023.21,
+          "tbt_ms": 43.44,
+          "generated_text_len": 5142,
+          "generated_word_count": 721,
+          "eviction_count": 0
+        }
+      },
+      "comparisons": {
+        "baseline_vs_mild_eviction": {
+          "common_tokens": 721,
+          "total_tokens_a": 726,
+          "total_tokens_b": 721,
+          "common_chars": 5142,
+          "total_chars_a": 5181,
+          "total_chars_b": 5142,
+          "common_ratio": 1.0
+        },
+        "baseline_vs_aggressive_eviction": {
+          "common_tokens": 721,
+          "total_tokens_a": 726,
+          "total_tokens_b": 721,
+          "common_chars": 5142,
+          "total_chars_a": 5181,
+          "total_chars_b": 5142,
+          "common_ratio": 1.0
+        }
+      }
+    }
+  }
+}
