@@ -15,14 +15,15 @@ llm.rs (repo: llm_rs2) — a high-performance on-device LLM inference framework 
 ```bash
 # Android cross-compilation (MUST source env first)
 source android.source
-cargo build --target aarch64-linux-android --release --bin generate
+cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
 
 # Host build (CPU-only, for development)
-cargo check          # syntax check
-cargo test           # unit tests (platform-agnostic logic only)
+cargo check --workspace    # syntax check (all crates)
+cargo test -p llm_rs2      # unit tests (engine)
+cargo test -p llm_shared   # unit tests (shared types)
 
 # Code quality
-./.agent/skills/developing/scripts/sanity_check.sh   # runs cargo fmt + cargo clippy
+./.agent/skills/developing/scripts/sanity_check.sh   # runs cargo fmt + cargo clippy (workspace)
 ```
 
 ## Testing
@@ -37,16 +38,23 @@ Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fi
 
 ## Architecture
 
-**Module structure** (`src/lib.rs`):
+**Cargo workspace** with 3 crates:
+- `engine/` — LLM inference engine (`llm_rs2` crate)
+- `shared/` — Shared signal types (`llm_shared` crate)
+- `manager/` — System resource manager service (`llm_manager` crate)
+- `dashboard/` — Web dashboard (Python/Flask, not a Rust crate)
+
+**Engine module structure** (`engine/src/lib.rs`):
 - `core/` — Traits and abstractions: `Backend` (15+ ops), `Buffer`, `Tensor`, `KVCache`, eviction policies
 - `backend/cpu/` — CPU backend with ARM64 NEON (`neon.rs`) and x86 AVX2 (`x86.rs`) specializations
-- `backend/opencl/` — OpenCL GPU backend; kernels live in `kernels/*.cl` (~78 files)
+- `backend/opencl/` — OpenCL GPU backend; kernels live in `engine/kernels/*.cl` (~78 files)
 - `models/llama/` — Llama 3.2 model loading and forward pass
 - `layers/` — Transformer layer, attention (naive + flash), pre-allocated workspace buffers
 - `memory/` — Galloc shared allocator
 - `buffer/` — SharedBuffer (zero-copy GPU↔CPU) and UnifiedBuffer
+- `resilience/` — Resilience manager (D-Bus/UnixSocket IPC, strategy patterns)
 
-**Key binaries** (`src/bin/`):
+**Key binaries** (`engine/src/bin/`):
 - `generate` — Main inference binary (single backend, CPU or OpenCL)
 - `generate_hybrid` — Dynamic CPU↔GPU switching based on sequence length
 - `test_backend` — Backend correctness verification (compares CPU vs OpenCL)
@@ -79,7 +87,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 
 - `scripts/android_profile.py` — On-device profiling with JSON output
 - `scripts/visualize_profile.py` — Generate performance graphs
-- `web_dashboard/` — Flask dashboard for benchmark visualization (`cd web_dashboard && python app.py`)
+- `dashboard/` — Flask dashboard for benchmark visualization (`cd dashboard && python app.py`)
 - Results stored in `results/data/` (JSON) — **committed to repo as test data**, plots in `results/plots/` (gitignored)
 
 ## Key Documentation
@@ -107,10 +115,10 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 ## Web Dashboard
 
 ```bash
-cd web_dashboard && .venv/bin/python app.py   # http://localhost:5000
+cd dashboard && .venv/bin/python app.py   # http://localhost:5000
 ```
 
-Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoints under `/api/`. Dashboard uses Flask + Plotly.js, venv at `web_dashboard/.venv/`.
+Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoints under `/api/`. Dashboard uses Flask + Plotly.js, venv at `dashboard/.venv/`.
 
 ## TODO System
 

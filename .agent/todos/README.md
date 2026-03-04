@@ -9,7 +9,7 @@ Antigravity 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
 ### 1. 아키텍트 (Architect)
 
 - **책임**: 시스템 설계, 트레이트/인터페이스 정의, 모듈 간 의존성 관리, 기술 결정
-- **소유 영역**: `src/core/` (backend.rs, buffer.rs 등 트레이트), `ARCHITECTURE.md`, 모듈 구조
+- **소유 영역**: `engine/src/core/`, `shared/`, Cargo workspace 구조, `ARCHITECTURE.md`
 - **도구**: `cargo check`, 설계 문서, 다이어그램
 - **산출물**: 설계 문서, RFC, 트레이트 정의, 아키텍처 다이어그램
 - **자율 결정**: 내부 트레이트 리팩터링, 모듈 구조 변경
@@ -19,7 +19,7 @@ Antigravity 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
 ### 2. Rust 개발자 (Rust Developer / LLM Developer)
 
 - **책임**: 백엔드 구현, 모델 추론 로직, 성능 최적화, 버그 수정
-- **소유 영역**: `src/backend/`, `src/models/`, `src/layers/`, `src/memory/`, `src/buffer/`, `src/bin/`, `src/resilience/`
+- **소유 영역**: `engine/src/`, `manager/`, `shared/`
 - **도구**: `cargo build/test/check`, `sanity_check.sh`, 프로파일링 스크립트
 - **산출물**: 기능 구현 코드, 유닛 테스트, 벤치마크 결과
 - **자율 결정**: 함수 내부 최적화, 버그 수정, 유닛 테스트 작성
@@ -29,7 +29,7 @@ Antigravity 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
 ### 3. 프론트엔드 개발자 (Frontend Developer / Dashboard Developer)
 
 - **책임**: 웹 대시보드 개발, 벤치마크 시각화, 모니터링 UI
-- **소유 영역**: `web_dashboard/`, `scripts/visualize_*.py`, `scripts/plot_*.py`
+- **소유 영역**: `dashboard/`, `scripts/visualize_*.py`, `scripts/plot_*.py`
 - **도구**: Flask, Plotly.js, Python, HTML/CSS/JS
 - **산출물**: 대시보드 UI, 차트/그래프, REST API 엔드포인트
 - **자율 결정**: UI 레이아웃, 차트 스타일, 프론트엔드 라이브러리 선택
@@ -39,7 +39,7 @@ Antigravity 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
 ### 4. 테스터 (Tester)
 
 - **책임**: 테스트 전략 수립, 테스트 케이스 설계, QA 검증, 품질 게이트 관리
-- **소유 영역**: `tests/`, `docs/14_component_status.md`, `scripts/update_test_status.py`, `.agent/rules/TESTING_STRATEGY.md`
+- **소유 영역**: `engine/tests/`, `docs/14_component_status.md`, `scripts/update_test_status.py`, `.agent/rules/TESTING_STRATEGY.md`
 - **도구**: `cargo test`, `run_android.sh`, `stress_test_adb.py`, `test_backend`
 - **산출물**: 테스트 케이스, 테스트 결과 리포트, 품질 게이트 업데이트
 - **자율 결정**: 테스트 케이스 추가, 테스트 스크립트 수정, 품질 게이트 기준 조정

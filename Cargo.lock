@@ -841,6 +841,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
+name = "llm_manager"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "env_logger",
+ "llm_shared",
+ "log",
+ "serde",
+ "serde_json",
+ "zbus",
+]
+
+[[package]]
 name = "llm_rs2"
 version = "0.1.0"
 dependencies = [
@@ -848,6 +862,7 @@ dependencies = [
  "clap",
  "env_logger",
  "half",
+ "llm_shared",
  "log",
  "memmap2",
  "ocl",
@@ -858,6 +873,14 @@ dependencies = [
  "serde_json",
  "tokenizers",
  "zbus",
+]
+
+[[package]]
+name = "llm_shared"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
