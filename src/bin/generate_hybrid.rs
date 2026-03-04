@@ -141,13 +141,14 @@ fn main() -> anyhow::Result<()> {
 
     // Start with CPU
     let mut current_backend = cpu_backend.clone();
-    let cpu_memory = Box::new(Galloc::new());
+    let cpu_memory: Arc<dyn Memory> = Arc::new(Galloc::new());
     // Create GPU memory context but don't use it yet
-    let gpu_memory = Box::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
-        gpu_backend_concrete.context.clone(),
-        gpu_backend_concrete.queue.clone(),
-        false, // No zero-copy for now
-    ));
+    let gpu_memory: Arc<dyn Memory> =
+        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+            gpu_backend_concrete.context.clone(),
+            gpu_backend_concrete.queue.clone(),
+            false, // No zero-copy for now
+        ));
 
     // Load Model on CPU initially
     println!("[Hybrid] Loading model on CPU...");
@@ -168,21 +169,32 @@ fn main() -> anyhow::Result<()> {
     let head_dim = model.config.head_dim;
     let num_layers = model.config.num_hidden_layers;
 
+    let initial_kv_capacity = tokens.len().next_power_of_two().max(128).min(max_seq_len);
+
     let mut kv_caches = Vec::new();
     for _ in 0..num_layers {
-        let k_buf = cpu_memory.alloc(max_seq_len * kv_heads * head_dim * 4, DType::F32)?;
-        let v_buf = cpu_memory.alloc(max_seq_len * kv_heads * head_dim * 4, DType::F32)?;
+        let kv_buf_size = initial_kv_capacity * kv_heads * head_dim * 4;
+        let k_buf = cpu_memory.alloc(kv_buf_size, DType::F32)?;
+        let v_buf = cpu_memory.alloc(kv_buf_size, DType::F32)?;
         let k = Tensor::new(
-            Shape::new(vec![1, max_seq_len, kv_heads, head_dim]),
+            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
             k_buf,
             cpu_backend.clone(),
         );
         let v = Tensor::new(
-            Shape::new(vec![1, max_seq_len, kv_heads, head_dim]),
+            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
             v_buf,
             cpu_backend.clone(),
         );
-        kv_caches.push(KVCache::new(k, v, max_seq_len));
+        kv_caches.push(KVCache::new_dynamic(
+            k,
+            v,
+            initial_kv_capacity,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            cpu_memory.clone(),
+        ));
     }
 
     let mut tokens_generated = Vec::new();
@@ -316,8 +328,11 @@ fn main() -> anyhow::Result<()> {
 
             // 1. Migrate KV Cache
             for kv in kv_caches.iter_mut() {
+                let current_capacity = kv.capacity();
+                let saved_pos = kv.current_pos;
+
                 // Read from CPU
-                let k_size = max_seq_len * kv_heads * head_dim * 4;
+                let k_size = current_capacity * kv_heads * head_dim * 4;
                 let mut k_data = vec![0u8; k_size];
                 let mut v_data = vec![0u8; k_size];
 
@@ -339,12 +354,18 @@ fn main() -> anyhow::Result<()> {
                 let v_cpu_tensor =
                     Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
 
-                // Copy to GPU and Create KVCache
-                *kv = KVCache::new(
+                // Copy to GPU and Create KVCache with dynamic allocation
+                let mut new_kv = KVCache::new_dynamic(
                     gpu_backend.copy_from(&k_cpu_tensor)?,
                     gpu_backend.copy_from(&v_cpu_tensor)?,
+                    current_capacity,
                     max_seq_len,
+                    kv_heads,
+                    head_dim,
+                    gpu_memory.clone(),
                 );
+                new_kv.current_pos = saved_pos;
+                *kv = new_kv;
             }
 
             // 2. Switch Backend

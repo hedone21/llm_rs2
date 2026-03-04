@@ -84,6 +84,10 @@ struct Args {
     #[arg(long)]
     protected_prefix: Option<usize>,
 
+    /// Initial KV cache capacity in tokens (0 = auto: prompt length rounded up to power of 2, min 128)
+    #[arg(long, default_value_t = 0)]
+    initial_kv_capacity: usize,
+
     /// Memory threshold in MB below which eviction triggers
     #[arg(long, default_value_t = 256)]
     memory_threshold_mb: usize,
@@ -204,18 +208,18 @@ fn main() -> anyhow::Result<()> {
         "opencl" => Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?),
         _ => anyhow::bail!("Unknown backend: {}", args.backend),
     };
-    let memory: Box<dyn Memory> = if args.backend == "opencl" {
+    let memory: Arc<dyn Memory> = if args.backend == "opencl" {
         let ocl_backend = backend
             .as_any()
             .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
             .ok_or(anyhow::anyhow!("Failed into cast to OpenCLBackend"))?;
-        Box::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
             ocl_backend.context.clone(),
             ocl_backend.queue.clone(),
             args.zero_copy,
         ))
     } else {
-        Box::new(Galloc::new())
+        Arc::new(Galloc::new())
     };
     let model = LlamaModel::load(model_path, backend.clone(), &*memory)?;
 
@@ -257,8 +261,20 @@ fn main() -> anyhow::Result<()> {
             args.kv_type
         ),
     };
-    // Calculate buffer size per KV cache
-    let n_values = max_seq_len * kv_heads * head_dim;
+
+    // Determine initial KV cache capacity (dynamic grow-on-demand)
+    let initial_kv_capacity = if args.initial_kv_capacity > 0 {
+        args.initial_kv_capacity.min(max_seq_len)
+    } else {
+        input_ids
+            .len()
+            .next_power_of_two()
+            .max(128)
+            .min(max_seq_len)
+    };
+
+    // Calculate buffer size per KV cache (based on initial capacity, not max)
+    let n_values = initial_kv_capacity * kv_heads * head_dim;
     let kv_buf_size = match kv_type {
         DType::Q4_0 => {
             use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
@@ -267,8 +283,8 @@ fn main() -> anyhow::Result<()> {
         _ => n_values * kv_type.size(),
     };
     println!(
-        "KV cache type: {:?} ({}B total per layer)",
-        kv_type, kv_buf_size
+        "KV cache type: {:?} (initial capacity: {} tokens, {}B per layer, max: {})",
+        kv_type, initial_kv_capacity, kv_buf_size, max_seq_len
     );
 
     let mut kv_caches = Vec::new();
@@ -277,17 +293,25 @@ fn main() -> anyhow::Result<()> {
         let v_buf = memory.alloc(kv_buf_size, kv_type)?;
 
         let k = Tensor::new(
-            Shape::new(vec![1, max_seq_len, kv_heads, head_dim]),
+            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
             k_buf,
             backend.clone(),
         );
         let v = Tensor::new(
-            Shape::new(vec![1, max_seq_len, kv_heads, head_dim]),
+            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
             v_buf,
             backend.clone(),
         );
 
-        kv_caches.push(KVCache::new(k, v, max_seq_len));
+        kv_caches.push(KVCache::new_dynamic(
+            k,
+            v,
+            initial_kv_capacity,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            memory.clone(),
+        ));
     }
 
     // 5. Resilience Manager (optional)

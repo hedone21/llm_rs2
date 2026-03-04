@@ -229,8 +229,8 @@ impl LlamaLayer {
 
             let chunk_q_stride = seq_len * n_heads_q * head_dim;
             let chunk_out_stride = seq_len * n_heads_q * head_dim;
-            // KV Cache is strided by max_seq_len because it is allocated as [Batch, MaxSeq, ...]
-            let chunk_k_stride = kv_cache.max_seq_len * n_heads_kv * head_dim;
+            // KV Cache is strided by capacity (physical buffer size), not max_seq_len
+            let chunk_k_stride = kv_cache.capacity() * n_heads_kv * head_dim;
 
             // Iterate over batch.
             // We use chunks_mut for out_ptr to satisfy borrow checker.
