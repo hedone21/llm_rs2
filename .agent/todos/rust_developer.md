@@ -22,12 +22,12 @@
 - **Notes**: 커밋 dc78418에서 구현 완료. CacheManager, EvictionPolicy(none/sliding/snapkv), max_seq_len 체크 추가
 
 ## [P1] Hybrid + Resilience 통합 구현
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 아키텍트의 Hybrid 통합 설계
 - **Description**: `engine/src/bin/generate_hybrid.rs`에 Resilience checkpoint 추가. GPU→CPU 역방향 전환 구현 (Thermal Critical 시)
 - **Acceptance Criteria**: hybrid 모드에서 resilience 신호 반응, GPU→CPU 전환 동작
-- **Notes**: SwitchBackend 액션이 실제로 동작하는 첫 구현. IPC Transport 완료로 블로커 해소
+- **Notes**: 커밋 db2df27에서 구현 완료. SwitchBackend 실제 동작, GPU↔CPU 양방향 전환, Evict/Throttle/Suspend 지원
 
 ## [P2] Manager 서비스 Collector 구현
 - **Status**: TODO
