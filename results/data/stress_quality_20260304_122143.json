@@ -1,0 +1,48 @@
+{
+  "version": 1,
+  "type": "stress_quality",
+  "metadata": {
+    "date": "2026-03-04T12:35:23.940314",
+    "prompt_file": "eval/med_len.txt",
+    "decode_tokens": 512,
+    "temperature": 0
+  },
+  "tests": {
+    "baseline_no_eviction": {
+      "exit_code": 0,
+      "completed": true,
+      "duration_sec": 75.2,
+      "ttft_ms": 39745.27,
+      "tbt_ms": 56.21,
+      "generated_text_len": 5142,
+      "generated_word_count": 721,
+      "eviction_count": 0
+    },
+    "mild_eviction": {
+      "exit_code": 137,
+      "completed": false,
+      "duration_sec": 49.1,
+      "ttft_ms": 0,
+      "tbt_ms": 0,
+      "generated_text_len": 0,
+      "generated_word_count": 0,
+      "eviction_count": 0
+    },
+    "aggressive_eviction": {
+      "exit_code": 137,
+      "completed": false,
+      "duration_sec": 47.9,
+      "ttft_ms": 0,
+      "tbt_ms": 0,
+      "generated_text_len": 0,
+      "generated_word_count": 0,
+      "eviction_count": 1
+    }
+  },
+  "comparisons": {},
+  "texts": {
+    "baseline_no_eviction": "Let\u2019s discuss a few Large Language Model (LLM) evaluation benchmarks today. An LLM evaluation benchmark is a standardised set of tests, datasets, and metrics designed to assess how well LLMs perform on specific types of tasks. Every benchmark comes with a dataset reflecting the ground truth.\nFirst, the Abstraction and Reasoning Corpus (ARC) aims to test an LLM\u2019s abstract reasoning and problem-solving capabilities. ARC evaluates an AI\u2019s cognitive flexibility and general intelligence by presenting tasks that involve visual puzzles with input-output grid pairs. The test ensures the LLM does not rely on memorising patterns by providing out-of-distribution puzzles (patterns the model has not seen before). It contains 1000 tasks. \nSecond, the Bias Benchmark for QA (BBQ) is an evaluation dataset designed to measure and analyse social biases in question-answering (QA) systems. It consists of 58K multiple-choice questions. The dataset covers social biases such as age, disability status, gender identity, nationality, physical appearance, race/ethnicity, religion, socio-economic status, and sexual orientation. The dataset also includes intersectional categories, such as Race-by-Gender, to study compounded biases.\nThird, the BIG-Bench Hard (BBH) is a benchmark suite comprising 23 challenging tasks selected from the broader BIG-Bench, which contains 204 tasks. The BBH benchmark measures a wide range of reasoning skills, including temporal understanding, spatial and geometric reasoning, commonsense, humour, causal reasoning, deductive logic, linguistic knowledge, counting, data structures, algorithms, and arithmetic operations.\nFourth, the BoolQ benchmark task is to decide if the evidence in the passage entails a \u201cyes\u201d or \u201cno\u201d answer to the question. There are 15942 questions. Each example consists of a passage, the answer, and the context to help draw the inference. \nFifth, the DROP (Discrete Reasoning Over Paragraphs) benchmark is a reading comprehension benchmark that evaluate",
+    "mild_eviction": "",
+    "aggressive_eviction": ""
+  }
+}

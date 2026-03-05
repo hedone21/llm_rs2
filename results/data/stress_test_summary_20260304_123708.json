@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "type": "stress_test_summary",
+  "metadata": {
+    "date": "2026-03-04T12:40:34.895663",
+    "device": "SM-S931N",
+    "total_duration_sec": 206.7,
+    "phases_run": [
+      5
+    ],
+    "git_commit": "bc7f35d"
+  },
+  "overall_verdict": "FAIL",
+  "phases": {
+    "quality": {
+      "verdict": "FAIL",
+      "tests": {
+        "baseline_no_eviction": {
+          "exit_code": 0,
+          "completed": true,
+          "duration_sec": 59.7,
+          "ttft_ms": 26108.52,
+          "tbt_ms": 56.95,
+          "generated_text_len": 5142,
+          "generated_word_count": 721,
+          "eviction_count": 0
+        },
+        "mild_eviction": {
+          "exit_code": 137,
+          "completed": false,
+          "duration_sec": 48.6,
+          "ttft_ms": 0,
+          "tbt_ms": 0,
+          "generated_text_len": 0,
+          "generated_word_count": 0,
+          "eviction_count": 0
+        },
+        "aggressive_eviction": {
+          "exit_code": 137,
+          "completed": false,
+          "duration_sec": 48.0,
+          "ttft_ms": 0,
+          "tbt_ms": 0,
+          "generated_text_len": 0,
+          "generated_word_count": 0,
+          "eviction_count": 1
+        }
+      },
+      "comparisons": {}
+    }
+  }
+}
