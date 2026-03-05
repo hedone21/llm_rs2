@@ -12,6 +12,7 @@ anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 log = "0.4"
 env_logger = "0.11"
+libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
 
 [dev-dependencies]

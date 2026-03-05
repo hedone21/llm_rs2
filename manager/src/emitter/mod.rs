@@ -1,3 +1,6 @@
+pub mod dbus;
+pub mod unix_socket;
+
 use llm_shared::SystemSignal;
 
 /// Emitter delivers SystemSignals to connected LLM engine clients.

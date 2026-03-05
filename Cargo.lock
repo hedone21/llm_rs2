@@ -847,6 +847,7 @@ dependencies = [
  "anyhow",
  "clap",
  "env_logger",
+ "libc",
  "llm_shared",
  "log",
  "serde",
