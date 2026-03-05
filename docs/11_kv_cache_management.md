@@ -87,6 +87,17 @@ pub trait EvictionPolicy: Send + Sync {
     /// 실제 eviction 수행. target_len은 eviction 후 유지할 토큰 수
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()>;
 
+    /// Importance score 기반 eviction (H2O 등). 기본 구현은 score를 무시하고 evict() 위임.
+    fn evict_with_scores(
+        &self,
+        cache: &mut KVCache,
+        target_len: usize,
+        scores: &[f32],
+    ) -> Result<()> {
+        let _ = scores;
+        self.evict(cache, target_len)
+    }
+
     /// 정책 이름 (로깅/디버깅용)
     fn name(&self) -> &str;
 }
@@ -105,9 +116,26 @@ pub struct CacheManager {
 }
 
 impl CacheManager {
-    /// 각 generation step 후에 호출
-    /// 메모리 압력에 따라 동적으로 eviction 수행
+    /// 각 generation step 후에 호출 (Sliding Window용).
+    /// H2O에서는 사용하지 않음 (signal-driven).
     pub fn maybe_evict(&self, caches: &mut [KVCache]) -> Result<EvictionResult>;
+
+    /// Resilience 시그널 수신 시 호출. score 없이 eviction 실행.
+    pub fn force_evict(&self, caches: &mut [KVCache]) -> Result<EvictionResult>;
+
+    /// Resilience 시그널 수신 시 호출. importance score 기반 3-partition eviction.
+    pub fn force_evict_with_scores(
+        &self,
+        caches: &mut [KVCache],
+        scores: &[f32],
+    ) -> Result<EvictionResult>;
+
+    /// score 기반 eviction 시도 (score 있으면 force_evict_with_scores, 없으면 force_evict).
+    pub fn maybe_evict_with_scores(
+        &self,
+        caches: &mut [KVCache],
+        scores: Option<&[f32]>,
+    ) -> Result<EvictionResult>;
 }
 
 pub struct EvictionResult {
@@ -293,7 +321,7 @@ src/core/
 │   ├── mod.rs          //   EvictionPolicy trait + re-exports
 │   ├── no_eviction.rs  //   NoEvictionPolicy
 │   ├── sliding_window.rs // SlidingWindowPolicy
-│   └── h2o.rs          //   H2OPolicy (stub)
+│   └── h2o.rs          //   H2OPolicy (3-partition)
 └── mod.rs              // [수정] eviction, cache_manager, sys_monitor 등록
 ```
 
@@ -399,7 +427,38 @@ pub use my_policy::MyCustomPolicy;
 
 ---
 
-## 11.11 향후 확장 계획
+## 11.11 AttentionScoreAccumulator
+
+H2O의 importance score 누적을 담당하는 컴포넌트.
+
+**파일**: `src/core/attention_scores.rs`
+
+```rust
+pub struct AttentionScoreAccumulator {
+    importance: Vec<f32>,    // 토큰별 누적 importance score
+    tracked_layers: usize,   // score를 추적하는 레이어 수 (마지막 N개)
+    decay: f32,              // 매 step마다 기존 score에 곱하는 감쇠율 (e.g., 0.9)
+}
+```
+
+**주요 메서드**:
+
+| 메서드 | 설명 |
+|--------|------|
+| `begin_step()` | 매 토큰 생성 시작 시 호출. 기존 score에 `(1.0 - decay)`를 곱하여 감쇠 |
+| `accumulate(layer, scores)` | tracked layer에서 attention weight를 누적 |
+| `importance_scores()` | 현재 누적된 importance score 슬라이스 반환 |
+| `reset()` | Eviction 후 score 배열 초기화 |
+
+**Generation 루프에서의 사용 흐름**:
+1. `score_accumulator.begin_step()` — decay 적용
+2. `model.forward_into()` — 내부에서 tracked layer의 attention weight를 `accumulate()` 호출
+3. Resilience 시그널 수신 시 `cache_manager.force_evict_with_scores(scores)` 호출
+4. Eviction 완료 후 `score_accumulator.reset()`
+
+---
+
+## 11.12 향후 확장 계획
 
 | 항목 | 설명 | 의존성 |
 |------|------|--------|

@@ -39,7 +39,7 @@ graph TB
         EvictionPolicy["EvictionPolicy trait"]
         NoEviction["NoEvictionPolicy"]
         SlidingWindow["SlidingWindowPolicy"]
-        H2O["H2OPolicy (stub)"]
+        H2O["H2OPolicy (3-partition)"]
         SysMonitor["SystemMonitor trait"]
         LinuxMonitor["LinuxSystemMonitor"]
     end

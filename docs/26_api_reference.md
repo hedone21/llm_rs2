@@ -16,7 +16,7 @@
 | [2. State Management](#2-state-management) | `OperatingMode` | `src/resilience/state.rs` |
 | [3. Strategy Framework](#3-strategy-framework) | `ResilienceAction`, `ResilienceStrategy`, `resolve_conflicts` | `src/resilience/strategy/mod.rs` |
 | [4. Strategy Implementations](#4-strategy-implementations) | `MemoryStrategy`, `ComputeStrategy`, `ThermalStrategy`, `EnergyStrategy` | `src/resilience/strategy/*.rs` |
-| [5. Manager & Execution](#5-manager--execution) | `ResilienceManager`, `DbusListener`, `InferenceContext`, `execute_action` | `src/resilience/manager.rs`, `dbus_listener.rs` |
+| [5. Manager & Execution](#5-manager--execution) | `ResilienceManager`, `SignalListener<T>`, `Transport`, `InferenceContext`, `execute_action` | `src/resilience/manager.rs`, `transport.rs`, `dbus_transport.rs` |
 | [6. CLI Integration](#6-cli-integration) | `--enable-resilience`, 초기화, 토큰 루프 체크포인트 | `src/bin/generate.rs` |
 
 ---
@@ -675,51 +675,59 @@ assert_eq!(mgr.mode(), OperatingMode::Degraded);
 
 ---
 
-### 5.2 `DbusListener`
+### 5.2 `Transport` trait + `SignalListener<T>`
 
-별도 스레드에서 D-Bus System Bus에 연결하여 `org.llm.Manager1` 시그널을 수신하는 리스너.
+시그널 수신을 추상화하는 Transport trait과, 별도 스레드에서 Transport를 구동하는 리스너.
 
-**파일**: `src/resilience/dbus_listener.rs`
+**파일**: `src/resilience/transport.rs`, `src/resilience/dbus_transport.rs`
 
-**정의**:
+**Transport trait**:
 ```rust
-pub struct DbusListener {
-    tx: mpsc::Sender<SystemSignal>,
+pub trait Transport: Send + 'static {
+    /// 블로킹 수신. 시그널을 하나 받아 반환.
+    fn recv(&mut self) -> anyhow::Result<SystemSignal>;
 }
 ```
 
-**D-Bus 상수** (private):
-
-| 상수 | 값 | 설명 |
-|------|---|------|
-| `MANAGER_DEST` | `"org.llm.Manager1"` | D-Bus well-known name |
-| `MANAGER_PATH` | `"/org/llm/Manager1"` | D-Bus object path |
-| `MANAGER_IFACE` | `"org.llm.Manager1"` | D-Bus interface |
+**SignalListener 정의**:
+```rust
+pub struct SignalListener<T: Transport> {
+    transport: T,
+    tx: mpsc::Sender<SystemSignal>,
+}
+```
 
 **Methods**:
 
 | 메서드 | 시그니처 | 설명 |
 |--------|---------|------|
-| `new` | `fn new(tx: mpsc::Sender<SystemSignal>) -> Self` | Sender 채널을 받아 리스너 생성 |
-| `spawn` | `fn spawn(self) -> std::thread::JoinHandle<()>` | 별도 스레드에서 D-Bus 수신 루프 시작. Manager 연결 실패 시 경고 로그 출력 후 정상 종료 (LLM은 Resilience 없이 계속 동작) |
+| `new` | `fn new(transport: T, tx: mpsc::Sender<SystemSignal>) -> Self` | Transport와 Sender 채널을 받아 리스너 생성 |
+| `spawn` | `fn spawn(self) -> std::thread::JoinHandle<()>` | 별도 스레드에서 수신 루프 시작. Transport 에러 시 경고 로그 출력 후 정상 종료 (fail-open) |
 
-**D-Bus 시그널 파싱**:
+**구현된 Transport**:
 
-| D-Bus 시그널 이름 | 파싱 함수 (private) | D-Bus 시그니처 | 변환 결과 |
-|------------------|-------------------|---------------|----------|
-| `MemoryPressure` | `parse_memory_pressure` | `(s, t, t)` — level, available_bytes, reclaim_target_bytes | `SystemSignal::MemoryPressure` |
-| `ComputeGuidance` | `parse_compute_guidance` | `(s, s, s, d, d)` — level, backend, reason, cpu_pct, gpu_pct | `SystemSignal::ComputeGuidance` |
-| `ThermalAlert` | `parse_thermal_alert` | `(s, i, b, d)` — level, temp_mc, throttling, ratio | `SystemSignal::ThermalAlert` |
-| `EnergyConstraint` | `parse_energy_constraint` | `(s, s, u)` — level, reason, power_mw | `SystemSignal::EnergyConstraint` |
+| Transport | 파일 | 설명 |
+|-----------|------|------|
+| `DbusTransport` | `dbus_transport.rs` | zbus blocking으로 D-Bus System Bus에서 `org.llm.Manager1` 시그널 수신 |
+
+**D-Bus 시그널 파싱** (`DbusTransport` 내부):
+
+| D-Bus 시그널 이름 | D-Bus 시그니처 | 변환 결과 |
+|------------------|---------------|----------|
+| `MemoryPressure` | `(s, t, t)` | `SystemSignal::MemoryPressure` |
+| `ComputeGuidance` | `(s, s, s, d, d)` | `SystemSignal::ComputeGuidance` |
+| `ThermalAlert` | `(s, i, b, d)` | `SystemSignal::ThermalAlert` |
+| `EnergyConstraint` | `(s, s, u)` | `SystemSignal::EnergyConstraint` |
 
 **예시**:
 ```rust
 use std::sync::mpsc;
-use llm_rs2::resilience::DbusListener;
+use llm_rs2::resilience::{SignalListener, DbusTransport};
 
 let (tx, rx) = mpsc::channel();
-let listener = DbusListener::new(tx);
-let _handle = listener.spawn();  // 별도 스레드에서 D-Bus 시그널 수신 시작
+let transport = DbusTransport::connect().unwrap();
+let listener = SignalListener::new(transport, tx);
+let _handle = listener.spawn();  // 별도 스레드에서 시그널 수신 시작
 ```
 
 ---
@@ -829,9 +837,10 @@ enable_resilience: bool,
 #[cfg(feature = "resilience")]
 let mut resilience_manager = if args.enable_resilience {
     let (tx, rx) = std::sync::mpsc::channel();
-    let listener = DbusListener::new(tx);
+    let transport = DbusTransport::connect()?; // 또는 선택된 transport
+    let listener = SignalListener::new(transport, tx);
     let _listener_handle = listener.spawn();
-    eprintln!("[Resilience] Manager enabled — listening for D-Bus signals");
+    eprintln!("[Resilience] Manager enabled — listening for signals");
     Some(ResilienceManager::new(rx))
 } else {
     None
@@ -842,8 +851,8 @@ let mut throttle_delay_ms: u64 = 0;
 
 **초기화 순서**:
 
-1. `mpsc::channel()` 생성 — `tx`는 DbusListener에, `rx`는 ResilienceManager에 전달
-2. `DbusListener::new(tx).spawn()` — 별도 스레드에서 D-Bus 시그널 수신 시작
+1. `mpsc::channel()` 생성 — `tx`는 SignalListener에, `rx`는 ResilienceManager에 전달
+2. `SignalListener::new(transport, tx).spawn()` — 별도 스레드에서 시그널 수신 시작
 3. `ResilienceManager::new(rx)` — `Some`으로 감싸서 Optional로 보관
 4. `throttle_delay_ms` 별도 변수 — 토큰 루프에서 딜레이 적용에 사용
 

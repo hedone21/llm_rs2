@@ -160,7 +160,7 @@ Transformer의 autoregressive decoding에 필수적인 KV cache와 메모리 관
 | `eviction/mod.rs` | `EvictionPolicy` trait |
 | `eviction/no_eviction.rs` | `NoEvictionPolicy` |
 | `eviction/sliding_window.rs` | `SlidingWindowPolicy` |
-| `eviction/h2o.rs` | `H2OPolicy` (stub) |
+| `eviction/h2o.rs` | `H2OPolicy` (3-partition model) |
 | `cache_manager.rs` | Cache 생명주기 관리 |
 | `sys_monitor.rs` | 시스템 리소스 모니터링 |
 
@@ -181,7 +181,7 @@ current_pos: usize  // 현재 채워진 위치 (물리적 슬롯)
 
 - `NoEvictionPolicy`: eviction 없음. `max_seq_len`에 도달하면 에러
 - `SlidingWindowPolicy`: 최근 N개 토큰만 유지. `protected_prefix`로 앞부분 보호 가능
-- `H2OPolicy`: attention score 기반 토큰 선택 (현재 stub, sliding window로 fallback)
+- `H2OPolicy`: 3-partition model (prefix + heavy hitters + recent window). Score 기반 eviction은 `evict_with_scores()`로, score 없을 시 recent window 보호 sliding window로 fallback
 
 ### 의존성
 

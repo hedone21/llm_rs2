@@ -407,7 +407,7 @@ fn mem_stats(&self) -> Result<MemoryStats> {
 
 **원인**
 
-`src/resilience/dbus_listener.rs:37-84`에서 D-Bus listener는 **fail-open** 설계를 따릅니다. `run()` 메서드가 System Bus 연결에 실패하면 에러를 반환하고, `spawn()` 메서드가 이를 잡아서 경고만 출력합니다:
+`src/resilience/transport.rs`의 `SignalListener<T: Transport>`는 **fail-open** 설계를 따릅니다. Transport의 `recv()` 메서드가 연결에 실패하면 에러를 반환하고, `spawn()` 메서드가 이를 잡아서 경고만 출력합니다:
 
 ```rust
 fn run(&self) -> anyhow::Result<()> {
@@ -460,7 +460,7 @@ D-Bus 연결은 성공하지만 proxy 생성 단계에서 에러가 발생합니
 
 **원인**
 
-`dbus_listener.rs:42`에서 `org.llm.Manager1` 서비스에 대한 proxy를 생성하려 하지만, 해당 서비스가 System Bus에 등록되어 있지 않습니다:
+`dbus_transport.rs`에서 `org.llm.Manager1` 서비스에 대한 proxy를 생성하려 하지만, 해당 서비스가 System Bus에 등록되어 있지 않습니다:
 
 ```rust
 let proxy = zbus::blocking::Proxy::new(

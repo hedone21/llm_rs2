@@ -84,7 +84,7 @@ COMPONENT_META = {
         "component": "Core",
         "name": "H2OPolicy",
         "tier": "T2",
-        "maturity": "Stub",
+        "maturity": "Stable",
     },
     "core::cache_manager": {
         "component": "Core",

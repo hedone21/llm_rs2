@@ -36,7 +36,8 @@ src/
 │   ├── signal.rs             # D-Bus 시그널 타입 정의 (Rust enum)
 │   ├── state.rs              # 운영 모드 상태 머신
 │   ├── manager.rs            # ResilienceManager (중앙 조율)
-│   ├── dbus_listener.rs      # D-Bus 수신 스레드 (zbus)
+│   ├── transport.rs          # Transport trait + SignalListener<T> (수신 스레드)
+│   ├── dbus_transport.rs    # DbusTransport (zbus blocking, Transport 구현)
 │   └── strategy/
 │       ├── mod.rs            # ResilienceStrategy trait
 │       ├── memory.rs         # MemoryPressure 반응
@@ -557,48 +558,56 @@ impl ResilienceStrategy for EnergyStrategy {
 
 ---
 
-## 8. D-Bus Listener (dbus_listener.rs)
+## 8. Signal Listener (transport.rs)
 
-별도 스레드에서 D-Bus 시그널을 수신하여 `mpsc::Sender`로 전달.
+`Transport` trait를 통해 시그널 수신 방식을 추상화하고, `SignalListener<T: Transport>`가 별도 스레드에서 수신하여 `mpsc::Sender`로 전달.
 
 ### 8.1 구조
 
 ```rust
 use std::sync::mpsc;
 
-/// D-Bus 리스너. 별도 스레드에서 실행.
-pub struct DbusListener {
+/// 시그널 수신 Transport 추상화.
+pub trait Transport: Send + 'static {
+    /// 블로킹 수신. 시그널을 하나 받아 반환.
+    fn recv(&mut self) -> anyhow::Result<SystemSignal>;
+}
+
+/// Transport를 래핑하는 시그널 리스너. 별도 스레드에서 실행.
+pub struct SignalListener<T: Transport> {
+    transport: T,
     tx: mpsc::Sender<SystemSignal>,
 }
 
-impl DbusListener {
-    pub fn new(tx: mpsc::Sender<SystemSignal>) -> Self {
-        Self { tx }
+impl<T: Transport> SignalListener<T> {
+    pub fn new(transport: T, tx: mpsc::Sender<SystemSignal>) -> Self {
+        Self { transport, tx }
     }
 
-    /// 별도 스레드에서 D-Bus 시그널 수신 루프를 시작.
-    /// Manager가 없거나 D-Bus 연결 실패 시 로그 후 종료.
+    /// 별도 스레드에서 시그널 수신 루프를 시작.
+    /// Transport 에러 시 로그 후 종료 (fail-open).
     pub fn spawn(self) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            if let Err(e) = self.run() {
-                log::warn!("D-Bus listener exited: {}. LLM continues without resilience.", e);
+            let mut listener = self;
+            loop {
+                match listener.transport.recv() {
+                    Ok(signal) => {
+                        if listener.tx.send(signal).is_err() {
+                            break; // receiver dropped
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Signal listener exited: {}. LLM continues without resilience.", e);
+                        break;
+                    }
+                }
             }
         })
     }
-
-    fn run(&self) -> anyhow::Result<()> {
-        // zbus를 사용한 D-Bus 시그널 구독.
-        // 구현 세부 사항은 Phase 2에서 작성.
-        //
-        // 개략적 흐름:
-        // 1. System Bus 연결
-        // 2. match rule 등록 (org.llm.Manager1)
-        // 3. 시그널 수신 루프
-        // 4. SystemSignal로 변환하여 tx.send()
-        todo!("Phase 2: zbus implementation")
-    }
 }
 ```
+
+`DbusTransport`는 `Transport` trait을 구현하며, zbus blocking으로 D-Bus System Bus에서 시그널을 수신합니다 (`dbus_transport.rs`).
 
 ### 8.2 스레드 모델
 
@@ -772,7 +781,8 @@ main() (generate.rs)
   │
   ├── // ── Resilience 초기화 (추가) ──
   │   let (tx, rx) = mpsc::channel();
-  │   let listener = DbusListener::new(tx);
+  │   let transport = DbusTransport::connect()?; // 또는 선택된 transport
+  │   let listener = SignalListener::new(transport, tx);
   │   let _listener_handle = listener.spawn();
   │   let resilience_manager = ResilienceManager::new(rx);
   │
@@ -904,8 +914,8 @@ D-Bus 의존성 없이 모든 전략을 단위 테스트 가능.
    └─────────┘    └────┘ └───┘│└───┘ └───┘
                                │
                          ┌─────▼──────┐
-                         │DbusListener│
-                         │(별도 스레드) │
+                         │SignalListener│
+                         │<T: Transport>│
                          └─────┬──────┘
                                │
                           System Bus
