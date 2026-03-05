@@ -434,3 +434,205 @@ fn test_transport_failure_graceful() {
         "Failed transport should produce no actions"
     );
 }
+
+// ── Extended L2 tests ───────────────────────────────────
+
+#[test]
+fn test_resilience_multiple_signals_simultaneous() {
+    // Memory(Warning) + Thermal(Critical) simultaneously → conflict resolution
+    let (tx, rx) = mpsc::channel();
+    let mut mgr = ResilienceManager::new(rx);
+
+    send(
+        &tx,
+        SystemSignal::MemoryPressure {
+            level: Level::Warning,
+            available_bytes: 100_000_000,
+            reclaim_target_bytes: 50_000_000,
+        },
+    );
+    send(
+        &tx,
+        SystemSignal::ThermalAlert {
+            level: Level::Critical,
+            temperature_mc: 80000,
+            throttling_active: true,
+            throttle_ratio: 0.5,
+        },
+    );
+
+    let actions = mgr.poll();
+    assert!(
+        !actions.is_empty(),
+        "Should produce actions from both signals"
+    );
+    assert_eq!(mgr.mode(), OperatingMode::Minimal);
+
+    // Should have both eviction and throttle actions
+    let has_evict = actions
+        .iter()
+        .any(|a| matches!(a, ResilienceAction::Evict { .. }));
+    let has_throttle = actions
+        .iter()
+        .any(|a| matches!(a, ResilienceAction::Throttle { .. }));
+    assert!(has_evict, "Memory(Warning) should produce Evict action");
+    assert!(
+        has_throttle,
+        "Thermal(Critical) should produce Throttle action"
+    );
+}
+
+#[test]
+fn test_resilience_eviction_plus_throttle_execution() {
+    // Both Evict and Throttle actions should be executable in sequence
+    let (tx, rx) = mpsc::channel();
+    let mut mgr = ResilienceManager::new(rx);
+
+    send(
+        &tx,
+        SystemSignal::MemoryPressure {
+            level: Level::Critical,
+            available_bytes: 30_000_000,
+            reclaim_target_bytes: 100_000_000,
+        },
+    );
+    send(
+        &tx,
+        SystemSignal::ThermalAlert {
+            level: Level::Critical,
+            temperature_mc: 80000,
+            throttling_active: true,
+            throttle_ratio: 0.5,
+        },
+    );
+
+    let actions = mgr.poll();
+
+    let mut num_tokens = 500usize;
+    let mut throttle = 0u64;
+    let mut suspended = false;
+    let mut reject = false;
+
+    for action in &actions {
+        match action {
+            ResilienceAction::Evict { target_ratio } => {
+                assert!(*target_ratio > 0.0 && *target_ratio < 1.0);
+            }
+            _ => {
+                let mut ctx = make_ctx(&mut num_tokens, &mut throttle, &mut suspended, &mut reject);
+                execute_action(action, &mut ctx);
+            }
+        }
+    }
+
+    assert!(
+        throttle > 0,
+        "Throttle should be set after ThermalAlert(Critical)"
+    );
+}
+
+#[test]
+fn test_resilience_rapid_state_transitions() {
+    // Normal → Emergency → Normal → Critical — verify state recovery
+    let (tx, rx) = mpsc::channel();
+    let mut mgr = ResilienceManager::new(rx);
+
+    // 1. Emergency → Suspended mode
+    send(
+        &tx,
+        SystemSignal::EnergyConstraint {
+            level: Level::Emergency,
+            reason: EnergyReason::BatteryCritical,
+            power_budget_mw: 500,
+        },
+    );
+    let actions = mgr.poll();
+    assert_eq!(mgr.mode(), OperatingMode::Suspended);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, ResilienceAction::Suspend)),
+        "Emergency should produce Suspend"
+    );
+
+    // 2. Back to Normal → RestoreDefaults
+    send(
+        &tx,
+        SystemSignal::EnergyConstraint {
+            level: Level::Normal,
+            reason: EnergyReason::Charging,
+            power_budget_mw: 15000,
+        },
+    );
+    let actions = mgr.poll();
+    assert_eq!(mgr.mode(), OperatingMode::Normal);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, ResilienceAction::RestoreDefaults)),
+        "Normal should produce RestoreDefaults"
+    );
+
+    // 3. Critical → Minimal mode (not suspended)
+    send(
+        &tx,
+        SystemSignal::MemoryPressure {
+            level: Level::Critical,
+            available_bytes: 30_000_000,
+            reclaim_target_bytes: 100_000_000,
+        },
+    );
+    let actions = mgr.poll();
+    assert_eq!(mgr.mode(), OperatingMode::Minimal);
+    assert!(
+        actions
+            .iter()
+            .any(|a| matches!(a, ResilienceAction::Evict { .. })),
+        "Critical memory should produce Evict"
+    );
+    assert!(
+        !actions
+            .iter()
+            .any(|a| matches!(a, ResilienceAction::Suspend)),
+        "Critical should NOT suspend"
+    );
+}
+
+#[test]
+fn test_resilience_signal_buffering() {
+    // Send 50 signals rapidly, verify no performance degradation or panics
+    let (tx, rx) = mpsc::channel();
+    let mut mgr = ResilienceManager::new(rx);
+
+    for i in 0..51 {
+        let level = match i % 4 {
+            0 => Level::Normal,
+            1 => Level::Warning,
+            2 => Level::Critical,
+            _ => Level::Emergency,
+        };
+        send(
+            &tx,
+            SystemSignal::MemoryPressure {
+                level,
+                available_bytes: 100_000_000,
+                reclaim_target_bytes: 50_000_000,
+            },
+        );
+    }
+
+    // poll() should drain all without panic
+    let actions = mgr.poll();
+    // Last signal: i=50, 50%4=2 → Critical → Minimal
+    assert_eq!(
+        mgr.mode(),
+        OperatingMode::Minimal,
+        "After 51 signals ending on Critical, mode should be Minimal"
+    );
+    // Actions should be resolved (not 50 separate actions)
+    assert!(
+        actions.len() < 50,
+        "Conflict resolution should merge actions: got {}",
+        actions.len()
+    );
+}

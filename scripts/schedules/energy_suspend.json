@@ -1,0 +1,4 @@
+[
+  {"delay_sec": 20, "signal": {"energy_constraint": {"level": "warning", "reason": "battery_low", "power_budget_mw": 5000}}},
+  {"delay_sec": 15, "signal": {"energy_constraint": {"level": "emergency", "reason": "battery_critical", "power_budget_mw": 1000}}}
+]

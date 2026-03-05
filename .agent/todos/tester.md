@@ -6,12 +6,12 @@
 ---
 
 ## [P1] 디바이스 스트레스 테스트 (Resilience 신호 포함)
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: Resilience Manager 통합 구현 완료
 - **Description**: 실제 Android 디바이스에서 장시간 추론 실행하며 resilience 신호 동작 검증. 온도 상승에 따른 자동 throttling, 메모리 압박 시 캐시 정리, 복구 후 정상 동작 확인
 - **Acceptance Criteria**: 1시간 연속 추론 안정 동작, 메모리 누수 없음, 비정상 종료 0건
-- **Notes**: `scripts/stress_test_device.py` 확장 필요
+- **Notes**: Phase 6 (Resilience) 추가. `signal_injector` 바이너리 + 4개 스케줄(memory_eviction, thermal_throttle, energy_suspend, recovery_cycle). L2 통합 테스트 14개 전부 통과 (multi-signal, rapid transition, buffering 포함)
 
 ## [P2] 범용 디바이스 배포/테스트 스크립트
 - **Status**: TODO

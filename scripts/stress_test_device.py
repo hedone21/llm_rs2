@@ -2,12 +2,13 @@
 """
 Device Stress Test Suite for llm_rs2.
 
-Comprehensive 5-phase stress test:
+Comprehensive 6-phase stress test:
   Phase 1: Thermal Stability   — sustained OpenCL inference, throttling detection
   Phase 2: Performance Sustain — repeated short inferences, consistency measurement
   Phase 3: Memory Stability    — long sequences + KV eviction, RSS leak detection
   Phase 4: Backend Correctness — CPU vs OpenCL numerical accuracy under heat
   Phase 5: Output Quality      — eviction vs no-eviction text quality comparison
+  Phase 6: Resilience Signals  — signal injection via Unix socket, adaptive response
 
 Usage:
   python scripts/stress_test_device.py                    # full test
@@ -38,8 +39,13 @@ GENERATE_BIN_REMOTE = f"{ANDROID_TMP_DIR}/generate"
 TEST_BACKEND_BIN_REMOTE = f"{ANDROID_TMP_DIR}/test_backend"
 EVAL_DIR = f"{ANDROID_TMP_DIR}/llm_rs2/eval"
 
+SIGNAL_INJECTOR_BIN_REMOTE = f"{ANDROID_TMP_DIR}/signal_injector"
+RESILIENCE_SOCKET = f"{ANDROID_TMP_DIR}/resilience.sock"
+SCHEDULES_DIR_REMOTE = f"{ANDROID_TMP_DIR}/schedules"
+
 GENERATE_BIN_LOCAL = "target/aarch64-linux-android/release/generate"
 TEST_BACKEND_BIN_LOCAL = "target/aarch64-linux-android/release/test_backend"
+SIGNAL_INJECTOR_BIN_LOCAL = "target/aarch64-linux-android/release/signal_injector"
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -254,10 +260,15 @@ def phase_build_push(args):
             generate_prompt_file(path, tok)
             print(f"  [Gen] Created {path}")
 
+    phases = [int(p) for p in args.phases.split(",")]
+
     if not args.skip_build:
-        print("\n  [Build] Building generate and test_backend...")
+        bins = "--bin generate --bin test_backend"
+        if 6 in phases:
+            bins += " --bin signal_injector"
+        print(f"\n  [Build] Building {bins}...")
         run_command(
-            "cargo build --target aarch64-linux-android --release --bin generate --bin test_backend",
+            f"cargo build --target aarch64-linux-android --release {bins}",
             dry_run=args.dry_run,
         )
 
@@ -268,6 +279,12 @@ def phase_build_push(args):
         run_command(f"adb shell chmod +x {GENERATE_BIN_REMOTE} {TEST_BACKEND_BIN_REMOTE}", dry_run=args.dry_run)
         run_command(f"adb shell mkdir -p {EVAL_DIR}", dry_run=args.dry_run)
         run_command(f"adb push eval/ {EVAL_DIR}/", check=False, dry_run=args.dry_run)
+
+        if 6 in phases:
+            run_command(f"adb push {SIGNAL_INJECTOR_BIN_LOCAL} {SIGNAL_INJECTOR_BIN_REMOTE}", dry_run=args.dry_run)
+            run_command(f"adb shell chmod +x {SIGNAL_INJECTOR_BIN_REMOTE}", dry_run=args.dry_run)
+            run_command(f"adb shell mkdir -p {SCHEDULES_DIR_REMOTE}", dry_run=args.dry_run)
+            run_command(f"adb push scripts/schedules/ {SCHEDULES_DIR_REMOTE}/", check=False, dry_run=args.dry_run)
 
     # Verify model exists
     model_check = run_adb_command(f'shell "ls {MODEL_PATH}/config.json 2>/dev/null"', check=False)
@@ -874,6 +891,245 @@ def phase_quality(monitor, args, timestamp):
     return {"verdict": overall, "tests": test_results, "comparisons": comparisons}
 
 
+# ─── Phase 6: Resilience Signal Injection ────────────────────────────────────
+
+def count_resilience_events(stdout):
+    """Count resilience-related events from stderr/stdout."""
+    if not stdout:
+        return {"evictions": 0, "throttles": 0, "suspends": 0, "restores": 0}
+    lines = stdout.splitlines()
+    return {
+        "evictions": sum(1 for l in lines if "[Resilience] Evicted" in l or "[Hybrid/Resilience] Evicted" in l),
+        "throttles": sum(1 for l in lines if "Throttle" in l and "Resilience" in l),
+        "suspends": sum(1 for l in lines if "suspended" in l.lower() and "Resilience" in l),
+        "restores": sum(1 for l in lines if "RestoreDefaults" in l),
+    }
+
+
+def run_with_signal_injection(schedule_name, generate_flags, timeout, args, monitor, timestamp):
+    """Run generate + signal_injector pair and collect results.
+
+    Starts signal_injector in background, then launches generate with
+    --enable-resilience --resilience-transport unix:<socket>.
+    Returns (test_data_dict, stdout).
+    """
+    schedule_remote = f"{SCHEDULES_DIR_REMOTE}/{schedule_name}.json"
+
+    # Start signal injector in background
+    injector_cmd = (
+        f"{SIGNAL_INJECTOR_BIN_REMOTE} "
+        f"--socket {RESILIENCE_SOCKET} "
+        f"--schedule-file {schedule_remote} "
+        f"--connect-timeout 30"
+    )
+    injector_adb = f'adb shell "LD_LIBRARY_PATH=/data/local/tmp nohup {injector_cmd} > /dev/null 2>&1 &"'
+
+    if args.dry_run:
+        print(f"  [DryRun] {injector_adb}")
+        print(f"  [DryRun] generate with resilience")
+        return {"dry_run": True}, ""
+
+    # Clean up stale socket
+    run_adb_command(f'shell "rm -f {RESILIENCE_SOCKET}"', check=False)
+
+    # Start injector
+    subprocess.Popen(
+        ["adb", "shell",
+         f"LD_LIBRARY_PATH=/data/local/tmp {injector_cmd} 2>/data/local/tmp/injector.log"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    # Give injector time to bind socket
+    time.sleep(1)
+
+    # Run generate with resilience
+    resilience_flags = f" --enable-resilience --resilience-transport unix:{RESILIENCE_SOCKET}"
+    device_cmd = (
+        f"{GENERATE_BIN_REMOTE} --model-path {MODEL_PATH} "
+        f"{generate_flags}{resilience_flags}"
+    )
+
+    if monitor:
+        monitor.start()
+    exit_code, stdout, duration = run_device_inference(device_cmd, timeout=timeout,
+                                                        env_vars="RUST_LOG=info")
+    timeseries = monitor.stop() if monitor else []
+
+    # Read injector log
+    injector_log = run_adb_command('shell "cat /data/local/tmp/injector.log 2>/dev/null"', check=False) or ""
+
+    results = parse_results(stdout) if exit_code == 0 else {}
+    events = count_resilience_events(stdout)
+
+    # Collect RSS data
+    rss_values = [s.get("process_mem_mb", 0) for s in timeseries if s.get("process_mem_mb", 0) > 0]
+    rss_start = rss_values[0] if rss_values else 0
+    rss_peak = max(rss_values) if rss_values else 0
+    rss_end = rss_values[-1] if rss_values else 0
+
+    td = {
+        "schedule": schedule_name,
+        "exit_code": exit_code,
+        "completed": exit_code == 0 or events["suspends"] > 0,
+        "duration_sec": round(duration, 1),
+        "ttft_ms": results.get("ttft_ms", 0),
+        "tbt_ms": results.get("tbt_ms", 0),
+        "tokens_per_sec": results.get("tokens_per_sec", 0),
+        "resilience_events": events,
+        "rss_start_mb": round(rss_start, 1),
+        "rss_peak_mb": round(rss_peak, 1),
+        "rss_end_mb": round(rss_end, 1),
+        "rss_delta_mb": round(rss_end - rss_start, 1),
+        "injector_log_lines": len(injector_log.strip().splitlines()),
+    }
+
+    return td, stdout
+
+
+def phase_resilience(monitor, args, timestamp):
+    """Phase 6: Resilience signal injection tests.
+
+    Tests:
+      D3 — Memory eviction under MemoryPressure(Critical)
+      D4 — Thermal throttling under ThermalAlert(Critical)
+      D5 — Suspend under EnergyConstraint(Emergency)
+      D7 — Recovery cycle (Critical → Normal → Critical → Normal)
+    """
+    print("\n" + "=" * 60)
+    print("Phase 6: RESILIENCE SIGNAL INJECTION")
+    print("  Test adaptive inference under system signal pressure")
+    print("=" * 60)
+
+    scenarios = [
+        {
+            "name": "memory_eviction",
+            "schedule": "memory_eviction",
+            "desc": "MemoryPressure(Critical) → evict KV cache",
+            "generate_flags": (
+                f"--prompt-file {EVAL_DIR}/prefill_512.txt "
+                "-n 512 -b opencl --max-seq-len 2048 "
+                "--eviction-policy h2o --h2o-recent-window 128 --h2o-keep-ratio 0.5"
+            ),
+            "timeout": 180,
+            "expect_evictions": True,
+            "expect_suspend": False,
+        },
+        {
+            "name": "thermal_throttle",
+            "schedule": "thermal_throttle",
+            "desc": "ThermalAlert(Critical) → throttle token generation",
+            "generate_flags": (
+                f"--prompt-file {EVAL_DIR}/prefill_512.txt "
+                "-n 256 -b opencl --max-seq-len 2048"
+            ),
+            "timeout": 180,
+            "expect_evictions": False,
+            "expect_suspend": False,
+        },
+        {
+            "name": "energy_suspend",
+            "schedule": "energy_suspend",
+            "desc": "EnergyConstraint(Emergency) → suspend inference",
+            "generate_flags": (
+                f"--prompt-file {EVAL_DIR}/prefill_512.txt "
+                "-n 1024 -b opencl --max-seq-len 2048"
+            ),
+            "timeout": 120,
+            "expect_evictions": False,
+            "expect_suspend": True,
+        },
+        {
+            "name": "recovery_cycle",
+            "schedule": "recovery_cycle",
+            "desc": "Critical → Normal → Critical cycles, verify recovery",
+            "generate_flags": (
+                f"--prompt-file {EVAL_DIR}/prefill_512.txt "
+                "-n 1024 -b opencl --max-seq-len 2048 "
+                "--eviction-policy h2o --h2o-recent-window 128 --h2o-keep-ratio 0.5"
+            ),
+            "timeout": 300,
+            "expect_evictions": True,
+            "expect_suspend": False,
+        },
+    ]
+
+    test_results = {}
+    verdicts = []
+
+    for scenario in scenarios:
+        print(f"\n  --- {scenario['name']}: {scenario['desc']} ---")
+
+        td, stdout = run_with_signal_injection(
+            schedule_name=scenario["schedule"],
+            generate_flags=scenario["generate_flags"],
+            timeout=scenario["timeout"],
+            args=args,
+            monitor=monitor,
+            timestamp=timestamp,
+        )
+
+        if td.get("dry_run"):
+            test_results[scenario["name"]] = td
+            continue
+
+        # Validate expectations
+        events = td.get("resilience_events", {})
+        issues = []
+
+        if scenario["expect_evictions"] and events.get("evictions", 0) == 0:
+            issues.append("Expected eviction events but found none")
+        if scenario["expect_suspend"] and events.get("suspends", 0) == 0:
+            issues.append("Expected suspend event but found none")
+        if not td["completed"]:
+            issues.append(f"Process exited with code {td['exit_code']}")
+
+        td["issues"] = issues
+        td["verdict"] = "PASS" if not issues else "FAIL"
+        test_results[scenario["name"]] = td
+        verdicts.append(td["verdict"])
+
+        status = (
+            f"evict={events.get('evictions', 0)} throttle={events.get('throttles', 0)} "
+            f"suspend={events.get('suspends', 0)} → {td['verdict']}"
+        )
+        print(f"  Result: {status}")
+        if issues:
+            for issue in issues:
+                print(f"    [!] {issue}")
+
+        # Save individual test data
+        test_data = {
+            "version": 1,
+            "type": "stress_resilience",
+            "metadata": {
+                "date": datetime.now().isoformat(),
+                "scenario": scenario["name"],
+                "schedule": scenario["schedule"],
+                "description": scenario["desc"],
+            },
+            "result": td,
+        }
+        fname = f"stress_resilience_{scenario['name']}_{timestamp}.json"
+        save_profile(test_data, args.output_dir, fname)
+
+        # Cooldown between resilience tests
+        if monitor:
+            time.sleep(20)
+
+    if args.dry_run:
+        return {"verdict": "DRY_RUN", "tests": test_results}
+
+    # Overall verdict
+    if "FAIL" in verdicts:
+        overall = "FAIL"
+    elif all(v == "PASS" for v in verdicts):
+        overall = "PASS"
+    else:
+        overall = "WARN"
+
+    print(f"\n  Phase 6 Result: {overall}")
+    return {"verdict": overall, "tests": test_results}
+
+
 # ─── Output ──────────────────────────────────────────────────────────────────
 
 def save_profile(data, output_dir, filename):
@@ -916,6 +1172,13 @@ def print_report(summary):
                 print(f"       {cmp_name}: {cmp.get('common_tokens', '?')}"
                       f"/{cmp.get('total_tokens_a', '?')} common"
                       f" ({cmp.get('common_ratio', 0):.1%})")
+        elif phase_name == "resilience" and "tests" in phase_data:
+            for tn, td in phase_data["tests"].items():
+                if isinstance(td, dict) and "resilience_events" in td:
+                    ev = td["resilience_events"]
+                    print(f"       {tn}: evict={ev.get('evictions', 0)} "
+                          f"throttle={ev.get('throttles', 0)} "
+                          f"suspend={ev.get('suspends', 0)} → {td.get('verdict', '?')}")
 
     overall = summary.get("overall_verdict", "N/A")
     print(f"\n  OVERALL: {overall}")
@@ -928,7 +1191,7 @@ def main():
     parser = argparse.ArgumentParser(description="Device Stress Test Suite for llm_rs2")
     parser.add_argument("--skip-build", action="store_true", help="Skip cargo build step")
     parser.add_argument("--skip-push", action="store_true", help="Skip adb push step")
-    parser.add_argument("--phases", default="1,2,3,4,5", help="Comma-separated phase numbers")
+    parser.add_argument("--phases", default="1,2,3,4,5,6", help="Comma-separated phase numbers")
     parser.add_argument("--cooldown", type=int, default=60, help="Cooldown seconds between phases")
     parser.add_argument("--thermal-limit", type=float, default=45.0, help="Max acceptable temp (°C)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands only")
@@ -987,6 +1250,12 @@ def main():
     # Phase 5: Output Quality
     if 5 in phases:
         results["quality"] = phase_quality(monitor, args, timestamp)
+        if not args.dry_run and 6 in phases:
+            wait_for_cooldown(monitor, target_temp=35.0, timeout=args.cooldown)
+
+    # Phase 6: Resilience
+    if 6 in phases:
+        results["resilience"] = phase_resilience(monitor, args, timestamp)
 
     # Overall verdict
     verdicts = [r.get("verdict", "N/A") for r in results.values()]

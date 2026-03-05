@@ -1,0 +1,8 @@
+[
+  {"delay_sec": 15, "signal": {"memory_pressure": {"level": "critical", "available_bytes": 30000000, "reclaim_target_bytes": 100000000}}},
+  {"delay_sec": 15, "signal": {"memory_pressure": {"level": "normal", "available_bytes": 500000000, "reclaim_target_bytes": 0}}},
+  {"delay_sec": 15, "signal": {"thermal_alert": {"level": "critical", "temperature_mc": 50000, "throttling_active": true, "throttle_ratio": 0.7}}},
+  {"delay_sec": 15, "signal": {"thermal_alert": {"level": "normal", "temperature_mc": 35000, "throttling_active": false, "throttle_ratio": 0.0}}},
+  {"delay_sec": 15, "signal": {"memory_pressure": {"level": "critical", "available_bytes": 20000000, "reclaim_target_bytes": 150000000}}},
+  {"delay_sec": 15, "signal": {"memory_pressure": {"level": "normal", "available_bytes": 500000000, "reclaim_target_bytes": 0}}}
+]

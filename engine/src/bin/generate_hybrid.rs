@@ -175,6 +175,69 @@ fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) ->
     valid_indices.first().copied().unwrap_or(0) as u32
 }
 
+/// Migrate KV caches between backends (CPU↔GPU).
+///
+/// Reads KV data from `src_backend`, creates intermediate CPU tensors,
+/// then optionally copies to GPU via `dst_backend.copy_from()`.
+#[allow(clippy::too_many_arguments)]
+fn migrate_kv_caches(
+    kv_caches: &mut [KVCache],
+    src_backend: &Arc<dyn Backend>,
+    dst_backend: &Arc<dyn Backend>,
+    cpu_backend: &Arc<dyn Backend>,
+    cpu_memory: &Arc<dyn Memory>,
+    dst_memory: &Arc<dyn Memory>,
+    kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    copy_to_dst: bool,
+) -> anyhow::Result<()> {
+    for kv in kv_caches.iter_mut() {
+        let current_capacity = kv.capacity();
+        let saved_pos = kv.current_pos;
+        let k_size = current_capacity * kv_heads * head_dim * 4;
+
+        let mut k_data = vec![0u8; k_size];
+        let mut v_data = vec![0u8; k_size];
+        src_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
+        src_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
+
+        let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(k_data.as_ptr(), k_cpu_buf.as_mut_ptr(), k_size);
+        }
+        let k_cpu_tensor = Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
+
+        let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_cpu_buf.as_mut_ptr(), k_size);
+        }
+        let v_cpu_tensor = Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
+
+        let (k_final, v_final) = if copy_to_dst {
+            (
+                dst_backend.copy_from(&k_cpu_tensor)?,
+                dst_backend.copy_from(&v_cpu_tensor)?,
+            )
+        } else {
+            (k_cpu_tensor, v_cpu_tensor)
+        };
+
+        let mut new_kv = KVCache::new_dynamic(
+            k_final,
+            v_final,
+            current_capacity,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            dst_memory.clone(),
+        );
+        new_kv.current_pos = saved_pos;
+        *kv = new_kv;
+    }
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
     rayon::ThreadPoolBuilder::new()
@@ -477,47 +540,19 @@ fn main() -> anyhow::Result<()> {
         if !is_gpu && start_pos >= args.switch_threshold {
             println!("\n\n[Hybrid] Switching to GPU at token {}...", start_pos);
 
-            // 1. Migrate KV Cache
-            for kv in kv_caches.iter_mut() {
-                let current_capacity = kv.capacity();
-                let saved_pos = kv.current_pos;
-
-                // Read from CPU
-                let k_size = current_capacity * kv_heads * head_dim * 4;
-                let mut k_data = vec![0u8; k_size];
-                let mut v_data = vec![0u8; k_size];
-
-                cpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
-                cpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
-
-                // Create CPU Tensor from data
-                let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(k_data.as_ptr(), k_cpu_buf.as_mut_ptr(), k_size);
-                }
-                let k_cpu_tensor =
-                    Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
-
-                let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_cpu_buf.as_mut_ptr(), k_size);
-                }
-                let v_cpu_tensor =
-                    Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
-
-                // Copy to GPU and Create KVCache with dynamic allocation
-                let mut new_kv = KVCache::new_dynamic(
-                    gpu_backend.copy_from(&k_cpu_tensor)?,
-                    gpu_backend.copy_from(&v_cpu_tensor)?,
-                    current_capacity,
-                    max_seq_len,
-                    kv_heads,
-                    head_dim,
-                    gpu_memory.clone(),
-                );
-                new_kv.current_pos = saved_pos;
-                *kv = new_kv;
-            }
+            // 1. Migrate KV Cache CPU→GPU
+            migrate_kv_caches(
+                &mut kv_caches,
+                &cpu_backend,
+                &gpu_backend,
+                &cpu_backend,
+                &cpu_memory,
+                &gpu_memory,
+                kv_heads,
+                head_dim,
+                max_seq_len,
+                true,
+            )?;
 
             // 2. Switch Backend
             current_backend = gpu_backend.clone();
@@ -632,56 +667,18 @@ fn main() -> anyhow::Result<()> {
                                 "[Hybrid/Resilience] Switching GPU → CPU at token {}",
                                 start_pos
                             );
-                            // 1. Migrate KV Cache GPU→CPU
-                            for kv in kv_caches.iter_mut() {
-                                let current_capacity = kv.capacity();
-                                let saved_pos = kv.current_pos;
-                                let k_size = current_capacity * kv_heads * head_dim * 4;
-                                let mut k_data = vec![0u8; k_size];
-                                let mut v_data = vec![0u8; k_size];
-                                gpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
-                                gpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
-
-                                let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        k_data.as_ptr(),
-                                        k_cpu_buf.as_mut_ptr(),
-                                        k_size,
-                                    );
-                                }
-                                let k_tensor = Tensor::new(
-                                    kv.k_buffer.shape().clone(),
-                                    k_cpu_buf,
-                                    cpu_backend.clone(),
-                                );
-
-                                let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        v_data.as_ptr(),
-                                        v_cpu_buf.as_mut_ptr(),
-                                        k_size,
-                                    );
-                                }
-                                let v_tensor = Tensor::new(
-                                    kv.v_buffer.shape().clone(),
-                                    v_cpu_buf,
-                                    cpu_backend.clone(),
-                                );
-
-                                let mut new_kv = KVCache::new_dynamic(
-                                    k_tensor,
-                                    v_tensor,
-                                    current_capacity,
-                                    max_seq_len,
-                                    kv_heads,
-                                    head_dim,
-                                    cpu_memory.clone(),
-                                );
-                                new_kv.current_pos = saved_pos;
-                                *kv = new_kv;
-                            }
+                            migrate_kv_caches(
+                                &mut kv_caches,
+                                &gpu_backend,
+                                &cpu_backend,
+                                &cpu_backend,
+                                &cpu_memory,
+                                &cpu_memory,
+                                kv_heads,
+                                head_dim,
+                                max_seq_len,
+                                false,
+                            )?;
 
                             // 2. Switch Backend
                             current_backend = cpu_backend.clone();
@@ -706,56 +703,18 @@ fn main() -> anyhow::Result<()> {
                                 "[Hybrid/Resilience] Switching CPU → GPU at token {}",
                                 start_pos
                             );
-                            // Reuse same CPU→GPU migration logic
-                            for kv in kv_caches.iter_mut() {
-                                let current_capacity = kv.capacity();
-                                let saved_pos = kv.current_pos;
-                                let k_size = current_capacity * kv_heads * head_dim * 4;
-                                let mut k_data = vec![0u8; k_size];
-                                let mut v_data = vec![0u8; k_size];
-                                cpu_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
-                                cpu_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
-
-                                let k_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        k_data.as_ptr(),
-                                        k_cpu_buf.as_mut_ptr(),
-                                        k_size,
-                                    );
-                                }
-                                let k_cpu_tensor = Tensor::new(
-                                    kv.k_buffer.shape().clone(),
-                                    k_cpu_buf,
-                                    cpu_backend.clone(),
-                                );
-
-                                let v_cpu_buf = cpu_memory.alloc(k_size, DType::F32)?;
-                                unsafe {
-                                    std::ptr::copy_nonoverlapping(
-                                        v_data.as_ptr(),
-                                        v_cpu_buf.as_mut_ptr(),
-                                        k_size,
-                                    );
-                                }
-                                let v_cpu_tensor = Tensor::new(
-                                    kv.v_buffer.shape().clone(),
-                                    v_cpu_buf,
-                                    cpu_backend.clone(),
-                                );
-
-                                let mut new_kv = KVCache::new_dynamic(
-                                    gpu_backend.copy_from(&k_cpu_tensor)?,
-                                    gpu_backend.copy_from(&v_cpu_tensor)?,
-                                    current_capacity,
-                                    max_seq_len,
-                                    kv_heads,
-                                    head_dim,
-                                    gpu_memory.clone(),
-                                );
-                                new_kv.current_pos = saved_pos;
-                                *kv = new_kv;
-                            }
+                            migrate_kv_caches(
+                                &mut kv_caches,
+                                &cpu_backend,
+                                &gpu_backend,
+                                &cpu_backend,
+                                &cpu_memory,
+                                &gpu_memory,
+                                kv_heads,
+                                head_dim,
+                                max_seq_len,
+                                true,
+                            )?;
 
                             current_backend = gpu_backend.clone();
 

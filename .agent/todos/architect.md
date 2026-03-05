@@ -22,12 +22,12 @@
 - **Notes**: 커밋 95af0a3에서 구현 완료. engine/shared/manager 3-crate workspace 구조 확립
 
 ## [P1] Hybrid 추론 + Eviction/Resilience 통합 설계
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음
 - **Description**: `engine/src/bin/generate_hybrid.rs`에 CacheManager(eviction), Resilience checkpoint, GPU→CPU 역방향 전환 통합 설계. 현재 hybrid는 eviction/resilience 미지원 상태
 - **Acceptance Criteria**: 통합 설계 문서, 역방향 전환 시퀀스, 변경 범위 명세
-- **Notes**: generate.rs 통합 패턴을 hybrid에 확장. 블로커 없음 → current로 승격
+- **Notes**: 구현 완료. KV 마이그레이션 3중 중복을 `migrate_kv_caches()` 헬퍼로 리팩토링 (-40줄). Evict, SwitchBackend(양방향), Throttle, Suspend 모두 통합됨
 
 ## [P3] 디바이스-모델 호환성 프로파일 설계
 - **Status**: TODO
