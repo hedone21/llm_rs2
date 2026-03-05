@@ -6,6 +6,7 @@ execution state so the frontend can poll for progress.
 """
 
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 _PROFILE_SCRIPT = _PROJECT_ROOT / "scripts" / "android_profile.py"
 _RESULTS_DIR = _PROJECT_ROOT / "results" / "data"
 
-# Android paths (matching run_benchmark_suite.py)
+# Legacy defaults (overridden when device_id is provided)
 _ANDROID_TMP = "/data/local/tmp"
 _LLM_DIR = f"{_ANDROID_TMP}/llm_rs2"
 _MODEL_PATH = f"{_LLM_DIR}/models/llama3.2-1b"
@@ -22,10 +23,25 @@ _EVAL_DIR = f"{_LLM_DIR}/eval"
 _GENERATE_BIN = f"{_ANDROID_TMP}/generate"
 
 
+def _load_device_paths(device_id):
+    """Load device paths from devices.toml, returning a dict of path overrides."""
+    scripts_dir = str(_PROJECT_ROOT / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from device_registry.config import load_device_config
+
+    cfg = load_device_config(device_id)
+    return {
+        "model_path": cfg.paths.model_dir or f"{cfg.paths.work_dir}/models/llama3.2-1b",
+        "eval_dir": cfg.paths.eval_dir or f"{cfg.paths.work_dir}/llm_rs2/eval",
+        "generate_bin": cfg.binary_remote_path("generate"),
+    }
+
+
 class BenchmarkRunner:
     """Singleton-style runner that manages one benchmark at a time."""
 
-    def __init__(self):
+    def __init__(self, device_id=""):
         self._lock = threading.Lock()
         self._running = False
         self._process = None
@@ -34,6 +50,7 @@ class BenchmarkRunner:
         self._params = {}
         self._result_file = None
         self._thread = None
+        self._device_paths = _load_device_paths(device_id) if device_id else None
 
     def is_running(self):
         with self._lock:
@@ -63,10 +80,18 @@ class BenchmarkRunner:
 
     def _build_device_cmd(self, backend, prefill_type, num_tokens):
         """Build the on-device command string."""
-        prompt_file = f"{_EVAL_DIR}/{prefill_type}.txt"
+        if self._device_paths:
+            eval_dir = self._device_paths["eval_dir"]
+            gen_bin = self._device_paths["generate_bin"]
+            model = self._device_paths["model_path"]
+        else:
+            eval_dir = _EVAL_DIR
+            gen_bin = _GENERATE_BIN
+            model = _MODEL_PATH
+        prompt_file = f"{eval_dir}/{prefill_type}.txt"
         return (
-            f"{_GENERATE_BIN} "
-            f"--model-path {_MODEL_PATH} "
+            f"{gen_bin} "
+            f"--model-path {model} "
             f"--prompt-file {prompt_file} "
             f"--num-tokens {num_tokens} "
             f"-b {backend}"

@@ -3,14 +3,34 @@ import subprocess
 import os
 import sys
 import time
+from pathlib import Path
 
-# Constants
+# Legacy defaults (overridden by --device)
 ANDROID_TMP_DIR = "/data/local/tmp"
 LLM_DIR = f"{ANDROID_TMP_DIR}/llm_rs2"
 EVAL_DIR = f"{LLM_DIR}/eval"
 MODEL_PATH = f"{LLM_DIR}/models/llama3.2-1b"
 GENERATE_BIN_LOCAL = "target/aarch64-linux-android/release/generate"
 GENERATE_BIN_REMOTE = f"{ANDROID_TMP_DIR}/generate"
+
+
+def _apply_device_config(device_id):
+    """Override module-level constants from devices.toml."""
+    global ANDROID_TMP_DIR, LLM_DIR, EVAL_DIR, MODEL_PATH
+    global GENERATE_BIN_LOCAL, GENERATE_BIN_REMOTE
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from device_registry.config import load_device_config
+    from device_registry.builder import get_local_binary_path
+
+    cfg = load_device_config(device_id)
+    project_root = Path(__file__).resolve().parent.parent
+
+    ANDROID_TMP_DIR = cfg.paths.work_dir
+    EVAL_DIR = cfg.paths.eval_dir or f"{ANDROID_TMP_DIR}/llm_rs2/eval"
+    MODEL_PATH = cfg.paths.model_dir or f"{ANDROID_TMP_DIR}/models/llama3.2-1b"
+    GENERATE_BIN_REMOTE = cfg.binary_remote_path("generate")
+    GENERATE_BIN_LOCAL = str(get_local_binary_path(cfg, "generate", project_root))
 
 def run_command(cmd, check=True, dry_run=False):
     if dry_run:
@@ -159,6 +179,7 @@ def run_suite(args):
 
 def main():
     parser = argparse.ArgumentParser(description="Run Benchmark Suite")
+    parser.add_argument("--device", default="", help="Device ID from devices.toml (overrides hardcoded paths)")
     parser.add_argument("--skip-build", action="store_true", help="Skip cargo build")
     parser.add_argument("--skip-push", action="store_true", help="Skip adb push")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running")
@@ -167,6 +188,9 @@ def main():
     parser.add_argument("--protected-prefix", type=int, default=0, help="Protected prefix tokens")
     parser.add_argument("--memory-threshold", type=int, default=256, help="Memory threshold (MB)")
     args = parser.parse_args()
+
+    if args.device:
+        _apply_device_config(args.device)
 
     # 1. Local Setup
     if not os.path.exists("eval"): 

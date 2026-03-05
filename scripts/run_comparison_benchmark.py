@@ -3,14 +3,30 @@ import subprocess
 import os
 import sys
 import time
+from pathlib import Path
 
-# Constants
+# Legacy defaults (overridden by --device)
 ANDROID_TMP_DIR = "/data/local/tmp"
 LLM_DIR = f"{ANDROID_TMP_DIR}/llm_rs2"
 EVAL_DIR = f"{LLM_DIR}/eval"
 MODEL_PATH = f"{LLM_DIR}/models/llama3.2-1b"
 GENERATE_BIN_REMOTE = f"{ANDROID_TMP_DIR}/generate"
 RESULTS_DIR = "results/data"
+
+
+def _apply_device_config(device_id):
+    """Override module-level constants from devices.toml."""
+    global ANDROID_TMP_DIR, LLM_DIR, EVAL_DIR, MODEL_PATH, GENERATE_BIN_REMOTE
+
+    sys.path.insert(0, os.path.dirname(__file__))
+    from device_registry.config import load_device_config
+
+    cfg = load_device_config(device_id)
+
+    ANDROID_TMP_DIR = cfg.paths.work_dir
+    EVAL_DIR = cfg.paths.eval_dir or f"{ANDROID_TMP_DIR}/llm_rs2/eval"
+    MODEL_PATH = cfg.paths.model_dir or f"{ANDROID_TMP_DIR}/models/llama3.2-1b"
+    GENERATE_BIN_REMOTE = cfg.binary_remote_path("generate")
 
 def run_command(cmd, check=True, dry_run=False):
     if dry_run:
@@ -48,9 +64,13 @@ def run_scenario(name, prompt_file, num_tokens, backend, dry_run=False):
 
 def main():
     parser = argparse.ArgumentParser(description="Run Comparison Benchmarks")
+    parser.add_argument("--device", default="", help="Device ID from devices.toml (overrides hardcoded paths)")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without running")
     parser.add_argument("--backend", choices=["cpu", "opencl", "all"], default="all", help="Backend to run (default: all)")
     args = parser.parse_args()
+
+    if args.device:
+        _apply_device_config(args.device)
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
 
