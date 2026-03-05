@@ -1,2 +1,4 @@
-// Manager service library.
-// Future home of Collectors, PolicyEngine, and Emitter.
+pub mod collector;
+pub mod config;
+pub mod emitter;
+pub mod policy;
