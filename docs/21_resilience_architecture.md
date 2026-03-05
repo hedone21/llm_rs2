@@ -935,13 +935,13 @@ classDiagram
     ResilienceManager --> ResilienceStrategy
     ResilienceManager --> SignalListener~T~
 
-    Backend <|.. CpuBackend
-    Backend <|.. OpenCLBackend
+    CpuBackend ..|> Backend
+    OpenCLBackend ..|> Backend
 
-    ResilienceStrategy <|.. MemoryStrategy
-    ResilienceStrategy <|.. ComputeStrategy
-    ResilienceStrategy <|.. ThermalStrategy
-    ResilienceStrategy <|.. EnergyStrategy
+    MemoryStrategy ..|> ResilienceStrategy
+    ComputeStrategy ..|> ResilienceStrategy
+    ThermalStrategy ..|> ResilienceStrategy
+    EnergyStrategy ..|> ResilienceStrategy
 
     SignalListener~T~ --> SystemBus : "D-Bus / Unix Socket"
 ```

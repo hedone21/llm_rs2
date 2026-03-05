@@ -614,8 +614,8 @@ classDiagram
         +memory_usage_bytes() usize
     }
 
-    Buffer <|.. SharedBuffer : implements
-    Memory <|.. Galloc : implements
+    SharedBuffer ..|> Buffer : implements
+    Galloc ..|> Memory : implements
     Tensor --> Shape : has
     Tensor --> Buffer : Arc~dyn Buffer~
     Tensor --> Backend : Arc~dyn Backend~
