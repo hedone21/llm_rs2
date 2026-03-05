@@ -1,7 +1,7 @@
 /// Accumulates per-token attention importance scores across layers.
 ///
 /// During decode, each layer's post-softmax attention weights are aggregated
-/// into a per-token importance score. SnapKV uses these scores to decide
+/// into a per-token importance score. H2O uses these scores to decide
 /// which tokens to keep vs evict.
 pub struct AttentionScoreAccumulator {
     /// Per-token importance scores, indexed by cache position.

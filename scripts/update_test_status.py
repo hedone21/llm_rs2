@@ -80,9 +80,9 @@ COMPONENT_META = {
         "tier": "T2",
         "maturity": "Stable",
     },
-    "core::eviction::snap_kv": {
+    "core::eviction::h2o": {
         "component": "Core",
-        "name": "SnapKVPolicy",
+        "name": "H2OPolicy",
         "tier": "T2",
         "maturity": "Stub",
     },

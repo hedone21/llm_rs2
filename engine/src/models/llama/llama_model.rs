@@ -52,7 +52,7 @@ pub struct LlamaModelForwardArgs<'a> {
     /// Optional cache manager for dynamic KV cache eviction.
     /// When provided, `maybe_evict()` is called after the layer pass.
     pub cache_manager: Option<&'a CacheManager>,
-    /// Optional attention score accumulator for SnapKV-style eviction.
+    /// Optional attention score accumulator for H2O-style eviction.
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
 }
@@ -360,7 +360,7 @@ impl LlamaModel {
 
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
-            // When SnapKV accumulator is tracking this layer, force CPU attention
+            // When H2O accumulator is tracking this layer, force CPU attention
             // so scores are written to ws.scores (GPU attention discards them).
             let layer_gpu_attn = if let Some(ref acc) = score_accumulator {
                 if acc.should_track_layer(i) {
@@ -384,7 +384,7 @@ impl LlamaModel {
                 use_gpu_attn: layer_gpu_attn,
             })?;
 
-            // Capture attention scores for SnapKV accumulator
+            // Capture attention scores for H2O accumulator
             if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
                 && acc.should_track_layer(i)
             {

@@ -17,7 +17,7 @@ declare -A SCENARIOS=(
 
 BACKEND="cpu"  # or "opencl"
 NUM_TOKENS=128
-EVICTION_POLICY="none"  # none, sliding, or snapkv
+EVICTION_POLICY="none"  # none, sliding, or h2o
 EVICTION_WINDOW=1024
 PROTECTED_PREFIX=0
 MEMORY_THRESHOLD_MB=256

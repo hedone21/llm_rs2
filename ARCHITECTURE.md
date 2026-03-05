@@ -8,7 +8,7 @@
 본 프로젝트는 연구 및 실험 목적의 온디바이스(On-device) LLM 추론 프레임워크입니다. 모바일 및 엣지 디바이스 환경에서의 고성능 추론과 유연한 실험 환경 제공을 목표로 합니다.
 - **유연한 백엔드 확장성 (Extensibility)**: Backend 인터페이스 기반 설계를 통해 CPU, GPU(OpenCL), NPU(QNN, TBD) 등 다양한 하드웨어 가속기를 손쉽게 추가하고 교체할 수 있는 구조를 지향합니다.
 - **고성능 메모리 관리 (Performance)**: ARM64 SoC 환경의 특성을 활용하여, Galloc 기반의 공유 메모리 관리자를 통해 CPU와 GPU/NPU 간 데이터 복사를 최소화(Zero-copy)하도록 설계되었습니다.
-- **동적 KV 캐시 관리**: 메모리 제약 환경에서 장시간 추론을 위한 KV 캐시 Eviction 정책(Sliding Window, SnapKV 등)을 지원합니다.
+- **동적 KV 캐시 관리**: 메모리 제약 환경에서 장시간 추론을 위한 KV 캐시 Eviction 정책(Sliding Window, H2O 등)을 지원합니다.
 
 ### Scope & Limitation
 - **Target Platform**: ARM64 아키텍처 기반의 엣지 디바이스(Android/Linux)를 주 타겟으로 합니다. x86 CPU 백엔드로도 추론은 가능하나, SIMD 최적화(NEON)는 ARM64 전용입니다.
@@ -50,7 +50,7 @@ graph TB
         EvictionPolicy["EvictionPolicy trait"]
         NoEviction["NoEvictionPolicy"]
         SlidingWindow["SlidingWindowPolicy"]
-        SnapKV["SnapKVPolicy (stub)"]
+        H2O["H2OPolicy (stub)"]
         SysMonitor["SystemMonitor trait"]
         LinuxMonitor["LinuxSystemMonitor"]
     end
@@ -77,7 +77,7 @@ graph TB
     CacheManager --> SysMonitor
     EvictionPolicy <|-- NoEviction
     EvictionPolicy <|-- SlidingWindow
-    EvictionPolicy <|-- SnapKV
+    EvictionPolicy <|-- H2O
     SysMonitor <|-- LinuxMonitor
     EvictionPolicy --> KVCache
 
@@ -239,7 +239,7 @@ classDiagram
         +should_evict() → pos > window + prefix
         +evict() → prune oldest, keep recent window
     }
-    class SnapKVPolicy {
+    class H2OPolicy {
         -observation_window: usize
         -keep_ratio: f32
         +evict() → (stub: sliding window fallback)
@@ -249,7 +249,7 @@ classDiagram
     CacheManager --> SystemMonitor
     EvictionPolicy <|-- NoEvictionPolicy
     EvictionPolicy <|-- SlidingWindowPolicy
-    EvictionPolicy <|-- SnapKVPolicy
+    EvictionPolicy <|-- H2OPolicy
 ```
 
 **Eviction 트리거 조건** (`CacheManager::maybe_evict`):
@@ -339,7 +339,7 @@ llm_rs2/
 │   │       ├── mod.rs             # EvictionPolicy trait
 │   │       ├── no_eviction.rs     # NoEvictionPolicy (항상 skip)
 │   │       ├── sliding_window.rs  # SlidingWindowPolicy (최근 N 토큰 유지)
-│   │       └── snap_kv.rs         # SnapKVPolicy (attention score 기반, stub)
+│   │       └── h2o.rs             # H2OPolicy (attention score 기반, stub)
 │   │
 │   ├── models/llama/
 │   │   ├── llama_model.rs    # LlamaModel (from_dir, forward_into)
@@ -433,7 +433,7 @@ llm_rs2/
 
 `generate` 바이너리의 eviction 관련 CLI 옵션:
 ```
---eviction-policy <POLICY>     none | sliding | snapkv [default: none]
+--eviction-policy <POLICY>     none | sliding | h2o [default: none]
 --eviction-window <SIZE>       Sliding window size [default: 512]
 --protected-prefix <N>         Attention sink tokens to protect [default: 0]
 --memory-threshold-mb <MB>     Memory pressure threshold [default: 256]
@@ -717,6 +717,6 @@ adb shell /data/local/tmp/generate --model-path /data/local/tmp/model --backend 
 3. **LayerWorkspace로 할당 최소화**: Decode 루프에서 매 토큰마다 메모리를 할당하지 않고, 사전 할당된 작업 버퍼를 재사용합니다.
 
 ### Known Limitations
-1. **SnapKV는 stub**: Attention score를 외부로 노출하는 API가 아직 없어 falling back to sliding window입니다.
+1. **H2O는 stub**: Attention score를 외부로 노출하는 API가 아직 없어 falling back to sliding window입니다.
 2. **GPU buffer prune 미지원**: `prune_prefix`는 CPU 포인터 접근이 필요하므로 GPU-only 버퍼에서는 실패합니다 (`as_mut_ptr()` null).
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.

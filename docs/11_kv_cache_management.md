@@ -29,7 +29,7 @@ graph TB
     subgraph "Eviction Policies (core/eviction/)"
         NoEviction["NoEvictionPolicy<br/>(기본값, 아무것도 안 함)"]
         SlidingWindow["SlidingWindowPolicy<br/>window_size, protected_prefix"]
-        SnapKV["SnapKVPolicy<br/>observation_window, keep_ratio"]
+        H2O["H2OPolicy<br/>observation_window, keep_ratio"]
     end
 
     subgraph "Integration"
@@ -43,7 +43,7 @@ graph TB
 
     EvictionPolicy -.-> NoEviction
     EvictionPolicy -.-> SlidingWindow
-    EvictionPolicy -.-> SnapKV
+    EvictionPolicy -.-> H2O
 
     LlamaModel --> CacheManager
     GenerateBin --> CacheManager
@@ -138,7 +138,7 @@ After (current_pos = 1088):
 
 **구현 핵심**: `KVCache::prune_prefix(count)` → `memmove`로 데이터를 앞으로 이동
 
-### 11.4.3 SnapKVPolicy (Attention-based)
+### 11.4.3 H2OPolicy (Attention-based)
 
 Attention score를 기반으로 중요한 토큰을 선택적으로 유지하는 전략입니다.
 자주 attention 되는 토큰은 보존하고, 거의 참조되지 않는 토큰을 제거합니다.
@@ -152,7 +152,7 @@ After (keep_ratio=0.5, 상위 50% 유지):
 [토큰 0][토큰 3][토큰 5]  ← 높은 attention score 토큰만 유지
 ```
 
-> **Note**: SnapKV는 attention score 접근이 필요합니다. 현재 attention 계산이
+> **Note**: H2O는 attention score 접근이 필요합니다. 현재 attention 계산이
 > `LlamaLayer` 내부에서 직접 이루어지므로, 실제 score 기반 동작을 위해서는
 > attention score를 외부로 노출하는 추가 리팩토링이 필요합니다.
 > **초기 구현에서는 인터페이스만 정의하고 fallback으로 sliding window를 사용합니다.**
@@ -257,7 +257,7 @@ src/core/
 │   ├── mod.rs          //   EvictionPolicy trait + re-exports
 │   ├── no_eviction.rs  //   NoEvictionPolicy
 │   ├── sliding_window.rs // SlidingWindowPolicy
-│   └── snap_kv.rs      //   SnapKVPolicy (stub)
+│   └── h2o.rs          //   H2OPolicy (stub)
 └── mod.rs              // [수정] eviction, cache_manager, sys_monitor 등록
 ```
 
@@ -268,7 +268,7 @@ src/core/
 ### CLI 옵션
 
 ```
---eviction-policy <none|sliding|snapkv>  (default: none)
+--eviction-policy <none|sliding|h2o>  (default: none)
 --eviction-window <usize>                (default: 1024)
 --memory-threshold <MB>                  (default: 256)
 ```
@@ -361,7 +361,7 @@ pub use my_policy::MyCustomPolicy;
 
 | 항목 | 설명 | 의존성 |
 |------|------|--------|
-| SnapKV 실제 구현 | Attention score 기반 선택적 토큰 유지 | Attention score 외부 노출 리팩토링 필요 |
+| H2O 실제 구현 | Attention score 기반 선택적 토큰 유지 | Attention score 외부 노출 리팩토링 필요 |
 | H2O (Heavy Hitter Oracle) | 자주 참조되는 토큰을 누적 score로 추적 | Attention score 외부 노출 필요 |
 | Adaptive 전략 | 메모리 압력 수준에 따라 전략 자동 전환 | CacheManager 확장 |
 | Per-layer 독립 전략 | 레이어별로 다른 eviction 전략 적용 | CacheManager 확장 |

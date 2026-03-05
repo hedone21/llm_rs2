@@ -363,10 +363,10 @@ mod tests {
 
     #[test]
     fn test_maybe_evict_with_scores_triggers() {
-        use crate::core::eviction::snap_kv::SnapKVPolicy;
+        use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
-            Box::new(SnapKVPolicy::new(5, 0.3, 0)), // prefix=4, keep_ratio=0.3
+            Box::new(H2OPolicy::new(5, 0.3, 0)), // prefix=4, keep_ratio=0.3
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }),

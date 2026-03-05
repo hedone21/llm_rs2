@@ -22,7 +22,7 @@ pub trait EvictionPolicy: Send + Sync {
 
     /// Performs eviction using per-token importance scores.
     /// Default implementation ignores scores and delegates to `evict()`.
-    /// Override in score-aware policies like SnapKV.
+    /// Override in score-aware policies like H2O.
     fn evict_with_scores(
         &self,
         cache: &mut KVCache,
@@ -33,10 +33,10 @@ pub trait EvictionPolicy: Send + Sync {
     }
 }
 
+pub mod h2o;
 pub mod no_eviction;
 pub mod sliding_window;
-pub mod snap_kv;
 
+pub use h2o::H2OPolicy;
 pub use no_eviction::NoEvictionPolicy;
 pub use sliding_window::SlidingWindowPolicy;
-pub use snap_kv::SnapKVPolicy;

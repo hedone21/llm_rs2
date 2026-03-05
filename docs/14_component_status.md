@@ -39,7 +39,7 @@ graph TB
         EvictionPolicy["EvictionPolicy trait"]
         NoEviction["NoEvictionPolicy"]
         SlidingWindow["SlidingWindowPolicy"]
-        SnapKV["SnapKVPolicy (stub)"]
+        H2O["H2OPolicy (stub)"]
         SysMonitor["SystemMonitor trait"]
         LinuxMonitor["LinuxSystemMonitor"]
     end
@@ -66,7 +66,7 @@ graph TB
     CacheManager --> SysMonitor
     NoEviction -.->|impl| EvictionPolicy
     SlidingWindow -.->|impl| EvictionPolicy
-    SnapKV -.->|impl| EvictionPolicy
+    H2O -.->|impl| EvictionPolicy
     LinuxMonitor -.->|impl| SysMonitor
     EvictionPolicy --> KVCache
 
@@ -90,7 +90,7 @@ graph TB
 | Tier | Scope | Components | Gate Criteria |
 |:-----|:------|:-----------|:--------------|
 | **T1: Foundation** | Data structures, memory primitives | Shape, Tensor, Buffer/DType, Quant, SharedBuffer, Galloc | Host unit tests required, all must PASS |
-| **T2: Algorithm** | Algorithms, policies, CPU-testable logic | KVCache, NoEvictionPolicy, SlidingWindowPolicy, SnapKVPolicy, CacheManager, SystemMonitor, Attention | Host unit tests required, all must PASS |
+| **T2: Algorithm** | Algorithms, policies, CPU-testable logic | KVCache, NoEvictionPolicy, SlidingWindowPolicy, H2OPolicy, CacheManager, SystemMonitor, Attention | Host unit tests required, all must PASS |
 | **T3: Backend** | Hardware-specific backends | CpuBackend, OpenCLBackend | Device verification via `test_backend`, host N/A |
 | **T4: Integration** | Model layers, GPU buffers | LlamaLayer, LayerWorkspace, LlamaModel, UnifiedBuffer | E2E device verification, host N/A |
 
@@ -140,7 +140,7 @@ _Last updated: 2026-03-02 23:52:33_
 | ResilienceManager | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
 | Signal/Level | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
 | SlidingWindowPolicy | T2 | Stable | 7 | 7 | 0 | PASS |
-| SnapKVPolicy | T2 | Stub | 6 | 6 | 0 | PASS |
+| H2OPolicy | T2 | Stub | 6 | 6 | 0 | PASS |
 | Strategy | T2 | Stable | 0 | 0 | 0 | **BLOCKED** |
 | SystemMonitor | T2 | Stable | 3 | 3 | 0 | PASS |
 | CpuBackend | T3 | Stable | 14 | 14 | 0 | PASS |
@@ -213,12 +213,12 @@ _Last updated: 2026-03-02 23:52:33_
 | `test_name` | SlidingWindowPolicy | PASS |
 | `test_should_evict` | SlidingWindowPolicy | PASS |
 | `test_should_evict_with_prefix` | SlidingWindowPolicy | PASS |
-| `test_evict_below_threshold_noop` | SnapKVPolicy | PASS |
-| `test_evict_stub_falls_back_to_sliding` | SnapKVPolicy | PASS |
-| `test_evict_with_prefix` | SnapKVPolicy | PASS |
-| `test_keep_ratio_clamping` | SnapKVPolicy | PASS |
-| `test_name` | SnapKVPolicy | PASS |
-| `test_should_evict` | SnapKVPolicy | PASS |
+| `test_evict_below_threshold_noop` | H2OPolicy | PASS |
+| `test_evict_stub_falls_back_to_sliding` | H2OPolicy | PASS |
+| `test_evict_with_prefix` | H2OPolicy | PASS |
+| `test_keep_ratio_clamping` | H2OPolicy | PASS |
+| `test_name` | H2OPolicy | PASS |
+| `test_should_evict` | H2OPolicy | PASS |
 | `test_linux_monitor_parsing` | SystemMonitor | PASS |
 | `test_parse_meminfo_bad_format_error` | SystemMonitor | PASS |
 | `test_parse_meminfo_missing_field_error` | SystemMonitor | PASS |

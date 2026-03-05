@@ -2,16 +2,20 @@ use super::EvictionPolicy;
 use crate::core::kv_cache::KVCache;
 use anyhow::Result;
 
-/// SnapKV eviction policy — attention score-based intelligent KV cache eviction.
+/// H2O (Heavy-Hitter Oracle) eviction policy — attention score-based KV cache eviction.
 ///
-/// SnapKV selectively keeps tokens with high attention scores, dropping those
-/// rarely attended to. When importance scores are provided via `evict_with_scores()`,
-/// tokens are ranked by cumulative attention weight and only the most important
-/// ones are retained. Without scores, falls back to sliding window behavior.
+/// H2O maintains a dynamic set of "heavy hitter" tokens that consistently receive
+/// high cumulative attention scores across decode steps, combined with recent tokens.
+/// When importance scores are provided via `evict_with_scores()`, tokens are ranked
+/// by cumulative attention weight and only the most important ones are retained.
+/// Without scores, falls back to sliding window behavior.
 ///
 /// The `AttentionScoreAccumulator` (in `core::attention_scores`) captures
 /// post-softmax attention weights during the forward pass and feeds them here.
-pub struct SnapKVPolicy {
+///
+/// Reference: "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of
+/// Large Language Models" (Zhang et al., 2023)
+pub struct H2OPolicy {
     /// Number of recent tokens to observe for score accumulation
     observation_window: usize,
     /// Fraction of tokens to keep (0.0 to 1.0)
@@ -20,7 +24,7 @@ pub struct SnapKVPolicy {
     protected_prefix: usize,
 }
 
-impl SnapKVPolicy {
+impl H2OPolicy {
     pub fn new(observation_window: usize, keep_ratio: f32, protected_prefix: usize) -> Self {
         let protected_prefix = protected_prefix.max(4);
         Self {
@@ -31,7 +35,7 @@ impl SnapKVPolicy {
     }
 }
 
-impl EvictionPolicy for SnapKVPolicy {
+impl EvictionPolicy for H2OPolicy {
     fn should_evict(&self, cache: &KVCache, _mem_available: usize) -> bool {
         // Trigger when the cache has significantly more tokens than what we'd keep
         let keep_count = ((cache.current_pos as f32) * self.keep_ratio) as usize;
@@ -51,7 +55,7 @@ impl EvictionPolicy for SnapKVPolicy {
 
         // Fallback: without attention scores, use sliding window behavior
         log::debug!(
-            "SnapKV (fallback): sliding window eviction, removing {} tokens",
+            "H2O (fallback): sliding window eviction, removing {} tokens",
             current - keep
         );
 
@@ -106,7 +110,7 @@ impl EvictionPolicy for SnapKVPolicy {
         }
 
         log::debug!(
-            "SnapKV: score-based eviction, keeping {}/{} tokens",
+            "H2O: score-based eviction, keeping {}/{} tokens",
             keep,
             current
         );
@@ -155,13 +159,13 @@ impl EvictionPolicy for SnapKVPolicy {
 
         cache.current_pos = self.protected_prefix + keep_positions.len();
 
-        log::debug!("SnapKV: compacted cache to {} tokens", cache.current_pos);
+        log::debug!("H2O: compacted cache to {} tokens", cache.current_pos);
 
         Ok(())
     }
 
     fn name(&self) -> &str {
-        "snap_kv"
+        "h2o"
     }
 }
 
@@ -226,7 +230,7 @@ mod tests {
 
     #[test]
     fn test_should_evict() {
-        let policy = SnapKVPolicy::new(5, 0.5, 0);
+        let policy = H2OPolicy::new(5, 0.5, 0);
         let cache = make_cache(20);
         assert!(policy.should_evict(&cache, 0));
 
@@ -235,9 +239,9 @@ mod tests {
     }
 
     #[test]
-    fn test_evict_stub_falls_back_to_sliding() {
+    fn test_evict_falls_back_to_sliding() {
         let _ = env_logger::try_init();
-        let policy = SnapKVPolicy::new(5, 0.5, 0); // prefix=4
+        let policy = H2OPolicy::new(5, 0.5, 0); // prefix=4
         let mut cache = make_cache(20);
         policy.evict(&mut cache, 10).unwrap();
         assert_eq!(cache.current_pos, 14);
@@ -245,7 +249,7 @@ mod tests {
 
     #[test]
     fn test_evict_with_prefix() {
-        let policy = SnapKVPolicy::new(5, 0.5, 3); // prefix=4
+        let policy = H2OPolicy::new(5, 0.5, 3); // prefix=4
         let mut cache = make_cache(20);
         policy.evict(&mut cache, 13).unwrap();
         assert_eq!(cache.current_pos, 14);
@@ -253,33 +257,33 @@ mod tests {
 
     #[test]
     fn test_name() {
-        assert_eq!(SnapKVPolicy::new(5, 0.5, 0).name(), "snap_kv");
+        assert_eq!(H2OPolicy::new(5, 0.5, 0).name(), "h2o");
     }
 
     #[test]
     fn test_keep_ratio_clamping() {
-        let policy = SnapKVPolicy::new(5, 2.0, 0);
+        let policy = H2OPolicy::new(5, 2.0, 0);
         let cache = make_cache(20);
         assert!(!policy.should_evict(&cache, 0));
 
-        let policy_neg = SnapKVPolicy::new(5, -1.0, 0);
+        let policy_neg = H2OPolicy::new(5, -1.0, 0);
         let cache2 = make_cache(20);
         assert!(policy_neg.should_evict(&cache2, 0));
     }
 
     #[test]
     fn test_evict_below_threshold_noop() {
-        let policy = SnapKVPolicy::new(5, 0.9, 0);
+        let policy = H2OPolicy::new(5, 0.9, 0);
         let mut cache = make_cache(10);
         policy.evict(&mut cache, 10).unwrap();
         assert_eq!(cache.current_pos, 10);
     }
 
-    // --- New tests for evict_with_scores ---
+    // --- Tests for evict_with_scores ---
 
     #[test]
     fn test_evict_with_scores_keeps_important_tokens() {
-        let _policy = SnapKVPolicy::new(5, 1.0, 0); // prefix=4, keep_ratio=1.0
+        let _policy = H2OPolicy::new(5, 1.0, 0); // prefix=4, keep_ratio=1.0
         let mut cache = make_cache(20);
 
         // Write marker values at each position
@@ -302,7 +306,7 @@ mod tests {
         // target_len = 10 → keep = clamp(10, min_keep=min(20,24)=20, max_keep=24) = 20
         // With keep_ratio=1.0 and prefix=4, max_keep = 20+4=24, so no eviction at target_len=10
         // Let's use a lower keep_ratio
-        let policy = SnapKVPolicy::new(5, 0.3, 0); // prefix=4, keep_ratio=0.3
+        let policy = H2OPolicy::new(5, 0.3, 0); // prefix=4, keep_ratio=0.3
         // max_keep = 20*0.3 + 4 = 10
         // min_keep = min(4+16, 10) = 10
         // keep = 8.clamp(10, 10) = 10
@@ -325,7 +329,7 @@ mod tests {
 
     #[test]
     fn test_evict_with_scores_preserves_prefix() {
-        let policy = SnapKVPolicy::new(5, 0.2, 5); // prefix=5, keep_ratio=0.2
+        let policy = H2OPolicy::new(5, 0.2, 5); // prefix=5, keep_ratio=0.2
         let mut cache = make_cache(30);
 
         // Give prefix tokens zero importance — they should still be kept
@@ -347,7 +351,7 @@ mod tests {
 
     #[test]
     fn test_evict_with_scores_maintains_order() {
-        let policy = SnapKVPolicy::new(5, 0.3, 0); // prefix=4, keep_ratio=0.3
+        let policy = H2OPolicy::new(5, 0.3, 0); // prefix=4, keep_ratio=0.3
         let mut cache = make_cache(20);
 
         // Write distinct markers
@@ -393,7 +397,7 @@ mod tests {
     #[test]
     fn test_evict_with_scores_fallback() {
         // Calling evict() (without scores) should still work
-        let policy = SnapKVPolicy::new(5, 0.5, 0);
+        let policy = H2OPolicy::new(5, 0.5, 0);
         let mut cache = make_cache(20);
         policy.evict(&mut cache, 10).unwrap();
         assert!(cache.current_pos < 20);

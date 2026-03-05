@@ -19,7 +19,7 @@
 - **Dependencies**: 아키텍트의 Hybrid 통합 설계
 - **Description**: `engine/src/bin/generate_hybrid.rs`에 CacheManager 연동, KV eviction 지원 추가. 현재 hybrid는 max_seq_len 초과 시 추론 중단됨
 - **Acceptance Criteria**: hybrid 모드에서 eviction 정상 동작, 장시간 추론 가능
-- **Notes**: 커밋 dc78418에서 구현 완료. CacheManager, EvictionPolicy(none/sliding/snapkv), max_seq_len 체크 추가
+- **Notes**: 커밋 dc78418에서 구현 완료. CacheManager, EvictionPolicy(none/sliding/h2o), max_seq_len 체크 추가
 
 ## [P1] Hybrid + Resilience 통합 구현
 - **Status**: DONE

@@ -4,9 +4,9 @@ use llm_rs2::core::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
 use llm_rs2::core::cache_manager::CacheManager;
+use llm_rs2::core::eviction::h2o::H2OPolicy;
 use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
-use llm_rs2::core::eviction::snap_kv::SnapKVPolicy;
 use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
@@ -75,11 +75,11 @@ struct Args {
     #[arg(long, default_value = "q4")]
     kv_type: String,
 
-    /// Eviction policy for KV cache management (none, sliding, snapkv)
+    /// Eviction policy for KV cache management (none, sliding, h2o)
     #[arg(long, default_value = "none")]
     eviction_policy: String,
 
-    /// Window size for sliding window / snapkv eviction (tokens)
+    /// Window size for sliding window / h2o eviction (tokens)
     #[arg(long, default_value_t = 1024)]
     eviction_window: usize,
 
@@ -373,13 +373,13 @@ fn main() -> anyhow::Result<()> {
                     args.eviction_window,
                     actual_protected_prefix,
                 )),
-                "snapkv" => Box::new(SnapKVPolicy::new(
+                "h2o" => Box::new(H2OPolicy::new(
                     args.eviction_window,
                     0.5,
                     actual_protected_prefix,
                 )),
                 other => anyhow::bail!(
-                    "Unknown eviction policy: '{}'. Use: none, sliding, snapkv",
+                    "Unknown eviction policy: '{}'. Use: none, sliding, h2o",
                     other
                 ),
             };
@@ -388,8 +388,8 @@ fn main() -> anyhow::Result<()> {
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
 
-    // Setup AttentionScoreAccumulator for SnapKV
-    let mut score_accumulator = if args.eviction_policy == "snapkv" {
+    // Setup AttentionScoreAccumulator for H2O
+    let mut score_accumulator = if args.eviction_policy == "h2o" {
         let mut acc = AttentionScoreAccumulator::new(
             max_seq_len,
             model.config.num_attention_heads,

@@ -321,7 +321,7 @@ for &idx in &valid_indices {
 | `--repetition-window` | `64` | 반복 검사 윈도우 크기 (토큰 수) |
 | `--kv-type` | `q4` | KV 캐시 dtype: `f32`, `f16`, `q4` |
 | `--max-seq-len` | `2048` | 최대 시퀀스 길이 |
-| `--eviction-policy` | `none` | 캐시 eviction 정책: `none`, `sliding`, `snapkv` |
+| `--eviction-policy` | `none` | 캐시 eviction 정책: `none`, `sliding`, `h2o` |
 | `--eviction-window` | `1024` | Eviction 윈도우 크기 |
 | `--protected-prefix` | `0` | Eviction에서 보호할 prefix 토큰 수 |
 | `--gpu-attn` | `false` | GPU attention 커널 사용 여부 |
