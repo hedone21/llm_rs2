@@ -38,11 +38,13 @@ Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fi
 
 ## Architecture
 
-**Cargo workspace** with 3 crates:
+**Cargo workspace** with 3 Rust crates:
 - `engine/` — LLM inference engine (`llm_rs2` crate)
 - `shared/` — Shared signal types (`llm_shared` crate)
 - `manager/` — System resource manager service (`llm_manager` crate)
-- `dashboard/` — Web dashboard (Python/Flask, not a Rust crate)
+
+**Non-Rust components**:
+- `dashboard/` — Web dashboard (Python/Flask)
 
 **Engine module structure** (`engine/src/lib.rs`):
 - `core/` — Traits and abstractions: `Backend` (15+ ops), `Buffer`, `Tensor`, `KVCache`, eviction policies
@@ -64,7 +66,7 @@ Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fi
 
 **Zero-copy memory**: On ARM SoCs, `CL_MEM_ALLOC_HOST_PTR` maps GPU buffers to CPU pointers, eliminating memcpy between CPU and GPU.
 
-**KV cache eviction**: `EvictionPolicy` trait with `SlidingWindowPolicy` (keep recent N tokens) and `NoEvictionPolicy`. RoPE position increments monotonically even after eviction; physical KV cache position can decrease via `prune_prefix()`.
+**KV cache eviction**: `EvictionPolicy` trait with `NoEvictionPolicy`, `SlidingWindowPolicy` (keep recent N tokens), and `H2OPolicy` (3-partition: prefix + heavy hitters + recent window, signal-driven via `CacheManager::force_evict_with_scores()`). RoPE position increments monotonically even after eviction; physical KV cache position can decrease via `prune_prefix()`.
 
 ## Important Constraints
 
@@ -111,6 +113,13 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/20_dbus_ipc_spec.md` — D-Bus IPC specification for Resilience Manager
 - `docs/21_resilience_architecture.md` — Resilience system architecture and strategy patterns
 - `docs/22_resilience_integration.md` — Phase 3 generate.rs integration design spec
+- `docs/README.md` — Documentation index and reading order guide
+- `docs/14_component_status.md` — Component quality gates and test status
+- `docs/15_test_strategy.md` — Resilience test strategy (T1-T4 tiers)
+- `docs/23_resilience_test_strategy.md` — Resilience integration test summary
+- `docs/24_resilience_usage_guide.md` — Resilience system usage guide
+- `docs/25_troubleshooting.md` — Troubleshooting guide
+- `docs/26_api_reference.md` — Resilience API reference
 
 ## Web Dashboard
 
