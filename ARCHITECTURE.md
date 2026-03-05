@@ -51,6 +51,7 @@ graph TB
         NoEviction["NoEvictionPolicy"]
         SlidingWindow["SlidingWindowPolicy"]
         H2O["H2OPolicy (3-partition)"]
+        ScoreAccum["AttentionScoreAccumulator"]
         SysMonitor["SystemMonitor trait"]
         LinuxMonitor["LinuxSystemMonitor"]
     end
@@ -80,6 +81,7 @@ graph TB
     EvictionPolicy <|-- H2O
     SysMonitor <|-- LinuxMonitor
     EvictionPolicy --> KVCache
+    H2O --> ScoreAccum
 
     Tensor --> BufferTrait
     Tensor --> BackendTrait
@@ -104,6 +106,7 @@ graph TB
 | **LlamaLayer** | 단일 트랜스포머 레이어 (`forward` / `forward_gen`) | `src/layers/llama_layer.rs` |
 | **LayerWorkspace** | 생성 루프용 사전 할당 작업 텐서 (매 토큰 재사용) | `src/layers/workspace.rs` |
 | **LlamaModel** | 모델 로딩, 임베딩, 레이어 반복, 로짓 계산 | `src/models/llama/llama_model.rs` |
+| **AttentionScoreAccumulator** | H2O용 attention importance score 누적 (decay, reset) | `src/core/attention_scores.rs` |
 
 ---
 
@@ -184,101 +187,23 @@ graph LR
 
 ## KV Cache & Eviction System
 
-### KVCache 구조
-
-각 트랜스포머 레이어마다 별도의 KVCache를 가집니다. GQA를 지원하므로 KV 헤드 수는 Query 헤드 수보다 적습니다.
-
-```rust
-pub struct KVCache {
-    pub k_buffer: Tensor,    // [max_seq_len, kv_heads, head_dim]
-    pub v_buffer: Tensor,    // [max_seq_len, kv_heads, head_dim]
-    pub current_pos: usize,  // 현재 저장된 토큰 수 (0 ~ max_seq_len)
-    pub max_seq_len: usize,  // 최대 시퀀스 길이
-}
-```
-
-주요 메서드:
-
-| 메서드 | 설명 |
-|:------|:-----|
-| `update(k, v)` | `current_pos` 위치에 새 K,V를 삽입, `current_pos += seq_len` |
-| `prune_prefix(count)` | 앞에서 `count`개 토큰 제거, 나머지를 앞으로 shift |
-| `get_view()` | 전체 K,V 버퍼 반환 (attention은 `current_pos`까지만 참조) |
-| `memory_usage_bytes()` | 현재 사용 중인 KV 데이터의 바이트 크기 |
-
-### Eviction Architecture
-
-```mermaid
-classDiagram
-    class EvictionPolicy {
-        <<trait>>
-        +should_evict(cache, mem_available) bool
-        +evict(cache, target_len) Result
-        +name() str
-    }
-
-    class CacheManager {
-        -policy: Box~EvictionPolicy~
-        -monitor: Box~SystemMonitor~
-        -threshold_bytes: usize
-        -target_ratio: f32
-        +maybe_evict(caches) Result~EvictionResult~
-    }
-
-    class SystemMonitor {
-        <<trait>>
-        +mem_stats() Result~MemoryStats~
-    }
-
-    class NoEvictionPolicy {
-        +should_evict() → false
-    }
-    class SlidingWindowPolicy {
-        -window_size: usize
-        -protected_prefix: usize
-        +should_evict() → pos > window + prefix
-        +evict() → prune oldest, keep recent window
-    }
-    class H2OPolicy {
-        -recent_window: usize
-        -keep_ratio: f32
-        -protected_prefix: usize
-        +evict() → fallback sliding with recent protection
-        +evict_with_scores() → 3-partition: prefix + heavy hitters + recent
-    }
-
-    CacheManager --> EvictionPolicy
-    CacheManager --> SystemMonitor
-    EvictionPolicy <|-- NoEvictionPolicy
-    EvictionPolicy <|-- SlidingWindowPolicy
-    EvictionPolicy <|-- H2OPolicy
-```
-
-**Eviction 트리거 조건** (`CacheManager::maybe_evict`):
-1. `EvictionPolicy::should_evict()` 가 true → 즉시 eviction
-2. 또는 `mem_available < threshold_bytes` → 메모리 압박에 의한 eviction
+3가지 전략을 지원하는 Strategy Pattern 기반 KV 캐시 관리:
+- **NoEvictionPolicy**: 기본값. eviction 없이 가득 차면 에러.
+- **SlidingWindowPolicy**: 최근 N 토큰 유지, `protected_prefix`로 attention sink 보호.
+- **H2OPolicy**: 3-partition 모델 (prefix + heavy hitters + recent window). Signal-driven — Resilience 시그널 수신 시 `CacheManager::force_evict_with_scores()`로 실행.
+- **AttentionScoreAccumulator**: H2O용 importance score를 매 토큰마다 누적 (bookkeeping only).
 
 **Eviction 후 데이터 흐름**:
 ```
 Before: [T0][T1][T2][T3][T4][T5][T6][T7] current_pos=8, start_pos=8
-         ↑ RoPE(0..7)
 prune_prefix(3):
 After:  [T3][T4][T5][T6][T7][_][_][_]   current_pos=5, start_pos=8 (불변!)
          ↑ RoPE(3..7) — 원래 인코딩 유지
-
-Next token: K gets RoPE(8), stored at slot 5
-→ Key at slot 4 has RoPE(7), relative distance = 1 ✓
 ```
 
-### Sliding Window 품질 가이드라인
+> `start_pos`(RoPE 논리 위치)는 eviction 후에도 단조 증가. `current_pos`(물리 슬롯)만 감소.
 
-| Window Size | 권장 상황 |
-|:-----------:|:---------|
-| ≥ 256 | 200토큰 이하 생성 — 우수한 품질 |
-| 128 | 100토큰 이하 생성 — 양호 |
-| ≤ 64 | 짧은 QA 응답에만 적합 — 반복 eviction 시 급격한 열화 |
-
-> **Tip**: `protected_prefix`로 첫 N개 토큰(attention sink)을 보호하면 작은 윈도우에서도 안정성이 향상됩니다 (StreamingLLM 기법).
+상세: [`docs/11_kv_cache_management.md`](docs/11_kv_cache_management.md)
 
 ---
 
@@ -337,6 +262,7 @@ llm_rs2/
 │   │   ├── cache_manager.rs       # CacheManager (eviction 조율)
 │   │   ├── sys_monitor.rs         # SystemMonitor trait + LinuxSystemMonitor
 │   │   ├── quant.rs               # BlockQ4_0 quantization 구조체
+│   │   ├── attention_scores.rs    # AttentionScoreAccumulator (H2O importance tracking)
 │   │   └── eviction/              # Eviction 정책 (Strategy Pattern)
 │   │       ├── mod.rs             # EvictionPolicy trait
 │   │       ├── no_eviction.rs     # NoEvictionPolicy (항상 skip)
@@ -368,7 +294,8 @@ llm_rs2/
 │   │   ├── manager.rs               # ResilienceManager (poll, execute_action)
 │   │   ├── signal.rs                # SystemSignal, Level, enum types
 │   │   ├── state.rs                 # OperatingMode (Normal/Degraded/Minimal/Suspended)
-│   │   ├── dbus_listener.rs         # DbusListener (zbus blocking, separate thread)
+│   │   ├── transport.rs              # Transport trait + SignalListener<T> (별도 스레드)
+│   │   ├── dbus_transport.rs        # DbusTransport (zbus blocking, Transport 구현)
 │   │   └── strategy/                # Signal reaction strategies
 │   │       ├── mod.rs               # ResilienceAction, resolve_conflicts()
 │   │       ├── memory.rs            # MemoryStrategy
@@ -409,11 +336,15 @@ llm_rs2/
 │   ├── 11_kv_cache_management.md
 │   ├── 12_hybrid_inference.md
 │   ├── 13_testing_and_benchmarks.md
+│   ├── 14_component_status.md        # 컴포넌트 품질 게이트
+│   ├── 15_test_strategy.md           # Resilience 테스트 전략 (T1-T4)
 │   ├── 20_dbus_ipc_spec.md          # D-Bus IPC 명세
 │   ├── 21_resilience_architecture.md # Resilience 아키텍처 + 전략 패턴
 │   ├── 22_resilience_integration.md  # Phase 3 generate.rs 통합 설계
-│   ├── 23_resilience_test_strategy.md # Resilience 테스트 전략
-│   └── 24_resilience_usage_guide.md  # Resilience 사용 가이드
+│   ├── 23_resilience_test_strategy.md # Resilience 통합 테스트 요약
+│   ├── 24_resilience_usage_guide.md  # Resilience 사용 가이드
+│   ├── 25_troubleshooting.md         # 트러블슈팅 가이드
+│   └── 26_api_reference.md           # Resilience API 레퍼런스
 │
 ├── web_dashboard/            # 벤치마크 시각화 웹 대시보드
 ├── benchmarks/               # 벤치마크 데이터 및 분석 스크립트
@@ -425,7 +356,7 @@ llm_rs2/
 
 | Binary | 용도 | 주요 옵션 |
 |:-------|:----|:---------|
-| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--eviction-policy`, `--eviction-window`, `--enable-resilience` |
+| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`, `--resilience-transport`, `--initial-kv-capacity` |
 | `generate_hybrid` | CPU↔GPU 동적 전환 추론 | `--switch-threshold`, `--warmup-tokens` |
 | `micro_bench` | 개별 연산자 벤치마크 | 연산별 크기 지정 |
 | `test_backend` | 백엔드 정합성 검증 | CPU vs OpenCL 결과 비교 |
@@ -448,167 +379,28 @@ llm_rs2/
 
 ### 4. Data Layout & Quantization
 
-#### 4.1. General Data Layout
-- **Data Layout**: C-style **Row-Major**
-- **Alignment**: 64-byte alignment (ARM NEON SIMD 및 Cache line 효율)
+- **Data Layout**: C-style Row-Major, 64-byte alignment
+- **Q4_0**: GGML 호환 4-bit 양자화 (32 values → 20 bytes: 1 `f32` scale + 16 `u8` nibbles). Dequant: `(nibble - 8) * scale`
+- **지원 DType**: F32, F16, BF16 (가중치 로딩), Q4_0/Q4_1/Q8_0 (양자화), U8
 
-#### 4.2. Block Quantization: `Q4_0`
-
-GGML 호환 4-bit 양자화. 바이어스 없이 스케일값만 저장합니다.
-- **Group Size**: 32 values
-- **Memory Size**: 20 bytes (1 `f32` scale + 16 `u8` packed nibbles)
-
-```rust
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct BlockQ4_0 {
-    pub d: f32,        // 4 bytes: scale
-    pub qs: [u8; 16],  // 16 bytes: 32 × 4-bit quantized values (offset by 8)
-}
-const _: () = assert!(std::mem::size_of::<BlockQ4_0>() == 20);
-```
-
-**Dequantization**: `value = (nibble - 8) * scale`
-
-#### 4.3. 지원 데이터 타입 (DType)
-
-| DType | Size | 용도 |
-|:------|:-----|:----|
-| `F32` | 4B | 활성화, 중간 연산, CPU attention |
-| `F16` | 2B | GPU KV 캐시, 가중치 |
-| `BF16` | 2B | 가중치 로딩 (safetensors) |
-| `Q4_0` | 20B/32elem | 모델 가중치 양자화 (메인) |
-| `Q4_1` | 24B/32elem | 모델 가중치 양자화 (실험적/레거시) |
-| `Q8_0` | 34B/32elem | 모델 가중치 양자화 (실험적/레거시) |
-| `U8` | 1B | 범용 바이트 버퍼 |
+상세: [`docs/02_core_abstractions.md`](docs/02_core_abstractions.md)
 
 ---
 
-## 5. Interface (Trait) Definitions
+## 5. 핵심 인터페이스 (Trait)
 
-### 5.1. `Backend` Trait
-
-하드웨어 가속기의 연산 커널을 추상화합니다. 대부분의 메서드는 기본(CPU) 구현을 가지고 있으며, OpenCL 백엔드에서 override합니다.
-
-| Category | Method | Signature | Description |
-|:---------|:-------|:----------|:------------|
-| **Identity** | `name()` | `→ &str` | 백엔드 이름 ("CPU", "OpenCL") |
-| | `device()` | `→ &str` | 디바이스 정보 |
-| **Math** | `matmul()` | `(a, b, out)` | 행렬곱 (양자화 dequant 포함) |
-| | `matmul_transposed()` | `(a, b, out)` | B를 전치한 행렬곱 |
-| | `matmul_slice()` | `(a, b, rows, cols, out)` | GQA용 슬라이스 행렬곱 |
-| **In-place** | `add_assign()` | `(a, b)` | a += b |
-| | `scale()` | `(x, v)` | x *= v |
-| **Activation** | `silu_mul()` | `(a, b)` | SwiGLU: `a = silu(a) * b` |
-| **Norm** | `rms_norm()` | `(x, w, eps)` | RMSNorm in-place |
-| | `softmax()` | `(x)` | Softmax in-place |
-| **Position** | `rope_inplace()` | `(x, pos, theta)` | RoPE 적용 |
-| **Attention** | `attention_gen()` | `(q, k, v, out, ...)` | 단일 쿼리 GQA attention (기본 CPU 구현 제공) |
-| **Embedding** | `gather()` | `(src, indices, dst)` | 임베딩 lookup |
-| **Memory** | `copy_from()` | `(t) → Tensor` | 텐서 복사 (다른 백엔드→자신) |
-| | `copy_slice()` | `(src, dst, off, off, n)` | 버퍼 슬라이스 복사 (element 단위) |
-| | `read_buffer()` | `(t, dst)` | GPU→CPU 데이터 읽기 |
-| **Type** | `cast()` | `(src, dst)` | dtype 변환 (F32↔F16) |
-| **Sync** | `synchronize()` | `()` | GPU 큐 동기화 (벤치마크용) |
-
-### 5.2. `Buffer` Trait
-
-```rust
-pub trait Buffer: Send + Sync {
-    fn dtype(&self) -> DType;
-    fn size(&self) -> usize;          // 전체 크기 (bytes)
-    fn as_ptr(&self) -> *const u8;    // CPU 읽기 포인터
-    fn as_mut_ptr(&self) -> *mut u8;  // CPU 쓰기 포인터
-    fn cl_mem(&self) -> Option<&cl_mem>;  // OpenCL 핸들 (GPU 전용)
-}
-```
-
-### 5.3. `Memory` Trait
-
-```rust
-pub trait Memory: Send + Sync {
-    fn alloc(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>>;
-    fn used_memory(&self) -> usize;
-}
-```
-
-### 5.4. `EvictionPolicy` Trait
-
-```rust
-pub trait EvictionPolicy: Send + Sync {
-    /// 캐시 상태와 가용 메모리 기반 eviction 판단
-    fn should_evict(&self, cache: &KVCache, mem_available: usize) -> bool;
-    /// 실제 eviction 수행: cache를 target_len 토큰으로 축소
-    fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()>;
-    /// 정책 이름 (로깅용)
-    fn name(&self) -> &str;
-}
-```
-
-### 5.5. `SystemMonitor` Trait
-
-```rust
-pub trait SystemMonitor: Send + Sync {
-    fn mem_stats(&self) -> Result<MemoryStats>;
-}
-
-pub struct MemoryStats {
-    pub total: usize,      // 전체 메모리 (bytes)
-    pub available: usize,  // 사용 가능 메모리 (bytes)
-    pub free: usize,       // 해제된 메모리 (bytes)
-}
-```
-
-`LinuxSystemMonitor`는 `/proc/meminfo`를 파싱하여 구현합니다.
+- **Backend** (15+ 연산) — 하드웨어 가속기 추상화 (matmul, softmax, RoPE 등) → [`docs/02_core_abstractions.md`](docs/02_core_abstractions.md)
+- **Buffer / Memory** — 물리 메모리 할당 및 접근 (CPU pointer, OpenCL handle) → [`docs/02_core_abstractions.md`](docs/02_core_abstractions.md)
+- **EvictionPolicy** (`should_evict`, `evict`, `evict_with_scores`, `name`) → [`docs/11_kv_cache_management.md`](docs/11_kv_cache_management.md)
+- **SystemMonitor** — `/proc/meminfo` 기반 시스템 메모리 모니터링 → [`docs/11_kv_cache_management.md`](docs/11_kv_cache_management.md)
 
 ---
 
 ## 6. Resilience Subsystem
 
-### 개요
+D-Bus/UnixSocket 시스템 신호(메모리/CPU/온도/에너지)에 따라 추론 동작을 자동 조절하는 적응형 추론 시스템. Feature-gated (`--features resilience`), opt-in (`--enable-resilience`).
 
-D-Bus 시스템 신호(메모리/CPU/온도/에너지)에 따라 추론 동작을 자동 조절하는 적응형 추론 시스템. Feature-gated (`--features resilience`), opt-in (`--enable-resilience`).
-
-### Component Diagram
-
-```mermaid
-graph TB
-    subgraph SystemBus ["D-Bus System Bus"]
-        Manager["org.llm.Manager1"]
-    end
-
-    subgraph ResilienceModule ["Resilience Module (src/resilience/)"]
-        DbusListener["DbusListener<br/>(std::thread)"]
-        RM["ResilienceManager"]
-        MS["MemoryStrategy"]
-        TS["ThermalStrategy"]
-        ES["EnergyStrategy"]
-        CS["ComputeStrategy"]
-        RC["resolve_conflicts()"]
-    end
-
-    subgraph InferenceLoop ["generate.rs"]
-        Poll["rm.poll()"]
-        Exec["execute_action()"]
-        Evict["kv_cache.prune_prefix()"]
-    end
-
-    Manager -->|"signals"| DbusListener
-    DbusListener -->|"mpsc::channel"| RM
-    RM --> MS
-    RM --> TS
-    RM --> ES
-    RM --> CS
-    MS --> RC
-    TS --> RC
-    ES --> RC
-    CS --> RC
-    RC --> Poll
-    Poll --> Exec
-    Poll --> Evict
-```
-
-### Operating Modes
+`SignalListener<T: Transport>` (별도 스레드) → mpsc::channel → `ResilienceManager.poll()` (논블로킹) → Strategy.react() → resolve_conflicts() → `cache_manager.force_evict_with_scores()` / execute_action().
 
 | Mode | Trigger | 동작 |
 |:-----|:--------|:-----|
@@ -617,20 +409,9 @@ graph TB
 | **Minimal** | Critical ≥ 1 | Evict + Throttle + LimitTokens |
 | **Suspended** | Emergency ≥ 1 | 추론 중단 (`break`) |
 
-### 데이터 흐름
+**설계 원칙**: Fail-open, No tokio (std::thread + mpsc).
 
-```
-D-Bus Signal → DbusListener (blocking recv, 별도 스레드)
-  → mpsc::channel (unbounded)
-  → ResilienceManager.poll() (토큰 루프 내, try_recv, 비블로킹)
-  → Strategy.react() → Vec<ResilienceAction>
-  → resolve_conflicts() → 최종 액션 리스트
-  → execute_action() / prune_prefix()
-```
-
-**설계 원칙**: Fail-open (Manager/D-Bus 불가 시 추론 정상 지속), No tokio (std::thread + mpsc만 사용).
-
-상세 설계: [`docs/22_resilience_integration.md`](docs/22_resilience_integration.md) | 사용 가이드: [`docs/24_resilience_usage_guide.md`](docs/24_resilience_usage_guide.md)
+상세: [`docs/21_resilience_architecture.md`](docs/21_resilience_architecture.md) | 통합: [`docs/22_resilience_integration.md`](docs/22_resilience_integration.md) | 사용 가이드: [`docs/24_resilience_usage_guide.md`](docs/24_resilience_usage_guide.md)
 
 ---
 
@@ -724,6 +505,6 @@ adb shell /data/local/tmp/generate --model-path /data/local/tmp/model --backend 
 3. **LayerWorkspace로 할당 최소화**: Decode 루프에서 매 토큰마다 메모리를 할당하지 않고, 사전 할당된 작업 버퍼를 재사용합니다.
 
 ### Known Limitations
-1. **H2O importance compaction 미구현**: Eviction 후 importance score 배열을 compact하지 않고 reset합니다. trait 시그니처 변경이 필요하여 별도 PR로 분리 예정입니다.
+1. **H2O importance score는 eviction 후 reset됨**: 설계 의도. 3-partition 모델의 recent window가 보완하여, 방금 생성된 토큰이 낮은 score로 evict되는 것을 방지합니다.
 2. **GPU buffer prune 미지원**: `prune_prefix`는 CPU 포인터 접근이 필요하므로 GPU-only 버퍼에서는 실패합니다 (`as_mut_ptr()` null).
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.
