@@ -203,21 +203,22 @@ RUST_LOG=debug ./target/release/generate --enable-resilience ...
 
 상세 설계: [`docs/22_resilience_integration.md`](22_resilience_integration.md)
 
-```
-D-Bus System Bus
-    │
-    ▼
-DbusListener (std::thread)
-    │ mpsc::channel
-    ▼
-ResilienceManager.poll() ← generate.rs 토큰 루프에서 호출
-    │
-    ├── MemoryStrategy  → Evict / LimitTokens / Suspend
-    ├── ThermalStrategy → SwitchBackend / Throttle / Suspend
-    ├── EnergyStrategy  → SwitchBackend / Throttle / Suspend
-    └── ComputeStrategy → SwitchBackend / Throttle / Suspend
-    │
-    ▼ resolve_conflicts()
-    │
-    ▼ execute_action() / prune_prefix()
+```mermaid
+flowchart TD
+    DBUS["D-Bus System Bus"]
+    LISTENER["DbusListener<br/><i>(std::thread)</i>"]
+    MPSC["mpsc::channel"]
+    RM["ResilienceManager.poll()<br/><i>generate.rs 토큰 루프에서 호출</i>"]
+
+    MEM["MemoryStrategy<br/>→ Evict / LimitTokens / Suspend"]
+    THERM["ThermalStrategy<br/>→ SwitchBackend / Throttle / Suspend"]
+    ENERGY["EnergyStrategy<br/>→ SwitchBackend / Throttle / Suspend"]
+    COMPUTE["ComputeStrategy<br/>→ SwitchBackend / Throttle / Suspend"]
+
+    RESOLVE["resolve_conflicts()"]
+    EXEC["execute_action() / prune_prefix()"]
+
+    DBUS --> LISTENER -->|mpsc::channel| RM
+    RM --> MEM & THERM & ENERGY & COMPUTE
+    MEM & THERM & ENERGY & COMPUTE --> RESOLVE --> EXEC
 ```

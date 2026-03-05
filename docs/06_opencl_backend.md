@@ -63,28 +63,16 @@ unsafe impl Sync for KernelCache {}
 ## 6.3 초기화 흐름 (`new()`)
 
 ### Step-by-Step
-```
-1. Platform::default()
-     └─ 시스템의 기본 OpenCL 플랫폼 선택
+```mermaid
+flowchart TD
+    S1["1. Platform::default()<br/><i>시스템의 기본 OpenCL 플랫폼 선택</i>"]
+    S2["2. Device::list(platform, DEVICE_TYPE_GPU)<br/><i>GPU 디바이스 목록에서 첫 번째 선택</i>"]
+    S3["3. Context::builder().platform().devices().build()<br/><i>OpenCL 컨텍스트 생성</i>"]
+    S4["4. Queue::new(&context, device, None)<br/><i>커맨드 큐 생성 (In-order execution)</i>"]
+    S5["5. Program::builder()...build(&context)<br/><i>각 커널 파일 컴파일 (4개)</i>"]
+    S6["6. ocl::core::create_kernel(&program, name)<br/><i>11개 커널 객체 생성 및 캐싱</i>"]
 
-2. Device::list(platform, DEVICE_TYPE_GPU)
-     └─ GPU 디바이스 목록에서 첫 번째 선택
-
-3. Context::builder().platform().devices().build()
-     └─ OpenCL 컨텍스트 생성
-
-4. Queue::new(&context, device, None)
-     └─ 커맨드 큐 생성 (In-order execution)
-
-5. Program::builder()
-     .devices(device)
-     .src(kernel_source)
-     .cmplr_opt(CL_FAST_MATH_OPTS)
-     .build(&context)
-     └─ 각 커널 파일 컴파일 (4개)
-
-6. ocl::core::create_kernel(&program, "kernel_name")
-     └─ 11개 커널 객체 생성 및 캐싱
+    S1 --> S2 --> S3 --> S4 --> S5 --> S6
 ```
 
 ### 컴파일러 최적화 플래그

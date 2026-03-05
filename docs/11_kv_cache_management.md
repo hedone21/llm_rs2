@@ -293,19 +293,18 @@ In-order command queue를 사용하므로 `buffer_shift()` 후 별도의 `queue.
 `CacheManager`는 `SystemMonitor` trait을 통해 시스템 메모리 상태를 조회합니다.
 Linux/Android에서는 `/proc/meminfo`를 파싱하여 `MemAvailable`을 읽습니다.
 
-```
-┌──────────────────────────────────────────────────────┐
-│  Generation Loop (매 토큰마다)                        │
-│                                                        │
-│  1. score_accumulator.begin_step()  (decay)           │
-│  2. model.forward_into(...)                           │
-│     └─ score_accumulator captures attention weights   │
-│     └─ cache_manager: None (H2O는 auto-eviction 없음) │
-│  3. Resilience checkpoint:                            │
-│     └─ if ResilienceAction::Evict received:           │
-│        cache_manager.force_evict_with_scores(...)     │
-│  4. sample next token                                 │
-└──────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    A["1. score_accumulator.begin_step()<br/><i>(decay 적용)</i>"]
+    B["2. model.forward_into(...)<br/><i>score_accumulator captures attention weights</i><br/><i>cache_manager: None (H2O는 auto-eviction 없음)</i>"]
+    C{"3. Resilience checkpoint:<br/>ResilienceAction::Evict 수신?"}
+    D["cache_manager.force_evict_with_scores(...)"]
+    E["4. sample next token"]
+
+    A --> B --> C
+    C -- Yes --> D --> E
+    C -- No --> E
+    E -.->|"다음 토큰"| A
 ```
 
 ---

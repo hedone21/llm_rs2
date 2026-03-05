@@ -114,15 +114,14 @@ Q4_0은 llama.cpp(GGML)에서 정의한 양자화 포맷으로, 광범위한 검
 
 ### 구조와 원리
 
-```
 BlockQ4_0 (18 bytes / 32 elements):
-┌─────────────────┬──────────────────────────────┐
-│  scale (f16)     │  quants ([u8; 16])            │
-│  2 bytes         │  16 bytes (32 x 4-bit)        │
-└─────────────────┴──────────────────────────────┘
 
-dequantize: value = (nibble - 8) * scale
+```mermaid
+flowchart LR
+    S["scale (f16)<br/>2 bytes"] --- Q["quants ([u8; 16])<br/>16 bytes (32 × 4-bit)"]
 ```
+
+`dequantize: value = (nibble - 8) * scale`
 
 - 4-bit 값에서 8을 빼는 방식 (offset bias)으로 zero-point calibration이 불필요합니다.
 - 32개 원소당 18 bytes = 약 4.5 bits/value.
@@ -146,11 +145,14 @@ Q4_0은 F16 대비 약 5%의 perplexity 증가를 보입니다. On-device infere
 
 Q8_0은 최종 저장 포맷이 아닌 **중간(intermediate) 포맷**입니다:
 
-```
-Activation (F32)
-  → quantize_row_q8_0 → Q8_0 (임시)
-  → vec_dot_q4_0_q8_0(weight_q4_0, activation_q8_0)
-  → 결과 (F32)
+```mermaid
+flowchart LR
+    A["Activation (F32)"]
+    Q["quantize_row_q8_0<br/>→ Q8_0 (임시)"]
+    DOT["vec_dot_q4_0_q8_0<br/>(weight_q4_0, activation_q8_0)"]
+    R["결과 (F32)"]
+
+    A --> Q --> DOT --> R
 ```
 
 F32 activation을 Q8_0으로 양자화한 뒤 Q4_0 가중치와 정수 dotprod를 수행하면, F32 x F32 dotprod 대비 **SIMD 활용도**가 크게 향상됩니다. ARM NEON의 `vdotq_s32`는 4개의 i8 x i8 곱을 한 사이클에 누적합니다.

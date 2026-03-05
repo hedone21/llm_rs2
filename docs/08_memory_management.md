@@ -206,14 +206,16 @@ let byte_len = count * type_size;
 ```
 
 ### 복사 케이스 분기
-```
-┌─────────────────────────────────────────────────┐
-│           copy_slice() 분기                      │
-├─────────────────────────────────────────────────┤
-│ src=OpenCL, dst=OpenCL → enqueue_copy_buffer    │
-│ src=CPU,    dst=OpenCL → enqueue_write_buffer   │
-│ src=OpenCL, dst=CPU    → enqueue_read_buffer    │
-└─────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    CS["copy_slice()"]
+    D2D["src=OpenCL, dst=OpenCL<br/>→ enqueue_copy_buffer"]
+    H2D["src=CPU, dst=OpenCL<br/>→ enqueue_write_buffer"]
+    D2H["src=OpenCL, dst=CPU<br/>→ enqueue_read_buffer"]
+
+    CS --> D2D
+    CS --> H2D
+    CS --> D2H
 ```
 
 ---
@@ -284,33 +286,34 @@ offset(t, h, d) = (t * kv_heads + h) * head_dim + d
 ## 8.10 메모리 흐름도
 
 ### Token Generation 메모리 흐름
-```
-┌──────────────────────────────────────────────────────────┐
-│                     GPU Memory                           │
-├──────────────────────────────────────────────────────────┤
-│                                                          │
-│  Input Token (H2D once)                                  │
-│       ↓                                                  │
-│  Embedding → hidden [1, dim]                             │
-│       ↓                                                  │
-│  ┌─────────────────────────────────────┐                │
-│  │ Layer 0                              │                │
-│  │   RMSNorm ─→ QKV Matmul ─→ RoPE     │                │
-│  │       ↓             ↓     ↓         │                │
-│  │   KV Cache Update  Attention (GPU!) │                │
-│  │       ↓                   ↓         │                │
-│  │   Output Proj ─→ Residual           │                │
-│  │       ↓                             │                │
-│  │   FFN (Gate/Up/Down)                │                │
-│  └─────────────────────────────────────┘                │
-│       ↓                                                  │
-│  ... (Layer 1-15) ...                                   │
-│       ↓                                                  │
-│  Final RMSNorm → LM Head Matmul                         │
-│       ↓                                                  │
-│  Logits [1, vocab_size] (D2H for argmax)                │
-│                                                          │
-└──────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TD
+    subgraph GPU["GPU Memory"]
+        direction TB
+        IN["Input Token (H2D once)"]
+        EMB["Embedding → hidden [1, dim]"]
+
+        subgraph Layer0["Layer 0"]
+            direction TB
+            NORM["RMSNorm"]
+            QKV["QKV Matmul"]
+            ROPE["RoPE"]
+            KVC["KV Cache Update"]
+            ATTN["Attention (GPU)"]
+            OPROJ["Output Proj → Residual"]
+            FFN["FFN (Gate/Up/Down)"]
+
+            NORM --> QKV --> ROPE
+            ROPE --> KVC --> ATTN
+            ATTN --> OPROJ --> FFN
+        end
+
+        MORE["... (Layer 1-15) ..."]
+        FINAL["Final RMSNorm → LM Head Matmul"]
+        LOGITS["Logits [1, vocab_size]<br/>(D2H for argmax)"]
+
+        IN --> EMB --> Layer0 --> MORE --> FINAL --> LOGITS
+    end
 ```
 
 **D2H 발생 지점**: Output logits만 CPU로 전송 (argmax 계산용)

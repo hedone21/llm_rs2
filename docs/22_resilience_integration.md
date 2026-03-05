@@ -149,19 +149,16 @@ if let Some(rm) = &mut resilience_manager {
 
 ### Evict 상세 흐름
 
-```
-MemoryPressure(Critical)
-  → MemoryStrategy.react() → [Evict { target_ratio: 0.50 }]
-  → resolve_conflicts()
-  → generate.rs 루프:
-      current_pos = 500
-      target_len = 500 * 0.50 = 250
-      remove = 500 - 250 = 250
-      cache_manager.force_evict_with_scores(kv_caches, scores)
-          // H2O: 3-partition eviction, fallback: sliding window
-      // current_pos: 500 → 250
-      // rope_pos: 변경 없음 (단조 증가)
-      // start_pos: 변경 없음
+```mermaid
+flowchart TD
+    SIG["MemoryPressure(Critical)"]
+    REACT["MemoryStrategy.react()<br/>→ [Evict { target_ratio: 0.50 }]"]
+    RESOLVE["resolve_conflicts()"]
+    LOOP["generate.rs 루프:<br/>current_pos = 500<br/>target_len = 500 × 0.50 = 250<br/>remove = 500 - 250 = 250"]
+    EVICT["cache_manager.force_evict_with_scores(kv_caches, scores)<br/><i>H2O: 3-partition eviction, fallback: sliding window</i>"]
+    RESULT["current_pos: 500 → 250<br/>rope_pos: 변경 없음 (단조 증가)<br/>start_pos: 변경 없음"]
+
+    SIG --> REACT --> RESOLVE --> LOOP --> EVICT --> RESULT
 ```
 
 **주의**: `start_pos`(RoPE 논리 위치)는 eviction 후에도 변경하지 않는다. 기존 `prune_prefix()` 설계와 일치.

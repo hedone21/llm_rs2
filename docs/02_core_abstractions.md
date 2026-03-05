@@ -403,10 +403,16 @@ const _: () = assert!(std::mem::size_of::<BlockQ8_0>() == 34);
 
 **사용 패턴**: Q4_0 가중치와의 matmul을 최적화할 때, 활성화 텐서(F32)를 Q8_0으로 양자화한 뒤 `vec_dot_q4_0_q8_0`으로 정수 내적을 수행합니다. 정수 연산은 부동소수점보다 SIMD에서 훨씬 효율적입니다.
 
-```
-F32 활성화 → quantize_row_q8_0 → BlockQ8_0
-                                      ↓
-BlockQ4_0 가중치 ←→ vec_dot_q4_0_q8_0 → F32 결과
+```mermaid
+flowchart LR
+    F32["F32 활성화"]
+    Q8["quantize_row_q8_0<br/>→ BlockQ8_0"]
+    DOT["vec_dot_q4_0_q8_0"]
+    Q4["BlockQ4_0 가중치"]
+    RES["F32 결과"]
+
+    F32 --> Q8 --> DOT --> RES
+    Q4 --> DOT
 ```
 
 ---
