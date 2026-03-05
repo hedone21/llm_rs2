@@ -1,5 +1,7 @@
 # 23. Resilience 통합 테스트 전략
 
+> **참고**: 전체 테스트 전략(T1-T4 계층, 개별 시나리오)은 [15. Test Strategy](15_test_strategy.md) 참조.
+
 > **상태**: 설계 완료
 > **대상**: Resilience Manager + generate.rs 통합 검증
 > **구현 참조**: `docs/22_resilience_integration.md`
