@@ -1,0 +1,69 @@
+# Device Registry — single source of truth for all device configurations.
+# Used by scripts/run_device.py and benchmark/test scripts.
+#
+# Schema:
+#   [devices.<id>]
+#   name               = "Human-readable name"
+#   [devices.<id>.connection]
+#   type               = "local" | "adb" | "ssh"   (required)
+#   serial             = ""                          (adb only; empty = default device)
+#   [devices.<id>.build]
+#   target             = ""                          (cargo target triple; empty = native)
+#   env_file           = ""                          (source before build, e.g. "android.source")
+#   binary_dir         = ""                          (relative path to built binaries)
+#   [devices.<id>.paths]
+#   work_dir           = ""                          (remote working directory; required)
+#   model_dir          = ""                          (model weights directory)
+#   eval_dir           = ""                          (evaluation prompt files)
+#   lib_dir            = ""                          (LD_LIBRARY_PATH on device)
+#   [devices.<id>.capabilities]
+#   arch, gpu, os, memory_gb, ...                    (informational metadata)
+#   [devices.<id>.manager]
+#   transport          = ""                          (manager IPC transport)
+#   thermal_zone_types = []                          (thermal zone type filters)
+
+[devices.host]
+name = "Dev Workstation"
+
+[devices.host.connection]
+type = "local"
+
+[devices.host.build]
+target = ""
+binary_dir = "target/release"
+
+[devices.host.paths]
+work_dir = "/tmp/llm_rs2"
+model_dir = ""
+
+[devices.host.capabilities]
+arch = "x86_64"
+gpu = "none"
+memory_gb = 62
+
+[devices.pixel]
+name = "Pixel Phone"
+
+[devices.pixel.connection]
+type = "adb"
+serial = ""
+
+[devices.pixel.build]
+target = "aarch64-linux-android"
+env_file = "android.source"
+binary_dir = "target/aarch64-linux-android/release"
+
+[devices.pixel.paths]
+work_dir = "/data/local/tmp"
+model_dir = "/data/local/tmp/models/llama3.2-1b"
+eval_dir = "/data/local/tmp/llm_rs2/eval"
+lib_dir = "/data/local/tmp"
+
+[devices.pixel.capabilities]
+arch = "aarch64"
+gpu = "adreno"
+os = "android"
+
+[devices.pixel.manager]
+transport = "unix"
+thermal_zone_types = ["cpu-0-0-usr"]
