@@ -76,10 +76,10 @@ graph TB
     LlamaModel --> CacheManager
     CacheManager --> EvictionPolicy
     CacheManager --> SysMonitor
-    NoEviction --|> EvictionPolicy
-    SlidingWindow --|> EvictionPolicy
-    H2O --|> EvictionPolicy
-    LinuxMonitor --|> SysMonitor
+    NoEviction -.-> EvictionPolicy
+    SlidingWindow -.-> EvictionPolicy
+    H2O -.-> EvictionPolicy
+    LinuxMonitor -.-> SysMonitor
     EvictionPolicy --> KVCache
     H2O --> ScoreAccum
 
