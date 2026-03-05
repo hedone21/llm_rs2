@@ -122,6 +122,29 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/26_api_reference.md` — Resilience API reference
 - `docs/27_manager_architecture.md` — Manager service internal architecture (3-layer, OCP PolicyEngine)
 
+## Device Registry
+
+TOML-based device configuration at `devices.toml` (project root). Manages build targets, connection info, and device paths for all scripts.
+
+```bash
+# CLI commands
+python scripts/device_registry.py discover          # scan & register devices
+python scripts/device_registry.py list               # show registered devices
+python scripts/device_registry.py validate           # check TOML schema
+
+# Unified runner (build -> deploy -> execute)
+python scripts/run_device.py -d pixel generate --prompt "Hello" -n 128
+python scripts/run_device.py -d host test_backend
+python scripts/run_device.py -d pixel --skip-build generate -b opencl
+
+# Existing scripts with --device option
+python scripts/stress_test_device.py --device pixel --phases 1,4
+python scripts/run_benchmark_suite.py --device pixel --dry-run
+python scripts/run_comparison_benchmark.py --device pixel --dry-run
+```
+
+Package: `scripts/device_registry/` — config.py (TOML loader), connection.py (Connection ABC), builder.py (cargo build), deployer.py (binary push), discover.py (device scan).
+
 ## Web Dashboard
 
 ```bash

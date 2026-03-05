@@ -17,12 +17,12 @@
 - **Notes**: 커밋 95af0a3에서 구현 완료. `manager/`, `shared/` crate 생성, mock_manager 이전
 
 ## [P2] Device Registry 시스템
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: TOML 기반 디바이스 목록 관리 (이름, 연결방식, SoC, 메모리, GPU, 지원 기능). 테스트 스크립트에서 참조하여 자동 배포/테스트 수행
 - **Acceptance Criteria**: devices.toml 스키마 정의, 파서 구현, 기존 run_android.sh와 연동
-- **Notes**: Part 3 기초 작업
+- **Notes**: 구현 완료. devices.toml + scripts/device_registry/ 패키지 + run_device.py 통합 runner + 기존 스크립트 --device 옵션 마이그레이션
 
 ## [P3] 다중 모델 사이즈 검증 테스트 매트릭스
 - **Status**: TODO
@@ -31,3 +31,11 @@
 - **Description**: Llama 3.2 1B/3B 및 향후 7B/8B 모델에 대한 디바이스별 테스트 매트릭스 정의
 - **Acceptance Criteria**: 매트릭스 문서, 디바이스별 최대 지원 모델 크기 명시
 - **Notes**: 실제 테스트는 디바이스 확보 후 진행
+
+## [P3] ThermalCollector zone 패턴 매칭 auto-discovery
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: 현재 `zone_types`는 exact match라서 장치마다 정확한 zone type 이름을 알아야 함. `zone_patterns = ["cpu", "pkg"]` 같은 substring/keyword 매칭으로 확장하면 하나의 config로 다양한 장치 커버 가능. 현재 exact match + fallback으로도 동작하므로 긴급하지 않음
+- **Acceptance Criteria**: contains 기반 패턴 매칭, 기존 exact match와 공존, 테스트 추가
+- **Notes**: 필요성 미확정. 실제 다중 장치 배포 시점에 재평가
