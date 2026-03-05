@@ -430,11 +430,13 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Determine whether to pass cache_manager
-    let cm_ref = if args.eviction_policy == "none" {
-        None
-    } else {
-        Some(&cache_manager)
+    // Determine whether to pass cache_manager to forward_into() for auto-eviction.
+    // H2O is signal-driven: eviction is triggered exclusively by resilience signals,
+    // not by automatic cache/memory checks. Score accumulation still happens every
+    // token via score_accumulator (passed separately).
+    let cm_ref = match args.eviction_policy.as_str() {
+        "sliding" => Some(&cache_manager),
+        _ => None, // "none" and "h2o" — no auto-eviction in forward path
     };
 
     // Pre-allocate generation buffers
@@ -620,20 +622,32 @@ fn main() -> anyhow::Result<()> {
 
                 for action in rm.poll() {
                     if let ResilienceAction::Evict { target_ratio } = &action {
-                        let target_len = (kv_caches[0].current_pos as f32 * target_ratio) as usize;
-                        let remove = kv_caches[0].current_pos.saturating_sub(target_len);
-                        if remove > 0 {
-                            for cache in kv_caches.iter_mut() {
-                                if let Err(e) = cache.prune_prefix(remove) {
-                                    eprintln!("[Resilience] Eviction error: {}", e);
+                        // Use policy-aware eviction via CacheManager.
+                        // For H2O: uses accumulated importance scores (3-partition).
+                        // For sliding: uses prefix-aware sliding window.
+                        let result = if let Some(ref acc) = score_accumulator {
+                            cache_manager.force_evict_with_scores(
+                                &mut kv_caches,
+                                *target_ratio,
+                                acc.importance_scores(),
+                            )
+                        } else {
+                            cache_manager.force_evict(&mut kv_caches, *target_ratio)
+                        };
+                        match result {
+                            Ok(r) if r.evicted => {
+                                eprintln!(
+                                    "[Resilience] Evicted {} tokens (pos: {} → {})",
+                                    r.tokens_removed,
+                                    r.new_pos + r.tokens_removed,
+                                    r.new_pos
+                                );
+                                if let Some(ref mut acc) = score_accumulator {
+                                    acc.reset();
                                 }
                             }
-                            eprintln!(
-                                "[Resilience] Evicted {} tokens (pos: {} → {})",
-                                remove,
-                                kv_caches[0].current_pos + remove,
-                                kv_caches[0].current_pos
-                            );
+                            Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
+                            _ => {}
                         }
                     } else {
                         execute_action(&action, &mut ctx);

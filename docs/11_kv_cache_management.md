@@ -7,9 +7,20 @@
 LLM 추론 시 KV Cache는 시퀀스 길이에 비례하여 메모리를 차지합니다. 모바일/엣지 환경에서는 긴 시퀀스 생성 시 메모리 부족(OOM)이 발생할 수 있으며, 이를 동적으로 관리하기 위한 확장 가능한 캐시 관리 전략이 필요합니다.
 
 ### 핵심 목표
-- **동적 메모리 관리**: 시스템 메모리 압력에 따라 자동으로 캐시를 축소
+- **Signal-driven eviction**: 모든 eviction, throttle 등 성능에 영향을 주는 로직은 Resilience 시그널을 받았을 때만 동작
 - **전략 교체 가능**: SOLID 원칙에 따라 새로운 eviction 전략을 기존 코드 수정 없이 추가
 - **기본 동작 무변경**: 기본값은 "전략 없음"으로 기존 동작과 완전히 동일
+
+### 대 원칙: Signal-Driven Eviction
+
+> **모든 eviction, delay, throttle 등 추론 성능에 영향을 주는 로직은 Resilience 시그널을
+> 받았을 때만 동작합니다.**
+>
+> - 추론 루프(`forward_into`)에서 자동으로 eviction을 트리거하지 않습니다.
+> - Score 누적(bookkeeping)은 매 토큰마다 수행되지만, 실제 eviction 결정은 외부
+>   Resilience Manager가 내립니다.
+> - `CacheManager::force_evict()` / `force_evict_with_scores()`가 시그널 수신 시 호출됩니다.
+> - H2O의 `should_evict()`는 항상 `false`를 반환합니다.
 
 ---
 
@@ -176,9 +187,11 @@ After (keep_ratio=0.5, hh_budget=6):
 | `--h2o-tracked-layers` | 3 | Importance score 추적 레이어 수 (마지막 N개) |
 | `--h2o-decay` | 0.1 | 매 step마다의 importance score 감쇠율 |
 
-> **참고**: `AttentionScoreAccumulator`가 forward pass 중 post-softmax attention weight를 캡처하여
-> `evict_with_scores()`에 전달합니다. Score 없이 호출될 경우 fallback으로 recent window를
-> 보호하는 sliding window 방식으로 동작합니다.
+> **Signal-driven**: H2O eviction은 Resilience 시그널(`ResilienceAction::Evict`)을 받았을 때만
+> 실행됩니다. `forward_into()`에서는 `AttentionScoreAccumulator`를 통해 score만 누적하고,
+> `CacheManager`는 전달하지 않습니다(`cm_ref=None`). 시그널 수신 시
+> `CacheManager::force_evict_with_scores()`가 호출되어 3-partition eviction이 실행됩니다.
+> Score 없이 호출될 경우 fallback으로 recent window를 보호하는 sliding window 방식으로 동작합니다.
 
 ---
 
@@ -253,18 +266,18 @@ In-order command queue를 사용하므로 `buffer_shift()` 후 별도의 `queue.
 Linux/Android에서는 `/proc/meminfo`를 파싱하여 `MemAvailable`을 읽습니다.
 
 ```
-┌──────────────────────────────────────────────────┐
-│  Generation Loop (매 토큰마다)                    │
-│                                                    │
-│  1. model.forward_into(...)                       │
-│  2. cache_manager.maybe_evict(&mut kv_caches)     │
-│     ├─ monitor.mem_stats() → MemoryStats          │
-│     ├─ if available < threshold:                  │
-│     │    policy.should_evict(cache, available)     │
-│     │    policy.evict(cache, target_len)           │
-│     └─ return EvictionResult                      │
-│  3. sample next token                             │
-└──────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  Generation Loop (매 토큰마다)                        │
+│                                                        │
+│  1. score_accumulator.begin_step()  (decay)           │
+│  2. model.forward_into(...)                           │
+│     └─ score_accumulator captures attention weights   │
+│     └─ cache_manager: None (H2O는 auto-eviction 없음) │
+│  3. Resilience checkpoint:                            │
+│     └─ if ResilienceAction::Evict received:           │
+│        cache_manager.force_evict_with_scores(...)     │
+│  4. sample next token                                 │
+└──────────────────────────────────────────────────────┘
 ```
 
 ---

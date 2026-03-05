@@ -39,11 +39,12 @@ impl H2OPolicy {
 }
 
 impl EvictionPolicy for H2OPolicy {
-    fn should_evict(&self, cache: &KVCache, _mem_available: usize) -> bool {
-        // Total tokens to keep = prefix + heavy hitters (ratio-based) + recent window
-        let hh_count = ((cache.current_pos as f32) * self.keep_ratio) as usize;
-        let total_keep = self.protected_prefix + hh_count + self.recent_window;
-        cache.current_pos > total_keep
+    fn should_evict(&self, _cache: &KVCache, _mem_available: usize) -> bool {
+        // H2O is signal-driven: eviction is triggered exclusively by external
+        // resilience signals, never by automatic cache/memory checks.
+        // Score accumulation happens every token, but eviction decisions
+        // come from the resilience manager.
+        false
     }
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
@@ -269,42 +270,16 @@ mod tests {
     // ── should_evict tests ──
 
     #[test]
-    fn test_should_evict() {
-        // recent_window=5, keep_ratio=0.5, prefix=4
-        // total_keep = 4 + 20*0.5 + 5 = 19 → 20 > 19 = true
+    fn test_should_evict_always_false() {
+        // H2O is signal-driven: should_evict() never triggers automatic eviction.
         let policy = H2OPolicy::new(5, 0.5, 0);
-        let cache = make_cache(20);
-        assert!(policy.should_evict(&cache, 0));
+        assert!(!policy.should_evict(&make_cache(20), 0));
+        assert!(!policy.should_evict(&make_cache(1000), 0));
+        assert!(!policy.should_evict(&make_cache(1), 0));
 
-        // total_keep = 4 + 10*0.5 + 5 = 14 → 10 > 14 = false
-        let cache = make_cache(10);
-        assert!(!policy.should_evict(&cache, 0));
-    }
-
-    #[test]
-    fn test_should_evict_with_recent_window() {
-        // recent_window=10, keep_ratio=0.5, prefix=4
-        // At pos=20: total_keep = 4 + 10 + 10 = 24 → 20 > 24 = false (recent window absorbs)
-        let policy = H2OPolicy::new(10, 0.5, 0);
-        let cache = make_cache(20);
-        assert!(!policy.should_evict(&cache, 0));
-
-        // At pos=30: total_keep = 4 + 15 + 10 = 29 → 30 > 29 = true
-        let cache = make_cache(30);
-        assert!(policy.should_evict(&cache, 0));
-    }
-
-    #[test]
-    fn test_keep_ratio_clamping() {
-        let policy = H2OPolicy::new(5, 2.0, 0); // clamped to 1.0
-        let cache = make_cache(20);
-        // total_keep = 4 + 20 + 5 = 29 → 20 > 29 = false
-        assert!(!policy.should_evict(&cache, 0));
-
-        let policy_neg = H2OPolicy::new(5, -1.0, 0); // clamped to 0.0
-        let cache2 = make_cache(20);
-        // total_keep = 4 + 0 + 5 = 9 → 20 > 9 = true
-        assert!(policy_neg.should_evict(&cache2, 0));
+        // Even with extreme settings
+        let policy_zero = H2OPolicy::new(0, 0.0, 0);
+        assert!(!policy_zero.should_evict(&make_cache(100), 0));
     }
 
     // ── evict (fallback) tests ──

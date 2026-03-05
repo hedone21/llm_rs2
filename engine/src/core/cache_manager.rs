@@ -201,6 +201,101 @@ impl CacheManager {
         })
     }
 
+    /// Force eviction without scores, bypassing should_evict() and memory checks.
+    ///
+    /// Used when eviction is triggered externally (e.g., by resilience signals).
+    pub fn force_evict(&self, caches: &mut [KVCache], target_ratio: f32) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        let current_pos = caches[0].current_pos;
+        let target_len = ((current_pos as f32) * target_ratio.clamp(0.1, 0.99)) as usize;
+        let target_len = target_len.max(1);
+
+        if current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+
+        log::info!(
+            "[CacheManager] Signal-driven eviction with policy '{}': {} → {} tokens",
+            self.policy.name(),
+            current_pos,
+            target_len
+        );
+
+        let tokens_removed = current_pos - target_len;
+        for cache in caches.iter_mut() {
+            self.policy.evict(cache, target_len)?;
+        }
+
+        let new_pos = caches[0].current_pos;
+        Ok(EvictionResult {
+            evicted: true,
+            tokens_removed,
+            new_pos,
+        })
+    }
+
+    /// Force eviction with importance scores, bypassing should_evict() and memory checks.
+    ///
+    /// Used when eviction is triggered externally (e.g., by resilience signals)
+    /// for score-aware policies like H2O.
+    pub fn force_evict_with_scores(
+        &self,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        importance: &[f32],
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        let current_pos = caches[0].current_pos;
+        let target_len = ((current_pos as f32) * target_ratio.clamp(0.1, 0.99)) as usize;
+        let target_len = target_len.max(1);
+
+        if current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+
+        log::info!(
+            "[CacheManager] Signal-driven eviction with policy '{}' (score-aware): {} → {} tokens",
+            self.policy.name(),
+            current_pos,
+            target_len
+        );
+
+        let tokens_removed = current_pos - target_len;
+        for cache in caches.iter_mut() {
+            self.policy
+                .evict_with_scores(cache, target_len, importance)?;
+        }
+
+        let new_pos = caches[0].current_pos;
+        Ok(EvictionResult {
+            evicted: true,
+            tokens_removed,
+            new_pos,
+        })
+    }
+
     /// Returns the name of the active policy.
     pub fn policy_name(&self) -> &str {
         self.policy.name()
@@ -410,6 +505,94 @@ mod tests {
             .unwrap();
         assert!(!result.evicted);
         assert_eq!(caches[0].current_pos, 50);
+    }
+
+    // ── force_evict tests (signal-driven) ──
+
+    #[test]
+    fn test_force_evict_bypasses_should_evict() {
+        // H2O's should_evict() always returns false, but force_evict must still work
+        use crate::core::eviction::h2o::H2OPolicy;
+
+        let cm = CacheManager::new(
+            Box::new(H2OPolicy::new(5, 0.3, 0)),
+            Box::new(MockMonitor {
+                available: 1024 * 1024 * 1024, // plenty of memory
+            }),
+            256 * 1024 * 1024,
+            0.75,
+        );
+        let mut caches = make_caches(4, 40);
+
+        // maybe_evict should NOT trigger (should_evict=false, memory OK)
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        assert!(!result.evicted);
+        assert_eq!(caches[0].current_pos, 40);
+
+        // force_evict MUST trigger regardless
+        let result = cm.force_evict(&mut caches, 0.5).unwrap();
+        assert!(result.evicted);
+        assert!(caches[0].current_pos < 40);
+    }
+
+    #[test]
+    fn test_force_evict_with_scores_bypasses_checks() {
+        use crate::core::eviction::h2o::H2OPolicy;
+
+        let cm = CacheManager::new(
+            Box::new(H2OPolicy::new(5, 0.3, 0)),
+            Box::new(MockMonitor {
+                available: 1024 * 1024 * 1024,
+            }),
+            256 * 1024 * 1024,
+            0.75,
+        );
+        let mut caches = make_caches(4, 40);
+
+        let mut importance = vec![0.0f32; 100];
+        importance[10] = 10.0;
+        importance[20] = 9.0;
+        importance[30] = 8.0;
+
+        let result = cm
+            .force_evict_with_scores(&mut caches, 0.5, &importance)
+            .unwrap();
+        assert!(result.evicted);
+        let pos = caches[0].current_pos;
+        for cache in &caches {
+            assert_eq!(cache.current_pos, pos);
+        }
+    }
+
+    #[test]
+    fn test_force_evict_empty_caches() {
+        let cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor { available: 0 }),
+            256 * 1024 * 1024,
+            0.75,
+        );
+        let mut caches: Vec<KVCache> = Vec::new();
+        let result = cm.force_evict(&mut caches, 0.5).unwrap();
+        assert!(!result.evicted);
+    }
+
+    #[test]
+    fn test_force_evict_ratio_clamping() {
+        use crate::core::eviction::h2o::H2OPolicy;
+
+        let cm = CacheManager::new(
+            Box::new(H2OPolicy::new(0, 0.5, 0)),
+            Box::new(MockMonitor { available: 0 }),
+            0,
+            0.75,
+        );
+        let mut caches = make_caches(1, 50);
+
+        // target_ratio=0.0 should clamp to 0.1
+        let result = cm.force_evict(&mut caches, 0.0).unwrap();
+        assert!(result.evicted);
+        assert!(caches[0].current_pos > 0);
     }
 
     #[test]
