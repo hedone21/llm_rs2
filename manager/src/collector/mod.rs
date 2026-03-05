@@ -1,3 +1,8 @@
+pub mod compute;
+pub mod energy;
+pub mod memory;
+pub mod thermal;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
