@@ -11,11 +11,12 @@ Comprehensive 6-phase stress test:
   Phase 6: Resilience Signals  — signal injection via Unix socket, adaptive response
 
 Usage:
-  python scripts/stress_test_device.py                    # full test
-  python scripts/stress_test_device.py --skip-build       # reuse existing binaries
-  python scripts/stress_test_device.py --phases 1,4       # specific phases only
-  python scripts/stress_test_device.py --phases 3,5       # memory + quality
-  python scripts/stress_test_device.py --dry-run           # preview commands
+  python scripts/stress_test_device.py                        # full test (legacy defaults)
+  python scripts/stress_test_device.py --device pixel          # use devices.toml config
+  python scripts/stress_test_device.py --skip-build            # reuse existing binaries
+  python scripts/stress_test_device.py --phases 1,4            # specific phases only
+  python scripts/stress_test_device.py --phases 3,5            # memory + quality
+  python scripts/stress_test_device.py --dry-run               # preview commands
 """
 
 import argparse
@@ -26,12 +27,13 @@ import subprocess
 import sys
 import time
 from datetime import datetime
+from pathlib import Path
 
 # Add scripts directory to path for android_profile imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 from android_profile import DeviceMonitor, parse_results, extract_metadata, run_adb_command
 
-# ─── Constants ───────────────────────────────────────────────────────────────
+# ─── Constants (legacy defaults, overridden by --device) ─────────────────────
 
 ANDROID_TMP_DIR = "/data/local/tmp"
 MODEL_PATH = f"{ANDROID_TMP_DIR}/models/llama3.2-1b"
@@ -46,6 +48,32 @@ SCHEDULES_DIR_REMOTE = f"{ANDROID_TMP_DIR}/schedules"
 GENERATE_BIN_LOCAL = "target/aarch64-linux-android/release/generate"
 TEST_BACKEND_BIN_LOCAL = "target/aarch64-linux-android/release/test_backend"
 SIGNAL_INJECTOR_BIN_LOCAL = "target/aarch64-linux-android/release/signal_injector"
+
+
+def _apply_device_config(device_id):
+    """Override module-level constants from devices.toml."""
+    global ANDROID_TMP_DIR, MODEL_PATH, GENERATE_BIN_REMOTE, TEST_BACKEND_BIN_REMOTE
+    global EVAL_DIR, SIGNAL_INJECTOR_BIN_REMOTE, RESILIENCE_SOCKET, SCHEDULES_DIR_REMOTE
+    global GENERATE_BIN_LOCAL, TEST_BACKEND_BIN_LOCAL, SIGNAL_INJECTOR_BIN_LOCAL
+
+    from device_registry.config import load_device_config
+    from device_registry.builder import get_local_binary_path
+
+    cfg = load_device_config(device_id)
+    project_root = Path(__file__).resolve().parent.parent
+
+    ANDROID_TMP_DIR = cfg.paths.work_dir
+    MODEL_PATH = cfg.paths.model_dir or f"{ANDROID_TMP_DIR}/models/llama3.2-1b"
+    GENERATE_BIN_REMOTE = cfg.binary_remote_path("generate")
+    TEST_BACKEND_BIN_REMOTE = cfg.binary_remote_path("test_backend")
+    EVAL_DIR = cfg.paths.eval_dir or f"{ANDROID_TMP_DIR}/llm_rs2/eval"
+    SIGNAL_INJECTOR_BIN_REMOTE = cfg.binary_remote_path("signal_injector")
+    RESILIENCE_SOCKET = f"{ANDROID_TMP_DIR}/resilience.sock"
+    SCHEDULES_DIR_REMOTE = f"{ANDROID_TMP_DIR}/schedules"
+
+    GENERATE_BIN_LOCAL = str(get_local_binary_path(cfg, "generate", project_root))
+    TEST_BACKEND_BIN_LOCAL = str(get_local_binary_path(cfg, "test_backend", project_root))
+    SIGNAL_INJECTOR_BIN_LOCAL = str(get_local_binary_path(cfg, "signal_injector", project_root))
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -262,6 +290,11 @@ def phase_build_push(args):
 
     phases = [int(p) for p in args.phases.split(",")]
 
+    # Use device_registry if --device was provided
+    if hasattr(args, "device") and args.device:
+        return _phase_build_push_registry(args, phases)
+
+    # Legacy path: direct adb commands
     if not args.skip_build:
         bins = "--bin generate --bin test_backend"
         if 6 in phases:
@@ -291,6 +324,53 @@ def phase_build_push(args):
     if not model_check or "config.json" not in model_check:
         print(f"  [ERROR] Model not found at {MODEL_PATH}")
         return False
+    print("  [OK] Model verified on device")
+    return True
+
+
+def _phase_build_push_registry(args, phases):
+    """Build & push using device_registry instead of hardcoded adb commands."""
+    from device_registry.config import load_device_config
+    from device_registry.connection import create_connection
+    from device_registry.builder import build_binary, get_local_binary_path
+    from device_registry.deployer import deploy_binary, deploy_eval_files, verify_model
+
+    cfg = load_device_config(args.device)
+    project_root = Path(__file__).resolve().parent.parent
+    conn = create_connection(cfg.connection)
+
+    extra_bins = ["test_backend"]
+    if 6 in phases:
+        extra_bins.append("signal_injector")
+
+    if not args.skip_build:
+        print(f"\n  [Build] Building via device_registry (target: {cfg.build.target or 'native'})...")
+        ok = build_binary(cfg, "generate", project_root, extra_bins=extra_bins, dry_run=args.dry_run)
+        if not ok:
+            return False
+
+    if not args.skip_push:
+        print("\n  [Push] Deploying via device_registry...")
+        for bin_name in ["generate", "test_backend"] + (["signal_injector"] if 6 in phases else []):
+            local_path = get_local_binary_path(cfg, bin_name, project_root)
+            ok = deploy_binary(conn, cfg, local_path, bin_name, dry_run=args.dry_run)
+            if not ok:
+                return False
+
+        deploy_eval_files(conn, cfg, project_root / "eval", dry_run=args.dry_run)
+
+        if 6 in phases:
+            schedules_dir = project_root / "scripts" / "schedules"
+            if schedules_dir.exists():
+                conn.mkdir(SCHEDULES_DIR_REMOTE)
+                for f in sorted(schedules_dir.iterdir()):
+                    if f.is_file():
+                        conn.push(f, f"{SCHEDULES_DIR_REMOTE}/{f.name}")
+
+    if not args.dry_run:
+        if not verify_model(conn, cfg):
+            print(f"  [ERROR] Model not found at {MODEL_PATH}")
+            return False
     print("  [OK] Model verified on device")
     return True
 
@@ -1189,6 +1269,7 @@ def print_report(summary):
 
 def main():
     parser = argparse.ArgumentParser(description="Device Stress Test Suite for llm_rs2")
+    parser.add_argument("--device", default="", help="Device ID from devices.toml (overrides hardcoded paths)")
     parser.add_argument("--skip-build", action="store_true", help="Skip cargo build step")
     parser.add_argument("--skip-push", action="store_true", help="Skip adb push step")
     parser.add_argument("--phases", default="1,2,3,4,5,6", help="Comma-separated phase numbers")
@@ -1197,6 +1278,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print commands only")
     parser.add_argument("--output-dir", default="results/data", help="Output directory for JSON profiles")
     args = parser.parse_args()
+
+    # Apply device config if specified
+    if args.device:
+        _apply_device_config(args.device)
 
     phases = [int(p) for p in args.phases.split(",")]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")

@@ -24,7 +24,7 @@ def deploy_binary(
         return True
 
     local_binary_path = Path(local_binary_path)
-    if not local_binary_path.exists():
+    if not dry_run and not local_binary_path.exists():
         print(f"  Error: binary not found: {local_binary_path}")
         return False
 
