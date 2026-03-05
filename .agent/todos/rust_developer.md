@@ -30,17 +30,17 @@
 - **Notes**: 커밋 db2df27에서 구현 완료. SwitchBackend 실제 동작, GPU↔CPU 양방향 전환, Evict/Throttle/Suspend 지원
 
 ## [P2] Manager 서비스 Collector 구현
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음 (workspace 구조 확정 완료)
 - **Description**: `manager/src/`에 시스템 리소스 수집기 구현. MemoryCollector(/proc/meminfo, PSI), ThermalCollector(/sys/class/thermal), ComputeCollector(/proc/stat), EnergyCollector(UPower/sysfs)
 - **Acceptance Criteria**: 각 Collector가 정확한 시스템 데이터 수집, 유닛 테스트 포함
-- **Notes**: Android와 Linux에서 sysfs 경로 차이 고려. workspace 블로커 해소 → current로 승격
+- **Notes**: 커밋 bd57980에서 구현 완료. 4개 Collector 모두 tempfile 기반 유닛 테스트 포함 (13개 테스트)
 
 ## [P2] Manager 서비스 PolicyEngine + Emitter 구현
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: current
 - **Dependencies**: Collector 구현
 - **Description**: Threshold + Hysteresis 기반 Level 결정 로직, TOML 설정 파싱, DbusEmitter/UnixSocketEmitter 송신 구현
 - **Acceptance Criteria**: 정책 엔진이 올바른 level 결정, 히스테리시스 동작, 시그널 송신 확인
-- **Notes**: docs/20_dbus_ipc_spec.md의 임계값/히스테리시스 예시 참고
+- **Notes**: 커밋 89e2a34 (ThresholdPolicy, 26개 테스트) + b35803a (Emitters + 메인 루프). OCP 준수 PolicyEngine trait 설계. E2E 검증 완료
