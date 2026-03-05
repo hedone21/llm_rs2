@@ -70,6 +70,10 @@ pub struct ThermalThresholds {
     pub emergency_temp_mc: i32,
     /// Hysteresis gap in millidegrees.
     pub hysteresis_mc: i32,
+    /// Filter thermal zones by type (e.g., `["x86_pkg_temp", "TCPU"]`).
+    /// Only matching zones are monitored. Empty = monitor all zones (default).
+    /// Zone types are read from `/sys/class/thermal/thermal_zone*/type`.
+    pub zone_types: Vec<String>,
 }
 
 impl Default for ThermalThresholds {
@@ -79,6 +83,7 @@ impl Default for ThermalThresholds {
             critical_temp_mc: 75000,
             emergency_temp_mc: 85000,
             hysteresis_mc: 5000,
+            zone_types: Vec::new(),
         }
     }
 }

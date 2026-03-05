@@ -85,7 +85,7 @@ manager/
         └── mock_manager.rs       # 테스트용 D-Bus 신호 발신기
 ```
 
-**코드 규모:** ~2,800줄 (테스트 포함), 41개 유닛 테스트
+**코드 규모:** ~2,900줄 (테스트 포함), 44개 유닛 테스트
 
 ## 4. Core Traits
 
@@ -200,9 +200,19 @@ Level 전이 시 진동(oscillation) 방지를 위해 상향/하향 임계값을
 
 | 항목 | 값 |
 |------|-----|
-| 데이터 소스 | `thermal_zone0..31/temp` (최고 온도 선택), `cooling_device0..63/cur_state` |
+| 데이터 소스 | `thermal_zone0..31/temp` (필터링된 zone 중 최고 온도), `cooling_device0..63/cur_state` |
 | 쓰로틀링 판단 | `cur_state > 0`이면 `throttling_active = true` |
-| zone 탐색 | 순차 시도, 파일 없으면 중단 (0-based) |
+| Zone 필터링 | `zone_types` 설정으로 모니터링할 zone 선택. 시작 시 `thermal_zone*/type` 읽어 캐싱 |
+| Fallback | 필터에 매칭되는 zone이 없으면 경고 후 전체 zone 사용 |
+
+**장치별 zone_types 예시:**
+
+| 플랫폼 | 추천 zone_types | 설명 |
+|--------|----------------|------|
+| x86 Desktop/Laptop | `["x86_pkg_temp"]` | CPU package 온도 |
+| Snapdragon (Android) | `["cpu-0-0-usr", "cpu-0-1-usr"]` | CPU cluster별 온도 |
+| MediaTek (Android) | `["mtktsAP"]` | AP 프로세서 온도 |
+| 미설정 (기본값) | `[]` | 모든 zone 중 최대값 (backward compatible) |
 
 ### 7.3 ComputeCollector
 
@@ -243,6 +253,7 @@ warning_temp_mc = 60000          # 60°C → Warning
 critical_temp_mc = 75000
 emergency_temp_mc = 85000
 hysteresis_mc = 5000             # 회복 시 -5°C 필요
+zone_types = ["x86_pkg_temp"]    # 모니터링할 zone type (빈 배열 = 전부)
 
 [compute]
 warning_usage_pct = 70.0         # CPU/GPU 중 높은 쪽 > 70% → Warning
@@ -344,12 +355,12 @@ pub enum SystemSignal {
 
 ## 13. 테스트 전략
 
-### 13.1 유닛 테스트 (41개)
+### 13.1 유닛 테스트 (44개)
 
 | 영역 | 테스트 수 | 방법 |
 |------|----------|------|
 | ThresholdPolicy 히스테리시스 | 26 | 직접 Reading 주입, Level 전이 검증 |
-| Collector 파싱 | 13 | `tempfile`로 synthetic sysfs 생성 |
+| Collector 파싱 | 16 | `tempfile`로 synthetic sysfs 생성 (thermal zone 필터링 포함) |
 | UnixSocket 라운드트립 | 2 | 소켓 생성 → 연결 → 신호 송수신 |
 
 ### 13.2 E2E 검증

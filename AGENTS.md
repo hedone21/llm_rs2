@@ -120,6 +120,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/24_resilience_usage_guide.md` — Resilience system usage guide
 - `docs/25_troubleshooting.md` — Troubleshooting guide
 - `docs/26_api_reference.md` — Resilience API reference
+- `docs/27_manager_architecture.md` — Manager service internal architecture (3-layer, OCP PolicyEngine)
 
 ## Web Dashboard
 

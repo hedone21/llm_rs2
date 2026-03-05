@@ -83,7 +83,7 @@ fn main() -> anyhow::Result<()> {
     let (tx, rx) = mpsc::channel::<Reading>();
 
     // Spawn collector threads
-    let collector_threads = spawn_collectors(poll_ms, tx, shutdown.clone());
+    let collector_threads = spawn_collectors(poll_ms, &config, tx, shutdown.clone());
     log::info!("Started {} collector threads", collector_threads.len());
 
     // Main loop
@@ -157,14 +157,21 @@ fn create_emitter(
 
 fn spawn_collectors(
     poll_ms: u64,
+    config: &Config,
     tx: mpsc::Sender<Reading>,
     shutdown: Arc<AtomicBool>,
 ) -> Vec<std::thread::JoinHandle<()>> {
     let mut handles = Vec::new();
 
+    let thermal_collector = if config.thermal.zone_types.is_empty() {
+        ThermalCollector::new(poll_ms)
+    } else {
+        ThermalCollector::with_zone_filter(poll_ms, config.thermal.zone_types.clone())
+    };
+
     let collectors: Vec<Box<dyn Collector>> = vec![
         Box::new(MemoryCollector::new(poll_ms)),
-        Box::new(ThermalCollector::new(poll_ms)),
+        Box::new(thermal_collector),
         Box::new(ComputeCollector::new(poll_ms)),
         Box::new(EnergyCollector::new(poll_ms)),
     ];
