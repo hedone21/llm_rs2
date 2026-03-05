@@ -29,7 +29,7 @@ graph TB
     subgraph "Eviction Policies (core/eviction/)"
         NoEviction["NoEvictionPolicy<br/>(기본값, 아무것도 안 함)"]
         SlidingWindow["SlidingWindowPolicy<br/>window_size, protected_prefix"]
-        H2O["H2OPolicy<br/>observation_window, keep_ratio"]
+        H2O["H2OPolicy<br/>recent_window, keep_ratio, protected_prefix"]
     end
 
     subgraph "Integration"
@@ -138,24 +138,47 @@ After (current_pos = 1088):
 
 **구현 핵심**: `KVCache::prune_prefix(count)` → `memmove`로 데이터를 앞으로 이동
 
-### 11.4.3 H2OPolicy (Attention-based)
+### 11.4.3 H2OPolicy (Attention-based, 3-Partition)
 
-Attention score를 기반으로 중요한 토큰을 선택적으로 유지하는 전략입니다.
-자주 attention 되는 토큰은 보존하고, 거의 참조되지 않는 토큰을 제거합니다.
+H2O 논문의 3-partition 모델을 구현합니다. KV cache를 세 영역으로 나누어 관리합니다:
 
 ```
-Before:
-[토큰 0][토큰 1][토큰 2][토큰 3][토큰 4][토큰 5]
- score:  0.8     0.1     0.05    0.7     0.02    0.3
-
-After (keep_ratio=0.5, 상위 50% 유지):
-[토큰 0][토큰 3][토큰 5]  ← 높은 attention score 토큰만 유지
+Cache layout:
+[Protected Prefix] [Heavy Hitters (score 경쟁)] [Recent Window (항상 보호)]
+ ← prefix개 →       ← evictable 영역 →           ← recent_window개 →
 ```
 
-> **Note**: H2O는 attention score 접근이 필요합니다. 현재 attention 계산이
-> `LlamaLayer` 내부에서 직접 이루어지므로, 실제 score 기반 동작을 위해서는
-> attention score를 외부로 노출하는 추가 리팩토링이 필요합니다.
-> **초기 구현에서는 인터페이스만 정의하고 fallback으로 sliding window를 사용합니다.**
+- **Protected Prefix**: 처음 N개 토큰(attention sink / 시스템 프롬프트)은 절대 evict되지 않습니다.
+- **Recent Window**: 최근 M개 토큰은 score와 무관하게 항상 보호됩니다. 방금 생성된 토큰이 낮은 score로 evict되는 것을 방지합니다.
+- **Heavy Hitters**: 나머지 evictable 영역에서 누적 attention score 상위 K개를 유지합니다.
+
+```
+Before (current=30, prefix=4, recent_window=5):
+[P0..P3][T4][T5]...[T24][T25][T26][T27][T28][T29]
+ prefix   evictable (score 경쟁)     recent (보호)
+
+After (keep_ratio=0.5, hh_budget=6):
+[P0..P3][T7][T10][T12][T15][T18][T20][T25][T26][T27][T28][T29]
+ prefix   heavy hitters (score 상위 6개)    recent window
+```
+
+**Edge cases**:
+- `recent_window=0` → 기존 동작과 동일 (모든 비-prefix 토큰이 score로 경쟁)
+- `recent_window >= current - prefix` → evictable 영역 없음, eviction skip
+- `prefix + recent >= keep budget` → hh_budget=0, sliding window로 퇴화
+
+**CLI 옵션**:
+
+| 옵션 | 기본값 | 설명 |
+|------|--------|------|
+| `--h2o-recent-window` | 128 | 항상 보호되는 최근 토큰 수 |
+| `--h2o-keep-ratio` | 0.5 | Heavy hitter 유지 비율 (0.0~1.0) |
+| `--h2o-tracked-layers` | 3 | Importance score 추적 레이어 수 (마지막 N개) |
+| `--h2o-decay` | 0.1 | 매 step마다의 importance score 감쇠율 |
+
+> **참고**: `AttentionScoreAccumulator`가 forward pass 중 post-softmax attention weight를 캡처하여
+> `evict_with_scores()`에 전달합니다. Score 없이 호출될 경우 fallback으로 recent window를
+> 보호하는 sliding window 방식으로 동작합니다.
 
 ---
 
@@ -269,8 +292,14 @@ src/core/
 
 ```
 --eviction-policy <none|sliding|h2o>  (default: none)
---eviction-window <usize>                (default: 1024)
---memory-threshold <MB>                  (default: 256)
+--eviction-window <usize>             (default: 1024)    # sliding window 전용
+--h2o-recent-window <usize>           (default: 128)     # H2O recent window
+--h2o-keep-ratio <f32>                (default: 0.5)     # H2O heavy hitter 비율
+--h2o-tracked-layers <usize>          (default: 3)       # score 추적 레이어 수
+--h2o-decay <f32>                     (default: 0.1)     # score 감쇠율
+--protected-prefix <usize>            (default: prompt length)
+--memory-threshold-mb <MB>            (default: 256)
+--eviction-target-ratio <f32>         (default: 0.75)
 ```
 
 ### Sequence Diagram
@@ -361,7 +390,7 @@ pub use my_policy::MyCustomPolicy;
 
 | 항목 | 설명 | 의존성 |
 |------|------|--------|
-| H2O 실제 구현 | Attention score 기반 선택적 토큰 유지 | Attention score 외부 노출 리팩토링 필요 |
-| H2O (Heavy Hitter Oracle) | 자주 참조되는 토큰을 누적 score로 추적 | Attention score 외부 노출 필요 |
+| Importance score compaction | Eviction 후 importance 배열도 compact (reset 대신) | EvictionPolicy trait 시그니처 변경 |
+| Per-head importance | GQA 모델에서 head별 중요도 추적 | 품질 테스트 후 결정 |
 | Adaptive 전략 | 메모리 압력 수준에 따라 전략 자동 전환 | CacheManager 확장 |
 | Per-layer 독립 전략 | 레이어별로 다른 eviction 전략 적용 | CacheManager 확장 |

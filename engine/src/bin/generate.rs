@@ -79,9 +79,25 @@ struct Args {
     #[arg(long, default_value = "none")]
     eviction_policy: String,
 
-    /// Window size for sliding window / h2o eviction (tokens)
+    /// Window size for sliding window eviction (tokens)
     #[arg(long, default_value_t = 1024)]
     eviction_window: usize,
+
+    /// Number of recent tokens always protected from H2O eviction
+    #[arg(long, default_value_t = 128)]
+    h2o_recent_window: usize,
+
+    /// Fraction of tokens to keep as heavy hitters (0.0 to 1.0)
+    #[arg(long, default_value_t = 0.5)]
+    h2o_keep_ratio: f32,
+
+    /// Number of final transformer layers to track for H2O importance scores
+    #[arg(long, default_value_t = 3)]
+    h2o_tracked_layers: usize,
+
+    /// Exponential decay factor for H2O importance scores per step (0.0 to 1.0)
+    #[arg(long, default_value_t = 0.1)]
+    h2o_decay: f32,
 
     /// Number of prefix tokens to protect from eviction (defaults to the entire prompt length)
     #[arg(long)]
@@ -374,8 +390,8 @@ fn main() -> anyhow::Result<()> {
                     actual_protected_prefix,
                 )),
                 "h2o" => Box::new(H2OPolicy::new(
-                    args.eviction_window,
-                    0.5,
+                    args.h2o_recent_window,
+                    args.h2o_keep_ratio,
                     actual_protected_prefix,
                 )),
                 other => anyhow::bail!(
@@ -394,8 +410,8 @@ fn main() -> anyhow::Result<()> {
             max_seq_len,
             model.config.num_attention_heads,
             model.config.num_hidden_layers,
-            3,   // track last 3 layers
-            0.1, // 10% decay per step
+            args.h2o_tracked_layers,
+            args.h2o_decay,
         );
         acc.set_active(true);
         Some(acc)

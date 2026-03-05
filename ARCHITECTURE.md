@@ -50,7 +50,7 @@ graph TB
         EvictionPolicy["EvictionPolicy trait"]
         NoEviction["NoEvictionPolicy"]
         SlidingWindow["SlidingWindowPolicy"]
-        H2O["H2OPolicy (stub)"]
+        H2O["H2OPolicy (3-partition)"]
         SysMonitor["SystemMonitor trait"]
         LinuxMonitor["LinuxSystemMonitor"]
     end
@@ -240,9 +240,11 @@ classDiagram
         +evict() → prune oldest, keep recent window
     }
     class H2OPolicy {
-        -observation_window: usize
+        -recent_window: usize
         -keep_ratio: f32
-        +evict() → (stub: sliding window fallback)
+        -protected_prefix: usize
+        +evict() → fallback sliding with recent protection
+        +evict_with_scores() → 3-partition: prefix + heavy hitters + recent
     }
 
     CacheManager --> EvictionPolicy
@@ -339,7 +341,7 @@ llm_rs2/
 │   │       ├── mod.rs             # EvictionPolicy trait
 │   │       ├── no_eviction.rs     # NoEvictionPolicy (항상 skip)
 │   │       ├── sliding_window.rs  # SlidingWindowPolicy (최근 N 토큰 유지)
-│   │       └── h2o.rs             # H2OPolicy (attention score 기반, stub)
+│   │       └── h2o.rs             # H2OPolicy (3-partition: prefix + heavy hitters + recent)
 │   │
 │   ├── models/llama/
 │   │   ├── llama_model.rs    # LlamaModel (from_dir, forward_into)
@@ -433,10 +435,15 @@ llm_rs2/
 
 `generate` 바이너리의 eviction 관련 CLI 옵션:
 ```
---eviction-policy <POLICY>     none | sliding | h2o [default: none]
---eviction-window <SIZE>       Sliding window size [default: 512]
---protected-prefix <N>         Attention sink tokens to protect [default: 0]
---memory-threshold-mb <MB>     Memory pressure threshold [default: 256]
+--eviction-policy <POLICY>       none | sliding | h2o [default: none]
+--eviction-window <SIZE>         Sliding window size [default: 1024]
+--protected-prefix <N>           Attention sink tokens to protect [default: prompt length]
+--memory-threshold-mb <MB>       Memory pressure threshold [default: 256]
+--eviction-target-ratio <RATIO>  Cache keep ratio on eviction [default: 0.75]
+--h2o-recent-window <N>          Recent tokens always protected [default: 128]
+--h2o-keep-ratio <RATIO>         Heavy hitter keep ratio [default: 0.5]
+--h2o-tracked-layers <N>         Layers tracked for importance [default: 3]
+--h2o-decay <DECAY>              Importance score decay per step [default: 0.1]
 ```
 
 ### 4. Data Layout & Quantization
@@ -717,6 +724,6 @@ adb shell /data/local/tmp/generate --model-path /data/local/tmp/model --backend 
 3. **LayerWorkspace로 할당 최소화**: Decode 루프에서 매 토큰마다 메모리를 할당하지 않고, 사전 할당된 작업 버퍼를 재사용합니다.
 
 ### Known Limitations
-1. **H2O는 stub**: Attention score를 외부로 노출하는 API가 아직 없어 falling back to sliding window입니다.
+1. **H2O importance compaction 미구현**: Eviction 후 importance score 배열을 compact하지 않고 reset합니다. trait 시그니처 변경이 필요하여 별도 PR로 분리 예정입니다.
 2. **GPU buffer prune 미지원**: `prune_prefix`는 CPU 포인터 접근이 필요하므로 GPU-only 버퍼에서는 실패합니다 (`as_mut_ptr()` null).
 3. **Sliding window 품질 한계**: 작은 윈도우(< 128)에서 반복 eviction 시 품질이 급격히 열화됩니다. Attention sink(`protected_prefix`)가 부분적으로 완화합니다.
