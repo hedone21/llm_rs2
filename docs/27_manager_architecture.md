@@ -15,48 +15,59 @@ Manager는 시스템 리소스를 모니터링하고, 임계값 기반 판단을
 
 ## 2. 3-Layer Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          Main Thread                                │
-│                                                                     │
-│  ┌──────────────────┐     ┌────────────────┐     ┌───────────────┐ │
-│  │    Collectors     │     │  PolicyEngine  │     │    Emitter    │ │
-│  │  (4 threads)      │     │  (main thread) │     │ (main thread) │ │
-│  │                   │     │                │     │               │ │
-│  │  MemoryCollector  │     │ ThresholdPolicy│     │ DbusEmitter   │ │
-│  │  ThermalCollector │ tx  │ (hysteresis)   │     │    or         │ │
-│  │  ComputeCollector │────▶│                │────▶│ UnixSocket    │──▶ LLM
-│  │  EnergyCollector  │     │ process()      │     │ Emitter       │ │
-│  │                   │mpsc │  → Vec<Signal> │     │               │ │
-│  └──────────────────┘     └────────────────┘     └───────────────┘ │
-│                                                                     │
-│  SIGINT/SIGTERM ──▶ AtomicBool shutdown ──▶ all threads exit        │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Collectors["Collectors (4 threads)"]
+        MC["MemoryCollector"]
+        TC["ThermalCollector"]
+        CC["ComputeCollector"]
+        EC["EnergyCollector"]
+    end
+
+    subgraph Main["Main Thread"]
+        PE["PolicyEngine<br/><i>ThresholdPolicy (hysteresis)</i><br/>process() → Vec‹Signal›"]
+        EM["Emitter<br/><i>DbusEmitter / UnixSocketEmitter</i>"]
+    end
+
+    LLM["LLM Engine<br/>(SignalListener‹T›)"]
+    SIG["SIGINT/SIGTERM"]
+    SHUT["AtomicBool shutdown"]
+
+    MC & TC & CC & EC -- "mpsc::Sender‹Reading›" --> PE
+    PE -- "SystemSignal" --> EM
+    EM --> LLM
+    SIG --> SHUT --> Collectors & Main
 ```
 
 **데이터 흐름:**
 
-```
-/proc/meminfo ──┐
-/proc/pressure/ ─┤
-                 ├──▶ Reading ──▶ mpsc ──▶ PolicyEngine::process()
-/sys/class/      │                              │
-  thermal/ ──────┤                         Level 변경?
-/proc/stat ──────┤                         ├── Yes → SystemSignal
-/sys/class/      │                         └── No  → (skip)
-  power_supply/ ─┘                              │
-                                                ▼
-                                     Emitter::emit(signal)
-                                                │
-                                     ┌──────────┴──────────┐
-                                     │                     │
-                                D-Bus Signal       Unix Socket
-                              (Linux System Bus)   (length-prefixed JSON)
-                                     │                     │
-                                     └──────────┬──────────┘
-                                                ▼
-                                          LLM Engine
-                                    (SignalListener<T>)
+```mermaid
+flowchart TD
+    subgraph Sources["Data Sources"]
+        P1["/proc/meminfo"]
+        P2["/proc/pressure/"]
+        P3["/sys/class/thermal/"]
+        P4["/proc/stat"]
+        P5["/sys/class/power_supply/"]
+    end
+
+    R["Reading (mpsc)"]
+    PE["PolicyEngine::process()"]
+    CHK{"Level 변경?"}
+    SIG["SystemSignal"]
+    EMIT["Emitter::emit(signal)"]
+
+    subgraph Transport["Transport"]
+        DBUS["D-Bus Signal<br/>(Linux System Bus)"]
+        UNIX["Unix Socket<br/>(length-prefixed JSON)"]
+    end
+
+    LLM["LLM Engine<br/>(SignalListener‹T›)"]
+
+    P1 & P2 & P3 & P4 & P5 --> R --> PE --> CHK
+    CHK -- "Yes" --> SIG --> EMIT
+    CHK -- "No" --> SKIP["(skip)"]
+    EMIT --> DBUS & UNIX --> LLM
 ```
 
 ## 3. Module Structure
@@ -149,13 +160,18 @@ pub trait Emitter: Send {
 
 Level 전이 시 진동(oscillation) 방지를 위해 상향/하향 임계값을 다르게 설정한다:
 
-```
-          Thermal 예시 (hysteresis = 5000mc = 5°C)
+```mermaid
+stateDiagram-v2
+    direction LR
+    Normal --> Warning : ≥ 60°C
+    Warning --> Critical : ≥ 75°C
+    Critical --> Emergency : ≥ 85°C
 
-상향(악화):  Normal ──60°C──▶ Warning ──75°C──▶ Critical ──85°C──▶ Emergency
-하향(회복):  Normal ◀──55°C── Warning ◀──70°C── Critical ◀──80°C── Emergency
-                      △              △               △
-                  -5°C gap       -5°C gap         -5°C gap
+    Warning --> Normal : < 55°C
+    Critical --> Warning : < 70°C
+    Emergency --> Critical : < 80°C
+
+    note right of Normal : Thermal 예시\n(hysteresis = 5°C)
 ```
 
 ### 6.2 평가 함수
@@ -291,21 +307,26 @@ llm_manager --transport unix:/tmp/llm_manager.sock
 
 ## 10. Threading Model
 
-```
-Main Thread
-├── signal handler (SIGINT/SIGTERM → AtomicBool)
-├── emitter 초기화
-├── policy engine 초기화
-├── collector 스레드 spawn (4개)
-│   ├── MemoryCollector thread   ──┐
-│   ├── ThermalCollector thread  ──┤ mpsc::Sender<Reading>
-│   ├── ComputeCollector thread  ──┤
-│   └── EnergyCollector thread   ──┘
-│                                   │
-│   mpsc::Receiver<Reading>  ◀──────┘
-│
-└── main loop:
-    recv_timeout(1s) → policy.process() → emitter.emit()
+```mermaid
+flowchart TD
+    MT["Main Thread"]
+
+    MT --> SH["Signal handler<br/>(SIGINT/SIGTERM → AtomicBool)"]
+    MT --> INIT["Emitter + PolicyEngine 초기화"]
+    MT --> SPAWN["Collector 스레드 spawn (4개)"]
+
+    subgraph Threads["Collector Threads"]
+        T1["MemoryCollector"]
+        T2["ThermalCollector"]
+        T3["ComputeCollector"]
+        T4["EnergyCollector"]
+    end
+
+    SPAWN --> Threads
+    T1 & T2 & T3 & T4 -- "mpsc::Sender‹Reading›" --> RX["mpsc::Receiver‹Reading›"]
+
+    MT --> LOOP["Main loop:<br/>recv_timeout(1s)<br/>→ policy.process()<br/>→ emitter.emit()"]
+    RX --> LOOP
 ```
 
 - Collector 스레드는 각각 독립적으로 동작. 하나가 실패해도 나머지 계속 수집

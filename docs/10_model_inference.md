@@ -25,40 +25,26 @@ rms_norm_eps = 1e-5
 ```
 
 ### 레이어 구조
-```
-Input Token IDs
-      ↓
-┌─────────────────────────────────────┐
-│           Embedding                  │
-│   embed_tokens: [vocab, hidden_dim]  │
-└─────────────────────────────────────┘
-      ↓
-┌─────────────────────────────────────┐
-│         LlamaLayer × 16             │
-│  ┌─────────────────────────────┐    │
-│  │ attention_norm (RMSNorm)    │    │
-│  │ self_attn:                  │    │
-│  │   q_proj, k_proj, v_proj    │    │
-│  │   o_proj                    │    │
-│  │ ffn_norm (RMSNorm)          │    │
-│  │ mlp:                        │    │
-│  │   gate_proj, up_proj        │    │
-│  │   down_proj                 │    │
-│  └─────────────────────────────┘    │
-└─────────────────────────────────────┘
-      ↓
-┌─────────────────────────────────────┐
-│           Final Norm                 │
-│   norm: RMSNorm                      │
-└─────────────────────────────────────┘
-      ↓
-┌─────────────────────────────────────┐
-│           LM Head                    │
-│   lm_head: [hidden_dim, vocab]       │
-│   (embed_tokens weight tied)         │
-└─────────────────────────────────────┘
-      ↓
-Output Logits
+
+```mermaid
+graph TD
+    Input["Input Token IDs"]
+    Embed["Embedding<br/><i>embed_tokens: [vocab, hidden_dim]</i>"]
+    Layer["LlamaLayer × 16"]
+    Norm["Final Norm<br/><i>RMSNorm</i>"]
+    Head["LM Head<br/><i>lm_head: [hidden_dim, vocab]</i><br/><i>(embed_tokens weight tied)</i>"]
+    Output["Output Logits"]
+
+    Input --> Embed --> Layer --> Norm --> Head --> Output
+
+    subgraph LlamaLayer
+        direction TB
+        AN["attention_norm (RMSNorm)"]
+        SA["self_attn: q_proj, k_proj, v_proj, o_proj"]
+        FN["ffn_norm (RMSNorm)"]
+        MLP["mlp: gate_proj, up_proj, down_proj"]
+        AN --> SA --> FN --> MLP
+    end
 ```
 
 ---
@@ -113,91 +99,36 @@ fn generate_token(&mut self, token_id: u32, pos: usize) -> Result<u32> {
 `src/layers/llama_layer.rs`
 
 ### 전체 흐름
-```
-Input: x [1, hidden_dim]
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 1. Residual Save + RMS Norm                               │
-│    residual = copy_from(x)                                │
-│    rms_norm(x, attention_norm, eps)                       │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 2. QKV Projection (Q4_0 quantized weights)                │
-│    q = matmul_transposed(x, wq)   → [1, dim]              │
-│    k = matmul_transposed(x, wk)   → [1, kv_dim]           │
-│    v = matmul_transposed(x, wv)   → [1, kv_dim]           │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 3. Reshape                                                │
-│    q_rope = reshape(q, [1, heads_q, head_dim])            │
-│    k_rope = reshape(k, [1, heads_kv, head_dim])           │
-│    v = reshape(v, [1, heads_kv, head_dim])                │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 4. RoPE Inplace                                           │
-│    rope_inplace(q_rope, start_pos, theta)                 │
-│    rope_inplace(k_rope, start_pos, theta)                 │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 5. KV Cache Update                                        │
-│    kv_cache.update(k_rope, v)                             │
-│    (k, v) = kv_cache.get_view()                           │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 6. Attention (GPU!)                                       │
-│    attention_gen(q_rope, k_cache, v_cache, out_attn)      │
-│    Output: [heads_q, head_dim]                            │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 7. Output Projection                                      │
-│    attn_out = matmul_transposed(out_attn, wo)             │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 8. Residual 1                                             │
-│    add_assign(attn_out, residual)                         │
-│    x = copy_from(attn_out)                                │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 9. FFN Norm                                               │
-│    residual = copy_from(x)                                │
-│    rms_norm(x, ffn_norm, eps)                             │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 10. FFN (SwiGLU)                                          │
-│     gate = matmul_transposed(x, w_gate)                   │
-│     up = matmul_transposed(x, w_up)                       │
-│     silu_mul(gate, up)   // gate = SiLU(gate) * up        │
-│     down = matmul_transposed(gate, w_down)                │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌───────────────────────────────────────────────────────────┐
-│ 11. Residual 2                                            │
-│     add_assign(down, residual)                            │
-│     x = copy_from(down)                                   │
-└───────────────────────────────────────────────────────────┘
-        │
-        ▼
-Output: x [1, hidden_dim]
+
+```mermaid
+graph TD
+    In["Input: x [1, hidden_dim]"]
+
+    S1["1. Residual Save + RMS Norm<br/><code>residual = copy_from(x)</code><br/><code>rms_norm(x, attention_norm, eps)</code>"]
+
+    S2["2. QKV Projection (Q4_0 weights)<br/><code>q = matmul_transposed(x, wq) → [1, dim]</code><br/><code>k = matmul_transposed(x, wk) → [1, kv_dim]</code><br/><code>v = matmul_transposed(x, wv) → [1, kv_dim]</code>"]
+
+    S3["3. Reshape<br/><code>q → [1, heads_q, head_dim]</code><br/><code>k → [1, heads_kv, head_dim]</code><br/><code>v → [1, heads_kv, head_dim]</code>"]
+
+    S4["4. RoPE Inplace<br/><code>rope_inplace(q, start_pos, theta)</code><br/><code>rope_inplace(k, start_pos, theta)</code>"]
+
+    S5["5. KV Cache Update<br/><code>kv_cache.update(k, v)</code><br/><code>(k, v) = kv_cache.get_view()</code>"]
+
+    S6["6. Attention (GPU)<br/><code>attention_gen(q, k_cache, v_cache, out_attn)</code><br/>Output: [heads_q, head_dim]"]
+
+    S7["7. Output Projection<br/><code>attn_out = matmul_transposed(out_attn, wo)</code>"]
+
+    S8["8. Residual 1<br/><code>add_assign(attn_out, residual)</code>"]
+
+    S9["9. FFN Norm<br/><code>residual = copy_from(x)</code><br/><code>rms_norm(x, ffn_norm, eps)</code>"]
+
+    S10["10. FFN (SwiGLU)<br/><code>gate = matmul(x, w_gate)</code><br/><code>up = matmul(x, w_up)</code><br/><code>silu_mul(gate, up)</code><br/><code>down = matmul(gate, w_down)</code>"]
+
+    S11["11. Residual 2<br/><code>add_assign(down, residual)</code>"]
+
+    Out["Output: x [1, hidden_dim]"]
+
+    In --> S1 --> S2 --> S3 --> S4 --> S5 --> S6 --> S7 --> S8 --> S9 --> S10 --> S11 --> Out
 ```
 
 ---
@@ -353,19 +284,16 @@ Avg TBT: 19.19 ms    # Time Between Tokens
 ## 10.9 성능 프로파일
 
 ### 레이어당 연산 비중 (추정)
-```
-┌─────────────────────────────────────────────┐
-│ Operation          │ Est. Time │ % of Layer │
-├─────────────────────────────────────────────┤
-│ QKV Projection     │  3-4 ms   │   20%      │
-│ RoPE               │  <1 ms    │   3%       │
-│ KV Cache Update    │  <1 ms    │   2%       │
-│ Attention (GPU)    │  2-3 ms   │   15%      │
-│ Output Projection  │  2 ms     │   12%      │
-│ FFN (3 matmuls)    │  6-8 ms   │   45%      │
-│ Other (norm, add)  │  <1 ms    │   3%       │
-└─────────────────────────────────────────────┘
-```
+
+| Operation | Est. Time | % of Layer |
+|-----------|-----------|------------|
+| QKV Projection | 3-4 ms | 20% |
+| RoPE | <1 ms | 3% |
+| KV Cache Update | <1 ms | 2% |
+| Attention (GPU) | 2-3 ms | 15% |
+| Output Projection | 2 ms | 12% |
+| FFN (3 matmuls) | 6-8 ms | 45% |
+| Other (norm, add) | <1 ms | 3% |
 
 ### 병목 분석
 1. **FFN**: 3개의 큰 matmul (8192 intermediate)

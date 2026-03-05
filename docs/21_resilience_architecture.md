@@ -145,19 +145,23 @@ pub enum OperatingMode {
 
 ### 4.2 상태 전이 다이어그램
 
-```
-                    악화 방향 →
-        ┌──────────────────────────────────────────┐
-        │                                          │
-    ┌───┴───┐      ┌──────────┐      ┌─────────┐  │  ┌───────────┐
-    │Normal │─────▶│ Degraded │─────▶│ Minimal │──┴─▶│ Suspended │
-    └───┬───┘      └────┬─────┘      └────┬────┘     └─────┬─────┘
-        │               │                 │                 │
-        │◀──────────────┘                 │                 │
-        │◀────────────────────────────────┘                 │
-        │◀──────────────────────────────────────────────────┘
-        │
-        └──── ← 회복 방향
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Normal
+    Normal --> Degraded : Warning ≥ 1
+    Normal --> Minimal : Critical ≥ 1
+    Normal --> Suspended : Emergency ≥ 1
+    Degraded --> Minimal : Critical ≥ 1
+    Degraded --> Suspended : Emergency ≥ 1
+    Minimal --> Suspended : Emergency ≥ 1
+
+    Degraded --> Normal : all Normal
+    Minimal --> Normal : all Normal
+    Minimal --> Degraded : worst = Warning
+    Suspended --> Normal : all Normal
+    Suspended --> Degraded : worst = Warning
+    Suspended --> Minimal : worst = Critical
 ```
 
 ### 4.3 전이 조건
@@ -611,16 +615,20 @@ impl<T: Transport> SignalListener<T> {
 
 ### 8.2 스레드 모델
 
-```
-┌─────────────────────┐          mpsc::channel          ┌──────────────────────┐
-│  D-Bus Listener     │                                  │  Inference Loop      │
-│  (별도 스레드)       │    ┌──────────────────────┐     │  (메인 스레드)        │
-│                     │    │                      │     │                      │
-│  zbus signal recv ──┼───▶│  SystemSignal 채널    │────▶│  ResilienceManager   │
-│                     │    │                      │     │  .poll()             │
-│                     │    └──────────────────────┘     │                      │
-└─────────────────────┘     Sender          Receiver    └──────────────────────┘
-        비동기                                               non-blocking try_recv
+```mermaid
+flowchart LR
+    subgraph ListenerThread["SignalListener (별도 스레드)"]
+        ZB["zbus blocking recv"]
+    end
+    subgraph Channel["mpsc::channel"]
+        TX["Sender"]
+        RX["Receiver"]
+    end
+    subgraph MainThread["Inference Loop (메인 스레드)"]
+        RM["ResilienceManager.poll()<br/><i>non-blocking try_recv</i>"]
+    end
+
+    ZB -- "SystemSignal" --> TX --> RX --> RM
 ```
 
 - D-Bus 리스너는 **별도 스레드**에서 blocking으로 시그널을 대기
@@ -774,44 +782,39 @@ fn resolve_conflicts(actions: Vec<ResilienceAction>) -> Vec<ResilienceAction> {
 
 ### 11.1 Resilience 활성화 시
 
-```
-main() (generate.rs)
-  │
-  ├── 모델 로드, 토크나이저, 백엔드 초기화  (기존)
-  │
-  ├── // ── Resilience 초기화 (추가) ──
-  │   let (tx, rx) = mpsc::channel();
-  │   let transport = DbusTransport::connect()?; // 또는 선택된 transport
-  │   let listener = SignalListener::new(transport, tx);
-  │   let _listener_handle = listener.spawn();
-  │   let resilience_manager = ResilienceManager::new(rx);
-  │
-  ├── 추론 루프 진입
-  │   └── 매 토큰:
-  │       ├── forward_into()
-  │       ├── resilience_manager.poll()     ← 시그널 확인
-  │       ├── execute_action()              ← 액션 실행
-  │       └── sample()
-  │
-  └── 추론 완료 / 중단
+```mermaid
+flowchart TD
+    A["main() - generate.rs"] --> B["모델 로드, 토크나이저, 백엔드 초기화"]
+    B --> C["Resilience 초기화<br/><code>mpsc::channel()</code><br/><code>DbusTransport::connect()</code><br/><code>SignalListener::spawn()</code><br/><code>ResilienceManager::new(rx)</code>"]
+    C --> D["추론 루프 진입"]
+
+    subgraph Loop["매 토큰"]
+        D1["forward_into()"]
+        D2["resilience_manager.poll()"]
+        D3["execute_action()"]
+        D4["sample()"]
+        D1 --> D2 --> D3 --> D4
+    end
+
+    D --> Loop --> E["추론 완료 / 중단"]
 ```
 
 ### 11.2 Resilience 비활성화 시 (D-Bus 없음)
 
-```
-main() (generate.rs)
-  │
-  ├── 모델 로드, 토크나이저, 백엔드 초기화
-  │
-  ├── let resilience_manager = None;  // D-Bus 없으면 None
-  │
-  ├── 추론 루프 진입
-  │   └── 매 토큰:
-  │       ├── forward_into()
-  │       ├── if let Some(rm) = &mut resilience_manager { ... }  ← skip
-  │       └── sample()
-  │
-  └── 추론 완료 (기존과 동일)
+```mermaid
+flowchart TD
+    A["main() - generate.rs"] --> B["모델 로드, 토크나이저, 백엔드 초기화"]
+    B --> C["resilience_manager = None"]
+    C --> D["추론 루프 진입"]
+
+    subgraph Loop["매 토큰"]
+        D1["forward_into()"]
+        D2["if let Some(rm) → skip"]
+        D3["sample()"]
+        D1 --> D2 --> D3
+    end
+
+    D --> Loop --> E["추론 완료 (기존과 동일)"]
 ```
 
 feature flag `resilience`로 컴파일 타임에도 제어 가능:
@@ -894,33 +897,53 @@ D-Bus 의존성 없이 모든 전략을 단위 테스트 가능.
 
 ## 13. Component Dependency Diagram
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                    generate.rs (bin)                      │
-│                                                          │
-│  ┌────────────┐  ┌───────────────────┐  ┌────────────┐  │
-│  │ LlamaModel │  │ ResilienceManager │  │ CacheManager│  │
-│  └─────┬──────┘  └────────┬──────────┘  └─────┬──────┘  │
-│        │                  │                    │         │
-└────────┼──────────────────┼────────────────────┼─────────┘
-         │                  │                    │
-    ┌────▼────┐    ┌───────▼────────┐   ┌──────▼────────┐
-    │ Backend │    │ ResilienceStrategy│  │EvictionPolicy │
-    │ (trait) │    │ (trait)          │  │ (trait)       │
-    └────┬────┘    └───┬───┬───┬────┘   └───────────────┘
-         │             │   │   │
-   ┌─────┴───┐    ┌───┴┐ ┌┴──┐│┌───┐
-   │CPU  GPU │    │Mem │ │Cmp││ │Thm│ │Eng│
-   └─────────┘    └────┘ └───┘│└───┘ └───┘
-                               │
-                         ┌─────▼──────┐
-                         │SignalListener│
-                         │<T: Transport>│
-                         └─────┬──────┘
-                               │
-                          System Bus
-                               │
-                          org.llm.Manager1
+```mermaid
+classDiagram
+    class generate_rs {
+        <<binary>>
+    }
+    class LlamaModel
+    class ResilienceManager
+    class CacheManager
+
+    class Backend {
+        <<trait>>
+    }
+    class ResilienceStrategy {
+        <<trait>>
+    }
+    class EvictionPolicy {
+        <<trait>>
+    }
+
+    class CpuBackend
+    class OpenCLBackend
+    class MemoryStrategy
+    class ComputeStrategy
+    class ThermalStrategy
+    class EnergyStrategy
+    class SignalListener~T~ {
+        T : Transport
+    }
+
+    generate_rs --> LlamaModel
+    generate_rs --> ResilienceManager
+    generate_rs --> CacheManager
+
+    LlamaModel --> Backend
+    CacheManager --> EvictionPolicy
+    ResilienceManager --> ResilienceStrategy
+    ResilienceManager --> SignalListener~T~
+
+    Backend <|.. CpuBackend
+    Backend <|.. OpenCLBackend
+
+    ResilienceStrategy <|.. MemoryStrategy
+    ResilienceStrategy <|.. ComputeStrategy
+    ResilienceStrategy <|.. ThermalStrategy
+    ResilienceStrategy <|.. EnergyStrategy
+
+    SignalListener~T~ --> SystemBus : "D-Bus / Unix Socket"
 ```
 
 ---
