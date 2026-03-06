@@ -6,7 +6,7 @@
 
 ## 5.1 HuggingFace Tokenizer 통합
 
-Antigravity는 HuggingFace의 `tokenizers` crate(`onig` 백엔드)를 사용하여 텍스트를 토큰으로 변환합니다.
+llm.rs는 HuggingFace의 `tokenizers` crate(`onig` 백엔드)를 사용하여 텍스트를 토큰으로 변환합니다.
 
 ### 로딩
 

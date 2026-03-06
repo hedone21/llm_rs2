@@ -1,6 +1,6 @@
 # 14. Component Quality Gates
 
-This document tracks component-level quality gates for the Antigravity (llm_rs2) inference framework. Each component is assigned a tier that determines its testing requirements and gate criteria.
+This document tracks component-level quality gates for the llm.rs (llm_rs2) inference framework. Each component is assigned a tier that determines its testing requirements and gate criteria.
 
 > **Auto-update**: Sections 3 and 4 are automatically maintained by `scripts/update_test_status.py`.
 

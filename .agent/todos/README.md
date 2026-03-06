@@ -1,6 +1,6 @@
 # TODO Management System
 
-Antigravity 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
+llm.rs 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
 
 ---
 

@@ -10,7 +10,7 @@ Resilience 시스템은 외부 시스템(D-Bus, Manager)에 의존하지만,
 ### 1.1 테스트 원칙
 
 - **D-Bus 없이 테스트**: 모든 로직은 `mpsc::channel`을 통해 주입 가능. D-Bus는 전송 계층일 뿐
-- **기존 3-Tier 확장**: Antigravity의 Host Unit / Backend Verification / E2E 구조를 유지하며 Resilience tier 추가
+- **기존 3-Tier 확장**: llm.rs의 Host Unit / Backend Verification / E2E 구조를 유지하며 Resilience tier 추가
 - **결정적 재현**: 시그널 시퀀스를 파일로 저장하고 재생하여 동일 결과 보장
 - **장애 주입**: 정상 시나리오뿐 아니라 경계 조건, 빠른 전환, 채널 끊김 등을 테스트
 

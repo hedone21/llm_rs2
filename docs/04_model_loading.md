@@ -6,7 +6,7 @@
 
 ## 4.1 Overview
 
-Antigravity는 HuggingFace Safetensors 포맷의 Llama 3.2 모델을 로드하여 Rust의 내부 `Tensor` 표현으로 변환합니다. 로딩 파이프라인은 다음 단계를 거칩니다:
+llm.rs는 HuggingFace Safetensors 포맷의 Llama 3.2 모델을 로드하여 Rust의 내부 `Tensor` 표현으로 변환합니다. 로딩 파이프라인은 다음 단계를 거칩니다:
 
 1. **Memory-mapped I/O**: `memmap2`를 사용하여 safetensors 파일을 메모리에 매핑
 2. **dtype 변환**: BF16/F16 → F32로 변환 (모든 연산은 F32 기반)

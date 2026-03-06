@@ -1,4 +1,4 @@
-# Antigravity: On-device LLM Inference Framework
+# llm.rs: On-device LLM Inference Framework
 
 본 프로젝트는 ARM64 기반 엣지 디바이스 및 모바일 환경에 최적화된 고성능 **On-device LLM 추론 프레임워크**입니다. Rust 언어로 구현되었으며, 하드웨어 가속기 활용을 위한 유연한 백엔드 구조와 메모리 효율성을 극대화한 Zero-copy 아키텍처를 지향합니다.
 

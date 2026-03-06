@@ -1,6 +1,6 @@
 # D-Bus IPC Specification
 
-> Phase 0 설계 문서 | Antigravity LLM Resilience System
+> Phase 0 설계 문서 | llm.rs LLM Resilience System
 > Version: 2.0 (redesigned)
 
 ## 1. Overview
@@ -19,7 +19,7 @@ flowchart LR
         MS["데이터 소스:<br/>/proc/meminfo, PSI<br/>/proc/stat, /sys/class/<br/>thermald, thermal_zone<br/>UPower, /sys/class/power"]
     end
 
-    subgraph LLM["LLM (Antigravity)"]
+    subgraph LLM["LLM (llm.rs)"]
         direction TB
         LR2["시그널 수신<br/>최적 동작 결정<br/>자율적 실행"]
     end
@@ -275,7 +275,7 @@ LLM은 별도 조회 없이 시그널 수신으로 초기 상태를 파악.
 sequenceDiagram
     participant M as Manager (내부)
     participant D as D-Bus
-    participant L as LLM (Antigravity)
+    participant L as LLM (llm.rs)
 
     Note over M: /proc/meminfo 폴링<br/>available: 35% → 18%<br/>PSI some: 25μs → 150μs
     Note over M: 분석: critical 진입<br/>reclaim 목표 계산: 128MB
@@ -299,7 +299,7 @@ sequenceDiagram
 sequenceDiagram
     participant M as Manager (내부)
     participant D as D-Bus
-    participant L as LLM (Antigravity)
+    participant L as LLM (llm.rs)
 
     Note over L: CPU 백엔드 사용 중
     Note over M: /proc/stat 폴링<br/>CPU: 55% → 72% → 91%<br/>GPU: 15%
@@ -317,7 +317,7 @@ sequenceDiagram
 sequenceDiagram
     participant M as Manager (내부)
     participant D as D-Bus
-    participant L as LLM (Antigravity)
+    participant L as LLM (llm.rs)
 
     Note over M: thermal_zone 폴링<br/>temp: 68℃ → 76℃<br/>쓰로틀링 예측 모델 실행
 
@@ -347,7 +347,7 @@ sequenceDiagram
 sequenceDiagram
     participant M as Manager (내부)
     participant D as D-Bus
-    participant L as LLM (Antigravity)
+    participant L as LLM (llm.rs)
 
     Note over M: UPower: Battery 28%<br/>방전률 분석
 

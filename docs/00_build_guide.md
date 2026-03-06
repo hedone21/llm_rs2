@@ -4,7 +4,7 @@
 
 ---
 
-이 문서는 Antigravity (llm_rs2) 프로젝트를 처음부터 다시 구현하고자 하는 개발자를 위한 단계별 가이드입니다. 각 Phase는 의존 관계를 고려하여 구성되어 있으며, 순서대로 따라가면 동작하는 on-device LLM inference framework를 완성할 수 있습니다.
+이 문서는 llm.rs (llm_rs2) 프로젝트를 처음부터 다시 구현하고자 하는 개발자를 위한 단계별 가이드입니다. 각 Phase는 의존 관계를 고려하여 구성되어 있으며, 순서대로 따라가면 동작하는 on-device LLM inference framework를 완성할 수 있습니다.
 
 ## Phase 의존 관계
 
