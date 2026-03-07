@@ -30,6 +30,22 @@
   - 다중 실험 겹쳐 그리기 지원 (`--experiments exp1.jsonl exp2.jsonl`)
 - **Notes**: `experiments/PLAN.md` Section 6.3 참조
 
+## [P1] Dashboard Experiments 탭 구현
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: Round 2 실험 완료 (결과 JSONL 축적 후)
+- **Description**: 기존 Flask 대시보드에 Experiments 탭 추가. JSONL 결과를 파싱하여 인터랙티브 비교 제공
+- **Acceptance Criteria**:
+  - `dashboard/backend/experiment_parser.py`: JSONL 파싱 (per-token + summary)
+  - `/api/experiments` 엔드포인트: 실험 목록, 개별 결과, 비교 데이터
+  - Experiments 탭 UI:
+    - 실험 목록 테이블 (ID, Signal, Eviction, Tokens, EMR, TBT%, RSS)
+    - 개별 실험 상세: TBT 시계열 (Plotly), RSS 시계열, 품질 메트릭 카드
+    - 비교 모드: baseline vs experiment 겹쳐 보기 (기존 Compare 탭 패턴 활용)
+    - 신호 주입 시점 수직선 + eviction 이벤트 마커
+  - 기존 대시보드 탭 (Overview, Table, Detail, ...) 영향 없음
+- **Notes**: CLI 스크립트 (compare.py, plot_*.py)가 먼저 완성된 후 대시보드로 확장. Plotly.js로 인터랙티브 줌/필터 제공
+
 ---
 
 ## [P2] Thermal throttling 감지 및 알림 UI

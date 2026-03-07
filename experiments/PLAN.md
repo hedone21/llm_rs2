@@ -690,13 +690,32 @@ experiments/
 
 ## 10. 구현 순서
 
-| Step | 내용 | 산출물 |
-|------|------|--------|
-| **1** | generate.rs experiment mode | CLI 플래그, 주입 로직, SystemSampler, JSONL 출력 |
-| **2** | Round 1~2 스케줄 JSON 작성 | `experiments/configs/` ~15개 파일 |
-| **3** | Baseline 실행 (128/512/1024) + JSONL 검증 | `B-128.jsonl`, `B-512.jsonl`, `B-1024.jsonl` |
-| **4** | compare.py + quality_metrics.py + plot 스크립트 | 분석 도구 |
-| **5** | Round 2 전체 실험 + 분석 | 보고서 + FINDINGS |
-| **6** | Round 3~5 반복 | 점진적 인사이트 누적 |
+### Phase A: CLI 기반 실험 인프라 (Step 1~5)
 
-각 Step 완료 시 커밋. **Step 1이 가장 크고 핵심적인 구현.**
+| Step | 내용 | 산출물 | 담당 |
+|------|------|--------|------|
+| **1** | generate.rs experiment mode | CLI 플래그, 주입 로직, SystemSampler, JSONL 출력 | Rust Dev |
+| **2a** | Round 1~2 스케줄 JSON 작성 | `experiments/configs/` ~15개 파일 | Rust Dev |
+| **2b** | compare.py + quality_metrics.py + plot 스크립트 | CLI 분석 도구 (matplotlib → PNG) | Frontend Dev |
+| **3** | Baseline 실행 (128/512/1024) + JSONL 검증 | `B-128.jsonl`, `B-512.jsonl`, `B-1024.jsonl` | Tester |
+| **4** | Round 2 전체 실험 + 분석 | 보고서 + FINDINGS | Tester |
+| **5** | Round 3~5 반복 | 점진적 인사이트 누적 | Tester |
+
+Step 2a, 2b는 병렬 진행. **Step 1이 가장 크고 핵심적인 구현.**
+
+### Phase B: 대시보드 연계 (Step 6~7)
+
+Round 2 결과가 축적된 후, 인터랙티브 분석 필요성이 생기면 착수.
+
+| Step | 내용 | 산출물 | 담당 |
+|------|------|--------|------|
+| **6** | JSONL 파서 + REST API | `dashboard/backend/experiment_parser.py`, `/api/experiments` | Frontend Dev |
+| **7** | Dashboard Experiments 탭 | 실험 목록, TBT/RSS 시계열 (Plotly), 비교 모드 | Frontend Dev |
+
+대시보드 탭 기능:
+- 실험 목록 테이블 (ID, Signal, Eviction, Tokens, EMR, TBT%, RSS)
+- 개별 상세: TBT 시계열 + RSS 시계열 (Plotly.js 인터랙티브)
+- 비교 모드: baseline vs experiment 겹쳐 보기 (기존 Compare 탭 패턴 활용)
+- 신호 주입 시점 수직선 + eviction 이벤트 마커
+
+각 Step 완료 시 커밋.
