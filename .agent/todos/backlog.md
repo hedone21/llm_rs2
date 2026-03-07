@@ -4,6 +4,14 @@
 
 ---
 
+## [P2] H2O eviction 품질이 Sliding보다 낮은 원인 분석
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: Round 2 실험 완료 ✅
+- **Description**: Round 2에서 H2O(EMR=0.593, FDT=302)가 Sliding(EMR=0.687, FDT=351)보다 품질이 낮게 나옴. 중요도 기반 eviction이 더 공격적으로 토큰을 제거하는 것인지, H2O 파라미터(keep_ratio, recent_window, decay) 튜닝 문제인지, 또는 구현 버그인지 확인 필요.
+- **Acceptance Criteria**: 원인 규명, 필요시 H2O 정책 개선 또는 파라미터 조정 권장사항 도출
+- **Notes**: Round 4 H2O sweep 결과와 교차 검증. `experiments/results/M-C-256-h2o.jsonl` vs `M-C-256-sl.jsonl` 비교 참조
+
 ## [P3] 다중 모델 사이즈 검증 테스트 매트릭스
 - **Status**: TODO
 - **Sprint**: backlog
