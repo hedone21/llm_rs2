@@ -2511,5 +2511,86 @@
         "passed": 0
       }
     }
+  },
+  {
+    "date": "2026-03-07T21:52:38",
+    "total": 209,
+    "passed": 209,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 13,
+        "passed": 13
+      },
+      "core::eviction::h2o": {
+        "total": 13,
+        "passed": 13
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::quant": {
+        "total": 6,
+        "passed": 6
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
   }
 ]
