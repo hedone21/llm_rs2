@@ -1,0 +1,40 @@
+pub mod compute;
+pub mod energy;
+pub mod external;
+pub mod memory;
+pub mod thermal;
+
+use llm_shared::SystemSignal;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::mpsc;
+
+/// A self-contained monitoring unit that collects data, evaluates thresholds,
+/// and produces SystemSignals.
+///
+/// Each Monitor owns its domain completely: data source, evaluation logic,
+/// and signal construction. The Manager simply acts as a signal bus.
+///
+/// # Adding a new monitor
+///
+/// 1. Create `monitor/your_monitor.rs`
+/// 2. Implement `Monitor` trait
+/// 3. Add config section to `config.rs`
+/// 4. Register in `main.rs::build_monitors()`
+pub trait Monitor: Send + 'static {
+    /// Run the monitor in a dedicated thread.
+    ///
+    /// Should send `SystemSignal`s to `tx` when thresholds are crossed
+    /// and return `Ok(())` when `shutdown` becomes true.
+    fn run(
+        &mut self,
+        tx: mpsc::Sender<SystemSignal>,
+        shutdown: Arc<AtomicBool>,
+    ) -> anyhow::Result<()>;
+
+    /// Initial state signal for new clients. Returns `None` if not applicable
+    /// (e.g., ExternalMonitor has no initial state).
+    fn initial_signal(&self) -> Option<SystemSignal>;
+
+    fn name(&self) -> &str;
+}
