@@ -5,18 +5,6 @@
 
 ---
 
-## [P0] Round 3~5 실험 반복 실행
-- **Status**: TODO
-- **Sprint**: current
-- **Dependencies**: Round 2 분석 완료 ✅
-- **Description**: Round 2 인사이트 기반으로 Round 3(위치변수), Round 4(H2O sweep), Round 5(복합) 순차 실행
-- **Acceptance Criteria**:
-  - 각 Round별 실험 실행 + 보고서 + FINDINGS 업데이트
-  - Round 간 인사이트 연결 (이전 Round 결과가 다음 Round 설계에 반영)
-- **Notes**: Round 3~5는 Round 2 결과에 따라 조정 가능
-
----
-
 ## [P2] 범용 디바이스 배포/테스트 스크립트
 - **Status**: TODO
 - **Sprint**: next
@@ -47,6 +35,10 @@
 ## [P0] Round 2 단일 신호 실험 실행 + 분석
 - **Status**: DONE
 - **Notes**: 커밋 1a6633f. 14 실험 완료. 속도(T-C-32: +174%), 품질(H2O EMR=0.593), 메모리(R-C-768: EMR=1.0) 확인
+
+## [P0] Round 3~5 실험 반복 실행
+- **Status**: DONE
+- **Notes**: Round 3(8실험), Round 4(9실험), Round 5(9실험+B-2048) 완료. 총 45개 실험. 핵심 발견: eviction 위치가 품질 최대 결정요인, H2O recent_window만 유의미한 파라미터, 복합 제약은 속도/품질 독립 영향
 
 ## [P1] 디바이스 스트레스 테스트 (Resilience 신호 포함)
 - **Status**: DONE

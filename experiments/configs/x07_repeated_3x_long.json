@@ -1,0 +1,66 @@
+{
+  "name": "X-07",
+  "description": "Long sequence: 3x Crit->Norm rounds (512/768, 1024/1280, 1536/1792)",
+  "signals": [
+    {
+      "at_token": 512,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 768,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    },
+    {
+      "at_token": 1024,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 1280,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    },
+    {
+      "at_token": 1536,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 1792,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    }
+  ]
+}

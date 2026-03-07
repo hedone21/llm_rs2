@@ -1,0 +1,16 @@
+{
+  "name": "M-C-128",
+  "description": "Memory Critical at token 128 — early eviction (25% of 512)",
+  "signals": [
+    {
+      "at_token": 128,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}

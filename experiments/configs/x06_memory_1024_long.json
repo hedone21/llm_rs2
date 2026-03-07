@@ -1,0 +1,16 @@
+{
+  "name": "X-06",
+  "description": "Long sequence: Memory Critical at token 1024 (2048 tokens total)",
+  "signals": [
+    {
+      "at_token": 1024,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "name": "X-03",
+  "description": "Repeated eviction: Crit(200)->Norm(300)->Crit(400)->Norm(500)",
+  "signals": [
+    {
+      "at_token": 200,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 300,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    },
+    {
+      "at_token": 400,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 500,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "R-C-896",
+  "description": "Memory Critical at token 896 — very late eviction (87.5% of 1024)",
+  "signals": [
+    {
+      "at_token": 896,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}

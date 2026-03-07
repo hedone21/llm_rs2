@@ -1,0 +1,16 @@
+{
+  "name": "M-C-384",
+  "description": "Memory Critical at token 384 — late eviction (75% of 512)",
+  "signals": [
+    {
+      "at_token": 384,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}

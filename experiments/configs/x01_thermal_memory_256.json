@@ -1,0 +1,27 @@
+{
+  "name": "X-01",
+  "description": "Compound: Thermal Critical + Memory Critical both at token 256",
+  "signals": [
+    {
+      "at_token": 256,
+      "signal": {
+        "thermal_alert": {
+          "level": "critical",
+          "temperature_mc": 48000,
+          "throttling_active": true,
+          "throttle_ratio": 0.3
+        }
+      }
+    },
+    {
+      "at_token": 256,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}
