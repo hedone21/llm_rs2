@@ -5,18 +5,7 @@
 
 ---
 
-## [P0] Experiment 스케줄 JSON 파일 작성
-- **Status**: TODO
-- **Sprint**: current
-- **Dependencies**: Experiment Mode 구현 완료 ✅
-- **Description**: Round 1~2 실험용 스케줄 JSON 파일 생성. `experiments/configs/` 디렉토리
-- **Acceptance Criteria**:
-  - baseline.json ✅ (완료)
-  - 속도 실험 (128 토큰): thermal_warning_32, thermal_critical_32, thermal_crit_32_recover_96, compute_cpu_32, energy_emergency_32
-  - 품질 실험 (512 토큰): memory_warning_256, memory_critical_256, memory_crit_256_recover_384
-  - 메모리 실험 (1024 토큰): memory_critical_512, memory_critical_256_long, memory_critical_768, memory_crit_512_recover_768
-  - 모든 JSON이 스케줄 스키마 준수
-- **Notes**: `experiments/PLAN.md` Section 3.2 + Section 5 참조
+*(현재 P0 작업 완료. 다음 실험 실행은 Tester 역할)*
 
 ---
 
@@ -32,6 +21,10 @@
 ## [P0] SystemSampler 구현
 - **Status**: DONE
 - **Notes**: 커밋 82d7cf2. RSS/CPU util/CPU freq/Thermal/GPU 수집, interval 제어, snapshot
+
+## [P0] Experiment 스케줄 JSON 파일 작성
+- **Status**: DONE
+- **Notes**: 커밋 39e6570. 12개 파일 (baseline + speed 5 + quality 3 + memory 3), 모두 Rust 파싱 검증 완료
 
 ## [P1] IPC Transport 추상화 구현
 - **Status**: DONE
