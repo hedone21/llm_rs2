@@ -120,7 +120,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-07 20:23:03_
+_Last updated: 2026-03-07 20:45:22_
 
 ### Quality Gate Summary
 
@@ -150,7 +150,7 @@ _Last updated: 2026-03-07 20:23:03_
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
 | UnifiedBuffer | T4 | Stable | 0 | 0 | 0 | N/A |
 | **Overall** | | | **135** | **135** | **0** | **FAIL** |
-| Integration | - | - | 66 | 66 | PASS |
+| Integration | - | - | 74 | 74 | PASS |
 
 ### Test Details
 
@@ -314,6 +314,14 @@ _Last updated: 2026-03-07 20:23:03_
 | `descending_skip_to_emergency` | Integration | PASS |
 | `descending_step_recovery` | Integration | PASS |
 | `no_emergency_level` | Integration | PASS |
+| `test_extract_top_k_logits` | Integration | PASS |
+| `test_extract_top_k_logits_k_larger_than_len` | Integration | PASS |
+| `test_schedule_signals_at` | Integration | PASS |
+| `test_summary_record_serialization` | Integration | PASS |
+| `test_system_sampler_interval_respects_interval` | Integration | PASS |
+| `test_system_sampler_interval_zero_returns_none` | Integration | PASS |
+| `test_system_sampler_snapshot_always_returns` | Integration | PASS |
+| `test_token_record_serialization` | Integration | PASS |
 | `balanced_recommendation` | Integration | PASS |
 | `both_loaded_recommendation` | Integration | PASS |
 | `compute_delta_calculation` | Integration | PASS |
@@ -366,7 +374,6 @@ _Last updated: 2026-03-07 20:23:03_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-02T23:49:01 | 88 | 85 | 3 | 96.6% |
 | 2026-03-02T23:49:05 | 85 | 85 | 0 | 100.0% |
 | 2026-03-02T23:49:10 | 85 | 85 | 0 | 100.0% |
 | 2026-03-02T23:49:14 | 88 | 85 | 3 | 96.6% |
@@ -386,4 +393,5 @@ _Last updated: 2026-03-07 20:23:03_
 | 2026-03-07T09:08:46 | 204 | 201 | 3 | 98.5% |
 | 2026-03-07T20:18:22 | 204 | 201 | 3 | 98.5% |
 | 2026-03-07T20:23:03 | 201 | 201 | 0 | 100.0% |
+| 2026-03-07T20:45:22 | 209 | 209 | 0 | 100.0% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->
