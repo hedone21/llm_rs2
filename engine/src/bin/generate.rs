@@ -18,12 +18,17 @@ use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
+use llm_rs2::experiment::{
+    ExperimentSchedule, JsonlWriter, SummaryRecord, SystemSampler, TokenRecord,
+    extract_top_k_logits,
+};
 #[cfg(feature = "resilience")]
 use llm_rs2::resilience::DbusTransport;
 #[cfg(unix)]
 use llm_rs2::resilience::UnixSocketTransport;
 use llm_rs2::resilience::{
-    InferenceContext, ResilienceAction, ResilienceManager, SignalListener, execute_action,
+    InferenceContext, ResilienceAction, ResilienceManager, SignalListener, SystemSignal,
+    execute_action,
 };
 
 #[derive(Parser, Debug)]
@@ -122,6 +127,27 @@ struct Args {
     /// Resilience signal transport: "dbus" or "unix:<path>"
     #[arg(long, default_value = "dbus")]
     resilience_transport: String,
+
+    // ── Experiment mode ──────────────────────────────
+    /// Experiment schedule JSON file (enables experiment mode)
+    #[arg(long)]
+    experiment_schedule: Option<String>,
+
+    /// Experiment output JSONL file path
+    #[arg(long)]
+    experiment_output: Option<String>,
+
+    /// Number of top-K logits to record per token in experiment mode
+    #[arg(long, default_value_t = 10)]
+    experiment_logits_topk: usize,
+
+    /// System metric sampling interval (N tokens, 0=disabled)
+    #[arg(long, default_value_t = 1)]
+    experiment_sample_interval: usize,
+
+    /// Force greedy sampling (temperature=0) for reproducibility
+    #[arg(long, default_value_t = false)]
+    greedy: bool,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -221,6 +247,12 @@ fn main() -> anyhow::Result<()> {
 
     #[allow(unused_mut)]
     let mut args = Args::parse();
+
+    // --greedy overrides temperature to 0
+    if args.greedy {
+        args.temperature = 0.0;
+    }
+
     let model_path = &args.model_path;
 
     // 1. Setup
@@ -337,8 +369,21 @@ fn main() -> anyhow::Result<()> {
         ));
     }
 
-    // 5. Resilience Manager (optional)
-    let mut resilience_manager = if args.enable_resilience {
+    // 5. Experiment schedule + Resilience Manager
+    let experiment_schedule = if let Some(ref path) = args.experiment_schedule {
+        Some(ExperimentSchedule::load(path)?)
+    } else {
+        None
+    };
+
+    let mut experiment_tx: Option<std::sync::mpsc::Sender<SystemSignal>> = None;
+    let mut resilience_manager = if let Some(ref schedule) = experiment_schedule {
+        // Experiment mode: internal mpsc channel (no external transport needed)
+        let (tx, rx) = std::sync::mpsc::channel();
+        experiment_tx = Some(tx);
+        eprintln!("[Experiment] Mode enabled — schedule: {}", schedule.name);
+        Some(ResilienceManager::new(rx))
+    } else if args.enable_resilience {
         let (tx, rx) = std::sync::mpsc::channel();
         let _listener_handle = match args.resilience_transport.as_str() {
             #[cfg(feature = "resilience")]
@@ -362,6 +407,23 @@ fn main() -> anyhow::Result<()> {
         None
     };
     let mut throttle_delay_ms: u64 = 0;
+
+    // Experiment JSONL writer + system sampler
+    let mut experiment_writer = if let Some(ref path) = args.experiment_output {
+        Some(JsonlWriter::new(path)?)
+    } else {
+        None
+    };
+    let mut system_sampler = SystemSampler::new(args.experiment_sample_interval);
+    let sys_start = if experiment_writer.is_some() {
+        Some(system_sampler.snapshot())
+    } else {
+        None
+    };
+    let mut experiment_eviction_count: usize = 0;
+    let mut experiment_evicted_total: usize = 0;
+    let mut experiment_total_throttle_ms: u64 = 0;
+    let mut forward_ms_values: Vec<f64> = Vec::new();
 
     // 6. Inference Loop
     let mut tokens = input_ids.clone();
@@ -576,7 +638,7 @@ fn main() -> anyhow::Result<()> {
         stdout.flush().ok();
 
         // Generation loop
-        for _ in 0..(args.num_tokens - 1) {
+        for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
             if kv_caches[0].current_pos >= max_seq_len {
                 println!("\n[Stopped: Max context length reached]");
@@ -594,6 +656,7 @@ fn main() -> anyhow::Result<()> {
                 acc.begin_step();
             }
 
+            let forward_start = std::time::Instant::now();
             let _eviction_result = model.forward_into(LlamaModelForwardArgs {
                 input_tokens: &gen_input_tensor,
                 start_pos,
@@ -607,8 +670,20 @@ fn main() -> anyhow::Result<()> {
                 cache_manager: cm_ref,
                 score_accumulator: score_accumulator.as_mut(),
             })?;
+            let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
+            forward_ms_values.push(forward_ms);
+
+            // ── Experiment: inject signals at this token position ──
+            let mut injected_signals: Vec<String> = Vec::new();
+            if let (Some(schedule), Some(tx)) = (&experiment_schedule, &experiment_tx) {
+                for entry in schedule.signals_at(decode_token_index) {
+                    tx.send(entry.signal.clone()).ok();
+                    injected_signals.push(signal_summary(&entry.signal));
+                }
+            }
 
             // ── Resilience checkpoint ─────────────────────────
+            let mut action_names: Vec<String> = Vec::new();
             if let Some(rm) = &mut resilience_manager {
                 let mut suspended = false;
                 let mut reject_new = false;
@@ -621,10 +696,9 @@ fn main() -> anyhow::Result<()> {
                 };
 
                 for action in rm.poll() {
+                    action_names.push(action_summary(&action));
+
                     if let ResilienceAction::Evict { target_ratio } = &action {
-                        // Use policy-aware eviction via CacheManager.
-                        // For H2O: uses accumulated importance scores (3-partition).
-                        // For sliding: uses prefix-aware sliding window.
                         let result = if let Some(ref acc) = score_accumulator {
                             cache_manager.force_evict_with_scores(
                                 &mut kv_caches,
@@ -642,6 +716,8 @@ fn main() -> anyhow::Result<()> {
                                     r.new_pos + r.tokens_removed,
                                     r.new_pos
                                 );
+                                experiment_eviction_count += 1;
+                                experiment_evicted_total += r.tokens_removed;
                                 if let Some(ref mut acc) = score_accumulator {
                                     acc.reset();
                                 }
@@ -662,19 +738,26 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 if throttle_delay_ms > 0 {
+                    experiment_total_throttle_ms += throttle_delay_ms;
                     std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
                 }
             }
             // ── End Resilience checkpoint ─────────────────────
 
-            // Sample
-            // Read logits
+            // Read logits to CPU
             let mut logits_cpu = vec![0.0f32; vocab_size];
             unsafe {
                 let ptr = logits_cpu.as_mut_ptr() as *mut u8;
                 let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
                 backend.read_buffer(&logits, slice)?;
             }
+
+            // Extract top-K logits before sampling modifies them
+            let top_logits = if experiment_writer.is_some() {
+                extract_top_k_logits(&logits_cpu, args.experiment_logits_topk)
+            } else {
+                vec![]
+            };
 
             let next_token_id = sample(&mut logits_cpu, &tokens, vocab_size, &args);
 
@@ -686,32 +769,43 @@ fn main() -> anyhow::Result<()> {
             tokens.push(next_token_id);
 
             // start_pos tracks the LOGICAL position for RoPE encoding.
-            // It must always increment, even after eviction. Eviction changes the
-            // physical cache layout (current_pos), but keys retain their original
-            // RoPE positions. The query must continue with the next sequential
-            // position to maintain correct relative distances.
             start_pos += 1;
 
-            // Streaming print
-            let current_text = tokenizer.decode(&tokens, true).unwrap_or_default();
-            if current_text.len() > _printed_len {
-                // Check if we are at a valid char boundary.
-                // If not (e.g. we are in the middle of a multi-byte char sequence from previous partial decode?),
-                // we might need to be careful.
-                // However, tokenizer.decode should return valid strings.
-                // The issue is likely that `_printed_len` (bytes) might not align with `current_text` if decoding changed slightly?
-                // Or `_printed_len` was set from a previous string.
+            // ── Experiment: write per-token JSONL record ──
+            if let Some(ref mut writer) = experiment_writer {
+                let token_text = tokenizer
+                    .decode(&[next_token_id], false)
+                    .unwrap_or_default();
+                let sys_metrics = system_sampler.sample(decode_token_index);
+                let signal_str = if injected_signals.is_empty() {
+                    None
+                } else {
+                    Some(injected_signals.join("+"))
+                };
+                let record = TokenRecord {
+                    pos: decode_token_index,
+                    token_id: next_token_id,
+                    text: token_text,
+                    tbt_ms: tbt,
+                    forward_ms,
+                    signal: signal_str.as_deref(),
+                    actions: action_names,
+                    cache_pos: kv_caches[0].current_pos,
+                    throttle_ms: throttle_delay_ms,
+                    top_logits,
+                    sys: sys_metrics,
+                };
+                writer.write_token(&record)?;
+            }
 
-                // Safe slicing:
-                if let Some(substring) = current_text.get(_printed_len..) {
+            // Streaming print (suppress in experiment mode for clean JSONL)
+            if experiment_writer.is_none() {
+                let current_text = tokenizer.decode(&tokens, true).unwrap_or_default();
+                if let Some(substring) = current_text.get(_printed_len..).filter(|s| !s.is_empty())
+                {
                     print!("{}", substring);
                     stdout.flush().ok();
                     _printed_len = current_text.len();
-                } else {
-                    // Verify if _printed_len is valid.
-                    // Often tokenizers re-decode slightly differently or we accumulate.
-                    // A safer way is: just print what's new from this round's decode, but we need to track bytes.
-                    // Let's just catch the case where we can't slice.
                 }
             }
 
@@ -721,11 +815,52 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 6. Output results
+    // 6. Write experiment summary
+    if let Some(ref mut writer) = experiment_writer {
+        let sys_end = Some(system_sampler.snapshot());
+        let avg_tbt_ms = if tbt_values.is_empty() {
+            0.0
+        } else {
+            tbt_values.iter().sum::<f64>() / tbt_values.len() as f64
+        };
+        let avg_forward_ms = if forward_ms_values.is_empty() {
+            0.0
+        } else {
+            forward_ms_values.iter().sum::<f64>() / forward_ms_values.len() as f64
+        };
+        let summary = SummaryRecord {
+            _summary: true,
+            total_tokens: tbt_values.len(),
+            ttft_ms: _ttft_ms,
+            avg_tbt_ms,
+            avg_forward_ms,
+            total_throttle_ms: experiment_total_throttle_ms,
+            eviction_count: experiment_eviction_count,
+            evicted_tokens_total: experiment_evicted_total,
+            final_cache_pos: kv_caches[0].current_pos,
+            max_seq_len,
+            prompt: prompt.clone(),
+            schedule_name: experiment_schedule
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_else(|| "baseline".to_string()),
+            eviction_policy: args.eviction_policy.clone(),
+            backend: args.backend.clone(),
+            sample_interval: args.experiment_sample_interval,
+            sys_start,
+            sys_end,
+            governor: Some(SystemSampler::read_governor()),
+        };
+        writer.write_summary(&summary)?;
+        eprintln!(
+            "[Experiment] Done: {} tokens, avg TBT {:.2}ms, {} evictions",
+            summary.total_tokens, avg_tbt_ms, experiment_eviction_count
+        );
+    }
+
+    // 7. Output results
     println!("\nDone.");
     println!("[Profile] Event: End");
-    // let full_text = tokenizer.decode(&tokens[input_ids.len()..], true).map_err(|e| anyhow::anyhow!(e))?;
-    // println!("Generated: {}", full_text);
     println!("TTFT: {:.2} ms", _ttft_ms);
     if !tbt_values.is_empty() {
         let avg_tbt: f64 = tbt_values.iter().sum::<f64>() / tbt_values.len() as f64;
@@ -737,4 +872,27 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ── Experiment helpers ────────────────────────────────────────
+
+fn signal_summary(signal: &SystemSignal) -> String {
+    match signal {
+        SystemSignal::ThermalAlert { level, .. } => format!("Thermal({:?})", level),
+        SystemSignal::MemoryPressure { level, .. } => format!("Memory({:?})", level),
+        SystemSignal::ComputeGuidance { level, .. } => format!("Compute({:?})", level),
+        SystemSignal::EnergyConstraint { level, .. } => format!("Energy({:?})", level),
+    }
+}
+
+fn action_summary(action: &ResilienceAction) -> String {
+    match action {
+        ResilienceAction::Evict { target_ratio } => format!("Evict({})", target_ratio),
+        ResilienceAction::SwitchBackend { to } => format!("SwitchBackend({:?})", to),
+        ResilienceAction::LimitTokens { max_tokens } => format!("LimitTokens({})", max_tokens),
+        ResilienceAction::Throttle { delay_ms } => format!("Throttle({}ms)", delay_ms),
+        ResilienceAction::Suspend => "Suspend".to_string(),
+        ResilienceAction::RejectNew => "RejectNew".to_string(),
+        ResilienceAction::RestoreDefaults => "RestoreDefaults".to_string(),
+    }
 }

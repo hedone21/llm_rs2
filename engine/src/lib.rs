@@ -5,4 +5,5 @@ pub mod layers;
 pub mod memory;
 pub mod models;
 
+pub mod experiment;
 pub mod resilience;

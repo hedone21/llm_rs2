@@ -1,0 +1,17 @@
+{
+  "name": "thermal_critical_at_32",
+  "description": "Thermal Critical at token 32 — strong throttle test",
+  "signals": [
+    {
+      "at_token": 32,
+      "signal": {
+        "thermal_alert": {
+          "level": "critical",
+          "temperature_mc": 48000,
+          "throttling_active": true,
+          "throttle_ratio": 0.3
+        }
+      }
+    }
+  ]
+}
