@@ -1,6 +1,6 @@
 {
-  "name": "thermal_critical_at_32",
-  "description": "Thermal Critical at token 32 — strong throttle test",
+  "name": "T-C-32",
+  "description": "Thermal Critical at token 32 — strong throttle (delay_ms=70, LimitTokens=64)",
   "signals": [
     {
       "at_token": 32,

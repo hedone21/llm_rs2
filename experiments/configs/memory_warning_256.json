@@ -1,0 +1,16 @@
+{
+  "name": "M-W-256",
+  "description": "Memory Warning at token 256 — mild eviction (target_ratio=0.85)",
+  "signals": [
+    {
+      "at_token": 256,
+      "signal": {
+        "memory_pressure": {
+          "level": "warning",
+          "available_bytes": 100000000,
+          "reclaim_target_bytes": 50000000
+        }
+      }
+    }
+  ]
+}

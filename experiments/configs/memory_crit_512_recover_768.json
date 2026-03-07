@@ -1,0 +1,26 @@
+{
+  "name": "R-CR-512-768",
+  "description": "Memory Critical at token 512, Normal recovery at token 768",
+  "signals": [
+    {
+      "at_token": 512,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 768,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    }
+  ]
+}

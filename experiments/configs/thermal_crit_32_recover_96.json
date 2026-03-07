@@ -1,0 +1,28 @@
+{
+  "name": "T-CR-32-96",
+  "description": "Thermal Critical at token 32, Normal recovery at token 96",
+  "signals": [
+    {
+      "at_token": 32,
+      "signal": {
+        "thermal_alert": {
+          "level": "critical",
+          "temperature_mc": 48000,
+          "throttling_active": true,
+          "throttle_ratio": 0.3
+        }
+      }
+    },
+    {
+      "at_token": 96,
+      "signal": {
+        "thermal_alert": {
+          "level": "normal",
+          "temperature_mc": 35000,
+          "throttling_active": false,
+          "throttle_ratio": 1.0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "E-32",
+  "description": "Energy Emergency at token 32 — triggers Suspend + RejectNew",
+  "signals": [
+    {
+      "at_token": 32,
+      "signal": {
+        "energy_constraint": {
+          "level": "emergency",
+          "reason": "battery_critical",
+          "power_budget_mw": 0
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "name": "M-CR-256-384",
+  "description": "Memory Critical at token 256, Normal recovery at token 384",
+  "signals": [
+    {
+      "at_token": 256,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    },
+    {
+      "at_token": 384,
+      "signal": {
+        "memory_pressure": {
+          "level": "normal",
+          "available_bytes": 500000000,
+          "reclaim_target_bytes": 0
+        }
+      }
+    }
+  ]
+}

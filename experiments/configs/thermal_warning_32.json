@@ -1,0 +1,17 @@
+{
+  "name": "T-W-32",
+  "description": "Thermal Warning at token 32 — mild throttle (SwitchBackend(Cpu) only)",
+  "signals": [
+    {
+      "at_token": 32,
+      "signal": {
+        "thermal_alert": {
+          "level": "warning",
+          "temperature_mc": 42000,
+          "throttling_active": false,
+          "throttle_ratio": 1.0
+        }
+      }
+    }
+  ]
+}

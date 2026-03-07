@@ -1,0 +1,16 @@
+{
+  "name": "R-C-768",
+  "description": "Memory Critical at token 768 — late eviction for RSS measurement",
+  "signals": [
+    {
+      "at_token": 768,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}
