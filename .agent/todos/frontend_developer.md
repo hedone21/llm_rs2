@@ -5,6 +5,33 @@
 
 ---
 
+## [P0] Experiment 분석 스크립트 구현
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: Rust Dev의 Experiment Mode 구현 완료 (JSONL 스키마 확정)
+- **Description**: 실험 결과 JSONL을 분석하여 속도/품질/리소스 메트릭을 계산하고 보고서를 생성하는 Python 스크립트 세트
+- **Acceptance Criteria**:
+  - `experiments/analysis/quality_metrics.py`: FDT, EMR, Suffix EMR, ROUGE-L, BLEU-4, Top-K Overlap 계산
+  - `experiments/analysis/compare.py`: baseline vs experiment 비교, 속도/품질/리소스 메트릭 출력, Markdown 보고서 생성
+  - `experiments/analysis/round_report.py`: Round 전체 요약 테이블 (ID, Signal, Evict, TBT%, EMR, FDT, ROUGE-L, RSS, ...)
+  - `experiments/analysis/requirements.txt`: rouge-score, nltk, matplotlib
+  - JSONL 파싱: per-token 레코드 + _summary 레코드 처리
+- **Notes**: `experiments/PLAN.md` Section 6 참조. quality_metrics.py가 핵심 라이브러리
+
+## [P0] Experiment 시각화 스크립트 구현
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: compare.py 구현 완료
+- **Description**: 실험 결과를 시각화하는 matplotlib 기반 그래프 생성 스크립트
+- **Acceptance Criteria**:
+  - `experiments/analysis/plot_tbt_timeline.py`: X=토큰위치, Y=TBT(ms). baseline 밴드 + 실험 라인 + 신호 주입 수직선 + eviction 마커
+  - `experiments/analysis/plot_rss_timeline.py`: X=토큰위치, Y=RSS(MB). eviction 전후 drop 관측
+  - 출력: `experiments/reports/plots/` PNG 파일
+  - 다중 실험 겹쳐 그리기 지원 (`--experiments exp1.jsonl exp2.jsonl`)
+- **Notes**: `experiments/PLAN.md` Section 6.3 참조
+
+---
+
 ## [P2] Thermal throttling 감지 및 알림 UI
 - **Status**: TODO
 - **Sprint**: next

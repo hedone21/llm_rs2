@@ -5,13 +5,41 @@
 
 ---
 
-## [P2] IPC Transport 문서화
+## [P0] Experiment 프레임워크 사용 가이드
 - **Status**: TODO
 - **Sprint**: current
+- **Dependencies**: Rust Dev의 Experiment Mode, Frontend Dev의 분석 스크립트 완료
+- **Description**: Resilience 실험 프레임워크 사용법 문서화. `docs/28_experiment_guide.md`
+- **Acceptance Criteria**:
+  - 실험 목적과 설계 원칙 설명
+  - CLI 플래그 레퍼런스 (--experiment-schedule, --experiment-output, --experiment-sample-interval, --greedy)
+  - 스케줄 JSON 포맷 명세 + 작성 가이드
+  - JSONL 출력 스키마 명세 (per-token + summary)
+  - 분석 스크립트 사용법 (compare.py, round_report.py, plot_*.py)
+  - 품질 메트릭 설명 (FDT, EMR, ROUGE-L, BLEU-4, Top-K Overlap)
+  - end-to-end 예제 워크플로우
+- **Notes**: `experiments/PLAN.md`를 기반으로 사용자 가이드 형태로 재구성
+
+## [P0] Experiment FINDINGS 기록
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 각 Round 실험 완료 시마다
+- **Description**: 각 Round 실험 완료 후 `experiments/FINDINGS.md`에 가설/결과/인사이트/다음 방향 기록
+- **Acceptance Criteria**:
+  - Round별 섹션 작성 (가설, 결과 수치, 인사이트, 다음 실험 방향)
+  - 핵심 수치 데이터 포함 (EMR, FDT, TBT%, RSS delta 등)
+  - 이전 Round와의 연결성 기술
+- **Notes**: 실험 실행과 병행하여 지속적으로 업데이트
+
+---
+
+## [P2] IPC Transport 문서화
+- **Status**: TODO
+- **Sprint**: next
 - **Dependencies**: 없음 (IPC Transport 구현 완료)
 - **Description**: SignalTransport 추상화 계층 문서화. D-Bus(Linux) vs UnixSocket(Android) 선택 로직, 메시지 포맷, 설정 방법, 트러블슈팅
 - **Acceptance Criteria**: 플랫폼별 설정 가이드, 메시지 포맷 명세, 문제 해결 가이드
-- **Notes**: docs/20_dbus_ipc_spec.md 업데이트 또는 별도 문서. 블로커 해소 → current로 승격
+- **Notes**: docs/20_dbus_ipc_spec.md 업데이트 또는 별도 문서
 
 ## [P2] Manager 서비스 운영 가이드
 - **Status**: TODO
