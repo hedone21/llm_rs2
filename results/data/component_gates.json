@@ -1,14 +1,14 @@
 {
-  "timestamp": "2026-03-08T12:16:13.564422",
+  "timestamp": "2026-03-08T14:15:56.136562",
   "overall_gate": "FAIL",
   "summary": {
     "total_components": 23,
     "pass": 18,
-    "fail": 1,
+    "fail": 0,
     "blocked": 1,
     "skip": 0,
-    "na": 3,
-    "pass_rate": 90.0
+    "na": 4,
+    "pass_rate": 94.7
   },
   "tiers": {
     "T1": {
@@ -253,11 +253,11 @@
           "name": "UnifiedBuffer",
           "module": "buffer::unified_buffer",
           "maturity": "Stable",
-          "total_tests": 1,
+          "total_tests": 0,
           "passed": 0,
-          "failed": 1,
+          "failed": 0,
           "skipped": 0,
-          "gate": "FAIL"
+          "gate": "N/A"
         }
       ]
     }
@@ -535,6 +535,13 @@
       "passed": 209,
       "failed": 1,
       "pass_rate": 99.5
+    },
+    {
+      "date": "2026-03-08T14:15:56",
+      "total": 209,
+      "passed": 209,
+      "failed": 0,
+      "pass_rate": 100.0
     }
   ]
 }
