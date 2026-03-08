@@ -120,7 +120,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-07 22:20:18_
+_Last updated: 2026-03-08 11:53:19_
 
 ### Quality Gate Summary
 
@@ -134,7 +134,7 @@ _Last updated: 2026-03-07 22:20:18_
 | Tensor | T1 | Stable | 6 | 6 | 0 | PASS |
 | Attention | T2 | Stable | 5 | 5 | 0 | PASS |
 | CacheManager | T2 | Stable | 13 | 13 | 0 | PASS |
-| H2OPolicy | T2 | Stable | 13 | 13 | 0 | PASS |
+| H2OPolicy | T2 | Stable | 10 | 10 | 0 | PASS |
 | KVCache | T2 | Stable | 15 | 15 | 0 | PASS |
 | NoEvictionPolicy | T2 | Stable | 3 | 3 | 0 | PASS |
 | OperatingMode | T2 | Stable | 5 | 5 | 0 | PASS |
@@ -148,9 +148,9 @@ _Last updated: 2026-03-07 22:20:18_
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 0 | 0 | 0 | N/A |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
-| **Overall** | | | **136** | **135** | **0** | **FAIL** |
-| Integration | - | - | 74 | 74 | PASS |
+| UnifiedBuffer | T4 | Stable | 2 | 0 | 0 | **FAIL** |
+| **Overall** | | | **134** | **132** | **0** | **FAIL** |
+| Integration | - | - | 77 | 77 | PASS |
 
 ### Test Details
 
@@ -202,18 +202,15 @@ _Last updated: 2026-03-07 22:20:18_
 | `test_policy_name` | CacheManager | PASS |
 | `test_sliding_window_with_memory_pressure` | CacheManager | PASS |
 | `test_target_ratio_clamping` | CacheManager | PASS |
+| `test_budget_split_50_50` | H2OPolicy | PASS |
 | `test_evict_below_threshold_noop` | H2OPolicy | PASS |
-| `test_evict_fallback_with_recent_window` | H2OPolicy | PASS |
-| `test_evict_falls_back_to_sliding` | H2OPolicy | PASS |
-| `test_evict_with_prefix` | H2OPolicy | PASS |
-| `test_evict_with_scores_fallback` | H2OPolicy | PASS |
-| `test_evict_with_scores_preserves_prefix` | H2OPolicy | PASS |
+| `test_evict_fallback_keeps_recent` | H2OPolicy | PASS |
+| `test_evict_fallback_works` | H2OPolicy | PASS |
+| `test_evict_preserves_prefix` | H2OPolicy | PASS |
+| `test_high_hh_ratio` | H2OPolicy | PASS |
 | `test_name` | H2OPolicy | PASS |
-| `test_recent_window_covers_all_evictable` | H2OPolicy | PASS |
-| `test_recent_window_exceeds_budget` | H2OPolicy | PASS |
-| `test_recent_window_order_preservation` | H2OPolicy | PASS |
-| `test_recent_window_protection` | H2OPolicy | PASS |
-| `test_recent_window_zero_backward_compat` | H2OPolicy | PASS |
+| `test_no_eviction_when_below_target` | H2OPolicy | PASS |
+| `test_order_preservation` | H2OPolicy | PASS |
 | `test_should_evict_always_false` | H2OPolicy | PASS |
 | `test_cache_creation` | KVCache | PASS |
 | `test_dynamic_growth_basic` | KVCache | PASS |
@@ -291,15 +288,19 @@ _Last updated: 2026-03-07 22:20:18_
 | `test_workspace_scores_size` | LayerWorkspace | PASS |
 | `test_workspace_small_config` | LayerWorkspace | PASS |
 | `test_workspace_tensors_writable` | LayerWorkspace | PASS |
+| `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
 | `test_unmap_and_remap` | UnifiedBuffer | **FAIL** |
 | `default_config_all_monitors_enabled` | Integration | PASS |
 | `parse_external_config` | Integration | PASS |
 | `parse_full_config` | Integration | PASS |
 | `parse_minimal_toml` | Integration | PASS |
-| `test_accumulate_multi_layer` | Integration | PASS |
+| `test_accumulate_multi_layer_uses_max` | Integration | PASS |
 | `test_accumulate_single_layer` | Integration | PASS |
+| `test_cumulative_across_steps` | Integration | PASS |
 | `test_decay` | Integration | PASS |
+| `test_end_step_without_begin_step` | Integration | PASS |
 | `test_inactive_no_accumulation` | Integration | PASS |
+| `test_per_layer_max_preserves_critical_tokens` | Integration | PASS |
 | `test_reset` | Integration | PASS |
 | `test_should_track_layer` | Integration | PASS |
 | `emit_without_client_is_noop` | Integration | PASS |
@@ -375,7 +376,6 @@ _Last updated: 2026-03-07 22:20:18_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-02T23:49:42 | 85 | 85 | 0 | 100.0% |
 | 2026-03-02T23:49:47 | 85 | 85 | 0 | 100.0% |
 | 2026-03-02T23:49:52 | 88 | 85 | 3 | 96.6% |
 | 2026-03-02T23:49:57 | 88 | 85 | 3 | 96.6% |
@@ -395,4 +395,5 @@ _Last updated: 2026-03-07 22:20:18_
 | 2026-03-07T21:52:38 | 209 | 209 | 0 | 100.0% |
 | 2026-03-07T22:19:33 | 209 | 209 | 0 | 100.0% |
 | 2026-03-07T22:20:18 | 210 | 209 | 1 | 99.5% |
+| 2026-03-08T11:53:19 | 211 | 209 | 2 | 99.1% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->
