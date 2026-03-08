@@ -278,3 +278,176 @@ def compute_topk_overlap(base_tokens, exp_tokens, k=10):
             overlaps.append(overlap)
 
     return overlaps
+
+
+# =============================================================================
+# Benchmark evaluation metrics (NIAH, QA)
+# =============================================================================
+
+
+def evaluate_niah_retrieval(generated_text, expected_answer):
+    """Evaluate NIAH retrieval accuracy.
+
+    Checks whether the expected answer appears in the generated text.
+    Also computes a partial retrieval score using LCS.
+
+    Args:
+        generated_text: Model-generated text string.
+        expected_answer: The needle information to retrieve.
+
+    Returns:
+        Dict with "success" (bool), "accuracy" (0 or 1),
+        "retrieval_score" (float 0.0-1.0 based on LCS).
+    """
+    normalized_gen = _normalize_answer(generated_text)
+    normalized_ans = _normalize_answer(expected_answer)
+
+    success = normalized_ans in normalized_gen
+
+    # Partial score via LCS ratio
+    gen_words = normalized_gen.split()
+    ans_words = normalized_ans.split()
+    if ans_words:
+        lcs_len = _lcs_length(gen_words, ans_words)
+        retrieval_score = lcs_len / len(ans_words)
+    else:
+        retrieval_score = 1.0 if not gen_words else 0.0
+
+    return {
+        "success": success,
+        "accuracy": 1 if success else 0,
+        "retrieval_score": retrieval_score,
+    }
+
+
+def compute_f1_score(prediction, reference):
+    """Token-level F1 score for QA evaluation.
+
+    Tokenizes by whitespace, computes precision and recall of token overlap.
+
+    Args:
+        prediction: Predicted answer string.
+        reference: Ground-truth answer string.
+
+    Returns:
+        Dict with "precision", "recall", "f1" float values.
+    """
+    pred_tokens = _normalize_answer(prediction).split()
+    ref_tokens = _normalize_answer(reference).split()
+
+    if not pred_tokens and not ref_tokens:
+        return {"precision": 1.0, "recall": 1.0, "f1": 1.0}
+    if not pred_tokens or not ref_tokens:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    common = Counter(pred_tokens) & Counter(ref_tokens)
+    num_common = sum(common.values())
+
+    if num_common == 0:
+        return {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    precision = num_common / len(pred_tokens)
+    recall = num_common / len(ref_tokens)
+    f1 = 2 * precision * recall / (precision + recall)
+
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def compute_exact_match(prediction, reference):
+    """Exact match after normalization.
+
+    Args:
+        prediction: Predicted answer string.
+        reference: Ground-truth answer string.
+
+    Returns:
+        1 if normalized strings match, 0 otherwise.
+    """
+    return 1 if _normalize_answer(prediction) == _normalize_answer(reference) else 0
+
+
+def _normalize_answer(text):
+    """Normalize answer text for comparison.
+
+    Lowercases, removes punctuation and extra whitespace.
+
+    Args:
+        text: Input text string.
+
+    Returns:
+        Normalized text string.
+    """
+    import re
+    import string
+
+    text = text.lower()
+    # Remove punctuation
+    text = text.translate(str.maketrans("", "", string.punctuation))
+    # Remove extra whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def compute_logit_entropy(token_records, k=10):
+    """Compute per-token entropy from top_logits.
+
+    Uses softmax over the top-K logits to estimate entropy.
+
+    Args:
+        token_records: List of token record dicts with top_logits.
+        k: Number of top logits to use.
+
+    Returns:
+        List of entropy values per token position.
+    """
+    entropies = []
+    for rec in token_records:
+        logits_raw = rec.get("top_logits", [])
+        if not logits_raw:
+            entropies.append(0.0)
+            continue
+
+        logit_values = [entry[1] for entry in logits_raw[:k]]
+        # Softmax
+        max_logit = max(logit_values)
+        exp_logits = [math.exp(v - max_logit) for v in logit_values]
+        sum_exp = sum(exp_logits)
+        probs = [e / sum_exp for e in exp_logits]
+
+        # Entropy: -sum(p * log(p))
+        entropy = 0.0
+        for p in probs:
+            if p > 0:
+                entropy -= p * math.log(p)
+        entropies.append(entropy)
+
+    return entropies
+
+
+def compute_baseline_token_rank(base_tokens, exp_tokens, k=10):
+    """For each position, find the rank of the baseline token in experiment top_logits.
+
+    Args:
+        base_tokens: Baseline token records.
+        exp_tokens: Experiment token records.
+        k: Top-K logits available.
+
+    Returns:
+        List of ranks (1-based, k+1 if not found) per position.
+    """
+    min_len = min(len(base_tokens), len(exp_tokens))
+    ranks = []
+
+    for i in range(min_len):
+        base_tid = base_tokens[i]["token_id"]
+        exp_logits = exp_tokens[i].get("top_logits", [])
+
+        rank = k + 1  # Not found default
+        for j, entry in enumerate(exp_logits[:k]):
+            if entry[0] == base_tid:
+                rank = j + 1
+                break
+
+        ranks.append(rank)
+
+    return ranks

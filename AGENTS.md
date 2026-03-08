@@ -121,6 +121,23 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/25_troubleshooting.md` — Troubleshooting guide
 - `docs/26_api_reference.md` — Resilience API reference
 - `docs/27_manager_architecture.md` — Manager service internal architecture (3-layer, OCP PolicyEngine)
+- `docs/30_evaluation_methodology.md` — KV Cache Eviction evaluation methodology (related work survey + benchmark design)
+
+## Experiment Benchmarks
+
+Benchmark prompts for KV cache eviction evaluation in `experiments/prompts/`:
+
+```bash
+# Perplexity: 5 domain prompts (PPL-01 ~ PPL-05)
+# NIAH: Parameterized needle-in-a-haystack prompts
+python experiments/prompts/assemble_niah.py --needle N-PASS --depth 0.25 --blocks 4
+python experiments/prompts/assemble_niah.py --all --output niah_all.json
+
+# QA: LongBench-style single-doc QA, summarization, few-shot, multi-hop
+# All prompts defined in experiments/prompts/benchmark_prompts.json
+```
+
+See `experiments/PLAN.md` Section 10 for experiment matrix (Round 10-12).
 
 ## Device Registry
 

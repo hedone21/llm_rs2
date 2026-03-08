@@ -1,0 +1,16 @@
+{
+  "name": "NIAH-evict-at-5",
+  "description": "NIAH evaluation: trigger eviction at token 5 to test KV cache information retention",
+  "signals": [
+    {
+      "at_token": 5,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}

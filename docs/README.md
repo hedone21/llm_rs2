@@ -9,6 +9,7 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 00-13 | Core Engine | 빌드, 설계, 추상화, 백엔드, 모델, 추론 |
 | 14-15 | Quality & Testing | 컴포넌트 품질 게이트, 테스트 전략 |
 | 20-26 | Resilience | D-Bus IPC, 아키텍처, 통합, 테스트, 사용 가이드, API |
+| 30+ | Evaluation | 평가 방법론, 벤치마크 |
 
 ## 문서 목록
 
@@ -37,6 +38,8 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 24 | [24_resilience_usage_guide.md](24_resilience_usage_guide.md) | Resilience 시스템 사용 가이드 |
 | 25 | [25_troubleshooting.md](25_troubleshooting.md) | 트러블슈팅 가이드 |
 | 26 | [26_api_reference.md](26_api_reference.md) | Resilience API 레퍼런스 |
+| 27 | [27_manager_architecture.md](27_manager_architecture.md) | Manager 서비스 내부 아키텍처 |
+| 30 | [30_evaluation_methodology.md](30_evaluation_methodology.md) | KV Cache Eviction 평가 방법론 |
 
 ## 추천 읽기 순서
 
@@ -47,3 +50,5 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 **Resilience 기능 관련**: 20 -> 21 -> 22 -> 24 -> 25 -> 26
 
 **특정 주제 심층 탐구**: OpenCL (06 -> 07 -> 08 -> 09), KV Cache (11), Hybrid (12)
+
+**평가/벤치마크**: 30 -> experiments/prompts/README.md -> experiments/PLAN.md (Section 10)

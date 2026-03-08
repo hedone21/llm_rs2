@@ -688,7 +688,106 @@ experiments/
  다음 Round 설계 ─────────────► 가설 수립
 ```
 
-## 10. 구현 순서
+## 10. 벤치마크 평가 (Round 10-12)
+
+> 방법론 상세: [docs/30_evaluation_methodology.md](../docs/30_evaluation_methodology.md)
+> 프롬프트: [experiments/prompts/](prompts/)
+
+기존 Round 1-9는 Resilience 시스템의 동작 검증에 집중했다.
+Round 10-12는 KV cache eviction의 **디코딩 정확도**를 학술적으로 평가한다.
+
+### 평가 프레임워크
+
+3-Tier 체계로 관련 논문 (H2O, StreamingLLM, SnapKV, PyramidKV 등)의
+표준 평가 방법론을 채택.
+
+| Tier | 벤치마크 | 참고 논문 | 측정 대상 |
+|------|---------|----------|----------|
+| 1 | **Perplexity** | StreamingLLM, ScissorHands, Quest | 토큰 예측 분포 품질 |
+| 2 | **NIAH** | SnapKV, PyramidKV, MInference | 정보 검색 정확도 |
+| 3 | **LongBench-style QA** | SnapKV, PyramidKV, KIVI | 태스크 수행 능력 |
+
+### Round 10: Perplexity 평가
+
+**프롬프트**: PPL-01 ~ PPL-05 (5개 도메인)
+
+| 도메인 | ID | 설명 |
+|--------|-----|------|
+| Literary | PPL-01 | 문학 작품 스타일 서사 |
+| Encyclopedic | PPL-02 | 백과사전/과학 설명문 |
+| Technical | PPL-03 | 알고리즘/자료구조 기술 문서 |
+| Conversational | PPL-04 | 대화체 일상 설명 |
+| News | PPL-05 | 뉴스 기사 보도문 |
+
+**실험 매트릭스** (5 프롬프트 × 3 길이 × 3 정책 = 45 실험):
+
+| 변수 | 값 |
+|------|------|
+| 생성 길이 | 512, 1024, 2048 토큰 |
+| Eviction 정책 | none (baseline), sliding, h2o |
+| 신호 주입 | 50% 위치에서 memory_critical |
+
+**메트릭**:
+- EMR (기존)
+- Top-K Overlap (기존)
+- ROUGE-L, BLEU-4 (기존)
+- Baseline Token Rank (신규): eviction 실행에서 baseline 토큰의 순위
+- Entropy Ratio (신규): eviction 후 logit 엔트로피 변화
+
+### Round 11: Needle-in-a-Haystack (NIAH)
+
+**프롬프트**: assemble_niah.py로 자동 조합
+
+| 변수 | 값 |
+|------|------|
+| Needle 유형 | passkey, fact, name, date, statistic (5종) |
+| Needle 깊이 | 10%, 25%, 50%, 75%, 90% |
+| 컨텍스트 길이 | 4 blocks (~256 tok), 6 blocks (~512 tok), 8 blocks (~1024 tok) |
+| Eviction 정책 | sliding, h2o |
+| 신호 주입 | 생성 1 토큰에서 memory_critical (즉시 eviction) |
+
+**핵심 가설**:
+- Sliding window: needle이 window 밖이면 반드시 검색 실패
+- H2O: needle의 attention score가 높으면 보존 → 검색 성공 가능
+- 깊은 needle(75-90%)은 sliding에서도 보존 (최근 window에 가까움)
+
+**메트릭**: Retrieval Accuracy (binary), Retrieval Score (LCS ratio)
+
+**전체**: 5 needle × 5 depth × 3 length × 2 policy = **150 실험**
+(축소 운영: passkey + fact 2종 × 5 depth × 2 length × 2 policy = **40 실험**)
+
+### Round 12: LongBench-style QA
+
+**프롬프트**: benchmark_prompts.json의 qa 섹션
+
+| 카테고리 | 프롬프트 수 | 메트릭 |
+|---------|-----------|--------|
+| Single-doc QA | 3 | F1, EM |
+| Summarization | 2 | ROUGE-L |
+| Few-shot | 3 | Accuracy |
+| Multi-hop | 2 | F1 |
+
+**실험 매트릭스** (10 프롬프트 × 3 정책 = 30 실험):
+
+| 변수 | 값 |
+|------|------|
+| Eviction 정책 | none (baseline), sliding, h2o |
+| 신호 주입 | 생성 5 토큰에서 memory_critical |
+
+**메트릭**: F1, Exact Match, ROUGE-L
+
+### 베이스라인 비교 (논문 표준)
+
+모든 Round에서 다음 4개 베이스라인을 비교:
+
+| # | 베이스라인 | 설명 |
+|---|----------|------|
+| 1 | Full KV cache | 압축 없음 (상한선) |
+| 2 | Sliding window | 최근 N 토큰만 유지 (SlidingWindowPolicy) |
+| 3 | H2O | Heavy hitter + recent (H2OPolicy) |
+| 4 | Random eviction | 랜덤 제거 (하한선, ablation용 — 향후 구현) |
+
+## 11. 구현 순서
 
 ### Phase A: CLI 기반 실험 인프라 (Step 1~5)
 
