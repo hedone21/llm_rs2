@@ -129,6 +129,41 @@
         "needle_text": "According to the internal report, the system achieved a throughput of exactly 3,847 transactions per second during peak load testing.",
         "question": "What throughput did the system achieve during peak load testing? The throughput was",
         "expected_answer": "3,847 transactions per second"
+      },
+      {
+        "id": "N-P3",
+        "type": "passkey",
+        "needle_text": "The verification code for the secure terminal is 729. Remember this code: 729.",
+        "question": "What is the verification code for the secure terminal? The verification code is",
+        "expected_answer": "729"
+      },
+      {
+        "id": "N-P10",
+        "type": "passkey",
+        "needle_text": "The encrypted session key for the classified network is 3847291056. Remember this key: 3847291056.",
+        "question": "What is the encrypted session key for the classified network? The session key is",
+        "expected_answer": "3847291056"
+      },
+      {
+        "id": "N-P20",
+        "type": "passkey",
+        "needle_text": "The master authentication token for the global infrastructure is 38472910564813927605. Remember this token: 38472910564813927605.",
+        "question": "What is the master authentication token for the global infrastructure? The authentication token is",
+        "expected_answer": "38472910564813927605"
+      },
+      {
+        "id": "N-NUM",
+        "type": "number",
+        "needle_text": "The final result of the statistical analysis was exactly 42. This number was verified independently by three separate teams.",
+        "question": "What was the final result of the statistical analysis? The result was",
+        "expected_answer": "42"
+      },
+      {
+        "id": "N-DATE2",
+        "type": "date",
+        "needle_text": "The historic milestone was achieved on July 20, 1969, when the team completed the first successful deployment of the system.",
+        "question": "When was the historic milestone achieved? The milestone was achieved on",
+        "expected_answer": "July 20, 1969"
       }
     ],
 

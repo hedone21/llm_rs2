@@ -148,6 +148,11 @@ struct Args {
     /// Force greedy sampling (temperature=0) for reproducibility
     #[arg(long, default_value_t = false)]
     greedy: bool,
+
+    /// Override eviction target_ratio from resilience signals (experiment mode).
+    /// When set, all Evict actions will use this ratio instead of the strategy default.
+    #[arg(long)]
+    experiment_eviction_ratio: Option<f32>,
 }
 
 fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
@@ -699,14 +704,16 @@ fn main() -> anyhow::Result<()> {
                     action_names.push(action_summary(&action));
 
                     if let ResilienceAction::Evict { target_ratio } = &action {
+                        let effective_ratio =
+                            args.experiment_eviction_ratio.unwrap_or(*target_ratio);
                         let result = if let Some(ref acc) = score_accumulator {
                             cache_manager.force_evict_with_scores(
                                 &mut kv_caches,
-                                *target_ratio,
+                                effective_ratio,
                                 acc.importance_scores(),
                             )
                         } else {
-                            cache_manager.force_evict(&mut kv_caches, *target_ratio)
+                            cache_manager.force_evict(&mut kv_caches, effective_ratio)
                         };
                         match result {
                             Ok(r) if r.evicted => {
