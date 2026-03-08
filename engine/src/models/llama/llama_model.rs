@@ -395,6 +395,11 @@ impl LlamaModel {
             }
         }
 
+        // Flush step-local importance (per-layer MAX) into cumulative importance
+        if let Some(ref mut acc) = score_accumulator {
+            acc.end_step();
+        }
+
         // 2.5 Dynamic KV cache eviction (if configured)
         let eviction_result = if let Some(cm) = args.cache_manager {
             let result = if let Some(ref acc) = score_accumulator {

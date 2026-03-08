@@ -5,33 +5,33 @@ use anyhow::Result;
 /// H2O (Heavy-Hitter Oracle) eviction policy — attention score-based KV cache eviction.
 ///
 /// Implements the 3-partition model from the H2O paper:
-///   [Protected Prefix] [Heavy Hitters (score-ranked)] [Recent Window (always protected)]
+///   [Protected Prefix] [Heavy Hitters (score-ranked)] [Recent Window]
 ///
 /// - **Protected Prefix**: First N tokens (attention sinks / system prompt) are never evicted.
-/// - **Recent Window**: Last M tokens are always protected regardless of their scores,
-///   ensuring recent context is preserved for coherent generation.
-/// - **Heavy Hitters**: Among the remaining (evictable) tokens, the top-K by cumulative
-///   attention score are retained; the rest are evicted.
+/// - **Heavy Hitters**: Tokens with highest cumulative attention scores.
+/// - **Recent Window**: Most recent M tokens, always protected.
 ///
-/// When `recent_window=0`, the recent partition is empty and all non-prefix tokens
-/// compete purely on score (backward-compatible with the previous implementation).
+/// Budget allocation (following the paper): after reserving prefix, the remaining
+/// `keep` slots are split between HH and Recent by `keep_ratio`:
+///   - `hh_budget = available * keep_ratio`
+///   - `recent_budget = available - hh_budget`
+///
+/// With `keep_ratio=0.5` (default), this produces the paper's recommended 50:50 split.
 ///
 /// Reference: "H2O: Heavy-Hitter Oracle for Efficient Generative Inference of
 /// Large Language Models" (Zhang et al., 2023)
 pub struct H2OPolicy {
-    /// Number of recent tokens always protected from eviction
-    recent_window: usize,
-    /// Fraction of tokens to keep (0.0 to 1.0), determines heavy hitter budget
+    /// Fraction of available budget allocated to heavy hitters (0.0 to 1.0).
+    /// Default 0.5 = paper's 50:50 HH:Recent split.
     keep_ratio: f32,
     /// Number of prefix tokens to always protect (attention sinks)
     protected_prefix: usize,
 }
 
 impl H2OPolicy {
-    pub fn new(recent_window: usize, keep_ratio: f32, protected_prefix: usize) -> Self {
+    pub fn new(_recent_window: usize, keep_ratio: f32, protected_prefix: usize) -> Self {
         let protected_prefix = protected_prefix.max(4);
         Self {
-            recent_window,
             keep_ratio: keep_ratio.clamp(0.0, 1.0),
             protected_prefix,
         }
@@ -49,40 +49,28 @@ impl EvictionPolicy for H2OPolicy {
 
     fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
         let current = cache.current_pos;
-        // Compute recent window boundary
-        let recent_start = self
-            .protected_prefix
-            .max(current.saturating_sub(self.recent_window));
-        let recent_count = current - recent_start;
-
-        let max_keep =
-            ((current as f32) * self.keep_ratio) as usize + self.protected_prefix + recent_count;
-        let min_keep = (self.protected_prefix + recent_count + 16).min(max_keep);
-        let keep = target_len.clamp(min_keep, max_keep);
+        let keep = target_len.max(self.protected_prefix + 2);
 
         if current <= keep {
             return Ok(());
         }
 
-        // Fallback: without attention scores, remove oldest tokens from the
-        // evictable range (prefix..recent_start), preserving both prefix and recent window.
-        log::debug!(
-            "H2O (fallback): sliding window eviction, removing {} tokens (recent_window={})",
-            current - keep,
-            self.recent_window
-        );
-
-        // Number of tokens to remove from the evictable zone
-        let evictable_count = recent_start - self.protected_prefix;
-        let desired_remove = current - keep;
-        let prune_count = desired_remove.min(evictable_count);
+        // Fallback: without attention scores, keep prefix + most recent tokens
+        let available = keep.saturating_sub(self.protected_prefix);
+        let recent_budget = available; // All budget goes to recent in fallback mode
+        let actual_recent = recent_budget.min(current - self.protected_prefix);
+        let prune_count = current - self.protected_prefix - actual_recent;
 
         if prune_count == 0 {
             return Ok(());
         }
 
-        // Shift: move [prefix+prune_count .. current) → [prefix ..)
-        // This preserves both the prefix tokens and the recent window tokens.
+        log::debug!(
+            "H2O (fallback): sliding window eviction, removing {} tokens (keep={})",
+            prune_count,
+            keep,
+        );
+
         let shape = cache.k_buffer.shape().dims();
         let heads = shape[2];
         let dim = shape[3];
@@ -93,14 +81,14 @@ impl EvictionPolicy for H2OPolicy {
             (
                 (self.protected_prefix + prune_count) * bpp,
                 self.protected_prefix * bpp,
-                (current - self.protected_prefix - prune_count) * bpp,
+                actual_recent * bpp,
             )
         } else {
             let epp = heads * dim;
             (
                 (self.protected_prefix + prune_count) * epp,
                 self.protected_prefix * epp,
-                (current - self.protected_prefix - prune_count) * epp,
+                actual_recent * epp,
             )
         };
 
@@ -108,7 +96,7 @@ impl EvictionPolicy for H2OPolicy {
         backend.buffer_shift(&mut cache.k_buffer, src_off, dst_off, move_count)?;
         backend.buffer_shift(&mut cache.v_buffer, src_off, dst_off, move_count)?;
 
-        cache.current_pos -= prune_count;
+        cache.current_pos = self.protected_prefix + actual_recent;
 
         Ok(())
     }
@@ -120,28 +108,26 @@ impl EvictionPolicy for H2OPolicy {
         importance: &[f32],
     ) -> Result<()> {
         let current = cache.current_pos;
-
-        // 3-partition boundaries:
-        //   [0..prefix)  [prefix..recent_start)  [recent_start..current)
-        //    protected       evictable (score)       recent (protected)
-        let recent_start = self
-            .protected_prefix
-            .max(current.saturating_sub(self.recent_window));
-        let recent_count = current - recent_start;
-
-        let max_keep =
-            ((current as f32) * self.keep_ratio) as usize + self.protected_prefix + recent_count;
-        let min_keep = (self.protected_prefix + recent_count + 16).min(max_keep);
-        let keep = target_len.clamp(min_keep, max_keep);
+        let keep = target_len.max(self.protected_prefix + 2);
 
         if current <= keep {
             return Ok(());
         }
 
-        // Heavy hitter budget = total keep - prefix - recent
-        let hh_budget = keep
-            .saturating_sub(self.protected_prefix)
-            .saturating_sub(recent_count);
+        // Budget allocation (paper's approach):
+        // available = keep - prefix
+        // hh_budget = available * keep_ratio  (default 0.5 = 50:50)
+        // recent_budget = available - hh_budget
+        let available = keep.saturating_sub(self.protected_prefix);
+        let hh_budget = (available as f32 * self.keep_ratio) as usize;
+        let recent_budget = available - hh_budget;
+        let actual_recent = recent_budget.min(current - self.protected_prefix);
+
+        // Recent window boundary
+        let recent_start = current
+            .saturating_sub(actual_recent)
+            .max(self.protected_prefix);
+        let actual_recent = current - recent_start;
 
         log::debug!(
             "H2O: score-based eviction, keeping {}/{} tokens (prefix={}, hh={}, recent={})",
@@ -149,7 +135,7 @@ impl EvictionPolicy for H2OPolicy {
             current,
             self.protected_prefix,
             hh_budget,
-            recent_count,
+            actual_recent,
         );
 
         // 1. Rank evictable tokens (prefix..recent_start) by importance
@@ -170,7 +156,6 @@ impl EvictionPolicy for H2OPolicy {
         hh_positions.sort();
 
         // 4. Build final keep list: [prefix positions] ++ [heavy hitters] ++ [recent positions]
-        //    Prefix is already in place, so we only compact hh + recent after prefix.
         let recent_positions: Vec<usize> = (recent_start..current).collect();
 
         // 5. Compact the KV cache: [prefix..., heavy hitters in order..., recent in order...]
@@ -237,7 +222,6 @@ mod tests {
         cache
     }
 
-    /// Write a marker value at a given position so we can verify token identity.
     fn write_marker(cache: &mut KVCache, pos: usize, val: f32) {
         let shape = cache.k_buffer.shape().dims();
         let heads = shape[2];
@@ -271,119 +255,86 @@ mod tests {
 
     #[test]
     fn test_should_evict_always_false() {
-        // H2O is signal-driven: should_evict() never triggers automatic eviction.
-        let policy = H2OPolicy::new(5, 0.5, 0);
+        let policy = H2OPolicy::new(0, 0.5, 0);
         assert!(!policy.should_evict(&make_cache(20), 0));
         assert!(!policy.should_evict(&make_cache(1000), 0));
         assert!(!policy.should_evict(&make_cache(1), 0));
-
-        // Even with extreme settings
-        let policy_zero = H2OPolicy::new(0, 0.0, 0);
-        assert!(!policy_zero.should_evict(&make_cache(100), 0));
     }
 
     // ── evict (fallback) tests ──
 
     #[test]
-    fn test_evict_falls_back_to_sliding() {
+    fn test_evict_fallback_keeps_recent() {
         let _ = env_logger::try_init();
-        // recent_window=0, keep_ratio=0.5, prefix=4
+        // keep_ratio=0.5, prefix=4(clamped)
         let policy = H2OPolicy::new(0, 0.5, 0);
         let mut cache = make_cache(20);
-        // max_keep = 20*0.5 + 4 + 0 = 14
-        policy.evict(&mut cache, 10).unwrap();
-        assert_eq!(cache.current_pos, 14);
-    }
 
-    #[test]
-    fn test_evict_with_prefix() {
-        // recent_window=0, keep_ratio=0.5, prefix=4 (3→clamped to 4)
-        let policy = H2OPolicy::new(0, 0.5, 3);
-        let mut cache = make_cache(20);
-        // max_keep = 20*0.5 + 4 + 0 = 14
-        policy.evict(&mut cache, 13).unwrap();
-        assert_eq!(cache.current_pos, 14);
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32);
+        }
+
+        // target_len=10 → keep=10, available=10-4=6, all recent
+        // prune = 20-4-6 = 10
+        policy.evict(&mut cache, 10).unwrap();
+        assert_eq!(cache.current_pos, 10);
+
+        // Prefix intact
+        for i in 0..4 {
+            let (k, _) = read_marker(&cache, i);
+            assert_eq!(k, (i + 1) as f32);
+        }
+        // Most recent tokens at the end
+        let (k, _) = read_marker(&cache, 9);
+        assert_eq!(k, 20.0);
     }
 
     #[test]
     fn test_evict_below_threshold_noop() {
-        let policy = H2OPolicy::new(0, 0.9, 0);
+        let policy = H2OPolicy::new(0, 0.5, 0);
         let mut cache = make_cache(10);
         policy.evict(&mut cache, 10).unwrap();
         assert_eq!(cache.current_pos, 10);
     }
 
-    #[test]
-    fn test_evict_fallback_with_recent_window() {
-        let _ = env_logger::try_init();
-        // recent_window=5, keep_ratio=0.3, prefix=4
-        // current=20, recent_start=max(4, 20-5)=15, recent_count=5
-        // max_keep = 20*0.3 + 4 + 5 = 15
-        // evictable_count = 15-4 = 11, desired_remove = 20-15 = 5
-        let policy = H2OPolicy::new(5, 0.3, 0);
-        let mut cache = make_cache(20);
-
-        // Write markers to verify recent tokens survive
-        for i in 0..20 {
-            write_marker(&mut cache, i, (i + 1) as f32);
-        }
-
-        policy.evict(&mut cache, 10).unwrap();
-        assert_eq!(cache.current_pos, 15);
-
-        // Prefix (0-3) should be intact
-        for i in 0..4 {
-            let (k, _) = read_marker(&cache, i);
-            assert_eq!(k, (i + 1) as f32);
-        }
-
-        // Recent tokens (originally at positions 15-19) should be at the end
-        // After removing 5 tokens from evictable zone [4..15), positions shift:
-        // new pos 4..10 = old 9..15 (surviving evictable)
-        // new pos 10..15 = old 15..20 (recent window)
-        let (k, _) = read_marker(&cache, cache.current_pos - 1);
-        assert_eq!(k, 20.0); // last recent token
-    }
-
     // ── evict_with_scores tests ──
 
     #[test]
-    fn test_recent_window_protection() {
-        // Recent tokens with score=0 must still be kept
-        let policy = H2OPolicy::new(5, 0.3, 0); // prefix=4, recent=5
+    fn test_budget_split_50_50() {
+        // keep_ratio=0.5 → 50:50 HH:Recent split (paper default)
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4(clamped)
         let mut cache = make_cache(20);
 
         for i in 0..20 {
             write_marker(&mut cache, i, (i + 1) as f32);
         }
 
-        // Give high scores only to early tokens, zero to recent
+        // High scores on specific tokens
         let mut importance = vec![0.0f32; 100];
-        for i in 4..15 {
-            importance[i] = (20 - i) as f32;
+        importance[5] = 10.0;
+        importance[8] = 9.0;
+        importance[12] = 8.0;
+        for i in 4..20 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
         }
-        // positions 15-19 have importance 0.0 — but recent window protects them
 
-        // current=20, recent_start=15, recent_count=5
-        // max_keep = 20*0.3+4+5 = 15, min_keep = (4+5+16).min(15)=15
-        // hh_budget = 15-4-5 = 6
+        // target_len=10, keep=10, available=10-4=6
+        // hh_budget = 6*0.5 = 3, recent_budget = 3
+        // recent_start = max(4, 20-3) = 17
+        // evictable: positions 4..17 (13 tokens), keep top-3 by score
         policy
             .evict_with_scores(&mut cache, 10, &importance)
             .unwrap();
 
-        assert_eq!(cache.current_pos, 15); // 4 prefix + 6 hh + 5 recent
-
-        // Verify recent tokens are at the end (originally pos 15-19, marker 16-20)
-        for i in 0..5 {
-            let (k, _) = read_marker(&cache, cache.current_pos - 5 + i);
-            assert_eq!(k, (16 + i) as f32);
-        }
+        assert_eq!(cache.current_pos, 10); // 4 prefix + 3 hh + 3 recent
     }
 
     #[test]
-    fn test_recent_window_zero_backward_compat() {
-        // recent_window=0 should behave exactly like old implementation
-        let policy = H2OPolicy::new(0, 0.3, 0); // prefix=4, recent=0
+    fn test_high_hh_ratio() {
+        // keep_ratio=0.8 → 80% HH, 20% Recent
+        let policy = H2OPolicy::new(0, 0.8, 0); // prefix=4(clamped)
         let mut cache = make_cache(20);
 
         for i in 0..20 {
@@ -391,24 +342,44 @@ mod tests {
         }
 
         let mut importance = vec![0.0f32; 100];
-        importance[10] = 10.0;
-        importance[15] = 8.0;
-        importance[19] = 9.0;
         for i in 4..20 {
-            if importance[i] == 0.0 {
-                importance[i] = 0.1;
-            }
+            importance[i] = (20 - i) as f32; // higher scores for earlier tokens
         }
 
-        // max_keep = 20*0.3+4+0 = 10, hh_budget = 10-4-0 = 6
+        // target_len=14, keep=14, available=14-4=10
+        // hh_budget = 10*0.8 = 8, recent_budget = 2
+        // recent_start = max(4, 20-2) = 18
         policy
-            .evict_with_scores(&mut cache, 8, &importance)
+            .evict_with_scores(&mut cache, 14, &importance)
             .unwrap();
 
-        assert_eq!(cache.current_pos, 10);
+        assert_eq!(cache.current_pos, 14); // 4 prefix + 8 hh + 2 recent
+    }
+
+    #[test]
+    fn test_evict_preserves_prefix() {
+        let policy = H2OPolicy::new(0, 0.5, 5); // prefix=5
+        let mut cache = make_cache(30);
+
+        for i in 0..30 {
+            write_marker(&mut cache, i, (i + 1) as f32);
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        for i in 5..30 {
+            importance[i] = (30 - i) as f32;
+        }
+
+        // target_len=15, keep=15, available=15-5=10
+        // hh_budget=5, recent=5
+        policy
+            .evict_with_scores(&mut cache, 15, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 15);
 
         // Prefix intact
-        for i in 0..4 {
+        for i in 0..5 {
             let (k, v) = read_marker(&cache, i);
             assert_eq!(k, (i + 1) as f32);
             assert_eq!(v, (i + 1) as f32);
@@ -416,96 +387,50 @@ mod tests {
     }
 
     #[test]
-    fn test_recent_window_exceeds_budget() {
-        // When recent_window is large, hh_budget shrinks to 0
-        let policy = H2OPolicy::new(12, 0.3, 0); // prefix=4, recent=12
-        let mut cache = make_cache(20);
+    fn test_no_eviction_when_below_target() {
+        let policy = H2OPolicy::new(0, 0.5, 0);
+        let mut cache = make_cache(10);
+        let importance = vec![1.0f32; 100];
 
-        for i in 0..20 {
-            write_marker(&mut cache, i, (i + 1) as f32);
-        }
-
-        let mut importance = vec![0.0f32; 100];
-        for i in 4..20 {
-            importance[i] = (20 - i) as f32;
-        }
-
-        // recent_start = max(4, 20-12) = 8, recent_count = 12
-        // max_keep = 20*0.3+4+12 = 22 → current(20) <= 22, no eviction
         policy
-            .evict_with_scores(&mut cache, 8, &importance)
+            .evict_with_scores(&mut cache, 15, &importance)
             .unwrap();
 
-        assert_eq!(cache.current_pos, 20); // no eviction happened
+        assert_eq!(cache.current_pos, 10); // no eviction
     }
 
     #[test]
-    fn test_recent_window_covers_all_evictable() {
-        // recent_window >= current - prefix → no evictable tokens
-        let policy = H2OPolicy::new(20, 0.1, 0); // prefix=4, recent=20
-        let mut cache = make_cache(20);
-
-        let importance = vec![0.0f32; 100];
-
-        // recent_start = max(4, 20-20) = 4, recent_count = 16
-        // max_keep = 20*0.1+4+16 = 22 → no eviction
-        policy
-            .evict_with_scores(&mut cache, 5, &importance)
-            .unwrap();
-
-        assert_eq!(cache.current_pos, 20);
-    }
-
-    #[test]
-    fn test_evict_with_scores_preserves_prefix() {
-        let policy = H2OPolicy::new(0, 0.2, 5); // prefix=5, recent=0, keep_ratio=0.2
-        let mut cache = make_cache(30);
-
-        let mut importance = vec![0.0f32; 100];
-        for i in 5..30 {
-            importance[i] = (30 - i) as f32;
-        }
-
-        // max_keep = 30*0.2+5+0 = 11, hh_budget = 11-5-0 = 6
-        policy
-            .evict_with_scores(&mut cache, 8, &importance)
-            .unwrap();
-
-        assert_eq!(cache.current_pos, 11);
-    }
-
-    #[test]
-    fn test_recent_window_order_preservation() {
+    fn test_order_preservation() {
         // Verify final layout is [prefix][hh in position order][recent in position order]
-        let policy = H2OPolicy::new(4, 0.3, 0); // prefix=4, recent=4
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4(clamped)
         let mut cache = make_cache(20);
 
         for i in 0..20 {
             write_marker(&mut cache, i, (i * 100) as f32);
         }
 
-        // Evictable range: positions 4..16 (prefix=4, recent_start=16)
+        // Give distinctive scores to specific tokens
         let mut importance = vec![0.0f32; 100];
-        importance[15] = 10.0;
-        importance[5] = 9.0;
-        importance[10] = 8.0;
-        importance[7] = 7.0;
-        importance[12] = 6.0;
-        importance[6] = 5.0;
-        for i in 4..16 {
+        importance[5] = 10.0;
+        importance[10] = 9.0;
+        importance[7] = 8.0;
+        for i in 4..20 {
             if importance[i] == 0.0 {
                 importance[i] = 0.01;
             }
         }
 
-        // max_keep = 20*0.3+4+4 = 14, hh_budget = 14-4-4 = 6
+        // target=10, keep=10, available=6, hh=3, recent=3
+        // recent_start = max(4, 20-3) = 17
+        // Top 3 HH from evictable [4..17]: pos 5(10.0), 10(9.0), 7(8.0)
+        // Final layout: [0,1,2,3] [5,7,10] [17,18,19]
         policy
-            .evict_with_scores(&mut cache, 8, &importance)
+            .evict_with_scores(&mut cache, 10, &importance)
             .unwrap();
 
-        assert_eq!(cache.current_pos, 14); // 4 prefix + 6 hh + 4 recent
+        assert_eq!(cache.current_pos, 10);
 
-        // Markers should be in ascending original-position order throughout
+        // All markers should be in ascending position order
         let mut prev_marker = -1.0f32;
         for i in 0..cache.current_pos {
             let (k, _) = read_marker(&cache, i);
@@ -519,15 +444,15 @@ mod tests {
             prev_marker = k;
         }
 
-        // Verify last 4 are the recent tokens (originally 16,17,18,19)
-        for i in 0..4 {
-            let (k, _) = read_marker(&cache, cache.current_pos - 4 + i);
-            assert_eq!(k, ((16 + i) * 100) as f32);
+        // Last 3 should be recent tokens (originally 17, 18, 19)
+        for i in 0..3 {
+            let (k, _) = read_marker(&cache, cache.current_pos - 3 + i);
+            assert_eq!(k, ((17 + i) * 100) as f32);
         }
     }
 
     #[test]
-    fn test_evict_with_scores_fallback() {
+    fn test_evict_fallback_works() {
         let policy = H2OPolicy::new(0, 0.5, 0);
         let mut cache = make_cache(20);
         policy.evict(&mut cache, 10).unwrap();
@@ -536,6 +461,6 @@ mod tests {
 
     #[test]
     fn test_name() {
-        assert_eq!(H2OPolicy::new(5, 0.5, 0).name(), "h2o");
+        assert_eq!(H2OPolicy::new(0, 0.5, 0).name(), "h2o");
     }
 }

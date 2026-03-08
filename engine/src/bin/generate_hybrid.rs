@@ -70,20 +70,20 @@ struct Args {
     #[arg(long, default_value_t = 1024)]
     eviction_window: usize,
 
-    /// Number of recent tokens always protected from H2O eviction
-    #[arg(long, default_value_t = 128)]
+    /// Deprecated: recent window is now derived from budget split. Kept for CLI compatibility.
+    #[arg(long, default_value_t = 128, hide = true)]
     h2o_recent_window: usize,
 
     /// Fraction of tokens to keep as heavy hitters (0.0 to 1.0)
     #[arg(long, default_value_t = 0.5)]
     h2o_keep_ratio: f32,
 
-    /// Number of final transformer layers to track for H2O importance scores
-    #[arg(long, default_value_t = 3)]
+    /// Number of final transformer layers to track for H2O importance scores (0 = all layers)
+    #[arg(long, default_value_t = 0)]
     h2o_tracked_layers: usize,
 
-    /// Exponential decay factor for H2O importance scores per step (0.0 to 1.0)
-    #[arg(long, default_value_t = 0.1)]
+    /// Exponential decay factor for H2O importance scores per step (0.0 = no decay)
+    #[arg(long, default_value_t = 0.0)]
     h2o_decay: f32,
 
     /// Number of prefix tokens to protect from eviction (defaults to prompt length)
