@@ -1,0 +1,16 @@
+{
+  "name": "M-C-4096",
+  "description": "Memory Critical at token 4096 — strong eviction (target_ratio=0.50)",
+  "signals": [
+    {
+      "at_token": 4096,
+      "signal": {
+        "memory_pressure": {
+          "level": "critical",
+          "available_bytes": 30000000,
+          "reclaim_target_bytes": 100000000
+        }
+      }
+    }
+  ]
+}
