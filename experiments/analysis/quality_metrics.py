@@ -32,7 +32,12 @@ def load_jsonl(filepath):
             line = line.strip()
             if not line:
                 continue
-            record = json.loads(line)
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
             if record.get("_summary"):
                 summary = record
             else:
