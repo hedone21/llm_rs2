@@ -5,6 +5,7 @@ pub mod cache_manager;
 pub mod eviction;
 pub mod kv_cache;
 pub mod memory;
+pub mod pressure;
 pub mod quant;
 pub mod shape;
 pub mod sys_monitor;

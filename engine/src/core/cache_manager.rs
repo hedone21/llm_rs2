@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::core::eviction::EvictionPolicy;
 use crate::core::kv_cache::KVCache;
+use crate::core::pressure::{ActionResult, CachePressurePipeline, HandlerContext, PressureLevel};
 use crate::core::sys_monitor::SystemMonitor;
 
 /// Result of an eviction attempt.
@@ -15,7 +16,14 @@ pub struct EvictionResult {
     pub new_pos: usize,
 }
 
-/// Orchestrates KV cache eviction based on memory pressure and policy decisions.
+/// Orchestrates KV cache management based on memory pressure and policy decisions.
+///
+/// CacheManager supports two operating modes:
+/// - **Legacy mode** (`new()`): single `EvictionPolicy`, backward-compatible
+/// - **Pipeline mode** (`with_pipeline()`): multi-handler `CachePressurePipeline`,
+///   dispatching different handlers based on `PressureLevel`
+///
+/// All public API methods work in both modes transparently.
 ///
 /// CacheManager follows the Dependency Inversion principle:
 /// - Depends on `dyn EvictionPolicy` (abstraction), not concrete policies
@@ -27,9 +35,12 @@ pub struct CacheManager {
     threshold_bytes: usize,
     /// After eviction, target cache size = current_pos * target_ratio.
     target_ratio: f32,
+    /// Optional pressure pipeline for multi-handler cache management.
+    pipeline: Option<CachePressurePipeline>,
 }
 
 impl CacheManager {
+    /// Create a CacheManager in legacy mode (single eviction policy).
     pub fn new(
         policy: Box<dyn EvictionPolicy>,
         monitor: Box<dyn SystemMonitor>,
@@ -41,12 +52,89 @@ impl CacheManager {
             monitor,
             threshold_bytes,
             target_ratio: target_ratio.clamp(0.1, 0.99),
+            pipeline: None,
+        }
+    }
+
+    /// Create a CacheManager in pipeline mode (multi-handler pressure pipeline).
+    ///
+    /// The pipeline dispatches different handlers based on `PressureLevel`,
+    /// which is determined from available memory relative to `threshold_bytes`.
+    pub fn with_pipeline(
+        pipeline: CachePressurePipeline,
+        monitor: Box<dyn SystemMonitor>,
+        threshold_bytes: usize,
+    ) -> Self {
+        use crate::core::eviction::no_eviction::NoEvictionPolicy;
+        Self {
+            policy: Box::new(NoEvictionPolicy::new()),
+            monitor,
+            threshold_bytes,
+            target_ratio: 0.75,
+            pipeline: Some(pipeline),
+        }
+    }
+
+    /// Determine pressure level from available memory.
+    ///
+    /// - `>= threshold`: Normal
+    /// - `>= threshold / 2`: Warning
+    /// - `>= threshold / 4`: Critical
+    /// - `< threshold / 4`: Emergency
+    fn determine_pressure_level(&self, mem_available: usize) -> PressureLevel {
+        if mem_available >= self.threshold_bytes {
+            PressureLevel::Normal
+        } else if mem_available >= self.threshold_bytes / 2 {
+            PressureLevel::Warning
+        } else if mem_available >= self.threshold_bytes / 4 {
+            PressureLevel::Critical
+        } else {
+            PressureLevel::Emergency
+        }
+    }
+
+    /// Convert pipeline `ActionResult`s into a legacy `EvictionResult`.
+    fn pipeline_results_to_eviction_result(
+        results: &[ActionResult],
+        caches: &[KVCache],
+    ) -> EvictionResult {
+        let mut total_removed = 0usize;
+        let mut any_action = false;
+        let mut last_new_pos = if caches.is_empty() {
+            0
+        } else {
+            caches[0].current_pos
+        };
+
+        for r in results {
+            match r {
+                ActionResult::Evicted {
+                    tokens_removed,
+                    new_pos,
+                } => {
+                    total_removed += tokens_removed;
+                    last_new_pos = *new_pos;
+                    any_action = true;
+                }
+                ActionResult::NoOp => {}
+                _ => {
+                    // Non-eviction actions (quantize, swap, etc.) count as action
+                    any_action = true;
+                }
+            }
+        }
+
+        EvictionResult {
+            evicted: any_action,
+            tokens_removed: total_removed,
+            new_pos: last_new_pos,
         }
     }
 
     /// Check memory pressure and evict from all caches if needed.
     ///
     /// Called after each generation step in the inference loop.
+    /// Routes to pipeline or legacy path depending on configuration.
     pub fn maybe_evict(&self, caches: &mut [KVCache]) -> Result<EvictionResult> {
         if caches.is_empty() {
             return Ok(EvictionResult {
@@ -69,26 +157,52 @@ impl CacheManager {
             }
         };
 
-        // Check if any cache needs eviction
+        // Pipeline path
+        if let Some(ref pipeline) = self.pipeline {
+            let pressure = self.determine_pressure_level(mem_available);
+            if pressure == PressureLevel::Normal {
+                return Ok(EvictionResult {
+                    evicted: false,
+                    tokens_removed: 0,
+                    new_pos: caches[0].current_pos,
+                });
+            }
+
+            log::info!(
+                "[CacheManager] Pipeline pressure={:?}, executing '{}'",
+                pressure,
+                pipeline.name(),
+            );
+
+            let mut ctx = HandlerContext {
+                caches,
+                importance: None,
+                pressure_level: pressure,
+                mem_available,
+            };
+            let results = pipeline.execute(&mut ctx)?;
+            return Ok(Self::pipeline_results_to_eviction_result(
+                &results, ctx.caches,
+            ));
+        }
+
+        // Legacy path
         let representative_cache = &caches[0];
         if !self
             .policy
             .should_evict(representative_cache, mem_available)
+            && mem_available >= self.threshold_bytes
         {
-            // Also check memory threshold
-            if mem_available >= self.threshold_bytes {
-                return Ok(EvictionResult {
-                    evicted: false,
-                    tokens_removed: 0,
-                    new_pos: representative_cache.current_pos,
-                });
-            }
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: representative_cache.current_pos,
+            });
         }
 
-        // Calculate target length
         let current_pos = representative_cache.current_pos;
         let target_len = ((current_pos as f32) * self.target_ratio) as usize;
-        let target_len = target_len.max(1); // Keep at least 1 token
+        let target_len = target_len.max(1);
 
         if current_pos <= target_len {
             return Ok(EvictionResult {
@@ -110,7 +224,6 @@ impl CacheManager {
             target_len
         );
 
-        // Evict from all caches (one per transformer layer)
         let tokens_removed = current_pos - target_len;
         for cache in caches.iter_mut() {
             self.policy.evict(cache, target_len)?;
@@ -129,6 +242,7 @@ impl CacheManager {
     ///
     /// Same logic as `maybe_evict()`, but passes importance scores to the policy
     /// via `evict_with_scores()`. Used when `AttentionScoreAccumulator` is active.
+    /// Routes to pipeline or legacy path depending on configuration.
     pub fn maybe_evict_with_scores(
         &self,
         caches: &mut [KVCache],
@@ -154,6 +268,36 @@ impl CacheManager {
             }
         };
 
+        // Pipeline path
+        if let Some(ref pipeline) = self.pipeline {
+            let pressure = self.determine_pressure_level(mem_available);
+            if pressure == PressureLevel::Normal {
+                return Ok(EvictionResult {
+                    evicted: false,
+                    tokens_removed: 0,
+                    new_pos: caches[0].current_pos,
+                });
+            }
+
+            log::info!(
+                "[CacheManager] Pipeline pressure={:?} (score-aware), executing '{}'",
+                pressure,
+                pipeline.name(),
+            );
+
+            let mut ctx = HandlerContext {
+                caches,
+                importance: Some(importance),
+                pressure_level: pressure,
+                mem_available,
+            };
+            let results = pipeline.execute(&mut ctx)?;
+            return Ok(Self::pipeline_results_to_eviction_result(
+                &results, ctx.caches,
+            ));
+        }
+
+        // Legacy path
         let representative_cache = &caches[0];
         if !self
             .policy
@@ -204,6 +348,7 @@ impl CacheManager {
     /// Force eviction without scores, bypassing should_evict() and memory checks.
     ///
     /// Used when eviction is triggered externally (e.g., by resilience signals).
+    /// In pipeline mode, runs at `Emergency` pressure level.
     pub fn force_evict(&self, caches: &mut [KVCache], target_ratio: f32) -> Result<EvictionResult> {
         if caches.is_empty() {
             return Ok(EvictionResult {
@@ -213,6 +358,26 @@ impl CacheManager {
             });
         }
 
+        // Pipeline path — force at Emergency level
+        if let Some(ref pipeline) = self.pipeline {
+            log::info!(
+                "[CacheManager] Signal-driven pipeline execution (Emergency): '{}'",
+                pipeline.name(),
+            );
+
+            let mut ctx = HandlerContext {
+                caches,
+                importance: None,
+                pressure_level: PressureLevel::Emergency,
+                mem_available: 0,
+            };
+            let results = pipeline.execute(&mut ctx)?;
+            return Ok(Self::pipeline_results_to_eviction_result(
+                &results, ctx.caches,
+            ));
+        }
+
+        // Legacy path
         let current_pos = caches[0].current_pos;
         let target_len = ((current_pos as f32) * target_ratio.clamp(0.1, 0.99)) as usize;
         let target_len = target_len.max(1);
@@ -249,6 +414,7 @@ impl CacheManager {
     ///
     /// Used when eviction is triggered externally (e.g., by resilience signals)
     /// for score-aware policies like H2O.
+    /// In pipeline mode, runs at `Emergency` pressure level with scores.
     pub fn force_evict_with_scores(
         &self,
         caches: &mut [KVCache],
@@ -263,6 +429,26 @@ impl CacheManager {
             });
         }
 
+        // Pipeline path — force at Emergency level with scores
+        if let Some(ref pipeline) = self.pipeline {
+            log::info!(
+                "[CacheManager] Signal-driven pipeline execution (Emergency, score-aware): '{}'",
+                pipeline.name(),
+            );
+
+            let mut ctx = HandlerContext {
+                caches,
+                importance: Some(importance),
+                pressure_level: PressureLevel::Emergency,
+                mem_available: 0,
+            };
+            let results = pipeline.execute(&mut ctx)?;
+            return Ok(Self::pipeline_results_to_eviction_result(
+                &results, ctx.caches,
+            ));
+        }
+
+        // Legacy path
         let current_pos = caches[0].current_pos;
         let target_len = ((current_pos as f32) * target_ratio.clamp(0.1, 0.99)) as usize;
         let target_len = target_len.max(1);
@@ -296,9 +482,13 @@ impl CacheManager {
         })
     }
 
-    /// Returns the name of the active policy.
-    pub fn policy_name(&self) -> &str {
-        self.policy.name()
+    /// Returns the name of the active policy or pipeline.
+    pub fn policy_name(&self) -> String {
+        if let Some(ref pipeline) = self.pipeline {
+            pipeline.name()
+        } else {
+            self.policy.name().to_string()
+        }
     }
 }
 
@@ -624,5 +814,329 @@ mod tests {
         // target = 50 * 0.99 = 49, but max_keep=14, so keep=14
         // Since eviction still happens (50 > 14 because threshold triggers)
         assert!(result2.evicted);
+    }
+
+    // ── Pipeline-backed CacheManager tests ──
+
+    #[test]
+    fn test_pipeline_manager_evicts_at_pressure() {
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Warning,
+            handler: Box::new(EvictionHandler::new(
+                Box::new(SlidingWindowPolicy::new(10, 0)),
+                0.5,
+            )),
+        }]);
+
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor {
+                available: 100 * 1024 * 1024, // 100MB
+            }),
+            256 * 1024 * 1024, // 256MB threshold → Warning level
+                               // (100MB >= 128MB=threshold/2 → Warning)
+        );
+
+        let mut caches = make_caches(4, 40);
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        assert!(result.evicted);
+        for cache in &caches {
+            assert!(cache.current_pos < 40);
+        }
+    }
+
+    #[test]
+    fn test_pipeline_manager_no_action_at_normal() {
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Warning,
+            handler: Box::new(EvictionHandler::new(
+                Box::new(SlidingWindowPolicy::new(10, 0)),
+                0.5,
+            )),
+        }]);
+
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor {
+                available: 512 * 1024 * 1024, // 512MB — above 256MB threshold → Normal
+            }),
+            256 * 1024 * 1024,
+        );
+
+        let mut caches = make_caches(4, 40);
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        assert!(!result.evicted);
+        assert_eq!(caches[0].current_pos, 40);
+    }
+
+    #[test]
+    fn test_pipeline_manager_force_evict() {
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Emergency,
+            handler: Box::new(EvictionHandler::new(
+                Box::new(SlidingWindowPolicy::new(10, 0)),
+                0.5,
+            )),
+        }]);
+
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor {
+                available: 1024 * 1024 * 1024, // plenty of memory
+            }),
+            256 * 1024 * 1024,
+        );
+
+        // maybe_evict should NOT trigger (Normal pressure)
+        let mut caches = make_caches(4, 40);
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        assert!(!result.evicted);
+
+        // force_evict MUST trigger (Emergency level)
+        let result = cm.force_evict(&mut caches, 0.5).unwrap();
+        assert!(result.evicted);
+        assert!(caches[0].current_pos < 40);
+    }
+
+    #[test]
+    fn test_pipeline_manager_force_evict_with_scores() {
+        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Emergency,
+            handler: Box::new(EvictionHandler::new(
+                Box::new(H2OPolicy::new(5, 0.5, 0)),
+                0.5,
+            )),
+        }]);
+
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor {
+                available: 1024 * 1024 * 1024,
+            }),
+            256 * 1024 * 1024,
+        );
+
+        let mut caches = make_caches(4, 40);
+        let mut importance = vec![0.0f32; 100];
+        importance[10] = 10.0;
+        importance[20] = 9.0;
+
+        let result = cm
+            .force_evict_with_scores(&mut caches, 0.5, &importance)
+            .unwrap();
+        assert!(result.evicted);
+        assert!(caches[0].current_pos < 40);
+    }
+
+    #[test]
+    fn test_pipeline_manager_with_scores() {
+        use crate::core::eviction::h2o::H2OPolicy;
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Warning,
+            handler: Box::new(EvictionHandler::new(
+                Box::new(H2OPolicy::new(5, 0.5, 0)),
+                0.5,
+            )),
+        }]);
+
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor {
+                available: 100 * 1024 * 1024, // Warning level
+            }),
+            256 * 1024 * 1024,
+        );
+
+        let mut caches = make_caches(4, 40);
+        let mut importance = vec![0.0f32; 100];
+        importance[10] = 10.0;
+        importance[20] = 9.0;
+        for i in 4..40 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        let result = cm
+            .maybe_evict_with_scores(&mut caches, &importance)
+            .unwrap();
+        assert!(result.evicted);
+        let pos = caches[0].current_pos;
+        for cache in &caches {
+            assert_eq!(cache.current_pos, pos);
+        }
+    }
+
+    #[test]
+    fn test_pipeline_manager_policy_name() {
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![
+            PressureStageConfig {
+                min_level: PressureLevel::Warning,
+                handler: Box::new(EvictionHandler::new(
+                    Box::new(SlidingWindowPolicy::new(10, 0)),
+                    0.8,
+                )),
+            },
+            PressureStageConfig {
+                min_level: PressureLevel::Critical,
+                handler: Box::new(EvictionHandler::new(
+                    Box::new(SlidingWindowPolicy::new(10, 0)),
+                    0.5,
+                )),
+            },
+        ]);
+
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor { available: 0 }),
+            256 * 1024 * 1024,
+        );
+
+        let name = cm.policy_name();
+        assert!(name.contains("sliding_window"));
+        assert!(name.contains("Warning"));
+        assert!(name.contains("Critical"));
+    }
+
+    #[test]
+    fn test_pipeline_manager_multi_level_graduated_response() {
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        // Two eviction stages: mild at Warning, aggressive at Critical
+        let pipeline = CachePressurePipeline::new(vec![
+            PressureStageConfig {
+                min_level: PressureLevel::Warning,
+                handler: Box::new(EvictionHandler::new(
+                    Box::new(SlidingWindowPolicy::new(30, 0)),
+                    0.9, // keep 90%
+                )),
+            },
+            PressureStageConfig {
+                min_level: PressureLevel::Critical,
+                handler: Box::new(EvictionHandler::new(
+                    Box::new(SlidingWindowPolicy::new(10, 0)),
+                    0.5, // keep 50%
+                )),
+            },
+        ]);
+
+        // At Warning level: only the first stage should run
+        let cm_warning = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor {
+                available: 200 * 1024 * 1024, // 200MB, threshold=400MB → Warning
+            }),
+            400 * 1024 * 1024,
+        );
+
+        let mut caches = make_caches(4, 40);
+        let result = cm_warning.maybe_evict(&mut caches).unwrap();
+        assert!(result.evicted);
+        let pos_after_warning = caches[0].current_pos;
+
+        // At Critical level: both stages should run (more aggressive)
+        let pipeline2 = CachePressurePipeline::new(vec![
+            PressureStageConfig {
+                min_level: PressureLevel::Warning,
+                handler: Box::new(EvictionHandler::new(
+                    Box::new(SlidingWindowPolicy::new(30, 0)),
+                    0.9,
+                )),
+            },
+            PressureStageConfig {
+                min_level: PressureLevel::Critical,
+                handler: Box::new(EvictionHandler::new(
+                    Box::new(SlidingWindowPolicy::new(10, 0)),
+                    0.5,
+                )),
+            },
+        ]);
+
+        let cm_critical = CacheManager::with_pipeline(
+            pipeline2,
+            Box::new(MockMonitor {
+                available: 50 * 1024 * 1024, // 50MB, threshold=400MB → Critical
+            }),
+            400 * 1024 * 1024,
+        );
+
+        let mut caches2 = make_caches(4, 40);
+        let result2 = cm_critical.maybe_evict(&mut caches2).unwrap();
+        assert!(result2.evicted);
+        let pos_after_critical = caches2[0].current_pos;
+
+        // Critical should be more aggressive than Warning
+        assert!(
+            pos_after_critical <= pos_after_warning,
+            "Critical ({}) should evict at least as much as Warning ({})",
+            pos_after_critical,
+            pos_after_warning,
+        );
+    }
+
+    #[test]
+    fn test_pipeline_manager_empty_pipeline() {
+        use crate::core::pressure::CachePressurePipeline;
+
+        let pipeline = CachePressurePipeline::new(vec![]);
+        let cm = CacheManager::with_pipeline(
+            pipeline,
+            Box::new(MockMonitor { available: 0 }),
+            256 * 1024 * 1024,
+        );
+
+        let mut caches = make_caches(4, 40);
+        // Emergency level but empty pipeline → no action
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        assert!(!result.evicted);
+    }
+
+    #[test]
+    fn test_pipeline_manager_monitor_error_skips() {
+        use crate::core::pressure::{
+            CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
+        };
+
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Warning,
+            handler: Box::new(EvictionHandler::new(
+                Box::new(SlidingWindowPolicy::new(10, 0)),
+                0.5,
+            )),
+        }]);
+
+        let cm = CacheManager::with_pipeline(pipeline, Box::new(ErrorMonitor), 256 * 1024 * 1024);
+
+        let mut caches = make_caches(4, 40);
+        let result = cm.maybe_evict(&mut caches).unwrap();
+        assert!(!result.evicted);
+        assert_eq!(result.new_pos, 40);
     }
 }
