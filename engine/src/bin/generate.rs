@@ -735,11 +735,21 @@ fn main() -> anyhow::Result<()> {
                         let effective_ratio =
                             args.experiment_eviction_ratio.unwrap_or(*target_ratio);
                         let result = if let Some(ref acc) = score_accumulator {
-                            cache_manager.force_evict_with_scores(
-                                &mut kv_caches,
-                                effective_ratio,
-                                acc.importance_scores(),
-                            )
+                            if let Some(head_imp) = acc.head_importance_scores() {
+                                cache_manager.force_evict_with_head_scores(
+                                    &mut kv_caches,
+                                    effective_ratio,
+                                    acc.importance_scores(),
+                                    head_imp,
+                                    acc.n_kv_heads(),
+                                )
+                            } else {
+                                cache_manager.force_evict_with_scores(
+                                    &mut kv_caches,
+                                    effective_ratio,
+                                    acc.importance_scores(),
+                                )
+                            }
                         } else {
                             cache_manager.force_evict(&mut kv_caches, effective_ratio)
                         };
