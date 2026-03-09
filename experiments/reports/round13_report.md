@@ -68,31 +68,54 @@ H2O+ (GQA-aware per-head eviction)가 H2O를 개선하는지 검증.
 
 ---
 
-## 분석: 왜 H2O == H2O+인가?
+## 근본 원인: Q4_0 어텐션 스코어 미기록 (Critical Bug)
 
-Per-head 선택은 각 KV 헤드가 다른 HH 토큰을 선택하는 것이 목표였다.
-그러나 결과적으로 동일한 EMR이 나온 이유:
+**H2O == H2O+의 진짜 원인은 어텐션 스코어가 전혀 수집되지 않았기 때문이다.**
 
-1. **GQA 그룹 내 Q-헤드들의 attention 패턴이 충분히 유사**
-   - 같은 GQA 그룹에 속한 Q-헤드들이 비슷한 토큰에 attention을 주므로,
-     per-KV-head 평균 점수가 flat 합산 점수와 동일한 토큰을 선택
-   - 결과적으로 8개 KV 헤드 모두 같은 HH 토큰을 선택
+### 버그 상세
 
-2. **1B 모델의 한계**
-   - 8개 KV 헤드로는 충분한 다양성이 없음
-   - 더 큰 모델(7B+, 더 많은 KV 헤드)에서 차이 가능성
+`llama_layer.rs:431`에서 KV 캐시 dtype이 F32가 아니면 `attention_gen()` 경로로 분기:
 
-3. **HH 자체의 근본적 한계**
-   - Round 12에서 이미 확인: HH partition이 무가치
-   - Per-head로 바꿔도 무가치한 것은 동일
+```rust
+if (backend.name() == "OpenCL" && use_gpu_attn) || k_cache.dtype() != DType::F32 {
+    backend.attention_gen(...)  // ← ws.scores에 기록하지 않음
+} else {
+    // CPU F32 경로 — 이 경로만 ws.scores에 post-softmax 점수 기록
+}
+```
+
+**Q4_0 KV 캐시** (실험에서 사용)는 항상 `attention_gen()` 경로를 타며,
+이 함수는 어텐션 출력만 계산하고 **post-softmax 스코어를 ws.scores에 기록하지 않는다**.
+
+### 결과
+
+- `AttentionScoreAccumulator`가 받는 `ws.scores`는 항상 **전부 0.0**
+- flat importance = 0, head importance = 0 → 모든 토큰이 동일 중요도
+- H2O/H2O+ 모두 "중요도 0인 토큰 중 선택" → 동일한 (사실상 무작위) 결과
+- **Round 12의 "HH 무가치" 결론도 이 버그의 영향을 받음**
+
+### 진단 과정
+
+1. H2O+ 진단: 8개 KV 헤드가 100% 동일한 HH 토큰 선택
+2. 스코어 진단: `flat nonzero=0/4096, head nonzero=0/32768`
+3. 누적기 진단: `accumulate_layer_gqa` 입력 `nonzero=0/131072`
+4. 코드 추적: `attention_gen()` 경로에서 scores 미출력 확인
+
+### 시사점
+
+- **Round 12 결론 재검토 필요**: H2O의 HH가 "무가치"한 것이 아니라, 스코어가 0이어서 HH 선택 자체가 작동하지 않았을 가능성
+- **수정 방향**: `attention_gen()` 경로에서도 post-softmax 스코어를 출력하거나, 별도 F32 스코어 계산 패스 추가
+- **수정 후 Round 12/13 재실험 필요**
 
 ---
 
 ## 시사점
 
-1. **Aggressive eviction에서 Sliding이 최적** — HH 할당은 불필요
-2. **Per-head eviction은 1B 모델에서 효과 없음** — 헤드 간 다양성 부족
-3. **비단조적 EMR 패턴** (kr=0.1 > kr=0.0, Literary) — 향후 조사 필요
-4. **다음 방향**: SnapKV (prefill-time compression)로 전환 권장
-   - Eviction 대신 compression: 중요 토큰을 미리 선별
-   - Prefill에서 attention pattern이 더 안정적
+1. **Q4_0 스코어 버그 수정이 최우선** — 스코어 없이는 score-based eviction 평가 불가
+2. **Round 12 "HH 무가치" 결론 재검토 필요** — 실제 스코어로 재실험해야 유효한 결론
+3. **비단조적 EMR 패턴** (kr=0.1 > kr=0.0, Literary) — 스코어가 0이므로 사실상 무작위 변동
+4. **수정 후 실험 로드맵**:
+   - Step 1: `attention_gen()` 경로에서 F32 스코어 출력 구현
+   - Step 2: Round 12 keep_ratio sweep 재실험 (H2O with real scores)
+   - Step 3: Round 13 H2O vs H2O+ 재비교 (with real scores)
+   - Step 4: 결과에 따라 SnapKV 또는 H2O+ 최적화 방향 결정
