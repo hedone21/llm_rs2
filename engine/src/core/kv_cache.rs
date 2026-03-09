@@ -500,6 +500,72 @@ impl KVCache {
 
         Ok(())
     }
+
+    /// Move `count` positions from `src_pos` to `dst_pos` for a **single** KV head.
+    ///
+    /// Unlike `shift_positions()` which moves the same positions for all heads,
+    /// this method only modifies data belonging to the specified `head`.
+    /// Used by per-head eviction policies (e.g., H2O+) where each KV head
+    /// independently selects which tokens to keep.
+    ///
+    /// **Requires HeadMajor layout** — panics on SeqMajor because per-head
+    /// data is interleaved and cannot be moved independently.
+    pub fn shift_positions_for_head(
+        &mut self,
+        head: usize,
+        src_pos: usize,
+        dst_pos: usize,
+        count: usize,
+    ) -> Result<()> {
+        assert_eq!(
+            self.layout,
+            KVLayout::HeadMajor,
+            "shift_positions_for_head requires HeadMajor layout"
+        );
+
+        if count == 0 || src_pos == dst_pos {
+            return Ok(());
+        }
+
+        let backend = self.k_buffer.backend().clone();
+        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+
+        if is_q4 {
+            let qk = crate::core::quant::QK4_0;
+            let head_stride = self.capacity * self.head_dim / qk;
+            let bph = self.head_dim / qk;
+            let base = head * head_stride;
+            backend.buffer_shift(
+                &mut self.k_buffer,
+                base + src_pos * bph,
+                base + dst_pos * bph,
+                count * bph,
+            )?;
+            backend.buffer_shift(
+                &mut self.v_buffer,
+                base + src_pos * bph,
+                base + dst_pos * bph,
+                count * bph,
+            )?;
+        } else {
+            let head_stride = self.capacity * self.head_dim;
+            let base = head * head_stride;
+            backend.buffer_shift(
+                &mut self.k_buffer,
+                base + src_pos * self.head_dim,
+                base + dst_pos * self.head_dim,
+                count * self.head_dim,
+            )?;
+            backend.buffer_shift(
+                &mut self.v_buffer,
+                base + src_pos * self.head_dim,
+                base + dst_pos * self.head_dim,
+                count * self.head_dim,
+            )?;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1276,5 +1342,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── Per-head shift tests ──
+
+    #[test]
+    fn test_shift_positions_for_head_basic() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_cache(16, heads, dim);
+
+        let backend = Arc::new(CpuBackend::new());
+        for i in 0..5 {
+            let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                for d in 0..dim {
+                    *ptr.add(d) = (i * 10 + d) as f32;
+                }
+                for d in 0..dim {
+                    *ptr.add(dim + d) = (i * 100 + d) as f32;
+                }
+            }
+            let k = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf.clone(),
+                backend.clone(),
+            );
+            let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend.clone());
+            cache.update(&k, &v).unwrap();
+        }
+        // Head 0: pos0=0, pos1=10, pos2=20, pos3=30, pos4=40
+        // Head 1: pos0=0, pos1=100, pos2=200, pos3=300, pos4=400
+
+        // Move pos 3 → pos 1 for HEAD 0 ONLY
+        cache.shift_positions_for_head(0, 3, 1, 1).unwrap();
+
+        // Head 0: pos 1 should now have value 30 (from pos 3)
+        assert_eq!(hm_read(&cache, 1, 0), 30.0);
+        // Head 1: pos 1 should be UNCHANGED (still 100)
+        assert_eq!(hm_read(&cache, 1, 1), 100.0);
+
+        // Head 0: pos 0 should be unchanged
+        assert_eq!(hm_read(&cache, 0, 0), 0.0);
+        // Head 1: pos 3 should be unchanged
+        assert_eq!(hm_read(&cache, 3, 1), 300.0);
+    }
+
+    #[test]
+    fn test_shift_positions_for_head_multi_count() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_cache(16, heads, dim);
+
+        let backend = Arc::new(CpuBackend::new());
+        for i in 0..6 {
+            let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                for d in 0..dim {
+                    *ptr.add(d) = (i * 10) as f32;
+                }
+                for d in 0..dim {
+                    *ptr.add(dim + d) = (i * 100) as f32;
+                }
+            }
+            let k = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf.clone(),
+                backend.clone(),
+            );
+            let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend.clone());
+            cache.update(&k, &v).unwrap();
+        }
+
+        // Move positions 4..6 → 2..4 for head 1 only
+        cache.shift_positions_for_head(1, 4, 2, 2).unwrap();
+
+        // Head 1: pos 2 = old pos 4 = 400, pos 3 = old pos 5 = 500
+        assert_eq!(hm_read(&cache, 2, 1), 400.0);
+        assert_eq!(hm_read(&cache, 3, 1), 500.0);
+        // Head 0: unchanged at pos 2, 3
+        assert_eq!(hm_read(&cache, 2, 0), 20.0);
+        assert_eq!(hm_read(&cache, 3, 0), 30.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "HeadMajor")]
+    fn test_shift_positions_for_head_panics_seq_major() {
+        let mut cache = make_cache(16, 2, 4);
+        cache.current_pos = 5;
+        cache.shift_positions_for_head(0, 3, 1, 1).unwrap();
+    }
+
+    #[test]
+    fn test_shift_positions_for_head_noop() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_cache(16, heads, dim);
+        cache.current_pos = 5;
+
+        // count=0 should be noop
+        cache.shift_positions_for_head(0, 3, 1, 0).unwrap();
+        // src==dst should be noop
+        cache.shift_positions_for_head(0, 3, 3, 1).unwrap();
     }
 }

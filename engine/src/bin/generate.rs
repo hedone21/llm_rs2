@@ -5,6 +5,7 @@ use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
 use llm_rs2::core::cache_manager::CacheManager;
 use llm_rs2::core::eviction::h2o::H2OPolicy;
+use llm_rs2::core::eviction::h2o_plus::H2OPlusPolicy;
 use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
 use llm_rs2::core::kv_cache::{KVCache, KVLayout};
@@ -472,8 +473,13 @@ fn main() -> anyhow::Result<()> {
                     args.h2o_keep_ratio,
                     actual_protected_prefix,
                 )),
+                "h2o_plus" => Box::new(H2OPlusPolicy::new(
+                    args.h2o_recent_window,
+                    args.h2o_keep_ratio,
+                    actual_protected_prefix,
+                )),
                 other => anyhow::bail!(
-                    "Unknown eviction policy: '{}'. Use: none, sliding, h2o",
+                    "Unknown eviction policy: '{}'. Use: none, sliding, h2o, h2o_plus",
                     other
                 ),
             };
@@ -482,11 +488,22 @@ fn main() -> anyhow::Result<()> {
         CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
     };
 
-    // Setup AttentionScoreAccumulator for H2O
+    // Setup AttentionScoreAccumulator for H2O / H2O+
     let mut score_accumulator = if args.eviction_policy == "h2o" {
         let mut acc = AttentionScoreAccumulator::new(
             max_seq_len,
             model.config.num_attention_heads,
+            model.config.num_hidden_layers,
+            args.h2o_tracked_layers,
+            args.h2o_decay,
+        );
+        acc.set_active(true);
+        Some(acc)
+    } else if args.eviction_policy == "h2o_plus" {
+        let mut acc = AttentionScoreAccumulator::new_gqa(
+            max_seq_len,
+            model.config.num_attention_heads,
+            model.config.num_key_value_heads,
             model.config.num_hidden_layers,
             args.h2o_tracked_layers,
             args.h2o_decay,
@@ -514,7 +531,7 @@ fn main() -> anyhow::Result<()> {
     // token via score_accumulator (passed separately).
     let cm_ref = match args.eviction_policy.as_str() {
         "sliding" => Some(&cache_manager),
-        _ => None, // "none" and "h2o" — no auto-eviction in forward path
+        _ => None, // "none", "h2o", "h2o_plus" — no auto-eviction in forward path
     };
 
     // Pre-allocate generation buffers

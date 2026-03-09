@@ -31,12 +31,32 @@ pub trait EvictionPolicy: Send + Sync {
     ) -> Result<()> {
         self.evict(cache, target_len)
     }
+
+    /// Per-KV-head eviction with GQA-aware importance scores.
+    ///
+    /// `head_importance` is `[n_kv_heads * max_seq_len]` (row-major): each KV head
+    /// has its own importance ranking, enabling per-head token selection.
+    ///
+    /// Default: ignores head scores, delegates to `evict_with_scores()`.
+    /// Override in GQA-aware policies like H2O+.
+    fn evict_with_head_scores(
+        &self,
+        cache: &mut KVCache,
+        target_len: usize,
+        flat_importance: &[f32],
+        _head_importance: &[f32],
+        _n_kv_heads: usize,
+    ) -> Result<()> {
+        self.evict_with_scores(cache, target_len, flat_importance)
+    }
 }
 
 pub mod h2o;
+pub mod h2o_plus;
 pub mod no_eviction;
 pub mod sliding_window;
 
 pub use h2o::H2OPolicy;
+pub use h2o_plus::H2OPlusPolicy;
 pub use no_eviction::NoEvictionPolicy;
 pub use sliding_window::SlidingWindowPolicy;

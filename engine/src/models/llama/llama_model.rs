@@ -384,14 +384,25 @@ impl LlamaModel {
                 use_gpu_attn: layer_gpu_attn,
             })?;
 
-            // Capture attention scores for H2O accumulator
+            // Capture attention scores for H2O/H2O+ accumulator
             if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
                 && acc.should_track_layer(i)
             {
                 let cache_seq_len = kv_caches[i].current_pos;
                 let n_heads_q = self.config.num_attention_heads;
                 let stride = ws.scores.len() / n_heads_q;
-                acc.accumulate_layer(&ws.scores, stride, cache_seq_len, n_heads_q);
+                if acc.n_kv_heads() > 0 {
+                    let n_kv_heads = self.config.num_key_value_heads;
+                    acc.accumulate_layer_gqa(
+                        &ws.scores,
+                        stride,
+                        cache_seq_len,
+                        n_heads_q,
+                        n_kv_heads,
+                    );
+                } else {
+                    acc.accumulate_layer(&ws.scores, stride, cache_seq_len, n_heads_q);
+                }
             }
         }
 
@@ -404,7 +415,16 @@ impl LlamaModel {
         let eviction_result = if let Some(cm) = args.cache_manager {
             let result = if let Some(ref acc) = score_accumulator {
                 if acc.is_active() {
-                    cm.maybe_evict_with_scores(kv_caches, acc.importance_scores())?
+                    if let Some(head_imp) = acc.head_importance_scores() {
+                        cm.maybe_evict_with_head_scores(
+                            kv_caches,
+                            acc.importance_scores(),
+                            head_imp,
+                            acc.n_kv_heads(),
+                        )?
+                    } else {
+                        cm.maybe_evict_with_scores(kv_caches, acc.importance_scores())?
+                    }
                 } else {
                     cm.maybe_evict(kv_caches)?
                 }

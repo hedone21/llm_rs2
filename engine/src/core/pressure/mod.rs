@@ -37,6 +37,11 @@ pub struct HandlerContext<'a> {
     pub caches: &'a mut [KVCache],
     /// Optional per-token importance scores (from AttentionScoreAccumulator).
     pub importance: Option<&'a [f32]>,
+    /// Optional per-KV-head importance scores for GQA-aware eviction.
+    /// Layout: `[n_kv_heads * max_seq_len]`, row-major.
+    pub head_importance: Option<&'a [f32]>,
+    /// Number of KV heads (0 = GQA mode disabled).
+    pub n_kv_heads: usize,
     /// Current pressure level determined by the pipeline.
     pub pressure_level: PressureLevel,
     /// Available system memory in bytes.
@@ -300,6 +305,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };
@@ -333,6 +340,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Normal,
             mem_available: 1024 * 1024 * 1024,
         };
@@ -367,6 +376,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
         };
@@ -385,6 +396,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
         };
@@ -413,6 +426,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };
@@ -494,6 +509,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
         };

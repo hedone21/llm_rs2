@@ -177,6 +177,8 @@ impl CacheManager {
             let mut ctx = HandlerContext {
                 caches,
                 importance: None,
+                head_importance: None,
+                n_kv_heads: 0,
                 pressure_level: pressure,
                 mem_available,
             };
@@ -288,6 +290,8 @@ impl CacheManager {
             let mut ctx = HandlerContext {
                 caches,
                 importance: Some(importance),
+                head_importance: None,
+                n_kv_heads: 0,
                 pressure_level: pressure,
                 mem_available,
             };
@@ -345,6 +349,107 @@ impl CacheManager {
         })
     }
 
+    /// Check memory pressure and evict using per-KV-head importance scores.
+    ///
+    /// GQA-aware version of `maybe_evict_with_scores()`. Passes head-level
+    /// importance to the policy via `evict_with_head_scores()`.
+    pub fn maybe_evict_with_head_scores(
+        &self,
+        caches: &mut [KVCache],
+        flat_importance: &[f32],
+        head_importance: &[f32],
+        n_kv_heads: usize,
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        let mem_available = match self.monitor.mem_stats() {
+            Ok(stats) => stats.available,
+            Err(e) => {
+                log::warn!("Failed to read memory stats: {}, skipping eviction", e);
+                return Ok(EvictionResult {
+                    evicted: false,
+                    tokens_removed: 0,
+                    new_pos: caches[0].current_pos,
+                });
+            }
+        };
+
+        // Pipeline path
+        if let Some(ref pipeline) = self.pipeline {
+            let pressure = self.determine_pressure_level(mem_available);
+            if pressure == PressureLevel::Normal {
+                return Ok(EvictionResult {
+                    evicted: false,
+                    tokens_removed: 0,
+                    new_pos: caches[0].current_pos,
+                });
+            }
+
+            let mut ctx = HandlerContext {
+                caches,
+                importance: Some(flat_importance),
+                head_importance: Some(head_importance),
+                n_kv_heads,
+                pressure_level: pressure,
+                mem_available,
+            };
+            let results = pipeline.execute(&mut ctx)?;
+            return Ok(Self::pipeline_results_to_eviction_result(
+                &results, ctx.caches,
+            ));
+        }
+
+        // Legacy path
+        let representative_cache = &caches[0];
+        if !self
+            .policy
+            .should_evict(representative_cache, mem_available)
+            && mem_available >= self.threshold_bytes
+        {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: representative_cache.current_pos,
+            });
+        }
+
+        let current_pos = representative_cache.current_pos;
+        let target_len = ((current_pos as f32) * self.target_ratio) as usize;
+        let target_len = target_len.max(1);
+
+        if current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+
+        let tokens_removed = current_pos - target_len;
+        for cache in caches.iter_mut() {
+            self.policy.evict_with_head_scores(
+                cache,
+                target_len,
+                flat_importance,
+                head_importance,
+                n_kv_heads,
+            )?;
+        }
+
+        let new_pos = caches[0].current_pos;
+        Ok(EvictionResult {
+            evicted: true,
+            tokens_removed,
+            new_pos,
+        })
+    }
+
     /// Force eviction without scores, bypassing should_evict() and memory checks.
     ///
     /// Used when eviction is triggered externally (e.g., by resilience signals).
@@ -368,6 +473,8 @@ impl CacheManager {
             let mut ctx = HandlerContext {
                 caches,
                 importance: None,
+                head_importance: None,
+                n_kv_heads: 0,
                 pressure_level: PressureLevel::Emergency,
                 mem_available: 0,
             };
@@ -439,6 +546,8 @@ impl CacheManager {
             let mut ctx = HandlerContext {
                 caches,
                 importance: Some(importance),
+                head_importance: None,
+                n_kv_heads: 0,
                 pressure_level: PressureLevel::Emergency,
                 mem_available: 0,
             };
@@ -472,6 +581,86 @@ impl CacheManager {
         for cache in caches.iter_mut() {
             self.policy
                 .evict_with_scores(cache, target_len, importance)?;
+        }
+
+        let new_pos = caches[0].current_pos;
+        Ok(EvictionResult {
+            evicted: true,
+            tokens_removed,
+            new_pos,
+        })
+    }
+
+    /// Force eviction with per-KV-head importance scores.
+    ///
+    /// Used when H2O+ (GQA-aware) policy needs per-head eviction.
+    /// In pipeline mode, runs at `Emergency` pressure level with head scores.
+    pub fn force_evict_with_head_scores(
+        &self,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        flat_importance: &[f32],
+        head_importance: &[f32],
+        n_kv_heads: usize,
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        // Pipeline path
+        if let Some(ref pipeline) = self.pipeline {
+            log::info!(
+                "[CacheManager] Signal-driven pipeline (Emergency, head-score-aware): '{}'",
+                pipeline.name(),
+            );
+
+            let mut ctx = HandlerContext {
+                caches,
+                importance: Some(flat_importance),
+                head_importance: Some(head_importance),
+                n_kv_heads,
+                pressure_level: PressureLevel::Emergency,
+                mem_available: 0,
+            };
+            let results = pipeline.execute(&mut ctx)?;
+            return Ok(Self::pipeline_results_to_eviction_result(
+                &results, ctx.caches,
+            ));
+        }
+
+        // Legacy path: delegate to per-head eviction on policy directly
+        let current_pos = caches[0].current_pos;
+        let target_len = ((current_pos as f32) * target_ratio.clamp(0.1, 0.99)) as usize;
+        let target_len = target_len.max(1);
+
+        if current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+
+        log::info!(
+            "[CacheManager] Signal-driven eviction with policy '{}' (head-score-aware): {} → {} tokens",
+            self.policy.name(),
+            current_pos,
+            target_len
+        );
+
+        let tokens_removed = current_pos - target_len;
+        for cache in caches.iter_mut() {
+            self.policy.evict_with_head_scores(
+                cache,
+                target_len,
+                flat_importance,
+                head_importance,
+                n_kv_heads,
+            )?;
         }
 
         let new_pos = caches[0].current_pos;

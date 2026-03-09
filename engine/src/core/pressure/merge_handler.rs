@@ -50,6 +50,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };

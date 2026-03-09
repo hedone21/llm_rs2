@@ -52,7 +52,19 @@ impl CachePressureHandler for EvictionHandler {
         );
 
         for cache in ctx.caches.iter_mut() {
-            if let Some(importance) = ctx.importance {
+            if let (Some(flat), Some(head_imp)) = (ctx.importance, ctx.head_importance) {
+                if ctx.n_kv_heads > 0 {
+                    self.policy.evict_with_head_scores(
+                        cache,
+                        target_len,
+                        flat,
+                        head_imp,
+                        ctx.n_kv_heads,
+                    )?;
+                } else {
+                    self.policy.evict_with_scores(cache, target_len, flat)?;
+                }
+            } else if let Some(importance) = ctx.importance {
                 self.policy
                     .evict_with_scores(cache, target_len, importance)?;
             } else {
@@ -121,6 +133,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };
@@ -167,6 +181,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };
@@ -196,6 +212,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
         };
@@ -213,6 +231,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
         };
@@ -242,6 +262,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };
@@ -264,6 +286,8 @@ mod tests {
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None, // no scores
+            head_importance: None,
+            n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
         };
