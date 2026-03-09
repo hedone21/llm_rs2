@@ -1,7 +1,7 @@
 use crate::backend::cpu::CpuBackend;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
-use crate::core::kv_cache::KVCache;
+use crate::core::kv_cache::{KVCache, KVLayout};
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
@@ -176,7 +176,12 @@ impl LlamaLayer {
             } else if k_cache.dtype() == DType::Q4_0 {
                 // Q4_0: dequantize KV cache to F32 temp buffers
                 use crate::core::quant::{BlockQ4_0, QK4_0};
-                let n_elems = cache_seq_len * n_heads_kv * head_dim;
+                // HeadMajor: need full buffer (heads are non-contiguous)
+                let n_elems = if kv_cache.layout() == KVLayout::HeadMajor {
+                    n_heads_kv * kv_cache.capacity() * head_dim
+                } else {
+                    cache_seq_len * n_heads_kv * head_dim
+                };
                 let n_blocks = n_elems / QK4_0;
                 let k_blocks = unsafe {
                     std::slice::from_raw_parts(k_cache.as_ptr() as *const BlockQ4_0, n_blocks)
@@ -201,7 +206,12 @@ impl LlamaLayer {
                 )
             } else if k_cache.dtype() == DType::F16 {
                 // F16: convert KV cache to F32 temp buffers
-                let n_elems = cache_seq_len * n_heads_kv * head_dim;
+                // HeadMajor: need full buffer (heads are non-contiguous)
+                let n_elems = if kv_cache.layout() == KVLayout::HeadMajor {
+                    n_heads_kv * kv_cache.capacity() * head_dim
+                } else {
+                    cache_seq_len * n_heads_kv * head_dim
+                };
                 let k_f16 = k_cache.as_slice::<half::f16>();
                 let v_f16 = v_cache.as_slice::<half::f16>();
                 k_vec.resize(n_elems, 0.0f32);
@@ -225,37 +235,43 @@ impl LlamaLayer {
                 )
             };
 
-            use crate::layers::attention::flash_attention_forward;
+            use crate::layers::attention::flash_attention_forward_strided;
+
+            let is_head_major_pf = kv_cache.layout() == KVLayout::HeadMajor;
+            let kv_capacity = kv_cache.capacity();
 
             let chunk_q_stride = seq_len * n_heads_q * head_dim;
             let chunk_out_stride = seq_len * n_heads_q * head_dim;
             // KV Cache is strided by capacity (physical buffer size), not max_seq_len
-            let chunk_k_stride = kv_cache.capacity() * n_heads_kv * head_dim;
+            let chunk_k_stride = kv_capacity * n_heads_kv * head_dim;
+
+            // Layout-dependent strides
+            let (k_pos_stride, kv_head_stride) = if is_head_major_pf {
+                (head_dim, kv_capacity * head_dim)
+            } else {
+                (n_heads_kv * head_dim, head_dim)
+            };
 
             // Iterate over batch.
             // We use chunks_mut for out_ptr to satisfy borrow checker.
             for (b, out_batch) in out_ptr.chunks_mut(chunk_out_stride).enumerate() {
                 let q_start = b * chunk_q_stride;
                 let k_start = b * chunk_k_stride;
-                let v_start = b * chunk_k_stride; // V has same layout as K in cache (usually)
+                let v_start = b * chunk_k_stride; // V has same layout as K in cache
 
                 let q_slice = &q_data[q_start..q_start + chunk_q_stride];
 
-                // K/V Cache: We only want the VALID part [0..cache_seq_len]
-                // But the buffer for this batch is huge (max_seq_len).
-                // We pass the slice covering valid data.
-                // Strides passed to flash_attention must match this slice logic.
-                // If we pass a slice starting at k_start, the "row 0" is k_data[k_start].
-                // The "row 1" is k_data[k_start + k_stride].
-                // k_stride = n_heads_kv * head_dim.
-                // This matches the cache layout (dense in seq dimension).
-                // The valid data length is cache_seq_len.
-
-                let k_valid_len = cache_seq_len * n_heads_kv * head_dim;
+                // For HeadMajor, heads are non-contiguous so we need the full buffer per batch.
+                // For SeqMajor, only valid positions are needed (contiguous from start).
+                let k_valid_len = if is_head_major_pf {
+                    n_heads_kv * kv_capacity * head_dim
+                } else {
+                    cache_seq_len * n_heads_kv * head_dim
+                };
                 let k_slice = &k_data[k_start..k_start + k_valid_len];
                 let v_slice = &v_data[v_start..v_start + k_valid_len];
 
-                flash_attention_forward(
+                flash_attention_forward_strided(
                     q_slice,
                     k_slice,
                     v_slice,
@@ -265,13 +281,14 @@ impl LlamaLayer {
                     seq_len,
                     cache_seq_len,
                     head_dim,
-                    n_heads_q * head_dim,  // q_stride
-                    n_heads_kv * head_dim, // k_stride
-                    n_heads_kv * head_dim, // v_stride
-                    n_heads_q * head_dim,  // out_stride
-                    start_pos,             // q_start_pos for causal mask
-                    32,                    // br
-                    32,                    // bc
+                    n_heads_q * head_dim, // q_stride
+                    k_pos_stride,         // k_stride (position stride)
+                    k_pos_stride,         // v_stride (same as k)
+                    n_heads_q * head_dim, // out_stride
+                    kv_head_stride,       // kv_head_stride
+                    start_pos,            // q_start_pos for causal mask
+                    32,                   // br
+                    32,                   // bc
                 );
             }
         }
@@ -466,6 +483,8 @@ impl LlamaLayer {
 
             let scale = 1.0 / (head_dim as f32).sqrt();
             let n_rep = n_heads_q / n_heads_kv;
+            let is_head_major = kv_cache.layout() == KVLayout::HeadMajor;
+            let kv_capacity = kv_cache.capacity();
 
             // Calculate stride before mutable borrow
             let stride = ws.scores.len() / n_heads_q;
@@ -505,7 +524,11 @@ impl LlamaLayer {
 
                             // --- Step 1: Q * K^T (NEON Vectorized) ---
                             for t in 0..cache_seq_len {
-                                let k_off = (t * n_heads_kv + kv_h) * head_dim;
+                                let k_off = if is_head_major {
+                                    (kv_h * kv_capacity + t) * head_dim
+                                } else {
+                                    (t * n_heads_kv + kv_h) * head_dim
+                                };
                                 let k_ptr = k_data.as_ptr().add(k_off);
 
                                 #[cfg(target_arch = "aarch64")]
@@ -612,7 +635,11 @@ impl LlamaLayer {
 
                             for t in 0..cache_seq_len {
                                 let weight = *active_scores.get_unchecked(t);
-                                let v_off = (t * n_heads_kv + kv_h) * head_dim;
+                                let v_off = if is_head_major {
+                                    (kv_h * kv_capacity + t) * head_dim
+                                } else {
+                                    (t * n_heads_kv + kv_h) * head_dim
+                                };
                                 let v_ptr = v_data.as_ptr().add(v_off);
                                 #[cfg(target_arch = "aarch64")]
                                 let out_ptr_h = out_h.as_mut_ptr();
@@ -679,7 +706,11 @@ impl LlamaLayer {
 
                             // --- Step 1: Q * K^T (NEON Vectorized) ---
                             for t in 0..cache_seq_len {
-                                let k_off = (t * n_heads_kv + kv_h) * head_dim;
+                                let k_off = if is_head_major {
+                                    (kv_h * kv_capacity + t) * head_dim
+                                } else {
+                                    (t * n_heads_kv + kv_h) * head_dim
+                                };
                                 let k_ptr = k_data.as_ptr().add(k_off);
 
                                 #[cfg(target_arch = "aarch64")]
@@ -768,7 +799,11 @@ impl LlamaLayer {
 
                             for t in 0..cache_seq_len {
                                 let weight = *active_scores.get_unchecked(t);
-                                let v_off = (t * n_heads_kv + kv_h) * head_dim;
+                                let v_off = if is_head_major {
+                                    (kv_h * kv_capacity + t) * head_dim
+                                } else {
+                                    (t * n_heads_kv + kv_h) * head_dim
+                                };
                                 let v_ptr = v_data.as_ptr().add(v_off);
                                 #[cfg(target_arch = "aarch64")]
                                 let out_ptr_h = out_h.as_mut_ptr();

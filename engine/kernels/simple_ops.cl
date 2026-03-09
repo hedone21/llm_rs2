@@ -397,31 +397,34 @@ REQD_SUBGROUP_SIZE_64
 #endif
 kernel void kernel_attn_gen(
     global float * Q,            // [num_heads_q, head_dim]
-    global float * K,            // [cache_seq_len, num_heads_kv, head_dim]
-    global float * V,            // [cache_seq_len, num_heads_kv, head_dim]
+    global float * K,            // SeqMajor: [seq, kv_heads, head_dim] or HeadMajor: [kv_heads, cap, head_dim]
+    global float * V,            // same layout as K
     global float * O,            // [num_heads_q, head_dim]
     int head_dim,
     int num_heads_q,
     int num_heads_kv,
     int cache_seq_len,
     float scale,
+    int kv_pos_stride,           // stride between positions (SeqMajor: kv_heads*head_dim, HeadMajor: head_dim)
+    int kv_head_stride,          // stride between heads (SeqMajor: head_dim, HeadMajor: cap*head_dim)
     local float * scratch        // size = local_size
 ) {
     int head_idx = get_group_id(0);    // which Q head
     int lid = get_local_id(0);
     int local_size = get_local_size(0);
-    
+
     // GQA: map Q head to KV head
     int gqa_ratio = num_heads_q / num_heads_kv;
     int kv_head = head_idx / gqa_ratio;
-    
+    int kv_base = kv_head * kv_head_stride;
+
     // Pointers
     global float * q_ptr = Q + head_idx * head_dim;
-    
+
     // === PASS 1: Compute max score using online approach ===
     float my_max = -INFINITY;
     for (int t = lid; t < cache_seq_len; t += local_size) {
-        global float * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        global float * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_ptr[d] * k_ptr[d];
@@ -429,7 +432,7 @@ kernel void kernel_attn_gen(
         score *= scale;
         my_max = fmax(my_max, score);
     }
-    
+
     // Reduce max across workgroup
     scratch[lid] = my_max;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -439,18 +442,18 @@ kernel void kernel_attn_gen(
     }
     float max_score = scratch[0];
     barrier(CLK_LOCAL_MEM_FENCE);
-    
+
     // Compute exp sum with known max
     float my_sum = 0.0f;
     for (int t = lid; t < cache_seq_len; t += local_size) {
-        global float * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        global float * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_ptr[d] * k_ptr[d];
         }
         my_sum += exp(score * scale - max_score);
     }
-    
+
     // Reduce sum
     scratch[lid] = my_sum;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -460,35 +463,35 @@ kernel void kernel_attn_gen(
     }
     float total_sum = scratch[0];
     barrier(CLK_LOCAL_MEM_FENCE);
-    
+
     // === PASS 2: Compute weighted V sum ===
     // Each thread accumulates output for ALL head_dim elements for its subset of tokens
     // Then we reduce across threads
-    
+
     // Initialize output accumulator per thread
     float out_local[64]; // Assuming head_dim <= 64
     for (int d = 0; d < head_dim; d++) {
         out_local[d] = 0.0f;
     }
-    
+
     // Each thread processes its subset of tokens
     for (int t = lid; t < cache_seq_len; t += local_size) {
-        global float * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
-        
+        global float * k_ptr = K + kv_base + t * kv_pos_stride;
+
         // Compute weight for this token
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_ptr[d] * k_ptr[d];
         }
         float weight = exp(score * scale - max_score) / total_sum;
-        
+
         // Accumulate V contribution
-        global float * v_ptr = V + (t * num_heads_kv + kv_head) * head_dim;
+        global float * v_ptr = V + kv_base + t * kv_pos_stride;
         for (int d = 0; d < head_dim; d++) {
             out_local[d] += weight * v_ptr[d];
         }
     }
-    
+
     // Reduce output across threads for each dimension
     // Use scratch for reduction (one dimension at a time)
     for (int d = 0; d < head_dim; d++) {
@@ -525,14 +528,16 @@ kernel void kernel_cast_f32_to_f16(
 // Q is F32, K/V cache is F16, output is F32
 kernel void kernel_attn_gen_half(
     global float * Q,            // [num_heads_q, head_dim]
-    global half * K,             // [cache_seq_len, num_heads_kv, head_dim]
-    global half * V,             // [cache_seq_len, num_heads_kv, head_dim]
+    global half * K,             // SeqMajor: [seq, kv_heads, head_dim] or HeadMajor: [kv_heads, cap, head_dim]
+    global half * V,             // same layout as K
     global float * O,            // [num_heads_q, head_dim]
     int head_dim,
     int num_heads_q,
     int num_heads_kv,
     int cache_seq_len,
     float scale,
+    int kv_pos_stride,           // stride between positions (SeqMajor: kv_heads*head_dim, HeadMajor: head_dim)
+    int kv_head_stride,          // stride between heads (SeqMajor: head_dim, HeadMajor: cap*head_dim)
     local float * scratch        // size = local_size
 ) {
     int head_idx = get_group_id(0);
@@ -541,13 +546,14 @@ kernel void kernel_attn_gen_half(
 
     int gqa_ratio = num_heads_q / num_heads_kv;
     int kv_head = head_idx / gqa_ratio;
+    int kv_base = kv_head * kv_head_stride;
 
     global float * q_ptr = Q + head_idx * head_dim;
 
     // === PASS 1: Compute max score ===
     float my_max = -INFINITY;
     for (int t = lid; t < cache_seq_len; t += local_size) {
-        global half * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        global half * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_ptr[d] * vload_half(d, k_ptr);
@@ -568,7 +574,7 @@ kernel void kernel_attn_gen_half(
     // Compute exp sum
     float my_sum = 0.0f;
     for (int t = lid; t < cache_seq_len; t += local_size) {
-        global half * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        global half * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_ptr[d] * vload_half(d, k_ptr);
@@ -592,14 +598,14 @@ kernel void kernel_attn_gen_half(
     }
 
     for (int t = lid; t < cache_seq_len; t += local_size) {
-        global half * k_ptr = K + (t * num_heads_kv + kv_head) * head_dim;
+        global half * k_ptr = K + kv_base + t * kv_pos_stride;
         float score = 0.0f;
         for (int d = 0; d < head_dim; d++) {
             score += q_ptr[d] * vload_half(d, k_ptr);
         }
         float weight = exp(score * scale - max_score) / total_sum;
 
-        global half * v_ptr = V + (t * num_heads_kv + kv_head) * head_dim;
+        global half * v_ptr = V + kv_base + t * kv_pos_stride;
         for (int d = 0; d < head_dim; d++) {
             out_local[d] += weight * vload_half(d, v_ptr);
         }

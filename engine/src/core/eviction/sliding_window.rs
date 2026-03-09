@@ -75,32 +75,12 @@ impl EvictionPolicy for SlidingWindowPolicy {
         if self.protected_prefix == 0 {
             cache.prune_prefix(prune_count)?;
         } else {
-            // Move [protected_prefix+prune_count .. current_pos] to [protected_prefix ..]
-            let shape = cache.k_buffer.shape().dims();
-            let heads = shape[2];
-            let dim = shape[3];
-            let is_q4 = cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
-
-            let (src_off, dst_off, move_count) = if is_q4 {
-                let bpp = heads * dim / crate::core::quant::QK4_0;
-                (
-                    (self.protected_prefix + prune_count) * bpp,
-                    self.protected_prefix * bpp,
-                    (current - self.protected_prefix - prune_count) * bpp,
-                )
-            } else {
-                let epp = heads * dim;
-                (
-                    (self.protected_prefix + prune_count) * epp,
-                    self.protected_prefix * epp,
-                    (current - self.protected_prefix - prune_count) * epp,
-                )
-            };
-
-            let backend = cache.k_buffer.backend().clone();
-            backend.buffer_shift(&mut cache.k_buffer, src_off, dst_off, move_count)?;
-            backend.buffer_shift(&mut cache.v_buffer, src_off, dst_off, move_count)?;
-
+            let remaining = current - self.protected_prefix - prune_count;
+            cache.shift_positions(
+                self.protected_prefix + prune_count,
+                self.protected_prefix,
+                remaining,
+            )?;
             cache.current_pos -= prune_count;
         }
 

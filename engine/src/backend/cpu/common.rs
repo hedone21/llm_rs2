@@ -320,6 +320,12 @@ impl Backend for CpuBackendCommon {
         let scale = 1.0 / (head_dim as f32).sqrt();
         let gqa_ratio = num_heads_q / num_heads_kv;
 
+        // Detect layout: HeadMajor [batch, kv_heads, capacity, head_dim]
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        let capacity = if is_head_major { k_shape[2] } else { 0 };
+
         match k_cache.dtype() {
             DType::F32 => {
                 let k_data = k_cache.as_slice::<f32>();
@@ -333,7 +339,11 @@ impl Backend for CpuBackendCommon {
                         let q_vec = &q_data[q_off..q_off + head_dim];
                         let mut scores = vec![0.0f32; cache_seq_len];
                         for t in 0..cache_seq_len {
-                            let off = (t * num_heads_kv + kv_h) * head_dim;
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
                             let k_vec = &k_data[off..off + head_dim];
                             let s: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
                             scores[t] = s * scale;
@@ -354,7 +364,11 @@ impl Backend for CpuBackendCommon {
                         }
                         for t in 0..cache_seq_len {
                             let w = scores[t];
-                            let off = (t * num_heads_kv + kv_h) * head_dim;
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
                             let v_vec = &v_data[off..off + head_dim];
                             for d in 0..head_dim {
                                 out_h[d] += w * v_vec[d];
@@ -378,7 +392,11 @@ impl Backend for CpuBackendCommon {
 
                         // Q * K^T: convert K row to F32, then NEON dot
                         for t in 0..cache_seq_len {
-                            let off = (t * num_heads_kv + kv_h) * head_dim;
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
                             let k_row = &k_data[off..off + head_dim];
                             // Bulk F16→F32 conversion (compiler auto-vectorizes on aarch64)
                             for d in 0..head_dim {
@@ -454,7 +472,11 @@ impl Backend for CpuBackendCommon {
                         }
                         for t in 0..cache_seq_len {
                             let w = scores[t];
-                            let off = (t * num_heads_kv + kv_h) * head_dim;
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
                             let v_row = &v_data[off..off + head_dim];
                             for d in 0..head_dim {
                                 kv_f32[d] = v_row[d].to_f32();
@@ -552,7 +574,11 @@ impl Backend for CpuBackendCommon {
 
                         // Q * K^T: dequantize K row, then dot
                         for t in 0..cache_seq_len {
-                            let block_off = (t * num_heads_kv + kv_h) * blocks_per_row;
+                            let block_off = if is_head_major {
+                                (kv_h * capacity + t) * blocks_per_row
+                            } else {
+                                (t * num_heads_kv + kv_h) * blocks_per_row
+                            };
                             // Dequantize K row into kv_f32
                             for bi in 0..blocks_per_row {
                                 let mut tmp = [0.0f32; QK4_0];
@@ -627,7 +653,11 @@ impl Backend for CpuBackendCommon {
                         }
                         for t in 0..cache_seq_len {
                             let w = scores[t];
-                            let block_off = (t * num_heads_kv + kv_h) * blocks_per_row;
+                            let block_off = if is_head_major {
+                                (kv_h * capacity + t) * blocks_per_row
+                            } else {
+                                (t * num_heads_kv + kv_h) * blocks_per_row
+                            };
                             for bi in 0..blocks_per_row {
                                 let mut tmp = [0.0f32; QK4_0];
                                 v_raw[block_off + bi].dequantize(&mut tmp);

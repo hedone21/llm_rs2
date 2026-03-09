@@ -31,7 +31,8 @@ pub trait Backend: Send + Sync {
     fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()>;
 
     // Single-query attention for generation (GQA-aware)
-    // Q: [num_heads_q, head_dim], K/V cache: [cache_seq_len, num_heads_kv, head_dim]
+    // Q: [num_heads_q, head_dim]
+    // K/V cache: SeqMajor [cache_seq_len, num_heads_kv, head_dim] or HeadMajor [num_heads_kv, capacity, head_dim]
     // Output: [num_heads_q, head_dim]
     #[allow(clippy::too_many_arguments)]
     fn attention_gen(
@@ -59,6 +60,12 @@ pub trait Backend: Send + Sync {
         let scale = 1.0 / (head_dim as f32).sqrt();
         let gqa_ratio = num_heads_q / num_heads_kv;
 
+        // Detect layout from shape: HeadMajor if shape[1] == num_heads_kv
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        let capacity = if is_head_major { k_shape[2] } else { 0 };
+
         for h in 0..num_heads_q {
             let kv_h = h / gqa_ratio;
             let q_off = h * head_dim;
@@ -68,7 +75,11 @@ pub trait Backend: Send + Sync {
             let mut scores = vec![0.0f32; cache_seq_len];
             #[allow(clippy::needless_range_loop)]
             for t in 0..cache_seq_len {
-                let k_off = (t * num_heads_kv + kv_h) * head_dim;
+                let k_off = if is_head_major {
+                    (kv_h * capacity + t) * head_dim
+                } else {
+                    (t * num_heads_kv + kv_h) * head_dim
+                };
                 let k_vec = &k_data[k_off..k_off + head_dim];
                 let score: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
                 scores[t] = score * scale;
@@ -93,7 +104,11 @@ pub trait Backend: Send + Sync {
             #[allow(clippy::needless_range_loop)]
             for t in 0..cache_seq_len {
                 let weight = scores[t];
-                let v_off = (t * num_heads_kv + kv_h) * head_dim;
+                let v_off = if is_head_major {
+                    (kv_h * capacity + t) * head_dim
+                } else {
+                    (t * num_heads_kv + kv_h) * head_dim
+                };
                 let v_vec = &v_data[v_off..v_off + head_dim];
                 for d in 0..head_dim {
                     out_data[out_off + d] += weight * v_vec[d];

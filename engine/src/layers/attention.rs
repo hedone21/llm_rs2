@@ -222,6 +222,50 @@ pub fn flash_attention_forward(
     br: usize,
     bc: usize,
 ) {
+    flash_attention_forward_strided(
+        q,
+        k,
+        v,
+        out,
+        n_heads_q,
+        n_heads_kv,
+        q_len,
+        kv_len,
+        head_dim,
+        q_stride,
+        k_stride,
+        v_stride,
+        out_stride,
+        head_dim, // kv_head_stride: SeqMajor default
+        q_start_pos,
+        br,
+        bc,
+    );
+}
+
+/// Like `flash_attention_forward` but with explicit `kv_head_stride` for layout-awareness.
+/// - SeqMajor: kv_head_stride = head_dim
+/// - HeadMajor: kv_head_stride = capacity * head_dim
+#[allow(clippy::too_many_arguments)]
+pub fn flash_attention_forward_strided(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    q_stride: usize,
+    k_stride: usize,
+    v_stride: usize,
+    out_stride: usize,
+    kv_head_stride: usize,
+    q_start_pos: usize,
+    br: usize,
+    bc: usize,
+) {
     let n_rep = n_heads_q / n_heads_kv;
 
     // We need to extract pointers BEFORE the closure to avoid capturing `&mut [f32]` which cannot be shared.
@@ -239,7 +283,7 @@ pub fn flash_attention_forward(
     (0..n_heads_q).into_par_iter().for_each(move |h| {
         let kv_h = h / n_rep;
         let q_head_offset = h * head_dim;
-        let k_head_offset = kv_h * head_dim;
+        let k_head_offset = kv_h * kv_head_stride;
         let out_head_offset = h * head_dim;
 
         let q_ptr = q_ptr_raw.load(Ordering::Relaxed);

@@ -881,6 +881,18 @@ impl Backend for OpenCLBackend {
         let local_size = 64usize;
         let local_mem_size = local_size * std::mem::size_of::<f32>();
 
+        // Detect layout from shape: HeadMajor [batch, kv_heads, capacity, head_dim]
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        let capacity = if is_head_major { k_shape[2] } else { 0 };
+
+        let (kv_pos_stride, kv_head_stride) = if is_head_major {
+            (head_dim as i32, (capacity * head_dim) as i32)
+        } else {
+            ((num_heads_kv * head_dim) as i32, head_dim as i32)
+        };
+
         let kernels = self
             .kernels
             .lock()
@@ -910,7 +922,13 @@ impl Backend for OpenCLBackend {
                 ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
             )?;
             ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
-            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&kv_pos_stride))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&kv_head_stride))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                11,
+                ocl::core::ArgVal::local::<f32>(&local_mem_size),
+            )?;
 
             let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];

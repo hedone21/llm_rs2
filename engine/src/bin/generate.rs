@@ -7,7 +7,7 @@ use llm_rs2::core::cache_manager::CacheManager;
 use llm_rs2::core::eviction::h2o::H2OPolicy;
 use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
-use llm_rs2::core::kv_cache::KVCache;
+use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
@@ -353,25 +353,28 @@ fn main() -> anyhow::Result<()> {
         let v_buf = memory.alloc(kv_buf_size, kv_type)?;
 
         let k = Tensor::new(
-            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
+            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]),
             k_buf,
             backend.clone(),
         );
         let v = Tensor::new(
-            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
+            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]),
             v_buf,
             backend.clone(),
         );
 
-        kv_caches.push(KVCache::new_dynamic(
-            k,
-            v,
-            initial_kv_capacity,
-            max_seq_len,
-            kv_heads,
-            head_dim,
-            memory.clone(),
-        ));
+        kv_caches.push(
+            KVCache::new_dynamic(
+                k,
+                v,
+                initial_kv_capacity,
+                max_seq_len,
+                kv_heads,
+                head_dim,
+                memory.clone(),
+            )
+            .with_layout(KVLayout::HeadMajor),
+        );
     }
 
     // 5. Experiment schedule + Resilience Manager

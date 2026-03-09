@@ -8,7 +8,7 @@ use llm_rs2::core::cache_manager::CacheManager;
 use llm_rs2::core::eviction::h2o::H2OPolicy;
 use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
-use llm_rs2::core::kv_cache::KVCache;
+use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
@@ -223,6 +223,7 @@ fn migrate_kv_caches(
             (k_cpu_tensor, v_cpu_tensor)
         };
 
+        let saved_layout = kv.layout();
         let mut new_kv = KVCache::new_dynamic(
             k_final,
             v_final,
@@ -231,7 +232,8 @@ fn migrate_kv_caches(
             kv_heads,
             head_dim,
             dst_memory.clone(),
-        );
+        )
+        .with_layout(saved_layout);
         new_kv.current_pos = saved_pos;
         *kv = new_kv;
     }
@@ -299,24 +301,27 @@ fn main() -> anyhow::Result<()> {
         let k_buf = cpu_memory.alloc(kv_buf_size, DType::F32)?;
         let v_buf = cpu_memory.alloc(kv_buf_size, DType::F32)?;
         let k = Tensor::new(
-            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
+            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]),
             k_buf,
             cpu_backend.clone(),
         );
         let v = Tensor::new(
-            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim]),
+            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]),
             v_buf,
             cpu_backend.clone(),
         );
-        kv_caches.push(KVCache::new_dynamic(
-            k,
-            v,
-            initial_kv_capacity,
-            max_seq_len,
-            kv_heads,
-            head_dim,
-            cpu_memory.clone(),
-        ));
+        kv_caches.push(
+            KVCache::new_dynamic(
+                k,
+                v,
+                initial_kv_capacity,
+                max_seq_len,
+                kv_heads,
+                head_dim,
+                cpu_memory.clone(),
+            )
+            .with_layout(KVLayout::HeadMajor),
+        );
     }
 
     // Setup CacheManager

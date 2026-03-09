@@ -71,30 +71,11 @@ impl EvictionPolicy for H2OPolicy {
             keep,
         );
 
-        let shape = cache.k_buffer.shape().dims();
-        let heads = shape[2];
-        let dim = shape[3];
-        let is_q4 = cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
-
-        let (src_off, dst_off, move_count) = if is_q4 {
-            let bpp = heads * dim / crate::core::quant::QK4_0;
-            (
-                (self.protected_prefix + prune_count) * bpp,
-                self.protected_prefix * bpp,
-                actual_recent * bpp,
-            )
-        } else {
-            let epp = heads * dim;
-            (
-                (self.protected_prefix + prune_count) * epp,
-                self.protected_prefix * epp,
-                actual_recent * epp,
-            )
-        };
-
-        let backend = cache.k_buffer.backend().clone();
-        backend.buffer_shift(&mut cache.k_buffer, src_off, dst_off, move_count)?;
-        backend.buffer_shift(&mut cache.v_buffer, src_off, dst_off, move_count)?;
+        cache.shift_positions(
+            self.protected_prefix + prune_count,
+            self.protected_prefix,
+            actual_recent,
+        )?;
 
         cache.current_pos = self.protected_prefix + actual_recent;
 
@@ -159,24 +140,10 @@ impl EvictionPolicy for H2OPolicy {
         let recent_positions: Vec<usize> = (recent_start..current).collect();
 
         // 5. Compact the KV cache: [prefix..., heavy hitters in order..., recent in order...]
-        let shape = cache.k_buffer.shape().dims();
-        let heads = shape[2];
-        let dim = shape[3];
-        let is_q4 = cache.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
-        let units_per_pos = if is_q4 {
-            heads * dim / crate::core::quant::QK4_0
-        } else {
-            heads * dim
-        };
-
-        let backend = cache.k_buffer.backend().clone();
         let mut write_pos = self.protected_prefix;
         for &src_pos in hh_positions.iter().chain(recent_positions.iter()) {
             if src_pos != write_pos {
-                let src_off = src_pos * units_per_pos;
-                let dst_off = write_pos * units_per_pos;
-                backend.buffer_shift(&mut cache.k_buffer, src_off, dst_off, units_per_pos)?;
-                backend.buffer_shift(&mut cache.v_buffer, src_off, dst_off, units_per_pos)?;
+                cache.shift_positions(src_pos, write_pos, 1)?;
             }
             write_pos += 1;
         }

@@ -4,6 +4,16 @@ use crate::core::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
 
+/// KV cache memory layout.
+///
+/// - `SeqMajor`: `[batch, seq_pos, kv_heads, head_dim]` — positions contiguous across heads.
+/// - `HeadMajor`: `[batch, kv_heads, seq_pos, head_dim]` — each head's positions contiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KVLayout {
+    SeqMajor,
+    HeadMajor,
+}
+
 pub struct KVCache {
     pub k_buffer: Tensor,
     pub v_buffer: Tensor,
@@ -12,12 +22,13 @@ pub struct KVCache {
     capacity: usize,
     kv_heads: usize,
     head_dim: usize,
+    pub(crate) layout: KVLayout,
     memory: Option<Arc<dyn Memory>>,
 }
 
 impl KVCache {
     /// Create a KVCache with full pre-allocation (capacity = max_seq_len).
-    /// Growth is disabled. This preserves backward compatibility.
+    /// Growth is disabled. Layout defaults to SeqMajor for backward compatibility.
     pub fn new(k: Tensor, v: Tensor, max_seq_len: usize) -> Self {
         let shape = k.shape().dims();
         let kv_heads = shape[2];
@@ -30,12 +41,14 @@ impl KVCache {
             capacity: max_seq_len,
             kv_heads,
             head_dim,
+            layout: KVLayout::SeqMajor,
             memory: None,
         }
     }
 
     /// Create a KVCache with dynamic grow-on-demand allocation.
     /// Starts with `initial_capacity` and doubles up to `max_seq_len`.
+    /// Layout defaults to SeqMajor for backward compatibility.
     pub fn new_dynamic(
         k: Tensor,
         v: Tensor,
@@ -53,6 +66,7 @@ impl KVCache {
             capacity: initial_capacity,
             kv_heads,
             head_dim,
+            layout: KVLayout::SeqMajor,
             memory: Some(memory),
         }
     }
@@ -60,6 +74,54 @@ impl KVCache {
     /// Current physical buffer capacity in tokens.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    pub fn layout(&self) -> KVLayout {
+        self.layout
+    }
+
+    /// Set the KV cache layout. Must be called before any data is written.
+    pub fn with_layout(mut self, layout: KVLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    pub fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    pub fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    /// Element offset for position `pos` of head `head`.
+    ///
+    /// - SeqMajor: `pos * kv_heads * head_dim + head * head_dim`
+    /// - HeadMajor: `head * capacity * head_dim + pos * head_dim`
+    #[inline]
+    pub fn offset(&self, pos: usize, head: usize) -> usize {
+        match self.layout {
+            KVLayout::SeqMajor => pos * self.kv_heads * self.head_dim + head * self.head_dim,
+            KVLayout::HeadMajor => head * self.capacity * self.head_dim + pos * self.head_dim,
+        }
+    }
+
+    /// Elements between consecutive positions for the same head.
+    #[inline]
+    pub fn pos_stride(&self) -> usize {
+        match self.layout {
+            KVLayout::SeqMajor => self.kv_heads * self.head_dim,
+            KVLayout::HeadMajor => self.head_dim,
+        }
+    }
+
+    /// Elements between consecutive heads for the same position.
+    #[inline]
+    pub fn head_stride(&self) -> usize {
+        match self.layout {
+            KVLayout::SeqMajor => self.head_dim,
+            KVLayout::HeadMajor => self.capacity * self.head_dim,
+        }
     }
 
     /// Grow the KV cache buffers to at least `min_capacity` tokens.
@@ -82,7 +144,10 @@ impl KVCache {
             _ => n_values * dtype.size(),
         };
 
-        let new_shape = Shape::new(vec![1, new_cap, self.kv_heads, self.head_dim]);
+        let new_shape = match self.layout {
+            KVLayout::SeqMajor => Shape::new(vec![1, new_cap, self.kv_heads, self.head_dim]),
+            KVLayout::HeadMajor => Shape::new(vec![1, self.kv_heads, new_cap, self.head_dim]),
+        };
 
         // Allocate new buffers
         let new_k_buf = memory.alloc(buf_size, dtype)?;
@@ -92,14 +157,66 @@ impl KVCache {
 
         // Copy existing data
         if self.current_pos > 0 {
-            let copy_count = if dtype == crate::core::buffer::DType::Q4_0 {
-                let blocks_per_pos = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
-                self.current_pos * blocks_per_pos
-            } else {
-                self.current_pos * self.kv_heads * self.head_dim
-            };
-            backend.copy_slice(&self.k_buffer, &mut new_k, 0, 0, copy_count)?;
-            backend.copy_slice(&self.v_buffer, &mut new_v, 0, 0, copy_count)?;
+            match self.layout {
+                KVLayout::SeqMajor => {
+                    // Contiguous: all positions × heads × dim
+                    let copy_count = if dtype == crate::core::buffer::DType::Q4_0 {
+                        let blocks_per_pos =
+                            self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                        self.current_pos * blocks_per_pos
+                    } else {
+                        self.current_pos * self.kv_heads * self.head_dim
+                    };
+                    backend.copy_slice(&self.k_buffer, &mut new_k, 0, 0, copy_count)?;
+                    backend.copy_slice(&self.v_buffer, &mut new_v, 0, 0, copy_count)?;
+                }
+                KVLayout::HeadMajor => {
+                    // Per-head copy: capacity changes head_stride
+                    let old_head_stride = self.capacity * self.head_dim;
+                    let new_head_stride = new_cap * self.head_dim;
+                    let copy_per_head = self.current_pos * self.head_dim;
+
+                    if dtype == crate::core::buffer::DType::Q4_0 {
+                        let qk = crate::core::quant::QK4_0;
+                        let old_hs = old_head_stride / qk;
+                        let new_hs = new_head_stride / qk;
+                        let cph = copy_per_head / qk;
+                        for h in 0..self.kv_heads {
+                            backend.copy_slice(
+                                &self.k_buffer,
+                                &mut new_k,
+                                h * old_hs,
+                                h * new_hs,
+                                cph,
+                            )?;
+                            backend.copy_slice(
+                                &self.v_buffer,
+                                &mut new_v,
+                                h * old_hs,
+                                h * new_hs,
+                                cph,
+                            )?;
+                        }
+                    } else {
+                        for h in 0..self.kv_heads {
+                            backend.copy_slice(
+                                &self.k_buffer,
+                                &mut new_k,
+                                h * old_head_stride,
+                                h * new_head_stride,
+                                copy_per_head,
+                            )?;
+                            backend.copy_slice(
+                                &self.v_buffer,
+                                &mut new_v,
+                                h * old_head_stride,
+                                h * new_head_stride,
+                                copy_per_head,
+                            )?;
+                        }
+                    }
+                }
+            }
         }
 
         log::info!(
@@ -115,6 +232,11 @@ impl KVCache {
         Ok(())
     }
 
+    /// Append new K/V data to the cache.
+    ///
+    /// Input tensors are always seq-major `[batch, seq_len, kv_heads, head_dim]`
+    /// (from the model's matmul output). For HeadMajor layout, this scatters
+    /// per-head data to the correct positions.
     pub fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
         let seq_len = new_k.shape().dims()[1];
 
@@ -125,22 +247,81 @@ impl KVCache {
             self.grow(self.current_pos + seq_len)?;
         }
 
-        let shape = self.k_buffer.shape().dims();
-        let heads = shape[2];
-        let dim = shape[3];
-
-        // For Q4_0, offsets/counts are in block units (each block = 32 elements = 18 bytes)
-        let (offset, count) = if self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0 {
-            let blocks_per_pos = heads * dim / crate::core::quant::QK4_0;
-            (self.current_pos * blocks_per_pos, seq_len * blocks_per_pos)
-        } else {
-            let height = heads * dim;
-            (self.current_pos * height, seq_len * height)
-        };
-
         let backend = self.k_buffer.backend().clone();
-        backend.copy_slice(new_k, &mut self.k_buffer, 0, offset, count)?;
-        backend.copy_slice(new_v, &mut self.v_buffer, 0, offset, count)?;
+        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+
+        match self.layout {
+            KVLayout::SeqMajor => {
+                // Contiguous: single copy per buffer
+                let (offset, count) = if is_q4 {
+                    let bpp = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    (self.current_pos * bpp, seq_len * bpp)
+                } else {
+                    let row = self.kv_heads * self.head_dim;
+                    (self.current_pos * row, seq_len * row)
+                };
+                backend.copy_slice(new_k, &mut self.k_buffer, 0, offset, count)?;
+                backend.copy_slice(new_v, &mut self.v_buffer, 0, offset, count)?;
+            }
+            KVLayout::HeadMajor => {
+                // Input is seq-major: [batch, seq_len, kv_heads, head_dim]
+                // Scatter to head-major: each head's data at head * capacity * head_dim + pos * head_dim
+                if is_q4 {
+                    let qk = crate::core::quant::QK4_0;
+                    let src_row = self.kv_heads * self.head_dim / qk; // blocks per seq position in input
+                    let dst_head_stride = self.capacity * self.head_dim / qk;
+                    let blocks_per_head = self.head_dim / qk;
+                    let dst_pos_blocks = self.current_pos * blocks_per_head;
+
+                    for s in 0..seq_len {
+                        for h in 0..self.kv_heads {
+                            let src_off = s * src_row + h * blocks_per_head;
+                            let dst_off =
+                                h * dst_head_stride + dst_pos_blocks + s * blocks_per_head;
+                            backend.copy_slice(
+                                new_k,
+                                &mut self.k_buffer,
+                                src_off,
+                                dst_off,
+                                blocks_per_head,
+                            )?;
+                            backend.copy_slice(
+                                new_v,
+                                &mut self.v_buffer,
+                                src_off,
+                                dst_off,
+                                blocks_per_head,
+                            )?;
+                        }
+                    }
+                } else {
+                    let src_row = self.kv_heads * self.head_dim; // elements per seq position in input
+                    let dst_head_stride = self.capacity * self.head_dim;
+
+                    for s in 0..seq_len {
+                        for h in 0..self.kv_heads {
+                            let src_off = s * src_row + h * self.head_dim;
+                            let dst_off =
+                                h * dst_head_stride + (self.current_pos + s) * self.head_dim;
+                            backend.copy_slice(
+                                new_k,
+                                &mut self.k_buffer,
+                                src_off,
+                                dst_off,
+                                self.head_dim,
+                            )?;
+                            backend.copy_slice(
+                                new_v,
+                                &mut self.v_buffer,
+                                src_off,
+                                dst_off,
+                                self.head_dim,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
 
         self.current_pos += seq_len;
 
@@ -168,9 +349,6 @@ impl KVCache {
             ));
         }
 
-        let shape = self.k_buffer.shape().dims();
-        let heads = shape[2];
-        let dim = shape[3];
         let remaining = self.current_pos - count;
 
         if remaining == 0 {
@@ -178,19 +356,62 @@ impl KVCache {
             return Ok(());
         }
 
+        let backend = self.k_buffer.backend().clone();
         let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
 
-        let (src_offset, move_count) = if is_q4 {
-            let bpp = heads * dim / crate::core::quant::QK4_0;
-            (count * bpp, remaining * bpp)
-        } else {
-            let epp = heads * dim;
-            (count * epp, remaining * epp)
-        };
-
-        let backend = self.k_buffer.backend().clone();
-        backend.buffer_shift(&mut self.k_buffer, src_offset, 0, move_count)?;
-        backend.buffer_shift(&mut self.v_buffer, src_offset, 0, move_count)?;
+        match self.layout {
+            KVLayout::SeqMajor => {
+                let (src_offset, move_count) = if is_q4 {
+                    let bpp = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    (count * bpp, remaining * bpp)
+                } else {
+                    let epp = self.kv_heads * self.head_dim;
+                    (count * epp, remaining * epp)
+                };
+                backend.buffer_shift(&mut self.k_buffer, src_offset, 0, move_count)?;
+                backend.buffer_shift(&mut self.v_buffer, src_offset, 0, move_count)?;
+            }
+            KVLayout::HeadMajor => {
+                // Per-head shift: each head's data is contiguous
+                if is_q4 {
+                    let qk = crate::core::quant::QK4_0;
+                    let head_stride = self.capacity * self.head_dim / qk;
+                    let bph = self.head_dim / qk; // blocks per head per position
+                    for h in 0..self.kv_heads {
+                        let base = h * head_stride;
+                        backend.buffer_shift(
+                            &mut self.k_buffer,
+                            base + count * bph,
+                            base,
+                            remaining * bph,
+                        )?;
+                        backend.buffer_shift(
+                            &mut self.v_buffer,
+                            base + count * bph,
+                            base,
+                            remaining * bph,
+                        )?;
+                    }
+                } else {
+                    let head_stride = self.capacity * self.head_dim;
+                    for h in 0..self.kv_heads {
+                        let base = h * head_stride;
+                        backend.buffer_shift(
+                            &mut self.k_buffer,
+                            base + count * self.head_dim,
+                            base,
+                            remaining * self.head_dim,
+                        )?;
+                        backend.buffer_shift(
+                            &mut self.v_buffer,
+                            base + count * self.head_dim,
+                            base,
+                            remaining * self.head_dim,
+                        )?;
+                    }
+                }
+            }
+        }
 
         self.current_pos = remaining;
         Ok(())
@@ -198,22 +419,86 @@ impl KVCache {
 
     /// Returns the memory usage in bytes for currently stored KV data.
     pub fn memory_usage_bytes(&self) -> usize {
-        let shape = self.k_buffer.shape().dims();
-        let heads = shape[2];
-        let dim = shape[3];
-
         let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
 
         let per_buffer = if is_q4 {
-            let blocks_per_pos = heads * dim / crate::core::quant::QK4_0;
+            let blocks_per_pos = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
             let block_size = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
             self.current_pos * blocks_per_pos * block_size
         } else {
             let type_size = self.k_buffer.dtype().size();
-            self.current_pos * heads * dim * type_size
+            self.current_pos * self.kv_heads * self.head_dim * type_size
         };
 
         per_buffer * 2 // K + V
+    }
+
+    /// Layout-aware position shift for eviction policies.
+    ///
+    /// Moves `count` positions worth of data from `src_pos` to `dst_pos`
+    /// within both K and V buffers. Handles per-head scattering for HeadMajor.
+    pub fn shift_positions(&mut self, src_pos: usize, dst_pos: usize, count: usize) -> Result<()> {
+        if count == 0 || src_pos == dst_pos {
+            return Ok(());
+        }
+
+        let backend = self.k_buffer.backend().clone();
+        let is_q4 = self.k_buffer.dtype() == crate::core::buffer::DType::Q4_0;
+
+        match self.layout {
+            KVLayout::SeqMajor => {
+                let (src_off, dst_off, move_count) = if is_q4 {
+                    let bpp = self.kv_heads * self.head_dim / crate::core::quant::QK4_0;
+                    (src_pos * bpp, dst_pos * bpp, count * bpp)
+                } else {
+                    let epp = self.kv_heads * self.head_dim;
+                    (src_pos * epp, dst_pos * epp, count * epp)
+                };
+                backend.buffer_shift(&mut self.k_buffer, src_off, dst_off, move_count)?;
+                backend.buffer_shift(&mut self.v_buffer, src_off, dst_off, move_count)?;
+            }
+            KVLayout::HeadMajor => {
+                if is_q4 {
+                    let qk = crate::core::quant::QK4_0;
+                    let head_stride = self.capacity * self.head_dim / qk;
+                    let bph = self.head_dim / qk;
+                    for h in 0..self.kv_heads {
+                        let base = h * head_stride;
+                        backend.buffer_shift(
+                            &mut self.k_buffer,
+                            base + src_pos * bph,
+                            base + dst_pos * bph,
+                            count * bph,
+                        )?;
+                        backend.buffer_shift(
+                            &mut self.v_buffer,
+                            base + src_pos * bph,
+                            base + dst_pos * bph,
+                            count * bph,
+                        )?;
+                    }
+                } else {
+                    let head_stride = self.capacity * self.head_dim;
+                    for h in 0..self.kv_heads {
+                        let base = h * head_stride;
+                        backend.buffer_shift(
+                            &mut self.k_buffer,
+                            base + src_pos * self.head_dim,
+                            base + dst_pos * self.head_dim,
+                            count * self.head_dim,
+                        )?;
+                        backend.buffer_shift(
+                            &mut self.v_buffer,
+                            base + src_pos * self.head_dim,
+                            base + dst_pos * self.head_dim,
+                            count * self.head_dim,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -562,5 +847,434 @@ mod tests {
         let vbuf = Arc::new(SharedBuffer::new(4 * 4, DType::F32));
         let vt = Tensor::new(Shape::new(vec![1, 1, 1, 4]), vbuf, backend.clone());
         assert!(cache.update(&t, &vt).is_err());
+    }
+
+    // ── Phase 0: Layout accessor tests ──
+
+    #[test]
+    fn test_layout_default_is_seq_major() {
+        let cache = make_cache(64, 4, 8);
+        assert_eq!(cache.layout(), KVLayout::SeqMajor);
+    }
+
+    #[test]
+    fn test_offset_seq_major() {
+        let cache = make_cache(64, 4, 8); // heads=4, dim=8, capacity=64
+        // SeqMajor: pos * kv_heads * head_dim + head * head_dim
+        assert_eq!(cache.offset(0, 0), 0);
+        assert_eq!(cache.offset(0, 1), 8);
+        assert_eq!(cache.offset(0, 3), 24);
+        assert_eq!(cache.offset(1, 0), 32); // 1 * 4 * 8
+        assert_eq!(cache.offset(5, 2), 5 * 32 + 16);
+    }
+
+    #[test]
+    fn test_offset_head_major() {
+        let cache = make_head_major_cache(64, 4, 8);
+
+        // HeadMajor: head * capacity * head_dim + pos * head_dim
+        assert_eq!(cache.offset(0, 0), 0);
+        assert_eq!(cache.offset(1, 0), 8); // pos=1, head=0 → 0 + 1*8
+        assert_eq!(cache.offset(0, 1), 512); // head=1 → 1 * 64 * 8
+        assert_eq!(cache.offset(5, 2), 2 * 512 + 5 * 8);
+    }
+
+    #[test]
+    fn test_strides_seq_major() {
+        let cache = make_cache(64, 4, 8);
+        assert_eq!(cache.pos_stride(), 32); // kv_heads * head_dim
+        assert_eq!(cache.head_stride(), 8); // head_dim
+    }
+
+    #[test]
+    fn test_strides_head_major() {
+        let cache = make_head_major_cache(64, 4, 8);
+
+        assert_eq!(cache.pos_stride(), 8); // head_dim
+        assert_eq!(cache.head_stride(), 512); // capacity * head_dim
+    }
+
+    #[test]
+    fn test_accessors() {
+        let cache = make_cache(64, 4, 8);
+        assert_eq!(cache.kv_heads(), 4);
+        assert_eq!(cache.head_dim(), 8);
+    }
+
+    // ── Phase 1: HeadMajor internal operations ──
+
+    fn make_head_major_cache(max_seq_len: usize, heads: usize, dim: usize) -> KVCache {
+        let size_bytes = max_seq_len * heads * dim * 4;
+        let k_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F32));
+        let backend = Arc::new(CpuBackend::new());
+        let k = Tensor::new(
+            Shape::new(vec![1, heads, max_seq_len, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, heads, max_seq_len, dim]), v_buf, backend);
+        KVCache {
+            k_buffer: k,
+            v_buffer: v,
+            current_pos: 0,
+            max_seq_len,
+            capacity: max_seq_len,
+            kv_heads: heads,
+            head_dim: dim,
+            layout: KVLayout::HeadMajor,
+            memory: None,
+        }
+    }
+
+    fn make_head_major_dynamic_cache(
+        initial_capacity: usize,
+        max_seq_len: usize,
+        heads: usize,
+        dim: usize,
+    ) -> KVCache {
+        let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+        let backend = Arc::new(CpuBackend::new());
+        let size_bytes = initial_capacity * heads * dim * 4;
+        let k_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F32));
+        let k = Tensor::new(
+            Shape::new(vec![1, heads, initial_capacity, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(
+            Shape::new(vec![1, heads, initial_capacity, dim]),
+            v_buf,
+            backend,
+        );
+        KVCache {
+            k_buffer: k,
+            v_buffer: v,
+            current_pos: 0,
+            max_seq_len,
+            capacity: initial_capacity,
+            kv_heads: heads,
+            head_dim: dim,
+            layout: KVLayout::HeadMajor,
+            memory: Some(memory),
+        }
+    }
+
+    /// Read a value from head-major cache at (pos, head, d=0)
+    fn hm_read(cache: &KVCache, pos: usize, head: usize) -> f32 {
+        let off = cache.offset(pos, head);
+        cache.k_buffer.as_slice::<f32>()[off]
+    }
+
+    fn hm_read_v(cache: &KVCache, pos: usize, head: usize) -> f32 {
+        let off = cache.offset(pos, head);
+        cache.v_buffer.as_slice::<f32>()[off]
+    }
+
+    #[test]
+    fn test_hm_update_single_token() {
+        let heads = 2;
+        let dim = 4;
+        let mut cache = make_head_major_cache(16, heads, dim);
+
+        // Input: seq-major [1, 1, 2, 4] — head0=[1,1,1,1], head1=[2,2,2,2]
+        let backend = Arc::new(CpuBackend::new());
+        let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+        unsafe {
+            let ptr = buf.as_mut_ptr() as *mut f32;
+            for d in 0..dim {
+                *ptr.add(d) = 1.0;
+            } // head 0
+            for d in 0..dim {
+                *ptr.add(dim + d) = 2.0;
+            } // head 1
+        }
+        let k = Tensor::new(
+            Shape::new(vec![1, 1, heads, dim]),
+            buf.clone(),
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend);
+        cache.update(&k, &v).unwrap();
+
+        assert_eq!(cache.current_pos, 1);
+        // Head 0, pos 0 should be 1.0
+        assert_eq!(hm_read(&cache, 0, 0), 1.0);
+        // Head 1, pos 0 should be 2.0
+        assert_eq!(hm_read(&cache, 0, 1), 2.0);
+    }
+
+    #[test]
+    fn test_hm_update_multi_token() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_cache(16, heads, dim);
+
+        // 3 tokens: seq-major [1,1,3,2]
+        let backend = Arc::new(CpuBackend::new());
+        let n = 3 * heads * dim;
+        let buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));
+        unsafe {
+            let ptr = buf.as_mut_ptr() as *mut f32;
+            // Token 0: h0=[10,11], h1=[20,21]
+            *ptr.add(0) = 10.0;
+            *ptr.add(1) = 11.0;
+            *ptr.add(2) = 20.0;
+            *ptr.add(3) = 21.0;
+            // Token 1: h0=[30,31], h1=[40,41]
+            *ptr.add(4) = 30.0;
+            *ptr.add(5) = 31.0;
+            *ptr.add(6) = 40.0;
+            *ptr.add(7) = 41.0;
+            // Token 2: h0=[50,51], h1=[60,61]
+            *ptr.add(8) = 50.0;
+            *ptr.add(9) = 51.0;
+            *ptr.add(10) = 60.0;
+            *ptr.add(11) = 61.0;
+        }
+        let k = Tensor::new(
+            Shape::new(vec![1, 3, heads, dim]),
+            buf.clone(),
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, 3, heads, dim]), buf, backend);
+        cache.update(&k, &v).unwrap();
+
+        assert_eq!(cache.current_pos, 3);
+        // Head 0: [10, 30, 50] at positions 0, 1, 2
+        assert_eq!(hm_read(&cache, 0, 0), 10.0);
+        assert_eq!(hm_read(&cache, 1, 0), 30.0);
+        assert_eq!(hm_read(&cache, 2, 0), 50.0);
+        // Head 1: [20, 40, 60] at positions 0, 1, 2
+        assert_eq!(hm_read(&cache, 0, 1), 20.0);
+        assert_eq!(hm_read(&cache, 1, 1), 40.0);
+        assert_eq!(hm_read(&cache, 2, 1), 60.0);
+    }
+
+    #[test]
+    fn test_hm_prune_prefix() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_cache(16, heads, dim);
+
+        // Insert 5 tokens with distinct values per head
+        let backend = Arc::new(CpuBackend::new());
+        for i in 0..5 {
+            let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                for d in 0..dim {
+                    *ptr.add(d) = (i * 10 + d) as f32;
+                }
+                for d in 0..dim {
+                    *ptr.add(dim + d) = (i * 100 + d) as f32;
+                }
+            }
+            let k = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf.clone(),
+                backend.clone(),
+            );
+            let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend.clone());
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.current_pos, 5);
+
+        // Head 0 pos 0: [0,1], pos 2: [20,21]
+        assert_eq!(hm_read(&cache, 0, 0), 0.0);
+        assert_eq!(hm_read(&cache, 2, 0), 20.0);
+
+        // Prune first 2 tokens
+        cache.prune_prefix(2).unwrap();
+        assert_eq!(cache.current_pos, 3);
+
+        // After prune: old pos 2 is now pos 0
+        // Head 0: [20, 30, 40]
+        assert_eq!(hm_read(&cache, 0, 0), 20.0);
+        assert_eq!(hm_read(&cache, 1, 0), 30.0);
+        assert_eq!(hm_read(&cache, 2, 0), 40.0);
+        // Head 1: [200, 300, 400]
+        assert_eq!(hm_read(&cache, 0, 1), 200.0);
+        assert_eq!(hm_read(&cache, 1, 1), 300.0);
+        assert_eq!(hm_read(&cache, 2, 1), 400.0);
+    }
+
+    #[test]
+    fn test_hm_dynamic_growth() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_dynamic_cache(4, 64, heads, dim);
+        assert_eq!(cache.capacity(), 4);
+
+        // Fill 4 tokens
+        let backend = Arc::new(CpuBackend::new());
+        for i in 0..4 {
+            let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                for d in 0..dim {
+                    *ptr.add(d) = (i + 1) as f32;
+                }
+                for d in 0..dim {
+                    *ptr.add(dim + d) = ((i + 1) * 10) as f32;
+                }
+            }
+            let k = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf.clone(),
+                backend.clone(),
+            );
+            let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend.clone());
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.capacity(), 4);
+
+        // 5th token triggers grow
+        let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+        unsafe {
+            let ptr = buf.as_mut_ptr() as *mut f32;
+            for d in 0..dim {
+                *ptr.add(d) = 5.0;
+            }
+            for d in 0..dim {
+                *ptr.add(dim + d) = 50.0;
+            }
+        }
+        let k = Tensor::new(
+            Shape::new(vec![1, 1, heads, dim]),
+            buf.clone(),
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend);
+        cache.update(&k, &v).unwrap();
+        assert!(cache.capacity() >= 5);
+        assert_eq!(cache.current_pos, 5);
+
+        // Verify data integrity after growth
+        assert_eq!(hm_read(&cache, 0, 0), 1.0);
+        assert_eq!(hm_read(&cache, 3, 0), 4.0);
+        assert_eq!(hm_read(&cache, 4, 0), 5.0);
+        assert_eq!(hm_read(&cache, 0, 1), 10.0);
+        assert_eq!(hm_read(&cache, 4, 1), 50.0);
+    }
+
+    #[test]
+    fn test_hm_shift_positions() {
+        let heads = 2;
+        let dim = 2;
+        let mut cache = make_head_major_cache(16, heads, dim);
+
+        let backend = Arc::new(CpuBackend::new());
+        for i in 0..5 {
+            let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                for d in 0..dim {
+                    *ptr.add(d) = (i * 10 + d) as f32;
+                }
+                for d in 0..dim {
+                    *ptr.add(dim + d) = (i * 100 + d) as f32;
+                }
+            }
+            let k = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf.clone(),
+                backend.clone(),
+            );
+            let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend.clone());
+            cache.update(&k, &v).unwrap();
+        }
+
+        // shift_positions: move positions 3..5 to 1..3
+        cache.shift_positions(3, 1, 2).unwrap();
+
+        // Head 0: pos 1 now has old pos 3 value (30)
+        assert_eq!(hm_read(&cache, 1, 0), 30.0);
+        assert_eq!(hm_read(&cache, 2, 0), 40.0);
+        // Head 1: pos 1 now has old pos 3 value (300)
+        assert_eq!(hm_read(&cache, 1, 1), 300.0);
+        assert_eq!(hm_read(&cache, 2, 1), 400.0);
+    }
+
+    /// Cross-layout: verify SeqMajor and HeadMajor produce same logical data
+    #[test]
+    fn test_cross_layout_equivalence() {
+        let heads = 2;
+        let dim = 4;
+        let backend = Arc::new(CpuBackend::new());
+
+        let mut sm_cache = make_cache(16, heads, dim);
+        let mut hm_cache = make_head_major_cache(16, heads, dim);
+
+        // Insert same 5 tokens into both
+        for i in 0..5 {
+            let buf = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf.as_mut_ptr() as *mut f32;
+                for d in 0..(heads * dim) {
+                    *ptr.add(d) = (i * 100 + d) as f32;
+                }
+            }
+            let k = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf.clone(),
+                backend.clone(),
+            );
+            let v = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf, backend.clone());
+            sm_cache.update(&k, &v).unwrap();
+
+            // Same data for hm
+            let buf2 = Arc::new(SharedBuffer::new(heads * dim * 4, DType::F32));
+            unsafe {
+                let ptr = buf2.as_mut_ptr() as *mut f32;
+                for d in 0..(heads * dim) {
+                    *ptr.add(d) = (i * 100 + d) as f32;
+                }
+            }
+            let k2 = Tensor::new(
+                Shape::new(vec![1, 1, heads, dim]),
+                buf2.clone(),
+                backend.clone(),
+            );
+            let v2 = Tensor::new(Shape::new(vec![1, 1, heads, dim]), buf2, backend.clone());
+            hm_cache.update(&k2, &v2).unwrap();
+        }
+
+        // Compare logical values at each (pos, head, d)
+        let sm_k = sm_cache.k_buffer.as_slice::<f32>();
+        let hm_k = hm_cache.k_buffer.as_slice::<f32>();
+        for pos in 0..5 {
+            for h in 0..heads {
+                for d in 0..dim {
+                    let sm_off = sm_cache.offset(pos, h) + d;
+                    let hm_off = hm_cache.offset(pos, h) + d;
+                    assert_eq!(
+                        sm_k[sm_off], hm_k[hm_off],
+                        "Mismatch at pos={}, head={}, d={}",
+                        pos, h, d
+                    );
+                }
+            }
+        }
+
+        // Prune and compare
+        sm_cache.prune_prefix(2).unwrap();
+        hm_cache.prune_prefix(2).unwrap();
+        let sm_k = sm_cache.k_buffer.as_slice::<f32>();
+        let hm_k = hm_cache.k_buffer.as_slice::<f32>();
+        for pos in 0..3 {
+            for h in 0..heads {
+                for d in 0..dim {
+                    let sm_off = sm_cache.offset(pos, h) + d;
+                    let hm_off = hm_cache.offset(pos, h) + d;
+                    assert_eq!(
+                        sm_k[sm_off], hm_k[hm_off],
+                        "After prune: mismatch at pos={}, head={}, d={}",
+                        pos, h, d
+                    );
+                }
+            }
+        }
     }
 }
