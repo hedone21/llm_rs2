@@ -149,6 +149,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     greedy: bool,
 
+    /// KV cache memory layout: "head" (head-major) or "seq" (seq-major)
+    #[arg(long, default_value = "head")]
+    kv_layout: String,
+
     /// Override eviction target_ratio from resilience signals (experiment mode).
     /// When set, all Evict actions will use this ratio instead of the strategy default.
     #[arg(long)]
@@ -342,9 +346,15 @@ fn main() -> anyhow::Result<()> {
         }
         _ => n_values * kv_type.size(),
     };
+    let use_head_major = args.kv_layout.to_lowercase() != "seq";
+    let kv_layout = if use_head_major {
+        KVLayout::HeadMajor
+    } else {
+        KVLayout::SeqMajor
+    };
     println!(
-        "KV cache type: {:?} (initial capacity: {} tokens, {}B per layer, max: {})",
-        kv_type, initial_kv_capacity, kv_buf_size, max_seq_len
+        "KV cache type: {:?}, layout: {:?} (initial capacity: {} tokens, {}B per layer, max: {})",
+        kv_type, kv_layout, initial_kv_capacity, kv_buf_size, max_seq_len
     );
 
     let mut kv_caches = Vec::new();
@@ -352,16 +362,14 @@ fn main() -> anyhow::Result<()> {
         let k_buf = memory.alloc(kv_buf_size, kv_type)?;
         let v_buf = memory.alloc(kv_buf_size, kv_type)?;
 
-        let k = Tensor::new(
-            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]),
-            k_buf,
-            backend.clone(),
-        );
-        let v = Tensor::new(
-            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim]),
-            v_buf,
-            backend.clone(),
-        );
+        let shape = if use_head_major {
+            Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim])
+        } else {
+            Shape::new(vec![1, initial_kv_capacity, kv_heads, head_dim])
+        };
+
+        let k = Tensor::new(shape.clone(), k_buf, backend.clone());
+        let v = Tensor::new(shape, v_buf, backend.clone());
 
         kv_caches.push(
             KVCache::new_dynamic(
@@ -373,7 +381,7 @@ fn main() -> anyhow::Result<()> {
                 head_dim,
                 memory.clone(),
             )
-            .with_layout(KVLayout::HeadMajor),
+            .with_layout(kv_layout),
         );
     }
 
