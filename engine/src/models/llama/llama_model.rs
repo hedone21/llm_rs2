@@ -291,6 +291,7 @@ impl LlamaModel {
                 rope_theta: self.config.rope_theta as f32,
                 workspace: None,
                 use_gpu_attn: true,
+                need_scores: false,
             })?;
         }
 
@@ -360,17 +361,9 @@ impl LlamaModel {
 
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
-            // When H2O accumulator is tracking this layer, force CPU attention
-            // so scores are written to ws.scores (GPU attention discards them).
-            let layer_gpu_attn = if let Some(ref acc) = score_accumulator {
-                if acc.should_track_layer(i) {
-                    false
-                } else {
-                    use_gpu_attn
-                }
-            } else {
-                use_gpu_attn
-            };
+            let need_scores = score_accumulator
+                .as_ref()
+                .is_some_and(|acc| acc.should_track_layer(i));
 
             layer.forward(LlamaLayerForwardArgs {
                 x: &mut x,
@@ -381,7 +374,8 @@ impl LlamaModel {
                 rms_norm_eps: self.config.rms_norm_eps as f32,
                 rope_theta: self.config.rope_theta as f32,
                 workspace: workspace.as_deref_mut(),
-                use_gpu_attn: layer_gpu_attn,
+                use_gpu_attn,
+                need_scores,
             })?;
 
             // Capture attention scores for H2O/H2O+ accumulator

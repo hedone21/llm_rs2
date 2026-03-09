@@ -44,6 +44,8 @@ impl LlamaLayer {
         let dim = x.shape().dims()[2];
         let head_dim = 64;
 
+        let need_scores = args.need_scores;
+
         if seq_len == 1
             && let Some(ws) = workspace
         {
@@ -57,6 +59,7 @@ impl LlamaLayer {
                 rms_norm_eps,
                 rope_theta,
                 use_gpu_attn,
+                need_scores,
             });
         }
 
@@ -428,6 +431,8 @@ impl LlamaLayer {
         let cache_seq_len = kv_cache.current_pos;
         let (k_cache, v_cache) = kv_cache.get_view(0);
 
+        let need_scores = args.need_scores;
+
         if (backend.name() == "OpenCL" && use_gpu_attn) || k_cache.dtype() != DType::F32 {
             // GPU attention or F16 KV cache - use backend's dtype-aware implementation
             backend.attention_gen(
@@ -440,6 +445,24 @@ impl LlamaLayer {
                 head_dim,
                 cache_seq_len,
             )?;
+
+            // Separate score computation pass for non-F32 KV cache.
+            // attention_gen() does NOT write to ws.scores, so we compute
+            // Q·K^T + softmax on CPU for score accumulation.
+            if need_scores {
+                Self::compute_attention_scores(
+                    &q_rope,
+                    &k_cache,
+                    &mut ws.scores,
+                    n_heads_q,
+                    n_heads_kv,
+                    head_dim,
+                    cache_seq_len,
+                    kv_cache.layout() == KVLayout::HeadMajor,
+                    kv_cache.capacity(),
+                    backend,
+                )?;
+            }
         } else {
             // CPU attention path (Fallback for OpenCL or native CPU F32)
             let mut q_vec = Vec::new();
@@ -904,6 +927,166 @@ impl LlamaLayer {
     }
 }
 
+impl LlamaLayer {
+    /// Compute post-softmax attention scores for non-F32 KV cache (Q4_0, F16).
+    /// This is a score-only pass — does NOT compute the attention output.
+    /// Scores are written to `scores_out` in [n_heads_q, stride] layout.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn compute_attention_scores(
+        q: &Tensor,
+        k_cache: &Tensor,
+        scores_out: &mut [f32],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        is_head_major: bool,
+        capacity: usize,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<()> {
+        let stride = scores_out.len() / n_heads_q;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let n_rep = n_heads_q / n_heads_kv;
+
+        // Read Q to CPU (always F32)
+        let q_data: Vec<f32> = if backend.name() == "OpenCL" {
+            let mut buf = vec![0.0f32; q.size() / 4];
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4)
+            };
+            backend.read_buffer(q, bytes)?;
+            buf
+        } else {
+            q.as_slice::<f32>().to_vec()
+        };
+
+        match k_cache.dtype() {
+            DType::Q4_0 => {
+                use crate::core::quant::{BlockQ4_0, QK4_0};
+                let blocks_per_row = head_dim / QK4_0;
+
+                // Read K cache to CPU
+                let k_bytes = if backend.name() == "OpenCL" {
+                    let mut buf = vec![0u8; k_cache.size()];
+                    backend.read_buffer(k_cache, &mut buf)?;
+                    buf
+                } else {
+                    let ptr = k_cache.as_ptr();
+                    let len = k_cache.size();
+                    unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
+                };
+                let k_blocks = unsafe {
+                    std::slice::from_raw_parts(
+                        k_bytes.as_ptr() as *const BlockQ4_0,
+                        k_bytes.len() / std::mem::size_of::<BlockQ4_0>(),
+                    )
+                };
+
+                let score_chunks: Vec<&mut [f32]> =
+                    scores_out.chunks_mut(stride).take(n_heads_q).collect();
+
+                // Process each Q head
+                for (h, scores_h) in score_chunks.into_iter().enumerate() {
+                    let kv_h = h / n_rep;
+                    let q_off = h * head_dim;
+                    let q_vec = &q_data[q_off..q_off + head_dim];
+                    let mut kv_f32 = [0.0f32; 128]; // max head_dim
+
+                    for t in 0..cache_seq_len {
+                        let block_off = if is_head_major {
+                            (kv_h * capacity + t) * blocks_per_row
+                        } else {
+                            (t * n_heads_kv + kv_h) * blocks_per_row
+                        };
+                        // Dequantize K row
+                        for bi in 0..blocks_per_row {
+                            let mut tmp = [0.0f32; QK4_0];
+                            k_blocks[block_off + bi].dequantize(&mut tmp);
+                            kv_f32[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                        }
+                        let score: f32 = q_vec
+                            .iter()
+                            .zip(kv_f32[..head_dim].iter())
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        scores_h[t] = score * scale;
+                    }
+
+                    // Softmax
+                    let active = &mut scores_h[..cache_seq_len];
+                    let max_v = active.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum_e = 0.0f32;
+                    for s in active.iter_mut() {
+                        *s = (*s - max_v).exp();
+                        sum_e += *s;
+                    }
+                    let inv = 1.0 / sum_e;
+                    for s in active.iter_mut() {
+                        *s *= inv;
+                    }
+                }
+            }
+            DType::F16 => {
+                // Read K cache to CPU
+                let k_data: Vec<half::f16> = if backend.name() == "OpenCL" {
+                    let mut buf = vec![0u8; k_cache.size()];
+                    backend.read_buffer(k_cache, &mut buf)?;
+                    unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr() as *const half::f16, buf.len() / 2)
+                            .to_vec()
+                    }
+                } else {
+                    k_cache.as_slice::<half::f16>().to_vec()
+                };
+
+                let score_chunks: Vec<&mut [f32]> =
+                    scores_out.chunks_mut(stride).take(n_heads_q).collect();
+
+                for (h, scores_h) in score_chunks.into_iter().enumerate() {
+                    let kv_h = h / n_rep;
+                    let q_off = h * head_dim;
+                    let q_vec = &q_data[q_off..q_off + head_dim];
+                    let mut kv_f32 = [0.0f32; 128];
+
+                    for t in 0..cache_seq_len {
+                        let off = if is_head_major {
+                            (kv_h * capacity + t) * head_dim
+                        } else {
+                            (t * n_heads_kv + kv_h) * head_dim
+                        };
+                        let k_row = &k_data[off..off + head_dim];
+                        for d in 0..head_dim {
+                            kv_f32[d] = k_row[d].to_f32();
+                        }
+                        let score: f32 = q_vec
+                            .iter()
+                            .zip(kv_f32[..head_dim].iter())
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        scores_h[t] = score * scale;
+                    }
+
+                    let active = &mut scores_h[..cache_seq_len];
+                    let max_v = active.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let mut sum_e = 0.0f32;
+                    for s in active.iter_mut() {
+                        *s = (*s - max_v).exp();
+                        sum_e += *s;
+                    }
+                    let inv = 1.0 / sum_e;
+                    for s in active.iter_mut() {
+                        *s *= inv;
+                    }
+                }
+            }
+            _ => {
+                // F32 should not reach here (handled by inline attention path)
+            }
+        }
+        Ok(())
+    }
+}
+
 pub struct LlamaForwardGenArgs<'a> {
     pub x: &'a mut Tensor,
     pub kv_cache: &'a mut KVCache,
@@ -914,6 +1097,9 @@ pub struct LlamaForwardGenArgs<'a> {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub use_gpu_attn: bool,
+    /// When true, compute attention scores into ws.scores even for non-F32 KV cache.
+    /// Required for H2O/H2O+ score accumulation with Q4_0/F16 KV cache.
+    pub need_scores: bool,
 }
 
 pub struct LlamaLayerForwardArgs<'a> {
@@ -926,4 +1112,5 @@ pub struct LlamaLayerForwardArgs<'a> {
     pub rope_theta: f32,
     pub workspace: Option<&'a mut super::workspace::LayerWorkspace>,
     pub use_gpu_attn: bool,
+    pub need_scores: bool,
 }
