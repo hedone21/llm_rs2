@@ -600,7 +600,7 @@ fn main() -> anyhow::Result<()> {
         println!("[Profile] Event: DecodingStart");
         // Pre-allocate workspace for generation
         let q_dim = hidden_size;
-        let k_dim = hidden_size / 4;
+        let k_dim = model.config.num_key_value_heads * model.config.head_dim;
         let v_dim = k_dim;
         let ffn_hidden = model.config.intermediate_size;
 

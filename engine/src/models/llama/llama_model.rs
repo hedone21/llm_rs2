@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow};
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
@@ -61,22 +62,60 @@ impl LlamaModel {
         let config_file = File::open(path.join("config.json"))?;
         let config: LlamaConfig = serde_json::from_reader(config_file)?;
 
-        // 2. Open Safetensors
-        let st_file = File::open(path.join("model.safetensors"))?;
-        let mmap = unsafe { MmapOptions::new().map(&st_file)? };
-        let tensors = SafeTensors::deserialize(&mmap)?;
+        // 2. Open Safetensors (single file or multi-shard)
+        let single_path = path.join("model.safetensors");
+        let index_path = path.join("model.safetensors.index.json");
+
+        let (shard_files, weight_map): (Vec<String>, HashMap<String, usize>) =
+            if single_path.exists() {
+                (vec!["model.safetensors".to_string()], HashMap::new())
+            } else if index_path.exists() {
+                Self::parse_shard_index(&index_path)?
+            } else {
+                return Err(anyhow!(
+                    "No model.safetensors or model.safetensors.index.json found in {}",
+                    model_path
+                ));
+            };
+
+        if shard_files.len() > 1 {
+            println!("Loading {} safetensors shards...", shard_files.len());
+        }
+
+        let shard_mmaps: Vec<memmap2::Mmap> = shard_files
+            .iter()
+            .map(|f| {
+                let file = File::open(path.join(f))?;
+                unsafe { Ok(MmapOptions::new().map(&file)?) }
+            })
+            .collect::<Result<_>>()?;
+
+        let shard_tensors: Vec<SafeTensors> = shard_mmaps
+            .iter()
+            .map(|m| SafeTensors::deserialize(m).map_err(|e| anyhow!("{}", e)))
+            .collect::<Result<_>>()?;
 
         // Use CPU memory for loading
         let cpu_memory = Galloc::new();
         let cpu_backend = Arc::new(crate::backend::cpu::CpuBackend::new());
 
-        // Helper to load a specific tensor by name
+        // Helper to load a specific tensor by name (supports multi-shard lookup)
         let load_tensor = |name: &str, quantize: bool| -> Result<Tensor> {
-            let tensor_view = match tensors.tensor(name) {
-                Ok(v) => v,
-                Err(e) => {
-                    println!("Error finding tensor: {}", name);
-                    return Err(e.into());
+            let tensor_view = if let Some(&idx) = weight_map.get(name) {
+                match shard_tensors[idx].tensor(name) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("Error finding tensor '{}' in shard {}", name, idx);
+                        return Err(anyhow!("{}", e));
+                    }
+                }
+            } else {
+                match shard_tensors[0].tensor(name) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        println!("Error finding tensor: {}", name);
+                        return Err(anyhow!("{}", e));
+                    }
                 }
             };
             let shape = Shape::new(tensor_view.shape().to_vec());
@@ -223,7 +262,12 @@ impl LlamaModel {
         let norm = load_tensor("model.norm.weight", false)?;
 
         let lm_head_name = "lm_head.weight";
-        let lm_head = if tensors.names().contains(&lm_head_name) {
+        let has_lm_head = if weight_map.is_empty() {
+            shard_tensors[0].names().contains(&lm_head_name)
+        } else {
+            weight_map.contains_key(lm_head_name)
+        };
+        let lm_head = if has_lm_head {
             load_tensor(lm_head_name, true)? // Quantize head? Usually yes for FFN/Head
         } else {
             // Tied weights: embed_tokens is F32, quantize to Q4_0 for lm_head
@@ -408,5 +452,38 @@ impl LlamaModel {
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
         Ok(())
+    }
+
+    /// Parse `model.safetensors.index.json` and return (shard_filenames, tensor→shard_idx map).
+    fn parse_shard_index(index_path: &Path) -> Result<(Vec<String>, HashMap<String, usize>)> {
+        #[derive(Deserialize)]
+        struct ShardIndex {
+            weight_map: HashMap<String, String>,
+        }
+        let index: ShardIndex = serde_json::from_reader(File::open(index_path)?)?;
+
+        let mut shard_files: Vec<String> = Vec::new();
+        let mut file_to_idx: HashMap<String, usize> = HashMap::new();
+        let mut weight_map: HashMap<String, usize> = HashMap::new();
+
+        for (tensor_name, shard_file) in &index.weight_map {
+            let idx = if let Some(&i) = file_to_idx.get(shard_file) {
+                i
+            } else {
+                let i = shard_files.len();
+                shard_files.push(shard_file.clone());
+                file_to_idx.insert(shard_file.clone(), i);
+                i
+            };
+            weight_map.insert(tensor_name.clone(), idx);
+        }
+
+        println!(
+            "Shard index: {} tensors across {} shards",
+            weight_map.len(),
+            shard_files.len()
+        );
+
+        Ok((shard_files, weight_map))
     }
 }
