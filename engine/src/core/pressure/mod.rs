@@ -9,6 +9,7 @@ use crate::core::kv_cache::KVCache;
 use anyhow::Result;
 
 pub mod compress_handler;
+pub mod d2o_handler;
 pub mod eviction_handler;
 pub mod merge_handler;
 pub mod quantize_handler;
@@ -16,6 +17,7 @@ pub mod sparse_handler;
 pub mod swap_handler;
 
 pub use compress_handler::CompressHandler;
+pub use d2o_handler::D2OHandler;
 pub use eviction_handler::EvictionHandler;
 pub use merge_handler::MergeHandler;
 pub use quantize_handler::QuantizeHandler;
