@@ -784,4 +784,333 @@ mod tests {
             n_heads
         );
     }
+
+    // ── Experiment: HH meaninglessness proof ──
+
+    /// Simulate Llama 3.2 1B attention patterns and dump score distribution.
+    ///
+    /// Calibrated to Round 15 observations: BOS≈3003, prompt avg≈3.3, gen avg≈33.
+    /// Outputs CSV to `experiments/analysis/score_distribution.csv`.
+    #[test]
+    fn experiment_hh_proof_score_distribution() {
+        use std::collections::HashSet;
+        use std::io::Write;
+
+        let max_seq = 2048usize;
+        let n_heads_q = 32usize;
+        let n_layers = 16usize;
+        let prompt_len = 128usize;
+        let cache_at_eviction = 1024usize;
+        let decode_steps = cache_at_eviction - prompt_len; // 896
+
+        // "Structural" prompt tokens (sentence boundaries, punctuation) — slightly
+        // higher attention than average prompt tokens.
+        let structural: HashSet<usize> = [5, 20, 45, 70, 100, 125].iter().copied().collect();
+
+        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, n_layers, 0, 0.0);
+        acc.set_active(true);
+
+        for step in 0..decode_steps {
+            acc.begin_step();
+            let cache_len = prompt_len + step + 1;
+
+            for layer in 0..n_layers {
+                let mut scores = vec![0.0f32; n_heads_q * max_seq];
+
+                for h in 0..n_heads_q {
+                    let off = h * max_seq;
+
+                    // ── Unnormalized attention weights ──
+                    // BOS: strong attention sink (varies slightly by head/layer)
+                    scores[off] = 100.0 + (layer as f32) * 2.0 + (h as f32) * 0.5;
+
+                    // Prompt tokens: very low attention
+                    for t in 1..prompt_len {
+                        scores[off + t] = if structural.contains(&t) {
+                            // Structural tokens: 3x normal prompt attention
+                            0.3 + 0.05 * ((h + layer) % 4) as f32
+                        } else {
+                            0.1 + 0.01 * ((h * 7 + t * 3) % 10) as f32 / 10.0
+                        };
+                    }
+
+                    // Generated tokens: exponential recency bias
+                    for t in prompt_len..cache_len {
+                        let distance = (cache_len - 1 - t) as f32;
+                        scores[off + t] = 0.5
+                            + 8.0 * (-distance / 80.0).exp()
+                            + 0.1 * ((h + t + layer) % 5) as f32 / 5.0;
+                    }
+
+                    // Normalize to probability distribution (sum=1)
+                    let sum: f32 = scores[off..off + cache_len].iter().sum();
+                    if sum > 0.0 {
+                        let inv = 1.0 / sum;
+                        for t in 0..cache_len {
+                            scores[off + t] *= inv;
+                        }
+                    }
+                }
+
+                acc.accumulate_layer(&scores, max_seq, cache_len, n_heads_q);
+            }
+
+            acc.end_step();
+        }
+
+        // ── Write CSV ──
+        let importance = acc.importance_scores();
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let output_dir = project_root.join("experiments").join("analysis");
+        std::fs::create_dir_all(&output_dir).ok();
+        let csv_path = output_dir.join("score_distribution.csv");
+
+        let mut f = std::fs::File::create(&csv_path).expect("create CSV");
+        writeln!(f, "position,score,token_type").unwrap();
+        for t in 0..cache_at_eviction {
+            let token_type = if t == 0 {
+                "bos"
+            } else if structural.contains(&t) {
+                "structural"
+            } else if t < prompt_len {
+                "prompt"
+            } else {
+                "generated"
+            };
+            writeln!(f, "{},{:.6},{}", t, importance[t], token_type).unwrap();
+        }
+
+        // ── Compute & print statistics ──
+        let bos = importance[0];
+        let prompt_scores: Vec<f32> = (1..prompt_len).map(|t| importance[t]).collect();
+        let struct_scores: Vec<f32> = structural
+            .iter()
+            .filter(|&&t| t > 0 && t < prompt_len)
+            .map(|&t| importance[t])
+            .collect();
+        let gen_scores: Vec<f32> = (prompt_len..cache_at_eviction)
+            .map(|t| importance[t])
+            .collect();
+
+        let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let std_dev = |v: &[f32]| {
+            let m = avg(v);
+            (v.iter().map(|x| (x - m).powi(2)).sum::<f32>() / v.len() as f32).sqrt()
+        };
+
+        let prompt_avg = avg(&prompt_scores);
+        let struct_avg = avg(&struct_scores);
+        let gen_avg = avg(&gen_scores);
+        let gen_std = std_dev(&gen_scores);
+
+        // Non-BOS scores for overall distribution analysis
+        let non_bos: Vec<f32> = (1..cache_at_eviction).map(|t| importance[t]).collect();
+        let non_bos_avg = avg(&non_bos);
+        let non_bos_std = std_dev(&non_bos);
+        let cv = non_bos_std / non_bos_avg;
+
+        // Tokens above 1σ and 2σ (excluding BOS)
+        let above_1s = non_bos
+            .iter()
+            .filter(|&&s| s > non_bos_avg + non_bos_std)
+            .count();
+        let above_2s = non_bos
+            .iter()
+            .filter(|&&s| s > non_bos_avg + 2.0 * non_bos_std)
+            .count();
+
+        // Shannon entropy (normalized)
+        let score_sum: f32 = non_bos.iter().sum();
+        let entropy: f64 = non_bos
+            .iter()
+            .filter(|&&s| s > 0.0)
+            .map(|&s| {
+                let p = s as f64 / score_sum as f64;
+                -p * p.ln()
+            })
+            .sum();
+        let max_entropy = (non_bos.len() as f64).ln();
+        let normalized_entropy = entropy / max_entropy;
+
+        // Gini coefficient
+        let mut sorted_non_bos = non_bos.clone();
+        sorted_non_bos.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let n = sorted_non_bos.len() as f64;
+        let gini_sum: f64 = sorted_non_bos
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| (2.0 * (i as f64 + 1.0) - n - 1.0) * s as f64)
+            .sum();
+        let gini = gini_sum / (n * score_sum as f64);
+
+        // H2O simulation: what would H2O select?
+        let protected_prefix = 4usize;
+        let target = 512usize;
+        let keep_ratio = 0.5f32;
+        let available = target.saturating_sub(protected_prefix);
+        let hh_budget = (available as f32 * keep_ratio) as usize;
+        let recent_budget = available - hh_budget;
+        let recent_start = cache_at_eviction - recent_budget;
+        let evictable_range = protected_prefix..recent_start;
+
+        let mut token_scores: Vec<(usize, f32)> = evictable_range
+            .clone()
+            .map(|pos| (pos, importance[pos]))
+            .collect();
+        token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+        let hh_selected: Vec<(usize, f32)> = token_scores.iter().take(hh_budget).cloned().collect();
+        let evicted: Vec<(usize, f32)> = token_scores.iter().skip(hh_budget).cloned().collect();
+
+        let hh_avg = avg(&hh_selected.iter().map(|x| x.1).collect::<Vec<_>>());
+        let evicted_avg = avg(&evicted.iter().map(|x| x.1).collect::<Vec<_>>());
+
+        // How many HH are prompt vs generated?
+        let hh_prompt_count = hh_selected.iter().filter(|x| x.0 < prompt_len).count();
+        let hh_gen_count = hh_selected.iter().filter(|x| x.0 >= prompt_len).count();
+
+        // Random baseline: average score of 254 random evictable tokens
+        // Use deterministic "random" = every other token
+        let random_selected: Vec<f32> = evictable_range
+            .clone()
+            .step_by(2)
+            .take(hh_budget)
+            .map(|pos| importance[pos])
+            .collect();
+        let random_avg = avg(&random_selected);
+
+        // Position-score correlation (Experiment 3)
+        // Pearson correlation for generated tokens only
+        let gen_positions: Vec<f64> = (prompt_len..cache_at_eviction).map(|t| t as f64).collect();
+        let gen_values: Vec<f64> = gen_scores.iter().map(|&s| s as f64).collect();
+        let gn = gen_positions.len() as f64;
+        let pos_mean = gen_positions.iter().sum::<f64>() / gn;
+        let val_mean = gen_values.iter().sum::<f64>() / gn;
+        let mut cov = 0.0f64;
+        let mut var_pos = 0.0f64;
+        let mut var_val = 0.0f64;
+        for i in 0..gen_positions.len() {
+            let dp = gen_positions[i] - pos_mean;
+            let dv = gen_values[i] - val_mean;
+            cov += dp * dv;
+            var_pos += dp * dp;
+            var_val += dv * dv;
+        }
+        let pearson_r = cov / (var_pos.sqrt() * var_val.sqrt());
+
+        // Spearman rank correlation
+        let mut gen_rank_pairs: Vec<(usize, f64)> = gen_values
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (i, v))
+            .collect();
+        gen_rank_pairs.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let mut score_ranks = vec![0.0f64; gen_rank_pairs.len()];
+        for (rank, &(idx, _)) in gen_rank_pairs.iter().enumerate() {
+            score_ranks[idx] = rank as f64;
+        }
+        let mut pos_ranks: Vec<f64> = (0..gen_positions.len()).map(|i| i as f64).collect();
+        let rank_n = pos_ranks.len() as f64;
+        let pos_rank_mean = pos_ranks.iter().sum::<f64>() / rank_n;
+        let score_rank_mean = score_ranks.iter().sum::<f64>() / rank_n;
+        let mut rank_cov = 0.0f64;
+        let mut rank_var_pos = 0.0f64;
+        let mut rank_var_val = 0.0f64;
+        for i in 0..pos_ranks.len() {
+            let dp = pos_ranks[i] - pos_rank_mean;
+            let dv = score_ranks[i] - score_rank_mean;
+            rank_cov += dp * dv;
+            rank_var_pos += dp * dp;
+            rank_var_val += dv * dv;
+        }
+        let spearman_rho = rank_cov / (rank_var_pos.sqrt() * rank_var_val.sqrt());
+
+        println!("\n{}", "=".repeat(60));
+        println!("  HH Proof Experiment: Score Distribution Analysis");
+        println!("{}", "=".repeat(60));
+        println!("\n[Distribution]");
+        println!("  BOS score:       {:.1}", bos);
+        println!(
+            "  Prompt avg:      {:.3} (n={})",
+            prompt_avg,
+            prompt_scores.len()
+        );
+        println!(
+            "  Structural avg:  {:.3} (n={})",
+            struct_avg,
+            struct_scores.len()
+        );
+        println!("  Generated avg:   {:.3} (n={})", gen_avg, gen_scores.len());
+        println!("  Generated std:   {:.3}", gen_std);
+        println!("  BOS/Prompt:      {:.0}x", bos / prompt_avg);
+        println!("  BOS/Generated:   {:.0}x", bos / gen_avg);
+        println!("\n[Non-BOS Statistics]");
+        println!("  Mean:  {:.3}", non_bos_avg);
+        println!("  Std:   {:.3}", non_bos_std);
+        println!("  CV:    {:.3}", cv);
+        println!(
+            "  >1σ:   {} ({:.1}%)",
+            above_1s,
+            100.0 * above_1s as f32 / non_bos.len() as f32
+        );
+        println!(
+            "  >2σ:   {} ({:.1}%)",
+            above_2s,
+            100.0 * above_2s as f32 / non_bos.len() as f32
+        );
+        println!("\n[Information Theory]");
+        println!("  Shannon entropy:    {:.4}", entropy);
+        println!("  Max entropy:        {:.4}", max_entropy);
+        println!(
+            "  Normalized entropy: {:.4} (1.0 = uniform)",
+            normalized_entropy
+        );
+        println!("  Gini coefficient:   {:.4} (0.0 = equal)", gini);
+        println!(
+            "\n[H2O Simulation (prefix={}, target={}, kr={})]",
+            protected_prefix, target, keep_ratio
+        );
+        println!("  HH budget:      {}", hh_budget);
+        println!("  Recent budget:   {}", recent_budget);
+        println!("  HH avg score:    {:.3}", hh_avg);
+        println!("  Evicted avg:     {:.3}", evicted_avg);
+        println!("  HH/Evicted:      {:.2}x", hh_avg / evicted_avg);
+        println!("  Random avg:      {:.3}", random_avg);
+        println!("  HH/Random:       {:.2}x", hh_avg / random_avg);
+        println!(
+            "  HH from prompt:  {} ({:.1}%)",
+            hh_prompt_count,
+            100.0 * hh_prompt_count as f32 / hh_budget as f32
+        );
+        println!(
+            "  HH from gen:     {} ({:.1}%)",
+            hh_gen_count,
+            100.0 * hh_gen_count as f32 / hh_budget as f32
+        );
+        if let Some(top) = hh_selected.first() {
+            println!("  HH top-1:        pos={} score={:.3}", top.0, top.1);
+        }
+        if let Some(bot) = hh_selected.last() {
+            println!("  HH bottom-1:     pos={} score={:.3}", bot.0, bot.1);
+        }
+        if let Some(top_ev) = evicted.first() {
+            println!("  Evicted top-1:   pos={} score={:.3}", top_ev.0, top_ev.1);
+        }
+        println!("\n[Position-Score Correlation (Generated only)]");
+        println!("  Pearson r:   {:.4}", pearson_r);
+        println!("  Spearman ρ:  {:.4}", spearman_rho);
+        println!(
+            "  Interpretation: {}",
+            if pearson_r.abs() > 0.7 {
+                "STRONG — scores ≈ recency → HH redundant with sliding"
+            } else if pearson_r.abs() > 0.4 {
+                "MODERATE — partial recency correlation"
+            } else {
+                "WEAK — scores independent of position"
+            }
+        );
+        println!("\n  CSV: {}", csv_path.display());
+    }
 }
