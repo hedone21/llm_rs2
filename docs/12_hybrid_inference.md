@@ -77,7 +77,7 @@ model.forward_into(LlamaModelForwardArgs {
     x_gen: None,        // prefill은 workspace 불필요
     workspace: None,
     use_gpu_attn: false,
-    cache_manager: None,
+    score_accumulator: None,
 });
 
 // 마지막 위치의 logits에서 첫 번째 생성 토큰 샘플링

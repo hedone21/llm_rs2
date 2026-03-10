@@ -280,7 +280,8 @@ pub struct LlamaModelForwardArgs<'a> {
     pub x_gen: Option<&'a mut Tensor>,      // seq_len=1 시 재사용 버퍼
     pub workspace: Option<&'a mut LayerWorkspace>, // 레이어 workspace 재사용
     pub use_gpu_attn: bool,
-    pub cache_manager: Option<&'a CacheManager>,
+    /// H2O-style eviction용 attention score 누적기
+    pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
 }
 ```
 
@@ -296,21 +297,18 @@ forward_into() 실행 순서:
 2. Layer Iteration (i = 0..num_hidden_layers)
    LlamaLayer::forward(x, kv_cache[i], start_pos, ...)
    * workspace가 있으면 중간 버퍼 재사용
+   * score_accumulator가 있으면 tracked layer에서 attention score 누적
 
-3. Cache Eviction (선택적)
-   cache_manager.maybe_evict(kv_caches)
-   * 메모리 압박 시 오래된 KV 엔트리 제거
-
-4. Final RMSNorm
+3. Final RMSNorm
    rms_norm(x, norm, eps)
 
-5. Output Projection
+4. Output Projection
    matmul_transposed(x, lm_head) → logits_out
 ```
 
 **Workspace 재사용**: decode 단계(`seq_len=1`)에서는 `x_gen`과 `LayerWorkspace`를 사전 할당하여 매 토큰 생성 시 메모리 할당을 완전히 제거합니다. 이는 on-device 환경에서 일관된 latency를 확보하는 핵심 최적화입니다.
 
-**Eviction 결과 반환**: `forward_into()`는 `Option<EvictionResult>`를 반환하여 호출자가 eviction 발생 여부와 제거된 토큰 수를 파악할 수 있게 합니다.
+**Eviction은 caller 책임**: `forward_into()`는 `Result<()>`를 반환하며 순수한 forward pass만 수행합니다. Eviction은 호출자(`generate.rs`)가 `CacheManager`를 통해 별도로 실행합니다.
 
 ---
 

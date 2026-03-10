@@ -138,7 +138,7 @@ model.forward_into(LlamaModelForwardArgs {
 // 마지막 토큰 위치의 logit만 샘플링
 let start_idx = (process_len - 1) * vocab_size;
 let mut last_logits = logits_cpu[start_idx..start_idx + vocab_size].to_vec();
-let next_token_id = sample(&mut last_logits, &tokens, vocab_size, &args);
+let next_token_id = sampling::sample(&mut last_logits, &tokens, vocab_size, &sampling_config);
 
 ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
 start_pos += process_len;
@@ -162,11 +162,12 @@ for _ in 0..(args.num_tokens - 1) {
         start_pos,
         x_gen: Some(&mut x_gen),           // 사전 할당 버퍼
         workspace: Some(&mut gen_ws),       // workspace 재사용
-        cache_manager: cm_ref,              // eviction 관리
+        score_accumulator: Some(&mut score_accumulator), // H2O score 누적
         // ...
     })?;
 
-    let next_token_id = sample(&mut logits_cpu, &tokens, vocab_size, &args);
+    // Eviction은 caller가 CacheManager를 통해 별도 실행
+    let next_token_id = sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config);
     tokens.push(next_token_id);
 
     // start_pos는 항상 증가 (eviction 후에도 RoPE 위치는 단조 증가)
@@ -182,7 +183,18 @@ for _ in 0..(args.num_tokens - 1) {
 
 ## 5.3 샘플링 알고리즘
 
-`sample()` 함수는 logits를 확률 분포로 변환하고 다음 토큰을 선택합니다.
+`sampling::sample()` 함수(`core/sampling.rs`)는 logits를 확률 분포로 변환하고 다음 토큰을 선택합니다. `SamplingConfig` 구조체로 파라미터를 전달받습니다:
+
+```rust
+// core/sampling.rs
+pub struct SamplingConfig {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: usize,
+    pub repetition_penalty: f32,
+    pub repetition_window: usize,
+}
+```
 
 ```mermaid
 flowchart TD
@@ -202,13 +214,13 @@ flowchart TD
 최근 `repetition_window`개 토큰에 대해 logit을 조정하여 반복 생성을 억제합니다:
 
 ```rust
-let start_idx = tokens.len().saturating_sub(args.repetition_window);
+let start_idx = tokens.len().saturating_sub(config.repetition_window);
 for &token_id in &tokens[start_idx..] {
     let logit = &mut logits[token_id as usize];
     if *logit < 0.0 {
-        *logit *= args.repetition_penalty;  // 음수 logit → 더 음수로
+        *logit *= config.repetition_penalty;  // 음수 logit → 더 음수로
     } else {
-        *logit /= args.repetition_penalty;  // 양수 logit → 더 작게
+        *logit /= config.repetition_penalty;  // 양수 logit → 더 작게
     }
 }
 ```
@@ -256,7 +268,7 @@ for l in logits.iter_mut() {
 let mut indices: Vec<usize> = (0..logits.len()).collect();
 indices.sort_by(|&a, &b| logits[b].total_cmp(&logits[a])); // 확률 내림차순
 
-let top_k = args.top_k.min(vocab_size);
+let top_k = config.top_k.min(vocab_size);
 valid_indices.truncate(top_k);  // 상위 K개만 유지
 ```
 
@@ -270,7 +282,7 @@ let mut cutoff_index = valid_indices.len();
 
 for (i, &idx) in valid_indices.iter().enumerate() {
     cumulative_prob += logits[idx];
-    if cumulative_prob > args.top_p {
+    if cumulative_prob > config.top_p {
         cutoff_index = i + 1;
         break;
     }

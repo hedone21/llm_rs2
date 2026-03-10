@@ -139,7 +139,7 @@ if let Some(rm) = &mut resilience_manager {
 
 | Action | 실행 위치 | 동작 |
 |--------|-----------|------|
-| **Evict** | 토큰 루프 내 | `cache_manager.force_evict_with_scores()` — H2O 3-partition 또는 sliding fallback |
+| **Evict** | 토큰 루프 내 | `cache_manager.force_evict_with_scores()` — CachePressurePipeline을 통해 등록된 핸들러(EvictionHandler, D2OHandler 등) 실행 |
 | **SwitchBackend** | Phase 3b (미구현) | generate_hybrid의 KV 마이그레이션 로직 참조. 단일 백엔드 generate에선 로그만 출력 |
 | **LimitTokens** | ctx 통해 | `args.num_tokens = min(current, limit)` |
 | **Throttle** | 토큰 루프 끝 | `thread::sleep(Duration::from_millis(delay))` |
