@@ -119,7 +119,8 @@ struct Args {
     #[arg(long, default_value_t = 1.0)]
     d2o_merge_e: f32,
 
-    /// Number of prefix tokens to protect from eviction (defaults to the entire prompt length)
+    /// Number of prefix tokens to protect from eviction.
+    /// Defaults to 4 for score-based policies (h2o, h2o_plus, d2o) and prompt length for sliding.
     #[arg(long)]
     protected_prefix: Option<usize>,
 
@@ -472,7 +473,16 @@ fn main() -> anyhow::Result<()> {
     let mut tbt_values = Vec::new();
 
     // 4.5 Setup CacheManager
-    let actual_protected_prefix = args.protected_prefix.unwrap_or(input_ids.len());
+    let actual_protected_prefix =
+        args.protected_prefix
+            .unwrap_or(match args.eviction_policy.as_str() {
+                // Score-based policies: default to 4 (attention sinks only).
+                // Protecting the entire prompt makes score-based eviction meaningless
+                // because only generated tokens would be evictable.
+                "h2o" | "h2o_plus" | "d2o" => 4,
+                // Sliding window / none: protect entire prompt (legacy behavior)
+                _ => input_ids.len(),
+            });
 
     let cache_manager = {
         let monitor = Box::new(LinuxSystemMonitor);
@@ -557,12 +567,14 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Determine whether to pass cache_manager to forward_into() for auto-eviction.
-    // H2O is signal-driven: eviction is triggered exclusively by resilience signals,
-    // not by automatic cache/memory checks. Score accumulation still happens every
-    // token via score_accumulator (passed separately).
+    // Auto-eviction control:
+    // - Sliding uses auto-eviction in normal mode (triggers when pos > prefix + window)
+    // - In experiment mode, ALL policies are signal-driven only — auto-eviction would
+    //   cause unfair comparisons because sliding evicts during prefill while H2O/D2O don't
+    // - H2O/D2O are always signal-driven (should_evict() returns false)
     let cm_ref = match args.eviction_policy.as_str() {
-        "sliding" => Some(&cache_manager),
-        _ => None, // "none", "h2o", "h2o_plus" — no auto-eviction in forward path
+        "sliding" if experiment_schedule.is_none() => Some(&cache_manager),
+        _ => None,
     };
 
     // Pre-allocate generation buffers

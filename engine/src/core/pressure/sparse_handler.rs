@@ -53,6 +53,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
+            target_ratio: None,
         };
         let result = handler.handle(&mut ctx).unwrap();
         assert!(!result.is_action());

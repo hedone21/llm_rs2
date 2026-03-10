@@ -181,6 +181,7 @@ impl CacheManager {
                 n_kv_heads: 0,
                 pressure_level: pressure,
                 mem_available,
+                target_ratio: None,
             };
             let results = pipeline.execute(&mut ctx)?;
             return Ok(Self::pipeline_results_to_eviction_result(
@@ -294,6 +295,7 @@ impl CacheManager {
                 n_kv_heads: 0,
                 pressure_level: pressure,
                 mem_available,
+                target_ratio: None,
             };
             let results = pipeline.execute(&mut ctx)?;
             return Ok(Self::pipeline_results_to_eviction_result(
@@ -398,6 +400,7 @@ impl CacheManager {
                 n_kv_heads,
                 pressure_level: pressure,
                 mem_available,
+                target_ratio: None,
             };
             let results = pipeline.execute(&mut ctx)?;
             return Ok(Self::pipeline_results_to_eviction_result(
@@ -477,6 +480,7 @@ impl CacheManager {
                 n_kv_heads: 0,
                 pressure_level: PressureLevel::Emergency,
                 mem_available: 0,
+                target_ratio: Some(target_ratio),
             };
             let results = pipeline.execute(&mut ctx)?;
             return Ok(Self::pipeline_results_to_eviction_result(
@@ -550,6 +554,7 @@ impl CacheManager {
                 n_kv_heads: 0,
                 pressure_level: PressureLevel::Emergency,
                 mem_available: 0,
+                target_ratio: Some(target_ratio),
             };
             let results = pipeline.execute(&mut ctx)?;
             return Ok(Self::pipeline_results_to_eviction_result(
@@ -625,6 +630,7 @@ impl CacheManager {
                 n_kv_heads,
                 pressure_level: PressureLevel::Emergency,
                 mem_available: 0,
+                target_ratio: Some(target_ratio),
             };
             let results = pipeline.execute(&mut ctx)?;
             return Ok(Self::pipeline_results_to_eviction_result(

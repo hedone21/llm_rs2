@@ -265,7 +265,9 @@ impl CachePressureHandler for D2OHandler {
         };
 
         let current_pos = ctx.caches[0].current_pos;
-        let target_len = ((current_pos as f32) * self.config.target_ratio) as usize;
+        // Use signal's target_ratio if provided, otherwise fall back to config
+        let effective_ratio = ctx.target_ratio.unwrap_or(self.config.target_ratio);
+        let target_len = ((current_pos as f32) * effective_ratio) as usize;
         let target_len = target_len.max(1);
 
         if current_pos <= target_len {
@@ -808,6 +810,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -855,6 +858,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -875,6 +879,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -918,6 +923,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -948,6 +954,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
+            target_ratio: None,
         };
         let result = handler.handle(&mut ctx).unwrap();
         assert!(!result.is_action());
@@ -987,6 +994,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1036,6 +1044,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1088,6 +1097,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1248,6 +1258,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         handler.handle(&mut ctx).unwrap();

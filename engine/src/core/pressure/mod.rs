@@ -48,6 +48,9 @@ pub struct HandlerContext<'a> {
     pub pressure_level: PressureLevel,
     /// Available system memory in bytes.
     pub mem_available: usize,
+    /// Optional target ratio override from external signal (e.g., resilience Evict action).
+    /// When set, handlers should use this instead of their internal config target_ratio.
+    pub target_ratio: Option<f32>,
 }
 
 // ── Action result ──────────────────────────────────────────────────
@@ -311,6 +314,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -346,6 +350,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Normal,
             mem_available: 1024 * 1024 * 1024,
+            target_ratio: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -382,6 +387,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -402,6 +408,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -432,6 +439,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -515,6 +523,7 @@ mod tests {
             n_kv_heads: 0,
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
+            target_ratio: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
