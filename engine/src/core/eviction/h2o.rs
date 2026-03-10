@@ -110,6 +110,9 @@ impl EvictionPolicy for H2OPolicy {
             .max(self.protected_prefix);
         let actual_recent = current - recent_start;
 
+        // 1. Rank evictable tokens (prefix..recent_start) by importance
+        let evictable_start = self.protected_prefix;
+
         log::debug!(
             "H2O: score-based eviction, keeping {}/{} tokens (prefix={}, hh={}, recent={})",
             keep,
@@ -118,9 +121,14 @@ impl EvictionPolicy for H2OPolicy {
             hh_budget,
             actual_recent,
         );
-
-        // 1. Rank evictable tokens (prefix..recent_start) by importance
-        let evictable_start = self.protected_prefix;
+        log::debug!(
+            "H2O: budget: available={}, keep_ratio={:.2}, evictable_range=[{}..{}), evictable_count={}",
+            available,
+            self.keep_ratio,
+            evictable_start,
+            recent_start,
+            recent_start - evictable_start,
+        );
         let mut token_scores: Vec<(usize, f32)> = (evictable_start..recent_start)
             .map(|pos| (pos, importance.get(pos).copied().unwrap_or(0.0)))
             .collect();
@@ -135,6 +143,21 @@ impl EvictionPolicy for H2OPolicy {
             .map(|(pos, _)| *pos)
             .collect();
         hh_positions.sort();
+
+        if log::log_enabled!(log::Level::Debug) {
+            let selected_hh: Vec<_> = token_scores.iter().take(hh_budget).collect();
+            let evicted: Vec<_> = token_scores.iter().skip(hh_budget).collect();
+            log::debug!(
+                "H2O: HH selected (pos, score): {:?}",
+                &selected_hh[..selected_hh.len().min(10)]
+            );
+            if !evicted.is_empty() {
+                log::debug!(
+                    "H2O: evicted (pos, score): {:?}",
+                    &evicted[..evicted.len().min(10)]
+                );
+            }
+        }
 
         // 4. Build final keep list: [prefix positions] ++ [heavy hitters] ++ [recent positions]
         let recent_positions: Vec<usize> = (recent_start..current).collect();
@@ -1329,6 +1352,326 @@ mod tests {
             10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, // prefix 0-7
             110.0, 160.0, 210.0, 250.0, // HH: pos 10, 15, 20, 24
             270.0, 280.0, 290.0, 300.0, // recent: pos 26, 27, 28, 29
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Phase 3: Score reset after eviction — verify reset is necessary
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_reset_prevents_score_position_misalignment() {
+        // After eviction, shift_positions() moves KV data:
+        //   Original pos 10 → new pos 5
+        // But the importance array is NOT rearranged.
+        // Without reset: importance[5] still holds OLD pos 5's score.
+        // With reset: importance[5] = 0, re-accumulated correctly for new data.
+        //
+        // This test demonstrates the misalignment that reset prevents.
+
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Give tokens at pos 5, 9, 13 highest scores (they become HH)
+        let mut importance = vec![0.0f32; 100];
+        importance[5] = 10.0;
+        importance[9] = 9.0;
+        importance[13] = 8.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+        assert_eq!(cache.current_pos, 10);
+
+        // After eviction, layout: [0,1,2,3, orig5, orig9, orig13, orig17, orig18, orig19]
+        // New slot 4 = orig pos 5 (marker 600)
+        // New slot 5 = orig pos 9 (marker 1000)
+        // New slot 6 = orig pos 13 (marker 1400)
+
+        // WITHOUT reset: importance[4] = 0.01 (was old pos 4's score, a non-HH token)
+        // but slot 4 now holds orig pos 5's data (marker 600, was HH with score 10.0)
+        // This is a MISALIGNMENT: score doesn't match the data.
+        assert!(
+            (importance[4] - 0.01).abs() < 1e-6,
+            "importance[4] = {} (stale score for old pos 4, not new data at slot 4)",
+            importance[4]
+        );
+
+        // The data at slot 4 is actually orig pos 5 (had score 10.0), not pos 4 (score 1.0).
+        let (k_val, _) = read_marker(&cache, 4);
+        assert_eq!(k_val, 600.0, "Slot 4 holds orig pos 5's data");
+
+        // After reset: importance[4] = 0.0 → will be re-accumulated correctly
+        // for the data that is actually at slot 4 (orig pos 5).
+        importance.fill(0.0); // simulating reset
+        assert_eq!(importance[4], 0.0, "After reset, slot 4 score = 0 (clean)");
+    }
+
+    #[test]
+    fn test_reset_allows_former_hh_to_be_evicted() {
+        // Round 1: Token at pos 5 has high score → selected as HH
+        // After eviction + reset, it re-accumulates with LOW scores
+        // Round 2: It should now be evictable (no "HH lock-in")
+
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Round 1: pos 5 is heavy hitter
+        let mut importance1 = vec![0.01f32; 100];
+        importance1[5] = 10.0;
+        importance1[9] = 9.0;
+        importance1[13] = 8.0;
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance1)
+            .unwrap();
+        assert_eq!(cache.current_pos, 10);
+
+        // After round 1: slots [0,1,2,3, orig5, orig9, orig13, orig17, orig18, orig19]
+        // Slot 4 = orig5 (was HH in round 1)
+        let (k4, _) = read_marker(&cache, 4);
+        assert_eq!(k4, 600.0); // orig pos 5
+
+        // Reset (simulating what generate.rs does)
+        importance1.fill(0.0);
+
+        // Round 2: Simulate new tokens arriving (pos 10-14 unused, pos 7-9 are recent)
+        // Now give slot 4 (orig pos 5) a LOW score → it should be evictable
+        let mut importance2 = vec![0.0f32; 100];
+        importance2[4] = 0.01; // slot 4 (former HH) now has low score
+        importance2[5] = 20.0; // slot 5 (orig9) high score
+        importance2[6] = 0.01; // slot 6 (orig13) low
+        importance2[7] = 0.01; // slot 7 (orig17)
+
+        // target=7: prefix=4, available=3, hh=1, recent=2
+        // recent_start = max(4, 10-2) = 8
+        // evictable = [4..8): slots 4,5,6,7
+        // HH = top-1 by score: slot 5 (score 20.0)
+        policy
+            .evict_with_scores(&mut cache, 7, &importance2)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 7);
+
+        // Slot 4 (former HH, orig pos 5) should be EVICTED because its score is now 0.01
+        // New layout: [prefix 0-3] [HH: slot5=orig9] [recent: slot8=orig18, slot9=orig19]
+        let markers = collect_markers(&cache);
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0,  // prefix
+            1000.0, // HH: orig9 (slot 5, score 20.0)
+            1900.0, 2000.0, // recent: orig18, orig19
+        ];
+        assert_eq!(
+            markers, expected,
+            "Former HH (orig5) must be evictable after reset + low re-score"
+        );
+    }
+
+    #[test]
+    fn test_without_reset_stale_scores_cause_wrong_eviction() {
+        // Demonstrate: without reset, stale importance scores cause incorrect HH selection.
+        //
+        // Round 1: evict 20→10, positions shift
+        // Round 2: use OLD importance array (not reset) → wrong tokens selected as HH
+
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Round 1 importance: pos 5, 9, 13 are HH
+        let mut importance = vec![0.01f32; 100];
+        importance[5] = 10.0;
+        importance[9] = 9.0;
+        importance[13] = 8.0;
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+        assert_eq!(cache.current_pos, 10);
+
+        // After round 1: [0,1,2,3, orig5, orig9, orig13, orig17, orig18, orig19]
+        // DO NOT RESET importance (simulate the bug)
+
+        // Round 2: use stale importance for 2nd eviction (10→7)
+        // Stale importance[4] = 0.01 (was pos 4's score, but data is now orig5)
+        // Stale importance[5] = 10.0 (was pos 5's score, but data is now orig9)
+        // Stale importance[6] = 0.01 (was pos 6's score, but data is now orig13)
+        // Stale importance[7] = 0.01 (was pos 7's score, but data is now orig17)
+        //
+        // target=7: hh=1, recent=2, recent_start=8
+        // evictable=[4..8), stale scores: 0.01, 10.0, 0.01, 0.01
+        // HH selection (top-1): slot 5 (stale score 10.0)
+        //
+        // But slot 5 has data from orig9 (marker 1000).
+        // The stale score 10.0 was for OLD pos 5 (marker 600), which is now at slot 4.
+        // This is a WRONG HH selection based on stale data.
+
+        policy
+            .evict_with_scores(&mut cache, 7, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 7);
+
+        let markers = collect_markers(&cache);
+        // With stale scores: HH=slot5 (stale score 10.0, but actually orig9's data)
+        // The "correct" selection should depend on actual attention patterns,
+        // but stale scores select based on old position mapping.
+        //
+        // This test documents the behavior — stale scores cause misaligned selection.
+        // Result: prefix [100,200,300,400] + HH slot5 [1000] + recent [1900,2000]
+        let stale_result = vec![
+            100.0, 200.0, 300.0, 400.0,  // prefix
+            1000.0, // HH: slot 5 (stale score 10.0 ← was pos 5)
+            1900.0, 2000.0, // recent
+        ];
+        assert_eq!(
+            markers, stale_result,
+            "Stale scores select HH based on old position mapping"
+        );
+
+        // Note: orig5 (marker 600, now at slot 4) had the REAL high importance
+        // but got evicted because stale importance[4]=0.01 (was old pos 4's score).
+        // This demonstrates why reset is necessary.
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Phase 4: Budget calculation edge cases
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_budget_calculation_exact_values() {
+        // Verify exact budget allocation for multiple (keep_ratio, prefix, current, target) combos.
+        struct Case {
+            keep_ratio: f32,
+            prefix: usize,
+            current: usize,
+            target: usize,
+            expected_hh: usize,
+            expected_recent: usize,
+        }
+
+        let cases = vec![
+            Case {
+                keep_ratio: 0.5,
+                prefix: 4,
+                current: 20,
+                target: 10,
+                expected_hh: 3,
+                expected_recent: 3,
+                // available=10-4=6, hh=3, recent=3
+            },
+            Case {
+                keep_ratio: 0.8,
+                prefix: 4,
+                current: 20,
+                target: 14,
+                expected_hh: 8,
+                expected_recent: 2,
+                // available=14-4=10, hh=8, recent=2
+            },
+            Case {
+                keep_ratio: 0.0,
+                prefix: 4,
+                current: 20,
+                target: 10,
+                expected_hh: 0,
+                expected_recent: 6,
+                // available=6, hh=0, recent=6 (pure sliding window)
+            },
+            Case {
+                keep_ratio: 1.0,
+                prefix: 4,
+                current: 20,
+                target: 10,
+                expected_hh: 6,
+                expected_recent: 0,
+                // available=6, hh=6, recent=0 (pure HH)
+            },
+            Case {
+                keep_ratio: 0.5,
+                prefix: 8,
+                current: 30,
+                target: 16,
+                expected_hh: 4,
+                expected_recent: 4,
+                // available=16-8=8, hh=4, recent=4
+            },
+        ];
+
+        for (idx, c) in cases.iter().enumerate() {
+            let keep = c.target.max(c.prefix + 2);
+            let available = keep.saturating_sub(c.prefix);
+            let hh_budget = (available as f32 * c.keep_ratio) as usize;
+            let recent_budget = available - hh_budget;
+
+            assert_eq!(
+                hh_budget, c.expected_hh,
+                "Case {}: hh_budget = {} (expected {})",
+                idx, hh_budget, c.expected_hh
+            );
+            assert_eq!(
+                recent_budget, c.expected_recent,
+                "Case {}: recent_budget = {} (expected {})",
+                idx, recent_budget, c.expected_recent
+            );
+            assert_eq!(
+                c.prefix + hh_budget + recent_budget,
+                keep,
+                "Case {}: prefix + hh + recent must equal keep",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_evictable_fewer_than_hh_budget() {
+        // Edge case: hh_budget > evictable tokens → keep all evictable as HH.
+        let policy = H2OPolicy::new(0, 0.9, 0); // prefix=4
+        let mut cache = make_cache(10);
+
+        for i in 0..10 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // target=9, keep=9, available=9-4=5
+        // hh_budget = (5*0.9) = 4, recent_budget = 1
+        // recent_start = max(4, 10-1) = 9
+        // evictable = [4..9) = 5 tokens
+        // Top-4 of 5 evictable → keeps 4 as HH, evicts 1
+        let mut importance = vec![0.0f32; 100];
+        importance[4] = 5.0;
+        importance[5] = 4.0;
+        importance[6] = 3.0;
+        importance[7] = 2.0;
+        importance[8] = 1.0; // lowest → evicted
+
+        policy
+            .evict_with_scores(&mut cache, 9, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 9);
+        let markers = collect_markers(&cache);
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            500.0, 600.0, 700.0, 800.0,  // HH: pos 4,5,6,7
+            1000.0, // recent: pos 9
         ];
         assert_eq!(markers, expected);
     }

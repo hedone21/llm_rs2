@@ -175,6 +175,10 @@ struct Args {
     /// When set, all Evict actions will use this ratio instead of the strategy default.
     #[arg(long)]
     experiment_eviction_ratio: Option<f32>,
+
+    /// Enable verbose H2O debug output (per-step scores, softmax validation, eviction details)
+    #[arg(long, default_value_t = false)]
+    h2o_debug: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -668,6 +672,45 @@ fn main() -> anyhow::Result<()> {
             })?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
+            // ── H2O Debug: per-step diagnostics ──
+            if args.h2o_debug {
+                // 1. Verify ws.scores is post-softmax (sample first 4 heads)
+                let n_heads_q = model.config.num_attention_heads;
+                let stride = gen_ws.scores.len() / n_heads_q;
+                let cache_pos = kv_caches[0].current_pos;
+                let heads_to_check = n_heads_q.min(4);
+                for h in 0..heads_to_check {
+                    let sum: f32 = gen_ws.scores[h * stride..h * stride + cache_pos]
+                        .iter()
+                        .sum();
+                    if (sum - 1.0).abs() > 0.01 {
+                        eprintln!(
+                            "[H2O-Debug] WARNING: head {} score sum = {:.6} (expect ~1.0)",
+                            h, sum
+                        );
+                    }
+                }
+
+                // 2. Dump importance score distribution
+                if let Some(ref acc) = score_accumulator {
+                    let scores = acc.importance_scores();
+                    let valid = &scores[..cache_pos];
+                    if !valid.is_empty() {
+                        let mut indexed: Vec<(usize, f32)> =
+                            valid.iter().enumerate().map(|(i, &s)| (i, s)).collect();
+                        indexed.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        let top5: Vec<_> = indexed.iter().take(5).collect();
+                        let bot5: Vec<_> = indexed.iter().rev().take(5).collect();
+                        eprintln!(
+                            "[H2O-Debug] step={} cache_pos={} Top5={:?} Bot5={:?}",
+                            decode_token_index, cache_pos, top5, bot5
+                        );
+                    }
+                }
+            }
+
             // Auto-eviction after forward pass (sliding window, non-experiment mode)
             if auto_eviction {
                 let result = if let Some(ref acc) = score_accumulator {
@@ -775,6 +818,34 @@ fn main() -> anyhow::Result<()> {
                                     r.new_pos + r.tokens_removed,
                                     r.new_pos
                                 );
+                                if args.h2o_debug {
+                                    if let Some(ref acc) = score_accumulator {
+                                        let scores = acc.importance_scores();
+                                        let pre_pos = r.new_pos + r.tokens_removed;
+                                        let valid = &scores[..pre_pos.min(scores.len())];
+                                        if !valid.is_empty() {
+                                            let total: f32 = valid.iter().sum();
+                                            let max_s = valid
+                                                .iter()
+                                                .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                                            let min_s =
+                                                valid.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                                            let avg_s = total / valid.len() as f32;
+                                            eprintln!(
+                                                "[H2O-Debug] Pre-eviction scores: min={:.3} avg={:.3} max={:.3} total={:.1} tokens={}",
+                                                min_s,
+                                                avg_s,
+                                                max_s,
+                                                total,
+                                                valid.len()
+                                            );
+                                        }
+                                    }
+                                    eprintln!(
+                                        "[H2O-Debug] Eviction: ratio={:.3} removed={} new_pos={}",
+                                        effective_ratio, r.tokens_removed, r.new_pos
+                                    );
+                                }
                                 experiment_eviction_count += 1;
                                 experiment_evicted_total += r.tokens_removed;
                                 if let Some(ref mut acc) = score_accumulator {

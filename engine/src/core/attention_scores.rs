@@ -572,4 +572,216 @@ mod tests {
         //   tok2: max(0.1, 9.0) = 9.0
         assert!((head_imp[4 + 2] - 9.0).abs() < 1e-6);
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Phase 2: MAX vs SUM aggregation — verify MAX preserves layer-critical tokens
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Helper: simulate SUM aggregation (instead of MAX) for comparison.
+    /// Returns per-token importance after one step with SUM across layers.
+    fn simulate_sum_aggregation(
+        layer_scores: &[Vec<f32>],
+        n_heads_q: usize,
+        max_seq_len: usize,
+        cache_seq_len: usize,
+    ) -> Vec<f32> {
+        let stride = max_seq_len;
+        let mut importance = vec![0.0f32; max_seq_len];
+        for layer in layer_scores {
+            // Sum across heads per token (same as accumulate_layer)
+            for t in 0..cache_seq_len {
+                let mut layer_score = 0.0f32;
+                for h in 0..n_heads_q {
+                    layer_score += layer[h * stride + t];
+                }
+                // SUM instead of MAX
+                importance[t] += layer_score;
+            }
+        }
+        importance
+    }
+
+    #[test]
+    fn test_max_vs_sum_divergent_hh_ranking() {
+        // Scenario where MAX and SUM produce DIFFERENT HH rankings.
+        //
+        // Token A: critical in layer 0 only (score=9.0), negligible in layer 1
+        // Token B: uniformly moderate in both layers (score=4.5 each)
+        // Token C: critical in layer 1 only (score=8.0), negligible in layer 0
+        //
+        // Per-token layer scores (1 head for simplicity):
+        //   Layer 0: A=9.0, B=4.5, C=0.1
+        //   Layer 1: A=0.1, B=4.5, C=8.0
+        //
+        // MAX: A=9.0, B=4.5, C=8.0 → ranking: A > C > B
+        // SUM: A=9.1, B=9.0, C=8.1 → ranking: A > B > C
+        //
+        // If we need to keep only 2 tokens (HH budget=2):
+        //   MAX keeps A, C — both layer-critical tokens preserved ✓
+        //   SUM keeps A, B — C (layer-1 critical) lost ✗
+
+        let max_seq = 8;
+        let cache_seq = 3;
+        let n_heads = 1;
+        let stride = max_seq;
+
+        // MAX aggregation (current implementation)
+        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads, 2, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+
+        let layer0 = {
+            let mut s = vec![0.0f32; n_heads * stride];
+            s[0] = 9.0; // Token A
+            s[1] = 4.5; // Token B
+            s[2] = 0.1; // Token C
+            s
+        };
+        let layer1 = {
+            let mut s = vec![0.0f32; n_heads * stride];
+            s[0] = 0.1; // Token A
+            s[1] = 4.5; // Token B
+            s[2] = 8.0; // Token C
+            s
+        };
+
+        acc.accumulate_layer(&layer0, stride, cache_seq, n_heads);
+        acc.accumulate_layer(&layer1, stride, cache_seq, n_heads);
+        acc.end_step();
+
+        let max_imp = acc.importance_scores();
+        // MAX: A=max(9.0, 0.1)=9.0, B=max(4.5, 4.5)=4.5, C=max(0.1, 8.0)=8.0
+        assert!((max_imp[0] - 9.0).abs() < 1e-6, "MAX A={}", max_imp[0]);
+        assert!((max_imp[1] - 4.5).abs() < 1e-6, "MAX B={}", max_imp[1]);
+        assert!((max_imp[2] - 8.0).abs() < 1e-6, "MAX C={}", max_imp[2]);
+
+        // MAX ranking: A(9.0) > C(8.0) > B(4.5) — both layer-critical tokens rank high
+        assert!(max_imp[0] > max_imp[2]); // A > C
+        assert!(max_imp[2] > max_imp[1]); // C > B
+
+        // SUM aggregation (simulated)
+        let sum_imp = simulate_sum_aggregation(
+            &[layer0.clone(), layer1.clone()],
+            n_heads,
+            max_seq,
+            cache_seq,
+        );
+        // SUM: A=9.0+0.1=9.1, B=4.5+4.5=9.0, C=0.1+8.0=8.1
+        assert!((sum_imp[0] - 9.1).abs() < 1e-6, "SUM A={}", sum_imp[0]);
+        assert!((sum_imp[1] - 9.0).abs() < 1e-6, "SUM B={}", sum_imp[1]);
+        assert!((sum_imp[2] - 8.1).abs() < 1e-6, "SUM C={}", sum_imp[2]);
+
+        // SUM ranking: A(9.1) > B(9.0) > C(8.1) — B (uniformly moderate) outranks C
+        assert!(sum_imp[0] > sum_imp[1]); // A > B
+        assert!(sum_imp[1] > sum_imp[2]); // B > C ← C (layer-1 critical) pushed down!
+
+        // CONCLUSION: MAX preserves layer-critical tokens better.
+        // If HH budget=2: MAX keeps {A, C}, SUM keeps {A, B}.
+        // Token C (critical for layer 1) survives under MAX but not SUM.
+    }
+
+    #[test]
+    fn test_max_preserves_single_layer_critical_token() {
+        // Token only critical in 1 of 4 layers: score 50.0 in layer 2, 0.01 elsewhere.
+        // MAX correctly gives it importance=50.0, ensuring it ranks high.
+        let max_seq = 4;
+        let cache_seq = 2;
+
+        let mut acc = AttentionScoreAccumulator::new(max_seq, 1, 4, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+
+        // 4 layers, token 0 is critical in layer 2 only
+        for layer_idx in 0..4 {
+            let mut s = vec![0.0f32; max_seq];
+            if layer_idx == 2 {
+                s[0] = 50.0; // critical
+                s[1] = 0.01;
+            } else {
+                s[0] = 0.01;
+                s[1] = 5.0; // moderately important in other layers
+            }
+            acc.accumulate_layer(&s, max_seq, cache_seq, 1);
+        }
+        acc.end_step();
+
+        let imp = acc.importance_scores();
+        // MAX: token 0 = max(0.01, 0.01, 50.0, 0.01) = 50.0
+        // MAX: token 1 = max(5.0, 5.0, 0.01, 5.0) = 5.0
+        assert!((imp[0] - 50.0).abs() < 1e-6);
+        assert!((imp[1] - 5.0).abs() < 1e-6);
+
+        // Token 0 ranks higher despite being critical in only 1 layer
+        assert!(imp[0] > imp[1]);
+    }
+
+    #[test]
+    fn test_two_stage_aggregation_within_step_max_across_steps_sum() {
+        // Verify the two-stage aggregation:
+        //   Within step: MAX across layers
+        //   Across steps: SUM of per-step MAX values
+        let max_seq = 4;
+
+        let mut acc = AttentionScoreAccumulator::new(max_seq, 1, 2, 0, 0.0);
+        acc.set_active(true);
+
+        // Step 1: layer0=[3.0, 1.0], layer1=[1.0, 5.0]
+        acc.begin_step();
+        acc.accumulate_layer(&[3.0, 1.0, 0.0, 0.0], max_seq, 2, 1);
+        acc.accumulate_layer(&[1.0, 5.0, 0.0, 0.0], max_seq, 2, 1);
+        acc.end_step();
+
+        // step_max: token0=max(3,1)=3, token1=max(1,5)=5
+        // importance after step 1: [3.0, 5.0]
+        assert!((acc.importance_scores()[0] - 3.0).abs() < 1e-6);
+        assert!((acc.importance_scores()[1] - 5.0).abs() < 1e-6);
+
+        // Step 2: layer0=[4.0, 2.0], layer1=[2.0, 1.0]
+        acc.begin_step();
+        acc.accumulate_layer(&[4.0, 2.0, 0.0, 0.0], max_seq, 2, 1);
+        acc.accumulate_layer(&[2.0, 1.0, 0.0, 0.0], max_seq, 2, 1);
+        acc.end_step();
+
+        // step_max: token0=max(4,2)=4, token1=max(2,1)=2
+        // importance = step1 + step2: [3+4, 5+2] = [7.0, 7.0]
+        assert!((acc.importance_scores()[0] - 7.0).abs() < 1e-6);
+        assert!((acc.importance_scores()[1] - 7.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_post_softmax_score_total_equals_n_heads() {
+        // When scores are valid post-softmax (each head sums to 1.0),
+        // accumulate_layer sums across heads → per-token total across all tokens = n_heads.
+        let max_seq = 4;
+        let n_heads = 4;
+        let cache_seq = 4;
+        let stride = max_seq;
+
+        // Create valid softmax distributions for each head
+        let mut scores = vec![0.0f32; n_heads * stride];
+        for h in 0..n_heads {
+            let base = h * stride;
+            // uniform distribution: each token gets 0.25
+            for t in 0..cache_seq {
+                scores[base + t] = 1.0 / cache_seq as f32;
+            }
+        }
+
+        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads);
+        acc.end_step();
+
+        let imp = acc.importance_scores();
+        // Each token: sum of n_heads * 0.25 = n_heads * 0.25 = 1.0
+        // Total across all tokens: n_heads * 1.0 = 4.0
+        let total: f32 = imp[..cache_seq].iter().sum();
+        assert!(
+            (total - n_heads as f32).abs() < 1e-5,
+            "Total importance {} != n_heads {}",
+            total,
+            n_heads
+        );
+    }
 }
