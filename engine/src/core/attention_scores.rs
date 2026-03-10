@@ -32,6 +32,14 @@ pub struct AttentionScoreAccumulator {
     head_importance: Vec<f32>,
     /// Per-KV-head step-local buffer (same layout).
     head_step_importance: Vec<f32>,
+    // ── Time-normalization fields ──
+    /// Per-token count of steps in which this position was active.
+    step_count: Vec<u32>,
+    /// Time-normalized importance: `importance[t] / step_count[t]`.
+    /// Computed at each `end_step()` when `time_normalize` is enabled.
+    normalized: Vec<f32>,
+    /// If true, `importance_scores()` returns time-normalized values.
+    time_normalize: bool,
 }
 
 impl AttentionScoreAccumulator {
@@ -60,6 +68,9 @@ impl AttentionScoreAccumulator {
             n_kv_heads: 0,
             head_importance: Vec::new(),
             head_step_importance: Vec::new(),
+            step_count: vec![0; max_seq_len],
+            normalized: vec![0.0; max_seq_len],
+            time_normalize: false,
         }
     }
 
@@ -95,7 +106,17 @@ impl AttentionScoreAccumulator {
             n_kv_heads,
             head_importance: vec![0.0; head_buf_size],
             head_step_importance: vec![0.0; head_buf_size],
+            step_count: vec![0; max_seq_len],
+            normalized: vec![0.0; max_seq_len],
+            time_normalize: false,
         }
+    }
+
+    /// Enable time-normalized scoring.
+    /// When enabled, `importance_scores()` returns `importance[t] / step_count[t]`
+    /// instead of raw cumulative scores, removing the time-in-cache bias.
+    pub fn set_time_normalize(&mut self, enable: bool) {
+        self.time_normalize = enable;
     }
 
     /// Returns whether this layer should be tracked.
@@ -201,8 +222,18 @@ impl AttentionScoreAccumulator {
         if !self.active {
             return;
         }
-        for (cum, &step) in self.importance.iter_mut().zip(self.step_importance.iter()) {
-            *cum += step;
+        for t in 0..self.max_seq_len {
+            let step_val = self.step_importance[t];
+            self.importance[t] += step_val;
+            // Track step count: increment for positions that were in cache this step
+            if step_val > 0.0 {
+                self.step_count[t] += 1;
+            }
+            // Compute time-normalized score
+            if self.time_normalize {
+                let count = self.step_count[t].max(1) as f32;
+                self.normalized[t] = self.importance[t] / count;
+            }
         }
         for (cum, &step) in self
             .head_importance
@@ -214,7 +245,18 @@ impl AttentionScoreAccumulator {
     }
 
     /// Get the importance scores slice.
+    /// When time-normalization is enabled, returns `importance[t] / step_count[t]`
+    /// (average per-step importance), removing the time-in-cache bias.
     pub fn importance_scores(&self) -> &[f32] {
+        if self.time_normalize {
+            &self.normalized
+        } else {
+            &self.importance
+        }
+    }
+
+    /// Get raw cumulative scores regardless of normalization setting.
+    pub fn raw_importance_scores(&self) -> &[f32] {
         &self.importance
     }
 
@@ -224,6 +266,8 @@ impl AttentionScoreAccumulator {
         self.step_importance.fill(0.0);
         self.head_importance.fill(0.0);
         self.head_step_importance.fill(0.0);
+        self.step_count.fill(0);
+        self.normalized.fill(0.0);
     }
 
     /// Activate accumulation.
@@ -1112,5 +1156,228 @@ mod tests {
             }
         );
         println!("\n  CSV: {}", csv_path.display());
+    }
+
+    /// Compare raw vs time-normalized scoring on the same attention patterns.
+    /// Generates both CSVs and prints comparison statistics.
+    #[test]
+    fn experiment_time_normalized_comparison() {
+        use std::collections::HashSet;
+        use std::io::Write;
+
+        let max_seq = 2048usize;
+        let n_heads_q = 32usize;
+        let n_layers = 16usize;
+        let prompt_len = 128usize;
+        let cache_at_eviction = 1024usize;
+        let decode_steps = cache_at_eviction - prompt_len;
+
+        let structural: HashSet<usize> = [5, 20, 45, 70, 100, 125].iter().copied().collect();
+
+        // Run two accumulators in parallel: raw vs time-normalized
+        let mut acc_raw = AttentionScoreAccumulator::new(max_seq, n_heads_q, n_layers, 0, 0.0);
+        acc_raw.set_active(true);
+
+        let mut acc_norm = AttentionScoreAccumulator::new(max_seq, n_heads_q, n_layers, 0, 0.0);
+        acc_norm.set_active(true);
+        acc_norm.set_time_normalize(true);
+
+        for step in 0..decode_steps {
+            acc_raw.begin_step();
+            acc_norm.begin_step();
+            let cache_len = prompt_len + step + 1;
+
+            for layer in 0..n_layers {
+                let mut scores = vec![0.0f32; n_heads_q * max_seq];
+
+                for h in 0..n_heads_q {
+                    let off = h * max_seq;
+                    scores[off] = 100.0 + (layer as f32) * 2.0 + (h as f32) * 0.5;
+                    for t in 1..prompt_len {
+                        scores[off + t] = if structural.contains(&t) {
+                            0.3 + 0.05 * ((h + layer) % 4) as f32
+                        } else {
+                            0.1 + 0.01 * ((h * 7 + t * 3) % 10) as f32 / 10.0
+                        };
+                    }
+                    for t in prompt_len..cache_len {
+                        let distance = (cache_len - 1 - t) as f32;
+                        scores[off + t] = 0.5
+                            + 8.0 * (-distance / 80.0).exp()
+                            + 0.1 * ((h + t + layer) % 5) as f32 / 5.0;
+                    }
+                    let sum: f32 = scores[off..off + cache_len].iter().sum();
+                    if sum > 0.0 {
+                        let inv = 1.0 / sum;
+                        for t in 0..cache_len {
+                            scores[off + t] *= inv;
+                        }
+                    }
+                }
+
+                acc_raw.accumulate_layer(&scores, max_seq, cache_len, n_heads_q);
+                acc_norm.accumulate_layer(&scores, max_seq, cache_len, n_heads_q);
+            }
+
+            acc_raw.end_step();
+            acc_norm.end_step();
+        }
+
+        let raw_scores = acc_raw.importance_scores();
+        let norm_scores = acc_norm.importance_scores();
+
+        // Write normalized CSV
+        let project_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let output_dir = project_root.join("experiments").join("analysis");
+        std::fs::create_dir_all(&output_dir).ok();
+        let csv_path = output_dir.join("score_distribution_normalized.csv");
+
+        let mut f = std::fs::File::create(&csv_path).expect("create CSV");
+        writeln!(f, "position,raw_score,norm_score,token_type").unwrap();
+        for t in 0..cache_at_eviction {
+            let token_type = if t == 0 {
+                "bos"
+            } else if structural.contains(&t) {
+                "structural"
+            } else if t < prompt_len {
+                "prompt"
+            } else {
+                "generated"
+            };
+            writeln!(
+                f,
+                "{},{:.6},{:.6},{}",
+                t, raw_scores[t], norm_scores[t], token_type
+            )
+            .unwrap();
+        }
+
+        // ── Statistics helper closures ──
+        let avg = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+
+        let gen_raw: Vec<f32> = (prompt_len..cache_at_eviction)
+            .map(|t| raw_scores[t])
+            .collect();
+        let gen_norm: Vec<f32> = (prompt_len..cache_at_eviction)
+            .map(|t| norm_scores[t])
+            .collect();
+
+        // Pearson correlation for generated tokens
+        let compute_pearson = |values: &[f32]| -> f64 {
+            let positions: Vec<f64> = (0..values.len()).map(|i| i as f64).collect();
+            let vals: Vec<f64> = values.iter().map(|&s| s as f64).collect();
+            let n = positions.len() as f64;
+            let pm = positions.iter().sum::<f64>() / n;
+            let vm = vals.iter().sum::<f64>() / n;
+            let mut cov = 0.0f64;
+            let mut vp = 0.0f64;
+            let mut vv = 0.0f64;
+            for i in 0..positions.len() {
+                let dp = positions[i] - pm;
+                let dv = vals[i] - vm;
+                cov += dp * dv;
+                vp += dp * dp;
+                vv += dv * dv;
+            }
+            let denom = (vp * vv).sqrt();
+            if denom > 0.0 { cov / denom } else { 0.0 }
+        };
+
+        let raw_pearson = compute_pearson(&gen_raw);
+        let norm_pearson = compute_pearson(&gen_norm);
+
+        // H2O simulation for both
+        let protected_prefix = 4usize;
+        let target = 512usize;
+        let keep_ratio = 0.5f32;
+        let available = target - protected_prefix;
+        let hh_budget = (available as f32 * keep_ratio) as usize;
+        let recent_budget = available - hh_budget;
+        let recent_start = cache_at_eviction - recent_budget;
+
+        let simulate_h2o = |scores: &[f32]| -> (f32, f32, usize, usize) {
+            let mut token_scores: Vec<(usize, f32)> = (protected_prefix..recent_start)
+                .map(|pos| (pos, scores[pos]))
+                .collect();
+            token_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let hh: Vec<f32> = token_scores.iter().take(hh_budget).map(|x| x.1).collect();
+            let ev: Vec<f32> = token_scores.iter().skip(hh_budget).map(|x| x.1).collect();
+            let hh_from_prompt = token_scores
+                .iter()
+                .take(hh_budget)
+                .filter(|x| x.0 < prompt_len)
+                .count();
+            let hh_oldest_gen = token_scores
+                .iter()
+                .take(hh_budget)
+                .filter(|x| x.0 >= prompt_len && x.0 < prompt_len + hh_budget)
+                .count();
+            (avg(&hh), avg(&ev), hh_from_prompt, hh_oldest_gen)
+        };
+
+        let (raw_hh_avg, raw_ev_avg, raw_hh_prompt, raw_hh_oldest) = simulate_h2o(raw_scores);
+        let (norm_hh_avg, norm_ev_avg, norm_hh_prompt, norm_hh_oldest) = simulate_h2o(norm_scores);
+
+        println!("\n{}", "=".repeat(60));
+        println!("  Time-Normalized vs Raw Scoring Comparison");
+        println!("{}", "=".repeat(60));
+        println!("\n[Position-Score Correlation (Generated only)]");
+        println!("  Raw  Pearson r:  {:.4}", raw_pearson);
+        println!("  Norm Pearson r:  {:.4}", norm_pearson);
+        println!(
+            "  Improvement:     {:.4} → {:.4} (Δ={:+.4})",
+            raw_pearson,
+            norm_pearson,
+            norm_pearson - raw_pearson
+        );
+        println!("\n[Score Distribution (Generated)]");
+        println!(
+            "  Raw  range: {:.3} - {:.3} (avg {:.3})",
+            gen_raw.iter().cloned().reduce(f32::min).unwrap(),
+            gen_raw.iter().cloned().reduce(f32::max).unwrap(),
+            avg(&gen_raw)
+        );
+        println!(
+            "  Norm range: {:.3} - {:.3} (avg {:.3})",
+            gen_norm.iter().cloned().reduce(f32::min).unwrap(),
+            gen_norm.iter().cloned().reduce(f32::max).unwrap(),
+            avg(&gen_norm)
+        );
+        println!(
+            "\n[H2O Simulation (prefix={}, target={}, kr={})]",
+            protected_prefix, target, keep_ratio
+        );
+        println!(
+            "  Raw:  HH avg={:.3}, Evicted avg={:.3}, ratio={:.2}x",
+            raw_hh_avg,
+            raw_ev_avg,
+            raw_hh_avg / raw_ev_avg
+        );
+        println!(
+            "  Norm: HH avg={:.3}, Evicted avg={:.3}, ratio={:.2}x",
+            norm_hh_avg,
+            norm_ev_avg,
+            norm_hh_avg / norm_ev_avg
+        );
+        println!(
+            "  Raw  HH composition: {} from prompt, {} oldest-gen (of {})",
+            raw_hh_prompt, raw_hh_oldest, hh_budget
+        );
+        println!(
+            "  Norm HH composition: {} from prompt, {} oldest-gen (of {})",
+            norm_hh_prompt, norm_hh_oldest, hh_budget
+        );
+        println!("\n  CSV: {}", csv_path.display());
+
+        // ── Assertions ──
+        // Time normalization should substantially reduce the magnitude of correlation
+        assert!(
+            norm_pearson.abs() < raw_pearson.abs(),
+            "Normalization should reduce position-score correlation: raw={:.4}, norm={:.4}",
+            raw_pearson,
+            norm_pearson
+        );
     }
 }

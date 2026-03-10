@@ -179,6 +179,11 @@ struct Args {
     /// Enable verbose H2O debug output (per-step scores, softmax validation, eviction details)
     #[arg(long, default_value_t = false)]
     h2o_debug: bool,
+
+    /// Enable time-normalized scoring: importance[t] / steps_in_cache[t].
+    /// Removes the cumulative time-in-cache bias that makes H2O select the oldest tokens.
+    #[arg(long, default_value_t = false)]
+    h2o_time_normalize: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -470,6 +475,7 @@ fn main() -> anyhow::Result<()> {
             args.h2o_decay,
         );
         acc.set_active(true);
+        acc.set_time_normalize(args.h2o_time_normalize);
         Some(acc)
     } else if args.eviction_policy == "h2o_plus" {
         let mut acc = AttentionScoreAccumulator::new_gqa(
@@ -481,6 +487,7 @@ fn main() -> anyhow::Result<()> {
             args.h2o_decay,
         );
         acc.set_active(true);
+        acc.set_time_normalize(args.h2o_time_normalize);
         Some(acc)
     } else {
         None
