@@ -430,4 +430,906 @@ mod tests {
     fn test_name() {
         assert_eq!(H2OPolicy::new(0, 0.5, 0).name(), "h2o");
     }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Group A: Score-based token identification accuracy
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Helper: create a cache with `n_heads` KV heads and `head_dim` dimensions.
+    fn make_cache_multihead(pos: usize, kv_heads: usize, head_dim: usize) -> KVCache {
+        let max_seq = 100;
+        let backend = Arc::new(CpuBackend::new());
+        let buf_size = max_seq * kv_heads * head_dim * std::mem::size_of::<f32>();
+        let k = Tensor::new(
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+            Arc::new(SharedBuffer::new(buf_size, DType::F32)),
+            backend.clone(),
+        );
+        let v = Tensor::new(
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+            Arc::new(SharedBuffer::new(buf_size, DType::F32)),
+            backend.clone(),
+        );
+        let mut cache = KVCache::new(k, v, max_seq);
+        cache.current_pos = pos;
+        cache
+    }
+
+    /// Helper: write marker to ALL elements of a position (fills entire position with val).
+    fn write_marker_full(cache: &mut KVCache, pos: usize, val: f32) {
+        let shape = cache.k_buffer.shape().dims();
+        let heads = shape[2];
+        let dim = shape[3];
+        let elems_per_pos = heads * dim;
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        let v_ptr = cache.v_buffer.as_mut_ptr();
+        unsafe {
+            let k_f32 = k_ptr as *mut f32;
+            let v_f32 = v_ptr as *mut f32;
+            for e in 0..elems_per_pos {
+                *k_f32.add(pos * elems_per_pos + e) = val;
+                *v_f32.add(pos * elems_per_pos + e) = val + 0.5; // V offset for distinguishing K/V
+            }
+        }
+    }
+
+    /// Helper: read markers from ALL elements of a position.
+    /// Returns (first_k, first_v) to identify which original token is here.
+    fn read_marker_full(cache: &KVCache, pos: usize) -> (f32, f32) {
+        let shape = cache.k_buffer.shape().dims();
+        let heads = shape[2];
+        let dim = shape[3];
+        let elems_per_pos = heads * dim;
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        let v_ptr = cache.v_buffer.as_mut_ptr();
+        unsafe {
+            let k_val = *(k_ptr as *const f32).add(pos * elems_per_pos);
+            let v_val = *(v_ptr as *const f32).add(pos * elems_per_pos);
+            (k_val, v_val)
+        }
+    }
+
+    /// Helper: collect all surviving token markers after eviction.
+    fn collect_markers(cache: &KVCache) -> Vec<f32> {
+        (0..cache.current_pos)
+            .map(|i| read_marker(cache, i).0)
+            .collect()
+    }
+
+    #[test]
+    fn test_hh_selects_highest_scores() {
+        // Core test: verify that the top-K scored tokens from evictable region
+        // are exactly the ones that survive as HH.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        // Each position gets a unique marker = (pos+1)*100
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Importance: assign distinct scores to evictable region
+        // Evictable will be [4..17) with target=10, keep_ratio=0.5
+        // hh_budget=3, recent_budget=3
+        let mut importance = vec![0.0f32; 100];
+        // Top 3 scores in evictable: pos 7 (9.0), pos 12 (8.5), pos 5 (8.0)
+        importance[7] = 9.0;
+        importance[12] = 8.5;
+        importance[5] = 8.0;
+        // Lower scores for other evictable tokens
+        importance[4] = 1.0;
+        importance[6] = 2.0;
+        importance[8] = 3.0;
+        importance[9] = 0.5;
+        importance[10] = 1.5;
+        importance[11] = 2.5;
+        importance[13] = 0.1;
+        importance[14] = 0.2;
+        importance[15] = 0.3;
+        importance[16] = 0.4;
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 10);
+
+        let markers = collect_markers(&cache);
+
+        // Expected layout: [prefix 0-3] [HH sorted by pos: 5, 7, 12] [recent: 17, 18, 19]
+        // Markers:          [100..400]   [600, 800, 1300]             [1800, 1900, 2000]
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix (pos 0,1,2,3)
+            600.0, 800.0, 1300.0, // HH (originally pos 5, 7, 12)
+            1800.0, 1900.0, 2000.0, // recent (pos 17, 18, 19)
+        ];
+        assert_eq!(
+            markers, expected,
+            "HH must be exactly the top-3 scored tokens from evictable region"
+        );
+    }
+
+    #[test]
+    fn test_hh_ignores_recent_region_scores() {
+        // Even if recent tokens have highest scores, they stay as "recent",
+        // and HH is selected only from evictable region.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        // Give VERY high scores to recent region tokens (17, 18, 19)
+        importance[17] = 999.0;
+        importance[18] = 998.0;
+        importance[19] = 997.0;
+        // Moderate scores in evictable region
+        importance[6] = 5.0;
+        importance[10] = 4.0;
+        importance[14] = 3.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        // target=10, hh=3, recent=3, recent_start=17
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // HH should be 6, 10, 14 (top-3 from evictable [4..17))
+        // NOT 17, 18, 19 (those are in recent, not HH candidates)
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            700.0, 1100.0, 1500.0, // HH from evictable: pos 6, 10, 14
+            1800.0, 1900.0, 2000.0, // recent: pos 17, 18, 19
+        ];
+        assert_eq!(
+            markers, expected,
+            "Recent tokens must not participate in HH selection"
+        );
+    }
+
+    #[test]
+    fn test_hh_ignores_prefix_region_scores() {
+        // Prefix tokens (even with high scores) are never in HH candidate set.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        // Give highest scores to prefix tokens
+        importance[0] = 100.0;
+        importance[1] = 99.0;
+        importance[2] = 98.0;
+        importance[3] = 97.0;
+        // Evictable region scores
+        importance[5] = 5.0;
+        importance[9] = 4.0;
+        importance[13] = 3.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // Prefix stays at [0-3], HH from evictable only
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix stays
+            600.0, 1000.0, 1400.0, // HH: pos 5(5.0), 9(4.0), 13(3.0)
+            1800.0, 1900.0, 2000.0, // recent
+        ];
+        assert_eq!(
+            markers, expected,
+            "Prefix tokens must not be in HH candidate pool"
+        );
+    }
+
+    #[test]
+    fn test_low_score_tokens_evicted() {
+        // Verify that the tokens with lowest scores are the ones removed.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Give each evictable token a descending score by position
+        // pos 4=16, pos 5=15, ..., pos 16=4
+        let mut importance = vec![0.0f32; 100];
+        for i in 4..17 {
+            importance[i] = (20 - i) as f32;
+        }
+
+        // target=10, hh=3, recent=3, evictable=[4..17)
+        // Top 3 from evictable by score: pos 4(16), pos 5(15), pos 6(14)
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            500.0, 600.0, 700.0, // HH: pos 4(16), 5(15), 6(14) — highest scores
+            1800.0, 1900.0, 2000.0, // recent
+        ];
+        assert_eq!(
+            markers, expected,
+            "Tokens with lowest scores must be evicted, highest kept"
+        );
+    }
+
+    #[test]
+    fn test_score_ranking_descending_pattern() {
+        // Scores descending by position: older tokens score higher.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(16);
+
+        for i in 0..16 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+        }
+
+        // target=8, available=4, hh=2, recent=2, recent_start=14, evictable=[4..14)
+        let mut importance = vec![0.0f32; 100];
+        for i in 4..14 {
+            importance[i] = (14 - i) as f32; // pos 4=10, pos 5=9, ..., pos 13=1
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 8, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // Top 2 from evictable [4..14): pos 4(10), pos 5(9)
+        let expected = vec![
+            10.0, 20.0, 30.0, 40.0, // prefix
+            50.0, 60.0, // HH: pos 4, 5
+            150.0, 160.0, // recent: pos 14, 15
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    #[test]
+    fn test_score_ranking_ascending_pattern() {
+        // Scores ascending by position: newer evictable tokens score higher.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(16);
+
+        for i in 0..16 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+        }
+
+        // target=8, available=4, hh=2, recent=2, recent_start=14, evictable=[4..14)
+        let mut importance = vec![0.0f32; 100];
+        for i in 4..14 {
+            importance[i] = (i - 3) as f32; // pos 4=1, pos 5=2, ..., pos 13=10
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 8, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // Top 2 from evictable [4..14): pos 13(10), pos 12(9)
+        let expected = vec![
+            10.0, 20.0, 30.0, 40.0, // prefix
+            130.0, 140.0, // HH: pos 12, 13 (highest scoring, sorted by position)
+            150.0, 160.0, // recent: pos 14, 15
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    #[test]
+    fn test_score_ranking_v_shape_pattern() {
+        // V-shape scores: both ends of evictable region score high, middle low.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(16);
+
+        for i in 0..16 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+        }
+
+        // evictable=[4..14), target=8, hh=2, recent=2
+        let mut importance = vec![0.0f32; 100];
+        importance[4] = 9.0; // left end high
+        importance[5] = 2.0;
+        importance[6] = 1.0;
+        importance[7] = 0.5;
+        importance[8] = 0.1;
+        importance[9] = 0.1;
+        importance[10] = 0.5;
+        importance[11] = 1.0;
+        importance[12] = 2.0;
+        importance[13] = 8.0; // right end high
+
+        policy
+            .evict_with_scores(&mut cache, 8, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // Top 2: pos 4(9.0), pos 13(8.0)
+        let expected = vec![
+            10.0, 20.0, 30.0, 40.0, // prefix
+            50.0, 140.0, // HH: pos 4, 13
+            150.0, 160.0, // recent
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Group B: Boundary conditions and budget calculation
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_keep_ratio_zero_no_hh() {
+        // keep_ratio=0.0 → hh_budget=0 → pure sliding window (no HH partition)
+        let policy = H2OPolicy::new(0, 0.0, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Even if some tokens have very high scores, they should be evicted
+        let mut importance = vec![0.0f32; 100];
+        importance[5] = 999.0; // would be top HH if ratio > 0
+        importance[10] = 888.0;
+
+        // target=10, available=6, hh=0, recent=6
+        // recent_start = max(4, 20-6) = 14
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // No HH at all, only prefix + recent 6
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            1500.0, 1600.0, 1700.0, 1800.0, 1900.0, 2000.0, // recent: pos 14-19
+        ];
+        assert_eq!(
+            markers, expected,
+            "With keep_ratio=0.0, high-score tokens must still be evicted (no HH partition)"
+        );
+    }
+
+    #[test]
+    fn test_keep_ratio_one_no_recent() {
+        // keep_ratio=1.0 → recent_budget=0 → all budget to HH
+        // Even the most recent token can be evicted if its score is low.
+        let policy = H2OPolicy::new(0, 1.0, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        // Give high scores to OLD evictable tokens, low to recent
+        importance[4] = 10.0;
+        importance[5] = 9.0;
+        importance[6] = 8.0;
+        importance[7] = 7.0;
+        importance[8] = 6.0;
+        importance[9] = 5.0;
+        // pos 10-19: low scores
+        for i in 10..20 {
+            importance[i] = 0.01;
+        }
+
+        // target=10, available=6, hh=6, recent=0
+        // recent_start = max(4, 20-0) = 20
+        // evictable = [4..20) = ALL non-prefix tokens
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // Top 6 by score from [4..20): pos 4(10), 5(9), 6(8), 7(7), 8(6), 9(5)
+        // Most recent tokens (19, 18, 17) are EVICTED because their scores are 0.01
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            500.0, 600.0, 700.0, 800.0, 900.0, 1000.0, // HH: pos 4-9
+        ];
+        assert_eq!(
+            markers, expected,
+            "With keep_ratio=1.0, recent tokens with low scores must be evicted"
+        );
+    }
+
+    #[test]
+    fn test_evictable_boundary_token() {
+        // Verify the exact boundary: recent_start-1 is evictable, recent_start is recent.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // target=10, hh=3, recent=3, recent_start=17
+        // pos 16 should be evictable, pos 17 should be recent
+        let mut importance = vec![0.0f32; 100];
+        // Give pos 16 the highest score in evictable region
+        importance[16] = 50.0;
+        importance[5] = 40.0;
+        importance[10] = 30.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // pos 16 should be kept as HH (evictable, highest score)
+        // pos 17 should be kept as recent
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            600.0, 1100.0, 1700.0, // HH: pos 5(40), 10(30), 16(50) sorted by pos
+            1800.0, 1900.0, 2000.0, // recent: 17, 18, 19
+        ];
+        assert_eq!(
+            markers, expected,
+            "Token at recent_start-1 must be evictable, at recent_start must be recent"
+        );
+    }
+
+    #[test]
+    fn test_budget_rounding_odd_available() {
+        // available=7 with keep_ratio=0.5 → hh=(7*0.5)=3 (truncated), recent=4
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        for i in 4..20 {
+            importance[i] = (20 - i) as f32;
+        }
+
+        // target=11, keep=11, available=11-4=7
+        // hh = (7*0.5) as usize = 3, recent = 7-3 = 4
+        // recent_start = max(4, 20-4) = 16
+        policy
+            .evict_with_scores(&mut cache, 11, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 11); // 4 + 3 + 4
+
+        let markers = collect_markers(&cache);
+
+        // Top 3 from evictable [4..16): pos 4(16), 5(15), 6(14)
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            500.0, 600.0, 700.0, // HH: pos 4, 5, 6
+            1700.0, 1800.0, 1900.0, 2000.0, // recent: pos 16, 17, 18, 19
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    #[test]
+    fn test_tie_breaking_prefers_earlier_position() {
+        // When multiple tokens have identical scores, stable sort preserves
+        // original position order → earlier positions are selected first.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // All evictable tokens have the SAME score
+        let mut importance = vec![0.0f32; 100];
+        for i in 4..17 {
+            importance[i] = 5.0; // identical scores
+        }
+
+        // target=10, hh=3, recent=3, evictable=[4..17) with 13 tokens all at 5.0
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers = collect_markers(&cache);
+
+        // stable sort → first 3 from evictable (pos 4, 5, 6) become HH
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            500.0, 600.0, 700.0, // HH: pos 4, 5, 6 (first 3 by position due to stable sort)
+            1800.0, 1900.0, 2000.0, // recent
+        ];
+        assert_eq!(
+            markers, expected,
+            "Tie-breaking must select earlier positions (stable sort)"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Group C: Compaction data integrity
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_compaction_noncontiguous_hh_exact_data() {
+        // HH at widely spaced positions: verify data at each position after compaction.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        // Write unique marker for each position
+        for i in 0..20 {
+            write_marker_full(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        importance[6] = 10.0;
+        importance[11] = 9.0;
+        importance[15] = 8.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        // Verify K and V separately
+        for i in 0..cache.current_pos {
+            let (k, v) = read_marker_full(&cache, i);
+            assert_eq!(v, k + 0.5, "K/V mismatch at pos {}: K={}, V={}", i, k, v);
+        }
+
+        let markers: Vec<f32> = (0..cache.current_pos)
+            .map(|i| read_marker_full(&cache, i).0)
+            .collect();
+
+        // pos 6→4, pos 11→5, pos 15→6, then recent 17→7, 18→8, 19→9
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix unchanged
+            700.0, 1200.0, 1600.0, // HH compacted from pos 6, 11, 15
+            1800.0, 1900.0, 2000.0, // recent
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    #[test]
+    fn test_compaction_adjacent_hh_no_unnecessary_shift() {
+        // HH tokens are right after prefix: pos 4, 5, 6 → no shift needed.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker_full(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // Make pos 4, 5, 6 the highest scoring in evictable
+        let mut importance = vec![0.0f32; 100];
+        importance[4] = 10.0;
+        importance[5] = 9.0;
+        importance[6] = 8.0;
+        for i in 7..17 {
+            importance[i] = 0.01;
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        let markers: Vec<f32> = (0..cache.current_pos)
+            .map(|i| read_marker_full(&cache, i).0)
+            .collect();
+
+        // HH = [4,5,6] are already in place (no shift needed)
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0, // prefix
+            500.0, 600.0, 700.0, // HH (no shift)
+            1800.0, 1900.0, 2000.0, // recent
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    #[test]
+    fn test_compaction_multihead_cache() {
+        // Multiple KV heads: verify shift_positions correctly moves all heads.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let kv_heads = 4;
+        let head_dim = 4;
+        let mut cache = make_cache_multihead(20, kv_heads, head_dim);
+
+        // Write per-head markers: for each position, each head gets a unique value
+        for pos in 0..20 {
+            let elems_per_pos = kv_heads * head_dim;
+            let k_ptr = cache.k_buffer.as_mut_ptr();
+            let v_ptr = cache.v_buffer.as_mut_ptr();
+            unsafe {
+                for h in 0..kv_heads {
+                    let offset = pos * elems_per_pos + h * head_dim;
+                    let marker = (pos * 100 + h * 10) as f32;
+                    *(k_ptr as *mut f32).add(offset) = marker;
+                    *(v_ptr as *mut f32).add(offset) = marker + 0.5;
+                }
+            }
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        importance[6] = 10.0;
+        importance[10] = 9.0;
+        importance[14] = 8.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 10);
+
+        // Verify per-head data integrity
+        let elems_per_pos = kv_heads * head_dim;
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        let v_ptr = cache.v_buffer.as_mut_ptr();
+
+        // Expected original positions at each slot after compaction:
+        // [0,1,2,3, 6,10,14, 17,18,19]
+        let expected_orig_pos = [0, 1, 2, 3, 6, 10, 14, 17, 18, 19];
+
+        for (slot, &orig_pos) in expected_orig_pos.iter().enumerate() {
+            for h in 0..kv_heads {
+                let offset = slot * elems_per_pos + h * head_dim;
+                let expected_marker = (orig_pos * 100 + h * 10) as f32;
+                unsafe {
+                    let k_val = *(k_ptr as *const f32).add(offset);
+                    let v_val = *(v_ptr as *const f32).add(offset);
+                    assert_eq!(
+                        k_val, expected_marker,
+                        "K mismatch at slot={} head={}: got {} expected {}",
+                        slot, h, k_val, expected_marker
+                    );
+                    assert_eq!(
+                        v_val,
+                        expected_marker + 0.5,
+                        "V mismatch at slot={} head={}: got {} expected {}",
+                        slot,
+                        h,
+                        v_val,
+                        expected_marker + 0.5
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_k_v_buffers_stay_synchronized() {
+        // Write different patterns to K and V, verify both compacted identically.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        // K gets positive markers, V gets negative markers
+        for i in 0..20 {
+            let shape = cache.k_buffer.shape().dims();
+            let elems_per_pos = shape[2] * shape[3];
+            let k_ptr = cache.k_buffer.as_mut_ptr();
+            let v_ptr = cache.v_buffer.as_mut_ptr();
+            unsafe {
+                *(k_ptr as *mut f32).add(i * elems_per_pos) = (i + 1) as f32;
+                *(v_ptr as *mut f32).add(i * elems_per_pos) = -((i + 1) as f32);
+            }
+        }
+
+        let mut importance = vec![0.0f32; 100];
+        importance[7] = 10.0;
+        importance[11] = 9.0;
+        importance[15] = 8.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        // Expected orig positions: [0,1,2,3, 7,11,15, 17,18,19]
+        let expected_orig = [0, 1, 2, 3, 7, 11, 15, 17, 18, 19];
+
+        let shape = cache.k_buffer.shape().dims();
+        let elems_per_pos = shape[2] * shape[3];
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        let v_ptr = cache.v_buffer.as_mut_ptr();
+
+        for (slot, &orig) in expected_orig.iter().enumerate() {
+            unsafe {
+                let k_val = *(k_ptr as *const f32).add(slot * elems_per_pos);
+                let v_val = *(v_ptr as *const f32).add(slot * elems_per_pos);
+                assert_eq!(k_val, (orig + 1) as f32, "K at slot {}", slot);
+                assert_eq!(v_val, -((orig + 1) as f32), "V at slot {}", slot);
+            }
+        }
+    }
+
+    #[test]
+    fn test_repeated_eviction_data_integrity() {
+        // Two rounds of eviction on the same cache.
+        // After 1st eviction, importance array is NOT realigned.
+        // 2nd eviction uses stale importance → test the resulting behavior.
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(20);
+
+        for i in 0..20 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 100.0);
+        }
+
+        // 1st eviction: 20→10
+        let mut importance = vec![0.0f32; 100];
+        importance[5] = 10.0;
+        importance[9] = 9.0;
+        importance[13] = 8.0;
+        for i in 4..17 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 10);
+
+        // After 1st eviction, cache layout is:
+        // [0,1,2,3, orig5, orig9, orig13, orig17, orig18, orig19]
+        // markers: [100, 200, 300, 400, 600, 1000, 1400, 1800, 1900, 2000]
+        let markers_after_1st = collect_markers(&cache);
+        assert_eq!(
+            markers_after_1st,
+            vec![
+                100.0, 200.0, 300.0, 400.0, 600.0, 1000.0, 1400.0, 1800.0, 1900.0, 2000.0
+            ]
+        );
+
+        // 2nd eviction: 10→7 with NEW importance (reflecting actual positions now)
+        // After 1st eviction, new positions:
+        //   slot 4 = orig5 (marker 600)
+        //   slot 5 = orig9 (marker 1000)
+        //   slot 6 = orig13 (marker 1400)
+        //   slot 7 = orig17 (marker 1800)
+        //   slot 8 = orig18 (marker 1900)
+        //   slot 9 = orig19 (marker 2000)
+        //
+        // target=7, keep=7, available=3, hh=1, recent=2
+        // recent_start = max(4, 10-2) = 8
+        // evictable = [4..8) = slots 4,5,6,7
+        let mut importance2 = vec![0.0f32; 100];
+        importance2[5] = 20.0; // slot 5 has highest score → keep as HH
+        importance2[4] = 1.0;
+        importance2[6] = 2.0;
+        importance2[7] = 3.0;
+
+        policy
+            .evict_with_scores(&mut cache, 7, &importance2)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 7);
+
+        let markers_after_2nd = collect_markers(&cache);
+        // prefix [0-3], HH slot 5 (marker 1000), recent slots 8,9 (markers 1900, 2000)
+        let expected = vec![
+            100.0, 200.0, 300.0, 400.0,  // prefix
+            1000.0, // HH: slot 5 (originally pos 9)
+            1900.0, 2000.0, // recent: slots 8,9 (originally pos 18,19)
+        ];
+        assert_eq!(
+            markers_after_2nd, expected,
+            "2nd eviction must correctly compact based on current slot positions"
+        );
+    }
+
+    #[test]
+    fn test_aggressive_eviction_large_to_small() {
+        // 50 tokens → 10 tokens (aggressive 80% eviction)
+        let policy = H2OPolicy::new(0, 0.5, 0); // prefix=4
+        let mut cache = make_cache(50);
+
+        for i in 0..50 {
+            write_marker(&mut cache, i, (i + 1) as f32);
+        }
+
+        // target=10, available=6, hh=3, recent=3
+        // recent_start = max(4, 50-3) = 47
+        // evictable = [4..47) = 43 tokens
+        let mut importance = vec![0.0f32; 100];
+        importance[20] = 100.0;
+        importance[30] = 99.0;
+        importance[40] = 98.0;
+        for i in 4..47 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 10, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 10);
+
+        let markers = collect_markers(&cache);
+        let expected = vec![
+            1.0, 2.0, 3.0, 4.0, // prefix
+            21.0, 31.0, 41.0, // HH: pos 20, 30, 40
+            48.0, 49.0, 50.0, // recent: pos 47, 48, 49
+        ];
+        assert_eq!(markers, expected);
+    }
+
+    #[test]
+    fn test_custom_prefix_size() {
+        // Custom prefix=8, verify correct partitioning.
+        let policy = H2OPolicy::new(0, 0.5, 8); // prefix=8
+        let mut cache = make_cache(30);
+
+        for i in 0..30 {
+            write_marker(&mut cache, i, (i + 1) as f32 * 10.0);
+        }
+
+        // target=16, keep=16, available=16-8=8, hh=4, recent=4
+        // recent_start = max(8, 30-4) = 26
+        // evictable = [8..26) = 18 tokens
+        let mut importance = vec![0.0f32; 100];
+        importance[10] = 10.0;
+        importance[15] = 9.0;
+        importance[20] = 8.0;
+        importance[24] = 7.0;
+        for i in 8..26 {
+            if importance[i] == 0.0 {
+                importance[i] = 0.01;
+            }
+        }
+
+        policy
+            .evict_with_scores(&mut cache, 16, &importance)
+            .unwrap();
+
+        assert_eq!(cache.current_pos, 16);
+
+        let markers = collect_markers(&cache);
+        let expected = vec![
+            10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, // prefix 0-7
+            110.0, 160.0, 210.0, 250.0, // HH: pos 10, 15, 20, 24
+            270.0, 280.0, 290.0, 300.0, // recent: pos 26, 27, 28, 29
+        ];
+        assert_eq!(markers, expected);
+    }
 }
