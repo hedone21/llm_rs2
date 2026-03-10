@@ -376,13 +376,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // H2O is signal-driven: eviction is triggered exclusively by resilience signals,
-    // not by automatic cache/memory checks. Score accumulation still happens via
-    // score_accumulator (passed separately to forward_into).
-    let cm_ref = match args.eviction_policy.as_str() {
-        "sliding" => Some(&cache_manager),
-        _ => None, // "none" and "h2o" — no auto-eviction in forward path
-    };
+    // H2O is signal-driven: eviction is triggered exclusively by resilience signals.
+    // Sliding uses auto-eviction after each forward pass.
+    let _auto_eviction = args.eviction_policy == "sliding";
 
     // Resilience Manager (optional)
     let mut resilience_manager = if args.enable_resilience {
@@ -452,22 +448,18 @@ fn main() -> anyhow::Result<()> {
             cpu_backend.clone(),
         );
 
-        model
-            .forward_into(LlamaModelForwardArgs {
-                input_tokens: &input_tensor,
-                start_pos,
-                kv_caches: &mut kv_caches,
-                backend: &current_backend,
-                memory: cpu_memory.as_ref(),
-                logits_out: &mut prefill_logits,
-                x_gen: None,
-                workspace: None,
-                use_gpu_attn: false,
-                cache_manager: cm_ref,
-                score_accumulator: None,
-            })?
-            .ok_or(())
-            .ok();
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend: &current_backend,
+            memory: cpu_memory.as_ref(),
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: false,
+            score_accumulator: None,
+        })?;
 
         // Sample last token
         let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
@@ -602,26 +594,22 @@ fn main() -> anyhow::Result<()> {
             acc.begin_step();
         }
 
-        model
-            .forward_into(LlamaModelForwardArgs {
-                input_tokens: &input_tensor,
-                start_pos,
-                kv_caches: &mut kv_caches,
-                backend: &current_backend,
-                memory: if is_gpu {
-                    gpu_memory.as_ref()
-                } else {
-                    cpu_memory.as_ref()
-                },
-                logits_out: &mut logits,
-                x_gen: _x_gen.as_mut(),
-                workspace: _gen_ws.as_mut(),
-                use_gpu_attn: is_gpu,
-                cache_manager: cm_ref,
-                score_accumulator: score_accumulator.as_mut(),
-            })?
-            .ok_or(())
-            .ok();
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend: &current_backend,
+            memory: if is_gpu {
+                gpu_memory.as_ref()
+            } else {
+                cpu_memory.as_ref()
+            },
+            logits_out: &mut logits,
+            x_gen: _x_gen.as_mut(),
+            workspace: _gen_ws.as_mut(),
+            use_gpu_attn: is_gpu,
+            score_accumulator: score_accumulator.as_mut(),
+        })?;
 
         // ── Resilience checkpoint ─────────────────────────
         if let Some(rm) = &mut resilience_manager {

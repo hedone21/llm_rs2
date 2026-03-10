@@ -493,16 +493,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Determine whether to pass cache_manager to forward_into() for auto-eviction.
-    // Auto-eviction control:
-    // - Sliding uses auto-eviction in normal mode (triggers when pos > prefix + window)
-    // - In experiment mode, ALL policies are signal-driven only — auto-eviction would
-    //   cause unfair comparisons because sliding evicts during prefill while H2O/D2O don't
-    // - H2O/D2O are always signal-driven (should_evict() returns false)
-    let cm_ref = match args.eviction_policy.as_str() {
-        "sliding" if experiment_schedule.is_none() => Some(&cache_manager),
-        _ => None,
-    };
+    // Auto-eviction: sliding window in non-experiment mode checks memory pressure
+    // after each forward pass. H2O/D2O are always signal-driven.
+    let auto_eviction = args.eviction_policy == "sliding" && experiment_schedule.is_none();
 
     // Pre-allocate generation buffers
     let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
@@ -551,22 +544,22 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         );
 
-        model
-            .forward_into(LlamaModelForwardArgs {
-                input_tokens: &input_tensor,
-                start_pos,
-                kv_caches: &mut kv_caches,
-                backend: &backend,
-                memory: memory.as_ref(),
-                logits_out: &mut prefill_logits,
-                x_gen: None,
-                workspace: None,
-                use_gpu_attn: args.gpu_attn,
-                cache_manager: cm_ref,
-                score_accumulator: None, // No score tracking during prefill
-            })?
-            .ok_or(())
-            .ok(); // Eviction during prefill is unlikely, ignore result
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend: &backend,
+            memory: memory.as_ref(),
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: None, // No score tracking during prefill
+        })?;
+        // Auto-eviction after prefill (sliding window only, non-experiment mode)
+        if auto_eviction {
+            cache_manager.maybe_evict(&mut kv_caches).ok();
+        }
 
         // Sample last token
         // Read logits to CPU
@@ -661,7 +654,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             let forward_start = std::time::Instant::now();
-            let _eviction_result = model.forward_into(LlamaModelForwardArgs {
+            model.forward_into(LlamaModelForwardArgs {
                 input_tokens: &gen_input_tensor,
                 start_pos,
                 kv_caches: &mut kv_caches,
@@ -671,10 +664,28 @@ fn main() -> anyhow::Result<()> {
                 x_gen: Some(&mut x_gen),
                 workspace: Some(&mut gen_ws),
                 use_gpu_attn: args.gpu_attn,
-                cache_manager: cm_ref,
                 score_accumulator: score_accumulator.as_mut(),
             })?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Auto-eviction after forward pass (sliding window, non-experiment mode)
+            if auto_eviction {
+                let result = if let Some(ref acc) = score_accumulator {
+                    if acc.is_active() {
+                        cache_manager
+                            .maybe_evict_with_scores(&mut kv_caches, acc.importance_scores())?
+                    } else {
+                        cache_manager.maybe_evict(&mut kv_caches)?
+                    }
+                } else {
+                    cache_manager.maybe_evict(&mut kv_caches)?
+                };
+                if result.evicted
+                    && let Some(ref mut acc) = score_accumulator
+                {
+                    acc.reset();
+                }
+            }
             forward_ms_values.push(forward_ms);
 
             // ── Experiment: inject signals at this token position ──

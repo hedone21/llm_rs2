@@ -9,7 +9,6 @@ use std::sync::Arc;
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
-use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::KVCache;
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
@@ -49,9 +48,6 @@ pub struct LlamaModelForwardArgs<'a> {
     pub x_gen: Option<&'a mut Tensor>,
     pub workspace: Option<&'a mut LayerWorkspace>,
     pub use_gpu_attn: bool,
-    /// Optional cache manager for dynamic KV cache eviction.
-    /// When provided, `maybe_evict()` is called after the layer pass.
-    pub cache_manager: Option<&'a CacheManager>,
     /// Optional attention score accumulator for H2O-style eviction.
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
@@ -314,10 +310,10 @@ impl LlamaModel {
 
     /// Comprehensive forward pass that writes logits into a pre-allocated buffer.
     /// Optionally accepts x_gen and workspace for memory optimization during generation.
-    pub fn forward_into(
-        &self,
-        args: LlamaModelForwardArgs,
-    ) -> Result<Option<crate::core::cache_manager::EvictionResult>> {
+    ///
+    /// Eviction is the caller's responsibility (via `CacheManager`).
+    /// Score accumulation is handled internally since it requires per-layer iteration.
+    pub fn forward_into(&self, args: LlamaModelForwardArgs) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
         let kv_caches = args.kv_caches;
@@ -405,50 +401,12 @@ impl LlamaModel {
             acc.end_step();
         }
 
-        // 2.5 Dynamic KV cache eviction (if configured)
-        let eviction_result = if let Some(cm) = args.cache_manager {
-            let result = if let Some(ref acc) = score_accumulator {
-                if acc.is_active() {
-                    if let Some(head_imp) = acc.head_importance_scores() {
-                        cm.maybe_evict_with_head_scores(
-                            kv_caches,
-                            acc.importance_scores(),
-                            head_imp,
-                            acc.n_kv_heads(),
-                        )?
-                    } else {
-                        cm.maybe_evict_with_scores(kv_caches, acc.importance_scores())?
-                    }
-                } else {
-                    cm.maybe_evict(kv_caches)?
-                }
-            } else {
-                cm.maybe_evict(kv_caches)?
-            };
-            if result.evicted {
-                log::info!(
-                    "[CacheManager] Evicted {} tokens, new_pos={}",
-                    result.tokens_removed,
-                    result.new_pos
-                );
-                // Reset accumulator after eviction so importance rebuilds
-                if let Some(ref mut acc) = score_accumulator {
-                    acc.reset();
-                }
-                Some(result)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         // 3. Final Norm
         backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
 
         // 4. Head
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
-        Ok(eviction_result)
+        Ok(())
     }
 }
