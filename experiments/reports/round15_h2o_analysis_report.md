@@ -294,17 +294,124 @@ Score가 mean + 2σ를 초과하는 34개 토큰 (상위 3.3%):
 
 ---
 
-## 10. 결론
+## 10. On-Device 실험: Time-Normalized Scoring 검증
+
+### 10.1 실험 설정
+
+누적 바이어스(SUM → time-in-cache proxy)를 제거하기 위해 **Time-Normalized Scoring**을 구현하고
+실제 모델에서 3-way 비교 실험을 수행하였다.
+
+- **Time-Normalized Scoring**: `importance[t] / step_count[t]` — 평균 per-step importance
+- 구현: `attention_scores.rs`의 `end_step()`에서 `step_count` 추적 + `importance_scores()` 분기
+
+| 조건 | Eviction | Scoring | CLI Flag |
+|------|----------|---------|----------|
+| **Sliding** | kr=0.0 (pure window) | N/A | `--eviction-policy sliding` |
+| **H2O-Raw** | kr=0.5 (HH+window) | Cumulative SUM | `--eviction-policy h2o` |
+| **H2O-Norm** | kr=0.5 (HH+window) | Time-normalized | `--eviction-policy h2o --h2o-time-normalize` |
+
+공통 파라미터: Llama 3.2 1B, `--greedy`, `--kv-layout head`, `--protected-prefix 4`,
+`--experiment-schedule memory_critical_1024.json` (target=512), `-n 2048`
+
+### 10.2 결과
+
+#### PPL-01 (Literary domain)
+
+| Metric | H2O-Raw vs Slide | H2O-Norm vs Slide |
+|--------|:---:|:---:|
+| **EMR** | 52.9% | **100.0%** |
+| **Suffix EMR** | 5.7% | **100.0%** |
+| **FDT** | pos 1078 | pos 2047 (no divergence) |
+| **Top-5 Overlap** | 54.5% | **91.9%** |
+| **Post-evict Top-5** | 9.0% | **83.9%** |
+| Avg TBT | 134.7ms | 135.7ms |
+
+#### PPL-03 (Technical domain)
+
+| Metric | H2O-Raw vs Slide | H2O-Norm vs Slide |
+|--------|:---:|:---:|
+| **EMR** | **100.0%** | 58.9% |
+| **Suffix EMR** | **100.0%** | 17.8% |
+| **FDT** | pos 2047 (no divergence) | pos 1203 |
+| **Top-5 Overlap** | **89.9%** | 59.5% |
+| **Post-evict Top-5** | **79.8%** | 19.0% |
+| Avg TBT | 139.9ms | 141.1ms |
+
+### 10.3 Score 분포 비교
+
+| Experiment | N_gen | BOS Score | Prompt μ | Gen μ | Gen σ | Pearson r |
+|------------|:---:|:---:|:---:|:---:|:---:|:---:|
+| H2O-RAW-PPL01 | 1024 | **22740.7** | 47.3 | 54.5 | 25.8 | **-0.47** |
+| H2O-NORM-PPL01 | 1024 | 22.2 | 0.05 | 0.21 | 0.39 | **+0.46** |
+| H2O-RAW-PPL03 | 1034 | **23160.1** | 54.5 | 51.1 | 22.4 | **-0.30** |
+| H2O-NORM-PPL03 | 1034 | 22.6 | 0.05 | 0.21 | 0.42 | **+0.45** |
+
+- Raw scoring: Pearson r < 0 → **older tokens score higher** (time-in-cache 지배)
+- Normalized scoring: Pearson r > 0 → **recent tokens score higher** (바이어스 반전 성공)
+
+### 10.4 Token Selection Overlap Analysis
+
+Time normalization이 H2O의 토큰 선택을 sliding window에 얼마나 근접시키는가:
+
+| Experiment | Both Keep | Only H2O | Only Slide | HH Contiguous Runs | Avg Gap |
+|------------|:---:|:---:|:---:|:---:|:---:|
+| RAW-PPL01 | 294 | **218** | 218 | 115 | 3.9 |
+| **NORM-PPL01** | **418** | **94** | 94 | 70 | 7.1 |
+| RAW-PPL03 | 315 | **197** | 197 | 110 | 4.4 |
+| **NORM-PPL03** | **431** | **81** | 81 | 58 | 9.1 |
+
+정규화 후 sliding과의 차이 토큰 수: **218→94 (PPL-01)**, **197→81 (PPL-03)** — 약 57% 감소
+
+### 10.5 핵심 발견: Contiguity Paradox
+
+결과가 프롬프트에 따라 정반대인 이유:
+
+1. **PPL-01**: Raw H2O가 218개 토큰을 다르게 선택 → 5.7% suffix EMR (치명적).
+   Norm이 차이를 94개로 줄임 → 100% EMR (완벽). **정규화가 해결**.
+
+2. **PPL-03**: Raw H2O가 197개 토큰을 다르게 선택 → 100% EMR (우연히 무해).
+   Norm이 차이를 81개로 줄임 → 17.8% EMR (악화). **정규화가 악화**.
+
+**근본 원인**: kr=0.5는 recent window를 508→254로 절반 축소한다.
+HH 예산(254)이 나머지를 채우는데, 이 토큰들은 **반드시 불연속(scattered)** 하다.
+불연속 토큰의 영향은 **예측 불가능**하고 **프롬프트 의존적**이다.
+
+- PPL-01에서 Raw의 218개 불연속 HH가 해로웠고, Norm의 94개는 무해했음
+- PPL-03에서 Raw의 197개 불연속 HH가 우연히 무해했으나, Norm의 81개가 해로움
+- 동일한 "개선" (차이 감소)이 반대 결과를 낳음 → **HH 선택 자체가 신뢰 불가**
+
+### 10.6 결론
+
+| 항목 | 판정 |
+|------|------|
+| 시간 정규화가 누적 바이어스를 제거하는가? | **YES** (Pearson r: -0.47 → +0.46) |
+| 정규화가 HH 선택을 sliding에 근접시키는가? | **YES** (차이 57% 감소) |
+| 정규화가 H2O 성능을 일관되게 개선하는가? | **NO** (PPL-01 개선, PPL-03 악화) |
+| HH 선택이 1B 모델에서 신뢰할 수 있는가? | **NO** (프롬프트 의존, 예측 불가) |
+
+> **최종 판정**: 누적 바이어스는 H2O 실패의 **기여 요인**이지만, **근본 원인이 아니다**.
+> 근본 원인은 **1B 모델의 attention entropy가 너무 높아** (≈0.97) genuine HH가 존재하지 않는 것이다.
+> 어떤 scoring 방식을 사용하든 kr>0인 한 contiguous recent context의 일부가 scattered HH로
+> 대체되며, 이는 **예측 불가능한 품질 변동**을 야기한다.
+> **Sliding Window (kr=0.0)만이 일관되게 최적이다.**
+
+---
+
+## 11. 결론
 
 1. **H2O 구현은 논문과 일치**한다. 성능 저하는 버그가 아니다.
-2. **1B 모델은 genuine Heavy Hitter를 생성하지 않는다** — attention이 BOS + 균등 분포.
+2. **1B 모델은 genuine Heavy Hitter를 생성하지 않는다** — attention entropy ≈ 0.97 (near-uniform).
 3. **누적 SUM scoring은 체류 시간의 proxy**가 되어 H2O가 가장 오래된 토큰을 "중요"하다고 판단한다.
-4. **결과적으로 H2O는 sliding window의 정반대 토큰을 보존**하여 적극적으로 해롭다.
-5. **Sliding Window (kr=0.0)가 1B 모델에서 최적**이며, H2O의 6x score 계산 오버헤드는 순수 비용이다.
-6. **보정 가능성**: 시간 정규화 또는 frequency ranking으로 누적 바이어스를 제거한 후,
-   모델 한계 vs 스코어링 문제를 분리 검증할 수 있다.
+4. **Time-Normalized Scoring은 누적 바이어스를 제거**하지만 (Pearson r: -0.47 → +0.46),
+   HH 선택의 결과는 프롬프트에 따라 개선(+94.3%) 또는 악화(-82.2%)되어 **신뢰 불가**.
+5. **근본 원인은 kr>0에 의한 contiguity 손실**: recent window 축소 + scattered HH 대체가
+   예측 불가능한 품질 변동을 야기한다. 어떤 scoring이든 이 구조적 문제를 극복할 수 없다.
+6. **Sliding Window (kr=0.0)가 1B 모델에서 유일하게 일관된 최적 전략**이다.
+7. **H2O의 score 계산 (6x overhead)은 1B에서 순수 비용**이며, 제거를 권장한다.
 
 ---
 
 *Generated: 2026-03-10*
 *Data: Round 14-15 experiments, 12 verification tests, score distribution simulation*
+*On-device validation: 6 experiments (PPL-01, PPL-03 × 3 conditions), Pixel phone, Llama 3.2 1B*
+*Analysis scripts: `experiments/analysis/round15_compare.py`, `round15_deep_analysis.py`*
