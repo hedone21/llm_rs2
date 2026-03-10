@@ -765,6 +765,140 @@ fn main() -> anyhow::Result<()> {
                     if let ResilienceAction::Evict { target_ratio } = &action {
                         let effective_ratio =
                             args.experiment_eviction_ratio.unwrap_or(*target_ratio);
+
+                        // ── Score distribution diagnostic ──
+                        if let Some(ref acc) = score_accumulator {
+                            let scores = acc.importance_scores();
+                            let cache_pos = kv_caches[0].current_pos;
+                            let prefix = actual_protected_prefix;
+
+                            // Compute stats on scores for active positions
+                            let active_scores: Vec<f32> = scores[..cache_pos].to_vec();
+                            if !active_scores.is_empty() {
+                                let min_s =
+                                    active_scores.iter().copied().fold(f32::INFINITY, f32::min);
+                                let max_s = active_scores
+                                    .iter()
+                                    .copied()
+                                    .fold(f32::NEG_INFINITY, f32::max);
+                                let mean_s: f32 =
+                                    active_scores.iter().sum::<f32>() / active_scores.len() as f32;
+                                let var_s: f32 = active_scores
+                                    .iter()
+                                    .map(|s| (s - mean_s).powi(2))
+                                    .sum::<f32>()
+                                    / active_scores.len() as f32;
+                                let std_s = var_s.sqrt();
+
+                                eprintln!(
+                                    "[ScoreDiag] cache_pos={}, prefix={}, decode_steps={}",
+                                    cache_pos, prefix, decode_token_index
+                                );
+                                eprintln!(
+                                    "[ScoreDiag] Score stats: min={:.4}, max={:.4}, mean={:.4}, std={:.4}, cv={:.4}",
+                                    min_s,
+                                    max_s,
+                                    mean_s,
+                                    std_s,
+                                    if mean_s > 0.0 { std_s / mean_s } else { 0.0 }
+                                );
+
+                                // Show top-10 and bottom-10 scoring positions
+                                let mut indexed: Vec<(usize, f32)> = active_scores
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, &s)| (i, s))
+                                    .collect();
+                                indexed.sort_by(|a, b| {
+                                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                                });
+
+                                let top10: Vec<String> = indexed
+                                    .iter()
+                                    .take(10)
+                                    .map(|(pos, score)| format!("{}:{:.3}", pos, score))
+                                    .collect();
+                                let bot10: Vec<String> = indexed
+                                    .iter()
+                                    .rev()
+                                    .take(10)
+                                    .map(|(pos, score)| format!("{}:{:.3}", pos, score))
+                                    .collect();
+                                eprintln!("[ScoreDiag] Top-10: [{}]", top10.join(", "));
+                                eprintln!("[ScoreDiag] Bot-10: [{}]", bot10.join(", "));
+
+                                // Prefix scores vs rest
+                                let prefix_avg: f32 = if prefix > 0 {
+                                    scores[..prefix.min(cache_pos)].iter().sum::<f32>()
+                                        / prefix.min(cache_pos) as f32
+                                } else {
+                                    0.0
+                                };
+                                let rest_avg: f32 = if cache_pos > prefix {
+                                    scores[prefix..cache_pos].iter().sum::<f32>()
+                                        / (cache_pos - prefix) as f32
+                                } else {
+                                    0.0
+                                };
+                                eprintln!(
+                                    "[ScoreDiag] Prefix avg={:.4}, Rest avg={:.4}, ratio={:.2}x",
+                                    prefix_avg,
+                                    rest_avg,
+                                    if rest_avg > 0.0 {
+                                        prefix_avg / rest_avg
+                                    } else {
+                                        0.0
+                                    }
+                                );
+
+                                // Score distribution: what fraction of non-prefix tokens
+                                // have scores above mean, above mean+1std, above mean+2std
+                                let non_prefix: Vec<f32> = scores[prefix..cache_pos].to_vec();
+                                if !non_prefix.is_empty() {
+                                    let np_mean =
+                                        non_prefix.iter().sum::<f32>() / non_prefix.len() as f32;
+                                    let np_var = non_prefix
+                                        .iter()
+                                        .map(|s| (s - np_mean).powi(2))
+                                        .sum::<f32>()
+                                        / non_prefix.len() as f32;
+                                    let np_std = np_var.sqrt();
+                                    let above_1s = non_prefix
+                                        .iter()
+                                        .filter(|&&s| s > np_mean + np_std)
+                                        .count();
+                                    let above_2s = non_prefix
+                                        .iter()
+                                        .filter(|&&s| s > np_mean + 2.0 * np_std)
+                                        .count();
+                                    eprintln!(
+                                        "[ScoreDiag] Non-prefix: n={}, >mean+1σ={}({:.1}%), >mean+2σ={}({:.1}%)",
+                                        non_prefix.len(),
+                                        above_1s,
+                                        100.0 * above_1s as f32 / non_prefix.len() as f32,
+                                        above_2s,
+                                        100.0 * above_2s as f32 / non_prefix.len() as f32,
+                                    );
+                                }
+
+                                // Dump full scores to file if experiment output is configured
+                                if let Some(ref out_path) = args.experiment_output {
+                                    let diag_path = format!(
+                                        "{}.scores.csv",
+                                        out_path.trim_end_matches(".jsonl")
+                                    );
+                                    if let Ok(mut f) = std::fs::File::create(&diag_path) {
+                                        use std::io::Write as _;
+                                        writeln!(f, "position,score").ok();
+                                        for (i, &s) in scores[..cache_pos].iter().enumerate() {
+                                            writeln!(f, "{},{:.6}", i, s).ok();
+                                        }
+                                        eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
+                                    }
+                                }
+                            }
+                        }
+
                         let result = if let Some(ref acc) = score_accumulator {
                             if let Some(head_imp) = acc.head_importance_scores() {
                                 cache_manager.force_evict_with_head_scores(
