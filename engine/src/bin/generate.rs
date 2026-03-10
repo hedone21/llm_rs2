@@ -4,6 +4,7 @@ use llm_rs2::core::attention_scores::AttentionScoreAccumulator;
 use llm_rs2::core::backend::Backend;
 use llm_rs2::core::buffer::DType;
 use llm_rs2::core::cache_manager::CacheManager;
+use llm_rs2::core::events::{self, CacheEvent, StderrDiagnosticSink};
 use llm_rs2::core::eviction::h2o::H2OPolicy;
 use llm_rs2::core::eviction::h2o_plus::H2OPlusPolicy;
 use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
@@ -12,6 +13,7 @@ use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
+use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
@@ -175,92 +177,6 @@ struct Args {
     experiment_eviction_ratio: Option<f32>,
 }
 
-fn sample(logits: &mut [f32], tokens: &[u32], vocab_size: usize, args: &Args) -> u32 {
-    // 1. Repetition Penalty
-    let start_idx = tokens.len().saturating_sub(args.repetition_window);
-    for &token_id in &tokens[start_idx..] {
-        let token_id = token_id as usize;
-        if token_id < vocab_size {
-            let logit = &mut logits[token_id];
-            if *logit < 0.0 {
-                *logit *= args.repetition_penalty;
-            } else {
-                *logit /= args.repetition_penalty;
-            }
-        }
-    }
-
-    // 2. Temperature
-    let temp = args.temperature;
-    if temp == 0.0 {
-        // Greedy
-        return logits
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.total_cmp(b))
-            .map(|(idx, _)| idx as u32)
-            .unwrap();
-    }
-
-    for l in logits.iter_mut() {
-        *l /= temp;
-    }
-
-    // Softmax
-    let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-    let mut exp_sum = 0.0;
-    for l in logits.iter_mut() {
-        *l = (*l - max_logit).exp();
-        exp_sum += *l;
-    }
-    for l in logits.iter_mut() {
-        *l /= exp_sum;
-    }
-
-    // 3. Top-K
-    let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.sort_by(|&a, &b| logits[b].total_cmp(&logits[a])); // Descending
-
-    let top_k = args.top_k.min(vocab_size);
-    let mut valid_indices = indices;
-    if top_k > 0 {
-        valid_indices.truncate(top_k);
-    }
-
-    // 4. Top-P
-    let mut cumulative_prob = 0.0;
-    let mut cutoff_index = valid_indices.len();
-
-    for (i, &idx) in valid_indices.iter().enumerate() {
-        cumulative_prob += logits[idx];
-        if cumulative_prob > args.top_p {
-            cutoff_index = i + 1;
-            break;
-        }
-    }
-    valid_indices.truncate(cutoff_index);
-
-    // 5. Sample
-    let mut rng = rand::rng();
-    let r: f32 = rand::Rng::random(&mut rng); // [0, 1)
-
-    // Normalize probabilities of valid indices
-    let mut prob_sum = 0.0;
-    for &idx in &valid_indices {
-        prob_sum += logits[idx];
-    }
-
-    let mut thread_r = r * prob_sum;
-    for &idx in &valid_indices {
-        thread_r -= logits[idx];
-        if thread_r <= 0.0 {
-            return idx as u32;
-        }
-    }
-
-    valid_indices.first().copied().unwrap_or(0) as u32
-}
-
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -277,6 +193,14 @@ fn main() -> anyhow::Result<()> {
     if args.greedy {
         args.temperature = 0.0;
     }
+
+    let sampling_config = SamplingConfig {
+        temperature: args.temperature,
+        top_p: args.top_p,
+        top_k: args.top_k,
+        repetition_penalty: args.repetition_penalty,
+        repetition_window: args.repetition_window,
+    };
 
     let model_path = &args.model_path;
 
@@ -484,7 +408,7 @@ fn main() -> anyhow::Result<()> {
                 _ => input_ids.len(),
             });
 
-    let cache_manager = {
+    let mut cache_manager = {
         let monitor = Box::new(LinuxSystemMonitor);
         let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
 
@@ -528,6 +452,9 @@ fn main() -> anyhow::Result<()> {
             CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
         }
     };
+
+    // Setup event sink for score diagnostics
+    cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
 
     // Setup AttentionScoreAccumulator for H2O / H2O+ / D2O
     let mut score_accumulator = if args.eviction_policy == "h2o" || args.eviction_policy == "d2o" {
@@ -654,7 +581,8 @@ fn main() -> anyhow::Result<()> {
         let start_idx = (process_len - 1) * vocab_size;
         let mut last_logits = logits_cpu[start_idx..start_idx + vocab_size].to_vec();
 
-        let next_token_id = sample(&mut last_logits, &tokens, vocab_size, &args);
+        let next_token_id =
+            sampling::sample(&mut last_logits, &tokens, vocab_size, &sampling_config);
 
         _ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         _last_token_time = std::time::Instant::now();
@@ -778,133 +706,31 @@ fn main() -> anyhow::Result<()> {
                         let effective_ratio =
                             args.experiment_eviction_ratio.unwrap_or(*target_ratio);
 
-                        // ── Score distribution diagnostic ──
+                        // ── Score distribution diagnostic (via events system) ──
                         if let Some(ref acc) = score_accumulator {
                             let scores = acc.importance_scores();
                             let cache_pos = kv_caches[0].current_pos;
-                            let prefix = actual_protected_prefix;
 
-                            // Compute stats on scores for active positions
-                            let active_scores: Vec<f32> = scores[..cache_pos].to_vec();
-                            if !active_scores.is_empty() {
-                                let min_s =
-                                    active_scores.iter().copied().fold(f32::INFINITY, f32::min);
-                                let max_s = active_scores
-                                    .iter()
-                                    .copied()
-                                    .fold(f32::NEG_INFINITY, f32::max);
-                                let mean_s: f32 =
-                                    active_scores.iter().sum::<f32>() / active_scores.len() as f32;
-                                let var_s: f32 = active_scores
-                                    .iter()
-                                    .map(|s| (s - mean_s).powi(2))
-                                    .sum::<f32>()
-                                    / active_scores.len() as f32;
-                                let std_s = var_s.sqrt();
+                            if let Some(snapshot) = events::build_score_snapshot(
+                                scores,
+                                cache_pos,
+                                actual_protected_prefix,
+                                decode_token_index,
+                                10,
+                            ) {
+                                cache_manager
+                                    .event_sink()
+                                    .emit(CacheEvent::ScoreDiagnostic(snapshot));
 
-                                eprintln!(
-                                    "[ScoreDiag] cache_pos={}, prefix={}, decode_steps={}",
-                                    cache_pos, prefix, decode_token_index
-                                );
-                                eprintln!(
-                                    "[ScoreDiag] Score stats: min={:.4}, max={:.4}, mean={:.4}, std={:.4}, cv={:.4}",
-                                    min_s,
-                                    max_s,
-                                    mean_s,
-                                    std_s,
-                                    if mean_s > 0.0 { std_s / mean_s } else { 0.0 }
-                                );
-
-                                // Show top-10 and bottom-10 scoring positions
-                                let mut indexed: Vec<(usize, f32)> = active_scores
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(i, &s)| (i, s))
-                                    .collect();
-                                indexed.sort_by(|a, b| {
-                                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-                                });
-
-                                let top10: Vec<String> = indexed
-                                    .iter()
-                                    .take(10)
-                                    .map(|(pos, score)| format!("{}:{:.3}", pos, score))
-                                    .collect();
-                                let bot10: Vec<String> = indexed
-                                    .iter()
-                                    .rev()
-                                    .take(10)
-                                    .map(|(pos, score)| format!("{}:{:.3}", pos, score))
-                                    .collect();
-                                eprintln!("[ScoreDiag] Top-10: [{}]", top10.join(", "));
-                                eprintln!("[ScoreDiag] Bot-10: [{}]", bot10.join(", "));
-
-                                // Prefix scores vs rest
-                                let prefix_avg: f32 = if prefix > 0 {
-                                    scores[..prefix.min(cache_pos)].iter().sum::<f32>()
-                                        / prefix.min(cache_pos) as f32
-                                } else {
-                                    0.0
-                                };
-                                let rest_avg: f32 = if cache_pos > prefix {
-                                    scores[prefix..cache_pos].iter().sum::<f32>()
-                                        / (cache_pos - prefix) as f32
-                                } else {
-                                    0.0
-                                };
-                                eprintln!(
-                                    "[ScoreDiag] Prefix avg={:.4}, Rest avg={:.4}, ratio={:.2}x",
-                                    prefix_avg,
-                                    rest_avg,
-                                    if rest_avg > 0.0 {
-                                        prefix_avg / rest_avg
-                                    } else {
-                                        0.0
-                                    }
-                                );
-
-                                // Score distribution: what fraction of non-prefix tokens
-                                // have scores above mean, above mean+1std, above mean+2std
-                                let non_prefix: Vec<f32> = scores[prefix..cache_pos].to_vec();
-                                if !non_prefix.is_empty() {
-                                    let np_mean =
-                                        non_prefix.iter().sum::<f32>() / non_prefix.len() as f32;
-                                    let np_var = non_prefix
-                                        .iter()
-                                        .map(|s| (s - np_mean).powi(2))
-                                        .sum::<f32>()
-                                        / non_prefix.len() as f32;
-                                    let np_std = np_var.sqrt();
-                                    let above_1s = non_prefix
-                                        .iter()
-                                        .filter(|&&s| s > np_mean + np_std)
-                                        .count();
-                                    let above_2s = non_prefix
-                                        .iter()
-                                        .filter(|&&s| s > np_mean + 2.0 * np_std)
-                                        .count();
-                                    eprintln!(
-                                        "[ScoreDiag] Non-prefix: n={}, >mean+1σ={}({:.1}%), >mean+2σ={}({:.1}%)",
-                                        non_prefix.len(),
-                                        above_1s,
-                                        100.0 * above_1s as f32 / non_prefix.len() as f32,
-                                        above_2s,
-                                        100.0 * above_2s as f32 / non_prefix.len() as f32,
-                                    );
-                                }
-
-                                // Dump full scores to file if experiment output is configured
+                                // Dump full scores to CSV if experiment output is configured
                                 if let Some(ref out_path) = args.experiment_output {
                                     let diag_path = format!(
                                         "{}.scores.csv",
                                         out_path.trim_end_matches(".jsonl")
                                     );
-                                    if let Ok(mut f) = std::fs::File::create(&diag_path) {
-                                        use std::io::Write as _;
-                                        writeln!(f, "position,score").ok();
-                                        for (i, &s) in scores[..cache_pos].iter().enumerate() {
-                                            writeln!(f, "{},{:.6}", i, s).ok();
-                                        }
+                                    if events::dump_scores_csv(scores, cache_pos, &diag_path)
+                                        .is_ok()
+                                    {
                                         eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
                                     }
                                 }
@@ -981,7 +807,8 @@ fn main() -> anyhow::Result<()> {
                 vec![]
             };
 
-            let next_token_id = sample(&mut logits_cpu, &tokens, vocab_size, &args);
+            let next_token_id =
+                sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config);
 
             let now = std::time::Instant::now();
             let tbt = now.duration_since(_last_token_time).as_secs_f64() * 1000.0;
