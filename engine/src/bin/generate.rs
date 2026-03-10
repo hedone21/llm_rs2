@@ -180,10 +180,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     h2o_debug: bool,
 
-    /// Enable time-normalized scoring: importance[t] / steps_in_cache[t].
-    /// Removes the cumulative time-in-cache bias that makes H2O select the oldest tokens.
+    /// Disable time-normalized scoring (use raw cumulative SUM).
+    /// By default, H2O/H2O+ use time-normalized scores to remove cumulative bias.
     #[arg(long, default_value_t = false)]
-    h2o_time_normalize: bool,
+    h2o_raw_scores: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -475,7 +475,7 @@ fn main() -> anyhow::Result<()> {
             args.h2o_decay,
         );
         acc.set_active(true);
-        acc.set_time_normalize(args.h2o_time_normalize);
+        acc.set_time_normalize(!args.h2o_raw_scores);
         Some(acc)
     } else if args.eviction_policy == "h2o_plus" {
         let mut acc = AttentionScoreAccumulator::new_gqa(
@@ -487,7 +487,7 @@ fn main() -> anyhow::Result<()> {
             args.h2o_decay,
         );
         acc.set_active(true);
-        acc.set_time_normalize(args.h2o_time_normalize);
+        acc.set_time_normalize(!args.h2o_raw_scores);
         Some(acc)
     } else {
         None
