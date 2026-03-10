@@ -57,7 +57,7 @@ run_generate() {
     local name="$1"
     local model="$2"
     local prompt="$3"
-    local eviction="$4"  # none | sliding | h2o
+    local eviction="$4"  # none | sliding | h2o | h2o_plus
     shift 4
     local extra_args=("$@")
 
@@ -91,6 +91,12 @@ run_generate() {
             cmd+=(--experiment-eviction-ratio "$EVICT_RATIO")
             cmd+=(--h2o-keep-ratio 0.5 --h2o-decay 0.0)
             ;;
+        h2o_plus)
+            cmd+=(--eviction-policy h2o_plus)
+            cmd+=(--experiment-schedule "$SCHEDULE")
+            cmd+=(--experiment-eviction-ratio "$EVICT_RATIO")
+            cmd+=(--h2o-keep-ratio 0.5 --h2o-decay 0.0)
+            ;;
     esac
 
     if [[ ${#extra_args[@]} -gt 0 ]]; then
@@ -115,7 +121,7 @@ run_generate() {
 #  Run all experiments
 # ============================================================
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "  Accuracy Benchmark: Base vs Sliding vs H2O"
+echo "  Accuracy Benchmark: Base vs Sliding vs H2O vs H2O+"
 echo "  Models: 1B, 3B | Tokens: $TOKENS | Max: $MAX_SEQ"
 echo "  Eviction at: decode 128 | Ratio: $EVICT_RATIO"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -142,6 +148,9 @@ for model_id in 1B 3B; do
 
         # 3. H2O
         run_generate "${model_id}-H2O-${ppl_id}" "$model_path" "$prompt" h2o
+
+        # 4. H2O+
+        run_generate "${model_id}-H2OP-${ppl_id}" "$model_path" "$prompt" h2o_plus
     done
 
     echo ""
@@ -174,7 +183,7 @@ for model_id in 1B 3B; do
         # Baseline row (self-comparison → perfect scores)
         echo "| $model_id | $ppl_id | Base | 1.000 | N/A | 1.000 | 1.000 | 1.000 | 0 |" >> "$REPORT_FILE"
 
-        for policy in SLIDE H2O; do
+        for policy in SLIDE H2O H2OP; do
             exp_file="$RESULTS/${model_id}-${policy}-${ppl_id}.jsonl"
 
             if [[ ! -f "$exp_file" ]]; then
