@@ -115,6 +115,18 @@ impl KVCache {
         }
     }
 
+    /// Block offset for Q4_0 data at (pos, head).
+    ///
+    /// Returns the block index into a `&[BlockQ4_0]` slice.
+    /// `blocks_per_pos` = head_dim / QK4_0 (e.g. 64/32 = 2).
+    #[inline]
+    pub fn q4_block_offset(&self, pos: usize, head: usize, blocks_per_pos: usize) -> usize {
+        match self.layout {
+            KVLayout::SeqMajor => (pos * self.kv_heads + head) * blocks_per_pos,
+            KVLayout::HeadMajor => (head * self.capacity + pos) * blocks_per_pos,
+        }
+    }
+
     /// Elements between consecutive heads for the same position.
     #[inline]
     pub fn head_stride(&self) -> usize {

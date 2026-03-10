@@ -6,11 +6,14 @@
 //! the evicted token is merged (weighted average) rather than permanently deleted.
 //!
 //! Phase 1: Uniform per-layer budget (layer-level variance allocation deferred).
-//! F32 KV cache only.
+//! Supports F32, F16, and Q4_0 KV cache dtypes.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
+use crate::core::buffer::DType;
 use crate::core::kv_cache::KVCache;
+use crate::core::quant::{BlockQ4_0, QK4_0};
 use anyhow::Result;
+use half::f16;
 use std::sync::Mutex;
 
 // ── Configuration ────────────────────────────────────────────────
@@ -150,7 +153,6 @@ impl D2OHandler {
         // ── Step 2: Cosine similarity + merge decision ──
         let kv_heads = cache.kv_heads();
         let head_dim = cache.head_dim();
-        let is_f32 = cache.k_buffer.dtype() == crate::core::buffer::DType::F32;
 
         // Merge targets exclude prefix tokens (prefix must remain unmodified)
         let merge_targets: Vec<usize> = retain_all
@@ -159,7 +161,7 @@ impl D2OHandler {
             .filter(|&p| p >= prefix)
             .collect();
 
-        if is_f32 && !evict_positions.is_empty() && !merge_targets.is_empty() {
+        if !evict_positions.is_empty() && !merge_targets.is_empty() {
             // Collect max similarities for EMA initialization
             let mut max_sims: Vec<f32> = Vec::with_capacity(evict_positions.len());
 
@@ -322,8 +324,40 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if denom < 1e-10 { 0.0 } else { dot / denom }
 }
 
+/// Dequantize a K vector at (pos, head) into the output buffer.
+/// Works for F32, F16, and Q4_0 dtypes.
+fn dequantize_k(cache: &KVCache, pos: usize, head: usize, head_dim: usize, out: &mut [f32]) {
+    match cache.k_buffer.dtype() {
+        DType::F32 => {
+            let k = cache.k_buffer.as_slice::<f32>();
+            let off = cache.offset(pos, head);
+            out[..head_dim].copy_from_slice(&k[off..off + head_dim]);
+        }
+        DType::F16 => {
+            let k = cache.k_buffer.as_slice::<f16>();
+            let off = cache.offset(pos, head);
+            for d in 0..head_dim {
+                out[d] = k[off + d].to_f32();
+            }
+        }
+        DType::Q4_0 => {
+            let k = cache.k_buffer.as_slice::<BlockQ4_0>();
+            let blocks_per_pos = head_dim / QK4_0;
+            let block_off = cache.q4_block_offset(pos, head, blocks_per_pos);
+            for bi in 0..blocks_per_pos {
+                let mut tmp = [0.0f32; QK4_0];
+                k[block_off + bi].dequantize(&mut tmp);
+                let dst = bi * QK4_0;
+                out[dst..dst + QK4_0].copy_from_slice(&tmp);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Find the nearest retained token to `evict_pos` by average cosine similarity
 /// across all KV heads. Returns (retain_position, max_similarity).
+/// Supports F32, F16, and Q4_0 KV cache dtypes.
 fn find_nearest_cosine(
     cache: &KVCache,
     evict_pos: usize,
@@ -331,9 +365,10 @@ fn find_nearest_cosine(
     kv_heads: usize,
     head_dim: usize,
 ) -> (usize, f32) {
-    let k_data = cache.k_buffer.as_slice::<f32>();
     let mut best_pos = retain_set[0];
     let mut best_sim = f32::NEG_INFINITY;
+    let mut evict_buf = vec![0.0f32; head_dim];
+    let mut retain_buf = vec![0.0f32; head_dim];
 
     for &retain_pos in retain_set {
         if retain_pos == evict_pos {
@@ -341,11 +376,9 @@ fn find_nearest_cosine(
         }
         let mut total_sim = 0.0f32;
         for h in 0..kv_heads {
-            let off_e = cache.offset(evict_pos, h);
-            let off_r = cache.offset(retain_pos, h);
-            let k_e = &k_data[off_e..off_e + head_dim];
-            let k_r = &k_data[off_r..off_r + head_dim];
-            total_sim += cosine_similarity(k_e, k_r);
+            dequantize_k(cache, evict_pos, h, head_dim, &mut evict_buf);
+            dequantize_k(cache, retain_pos, h, head_dim, &mut retain_buf);
+            total_sim += cosine_similarity(&evict_buf[..head_dim], &retain_buf[..head_dim]);
         }
         total_sim /= kv_heads as f32;
         if total_sim > best_sim {
@@ -363,6 +396,8 @@ fn find_nearest_cosine(
 ///   w_evict  = exp(sim) / (exp(sim) + e)
 ///   K[retain] = w_retain * K[retain] + w_evict * K[evict]
 ///   V[retain] = w_retain * V[retain] + w_evict * V[evict]
+///
+/// Supports F32 (in-place), F16 (f16↔f32), Q4_0 (deq→merge→req).
 fn weighted_merge(
     cache: &mut KVCache,
     evict_pos: usize,
@@ -377,27 +412,140 @@ fn weighted_merge(
     let w_retain = e / denom;
     let w_evict = exp_sim / denom;
 
-    // Pre-compute offsets to avoid borrowing `cache` while mutating buffers
+    let dtype = cache.k_buffer.dtype();
+    match dtype {
+        DType::F32 => {
+            weighted_merge_f32(
+                cache, evict_pos, retain_pos, w_retain, w_evict, kv_heads, head_dim,
+            );
+        }
+        DType::F16 => {
+            weighted_merge_f16(
+                cache, evict_pos, retain_pos, w_retain, w_evict, kv_heads, head_dim,
+            );
+        }
+        DType::Q4_0 => {
+            weighted_merge_q4(
+                cache, evict_pos, retain_pos, w_retain, w_evict, kv_heads, head_dim,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn weighted_merge_f32(
+    cache: &mut KVCache,
+    evict_pos: usize,
+    retain_pos: usize,
+    w_retain: f32,
+    w_evict: f32,
+    kv_heads: usize,
+    head_dim: usize,
+) {
     let offsets: Vec<(usize, usize)> = (0..kv_heads)
         .map(|h| (cache.offset(retain_pos, h), cache.offset(evict_pos, h)))
         .collect();
-
-    // Merge K vectors
     {
-        let k_data = cache.k_buffer.as_mut_slice::<f32>();
+        let k = cache.k_buffer.as_mut_slice::<f32>();
         for &(off_r, off_e) in &offsets {
             for d in 0..head_dim {
-                k_data[off_r + d] = w_retain * k_data[off_r + d] + w_evict * k_data[off_e + d];
+                k[off_r + d] = w_retain * k[off_r + d] + w_evict * k[off_e + d];
+            }
+        }
+    }
+    {
+        let v = cache.v_buffer.as_mut_slice::<f32>();
+        for &(off_r, off_e) in &offsets {
+            for d in 0..head_dim {
+                v[off_r + d] = w_retain * v[off_r + d] + w_evict * v[off_e + d];
+            }
+        }
+    }
+}
+
+fn weighted_merge_f16(
+    cache: &mut KVCache,
+    evict_pos: usize,
+    retain_pos: usize,
+    w_retain: f32,
+    w_evict: f32,
+    kv_heads: usize,
+    head_dim: usize,
+) {
+    let offsets: Vec<(usize, usize)> = (0..kv_heads)
+        .map(|h| (cache.offset(retain_pos, h), cache.offset(evict_pos, h)))
+        .collect();
+    {
+        let k = cache.k_buffer.as_mut_slice::<f16>();
+        for &(off_r, off_e) in &offsets {
+            for d in 0..head_dim {
+                let vr = k[off_r + d].to_f32();
+                let ve = k[off_e + d].to_f32();
+                k[off_r + d] = f16::from_f32(w_retain * vr + w_evict * ve);
+            }
+        }
+    }
+    {
+        let v = cache.v_buffer.as_mut_slice::<f16>();
+        for &(off_r, off_e) in &offsets {
+            for d in 0..head_dim {
+                let vr = v[off_r + d].to_f32();
+                let ve = v[off_e + d].to_f32();
+                v[off_r + d] = f16::from_f32(w_retain * vr + w_evict * ve);
+            }
+        }
+    }
+}
+
+fn weighted_merge_q4(
+    cache: &mut KVCache,
+    evict_pos: usize,
+    retain_pos: usize,
+    w_retain: f32,
+    w_evict: f32,
+    kv_heads: usize,
+    head_dim: usize,
+) {
+    let blocks_per_pos = head_dim / QK4_0;
+    let block_offsets: Vec<(usize, usize)> = (0..kv_heads)
+        .map(|h| {
+            (
+                cache.q4_block_offset(retain_pos, h, blocks_per_pos),
+                cache.q4_block_offset(evict_pos, h, blocks_per_pos),
+            )
+        })
+        .collect();
+
+    // Merge K
+    {
+        let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
+        let mut r_f32 = [0.0f32; QK4_0];
+        let mut e_f32 = [0.0f32; QK4_0];
+        for &(off_r, off_e) in &block_offsets {
+            for bi in 0..blocks_per_pos {
+                k[off_r + bi].dequantize(&mut r_f32);
+                k[off_e + bi].dequantize(&mut e_f32);
+                for i in 0..QK4_0 {
+                    r_f32[i] = w_retain * r_f32[i] + w_evict * e_f32[i];
+                }
+                k[off_r + bi] = BlockQ4_0::quantize(&r_f32);
             }
         }
     }
 
-    // Merge V vectors
+    // Merge V
     {
-        let v_data = cache.v_buffer.as_mut_slice::<f32>();
-        for &(off_r, off_e) in &offsets {
-            for d in 0..head_dim {
-                v_data[off_r + d] = w_retain * v_data[off_r + d] + w_evict * v_data[off_e + d];
+        let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
+        let mut r_f32 = [0.0f32; QK4_0];
+        let mut e_f32 = [0.0f32; QK4_0];
+        for &(off_r, off_e) in &block_offsets {
+            for bi in 0..blocks_per_pos {
+                v[off_r + bi].dequantize(&mut r_f32);
+                v[off_e + bi].dequantize(&mut e_f32);
+                for i in 0..QK4_0 {
+                    r_f32[i] = w_retain * r_f32[i] + w_evict * e_f32[i];
+                }
+                v[off_r + bi] = BlockQ4_0::quantize(&r_f32);
             }
         }
     }
@@ -948,5 +1096,168 @@ mod tests {
         // target = 40 * 0.5 = 20; keep = max(20, 2+2) = 20
         // available = 20 - 2 = 18; hh_budget = 18 * 0.75 = 13; recent = 5
         assert_eq!(new_pos, 20);
+    }
+
+    // ── Q4_0 tests ──
+
+    /// Create a Q4_0 KV cache for testing.
+    fn make_cache_q4(max_seq: usize, kv_heads: usize, head_dim: usize, pos: usize) -> KVCache {
+        let backend = Arc::new(CpuBackend::new());
+        let blocks_per_pos = head_dim / QK4_0;
+        let total_blocks = max_seq * kv_heads * blocks_per_pos;
+        let buf_size = total_blocks * std::mem::size_of::<BlockQ4_0>();
+        let k = Tensor::new(
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+            Arc::new(SharedBuffer::new(buf_size, DType::Q4_0)),
+            backend.clone(),
+        );
+        let v = Tensor::new(
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+            Arc::new(SharedBuffer::new(buf_size, DType::Q4_0)),
+            backend,
+        );
+        let mut cache = KVCache::new(k, v, max_seq);
+        cache.current_pos = pos;
+        cache
+    }
+
+    /// Write an f32 vector to Q4_0 K cache at (pos, head) via quantize.
+    fn write_k_q4(cache: &mut KVCache, pos: usize, head: usize, values: &[f32]) {
+        let head_dim = values.len();
+        let blocks_per_pos = head_dim / QK4_0;
+        let block_off = cache.q4_block_offset(pos, head, blocks_per_pos);
+        let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
+        for bi in 0..blocks_per_pos {
+            let start = bi * QK4_0;
+            let mut src = [0.0f32; QK4_0];
+            src.copy_from_slice(&values[start..start + QK4_0]);
+            k[block_off + bi] = BlockQ4_0::quantize(&src);
+        }
+    }
+
+    /// Read K cache at (pos, head) from Q4_0 as dequantized f32.
+    fn read_k_q4(cache: &KVCache, pos: usize, head: usize, head_dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; head_dim];
+        dequantize_k(cache, pos, head, head_dim, &mut out);
+        out
+    }
+
+    #[test]
+    fn test_quantize_round_trip() {
+        let src: [f32; QK4_0] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.5);
+        let block = BlockQ4_0::quantize(&src);
+        let mut dst = [0.0f32; QK4_0];
+        block.dequantize(&mut dst);
+        // Q4_0 has limited precision; check within tolerance
+        for i in 0..QK4_0 {
+            assert!(
+                (src[i] - dst[i]).abs() < 1.5,
+                "round-trip drift too large at {i}: src={}, dst={}",
+                src[i],
+                dst[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_q4_dequantize_k() {
+        let mut cache = make_cache_q4(10, 1, 64, 3);
+        let values: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        write_k_q4(&mut cache, 1, 0, &values);
+        let read = read_k_q4(&cache, 1, 0, 64);
+        // Verify dequantize produces values close to originals
+        for i in 0..64 {
+            assert!(
+                (values[i] - read[i]).abs() < 0.5,
+                "mismatch at {i}: wrote={}, read={}",
+                values[i],
+                read[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_q4_find_nearest_cosine() {
+        // head_dim must be multiple of QK4_0=32, use 32
+        let mut cache = make_cache_q4(10, 1, 32, 3);
+        // pos 0: all positive
+        let v0: Vec<f32> = (0..32).map(|i| 1.0 + i as f32 * 0.1).collect();
+        // pos 1: all negative (opposite direction)
+        let v1: Vec<f32> = (0..32).map(|i| -1.0 - i as f32 * 0.1).collect();
+        // pos 2: similar to pos 0
+        let v2: Vec<f32> = (0..32).map(|i| 1.1 + i as f32 * 0.1).collect();
+        write_k_q4(&mut cache, 0, 0, &v0);
+        write_k_q4(&mut cache, 1, 0, &v1);
+        write_k_q4(&mut cache, 2, 0, &v2);
+
+        let retain = vec![0, 1];
+        let (nearest, sim) = find_nearest_cosine(&cache, 2, &retain, 1, 32);
+        assert_eq!(nearest, 0, "pos 2 should be nearest to pos 0");
+        assert!(sim > 0.9, "similarity should be high, got {sim}");
+    }
+
+    #[test]
+    fn test_q4_weighted_merge() {
+        let mut cache = make_cache_q4(10, 1, 32, 3);
+        let v_retain: Vec<f32> = (0..32).map(|i| 2.0 + i as f32 * 0.1).collect();
+        let v_evict: Vec<f32> = (0..32).map(|i| 4.0 + i as f32 * 0.1).collect();
+        write_k_q4(&mut cache, 0, 0, &v_retain);
+        write_k_q4(&mut cache, 1, 0, &v_evict);
+
+        // sim=0 → w_retain=e/(1+e)=0.5, w_evict=1/(1+1)=0.5 (equal weights)
+        weighted_merge(&mut cache, 1, 0, 0.0, 1.0, 1, 32);
+
+        let merged = read_k_q4(&cache, 0, 0, 32);
+        // After merge: approximately (v_retain + v_evict) / 2
+        // Q4_0 quantization adds noise, but average should be roughly correct
+        let expected_avg: f32 = (0..32)
+            .map(|i| (2.0 + i as f32 * 0.1 + 4.0 + i as f32 * 0.1) / 2.0)
+            .sum::<f32>()
+            / 32.0;
+        let actual_avg: f32 = merged.iter().sum::<f32>() / 32.0;
+        assert!(
+            (expected_avg - actual_avg).abs() < 1.0,
+            "Q4_0 merge average drift too large: expected={expected_avg}, actual={actual_avg}"
+        );
+    }
+
+    #[test]
+    fn test_handler_q4_evicts() {
+        // Full handler integration with Q4_0 cache
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.75,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            beta: 0.7,
+            merge_e: 1.0,
+        });
+
+        let mut cache = make_cache_q4(50, 1, 32, 20);
+        // Write distinct K vectors so similarity is meaningful
+        for pos in 0..20 {
+            let v: Vec<f32> = (0..32).map(|d| ((pos * 32 + d) as f32) * 0.01).collect();
+            write_k_q4(&mut cache, pos, 0, &v);
+        }
+
+        let importance: Vec<f32> = (0..50).map(|i| 20.0 - i as f32).collect();
+        let mut caches = vec![cache];
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Critical,
+            mem_available: 0,
+        };
+
+        handler.handle(&mut ctx).unwrap();
+
+        let new_pos = ctx.caches[0].current_pos;
+        // target = 20 * 0.5 = 10
+        assert!(
+            new_pos <= 10,
+            "Q4_0 eviction should reduce pos, got {new_pos}"
+        );
+        assert!(new_pos >= 2, "prefix should be preserved");
     }
 }

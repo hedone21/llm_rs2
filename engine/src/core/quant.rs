@@ -22,8 +22,26 @@ pub struct BlockQ4_1 {
 const _: () = assert!(std::mem::size_of::<BlockQ4_0>() == 18);
 const _: () = assert!(std::mem::size_of::<BlockQ4_1>() == 20);
 
-// Helper for dequantization
 impl BlockQ4_0 {
+    /// Quantize 32 f32 values into a Q4_0 block.
+    ///
+    /// Symmetric quantization: finds max absolute value, scales to [-8, 7] range.
+    pub fn quantize(src: &[f32; QK4_0]) -> Self {
+        let max_abs = src.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let d = max_abs / 7.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+        let mut qs = [0u8; QK4_0 / 2];
+        for i in 0..(QK4_0 / 2) {
+            let v0 = (src[i] * id).round().clamp(-8.0, 7.0) as i8;
+            let v1 = (src[i + QK4_0 / 2] * id).round().clamp(-8.0, 7.0) as i8;
+            qs[i] = ((v0 + 8) as u8) | (((v1 + 8) as u8) << 4);
+        }
+        Self {
+            d: f16::from_f32(d),
+            qs,
+        }
+    }
+
     pub fn dequantize(&self, out: &mut [f32; QK4_0]) {
         let d = self.d.to_f32();
         for i in 0..(QK4_0 / 2) {
@@ -183,6 +201,34 @@ mod tests {
         assert_eq!(std::mem::size_of::<BlockQ4_0>(), 18);
         assert_eq!(std::mem::size_of::<BlockQ4_1>(), 20);
         assert_eq!(std::mem::size_of::<BlockQ8_0>(), 34);
+    }
+
+    #[test]
+    fn test_block_q4_0_quantize_round_trip() {
+        // Values within representable range
+        let src: [f32; QK4_0] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.5);
+        let block = BlockQ4_0::quantize(&src);
+        let mut dst = [0.0f32; QK4_0];
+        block.dequantize(&mut dst);
+        for i in 0..QK4_0 {
+            assert!(
+                (src[i] - dst[i]).abs() < 1.5,
+                "round-trip error at {i}: src={}, dst={}",
+                src[i],
+                dst[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_block_q4_0_quantize_zeros() {
+        let src = [0.0f32; QK4_0];
+        let block = BlockQ4_0::quantize(&src);
+        let mut dst = [0.0f32; QK4_0];
+        block.dequantize(&mut dst);
+        for val in dst {
+            assert_eq!(val, 0.0);
+        }
     }
 
     #[test]

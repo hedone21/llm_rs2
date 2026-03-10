@@ -10,6 +10,8 @@ use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
 use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
+use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
+use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
@@ -81,7 +83,7 @@ struct Args {
     #[arg(long, default_value = "q4")]
     kv_type: String,
 
-    /// Eviction policy for KV cache management (none, sliding, h2o)
+    /// Eviction policy for KV cache management (none, sliding, h2o, h2o_plus, d2o)
     #[arg(long, default_value = "none")]
     eviction_policy: String,
 
@@ -104,6 +106,18 @@ struct Args {
     /// Exponential decay factor for H2O importance scores per step (0.0 = no decay)
     #[arg(long, default_value_t = 0.0)]
     h2o_decay: f32,
+
+    /// D2O heavy-hitter keep ratio (0.0–1.0, paper default 0.75 = 3:1 ratio)
+    #[arg(long, default_value_t = 0.75)]
+    d2o_keep_ratio: f32,
+
+    /// D2O EMA beta for similarity threshold (0.0–1.0, paper default 0.7)
+    #[arg(long, default_value_t = 0.7)]
+    d2o_beta: f32,
+
+    /// D2O merge stability constant (paper default 1.0)
+    #[arg(long, default_value_t = 1.0)]
+    d2o_merge_e: f32,
 
     /// Number of prefix tokens to protect from eviction (defaults to the entire prompt length)
     #[arg(long)]
@@ -461,35 +475,52 @@ fn main() -> anyhow::Result<()> {
     let actual_protected_prefix = args.protected_prefix.unwrap_or(input_ids.len());
 
     let cache_manager = {
-        let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> =
-            match args.eviction_policy.as_str() {
-                "none" => Box::new(NoEvictionPolicy::new()),
-                "sliding" => Box::new(SlidingWindowPolicy::new(
-                    args.eviction_window,
-                    actual_protected_prefix,
-                )),
-                "h2o" => Box::new(H2OPolicy::new(
-                    args.h2o_recent_window,
-                    args.h2o_keep_ratio,
-                    actual_protected_prefix,
-                )),
-                "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                    args.h2o_recent_window,
-                    args.h2o_keep_ratio,
-                    actual_protected_prefix,
-                )),
-                other => anyhow::bail!(
-                    "Unknown eviction policy: '{}'. Use: none, sliding, h2o, h2o_plus",
-                    other
-                ),
-            };
         let monitor = Box::new(LinuxSystemMonitor);
         let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
-        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
+
+        if args.eviction_policy == "d2o" {
+            // D2O uses CachePressureHandler (Pipeline mode), not EvictionPolicy (Legacy mode)
+            let d2o_handler = D2OHandler::new(D2OConfig {
+                keep_ratio: args.d2o_keep_ratio,
+                protected_prefix: actual_protected_prefix,
+                target_ratio: args.eviction_target_ratio,
+                beta: args.d2o_beta,
+                merge_e: args.d2o_merge_e,
+            });
+            let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+                min_level: PressureLevel::Warning,
+                handler: Box::new(d2o_handler),
+            }]);
+            CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
+        } else {
+            let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> =
+                match args.eviction_policy.as_str() {
+                    "none" => Box::new(NoEvictionPolicy::new()),
+                    "sliding" => Box::new(SlidingWindowPolicy::new(
+                        args.eviction_window,
+                        actual_protected_prefix,
+                    )),
+                    "h2o" => Box::new(H2OPolicy::new(
+                        args.h2o_recent_window,
+                        args.h2o_keep_ratio,
+                        actual_protected_prefix,
+                    )),
+                    "h2o_plus" => Box::new(H2OPlusPolicy::new(
+                        args.h2o_recent_window,
+                        args.h2o_keep_ratio,
+                        actual_protected_prefix,
+                    )),
+                    other => anyhow::bail!(
+                        "Unknown eviction policy: '{}'. Use: none, sliding, h2o, h2o_plus, d2o",
+                        other
+                    ),
+                };
+            CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
+        }
     };
 
-    // Setup AttentionScoreAccumulator for H2O / H2O+
-    let mut score_accumulator = if args.eviction_policy == "h2o" {
+    // Setup AttentionScoreAccumulator for H2O / H2O+ / D2O
+    let mut score_accumulator = if args.eviction_policy == "h2o" || args.eviction_policy == "d2o" {
         let mut acc = AttentionScoreAccumulator::new(
             max_seq_len,
             model.config.num_attention_heads,
