@@ -262,11 +262,11 @@ llm_rs2/
 │   │   ├── micro_bench.rs   # 개별 연산자 벤치마크
 │   │   ├── test_backend.rs  # 백엔드 정합성 테스트
 │   │   ├── test_model.rs    # 모델 로딩 테스트
-│   │   └── repro_attention.rs  # attention 버그 재현용
+│   │   └── signal_injector.rs  # Resilience 시그널 주입 테스트
 │   │
 │   ├── core/                      # 핵심 추상화 레이어
 │   │   ├── mod.rs                 # 모듈 선언
-│   │   ├── backend.rs             # Backend trait (15개 연산자 정의)
+│   │   ├── backend.rs             # Backend trait (17개 연산자 정의)
 │   │   ├── buffer.rs              # Buffer trait + DType enum
 │   │   ├── memory.rs              # Memory trait (alloc/used_memory)
 │   │   ├── tensor.rs              # Tensor struct (Shape + Buffer + Backend)
@@ -290,8 +290,7 @@ llm_rs2/
 │   │       └── {compress,quantize,merge,swap,sparse}_handler.rs  # stubs
 │   │
 │   ├── models/llama/
-│   │   ├── llama_model.rs    # LlamaModel (from_dir, forward_into)
-│   │   └── llama_model_tmp.rs  # 실험용
+│   │   └── llama_model.rs    # LlamaModel (from_dir, forward_into)
 │   │
 │   ├── layers/
 │   │   ├── llama_layer.rs    # LlamaLayer (forward — seq_len에 따라 내부 분기)
@@ -326,7 +325,7 @@ llm_rs2/
 │   ├── memory/galloc.rs      # Galloc (CPU 전용 메모리 할당)
 │   └── buffer/shared_buffer.rs  # SharedBuffer 구현
 │
-├── kernels/                  # OpenCL 커널 파일 (~78개 .cl 파일)
+├── kernels/                  # OpenCL 커널 파일 (~80개 .cl 파일)
 │   ├── mul_mv_q4_0_f32*.cl   # Q4_0 양자화 MatVec 커널
 │   ├── rms_norm.cl           # RMS Norm 커널
 │   ├── rope.cl               # RoPE 커널
@@ -363,9 +362,13 @@ llm_rs2/
 │   ├── 23_resilience_test_strategy.md # Resilience 통합 테스트 요약
 │   ├── 24_resilience_usage_guide.md  # Resilience 사용 가이드
 │   ├── 25_troubleshooting.md         # 트러블슈팅 가이드
-│   └── 26_api_reference.md           # Resilience API 레퍼런스
+│   ├── 26_api_reference.md           # Resilience API 레퍼런스
+│   ├── 27_manager_architecture.md    # Manager 서비스 내부 아키텍처
+│   ├── 28_experiment_guide.md        # 실험 가이드
+│   ├── 29_manager_monitor_redesign.md # Manager 모니터 재설계
+│   └── 30_evaluation_methodology.md  # KV Cache Eviction 평가 방법론
 │
-├── web_dashboard/            # 벤치마크 시각화 웹 대시보드
+├── dashboard/                # 벤치마크 시각화 웹 대시보드 (Flask + Plotly.js)
 ├── results/                  # 프로파일링 결과 JSON
 └── tests/                    # 통합 테스트
 ```
@@ -379,12 +382,11 @@ llm_rs2/
 | `micro_bench` | 개별 연산자 벤치마크 | 연산별 크기 지정 |
 | `test_backend` | 백엔드 정합성 검증 | CPU vs OpenCL 결과 비교 |
 | `test_model` | 모델 로딩 검증 | `--model-path` |
-| `repro_attention` | attention 버그 재현 | 디버깅용 |
-| `reproduce_opencl_cast` | OpenCL cast 버그 재현 | 디버깅용 |
+| `signal_injector` | Resilience 시그널 주입 테스트 | `--signal-type`, `--level` |
 
 `generate` 바이너리의 eviction 관련 CLI 옵션:
 ```
---eviction-policy <POLICY>       none | sliding | h2o [default: none]
+--eviction-policy <POLICY>       none | sliding | h2o | h2o_plus | d2o [default: none]
 --eviction-window <SIZE>         Sliding window size [default: 1024]
 --protected-prefix <N>           Attention sink tokens to protect [default: prompt length]
 --memory-threshold-mb <MB>       Memory pressure threshold [default: 256]
@@ -393,6 +395,9 @@ llm_rs2/
 --h2o-keep-ratio <RATIO>         Heavy hitter keep ratio [default: 0.5]
 --h2o-tracked-layers <N>         Layers tracked for importance [default: 3]
 --h2o-decay <DECAY>              Importance score decay per step [default: 0.1]
+--d2o-keep-ratio <RATIO>         D2O keep ratio [default: 0.75]
+--d2o-beta <BETA>                D2O EMA threshold decay [default: 0.7]
+--d2o-merge-e <E>                D2O merge weight parameter [default: 1.0]
 ```
 
 ### 4. Data Layout & Quantization
@@ -407,7 +412,7 @@ llm_rs2/
 
 ## 5. 핵심 인터페이스 (Trait)
 
-- **Backend** (15+ 연산) — 하드웨어 가속기 추상화 (matmul, softmax, RoPE 등) → [`docs/02_core_abstractions.md`](docs/02_core_abstractions.md)
+- **Backend** (17+ 연산) — 하드웨어 가속기 추상화 (matmul, softmax, RoPE 등) → [`docs/02_core_abstractions.md`](docs/02_core_abstractions.md)
 - **Buffer / Memory** — 물리 메모리 할당 및 접근 (CPU pointer, OpenCL handle) → [`docs/02_core_abstractions.md`](docs/02_core_abstractions.md)
 - **EvictionPolicy** (`should_evict`, `evict`, `evict_with_scores`, `name`) → [`docs/11_kv_cache_management.md`](docs/11_kv_cache_management.md)
 - **CachePressureHandler** (`handle`, `name`) — 일반화된 캐시 관리 핸들러 (eviction, merge, compress 등) → `src/core/pressure/mod.rs`

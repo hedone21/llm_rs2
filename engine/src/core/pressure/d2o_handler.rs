@@ -261,7 +261,9 @@ impl CachePressureHandler for D2OHandler {
 
         // Validate: all caches must use the same layout.
         debug_assert!(
-            ctx.caches.windows(2).all(|w| w[0].layout() == w[1].layout()),
+            ctx.caches
+                .windows(2)
+                .all(|w| w[0].layout() == w[1].layout()),
             "D2OHandler: all caches must use the same KVLayout"
         );
 

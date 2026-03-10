@@ -34,14 +34,19 @@ graph TB
         Quant["Quant (Q4_0)"]
     end
 
-    subgraph EvictionSubsystem ["KV Cache Eviction"]
+    subgraph EvictionSubsystem ["KV Cache Management"]
         CacheManager["CacheManager"]
+        Pipeline["CachePressurePipeline"]
+        HandlerTrait["CachePressureHandler trait"]
+        EvictionHandler["EvictionHandler"]
+        D2OHandler["D2OHandler"]
         EvictionPolicy["EvictionPolicy trait"]
         NoEviction["NoEvictionPolicy"]
         SlidingWindow["SlidingWindowPolicy"]
         H2O["H2OPolicy (3-partition)"]
         SysMonitor["SystemMonitor trait"]
         LinuxMonitor["LinuxSystemMonitor"]
+        EventSinkTrait["EventSink trait"]
     end
 
     subgraph BackendComponent ["Compute Backends"]
@@ -61,9 +66,14 @@ graph TB
     LlamaLayer --> Attention
     LlamaLayer --> KVCache
 
-    LlamaModel --> CacheManager
-    CacheManager --> EvictionPolicy
+    Generate --> CacheManager
+    CacheManager --> Pipeline
     CacheManager --> SysMonitor
+    CacheManager --> EventSinkTrait
+    Pipeline --> HandlerTrait
+    HandlerTrait -.-> EvictionHandler
+    HandlerTrait -.-> D2OHandler
+    EvictionHandler --> EvictionPolicy
     NoEviction -.->|impl| EvictionPolicy
     SlidingWindow -.->|impl| EvictionPolicy
     H2O -.->|impl| EvictionPolicy
@@ -90,7 +100,7 @@ graph TB
 | Tier | Scope | Components | Gate Criteria |
 |:-----|:------|:-----------|:--------------|
 | **T1: Foundation** | Data structures, memory primitives | Shape, Tensor, Buffer/DType, Quant, SharedBuffer, Galloc | Host unit tests required, all must PASS |
-| **T2: Algorithm** | Algorithms, policies, CPU-testable logic | KVCache, NoEvictionPolicy, SlidingWindowPolicy, H2OPolicy, CacheManager, SystemMonitor, Attention | Host unit tests required, all must PASS |
+| **T2: Algorithm** | Algorithms, policies, CPU-testable logic | KVCache, NoEvictionPolicy, SlidingWindowPolicy, H2OPolicy, D2OHandler, CacheManager, SystemMonitor, Attention | Host unit tests required, all must PASS |
 | **T3: Backend** | Hardware-specific backends | CpuBackend, OpenCLBackend | Device verification via `test_backend`, host N/A |
 | **T4: Integration** | Model layers, GPU buffers | LlamaLayer, LayerWorkspace, LlamaModel, UnifiedBuffer | E2E device verification, host N/A |
 
@@ -134,6 +144,7 @@ _Last updated: 2026-03-08 23:45:12_
 | Tensor | T1 | Stable | 6 | 6 | 0 | PASS |
 | Attention | T2 | Stable | 5 | 5 | 0 | PASS |
 | CacheManager | T2 | Stable | 13 | 13 | 0 | PASS |
+| D2OHandler | T2 | Stable | 25 | 25 | 0 | PASS |
 | H2OPolicy | T2 | Stable | 10 | 10 | 0 | PASS |
 | KVCache | T2 | Stable | 15 | 15 | 0 | PASS |
 | NoEvictionPolicy | T2 | Stable | 3 | 3 | 0 | PASS |

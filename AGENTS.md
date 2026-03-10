@@ -47,9 +47,9 @@ Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fi
 - `dashboard/` — Web dashboard (Python/Flask)
 
 **Engine module structure** (`engine/src/lib.rs`):
-- `core/` — Traits and abstractions: `Backend` (15+ ops), `Buffer`, `Tensor`, `KVCache`, eviction policies
+- `core/` — Traits and abstractions: `Backend` (17+ ops), `Buffer`, `Tensor`, `KVCache`, eviction policies
 - `backend/cpu/` — CPU backend with ARM64 NEON (`neon.rs`) and x86 AVX2 (`x86.rs`) specializations
-- `backend/opencl/` — OpenCL GPU backend; kernels live in `engine/kernels/*.cl` (~78 files)
+- `backend/opencl/` — OpenCL GPU backend; kernels live in `engine/kernels/*.cl` (~80 files)
 - `models/llama/` — Llama 3.2 model loading and forward pass
 - `layers/` — Transformer layer, attention (naive + flash), pre-allocated workspace buffers
 - `memory/` — Galloc shared allocator
@@ -61,12 +61,14 @@ Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fi
 - `generate_hybrid` — Dynamic CPU↔GPU switching based on sequence length
 - `test_backend` — Backend correctness verification (compares CPU vs OpenCL)
 - `micro_bench` — Individual operator benchmarks
+- `test_model` — Model loading verification
+- `signal_injector` — Resilience signal injection for testing
 
-**Inference flow**: Prefill (batch tokens) → Decode (token-by-token). Each layer: RMSNorm → QKV matmul → RoPE → KV cache update → Attention → FFN. The model has separate `forward()` (prefill) and `forward_gen()` (decode) paths.
+**Inference flow**: Prefill (batch tokens) → Decode (token-by-token). Each layer: RMSNorm → QKV matmul → RoPE → KV cache update → Attention → FFN. Model uses `forward_into()` for unified forward pass; eviction is caller's responsibility via `CacheManager`. `LlamaLayer::forward()` internally dispatches to a private `forward_gen()` path when `seq_len == 1`.
 
 **Zero-copy memory**: On ARM SoCs, `CL_MEM_ALLOC_HOST_PTR` maps GPU buffers to CPU pointers, eliminating memcpy between CPU and GPU.
 
-**KV cache eviction**: `EvictionPolicy` trait with `NoEvictionPolicy`, `SlidingWindowPolicy` (keep recent N tokens), and `H2OPolicy` (3-partition: prefix + heavy hitters + recent window, signal-driven via `CacheManager::force_evict_with_scores()`). RoPE position increments monotonically even after eviction; physical KV cache position can decrease via `prune_prefix()`.
+**KV cache eviction**: `EvictionPolicy` trait with `NoEvictionPolicy`, `SlidingWindowPolicy` (keep recent N tokens), `H2OPolicy` (3-partition: prefix + heavy hitters + recent window), and `H2OPlusPolicy` (per-head GQA-aware variant). Also `D2OHandler` (merge compensation via `CachePressureHandler`). RoPE position increments monotonically even after eviction; physical KV cache position can decrease via `prune_prefix()`.
 
 ## Important Constraints
 
@@ -121,6 +123,8 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/25_troubleshooting.md` — Troubleshooting guide
 - `docs/26_api_reference.md` — Resilience API reference
 - `docs/27_manager_architecture.md` — Manager service internal architecture (3-layer, OCP PolicyEngine)
+- `docs/28_experiment_guide.md` — Experiment guide
+- `docs/29_manager_monitor_redesign.md` — Manager monitor redesign
 - `docs/30_evaluation_methodology.md` — KV Cache Eviction evaluation methodology (related work survey + benchmark design)
 
 ## Experiment Benchmarks
