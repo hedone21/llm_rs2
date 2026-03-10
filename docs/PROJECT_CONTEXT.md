@@ -13,6 +13,12 @@
 - **`src/core/`**: Core abstractions (`Tensor`, `Buffer`, `Device`).
 - **`kernels/`**: OpenCL / compute kernels.
 
+### Model Weights
+- **`models/`**: 모델 가중치 저장 디렉토리 (gitignored). 호스트 PC에서 테스트 시 사용.
+    - `models/llama3.2-1b/`: Llama 3.2 1B 모델 (HuggingFace Safetensors 포맷)
+    - 다운로드: `huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b`
+- **Android 디바이스**: `/data/local/tmp/models/llama3.2-1b`
+
 ## 2. Target Environment
 - **Primary Target**: Android (aarch64) on Mobile SoC (e.g., Snapdragon).
 - **Secondary Target**: Generic Linux (x86_64 / aarch64).

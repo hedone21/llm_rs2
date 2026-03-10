@@ -34,7 +34,7 @@ binary_dir = "target/release"
 
 [devices.host.paths]
 work_dir = "/tmp/llm_rs2"
-model_dir = ""
+model_dir = "models/llama3.2-1b"
 
 [devices.host.capabilities]
 arch = "x86_64"

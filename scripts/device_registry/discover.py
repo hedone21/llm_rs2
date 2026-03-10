@@ -42,7 +42,7 @@ class DiscoveredDevice:
         paths: dict = {}
         if self.connection_type == "local":
             paths["work_dir"] = "/tmp/llm_rs2"
-            paths["model_dir"] = ""
+            paths["model_dir"] = "models/llama3.2-1b"
         else:
             paths["work_dir"] = "/data/local/tmp"
             paths["model_dir"] = "/data/local/tmp/models/llama3.2-1b"

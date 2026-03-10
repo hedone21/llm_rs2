@@ -36,6 +36,23 @@ cargo test -p llm_shared   # unit tests (shared types)
 
 Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fix requires a test.
 
+## Model Weights
+
+`models/` 디렉토리는 `.gitignore`에 등록되어 git에 포함되지 않습니다. 호스트 PC에서 테스트할 때 모델 가중치를 이 경로에 저장합니다.
+
+```bash
+# HuggingFace에서 모델 다운로드
+huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
+
+# 호스트에서 추론 테스트
+cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "Hello" -n 128
+```
+
+| 경로 | 용도 |
+|------|------|
+| `models/llama3.2-1b/` | 호스트 PC 테스트용 (gitignored) |
+| `/data/local/tmp/models/llama3.2-1b` | Android 디바이스용 |
+
 ## Architecture
 
 **Cargo workspace** with 3 Rust crates:

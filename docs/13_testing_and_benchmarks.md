@@ -183,6 +183,23 @@ x86_64에서 AVX2가 감지되지 않으면 scalar로 fallback한다.
 
 ## 13.7 테스트 실행 가이드
 
+### 모델 가중치 준비
+
+호스트 PC에서 E2E 테스트를 수행하려면 `models/` 디렉토리에 모델을 다운로드해야 한다. 이 디렉토리는 gitignored이다.
+
+```bash
+# HuggingFace에서 Llama 3.2 1B 다운로드
+huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
+
+# 호스트에서 추론 테스트
+cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "Hello" -n 128
+```
+
+| 환경 | 모델 경로 |
+|------|-----------|
+| 호스트 PC | `models/llama3.2-1b` (프로젝트 루트 상대 경로) |
+| Android 디바이스 | `/data/local/tmp/models/llama3.2-1b` |
+
 ### Host 단위 테스트
 
 ```bash
