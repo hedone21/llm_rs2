@@ -1,14 +1,14 @@
 {
-  "timestamp": "2026-03-08T23:45:12.117845",
+  "timestamp": "2026-03-11T07:51:44.327589",
   "overall_gate": "FAIL",
   "summary": {
     "total_components": 23,
-    "pass": 18,
-    "fail": 0,
+    "pass": 19,
+    "fail": 1,
     "blocked": 1,
     "skip": 0,
-    "na": 4,
-    "pass_rate": 94.7
+    "na": 2,
+    "pass_rate": 90.5
   },
   "tiers": {
     "T1": {
@@ -38,8 +38,8 @@
           "name": "Quant",
           "module": "core::quant",
           "maturity": "Stable",
-          "total_tests": 6,
-          "passed": 6,
+          "total_tests": 8,
+          "passed": 8,
           "failed": 0,
           "skipped": 0,
           "gate": "PASS"
@@ -93,8 +93,8 @@
           "name": "CacheManager",
           "module": "core::cache_manager",
           "maturity": "Stable",
-          "total_tests": 13,
-          "passed": 13,
+          "total_tests": 22,
+          "passed": 22,
           "failed": 0,
           "skipped": 0,
           "gate": "PASS"
@@ -103,8 +103,8 @@
           "name": "H2OPolicy",
           "module": "core::eviction::h2o",
           "maturity": "Stable",
-          "total_tests": 10,
-          "passed": 10,
+          "total_tests": 44,
+          "passed": 44,
           "failed": 0,
           "skipped": 0,
           "gate": "PASS"
@@ -113,8 +113,8 @@
           "name": "KVCache",
           "module": "core::kv_cache",
           "maturity": "Stable",
-          "total_tests": 15,
-          "passed": 15,
+          "total_tests": 30,
+          "passed": 30,
           "failed": 0,
           "skipped": 0,
           "gate": "PASS"
@@ -233,11 +233,11 @@
           "name": "LlamaLayer",
           "module": "layers::llama_layer",
           "maturity": "Stable",
-          "total_tests": 0,
-          "passed": 0,
+          "total_tests": 3,
+          "passed": 3,
           "failed": 0,
           "skipped": 0,
-          "gate": "N/A"
+          "gate": "PASS"
         },
         {
           "name": "LlamaModel",
@@ -253,11 +253,11 @@
           "name": "UnifiedBuffer",
           "module": "buffer::unified_buffer",
           "maturity": "Stable",
-          "total_tests": 0,
+          "total_tests": 1,
           "passed": 0,
-          "failed": 0,
+          "failed": 1,
           "skipped": 0,
-          "gate": "N/A"
+          "gate": "FAIL"
         }
       ]
     }
@@ -577,6 +577,48 @@
       "passed": 209,
       "failed": 0,
       "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-10T19:06:30",
+      "total": 342,
+      "passed": 341,
+      "failed": 1,
+      "pass_rate": 99.7
+    },
+    {
+      "date": "2026-03-10T19:47:06",
+      "total": 344,
+      "passed": 341,
+      "failed": 3,
+      "pass_rate": 99.1
+    },
+    {
+      "date": "2026-03-10T19:54:30",
+      "total": 343,
+      "passed": 341,
+      "failed": 2,
+      "pass_rate": 99.4
+    },
+    {
+      "date": "2026-03-10T20:04:07",
+      "total": 344,
+      "passed": 341,
+      "failed": 3,
+      "pass_rate": 99.1
+    },
+    {
+      "date": "2026-03-11T00:49:12",
+      "total": 344,
+      "passed": 344,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-11T07:51:44",
+      "total": 345,
+      "passed": 344,
+      "failed": 1,
+      "pass_rate": 99.7
     }
   ]
 }

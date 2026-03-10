@@ -130,7 +130,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-08 23:45:12_
+_Last updated: 2026-03-11 07:51:44_
 
 ### Quality Gate Summary
 
@@ -138,15 +138,14 @@ _Last updated: 2026-03-08 23:45:12_
 |:----------|:-----|:---------|------:|-------:|--------:|:-----|
 | Buffer/DType | T1 | Stable | 5 | 5 | 0 | PASS |
 | Galloc | T1 | Stable | 3 | 3 | 0 | PASS |
-| Quant | T1 | Stable | 6 | 6 | 0 | PASS |
+| Quant | T1 | Stable | 8 | 8 | 0 | PASS |
 | Shape | T1 | Stable | 3 | 3 | 0 | PASS |
 | SharedBuffer | T1 | Stable | 5 | 5 | 0 | PASS |
 | Tensor | T1 | Stable | 6 | 6 | 0 | PASS |
 | Attention | T2 | Stable | 5 | 5 | 0 | PASS |
-| CacheManager | T2 | Stable | 13 | 13 | 0 | PASS |
-| D2OHandler | T2 | Stable | 25 | 25 | 0 | PASS |
-| H2OPolicy | T2 | Stable | 10 | 10 | 0 | PASS |
-| KVCache | T2 | Stable | 15 | 15 | 0 | PASS |
+| CacheManager | T2 | Stable | 22 | 22 | 0 | PASS |
+| H2OPolicy | T2 | Stable | 44 | 44 | 0 | PASS |
+| KVCache | T2 | Stable | 30 | 30 | 0 | PASS |
 | NoEvictionPolicy | T2 | Stable | 3 | 3 | 0 | PASS |
 | OperatingMode | T2 | Stable | 5 | 5 | 0 | PASS |
 | ResilienceManager | T2 | Stable | 9 | 9 | 0 | PASS |
@@ -157,11 +156,11 @@ _Last updated: 2026-03-08 23:45:12_
 | CpuBackend | T3 | Stable | 14 | 14 | 0 | PASS |
 | OpenCLBackend | T3 | Stable | 0 | 0 | 0 | N/A |
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
-| LlamaLayer | T4 | Stable | 0 | 0 | 0 | N/A |
+| LlamaLayer | T4 | Stable | 3 | 3 | 0 | PASS |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 0 | 0 | 0 | N/A |
-| **Overall** | | | **132** | **132** | **0** | **FAIL** |
-| Integration | - | - | 77 | 77 | PASS |
+| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
+| **Overall** | | | **196** | **195** | **0** | **FAIL** |
+| Integration | - | - | 149 | 149 | PASS |
 
 ### Test Details
 
@@ -176,6 +175,8 @@ _Last updated: 2026-03-08 23:45:12_
 | `test_galloc_used_memory` | Galloc | PASS |
 | `test_galloc_zero_size_allocation` | Galloc | PASS |
 | `test_block_q4_0_dequantize` | Quant | PASS |
+| `test_block_q4_0_quantize_round_trip` | Quant | PASS |
+| `test_block_q4_0_quantize_zeros` | Quant | PASS |
 | `test_block_q4_0_zero_scale` | Quant | PASS |
 | `test_block_q4_1_dequantize` | Quant | PASS |
 | `test_block_q4_1_zero_scale` | Quant | PASS |
@@ -210,33 +211,91 @@ _Last updated: 2026-03-08 23:45:12_
 | `test_maybe_evict_with_scores_triggers` | CacheManager | PASS |
 | `test_monitor_error_skips_eviction` | CacheManager | PASS |
 | `test_no_eviction_with_plenty_memory` | CacheManager | PASS |
+| `test_pipeline_manager_empty_pipeline` | CacheManager | PASS |
+| `test_pipeline_manager_evicts_at_pressure` | CacheManager | PASS |
+| `test_pipeline_manager_force_evict` | CacheManager | PASS |
+| `test_pipeline_manager_force_evict_with_scores` | CacheManager | PASS |
+| `test_pipeline_manager_monitor_error_skips` | CacheManager | PASS |
+| `test_pipeline_manager_multi_level_graduated_response` | CacheManager | PASS |
+| `test_pipeline_manager_no_action_at_normal` | CacheManager | PASS |
+| `test_pipeline_manager_policy_name` | CacheManager | PASS |
+| `test_pipeline_manager_with_scores` | CacheManager | PASS |
 | `test_policy_name` | CacheManager | PASS |
 | `test_sliding_window_with_memory_pressure` | CacheManager | PASS |
 | `test_target_ratio_clamping` | CacheManager | PASS |
+| `test_aggressive_eviction_large_to_small` | H2OPolicy | PASS |
+| `test_budget_calculation_exact_values` | H2OPolicy | PASS |
+| `test_budget_rounding_odd_available` | H2OPolicy | PASS |
 | `test_budget_split_50_50` | H2OPolicy | PASS |
+| `test_compaction_adjacent_hh_no_unnecessary_shift` | H2OPolicy | PASS |
+| `test_compaction_multihead_cache` | H2OPolicy | PASS |
+| `test_compaction_noncontiguous_hh_exact_data` | H2OPolicy | PASS |
+| `test_custom_prefix_size` | H2OPolicy | PASS |
 | `test_evict_below_threshold_noop` | H2OPolicy | PASS |
 | `test_evict_fallback_keeps_recent` | H2OPolicy | PASS |
 | `test_evict_fallback_works` | H2OPolicy | PASS |
 | `test_evict_preserves_prefix` | H2OPolicy | PASS |
+| `test_evictable_boundary_token` | H2OPolicy | PASS |
+| `test_evictable_fewer_than_hh_budget` | H2OPolicy | PASS |
+| `test_hh_ignores_prefix_region_scores` | H2OPolicy | PASS |
+| `test_hh_ignores_recent_region_scores` | H2OPolicy | PASS |
+| `test_hh_selects_highest_scores` | H2OPolicy | PASS |
 | `test_high_hh_ratio` | H2OPolicy | PASS |
+| `test_k_v_buffers_stay_synchronized` | H2OPolicy | PASS |
+| `test_keep_ratio_one_no_recent` | H2OPolicy | PASS |
+| `test_keep_ratio_zero_no_hh` | H2OPolicy | PASS |
+| `test_low_score_tokens_evicted` | H2OPolicy | PASS |
 | `test_name` | H2OPolicy | PASS |
 | `test_no_eviction_when_below_target` | H2OPolicy | PASS |
 | `test_order_preservation` | H2OPolicy | PASS |
+| `test_repeated_eviction_data_integrity` | H2OPolicy | PASS |
+| `test_reset_allows_former_hh_to_be_evicted` | H2OPolicy | PASS |
+| `test_reset_prevents_score_position_misalignment` | H2OPolicy | PASS |
+| `test_score_ranking_ascending_pattern` | H2OPolicy | PASS |
+| `test_score_ranking_descending_pattern` | H2OPolicy | PASS |
+| `test_score_ranking_v_shape_pattern` | H2OPolicy | PASS |
 | `test_should_evict_always_false` | H2OPolicy | PASS |
+| `test_tie_breaking_prefers_earlier_position` | H2OPolicy | PASS |
+| `test_without_reset_stale_scores_cause_wrong_eviction` | H2OPolicy | PASS |
+| `test_current_pos_uniform_after_eviction` | H2OPolicy | PASS |
+| `test_evict_fallback` | H2OPolicy | PASS |
+| `test_flat_scores_fallback` | H2OPolicy | PASS |
+| `test_name` | H2OPolicy | PASS |
+| `test_noop_when_below_target` | H2OPolicy | PASS |
+| `test_per_head_different_hh` | H2OPolicy | PASS |
+| `test_per_head_eviction_basic` | H2OPolicy | PASS |
+| `test_per_head_preserves_prefix` | H2OPolicy | PASS |
+| `test_per_head_preserves_recent` | H2OPolicy | PASS |
+| `test_should_evict_always_false` | H2OPolicy | PASS |
+| `test_accessors` | KVCache | PASS |
 | `test_cache_creation` | KVCache | PASS |
+| `test_cross_layout_equivalence` | KVCache | PASS |
 | `test_dynamic_growth_basic` | KVCache | PASS |
 | `test_dynamic_growth_capped` | KVCache | PASS |
 | `test_dynamic_growth_doubling` | KVCache | PASS |
 | `test_dynamic_overflow` | KVCache | PASS |
 | `test_dynamic_with_eviction` | KVCache | PASS |
 | `test_get_view` | KVCache | PASS |
+| `test_hm_dynamic_growth` | KVCache | PASS |
+| `test_hm_prune_prefix` | KVCache | PASS |
+| `test_hm_shift_positions` | KVCache | PASS |
+| `test_hm_update_multi_token` | KVCache | PASS |
+| `test_hm_update_single_token` | KVCache | PASS |
+| `test_layout_default_is_seq_major` | KVCache | PASS |
 | `test_memory_usage_bytes` | KVCache | PASS |
 | `test_new_backward_compat` | KVCache | PASS |
 | `test_non_dynamic_grow_fails` | KVCache | PASS |
+| `test_offset_head_major` | KVCache | PASS |
+| `test_offset_seq_major` | KVCache | PASS |
 | `test_prune_prefix_all` | KVCache | PASS |
 | `test_prune_prefix_basic` | KVCache | PASS |
 | `test_prune_prefix_over_count` | KVCache | PASS |
 | `test_prune_prefix_zero` | KVCache | PASS |
+| `test_shift_positions_for_head_basic` | KVCache | PASS |
+| `test_shift_positions_for_head_multi_count` | KVCache | PASS |
+| `test_shift_positions_for_head_noop` | KVCache | PASS |
+| `test_strides_head_major` | KVCache | PASS |
+| `test_strides_seq_major` | KVCache | PASS |
 | `test_update_overflow` | KVCache | PASS |
 | `test_no_eviction_evict_is_noop` | NoEvictionPolicy | PASS |
 | `test_no_eviction_name` | NoEvictionPolicy | PASS |
@@ -299,19 +358,95 @@ _Last updated: 2026-03-08 23:45:12_
 | `test_workspace_scores_size` | LayerWorkspace | PASS |
 | `test_workspace_small_config` | LayerWorkspace | PASS |
 | `test_workspace_tensors_writable` | LayerWorkspace | PASS |
+| `test_accumulator_receives_post_softmax_scores` | LlamaLayer | PASS |
+| `test_compute_attention_scores_f16_post_softmax` | LlamaLayer | PASS |
+| `test_inline_softmax_produces_valid_probabilities` | LlamaLayer | PASS |
+| `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
 | `default_config_all_monitors_enabled` | Integration | PASS |
 | `parse_external_config` | Integration | PASS |
 | `parse_full_config` | Integration | PASS |
 | `parse_minimal_toml` | Integration | PASS |
+| `test_accumulate_gqa_groups_q_heads` | Integration | PASS |
 | `test_accumulate_multi_layer_uses_max` | Integration | PASS |
 | `test_accumulate_single_layer` | Integration | PASS |
 | `test_cumulative_across_steps` | Integration | PASS |
 | `test_decay` | Integration | PASS |
 | `test_end_step_without_begin_step` | Integration | PASS |
+| `test_gqa_also_updates_flat` | Integration | PASS |
+| `test_gqa_decay` | Integration | PASS |
+| `test_gqa_multi_layer_max` | Integration | PASS |
+| `test_gqa_reset` | Integration | PASS |
+| `test_head_importance_accessor` | Integration | PASS |
 | `test_inactive_no_accumulation` | Integration | PASS |
+| `test_max_preserves_single_layer_critical_token` | Integration | PASS |
+| `test_max_vs_sum_divergent_hh_ranking` | Integration | PASS |
 | `test_per_layer_max_preserves_critical_tokens` | Integration | PASS |
+| `test_post_softmax_score_total_equals_n_heads` | Integration | PASS |
 | `test_reset` | Integration | PASS |
 | `test_should_track_layer` | Integration | PASS |
+| `test_two_stage_aggregation_within_step_max_across_steps_sum` | Integration | PASS |
+| `test_build_score_snapshot_all_prefix` | Integration | PASS |
+| `test_build_score_snapshot_basic` | Integration | PASS |
+| `test_build_score_snapshot_empty_returns_none` | Integration | PASS |
+| `test_build_score_snapshot_sigma_distribution` | Integration | PASS |
+| `test_collecting_sink_captures_events` | Integration | PASS |
+| `test_noop_sink_is_zero_cost` | Integration | PASS |
+| `test_compress_name` | Integration | PASS |
+| `test_compress_returns_noop` | Integration | PASS |
+| `test_cosine_identical_vectors` | Integration | PASS |
+| `test_cosine_opposite_vectors` | Integration | PASS |
+| `test_cosine_orthogonal_vectors` | Integration | PASS |
+| `test_cosine_zero_vector` | Integration | PASS |
+| `test_ema_initialization` | Integration | PASS |
+| `test_ema_update` | Integration | PASS |
+| `test_find_nearest_cosine_head_major` | Integration | PASS |
+| `test_find_nearest_cosine_seq_major` | Integration | PASS |
+| `test_handler_empty_caches` | Integration | PASS |
+| `test_handler_evicts_head_major` | Integration | PASS |
+| `test_handler_evicts_tokens` | Integration | PASS |
+| `test_handler_layout_equivalence` | Integration | PASS |
+| `test_handler_multi_layer` | Integration | PASS |
+| `test_handler_name` | Integration | PASS |
+| `test_handler_noop_below_target` | Integration | PASS |
+| `test_handler_noop_no_importance` | Integration | PASS |
+| `test_handler_q4_evicts` | Integration | PASS |
+| `test_keep_ratio_3_to_1` | Integration | PASS |
+| `test_merge_weights_sum_to_one` | Integration | PASS |
+| `test_prefix_always_protected` | Integration | PASS |
+| `test_q4_dequantize_k` | Integration | PASS |
+| `test_q4_find_nearest_cosine` | Integration | PASS |
+| `test_q4_weighted_merge` | Integration | PASS |
+| `test_quantize_round_trip` | Integration | PASS |
+| `test_weighted_merge_values` | Integration | PASS |
+| `test_h2o_fallback_without_scores` | Integration | PASS |
+| `test_name_delegates_to_policy` | Integration | PASS |
+| `test_noop_on_empty_caches` | Integration | PASS |
+| `test_noop_when_below_target` | Integration | PASS |
+| `test_target_ratio_clamping` | Integration | PASS |
+| `test_wraps_h2o_with_scores` | Integration | PASS |
+| `test_wraps_sliding_window` | Integration | PASS |
+| `test_merge_name` | Integration | PASS |
+| `test_merge_returns_noop` | Integration | PASS |
+| `test_quantize_name` | Integration | PASS |
+| `test_quantize_returns_noop` | Integration | PASS |
+| `test_sparse_name` | Integration | PASS |
+| `test_sparse_returns_noop` | Integration | PASS |
+| `test_swap_name` | Integration | PASS |
+| `test_swap_returns_noop` | Integration | PASS |
+| `test_action_result_is_action` | Integration | PASS |
+| `test_context_updated_after_eviction` | Integration | PASS |
+| `test_empty_pipeline` | Integration | PASS |
+| `test_pipeline_executes_matching_stages` | Integration | PASS |
+| `test_pipeline_len` | Integration | PASS |
+| `test_pipeline_ordering_sorts_by_level` | Integration | PASS |
+| `test_pipeline_skips_all_at_normal` | Integration | PASS |
+| `test_same_level_multiple_handlers` | Integration | PASS |
+| `test_compute_log_prob_peaked` | Integration | PASS |
+| `test_compute_log_prob_sums_to_one` | Integration | PASS |
+| `test_compute_log_prob_uniform` | Integration | PASS |
+| `test_greedy_sampling` | Integration | PASS |
+| `test_greedy_with_negative_logits` | Integration | PASS |
+| `test_repetition_penalty_reduces_repeated` | Integration | PASS |
 | `emit_without_client_is_noop` | Integration | PASS |
 | `roundtrip_signal_over_socket` | Integration | PASS |
 | `ascending_escalation_path` | Integration | PASS |
@@ -385,12 +520,6 @@ _Last updated: 2026-03-08 23:45:12_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-07T09:08:46 | 204 | 201 | 3 | 98.5% |
-| 2026-03-07T20:18:22 | 204 | 201 | 3 | 98.5% |
-| 2026-03-07T20:23:03 | 201 | 201 | 0 | 100.0% |
-| 2026-03-07T20:45:22 | 209 | 209 | 0 | 100.0% |
-| 2026-03-07T20:56:14 | 212 | 209 | 3 | 98.6% |
-| 2026-03-07T20:56:45 | 212 | 209 | 3 | 98.6% |
 | 2026-03-07T21:34:43 | 211 | 209 | 2 | 99.1% |
 | 2026-03-07T21:36:10 | 212 | 209 | 3 | 98.6% |
 | 2026-03-07T21:41:43 | 211 | 209 | 2 | 99.1% |
@@ -405,4 +534,10 @@ _Last updated: 2026-03-08 23:45:12_
 | 2026-03-08T18:43:48 | 212 | 209 | 3 | 98.6% |
 | 2026-03-08T22:12:16 | 209 | 209 | 0 | 100.0% |
 | 2026-03-08T23:45:12 | 209 | 209 | 0 | 100.0% |
+| 2026-03-10T19:06:30 | 342 | 341 | 1 | 99.7% |
+| 2026-03-10T19:47:06 | 344 | 341 | 3 | 99.1% |
+| 2026-03-10T19:54:30 | 343 | 341 | 2 | 99.4% |
+| 2026-03-10T20:04:07 | 344 | 341 | 3 | 99.1% |
+| 2026-03-11T00:49:12 | 344 | 344 | 0 | 100.0% |
+| 2026-03-11T07:51:44 | 345 | 344 | 1 | 99.7% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->
