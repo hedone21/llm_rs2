@@ -184,6 +184,24 @@ struct Args {
     /// By default, H2O/H2O+ use time-normalized scores to remove cumulative bias.
     #[arg(long, default_value_t = false)]
     h2o_raw_scores: bool,
+
+    // ── Eval-LL mode (log-likelihood evaluation) ──
+    /// Enable log-likelihood evaluation mode (downstream task accuracy)
+    #[arg(long, default_value_t = false)]
+    eval_ll: bool,
+
+    /// Continuation text to evaluate log-likelihood (single task mode)
+    #[arg(long)]
+    eval_continuation: Option<String>,
+
+    /// Path to evaluation batch JSON file: [{"id","prompt","continuation"}, ...]
+    #[arg(long)]
+    eval_batch: Option<String>,
+
+    /// Maximum KV cache budget in tokens. Evicts when cache_pos exceeds this.
+    /// 0 = no budget limit (default).
+    #[arg(long, default_value_t = 0)]
+    kv_budget: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -276,7 +294,10 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Determine initial KV cache capacity (dynamic grow-on-demand)
-    let initial_kv_capacity = if args.initial_kv_capacity > 0 {
+    let initial_kv_capacity = if args.eval_ll {
+        // Eval-LL batch mode: pre-allocate full capacity to avoid re-allocation
+        max_seq_len
+    } else if args.initial_kv_capacity > 0 {
         args.initial_kv_capacity.min(max_seq_len)
     } else {
         input_ids
@@ -507,6 +528,26 @@ fn main() -> anyhow::Result<()> {
     // Auto-eviction: sliding window in non-experiment mode checks memory pressure
     // after each forward pass. H2O/D2O are always signal-driven.
     let auto_eviction = args.eviction_policy == "sliding" && experiment_schedule.is_none();
+
+    // ════════════════════════════════════════════════════════════
+    //  EVAL-LL MODE: Log-likelihood evaluation for downstream tasks
+    // ════════════════════════════════════════════════════════════
+    if args.eval_ll {
+        return run_eval_ll(
+            &args,
+            &model,
+            &tokenizer,
+            &backend,
+            &*memory,
+            &mut kv_caches,
+            &mut cache_manager,
+            &mut score_accumulator,
+            vocab_size,
+            hidden_size,
+            max_seq_len,
+            &prompt,
+        );
+    }
 
     // Pre-allocate generation buffers
     let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
@@ -1033,4 +1074,509 @@ fn action_summary(action: &ResilienceAction) -> String {
         ResilienceAction::RejectNew => "RejectNew".to_string(),
         ResilienceAction::RestoreDefaults => "RestoreDefaults".to_string(),
     }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Eval-LL: Log-likelihood evaluation for downstream task accuracy
+// ════════════════════════════════════════════════════════════════
+
+/// KV cache snapshot for save/restore between multi-token choice scoring.
+struct KVSnapshot {
+    data: Vec<Vec<u8>>, // [layer] = k_bytes ++ v_bytes
+    positions: Vec<usize>,
+}
+
+fn snapshot_kv(kv_caches: &[KVCache]) -> KVSnapshot {
+    let mut data = Vec::with_capacity(kv_caches.len());
+    let mut positions = Vec::with_capacity(kv_caches.len());
+    for cache in kv_caches {
+        let k_size = cache.k_buffer.buffer().size();
+        let v_size = cache.v_buffer.buffer().size();
+        let mut buf = vec![0u8; k_size + v_size];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cache.k_buffer.buffer().as_ptr(),
+                buf.as_mut_ptr(),
+                k_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                cache.v_buffer.buffer().as_ptr(),
+                buf.as_mut_ptr().add(k_size),
+                v_size,
+            );
+        }
+        data.push(buf);
+        positions.push(cache.current_pos);
+    }
+    KVSnapshot { data, positions }
+}
+
+fn restore_kv(kv_caches: &mut [KVCache], snapshot: &KVSnapshot) {
+    for (i, cache) in kv_caches.iter_mut().enumerate() {
+        let k_size = cache.k_buffer.buffer().size();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                snapshot.data[i].as_ptr(),
+                cache.k_buffer.buffer().as_mut_ptr(),
+                k_size,
+            );
+            std::ptr::copy_nonoverlapping(
+                snapshot.data[i].as_ptr().add(k_size),
+                cache.v_buffer.buffer().as_mut_ptr(),
+                snapshot.data[i].len() - k_size,
+            );
+        }
+        cache.current_pos = snapshot.positions[i];
+    }
+}
+
+/// Grouped eval-LL: each task has a prompt + list of choices.
+///
+/// Prompt processing:
+/// - No budget (kv_budget=0 or prompt fits): full prefill
+/// - Budget mode (prompt > kv_budget): prefill first `budget` tokens, then
+///   decode remaining tokens one-by-one with eviction
+///
+/// Choice scoring (multi-token):
+/// - Score each choice's full token sequence using KV cache snapshot/restore
+/// - NLL = -sum(log_prob(token_i | prompt, tokens[:i])) / n_tokens
+///
+/// Batch format: [{"id": "q1", "prompt": "...", "choices": [" carbon dioxide", ...]}]
+#[allow(clippy::too_many_arguments)]
+fn run_eval_ll(
+    args: &Args,
+    model: &LlamaModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &dyn Memory,
+    kv_caches: &mut [KVCache],
+    cache_manager: &mut CacheManager,
+    score_accumulator: &mut Option<AttentionScoreAccumulator>,
+    vocab_size: usize,
+    _hidden_size: usize,
+    max_seq_len: usize,
+    default_prompt: &str,
+) -> anyhow::Result<()> {
+    let hidden_size = model.config.hidden_size;
+
+    // Load evaluation tasks
+    let raw_tasks: Vec<serde_json::Value> = if let Some(ref path) = args.eval_batch {
+        let file = std::fs::File::open(path)
+            .map_err(|e| anyhow::anyhow!("Failed to open eval batch {}: {}", path, e))?;
+        serde_json::from_reader(file)?
+    } else {
+        let cont = args.eval_continuation.as_deref().ok_or_else(|| {
+            anyhow::anyhow!("--eval-ll requires --eval-continuation or --eval-batch")
+        })?;
+        vec![serde_json::json!({
+            "id": "single",
+            "prompt": default_prompt,
+            "choices": [cont],
+        })]
+    };
+
+    // Normalize to grouped format
+    struct EvalQuestion {
+        id: String,
+        prompt: String,
+        choices: Vec<String>,
+    }
+    let mut questions: Vec<EvalQuestion> = Vec::new();
+    for task in &raw_tasks {
+        if let Some(choices) = task["choices"].as_array() {
+            questions.push(EvalQuestion {
+                id: task["id"].as_str().unwrap_or("unknown").to_string(),
+                prompt: task["prompt"]
+                    .as_str()
+                    .unwrap_or(default_prompt)
+                    .to_string(),
+                choices: choices
+                    .iter()
+                    .filter_map(|c| c.as_str().map(|s| s.to_string()))
+                    .collect(),
+            });
+        } else if let Some(cont) = task["continuation"].as_str() {
+            questions.push(EvalQuestion {
+                id: task["id"].as_str().unwrap_or("unknown").to_string(),
+                prompt: task["prompt"]
+                    .as_str()
+                    .unwrap_or(default_prompt)
+                    .to_string(),
+                choices: vec![cont.to_string()],
+            });
+        }
+    }
+
+    let budget_mode = args.kv_budget > 0;
+    eprintln!(
+        "[Eval-LL] {} questions, policy={}, kv_budget={}, mode={}",
+        questions.len(),
+        args.eviction_policy,
+        args.kv_budget,
+        if budget_mode {
+            "chunked"
+        } else {
+            "full-prefill"
+        }
+    );
+
+    // Pre-allocate decode buffers (needed for multi-token continuation scoring)
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut decode_logits =
+        Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let q_dim = hidden_size;
+    let k_dim = model.config.num_key_value_heads * model.config.head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = model.config.intermediate_size;
+    let mut gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len: args.max_seq_len,
+        },
+        memory,
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+
+    let mut results: Vec<serde_json::Value> = Vec::new();
+    let overall_start = std::time::Instant::now();
+
+    for (q_idx, question) in questions.iter().enumerate() {
+        let q_start = std::time::Instant::now();
+
+        // Reset KV caches
+        for cache in kv_caches.iter_mut() {
+            cache.current_pos = 0;
+        }
+        if let Some(acc) = score_accumulator.as_mut() {
+            acc.reset();
+        }
+
+        // Tokenize prompt
+        let prompt_enc = tokenizer
+            .encode(question.prompt.as_str(), true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let prompt_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
+        let prompt_len = prompt_ids.len();
+
+        if prompt_len > max_seq_len {
+            eprintln!(
+                "[Eval-LL] {}: prompt too long ({} > {}), skipping",
+                question.id, prompt_len, max_seq_len
+            );
+            continue;
+        }
+
+        let mut eviction_count: usize = 0;
+        let mut evicted_total: usize = 0;
+        let start_pos_after_prompt: usize;
+
+        // ── PROMPT PROCESSING ──
+        let prompt_logits_cpu: Vec<f32> = if budget_mode && prompt_len > args.kv_budget {
+            // ═══ CHUNKED PREFILL + DECODE (budget-constrained) ═══
+            let first_chunk_len = args.kv_budget;
+            let cpu_buf = Galloc::new().alloc(first_chunk_len * 4, DType::U8)?;
+            unsafe {
+                let ptr = cpu_buf.as_mut_ptr() as *mut u32;
+                std::ptr::copy_nonoverlapping(prompt_ids.as_ptr(), ptr, first_chunk_len);
+            }
+            let cpu_input = Tensor::new(
+                Shape::new(vec![1, first_chunk_len]),
+                cpu_buf,
+                Arc::new(CpuBackend::new()),
+            );
+            let input_tensor = backend.copy_from(&cpu_input)?;
+
+            let prefill_buf = memory.alloc(first_chunk_len * vocab_size * 4, DType::F32)?;
+            let mut prefill_logits = Tensor::new(
+                Shape::new(vec![1, first_chunk_len, vocab_size]),
+                prefill_buf,
+                backend.clone(),
+            );
+
+            model.forward_into(LlamaModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: 0,
+                kv_caches,
+                backend,
+                memory,
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                use_gpu_attn: args.gpu_attn,
+                score_accumulator: None,
+            })?;
+
+            let mut start_pos = first_chunk_len;
+
+            // Evict to make room
+            if kv_caches[0].current_pos > args.kv_budget {
+                let ratio = args.kv_budget as f32 / kv_caches[0].current_pos as f32;
+                let r = cache_manager.force_evict(kv_caches, ratio)?;
+                if r.evicted {
+                    eviction_count += 1;
+                    evicted_total += r.tokens_removed;
+                }
+            }
+
+            // Decode remaining prompt tokens one-by-one
+            for &token_id in &prompt_ids[first_chunk_len..] {
+                unsafe {
+                    *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token_id;
+                }
+                let gen_input = backend.copy_from(&cpu_gen_input)?;
+
+                if let Some(acc) = score_accumulator.as_mut() {
+                    acc.begin_step();
+                }
+
+                model.forward_into(LlamaModelForwardArgs {
+                    input_tokens: &gen_input,
+                    start_pos,
+                    kv_caches,
+                    backend,
+                    memory,
+                    logits_out: &mut decode_logits,
+                    x_gen: Some(&mut x_gen),
+                    workspace: Some(&mut gen_ws),
+                    use_gpu_attn: args.gpu_attn,
+                    score_accumulator: score_accumulator.as_mut(),
+                })?;
+                start_pos += 1;
+
+                if kv_caches[0].current_pos > args.kv_budget {
+                    let ratio = args.kv_budget as f32 / kv_caches[0].current_pos as f32;
+                    let evict_result = if let Some(acc) = score_accumulator.as_ref() {
+                        cache_manager.force_evict_with_scores(
+                            kv_caches,
+                            ratio,
+                            acc.importance_scores(),
+                        )?
+                    } else {
+                        cache_manager.force_evict(kv_caches, ratio)?
+                    };
+                    if evict_result.evicted {
+                        eviction_count += 1;
+                        evicted_total += evict_result.tokens_removed;
+                    }
+                }
+            }
+
+            start_pos_after_prompt = start_pos;
+
+            // Read logits from last decode step
+            let mut logits_cpu = vec![0.0f32; vocab_size];
+            unsafe {
+                let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+                let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+                backend.read_buffer(&decode_logits, slice)?;
+            }
+            logits_cpu
+        } else {
+            // ═══ FULL PREFILL ═══
+            let cpu_indices_buf = Galloc::new().alloc(prompt_len * 4, DType::U8)?;
+            unsafe {
+                let ptr = cpu_indices_buf.as_mut_ptr() as *mut u32;
+                std::ptr::copy_nonoverlapping(prompt_ids.as_ptr(), ptr, prompt_len);
+            }
+            let cpu_input = Tensor::new(
+                Shape::new(vec![1, prompt_len]),
+                cpu_indices_buf,
+                Arc::new(CpuBackend::new()),
+            );
+            let input_tensor = backend.copy_from(&cpu_input)?;
+
+            let prefill_logits_buf = memory.alloc(prompt_len * vocab_size * 4, DType::F32)?;
+            let mut prefill_logits = Tensor::new(
+                Shape::new(vec![1, prompt_len, vocab_size]),
+                prefill_logits_buf,
+                backend.clone(),
+            );
+
+            model.forward_into(LlamaModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: 0,
+                kv_caches,
+                backend,
+                memory,
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                use_gpu_attn: args.gpu_attn,
+                score_accumulator: None,
+            })?;
+
+            start_pos_after_prompt = prompt_len;
+
+            // Read last-position logits
+            let mut all_logits = vec![0.0f32; prompt_len * vocab_size];
+            unsafe {
+                let ptr = all_logits.as_mut_ptr() as *mut u8;
+                let slice = std::slice::from_raw_parts_mut(ptr, all_logits.len() * 4);
+                backend.read_buffer(&prefill_logits, slice)?;
+            }
+            let off = (prompt_len - 1) * vocab_size;
+            all_logits[off..off + vocab_size].to_vec()
+        };
+
+        // ── SNAPSHOT KV cache after prompt (for multi-token choice scoring) ──
+        let kv_snap = snapshot_kv(kv_caches);
+
+        // ── SCORE EACH CHOICE ──
+        let mut choice_nlls: Vec<f64> = Vec::new();
+        let mut choice_byte_lens: Vec<usize> = Vec::new();
+        let mut choice_token_lens: Vec<usize> = Vec::new();
+        for choice_text in &question.choices {
+            // Tokenize full text to extract continuation tokens
+            let full_text = format!("{}{}", question.prompt, choice_text);
+            let full_enc = tokenizer
+                .encode(full_text.as_str(), true)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let full_ids: Vec<u32> = full_enc.get_ids().to_vec();
+            let cont_ids: Vec<u32> = full_ids[prompt_ids.len()..].to_vec();
+
+            if cont_ids.is_empty() {
+                choice_nlls.push(f64::INFINITY);
+                continue;
+            }
+
+            // First token scored from prompt logits
+            let mut total_nll =
+                -sampling::compute_log_prob(&prompt_logits_cpu, cont_ids[0], vocab_size);
+
+            // Multi-token: decode remaining tokens, accumulating NLL
+            if cont_ids.len() > 1 {
+                // Restore KV cache to post-prompt state
+                restore_kv(kv_caches, &kv_snap);
+                let mut sp = start_pos_after_prompt;
+
+                for token_pair in cont_ids.windows(2) {
+                    let input_token = token_pair[0];
+                    let target_token = token_pair[1];
+
+                    unsafe {
+                        *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = input_token;
+                    }
+                    let gen_input = backend.copy_from(&cpu_gen_input)?;
+
+                    model.forward_into(LlamaModelForwardArgs {
+                        input_tokens: &gen_input,
+                        start_pos: sp,
+                        kv_caches,
+                        backend,
+                        memory,
+                        logits_out: &mut decode_logits,
+                        x_gen: Some(&mut x_gen),
+                        workspace: Some(&mut gen_ws),
+                        use_gpu_attn: args.gpu_attn,
+                        score_accumulator: None,
+                    })?;
+                    sp += 1;
+
+                    // Read logits and score target token
+                    let mut step_logits = vec![0.0f32; vocab_size];
+                    unsafe {
+                        let ptr = step_logits.as_mut_ptr() as *mut u8;
+                        let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+                        backend.read_buffer(&decode_logits, slice)?;
+                    }
+                    total_nll -= sampling::compute_log_prob(&step_logits, target_token, vocab_size);
+                }
+            }
+
+            // Store raw total NLL (Python handles normalization strategy)
+            choice_nlls.push(total_nll);
+            choice_byte_lens.push(choice_text.len());
+            choice_token_lens.push(cont_ids.len());
+        }
+
+        // Restore KV cache for consistency (not strictly needed as we reset next iter)
+        restore_kv(kv_caches, &kv_snap);
+
+        // Find predicted using byte-length-normalized NLL (acc_norm, lm-eval style)
+        let predicted_norm: usize = choice_nlls
+            .iter()
+            .zip(choice_byte_lens.iter())
+            .enumerate()
+            .min_by(|(_, (a, al)), (_, (b, bl))| {
+                let a_norm = *a / **al as f64;
+                let b_norm = *b / **bl as f64;
+                a_norm
+                    .partial_cmp(&b_norm)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        // Also compute raw prediction (acc, no normalization)
+        let predicted_raw: usize = choice_nlls
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        let elapsed_q = q_start.elapsed().as_secs_f64();
+        eprintln!(
+            "[Eval-LL] {}/{} {} — norm={} raw={} nlls=[{}] evict={} {:.1}s",
+            q_idx + 1,
+            questions.len(),
+            question.id,
+            predicted_norm,
+            predicted_raw,
+            choice_nlls
+                .iter()
+                .map(|v| format!("{:.3}", v))
+                .collect::<Vec<_>>()
+                .join(","),
+            eviction_count,
+            elapsed_q,
+        );
+
+        results.push(serde_json::json!({
+            "id": question.id,
+            "choice_nlls": choice_nlls,
+            "choice_byte_lens": choice_byte_lens,
+            "choice_token_lens": choice_token_lens,
+            "predicted": predicted_norm,
+            "predicted_raw": predicted_raw,
+            "n_choices": question.choices.len(),
+            "n_prompt_tokens": prompt_len,
+            "eviction_count": eviction_count,
+            "evicted_tokens": evicted_total,
+            "final_cache_pos": kv_caches[0].current_pos,
+        }));
+    }
+
+    let elapsed = overall_start.elapsed().as_secs_f64();
+    let output = serde_json::json!({
+        "results": results,
+        "config": {
+            "model": args.model_path,
+            "eviction_policy": args.eviction_policy,
+            "kv_budget": args.kv_budget,
+            "max_seq_len": max_seq_len,
+            "kv_type": args.kv_type,
+            "h2o_keep_ratio": args.h2o_keep_ratio,
+            "h2o_decay": args.h2o_decay,
+            "time_normalized": !args.h2o_raw_scores,
+        },
+        "wall_time_s": elapsed,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }

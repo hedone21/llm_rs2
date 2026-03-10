@@ -105,6 +105,22 @@ pub fn sample(
     valid_indices.first().copied().unwrap_or(0) as u32
 }
 
+/// Compute log P(token_id) from raw logits using numerically stable log-softmax.
+///
+/// Uses f64 arithmetic to avoid precision loss when accumulating over many tokens.
+/// Formula: log_softmax(x)_i = (x_i - max) - log(sum(exp(x_j - max)))
+pub fn compute_log_prob(logits: &[f32], token_id: u32, vocab_size: usize) -> f64 {
+    let logits = &logits[..vocab_size];
+    let max_logit = logits.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let log_sum_exp: f64 = logits
+        .iter()
+        .map(|&x| ((x - max_logit) as f64).exp())
+        .sum::<f64>()
+        .ln()
+        + max_logit as f64;
+    logits[token_id as usize] as f64 - log_sum_exp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,5 +162,33 @@ mod tests {
         let config = default_config();
         let token = sample(&mut logits, &[], 3, &config);
         assert_eq!(token, 1); // -1.0 is the highest
+    }
+
+    #[test]
+    fn test_compute_log_prob_uniform() {
+        // Uniform logits → each token has prob 1/4 → log(1/4) ≈ -1.386
+        let logits = vec![1.0, 1.0, 1.0, 1.0];
+        let lp = compute_log_prob(&logits, 0, 4);
+        assert!((lp - (-4.0f64.ln())).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_compute_log_prob_peaked() {
+        // One very high logit should get log_prob close to 0
+        let logits = vec![100.0, 0.0, 0.0, 0.0];
+        let lp = compute_log_prob(&logits, 0, 4);
+        assert!(lp > -1e-10); // close to 0
+        // The other tokens should have very negative log_prob
+        let lp_other = compute_log_prob(&logits, 1, 4);
+        assert!(lp_other < -90.0);
+    }
+
+    #[test]
+    fn test_compute_log_prob_sums_to_one() {
+        let logits = vec![2.0, 1.0, 0.5, 3.0, -1.0];
+        let total: f64 = (0..5)
+            .map(|i| compute_log_prob(&logits, i as u32, 5).exp())
+            .sum();
+        assert!((total - 1.0).abs() < 1e-10);
     }
 }

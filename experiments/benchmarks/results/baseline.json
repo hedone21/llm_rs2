@@ -1,0 +1,46 @@
+{
+  "boolq_none": {
+    "task": "boolq",
+    "policy": "none",
+    "kv_budget": 0,
+    "model": "models/llama3.2-1b",
+    "accuracy": 0.48,
+    "accuracy_raw": 0.52,
+    "correct": 12,
+    "correct_raw": 13,
+    "total": 25,
+    "wall_time_s": 1667.485201886,
+    "config": {
+      "eviction_policy": "none",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_type": "q4",
+      "max_seq_len": 1024,
+      "model": "models/llama3.2-1b",
+      "time_normalized": true
+    }
+  },
+  "arc_easy_none": {
+    "task": "arc_easy",
+    "policy": "none",
+    "kv_budget": 0,
+    "model": "models/llama3.2-1b",
+    "accuracy": 0.4,
+    "accuracy_raw": 0.28,
+    "correct": 10,
+    "correct_raw": 7,
+    "total": 25,
+    "wall_time_s": 1180.073263732,
+    "config": {
+      "eviction_policy": "none",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_type": "q4",
+      "max_seq_len": 1024,
+      "model": "models/llama3.2-1b",
+      "time_normalized": true
+    }
+  }
+}
