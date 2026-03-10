@@ -2,6 +2,7 @@ pub mod attention_scores;
 pub mod backend;
 pub mod buffer;
 pub mod cache_manager;
+pub mod events;
 pub mod eviction;
 pub mod kv_cache;
 pub mod memory;

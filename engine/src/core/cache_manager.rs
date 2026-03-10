@@ -1,5 +1,8 @@
+use std::sync::Arc;
+
 use anyhow::Result;
 
+use crate::core::events::{CacheEvent, EventSink, NoOpSink};
 use crate::core::eviction::EvictionPolicy;
 use crate::core::kv_cache::KVCache;
 use crate::core::pressure::{
@@ -48,6 +51,8 @@ pub struct CacheManager {
     monitor: Box<dyn SystemMonitor>,
     /// Eviction triggers when available memory drops below this threshold (bytes).
     threshold_bytes: usize,
+    /// Event sink for observability. Defaults to `NoOpSink` (zero overhead).
+    event_sink: Arc<dyn EventSink>,
 }
 
 impl CacheManager {
@@ -69,6 +74,7 @@ impl CacheManager {
             pipeline,
             monitor,
             threshold_bytes,
+            event_sink: Arc::new(NoOpSink),
         }
     }
 
@@ -85,7 +91,18 @@ impl CacheManager {
             pipeline,
             monitor,
             threshold_bytes,
+            event_sink: Arc::new(NoOpSink),
         }
+    }
+
+    /// Set the event sink for observability.
+    pub fn set_event_sink(&mut self, sink: Arc<dyn EventSink>) {
+        self.event_sink = sink;
+    }
+
+    /// Get a reference to the event sink.
+    pub fn event_sink(&self) -> &Arc<dyn EventSink> {
+        &self.event_sink
     }
 
     /// Determine pressure level from available memory.
@@ -186,6 +203,12 @@ impl CacheManager {
             (pressure, mem_available)
         };
 
+        self.event_sink.emit(CacheEvent::PressureDetected {
+            level: pressure,
+            mem_available,
+            forced: force,
+        });
+
         log::info!(
             "[CacheManager] pressure={:?}{}, executing '{}'",
             pressure,
@@ -213,9 +236,17 @@ impl CacheManager {
             target_ratio: force_target_ratio,
         };
         let results = self.pipeline.execute(&mut ctx)?;
-        Ok(Self::pipeline_results_to_eviction_result(
-            &results, ctx.caches,
-        ))
+        let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);
+
+        if eviction_result.evicted {
+            self.event_sink.emit(CacheEvent::EvictionCompleted {
+                policy: self.pipeline.name(),
+                tokens_removed: eviction_result.tokens_removed,
+                new_pos: eviction_result.new_pos,
+            });
+        }
+
+        Ok(eviction_result)
     }
 
     // ── Public API (all signatures preserved) ───────────────────────
