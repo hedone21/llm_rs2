@@ -259,6 +259,12 @@ impl CachePressureHandler for D2OHandler {
             return Ok(ActionResult::NoOp);
         }
 
+        // Validate: all caches must use the same layout.
+        debug_assert!(
+            ctx.caches.windows(2).all(|w| w[0].layout() == w[1].layout()),
+            "D2OHandler: all caches must use the same KVLayout"
+        );
+
         let importance = match ctx.importance {
             Some(imp) => imp,
             None => return Ok(ActionResult::NoOp),
@@ -597,13 +603,16 @@ mod tests {
     ) -> KVCache {
         let backend = Arc::new(CpuBackend::new());
         let buf_size = max_seq * kv_heads * head_dim * 4;
+        // Pass shape as [1, max_seq, kv_heads, head_dim] so KVCache::new
+        // correctly reads kv_heads from shape[2] and head_dim from shape[3].
+        // The HeadMajor layout flag controls how offset() computes addresses.
         let k = Tensor::new(
-            Shape::new(vec![1, kv_heads, max_seq, head_dim]),
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
             Arc::new(SharedBuffer::new(buf_size, DType::F32)),
             backend.clone(),
         );
         let v = Tensor::new(
-            Shape::new(vec![1, kv_heads, max_seq, head_dim]),
+            Shape::new(vec![1, max_seq, kv_heads, head_dim]),
             Arc::new(SharedBuffer::new(buf_size, DType::F32)),
             backend,
         );
@@ -1270,5 +1279,167 @@ mod tests {
             "Q4_0 eviction should reduce pos, got {new_pos}"
         );
         assert!(new_pos >= 2, "prefix should be preserved");
+    }
+
+    // ── Layout coverage tests ──
+
+    #[test]
+    fn test_handler_evicts_head_major() {
+        // Full handler integration with HeadMajor layout.
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.75,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            beta: 0.7,
+            merge_e: 1.0,
+        });
+
+        let mut cache = make_cache_head_major(50, 2, 4, 30);
+        for pos in 0..30 {
+            let angle = pos as f32 * 0.2;
+            for h in 0..2 {
+                write_k(
+                    &mut cache,
+                    pos,
+                    h,
+                    &[angle.cos(), angle.sin(), h as f32 * 0.1, 0.0],
+                );
+                write_v(&mut cache, pos, h, &[pos as f32, h as f32, 0.0, 0.0]);
+            }
+        }
+
+        let mut importance = vec![0.1; 50];
+        importance[..5].fill(10.0);
+        importance[25..30].fill(5.0);
+
+        let mut caches = vec![cache];
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Critical,
+            mem_available: 0,
+            target_ratio: None,
+        };
+
+        let result = handler.handle(&mut ctx).unwrap();
+        match result {
+            ActionResult::Evicted {
+                tokens_removed,
+                new_pos,
+            } => {
+                assert!(tokens_removed > 0, "should have removed tokens");
+                assert!(new_pos < 30, "new_pos should be less than original");
+                assert!(new_pos >= 2, "should keep at least prefix");
+                assert_eq!(new_pos, 15, "should reduce to target (30*0.5)");
+            }
+            other => panic!("Expected Evicted, got {:?}", other),
+        }
+
+        // Verify prefix tokens preserved for both heads
+        // pos=0: angle = 0.0, so K[0] = cos(0.0) = 1.0
+        for h in 0..2 {
+            let k0 = read_k(&ctx.caches[0], 0, h, 4);
+            assert!(
+                (k0[0] - 1.0).abs() < 1e-4,
+                "head {h} prefix pos 0 K[0] should be cos(0)=1.0, got {}",
+                k0[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_handler_layout_equivalence() {
+        // SeqMajor and HeadMajor should produce identical eviction results
+        // (same tokens_removed, same new_pos) given the same logical data.
+        let make_config = || D2OConfig {
+            keep_ratio: 0.75,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            beta: 0.7,
+            merge_e: 1.0,
+        };
+
+        let mut importance = vec![0.1; 50];
+        importance[..5].fill(10.0);
+        importance[15..20].fill(5.0);
+
+        // Populate identical logical content into both layouts
+        let populate = |cache: &mut KVCache| {
+            for pos in 0..20 {
+                let angle = pos as f32 * 0.3;
+                write_k(cache, pos, 0, &[angle.cos(), angle.sin(), 0.0, 0.0]);
+                write_v(cache, pos, 0, &[pos as f32, 0.0, 0.0, 0.0]);
+            }
+        };
+
+        // --- SeqMajor ---
+        let handler_seq = D2OHandler::new(make_config());
+        let mut cache_seq = make_cache(50, 1, 4, 20);
+        populate(&mut cache_seq);
+        let mut caches_seq = vec![cache_seq];
+        let mut ctx_seq = HandlerContext {
+            caches: &mut caches_seq,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Critical,
+            mem_available: 0,
+            target_ratio: None,
+        };
+        let result_seq = handler_seq.handle(&mut ctx_seq).unwrap();
+
+        // --- HeadMajor ---
+        let handler_hm = D2OHandler::new(make_config());
+        let mut cache_hm = make_cache_head_major(50, 1, 4, 20);
+        populate(&mut cache_hm);
+        let mut caches_hm = vec![cache_hm];
+        let mut ctx_hm = HandlerContext {
+            caches: &mut caches_hm,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Critical,
+            mem_available: 0,
+            target_ratio: None,
+        };
+        let result_hm = handler_hm.handle(&mut ctx_hm).unwrap();
+
+        // Both should produce Evicted with matching stats
+        match (&result_seq, &result_hm) {
+            (
+                ActionResult::Evicted {
+                    tokens_removed: rem_s,
+                    new_pos: pos_s,
+                },
+                ActionResult::Evicted {
+                    tokens_removed: rem_h,
+                    new_pos: pos_h,
+                },
+            ) => {
+                assert_eq!(rem_s, rem_h, "tokens_removed must match across layouts");
+                assert_eq!(pos_s, pos_h, "new_pos must match across layouts");
+            }
+            _ => panic!(
+                "Expected Evicted for both, got seq={:?} hm={:?}",
+                result_seq, result_hm
+            ),
+        }
+
+        // Verify the compacted K values match logically
+        let final_pos = ctx_seq.caches[0].current_pos;
+        for pos in 0..final_pos {
+            let k_seq = read_k(&ctx_seq.caches[0], pos, 0, 4);
+            let k_hm = read_k(&ctx_hm.caches[0], pos, 0, 4);
+            for d in 0..4 {
+                assert!(
+                    (k_seq[d] - k_hm[d]).abs() < 1e-4,
+                    "K mismatch at pos={pos} dim={d}: seq={} hm={}",
+                    k_seq[d],
+                    k_hm[d],
+                );
+            }
+        }
     }
 }
