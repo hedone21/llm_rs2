@@ -26,7 +26,7 @@ Use the `auto_profile.sh` script to Run -> Visualize -> Update Log in one step.
 **Example:**
 ```bash
 ./.agent/skills/profiling/scripts/auto_profile.sh \
-    --cmd "/data/local/tmp/generate --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt --num-tokens 128 -b cpu" \
+    --cmd "/data/local/tmp/generate --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b --prompt-file /data/local/tmp/llm_rs2/experiments/prompts/short_len.txt --num-tokens 128 -b cpu" \
     --output-name "cpu_short_run"
 ```
 

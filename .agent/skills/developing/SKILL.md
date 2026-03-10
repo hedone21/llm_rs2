@@ -96,7 +96,7 @@ Run this script before verification to ensure code style and linting are correct
 ## 6. Finalizing (Definition of Done)
 
 ALWAYS perform these steps before marking a task as complete:
-1.  **Update Documentation**: Reflect any architectural changes, new commands, or findings in `PROJECT_CONTEXT.md` or relevant `GUIDE.md` files.
+1.  **Update Documentation**: Reflect any architectural changes, new commands, or findings in `docs/PROJECT_CONTEXT.md` or relevant `GUIDE.md` files.
 2.  **Update Artifacts**: Ensure `task.md` and `walkthrough.md` are up to date.
 
     **Update Artifacts**: Ensure `task.md` and `walkthrough.md` are up to date.

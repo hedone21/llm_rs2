@@ -40,7 +40,7 @@ adb shell "chmod +x /data/local/tmp/generate"
 # adb push models/llama3.2-1b /data/local/tmp/llm_rs2/models/
 
 # Push evaluation prompts
-adb push eval/ /data/local/tmp/llm_rs2/
+adb push experiments/prompts/ /data/local/tmp/llm_rs2/
 ```
 
 ### Step 3: Run Profiling
@@ -56,7 +56,7 @@ Use the `scripts/android_profile.py` script. This wrapper handles:
 python3 scripts/android_profile.py \
     --cmd "/data/local/tmp/generate \
         --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b \
-        --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt \
+        --prompt-file /data/local/tmp/llm_rs2/experiments/prompts/short_len.txt \
         --num-tokens 128 \
         -b cpu" \
     --output-dir results/data

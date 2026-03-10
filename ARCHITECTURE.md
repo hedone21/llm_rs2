@@ -318,7 +318,6 @@ llm_rs2/
 │   ├── android_profile.py    # Android 프로파일링 + JSON 결과 수집
 │   ├── run_benchmark_suite.py  # 벤치마크 매트릭스 실행
 │   ├── update_benchmark_summary.py  # 결과 요약 테이블 생성
-│   ├── test_foreground_impact.sh  # 포그라운드 앱 영향 테스트
 │   └── visualize_profile.py  # 프로파일 데이터 시각화
 │
 ├── docs/                     # 상세 기술 문서
@@ -347,7 +346,6 @@ llm_rs2/
 │   └── 26_api_reference.md           # Resilience API 레퍼런스
 │
 ├── web_dashboard/            # 벤치마크 시각화 웹 대시보드
-├── benchmarks/               # 벤치마크 데이터 및 분석 스크립트
 ├── results/                  # 프로파일링 결과 JSON
 └── tests/                    # 통합 테스트
 ```

@@ -281,9 +281,9 @@ def phase_build_push(args):
     print("=" * 60)
 
     # Generate eval prompt files
-    os.makedirs("eval", exist_ok=True)
+    os.makedirs("experiments/prompts", exist_ok=True)
     for tok in [512, 1024]:
-        path = f"eval/prefill_{tok}.txt"
+        path = f"experiments/prompts/prefill_{tok}.txt"
         if not os.path.exists(path):
             generate_prompt_file(path, tok)
             print(f"  [Gen] Created {path}")
@@ -311,7 +311,7 @@ def phase_build_push(args):
         run_command(f"adb push {TEST_BACKEND_BIN_LOCAL} {TEST_BACKEND_BIN_REMOTE}", dry_run=args.dry_run)
         run_command(f"adb shell chmod +x {GENERATE_BIN_REMOTE} {TEST_BACKEND_BIN_REMOTE}", dry_run=args.dry_run)
         run_command(f"adb shell mkdir -p {EVAL_DIR}", dry_run=args.dry_run)
-        run_command(f"adb push eval/ {EVAL_DIR}/", check=False, dry_run=args.dry_run)
+        run_command(f"adb push experiments/prompts/ {EVAL_DIR}/", check=False, dry_run=args.dry_run)
 
         if 6 in phases:
             run_command(f"adb push {SIGNAL_INJECTOR_BIN_LOCAL} {SIGNAL_INJECTOR_BIN_REMOTE}", dry_run=args.dry_run)
@@ -950,7 +950,7 @@ def phase_quality(monitor, args, timestamp):
         "type": "stress_quality",
         "metadata": {
             "date": datetime.now().isoformat(),
-            "prompt_file": "eval/med_len.txt",
+            "prompt_file": "experiments/prompts/med_len.txt",
             "decode_tokens": 512,
             "temperature": 0,
         },

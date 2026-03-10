@@ -49,7 +49,7 @@ def main() -> int:
     parser.add_argument("--skip-deploy", action="store_true", help="Skip deploy step")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument("--list-devices", action="store_true", help="List registered devices")
-    parser.add_argument("--deploy-eval", action="store_true", help="Deploy eval/ files too")
+    parser.add_argument("--deploy-eval", action="store_true", help="Deploy experiments/prompts/ files too")
     parser.add_argument("--extra-bin", action="append", default=[], help="Additional binaries to build")
 
     # Parse known args, rest goes to the binary
@@ -101,7 +101,7 @@ def main() -> int:
             return 1
 
         if args.deploy_eval:
-            deploy_eval_files(conn, device, _PROJECT_ROOT / "eval", dry_run=args.dry_run)
+            deploy_eval_files(conn, device, _PROJECT_ROOT / "experiments" / "prompts", dry_run=args.dry_run)
 
         # Verify model if it's an inference binary
         if binary_name in ("generate", "generate_hybrid") and not args.dry_run:

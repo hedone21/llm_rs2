@@ -73,8 +73,8 @@ def push_artifacts(dry_run=False):
     run_command(f"adb shell mkdir -p {EVAL_DIR}", dry_run=dry_run)
     
     # Push all locally generated prompt files
-    run_command(f"adb push eval/prefill_*.txt {EVAL_DIR}/", dry_run=dry_run)
-    run_command(f"adb push eval/short_len.txt {EVAL_DIR}/", dry_run=dry_run)
+    run_command(f"adb push experiments/prompts/prefill_*.txt {EVAL_DIR}/", dry_run=dry_run)
+    run_command(f"adb push experiments/prompts/short_len.txt {EVAL_DIR}/", dry_run=dry_run)
 
 def run_suite(args):
     # Configurations
@@ -193,13 +193,12 @@ def main():
         _apply_device_config(args.device)
 
     # 1. Local Setup
-    if not os.path.exists("eval"): 
-        os.makedirs("eval")
-        
+    os.makedirs("experiments/prompts", exist_ok=True)
+
     # Generate prompt files locally
-    generate_prompt_file("eval/prefill_128.txt", 128)
-    generate_prompt_file("eval/prefill_512.txt", 512)
-    generate_prompt_file("eval/prefill_1024.txt", 1024)
+    generate_prompt_file("experiments/prompts/prefill_128.txt", 128)
+    generate_prompt_file("experiments/prompts/prefill_512.txt", 512)
+    generate_prompt_file("experiments/prompts/prefill_1024.txt", 1024)
 
     # 2. Build
     if not args.skip_build:

@@ -91,10 +91,10 @@ adb shell "chmod +x /data/local/tmp/generate && \
   -n 128 \
   --temperature 0"
 
-# Run with prompt file (useful for eval/ files)
+# Run with prompt file
 adb shell "/data/local/tmp/generate \
   --model-path /data/local/tmp/llm_rs2/models/llama3.2-1b \
-  --prompt-file /data/local/tmp/llm_rs2/eval/short_len.txt \
+  --prompt-file /data/local/tmp/llm_rs2/experiments/prompts/short_len.txt \
   -n 128"
 ```
 

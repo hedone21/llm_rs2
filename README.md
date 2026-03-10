@@ -15,7 +15,7 @@
 시스템 아키텍처, 데이터 레이아웃, 인터페이스 정의 및 메모리 모델에 대한 상세한 내용은 아래 문서를 참조하십시오.
 
 * **[ARCHITECTURE.md](ARCHITECTURE.md)** — 하이레벨/로레벨 컴포넌트 설계, Zero-copy 메커니즘, 양자화 포맷 및 Trait 정의
-* **[PROJECT_CONTEXT.md](PROJECT_CONTEXT.md)** — 개발 치트시트 (빌드, 배포, 테스트 명령어)
+* **[docs/PROJECT_CONTEXT.md](docs/PROJECT_CONTEXT.md)** — 개발 치트시트 (빌드, 배포, 테스트 명령어)
 
 ### docs/ 상세 문서
 

@@ -95,7 +95,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 ## Key Documentation
 
 - `ARCHITECTURE.md` — Detailed component design, trait interfaces, execution flow
-- `PROJECT_CONTEXT.md` — Implementation status and development cheat sheet
+- `docs/PROJECT_CONTEXT.md` — Implementation status and development cheat sheet
 - `docs/00_build_guide.md` — Step-by-step implementation guide (build order)
 - `docs/01_design_rationale.md` — Why decisions were made (Rust, OpenCL, Q4_0, etc.)
 - `docs/02_core_abstractions.md` — Tensor, Buffer, Shape, DType, KVCache details

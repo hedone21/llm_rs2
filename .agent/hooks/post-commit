@@ -27,7 +27,7 @@ if [ -f "$PROJECT_ROOT/$SCRIPT" ]; then
         if git diff --quiet -- docs/14_component_status.md results/data/component_gates.json 2>/dev/null; then
             : # No changes
         else
-            git add docs/14_component_status.md results/data/component_gates.json docs/test_history.json 2>/dev/null
+            git add docs/14_component_status.md results/data/component_gates.json results/data/test_history.json 2>/dev/null
             git commit --no-verify -m "chore(gates): auto-update quality gates" 2>/dev/null || true
         fi
     ) &

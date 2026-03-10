@@ -1,7 +1,7 @@
 # Technical Writer TODO
 
 > **역할**: 기술 문서 작성, API 가이드, 설계 문서 리뷰, 기술 조사
-> **소유 영역**: `docs/` (00~26), `README.md`, `PROJECT_CONTEXT.md`, `results/GUIDE.md`
+> **소유 영역**: `docs/` (00~30), `README.md`, `results/GUIDE.md`
 
 ---
 

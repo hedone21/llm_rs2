@@ -41,8 +41,6 @@ echo "=========================================="
 echo ""
 echo "[1/3] Running On-Device Profiling..."
 # Note: we use existing android_profile.py
-# Using a temp output dir initially or direct to benchmarks/data?
-# Best practice: direct to results/data as per GUIDE
 python3 scripts/android_profile.py --cmd "$CMD" --output-dir results/data
 
 # Find the generated file. android_profile.py generates a timestamped filename.

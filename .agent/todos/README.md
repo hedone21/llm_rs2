@@ -49,7 +49,7 @@ llm.rs 프로젝트의 팀 역할 정의 및 업무 추적 시스템.
 ### 5. 테크니컬 라이터 / 연구자 (Technical Writer / Researcher)
 
 - **책임**: 기술 문서 작성, API 가이드, 설계 문서 리뷰, 기술 조사, **소스코드 변경 시 문서 정합성 검증**
-- **소유 영역**: `docs/` (00~26), `docs/README.md`, `README.md`, `PROJECT_CONTEXT.md`, `results/GUIDE.md`
+- **소유 영역**: `docs/` (00~30), `docs/README.md`, `README.md`, `results/GUIDE.md`
 - **도구**: Markdown, 다이어그램 도구, 웹 리서치
 - **산출물**: 설계 문서, 사용자 가이드, API 레퍼런스, 기술 조사 보고서
 - **자율 결정**: 문서 구조, 용어 표준화, 기존 문서 업데이트

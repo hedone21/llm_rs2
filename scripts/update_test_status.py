@@ -18,7 +18,7 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 DOC_PATH = PROJECT_ROOT / "docs" / "14_component_status.md"
-HISTORY_PATH = PROJECT_ROOT / "docs" / "test_history.json"
+HISTORY_PATH = PROJECT_ROOT / "results" / "data" / "test_history.json"
 
 # Module path prefix → component metadata
 # tier: T1=Foundation, T2=Algorithm, T3=Backend, T4=Integration
@@ -525,7 +525,7 @@ def write_gate_json(gate_statuses, groups, results, overall_gate):
         "pass_rate": pass_rate,
     }
 
-    # Load history from docs/test_history.json
+    # Load history from results/data/test_history.json
     history = []
     if HISTORY_PATH.exists():
         try:
