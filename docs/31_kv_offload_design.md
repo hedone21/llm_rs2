@@ -29,8 +29,9 @@ KVCacheOps (trait, 기존)
 
 PrefetchPipeline (신규)
   - std::thread + mpsc 채널 (tokio 금지)
-  - 더블 버퍼 (2 레이어분 F16/F32 데이터)
-  - Layer N 연산 중 Layer N+1 비동기 로드
+  - 청크 단위 더블 버퍼 (chunk_size 레이어 × 2)
+  - Chunk N 연산 중 Chunk N+1 비동기 로드
+  - 적응형 chunk_size: 런타임 I/O 대비 연산 비율로 자동 조정
 ```
 
 ### 2.1 Module Structure
@@ -91,19 +92,54 @@ enum CacheState {
 }
 
 // ── pipeline.rs ──
+
+/// 청크 구성: 성능/메모리 트레이드오프 제어
+pub struct ChunkConfig {
+    /// 한 번에 프리페치할 레이어 수 (1, 2, 4, 8)
+    pub chunk_size: usize,
+    /// 파이프라인 버퍼에 할당 가능한 최대 메모리 (바이트)
+    /// chunk_size는 이 예산 내에서 자동 결정됨
+    pub max_buffer_bytes: Option<usize>,
+    /// 적응형 조정 활성화
+    pub adaptive: bool,
+}
+
 pub struct PrefetchPipeline {
     num_layers: usize,
-    /// 더블 버퍼 (각각 1 레이어분 K + V)
-    buf_a_k: Vec<u8>,
-    buf_a_v: Vec<u8>,
-    buf_b_k: Vec<u8>,
-    buf_b_v: Vec<u8>,
+    chunk_config: ChunkConfig,
+    /// 더블 버퍼: 각각 chunk_size 레이어분의 K + V 데이터
+    /// buf_a[layer_offset..layer_offset+layer_bytes] 로 레이어별 접근
+    buf_a: AlignedBuffer,   // chunk_size × layer_kv_bytes
+    buf_b: AlignedBuffer,   // chunk_size × layer_kv_bytes
+    layer_kv_bytes: usize,  // 레이어당 K+V 바이트 수
     /// 현재 어떤 버퍼가 활성인지
     active_buf: BufferSlot, // A or B
     /// I/O 스레드 통신 (std::sync::mpsc)
     request_tx: Sender<PipelineCmd>,
     result_rx: Receiver<PipelineResult>,
     io_thread: Option<JoinHandle<()>>,
+    /// 적응형 조정을 위한 런타임 통계
+    stats: PipelineStats,
+}
+
+/// 런타임 성능 측정 (적응형 chunk_size 조정용)
+struct PipelineStats {
+    /// I/O 시간 EMA (지수이동평균), ms 단위
+    io_ema_ms: f32,
+    /// Compute 시간 EMA, ms 단위
+    compute_ema_ms: f32,
+    /// 연속 스톨 횟수 (I/O가 compute보다 오래 걸린 경우)
+    consecutive_stalls: usize,
+    /// 총 처리된 청크 수
+    chunks_processed: usize,
+}
+
+enum PipelineCmd {
+    /// 청크 로드: layers[start..end]를 지정 버퍼에 로드
+    LoadChunk { start_layer: usize, end_layer: usize, buf: BufferSlot },
+    /// 청크 저장: 지정 버퍼의 데이터를 저장소에 기록
+    StoreChunk { start_layer: usize, end_layer: usize, buf: BufferSlot },
+    Shutdown,
 }
 ```
 
@@ -126,6 +162,183 @@ pub struct PrefetchPipeline {
 [Restore] (선택사항)
   OffloadStore.load() → KVCache (인메모리 복귀)
 ```
+
+### 2.4 Chunked Prefetch Strategy
+
+레이어 하나씩 프리페치하면 I/O 비용이 연산보다 클 때 파이프라인이 스톨된다.
+**여러 레이어를 하나의 청크로 묶어서** 프리페치하면 이 문제를 완화할 수 있다.
+
+#### 2.4.1 기본 개념
+
+```
+단일 레이어 프리페치 (chunk_size=1, 기존):
+  Load(L0) → [Compute(L0) | Load(L1)] → [Compute(L1) | Load(L2)] → ...
+  매 스텝 병목: max(io_1layer, compute_1layer)
+
+청크 프리페치 (chunk_size=4):
+  Load(L0-3) → [Compute(L0-3) | Load(L4-7)] → [Compute(L4-7) | Load(L8-11)] → ...
+  매 스텝 병목: max(io_4layers, compute_4layers)
+```
+
+#### 2.4.2 청크가 효과적인 이유
+
+**1. 고정 오버헤드 분산 (amortization)**
+
+각 프리페치 작업에는 데이터 크기와 무관한 고정 비용이 있다:
+- 스레드 wake-up: ~0.1-0.5ms
+- mpsc 채널 send/recv: ~0.01ms
+- 파일 seek (DiskStore): ~0.1-0.5ms
+- LZ4 함수 호출 (ZramStore): ~0.01ms
+
+```
+chunk_size=1: 16 sync points × ~0.5ms = ~8ms 고정 오버헤드/token
+chunk_size=4:  4 sync points × ~0.5ms = ~2ms 고정 오버헤드/token
+절감: ~6ms/token
+```
+
+**2. 순차 I/O 효율 향상 (DiskStore)**
+
+Android UFS는 대용량 순차 읽기에서 처리량이 향상된다:
+```
+ 8 MB read: ~1.5 GB/s (syscall + 스토리지 컨트롤러 오버헤드)
+16 MB read: ~1.6 GB/s
+32 MB read: ~1.7 GB/s (오버헤드 분산, 더 큰 DMA 전송)
+```
+
+**3. 레이턴시 분산 평균화**
+
+개별 레이어의 I/O 지터나 연산 시간 편차가 청크 내에서 평균화된다.
+한 레이어에서 I/O 스파이크가 발생해도 같은 청크의 다른 레이어가 이를 보상.
+
+**4. ZramStore 압축 효율**
+
+더 큰 블록에서 LZ4가 더 긴 패턴을 찾을 수 있고,
+바이트 재배치(shuffle)도 NEON 벡터 연산으로 더 효율적으로 처리된다.
+
+#### 2.4.3 메모리-성능 트레이드오프
+
+더블 버퍼 메모리 = `2 × chunk_size × layer_kv_bytes`
+
+| chunk_size | 버퍼 메모리 (F16) | 버퍼 메모리 (F32) | 메모리 절약 (vs 전체 인메모리) | Sync 횟수 |
+|------------|------------------|------------------|------------------------------|-----------|
+| 1 | 8 MB | 16 MB | 87.5% | 16 |
+| 2 | 16 MB | 32 MB | 75.0% | 8 |
+| 4 | 32 MB | 64 MB | 50.0% | 4 |
+| 8 | 64 MB | 128 MB | 0% (의미 없음) | 2 |
+
+> **상한선**: `chunk_size ≤ num_layers / 2` (그 이상이면 오프로드 의미 없음)
+
+#### 2.4.4 적응형 Chunk Sizing
+
+런타임에 chunk_size를 자동 조정한다:
+
+```rust
+impl PrefetchPipeline {
+    /// 매 청크 처리 후 호출: I/O vs Compute 시간 비교
+    fn adapt_chunk_size(&mut self) {
+        let ratio = self.stats.io_ema_ms / self.stats.compute_ema_ms;
+
+        let desired = if ratio <= 1.0 {
+            1  // I/O ≤ Compute: 최소 chunk으로 메모리 최적화
+        } else if ratio <= 1.5 {
+            2  // 약간 I/O bound: chunk 2로 고정 오버헤드 절감
+        } else if ratio <= 2.5 {
+            4  // 확실히 I/O bound: chunk 4
+        } else {
+            8  // 심각한 I/O 병목: 최대 chunk
+        };
+
+        // 메모리 예산 확인
+        let max_by_budget = self.chunk_config.max_buffer_bytes
+            .map(|b| b / (2 * self.layer_kv_bytes))
+            .unwrap_or(usize::MAX);
+
+        // 레이어 수 상한
+        let max_by_layers = self.num_layers / 2;
+
+        self.chunk_config.chunk_size = desired
+            .min(max_by_budget)
+            .min(max_by_layers)
+            .max(1);
+    }
+}
+```
+
+**안정성 규칙**:
+- chunk_size 변경은 토큰 경계에서만 (forward pass 도중 변경 금지)
+- 증가는 즉시, 감소는 연속 3회 안정 후 적용 (oscillation 방지)
+- EMA smoothing factor: α=0.3 (최근 값에 가중)
+
+#### 2.4.5 Forward Loop (청크 기반)
+
+```rust
+pub fn forward_into_offload(
+    &self,
+    args: LlamaModelForwardArgs<OffloadKVCache>,
+    pipeline: &mut PrefetchPipeline,
+) -> Result<()> {
+    // ... embedding lookup ...
+
+    let C = pipeline.chunk_size();
+    let num_chunks = (self.layers.len() + C - 1) / C;
+
+    // Load first chunk
+    pipeline.load_chunk(0)?;
+
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * C;
+        let end = (start + C).min(self.layers.len());
+
+        // Wait for current chunk data
+        pipeline.wait_chunk_ready(chunk_idx)?;
+        let compute_start = Instant::now();
+
+        // Start loading next chunk (overlaps with compute)
+        if chunk_idx + 1 < num_chunks {
+            pipeline.load_chunk(chunk_idx + 1)?;
+        }
+
+        // Compute all layers in this chunk
+        for i in start..end {
+            let buf_view = pipeline.layer_view(i);  // 버퍼 내 레이어 슬라이스
+            layer_forward_with_buffer(
+                &self.layers[i], &mut x, buf_view,
+                &mut kv_caches[i], backend, memory, ...
+            )?;
+        }
+
+        let compute_ms = compute_start.elapsed().as_secs_f32() * 1000.0;
+        pipeline.record_compute(compute_ms);
+
+        // Async write-back (append new tokens for this chunk)
+        pipeline.store_chunk(chunk_idx)?;
+    }
+
+    // Adaptive adjustment for next token
+    if pipeline.is_adaptive() {
+        pipeline.adapt_chunk_size();
+    }
+
+    // ... final norm + head ...
+}
+```
+
+#### 2.4.6 버퍼 레이아웃 (청크 내 레이어 배치)
+
+```
+AlignedBuffer (chunk_size=4 예시):
+┌──────────────────────────────────────────────────────────┐
+│ Layer 0 K data │ Layer 0 V data │ Layer 1 K │ Layer 1 V │...
+│ [token_bytes]  │ [token_bytes]  │           │           │
+└──────────────────────────────────────────────────────────┘
+  ↑ offset = 0    ↑ offset = tb    ↑ 2*tb      ↑ 3*tb
+
+layer_view(i) → &buf[i*2*token_bytes .. (i+1)*2*token_bytes]
+  여기서 token_bytes = current_pos × kv_heads × head_dim × dtype.size()
+```
+
+DiskStore: 파일 내 레이아웃과 동일한 순서 → 순차 읽기 최적화.
+ZramStore: 청크 전체를 하나의 LZ4 블록으로 압축 가능 (더 높은 압축률).
 
 ## 3. Risk Analysis
 
@@ -308,10 +521,14 @@ LZ4 압축 속도: Snapdragon ~350-500 MB/s. 4MB 레이어 압축: ~8-11ms.
 **영향**: 파이프라인 효과 감소, 실질 오버헤드 증가
 
 **대응**:
-- **적응형 프리페치 깊이**: 기본 1-레이어 ahead.
-  스톨 감지 시 2-레이어 ahead로 확장 (트리플 버퍼 활성화)
-- **스톨 카운터**: 연속 스톨 N회 이상이면 오프로드 비활성화 고려
-- **통계 기반 조정**: 런타임 중 I/O 시간과 연산 시간 EMA 추적
+- **청크 프리페치 (Section 2.4)**: 여러 레이어를 묶어서 프리페치.
+  chunk_size=4면 4개 레이어의 연산 시간 동안 다음 4개를 로드.
+  개별 I/O 지터가 청크 내에서 평균화됨
+- **적응형 chunk_size**: 런타임 I/O/Compute EMA 비율 기반 자동 조정.
+  스톨 비율이 높으면 chunk_size 증가, 낮으면 감소 (메모리 반환)
+- **스톨 카운터**: 최대 chunk_size에서도 연속 스톨 N회 이상이면
+  오프로드 비활성화 + 인메모리 복귀 고려
+- **통계 기반 조정**: `PipelineStats`의 io_ema_ms/compute_ema_ms 추적
 
 #### R-C3: Score Accumulator 비호환 (Severity: MEDIUM)
 
@@ -358,10 +575,12 @@ DiskStore: 읽기 ~5.3ms > 레이어 연산 ~3ms → **I/O가 병목**.
 ZramStore: 해제 ~1.3ms, 전처리 역변환 ~1ms → 총 ~2.3ms, 여유 있음.
 
 **대응**:
-- **F32 DiskStore**: 파이프라인 깊이를 2-ahead로 설정 (트리플 버퍼)
-  또는 I/O가 병목임을 수용하고 처리량 저하 문서화
-- **F32 ZramStore**: 문제 없음 (해제 시간 < 연산 시간)
-- **사용자 가이드**: F16 사용 권장, F32는 ZramStore에 더 적합하다고 안내
+- **F32 DiskStore + 청크 프리페치**: chunk_size=4로 고정 오버헤드 절감.
+  순차 I/O 효율 향상 (32MB @ ~1.7 GB/s)으로 레이어당 실효 I/O 시간 감소.
+  그래도 I/O bound이므로 ~40-50% 오버헤드는 불가피 (Section 5.6 참조)
+- **F32 ZramStore**: 문제 없음 (해제 시간 < 연산 시간). F32에서는 ZramStore 권장
+- **적응형**: F32 DiskStore 시 adaptive chunk_size가 자동으로 4로 증가
+- **사용자 가이드**: F16 사용 권장, F32 DiskStore는 성능 저하 문서화
 
 ### 3.4 Risk Summary Matrix
 
@@ -378,11 +597,12 @@ ZramStore: 해제 ~1.3ms, 전처리 역변환 ~1ms → 총 ~2.3ms, 여유 있음
 | R-Z4 | LZ4 edge case | LOW | LOW | 입력 가드 + 크기 관리 |
 | R-Z5 | 레이어별 압축률 편차 | LOW | MEDIUM | 적응형 압축 정책 |
 | R-C1 | **파이프라인 데드락** | **HIGH** | MEDIUM | 단방향 흐름 + timeout + 상태 머신 |
-| R-C2 | 레이턴시 편차 | MEDIUM | HIGH | 적응형 프리페치 깊이 |
+| R-C2 | 레이턴시 편차 | MEDIUM | HIGH | **청크 프리페치 + 적응형 chunk_size** |
 | R-C3 | Score accumulator 비호환 | MEDIUM | LOW | 메타데이터 분리 유지 |
 | R-C4 | **Eviction 비호환** | **HIGH** | CERTAIN | Phase 1 미지원 + Phase 2 제네릭화 |
 | R-C5 | 마이그레이션 실패 | MEDIUM | LOW | 트랜잭션 패턴 (전체 성공/롤백) |
-| R-C6 | F32 I/O 병목 | MEDIUM | HIGH | 트리플 버퍼 / ZramStore 권장 |
+| R-C6 | F32 I/O 병목 | MEDIUM | HIGH | **청크 프리페치 C=4 (−32%p)** / ZramStore 권장 |
+| R-C7 | 청크 크기 oscillation | LOW | MEDIUM | 감소는 3회 안정 후 적용 + EMA 평활화 |
 
 ## 4. Implementation Plan
 
@@ -392,10 +612,11 @@ ZramStore: 해제 ~1.3ms, 전처리 역변환 ~1ms → 총 ~2.3ms, 여유 있음
 |------|------|------|------------|
 | 1-1 | `OffloadStore` trait 정의 | `core/offload/store.rs` | — |
 | 1-2 | `OffloadKVCache` + `KVCacheOps` impl | `core/offload/mod.rs` | R-C3 (current_pos 메타) |
-| 1-3 | `PrefetchPipeline` (더블 버퍼 + I/O 스레드) | `core/offload/pipeline.rs` | R-C1 (상태 머신 + timeout) |
-| 1-4 | Migration: KVCache → OffloadKVCache 변환 | `core/offload/mod.rs` | R-C5 (트랜잭션 패턴) |
-| 1-5 | `forward_into_offload()` 메서드 | `models/llama/llama_model.rs` | R-C2 (적응형 프리페치) |
-| 1-6 | 유닛 테스트: 파이프라인 동기화, 데드락 방지 | 각 모듈 `#[cfg(test)]` | R-C1 (스트레스 테스트) |
+| 1-3 | `ChunkConfig` + `PrefetchPipeline` (청크 더블 버퍼 + I/O 스레드) | `core/offload/pipeline.rs` | R-C1 (상태 머신 + timeout) |
+| 1-4 | `PipelineStats` + 적응형 chunk_size 조정 로직 | `core/offload/pipeline.rs` | R-C2, R-C7 (EMA + 안정성 규칙) |
+| 1-5 | Migration: KVCache → OffloadKVCache 변환 | `core/offload/mod.rs` | R-C5 (트랜잭션 패턴) |
+| 1-6 | `forward_into_offload()` (청크 기반 루프) | `models/llama/llama_model.rs` | R-C2 (적응형 청크) |
+| 1-7 | 유닛 테스트: 파이프라인 동기화, 데드락 방지, 청크 경계 | 각 모듈 `#[cfg(test)]` | R-C1 (스트레스 테스트) |
 
 ### Phase 2A: DiskStore (디스크 오프로드)
 
@@ -440,7 +661,9 @@ ZramStore: 해제 ~1.3ms, 전처리 역변환 ~1ms → 총 ~2.3ms, 여유 있음
 | `test_store_roundtrip_{disk,zram}` | store→load 데이터 일치 | 기본 정확성 |
 | `test_preprocess_roundtrip` | shuffle→unshuffle bit-exact | R-Z1 |
 | `test_compression_ratio` | ZramStore 압축률 ≥ 1.5x (abort gate) | **R-Z1** |
-| `test_pipeline_no_deadlock` | 100회 반복 + 인위적 지연 | **R-C1** |
+| `test_pipeline_no_deadlock` | 100회 반복 + 인위적 지연 (C=1,2,4) | **R-C1** |
+| `test_pipeline_chunk_boundary` | 16 layers를 C=3,5,7로 불균등 분할 시 정확성 | R-C2 |
+| `test_pipeline_adaptive_sizing` | I/O 느릴 때 C 증가, 빨라지면 C 감소 확인 | R-C2, R-C7 |
 | `test_pipeline_timeout_fallback` | I/O 지연 시 동기 fallback | R-D1, R-C2 |
 | `test_migration_rollback` | 마이그레이션 실패 시 원본 유지 | R-C5 |
 | `test_migration_partial` | 부분 마이그레이션 후 혼합 모드 | R-C5 |
@@ -458,32 +681,65 @@ ZramStore: 해제 ~1.3ms, 전처리 역변환 ~1ms → 총 ~2.3ms, 여유 있음
 레이어당 KV 크기: 2048 × 8 × 64 × 2B × 2(K+V) = 4 MB
 Android UFS 3.1 sequential read: ~1.5 GB/s
 Android UFS 3.1 sequential write: ~0.8 GB/s
+고정 오버헤드: ~0.5ms/sync
 
   Read:  4 MB / 1.5 GB/s = 2.7 ms
   Write: 2 KB / 0.8 GB/s ≈ 0 ms (append 1 token)
   Compute per layer: ~3 ms (decode, single token)
 
-Pipeline:
+chunk_size=1 (I/O < Compute → 최적):
   L0 load (2.7ms) → [L0 compute (3ms) | L1 load (2.7ms)] → ...
+  Total: 2.7 + 15 × (3.0 + 0.5) = 2.7 + 52.5 = 55.2 ms/token
+  Baseline: 48 ms/token
+  Overhead: ~15%
+  → C=1이 이미 최적 (I/O가 compute보다 짧으므로 chunk 불필요)
 
-  Total: 2.7 + 16 × 3.0 = 50.7 ms/token
-  Baseline (in-memory): 48 ms/token
+chunk_size=2 (고정 오버헤드 절감):
+  청크 I/O: 8 MB / 1.5 GB/s = 5.3 ms
+  청크 연산: 2 × 3 ms = 6 ms (여전히 compute bound)
+  Total: 5.3 + 7 × (6.0 + 0.5) = 5.3 + 45.5 = 50.8 ms/token
   Overhead: ~6% ✓
+  → sync 횟수 절반으로 고정 오버헤드 절감 효과
 ```
 
-### 5.2 DiskStore Pipeline (F32, seq=2048)
+### 5.2 DiskStore Pipeline (F32, seq=2048, chunk_size=1)
 
 ```
 레이어당 KV 크기: 8 MB
   Read:  8 MB / 1.5 GB/s = 5.3 ms  ← 연산(3ms)보다 느림!
+  고정 오버헤드: ~0.5ms/sync (스레드 wake + 채널)
 
-Pipeline (I/O bound):
-  Total: 5.3 + 16 × 5.3 = 90.1 ms/token
-  Overhead: ~88% ✗
+Pipeline (I/O bound, C=1):
+  Total: 5.3 + 15 × (5.3 + 0.5) = 5.3 + 87.0 = 92.3 ms/token
+  Overhead: ~92% ✗
+```
 
-Triple buffer (2-ahead prefetch):
-  Total: ~5.3 + 16 × max(5.3, 3+2.7) = ~90 ms (여전히 I/O bound)
-  → F32 DiskStore는 성능 저하 불가피. ZramStore 권장.
+### 5.2.1 DiskStore Pipeline (F32, 청크 프리페치 적용)
+
+```
+chunk_size=4:
+  청크 I/O: 32 MB / 1.7 GB/s = 18.8 ms (대용량 순차 읽기로 처리량 향상)
+  청크 연산: 4 × 3 ms = 12 ms
+  고정 오버헤드: ~0.5ms × 4 sync = 2.0 ms
+
+  Total: 18.8 + 3 × (18.8 + 0.5) = 18.8 + 57.9 = 76.7 ms/token
+  Overhead: ~60% (C=1의 92%에서 32%p 개선)
+  버퍼 메모리: 2 × 4 × 8 MB = 64 MB
+
+chunk_size=2:
+  청크 I/O: 16 MB / 1.6 GB/s = 10.0 ms
+  청크 연산: 2 × 3 ms = 6 ms
+
+  Total: 10.0 + 7 × (10.0 + 0.5) = 10.0 + 73.5 = 83.5 ms/token
+  Overhead: ~74%
+  버퍼 메모리: 2 × 2 × 8 MB = 32 MB
+
+비교 (F32 DiskStore):
+  C=1: ~92%, 버퍼 16 MB
+  C=2: ~74%, 버퍼 32 MB  (−18%p)
+  C=4: ~60%, 버퍼 64 MB  (−32%p)
+  → F32 DiskStore는 C=4에서도 상당한 오버헤드.
+  → F32에서는 ZramStore가 적합 (Section 5.4: 오버헤드 ~5.4%)
 ```
 
 ### 5.3 ZramStore Pipeline (F16, seq=2048)
@@ -514,15 +770,22 @@ Pipeline:
   Overhead: ~5.4% ✓  ← DiskStore F32 (88%)보다 훨씬 양호
 ```
 
-### 5.5 Summary
+### 5.5 Summary (chunk_size별 비교)
 
-| 구성 | 오버헤드 | 메모리 절약 | 판정 |
-|------|---------|-----------|------|
-| DiskStore F16 | ~6% | 56 MB | ✓ 실용적 |
-| DiskStore F32 | ~88% | 112 MB | ✗ 느림 |
-| ZramStore F16 | ~2.5% | ~30 MB | ✓ 최적 |
-| ZramStore F32 | ~5.4% | ~50 MB | ✓ 양호 |
-| (참고) KIVI Q2 | ~0% | 61.8 MB | ✓ 최적 (단, 손실) |
+| 구성 | C | 오버헤드 | 버퍼 메모리 | 메모리 절약 | 판정 |
+|------|---|---------|-----------|-----------|------|
+| DiskStore F16 | 1 | ~15% | 8 MB | 56 MB | ✓ 양호 |
+| DiskStore F16 | 2 | ~6% | 16 MB | 48 MB | ✓ 최적 (추천) |
+| DiskStore F32 | 1 | ~92% | 16 MB | 112 MB | ✗ 느림 |
+| DiskStore F32 | 4 | ~60% | 64 MB | 64 MB | △ 개선되나 여전히 느림 |
+| ZramStore F16 | 1 | ~2.5% | 8 MB | ~30 MB | ✓ 최적 |
+| ZramStore F32 | 1 | ~5.4% | 16 MB | ~50 MB | ✓ 양호 |
+| (참고) KIVI Q2 | — | ~0% | — | 61.8 MB | ✓ 최적 (단, 손실) |
+
+**핵심 인사이트**:
+- **I/O ≤ Compute (F16 Disk, ZramStore 전체)**: C=1~2가 최적. 메모리 절약 극대화.
+- **I/O > Compute (F32 DiskStore)**: C=4로 32%p 개선되나 근본적 한계 존재. → **ZramStore 권장**.
+- 적응형 chunk_size는 이 결정을 런타임에 자동으로 수행.
 
 ## 6. Decision Log
 
@@ -535,3 +798,6 @@ Pipeline:
 | 바이트 재배치 필수 (ZramStore) | raw float LZ4 압축률 ~1.0x, 전처리 없이 무의미 |
 | 잔여 버퍼 패턴 (ZramStore) | 매 토큰 재압축 방지, KiviCache 패턴 검증됨 |
 | std::thread + mpsc | tokio 금지 제약, 파이프라인에 충분한 동기화 |
+| 청크 프리페치 (적응형) | I/O > Compute 시 고정 오버헤드 분산 + 순차 I/O 효율. F32 DiskStore에서 92%→60% 개선 |
+| chunk_size 상한 = num_layers/2 | 그 이상이면 버퍼가 전체 인메모리와 동일 → 오프로드 의미 없음 |
+| 적응형 감소는 3회 안정 후 | chunk_size oscillation 방지, EMA α=0.3으로 평활화 |
