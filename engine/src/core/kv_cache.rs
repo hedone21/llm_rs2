@@ -1,8 +1,50 @@
+use crate::core::buffer::DType;
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
+
+// ── KVCacheOps trait (OCP extension point) ──────────────────────────────────
+
+/// Trait abstracting KV cache operations for LlamaLayer/LlamaModel.
+///
+/// Implementors: `KVCache` (standard F32/F16/Q4_0 with eviction support),
+/// `KiviCache` (KIVI Q2 + residual buffer, no eviction).
+///
+/// Generic monomorphization (`<C: KVCacheOps>`) is used instead of `dyn Trait`
+/// to preserve contiguous slice access (`&mut [C]`) and zero runtime overhead.
+pub trait KVCacheOps: Send {
+    /// Number of valid tokens currently in the cache.
+    fn current_pos(&self) -> usize;
+
+    /// Physical buffer capacity in tokens.
+    fn capacity(&self) -> usize;
+
+    /// Number of KV heads.
+    fn kv_heads(&self) -> usize;
+
+    /// Dimension per head.
+    fn head_dim(&self) -> usize;
+
+    /// Memory layout.
+    fn layout(&self) -> KVLayout;
+
+    /// The DType that the caller should pass to `update()`.
+    /// For KIVI, returns F32 (caller sends F32; KIVI quantizes internally).
+    fn kv_dtype(&self) -> DType;
+
+    /// Memory usage in bytes for currently stored KV data.
+    fn memory_usage_bytes(&self) -> usize;
+
+    /// Append new K/V data. Input shape: `[batch, seq_len, kv_heads, head_dim]`.
+    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()>;
+
+    /// Get K/V tensors for attention computation.
+    /// Returns `(k_tensor, v_tensor)` covering `[0..current_pos]`.
+    /// `&mut self` allows internal buffer assembly (e.g. KIVI dequantization).
+    fn get_view(&mut self) -> (Tensor, Tensor);
+}
 
 /// KV cache memory layout.
 ///
@@ -577,6 +619,46 @@ impl KVCache {
         }
 
         Ok(())
+    }
+}
+
+// ── KVCacheOps implementation for KVCache ───────────────────────────────────
+
+impl KVCacheOps for KVCache {
+    fn current_pos(&self) -> usize {
+        self.current_pos
+    }
+
+    fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn kv_heads(&self) -> usize {
+        self.kv_heads
+    }
+
+    fn head_dim(&self) -> usize {
+        self.head_dim
+    }
+
+    fn layout(&self) -> KVLayout {
+        self.layout
+    }
+
+    fn kv_dtype(&self) -> DType {
+        self.k_buffer.dtype()
+    }
+
+    fn memory_usage_bytes(&self) -> usize {
+        self.memory_usage_bytes()
+    }
+
+    fn update(&mut self, new_k: &Tensor, new_v: &Tensor) -> Result<()> {
+        self.update(new_k, new_v)
+    }
+
+    fn get_view(&mut self) -> (Tensor, Tensor) {
+        (self.k_buffer.clone(), self.v_buffer.clone())
     }
 }
 

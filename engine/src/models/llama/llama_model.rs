@@ -10,7 +10,7 @@ use std::sync::Arc;
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
-use crate::core::kv_cache::KVCache;
+use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
@@ -39,10 +39,10 @@ pub struct LlamaModel {
     pub lm_head: Tensor,
 }
 
-pub struct LlamaModelForwardArgs<'a> {
+pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub input_tokens: &'a Tensor,
     pub start_pos: usize,
-    pub kv_caches: &'a mut [KVCache],
+    pub kv_caches: &'a mut [C],
     pub backend: &'a Arc<dyn Backend>,
     pub memory: &'a dyn Memory,
     pub logits_out: &'a mut Tensor,
@@ -357,7 +357,7 @@ impl LlamaModel {
     ///
     /// Eviction is the caller's responsibility (via `CacheManager`).
     /// Score accumulation is handled internally since it requires per-layer iteration.
-    pub fn forward_into(&self, args: LlamaModelForwardArgs) -> Result<()> {
+    pub fn forward_into<C: KVCacheOps>(&self, args: LlamaModelForwardArgs<C>) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
         let kv_caches = args.kv_caches;
@@ -422,7 +422,7 @@ impl LlamaModel {
             if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
                 && acc.should_track_layer(i)
             {
-                let cache_seq_len = kv_caches[i].current_pos;
+                let cache_seq_len = kv_caches[i].current_pos();
                 let n_heads_q = self.config.num_attention_heads;
                 let stride = ws.scores.len() / n_heads_q;
                 if acc.n_kv_heads() > 0 {

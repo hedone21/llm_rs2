@@ -9,6 +9,7 @@ use llm_rs2::core::eviction::h2o::H2OPolicy;
 use llm_rs2::core::eviction::h2o_plus::H2OPlusPolicy;
 use llm_rs2::core::eviction::no_eviction::NoEvictionPolicy;
 use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
+use llm_rs2::core::kivi_cache::KiviCache;
 use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
@@ -208,6 +209,17 @@ struct Args {
     /// Matches H2O paper evaluation methodology.
     #[arg(long, default_value_t = 0.0)]
     kv_budget_ratio: f32,
+
+    /// Enable KIVI-style Q2 KV cache compression (ICML 2024).
+    /// Mutually exclusive with eviction policies; uses FP32 residual buffer
+    /// that batch-quantizes to 2-bit when full.
+    #[arg(long, default_value_t = false)]
+    kivi: bool,
+
+    /// KIVI residual buffer size in tokens (must be multiple of 32).
+    /// Default: 32. Larger values improve quality but use more memory.
+    #[arg(long, default_value_t = 32)]
+    kivi_residual_size: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -288,6 +300,25 @@ fn main() -> anyhow::Result<()> {
         "Model config: layers={}, kv_heads={}, head_dim={}, max_seq_len={}",
         num_layers, kv_heads, head_dim, max_seq_len
     );
+
+    // ── KIVI mode: separate path with KiviCache ──
+    if args.kivi {
+        return run_kivi(
+            &model,
+            &tokenizer,
+            &backend,
+            &memory,
+            &input_ids,
+            &sampling_config,
+            kv_heads,
+            head_dim,
+            num_layers,
+            max_seq_len,
+            args.kivi_residual_size,
+            args.num_tokens,
+            args.gpu_attn,
+        );
+    }
 
     let kv_type = match args.kv_type.as_str() {
         "f32" => DType::F32,
@@ -1303,7 +1334,10 @@ fn run_eval_ll(
         if ratio_mode {
             eprintln!(
                 "[Eval-LL] {}: prompt_len={}, budget={} (ratio={:.0}%)",
-                question.id, prompt_len, effective_budget, args.kv_budget_ratio * 100.0
+                question.id,
+                prompt_len,
+                effective_budget,
+                args.kv_budget_ratio * 100.0
             );
         }
 
@@ -1603,5 +1637,257 @@ fn run_eval_ll(
     });
 
     println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+// ── KIVI mode: KiviCache-based inference ────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn run_kivi(
+    model: &LlamaModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &Arc<dyn Memory>,
+    input_ids: &[u32],
+    sampling_config: &SamplingConfig,
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    max_seq_len: usize,
+    residual_size: usize,
+    num_tokens: usize,
+    gpu_attn: bool,
+) -> anyhow::Result<()> {
+    use llm_rs2::core::kv_cache::KVCacheOps;
+
+    println!(
+        "[KIVI] Q2 KV cache enabled — residual_size={}, max_seq_len={}",
+        residual_size, max_seq_len
+    );
+
+    // Create KiviCache per layer
+    let mut kv_caches: Vec<KiviCache> = (0..num_layers)
+        .map(|_| KiviCache::new(kv_heads, head_dim, max_seq_len, residual_size))
+        .collect();
+
+    let vocab_size = model.config.vocab_size;
+    let hidden_size = model.config.hidden_size;
+    let q_dim = model.config.num_attention_heads * head_dim;
+    let k_dim = kv_heads * head_dim;
+    let v_dim = kv_heads * head_dim;
+    let ffn_hidden = model.config.intermediate_size;
+
+    // Allocate workspace
+    let mut gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let x_gen_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let mut x_gen = Tensor::new(
+        Shape::new(vec![1, 1, hidden_size]),
+        x_gen_buf,
+        backend.clone(),
+    );
+
+    let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut logits = Tensor::new(
+        Shape::new(vec![1, 1, vocab_size]),
+        logits_buf,
+        backend.clone(),
+    );
+
+    // === PREFILL ===
+    let mut tokens: Vec<u32> = input_ids.to_vec();
+    let process_len = tokens.len();
+    if process_len > max_seq_len {
+        anyhow::bail!(
+            "Prompt length {} exceeds max_seq_len {}",
+            process_len,
+            max_seq_len
+        );
+    }
+    let mut start_pos = 0usize;
+
+    let prefill_start = std::time::Instant::now();
+    {
+        let cpu_indices_buf = Galloc::new().alloc(process_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = cpu_indices_buf.as_mut_ptr() as *mut u32;
+            std::ptr::copy_nonoverlapping(tokens.as_ptr(), ptr, process_len);
+        }
+        let cpu_input = Tensor::new(
+            Shape::new(vec![1, process_len]),
+            cpu_indices_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let input_tensor = backend.copy_from(&cpu_input)?;
+
+        let prefill_logits_buf = memory.alloc(process_len * vocab_size * 4, DType::F32)?;
+        let mut prefill_logits = Tensor::new(
+            Shape::new(vec![1, process_len, vocab_size]),
+            prefill_logits_buf,
+            backend.clone(),
+        );
+
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: gpu_attn,
+            score_accumulator: None,
+        })?;
+
+        // Sample last token from prefill logits
+        let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
+        unsafe {
+            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
+            backend.read_buffer(&prefill_logits, slice)?;
+        }
+        let last_start = (process_len - 1) * vocab_size;
+        let next_token = sampling::sample(
+            &mut logits_cpu[last_start..last_start + vocab_size],
+            &tokens,
+            vocab_size,
+            sampling_config,
+        );
+        tokens.push(next_token);
+        start_pos = process_len;
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    let kivi_mem = kv_caches
+        .iter()
+        .map(|c| c.memory_usage_bytes())
+        .sum::<usize>();
+    println!(
+        "[KIVI] Prefill: {}ms, cache_pos={}, Q2_tokens={}, res_pos={}, mem={}KB",
+        prefill_ms as u32,
+        kv_caches[0].current_pos(),
+        kv_caches[0].q2_tokens,
+        kv_caches[0].res_pos,
+        kivi_mem / 1024,
+    );
+
+    // Print prompt
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let initial_text = tokenizer.decode(&tokens, true).unwrap_or_default();
+    print!("{}", initial_text);
+    stdout.flush().ok();
+
+    // === DECODE ===
+    let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_indices_buf,
+        Arc::new(CpuBackend::new()),
+    );
+
+    let eos_id = tokenizer
+        .get_vocab(true)
+        .get("</s>")
+        .copied()
+        .unwrap_or(u32::MAX);
+
+    let decode_start = std::time::Instant::now();
+    let mut generated_count = 0usize;
+
+    for _ in 0..(num_tokens - 1) {
+        if kv_caches[0].current_pos() >= max_seq_len {
+            println!("\n[Stopped: Max context length reached]");
+            break;
+        }
+
+        let last_token = tokens[tokens.len() - 1];
+        unsafe {
+            *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
+        }
+        let gen_input = backend.copy_from(&cpu_gen_input)?;
+
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &gen_input,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut logits,
+            x_gen: Some(&mut x_gen),
+            workspace: Some(&mut gen_ws),
+            use_gpu_attn: gpu_attn,
+            score_accumulator: None,
+        })?;
+
+        start_pos += 1;
+        generated_count += 1;
+
+        // Sample
+        let mut logits_cpu = vec![0.0f32; vocab_size];
+        unsafe {
+            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
+            backend.read_buffer(&logits, slice)?;
+        }
+        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config);
+        tokens.push(next_token);
+
+        // Stream output
+        let text = tokenizer.decode(&tokens, true).unwrap_or_default();
+        let new_text = &text[initial_text.len()..];
+        // Re-print new portion
+        print!("\r{}{}", initial_text, new_text);
+        stdout.flush().ok();
+
+        if next_token == eos_id {
+            break;
+        }
+    }
+
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    let tok_per_s = if decode_ms > 0.0 {
+        generated_count as f64 / (decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let kivi_mem_final = kv_caches
+        .iter()
+        .map(|c| c.memory_usage_bytes())
+        .sum::<usize>();
+    println!();
+    println!(
+        "[KIVI] Decode: {} tokens, {:.1}ms ({:.1} tok/s)",
+        generated_count, decode_ms, tok_per_s
+    );
+    println!(
+        "[KIVI] Final: cache_pos={}, Q2_tokens={}, res_pos={}, mem={}KB",
+        kv_caches[0].current_pos(),
+        kv_caches[0].q2_tokens,
+        kv_caches[0].res_pos,
+        kivi_mem_final / 1024,
+    );
+
+    // Compare with FP32 equivalent
+    let fp32_equiv = kv_caches[0].current_pos() * kv_heads * head_dim * 4 * 2 * num_layers;
+    println!(
+        "[KIVI] Compression: {:.1}x vs FP32 ({}KB vs {}KB)",
+        fp32_equiv as f64 / kivi_mem_final.max(1) as f64,
+        kivi_mem_final / 1024,
+        fp32_equiv / 1024,
+    );
+
     Ok(())
 }

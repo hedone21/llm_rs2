@@ -4,6 +4,7 @@ pub mod buffer;
 pub mod cache_manager;
 pub mod events;
 pub mod eviction;
+pub mod kivi_cache;
 pub mod kv_cache;
 pub mod memory;
 pub mod pressure;

@@ -1,7 +1,7 @@
 use crate::backend::cpu::CpuBackend;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
-use crate::core::kv_cache::{KVCache, KVLayout};
+use crate::core::kv_cache::{KVCache, KVCacheOps, KVLayout};
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
@@ -28,7 +28,7 @@ pub struct LlamaLayer {
 }
 
 impl LlamaLayer {
-    pub fn forward(&self, args: LlamaLayerForwardArgs) -> Result<()> {
+    pub fn forward<C: KVCacheOps>(&self, args: LlamaLayerForwardArgs<C>) -> Result<()> {
         let x = args.x;
         let kv_cache = args.kv_cache;
         let start_pos = args.start_pos;
@@ -97,7 +97,7 @@ impl LlamaLayer {
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
 
         // Cast to target dtype if KV cache is not F32
-        let kv_dtype = kv_cache.k_buffer.dtype();
+        let kv_dtype = kv_cache.kv_dtype();
         if kv_dtype != DType::F32 {
             let n_elem = seq_len * n_heads_kv * head_dim;
             let buf_size = match kv_dtype {
@@ -119,8 +119,8 @@ impl LlamaLayer {
             kv_cache.update(&k_rope, &v)?;
         }
 
-        let cache_seq_len = kv_cache.current_pos;
-        let (k_cache, v_cache) = kv_cache.get_view(0);
+        let cache_seq_len = kv_cache.current_pos();
+        let (k_cache, v_cache) = kv_cache.get_view();
 
         let mut out_attn = self.alloc_temp(vec![batch_size, seq_len, q_dim], memory, backend)?;
 
@@ -352,7 +352,7 @@ impl LlamaLayer {
     }
 
     /// Fast path for single token generation using pre-allocated workspace.
-    fn forward_gen(&self, args: LlamaForwardGenArgs) -> Result<()> {
+    fn forward_gen<C: KVCacheOps>(&self, args: LlamaForwardGenArgs<C>) -> Result<()> {
         let x = args.x;
         let kv_cache = args.kv_cache;
         let start_pos = args.start_pos;
@@ -401,7 +401,7 @@ impl LlamaLayer {
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
 
         // 4. KV Cache Update - cast to target dtype if needed
-        let kv_dtype = kv_cache.k_buffer.dtype();
+        let kv_dtype = kv_cache.kv_dtype();
         if kv_dtype != DType::F32 {
             let n_elem = n_heads_kv * head_dim;
             let buf_size = match kv_dtype {
@@ -428,8 +428,8 @@ impl LlamaLayer {
         }
 
         // 5. Attention - use GPU kernel for OpenCL
-        let cache_seq_len = kv_cache.current_pos;
-        let (k_cache, v_cache) = kv_cache.get_view(0);
+        let cache_seq_len = kv_cache.current_pos();
+        let (k_cache, v_cache) = kv_cache.get_view();
 
         let need_scores = args.need_scores;
 
@@ -1087,9 +1087,9 @@ impl LlamaLayer {
     }
 }
 
-pub struct LlamaForwardGenArgs<'a> {
+pub struct LlamaForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub x: &'a mut Tensor,
-    pub kv_cache: &'a mut KVCache,
+    pub kv_cache: &'a mut C,
     pub start_pos: usize,
     pub backend: &'a Arc<dyn Backend>,
     pub memory: &'a dyn Memory,
@@ -1102,9 +1102,9 @@ pub struct LlamaForwardGenArgs<'a> {
     pub need_scores: bool,
 }
 
-pub struct LlamaLayerForwardArgs<'a> {
+pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub x: &'a mut Tensor,
-    pub kv_cache: &'a mut KVCache,
+    pub kv_cache: &'a mut C,
     pub start_pos: usize,
     pub backend: &'a Arc<dyn Backend>,
     pub memory: &'a dyn Memory,
