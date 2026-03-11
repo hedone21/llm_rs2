@@ -7,6 +7,7 @@ pub mod eviction;
 pub mod kivi_cache;
 pub mod kv_cache;
 pub mod memory;
+pub mod offload;
 pub mod pressure;
 pub mod quant;
 pub mod sampling;
