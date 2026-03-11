@@ -202,6 +202,12 @@ struct Args {
     /// 0 = no budget limit (default).
     #[arg(long, default_value_t = 0)]
     kv_budget: usize,
+
+    /// KV cache budget as a ratio of prompt length (0.0–1.0).
+    /// When set (> 0), overrides --kv-budget per question: budget = prompt_len * ratio.
+    /// Matches H2O paper evaluation methodology.
+    #[arg(long, default_value_t = 0.0)]
+    kv_budget_ratio: f32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1207,12 +1213,14 @@ fn run_eval_ll(
         }
     }
 
-    let budget_mode = args.kv_budget > 0;
+    let ratio_mode = args.kv_budget_ratio > 0.0;
+    let budget_mode = args.kv_budget > 0 || ratio_mode;
     eprintln!(
-        "[Eval-LL] {} questions, policy={}, kv_budget={}, mode={}",
+        "[Eval-LL] {} questions, policy={}, kv_budget={}, kv_budget_ratio={}, mode={}",
         questions.len(),
         args.eviction_policy,
         args.kv_budget,
+        args.kv_budget_ratio,
         if budget_mode {
             "chunked"
         } else {
@@ -1284,10 +1292,25 @@ fn run_eval_ll(
         let mut evicted_total: usize = 0;
         let start_pos_after_prompt: usize;
 
+        // Compute effective budget: ratio-based (per question) or absolute
+        let effective_budget = if ratio_mode {
+            let b = (prompt_len as f32 * args.kv_budget_ratio).round() as usize;
+            b.max(4) // minimum 4 tokens (protected prefix)
+        } else {
+            args.kv_budget
+        };
+
+        if ratio_mode {
+            eprintln!(
+                "[Eval-LL] {}: prompt_len={}, budget={} (ratio={:.0}%)",
+                question.id, prompt_len, effective_budget, args.kv_budget_ratio * 100.0
+            );
+        }
+
         // ── PROMPT PROCESSING ──
-        let prompt_logits_cpu: Vec<f32> = if budget_mode && prompt_len > args.kv_budget {
+        let prompt_logits_cpu: Vec<f32> = if budget_mode && prompt_len > effective_budget {
             // ═══ CHUNKED PREFILL + DECODE (budget-constrained) ═══
-            let first_chunk_len = args.kv_budget;
+            let first_chunk_len = effective_budget;
             let cpu_buf = Galloc::new().alloc(first_chunk_len * 4, DType::U8)?;
             unsafe {
                 let ptr = cpu_buf.as_mut_ptr() as *mut u32;
@@ -1323,8 +1346,8 @@ fn run_eval_ll(
             let mut start_pos = first_chunk_len;
 
             // Evict to make room
-            if kv_caches[0].current_pos > args.kv_budget {
-                let ratio = args.kv_budget as f32 / kv_caches[0].current_pos as f32;
+            if kv_caches[0].current_pos > effective_budget {
+                let ratio = effective_budget as f32 / kv_caches[0].current_pos as f32;
                 let r = cache_manager.force_evict(kv_caches, ratio)?;
                 if r.evicted {
                     eviction_count += 1;
@@ -1357,8 +1380,8 @@ fn run_eval_ll(
                 })?;
                 start_pos += 1;
 
-                if kv_caches[0].current_pos > args.kv_budget {
-                    let ratio = args.kv_budget as f32 / kv_caches[0].current_pos as f32;
+                if kv_caches[0].current_pos > effective_budget {
+                    let ratio = effective_budget as f32 / kv_caches[0].current_pos as f32;
                     let evict_result = if let Some(acc) = score_accumulator.as_ref() {
                         cache_manager.force_evict_with_scores(
                             kv_caches,
@@ -1555,6 +1578,7 @@ fn run_eval_ll(
             "predicted_raw": predicted_raw,
             "n_choices": question.choices.len(),
             "n_prompt_tokens": prompt_len,
+            "effective_budget": effective_budget,
             "eviction_count": eviction_count,
             "evicted_tokens": evicted_total,
             "final_cache_pos": kv_caches[0].current_pos,
@@ -1568,6 +1592,7 @@ fn run_eval_ll(
             "model": args.model_path,
             "eviction_policy": args.eviction_policy,
             "kv_budget": args.kv_budget,
+            "kv_budget_ratio": args.kv_budget_ratio,
             "max_seq_len": max_seq_len,
             "kv_type": args.kv_type,
             "h2o_keep_ratio": args.h2o_keep_ratio,
