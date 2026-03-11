@@ -33,7 +33,7 @@ pub struct KiviCache {
     // Q2 compressed storage (raw block data)
     q2_k: Vec<BlockQ2_0>,
     q2_v: Vec<BlockQ2_0>,
-    /// Number of tokens in Q2 storage (always a multiple of `group_size`).
+    /// Number of tokens in Q2 storage (always a multiple of `res_cap`).
     pub q2_tokens: usize,
 
     // FP32 residual buffer — layout: [kv_heads][res_cap][head_dim]
@@ -44,9 +44,16 @@ pub struct KiviCache {
     /// Residual buffer capacity (R). Must be a multiple of QK2_0 (32).
     res_cap: usize,
 
-    // Pre-allocated output buffers for get_view() dequantization
+    // Pre-allocated output buffers for assemble_view() dequantization
     attn_k_buf: Vec<f32>,
     attn_v_buf: Vec<f32>,
+
+    /// Number of Q2 tokens already dequantized into attn_k_buf/attn_v_buf.
+    /// Enables incremental dequantization — only new flushes are processed.
+    q2_deq_tokens: usize,
+
+    // Shared backend for get_view() tensors (avoid per-call allocation)
+    out_backend: Arc<CpuBackend>,
 
     // Dimensions
     kv_heads: usize,
@@ -75,15 +82,13 @@ impl KiviCache {
         );
 
         let res_elems = kv_heads * residual_size * head_dim;
-        // Estimate max Q2 blocks: (max_seq_len / group_size) * kv_heads * head_dim / QK2_0
-        // But we allocate conservatively and grow as needed
-        let max_q2_tokens = max_seq_len; // upper bound
-        let blocks_per_flush_k = kv_heads * head_dim; // per-channel: head_dim channels × (group_size/QK2_0=1) blocks
-        let blocks_per_flush_v = kv_heads * (head_dim / QK2_0) * (residual_size / QK2_0);
-        // Total max flushes
-        let max_flushes = max_q2_tokens / residual_size;
-        let max_k_blocks = max_flushes * blocks_per_flush_k;
-        let max_v_blocks = max_flushes * blocks_per_flush_v;
+        let groups_per_flush = residual_size / QK2_0;
+        let max_flushes = max_seq_len / residual_size;
+        // Key: per-channel — each flush produces (groups × heads × head_dim) blocks
+        let max_k_blocks = max_flushes * groups_per_flush * kv_heads * head_dim;
+        // Value: per-token — each flush produces (heads × residual_size × blocks_per_token) blocks
+        let blocks_per_token = head_dim / QK2_0;
+        let max_v_blocks = max_flushes * kv_heads * residual_size * blocks_per_token;
 
         let attn_buf_size = max_seq_len * kv_heads * head_dim;
 
@@ -97,6 +102,8 @@ impl KiviCache {
             res_cap: residual_size,
             attn_k_buf: vec![0.0; attn_buf_size],
             attn_v_buf: vec![0.0; attn_buf_size],
+            q2_deq_tokens: 0,
+            out_backend: Arc::new(CpuBackend::new()),
             kv_heads,
             head_dim,
             max_seq_len,
@@ -119,6 +126,12 @@ impl KiviCache {
     fn flush_residual(&mut self) {
         let gs = self.group_size; // = QK2_0
         assert!(self.res_pos >= gs, "not enough tokens to flush");
+        debug_assert!(
+            self.q2_tokens.is_multiple_of(self.res_cap),
+            "q2_tokens ({}) must be a multiple of res_cap ({})",
+            self.q2_tokens,
+            self.res_cap
+        );
 
         // How many full groups to flush
         let n_groups = self.res_pos / gs;
@@ -176,26 +189,47 @@ impl KiviCache {
         self.res_pos = remaining;
     }
 
-    /// Assemble full K/V view by dequantizing Q2 blocks and copying residual data
+    /// Assemble K/V view by dequantizing Q2 blocks and copying residual data
     /// into the pre-allocated attention buffers.
+    ///
+    /// **Incremental**: only dequantizes Q2 flushes that haven't been processed
+    /// yet (tracked by `q2_deq_tokens`). Residual data is always re-copied
+    /// because it changes every decode step.
     fn assemble_view(&mut self) {
         let gs = self.group_size;
+        let groups_per_flush = self.res_cap / gs;
 
-        // === Dequantize Q2 Key (per-channel) ===
-        if self.q2_tokens > 0 {
-            let groups_per_flush = self.res_cap / gs;
-            let n_flushes = self.q2_tokens / self.res_cap;
-            let mut block_idx = 0;
+        // === Incremental Q2 dequantization (only new flushes) ===
+        if self.q2_tokens > self.q2_deq_tokens {
+            debug_assert!(
+                self.q2_tokens.is_multiple_of(self.res_cap),
+                "q2_tokens ({}) must be a multiple of res_cap ({})",
+                self.q2_tokens,
+                self.res_cap
+            );
+            let old_flushes = self.q2_deq_tokens / self.res_cap;
+            let new_flushes = self.q2_tokens / self.res_cap;
+
+            // Compute block offsets to skip already-dequantized flushes
+            let k_blocks_per_flush = groups_per_flush * self.kv_heads * self.head_dim;
+            let blocks_per_token = self.head_dim / QK2_0;
+            let v_blocks_per_flush = self.kv_heads * self.res_cap * blocks_per_token;
+
+            let mut k_block_idx = old_flushes * k_blocks_per_flush;
+            let mut v_block_idx = old_flushes * v_blocks_per_flush;
             let mut channel_buf = [0.0f32; QK2_0];
+            let mut deq_buf = [0.0f32; QK2_0];
 
-            for flush in 0..n_flushes {
+            for flush in old_flushes..new_flushes {
                 let tok_base = flush * self.res_cap;
+
+                // Key: per-channel dequantization
                 for h in 0..self.kv_heads {
                     for g in 0..groups_per_flush {
                         let tok_start = tok_base + g * gs;
                         for ch in 0..self.head_dim {
-                            self.q2_k[block_idx].dequantize(&mut channel_buf);
-                            block_idx += 1;
+                            self.q2_k[k_block_idx].dequantize(&mut channel_buf);
+                            k_block_idx += 1;
                             for (t, &val) in channel_buf.iter().enumerate().take(gs) {
                                 let pos = tok_start + t;
                                 let out_idx =
@@ -205,15 +239,8 @@ impl KiviCache {
                         }
                     }
                 }
-            }
 
-            // === Dequantize Q2 Value (per-token) ===
-            let blocks_per_token = self.head_dim / QK2_0;
-            let mut v_block_idx = 0;
-            let mut deq_buf = [0.0f32; QK2_0];
-
-            for flush in 0..n_flushes {
-                let tok_base = flush * self.res_cap;
+                // Value: per-token dequantization
                 for h in 0..self.kv_heads {
                     for t in 0..self.res_cap {
                         let pos = tok_base + t;
@@ -227,9 +254,11 @@ impl KiviCache {
                     }
                 }
             }
+
+            self.q2_deq_tokens = self.q2_tokens;
         }
 
-        // === Copy residual FP32 data ===
+        // === Copy residual FP32 data (always, since it changes every step) ===
         if self.res_pos > 0 {
             let token_offset = self.q2_tokens;
             for h in 0..self.kv_heads {
@@ -323,43 +352,37 @@ impl KVCacheOps for KiviCache {
 
     fn get_view(&mut self) -> (Tensor, Tensor) {
         let total = self.total_tokens();
+        let backend: Arc<dyn crate::core::backend::Backend> = self.out_backend.clone();
         if total == 0 {
-            // Return empty tensors
-            let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
             let buf = Arc::new(SharedBuffer::new(0, DType::F32));
             let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
             let t = Tensor::new(shape.clone(), buf.clone(), backend.clone());
             return (t.clone(), t);
         }
 
-        // Assemble full view (dequantize Q2 + copy residual)
+        // Incremental assemble (only dequantize new Q2 flushes + copy residual)
         self.assemble_view();
 
         let buf_size = total * self.kv_heads * self.head_dim;
-
-        // Create tensors wrapping the output buffers
-        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let byte_size = buf_size * 4;
         let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
 
-        let k_byte_size = buf_size * 4;
-        let k_buf = Arc::new(SharedBuffer::new(k_byte_size, DType::F32));
+        let k_buf = Arc::new(SharedBuffer::new(byte_size, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::new(byte_size, DType::F32));
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.attn_k_buf.as_ptr(),
                 k_buf.as_mut_ptr() as *mut f32,
                 buf_size,
             );
-        }
-        let k_tensor = Tensor::new(shape.clone(), k_buf, backend.clone());
-
-        let v_buf = Arc::new(SharedBuffer::new(k_byte_size, DType::F32));
-        unsafe {
             std::ptr::copy_nonoverlapping(
                 self.attn_v_buf.as_ptr(),
                 v_buf.as_mut_ptr() as *mut f32,
                 buf_size,
             );
         }
+
+        let k_tensor = Tensor::new(shape.clone(), k_buf, backend.clone());
         let v_tensor = Tensor::new(shape, v_buf, backend);
 
         (k_tensor, v_tensor)
@@ -624,6 +647,93 @@ mod tests {
         assert!(
             ratio > 3.0,
             "compression ratio {ratio:.1}x too low (expected >3x)"
+        );
+    }
+
+    #[test]
+    fn test_kivi_cache_incremental_deq() {
+        // Verify that incremental dequantization produces identical results
+        // to full dequantization across multiple flushes.
+        let kv_heads = 2;
+        let head_dim = 64;
+        let max_seq = 256;
+        let res_cap = 32;
+
+        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+
+        // Fill 64 tokens → 2 flushes (at token 32 and 64)
+        for i in 0..65 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.03);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.03 + 10.0);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.q2_tokens, 64);
+        assert_eq!(cache.res_pos, 1);
+        assert_eq!(cache.q2_deq_tokens, 0); // nothing dequantized yet
+
+        // First get_view: dequantize all 64 Q2 tokens
+        let (k1, v1) = cache.get_view();
+        assert_eq!(cache.q2_deq_tokens, 64);
+        let k1_data: Vec<f32> = k1.as_slice::<f32>().to_vec();
+        let v1_data: Vec<f32> = v1.as_slice::<f32>().to_vec();
+
+        // Add more tokens to trigger another flush
+        for i in 65..97 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.03);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.03 + 10.0);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.q2_tokens, 96);
+        assert_eq!(cache.q2_deq_tokens, 64); // still at 64 from last get_view
+
+        // Second get_view: should only dequantize flush 2 (tokens 64..95)
+        let (k2, _v2) = cache.get_view();
+        assert_eq!(cache.q2_deq_tokens, 96);
+        let k2_data = k2.as_slice::<f32>();
+
+        // First 64 tokens should be identical to the previous get_view
+        let first_64_elems = 64 * kv_heads * head_dim;
+        assert_eq!(&k1_data[..first_64_elems], &k2_data[..first_64_elems]);
+        assert_eq!(
+            &v1_data[..first_64_elems],
+            &_v2.as_slice::<f32>()[..first_64_elems]
+        );
+    }
+
+    #[test]
+    fn test_kivi_cache_vec_capacity_no_realloc() {
+        // With correct capacity calculations, no reallocation should occur
+        // for sequences within max_seq_len.
+        let kv_heads = 8;
+        let head_dim = 64;
+        let max_seq = 256;
+        let res_cap = 64; // larger residual to test groups_per_flush > 1
+
+        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        let initial_k_cap = cache.q2_k.capacity();
+        let initial_v_cap = cache.q2_v.capacity();
+
+        // Fill to max_seq_len (3 flushes: at 64, 128, 192 → 192 Q2 + 64 residual)
+        for _ in 0..max_seq {
+            let k = make_input_tensor(1, kv_heads, head_dim, 0.1);
+            let v = make_input_tensor(1, kv_heads, head_dim, 0.2);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.q2_tokens, 192);
+        assert_eq!(cache.res_pos, 64);
+
+        // No reallocation should have occurred
+        assert_eq!(
+            cache.q2_k.capacity(),
+            initial_k_cap,
+            "K vec reallocated (initial={initial_k_cap}, now={})",
+            cache.q2_k.capacity()
+        );
+        assert_eq!(
+            cache.q2_v.capacity(),
+            initial_v_cap,
+            "V vec reallocated (initial={initial_v_cap}, now={})",
+            cache.q2_v.capacity()
         );
     }
 }
