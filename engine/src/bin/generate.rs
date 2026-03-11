@@ -317,6 +317,11 @@ fn main() -> anyhow::Result<()> {
             args.kivi_residual_size,
             args.num_tokens,
             args.gpu_attn,
+            args.experiment_output.as_deref(),
+            args.experiment_logits_topk,
+            args.experiment_sample_interval,
+            &prompt,
+            &args.backend,
         );
     }
 
@@ -1657,6 +1662,11 @@ fn run_kivi(
     residual_size: usize,
     num_tokens: usize,
     gpu_attn: bool,
+    experiment_output: Option<&str>,
+    experiment_logits_topk: usize,
+    experiment_sample_interval: usize,
+    prompt: &str,
+    backend_name: &str,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
@@ -1664,6 +1674,19 @@ fn run_kivi(
         "[KIVI] Q2 KV cache enabled — residual_size={}, max_seq_len={}",
         residual_size, max_seq_len
     );
+
+    // Experiment infrastructure
+    let mut experiment_writer = if let Some(path) = experiment_output {
+        Some(JsonlWriter::new(path)?)
+    } else {
+        None
+    };
+    let mut system_sampler = SystemSampler::new(experiment_sample_interval);
+    let sys_start = if experiment_writer.is_some() {
+        Some(system_sampler.snapshot())
+    } else {
+        None
+    };
 
     // Create KiviCache per layer
     let mut kv_caches: Vec<KiviCache> = (0..num_layers)
@@ -1770,11 +1793,12 @@ fn run_kivi(
         start_pos = process_len;
     }
     let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+    let ttft_ms = prefill_ms;
     let kivi_mem = kv_caches
         .iter()
         .map(|c| c.memory_usage_bytes())
         .sum::<usize>();
-    println!(
+    eprintln!(
         "[KIVI] Prefill: {}ms, cache_pos={}, Q2_tokens={}, res_pos={}, mem={}KB",
         prefill_ms as u32,
         kv_caches[0].current_pos(),
@@ -1787,8 +1811,10 @@ fn run_kivi(
     use std::io::Write;
     let mut stdout = std::io::stdout();
     let initial_text = tokenizer.decode(&tokens, true).unwrap_or_default();
-    print!("{}", initial_text);
-    stdout.flush().ok();
+    if experiment_writer.is_none() {
+        print!("{}", initial_text);
+        stdout.flush().ok();
+    }
 
     // === DECODE ===
     let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
@@ -1806,10 +1832,13 @@ fn run_kivi(
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;
+    let mut tbt_values: Vec<f64> = Vec::new();
+    let mut forward_ms_values: Vec<f64> = Vec::new();
+    let mut last_token_time = std::time::Instant::now();
 
-    for _ in 0..(num_tokens - 1) {
+    for decode_idx in 0..(num_tokens - 1) {
         if kv_caches[0].current_pos() >= max_seq_len {
-            println!("\n[Stopped: Max context length reached]");
+            eprintln!("\n[Stopped: Max context length reached]");
             break;
         }
 
@@ -1819,6 +1848,7 @@ fn run_kivi(
         }
         let gen_input = backend.copy_from(&cpu_gen_input)?;
 
+        let fwd_start = std::time::Instant::now();
         model.forward_into(LlamaModelForwardArgs {
             input_tokens: &gen_input,
             start_pos,
@@ -1831,26 +1861,63 @@ fn run_kivi(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
         })?;
+        let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
+        forward_ms_values.push(forward_ms);
 
         start_pos += 1;
         generated_count += 1;
 
-        // Sample
+        // Read logits to CPU
         let mut logits_cpu = vec![0.0f32; vocab_size];
         unsafe {
             let ptr = logits_cpu.as_mut_ptr() as *mut u8;
             let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
             backend.read_buffer(&logits, slice)?;
         }
+
+        // Extract top-K logits before sampling modifies them
+        let top_logits = if experiment_writer.is_some() {
+            extract_top_k_logits(&logits_cpu, experiment_logits_topk)
+        } else {
+            vec![]
+        };
+
         let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config);
+
+        let now = std::time::Instant::now();
+        let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
+        tbt_values.push(tbt);
+        last_token_time = now;
+
         tokens.push(next_token);
 
-        // Stream output
-        let text = tokenizer.decode(&tokens, true).unwrap_or_default();
-        let new_text = &text[initial_text.len()..];
-        // Re-print new portion
-        print!("\r{}{}", initial_text, new_text);
-        stdout.flush().ok();
+        // Experiment: write per-token JSONL record
+        if let Some(ref mut writer) = experiment_writer {
+            let token_text = tokenizer.decode(&[next_token], false).unwrap_or_default();
+            let sys_metrics = system_sampler.sample(decode_idx);
+            let record = TokenRecord {
+                pos: decode_idx,
+                token_id: next_token,
+                text: token_text,
+                tbt_ms: tbt,
+                forward_ms,
+                signal: None,
+                actions: vec![],
+                cache_pos: kv_caches[0].current_pos(),
+                throttle_ms: 0,
+                top_logits,
+                sys: sys_metrics,
+            };
+            writer.write_token(&record)?;
+        }
+
+        // Stream output (suppress in experiment mode)
+        if experiment_writer.is_none() {
+            let text = tokenizer.decode(&tokens, true).unwrap_or_default();
+            let new_text = &text[initial_text.len()..];
+            print!("\r{}{}", initial_text, new_text);
+            stdout.flush().ok();
+        }
 
         if next_token == eos_id {
             break;
@@ -1867,12 +1934,53 @@ fn run_kivi(
         .iter()
         .map(|c| c.memory_usage_bytes())
         .sum::<usize>();
-    println!();
-    println!(
+
+    // Write experiment summary
+    if let Some(ref mut writer) = experiment_writer {
+        let sys_end = Some(system_sampler.snapshot());
+        let avg_tbt_ms = if tbt_values.is_empty() {
+            0.0
+        } else {
+            tbt_values.iter().sum::<f64>() / tbt_values.len() as f64
+        };
+        let avg_forward_ms = if forward_ms_values.is_empty() {
+            0.0
+        } else {
+            forward_ms_values.iter().sum::<f64>() / forward_ms_values.len() as f64
+        };
+        let summary = SummaryRecord {
+            _summary: true,
+            total_tokens: tbt_values.len(),
+            ttft_ms,
+            avg_tbt_ms,
+            avg_forward_ms,
+            total_throttle_ms: 0,
+            eviction_count: 0,
+            evicted_tokens_total: 0,
+            final_cache_pos: kv_caches[0].current_pos(),
+            max_seq_len,
+            prompt: prompt.to_string(),
+            schedule_name: "kivi".to_string(),
+            eviction_policy: "none".to_string(),
+            backend: backend_name.to_string(),
+            sample_interval: experiment_sample_interval,
+            sys_start,
+            sys_end,
+            governor: Some(SystemSampler::read_governor()),
+        };
+        writer.write_summary(&summary)?;
+        eprintln!(
+            "[KIVI-Experiment] Done: {} tokens, avg TBT {:.2}ms",
+            summary.total_tokens, avg_tbt_ms,
+        );
+    }
+
+    eprintln!();
+    eprintln!(
         "[KIVI] Decode: {} tokens, {:.1}ms ({:.1} tok/s)",
         generated_count, decode_ms, tok_per_s
     );
-    println!(
+    eprintln!(
         "[KIVI] Final: cache_pos={}, Q2_tokens={}, res_pos={}, mem={}KB",
         kv_caches[0].current_pos(),
         kv_caches[0].q2_tokens,
@@ -1882,7 +1990,7 @@ fn run_kivi(
 
     // Compare with FP32 equivalent
     let fp32_equiv = kv_caches[0].current_pos() * kv_heads * head_dim * 4 * 2 * num_layers;
-    println!(
+    eprintln!(
         "[KIVI] Compression: {:.1}x vs FP32 ({}KB vs {}KB)",
         fp32_equiv as f64 / kivi_mem_final.max(1) as f64,
         kivi_mem_final / 1024,
