@@ -130,7 +130,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-11 07:51:44_
+_Last updated: 2026-03-11 23:52:20_
 
 ### Quality Gate Summary
 
@@ -138,7 +138,7 @@ _Last updated: 2026-03-11 07:51:44_
 |:----------|:-----|:---------|------:|-------:|--------:|:-----|
 | Buffer/DType | T1 | Stable | 5 | 5 | 0 | PASS |
 | Galloc | T1 | Stable | 3 | 3 | 0 | PASS |
-| Quant | T1 | Stable | 8 | 8 | 0 | PASS |
+| Quant | T1 | Stable | 15 | 15 | 0 | PASS |
 | Shape | T1 | Stable | 3 | 3 | 0 | PASS |
 | SharedBuffer | T1 | Stable | 5 | 5 | 0 | PASS |
 | Tensor | T1 | Stable | 6 | 6 | 0 | PASS |
@@ -158,9 +158,9 @@ _Last updated: 2026-03-11 07:51:44_
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 3 | 3 | 0 | PASS |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
-| **Overall** | | | **196** | **195** | **0** | **FAIL** |
-| Integration | - | - | 149 | 149 | PASS |
+| UnifiedBuffer | T4 | Stable | 3 | 0 | 0 | **FAIL** |
+| **Overall** | | | **205** | **202** | **0** | **FAIL** |
+| Integration | - | - | 157 | 157 | PASS |
 
 ### Test Details
 
@@ -174,6 +174,12 @@ _Last updated: 2026-03-11 07:51:44_
 | `test_galloc_allocation` | Galloc | PASS |
 | `test_galloc_used_memory` | Galloc | PASS |
 | `test_galloc_zero_size_allocation` | Galloc | PASS |
+| `test_block_q2_0_constant` | Quant | PASS |
+| `test_block_q2_0_dequantize_known` | Quant | PASS |
+| `test_block_q2_0_manual_pack` | Quant | PASS |
+| `test_block_q2_0_negative_range` | Quant | PASS |
+| `test_block_q2_0_round_trip` | Quant | PASS |
+| `test_block_q2_0_zeros` | Quant | PASS |
 | `test_block_q4_0_dequantize` | Quant | PASS |
 | `test_block_q4_0_quantize_round_trip` | Quant | PASS |
 | `test_block_q4_0_quantize_zeros` | Quant | PASS |
@@ -181,6 +187,7 @@ _Last updated: 2026-03-11 07:51:44_
 | `test_block_q4_1_dequantize` | Quant | PASS |
 | `test_block_q4_1_zero_scale` | Quant | PASS |
 | `test_block_q8_0_dequantize` | Quant | PASS |
+| `test_quantize_dequantize_slice_q2` | Quant | PASS |
 | `test_struct_sizes` | Quant | PASS |
 | `test_empty_shape_scalar` | Shape | PASS |
 | `test_one_dimensional_empty` | Shape | PASS |
@@ -361,7 +368,9 @@ _Last updated: 2026-03-11 07:51:44_
 | `test_accumulator_receives_post_softmax_scores` | LlamaLayer | PASS |
 | `test_compute_attention_scores_f16_post_softmax` | LlamaLayer | PASS |
 | `test_inline_softmax_produces_valid_probabilities` | LlamaLayer | PASS |
+| `test_alloc_unified_buffer` | UnifiedBuffer | **FAIL** |
 | `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
+| `test_unmap_and_remap` | UnifiedBuffer | **FAIL** |
 | `default_config_all_monitors_enabled` | Integration | PASS |
 | `parse_external_config` | Integration | PASS |
 | `parse_full_config` | Integration | PASS |
@@ -391,6 +400,14 @@ _Last updated: 2026-03-11 07:51:44_
 | `test_build_score_snapshot_sigma_distribution` | Integration | PASS |
 | `test_collecting_sink_captures_events` | Integration | PASS |
 | `test_noop_sink_is_zero_cost` | Integration | PASS |
+| `test_kivi_cache_basic` | Integration | PASS |
+| `test_kivi_cache_compression_ratio` | Integration | PASS |
+| `test_kivi_cache_flush_and_quantize` | Integration | PASS |
+| `test_kivi_cache_get_view_after_flush` | Integration | PASS |
+| `test_kivi_cache_memory_usage` | Integration | PASS |
+| `test_kivi_cache_multi_token_update` | Integration | PASS |
+| `test_kivi_cache_overflow` | Integration | PASS |
+| `test_kivi_cache_residual_only` | Integration | PASS |
 | `test_compress_name` | Integration | PASS |
 | `test_compress_returns_noop` | Integration | PASS |
 | `test_cosine_identical_vectors` | Integration | PASS |
@@ -520,7 +537,6 @@ _Last updated: 2026-03-11 07:51:44_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-07T21:34:43 | 211 | 209 | 2 | 99.1% |
 | 2026-03-07T21:36:10 | 212 | 209 | 3 | 98.6% |
 | 2026-03-07T21:41:43 | 211 | 209 | 2 | 99.1% |
 | 2026-03-07T21:52:38 | 209 | 209 | 0 | 100.0% |
@@ -540,4 +556,5 @@ _Last updated: 2026-03-11 07:51:44_
 | 2026-03-10T20:04:07 | 344 | 341 | 3 | 99.1% |
 | 2026-03-11T00:49:12 | 344 | 344 | 0 | 100.0% |
 | 2026-03-11T07:51:44 | 345 | 344 | 1 | 99.7% |
+| 2026-03-11T23:52:20 | 362 | 359 | 3 | 99.2% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->
