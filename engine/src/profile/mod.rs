@@ -112,17 +112,26 @@ impl InferenceProfiler {
     }
 
     /// Called at the end of each decode step after forward pass and sampling.
+    #[allow(clippy::too_many_arguments)]
     pub fn on_step_end(
         &mut self,
         step: usize,
-        _token_id: u32,
+        token_id: u32,
         forward_us: u64,
         sample_us: u64,
         total_us: u64,
         cache_len: usize,
+        importance: Option<&[f32]>,
+        head_importance: Option<&[f32]>,
+        n_kv_heads: usize,
     ) {
         self.latency
             .record(step, forward_us, sample_us, total_us, cache_len);
+
+        if let Some(imp) = importance {
+            self.scores
+                .take_snapshot(step, token_id, cache_len, imp, head_importance, n_kv_heads);
+        }
     }
 
     /// Record an eviction event.
@@ -214,8 +223,8 @@ mod tests {
     #[test]
     fn test_on_step_end_records_latency() {
         let mut p = InferenceProfiler::new(default_config());
-        p.on_step_end(0, 42, 5000, 100, 5100, 128);
-        p.on_step_end(1, 43, 5200, 80, 5280, 129);
+        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0);
+        p.on_step_end(1, 43, 5200, 80, 5280, 129, None, None, 0);
 
         let records = p.latency.records();
         assert_eq!(records.len(), 2);
@@ -259,7 +268,7 @@ mod tests {
         let mut p = InferenceProfiler::new(config);
         p.ops.matmul_qkv = 1000;
         p.ops.count = 10;
-        p.on_step_end(0, 42, 5000, 100, 5100, 128);
+        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0);
 
         let metadata = ProfileMetadata {
             model: "llama-3.2-1b".to_string(),
@@ -318,5 +327,98 @@ mod tests {
         assert!(json["cache"].is_null());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_on_step_end_records_score_snapshot() {
+        let mut p = InferenceProfiler::new(default_config());
+        let scores = vec![0.8, 0.15, 0.05];
+        p.on_step_end(0, 42, 5000, 100, 5100, 3, Some(&scores), None, 0);
+
+        assert_eq!(p.scores.snapshots().len(), 1);
+        assert_eq!(p.scores.snapshots()[0].step, 0);
+        assert_eq!(p.scores.snapshots()[0].token_id, 42);
+        assert!((p.scores.snapshots()[0].importance[0] - 0.8).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_on_step_end_no_snapshot_without_scores() {
+        let mut p = InferenceProfiler::new(default_config());
+        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0);
+
+        // No importance → no snapshot
+        assert!(p.scores.snapshots().is_empty());
+        // But latency is still recorded
+        assert_eq!(p.latency.records().len(), 1);
+    }
+
+    #[test]
+    fn test_on_step_end_with_head_importance() {
+        let config = ProfileConfig {
+            track_per_head: true,
+            ..default_config()
+        };
+        let mut p = InferenceProfiler::new(config);
+        let scores = vec![0.5, 0.5];
+        let head_scores = vec![0.6, 0.4, 0.3, 0.7];
+        p.on_step_end(
+            0,
+            10,
+            5000,
+            100,
+            5100,
+            2,
+            Some(&scores),
+            Some(&head_scores),
+            2,
+        );
+
+        let snap = &p.scores.snapshots()[0];
+        assert!(snap.head_importance.is_some());
+        assert_eq!(snap.head_importance.as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn test_full_lifecycle_scores_and_eviction() {
+        let mut p = InferenceProfiler::new(default_config());
+
+        // Simulate 5 decode steps
+        for step in 0..5 {
+            let scores: Vec<f32> = (0..10).map(|i| (10 - i) as f32 * 0.1).collect();
+            p.on_step_end(
+                step,
+                step as u32,
+                5000,
+                100,
+                5100,
+                10,
+                Some(&scores),
+                None,
+                0,
+            );
+        }
+
+        // Eviction at step 3
+        p.on_eviction(EvictionEvent {
+            step: 3,
+            policy: "h2o".to_string(),
+            before_len: 10,
+            after_len: 8,
+            evicted_count: 2,
+            partition: PartitionInfo {
+                prefix_end: 2,
+                hh_count: 3,
+                recent_start: 5,
+            },
+        });
+
+        assert_eq!(p.scores.snapshots().len(), 5);
+        assert_eq!(p.scores.evictions().len(), 1);
+        assert_eq!(p.latency.records().len(), 5);
+
+        // Verify JSON export contains all data
+        let json = p.scores.to_json();
+        assert_eq!(json["snapshot_count"], 5);
+        assert_eq!(json["eviction_count"], 1);
     }
 }
