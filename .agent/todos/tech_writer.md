@@ -5,8 +5,6 @@
 
 ---
 
----
-
 ## [P2] IPC Transport 문서화
 - **Status**: TODO
 - **Sprint**: next
@@ -38,20 +36,3 @@
 - **Description**: 다양한 모델 크기(1B/3B/7B/8B)의 다운로드, 양자화, 배포, 실행 방법 문서화
 - **Acceptance Criteria**: 모델별 설정 가이드, 디바이스별 호환성 표
 - **Notes**: 실제 테스트 데이터 확보 후 작성
-
----
-
-## Archive (완료)
-
-<details>
-<summary>DONE 항목 (접기)</summary>
-
-## [P0] Experiment 프레임워크 사용 가이드
-- **Status**: DONE
-- **Notes**: `docs/28_experiment_guide.md` 작성. CLI 플래그, 스케줄 JSON 포맷, JSONL 스키마, 품질 메트릭, 분석 스크립트 사용법, 워크플로우 포함.
-
-## [P0] Experiment FINDINGS 기록
-- **Status**: DONE
-- **Notes**: `experiments/FINDINGS.md` — Round 1~5 전체 기록. 가설/결과/인사이트/결론 포함. 10개 핵심 발견 + 5개 운영 권장사항 도출.
-
-</details>
