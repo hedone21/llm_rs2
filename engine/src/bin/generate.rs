@@ -633,9 +633,12 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Auto-eviction: sliding window in non-experiment mode checks memory pressure
-    // after each forward pass. H2O/D2O are always signal-driven.
-    let auto_eviction = args.eviction_policy == "sliding" && experiment_schedule.is_none();
+    // Auto-eviction: non-experiment mode evicts automatically.
+    // - Sliding window: triggers on memory pressure after each forward pass.
+    // - Score-based (H2O/H2O+/D2O): triggers when cache utilization >= 90% capacity,
+    //   using force_evict_with_scores to bypass memory pressure checks.
+    let auto_eviction = args.eviction_policy != "none" && experiment_schedule.is_none();
+    let score_based_eviction = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
 
     // ════════════════════════════════════════════════════════════
     //  EVAL-LL MODE: Log-likelihood evaluation for downstream tasks
@@ -883,10 +886,26 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Auto-eviction after forward pass (sliding window, non-experiment mode)
+            // Auto-eviction after forward pass (non-experiment mode)
             if auto_eviction {
                 let before_len = kv_caches[0].current_pos;
-                let result = if let Some(ref acc) = score_accumulator {
+                let capacity = kv_caches[0].capacity();
+                let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
+                    // Score-based policies: force evict when cache >= 90% full
+                    if let Some(ref acc) = score_accumulator {
+                        if acc.is_active() {
+                            cache_manager.force_evict_with_scores(
+                                &mut kv_caches,
+                                args.eviction_target_ratio,
+                                acc.importance_scores(),
+                            )?
+                        } else {
+                            cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
+                        }
+                    } else {
+                        cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
+                    }
+                } else if let Some(ref acc) = score_accumulator {
                     if acc.is_active() {
                         cache_manager
                             .maybe_evict_with_scores(&mut kv_caches, acc.importance_scores())?
