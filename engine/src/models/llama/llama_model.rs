@@ -53,7 +53,7 @@ pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
     /// Optional per-op profiler.
-    pub profiler: Option<&'a mut crate::layers::llama_layer::OpProfiler>,
+    pub profiler: Option<&'a mut crate::profile::ops::OpProfiler>,
 }
 
 impl LlamaModel {
