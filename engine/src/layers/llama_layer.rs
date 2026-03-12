@@ -10,6 +10,111 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+// --- x86_64 AVX2 SIMD helpers for attention ---
+
+/// Dot product: sum(a[i] * b[i]) for i in 0..len, using AVX2+FMA.
+/// head_dim=64 → 8 AVX2 iterations (4x unrolled = 2 outer iterations).
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn dot_f32_avx2(a: *const f32, b: *const f32, len: usize) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut sum = _mm256_setzero_ps();
+        let mut i = 0;
+
+        // 4x unrolled: 32 floats per iteration
+        while i + 32 <= len {
+            let a0 = _mm256_loadu_ps(a.add(i));
+            let b0 = _mm256_loadu_ps(b.add(i));
+            sum = _mm256_fmadd_ps(a0, b0, sum);
+
+            let a1 = _mm256_loadu_ps(a.add(i + 8));
+            let b1 = _mm256_loadu_ps(b.add(i + 8));
+            sum = _mm256_fmadd_ps(a1, b1, sum);
+
+            let a2 = _mm256_loadu_ps(a.add(i + 16));
+            let b2 = _mm256_loadu_ps(b.add(i + 16));
+            sum = _mm256_fmadd_ps(a2, b2, sum);
+
+            let a3 = _mm256_loadu_ps(a.add(i + 24));
+            let b3 = _mm256_loadu_ps(b.add(i + 24));
+            sum = _mm256_fmadd_ps(a3, b3, sum);
+
+            i += 32;
+        }
+
+        while i + 8 <= len {
+            let a0 = _mm256_loadu_ps(a.add(i));
+            let b0 = _mm256_loadu_ps(b.add(i));
+            sum = _mm256_fmadd_ps(a0, b0, sum);
+            i += 8;
+        }
+
+        // Horizontal sum: 256→128→scalar
+        let hi = _mm256_extractf128_ps(sum, 1);
+        let lo = _mm256_castps256_ps128(sum);
+        let sum128 = _mm_add_ps(lo, hi);
+        let shuf = _mm_movehdup_ps(sum128);
+        let sums = _mm_add_ps(sum128, shuf);
+        let shuf2 = _mm_movehl_ps(sums, sums);
+        let result128 = _mm_add_ss(sums, shuf2);
+        let mut result = _mm_cvtss_f32(result128);
+
+        // Scalar tail
+        while i < len {
+            result += *a.add(i) * *b.add(i);
+            i += 1;
+        }
+
+        result
+    }
+}
+
+/// Weighted accumulation: out[i] += weight * v[i] for i in 0..len, using AVX2+FMA.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+unsafe fn weighted_accum_f32_avx2(out: *mut f32, v: *const f32, weight: f32, len: usize) {
+    unsafe {
+        use std::arch::x86_64::*;
+        let w = _mm256_set1_ps(weight);
+        let mut i = 0;
+
+        // 4x unrolled: 32 floats per iteration
+        while i + 32 <= len {
+            let o0 = _mm256_loadu_ps(out.add(i));
+            let v0 = _mm256_loadu_ps(v.add(i));
+            _mm256_storeu_ps(out.add(i), _mm256_fmadd_ps(w, v0, o0));
+
+            let o1 = _mm256_loadu_ps(out.add(i + 8));
+            let v1 = _mm256_loadu_ps(v.add(i + 8));
+            _mm256_storeu_ps(out.add(i + 8), _mm256_fmadd_ps(w, v1, o1));
+
+            let o2 = _mm256_loadu_ps(out.add(i + 16));
+            let v2 = _mm256_loadu_ps(v.add(i + 16));
+            _mm256_storeu_ps(out.add(i + 16), _mm256_fmadd_ps(w, v2, o2));
+
+            let o3 = _mm256_loadu_ps(out.add(i + 24));
+            let v3 = _mm256_loadu_ps(v.add(i + 24));
+            _mm256_storeu_ps(out.add(i + 24), _mm256_fmadd_ps(w, v3, o3));
+
+            i += 32;
+        }
+
+        while i + 8 <= len {
+            let o0 = _mm256_loadu_ps(out.add(i));
+            let v0 = _mm256_loadu_ps(v.add(i));
+            _mm256_storeu_ps(out.add(i), _mm256_fmadd_ps(w, v0, o0));
+            i += 8;
+        }
+
+        // Scalar tail
+        while i < len {
+            *out.add(i) += weight * *v.add(i);
+            i += 1;
+        }
+    }
+}
+
 pub struct LlamaLayer {
     // Attention
     pub wq: Tensor,
@@ -601,7 +706,10 @@ impl LlamaLayer {
                                     score
                                 };
 
-                                #[cfg(not(target_arch = "aarch64"))]
+                                #[cfg(target_arch = "x86_64")]
+                                let score = dot_f32_avx2(q_ptr, k_ptr, head_dim);
+
+                                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                                 let score = {
                                     let mut score = 0.0;
                                     for i in 0..head_dim {
@@ -636,7 +744,7 @@ impl LlamaLayer {
                                 *active_scores.get_unchecked_mut(i) *= inv_sum;
                             }
 
-                            // --- Step 3: Score * V (NEON Vectorized) ---
+                            // --- Step 3: Score * V (SIMD Vectorized) ---
                             // Zero out output
                             #[cfg(target_arch = "aarch64")]
                             {
@@ -665,12 +773,11 @@ impl LlamaLayer {
                                     (t * n_heads_kv + kv_h) * head_dim
                                 };
                                 let v_ptr = v_data.as_ptr().add(v_off);
-                                #[cfg(target_arch = "aarch64")]
-                                let out_ptr_h = out_h.as_mut_ptr();
 
                                 #[cfg(target_arch = "aarch64")]
                                 {
                                     use std::arch::aarch64::*;
+                                    let out_ptr_h = out_h.as_mut_ptr();
                                     let w = vdupq_n_f32(weight);
 
                                     let mut i = 0;
@@ -707,7 +814,15 @@ impl LlamaLayer {
                                     }
                                 }
 
-                                #[cfg(not(target_arch = "aarch64"))]
+                                #[cfg(target_arch = "x86_64")]
+                                weighted_accum_f32_avx2(
+                                    out_h.as_mut_ptr(),
+                                    v_ptr,
+                                    weight,
+                                    head_dim,
+                                );
+
+                                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                                 for i in 0..head_dim {
                                     *out_h.get_unchecked_mut(i) += weight * *v_ptr.add(i);
                                 }
@@ -770,7 +885,10 @@ impl LlamaLayer {
                                     }
                                     score
                                 };
-                                #[cfg(not(target_arch = "aarch64"))]
+                                #[cfg(target_arch = "x86_64")]
+                                let score = dot_f32_avx2(q_ptr, k_ptr, head_dim);
+
+                                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                                 let score = {
                                     let mut score = 0.0;
                                     for i in 0..head_dim {
@@ -863,7 +981,15 @@ impl LlamaLayer {
                                         i += 1;
                                     }
                                 }
-                                #[cfg(not(target_arch = "aarch64"))]
+                                #[cfg(target_arch = "x86_64")]
+                                weighted_accum_f32_avx2(
+                                    out_h.as_mut_ptr(),
+                                    v_ptr,
+                                    weight,
+                                    head_dim,
+                                );
+
+                                #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
                                 for i in 0..head_dim {
                                     *out_h.get_unchecked_mut(i) += weight * *v_ptr.add(i);
                                 }

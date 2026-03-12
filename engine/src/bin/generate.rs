@@ -221,6 +221,11 @@ struct Args {
     #[arg(long, default_value_t = 32)]
     kivi_residual_size: usize,
 
+    /// Number of threads for parallel computation.
+    /// Default: auto-detect CPU core count.
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
+
     /// KV cache offload mode: none, disk, or zram.
     /// Offloads KV cache to disk files or compressed memory (lossless).
     /// Requires --kv-layout seq and --kv-type f16 or f32.
@@ -235,14 +240,22 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
-    // Configure Rayon to use 8 threads
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(8)
-        .build_global()
-        .unwrap();
-
     #[allow(unused_mut)]
     let mut args = Args::parse();
+
+    // Configure Rayon thread pool: 0 = auto-detect CPU cores
+    let num_threads = if args.threads > 0 {
+        args.threads
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(8)
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build_global()
+        .unwrap();
+    eprintln!("[Config] Using {} threads", num_threads);
 
     // --greedy overrides temperature to 0
     if args.greedy {

@@ -4,5 +4,5 @@ linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-lin
 ar = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 rustflags = ["-C", "target-feature=+neon,+dotprod", "-C", "link-arg=-Wl,--allow-shlib-undefined", "-L", "libs/aarch64"]
 
-[target.x86_64-linux]
+[target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+avx2,+fma"]
