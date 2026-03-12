@@ -569,8 +569,48 @@ impl CpuBackendAVX2 {
                 });
             Ok(())
         } else {
-            // For M >= 4, use common implementation which handles larger matrices well.
-            CpuBackendCommon::new().matmul_transposed_q4_0(a, b, out)
+            // M >= 4: AVX2 with row-level parallelism
+            // 1. Quantize all A rows to Q8_0
+            let nb_k_q8 = k / QK8_0;
+            let total_q8_blocks = m * nb_k_q8;
+
+            let mut a_q8 = vec![
+                BlockQ8_0 {
+                    d: half::f16::from_f32(0.0),
+                    qs: [0; QK8_0]
+                };
+                total_q8_blocks
+            ];
+
+            // Parallel quantization for large M
+            a_q8.par_chunks_mut(nb_k_q8)
+                .enumerate()
+                .for_each(|(i, q8_row)| {
+                    let a_offset = i * k;
+                    let a_row = &a_data[a_offset..a_offset + k];
+                    unsafe {
+                        self.quantize_row_q8_0(a_row, q8_row, k);
+                    }
+                });
+
+            // 2. Parallel over M rows: each row computes N dot products
+            out_data
+                .par_chunks_mut(n)
+                .enumerate()
+                .for_each(|(i, out_row)| {
+                    let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
+                    let b_base = unsafe { b.as_ptr() as *const BlockQ4_0 };
+
+                    for (j, out_val) in out_row.iter_mut().enumerate() {
+                        let b_row_ptr = unsafe { b_base.add(j * nb_k) };
+                        let mut sum = 0.0f32;
+                        unsafe {
+                            self.vec_dot_q4_0_q8_0(k, &mut sum, b_row_ptr, a_row_ptr);
+                        }
+                        *out_val = sum;
+                    }
+                });
+            Ok(())
         }
     }
 

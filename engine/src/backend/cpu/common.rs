@@ -6,6 +6,11 @@ use crate::core::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 
+/// Minimum number of elements before using Rayon parallelism.
+/// Below this, serial execution is faster due to thread dispatch overhead.
+/// 16384 floats = 64KB ≈ L1 cache size.
+const PARALLEL_THRESHOLD: usize = 16384;
+
 pub struct CpuBackendCommon;
 
 impl Default for CpuBackendCommon {
@@ -107,18 +112,30 @@ impl Backend for CpuBackendCommon {
             return Err(anyhow!("Size mismatch for add_assign"));
         }
 
-        a_data
-            .par_iter_mut()
-            .zip(b_data.par_iter())
-            .for_each(|(x, y)| {
+        if a_data.len() < PARALLEL_THRESHOLD {
+            for (x, y) in a_data.iter_mut().zip(b_data.iter()) {
                 *x += y;
-            });
+            }
+        } else {
+            a_data
+                .par_iter_mut()
+                .zip(b_data.par_iter())
+                .for_each(|(x, y)| {
+                    *x += y;
+                });
+        }
         Ok(())
     }
 
     fn scale(&self, x: &mut Tensor, v: f32) -> Result<()> {
         let x_data = x.as_mut_slice::<f32>();
-        x_data.par_iter_mut().for_each(|val| *val *= v);
+        if x_data.len() < PARALLEL_THRESHOLD {
+            for val in x_data.iter_mut() {
+                *val *= v;
+            }
+        } else {
+            x_data.par_iter_mut().for_each(|val| *val *= v);
+        }
         Ok(())
     }
 
@@ -126,13 +143,20 @@ impl Backend for CpuBackendCommon {
         let a_data = a.as_mut_slice::<f32>();
         let b_data = b.as_slice::<f32>();
 
-        a_data
-            .par_iter_mut()
-            .zip(b_data.par_iter())
-            .for_each(|(x, y)| {
+        if a_data.len() < PARALLEL_THRESHOLD {
+            for (x, y) in a_data.iter_mut().zip(b_data.iter()) {
                 let silu_x = *x / (1.0 + (-*x).exp());
                 *x = silu_x * y;
-            });
+            }
+        } else {
+            a_data
+                .par_iter_mut()
+                .zip(b_data.par_iter())
+                .for_each(|(x, y)| {
+                    let silu_x = *x / (1.0 + (-*x).exp());
+                    *x = silu_x * y;
+                });
+        }
         Ok(())
     }
 
@@ -194,6 +218,13 @@ impl Backend for CpuBackendCommon {
             return Err(anyhow!("Head dim must be even for RoPE"));
         }
 
+        // Precompute base frequencies: freq[i] = theta^(-2i/head_dim)
+        // This eliminates repeated powf() calls in the inner loop.
+        let half_dim = head_dim / 2;
+        let freqs: Vec<f32> = (0..half_dim)
+            .map(|i| theta.powf(-2.0 * (i as f32) / (head_dim as f32)))
+            .collect();
+
         let x_data = x.as_mut_slice::<f32>();
 
         x_data
@@ -206,16 +237,15 @@ impl Backend for CpuBackendCommon {
                         let offset = (t * num_heads + h) * head_dim;
                         let head_slice = &mut batch_chunk[offset..offset + head_dim];
 
-                        for i in 0..head_dim / 2 {
-                            let freq = theta.powf(-2.0 * (i as f32) / (head_dim as f32));
-                            let val = pos as f32 * freq;
+                        for i in 0..half_dim {
+                            let val = pos as f32 * freqs[i];
                             let (sin, cos) = val.sin_cos();
 
                             let v0 = head_slice[i];
-                            let v1 = head_slice[i + head_dim / 2];
+                            let v1 = head_slice[i + half_dim];
 
                             head_slice[i] = v0 * cos - v1 * sin;
-                            head_slice[i + head_dim / 2] = v0 * sin + v1 * cos;
+                            head_slice[i + half_dim] = v0 * sin + v1 * cos;
                         }
                     }
                 }

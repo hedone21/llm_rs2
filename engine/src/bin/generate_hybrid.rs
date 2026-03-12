@@ -459,6 +459,7 @@ fn main() -> anyhow::Result<()> {
             workspace: None,
             use_gpu_attn: false,
             score_accumulator: None,
+            profiler: None,
         })?;
 
         // Sample last token
@@ -609,6 +610,7 @@ fn main() -> anyhow::Result<()> {
             workspace: _gen_ws.as_mut(),
             use_gpu_attn: is_gpu,
             score_accumulator: score_accumulator.as_mut(),
+            profiler: None,
         })?;
 
         // ── Resilience checkpoint ─────────────────────────

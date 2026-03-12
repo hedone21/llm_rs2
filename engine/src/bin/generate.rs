@@ -82,6 +82,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gpu_attn: bool,
 
+    /// Enable per-layer operation profiling (prints timing breakdown at end).
+    #[arg(long, default_value_t = false)]
+    profile: bool,
+
     /// KV cache data type (f32, f16, or q4)
     #[arg(long, default_value = "q4")]
     kv_type: String,
@@ -695,6 +699,7 @@ fn main() -> anyhow::Result<()> {
             workspace: None,
             use_gpu_attn: args.gpu_attn,
             score_accumulator: None, // No score tracking during prefill
+            profiler: None,
         })?;
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
@@ -723,6 +728,13 @@ fn main() -> anyhow::Result<()> {
         tokens.push(next_token_id);
         start_pos += process_len;
     }
+
+    // Per-op profiler (only when --profile is set)
+    let mut op_profiler = if args.profile {
+        Some(llm_rs2::layers::llama_layer::OpProfiler::new())
+    } else {
+        None
+    };
 
     // === GENERATION PHASE ===
     {
@@ -805,6 +817,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: Some(&mut gen_ws),
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: score_accumulator.as_mut(),
+                profiler: op_profiler.as_mut(),
             })?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -1125,6 +1138,11 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // 6.5. Print profiler report if enabled
+    if let Some(ref profiler) = op_profiler {
+        profiler.print_report();
+    }
+
     // 7. Output results
     println!("\nDone.");
     println!("[Profile] Event: End");
@@ -1426,6 +1444,7 @@ fn run_eval_ll(
                 workspace: None,
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: None,
+                profiler: None,
             })?;
 
             let mut start_pos = first_chunk_len;
@@ -1462,6 +1481,7 @@ fn run_eval_ll(
                     workspace: Some(&mut gen_ws),
                     use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
+                    profiler: None,
                 })?;
                 start_pos += 1;
 
@@ -1525,6 +1545,7 @@ fn run_eval_ll(
                 workspace: None,
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: None,
+                profiler: None,
             })?;
 
             start_pos_after_prompt = prompt_len;
@@ -1591,6 +1612,7 @@ fn run_eval_ll(
                         workspace: Some(&mut gen_ws),
                         use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
+                        profiler: None,
                     })?;
                     sp += 1;
 
@@ -1819,6 +1841,7 @@ fn run_kivi(
             workspace: None,
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
+            profiler: None,
         })?;
 
         // Sample last token from prefill logits
@@ -1906,6 +1929,7 @@ fn run_kivi(
             workspace: Some(&mut gen_ws),
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
+            profiler: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -2192,6 +2216,7 @@ fn run_offload(
             workspace: None,
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
+            profiler: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2281,6 +2306,7 @@ fn run_offload(
             workspace: Some(&mut gen_ws),
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
+            profiler: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);

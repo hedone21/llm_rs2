@@ -166,6 +166,7 @@ impl LlamaLayer {
                 use_gpu_attn,
                 need_scores,
                 head_dim,
+                profiler: args.profiler,
             });
         }
 
@@ -458,7 +459,7 @@ impl LlamaLayer {
     }
 
     /// Fast path for single token generation using pre-allocated workspace.
-    fn forward_gen<C: KVCacheOps>(&self, args: LlamaForwardGenArgs<C>) -> Result<()> {
+    fn forward_gen<C: KVCacheOps>(&self, mut args: LlamaForwardGenArgs<C>) -> Result<()> {
         let x = args.x;
         let kv_cache = args.kv_cache;
         let start_pos = args.start_pos;
@@ -471,22 +472,44 @@ impl LlamaLayer {
 
         let batch_size = x.shape().dims()[0];
         let head_dim = args.head_dim;
+        let mut profiler = args.profiler.as_deref_mut();
+
+        macro_rules! prof_start {
+            () => {
+                if profiler.is_some() {
+                    std::time::Instant::now()
+                } else {
+                    // Dummy instant (never read)
+                    std::time::Instant::now()
+                }
+            };
+        }
+        macro_rules! prof_record {
+            ($t:expr, $field:ident) => {
+                if let Some(ref mut p) = profiler {
+                    p.$field += $t.elapsed().as_micros() as u64;
+                }
+            };
+        }
 
         // 1. Attention Norm
-        // x and ws.residual are tensors. Use copy_from for OpenCL compatibility (allocs new buffer but correct)
-
+        let t = prof_start!();
         ws.residual = backend.copy_from(x)?;
+        prof_record!(t, copy_residual);
 
+        let t = prof_start!();
         backend.rms_norm(x, &self.attention_norm, rms_norm_eps)?;
+        prof_record!(t, rms_norm);
 
         // 2. QKV Projections
-
+        let t = prof_start!();
         backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
         backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
         backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
+        prof_record!(t, matmul_qkv);
 
         // 3. RoPE
-
+        let t = prof_start!();
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
         let n_heads_q = q_dim / head_dim;
@@ -505,8 +528,10 @@ impl LlamaLayer {
 
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+        prof_record!(t, rope);
 
         // 4. KV Cache Update - cast to target dtype if needed
+        let t = prof_start!();
         let kv_dtype = kv_cache.kv_dtype();
         if kv_dtype != DType::F32 {
             let n_elem = n_heads_kv * head_dim;
@@ -532,8 +557,10 @@ impl LlamaLayer {
         } else {
             kv_cache.update(&k_rope, &ws.v)?;
         }
+        prof_record!(t, kv_update);
 
         // 5. Attention - use GPU kernel for OpenCL
+        let t = prof_start!();
         let cache_seq_len = kv_cache.current_pos();
         let (k_cache, v_cache) = kv_cache.get_view();
 
@@ -1021,34 +1048,56 @@ impl LlamaLayer {
         }
 
         // 6. Output Projection
+        prof_record!(t, attention);
 
+        let t = prof_start!();
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
+        prof_record!(t, matmul_wo);
 
         // 7. Residual 1
-
+        let t = prof_start!();
         backend.add_assign(&mut ws.attn_out, &ws.residual)?;
+        prof_record!(t, add_assign);
 
         // Copy to x for next stage
+        let t = prof_start!();
         *x = backend.copy_from(&ws.attn_out)?;
 
         // 8. FFN Norm
-
         ws.residual = backend.copy_from(x)?;
+        prof_record!(t, copy_residual);
+
+        let t = prof_start!();
         backend.rms_norm(x, &self.ffn_norm, rms_norm_eps)?;
+        prof_record!(t, rms_norm);
 
         // 9. FFN
-
+        let t = prof_start!();
         backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
         backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
+        prof_record!(t, matmul_ffn);
+
+        let t = prof_start!();
         backend.silu_mul(&mut ws.gate, &ws.up)?;
+        prof_record!(t, silu_mul);
+
+        let t = prof_start!();
         backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+        prof_record!(t, matmul_ffn);
 
         // 10. Residual 2
-
+        let t = prof_start!();
         backend.add_assign(&mut ws.down, &ws.residual)?;
+        prof_record!(t, add_assign);
 
         // Copy to x for next layer
+        let t = prof_start!();
         *x = backend.copy_from(&ws.down)?;
+        prof_record!(t, copy_residual);
+
+        if let Some(ref mut p) = profiler {
+            p.count += 1;
+        }
 
         Ok(())
     }
@@ -1228,6 +1277,8 @@ pub struct LlamaForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     /// Required for H2O/H2O+ score accumulation with Q4_0/F16 KV cache.
     pub need_scores: bool,
     pub head_dim: usize,
+    /// Optional per-op profiler for timing breakdown.
+    pub profiler: Option<&'a mut OpProfiler>,
 }
 
 pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -1242,6 +1293,99 @@ pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub use_gpu_attn: bool,
     pub need_scores: bool,
     pub head_dim: usize,
+    /// Optional per-op profiler for timing breakdown.
+    pub profiler: Option<&'a mut OpProfiler>,
+}
+
+/// Per-operation profiler for forward_gen timing breakdown.
+/// Accumulates microseconds per operation across layers and tokens.
+#[derive(Default)]
+pub struct OpProfiler {
+    pub rms_norm: u64,
+    pub matmul_qkv: u64,
+    pub rope: u64,
+    pub kv_update: u64,
+    pub attention: u64,
+    pub matmul_wo: u64,
+    pub matmul_ffn: u64,
+    pub silu_mul: u64,
+    pub add_assign: u64,
+    pub copy_residual: u64,
+    pub cast: u64,
+    pub count: u64,
+}
+
+impl OpProfiler {
+    pub fn new() -> Self {
+        Self {
+            rms_norm: 0,
+            matmul_qkv: 0,
+            rope: 0,
+            kv_update: 0,
+            attention: 0,
+            matmul_wo: 0,
+            matmul_ffn: 0,
+            silu_mul: 0,
+            add_assign: 0,
+            copy_residual: 0,
+            cast: 0,
+            count: 0,
+        }
+    }
+
+    pub fn print_report(&self) {
+        let total = self.rms_norm
+            + self.matmul_qkv
+            + self.rope
+            + self.kv_update
+            + self.attention
+            + self.matmul_wo
+            + self.matmul_ffn
+            + self.silu_mul
+            + self.add_assign
+            + self.copy_residual
+            + self.cast;
+        let n = if self.count > 0 { self.count } else { 1 };
+        let pct = |v: u64| -> f64 {
+            if total > 0 {
+                v as f64 / total as f64 * 100.0
+            } else {
+                0.0
+            }
+        };
+        eprintln!(
+            "\n[Profile] Per-op breakdown (accumulated over {} layer-calls):",
+            n
+        );
+        eprintln!(
+            "  {:<20} {:>10} {:>10} {:>8}",
+            "Operation", "Total(us)", "Avg(us)", "%"
+        );
+        eprintln!("  {:-<20} {:-<10} {:-<10} {:-<8}", "", "", "", "");
+        let ops = [
+            ("matmul_qkv", self.matmul_qkv),
+            ("matmul_wo", self.matmul_wo),
+            ("matmul_ffn", self.matmul_ffn),
+            ("attention", self.attention),
+            ("rms_norm", self.rms_norm),
+            ("rope", self.rope),
+            ("silu_mul", self.silu_mul),
+            ("add_assign", self.add_assign),
+            ("copy_residual", self.copy_residual),
+            ("kv_update", self.kv_update),
+            ("cast", self.cast),
+        ];
+        for (name, val) in &ops {
+            eprintln!(
+                "  {:<20} {:>10} {:>10} {:>7.1}%",
+                name,
+                val,
+                val / n,
+                pct(*val)
+            );
+        }
+        eprintln!("  {:<20} {:>10} {:>10}", "TOTAL", total, total / n,);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════

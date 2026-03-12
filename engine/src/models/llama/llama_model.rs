@@ -52,6 +52,8 @@ pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Optional attention score accumulator for H2O-style eviction.
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
+    /// Optional per-op profiler.
+    pub profiler: Option<&'a mut crate::layers::llama_layer::OpProfiler>,
 }
 
 impl LlamaModel {
@@ -333,6 +335,7 @@ impl LlamaModel {
                 use_gpu_attn: true,
                 need_scores: false,
                 head_dim: self.config.head_dim,
+                profiler: None,
             })?;
         }
 
@@ -368,6 +371,7 @@ impl LlamaModel {
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
         let use_gpu_attn = args.use_gpu_attn;
+        let mut profiler = args.profiler;
 
         let mut score_accumulator = args.score_accumulator;
 
@@ -418,6 +422,7 @@ impl LlamaModel {
                 use_gpu_attn,
                 need_scores,
                 head_dim: self.config.head_dim,
+                profiler: profiler.as_deref_mut(),
             })?;
 
             // Capture attention scores for H2O/H2O+ accumulator
@@ -532,6 +537,7 @@ impl LlamaModel {
                         use_gpu_attn,
                         need_scores: false,
                         head_dim: self.config.head_dim,
+                        profiler: None,
                     });
 
                     // Wait for preload and handle errors (R-P7)
@@ -567,6 +573,7 @@ impl LlamaModel {
                     use_gpu_attn,
                     need_scores: false,
                     head_dim: self.config.head_dim,
+                    profiler: None,
                 })?;
 
                 // Release last layer's buffers
