@@ -42,7 +42,7 @@ impl LlamaLayer {
         let batch_size = x.shape().dims()[0];
         let seq_len = x.shape().dims()[1];
         let dim = x.shape().dims()[2];
-        let head_dim = 64;
+        let head_dim = args.head_dim;
 
         let need_scores = args.need_scores;
 
@@ -60,6 +60,7 @@ impl LlamaLayer {
                 rope_theta,
                 use_gpu_attn,
                 need_scores,
+                head_dim,
             });
         }
 
@@ -364,7 +365,7 @@ impl LlamaLayer {
         let use_gpu_attn = args.use_gpu_attn;
 
         let batch_size = x.shape().dims()[0];
-        let head_dim = 64;
+        let head_dim = args.head_dim;
 
         // 1. Attention Norm
         // x and ws.residual are tensors. Use copy_from for OpenCL compatibility (allocs new buffer but correct)
@@ -990,7 +991,7 @@ impl LlamaLayer {
                     let kv_h = h / n_rep;
                     let q_off = h * head_dim;
                     let q_vec = &q_data[q_off..q_off + head_dim];
-                    let mut kv_f32 = [0.0f32; 128]; // max head_dim
+                    let mut kv_f32 = vec![0.0f32; head_dim];
 
                     for t in 0..cache_seq_len {
                         let block_off = if is_head_major {
@@ -1046,7 +1047,7 @@ impl LlamaLayer {
                     let kv_h = h / n_rep;
                     let q_off = h * head_dim;
                     let q_vec = &q_data[q_off..q_off + head_dim];
-                    let mut kv_f32 = [0.0f32; 128];
+                    let mut kv_f32 = vec![0.0f32; head_dim];
 
                     for t in 0..cache_seq_len {
                         let off = if is_head_major {
@@ -1100,6 +1101,7 @@ pub struct LlamaForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     /// When true, compute attention scores into ws.scores even for non-F32 KV cache.
     /// Required for H2O/H2O+ score accumulation with Q4_0/F16 KV cache.
     pub need_scores: bool,
+    pub head_dim: usize,
 }
 
 pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -1113,6 +1115,7 @@ pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub workspace: Option<&'a mut super::workspace::LayerWorkspace>,
     pub use_gpu_attn: bool,
     pub need_scores: bool,
+    pub head_dim: usize,
 }
 
 // ═══════════════════════════════════════════════════════════════════

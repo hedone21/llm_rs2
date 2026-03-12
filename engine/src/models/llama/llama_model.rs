@@ -332,6 +332,7 @@ impl LlamaModel {
                 workspace: None,
                 use_gpu_attn: true,
                 need_scores: false,
+                head_dim: self.config.head_dim,
             })?;
         }
 
@@ -416,6 +417,7 @@ impl LlamaModel {
                 workspace: workspace.as_deref_mut(),
                 use_gpu_attn,
                 need_scores,
+                head_dim: self.config.head_dim,
             })?;
 
             // Capture attention scores for H2O/H2O+ accumulator
@@ -529,6 +531,7 @@ impl LlamaModel {
                         workspace: workspace.as_deref_mut(),
                         use_gpu_attn,
                         need_scores: false,
+                        head_dim: self.config.head_dim,
                     });
 
                     // Wait for preload and handle errors (R-P7)
@@ -563,6 +566,7 @@ impl LlamaModel {
                     workspace: workspace.as_deref_mut(),
                     use_gpu_attn,
                     need_scores: false,
+                    head_dim: self.config.head_dim,
                 })?;
 
                 // Release last layer's buffers
