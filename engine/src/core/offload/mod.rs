@@ -1029,6 +1029,443 @@ mod tests {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    //  Phase 3 Benchmark: Sync vs Preload, Memory Analysis
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_bench_preload_vs_sync_and_memory() {
+        // Llama 3.2 1B-scale parameters
+        let kv_heads = 8;
+        let head_dim = 64;
+        let num_layers = 16;
+        let max_seq_len = 2048;
+        let prefill_len = 64;
+        let decode_steps = 128;
+
+        let token_bytes_f16 = kv_heads * head_dim * 2; // 1024 bytes/token
+        let token_bytes_f32 = kv_heads * head_dim * 4; // 2048 bytes/token
+
+        println!("\n╔══════════════════════════════════════════════════════════════════╗");
+        println!("║  Phase 3 KV Offload Benchmark: Sync vs Preload + Memory        ║");
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  Config: kv_heads={}, head_dim={}, layers={}, max_seq={}",
+            kv_heads, head_dim, num_layers, max_seq_len
+        );
+        println!("║  Prefill={}, Decode={}", prefill_len, decode_steps);
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+
+        let total_tokens = prefill_len + decode_steps;
+
+        // ── Helper: create N-layer caches and run decode simulation ──
+        let run_decode_bench = |mode: &str,
+                                dtype: DType,
+                                use_preload: bool|
+         -> (f64, f64, f64, usize, usize) {
+            let token_bytes = kv_heads * head_dim * dtype.size();
+            let mut caches: Vec<OffloadKVCache> = (0..num_layers)
+                .map(|layer_id| {
+                    let store: Box<dyn store::OffloadStore> = match mode {
+                        "zram" => {
+                            Box::new(zram_store::ZramStore::new(token_bytes, dtype.size(), 64))
+                        }
+                        "disk" => {
+                            let dir = std::env::temp_dir()
+                                .join(format!("llm_rs2_bench3_{}_{:?}_{}", mode, dtype, layer_id));
+                            Box::new(
+                                disk_store::DiskStore::new(&dir, layer_id, token_bytes).unwrap(),
+                            )
+                        }
+                        _ => unreachable!(),
+                    };
+                    OffloadKVCache::new(layer_id, kv_heads, head_dim, dtype, max_seq_len, store)
+                })
+                .collect();
+
+            // Prefill
+            let k_pf = if dtype == DType::F32 {
+                make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0)
+            } else {
+                make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00)
+            };
+            let v_pf = if dtype == DType::F32 {
+                make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0)
+            } else {
+                make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00)
+            };
+            for c in caches.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+
+            // Decode loop
+            let decode_start = std::time::Instant::now();
+            let mut total_io_us = 0u64;
+            let mut total_getview_us = 0u64;
+
+            for step in 0..decode_steps {
+                // Generate per-step token data
+                let k_tok = if dtype == DType::F32 {
+                    make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * step as f32)
+                } else {
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3))
+                };
+                let v_tok = if dtype == DType::F32 {
+                    make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * step as f32)
+                } else {
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5))
+                };
+
+                if use_preload {
+                    // Reset preload flags
+                    for c in caches.iter_mut() {
+                        c.reset_preload();
+                    }
+
+                    // Update all layers
+                    for c in caches.iter_mut() {
+                        c.update(&k_tok, &v_tok).unwrap();
+                    }
+
+                    // Preload layer 0
+                    caches[0].preload().unwrap();
+
+                    // Pipeline: compute(layer i) || preload(layer i+1)
+                    for i in 0..num_layers {
+                        if i + 1 < num_layers {
+                            let (left, right) = caches.split_at_mut(i + 1);
+                            let current = &mut left[i];
+                            let next = &mut right[0];
+
+                            std::thread::scope(|s| {
+                                let io_start = std::time::Instant::now();
+                                let handle = s.spawn(|| next.preload().unwrap());
+
+                                let gv_start = std::time::Instant::now();
+                                let _ = current.get_view();
+                                total_getview_us += gv_start.elapsed().as_micros() as u64;
+
+                                handle.join().unwrap();
+                                total_io_us += io_start.elapsed().as_micros() as u64;
+                            });
+
+                            if i > 0 {
+                                caches[i - 1].release_buffers();
+                            }
+                        } else {
+                            let gv_start = std::time::Instant::now();
+                            let _ = caches[i].get_view();
+                            total_getview_us += gv_start.elapsed().as_micros() as u64;
+                            caches[i].release_buffers();
+                        }
+                    }
+                } else {
+                    // Sync: update + get_view for all layers
+                    for c in caches.iter_mut() {
+                        c.update(&k_tok, &v_tok).unwrap();
+                    }
+                    for c in caches.iter_mut() {
+                        let gv_start = std::time::Instant::now();
+                        let _ = c.get_view();
+                        total_getview_us += gv_start.elapsed().as_micros() as u64;
+                    }
+                }
+            }
+            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+            let avg_per_token_ms = decode_ms / decode_steps as f64;
+            let avg_getview_us = total_getview_us as f64 / (decode_steps * num_layers) as f64;
+
+            // Memory analysis
+            let store_mem: usize = caches.iter().map(|c| c.memory_usage_bytes()).sum();
+            let attn_buf_mem: usize = caches
+                .iter()
+                .map(|c| {
+                    c.attn_k_buf.as_ref().map_or(0, |b| b.len())
+                        + c.attn_v_buf.as_ref().map_or(0, |b| b.len())
+                })
+                .sum();
+
+            (
+                decode_ms,
+                avg_per_token_ms,
+                avg_getview_us,
+                store_mem,
+                attn_buf_mem,
+            )
+        };
+
+        // ── Baseline: KVCache F32 ──
+        let base_start = std::time::Instant::now();
+        {
+            let mut bases: Vec<KVCache> = (0..num_layers)
+                .map(|_| make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F32))
+                .collect();
+            let k_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
+            let v_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
+            for c in bases.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+            for step in 0..decode_steps {
+                let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * step as f32);
+                let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * step as f32);
+                for c in bases.iter_mut() {
+                    c.update(&k, &v).unwrap();
+                    let _ = KVCacheOps::get_view(c);
+                }
+            }
+        }
+        let base_ms = base_start.elapsed().as_secs_f64() * 1000.0;
+        let base_per_tok = base_ms / decode_steps as f64;
+        // BASE memory: 16 layers × max_seq_len × kv_heads × head_dim × 4 × 2 (K+V)
+        let base_mem = num_layers * max_seq_len * kv_heads * head_dim * 4 * 2;
+
+        // ── Baseline: KVCache F16 ──
+        let base_f16_start = std::time::Instant::now();
+        {
+            let mut bases: Vec<KVCache> = (0..num_layers)
+                .map(|_| make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F16))
+                .collect();
+            let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
+            let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
+            for c in bases.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+            for step in 0..decode_steps {
+                let k =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
+                let v =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
+                for c in bases.iter_mut() {
+                    c.update(&k, &v).unwrap();
+                    let _ = KVCacheOps::get_view(c);
+                }
+            }
+        }
+        let base_f16_ms = base_f16_start.elapsed().as_secs_f64() * 1000.0;
+        let base_f16_per_tok = base_f16_ms / decode_steps as f64;
+        let base_f16_mem = num_layers * max_seq_len * kv_heads * head_dim * 2 * 2;
+
+        // ── ZramStore F16: Sync ──
+        let (zram_f16_sync_ms, zram_f16_sync_pt, zram_f16_sync_gv, zram_f16_store, _) =
+            run_decode_bench("zram", DType::F16, false);
+
+        // ── ZramStore F16: Preload ──
+        let (
+            zram_f16_pre_ms,
+            zram_f16_pre_pt,
+            zram_f16_pre_gv,
+            zram_f16_pre_store,
+            zram_f16_pre_attn,
+        ) = run_decode_bench("zram", DType::F16, true);
+
+        // ── ZramStore F32: Sync ──
+        let (zram_f32_sync_ms, zram_f32_sync_pt, zram_f32_sync_gv, zram_f32_store, _) =
+            run_decode_bench("zram", DType::F32, false);
+
+        // ── ZramStore F32: Preload ──
+        let (
+            zram_f32_pre_ms,
+            zram_f32_pre_pt,
+            zram_f32_pre_gv,
+            zram_f32_pre_store,
+            zram_f32_pre_attn,
+        ) = run_decode_bench("zram", DType::F32, true);
+
+        // ── DiskStore F16: Sync ──
+        let (disk_f16_sync_ms, disk_f16_sync_pt, disk_f16_sync_gv, disk_f16_store, _) =
+            run_decode_bench("disk", DType::F16, false);
+
+        // ── DiskStore F16: Preload ──
+        let (disk_f16_pre_ms, disk_f16_pre_pt, disk_f16_pre_gv, _, disk_f16_pre_attn) =
+            run_decode_bench("disk", DType::F16, true);
+
+        let raw_f16_kv = total_tokens * token_bytes_f16 * 2 * num_layers; // K+V, all layers
+        let raw_f32_kv = total_tokens * token_bytes_f32 * 2 * num_layers;
+
+        // ═══ Performance Report ═══
+        println!("║");
+        println!(
+            "║  {:30} {:>8} {:>10} {:>10} {:>8}",
+            "Configuration", "Total", "Per-Token", "get_view", "vs BASE"
+        );
+        println!(
+            "║  {:30} {:>8} {:>10} {:>10} {:>8}",
+            "", "(ms)", "(ms/tok)", "(μs/call)", ""
+        );
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10} {:>8}",
+            "BASE KVCache F32", base_ms, base_per_tok, "—", "1.0x"
+        );
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10} {:>8}",
+            "BASE KVCache F16",
+            base_f16_ms,
+            base_f16_per_tok,
+            "—",
+            format!("{:.1}x", base_f16_ms / base_ms)
+        );
+        println!("║  ──────────────────────────────────────────────────────────────");
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
+            "ZramStore F16 (sync)",
+            zram_f16_sync_ms,
+            zram_f16_sync_pt,
+            zram_f16_sync_gv,
+            format!("{:.1}x", zram_f16_sync_ms / base_f16_ms)
+        );
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
+            "ZramStore F16 (preload)",
+            zram_f16_pre_ms,
+            zram_f16_pre_pt,
+            zram_f16_pre_gv,
+            format!("{:.1}x", zram_f16_pre_ms / base_f16_ms)
+        );
+        let f16_speedup = zram_f16_sync_ms / zram_f16_pre_ms;
+        println!("║    ↳ preload speedup vs sync: {:.2}x", f16_speedup);
+        println!("║  ──────────────────────────────────────────────────────────────");
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
+            "ZramStore F32 (sync)",
+            zram_f32_sync_ms,
+            zram_f32_sync_pt,
+            zram_f32_sync_gv,
+            format!("{:.1}x", zram_f32_sync_ms / base_ms)
+        );
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
+            "ZramStore F32 (preload)",
+            zram_f32_pre_ms,
+            zram_f32_pre_pt,
+            zram_f32_pre_gv,
+            format!("{:.1}x", zram_f32_pre_ms / base_ms)
+        );
+        let f32_speedup = zram_f32_sync_ms / zram_f32_pre_ms;
+        println!("║    ↳ preload speedup vs sync: {:.2}x", f32_speedup);
+        println!("║  ──────────────────────────────────────────────────────────────");
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
+            "DiskStore F16 (sync)",
+            disk_f16_sync_ms,
+            disk_f16_sync_pt,
+            disk_f16_sync_gv,
+            format!("{:.1}x", disk_f16_sync_ms / base_f16_ms)
+        );
+        println!(
+            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
+            "DiskStore F16 (preload)",
+            disk_f16_pre_ms,
+            disk_f16_pre_pt,
+            disk_f16_pre_gv,
+            format!("{:.1}x", disk_f16_pre_ms / base_f16_ms)
+        );
+        let disk_speedup = disk_f16_sync_ms / disk_f16_pre_ms;
+        println!("║    ↳ preload speedup vs sync: {:.2}x", disk_speedup);
+
+        // ═══ Memory Report ═══
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  MEMORY ANALYSIS (at {} tokens, {} layers)",
+            total_tokens, num_layers
+        );
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:30} {:>10} {:>10} {:>10} {:>8}",
+            "Configuration", "KV Data", "Attn Buf", "Total", "vs BASE"
+        );
+        println!("║  ──────────────────────────────────────────────────────────────");
+        println!(
+            "║  {:30} {:>9}K {:>10} {:>9}K {:>8}",
+            "BASE KVCache F32",
+            base_mem / 1024,
+            "—",
+            base_mem / 1024,
+            "1.0x"
+        );
+        println!(
+            "║  {:30} {:>9}K {:>10} {:>9}K {:>8}",
+            "BASE KVCache F16",
+            base_f16_mem / 1024,
+            "—",
+            base_f16_mem / 1024,
+            "1.0x"
+        );
+        println!("║  ──────────────────────────────────────────────────────────────");
+
+        let zram_f16_total = zram_f16_pre_store + zram_f16_pre_attn;
+        let zram_f16_savings = 1.0 - (zram_f16_total as f64 / base_f16_mem as f64);
+        println!(
+            "║  {:30} {:>9}K {:>9}K {:>9}K {:>7.0}%",
+            "ZramStore F16 (preload)",
+            zram_f16_pre_store / 1024,
+            zram_f16_pre_attn / 1024,
+            zram_f16_total / 1024,
+            zram_f16_savings * 100.0
+        );
+        println!(
+            "║    ↳ store compression: {:.2}x (raw {}K → {}K)",
+            raw_f16_kv as f64 / zram_f16_pre_store.max(1) as f64,
+            raw_f16_kv / 1024,
+            zram_f16_pre_store / 1024,
+        );
+
+        let zram_f32_total = zram_f32_pre_store + zram_f32_pre_attn;
+        let zram_f32_savings = 1.0 - (zram_f32_total as f64 / base_mem as f64);
+        println!(
+            "║  {:30} {:>9}K {:>9}K {:>9}K {:>7.0}%",
+            "ZramStore F32 (preload)",
+            zram_f32_pre_store / 1024,
+            zram_f32_pre_attn / 1024,
+            zram_f32_total / 1024,
+            zram_f32_savings * 100.0
+        );
+        println!(
+            "║    ↳ store compression: {:.2}x (raw {}K → {}K)",
+            raw_f32_kv as f64 / zram_f32_pre_store.max(1) as f64,
+            raw_f32_kv / 1024,
+            zram_f32_pre_store / 1024,
+        );
+
+        let disk_f16_total = disk_f16_store + disk_f16_pre_attn;
+        let disk_f16_savings = 1.0 - (disk_f16_total as f64 / base_f16_mem as f64);
+        println!(
+            "║  {:30} {:>9}K {:>9}K {:>9}K {:>7.0}%",
+            "DiskStore F16 (preload)",
+            disk_f16_store / 1024,
+            disk_f16_pre_attn / 1024,
+            disk_f16_total / 1024,
+            disk_f16_savings * 100.0
+        );
+        println!("║    ↳ NOTE: disk store KB = file size (data on disk, not in RAM)",);
+
+        // Attn buffer analysis
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!("║  ATTN BUFFER ANALYSIS (preload mode)");
+        println!("║  ──────────────────────────────────────────────────────────────");
+        let max_attn_f16 = 2 * max_seq_len * token_bytes_f16; // 2 layers (K+V)
+        let max_attn_f32 = 2 * max_seq_len * token_bytes_f32;
+        let naive_attn_f16 = num_layers * max_seq_len * token_bytes_f16 * 2;
+        let naive_attn_f32 = num_layers * max_seq_len * token_bytes_f32 * 2;
+        println!(
+            "║  F16: active={} layers × {}K = {}K  (naive 16 layers = {}K, saving {:.0}%)",
+            2,
+            max_seq_len * token_bytes_f16 / 1024,
+            max_attn_f16 / 1024,
+            naive_attn_f16 / 1024,
+            (1.0 - max_attn_f16 as f64 / naive_attn_f16 as f64) * 100.0,
+        );
+        println!(
+            "║  F32: active={} layers × {}K = {}K  (naive 16 layers = {}K, saving {:.0}%)",
+            2,
+            max_seq_len * token_bytes_f32 / 1024,
+            max_attn_f32 / 1024,
+            naive_attn_f32 / 1024,
+            (1.0 - max_attn_f32 as f64 / naive_attn_f32 as f64) * 100.0,
+        );
+        println!("╚══════════════════════════════════════════════════════════════════╝\n");
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     //  Preload / Prefetch Tests
     // ════════════════════════════════════════════════════════════════════════
 
