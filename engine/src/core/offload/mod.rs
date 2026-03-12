@@ -29,7 +29,11 @@ use self::store::OffloadStore;
 /// Implements `KVCacheOps` so it can be used as a drop-in replacement in the
 /// generic `forward_into<C: KVCacheOps>` path.
 ///
-/// Phase 1: SeqMajor layout only. No eviction support.
+/// Phase 3 design: lazy attn buffers + per-layer prefetch support.
+/// Only 2 layers hold attn buffers simultaneously (current + next), saving ~75% memory
+/// vs pre-allocating all layers.
+///
+/// SeqMajor layout only. No eviction support.
 pub struct OffloadKVCache {
     /// Layer index (for debug/logging).
     layer_id: usize,
@@ -47,16 +51,23 @@ pub struct OffloadKVCache {
     token_bytes: usize,
     /// The backing store (DiskStore or ZramStore).
     store: Box<dyn OffloadStore>,
-    /// Pre-allocated attention output buffer for K.
-    attn_k_buf: Vec<u8>,
-    /// Pre-allocated attention output buffer for V.
-    attn_v_buf: Vec<u8>,
+    /// Lazy-allocated attention buffer for K. Allocated on preload(), freed on release_buffers().
+    attn_k_buf: Option<Vec<u8>>,
+    /// Lazy-allocated attention buffer for V. Allocated on preload(), freed on release_buffers().
+    attn_v_buf: Option<Vec<u8>>,
+    /// Whether preload() has been called and data is ready in attn buffers.
+    preloaded: bool,
+    /// Reusable output SharedBuffer for K (R-P2: avoid per-call allocation).
+    out_k_buf: Option<Arc<SharedBuffer>>,
+    /// Reusable output SharedBuffer for V (R-P2: avoid per-call allocation).
+    out_v_buf: Option<Arc<SharedBuffer>>,
     /// Shared CPU backend for creating output tensors.
     out_backend: Arc<CpuBackend>,
 }
 
 impl OffloadKVCache {
     /// Create a new OffloadKVCache wrapping the given store.
+    /// Attn buffers are lazy-allocated (None until preload() or get_view()).
     pub fn new(
         layer_id: usize,
         kv_heads: usize,
@@ -66,7 +77,6 @@ impl OffloadKVCache {
         store: Box<dyn OffloadStore>,
     ) -> Self {
         let token_bytes = kv_heads * head_dim * dtype.size();
-        let max_bytes = max_seq_len * token_bytes;
 
         Self {
             layer_id,
@@ -77,8 +87,11 @@ impl OffloadKVCache {
             max_seq_len,
             token_bytes,
             store,
-            attn_k_buf: vec![0u8; max_bytes],
-            attn_v_buf: vec![0u8; max_bytes],
+            attn_k_buf: None,
+            attn_v_buf: None,
+            preloaded: false,
+            out_k_buf: None,
+            out_v_buf: None,
             out_backend: Arc::new(CpuBackend::new()),
         }
     }
@@ -99,6 +112,54 @@ impl OffloadKVCache {
     /// Get a reference to the underlying store (for compression ratio queries etc).
     pub fn store(&self) -> &dyn OffloadStore {
         self.store.as_ref()
+    }
+
+    /// Pre-load KV data from store into attn buffers.
+    /// Called by the prefetch pipeline to overlap I/O with compute.
+    /// If attn buffers are not allocated, they are lazily created.
+    pub fn preload(&mut self) -> Result<()> {
+        let total_bytes = self.current_pos * self.token_bytes;
+        if total_bytes == 0 {
+            self.preloaded = true;
+            return Ok(());
+        }
+
+        let max_bytes = self.max_seq_len * self.token_bytes;
+        let k_buf = self.attn_k_buf.get_or_insert_with(|| vec![0u8; max_bytes]);
+        let v_buf = self.attn_v_buf.get_or_insert_with(|| vec![0u8; max_bytes]);
+
+        self.store
+            .load_into(&mut k_buf[..total_bytes], &mut v_buf[..total_bytes])?;
+        self.preloaded = true;
+        Ok(())
+    }
+
+    /// Release attn buffers to free memory (R-P1: only 2 layers active at once).
+    pub fn release_buffers(&mut self) {
+        self.attn_k_buf = None;
+        self.attn_v_buf = None;
+        self.preloaded = false;
+    }
+
+    /// Reset preloaded flag (R-P5: call at token boundary).
+    pub fn reset_preload(&mut self) {
+        self.preloaded = false;
+    }
+
+    /// Allocate or reuse a SharedBuffer of the given size.
+    fn reuse_or_alloc_out_buf(
+        slot: &mut Option<Arc<SharedBuffer>>,
+        needed_bytes: usize,
+        dtype: DType,
+    ) -> Arc<SharedBuffer> {
+        if let Some(buf) = slot.as_ref()
+            && buf.size() >= needed_bytes
+        {
+            return buf.clone();
+        }
+        let buf = Arc::new(SharedBuffer::new(needed_bytes, dtype));
+        *slot = Some(buf.clone());
+        buf
     }
 }
 
@@ -155,10 +216,17 @@ impl KVCacheOps for OffloadKVCache {
         if seq_len == 1 {
             // Decode path: single token append
             self.store.append_token(k_data, v_data)?;
+
+            // If preloaded, also append to attn buffers (avoid re-load in get_view)
+            if self.preloaded
+                && let (Some(k_buf), Some(v_buf)) = (&mut self.attn_k_buf, &mut self.attn_v_buf)
+            {
+                let offset = self.current_pos * self.token_bytes;
+                k_buf[offset..offset + self.token_bytes].copy_from_slice(k_data);
+                v_buf[offset..offset + self.token_bytes].copy_from_slice(v_data);
+            }
         } else {
             // Prefill or multi-token: batch store
-            // If we already have data, this is an error in Phase 1
-            // (we don't support incremental multi-token append to existing data)
             if self.current_pos == 0 {
                 self.store.store(k_data, v_data, seq_len)?;
             } else {
@@ -188,36 +256,37 @@ impl KVCacheOps for OffloadKVCache {
             return (t.clone(), t);
         }
 
-        // Load data from store into pre-allocated buffers
         let total_bytes = total * self.token_bytes;
-        if let Err(e) = self.store.load_into(
-            &mut self.attn_k_buf[..total_bytes],
-            &mut self.attn_v_buf[..total_bytes],
-        ) {
-            log::error!("OffloadKVCache[{}] load failed: {}", self.layer_id, e);
-            // Return empty tensors on error
-            let buf = Arc::new(SharedBuffer::new(0, self.dtype));
-            let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
-            let t = Tensor::new(shape.clone(), buf.clone(), backend.clone());
-            return (t.clone(), t);
+        let max_bytes = self.max_seq_len * self.token_bytes;
+
+        // Lazy-allocate attn buffers if needed
+        let k_attn = self.attn_k_buf.get_or_insert_with(|| vec![0u8; max_bytes]);
+        let v_attn = self.attn_v_buf.get_or_insert_with(|| vec![0u8; max_bytes]);
+
+        if !self.preloaded {
+            // Synchronous fallback: load from store
+            if let Err(e) = self
+                .store
+                .load_into(&mut k_attn[..total_bytes], &mut v_attn[..total_bytes])
+            {
+                log::error!("OffloadKVCache[{}] load failed: {}", self.layer_id, e);
+                let buf = Arc::new(SharedBuffer::new(0, self.dtype));
+                let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
+                let t = Tensor::new(shape.clone(), buf.clone(), backend.clone());
+                return (t.clone(), t);
+            }
         }
+        // Reset preloaded after consumption
+        self.preloaded = false;
 
         let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
 
-        // Create output buffers and copy data
-        let k_buf = Arc::new(SharedBuffer::new(total_bytes, self.dtype));
-        let v_buf = Arc::new(SharedBuffer::new(total_bytes, self.dtype));
+        // R-P2: Reuse output SharedBuffers when possible
+        let k_buf = Self::reuse_or_alloc_out_buf(&mut self.out_k_buf, total_bytes, self.dtype);
+        let v_buf = Self::reuse_or_alloc_out_buf(&mut self.out_v_buf, total_bytes, self.dtype);
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.attn_k_buf.as_ptr(),
-                k_buf.as_mut_ptr(),
-                total_bytes,
-            );
-            std::ptr::copy_nonoverlapping(
-                self.attn_v_buf.as_ptr(),
-                v_buf.as_mut_ptr(),
-                total_bytes,
-            );
+            std::ptr::copy_nonoverlapping(k_attn.as_ptr(), k_buf.as_mut_ptr(), total_bytes);
+            std::ptr::copy_nonoverlapping(v_attn.as_ptr(), v_buf.as_mut_ptr(), total_bytes);
         }
 
         let k_tensor = Tensor::new(shape.clone(), k_buf, backend.clone());
@@ -957,5 +1026,242 @@ mod tests {
             zram_f32_ratio >= 1.2,
             "ZramStore F32 compression ratio {zram_f32_ratio:.2}x too low"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Preload / Prefetch Tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_preload_skips_io_in_get_view() {
+        // After preload(), get_view() should NOT call store.load_into() again.
+        // Verify by comparing data: preloaded get_view == non-preloaded get_view.
+        let kv_heads = 2;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Store some data
+        let k = make_f32_tensor_with_data(
+            &(0..kv_heads * head_dim)
+                .map(|i| i as f32)
+                .collect::<Vec<_>>(),
+            1,
+            kv_heads,
+            head_dim,
+        );
+        let v = make_f32_tensor_with_data(
+            &(0..kv_heads * head_dim)
+                .map(|i| 100.0 + i as f32)
+                .collect::<Vec<_>>(),
+            1,
+            kv_heads,
+            head_dim,
+        );
+        cache.update(&k, &v).unwrap();
+
+        // Preload then get_view
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+        let (k1, v1) = cache.get_view();
+        assert!(!cache.preloaded, "preloaded should be reset after get_view");
+
+        // Non-preloaded get_view (sync fallback)
+        let (k2, v2) = cache.get_view();
+
+        let k1_data = k1.as_slice::<f32>();
+        let k2_data = k2.as_slice::<f32>();
+        let v1_data = v1.as_slice::<f32>();
+        let v2_data = v2.as_slice::<f32>();
+        assert_eq!(k1_data, k2_data, "preloaded vs sync K mismatch");
+        assert_eq!(v1_data, v2_data, "preloaded vs sync V mismatch");
+    }
+
+    #[test]
+    fn test_preload_update_append_to_attn_buf() {
+        // When preloaded, update(seq_len=1) should append to attn buffers too.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Prefill
+        let k0: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let v0: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0];
+        cache
+            .update(
+                &make_f32_tensor_with_data(&k0, 1, kv_heads, head_dim),
+                &make_f32_tensor_with_data(&v0, 1, kv_heads, head_dim),
+            )
+            .unwrap();
+
+        // Preload (loads 1 token into attn buf)
+        cache.preload().unwrap();
+
+        // Decode: append 1 token while preloaded
+        let k1: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+        let v1: Vec<f32> = vec![50.0, 60.0, 70.0, 80.0];
+        cache
+            .update(
+                &make_f32_tensor_with_data(&k1, 1, kv_heads, head_dim),
+                &make_f32_tensor_with_data(&v1, 1, kv_heads, head_dim),
+            )
+            .unwrap();
+        assert_eq!(cache.current_pos(), 2);
+
+        // get_view should return both tokens without re-loading
+        // (preloaded + appended to attn buf)
+        let (k_view, v_view) = cache.get_view();
+        let k_data = k_view.as_slice::<f32>();
+        let v_data = v_view.as_slice::<f32>();
+
+        assert_eq!(&k_data[..4], &k0);
+        assert_eq!(&k_data[4..8], &k1);
+        assert_eq!(&v_data[..4], &v0);
+        assert_eq!(&v_data[4..8], &v1);
+    }
+
+    #[test]
+    fn test_release_buffers_frees_memory() {
+        let kv_heads = 2;
+        let head_dim = 32;
+        let token_bytes = kv_heads * head_dim * 2;
+        let store = zram_store::ZramStore::new(token_bytes, 2, 64);
+        let mut cache =
+            OffloadKVCache::new(0, kv_heads, head_dim, DType::F16, 256, Box::new(store));
+
+        // Trigger allocation via preload
+        let k = make_test_tensor(4, kv_heads, head_dim, DType::F16, 0xAA);
+        let v = make_test_tensor(4, kv_heads, head_dim, DType::F16, 0xBB);
+        cache.update(&k, &v).unwrap();
+        cache.preload().unwrap();
+        assert!(cache.attn_k_buf.is_some());
+        assert!(cache.attn_v_buf.is_some());
+
+        // Release
+        cache.release_buffers();
+        assert!(cache.attn_k_buf.is_none());
+        assert!(cache.attn_v_buf.is_none());
+        assert!(!cache.preloaded);
+
+        // get_view should still work (sync fallback with fresh allocation)
+        let (k_view, _) = cache.get_view();
+        assert_eq!(k_view.shape().dims(), &[1, 4, kv_heads, head_dim]);
+    }
+
+    #[test]
+    fn test_preload_concurrent_split_at_mut() {
+        // Simulate the per-layer prefetch pattern: split_at_mut + thread::scope.
+        let kv_heads = 2;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+
+        let mut caches: Vec<OffloadKVCache> = (0..4)
+            .map(|i| {
+                let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+                let mut c =
+                    OffloadKVCache::new(i, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+                // Prefill each cache with 2 tokens
+                let k = make_realistic_f32_tensor(2, kv_heads, head_dim, i as f32);
+                let v = make_realistic_f32_tensor(2, kv_heads, head_dim, i as f32 + 10.0);
+                c.update(&k, &v).unwrap();
+                c
+            })
+            .collect();
+
+        // Preload layer 0
+        caches[0].preload().unwrap();
+
+        // Simulate pipeline: compute layer i while preloading layer i+1
+        for i in 0..3 {
+            let (left, right) = caches.split_at_mut(i + 1);
+            let current = &mut left[i];
+            let next = &mut right[0];
+
+            std::thread::scope(|s| {
+                let handle = s.spawn(|| next.preload());
+                // "Compute" on current layer (just read the view)
+                let (k, v) = current.get_view();
+                assert_eq!(k.shape().dims(), &[1, 2, kv_heads, head_dim]);
+                assert_eq!(v.shape().dims(), &[1, 2, kv_heads, head_dim]);
+                handle.join().unwrap().unwrap();
+            });
+
+            // Release previous layer's buffers
+            if i > 0 {
+                caches[i - 1].release_buffers();
+            }
+        }
+
+        // Final layer
+        let last = caches.len() - 1;
+        let (k, v) = caches[last].get_view();
+        assert_eq!(k.shape().dims(), &[1, 2, kv_heads, head_dim]);
+        assert_eq!(v.shape().dims(), &[1, 2, kv_heads, head_dim]);
+    }
+
+    #[test]
+    fn test_preload_empty_cache() {
+        // preload() on empty cache should succeed
+        let store = zram_store::ZramStore::new(32, 4, 8);
+        let mut cache = OffloadKVCache::new(0, 1, 4, DType::F32, 64, Box::new(store));
+
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+        // attn buffers should NOT be allocated for empty cache
+        assert!(cache.attn_k_buf.is_none());
+
+        let (k, v) = cache.get_view();
+        assert_eq!(k.shape().dims(), &[1, 0, 1, 4]);
+        assert_eq!(v.shape().dims(), &[1, 0, 1, 4]);
+    }
+
+    #[test]
+    fn test_reset_preload() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4; // F32
+        let store = zram_store::ZramStore::new(token_bytes, 4, 8);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        let k = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, 1, 4);
+        let v = make_f32_tensor_with_data(&[5.0, 6.0, 7.0, 8.0], 1, 1, 4);
+        cache.update(&k, &v).unwrap();
+
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+
+        cache.reset_preload();
+        assert!(!cache.preloaded);
+
+        // get_view should still work (sync fallback)
+        let (k_view, _) = cache.get_view();
+        assert_eq!(k_view.as_slice::<f32>(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_out_buf_reuse() {
+        // R-P2: verify SharedBuffer reuse across get_view calls
+        let kv_heads = 2;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 1.0);
+        let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 2.0);
+        cache.update(&k, &v).unwrap();
+
+        // First get_view allocates out buffers
+        let _ = cache.get_view();
+        assert!(cache.out_k_buf.is_some());
+        let ptr1 = cache.out_k_buf.as_ref().unwrap().as_ptr();
+
+        // Second get_view should reuse same buffer (same size)
+        let _ = cache.get_view();
+        let ptr2 = cache.out_k_buf.as_ref().unwrap().as_ptr();
+        assert_eq!(ptr1, ptr2, "SharedBuffer should be reused");
     }
 }

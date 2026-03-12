@@ -454,6 +454,129 @@ impl LlamaModel {
         Ok(())
     }
 
+    /// Offload-optimized forward pass with per-layer prefetch pipeline.
+    ///
+    /// Identical to `forward_into()` except the layer loop uses `split_at_mut` +
+    /// `std::thread::scope` to preload the next layer's KV data from the offload
+    /// store while computing the current layer. This overlaps I/O with compute.
+    ///
+    /// Score accumulator is forced to None (offload mode doesn't support eviction).
+    pub fn forward_into_offload(
+        &self,
+        args: LlamaModelForwardArgs<'_, crate::core::offload::OffloadKVCache>,
+    ) -> Result<()> {
+        let input_tokens = args.input_tokens;
+        let start_pos = args.start_pos;
+        let kv_caches = args.kv_caches;
+        let backend = args.backend;
+        let memory = args.memory;
+        let logits_out = args.logits_out;
+        let x_gen = args.x_gen;
+        let mut workspace = args.workspace;
+        let use_gpu_attn = args.use_gpu_attn;
+
+        let batch_size = input_tokens.shape().dims()[0];
+        let seq_len = input_tokens.shape().dims()[1];
+        let hidden_size = self.config.hidden_size;
+
+        // 1. Embedding lookup (identical to forward_into)
+        let mut x = if seq_len == 1 {
+            if let Some(xb) = x_gen {
+                (*xb).clone()
+            } else {
+                let x_buf = memory.alloc(batch_size * seq_len * hidden_size * 4, DType::F32)?;
+                Tensor::new(
+                    Shape::new(vec![batch_size, seq_len, hidden_size]),
+                    x_buf,
+                    backend.clone(),
+                )
+            }
+        } else {
+            let x_buf = memory.alloc(batch_size * seq_len * hidden_size * 4, DType::F32)?;
+            Tensor::new(
+                Shape::new(vec![batch_size, seq_len, hidden_size]),
+                x_buf,
+                backend.clone(),
+            )
+        };
+        backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
+
+        // 2. Preload layer 0 (synchronous, before pipeline starts)
+        kv_caches[0].preload()?;
+
+        // 3. Layer loop with per-layer prefetch pipeline
+        let num_layers = self.layers.len();
+        for i in 0..num_layers {
+            if i + 1 < num_layers {
+                // Split: current layer (left[i]) and next layer (right[0])
+                let (left, right) = kv_caches.split_at_mut(i + 1);
+                let current = &mut left[i];
+                let next = &mut right[0];
+
+                std::thread::scope(|s| {
+                    // Background: preload next layer's KV data
+                    let handle = s.spawn(|| next.preload());
+
+                    // Foreground: compute current layer
+                    let layer_result = self.layers[i].forward(LlamaLayerForwardArgs {
+                        x: &mut x,
+                        kv_cache: current,
+                        start_pos,
+                        backend,
+                        memory,
+                        rms_norm_eps: self.config.rms_norm_eps as f32,
+                        rope_theta: self.config.rope_theta as f32,
+                        workspace: workspace.as_deref_mut(),
+                        use_gpu_attn,
+                        need_scores: false,
+                    });
+
+                    // Wait for preload and handle errors (R-P7)
+                    match handle.join() {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => {
+                            log::warn!("L{} preload failed: {e}, falling back to sync", i + 1);
+                            // next.preloaded remains false → get_view will sync load
+                        }
+                        Err(_) => {
+                            log::error!("L{} preload thread panicked", i + 1);
+                        }
+                    }
+
+                    layer_result
+                })?;
+
+                // R-P1: Release previous layer's buffers
+                if i > 0 {
+                    kv_caches[i - 1].release_buffers();
+                }
+            } else {
+                // Last layer: no prefetch needed
+                self.layers[i].forward(LlamaLayerForwardArgs {
+                    x: &mut x,
+                    kv_cache: &mut kv_caches[i],
+                    start_pos,
+                    backend,
+                    memory,
+                    rms_norm_eps: self.config.rms_norm_eps as f32,
+                    rope_theta: self.config.rope_theta as f32,
+                    workspace: workspace.as_deref_mut(),
+                    use_gpu_attn,
+                    need_scores: false,
+                })?;
+
+                // Release last layer's buffers
+                kv_caches[i].release_buffers();
+            }
+        }
+
+        // 4. Final Norm + Head (identical to forward_into)
+        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
+        backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+
+        Ok(())
+    }
+
     /// Parse `model.safetensors.index.json` and return (shard_filenames, tensor→shard_idx map).
     fn parse_shard_index(index_path: &Path) -> Result<(Vec<String>, HashMap<String, usize>)> {
         #[derive(Deserialize)]
