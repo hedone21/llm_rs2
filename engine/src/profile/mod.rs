@@ -25,7 +25,7 @@ pub mod scores;
 use std::path::PathBuf;
 
 pub use ops::OpProfiler;
-pub use scores::{EvictionEvent, PartitionInfo};
+pub use scores::{EvictionEvent, PartitionInfo, compute_h2o_evicted_indices};
 
 use cache::CacheTracker;
 use entropy::EntropyTracker;
@@ -124,13 +124,21 @@ impl InferenceProfiler {
         importance: Option<&[f32]>,
         head_importance: Option<&[f32]>,
         n_kv_heads: usize,
+        position_map: Option<&[usize]>,
     ) {
         self.latency
             .record(step, forward_us, sample_us, total_us, cache_len);
 
         if let Some(imp) = importance {
-            self.scores
-                .take_snapshot(step, token_id, cache_len, imp, head_importance, n_kv_heads);
+            self.scores.take_snapshot(
+                step,
+                token_id,
+                cache_len,
+                imp,
+                head_importance,
+                n_kv_heads,
+                position_map,
+            );
         }
     }
 
@@ -223,8 +231,8 @@ mod tests {
     #[test]
     fn test_on_step_end_records_latency() {
         let mut p = InferenceProfiler::new(default_config());
-        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0);
-        p.on_step_end(1, 43, 5200, 80, 5280, 129, None, None, 0);
+        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0, None);
+        p.on_step_end(1, 43, 5200, 80, 5280, 129, None, None, 0, None);
 
         let records = p.latency.records();
         assert_eq!(records.len(), 2);
@@ -249,6 +257,8 @@ mod tests {
                 hh_count: 98,
                 recent_start: 102,
             },
+            evicted_indices: vec![],
+            pre_eviction_scores: vec![],
         });
 
         assert_eq!(p.scores.evictions().len(), 1);
@@ -268,7 +278,7 @@ mod tests {
         let mut p = InferenceProfiler::new(config);
         p.ops.matmul_qkv = 1000;
         p.ops.count = 10;
-        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0);
+        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0, None);
 
         let metadata = ProfileMetadata {
             model: "llama-3.2-1b".to_string(),
@@ -333,7 +343,7 @@ mod tests {
     fn test_on_step_end_records_score_snapshot() {
         let mut p = InferenceProfiler::new(default_config());
         let scores = vec![0.8, 0.15, 0.05];
-        p.on_step_end(0, 42, 5000, 100, 5100, 3, Some(&scores), None, 0);
+        p.on_step_end(0, 42, 5000, 100, 5100, 3, Some(&scores), None, 0, None);
 
         assert_eq!(p.scores.snapshots().len(), 1);
         assert_eq!(p.scores.snapshots()[0].step, 0);
@@ -344,7 +354,7 @@ mod tests {
     #[test]
     fn test_on_step_end_no_snapshot_without_scores() {
         let mut p = InferenceProfiler::new(default_config());
-        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0);
+        p.on_step_end(0, 42, 5000, 100, 5100, 128, None, None, 0, None);
 
         // No importance → no snapshot
         assert!(p.scores.snapshots().is_empty());
@@ -371,6 +381,7 @@ mod tests {
             Some(&scores),
             Some(&head_scores),
             2,
+            None,
         );
 
         let snap = &p.scores.snapshots()[0];
@@ -395,6 +406,7 @@ mod tests {
                 Some(&scores),
                 None,
                 0,
+                None,
             );
         }
 
@@ -410,6 +422,8 @@ mod tests {
                 hh_count: 3,
                 recent_start: 5,
             },
+            evicted_indices: vec![],
+            pre_eviction_scores: vec![],
         });
 
         assert_eq!(p.scores.snapshots().len(), 5);

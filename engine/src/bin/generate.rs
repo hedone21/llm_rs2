@@ -762,6 +762,21 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Position → birth step mapping for profiling (token identity tracking)
+    let mut position_birth_step: Vec<usize> = if profiler.is_some() {
+        // All prefill tokens have birth_step = 0 (prompt)
+        let prompt_len = tokens.len();
+        let map = vec![0usize; prompt_len];
+        // Register prompt token births + first generated token
+        if let Some(ref mut p) = profiler {
+            p.scores
+                .record_token_births(0, prompt_len, actual_protected_prefix);
+        }
+        map
+    } else {
+        Vec::new()
+    };
+
     // === GENERATION PHASE ===
     {
         println!("[Profile] Event: DecodingStart");
@@ -890,6 +905,24 @@ fn main() -> anyhow::Result<()> {
             if auto_eviction {
                 let before_len = kv_caches[0].current_pos;
                 let capacity = kv_caches[0].capacity();
+
+                // Capture pre-eviction scores for profiling (before eviction mutates state)
+                let pre_eviction_scores: Vec<f32> = if profiler.is_some()
+                    && score_based_eviction
+                    && before_len >= capacity * 9 / 10
+                {
+                    score_accumulator
+                        .as_ref()
+                        .filter(|acc| acc.is_active())
+                        .map(|acc| {
+                            acc.importance_scores()[..before_len.min(acc.importance_scores().len())]
+                                .to_vec()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
                 let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
                     // Score-based policies: force evict when cache >= 90% full
                     if let Some(ref acc) = score_accumulator {
@@ -916,7 +949,30 @@ fn main() -> anyhow::Result<()> {
                     cache_manager.maybe_evict(&mut kv_caches)?
                 };
                 if result.evicted {
+                    // Compute evicted indices from pre-eviction state
+                    let target_len = ((before_len as f32) * args.eviction_target_ratio) as usize;
+                    let evicted_indices = if !pre_eviction_scores.is_empty() {
+                        llm_rs2::profile::compute_h2o_evicted_indices(
+                            before_len,
+                            target_len,
+                            actual_protected_prefix,
+                            args.h2o_keep_ratio,
+                            &pre_eviction_scores,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+
                     if let Some(ref mut p) = profiler {
+                        // Record token deaths before the EvictionEvent
+                        if !evicted_indices.is_empty() {
+                            p.scores.record_token_deaths(
+                                decode_token_index,
+                                &evicted_indices,
+                                &position_birth_step,
+                                &pre_eviction_scores,
+                            );
+                        }
                         p.on_eviction(llm_rs2::profile::EvictionEvent {
                             step: decode_token_index,
                             policy: args.eviction_policy.clone(),
@@ -925,11 +981,27 @@ fn main() -> anyhow::Result<()> {
                             evicted_count: result.tokens_removed,
                             partition: llm_rs2::profile::PartitionInfo {
                                 prefix_end: actual_protected_prefix,
-                                hh_count: 0, // derived at visualization time
+                                hh_count: 0,
                                 recent_start: result.new_pos,
                             },
+                            evicted_indices: evicted_indices.clone(),
+                            pre_eviction_scores,
                         });
                     }
+
+                    // Update position_birth_step mapping after eviction (compact)
+                    if !position_birth_step.is_empty() {
+                        let evicted_set: std::collections::HashSet<usize> =
+                            evicted_indices.iter().copied().collect();
+                        let mut kept = Vec::new();
+                        for (pos, &birth) in position_birth_step.iter().enumerate() {
+                            if pos < before_len && !evicted_set.contains(&pos) {
+                                kept.push(birth);
+                            }
+                        }
+                        position_birth_step = kept;
+                    }
+
                     if let Some(ref mut acc) = score_accumulator {
                         acc.reset();
                     }
@@ -1064,6 +1136,8 @@ fn main() -> anyhow::Result<()> {
                                             hh_count: 0,
                                             recent_start: r.new_pos,
                                         },
+                                        evicted_indices: vec![],
+                                        pre_eviction_scores: vec![],
                                     });
                                 }
                                 experiment_eviction_count += 1;
@@ -1131,6 +1205,11 @@ fn main() -> anyhow::Result<()> {
                     ),
                     _ => (None, None, 0),
                 };
+                let pos_map = if position_birth_step.is_empty() {
+                    None
+                } else {
+                    Some(position_birth_step.as_slice())
+                };
                 p.on_step_end(
                     decode_token_index,
                     next_token_id,
@@ -1141,7 +1220,15 @@ fn main() -> anyhow::Result<()> {
                     imp,
                     head_imp,
                     n_kv,
+                    pos_map,
                 );
+                // Record new token birth
+                p.scores
+                    .record_token_births(decode_token_index + 1, 1, actual_protected_prefix);
+            }
+            // Track birth step for new token (even if profiler is off, keep mapping in sync)
+            if !position_birth_step.is_empty() {
+                position_birth_step.push(decode_token_index + 1);
             }
 
             _last_token_time = now;
