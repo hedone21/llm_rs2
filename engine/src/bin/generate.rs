@@ -82,9 +82,25 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gpu_attn: bool,
 
-    /// Enable per-layer operation profiling (prints timing breakdown at end).
+    /// Enable profiling (per-op timing, latency, score snapshots).
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    /// Output directory for profiling data.
+    #[arg(long, default_value = "results/profile")]
+    profile_dir: String,
+
+    /// Score snapshot interval (1 = every step, 10 = every 10th step).
+    #[arg(long, default_value_t = 1)]
+    profile_interval: usize,
+
+    /// Comma-separated list of probes: ops,latency,scores,entropy,cache.
+    #[arg(long, default_value = "ops,latency,scores")]
+    profile_probes: String,
+
+    /// Enable per-KV-head score tracking (for H2O+ analysis).
+    #[arg(long, default_value_t = false)]
+    profile_per_head: bool,
 
     /// KV cache data type (f32, f16, or q4)
     #[arg(long, default_value = "q4")]
@@ -729,9 +745,16 @@ fn main() -> anyhow::Result<()> {
         start_pos += process_len;
     }
 
-    // Per-op profiler (only when --profile is set)
-    let mut op_profiler = if args.profile {
-        Some(llm_rs2::layers::llama_layer::OpProfiler::new())
+    // Inference profiler (only when --profile is set)
+    let mut profiler = if args.profile {
+        Some(llm_rs2::profile::InferenceProfiler::new(
+            llm_rs2::profile::ProfileConfig {
+                score_snapshot_interval: args.profile_interval,
+                track_per_head: args.profile_per_head,
+                enabled_probes: args.profile_probes.split(',').map(String::from).collect(),
+                output_dir: std::path::PathBuf::from(&args.profile_dir),
+            },
+        ))
     } else {
         None
     };
@@ -817,7 +840,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: Some(&mut gen_ws),
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: score_accumulator.as_mut(),
-                profiler: op_profiler.as_mut(),
+                profiler: profiler.as_mut().map(|p| &mut p.ops),
             })?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -862,6 +885,7 @@ fn main() -> anyhow::Result<()> {
 
             // Auto-eviction after forward pass (sliding window, non-experiment mode)
             if auto_eviction {
+                let before_len = kv_caches[0].current_pos;
                 let result = if let Some(ref acc) = score_accumulator {
                     if acc.is_active() {
                         cache_manager
@@ -872,10 +896,24 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     cache_manager.maybe_evict(&mut kv_caches)?
                 };
-                if result.evicted
-                    && let Some(ref mut acc) = score_accumulator
-                {
-                    acc.reset();
+                if result.evicted {
+                    if let Some(ref mut p) = profiler {
+                        p.on_eviction(llm_rs2::profile::EvictionEvent {
+                            step: decode_token_index,
+                            policy: args.eviction_policy.clone(),
+                            before_len,
+                            after_len: result.new_pos,
+                            evicted_count: result.tokens_removed,
+                            partition: llm_rs2::profile::PartitionInfo {
+                                prefix_end: actual_protected_prefix,
+                                hh_count: 0, // derived at visualization time
+                                recent_start: result.new_pos,
+                            },
+                        });
+                    }
+                    if let Some(ref mut acc) = score_accumulator {
+                        acc.reset();
+                    }
                 }
             }
             forward_ms_values.push(forward_ms);
@@ -995,6 +1033,20 @@ fn main() -> anyhow::Result<()> {
                                         effective_ratio, r.tokens_removed, r.new_pos
                                     );
                                 }
+                                if let Some(ref mut p) = profiler {
+                                    p.on_eviction(llm_rs2::profile::EvictionEvent {
+                                        step: decode_token_index,
+                                        policy: args.eviction_policy.clone(),
+                                        before_len: r.new_pos + r.tokens_removed,
+                                        after_len: r.new_pos,
+                                        evicted_count: r.tokens_removed,
+                                        partition: llm_rs2::profile::PartitionInfo {
+                                            prefix_end: actual_protected_prefix,
+                                            hh_count: 0,
+                                            recent_start: r.new_pos,
+                                        },
+                                    });
+                                }
                                 experiment_eviction_count += 1;
                                 experiment_evicted_total += r.tokens_removed;
                                 if let Some(ref mut acc) = score_accumulator {
@@ -1038,12 +1090,40 @@ fn main() -> anyhow::Result<()> {
                 vec![]
             };
 
+            let sample_start = std::time::Instant::now();
             let next_token_id =
                 sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config);
+            let sample_us = sample_start.elapsed().as_micros() as u64;
 
             let now = std::time::Instant::now();
             let tbt = now.duration_since(_last_token_time).as_secs_f64() * 1000.0;
             tbt_values.push(tbt);
+
+            // ── Profiler: record step data ──
+            if let Some(ref mut p) = profiler {
+                let forward_us = (forward_ms * 1000.0) as u64;
+                let total_us = forward_us + sample_us;
+                let cache_len = kv_caches[0].current_pos;
+                let (imp, head_imp, n_kv) = match score_accumulator {
+                    Some(ref acc) if acc.is_active() => (
+                        Some(acc.importance_scores()),
+                        acc.head_importance_scores(),
+                        acc.n_kv_heads(),
+                    ),
+                    _ => (None, None, 0),
+                };
+                p.on_step_end(
+                    decode_token_index,
+                    next_token_id,
+                    forward_us,
+                    sample_us,
+                    total_us,
+                    cache_len,
+                    imp,
+                    head_imp,
+                    n_kv,
+                );
+            }
 
             _last_token_time = now;
             tokens.push(next_token_id);
@@ -1138,9 +1218,22 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 6.5. Print profiler report if enabled
-    if let Some(ref profiler) = op_profiler {
-        profiler.print_report();
+    // 6.5. Export profiler data if enabled
+    if let Some(ref profiler) = profiler {
+        profiler.ops.print_report();
+
+        let metadata = llm_rs2::profile::ProfileMetadata {
+            model: args.model_path.clone(),
+            backend: args.backend.clone(),
+            eviction_policy: args.eviction_policy.clone(),
+            max_seq_len: args.max_seq_len,
+            prompt_len: prompt.len(),
+            generated_tokens: tbt_values.len(),
+        };
+        match profiler.export_json(&metadata) {
+            Ok(path) => eprintln!("[Profile] Exported to {}", path.display()),
+            Err(e) => eprintln!("[Profile] Export failed: {}", e),
+        }
     }
 
     // 7. Output results
