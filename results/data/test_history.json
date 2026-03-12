@@ -4126,5 +4126,1308 @@
         "passed": 0
       }
     }
+  },
+  {
+    "date": "2026-03-12T00:18:57",
+    "total": 359,
+    "passed": 359,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T00:41:39",
+    "total": 361,
+    "passed": 361,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T01:22:01",
+    "total": 364,
+    "passed": 361,
+    "failed": 3,
+    "pass_rate": 99.2,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 3,
+        "passed": 0
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T01:31:39",
+    "total": 361,
+    "passed": 361,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T01:45:43",
+    "total": 394,
+    "passed": 394,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T01:47:14",
+    "total": 396,
+    "passed": 394,
+    "failed": 2,
+    "pass_rate": 99.5,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 2,
+        "passed": 0
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:17:32",
+    "total": 413,
+    "passed": 413,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:19:01",
+    "total": 421,
+    "passed": 421,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:22:54",
+    "total": 441,
+    "passed": 441,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:26:02",
+    "total": 444,
+    "passed": 441,
+    "failed": 3,
+    "pass_rate": 99.3,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 3,
+        "passed": 0
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:27:35",
+    "total": 453,
+    "passed": 451,
+    "failed": 2,
+    "pass_rate": 99.6,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 2,
+        "passed": 0
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:28:49",
+    "total": 459,
+    "passed": 459,
+    "failed": 0,
+    "pass_rate": 100.0,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:32:02",
+    "total": 462,
+    "passed": 459,
+    "failed": 3,
+    "pass_rate": 99.4,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 3,
+        "passed": 0
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T20:42:24",
+    "total": 461,
+    "passed": 459,
+    "failed": 2,
+    "pass_rate": 99.6,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 2,
+        "passed": 0
+      }
+    }
+  },
+  {
+    "date": "2026-03-12T22:32:21",
+    "total": 467,
+    "passed": 466,
+    "failed": 1,
+    "pass_rate": 99.8,
+    "details": {
+      "backend::cpu": {
+        "total": 14,
+        "passed": 14
+      },
+      "buffer::shared_buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::buffer": {
+        "total": 5,
+        "passed": 5
+      },
+      "core::cache_manager": {
+        "total": 22,
+        "passed": 22
+      },
+      "core::eviction::h2o": {
+        "total": 44,
+        "passed": 44
+      },
+      "core::eviction::no_eviction": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::eviction::sliding_window": {
+        "total": 7,
+        "passed": 7
+      },
+      "core::kv_cache": {
+        "total": 30,
+        "passed": 30
+      },
+      "core::quant": {
+        "total": 15,
+        "passed": 15
+      },
+      "core::shape": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::sys_monitor": {
+        "total": 3,
+        "passed": 3
+      },
+      "core::tensor": {
+        "total": 6,
+        "passed": 6
+      },
+      "layers::attention": {
+        "total": 5,
+        "passed": 5
+      },
+      "layers::llama_layer": {
+        "total": 3,
+        "passed": 3
+      },
+      "layers::workspace": {
+        "total": 4,
+        "passed": 4
+      },
+      "memory::galloc": {
+        "total": 3,
+        "passed": 3
+      },
+      "resilience::manager": {
+        "total": 9,
+        "passed": 9
+      },
+      "resilience::state": {
+        "total": 5,
+        "passed": 5
+      },
+      "resilience::strategy": {
+        "total": 16,
+        "passed": 16
+      },
+      "buffer::unified_buffer": {
+        "total": 1,
+        "passed": 0
+      }
+    }
   }
 ]

@@ -11,6 +11,7 @@ build/
 
 # Generated results
 results/plots/
+results/profile/
 results/micro_bench_results.txt
 
 # Reference code
