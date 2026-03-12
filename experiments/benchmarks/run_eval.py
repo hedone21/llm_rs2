@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """Run log-likelihood evaluation on benchmark datasets.
 
-Calls `generate --eval-ll --eval-batch` for each task × policy combination,
+Calls `generate --eval-ll --eval-batch` for each task x policy combination,
 then computes accuracy by comparing log-likelihoods across choices.
 
 Usage:
+    # H2O paper reproduction (ratio-based budget)
     python experiments/benchmarks/run_eval.py \
         --model models/llama3.2-1b \
-        --tasks hellaswag,arc_easy,boolq \
+        --tasks copa,piqa,winogrande,openbookqa,rte,mathqa \
         --policies none,sliding,h2o,h2o_plus \
-        --kv-budget 256 \
-        --max-seq-len 512
+        --kv-budget-ratio 0.2 \
+        --kv-type f16
 
-    # Quick test (5 questions, 1 task)
+    # Absolute budget (legacy)
     python experiments/benchmarks/run_eval.py \
         --model models/llama3.2-1b \
-        --tasks boolq --policies none --n-questions 5
+        --tasks boolq --policies none --kv-budget 256
 """
 
 import argparse
@@ -59,13 +60,7 @@ def load_tasks(task_name, n_questions=None):
 
 
 def tasks_to_grouped(tasks):
-    """Convert flat tasks to grouped format for the binary.
-
-    Flat: [{"id": "q1_c0", "question_id": "q1", "prompt": "...", "continuation": " A", "choice_idx": 0, "gold": 2}, ...]
-    Grouped: [{"id": "q1", "prompt": "...", "choices": [" A", " B", " C", " D"]}]
-
-    Returns (grouped_batch, gold_map) where gold_map maps question_id -> gold index.
-    """
+    """Convert flat tasks to grouped format for the binary."""
     questions = defaultdict(list)
     for t in tasks:
         questions[t["question_id"]].append(t)
@@ -84,7 +79,7 @@ def tasks_to_grouped(tasks):
     return grouped, gold_map
 
 
-def run_eval_batch(tasks, model, policy, kv_budget, max_seq_len, extra_args=None):
+def run_eval_batch(tasks, model, policy, kv_budget, kv_budget_ratio, max_seq_len, kv_type):
     """Run generate --eval-ll --eval-batch and return results."""
     grouped, gold_map = tasks_to_grouped(tasks)
 
@@ -100,19 +95,19 @@ def run_eval_batch(tasks, model, policy, kv_budget, max_seq_len, extra_args=None
             "--eval-batch", batch_path,
             "--max-seq-len", str(max_seq_len),
             "--eviction-policy", policy,
+            "--kv-type", kv_type,
             "--greedy",
         ]
 
-        if kv_budget > 0:
+        if kv_budget_ratio > 0:
+            cmd.extend(["--kv-budget-ratio", str(kv_budget_ratio)])
+        elif kv_budget > 0:
             cmd.extend(["--kv-budget", str(kv_budget)])
 
         if policy in ("h2o", "h2o_plus"):
             cmd.extend(["--h2o-keep-ratio", "0.5", "--h2o-decay", "0.0"])
 
-        if extra_args:
-            cmd.extend(extra_args)
-
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
 
         if result.returncode != 0:
             print(f"ERROR: generate failed:\n{result.stderr}", file=sys.stderr)
@@ -131,20 +126,11 @@ def run_eval_batch(tasks, model, policy, kv_budget, max_seq_len, extra_args=None
 
 
 def compute_accuracy(eval_results, gold_map):
-    """Compute accuracy from grouped log-likelihood results.
-
-    Computes both:
-    - acc_norm: byte-length-normalized NLL (lm-eval-harness standard)
-    - acc_raw: raw total NLL (favors shorter choices)
-
-    eval_results: {"results": [{"id": "q1", "choice_nlls": [...], "predicted": 2}]}
-    gold_map: {"q1": 2}
-    """
+    """Compute acc_norm from grouped log-likelihood results."""
     if not eval_results:
-        return {"accuracy": 0.0, "accuracy_raw": 0.0, "correct": 0, "total": 0, "details": []}
+        return {"accuracy": 0.0, "correct": 0, "total": 0, "details": []}
 
-    correct_norm = 0
-    correct_raw = 0
+    correct = 0
     total = 0
     details = []
 
@@ -154,32 +140,27 @@ def compute_accuracy(eval_results, gold_map):
         if gold is None:
             continue
 
-        pred_norm = r.get("predicted", 0)
-        pred_raw = r.get("predicted_raw", pred_norm)
+        pred = r.get("predicted", 0)
 
-        if pred_norm == gold:
-            correct_norm += 1
-        if pred_raw == gold:
-            correct_raw += 1
+        if pred == gold:
+            correct += 1
         total += 1
 
         details.append({
             "question_id": qid,
             "gold": gold,
-            "predicted_norm": pred_norm,
-            "predicted_raw": pred_raw,
-            "correct_norm": pred_norm == gold,
-            "correct_raw": pred_raw == gold,
+            "predicted": pred,
+            "correct": pred == gold,
             "choice_nlls": r.get("choice_nlls", []),
+            "n_prompt_tokens": r.get("n_prompt_tokens", 0),
+            "effective_budget": r.get("effective_budget", 0),
+            "eviction_count": r.get("eviction_count", 0),
         })
 
-    acc_norm = correct_norm / total if total > 0 else 0.0
-    acc_raw = correct_raw / total if total > 0 else 0.0
+    acc = correct / total if total > 0 else 0.0
     return {
-        "accuracy": acc_norm,
-        "accuracy_raw": acc_raw,
-        "correct": correct_norm,
-        "correct_raw": correct_raw,
+        "accuracy": acc,
+        "correct": correct,
         "total": total,
         "details": details,
     }
@@ -188,13 +169,17 @@ def compute_accuracy(eval_results, gold_map):
 def main():
     parser = argparse.ArgumentParser(description="Run downstream task evaluation")
     parser.add_argument("--model", default="models/llama3.2-1b")
-    parser.add_argument("--tasks", default="hellaswag,arc_easy,boolq",
+    parser.add_argument("--tasks", default="copa,piqa,winogrande,openbookqa,rte,mathqa",
                         help="Comma-separated task names")
     parser.add_argument("--policies", default="none",
                         help="Comma-separated eviction policies")
     parser.add_argument("--kv-budget", type=int, default=0,
-                        help="KV cache budget (0=unlimited)")
-    parser.add_argument("--max-seq-len", type=int, default=512)
+                        help="KV cache budget in tokens (0=unlimited)")
+    parser.add_argument("--kv-budget-ratio", type=float, default=0.0,
+                        help="KV cache budget as ratio of prompt length (0.0-1.0)")
+    parser.add_argument("--kv-type", default="f16",
+                        help="KV cache data type (f16, f32, q4)")
+    parser.add_argument("--max-seq-len", type=int, default=2048)
     parser.add_argument("--n-questions", type=int, default=None,
                         help="Limit number of questions per task")
     parser.add_argument("--output", default=None,
@@ -213,17 +198,21 @@ def main():
         tasks = load_tasks(task_name, n_questions=args.n_questions)
         n_questions = len(set(t["question_id"] for t in tasks))
         print(f"\n{'='*60}")
-        print(f"  Task: {task_name} ({n_questions} questions, {len(tasks)} evals)")
+        print(f"  Task: {task_name} ({n_questions} questions)")
         print(f"{'='*60}")
 
         for policy in policies:
             label = f"{task_name}/{policy}"
-            if args.kv_budget > 0:
+            if args.kv_budget_ratio > 0:
+                label += f"/ratio={args.kv_budget_ratio}"
+            elif args.kv_budget > 0:
                 label += f"/budget={args.kv_budget}"
 
             print(f"\n  Running: {label}...")
             eval_output, gold_map = run_eval_batch(
-                tasks, args.model, policy, args.kv_budget, args.max_seq_len
+                tasks, args.model, policy,
+                args.kv_budget, args.kv_budget_ratio,
+                args.max_seq_len, args.kv_type,
             )
 
             if eval_output is None:
@@ -232,21 +221,22 @@ def main():
 
             acc_result = compute_accuracy(eval_output, gold_map)
             acc = acc_result["accuracy"]
-            acc_raw = acc_result["accuracy_raw"]
-            print(f"  Result: acc_norm={acc:.1%} acc_raw={acc_raw:.1%} ({acc_result['total']} questions)")
+            print(f"  Result: acc_norm={acc:.1%} ({acc_result['correct']}/{acc_result['total']})")
 
             key = f"{task_name}_{policy}"
-            if args.kv_budget > 0:
+            if args.kv_budget_ratio > 0:
+                key += f"_r{int(args.kv_budget_ratio*100)}"
+            elif args.kv_budget > 0:
                 key += f"_b{args.kv_budget}"
             all_results[key] = {
                 "task": task_name,
                 "policy": policy,
                 "kv_budget": args.kv_budget,
+                "kv_budget_ratio": args.kv_budget_ratio,
+                "kv_type": args.kv_type,
                 "model": args.model,
                 "accuracy": acc,
-                "accuracy_raw": acc_raw,
                 "correct": acc_result["correct"],
-                "correct_raw": acc_result.get("correct_raw", 0),
                 "total": acc_result["total"],
                 "wall_time_s": eval_output.get("wall_time_s", 0),
                 "config": eval_output.get("config", {}),
@@ -256,17 +246,25 @@ def main():
     print(f"\n{'='*60}")
     print("  Summary")
     print(f"{'='*60}")
-    print(f"  {'Task':<15} {'Policy':<12} {'Budget':<8} {'Acc(norm)':>10} {'Acc(raw)':>10}")
-    print(f"  {'-'*15} {'-'*12} {'-'*8} {'-'*10} {'-'*10}")
+    budget_label = (f"ratio={args.kv_budget_ratio}" if args.kv_budget_ratio > 0
+                    else f"budget={args.kv_budget}" if args.kv_budget > 0 else "full")
+    print(f"  {'Task':<15} {'Policy':<12} {'Budget':<12} {'Acc(norm)':>10}")
+    print(f"  {'-'*15} {'-'*12} {'-'*12} {'-'*10}")
     for key, r in all_results.items():
-        budget_str = str(r["kv_budget"]) if r["kv_budget"] > 0 else "full"
-        print(f"  {r['task']:<15} {r['policy']:<12} {budget_str:<8} {r['accuracy']:>9.1%} {r.get('accuracy_raw',0):>9.1%}")
+        bl = (f"r={r['kv_budget_ratio']}" if r["kv_budget_ratio"] > 0
+              else f"b={r['kv_budget']}" if r["kv_budget"] > 0 else "full")
+        print(f"  {r['task']:<15} {r['policy']:<12} {bl:<12} {r['accuracy']:>9.1%}")
 
     # Save results
     output_path = args.output
     if output_path is None:
-        budget_str = f"_b{args.kv_budget}" if args.kv_budget > 0 else ""
         policies_str = "_".join(policies)
+        if args.kv_budget_ratio > 0:
+            budget_str = f"_r{int(args.kv_budget_ratio*100)}"
+        elif args.kv_budget > 0:
+            budget_str = f"_b{args.kv_budget}"
+        else:
+            budget_str = ""
         output_path = os.path.join(
             RESULTS_DIR,
             f"{model_name}_{policies_str}{budget_str}.json"
