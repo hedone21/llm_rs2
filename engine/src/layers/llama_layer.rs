@@ -10,6 +10,9 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+// Re-export OpProfiler from its canonical location for backward compatibility.
+pub use crate::profile::ops::OpProfiler;
+
 // --- x86_64 AVX2 SIMD helpers for attention ---
 
 /// Dot product: sum(a[i] * b[i]) for i in 0..len, using AVX2+FMA.
@@ -1297,96 +1300,8 @@ pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub profiler: Option<&'a mut OpProfiler>,
 }
 
-/// Per-operation profiler for forward_gen timing breakdown.
-/// Accumulates microseconds per operation across layers and tokens.
-#[derive(Default)]
-pub struct OpProfiler {
-    pub rms_norm: u64,
-    pub matmul_qkv: u64,
-    pub rope: u64,
-    pub kv_update: u64,
-    pub attention: u64,
-    pub matmul_wo: u64,
-    pub matmul_ffn: u64,
-    pub silu_mul: u64,
-    pub add_assign: u64,
-    pub copy_residual: u64,
-    pub cast: u64,
-    pub count: u64,
-}
-
-impl OpProfiler {
-    pub fn new() -> Self {
-        Self {
-            rms_norm: 0,
-            matmul_qkv: 0,
-            rope: 0,
-            kv_update: 0,
-            attention: 0,
-            matmul_wo: 0,
-            matmul_ffn: 0,
-            silu_mul: 0,
-            add_assign: 0,
-            copy_residual: 0,
-            cast: 0,
-            count: 0,
-        }
-    }
-
-    pub fn print_report(&self) {
-        let total = self.rms_norm
-            + self.matmul_qkv
-            + self.rope
-            + self.kv_update
-            + self.attention
-            + self.matmul_wo
-            + self.matmul_ffn
-            + self.silu_mul
-            + self.add_assign
-            + self.copy_residual
-            + self.cast;
-        let n = if self.count > 0 { self.count } else { 1 };
-        let pct = |v: u64| -> f64 {
-            if total > 0 {
-                v as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
-        eprintln!(
-            "\n[Profile] Per-op breakdown (accumulated over {} layer-calls):",
-            n
-        );
-        eprintln!(
-            "  {:<20} {:>10} {:>10} {:>8}",
-            "Operation", "Total(us)", "Avg(us)", "%"
-        );
-        eprintln!("  {:-<20} {:-<10} {:-<10} {:-<8}", "", "", "", "");
-        let ops = [
-            ("matmul_qkv", self.matmul_qkv),
-            ("matmul_wo", self.matmul_wo),
-            ("matmul_ffn", self.matmul_ffn),
-            ("attention", self.attention),
-            ("rms_norm", self.rms_norm),
-            ("rope", self.rope),
-            ("silu_mul", self.silu_mul),
-            ("add_assign", self.add_assign),
-            ("copy_residual", self.copy_residual),
-            ("kv_update", self.kv_update),
-            ("cast", self.cast),
-        ];
-        for (name, val) in &ops {
-            eprintln!(
-                "  {:<20} {:>10} {:>10} {:>7.1}%",
-                name,
-                val,
-                val / n,
-                pct(*val)
-            );
-        }
-        eprintln!("  {:<20} {:>10} {:>10}", "TOTAL", total, total / n,);
-    }
-}
+// OpProfiler has been moved to crate::profile::ops.
+// Re-exported via `pub use crate::profile::ops::OpProfiler;` at the top of this file.
 
 // ═══════════════════════════════════════════════════════════════════
 // Phase 1: Verify attention scores are post-softmax probabilities

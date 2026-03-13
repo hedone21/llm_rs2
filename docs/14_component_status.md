@@ -130,7 +130,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-11 23:57:36_
+_Last updated: 2026-03-12 22:32:21_
 
 ### Quality Gate Summary
 
@@ -158,9 +158,9 @@ _Last updated: 2026-03-11 23:57:36_
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 3 | 3 | 0 | PASS |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 3 | 0 | 0 | **FAIL** |
-| **Overall** | | | **205** | **202** | **0** | **FAIL** |
-| Integration | - | - | 157 | 157 | PASS |
+| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
+| **Overall** | | | **203** | **202** | **0** | **FAIL** |
+| Integration | - | - | 264 | 264 | PASS |
 
 ### Test Details
 
@@ -368,8 +368,6 @@ _Last updated: 2026-03-11 23:57:36_
 | `test_accumulator_receives_post_softmax_scores` | LlamaLayer | PASS |
 | `test_compute_attention_scores_f16_post_softmax` | LlamaLayer | PASS |
 | `test_inline_softmax_produces_valid_probabilities` | LlamaLayer | PASS |
-| `test_alloc_unified_buffer` | UnifiedBuffer | **FAIL** |
-| `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
 | `test_unmap_and_remap` | UnifiedBuffer | **FAIL** |
 | `default_config_all_monitors_enabled` | Integration | PASS |
 | `parse_external_config` | Integration | PASS |
@@ -404,10 +402,52 @@ _Last updated: 2026-03-11 23:57:36_
 | `test_kivi_cache_compression_ratio` | Integration | PASS |
 | `test_kivi_cache_flush_and_quantize` | Integration | PASS |
 | `test_kivi_cache_get_view_after_flush` | Integration | PASS |
+| `test_kivi_cache_incremental_deq` | Integration | PASS |
 | `test_kivi_cache_memory_usage` | Integration | PASS |
 | `test_kivi_cache_multi_token_update` | Integration | PASS |
 | `test_kivi_cache_overflow` | Integration | PASS |
 | `test_kivi_cache_residual_only` | Integration | PASS |
+| `test_kivi_cache_vec_capacity_no_realloc` | Integration | PASS |
+| `test_disk_store_append_from_empty` | Integration | PASS |
+| `test_disk_store_append_token` | Integration | PASS |
+| `test_disk_store_cleanup_on_drop` | Integration | PASS |
+| `test_disk_store_clear` | Integration | PASS |
+| `test_disk_store_empty_load` | Integration | PASS |
+| `test_disk_store_roundtrip` | Integration | PASS |
+| `test_shuffle_dispatch` | Integration | PASS |
+| `test_shuffle_f16_layout` | Integration | PASS |
+| `test_shuffle_f32_layout` | Integration | PASS |
+| `test_shuffle_realistic_f16_data` | Integration | PASS |
+| `test_shuffle_unshuffle_f16_roundtrip` | Integration | PASS |
+| `test_shuffle_unshuffle_f32_roundtrip` | Integration | PASS |
+| `test_integration_base_vs_disk_f16_accuracy` | Integration | PASS |
+| `test_integration_base_vs_disk_f32_accuracy` | Integration | PASS |
+| `test_integration_base_vs_zram_f16_accuracy` | Integration | PASS |
+| `test_integration_base_vs_zram_f32_accuracy` | Integration | PASS |
+| `test_integration_speed_and_compression` | Integration | PASS |
+| `test_offload_kvcache_decode_loop` | Integration | PASS |
+| `test_offload_kvcache_empty_view` | Integration | PASS |
+| `test_offload_kvcache_f32_bit_exact` | Integration | PASS |
+| `test_offload_kvcache_f32_zram_bit_exact` | Integration | PASS |
+| `test_offload_kvcache_memory_usage` | Integration | PASS |
+| `test_offload_kvcache_ops_disk` | Integration | PASS |
+| `test_offload_kvcache_ops_zram` | Integration | PASS |
+| `test_offload_kvcache_overflow` | Integration | PASS |
+| `test_out_buf_reuse` | Integration | PASS |
+| `test_preload_concurrent_split_at_mut` | Integration | PASS |
+| `test_preload_empty_cache` | Integration | PASS |
+| `test_preload_skips_io_in_get_view` | Integration | PASS |
+| `test_preload_update_append_to_attn_buf` | Integration | PASS |
+| `test_release_buffers_frees_memory` | Integration | PASS |
+| `test_reset_preload` | Integration | PASS |
+| `test_zram_store_append_decode` | Integration | PASS |
+| `test_zram_store_clear` | Integration | PASS |
+| `test_zram_store_compression_ratio_f16` | Integration | PASS |
+| `test_zram_store_compression_ratio_f32` | Integration | PASS |
+| `test_zram_store_empty_guard` | Integration | PASS |
+| `test_zram_store_residual_flush_boundary` | Integration | PASS |
+| `test_zram_store_roundtrip_f16` | Integration | PASS |
+| `test_zram_store_roundtrip_f32` | Integration | PASS |
 | `test_compress_name` | Integration | PASS |
 | `test_compress_returns_noop` | Integration | PASS |
 | `test_cosine_identical_vectors` | Integration | PASS |
@@ -514,6 +554,71 @@ _Last updated: 2026-03-11 23:57:36_
 | `monitor_zone_discovery` | Integration | PASS |
 | `monitor_zone_filter` | Integration | PASS |
 | `reads_hottest_zone` | Integration | PASS |
+| `test_cache_tracker_empty` | Integration | PASS |
+| `test_cache_tracker_growth_and_eviction` | Integration | PASS |
+| `test_cache_tracker_many_records` | Integration | PASS |
+| `test_cache_tracker_record` | Integration | PASS |
+| `test_cache_tracker_to_json` | Integration | PASS |
+| `test_cache_tracker_to_json_empty` | Integration | PASS |
+| `test_cache_tracker_utilization_calculation` | Integration | PASS |
+| `test_cache_tracker_zero_capacity` | Integration | PASS |
+| `test_entropy_tracker_empty` | Integration | PASS |
+| `test_entropy_tracker_multiple_steps` | Integration | PASS |
+| `test_entropy_tracker_record_from_scores` | Integration | PASS |
+| `test_entropy_tracker_to_json` | Integration | PASS |
+| `test_entropy_tracker_to_json_empty` | Integration | PASS |
+| `test_entropy_tracker_zero_heads_noop` | Integration | PASS |
+| `test_shannon_entropy_binary` | Integration | PASS |
+| `test_shannon_entropy_peaked` | Integration | PASS |
+| `test_shannon_entropy_skewed` | Integration | PASS |
+| `test_shannon_entropy_uniform` | Integration | PASS |
+| `test_latency_tracker_cache_len_increases` | Integration | PASS |
+| `test_latency_tracker_empty` | Integration | PASS |
+| `test_latency_tracker_record_and_access` | Integration | PASS |
+| `test_latency_tracker_summary` | Integration | PASS |
+| `test_latency_tracker_summary_single_record` | Integration | PASS |
+| `test_latency_tracker_to_json_empty` | Integration | PASS |
+| `test_latency_tracker_to_json_includes_summary` | Integration | PASS |
+| `test_latency_tracker_to_json_structure` | Integration | PASS |
+| `test_op_profiler_default_is_zero` | Integration | PASS |
+| `test_op_profiler_to_json_percentages` | Integration | PASS |
+| `test_op_profiler_to_json_structure` | Integration | PASS |
+| `test_op_profiler_to_json_zero_count` | Integration | PASS |
+| `test_op_profiler_to_json_zero_total` | Integration | PASS |
+| `test_op_profiler_total` | Integration | PASS |
+| `test_compute_h2o_evicted_indices_basic` | Integration | PASS |
+| `test_compute_h2o_evicted_indices_no_eviction_needed` | Integration | PASS |
+| `test_eviction_event_with_indices_and_scores` | Integration | PASS |
+| `test_prefix_tokens_never_die` | Integration | PASS |
+| `test_record_eviction` | Integration | PASS |
+| `test_record_multiple_evictions` | Integration | PASS |
+| `test_score_tracker_default` | Integration | PASS |
+| `test_score_tracker_new` | Integration | PASS |
+| `test_snapshot_interval_min_one` | Integration | PASS |
+| `test_snapshot_with_position_map` | Integration | PASS |
+| `test_take_snapshot_basic` | Integration | PASS |
+| `test_take_snapshot_cache_len_bounds` | Integration | PASS |
+| `test_take_snapshot_clones_data` | Integration | PASS |
+| `test_take_snapshot_head_importance_not_tracked` | Integration | PASS |
+| `test_take_snapshot_interval_skip` | Integration | PASS |
+| `test_take_snapshot_with_head_importance` | Integration | PASS |
+| `test_to_json_combined` | Integration | PASS |
+| `test_to_json_empty` | Integration | PASS |
+| `test_to_json_with_evictions` | Integration | PASS |
+| `test_to_json_with_head_importance` | Integration | PASS |
+| `test_to_json_with_snapshots` | Integration | PASS |
+| `test_token_lifetime_json` | Integration | PASS |
+| `test_token_lifetime_tracking` | Integration | PASS |
+| `test_export_json_creates_file` | Integration | PASS |
+| `test_export_json_optional_probes_null_when_disabled` | Integration | PASS |
+| `test_full_lifecycle_scores_and_eviction` | Integration | PASS |
+| `test_on_eviction_records_event` | Integration | PASS |
+| `test_on_step_end_no_snapshot_without_scores` | Integration | PASS |
+| `test_on_step_end_records_latency` | Integration | PASS |
+| `test_on_step_end_records_score_snapshot` | Integration | PASS |
+| `test_on_step_end_with_head_importance` | Integration | PASS |
+| `test_profiler_creation_with_default_probes` | Integration | PASS |
+| `test_profiler_creation_with_optional_probes` | Integration | PASS |
 | `test_listener_forwards_to_channel` | Integration | PASS |
 | `test_listener_stops_on_disconnect` | Integration | PASS |
 | `test_listener_stops_when_receiver_dropped` | Integration | PASS |
@@ -537,24 +642,24 @@ _Last updated: 2026-03-11 23:57:36_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-07T21:41:43 | 211 | 209 | 2 | 99.1% |
-| 2026-03-07T21:52:38 | 209 | 209 | 0 | 100.0% |
-| 2026-03-07T22:19:33 | 209 | 209 | 0 | 100.0% |
-| 2026-03-07T22:20:18 | 210 | 209 | 1 | 99.5% |
-| 2026-03-08T11:53:19 | 211 | 209 | 2 | 99.1% |
-| 2026-03-08T12:16:13 | 210 | 209 | 1 | 99.5% |
-| 2026-03-08T14:15:56 | 209 | 209 | 0 | 100.0% |
-| 2026-03-08T15:07:11 | 209 | 209 | 0 | 100.0% |
-| 2026-03-08T16:50:46 | 209 | 209 | 0 | 100.0% |
-| 2026-03-08T18:43:48 | 212 | 209 | 3 | 98.6% |
-| 2026-03-08T22:12:16 | 209 | 209 | 0 | 100.0% |
-| 2026-03-08T23:45:12 | 209 | 209 | 0 | 100.0% |
-| 2026-03-10T19:06:30 | 342 | 341 | 1 | 99.7% |
-| 2026-03-10T19:47:06 | 344 | 341 | 3 | 99.1% |
-| 2026-03-10T19:54:30 | 343 | 341 | 2 | 99.4% |
 | 2026-03-10T20:04:07 | 344 | 341 | 3 | 99.1% |
 | 2026-03-11T00:49:12 | 344 | 344 | 0 | 100.0% |
 | 2026-03-11T07:51:44 | 345 | 344 | 1 | 99.7% |
 | 2026-03-11T23:52:20 | 362 | 359 | 3 | 99.2% |
 | 2026-03-11T23:57:36 | 362 | 359 | 3 | 99.2% |
+| 2026-03-12T00:18:57 | 359 | 359 | 0 | 100.0% |
+| 2026-03-12T00:41:39 | 361 | 361 | 0 | 100.0% |
+| 2026-03-12T01:22:01 | 364 | 361 | 3 | 99.2% |
+| 2026-03-12T01:31:39 | 361 | 361 | 0 | 100.0% |
+| 2026-03-12T01:45:43 | 394 | 394 | 0 | 100.0% |
+| 2026-03-12T01:47:14 | 396 | 394 | 2 | 99.5% |
+| 2026-03-12T20:17:32 | 413 | 413 | 0 | 100.0% |
+| 2026-03-12T20:19:01 | 421 | 421 | 0 | 100.0% |
+| 2026-03-12T20:22:54 | 441 | 441 | 0 | 100.0% |
+| 2026-03-12T20:26:02 | 444 | 441 | 3 | 99.3% |
+| 2026-03-12T20:27:35 | 453 | 451 | 2 | 99.6% |
+| 2026-03-12T20:28:49 | 459 | 459 | 0 | 100.0% |
+| 2026-03-12T20:32:02 | 462 | 459 | 3 | 99.4% |
+| 2026-03-12T20:42:24 | 461 | 459 | 2 | 99.6% |
+| 2026-03-12T22:32:21 | 467 | 466 | 1 | 99.8% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->

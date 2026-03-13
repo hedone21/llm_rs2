@@ -82,9 +82,25 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gpu_attn: bool,
 
-    /// Enable per-layer operation profiling (prints timing breakdown at end).
+    /// Enable profiling (per-op timing, latency, score snapshots).
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    /// Output directory for profiling data.
+    #[arg(long, default_value = "results/profile")]
+    profile_dir: String,
+
+    /// Score snapshot interval (1 = every step, 10 = every 10th step).
+    #[arg(long, default_value_t = 1)]
+    profile_interval: usize,
+
+    /// Comma-separated list of probes: ops,latency,scores,entropy,cache.
+    #[arg(long, default_value = "ops,latency,scores")]
+    profile_probes: String,
+
+    /// Enable per-KV-head score tracking (for H2O+ analysis).
+    #[arg(long, default_value_t = false)]
+    profile_per_head: bool,
 
     /// KV cache data type (f32, f16, or q4)
     #[arg(long, default_value = "q4")]
@@ -617,9 +633,12 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // Auto-eviction: sliding window in non-experiment mode checks memory pressure
-    // after each forward pass. H2O/D2O are always signal-driven.
-    let auto_eviction = args.eviction_policy == "sliding" && experiment_schedule.is_none();
+    // Auto-eviction: non-experiment mode evicts automatically.
+    // - Sliding window: triggers on memory pressure after each forward pass.
+    // - Score-based (H2O/H2O+/D2O): triggers when cache utilization >= 90% capacity,
+    //   using force_evict_with_scores to bypass memory pressure checks.
+    let auto_eviction = args.eviction_policy != "none" && experiment_schedule.is_none();
+    let score_based_eviction = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
 
     // ════════════════════════════════════════════════════════════
     //  EVAL-LL MODE: Log-likelihood evaluation for downstream tasks
@@ -729,11 +748,33 @@ fn main() -> anyhow::Result<()> {
         start_pos += process_len;
     }
 
-    // Per-op profiler (only when --profile is set)
-    let mut op_profiler = if args.profile {
-        Some(llm_rs2::layers::llama_layer::OpProfiler::new())
+    // Inference profiler (only when --profile is set)
+    let mut profiler = if args.profile {
+        Some(llm_rs2::profile::InferenceProfiler::new(
+            llm_rs2::profile::ProfileConfig {
+                score_snapshot_interval: args.profile_interval,
+                track_per_head: args.profile_per_head,
+                enabled_probes: args.profile_probes.split(',').map(String::from).collect(),
+                output_dir: std::path::PathBuf::from(&args.profile_dir),
+            },
+        ))
     } else {
         None
+    };
+
+    // Position → birth step mapping for profiling (token identity tracking)
+    let mut position_birth_step: Vec<usize> = if profiler.is_some() {
+        // All prefill tokens have birth_step = 0 (prompt)
+        let prompt_len = tokens.len();
+        let map = vec![0usize; prompt_len];
+        // Register prompt token births + first generated token
+        if let Some(ref mut p) = profiler {
+            p.scores
+                .record_token_births(0, prompt_len, actual_protected_prefix);
+        }
+        map
+    } else {
+        Vec::new()
     };
 
     // === GENERATION PHASE ===
@@ -817,7 +858,7 @@ fn main() -> anyhow::Result<()> {
                 workspace: Some(&mut gen_ws),
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: score_accumulator.as_mut(),
-                profiler: op_profiler.as_mut(),
+                profiler: profiler.as_mut().map(|p| &mut p.ops),
             })?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
@@ -860,9 +901,44 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // Auto-eviction after forward pass (sliding window, non-experiment mode)
+            // Auto-eviction after forward pass (non-experiment mode)
             if auto_eviction {
-                let result = if let Some(ref acc) = score_accumulator {
+                let before_len = kv_caches[0].current_pos;
+                let capacity = kv_caches[0].capacity();
+
+                // Capture pre-eviction scores for profiling (before eviction mutates state)
+                let pre_eviction_scores: Vec<f32> = if profiler.is_some()
+                    && score_based_eviction
+                    && before_len >= capacity * 9 / 10
+                {
+                    score_accumulator
+                        .as_ref()
+                        .filter(|acc| acc.is_active())
+                        .map(|acc| {
+                            acc.importance_scores()[..before_len.min(acc.importance_scores().len())]
+                                .to_vec()
+                        })
+                        .unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+
+                let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
+                    // Score-based policies: force evict when cache >= 90% full
+                    if let Some(ref acc) = score_accumulator {
+                        if acc.is_active() {
+                            cache_manager.force_evict_with_scores(
+                                &mut kv_caches,
+                                args.eviction_target_ratio,
+                                acc.importance_scores(),
+                            )?
+                        } else {
+                            cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
+                        }
+                    } else {
+                        cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
+                    }
+                } else if let Some(ref acc) = score_accumulator {
                     if acc.is_active() {
                         cache_manager
                             .maybe_evict_with_scores(&mut kv_caches, acc.importance_scores())?
@@ -872,10 +948,63 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     cache_manager.maybe_evict(&mut kv_caches)?
                 };
-                if result.evicted
-                    && let Some(ref mut acc) = score_accumulator
-                {
-                    acc.reset();
+                if result.evicted {
+                    // Compute evicted indices from pre-eviction state
+                    let target_len = ((before_len as f32) * args.eviction_target_ratio) as usize;
+                    let evicted_indices = if !pre_eviction_scores.is_empty() {
+                        llm_rs2::profile::compute_h2o_evicted_indices(
+                            before_len,
+                            target_len,
+                            actual_protected_prefix,
+                            args.h2o_keep_ratio,
+                            &pre_eviction_scores,
+                        )
+                    } else {
+                        Vec::new()
+                    };
+
+                    if let Some(ref mut p) = profiler {
+                        // Record token deaths before the EvictionEvent
+                        if !evicted_indices.is_empty() {
+                            p.scores.record_token_deaths(
+                                decode_token_index,
+                                &evicted_indices,
+                                &position_birth_step,
+                                &pre_eviction_scores,
+                            );
+                        }
+                        p.on_eviction(llm_rs2::profile::EvictionEvent {
+                            step: decode_token_index,
+                            policy: args.eviction_policy.clone(),
+                            before_len,
+                            after_len: result.new_pos,
+                            evicted_count: result.tokens_removed,
+                            partition: llm_rs2::profile::PartitionInfo {
+                                prefix_end: actual_protected_prefix,
+                                hh_count: 0,
+                                recent_start: result.new_pos,
+                            },
+                            evicted_indices: evicted_indices.clone(),
+                            pre_eviction_scores,
+                        });
+                    }
+
+                    // Update position_birth_step mapping after eviction (compact)
+                    if !position_birth_step.is_empty() {
+                        let evicted_set: std::collections::HashSet<usize> =
+                            evicted_indices.iter().copied().collect();
+                        let mut kept = Vec::new();
+                        for (pos, &birth) in position_birth_step.iter().enumerate() {
+                            if pos < before_len && !evicted_set.contains(&pos) {
+                                kept.push(birth);
+                            }
+                        }
+                        position_birth_step = kept;
+                    }
+
+                    if let Some(ref mut acc) = score_accumulator {
+                        acc.reset();
+                    }
                 }
             }
             forward_ms_values.push(forward_ms);
@@ -995,6 +1124,22 @@ fn main() -> anyhow::Result<()> {
                                         effective_ratio, r.tokens_removed, r.new_pos
                                     );
                                 }
+                                if let Some(ref mut p) = profiler {
+                                    p.on_eviction(llm_rs2::profile::EvictionEvent {
+                                        step: decode_token_index,
+                                        policy: args.eviction_policy.clone(),
+                                        before_len: r.new_pos + r.tokens_removed,
+                                        after_len: r.new_pos,
+                                        evicted_count: r.tokens_removed,
+                                        partition: llm_rs2::profile::PartitionInfo {
+                                            prefix_end: actual_protected_prefix,
+                                            hh_count: 0,
+                                            recent_start: r.new_pos,
+                                        },
+                                        evicted_indices: vec![],
+                                        pre_eviction_scores: vec![],
+                                    });
+                                }
                                 experiment_eviction_count += 1;
                                 experiment_evicted_total += r.tokens_removed;
                                 if let Some(ref mut acc) = score_accumulator {
@@ -1038,12 +1183,53 @@ fn main() -> anyhow::Result<()> {
                 vec![]
             };
 
+            let sample_start = std::time::Instant::now();
             let next_token_id =
                 sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config);
+            let sample_us = sample_start.elapsed().as_micros() as u64;
 
             let now = std::time::Instant::now();
             let tbt = now.duration_since(_last_token_time).as_secs_f64() * 1000.0;
             tbt_values.push(tbt);
+
+            // ── Profiler: record step data ──
+            if let Some(ref mut p) = profiler {
+                let forward_us = (forward_ms * 1000.0) as u64;
+                let total_us = forward_us + sample_us;
+                let cache_len = kv_caches[0].current_pos;
+                let (imp, head_imp, n_kv) = match score_accumulator {
+                    Some(ref acc) if acc.is_active() => (
+                        Some(acc.importance_scores()),
+                        acc.head_importance_scores(),
+                        acc.n_kv_heads(),
+                    ),
+                    _ => (None, None, 0),
+                };
+                let pos_map = if position_birth_step.is_empty() {
+                    None
+                } else {
+                    Some(position_birth_step.as_slice())
+                };
+                p.on_step_end(
+                    decode_token_index,
+                    next_token_id,
+                    forward_us,
+                    sample_us,
+                    total_us,
+                    cache_len,
+                    imp,
+                    head_imp,
+                    n_kv,
+                    pos_map,
+                );
+                // Record new token birth
+                p.scores
+                    .record_token_births(decode_token_index + 1, 1, actual_protected_prefix);
+            }
+            // Track birth step for new token (even if profiler is off, keep mapping in sync)
+            if !position_birth_step.is_empty() {
+                position_birth_step.push(decode_token_index + 1);
+            }
 
             _last_token_time = now;
             tokens.push(next_token_id);
@@ -1138,9 +1324,22 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 6.5. Print profiler report if enabled
-    if let Some(ref profiler) = op_profiler {
-        profiler.print_report();
+    // 6.5. Export profiler data if enabled
+    if let Some(ref profiler) = profiler {
+        profiler.ops.print_report();
+
+        let metadata = llm_rs2::profile::ProfileMetadata {
+            model: args.model_path.clone(),
+            backend: args.backend.clone(),
+            eviction_policy: args.eviction_policy.clone(),
+            max_seq_len: args.max_seq_len,
+            prompt_len: prompt.len(),
+            generated_tokens: tbt_values.len(),
+        };
+        match profiler.export_json(&metadata) {
+            Ok(path) => eprintln!("[Profile] Exported to {}", path.display()),
+            Err(e) => eprintln!("[Profile] Export failed: {}", e),
+        }
     }
 
     // 7. Output results
