@@ -79,14 +79,20 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant OS as OS (/proc, /sys)
-    participant Mon as Manager<br/>Monitors
-    participant Eval as Manager<br/>PolicyEngine
-    participant Emit as Manager<br/>Emitter
-    participant Res as Engine<br/>ResilienceManager
-    participant Strat as Engine<br/>Strategy
-    participant CM as Engine<br/>CacheManager
-    participant Model as Engine<br/>LlamaModel
+    box rgb(70,70,70) OS
+        participant OS as /proc, /sys
+    end
+    box rgb(50,80,120) Manager (llm_manager)
+        participant Mon as Monitors
+        participant Eval as PolicyEngine
+        participant Emit as Emitter
+    end
+    box rgb(50,120,80) Engine (llm_rs2)
+        participant Res as ResilienceManager
+        participant Strat as Strategy
+        participant CM as CacheManager
+        participant Model as LlamaModel
+    end
 
     Note over OS,Model: 런타임 신호 흐름 (Manager → Engine, 단방향)
 
