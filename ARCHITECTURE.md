@@ -84,44 +84,25 @@ sequenceDiagram
     end
     box rgb(50,80,120) Manager (llm_manager)
         participant Mon as Monitors
-        participant Eval as PolicyEngine
-        participant Emit as Emitter
+        participant PE as PolicyEngine
     end
     box rgb(50,120,80) Engine (llm_rs2)
         participant Res as ResilienceManager
-        participant Strat as Strategy
         participant CM as CacheManager
-        participant Model as LlamaModel
     end
 
-    Note over OS,Model: 런타임 신호 흐름 (Manager → Engine, 단방향)
+    OS->>Mon: metric (memory 15%)
+    Mon->>PE: threshold 초과
+    PE->>Res: SystemSignal (Critical)
+    Res->>CM: Evict(0.50)
+    CM-->>Res: cache pruned
 
-    OS->>Mon: /proc/meminfo (available: 15%)
-    Mon->>Eval: raw metric
-    Eval->>Eval: hysteresis 평가<br/>(15% < critical 20%)
-    Eval->>Emit: SystemSignal::MemoryPressure<br/>{level: Critical, reclaim: 10%}
+    Note over OS,CM: 회복
 
-    alt D-Bus (Linux)
-        Emit->>Res: org.llm.Manager1 signal
-    else Unix Socket (Android)
-        Emit->>Res: [4B len][JSON]
-    end
-
-    Res->>Strat: MemoryStrategy.react(Critical)
-    Strat-->>Res: ResilienceAction::Evict(target_ratio: 0.50)
-    Res->>CM: force_evict(target_ratio: 0.50)
-    CM->>CM: CachePressurePipeline 실행<br/>(EvictionHandler / D2OHandler)
-    CM-->>Model: KV cache pruned
-
-    Note over OS,Model: 회복 흐름
-
-    OS->>Mon: /proc/meminfo (available: 55%)
-    Mon->>Eval: raw metric
-    Eval->>Eval: recovery threshold 통과<br/>(55% > critical + hysteresis)
-    Eval->>Emit: SystemSignal::MemoryPressure<br/>{level: Normal}
-    Emit->>Res: level: Normal
-    Res->>Strat: MemoryStrategy.react(Normal)
-    Strat-->>Res: ResilienceAction::RestoreDefaults
+    OS->>Mon: metric (memory 55%)
+    Mon->>PE: threshold 회복
+    PE->>Res: SystemSignal (Normal)
+    Res-->>Res: RestoreDefaults
 ```
 
 **통신 방향**: Manager → Engine (단방향). Engine은 Manager에 피드백을 보내지 않음 (fire-and-forget).
