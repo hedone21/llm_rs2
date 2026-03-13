@@ -29,6 +29,7 @@ use std::sync::Arc;
 ///   quantized across tokens in groups of QK2_0 (32).
 /// - Value: per-token blocks. For each head, each token's `head_dim` values
 ///   quantized in groups of QK2_0 (32).
+#[derive(Clone)]
 pub struct KiviCache {
     // Q2 compressed storage (raw block data)
     q2_k: Vec<BlockQ2_0>,
@@ -114,6 +115,19 @@ impl KiviCache {
     /// Total number of valid tokens (Q2 + residual).
     fn total_tokens(&self) -> usize {
         self.q2_tokens + self.res_pos
+    }
+
+    /// Reset cache to empty state (reuse allocations).
+    pub fn reset(&mut self) {
+        self.q2_k.clear();
+        self.q2_v.clear();
+        self.q2_tokens = 0;
+        self.res_k.fill(0.0);
+        self.res_v.fill(0.0);
+        self.res_pos = 0;
+        self.attn_k_buf.fill(0.0);
+        self.attn_v_buf.fill(0.0);
+        self.q2_deq_tokens = 0;
     }
 
     /// Flush residual buffer to Q2 storage.

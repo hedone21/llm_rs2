@@ -79,7 +79,8 @@ def tasks_to_grouped(tasks):
     return grouped, gold_map
 
 
-def run_eval_batch(tasks, model, policy, kv_budget, kv_budget_ratio, max_seq_len, kv_type):
+def run_eval_batch(tasks, model, policy, kv_budget, kv_budget_ratio, max_seq_len, kv_type,
+                    kivi=False, kivi_residual_size=32):
     """Run generate --eval-ll --eval-batch and return results."""
     grouped, gold_map = tasks_to_grouped(tasks)
 
@@ -98,6 +99,9 @@ def run_eval_batch(tasks, model, policy, kv_budget, kv_budget_ratio, max_seq_len
             "--kv-type", kv_type,
             "--greedy",
         ]
+
+        if kivi:
+            cmd.extend(["--kivi", "--kivi-residual-size", str(kivi_residual_size)])
 
         if kv_budget_ratio > 0:
             cmd.extend(["--kv-budget-ratio", str(kv_budget_ratio)])
@@ -184,6 +188,10 @@ def main():
                         help="Limit number of questions per task")
     parser.add_argument("--output", default=None,
                         help="Output JSON path")
+    parser.add_argument("--kivi", action="store_true",
+                        help="Enable KIVI Q2 KV cache compression")
+    parser.add_argument("--kivi-residual-size", type=int, default=32,
+                        help="KIVI residual buffer size (default: 32)")
     args = parser.parse_args()
 
     task_names = [t.strip() for t in args.tasks.split(",")]
@@ -213,6 +221,8 @@ def main():
                 tasks, args.model, policy,
                 args.kv_budget, args.kv_budget_ratio,
                 args.max_seq_len, args.kv_type,
+                kivi=args.kivi,
+                kivi_residual_size=args.kivi_residual_size,
             )
 
             if eval_output is None:
@@ -228,12 +238,14 @@ def main():
                 key += f"_r{int(args.kv_budget_ratio*100)}"
             elif args.kv_budget > 0:
                 key += f"_b{args.kv_budget}"
+            if args.kivi:
+                key += f"_kivi_r{args.kivi_residual_size}"
             all_results[key] = {
                 "task": task_name,
-                "policy": policy,
+                "policy": policy if not args.kivi else f"kivi_r{args.kivi_residual_size}",
                 "kv_budget": args.kv_budget,
                 "kv_budget_ratio": args.kv_budget_ratio,
-                "kv_type": args.kv_type,
+                "kv_type": args.kv_type if not args.kivi else "q2+f32",
                 "model": args.model,
                 "accuracy": acc,
                 "correct": acc_result["correct"],
@@ -265,6 +277,8 @@ def main():
             budget_str = f"_b{args.kv_budget}"
         else:
             budget_str = ""
+        if args.kivi:
+            budget_str += f"_kivi_r{args.kivi_residual_size}"
         output_path = os.path.join(
             RESULTS_DIR,
             f"{model_name}_{policies_str}{budget_str}.json"
