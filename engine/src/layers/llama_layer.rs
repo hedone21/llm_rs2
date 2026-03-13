@@ -272,6 +272,18 @@ impl LlamaLayer {
                             blocks[i].dequantize(&mut tmp);
                             vec[i * QK4_0..(i + 1) * QK4_0].copy_from_slice(&tmp);
                         }
+                    } else if t.dtype() == DType::F16 {
+                        let numel = t.numel();
+                        let byte_size = numel * 2;
+                        let mut byte_vec = vec![0u8; byte_size];
+                        backend.read_buffer(t, &mut byte_vec)?;
+                        vec.resize(numel, 0.0);
+                        let f16_slice = unsafe {
+                            std::slice::from_raw_parts(byte_vec.as_ptr() as *const half::f16, numel)
+                        };
+                        for i in 0..numel {
+                            vec[i] = f16_slice[i].to_f32();
+                        }
                     } else {
                         vec.resize(t.numel(), 0.0);
                         backend.read_buffer(t, as_u8_mut(vec))?;
