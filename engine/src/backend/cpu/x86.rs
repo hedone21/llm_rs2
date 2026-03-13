@@ -45,7 +45,7 @@ impl Backend for CpuBackendAVX2 {
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
-            DType::F16 => CpuBackendCommon::new().matmul_transposed_f16(a, b, out),
+            DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
             _ => Err(anyhow!(
@@ -59,13 +59,13 @@ impl Backend for CpuBackendAVX2 {
         &self,
         a: &Tensor,
         b: &Tensor,
-        rows: usize,
-        cols: usize,
+        _rows: usize,
+        _cols: usize,
         out: &mut Tensor,
     ) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
-            DType::F16 => CpuBackendCommon::new().matmul_transposed_f16(a, b, out),
+            DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
             _ => Err(anyhow!(
@@ -295,6 +295,139 @@ impl CpuBackendAVX2 {
                     }
                 });
             Ok(())
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn matmul_transposed_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        CpuBackendCommon::new().matmul_transposed_f16(a, b, out)
+    }
+
+    /// AVX2+F16C F16 matmul: A(F32) x B^T(F16) -> Out(F32)
+    /// Uses _mm256_cvtph_ps (F16C) for F16→F32 + _mm256_fmadd_ps (FMA).
+    #[cfg(target_arch = "x86_64")]
+    fn matmul_transposed_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        if !is_x86_feature_detected!("f16c") || !is_x86_feature_detected!("avx2") {
+            return CpuBackendCommon::new().matmul_transposed_f16(a, b, out);
+        }
+
+        unsafe {
+            let a_shape = a.shape().dims();
+            let b_shape = b.shape().dims();
+            let a_rank = a_shape.len();
+            let b_rank = b_shape.len();
+
+            let k = a_shape[a_rank - 1];
+            let m: usize = a_shape[..a_rank - 1].iter().product();
+            let n = b_shape[b_rank - 2];
+
+            let a_data = a.as_slice::<f32>();
+            let b_data = b.as_slice::<half::f16>();
+            let out_data = out.as_mut_slice::<f32>();
+
+            if (m * n * k) < 100_000 {
+                return self.matmul_transposed_f16_serial(a_data, b_data, out_data, m, n, k);
+            }
+
+            // Parallelize over output elements
+            out_data
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, out_val)| {
+                    let i = idx / n;
+                    let j = idx % n;
+
+                    unsafe {
+                        let a_ptr = a_data.as_ptr().add(i * k);
+                        let b_ptr = (b_data.as_ptr() as *const u16).add(j * k);
+                        *out_val = Self::vec_dot_f16_f32_avx2(k, a_ptr, b_ptr);
+                    }
+                });
+            Ok(())
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn matmul_transposed_f16_serial(
+        &self,
+        a_data: &[f32],
+        b_data: &[half::f16],
+        out_data: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        for i in 0..m {
+            let a_ptr = unsafe { a_data.as_ptr().add(i * k) };
+            for j in 0..n {
+                let b_ptr = unsafe { (b_data.as_ptr() as *const u16).add(j * k) };
+                out_data[i * n + j] = unsafe { Self::vec_dot_f16_f32_avx2(k, a_ptr, b_ptr) };
+            }
+        }
+        Ok(())
+    }
+
+    /// AVX2+F16C dot product: A(F32) · B(F16).
+    /// Processes 32 elements per iteration (4x unroll of 8-element F16C converts).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+    unsafe fn vec_dot_f16_f32_avx2(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
+        unsafe {
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut acc2 = _mm256_setzero_ps();
+            let mut acc3 = _mm256_setzero_ps();
+
+            let mut k_idx = 0;
+
+            // Main loop: 32 elements per iteration
+            while k_idx + 32 <= k {
+                let b0 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(k_idx) as *const __m128i));
+                let b1 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(k_idx + 8) as *const __m128i));
+                let b2 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(k_idx + 16) as *const __m128i));
+                let b3 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(k_idx + 24) as *const __m128i));
+
+                let a0 = _mm256_loadu_ps(a_ptr.add(k_idx));
+                let a1 = _mm256_loadu_ps(a_ptr.add(k_idx + 8));
+                let a2 = _mm256_loadu_ps(a_ptr.add(k_idx + 16));
+                let a3 = _mm256_loadu_ps(a_ptr.add(k_idx + 24));
+
+                acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+                acc1 = _mm256_fmadd_ps(a1, b1, acc1);
+                acc2 = _mm256_fmadd_ps(a2, b2, acc2);
+                acc3 = _mm256_fmadd_ps(a3, b3, acc3);
+
+                k_idx += 32;
+            }
+
+            // 8-element tail
+            while k_idx + 8 <= k {
+                let b0 = _mm256_cvtph_ps(_mm_loadu_si128(b_ptr.add(k_idx) as *const __m128i));
+                let a0 = _mm256_loadu_ps(a_ptr.add(k_idx));
+                acc0 = _mm256_fmadd_ps(a0, b0, acc0);
+                k_idx += 8;
+            }
+
+            // Reduce 4 accumulators
+            acc0 = _mm256_add_ps(acc0, acc1);
+            acc2 = _mm256_add_ps(acc2, acc3);
+            acc0 = _mm256_add_ps(acc0, acc2);
+
+            // Horizontal sum
+            let hi = _mm256_extractf128_ps(acc0, 1);
+            let lo = _mm256_castps256_ps128(acc0);
+            let sum128 = _mm_add_ps(hi, lo);
+            let sum128 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+            let sum128 = _mm_add_ss(sum128, _mm_movehdup_ps(sum128));
+            let mut sum = _mm_cvtss_f32(sum128);
+
+            // Scalar tail
+            while k_idx < k {
+                sum += *a_ptr.add(k_idx) * half::f16::from_bits(*b_ptr.add(k_idx)).to_f32();
+                k_idx += 1;
+            }
+
+            sum
         }
     }
 
