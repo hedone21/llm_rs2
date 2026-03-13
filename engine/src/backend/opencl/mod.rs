@@ -64,6 +64,7 @@ fn build_cl_opts(device: &Device) -> String {
 /// Uses Mutex to make the raw kernel pointers thread-safe.
 struct KernelCache {
     kernel_mul_mat_f32_f32: CoreKernel,
+    kernel_mul_mat_f16_f32: CoreKernel,
     kernel_mul_mat_q4_0_f32: CoreKernel,
     kernel_rms_norm_opt: CoreKernel,
     kernel_softmax_opt: CoreKernel,
@@ -95,6 +96,7 @@ pub struct OpenCLBackend {
     pub program: Program,
     pub simple_ops_program: Program,
     pub q4_0_program: Program,
+    pub f16_program: Program,
     pub quant_q4_0_program: Program,
     pub get_rows_program: Program,
 
@@ -317,9 +319,31 @@ impl OpenCLBackend {
             }
         };
 
+        // F16 matmul: try mul_mat_f16_f32.cl, fallback to dummy
+        let f16_src = include_str!("../../../kernels/mul_mat_f16_f32.cl");
+        let f16_program = match Program::builder()
+            .devices(device)
+            .src(f16_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("mul_mat_f16_f32.cl compiled");
+                p
+            }
+            Err(e) => {
+                log::warn!("mul_mat_f16_f32.cl failed: {}. Using dummy.", e);
+                Program::builder()
+                    .devices(device)
+                    .src("__kernel void mul_mat_f16_f32() {}")
+                    .build(&context)?
+            }
+        };
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
+            kernel_mul_mat_f16_f32: ocl::core::create_kernel(&f16_program, "mul_mat_f16_f32")?,
             kernel_mul_mat_q4_0_f32: ocl::core::create_kernel(
                 &q4_0_program,
                 "kernel_mul_mat_q4_0_f32",
@@ -380,10 +404,78 @@ impl OpenCLBackend {
             program,
             simple_ops_program,
             q4_0_program,
+            f16_program,
             quant_q4_0_program,
             get_rows_program,
             kernels: Mutex::new(kernel_cache),
         })
+    }
+
+    /// F16 weight matmul: A(F32) x B^T(F16) -> Out(F32)
+    /// Uses the mul_mat_f16_f32 kernel. B is the F16 weight matrix (row-major, transposed).
+    pub fn matmul_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+
+        let (m, k) = if a_dims.len() == 3 {
+            (a_dims[0] * a_dims[1], a_dims[2])
+        } else {
+            (a_dims[0], a_dims[1])
+        };
+        let n = b_dims[0];
+
+        let a_buf =
+            get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
+        let b_buf =
+            get_cl_mem(b.buffer().as_ref()).map_err(|_| anyhow!("B is not OpenCL buffer"))?;
+        let out_buf =
+            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+
+        let kernels = self
+            .kernels
+            .lock()
+            .map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_mul_mat_f16_f32;
+
+        // mul_mat_f16_f32 kernel signature: (M, N, K, A_void, A_offset, B_void, B_offset, C_void, C_offset)
+        // A = weight (F16, [N, K] row-major), B = activation (F32, [M, K] row-major), C = output (F32)
+        // Note: kernel treats first arg as the matrix with N rows (weight), second as M rows (activation)
+        let m_i32 = n as i32; // weight rows = output columns
+        let n_i32 = m as i32; // activation rows = output rows
+        let k_i32 = k as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::scalar(&m_i32))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&n_i32))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&k_i32))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(b_buf))?; // A=weight(F16)
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(a_buf))?; // B=activation(F32)
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::mem(out_buf))?; // C=output(F32)
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&0u64))?;
+
+            // Tile dimensions from kernel: OPWM=64, OPWN=64, WG_M=16, WG_N=8
+            let opwm = 64usize;
+            let opwn = 64usize;
+            let wg_m = 16usize; // OPWM / OPTM = 64 / 4
+            let wg_n = 8usize; // OPWN / OPTN = 64 / 8
+            let global_work_size: [usize; 3] =
+                [n.div_ceil(opwm) * wg_m, m.div_ceil(opwn) * wg_n, 1];
+            let local_work_size: [usize; 3] = [wg_m, wg_n, 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
     }
 
     pub fn matmul_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -503,6 +595,7 @@ impl Backend for OpenCLBackend {
             .map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: src_kernels.kernel_mul_mat_f32_f32.clone(),
+            kernel_mul_mat_f16_f32: src_kernels.kernel_mul_mat_f16_f32.clone(),
             kernel_mul_mat_q4_0_f32: src_kernels.kernel_mul_mat_q4_0_f32.clone(),
             kernel_rms_norm_opt: src_kernels.kernel_rms_norm_opt.clone(),
             kernel_softmax_opt: src_kernels.kernel_softmax_opt.clone(),
@@ -529,6 +622,7 @@ impl Backend for OpenCLBackend {
                 program: self.program.clone(),
                 simple_ops_program: self.simple_ops_program.clone(),
                 q4_0_program: self.q4_0_program.clone(),
+                f16_program: self.f16_program.clone(),
                 quant_q4_0_program: self.quant_q4_0_program.clone(),
                 get_rows_program: self.get_rows_program.clone(),
                 kernels: Mutex::new(kernel_cache),
@@ -685,10 +779,11 @@ impl Backend for OpenCLBackend {
     }
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-        if b.dtype() == DType::Q4_0 {
-            return self.matmul_q4_0(a, b, out);
+        match b.dtype() {
+            DType::Q4_0 => self.matmul_q4_0(a, b, out),
+            DType::F16 => self.matmul_f16(a, b, out),
+            _ => self.matmul(a, b, out), // F32 path
         }
-        self.matmul(a, b, out)
     }
 
     fn rms_norm(&self, x: &mut Tensor, weight: &Tensor, epsilon: f32) -> Result<()> {

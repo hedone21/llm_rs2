@@ -45,6 +45,7 @@ impl Backend for CpuBackendAVX2 {
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
+            DType::F16 => CpuBackendCommon::new().matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
             _ => Err(anyhow!(
@@ -64,6 +65,7 @@ impl Backend for CpuBackendAVX2 {
     ) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
+            DType::F16 => CpuBackendCommon::new().matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
             _ => Err(anyhow!(

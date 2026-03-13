@@ -75,6 +75,7 @@ impl Backend for CpuBackendCommon {
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
+            DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
             _ => Err(anyhow!(
@@ -95,6 +96,7 @@ impl Backend for CpuBackendCommon {
         // Reuse matmul_transposed logic as implemented in CPU backend
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
+            DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             DType::Q4_1 => self.matmul_transposed_q4_1(a, b, out),
             _ => Err(anyhow!(
@@ -819,6 +821,50 @@ impl CpuBackendCommon {
         Ok(())
     }
 
+    /// F16 weight matmul: A(F32) x B^T(F16) -> Out(F32)
+    /// Dequantizes F16 weights to F32 in blocks during dot product.
+    pub fn matmul_transposed_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        let a_shape = a.shape().dims();
+        let b_shape = b.shape().dims();
+        let a_rank = a_shape.len();
+        let b_rank = b_shape.len();
+
+        let k = a_shape[a_rank - 1];
+        let k_b = b_shape[b_rank - 1];
+
+        if k != k_b {
+            return Err(anyhow!(
+                "Shape mismatch for matmul_transposed_f16: K dims {} != {}",
+                k,
+                k_b
+            ));
+        }
+
+        let n = b_shape[b_rank - 2];
+
+        let a_data = a.as_slice::<f32>();
+        let b_data = b.as_slice::<half::f16>();
+        let out_data = out.as_mut_slice::<f32>();
+
+        out_data.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
+            let a_offset = i * k;
+            let a_row = &a_data[a_offset..a_offset + k];
+
+            for (j, out_val) in row.iter_mut().enumerate().take(n) {
+                let b_offset = j * k;
+                let b_row = &b_data[b_offset..b_offset + k];
+
+                let mut sum = 0.0f32;
+                for z in 0..k {
+                    sum += a_row[z] * b_row[z].to_f32();
+                }
+                *out_val = sum;
+            }
+        });
+
+        Ok(())
+    }
+
     #[allow(clippy::needless_range_loop)]
     pub fn matmul_transposed_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_shape = a.shape().dims();
@@ -1363,6 +1409,87 @@ mod tests {
             out_a.as_slice::<f32>(),
             1e-4,
             "matmul_slice_f32",
+        );
+    }
+
+    fn make_f16_tensor(backend: &Arc<dyn Backend>, shape: Vec<usize>, f32_data: &[f32]) -> Tensor {
+        let memory = Galloc::new();
+        let numel: usize = shape.iter().product();
+        assert_eq!(f32_data.len(), numel);
+        let buf = memory.alloc(numel * 2, DType::F16).unwrap();
+        let f16_data: Vec<half::f16> = f32_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                f16_data.as_ptr() as *const u8,
+                buf.as_mut_ptr(),
+                numel * 2,
+            );
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    #[test]
+    fn test_matmul_transposed_f16_oracle() {
+        let (m, k, n) = (1, 128, 64);
+        let a_data = gen_data(m * k, 42);
+        let b_data = gen_data(n * k, 137);
+
+        let backend = scalar_backend();
+
+        // Reference: F32 x F32
+        let a_f32 = make_f32_tensor(&backend, vec![m, k], &a_data);
+        let b_f32 = make_f32_tensor(&backend, vec![n, k], &b_data);
+        let mut out_ref = make_f32_tensor_zeros(&backend, vec![m, n]);
+        backend
+            .matmul_transposed(&a_f32, &b_f32, &mut out_ref)
+            .unwrap();
+
+        // Test: F32 x F16
+        let a_f32_2 = make_f32_tensor(&backend, vec![m, k], &a_data);
+        let b_f16 = make_f16_tensor(&backend, vec![n, k], &b_data);
+        let mut out_f16 = make_f32_tensor_zeros(&backend, vec![m, n]);
+        backend
+            .matmul_transposed(&a_f32_2, &b_f16, &mut out_f16)
+            .unwrap();
+
+        // F16 precision: ~1e-3 relative error
+        assert_close(
+            out_ref.as_slice::<f32>(),
+            out_f16.as_slice::<f32>(),
+            5e-2,
+            "matmul_transposed_f16 [1,128]x[64,128]",
+        );
+    }
+
+    #[test]
+    fn test_matmul_transposed_f16_large_oracle() {
+        let (m, k, n) = (8, 256, 128);
+        let a_data = gen_data(m * k, 53);
+        let b_data = gen_data(n * k, 97);
+
+        let backend = scalar_backend();
+
+        // Reference: F32 x F32
+        let a_f32 = make_f32_tensor(&backend, vec![m, k], &a_data);
+        let b_f32 = make_f32_tensor(&backend, vec![n, k], &b_data);
+        let mut out_ref = make_f32_tensor_zeros(&backend, vec![m, n]);
+        backend
+            .matmul_transposed(&a_f32, &b_f32, &mut out_ref)
+            .unwrap();
+
+        // Test: F32 x F16
+        let a_f32_2 = make_f32_tensor(&backend, vec![m, k], &a_data);
+        let b_f16 = make_f16_tensor(&backend, vec![n, k], &b_data);
+        let mut out_f16 = make_f32_tensor_zeros(&backend, vec![m, n]);
+        backend
+            .matmul_transposed(&a_f32_2, &b_f16, &mut out_f16)
+            .unwrap();
+
+        assert_close(
+            out_ref.as_slice::<f32>(),
+            out_f16.as_slice::<f32>(),
+            5e-2,
+            "matmul_transposed_f16 [8,256]x[128,256]",
         );
     }
 

@@ -102,6 +102,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     profile_per_head: bool,
 
+    /// Model weight data type (f16 or q4). f16 = no quantization, q4 = Q4_0 quantization at load time.
+    #[arg(long, default_value = "f16")]
+    weight_dtype: String,
+
     /// KV cache data type (f32, f16, or q4)
     #[arg(long, default_value = "f16")]
     kv_type: String,
@@ -313,7 +317,16 @@ fn main() -> anyhow::Result<()> {
     } else {
         Arc::new(Galloc::new())
     };
-    let model = LlamaModel::load(model_path, backend.clone(), &*memory)?;
+    let w_dtype = match args.weight_dtype.as_str() {
+        "f16" => DType::F16,
+        "q4" | "q4_0" => DType::Q4_0,
+        _ => anyhow::bail!(
+            "Unknown weight-dtype: {}. Use f16 or q4.",
+            args.weight_dtype
+        ),
+    };
+    eprintln!("[Config] Weight dtype: {:?}", w_dtype);
+    let model = LlamaModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
 
     // 2. Tokenizer
     let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_path))

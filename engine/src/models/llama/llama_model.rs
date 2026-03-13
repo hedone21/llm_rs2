@@ -58,6 +58,15 @@ pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
 
 impl LlamaModel {
     pub fn load(model_path: &str, backend: Arc<dyn Backend>, _memory: &dyn Memory) -> Result<Self> {
+        Self::load_with_dtype(model_path, backend, _memory, DType::F16)
+    }
+
+    pub fn load_with_dtype(
+        model_path: &str,
+        backend: Arc<dyn Backend>,
+        _memory: &dyn Memory,
+        weight_dtype: DType,
+    ) -> Result<Self> {
         let path = Path::new(model_path);
 
         // 1. Load Config
@@ -102,7 +111,8 @@ impl LlamaModel {
         let cpu_backend = Arc::new(crate::backend::cpu::CpuBackend::new());
 
         // Helper to load a specific tensor by name (supports multi-shard lookup)
-        let load_tensor = |name: &str, quantize: bool| -> Result<Tensor> {
+        // is_weight: true for weight matrices (use weight_dtype), false for norms/embeddings (always F32)
+        let load_tensor = |name: &str, is_weight: bool| -> Result<Tensor> {
             let tensor_view = if let Some(&idx) = weight_map.get(name) {
                 match shard_tensors[idx].tensor(name) {
                     Ok(v) => v,
@@ -123,9 +133,65 @@ impl LlamaModel {
             let shape = Shape::new(tensor_view.shape().to_vec());
             let num_elements: usize = tensor_view.shape().iter().product();
 
-            // Using captured cpu_memory and cpu_backend
+            let target_dtype = if is_weight { weight_dtype } else { DType::F32 };
 
-            // Read F32 data first
+            // F16 weight path: convert directly to F16 without F32 intermediate
+            if target_dtype == DType::F16 {
+                use half::f16;
+                let mut f16_data = vec![f16::from_f32(0.0); num_elements];
+
+                match tensor_view.dtype() {
+                    safetensors::Dtype::F16 => {
+                        // Zero-copy: direct memcpy from safetensors
+                        let data = tensor_view.data();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                f16_data.as_mut_ptr() as *mut u8,
+                                data.len(),
+                            );
+                        }
+                    }
+                    safetensors::Dtype::BF16 => {
+                        let data = tensor_view.data();
+                        let u16_data = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const u16, num_elements)
+                        };
+                        for (i, &b) in u16_data.iter().enumerate() {
+                            f16_data[i] = f16::from_f32(half::bf16::from_bits(b).to_f32());
+                        }
+                    }
+                    safetensors::Dtype::F32 => {
+                        let data = tensor_view.data();
+                        let f32_slice = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const f32, num_elements)
+                        };
+                        for (i, &v) in f32_slice.iter().enumerate() {
+                            f16_data[i] = f16::from_f32(v);
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "Unsupported dtype in safetensors: {:?}",
+                            tensor_view.dtype()
+                        ));
+                    }
+                }
+
+                let size_bytes = num_elements * 2;
+                let buffer = cpu_memory.alloc(size_bytes, DType::F16)?;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        f16_data.as_ptr() as *const u8,
+                        buffer.as_mut_ptr(),
+                        size_bytes,
+                    );
+                }
+                let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
+                return backend.copy_from(&cpu_tensor);
+            }
+
+            // F32 / Q4_0 path: read as F32 first
             let mut f32_data = vec![0.0f32; num_elements];
 
             match tensor_view.dtype() {
@@ -162,7 +228,7 @@ impl LlamaModel {
                 }
             }
 
-            if quantize {
+            if target_dtype == DType::Q4_0 {
                 // Quantize to Q4_0
                 let rows = shape.dims()[0];
                 let cols = shape.dims()[1];
@@ -223,6 +289,7 @@ impl LlamaModel {
                 let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
                 backend.copy_from(&cpu_tensor)
             } else {
+                // F32 (norms, embeddings)
                 let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -270,10 +337,10 @@ impl LlamaModel {
             weight_map.contains_key(lm_head_name)
         };
         let lm_head = if has_lm_head {
-            load_tensor(lm_head_name, true)? // Quantize head? Usually yes for FFN/Head
+            load_tensor(lm_head_name, true)?
         } else {
-            // Tied weights: embed_tokens is F32, quantize to Q4_0 for lm_head
-            println!("lm_head not found, quantizing embed_tokens for lm_head...");
+            // Tied weights: use embed_tokens with weight_dtype for lm_head
+            println!("lm_head not found, using embed_tokens as lm_head...");
             load_tensor("model.embed_tokens.weight", true)?
         };
 
