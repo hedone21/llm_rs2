@@ -36,7 +36,7 @@ impl Backend for CpuBackendNeon {
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
-            DType::F16 => CpuBackendCommon::new().matmul_transposed_f16(a, b, out),
+            DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
             _ => CpuBackendCommon::new().matmul_transposed(a, b, out),
         }
@@ -46,15 +46,15 @@ impl Backend for CpuBackendNeon {
         &self,
         a: &Tensor,
         b: &Tensor,
-        rows: usize,
-        cols: usize,
+        _rows: usize,
+        _cols: usize,
         out: &mut Tensor,
     ) -> Result<()> {
         match b.dtype() {
             DType::F32 => self.matmul_transposed_f32(a, b, out),
-            DType::F16 => CpuBackendCommon::new().matmul_transposed_f16(a, b, out),
+            DType::F16 => self.matmul_transposed_f16(a, b, out),
             DType::Q4_0 => self.matmul_transposed_q4_0(a, b, out),
-            _ => CpuBackendCommon::new().matmul_slice(a, b, rows, cols, out),
+            _ => CpuBackendCommon::new().matmul_transposed(a, b, out),
         }
     }
 
@@ -235,6 +235,170 @@ impl CpuBackendNeon {
             }
         }
         Ok(())
+    }
+
+    /// NEON F16 matmul: A(F32) x B^T(F16) -> Out(F32)
+    /// Uses fcvtl/fcvtl2 for F16→F32 conversion + vfmaq_f32 FMA.
+    fn matmul_transposed_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        let a_shape = a.shape().dims();
+        let b_shape = b.shape().dims();
+        let a_rank = a_shape.len();
+        let b_rank = b_shape.len();
+
+        let k = a_shape[a_rank - 1];
+        let n = b_shape[b_rank - 2];
+        let m: usize = a_shape[..a_rank - 1].iter().product();
+
+        let a_data = a.as_slice::<f32>();
+        let b_data = b.as_slice::<half::f16>();
+        let out_data = out.as_mut_slice::<f32>();
+
+        // Same heuristic as F32 NEON matmul
+        if (m * n * k) < 100_000 {
+            return self.matmul_transposed_f16_serial(a_data, b_data, out_data, m, n, k);
+        }
+
+        let num_threads = rayon::current_num_threads();
+        let chunk_size = ((n + num_threads - 1) / num_threads).max(256);
+
+        out_data
+            .par_chunks_mut(chunk_size)
+            .enumerate()
+            .for_each(|(chunk_idx, chunk)| {
+                let start_idx = chunk_idx * chunk_size;
+                for (local_i, out_val) in chunk.iter_mut().enumerate() {
+                    let idx = start_idx + local_i;
+                    let i = idx / n;
+                    let j = idx % n;
+
+                    let a_ptr = unsafe { a_data.as_ptr().add(i * k) };
+                    let b_ptr = unsafe { (b_data.as_ptr() as *const u16).add(j * k) };
+
+                    unsafe {
+                        *out_val = Self::vec_dot_f16_f32(k, a_ptr, b_ptr);
+                    }
+                }
+            });
+        Ok(())
+    }
+
+    fn matmul_transposed_f16_serial(
+        &self,
+        a_data: &[f32],
+        b_data: &[half::f16],
+        out_data: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        for i in 0..m {
+            let a_ptr = unsafe { a_data.as_ptr().add(i * k) };
+            for j in 0..n {
+                let b_ptr = unsafe { (b_data.as_ptr() as *const u16).add(j * k) };
+                out_data[i * n + j] = unsafe { Self::vec_dot_f16_f32(k, a_ptr, b_ptr) };
+            }
+        }
+        Ok(())
+    }
+
+    /// NEON dot product: A(F32) · B(F16) using fcvtl + vfmaq_f32.
+    /// Processes 16 elements per iteration (2x unroll of 8-element blocks).
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_f16_f32(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
+        let mut sum0 = vdupq_n_f32(0.0);
+        let mut sum1 = vdupq_n_f32(0.0);
+        let mut sum2 = vdupq_n_f32(0.0);
+        let mut sum3 = vdupq_n_f32(0.0);
+
+        let mut k_idx = 0;
+
+        // Main loop: 16 elements per iteration
+        while k_idx + 16 <= k {
+            // Load 2x8 f16 values
+            let b_raw0: uint16x8_t = vld1q_u16(b_ptr.add(k_idx));
+            let b_raw1: uint16x8_t = vld1q_u16(b_ptr.add(k_idx + 8));
+
+            // Convert f16 → f32 using fcvtl/fcvtl2
+            let b_f32_0: float32x4_t;
+            let b_f32_1: float32x4_t;
+            let b_f32_2: float32x4_t;
+            let b_f32_3: float32x4_t;
+
+            std::arch::asm!(
+                "fcvtl {out:v}.4s, {inp:v}.4h",
+                out = lateout(vreg) b_f32_0,
+                inp = in(vreg) b_raw0,
+            );
+            std::arch::asm!(
+                "fcvtl2 {out:v}.4s, {inp:v}.8h",
+                out = lateout(vreg) b_f32_1,
+                inp = in(vreg) b_raw0,
+            );
+            std::arch::asm!(
+                "fcvtl {out:v}.4s, {inp:v}.4h",
+                out = lateout(vreg) b_f32_2,
+                inp = in(vreg) b_raw1,
+            );
+            std::arch::asm!(
+                "fcvtl2 {out:v}.4s, {inp:v}.8h",
+                out = lateout(vreg) b_f32_3,
+                inp = in(vreg) b_raw1,
+            );
+
+            // Load 16 f32 activations
+            let a0 = vld1q_f32(a_ptr.add(k_idx));
+            let a1 = vld1q_f32(a_ptr.add(k_idx + 4));
+            let a2 = vld1q_f32(a_ptr.add(k_idx + 8));
+            let a3 = vld1q_f32(a_ptr.add(k_idx + 12));
+
+            // FMA
+            sum0 = vfmaq_f32(sum0, a0, b_f32_0);
+            sum1 = vfmaq_f32(sum1, a1, b_f32_1);
+            sum2 = vfmaq_f32(sum2, a2, b_f32_2);
+            sum3 = vfmaq_f32(sum3, a3, b_f32_3);
+
+            k_idx += 16;
+        }
+
+        // 8-element tail
+        while k_idx + 8 <= k {
+            let b_raw: uint16x8_t = vld1q_u16(b_ptr.add(k_idx));
+
+            let b_lo: float32x4_t;
+            let b_hi: float32x4_t;
+            std::arch::asm!(
+                "fcvtl {out:v}.4s, {inp:v}.4h",
+                out = lateout(vreg) b_lo,
+                inp = in(vreg) b_raw,
+            );
+            std::arch::asm!(
+                "fcvtl2 {out:v}.4s, {inp:v}.8h",
+                out = lateout(vreg) b_hi,
+                inp = in(vreg) b_raw,
+            );
+
+            let a0 = vld1q_f32(a_ptr.add(k_idx));
+            let a1 = vld1q_f32(a_ptr.add(k_idx + 4));
+
+            sum0 = vfmaq_f32(sum0, a0, b_lo);
+            sum1 = vfmaq_f32(sum1, a1, b_hi);
+
+            k_idx += 8;
+        }
+
+        // Reduce 4 accumulators → scalar
+        sum0 = vaddq_f32(sum0, sum1);
+        sum2 = vaddq_f32(sum2, sum3);
+        sum0 = vaddq_f32(sum0, sum2);
+        let mut sum = vaddvq_f32(sum0);
+
+        // Scalar tail
+        while k_idx < k {
+            sum += *a_ptr.add(k_idx) * half::f16::from_bits(*b_ptr.add(k_idx)).to_f32();
+            k_idx += 1;
+        }
+
+        sum
     }
 
     fn matmul_transposed_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
