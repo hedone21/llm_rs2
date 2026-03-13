@@ -1,0 +1,25 @@
+{
+  "piqa_sliding_r20": {
+    "task": "piqa",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.2,
+    "kv_type": "f16",
+    "model": "models/llama3.1-8b",
+    "accuracy": 0.71,
+    "correct": 71,
+    "total": 100,
+    "wall_time_s": 4788.423183136,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.20000000298023224,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.1-8b",
+      "time_normalized": true
+    }
+  }
+}
