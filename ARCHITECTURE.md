@@ -35,103 +35,81 @@
 
 ```mermaid
 graph TB
-    subgraph SystemLayer ["System (OS / Hardware)"]
-        ProcFS["/proc/meminfo\n/proc/stat\n/proc/pressure/"]
-        SysFS["/sys/class/thermal/\n/sys/class/power_supply/"]
+    subgraph OS ["OS / Hardware"]
+        SysMetrics["/proc, /sys\n(meminfo, thermal, stat, battery)"]
     end
 
-    subgraph ManagerService ["Manager Service (llm_manager)"]
-        MemMon["MemoryMonitor"]
-        ThermMon["ThermalMonitor"]
-        CompMon["ComputeMonitor"]
-        EnergyMon["EnergyMonitor"]
-        ExtMon["ExternalMonitor\n(signal injection)"]
-        Evaluator["ThresholdEvaluator\n(hysteresis)"]
-        EmitterTrait["Emitter trait"]
-        DBusEmit["DbusEmitter"]
-        UnixEmit["UnixSocketEmitter"]
+    subgraph Manager ["Manager Service (llm_manager)"]
+        Monitors["4 Monitors\n(Memory, Thermal, Compute, Energy)"]
+        Evaluator["ThresholdEvaluator"]
+        Emitter["Emitter\n(D-Bus / UnixSocket)"]
     end
 
-    subgraph SharedTypes ["Shared Types (llm_shared)"]
-        SysSignal["SystemSignal\n(4 variants)"]
-        LevelEnum["Level\n(Normal→Emergency)"]
+    subgraph Engine ["Inference Engine (llm_rs2)"]
+        Resilience["ResilienceManager"]
+        CacheMgr["CacheManager"]
+        Model["LlamaModel"]
+        Backends["CPU / OpenCL Backend"]
     end
 
-    subgraph EngineService ["Inference Engine (llm_rs2)"]
-        Generate["generate\n(main binary)"]
-        Resilience["ResilienceManager\n+ Strategy"]
-        CacheMgr["CacheManager\n+ Pipeline"]
-        Model["LlamaModel\n+ LlamaLayer"]
-        Backends["CpuBackend\nOpenCLBackend"]
-        KVCache2["KVCache / KiviCache"]
-    end
-
-    subgraph Tooling ["Tooling & Visualization"]
+    subgraph Tooling ["Tooling"]
+        Scripts["scripts/\n(device_registry, profiling)"]
+        Experiments["experiments/\n(benchmarks, prompts)"]
         Dashboard["Dashboard\n(Flask + Plotly.js)"]
-        Scripts["scripts/\n(device_registry,\nprofiling)"]
-        Experiments["experiments/\n(benchmarks,\nprompts, analysis)"]
     end
 
-    ProcFS --> MemMon
-    ProcFS --> CompMon
-    SysFS --> ThermMon
-    SysFS --> EnergyMon
-
-    MemMon --> Evaluator
-    ThermMon --> Evaluator
-    CompMon --> Evaluator
-    EnergyMon --> Evaluator
-    ExtMon --> Evaluator
-
-    Evaluator --> EmitterTrait
-    EmitterTrait -.-> DBusEmit
-    EmitterTrait -.-> UnixEmit
-
-    DBusEmit -->|"D-Bus / Unix Socket"| Resilience
-    UnixEmit -->|"D-Bus / Unix Socket"| Resilience
-    SysSignal -.->|"wire format"| DBusEmit
-    SysSignal -.->|"wire format"| UnixEmit
-
-    Resilience -->|"ResilienceAction"| CacheMgr
-    CacheMgr --> KVCache2
-    Generate --> Model
-    Generate --> CacheMgr
+    SysMetrics --> Monitors
+    Monitors --> Evaluator --> Emitter
+    Emitter -->|"SystemSignal"| Resilience
+    Resilience --> CacheMgr --> Model
     Model --> Backends
-    Model --> KVCache2
 
-    Scripts -->|"build/deploy/run"| Generate
-    Experiments -->|"eval prompts"| Generate
-    Dashboard -->|"results/data/*.json"| Scripts
+    Scripts -->|"build / deploy / run"| Engine
+    Experiments -->|"eval prompts"| Engine
+    Engine -.->|"results/*.json"| Dashboard
 ```
 
 ### Inter-Component Communication
 
-```
-┌─────────────┐   SystemSignal   ┌─────────────┐
-│   Manager    │ ──────────────→ │   Engine     │
-│ (llm_manager)│  D-Bus / Unix   │ (llm_rs2)    │
-│              │    Socket        │              │
-│  4 Monitors  │                 │ Resilience   │
-│  + Evaluator │                 │  Manager     │
-│  + Emitter   │                 │  → Strategy  │
-└─────────────┘                  │  → CacheMgr  │
-       ↑                         └──────┬───────┘
-       │                                │
-  /proc, /sys                    forward pass +
-  (OS metrics)                   token generation
-                                        │
-                                        ↓
-                                ┌───────────────┐
-                                │ results/*.json │
-                                └───────┬───────┘
-                                        │
-                                        ↓
-                              ┌──────────────────┐
-                              │    Dashboard     │
-                              │ (Flask + Plotly)  │
-                              │ http://localhost  │
-                              │      :5000       │
-                              └──────────────────┘
+```mermaid
+sequenceDiagram
+    participant OS as OS (/proc, /sys)
+    participant Mon as Manager<br/>Monitors
+    participant Eval as Manager<br/>Evaluator
+    participant Emit as Manager<br/>Emitter
+    participant Res as Engine<br/>ResilienceManager
+    participant Strat as Engine<br/>Strategy
+    participant CM as Engine<br/>CacheManager
+    participant Model as Engine<br/>LlamaModel
+
+    Note over OS,Model: 런타임 신호 흐름 (Manager → Engine, 단방향)
+
+    OS->>Mon: /proc/meminfo (available: 15%)
+    Mon->>Eval: raw metric
+    Eval->>Eval: hysteresis 평가<br/>(15% < critical 20%)
+    Eval->>Emit: SystemSignal::MemoryPressure<br/>{level: Critical, reclaim: 10%}
+
+    alt D-Bus (Linux)
+        Emit->>Res: org.llm.Manager1 signal
+    else Unix Socket (Android)
+        Emit->>Res: [4B len][JSON]
+    end
+
+    Res->>Strat: MemoryStrategy.react(Critical)
+    Strat-->>Res: ResilienceAction::Evict(target_ratio: 0.50)
+    Res->>CM: force_evict(target_ratio: 0.50)
+    CM->>CM: CachePressurePipeline 실행<br/>(EvictionHandler / D2OHandler)
+    CM-->>Model: KV cache pruned
+
+    Note over OS,Model: 회복 흐름
+
+    OS->>Mon: /proc/meminfo (available: 55%)
+    Mon->>Eval: raw metric
+    Eval->>Eval: recovery threshold 통과<br/>(55% > critical + hysteresis)
+    Eval->>Emit: SystemSignal::MemoryPressure<br/>{level: Normal}
+    Emit->>Res: level: Normal
+    Res->>Strat: MemoryStrategy.react(Normal)
+    Strat-->>Res: ResilienceAction::RestoreDefaults
 ```
 
 **통신 방향**: Manager → Engine (단방향). Engine은 Manager에 피드백을 보내지 않음 (fire-and-forget).
