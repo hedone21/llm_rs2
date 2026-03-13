@@ -36,13 +36,16 @@
 ```mermaid
 graph TB
     subgraph OS ["OS / Hardware"]
-        SysMetrics["/proc, /sys\n(meminfo, thermal, stat, battery)"]
+        SysMetrics["/proc, /sys
+        (meminfo, thermal, stat, battery)"]
     end
 
     subgraph Manager ["Manager Service (llm_manager)"]
-        Monitors["4 Monitors\n(Memory, Thermal, Compute, Energy)"]
-        Evaluator["ThresholdEvaluator"]
-        Emitter["Emitter\n(D-Bus / UnixSocket)"]
+        Monitors["4 Monitors
+        (Memory, Thermal, Compute, Energy)"]
+        PolicyEngine["PolicyEngine"]
+        Emitter["Emitter
+        (D-Bus / UnixSocket)"]
     end
 
     subgraph Engine ["Inference Engine (llm_rs2)"]
@@ -53,13 +56,16 @@ graph TB
     end
 
     subgraph Tooling ["Tooling"]
-        Scripts["scripts/\n(device_registry, profiling)"]
-        Experiments["experiments/\n(benchmarks, prompts)"]
-        Dashboard["Dashboard\n(Flask + Plotly.js)"]
+        Scripts["scripts/
+        (device_registry, profiling)"]
+        Experiments["experiments/
+        (benchmarks, prompts)"]
+        Dashboard["Dashboard
+        (Flask + Plotly.js)"]
     end
 
     SysMetrics --> Monitors
-    Monitors --> Evaluator --> Emitter
+    Monitors --> PolicyEngine --> Emitter
     Emitter -->|"SystemSignal"| Resilience
     Resilience --> CacheMgr --> Model
     Model --> Backends
@@ -75,7 +81,7 @@ graph TB
 sequenceDiagram
     participant OS as OS (/proc, /sys)
     participant Mon as Manager<br/>Monitors
-    participant Eval as Manager<br/>Evaluator
+    participant Eval as Manager<br/>PolicyEngine
     participant Emit as Manager<br/>Emitter
     participant Res as Engine<br/>ResilienceManager
     participant Strat as Engine<br/>Strategy
