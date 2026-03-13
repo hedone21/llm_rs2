@@ -103,7 +103,7 @@ struct Args {
     profile_per_head: bool,
 
     /// KV cache data type (f32, f16, or q4)
-    #[arg(long, default_value = "q4")]
+    #[arg(long, default_value = "f16")]
     kv_type: String,
 
     /// Eviction policy for KV cache management (none, sliding, h2o, h2o_plus, d2o)
