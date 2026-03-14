@@ -1875,12 +1875,15 @@ mod tests {
             max_depth: usize,
             simulate_forward: &dyn Fn(),
             preload_extra_delay: std::time::Duration,
+            store_mode: &str,
         ) -> (f64, usize, usize, usize, usize) {
             let token_bytes = kv_heads * head_dim * 2;
             let mut caches: Vec<OffloadKVCache> = (0..num_layers)
                 .map(|layer_id| {
-                    let store: Box<dyn store::OffloadStore> =
-                        Box::new(zram_store::ZramStore::new(token_bytes, 2, 64));
+                    let store: Box<dyn store::OffloadStore> = match store_mode {
+                        "raw" => Box::new(raw_store::RawStore::new(token_bytes)),
+                        _ => Box::new(zram_store::ZramStore::new(token_bytes, 2, 64)),
+                    };
                     OffloadKVCache::new(
                         layer_id,
                         kv_heads,
@@ -2036,7 +2039,7 @@ mod tests {
             start.elapsed().as_secs_f64() * 1000.0
         };
 
-        // Run with depth=1 (fixed)
+        // Run with depth=1 (fixed, zram)
         let (d1_ms, _d1_calls, d1_skips, d1_bufs, d1_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2047,9 +2050,10 @@ mod tests {
             1,
             &simulate_forward,
             simulate_preload_extra,
+            "zram",
         );
 
-        // Run with adaptive (max_depth=4)
+        // Run with adaptive (max_depth=4, zram)
         let (da_ms, _da_calls, _da_skips, da_bufs, da_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2060,9 +2064,10 @@ mod tests {
             4,
             &simulate_forward,
             simulate_preload_extra,
+            "zram",
         );
 
-        // Run with depth=4 (fixed max)
+        // Run with depth=4 (fixed max, zram)
         let (d4_ms, _d4_calls, _d4_skips, _d4_bufs, d4_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2073,56 +2078,80 @@ mod tests {
             4,
             &simulate_forward,
             simulate_preload_extra,
+            "zram",
+        );
+
+        // Run with adaptive (max_depth=4, raw) — Phase 3 optimization
+        let (raw_ms, _raw_calls, _raw_skips, raw_bufs, raw_depth) = run_with_depth(
+            num_layers,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            prefill_len,
+            decode_steps,
+            4,
+            &simulate_forward,
+            simulate_preload_extra,
+            "raw",
         );
 
         let base_per_tok = base_ms / decode_steps as f64;
         let d1_per_tok = d1_ms / decode_steps as f64;
         let da_per_tok = da_ms / decode_steps as f64;
         let d4_per_tok = d4_ms / decode_steps as f64;
+        let raw_per_tok = raw_ms / decode_steps as f64;
 
         println!("║");
         println!(
-            "║  {:25} {:>10} {:>10} {:>8} {:>10}",
+            "║  {:30} {:>10} {:>10} {:>8} {:>10}",
             "Strategy", "Total(ms)", "ms/tok", "Depth", "vs BASE"
         );
         println!("╠═══════════════════════════════════════════════════════════════════════════╣");
         println!(
-            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>10}",
+            "║  {:30} {:>10.1} {:>10.2} {:>8} {:>10}",
             "BASE (no offload)", base_ms, base_per_tok, "-", "-"
         );
         println!(
-            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Fixed depth=1",
+            "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Fixed depth=1 (zram)",
             d1_ms,
             d1_per_tok,
             d1_depth,
             (d1_ms / base_ms - 1.0) * 100.0
         );
         println!(
-            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Adaptive (max=4)",
+            "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Adaptive max=4 (zram)",
             da_ms,
             da_per_tok,
             da_depth,
             (da_ms / base_ms - 1.0) * 100.0
         );
         println!(
-            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Fixed depth=4",
+            "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Fixed depth=4 (zram)",
             d4_ms,
             d4_per_tok,
             d4_depth,
             (d4_ms / base_ms - 1.0) * 100.0
         );
+        println!(
+            "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Adaptive max=4 (raw+deferred)",
+            raw_ms,
+            raw_per_tok,
+            raw_depth,
+            (raw_ms / base_ms - 1.0) * 100.0
+        );
         println!("╠═══════════════════════════════════════════════════════════════════════════╣");
         println!(
-            "║  Offload overhead: depth=1 {:.1}%, adaptive {:.1}% (vs BASE)",
-            (d1_ms / base_ms - 1.0) * 100.0,
+            "║  Zram adaptive overhead: {:+.1}%  |  Raw+deferred overhead: {:+.1}%",
             (da_ms / base_ms - 1.0) * 100.0,
+            (raw_ms / base_ms - 1.0) * 100.0,
         );
         println!(
-            "║  Adaptive vs depth=1: {:.1}% faster",
-            (1.0 - da_ms / d1_ms) * 100.0,
+            "║  Raw+deferred vs Zram adaptive: {:.1}% faster",
+            (1.0 - raw_ms / da_ms) * 100.0,
         );
         println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
 
@@ -2144,12 +2173,262 @@ mod tests {
             da_bufs <= 6,
             "adaptive: too many active buffers at end: {da_bufs}"
         );
+        assert!(
+            raw_bufs <= 6,
+            "raw adaptive: too many active buffers at end: {raw_bufs}"
+        );
 
         // 3. Adaptive should not be catastrophically slower (< 2x overhead)
         assert!(
             da_ms < d1_ms * 2.5,
             "adaptive is too slow: {da_ms:.1}ms vs depth=1 {d1_ms:.1}ms"
         );
+    }
+
+    #[test]
+    fn test_bench_deferred_store_write() {
+        // Measures the performance impact of deferred store writes.
+        // No artificial delays — isolates pure store.append_token() cost.
+        use crate::core::offload::prefetch::PrefetchController;
+
+        let kv_heads = 8;
+        let head_dim = 64;
+        let num_layers = 16;
+        let max_seq_len = 2048;
+        let prefill_len = 128;
+        let decode_steps = 64;
+        let max_depth = 4;
+
+        println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
+        println!("║  Deferred Store Write Benchmark (no artificial delays)                   ║");
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  Config: layers={num_layers}, depth={max_depth}, decode={decode_steps}, \
+             kv_heads={kv_heads}, head_dim={head_dim}, prefill={prefill_len}"
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+
+        /// Run decode loop measuring per-token update + get_view cost.
+        /// `store_mode`: "zram", "raw"
+        /// `use_deferred`: if true, retained layers skip store writes (deferred).
+        fn run_bench(
+            store_mode: &str,
+            num_layers: usize,
+            max_seq_len: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            prefill_len: usize,
+            decode_steps: usize,
+            max_depth: usize,
+        ) -> (f64, f64, f64) {
+            let token_bytes = kv_heads * head_dim * 2;
+            let mut caches: Vec<OffloadKVCache> = (0..num_layers)
+                .map(|layer_id| {
+                    let store: Box<dyn store::OffloadStore> = match store_mode {
+                        "zram" => Box::new(zram_store::ZramStore::new(token_bytes, 2, 64)),
+                        "raw" => Box::new(raw_store::RawStore::new(token_bytes)),
+                        _ => unreachable!(),
+                    };
+                    OffloadKVCache::new(
+                        layer_id,
+                        kv_heads,
+                        head_dim,
+                        DType::F16,
+                        max_seq_len,
+                        store,
+                    )
+                })
+                .collect();
+
+            // Prefill
+            let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
+            let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
+            for c in caches.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+
+            let mut prefetch = PrefetchController::new(max_depth, num_layers);
+            let caches_ptr = caches.as_mut_ptr();
+
+            let decode_start = std::time::Instant::now();
+            let mut total_update_us = 0u64;
+            let mut total_getview_us = 0u64;
+
+            for step in 0..decode_steps {
+                let k_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
+                let v_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
+
+                // Update all layers
+                let upd_t0 = std::time::Instant::now();
+                for c in caches.iter_mut() {
+                    c.update(&k_tok, &v_tok).unwrap();
+                }
+                total_update_us += upd_t0.elapsed().as_micros() as u64;
+
+                let depth = prefetch.depth();
+
+                std::thread::scope(|s| {
+                    // Sync preload [0..depth)
+                    for j in 0..depth.min(num_layers) {
+                        let t0 = std::time::Instant::now();
+                        unsafe { (*caches_ptr.add(j)).preload().unwrap() };
+                        prefetch.record_preload(t0.elapsed());
+                    }
+
+                    // Fire background preloads [depth..2*depth)
+                    type Handle<'s> =
+                        Option<std::thread::ScopedJoinHandle<'s, std::time::Duration>>;
+                    let mut pending: Vec<Handle<'_>> = (0..num_layers).map(|_| None).collect();
+
+                    for j in depth..(2 * depth).min(num_layers) {
+                        let cache_j = unsafe { &mut *caches_ptr.add(j) };
+                        pending[j] = Some(s.spawn(move || {
+                            let t0 = std::time::Instant::now();
+                            cache_j.preload().unwrap();
+                            t0.elapsed()
+                        }));
+                    }
+
+                    for i in 0..num_layers {
+                        if let Some(handle) = pending[i].take() {
+                            let dur = handle.join().unwrap();
+                            prefetch.record_preload(dur);
+                        }
+
+                        let far_idx = i + depth;
+                        if far_idx < num_layers && pending[far_idx].is_none() {
+                            let cache_far = unsafe { &mut *caches_ptr.add(far_idx) };
+                            pending[far_idx] = Some(s.spawn(move || {
+                                let t0 = std::time::Instant::now();
+                                cache_far.preload().unwrap();
+                                t0.elapsed()
+                            }));
+                        }
+
+                        let current = unsafe { &mut *caches_ptr.add(i) };
+                        let gv_t0 = std::time::Instant::now();
+                        let _ = current.get_view();
+                        total_getview_us += gv_t0.elapsed().as_micros() as u64;
+                        prefetch.record_forward(gv_t0.elapsed());
+
+                        if i < depth {
+                            unsafe { (*caches_ptr.add(i)).retain_preload() };
+                        }
+                        if i > 0 && (i - 1) >= depth {
+                            unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
+                        }
+                    }
+
+                    for handle in pending.into_iter().flatten() {
+                        let dur = handle.join().unwrap();
+                        prefetch.record_preload(dur);
+                    }
+                    if num_layers >= 1 && (num_layers - 1) >= depth {
+                        caches[num_layers - 1].release_buffers();
+                    }
+                });
+
+                prefetch.adjust();
+            }
+
+            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+            let avg_update_us = total_update_us as f64 / (decode_steps * num_layers) as f64;
+            let avg_getview_us = total_getview_us as f64 / (decode_steps * num_layers) as f64;
+
+            (decode_ms, avg_update_us, avg_getview_us)
+        }
+
+        // ── BASE: no offload ──
+        let base_ms = {
+            let start = std::time::Instant::now();
+            let mut bases: Vec<KVCache> = (0..num_layers)
+                .map(|_| make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F16))
+                .collect();
+            let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
+            let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
+            for c in bases.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+            for step in 0..decode_steps {
+                let k =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
+                let v =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
+                for c in bases.iter_mut() {
+                    c.update(&k, &v).unwrap();
+                    let _ = KVCacheOps::get_view(c);
+                }
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+        let base_per_tok = base_ms / decode_steps as f64;
+
+        // ── ZramStore + deferred ──
+        let (zram_ms, zram_upd_us, zram_gv_us) = run_bench(
+            "zram",
+            num_layers,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            prefill_len,
+            decode_steps,
+            max_depth,
+        );
+        let zram_per_tok = zram_ms / decode_steps as f64;
+
+        // ── RawStore + deferred ──
+        let (raw_ms, raw_upd_us, raw_gv_us) = run_bench(
+            "raw",
+            num_layers,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            prefill_len,
+            decode_steps,
+            max_depth,
+        );
+        let raw_per_tok = raw_ms / decode_steps as f64;
+
+        println!("║");
+        println!(
+            "║  {:32} {:>10} {:>10} {:>10} {:>10} {:>10}",
+            "Configuration", "Total(ms)", "ms/tok", "upd(μs)", "gv(μs)", "vs BASE"
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:32} {:>10.1} {:>10.2} {:>10} {:>10} {:>10}",
+            "BASE (no offload)", base_ms, base_per_tok, "—", "—", "—"
+        );
+        println!(
+            "║  {:32} {:>10.1} {:>10.2} {:>10.1} {:>10.1} {:>+9.1}%",
+            "ZramStore (deferred, depth=4)",
+            zram_ms,
+            zram_per_tok,
+            zram_upd_us,
+            zram_gv_us,
+            (zram_ms / base_ms - 1.0) * 100.0
+        );
+        println!(
+            "║  {:32} {:>10.1} {:>10.2} {:>10.1} {:>10.1} {:>+9.1}%",
+            "RawStore (deferred, depth=4)",
+            raw_ms,
+            raw_per_tok,
+            raw_upd_us,
+            raw_gv_us,
+            (raw_ms / base_ms - 1.0) * 100.0
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  RawStore vs ZramStore: {:.1}% faster",
+            (1.0 - raw_ms / zram_ms) * 100.0
+        );
+        println!(
+            "║  RawStore overhead vs BASE: {:+.1}%",
+            (raw_ms / base_ms - 1.0) * 100.0
+        );
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
     }
 
     #[test]
