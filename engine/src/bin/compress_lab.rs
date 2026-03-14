@@ -460,6 +460,300 @@ fn algo_delta_token_bitshuffle_lz4(data: &[u8], _elem_size: usize) -> AlgoResult
     }
 }
 
+// ── H8: Zstd higher compression levels ──────────────────────────────────
+
+fn algo_expsplit_bytedelta_zstd3(data: &[u8], _elem_size: usize) -> AlgoResult {
+    expsplit_bytedelta_zstd_level(data, 3)
+}
+
+fn algo_expsplit_bytedelta_zstd5(data: &[u8], _elem_size: usize) -> AlgoResult {
+    expsplit_bytedelta_zstd_level(data, 5)
+}
+
+fn algo_expsplit_bytedelta_zstd9(data: &[u8], _elem_size: usize) -> AlgoResult {
+    expsplit_bytedelta_zstd_level(data, 9)
+}
+
+fn expsplit_bytedelta_zstd_level(data: &[u8], level: i32) -> AlgoResult {
+    let n = data.len() / 2;
+    let mut hi_stream = Vec::with_capacity(n);
+    let mut lo_stream = Vec::with_capacity(n);
+
+    let t0 = Instant::now();
+    for i in 0..n {
+        lo_stream.push(data[i * 2]);
+        hi_stream.push(data[i * 2 + 1]);
+    }
+    preprocess::bytedelta_encode(&mut hi_stream, n, 1);
+    let hi_compressed = zstd::bulk::compress(&hi_stream, level).unwrap();
+    let lo_compressed = lz4::block::compress(&lo_stream, None, false).unwrap();
+    let compress_us = t0.elapsed().as_micros() as u64;
+
+    let total_compressed = hi_compressed.len() + lo_compressed.len();
+
+    let t1 = Instant::now();
+    let mut hi_dec = zstd::bulk::decompress(&hi_compressed, n).unwrap();
+    preprocess::bytedelta_decode(&mut hi_dec, n, 1);
+    let lo_dec = lz4::block::decompress(&lo_compressed, Some(n as i32)).unwrap();
+    let mut restored = vec![0u8; data.len()];
+    for i in 0..n {
+        restored[i * 2] = lo_dec[i];
+        restored[i * 2 + 1] = hi_dec[i];
+    }
+    let decompress_us = t1.elapsed().as_micros() as u64;
+
+    AlgoResult {
+        compressed_size: total_compressed,
+        original_size: data.len(),
+        compress_us,
+        decompress_us,
+        verified: restored == data,
+    }
+}
+
+// ── H9: Hi-stream bitshuffle + Zstd ─────────────────────────────────────
+
+fn algo_expsplit_bitshuffle_zstd(data: &[u8], _elem_size: usize) -> AlgoResult {
+    let n = data.len() / 2;
+    let mut hi_stream = Vec::with_capacity(n);
+    let mut lo_stream = Vec::with_capacity(n);
+
+    let t0 = Instant::now();
+    for i in 0..n {
+        lo_stream.push(data[i * 2]);
+        hi_stream.push(data[i * 2 + 1]);
+    }
+    // Bitshuffle the hi stream (elem_size=1 for byte-level bit transpose)
+    let mut hi_shuffled = vec![0u8; n];
+    preprocess::bitshuffle(&hi_stream, &mut hi_shuffled, 1);
+    let hi_compressed = zstd::bulk::compress(&hi_shuffled, 1).unwrap();
+    let lo_compressed = lz4::block::compress(&lo_stream, None, false).unwrap();
+    let compress_us = t0.elapsed().as_micros() as u64;
+
+    let total_compressed = hi_compressed.len() + lo_compressed.len();
+
+    let t1 = Instant::now();
+    let hi_dec_shuffled = zstd::bulk::decompress(&hi_compressed, n).unwrap();
+    let mut hi_dec = vec![0u8; n];
+    preprocess::bitunshuffle(&hi_dec_shuffled, &mut hi_dec, 1);
+    let lo_dec = lz4::block::decompress(&lo_compressed, Some(n as i32)).unwrap();
+    let mut restored = vec![0u8; data.len()];
+    for i in 0..n {
+        restored[i * 2] = lo_dec[i];
+        restored[i * 2 + 1] = hi_dec[i];
+    }
+    let decompress_us = t1.elapsed().as_micros() as u64;
+
+    AlgoResult {
+        compressed_size: total_compressed,
+        original_size: data.len(),
+        compress_us,
+        decompress_us,
+        verified: restored == data,
+    }
+}
+
+// ── H10: Context-dependent lo byte coding ────────────────────────────────
+
+fn algo_expsplit_context_zstd(data: &[u8], _elem_size: usize) -> AlgoResult {
+    let n = data.len() / 2;
+
+    let t0 = Instant::now();
+    // Group lo bytes by their corresponding hi byte value
+    let mut buckets: std::collections::HashMap<u8, Vec<u8>> = std::collections::HashMap::new();
+    let mut hi_stream = Vec::with_capacity(n);
+    for i in 0..n {
+        let lo = data[i * 2];
+        let hi = data[i * 2 + 1];
+        hi_stream.push(hi);
+        buckets.entry(hi).or_default().push(lo);
+    }
+    // Compress hi stream with bytedelta + zstd
+    preprocess::bytedelta_encode(&mut hi_stream, n, 1);
+    let hi_compressed = zstd::bulk::compress(&hi_stream, 1).unwrap();
+
+    // Compress each lo bucket independently with zstd
+    let mut lo_total_compressed = 0usize;
+    let mut lo_buckets_compressed: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut bucket_keys: Vec<u8> = buckets.keys().copied().collect();
+    bucket_keys.sort();
+    for &key in &bucket_keys {
+        let bucket = &buckets[&key];
+        let compressed = zstd::bulk::compress(bucket, 1).unwrap();
+        lo_total_compressed += compressed.len();
+        lo_buckets_compressed.push((key, compressed));
+    }
+    let compress_us = t0.elapsed().as_micros() as u64;
+
+    // Header overhead: number of buckets + (key, size) per bucket
+    let header_size = 2 + bucket_keys.len() * 6; // 2 byte count + 6 per bucket
+    let total_compressed = hi_compressed.len() + lo_total_compressed + header_size;
+
+    let t1 = Instant::now();
+    // Decompress hi
+    let mut hi_dec = zstd::bulk::decompress(&hi_compressed, n).unwrap();
+    preprocess::bytedelta_decode(&mut hi_dec, n, 1);
+    // Decompress lo buckets
+    let mut lo_buckets_dec: std::collections::HashMap<u8, Vec<u8>> =
+        std::collections::HashMap::new();
+    for (key, compressed) in &lo_buckets_compressed {
+        let bucket_size = buckets[key].len();
+        let decompressed = zstd::bulk::decompress(compressed, bucket_size).unwrap();
+        lo_buckets_dec.insert(*key, decompressed);
+    }
+    // Reconstruct: replay hi bytes to get lo bytes from correct buckets
+    let mut bucket_cursors: std::collections::HashMap<u8, usize> = std::collections::HashMap::new();
+    let mut restored = vec![0u8; data.len()];
+    for i in 0..n {
+        let hi = hi_dec[i];
+        let cursor = bucket_cursors.entry(hi).or_insert(0);
+        let lo = lo_buckets_dec[&hi][*cursor];
+        *cursor += 1;
+        restored[i * 2] = lo;
+        restored[i * 2 + 1] = hi;
+    }
+    let decompress_us = t1.elapsed().as_micros() as u64;
+
+    AlgoResult {
+        compressed_size: total_compressed,
+        original_size: data.len(),
+        compress_us,
+        decompress_us,
+        verified: restored == data,
+    }
+}
+
+// ── H11: 3-stream bitfield split (sign, exp, mantissa) ──────────────────
+
+fn algo_3stream_bitfield_zstd(data: &[u8], _elem_size: usize) -> AlgoResult {
+    let n = data.len() / 2;
+
+    let t0 = Instant::now();
+    // Pack sign bits: 8 signs per byte
+    let sign_bytes = n.div_ceil(8);
+    let mut sign_stream = vec![0u8; sign_bytes];
+    // Exponent: 5 bits each, pack as u8 (0-31 range)
+    let mut exp_stream = Vec::with_capacity(n);
+    // Mantissa: 10 bits each, pack as 2 bytes LE
+    let mut man_stream = Vec::with_capacity(n * 2);
+
+    for i in 0..n {
+        let val = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+        let sign = (val >> 15) & 1;
+        let exp = ((val >> 10) & 0x1F) as u8;
+        let man = val & 0x03FF;
+
+        if sign != 0 {
+            sign_stream[i / 8] |= 1 << (i % 8);
+        }
+        exp_stream.push(exp);
+        man_stream.push((man & 0xFF) as u8);
+        man_stream.push((man >> 8) as u8);
+    }
+
+    // Compress each stream
+    let sign_compressed = lz4::block::compress(&sign_stream, None, false).unwrap();
+    preprocess::bytedelta_encode(&mut exp_stream, n, 1);
+    let exp_compressed = zstd::bulk::compress(&exp_stream, 1).unwrap();
+    let man_compressed = lz4::block::compress(&man_stream, None, false).unwrap();
+    let compress_us = t0.elapsed().as_micros() as u64;
+
+    let total_compressed = sign_compressed.len() + exp_compressed.len() + man_compressed.len();
+
+    let t1 = Instant::now();
+    let sign_dec = lz4::block::decompress(&sign_compressed, Some(sign_bytes as i32)).unwrap();
+    let mut exp_dec = zstd::bulk::decompress(&exp_compressed, n).unwrap();
+    preprocess::bytedelta_decode(&mut exp_dec, n, 1);
+    let man_dec = lz4::block::decompress(&man_compressed, Some((n * 2) as i32)).unwrap();
+
+    let mut restored = vec![0u8; data.len()];
+    for i in 0..n {
+        let sign = ((sign_dec[i / 8] >> (i % 8)) & 1) as u16;
+        let exp = exp_dec[i] as u16;
+        let man = u16::from_le_bytes([man_dec[i * 2], man_dec[i * 2 + 1]]);
+        let val = (sign << 15) | (exp << 10) | man;
+        restored[i * 2] = (val & 0xFF) as u8;
+        restored[i * 2 + 1] = (val >> 8) as u8;
+    }
+    let decompress_us = t1.elapsed().as_micros() as u64;
+
+    AlgoResult {
+        compressed_size: total_compressed,
+        original_size: data.len(),
+        compress_us,
+        decompress_us,
+        verified: restored == data,
+    }
+}
+
+// ── H12: Per-head independent compression ────────────────────────────────
+
+fn algo_perhead_expsplit_zstd(data: &[u8], _elem_size: usize) -> AlgoResult {
+    // Llama 3.2 1B: 8 heads × 64 dim = 512 F16 values per token
+    let n_heads = 8;
+    let head_dim = 64;
+    let bytes_per_token = n_heads * head_dim * 2;
+    let n_tokens = data.len() / bytes_per_token;
+    if n_tokens == 0 || !data.len().is_multiple_of(bytes_per_token) {
+        return algo_exponent_split_zstd(data, 2);
+    }
+
+    let t0 = Instant::now();
+    let mut total_compressed = 0usize;
+    let mut head_compressed_data: Vec<Vec<u8>> = Vec::new();
+    let head_values = n_tokens * head_dim; // F16 values per head
+
+    for h in 0..n_heads {
+        // Gather this head's data across all tokens
+        let mut hi_stream = Vec::with_capacity(head_values);
+        let mut lo_stream = Vec::with_capacity(head_values);
+        for tok in 0..n_tokens {
+            let base = tok * bytes_per_token + h * head_dim * 2;
+            for d in 0..head_dim {
+                lo_stream.push(data[base + d * 2]);
+                hi_stream.push(data[base + d * 2 + 1]);
+            }
+        }
+        preprocess::bytedelta_encode(&mut hi_stream, head_values, 1);
+        let hi_c = zstd::bulk::compress(&hi_stream, 1).unwrap();
+        let lo_c = lz4::block::compress(&lo_stream, None, false).unwrap();
+        total_compressed += hi_c.len() + lo_c.len();
+        head_compressed_data.push(hi_c);
+        head_compressed_data.push(lo_c);
+    }
+    let compress_us = t0.elapsed().as_micros() as u64;
+
+    // Add header overhead for per-head sizes
+    total_compressed += n_heads * 2 * 4; // 2 streams × 4 bytes size per head
+
+    let t1 = Instant::now();
+    let mut restored = vec![0u8; data.len()];
+    for h in 0..n_heads {
+        let hi_c = &head_compressed_data[h * 2];
+        let lo_c = &head_compressed_data[h * 2 + 1];
+        let mut hi_dec = zstd::bulk::decompress(hi_c, head_values).unwrap();
+        preprocess::bytedelta_decode(&mut hi_dec, head_values, 1);
+        let lo_dec = lz4::block::decompress(lo_c, Some(head_values as i32)).unwrap();
+        for tok in 0..n_tokens {
+            let base = tok * bytes_per_token + h * head_dim * 2;
+            for d in 0..head_dim {
+                let idx = tok * head_dim + d;
+                restored[base + d * 2] = lo_dec[idx];
+                restored[base + d * 2 + 1] = hi_dec[idx];
+            }
+        }
+    }
+    let decompress_us = t1.elapsed().as_micros() as u64;
+
+    AlgoResult {
+        compressed_size: total_compressed,
+        original_size: data.len(),
+        compress_us,
+        decompress_us,
+        verified: restored == data,
+    }
+}
+
 fn all_algorithms() -> Vec<(&'static str, AlgoFn)> {
     vec![
         ("raw_lz4", algo_raw_lz4 as AlgoFn),
@@ -477,6 +771,18 @@ fn all_algorithms() -> Vec<(&'static str, AlgoFn)> {
             "delta_token+bitshuffle+lz4",
             algo_delta_token_bitshuffle_lz4,
         ),
+        // H8: Zstd levels
+        ("H8:expsplit+bd+zstd(3)", algo_expsplit_bytedelta_zstd3),
+        ("H8:expsplit+bd+zstd(5)", algo_expsplit_bytedelta_zstd5),
+        ("H8:expsplit+bd+zstd(9)", algo_expsplit_bytedelta_zstd9),
+        // H9: Hi-stream bitshuffle
+        ("H9:expsplit+bitshuffle+zstd", algo_expsplit_bitshuffle_zstd),
+        // H10: Context-dependent lo coding
+        ("H10:context_lo+zstd", algo_expsplit_context_zstd),
+        // H11: 3-stream bitfield split
+        ("H11:3stream_bitfield+zstd", algo_3stream_bitfield_zstd),
+        // H12: Per-head compression
+        ("H12:perhead+expsplit+zstd", algo_perhead_expsplit_zstd),
     ]
 }
 
@@ -996,6 +1302,65 @@ fn run_benchmark(args: &Args) -> Result<()> {
         }
         let sub_byte_ent = byte_entropy(&sub_delta);
         println!("SUB delta byte entropy: {:.3} bits/byte", sub_byte_ent);
+
+        // ── H10: Hi↔Lo mutual information ──
+        println!("\n── H10: Hi↔Lo mutual information ──");
+        // I(Hi;Lo) = H(Hi) + H(Lo) - H(Hi,Lo)
+        // All in bits/symbol: H(Hi) and H(Lo) are bits/byte = bits per 1-byte symbol
+        // H(Hi,Lo) = f16_entropy = bits per 16-bit symbol = bits per (Hi,Lo) pair
+        let h_hi = byte_entropy(&hi);
+        let h_lo = byte_entropy(&lo);
+        let h_joint = f16_entropy; // bits per (Hi,Lo) pair
+        let mutual_info = h_hi + h_lo - h_joint;
+        println!(
+            "H(Hi)={:.3}, H(Lo)={:.3}, H(Hi,Lo)={:.3} bits/symbol",
+            h_hi, h_lo, h_joint
+        );
+        println!(
+            "I(Hi;Lo) = {:.3} bits/symbol ({:.1}% of H(Lo))",
+            mutual_info,
+            mutual_info / h_lo * 100.0
+        );
+        println!(
+            "Independent coding: {:.3} bits vs joint optimal: {:.3} bits → gap {:.3} bits/sym",
+            h_hi + h_lo,
+            h_joint,
+            mutual_info
+        );
+
+        // ── H12: Per-head entropy comparison ──
+        println!("\n── H12: Per-head entropy ──");
+        let head_dim = 64;
+        let n_heads = 8;
+        let bytes_per_token = n_heads * head_dim * 2;
+        let n_tokens_h = data.len() / bytes_per_token;
+        if n_tokens_h > 0 {
+            println!(
+                "{:>5}  {:>8}  {:>8}  {:>8}",
+                "Head", "Overall", "Hi byte", "Lo byte"
+            );
+            for h in 0..n_heads {
+                let mut head_data = Vec::new();
+                for tok in 0..n_tokens_h {
+                    let base = tok * bytes_per_token + h * head_dim * 2;
+                    head_data.extend_from_slice(&data[base..base + head_dim * 2]);
+                }
+                let hn = head_data.len() / 2;
+                let mut hhi = Vec::with_capacity(hn);
+                let mut hlo = Vec::with_capacity(hn);
+                for i in 0..hn {
+                    hlo.push(head_data[i * 2]);
+                    hhi.push(head_data[i * 2 + 1]);
+                }
+                println!(
+                    "   {:>2}  {:>8.3}  {:>8.3}  {:>8.3}",
+                    h,
+                    byte_entropy(&head_data),
+                    byte_entropy(&hhi),
+                    byte_entropy(&hlo),
+                );
+            }
+        }
     }
 
     Ok(())
