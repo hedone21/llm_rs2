@@ -1,14 +1,14 @@
 {
-  "timestamp": "2026-03-12T22:32:21.969765",
+  "timestamp": "2026-03-14T21:03:09.783818",
   "overall_gate": "FAIL",
   "summary": {
     "total_components": 23,
-    "pass": 19,
+    "pass": 8,
     "fail": 1,
-    "blocked": 1,
+    "blocked": 10,
     "skip": 0,
-    "na": 2,
-    "pass_rate": 90.5
+    "na": 4,
+    "pass_rate": 42.1
   },
   "tiers": {
     "T1": {
@@ -28,31 +28,31 @@
           "name": "Galloc",
           "module": "memory::galloc",
           "maturity": "Stable",
-          "total_tests": 3,
-          "passed": 3,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "Quant",
           "module": "core::quant",
           "maturity": "Stable",
-          "total_tests": 15,
-          "passed": 15,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "Shape",
           "module": "core::shape",
           "maturity": "Stable",
-          "total_tests": 3,
-          "passed": 3,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "SharedBuffer",
@@ -68,11 +68,11 @@
           "name": "Tensor",
           "module": "core::tensor",
           "maturity": "Stable",
-          "total_tests": 6,
-          "passed": 6,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         }
       ]
     },
@@ -83,11 +83,11 @@
           "name": "Attention",
           "module": "layers::attention",
           "maturity": "Stable",
-          "total_tests": 5,
-          "passed": 5,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "CacheManager",
@@ -133,21 +133,21 @@
           "name": "OperatingMode",
           "module": "resilience::state",
           "maturity": "Stable",
-          "total_tests": 5,
-          "passed": 5,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "ResilienceManager",
           "module": "resilience::manager",
           "maturity": "Stable",
-          "total_tests": 9,
-          "passed": 9,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "Signal/Level",
@@ -173,21 +173,21 @@
           "name": "Strategy",
           "module": "resilience::strategy",
           "maturity": "Stable",
-          "total_tests": 16,
-          "passed": 16,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         },
         {
           "name": "SystemMonitor",
           "module": "core::sys_monitor",
           "maturity": "Stable",
-          "total_tests": 3,
-          "passed": 3,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "BLOCKED"
         }
       ]
     },
@@ -223,21 +223,21 @@
           "name": "LayerWorkspace",
           "module": "layers::workspace",
           "maturity": "Stable",
-          "total_tests": 4,
-          "passed": 4,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "N/A"
         },
         {
           "name": "LlamaLayer",
           "module": "layers::llama_layer",
           "maturity": "Stable",
-          "total_tests": 3,
-          "passed": 3,
+          "total_tests": 0,
+          "passed": 0,
           "failed": 0,
           "skipped": 0,
-          "gate": "PASS"
+          "gate": "N/A"
         },
         {
           "name": "LlamaModel",
@@ -253,9 +253,9 @@
           "name": "UnifiedBuffer",
           "module": "buffer::unified_buffer",
           "maturity": "Stable",
-          "total_tests": 1,
+          "total_tests": 3,
           "passed": 0,
-          "failed": 1,
+          "failed": 3,
           "skipped": 0,
           "gate": "FAIL"
         }
@@ -738,6 +738,118 @@
       "passed": 466,
       "failed": 1,
       "pass_rate": 99.8
+    },
+    {
+      "date": "2026-03-14T10:56:35",
+      "total": 469,
+      "passed": 466,
+      "failed": 3,
+      "pass_rate": 99.4
+    },
+    {
+      "date": "2026-03-14T11:07:21",
+      "total": 484,
+      "passed": 484,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-14T11:12:03",
+      "total": 486,
+      "passed": 484,
+      "failed": 2,
+      "pass_rate": 99.6
+    },
+    {
+      "date": "2026-03-14T11:44:58",
+      "total": 272,
+      "passed": 269,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T12:15:22",
+      "total": 264,
+      "passed": 261,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T13:56:45",
+      "total": 267,
+      "passed": 264,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T14:17:09",
+      "total": 267,
+      "passed": 265,
+      "failed": 2,
+      "pass_rate": 99.3
+    },
+    {
+      "date": "2026-03-14T14:41:00",
+      "total": 262,
+      "passed": 260,
+      "failed": 2,
+      "pass_rate": 99.2
+    },
+    {
+      "date": "2026-03-14T15:38:38",
+      "total": 267,
+      "passed": 264,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T16:19:31",
+      "total": 264,
+      "passed": 264,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-14T16:28:41",
+      "total": 267,
+      "passed": 264,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T19:30:45",
+      "total": 266,
+      "passed": 263,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T20:00:11",
+      "total": 268,
+      "passed": 266,
+      "failed": 2,
+      "pass_rate": 99.3
+    },
+    {
+      "date": "2026-03-14T20:41:48",
+      "total": 275,
+      "passed": 275,
+      "failed": 0,
+      "pass_rate": 100.0
+    },
+    {
+      "date": "2026-03-14T20:48:03",
+      "total": 267,
+      "passed": 264,
+      "failed": 3,
+      "pass_rate": 98.9
+    },
+    {
+      "date": "2026-03-14T21:03:09",
+      "total": 267,
+      "passed": 264,
+      "failed": 3,
+      "pass_rate": 98.9
     }
   ]
 }
