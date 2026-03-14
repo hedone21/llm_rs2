@@ -77,6 +77,88 @@ pub fn unshuffle(src: &[u8], dst: &mut [u8], elem_size: usize) {
     }
 }
 
+// ── Bytedelta filter (Blosc2-inspired) ──────────────────────────────────
+
+/// Bytedelta encode: apply delta encoding within each byte stream.
+///
+/// After byte-shuffle, data is organized as `n_streams` contiguous streams
+/// of `stream_len` bytes each. Within each stream, consecutive bytes often
+/// differ by small amounts. Delta encoding replaces each byte with
+/// `current - previous`, producing many near-zero values that compress well.
+///
+/// This is an in-place operation on the shuffled data.
+pub fn bytedelta_encode(data: &mut [u8], stream_len: usize, n_streams: usize) {
+    debug_assert_eq!(data.len(), stream_len * n_streams);
+    for s in 0..n_streams {
+        let base = s * stream_len;
+        let mut prev = 0u8;
+        for i in 0..stream_len {
+            let curr = data[base + i];
+            data[base + i] = curr.wrapping_sub(prev);
+            prev = curr;
+        }
+    }
+}
+
+/// Bytedelta decode: restore original bytes via prefix-sum.
+///
+/// Inverse of `bytedelta_encode`. This is an in-place operation.
+pub fn bytedelta_decode(data: &mut [u8], stream_len: usize, n_streams: usize) {
+    debug_assert_eq!(data.len(), stream_len * n_streams);
+    for s in 0..n_streams {
+        let base = s * stream_len;
+        let mut prev = 0u8;
+        for i in 0..stream_len {
+            let val = data[base + i].wrapping_add(prev);
+            data[base + i] = val;
+            prev = val;
+        }
+    }
+}
+
+// ── Truncated precision filter (lossy) ──────────────────────────────────
+
+/// Zero the lowest `zero_bits` mantissa bits of each F16 value.
+///
+/// F16 format: 1 sign + 5 exponent + 10 mantissa bits.
+/// Zeroing low mantissa bits reduces effective precision but makes the
+/// data much more compressible (more repeated byte patterns after shuffle).
+///
+/// `zero_bits` must be in 0..=10. With 0, data is unchanged (lossless).
+pub fn trunc_prec_f16(data: &mut [u8], zero_bits: u32) {
+    if zero_bits == 0 || zero_bits > 10 {
+        return;
+    }
+    let mask = !((1u16 << zero_bits) - 1);
+    for chunk in data.chunks_exact_mut(2) {
+        let val = u16::from_le_bytes([chunk[0], chunk[1]]);
+        let truncated = val & mask;
+        let bytes = truncated.to_le_bytes();
+        chunk[0] = bytes[0];
+        chunk[1] = bytes[1];
+    }
+}
+
+/// Zero the lowest `zero_bits` mantissa bits of each F32 value.
+///
+/// F32 format: 1 sign + 8 exponent + 23 mantissa bits.
+/// `zero_bits` must be in 0..=23.
+pub fn trunc_prec_f32(data: &mut [u8], zero_bits: u32) {
+    if zero_bits == 0 || zero_bits > 23 {
+        return;
+    }
+    let mask = !((1u32 << zero_bits) - 1);
+    for chunk in data.chunks_exact_mut(4) {
+        let val = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let truncated = val & mask;
+        let bytes = truncated.to_le_bytes();
+        chunk[0] = bytes[0];
+        chunk[1] = bytes[1];
+        chunk[2] = bytes[2];
+        chunk[3] = bytes[3];
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +228,151 @@ mod tests {
         // Unknown elem size: identity
         shuffle(&original, &mut shuffled, 1);
         assert_eq!(&original, &shuffled);
+    }
+
+    // ── Bytedelta tests ──
+
+    #[test]
+    fn test_bytedelta_roundtrip() {
+        let original: Vec<u8> = (0..64).collect();
+        let mut data = original.clone();
+        // F16: 2 streams of 32 bytes each
+        bytedelta_encode(&mut data, 32, 2);
+        assert_ne!(&data, &original, "encode should change data");
+        bytedelta_decode(&mut data, 32, 2);
+        assert_eq!(&data, &original, "decode must restore original");
+    }
+
+    #[test]
+    fn test_bytedelta_constant_stream() {
+        // Constant bytes → all deltas should be 0 after the first
+        let mut data = vec![0x3Cu8; 16];
+        bytedelta_encode(&mut data, 16, 1);
+        assert_eq!(data[0], 0x3C); // first element unchanged
+        assert!(
+            data[1..].iter().all(|&b| b == 0),
+            "constant stream → zero deltas"
+        );
+    }
+
+    #[test]
+    fn test_bytedelta_with_shuffle_f16() {
+        // Full pipeline: shuffle → bytedelta → bytedelta_decode → unshuffle
+        let original: Vec<u8> = (0..128).collect();
+        let n = original.len() / 2; // 64 elements
+
+        let mut shuffled = vec![0u8; 128];
+        shuffle_f16(&original, &mut shuffled);
+        bytedelta_encode(&mut shuffled, n, 2);
+
+        // Decode
+        bytedelta_decode(&mut shuffled, n, 2);
+        let mut restored = vec![0u8; 128];
+        unshuffle_f16(&shuffled, &mut restored);
+        assert_eq!(&restored, &original);
+    }
+
+    #[test]
+    fn test_bytedelta_with_shuffle_f32() {
+        let original: Vec<u8> = (0..128).collect();
+        let n = original.len() / 4; // 32 elements
+
+        let mut shuffled = vec![0u8; 128];
+        shuffle_f32(&original, &mut shuffled);
+        bytedelta_encode(&mut shuffled, n, 4);
+
+        bytedelta_decode(&mut shuffled, n, 4);
+        let mut restored = vec![0u8; 128];
+        unshuffle_f32(&shuffled, &mut restored);
+        assert_eq!(&restored, &original);
+    }
+
+    #[test]
+    fn test_bytedelta_wrapping() {
+        // Test wrapping arithmetic: 0x02 - 0xFF = 0x03 (wrapping)
+        let mut data = vec![0xFF, 0x02];
+        bytedelta_encode(&mut data, 2, 1);
+        assert_eq!(data, vec![0xFF, 0x03]); // 0x02 - 0xFF = 0x03 (wrapping_sub)
+        bytedelta_decode(&mut data, 2, 1);
+        assert_eq!(data, vec![0xFF, 0x02]);
+    }
+
+    // ── Trunc prec tests ──
+
+    #[test]
+    fn test_trunc_prec_f16_zero_bits_noop() {
+        let original = vec![0x12, 0x34, 0x56, 0x78];
+        let mut data = original.clone();
+        trunc_prec_f16(&mut data, 0);
+        assert_eq!(&data, &original, "zero_bits=0 should be no-op");
+    }
+
+    #[test]
+    fn test_trunc_prec_f16_masks_low_bits() {
+        // F16 value 0x3C01 (1.0 + small mantissa)
+        // zero_bits=4 → mask = !0x000F = 0xFFF0
+        // 0x3C01 & 0xFFF0 = 0x3C00
+        let mut data = vec![0x01, 0x3C]; // little-endian 0x3C01
+        trunc_prec_f16(&mut data, 4);
+        assert_eq!(data, vec![0x00, 0x3C]); // 0x3C00
+    }
+
+    #[test]
+    fn test_trunc_prec_f16_max_bits() {
+        // zero_bits=10 → all mantissa zeroed, only sign+exponent remain
+        // 0x3FFF → 0x3C00 (exponent=15, mantissa=0)
+        let mut data = vec![0xFF, 0x3F];
+        trunc_prec_f16(&mut data, 10);
+        assert_eq!(data, vec![0x00, 0x3C]); // sign=0, exp=15, mantissa=0
+    }
+
+    #[test]
+    fn test_trunc_prec_f16_over_10_noop() {
+        let original = vec![0xFF, 0x3F];
+        let mut data = original.clone();
+        trunc_prec_f16(&mut data, 11);
+        assert_eq!(&data, &original, "zero_bits>10 should be no-op");
+    }
+
+    #[test]
+    fn test_trunc_prec_f32_masks_low_bits() {
+        // F32 value 0x3F800001 (1.0 + tiny mantissa)
+        // zero_bits=8 → mask = !0xFF = 0xFFFFFF00
+        // 0x3F800001 & 0xFFFFFF00 = 0x3F800000
+        let mut data = vec![0x01, 0x00, 0x80, 0x3F]; // little-endian
+        trunc_prec_f32(&mut data, 8);
+        assert_eq!(data, vec![0x00, 0x00, 0x80, 0x3F]); // exact 1.0
+    }
+
+    #[test]
+    fn test_trunc_then_shuffle_pipeline_f16() {
+        // Full lossy pipeline: trunc → shuffle → bytedelta → reverse
+        let mut data = vec![0u8; 64];
+        for i in 0..32 {
+            let val = 0x3C00u16 + (i as u16 * 17); // varying mantissa
+            data[i * 2] = (val & 0xFF) as u8;
+            data[i * 2 + 1] = (val >> 8) as u8;
+        }
+
+        // Apply trunc
+        let mut truncated = data.clone();
+        trunc_prec_f16(&mut truncated, 4);
+
+        // Full pipeline
+        let n = truncated.len() / 2;
+        let mut shuffled = vec![0u8; 64];
+        shuffle_f16(&truncated, &mut shuffled);
+        bytedelta_encode(&mut shuffled, n, 2);
+
+        // Reverse
+        bytedelta_decode(&mut shuffled, n, 2);
+        let mut restored = vec![0u8; 64];
+        unshuffle_f16(&shuffled, &mut restored);
+
+        // Should match truncated (not original!)
+        assert_eq!(&restored, &truncated);
+        // But NOT the original (lossy)
+        assert_ne!(&restored, &data);
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! ZramStore: lossless KV cache compression in memory using LZ4 + byte-shuffle.
+//! ZramStore: KV cache compression in memory using configurable filter+codec pipeline.
 //!
-//! Inspired by Linux zram swap. Raw F16/F32 data is byte-shuffled to group
-//! similar bytes (exponent/sign), then compressed with LZ4 block API.
+//! Inspired by Linux zram swap and Blosc2 filter architecture.
+//! Pipeline: [trunc_prec (optional, lossy)] → byte-shuffle → [bytedelta (optional)] → codec (LZ4/Zstd).
 //!
 //! Uses a residual buffer pattern (from KiviCache): recent tokens stay
 //! uncompressed, batch-compressed when the residual fills up.
@@ -10,7 +10,37 @@ use super::preprocess;
 use super::store::OffloadStore;
 use anyhow::{Context, Result};
 
-/// Lossless KV cache compression using LZ4 + byte-shuffle preprocessing.
+/// Compression codec selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZramCodec {
+    /// LZ4 block compression (fastest).
+    Lz4,
+    /// Zstandard compression at a given level (better ratio).
+    Zstd(i32),
+}
+
+/// Configuration for the ZramStore compression pipeline.
+#[derive(Debug, Clone)]
+pub struct ZramConfig {
+    /// Apply bytedelta filter after shuffle (Blosc2-inspired).
+    pub use_bytedelta: bool,
+    /// Number of F16/F32 mantissa bits to zero before compression (0 = lossless).
+    pub trunc_bits: u32,
+    /// Compression codec to use.
+    pub codec: ZramCodec,
+}
+
+impl Default for ZramConfig {
+    fn default() -> Self {
+        Self {
+            use_bytedelta: false,
+            trunc_bits: 0,
+            codec: ZramCodec::Lz4,
+        }
+    }
+}
+
+/// KV cache compression using configurable filter+codec pipeline.
 pub struct ZramStore {
     /// Compressed K data blocks (each block = residual_cap tokens).
     compressed_k: Vec<CompressedBlock>,
@@ -32,6 +62,8 @@ pub struct ZramStore {
     compressed_tokens: usize,
     /// Scratch buffer for shuffle/compress operations.
     shuffle_buf: Vec<u8>,
+    /// Pipeline configuration.
+    config: ZramConfig,
 }
 
 /// A single compressed block representing some tokens worth of data.
@@ -42,12 +74,22 @@ struct CompressedBlock {
 }
 
 impl ZramStore {
-    /// Create a new ZramStore.
+    /// Create a new ZramStore with default config (shuffle + LZ4, backward compatible).
     ///
     /// - `token_bytes`: bytes per token for K (or V), i.e. kv_heads × head_dim × dtype_size
     /// - `elem_size`: DType element size (2 for F16, 4 for F32)
     /// - `residual_cap`: number of tokens to buffer before batch-compressing (e.g. 64)
     pub fn new(token_bytes: usize, elem_size: usize, residual_cap: usize) -> Self {
+        Self::with_config(token_bytes, elem_size, residual_cap, ZramConfig::default())
+    }
+
+    /// Create a new ZramStore with explicit pipeline configuration.
+    pub fn with_config(
+        token_bytes: usize,
+        elem_size: usize,
+        residual_cap: usize,
+        config: ZramConfig,
+    ) -> Self {
         let res_bytes = residual_cap * token_bytes;
         Self {
             compressed_k: Vec::new(),
@@ -60,10 +102,13 @@ impl ZramStore {
             elem_size,
             compressed_tokens: 0,
             shuffle_buf: vec![0u8; res_bytes],
+            config,
         }
     }
 
-    /// Compress a data slice using byte-shuffle + LZ4.
+    /// Compress a data slice using the configured pipeline.
+    ///
+    /// Pipeline: [trunc_prec] → shuffle → [bytedelta] → codec
     fn compress_block(&mut self, data: &[u8]) -> Result<CompressedBlock> {
         if data.is_empty() {
             return Ok(CompressedBlock {
@@ -77,12 +122,47 @@ impl ZramStore {
             self.shuffle_buf.resize(data.len(), 0);
         }
 
-        // Step 1: byte-shuffle
-        preprocess::shuffle(data, &mut self.shuffle_buf[..data.len()], self.elem_size);
+        // Step 1 (optional, lossy): truncate mantissa precision
+        if self.config.trunc_bits > 0 {
+            // We need a mutable copy for trunc_prec since data is &[u8]
+            self.shuffle_buf[..data.len()].copy_from_slice(data);
+            match self.elem_size {
+                2 => preprocess::trunc_prec_f16(
+                    &mut self.shuffle_buf[..data.len()],
+                    self.config.trunc_bits,
+                ),
+                4 => preprocess::trunc_prec_f32(
+                    &mut self.shuffle_buf[..data.len()],
+                    self.config.trunc_bits,
+                ),
+                _ => {}
+            }
+            // Shuffle in-place: need a second buffer
+            let mut tmp = vec![0u8; data.len()];
+            preprocess::shuffle(&self.shuffle_buf[..data.len()], &mut tmp, self.elem_size);
+            self.shuffle_buf[..data.len()].copy_from_slice(&tmp);
+        } else {
+            // Step 2: byte-shuffle
+            preprocess::shuffle(data, &mut self.shuffle_buf[..data.len()], self.elem_size);
+        }
 
-        // Step 2: LZ4 compress
-        let compressed = lz4::block::compress(&self.shuffle_buf[..data.len()], None, false)
-            .context("LZ4 compress")?;
+        // Step 3 (optional): bytedelta
+        if self.config.use_bytedelta {
+            let n_elements = data.len() / self.elem_size;
+            preprocess::bytedelta_encode(
+                &mut self.shuffle_buf[..data.len()],
+                n_elements,
+                self.elem_size,
+            );
+        }
+
+        // Step 4: codec compress
+        let compressed = match self.config.codec {
+            ZramCodec::Lz4 => lz4::block::compress(&self.shuffle_buf[..data.len()], None, false)
+                .context("LZ4 compress")?,
+            ZramCodec::Zstd(level) => zstd::bulk::compress(&self.shuffle_buf[..data.len()], level)
+                .context("Zstd compress")?,
+        };
 
         Ok(CompressedBlock {
             data: compressed,
@@ -91,16 +171,28 @@ impl ZramStore {
     }
 
     /// Decompress a block into the destination buffer.
+    ///
+    /// Pipeline (reverse): codec → [bytedelta_decode] → unshuffle
     fn decompress_block(&self, block: &CompressedBlock, dst: &mut [u8]) -> Result<()> {
         if block.original_size == 0 {
             return Ok(());
         }
 
-        // Step 1: LZ4 decompress into a temp buffer
-        let decompressed = lz4::block::decompress(&block.data, Some(block.original_size as i32))
-            .context("LZ4 decompress")?;
+        // Step 1: codec decompress
+        let mut decompressed = match self.config.codec {
+            ZramCodec::Lz4 => lz4::block::decompress(&block.data, Some(block.original_size as i32))
+                .context("LZ4 decompress")?,
+            ZramCodec::Zstd(_) => zstd::bulk::decompress(&block.data, block.original_size)
+                .context("Zstd decompress")?,
+        };
 
-        // Step 2: byte-unshuffle
+        // Step 2 (optional): bytedelta decode
+        if self.config.use_bytedelta {
+            let n_elements = block.original_size / self.elem_size;
+            preprocess::bytedelta_decode(&mut decompressed, n_elements, self.elem_size);
+        }
+
+        // Step 3: byte-unshuffle
         preprocess::unshuffle(
             &decompressed,
             &mut dst[..block.original_size],
@@ -156,6 +248,11 @@ impl ZramStore {
         }
         let original = self.compressed_tokens * self.token_bytes * 2; // K + V
         original as f64 / compressed as f64
+    }
+
+    /// Returns the current pipeline configuration.
+    pub fn config(&self) -> &ZramConfig {
+        &self.config
     }
 }
 
@@ -290,6 +387,8 @@ mod tests {
         data
     }
 
+    // ── Legacy API compatibility ──
+
     #[test]
     fn test_zram_store_roundtrip_f16() {
         let token_bytes = 8 * 64 * 2; // 8 heads × 64 dim × 2 bytes
@@ -335,7 +434,6 @@ mod tests {
         let token_bytes = 8 * 64 * 2;
         let mut store = ZramStore::new(token_bytes, 2, 64);
 
-        // Simulate decode: append tokens one by one
         let mut all_k = Vec::new();
         let mut all_v = Vec::new();
 
@@ -370,7 +468,6 @@ mod tests {
 
         let ratio = store.compression_ratio();
         println!("F16 compression ratio: {ratio:.2}x");
-        // With byte-shuffle, F16 data should compress well (≥1.5x)
         assert!(
             ratio >= 1.5,
             "F16 compression ratio {ratio:.2}x < 1.5x — byte-shuffle ineffective"
@@ -421,7 +518,6 @@ mod tests {
 
     #[test]
     fn test_zram_store_residual_flush_boundary() {
-        // Append exactly residual_cap tokens → triggers flush
         let token_bytes = 32;
         let residual_cap = 8;
         let mut store = ZramStore::new(token_bytes, 2, residual_cap);
@@ -429,7 +525,6 @@ mod tests {
         let mut all_k = Vec::new();
         let mut all_v = Vec::new();
 
-        // Fill residual_cap tokens (triggers flush) + 1 more
         for i in 0..(residual_cap + 1) as u8 {
             let k = vec![i; token_bytes];
             let v = vec![i + 100; token_bytes];
@@ -448,5 +543,328 @@ mod tests {
 
         assert_eq!(&k_buf, &all_k);
         assert_eq!(&v_buf, &all_v);
+    }
+
+    // ── Bytedelta pipeline tests ──
+
+    #[test]
+    fn test_zram_bytedelta_lz4_roundtrip_f16() {
+        let token_bytes = 8 * 64 * 2;
+        let num_tokens = 128;
+        let config = ZramConfig {
+            use_bytedelta: true,
+            trunc_bits: 0,
+            codec: ZramCodec::Lz4,
+        };
+        let mut store = ZramStore::with_config(token_bytes, 2, 64, config);
+
+        let k_data = make_f16_kv_data(num_tokens, token_bytes, 1);
+        let v_data = make_f16_kv_data(num_tokens, token_bytes, 2);
+
+        store.store(&k_data, &v_data, num_tokens).unwrap();
+
+        let mut k_buf = vec![0u8; k_data.len()];
+        let mut v_buf = vec![0u8; v_data.len()];
+        let loaded = store.load_into(&mut k_buf, &mut v_buf).unwrap();
+
+        assert_eq!(loaded, num_tokens);
+        assert_eq!(&k_buf, &k_data, "bytedelta+LZ4 K roundtrip failed");
+        assert_eq!(&v_buf, &v_data, "bytedelta+LZ4 V roundtrip failed");
+    }
+
+    #[test]
+    fn test_zram_bytedelta_zstd_roundtrip_f16() {
+        let token_bytes = 8 * 64 * 2;
+        let num_tokens = 128;
+        let config = ZramConfig {
+            use_bytedelta: true,
+            trunc_bits: 0,
+            codec: ZramCodec::Zstd(1),
+        };
+        let mut store = ZramStore::with_config(token_bytes, 2, 64, config);
+
+        let k_data = make_f16_kv_data(num_tokens, token_bytes, 5);
+        let v_data = make_f16_kv_data(num_tokens, token_bytes, 6);
+
+        store.store(&k_data, &v_data, num_tokens).unwrap();
+
+        let mut k_buf = vec![0u8; k_data.len()];
+        let mut v_buf = vec![0u8; v_data.len()];
+        store.load_into(&mut k_buf, &mut v_buf).unwrap();
+
+        assert_eq!(&k_buf, &k_data, "bytedelta+Zstd K roundtrip failed");
+        assert_eq!(&v_buf, &v_data, "bytedelta+Zstd V roundtrip failed");
+    }
+
+    #[test]
+    fn test_zram_trunc_bytedelta_zstd_roundtrip_f16() {
+        let token_bytes = 8 * 64 * 2;
+        let num_tokens = 128;
+        let config = ZramConfig {
+            use_bytedelta: true,
+            trunc_bits: 5,
+            codec: ZramCodec::Zstd(1),
+        };
+        let mut store = ZramStore::with_config(token_bytes, 2, 64, config);
+
+        let k_data = make_f16_kv_data(num_tokens, token_bytes, 7);
+        let v_data = make_f16_kv_data(num_tokens, token_bytes, 8);
+
+        store.store(&k_data, &v_data, num_tokens).unwrap();
+
+        let mut k_buf = vec![0u8; k_data.len()];
+        let mut v_buf = vec![0u8; v_data.len()];
+        store.load_into(&mut k_buf, &mut v_buf).unwrap();
+
+        // Lossy: data should NOT match original exactly
+        // But should match the truncated version
+        let mut k_expected = k_data.clone();
+        let mut v_expected = v_data.clone();
+        preprocess::trunc_prec_f16(&mut k_expected, 5);
+        preprocess::trunc_prec_f16(&mut v_expected, 5);
+
+        assert_eq!(
+            &k_buf, &k_expected,
+            "trunc+bytedelta+Zstd K should match truncated"
+        );
+        assert_eq!(
+            &v_buf, &v_expected,
+            "trunc+bytedelta+Zstd V should match truncated"
+        );
+    }
+
+    #[test]
+    fn test_zram_bytedelta_append_decode() {
+        let token_bytes = 8 * 64 * 2;
+        let config = ZramConfig {
+            use_bytedelta: true,
+            trunc_bits: 0,
+            codec: ZramCodec::Lz4,
+        };
+        let mut store = ZramStore::with_config(token_bytes, 2, 64, config);
+
+        let mut all_k = Vec::new();
+        let mut all_v = Vec::new();
+
+        for i in 0..100u8 {
+            let k_tok = make_f16_kv_data(1, token_bytes, i);
+            let v_tok = make_f16_kv_data(1, token_bytes, i + 128);
+            store.append_token(&k_tok, &v_tok).unwrap();
+            all_k.extend_from_slice(&k_tok);
+            all_v.extend_from_slice(&v_tok);
+        }
+
+        let mut k_buf = vec![0u8; all_k.len()];
+        let mut v_buf = vec![0u8; all_v.len()];
+        store.load_into(&mut k_buf, &mut v_buf).unwrap();
+
+        assert_eq!(&k_buf, &all_k, "bytedelta append K mismatch");
+        assert_eq!(&v_buf, &all_v, "bytedelta append V mismatch");
+    }
+
+    // ── Compression ratio comparison benchmark ──
+
+    fn pipeline_configs() -> Vec<(&'static str, ZramConfig)> {
+        vec![
+            (
+                "shuffle+LZ4",
+                ZramConfig {
+                    use_bytedelta: false,
+                    trunc_bits: 0,
+                    codec: ZramCodec::Lz4,
+                },
+            ),
+            (
+                "shuffle+bytedelta+LZ4",
+                ZramConfig {
+                    use_bytedelta: true,
+                    trunc_bits: 0,
+                    codec: ZramCodec::Lz4,
+                },
+            ),
+            (
+                "shuffle+bytedelta+Zstd(1)",
+                ZramConfig {
+                    use_bytedelta: true,
+                    trunc_bits: 0,
+                    codec: ZramCodec::Zstd(1),
+                },
+            ),
+            (
+                "trunc(3)+shuffle+bytedelta+LZ4",
+                ZramConfig {
+                    use_bytedelta: true,
+                    trunc_bits: 3,
+                    codec: ZramCodec::Lz4,
+                },
+            ),
+            (
+                "trunc(5)+shuffle+bytedelta+Zstd(1)",
+                ZramConfig {
+                    use_bytedelta: true,
+                    trunc_bits: 5,
+                    codec: ZramCodec::Zstd(1),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn test_compression_ratio_comparison_synthetic() {
+        let token_bytes = 8 * 64 * 2;
+        let num_tokens = 256;
+
+        let k_data = make_f16_kv_data(num_tokens, token_bytes, 42);
+        let v_data = make_f16_kv_data(num_tokens, token_bytes, 43);
+        let original_size = num_tokens * token_bytes * 2;
+
+        println!("\n=== Compression Ratio Comparison (synthetic F16) ===");
+        println!("{:<40} {:>10} {:>12}", "Pipeline", "Ratio", "Size");
+        println!("{}", "-".repeat(64));
+
+        for (name, config) in &pipeline_configs() {
+            let mut store = ZramStore::with_config(token_bytes, 2, 64, config.clone());
+            store.store(&k_data, &v_data, num_tokens).unwrap();
+
+            let ratio = store.compression_ratio();
+            let compressed_size = store.total_compressed_size();
+            println!("{:<40} {:>9.2}x {:>10} B", name, ratio, compressed_size);
+
+            // Verify lossless roundtrip
+            let mut k_buf = vec![0u8; k_data.len()];
+            let mut v_buf = vec![0u8; v_data.len()];
+            store.load_into(&mut k_buf, &mut v_buf).unwrap();
+            if config.trunc_bits == 0 {
+                assert_eq!(&k_buf, &k_data, "{name}: lossless K mismatch");
+                assert_eq!(&v_buf, &v_data, "{name}: lossless V mismatch");
+            }
+        }
+        println!("Original size: {original_size} B");
+    }
+
+    /// Generate high-entropy F16 data mimicking real KV cache activations.
+    /// Uses pseudo-random XORShift to produce near-random mantissa bits
+    /// with concentrated exponents (like real model outputs).
+    fn make_high_entropy_f16_data(num_tokens: usize, token_bytes: usize, seed: u64) -> Vec<u8> {
+        let total = num_tokens * token_bytes;
+        let mut data = vec![0u8; total];
+        let mut rng = seed;
+        for i in 0..total / 2 {
+            // XORShift64 PRNG
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            // Exponent in small range (12-17 → 0x3000-0x4400), mantissa random
+            let exp = ((rng >> 32) % 6 + 12) as u16; // exponent 12-17
+            let mantissa = (rng & 0x03FF) as u16; // random 10-bit mantissa
+            let val = (exp << 10) | mantissa;
+            data[i * 2] = (val & 0xFF) as u8;
+            data[i * 2 + 1] = (val >> 8) as u8;
+        }
+        data
+    }
+
+    #[test]
+    fn test_compression_ratio_comparison_high_entropy() {
+        let token_bytes = 8 * 64 * 2; // 8 heads × 64 dim × F16
+        let num_tokens = 256;
+
+        let k_data = make_high_entropy_f16_data(num_tokens, token_bytes, 12345);
+        let v_data = make_high_entropy_f16_data(num_tokens, token_bytes, 67890);
+        let original_size = num_tokens * token_bytes * 2;
+
+        println!(
+            "\n=== Compression Ratio Comparison (HIGH-ENTROPY F16, pseudo-random mantissa) ==="
+        );
+        println!(
+            "{:<40} {:>10} {:>14} {:>14}",
+            "Pipeline", "Ratio", "Compress ms", "Decompr ms"
+        );
+        println!("{}", "-".repeat(82));
+
+        for (name, config) in &pipeline_configs() {
+            let mut store = ZramStore::with_config(token_bytes, 2, 64, config.clone());
+
+            // Measure compress time
+            let t0 = std::time::Instant::now();
+            store.store(&k_data, &v_data, num_tokens).unwrap();
+            let compress_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let ratio = store.compression_ratio();
+
+            // Measure decompress time
+            let mut k_buf = vec![0u8; k_data.len()];
+            let mut v_buf = vec![0u8; v_data.len()];
+            let t1 = std::time::Instant::now();
+            store.load_into(&mut k_buf, &mut v_buf).unwrap();
+            let decompress_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+            println!(
+                "{:<40} {:>9.2}x {:>12.3} ms {:>12.3} ms",
+                name, ratio, compress_ms, decompress_ms
+            );
+
+            // Verify roundtrip
+            if config.trunc_bits == 0 {
+                assert_eq!(&k_buf, &k_data, "{name}: lossless K mismatch");
+                assert_eq!(&v_buf, &v_data, "{name}: lossless V mismatch");
+            } else {
+                // Lossy: verify matches truncated expectation
+                let mut k_expected = k_data.clone();
+                let mut v_expected = v_data.clone();
+                preprocess::trunc_prec_f16(&mut k_expected, config.trunc_bits);
+                preprocess::trunc_prec_f16(&mut v_expected, config.trunc_bits);
+                assert_eq!(&k_buf, &k_expected, "{name}: lossy K mismatch");
+                assert_eq!(&v_buf, &v_expected, "{name}: lossy V mismatch");
+            }
+        }
+        println!(
+            "Original size: {original_size} B ({:.1} KB)",
+            original_size as f64 / 1024.0
+        );
+    }
+
+    #[test]
+    fn test_compression_ratio_comparison_high_entropy_large() {
+        // Simulate a realistic layer: 512 tokens × 8 heads × 64 dim × F16
+        let token_bytes = 8 * 64 * 2;
+        let num_tokens = 512;
+
+        let k_data = make_high_entropy_f16_data(num_tokens, token_bytes, 11111);
+        let v_data = make_high_entropy_f16_data(num_tokens, token_bytes, 22222);
+        let original_size = num_tokens * token_bytes * 2;
+
+        println!("\n=== Compression Ratio (HIGH-ENTROPY, 512 tokens, ~1MB) ===");
+        println!(
+            "{:<40} {:>10} {:>12} {:>14} {:>14}",
+            "Pipeline", "Ratio", "Size", "Compress", "Decompress"
+        );
+        println!("{}", "-".repeat(96));
+
+        for (name, config) in &pipeline_configs() {
+            let mut store = ZramStore::with_config(token_bytes, 2, 128, config.clone());
+
+            let t0 = std::time::Instant::now();
+            store.store(&k_data, &v_data, num_tokens).unwrap();
+            let compress_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            let ratio = store.compression_ratio();
+            let compressed_size = store.total_compressed_size();
+
+            let mut k_buf = vec![0u8; k_data.len()];
+            let mut v_buf = vec![0u8; v_data.len()];
+            let t1 = std::time::Instant::now();
+            store.load_into(&mut k_buf, &mut v_buf).unwrap();
+            let decompress_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+            println!(
+                "{:<40} {:>9.2}x {:>10} B {:>12.3} ms {:>12.3} ms",
+                name, ratio, compressed_size, compress_ms, decompress_ms
+            );
+        }
+        println!(
+            "Original size: {original_size} B ({:.1} KB)",
+            original_size as f64 / 1024.0
+        );
     }
 }
