@@ -864,9 +864,198 @@ fn run_benchmark(args: &Args) -> Result<()> {
             );
         }
         println!("  unique exponents: {}", sorted.len());
+
+        // ── H1: 16-bit symbol entropy ──
+        println!("\n── H1: 16-bit symbol entropy ──");
+        let f16_entropy = symbol_entropy_u16(data);
+        let theoretical_ratio = 16.0 / f16_entropy;
+        let unique_vals = count_unique_u16(data);
+        println!(
+            "F16 symbol entropy: {:.3} bits/symbol (max 16.0)",
+            f16_entropy
+        );
+        println!("Theoretical best ratio: {:.3}x", theoretical_ratio);
+        println!(
+            "Unique F16 values: {} / {} total ({:.1}% of 65536)",
+            unique_vals,
+            n,
+            unique_vals as f64 / 65536.0 * 100.0
+        );
+
+        // Top-10 most frequent F16 values
+        let mut val_counts = std::collections::HashMap::<u16, u32>::new();
+        for i in 0..n {
+            let val = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+            *val_counts.entry(val).or_insert(0) += 1;
+        }
+        let mut top_vals: Vec<_> = val_counts.iter().collect();
+        top_vals.sort_by(|a, b| b.1.cmp(a.1));
+        println!("Top-10 F16 values:");
+        for (val, count) in top_vals.iter().take(10) {
+            let f = half::f16::from_bits(**val);
+            println!(
+                "  0x{:04X} ({:>10.6}) : {:>6} ({:5.2}%)",
+                val,
+                f.to_f32(),
+                count,
+                **count as f64 / n as f64 * 100.0
+            );
+        }
+
+        // ── H4: Per-bit entropy profile ──
+        println!("\n── H4: Per-bit entropy profile ──");
+        println!("Bit  P(1)     Entropy  Region");
+        for bit in (0..16).rev() {
+            let ones = count_bit_ones(data, bit);
+            let p1 = ones as f64 / n as f64;
+            let bit_ent = if p1 == 0.0 || p1 == 1.0 {
+                0.0
+            } else {
+                -(p1 * p1.log2() + (1.0 - p1) * (1.0 - p1).log2())
+            };
+            let region = match bit {
+                15 => "sign",
+                10..=14 => "exponent",
+                _ => "mantissa",
+            };
+            println!(" {:2}  {:.4}  {:.4}    {}", bit, p1, bit_ent, region);
+        }
+
+        // ── H2: Exponent-grouped mantissa entropy ──
+        println!("\n── H2: Exponent-grouped mantissa entropy ──");
+        // Group mantissa values by exponent
+        let mut exp_groups: std::collections::HashMap<u8, Vec<u16>> =
+            std::collections::HashMap::new();
+        for i in 0..n {
+            let val = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+            let exp = ((val >> 10) & 0x1F) as u8;
+            let mantissa = val & 0x03FF; // lower 10 bits
+            exp_groups.entry(exp).or_default().push(mantissa);
+        }
+        let mut exp_keys: Vec<_> = exp_groups.keys().copied().collect();
+        exp_keys.sort();
+        println!(
+            "{:>4}  {:>7}  {:>8}  {:>8}  {:>7}",
+            "Exp", "Count", "Unique", "Ent(10b)", "Ent/max"
+        );
+        for exp in &exp_keys {
+            let mantissas = &exp_groups[exp];
+            let ent = symbol_entropy_u16_from_slice(mantissas);
+            let max_ent = 10.0f64; // 10-bit mantissa
+            let unique = {
+                let mut s = std::collections::HashSet::new();
+                for &m in mantissas {
+                    s.insert(m);
+                }
+                s.len()
+            };
+            println!(
+                " {:>3}  {:>7}  {:>8}  {:>8.3}  {:>6.1}%",
+                exp,
+                mantissas.len(),
+                unique,
+                ent,
+                ent / max_ent * 100.0
+            );
+        }
+
+        // ── H3: Adjacent channel XOR delta entropy ──
+        println!("\n── H3: Adjacent channel XOR delta entropy ──");
+        let mut delta_data = Vec::with_capacity(data.len());
+        // First value: copy as-is
+        delta_data.push(data[0]);
+        delta_data.push(data[1]);
+        for i in 1..n {
+            let curr = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+            let prev = u16::from_le_bytes([data[(i - 1) * 2], data[(i - 1) * 2 + 1]]);
+            let d = curr ^ prev;
+            delta_data.push((d & 0xFF) as u8);
+            delta_data.push((d >> 8) as u8);
+        }
+        let delta_byte_ent = byte_entropy(&delta_data);
+        let delta_sym_ent = symbol_entropy_u16(&delta_data);
+        println!(
+            "XOR delta byte entropy: {:.3} bits/byte (원본 {:.3})",
+            delta_byte_ent,
+            byte_entropy(data)
+        );
+        println!(
+            "XOR delta F16 entropy:  {:.3} bits/sym  (원본 {:.3})",
+            delta_sym_ent, f16_entropy
+        );
+        // Also try integer subtraction delta
+        let mut sub_delta = Vec::with_capacity(data.len());
+        sub_delta.push(data[0]);
+        sub_delta.push(data[1]);
+        for i in 1..n {
+            let curr = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+            let prev = u16::from_le_bytes([data[(i - 1) * 2], data[(i - 1) * 2 + 1]]);
+            let d = curr.wrapping_sub(prev);
+            sub_delta.push((d & 0xFF) as u8);
+            sub_delta.push((d >> 8) as u8);
+        }
+        let sub_byte_ent = byte_entropy(&sub_delta);
+        println!("SUB delta byte entropy: {:.3} bits/byte", sub_byte_ent);
     }
 
     Ok(())
+}
+
+fn symbol_entropy_u16(data: &[u8]) -> f64 {
+    let n = data.len() / 2;
+    let mut counts = std::collections::HashMap::<u16, u64>::new();
+    for i in 0..n {
+        let val = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+        *counts.entry(val).or_insert(0) += 1;
+    }
+    let total = n as f64;
+    let mut entropy = 0.0;
+    for &c in counts.values() {
+        if c > 0 {
+            let p = c as f64 / total;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+fn symbol_entropy_u16_from_slice(vals: &[u16]) -> f64 {
+    let mut counts = std::collections::HashMap::<u16, u64>::new();
+    for &v in vals {
+        *counts.entry(v).or_insert(0) += 1;
+    }
+    let total = vals.len() as f64;
+    let mut entropy = 0.0;
+    for &c in counts.values() {
+        if c > 0 {
+            let p = c as f64 / total;
+            entropy -= p * p.log2();
+        }
+    }
+    entropy
+}
+
+fn count_unique_u16(data: &[u8]) -> usize {
+    let n = data.len() / 2;
+    let mut set = std::collections::HashSet::new();
+    for i in 0..n {
+        let val = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+        set.insert(val);
+    }
+    set.len()
+}
+
+fn count_bit_ones(data: &[u8], bit: u32) -> usize {
+    let n = data.len() / 2;
+    let mask = 1u16 << bit;
+    let mut count = 0;
+    for i in 0..n {
+        let val = u16::from_le_bytes([data[i * 2], data[i * 2 + 1]]);
+        if val & mask != 0 {
+            count += 1;
+        }
+    }
+    count
 }
 
 fn byte_entropy(data: &[u8]) -> f64 {
