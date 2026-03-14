@@ -246,8 +246,8 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// KV cache offload mode: none, disk, or zram.
-    /// Offloads KV cache to disk files or compressed memory (lossless).
+    /// KV cache offload mode: none, disk, zram, or svd.
+    /// disk/zram: lossless offload. svd: SVD-compressed K + V offload.
     /// Requires --kv-layout seq and --kv-type f16 or f32.
     #[arg(long, default_value = "none")]
     kv_offload: String,
@@ -255,6 +255,10 @@ struct Args {
     /// Directory for disk-based offload storage.
     #[arg(long, default_value = "/tmp/llm_rs2_offload")]
     offload_dir: String,
+
+    /// SVD rank for K-cache compression (used with --kv-offload svd).
+    #[arg(long, default_value_t = 10)]
+    svd_rank: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -365,6 +369,25 @@ fn main() -> anyhow::Result<()> {
             args.experiment_sample_interval,
             &prompt,
             &args.backend,
+        );
+    }
+
+    // ── SVD offload mode: separate path with SvdOffloadKVCache ──
+    if args.kv_offload == "svd" {
+        return run_svd_offload(
+            &model,
+            &tokenizer,
+            &backend,
+            &memory,
+            &input_ids,
+            &sampling_config,
+            kv_heads,
+            head_dim,
+            num_layers,
+            max_seq_len,
+            args.num_tokens,
+            args.gpu_attn,
+            args.svd_rank,
         );
     }
 
@@ -2265,6 +2288,297 @@ fn run_kivi(
         kivi_mem_final / 1024,
         fp32_equiv / 1024,
     );
+
+    Ok(())
+}
+
+// ── SVD offload mode: SVD-compressed K + V offload ──────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn run_svd_offload(
+    model: &LlamaModel,
+    tokenizer: &tokenizers::Tokenizer,
+    backend: &Arc<dyn llm_rs2::core::backend::Backend>,
+    memory: &Arc<dyn llm_rs2::core::memory::Memory>,
+    input_ids: &[u32],
+    sampling_config: &SamplingConfig,
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    max_seq_len: usize,
+    num_tokens: usize,
+    gpu_attn: bool,
+    svd_rank: usize,
+) -> anyhow::Result<()> {
+    use llm_rs2::core::kv_cache::KVCacheOps;
+    use llm_rs2::core::offload::zram_store::ZramStore;
+    use llm_rs2::core::svd_cache::{SvdConfig, SvdOffloadKVCache};
+
+    let v_token_bytes = kv_heads * head_dim * DType::F16.size();
+
+    eprintln!(
+        "[SVD Offload] rank={}, kv_heads={}, head_dim={}, layers={}, max_seq={}",
+        svd_rank, kv_heads, head_dim, num_layers, max_seq_len,
+    );
+
+    // Create SvdOffloadKVCache per layer (V uses ZramStore)
+    let mut kv_caches: Vec<SvdOffloadKVCache> = (0..num_layers)
+        .map(|layer_id| {
+            let residual_cap = 64;
+            let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> =
+                Box::new(ZramStore::new(v_token_bytes, 2, residual_cap));
+            SvdOffloadKVCache::new(
+                layer_id,
+                kv_heads,
+                head_dim,
+                max_seq_len,
+                SvdConfig { rank_k: svd_rank },
+                store,
+            )
+        })
+        .collect();
+
+    let vocab_size = model.config.vocab_size;
+    let hidden_size = model.config.hidden_size;
+    let q_dim = model.config.num_attention_heads * head_dim;
+    let k_dim = kv_heads * head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = model.config.intermediate_size;
+
+    let mut gen_ws = LayerWorkspace::new(
+        llm_rs2::layers::workspace::WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let x_gen_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let mut x_gen = Tensor::new(
+        Shape::new(vec![1, 1, hidden_size]),
+        x_gen_buf,
+        backend.clone(),
+    );
+
+    let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut logits = Tensor::new(
+        Shape::new(vec![1, 1, vocab_size]),
+        logits_buf,
+        backend.clone(),
+    );
+
+    // === PREFILL ===
+    let mut tokens: Vec<u32> = input_ids.to_vec();
+    let process_len = tokens.len();
+    if process_len > max_seq_len {
+        anyhow::bail!(
+            "Prompt length {} exceeds max_seq_len {}",
+            process_len,
+            max_seq_len
+        );
+    }
+    let mut start_pos = 0usize;
+
+    let prefill_start = std::time::Instant::now();
+    {
+        let cpu_indices_buf = Galloc::new().alloc(process_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = cpu_indices_buf.as_mut_ptr() as *mut u32;
+            std::ptr::copy_nonoverlapping(tokens.as_ptr(), ptr, process_len);
+        }
+        let cpu_input = Tensor::new(
+            Shape::new(vec![1, process_len]),
+            cpu_indices_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let input_tensor = backend.copy_from(&cpu_input)?;
+
+        let prefill_logits_buf = memory.alloc(process_len * vocab_size * 4, DType::F32)?;
+        let mut prefill_logits = Tensor::new(
+            Shape::new(vec![1, process_len, vocab_size]),
+            prefill_logits_buf,
+            backend.clone(),
+        );
+
+        // Prefill uses standard forward_into (no prefetch needed for batch)
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: gpu_attn,
+            score_accumulator: None,
+            profiler: None,
+        })?;
+
+        let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
+        unsafe {
+            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
+            backend.read_buffer(&prefill_logits, slice)?;
+        }
+        let last_start = (process_len - 1) * vocab_size;
+        let next_token = sampling::sample(
+            &mut logits_cpu[last_start..last_start + vocab_size],
+            &tokens,
+            vocab_size,
+            sampling_config,
+        );
+        tokens.push(next_token);
+        start_pos = process_len;
+    }
+    let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+
+    let svd_mem_after_prefill: usize = kv_caches.iter().map(|c| c.memory_usage_bytes()).sum();
+    let raw_equiv = process_len * kv_heads * head_dim * 2 * 2 * num_layers; // K+V F16
+    eprintln!(
+        "[SVD Offload] Prefill: {:.1}ms, cache_pos={}, svd_mem={}KB (raw equiv={}KB, ratio={:.2}x)",
+        prefill_ms,
+        kv_caches[0].current_pos(),
+        svd_mem_after_prefill / 1024,
+        raw_equiv / 1024,
+        raw_equiv as f64 / svd_mem_after_prefill.max(1) as f64,
+    );
+
+    // Print prompt
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let initial_text = tokenizer.decode(&tokens, true).unwrap_or_default();
+    print!("{}", initial_text);
+    stdout.flush().ok();
+
+    // === DECODE with per-layer prefetch ===
+    let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_indices_buf,
+        Arc::new(CpuBackend::new()),
+    );
+
+    let eos_id = tokenizer
+        .get_vocab(true)
+        .get("</s>")
+        .copied()
+        .unwrap_or(u32::MAX);
+
+    let decode_start = std::time::Instant::now();
+    let mut generated_count = 0usize;
+    let mut tbt_values: Vec<f64> = Vec::new();
+    let mut forward_ms_values: Vec<f64> = Vec::new();
+    let mut last_token_time = std::time::Instant::now();
+
+    for _decode_idx in 0..(num_tokens - 1) {
+        if kv_caches[0].current_pos() >= max_seq_len {
+            eprintln!("\n[Stopped: Max context length reached]");
+            break;
+        }
+
+        let last_token = tokens[tokens.len() - 1];
+        unsafe {
+            *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
+        }
+        let gen_input = backend.copy_from(&cpu_gen_input)?;
+
+        // Reset preload flags at token boundary
+        for cache in kv_caches.iter_mut() {
+            cache.reset_preload();
+        }
+
+        let fwd_start = std::time::Instant::now();
+        model.forward_into_offload(LlamaModelForwardArgs {
+            input_tokens: &gen_input,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut logits,
+            x_gen: Some(&mut x_gen),
+            workspace: Some(&mut gen_ws),
+            use_gpu_attn: gpu_attn,
+            score_accumulator: None,
+            profiler: None,
+        })?;
+        let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
+        forward_ms_values.push(forward_ms);
+
+        start_pos += 1;
+        generated_count += 1;
+
+        let mut logits_cpu = vec![0.0f32; vocab_size];
+        unsafe {
+            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
+            backend.read_buffer(&logits, slice)?;
+        }
+
+        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config);
+
+        let now = std::time::Instant::now();
+        let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
+        tbt_values.push(tbt);
+        last_token_time = now;
+
+        tokens.push(next_token);
+
+        let text = tokenizer.decode(&tokens, true).unwrap_or_default();
+        let new_text = &text[initial_text.len()..];
+        print!("\r{}{}", initial_text, new_text);
+        stdout.flush().ok();
+
+        if next_token == eos_id {
+            break;
+        }
+    }
+
+    let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+    let tok_per_s = if decode_ms > 0.0 {
+        generated_count as f64 / (decode_ms / 1000.0)
+    } else {
+        0.0
+    };
+    let svd_mem_final: usize = kv_caches.iter().map(|c| c.memory_usage_bytes()).sum();
+    let final_raw_equiv = kv_caches[0].current_pos() * kv_heads * head_dim * 2 * 2 * num_layers;
+
+    eprintln!();
+    eprintln!(
+        "[SVD Offload] Decode: {} tokens, {:.1}ms ({:.1} tok/s)",
+        generated_count, decode_ms, tok_per_s,
+    );
+    eprintln!(
+        "[SVD Offload] Final: cache_pos={}, svd_mem={}KB (raw equiv={}KB, ratio={:.2}x)",
+        kv_caches[0].current_pos(),
+        svd_mem_final / 1024,
+        final_raw_equiv / 1024,
+        final_raw_equiv as f64 / svd_mem_final.max(1) as f64,
+    );
+
+    let avg_forward_ms = if forward_ms_values.is_empty() {
+        0.0
+    } else {
+        forward_ms_values.iter().sum::<f64>() / forward_ms_values.len() as f64
+    };
+    let avg_tbt = if tbt_values.is_empty() {
+        0.0
+    } else {
+        tbt_values.iter().sum::<f64>() / tbt_values.len() as f64
+    };
+
+    eprintln!(
+        "[SVD Offload] Avg forward={:.1}ms, avg TBT={:.1}ms, TTFT={:.1}ms",
+        avg_forward_ms, avg_tbt, prefill_ms,
+    );
+
+    println!("\nDone.");
 
     Ok(())
 }

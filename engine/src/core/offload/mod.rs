@@ -296,6 +296,20 @@ impl KVCacheOps for OffloadKVCache {
     }
 }
 
+impl crate::core::kv_cache::PrefetchableCache for OffloadKVCache {
+    fn preload(&mut self) -> Result<()> {
+        self.preload()
+    }
+
+    fn release_buffers(&mut self) {
+        self.release_buffers();
+    }
+
+    fn reset_preload(&mut self) {
+        self.reset_preload();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

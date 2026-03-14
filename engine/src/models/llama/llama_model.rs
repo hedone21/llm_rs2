@@ -468,9 +468,9 @@ impl LlamaModel {
     /// store while computing the current layer. This overlaps I/O with compute.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
-    pub fn forward_into_offload(
+    pub fn forward_into_offload<C: crate::core::kv_cache::PrefetchableCache>(
         &self,
-        args: LlamaModelForwardArgs<'_, crate::core::offload::OffloadKVCache>,
+        args: LlamaModelForwardArgs<'_, C>,
     ) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;

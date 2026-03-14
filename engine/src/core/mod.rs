@@ -12,5 +12,7 @@ pub mod pressure;
 pub mod quant;
 pub mod sampling;
 pub mod shape;
+pub mod svd_cache;
+pub mod svd_math;
 pub mod sys_monitor;
 pub mod tensor;
