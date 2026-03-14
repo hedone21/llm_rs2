@@ -461,16 +461,21 @@ impl LlamaModel {
         Ok(())
     }
 
-    /// Offload-optimized forward pass with per-layer prefetch pipeline.
+    /// Offload-optimized forward pass with adaptive multi-layer prefetch pipeline.
     ///
-    /// Identical to `forward_into()` except the layer loop uses `split_at_mut` +
-    /// `std::thread::scope` to preload the next layer's KV data from the offload
-    /// store while computing the current layer. This overlaps I/O with compute.
+    /// Uses `PrefetchController` to dynamically adjust how far ahead layers are
+    /// preloaded. When preload is slower than forward (pipeline stall), depth increases.
+    /// When there is slack, depth decreases to save memory.
+    ///
+    /// At each layer, exactly one background thread preloads the farthest future layer
+    /// (same thread count as depth=1). Closer layers are already loaded from previous
+    /// iterations. Preload guards prevent redundant decompression.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
     pub fn forward_into_offload<C: crate::core::kv_cache::PrefetchableCache>(
         &self,
         args: LlamaModelForwardArgs<'_, C>,
+        prefetch: &mut crate::core::offload::prefetch::PrefetchController,
     ) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -508,23 +513,37 @@ impl LlamaModel {
         };
         backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
 
-        // 2. Preload layer 0 (synchronous, before pipeline starts)
-        kv_caches[0].preload()?;
-
-        // 3. Layer loop with per-layer prefetch pipeline
+        // 2. Synchronous initial preload: layers [0..depth)
         let num_layers = self.layers.len();
+        let depth = prefetch.depth();
+        for cache in kv_caches.iter_mut().take(depth.min(num_layers)) {
+            cache.preload()?;
+        }
+
+        // 3. Layer loop with adaptive prefetch pipeline
         for i in 0..num_layers {
-            if i + 1 < num_layers {
-                // Split: current layer (left[i]) and next layer (right[0])
+            let layers_remaining = num_layers - i - 1;
+
+            if layers_remaining > 0 {
+                // Split: left[0..=i], right[i+1..]
                 let (left, right) = kv_caches.split_at_mut(i + 1);
                 let current = &mut left[i];
-                let next = &mut right[0];
+
+                // Target: the farthest future layer within depth window
+                // right[0] = layer i+1, so target_offset indexes into right[]
+                let target_offset = (depth - 1).min(right.len() - 1);
+                let target = &mut right[target_offset];
 
                 std::thread::scope(|s| {
-                    // Background: preload next layer's KV data
-                    let handle = s.spawn(|| next.preload());
+                    // Background: preload the target layer (guard skips if already loaded)
+                    let handle = s.spawn(|| {
+                        let t0 = std::time::Instant::now();
+                        let r = target.preload();
+                        (r, t0.elapsed())
+                    });
 
                     // Foreground: compute current layer
+                    let fwd_t0 = std::time::Instant::now();
                     let layer_result = self.layers[i].forward(LlamaLayerForwardArgs {
                         x: &mut x,
                         kv_cache: current,
@@ -539,23 +558,28 @@ impl LlamaModel {
                         head_dim: self.config.head_dim,
                         profiler: None,
                     });
+                    let fwd_dur = fwd_t0.elapsed();
 
-                    // Wait for preload and handle errors (R-P7)
+                    // Wait for preload and record timing
                     match handle.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            log::warn!("L{} preload failed: {e}, falling back to sync", i + 1);
-                            // next.preloaded remains false → get_view will sync load
+                        Ok((Ok(()), preload_dur)) => {
+                            prefetch.record(preload_dur, fwd_dur);
+                        }
+                        Ok((Err(e), _)) => {
+                            log::warn!(
+                                "L{} preload failed: {e}, falling back to sync",
+                                i + 1 + target_offset
+                            );
                         }
                         Err(_) => {
-                            log::error!("L{} preload thread panicked", i + 1);
+                            log::error!("L{} preload thread panicked", i + 1 + target_offset);
                         }
                     }
 
                     layer_result
                 })?;
 
-                // R-P1: Release previous layer's buffers
+                // Release previous layer's buffers (scope ended, borrows released)
                 if i > 0 {
                     kv_caches[i - 1].release_buffers();
                 }
@@ -580,6 +604,14 @@ impl LlamaModel {
                 kv_caches[i].release_buffers();
             }
         }
+
+        // Release remaining layer buffers (second-to-last wasn't released in loop)
+        if num_layers >= 2 {
+            kv_caches[num_layers - 2].release_buffers();
+        }
+
+        // Adjust depth for the next token
+        prefetch.adjust();
 
         // 4. Final Norm + Head (identical to forward_into)
         backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;

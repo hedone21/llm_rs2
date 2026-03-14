@@ -9,6 +9,7 @@
 //! and on-demand data loading for attention computation.
 
 pub mod disk_store;
+pub mod prefetch;
 pub mod preprocess;
 pub mod store;
 pub mod zram_store;
@@ -118,6 +119,10 @@ impl OffloadKVCache {
     /// Called by the prefetch pipeline to overlap I/O with compute.
     /// If attn buffers are not allocated, they are lazily created.
     pub fn preload(&mut self) -> Result<()> {
+        if self.preloaded {
+            return Ok(()); // Already loaded, skip redundant work
+        }
+
         let total_bytes = self.current_pos * self.token_bytes;
         if total_bytes == 0 {
             self.preloaded = true;
@@ -1714,5 +1719,37 @@ mod tests {
         let _ = cache.get_view();
         let ptr2 = cache.out_k_buf.as_ref().unwrap().as_ptr();
         assert_eq!(ptr1, ptr2, "SharedBuffer should be reused");
+    }
+
+    #[test]
+    fn test_preload_idempotent() {
+        let token_bytes = 2 * 32 * 2;
+        let store = zram_store::ZramStore::new(token_bytes, 2, 64);
+        let mut cache = OffloadKVCache::new(0, 2, 32, DType::F16, 256, Box::new(store));
+
+        let k = make_test_tensor(4, 2, 32, DType::F16, 0xAB);
+        let v = make_test_tensor(4, 2, 32, DType::F16, 0xCD);
+        cache.update(&k, &v).unwrap();
+
+        // First preload
+        cache.preload().unwrap();
+        let k_ptr1 = cache.attn_k_buf.as_ref().unwrap().as_ptr();
+
+        // Second preload (should be idempotent — skips due to guard)
+        cache.preload().unwrap();
+        let k_ptr2 = cache.attn_k_buf.as_ref().unwrap().as_ptr();
+        assert_eq!(k_ptr1, k_ptr2, "preload should be idempotent");
+
+        // Data should still be correct after double preload
+        let (k_view, v_view) = cache.get_view();
+        assert_eq!(k_view.shape().dims(), &[1, 4, 2, 32]);
+        assert_eq!(v_view.shape().dims(), &[1, 4, 2, 32]);
+
+        let k_out =
+            unsafe { std::slice::from_raw_parts(k_view.buffer().as_ptr(), 4 * token_bytes) };
+        assert!(
+            k_out.iter().all(|&b| b == 0xAB),
+            "K data corrupted after double preload"
+        );
     }
 }

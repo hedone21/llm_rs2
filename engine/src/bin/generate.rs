@@ -259,6 +259,11 @@ struct Args {
     /// SVD rank for K-cache compression (used with --kv-offload svd).
     #[arg(long, default_value_t = 10)]
     svd_rank: usize,
+
+    /// Maximum adaptive prefetch depth for offload KV cache pipeline.
+    /// Higher values use more memory but can hide preload latency.
+    #[arg(long, default_value_t = 4)]
+    max_prefetch_depth: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -388,6 +393,7 @@ fn main() -> anyhow::Result<()> {
             args.num_tokens,
             args.gpu_attn,
             args.svd_rank,
+            args.max_prefetch_depth,
         );
     }
 
@@ -411,6 +417,7 @@ fn main() -> anyhow::Result<()> {
             &args.kv_offload,
             &args.offload_dir,
             &args.kv_type,
+            args.max_prefetch_depth,
         );
     }
 
@@ -2309,6 +2316,7 @@ fn run_svd_offload(
     num_tokens: usize,
     gpu_attn: bool,
     svd_rank: usize,
+    max_prefetch_depth: usize,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::zram_store::ZramStore;
@@ -2457,7 +2465,7 @@ fn run_svd_offload(
     print!("{}", initial_text);
     stdout.flush().ok();
 
-    // === DECODE with per-layer prefetch ===
+    // === DECODE with adaptive prefetch ===
     let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
     let cpu_gen_input = Tensor::new(
         Shape::new(vec![1, 1]),
@@ -2470,6 +2478,9 @@ fn run_svd_offload(
         .get("</s>")
         .copied()
         .unwrap_or(u32::MAX);
+
+    let mut prefetch =
+        llm_rs2::core::offload::prefetch::PrefetchController::new(max_prefetch_depth, num_layers);
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;
@@ -2495,19 +2506,22 @@ fn run_svd_offload(
         }
 
         let fwd_start = std::time::Instant::now();
-        model.forward_into_offload(LlamaModelForwardArgs {
-            input_tokens: &gen_input,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend,
-            memory: memory.as_ref(),
-            logits_out: &mut logits,
-            x_gen: Some(&mut x_gen),
-            workspace: Some(&mut gen_ws),
-            use_gpu_attn: gpu_attn,
-            score_accumulator: None,
-            profiler: None,
-        })?;
+        model.forward_into_offload(
+            LlamaModelForwardArgs {
+                input_tokens: &gen_input,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                use_gpu_attn: gpu_attn,
+                score_accumulator: None,
+                profiler: None,
+            },
+            &mut prefetch,
+        )?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
 
@@ -2577,6 +2591,12 @@ fn run_svd_offload(
         "[SVD Offload] Avg forward={:.1}ms, avg TBT={:.1}ms, TTFT={:.1}ms",
         avg_forward_ms, avg_tbt, prefill_ms,
     );
+    eprintln!(
+        "[Prefetch] final depth={}, preload_ema={:.0}us, forward_ema={:.0}us",
+        prefetch.depth(),
+        prefetch.preload_ema_us(),
+        prefetch.forward_ema_us(),
+    );
 
     println!("\nDone.");
 
@@ -2604,6 +2624,7 @@ fn run_offload(
     offload_mode: &str,
     offload_dir: &str,
     kv_type_str: &str,
+    max_prefetch_depth: usize,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
@@ -2770,7 +2791,7 @@ fn run_offload(
     print!("{}", initial_text);
     stdout.flush().ok();
 
-    // === DECODE with per-layer prefetch ===
+    // === DECODE with adaptive prefetch ===
     let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
     let cpu_gen_input = Tensor::new(
         Shape::new(vec![1, 1]),
@@ -2783,6 +2804,9 @@ fn run_offload(
         .get("</s>")
         .copied()
         .unwrap_or(u32::MAX);
+
+    let mut prefetch =
+        llm_rs2::core::offload::prefetch::PrefetchController::new(max_prefetch_depth, num_layers);
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;
@@ -2808,19 +2832,22 @@ fn run_offload(
         }
 
         let fwd_start = std::time::Instant::now();
-        model.forward_into_offload(LlamaModelForwardArgs {
-            input_tokens: &gen_input,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend,
-            memory: memory.as_ref(),
-            logits_out: &mut logits,
-            x_gen: Some(&mut x_gen),
-            workspace: Some(&mut gen_ws),
-            use_gpu_attn: gpu_attn,
-            score_accumulator: None,
-            profiler: None,
-        })?;
+        model.forward_into_offload(
+            LlamaModelForwardArgs {
+                input_tokens: &gen_input,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                use_gpu_attn: gpu_attn,
+                score_accumulator: None,
+                profiler: None,
+            },
+            &mut prefetch,
+        )?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
 
@@ -2887,6 +2914,13 @@ fn run_offload(
     } else {
         tbt_values.iter().sum::<f64>() / tbt_values.len() as f64
     };
+
+    eprintln!(
+        "[Prefetch] final depth={}, preload_ema={:.0}us, forward_ema={:.0}us",
+        prefetch.depth(),
+        prefetch.preload_ema_us(),
+        prefetch.forward_ema_us(),
+    );
 
     println!("\nDone.");
     println!("TTFT: {:.2} ms", ttft_ms);

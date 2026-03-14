@@ -301,6 +301,10 @@ impl SvdOffloadKVCache {
 
     /// Pre-load V data from store into attn_v_buf.
     pub fn preload(&mut self) -> Result<()> {
+        if self.v_preloaded {
+            return Ok(()); // Already loaded, skip redundant work
+        }
+
         let total_bytes = self.current_pos * self.v_token_bytes;
         if total_bytes == 0 {
             self.v_preloaded = true;
