@@ -56,6 +56,11 @@ impl PrefetchController {
         self.depth
     }
 
+    /// Maximum allowed prefetch depth.
+    pub fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
     /// EMA of preload time in microseconds.
     pub fn preload_ema_us(&self) -> f64 {
         self.preload_ema_us

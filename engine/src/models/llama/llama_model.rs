@@ -12,6 +12,7 @@ use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::memory::Memory;
+use crate::core::offload::preload_pool::{self, PreloadPool};
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::layers::llama_layer::{LlamaLayer, LlamaLayerForwardArgs};
@@ -37,6 +38,10 @@ pub struct LlamaModel {
     pub embed_tokens: Tensor,
     pub norm: Tensor,
     pub lm_head: Tensor,
+    /// Persistent thread pool for offload preload operations.
+    /// Lazily initialized on first `forward_into_offload` call.
+    /// Uses `Mutex` for interior mutability (`forward_into_offload` takes `&self`).
+    preload_pool: std::sync::Mutex<Option<PreloadPool>>,
 }
 
 pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -283,6 +288,7 @@ impl LlamaModel {
             embed_tokens,
             norm,
             lm_head,
+            preload_pool: std::sync::Mutex::new(None),
         })
     }
 
@@ -467,10 +473,9 @@ impl LlamaModel {
     /// preloaded. When preload is slower than forward (pipeline stall), depth increases.
     /// When there is slack, depth decreases to save memory.
     ///
-    /// **Fire-and-forget preloads**: A background preload for layer `i+depth` is spawned
-    /// during layer `i`'s forward pass, but NOT joined until layer `i+depth` is actually
-    /// needed (up to `depth` layers later). This allows the preload to overlap with
-    /// multiple forward passes, amortizing the decompression latency.
+    /// **Fire-and-forget preloads**: A preload task for layer `i+depth` is submitted
+    /// to a persistent thread pool during layer `i`'s forward pass, then collected
+    /// when layer `i+depth` is needed. This avoids per-token thread spawn/join overhead.
     ///
     /// Uses raw pointers to safely manage concurrent `&mut` access to disjoint cache
     /// elements. SAFETY: layer indices are guaranteed non-overlapping — at most one
@@ -522,119 +527,113 @@ impl LlamaModel {
         let depth = prefetch.depth();
         let caches_ptr = kv_caches.as_mut_ptr();
 
-        // Use a single thread::scope for the entire layer loop.
-        // Preload threads are fire-and-forget within the scope — they run concurrently
-        // with multiple forward passes. We only join when we actually need the data.
-        //
+        // Lazy-init persistent thread pool (sized to max_depth for full concurrency).
+        // Mutex is locked once per token — zero contention.
+        let mut pool_guard = self.preload_pool.lock().unwrap();
+        let pool = pool_guard.get_or_insert_with(|| PreloadPool::new(prefetch.max_depth()));
+
+        // 2. Synchronous initial preload: layers [0..depth)
+        // Retained layers (preloaded=true) skip via early-return.
+        for j in 0..depth.min(num_layers) {
+            // SAFETY: j < num_layers, no concurrent access during sync phase
+            unsafe { (*caches_ptr.add(j)).preload() }?;
+        }
+
+        // Track pending results: pending[j] = receiver for kv_caches[j]'s preload
         // SAFETY: raw pointer access to kv_caches elements. We guarantee that:
-        // 1. Each preload thread accesses exactly one element kv_caches[far_idx]
+        // 1. Each pool task accesses exactly one element kv_caches[far_idx]
         // 2. The main thread accesses kv_caches[i] for forward
         // 3. far_idx != i (far_idx = i + depth, depth >= 1)
         // 4. Each element is accessed by at most one thread at a time:
-        //    - A preload thread for element j finishes before j is used for forward
+        //    - A preload task for element j completes before j is used for forward
         //    - release_buffers(j) happens after forward(j) completes
-        std::thread::scope(|s| {
-            // 2. Synchronous initial preload: layers [0..depth)
-            // These layers will be consumed by forward passes before any background
-            // preload targeting them could complete, so they must be loaded upfront.
-            for j in 0..depth.min(num_layers) {
-                // SAFETY: j < num_layers, no concurrent access during sync phase
-                unsafe { (*caches_ptr.add(j)).preload() }?;
-            }
+        let mut pending: Vec<Option<std::sync::mpsc::Receiver<preload_pool::PreloadResult>>> =
+            (0..num_layers).map(|_| None).collect();
 
-            // Track pending preload handles: pending[j] = handle for kv_caches[j]
-            type PreloadHandle<'scope, 'env> =
-                Option<std::thread::ScopedJoinHandle<'scope, (Result<()>, std::time::Duration)>>;
-            let mut pending: Vec<PreloadHandle<'_, '_>> = (0..num_layers).map(|_| None).collect();
+        // Fire initial background preloads for layers [depth..2*depth)
+        #[allow(clippy::needless_range_loop)]
+        for j in depth..(2 * depth).min(num_layers) {
+            pending[j] = Some(unsafe {
+                pool.submit(
+                    caches_ptr.add(j) as *mut (),
+                    preload_pool::preload_erased::<C>,
+                )
+            });
+        }
 
-            // Fire initial background preloads for layers [depth..2*depth)
-            // These will complete while layers [0..depth) are being processed.
-            // Note: j is used both to index pending[] and to compute caches_ptr.add(j).
-            #[allow(clippy::needless_range_loop)]
-            for j in depth..(2 * depth).min(num_layers) {
-                let cache_j = unsafe { &mut *caches_ptr.add(j) };
-                pending[j] = Some(s.spawn(move || {
-                    let t0 = std::time::Instant::now();
-                    let r = cache_j.preload();
-                    (r, t0.elapsed())
-                }));
-            }
-
-            // 3. Layer loop
-            for i in 0..num_layers {
-                // Join pending preload for layer i (if any).
-                // At this point, the preload was started `depth` layers ago,
-                // so it had `depth` forward passes worth of time to complete.
-                if let Some(handle) = pending[i].take() {
-                    match handle.join() {
-                        Ok((Ok(()), preload_dur)) => {
-                            prefetch.record_preload(preload_dur);
-                        }
-                        Ok((Err(e), _)) => {
-                            log::warn!("L{i} preload failed: {e}, falling back to sync");
-                        }
-                        Err(_) => {
-                            log::error!("L{i} preload thread panicked");
-                        }
+        // 3. Layer loop
+        for i in 0..num_layers {
+            // Collect preload result for layer i (if any).
+            if let Some(rx) = pending[i].take() {
+                match rx.recv() {
+                    Ok(preload_pool::PreloadResult {
+                        result: Ok(()),
+                        duration,
+                    }) => {
+                        prefetch.record_preload(duration);
+                    }
+                    Ok(preload_pool::PreloadResult { result: Err(e), .. }) => {
+                        log::warn!("L{i} preload failed: {e}, falling back to sync");
+                    }
+                    Err(_) => {
+                        log::error!("L{i} preload worker dropped result channel");
                     }
                 }
-
-                // Fire preload for layer i + depth (if within bounds)
-                let far_idx = i + depth;
-                if far_idx < num_layers && pending[far_idx].is_none() {
-                    let cache_far = unsafe { &mut *caches_ptr.add(far_idx) };
-                    pending[far_idx] = Some(s.spawn(move || {
-                        let t0 = std::time::Instant::now();
-                        let r = cache_far.preload();
-                        (r, t0.elapsed())
-                    }));
-                }
-
-                // Forward current layer
-                let current = unsafe { &mut *caches_ptr.add(i) };
-                let fwd_t0 = std::time::Instant::now();
-                self.layers[i].forward(LlamaLayerForwardArgs {
-                    x: &mut x,
-                    kv_cache: current,
-                    start_pos,
-                    backend,
-                    memory,
-                    rms_norm_eps: self.config.rms_norm_eps as f32,
-                    rope_theta: self.config.rope_theta as f32,
-                    workspace: workspace.as_deref_mut(),
-                    use_gpu_attn,
-                    need_scores: false,
-                    head_dim: self.config.head_dim,
-                    profiler: None,
-                })?;
-                let fwd_dur = fwd_t0.elapsed();
-                prefetch.record_forward(fwd_dur);
-
-                // Cross-token retention: keep first `depth` layers' buffers alive
-                // so next token's preload() early-returns (preloaded=true).
-                if i < depth {
-                    current.retain_preload();
-                }
-
-                // Release consumed layer's buffers (skip retained layers)
-                if i > 0 && (i - 1) >= depth {
-                    // SAFETY: layer i-1 forward is complete, preload thread (if any) joined
-                    unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
-                }
             }
 
-            // Join any remaining pending preloads
-            for handle in pending.into_iter().flatten() {
-                let _ = handle.join();
+            // Fire preload for layer i + depth (if within bounds)
+            let far_idx = i + depth;
+            if far_idx < num_layers && pending[far_idx].is_none() {
+                pending[far_idx] = Some(unsafe {
+                    pool.submit(
+                        caches_ptr.add(far_idx) as *mut (),
+                        preload_pool::preload_erased::<C>,
+                    )
+                });
             }
 
-            // Release last layer's buffers (unless retained)
-            if num_layers >= 1 && (num_layers - 1) >= depth {
-                kv_caches[num_layers - 1].release_buffers();
+            // Forward current layer
+            let current = unsafe { &mut *caches_ptr.add(i) };
+            let fwd_t0 = std::time::Instant::now();
+            self.layers[i].forward(LlamaLayerForwardArgs {
+                x: &mut x,
+                kv_cache: current,
+                start_pos,
+                backend,
+                memory,
+                rms_norm_eps: self.config.rms_norm_eps as f32,
+                rope_theta: self.config.rope_theta as f32,
+                workspace: workspace.as_deref_mut(),
+                use_gpu_attn,
+                need_scores: false,
+                head_dim: self.config.head_dim,
+                profiler: None,
+            })?;
+            let fwd_dur = fwd_t0.elapsed();
+            prefetch.record_forward(fwd_dur);
+
+            // Cross-token retention: keep first `depth` layers' buffers alive
+            // so next token's preload() early-returns (preloaded=true).
+            if i < depth {
+                current.retain_preload();
             }
 
-            Ok::<_, anyhow::Error>(())
-        })?;
+            // Release consumed layer's buffers (skip retained layers)
+            if i > 0 && (i - 1) >= depth {
+                // SAFETY: layer i-1 forward is complete, preload task (if any) collected
+                unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
+            }
+        }
+
+        // Collect any remaining pending preloads
+        for rx in pending.into_iter().flatten() {
+            let _ = rx.recv();
+        }
+
+        // Release last layer's buffers (unless retained)
+        if num_layers >= 1 && (num_layers - 1) >= depth {
+            kv_caches[num_layers - 1].release_buffers();
+        }
 
         // Adjust depth for the next token
         prefetch.adjust();

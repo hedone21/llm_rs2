@@ -10,6 +10,7 @@
 
 pub mod disk_store;
 pub mod prefetch;
+pub mod preload_pool;
 pub mod preprocess;
 pub mod store;
 pub mod zram_store;
