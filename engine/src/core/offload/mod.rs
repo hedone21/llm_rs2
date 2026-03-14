@@ -1949,8 +1949,19 @@ mod tests {
             )
         }
 
+        // Run BASE: no offload, pure forward only (theoretical minimum)
+        let base_ms = {
+            let start = std::time::Instant::now();
+            for _step in 0..decode_steps {
+                for _layer in 0..num_layers {
+                    simulate_forward();
+                }
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+
         // Run with depth=1 (fixed)
-        let (d1_ms, d1_calls, d1_skips, d1_bufs, d1_depth) = run_with_depth(
+        let (d1_ms, _d1_calls, d1_skips, d1_bufs, d1_depth) = run_with_depth(
             num_layers,
             max_seq_len,
             kv_heads,
@@ -1963,7 +1974,7 @@ mod tests {
         );
 
         // Run with adaptive (max_depth=4)
-        let (da_ms, da_calls, da_skips, da_bufs, da_depth) = run_with_depth(
+        let (da_ms, _da_calls, _da_skips, da_bufs, da_depth) = run_with_depth(
             num_layers,
             max_seq_len,
             kv_heads,
@@ -1976,7 +1987,7 @@ mod tests {
         );
 
         // Run with depth=4 (fixed max)
-        let (d4_ms, d4_calls, d4_skips, d4_bufs, d4_depth) = run_with_depth(
+        let (d4_ms, _d4_calls, _d4_skips, _d4_bufs, d4_depth) = run_with_depth(
             num_layers,
             max_seq_len,
             kv_heads,
@@ -1988,45 +1999,54 @@ mod tests {
             simulate_preload_extra,
         );
 
-        println!("║");
-        println!(
-            "║  {:25} {:>10} {:>10} {:>10} {:>8} {:>8}",
-            "Strategy", "Total(ms)", "Preloads", "Skips", "Act.Bufs", "Depth"
-        );
-        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  {:25} {:>10.1} {:>10} {:>10} {:>8} {:>8}",
-            "Fixed depth=1", d1_ms, d1_calls, d1_skips, d1_bufs, d1_depth
-        );
-        println!(
-            "║  {:25} {:>10.1} {:>10} {:>10} {:>8} {:>8}",
-            "Adaptive (max=4)", da_ms, da_calls, da_skips, da_bufs, da_depth
-        );
-        println!(
-            "║  {:25} {:>10.1} {:>10} {:>10} {:>8} {:>8}",
-            "Fixed depth=4", d4_ms, d4_calls, d4_skips, d4_bufs, d4_depth
-        );
-        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
-
+        let base_per_tok = base_ms / decode_steps as f64;
         let d1_per_tok = d1_ms / decode_steps as f64;
         let da_per_tok = da_ms / decode_steps as f64;
-        println!(
-            "║  depth=1: {:.2}ms/tok, adaptive: {:.2}ms/tok ({:.1}%)",
-            d1_per_tok,
-            da_per_tok,
-            (da_ms / d1_ms - 1.0) * 100.0,
-        );
+        let d4_per_tok = d4_ms / decode_steps as f64;
 
-        // Adaptive should have meaningful skip count due to guard
-        // (depth>1 preloads layers that were already loaded in previous iterations)
+        println!("║");
         println!(
-            "║  Skip ratio: depth=1 {}/{} ({:.0}%), adaptive {}/{} ({:.0}%)",
-            d1_skips,
-            d1_calls,
-            d1_skips as f64 / d1_calls.max(1) as f64 * 100.0,
-            da_skips,
-            da_calls,
-            da_skips as f64 / da_calls.max(1) as f64 * 100.0,
+            "║  {:25} {:>10} {:>10} {:>8} {:>10}",
+            "Strategy", "Total(ms)", "ms/tok", "Depth", "vs BASE"
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>10}",
+            "BASE (no offload)", base_ms, base_per_tok, "-", "-"
+        );
+        println!(
+            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Fixed depth=1",
+            d1_ms,
+            d1_per_tok,
+            d1_depth,
+            (d1_ms / base_ms - 1.0) * 100.0
+        );
+        println!(
+            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Adaptive (max=4)",
+            da_ms,
+            da_per_tok,
+            da_depth,
+            (da_ms / base_ms - 1.0) * 100.0
+        );
+        println!(
+            "║  {:25} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
+            "Fixed depth=4",
+            d4_ms,
+            d4_per_tok,
+            d4_depth,
+            (d4_ms / base_ms - 1.0) * 100.0
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  Offload overhead: depth=1 {:.1}%, adaptive {:.1}% (vs BASE)",
+            (d1_ms / base_ms - 1.0) * 100.0,
+            (da_ms / base_ms - 1.0) * 100.0,
+        );
+        println!(
+            "║  Adaptive vs depth=1: {:.1}% faster",
+            (1.0 - da_ms / d1_ms) * 100.0,
         );
         println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
 
