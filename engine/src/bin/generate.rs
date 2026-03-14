@@ -2628,6 +2628,7 @@ fn run_offload(
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
     use llm_rs2::core::offload::disk_store::DiskStore;
+    use llm_rs2::core::offload::raw_store::RawStore;
     use llm_rs2::core::offload::zram_store::ZramStore;
 
     // Validate constraints
@@ -2662,6 +2663,7 @@ fn run_offload(
                     let residual_cap = 64;
                     Box::new(ZramStore::new(token_bytes, kv_dtype.size(), residual_cap))
                 }
+                "raw" => Box::new(RawStore::new(token_bytes)),
                 _ => panic!("Unknown offload mode: {}", offload_mode),
             };
             OffloadKVCache::new(layer_id, kv_heads, head_dim, kv_dtype, max_seq_len, store)

@@ -12,6 +12,7 @@ pub mod disk_store;
 pub mod prefetch;
 pub mod preload_pool;
 pub mod preprocess;
+pub mod raw_store;
 pub mod store;
 pub mod zram_store;
 
@@ -65,6 +66,9 @@ pub struct OffloadKVCache {
     out_v_buf: Option<Arc<SharedBuffer>>,
     /// Shared CPU backend for creating output tensors.
     out_backend: Arc<CpuBackend>,
+    /// Number of tokens written to attn_buf but not yet flushed to store.
+    /// When preloaded, decode updates go to attn_buf only; store catches up on release.
+    store_behind: usize,
 }
 
 impl OffloadKVCache {
@@ -95,6 +99,7 @@ impl OffloadKVCache {
             out_k_buf: None,
             out_v_buf: None,
             out_backend: Arc::new(CpuBackend::new()),
+            store_behind: 0,
         }
     }
 
@@ -124,6 +129,11 @@ impl OffloadKVCache {
             return Ok(()); // Already loaded, skip redundant work
         }
 
+        // If store_behind > 0, attn_buf has newer data than store — flush first.
+        if self.store_behind > 0 {
+            self.flush_deferred()?;
+        }
+
         let total_bytes = self.current_pos * self.token_bytes;
         if total_bytes == 0 {
             self.preloaded = true;
@@ -140,8 +150,42 @@ impl OffloadKVCache {
         Ok(())
     }
 
+    /// Flush deferred tokens from attn_buf to store.
+    /// Called before releasing buffers or when store needs to be up-to-date.
+    fn flush_deferred(&mut self) -> Result<()> {
+        if self.store_behind == 0 {
+            return Ok(());
+        }
+        let (Some(k_buf), Some(v_buf)) = (&self.attn_k_buf, &self.attn_v_buf) else {
+            anyhow::bail!(
+                "OffloadKVCache[{}] flush_deferred: attn_buf is None but store_behind={}",
+                self.layer_id,
+                self.store_behind
+            );
+        };
+        let start = (self.current_pos - self.store_behind) * self.token_bytes;
+        let end = self.current_pos * self.token_bytes;
+        for i in (start..end).step_by(self.token_bytes) {
+            self.store.append_token(
+                &k_buf[i..i + self.token_bytes],
+                &v_buf[i..i + self.token_bytes],
+            )?;
+        }
+        self.store_behind = 0;
+        Ok(())
+    }
+
     /// Release attn buffers to free memory (R-P1: only 2 layers active at once).
     pub fn release_buffers(&mut self) {
+        if self.store_behind > 0
+            && let Err(e) = self.flush_deferred()
+        {
+            log::error!(
+                "OffloadKVCache[{}] flush_deferred failed: {}",
+                self.layer_id,
+                e
+            );
+        }
         self.attn_k_buf = None;
         self.attn_v_buf = None;
         self.preloaded = false;
@@ -229,16 +273,18 @@ impl KVCacheOps for OffloadKVCache {
         let v_data = unsafe { std::slice::from_raw_parts(v_ptr, expected_bytes) };
 
         if seq_len == 1 {
-            // Decode path: single token append
-            self.store.append_token(k_data, v_data)?;
-
-            // If preloaded, also append to attn buffers (avoid re-load in get_view)
             if self.preloaded
                 && let (Some(k_buf), Some(v_buf)) = (&mut self.attn_k_buf, &mut self.attn_v_buf)
             {
+                // Deferred write: attn_buf is authoritative, skip store write.
+                // Store will catch up in flush_deferred() on release_buffers().
                 let offset = self.current_pos * self.token_bytes;
                 k_buf[offset..offset + self.token_bytes].copy_from_slice(k_data);
                 v_buf[offset..offset + self.token_bytes].copy_from_slice(v_data);
+                self.store_behind += 1;
+            } else {
+                // Non-retained: write to store immediately
+                self.store.append_token(k_data, v_data)?;
             }
         } else {
             // Prefill or multi-token: batch store
@@ -274,11 +320,25 @@ impl KVCacheOps for OffloadKVCache {
         let total_bytes = total * self.token_bytes;
         let max_bytes = self.max_seq_len * self.token_bytes;
 
+        // Flush deferred tokens before borrowing attn buffers (avoids borrow conflict).
+        // Track whether attn_buf already has valid data (deferred tokens in it).
+        let attn_buf_valid = !self.preloaded && self.store_behind > 0;
+        if attn_buf_valid {
+            // attn_buf holds valid data — just sync store, no load_into needed.
+            if let Err(e) = self.flush_deferred() {
+                log::error!(
+                    "OffloadKVCache[{}] flush_deferred in get_view failed: {}",
+                    self.layer_id,
+                    e
+                );
+            }
+        }
+
         // Lazy-allocate attn buffers if needed
         let k_attn = self.attn_k_buf.get_or_insert_with(|| vec![0u8; max_bytes]);
         let v_attn = self.attn_v_buf.get_or_insert_with(|| vec![0u8; max_bytes]);
 
-        if !self.preloaded {
+        if !self.preloaded && !attn_buf_valid {
             // Synchronous fallback: load from store
             if let Err(e) = self
                 .store
@@ -2093,6 +2153,227 @@ mod tests {
     }
 
     #[test]
+    fn test_bench_pool_vs_scope() {
+        // Compare thread::scope (spawn per layer) vs PreloadPool (persistent workers).
+        // Measures real preload cost without artificial delays — isolates threading overhead.
+        use crate::core::offload::prefetch::PrefetchController;
+        use crate::core::offload::preload_pool::{self, PreloadPool};
+
+        let kv_heads = 8;
+        let head_dim = 64;
+        let num_layers = 16;
+        let max_seq_len = 2048;
+        let prefill_len = 128;
+        let decode_steps = 64;
+        let max_depth = 4;
+        let token_bytes = kv_heads * head_dim * 2;
+
+        println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
+        println!("║  PreloadPool vs thread::scope Benchmark                                 ║");
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  Config: layers={num_layers}, depth={max_depth}, decode={decode_steps}, \
+             kv_heads={kv_heads}, head_dim={head_dim}"
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+
+        // Helper: create and prefill caches
+        let make_caches = || -> Vec<OffloadKVCache> {
+            let mut caches: Vec<OffloadKVCache> = (0..num_layers)
+                .map(|layer_id| {
+                    let store: Box<dyn store::OffloadStore> =
+                        Box::new(zram_store::ZramStore::new(token_bytes, 2, 64));
+                    OffloadKVCache::new(
+                        layer_id,
+                        kv_heads,
+                        head_dim,
+                        DType::F16,
+                        max_seq_len,
+                        store,
+                    )
+                })
+                .collect();
+            let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
+            let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
+            for c in caches.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+            caches
+        };
+
+        // ─── thread::scope baseline ───
+        let scope_ms = {
+            let mut caches = make_caches();
+            let caches_ptr = caches.as_mut_ptr();
+            let mut prefetch = PrefetchController::new(max_depth, num_layers);
+
+            let start = std::time::Instant::now();
+            for step in 0..decode_steps {
+                let k_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
+                let v_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
+                for c in caches.iter_mut() {
+                    c.update(&k_tok, &v_tok).unwrap();
+                }
+                let depth = prefetch.depth();
+
+                std::thread::scope(|s| {
+                    for j in 0..depth.min(num_layers) {
+                        unsafe { (*caches_ptr.add(j)).preload().unwrap() };
+                    }
+                    type Handle<'s> =
+                        Option<std::thread::ScopedJoinHandle<'s, std::time::Duration>>;
+                    let mut pending: Vec<Handle<'_>> = (0..num_layers).map(|_| None).collect();
+                    for j in depth..(2 * depth).min(num_layers) {
+                        let cache_j = unsafe { &mut *caches_ptr.add(j) };
+                        pending[j] = Some(s.spawn(move || {
+                            let t0 = std::time::Instant::now();
+                            cache_j.preload().unwrap();
+                            t0.elapsed()
+                        }));
+                    }
+                    for i in 0..num_layers {
+                        if let Some(handle) = pending[i].take() {
+                            prefetch.record_preload(handle.join().unwrap());
+                        }
+                        let far_idx = i + depth;
+                        if far_idx < num_layers && pending[far_idx].is_none() {
+                            let cache_far = unsafe { &mut *caches_ptr.add(far_idx) };
+                            pending[far_idx] = Some(s.spawn(move || {
+                                let t0 = std::time::Instant::now();
+                                cache_far.preload().unwrap();
+                                t0.elapsed()
+                            }));
+                        }
+                        let current = unsafe { &mut *caches_ptr.add(i) };
+                        let fwd_t0 = std::time::Instant::now();
+                        let _ = current.get_view();
+                        prefetch.record_forward(fwd_t0.elapsed());
+                        if i < depth {
+                            unsafe { (*caches_ptr.add(i)).retain_preload() };
+                        }
+                        if i > 0 && (i - 1) >= depth {
+                            unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
+                        }
+                    }
+                    for handle in pending.into_iter().flatten() {
+                        let _ = handle.join();
+                    }
+                    if num_layers >= 1 && (num_layers - 1) >= depth {
+                        caches[num_layers - 1].release_buffers();
+                    }
+                });
+                prefetch.adjust();
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+
+        // ─── PreloadPool ───
+        let pool_ms = {
+            let mut caches = make_caches();
+            let caches_ptr = caches.as_mut_ptr();
+            let mut prefetch = PrefetchController::new(max_depth, num_layers);
+            let pool = PreloadPool::new(max_depth);
+
+            let start = std::time::Instant::now();
+            for step in 0..decode_steps {
+                let k_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
+                let v_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
+                for c in caches.iter_mut() {
+                    c.update(&k_tok, &v_tok).unwrap();
+                }
+                let depth = prefetch.depth();
+
+                // Sync preload [0..depth)
+                for j in 0..depth.min(num_layers) {
+                    unsafe { (*caches_ptr.add(j)).preload().unwrap() };
+                }
+
+                // Pending receivers
+                let mut pending: Vec<
+                    Option<std::sync::mpsc::Receiver<preload_pool::PreloadResult>>,
+                > = (0..num_layers).map(|_| None).collect();
+
+                // Fire initial bg preloads [depth..2*depth)
+                #[allow(clippy::needless_range_loop)]
+                for j in depth..(2 * depth).min(num_layers) {
+                    pending[j] = Some(unsafe {
+                        pool.submit(
+                            caches_ptr.add(j) as *mut (),
+                            preload_pool::preload_erased::<OffloadKVCache>,
+                        )
+                    });
+                }
+
+                // Layer loop
+                for i in 0..num_layers {
+                    if let Some(rx) = pending[i].take() {
+                        if let Ok(r) = rx.recv() {
+                            prefetch.record_preload(r.duration);
+                        }
+                    }
+                    let far_idx = i + depth;
+                    if far_idx < num_layers && pending[far_idx].is_none() {
+                        pending[far_idx] = Some(unsafe {
+                            pool.submit(
+                                caches_ptr.add(far_idx) as *mut (),
+                                preload_pool::preload_erased::<OffloadKVCache>,
+                            )
+                        });
+                    }
+                    let current = unsafe { &mut *caches_ptr.add(i) };
+                    let fwd_t0 = std::time::Instant::now();
+                    let _ = current.get_view();
+                    prefetch.record_forward(fwd_t0.elapsed());
+                    if i < depth {
+                        unsafe { (*caches_ptr.add(i)).retain_preload() };
+                    }
+                    if i > 0 && (i - 1) >= depth {
+                        unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
+                    }
+                }
+                for rx in pending.into_iter().flatten() {
+                    let _ = rx.recv();
+                }
+                if num_layers >= 1 && (num_layers - 1) >= depth {
+                    caches[num_layers - 1].release_buffers();
+                }
+
+                prefetch.adjust();
+            }
+            start.elapsed().as_secs_f64() * 1000.0
+        };
+
+        let scope_per_tok = scope_ms / decode_steps as f64;
+        let pool_per_tok = pool_ms / decode_steps as f64;
+        let speedup_pct = (1.0 - pool_ms / scope_ms) * 100.0;
+
+        println!("║");
+        println!("║  {:25} {:>10} {:>10}", "Strategy", "Total(ms)", "ms/tok");
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:25} {:>10.1} {:>10.3}",
+            "thread::scope (per-tok)", scope_ms, scope_per_tok
+        );
+        println!(
+            "║  {:25} {:>10.1} {:>10.3}",
+            "PreloadPool (persistent)", pool_ms, pool_per_tok
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
+        println!("║  Pool speedup: {speedup_pct:+.1}% vs thread::scope");
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
+
+        // Pool should not be significantly slower than scope
+        assert!(
+            pool_ms < scope_ms * 1.2,
+            "pool should not be >20% slower: pool={pool_ms:.1}ms, scope={scope_ms:.1}ms"
+        );
+    }
+
+    #[test]
     fn test_retain_preload_cross_token() {
         // Verify cross-token retention: retain_preload() after get_view()
         // allows next token's update() to dual-write, and preload() to skip.
@@ -2221,5 +2502,254 @@ mod tests {
             !cache.preloaded,
             "retain_preload after release should not arm"
         );
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Deferred Store Write Tests
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_deferred_write_skips_store() {
+        // When preloaded, decode update should NOT write to store (store_behind increases).
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Prefill 1 token
+        let k0 = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, kv_heads, head_dim);
+        let v0 = make_f32_tensor_with_data(&[5.0, 6.0, 7.0, 8.0], 1, kv_heads, head_dim);
+        cache.update(&k0, &v0).unwrap();
+        assert_eq!(cache.store.stored_tokens(), 1);
+        assert_eq!(cache.store_behind, 0);
+
+        // Preload + retain
+        cache.preload().unwrap();
+
+        // Decode while preloaded: should defer store write
+        let k1 = make_f32_tensor_with_data(&[10.0, 20.0, 30.0, 40.0], 1, kv_heads, head_dim);
+        let v1 = make_f32_tensor_with_data(&[50.0, 60.0, 70.0, 80.0], 1, kv_heads, head_dim);
+        cache.update(&k1, &v1).unwrap();
+
+        // Store should NOT have the new token yet
+        assert_eq!(
+            cache.store.stored_tokens(),
+            1,
+            "store should still have 1 token"
+        );
+        assert_eq!(cache.store_behind, 1, "store_behind should be 1");
+        assert_eq!(cache.current_pos(), 2);
+    }
+
+    #[test]
+    fn test_deferred_flush_on_release() {
+        // release_buffers() should flush deferred tokens to store.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Prefill + preload
+        let k0 = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, kv_heads, head_dim);
+        let v0 = make_f32_tensor_with_data(&[5.0, 6.0, 7.0, 8.0], 1, kv_heads, head_dim);
+        cache.update(&k0, &v0).unwrap();
+        cache.preload().unwrap();
+
+        // 3 deferred decode tokens
+        for i in 0..3 {
+            let val = 10.0 * (i + 1) as f32;
+            let k = make_f32_tensor_with_data(
+                &[val, val + 1.0, val + 2.0, val + 3.0],
+                1,
+                kv_heads,
+                head_dim,
+            );
+            let v = make_f32_tensor_with_data(
+                &[val + 10.0, val + 11.0, val + 12.0, val + 13.0],
+                1,
+                kv_heads,
+                head_dim,
+            );
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.store_behind, 3);
+        assert_eq!(cache.store.stored_tokens(), 1);
+
+        // Release: should flush all deferred tokens
+        cache.release_buffers();
+        assert_eq!(cache.store_behind, 0);
+        assert_eq!(cache.store.stored_tokens(), 4); // 1 original + 3 deferred
+
+        // Verify data integrity: reload and check
+        cache.preload().unwrap();
+        let (k_view, v_view) = cache.get_view();
+        let k_data = k_view.as_slice::<f32>();
+        let v_data = v_view.as_slice::<f32>();
+        assert_eq!(&k_data[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&k_data[4..8], &[10.0, 11.0, 12.0, 13.0]);
+        assert_eq!(&v_data[..4], &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(&v_data[4..8], &[20.0, 21.0, 22.0, 23.0]);
+    }
+
+    #[test]
+    fn test_deferred_preload_after_behind() {
+        // preload() with store_behind > 0 should flush then reload from store.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Prefill + preload
+        let k0 = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, kv_heads, head_dim);
+        let v0 = make_f32_tensor_with_data(&[5.0, 6.0, 7.0, 8.0], 1, kv_heads, head_dim);
+        cache.update(&k0, &v0).unwrap();
+        cache.preload().unwrap();
+
+        // Deferred token
+        let k1 = make_f32_tensor_with_data(&[10.0, 20.0, 30.0, 40.0], 1, kv_heads, head_dim);
+        let v1 = make_f32_tensor_with_data(&[50.0, 60.0, 70.0, 80.0], 1, kv_heads, head_dim);
+        cache.update(&k1, &v1).unwrap();
+        assert_eq!(cache.store_behind, 1);
+
+        // Reset preloaded (simulates token boundary)
+        cache.preloaded = false;
+
+        // preload() should flush then reload
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+        assert_eq!(cache.store_behind, 0);
+        assert_eq!(cache.store.stored_tokens(), 2);
+
+        // Verify data
+        let (k_view, v_view) = cache.get_view();
+        let k_data = k_view.as_slice::<f32>();
+        let v_data = v_view.as_slice::<f32>();
+        assert_eq!(&k_data[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&k_data[4..8], &[10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(&v_data[..4], &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(&v_data[4..8], &[50.0, 60.0, 70.0, 80.0]);
+    }
+
+    #[test]
+    fn test_deferred_get_view_with_store_behind() {
+        // get_view() when !preloaded && store_behind > 0: attn_buf is valid, just flush.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Prefill + preload
+        let k0 = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, kv_heads, head_dim);
+        let v0 = make_f32_tensor_with_data(&[5.0, 6.0, 7.0, 8.0], 1, kv_heads, head_dim);
+        cache.update(&k0, &v0).unwrap();
+        cache.preload().unwrap();
+
+        // Deferred token
+        let k1 = make_f32_tensor_with_data(&[10.0, 20.0, 30.0, 40.0], 1, kv_heads, head_dim);
+        let v1 = make_f32_tensor_with_data(&[50.0, 60.0, 70.0, 80.0], 1, kv_heads, head_dim);
+        cache.update(&k1, &v1).unwrap();
+
+        // get_view consumes preloaded (sets to false), but data is in attn_buf
+        let (k_view, v_view) = cache.get_view();
+        let k_data = k_view.as_slice::<f32>();
+        assert_eq!(&k_data[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&k_data[4..8], &[10.0, 20.0, 30.0, 40.0]);
+        let v_data = v_view.as_slice::<f32>();
+        assert_eq!(&v_data[..4], &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(&v_data[4..8], &[50.0, 60.0, 70.0, 80.0]);
+
+        // Now preloaded=false, store_behind=1 (get_view with preloaded=true doesn't flush).
+        // retain_preload re-arms preloaded. Next deferred update increments store_behind to 2.
+        cache.retain_preload(); // re-arm after get_view
+
+        let k2 = make_f32_tensor_with_data(&[100.0, 200.0, 300.0, 400.0], 1, kv_heads, head_dim);
+        let v2 = make_f32_tensor_with_data(&[500.0, 600.0, 700.0, 800.0], 1, kv_heads, head_dim);
+        cache.update(&k2, &v2).unwrap();
+        assert_eq!(cache.store_behind, 2); // 1 from first deferred + 1 from second
+
+        // Manually set preloaded=false to trigger the store_behind path in get_view
+        cache.preloaded = false;
+
+        let (k_view2, _) = cache.get_view();
+        let k_data2 = k_view2.as_slice::<f32>();
+        assert_eq!(k_data2.len(), 3 * 4); // 3 tokens × 4 floats
+        assert_eq!(&k_data2[8..12], &[100.0, 200.0, 300.0, 400.0]);
+    }
+
+    #[test]
+    fn test_deferred_write_with_raw_store() {
+        // Verify deferred write works with RawStore too.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = raw_store::RawStore::new(token_bytes);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Prefill
+        let k0 = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, kv_heads, head_dim);
+        let v0 = make_f32_tensor_with_data(&[5.0, 6.0, 7.0, 8.0], 1, kv_heads, head_dim);
+        cache.update(&k0, &v0).unwrap();
+        cache.preload().unwrap();
+
+        // 5 deferred tokens
+        for i in 1..=5 {
+            let val = i as f32 * 10.0;
+            let k = make_f32_tensor_with_data(
+                &[val, val + 1.0, val + 2.0, val + 3.0],
+                1,
+                kv_heads,
+                head_dim,
+            );
+            let v = make_f32_tensor_with_data(
+                &[val + 50.0, val + 51.0, val + 52.0, val + 53.0],
+                1,
+                kv_heads,
+                head_dim,
+            );
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.store_behind, 5);
+        assert_eq!(cache.store.stored_tokens(), 1);
+        assert_eq!(cache.current_pos(), 6);
+
+        // Release flushes everything
+        cache.release_buffers();
+        assert_eq!(cache.store.stored_tokens(), 6);
+        assert_eq!(cache.store_behind, 0);
+
+        // Reload and verify all 6 tokens
+        cache.preload().unwrap();
+        let (k_view, v_view) = cache.get_view();
+        let k_data = k_view.as_slice::<f32>();
+        let v_data = v_view.as_slice::<f32>();
+        assert_eq!(k_data.len(), 6 * 4);
+        assert_eq!(&k_data[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&k_data[4..8], &[10.0, 11.0, 12.0, 13.0]);
+        assert_eq!(&v_data[..4], &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(&v_data[4..8], &[60.0, 61.0, 62.0, 63.0]);
+    }
+
+    #[test]
+    fn test_non_retained_update_writes_store_immediately() {
+        // Without preload, update should write to store directly (store_behind stays 0).
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = raw_store::RawStore::new(token_bytes);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Decode without preload
+        for i in 0..5 {
+            let val = i as f32;
+            let k = make_f32_tensor_with_data(&[val, val, val, val], 1, kv_heads, head_dim);
+            let v = make_f32_tensor_with_data(&[val, val, val, val], 1, kv_heads, head_dim);
+            cache.update(&k, &v).unwrap();
+            assert_eq!(cache.store.stored_tokens(), i + 1);
+            assert_eq!(cache.store_behind, 0);
+        }
     }
 }
