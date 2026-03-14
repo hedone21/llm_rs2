@@ -1766,7 +1766,7 @@ mod tests {
         let num_layers = 16;
         let max_seq_len = 2048;
         let prefill_len = 128;
-        let decode_steps = 64;
+        let decode_steps = 32;
 
         println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
         println!("║  Adaptive Prefetch Benchmark: depth=1 vs adaptive                       ║");
@@ -1777,17 +1777,17 @@ mod tests {
         );
         println!("╠══════════════════════════════════════════════════════════════════╣");
 
-        // Simulate forward time: on real hardware, layer forward is ~2-4ms.
-        // Zram preload on host is fast, so we use std::thread::yield for
-        // a minimal "work" simulation. The key metric is preload guard skips.
-        let simulate_work = || {
-            // Minimal busywork to occupy the CPU
-            let mut x = 0u64;
-            for i in 0..5000 {
-                x = x.wrapping_add(i * i);
-            }
-            std::hint::black_box(x);
+        // Simulate realistic timing: on ARM devices, layer forward takes ~2-4ms
+        // and zram decompression takes ~2-6ms per layer. On the host, zram preload
+        // is near-instant, so we inject artificial delays to exercise the adaptive
+        // depth controller and measure overlap effectiveness.
+        //
+        // simulate_forward: ~2ms (simulates matrix ops per layer)
+        // simulate_preload_extra: ~3ms (simulates zram decompression overhead)
+        let simulate_forward = || {
+            std::thread::sleep(std::time::Duration::from_millis(2));
         };
+        let simulate_preload_extra = std::time::Duration::from_millis(3);
 
         /// Run decode loop with fire-and-forget prefetch strategy.
         /// Returns (total_ms, preload_calls, preload_skips, active_bufs_at_end, final_depth)
@@ -1799,7 +1799,8 @@ mod tests {
             prefill_len: usize,
             decode_steps: usize,
             max_depth: usize,
-            simulate_work: &dyn Fn(),
+            simulate_forward: &dyn Fn(),
+            preload_extra_delay: std::time::Duration,
         ) -> (f64, usize, usize, usize, usize) {
             let token_bytes = kv_heads * head_dim * 2;
             let mut caches: Vec<OffloadKVCache> = (0..num_layers)
@@ -1851,23 +1852,33 @@ mod tests {
                     // Sync preload [0..depth)
                     for j in 0..depth.min(num_layers) {
                         let was = unsafe { (*caches_ptr.add(j)).preloaded };
+                        let t0 = std::time::Instant::now();
                         unsafe { (*caches_ptr.add(j)).preload().unwrap() };
+                        if !was {
+                            std::thread::sleep(preload_extra_delay);
+                        }
+                        prefetch.record_preload(t0.elapsed());
                         preload_calls += 1;
                         if was {
                             preload_skips += 1;
                         }
                     }
 
-                    // Pending preload handles
-                    let mut pending: Vec<Option<std::thread::ScopedJoinHandle<'_, ()>>> =
-                        (0..num_layers).map(|_| None).collect();
+                    // Pending preload handles: each returns preload duration
+                    type Handle<'s> =
+                        Option<std::thread::ScopedJoinHandle<'s, std::time::Duration>>;
+                    let mut pending: Vec<Handle<'_>> = (0..num_layers).map(|_| None).collect();
 
                     // Fire initial background preloads [depth..2*depth)
                     for j in depth..(2 * depth).min(num_layers) {
                         let cache_j = unsafe { &mut *caches_ptr.add(j) };
+                        let delay = preload_extra_delay;
                         preload_calls += 1;
                         pending[j] = Some(s.spawn(move || {
+                            let t0 = std::time::Instant::now();
                             cache_j.preload().unwrap();
+                            std::thread::sleep(delay);
+                            t0.elapsed()
                         }));
                     }
 
@@ -1875,16 +1886,21 @@ mod tests {
                     for i in 0..num_layers {
                         // Join pending preload for this layer
                         if let Some(handle) = pending[i].take() {
-                            handle.join().unwrap();
+                            let preload_dur = handle.join().unwrap();
+                            prefetch.record_preload(preload_dur);
                         }
 
                         // Fire preload for layer i + depth
                         let far_idx = i + depth;
                         if far_idx < num_layers && pending[far_idx].is_none() {
                             let cache_far = unsafe { &mut *caches_ptr.add(far_idx) };
+                            let delay = preload_extra_delay;
                             preload_calls += 1;
                             pending[far_idx] = Some(s.spawn(move || {
+                                let t0 = std::time::Instant::now();
                                 cache_far.preload().unwrap();
+                                std::thread::sleep(delay);
+                                t0.elapsed()
                             }));
                         }
 
@@ -1892,7 +1908,7 @@ mod tests {
                         let current = unsafe { &mut *caches_ptr.add(i) };
                         let fwd_t0 = std::time::Instant::now();
                         let _ = current.get_view();
-                        simulate_work();
+                        simulate_forward();
                         prefetch.record_forward(fwd_t0.elapsed());
 
                         // Release previous layer
@@ -1903,7 +1919,8 @@ mod tests {
 
                     // Join remaining
                     for handle in pending.into_iter().flatten() {
-                        handle.join().unwrap();
+                        let preload_dur = handle.join().unwrap();
+                        prefetch.record_preload(preload_dur);
                     }
 
                     // Release last layer
@@ -1941,7 +1958,8 @@ mod tests {
             prefill_len,
             decode_steps,
             1,
-            &simulate_work,
+            &simulate_forward,
+            simulate_preload_extra,
         );
 
         // Run with adaptive (max_depth=4)
@@ -1953,7 +1971,8 @@ mod tests {
             prefill_len,
             decode_steps,
             4,
-            &simulate_work,
+            &simulate_forward,
+            simulate_preload_extra,
         );
 
         // Run with depth=4 (fixed max)
@@ -1965,7 +1984,8 @@ mod tests {
             prefill_len,
             decode_steps,
             4,
-            &simulate_work,
+            &simulate_forward,
+            simulate_preload_extra,
         );
 
         println!("║");
