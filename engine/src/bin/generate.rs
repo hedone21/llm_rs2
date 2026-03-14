@@ -2319,7 +2319,7 @@ fn run_svd_offload(
     max_prefetch_depth: usize,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
-    use llm_rs2::core::offload::zram_store::ZramStore;
+    use llm_rs2::core::offload::raw_store::RawStore;
     use llm_rs2::core::svd_cache::{SvdConfig, SvdOffloadKVCache};
 
     let v_token_bytes = kv_heads * head_dim * DType::F16.size();
@@ -2329,12 +2329,11 @@ fn run_svd_offload(
         svd_rank, kv_heads, head_dim, num_layers, max_seq_len,
     );
 
-    // Create SvdOffloadKVCache per layer (V uses ZramStore)
+    // Create SvdOffloadKVCache per layer (V uses RawStore)
     let mut kv_caches: Vec<SvdOffloadKVCache> = (0..num_layers)
         .map(|layer_id| {
-            let residual_cap = 64;
             let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> =
-                Box::new(ZramStore::new(v_token_bytes, 2, residual_cap));
+                Box::new(RawStore::new(v_token_bytes));
             SvdOffloadKVCache::new(
                 layer_id,
                 kv_heads,
@@ -2621,15 +2620,13 @@ fn run_offload(
     _prompt: &str,
     _backend_name: &str,
     offload_mode: &str,
-    offload_dir: &str,
+    _offload_dir: &str,
     kv_type_str: &str,
     max_prefetch_depth: usize,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
-    use llm_rs2::core::offload::disk_store::DiskStore;
     use llm_rs2::core::offload::raw_store::RawStore;
-    use llm_rs2::core::offload::zram_store::ZramStore;
 
     // Validate constraints
     let kv_dtype = match kv_type_str {
@@ -2652,17 +2649,6 @@ fn run_offload(
     let mut kv_caches: Vec<OffloadKVCache> = (0..num_layers)
         .map(|layer_id| {
             let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> = match offload_mode {
-                "disk" => {
-                    let dir = std::path::Path::new(offload_dir);
-                    Box::new(
-                        DiskStore::new(dir, layer_id, token_bytes)
-                            .expect("Failed to create DiskStore"),
-                    )
-                }
-                "zram" => {
-                    let residual_cap = 64;
-                    Box::new(ZramStore::new(token_bytes, kv_dtype.size(), residual_cap))
-                }
                 "raw" => Box::new(RawStore::new(token_bytes)),
                 _ => panic!("Unknown offload mode: {}", offload_mode),
             };

@@ -1,20 +1,16 @@
 //! KV cache layer-wise offload system.
 //!
-//! Two lossless strategies share a common `OffloadStore` interface:
-//! - `DiskStore`: raw KV data → temporary files
-//! - `ZramStore`: byte-shuffle → LZ4 compression → in-memory storage
+//! `RawStore` provides zero-overhead in-memory KV data storage (no compression).
 //!
 //! `OffloadKVCache` implements `KVCacheOps` and manages the lifecycle:
 //! migration (KVCache → offload), per-token append during decode,
-//! and on-demand data loading for attention computation.
+//! deferred store writes for retained layers, and on-demand data loading
+//! for attention computation.
 
-pub mod disk_store;
 pub mod prefetch;
 pub mod preload_pool;
-pub mod preprocess;
 pub mod raw_store;
 pub mod store;
-pub mod zram_store;
 
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::shared_buffer::SharedBuffer;
@@ -27,7 +23,7 @@ use std::sync::Arc;
 
 use self::store::OffloadStore;
 
-/// KV cache implementation that offloads data to an external store (disk or compressed memory).
+/// KV cache implementation that offloads data to an external store.
 ///
 /// Implements `KVCacheOps` so it can be used as a drop-in replacement in the
 /// generic `forward_into<C: KVCacheOps>` path.
@@ -52,7 +48,7 @@ pub struct OffloadKVCache {
     max_seq_len: usize,
     /// Bytes per token for K (or V): kv_heads × head_dim × dtype.size().
     token_bytes: usize,
-    /// The backing store (DiskStore or ZramStore).
+    /// The backing store (e.g. RawStore).
     store: Box<dyn OffloadStore>,
     /// Lazy-allocated attention buffer for K. Allocated on preload(), freed on release_buffers().
     attn_k_buf: Option<Vec<u8>>,
@@ -435,43 +431,9 @@ mod tests {
     }
 
     #[test]
-    fn test_offload_kvcache_ops_disk() {
-        let dir = std::env::temp_dir().join("llm_rs2_test_offload_ops");
-        let token_bytes = 2 * 32 * 2; // 2 heads × 32 dim × F16
-        let store = disk_store::DiskStore::new(&dir, 0, token_bytes).unwrap();
-
-        let mut cache = OffloadKVCache::new(0, 2, 32, DType::F16, 256, Box::new(store));
-
-        assert_eq!(cache.current_pos(), 0);
-        assert_eq!(cache.capacity(), 256);
-        assert_eq!(cache.kv_dtype(), DType::F16);
-        assert_eq!(cache.layout(), KVLayout::SeqMajor);
-
-        // Update with 4 tokens
-        let k = make_test_tensor(4, 2, 32, DType::F16, 0xAB);
-        let v = make_test_tensor(4, 2, 32, DType::F16, 0xCD);
-        cache.update(&k, &v).unwrap();
-        assert_eq!(cache.current_pos(), 4);
-
-        // Get view
-        let (k_view, v_view) = cache.get_view();
-        assert_eq!(k_view.shape().dims(), &[1, 4, 2, 32]);
-        assert_eq!(v_view.shape().dims(), &[1, 4, 2, 32]);
-
-        // Verify data
-        let k_out =
-            unsafe { std::slice::from_raw_parts(k_view.buffer().as_ptr(), 4 * token_bytes) };
-        assert!(k_out.iter().all(|&b| b == 0xAB), "K data corrupted");
-
-        let v_out =
-            unsafe { std::slice::from_raw_parts(v_view.buffer().as_ptr(), 4 * token_bytes) };
-        assert!(v_out.iter().all(|&b| b == 0xCD), "V data corrupted");
-    }
-
-    #[test]
-    fn test_offload_kvcache_ops_zram() {
+    fn test_offload_kvcache_ops() {
         let token_bytes = 2 * 32 * 2;
-        let store = zram_store::ZramStore::new(token_bytes, 2, 64);
+        let store = raw_store::RawStore::new(token_bytes);
 
         let mut cache = OffloadKVCache::new(0, 2, 32, DType::F16, 256, Box::new(store));
 
@@ -493,119 +455,11 @@ mod tests {
     }
 
     #[test]
-    fn test_offload_kvcache_decode_loop() {
-        let dir = std::env::temp_dir().join("llm_rs2_test_decode_loop");
-        let kv_heads = 2;
-        let head_dim = 32;
-        let token_bytes = kv_heads * head_dim * 2; // F16
-        let store = disk_store::DiskStore::new(&dir, 0, token_bytes).unwrap();
-
-        let mut cache =
-            OffloadKVCache::new(0, kv_heads, head_dim, DType::F16, 512, Box::new(store));
-
-        // Simulate prefill (4 tokens) then 100 decode steps
-        let k_prefill = make_test_tensor(4, kv_heads, head_dim, DType::F16, 0x11);
-        let v_prefill = make_test_tensor(4, kv_heads, head_dim, DType::F16, 0x22);
-        cache.update(&k_prefill, &v_prefill).unwrap();
-
-        for i in 0..100u8 {
-            let k = make_test_tensor(1, kv_heads, head_dim, DType::F16, i);
-            let v = make_test_tensor(1, kv_heads, head_dim, DType::F16, i + 128);
-            cache.update(&k, &v).unwrap();
-        }
-
-        assert_eq!(cache.current_pos(), 104);
-
-        let (k_view, v_view) = cache.get_view();
-        assert_eq!(k_view.shape().dims(), &[1, 104, kv_heads, head_dim]);
-        assert_eq!(v_view.shape().dims(), &[1, 104, kv_heads, head_dim]);
-
-        // Verify first 4 tokens still have prefill data
-        let k_out =
-            unsafe { std::slice::from_raw_parts(k_view.buffer().as_ptr(), 104 * token_bytes) };
-        assert!(
-            k_out[..token_bytes].iter().all(|&b| b == 0x11),
-            "prefill K data corrupted"
-        );
-    }
-
-    #[test]
-    fn test_offload_kvcache_f32_bit_exact() {
-        // Verify F32 data survives the full round-trip (DiskStore)
-        let dir = std::env::temp_dir().join("llm_rs2_test_f32_exact");
-        let kv_heads = 2;
-        let head_dim = 4;
-        let token_bytes = kv_heads * head_dim * 4; // F32
-        let store = disk_store::DiskStore::new(&dir, 0, token_bytes).unwrap();
-
-        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
-
-        let k_vals: Vec<f32> = (0..kv_heads * head_dim)
-            .map(|i| 1.0 + i as f32 * 0.01)
-            .collect();
-        let v_vals: Vec<f32> = (0..kv_heads * head_dim)
-            .map(|i| 2.0 + i as f32 * 0.01)
-            .collect();
-
-        let k = make_f32_tensor_with_data(&k_vals, 1, kv_heads, head_dim);
-        let v = make_f32_tensor_with_data(&v_vals, 1, kv_heads, head_dim);
-        cache.update(&k, &v).unwrap();
-
-        let (k_view, v_view) = cache.get_view();
-        let k_out = k_view.as_slice::<f32>();
-        let v_out = v_view.as_slice::<f32>();
-
-        for i in 0..k_vals.len() {
-            assert_eq!(
-                k_out[i], k_vals[i],
-                "K[{i}] mismatch: {} vs {}",
-                k_out[i], k_vals[i]
-            );
-            assert_eq!(
-                v_out[i], v_vals[i],
-                "V[{i}] mismatch: {} vs {}",
-                v_out[i], v_vals[i]
-            );
-        }
-    }
-
-    #[test]
-    fn test_offload_kvcache_f32_zram_bit_exact() {
-        // Verify F32 data survives ZramStore round-trip (lossless!)
-        let kv_heads = 2;
-        let head_dim = 4;
-        let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
-
-        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
-
-        let k_vals: Vec<f32> = (0..kv_heads * head_dim)
-            .map(|i| std::f32::consts::PI + i as f32 * 0.001)
-            .collect();
-        let v_vals: Vec<f32> = (0..kv_heads * head_dim)
-            .map(|i| std::f32::consts::E + i as f32 * 0.001)
-            .collect();
-
-        let k = make_f32_tensor_with_data(&k_vals, 1, kv_heads, head_dim);
-        let v = make_f32_tensor_with_data(&v_vals, 1, kv_heads, head_dim);
-        cache.update(&k, &v).unwrap();
-
-        let (k_view, v_view) = cache.get_view();
-        let k_out = k_view.as_slice::<f32>();
-        let v_out = v_view.as_slice::<f32>();
-
-        for i in 0..k_vals.len() {
-            assert_eq!(k_out[i], k_vals[i], "K[{i}] not bit-exact");
-            assert_eq!(v_out[i], v_vals[i], "V[{i}] not bit-exact");
-        }
-    }
-
-    #[test]
     fn test_offload_kvcache_overflow() {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 2;
-        let store = zram_store::ZramStore::new(token_bytes, 2, 8);
+        let store = raw_store::RawStore::new(token_bytes);
 
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F16, 8, Box::new(store));
 
@@ -624,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_offload_kvcache_empty_view() {
-        let store = zram_store::ZramStore::new(64, 2, 8);
+        let store = raw_store::RawStore::new(64);
         let mut cache = OffloadKVCache::new(0, 2, 4, DType::F16, 64, Box::new(store));
 
         let (k, v) = cache.get_view();
@@ -635,7 +489,7 @@ mod tests {
     #[test]
     fn test_offload_kvcache_memory_usage() {
         let token_bytes = 8 * 64 * 2;
-        let store = zram_store::ZramStore::new(token_bytes, 2, 64);
+        let store = raw_store::RawStore::new(token_bytes);
         let cache = OffloadKVCache::new(0, 8, 64, DType::F16, 256, Box::new(store));
         assert_eq!(cache.memory_usage_bytes(), 0);
     }
@@ -737,65 +591,15 @@ mod tests {
     }
 
     #[test]
-    fn test_integration_base_vs_disk_f32_accuracy() {
+    fn test_integration_base_vs_offload_f16_accuracy() {
         let kv_heads = 8;
         let head_dim = 64;
         let max_seq_len = 256;
         let prefill_len = 16;
         let decode_steps = 64;
 
-        let dir = std::env::temp_dir().join("llm_rs2_integ_disk_f32");
-        let token_bytes = kv_heads * head_dim * 4;
-        let disk = disk_store::DiskStore::new(&dir, 0, token_bytes).unwrap();
-
-        let mut base = make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F32);
-        let mut offload = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F32,
-            max_seq_len,
-            Box::new(disk),
-        );
-
-        // Prefill
-        let k_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-        let v_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-        base.update(&k_pf, &v_pf).unwrap();
-        offload.update(&k_pf, &v_pf).unwrap();
-
-        // Decode
-        for i in 0..decode_steps {
-            let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * i as f32);
-            let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * i as f32);
-            base.update(&k, &v).unwrap();
-            offload.update(&k, &v).unwrap();
-        }
-
-        assert_eq!(base.current_pos(), offload.current_pos());
-        let (exact, elems) = compare_views(&mut base, &mut offload, DType::F32);
-        assert!(
-            exact,
-            "DiskStore F32: BASE vs Offload NOT bit-exact! ({elems} elements)"
-        );
-        println!(
-            "[PASS] DiskStore F32: bit-exact match, {} tokens, {} elements",
-            base.current_pos(),
-            elems
-        );
-    }
-
-    #[test]
-    fn test_integration_base_vs_disk_f16_accuracy() {
-        let kv_heads = 8;
-        let head_dim = 64;
-        let max_seq_len = 256;
-        let prefill_len = 16;
-        let decode_steps = 64;
-
-        let dir = std::env::temp_dir().join("llm_rs2_integ_disk_f16");
         let token_bytes = kv_heads * head_dim * 2;
-        let disk = disk_store::DiskStore::new(&dir, 0, token_bytes).unwrap();
+        let store = raw_store::RawStore::new(token_bytes);
 
         let mut base = make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F16);
         let mut offload = OffloadKVCache::new(
@@ -804,101 +608,7 @@ mod tests {
             head_dim,
             DType::F16,
             max_seq_len,
-            Box::new(disk),
-        );
-
-        // Prefill
-        let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
-        let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
-        base.update(&k_pf, &v_pf).unwrap();
-        offload.update(&k_pf, &v_pf).unwrap();
-
-        // Decode
-        for i in 0..decode_steps {
-            let k = make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (i as u16 * 3));
-            let v = make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (i as u16 * 5));
-            base.update(&k, &v).unwrap();
-            offload.update(&k, &v).unwrap();
-        }
-
-        let (exact, elems) = compare_views(&mut base, &mut offload, DType::F16);
-        assert!(
-            exact,
-            "DiskStore F16: BASE vs Offload NOT bit-exact! ({elems} elements)"
-        );
-        println!(
-            "[PASS] DiskStore F16: bit-exact match, {} tokens, {} elements",
-            base.current_pos(),
-            elems
-        );
-    }
-
-    #[test]
-    fn test_integration_base_vs_zram_f32_accuracy() {
-        let kv_heads = 8;
-        let head_dim = 64;
-        let max_seq_len = 256;
-        let prefill_len = 16;
-        let decode_steps = 64;
-
-        let token_bytes = kv_heads * head_dim * 4;
-        let zram = zram_store::ZramStore::new(token_bytes, 4, 64);
-
-        let mut base = make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F32);
-        let mut offload = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F32,
-            max_seq_len,
-            Box::new(zram),
-        );
-
-        // Prefill
-        let k_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-        let v_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-        base.update(&k_pf, &v_pf).unwrap();
-        offload.update(&k_pf, &v_pf).unwrap();
-
-        // Decode
-        for i in 0..decode_steps {
-            let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * i as f32);
-            let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * i as f32);
-            base.update(&k, &v).unwrap();
-            offload.update(&k, &v).unwrap();
-        }
-
-        let (exact, elems) = compare_views(&mut base, &mut offload, DType::F32);
-        assert!(
-            exact,
-            "ZramStore F32: BASE vs Offload NOT bit-exact! ({elems} elements)"
-        );
-        println!(
-            "[PASS] ZramStore F32: bit-exact match, {} tokens, {} elements",
-            base.current_pos(),
-            elems
-        );
-    }
-
-    #[test]
-    fn test_integration_base_vs_zram_f16_accuracy() {
-        let kv_heads = 8;
-        let head_dim = 64;
-        let max_seq_len = 256;
-        let prefill_len = 16;
-        let decode_steps = 64;
-
-        let token_bytes = kv_heads * head_dim * 2;
-        let zram = zram_store::ZramStore::new(token_bytes, 2, 64);
-
-        let mut base = make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F16);
-        let mut offload = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F16,
-            max_seq_len,
-            Box::new(zram),
+            Box::new(store),
         );
 
         let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
@@ -916,646 +626,13 @@ mod tests {
         let (exact, elems) = compare_views(&mut base, &mut offload, DType::F16);
         assert!(
             exact,
-            "ZramStore F16: BASE vs Offload NOT bit-exact! ({elems} elements)"
+            "RawStore F16: BASE vs Offload NOT bit-exact! ({elems} elements)"
         );
         println!(
-            "[PASS] ZramStore F16: bit-exact match, {} tokens, {} elements",
+            "[PASS] RawStore F16: bit-exact match, {} tokens, {} elements",
             base.current_pos(),
             elems
         );
-    }
-
-    #[test]
-    fn test_integration_speed_and_compression() {
-        // Benchmark: BASE vs DiskStore vs ZramStore
-        // Measures update + get_view timing and ZramStore compression ratio
-        let kv_heads = 8;
-        let head_dim = 64;
-        let max_seq_len = 512;
-        let prefill_len = 32;
-        let decode_steps = 128;
-
-        let dir = std::env::temp_dir().join("llm_rs2_integ_bench");
-
-        // --- BASE (KVCache) ---
-        let base_start = std::time::Instant::now();
-        let mut base = make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F32);
-        {
-            let k = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-            let v = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-            base.update(&k, &v).unwrap();
-        }
-        for i in 0..decode_steps {
-            let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * i as f32);
-            let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * i as f32);
-            base.update(&k, &v).unwrap();
-            let _ = KVCacheOps::get_view(&mut base);
-        }
-        let base_ms = base_start.elapsed().as_secs_f64() * 1000.0;
-
-        // --- DiskStore ---
-        let token_bytes = kv_heads * head_dim * 4;
-        let disk_start = std::time::Instant::now();
-        let disk = disk_store::DiskStore::new(&dir, 0, token_bytes).unwrap();
-        let mut disk_cache = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F32,
-            max_seq_len,
-            Box::new(disk),
-        );
-        {
-            let k = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-            let v = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-            disk_cache.update(&k, &v).unwrap();
-        }
-        for i in 0..decode_steps {
-            let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * i as f32);
-            let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * i as f32);
-            disk_cache.update(&k, &v).unwrap();
-            let _ = disk_cache.get_view();
-        }
-        let disk_ms = disk_start.elapsed().as_secs_f64() * 1000.0;
-        let disk_size = disk_cache.memory_usage_bytes();
-
-        // --- ZramStore F32 ---
-        let zram_f32_start = std::time::Instant::now();
-        let zram = zram_store::ZramStore::new(token_bytes, 4, 64);
-        let mut zram_f32_cache = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F32,
-            max_seq_len,
-            Box::new(zram),
-        );
-        {
-            let k = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-            let v = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-            zram_f32_cache.update(&k, &v).unwrap();
-        }
-        for i in 0..decode_steps {
-            let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * i as f32);
-            let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * i as f32);
-            zram_f32_cache.update(&k, &v).unwrap();
-            let _ = zram_f32_cache.get_view();
-        }
-        let zram_f32_ms = zram_f32_start.elapsed().as_secs_f64() * 1000.0;
-        let zram_f32_storage = zram_f32_cache.memory_usage_bytes();
-        let raw_f32_size = zram_f32_cache.current_pos() * kv_heads * head_dim * 4 * 2; // K+V
-        let zram_f32_ratio = raw_f32_size as f64 / zram_f32_storage.max(1) as f64;
-
-        // --- ZramStore F16 ---
-        let token_bytes_f16 = kv_heads * head_dim * 2;
-        let zram_f16_start = std::time::Instant::now();
-        let zram16 = zram_store::ZramStore::new(token_bytes_f16, 2, 64);
-        let mut zram_f16_cache = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F16,
-            max_seq_len,
-            Box::new(zram16),
-        );
-        {
-            let k = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
-            let v = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
-            zram_f16_cache.update(&k, &v).unwrap();
-        }
-        for i in 0..decode_steps {
-            let k = make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (i as u16 * 3));
-            let v = make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (i as u16 * 5));
-            zram_f16_cache.update(&k, &v).unwrap();
-            let _ = zram_f16_cache.get_view();
-        }
-        let zram_f16_ms = zram_f16_start.elapsed().as_secs_f64() * 1000.0;
-        let zram_f16_storage = zram_f16_cache.memory_usage_bytes();
-        let raw_f16_size = zram_f16_cache.current_pos() * kv_heads * head_dim * 2 * 2;
-        let zram_f16_ratio = raw_f16_size as f64 / zram_f16_storage.max(1) as f64;
-
-        // Print report
-        let total_tokens = prefill_len + decode_steps;
-        println!("\n╔══════════════════════════════════════════════════════════════╗");
-        println!("║  KV Cache Offload Integration Benchmark                     ║");
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!("║  Config: kv_heads={kv_heads}, head_dim={head_dim}, tokens={total_tokens}");
-        println!("║  Prefill={prefill_len}, Decode={decode_steps}");
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  {:20} {:>10} {:>10} {:>10} ║",
-            "Method", "Time(ms)", "Storage", "Ratio"
-        );
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  {:20} {:>10.2} {:>9}B {:>10} ║",
-            "BASE (KVCache F32)", base_ms, raw_f32_size, "1.00x"
-        );
-        println!(
-            "║  {:20} {:>10.2} {:>9}B {:>10} ║",
-            "DiskStore F32", disk_ms, disk_size, "N/A"
-        );
-        println!(
-            "║  {:20} {:>10.2} {:>9}B {:>9.2}x ║",
-            "ZramStore F32", zram_f32_ms, zram_f32_storage, zram_f32_ratio
-        );
-        println!(
-            "║  {:20} {:>10.2} {:>9}B {:>9.2}x ║",
-            "ZramStore F16", zram_f16_ms, zram_f16_storage, zram_f16_ratio
-        );
-        println!("╠══════════════════════════════════════════════════════════════╣");
-        println!("║  Disk overhead: {:.1}x slower", disk_ms / base_ms);
-        println!("║  Zram F32 overhead: {:.1}x slower", zram_f32_ms / base_ms);
-        println!("║  Zram F16 compression: {:.2}x", zram_f16_ratio);
-        println!("╚══════════════════════════════════════════════════════════════╝\n");
-
-        // Accuracy verification (all must be bit-exact)
-        let mut base2 = make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F32);
-        let disk2 = disk_store::DiskStore::new(&dir.join("verify"), 0, token_bytes).unwrap();
-        let mut disk2_cache = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F32,
-            max_seq_len,
-            Box::new(disk2),
-        );
-        let zram2 = zram_store::ZramStore::new(token_bytes, 4, 64);
-        let mut zram2_cache = OffloadKVCache::new(
-            0,
-            kv_heads,
-            head_dim,
-            DType::F32,
-            max_seq_len,
-            Box::new(zram2),
-        );
-
-        let k = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-        let v = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-        base2.update(&k, &v).unwrap();
-        disk2_cache.update(&k, &v).unwrap();
-        zram2_cache.update(&k, &v).unwrap();
-
-        for i in 0..decode_steps {
-            let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * i as f32);
-            let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * i as f32);
-            base2.update(&k, &v).unwrap();
-            disk2_cache.update(&k, &v).unwrap();
-            zram2_cache.update(&k, &v).unwrap();
-        }
-
-        let (disk_exact, _) = compare_views(&mut base2, &mut disk2_cache, DType::F32);
-        assert!(disk_exact, "DiskStore F32 accuracy: NOT bit-exact vs BASE!");
-
-        let (zram_exact, _) = compare_views(&mut base2, &mut zram2_cache, DType::F32);
-        assert!(zram_exact, "ZramStore F32 accuracy: NOT bit-exact vs BASE!");
-
-        // ZramStore compression should be meaningful
-        assert!(
-            zram_f16_ratio >= 1.3,
-            "ZramStore F16 compression ratio {zram_f16_ratio:.2}x too low"
-        );
-        assert!(
-            zram_f32_ratio >= 1.2,
-            "ZramStore F32 compression ratio {zram_f32_ratio:.2}x too low"
-        );
-    }
-
-    // ════════════════════════════════════════════════════════════════════════
-    //  Phase 3 Benchmark: Sync vs Preload, Memory Analysis
-    // ════════════════════════════════════════════════════════════════════════
-
-    #[test]
-    fn test_bench_preload_vs_sync_and_memory() {
-        // Llama 3.2 1B-scale parameters
-        let kv_heads = 8;
-        let head_dim = 64;
-        let num_layers = 16;
-        let max_seq_len = 2048;
-        let prefill_len = 64;
-        let decode_steps = 128;
-
-        let token_bytes_f16 = kv_heads * head_dim * 2; // 1024 bytes/token
-        let token_bytes_f32 = kv_heads * head_dim * 4; // 2048 bytes/token
-
-        println!("\n╔══════════════════════════════════════════════════════════════════╗");
-        println!("║  Phase 3 KV Offload Benchmark: Sync vs Preload + Memory        ║");
-        println!("╠══════════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  Config: kv_heads={}, head_dim={}, layers={}, max_seq={}",
-            kv_heads, head_dim, num_layers, max_seq_len
-        );
-        println!("║  Prefill={}, Decode={}", prefill_len, decode_steps);
-        println!("╠══════════════════════════════════════════════════════════════════╣");
-
-        let total_tokens = prefill_len + decode_steps;
-
-        // ── Helper: create N-layer caches and run decode simulation ──
-        let run_decode_bench = |mode: &str,
-                                dtype: DType,
-                                use_preload: bool|
-         -> (f64, f64, f64, usize, usize) {
-            let token_bytes = kv_heads * head_dim * dtype.size();
-            let mut caches: Vec<OffloadKVCache> = (0..num_layers)
-                .map(|layer_id| {
-                    let store: Box<dyn store::OffloadStore> = match mode {
-                        "zram" => {
-                            Box::new(zram_store::ZramStore::new(token_bytes, dtype.size(), 64))
-                        }
-                        "disk" => {
-                            let dir = std::env::temp_dir()
-                                .join(format!("llm_rs2_bench3_{}_{:?}_{}", mode, dtype, layer_id));
-                            Box::new(
-                                disk_store::DiskStore::new(&dir, layer_id, token_bytes).unwrap(),
-                            )
-                        }
-                        _ => unreachable!(),
-                    };
-                    OffloadKVCache::new(layer_id, kv_heads, head_dim, dtype, max_seq_len, store)
-                })
-                .collect();
-
-            // Prefill
-            let k_pf = if dtype == DType::F32 {
-                make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0)
-            } else {
-                make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00)
-            };
-            let v_pf = if dtype == DType::F32 {
-                make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0)
-            } else {
-                make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00)
-            };
-            for c in caches.iter_mut() {
-                c.update(&k_pf, &v_pf).unwrap();
-            }
-
-            // Decode loop
-            let decode_start = std::time::Instant::now();
-            let mut total_io_us = 0u64;
-            let mut total_getview_us = 0u64;
-
-            for step in 0..decode_steps {
-                // Generate per-step token data
-                let k_tok = if dtype == DType::F32 {
-                    make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * step as f32)
-                } else {
-                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3))
-                };
-                let v_tok = if dtype == DType::F32 {
-                    make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * step as f32)
-                } else {
-                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5))
-                };
-
-                if use_preload {
-                    // Reset preload flags
-                    for c in caches.iter_mut() {
-                        c.reset_preload();
-                    }
-
-                    // Update all layers
-                    for c in caches.iter_mut() {
-                        c.update(&k_tok, &v_tok).unwrap();
-                    }
-
-                    // Preload layer 0
-                    caches[0].preload().unwrap();
-
-                    // Pipeline: compute(layer i) || preload(layer i+1)
-                    for i in 0..num_layers {
-                        if i + 1 < num_layers {
-                            let (left, right) = caches.split_at_mut(i + 1);
-                            let current = &mut left[i];
-                            let next = &mut right[0];
-
-                            std::thread::scope(|s| {
-                                let io_start = std::time::Instant::now();
-                                let handle = s.spawn(|| next.preload().unwrap());
-
-                                let gv_start = std::time::Instant::now();
-                                let _ = current.get_view();
-                                total_getview_us += gv_start.elapsed().as_micros() as u64;
-
-                                handle.join().unwrap();
-                                total_io_us += io_start.elapsed().as_micros() as u64;
-                            });
-
-                            if i > 0 {
-                                caches[i - 1].release_buffers();
-                            }
-                        } else {
-                            let gv_start = std::time::Instant::now();
-                            let _ = caches[i].get_view();
-                            total_getview_us += gv_start.elapsed().as_micros() as u64;
-                            caches[i].release_buffers();
-                        }
-                    }
-                } else {
-                    // Sync: update + get_view for all layers
-                    for c in caches.iter_mut() {
-                        c.update(&k_tok, &v_tok).unwrap();
-                    }
-                    for c in caches.iter_mut() {
-                        let gv_start = std::time::Instant::now();
-                        let _ = c.get_view();
-                        total_getview_us += gv_start.elapsed().as_micros() as u64;
-                    }
-                }
-            }
-            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
-            let avg_per_token_ms = decode_ms / decode_steps as f64;
-            let avg_getview_us = total_getview_us as f64 / (decode_steps * num_layers) as f64;
-
-            // Memory analysis
-            let store_mem: usize = caches.iter().map(|c| c.memory_usage_bytes()).sum();
-            let attn_buf_mem: usize = caches
-                .iter()
-                .map(|c| {
-                    c.attn_k_buf.as_ref().map_or(0, |b| b.len())
-                        + c.attn_v_buf.as_ref().map_or(0, |b| b.len())
-                })
-                .sum();
-
-            (
-                decode_ms,
-                avg_per_token_ms,
-                avg_getview_us,
-                store_mem,
-                attn_buf_mem,
-            )
-        };
-
-        // ── Baseline: KVCache F32 ──
-        let base_start = std::time::Instant::now();
-        {
-            let mut bases: Vec<KVCache> = (0..num_layers)
-                .map(|_| make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F32))
-                .collect();
-            let k_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 1.0);
-            let v_pf = make_realistic_f32_tensor(prefill_len, kv_heads, head_dim, 2.0);
-            for c in bases.iter_mut() {
-                c.update(&k_pf, &v_pf).unwrap();
-            }
-            for step in 0..decode_steps {
-                let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.1 * step as f32);
-                let v = make_realistic_f32_tensor(1, kv_heads, head_dim, 0.2 * step as f32);
-                for c in bases.iter_mut() {
-                    c.update(&k, &v).unwrap();
-                    let _ = KVCacheOps::get_view(c);
-                }
-            }
-        }
-        let base_ms = base_start.elapsed().as_secs_f64() * 1000.0;
-        let base_per_tok = base_ms / decode_steps as f64;
-        // BASE memory: 16 layers × max_seq_len × kv_heads × head_dim × 4 × 2 (K+V)
-        let base_mem = num_layers * max_seq_len * kv_heads * head_dim * 4 * 2;
-
-        // ── Baseline: KVCache F16 ──
-        let base_f16_start = std::time::Instant::now();
-        {
-            let mut bases: Vec<KVCache> = (0..num_layers)
-                .map(|_| make_base_kvcache(kv_heads, head_dim, max_seq_len, DType::F16))
-                .collect();
-            let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
-            let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
-            for c in bases.iter_mut() {
-                c.update(&k_pf, &v_pf).unwrap();
-            }
-            for step in 0..decode_steps {
-                let k =
-                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
-                let v =
-                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
-                for c in bases.iter_mut() {
-                    c.update(&k, &v).unwrap();
-                    let _ = KVCacheOps::get_view(c);
-                }
-            }
-        }
-        let base_f16_ms = base_f16_start.elapsed().as_secs_f64() * 1000.0;
-        let base_f16_per_tok = base_f16_ms / decode_steps as f64;
-        let base_f16_mem = num_layers * max_seq_len * kv_heads * head_dim * 2 * 2;
-
-        // ── ZramStore F16: Sync ──
-        let (zram_f16_sync_ms, zram_f16_sync_pt, zram_f16_sync_gv, zram_f16_store, _) =
-            run_decode_bench("zram", DType::F16, false);
-
-        // ── ZramStore F16: Preload ──
-        let (
-            zram_f16_pre_ms,
-            zram_f16_pre_pt,
-            zram_f16_pre_gv,
-            zram_f16_pre_store,
-            zram_f16_pre_attn,
-        ) = run_decode_bench("zram", DType::F16, true);
-
-        // ── ZramStore F32: Sync ──
-        let (zram_f32_sync_ms, zram_f32_sync_pt, zram_f32_sync_gv, zram_f32_store, _) =
-            run_decode_bench("zram", DType::F32, false);
-
-        // ── ZramStore F32: Preload ──
-        let (
-            zram_f32_pre_ms,
-            zram_f32_pre_pt,
-            zram_f32_pre_gv,
-            zram_f32_pre_store,
-            zram_f32_pre_attn,
-        ) = run_decode_bench("zram", DType::F32, true);
-
-        // ── DiskStore F16: Sync ──
-        let (disk_f16_sync_ms, disk_f16_sync_pt, disk_f16_sync_gv, disk_f16_store, _) =
-            run_decode_bench("disk", DType::F16, false);
-
-        // ── DiskStore F16: Preload ──
-        let (disk_f16_pre_ms, disk_f16_pre_pt, disk_f16_pre_gv, _, disk_f16_pre_attn) =
-            run_decode_bench("disk", DType::F16, true);
-
-        let raw_f16_kv = total_tokens * token_bytes_f16 * 2 * num_layers; // K+V, all layers
-        let raw_f32_kv = total_tokens * token_bytes_f32 * 2 * num_layers;
-
-        // ═══ Performance Report ═══
-        println!("║");
-        println!(
-            "║  {:30} {:>8} {:>10} {:>10} {:>8}",
-            "Configuration", "Total", "Per-Token", "get_view", "vs BASE"
-        );
-        println!(
-            "║  {:30} {:>8} {:>10} {:>10} {:>8}",
-            "", "(ms)", "(ms/tok)", "(μs/call)", ""
-        );
-        println!("╠══════════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10} {:>8}",
-            "BASE KVCache F32", base_ms, base_per_tok, "—", "1.0x"
-        );
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10} {:>8}",
-            "BASE KVCache F16",
-            base_f16_ms,
-            base_f16_per_tok,
-            "—",
-            format!("{:.1}x", base_f16_ms / base_ms)
-        );
-        println!("║  ──────────────────────────────────────────────────────────────");
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
-            "ZramStore F16 (sync)",
-            zram_f16_sync_ms,
-            zram_f16_sync_pt,
-            zram_f16_sync_gv,
-            format!("{:.1}x", zram_f16_sync_ms / base_f16_ms)
-        );
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
-            "ZramStore F16 (preload)",
-            zram_f16_pre_ms,
-            zram_f16_pre_pt,
-            zram_f16_pre_gv,
-            format!("{:.1}x", zram_f16_pre_ms / base_f16_ms)
-        );
-        let f16_speedup = zram_f16_sync_ms / zram_f16_pre_ms;
-        println!("║    ↳ preload speedup vs sync: {:.2}x", f16_speedup);
-        println!("║  ──────────────────────────────────────────────────────────────");
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
-            "ZramStore F32 (sync)",
-            zram_f32_sync_ms,
-            zram_f32_sync_pt,
-            zram_f32_sync_gv,
-            format!("{:.1}x", zram_f32_sync_ms / base_ms)
-        );
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
-            "ZramStore F32 (preload)",
-            zram_f32_pre_ms,
-            zram_f32_pre_pt,
-            zram_f32_pre_gv,
-            format!("{:.1}x", zram_f32_pre_ms / base_ms)
-        );
-        let f32_speedup = zram_f32_sync_ms / zram_f32_pre_ms;
-        println!("║    ↳ preload speedup vs sync: {:.2}x", f32_speedup);
-        println!("║  ──────────────────────────────────────────────────────────────");
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
-            "DiskStore F16 (sync)",
-            disk_f16_sync_ms,
-            disk_f16_sync_pt,
-            disk_f16_sync_gv,
-            format!("{:.1}x", disk_f16_sync_ms / base_f16_ms)
-        );
-        println!(
-            "║  {:30} {:>8.1} {:>10.3} {:>10.1} {:>8}",
-            "DiskStore F16 (preload)",
-            disk_f16_pre_ms,
-            disk_f16_pre_pt,
-            disk_f16_pre_gv,
-            format!("{:.1}x", disk_f16_pre_ms / base_f16_ms)
-        );
-        let disk_speedup = disk_f16_sync_ms / disk_f16_pre_ms;
-        println!("║    ↳ preload speedup vs sync: {:.2}x", disk_speedup);
-
-        // ═══ Memory Report ═══
-        println!("╠══════════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  MEMORY ANALYSIS (at {} tokens, {} layers)",
-            total_tokens, num_layers
-        );
-        println!("╠══════════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  {:30} {:>10} {:>10} {:>10} {:>8}",
-            "Configuration", "KV Data", "Attn Buf", "Total", "vs BASE"
-        );
-        println!("║  ──────────────────────────────────────────────────────────────");
-        println!(
-            "║  {:30} {:>9}K {:>10} {:>9}K {:>8}",
-            "BASE KVCache F32",
-            base_mem / 1024,
-            "—",
-            base_mem / 1024,
-            "1.0x"
-        );
-        println!(
-            "║  {:30} {:>9}K {:>10} {:>9}K {:>8}",
-            "BASE KVCache F16",
-            base_f16_mem / 1024,
-            "—",
-            base_f16_mem / 1024,
-            "1.0x"
-        );
-        println!("║  ──────────────────────────────────────────────────────────────");
-
-        let zram_f16_total = zram_f16_pre_store + zram_f16_pre_attn;
-        let zram_f16_savings = 1.0 - (zram_f16_total as f64 / base_f16_mem as f64);
-        println!(
-            "║  {:30} {:>9}K {:>9}K {:>9}K {:>7.0}%",
-            "ZramStore F16 (preload)",
-            zram_f16_pre_store / 1024,
-            zram_f16_pre_attn / 1024,
-            zram_f16_total / 1024,
-            zram_f16_savings * 100.0
-        );
-        println!(
-            "║    ↳ store compression: {:.2}x (raw {}K → {}K)",
-            raw_f16_kv as f64 / zram_f16_pre_store.max(1) as f64,
-            raw_f16_kv / 1024,
-            zram_f16_pre_store / 1024,
-        );
-
-        let zram_f32_total = zram_f32_pre_store + zram_f32_pre_attn;
-        let zram_f32_savings = 1.0 - (zram_f32_total as f64 / base_mem as f64);
-        println!(
-            "║  {:30} {:>9}K {:>9}K {:>9}K {:>7.0}%",
-            "ZramStore F32 (preload)",
-            zram_f32_pre_store / 1024,
-            zram_f32_pre_attn / 1024,
-            zram_f32_total / 1024,
-            zram_f32_savings * 100.0
-        );
-        println!(
-            "║    ↳ store compression: {:.2}x (raw {}K → {}K)",
-            raw_f32_kv as f64 / zram_f32_pre_store.max(1) as f64,
-            raw_f32_kv / 1024,
-            zram_f32_pre_store / 1024,
-        );
-
-        let disk_f16_total = disk_f16_store + disk_f16_pre_attn;
-        let disk_f16_savings = 1.0 - (disk_f16_total as f64 / base_f16_mem as f64);
-        println!(
-            "║  {:30} {:>9}K {:>9}K {:>9}K {:>7.0}%",
-            "DiskStore F16 (preload)",
-            disk_f16_store / 1024,
-            disk_f16_pre_attn / 1024,
-            disk_f16_total / 1024,
-            disk_f16_savings * 100.0
-        );
-        println!("║    ↳ NOTE: disk store KB = file size (data on disk, not in RAM)",);
-
-        // Attn buffer analysis
-        println!("╠══════════════════════════════════════════════════════════════════╣");
-        println!("║  ATTN BUFFER ANALYSIS (preload mode)");
-        println!("║  ──────────────────────────────────────────────────────────────");
-        let max_attn_f16 = 2 * max_seq_len * token_bytes_f16; // 2 layers (K+V)
-        let max_attn_f32 = 2 * max_seq_len * token_bytes_f32;
-        let naive_attn_f16 = num_layers * max_seq_len * token_bytes_f16 * 2;
-        let naive_attn_f32 = num_layers * max_seq_len * token_bytes_f32 * 2;
-        println!(
-            "║  F16: active={} layers × {}K = {}K  (naive 16 layers = {}K, saving {:.0}%)",
-            2,
-            max_seq_len * token_bytes_f16 / 1024,
-            max_attn_f16 / 1024,
-            naive_attn_f16 / 1024,
-            (1.0 - max_attn_f16 as f64 / naive_attn_f16 as f64) * 100.0,
-        );
-        println!(
-            "║  F32: active={} layers × {}K = {}K  (naive 16 layers = {}K, saving {:.0}%)",
-            2,
-            max_seq_len * token_bytes_f32 / 1024,
-            max_attn_f32 / 1024,
-            naive_attn_f32 / 1024,
-            (1.0 - max_attn_f32 as f64 / naive_attn_f32 as f64) * 100.0,
-        );
-        println!("╚══════════════════════════════════════════════════════════════════╝\n");
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1569,7 +646,7 @@ mod tests {
         let kv_heads = 2;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Store some data
@@ -1614,7 +691,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Prefill
@@ -1658,7 +735,7 @@ mod tests {
         let kv_heads = 2;
         let head_dim = 32;
         let token_bytes = kv_heads * head_dim * 2;
-        let store = zram_store::ZramStore::new(token_bytes, 2, 64);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache =
             OffloadKVCache::new(0, kv_heads, head_dim, DType::F16, 256, Box::new(store));
 
@@ -1690,7 +767,7 @@ mod tests {
 
         let mut caches: Vec<OffloadKVCache> = (0..4)
             .map(|i| {
-                let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+                let store = raw_store::RawStore::new(token_bytes);
                 let mut c =
                     OffloadKVCache::new(i, kv_heads, head_dim, DType::F32, 64, Box::new(store));
                 // Prefill each cache with 2 tokens
@@ -1735,7 +812,7 @@ mod tests {
     #[test]
     fn test_preload_empty_cache() {
         // preload() on empty cache should succeed
-        let store = zram_store::ZramStore::new(32, 4, 8);
+        let store = raw_store::RawStore::new(32);
         let mut cache = OffloadKVCache::new(0, 1, 4, DType::F32, 64, Box::new(store));
 
         cache.preload().unwrap();
@@ -1753,7 +830,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4; // F32
-        let store = zram_store::ZramStore::new(token_bytes, 4, 8);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         let k = make_f32_tensor_with_data(&[1.0, 2.0, 3.0, 4.0], 1, 1, 4);
@@ -1777,7 +854,7 @@ mod tests {
         let kv_heads = 2;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         let k = make_realistic_f32_tensor(1, kv_heads, head_dim, 1.0);
@@ -1798,7 +875,7 @@ mod tests {
     #[test]
     fn test_preload_idempotent() {
         let token_bytes = 2 * 32 * 2;
-        let store = zram_store::ZramStore::new(token_bytes, 2, 64);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, 2, 32, DType::F16, 256, Box::new(store));
 
         let k = make_test_tensor(4, 2, 32, DType::F16, 0xAB);
@@ -1852,12 +929,12 @@ mod tests {
         println!("╠══════════════════════════════════════════════════════════════════╣");
 
         // Simulate realistic timing: on ARM devices, layer forward takes ~2-4ms
-        // and zram decompression takes ~2-6ms per layer. On the host, zram preload
+        // and store decompression takes ~2-6ms per layer. On the host, preload
         // is near-instant, so we inject artificial delays to exercise the adaptive
         // depth controller and measure overlap effectiveness.
         //
         // simulate_forward: ~2ms (simulates matrix ops per layer)
-        // simulate_preload_extra: ~3ms (simulates zram decompression overhead)
+        // simulate_preload_extra: ~3ms (simulates store decompression overhead)
         let simulate_forward = || {
             std::thread::sleep(std::time::Duration::from_millis(2));
         };
@@ -1875,15 +952,12 @@ mod tests {
             max_depth: usize,
             simulate_forward: &dyn Fn(),
             preload_extra_delay: std::time::Duration,
-            store_mode: &str,
         ) -> (f64, usize, usize, usize, usize) {
             let token_bytes = kv_heads * head_dim * 2;
             let mut caches: Vec<OffloadKVCache> = (0..num_layers)
                 .map(|layer_id| {
-                    let store: Box<dyn store::OffloadStore> = match store_mode {
-                        "raw" => Box::new(raw_store::RawStore::new(token_bytes)),
-                        _ => Box::new(zram_store::ZramStore::new(token_bytes, 2, 64)),
-                    };
+                    let store: Box<dyn store::OffloadStore> =
+                        Box::new(raw_store::RawStore::new(token_bytes));
                     OffloadKVCache::new(
                         layer_id,
                         kv_heads,
@@ -2039,7 +1113,7 @@ mod tests {
             start.elapsed().as_secs_f64() * 1000.0
         };
 
-        // Run with depth=1 (fixed, zram)
+        // Run with depth=1 (fixed)
         let (d1_ms, _d1_calls, d1_skips, d1_bufs, d1_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2050,10 +1124,9 @@ mod tests {
             1,
             &simulate_forward,
             simulate_preload_extra,
-            "zram",
         );
 
-        // Run with adaptive (max_depth=4, zram)
+        // Run with adaptive (max_depth=4)
         let (da_ms, _da_calls, _da_skips, da_bufs, da_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2064,10 +1137,9 @@ mod tests {
             4,
             &simulate_forward,
             simulate_preload_extra,
-            "zram",
         );
 
-        // Run with depth=4 (fixed max, zram)
+        // Run with depth=4 (fixed max)
         let (d4_ms, _d4_calls, _d4_skips, _d4_bufs, d4_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2078,10 +1150,9 @@ mod tests {
             4,
             &simulate_forward,
             simulate_preload_extra,
-            "zram",
         );
 
-        // Run with adaptive (max_depth=4, raw) — Phase 3 optimization
+        // Run with adaptive (max_depth=4, deferred) — Phase 3 optimization
         let (raw_ms, _raw_calls, _raw_skips, raw_bufs, raw_depth) = run_with_depth(
             num_layers,
             max_seq_len,
@@ -2092,7 +1163,6 @@ mod tests {
             4,
             &simulate_forward,
             simulate_preload_extra,
-            "raw",
         );
 
         let base_per_tok = base_ms / decode_steps as f64;
@@ -2113,7 +1183,7 @@ mod tests {
         );
         println!(
             "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Fixed depth=1 (zram)",
+            "Fixed depth=1",
             d1_ms,
             d1_per_tok,
             d1_depth,
@@ -2121,7 +1191,7 @@ mod tests {
         );
         println!(
             "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Adaptive max=4 (zram)",
+            "Adaptive max=4",
             da_ms,
             da_per_tok,
             da_depth,
@@ -2129,7 +1199,7 @@ mod tests {
         );
         println!(
             "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Fixed depth=4 (zram)",
+            "Fixed depth=4",
             d4_ms,
             d4_per_tok,
             d4_depth,
@@ -2137,7 +1207,7 @@ mod tests {
         );
         println!(
             "║  {:30} {:>10.1} {:>10.2} {:>8} {:>+9.1}%",
-            "Adaptive max=4 (raw+deferred)",
+            "Adaptive max=4 (deferred)",
             raw_ms,
             raw_per_tok,
             raw_depth,
@@ -2145,12 +1215,12 @@ mod tests {
         );
         println!("╠═══════════════════════════════════════════════════════════════════════════╣");
         println!(
-            "║  Zram adaptive overhead: {:+.1}%  |  Raw+deferred overhead: {:+.1}%",
+            "║  Adaptive overhead: {:+.1}%  |  Deferred overhead: {:+.1}%",
             (da_ms / base_ms - 1.0) * 100.0,
             (raw_ms / base_ms - 1.0) * 100.0,
         );
         println!(
-            "║  Raw+deferred vs Zram adaptive: {:.1}% faster",
+            "║  Deferred vs Adaptive: {:.1}% faster",
             (1.0 - raw_ms / da_ms) * 100.0,
         );
         println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
@@ -2209,10 +1279,7 @@ mod tests {
         println!("╠═══════════════════════════════════════════════════════════════════════════╣");
 
         /// Run decode loop measuring per-token update + get_view cost.
-        /// `store_mode`: "zram", "raw"
-        /// `use_deferred`: if true, retained layers skip store writes (deferred).
         fn run_bench(
-            store_mode: &str,
             num_layers: usize,
             max_seq_len: usize,
             kv_heads: usize,
@@ -2224,11 +1291,8 @@ mod tests {
             let token_bytes = kv_heads * head_dim * 2;
             let mut caches: Vec<OffloadKVCache> = (0..num_layers)
                 .map(|layer_id| {
-                    let store: Box<dyn store::OffloadStore> = match store_mode {
-                        "zram" => Box::new(zram_store::ZramStore::new(token_bytes, 2, 64)),
-                        "raw" => Box::new(raw_store::RawStore::new(token_bytes)),
-                        _ => unreachable!(),
-                    };
+                    let store: Box<dyn store::OffloadStore> =
+                        Box::new(raw_store::RawStore::new(token_bytes));
                     OffloadKVCache::new(
                         layer_id,
                         kv_heads,
@@ -2365,22 +1429,8 @@ mod tests {
         };
         let base_per_tok = base_ms / decode_steps as f64;
 
-        // ── ZramStore + deferred ──
-        let (zram_ms, zram_upd_us, zram_gv_us) = run_bench(
-            "zram",
-            num_layers,
-            max_seq_len,
-            kv_heads,
-            head_dim,
-            prefill_len,
-            decode_steps,
-            max_depth,
-        );
-        let zram_per_tok = zram_ms / decode_steps as f64;
-
         // ── RawStore + deferred ──
         let (raw_ms, raw_upd_us, raw_gv_us) = run_bench(
-            "raw",
             num_layers,
             max_seq_len,
             kv_heads,
@@ -2403,15 +1453,6 @@ mod tests {
         );
         println!(
             "║  {:32} {:>10.1} {:>10.2} {:>10.1} {:>10.1} {:>+9.1}%",
-            "ZramStore (deferred, depth=4)",
-            zram_ms,
-            zram_per_tok,
-            zram_upd_us,
-            zram_gv_us,
-            (zram_ms / base_ms - 1.0) * 100.0
-        );
-        println!(
-            "║  {:32} {:>10.1} {:>10.2} {:>10.1} {:>10.1} {:>+9.1}%",
             "RawStore (deferred, depth=4)",
             raw_ms,
             raw_per_tok,
@@ -2420,10 +1461,6 @@ mod tests {
             (raw_ms / base_ms - 1.0) * 100.0
         );
         println!("╠═══════════════════════════════════════════════════════════════════════════╣");
-        println!(
-            "║  RawStore vs ZramStore: {:.1}% faster",
-            (1.0 - raw_ms / zram_ms) * 100.0
-        );
         println!(
             "║  RawStore overhead vs BASE: {:+.1}%",
             (raw_ms / base_ms - 1.0) * 100.0
@@ -2461,7 +1498,7 @@ mod tests {
             let mut caches: Vec<OffloadKVCache> = (0..num_layers)
                 .map(|layer_id| {
                     let store: Box<dyn store::OffloadStore> =
-                        Box::new(zram_store::ZramStore::new(token_bytes, 2, 64));
+                        Box::new(raw_store::RawStore::new(token_bytes));
                     OffloadKVCache::new(
                         layer_id,
                         kv_heads,
@@ -2659,7 +1696,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4; // F32
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Token 0: prefill
@@ -2717,7 +1754,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Setup: prefill + preload + get_view + retain
@@ -2753,7 +1790,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // No data, no buffers
@@ -2793,7 +1830,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Prefill 1 token
@@ -2827,7 +1864,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Prefill + preload
@@ -2878,7 +1915,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Prefill + preload
@@ -2918,7 +1955,7 @@ mod tests {
         let kv_heads = 1;
         let head_dim = 4;
         let token_bytes = kv_heads * head_dim * 4;
-        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let store = raw_store::RawStore::new(token_bytes);
         let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
 
         // Prefill + preload
