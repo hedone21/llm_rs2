@@ -52,7 +52,14 @@ pub fn svd_eigen_f32(ata: &[f32], n: usize, max_k: usize) -> (Vec<f32>, Vec<f32>
             av[i] = sum;
         }
         let eigenval: f32 = v.iter().zip(av.iter()).map(|(a, b)| a * b).sum();
-        if eigenval < 1e-6 {
+        // Use relative threshold: stop when eigenvalue is negligible compared to the largest.
+        // This prevents noisy eigenvectors from near-zero eigenvalues corrupting reconstruction.
+        let threshold = if eigenvalues.is_empty() {
+            1e-6
+        } else {
+            eigenvalues[0] * 1e-4
+        };
+        if eigenval < threshold {
             break;
         }
         eigenvalues.push(eigenval);

@@ -803,6 +803,83 @@ mod tests {
     }
 
     #[test]
+    fn test_svd_cache_k_lossless_full_rank() {
+        // When rank_k >= head_dim, SVD should be mathematically lossless
+        let kv_heads = 1;
+        let head_dim = 4; // tiny for debugging
+        let rank_k = 4; // full rank
+        let prefill_len = 3;
+
+        // Test SVD math directly first (bypass SvdOffloadKVCache)
+        let data: Vec<f32> = vec![
+            1.0, 2.0, 3.0, 4.0, // token 0
+            5.0, 6.0, 7.0, 8.0, // token 1
+            9.0, 10.0, 11.0, 12.0, // token 2
+        ];
+
+        let ata = crate::core::svd_math::compute_gram_matrix(&data, prefill_len, head_dim);
+        eprintln!("Gram matrix (4×4):");
+        for i in 0..head_dim {
+            for j in 0..head_dim {
+                eprint!("{:8.1} ", ata[i * head_dim + j]);
+            }
+            eprintln!();
+        }
+
+        let (eigenvalues, eigvecs) = crate::core::svd_math::svd_eigen_f32(&ata, head_dim, rank_k);
+        let actual_k = eigvecs.len() / head_dim;
+        eprintln!("Found {} eigenvectors (requested {})", actual_k, rank_k);
+        for (i, val) in eigenvalues.iter().enumerate() {
+            eprintln!("  λ{} = {:.4}", i, val);
+        }
+
+        // Project and reconstruct
+        let mut all_coeffs = Vec::new();
+        for t in 0..prefill_len {
+            let token = &data[t * head_dim..(t + 1) * head_dim];
+            let coeffs = crate::core::svd_math::project_token(token, &eigvecs, actual_k, head_dim);
+            all_coeffs.extend_from_slice(&coeffs);
+        }
+
+        let mut reconstructed = vec![0.0f32; prefill_len * kv_heads * head_dim];
+        crate::core::svd_math::reconstruct_into(
+            &eigvecs,
+            &all_coeffs,
+            0,
+            prefill_len,
+            actual_k,
+            head_dim,
+            kv_heads,
+            0,
+            &mut reconstructed,
+        );
+
+        eprintln!("Original vs Reconstructed (direct SVD math):");
+        for t in 0..prefill_len {
+            let orig = &data[t * head_dim..(t + 1) * head_dim];
+            let recon = &reconstructed[t * kv_heads * head_dim..t * kv_heads * head_dim + head_dim];
+            let diff: Vec<f32> = orig.iter().zip(recon).map(|(a, b)| (a - b).abs()).collect();
+            eprintln!(
+                "  t{}: orig={:.2?} recon={:.2?} diff={:.4?}",
+                t, orig, recon, diff
+            );
+        }
+
+        // Verify direct SVD math roundtrip
+        let mut max_diff: f32 = 0.0;
+        for i in 0..data.len() {
+            let orig = data[i];
+            let pos = (i / (kv_heads * head_dim)) * kv_heads * head_dim + i % (kv_heads * head_dim);
+            let diff = (orig - reconstructed[pos]).abs();
+            max_diff = max_diff.max(diff);
+        }
+        assert!(
+            max_diff < 0.01,
+            "Direct SVD roundtrip max_diff={max_diff:.6}, expected < 0.01"
+        );
+    }
+
+    #[test]
     fn test_svd_cache_incremental_reconstruction() {
         let kv_heads = 1;
         let head_dim = 32;
