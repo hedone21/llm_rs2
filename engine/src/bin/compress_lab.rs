@@ -160,6 +160,25 @@ impl AlgoResult {
 
 type AlgoFn = fn(&[u8], usize) -> AlgoResult;
 
+#[allow(dead_code)]
+struct SvdQuality {
+    mse: f64,            // Mean Squared Error (f32 domain)
+    max_abs_err: f64,    // Maximum absolute error
+    cosine_sim_avg: f64, // Average cosine similarity (per-token vectors)
+    cosine_sim_min: f64, // Worst-case cosine similarity
+    rel_frob_err: f64,   // ||A - A'||_F / ||A||_F
+}
+
+#[allow(dead_code)]
+struct SvdResult {
+    rank_k: usize,
+    compressed_size: usize,
+    original_size: usize,
+    compress_us: u64,
+    decompress_us: u64,
+    quality: SvdQuality,
+}
+
 fn algo_raw_lz4(data: &[u8], _elem_size: usize) -> AlgoResult {
     let t0 = Instant::now();
     let compressed = lz4::block::compress(data, None, false).unwrap();
@@ -2396,6 +2415,9 @@ fn run_benchmark(args: &Args) -> Result<()> {
         }
     }
 
+    // SVD lossy compression benchmark
+    run_svd_benchmark(&dump, args.per_layer)?;
+
     Ok(())
 }
 
@@ -2433,21 +2455,19 @@ fn haar_transform(x: &[f64]) -> Vec<f64> {
     c
 }
 
-/// Estimate singular values via eigenvalues of A^T A using QR-like iteration
-/// Returns squared singular values (eigenvalues of A^T A) sorted descending
+/// Estimate singular values and eigenvectors via power iteration on A^T A.
+/// Returns (eigenvalues, eigenvectors) sorted by eigenvalue descending.
+/// eigenvalues = squared singular values of A.
 #[allow(clippy::needless_range_loop)]
-fn estimate_singular_values(ata: &[Vec<f64>], n: usize, max_k: usize) -> Vec<f64> {
-    // Simple approach: compute diagonal of A^T A after a few Jacobi-like sweeps
-    // For small n=64, we can afford O(n^3) operations
-    // Use power iteration to get eigenvalues
+fn svd_eigen(ata: &[Vec<f64>], n: usize, max_k: usize) -> (Vec<f64>, Vec<Vec<f64>>) {
     let mut eigenvalues = Vec::new();
+    let mut eigenvectors = Vec::new();
     let mut mat: Vec<Vec<f64>> = ata.to_vec();
 
     for _ in 0..max_k {
         // Power iteration for largest eigenvalue
         let mut v = vec![1.0 / (n as f64).sqrt(); n];
         for _ in 0..50 {
-            // iterations
             let mut new_v = vec![0.0; n];
             for i in 0..n {
                 for j in 0..n {
@@ -2475,6 +2495,7 @@ fn estimate_singular_values(ata: &[Vec<f64>], n: usize, max_k: usize) -> Vec<f64
             break;
         }
         eigenvalues.push(eigenval);
+        eigenvectors.push(v.clone());
 
         // Deflate: A = A - λ v v^T
         for i in 0..n {
@@ -2484,7 +2505,12 @@ fn estimate_singular_values(ata: &[Vec<f64>], n: usize, max_k: usize) -> Vec<f64
         }
     }
 
-    eigenvalues
+    (eigenvalues, eigenvectors)
+}
+
+/// Backward-compatible wrapper: returns only eigenvalues.
+fn estimate_singular_values(ata: &[Vec<f64>], n: usize, max_k: usize) -> Vec<f64> {
+    svd_eigen(ata, n, max_k).0
 }
 
 fn symbol_entropy_u16(data: &[u8]) -> f64 {
@@ -2558,6 +2584,271 @@ fn byte_entropy(data: &[u8]) -> f64 {
         }
     }
     entropy
+}
+
+// ── SVD lossy compression ────────────────────────────────────────────────
+
+/// Convert raw F16 bytes into per-head f64 matrices: [head][token][dim]
+#[allow(clippy::needless_range_loop)]
+fn f16_bytes_to_f64_heads(
+    data: &[u8],
+    num_tokens: usize,
+    kv_heads: usize,
+    head_dim: usize,
+) -> Vec<Vec<Vec<f64>>> {
+    let channels = kv_heads * head_dim;
+    let bytes_per_token = channels * 2;
+    let mut heads = vec![vec![vec![0.0f64; head_dim]; num_tokens]; kv_heads];
+    for tok in 0..num_tokens {
+        for h in 0..kv_heads {
+            for d in 0..head_dim {
+                let off = tok * bytes_per_token + (h * head_dim + d) * 2;
+                let val = u16::from_le_bytes([data[off], data[off + 1]]);
+                heads[h][tok][d] = half::f16::from_bits(val).to_f64();
+            }
+        }
+    }
+    heads
+}
+
+/// Compute quality metrics between original and reconstructed matrices (both [tokens][dim]).
+fn compute_svd_quality(original: &[Vec<f64>], reconstructed: &[Vec<f64>]) -> SvdQuality {
+    let n_tokens = original.len();
+    let dim = original[0].len();
+    let total_elems = (n_tokens * dim) as f64;
+
+    let mut sum_sq_err = 0.0;
+    let mut max_abs_err = 0.0f64;
+    let mut frob_orig_sq = 0.0;
+
+    let mut cosine_sims = Vec::with_capacity(n_tokens);
+
+    for t in 0..n_tokens {
+        let mut dot = 0.0;
+        let mut norm_o = 0.0;
+        let mut norm_r = 0.0;
+        for d in 0..dim {
+            let o = original[t][d];
+            let r = reconstructed[t][d];
+            let err = (o - r).abs();
+            sum_sq_err += (o - r) * (o - r);
+            if err > max_abs_err {
+                max_abs_err = err;
+            }
+            frob_orig_sq += o * o;
+            dot += o * r;
+            norm_o += o * o;
+            norm_r += r * r;
+        }
+        let cos_sim = if norm_o > 1e-30 && norm_r > 1e-30 {
+            dot / (norm_o.sqrt() * norm_r.sqrt())
+        } else {
+            1.0 // both near-zero
+        };
+        cosine_sims.push(cos_sim);
+    }
+
+    let mse = sum_sq_err / total_elems;
+    let cosine_sim_avg = cosine_sims.iter().sum::<f64>() / cosine_sims.len() as f64;
+    let cosine_sim_min = cosine_sims.iter().cloned().fold(f64::INFINITY, f64::min);
+    let rel_frob_err = if frob_orig_sq > 1e-30 {
+        (sum_sq_err / frob_orig_sq).sqrt()
+    } else {
+        0.0
+    };
+
+    SvdQuality {
+        mse,
+        max_abs_err,
+        cosine_sim_avg,
+        cosine_sim_min,
+        rel_frob_err,
+    }
+}
+
+/// SVD compress a single head matrix [tokens × dim] to rank k.
+/// Returns (V_k [k × dim], coeffs [tokens × k]).
+#[allow(clippy::needless_range_loop)]
+fn svd_compress_head(matrix: &[Vec<f64>], rank_k: usize) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let n_tokens = matrix.len();
+    let dim = matrix[0].len();
+    let k = rank_k.min(dim);
+
+    // Compute A^T A (dim × dim)
+    let mut ata = vec![vec![0.0f64; dim]; dim];
+    for tok in 0..n_tokens {
+        for i in 0..dim {
+            let vi = matrix[tok][i];
+            for j in i..dim {
+                ata[i][j] += vi * matrix[tok][j];
+            }
+        }
+    }
+    // Symmetrize
+    for i in 0..dim {
+        for j in 0..i {
+            ata[i][j] = ata[j][i];
+        }
+    }
+
+    // Get top-k eigenvectors (V_k)
+    let (_, eigvecs) = svd_eigen(&ata, dim, k);
+    let actual_k = eigvecs.len();
+
+    // Project: coeffs[t][j] = Σ_d A[t][d] * V[j][d]
+    let mut coeffs = vec![vec![0.0f64; actual_k]; n_tokens];
+    for t in 0..n_tokens {
+        for j in 0..actual_k {
+            let mut sum = 0.0;
+            for d in 0..dim {
+                sum += matrix[t][d] * eigvecs[j][d];
+            }
+            coeffs[t][j] = sum;
+        }
+    }
+
+    (eigvecs, coeffs)
+}
+
+/// SVD decompress: reconstruct [tokens × dim] from V_k and coeffs.
+#[allow(clippy::needless_range_loop)]
+fn svd_decompress_head(v_k: &[Vec<f64>], coeffs: &[Vec<f64>], head_dim: usize) -> Vec<Vec<f64>> {
+    let n_tokens = coeffs.len();
+    let k = v_k.len();
+    let mut reconstructed = vec![vec![0.0f64; head_dim]; n_tokens];
+    for t in 0..n_tokens {
+        for j in 0..k {
+            let c = coeffs[t][j];
+            for d in 0..head_dim {
+                reconstructed[t][d] += c * v_k[j][d];
+            }
+        }
+    }
+    reconstructed
+}
+
+/// Run SVD lossy compression benchmark across all layers, heads, K/V.
+#[allow(clippy::needless_range_loop)]
+fn run_svd_benchmark(dump: &KVDump, per_layer: bool) -> Result<()> {
+    const SVD_RANKS: &[usize] = &[4, 8, 10, 14, 19, 32];
+
+    println!("\n══ SVD Lossy Compression ════════════════════════════════════════");
+    println!(
+        "{:>5}  {:>7}  {:>9}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}",
+        "Rank", "Ratio", "Comp ms", "Decomp ms", "MSE", "MaxErr", "CosSim", "FrobErr%"
+    );
+    println!("{}", "─".repeat(80));
+
+    let num_tokens = dump.num_tokens;
+    let kv_heads = dump.kv_heads;
+    let head_dim = dump.head_dim;
+    let original_head_bytes = num_tokens * head_dim * 2; // F16
+
+    for &rank_k in SVD_RANKS {
+        let mut total_compress_us = 0u64;
+        let mut total_decompress_us = 0u64;
+        let mut all_qualities: Vec<SvdQuality> = Vec::new();
+        let mut total_compressed_size = 0usize;
+        let mut total_original_size = 0usize;
+
+        // Per-layer detail storage
+        let mut layer_details: Vec<(f64, f64, f64, f64)> = Vec::new(); // (k_mse, k_cos, v_mse, v_cos)
+
+        for layer in &dump.layers {
+            let k_heads = f16_bytes_to_f64_heads(&layer.k, num_tokens, kv_heads, head_dim);
+            let v_heads = f16_bytes_to_f64_heads(&layer.v, num_tokens, kv_heads, head_dim);
+
+            let mut k_mse_sum = 0.0;
+            let mut k_cos_sum = 0.0;
+            let mut v_mse_sum = 0.0;
+            let mut v_cos_sum = 0.0;
+
+            for kv_type in 0..2 {
+                let heads = if kv_type == 0 { &k_heads } else { &v_heads };
+                for h in 0..kv_heads {
+                    let matrix = &heads[h];
+
+                    let t0 = Instant::now();
+                    let (v_k, coeffs) = svd_compress_head(matrix, rank_k);
+                    let compress_us = t0.elapsed().as_micros() as u64;
+
+                    let actual_k = v_k.len();
+                    // Compressed size: V_k (k × dim × 2) + coeffs (tokens × k × 2)
+                    let compressed_bytes = actual_k * head_dim * 2 + num_tokens * actual_k * 2;
+
+                    let t1 = Instant::now();
+                    let reconstructed = svd_decompress_head(&v_k, &coeffs, head_dim);
+                    let decompress_us = t1.elapsed().as_micros() as u64;
+
+                    let quality = compute_svd_quality(matrix, &reconstructed);
+
+                    if kv_type == 0 {
+                        k_mse_sum += quality.mse;
+                        k_cos_sum += quality.cosine_sim_avg;
+                    } else {
+                        v_mse_sum += quality.mse;
+                        v_cos_sum += quality.cosine_sim_avg;
+                    }
+
+                    total_compress_us += compress_us;
+                    total_decompress_us += decompress_us;
+                    total_compressed_size += compressed_bytes;
+                    total_original_size += original_head_bytes;
+                    all_qualities.push(quality);
+                }
+            }
+
+            layer_details.push((
+                k_mse_sum / kv_heads as f64,
+                k_cos_sum / kv_heads as f64,
+                v_mse_sum / kv_heads as f64,
+                v_cos_sum / kv_heads as f64,
+            ));
+        }
+
+        // Aggregate quality
+        let n = all_qualities.len() as f64;
+        let avg_mse = all_qualities.iter().map(|q| q.mse).sum::<f64>() / n;
+        let max_abs_err = all_qualities
+            .iter()
+            .map(|q| q.max_abs_err)
+            .fold(0.0f64, f64::max);
+        let avg_cos = all_qualities.iter().map(|q| q.cosine_sim_avg).sum::<f64>() / n;
+        let avg_frob = all_qualities.iter().map(|q| q.rel_frob_err).sum::<f64>() / n;
+
+        let ratio = total_original_size as f64 / total_compressed_size as f64;
+        let compress_ms = total_compress_us as f64 / 1000.0;
+        let decompress_ms = total_decompress_us as f64 / 1000.0;
+
+        println!(
+            "k={:>2}  {:>6.2}x  {:>8.1}  {:>9.1}  {:>10.2e}  {:>8.4}  {:>8.4}  {:>7.2}%",
+            rank_k,
+            ratio,
+            compress_ms,
+            decompress_ms,
+            avg_mse,
+            max_abs_err,
+            avg_cos,
+            avg_frob * 100.0
+        );
+
+        // Per-layer breakdown
+        if per_layer {
+            println!("  ── k={}: Layer/K-V breakdown ──", rank_k);
+            println!(
+                "  {:>5}  {:>10}  {:>8}  {:>10}  {:>8}",
+                "Layer", "K_MSE", "K_CosSim", "V_MSE", "V_CosSim"
+            );
+            for (i, &(k_mse, k_cos, v_mse, v_cos)) in layer_details.iter().enumerate() {
+                println!(
+                    "  L{:02}   {:>10.2e}  {:>8.4}  {:>10.2e}  {:>8.4}",
+                    i, k_mse, k_cos, v_mse, v_cos
+                );
+            }
+        }
+    }
+
+    Ok(())
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────
