@@ -1768,9 +1768,9 @@ mod tests {
         let prefill_len = 128;
         let decode_steps = 64;
 
-        println!("\n╔══════════════════════════════════════════════════════════════════╗");
-        println!("║  Adaptive Prefetch Benchmark: depth=1 vs adaptive              ║");
-        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!("\n╔═══════════════════════════════════════════════════════════════════════════╗");
+        println!("║  Adaptive Prefetch Benchmark: depth=1 vs adaptive                       ║");
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
         println!(
             "║  Config: kv_heads={}, head_dim={}, layers={}, prefill={}, decode={}",
             kv_heads, head_dim, num_layers, prefill_len, decode_steps
@@ -1789,8 +1789,8 @@ mod tests {
             std::hint::black_box(x);
         };
 
-        /// Run decode loop with given prefetch depth strategy.
-        /// Returns (total_ms, preload_calls, preload_skips, active_bufs_at_end)
+        /// Run decode loop with fire-and-forget prefetch strategy.
+        /// Returns (total_ms, preload_calls, preload_skips, active_bufs_at_end, final_depth)
         fn run_with_depth(
             num_layers: usize,
             max_seq_len: usize,
@@ -1800,7 +1800,7 @@ mod tests {
             decode_steps: usize,
             max_depth: usize,
             simulate_work: &dyn Fn(),
-        ) -> (f64, usize, usize, usize) {
+        ) -> (f64, usize, usize, usize, usize) {
             let token_bytes = kv_heads * head_dim * 2;
             let mut caches: Vec<OffloadKVCache> = (0..num_layers)
                 .map(|layer_id| {
@@ -1829,6 +1829,7 @@ mod tests {
             let mut preload_skips = 0usize;
 
             let decode_start = std::time::Instant::now();
+            let caches_ptr = caches.as_mut_ptr();
 
             for step in 0..decode_steps {
                 let k_tok =
@@ -1845,59 +1846,71 @@ mod tests {
 
                 let depth = prefetch.depth();
 
-                // Synchronous initial preload: [0..depth)
-                for cache in caches.iter_mut().take(depth.min(num_layers)) {
-                    let was_preloaded = cache.preloaded;
-                    cache.preload().unwrap();
-                    preload_calls += 1;
-                    if was_preloaded {
-                        preload_skips += 1;
-                    }
-                }
-
-                // Layer loop (mimics forward_into_offload)
-                for i in 0..num_layers {
-                    let layers_remaining = num_layers - i - 1;
-                    if layers_remaining > 0 {
-                        let (left, right) = caches.split_at_mut(i + 1);
-                        let current = &mut left[i];
-                        let target_offset = (depth - 1).min(right.len() - 1);
-                        let target = &mut right[target_offset];
-
-                        std::thread::scope(|s| {
-                            let handle = s.spawn(|| {
-                                let t0 = std::time::Instant::now();
-                                let was_preloaded = target.preloaded;
-                                target.preload().unwrap();
-                                preload_calls += 1;
-                                if was_preloaded {
-                                    preload_skips += 1;
-                                }
-                                t0.elapsed()
-                            });
-
-                            let fwd_t0 = std::time::Instant::now();
-                            let _ = current.get_view();
-                            simulate_work();
-                            let fwd_dur = fwd_t0.elapsed();
-
-                            let preload_dur = handle.join().unwrap();
-                            prefetch.record(preload_dur, fwd_dur);
-                        });
-
-                        if i > 0 {
-                            caches[i - 1].release_buffers();
+                // Fire-and-forget prefetch (mirrors forward_into_offload)
+                std::thread::scope(|s| {
+                    // Sync preload [0..depth)
+                    for j in 0..depth.min(num_layers) {
+                        let was = unsafe { (*caches_ptr.add(j)).preloaded };
+                        unsafe { (*caches_ptr.add(j)).preload().unwrap() };
+                        preload_calls += 1;
+                        if was {
+                            preload_skips += 1;
                         }
-                    } else {
-                        let _ = caches[i].get_view();
-                        simulate_work();
-                        caches[i].release_buffers();
                     }
-                }
 
-                if num_layers >= 2 {
-                    caches[num_layers - 2].release_buffers();
-                }
+                    // Pending preload handles
+                    let mut pending: Vec<Option<std::thread::ScopedJoinHandle<'_, ()>>> =
+                        (0..num_layers).map(|_| None).collect();
+
+                    // Fire initial background preloads [depth..2*depth)
+                    for j in depth..(2 * depth).min(num_layers) {
+                        let cache_j = unsafe { &mut *caches_ptr.add(j) };
+                        preload_calls += 1;
+                        pending[j] = Some(s.spawn(move || {
+                            cache_j.preload().unwrap();
+                        }));
+                    }
+
+                    // Layer loop
+                    for i in 0..num_layers {
+                        // Join pending preload for this layer
+                        if let Some(handle) = pending[i].take() {
+                            handle.join().unwrap();
+                        }
+
+                        // Fire preload for layer i + depth
+                        let far_idx = i + depth;
+                        if far_idx < num_layers && pending[far_idx].is_none() {
+                            let cache_far = unsafe { &mut *caches_ptr.add(far_idx) };
+                            preload_calls += 1;
+                            pending[far_idx] = Some(s.spawn(move || {
+                                cache_far.preload().unwrap();
+                            }));
+                        }
+
+                        // Forward (get_view + simulated work)
+                        let current = unsafe { &mut *caches_ptr.add(i) };
+                        let fwd_t0 = std::time::Instant::now();
+                        let _ = current.get_view();
+                        simulate_work();
+                        prefetch.record_forward(fwd_t0.elapsed());
+
+                        // Release previous layer
+                        if i > 0 {
+                            unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
+                        }
+                    }
+
+                    // Join remaining
+                    for handle in pending.into_iter().flatten() {
+                        handle.join().unwrap();
+                    }
+
+                    // Release last layer
+                    if num_layers >= 1 {
+                        caches[num_layers - 1].release_buffers();
+                    }
+                });
 
                 prefetch.adjust();
             }
@@ -1910,11 +1923,17 @@ mod tests {
                 .filter(|c| c.attn_k_buf.is_some() || c.attn_v_buf.is_some())
                 .count();
 
-            (decode_ms, preload_calls, preload_skips, active_bufs)
+            (
+                decode_ms,
+                preload_calls,
+                preload_skips,
+                active_bufs,
+                prefetch.depth(),
+            )
         }
 
         // Run with depth=1 (fixed)
-        let (d1_ms, d1_calls, d1_skips, d1_bufs) = run_with_depth(
+        let (d1_ms, d1_calls, d1_skips, d1_bufs, d1_depth) = run_with_depth(
             num_layers,
             max_seq_len,
             kv_heads,
@@ -1926,7 +1945,7 @@ mod tests {
         );
 
         // Run with adaptive (max_depth=4)
-        let (da_ms, da_calls, da_skips, da_bufs) = run_with_depth(
+        let (da_ms, da_calls, da_skips, da_bufs, da_depth) = run_with_depth(
             num_layers,
             max_seq_len,
             kv_heads,
@@ -1938,7 +1957,7 @@ mod tests {
         );
 
         // Run with depth=4 (fixed max)
-        let (d4_ms, d4_calls, d4_skips, d4_bufs) = run_with_depth(
+        let (d4_ms, d4_calls, d4_skips, d4_bufs, d4_depth) = run_with_depth(
             num_layers,
             max_seq_len,
             kv_heads,
@@ -1951,23 +1970,23 @@ mod tests {
 
         println!("║");
         println!(
-            "║  {:25} {:>10} {:>10} {:>10} {:>8}",
-            "Strategy", "Total(ms)", "Preloads", "Skips", "Act.Bufs"
+            "║  {:25} {:>10} {:>10} {:>10} {:>8} {:>8}",
+            "Strategy", "Total(ms)", "Preloads", "Skips", "Act.Bufs", "Depth"
         );
-        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
         println!(
-            "║  {:25} {:>10.1} {:>10} {:>10} {:>8}",
-            "Fixed depth=1", d1_ms, d1_calls, d1_skips, d1_bufs
-        );
-        println!(
-            "║  {:25} {:>10.1} {:>10} {:>10} {:>8}",
-            "Adaptive (max=4)", da_ms, da_calls, da_skips, da_bufs
+            "║  {:25} {:>10.1} {:>10} {:>10} {:>8} {:>8}",
+            "Fixed depth=1", d1_ms, d1_calls, d1_skips, d1_bufs, d1_depth
         );
         println!(
-            "║  {:25} {:>10.1} {:>10} {:>10} {:>8}",
-            "Fixed depth=4", d4_ms, d4_calls, d4_skips, d4_bufs
+            "║  {:25} {:>10.1} {:>10} {:>10} {:>8} {:>8}",
+            "Adaptive (max=4)", da_ms, da_calls, da_skips, da_bufs, da_depth
         );
-        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:25} {:>10.1} {:>10} {:>10} {:>8} {:>8}",
+            "Fixed depth=4", d4_ms, d4_calls, d4_skips, d4_bufs, d4_depth
+        );
+        println!("╠═══════════════════════════════════════════════════════════════════════════╣");
 
         let d1_per_tok = d1_ms / decode_steps as f64;
         let da_per_tok = da_ms / decode_steps as f64;
@@ -1989,7 +2008,7 @@ mod tests {
             da_calls,
             da_skips as f64 / da_calls.max(1) as f64 * 100.0,
         );
-        println!("╚══════════════════════════════════════════════════════════════════╝\n");
+        println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
 
         // Correctness assertions:
         // 1. depth=1 should have 0 skips (each layer preloaded exactly once)

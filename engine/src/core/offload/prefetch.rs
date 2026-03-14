@@ -83,6 +83,29 @@ impl PrefetchController {
         self.samples += 1;
     }
 
+    /// Record only a preload duration observation.
+    pub fn record_preload(&mut self, preload_dur: Duration) {
+        let preload_us = preload_dur.as_secs_f64() * 1_000_000.0;
+        if self.samples == 0 {
+            self.preload_ema_us = preload_us;
+        } else {
+            self.preload_ema_us =
+                self.alpha * preload_us + (1.0 - self.alpha) * self.preload_ema_us;
+        }
+    }
+
+    /// Record only a forward duration observation.
+    pub fn record_forward(&mut self, forward_dur: Duration) {
+        let forward_us = forward_dur.as_secs_f64() * 1_000_000.0;
+        if self.samples == 0 {
+            self.forward_ema_us = forward_us;
+        } else {
+            self.forward_ema_us =
+                self.alpha * forward_us + (1.0 - self.alpha) * self.forward_ema_us;
+        }
+        self.samples += 1; // Count forward calls as samples (one per layer)
+    }
+
     /// Adjust depth based on accumulated timing data.
     /// Call once per token boundary (after all layers complete).
     pub fn adjust(&mut self) {

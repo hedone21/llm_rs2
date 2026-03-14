@@ -467,9 +467,14 @@ impl LlamaModel {
     /// preloaded. When preload is slower than forward (pipeline stall), depth increases.
     /// When there is slack, depth decreases to save memory.
     ///
-    /// At each layer, exactly one background thread preloads the farthest future layer
-    /// (same thread count as depth=1). Closer layers are already loaded from previous
-    /// iterations. Preload guards prevent redundant decompression.
+    /// **Fire-and-forget preloads**: A background preload for layer `i+depth` is spawned
+    /// during layer `i`'s forward pass, but NOT joined until layer `i+depth` is actually
+    /// needed (up to `depth` layers later). This allows the preload to overlap with
+    /// multiple forward passes, amortizing the decompression latency.
+    ///
+    /// Uses raw pointers to safely manage concurrent `&mut` access to disjoint cache
+    /// elements. SAFETY: layer indices are guaranteed non-overlapping — at most one
+    /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
     pub fn forward_into_offload<C: crate::core::kv_cache::PrefetchableCache>(
@@ -513,81 +518,84 @@ impl LlamaModel {
         };
         backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
 
-        // 2. Synchronous initial preload: layers [0..depth)
         let num_layers = self.layers.len();
         let depth = prefetch.depth();
-        for cache in kv_caches.iter_mut().take(depth.min(num_layers)) {
-            cache.preload()?;
-        }
+        let caches_ptr = kv_caches.as_mut_ptr();
 
-        // 3. Layer loop with adaptive prefetch pipeline
-        for i in 0..num_layers {
-            let layers_remaining = num_layers - i - 1;
+        // Use a single thread::scope for the entire layer loop.
+        // Preload threads are fire-and-forget within the scope — they run concurrently
+        // with multiple forward passes. We only join when we actually need the data.
+        //
+        // SAFETY: raw pointer access to kv_caches elements. We guarantee that:
+        // 1. Each preload thread accesses exactly one element kv_caches[far_idx]
+        // 2. The main thread accesses kv_caches[i] for forward
+        // 3. far_idx != i (far_idx = i + depth, depth >= 1)
+        // 4. Each element is accessed by at most one thread at a time:
+        //    - A preload thread for element j finishes before j is used for forward
+        //    - release_buffers(j) happens after forward(j) completes
+        std::thread::scope(|s| {
+            // 2. Synchronous initial preload: layers [0..depth)
+            // These layers will be consumed by forward passes before any background
+            // preload targeting them could complete, so they must be loaded upfront.
+            for j in 0..depth.min(num_layers) {
+                // SAFETY: j < num_layers, no concurrent access during sync phase
+                unsafe { (*caches_ptr.add(j)).preload() }?;
+            }
 
-            if layers_remaining > 0 {
-                // Split: left[0..=i], right[i+1..]
-                let (left, right) = kv_caches.split_at_mut(i + 1);
-                let current = &mut left[i];
+            // Track pending preload handles: pending[j] = handle for kv_caches[j]
+            type PreloadHandle<'scope, 'env> =
+                Option<std::thread::ScopedJoinHandle<'scope, (Result<()>, std::time::Duration)>>;
+            let mut pending: Vec<PreloadHandle<'_, '_>> = (0..num_layers).map(|_| None).collect();
 
-                // Target: the farthest future layer within depth window
-                // right[0] = layer i+1, so target_offset indexes into right[]
-                let target_offset = (depth - 1).min(right.len() - 1);
-                let target = &mut right[target_offset];
+            // Fire initial background preloads for layers [depth..2*depth)
+            // These will complete while layers [0..depth) are being processed.
+            // Note: j is used both to index pending[] and to compute caches_ptr.add(j).
+            #[allow(clippy::needless_range_loop)]
+            for j in depth..(2 * depth).min(num_layers) {
+                let cache_j = unsafe { &mut *caches_ptr.add(j) };
+                pending[j] = Some(s.spawn(move || {
+                    let t0 = std::time::Instant::now();
+                    let r = cache_j.preload();
+                    (r, t0.elapsed())
+                }));
+            }
 
-                std::thread::scope(|s| {
-                    // Background: preload the target layer (guard skips if already loaded)
-                    let handle = s.spawn(|| {
-                        let t0 = std::time::Instant::now();
-                        let r = target.preload();
-                        (r, t0.elapsed())
-                    });
-
-                    // Foreground: compute current layer
-                    let fwd_t0 = std::time::Instant::now();
-                    let layer_result = self.layers[i].forward(LlamaLayerForwardArgs {
-                        x: &mut x,
-                        kv_cache: current,
-                        start_pos,
-                        backend,
-                        memory,
-                        rms_norm_eps: self.config.rms_norm_eps as f32,
-                        rope_theta: self.config.rope_theta as f32,
-                        workspace: workspace.as_deref_mut(),
-                        use_gpu_attn,
-                        need_scores: false,
-                        head_dim: self.config.head_dim,
-                        profiler: None,
-                    });
-                    let fwd_dur = fwd_t0.elapsed();
-
-                    // Wait for preload and record timing
+            // 3. Layer loop
+            for i in 0..num_layers {
+                // Join pending preload for layer i (if any).
+                // At this point, the preload was started `depth` layers ago,
+                // so it had `depth` forward passes worth of time to complete.
+                if let Some(handle) = pending[i].take() {
                     match handle.join() {
                         Ok((Ok(()), preload_dur)) => {
-                            prefetch.record(preload_dur, fwd_dur);
+                            prefetch.record_preload(preload_dur);
                         }
                         Ok((Err(e), _)) => {
-                            log::warn!(
-                                "L{} preload failed: {e}, falling back to sync",
-                                i + 1 + target_offset
-                            );
+                            log::warn!("L{i} preload failed: {e}, falling back to sync");
                         }
                         Err(_) => {
-                            log::error!("L{} preload thread panicked", i + 1 + target_offset);
+                            log::error!("L{i} preload thread panicked");
                         }
                     }
-
-                    layer_result
-                })?;
-
-                // Release previous layer's buffers (scope ended, borrows released)
-                if i > 0 {
-                    kv_caches[i - 1].release_buffers();
                 }
-            } else {
-                // Last layer: no prefetch needed
+
+                // Fire preload for layer i + depth (if within bounds)
+                let far_idx = i + depth;
+                if far_idx < num_layers && pending[far_idx].is_none() {
+                    let cache_far = unsafe { &mut *caches_ptr.add(far_idx) };
+                    pending[far_idx] = Some(s.spawn(move || {
+                        let t0 = std::time::Instant::now();
+                        let r = cache_far.preload();
+                        (r, t0.elapsed())
+                    }));
+                }
+
+                // Forward current layer
+                let current = unsafe { &mut *caches_ptr.add(i) };
+                let fwd_t0 = std::time::Instant::now();
                 self.layers[i].forward(LlamaLayerForwardArgs {
                     x: &mut x,
-                    kv_cache: &mut kv_caches[i],
+                    kv_cache: current,
                     start_pos,
                     backend,
                     memory,
@@ -599,16 +607,28 @@ impl LlamaModel {
                     head_dim: self.config.head_dim,
                     profiler: None,
                 })?;
+                let fwd_dur = fwd_t0.elapsed();
+                prefetch.record_forward(fwd_dur);
 
-                // Release last layer's buffers
-                kv_caches[i].release_buffers();
+                // Release consumed layer's buffers
+                if i > 0 {
+                    // SAFETY: layer i-1 forward is complete, preload thread (if any) joined
+                    unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
+                }
             }
-        }
 
-        // Release remaining layer buffers (second-to-last wasn't released in loop)
-        if num_layers >= 2 {
-            kv_caches[num_layers - 2].release_buffers();
-        }
+            // Join any remaining pending preloads
+            for handle in pending.into_iter().flatten() {
+                let _ = handle.join();
+            }
+
+            // Release last two layers' buffers
+            if num_layers >= 1 {
+                kv_caches[num_layers - 1].release_buffers();
+            }
+
+            Ok::<_, anyhow::Error>(())
+        })?;
 
         // Adjust depth for the next token
         prefetch.adjust();
