@@ -2121,9 +2121,370 @@ fn run_benchmark(args: &Args) -> Result<()> {
                 );
             }
         }
+
+        // ══════════════════════════════════════════════════════════════
+        // Transform domain analysis: DCT, SVD, Haar wavelet
+        // Treat KV data as 2D: [tokens × channels] where channels = kv_heads * head_dim
+        // ══════════════════════════════════════════════════════════════
+
+        let head_dim_t = 64usize;
+        let n_heads_t = 8usize;
+        let channels = n_heads_t * head_dim_t; // 512
+        let bytes_per_token_t = channels * 2;
+        let n_tokens_t = data.len() / bytes_per_token_t;
+
+        #[allow(clippy::needless_range_loop)]
+        if n_tokens_t >= 4 {
+            // Convert to f32 matrix [tokens × channels]
+            let mut matrix = vec![vec![0.0f32; channels]; n_tokens_t];
+            for tok in 0..n_tokens_t {
+                for ch in 0..channels {
+                    let off = tok * bytes_per_token_t + ch * 2;
+                    let val = u16::from_le_bytes([data[off], data[off + 1]]);
+                    matrix[tok][ch] = half::f16::from_bits(val).to_f32();
+                }
+            }
+
+            // ── DCT energy spectrum (per-head, along head_dim=64) ──
+            println!("\n── Transform: DCT-64 energy spectrum (Head 0, avg over tokens) ──");
+            // Naive DCT-II on head_dim=64 for head 0
+            let mut dct_energy = vec![0.0f64; head_dim_t];
+            for tok in 0..n_tokens_t {
+                let head_start = 0; // head 0
+                let x: Vec<f64> = (0..head_dim_t)
+                    .map(|d| matrix[tok][head_start + d] as f64)
+                    .collect();
+                let coeffs = dct_ii(&x);
+                for (k, c) in coeffs.iter().enumerate() {
+                    dct_energy[k] += c * c;
+                }
+            }
+            // Normalize
+            let total_energy: f64 = dct_energy.iter().sum();
+            let mut cumulative = 0.0;
+            println!("Coeff  Energy%  Cumul%");
+            for (k, e) in dct_energy.iter().enumerate() {
+                let pct = e / total_energy * 100.0;
+                cumulative += pct;
+                if k < 16 || k == 31 || k == 47 || k == 63 {
+                    println!("  {:>3}  {:>6.2}%  {:>6.2}%", k, pct, cumulative);
+                }
+            }
+            // How many coefficients for 90%, 95%, 99%?
+            let mut cum = 0.0;
+            let mut k90 = 64;
+            let mut k95 = 64;
+            let mut k99 = 64;
+            // Sort by energy descending
+            let mut sorted_energy: Vec<(usize, f64)> =
+                dct_energy.iter().copied().enumerate().collect();
+            sorted_energy.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            for (i, &(_, e)) in sorted_energy.iter().enumerate() {
+                cum += e / total_energy * 100.0;
+                if cum >= 90.0 && k90 == 64 {
+                    k90 = i + 1;
+                }
+                if cum >= 95.0 && k95 == 64 {
+                    k95 = i + 1;
+                }
+                if cum >= 99.0 && k99 == 64 {
+                    k99 = i + 1;
+                }
+            }
+            println!(
+                "Coefficients for 90%={}, 95%={}, 99%={} of energy (out of 64)",
+                k90, k95, k99
+            );
+
+            // ── DCT across ALL heads ──
+            println!("\n── DCT-64 energy concentration per head ──");
+            println!(
+                "{:>5}  {:>6}  {:>6}  {:>6}  {:>8}",
+                "Head", "K@90%", "K@95%", "K@99%", "Top1%"
+            );
+            for h in 0..n_heads_t {
+                let mut de = vec![0.0f64; head_dim_t];
+                for tok in 0..n_tokens_t {
+                    let x: Vec<f64> = (0..head_dim_t)
+                        .map(|d| matrix[tok][h * head_dim_t + d] as f64)
+                        .collect();
+                    let coeffs = dct_ii(&x);
+                    for (k, c) in coeffs.iter().enumerate() {
+                        de[k] += c * c;
+                    }
+                }
+                let te: f64 = de.iter().sum();
+                let top1_pct = de.iter().cloned().fold(0.0f64, f64::max) / te * 100.0;
+                let mut se: Vec<f64> = de.clone();
+                se.sort_by(|a, b| b.partial_cmp(a).unwrap());
+                let (mut c, mut h90, mut h95, mut h99) = (0.0, 64, 64, 64);
+                for (i, &e) in se.iter().enumerate() {
+                    c += e / te * 100.0;
+                    if c >= 90.0 && h90 == 64 {
+                        h90 = i + 1;
+                    }
+                    if c >= 95.0 && h95 == 64 {
+                        h95 = i + 1;
+                    }
+                    if c >= 99.0 && h99 == 64 {
+                        h99 = i + 1;
+                    }
+                }
+                println!(
+                    "   {:>2}  {:>6}  {:>6}  {:>6}  {:>7.1}%",
+                    h, h90, h95, h99, top1_pct
+                );
+            }
+
+            // ── SVD singular value spectrum ──
+            // Compute per-head: [n_tokens × head_dim] matrix
+            println!("\n── Transform: SVD singular value spectrum (Head 0) ──");
+            {
+                let m = n_tokens_t;
+                let nd = head_dim_t;
+                // Compute A^T A (nd × nd) for head 0
+                let mut ata = vec![vec![0.0f64; nd]; nd];
+                for tok in 0..m {
+                    for i in 0..nd {
+                        let vi = matrix[tok][i] as f64;
+                        for j in i..nd {
+                            let vj = matrix[tok][j] as f64;
+                            ata[i][j] += vi * vj;
+                        }
+                    }
+                }
+                // Symmetrize
+                for i in 0..nd {
+                    for j in 0..i {
+                        ata[i][j] = ata[j][i];
+                    }
+                }
+                // Power iteration for top singular values
+                let singular_values = estimate_singular_values(&ata, nd, 20);
+                let sv_total: f64 = singular_values.iter().sum();
+                let mut cum_sv = 0.0;
+                println!("  k   σ²         Energy%  Cumul%");
+                let mut k90s = nd;
+                let mut k95s = nd;
+                let mut k99s = nd;
+                for (k, &sv) in singular_values.iter().enumerate() {
+                    let pct = sv / sv_total * 100.0;
+                    cum_sv += pct;
+                    if k < 10 || k == 19 || k == 31 || k == 63 {
+                        println!("  {:>3}  {:>10.2}  {:>6.2}%  {:>6.2}%", k, sv, pct, cum_sv);
+                    }
+                    if cum_sv >= 90.0 && k90s == nd {
+                        k90s = k + 1;
+                    }
+                    if cum_sv >= 95.0 && k95s == nd {
+                        k95s = k + 1;
+                    }
+                    if cum_sv >= 99.0 && k99s == nd {
+                        k99s = k + 1;
+                    }
+                }
+                println!(
+                    "Singular values for 90%={}, 95%={}, 99%={} (out of {})",
+                    k90s, k95s, k99s, nd
+                );
+                let top1_sv = singular_values[0] / sv_total * 100.0;
+                let top4_sv: f64 = singular_values[..4].iter().sum::<f64>() / sv_total * 100.0;
+                println!("Top-1: {:.1}%, Top-4: {:.1}%", top1_sv, top4_sv);
+            }
+
+            // SVD summary across all heads
+            println!("\n── SVD rank for 90%/95%/99% energy per head ──");
+            println!(
+                "{:>5}  {:>6}  {:>6}  {:>6}  {:>8}",
+                "Head", "K@90%", "K@95%", "K@99%", "Top1%"
+            );
+            for h in 0..n_heads_t {
+                let nd = head_dim_t;
+                let mut ata = vec![vec![0.0f64; nd]; nd];
+                for tok in 0..n_tokens_t {
+                    for i in 0..nd {
+                        let vi = matrix[tok][h * head_dim_t + i] as f64;
+                        for j in i..nd {
+                            let vj = matrix[tok][h * head_dim_t + j] as f64;
+                            ata[i][j] += vi * vj;
+                        }
+                    }
+                }
+                for i in 0..nd {
+                    for j in 0..i {
+                        ata[i][j] = ata[j][i];
+                    }
+                }
+                let svs = estimate_singular_values(&ata, nd, nd.min(20));
+                let total: f64 = svs.iter().sum();
+                let top1 = svs[0] / total * 100.0;
+                let (mut c2, mut h90, mut h95, mut h99) = (0.0, nd, nd, nd);
+                for (i, &sv) in svs.iter().enumerate() {
+                    c2 += sv / total * 100.0;
+                    if c2 >= 90.0 && h90 == nd {
+                        h90 = i + 1;
+                    }
+                    if c2 >= 95.0 && h95 == nd {
+                        h95 = i + 1;
+                    }
+                    if c2 >= 99.0 && h99 == nd {
+                        h99 = i + 1;
+                    }
+                }
+                println!(
+                    "   {:>2}  {:>6}  {:>6}  {:>6}  {:>7.1}%",
+                    h, h90, h95, h99, top1
+                );
+            }
+
+            // ── Haar wavelet energy distribution ──
+            println!("\n── Transform: Haar wavelet energy (Head 0, along head_dim) ──");
+            {
+                // Haar on 64-element vectors: 6 levels
+                // Level 0: 32 detail coefficients
+                // Level 1: 16 detail coefficients
+                // ...
+                // Level 5: 1 detail + 1 approx
+                let mut level_energy = [0.0f64; 7]; // levels 0-5 detail + level 6 = approx
+                for tok in 0..n_tokens_t {
+                    let x: Vec<f64> = (0..head_dim_t).map(|d| matrix[tok][d] as f64).collect();
+                    let coeffs = haar_transform(&x);
+                    // coeffs layout: [approx(1), detail_L5(1), detail_L4(2), detail_L3(4),
+                    //                 detail_L2(8), detail_L1(16), detail_L0(32)]
+                    level_energy[6] += coeffs[0] * coeffs[0]; // approx (DC)
+                    level_energy[5] += coeffs[1] * coeffs[1]; // level 5
+                    for i in 2..4 {
+                        level_energy[4] += coeffs[i] * coeffs[i];
+                    }
+                    for i in 4..8 {
+                        level_energy[3] += coeffs[i] * coeffs[i];
+                    }
+                    for i in 8..16 {
+                        level_energy[2] += coeffs[i] * coeffs[i];
+                    }
+                    for i in 16..32 {
+                        level_energy[1] += coeffs[i] * coeffs[i];
+                    }
+                    for i in 32..64 {
+                        level_energy[0] += coeffs[i] * coeffs[i];
+                    }
+                }
+                let total_e: f64 = level_energy.iter().sum();
+                println!("Level      Coeffs  Energy%  Description");
+                let labels = [
+                    "Detail 0", "Detail 1", "Detail 2", "Detail 3", "Detail 4", "Detail 5",
+                    "Approx",
+                ];
+                let counts = [32, 16, 8, 4, 2, 1, 1];
+                for (i, label) in labels.iter().enumerate() {
+                    println!(
+                        "  {:>8}  {:>6}  {:>6.2}%  {}frequency",
+                        label,
+                        counts[i],
+                        level_energy[i] / total_e * 100.0,
+                        if i >= 4 { "low " } else { "high " },
+                    );
+                }
+                let low_freq_pct =
+                    (level_energy[4] + level_energy[5] + level_energy[6]) / total_e * 100.0;
+                let high_freq_pct = (level_energy[0] + level_energy[1]) / total_e * 100.0;
+                println!(
+                    "Low-freq (approx+L5+L4): {:.1}%, High-freq (L0+L1): {:.1}%",
+                    low_freq_pct, high_freq_pct
+                );
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Naive DCT-II
+#[allow(clippy::needless_range_loop)]
+fn dct_ii(x: &[f64]) -> Vec<f64> {
+    let n = x.len();
+    let mut out = vec![0.0; n];
+    for k in 0..n {
+        let mut sum = 0.0;
+        for (i, &xi) in x.iter().enumerate() {
+            sum += xi
+                * (std::f64::consts::PI * (2.0 * i as f64 + 1.0) * k as f64 / (2.0 * n as f64))
+                    .cos();
+        }
+        out[k] = sum;
+    }
+    out
+}
+
+/// Haar wavelet transform (in-place style, returns coefficient array)
+fn haar_transform(x: &[f64]) -> Vec<f64> {
+    let mut c = x.to_vec();
+    let mut len = c.len();
+    let mut tmp = vec![0.0; len];
+    while len > 1 {
+        let half = len / 2;
+        for i in 0..half {
+            tmp[i] = (c[2 * i] + c[2 * i + 1]) / std::f64::consts::SQRT_2;
+            tmp[half + i] = (c[2 * i] - c[2 * i + 1]) / std::f64::consts::SQRT_2;
+        }
+        c[..len].copy_from_slice(&tmp[..len]);
+        len = half;
+    }
+    c
+}
+
+/// Estimate singular values via eigenvalues of A^T A using QR-like iteration
+/// Returns squared singular values (eigenvalues of A^T A) sorted descending
+#[allow(clippy::needless_range_loop)]
+fn estimate_singular_values(ata: &[Vec<f64>], n: usize, max_k: usize) -> Vec<f64> {
+    // Simple approach: compute diagonal of A^T A after a few Jacobi-like sweeps
+    // For small n=64, we can afford O(n^3) operations
+    // Use power iteration to get eigenvalues
+    let mut eigenvalues = Vec::new();
+    let mut mat: Vec<Vec<f64>> = ata.to_vec();
+
+    for _ in 0..max_k {
+        // Power iteration for largest eigenvalue
+        let mut v = vec![1.0 / (n as f64).sqrt(); n];
+        for _ in 0..50 {
+            // iterations
+            let mut new_v = vec![0.0; n];
+            for i in 0..n {
+                for j in 0..n {
+                    new_v[i] += mat[i][j] * v[j];
+                }
+            }
+            let norm: f64 = new_v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            if norm < 1e-15 {
+                break;
+            }
+            for x in &mut new_v {
+                *x /= norm;
+            }
+            v = new_v;
+        }
+        // Eigenvalue = v^T A v
+        let mut av = vec![0.0; n];
+        for i in 0..n {
+            for j in 0..n {
+                av[i] += mat[i][j] * v[j];
+            }
+        }
+        let eigenval: f64 = v.iter().zip(av.iter()).map(|(a, b)| a * b).sum();
+        if eigenval < 1e-10 {
+            break;
+        }
+        eigenvalues.push(eigenval);
+
+        // Deflate: A = A - λ v v^T
+        for i in 0..n {
+            for j in 0..n {
+                mat[i][j] -= eigenval * v[i] * v[j];
+            }
+        }
+    }
+
+    eigenvalues
 }
 
 fn symbol_entropy_u16(data: &[u8]) -> f64 {
