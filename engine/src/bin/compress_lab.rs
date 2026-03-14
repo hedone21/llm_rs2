@@ -2848,6 +2848,230 @@ fn run_svd_benchmark(dump: &KVDump, per_layer: bool) -> Result<()> {
         }
     }
 
+    // ── Strategy 1: Asymmetric K/V rank allocation ──
+    run_svd_asymmetric_benchmark(dump, per_layer)?;
+
+    // ── Strategy 2: K-only SVD + V lossless ──
+    run_svd_k_only_benchmark(dump)?;
+
+    Ok(())
+}
+
+/// Strategy 1: Asymmetric rank — give K fewer ranks, V more ranks.
+/// Compare against uniform rank at the same total compressed size.
+#[allow(clippy::needless_range_loop)]
+fn run_svd_asymmetric_benchmark(dump: &KVDump, per_layer: bool) -> Result<()> {
+    // Pairs: (k_rank, v_rank) — designed so total budget ≈ uniform rank's budget
+    // Budget per head = rank * (head_dim + num_tokens) * 2 bytes
+    // For uniform k=10: budget = 10 * (64 + 161) * 2 = 4500 bytes/head
+    // Asymmetric pairs chosen to have similar total budget:
+    //   (6, 14): 6*(225) + 14*(225) = 20*225 = same as uniform k=10 per K+V pair
+    let configs: &[(usize, usize, &str)] = &[
+        (4, 16, "K4/V16"),              // aggressive: heavily favors V
+        (6, 14, "K6/V14"),              // moderate asymmetry
+        (8, 12, "K8/V12"),              // mild asymmetry
+        (10, 10, "K10/V10 (baseline)"), // uniform baseline for comparison
+        (6, 26, "K6/V26"),              // high total budget, strong asymmetry
+        (10, 22, "K10/V22"),            // high total budget, mild asymmetry
+    ];
+
+    println!("\n══ SVD Asymmetric K/V Rank ══════════════════════════════════════");
+    println!(
+        "{:<22} {:>7} {:>9} {:>10}  {:>8} {:>8}  {:>8} {:>8}",
+        "Config", "Ratio", "Comp ms", "Decomp ms", "K_Cos", "V_Cos", "AllCos", "FrobErr%"
+    );
+    println!("{}", "─".repeat(96));
+
+    let num_tokens = dump.num_tokens;
+    let kv_heads = dump.kv_heads;
+    let head_dim = dump.head_dim;
+    let original_head_bytes = num_tokens * head_dim * 2;
+
+    for &(k_rank, v_rank, label) in configs {
+        let mut total_compress_us = 0u64;
+        let mut total_decompress_us = 0u64;
+        let mut total_compressed_size = 0usize;
+        let mut total_original_size = 0usize;
+        let mut k_cos_sum = 0.0;
+        let mut v_cos_sum = 0.0;
+        let mut k_count = 0usize;
+        let mut v_count = 0usize;
+        let mut all_qualities: Vec<SvdQuality> = Vec::new();
+        let mut layer_details: Vec<(f64, f64, f64, f64)> = Vec::new();
+
+        for layer in &dump.layers {
+            let k_heads = f16_bytes_to_f64_heads(&layer.k, num_tokens, kv_heads, head_dim);
+            let v_heads = f16_bytes_to_f64_heads(&layer.v, num_tokens, kv_heads, head_dim);
+
+            let mut lk_mse = 0.0;
+            let mut lk_cos = 0.0;
+            let mut lv_mse = 0.0;
+            let mut lv_cos = 0.0;
+
+            for kv_type in 0..2 {
+                let heads = if kv_type == 0 { &k_heads } else { &v_heads };
+                let rank = if kv_type == 0 { k_rank } else { v_rank };
+                for h in 0..kv_heads {
+                    let matrix = &heads[h];
+
+                    let t0 = Instant::now();
+                    let (v_k, coeffs) = svd_compress_head(matrix, rank);
+                    let compress_us = t0.elapsed().as_micros() as u64;
+
+                    let actual_k = v_k.len();
+                    let compressed_bytes = actual_k * head_dim * 2 + num_tokens * actual_k * 2;
+
+                    let t1 = Instant::now();
+                    let reconstructed = svd_decompress_head(&v_k, &coeffs, head_dim);
+                    let decompress_us = t1.elapsed().as_micros() as u64;
+
+                    let quality = compute_svd_quality(matrix, &reconstructed);
+
+                    if kv_type == 0 {
+                        k_cos_sum += quality.cosine_sim_avg;
+                        k_count += 1;
+                        lk_mse += quality.mse;
+                        lk_cos += quality.cosine_sim_avg;
+                    } else {
+                        v_cos_sum += quality.cosine_sim_avg;
+                        v_count += 1;
+                        lv_mse += quality.mse;
+                        lv_cos += quality.cosine_sim_avg;
+                    }
+
+                    total_compress_us += compress_us;
+                    total_decompress_us += decompress_us;
+                    total_compressed_size += compressed_bytes;
+                    total_original_size += original_head_bytes;
+                    all_qualities.push(quality);
+                }
+            }
+
+            layer_details.push((
+                lk_mse / kv_heads as f64,
+                lk_cos / kv_heads as f64,
+                lv_mse / kv_heads as f64,
+                lv_cos / kv_heads as f64,
+            ));
+        }
+
+        let n = all_qualities.len() as f64;
+        let avg_cos = all_qualities.iter().map(|q| q.cosine_sim_avg).sum::<f64>() / n;
+        let avg_frob = all_qualities.iter().map(|q| q.rel_frob_err).sum::<f64>() / n;
+        let ratio = total_original_size as f64 / total_compressed_size as f64;
+        let compress_ms = total_compress_us as f64 / 1000.0;
+        let decompress_ms = total_decompress_us as f64 / 1000.0;
+        let k_cos_avg = k_cos_sum / k_count as f64;
+        let v_cos_avg = v_cos_sum / v_count as f64;
+
+        println!(
+            "{:<22} {:>6.2}x  {:>8.1}  {:>9.1}  {:>8.4} {:>8.4}  {:>8.4} {:>7.2}%",
+            label,
+            ratio,
+            compress_ms,
+            decompress_ms,
+            k_cos_avg,
+            v_cos_avg,
+            avg_cos,
+            avg_frob * 100.0
+        );
+
+        if per_layer {
+            println!("  ── {}: Layer breakdown ──", label);
+            println!(
+                "  {:>5}  {:>10}  {:>8}  {:>10}  {:>8}",
+                "Layer", "K_MSE", "K_CosSim", "V_MSE", "V_CosSim"
+            );
+            for (i, &(km, kc, vm, vc)) in layer_details.iter().enumerate() {
+                println!(
+                    "  L{:02}   {:>10.2e}  {:>8.4}  {:>10.2e}  {:>8.4}",
+                    i, km, kc, vm, vc
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Strategy 2: K-only SVD + V lossless (nibble shuffle + zstd).
+/// K gets lossy SVD compression, V stays bit-perfect with best lossless algo.
+#[allow(clippy::needless_range_loop)]
+fn run_svd_k_only_benchmark(dump: &KVDump) -> Result<()> {
+    println!("\n══ SVD K-only + V Lossless (nibshuffle+zstd) ════════════════════");
+    println!(
+        "{:>7} {:>7} {:>7} {:>9} {:>10}  {:>8}  {:>8}",
+        "K_rank", "K_Rat", "V_Rat", "Comb_Rat", "Comp ms", "K_CosSim", "V_verify"
+    );
+    println!("{}", "─".repeat(72));
+
+    let num_tokens = dump.num_tokens;
+    let kv_heads = dump.kv_heads;
+    let head_dim = dump.head_dim;
+    let original_head_bytes = num_tokens * head_dim * 2;
+
+    let k_ranks = [4, 8, 10, 14, 19, 32];
+
+    for &k_rank in &k_ranks {
+        let mut k_compressed_total = 0usize;
+        let mut k_original_total = 0usize;
+        let mut v_compressed_total = 0usize;
+        let mut v_original_total = 0usize;
+        let mut total_compress_us = 0u64;
+        let mut k_cos_sum = 0.0;
+        let mut k_cos_count = 0usize;
+        let mut v_all_verified = true;
+
+        for layer in &dump.layers {
+            // K: SVD lossy
+            let k_heads_mat = f16_bytes_to_f64_heads(&layer.k, num_tokens, kv_heads, head_dim);
+            for h in 0..kv_heads {
+                let t0 = Instant::now();
+                let (v_k, coeffs) = svd_compress_head(&k_heads_mat[h], k_rank);
+                let compress_us = t0.elapsed().as_micros() as u64;
+
+                let actual_k = v_k.len();
+                let compressed_bytes = actual_k * head_dim * 2 + num_tokens * actual_k * 2;
+
+                let reconstructed = svd_decompress_head(&v_k, &coeffs, head_dim);
+                let quality = compute_svd_quality(&k_heads_mat[h], &reconstructed);
+
+                k_compressed_total += compressed_bytes;
+                k_original_total += original_head_bytes;
+                k_cos_sum += quality.cosine_sim_avg;
+                k_cos_count += 1;
+                total_compress_us += compress_us;
+            }
+
+            // V: Lossless nibble shuffle + zstd
+            let t0 = Instant::now();
+            let vr = algo_nibble_shuffle_zstd(&layer.v, 2);
+            total_compress_us += t0.elapsed().as_micros() as u64;
+
+            v_compressed_total += vr.compressed_size;
+            v_original_total += vr.original_size;
+            v_all_verified &= vr.verified;
+        }
+
+        let k_ratio = k_original_total as f64 / k_compressed_total as f64;
+        let v_ratio = v_original_total as f64 / v_compressed_total as f64;
+        let combined_ratio = (k_original_total + v_original_total) as f64
+            / (k_compressed_total + v_compressed_total) as f64;
+        let compress_ms = total_compress_us as f64 / 1000.0;
+        let k_cos_avg = k_cos_sum / k_cos_count as f64;
+
+        println!(
+            "k={:>3}  {:>6.2}x {:>6.2}x  {:>7.2}x  {:>8.1}  {:>8.4}  {}",
+            k_rank,
+            k_ratio,
+            v_ratio,
+            combined_ratio,
+            compress_ms,
+            k_cos_avg,
+            if v_all_verified { "OK" } else { "FAIL" }
+        );
+    }
+
     Ok(())
 }
 
