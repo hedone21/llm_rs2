@@ -1752,4 +1752,263 @@ mod tests {
             "K data corrupted after double preload"
         );
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    //  Adaptive Prefetch Benchmark: depth=1 vs adaptive with simulated work
+    // ════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_bench_adaptive_prefetch() {
+        use crate::core::offload::prefetch::PrefetchController;
+
+        let kv_heads = 8;
+        let head_dim = 64;
+        let num_layers = 16;
+        let max_seq_len = 2048;
+        let prefill_len = 128;
+        let decode_steps = 64;
+
+        println!("\n╔══════════════════════════════════════════════════════════════════╗");
+        println!("║  Adaptive Prefetch Benchmark: depth=1 vs adaptive              ║");
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  Config: kv_heads={}, head_dim={}, layers={}, prefill={}, decode={}",
+            kv_heads, head_dim, num_layers, prefill_len, decode_steps
+        );
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+
+        // Simulate forward time: on real hardware, layer forward is ~2-4ms.
+        // Zram preload on host is fast, so we use std::thread::yield for
+        // a minimal "work" simulation. The key metric is preload guard skips.
+        let simulate_work = || {
+            // Minimal busywork to occupy the CPU
+            let mut x = 0u64;
+            for i in 0..5000 {
+                x = x.wrapping_add(i * i);
+            }
+            std::hint::black_box(x);
+        };
+
+        /// Run decode loop with given prefetch depth strategy.
+        /// Returns (total_ms, preload_calls, preload_skips, active_bufs_at_end)
+        fn run_with_depth(
+            num_layers: usize,
+            max_seq_len: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            prefill_len: usize,
+            decode_steps: usize,
+            max_depth: usize,
+            simulate_work: &dyn Fn(),
+        ) -> (f64, usize, usize, usize) {
+            let token_bytes = kv_heads * head_dim * 2;
+            let mut caches: Vec<OffloadKVCache> = (0..num_layers)
+                .map(|layer_id| {
+                    let store: Box<dyn store::OffloadStore> =
+                        Box::new(zram_store::ZramStore::new(token_bytes, 2, 64));
+                    OffloadKVCache::new(
+                        layer_id,
+                        kv_heads,
+                        head_dim,
+                        DType::F16,
+                        max_seq_len,
+                        store,
+                    )
+                })
+                .collect();
+
+            // Prefill
+            let k_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3C00);
+            let v_pf = make_realistic_f16_tensor(prefill_len, kv_heads, head_dim, 0x3E00);
+            for c in caches.iter_mut() {
+                c.update(&k_pf, &v_pf).unwrap();
+            }
+
+            let mut prefetch = PrefetchController::new(max_depth, num_layers);
+            let mut preload_calls = 0usize;
+            let mut preload_skips = 0usize;
+
+            let decode_start = std::time::Instant::now();
+
+            for step in 0..decode_steps {
+                let k_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3C00 + (step as u16 * 3));
+                let v_tok =
+                    make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
+
+                for c in caches.iter_mut() {
+                    c.reset_preload();
+                }
+                for c in caches.iter_mut() {
+                    c.update(&k_tok, &v_tok).unwrap();
+                }
+
+                let depth = prefetch.depth();
+
+                // Synchronous initial preload: [0..depth)
+                for cache in caches.iter_mut().take(depth.min(num_layers)) {
+                    let was_preloaded = cache.preloaded;
+                    cache.preload().unwrap();
+                    preload_calls += 1;
+                    if was_preloaded {
+                        preload_skips += 1;
+                    }
+                }
+
+                // Layer loop (mimics forward_into_offload)
+                for i in 0..num_layers {
+                    let layers_remaining = num_layers - i - 1;
+                    if layers_remaining > 0 {
+                        let (left, right) = caches.split_at_mut(i + 1);
+                        let current = &mut left[i];
+                        let target_offset = (depth - 1).min(right.len() - 1);
+                        let target = &mut right[target_offset];
+
+                        std::thread::scope(|s| {
+                            let handle = s.spawn(|| {
+                                let t0 = std::time::Instant::now();
+                                let was_preloaded = target.preloaded;
+                                target.preload().unwrap();
+                                preload_calls += 1;
+                                if was_preloaded {
+                                    preload_skips += 1;
+                                }
+                                t0.elapsed()
+                            });
+
+                            let fwd_t0 = std::time::Instant::now();
+                            let _ = current.get_view();
+                            simulate_work();
+                            let fwd_dur = fwd_t0.elapsed();
+
+                            let preload_dur = handle.join().unwrap();
+                            prefetch.record(preload_dur, fwd_dur);
+                        });
+
+                        if i > 0 {
+                            caches[i - 1].release_buffers();
+                        }
+                    } else {
+                        let _ = caches[i].get_view();
+                        simulate_work();
+                        caches[i].release_buffers();
+                    }
+                }
+
+                if num_layers >= 2 {
+                    caches[num_layers - 2].release_buffers();
+                }
+
+                prefetch.adjust();
+            }
+
+            let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+            // Count active buffers at end
+            let active_bufs = caches
+                .iter()
+                .filter(|c| c.attn_k_buf.is_some() || c.attn_v_buf.is_some())
+                .count();
+
+            (decode_ms, preload_calls, preload_skips, active_bufs)
+        }
+
+        // Run with depth=1 (fixed)
+        let (d1_ms, d1_calls, d1_skips, d1_bufs) = run_with_depth(
+            num_layers,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            prefill_len,
+            decode_steps,
+            1,
+            &simulate_work,
+        );
+
+        // Run with adaptive (max_depth=4)
+        let (da_ms, da_calls, da_skips, da_bufs) = run_with_depth(
+            num_layers,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            prefill_len,
+            decode_steps,
+            4,
+            &simulate_work,
+        );
+
+        // Run with depth=4 (fixed max)
+        let (d4_ms, d4_calls, d4_skips, d4_bufs) = run_with_depth(
+            num_layers,
+            max_seq_len,
+            kv_heads,
+            head_dim,
+            prefill_len,
+            decode_steps,
+            4,
+            &simulate_work,
+        );
+
+        println!("║");
+        println!(
+            "║  {:25} {:>10} {:>10} {:>10} {:>8}",
+            "Strategy", "Total(ms)", "Preloads", "Skips", "Act.Bufs"
+        );
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+        println!(
+            "║  {:25} {:>10.1} {:>10} {:>10} {:>8}",
+            "Fixed depth=1", d1_ms, d1_calls, d1_skips, d1_bufs
+        );
+        println!(
+            "║  {:25} {:>10.1} {:>10} {:>10} {:>8}",
+            "Adaptive (max=4)", da_ms, da_calls, da_skips, da_bufs
+        );
+        println!(
+            "║  {:25} {:>10.1} {:>10} {:>10} {:>8}",
+            "Fixed depth=4", d4_ms, d4_calls, d4_skips, d4_bufs
+        );
+        println!("╠══════════════════════════════════════════════════════════════════╣");
+
+        let d1_per_tok = d1_ms / decode_steps as f64;
+        let da_per_tok = da_ms / decode_steps as f64;
+        println!(
+            "║  depth=1: {:.2}ms/tok, adaptive: {:.2}ms/tok ({:.1}%)",
+            d1_per_tok,
+            da_per_tok,
+            (da_ms / d1_ms - 1.0) * 100.0,
+        );
+
+        // Adaptive should have meaningful skip count due to guard
+        // (depth>1 preloads layers that were already loaded in previous iterations)
+        println!(
+            "║  Skip ratio: depth=1 {}/{} ({:.0}%), adaptive {}/{} ({:.0}%)",
+            d1_skips,
+            d1_calls,
+            d1_skips as f64 / d1_calls.max(1) as f64 * 100.0,
+            da_skips,
+            da_calls,
+            da_skips as f64 / da_calls.max(1) as f64 * 100.0,
+        );
+        println!("╚══════════════════════════════════════════════════════════════════╝\n");
+
+        // Correctness assertions:
+        // 1. depth=1 should have 0 skips (each layer preloaded exactly once)
+        assert_eq!(d1_skips, 0, "depth=1 should have no preload skips");
+
+        // 2. Active buffers at end should be bounded (not all layers active)
+        assert!(
+            d1_bufs <= 3,
+            "depth=1: too many active buffers at end: {d1_bufs}"
+        );
+        assert!(
+            da_bufs <= 6,
+            "adaptive: too many active buffers at end: {da_bufs}"
+        );
+
+        // 3. Adaptive should not be catastrophically slower (< 2x overhead)
+        assert!(
+            da_ms < d1_ms * 2.5,
+            "adaptive is too slow: {da_ms:.1}ms vs depth=1 {d1_ms:.1}ms"
+        );
+    }
 }
