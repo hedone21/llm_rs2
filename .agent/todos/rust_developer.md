@@ -64,3 +64,63 @@
 - **Status**: DONE
 - **Sprint**: current
 - **Notes**: 커밋 9fb86b6. M≥4에서 CpuBackendCommon 스칼라 폴백 → AVX2 quantize_row_q8_0 + vec_dot_q4_0_q8_0 사용. 병렬 A행 양자화 + 행별 병렬 dot product. 프리필 경로 AVX2 커버리지 100%.
+
+---
+
+## [P1] ZramStore Blosc 필터 실험: bytedelta + 압축 코덱 비교
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (기존 ZramStore + preprocess.rs 위에 구현)
+- **Description**: |
+  현재 ZramStore(byte-shuffle + LZ4)가 실제 F16 KV 캐시에서 압축률 1.0x.
+  Blosc 핵심 아이디어(bytedelta, trunc_prec)를 순수 Rust로 구현하고
+  실제 모델 데이터에서 압축률과 해제 속도를 실측한다.
+
+  ### Step 1: bytedelta 구현 (`preprocess.rs`)
+  - `bytedelta_encode(data, stream_len, n_streams)` — 바이트 스트림 내 delta 인코딩
+  - `bytedelta_decode(data, stream_len, n_streams)` — prefix-sum 복원
+  - 유닛 테스트: roundtrip bit-exact 검증
+
+  ### Step 2: trunc_prec 구현 (`preprocess.rs`)
+  - `trunc_prec_f16(data, zero_bits)` — F16 mantissa 하위 N비트 마스킹 (lossy)
+  - 유닛 테스트: 마스킹 정확성 검증
+
+  ### Step 3: ZramStore 압축 파이프라인 확장 (`zram_store.rs`)
+  - 기존: shuffle → LZ4
+  - 확장: shuffle → bytedelta → LZ4 (또는 Zstd)
+  - `ZramConfig` 구조체로 파이프라인 옵션 제어:
+    - `use_bytedelta: bool`
+    - `trunc_bits: u32` (0 = 무손실)
+    - `codec: Codec` (LZ4 / Zstd)
+  - Zstd 사용 시 `zstd` 크레이트 추가 (Cargo.toml)
+
+  ### Step 4: 압축률 벤치마크 테스트
+  - 실제 모델(Llama 3.2 1B) KV 캐시 데이터로 다음 조합 실측:
+    ```
+    ① shuffle + LZ4              (기준선, 현재)
+    ② shuffle + bytedelta + LZ4
+    ③ shuffle + bytedelta + Zstd(1)
+    ④ trunc(3) + shuffle + bytedelta + LZ4
+    ⑤ trunc(5) + shuffle + bytedelta + Zstd(1)
+    ```
+  - 각 조합에서 측정:
+    - 압축률 (compressed / original)
+    - 레이어별 압축률 분포 (16 layers)
+    - 압축 시간 (ms) / 해제 시간 (ms)
+    - 4MB 블록 기준 해제 지연 (3ms 예산 대비)
+
+  ### Step 5: E2E 추론 벤치마크
+  - `--kv-offload zram` + 각 파이프라인 설정으로 실행
+  - 측정: tok/s, RAM 사용량, 생성 텍스트 품질 비교 (trunc_prec 설정별)
+
+- **Acceptance Criteria**:
+  1. bytedelta roundtrip 테스트 통과
+  2. trunc_prec roundtrip 테스트 통과 (마스킹 후 복원 시 마스킹된 값 동일)
+  3. 5개 조합의 압축률/속도 벤치마크 테이블 작성
+  4. 레이어별 압축률 분포 확인
+  5. 최적 조합 선정 및 근거 문서화
+- **Notes**: |
+  - Zstd 크레이트: `zstd = "0.13"` (C 바인딩, Android 크로스 컴파일 확인 필요)
+  - 순수 Rust LZ4 대안: `lz4_flex` (크로스 컴파일 더 쉬움)
+  - bytedelta NEON SIMD 최적화는 후속 작업으로 분리
+  - 무손실 상한 기대치: 1.3~1.8x, trunc(5) 시 2.0~3.5x
