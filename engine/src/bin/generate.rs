@@ -246,15 +246,11 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// KV cache offload mode: none, disk, zram, or svd.
-    /// disk/zram: lossless offload. svd: SVD-compressed K + V offload.
+    /// KV cache offload mode: none, raw, or svd.
+    /// raw: lossless in-memory offload. svd: SVD-compressed K + V offload.
     /// Requires --kv-layout seq and --kv-type f16 or f32.
     #[arg(long, default_value = "none")]
     kv_offload: String,
-
-    /// Directory for disk-based offload storage.
-    #[arg(long, default_value = "/tmp/llm_rs2_offload")]
-    offload_dir: String,
 
     /// SVD rank for K-cache compression (used with --kv-offload svd).
     #[arg(long, default_value_t = 10)]
@@ -415,7 +411,6 @@ fn main() -> anyhow::Result<()> {
             &prompt,
             &args.backend,
             &args.kv_offload,
-            &args.offload_dir,
             &args.kv_type,
             args.max_prefetch_depth,
         );
@@ -2620,7 +2615,6 @@ fn run_offload(
     _prompt: &str,
     _backend_name: &str,
     offload_mode: &str,
-    _offload_dir: &str,
     kv_type_str: &str,
     max_prefetch_depth: usize,
 ) -> anyhow::Result<()> {

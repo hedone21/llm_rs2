@@ -29,10 +29,6 @@ clap = { version = "4.5", features = ["derive"] }
 # 병렬화
 rayon = "1.11"
 
-# Compression (ZramStore KV cache offload)
-lz4 = "1.28"
-zstd = "0.13"
-
 # log
 log = "0.4"
 env_logger = "0.11"
