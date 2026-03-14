@@ -19,9 +19,21 @@ pub enum ZramCodec {
     Zstd(i32),
 }
 
+/// Shuffle mode selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShuffleMode {
+    /// Byte-level shuffle: separates high/low bytes (fast, moderate compression).
+    Byte,
+    /// Bit-level shuffle: transposes into bit-planes (slower, better compression).
+    /// Groups exponent bit-planes together for high compressibility.
+    Bit,
+}
+
 /// Configuration for the ZramStore compression pipeline.
 #[derive(Debug, Clone)]
 pub struct ZramConfig {
+    /// Shuffle mode: byte-level or bit-level transposition.
+    pub shuffle: ShuffleMode,
     /// Apply bytedelta filter after shuffle (Blosc2-inspired).
     pub use_bytedelta: bool,
     /// Number of F16/F32 mantissa bits to zero before compression (0 = lossless).
@@ -33,6 +45,7 @@ pub struct ZramConfig {
 impl Default for ZramConfig {
     fn default() -> Self {
         Self {
+            shuffle: ShuffleMode::Byte,
             use_bytedelta: false,
             trunc_bits: 0,
             codec: ZramCodec::Lz4,
@@ -123,8 +136,7 @@ impl ZramStore {
         }
 
         // Step 1 (optional, lossy): truncate mantissa precision
-        if self.config.trunc_bits > 0 {
-            // We need a mutable copy for trunc_prec since data is &[u8]
+        let shuffle_src = if self.config.trunc_bits > 0 {
             self.shuffle_buf[..data.len()].copy_from_slice(data);
             match self.elem_size {
                 2 => preprocess::trunc_prec_f16(
@@ -137,13 +149,29 @@ impl ZramStore {
                 ),
                 _ => {}
             }
-            // Shuffle in-place: need a second buffer
             let mut tmp = vec![0u8; data.len()];
-            preprocess::shuffle(&self.shuffle_buf[..data.len()], &mut tmp, self.elem_size);
-            self.shuffle_buf[..data.len()].copy_from_slice(&tmp);
+            tmp.copy_from_slice(&self.shuffle_buf[..data.len()]);
+            tmp
         } else {
-            // Step 2: byte-shuffle
-            preprocess::shuffle(data, &mut self.shuffle_buf[..data.len()], self.elem_size);
+            data.to_vec()
+        };
+
+        // Step 2: shuffle (byte or bit level)
+        match self.config.shuffle {
+            ShuffleMode::Byte => {
+                preprocess::shuffle(
+                    &shuffle_src,
+                    &mut self.shuffle_buf[..data.len()],
+                    self.elem_size,
+                );
+            }
+            ShuffleMode::Bit => {
+                preprocess::bitshuffle(
+                    &shuffle_src,
+                    &mut self.shuffle_buf[..data.len()],
+                    self.elem_size,
+                );
+            }
         }
 
         // Step 3 (optional): bytedelta
@@ -192,12 +220,19 @@ impl ZramStore {
             preprocess::bytedelta_decode(&mut decompressed, n_elements, self.elem_size);
         }
 
-        // Step 3: byte-unshuffle
-        preprocess::unshuffle(
-            &decompressed,
-            &mut dst[..block.original_size],
-            self.elem_size,
-        );
+        // Step 3: unshuffle (byte or bit level)
+        match self.config.shuffle {
+            ShuffleMode::Byte => preprocess::unshuffle(
+                &decompressed,
+                &mut dst[..block.original_size],
+                self.elem_size,
+            ),
+            ShuffleMode::Bit => preprocess::bitunshuffle(
+                &decompressed,
+                &mut dst[..block.original_size],
+                self.elem_size,
+            ),
+        }
 
         Ok(())
     }
@@ -552,6 +587,7 @@ mod tests {
         let token_bytes = 8 * 64 * 2;
         let num_tokens = 128;
         let config = ZramConfig {
+            shuffle: ShuffleMode::Byte,
             use_bytedelta: true,
             trunc_bits: 0,
             codec: ZramCodec::Lz4,
@@ -577,6 +613,7 @@ mod tests {
         let token_bytes = 8 * 64 * 2;
         let num_tokens = 128;
         let config = ZramConfig {
+            shuffle: ShuffleMode::Byte,
             use_bytedelta: true,
             trunc_bits: 0,
             codec: ZramCodec::Zstd(1),
@@ -601,6 +638,7 @@ mod tests {
         let token_bytes = 8 * 64 * 2;
         let num_tokens = 128;
         let config = ZramConfig {
+            shuffle: ShuffleMode::Byte,
             use_bytedelta: true,
             trunc_bits: 5,
             codec: ZramCodec::Zstd(1),
@@ -637,6 +675,7 @@ mod tests {
     fn test_zram_bytedelta_append_decode() {
         let token_bytes = 8 * 64 * 2;
         let config = ZramConfig {
+            shuffle: ShuffleMode::Byte,
             use_bytedelta: true,
             trunc_bits: 0,
             codec: ZramCodec::Lz4,
@@ -666,43 +705,77 @@ mod tests {
 
     fn pipeline_configs() -> Vec<(&'static str, ZramConfig)> {
         vec![
+            // ── Byte-shuffle pipelines (baseline) ──
             (
-                "shuffle+LZ4",
+                "byteshuffle+LZ4",
                 ZramConfig {
+                    shuffle: ShuffleMode::Byte,
                     use_bytedelta: false,
                     trunc_bits: 0,
                     codec: ZramCodec::Lz4,
                 },
             ),
             (
-                "shuffle+bytedelta+LZ4",
+                "byteshuffle+bytedelta+LZ4",
                 ZramConfig {
+                    shuffle: ShuffleMode::Byte,
                     use_bytedelta: true,
                     trunc_bits: 0,
                     codec: ZramCodec::Lz4,
                 },
             ),
             (
-                "shuffle+bytedelta+Zstd(1)",
+                "byteshuffle+bytedelta+Zstd(1)",
                 ZramConfig {
+                    shuffle: ShuffleMode::Byte,
                     use_bytedelta: true,
                     trunc_bits: 0,
                     codec: ZramCodec::Zstd(1),
                 },
             ),
             (
-                "trunc(3)+shuffle+bytedelta+LZ4",
+                "trunc(5)+byteshuffle+bytedelta+Zstd(1)",
                 ZramConfig {
+                    shuffle: ShuffleMode::Byte,
                     use_bytedelta: true,
-                    trunc_bits: 3,
+                    trunc_bits: 5,
+                    codec: ZramCodec::Zstd(1),
+                },
+            ),
+            // ── Bitshuffle pipelines ──
+            (
+                "bitshuffle+LZ4",
+                ZramConfig {
+                    shuffle: ShuffleMode::Bit,
+                    use_bytedelta: false,
+                    trunc_bits: 0,
                     codec: ZramCodec::Lz4,
                 },
             ),
             (
-                "trunc(5)+shuffle+bytedelta+Zstd(1)",
+                "bitshuffle+Zstd(1)",
                 ZramConfig {
+                    shuffle: ShuffleMode::Bit,
+                    use_bytedelta: false,
+                    trunc_bits: 0,
+                    codec: ZramCodec::Zstd(1),
+                },
+            ),
+            (
+                "bitshuffle+bytedelta+LZ4",
+                ZramConfig {
+                    shuffle: ShuffleMode::Bit,
                     use_bytedelta: true,
-                    trunc_bits: 5,
+                    trunc_bits: 0,
+                    codec: ZramCodec::Lz4,
+                },
+            ),
+            (
+                "bitshuffle+bytedelta+Zstd(1)",
+                ZramConfig {
+                    shuffle: ShuffleMode::Bit,
+                    use_bytedelta: true,
+                    trunc_bits: 0,
                     codec: ZramCodec::Zstd(1),
                 },
             ),

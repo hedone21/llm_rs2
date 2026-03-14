@@ -77,6 +77,145 @@ pub fn unshuffle(src: &[u8], dst: &mut [u8], elem_size: usize) {
     }
 }
 
+// ── Bitshuffle (bit-plane transposition) ─────────────────────────────────
+
+/// Bitshuffle: transpose N elements of `elem_size` bytes into bit-planes.
+///
+/// For N F16 values (elem_size=2), the 16-bit values are rearranged so that
+/// all bit-0 values are contiguous, all bit-1 values, etc. This groups
+/// exponent bits (planes 10-14) and sign (plane 15) together — these have
+/// low entropy and compress extremely well. Mantissa planes (0-9) remain
+/// high-entropy but no worse than before.
+///
+/// Layout: `src` has N elements of `elem_size` bytes each.
+/// `dst` receives `elem_size * 8` bit-planes, each of `N / 8` bytes
+/// (N must be a multiple of 8).
+pub fn bitshuffle(src: &[u8], dst: &mut [u8], elem_size: usize) {
+    debug_assert_eq!(src.len(), dst.len());
+    match elem_size {
+        2 => bitshuffle_f16(src, dst),
+        _ => bitshuffle_generic(src, dst, elem_size),
+    }
+}
+
+/// Optimized bitshuffle for F16 (elem_size=2, 16 bit-planes).
+fn bitshuffle_f16(src: &[u8], dst: &mut [u8]) {
+    let n_elem = src.len() / 2;
+    debug_assert_eq!(n_elem % 8, 0);
+    let plane_bytes = n_elem / 8;
+
+    for group in 0..plane_bytes {
+        // Load 8 F16 values as u16
+        let base = group * 8 * 2;
+        let mut vals = [0u16; 8];
+        for (j, val) in vals.iter_mut().enumerate() {
+            *val = u16::from_le_bytes([src[base + j * 2], src[base + j * 2 + 1]]);
+        }
+
+        // For each of 16 bit-planes, gather bits from 8 elements
+        for bit in 0..16u32 {
+            let mask = 1u16 << bit;
+            let mut out_byte = 0u8;
+            for (j, val) in vals.iter().enumerate() {
+                if val & mask != 0 {
+                    out_byte |= 1 << j;
+                }
+            }
+            dst[bit as usize * plane_bytes + group] = out_byte;
+        }
+    }
+}
+
+/// Generic bitshuffle for arbitrary elem_size.
+fn bitshuffle_generic(src: &[u8], dst: &mut [u8], elem_size: usize) {
+    let n_elem = src.len() / elem_size;
+    debug_assert_eq!(n_elem % 8, 0);
+    let bits_per_elem = elem_size * 8;
+    let plane_bytes = n_elem / 8;
+
+    for group in 0..plane_bytes {
+        let elem_base = group * 8;
+        for bit in 0..bits_per_elem {
+            let byte_in_elem = bit / 8;
+            let bit_in_byte = bit % 8;
+            let mask = 1u8 << bit_in_byte;
+            let mut out_byte = 0u8;
+            for j in 0..8 {
+                let src_byte = src[(elem_base + j) * elem_size + byte_in_elem];
+                if src_byte & mask != 0 {
+                    out_byte |= 1 << j;
+                }
+            }
+            dst[bit * plane_bytes + group] = out_byte;
+        }
+    }
+}
+
+/// Reverse bitshuffle: reconstruct elements from bit-planes.
+pub fn bitunshuffle(src: &[u8], dst: &mut [u8], elem_size: usize) {
+    debug_assert_eq!(src.len(), dst.len());
+    // Dispatch to specialized F16 path or generic path
+    match elem_size {
+        2 => bitunshuffle_f16(src, dst),
+        _ => bitunshuffle_generic(src, dst, elem_size),
+    }
+}
+
+/// Optimized bitunshuffle for F16 (elem_size=2, 16 bit-planes).
+/// Processes one output byte per plane in the inner loop, avoiding per-bit branching.
+fn bitunshuffle_f16(src: &[u8], dst: &mut [u8]) {
+    let n_elem = dst.len() / 2;
+    debug_assert_eq!(n_elem % 8, 0);
+    let plane_bytes = n_elem / 8;
+
+    // For each group of 8 F16 elements, reconstruct from 16 bit-planes
+    for group in 0..plane_bytes {
+        // Accumulate 8 elements as u16 values
+        let mut vals = [0u16; 8];
+        for bit in 0..16u32 {
+            let in_byte = src[bit as usize * plane_bytes + group];
+            // Scatter each bit from in_byte to the 8 element accumulators
+            for (j, val) in vals.iter_mut().enumerate() {
+                *val |= (((in_byte >> j) & 1) as u16) << bit;
+            }
+        }
+        // Write out as little-endian bytes
+        let base = group * 8 * 2;
+        for (j, val) in vals.iter().enumerate() {
+            let bytes = val.to_le_bytes();
+            dst[base + j * 2] = bytes[0];
+            dst[base + j * 2 + 1] = bytes[1];
+        }
+    }
+}
+
+/// Generic bitunshuffle for arbitrary elem_size.
+fn bitunshuffle_generic(src: &[u8], dst: &mut [u8], elem_size: usize) {
+    let n_elem = dst.len() / elem_size;
+    debug_assert_eq!(n_elem % 8, 0);
+    let bits_per_elem = elem_size * 8;
+    let plane_bytes = n_elem / 8;
+
+    for group in 0..plane_bytes {
+        let elem_base = group * 8;
+        for j in 0..8 {
+            for b in 0..elem_size {
+                dst[(elem_base + j) * elem_size + b] = 0;
+            }
+        }
+        for bit in 0..bits_per_elem {
+            let byte_in_elem = bit / 8;
+            let bit_in_byte = bit % 8;
+            let in_byte = src[bit * plane_bytes + group];
+            for j in 0..8 {
+                if in_byte & (1 << j) != 0 {
+                    dst[(elem_base + j) * elem_size + byte_in_elem] |= 1 << bit_in_byte;
+                }
+            }
+        }
+    }
+}
+
 // ── Bytedelta filter (Blosc2-inspired) ──────────────────────────────────
 
 /// Bytedelta encode: apply delta encoding within each byte stream.
@@ -228,6 +367,85 @@ mod tests {
         // Unknown elem size: identity
         shuffle(&original, &mut shuffled, 1);
         assert_eq!(&original, &shuffled);
+    }
+
+    // ── Bitshuffle tests ──
+
+    #[test]
+    fn test_bitshuffle_roundtrip_f16() {
+        // 16 F16 elements = 32 bytes, N must be multiple of 8
+        let original: Vec<u8> = (0..32).collect();
+        let mut shuffled = vec![0u8; 32];
+        let mut restored = vec![0u8; 32];
+
+        bitshuffle(&original, &mut shuffled, 2);
+        assert_ne!(&shuffled, &original, "bitshuffle should change data");
+        bitunshuffle(&shuffled, &mut restored, 2);
+        assert_eq!(&restored, &original, "bitunshuffle must restore original");
+    }
+
+    #[test]
+    fn test_bitshuffle_roundtrip_f32() {
+        let original: Vec<u8> = (0..128).collect();
+        let mut shuffled = vec![0u8; 128];
+        let mut restored = vec![0u8; 128];
+
+        bitshuffle(&original, &mut shuffled, 4);
+        assert_ne!(&shuffled, &original);
+        bitunshuffle(&shuffled, &mut restored, 4);
+        assert_eq!(&restored, &original);
+    }
+
+    #[test]
+    fn test_bitshuffle_plane_structure_f16() {
+        // 8 identical F16 values: 0x3C00 = 1.0 in F16
+        // LE bytes: [0x00, 0x3C] repeated 8 times
+        let mut src = vec![0u8; 16];
+        for i in 0..8 {
+            src[i * 2] = 0x00; // low byte
+            src[i * 2 + 1] = 0x3C; // high byte = 0011_1100
+        }
+        let mut dst = vec![0u8; 16];
+        bitshuffle(&src, &mut dst, 2);
+
+        // plane_bytes = 8/8 = 1 byte per plane
+        // Planes 0-7 (low byte = 0x00): all bits are 0 → plane bytes = 0x00
+        for plane in 0..8 {
+            assert_eq!(
+                dst[plane], 0x00,
+                "mantissa low plane {plane} should be all-zero"
+            );
+        }
+        // Planes 8-9 (high byte bits 0-1, = 0b00): plane bytes = 0x00
+        assert_eq!(dst[8], 0x00);
+        assert_eq!(dst[9], 0x00);
+        // Planes 10-13 (high byte bits 2-5 of 0x3C = 0b0011_1100):
+        //   bit2=1, bit3=1, bit4=1, bit5=1 → all 8 elements have this set
+        assert_eq!(dst[10], 0xFF, "exponent plane 10");
+        assert_eq!(dst[11], 0xFF, "exponent plane 11");
+        assert_eq!(dst[12], 0xFF, "exponent plane 12");
+        assert_eq!(dst[13], 0xFF, "exponent plane 13");
+        // Planes 14-15 (bits 6-7 of 0x3C = 0b00): 0x00
+        assert_eq!(dst[14], 0x00, "exponent plane 14");
+        assert_eq!(dst[15], 0x00, "sign plane 15");
+    }
+
+    #[test]
+    fn test_bitshuffle_large_roundtrip_f16() {
+        // Realistic size: 512 F16 elements
+        let n = 512;
+        let mut original = vec![0u8; n * 2];
+        for i in 0..n {
+            let val = 0x3C00u16 + (i as u16 % 1024);
+            original[i * 2] = (val & 0xFF) as u8;
+            original[i * 2 + 1] = (val >> 8) as u8;
+        }
+        let mut shuffled = vec![0u8; n * 2];
+        let mut restored = vec![0u8; n * 2];
+
+        bitshuffle(&original, &mut shuffled, 2);
+        bitunshuffle(&shuffled, &mut restored, 2);
+        assert_eq!(&restored, &original);
     }
 
     // ── Bytedelta tests ──
