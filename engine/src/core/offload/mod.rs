@@ -151,6 +151,15 @@ impl OffloadKVCache {
         self.preloaded = false;
     }
 
+    /// Re-arm preloaded flag for cross-token buffer retention.
+    /// Safe to call after `get_view()`: attn buffers still hold valid data
+    /// because `get_view()` copies out (does not consume the source).
+    pub fn retain_preload(&mut self) {
+        if self.attn_k_buf.is_some() && self.attn_v_buf.is_some() {
+            self.preloaded = true;
+        }
+    }
+
     /// Allocate or reuse a SharedBuffer of the given size.
     fn reuse_or_alloc_out_buf(
         slot: &mut Option<Arc<SharedBuffer>>,
@@ -312,6 +321,10 @@ impl crate::core::kv_cache::PrefetchableCache for OffloadKVCache {
 
     fn reset_preload(&mut self) {
         self.reset_preload();
+    }
+
+    fn retain_preload(&mut self) {
+        self.retain_preload();
     }
 }
 
@@ -1839,9 +1852,6 @@ mod tests {
                     make_realistic_f16_tensor(1, kv_heads, head_dim, 0x3E00 + (step as u16 * 5));
 
                 for c in caches.iter_mut() {
-                    c.reset_preload();
-                }
-                for c in caches.iter_mut() {
                     c.update(&k_tok, &v_tok).unwrap();
                 }
 
@@ -1911,8 +1921,13 @@ mod tests {
                         simulate_forward();
                         prefetch.record_forward(fwd_t0.elapsed());
 
-                        // Release previous layer
-                        if i > 0 {
+                        // Cross-token retention for first `depth` layers
+                        if i < depth {
+                            unsafe { (*caches_ptr.add(i)).retain_preload() };
+                        }
+
+                        // Release previous layer (skip retained)
+                        if i > 0 && (i - 1) >= depth {
                             unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
                         }
                     }
@@ -1923,8 +1938,8 @@ mod tests {
                         prefetch.record_preload(preload_dur);
                     }
 
-                    // Release last layer
-                    if num_layers >= 1 {
+                    // Release last layer (unless retained)
+                    if num_layers >= 1 && (num_layers - 1) >= depth {
                         caches[num_layers - 1].release_buffers();
                     }
                 });
@@ -2051,8 +2066,13 @@ mod tests {
         println!("╚═══════════════════════════════════════════════════════════════════════════╝\n");
 
         // Correctness assertions:
-        // 1. depth=1 should have 0 skips (each layer preloaded exactly once)
-        assert_eq!(d1_skips, 0, "depth=1 should have no preload skips");
+        // 1. depth=1 with retention: first token preloads layer 0 (no skip),
+        //    subsequent tokens find layer 0 retained (skip). Total skips = decode_steps - 1.
+        assert_eq!(
+            d1_skips,
+            decode_steps - 1,
+            "depth=1 should skip retained preloads on tokens 2+"
+        );
 
         // 2. Active buffers at end should be bounded (not all layers active)
         assert!(
@@ -2068,6 +2088,137 @@ mod tests {
         assert!(
             da_ms < d1_ms * 2.5,
             "adaptive is too slow: {da_ms:.1}ms vs depth=1 {d1_ms:.1}ms"
+        );
+    }
+
+    #[test]
+    fn test_retain_preload_cross_token() {
+        // Verify cross-token retention: retain_preload() after get_view()
+        // allows next token's update() to dual-write, and preload() to skip.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4; // F32
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Token 0: prefill
+        let k0: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let v0: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0];
+        cache
+            .update(
+                &make_f32_tensor_with_data(&k0, 1, kv_heads, head_dim),
+                &make_f32_tensor_with_data(&v0, 1, kv_heads, head_dim),
+            )
+            .unwrap();
+
+        // Preload (first time, loads from store)
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+
+        // get_view resets preloaded
+        let _ = cache.get_view();
+        assert!(!cache.preloaded);
+
+        // retain_preload: re-arms preloaded since buffers still exist
+        cache.retain_preload();
+        assert!(cache.preloaded);
+        assert!(cache.attn_k_buf.is_some());
+        assert!(cache.attn_v_buf.is_some());
+
+        // Token 1: update with preloaded=true → dual-write
+        let k1: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0];
+        let v1: Vec<f32> = vec![50.0, 60.0, 70.0, 80.0];
+        cache
+            .update(
+                &make_f32_tensor_with_data(&k1, 1, kv_heads, head_dim),
+                &make_f32_tensor_with_data(&v1, 1, kv_heads, head_dim),
+            )
+            .unwrap();
+        assert_eq!(cache.current_pos(), 2);
+
+        // preload() should be a no-op (already preloaded)
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+
+        // get_view should return both tokens correctly
+        let (k_view, v_view) = cache.get_view();
+        let k_data = k_view.as_slice::<f32>();
+        let v_data = v_view.as_slice::<f32>();
+        assert_eq!(&k_data[..4], &k0);
+        assert_eq!(&k_data[4..8], &k1);
+        assert_eq!(&v_data[..4], &v0);
+        assert_eq!(&v_data[4..8], &v1);
+    }
+
+    #[test]
+    fn test_retain_preload_depth_decrease() {
+        // When depth decreases, previously retained layers should be released normally.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // Setup: prefill + preload + get_view + retain
+        let k0: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let v0: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0];
+        cache
+            .update(
+                &make_f32_tensor_with_data(&k0, 1, kv_heads, head_dim),
+                &make_f32_tensor_with_data(&v0, 1, kv_heads, head_dim),
+            )
+            .unwrap();
+        cache.preload().unwrap();
+        let _ = cache.get_view();
+        cache.retain_preload();
+        assert!(cache.preloaded);
+
+        // Simulate depth decrease: release_buffers clears retained state
+        cache.release_buffers();
+        assert!(!cache.preloaded);
+        assert!(cache.attn_k_buf.is_none());
+        assert!(cache.attn_v_buf.is_none());
+
+        // preload() should load from store again
+        cache.preload().unwrap();
+        assert!(cache.preloaded);
+        let (k_view, _) = cache.get_view();
+        assert_eq!(k_view.as_slice::<f32>(), &k0);
+    }
+
+    #[test]
+    fn test_retain_preload_guards_none_bufs() {
+        // retain_preload() with no buffers should NOT set preloaded=true.
+        let kv_heads = 1;
+        let head_dim = 4;
+        let token_bytes = kv_heads * head_dim * 4;
+        let store = zram_store::ZramStore::new(token_bytes, 4, 32);
+        let mut cache = OffloadKVCache::new(0, kv_heads, head_dim, DType::F32, 64, Box::new(store));
+
+        // No data, no buffers
+        assert!(!cache.preloaded);
+        assert!(cache.attn_k_buf.is_none());
+        cache.retain_preload();
+        assert!(
+            !cache.preloaded,
+            "retain_preload should not arm without buffers"
+        );
+
+        // After release_buffers, retain should also be safe
+        let k: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
+        let v: Vec<f32> = vec![5.0, 6.0, 7.0, 8.0];
+        cache
+            .update(
+                &make_f32_tensor_with_data(&k, 1, kv_heads, head_dim),
+                &make_f32_tensor_with_data(&v, 1, kv_heads, head_dim),
+            )
+            .unwrap();
+        cache.preload().unwrap();
+        cache.release_buffers();
+        cache.retain_preload();
+        assert!(
+            !cache.preloaded,
+            "retain_preload after release should not arm"
         );
     }
 }

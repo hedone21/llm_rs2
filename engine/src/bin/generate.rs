@@ -2500,10 +2500,9 @@ fn run_svd_offload(
         }
         let gen_input = backend.copy_from(&cpu_gen_input)?;
 
-        // Reset preload flags at token boundary
-        for cache in kv_caches.iter_mut() {
-            cache.reset_preload();
-        }
+        // Preload state managed by forward_into_offload:
+        // - retained layers: retain_preload() keeps preloaded=true
+        // - non-retained layers: release_buffers() sets preloaded=false
 
         let fwd_start = std::time::Instant::now();
         model.forward_into_offload(
@@ -2826,10 +2825,9 @@ fn run_offload(
         }
         let gen_input = backend.copy_from(&cpu_gen_input)?;
 
-        // R-P5: Reset preload flags at token boundary
-        for cache in kv_caches.iter_mut() {
-            cache.reset_preload();
-        }
+        // Preload state managed by forward_into_offload:
+        // - retained layers: retain_preload() keeps preloaded=true
+        // - non-retained layers: release_buffers() sets preloaded=false
 
         let fwd_start = std::time::Instant::now();
         model.forward_into_offload(

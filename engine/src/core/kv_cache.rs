@@ -59,6 +59,14 @@ pub trait PrefetchableCache: KVCacheOps {
 
     /// Reset preloaded flag at token boundary.
     fn reset_preload(&mut self);
+
+    /// Re-arm preloaded state for cross-token buffer retention.
+    ///
+    /// Call after `get_view()` on layers whose buffers should survive the token
+    /// boundary. The next token's `update()` dual-writes into the still-valid
+    /// attn buffers, so `preload()` becomes a no-op (early-return on
+    /// `self.preloaded == true`).
+    fn retain_preload(&mut self) {}
 }
 
 /// KV cache memory layout.

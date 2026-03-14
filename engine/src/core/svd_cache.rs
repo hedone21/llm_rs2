@@ -328,6 +328,14 @@ impl SvdOffloadKVCache {
     pub fn reset_preload(&mut self) {
         self.v_preloaded = false;
     }
+
+    /// Re-arm preloaded flag for cross-token buffer retention.
+    /// K is in-memory (SVD), only V is offloaded.
+    pub fn retain_preload(&mut self) {
+        if self.attn_v_buf.is_some() {
+            self.v_preloaded = true;
+        }
+    }
 }
 
 impl KVCacheOps for SvdOffloadKVCache {
@@ -528,6 +536,10 @@ impl crate::core::kv_cache::PrefetchableCache for SvdOffloadKVCache {
 
     fn reset_preload(&mut self) {
         self.reset_preload();
+    }
+
+    fn retain_preload(&mut self) {
+        self.retain_preload();
     }
 }
 

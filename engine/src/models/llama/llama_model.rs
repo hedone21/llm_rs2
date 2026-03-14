@@ -610,8 +610,14 @@ impl LlamaModel {
                 let fwd_dur = fwd_t0.elapsed();
                 prefetch.record_forward(fwd_dur);
 
-                // Release consumed layer's buffers
-                if i > 0 {
+                // Cross-token retention: keep first `depth` layers' buffers alive
+                // so next token's preload() early-returns (preloaded=true).
+                if i < depth {
+                    current.retain_preload();
+                }
+
+                // Release consumed layer's buffers (skip retained layers)
+                if i > 0 && (i - 1) >= depth {
                     // SAFETY: layer i-1 forward is complete, preload thread (if any) joined
                     unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
                 }
@@ -622,8 +628,8 @@ impl LlamaModel {
                 let _ = handle.join();
             }
 
-            // Release last two layers' buffers
-            if num_layers >= 1 {
+            // Release last layer's buffers (unless retained)
+            if num_layers >= 1 && (num_layers - 1) >= depth {
                 kv_caches[num_layers - 1].release_buffers();
             }
 
