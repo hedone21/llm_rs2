@@ -68,7 +68,7 @@
 ---
 
 ## [P1] ZramStore Blosc 필터 실험: bytedelta + 압축 코덱 비교
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음 (기존 ZramStore + preprocess.rs 위에 구현)
 - **Description**: |
