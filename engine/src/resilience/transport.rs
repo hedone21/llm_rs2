@@ -5,7 +5,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::mpsc;
 
-use super::signal::SystemSignal;
+use llm_shared::{EngineMessage, ManagerMessage};
 
 // ── TransportError ──────────────────────────────────────────
 
@@ -39,75 +39,102 @@ impl From<std::io::Error> for TransportError {
 
 // ── Transport trait ─────────────────────────────────────────
 
-/// Platform-agnostic transport for receiving system signals.
+/// Bidirectional transport for Manager↔Engine communication.
+///
+/// - `recv()` blocks until a `ManagerMessage` arrives (Manager→Engine).
+/// - `send()` writes an `EngineMessage` to the Manager (Engine→Manager).
 pub trait Transport: Send + 'static {
     /// Establish connection to the signal source.
     fn connect(&mut self) -> Result<(), TransportError>;
 
-    /// Receive the next signal (blocking).
-    fn recv(&mut self) -> Result<SystemSignal, TransportError>;
+    /// Receive the next message from Manager (blocking).
+    fn recv(&mut self) -> Result<ManagerMessage, TransportError>;
+
+    /// Send a message to Manager (Engine→Manager).
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), TransportError>;
 
     /// Human-readable name for logging.
     fn name(&self) -> &str;
 }
 
-// ── SignalListener ──────────────────────────────────────────
+// ── MessageLoop ─────────────────────────────────────────────
 
-/// Generic listener that bridges a Transport to an mpsc channel.
-pub struct SignalListener<T: Transport> {
-    transport: T,
-    tx: mpsc::Sender<SystemSignal>,
-}
+/// Bidirectional message loop bridging Transport to mpsc channels.
+///
+/// The reader thread owns the transport and does both recv (blocking) and
+/// send (via try_recv on write queue between blocking recv calls).
+/// The resp_tx channel is used by the executor to queue outgoing messages.
+pub struct MessageLoop;
 
-impl<T: Transport> SignalListener<T> {
-    pub fn new(transport: T, tx: mpsc::Sender<SystemSignal>) -> Self {
-        Self { transport, tx }
+impl MessageLoop {
+    /// Spawn the message loop thread.
+    ///
+    /// Returns channels for the executor:
+    /// - `cmd_rx`: receives ManagerMessages from transport
+    /// - `resp_tx`: sends EngineMessages to transport
+    #[allow(clippy::type_complexity)]
+    pub fn spawn<T: Transport>(
+        mut transport: T,
+    ) -> Result<
+        (
+            mpsc::Receiver<ManagerMessage>,
+            mpsc::Sender<EngineMessage>,
+            std::thread::JoinHandle<()>,
+        ),
+        TransportError,
+    > {
+        transport.connect()?;
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ManagerMessage>();
+        let (resp_tx, resp_rx) = mpsc::channel::<EngineMessage>();
+
+        let transport_name = transport.name().to_string();
+
+        let handle = std::thread::Builder::new()
+            .name(format!("{}-loop", transport_name))
+            .spawn(move || {
+                Self::run_loop(transport, cmd_tx, resp_rx);
+            })
+            .expect("Failed to spawn message loop thread");
+
+        Ok((cmd_rx, resp_tx, handle))
     }
 
-    /// Spawn the listener loop in a dedicated thread.
-    pub fn spawn(self) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || {
-            self.run();
-        })
-    }
-
-    fn run(mut self) {
-        if let Err(e) = self.transport.connect() {
-            log::warn!(
-                "{} transport connect failed: {}. Continuing without resilience.",
-                self.transport.name(),
-                e
-            );
-            return;
-        }
-        log::info!("{} transport connected.", self.transport.name());
-
+    fn run_loop<T: Transport>(
+        mut transport: T,
+        cmd_tx: mpsc::Sender<ManagerMessage>,
+        resp_rx: mpsc::Receiver<EngineMessage>,
+    ) {
         loop {
-            match self.transport.recv() {
-                Ok(signal) => {
-                    log::debug!(
-                        "Received signal via {}: {:?}",
-                        self.transport.name(),
-                        signal
-                    );
-                    if self.tx.send(signal).is_err() {
+            // Drain all pending outgoing messages first
+            while let Ok(msg) = resp_rx.try_recv() {
+                if let Err(e) = transport.send(&msg) {
+                    log::warn!("{} send error: {}. Stopping.", transport.name(), e);
+                    return;
+                }
+            }
+
+            // Blocking recv for incoming messages
+            match transport.recv() {
+                Ok(msg) => {
+                    if cmd_tx.send(msg).is_err() {
                         log::info!(
-                            "Receiver dropped. Stopping {} listener.",
-                            self.transport.name()
+                            "Receiver dropped. Stopping {} message loop.",
+                            transport.name()
                         );
                         break;
                     }
                 }
                 Err(TransportError::ParseError(msg)) => {
-                    log::warn!("{} parse error: {}. Skipping.", self.transport.name(), msg);
+                    log::warn!("{} parse error: {}. Skipping.", transport.name(), msg);
                     continue;
                 }
                 Err(TransportError::Disconnected) => {
-                    log::info!("{} disconnected. Stopping listener.", self.transport.name());
+                    log::info!("{} disconnected. Stopping message loop.", transport.name());
                     break;
                 }
                 Err(e) => {
-                    log::warn!("{} error: {}. Stopping listener.", self.transport.name(), e);
+                    log::warn!("{} error: {}. Stopping message loop.", transport.name(), e);
                     break;
                 }
             }
@@ -117,37 +144,77 @@ impl<T: Transport> SignalListener<T> {
 
 // ── MockTransport ───────────────────────────────────────────
 
-/// Mock transport for testing. Receives signals from a channel or pre-loaded vec.
+/// Mock transport for testing. Bidirectional via channels.
 pub struct MockTransport {
-    rx: mpsc::Receiver<SystemSignal>,
+    rx: mpsc::Receiver<ManagerMessage>,
+    sent: mpsc::Sender<EngineMessage>,
 }
 
-/// Sender handle paired with MockTransport.
+/// Sender handle paired with MockTransport (simulates Manager side).
 pub struct MockSender {
-    tx: mpsc::Sender<SystemSignal>,
+    tx: mpsc::Sender<ManagerMessage>,
 }
 
 impl MockSender {
-    pub fn send(&self, signal: SystemSignal) -> Result<(), mpsc::SendError<SystemSignal>> {
-        self.tx.send(signal)
+    pub fn send(&self, msg: ManagerMessage) -> Result<(), mpsc::SendError<ManagerMessage>> {
+        self.tx.send(msg)
+    }
+}
+
+/// Manager-side handle for bidirectional mock testing.
+pub struct MockManagerEnd {
+    pub tx: mpsc::Sender<ManagerMessage>,
+    pub rx: mpsc::Receiver<EngineMessage>,
+}
+
+impl MockManagerEnd {
+    pub fn send(&self, msg: ManagerMessage) -> Result<(), mpsc::SendError<ManagerMessage>> {
+        self.tx.send(msg)
+    }
+
+    pub fn recv(&self) -> Result<EngineMessage, mpsc::RecvError> {
+        self.rx.recv()
+    }
+
+    pub fn try_recv(&self) -> Result<EngineMessage, mpsc::TryRecvError> {
+        self.rx.try_recv()
     }
 }
 
 impl MockTransport {
-    /// Create a channel-based mock transport.
+    /// Create a channel-based mock transport (unidirectional sender).
     pub fn channel() -> (Self, MockSender) {
         let (tx, rx) = mpsc::channel();
-        (Self { rx }, MockSender { tx })
+        let (sent_tx, _sent_rx) = mpsc::channel();
+        (Self { rx, sent: sent_tx }, MockSender { tx })
     }
 
-    /// Create a mock transport pre-loaded with signals.
-    pub fn from_signals(signals: Vec<SystemSignal>) -> Self {
+    /// Create a bidirectional mock transport.
+    /// Returns (transport, manager_end) where manager_end can send commands and receive responses.
+    pub fn bidirectional() -> (Self, MockManagerEnd) {
+        let (mgr_tx, eng_rx) = mpsc::channel(); // Manager → Engine
+        let (eng_tx, mgr_rx) = mpsc::channel(); // Engine → Manager
+        (
+            Self {
+                rx: eng_rx,
+                sent: eng_tx,
+            },
+            MockManagerEnd {
+                tx: mgr_tx,
+                rx: mgr_rx,
+            },
+        )
+    }
+
+    /// Create a mock transport pre-loaded with ManagerMessages.
+    pub fn from_messages(messages: Vec<ManagerMessage>) -> Self {
         let (tx, rx) = mpsc::channel();
-        for sig in signals {
-            tx.send(sig).unwrap();
+        for msg in messages {
+            tx.send(msg).unwrap();
         }
-        drop(tx); // Will produce Disconnected after all signals consumed
-        Self { rx }
+        drop(tx);
+        let (sent_tx, _sent_rx) = mpsc::channel();
+        Self { rx, sent: sent_tx }
     }
 }
 
@@ -156,8 +223,14 @@ impl Transport for MockTransport {
         Ok(())
     }
 
-    fn recv(&mut self) -> Result<SystemSignal, TransportError> {
+    fn recv(&mut self) -> Result<ManagerMessage, TransportError> {
         self.rx.recv().map_err(|_| TransportError::Disconnected)
+    }
+
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), TransportError> {
+        self.sent
+            .send(msg.clone())
+            .map_err(|_| TransportError::Disconnected)
     }
 
     fn name(&self) -> &str {
@@ -170,26 +243,33 @@ impl Transport for MockTransport {
 /// Maximum message payload size (64KB sanity check).
 const MAX_PAYLOAD_SIZE: u32 = 64 * 1024;
 
-/// Unix domain socket transport.
+/// Unix domain socket transport (bidirectional).
 /// Wire format: `[4 bytes BE u32 length][UTF-8 JSON payload]`
 #[cfg(unix)]
 pub struct UnixSocketTransport {
     path: PathBuf,
-    stream: Option<UnixStream>,
+    reader: Option<UnixStream>,
+    writer: Option<UnixStream>,
 }
 
 #[cfg(unix)]
 impl UnixSocketTransport {
     pub fn new(path: PathBuf) -> Self {
-        Self { path, stream: None }
+        Self {
+            path,
+            reader: None,
+            writer: None,
+        }
     }
 
     /// Create from an already-connected stream (for testing).
     #[cfg(test)]
     pub fn from_stream(stream: UnixStream) -> Self {
+        let writer = stream.try_clone().expect("try_clone failed in test");
         Self {
             path: PathBuf::new(),
-            stream: Some(stream),
+            reader: Some(stream),
+            writer: Some(writer),
         }
     }
 
@@ -202,31 +282,10 @@ impl UnixSocketTransport {
             Err(e) => Err(TransportError::Io(e)),
         }
     }
-}
 
-#[cfg(unix)]
-impl Transport for UnixSocketTransport {
-    fn connect(&mut self) -> Result<(), TransportError> {
-        match UnixStream::connect(&self.path) {
-            Ok(stream) => {
-                self.stream = Some(stream);
-                Ok(())
-            }
-            Err(e) => Err(TransportError::ConnectionFailed(format!(
-                "{}: {}",
-                self.path.display(),
-                e
-            ))),
-        }
-    }
-
-    fn recv(&mut self) -> Result<SystemSignal, TransportError> {
-        let stream = self
-            .stream
-            .as_mut()
-            .ok_or_else(|| TransportError::ConnectionFailed("not connected".into()))?;
-
-        // Read 4-byte length header (big-endian)
+    fn read_message<T: serde::de::DeserializeOwned>(
+        stream: &mut UnixStream,
+    ) -> Result<T, TransportError> {
         let mut len_buf = [0u8; 4];
         Self::read_exact(stream, &mut len_buf)?;
         let len = u32::from_be_bytes(len_buf);
@@ -238,7 +297,6 @@ impl Transport for UnixSocketTransport {
             )));
         }
 
-        // Read JSON payload
         let mut payload = vec![0u8; len as usize];
         Self::read_exact(stream, &mut payload)?;
 
@@ -246,20 +304,81 @@ impl Transport for UnixSocketTransport {
             .map_err(|e| TransportError::ParseError(format!("invalid JSON: {}", e)))
     }
 
+    fn write_message<T: serde::Serialize>(
+        stream: &mut UnixStream,
+        msg: &T,
+    ) -> Result<(), TransportError> {
+        use std::io::Write as _;
+        let json = serde_json::to_vec(msg)
+            .map_err(|e| TransportError::ParseError(format!("serialize error: {}", e)))?;
+        let len = (json.len() as u32).to_be_bytes();
+        stream.write_all(&len)?;
+        stream.write_all(&json)?;
+        stream.flush()?;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Transport for UnixSocketTransport {
+    fn connect(&mut self) -> Result<(), TransportError> {
+        match UnixStream::connect(&self.path) {
+            Ok(stream) => {
+                let writer = stream.try_clone().map_err(TransportError::Io)?;
+                self.reader = Some(stream);
+                self.writer = Some(writer);
+                Ok(())
+            }
+            Err(e) => Err(TransportError::ConnectionFailed(format!(
+                "{}: {}",
+                self.path.display(),
+                e
+            ))),
+        }
+    }
+
+    fn recv(&mut self) -> Result<ManagerMessage, TransportError> {
+        let stream = self
+            .reader
+            .as_mut()
+            .ok_or_else(|| TransportError::ConnectionFailed("not connected".into()))?;
+        Self::read_message(stream)
+    }
+
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), TransportError> {
+        let stream = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| TransportError::ConnectionFailed("not connected".into()))?;
+        Self::write_message(stream, msg)
+    }
+
     fn name(&self) -> &str {
         "UnixSocket"
     }
 }
 
-/// Helper: write a length-prefixed JSON message to a stream.
+/// Helper: write a length-prefixed JSON ManagerMessage to a stream.
 #[cfg(all(unix, test))]
-pub fn write_signal(stream: &mut UnixStream, signal: &SystemSignal) -> std::io::Result<()> {
+pub fn write_manager_message(stream: &mut UnixStream, msg: &ManagerMessage) -> std::io::Result<()> {
     use std::io::Write as _;
-    let json = serde_json::to_vec(signal).unwrap();
+    let json = serde_json::to_vec(msg).unwrap();
     let len = (json.len() as u32).to_be_bytes();
     stream.write_all(&len)?;
     stream.write_all(&json)?;
     stream.flush()
+}
+
+/// Helper: read a length-prefixed JSON EngineMessage from a stream.
+#[cfg(all(unix, test))]
+pub fn read_engine_message(stream: &mut UnixStream) -> std::io::Result<EngineMessage> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf)?;
+    let len = u32::from_be_bytes(len_buf) as usize;
+    let mut payload = vec![0u8; len];
+    stream.read_exact(&mut payload)?;
+    serde_json::from_slice(&payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
 // ── Tests ───────────────────────────────────────────────────
@@ -267,37 +386,52 @@ pub fn write_signal(stream: &mut UnixStream, signal: &SystemSignal) -> std::io::
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resilience::signal::{EnergyReason, Level};
+    use llm_shared::*;
 
-    fn sample_signal() -> SystemSignal {
-        SystemSignal::MemoryPressure {
-            level: Level::Warning,
-            available_bytes: 200_000_000,
-            reclaim_target_bytes: 50_000_000,
-        }
+    fn sample_directive() -> ManagerMessage {
+        ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SetMemoryLevel {
+                level: ResourceLevel::Warning,
+                target_ratio: 0.85,
+                deadline_ms: None,
+            }],
+        })
+    }
+
+    fn sample_capability() -> EngineMessage {
+        EngineMessage::Capability(EngineCapability {
+            available_devices: vec!["cpu".into()],
+            active_device: "cpu".into(),
+            max_kv_tokens: 2048,
+            bytes_per_kv_token: 256,
+            num_layers: 16,
+        })
     }
 
     // ── MockTransport tests ────────────────────────────────
 
     #[test]
-    fn test_mock_from_signals_delivers_all() {
-        let signals = vec![
-            sample_signal(),
-            SystemSignal::ThermalAlert {
-                level: Level::Critical,
-                temperature_mc: 80000,
-                throttling_active: true,
-                throttle_ratio: 0.5,
-            },
+    fn test_mock_from_messages_delivers_all() {
+        let msgs = vec![
+            sample_directive(),
+            ManagerMessage::Directive(EngineDirective {
+                seq_id: 2,
+                commands: vec![EngineCommand::Suspend],
+            }),
         ];
-        let mut transport = MockTransport::from_signals(signals);
+        let mut transport = MockTransport::from_messages(msgs);
         assert!(transport.connect().is_ok());
 
-        let s1 = transport.recv().unwrap();
-        assert_eq!(s1.level(), Level::Warning);
+        let m1 = transport.recv().unwrap();
+        match m1 {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+        }
 
-        let s2 = transport.recv().unwrap();
-        assert_eq!(s2.level(), Level::Critical);
+        let m2 = transport.recv().unwrap();
+        match m2 {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 2),
+        }
 
         assert!(matches!(
             transport.recv(),
@@ -310,9 +444,11 @@ mod tests {
         let (mut transport, sender) = MockTransport::channel();
         assert!(transport.connect().is_ok());
 
-        sender.send(sample_signal()).unwrap();
-        let sig = transport.recv().unwrap();
-        assert_eq!(sig.level(), Level::Warning);
+        sender.send(sample_directive()).unwrap();
+        let msg = transport.recv().unwrap();
+        match msg {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+        }
     }
 
     #[test]
@@ -328,8 +464,59 @@ mod tests {
 
     #[test]
     fn test_mock_connect_always_ok() {
-        let mut transport = MockTransport::from_signals(vec![]);
-        assert!(transport.connect().is_ok());
+        let transport = MockTransport::from_messages(vec![]);
+        assert!(matches!(transport.rx.try_recv(), Err(_)));
+    }
+
+    #[test]
+    fn test_mock_bidirectional() {
+        let (mut transport, mgr) = MockTransport::bidirectional();
+        transport.connect().unwrap();
+
+        // Manager → Engine
+        mgr.send(sample_directive()).unwrap();
+        let msg = transport.recv().unwrap();
+        match msg {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+        }
+
+        // Engine → Manager
+        transport.send(&sample_capability()).unwrap();
+        let resp = mgr.recv().unwrap();
+        assert!(matches!(resp, EngineMessage::Capability(_)));
+    }
+
+    #[test]
+    fn test_mock_bidirectional_multiple_roundtrips() {
+        let (mut transport, mgr) = MockTransport::bidirectional();
+        transport.connect().unwrap();
+
+        for i in 1..=5 {
+            let directive = ManagerMessage::Directive(EngineDirective {
+                seq_id: i,
+                commands: vec![EngineCommand::SetComputeLevel {
+                    level: ResourceLevel::Warning,
+                    target_throughput: 0.7,
+                    deadline_ms: None,
+                }],
+            });
+            mgr.send(directive).unwrap();
+            let msg = transport.recv().unwrap();
+            match msg {
+                ManagerMessage::Directive(d) => assert_eq!(d.seq_id, i),
+            }
+
+            let response = EngineMessage::Response(CommandResponse {
+                seq_id: i,
+                results: vec![CommandResult::Ok],
+            });
+            transport.send(&response).unwrap();
+            let resp = mgr.recv().unwrap();
+            match resp {
+                EngineMessage::Response(r) => assert_eq!(r.seq_id, i),
+                _ => panic!("Expected Response"),
+            }
+        }
     }
 
     // ── UnixSocketTransport tests ──────────────────────────
@@ -337,7 +524,6 @@ mod tests {
     #[cfg(unix)]
     mod unix_tests {
         use super::*;
-        use std::io::Write as _;
         use std::os::unix::net::UnixListener;
 
         fn tmp_socket_path() -> PathBuf {
@@ -361,12 +547,50 @@ mod tests {
             });
 
             let (mut server_stream, _) = listener.accept().unwrap();
-            let sig = sample_signal();
-            write_signal(&mut server_stream, &sig).unwrap();
+            let msg = sample_directive();
+            write_manager_message(&mut server_stream, &msg).unwrap();
             drop(server_stream);
 
             let received = handle.join().unwrap();
-            assert_eq!(received.level(), Level::Warning);
+            match received {
+                ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+            }
+            std::fs::remove_file(&path).ok();
+        }
+
+        #[test]
+        fn test_unix_socket_bidirectional() {
+            let path = tmp_socket_path();
+            let listener = UnixListener::bind(&path).unwrap();
+
+            let path2 = path.clone();
+            let handle = std::thread::spawn(move || {
+                let mut transport = UnixSocketTransport::new(path2);
+                transport.connect().unwrap();
+
+                // Receive directive
+                let msg = transport.recv().unwrap();
+
+                // Send capability back
+                transport.send(&sample_capability()).unwrap();
+
+                msg
+            });
+
+            let (mut server_stream, _) = listener.accept().unwrap();
+
+            // Send directive
+            write_manager_message(&mut server_stream, &sample_directive()).unwrap();
+
+            // Read response
+            let response = read_engine_message(&mut server_stream).unwrap();
+            assert!(matches!(response, EngineMessage::Capability(_)));
+
+            drop(server_stream);
+            let received = handle.join().unwrap();
+            match received {
+                ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+            }
             std::fs::remove_file(&path).ok();
         }
 
@@ -379,32 +603,42 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 let mut transport = UnixSocketTransport::new(path2);
                 transport.connect().unwrap();
-                let s1 = transport.recv().unwrap();
-                let s2 = transport.recv().unwrap();
-                let s3 = transport.recv().unwrap();
-                (s1, s2, s3)
+                let m1 = transport.recv().unwrap();
+                let m2 = transport.recv().unwrap();
+                let m3 = transport.recv().unwrap();
+                (m1, m2, m3)
             });
 
             let (mut server_stream, _) = listener.accept().unwrap();
-            for level in [Level::Normal, Level::Warning, Level::Critical] {
-                let sig = SystemSignal::MemoryPressure {
-                    level,
-                    available_bytes: 1000,
-                    reclaim_target_bytes: 500,
-                };
-                write_signal(&mut server_stream, &sig).unwrap();
+            for seq_id in 1..=3 {
+                let msg = ManagerMessage::Directive(EngineDirective {
+                    seq_id,
+                    commands: vec![EngineCommand::SetMemoryLevel {
+                        level: ResourceLevel::Normal,
+                        target_ratio: 1.0,
+                        deadline_ms: None,
+                    }],
+                });
+                write_manager_message(&mut server_stream, &msg).unwrap();
             }
             drop(server_stream);
 
-            let (s1, s2, s3) = handle.join().unwrap();
-            assert_eq!(s1.level(), Level::Normal);
-            assert_eq!(s2.level(), Level::Warning);
-            assert_eq!(s3.level(), Level::Critical);
+            let (m1, m2, m3) = handle.join().unwrap();
+            match m1 {
+                ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+            }
+            match m2 {
+                ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 2),
+            }
+            match m3 {
+                ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 3),
+            }
             std::fs::remove_file(&path).ok();
         }
 
         #[test]
         fn test_unix_socket_parse_error() {
+            use std::io::Write as _;
             let path = tmp_socket_path();
             let listener = UnixListener::bind(&path).unwrap();
 
@@ -416,7 +650,6 @@ mod tests {
             });
 
             let (mut server_stream, _) = listener.accept().unwrap();
-            // Write valid length + invalid JSON
             let bad_json = b"not json!";
             let len = (bad_json.len() as u32).to_be_bytes();
             server_stream.write_all(&len).unwrap();
@@ -431,6 +664,7 @@ mod tests {
 
         #[test]
         fn test_unix_socket_oversized_rejected() {
+            use std::io::Write as _;
             let path = tmp_socket_path();
             let listener = UnixListener::bind(&path).unwrap();
 
@@ -442,7 +676,6 @@ mod tests {
             });
 
             let (mut server_stream, _) = listener.accept().unwrap();
-            // Write length > 64KB
             let len = (MAX_PAYLOAD_SIZE + 1).to_be_bytes();
             server_stream.write_all(&len).unwrap();
             server_stream.flush().unwrap();
@@ -466,7 +699,7 @@ mod tests {
             });
 
             let (server_stream, _) = listener.accept().unwrap();
-            drop(server_stream); // Close immediately
+            drop(server_stream);
 
             let result = handle.join().unwrap();
             assert!(matches!(result, Err(TransportError::Disconnected)));
@@ -484,102 +717,47 @@ mod tests {
         }
     }
 
-    // ── SignalListener tests ───────────────────────────────
+    // ── MessageLoop tests ──────────────────────────────────
 
     #[test]
-    fn test_listener_forwards_to_channel() {
-        let signals = vec![
-            sample_signal(),
-            SystemSignal::ThermalAlert {
-                level: Level::Critical,
-                temperature_mc: 80000,
-                throttling_active: true,
-                throttle_ratio: 0.5,
-            },
-            SystemSignal::EnergyConstraint {
-                level: Level::Emergency,
-                reason: EnergyReason::BatteryCritical,
-                power_budget_mw: 0,
-            },
+    fn test_message_loop_receives_directives() {
+        let msgs = vec![
+            sample_directive(),
+            ManagerMessage::Directive(EngineDirective {
+                seq_id: 2,
+                commands: vec![EngineCommand::Suspend],
+            }),
         ];
-        let transport = MockTransport::from_signals(signals);
-        let (tx, rx) = mpsc::channel();
-        let listener = SignalListener::new(transport, tx);
-        let handle = listener.spawn();
+        let transport = MockTransport::from_messages(msgs);
 
-        let s1 = rx.recv().unwrap();
-        assert_eq!(s1.level(), Level::Warning);
-        let s2 = rx.recv().unwrap();
-        assert_eq!(s2.level(), Level::Critical);
-        let s3 = rx.recv().unwrap();
-        assert_eq!(s3.level(), Level::Emergency);
+        let (cmd_rx, _resp_tx, _handle) = MessageLoop::spawn(transport).unwrap();
 
-        handle.join().unwrap();
+        let m1 = cmd_rx.recv().unwrap();
+        match m1 {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
+        }
+        let m2 = cmd_rx.recv().unwrap();
+        match m2 {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 2),
+        }
     }
 
     #[test]
-    fn test_listener_survives_parse_errors() {
-        // Custom transport that returns ParseError then Ok then Disconnected
-        struct FlakyTransport {
-            calls: u32,
-        }
-        impl Transport for FlakyTransport {
-            fn connect(&mut self) -> Result<(), TransportError> {
-                Ok(())
-            }
-            fn recv(&mut self) -> Result<SystemSignal, TransportError> {
-                self.calls += 1;
-                match self.calls {
-                    1 => Err(TransportError::ParseError("bad data".into())),
-                    2 => Ok(SystemSignal::MemoryPressure {
-                        level: Level::Warning,
-                        available_bytes: 1000,
-                        reclaim_target_bytes: 500,
-                    }),
-                    _ => Err(TransportError::Disconnected),
-                }
-            }
-            fn name(&self) -> &str {
-                "Flaky"
-            }
+    fn test_message_loop_bidirectional() {
+        let (transport, mgr) = MockTransport::bidirectional();
+
+        let (cmd_rx, _resp_tx, _handle) = MessageLoop::spawn(transport).unwrap();
+
+        // Manager sends directive
+        mgr.send(sample_directive()).unwrap();
+
+        // Engine receives it
+        let msg = cmd_rx.recv().unwrap();
+        match msg {
+            ManagerMessage::Directive(d) => assert_eq!(d.seq_id, 1),
         }
 
-        let (tx, rx) = mpsc::channel();
-        let listener = SignalListener::new(FlakyTransport { calls: 0 }, tx);
-        let handle = listener.spawn();
-
-        // Should receive the one good signal (parse error skipped)
-        let sig = rx.recv().unwrap();
-        assert_eq!(sig.level(), Level::Warning);
-
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_listener_stops_on_disconnect() {
-        let transport = MockTransport::from_signals(vec![sample_signal()]);
-        let (tx, rx) = mpsc::channel();
-        let listener = SignalListener::new(transport, tx);
-        let handle = listener.spawn();
-
-        let _ = rx.recv().unwrap();
-        // Thread should terminate after Disconnected
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn test_listener_stops_when_receiver_dropped() {
-        let (transport, sender) = MockTransport::channel();
-        let (tx, rx) = mpsc::channel();
-        let listener = SignalListener::new(transport, tx);
-        let handle = listener.spawn();
-
-        // Drop receiver — next send by listener should fail
-        drop(rx);
-
-        // Send a signal — listener should detect send failure and stop
-        sender.send(sample_signal()).unwrap();
-
-        handle.join().unwrap();
+        // Drop manager to disconnect, which allows thread to exit
+        drop(mgr);
     }
 }

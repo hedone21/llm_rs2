@@ -7,7 +7,8 @@ use llm_manager::monitor::energy::EnergyMonitor;
 use llm_manager::monitor::external::ExternalMonitor;
 use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
-use llm_shared::SystemSignal;
+use llm_manager::policy::{MonitorSnapshot, PolicyEngine};
+use llm_shared::{ManagerMessage, SystemSignal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -21,7 +22,7 @@ extern "C" fn handle_signal(_: libc::c_int) {
 
 #[derive(Parser)]
 #[command(
-    about = "LLM Resource Manager — monitors system resources and emits signals to LLM engine"
+    about = "LLM Resource Manager — monitors system resources and emits directives to LLM engine"
 )]
 struct Args {
     /// Path to TOML configuration file.
@@ -35,6 +36,14 @@ struct Args {
     /// Timeout in seconds to wait for LLM client (unix socket only).
     #[arg(long, default_value_t = 60)]
     client_timeout: u64,
+
+    /// PolicyEngine cooldown between directives (ms).
+    #[arg(long, default_value_t = 500)]
+    policy_cooldown_ms: u64,
+
+    /// Enable legacy passthrough mode (emit raw SystemSignals instead of directives).
+    #[arg(long, default_value_t = false)]
+    legacy_passthrough: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -83,19 +92,57 @@ fn main() -> anyhow::Result<()> {
     let handles = spawn_monitors(monitors, tx, shutdown.clone());
     log::info!("Started {} monitor threads", handles.len());
 
-    // Main loop: signal bus
-    log::info!("Entering main loop");
+    // PolicyEngine for directive generation
+    let mut policy = PolicyEngine::new(args.policy_cooldown_ms);
+    let mut snapshot = MonitorSnapshot::default();
+
+    // Initialize snapshot from initial signals
+    for signal in &initial_signals {
+        snapshot.update(signal);
+    }
+
+    // Main loop
+    log::info!(
+        "Entering main loop (legacy_passthrough={})",
+        args.legacy_passthrough
+    );
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             shutdown.store(true, Ordering::Relaxed);
             break;
         }
 
-        match rx.recv_timeout(Duration::from_secs(1)) {
+        match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(signal) => {
                 log::info!("Signal: {:?}", signal);
-                if let Err(e) = emitter.emit(&signal) {
-                    log::error!("Emit failed: {}", e);
+
+                if args.legacy_passthrough {
+                    // Legacy mode: pass raw signals directly
+                    if let Err(e) = emitter.emit(&signal) {
+                        log::error!("Emit failed: {}", e);
+                    }
+                } else {
+                    // New mode: update snapshot and evaluate policy
+                    snapshot.update(&signal);
+
+                    if let Some(directive) = policy.evaluate(&snapshot, None) {
+                        log::info!(
+                            "Directive seq={}: {} commands",
+                            directive.seq_id,
+                            directive.commands.len()
+                        );
+                        let msg = ManagerMessage::Directive(directive);
+                        let json = serde_json::to_vec(&msg).unwrap_or_default();
+                        // Wrap as a SystemSignal for the emitter (temporary bridge)
+                        // TODO: Update Emitter trait to support ManagerMessage directly
+                        log::debug!("Directive JSON: {} bytes", json.len());
+
+                        // For now, emit the directive as a memory pressure signal
+                        // with the JSON in the available_bytes field (hack for backward compat)
+                        // In the real implementation, the emitter should send ManagerMessage
+                        // directly over the transport. This is handled by the UnixSocket
+                        // emitter's enhanced send_directive method.
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,

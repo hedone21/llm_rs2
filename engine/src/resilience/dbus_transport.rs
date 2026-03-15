@@ -1,5 +1,6 @@
 use super::signal::{ComputeReason, EnergyReason, Level, RecommendedBackend, SystemSignal};
 use super::transport::{Transport, TransportError};
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage, ResourceLevel};
 
 /// D-Bus well-known name for the LLM resource manager.
 const MANAGER_DEST: &str = "org.llm.Manager1";
@@ -9,10 +10,14 @@ const MANAGER_PATH: &str = "/org/llm/Manager1";
 const MANAGER_IFACE: &str = "org.llm.Manager1";
 
 /// D-Bus transport that connects to `org.llm.Manager1` on the System Bus.
+///
+/// Receives D-Bus signals and converts them to ManagerMessage directives.
+/// Engine→Manager responses are sent as D-Bus method calls (best-effort).
 pub struct DbusTransport {
     conn: Option<zbus::blocking::Connection>,
     proxy: Option<zbus::blocking::Proxy<'static>>,
     signals: Option<Box<dyn Iterator<Item = zbus::Message> + Send>>,
+    next_seq_id: u64,
 }
 
 impl DbusTransport {
@@ -21,7 +26,125 @@ impl DbusTransport {
             conn: None,
             proxy: None,
             signals: None,
+            next_seq_id: 1,
         }
+    }
+
+    /// Convert a legacy SystemSignal to the new ManagerMessage format.
+    fn signal_to_manager_message(&mut self, signal: SystemSignal) -> ManagerMessage {
+        let commands = match signal {
+            SystemSignal::MemoryPressure { level, .. } => {
+                let (res_level, target_ratio) = match level {
+                    Level::Normal => (ResourceLevel::Normal, 1.0),
+                    Level::Warning => (ResourceLevel::Warning, 0.85),
+                    Level::Critical => (ResourceLevel::Critical, 0.50),
+                    Level::Emergency => {
+                        // Emergency maps to Suspend
+                        return ManagerMessage::Directive(EngineDirective {
+                            seq_id: self.next_seq(),
+                            commands: vec![EngineCommand::Suspend],
+                        });
+                    }
+                };
+                vec![EngineCommand::SetMemoryLevel {
+                    level: res_level,
+                    target_ratio,
+                    deadline_ms: None,
+                }]
+            }
+            SystemSignal::ComputeGuidance {
+                level,
+                recommended_backend,
+                ..
+            } => {
+                let (res_level, throughput) = match level {
+                    Level::Normal => (ResourceLevel::Normal, 1.0),
+                    Level::Warning => (ResourceLevel::Warning, 0.7),
+                    Level::Critical => (ResourceLevel::Critical, 0.3),
+                    Level::Emergency => {
+                        return ManagerMessage::Directive(EngineDirective {
+                            seq_id: self.next_seq(),
+                            commands: vec![EngineCommand::Suspend],
+                        });
+                    }
+                };
+                let device = match recommended_backend {
+                    RecommendedBackend::Cpu => "cpu",
+                    RecommendedBackend::Gpu => "gpu",
+                    RecommendedBackend::Any => "any",
+                };
+                vec![
+                    EngineCommand::SetComputeLevel {
+                        level: res_level,
+                        target_throughput: throughput,
+                        deadline_ms: None,
+                    },
+                    EngineCommand::SwitchComputeUnit {
+                        device: device.to_string(),
+                    },
+                ]
+            }
+            SystemSignal::ThermalAlert { level, .. } => match level {
+                Level::Normal => vec![EngineCommand::SetComputeLevel {
+                    level: ResourceLevel::Normal,
+                    target_throughput: 1.0,
+                    deadline_ms: None,
+                }],
+                Level::Warning => vec![
+                    EngineCommand::SetComputeLevel {
+                        level: ResourceLevel::Warning,
+                        target_throughput: 0.7,
+                        deadline_ms: None,
+                    },
+                    EngineCommand::PrepareComputeUnit {
+                        device: "cpu".to_string(),
+                    },
+                ],
+                Level::Critical => vec![
+                    EngineCommand::SetComputeLevel {
+                        level: ResourceLevel::Critical,
+                        target_throughput: 0.3,
+                        deadline_ms: Some(1000),
+                    },
+                    EngineCommand::SwitchComputeUnit {
+                        device: "cpu".to_string(),
+                    },
+                ],
+                Level::Emergency => vec![EngineCommand::Suspend],
+            },
+            SystemSignal::EnergyConstraint { level, .. } => match level {
+                Level::Normal => vec![EngineCommand::SetComputeLevel {
+                    level: ResourceLevel::Normal,
+                    target_throughput: 1.0,
+                    deadline_ms: None,
+                }],
+                Level::Warning => vec![EngineCommand::SwitchComputeUnit {
+                    device: "cpu".to_string(),
+                }],
+                Level::Critical => vec![
+                    EngineCommand::SwitchComputeUnit {
+                        device: "cpu".to_string(),
+                    },
+                    EngineCommand::SetComputeLevel {
+                        level: ResourceLevel::Critical,
+                        target_throughput: 0.3,
+                        deadline_ms: None,
+                    },
+                ],
+                Level::Emergency => vec![EngineCommand::Suspend],
+            },
+        };
+
+        ManagerMessage::Directive(EngineDirective {
+            seq_id: self.next_seq(),
+            commands,
+        })
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let id = self.next_seq_id;
+        self.next_seq_id += 1;
+        id
     }
 }
 
@@ -37,8 +160,6 @@ impl Transport for DbusTransport {
             TransportError::ConnectionFailed(format!("D-Bus signal iterator: {}", e))
         })?;
 
-        // Store connection and proxy to keep them alive.
-        // Use 'static lifetime by leaking the connection (it lives for the process lifetime).
         self.conn = Some(conn);
         self.proxy = Some(proxy);
         self.signals = Some(Box::new(signals));
@@ -47,7 +168,7 @@ impl Transport for DbusTransport {
         Ok(())
     }
 
-    fn recv(&mut self) -> Result<SystemSignal, TransportError> {
+    fn recv(&mut self) -> Result<ManagerMessage, TransportError> {
         let signals = self
             .signals
             .as_mut()
@@ -65,6 +186,18 @@ impl Transport for DbusTransport {
                 None => continue,
             };
 
+            // Try the new JSON-based Directive signal first
+            if member.as_str() == "Directive" {
+                let body = msg.body();
+                let json_str: String = body
+                    .deserialize()
+                    .map_err(|e| TransportError::ParseError(format!("Directive body: {}", e)))?;
+                let directive: ManagerMessage = serde_json::from_str(&json_str)
+                    .map_err(|e| TransportError::ParseError(format!("Directive JSON: {}", e)))?;
+                return Ok(directive);
+            }
+
+            // Legacy signal conversion
             let result = match member.as_str() {
                 "MemoryPressure" => parse_memory_pressure(&msg),
                 "ComputeGuidance" => parse_compute_guidance(&msg),
@@ -76,8 +209,33 @@ impl Transport for DbusTransport {
                 }
             };
 
-            return result.map_err(|e| TransportError::ParseError(format!("{}: {}", member, e)));
+            let signal =
+                result.map_err(|e| TransportError::ParseError(format!("{}: {}", member, e)))?;
+
+            return Ok(self.signal_to_manager_message(signal));
         }
+    }
+
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), TransportError> {
+        let conn = self
+            .conn
+            .as_ref()
+            .ok_or_else(|| TransportError::ConnectionFailed("not connected".into()))?;
+
+        let json = serde_json::to_string(msg)
+            .map_err(|e| TransportError::ParseError(format!("serialize: {}", e)))?;
+
+        // Emit as a D-Bus signal (best-effort, Engine→Manager)
+        conn.emit_signal(
+            Option::<&str>::None,
+            MANAGER_PATH,
+            MANAGER_IFACE,
+            "EngineMessage",
+            &(json,),
+        )
+        .map_err(|e| TransportError::Io(std::io::Error::other(format!("D-Bus emit: {}", e))))?;
+
+        Ok(())
     }
 
     fn name(&self) -> &str {
