@@ -33,8 +33,7 @@ use llm_rs2::resilience::DbusTransport;
 #[cfg(unix)]
 use llm_rs2::resilience::UnixSocketTransport;
 use llm_rs2::resilience::{
-    InferenceContext, ResilienceAction, ResilienceManager, SignalListener, SystemSignal,
-    execute_action,
+    CommandExecutor, EngineCommand, KVSnapshot, ManagerMessage, MessageLoop, ResourceLevel,
 };
 
 #[derive(Parser, Debug)]
@@ -250,15 +249,16 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// KV cache offload mode: none, disk, or zram.
-    /// Offloads KV cache to disk files or compressed memory (lossless).
+    /// KV cache offload mode: none or raw.
+    /// raw: lossless in-memory offload.
     /// Requires --kv-layout seq and --kv-type f16 or f32.
     #[arg(long, default_value = "none")]
     kv_offload: String,
 
-    /// Directory for disk-based offload storage.
-    #[arg(long, default_value = "/tmp/llm_rs2_offload")]
-    offload_dir: String,
+    /// Maximum adaptive prefetch depth for offload KV cache pipeline.
+    /// Higher values use more memory but can hide preload latency.
+    #[arg(long, default_value_t = 4)]
+    max_prefetch_depth: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -415,8 +415,8 @@ fn main() -> anyhow::Result<()> {
             &prompt,
             &args.backend,
             &args.kv_offload,
-            &args.offload_dir,
             &args.kv_type,
+            args.max_prefetch_depth,
         );
     }
 
@@ -492,29 +492,35 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // 5. Experiment schedule + Resilience Manager
+    // 5. Experiment schedule + Command Executor
     let experiment_schedule = if let Some(ref path) = args.experiment_schedule {
         Some(ExperimentSchedule::load(path)?)
     } else {
         None
     };
 
-    let mut experiment_tx: Option<std::sync::mpsc::Sender<SystemSignal>> = None;
-    let mut resilience_manager = if let Some(ref schedule) = experiment_schedule {
+    let mut experiment_tx: Option<std::sync::mpsc::Sender<ManagerMessage>> = None;
+    let heartbeat_interval = std::time::Duration::from_millis(1000);
+    let mut command_executor = if let Some(ref schedule) = experiment_schedule {
         // Experiment mode: internal mpsc channel (no external transport needed)
         let (tx, rx) = std::sync::mpsc::channel();
+        let (resp_tx, _resp_rx) = std::sync::mpsc::channel();
         experiment_tx = Some(tx);
         eprintln!("[Experiment] Mode enabled — schedule: {}", schedule.name);
-        Some(ResilienceManager::new(rx))
+        Some(CommandExecutor::new(
+            rx,
+            resp_tx,
+            args.backend.clone(),
+            heartbeat_interval,
+        ))
     } else if args.enable_resilience {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _listener_handle = match args.resilience_transport.as_str() {
+        let (cmd_rx, resp_tx, _handle) = match args.resilience_transport.as_str() {
             #[cfg(feature = "resilience")]
-            "dbus" => SignalListener::new(DbusTransport::new(), tx).spawn(),
+            "dbus" => MessageLoop::spawn(DbusTransport::new())?,
             #[cfg(unix)]
             s if s.starts_with("unix:") => {
                 let path = std::path::PathBuf::from(&s[5..]);
-                SignalListener::new(UnixSocketTransport::new(path), tx).spawn()
+                MessageLoop::spawn(UnixSocketTransport::new(path))?
             }
             other => {
                 eprintln!("[Resilience] Unknown transport: {}", other);
@@ -522,10 +528,15 @@ fn main() -> anyhow::Result<()> {
             }
         };
         eprintln!(
-            "[Resilience] Manager enabled — transport: {}",
+            "[Resilience] Executor enabled — transport: {}",
             args.resilience_transport
         );
-        Some(ResilienceManager::new(rx))
+        Some(CommandExecutor::new(
+            cmd_rx,
+            resp_tx,
+            args.backend.clone(),
+            heartbeat_interval,
+        ))
     } else {
         None
     };
@@ -1038,66 +1049,67 @@ fn main() -> anyhow::Result<()> {
             }
             forward_ms_values.push(forward_ms);
 
-            // ── Experiment: inject signals at this token position ──
+            // ── Experiment: inject directives at this token position ──
             let mut injected_signals: Vec<String> = Vec::new();
             if let (Some(schedule), Some(tx)) = (&experiment_schedule, &experiment_tx) {
-                for entry in schedule.signals_at(decode_token_index) {
-                    tx.send(entry.signal.clone()).ok();
-                    injected_signals.push(signal_summary(&entry.signal));
+                for entry in schedule.directives_at(decode_token_index) {
+                    let msg = ManagerMessage::Directive(entry.directive.clone());
+                    injected_signals.push(directive_summary(&msg));
+                    tx.send(msg).ok();
                 }
             }
 
-            // ── Resilience checkpoint ─────────────────────────
+            // ── Resilience checkpoint (CommandExecutor) ──────
             let mut action_names: Vec<String> = Vec::new();
-            if let Some(rm) = &mut resilience_manager {
-                let mut suspended = false;
-                let mut reject_new = false;
-                let mut num_tokens = args.num_tokens;
-                let mut ctx = InferenceContext {
-                    max_tokens: &mut num_tokens,
-                    throttle_delay_ms: &mut throttle_delay_ms,
-                    suspended: &mut suspended,
-                    reject_new: &mut reject_new,
+            if let Some(executor) = &mut command_executor {
+                let kv_snap = KVSnapshot {
+                    total_bytes: kv_caches
+                        .iter()
+                        .map(|c| (c.k_buffer.buffer().size() + c.v_buffer.buffer().size()) as u64)
+                        .sum(),
+                    total_tokens: kv_caches[0].current_pos,
+                    capacity: kv_caches[0].capacity(),
+                    protected_prefix: actual_protected_prefix,
                 };
 
-                for action in rm.poll() {
-                    action_names.push(action_summary(&action));
+                let plan = executor.poll(&kv_snap);
+                action_names = plan_summary(&plan);
 
-                    if let ResilienceAction::Evict { target_ratio } = &action {
-                        let effective_ratio =
-                            args.experiment_eviction_ratio.unwrap_or(*target_ratio);
+                if let Some(evict) = &plan.evict {
+                    let effective_ratio =
+                        args.experiment_eviction_ratio.unwrap_or(evict.target_ratio);
 
-                        // ── Score distribution diagnostic (via events system) ──
-                        if let Some(ref acc) = score_accumulator {
-                            let scores = acc.importance_scores();
-                            let cache_pos = kv_caches[0].current_pos;
+                    // ── Score distribution diagnostic (via events system) ──
+                    if let Some(ref acc) = score_accumulator {
+                        let scores = acc.importance_scores();
+                        let cache_pos = kv_caches[0].current_pos;
 
-                            if let Some(snapshot) = events::build_score_snapshot(
-                                scores,
-                                cache_pos,
-                                actual_protected_prefix,
-                                decode_token_index,
-                                10,
-                            ) {
-                                cache_manager
-                                    .event_sink()
-                                    .emit(CacheEvent::ScoreDiagnostic(snapshot));
+                        if let Some(snapshot) = events::build_score_snapshot(
+                            scores,
+                            cache_pos,
+                            actual_protected_prefix,
+                            decode_token_index,
+                            10,
+                        ) {
+                            cache_manager
+                                .event_sink()
+                                .emit(CacheEvent::ScoreDiagnostic(snapshot));
 
-                                // Dump full scores to CSV if experiment output is configured
-                                if let Some(ref out_path) = args.experiment_output {
-                                    let diag_path = format!(
-                                        "{}.scores.csv",
-                                        out_path.trim_end_matches(".jsonl")
-                                    );
-                                    if events::dump_scores_csv(scores, cache_pos, &diag_path)
-                                        .is_ok()
-                                    {
-                                        eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
-                                    }
+                            if let Some(ref out_path) = args.experiment_output {
+                                let diag_path =
+                                    format!("{}.scores.csv", out_path.trim_end_matches(".jsonl"));
+                                if events::dump_scores_csv(scores, cache_pos, &diag_path).is_ok() {
+                                    eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
                                 }
                             }
                         }
+                    }
 
+                    // Warning level = lossless only (currently no-op)
+                    // Critical level = force evict (lossy OK)
+                    if evict.level >= ResourceLevel::Critical
+                        || args.experiment_eviction_ratio.is_some()
+                    {
                         let result = if let Some(ref acc) = score_accumulator {
                             if let Some(head_imp) = acc.head_importance_scores() {
                                 cache_manager.force_evict_with_head_scores(
@@ -1178,14 +1190,18 @@ fn main() -> anyhow::Result<()> {
                             Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
                             _ => {}
                         }
-                    } else {
-                        execute_action(&action, &mut ctx);
                     }
                 }
 
-                args.num_tokens = num_tokens;
+                if let Some(ref _device) = plan.switch_device {
+                    log::warn!(
+                        "[Resilience] SwitchComputeUnit not supported in single-backend mode"
+                    );
+                }
 
-                if suspended {
+                throttle_delay_ms = plan.throttle_delay_ms;
+
+                if plan.suspended {
                     eprintln!("\n[Resilience] Inference suspended by system signal");
                     break;
                 }
@@ -1194,6 +1210,8 @@ fn main() -> anyhow::Result<()> {
                     experiment_total_throttle_ms += throttle_delay_ms;
                     std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
                 }
+
+                executor.on_token_generated();
             }
             // ── End Resilience checkpoint ─────────────────────
 
@@ -1389,25 +1407,59 @@ fn main() -> anyhow::Result<()> {
 
 // ── Experiment helpers ────────────────────────────────────────
 
-fn signal_summary(signal: &SystemSignal) -> String {
-    match signal {
-        SystemSignal::ThermalAlert { level, .. } => format!("Thermal({:?})", level),
-        SystemSignal::MemoryPressure { level, .. } => format!("Memory({:?})", level),
-        SystemSignal::ComputeGuidance { level, .. } => format!("Compute({:?})", level),
-        SystemSignal::EnergyConstraint { level, .. } => format!("Energy({:?})", level),
+fn directive_summary(msg: &ManagerMessage) -> String {
+    match msg {
+        ManagerMessage::Directive(d) => {
+            let cmds: Vec<String> = d.commands.iter().map(command_summary).collect();
+            format!("Directive(seq={}, [{}])", d.seq_id, cmds.join(", "))
+        }
     }
 }
 
-fn action_summary(action: &ResilienceAction) -> String {
-    match action {
-        ResilienceAction::Evict { target_ratio } => format!("Evict({})", target_ratio),
-        ResilienceAction::SwitchBackend { to } => format!("SwitchBackend({:?})", to),
-        ResilienceAction::LimitTokens { max_tokens } => format!("LimitTokens({})", max_tokens),
-        ResilienceAction::Throttle { delay_ms } => format!("Throttle({}ms)", delay_ms),
-        ResilienceAction::Suspend => "Suspend".to_string(),
-        ResilienceAction::RejectNew => "RejectNew".to_string(),
-        ResilienceAction::RestoreDefaults => "RestoreDefaults".to_string(),
+fn command_summary(cmd: &EngineCommand) -> String {
+    match cmd {
+        EngineCommand::SetComputeLevel {
+            level,
+            target_throughput,
+            ..
+        } => {
+            format!("SetCompute({:?}, thr={:.1})", level, target_throughput)
+        }
+        EngineCommand::SwitchComputeUnit { device } => format!("Switch({})", device),
+        EngineCommand::PrepareComputeUnit { device } => format!("Prepare({})", device),
+        EngineCommand::SetMemoryLevel {
+            level,
+            target_ratio,
+            ..
+        } => {
+            format!("SetMem({:?}, ratio={:.2})", level, target_ratio)
+        }
+        EngineCommand::Suspend => "Suspend".to_string(),
+        EngineCommand::Resume => "Resume".to_string(),
     }
+}
+
+fn plan_summary(plan: &llm_rs2::resilience::ExecutionPlan) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Some(ref evict) = plan.evict {
+        names.push(format!(
+            "Evict({:.2}, {:?})",
+            evict.target_ratio, evict.level
+        ));
+    }
+    if let Some(ref dev) = plan.switch_device {
+        names.push(format!("Switch({})", dev));
+    }
+    if plan.throttle_delay_ms > 0 {
+        names.push(format!("Throttle({}ms)", plan.throttle_delay_ms));
+    }
+    if plan.suspended {
+        names.push("Suspend".to_string());
+    }
+    if plan.resumed {
+        names.push("Resume".to_string());
+    }
+    names
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1415,12 +1467,12 @@ fn action_summary(action: &ResilienceAction) -> String {
 // ════════════════════════════════════════════════════════════════
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
-struct KVSnapshot {
+struct EvalKVSnapshot {
     data: Vec<Vec<u8>>, // [layer] = k_bytes ++ v_bytes
     positions: Vec<usize>,
 }
 
-fn snapshot_kv(kv_caches: &[KVCache]) -> KVSnapshot {
+fn snapshot_kv(kv_caches: &[KVCache]) -> EvalKVSnapshot {
     let mut data = Vec::with_capacity(kv_caches.len());
     let mut positions = Vec::with_capacity(kv_caches.len());
     for cache in kv_caches {
@@ -1442,10 +1494,10 @@ fn snapshot_kv(kv_caches: &[KVCache]) -> KVSnapshot {
         data.push(buf);
         positions.push(cache.current_pos);
     }
-    KVSnapshot { data, positions }
+    EvalKVSnapshot { data, positions }
 }
 
-fn restore_kv(kv_caches: &mut [KVCache], snapshot: &KVSnapshot) {
+fn restore_kv(kv_caches: &mut [KVCache], snapshot: &EvalKVSnapshot) {
     for (i, cache) in kv_caches.iter_mut().enumerate() {
         let k_size = cache.k_buffer.buffer().size();
         unsafe {
@@ -2640,13 +2692,12 @@ fn run_offload(
     _prompt: &str,
     _backend_name: &str,
     offload_mode: &str,
-    offload_dir: &str,
     kv_type_str: &str,
+    max_prefetch_depth: usize,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
-    use llm_rs2::core::offload::disk_store::DiskStore;
-    use llm_rs2::core::offload::zram_store::ZramStore;
+    use llm_rs2::core::offload::raw_store::RawStore;
 
     // Validate constraints
     let kv_dtype = match kv_type_str {
@@ -2669,17 +2720,7 @@ fn run_offload(
     let mut kv_caches: Vec<OffloadKVCache> = (0..num_layers)
         .map(|layer_id| {
             let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> = match offload_mode {
-                "disk" => {
-                    let dir = std::path::Path::new(offload_dir);
-                    Box::new(
-                        DiskStore::new(dir, layer_id, token_bytes)
-                            .expect("Failed to create DiskStore"),
-                    )
-                }
-                "zram" => {
-                    let residual_cap = 64;
-                    Box::new(ZramStore::new(token_bytes, kv_dtype.size(), residual_cap))
-                }
+                "raw" => Box::new(RawStore::new(token_bytes)),
                 _ => panic!("Unknown offload mode: {}", offload_mode),
             };
             OffloadKVCache::new(layer_id, kv_heads, head_dim, kv_dtype, max_seq_len, store)
@@ -2808,7 +2849,7 @@ fn run_offload(
     print!("{}", initial_text);
     stdout.flush().ok();
 
-    // === DECODE with per-layer prefetch ===
+    // === DECODE with adaptive prefetch ===
     let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
     let cpu_gen_input = Tensor::new(
         Shape::new(vec![1, 1]),
@@ -2821,6 +2862,9 @@ fn run_offload(
         .get("</s>")
         .copied()
         .unwrap_or(u32::MAX);
+
+    let mut prefetch =
+        llm_rs2::core::offload::prefetch::PrefetchController::new(max_prefetch_depth, num_layers);
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;
@@ -2840,25 +2884,27 @@ fn run_offload(
         }
         let gen_input = backend.copy_from(&cpu_gen_input)?;
 
-        // R-P5: Reset preload flags at token boundary
-        for cache in kv_caches.iter_mut() {
-            cache.reset_preload();
-        }
+        // Preload state managed by forward_into_offload:
+        // - retained layers: retain_preload() keeps preloaded=true
+        // - non-retained layers: release_buffers() sets preloaded=false
 
         let fwd_start = std::time::Instant::now();
-        model.forward_into_offload(LlamaModelForwardArgs {
-            input_tokens: &gen_input,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend,
-            memory: memory.as_ref(),
-            logits_out: &mut logits,
-            x_gen: Some(&mut x_gen),
-            workspace: Some(&mut gen_ws),
-            use_gpu_attn: gpu_attn,
-            score_accumulator: None,
-            profiler: None,
-        })?;
+        model.forward_into_offload(
+            LlamaModelForwardArgs {
+                input_tokens: &gen_input,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                use_gpu_attn: gpu_attn,
+                score_accumulator: None,
+                profiler: None,
+            },
+            &mut prefetch,
+        )?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
 
@@ -2925,6 +2971,13 @@ fn run_offload(
     } else {
         tbt_values.iter().sum::<f64>() / tbt_values.len() as f64
     };
+
+    eprintln!(
+        "[Prefetch] final depth={}, preload_ema={:.0}us, forward_ema={:.0}us",
+        prefetch.depth(),
+        prefetch.preload_ema_us(),
+        prefetch.forward_ema_us(),
+    );
 
     println!("\nDone.");
     println!("TTFT: {:.2} ms", ttft_ms);

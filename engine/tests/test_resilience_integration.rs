@@ -1,189 +1,153 @@
-//! Integration tests for Resilience Manager — generate.rs integration logic.
+//! Integration tests for Command Executor — generate.rs integration logic.
 //!
 //! These tests verify the resilience checkpoint behavior that runs inside
-//! the token generation loop: signal → poll → action → state change.
+//! the token generation loop: directive → poll → execution plan → state change.
 //!
 //! Run with: `cargo test --test test_resilience_integration`
 
 use std::sync::mpsc;
+use std::time::Duration;
 
-use llm_rs2::resilience::signal::{EnergyReason, Level, SystemSignal};
-use llm_rs2::resilience::state::OperatingMode;
-use llm_rs2::resilience::{
-    InferenceContext, MockTransport, ResilienceAction, ResilienceManager, SignalListener,
-    execute_action,
-};
+use llm_rs2::resilience::{CommandExecutor, KVSnapshot, MessageLoop, MockTransport, ResourceLevel};
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineState, ManagerMessage};
 
 // ── Helpers ───────────────────────────────────────────────
 
-fn send(tx: &mpsc::Sender<SystemSignal>, signal: SystemSignal) {
-    tx.send(signal).unwrap();
+fn make_executor() -> (
+    CommandExecutor,
+    mpsc::Sender<ManagerMessage>,
+    mpsc::Receiver<EngineMessage>,
+) {
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (resp_tx, resp_rx) = mpsc::channel();
+    let executor = CommandExecutor::new(
+        cmd_rx,
+        resp_tx,
+        "cpu".to_string(),
+        Duration::from_secs(60), // Long interval to avoid heartbeat noise in tests
+    );
+    (executor, cmd_tx, resp_rx)
 }
 
-fn make_ctx<'a>(
-    num_tokens: &'a mut usize,
-    throttle: &'a mut u64,
-    suspended: &'a mut bool,
-    reject: &'a mut bool,
-) -> InferenceContext<'a> {
-    InferenceContext {
-        max_tokens: num_tokens,
-        throttle_delay_ms: throttle,
-        suspended,
-        reject_new: reject,
+fn empty_snap() -> KVSnapshot {
+    KVSnapshot::default()
+}
+
+fn snap(tokens: usize, capacity: usize, prefix: usize) -> KVSnapshot {
+    KVSnapshot {
+        total_bytes: (tokens * 256) as u64,
+        total_tokens: tokens,
+        capacity,
+        protected_prefix: prefix,
     }
+}
+
+fn send_directive(tx: &mpsc::Sender<ManagerMessage>, seq_id: u64, commands: Vec<EngineCommand>) {
+    tx.send(ManagerMessage::Directive(EngineDirective {
+        seq_id,
+        commands,
+    }))
+    .unwrap();
 }
 
 // ── Test: Eviction flow ──────────────────────────────────
 
 #[test]
 fn test_resilience_eviction_flow() {
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+    let (mut executor, tx, rx) = make_executor();
 
-    // Send MemoryPressure(Critical) → should produce Evict action
-    send(
+    // Send SetMemoryLevel(Critical) → should produce EvictPlan
+    send_directive(
         &tx,
-        SystemSignal::MemoryPressure {
-            level: Level::Critical,
-            available_bytes: 50 * 1024 * 1024,
-            reclaim_target_bytes: 100 * 1024 * 1024,
-        },
+        1,
+        vec![EngineCommand::SetMemoryLevel {
+            level: ResourceLevel::Critical,
+            target_ratio: 0.5,
+            deadline_ms: Some(1000),
+        }],
     );
 
-    let actions = mgr.poll();
+    let plan = executor.poll(&snap(500, 2048, 4));
     assert!(
-        !actions.is_empty(),
-        "Should produce actions for Critical memory"
+        plan.evict.is_some(),
+        "Should produce evict plan for Critical memory"
     );
 
-    // Find the Evict action
-    let evict = actions
-        .iter()
-        .find(|a| matches!(a, ResilienceAction::Evict { .. }));
-    assert!(evict.is_some(), "Should contain an Evict action");
+    let evict = plan.evict.unwrap();
+    assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
+    assert_eq!(evict.level, ResourceLevel::Critical);
 
-    if let Some(ResilienceAction::Evict { target_ratio }) = evict {
-        assert!(
-            *target_ratio > 0.0 && *target_ratio < 1.0,
-            "target_ratio should be between 0 and 1, got {}",
-            target_ratio
-        );
+    // Simulate KV cache eviction (like generate.rs does)
+    let current_pos: usize = 500;
+    let target_len = (current_pos as f32 * evict.target_ratio) as usize;
+    let remove = current_pos.saturating_sub(target_len);
+    assert!(remove > 0, "Should remove some tokens");
 
-        // Simulate KV cache eviction (like generate.rs does)
-        let current_pos: usize = 500;
-        let target_len = (current_pos as f32 * target_ratio) as usize;
-        let remove = current_pos.saturating_sub(target_len);
-        assert!(remove > 0, "Should remove some tokens");
+    let new_pos = current_pos - remove;
+    assert!(
+        new_pos < current_pos,
+        "Position should decrease after eviction"
+    );
 
-        let new_pos = current_pos - remove;
-        assert!(
-            new_pos < current_pos,
-            "Position should decrease after eviction"
-        );
-    }
+    // Verify response was sent
+    let resp = rx.recv().unwrap();
+    assert!(matches!(resp, EngineMessage::Response(_)));
 }
 
 // ── Test: Throttle flow ──────────────────────────────────
 
 #[test]
 fn test_resilience_throttle_flow() {
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+    let (mut executor, tx, _rx) = make_executor();
 
-    // ThermalAlert(Critical) → should produce Throttle
-    send(
+    // SetComputeLevel(Warning) → should produce throttle delay
+    send_directive(
         &tx,
-        SystemSignal::ThermalAlert {
-            level: Level::Critical,
-            temperature_mc: 80000,
-            throttling_active: true,
-            throttle_ratio: 0.5,
-        },
+        1,
+        vec![EngineCommand::SetComputeLevel {
+            level: ResourceLevel::Warning,
+            target_throughput: 0.7,
+            deadline_ms: None,
+        }],
     );
 
-    let actions = mgr.poll();
-    assert!(!actions.is_empty());
-
-    let mut num_tokens = 128usize;
-    let mut throttle_delay_ms = 0u64;
-    let mut suspended = false;
-    let mut reject_new = false;
-    let mut ctx = make_ctx(
-        &mut num_tokens,
-        &mut throttle_delay_ms,
-        &mut suspended,
-        &mut reject_new,
-    );
-
-    for action in &actions {
-        if !matches!(action, ResilienceAction::Evict { .. }) {
-            execute_action(action, &mut ctx);
-        }
-    }
-
+    let plan = executor.poll(&empty_snap());
     assert!(
-        throttle_delay_ms > 0,
+        plan.throttle_delay_ms > 0,
         "Throttle delay should be set, got {}",
-        throttle_delay_ms
+        plan.throttle_delay_ms
     );
-    assert!(!suspended, "Should not be suspended on Warning");
+    assert!(!plan.suspended, "Should not be suspended on Warning");
+    assert_eq!(executor.compute_level(), ResourceLevel::Warning);
 }
 
 // ── Test: Suspend flow ───────────────────────────────────
 
 #[test]
 fn test_resilience_suspend_flow() {
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+    let (mut executor, tx, _rx) = make_executor();
 
-    // EnergyConstraint(Emergency) → should produce Suspend
-    send(
-        &tx,
-        SystemSignal::EnergyConstraint {
-            level: Level::Emergency,
-            reason: EnergyReason::BatteryCritical,
-            power_budget_mw: 0,
-        },
-    );
+    // Suspend command
+    send_directive(&tx, 1, vec![EngineCommand::Suspend]);
 
-    let actions = mgr.poll();
-    assert!(!actions.is_empty());
-    assert_eq!(mgr.mode(), OperatingMode::Suspended);
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.suspended, "Should be suspended after Suspend command");
+    assert_eq!(executor.state(), EngineState::Suspended);
 
-    let mut num_tokens = 128usize;
-    let mut throttle_delay_ms = 0u64;
-    let mut suspended = false;
-    let mut reject_new = false;
-    let mut ctx = make_ctx(
-        &mut num_tokens,
-        &mut throttle_delay_ms,
-        &mut suspended,
-        &mut reject_new,
-    );
-
-    for action in &actions {
-        execute_action(action, &mut ctx);
-    }
-
-    assert!(
-        suspended,
-        "Should be suspended after Emergency energy signal"
-    );
+    // Suspend should override any other plan fields
+    assert!(plan.evict.is_none());
+    assert!(plan.switch_device.is_none());
 }
 
 // ── Test: Disabled resilience is noop ────────────────────
 
 #[test]
 fn test_resilience_disabled_noop() {
-    // When resilience_manager is None, no poll happens.
-    // This test verifies the Option<ResilienceManager> pattern.
-    let resilience_manager: Option<ResilienceManager> = None;
+    // When command_executor is None, no poll happens.
+    let command_executor: Option<CommandExecutor> = None;
 
-    // Simulate the generate.rs pattern
     let mut throttle_delay_ms = 0u64;
-    if let Some(_rm) = &resilience_manager {
-        // This block should never execute
+    if let Some(_ex) = &command_executor {
         throttle_delay_ms = 999;
     }
 
@@ -193,167 +157,103 @@ fn test_resilience_disabled_noop() {
     );
 }
 
-// ── Test: RestoreDefaults clears constraints ─────────────
+// ── Test: Resume clears constraints ──────────────────────
 
 #[test]
-fn test_resilience_restore_defaults_flow() {
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+fn test_resilience_resume_clears_constraints() {
+    let (mut executor, tx, _rx) = make_executor();
 
-    // First: Critical → set throttle
-    send(
+    // First: set to critical
+    send_directive(
         &tx,
-        SystemSignal::ThermalAlert {
-            level: Level::Critical,
-            temperature_mc: 80000,
-            throttling_active: true,
-            throttle_ratio: 0.5,
-        },
+        1,
+        vec![EngineCommand::SetComputeLevel {
+            level: ResourceLevel::Critical,
+            target_throughput: 0.3,
+            deadline_ms: None,
+        }],
     );
+    executor.poll(&empty_snap());
+    assert!(executor.throttle_delay_ms() > 0, "Throttle should be set");
 
-    let actions = mgr.poll();
-    let mut num_tokens = 128usize;
-    let mut throttle_delay_ms = 0u64;
-    let mut suspended = false;
-    let mut reject_new = false;
+    // Then: suspend
+    send_directive(&tx, 2, vec![EngineCommand::Suspend]);
+    executor.poll(&empty_snap());
+    assert_eq!(executor.state(), EngineState::Suspended);
 
-    {
-        let mut ctx = make_ctx(
-            &mut num_tokens,
-            &mut throttle_delay_ms,
-            &mut suspended,
-            &mut reject_new,
-        );
-        for action in &actions {
-            if !matches!(action, ResilienceAction::Evict { .. }) {
-                execute_action(action, &mut ctx);
-            }
-        }
-    }
-    assert!(throttle_delay_ms > 0, "Throttle should be set");
-
-    // Then: all Normal → RestoreDefaults
-    send(
-        &tx,
-        SystemSignal::ThermalAlert {
-            level: Level::Normal,
-            temperature_mc: 40000,
-            throttling_active: false,
-            throttle_ratio: 1.0,
-        },
-    );
-
-    let actions = mgr.poll();
-    {
-        let mut ctx = make_ctx(
-            &mut num_tokens,
-            &mut throttle_delay_ms,
-            &mut suspended,
-            &mut reject_new,
-        );
-        for action in &actions {
-            execute_action(action, &mut ctx);
-        }
-    }
-
-    assert_eq!(
-        throttle_delay_ms, 0,
-        "RestoreDefaults should clear throttle"
-    );
-    assert!(!reject_new, "RestoreDefaults should clear reject_new");
+    // Resume should restore Normal
+    send_directive(&tx, 3, vec![EngineCommand::Resume]);
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.resumed);
+    assert_eq!(executor.state(), EngineState::Running);
+    assert_eq!(executor.compute_level(), ResourceLevel::Normal);
+    assert_eq!(executor.memory_level(), ResourceLevel::Normal);
+    assert_eq!(executor.throttle_delay_ms(), 0);
 }
 
 // ── Test: Channel disconnect is graceful ─────────────────
 
 #[test]
 fn test_resilience_channel_disconnect_graceful() {
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+    let (mut executor, tx, _rx) = make_executor();
 
-    // Send signal then drop sender (simulates listener crash)
-    send(
+    // Send directive then drop sender (simulates transport crash)
+    send_directive(
         &tx,
-        SystemSignal::MemoryPressure {
-            level: Level::Warning,
-            available_bytes: 200 * 1024 * 1024,
-            reclaim_target_bytes: 50 * 1024 * 1024,
-        },
+        1,
+        vec![EngineCommand::SetMemoryLevel {
+            level: ResourceLevel::Warning,
+            target_ratio: 0.85,
+            deadline_ms: None,
+        }],
     );
     drop(tx);
 
-    // First poll: processes buffered signal
-    let actions = mgr.poll();
-    assert!(!actions.is_empty());
-    assert_eq!(mgr.mode(), OperatingMode::Degraded);
+    // First poll: processes buffered directive
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.evict.is_some());
+    assert_eq!(executor.memory_level(), ResourceLevel::Warning);
 
     // Second poll: channel dead, no panic, state preserved
-    let actions = mgr.poll();
-    assert!(actions.is_empty());
-    assert_eq!(mgr.mode(), OperatingMode::Degraded);
-}
-
-// ── Test: LimitTokens takes minimum ──────────────────────
-
-#[test]
-fn test_resilience_limit_tokens_takes_minimum() {
-    let mut num_tokens = 200usize;
-    let mut throttle_delay_ms = 0u64;
-    let mut suspended = false;
-    let mut reject_new = false;
-
-    {
-        let mut ctx = make_ctx(
-            &mut num_tokens,
-            &mut throttle_delay_ms,
-            &mut suspended,
-            &mut reject_new,
-        );
-        execute_action(&ResilienceAction::LimitTokens { max_tokens: 100 }, &mut ctx);
-    }
-    assert_eq!(num_tokens, 100);
-
-    // Applying a higher limit should not increase
-    {
-        let mut ctx = make_ctx(
-            &mut num_tokens,
-            &mut throttle_delay_ms,
-            &mut suspended,
-            &mut reject_new,
-        );
-        execute_action(&ResilienceAction::LimitTokens { max_tokens: 300 }, &mut ctx);
-    }
-    assert_eq!(num_tokens, 100, "Should keep the lower limit");
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.evict.is_none()); // No new commands
+    assert_eq!(executor.memory_level(), ResourceLevel::Warning);
 }
 
 // ── Transport integration tests ──────────────────────────
 
 #[test]
 fn test_mock_transport_e2e() {
-    let signals = vec![
-        SystemSignal::MemoryPressure {
-            level: Level::Warning,
-            available_bytes: 200_000_000,
-            reclaim_target_bytes: 50_000_000,
-        },
-        SystemSignal::ThermalAlert {
-            level: Level::Critical,
-            temperature_mc: 80000,
-            throttling_active: true,
-            throttle_ratio: 0.5,
-        },
+    let messages = vec![
+        ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SetMemoryLevel {
+                level: ResourceLevel::Warning,
+                target_ratio: 0.85,
+                deadline_ms: None,
+            }],
+        }),
+        ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::SetComputeLevel {
+                level: ResourceLevel::Critical,
+                target_throughput: 0.3,
+                deadline_ms: Some(1000),
+            }],
+        }),
     ];
-    let transport = MockTransport::from_signals(signals);
-    let (tx, rx) = mpsc::channel();
-    let handle = SignalListener::new(transport, tx).spawn();
+    let transport = MockTransport::from_messages(messages);
+    let (cmd_rx, resp_tx, _handle) = MessageLoop::spawn(transport).unwrap();
 
-    let mut mgr = ResilienceManager::new(rx);
+    let mut executor =
+        CommandExecutor::new(cmd_rx, resp_tx, "cpu".to_string(), Duration::from_secs(60));
 
-    // Wait for listener thread to send signals
-    handle.join().unwrap();
+    // Wait for MessageLoop to forward messages
+    std::thread::sleep(Duration::from_millis(50));
 
-    let actions = mgr.poll();
+    let plan = executor.poll(&snap(500, 2048, 4));
     assert!(
-        !actions.is_empty(),
+        plan.evict.is_some() || plan.throttle_delay_ms > 0,
         "Should have actions from mock transport pipeline"
     );
 }
@@ -361,7 +261,8 @@ fn test_mock_transport_e2e() {
 #[cfg(unix)]
 #[test]
 fn test_unix_socket_e2e() {
-    use llm_rs2::resilience::UnixSocketTransport;
+    use llm_rs2::resilience::{Transport, UnixSocketTransport};
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
 
     let path = std::env::temp_dir().join(format!(
@@ -374,265 +275,178 @@ fn test_unix_socket_e2e() {
     let listener = UnixListener::bind(&path).unwrap();
 
     let path2 = path.clone();
-    let (tx, rx) = mpsc::channel();
-    let handle = std::thread::spawn(move || {
-        let transport = UnixSocketTransport::new(path2);
-        SignalListener::new(transport, tx).spawn().join().unwrap();
+    let (cmd_tx, cmd_rx) = mpsc::channel();
+    let (resp_tx, _resp_rx) = mpsc::channel();
+
+    std::thread::spawn(move || {
+        let mut transport = UnixSocketTransport::new(path2);
+        if transport.connect().is_err() {
+            return;
+        }
+        loop {
+            match transport.recv() {
+                Ok(msg) => {
+                    if cmd_tx.send(msg).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
     });
 
     let (mut server_stream, _) = listener.accept().unwrap();
-    let sig = SystemSignal::MemoryPressure {
-        level: Level::Critical,
-        available_bytes: 50_000_000,
-        reclaim_target_bytes: 100_000_000,
-    };
-    // Write length-prefixed JSON
-    let json = serde_json::to_vec(&sig).unwrap();
-    use std::io::Write;
+    let msg = ManagerMessage::Directive(EngineDirective {
+        seq_id: 1,
+        commands: vec![EngineCommand::SetMemoryLevel {
+            level: ResourceLevel::Critical,
+            target_ratio: 0.5,
+            deadline_ms: None,
+        }],
+    });
+    let json = serde_json::to_vec(&msg).unwrap();
     let len = (json.len() as u32).to_be_bytes();
     server_stream.write_all(&len).unwrap();
     server_stream.write_all(&json).unwrap();
     server_stream.flush().unwrap();
     drop(server_stream);
 
-    let mut mgr = ResilienceManager::new(rx);
-    handle.join().unwrap();
+    let mut executor =
+        CommandExecutor::new(cmd_rx, resp_tx, "cpu".to_string(), Duration::from_secs(60));
 
-    let actions = mgr.poll();
+    std::thread::sleep(Duration::from_millis(100));
+
+    let plan = executor.poll(&snap(500, 2048, 4));
     assert!(
-        !actions.is_empty(),
-        "Should have actions from unix socket pipeline"
+        plan.evict.is_some(),
+        "Should have evict plan from unix socket pipeline"
     );
     std::fs::remove_file(&path).ok();
 }
 
-#[test]
-fn test_transport_failure_graceful() {
-    // Create a transport that fails to connect (non-existent socket path)
-    // The listener should exit gracefully and the manager should return empty polls.
-    let (tx, rx) = mpsc::channel();
-
-    #[cfg(unix)]
-    {
-        use llm_rs2::resilience::UnixSocketTransport;
-        let transport = UnixSocketTransport::new(std::path::PathBuf::from(
-            "/tmp/nonexistent_llm_e2e_test.sock",
-        ));
-        let handle = SignalListener::new(transport, tx).spawn();
-        handle.join().unwrap();
-    }
-
-    #[cfg(not(unix))]
-    {
-        drop(tx);
-    }
-
-    let mut mgr = ResilienceManager::new(rx);
-    let actions = mgr.poll();
-    assert!(
-        actions.is_empty(),
-        "Failed transport should produce no actions"
-    );
-}
-
-// ── Extended L2 tests ───────────────────────────────────
+// ── Test: Superseding directives ─────────────────────────
 
 #[test]
-fn test_resilience_multiple_signals_simultaneous() {
-    // Memory(Warning) + Thermal(Critical) simultaneously → conflict resolution
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+fn test_resilience_superseding_directives() {
+    let (mut executor, tx, _rx) = make_executor();
 
-    send(
+    // Memory Warning, then Memory Critical in quick succession
+    send_directive(
         &tx,
-        SystemSignal::MemoryPressure {
-            level: Level::Warning,
-            available_bytes: 100_000_000,
-            reclaim_target_bytes: 50_000_000,
-        },
+        1,
+        vec![EngineCommand::SetMemoryLevel {
+            level: ResourceLevel::Warning,
+            target_ratio: 0.85,
+            deadline_ms: None,
+        }],
     );
-    send(
+    send_directive(
         &tx,
-        SystemSignal::ThermalAlert {
-            level: Level::Critical,
-            temperature_mc: 80000,
-            throttling_active: true,
-            throttle_ratio: 0.5,
-        },
+        2,
+        vec![EngineCommand::SetMemoryLevel {
+            level: ResourceLevel::Critical,
+            target_ratio: 0.5,
+            deadline_ms: None,
+        }],
     );
 
-    let actions = mgr.poll();
-    assert!(
-        !actions.is_empty(),
-        "Should produce actions from both signals"
-    );
-    assert_eq!(mgr.mode(), OperatingMode::Minimal);
-
-    // Should have both eviction and throttle actions
-    let has_evict = actions
-        .iter()
-        .any(|a| matches!(a, ResilienceAction::Evict { .. }));
-    let has_throttle = actions
-        .iter()
-        .any(|a| matches!(a, ResilienceAction::Throttle { .. }));
-    assert!(has_evict, "Memory(Warning) should produce Evict action");
-    assert!(
-        has_throttle,
-        "Thermal(Critical) should produce Throttle action"
-    );
+    let plan = executor.poll(&empty_snap());
+    // The second (more severe) should supersede
+    let evict = plan.evict.unwrap();
+    assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
+    assert_eq!(evict.level, ResourceLevel::Critical);
 }
+
+// ── Test: Multi-domain directives ────────────────────────
 
 #[test]
-fn test_resilience_eviction_plus_throttle_execution() {
-    // Both Evict and Throttle actions should be executable in sequence
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+fn test_resilience_multi_domain_directive() {
+    let (mut executor, tx, _rx) = make_executor();
 
-    send(
+    // Single directive with both compute and memory commands
+    send_directive(
         &tx,
-        SystemSignal::MemoryPressure {
-            level: Level::Critical,
-            available_bytes: 30_000_000,
-            reclaim_target_bytes: 100_000_000,
-        },
+        1,
+        vec![
+            EngineCommand::SetComputeLevel {
+                level: ResourceLevel::Warning,
+                target_throughput: 0.7,
+                deadline_ms: None,
+            },
+            EngineCommand::SetMemoryLevel {
+                level: ResourceLevel::Critical,
+                target_ratio: 0.5,
+                deadline_ms: Some(1000),
+            },
+        ],
     );
-    send(
-        &tx,
-        SystemSignal::ThermalAlert {
-            level: Level::Critical,
-            temperature_mc: 80000,
-            throttling_active: true,
-            throttle_ratio: 0.5,
-        },
-    );
 
-    let actions = mgr.poll();
-
-    let mut num_tokens = 500usize;
-    let mut throttle = 0u64;
-    let mut suspended = false;
-    let mut reject = false;
-
-    for action in &actions {
-        match action {
-            ResilienceAction::Evict { target_ratio } => {
-                assert!(*target_ratio > 0.0 && *target_ratio < 1.0);
-            }
-            _ => {
-                let mut ctx = make_ctx(&mut num_tokens, &mut throttle, &mut suspended, &mut reject);
-                execute_action(action, &mut ctx);
-            }
-        }
-    }
-
-    assert!(
-        throttle > 0,
-        "Throttle should be set after ThermalAlert(Critical)"
-    );
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.evict.is_some(), "Should have evict plan");
+    assert!(plan.throttle_delay_ms > 0, "Should have throttle");
 }
+
+// ── Test: Suspend overrides everything ───────────────────
 
 #[test]
-fn test_resilience_rapid_state_transitions() {
-    // Normal → Emergency → Normal → Critical — verify state recovery
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+fn test_resilience_suspend_overrides_all() {
+    let (mut executor, tx, _rx) = make_executor();
 
-    // 1. Emergency → Suspended mode
-    send(
+    // Memory + Compute + Suspend in one directive
+    send_directive(
         &tx,
-        SystemSignal::EnergyConstraint {
-            level: Level::Emergency,
-            reason: EnergyReason::BatteryCritical,
-            power_budget_mw: 500,
-        },
-    );
-    let actions = mgr.poll();
-    assert_eq!(mgr.mode(), OperatingMode::Suspended);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, ResilienceAction::Suspend)),
-        "Emergency should produce Suspend"
+        1,
+        vec![
+            EngineCommand::SetMemoryLevel {
+                level: ResourceLevel::Critical,
+                target_ratio: 0.5,
+                deadline_ms: None,
+            },
+            EngineCommand::SwitchComputeUnit {
+                device: "gpu".to_string(),
+            },
+            EngineCommand::Suspend,
+        ],
     );
 
-    // 2. Back to Normal → RestoreDefaults
-    send(
-        &tx,
-        SystemSignal::EnergyConstraint {
-            level: Level::Normal,
-            reason: EnergyReason::Charging,
-            power_budget_mw: 15000,
-        },
-    );
-    let actions = mgr.poll();
-    assert_eq!(mgr.mode(), OperatingMode::Normal);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, ResilienceAction::RestoreDefaults)),
-        "Normal should produce RestoreDefaults"
-    );
-
-    // 3. Critical → Minimal mode (not suspended)
-    send(
-        &tx,
-        SystemSignal::MemoryPressure {
-            level: Level::Critical,
-            available_bytes: 30_000_000,
-            reclaim_target_bytes: 100_000_000,
-        },
-    );
-    let actions = mgr.poll();
-    assert_eq!(mgr.mode(), OperatingMode::Minimal);
-    assert!(
-        actions
-            .iter()
-            .any(|a| matches!(a, ResilienceAction::Evict { .. })),
-        "Critical memory should produce Evict"
-    );
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, ResilienceAction::Suspend)),
-        "Critical should NOT suspend"
-    );
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.suspended, "Suspend should be set");
+    assert!(plan.evict.is_none(), "Suspend should clear evict");
+    assert!(plan.switch_device.is_none(), "Suspend should clear switch");
 }
+
+// ── Test: Rapid signal buffering ─────────────────────────
 
 #[test]
 fn test_resilience_signal_buffering() {
-    // Send 50 signals rapidly, verify no performance degradation or panics
-    let (tx, rx) = mpsc::channel();
-    let mut mgr = ResilienceManager::new(rx);
+    let (mut executor, tx, _rx) = make_executor();
 
-    for i in 0..51 {
-        let level = match i % 4 {
-            0 => Level::Normal,
-            1 => Level::Warning,
-            2 => Level::Critical,
-            _ => Level::Emergency,
+    // Send 50 directives rapidly
+    for i in 0..50 {
+        let level = match i % 3 {
+            0 => ResourceLevel::Normal,
+            1 => ResourceLevel::Warning,
+            _ => ResourceLevel::Critical,
         };
-        send(
+        send_directive(
             &tx,
-            SystemSignal::MemoryPressure {
+            i + 1,
+            vec![EngineCommand::SetMemoryLevel {
                 level,
-                available_bytes: 100_000_000,
-                reclaim_target_bytes: 50_000_000,
-            },
+                target_ratio: match level {
+                    ResourceLevel::Normal => 1.0,
+                    ResourceLevel::Warning => 0.85,
+                    ResourceLevel::Critical => 0.5,
+                },
+                deadline_ms: None,
+            }],
         );
     }
 
     // poll() should drain all without panic
-    let actions = mgr.poll();
-    // Last signal: i=50, 50%4=2 → Critical → Minimal
-    assert_eq!(
-        mgr.mode(),
-        OperatingMode::Minimal,
-        "After 51 signals ending on Critical, mode should be Minimal"
-    );
-    // Actions should be resolved (not 50 separate actions)
-    assert!(
-        actions.len() < 50,
-        "Conflict resolution should merge actions: got {}",
-        actions.len()
-    );
+    let plan = executor.poll(&empty_snap());
+    // Last directive: i=49, 49%3=1 → Warning
+    assert_eq!(executor.memory_level(), ResourceLevel::Warning);
+    // Should have an evict plan from the last superseding command
+    assert!(plan.evict.is_some());
 }

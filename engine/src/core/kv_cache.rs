@@ -46,6 +46,29 @@ pub trait KVCacheOps: Send {
     fn get_view(&mut self) -> (Tensor, Tensor);
 }
 
+/// Extension trait for KV caches that support prefetch pipelines.
+///
+/// Implementors: `OffloadKVCache`.
+/// Used by `forward_into_offload` to overlap I/O with compute.
+pub trait PrefetchableCache: KVCacheOps {
+    /// Pre-load data from external storage into memory buffers.
+    fn preload(&mut self) -> Result<()>;
+
+    /// Release memory buffers to free RAM (only 2 layers active at once).
+    fn release_buffers(&mut self);
+
+    /// Reset preloaded flag at token boundary.
+    fn reset_preload(&mut self);
+
+    /// Re-arm preloaded state for cross-token buffer retention.
+    ///
+    /// Call after `get_view()` on layers whose buffers should survive the token
+    /// boundary. The next token's `update()` dual-writes into the still-valid
+    /// attn buffers, so `preload()` becomes a no-op (early-return on
+    /// `self.preloaded == true`).
+    fn retain_preload(&mut self) {}
+}
+
 /// KV cache memory layout.
 ///
 /// - `SeqMajor`: `[batch, seq_pos, kv_heads, head_dim]` — positions contiguous across heads.

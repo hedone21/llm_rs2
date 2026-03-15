@@ -16,10 +16,7 @@ use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
-use llm_rs2::resilience::signal::RecommendedBackend;
-use llm_rs2::resilience::{
-    InferenceContext, ResilienceAction, ResilienceManager, SignalListener, execute_action,
-};
+use llm_rs2::resilience::{CommandExecutor, KVSnapshot, MessageLoop, ResourceLevel};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -247,7 +244,7 @@ fn main() -> anyhow::Result<()> {
         .build_global()
         .unwrap();
 
-    let mut args = Args::parse();
+    let args = Args::parse();
     let model_path = &args.model_path;
 
     println!("[Hybrid] Starting hybrid generation...");
@@ -380,16 +377,16 @@ fn main() -> anyhow::Result<()> {
     // Sliding uses auto-eviction after each forward pass.
     let _auto_eviction = args.eviction_policy == "sliding";
 
-    // Resilience Manager (optional)
-    let mut resilience_manager = if args.enable_resilience {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let _listener_handle = match args.resilience_transport.as_str() {
+    // Command Executor (optional)
+    let heartbeat_interval = std::time::Duration::from_millis(1000);
+    let mut command_executor = if args.enable_resilience {
+        let (cmd_rx, resp_tx, _handle) = match args.resilience_transport.as_str() {
             #[cfg(feature = "resilience")]
-            "dbus" => SignalListener::new(DbusTransport::new(), tx).spawn(),
+            "dbus" => MessageLoop::spawn(DbusTransport::new())?,
             #[cfg(unix)]
             s if s.starts_with("unix:") => {
                 let path = std::path::PathBuf::from(&s[5..]);
-                SignalListener::new(UnixSocketTransport::new(path), tx).spawn()
+                MessageLoop::spawn(UnixSocketTransport::new(path))?
             }
             other => {
                 eprintln!("[Hybrid/Resilience] Unknown transport: {}", other);
@@ -397,13 +394,19 @@ fn main() -> anyhow::Result<()> {
             }
         };
         eprintln!(
-            "[Hybrid/Resilience] Manager enabled — transport: {}",
+            "[Hybrid/Resilience] Executor enabled — transport: {}",
             args.resilience_transport
         );
-        Some(ResilienceManager::new(rx))
+        Some(CommandExecutor::new(
+            cmd_rx,
+            resp_tx,
+            "cpu".to_string(), // Will be updated when is_gpu is determined
+            heartbeat_interval,
+        ))
     } else {
         None
     };
+    #[allow(unused_assignments)]
     let mut throttle_delay_ms: u64 = 0;
 
     let mut tokens_generated = Vec::new();
@@ -613,129 +616,128 @@ fn main() -> anyhow::Result<()> {
             profiler: None,
         })?;
 
-        // ── Resilience checkpoint ─────────────────────────
-        if let Some(rm) = &mut resilience_manager {
-            let mut suspended = false;
-            let mut reject_new = false;
-            let mut num_tokens = args.num_tokens;
-            let mut ctx = InferenceContext {
-                max_tokens: &mut num_tokens,
-                throttle_delay_ms: &mut throttle_delay_ms,
-                suspended: &mut suspended,
-                reject_new: &mut reject_new,
+        // ── Resilience checkpoint (CommandExecutor) ──────
+        if let Some(executor) = &mut command_executor {
+            let kv_snap = KVSnapshot {
+                total_bytes: kv_caches
+                    .iter()
+                    .map(|c| (c.k_buffer.buffer().size() + c.v_buffer.buffer().size()) as u64)
+                    .sum(),
+                total_tokens: kv_caches[0].current_pos,
+                capacity: kv_caches[0].capacity(),
+                protected_prefix: actual_protected_prefix,
             };
 
-            for action in rm.poll() {
-                match &action {
-                    ResilienceAction::Evict { target_ratio } => {
-                        // Use policy-aware eviction via CacheManager.
-                        let result = if let Some(ref acc) = score_accumulator {
-                            cache_manager.force_evict_with_scores(
-                                &mut kv_caches,
-                                *target_ratio,
-                                acc.importance_scores(),
-                            )
-                        } else {
-                            cache_manager.force_evict(&mut kv_caches, *target_ratio)
-                        };
-                        match result {
-                            Ok(r) if r.evicted => {
-                                eprintln!(
-                                    "[Hybrid/Resilience] Evicted {} tokens (pos: {} → {})",
-                                    r.tokens_removed,
-                                    r.new_pos + r.tokens_removed,
-                                    r.new_pos
-                                );
-                                if let Some(ref mut acc) = score_accumulator {
-                                    acc.reset();
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[Hybrid/Resilience] Eviction error: {}", e)
-                            }
-                            _ => {}
+            let plan = executor.poll(&kv_snap);
+
+            if let Some(evict) = &plan.evict
+                && evict.level >= ResourceLevel::Critical
+            {
+                let result = if let Some(ref acc) = score_accumulator {
+                    cache_manager.force_evict_with_scores(
+                        &mut kv_caches,
+                        evict.target_ratio,
+                        acc.importance_scores(),
+                    )
+                } else {
+                    cache_manager.force_evict(&mut kv_caches, evict.target_ratio)
+                };
+                match result {
+                    Ok(r) if r.evicted => {
+                        eprintln!(
+                            "[Hybrid/Resilience] Evicted {} tokens (pos: {} → {})",
+                            r.tokens_removed,
+                            r.new_pos + r.tokens_removed,
+                            r.new_pos
+                        );
+                        if let Some(ref mut acc) = score_accumulator {
+                            acc.reset();
                         }
                     }
-                    ResilienceAction::SwitchBackend { to } => match to {
-                        RecommendedBackend::Cpu if is_gpu => {
-                            eprintln!(
-                                "[Hybrid/Resilience] Switching GPU → CPU at token {}",
-                                start_pos
-                            );
-                            migrate_kv_caches(
-                                &mut kv_caches,
-                                &gpu_backend,
-                                &cpu_backend,
-                                &cpu_backend,
-                                &cpu_memory,
-                                &cpu_memory,
-                                kv_heads,
-                                head_dim,
-                                max_seq_len,
-                                false,
-                            )?;
-
-                            // 2. Switch Backend
-                            current_backend = cpu_backend.clone();
-
-                            // 3. Re-allocate Logits & Workspace on CPU
-                            let logits_cpu_buf = cpu_memory.alloc(vocab_size * 4, DType::F32)?;
-                            logits = Tensor::new(
-                                Shape::new(vec![1, 1, vocab_size]),
-                                logits_cpu_buf,
-                                cpu_backend.clone(),
-                            );
-                            let (new_x_gen, new_ws) =
-                                setup_workspace(&cpu_backend, cpu_memory.as_ref())?;
-                            _x_gen = Some(new_x_gen);
-                            _gen_ws = Some(new_ws);
-
-                            is_gpu = false;
-                            eprintln!("[Hybrid/Resilience] Switched to CPU successfully.");
-                        }
-                        RecommendedBackend::Gpu if !is_gpu => {
-                            eprintln!(
-                                "[Hybrid/Resilience] Switching CPU → GPU at token {}",
-                                start_pos
-                            );
-                            migrate_kv_caches(
-                                &mut kv_caches,
-                                &cpu_backend,
-                                &gpu_backend,
-                                &cpu_backend,
-                                &cpu_memory,
-                                &gpu_memory,
-                                kv_heads,
-                                head_dim,
-                                max_seq_len,
-                                true,
-                            )?;
-
-                            current_backend = gpu_backend.clone();
-
-                            let logits_gpu_buf = gpu_memory.alloc(vocab_size * 4, DType::F32)?;
-                            logits = Tensor::new(
-                                Shape::new(vec![1, 1, vocab_size]),
-                                logits_gpu_buf,
-                                gpu_backend.clone(),
-                            );
-                            let (new_x_gen, new_ws) =
-                                setup_workspace(&gpu_backend, gpu_memory.as_ref())?;
-                            _x_gen = Some(new_x_gen);
-                            _gen_ws = Some(new_ws);
-
-                            is_gpu = true;
-                            eprintln!("[Hybrid/Resilience] Switched to GPU successfully.");
-                        }
-                        _ => {} // Already on requested backend
-                    },
-                    _ => execute_action(&action, &mut ctx),
+                    Err(e) => {
+                        eprintln!("[Hybrid/Resilience] Eviction error: {}", e)
+                    }
+                    _ => {}
                 }
             }
 
-            args.num_tokens = num_tokens;
+            if let Some(ref device) = plan.switch_device {
+                match device.as_str() {
+                    "cpu" if is_gpu => {
+                        eprintln!(
+                            "[Hybrid/Resilience] Switching GPU → CPU at token {}",
+                            start_pos
+                        );
+                        migrate_kv_caches(
+                            &mut kv_caches,
+                            &gpu_backend,
+                            &cpu_backend,
+                            &cpu_backend,
+                            &cpu_memory,
+                            &cpu_memory,
+                            kv_heads,
+                            head_dim,
+                            max_seq_len,
+                            false,
+                        )?;
 
-            if suspended {
+                        current_backend = cpu_backend.clone();
+
+                        let logits_cpu_buf = cpu_memory.alloc(vocab_size * 4, DType::F32)?;
+                        logits = Tensor::new(
+                            Shape::new(vec![1, 1, vocab_size]),
+                            logits_cpu_buf,
+                            cpu_backend.clone(),
+                        );
+                        let (new_x_gen, new_ws) =
+                            setup_workspace(&cpu_backend, cpu_memory.as_ref())?;
+                        _x_gen = Some(new_x_gen);
+                        _gen_ws = Some(new_ws);
+
+                        is_gpu = false;
+                        eprintln!("[Hybrid/Resilience] Switched to CPU successfully.");
+                    }
+                    "gpu" | "opencl" if !is_gpu => {
+                        eprintln!(
+                            "[Hybrid/Resilience] Switching CPU → GPU at token {}",
+                            start_pos
+                        );
+                        migrate_kv_caches(
+                            &mut kv_caches,
+                            &cpu_backend,
+                            &gpu_backend,
+                            &cpu_backend,
+                            &cpu_memory,
+                            &gpu_memory,
+                            kv_heads,
+                            head_dim,
+                            max_seq_len,
+                            true,
+                        )?;
+
+                        current_backend = gpu_backend.clone();
+
+                        let logits_gpu_buf = gpu_memory.alloc(vocab_size * 4, DType::F32)?;
+                        logits = Tensor::new(
+                            Shape::new(vec![1, 1, vocab_size]),
+                            logits_gpu_buf,
+                            gpu_backend.clone(),
+                        );
+                        let (new_x_gen, new_ws) =
+                            setup_workspace(&gpu_backend, gpu_memory.as_ref())?;
+                        _x_gen = Some(new_x_gen);
+                        _gen_ws = Some(new_ws);
+
+                        is_gpu = true;
+                        eprintln!("[Hybrid/Resilience] Switched to GPU successfully.");
+                    }
+                    _ => {} // Already on requested backend
+                }
+            }
+
+            throttle_delay_ms = plan.throttle_delay_ms;
+
+            if plan.suspended {
                 eprintln!("\n[Hybrid/Resilience] Inference suspended by system signal");
                 break;
             }
@@ -743,6 +745,8 @@ fn main() -> anyhow::Result<()> {
             if throttle_delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
             }
+
+            executor.on_token_generated();
         }
         // ── End Resilience checkpoint ─────────────────────
 

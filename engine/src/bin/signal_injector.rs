@@ -1,25 +1,25 @@
 //! Signal injector for resilience stress testing.
 //!
 //! Listens on a Unix socket, waits for the generate binary to connect,
-//! then sends SystemSignal messages according to a JSON schedule file.
+//! then sends ManagerMessage directives according to a JSON schedule file.
 //!
 //! Schedule format:
 //! ```json
 //! [
-//!   {"delay_sec": 10, "signal": {"memory_pressure": {"level": "critical", ...}}},
-//!   {"delay_sec": 20, "signal": {"thermal_alert": {"level": "warning", ...}}}
+//!   {"delay_sec": 10, "directive": {"seq_id": 1, "commands": [{"type": "set_memory_level", "level": "critical", "target_ratio": 0.5}]}},
+//!   {"delay_sec": 20, "directive": {"seq_id": 2, "commands": [{"type": "suspend"}]}}
 //! ]
 //! ```
 
 use clap::Parser;
-use llm_shared::SystemSignal;
+use llm_shared::{EngineDirective, ManagerMessage};
 use serde::Deserialize;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(about = "Inject resilience signals via Unix socket for stress testing")]
+#[command(about = "Inject resilience directives via Unix socket for stress testing")]
 struct Args {
     /// Path to the Unix socket to listen on
     #[arg(short, long)]
@@ -37,14 +37,14 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct ScheduleEntry {
     delay_sec: f64,
-    signal: SystemSignal,
+    directive: EngineDirective,
 }
 
-fn write_signal(
+fn write_message(
     stream: &mut std::os::unix::net::UnixStream,
-    signal: &SystemSignal,
+    msg: &ManagerMessage,
 ) -> std::io::Result<()> {
-    let json = serde_json::to_vec(signal).expect("SystemSignal serialization should not fail");
+    let json = serde_json::to_vec(msg).expect("ManagerMessage serialization should not fail");
     let len = (json.len() as u32).to_be_bytes();
     stream.write_all(&len)?;
     stream.write_all(&json)?;
@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
     let schedule_json = std::fs::read_to_string(&args.schedule_file)?;
     let schedule: Vec<ScheduleEntry> = serde_json::from_str(&schedule_json)?;
     eprintln!(
-        "[Injector] Loaded {} signals from {}",
+        "[Injector] Loaded {} directives from {}",
         schedule.len(),
         args.schedule_file.display()
     );
@@ -93,19 +93,21 @@ fn main() -> anyhow::Result<()> {
     stream.set_nonblocking(false)?;
     eprintln!("[Injector] Client connected");
 
-    // Send signals according to schedule
+    // Send directives according to schedule
     for (i, entry) in schedule.iter().enumerate() {
         if entry.delay_sec > 0.0 {
             std::thread::sleep(std::time::Duration::from_secs_f64(entry.delay_sec));
         }
 
-        match write_signal(&mut stream, &entry.signal) {
+        let msg = ManagerMessage::Directive(entry.directive.clone());
+        match write_message(&mut stream, &msg) {
             Ok(()) => {
                 eprintln!(
-                    "[Injector] [{}/{}] Sent: {:?}",
+                    "[Injector] [{}/{}] Sent: seq_id={}, {} commands",
                     i + 1,
                     schedule.len(),
-                    entry.signal
+                    entry.directive.seq_id,
+                    entry.directive.commands.len()
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {

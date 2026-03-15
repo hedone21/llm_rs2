@@ -130,7 +130,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-12 22:32:21_
+_Last updated: 2026-03-15 16:03:37_
 
 ### Quality Gate Summary
 
@@ -158,9 +158,9 @@ _Last updated: 2026-03-12 22:32:21_
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 3 | 3 | 0 | PASS |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 1 | 0 | 0 | **FAIL** |
-| **Overall** | | | **203** | **202** | **0** | **FAIL** |
-| Integration | - | - | 264 | 264 | PASS |
+| UnifiedBuffer | T4 | Stable | 3 | 0 | 0 | **FAIL** |
+| **Overall** | | | **205** | **202** | **0** | **FAIL** |
+| Integration | - | - | 260 | 260 | PASS |
 
 ### Test Details
 
@@ -368,6 +368,8 @@ _Last updated: 2026-03-12 22:32:21_
 | `test_accumulator_receives_post_softmax_scores` | LlamaLayer | PASS |
 | `test_compute_attention_scores_f16_post_softmax` | LlamaLayer | PASS |
 | `test_inline_softmax_produces_valid_probabilities` | LlamaLayer | PASS |
+| `test_alloc_unified_buffer` | UnifiedBuffer | **FAIL** |
+| `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
 | `test_unmap_and_remap` | UnifiedBuffer | **FAIL** |
 | `default_config_all_monitors_enabled` | Integration | PASS |
 | `parse_external_config` | Integration | PASS |
@@ -398,6 +400,7 @@ _Last updated: 2026-03-12 22:32:21_
 | `test_build_score_snapshot_sigma_distribution` | Integration | PASS |
 | `test_collecting_sink_captures_events` | Integration | PASS |
 | `test_noop_sink_is_zero_cost` | Integration | PASS |
+| `test_compare_kivi_vs_baseline` | Integration | PASS |
 | `test_kivi_cache_basic` | Integration | PASS |
 | `test_kivi_cache_compression_ratio` | Integration | PASS |
 | `test_kivi_cache_flush_and_quantize` | Integration | PASS |
@@ -408,46 +411,41 @@ _Last updated: 2026-03-12 22:32:21_
 | `test_kivi_cache_overflow` | Integration | PASS |
 | `test_kivi_cache_residual_only` | Integration | PASS |
 | `test_kivi_cache_vec_capacity_no_realloc` | Integration | PASS |
-| `test_disk_store_append_from_empty` | Integration | PASS |
-| `test_disk_store_append_token` | Integration | PASS |
-| `test_disk_store_cleanup_on_drop` | Integration | PASS |
-| `test_disk_store_clear` | Integration | PASS |
-| `test_disk_store_empty_load` | Integration | PASS |
-| `test_disk_store_roundtrip` | Integration | PASS |
-| `test_shuffle_dispatch` | Integration | PASS |
-| `test_shuffle_f16_layout` | Integration | PASS |
-| `test_shuffle_f32_layout` | Integration | PASS |
-| `test_shuffle_realistic_f16_data` | Integration | PASS |
-| `test_shuffle_unshuffle_f16_roundtrip` | Integration | PASS |
-| `test_shuffle_unshuffle_f32_roundtrip` | Integration | PASS |
-| `test_integration_base_vs_disk_f16_accuracy` | Integration | PASS |
-| `test_integration_base_vs_disk_f32_accuracy` | Integration | PASS |
-| `test_integration_base_vs_zram_f16_accuracy` | Integration | PASS |
-| `test_integration_base_vs_zram_f32_accuracy` | Integration | PASS |
-| `test_integration_speed_and_compression` | Integration | PASS |
-| `test_offload_kvcache_decode_loop` | Integration | PASS |
+| `test_decrease_with_patience` | Integration | PASS |
+| `test_increase_on_stall` | Integration | PASS |
+| `test_max_depth_cap` | Integration | PASS |
+| `test_no_oscillation` | Integration | PASS |
+| `test_warmup_no_adjust` | Integration | PASS |
+| `test_pool_basic` | Integration | PASS |
+| `test_pool_concurrent_tasks` | Integration | PASS |
+| `test_pool_drop_joins_workers` | Integration | PASS |
+| `test_pool_result_timing` | Integration | PASS |
+| `test_raw_store_append_token` | Integration | PASS |
+| `test_raw_store_basic` | Integration | PASS |
+| `test_raw_store_clear` | Integration | PASS |
+| `test_raw_store_empty` | Integration | PASS |
+| `test_deferred_flush_on_release` | Integration | PASS |
+| `test_deferred_get_view_with_store_behind` | Integration | PASS |
+| `test_deferred_preload_after_behind` | Integration | PASS |
+| `test_deferred_write_skips_store` | Integration | PASS |
+| `test_deferred_write_with_raw_store` | Integration | PASS |
+| `test_integration_base_vs_offload_f16_accuracy` | Integration | PASS |
+| `test_non_retained_update_writes_store_immediately` | Integration | PASS |
 | `test_offload_kvcache_empty_view` | Integration | PASS |
-| `test_offload_kvcache_f32_bit_exact` | Integration | PASS |
-| `test_offload_kvcache_f32_zram_bit_exact` | Integration | PASS |
 | `test_offload_kvcache_memory_usage` | Integration | PASS |
-| `test_offload_kvcache_ops_disk` | Integration | PASS |
-| `test_offload_kvcache_ops_zram` | Integration | PASS |
+| `test_offload_kvcache_ops` | Integration | PASS |
 | `test_offload_kvcache_overflow` | Integration | PASS |
 | `test_out_buf_reuse` | Integration | PASS |
 | `test_preload_concurrent_split_at_mut` | Integration | PASS |
 | `test_preload_empty_cache` | Integration | PASS |
+| `test_preload_idempotent` | Integration | PASS |
 | `test_preload_skips_io_in_get_view` | Integration | PASS |
 | `test_preload_update_append_to_attn_buf` | Integration | PASS |
 | `test_release_buffers_frees_memory` | Integration | PASS |
 | `test_reset_preload` | Integration | PASS |
-| `test_zram_store_append_decode` | Integration | PASS |
-| `test_zram_store_clear` | Integration | PASS |
-| `test_zram_store_compression_ratio_f16` | Integration | PASS |
-| `test_zram_store_compression_ratio_f32` | Integration | PASS |
-| `test_zram_store_empty_guard` | Integration | PASS |
-| `test_zram_store_residual_flush_boundary` | Integration | PASS |
-| `test_zram_store_roundtrip_f16` | Integration | PASS |
-| `test_zram_store_roundtrip_f32` | Integration | PASS |
+| `test_retain_preload_cross_token` | Integration | PASS |
+| `test_retain_preload_depth_decrease` | Integration | PASS |
+| `test_retain_preload_guards_none_bufs` | Integration | PASS |
 | `test_compress_name` | Integration | PASS |
 | `test_compress_returns_noop` | Integration | PASS |
 | `test_cosine_identical_vectors` | Integration | PASS |
@@ -642,24 +640,24 @@ _Last updated: 2026-03-12 22:32:21_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-10T20:04:07 | 344 | 341 | 3 | 99.1% |
-| 2026-03-11T00:49:12 | 344 | 344 | 0 | 100.0% |
-| 2026-03-11T07:51:44 | 345 | 344 | 1 | 99.7% |
-| 2026-03-11T23:52:20 | 362 | 359 | 3 | 99.2% |
-| 2026-03-11T23:57:36 | 362 | 359 | 3 | 99.2% |
-| 2026-03-12T00:18:57 | 359 | 359 | 0 | 100.0% |
-| 2026-03-12T00:41:39 | 361 | 361 | 0 | 100.0% |
-| 2026-03-12T01:22:01 | 364 | 361 | 3 | 99.2% |
-| 2026-03-12T01:31:39 | 361 | 361 | 0 | 100.0% |
-| 2026-03-12T01:45:43 | 394 | 394 | 0 | 100.0% |
-| 2026-03-12T01:47:14 | 396 | 394 | 2 | 99.5% |
-| 2026-03-12T20:17:32 | 413 | 413 | 0 | 100.0% |
-| 2026-03-12T20:19:01 | 421 | 421 | 0 | 100.0% |
-| 2026-03-12T20:22:54 | 441 | 441 | 0 | 100.0% |
-| 2026-03-12T20:26:02 | 444 | 441 | 3 | 99.3% |
-| 2026-03-12T20:27:35 | 453 | 451 | 2 | 99.6% |
-| 2026-03-12T20:28:49 | 459 | 459 | 0 | 100.0% |
-| 2026-03-12T20:32:02 | 462 | 459 | 3 | 99.4% |
-| 2026-03-12T20:42:24 | 461 | 459 | 2 | 99.6% |
-| 2026-03-12T22:32:21 | 467 | 466 | 1 | 99.8% |
+| 2026-03-14T15:38:38 | 267 | 264 | 3 | 98.9% |
+| 2026-03-14T16:19:31 | 264 | 264 | 0 | 100.0% |
+| 2026-03-14T16:28:41 | 267 | 264 | 3 | 98.9% |
+| 2026-03-14T19:30:45 | 266 | 263 | 3 | 98.9% |
+| 2026-03-14T20:00:11 | 268 | 266 | 2 | 99.3% |
+| 2026-03-14T20:41:48 | 275 | 275 | 0 | 100.0% |
+| 2026-03-14T20:48:03 | 267 | 264 | 3 | 98.9% |
+| 2026-03-14T21:03:09 | 267 | 264 | 3 | 98.9% |
+| 2026-03-14T21:03:48 | 265 | 264 | 1 | 99.6% |
+| 2026-03-14T21:08:24 | 267 | 264 | 3 | 98.9% |
+| 2026-03-14T21:11:17 | 265 | 264 | 1 | 99.6% |
+| 2026-03-14T22:17:48 | 270 | 267 | 3 | 98.9% |
+| 2026-03-14T22:38:05 | 273 | 271 | 2 | 99.3% |
+| 2026-03-14T23:55:49 | 284 | 281 | 3 | 98.9% |
+| 2026-03-15T00:01:53 | 281 | 281 | 0 | 100.0% |
+| 2026-03-15T00:21:59 | 476 | 476 | 0 | 100.0% |
+| 2026-03-15T00:28:49 | 477 | 476 | 1 | 99.8% |
+| 2026-03-15T12:42:47 | 478 | 476 | 2 | 99.6% |
+| 2026-03-15T15:56:07 | 465 | 462 | 3 | 99.4% |
+| 2026-03-15T16:03:37 | 465 | 462 | 3 | 99.4% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->

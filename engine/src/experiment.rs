@@ -1,4 +1,4 @@
-use llm_shared::SystemSignal;
+use llm_shared::EngineDirective;
 use serde::{Deserialize, Serialize};
 use std::io::{BufWriter, Write};
 
@@ -9,13 +9,13 @@ pub struct ExperimentSchedule {
     pub name: String,
     #[serde(default)]
     pub description: String,
-    pub signals: Vec<ScheduleEntry>,
+    pub directives: Vec<DirectiveEntry>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ScheduleEntry {
+pub struct DirectiveEntry {
     pub at_token: usize,
-    pub signal: SystemSignal,
+    pub directive: EngineDirective,
 }
 
 impl ExperimentSchedule {
@@ -25,9 +25,11 @@ impl ExperimentSchedule {
         Ok(schedule)
     }
 
-    /// Return all signals scheduled at the given decode token position.
-    pub fn signals_at(&self, token_pos: usize) -> impl Iterator<Item = &ScheduleEntry> {
-        self.signals.iter().filter(move |e| e.at_token == token_pos)
+    /// Return all directives scheduled at the given decode token position.
+    pub fn directives_at(&self, token_pos: usize) -> impl Iterator<Item = &DirectiveEntry> {
+        self.directives
+            .iter()
+            .filter(move |e| e.at_token == token_pos)
     }
 }
 
@@ -333,20 +335,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_schedule_signals_at() {
+    fn test_schedule_directives_at() {
         let json = r#"{
             "name": "test",
-            "signals": [
-                {"at_token": 10, "signal": {"thermal_alert": {"level": "critical", "temperature_mc": 48000, "throttling_active": true, "throttle_ratio": 0.3}}},
-                {"at_token": 10, "signal": {"memory_pressure": {"level": "warning", "available_bytes": 100000000, "reclaim_target_bytes": 50000000}}},
-                {"at_token": 20, "signal": {"thermal_alert": {"level": "normal", "temperature_mc": 35000, "throttling_active": false, "throttle_ratio": 1.0}}}
+            "directives": [
+                {"at_token": 10, "directive": {"seq_id": 1, "commands": [{"type": "set_memory_level", "level": "critical", "target_ratio": 0.5}]}},
+                {"at_token": 10, "directive": {"seq_id": 2, "commands": [{"type": "set_compute_level", "level": "warning", "target_throughput": 0.7}]}},
+                {"at_token": 20, "directive": {"seq_id": 3, "commands": [{"type": "set_compute_level", "level": "normal", "target_throughput": 1.0}]}}
             ]
         }"#;
         let schedule: ExperimentSchedule = serde_json::from_str(json).unwrap();
         assert_eq!(schedule.name, "test");
-        assert_eq!(schedule.signals_at(10).count(), 2);
-        assert_eq!(schedule.signals_at(20).count(), 1);
-        assert_eq!(schedule.signals_at(5).count(), 0);
+        assert_eq!(schedule.directives_at(10).count(), 2);
+        assert_eq!(schedule.directives_at(20).count(), 1);
+        assert_eq!(schedule.directives_at(5).count(), 0);
     }
 
     #[test]

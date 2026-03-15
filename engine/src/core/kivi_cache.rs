@@ -750,4 +750,250 @@ mod tests {
             cache.q2_v.capacity()
         );
     }
+
+    /// Direct quality comparison: KIVI Q2 vs Baseline.
+    ///
+    /// Same synthetic KV data fed to both caches. Measures:
+    /// - Cosine similarity (K and V separately)
+    /// - MSE (mean squared error)
+    /// - Memory usage
+    ///
+    /// Data pattern: sin-based low-rank structure (realistic for attention KV).
+    #[test]
+    fn test_compare_kivi_vs_baseline() {
+        use crate::core::kv_cache::{KVCache, KVCacheOps};
+
+        let kv_heads = 8;
+        let head_dim = 64;
+        let max_seq = 256;
+        let prefill_len = 32;
+        let decode_len = 96;
+        let total = prefill_len + decode_len; // 128 tokens
+
+        // Generate ground truth KV data (F32)
+        // Pattern: sin-based with mild low-rank structure
+        let mut ground_truth_k = vec![0.0f32; total * kv_heads * head_dim];
+        let mut ground_truth_v = vec![0.0f32; total * kv_heads * head_dim];
+        for t in 0..total {
+            for h in 0..kv_heads {
+                for d in 0..head_dim {
+                    let idx = t * kv_heads * head_dim + h * head_dim + d;
+                    // K: lower effective rank (attention key pattern)
+                    ground_truth_k[idx] = ((t as f32 + 1.0) * (d as f32 + 1.0) * 0.003).sin() * 0.3
+                        + ((h as f32 + 1.0) * (d as f32 + 1.0) * 0.007).cos() * 0.2;
+                    // V: higher rank, more varied (value pattern)
+                    ground_truth_v[idx] =
+                        ((t as f32 * 0.1 + d as f32 * 0.05 + h as f32 * 0.3).sin()) * 0.4
+                            + (t as f32 * 0.02).cos() * 0.1;
+                }
+            }
+        }
+
+        // Helper: create F32 tensor from slice
+        let make_f32 = |data: &[f32], seq_len: usize| -> Tensor {
+            let n = seq_len * kv_heads * head_dim;
+            let buf = Arc::new(SharedBuffer::new(n * 4, DType::F32));
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr() as *mut f32, n);
+            }
+            let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+            Tensor::new(
+                Shape::new(vec![1, seq_len, kv_heads, head_dim]),
+                buf,
+                backend,
+            )
+        };
+
+        // Helper: cosine similarity
+        let cosine_sim = |a: &[f32], b: &[f32]| -> f64 {
+            let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..a.len() {
+                let (x, y) = (a[i] as f64, b[i] as f64);
+                dot += x * y;
+                na += x * x;
+                nb += y * y;
+            }
+            dot / (na.sqrt() * nb.sqrt() + 1e-15)
+        };
+
+        // Helper: MSE
+        let mse = |a: &[f32], b: &[f32]| -> f64 {
+            let sum: f64 = a
+                .iter()
+                .zip(b.iter())
+                .map(|(&x, &y)| {
+                    let d = (x - y) as f64;
+                    d * d
+                })
+                .sum();
+            sum / a.len() as f64
+        };
+
+        let elems_per_step = |seq_len: usize| seq_len * kv_heads * head_dim;
+
+        // ═══════════════════════════════════════════════
+        // 1. Baseline: standard KVCache (F32, lossless)
+        // ═══════════════════════════════════════════════
+        let baseline_k: Vec<f32>;
+        let baseline_v: Vec<f32>;
+        {
+            let memory: Arc<dyn crate::core::memory::Memory> =
+                Arc::new(crate::memory::galloc::Galloc);
+            let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+            let k_buf = memory
+                .alloc(max_seq * kv_heads * head_dim * 4, DType::F32)
+                .unwrap();
+            let v_buf = memory
+                .alloc(max_seq * kv_heads * head_dim * 4, DType::F32)
+                .unwrap();
+            let mut cache = KVCache::new(
+                Tensor::new(
+                    Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+                    k_buf,
+                    backend.clone(),
+                ),
+                Tensor::new(
+                    Shape::new(vec![1, max_seq, kv_heads, head_dim]),
+                    v_buf,
+                    backend.clone(),
+                ),
+                max_seq,
+            );
+
+            // Prefill
+            let off = 0;
+            let n = elems_per_step(prefill_len);
+            let k = make_f32(&ground_truth_k[off..off + n], prefill_len);
+            let v = make_f32(&ground_truth_v[off..off + n], prefill_len);
+            cache.update(&k, &v).unwrap();
+
+            // Decode
+            for t in 0..decode_len {
+                let off = (prefill_len + t) * kv_heads * head_dim;
+                let n = elems_per_step(1);
+                let k = make_f32(&ground_truth_k[off..off + n], 1);
+                let v = make_f32(&ground_truth_v[off..off + n], 1);
+                cache.update(&k, &v).unwrap();
+            }
+
+            let (kv, vv) = KVCacheOps::get_view(&mut cache);
+            let n = total * kv_heads * head_dim;
+            baseline_k = kv.as_slice::<f32>()[..n].to_vec();
+            baseline_v = vv.as_slice::<f32>()[..n].to_vec();
+        }
+
+        // ═══════════════════════════════════════════════
+        // 2. KIVI Q2 (res_cap=32)
+        // ═══════════════════════════════════════════════
+        let kivi_k: Vec<f32>;
+        let kivi_v: Vec<f32>;
+        let kivi_mem: usize;
+        {
+            let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, 32);
+
+            // Prefill
+            let off = 0;
+            let n = elems_per_step(prefill_len);
+            let k = make_f32(&ground_truth_k[off..off + n], prefill_len);
+            let v = make_f32(&ground_truth_v[off..off + n], prefill_len);
+            cache.update(&k, &v).unwrap();
+
+            // Decode
+            for t in 0..decode_len {
+                let off = (prefill_len + t) * kv_heads * head_dim;
+                let n = elems_per_step(1);
+                let k = make_f32(&ground_truth_k[off..off + n], 1);
+                let v = make_f32(&ground_truth_v[off..off + n], 1);
+                cache.update(&k, &v).unwrap();
+            }
+
+            kivi_mem = cache.memory_usage_bytes();
+            let (kv, vv) = cache.get_view();
+            let n = total * kv_heads * head_dim;
+            kivi_k = kv.as_slice::<f32>()[..n].to_vec();
+            kivi_v = vv.as_slice::<f32>()[..n].to_vec();
+        }
+
+        // ═══════════════════════════════════════════════
+        // 3. F16 baseline (quantization-only loss, no compression)
+        // ═══════════════════════════════════════════════
+        let f16_baseline_k: Vec<f32> = ground_truth_k
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let f16_baseline_v: Vec<f32> = ground_truth_v
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+
+        // ═══════════════════════════════════════════════
+        // Compute metrics
+        // ═══════════════════════════════════════════════
+        let n = total * kv_heads * head_dim;
+
+        // KIVI vs Baseline (F32)
+        let kivi_k_cos = cosine_sim(&baseline_k, &kivi_k);
+        let kivi_v_cos = cosine_sim(&baseline_v, &kivi_v);
+        let kivi_k_mse = mse(&baseline_k, &kivi_k);
+        let kivi_v_mse = mse(&baseline_v, &kivi_v);
+
+        // F16 vs F32 Baseline (pure precision loss)
+        let f16_k_cos = cosine_sim(&baseline_k, &f16_baseline_k[..n]);
+        let f16_v_cos = cosine_sim(&baseline_v, &f16_baseline_v[..n]);
+
+        // Memory
+        let baseline_mem = total * kv_heads * head_dim * 4 * 2; // F32 K+V
+
+        // ═══════════════════════════════════════════════
+        // Print comparison table
+        // ═══════════════════════════════════════════════
+        eprintln!();
+        eprintln!("╔══════════════════════════════════════════════════════════════════╗");
+        eprintln!("║           KIVI vs Baseline Quality Comparison                   ║");
+        eprintln!(
+            "║  Data: {total} tokens, {kv_heads} heads, {head_dim} dim, prefill={prefill_len} decode={decode_len}  ║"
+        );
+        eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+        eprintln!("║                      │  K CosSim  │  V CosSim  │  K MSE       ║");
+        eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+        eprintln!(
+            "║ F16 (precision only) │  {:.6}  │  {:.6}  │  {:.2e}  ║",
+            f16_k_cos,
+            f16_v_cos,
+            mse(&baseline_k, &f16_baseline_k[..n])
+        );
+        eprintln!(
+            "║ KIVI Q2 res=32       │  {:.6}  │  {:.6}  │  {:.2e}  ║",
+            kivi_k_cos, kivi_v_cos, kivi_k_mse
+        );
+        eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+        eprintln!("║                      │  V MSE     │  Memory    │  Ratio       ║");
+        eprintln!("╠══════════════════════════════════════════════════════════════════╣");
+        eprintln!(
+            "║ Baseline (F32)       │  0.00e+00  │  {:>7}B  │  1.00x       ║",
+            baseline_mem
+        );
+        eprintln!(
+            "║ KIVI Q2 res=32       │  {:.2e}  │  {:>7}B  │  {:.2}x       ║",
+            kivi_v_mse,
+            kivi_mem,
+            baseline_mem as f64 / kivi_mem as f64
+        );
+        eprintln!("╚══════════════════════════════════════════════════════════════════╝");
+        eprintln!();
+
+        // ═══════════════════════════════════════════════
+        // Assertions
+        // ═══════════════════════════════════════════════
+
+        // KIVI should have reasonable K cosine similarity
+        assert!(kivi_k_cos > 0.9, "KIVI K CosSim {kivi_k_cos:.4} < 0.9");
+
+        // KIVI should achieve good compression ratio
+        let kivi_ratio = baseline_mem as f64 / kivi_mem as f64;
+        assert!(
+            kivi_ratio > 1.5,
+            "KIVI ratio ({kivi_ratio:.1}x) should be > 1.5x"
+        );
+    }
 }

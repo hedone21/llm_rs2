@@ -11,6 +11,7 @@ build/
 
 # Generated results
 results/plots/
+experiments/kv_dump/
 results/profile/
 results/micro_bench_results.txt
 

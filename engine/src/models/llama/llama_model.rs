@@ -12,6 +12,7 @@ use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::memory::Memory;
+use crate::core::offload::preload_pool::{self, PreloadPool};
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::layers::llama_layer::{LlamaLayer, LlamaLayerForwardArgs};
@@ -37,6 +38,10 @@ pub struct LlamaModel {
     pub embed_tokens: Tensor,
     pub norm: Tensor,
     pub lm_head: Tensor,
+    /// Persistent thread pool for offload preload operations.
+    /// Lazily initialized on first `forward_into_offload` call.
+    /// Uses `Mutex` for interior mutability (`forward_into_offload` takes `&self`).
+    preload_pool: std::sync::Mutex<Option<PreloadPool>>,
 }
 
 pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -350,6 +355,7 @@ impl LlamaModel {
             embed_tokens,
             norm,
             lm_head,
+            preload_pool: std::sync::Mutex::new(None),
         })
     }
 
@@ -528,16 +534,25 @@ impl LlamaModel {
         Ok(())
     }
 
-    /// Offload-optimized forward pass with per-layer prefetch pipeline.
+    /// Offload-optimized forward pass with adaptive multi-layer prefetch pipeline.
     ///
-    /// Identical to `forward_into()` except the layer loop uses `split_at_mut` +
-    /// `std::thread::scope` to preload the next layer's KV data from the offload
-    /// store while computing the current layer. This overlaps I/O with compute.
+    /// Uses `PrefetchController` to dynamically adjust how far ahead layers are
+    /// preloaded. When preload is slower than forward (pipeline stall), depth increases.
+    /// When there is slack, depth decreases to save memory.
+    ///
+    /// **Fire-and-forget preloads**: A preload task for layer `i+depth` is submitted
+    /// to a persistent thread pool during layer `i`'s forward pass, then collected
+    /// when layer `i+depth` is needed. This avoids per-token thread spawn/join overhead.
+    ///
+    /// Uses raw pointers to safely manage concurrent `&mut` access to disjoint cache
+    /// elements. SAFETY: layer indices are guaranteed non-overlapping — at most one
+    /// thread accesses any given `kv_caches[j]` at a time.
     ///
     /// Score accumulator is forced to None (offload mode doesn't support eviction).
-    pub fn forward_into_offload(
+    pub fn forward_into_offload<C: crate::core::kv_cache::PrefetchableCache>(
         &self,
-        args: LlamaModelForwardArgs<'_, crate::core::offload::OffloadKVCache>,
+        args: LlamaModelForwardArgs<'_, C>,
+        prefetch: &mut crate::core::offload::prefetch::PrefetchController,
     ) -> Result<()> {
         let input_tokens = args.input_tokens;
         let start_pos = args.start_pos;
@@ -575,78 +590,120 @@ impl LlamaModel {
         };
         backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
 
-        // 2. Preload layer 0 (synchronous, before pipeline starts)
-        kv_caches[0].preload()?;
-
-        // 3. Layer loop with per-layer prefetch pipeline
         let num_layers = self.layers.len();
+        let depth = prefetch.depth();
+        let caches_ptr = kv_caches.as_mut_ptr();
+
+        // Lazy-init persistent thread pool (sized to max_depth for full concurrency).
+        // Mutex is locked once per token — zero contention.
+        let mut pool_guard = self.preload_pool.lock().unwrap();
+        let pool = pool_guard.get_or_insert_with(|| PreloadPool::new(prefetch.max_depth()));
+
+        // 2. Synchronous initial preload: layers [0..depth)
+        // Retained layers (preloaded=true) skip via early-return.
+        for j in 0..depth.min(num_layers) {
+            // SAFETY: j < num_layers, no concurrent access during sync phase
+            unsafe { (*caches_ptr.add(j)).preload() }?;
+        }
+
+        // Track pending results: pending[j] = receiver for kv_caches[j]'s preload
+        // SAFETY: raw pointer access to kv_caches elements. We guarantee that:
+        // 1. Each pool task accesses exactly one element kv_caches[far_idx]
+        // 2. The main thread accesses kv_caches[i] for forward
+        // 3. far_idx != i (far_idx = i + depth, depth >= 1)
+        // 4. Each element is accessed by at most one thread at a time:
+        //    - A preload task for element j completes before j is used for forward
+        //    - release_buffers(j) happens after forward(j) completes
+        let mut pending: Vec<Option<std::sync::mpsc::Receiver<preload_pool::PreloadResult>>> =
+            (0..num_layers).map(|_| None).collect();
+
+        // Fire initial background preloads for layers [depth..2*depth)
+        #[allow(clippy::needless_range_loop)]
+        for j in depth..(2 * depth).min(num_layers) {
+            pending[j] = Some(unsafe {
+                pool.submit(
+                    caches_ptr.add(j) as *mut (),
+                    preload_pool::preload_erased::<C>,
+                )
+            });
+        }
+
+        // 3. Layer loop
         for i in 0..num_layers {
-            if i + 1 < num_layers {
-                // Split: current layer (left[i]) and next layer (right[0])
-                let (left, right) = kv_caches.split_at_mut(i + 1);
-                let current = &mut left[i];
-                let next = &mut right[0];
-
-                std::thread::scope(|s| {
-                    // Background: preload next layer's KV data
-                    let handle = s.spawn(|| next.preload());
-
-                    // Foreground: compute current layer
-                    let layer_result = self.layers[i].forward(LlamaLayerForwardArgs {
-                        x: &mut x,
-                        kv_cache: current,
-                        start_pos,
-                        backend,
-                        memory,
-                        rms_norm_eps: self.config.rms_norm_eps as f32,
-                        rope_theta: self.config.rope_theta as f32,
-                        workspace: workspace.as_deref_mut(),
-                        use_gpu_attn,
-                        need_scores: false,
-                        head_dim: self.config.head_dim,
-                        profiler: None,
-                    });
-
-                    // Wait for preload and handle errors (R-P7)
-                    match handle.join() {
-                        Ok(Ok(())) => {}
-                        Ok(Err(e)) => {
-                            log::warn!("L{} preload failed: {e}, falling back to sync", i + 1);
-                            // next.preloaded remains false → get_view will sync load
-                        }
-                        Err(_) => {
-                            log::error!("L{} preload thread panicked", i + 1);
-                        }
+            // Collect preload result for layer i (if any).
+            if let Some(rx) = pending[i].take() {
+                match rx.recv() {
+                    Ok(preload_pool::PreloadResult {
+                        result: Ok(()),
+                        duration,
+                    }) => {
+                        prefetch.record_preload(duration);
                     }
-
-                    layer_result
-                })?;
-
-                // R-P1: Release previous layer's buffers
-                if i > 0 {
-                    kv_caches[i - 1].release_buffers();
+                    Ok(preload_pool::PreloadResult { result: Err(e), .. }) => {
+                        log::warn!("L{i} preload failed: {e}, falling back to sync");
+                    }
+                    Err(_) => {
+                        log::error!("L{i} preload worker dropped result channel");
+                    }
                 }
-            } else {
-                // Last layer: no prefetch needed
-                self.layers[i].forward(LlamaLayerForwardArgs {
-                    x: &mut x,
-                    kv_cache: &mut kv_caches[i],
-                    start_pos,
-                    backend,
-                    memory,
-                    rms_norm_eps: self.config.rms_norm_eps as f32,
-                    rope_theta: self.config.rope_theta as f32,
-                    workspace: workspace.as_deref_mut(),
-                    use_gpu_attn,
-                    need_scores: false,
-                    head_dim: self.config.head_dim,
-                    profiler: None,
-                })?;
+            }
 
-                // Release last layer's buffers
-                kv_caches[i].release_buffers();
+            // Fire preload for layer i + depth (if within bounds)
+            let far_idx = i + depth;
+            if far_idx < num_layers && pending[far_idx].is_none() {
+                pending[far_idx] = Some(unsafe {
+                    pool.submit(
+                        caches_ptr.add(far_idx) as *mut (),
+                        preload_pool::preload_erased::<C>,
+                    )
+                });
+            }
+
+            // Forward current layer
+            let current = unsafe { &mut *caches_ptr.add(i) };
+            let fwd_t0 = std::time::Instant::now();
+            self.layers[i].forward(LlamaLayerForwardArgs {
+                x: &mut x,
+                kv_cache: current,
+                start_pos,
+                backend,
+                memory,
+                rms_norm_eps: self.config.rms_norm_eps as f32,
+                rope_theta: self.config.rope_theta as f32,
+                workspace: workspace.as_deref_mut(),
+                use_gpu_attn,
+                need_scores: false,
+                head_dim: self.config.head_dim,
+                profiler: None,
+            })?;
+            let fwd_dur = fwd_t0.elapsed();
+            prefetch.record_forward(fwd_dur);
+
+            // Cross-token retention: keep first `depth` layers' buffers alive
+            // so next token's preload() early-returns (preloaded=true).
+            if i < depth {
+                current.retain_preload();
+            }
+
+            // Release consumed layer's buffers (skip retained layers)
+            if i > 0 && (i - 1) >= depth {
+                // SAFETY: layer i-1 forward is complete, preload task (if any) collected
+                unsafe { (*caches_ptr.add(i - 1)).release_buffers() };
             }
         }
+
+        // Collect any remaining pending preloads
+        for rx in pending.into_iter().flatten() {
+            let _ = rx.recv();
+        }
+
+        // Release last layer's buffers (unless retained)
+        if num_layers >= 1 && (num_layers - 1) >= depth {
+            kv_caches[num_layers - 1].release_buffers();
+        }
+
+        // Adjust depth for the next token
+        prefetch.adjust();
 
         // 4. Final Norm + Head (identical to forward_into)
         backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;

@@ -4,7 +4,7 @@ use anyhow::Result;
 
 /// Backend-agnostic KV cache storage for a single layer.
 ///
-/// Implementations: `DiskStore` (file I/O), `ZramStore` (LZ4 compressed memory).
+/// Implementation: `RawStore` (in-memory, no compression).
 /// Each store instance holds data for one transformer layer (K + V).
 pub trait OffloadStore: Send {
     /// Write full KV data to storage (used during migration).
@@ -17,7 +17,7 @@ pub trait OffloadStore: Send {
     /// Append a single token's K/V data (used during decode).
     fn append_token(&mut self, k_token: &[u8], v_token: &[u8]) -> Result<()>;
 
-    /// Current storage size in bytes (compressed for ZramStore, raw for DiskStore).
+    /// Current storage size in bytes.
     fn storage_size(&self) -> usize;
 
     /// Number of tokens currently stored.

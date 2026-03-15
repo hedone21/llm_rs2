@@ -141,6 +141,7 @@ graph TB
         KVCacheOpsTrait["KVCacheOps trait"]
         KVCache["KVCache"]
         KiviCache["KiviCache (Q2+Residual)"]
+        OffloadKVCache["OffloadKVCache (RawStore)"]
         Tensor["Tensor"]
         Shape["Shape"]
         Quant["Quant (Q4_0, Q2_0)"]
@@ -180,6 +181,7 @@ graph TB
     LlamaLayer --> KVCacheOpsTrait
     KVCache -.-> KVCacheOpsTrait
     KiviCache -.-> KVCacheOpsTrait
+    OffloadKVCache -.-> KVCacheOpsTrait
 
     Generate --> CacheManager
     CacheManager --> Pipeline
@@ -312,8 +314,9 @@ LlamaLayer와 LlamaModel은 `C: KVCacheOps` 제네릭으로 KV 캐시를 추상�
 
 ```
 KVCacheOps trait
-  ├── KVCache     (표준: F32/F16/Q4_0, eviction 지원)
-  └── KiviCache   (KIVI: Q2 압축 + FP32 Residual, eviction 미사용)
+  ├── KVCache          (표준: F32/F16/Q4_0, eviction 지원)
+  ├── KiviCache        (KIVI: Q2 압축 + FP32 Residual, eviction 미사용)
+  └── OffloadKVCache   (RawStore 오프로드 + 레이어별 프리페치, eviction 미사용)
 ```
 
 기본 타입 파라미터 `C = KVCache`로 기존 코드와 완전 호환됩니다. `CacheManager`는 concrete `&mut [KVCache]`를 사용하여 변경 없이 동작합니다.
@@ -399,6 +402,7 @@ llm_rs2/
 │   └── src/
 │       ├── lib.rs               # 라이브러리 루트 (모듈 선언)
 │       ├── main.rs              # 기본 엔트리포인트 (미사용)
+│       ├── experiment.rs        # 실험 설정/데이터 수집
 │       ├── bin/
 │       │   ├── generate.rs      # ★ 주력 추론 바이너리 (단일 백엔드)
 │       │   ├── generate_hybrid.rs  # CPU↔GPU 동적 전환 추론
@@ -422,11 +426,18 @@ llm_rs2/
 │       │   ├── attention_scores.rs    # AttentionScoreAccumulator (H2O importance tracking)
 │       │   ├── events.rs              # EventSink trait, CacheEvent enum, StderrDiagnosticSink
 │       │   ├── sampling.rs            # SamplingConfig, sample() 함수
+│       │   ├── offload/               # KV Cache Offload (레이어별 프리페치)
+│       │   │   ├── mod.rs             # OffloadKVCache struct + KVCacheOps/PrefetchableCache impl
+│       │   │   ├── store.rs           # OffloadStore trait
+│       │   │   ├── raw_store.rs       # RawStore (무압축 Vec<u8> 저장)
+│       │   │   ├── prefetch.rs        # PrefetchController (적응형 프리페치 깊이)
+│       │   │   └── preload_pool.rs    # PreloadPool (지속성 스레드 풀)
 │       │   ├── eviction/              # Eviction 정책 (Strategy Pattern)
 │       │   │   ├── mod.rs             # EvictionPolicy trait
 │       │   │   ├── no_eviction.rs     # NoEvictionPolicy (항상 skip)
 │       │   │   ├── sliding_window.rs  # SlidingWindowPolicy (최근 N 토큰 유지)
-│       │   │   └── h2o.rs             # H2OPolicy (3-partition: prefix + heavy hitters + recent)
+│       │   │   ├── h2o.rs             # H2OPolicy (3-partition: prefix + heavy hitters + recent)
+│       │   │   └── h2o_plus.rs        # H2OPlusPolicy (per-head GQA-aware variant)
 │       │   └── pressure/              # CachePressure 핸들러 (Pipeline Pattern)
 │       │       ├── mod.rs             # CachePressureHandler trait, CachePressurePipeline
 │       │       ├── eviction_handler.rs # EvictionHandler (EvictionPolicy → Handler 어댑터)
@@ -455,6 +466,7 @@ llm_rs2/
 │       ├── resilience/                  # Resilience Manager (feature-gated)
 │       │   ├── mod.rs                   # 모듈 선언 + re-exports
 │       │   ├── manager.rs               # ResilienceManager (poll, execute_action)
+│       │   ├── executor.rs              # Action 실행 로직
 │       │   ├── signal.rs                # SystemSignal, Level, enum types
 │       │   ├── state.rs                 # OperatingMode (Normal/Degraded/Minimal/Suspended)
 │       │   ├── transport.rs             # Transport trait + SignalListener<T> (별도 스레드)
@@ -466,16 +478,26 @@ llm_rs2/
 │       │       ├── energy.rs            # EnergyStrategy
 │       │       └── compute.rs           # ComputeStrategy
 │       │
-│       ├── memory/galloc.rs      # Galloc (CPU 전용 메모리 할당)
-│       └── buffer/shared_buffer.rs  # SharedBuffer 구현
+│       ├── profile/               # 추론 프로파일링 프레임워크
+│       │   ├── mod.rs             # Profiler struct, ProbeSet
+│       │   ├── latency.rs         # LatencyProbe (레이어별 지연시간)
+│       │   ├── ops.rs             # OpsProbe (연산자별 소요시간)
+│       │   ├── cache.rs           # CacheProbe (KV 캐시 상태)
+│       │   ├── scores.rs          # ScoresProbe (attention score 분포)
+│       │   └── entropy.rs         # EntropyProbe (출력 엔트로피)
+│       │
+│       ├── memory/galloc.rs       # Galloc (CPU 전용 메모리 할당)
+│       └── buffer/
+│           ├── shared_buffer.rs   # SharedBuffer (CPU Vec)
+│           └── unified_buffer.rs  # UnifiedBuffer (CPU-GPU zero-copy)
 │
-│   └── kernels/              # OpenCL 커널 파일 (~80개 .cl 파일)
-│   ├── mul_mv_q4_0_f32*.cl   # Q4_0 양자화 MatVec 커널
-│   ├── rms_norm.cl           # RMS Norm 커널
-│   ├── rope.cl               # RoPE 커널
-│   ├── simple_ops.cl         # 기본 연산 (add, scale, silu)
-│   ├── flash_attn_f32.cl     # Flash Attention 커널
-│   └── ...
+│   └── kernels/              # OpenCL 커널 파일 (~87개 .cl 파일)
+│       ├── mul_mv_q4_0_f32*.cl   # Q4_0 양자화 MatVec 커널
+│       ├── rms_norm.cl           # RMS Norm 커널
+│       ├── rope.cl               # RoPE 커널
+│       ├── simple_ops.cl         # 기본 연산 (add, scale, silu)
+│       ├── flash_attn_f32.cl     # Flash Attention 커널
+│       └── ...
 │
 ├── shared/                  # ★ 공유 신호 타입 (llm_shared crate)
 │   ├── Cargo.toml
@@ -485,8 +507,10 @@ llm_rs2/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs          # 서비스 진입점 (스레딩 오케스트레이션)
+│       ├── lib.rs           # 라이브러리 루트
 │       ├── config.rs        # TOML 설정 구조체
 │       ├── evaluator.rs     # ThresholdEvaluator (히스테리시스)
+│       ├── policy.rs        # PolicyEngine (정책 평가)
 │       ├── monitor/         # 데이터 수집 (4 모니터)
 │       │   ├── mod.rs       # Monitor trait
 │       │   ├── memory.rs    # /proc/meminfo + PSI
@@ -553,7 +577,10 @@ llm_rs2/
 │   ├── 27_manager_architecture.md    # Manager 서비스 내부 아키텍처
 │   ├── 28_experiment_guide.md        # 실험 가이드
 │   ├── 29_manager_monitor_redesign.md # Manager 모니터 재설계
-│   └── 30_evaluation_methodology.md  # KV Cache Eviction 평가 방법론
+│   ├── 30_evaluation_methodology.md  # KV Cache Eviction 평가 방법론
+│   ├── 31_memory_architecture.md     # 메모리 아키텍처 통합 개요
+│   ├── 32_kv_offload.md              # KV 캐시 오프로드 (RawStore, PrefetchController)
+│   └── 34_profiling_framework_design.md # 추론 프로파일링 프레임워크 설계
 │
 ├── dashboard/                # 벤치마크 시각화 웹 대시보드 (Flask + Plotly.js)
 │   ├── app.py                # Flask 진입점 (port 5000)
@@ -573,7 +600,7 @@ llm_rs2/
 
 | Binary | 용도 | 주요 옵션 |
 |:-------|:----|:---------|
-| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`, `--resilience-transport`, `--initial-kv-capacity`, `--kivi`, `--kivi-residual-size` |
+| `generate` | 단일 백엔드 추론 (주력) | `--backend`, `--kv-type`, `--kv-offload`, `--max-prefetch-depth`, `--eviction-policy`, `--eviction-window`, `--enable-resilience`, `--resilience-transport`, `--initial-kv-capacity`, `--kivi`, `--kivi-residual-size` |
 | `generate_hybrid` | CPU↔GPU 동적 전환 추론 | `--switch-threshold`, `--warmup-tokens` |
 | `micro_bench` | 개별 연산자 벤치마크 | 연산별 크기 지정 |
 | `test_backend` | 백엔드 정합성 검증 | CPU vs OpenCL 결과 비교 |
