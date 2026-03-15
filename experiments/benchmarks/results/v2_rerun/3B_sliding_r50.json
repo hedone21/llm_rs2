@@ -1,0 +1,140 @@
+{
+  "copa_sliding_r50": {
+    "task": "copa",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.46,
+    "correct": 46,
+    "total": 100,
+    "wall_time_s": 216.911243817,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "piqa_sliding_r50": {
+    "task": "piqa",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.58,
+    "correct": 58,
+    "total": 100,
+    "wall_time_s": 380.815051148,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "winogrande_sliding_r50": {
+    "task": "winogrande",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.49,
+    "correct": 49,
+    "total": 100,
+    "wall_time_s": 729.389919979,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "openbookqa_sliding_r50": {
+    "task": "openbookqa",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.3,
+    "correct": 30,
+    "total": 100,
+    "wall_time_s": 249.405006478,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "rte_sliding_r50": {
+    "task": "rte",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.57,
+    "correct": 57,
+    "total": 100,
+    "wall_time_s": 320.406368237,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "mathqa_sliding_r50": {
+    "task": "mathqa",
+    "policy": "sliding",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.2,
+    "correct": 20,
+    "total": 100,
+    "wall_time_s": 385.601671915,
+    "config": {
+      "eviction_policy": "sliding",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  }
+}

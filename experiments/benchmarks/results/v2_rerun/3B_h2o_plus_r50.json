@@ -1,0 +1,140 @@
+{
+  "copa_h2o_plus_r50": {
+    "task": "copa",
+    "policy": "h2o_plus",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.44,
+    "correct": 44,
+    "total": 100,
+    "wall_time_s": 276.990190847,
+    "config": {
+      "eviction_policy": "h2o_plus",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "piqa_h2o_plus_r50": {
+    "task": "piqa",
+    "policy": "h2o_plus",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.62,
+    "correct": 62,
+    "total": 100,
+    "wall_time_s": 487.005749868,
+    "config": {
+      "eviction_policy": "h2o_plus",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "winogrande_h2o_plus_r50": {
+    "task": "winogrande",
+    "policy": "h2o_plus",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.52,
+    "correct": 52,
+    "total": 100,
+    "wall_time_s": 1021.305525847,
+    "config": {
+      "eviction_policy": "h2o_plus",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "openbookqa_h2o_plus_r50": {
+    "task": "openbookqa",
+    "policy": "h2o_plus",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.3,
+    "correct": 30,
+    "total": 100,
+    "wall_time_s": 286.112427732,
+    "config": {
+      "eviction_policy": "h2o_plus",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "rte_h2o_plus_r50": {
+    "task": "rte",
+    "policy": "h2o_plus",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.6,
+    "correct": 60,
+    "total": 100,
+    "wall_time_s": 394.807082272,
+    "config": {
+      "eviction_policy": "h2o_plus",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  },
+  "mathqa_h2o_plus_r50": {
+    "task": "mathqa",
+    "policy": "h2o_plus",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.5,
+    "kv_type": "f16",
+    "model": "models/llama3.2-3b",
+    "accuracy": 0.25,
+    "correct": 25,
+    "total": 100,
+    "wall_time_s": 460.62694469,
+    "config": {
+      "eviction_policy": "h2o_plus",
+      "h2o_decay": 0.0,
+      "h2o_keep_ratio": 0.5,
+      "kv_budget": 0,
+      "kv_budget_ratio": 0.5,
+      "kv_type": "f16",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-3b",
+      "time_normalized": true
+    }
+  }
+}
