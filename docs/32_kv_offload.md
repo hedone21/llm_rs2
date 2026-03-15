@@ -1,6 +1,6 @@
 # Chapter 32: KV Cache Offload
 
-> **이전**: [31. 메모리 아키텍처 개요](31_memory_architecture.md) | **다음**: [33. SVD 캐시](33_svd_cache.md)
+> **이전**: [31. 메모리 아키텍처 개요](31_memory_architecture.md)
 
 KV 캐시 오프로드는 비활성 레이어의 KV 데이터를 외부 저장소로 이전하고, 레이어별 프리페치 파이프라인으로 I/O와 연산을 겹쳐 성능 저하를 최소화하는 시스템입니다.
 
@@ -206,7 +206,7 @@ pub struct PreloadResult {
 
 ### 타입 소거
 
-`PreloadPool`은 `OffloadKVCache`나 `SvdOffloadKVCache` 타입을 모릅니다. 대신 raw pointer + 타입 소거 함수를 사용합니다:
+`PreloadPool`은 `OffloadKVCache` 타입을 모릅니다. 대신 raw pointer + 타입 소거 함수를 사용합니다:
 
 ```rust
 pub unsafe fn preload_erased<C: PrefetchableCache>(ptr: *mut ()) -> Result<()> {
@@ -321,7 +321,7 @@ Worker 2:                  preload(3) preload(5) preload(7) ...
 ```bash
 cargo run --release --bin generate -- \
   --model-path models/llama3.2-1b \
-  --kv-offload raw \                 # 오프로드 모드 (none/raw/svd)
+  --kv-offload raw \                 # 오프로드 모드 (none/raw)
   --max-prefetch-depth 4 \           # 최대 프리페치 깊이
   --kv-type f16 \                    # F16 또는 F32 필수
   --kv-layout seq \                  # SeqMajor 필수

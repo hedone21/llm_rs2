@@ -12,9 +12,9 @@ llm.rs의 메모리 시스템은 4개 계층으로 구성됩니다:
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Layer 4: KV Cache 정책 (Eviction / Offload / SVD)      │ ← docs 11, 32, 33
+│  Layer 4: KV Cache 정책 (Eviction / Offload)             │ ← docs 11, 32
 │    CacheManager, EvictionPolicy, OffloadKVCache,        │
-│    SvdOffloadKVCache, PrefetchController, PreloadPool   │
+│    PrefetchController, PreloadPool                      │
 ├─────────────────────────────────────────────────────────┤
 │  Layer 3: KV Cache 데이터 구조                           │ ← §31.3
 │    KVCache (SeqMajor/HeadMajor), KVCacheOps trait,     │
@@ -197,7 +197,6 @@ pub enum KVLayout {
 |------|------|-----------|---------|---------|------|
 | **KVCache** | 무손실 | 인메모리 (동적 성장) | 지원 | 양쪽 | `core/kv_cache.rs` |
 | **OffloadKVCache** | 무손실 | RawStore + 레이어별 프리페치 | 미지원 | SeqMajor만 | `core/offload/mod.rs` |
-| **SvdOffloadKVCache** | K 손실 / V 무손실 | SVD(K) + RawStore(V) | 미지원 | SeqMajor만 | `core/svd_cache.rs` |
 
 ---
 
@@ -214,8 +213,7 @@ KV Cache 정책
 │   └── D2OHandler              — merge compensation (pipeline handler)
 │
 └── Offloading (외부 저장소로 이동)
-    ├── OffloadKVCache + RawStore  — 무압축 인메모리 오프로드
-    └── SvdOffloadKVCache          — SVD 압축(K) + RawStore(V) 오프로드
+    └── OffloadKVCache + RawStore  — 무압축 인메모리 오프로드
 ```
 
 ### Eviction vs Offloading
@@ -223,7 +221,7 @@ KV Cache 정책
 | 속성 | Eviction | Offloading |
 |------|---------|-----------|
 | 목적 | 오래된 토큰 제거 | 비활성 레이어 저장소 이전 |
-| 품질 영향 | 있음 (토큰 유실) | 없음 (무손실) 또는 제어된 손실 (SVD) |
+| 품질 영향 | 있음 (토큰 유실) | 없음 (무손실) |
 | 트리거 | Resilience 시그널 | 항상 활성 (decode 시) |
 | 메모리 절감 | 토큰 수 비례 | 활성 레이어 수 비례 |
 | 호환성 | 상호 비호환 | 상호 비호환 |
@@ -232,8 +230,6 @@ KV Cache 정책
 > **Eviction 상세**: [Chapter 11: KV Cache 관리 전략](11_kv_cache_management.md)
 >
 > **Offloading 상세**: [Chapter 32: KV 캐시 오프로드](32_kv_offload.md)
->
-> **SVD 캐시 상세**: [Chapter 33: SVD 캐시](33_svd_cache.md)
 
 ---
 
@@ -296,7 +292,6 @@ Next Token
 | 표준 | F32 | 128 MB | 128 MB | 16L × 8MB |
 | 오프로드 (Raw, depth=2) | F16 | ~16 MB | 64 MB | 2L attn + 8MB out |
 | 오프로드 (Raw, depth=2) | F32 | ~32 MB | 128 MB | 2L attn + 16MB out |
-| SVD (rank=10) | F16 | ~8 MB (K) + ~8 MB (V attn) | K: ~8MB, V: 32MB | K 손실 압축 |
 
 ### Workspace (고정, 레이어 공유)
 
@@ -344,8 +339,6 @@ engine/src/
 │   ├── backend.rs          Backend trait (17+ ops)
 │   ├── kv_cache.rs         KVCache, KVCacheOps, PrefetchableCache, KVLayout
 │   ├── cache_manager.rs    CacheManager (pressure pipeline)
-│   ├── svd_cache.rs        SvdOffloadKVCache
-│   ├── svd_math.rs         SVD 선형대수 유틸리티
 │   ├── eviction/           Eviction 정책 (NoEviction, SlidingWindow, H2O)
 │   ├── pressure/           CachePressure 핸들러 (D2O, stubs)
 │   ├── offload/
@@ -377,4 +370,3 @@ engine/src/
 | [10. Model Inference](10_model_inference.md) | Forward pass, LayerWorkspace 사용 | Layer 2 상세 |
 | [11. KV Cache 관리 전략](11_kv_cache_management.md) | Eviction 정책 (SlidingWindow, H2O, D2O) | Layer 4-A |
 | [32. KV 캐시 오프로드](32_kv_offload.md) | OffloadKVCache, RawStore, 프리페치 파이프라인 | Layer 4-B |
-| [33. SVD 캐시](33_svd_cache.md) | SvdOffloadKVCache, SVD 압축, VStoreAdapter | Layer 4-C |

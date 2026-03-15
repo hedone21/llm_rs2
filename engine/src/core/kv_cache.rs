@@ -48,7 +48,7 @@ pub trait KVCacheOps: Send {
 
 /// Extension trait for KV caches that support prefetch pipelines.
 ///
-/// Implementors: `OffloadKVCache`, `SvdOffloadKVCache`.
+/// Implementors: `OffloadKVCache`.
 /// Used by `forward_into_offload` to overlap I/O with compute.
 pub trait PrefetchableCache: KVCacheOps {
     /// Pre-load data from external storage into memory buffers.

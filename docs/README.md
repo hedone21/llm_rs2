@@ -10,7 +10,7 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 14-15 | Quality & Testing | 컴포넌트 품질 게이트, 테스트 전략 |
 | 20-26 | Resilience | D-Bus IPC, 아키텍처, 통합, 테스트, 사용 가이드, API |
 | 27 | Manager | Manager 서비스 아키텍처 |
-| 30+ | Evaluation & Memory | 평가 방법론, 메모리 아키텍처, KV 캐시 오프로드/SVD |
+| 30+ | Evaluation & Memory | 평가 방법론, 메모리 아키텍처, KV 캐시 오프로드 |
 
 ## 문서 목록
 
@@ -43,7 +43,6 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 30 | [30_evaluation_methodology.md](30_evaluation_methodology.md) | KV Cache Eviction 평가 방법론 |
 | 31 | [31_memory_architecture.md](31_memory_architecture.md) | **메모리 아키텍처 통합 개요** (Buffer → KV Cache → 정책) |
 | 32 | [32_kv_offload.md](32_kv_offload.md) | KV 캐시 오프로드 (RawStore, PrefetchController, PreloadPool) |
-| 33 | [33_svd_cache.md](33_svd_cache.md) | SVD 캐시 (K 저랭크 압축 + V 오프로드) |
 
 ## 추천 읽기 순서
 
@@ -53,8 +52,8 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 
 **Resilience 기능 관련**: 20 -> 21 -> 22 -> 24 -> 25 -> 26
 
-**메모리 & KV 캐시**: 31 (개요) -> 08 (버퍼) -> 11 (Eviction) -> 32 (오프로드) -> 33 (SVD)
+**메모리 & KV 캐시**: 31 (개요) -> 08 (버퍼) -> 11 (Eviction) -> 32 (오프로드)
 
-**특정 주제 심층 탐구**: OpenCL (06 -> 07 -> 08 -> 09), KV Cache (11 -> 32 -> 33), Hybrid (12)
+**특정 주제 심층 탐구**: OpenCL (06 -> 07 -> 08 -> 09), KV Cache (11 -> 32), Hybrid (12)
 
 **평가/벤치마크**: 30 -> experiments/prompts/README.md -> experiments/PLAN.md (Section 10)
