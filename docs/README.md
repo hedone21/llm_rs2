@@ -43,6 +43,7 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 30 | [30_evaluation_methodology.md](30_evaluation_methodology.md) | KV Cache Eviction 평가 방법론 |
 | 31 | [31_memory_architecture.md](31_memory_architecture.md) | **메모리 아키텍처 통합 개요** (Buffer → KV Cache → 정책) |
 | 32 | [32_kv_offload.md](32_kv_offload.md) | KV 캐시 오프로드 (RawStore, PrefetchController, PreloadPool) |
+| 34 | [34_profiling_framework_design.md](34_profiling_framework_design.md) | 추론 프로파일링 프레임워크 설계 |
 
 ## 추천 읽기 순서
 

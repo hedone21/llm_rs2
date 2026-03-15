@@ -145,6 +145,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/30_evaluation_methodology.md` — KV Cache Eviction evaluation methodology (related work survey + benchmark design)
 - `docs/31_memory_architecture.md` — Memory architecture overview (Buffer → KV Cache → Policy unified view)
 - `docs/32_kv_offload.md` — KV cache offload (RawStore, PrefetchController, PreloadPool)
+- `docs/34_profiling_framework_design.md` — Inference profiling framework design
 
 ## Experiment Benchmarks
 

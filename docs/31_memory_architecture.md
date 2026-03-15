@@ -342,11 +342,11 @@ engine/src/
 │   ├── eviction/           Eviction 정책 (NoEviction, SlidingWindow, H2O)
 │   ├── pressure/           CachePressure 핸들러 (D2O, stubs)
 │   ├── offload/
-│   │   ├── mod.rs          OffloadKVCache (387줄)
-│   │   ├── store.rs        OffloadStore trait (29줄)
-│   │   ├── raw_store.rs    RawStore (161줄)
-│   │   ├── prefetch.rs     PrefetchController (280줄)
-│   │   └── preload_pool.rs PreloadPool (242줄)
+│   │   ├── mod.rs          OffloadKVCache + tests (2071줄)
+│   │   ├── store.rs        OffloadStore trait (28줄)
+│   │   ├── raw_store.rs    RawStore (160줄)
+│   │   ├── prefetch.rs     PrefetchController (279줄)
+│   │   └── preload_pool.rs PreloadPool (241줄)
 │   └── ...
 ├── buffer/
 │   ├── shared_buffer.rs    SharedBuffer (CPU Vec)

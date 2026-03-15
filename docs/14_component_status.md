@@ -130,7 +130,7 @@ The overall gate is **FAIL** if any T1 or T2 component has status BLOCKED or FAI
 ## 3. Component Quality Status
 
 <!-- AUTO-GENERATED:TEST_STATUS:START -->
-_Last updated: 2026-03-15 12:42:47_
+_Last updated: 2026-03-15 15:56:07_
 
 ### Quality Gate Summary
 
@@ -158,9 +158,9 @@ _Last updated: 2026-03-15 12:42:47_
 | LayerWorkspace | T4 | Stable | 4 | 4 | 0 | PASS |
 | LlamaLayer | T4 | Stable | 3 | 3 | 0 | PASS |
 | LlamaModel | T4 | Stable | 0 | 0 | 0 | N/A |
-| UnifiedBuffer | T4 | Stable | 2 | 0 | 0 | **FAIL** |
-| **Overall** | | | **204** | **202** | **0** | **FAIL** |
-| Integration | - | - | 274 | 274 | PASS |
+| UnifiedBuffer | T4 | Stable | 3 | 0 | 0 | **FAIL** |
+| **Overall** | | | **205** | **202** | **0** | **FAIL** |
+| Integration | - | - | 260 | 260 | PASS |
 
 ### Test Details
 
@@ -368,6 +368,7 @@ _Last updated: 2026-03-15 12:42:47_
 | `test_accumulator_receives_post_softmax_scores` | LlamaLayer | PASS |
 | `test_compute_attention_scores_f16_post_softmax` | LlamaLayer | PASS |
 | `test_inline_softmax_produces_valid_probabilities` | LlamaLayer | PASS |
+| `test_alloc_unified_buffer` | UnifiedBuffer | **FAIL** |
 | `test_map_returns_valid_ptr` | UnifiedBuffer | **FAIL** |
 | `test_unmap_and_remap` | UnifiedBuffer | **FAIL** |
 | `default_config_all_monitors_enabled` | Integration | PASS |
@@ -399,6 +400,7 @@ _Last updated: 2026-03-15 12:42:47_
 | `test_build_score_snapshot_sigma_distribution` | Integration | PASS |
 | `test_collecting_sink_captures_events` | Integration | PASS |
 | `test_noop_sink_is_zero_cost` | Integration | PASS |
+| `test_compare_kivi_vs_baseline` | Integration | PASS |
 | `test_kivi_cache_basic` | Integration | PASS |
 | `test_kivi_cache_compression_ratio` | Integration | PASS |
 | `test_kivi_cache_flush_and_quantize` | Integration | PASS |
@@ -638,7 +640,6 @@ _Last updated: 2026-03-15 12:42:47_
 <!-- AUTO-GENERATED:TEST_HISTORY:START -->
 | Date | Total | Passed | Failed | Pass Rate |
 |:-----|------:|-------:|-------:|----------:|
-| 2026-03-14T14:17:09 | 267 | 265 | 2 | 99.3% |
 | 2026-03-14T14:41:00 | 262 | 260 | 2 | 99.2% |
 | 2026-03-14T15:38:38 | 267 | 264 | 3 | 98.9% |
 | 2026-03-14T16:19:31 | 264 | 264 | 0 | 100.0% |
@@ -658,4 +659,5 @@ _Last updated: 2026-03-15 12:42:47_
 | 2026-03-15T00:21:59 | 476 | 476 | 0 | 100.0% |
 | 2026-03-15T00:28:49 | 477 | 476 | 1 | 99.8% |
 | 2026-03-15T12:42:47 | 478 | 476 | 2 | 99.6% |
+| 2026-03-15T15:56:07 | 465 | 462 | 3 | 99.4% |
 <!-- AUTO-GENERATED:TEST_HISTORY:END -->

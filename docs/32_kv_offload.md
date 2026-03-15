@@ -44,11 +44,11 @@ PreloadPool
 
 ```
 engine/src/core/offload/
-├── mod.rs          OffloadKVCache + KVCacheOps/PrefetchableCache impl (387줄)
-├── store.rs        OffloadStore trait 정의 (29줄)
-├── raw_store.rs    RawStore: 무압축 Vec<u8> 저장 (161줄)
-├── prefetch.rs     PrefetchController: 적응형 프리페치 깊이 (280줄)
-└── preload_pool.rs PreloadPool: 지속성 스레드 풀 (242줄)
+├── mod.rs          OffloadKVCache + KVCacheOps/PrefetchableCache impl + tests (2071줄)
+├── store.rs        OffloadStore trait 정의 (28줄)
+├── raw_store.rs    RawStore: 무압축 Vec<u8> 저장 (160줄)
+├── prefetch.rs     PrefetchController: 적응형 프리페치 깊이 (279줄)
+└── preload_pool.rs PreloadPool: 지속성 스레드 풀 (241줄)
 ```
 
 ---
