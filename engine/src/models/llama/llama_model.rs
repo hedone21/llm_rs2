@@ -103,7 +103,22 @@ impl LlamaModel {
             .iter()
             .map(|f| {
                 let file = File::open(path.join(f))?;
-                Ok(Arc::new(unsafe { MmapOptions::new().map(&file)? }))
+                let mmap = unsafe { MmapOptions::new().map(&file)? };
+                // madvise hints for weight mmap:
+                // - HUGEPAGE: request 2MB THP (reduces TLB misses ~500x)
+                // - SEQUENTIAL: hint sequential readahead (matches GEMV access)
+                // - WILLNEED: prefault all pages (avoid faults during inference)
+                #[cfg(unix)]
+                {
+                    let ptr = mmap.as_ptr() as *mut libc::c_void;
+                    let len = mmap.len();
+                    unsafe {
+                        libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
+                        libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
+                        libc::madvise(ptr, len, libc::MADV_WILLNEED);
+                    }
+                }
+                Ok(Arc::new(mmap))
             })
             .collect::<Result<_>>()?;
 
