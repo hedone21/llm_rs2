@@ -94,10 +94,10 @@ impl SpinPool {
                 }
                 spins += 1;
                 if spins < 500 {
-                    // Brief spin (~150ns on ARM) to catch next matmul in chain
+                    // Brief spin (~150ns on ARM) to catch back-to-back dispatches
                     std::hint::spin_loop();
                 } else {
-                    // No new work after spin window — park to save CPU
+                    // Park to release CPU for non-matmul operations
                     std::thread::park();
                     spins = 0;
                 }
