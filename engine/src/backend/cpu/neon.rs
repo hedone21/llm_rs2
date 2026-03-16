@@ -238,7 +238,8 @@ impl CpuBackendNeon {
     }
 
     /// NEON F16 matmul: A(F32) x B^T(F16) -> Out(F32)
-    /// Uses fcvtl/fcvtl2 for F16→F32 conversion + vfmaq_f32 FMA.
+    /// Multi-row GEMV: processes NR=4 output rows simultaneously,
+    /// sharing activation loads across rows for better ILP and reduced overhead.
     fn matmul_transposed_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_shape = a.shape().dims();
         let b_shape = b.shape().dims();
@@ -253,32 +254,57 @@ impl CpuBackendNeon {
         let b_data = b.as_slice::<half::f16>();
         let out_data = out.as_mut_slice::<f32>();
 
-        // Same heuristic as F32 NEON matmul
         if (m * n * k) < 100_000 {
             return self.matmul_transposed_f16_serial(a_data, b_data, out_data, m, n, k);
         }
 
+        const NR: usize = 4;
+        // Use usize to bypass Send bounds — threads access non-overlapping regions.
+        let a_raw = a_data.as_ptr() as usize;
+        let b_raw = b_data.as_ptr() as usize;
+
+        // Work-stealing via par_chunks_mut with moderate chunk size.
+        // Too small = Rayon task overhead; too large = load imbalance on big.LITTLE.
+        // Target: ~2x thread count chunks for work-stealing headroom.
         let num_threads = rayon::current_num_threads();
-        let chunk_size = ((n + num_threads - 1) / num_threads).max(256);
+        let target_chunks = num_threads * 2;
+        let chunk_rows = ((n + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
+        let chunk_rows = chunk_rows.max(NR);
 
-        out_data
-            .par_chunks_mut(chunk_size)
-            .enumerate()
-            .for_each(|(chunk_idx, chunk)| {
-                let start_idx = chunk_idx * chunk_size;
-                for (local_i, out_val) in chunk.iter_mut().enumerate() {
-                    let idx = start_idx + local_i;
-                    let i = idx / n;
-                    let j = idx % n;
+        for i in 0..m {
+            let out_row = &mut out_data[i * n..(i + 1) * n];
+            out_row
+                .par_chunks_mut(chunk_rows)
+                .enumerate()
+                .for_each(|(ci, chunk)| {
+                    let a_ptr = unsafe { (a_raw as *const f32).add(i * k) };
+                    let b_base = b_raw as *const u16;
+                    let j_start = ci * chunk_rows;
 
-                    let a_ptr = unsafe { a_data.as_ptr().add(i * k) };
-                    let b_ptr = unsafe { (b_data.as_ptr() as *const u16).add(j * k) };
-
-                    unsafe {
-                        *out_val = Self::vec_dot_f16_f32(k, a_ptr, b_ptr);
+                    let mut local_j = 0;
+                    while local_j + NR <= chunk.len() {
+                        let gj = j_start + local_j;
+                        let b_ptrs = [
+                            unsafe { b_base.add(gj * k) },
+                            unsafe { b_base.add((gj + 1) * k) },
+                            unsafe { b_base.add((gj + 2) * k) },
+                            unsafe { b_base.add((gj + 3) * k) },
+                        ];
+                        let mut results = [0.0f32; NR];
+                        unsafe {
+                            Self::vec_dot_f16_f32_4rows(k, a_ptr, b_ptrs, &mut results);
+                        }
+                        chunk[local_j..local_j + NR].copy_from_slice(&results);
+                        local_j += NR;
                     }
-                }
-            });
+                    while local_j < chunk.len() {
+                        let gj = j_start + local_j;
+                        let b_ptr = unsafe { b_base.add(gj * k) };
+                        chunk[local_j] = unsafe { Self::vec_dot_f16_f32(k, a_ptr, b_ptr) };
+                        local_j += 1;
+                    }
+                });
+        }
         Ok(())
     }
 
@@ -291,18 +317,155 @@ impl CpuBackendNeon {
         n: usize,
         k: usize,
     ) -> Result<()> {
+        const NR: usize = 4;
+        let b_ptr_base = b_data.as_ptr() as *const u16;
+
         for i in 0..m {
             let a_ptr = unsafe { a_data.as_ptr().add(i * k) };
-            for j in 0..n {
+            let mut j = 0;
+            while j + NR <= n {
+                let b_ptrs = [
+                    unsafe { b_ptr_base.add(j * k) },
+                    unsafe { b_ptr_base.add((j + 1) * k) },
+                    unsafe { b_ptr_base.add((j + 2) * k) },
+                    unsafe { b_ptr_base.add((j + 3) * k) },
+                ];
+                let mut results = [0.0f32; NR];
+                unsafe {
+                    Self::vec_dot_f16_f32_4rows(k, a_ptr, b_ptrs, &mut results);
+                }
+                out_data[i * n + j..i * n + j + NR].copy_from_slice(&results);
+                j += NR;
+            }
+            while j < n {
                 let b_ptr = unsafe { (b_data.as_ptr() as *const u16).add(j * k) };
                 out_data[i * n + j] = unsafe { Self::vec_dot_f16_f32(k, a_ptr, b_ptr) };
+                j += 1;
             }
         }
         Ok(())
     }
 
-    /// NEON dot product: A(F32) · B(F16) using fcvtl + vfmaq_f32.
-    /// Processes 16 elements per iteration (2x unroll of 8-element blocks).
+    /// NEON multi-row dot product: compute 4 dot products simultaneously.
+    /// A(F32)[K] · B0..B3(F16)[K] → 4 output scalars.
+    /// Uses 16-element stride with software prefetch for weight data.
+    /// 16 accumulators (4 rows × 4 each) for maximum ILP.
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_f16_f32_4rows(
+        k: usize,
+        a_ptr: *const f32,
+        b_ptrs: [*const u16; 4],
+        out: &mut [f32; 4],
+    ) {
+        // 4 rows × 4 accumulators = 16 registers (leaves 16 for temps)
+        let mut s00 = vdupq_n_f32(0.0);
+        let mut s01 = vdupq_n_f32(0.0);
+        let mut s02 = vdupq_n_f32(0.0);
+        let mut s03 = vdupq_n_f32(0.0);
+        let mut s10 = vdupq_n_f32(0.0);
+        let mut s11 = vdupq_n_f32(0.0);
+        let mut s12 = vdupq_n_f32(0.0);
+        let mut s13 = vdupq_n_f32(0.0);
+        let mut s20 = vdupq_n_f32(0.0);
+        let mut s21 = vdupq_n_f32(0.0);
+        let mut s22 = vdupq_n_f32(0.0);
+        let mut s23 = vdupq_n_f32(0.0);
+        let mut s30 = vdupq_n_f32(0.0);
+        let mut s31 = vdupq_n_f32(0.0);
+        let mut s32 = vdupq_n_f32(0.0);
+        let mut s33 = vdupq_n_f32(0.0);
+
+        let mut idx = 0;
+        // Prefetch distance: 128 bytes ahead (~2 cache lines = 64 F16 values)
+        const PF: usize = 64;
+
+        // Main loop: 16 elements per iteration × 4 rows
+        while idx + 16 <= k {
+            // Software prefetch weight data for all 4 rows
+            std::arch::asm!(
+                "prfm pldl1strm, [{b0}]",
+                "prfm pldl1strm, [{b1}]",
+                "prfm pldl1strm, [{b2}]",
+                "prfm pldl1strm, [{b3}]",
+                b0 = in(reg) b_ptrs[0].add(idx + PF),
+                b1 = in(reg) b_ptrs[1].add(idx + PF),
+                b2 = in(reg) b_ptrs[2].add(idx + PF),
+                b3 = in(reg) b_ptrs[3].add(idx + PF),
+            );
+
+            // Load 16 F32 activations (shared)
+            let a0 = vld1q_f32(a_ptr.add(idx));
+            let a1 = vld1q_f32(a_ptr.add(idx + 4));
+            let a2 = vld1q_f32(a_ptr.add(idx + 8));
+            let a3 = vld1q_f32(a_ptr.add(idx + 12));
+
+            // Macro: load 16 F16 → 4×F32, FMA into 4 accumulators
+            macro_rules! dot16_row {
+                ($bp:expr, $sa:ident, $sb:ident, $sc:ident, $sd:ident) => {
+                    let bra: uint16x8_t = vld1q_u16($bp.add(idx));
+                    let brb: uint16x8_t = vld1q_u16($bp.add(idx + 8));
+                    let c0: float32x4_t;
+                    let c1: float32x4_t;
+                    let c2: float32x4_t;
+                    let c3: float32x4_t;
+                    std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) c0, i = in(vreg) bra);
+                    std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) c1, i = in(vreg) bra);
+                    std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) c2, i = in(vreg) brb);
+                    std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) c3, i = in(vreg) brb);
+                    $sa = vfmaq_f32($sa, a0, c0);
+                    $sb = vfmaq_f32($sb, a1, c1);
+                    $sc = vfmaq_f32($sc, a2, c2);
+                    $sd = vfmaq_f32($sd, a3, c3);
+                };
+            }
+            dot16_row!(b_ptrs[0], s00, s01, s02, s03);
+            dot16_row!(b_ptrs[1], s10, s11, s12, s13);
+            dot16_row!(b_ptrs[2], s20, s21, s22, s23);
+            dot16_row!(b_ptrs[3], s30, s31, s32, s33);
+
+            idx += 16;
+        }
+
+        // 8-element tail
+        while idx + 8 <= k {
+            let a0 = vld1q_f32(a_ptr.add(idx));
+            let a1 = vld1q_f32(a_ptr.add(idx + 4));
+
+            macro_rules! dot8_row {
+                ($bp:expr, $s0:ident, $s1:ident) => {
+                    let br: uint16x8_t = vld1q_u16($bp.add(idx));
+                    let bl: float32x4_t;
+                    let bh: float32x4_t;
+                    std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) bl, i = in(vreg) br);
+                    std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) bh, i = in(vreg) br);
+                    $s0 = vfmaq_f32($s0, a0, bl);
+                    $s1 = vfmaq_f32($s1, a1, bh);
+                };
+            }
+            dot8_row!(b_ptrs[0], s00, s01);
+            dot8_row!(b_ptrs[1], s10, s11);
+            dot8_row!(b_ptrs[2], s20, s21);
+            dot8_row!(b_ptrs[3], s30, s31);
+            idx += 8;
+        }
+
+        // Reduce 4 accumulators per row → scalar
+        out[0] = vaddvq_f32(vaddq_f32(vaddq_f32(s00, s01), vaddq_f32(s02, s03)));
+        out[1] = vaddvq_f32(vaddq_f32(vaddq_f32(s10, s11), vaddq_f32(s12, s13)));
+        out[2] = vaddvq_f32(vaddq_f32(vaddq_f32(s20, s21), vaddq_f32(s22, s23)));
+        out[3] = vaddvq_f32(vaddq_f32(vaddq_f32(s30, s31), vaddq_f32(s32, s33)));
+
+        // Scalar tail
+        while idx < k {
+            let a_val = *a_ptr.add(idx);
+            for r in 0..4 {
+                out[r] += a_val * half::f16::from_bits(*b_ptrs[r].add(idx)).to_f32();
+            }
+            idx += 1;
+        }
+    }
+
+    /// Single-row NEON dot product (used for tail rows when N % 4 != 0).
     #[target_feature(enable = "neon")]
     unsafe fn vec_dot_f16_f32(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
         let mut sum0 = vdupq_n_f32(0.0);
@@ -314,44 +477,24 @@ impl CpuBackendNeon {
 
         // Main loop: 16 elements per iteration
         while k_idx + 16 <= k {
-            // Load 2x8 f16 values
             let b_raw0: uint16x8_t = vld1q_u16(b_ptr.add(k_idx));
             let b_raw1: uint16x8_t = vld1q_u16(b_ptr.add(k_idx + 8));
 
-            // Convert f16 → f32 using fcvtl/fcvtl2
             let b_f32_0: float32x4_t;
             let b_f32_1: float32x4_t;
             let b_f32_2: float32x4_t;
             let b_f32_3: float32x4_t;
 
-            std::arch::asm!(
-                "fcvtl {out:v}.4s, {inp:v}.4h",
-                out = lateout(vreg) b_f32_0,
-                inp = in(vreg) b_raw0,
-            );
-            std::arch::asm!(
-                "fcvtl2 {out:v}.4s, {inp:v}.8h",
-                out = lateout(vreg) b_f32_1,
-                inp = in(vreg) b_raw0,
-            );
-            std::arch::asm!(
-                "fcvtl {out:v}.4s, {inp:v}.4h",
-                out = lateout(vreg) b_f32_2,
-                inp = in(vreg) b_raw1,
-            );
-            std::arch::asm!(
-                "fcvtl2 {out:v}.4s, {inp:v}.8h",
-                out = lateout(vreg) b_f32_3,
-                inp = in(vreg) b_raw1,
-            );
+            std::arch::asm!("fcvtl {out:v}.4s, {inp:v}.4h", out = lateout(vreg) b_f32_0, inp = in(vreg) b_raw0);
+            std::arch::asm!("fcvtl2 {out:v}.4s, {inp:v}.8h", out = lateout(vreg) b_f32_1, inp = in(vreg) b_raw0);
+            std::arch::asm!("fcvtl {out:v}.4s, {inp:v}.4h", out = lateout(vreg) b_f32_2, inp = in(vreg) b_raw1);
+            std::arch::asm!("fcvtl2 {out:v}.4s, {inp:v}.8h", out = lateout(vreg) b_f32_3, inp = in(vreg) b_raw1);
 
-            // Load 16 f32 activations
             let a0 = vld1q_f32(a_ptr.add(k_idx));
             let a1 = vld1q_f32(a_ptr.add(k_idx + 4));
             let a2 = vld1q_f32(a_ptr.add(k_idx + 8));
             let a3 = vld1q_f32(a_ptr.add(k_idx + 12));
 
-            // FMA
             sum0 = vfmaq_f32(sum0, a0, b_f32_0);
             sum1 = vfmaq_f32(sum1, a1, b_f32_1);
             sum2 = vfmaq_f32(sum2, a2, b_f32_2);
@@ -363,19 +506,10 @@ impl CpuBackendNeon {
         // 8-element tail
         while k_idx + 8 <= k {
             let b_raw: uint16x8_t = vld1q_u16(b_ptr.add(k_idx));
-
             let b_lo: float32x4_t;
             let b_hi: float32x4_t;
-            std::arch::asm!(
-                "fcvtl {out:v}.4s, {inp:v}.4h",
-                out = lateout(vreg) b_lo,
-                inp = in(vreg) b_raw,
-            );
-            std::arch::asm!(
-                "fcvtl2 {out:v}.4s, {inp:v}.8h",
-                out = lateout(vreg) b_hi,
-                inp = in(vreg) b_raw,
-            );
+            std::arch::asm!("fcvtl {out:v}.4s, {inp:v}.4h", out = lateout(vreg) b_lo, inp = in(vreg) b_raw);
+            std::arch::asm!("fcvtl2 {out:v}.4s, {inp:v}.8h", out = lateout(vreg) b_hi, inp = in(vreg) b_raw);
 
             let a0 = vld1q_f32(a_ptr.add(k_idx));
             let a1 = vld1q_f32(a_ptr.add(k_idx + 4));
@@ -386,13 +520,11 @@ impl CpuBackendNeon {
             k_idx += 8;
         }
 
-        // Reduce 4 accumulators → scalar
         sum0 = vaddq_f32(sum0, sum1);
         sum2 = vaddq_f32(sum2, sum3);
         sum0 = vaddq_f32(sum0, sum2);
         let mut sum = vaddvq_f32(sum0);
 
-        // Scalar tail
         while k_idx < k {
             sum += *a_ptr.add(k_idx) * half::f16::from_bits(*b_ptr.add(k_idx)).to_f32();
             k_idx += 1;

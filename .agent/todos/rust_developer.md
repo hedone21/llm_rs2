@@ -67,143 +67,94 @@
 
 ---
 
-# 성능 개선 Sprint: llama.cpp 동급 달성
+# 성능 개선 Sprint: F16 llama.cpp 동급 달성
 
-> **목표**: llama.cpp 24.4 tok/s 동급 이상 달성 (현재 CPU 17.5, OpenCL Q4 30.1)
+> **목표**: llama.cpp F16 24.4 tok/s 동급 이상 달성
 > **방법론**: 분석 → 구현 → 측정 루프 (점진적 개선)
 > **llama.cpp 소스**: `/home/go/Workspace/llama.cpp/` (shallow clone)
 > **기준 벤치마크**: `docs/31_perf_comparison_llama_cpp.md`
-> **측정 조건**: Galaxy S24, "tell me short story", decode 128, 시작 온도 ~40°C
+> **측정 조건**: Galaxy S24, decode 128, 시작 온도 ~40°C
+> **이론 피크 (F16)**: ~27.5 tok/s (LPDDR5X 51 GB/s, weight 1.878 GB/token)
 
 ---
 
-## Iteration 1: CPU Q4 Decode (17.5 → 24+ tok/s)
+## [DONE] Iteration 0: CPU Q4 Decode — 목표 달성
 
-### [P0] 1-1. llama.cpp NEON Q4 dot product 분석 리포트
-- **Status**: TODO
+- **결과**: 30.5 tok/s (llama.cpp CPU 24.4 대비 **+25%**)
+- **커밋**: 86d4885, c889b58 (NEON/AVX2 SIMD)
+- **비고**: Q4는 F16보다 3.2x 적은 bandwidth 사용 → 높은 tok/s 달성
+
+---
+
+## Iteration 1: CPU F16 Decode (15.1 → 24+ tok/s) ← CURRENT
+
+### [P0] 1-1. NEON F16 multi-row GEMV 구현
+- **Status**: IN_PROGRESS
 - **Sprint**: current
-- **Description**: llama.cpp의 `vec_dot_q4_0_q8_0` NEON 구현을 정밀 분석하고 우리 구현과 비교 리포트 작성.
-- **분석 대상**:
-  - `llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c` — ARM NEON Q4×Q8 dot product
-  - `llama.cpp/ggml/src/ggml-cpu/quants.c` — 공통 양자화 루틴
-  - 우리 코드: `engine/src/backend/cpu/neon.rs:625-775` — vec_dot_q4_0_q8_0
-- **리포트 내용**: 명령어 수준 비교, 블록 배칭 전략, 수평 합산 방식, 누적기 패턴 차이
-- **산출물**: `docs/32_llama_cpp_neon_q4_analysis.md`
-- **Acceptance Criteria**: 두 구현의 명령어 수/블록, ILP 패턴, 예상 cycle count 비교 테이블
+- **Description**: llama.cpp tinyBLAS 분석 기반으로 multi-row GEMV 구현.
+  현재 단일 행 `vec_dot_f16_f32` (4 accumulators) → 4-row 동시 처리로 전환.
+- **분석 결과**:
+  - llama.cpp: tinyBLAS RM=4×RN=6 블록 타일 + work-stealing threadpool
+  - 우리: 단일 행 GEMV + Rayon flat 병렬화
+  - 핵심 차이: 다중 행 처리로 ILP 향상 + 스레드 스케줄링 오버헤드 감소
+- **구현 내용**:
+  - `vec_dot_f16_f32_4rows()`: 4 weight rows × 8-element inner loop
+  - 8 accumulators (4 rows × 2 each), activation 1회 로드 후 4 rows에 재사용
+  - Rayon 스레드당 연속 output row 범위 할당 (chunk dispatch 대신)
+- **Acceptance Criteria**: 디바이스 decode 128에서 20+ tok/s
 
-### [P0] 1-2. llama.cpp 양자화 루틴 분석
-- **Status**: TODO
-- **Sprint**: current
-- **Dependencies**: 1-1과 병행 가능
-- **Description**: llama.cpp의 `quantize_row_q8_0` NEON 구현과 matmul 내 양자화 타이밍 분석.
-- **분석 대상**:
-  - `llama.cpp/ggml/src/ggml-cpu/arch/arm/quants.c` — quantize_row_q8_0
-  - 우리 코드: `engine/src/backend/cpu/neon.rs:534-621`
-- **핵심 질문**: llama.cpp는 fused quantize-dot을 하는가? 양자화 비용이 전체에서 몇 %인가?
-- **산출물**: 1-1 리포트에 포함
-
-### [P0] 1-3. NEON dot product 개선 구현 (Iter 1)
+### [P0] 1-2. 벤치마크 & 측정
 - **Status**: TODO
 - **Sprint**: current
 - **Dependencies**: 1-1 완료 후
-- **Description**: 분석 결과를 기반으로 `vec_dot_q4_0_q8_0` 첫 번째 개선.
-- **예상 작업**: 수평 합산 방식 변경, 블록 배칭 증가, 누적기 패턴 적용
-- **Acceptance Criteria**: micro_bench에서 기존 대비 개선 확인
+- **Description**: 디바이스에서 CPU F16 decode 128 측정, llama.cpp 대비 갭 확인.
+- **다음 단계**: 24+ 미달 시 추가 최적화 (software prefetch, NR=8 등)
 
-### [P0] 1-4. 벤치마크 & 측정 (Iter 1)
+### [P1] 1-3. 추가 최적화 (필요 시)
 - **Status**: TODO
 - **Sprint**: current
-- **Dependencies**: 1-3 완료 후
-- **Description**: 디바이스에서 decode 128/256 측정, llama.cpp 대비 갭 확인.
-- **산출물**: `docs/31_perf_comparison_llama_cpp.md` 업데이트
-- **다음 단계**: 갭이 남아있으면 1-3으로 돌아가 추가 최적화
-
-### [P1] 1-5. llama.cpp matmul 병렬화 분석
-- **Status**: TODO
-- **Sprint**: current
-- **Description**: llama.cpp의 matmul 스레딩 전략 분석 (ggml의 task decomposition).
-- **분석 대상**:
-  - `llama.cpp/ggml/src/ggml-cpu/ggml-cpu.c` or `ops.cpp` — compute_forward_mul_mat
-  - 스레드 분할 방식 (N-parallel? M-parallel?)
-  - 우리 Rayon 병렬화와 비교
-- **핵심 질문**: decode M=1에서 llama.cpp는 어떻게 병렬화하는가?
-- **산출물**: 1-1 리포트에 섹션 추가
-
-### [P1] 1-6. 병렬화 개선 구현
-- **Status**: TODO
-- **Sprint**: current
-- **Dependencies**: 1-5 완료 후
-- **Description**: 분석 결과 기반 Rayon 오버헤드 감소 또는 직접 스레딩.
+- **Dependencies**: 1-2 결과에 따라
+- **Description**: software prefetching (`prfm pldl1strm`), NR=8 multi-row, 32-element stride
+- **Target**: 이론 피크의 85%+ (23.4+ tok/s)
 
 ---
 
-## Iteration 2: OpenCL F16 Matmul (1.7 → 25+ tok/s)
+## Iteration 2: OpenCL F16 Matmul (1.9 → 25+ tok/s)
 
-### [P0] 2-1. llama.cpp OpenCL 커널 분석 리포트
+### [P0] 2-1. Adreno F16 GEMV 커널 작성
 - **Status**: TODO
 - **Sprint**: next
-- **Description**: llama.cpp의 OpenCL matmul 커널(특히 Adreno 최적화)을 분석.
-- **분석 대상**:
-  - `llama.cpp/ggml/src/ggml-opencl/kernels/mul_mat_f16_f32.cl`
-  - `llama.cpp/ggml/src/ggml-opencl/kernels/gemv_noshuffle.cl` — Adreno 특화
-  - `llama.cpp/ggml/src/ggml-opencl/ggml-opencl.cpp` — dispatch 로직
-  - 우리 코드: `engine/kernels/mul_mat_f16_f32.cl` (범용, 1.7 tok/s)
-  - 우리 코드: `engine/kernels/mul_mv_q4_0_f32.cl` (Adreno 특화, 30.1 tok/s)
-- **리포트 내용**: 서브그룹 활용, 메모리 접근 패턴, 타일링 전략, dispatch 비교
-- **산출물**: `docs/33_llama_cpp_opencl_kernel_analysis.md`
+- **Description**: 기존 Q4 커널(`mul_mv_q4_0_f32.cl`) 패턴 기반 Adreno 특화 F16 GEMV 커널.
+  현재 `mul_mat_f16_f32.cl`은 범용 tiled GEMM (1.9 tok/s, 사실상 미작동).
+- **핵심**: 서브그룹 dispatch, `read_imageh()`, 배리어 제거, 1D workgroup
+- **참고**: llama.cpp `gemv_noshuffle.cl` (Adreno 특화)
+- **Acceptance Criteria**: 디바이스에서 10+ tok/s 달성
 
-### [P0] 2-2. Adreno F16 GEMV 커널 작성 (Iter 1)
+### [P0] 2-2. 벤치마크 & 커널 튜닝
 - **Status**: TODO
 - **Sprint**: next
 - **Dependencies**: 2-1 완료 후
-- **Description**: 기존 Q4 커널(`mul_mv_q4_0_f32.cl`) + llama.cpp 분석 기반으로 Adreno 특화 F16 GEMV 커널 작성.
-- **핵심**: 서브그룹 dispatch, `read_imageh()`, 배리어 제거
-- **산출물**: `engine/kernels/mul_mv_f16_f32.cl` (신규)
-- **Acceptance Criteria**: 디바이스에서 10+ tok/s 달성
-
-### [P0] 2-3. 벤치마크 & 측정 (Iter 1)
-- **Status**: TODO
-- **Sprint**: next
-- **Dependencies**: 2-2 완료 후
-- **Description**: OpenCL F16 decode 128/256 측정, Q4 대비 갭 확인.
-- **다음 단계**: 25+ tok/s 미달 시 2-2로 돌아가 커널 튜닝
-
-### [P1] 2-4. OpenCL F16 GEMM 커널 (Prefill Batch)
-- **Status**: TODO
-- **Sprint**: next
-- **Dependencies**: 2-2 완료 후
-- **Description**: M>1 (prefill) 전용 F16 GEMM 커널. GEMV와 별도 dispatch.
+- **다음 단계**: 25+ tok/s 미달 시 커널 파라미터 튜닝
 
 ---
 
-## Iteration 3: Prefill 최적화 (36 → 10 ms/tok)
+## Iteration 3: Prefill 최적화 (TTFT 942ms → 100ms)
 
-### [P1] 3-1. llama.cpp prefill 경로 분석
+### [P1] 3-1. CPU F16 batch matmul 타일링
 - **Status**: TODO
 - **Sprint**: backlog
-- **Description**: llama.cpp가 prefill에서 6.6 ms/tok 달성하는 방법 분석.
-- **분석 대상**:
-  - batch matmul (M>1) 타일링 전략
-  - KV cache 업데이트 방식
-  - 프리필과 디코드의 커널 분리 여부
-- **산출물**: 리포트 (docs/)
-
-### [P1] 3-2. CPU batch matmul 타일링 구현
-- **Status**: TODO
-- **Sprint**: backlog
-- **Dependencies**: 3-1, Iter 1 완료 후
 - **Description**: L1/L2 캐시에 맞는 타일 블로킹 적용.
 
-### [P1] 3-3. OpenCL prefill matmul 최적화
+### [P1] 3-2. OpenCL prefill matmul 최적화
 - **Status**: TODO
 - **Sprint**: backlog
-- **Dependencies**: 3-1, Iter 2 완료 후
 - **Description**: M>1 전용 GEMM dispatch 경로.
 
 ---
 
 ## 측정 기록
 
-| 날짜 | Iter | 변경 | CPU Q4 tok/s | OCL Q4 tok/s | OCL F16 tok/s | 비고 |
-|------|------|------|-------------|-------------|--------------|------|
-| 2026-03-13 | baseline | - | 17.5 | 30.1 | 1.7 | llama.cpp CPU=24.4, GPU=22.7 |
+| 날짜 | Iter | 변경 | CPU F16 tok/s | CPU Q4 tok/s | OCL Q4 tok/s | OCL F16 tok/s | 비고 |
+|------|------|------|-------------|-------------|-------------|--------------|------|
+| 2026-03-13 | baseline | - | 15.2 | 17.5 | 30.1 | 1.7 | llama.cpp CPU F16=24.4 |
+| 2026-03-16 | re-measure | NEON/AVX2 SIMD 적용 후 | 15.1 | 30.5 | 21.8 | 1.9 | Q4 목표 달성, F16 최적화 필요 |
