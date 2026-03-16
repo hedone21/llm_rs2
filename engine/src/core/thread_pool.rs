@@ -1,11 +1,8 @@
-//! Spin-wait thread pool for low-latency matmul dispatch.
+//! Low-latency thread pool for matmul dispatch.
 //!
-//! Unlike Rayon's fork-join model which creates tasks per parallel call,
-//! this pool keeps worker threads spinning between dispatches, achieving
-//! near-zero per-call overhead (~100ns vs Rayon's ~300µs).
-//!
-//! Workers use atomic fetch_add for work-stealing, which naturally
-//! balances load across heterogeneous cores (big.LITTLE).
+//! Workers park between dispatches (zero CPU when idle) and are woken
+//! via thread::unpark (~1-3µs). During dispatch, work-stealing via
+//! atomic fetch_add naturally balances load across heterogeneous cores.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -14,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub type WorkFn = unsafe fn(*const u8, usize);
 
 struct SharedState {
-    /// Incremented each dispatch — workers spin on this.
+    /// Incremented each dispatch — workers check this after unpark.
     generation: AtomicU64,
     /// Workers fetch_add to grab the next chunk (work-stealing).
     next_chunk: AtomicUsize,
@@ -34,7 +31,8 @@ struct SharedState {
 
 pub struct SpinPool {
     shared: Arc<SharedState>,
-    _handles: Vec<std::thread::JoinHandle<()>>,
+    worker_threads: Vec<std::thread::Thread>,
+    _join_handles: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl SpinPool {
@@ -52,17 +50,28 @@ impl SpinPool {
             work_ctx: AtomicUsize::new(0),
         });
 
-        let mut handles = Vec::with_capacity(n_workers);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut join_handles = Vec::with_capacity(n_workers);
+
         for _ in 0..n_workers {
             let s = shared.clone();
-            handles.push(std::thread::spawn(move || {
+            let tx = tx.clone();
+            join_handles.push(std::thread::spawn(move || {
+                // Send our Thread handle back for unpark, then drop sender
+                // so rx.into_iter() terminates after all handles are collected.
+                tx.send(std::thread::current()).unwrap();
+                drop(tx);
                 Self::worker_loop(&s);
             }));
         }
+        drop(tx);
+
+        let worker_threads: Vec<_> = rx.into_iter().collect();
 
         SpinPool {
             shared,
-            _handles: handles,
+            worker_threads,
+            _join_handles: join_handles,
         }
     }
 
@@ -70,26 +79,29 @@ impl SpinPool {
         let mut last_gen = 0u64;
 
         loop {
-            // Phase 1: spin-wait for new work (fast path)
+            // Hybrid wait: brief spin then park.
+            // Spin catches rapid back-to-back dispatches (matmul chains).
+            // Park yields CPU for non-matmul ops after the spin window.
             let mut spins = 0u32;
-            let cur_gen = loop {
+            loop {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
                 let g = shared.generation.load(Ordering::Acquire);
                 if g != last_gen {
-                    break g;
+                    last_gen = g;
+                    break;
                 }
                 spins += 1;
-                if spins < 4000 {
+                if spins < 500 {
+                    // Brief spin (~150ns on ARM) to catch next matmul in chain
                     std::hint::spin_loop();
                 } else {
-                    // Yield to OS after ~1µs of spinning to reduce power
-                    std::thread::yield_now();
-                    spins = 2000; // don't reset to 0, keep yielding
+                    // No new work after spin window — park to save CPU
+                    std::thread::park();
+                    spins = 0;
                 }
-            };
-            last_gen = cur_gen;
+            }
 
             // Work-stealing: grab chunks via atomic counter
             Self::steal_work(shared);
@@ -118,8 +130,6 @@ impl SpinPool {
 
     /// Dispatch `n_chunks` work items. Blocks until all are processed.
     ///
-    /// Main thread participates in work-stealing alongside workers.
-    ///
     /// # Safety
     /// `work_fn(ctx, chunk_id)` must be safe to call for all chunk_id in 0..n_chunks.
     /// `ctx` must remain valid until dispatch returns.
@@ -137,8 +147,13 @@ impl SpinPool {
         self.shared.next_chunk.store(0, Ordering::Relaxed);
         self.shared.done_count.store(0, Ordering::Relaxed);
 
-        // Wake workers (Release ensures work setup is visible)
+        // Publish work (Release ensures setup is visible to workers)
         self.shared.generation.fetch_add(1, Ordering::Release);
+
+        // Wake all parked workers
+        for wt in &self.worker_threads {
+            wt.unpark();
+        }
 
         // Main thread also steals work
         Self::steal_work(&self.shared);
@@ -153,9 +168,11 @@ impl SpinPool {
 impl Drop for SpinPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        // Bump generation to wake any sleeping workers
         self.shared.generation.fetch_add(1, Ordering::Release);
-        for h in self._handles.drain(..) {
+        for wt in &self.worker_threads {
+            wt.unpark();
+        }
+        for h in self._join_handles.drain(..) {
             let _ = h.join();
         }
     }
@@ -165,15 +182,12 @@ impl Drop for SpinPool {
 static POOL: std::sync::OnceLock<SpinPool> = std::sync::OnceLock::new();
 
 /// Get the global SpinPool.
-/// Uses 3 workers + main thread = 4 total (targeting big cores on ARM SoCs).
-/// More workers cause cache/bus contention during non-matmul operations.
 pub fn get_pool() -> &'static SpinPool {
     POOL.get_or_init(|| {
-        // 3 workers + main = 4 threads (prime + 3 big cores on Snapdragon 8 Gen 3)
-        // Optimal: 3 workers + main = 4 threads.
-        // On Snapdragon 8 Gen 3: saturates DRAM bandwidth with 4 big cores.
-        // More threads cause cache/bus contention from spin-wait overhead.
-        SpinPool::new(3)
+        let n = rayon::current_num_threads();
+        // n-1 workers + main = n total. Park/unpark means idle workers
+        // don't consume CPU, so we can safely use all available threads.
+        SpinPool::new(n.saturating_sub(1))
     })
 }
 
@@ -183,7 +197,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
 
     #[test]
-    fn test_spin_pool_basic() {
+    fn test_basic() {
         let pool = SpinPool::new(3);
         let counter = AtomicU64::new(0);
 
@@ -199,9 +213,9 @@ mod tests {
     }
 
     #[test]
-    fn test_spin_pool_work_stealing() {
+    fn test_work_stealing() {
         let pool = SpinPool::new(4);
-        let results = vec![AtomicU64::new(0); 1000];
+        let results: Vec<AtomicU64> = (0..1000).map(|_| AtomicU64::new(0)).collect();
 
         unsafe fn mark_work(ctx: *const u8, chunk_id: usize) {
             let results = &*(ctx as *const Vec<AtomicU64>);
@@ -212,7 +226,6 @@ mod tests {
             pool.dispatch(1000, mark_work, &results as *const _ as *const u8);
         }
 
-        // Every chunk should be processed exactly once
         for (i, r) in results.iter().enumerate() {
             assert_eq!(
                 r.load(Ordering::Relaxed),
@@ -225,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spin_pool_multiple_dispatches() {
+    fn test_multiple_dispatches() {
         let pool = SpinPool::new(2);
         let counter = AtomicU64::new(0);
 
