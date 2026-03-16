@@ -20,6 +20,10 @@ pub struct LayerWorkspace {
     pub attn_out: Tensor, // [batch, 1, dim]
     /// Pre-allocated scores buffer for attention (max_seq_len size)
     pub scores: Vec<f32>,
+    /// Pre-allocated KV cache cast buffers (F32→F16 conversion).
+    /// Avoids GPU memory allocation per token per layer.
+    pub k_cast: Option<Tensor>,
+    pub v_cast: Option<Tensor>,
 }
 
 impl LayerWorkspace {
@@ -45,6 +49,8 @@ impl LayerWorkspace {
             residual: alloc(vec![config.batch_size, 1, config.dim])?,
             attn_out: alloc(vec![config.batch_size, 1, config.dim])?,
             scores: vec![0.0; config.n_heads * config.max_seq_len],
+            k_cast: None, // Lazily initialized on first use with correct dtype
+            v_cast: None,
         })
     }
 }

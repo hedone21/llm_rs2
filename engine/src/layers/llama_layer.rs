@@ -556,19 +556,25 @@ impl LlamaLayer {
                     (n_elem / crate::core::quant::QK4_0)
                         * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
                 }
-                _ => n_elem * 4, // fallback
+                _ => n_elem * 4,
             };
-            let k_cast_buf = memory.alloc(buf_size, kv_dtype)?;
-            let mut k_cast = Tensor::new(k_rope.shape().clone(), k_cast_buf, backend.clone());
-            backend.cast(&k_rope, &mut k_cast)?;
-            let v_cast_buf = memory.alloc(buf_size, kv_dtype)?;
-            let mut v_cast = Tensor::new(
-                Shape::new(vec![batch_size, 1, n_heads_kv, head_dim]),
-                v_cast_buf,
-                backend.clone(),
-            );
-            backend.cast(&ws.v, &mut v_cast)?;
-            kv_cache.update(&k_cast, &v_cast)?;
+            // Reuse pre-allocated workspace buffers for F32→F16 cast
+            // (avoids GPU memory allocation per token per layer)
+            let k_shape = k_rope.shape().clone();
+            let v_shape = Shape::new(vec![batch_size, 1, n_heads_kv, head_dim]);
+            if ws.k_cast.is_none() {
+                let buf = memory.alloc(buf_size, kv_dtype)?;
+                ws.k_cast = Some(Tensor::new(k_shape.clone(), buf, backend.clone()));
+            }
+            if ws.v_cast.is_none() {
+                let buf = memory.alloc(buf_size, kv_dtype)?;
+                ws.v_cast = Some(Tensor::new(v_shape.clone(), buf, backend.clone()));
+            }
+            let k_cast = ws.k_cast.as_mut().unwrap();
+            let v_cast = ws.v_cast.as_mut().unwrap();
+            backend.cast(&k_rope, k_cast)?;
+            backend.cast(&ws.v, v_cast)?;
+            kv_cache.update(k_cast, v_cast)?;
         } else {
             kv_cache.update(&k_rope, &ws.v)?;
         }
