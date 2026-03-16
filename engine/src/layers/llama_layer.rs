@@ -552,13 +552,55 @@ impl LlamaLayer {
         backend.rms_norm(x, &self.attention_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
-        // 2. QKV Projections — batch mode keeps SpinPool workers hot
+        // 2. QKV Projections — fused dispatch for F16 CPU (1 dispatch instead of 3)
         let t = prof_start!();
-        crate::core::thread_pool::get_pool().begin_batch();
-        backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
-        backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
-        backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
-        crate::core::thread_pool::get_pool().end_batch();
+        #[cfg(target_arch = "aarch64")]
+        let is_cpu_f16 = backend.name().contains("CPU") && self.wq.dtype() == DType::F16;
+        #[cfg(not(target_arch = "aarch64"))]
+        let is_cpu_f16 = false;
+        let is_decode = x
+            .shape()
+            .dims()
+            .iter()
+            .take(x.shape().dims().len() - 1)
+            .product::<usize>()
+            == 1;
+        if is_cpu_f16 && is_decode {
+            // Fused QKV: single SpinPool dispatch for all 3 matmuls
+            #[cfg(target_arch = "aarch64")]
+            {
+                let k = x.shape().dims()[x.shape().dims().len() - 1];
+                unsafe {
+                    crate::backend::cpu::neon::fused_matmul_f16(
+                        x.as_ptr() as *const f32,
+                        k,
+                        &[
+                            (
+                                self.wq.as_ptr() as *const u16,
+                                ws.q.as_mut_ptr() as *mut f32,
+                                self.wq.shape().dims()[0],
+                            ),
+                            (
+                                self.wk.as_ptr() as *const u16,
+                                ws.k.as_mut_ptr() as *mut f32,
+                                self.wk.shape().dims()[0],
+                            ),
+                            (
+                                self.wv.as_ptr() as *const u16,
+                                ws.v.as_mut_ptr() as *mut f32,
+                                self.wv.shape().dims()[0],
+                            ),
+                        ],
+                    );
+                }
+            }
+        } else {
+            crate::core::thread_pool::get_pool().begin_batch();
+            backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
+            backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
+            backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
+            crate::core::thread_pool::get_pool().end_batch();
+        }
         prof_record!(t, matmul_qkv);
 
         // 3. RoPE
@@ -1130,12 +1172,37 @@ impl LlamaLayer {
         backend.rms_norm(x, &self.ffn_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
-        // 9. FFN — batch mode for consecutive gate+up matmuls
+        // 9. FFN — fused gate+up dispatch for F16 CPU (1 dispatch instead of 2)
         let t = prof_start!();
-        crate::core::thread_pool::get_pool().begin_batch();
-        backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
-        backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
-        crate::core::thread_pool::get_pool().end_batch();
+        if is_cpu_f16 && is_decode {
+            #[cfg(target_arch = "aarch64")]
+            {
+                let k = x.shape().dims()[x.shape().dims().len() - 1];
+                unsafe {
+                    crate::backend::cpu::neon::fused_matmul_f16(
+                        x.as_ptr() as *const f32,
+                        k,
+                        &[
+                            (
+                                self.w_gate.as_ptr() as *const u16,
+                                ws.gate.as_mut_ptr() as *mut f32,
+                                self.w_gate.shape().dims()[0],
+                            ),
+                            (
+                                self.w_up.as_ptr() as *const u16,
+                                ws.up.as_mut_ptr() as *mut f32,
+                                self.w_up.shape().dims()[0],
+                            ),
+                        ],
+                    );
+                }
+            }
+        } else {
+            crate::core::thread_pool::get_pool().begin_batch();
+            backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
+            backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
+            crate::core::thread_pool::get_pool().end_batch();
+        }
         prof_record!(t, matmul_ffn);
 
         let t = prof_start!();

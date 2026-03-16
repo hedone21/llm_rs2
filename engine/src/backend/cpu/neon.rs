@@ -1018,6 +1018,120 @@ struct F16GemvCtx {
     rows_per_chunk: usize,
 }
 
+// --- Fused multi-matmul dispatch (QKV / gate+up) ---
+
+/// Context for fused multi-matmul dispatch.
+/// Multiple matmuls share input but have different weights/outputs.
+/// Chunks are distributed across all matmuls in a single dispatch.
+#[repr(C)]
+struct FusedGemvCtx {
+    a_ptr: *const f32,
+    k: usize,
+    rows_per_chunk: usize,
+    n_matmuls: usize,
+    // Per-matmul params (up to 3 for QKV)
+    b_bases: [*const u16; 3],
+    out_ptrs: [*mut f32; 3],
+    ns: [usize; 3],
+    chunk_offsets: [usize; 3], // cumulative chunk offset per matmul
+}
+
+/// Work function for fused multi-matmul: chunk_id spans across all matmuls.
+///
+/// # Safety
+/// Called by SpinPool workers with valid FusedGemvCtx pointer.
+unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
+    const NR: usize = 4;
+    let ctx = &*(ctx_ptr as *const FusedGemvCtx);
+
+    // Determine which matmul this chunk belongs to
+    let (mat_idx, local_chunk) = if chunk_id < ctx.chunk_offsets[1] {
+        (0, chunk_id - ctx.chunk_offsets[0])
+    } else if ctx.n_matmuls > 1 && chunk_id < ctx.chunk_offsets[2] {
+        (1, chunk_id - ctx.chunk_offsets[1])
+    } else {
+        (2, chunk_id - ctx.chunk_offsets[2])
+    };
+
+    let b_base = ctx.b_bases[mat_idx];
+    let out_ptr = ctx.out_ptrs[mat_idx];
+    let n = ctx.ns[mat_idx];
+
+    let j_start = local_chunk * ctx.rows_per_chunk;
+    let j_end = (j_start + ctx.rows_per_chunk).min(n);
+
+    let mut j = j_start;
+    while j + NR <= j_end {
+        let b_ptrs = [
+            b_base.add(j * ctx.k),
+            b_base.add((j + 1) * ctx.k),
+            b_base.add((j + 2) * ctx.k),
+            b_base.add((j + 3) * ctx.k),
+        ];
+        let mut results = [0.0f32; NR];
+        CpuBackendNeon::vec_dot_f16_f32_4rows(ctx.k, ctx.a_ptr, b_ptrs, &mut results);
+        std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
+        j += NR;
+    }
+    while j < j_end {
+        *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_f32(ctx.k, ctx.a_ptr, b_base.add(j * ctx.k));
+        j += 1;
+    }
+}
+
+/// Dispatch multiple F16 matmuls (sharing the same input) as a single SpinPool dispatch.
+/// Reduces dispatch overhead from N dispatches to 1.
+///
+/// # Safety
+/// All tensor pointers must be valid. Input must be F32, weights F16, outputs F32.
+/// All matmuls must share the same K dimension.
+pub unsafe fn fused_matmul_f16(
+    a_data: *const f32,
+    k: usize,
+    matmuls: &[(*const u16, *mut f32, usize)], // (weight_base, out_ptr, n_rows)
+) {
+    use crate::core::thread_pool;
+    const NR: usize = 4;
+
+    let pool = thread_pool::get_pool();
+    let n_threads = rayon::current_num_threads();
+    let total_rows: usize = matmuls.iter().map(|m| m.2).sum();
+    let target_chunks = n_threads * 8;
+    let rows_per_chunk = ((total_rows + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
+    let rows_per_chunk = rows_per_chunk.max(NR);
+
+    let mut b_bases = [std::ptr::null::<u16>(); 3];
+    let mut out_ptrs = [std::ptr::null_mut::<f32>(); 3];
+    let mut ns = [0usize; 3];
+    let mut chunk_offsets = [0usize; 3];
+    let mut total_chunks = 0;
+
+    for (i, &(b, o, n)) in matmuls.iter().enumerate().take(3) {
+        b_bases[i] = b;
+        out_ptrs[i] = o;
+        ns[i] = n;
+        chunk_offsets[i] = total_chunks;
+        total_chunks += (n + rows_per_chunk - 1) / rows_per_chunk;
+    }
+
+    let ctx = FusedGemvCtx {
+        a_ptr: a_data,
+        k,
+        rows_per_chunk,
+        n_matmuls: matmuls.len(),
+        b_bases,
+        out_ptrs,
+        ns,
+        chunk_offsets,
+    };
+
+    pool.dispatch(
+        total_chunks,
+        fused_gemv_chunk,
+        &ctx as *const FusedGemvCtx as *const u8,
+    );
+}
+
 /// Work function for SpinPool: processes a coarse chunk of output rows.
 /// Each chunk contains multiple NR=4 row blocks to reduce atomic contention.
 ///
