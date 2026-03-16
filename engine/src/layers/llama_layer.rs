@@ -278,11 +278,25 @@ impl LlamaLayer {
                         let mut byte_vec = vec![0u8; byte_size];
                         backend.read_buffer(t, &mut byte_vec)?;
                         vec.resize(numel, 0.0);
-                        let f16_slice = unsafe {
-                            std::slice::from_raw_parts(byte_vec.as_ptr() as *const half::f16, numel)
-                        };
-                        for i in 0..numel {
-                            vec[i] = f16_slice[i].to_f32();
+                        #[cfg(target_arch = "aarch64")]
+                        unsafe {
+                            crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                                byte_vec.as_ptr() as *const u16,
+                                vec.as_mut_ptr(),
+                                numel,
+                            );
+                        }
+                        #[cfg(not(target_arch = "aarch64"))]
+                        {
+                            let f16_slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    byte_vec.as_ptr() as *const half::f16,
+                                    numel,
+                                )
+                            };
+                            for i in 0..numel {
+                                vec[i] = f16_slice[i].to_f32();
+                            }
                         }
                     } else {
                         vec.resize(t.numel(), 0.0);
@@ -330,20 +344,42 @@ impl LlamaLayer {
                     out_attn.as_mut_slice::<f32>(),
                 )
             } else if k_cache.dtype() == DType::F16 {
-                // F16: convert KV cache to F32 temp buffers
+                // F16: convert KV cache to F32 temp buffers using NEON bulk conversion
                 // HeadMajor: need full buffer (heads are non-contiguous)
                 let n_elems = if kv_cache.layout() == KVLayout::HeadMajor {
                     n_heads_kv * kv_cache.capacity() * head_dim
                 } else {
                     cache_seq_len * n_heads_kv * head_dim
                 };
-                let k_f16 = k_cache.as_slice::<half::f16>();
-                let v_f16 = v_cache.as_slice::<half::f16>();
+                let k_f16_ptr = k_cache.as_ptr() as *const u16;
+                let v_f16_ptr = v_cache.as_ptr() as *const u16;
                 k_vec.resize(n_elems, 0.0f32);
                 v_vec.resize(n_elems, 0.0f32);
-                for i in 0..n_elems {
-                    k_vec[i] = k_f16[i].to_f32();
-                    v_vec[i] = v_f16[i].to_f32();
+                #[cfg(target_arch = "aarch64")]
+                unsafe {
+                    crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                        k_f16_ptr,
+                        k_vec.as_mut_ptr(),
+                        n_elems,
+                    );
+                    crate::backend::cpu::neon::CpuBackendNeon::bulk_f16_to_f32(
+                        v_f16_ptr,
+                        v_vec.as_mut_ptr(),
+                        n_elems,
+                    );
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    let k_f16 = unsafe {
+                        std::slice::from_raw_parts(k_f16_ptr as *const half::f16, n_elems)
+                    };
+                    let v_f16 = unsafe {
+                        std::slice::from_raw_parts(v_f16_ptr as *const half::f16, n_elems)
+                    };
+                    for i in 0..n_elems {
+                        k_vec[i] = k_f16[i].to_f32();
+                        v_vec[i] = v_f16[i].to_f32();
+                    }
                 }
                 (
                     q_rope.as_slice::<f32>(),
@@ -1228,17 +1264,17 @@ impl LlamaLayer {
                 }
             }
             DType::F16 => {
-                // Read K cache to CPU
-                let k_data: Vec<half::f16> = if backend.name() == "OpenCL" {
+                // Read K cache to CPU as raw bytes
+                let k_bytes: Vec<u8> = if backend.name() == "OpenCL" {
                     let mut buf = vec![0u8; k_cache.size()];
                     backend.read_buffer(k_cache, &mut buf)?;
-                    unsafe {
-                        std::slice::from_raw_parts(buf.as_ptr() as *const half::f16, buf.len() / 2)
-                            .to_vec()
-                    }
+                    buf
                 } else {
-                    k_cache.as_slice::<half::f16>().to_vec()
+                    let ptr = k_cache.as_ptr();
+                    let len = k_cache.size();
+                    unsafe { std::slice::from_raw_parts(ptr, len).to_vec() }
                 };
+                let k_raw = k_bytes.as_ptr() as *const u16;
 
                 let score_chunks: Vec<&mut [f32]> =
                     scores_out.chunks_mut(stride).take(n_heads_q).collect();
@@ -1246,8 +1282,6 @@ impl LlamaLayer {
                 for (h, scores_h) in score_chunks.into_iter().enumerate() {
                     let kv_h = h / n_rep;
                     let q_off = h * head_dim;
-                    let q_vec = &q_data[q_off..q_off + head_dim];
-                    let mut kv_f32 = vec![0.0f32; head_dim];
 
                     for t in 0..cache_seq_len {
                         let off = if is_head_major {
@@ -1255,15 +1289,30 @@ impl LlamaLayer {
                         } else {
                             (t * n_heads_kv + kv_h) * head_dim
                         };
-                        let k_row = &k_data[off..off + head_dim];
-                        for d in 0..head_dim {
-                            kv_f32[d] = k_row[d].to_f32();
-                        }
-                        let score: f32 = q_vec
-                            .iter()
-                            .zip(kv_f32[..head_dim].iter())
-                            .map(|(a, b)| a * b)
-                            .sum();
+
+                        #[cfg(target_arch = "aarch64")]
+                        let score = unsafe {
+                            crate::backend::cpu::neon::CpuBackendNeon::vec_dot_f16_f32(
+                                head_dim,
+                                q_data.as_ptr().add(q_off),
+                                k_raw.add(off),
+                            )
+                        };
+                        #[cfg(not(target_arch = "aarch64"))]
+                        let score = {
+                            let k_f16 = unsafe {
+                                std::slice::from_raw_parts(
+                                    k_raw.add(off) as *const half::f16,
+                                    head_dim,
+                                )
+                            };
+                            let q_vec = &q_data[q_off..q_off + head_dim];
+                            q_vec
+                                .iter()
+                                .zip(k_f16.iter())
+                                .map(|(&a, &b)| a * b.to_f32())
+                                .sum::<f32>()
+                        };
                         scores_h[t] = score * scale;
                     }
 

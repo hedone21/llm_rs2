@@ -38,7 +38,8 @@ impl MmapBuffer {
     /// `offset + size` must not exceed the mmap length.
     pub unsafe fn new(mmap: Arc<memmap2::Mmap>, offset: usize, size: usize, dtype: DType) -> Self {
         debug_assert!(offset + size <= mmap.len());
-        let ptr = mmap.as_ptr().add(offset);
+        // Safety: caller guarantees offset + size <= mmap.len()
+        let ptr = unsafe { mmap.as_ptr().add(offset) };
         Self {
             ptr,
             size,

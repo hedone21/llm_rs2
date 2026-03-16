@@ -280,21 +280,43 @@ impl Backend for CpuBackendCommon {
             (DType::F32, DType::F16) => {
                 let s = src.as_slice::<f32>();
                 let d = dst.as_mut_slice::<half::f16>();
-                d.par_iter_mut()
-                    .zip(s.par_iter())
-                    .for_each(|(d_val, s_val)| {
+                // Serial for small arrays (avoids Rayon dispatch overhead ~100µs)
+                if s.len() < 4096 {
+                    for (d_val, s_val) in d.iter_mut().zip(s.iter()) {
                         *d_val = half::f16::from_f32(*s_val);
-                    });
+                    }
+                } else {
+                    d.par_iter_mut()
+                        .zip(s.par_iter())
+                        .for_each(|(d_val, s_val)| {
+                            *d_val = half::f16::from_f32(*s_val);
+                        });
+                }
                 Ok(())
             }
             (DType::F16, DType::F32) => {
                 let s = src.as_slice::<half::f16>();
                 let d = dst.as_mut_slice::<f32>();
-                d.par_iter_mut()
-                    .zip(s.par_iter())
-                    .for_each(|(d_val, s_val)| {
+                if s.len() < 4096 {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        super::neon::CpuBackendNeon::bulk_f16_to_f32(
+                            s.as_ptr() as *const u16,
+                            d.as_mut_ptr(),
+                            s.len(),
+                        );
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    for (d_val, s_val) in d.iter_mut().zip(s.iter()) {
                         *d_val = s_val.to_f32();
-                    });
+                    }
+                } else {
+                    d.par_iter_mut()
+                        .zip(s.par_iter())
+                        .for_each(|(d_val, s_val)| {
+                            *d_val = s_val.to_f32();
+                        });
+                }
                 Ok(())
             }
             (DType::F32, DType::Q4_0) => {
@@ -409,6 +431,9 @@ impl Backend for CpuBackendCommon {
                     });
             }
             DType::F16 => {
+                // With +fp16 target feature, half::f16::to_f32() inlines to scalar fcvt
+                // and the compiler auto-vectorizes the conversion loop to fcvtl.
+                // This is faster than manual inline asm due to better register allocation.
                 let k_data = k_cache.as_slice::<half::f16>();
                 let v_data = v_cache.as_slice::<half::f16>();
                 out_data
@@ -419,10 +444,9 @@ impl Backend for CpuBackendCommon {
                         let q_off = h * head_dim;
                         let q_vec = &q_data[q_off..q_off + head_dim];
                         let mut scores = vec![0.0f32; cache_seq_len];
-                        // Thread-local F32 buffer for converted F16 data
                         let mut kv_f32 = vec![0.0f32; head_dim];
 
-                        // Q * K^T: convert K row to F32, then NEON dot
+                        // Q * K^T: convert K to F32, then NEON dot
                         for t in 0..cache_seq_len {
                             let off = if is_head_major {
                                 (kv_h * capacity + t) * head_dim
@@ -430,7 +454,6 @@ impl Backend for CpuBackendCommon {
                                 (t * num_heads_kv + kv_h) * head_dim
                             };
                             let k_row = &k_data[off..off + head_dim];
-                            // Bulk F16→F32 conversion (compiler auto-vectorizes on aarch64)
                             for d in 0..head_dim {
                                 kv_f32[d] = k_row[d].to_f32();
                             }
@@ -498,7 +521,7 @@ impl Backend for CpuBackendCommon {
                             *s /= sum_e;
                         }
 
-                        // Weighted V sum: convert V row to F32, then NEON FMA
+                        // Weighted V sum
                         for d in 0..head_dim {
                             out_h[d] = 0.0;
                         }

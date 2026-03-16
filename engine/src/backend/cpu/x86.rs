@@ -369,9 +369,12 @@ impl CpuBackendAVX2 {
 
     /// AVX2+F16C dot product: A(F32) · B(F16).
     /// Processes 32 elements per iteration (4x unroll of 8-element F16C converts).
+    ///
+    /// # Safety
+    /// `a_ptr` must point to at least `k` f32 values, `b_ptr` to at least `k` u16 (F16) values.
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
-    unsafe fn vec_dot_f16_f32_avx2(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
+    pub unsafe fn vec_dot_f16_f32_avx2(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
         unsafe {
             let mut acc0 = _mm256_setzero_ps();
             let mut acc1 = _mm256_setzero_ps();
@@ -428,6 +431,64 @@ impl CpuBackendAVX2 {
             }
 
             sum
+        }
+    }
+
+    /// AVX2+F16C weighted accumulate: out[i] += weight * v_f16[i]
+    /// Fused F16C convert + FMA — operates directly on F16 data.
+    ///
+    /// # Safety
+    /// `out_ptr` must point to at least `k` f32 values (read-write),
+    /// `v_ptr` to at least `k` u16 (F16) values.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma", enable = "f16c")]
+    pub unsafe fn vec_mad_f16_avx2(k: usize, out_ptr: *mut f32, v_ptr: *const u16, weight: f32) {
+        unsafe {
+            let w = _mm256_set1_ps(weight);
+            let mut idx = 0;
+
+            // Main loop: 32 elements per iteration
+            while idx + 32 <= k {
+                let v0 = _mm256_cvtph_ps(_mm_loadu_si128(v_ptr.add(idx) as *const __m128i));
+                let v1 = _mm256_cvtph_ps(_mm_loadu_si128(v_ptr.add(idx + 8) as *const __m128i));
+                let v2 = _mm256_cvtph_ps(_mm_loadu_si128(v_ptr.add(idx + 16) as *const __m128i));
+                let v3 = _mm256_cvtph_ps(_mm_loadu_si128(v_ptr.add(idx + 24) as *const __m128i));
+
+                _mm256_storeu_ps(
+                    out_ptr.add(idx),
+                    _mm256_fmadd_ps(w, v0, _mm256_loadu_ps(out_ptr.add(idx))),
+                );
+                _mm256_storeu_ps(
+                    out_ptr.add(idx + 8),
+                    _mm256_fmadd_ps(w, v1, _mm256_loadu_ps(out_ptr.add(idx + 8))),
+                );
+                _mm256_storeu_ps(
+                    out_ptr.add(idx + 16),
+                    _mm256_fmadd_ps(w, v2, _mm256_loadu_ps(out_ptr.add(idx + 16))),
+                );
+                _mm256_storeu_ps(
+                    out_ptr.add(idx + 24),
+                    _mm256_fmadd_ps(w, v3, _mm256_loadu_ps(out_ptr.add(idx + 24))),
+                );
+
+                idx += 32;
+            }
+
+            // 8-element tail
+            while idx + 8 <= k {
+                let v0 = _mm256_cvtph_ps(_mm_loadu_si128(v_ptr.add(idx) as *const __m128i));
+                _mm256_storeu_ps(
+                    out_ptr.add(idx),
+                    _mm256_fmadd_ps(w, v0, _mm256_loadu_ps(out_ptr.add(idx))),
+                );
+                idx += 8;
+            }
+
+            // Scalar tail
+            while idx < k {
+                *out_ptr.add(idx) += weight * half::f16::from_bits(*v_ptr.add(idx)).to_f32();
+                idx += 1;
+            }
         }
     }
 

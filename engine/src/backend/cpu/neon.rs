@@ -446,9 +446,13 @@ impl CpuBackendNeon {
         }
     }
 
-    /// Single-row NEON dot product (used for tail rows when N % 4 != 0).
+    /// Single-row NEON dot product: A(F32) · B(F16) → scalar F32.
+    /// Fused fcvtl + vfmaq_f32 — no intermediate F32 buffer needed.
+    ///
+    /// # Safety
+    /// `a_ptr` must point to at least `k` f32 values, `b_ptr` to at least `k` u16 (F16) values.
     #[target_feature(enable = "neon")]
-    unsafe fn vec_dot_f16_f32(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
+    pub unsafe fn vec_dot_f16_f32(k: usize, a_ptr: *const f32, b_ptr: *const u16) -> f32 {
         let mut sum0 = vdupq_n_f32(0.0);
         let mut sum1 = vdupq_n_f32(0.0);
         let mut sum2 = vdupq_n_f32(0.0);
@@ -512,6 +516,120 @@ impl CpuBackendNeon {
         }
 
         sum
+    }
+
+    /// NEON F16 weighted accumulate: out[i] += weight * v_f16[i]
+    /// Fused fcvtl + vfmaq_f32 — operates directly on F16 data without temp buffer.
+    ///
+    /// # Safety
+    /// `out_ptr` must point to at least `k` f32 values (read-write),
+    /// `v_ptr` to at least `k` u16 (F16) values.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn vec_mad_f16(k: usize, out_ptr: *mut f32, v_ptr: *const u16, weight: f32) {
+        let w_v = vdupq_n_f32(weight);
+        let mut idx = 0;
+
+        // Main loop: 16 elements per iteration
+        while idx + 16 <= k {
+            let v_raw0: uint16x8_t = vld1q_u16(v_ptr.add(idx));
+            let v_raw1: uint16x8_t = vld1q_u16(v_ptr.add(idx + 8));
+
+            let v0: float32x4_t;
+            let v1: float32x4_t;
+            let v2: float32x4_t;
+            let v3: float32x4_t;
+            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) v0, i = in(vreg) v_raw0);
+            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) v1, i = in(vreg) v_raw0);
+            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) v2, i = in(vreg) v_raw1);
+            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) v3, i = in(vreg) v_raw1);
+
+            vst1q_f32(
+                out_ptr.add(idx),
+                vfmaq_f32(vld1q_f32(out_ptr.add(idx)), w_v, v0),
+            );
+            vst1q_f32(
+                out_ptr.add(idx + 4),
+                vfmaq_f32(vld1q_f32(out_ptr.add(idx + 4)), w_v, v1),
+            );
+            vst1q_f32(
+                out_ptr.add(idx + 8),
+                vfmaq_f32(vld1q_f32(out_ptr.add(idx + 8)), w_v, v2),
+            );
+            vst1q_f32(
+                out_ptr.add(idx + 12),
+                vfmaq_f32(vld1q_f32(out_ptr.add(idx + 12)), w_v, v3),
+            );
+
+            idx += 16;
+        }
+
+        // 8-element tail
+        while idx + 8 <= k {
+            let v_raw: uint16x8_t = vld1q_u16(v_ptr.add(idx));
+            let vlo: float32x4_t;
+            let vhi: float32x4_t;
+            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) vlo, i = in(vreg) v_raw);
+            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) vhi, i = in(vreg) v_raw);
+
+            vst1q_f32(
+                out_ptr.add(idx),
+                vfmaq_f32(vld1q_f32(out_ptr.add(idx)), w_v, vlo),
+            );
+            vst1q_f32(
+                out_ptr.add(idx + 4),
+                vfmaq_f32(vld1q_f32(out_ptr.add(idx + 4)), w_v, vhi),
+            );
+
+            idx += 8;
+        }
+
+        // Scalar tail
+        while idx < k {
+            *out_ptr.add(idx) += weight * half::f16::from_bits(*v_ptr.add(idx)).to_f32();
+            idx += 1;
+        }
+    }
+
+    /// NEON bulk F16→F32 conversion using fcvtl.
+    /// 16 elements per iteration (2× vld1q_u16 + 4× fcvtl/fcvtl2 + 4× vst1q_f32).
+    ///
+    /// # Safety
+    /// `src` must point to at least `n` u16 (F16) values,
+    /// `dst` to at least `n` f32 values (write-only).
+    #[target_feature(enable = "neon")]
+    pub unsafe fn bulk_f16_to_f32(src: *const u16, dst: *mut f32, n: usize) {
+        let mut i = 0;
+        while i + 16 <= n {
+            let raw0: uint16x8_t = vld1q_u16(src.add(i));
+            let raw1: uint16x8_t = vld1q_u16(src.add(i + 8));
+            let f0: float32x4_t;
+            let f1: float32x4_t;
+            let f2: float32x4_t;
+            let f3: float32x4_t;
+            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f0, i = in(vreg) raw0);
+            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f1, i = in(vreg) raw0);
+            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f2, i = in(vreg) raw1);
+            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f3, i = in(vreg) raw1);
+            vst1q_f32(dst.add(i), f0);
+            vst1q_f32(dst.add(i + 4), f1);
+            vst1q_f32(dst.add(i + 8), f2);
+            vst1q_f32(dst.add(i + 12), f3);
+            i += 16;
+        }
+        while i + 8 <= n {
+            let raw: uint16x8_t = vld1q_u16(src.add(i));
+            let lo: float32x4_t;
+            let hi: float32x4_t;
+            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) lo, i = in(vreg) raw);
+            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) hi, i = in(vreg) raw);
+            vst1q_f32(dst.add(i), lo);
+            vst1q_f32(dst.add(i + 4), hi);
+            i += 8;
+        }
+        while i < n {
+            *dst.add(i) = half::f16::from_bits(*src.add(i)).to_f32();
+            i += 1;
+        }
     }
 
     fn matmul_transposed_q4_0(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
