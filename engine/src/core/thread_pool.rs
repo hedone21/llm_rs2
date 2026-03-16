@@ -176,9 +176,7 @@ impl SpinPool {
         // just update work params and bump generation — no unpark needed.
         for &(wf, ctx, nc) in &items[1..] {
             self.shared.work_fn.store(wf as usize, Ordering::Relaxed);
-            self.shared
-                .work_ctx
-                .store(ctx as usize, Ordering::Relaxed);
+            self.shared.work_ctx.store(ctx as usize, Ordering::Relaxed);
             self.shared.total_chunks.store(nc, Ordering::Relaxed);
             self.shared.next_chunk.store(0, Ordering::Relaxed);
             self.shared.done_count.store(0, Ordering::Relaxed);

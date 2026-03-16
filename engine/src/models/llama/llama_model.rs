@@ -98,17 +98,18 @@ impl LlamaModel {
             println!("Loading {} safetensors shards...", shard_files.len());
         }
 
-        let shard_mmaps: Vec<memmap2::Mmap> = shard_files
+        // Arc-wrapped mmaps for zero-copy MmapBuffer weight sharing
+        let shard_mmap_arcs: Vec<Arc<memmap2::Mmap>> = shard_files
             .iter()
             .map(|f| {
                 let file = File::open(path.join(f))?;
-                unsafe { Ok(MmapOptions::new().map(&file)?) }
+                Ok(Arc::new(unsafe { MmapOptions::new().map(&file)? }))
             })
             .collect::<Result<_>>()?;
 
-        let shard_tensors: Vec<SafeTensors> = shard_mmaps
+        let shard_tensors: Vec<SafeTensors> = shard_mmap_arcs
             .iter()
-            .map(|m| SafeTensors::deserialize(m).map_err(|e| anyhow!("{}", e)))
+            .map(|m| SafeTensors::deserialize(m.as_ref()).map_err(|e| anyhow!("{}", e)))
             .collect::<Result<_>>()?;
 
         // Use CPU memory for loading
@@ -118,21 +119,12 @@ impl LlamaModel {
         // Helper to load a specific tensor by name (supports multi-shard lookup)
         // is_weight: true for weight matrices (use weight_dtype), false for norms/embeddings (always F32)
         let load_tensor = |name: &str, is_weight: bool| -> Result<Tensor> {
-            let tensor_view = if let Some(&idx) = weight_map.get(name) {
-                match shard_tensors[idx].tensor(name) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        println!("Error finding tensor '{}' in shard {}", name, idx);
-                        return Err(anyhow!("{}", e));
-                    }
-                }
-            } else {
-                match shard_tensors[0].tensor(name) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        println!("Error finding tensor: {}", name);
-                        return Err(anyhow!("{}", e));
-                    }
+            let shard_idx = weight_map.get(name).copied().unwrap_or(0);
+            let tensor_view = match shard_tensors[shard_idx].tensor(name) {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("Error finding tensor '{}' in shard {}", name, shard_idx);
+                    return Err(anyhow!("{}", e));
                 }
             };
             let shape = Shape::new(tensor_view.shape().to_vec());
@@ -140,14 +132,28 @@ impl LlamaModel {
 
             let target_dtype = if is_weight { weight_dtype } else { DType::F32 };
 
-            // F16 weight path: convert directly to F16 without F32 intermediate
+            // F16 weight path: zero-copy mmap when safetensors is already F16 (CPU backend)
             if target_dtype == DType::F16 {
+                // Fast path: safetensors stores F16 → reference mmap directly (0 copies)
+                if tensor_view.dtype() == safetensors::Dtype::F16 && backend.name().contains("CPU")
+                {
+                    use crate::buffer::mmap_buffer::MmapBuffer;
+                    let data = tensor_view.data();
+                    let data_offset =
+                        data.as_ptr() as usize - shard_mmap_arcs[shard_idx].as_ptr() as usize;
+                    let mmap_arc = shard_mmap_arcs[shard_idx].clone();
+                    let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
+                        MmapBuffer::new(mmap_arc, data_offset, data.len(), DType::F16)
+                    });
+                    return Ok(Tensor::new(shape, buffer, backend.clone()));
+                }
+
+                // Conversion path: BF16/F32 → F16 (requires copy)
                 use half::f16;
                 let mut f16_data = vec![f16::from_f32(0.0); num_elements];
 
                 match tensor_view.dtype() {
                     safetensors::Dtype::F16 => {
-                        // Zero-copy: direct memcpy from safetensors
                         let data = tensor_view.data();
                         unsafe {
                             std::ptr::copy_nonoverlapping(
