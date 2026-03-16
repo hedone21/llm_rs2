@@ -14,3 +14,4 @@ pub mod sampling;
 pub mod shape;
 pub mod sys_monitor;
 pub mod tensor;
+pub mod thread_pool;

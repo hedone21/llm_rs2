@@ -3,6 +3,7 @@ use crate::core::backend::Backend;
 use crate::core::buffer::DType;
 use crate::core::quant::{BlockQ4_0, BlockQ4_1, BlockQ8_0, QK4_0, QK4_1, QK8_0};
 use crate::core::tensor::Tensor;
+use crate::core::thread_pool::{self, WorkFn};
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::arch::aarch64::*;
@@ -259,51 +260,32 @@ impl CpuBackendNeon {
         }
 
         const NR: usize = 4;
-        // Use usize to bypass Send bounds — threads access non-overlapping regions.
-        let a_raw = a_data.as_ptr() as usize;
-        let b_raw = b_data.as_ptr() as usize;
+        let pool = thread_pool::get_pool();
 
-        // Work-stealing via par_chunks_mut with moderate chunk size.
-        // Too small = Rayon task overhead; too large = load imbalance on big.LITTLE.
-        // Target: ~2x thread count chunks for work-stealing headroom.
-        let num_threads = rayon::current_num_threads();
-        let target_chunks = num_threads * 2;
-        let chunk_rows = ((n + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
-        let chunk_rows = chunk_rows.max(NR);
+        // Coarse chunks to minimize atomic contention on next_chunk counter.
+        // Target ~8 chunks per thread for work-stealing balance.
+        let n_threads = rayon::current_num_threads();
+        let target_chunks = n_threads * 8;
+        let rows_per_chunk = ((n + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
+        let rows_per_chunk = rows_per_chunk.max(NR);
+        let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
 
         for i in 0..m {
-            let out_row = &mut out_data[i * n..(i + 1) * n];
-            out_row
-                .par_chunks_mut(chunk_rows)
-                .enumerate()
-                .for_each(|(ci, chunk)| {
-                    let a_ptr = unsafe { (a_raw as *const f32).add(i * k) };
-                    let b_base = b_raw as *const u16;
-                    let j_start = ci * chunk_rows;
-
-                    let mut local_j = 0;
-                    while local_j + NR <= chunk.len() {
-                        let gj = j_start + local_j;
-                        let b_ptrs = [
-                            unsafe { b_base.add(gj * k) },
-                            unsafe { b_base.add((gj + 1) * k) },
-                            unsafe { b_base.add((gj + 2) * k) },
-                            unsafe { b_base.add((gj + 3) * k) },
-                        ];
-                        let mut results = [0.0f32; NR];
-                        unsafe {
-                            Self::vec_dot_f16_f32_4rows(k, a_ptr, b_ptrs, &mut results);
-                        }
-                        chunk[local_j..local_j + NR].copy_from_slice(&results);
-                        local_j += NR;
-                    }
-                    while local_j < chunk.len() {
-                        let gj = j_start + local_j;
-                        let b_ptr = unsafe { b_base.add(gj * k) };
-                        chunk[local_j] = unsafe { Self::vec_dot_f16_f32(k, a_ptr, b_ptr) };
-                        local_j += 1;
-                    }
-                });
+            let ctx = F16GemvCtx {
+                a_ptr: unsafe { a_data.as_ptr().add(i * k) },
+                b_base: b_data.as_ptr() as *const u16,
+                out_ptr: unsafe { out_data.as_mut_ptr().add(i * n) },
+                k,
+                n,
+                rows_per_chunk,
+            };
+            unsafe {
+                pool.dispatch(
+                    n_chunks,
+                    f16_gemv_chunk,
+                    &ctx as *const F16GemvCtx as *const u8,
+                );
+            }
         }
         Ok(())
     }
@@ -904,5 +886,49 @@ impl CpuBackendNeon {
             }
         }
         *s = sumf;
+    }
+}
+
+// --- SpinPool work context for F16 GEMV ---
+
+#[repr(C)]
+struct F16GemvCtx {
+    a_ptr: *const f32,
+    b_base: *const u16,
+    out_ptr: *mut f32,
+    k: usize,
+    n: usize,
+    rows_per_chunk: usize,
+}
+
+/// Work function for SpinPool: processes a coarse chunk of output rows.
+/// Each chunk contains multiple NR=4 row blocks to reduce atomic contention.
+///
+/// # Safety
+/// Called by SpinPool workers with valid F16GemvCtx pointer.
+unsafe fn f16_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
+    const NR: usize = 4;
+    let ctx = &*(ctx_ptr as *const F16GemvCtx);
+    let j_start = chunk_id * ctx.rows_per_chunk;
+    let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
+
+    let mut j = j_start;
+    while j + NR <= j_end {
+        let b_ptrs = [
+            ctx.b_base.add(j * ctx.k),
+            ctx.b_base.add((j + 1) * ctx.k),
+            ctx.b_base.add((j + 2) * ctx.k),
+            ctx.b_base.add((j + 3) * ctx.k),
+        ];
+        let mut results = [0.0f32; NR];
+        CpuBackendNeon::vec_dot_f16_f32_4rows(ctx.k, ctx.a_ptr, b_ptrs, &mut results);
+        std::ptr::copy_nonoverlapping(results.as_ptr(), ctx.out_ptr.add(j), NR);
+        j += NR;
+    }
+    // Scalar tail within chunk
+    while j < j_end {
+        *ctx.out_ptr.add(j) =
+            CpuBackendNeon::vec_dot_f16_f32(ctx.k, ctx.a_ptr, ctx.b_base.add(j * ctx.k));
+        j += 1;
     }
 }
