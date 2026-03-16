@@ -13,148 +13,242 @@
 ## [P0] Rayon 스레드 수 자동 감지
 - **Status**: DONE
 - **Sprint**: current
-- **Notes**: 커밋 7ada247. `--threads` CLI 옵션 추가. 기본값: `available_parallelism()` 자동 감지. 8→20 스레드로 +24.5% (37.5→46.7 tok/s).
+- **Notes**: 커밋 7ada247. `--threads` CLI 옵션 추가. 기본값: `available_parallelism()` 자동 감지.
 
 ## [P0] x86 attention AVX2 SIMD 구현
 - **Status**: DONE
 - **Sprint**: current
-- **Notes**: 커밋 7ada247. `dot_f32_avx2()` + `weighted_accum_f32_avx2()` 4x 언롤 FMA. parallel/serial 양쪽 경로 적용. 365 tests passed.
+- **Notes**: 커밋 7ada247. `dot_f32_avx2()` + `weighted_accum_f32_avx2()`.
 
-## [P0] 기준선 측정 및 수정 전후 비교
+## [P0] NEON F16 multi-row GEMV
 - **Status**: DONE
 - **Sprint**: current
-- **Notes**: 측정 완료. F32 KV: 51.5 tok/s, Q4 KV: 51.2 tok/s (20 threads). 긴 프롬프트(141 tokens) TTFT 3.4s, decode 49.3 tok/s. 이론 피크 ~120 tok/s 대비 43% 달성. 스레드 스케일링: 4t=20.9, 8t=37.5, 12t=42.4, 16t=45.6, 20t=46.7 tok/s (diminishing returns → memory bandwidth bound).
+- **Notes**: 커밋 b25bc19. `vec_dot_f16_f32_4rows()` 16-element stride + prefetch. 단일 스레드 성능은 llama.cpp와 동일 (6.2 vs 6.27 tok/s). 멀티스레드 스케일링이 병목.
 
-## [P1] forward_gen 연산별 내부 계측
-- **Status**: DONE
+---
+
+# F16 성능 개선 Sprint: llama.cpp 동급 달성
+
+> **목표**: llama.cpp F16 24.9 tok/s 동급 달성 (현재 15.5 tok/s)
+> **핵심 병목**: 멀티스레드 스케일링 (1.76x@4T vs llama.cpp 4.06x@4T)
+> **근본 원인**: Rayon per-matmul fork-join 오버헤드 (~300µs × 112 calls = 33ms/token)
+> **측정 디바이스**: Galaxy S24 (Snapdragon 8 Gen 3), Llama 3.2 1B F16
+> **llama.cpp 소스**: `/home/go/Workspace/llama.cpp/`
+
+---
+
+## 근거 데이터 (2026-03-16 측정)
+
+### 스레드 스케일링 비교
+
+| Threads | llama.cpp tok/s | llm.rs2 tok/s | llama.cpp 스케일링 | llm.rs2 스케일링 |
+|---------|-----------------|---------------|-------------------|-----------------|
+| 1 | 6.27 | 6.2 | 1.00x | 1.00x |
+| 4 | **25.45** | 10.9 | **4.06x** | 1.76x |
+| 7 | 24.41 | 15.9 | 3.89x | 2.57x |
+| 8 | 24.58 | 12.6 | 3.92x | 2.03x |
+
+**핵심**: 단일 스레드 동일 → NEON inner loop 최적화 불필요. 문제는 100% threading.
+
+### 대역폭 분석
+
+- 단일 코어 대역폭: ~11.5 GB/s (동일)
+- llama.cpp 4T: 25.45 tok/s = 46.3 GB/s aggregate (4코어로 대역폭 포화)
+- llm.rs2 7T: 15.9 tok/s = 29.5 GB/s aggregate (7코어인데도 대역폭 미포화)
+- 갭 원인: 코어 추가가 대역폭 증가로 이어지지 않음 → 스레드 오버헤드
+
+### 프로파일 분석
+
+Per-token 시간 분해 (F16, 7T):
+- 프로파일 추적됨: 43.6 ms (matmul 92%, attention 3%, kv_update 4%)
+- 미추적 시간: ~15 ms (lm_head matmul + Rayon overhead)
+- 112 matmul calls × ~300µs Rayon overhead = ~33 ms 추정
+
+---
+
+## 가설 및 검증 계획
+
+### [H1] Rayon per-matmul fork-join 오버헤드 ← 최우선 가설
+- **확신도**: 95%
+- **근거**: 1T 동일, 4T에서 2.3x 격차. llama.cpp는 persistent spin-wait threadpool.
+- **예상 영향**: 30-40 ms/token 절약 → 15.5 → 24+ tok/s
+- **검증**: H1-1 ~ H1-4 참조
+
+### [H2] lm_head matmul 미프로파일링
+- **확신도**: 99%
+- **근거**: 128256×2048 F16 = 501 MB, 미추적 15ms와 일치
+- **영향**: 성능 자체 영향 없음 (lm_head은 어쨌든 실행됨). 프로파일 정확도 개선.
+- **검증**: H2-1 참조
+
+### [H3] 이종 코어(big.LITTLE) 로드 밸런싱
+- **확신도**: 70%
+- **근거**: 8T(12.6) < 7T(15.9). little core가 static partitioning에서 병목.
+- **영향**: llama.cpp도 8T에서 7T와 동일 (24.4 vs 24.6) → big.LITTLE 자체는 공통 한계
+- **검증**: H1 해결로 함께 해결 가능 (work-stealing → little core에 적게 할당)
+
+### [H4] OpenCL F16 커널 미최적화
+- **확신도**: 99%
+- **근거**: 1.9 tok/s. 범용 GEMM 템플릿, Adreno 서브그룹 미사용.
+- **영향**: OpenCL F16에만 해당 (CPU F16과 독립)
+- **검증**: H4-1 ~ H4-2 참조
+
+---
+
+## Iteration 1: Rayon → Spin-wait Threadpool [H1 검증]
+
+### [P0] H1-1. Rayon 오버헤드 정량 측정
+- **Status**: TODO
 - **Sprint**: current
-- **Notes**: 커밋 9fb86b6. `--profile` CLI 플래그 추가. OpProfiler로 11개 연산 구간별 Instant 타이밍. 결과: matmul_ffn(67%), matmul_qkv(17%), matmul_wo(8%), attention(5.6%), silu_mul(1.4%), rope(0.5%), rms_norm(0.3%), kv_update(0.4%). matmul 합계 91.7% → memory bandwidth bound 확인.
+- **Description**: matmul_transposed 함수 진입/퇴장 시간을 Instant::now()로 측정.
+  matmul 내부 순수 연산 시간과 함수 전체 시간의 차이 = Rayon 오버헤드.
+- **측정 방법**:
+  1. matmul_transposed_f16 시작에 `t_start = Instant::now()`
+  2. par_chunks_mut 직전에 `t_par_start`
+  3. par_chunks_mut 직후에 `t_par_end`
+  4. 함수 끝에 `t_end`
+  5. `t_par_end - t_par_start` = Rayon 실행 시간
+  6. `(t_end - t_start) - (t_par_end - t_par_start)` = setup 오버헤드
+  7. 집계: 총 호출 수, 평균/최대 Rayon 시간, 평균/최대 setup 시간
+- **Acceptance Criteria**: per-call 오버헤드 숫자 (예: 300µs), 총 오버헤드 (예: 33ms/token)
+- **비고**: 이 측정 자체가 오버헤드를 추가하므로 delta 비교로 평가
 
-## [P1] 외부 프로파일링 (flamegraph + perf stat)
+### [P0] H1-2. Spin-wait ThreadPool 구현
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: H1-1으로 오버헤드 확인 후
+- **Description**: llama.cpp 방식의 persistent spin-wait threadpool 구현.
+  Rayon 대체가 아닌 F16 matmul 전용 (기존 Q4/다른 연산은 Rayon 유지).
+- **설계**:
+  ```
+  SpinPool {
+    workers: Vec<JoinHandle>,
+    shared: Arc<SharedState>,
+  }
+  SharedState {
+    generation: AtomicU64,     // 작업 세대 (workers가 spin-wait)
+    work_fn: AtomicPtr<()>,     // 작업 함수 포인터
+    work_data: AtomicPtr<()>,   // 작업 데이터 포인터
+    next_chunk: AtomicUsize,    // work-stealing용 원자 카운터
+    total_chunks: AtomicUsize,  // 총 청크 수
+    done_count: AtomicUsize,    // 완료 카운터
+  }
+  ```
+  Worker 루프:
+  ```
+  loop {
+    spin_wait(generation 변경)
+    loop {
+      chunk_id = next_chunk.fetch_add(1)
+      if chunk_id >= total_chunks: break
+      execute work_fn(work_data, chunk_id)
+    }
+    done_count.fetch_add(1)
+  }
+  ```
+  Main thread:
+  ```
+  fn dispatch(work_fn, data, n_chunks):
+    set work_fn, work_data, total_chunks
+    next_chunk = 0, done_count = 0
+    generation += 1  // workers 깨우기
+    spin_wait(done_count == n_workers)
+  ```
+- **구현 위치**: `engine/src/core/thread_pool.rs` (신규)
+- **Acceptance Criteria**: per-matmul 오버헤드 < 10µs, 112 calls < 1.2ms/token
+- **핵심**: work-stealing (fetch_add) → big.LITTLE 자연 밸런싱
+
+### [P0] H1-3. F16 matmul을 SpinPool로 전환
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: H1-2 완료 후
+- **Description**: `matmul_transposed_f16`에서 `par_chunks_mut` → `spin_pool.dispatch()` 교체.
+  SpinPool은 CpuBackendNeon에 필드로 저장 (lazy init).
+- **Acceptance Criteria**: CPU F16 tok/s > 20 (4T 기준 비교)
+- **Notes**: Q4 matmul은 일단 Rayon 유지 (이미 30.9 tok/s)
+
+### [P0] H1-4. 디바이스 벤치마크 & 스레드 스케일링 재측정
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: H1-3 완료 후
+- **Description**: 1T/4T/7T/8T 스케일링 재측정. llama.cpp 대비 갭 확인.
+- **목표**: 4T에서 24+ tok/s (llama.cpp 25.45 수준)
+- **다음 단계**: 갭 잔존 시 H1-5 프로파일 분석
+
+### [P1] H1-5. Q4 matmul도 SpinPool로 전환
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: P1 내부 계측 완료 ✅
-- **Description**: `cargo flamegraph`로 CPU 시간 분포 시각화, `perf stat`으로 IPC/캐시 미스율 측정. prefill-only vs decode-only 분리 프로파일링. Rayon 오버헤드 확인.
-- **Acceptance Criteria**: Flamegraph SVG, perf stat 카운터 테이블, 병목 분류(compute/memory/overhead)
+- **Dependencies**: H1-4에서 SpinPool 효과 확인 후
+- **Description**: Q4 matmul도 SpinPool 적용하여 추가 개선.
+- **예상 효과**: Q4 30.9 → 35+ tok/s (Rayon 오버헤드 제거)
 
-## [P1] micro_bench 확장
+---
+
+## Iteration 2: 프로파일 개선 [H2 검증]
+
+### [P1] H2-1. lm_head matmul 프로파일 추가
+- **Status**: TODO
+- **Sprint**: current
+- **Description**: `forward_into()`의 lm_head matmul에 프로파일 계측 추가.
+  matmul_lm_head 항목으로 별도 표시.
+- **위치**: `engine/src/models/llama/llama_model.rs:532`
+- **Acceptance Criteria**: 프로파일에서 lm_head 시간 표시, 미추적 시간 < 5%
+
+---
+
+## Iteration 3: OpenCL F16 커널 [H4 검증]
+
+### [P0] H4-1. Adreno F16 GEMV 커널 작성
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: P1 내부 계측 완료 ✅
-- **Description**: 현재 `quantize_row_q8_0`, `vec_dot_q4_0_q8_0`만 벤치마크. 추가 대상: matmul 차원별(N=2048/8192/128256), attention seq_len별(64~2048), rms_norm/rope/silu_mul 개별, Rayon serial vs parallel 비교.
-- **Acceptance Criteria**: 연산별 throughput 테이블, Rayon 오버헤드 정량화
-- **Notes**: `engine/src/bin/micro_bench.rs`
+- **Description**: `mul_mv_f16_f32.cl` 신규 작성. 기존 `mul_mv_q4_0_f32.cl` 패턴 기반.
+- **현재**: `mul_mat_f16_f32.cl` (범용 tiled GEMM, 1.9 tok/s)
+- **목표**: Adreno 830 특화 GEMV
+- **핵심 최적화**:
+  - 1D workgroup + 서브그룹 dispatch (64-thread wavefront)
+  - `read_imageh()` 또는 `vload_half` 활용 (Adreno 텍스처 캐시)
+  - 배리어 0개, 인라인 F16→F32 변환
+  - `half4`/`half8` 벡터 타입 활용
+  - N_DST=4 rows/subgroup (Q4 커널과 동일 패턴)
+- **참고**:
+  - llama.cpp `gemv_noshuffle.cl` (Adreno 특화)
+  - 우리 `mul_mv_q4_0_f32.cl` (Adreno 특화, 21.8 tok/s 달성)
+- **산출물**: `engine/kernels/mul_mv_f16_f32.cl`
+- **Acceptance Criteria**: 디바이스에서 15+ tok/s
 
-## [P1] 이론적 피크 대비 달성률 분석
-- **Status**: DONE
-- **Sprint**: current
-- **Notes**: Llama 3.2 1B Q4_0 디코드 기준 이론 피크 ~120 tok/s (DDR5 80GB/s). 실측 51.5 tok/s = 43% 달성. 스레드 12 이상에서 수확체감 → memory bandwidth bound 확인.
-
-## [P2] 소규모 연산 Rayon 오버헤드 제거
-- **Status**: DONE
-- **Sprint**: current
-- **Notes**: 커밋 9fb86b6. PARALLEL_THRESHOLD=16384 (64KB ≈ L1 cache size). add_assign, scale, silu_mul에서 threshold 미만 serial 실행. 프로파일 결과 add_assign 0.0%, silu_mul 1.4% (전체의 미미한 비중이므로 실측 성능 차이 미미).
-
-## [P2] RoPE 주파수 테이블 사전 계산
-- **Status**: DONE
-- **Sprint**: current
-- **Notes**: 커밋 9fb86b6. `powf()` 호출을 inner loop 밖으로 이동하여 freqs Vec 사전 계산. 프로파일 결과 rope 0.5% (전체의 미미한 비중).
-
-## [P2] Q4_0 matmul M≥4 AVX2 구현 (프리필 최적화)
-- **Status**: DONE
-- **Sprint**: current
-- **Notes**: 커밋 9fb86b6. M≥4에서 CpuBackendCommon 스칼라 폴백 → AVX2 quantize_row_q8_0 + vec_dot_q4_0_q8_0 사용. 병렬 A행 양자화 + 행별 병렬 dot product. 프리필 경로 AVX2 커버리지 100%.
-
----
-
-# 성능 개선 Sprint: F16 llama.cpp 동급 달성
-
-> **목표**: llama.cpp F16 24.4 tok/s 동급 이상 달성
-> **방법론**: 분석 → 구현 → 측정 루프 (점진적 개선)
-> **llama.cpp 소스**: `/home/go/Workspace/llama.cpp/` (shallow clone)
-> **기준 벤치마크**: `docs/31_perf_comparison_llama_cpp.md`
-> **측정 조건**: Galaxy S24, decode 128, 시작 온도 ~40°C
-> **이론 피크 (F16)**: ~27.5 tok/s (LPDDR5X 51 GB/s, weight 1.878 GB/token)
-
----
-
-## [DONE] Iteration 0: CPU Q4 Decode — 목표 달성
-
-- **결과**: 30.5 tok/s (llama.cpp CPU 24.4 대비 **+25%**)
-- **커밋**: 86d4885, c889b58 (NEON/AVX2 SIMD)
-- **비고**: Q4는 F16보다 3.2x 적은 bandwidth 사용 → 높은 tok/s 달성
-
----
-
-## Iteration 1: CPU F16 Decode (15.1 → 24+ tok/s) ← CURRENT
-
-### [P0] 1-1. NEON F16 multi-row GEMV 구현
-- **Status**: IN_PROGRESS
-- **Sprint**: current
-- **Description**: llama.cpp tinyBLAS 분석 기반으로 multi-row GEMV 구현.
-  현재 단일 행 `vec_dot_f16_f32` (4 accumulators) → 4-row 동시 처리로 전환.
-- **분석 결과**:
-  - llama.cpp: tinyBLAS RM=4×RN=6 블록 타일 + work-stealing threadpool
-  - 우리: 단일 행 GEMV + Rayon flat 병렬화
-  - 핵심 차이: 다중 행 처리로 ILP 향상 + 스레드 스케줄링 오버헤드 감소
-- **구현 내용**:
-  - `vec_dot_f16_f32_4rows()`: 4 weight rows × 8-element inner loop
-  - 8 accumulators (4 rows × 2 each), activation 1회 로드 후 4 rows에 재사용
-  - Rayon 스레드당 연속 output row 범위 할당 (chunk dispatch 대신)
-- **Acceptance Criteria**: 디바이스 decode 128에서 20+ tok/s
-
-### [P0] 1-2. 벤치마크 & 측정
-- **Status**: TODO
-- **Sprint**: current
-- **Dependencies**: 1-1 완료 후
-- **Description**: 디바이스에서 CPU F16 decode 128 측정, llama.cpp 대비 갭 확인.
-- **다음 단계**: 24+ 미달 시 추가 최적화 (software prefetch, NR=8 등)
-
-### [P1] 1-3. 추가 최적화 (필요 시)
-- **Status**: TODO
-- **Sprint**: current
-- **Dependencies**: 1-2 결과에 따라
-- **Description**: software prefetching (`prfm pldl1strm`), NR=8 multi-row, 32-element stride
-- **Target**: 이론 피크의 85%+ (23.4+ tok/s)
-
----
-
-## Iteration 2: OpenCL F16 Matmul (1.9 → 25+ tok/s)
-
-### [P0] 2-1. Adreno F16 GEMV 커널 작성
+### [P0] H4-2. OpenCL F16 dispatch 경로 연결
 - **Status**: TODO
 - **Sprint**: next
-- **Description**: 기존 Q4 커널(`mul_mv_q4_0_f32.cl`) 패턴 기반 Adreno 특화 F16 GEMV 커널.
-  현재 `mul_mat_f16_f32.cl`은 범용 tiled GEMM (1.9 tok/s, 사실상 미작동).
-- **핵심**: 서브그룹 dispatch, `read_imageh()`, 배리어 제거, 1D workgroup
-- **참고**: llama.cpp `gemv_noshuffle.cl` (Adreno 특화)
-- **Acceptance Criteria**: 디바이스에서 10+ tok/s 달성
+- **Dependencies**: H4-1 완료 후
+- **Description**: `OpenCLBackend::matmul_transposed()`에서 F16 weight 감지 시
+  `mul_mv_f16_f32.cl` 커널 dispatch.
+- **위치**: `engine/src/backend/opencl/mod.rs`
+- **Acceptance Criteria**: `--backend opencl --weight-dtype f16`에서 새 커널 사용
 
-### [P0] 2-2. 벤치마크 & 커널 튜닝
+### [P1] H4-3. 커널 파라미터 튜닝
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: 2-1 완료 후
-- **다음 단계**: 25+ tok/s 미달 시 커널 파라미터 튜닝
+- **Dependencies**: H4-2 완료 후
+- **Description**: workgroup size, N_DST, 벡터 너비, 캐시 사용량 튜닝.
+- **목표**: 25+ tok/s (llama.cpp GPU 22.7 수준 이상)
 
 ---
 
-## Iteration 3: Prefill 최적화 (TTFT 942ms → 100ms)
+## Iteration 4: Prefill 최적화
 
-### [P1] 3-1. CPU F16 batch matmul 타일링
+### [P1] 4-1. Prefill TTFT 개선 (942ms → 150ms)
 - **Status**: TODO
 - **Sprint**: backlog
-- **Description**: L1/L2 캐시에 맞는 타일 블로킹 적용.
-
-### [P1] 3-2. OpenCL prefill matmul 최적화
-- **Status**: TODO
-- **Sprint**: backlog
-- **Description**: M>1 전용 GEMM dispatch 경로.
+- **Description**: batch matmul (M>1) 타일링 + SpinPool 적용
+- **현재**: TTFT 942ms (F16), llama.cpp 115ms
+- **Notes**: Iter 1,2 완료 후 진행
 
 ---
 
 ## 측정 기록
 
-| 날짜 | Iter | 변경 | CPU F16 tok/s | CPU Q4 tok/s | OCL Q4 tok/s | OCL F16 tok/s | 비고 |
-|------|------|------|-------------|-------------|-------------|--------------|------|
-| 2026-03-13 | baseline | - | 15.2 | 17.5 | 30.1 | 1.7 | llama.cpp CPU F16=24.4 |
-| 2026-03-16 | re-measure | NEON/AVX2 SIMD 적용 후 | 15.1 | 30.5 | 21.8 | 1.9 | Q4 목표 달성, F16 최적화 필요 |
+| 날짜 | 변경 | CPU F16 tok/s | CPU Q4 tok/s | OCL F16 tok/s | 비고 |
+|------|------|-------------|-------------|--------------|------|
+| 03-13 | baseline | 15.2 | 17.5 | 1.7 | llama.cpp CPU=24.4 |
+| 03-16 | NEON SIMD | 15.1 | 30.5 | 1.9 | Q4 목표 달성 |
+| 03-16 | multi-row GEMV | 15.5 | 30.9 | - | inner loop 최적화 한계 확인 |
+| 03-16 | thread scaling | 15.9(7T) | 30.9 | - | **1T 동일, 멀티스레드 병목 확인** |
