@@ -319,8 +319,8 @@ impl OpenCLBackend {
             }
         };
 
-        // F16 matmul: try mul_mat_f16_f32.cl, fallback to dummy
-        let f16_src = include_str!("../../../kernels/mul_mat_f16_f32.cl");
+        // F16 GEMV: Adreno-optimized multi-row kernel (Q4 pattern ported to F16)
+        let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
         let f16_program = match Program::builder()
             .devices(device)
             .src(f16_src)
@@ -328,14 +328,14 @@ impl OpenCLBackend {
             .build(&context)
         {
             Ok(p) => {
-                log::info!("mul_mat_f16_f32.cl compiled");
+                log::info!("mul_mv_f16_f32.cl compiled (GEMV optimized)");
                 p
             }
             Err(e) => {
-                log::warn!("mul_mat_f16_f32.cl failed: {}. Using dummy.", e);
+                log::warn!("mul_mv_f16_f32.cl failed: {}. Using dummy.", e);
                 Program::builder()
                     .devices(device)
-                    .src("__kernel void mul_mat_f16_f32() {}")
+                    .src("__kernel void kernel_mul_mat_f16_f32() {}")
                     .build(&context)?
             }
         };
@@ -343,7 +343,10 @@ impl OpenCLBackend {
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
-            kernel_mul_mat_f16_f32: ocl::core::create_kernel(&f16_program, "mul_mat_f16_f32")?,
+            kernel_mul_mat_f16_f32: ocl::core::create_kernel(
+                &f16_program,
+                "kernel_mul_mat_f16_f32",
+            )?,
             kernel_mul_mat_q4_0_f32: ocl::core::create_kernel(
                 &q4_0_program,
                 "kernel_mul_mat_q4_0_f32",
@@ -437,32 +440,38 @@ impl OpenCLBackend {
             .map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
         let kernel = &kernels.kernel_mul_mat_f16_f32;
 
-        // mul_mat_f16_f32 kernel signature: (M, N, K, A_void, A_offset, B_void, B_offset, C_void, C_offset)
-        // A = weight (F16, [N, K] row-major), B = activation (F32, [M, K] row-major), C = output (F32)
-        // Note: kernel treats first arg as the matrix with N rows (weight), second as M rows (activation)
-        let m_i32 = n as i32; // weight rows = output columns
-        let n_i32 = m as i32; // activation rows = output rows
-        let k_i32 = k as i32;
+        // Same 15-arg signature as Q4 GEMV kernel
+        let ne00 = k as i32;
+        let ne01 = n as i32;
+        let ne02 = 1i32;
+        let ne10 = k as i32;
+        let ne12 = 1i32;
+        let ne0 = n as i32;
+        let ne1 = m as i32;
+        let r2 = 1i32;
+        let r3 = 1i32;
 
         unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::scalar(&m_i32))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&n_i32))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&k_i32))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(b_buf))?; // A=weight(F16)
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(a_buf))?; // B=activation(F32)
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::mem(out_buf))?; // C=output(F32)
-            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(b_buf))?; // src0=weight(F16)
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(a_buf))?; // src1=activation(F32)
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&ne10))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&ne12))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&ne0))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&ne1))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            // Tile dimensions from kernel: OPWM=64, OPWN=64, WG_M=16, WG_N=8
-            let opwm = 64usize;
-            let opwn = 64usize;
-            let wg_m = 16usize; // OPWM / OPTM = 64 / 4
-            let wg_n = 8usize; // OPWN / OPTN = 64 / 8
-            let global_work_size: [usize; 3] =
-                [n.div_ceil(opwm) * wg_m, m.div_ceil(opwn) * wg_n, 1];
-            let local_work_size: [usize; 3] = [wg_m, wg_n, 1];
+            // Same dispatch as Q4: 1 subgroup (64 threads) per N_DST=4 output rows
+            let local_work_size: [usize; 3] = [64, 1, 1];
+            let group_size_0 = n.div_ceil(4);
+            let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], m, 1];
 
             ocl::core::enqueue_kernel(
                 &self.queue,
