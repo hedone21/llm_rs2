@@ -345,7 +345,7 @@ impl KVCache {
                 // Scatter to head-major: each head's data at head * capacity * head_dim + pos * head_dim
                 if is_q4 {
                     let qk = crate::core::quant::QK4_0;
-                    let src_row = self.kv_heads * self.head_dim / qk; // blocks per seq position in input
+                    let src_row = self.kv_heads * self.head_dim / qk;
                     let dst_head_stride = self.capacity * self.head_dim / qk;
                     let blocks_per_head = self.head_dim / qk;
                     let dst_pos_blocks = self.current_pos * blocks_per_head;
@@ -372,28 +372,69 @@ impl KVCache {
                         }
                     }
                 } else {
-                    let src_row = self.kv_heads * self.head_dim; // elements per seq position in input
-                    let dst_head_stride = self.capacity * self.head_dim;
+                    // Direct memcpy scatter — avoids Backend::copy_slice overhead
+                    // (dtype match, null check per call) for many small copies.
+                    let type_size = match self.k_buffer.dtype() {
+                        crate::core::buffer::DType::F16 => 2,
+                        crate::core::buffer::DType::F32 => 4,
+                        _ => {
+                            // Fallback to backend copy_slice for unusual dtypes
+                            let src_row = self.kv_heads * self.head_dim;
+                            let dst_head_stride = self.capacity * self.head_dim;
+                            for s in 0..seq_len {
+                                for h in 0..self.kv_heads {
+                                    let src_off = s * src_row + h * self.head_dim;
+                                    let dst_off = h * dst_head_stride
+                                        + (self.current_pos + s) * self.head_dim;
+                                    backend.copy_slice(
+                                        new_k,
+                                        &mut self.k_buffer,
+                                        src_off,
+                                        dst_off,
+                                        self.head_dim,
+                                    )?;
+                                    backend.copy_slice(
+                                        new_v,
+                                        &mut self.v_buffer,
+                                        src_off,
+                                        dst_off,
+                                        self.head_dim,
+                                    )?;
+                                }
+                            }
+                            self.current_pos += seq_len;
+                            return Ok(());
+                        }
+                    };
 
-                    for s in 0..seq_len {
-                        for h in 0..self.kv_heads {
-                            let src_off = s * src_row + h * self.head_dim;
-                            let dst_off =
-                                h * dst_head_stride + (self.current_pos + s) * self.head_dim;
-                            backend.copy_slice(
-                                new_k,
-                                &mut self.k_buffer,
-                                src_off,
-                                dst_off,
-                                self.head_dim,
-                            )?;
-                            backend.copy_slice(
-                                new_v,
-                                &mut self.v_buffer,
-                                src_off,
-                                dst_off,
-                                self.head_dim,
-                            )?;
+                    let src_row = self.kv_heads * self.head_dim;
+                    let dst_head_stride = self.capacity * self.head_dim;
+                    let bytes_per_head = self.head_dim * type_size;
+
+                    let k_src = new_k.as_ptr();
+                    let v_src = new_v.as_ptr();
+                    let k_dst = self.k_buffer.as_mut_ptr();
+                    let v_dst = self.v_buffer.as_mut_ptr();
+
+                    unsafe {
+                        for s in 0..seq_len {
+                            for h in 0..self.kv_heads {
+                                let src_byte =
+                                    (s * src_row + h * self.head_dim) * type_size;
+                                let dst_byte = (h * dst_head_stride
+                                    + (self.current_pos + s) * self.head_dim)
+                                    * type_size;
+                                std::ptr::copy_nonoverlapping(
+                                    k_src.add(src_byte),
+                                    k_dst.add(dst_byte),
+                                    bytes_per_head,
+                                );
+                                std::ptr::copy_nonoverlapping(
+                                    v_src.add(src_byte),
+                                    v_dst.add(dst_byte),
+                                    bytes_per_head,
+                                );
+                            }
                         }
                     }
                 }
