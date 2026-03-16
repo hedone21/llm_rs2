@@ -381,9 +381,13 @@ impl KVCache {
                         _ => 0,
                     };
 
+                    // Direct CPU memcpy is faster than GPU enqueue_copy_buffer for
+                    // tiny copies (128 bytes per head). On ARM UMA (CL_MEM_ALLOC_HOST_PTR),
+                    // host pointers directly access GPU memory without DMA transfer.
                     let k_dst = self.k_buffer.as_mut_ptr();
                     let k_src = new_k.as_ptr();
-                    let can_direct_copy = type_size > 0 && !k_dst.is_null() && !k_src.is_null();
+                    let can_direct_copy =
+                        type_size > 0 && !k_dst.is_null() && !k_src.is_null();
 
                     let src_row = self.kv_heads * self.head_dim;
                     let dst_head_stride = self.capacity * self.head_dim;
