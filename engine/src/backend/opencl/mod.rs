@@ -468,7 +468,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            // Same dispatch as Q4: 1 subgroup (64 threads) per N_DST=4 output rows
+            // N_DST=4 rows per workgroup, 64 threads (1 subgroup)
             let local_work_size: [usize; 3] = [64, 1, 1];
             let group_size_0 = n.div_ceil(4);
             let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], m, 1];
