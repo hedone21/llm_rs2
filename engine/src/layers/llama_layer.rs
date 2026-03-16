@@ -516,11 +516,13 @@ impl LlamaLayer {
         backend.rms_norm(x, &self.attention_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
-        // 2. QKV Projections
+        // 2. QKV Projections — batch mode keeps SpinPool workers hot
         let t = prof_start!();
+        crate::core::thread_pool::get_pool().begin_batch();
         backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
         backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
         backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
+        crate::core::thread_pool::get_pool().end_batch();
         prof_record!(t, matmul_qkv);
 
         // 3. RoPE
@@ -1092,10 +1094,12 @@ impl LlamaLayer {
         backend.rms_norm(x, &self.ffn_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
-        // 9. FFN
+        // 9. FFN — batch mode for consecutive gate+up matmuls
         let t = prof_start!();
+        crate::core::thread_pool::get_pool().begin_batch();
         backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
         backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
+        crate::core::thread_pool::get_pool().end_batch();
         prof_record!(t, matmul_ffn);
 
         let t = prof_start!();

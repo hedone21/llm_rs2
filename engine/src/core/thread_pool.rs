@@ -21,6 +21,9 @@ struct SharedState {
     done_count: AtomicUsize,
     /// Shutdown signal.
     shutdown: AtomicBool,
+    /// When true, workers spin instead of park after completing work.
+    /// Used during batch dispatches to keep workers hot.
+    batch_mode: AtomicBool,
     /// Number of worker threads (excludes main thread).
     n_workers: usize,
     /// Work function pointer (stored as usize for atomicity).
@@ -45,6 +48,7 @@ impl SpinPool {
             total_chunks: AtomicUsize::new(0),
             done_count: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
+            batch_mode: AtomicBool::new(false),
             n_workers,
             work_fn: AtomicUsize::new(0),
             work_ctx: AtomicUsize::new(0),
@@ -93,11 +97,14 @@ impl SpinPool {
                     break;
                 }
                 spins += 1;
-                if spins < 500 {
-                    // Brief spin (~150ns on ARM) to catch back-to-back dispatches
+                if spins < 500 || shared.batch_mode.load(Ordering::Relaxed) {
+                    // In batch mode: pure spin (keep workers hot between dispatches)
+                    // Normal mode: brief spin then park
                     std::hint::spin_loop();
+                    if spins > 500 {
+                        spins = 500; // prevent overflow
+                    }
                 } else {
-                    // Park to release CPU for non-matmul operations
                     std::thread::park();
                     spins = 0;
                 }
@@ -124,6 +131,62 @@ impl SpinPool {
             }
             unsafe {
                 work_fn(work_ctx, chunk);
+            }
+        }
+    }
+
+    /// Enter batch mode: workers will spin instead of park after finishing work.
+    /// Call before a sequence of rapid dispatch() calls (e.g., QKV matmuls).
+    pub fn begin_batch(&self) {
+        self.shared.batch_mode.store(true, Ordering::Release);
+    }
+
+    /// Exit batch mode: workers will park normally after finishing work.
+    pub fn end_batch(&self) {
+        self.shared.batch_mode.store(false, Ordering::Release);
+    }
+
+    /// Dispatch a batch of work items sequentially, keeping workers spinning
+    /// between items (no park/unpark). Emulates ggml's graph execution model.
+    ///
+    /// # Safety
+    /// All work_fn/ctx pairs must be valid for their respective chunk ranges.
+    pub unsafe fn dispatch_batch(&self, items: &[(WorkFn, *const u8, usize)]) {
+        if items.is_empty() {
+            return;
+        }
+
+        // Wake workers for first item
+        let (wf, ctx, nc) = items[0];
+        self.shared.work_fn.store(wf as usize, Ordering::Relaxed);
+        self.shared.work_ctx.store(ctx as usize, Ordering::Relaxed);
+        self.shared.total_chunks.store(nc, Ordering::Relaxed);
+        self.shared.next_chunk.store(0, Ordering::Relaxed);
+        self.shared.done_count.store(0, Ordering::Relaxed);
+        self.shared.generation.fetch_add(1, Ordering::Release);
+        for wt in &self.worker_threads {
+            wt.unpark();
+        }
+        Self::steal_work(&self.shared);
+        while self.shared.done_count.load(Ordering::Acquire) < self.shared.n_workers {
+            std::hint::spin_loop();
+        }
+
+        // Subsequent items: workers are spinning (within spin window),
+        // just update work params and bump generation — no unpark needed.
+        for &(wf, ctx, nc) in &items[1..] {
+            self.shared.work_fn.store(wf as usize, Ordering::Relaxed);
+            self.shared
+                .work_ctx
+                .store(ctx as usize, Ordering::Relaxed);
+            self.shared.total_chunks.store(nc, Ordering::Relaxed);
+            self.shared.next_chunk.store(0, Ordering::Relaxed);
+            self.shared.done_count.store(0, Ordering::Relaxed);
+            self.shared.generation.fetch_add(1, Ordering::Release);
+            // Workers are still spinning — they'll catch the generation change
+            Self::steal_work(&self.shared);
+            while self.shared.done_count.load(Ordering::Acquire) < self.shared.n_workers {
+                std::hint::spin_loop();
             }
         }
     }

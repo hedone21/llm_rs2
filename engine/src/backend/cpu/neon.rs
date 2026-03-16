@@ -262,8 +262,6 @@ impl CpuBackendNeon {
         const NR: usize = 4;
         let pool = thread_pool::get_pool();
 
-        // Coarse chunks to minimize atomic contention on next_chunk counter.
-        // Target ~8 chunks per thread for work-stealing balance.
         let n_threads = rayon::current_num_threads();
         let target_chunks = n_threads * 8;
         let rows_per_chunk = ((n + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
@@ -287,6 +285,7 @@ impl CpuBackendNeon {
                 );
             }
         }
+
         Ok(())
     }
 
