@@ -1,8 +1,10 @@
 # Action Pool 구현 Sprint
 
 > **목표**: `action-impl-spec.md`에 정의된 8개 액션 전체를 동적 enable/disable 가능하게 구현
-> **현황**: 3개 완전 구현 (W1, W3, C4), 2개 부분 구현 (C6, C8), 3개 미구현 (W2, C5, C1)
+> **현황**: ✅ 전체 구현 완료 (Phase 1-A ~ Phase 4)
 > **참조**: `/home/go/Workspace/papers/pact2026/plan/action-impl-spec.md`
+> **완료일**: 2026-03-17
+> **테스트**: 505 lib + 14 integration = 519 tests passing
 
 ---
 
@@ -29,7 +31,7 @@
 
 ## [P1] AP-1A-1: StreamingLLM CLI alias 및 파라미터 추가
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음 (기존 코드 완전)
 
@@ -79,7 +81,7 @@
 
 ## [P1] AP-1B-1: BlockQ4_0 / BlockQ8_0 KV cache용 양자화 포맷 추가
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: 없음
 
@@ -141,7 +143,7 @@
 
 ## [P1] AP-1B-2: KiviCache multi-bit 지원 및 transition_bits() 구현
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: AP-1B-1
 
@@ -249,7 +251,7 @@
 
 ## [P1] AP-1B-3: QuantizeHandler 실구현 — Pressure 연동 동적 비트 전환
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: current
 - **Dependencies**: AP-1B-2
 
@@ -331,7 +333,7 @@
 
 ## [P2] AP-2A-1: avg_pool_1d 유틸리티 + per-head top-k 선택 함수 추가
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 
@@ -401,7 +403,7 @@
 
 ## [P2] AP-2A-2: KVCache::compress_per_head() 메서드 추가
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: AP-2A-1
 
@@ -475,7 +477,7 @@
 
 ## [P2] AP-2A-3: SnapKVHandler (CompressHandler 실구현)
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: AP-2A-1, AP-2A-2
 
@@ -598,7 +600,7 @@
 
 ## [P2] AP-2A-4: SnapKV + Eviction 조합 테스트
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: AP-2A-3
 
@@ -638,7 +640,7 @@
 
 ## [P2] AP-2B-1: DiskStore 재구현 (OffloadStore trait)
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 
@@ -746,7 +748,7 @@
 
 ## [P2] AP-2B-2: SwapHandler 실구현 — Pressure 연동 디스크 Offload
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: AP-2B-1
 
@@ -822,7 +824,7 @@
 
 ## [P1] AP-3-1: SkipConfig 구조체 및 LlamaLayer skip 분기 추가
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 
@@ -939,7 +941,7 @@
 
 ## [P2] AP-3-2: SpeculativeDecoder — Draft/Verify 사이클 구현
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: AP-3-1
 
@@ -1069,7 +1071,7 @@
 
 ## [P2] AP-3-3: SkipOptimizer — Skip layer 선택 최적화
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: backlog
 - **Dependencies**: AP-3-1, AP-3-2
 
@@ -1177,7 +1179,7 @@
 
 ## [P2] AP-3-4: generate.rs SWIFT 통합 및 CLI
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: backlog
 - **Dependencies**: AP-3-1, AP-3-2, AP-3-3
 
@@ -1266,7 +1268,7 @@
 
 ## [P1] AP-4-1: Action별 단위 테스트 완성
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next (각 Phase 완료 시 병행)
 - **Dependencies**: 각 Phase의 구현 완료
 
@@ -1305,7 +1307,7 @@
 
 ## [P1] AP-4-2: Cross-Action 통합 테스트
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: Phase 1-A, 1-B, 2-A, 2-B 완료
 
@@ -1372,7 +1374,7 @@
 
 ## [P2] AP-4-3: E2E Benchmark 스크립트 및 검증
 
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: backlog
 - **Dependencies**: 모든 Phase 구현 완료
 
