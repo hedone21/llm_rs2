@@ -78,6 +78,7 @@ struct KernelCache {
     kernel_cast_f32_to_f16: CoreKernel,
     kernel_attn_gen_half: CoreKernel,
     kernel_quantize_f32_to_q4_0: CoreKernel,
+    kernel_kv_scatter_f32_to_f16: CoreKernel,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -395,6 +396,10 @@ impl OpenCLBackend {
             kernel_quantize_f32_to_q4_0: ocl::core::create_kernel(
                 &quant_q4_0_program,
                 "kernel_quantize_f32_to_q4_0",
+            )?,
+            kernel_kv_scatter_f32_to_f16: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_kv_scatter_f32_to_f16",
             )?,
         };
 
@@ -959,6 +964,54 @@ impl Backend for OpenCLBackend {
                 dst.dtype()
             )),
         }
+    }
+
+    fn kv_scatter_f32_to_f16(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        head_dim: usize,
+        capacity: usize,
+        write_pos: usize,
+    ) -> Result<()> {
+        let k_src_mem = get_cl_mem(k_src.buffer().as_ref())?;
+        let v_src_mem = get_cl_mem(v_src.buffer().as_ref())?;
+        let k_dst_mem = get_cl_mem(k_dst.buffer().as_ref())?;
+        let v_dst_mem = get_cl_mem(v_dst.buffer().as_ref())?;
+
+        let n_elems: usize = k_src.shape().dims().iter().product(); // kv_heads * head_dim
+
+        let kernels = self
+            .kernels
+            .lock()
+            .map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
+        let kernel = &kernels.kernel_kv_scatter_f32_to_f16;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(k_src_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(v_src_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(k_dst_mem))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(v_dst_mem))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&(capacity as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&(write_pos as i32)))?;
+
+            let gws: [usize; 3] = [n_elems.div_ceil(64) * 64, 1, 1];
+            let lws: [usize; 3] = [64, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                1,
+                None,
+                &gws,
+                Some(lws),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
     }
 
     fn attention_gen(

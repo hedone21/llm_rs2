@@ -121,6 +121,23 @@ pub trait Backend: Send + Sync {
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
 
+    /// Fused F32→F16 cast + HeadMajor scatter for KV cache update.
+    /// Replaces 2× cast + 16× copy_slice with a single GPU kernel.
+    /// Default: falls back to separate cast + copy.
+    #[allow(unused_variables)]
+    fn kv_scatter_f32_to_f16(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        head_dim: usize,
+        capacity: usize,
+        write_pos: usize,
+    ) -> Result<()> {
+        anyhow::bail!("kv_scatter_f32_to_f16 not implemented for this backend")
+    }
+
     /// Copy data from src into dst buffer (same shape/size required).
     /// On GPU: just enqueue_copy_buffer, no new backend/kernel allocation.
     /// On CPU: memcpy.

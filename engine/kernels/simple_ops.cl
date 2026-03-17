@@ -624,3 +624,34 @@ kernel void kernel_attn_gen_half(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
 }
+
+// ============================================================
+// Fused F32->F16 Cast + HeadMajor Scatter for KV Cache Update
+// ============================================================
+// Replaces 2x cast kernel + 16x enqueue_copy_buffer with 1 kernel dispatch.
+// Input: F32 [kv_heads, head_dim] (seq-major from rope/matmul)
+// Output: F16 KV cache [kv_heads, capacity, head_dim] (head-major)
+//
+// Work items: kv_heads * head_dim (one per element)
+kernel void kernel_kv_scatter_f32_to_f16(
+    global const float * k_src,   // [kv_heads * head_dim] F32
+    global const float * v_src,   // [kv_heads * head_dim] F32
+    global half * k_dst,          // [kv_heads, capacity, head_dim] F16 HeadMajor
+    global half * v_dst,          // [kv_heads, capacity, head_dim] F16 HeadMajor
+    int head_dim,
+    int capacity,
+    int write_pos                 // current position in cache to write
+) {
+    int gid = get_global_id(0);
+    int h = gid / head_dim;       // which head
+    int d = gid % head_dim;       // which dim
+
+    // Source: seq-major [h * head_dim + d]
+    int src_idx = h * head_dim + d;
+
+    // Dest: head-major [h * capacity * head_dim + write_pos * head_dim + d]
+    int dst_idx = h * capacity * head_dim + write_pos * head_dim + d;
+
+    k_dst[dst_idx] = (half)k_src[src_idx];
+    v_dst[dst_idx] = (half)v_src[src_idx];
+}

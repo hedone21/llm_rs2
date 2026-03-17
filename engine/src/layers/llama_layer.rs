@@ -629,11 +629,20 @@ impl LlamaLayer {
         // 4. KV Cache Update - cast to target dtype if needed
         let t = prof_start!();
         let kv_dtype = kv_cache.kv_dtype();
-        let is_opencl = backend.name() == "OpenCL";
-
-        // On GPU + F16: direct CPU cast+scatter avoids GPU kernel + clFinish overhead.
-        // ARM UMA (CL_MEM_ALLOC_HOST_PTR) makes GPU buffers host-accessible.
-        if kv_dtype != DType::F32 {
+        use crate::core::kv_cache::KVLayout;
+        if kv_dtype == DType::F16
+            && is_opencl
+            && is_decode
+            && kv_cache.layout() == KVLayout::HeadMajor
+        {
+            // GPU F16 HeadMajor: fused cast+scatter kernel (1 dispatch instead of 2+16)
+            let pos = kv_cache.current_pos();
+            let cap = kv_cache.capacity();
+            if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
+                backend.kv_scatter_f32_to_f16(&k_rope, &ws.v, k_buf, v_buf, head_dim, cap, pos)?;
+            }
+            kv_cache.advance_pos(1);
+        } else if kv_dtype != DType::F32 {
             let n_elem = n_heads_kv * head_dim;
             let buf_size = match kv_dtype {
                 DType::F16 => n_elem * 2,
