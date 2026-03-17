@@ -545,7 +545,14 @@ impl LlamaLayer {
 
         // 1. Attention Norm
         let t = prof_start!();
-        ws.residual = backend.copy_from(x)?;
+        let is_opencl = backend.name() == "OpenCL";
+        if is_opencl {
+            // GPU: copy_from's backend clone overhead helps pipeline GPU matmuls
+            ws.residual = backend.copy_from(x)?;
+        } else {
+            // CPU: copy_into avoids unnecessary backend cloning
+            backend.copy_into(x, &mut ws.residual)?;
+        }
         prof_record!(t, copy_residual);
 
         let t = prof_start!();
@@ -628,6 +635,10 @@ impl LlamaLayer {
         // 4. KV Cache Update - cast to target dtype if needed
         let t = prof_start!();
         let kv_dtype = kv_cache.kv_dtype();
+        let is_opencl = backend.name() == "OpenCL";
+
+        // On GPU + F16: direct CPU cast+scatter avoids GPU kernel + clFinish overhead.
+        // ARM UMA (CL_MEM_ALLOC_HOST_PTR) makes GPU buffers host-accessible.
         if kv_dtype != DType::F32 {
             let n_elem = n_heads_kv * head_dim;
             let buf_size = match kv_dtype {
@@ -638,8 +649,6 @@ impl LlamaLayer {
                 }
                 _ => n_elem * 4,
             };
-            // Reuse pre-allocated workspace buffers for F32→F16 cast
-            // (avoids GPU memory allocation per token per layer)
             let k_shape = k_rope.shape().clone();
             let v_shape = Shape::new(vec![batch_size, 1, n_heads_kv, head_dim]);
             if ws.k_cast.is_none() {
@@ -1160,12 +1169,15 @@ impl LlamaLayer {
         backend.add_assign(&mut ws.attn_out, &ws.residual)?;
         prof_record!(t, add_assign);
 
-        // Copy to x for next stage
+        // Copy attn_out → x, and x → residual for FFN skip connection
         let t = prof_start!();
-        *x = backend.copy_from(&ws.attn_out)?;
-
-        // 8. FFN Norm
-        ws.residual = backend.copy_from(x)?;
+        if is_opencl {
+            *x = backend.copy_from(&ws.attn_out)?;
+            ws.residual = backend.copy_from(x)?;
+        } else {
+            backend.copy_into(&ws.attn_out, x)?;
+            backend.copy_into(x, &mut ws.residual)?;
+        }
         prof_record!(t, copy_residual);
 
         let t = prof_start!();
@@ -1218,9 +1230,13 @@ impl LlamaLayer {
         backend.add_assign(&mut ws.down, &ws.residual)?;
         prof_record!(t, add_assign);
 
-        // Copy to x for next layer
+        // Copy down → x for next layer
         let t = prof_start!();
-        *x = backend.copy_from(&ws.down)?;
+        if is_opencl {
+            *x = backend.copy_from(&ws.down)?;
+        } else {
+            backend.copy_into(&ws.down, x)?;
+        }
         prof_record!(t, copy_residual);
 
         if let Some(ref mut p) = profiler {

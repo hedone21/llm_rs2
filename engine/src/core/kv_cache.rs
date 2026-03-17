@@ -44,6 +44,16 @@ pub trait KVCacheOps: Send {
     /// Returns `(k_tensor, v_tensor)` covering `[0..current_pos]`.
     /// `&mut self` allows internal buffer assembly (e.g. KIVI dequantization).
     fn get_view(&mut self) -> (Tensor, Tensor);
+
+    /// Direct access to underlying K/V buffers for zero-overhead scatter writes.
+    /// Returns None if the implementation doesn't support direct access (e.g. KIVI).
+    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
+        None
+    }
+
+    /// Advance position counter without performing any data copy.
+    /// Used with get_buffers_mut() when caller writes directly.
+    fn advance_pos(&mut self, _n: usize) {}
 }
 
 /// Extension trait for KV caches that support prefetch pipelines.
@@ -386,8 +396,7 @@ impl KVCache {
                     // host pointers directly access GPU memory without DMA transfer.
                     let k_dst = self.k_buffer.as_mut_ptr();
                     let k_src = new_k.as_ptr();
-                    let can_direct_copy =
-                        type_size > 0 && !k_dst.is_null() && !k_src.is_null();
+                    let can_direct_copy = type_size > 0 && !k_dst.is_null() && !k_src.is_null();
 
                     let src_row = self.kv_heads * self.head_dim;
                     let dst_head_stride = self.capacity * self.head_dim;
@@ -726,6 +735,14 @@ impl KVCacheOps for KVCache {
 
     fn get_view(&mut self) -> (Tensor, Tensor) {
         (self.k_buffer.clone(), self.v_buffer.clone())
+    }
+
+    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
+        Some((&mut self.k_buffer, &mut self.v_buffer))
+    }
+
+    fn advance_pos(&mut self, n: usize) {
+        self.current_pos += n;
     }
 }
 

@@ -684,6 +684,40 @@ impl Backend for OpenCLBackend {
         Ok(new_tensor)
     }
 
+    fn copy_into(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        let size = src.size();
+        assert_eq!(size, dst.size(), "copy_into: size mismatch");
+
+        if let (Ok(src_mem), Ok(dst_mem)) = (
+            get_cl_mem(src.buffer().as_ref()),
+            get_cl_mem(dst.buffer().as_ref()),
+        ) {
+            // GPU→GPU: just enqueue_copy_buffer (no backend clone, no kernel cache)
+            unsafe {
+                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                    &self.queue,
+                    src_mem,
+                    dst_mem,
+                    0,
+                    0,
+                    size,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        } else {
+            // Fallback: CPU memcpy
+            let src_ptr = src.as_ptr();
+            let dst_ptr = dst.as_mut_ptr();
+            if !src_ptr.is_null() && !dst_ptr.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn synchronize(&self) -> Result<()> {
         ocl::core::finish(&self.queue)?;
         Ok(())

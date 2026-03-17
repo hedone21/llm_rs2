@@ -865,6 +865,7 @@ dependencies = [
  "clap",
  "env_logger",
  "half",
+ "libc",
  "llm_shared",
  "log",
  "memmap2",

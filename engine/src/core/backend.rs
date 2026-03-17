@@ -120,6 +120,22 @@ pub trait Backend: Send + Sync {
 
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
+
+    /// Copy data from src into dst buffer (same shape/size required).
+    /// On GPU: just enqueue_copy_buffer, no new backend/kernel allocation.
+    /// On CPU: memcpy.
+    fn copy_into(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
+        let size = src.size();
+        assert_eq!(size, dst.size(), "copy_into: size mismatch");
+        let src_ptr = src.as_ptr();
+        let dst_ptr = dst.as_mut_ptr();
+        if !src_ptr.is_null() && !dst_ptr.is_null() {
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+            }
+        }
+        Ok(())
+    }
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
         let src_ptr = t.buffer().as_ptr();
         if src_ptr.is_null() {
