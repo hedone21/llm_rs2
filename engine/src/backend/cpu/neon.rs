@@ -7,6 +7,11 @@ use crate::core::thread_pool::{self, WorkFn};
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::arch::aarch64::*;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+/// Runtime toggle: when true, F16 matmul uses Rayon instead of SpinPool.
+/// Set via `--use-rayon` CLI flag for A/B benchmarking.
+pub static USE_RAYON: AtomicBool = AtomicBool::new(false);
 
 // sdot_asm and prefetch_asm removed (unused)
 
@@ -260,29 +265,64 @@ impl CpuBackendNeon {
         }
 
         const NR: usize = 4;
-        let pool = thread_pool::get_pool();
 
-        let n_threads = rayon::current_num_threads();
-        let target_chunks = n_threads * 8;
-        let rows_per_chunk = ((n + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
-        let rows_per_chunk = rows_per_chunk.max(NR);
-        let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
+        if USE_RAYON.load(AtomicOrdering::Relaxed) {
+            // Rayon path: par_chunks_mut for A/B benchmarking vs SpinPool
+            let b_ptr_base = b_data.as_ptr() as usize; // usize for Send
+            for i in 0..m {
+                let a_ptr = unsafe { a_data.as_ptr().add(i * k) } as usize;
+                let row_out = &mut out_data[i * n..(i + 1) * n];
+                row_out
+                    .par_chunks_mut(NR)
+                    .enumerate()
+                    .for_each(|(chunk_idx, chunk)| {
+                        let j = chunk_idx * NR;
+                        let bp = b_ptr_base as *const u16;
+                        let ap = a_ptr as *const f32;
+                        if chunk.len() == NR {
+                            let b_ptrs = [
+                                unsafe { bp.add(j * k) },
+                                unsafe { bp.add((j + 1) * k) },
+                                unsafe { bp.add((j + 2) * k) },
+                                unsafe { bp.add((j + 3) * k) },
+                            ];
+                            let mut results = [0.0f32; NR];
+                            unsafe { Self::vec_dot_f16_f32_4rows(k, ap, b_ptrs, &mut results) };
+                            chunk.copy_from_slice(&results);
+                        } else {
+                            for t in 0..chunk.len() {
+                                chunk[t] =
+                                    unsafe { Self::vec_dot_f16_f32(k, ap, bp.add((j + t) * k)) };
+                            }
+                        }
+                    });
+            }
+        } else {
+            // SpinPool path (default)
+            let pool = thread_pool::get_pool();
 
-        for i in 0..m {
-            let ctx = F16GemvCtx {
-                a_ptr: unsafe { a_data.as_ptr().add(i * k) },
-                b_base: b_data.as_ptr() as *const u16,
-                out_ptr: unsafe { out_data.as_mut_ptr().add(i * n) },
-                k,
-                n,
-                rows_per_chunk,
-            };
-            unsafe {
-                pool.dispatch(
-                    n_chunks,
-                    f16_gemv_chunk,
-                    &ctx as *const F16GemvCtx as *const u8,
-                );
+            let n_threads = rayon::current_num_threads();
+            let target_chunks = n_threads * 8;
+            let rows_per_chunk = ((n + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
+            let rows_per_chunk = rows_per_chunk.max(NR);
+            let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
+
+            for i in 0..m {
+                let ctx = F16GemvCtx {
+                    a_ptr: unsafe { a_data.as_ptr().add(i * k) },
+                    b_base: b_data.as_ptr() as *const u16,
+                    out_ptr: unsafe { out_data.as_mut_ptr().add(i * n) },
+                    k,
+                    n,
+                    rows_per_chunk,
+                };
+                unsafe {
+                    pool.dispatch(
+                        n_chunks,
+                        f16_gemv_chunk,
+                        &ctx as *const F16GemvCtx as *const u8,
+                    );
+                }
             }
         }
 

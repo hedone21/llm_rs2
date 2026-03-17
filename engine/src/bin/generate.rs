@@ -259,6 +259,10 @@ struct Args {
     /// Higher values use more memory but can hide preload latency.
     #[arg(long, default_value_t = 4)]
     max_prefetch_depth: usize,
+
+    /// Use Rayon par_chunks_mut instead of SpinPool for F16 matmul (A/B benchmarking).
+    #[arg(long, default_value_t = false)]
+    use_rayon: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -280,6 +284,13 @@ fn main() -> anyhow::Result<()> {
         .build_global()
         .unwrap();
     eprintln!("[Config] Using {} threads", num_threads);
+
+    // Wire Rayon vs SpinPool toggle
+    #[cfg(target_arch = "aarch64")]
+    if args.use_rayon {
+        llm_rs2::backend::cpu::neon::USE_RAYON.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[Config] F16 matmul: Rayon (par_chunks_mut)");
+    }
 
     // --greedy overrides temperature to 0
     if args.greedy {
