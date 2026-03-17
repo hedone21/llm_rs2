@@ -25,6 +25,12 @@ pub trait Backend: Send + Sync {
     // Activation & Norm
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()>;
     fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()>;
+    /// Out-of-place RMS norm: out = norm(x) * w. x is preserved.
+    /// Default: copy x → out, then in-place rms_norm(out).
+    fn rms_norm_oop(&self, x: &Tensor, out: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
+        self.copy_into(x, out)?;
+        self.rms_norm(out, w, eps)
+    }
     fn softmax(&self, x: &mut Tensor) -> Result<()>;
 
     // Rotate

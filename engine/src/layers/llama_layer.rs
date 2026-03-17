@@ -524,10 +524,15 @@ impl LlamaLayer {
         let batch_size = x.shape().dims()[0];
         let head_dim = args.head_dim;
         let mut profiler = args.profiler.as_deref_mut();
+        let is_opencl = backend.name() == "OpenCL";
 
         macro_rules! prof_start {
             () => {
                 if profiler.is_some() {
+                    // Drain GPU queue before timing to get accurate per-op measurement
+                    if is_opencl {
+                        backend.synchronize().ok();
+                    }
                     std::time::Instant::now()
                 } else {
                     // Dummy instant (never read)
@@ -538,22 +543,21 @@ impl LlamaLayer {
         macro_rules! prof_record {
             ($t:expr, $field:ident) => {
                 if let Some(ref mut p) = profiler {
+                    // Wait for GPU kernel to actually complete before recording time
+                    if is_opencl {
+                        backend.synchronize().ok();
+                    }
                     p.$field += $t.elapsed().as_micros() as u64;
                 }
             };
         }
 
-        // 1. Attention Norm — copy_into reuses pre-allocated residual buffer
+        // 1. Attention Norm — out-of-place: ws.residual = norm(x), x preserved for skip connection
         let t = prof_start!();
-        let is_opencl = backend.name() == "OpenCL";
-        backend.copy_into(x, &mut ws.residual)?;
-        prof_record!(t, copy_residual);
-
-        let t = prof_start!();
-        backend.rms_norm(x, &self.attention_norm, rms_norm_eps)?;
+        backend.rms_norm_oop(x, &mut ws.residual, &self.attention_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
-        // 2. QKV Projections — fused dispatch for F16 CPU (1 dispatch instead of 3)
+        // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
         let t = prof_start!();
         #[cfg(target_arch = "aarch64")]
         let is_cpu_f16 = backend.name().contains("CPU") && self.wq.dtype() == DType::F16;
@@ -570,10 +574,10 @@ impl LlamaLayer {
             // Fused QKV: single SpinPool dispatch for all 3 matmuls
             #[cfg(target_arch = "aarch64")]
             {
-                let k = x.shape().dims()[x.shape().dims().len() - 1];
+                let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_f16(
-                        x.as_ptr() as *const f32,
+                        ws.residual.as_ptr() as *const f32,
                         k,
                         &[
                             (
@@ -597,9 +601,9 @@ impl LlamaLayer {
             }
         } else {
             crate::core::thread_pool::get_pool().begin_batch();
-            backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
-            backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
-            backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
+            backend.matmul_transposed(&ws.residual, &self.wq, &mut ws.q)?;
+            backend.matmul_transposed(&ws.residual, &self.wk, &mut ws.k)?;
+            backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
         prof_record!(t, matmul_qkv);
@@ -1167,19 +1171,14 @@ impl LlamaLayer {
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
         prof_record!(t, matmul_wo);
 
-        // 7. Residual 1
+        // 7. Residual 1 — accumulate attention result into x (skip connection)
         let t = prof_start!();
-        backend.add_assign(&mut ws.attn_out, &ws.residual)?;
+        backend.add_assign(x, &ws.attn_out)?;
         prof_record!(t, add_assign);
 
-        // Copy attn_out → x, and x → residual for FFN skip connection
+        // 8. FFN Norm — out-of-place: ws.residual = norm(x), x preserved
         let t = prof_start!();
-        backend.copy_into(&ws.attn_out, x)?;
-        backend.copy_into(x, &mut ws.residual)?;
-        prof_record!(t, copy_residual);
-
-        let t = prof_start!();
-        backend.rms_norm(x, &self.ffn_norm, rms_norm_eps)?;
+        backend.rms_norm_oop(x, &mut ws.residual, &self.ffn_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
         // 9. FFN — fused gate+up dispatch for F16 CPU (1 dispatch instead of 2)
@@ -1187,10 +1186,10 @@ impl LlamaLayer {
         if is_cpu_f16 && is_decode {
             #[cfg(target_arch = "aarch64")]
             {
-                let k = x.shape().dims()[x.shape().dims().len() - 1];
+                let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_f16(
-                        x.as_ptr() as *const f32,
+                        ws.residual.as_ptr() as *const f32,
                         k,
                         &[
                             (
@@ -1209,8 +1208,8 @@ impl LlamaLayer {
             }
         } else {
             crate::core::thread_pool::get_pool().begin_batch();
-            backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
-            backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
+            backend.matmul_transposed(&ws.residual, &self.w_gate, &mut ws.gate)?;
+            backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
         prof_record!(t, matmul_ffn);
@@ -1223,15 +1222,10 @@ impl LlamaLayer {
         backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
         prof_record!(t, matmul_ffn);
 
-        // 10. Residual 2
+        // 10. Residual 2 — accumulate FFN result into x (skip connection)
         let t = prof_start!();
-        backend.add_assign(&mut ws.down, &ws.residual)?;
+        backend.add_assign(x, &ws.down)?;
         prof_record!(t, add_assign);
-
-        // Copy down → x for next layer
-        let t = prof_start!();
-        backend.copy_into(&ws.down, x)?;
-        prof_record!(t, copy_residual);
 
         if let Some(ref mut p) = profiler {
             p.count += 1;

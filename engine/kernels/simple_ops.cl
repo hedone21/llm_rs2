@@ -81,6 +81,58 @@ kernel void kernel_rms_norm_opt(
     }
 }
 
+// Out-of-place variant: reads from x, writes to out (x is preserved).
+// Used to eliminate copy_residual in the forward pass.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_rms_norm_oop(
+    global float * x,
+    global float * out,
+    global float * weight,
+    int dim,
+    float eps,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float * x_row = x + row * dim;
+    global float * out_row = out + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim; i += local_size) {
+        float val = x_row[i];
+        sum_sq += val * val;
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+
+    for (int i = lid; i < dim; i += local_size) {
+        out_row[i] = x_row[i] * scale * weight[i];
+    }
+}
+
 //------------------------------------------------------------------------------
 // Optimized Softmax with local memory reduction
 // Input x: [rows, dim], output: x (inplace)
