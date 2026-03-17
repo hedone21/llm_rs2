@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 pub mod buffer;
 pub mod memory;
+pub mod plan;
 
 /// Helper function to get the OpenCL memory handle from a tensor buffer.
 /// Works with both UnifiedBuffer and legacy OpenCLBuffer.
