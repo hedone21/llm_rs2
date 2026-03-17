@@ -81,6 +81,7 @@ struct KernelCache {
     kernel_quantize_f32_to_q4_0: CoreKernel,
     kernel_kv_scatter_f32_to_f16: CoreKernel,
     kernel_rms_norm_oop: CoreKernel,
+    kernel_add_rms_norm_oop: CoreKernel,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -413,6 +414,10 @@ impl OpenCLBackend {
             kernel_rms_norm_oop: ocl::core::create_kernel(
                 &simple_ops_program,
                 "kernel_rms_norm_oop",
+            )?,
+            kernel_add_rms_norm_oop: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_add_rms_norm_oop",
             )?,
         };
 
@@ -869,6 +874,58 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&epsilon))?;
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+
+            let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                1,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn add_rms_norm_oop(
+        &self,
+        x: &mut Tensor,
+        residual: &Tensor,
+        out: &mut Tensor,
+        weight: &Tensor,
+        epsilon: f32,
+    ) -> Result<()> {
+        let dims = x.shape().dims();
+        let dim = dims[dims.len() - 1];
+        let rows: usize = dims[..dims.len() - 1].iter().product();
+
+        let x_buf =
+            get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
+        let res_buf = get_cl_mem(residual.buffer().as_ref())
+            .map_err(|_| anyhow!("Residual is not OpenCL buffer"))?;
+        let out_buf =
+            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
+        let w_buf = get_cl_mem(weight.buffer().as_ref())
+            .map_err(|_| anyhow!("Weight is not OpenCL buffer"))?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = &kernels.kernel_add_rms_norm_oop;
+        let local_size = 64usize;
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(res_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(w_buf))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&epsilon))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];

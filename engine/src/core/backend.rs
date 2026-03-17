@@ -31,6 +31,19 @@ pub trait Backend: Send + Sync {
         self.copy_into(x, out)?;
         self.rms_norm(out, w, eps)
     }
+    /// Fused add + out-of-place RMS norm: x += residual; out = norm(x) * w.
+    /// Eliminates a separate add_assign dispatch.
+    fn add_rms_norm_oop(
+        &self,
+        x: &mut Tensor,
+        residual: &Tensor,
+        out: &mut Tensor,
+        w: &Tensor,
+        eps: f32,
+    ) -> Result<()> {
+        self.add_assign(x, residual)?;
+        self.rms_norm_oop(x, out, w, eps)
+    }
     fn softmax(&self, x: &mut Tensor) -> Result<()>;
 
     // Rotate

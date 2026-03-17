@@ -1172,14 +1172,9 @@ impl LlamaLayer {
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
         prof_record!(t, matmul_wo);
 
-        // 7. Residual 1 — accumulate attention result into x (skip connection)
+        // 7+8. Fused: x += attn_out; ws.residual = norm(x) * ffn_norm
         let t = prof_start!();
-        backend.add_assign(x, &ws.attn_out)?;
-        prof_record!(t, add_assign);
-
-        // 8. FFN Norm — out-of-place: ws.residual = norm(x), x preserved
-        let t = prof_start!();
-        backend.rms_norm_oop(x, &mut ws.residual, &self.ffn_norm, rms_norm_eps)?;
+        backend.add_rms_norm_oop(x, &ws.attn_out, &mut ws.residual, &self.ffn_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
         // 9. FFN — fused gate+up dispatch for F16 CPU (1 dispatch instead of 2)
