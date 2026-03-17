@@ -54,6 +54,12 @@ pub trait KVCacheOps: Send {
     /// Advance position counter without performing any data copy.
     /// Used with get_buffers_mut() when caller writes directly.
     fn advance_pos(&mut self, _n: usize) {}
+
+    /// Ensure the cache has capacity for at least `min_tokens` total tokens.
+    /// Grows the underlying buffers if needed. Returns true if buffers changed.
+    fn ensure_capacity(&mut self, _min_tokens: usize) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Extension trait for KV caches that support prefetch pipelines.
@@ -744,6 +750,21 @@ impl KVCacheOps for KVCache {
     fn advance_pos(&mut self, n: usize) {
         self.current_pos += n;
     }
+
+    fn ensure_capacity(&mut self, min_tokens: usize) -> Result<bool> {
+        if min_tokens <= self.capacity {
+            return Ok(false);
+        }
+        if min_tokens > self.max_seq_len {
+            return Err(anyhow::anyhow!(
+                "KV Cache overflow: need {} tokens but max_seq_len={}",
+                min_tokens,
+                self.max_seq_len
+            ));
+        }
+        self.grow(min_tokens)?;
+        Ok(true)
+    }
 }
 
 #[cfg(test)]
@@ -1039,6 +1060,47 @@ mod tests {
         // One more should overflow
         let (k, v) = make_token_tensor(0.0, heads, dim);
         assert!(cache.update(&k, &v).is_err());
+    }
+
+    #[test]
+    fn test_ensure_capacity_grows_when_needed() {
+        let heads = 1;
+        let dim = 4;
+        let mut cache = make_dynamic_cache(4, 64, heads, dim);
+
+        // Fill to capacity
+        for i in 0..4 {
+            let (k, v) = make_token_tensor(i as f32, heads, dim);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.capacity(), 4);
+        assert_eq!(cache.current_pos(), 4);
+
+        // ensure_capacity within current → no grow, returns false
+        assert_eq!(cache.ensure_capacity(3).unwrap(), false);
+        assert_eq!(cache.capacity(), 4);
+
+        // ensure_capacity exactly at boundary → no grow
+        assert_eq!(cache.ensure_capacity(4).unwrap(), false);
+
+        // ensure_capacity beyond → grow, returns true
+        assert_eq!(cache.ensure_capacity(5).unwrap(), true);
+        assert!(cache.capacity() >= 5);
+
+        // Data integrity after grow
+        let k_data = cache.k_buffer.as_slice::<f32>();
+        assert_eq!(k_data[0], 0.0);
+        assert_eq!(k_data[dim], 1.0);
+    }
+
+    #[test]
+    fn test_ensure_capacity_overflow() {
+        let heads = 1;
+        let dim = 4;
+        let mut cache = make_dynamic_cache(4, 8, heads, dim);
+
+        // Beyond max_seq_len → error
+        assert!(cache.ensure_capacity(9).is_err());
     }
 
     #[test]

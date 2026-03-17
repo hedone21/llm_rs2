@@ -641,6 +641,8 @@ impl LlamaLayer {
             && kv_cache.layout() == KVLayout::HeadMajor
         {
             // GPU F16 HeadMajor: fused cast+scatter kernel (1 dispatch instead of 2+16)
+            // Ensure capacity before direct scatter to prevent out-of-bounds GPU write
+            kv_cache.ensure_capacity(kv_cache.current_pos() + 1)?;
             let pos = kv_cache.current_pos();
             let cap = kv_cache.capacity();
             if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
