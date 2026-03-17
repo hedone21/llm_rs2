@@ -741,3 +741,180 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         flush_after: true,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Full model plan builder
+// ---------------------------------------------------------------------------
+
+/// Config for building the full model plan (all layers + final norm + lm_head).
+pub struct FullPlanConfig<'a> {
+    pub f16_program: &'a ocl::Program,
+    pub simple_ops_program: &'a ocl::Program,
+    // Per-layer weight buffers: Vec<(wq, wk, wv, wo, w_gate, w_up, w_down, attn_norm, ffn_norm)>
+    pub layer_bufs: Vec<LayerBufs<'a>>,
+    // Workspace buffers (shared across layers)
+    pub x_buf: &'a Mem,
+    pub q_buf: &'a Mem,
+    pub k_buf: &'a Mem,
+    pub v_buf: &'a Mem,
+    pub out_attn_buf: &'a Mem,
+    pub attn_out_buf: &'a Mem,
+    pub gate_buf: &'a Mem,
+    pub up_buf: &'a Mem,
+    pub down_buf: &'a Mem,
+    pub residual_buf: &'a Mem,
+    // Per-layer KV cache buffers
+    pub kv_bufs: Vec<KvBufs<'a>>,
+    // Final norm + lm_head
+    pub final_norm_buf: &'a Mem,
+    pub lm_head_buf: &'a Mem,
+    pub logits_buf: &'a Mem,
+    // Model config
+    pub dim: usize,
+    pub n_heads_q: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub ffn_hidden: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub kv_capacity: usize,
+    pub kv_pos_stride: i32,
+    pub kv_head_stride: i32,
+}
+
+/// Per-layer weight buffer references.
+pub struct LayerBufs<'a> {
+    pub wq: &'a Mem,
+    pub wk: &'a Mem,
+    pub wv: &'a Mem,
+    pub wo: &'a Mem,
+    pub w_gate: &'a Mem,
+    pub w_up: &'a Mem,
+    pub w_down: &'a Mem,
+    pub attn_norm: &'a Mem,
+    pub ffn_norm: &'a Mem,
+}
+
+/// Per-layer KV cache buffer references.
+pub struct KvBufs<'a> {
+    pub k_cache: &'a Mem,
+    pub v_cache: &'a Mem,
+}
+
+/// Build a pre-bound plan for the full model decode pass (all layers + head).
+pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
+    let n_q = config.n_heads_q * config.head_dim;
+    let n_k = config.n_kv_heads * config.head_dim;
+    let n_v = n_k;
+
+    let mut layers = Vec::with_capacity(config.layer_bufs.len());
+    for (i, (lb, kb)) in config
+        .layer_bufs
+        .iter()
+        .zip(config.kv_bufs.iter())
+        .enumerate()
+    {
+        let layer_config = LayerPlanConfig {
+            f16_program: config.f16_program,
+            simple_ops_program: config.simple_ops_program,
+            x_buf: config.x_buf,
+            wq_buf: lb.wq,
+            wk_buf: lb.wk,
+            wv_buf: lb.wv,
+            wo_buf: lb.wo,
+            w_gate_buf: lb.w_gate,
+            w_up_buf: lb.w_up,
+            w_down_buf: lb.w_down,
+            attn_norm_buf: lb.attn_norm,
+            ffn_norm_buf: lb.ffn_norm,
+            q_buf: config.q_buf,
+            k_buf: config.k_buf,
+            v_buf: config.v_buf,
+            out_attn_buf: config.out_attn_buf,
+            attn_out_buf: config.attn_out_buf,
+            gate_buf: config.gate_buf,
+            up_buf: config.up_buf,
+            down_buf: config.down_buf,
+            residual_buf: config.residual_buf,
+            k_cache_buf: kb.k_cache,
+            v_cache_buf: kb.v_cache,
+            dim: config.dim,
+            n_heads_q: config.n_heads_q,
+            n_kv_heads: config.n_kv_heads,
+            head_dim: config.head_dim,
+            ffn_hidden: config.ffn_hidden,
+            n_q,
+            n_k,
+            n_v,
+            rms_norm_eps: config.rms_norm_eps,
+            rope_theta: config.rope_theta,
+            kv_capacity: config.kv_capacity,
+            kv_pos_stride: config.kv_pos_stride,
+            kv_head_stride: config.kv_head_stride,
+        };
+        layers.push(
+            build_layer_plan(&layer_config)
+                .with_context(|| format!("build plan for layer {}", i))?,
+        );
+    }
+
+    // Final RMSNorm (in-place on x)
+    let final_norm = {
+        let kernel =
+            ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_opt")
+                .context("create final kernel_rms_norm_opt")?;
+        let local_size = 64usize;
+        let local_mem_bytes = local_size * std::mem::size_of::<f32>();
+        unsafe {
+            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                1,
+                ocl::core::ArgVal::mem(config.final_norm_buf),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                2,
+                ocl::core::ArgVal::scalar(&(config.dim as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                3,
+                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                4,
+                ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
+            )?;
+        }
+        KernelStep {
+            kernel,
+            ndim: 1,
+            global_work_size: [local_size, 1, 1], // rows=1 for decode
+            local_work_size: Some([local_size, 1, 1]),
+            dynamic_args: vec![],
+            op_tag: OpTag::FinalNorm,
+        }
+    };
+
+    // lm_head matmul: x [1, dim] × lm_head [vocab, dim]^T → logits [1, vocab]
+    let lm_head = make_f16_matmul_step(
+        config.f16_program,
+        config.x_buf,
+        config.lm_head_buf,
+        config.logits_buf,
+        config.vocab_size,
+        config.dim,
+        OpTag::LmHead,
+    )
+    .context("build lm_head matmul step")?;
+
+    Ok(FullKernelPlan {
+        layers,
+        final_norm,
+        lm_head,
+        kv_capacity: config.kv_capacity,
+    })
+}
