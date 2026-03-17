@@ -1193,6 +1193,7 @@ impl Backend for OpenCLBackend {
 
     fn silu_mul(&self, x: &mut Tensor, y: &Tensor) -> Result<()> {
         let size = x.shape().dims().iter().product::<usize>();
+        let size4 = size / 4;
 
         let x_buf =
             get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
@@ -1204,14 +1205,14 @@ impl Backend for OpenCLBackend {
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size4 as i32)))?;
 
             ocl::core::enqueue_kernel(
                 &self.queue,
                 kernel,
                 1,
                 None,
-                &[size, 1, 1],
+                &[size4, 1, 1],
                 None::<[usize; 3]>,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
@@ -1222,6 +1223,7 @@ impl Backend for OpenCLBackend {
 
     fn add_assign(&self, x: &mut Tensor, y: &Tensor) -> Result<()> {
         let size = x.shape().dims().iter().product::<usize>();
+        let size4 = size / 4;
 
         let x_buf =
             get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
@@ -1233,14 +1235,14 @@ impl Backend for OpenCLBackend {
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size4 as i32)))?;
 
             ocl::core::enqueue_kernel(
                 &self.queue,
                 kernel,
                 1,
                 None,
-                &[size, 1, 1],
+                &[size4, 1, 1],
                 None::<[usize; 3]>,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,

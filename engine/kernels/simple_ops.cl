@@ -466,25 +466,25 @@ kernel void kernel_scale_simple(
 }
 
 kernel void kernel_add_assign_simple(
-    global float * x,
-    global float * y,
-    int size
+    global float4 * x,
+    global float4 * y,
+    int size4
 ) {
     int i = get_global_id(0);
-    if (i < size) {
+    if (i < size4) {
         x[i] += y[i];
     }
 }
 
 kernel void kernel_silu_mul_simple(
-    global float * x,
-    global float * y,
-    int size
+    global float4 * x,
+    global float4 * y,
+    int size4
 ) {
     int i = get_global_id(0);
-    if (i < size) {
-        float val = x[i];
-        float sigmoid = 1.0f / (1.0f + exp(-val));
+    if (i < size4) {
+        float4 val = x[i];
+        float4 sigmoid = 1.0f / (1.0f + exp(-val));
         x[i] = val * sigmoid * y[i];
     }
 }
