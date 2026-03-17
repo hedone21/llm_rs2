@@ -71,8 +71,8 @@ pub enum ActionResult {
     Merged,
     /// KV data was compressed (e.g., SnapKV prefill-time compression).
     Compressed { tokens_removed: usize },
-    /// KV data was swapped to secondary storage (stub).
-    Swapped,
+    /// KV data was swapped to secondary storage (disk offload).
+    Swapped { tokens_swapped: usize },
     /// Sparse attention mask was applied (stub).
     Sparsified,
 }
@@ -474,7 +474,7 @@ mod tests {
         assert!(ActionResult::Quantized.is_action());
         assert!(ActionResult::Merged.is_action());
         assert!(ActionResult::Compressed { tokens_removed: 0 }.is_action());
-        assert!(ActionResult::Swapped.is_action());
+        assert!(ActionResult::Swapped { tokens_swapped: 0 }.is_action());
         assert!(ActionResult::Sparsified.is_action());
     }
 

@@ -7,6 +7,7 @@
 //! deferred store writes for retained layers, and on-demand data loading
 //! for attention computation.
 
+pub mod disk_store;
 pub mod prefetch;
 pub mod preload_pool;
 pub mod raw_store;
