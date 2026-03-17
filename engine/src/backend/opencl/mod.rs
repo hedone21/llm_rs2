@@ -597,46 +597,10 @@ impl Backend for OpenCLBackend {
         );
         let buffer = memory.alloc(size, src.dtype())?;
 
-        // Create new kernel cache by cloning kernel objects
-        let src_kernels = self
-            .kernels
-            .lock()
-            .map_err(|e| anyhow!("Kernel lock poisoned: {}", e))?;
-        let kernel_cache = KernelCache {
-            kernel_mul_mat_f32_f32: src_kernels.kernel_mul_mat_f32_f32.clone(),
-            kernel_mul_mat_f16_f32: src_kernels.kernel_mul_mat_f16_f32.clone(),
-            kernel_mul_mat_q4_0_f32: src_kernels.kernel_mul_mat_q4_0_f32.clone(),
-            kernel_rms_norm_opt: src_kernels.kernel_rms_norm_opt.clone(),
-            kernel_softmax_opt: src_kernels.kernel_softmax_opt.clone(),
-            kernel_rope_simple: src_kernels.kernel_rope_simple.clone(),
-            kernel_silu_mul_simple: src_kernels.kernel_silu_mul_simple.clone(),
-            kernel_add_assign_simple: src_kernels.kernel_add_assign_simple.clone(),
-            kernel_scale_simple: src_kernels.kernel_scale_simple.clone(),
-            kernel_get_rows_q4_0: src_kernels.kernel_get_rows_q4_0.clone(),
-            kernel_get_rows_f32: src_kernels.kernel_get_rows_f32.clone(),
-            kernel_attn_gen: src_kernels.kernel_attn_gen.clone(),
-            kernel_cast_f32_to_f16: src_kernels.kernel_cast_f32_to_f16.clone(),
-            kernel_attn_gen_half: src_kernels.kernel_attn_gen_half.clone(),
-            kernel_quantize_f32_to_q4_0: src_kernels.kernel_quantize_f32_to_q4_0.clone(),
-        };
-        drop(src_kernels); // Release lock before potentially blocking operations
-
-        let new_tensor = Tensor::new(
-            src.shape().clone(),
-            buffer.clone(),
-            Arc::new(Self {
-                context: self.context.clone(),
-                queue: self.queue.clone(),
-                device: self.device,
-                program: self.program.clone(),
-                simple_ops_program: self.simple_ops_program.clone(),
-                q4_0_program: self.q4_0_program.clone(),
-                f16_program: self.f16_program.clone(),
-                quant_q4_0_program: self.quant_q4_0_program.clone(),
-                get_rows_program: self.get_rows_program.clone(),
-                kernels: Mutex::new(kernel_cache),
-            }),
-        );
+        // Share the source tensor's backend (Arc clone = cheap reference count)
+        // instead of creating a new backend + cloning 15 kernel objects.
+        // The Mutex<KernelCache> already provides thread safety.
+        let new_tensor = Tensor::new(src.shape().clone(), buffer.clone(), src.backend().clone());
 
         // Device-to-Device Copy - try using get_cl_mem for both buffer types
         if let (Ok(src_mem), Ok(dst_mem)) = (
