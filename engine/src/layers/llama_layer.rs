@@ -606,6 +606,7 @@ impl LlamaLayer {
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
+        if is_opencl { backend.flush()?; }
         prof_record!(t, matmul_qkv);
 
         // 3. RoPE
@@ -1212,6 +1213,7 @@ impl LlamaLayer {
             backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
+        if is_opencl { backend.flush()?; }
         prof_record!(t, matmul_ffn);
 
         let t = prof_start!();

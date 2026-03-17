@@ -455,7 +455,6 @@ impl OpenCLBackend {
         let kernels = unsafe { &*self.kernels.get() };
         let kernel = &kernels.kernel_mul_mat_f16_f32;
 
-        // Same 15-arg signature as Q4 GEMV kernel
         let ne00 = k as i32;
         let ne01 = n as i32;
         let ne02 = 1i32;
@@ -696,6 +695,11 @@ impl Backend for OpenCLBackend {
 
     fn synchronize(&self) -> Result<()> {
         ocl::core::finish(&self.queue)?;
+        Ok(())
+    }
+
+    fn flush(&self) -> Result<()> {
+        ocl::core::flush(&self.queue)?;
         Ok(())
     }
 

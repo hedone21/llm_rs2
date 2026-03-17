@@ -178,6 +178,12 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Flush the command queue — submit enqueued commands to the device without waiting.
+    /// On GPU backends this calls clFlush to prevent pipeline bubbles.
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+
     // Embedding Lookup / Gather
     // src: [Rows, Cols] (Embeddings)
     // indices: [NumIndices] (Indices)
