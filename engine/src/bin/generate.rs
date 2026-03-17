@@ -895,10 +895,6 @@ fn main() -> anyhow::Result<()> {
             }
 
             let last_token = tokens[tokens.len() - 1];
-            unsafe {
-                *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
-            }
-            let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
 
             // Apply decay to accumulated importance scores before this step
             if let Some(ref mut acc) = score_accumulator {
@@ -908,17 +904,10 @@ fn main() -> anyhow::Result<()> {
             let forward_start = std::time::Instant::now();
 
             // Try GPU plan path (OpenCL decode only, no profiling)
+            // Plan includes pre-bound gather — no copy_from needed, just pass token_id.
             #[cfg(feature = "opencl")]
             let used_plan = if let Some(ref plan) = gpu_plan {
-                match model.execute_plan(
-                    plan,
-                    &gen_input_tensor,
-                    start_pos,
-                    &mut x_gen,
-                    &mut kv_caches,
-                    &mut logits,
-                    &backend,
-                ) {
+                match model.execute_plan(plan, last_token, start_pos, &mut kv_caches, &backend) {
                     Ok(true) => true,
                     Ok(false) => {
                         // Plan invalidated (KV cache resize needed).
@@ -939,6 +928,12 @@ fn main() -> anyhow::Result<()> {
             let used_plan = false;
 
             if !used_plan {
+                // Non-plan path: need copy_from for GPU input tensor
+                unsafe {
+                    *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
+                }
+                let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
+
                 model.forward_into(LlamaModelForwardArgs {
                     input_tokens: &gen_input_tensor,
                     start_pos,
@@ -956,9 +951,7 @@ fn main() -> anyhow::Result<()> {
                 // Rebuild plan after fallback (KV cache may have grown)
                 #[cfg(feature = "opencl")]
                 if gpu_plan.is_none() && backend.name() == "OpenCL" && !args.profile {
-                    gpu_plan = model.build_plan(
-                        &x_gen, &logits, &gen_ws, &mut kv_caches, &backend,
-                    );
+                    gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                 }
             }
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;

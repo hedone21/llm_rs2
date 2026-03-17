@@ -851,7 +851,13 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
-    fn rms_norm_oop(&self, x: &Tensor, out: &mut Tensor, weight: &Tensor, epsilon: f32) -> Result<()> {
+    fn rms_norm_oop(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        weight: &Tensor,
+        epsilon: f32,
+    ) -> Result<()> {
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
