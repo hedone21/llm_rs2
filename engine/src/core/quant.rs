@@ -182,6 +182,106 @@ impl BlockQ8_0 {
     }
 }
 
+// ── KV cache asymmetric quantization blocks (KIVI multi-bit) ─────────────────
+
+/// Group size for KV cache quantization (same as QK2_0).
+pub const QKKV: usize = 32;
+
+/// 4-bit asymmetric KV cache quantization block.
+///
+/// 32 values → 16 bytes (nibble-packed) + 4 bytes (scale f16 + min f16) = 20 bytes.
+/// Compression: 0.625 bytes/element.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct BlockKVQ4 {
+    pub d: f16,               // scale = (max - min) / 15
+    pub m: f16,               // minimum value
+    pub qs: [u8; QKKV / 2],  // 32 × 4-bit packed into 16 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<BlockKVQ4>() == 20);
+
+impl BlockKVQ4 {
+    /// Quantize 32 f32 values into asymmetric 4-bit.
+    pub fn quantize(src: &[f32; QKKV]) -> Self {
+        let min_val = src.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_val = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let d = range / 15.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+
+        let mut qs = [0u8; QKKV / 2];
+        for (i, qs_byte) in qs.iter_mut().enumerate() {
+            let lo = ((src[i * 2] - min_val) * id).round().clamp(0.0, 15.0) as u8;
+            let hi = ((src[i * 2 + 1] - min_val) * id).round().clamp(0.0, 15.0) as u8;
+            *qs_byte = lo | (hi << 4);
+        }
+
+        Self {
+            d: f16::from_f32(d),
+            m: f16::from_f32(min_val),
+            qs,
+        }
+    }
+
+    /// Dequantize 4-bit block back to 32 f32 values.
+    pub fn dequantize(&self, out: &mut [f32; QKKV]) {
+        let d = self.d.to_f32();
+        let m = self.m.to_f32();
+        for (i, &byte) in self.qs.iter().enumerate() {
+            let lo = (byte & 0x0F) as f32;
+            let hi = (byte >> 4) as f32;
+            out[i * 2] = lo * d + m;
+            out[i * 2 + 1] = hi * d + m;
+        }
+    }
+}
+
+/// 8-bit asymmetric KV cache quantization block.
+///
+/// 32 values → 32 bytes + 4 bytes (scale f16 + min f16) = 36 bytes.
+/// Compression: 1.125 bytes/element.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct BlockKVQ8 {
+    pub d: f16,           // scale = (max - min) / 255
+    pub m: f16,           // minimum value
+    pub qs: [u8; QKKV],  // 32 × 8-bit
+}
+
+const _: () = assert!(std::mem::size_of::<BlockKVQ8>() == 36);
+
+impl BlockKVQ8 {
+    /// Quantize 32 f32 values into asymmetric 8-bit.
+    pub fn quantize(src: &[f32; QKKV]) -> Self {
+        let min_val = src.iter().copied().fold(f32::INFINITY, f32::min);
+        let max_val = src.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let range = max_val - min_val;
+        let d = range / 255.0;
+        let id = if d == 0.0 { 0.0 } else { 1.0 / d };
+
+        let mut qs = [0u8; QKKV];
+        for (i, q) in qs.iter_mut().enumerate() {
+            *q = ((src[i] - min_val) * id).round().clamp(0.0, 255.0) as u8;
+        }
+
+        Self {
+            d: f16::from_f32(d),
+            m: f16::from_f32(min_val),
+            qs,
+        }
+    }
+
+    /// Dequantize 8-bit block back to 32 f32 values.
+    pub fn dequantize(&self, out: &mut [f32; QKKV]) {
+        let d = self.d.to_f32();
+        let m = self.m.to_f32();
+        for (i, &q) in self.qs.iter().enumerate() {
+            out[i] = q as f32 * d + m;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,5 +580,101 @@ mod tests {
                 "Q4_1 zero scale should produce m for all elements"
             );
         }
+    }
+
+    // ── BlockKVQ4 tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_kvq4_round_trip() {
+        let src: [f32; QKKV] = std::array::from_fn(|i| i as f32 * 0.1);
+        let block = BlockKVQ4::quantize(&src);
+        let mut dst = [0.0f32; QKKV];
+        block.dequantize(&mut dst);
+        let range = 3.1f32;
+        let max_err = range / 30.0 + 0.02; // 4-bit: 16 levels, max error ≈ range/30
+        for i in 0..QKKV {
+            assert!(
+                (src[i] - dst[i]).abs() < max_err,
+                "KVQ4 error at {i}: src={}, dst={}, err={}",
+                src[i], dst[i], (src[i] - dst[i]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_kvq4_zeros() {
+        let src = [0.0f32; QKKV];
+        let block = BlockKVQ4::quantize(&src);
+        let mut dst = [0.0f32; QKKV];
+        block.dequantize(&mut dst);
+        for val in dst {
+            assert_eq!(val, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_kvq4_known_values() {
+        let block = BlockKVQ4 {
+            d: f16::from_f32(1.0),
+            m: f16::from_f32(-2.0),
+            qs: [0x31; QKKV / 2], // lo=1, hi=3 repeating
+        };
+        let mut out = [0.0f32; QKKV];
+        block.dequantize(&mut out);
+        for i in (0..QKKV).step_by(2) {
+            assert!((out[i] - (-1.0)).abs() < 0.01, "lo: {} != -1.0", out[i]);      // 1*1 + (-2) = -1
+            assert!((out[i + 1] - 1.0).abs() < 0.01, "hi: {} != 1.0", out[i + 1]); // 3*1 + (-2) = 1
+        }
+    }
+
+    // ── BlockKVQ8 tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_kvq8_round_trip() {
+        let src: [f32; QKKV] = std::array::from_fn(|i| (i as f32 - 16.0) * 0.5);
+        let block = BlockKVQ8::quantize(&src);
+        let mut dst = [0.0f32; QKKV];
+        block.dequantize(&mut dst);
+        let range = 15.5f32;
+        let max_err = range / 510.0 + 0.02; // 8-bit: 256 levels
+        for i in 0..QKKV {
+            assert!(
+                (src[i] - dst[i]).abs() < max_err,
+                "KVQ8 error at {i}: src={}, dst={}, err={}",
+                src[i], dst[i], (src[i] - dst[i]).abs()
+            );
+        }
+    }
+
+    #[test]
+    fn test_kvq8_zeros() {
+        let src = [0.0f32; QKKV];
+        let block = BlockKVQ8::quantize(&src);
+        let mut dst = [0.0f32; QKKV];
+        block.dequantize(&mut dst);
+        for val in dst {
+            assert_eq!(val, 0.0);
+        }
+    }
+
+    #[test]
+    fn test_kvq8_high_precision() {
+        // 8-bit should have much lower error than 2-bit
+        let src: [f32; QKKV] = std::array::from_fn(|i| (i as f32) * 0.1);
+        let q8 = BlockKVQ8::quantize(&src);
+        let q2 = BlockQ2_0::quantize(&src);
+        let mut dst_q8 = [0.0f32; QKKV];
+        let mut dst_q2 = [0.0f32; QKKV];
+        q8.dequantize(&mut dst_q8);
+        q2.dequantize(&mut dst_q2);
+        let mse_q8: f32 = src.iter().zip(dst_q8.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / QKKV as f32;
+        let mse_q2: f32 = src.iter().zip(dst_q2.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / QKKV as f32;
+        assert!(mse_q8 < mse_q2, "Q8 MSE ({mse_q8}) should be < Q2 MSE ({mse_q2})");
+    }
+
+    #[test]
+    fn test_kv_block_sizes() {
+        assert_eq!(std::mem::size_of::<BlockKVQ4>(), 20);
+        assert_eq!(std::mem::size_of::<BlockKVQ8>(), 36);
     }
 }

@@ -109,13 +109,19 @@ struct Args {
     #[arg(long, default_value = "f16")]
     kv_type: String,
 
-    /// Eviction policy for KV cache management (none, sliding, h2o, h2o_plus, d2o)
+    /// Eviction policy for KV cache management (none, sliding, streaming, h2o, h2o_plus, d2o)
     #[arg(long, default_value = "none")]
     eviction_policy: String,
 
-    /// Window size for sliding window eviction (tokens)
+    /// Window size for sliding window / streaming eviction (tokens).
+    /// Default: 1024 for sliding, 2000 for streaming.
     #[arg(long, default_value_t = 1024)]
     eviction_window: usize,
+
+    /// Number of attention sink tokens to preserve (StreamingLLM).
+    /// Only used with --eviction-policy streaming.
+    #[arg(long, default_value_t = 4)]
+    sink_size: usize,
 
     /// Deprecated: recent window is now derived from budget split. Kept for CLI compatibility.
     #[arg(long, default_value_t = 128, hide = true)]
@@ -593,6 +599,8 @@ fn main() -> anyhow::Result<()> {
                 // Protecting the entire prompt makes score-based eviction meaningless
                 // because only generated tokens would be evictable.
                 "h2o" | "h2o_plus" | "d2o" => 4,
+                // StreamingLLM: use explicit sink_size parameter
+                "streaming" => args.sink_size,
                 // Sliding window / none: protect entire prompt (legacy behavior)
                 _ => input_ids.len(),
             });
@@ -623,6 +631,15 @@ fn main() -> anyhow::Result<()> {
                         args.eviction_window,
                         actual_protected_prefix,
                     )),
+                    "streaming" => {
+                        // StreamingLLM: default window=2000 if user didn't override
+                        let window = if args.eviction_window == 1024 {
+                            2000
+                        } else {
+                            args.eviction_window
+                        };
+                        Box::new(SlidingWindowPolicy::new(window, actual_protected_prefix))
+                    }
                     "h2o" => Box::new(H2OPolicy::new(
                         args.h2o_recent_window,
                         args.h2o_keep_ratio,
@@ -634,7 +651,7 @@ fn main() -> anyhow::Result<()> {
                         actual_protected_prefix,
                     )),
                     other => anyhow::bail!(
-                        "Unknown eviction policy: '{}'. Use: none, sliding, h2o, h2o_plus, d2o",
+                        "Unknown eviction policy: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
                         other
                     ),
                 };
