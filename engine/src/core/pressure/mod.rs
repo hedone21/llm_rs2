@@ -16,7 +16,7 @@ pub mod quantize_handler;
 pub mod sparse_handler;
 pub mod swap_handler;
 
-pub use compress_handler::CompressHandler;
+pub use compress_handler::SnapKVHandler;
 pub use d2o_handler::D2OHandler;
 pub use eviction_handler::EvictionHandler;
 pub use merge_handler::MergeHandler;
@@ -69,8 +69,8 @@ pub enum ActionResult {
     Quantized,
     /// Similar tokens were merged (stub).
     Merged,
-    /// KV data was compressed (stub).
-    Compressed,
+    /// KV data was compressed (e.g., SnapKV prefill-time compression).
+    Compressed { tokens_removed: usize },
     /// KV data was swapped to secondary storage (stub).
     Swapped,
     /// Sparse attention mask was applied (stub).
@@ -473,7 +473,7 @@ mod tests {
         );
         assert!(ActionResult::Quantized.is_action());
         assert!(ActionResult::Merged.is_action());
-        assert!(ActionResult::Compressed.is_action());
+        assert!(ActionResult::Compressed { tokens_removed: 0 }.is_action());
         assert!(ActionResult::Swapped.is_action());
         assert!(ActionResult::Sparsified.is_action());
     }
