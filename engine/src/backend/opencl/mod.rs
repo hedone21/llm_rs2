@@ -661,7 +661,7 @@ impl Backend for OpenCLBackend {
             get_cl_mem(src.buffer().as_ref()),
             get_cl_mem(dst.buffer().as_ref()),
         ) {
-            // GPU→GPU: enqueue_copy_buffer + flush (submit without waiting)
+            // GPU→GPU: enqueue_copy_buffer (in-order queue ensures correctness)
             unsafe {
                 ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
                     &self.queue,
@@ -674,8 +674,6 @@ impl Backend for OpenCLBackend {
                     None::<&mut ocl::core::Event>,
                 )?;
             }
-            // Flush: submit queued commands immediately for better GPU pipelining
-            ocl::core::flush(&self.queue)?;
         } else {
             // Fallback: CPU memcpy
             let src_ptr = src.as_ptr();
