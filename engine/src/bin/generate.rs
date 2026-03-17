@@ -886,6 +886,9 @@ fn main() -> anyhow::Result<()> {
             None
         };
 
+        // Pre-allocate logits CPU buffer (reused across tokens, avoids 500KB alloc per token)
+        let mut logits_cpu = vec![0.0f32; vocab_size];
+
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
@@ -1276,8 +1279,7 @@ fn main() -> anyhow::Result<()> {
             }
             // ── End Resilience checkpoint ─────────────────────
 
-            // Read logits to CPU
-            let mut logits_cpu = vec![0.0f32; vocab_size];
+            // Read logits to CPU (reuses pre-allocated buffer)
             unsafe {
                 let ptr = logits_cpu.as_mut_ptr() as *mut u8;
                 let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);

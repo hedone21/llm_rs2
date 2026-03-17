@@ -61,15 +61,17 @@ pub fn sample(
         *l /= exp_sum;
     }
 
-    // 3. Top-K
+    // 3. Top-K — partial sort O(n) instead of full sort O(n log n)
+    let top_k = config.top_k.min(vocab_size).max(1);
     let mut indices: Vec<usize> = (0..logits.len()).collect();
-    indices.sort_by(|&a, &b| logits[b].total_cmp(&logits[a])); // Descending
-
-    let top_k = config.top_k.min(vocab_size);
-    let mut valid_indices = indices;
-    if top_k > 0 {
-        valid_indices.truncate(top_k);
+    if top_k < indices.len() {
+        // select_nth partitions: elements [0..top_k) are all >= element at top_k
+        indices.select_nth_unstable_by(top_k, |&a, &b| logits[b].total_cmp(&logits[a]));
+        indices.truncate(top_k);
     }
+    // Sort only the top-k (40 elements) for top-p cumulative sum
+    indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
+    let mut valid_indices = indices;
 
     // 4. Top-P
     let mut cumulative_prob = 0.0;
