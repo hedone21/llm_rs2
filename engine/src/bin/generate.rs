@@ -903,16 +903,18 @@ fn main() -> anyhow::Result<()> {
 
             let forward_start = std::time::Instant::now();
 
-            // Try GPU plan path (OpenCL decode only, no profiling)
-            // Plan includes pre-bound gather — no copy_from needed, just pass token_id.
+            // Try GPU plan path (pre-bound gather, no copy_from needed)
             #[cfg(feature = "opencl")]
             let used_plan = if let Some(ref plan) = gpu_plan {
-                match model.execute_plan(plan, last_token, start_pos, &mut kv_caches, &backend) {
+                match model.execute_plan(
+                    plan,
+                    last_token,
+                    start_pos,
+                    &mut kv_caches,
+                    &backend,
+                ) {
                     Ok(true) => true,
                     Ok(false) => {
-                        // Plan invalidated (KV cache resize needed).
-                        // Set to None; forward_into will handle grow.
-                        // Plan is rebuilt on the next token after grow completes.
                         gpu_plan = None;
                         false
                     }
