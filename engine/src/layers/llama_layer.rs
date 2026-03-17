@@ -137,6 +137,14 @@ pub struct LlamaLayer {
 
 impl LlamaLayer {
     pub fn forward<C: KVCacheOps>(&self, args: LlamaLayerForwardArgs<C>) -> Result<()> {
+        let skip_attn = args.skip_attn;
+        let skip_mlp = args.skip_mlp;
+
+        // SWIFT: if both sub-layers are skipped, early return (identity)
+        if skip_attn && skip_mlp {
+            return Ok(());
+        }
+
         let x = args.x;
         let kv_cache = args.kv_cache;
         let start_pos = args.start_pos;
@@ -170,6 +178,8 @@ impl LlamaLayer {
                 need_scores,
                 head_dim,
                 profiler: args.profiler,
+                skip_attn,
+                skip_mlp,
             });
         }
 
@@ -511,6 +521,13 @@ impl LlamaLayer {
 
     /// Fast path for single token generation using pre-allocated workspace.
     fn forward_gen<C: KVCacheOps>(&self, mut args: LlamaForwardGenArgs<C>) -> Result<()> {
+        // SWIFT: if both sub-layers are skipped, early return (identity)
+        if args.skip_attn && args.skip_mlp {
+            return Ok(());
+        }
+
+        let skip_attn = args.skip_attn;
+        let skip_mlp = args.skip_mlp;
         let x = args.x;
         let kv_cache = args.kv_cache;
         let start_pos = args.start_pos;
@@ -1423,6 +1440,10 @@ pub struct LlamaForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub head_dim: usize,
     /// Optional per-op profiler for timing breakdown.
     pub profiler: Option<&'a mut OpProfiler>,
+    /// SWIFT: skip attention sub-layer (identity pass).
+    pub skip_attn: bool,
+    /// SWIFT: skip MLP/FFN sub-layer (identity pass).
+    pub skip_mlp: bool,
 }
 
 pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -1439,6 +1460,12 @@ pub struct LlamaLayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub head_dim: usize,
     /// Optional per-op profiler for timing breakdown.
     pub profiler: Option<&'a mut OpProfiler>,
+    /// Layer index (0-based). Used for SWIFT layer skip.
+    pub layer_id: usize,
+    /// If true, skip the attention sub-layer (identity pass).
+    pub skip_attn: bool,
+    /// If true, skip the MLP/FFN sub-layer (identity pass).
+    pub skip_mlp: bool,
 }
 
 // OpProfiler has been moved to crate::profile::ops.

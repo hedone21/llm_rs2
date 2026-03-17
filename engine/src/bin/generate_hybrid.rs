@@ -463,6 +463,7 @@ fn main() -> anyhow::Result<()> {
             use_gpu_attn: false,
             score_accumulator: None,
             profiler: None,
+            skip_config: None,
         })?;
 
         // Sample last token
@@ -614,6 +615,7 @@ fn main() -> anyhow::Result<()> {
             use_gpu_attn: is_gpu,
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
+            skip_config: None,
         })?;
 
         // ── Resilience checkpoint (CommandExecutor) ──────

@@ -12,6 +12,8 @@ pub mod offload;
 pub mod pressure;
 pub mod quant;
 pub mod sampling;
+pub mod skip_config;
+pub mod speculative;
 pub mod shape;
 pub mod sys_monitor;
 pub mod tensor;

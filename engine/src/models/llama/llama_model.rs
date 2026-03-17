@@ -62,6 +62,8 @@ pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
     /// Optional per-op profiler.
     pub profiler: Option<&'a mut crate::profile::ops::OpProfiler>,
+    /// Optional SWIFT skip configuration for layer skipping.
+    pub skip_config: Option<&'a crate::core::skip_config::SkipConfig>,
 }
 
 impl LlamaModel {
@@ -433,6 +435,9 @@ impl LlamaModel {
                 need_scores: false,
                 head_dim: self.config.head_dim,
                 profiler: None,
+                layer_id: i,
+                skip_attn: false,
+                skip_mlp: false,
             })?;
         }
 
@@ -471,6 +476,7 @@ impl LlamaModel {
         let mut profiler = args.profiler;
 
         let mut score_accumulator = args.score_accumulator;
+        let skip_config = args.skip_config;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -507,6 +513,9 @@ impl LlamaModel {
                 .as_ref()
                 .is_some_and(|acc| acc.should_track_layer(i));
 
+            let (s_attn, s_mlp) = skip_config
+                .map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
+
             layer.forward(LlamaLayerForwardArgs {
                 x: &mut x,
                 kv_cache: &mut kv_caches[i],
@@ -520,6 +529,9 @@ impl LlamaModel {
                 need_scores,
                 head_dim: self.config.head_dim,
                 profiler: profiler.as_deref_mut(),
+                layer_id: i,
+                skip_attn: s_attn,
+                skip_mlp: s_mlp,
             })?;
 
             // Capture attention scores for H2O/H2O+ accumulator
@@ -836,6 +848,9 @@ impl LlamaModel {
                 need_scores: false,
                 head_dim: self.config.head_dim,
                 profiler: None,
+                layer_id: i,
+                skip_attn: false,
+                skip_mlp: false,
             })?;
             let fwd_dur = fwd_t0.elapsed();
             prefetch.record_forward(fwd_dur);

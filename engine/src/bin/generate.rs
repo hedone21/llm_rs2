@@ -787,6 +787,7 @@ fn main() -> anyhow::Result<()> {
             use_gpu_attn: args.gpu_attn,
             score_accumulator: None, // No score tracking during prefill
             profiler: None,
+                skip_config: None,
         })?;
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
@@ -972,6 +973,7 @@ fn main() -> anyhow::Result<()> {
                     use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
+                    skip_config: None,
                 })?;
 
                 // Rebuild plan after fallback (KV cache may have grown)
@@ -1806,6 +1808,7 @@ fn run_eval_ll(
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: None,
                 profiler: None,
+                skip_config: None,
             })?;
 
             let mut start_pos = first_chunk_len;
@@ -1843,6 +1846,7 @@ fn run_eval_ll(
                     use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: None,
+                skip_config: None,
                 })?;
                 start_pos += 1;
 
@@ -1907,6 +1911,7 @@ fn run_eval_ll(
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: None,
                 profiler: None,
+                skip_config: None,
             })?;
 
             start_pos_after_prompt = prompt_len;
@@ -1974,6 +1979,7 @@ fn run_eval_ll(
                         use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
+                skip_config: None,
                     })?;
                     sp += 1;
 
@@ -2235,6 +2241,7 @@ fn run_kivi_eval_ll(
             use_gpu_attn: args.gpu_attn,
             score_accumulator: None,
             profiler: None,
+                skip_config: None,
         })?;
 
         let start_pos_after_prompt = prompt_len;
@@ -2302,6 +2309,7 @@ fn run_kivi_eval_ll(
                         use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
+                skip_config: None,
                     })?;
                     sp += 1;
 
@@ -2526,6 +2534,7 @@ fn run_kivi(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
+                skip_config: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2615,6 +2624,7 @@ fn run_kivi(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
+                skip_config: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -2891,6 +2901,7 @@ fn run_offload(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
+                skip_config: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2985,6 +2996,7 @@ fn run_offload(
                 use_gpu_attn: gpu_attn,
                 score_accumulator: None,
                 profiler: None,
+                skip_config: None,
             },
             &mut prefetch,
         )?;
