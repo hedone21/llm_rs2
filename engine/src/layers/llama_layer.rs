@@ -543,16 +543,10 @@ impl LlamaLayer {
             };
         }
 
-        // 1. Attention Norm
+        // 1. Attention Norm — copy_into reuses pre-allocated residual buffer
         let t = prof_start!();
         let is_opencl = backend.name() == "OpenCL";
-        if is_opencl {
-            // GPU: copy_from's backend clone overhead helps pipeline GPU matmuls
-            ws.residual = backend.copy_from(x)?;
-        } else {
-            // CPU: copy_into avoids unnecessary backend cloning
-            backend.copy_into(x, &mut ws.residual)?;
-        }
+        backend.copy_into(x, &mut ws.residual)?;
         prof_record!(t, copy_residual);
 
         let t = prof_start!();
@@ -1171,13 +1165,8 @@ impl LlamaLayer {
 
         // Copy attn_out → x, and x → residual for FFN skip connection
         let t = prof_start!();
-        if is_opencl {
-            *x = backend.copy_from(&ws.attn_out)?;
-            ws.residual = backend.copy_from(x)?;
-        } else {
-            backend.copy_into(&ws.attn_out, x)?;
-            backend.copy_into(x, &mut ws.residual)?;
-        }
+        backend.copy_into(&ws.attn_out, x)?;
+        backend.copy_into(x, &mut ws.residual)?;
         prof_record!(t, copy_residual);
 
         let t = prof_start!();
@@ -1232,11 +1221,7 @@ impl LlamaLayer {
 
         // Copy down → x for next layer
         let t = prof_start!();
-        if is_opencl {
-            *x = backend.copy_from(&ws.down)?;
-        } else {
-            backend.copy_into(&ws.down, x)?;
-        }
+        backend.copy_into(&ws.down, x)?;
         prof_record!(t, copy_residual);
 
         if let Some(ref mut p) = profiler {
