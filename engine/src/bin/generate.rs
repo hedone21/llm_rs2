@@ -790,7 +790,7 @@ fn main() -> anyhow::Result<()> {
         let mut last_logits = logits_cpu[start_idx..start_idx + vocab_size].to_vec();
 
         let next_token_id =
-            sampling::sample(&mut last_logits, &tokens, vocab_size, &sampling_config);
+            sampling::sample(&mut last_logits, &tokens, vocab_size, &sampling_config, None);
 
         _ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         _last_token_time = std::time::Instant::now();
@@ -886,8 +886,9 @@ fn main() -> anyhow::Result<()> {
             None
         };
 
-        // Pre-allocate logits CPU buffer (reused across tokens, avoids 500KB alloc per token)
+        // Pre-allocate decode buffers (reused across tokens)
         let mut logits_cpu = vec![0.0f32; vocab_size];
+        let mut sampling_indices: Vec<usize> = (0..vocab_size).collect();
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
@@ -1295,7 +1296,7 @@ fn main() -> anyhow::Result<()> {
 
             let sample_start = std::time::Instant::now();
             let next_token_id =
-                sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config);
+                sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config, Some(&mut sampling_indices));
             let sample_us = sample_start.elapsed().as_micros() as u64;
 
             let now = std::time::Instant::now();
@@ -2523,6 +2524,7 @@ fn run_kivi(
             &tokens,
             vocab_size,
             sampling_config,
+            None,
         );
         tokens.push(next_token);
         start_pos = process_len;
@@ -2618,7 +2620,7 @@ fn run_kivi(
             vec![]
         };
 
-        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config);
+        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
 
         let now = std::time::Instant::now();
         let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
@@ -2887,6 +2889,7 @@ fn run_offload(
             &tokens,
             vocab_size,
             sampling_config,
+            None,
         );
         tokens.push(next_token);
         start_pos = process_len;
@@ -2982,7 +2985,7 @@ fn run_offload(
             backend.read_buffer(&logits, slice)?;
         }
 
-        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config);
+        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
 
         let now = std::time::Instant::now();
         let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;

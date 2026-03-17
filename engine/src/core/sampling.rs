@@ -15,11 +15,14 @@ pub struct SamplingConfig {
 /// top-k, and top-p filtering.
 ///
 /// Modifies `logits` in-place (applies penalty, temperature scaling, softmax).
+/// `indices_buf` is a reusable scratch buffer (len >= vocab_size) to avoid
+/// per-token heap allocation. Pass `None` to allocate internally.
 pub fn sample(
     logits: &mut [f32],
     recent_tokens: &[u32],
     vocab_size: usize,
     config: &SamplingConfig,
+    indices_buf: Option<&mut Vec<usize>>,
 ) -> u32 {
     // 1. Repetition Penalty
     let start_idx = recent_tokens.len().saturating_sub(config.repetition_window);
@@ -63,28 +66,41 @@ pub fn sample(
 
     // 3. Top-K — partial sort O(n) instead of full sort O(n log n)
     let top_k = config.top_k.min(vocab_size).max(1);
-    let mut indices: Vec<usize> = (0..logits.len()).collect();
-    if top_k < indices.len() {
-        // select_nth partitions: elements [0..top_k) are all >= element at top_k
+    let n = logits.len();
+
+    // Reuse pre-allocated indices buffer or allocate fresh
+    let mut owned_buf;
+    let indices = match indices_buf {
+        Some(buf) => {
+            buf.clear();
+            buf.extend(0..n);
+            buf
+        }
+        None => {
+            owned_buf = (0..n).collect::<Vec<usize>>();
+            &mut owned_buf
+        }
+    };
+
+    if top_k < n {
         indices.select_nth_unstable_by(top_k, |&a, &b| logits[b].total_cmp(&logits[a]));
         indices.truncate(top_k);
     }
     // Sort only the top-k (40 elements) for top-p cumulative sum
     indices.sort_unstable_by(|&a, &b| logits[b].total_cmp(&logits[a]));
-    let mut valid_indices = indices;
 
     // 4. Top-P
     let mut cumulative_prob = 0.0;
-    let mut cutoff_index = valid_indices.len();
+    let mut cutoff_index = indices.len();
 
-    for (i, &idx) in valid_indices.iter().enumerate() {
+    for (i, &idx) in indices.iter().enumerate() {
         cumulative_prob += logits[idx];
         if cumulative_prob > config.top_p {
             cutoff_index = i + 1;
             break;
         }
     }
-    valid_indices.truncate(cutoff_index);
+    let valid = &indices[..cutoff_index];
 
     // 5. Sample
     let mut rng = rand::rng();
@@ -92,19 +108,19 @@ pub fn sample(
 
     // Normalize probabilities of valid indices
     let mut prob_sum = 0.0;
-    for &idx in &valid_indices {
+    for &idx in valid {
         prob_sum += logits[idx];
     }
 
     let mut thread_r = r * prob_sum;
-    for &idx in &valid_indices {
+    for &idx in valid {
         thread_r -= logits[idx];
         if thread_r <= 0.0 {
             return idx as u32;
         }
     }
 
-    valid_indices.first().copied().unwrap_or(0) as u32
+    valid.first().copied().unwrap_or(0) as u32
 }
 
 /// Compute log P(token_id) from raw logits using numerically stable log-softmax.
@@ -141,7 +157,7 @@ mod tests {
     fn test_greedy_sampling() {
         let mut logits = vec![0.1, 0.5, 0.3, 0.9, 0.2];
         let config = default_config(); // temp=0.0 → greedy
-        let token = sample(&mut logits, &[], 5, &config);
+        let token = sample(&mut logits, &[], 5, &config, None);
         assert_eq!(token, 3); // highest logit at index 3
     }
 
@@ -154,7 +170,7 @@ mod tests {
         };
         // Token 4 (logit=5.0, positive) should be divided by 2.0 → 2.5
         // Token 3 (logit=4.0) stays → should win greedy
-        let token = sample(&mut logits, &[4], 5, &config);
+        let token = sample(&mut logits, &[4], 5, &config, None);
         assert_eq!(token, 3);
     }
 
@@ -162,7 +178,7 @@ mod tests {
     fn test_greedy_with_negative_logits() {
         let mut logits = vec![-5.0, -1.0, -3.0];
         let config = default_config();
-        let token = sample(&mut logits, &[], 3, &config);
+        let token = sample(&mut logits, &[], 3, &config, None);
         assert_eq!(token, 1); // -1.0 is the highest
     }
 
