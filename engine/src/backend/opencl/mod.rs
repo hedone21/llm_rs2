@@ -17,7 +17,7 @@ pub mod plan;
 
 /// Helper function to get the OpenCL memory handle from a tensor buffer.
 /// Works with both UnifiedBuffer and legacy OpenCLBuffer.
-fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
+pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // First try UnifiedBuffer
     if let Some(unified) = buf.as_any().downcast_ref::<UnifiedBuffer>() {
         return Ok(unified.cl_buffer().as_core());

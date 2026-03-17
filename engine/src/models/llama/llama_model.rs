@@ -19,6 +19,9 @@ use crate::layers::llama_layer::{LlamaLayer, LlamaLayerForwardArgs};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::galloc::Galloc;
 
+#[cfg(feature = "opencl")]
+use crate::backend::opencl::plan::FullKernelPlan;
+
 #[derive(Debug, Deserialize)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
@@ -553,6 +556,143 @@ impl LlamaModel {
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
         Ok(())
+    }
+
+    /// Build a pre-bound GPU kernel execution plan for decode (seq_len=1).
+    /// Returns None if the backend is not OpenCL or if plan construction fails.
+    #[cfg(feature = "opencl")]
+    pub fn build_plan(
+        &self,
+        x: &Tensor,
+        logits: &Tensor,
+        ws: &LayerWorkspace,
+        kv_caches: &mut [KVCache],
+        backend: &Arc<dyn Backend>,
+    ) -> Option<FullKernelPlan> {
+        use crate::backend::opencl::get_cl_mem;
+        use crate::backend::opencl::plan::*;
+        use crate::core::buffer::Buffer;
+        use crate::core::kv_cache::KVLayout;
+
+        if backend.name() != "OpenCL" || kv_caches.is_empty() {
+            return None;
+        }
+
+        // Helper macro to extract cl_mem from tensor (avoids closure lifetime issues)
+        macro_rules! cl {
+            ($t:expr) => {
+                match get_cl_mem($t.buffer().as_ref()) {
+                    Ok(m) => m,
+                    Err(_) => return None,
+                }
+            };
+        }
+
+        let dim = self.config.hidden_size;
+        let head_dim = self.config.head_dim;
+        let n_kv_heads = self.config.num_key_value_heads;
+        let capacity = kv_caches[0].capacity();
+
+        let (kv_pos_stride, kv_head_stride) = if kv_caches[0].layout() == KVLayout::HeadMajor {
+            (head_dim as i32, (capacity * head_dim) as i32)
+        } else {
+            ((n_kv_heads * head_dim) as i32, head_dim as i32)
+        };
+
+        // Collect per-layer buffer handles
+        let mut layer_bufs = Vec::new();
+        let mut kv_bufs_vec = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer_bufs.push(LayerBufs {
+                wq: cl!(layer.wq),
+                wk: cl!(layer.wk),
+                wv: cl!(layer.wv),
+                wo: cl!(layer.wo),
+                w_gate: cl!(layer.w_gate),
+                w_up: cl!(layer.w_up),
+                w_down: cl!(layer.w_down),
+                attn_norm: cl!(layer.attention_norm),
+                ffn_norm: cl!(layer.ffn_norm),
+            });
+            kv_bufs_vec.push(KvBufs {
+                k_cache: cl!(kv_caches[i].k_buffer),
+                v_cache: cl!(kv_caches[i].v_buffer),
+            });
+        }
+
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
+
+        let full_config = FullPlanConfig {
+            f16_program: &ocl_backend.f16_program,
+            simple_ops_program: &ocl_backend.simple_ops_program,
+            layer_bufs,
+            x_buf: cl!(x),
+            q_buf: cl!(ws.q),
+            k_buf: cl!(ws.k),
+            v_buf: cl!(ws.v),
+            out_attn_buf: cl!(ws.out_attn),
+            attn_out_buf: cl!(ws.attn_out),
+            gate_buf: cl!(ws.gate),
+            up_buf: cl!(ws.up),
+            down_buf: cl!(ws.down),
+            residual_buf: cl!(ws.residual),
+            kv_bufs: kv_bufs_vec,
+            final_norm_buf: cl!(self.norm),
+            lm_head_buf: cl!(self.lm_head),
+            logits_buf: cl!(logits),
+            dim,
+            n_heads_q: self.config.num_attention_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_hidden: self.config.intermediate_size,
+            vocab_size: self.config.vocab_size,
+            rms_norm_eps: self.config.rms_norm_eps as f32,
+            rope_theta: self.config.rope_theta as f32,
+            kv_capacity: capacity,
+            kv_pos_stride,
+            kv_head_stride,
+        };
+
+        match build_full_plan(&full_config) {
+            Ok(plan) => {
+                log::info!("GPU kernel plan built ({} layers, capacity={})", self.layers.len(), capacity);
+                Some(plan)
+            }
+            Err(e) => {
+                log::warn!("Failed to build GPU kernel plan: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Execute a pre-built GPU kernel plan for a single decode token.
+    /// Falls back to forward_into() on plan invalidation.
+    #[cfg(feature = "opencl")]
+    pub fn execute_plan(
+        &self,
+        plan: &FullKernelPlan,
+        input_tokens: &Tensor,
+        start_pos: usize,
+        x_gen: &mut Tensor,
+        kv_caches: &mut [KVCache],
+        logits_out: &mut Tensor,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<bool> {
+        // 1. Embedding lookup
+        backend.gather(&self.embed_tokens, input_tokens, x_gen)?;
+
+        // 2. Execute plan (all layers + final norm + lm_head)
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
+
+        match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false), // plan invalidated, caller should rebuild
+        }
     }
 
     /// Offload-optimized forward pass with adaptive multi-layer prefetch pipeline.

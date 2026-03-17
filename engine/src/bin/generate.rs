@@ -878,6 +878,14 @@ fn main() -> anyhow::Result<()> {
         _printed_len = initial_text.len();
         stdout.flush().ok();
 
+        // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
+        #[cfg(feature = "opencl")]
+        let mut gpu_plan = if backend.name() == "OpenCL" && !args.profile {
+            model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
+        } else {
+            None
+        };
+
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
@@ -898,19 +906,53 @@ fn main() -> anyhow::Result<()> {
             }
 
             let forward_start = std::time::Instant::now();
-            model.forward_into(LlamaModelForwardArgs {
-                input_tokens: &gen_input_tensor,
-                start_pos,
-                kv_caches: &mut kv_caches,
-                backend: &backend,
-                memory: memory.as_ref(),
-                logits_out: &mut logits,
-                x_gen: Some(&mut x_gen),
-                workspace: Some(&mut gen_ws),
-                use_gpu_attn: args.gpu_attn,
-                score_accumulator: score_accumulator.as_mut(),
-                profiler: profiler.as_mut().map(|p| &mut p.ops),
-            })?;
+
+            // Try GPU plan path (OpenCL decode only, no profiling)
+            #[cfg(feature = "opencl")]
+            let used_plan = if let Some(ref plan) = gpu_plan {
+                match model.execute_plan(
+                    plan,
+                    &gen_input_tensor,
+                    start_pos,
+                    &mut x_gen,
+                    &mut kv_caches,
+                    &mut logits,
+                    &backend,
+                ) {
+                    Ok(true) => true,
+                    Ok(false) => {
+                        // Plan invalidated (KV cache resized), rebuild
+                        gpu_plan = model.build_plan(
+                            &x_gen, &logits, &gen_ws, &mut kv_caches, &backend,
+                        );
+                        false
+                    }
+                    Err(_) => {
+                        gpu_plan = None;
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            #[cfg(not(feature = "opencl"))]
+            let used_plan = false;
+
+            if !used_plan {
+                model.forward_into(LlamaModelForwardArgs {
+                    input_tokens: &gen_input_tensor,
+                    start_pos,
+                    kv_caches: &mut kv_caches,
+                    backend: &backend,
+                    memory: memory.as_ref(),
+                    logits_out: &mut logits,
+                    x_gen: Some(&mut x_gen),
+                    workspace: Some(&mut gen_ws),
+                    use_gpu_attn: args.gpu_attn,
+                    score_accumulator: score_accumulator.as_mut(),
+                    profiler: profiler.as_mut().map(|p| &mut p.ops),
+                })?;
+            }
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
             // ── H2O Debug: per-step diagnostics ──
