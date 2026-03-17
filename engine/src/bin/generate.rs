@@ -921,10 +921,10 @@ fn main() -> anyhow::Result<()> {
                 ) {
                     Ok(true) => true,
                     Ok(false) => {
-                        // Plan invalidated (KV cache resized), rebuild
-                        gpu_plan = model.build_plan(
-                            &x_gen, &logits, &gen_ws, &mut kv_caches, &backend,
-                        );
+                        // Plan invalidated (KV cache resize needed).
+                        // Set to None; forward_into will handle grow.
+                        // Plan is rebuilt on the next token after grow completes.
+                        gpu_plan = None;
                         false
                     }
                     Err(_) => {
@@ -952,6 +952,14 @@ fn main() -> anyhow::Result<()> {
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
                 })?;
+
+                // Rebuild plan after fallback (KV cache may have grown)
+                #[cfg(feature = "opencl")]
+                if gpu_plan.is_none() && backend.name() == "OpenCL" && !args.profile {
+                    gpu_plan = model.build_plan(
+                        &x_gen, &logits, &gen_ws, &mut kv_caches, &backend,
+                    );
+                }
             }
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 

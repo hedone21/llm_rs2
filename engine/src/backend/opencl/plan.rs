@@ -111,8 +111,10 @@ impl FullKernelPlan {
         for (i, layer_plan) in self.layers.iter().enumerate() {
             let cache = &mut kv_caches[i];
 
-            // Check for KV cache resize (plan invalidation)
-            if cache.capacity() != self.kv_capacity {
+            // Check for KV cache resize or capacity overflow (plan invalidation)
+            if cache.capacity() != self.kv_capacity
+                || cache.current_pos() >= cache.capacity()
+            {
                 return Err(PlanInvalidated);
             }
 
