@@ -161,31 +161,6 @@ impl FullKernelPlan {
         start_pos: usize,
         kv_caches: &mut [C],
     ) -> std::result::Result<(), PlanInvalidated> {
-        // Write token to pre-allocated input buffer + enqueue gather
-        unsafe {
-            let token_slice = std::slice::from_raw_parts(&token_id as *const u32, 1);
-            ocl::core::enqueue_write_buffer(
-                queue,
-                &self.input_token_buf,
-                false, // non-blocking (ordered with subsequent kernels)
-                0,
-                token_slice,
-                None::<ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )
-            .ok();
-            enqueue_step(queue, &self.embed_gather);
-        }
-        self.execute_layers(queue, start_pos, kv_caches)
-    }
-
-    /// Core execution: hoisted invariants + flat dynamic arg dispatch.
-    fn execute_layers<C: crate::core::kv_cache::KVCacheOps>(
-        &self,
-        queue: &ocl::core::CommandQueue,
-        start_pos: usize,
-        kv_caches: &mut [C],
-    ) -> std::result::Result<(), PlanInvalidated> {
         // ── Hoist all invariants ──
         // All KV caches are homogeneous (same capacity/pos), check once.
         let initial_pos = kv_caches[0].current_pos();
@@ -201,7 +176,23 @@ impl FullKernelPlan {
             self.kv_capacity as i32, // DynTag::KvCapacity = 3
         ];
 
-        // ── Layer loop — tight enqueue with flat dynamic arg dispatch ──
+        // ── 1. Write token to pre-allocated input buffer + enqueue gather ──
+        unsafe {
+            let token_slice = std::slice::from_raw_parts(&token_id as *const u32, 1);
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.input_token_buf,
+                false, // non-blocking (ordered with subsequent kernels)
+                0,
+                token_slice,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .ok();
+            enqueue_step(queue, &self.embed_gather);
+        }
+
+        // ── 2. Layer loop — tight enqueue with flat dynamic arg dispatch ──
         for (i, layer_plan) in self.layers.iter().enumerate() {
             for step in &layer_plan.steps {
                 // Set dynamic args (0, 1, or 2 per step — unrolled, no Vec)

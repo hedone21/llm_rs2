@@ -675,8 +675,9 @@ impl LlamaModel {
 
     /// Execute a pre-built GPU kernel plan for a single decode token.
     ///
-    /// Uses pre-bound gather: writes token_id to plan's input buffer,
-    /// then runs gather + all layers in one tight enqueue loop.
+    /// The plan includes pre-bound gather (embedding lookup), so no separate
+    /// `backend.gather()` call is needed. Token ID is written directly to the
+    /// plan's pre-allocated input buffer.
     #[cfg(feature = "opencl")]
     pub fn execute_plan(
         &self,
@@ -691,13 +692,11 @@ impl LlamaModel {
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
-        match plan.execute(ocl_backend.queue.as_core(), token_id, start_pos, kv_caches)
-        {
+        match plan.execute(ocl_backend.queue.as_core(), token_id, start_pos, kv_caches) {
             Ok(()) => Ok(true),
-            Err(_) => Ok(false),
+            Err(_) => Ok(false), // plan invalidated, caller should rebuild
         }
     }
-
 
     /// Offload-optimized forward pass with adaptive multi-layer prefetch pipeline.
     ///
