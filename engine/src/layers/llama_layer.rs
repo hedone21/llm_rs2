@@ -606,9 +606,7 @@ impl LlamaLayer {
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
-        if is_opencl {
-            backend.flush()?;
-        }
+        if is_opencl { backend.flush()?; }
         prof_record!(t, matmul_qkv);
 
         // 3. RoPE
@@ -1178,13 +1176,7 @@ impl LlamaLayer {
 
         // 7+8. Fused: x += attn_out; ws.residual = norm(x) * ffn_norm
         let t = prof_start!();
-        backend.add_rms_norm_oop(
-            x,
-            &ws.attn_out,
-            &mut ws.residual,
-            &self.ffn_norm,
-            rms_norm_eps,
-        )?;
+        backend.add_rms_norm_oop(x, &ws.attn_out, &mut ws.residual, &self.ffn_norm, rms_norm_eps)?;
         prof_record!(t, rms_norm);
 
         // 9. FFN — fused gate+up dispatch for F16 CPU (1 dispatch instead of 2)
@@ -1218,9 +1210,7 @@ impl LlamaLayer {
             backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
-        if is_opencl {
-            backend.flush()?;
-        }
+        if is_opencl { backend.flush()?; }
         prof_record!(t, matmul_ffn);
 
         let t = prof_start!();

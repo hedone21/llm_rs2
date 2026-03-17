@@ -2,10 +2,10 @@
 //!
 //! Eliminates per-dispatch overhead by pre-binding all static kernel arguments
 //! (weights, workspace buffers, dimensions) at plan build time. During execution,
-//! only dynamic scalars (start_pos, cache_seq_len, write_pos) are updated via a
-//! compact inline slot table — no Vec, no enum match dispatch.
+//! only dynamic scalars (start_pos, cache_seq_len, write_pos) are updated.
 //!
-//! Includes pre-bound embedding gather to avoid per-token dispatch overhead.
+//! This mirrors llama.cpp's tight enqueue loop where kernel arguments rarely change
+//! between tokens, achieving near-zero CPU overhead per dispatch.
 
 use anyhow::{Context, Result};
 use ocl::core::Kernel as CoreKernel;
@@ -14,7 +14,6 @@ use ocl::core::Mem;
 /// Operation tag for profiling — maps to OpProfiler fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpTag {
-    EmbedGather,
     RmsNorm,
     MatmulQKV,
     Rope,
@@ -30,28 +29,17 @@ pub enum OpTag {
     LmHead,
 }
 
-/// Tag identifying which pre-computed dynamic value a slot references.
-/// Repr(u8) enables direct indexing into a `[i32; 4]` values array.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum DynTag {
-    /// RoPE start position
-    StartPos = 0,
-    /// Attention cache sequence length (= current_pos before advance)
-    CacheSeqLen = 1,
-    /// KV scatter write position (= current_pos before advance)
-    WritePos = 2,
-    /// KV cache capacity (constant per plan lifetime)
-    KvCapacity = 3,
-}
-
-/// Compact dynamic argument slot — inline, no heap allocation.
-#[derive(Debug, Clone, Copy)]
-pub struct DynArgSlot {
-    /// Kernel argument index to update.
-    pub arg_idx: u32,
-    /// Which pre-computed value to use (indexes into values array).
-    pub tag: DynTag,
+/// Dynamic argument that changes per token.
+#[derive(Debug, Clone)]
+pub enum DynamicArg {
+    /// RoPE start position (i32)
+    StartPos { arg_idx: u32 },
+    /// Attention cache sequence length (i32)
+    CacheSeqLen { arg_idx: u32 },
+    /// KV scatter write position (i32)
+    WritePos { arg_idx: u32 },
+    /// KV cache capacity — changes on resize (i32)
+    KvCapacity { arg_idx: u32 },
 }
 
 /// A single GPU kernel dispatch with pre-bound arguments.
@@ -64,9 +52,8 @@ pub struct KernelStep {
     pub global_work_size: [usize; 3],
     /// Local work size (None = driver picks)
     pub local_work_size: Option<[usize; 3]>,
-    /// Up to 2 dynamic arguments per step (inline, no Vec allocation).
-    /// Most steps (10/15) have [None, None]. Scatter has 2.
-    pub dyn_slots: [Option<DynArgSlot>; 2],
+    /// Arguments that must be updated per token
+    pub dynamic_args: Vec<DynamicArg>,
     /// Operation tag for profiling
     pub op_tag: OpTag,
 }
@@ -88,16 +75,12 @@ pub struct LayerKernelPlan {
 pub struct FullKernelPlan {
     /// Per-layer plans (indexed by layer number)
     pub layers: Vec<LayerKernelPlan>,
-    /// Pre-bound embedding gather step
-    pub embed_gather: KernelStep,
     /// Final RMSNorm step (model.norm)
     pub final_norm: KernelStep,
     /// lm_head matmul step
     pub lm_head: KernelStep,
     /// KV cache capacity at plan creation time (for invalidation check)
     pub kv_capacity: usize,
-    /// Pre-allocated GPU buffer for 1 input token (4 bytes, owned by plan)
-    pub input_token_buf: Mem,
 }
 
 /// Error indicating the plan's pre-bound arguments are stale.
@@ -112,111 +95,126 @@ impl std::fmt::Display for PlanInvalidated {
 
 impl std::error::Error for PlanInvalidated {}
 
-/// Helper: set a single dynamic arg on a kernel step.
-#[inline(always)]
-unsafe fn set_dyn_arg(kernel: &CoreKernel, slot: &DynArgSlot, vals: &[i32; 4]) {
-    unsafe {
-        ocl::core::set_kernel_arg(
-            kernel,
-            slot.arg_idx,
-            ocl::core::ArgVal::scalar(&vals[slot.tag as usize]),
-        )
-        .ok();
-    }
-}
-
-/// Helper: enqueue a single kernel step.
-#[inline(always)]
-unsafe fn enqueue_step(queue: &ocl::core::CommandQueue, step: &KernelStep) {
-    unsafe {
-        ocl::core::enqueue_kernel(
-            queue,
-            &step.kernel,
-            step.ndim,
-            None,
-            &step.global_work_size,
-            step.local_work_size,
-            None::<&ocl::core::Event>,
-            None::<&mut ocl::core::Event>,
-        )
-        .ok();
-    }
-}
-
 impl FullKernelPlan {
     /// Execute the full decode plan for one token.
     ///
-    /// Writes `token_id` to the pre-allocated input buffer, enqueues gather,
-    /// then runs all layer kernels with minimal CPU overhead.
-    ///
-    /// All dynamic values are pre-computed once before the layer loop:
-    /// - `start_pos`, `cache_seq_len`, `write_pos`, `kv_capacity` hoisted.
-    /// - Capacity check runs once (all caches are homogeneous).
+    /// Updates only dynamic args (start_pos, cache_seq_len, write_pos),
+    /// then enqueues all kernels in a tight loop with minimal CPU intervention.
     ///
     /// Returns `Err(PlanInvalidated)` if KV cache capacity changed.
     pub fn execute<C: crate::core::kv_cache::KVCacheOps>(
         &self,
         queue: &ocl::core::CommandQueue,
-        token_id: u32,
         start_pos: usize,
         kv_caches: &mut [C],
     ) -> std::result::Result<(), PlanInvalidated> {
-        // ── Hoist all invariants ──
-        // All KV caches are homogeneous (same capacity/pos), check once.
-        let initial_pos = kv_caches[0].current_pos();
-        if kv_caches[0].capacity() != self.kv_capacity || initial_pos >= self.kv_capacity {
-            return Err(PlanInvalidated);
-        }
-
-        // Pre-compute all 4 dynamic values (indexed by DynTag repr).
-        let dyn_vals: [i32; 4] = [
-            start_pos as i32,        // DynTag::StartPos = 0
-            initial_pos as i32,      // DynTag::CacheSeqLen = 1
-            initial_pos as i32,      // DynTag::WritePos = 2
-            self.kv_capacity as i32, // DynTag::KvCapacity = 3
-        ];
-
-        // ── 1. Write token to pre-allocated input buffer + enqueue gather ──
-        unsafe {
-            let token_slice = std::slice::from_raw_parts(&token_id as *const u32, 1);
-            ocl::core::enqueue_write_buffer(
-                queue,
-                &self.input_token_buf,
-                false, // non-blocking (ordered with subsequent kernels)
-                0,
-                token_slice,
-                None::<ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )
-            .ok();
-            enqueue_step(queue, &self.embed_gather);
-        }
-
-        // ── 2. Layer loop — tight enqueue with flat dynamic arg dispatch ──
         for (i, layer_plan) in self.layers.iter().enumerate() {
-            for step in &layer_plan.steps {
-                // Set dynamic args (0, 1, or 2 per step — unrolled, no Vec)
-                if let Some(ref s) = step.dyn_slots[0] {
-                    unsafe { set_dyn_arg(&step.kernel, s, &dyn_vals) };
-                }
-                if let Some(ref s) = step.dyn_slots[1] {
-                    unsafe { set_dyn_arg(&step.kernel, s, &dyn_vals) };
-                }
+            let cache = &mut kv_caches[i];
 
-                unsafe { enqueue_step(queue, step) };
+            // Check for KV cache resize or capacity overflow (plan invalidation)
+            if cache.capacity() != self.kv_capacity
+                || cache.current_pos() >= cache.capacity()
+            {
+                return Err(PlanInvalidated);
             }
 
-            kv_caches[i].advance_pos(1);
+            let cache_seq_len = cache.current_pos() as i32;
+            let write_pos = cache.current_pos() as i32;
+            let start_pos_i32 = start_pos as i32;
+
+            for step in &layer_plan.steps {
+                // Update dynamic args only (typically 1-3 per step)
+                for dyn_arg in &step.dynamic_args {
+                    unsafe {
+                        match dyn_arg {
+                            DynamicArg::StartPos { arg_idx } => {
+                                ocl::core::set_kernel_arg(
+                                    &step.kernel,
+                                    *arg_idx,
+                                    ocl::core::ArgVal::scalar(&start_pos_i32),
+                                )
+                                .ok();
+                            }
+                            DynamicArg::CacheSeqLen { arg_idx } => {
+                                ocl::core::set_kernel_arg(
+                                    &step.kernel,
+                                    *arg_idx,
+                                    ocl::core::ArgVal::scalar(&cache_seq_len),
+                                )
+                                .ok();
+                            }
+                            DynamicArg::WritePos { arg_idx } => {
+                                ocl::core::set_kernel_arg(
+                                    &step.kernel,
+                                    *arg_idx,
+                                    ocl::core::ArgVal::scalar(&write_pos),
+                                )
+                                .ok();
+                            }
+                            DynamicArg::KvCapacity { arg_idx } => {
+                                let cap = cache.capacity() as i32;
+                                ocl::core::set_kernel_arg(
+                                    &step.kernel,
+                                    *arg_idx,
+                                    ocl::core::ArgVal::scalar(&cap),
+                                )
+                                .ok();
+                            }
+                        }
+                    }
+                }
+
+                // Enqueue kernel — minimal CPU work
+                unsafe {
+                    ocl::core::enqueue_kernel(
+                        queue,
+                        &step.kernel,
+                        step.ndim,
+                        None,
+                        &step.global_work_size,
+                        step.local_work_size,
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )
+                    .ok();
+                }
+            }
+
+            cache.advance_pos(1);
 
             if layer_plan.flush_after {
                 ocl::core::flush(queue).ok();
             }
         }
 
-        // ── 3. Final norm + lm_head ──
+        // Final norm
         unsafe {
-            enqueue_step(queue, &self.final_norm);
-            enqueue_step(queue, &self.lm_head);
+            ocl::core::enqueue_kernel(
+                queue,
+                &self.final_norm.kernel,
+                self.final_norm.ndim,
+                None,
+                &self.final_norm.global_work_size,
+                self.final_norm.local_work_size,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .ok();
+        }
+
+        // lm_head matmul
+        unsafe {
+            ocl::core::enqueue_kernel(
+                queue,
+                &self.lm_head.kernel,
+                self.lm_head.ndim,
+                None,
+                &self.lm_head.global_work_size,
+                self.lm_head.local_work_size,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .ok();
         }
 
         Ok(())
@@ -273,9 +271,6 @@ pub struct LayerPlanConfig<'a> {
     pub kv_head_stride: i32,
 }
 
-/// No dynamic args (10 of 15 steps per layer).
-const NO_DYN: [Option<DynArgSlot>; 2] = [None, None];
-
 /// Helper: create a dedicated kernel and pre-bind F16 matmul arguments.
 ///
 /// Matches the dispatch in `OpenClBackend::matmul_f16` for the decode case (m=1):
@@ -329,7 +324,7 @@ fn make_f16_matmul_step(
         ndim: 3,
         global_work_size: [group_size_0 * 64, 1, 1],
         local_work_size: Some([64, 1, 1]),
-        dyn_slots: NO_DYN,
+        dynamic_args: vec![],
         op_tag,
     })
 }
@@ -339,7 +334,7 @@ fn make_f16_matmul_step(
 ///
 /// Creates dedicated kernel objects via `ocl::core::create_kernel` and pre-binds
 /// all static arguments. Dynamic arguments (start_pos, cache_seq_len, write_pos)
-/// are tagged with [`DynArgSlot`] for flat dispatch during execution.
+/// are tagged with [`DynamicArg`] and set to initial value 0.
 pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     let local_size = 64usize;
     let local_mem_bytes = local_size * std::mem::size_of::<f32>();
@@ -359,8 +354,16 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.residual_buf))?;
             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.attn_norm_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&(dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                3,
+                ocl::core::ArgVal::scalar(&(dim as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                4,
+                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
+            )?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 5,
@@ -372,7 +375,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [local_size, 1, 1], // rows=1 for decode
             local_work_size: Some([local_size, 1, 1]),
-            dyn_slots: NO_DYN,
+            dynamic_args: vec![],
             op_tag: OpTag::RmsNorm,
         });
     }
@@ -439,7 +442,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             )?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&seq_len_i32))?;
             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&start_pos_init))?;
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rope_theta))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                5,
+                ocl::core::ArgVal::scalar(&config.rope_theta),
+            )?;
         }
         let work_size = config.n_heads_q * (config.head_dim / 2);
         steps.push(KernelStep {
@@ -447,13 +454,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [work_size, 1, 1],
             local_work_size: None,
-            dyn_slots: [
-                Some(DynArgSlot {
-                    arg_idx: 4,
-                    tag: DynTag::StartPos,
-                }),
-                None,
-            ],
+            dynamic_args: vec![DynamicArg::StartPos { arg_idx: 4 }],
             op_tag: OpTag::Rope,
         });
     }
@@ -480,7 +481,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             )?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&seq_len_i32))?;
             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&start_pos_init))?;
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rope_theta))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                5,
+                ocl::core::ArgVal::scalar(&config.rope_theta),
+            )?;
         }
         let work_size = config.n_kv_heads * (config.head_dim / 2);
         steps.push(KernelStep {
@@ -488,13 +493,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [work_size, 1, 1],
             local_work_size: None,
-            dyn_slots: [
-                Some(DynArgSlot {
-                    arg_idx: 4,
-                    tag: DynTag::StartPos,
-                }),
-                None,
-            ],
+            dynamic_args: vec![DynamicArg::StartPos { arg_idx: 4 }],
             op_tag: OpTag::Rope,
         });
     }
@@ -528,15 +527,9 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [n_elems.div_ceil(64) * 64, 1, 1],
             local_work_size: Some([64, 1, 1]),
-            dyn_slots: [
-                Some(DynArgSlot {
-                    arg_idx: 5,
-                    tag: DynTag::KvCapacity,
-                }),
-                Some(DynArgSlot {
-                    arg_idx: 6,
-                    tag: DynTag::WritePos,
-                }),
+            dynamic_args: vec![
+                DynamicArg::KvCapacity { arg_idx: 5 },
+                DynamicArg::WritePos { arg_idx: 6 },
             ],
             op_tag: OpTag::KvScatter,
         });
@@ -549,8 +542,9 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //          kv_pos_stride(i32), kv_head_stride(i32), local_mem
     // -----------------------------------------------------------------------
     {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
-            .context("create kernel_attn_gen_half")?;
+        let kernel =
+            ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
+                .context("create kernel_attn_gen_half")?;
         let scale = 1.0f32 / (config.head_dim as f32).sqrt();
         let cache_seq_len_init = 0i32;
         unsafe {
@@ -573,7 +567,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
                 6,
                 ocl::core::ArgVal::scalar(&(config.n_kv_heads as i32)),
             )?;
-            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&cache_seq_len_init))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                7,
+                ocl::core::ArgVal::scalar(&cache_seq_len_init),
+            )?;
             ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
             ocl::core::set_kernel_arg(
                 &kernel,
@@ -596,13 +594,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [config.n_heads_q * local_size, 1, 1],
             local_work_size: Some([local_size, 1, 1]),
-            dyn_slots: [
-                Some(DynArgSlot {
-                    arg_idx: 7,
-                    tag: DynTag::CacheSeqLen,
-                }),
-                None,
-            ],
+            dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 7 }],
             op_tag: OpTag::Attention,
         });
     }
@@ -625,15 +617,24 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //     args: x, attn_out, residual, ffn_norm, dim(i32), eps(f32), local_mem
     // -----------------------------------------------------------------------
     {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_add_rms_norm_oop")
-            .context("create kernel_add_rms_norm_oop")?;
+        let kernel =
+            ocl::core::create_kernel(config.simple_ops_program, "kernel_add_rms_norm_oop")
+                .context("create kernel_add_rms_norm_oop")?;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.attn_out_buf))?;
             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.residual_buf))?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::mem(config.ffn_norm_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&(dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                4,
+                ocl::core::ArgVal::scalar(&(dim as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                5,
+                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
+            )?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 6,
@@ -645,7 +646,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [local_size, 1, 1],
             local_work_size: Some([local_size, 1, 1]),
-            dyn_slots: NO_DYN,
+            dynamic_args: vec![],
             op_tag: OpTag::AddRmsNorm,
         });
     }
@@ -681,8 +682,9 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //     args: gate, up, size4(i32)
     // -----------------------------------------------------------------------
     {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_silu_mul_simple")
-            .context("create kernel_silu_mul_simple")?;
+        let kernel =
+            ocl::core::create_kernel(config.simple_ops_program, "kernel_silu_mul_simple")
+                .context("create kernel_silu_mul_simple")?;
         let size4 = (config.ffn_hidden / 4) as i32;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.gate_buf))?;
@@ -694,7 +696,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [config.ffn_hidden / 4, 1, 1],
             local_work_size: None,
-            dyn_slots: NO_DYN,
+            dynamic_args: vec![],
             op_tag: OpTag::SiluMul,
         });
     }
@@ -731,7 +733,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [dim / 4, 1, 1],
             local_work_size: None,
-            dyn_slots: NO_DYN,
+            dynamic_args: vec![],
             op_tag: OpTag::AddAssign,
         });
     }
@@ -746,13 +748,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 // Full model plan builder
 // ---------------------------------------------------------------------------
 
-/// Config for building the full model plan (all layers + gather + final norm + lm_head).
+/// Config for building the full model plan (all layers + final norm + lm_head).
 pub struct FullPlanConfig<'a> {
     pub f16_program: &'a ocl::Program,
     pub simple_ops_program: &'a ocl::Program,
-    pub get_rows_program: &'a ocl::Program,
-    pub context: &'a ocl::core::Context,
-    // Per-layer weight buffers
+    // Per-layer weight buffers: Vec<(wq, wk, wv, wo, w_gate, w_up, w_down, attn_norm, ffn_norm)>
     pub layer_bufs: Vec<LayerBufs<'a>>,
     // Workspace buffers (shared across layers)
     pub x_buf: &'a Mem,
@@ -767,8 +767,7 @@ pub struct FullPlanConfig<'a> {
     pub residual_buf: &'a Mem,
     // Per-layer KV cache buffers
     pub kv_bufs: Vec<KvBufs<'a>>,
-    // Embedding + final norm + lm_head
-    pub embed_tokens_buf: &'a Mem,
+    // Final norm + lm_head
     pub final_norm_buf: &'a Mem,
     pub lm_head_buf: &'a Mem,
     pub logits_buf: &'a Mem,
@@ -805,66 +804,12 @@ pub struct KvBufs<'a> {
     pub v_cache: &'a Mem,
 }
 
-/// Build a pre-bound plan for the full model decode pass (gather + all layers + head).
+/// Build a pre-bound plan for the full model decode pass (all layers + head).
 pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     let n_q = config.n_heads_q * config.head_dim;
     let n_k = config.n_kv_heads * config.head_dim;
     let n_v = n_k;
 
-    // ── Pre-allocate input token buffer (4 bytes for 1 u32) ──
-    let input_token_buf = unsafe {
-        ocl::core::create_buffer::<_, u32>(config.context, ocl::core::MEM_READ_ONLY, 1, None)
-            .context("create input token buffer")?
-    };
-
-    // ── Build embed_gather step (kernel_get_rows_f32) ──
-    let embed_gather = {
-        let kernel = ocl::core::create_kernel(config.get_rows_program, "kernel_get_rows_f32")
-            .context("create kernel_get_rows_f32 for plan")?;
-        let k = config.dim;
-        let ne00 = k as i32;
-        let nb01 = (k * 4) as u64; // F32 row stride
-        let nb02 = nb01 * config.vocab_size as u64;
-        let nb03 = nb02;
-        let ne10 = 1i32; // 1 index for decode
-        let nb10 = 4u64;
-        let nb11 = 4u64;
-        let nb12 = 4u64;
-        let nb1 = (k * 4) as u64;
-        let nb2 = nb1;
-        let nb3 = nb2;
-
-        unsafe {
-            ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.embed_tokens_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(&input_token_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(config.x_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
-            ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
-            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&nb01))?;
-            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&nb02))?;
-            ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&nb03))?;
-            ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&ne10))?;
-            ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&nb10))?;
-            ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&nb11))?;
-            ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&nb12))?;
-            ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&nb1))?;
-            ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&nb2))?;
-            ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&nb3))?;
-        }
-
-        KernelStep {
-            kernel,
-            ndim: 1,
-            global_work_size: [64, 1, 1], // 1 index × 64 threads
-            local_work_size: Some([64, 1, 1]),
-            dyn_slots: NO_DYN,
-            op_tag: OpTag::EmbedGather,
-        }
-    };
-
-    // ── Build per-layer plans ──
     let mut layers = Vec::with_capacity(config.layer_bufs.len());
     for (i, (lb, kb)) in config
         .layer_bufs
@@ -916,17 +861,30 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         );
     }
 
-    // ── Final RMSNorm (in-place on x) ──
+    // Final RMSNorm (in-place on x)
     let final_norm = {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_opt")
-            .context("create final kernel_rms_norm_opt")?;
+        let kernel =
+            ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_opt")
+                .context("create final kernel_rms_norm_opt")?;
         let local_size = 64usize;
         let local_mem_bytes = local_size * std::mem::size_of::<f32>();
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.final_norm_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(config.dim as i32)))?;
-            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                1,
+                ocl::core::ArgVal::mem(config.final_norm_buf),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                2,
+                ocl::core::ArgVal::scalar(&(config.dim as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                3,
+                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
+            )?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 4,
@@ -938,12 +896,12 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             ndim: 1,
             global_work_size: [local_size, 1, 1], // rows=1 for decode
             local_work_size: Some([local_size, 1, 1]),
-            dyn_slots: NO_DYN,
+            dynamic_args: vec![],
             op_tag: OpTag::FinalNorm,
         }
     };
 
-    // ── lm_head matmul: x [1, dim] × lm_head [vocab, dim]^T → logits [1, vocab] ──
+    // lm_head matmul: x [1, dim] × lm_head [vocab, dim]^T → logits [1, vocab]
     let lm_head = make_f16_matmul_step(
         config.f16_program,
         config.x_buf,
@@ -957,10 +915,8 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
 
     Ok(FullKernelPlan {
         layers,
-        embed_gather,
         final_norm,
         lm_head,
         kv_capacity: config.kv_capacity,
-        input_token_buf,
     })
 }

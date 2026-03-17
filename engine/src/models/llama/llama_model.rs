@@ -571,6 +571,7 @@ impl LlamaModel {
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
+        use crate::core::buffer::Buffer;
         use crate::core::kv_cache::KVLayout;
 
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
@@ -626,8 +627,6 @@ impl LlamaModel {
         let full_config = FullPlanConfig {
             f16_program: &ocl_backend.f16_program,
             simple_ops_program: &ocl_backend.simple_ops_program,
-            get_rows_program: &ocl_backend.get_rows_program,
-            context: ocl_backend.context.as_core(),
             layer_bufs,
             x_buf: cl!(x),
             q_buf: cl!(ws.q),
@@ -640,7 +639,6 @@ impl LlamaModel {
             down_buf: cl!(ws.down),
             residual_buf: cl!(ws.residual),
             kv_bufs: kv_bufs_vec,
-            embed_tokens_buf: cl!(self.embed_tokens),
             final_norm_buf: cl!(self.norm),
             lm_head_buf: cl!(self.lm_head),
             logits_buf: cl!(logits),
@@ -659,11 +657,7 @@ impl LlamaModel {
 
         match build_full_plan(&full_config) {
             Ok(plan) => {
-                log::info!(
-                    "GPU kernel plan built ({} layers, capacity={})",
-                    self.layers.len(),
-                    capacity
-                );
+                log::info!("GPU kernel plan built ({} layers, capacity={})", self.layers.len(), capacity);
                 Some(plan)
             }
             Err(e) => {
@@ -674,25 +668,28 @@ impl LlamaModel {
     }
 
     /// Execute a pre-built GPU kernel plan for a single decode token.
-    ///
-    /// The plan includes pre-bound gather (embedding lookup), so no separate
-    /// `backend.gather()` call is needed. Token ID is written directly to the
-    /// plan's pre-allocated input buffer.
+    /// Falls back to forward_into() on plan invalidation.
     #[cfg(feature = "opencl")]
     pub fn execute_plan(
         &self,
         plan: &FullKernelPlan,
-        token_id: u32,
+        input_tokens: &Tensor,
         start_pos: usize,
+        x_gen: &mut Tensor,
         kv_caches: &mut [KVCache],
+        logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
+        // 1. Embedding lookup
+        backend.gather(&self.embed_tokens, input_tokens, x_gen)?;
+
+        // 2. Execute plan (all layers + final norm + lm_head)
         let ocl_backend = backend
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
-        match plan.execute(ocl_backend.queue.as_core(), token_id, start_pos, kv_caches) {
+        match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false), // plan invalidated, caller should rebuild
         }
