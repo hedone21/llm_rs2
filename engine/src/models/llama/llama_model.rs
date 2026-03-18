@@ -100,7 +100,7 @@ impl LlamaModel {
             };
 
         if shard_files.len() > 1 {
-            println!("Loading {} safetensors shards...", shard_files.len());
+            eprintln!("Loading {} safetensors shards...", shard_files.len());
         }
 
         // Arc-wrapped mmaps for zero-copy MmapBuffer weight sharing
@@ -143,7 +143,7 @@ impl LlamaModel {
             let tensor_view = match shard_tensors[shard_idx].tensor(name) {
                 Ok(v) => v,
                 Err(e) => {
-                    println!("Error finding tensor '{}' in shard {}", name, shard_idx);
+                    eprintln!("Error finding tensor '{}' in shard {}", name, shard_idx);
                     return Err(anyhow!("{}", e));
                 }
             };
@@ -371,7 +371,7 @@ impl LlamaModel {
             load_tensor(lm_head_name, true)?
         } else {
             // Tied weights: use embed_tokens with weight_dtype for lm_head
-            println!("lm_head not found, using embed_tokens as lm_head...");
+            eprintln!("lm_head not found, using embed_tokens as lm_head...");
             load_tensor("model.embed_tokens.weight", true)?
         };
 
@@ -916,7 +916,7 @@ impl LlamaModel {
             weight_map.insert(tensor_name.clone(), idx);
         }
 
-        println!(
+        eprintln!(
             "Shard index: {} tensors across {} shards",
             weight_map.len(),
             shard_files.len()

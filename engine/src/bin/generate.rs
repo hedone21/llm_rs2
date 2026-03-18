@@ -319,8 +319,8 @@ fn main() -> anyhow::Result<()> {
     let model_path = &args.model_path;
 
     // 1. Setup
-    println!("[Profile] Event: ModelLoadStart");
-    println!("Loading model from {}", model_path);
+    eprintln!("[Profile] Event: ModelLoadStart");
+    eprintln!("Loading model from {}", model_path);
     let backend: Arc<dyn Backend> = match args.backend.as_str() {
         "cpu" => Arc::new(CpuBackend::new()),
         "opencl" => Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?),
@@ -361,20 +361,20 @@ fn main() -> anyhow::Result<()> {
     } else {
         args.prompt.clone()
     };
-    println!("Prompt: {}", prompt);
+    eprintln!("Prompt: {}", prompt);
 
     let encoding = tokenizer
         .encode(prompt.as_str(), true)
         .map_err(|e| anyhow::anyhow!(e))?;
     let input_ids: Vec<u32> = encoding.get_ids().to_vec();
-    println!("Token Length: {}", input_ids.len());
+    eprintln!("Token Length: {}", input_ids.len());
 
     // 4. Prepare KV Cache
     let max_seq_len = args.max_seq_len; // Use argument
     let kv_heads = model.config.num_key_value_heads;
     let head_dim = model.config.head_dim;
     let num_layers = model.config.num_hidden_layers;
-    println!(
+    eprintln!(
         "Model config: layers={}, kv_heads={}, head_dim={}, max_seq_len={}",
         num_layers, kv_heads, head_dim, max_seq_len
     );
@@ -481,7 +481,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         KVLayout::SeqMajor
     };
-    println!(
+    eprintln!(
         "KV cache type: {:?}, layout: {:?} (initial capacity: {} tokens, {}B per layer, max: {})",
         kv_type, kv_layout, initial_kv_capacity, kv_buf_size, max_seq_len
     );
@@ -587,7 +587,7 @@ fn main() -> anyhow::Result<()> {
     let vocab_size = model.config.vocab_size;
     let hidden_size = model.config.hidden_size;
 
-    println!(
+    eprintln!(
         "Generating (Max: {}, Temp: {}, TopP: {}, TopK: {})...",
         max_seq_len, args.temperature, args.top_p, args.top_k
     );
@@ -698,7 +698,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if args.eviction_policy != "none" {
-        println!(
+        eprintln!(
             "Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
             args.eviction_policy,
             args.eviction_window,
@@ -3213,6 +3213,12 @@ fn run_ppl(
 
     // ── 3. Determine prefill chunk size ──
     let has_budget = args.kv_budget > 0 || args.kv_budget_ratio > 0.0;
+    if auto_eviction && !has_budget {
+        eprintln!(
+            "[PPL] Warning: eviction enabled without --kv-budget. \
+             Results may not be reproducible. Use --kv-budget N for deterministic experiments."
+        );
+    }
     let prefill_chunk = if has_budget {
         let budget = if args.kv_budget_ratio > 0.0 {
             ((eval_tokens as f32) * args.kv_budget_ratio) as usize
@@ -3225,6 +3231,18 @@ fn run_ppl(
     } else {
         eval_tokens
     };
+
+    let effective_budget = if args.kv_budget_ratio > 0.0 {
+        ((eval_tokens as f32) * args.kv_budget_ratio) as usize
+    } else if args.kv_budget > 0 {
+        args.kv_budget
+    } else {
+        max_seq_len // No budget → no eviction trigger
+    };
+
+    if has_budget {
+        eprintln!("[PPL] Effective budget: {} tokens (deterministic eviction)", effective_budget);
+    }
 
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
@@ -3346,18 +3364,21 @@ fn run_ppl(
         total_nll -= lp;
         nll_count += 1;
 
-        // ── Auto-eviction ──
-        if auto_eviction {
+        // ── Budget-based eviction (deterministic, experiment-reproducible) ──
+        // Eviction triggers when cache_pos exceeds the effective budget.
+        // This is deterministic: same text + same budget = same eviction positions.
+        // No dependency on memory pressure or hardware state.
+        if auto_eviction && has_budget {
             let before_len = kv_caches[0].current_pos;
-            let capacity = kv_caches[0].capacity();
+            if before_len > effective_budget {
+                let ratio = effective_budget as f32 / before_len as f32;
 
-            let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
-                if let Some(acc) = score_accumulator.as_ref() {
+                // Collect proxy metric before eviction
+                let result = if let Some(acc) = score_accumulator.as_ref() {
                     if acc.is_active() {
-                        // Collect proxy before eviction
                         let scores = acc.importance_scores();
-                        let target_len =
-                            ((before_len as f32) * args.eviction_target_ratio) as usize;
+                        // Pre-identify evicted tokens for proxy
+                        let target_len = ((before_len as f32) * ratio) as usize;
                         let evicted = llm_rs2::core::proxy::identify_evicted_h2o(
                             scores,
                             protected_prefix,
@@ -3365,7 +3386,10 @@ fn run_ppl(
                             before_len,
                             target_len,
                         );
-                        if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty() {
+                        if !evicted.is_empty()
+                            && args.kv_type == "f32"
+                            && !kv_caches.is_empty()
+                        {
                             let metric = llm_rs2::core::proxy::compute_eviction_proxy(
                                 &evicted,
                                 &kv_caches[0],
@@ -3379,54 +3403,40 @@ fn run_ppl(
                                 "cache_pos_before": before_len,
                             }));
                         }
-
-                        cache_manager.force_evict_with_scores(
-                            kv_caches,
-                            args.eviction_target_ratio,
-                            scores,
-                        )?
+                        cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
                     } else {
-                        cache_manager.force_evict(kv_caches, args.eviction_target_ratio)?
+                        cache_manager.force_evict(kv_caches, ratio)?
                     }
                 } else {
-                    cache_manager.force_evict(kv_caches, args.eviction_target_ratio)?
-                }
-            } else if let Some(acc) = score_accumulator.as_ref() {
-                if acc.is_active() {
-                    cache_manager.maybe_evict_with_scores(kv_caches, acc.importance_scores())?
-                } else {
-                    cache_manager.maybe_evict(kv_caches)?
-                }
-            } else {
-                cache_manager.maybe_evict(kv_caches)?
-            };
+                    // Sliding window: position-based proxy
+                    let r = cache_manager.force_evict(kv_caches, ratio)?;
+                    if r.evicted {
+                        let metric = llm_rs2::core::proxy::compute_sliding_proxy(
+                            r.tokens_removed,
+                            before_len,
+                        );
+                        proxy_metrics.push(serde_json::json!({
+                            "step": i,
+                            "action": metric.action,
+                            "raw_value": metric.raw_value,
+                            "tokens_affected": metric.tokens_affected,
+                            "cache_pos_before": before_len,
+                            "cache_pos_after": r.new_pos,
+                        }));
+                    }
+                    r
+                };
 
-            if result.evicted {
-                // Sliding window proxy (works for all KV types)
-                if !score_based_eviction {
-                    let metric = llm_rs2::core::proxy::compute_sliding_proxy(
-                        result.tokens_removed,
-                        before_len,
+                if result.evicted {
+                    start_pos = kv_caches[0].current_pos;
+                    if let Some(acc) = score_accumulator.as_mut() {
+                        acc.reset();
+                    }
+                    eprintln!(
+                        "[PPL] Eviction at step {}: {} → {} tokens (removed {})",
+                        i, before_len, result.new_pos, result.tokens_removed
                     );
-                    proxy_metrics.push(serde_json::json!({
-                        "step": i,
-                        "action": metric.action,
-                        "raw_value": metric.raw_value,
-                        "tokens_affected": metric.tokens_affected,
-                        "cache_pos_before": before_len,
-                        "cache_pos_after": result.new_pos,
-                    }));
                 }
-
-                start_pos = kv_caches[0].current_pos;
-                if let Some(acc) = score_accumulator.as_mut() {
-                    acc.reset();
-                }
-
-                eprintln!(
-                    "[PPL] Eviction at step {}: {} → {} tokens (removed {})",
-                    i, before_len, result.new_pos, result.tokens_removed
-                );
             }
         }
 

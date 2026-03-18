@@ -1,0 +1,16 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b
+[Config] Weight dtype: F16
+lm_head not found, using embed_tokens as lm_head...
+Prompt: Hello, world! I am a
+Token Length: 8
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 4194304B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[PPL] Warning: text has 2757 tokens, truncating to max_seq_len=2048
+[PPL] 2048 tokens, policy=none, kv_budget=0, kv_type=f32
+[PPL] Prefill: 2048 tokens
+[PPL] Prefill NLL: 4010.6598, count=2047, running PPL=7.0943
+
+[PPL] Final: PPL=7.0943, NLL=4010.6598, tokens=2047, 69.2 tok/s, 29.6s
