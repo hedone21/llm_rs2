@@ -62,6 +62,8 @@ pub enum CacheEvent {
     },
     /// Score distribution snapshot taken at eviction time.
     ScoreDiagnostic(ScoreSnapshot),
+    /// Proxy metric computed during a lossy cache action.
+    ProxyComputed(crate::core::proxy::ProxyMetric),
 }
 
 // ── Sink trait ────────────────────────────────────────────────
@@ -161,6 +163,25 @@ impl EventSink for StderrDiagnosticSink {
                 ref result,
             } => {
                 eprintln!("[CacheEvent] Stage '{}' → {:?}", handler, result);
+            }
+            CacheEvent::ProxyComputed(ref metric) => {
+                eprintln!(
+                    "[ProxyDeg] action='{}', proxy={:.6}, tokens_affected={}{}",
+                    metric.action,
+                    metric.raw_value,
+                    metric.tokens_affected,
+                    if let Some(ref ph) = metric.per_head {
+                        format!(
+                            ", per_head=[{}]",
+                            ph.iter()
+                                .map(|v| format!("{:.4}", v))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
             }
         }
     }

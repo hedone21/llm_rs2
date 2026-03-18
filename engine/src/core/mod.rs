@@ -10,6 +10,7 @@ pub mod math_utils;
 pub mod memory;
 pub mod offload;
 pub mod pressure;
+pub mod proxy;
 pub mod quant;
 pub mod sampling;
 pub mod shape;

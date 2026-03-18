@@ -5,15 +5,20 @@
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
 use crate::core::eviction::EvictionPolicy;
+use crate::core::proxy::ProxyConfig;
 use anyhow::Result;
 
 /// Adapts an `EvictionPolicy` to the `CachePressureHandler` interface.
 ///
 /// The wrapped policy's `evict()` / `evict_with_scores()` is called with
 /// `target_len = current_pos * target_ratio`.
+///
+/// When `proxy_config` is set and `ctx.proxy_sink` is available, computes
+/// eviction proxy metrics before executing the actual eviction.
 pub struct EvictionHandler {
     policy: Box<dyn EvictionPolicy>,
     target_ratio: f32,
+    proxy_config: Option<ProxyConfig>,
 }
 
 impl EvictionHandler {
@@ -26,6 +31,58 @@ impl EvictionHandler {
         Self {
             policy,
             target_ratio: target_ratio.clamp(0.1, 0.99),
+            proxy_config: None,
+        }
+    }
+
+    /// Enable proxy metric collection with the given config.
+    pub fn with_proxy(mut self, config: ProxyConfig) -> Self {
+        self.proxy_config = Some(config);
+        self
+    }
+}
+
+impl EvictionHandler {
+    /// Compute proxy metrics and push to ctx.proxy_sink if enabled.
+    fn compute_and_push_proxy(
+        &self,
+        ctx: &mut HandlerContext,
+        current_pos: usize,
+        target_len: usize,
+    ) {
+        let config = match &self.proxy_config {
+            Some(c) if c.enabled => c,
+            _ => return,
+        };
+        let sink = match ctx.proxy_sink.as_mut() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let policy_name = self.policy.name();
+
+        if policy_name == "sliding_window" {
+            // Position-based proxy: fraction of tokens removed
+            let prune_count = current_pos.saturating_sub(target_len);
+            let metric = crate::core::proxy::compute_sliding_proxy(prune_count, current_pos);
+            sink.push(metric);
+        } else if let Some(importance) = ctx.importance {
+            // Score-based proxy (H2O, etc.): identify evicted tokens + V-norm computation
+            // Use protected_prefix=4 as the H2O default minimum
+            let protected_prefix = 4;
+            let keep_ratio = 0.5; // H2O default
+            let evicted = crate::core::proxy::identify_evicted_h2o(
+                importance,
+                protected_prefix,
+                keep_ratio,
+                current_pos,
+                target_len,
+            );
+            if !evicted.is_empty() && !ctx.caches.is_empty() {
+                let metric =
+                    crate::core::proxy::compute_eviction_proxy(&evicted, &ctx.caches[0], config);
+                sink.push(metric);
+            }
         }
     }
 }
@@ -52,6 +109,9 @@ impl CachePressureHandler for EvictionHandler {
             current_pos,
             target_len,
         );
+
+        // Compute proxy metric before eviction (V buffer access required pre-deletion)
+        self.compute_and_push_proxy(ctx, current_pos, target_len);
 
         for cache in ctx.caches.iter_mut() {
             if let (Some(flat), Some(head_imp)) = (ctx.importance, ctx.head_importance) {
@@ -140,6 +200,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -189,6 +250,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -221,6 +283,7 @@ mod tests {
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -241,6 +304,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -273,6 +337,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -298,6 +363,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();

@@ -51,6 +51,9 @@ pub struct HandlerContext<'a> {
     /// Optional target ratio override from external signal (e.g., resilience Evict action).
     /// When set, handlers should use this instead of their internal config target_ratio.
     pub target_ratio: Option<f32>,
+    /// Optional sink for proxy metrics collected during handler execution.
+    /// When `Some`, handlers push `ProxyMetric` values for degradation estimation.
+    pub proxy_sink: Option<&'a mut Vec<crate::core::proxy::ProxyMetric>>,
 }
 
 // ── Action result ──────────────────────────────────────────────────
@@ -315,6 +318,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -351,6 +355,7 @@ mod tests {
             pressure_level: PressureLevel::Normal,
             mem_available: 1024 * 1024 * 1024,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -388,6 +393,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -409,6 +415,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -440,6 +447,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -524,6 +532,7 @@ mod tests {
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
             target_ratio: None,
+            proxy_sink: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();

@@ -155,6 +155,9 @@ pub struct KiviCache {
 
     // Group size for quantization (= QKKV = 32)
     group_size: usize,
+
+    /// Last flush proxy metric (NMSE). Set during `flush_residual()`.
+    last_flush_proxy: Option<crate::core::proxy::ProxyMetric>,
 }
 
 impl KiviCache {
@@ -211,6 +214,7 @@ impl KiviCache {
             head_dim,
             max_seq_len,
             group_size: QKKV,
+            last_flush_proxy: None,
         }
     }
 
@@ -222,6 +226,13 @@ impl KiviCache {
     /// Current quantization bit-width.
     pub fn bits(&self) -> u8 {
         self.bits
+    }
+
+    /// Take the last flush proxy metric (NMSE), consuming it.
+    ///
+    /// Returns `Some(ProxyMetric)` if a flush occurred since the last call.
+    pub fn take_flush_proxy(&mut self) -> Option<crate::core::proxy::ProxyMetric> {
+        self.last_flush_proxy.take()
     }
 
     /// Total number of valid tokens (Q2 + residual).
@@ -240,6 +251,7 @@ impl KiviCache {
         self.attn_k_buf.fill(0.0);
         self.attn_v_buf.fill(0.0);
         self.q2_deq_tokens = 0;
+        self.last_flush_proxy = None;
     }
 
     /// Flush residual buffer to quantized storage.
@@ -262,6 +274,22 @@ impl KiviCache {
         // How many full groups to flush
         let n_groups = self.res_pos / gs;
         let flush_tokens = n_groups * gs;
+
+        // Compute NMSE proxy before quantization (FP32 originals still available)
+        let proxy_config = crate::core::proxy::ProxyConfig::default();
+        let proxy_params = crate::core::proxy::FlushProxyParams {
+            res_k: &self.res_k,
+            res_v: &self.res_v,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            flush_tokens,
+            res_cap: self.res_cap,
+            bits: self.bits,
+        };
+        self.last_flush_proxy = Some(crate::core::proxy::compute_flush_proxy(
+            &proxy_params,
+            &proxy_config,
+        ));
 
         // === Key: per-channel quantization ===
         for h in 0..self.kv_heads {
