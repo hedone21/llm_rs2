@@ -1,0 +1,14 @@
+{
+  "task_id": "QA-MH-01",
+  "category": "multi_hop",
+  "budget_key": "B0",
+  "budget": 2048,
+  "policy": "sliding",
+  "f1": 0.022782750203417416,
+  "exact_match": false,
+  "expected": "The Nobel Prize is presented in Stockholm. The ceremony is held on December 10, the anniversary of Alfred Nobel's death in 1896.",
+  "generated_prefix": "[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nUrban planning involves the technical and political process of developing land use strategies. Modern cities face challenges including traffic congestion, housing affordability, and environmental sustainability. Planners must balance econo",
+  "prompt_len_approx": 1411,
+  "qcf_avg": 0.0,
+  "eviction_count": 0
+}

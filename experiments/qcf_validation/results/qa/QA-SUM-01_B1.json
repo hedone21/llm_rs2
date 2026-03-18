@@ -1,0 +1,14 @@
+{
+  "task_id": "QA-SUM-01",
+  "category": "summarization",
+  "budget_key": "B1",
+  "budget": 1600,
+  "policy": "sliding",
+  "f1": 0.043866774979691305,
+  "exact_match": false,
+  "expected": "Earth lost 28 trillion tonnes of ice from 1994 to 2017, with the annual rate increasing from 0.8 to 1.3 trillion tonnes. Antarctic and Greenland ice sheet losses have increased sixfold since the 1990s, matching worst-case climate predictions.",
+  "generated_prefix": "[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nUrban planning involves the technical and political process of developing land use strategies. Modern cities face challenges including traffic congestion, housing affordability, and environmental sustainability. Planners must balance econo",
+  "prompt_len_approx": 1391,
+  "qcf_avg": 0.0,
+  "eviction_count": 0
+}

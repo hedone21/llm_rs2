@@ -1,0 +1,11 @@
+{
+  "subject": "marketing",
+  "budget_key": "B2",
+  "budget": 1200,
+  "policy": "sliding",
+  "n_shots": 20,
+  "accuracy": 0.25,
+  "n_correct": 5,
+  "n_total": 20,
+  "qcf_avg": 0.1440466344356537
+}

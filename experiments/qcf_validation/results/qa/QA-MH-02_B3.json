@@ -1,0 +1,14 @@
+{
+  "task_id": "QA-MH-02",
+  "category": "multi_hop",
+  "budget_key": "B3",
+  "budget": 900,
+  "policy": "sliding",
+  "f1": 0.02021903959561921,
+  "exact_match": false,
+  "expected": "The highest peak of the Andes is Aconcagua at 6,961 meters, located in Argentina.",
+  "generated_prefix": "[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nUrban planning involves the technical and political process of developing land use strategies. Modern cities face challenges including traffic congestion, housing affordability, and environmental sustainability. Planners must balance econo",
+  "prompt_len_approx": 1374,
+  "qcf_avg": 0.0011098779505118728,
+  "eviction_count": 391
+}

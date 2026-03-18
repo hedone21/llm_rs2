@@ -1,0 +1,14 @@
+{
+  "task_id": "QA-SD-02",
+  "category": "single_doc_qa",
+  "budget_key": "B2",
+  "budget": 1200,
+  "policy": "sliding",
+  "f1": 0.025041736227045072,
+  "exact_match": false,
+  "expected": "The light-dependent reactions take place in the thylakoid membranes of the chloroplast, producing oxygen, ATP, and NADPH.",
+  "generated_prefix": "[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nUrban planning involves the technical and political process of developing land use strategies. Modern cities face challenges including traffic congestion, housing affordability, and environmental sustainability. Planners must balance econo",
+  "prompt_len_approx": 1376,
+  "qcf_avg": 0.1440466344356537,
+  "eviction_count": 1
+}

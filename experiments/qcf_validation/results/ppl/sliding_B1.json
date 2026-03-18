@@ -1,0 +1,39 @@
+{
+  "config": {
+    "eviction_policy": "sliding",
+    "eviction_target_ratio": 0.75,
+    "h2o_keep_ratio": 0.5,
+    "kv_budget": 1600,
+    "kv_type": "f32",
+    "max_seq_len": 2048,
+    "model": "/home/go/Workspace/llm_rs2/models/llama3.2-1b",
+    "protected_prefix": 4,
+    "text_file": "/home/go/Workspace/llm_rs2/experiments/proxy_validation/texts/eval_text.txt"
+  },
+  "eviction_count": 1,
+  "ppl": 8.215416998975611,
+  "qcf_metrics": [
+    {
+      "action": "sliding",
+      "cache_pos_after": 1028,
+      "cache_pos_before": 1601,
+      "raw_value": 0.35790130496025085,
+      "step": 1600,
+      "tokens_affected": 573
+    }
+  ],
+  "token_count": 2046,
+  "tokens_per_second": 48.86917842885409,
+  "total_nll": 4308.90159725979,
+  "wall_time_s": 41.866879407,
+  "budget_key": "B1",
+  "budget": 1600,
+  "policy": "sliding",
+  "delta_ppl": 1.1211521970557872,
+  "qcf_summary": {
+    "count": 1,
+    "avg": 0.35790130496025085,
+    "total": 0.35790130496025085,
+    "max": 0.35790130496025085
+  }
+}

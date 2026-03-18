@@ -1,0 +1,71 @@
+{
+  "config": {
+    "eviction_policy": "sliding",
+    "eviction_target_ratio": 0.75,
+    "h2o_keep_ratio": 0.5,
+    "kv_budget": 1200,
+    "kv_type": "f32",
+    "max_seq_len": 2048,
+    "model": "/home/go/Workspace/llm_rs2/models/llama3.2-1b",
+    "protected_prefix": 4,
+    "text_file": "/home/go/Workspace/llm_rs2/experiments/proxy_validation/texts/eval_text.txt"
+  },
+  "eviction_count": 5,
+  "ppl": 15.993197338305393,
+  "qcf_metrics": [
+    {
+      "action": "sliding",
+      "cache_pos_after": 1028,
+      "cache_pos_before": 1201,
+      "raw_value": 0.1440466344356537,
+      "step": 1200,
+      "tokens_affected": 173
+    },
+    {
+      "action": "sliding",
+      "cache_pos_after": 1028,
+      "cache_pos_before": 1201,
+      "raw_value": 0.1440466344356537,
+      "step": 1373,
+      "tokens_affected": 173
+    },
+    {
+      "action": "sliding",
+      "cache_pos_after": 1028,
+      "cache_pos_before": 1201,
+      "raw_value": 0.1440466344356537,
+      "step": 1546,
+      "tokens_affected": 173
+    },
+    {
+      "action": "sliding",
+      "cache_pos_after": 1028,
+      "cache_pos_before": 1201,
+      "raw_value": 0.1440466344356537,
+      "step": 1719,
+      "tokens_affected": 173
+    },
+    {
+      "action": "sliding",
+      "cache_pos_after": 1028,
+      "cache_pos_before": 1201,
+      "raw_value": 0.1440466344356537,
+      "step": 1892,
+      "tokens_affected": 173
+    }
+  ],
+  "token_count": 2046,
+  "tokens_per_second": 37.9459067815536,
+  "total_nll": 5671.846450361904,
+  "wall_time_s": 53.918859069,
+  "budget_key": "B2",
+  "budget": 1200,
+  "policy": "sliding",
+  "delta_ppl": 8.89893253638557,
+  "qcf_summary": {
+    "count": 5,
+    "avg": 0.1440466344356537,
+    "total": 0.7202331721782684,
+    "max": 0.1440466344356537
+  }
+}

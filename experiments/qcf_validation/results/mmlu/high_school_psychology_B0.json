@@ -1,0 +1,11 @@
+{
+  "subject": "high_school_psychology",
+  "budget_key": "B0",
+  "budget": 2048,
+  "policy": "sliding",
+  "n_shots": 20,
+  "accuracy": 0.1,
+  "n_correct": 2,
+  "n_total": 20,
+  "qcf_avg": 0.0
+}

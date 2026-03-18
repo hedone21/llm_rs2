@@ -1,0 +1,117 @@
+{
+  "phase": "ppl",
+  "baseline_ppl": 7.094264801919824,
+  "results": [
+    {
+      "policy": "none",
+      "budget_key": "B0",
+      "budget": 2048,
+      "ppl": 7.094264801919824,
+      "delta_ppl": 0,
+      "qcf_avg": 0.0,
+      "qcf_total": 0.0,
+      "eviction_count": 0
+    },
+    {
+      "policy": "sliding",
+      "budget_key": "B1",
+      "budget": 1600,
+      "ppl": 8.215416998975611,
+      "delta_ppl": 1.1211521970557872,
+      "qcf_avg": 0.35790130496025085,
+      "qcf_total": 0.35790130496025085,
+      "eviction_count": 1
+    },
+    {
+      "policy": "sliding",
+      "budget_key": "B2",
+      "budget": 1200,
+      "ppl": 15.993197338305393,
+      "delta_ppl": 8.89893253638557,
+      "qcf_avg": 0.1440466344356537,
+      "qcf_total": 0.7202331721782684,
+      "eviction_count": 5
+    },
+    {
+      "policy": "sliding",
+      "budget_key": "B3",
+      "budget": 900,
+      "ppl": 118.66244426401262,
+      "delta_ppl": 111.5681794620928,
+      "qcf_avg": 0.0011098779505118728,
+      "qcf_total": 1.273030009237118,
+      "eviction_count": 1147
+    },
+    {
+      "policy": "sliding",
+      "budget_key": "B4",
+      "budget": 600,
+      "ppl": 251.14761668971073,
+      "delta_ppl": 244.0533518877909,
+      "qcf_avg": 0.001663893461227417,
+      "qcf_total": 2.4076538383960724,
+      "eviction_count": 1447
+    },
+    {
+      "policy": "sliding",
+      "budget_key": "B5",
+      "budget": 350,
+      "ppl": 434.5666490118619,
+      "delta_ppl": 427.47238420994205,
+      "qcf_avg": 0.0028490028344094753,
+      "qcf_total": 4.83475780999288,
+      "eviction_count": 1697
+    },
+    {
+      "policy": "h2o",
+      "budget_key": "B1",
+      "budget": 1600,
+      "ppl": 17.519258042178574,
+      "delta_ppl": 10.42499324025875,
+      "qcf_avg": 5.9221877588356875e-06,
+      "qcf_total": 0.0026472179281995523,
+      "eviction_count": 447
+    },
+    {
+      "policy": "h2o",
+      "budget_key": "B2",
+      "budget": 1200,
+      "ppl": 48.16775217140218,
+      "delta_ppl": 41.07348736948235,
+      "qcf_avg": 1.4113616559680498e-05,
+      "qcf_total": 0.011954233226049382,
+      "eviction_count": 847
+    },
+    {
+      "policy": "h2o",
+      "budget_key": "B3",
+      "budget": 900,
+      "ppl": 120.3619279758056,
+      "delta_ppl": 113.26766317388578,
+      "qcf_avg": 0.00018346252312029495,
+      "qcf_total": 0.2104315140189783,
+      "eviction_count": 1147
+    },
+    {
+      "policy": "h2o",
+      "budget_key": "B4",
+      "budget": 600,
+      "ppl": 269.19549453800056,
+      "delta_ppl": 262.1012297360807,
+      "qcf_avg": 0.0006894879720625534,
+      "qcf_total": 0.9976890955745148,
+      "eviction_count": 1447
+    },
+    {
+      "policy": "h2o",
+      "budget_key": "B5",
+      "budget": 350,
+      "ppl": 467.5567684594795,
+      "delta_ppl": 460.46250365755964,
+      "qcf_avg": 0.0015558801916719961,
+      "qcf_total": 2.6403286852673773,
+      "eviction_count": 1697
+    }
+  ],
+  "wall_time_s": 926.1676518917084
+}

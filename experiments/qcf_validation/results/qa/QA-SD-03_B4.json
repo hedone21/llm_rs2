@@ -1,0 +1,14 @@
+{
+  "task_id": "QA-SD-03",
+  "category": "single_doc_qa",
+  "budget_key": "B4",
+  "budget": 600,
+  "policy": "sliding",
+  "f1": 0.023411371237458196,
+  "exact_match": false,
+  "expected": "The Medici family funded artists in Florence. Three key figures were Leonardo da Vinci, Michelangelo, and Raphael.",
+  "generated_prefix": "[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nUrban planning involves the technical and political process of developing land use strategies. Modern cities face challenges including traffic congestion, housing affordability, and environmental sustainability. Planners must balance econo",
+  "prompt_len_approx": 1394,
+  "qcf_avg": 0.001663893461227417,
+  "eviction_count": 700
+}

@@ -15,6 +15,10 @@ import json
 import sys
 from pathlib import Path
 
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+from common import save_result
+
 RESULTS_DIR = Path(__file__).resolve().parents[1] / "results"
 PLOTS_DIR = Path(__file__).resolve().parents[1] / "plots"
 

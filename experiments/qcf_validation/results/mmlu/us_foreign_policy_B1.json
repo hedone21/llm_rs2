@@ -1,0 +1,11 @@
+{
+  "subject": "us_foreign_policy",
+  "budget_key": "B1",
+  "budget": 1600,
+  "policy": "sliding",
+  "n_shots": 20,
+  "accuracy": 0.4,
+  "n_correct": 8,
+  "n_total": 20,
+  "qcf_avg": 0.0
+}

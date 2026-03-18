@@ -1,0 +1,14 @@
+{
+  "needle": "N-PASS",
+  "depth": 0.1,
+  "budget_key": "B1",
+  "budget": 1600,
+  "policy": "sliding",
+  "success": true,
+  "expected": "58291",
+  "generated_prefix": "[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nUrban planning involves the technical and political process of developing land use strategies. Modern cities face challenges including traf",
+  "prompt_len_approx": 1482,
+  "qcf_avg": 0.0,
+  "qcf_total": 0.0,
+  "eviction_count": 0
+}

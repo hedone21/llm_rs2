@@ -1,0 +1,29 @@
+{
+  "config": {
+    "eviction_policy": "none",
+    "eviction_target_ratio": 0.75,
+    "h2o_keep_ratio": 0.5,
+    "kv_budget": 0,
+    "kv_type": "f32",
+    "max_seq_len": 2048,
+    "model": "/home/go/Workspace/llm_rs2/models/llama3.2-1b",
+    "protected_prefix": 4,
+    "text_file": "/home/go/Workspace/llm_rs2/experiments/proxy_validation/texts/eval_text.txt"
+  },
+  "eviction_count": 0,
+  "ppl": 7.094264801919824,
+  "qcf_metrics": [],
+  "token_count": 2047,
+  "tokens_per_second": 69.63827743760102,
+  "total_nll": 4010.659840601001,
+  "wall_time_s": 29.394753508,
+  "budget_key": "B0",
+  "budget": 2048,
+  "policy": "none",
+  "qcf_summary": {
+    "count": 0,
+    "avg": 0.0,
+    "total": 0.0,
+    "max": 0.0
+  }
+}
