@@ -79,9 +79,9 @@ def plot_proxy_vs_ppl(model_name, baseline_ppl, policies, suffix=""):
                 label=f"{POLICY_LABELS.get(policy, policy)} (ρ=1.0)",
                 linewidth=1.5, markersize=7, zorder=3)
 
-    ax.set_xlabel("Average Proxy Value (per eviction)", fontsize=12)
+    ax.set_xlabel("Average QCF (per eviction)", fontsize=12)
     ax.set_ylabel("ΔPPL (PPL increase from baseline)", fontsize=12)
-    ax.set_title(f"{model_name}  —  Proxy vs PPL Degradation\n(Baseline PPL = {baseline_ppl:.2f})",
+    ax.set_title(f"{model_name}  —  QCF vs PPL Degradation\n(Baseline PPL = {baseline_ppl:.2f})",
                  fontsize=13)
     ax.legend(fontsize=10, loc="upper left")
     ax.grid(True, alpha=0.3)
@@ -89,7 +89,7 @@ def plot_proxy_vs_ppl(model_name, baseline_ppl, policies, suffix=""):
     ax.set_ylim(bottom=0)
 
     plt.tight_layout()
-    path = f"{OUTDIR}/proxy_vs_ppl_{suffix}.png"
+    path = f"{OUTDIR}/qcf_vs_ppl_{suffix}.png"
     fig.savefig(path, dpi=150)
     plt.close(fig)
     print(f"  Saved: {path}")
@@ -143,7 +143,7 @@ def plot_combined_comparison():
                     label=POLICY_LABELS.get(policy, policy),
                     linewidth=1.5, markersize=6, zorder=3)
 
-        ax.set_xlabel("Average Proxy Value", fontsize=11)
+        ax.set_xlabel("Average QCF", fontsize=11)
         ax.set_ylabel("ΔPPL" if idx == 0 else "", fontsize=11)
         ax.set_title(f"{label}  (Baseline PPL = {baseline_ppl:.2f})", fontsize=12)
         ax.legend(fontsize=9, loc="upper left")
@@ -151,7 +151,7 @@ def plot_combined_comparison():
         ax.set_xlim(left=0)
         ax.set_ylim(bottom=0)
 
-    fig.suptitle("Proxy vs PPL Degradation — Spearman ρ = 1.0 (all combinations)",
+    fig.suptitle("QCF vs PPL Degradation — Spearman ρ = 1.0 (all combinations)",
                  fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
     path = f"{OUTDIR}/comparison_1b_3b.png"
@@ -160,7 +160,7 @@ def plot_combined_comparison():
     print(f"  Saved: {path}")
 
 
-def plot_total_proxy_vs_ppl():
+def plot_total_qcf_vs_ppl():
     """Total proxy (cumulative) vs ΔPPL — shows stronger relationship."""
     fig, axes = plt.subplots(1, 2, figsize=(14, 5.5))
 
@@ -180,7 +180,7 @@ def plot_total_proxy_vs_ppl():
                     label=POLICY_LABELS.get(policy, policy),
                     linewidth=1.5, markersize=6, zorder=3)
 
-        ax.set_xlabel("Cumulative Proxy (sum over all evictions)", fontsize=11)
+        ax.set_xlabel("Cumulative QCF (sum over all evictions)", fontsize=11)
         ax.set_ylabel("ΔPPL" if idx == 0 else "", fontsize=11)
         ax.set_title(f"{label}  (Baseline PPL = {baseline_ppl:.2f})", fontsize=12)
         ax.legend(fontsize=9, loc="upper left")
@@ -188,10 +188,10 @@ def plot_total_proxy_vs_ppl():
         ax.set_xlim(left=0)
         ax.set_ylim(bottom=0)
 
-    fig.suptitle("Cumulative Proxy vs PPL Degradation — ρ = 1.0",
+    fig.suptitle("Cumulative QCF vs PPL Degradation — ρ = 1.0",
                  fontsize=14, fontweight="bold", y=1.02)
     plt.tight_layout()
-    path = f"{OUTDIR}/total_proxy_vs_ppl.png"
+    path = f"{OUTDIR}/total_qcf_vs_ppl.png"
     fig.savefig(path, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f"  Saved: {path}")
@@ -212,7 +212,7 @@ def main():
 
     print("\n  Combined:")
     plot_combined_comparison()
-    plot_total_proxy_vs_ppl()
+    plot_total_qcf_vs_ppl()
     print("\nDone.")
 
 
