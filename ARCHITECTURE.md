@@ -151,6 +151,15 @@ graph TB
         MathUtils["MathUtils (avg_pool, topk)"]
     end
 
+    subgraph QCFSubsystem ["QCF (Quality Cost Function)"]
+        QcfMetric["QcfMetric / QcfConfig"]
+        EvictionQcf["compute_eviction_qcf"]
+        QuantQcf["compute_flush_qcf (NMSE)"]
+        SkipQcf["SkipQcfTracker"]
+        LayerImp["ImportanceTable / ImportanceCollector"]
+        DegEst["DegradationEstimator (α×Q)"]
+    end
+
     subgraph EvictionSubsystem ["KV Cache Management"]
         CacheManager["CacheManager"]
         Pipeline["CachePressurePipeline"]
@@ -213,6 +222,16 @@ graph TB
     LlamaLayer --> SkipConfig
     H2O --> ScoreAccum
 
+    Generate --> QcfMetric
+    EvictionHandler --> EvictionQcf
+    SnapKVHandler --> EvictionQcf
+    QuantizeHandler --> QuantQcf
+    EvictionQcf --> KVCache
+    EvictionQcf --> ScoreAccum
+    QuantQcf --> KiviCache
+    LlamaModel --> LayerImp
+    DegEst --> QcfMetric
+
     Tensor --> BufferTrait
     Tensor --> BackendTrait
     Tensor --> Shape
@@ -249,6 +268,9 @@ graph TB
 | **LayerWorkspace** | 생성 루프용 사전 할당 작업 텐서 (매 토큰 재사용) | `engine/src/layers/workspace.rs` |
 | **LlamaModel** | 모델 로딩, 임베딩, 레이어 반복(skip_config 전달), 로짓 계산 | `engine/src/models/llama/llama_model.rs` |
 | **AttentionScoreAccumulator** | H2O/SnapKV용 attention importance score 누적 (decay, reset) | `engine/src/core/attention_scores.rs` |
+| **QcfMetric** | lossy action의 품질 열화 측정값 (action, raw_value, per_head, tokens_affected) | `engine/src/core/qcf/mod.rs` |
+| **DegradationEstimator** | QCF→PPL 증가량 변환 (offline-calibrated PiecewiseLinear + runtime EMA 보정) | `engine/src/core/qcf/estimator.rs` |
+| **ImportanceTable** | Prefill 시 cosine similarity 기반 레이어 중요도 테이블. Layer Skip QCF 계산용 | `engine/src/core/qcf/layer_importance.rs` |
 
 ---
 
