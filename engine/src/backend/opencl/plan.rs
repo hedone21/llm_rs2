@@ -112,9 +112,7 @@ impl FullKernelPlan {
             let cache = &mut kv_caches[i];
 
             // Check for KV cache resize or capacity overflow (plan invalidation)
-            if cache.capacity() != self.kv_capacity
-                || cache.current_pos() >= cache.capacity()
-            {
+            if cache.capacity() != self.kv_capacity || cache.current_pos() >= cache.capacity() {
                 return Err(PlanInvalidated);
             }
 
@@ -354,16 +352,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.residual_buf))?;
             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.attn_norm_buf))?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                3,
-                ocl::core::ArgVal::scalar(&(dim as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                4,
-                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
-            )?;
+            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 5,
@@ -442,11 +432,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             )?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&seq_len_i32))?;
             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&start_pos_init))?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                5,
-                ocl::core::ArgVal::scalar(&config.rope_theta),
-            )?;
+            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rope_theta))?;
         }
         let work_size = config.n_heads_q * (config.head_dim / 2);
         steps.push(KernelStep {
@@ -481,11 +467,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             )?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&seq_len_i32))?;
             ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&start_pos_init))?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                5,
-                ocl::core::ArgVal::scalar(&config.rope_theta),
-            )?;
+            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rope_theta))?;
         }
         let work_size = config.n_kv_heads * (config.head_dim / 2);
         steps.push(KernelStep {
@@ -542,9 +524,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //          kv_pos_stride(i32), kv_head_stride(i32), local_mem
     // -----------------------------------------------------------------------
     {
-        let kernel =
-            ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
-                .context("create kernel_attn_gen_half")?;
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
+            .context("create kernel_attn_gen_half")?;
         let scale = 1.0f32 / (config.head_dim as f32).sqrt();
         let cache_seq_len_init = 0i32;
         unsafe {
@@ -567,11 +548,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
                 6,
                 ocl::core::ArgVal::scalar(&(config.n_kv_heads as i32)),
             )?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                7,
-                ocl::core::ArgVal::scalar(&cache_seq_len_init),
-            )?;
+            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&cache_seq_len_init))?;
             ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
             ocl::core::set_kernel_arg(
                 &kernel,
@@ -617,24 +594,15 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //     args: x, attn_out, residual, ffn_norm, dim(i32), eps(f32), local_mem
     // -----------------------------------------------------------------------
     {
-        let kernel =
-            ocl::core::create_kernel(config.simple_ops_program, "kernel_add_rms_norm_oop")
-                .context("create kernel_add_rms_norm_oop")?;
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_add_rms_norm_oop")
+            .context("create kernel_add_rms_norm_oop")?;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.attn_out_buf))?;
             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.residual_buf))?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::mem(config.ffn_norm_buf))?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                4,
-                ocl::core::ArgVal::scalar(&(dim as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                5,
-                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
-            )?;
+            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 6,
@@ -682,9 +650,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //     args: gate, up, size4(i32)
     // -----------------------------------------------------------------------
     {
-        let kernel =
-            ocl::core::create_kernel(config.simple_ops_program, "kernel_silu_mul_simple")
-                .context("create kernel_silu_mul_simple")?;
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_silu_mul_simple")
+            .context("create kernel_silu_mul_simple")?;
         let size4 = (config.ffn_hidden / 4) as i32;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.gate_buf))?;
@@ -863,28 +830,15 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
 
     // Final RMSNorm (in-place on x)
     let final_norm = {
-        let kernel =
-            ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_opt")
-                .context("create final kernel_rms_norm_opt")?;
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_opt")
+            .context("create final kernel_rms_norm_opt")?;
         let local_size = 64usize;
         let local_mem_bytes = local_size * std::mem::size_of::<f32>();
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                1,
-                ocl::core::ArgVal::mem(config.final_norm_buf),
-            )?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                2,
-                ocl::core::ArgVal::scalar(&(config.dim as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                3,
-                ocl::core::ArgVal::scalar(&config.rms_norm_eps),
-            )?;
+            ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.final_norm_buf))?;
+            ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&(config.dim as i32)))?;
+            ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 4,

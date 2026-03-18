@@ -194,9 +194,9 @@ pub const QKKV: usize = 32;
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BlockKVQ4 {
-    pub d: f16,               // scale = (max - min) / 15
-    pub m: f16,               // minimum value
-    pub qs: [u8; QKKV / 2],  // 32 × 4-bit packed into 16 bytes
+    pub d: f16,             // scale = (max - min) / 15
+    pub m: f16,             // minimum value
+    pub qs: [u8; QKKV / 2], // 32 × 4-bit packed into 16 bytes
 }
 
 const _: () = assert!(std::mem::size_of::<BlockKVQ4>() == 20);
@@ -244,9 +244,9 @@ impl BlockKVQ4 {
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct BlockKVQ8 {
-    pub d: f16,           // scale = (max - min) / 255
-    pub m: f16,           // minimum value
-    pub qs: [u8; QKKV],  // 32 × 8-bit
+    pub d: f16,         // scale = (max - min) / 255
+    pub m: f16,         // minimum value
+    pub qs: [u8; QKKV], // 32 × 8-bit
 }
 
 const _: () = assert!(std::mem::size_of::<BlockKVQ8>() == 36);
@@ -596,7 +596,9 @@ mod tests {
             assert!(
                 (src[i] - dst[i]).abs() < max_err,
                 "KVQ4 error at {i}: src={}, dst={}, err={}",
-                src[i], dst[i], (src[i] - dst[i]).abs()
+                src[i],
+                dst[i],
+                (src[i] - dst[i]).abs()
             );
         }
     }
@@ -622,7 +624,7 @@ mod tests {
         let mut out = [0.0f32; QKKV];
         block.dequantize(&mut out);
         for i in (0..QKKV).step_by(2) {
-            assert!((out[i] - (-1.0)).abs() < 0.01, "lo: {} != -1.0", out[i]);      // 1*1 + (-2) = -1
+            assert!((out[i] - (-1.0)).abs() < 0.01, "lo: {} != -1.0", out[i]); // 1*1 + (-2) = -1
             assert!((out[i + 1] - 1.0).abs() < 0.01, "hi: {} != 1.0", out[i + 1]); // 3*1 + (-2) = 1
         }
     }
@@ -641,7 +643,9 @@ mod tests {
             assert!(
                 (src[i] - dst[i]).abs() < max_err,
                 "KVQ8 error at {i}: src={}, dst={}, err={}",
-                src[i], dst[i], (src[i] - dst[i]).abs()
+                src[i],
+                dst[i],
+                (src[i] - dst[i]).abs()
             );
         }
     }
@@ -667,9 +671,22 @@ mod tests {
         let mut dst_q2 = [0.0f32; QKKV];
         q8.dequantize(&mut dst_q8);
         q2.dequantize(&mut dst_q2);
-        let mse_q8: f32 = src.iter().zip(dst_q8.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / QKKV as f32;
-        let mse_q2: f32 = src.iter().zip(dst_q2.iter()).map(|(a, b)| (a - b).powi(2)).sum::<f32>() / QKKV as f32;
-        assert!(mse_q8 < mse_q2, "Q8 MSE ({mse_q8}) should be < Q2 MSE ({mse_q2})");
+        let mse_q8: f32 = src
+            .iter()
+            .zip(dst_q8.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / QKKV as f32;
+        let mse_q2: f32 = src
+            .iter()
+            .zip(dst_q2.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / QKKV as f32;
+        assert!(
+            mse_q8 < mse_q2,
+            "Q8 MSE ({mse_q8}) should be < Q2 MSE ({mse_q2})"
+        );
     }
 
     #[test]

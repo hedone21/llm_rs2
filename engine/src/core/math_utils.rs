@@ -125,8 +125,7 @@ mod tests {
         // 2 heads, 5 prefix tokens, keep 3
         let scores = vec![
             // head 0: positions with scores [1, 5, 2, 4, 3]
-            1.0, 5.0, 2.0, 4.0, 3.0,
-            // head 1: positions with scores [5, 1, 4, 2, 3]
+            1.0, 5.0, 2.0, 4.0, 3.0, // head 1: positions with scores [5, 1, 4, 2, 3]
             5.0, 1.0, 4.0, 2.0, 3.0,
         ];
         let result = topk_indices_per_head(&scores, 2, 5, 3);

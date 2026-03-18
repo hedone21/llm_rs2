@@ -1199,7 +1199,8 @@ mod tests {
             assert!(
                 err < max_q4_err,
                 "K Q4 error at {i}: expected={}, got={}, err={err}",
-                all_k[i], k_out[i]
+                all_k[i],
+                k_out[i]
             );
         }
     }
@@ -1236,8 +1237,12 @@ mod tests {
         let k4_data = k4.as_slice::<f32>();
 
         // Q4 should be close to Q8 (some error from requant)
-        let mse_8_to_4: f32 = k8_data.iter().zip(k4_data.iter())
-            .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / k8_data.len() as f32;
+        let mse_8_to_4: f32 = k8_data
+            .iter()
+            .zip(k4_data.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / k8_data.len() as f32;
 
         // Transition 4 → 2
         cache.transition_bits(2).unwrap();
@@ -1246,15 +1251,22 @@ mod tests {
         let (k2, _) = cache.get_view();
         let k2_data = k2.as_slice::<f32>();
 
-        let mse_4_to_2: f32 = k4_data.iter().zip(k2_data.iter())
-            .map(|(a, b)| (a - b).powi(2)).sum::<f32>() / k4_data.len() as f32;
+        let mse_4_to_2: f32 = k4_data
+            .iter()
+            .zip(k2_data.iter())
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f32>()
+            / k4_data.len() as f32;
 
         // Both MSEs should be bounded (not NaN, not huge)
         assert!(mse_8_to_4 < 1.0, "MSE 8→4 too high: {mse_8_to_4}");
         assert!(mse_4_to_2 < 5.0, "MSE 4→2 too high: {mse_4_to_2}");
 
         // Q4→Q2 should have more error than Q8→Q4
-        assert!(mse_4_to_2 > mse_8_to_4, "Expected more error in 4→2 than 8→4");
+        assert!(
+            mse_4_to_2 > mse_8_to_4,
+            "Expected more error in 4→2 than 8→4"
+        );
     }
 
     #[test]

@@ -89,7 +89,9 @@ impl CachePressureHandler for SnapKVHandler {
                 let mut votes = importance[..prefix_len].to_vec();
                 avg_pool_1d(&mut votes, self.kernel_size);
 
-                let flat: Vec<f32> = (0..n_kv_heads).flat_map(|_| votes.iter().copied()).collect();
+                let flat: Vec<f32> = (0..n_kv_heads)
+                    .flat_map(|_| votes.iter().copied())
+                    .collect();
                 topk_indices_per_head(&flat, n_kv_heads, prefix_len, keep_count)
             } else {
                 // No scores available — cannot compress

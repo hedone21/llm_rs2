@@ -746,7 +746,9 @@ impl KVCache {
             }
         }
 
-        let new_pos = keep_indices.get(0).map_or(window_tokens, |k| k.len() + window_tokens);
+        let new_pos = keep_indices
+            .get(0)
+            .map_or(window_tokens, |k| k.len() + window_tokens);
         self.current_pos = new_pos;
 
         Ok(new_pos)

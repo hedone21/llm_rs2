@@ -136,7 +136,10 @@ impl SkipOptimizer {
     pub fn perturb(config: &SkipConfig, num_layers: usize, rng_seed: u64) -> SkipConfig {
         let mut new_config = config.clone();
         // Simple hash-based pseudo-random
-        let idx = (rng_seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) >> 33) as usize;
+        let idx = (rng_seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407)
+            >> 33) as usize;
         let layer = 1 + (idx % (num_layers.saturating_sub(2)).max(1));
         let is_attn = (idx / num_layers) % 2 == 0;
 
@@ -241,8 +244,14 @@ mod tests {
         // Test many seeds — layer 0 and L-1 should never appear
         for seed in 0..100 {
             let p = SkipOptimizer::perturb(&config, 16, seed);
-            assert!(!p.attn_skip.contains(&0), "seed={seed}: layer 0 in attn_skip");
-            assert!(!p.attn_skip.contains(&15), "seed={seed}: layer 15 in attn_skip");
+            assert!(
+                !p.attn_skip.contains(&0),
+                "seed={seed}: layer 0 in attn_skip"
+            );
+            assert!(
+                !p.attn_skip.contains(&15),
+                "seed={seed}: layer 15 in attn_skip"
+            );
         }
     }
 

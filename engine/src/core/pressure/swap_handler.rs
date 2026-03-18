@@ -20,9 +20,7 @@ impl SwapHandler {
 
 impl Default for SwapHandler {
     fn default() -> Self {
-        Self {
-            offload_ratio: 0.5,
-        }
+        Self { offload_ratio: 0.5 }
     }
 }
 
@@ -95,11 +93,7 @@ mod tests {
             k_buf,
             backend.clone(),
         );
-        let v = Tensor::new(
-            Shape::new(vec![1, max_seq, heads, dim]),
-            v_buf,
-            backend,
-        );
+        let v = Tensor::new(Shape::new(vec![1, max_seq, heads, dim]), v_buf, backend);
         let mut cache = KVCache::new(k, v, max_seq);
         cache.current_pos = num_tokens;
         cache

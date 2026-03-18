@@ -94,21 +94,33 @@ mod tests {
 
     #[test]
     fn test_target_bits_normal() {
-        assert_eq!(QuantizeHandler::target_bits_for_pressure(PressureLevel::Normal), None);
+        assert_eq!(
+            QuantizeHandler::target_bits_for_pressure(PressureLevel::Normal),
+            None
+        );
     }
 
     #[test]
     fn test_target_bits_warning() {
-        assert_eq!(QuantizeHandler::target_bits_for_pressure(PressureLevel::Warning), Some(8));
+        assert_eq!(
+            QuantizeHandler::target_bits_for_pressure(PressureLevel::Warning),
+            Some(8)
+        );
     }
 
     #[test]
     fn test_target_bits_critical() {
-        assert_eq!(QuantizeHandler::target_bits_for_pressure(PressureLevel::Critical), Some(4));
+        assert_eq!(
+            QuantizeHandler::target_bits_for_pressure(PressureLevel::Critical),
+            Some(4)
+        );
     }
 
     #[test]
     fn test_target_bits_emergency() {
-        assert_eq!(QuantizeHandler::target_bits_for_pressure(PressureLevel::Emergency), Some(2));
+        assert_eq!(
+            QuantizeHandler::target_bits_for_pressure(PressureLevel::Emergency),
+            Some(2)
+        );
     }
 }

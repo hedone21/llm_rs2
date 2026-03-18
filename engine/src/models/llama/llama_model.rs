@@ -513,8 +513,8 @@ impl LlamaModel {
                 .as_ref()
                 .is_some_and(|acc| acc.should_track_layer(i));
 
-            let (s_attn, s_mlp) = skip_config
-                .map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
+            let (s_attn, s_mlp) =
+                skip_config.map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
 
             layer.forward(LlamaLayerForwardArgs {
                 x: &mut x,
@@ -669,7 +669,11 @@ impl LlamaModel {
 
         match build_full_plan(&full_config) {
             Ok(plan) => {
-                log::info!("GPU kernel plan built ({} layers, capacity={})", self.layers.len(), capacity);
+                log::info!(
+                    "GPU kernel plan built ({} layers, capacity={})",
+                    self.layers.len(),
+                    capacity
+                );
                 Some(plan)
             }
             Err(e) => {

@@ -624,37 +624,39 @@ fn main() -> anyhow::Result<()> {
             }]);
             CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
         } else {
-            let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> =
-                match args.eviction_policy.as_str() {
-                    "none" => Box::new(NoEvictionPolicy::new()),
-                    "sliding" => Box::new(SlidingWindowPolicy::new(
-                        args.eviction_window,
-                        actual_protected_prefix,
-                    )),
-                    "streaming" => {
-                        // StreamingLLM: default window=2000 if user didn't override
-                        let window = if args.eviction_window == 1024 {
-                            2000
-                        } else {
-                            args.eviction_window
-                        };
-                        Box::new(SlidingWindowPolicy::new(window, actual_protected_prefix))
-                    }
-                    "h2o" => Box::new(H2OPolicy::new(
-                        args.h2o_recent_window,
-                        args.h2o_keep_ratio,
-                        actual_protected_prefix,
-                    )),
-                    "h2o_plus" => Box::new(H2OPlusPolicy::new(
-                        args.h2o_recent_window,
-                        args.h2o_keep_ratio,
-                        actual_protected_prefix,
-                    )),
-                    other => anyhow::bail!(
-                        "Unknown eviction policy: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
-                        other
-                    ),
-                };
+            let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args
+                .eviction_policy
+                .as_str()
+            {
+                "none" => Box::new(NoEvictionPolicy::new()),
+                "sliding" => Box::new(SlidingWindowPolicy::new(
+                    args.eviction_window,
+                    actual_protected_prefix,
+                )),
+                "streaming" => {
+                    // StreamingLLM: default window=2000 if user didn't override
+                    let window = if args.eviction_window == 1024 {
+                        2000
+                    } else {
+                        args.eviction_window
+                    };
+                    Box::new(SlidingWindowPolicy::new(window, actual_protected_prefix))
+                }
+                "h2o" => Box::new(H2OPolicy::new(
+                    args.h2o_recent_window,
+                    args.h2o_keep_ratio,
+                    actual_protected_prefix,
+                )),
+                "h2o_plus" => Box::new(H2OPlusPolicy::new(
+                    args.h2o_recent_window,
+                    args.h2o_keep_ratio,
+                    actual_protected_prefix,
+                )),
+                other => anyhow::bail!(
+                    "Unknown eviction policy: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
+                    other
+                ),
+            };
             CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
         }
     };
@@ -787,7 +789,7 @@ fn main() -> anyhow::Result<()> {
             use_gpu_attn: args.gpu_attn,
             score_accumulator: None, // No score tracking during prefill
             profiler: None,
-                skip_config: None,
+            skip_config: None,
         })?;
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
@@ -807,8 +809,13 @@ fn main() -> anyhow::Result<()> {
         let start_idx = (process_len - 1) * vocab_size;
         let mut last_logits = logits_cpu[start_idx..start_idx + vocab_size].to_vec();
 
-        let next_token_id =
-            sampling::sample(&mut last_logits, &tokens, vocab_size, &sampling_config, None);
+        let next_token_id = sampling::sample(
+            &mut last_logits,
+            &tokens,
+            vocab_size,
+            &sampling_config,
+            None,
+        );
 
         _ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
         _last_token_time = std::time::Instant::now();
@@ -979,9 +986,7 @@ fn main() -> anyhow::Result<()> {
                 // Rebuild plan after fallback (KV cache may have grown)
                 #[cfg(feature = "opencl")]
                 if gpu_plan.is_none() && backend.name() == "OpenCL" && !args.profile {
-                    gpu_plan = model.build_plan(
-                        &x_gen, &logits, &gen_ws, &mut kv_caches, &backend,
-                    );
+                    gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                 }
             }
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
@@ -1314,8 +1319,13 @@ fn main() -> anyhow::Result<()> {
             };
 
             let sample_start = std::time::Instant::now();
-            let next_token_id =
-                sampling::sample(&mut logits_cpu, &tokens, vocab_size, &sampling_config, Some(&mut sampling_indices));
+            let next_token_id = sampling::sample(
+                &mut logits_cpu,
+                &tokens,
+                vocab_size,
+                &sampling_config,
+                Some(&mut sampling_indices),
+            );
             let sample_us = sample_start.elapsed().as_micros() as u64;
 
             let now = std::time::Instant::now();
@@ -1846,7 +1856,7 @@ fn run_eval_ll(
                     use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: None,
-                skip_config: None,
+                    skip_config: None,
                 })?;
                 start_pos += 1;
 
@@ -1979,7 +1989,7 @@ fn run_eval_ll(
                         use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
-                skip_config: None,
+                        skip_config: None,
                     })?;
                     sp += 1;
 
@@ -2241,7 +2251,7 @@ fn run_kivi_eval_ll(
             use_gpu_attn: args.gpu_attn,
             score_accumulator: None,
             profiler: None,
-                skip_config: None,
+            skip_config: None,
         })?;
 
         let start_pos_after_prompt = prompt_len;
@@ -2309,7 +2319,7 @@ fn run_kivi_eval_ll(
                         use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
-                skip_config: None,
+                        skip_config: None,
                     })?;
                     sp += 1;
 
@@ -2534,7 +2544,7 @@ fn run_kivi(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
-                skip_config: None,
+            skip_config: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2624,7 +2634,7 @@ fn run_kivi(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
-                skip_config: None,
+            skip_config: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -2647,7 +2657,8 @@ fn run_kivi(
             vec![]
         };
 
-        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
+        let next_token =
+            sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
 
         let now = std::time::Instant::now();
         let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
@@ -2901,7 +2912,7 @@ fn run_offload(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
-                skip_config: None,
+            skip_config: None,
         })?;
 
         // Sample last token from prefill logits
@@ -3014,7 +3025,8 @@ fn run_offload(
             backend.read_buffer(&logits, slice)?;
         }
 
-        let next_token = sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
+        let next_token =
+            sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
 
         let now = std::time::Instant::now();
         let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;

@@ -225,7 +225,9 @@ mod tests {
 
         let num_tokens = 128;
         let k_data: Vec<u8> = (0..num_tokens * bpt).map(|i| (i % 256) as u8).collect();
-        let v_data: Vec<u8> = (0..num_tokens * bpt).map(|i| ((i + 128) % 256) as u8).collect();
+        let v_data: Vec<u8> = (0..num_tokens * bpt)
+            .map(|i| ((i + 128) % 256) as u8)
+            .collect();
         store.store(&k_data, &v_data, num_tokens).unwrap();
 
         let mut k_buf = vec![0u8; num_tokens * bpt];
