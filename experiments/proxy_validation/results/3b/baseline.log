@@ -13,3 +13,6 @@ Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
 [PPL] Warning: text has 2757 tokens, truncating to max_seq_len=2048
 [PPL] 2048 tokens, policy=none, kv_budget=0, kv_type=f32
 [PPL] Prefill: 2048 tokens
+[PPL] Prefill NLL: 3531.7756, count=2047, running PPL=5.6144
+
+[PPL] Final: PPL=5.6144, NLL=3531.7756, tokens=2047, 27.0 tok/s, 75.9s

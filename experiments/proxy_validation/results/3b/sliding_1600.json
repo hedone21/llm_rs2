@@ -1,5 +1,3 @@
-Shard index: 254 tensors across 2 shards
-Loading 2 safetensors shards...
 {
   "config": {
     "eviction_policy": "sliding",
@@ -3593,7 +3591,7 @@ Loading 2 safetensors shards...
     }
   ],
   "token_count": 2046,
-  "tokens_per_second": 16.476164272900846,
+  "tokens_per_second": 18.22188290245305,
   "total_nll": 5177.333592849395,
-  "wall_time_s": 124.179388243
+  "wall_time_s": 112.282578642
 }
