@@ -269,6 +269,11 @@ struct Args {
     /// Use Rayon par_chunks_mut instead of SpinPool for F16 matmul (A/B benchmarking).
     #[arg(long, default_value_t = false)]
     use_rayon: bool,
+
+    /// Path to reference text file for perplexity evaluation (teacher-forcing).
+    /// Measures PPL and collects proxy metrics during eviction.
+    #[arg(long)]
+    ppl: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -448,8 +453,8 @@ fn main() -> anyhow::Result<()> {
     };
 
     // Determine initial KV cache capacity (dynamic grow-on-demand)
-    let initial_kv_capacity = if args.eval_ll {
-        // Eval-LL batch mode: pre-allocate full capacity to avoid re-allocation
+    let initial_kv_capacity = if args.eval_ll || args.ppl.is_some() {
+        // Eval modes: pre-allocate full capacity to avoid re-allocation
         max_seq_len
     } else if args.initial_kv_capacity > 0 {
         args.initial_kv_capacity.min(max_seq_len)
@@ -730,6 +735,29 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // ════════════════════════════════════════════════════════════
+    //  PPL MODE: Perplexity evaluation on reference text
+    // ════════════════════════════════════════════════════════════
+    if let Some(ref ppl_path) = args.ppl {
+        return run_ppl(
+            &args,
+            &model,
+            &tokenizer,
+            &backend,
+            &*memory,
+            &mut kv_caches,
+            &mut cache_manager,
+            &mut score_accumulator,
+            vocab_size,
+            hidden_size,
+            max_seq_len,
+            ppl_path,
+            auto_eviction,
+            score_based_eviction,
+            actual_protected_prefix,
+        );
+    }
+
     // Pre-allocate generation buffers
     let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
     let mut logits = Tensor::new(
@@ -930,7 +958,7 @@ fn main() -> anyhow::Result<()> {
             let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
 
             // Apply decay to accumulated importance scores before this step
-            if let Some(ref mut acc) = score_accumulator {
+            if let Some(acc) = score_accumulator.as_mut() {
                 acc.begin_step();
             }
 
@@ -1011,7 +1039,7 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // 2. Dump importance score distribution
-                if let Some(ref acc) = score_accumulator {
+                if let Some(acc) = score_accumulator.as_ref() {
                     let scores = acc.importance_scores();
                     let valid = &scores[..cache_pos];
                     if !valid.is_empty() {
@@ -1054,7 +1082,7 @@ fn main() -> anyhow::Result<()> {
 
                 let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
                     // Score-based policies: force evict when cache >= 90% full
-                    if let Some(ref acc) = score_accumulator {
+                    if let Some(acc) = score_accumulator.as_ref() {
                         if acc.is_active() {
                             cache_manager.force_evict_with_scores(
                                 &mut kv_caches,
@@ -1067,7 +1095,7 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
                     }
-                } else if let Some(ref acc) = score_accumulator {
+                } else if let Some(acc) = score_accumulator.as_ref() {
                     if acc.is_active() {
                         cache_manager
                             .maybe_evict_with_scores(&mut kv_caches, acc.importance_scores())?
@@ -1131,7 +1159,7 @@ fn main() -> anyhow::Result<()> {
                         position_birth_step = kept;
                     }
 
-                    if let Some(ref mut acc) = score_accumulator {
+                    if let Some(acc) = score_accumulator.as_mut() {
                         acc.reset();
                     }
                 }
@@ -1169,7 +1197,7 @@ fn main() -> anyhow::Result<()> {
                         args.experiment_eviction_ratio.unwrap_or(evict.target_ratio);
 
                     // ── Score distribution diagnostic (via events system) ──
-                    if let Some(ref acc) = score_accumulator {
+                    if let Some(acc) = score_accumulator.as_ref() {
                         let scores = acc.importance_scores();
                         let cache_pos = kv_caches[0].current_pos;
 
@@ -1199,7 +1227,7 @@ fn main() -> anyhow::Result<()> {
                     if evict.level >= ResourceLevel::Critical
                         || args.experiment_eviction_ratio.is_some()
                     {
-                        let result = if let Some(ref acc) = score_accumulator {
+                        let result = if let Some(acc) = score_accumulator.as_ref() {
                             if let Some(head_imp) = acc.head_importance_scores() {
                                 cache_manager.force_evict_with_head_scores(
                                     &mut kv_caches,
@@ -1227,7 +1255,7 @@ fn main() -> anyhow::Result<()> {
                                     r.new_pos
                                 );
                                 if args.h2o_debug {
-                                    if let Some(ref acc) = score_accumulator {
+                                    if let Some(acc) = score_accumulator.as_ref() {
                                         let scores = acc.importance_scores();
                                         let pre_pos = r.new_pos + r.tokens_removed;
                                         let valid = &scores[..pre_pos.min(scores.len())];
@@ -1272,7 +1300,7 @@ fn main() -> anyhow::Result<()> {
                                 }
                                 experiment_eviction_count += 1;
                                 experiment_evicted_total += r.tokens_removed;
-                                if let Some(ref mut acc) = score_accumulator {
+                                if let Some(acc) = score_accumulator.as_mut() {
                                     acc.reset();
                                 }
                             }
@@ -3091,6 +3119,362 @@ fn run_offload(
     println!(
         "Avg forward: {:.2} ms, Avg TBT: {:.2} ms ({:.1} tok/s)",
         avg_forward_ms, avg_tbt, tok_per_s,
+    );
+
+    Ok(())
+}
+
+// ════════════════════════════════════════════════════════════════
+//  PPL MODE: Teacher-forcing perplexity evaluation on reference text.
+//
+//  Reads a text file, tokenizes it, and measures how well the model
+//  predicts each token given all previous tokens. Applies the configured
+//  eviction policy and collects proxy metrics during eviction events.
+// ════════════════════════════════════════════════════════════════
+
+#[allow(clippy::too_many_arguments)]
+fn run_ppl(
+    args: &Args,
+    model: &LlamaModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &dyn Memory,
+    kv_caches: &mut [KVCache],
+    cache_manager: &mut CacheManager,
+    score_accumulator: &mut Option<AttentionScoreAccumulator>,
+    vocab_size: usize,
+    hidden_size: usize,
+    max_seq_len: usize,
+    text_file: &str,
+    auto_eviction: bool,
+    score_based_eviction: bool,
+    protected_prefix: usize,
+) -> anyhow::Result<()> {
+    use llm_rs2::core::proxy::{ProxyConfig, ProxyMetric};
+
+    // ── 1. Read and tokenize reference text ──
+    let text = std::fs::read_to_string(text_file)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", text_file, e))?;
+    let encoding = tokenizer
+        .encode(text.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
+    let all_ids: Vec<u32> = encoding.get_ids().to_vec();
+    let total_tokens = all_ids.len();
+
+    if total_tokens < 2 {
+        anyhow::bail!("PPL requires at least 2 tokens, got {}", total_tokens);
+    }
+
+    let eval_tokens = total_tokens.min(max_seq_len);
+    if total_tokens > max_seq_len {
+        eprintln!(
+            "[PPL] Warning: text has {} tokens, truncating to max_seq_len={}",
+            total_tokens, max_seq_len
+        );
+    }
+    let token_ids = &all_ids[..eval_tokens];
+
+    eprintln!(
+        "[PPL] {} tokens, policy={}, kv_budget={}, kv_type={}",
+        eval_tokens, args.eviction_policy, args.kv_budget, args.kv_type
+    );
+
+    // ── 2. Pre-allocate decode buffers ──
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut decode_logits =
+        Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let q_dim = hidden_size;
+    let k_dim = model.config.num_key_value_heads * model.config.head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = model.config.intermediate_size;
+    let mut gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len: args.max_seq_len,
+        },
+        memory,
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+    let mut logits_cpu = vec![0.0f32; vocab_size];
+
+    // ── 3. Determine prefill chunk size ──
+    let has_budget = args.kv_budget > 0 || args.kv_budget_ratio > 0.0;
+    let prefill_chunk = if has_budget {
+        let budget = if args.kv_budget_ratio > 0.0 {
+            ((eval_tokens as f32) * args.kv_budget_ratio) as usize
+        } else {
+            args.kv_budget
+        };
+        budget.min(eval_tokens).max(2)
+    } else if auto_eviction && args.eviction_policy == "sliding" {
+        args.eviction_window.min(eval_tokens)
+    } else {
+        eval_tokens
+    };
+
+    let mut total_nll: f64 = 0.0;
+    let mut nll_count: usize = 0;
+    let mut proxy_metrics: Vec<serde_json::Value> = Vec::new();
+    let proxy_config = ProxyConfig::default();
+    let overall_start = std::time::Instant::now();
+
+    // ── 4. Prefill phase ──
+    let prefill_len = prefill_chunk.min(eval_tokens);
+    eprintln!("[PPL] Prefill: {} tokens", prefill_len);
+
+    {
+        let cpu_backend = Arc::new(CpuBackend::new());
+        let input_buf = Galloc::new().alloc(prefill_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = input_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in token_ids[..prefill_len].iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_input = Tensor::new(Shape::new(vec![1, prefill_len]), input_buf, cpu_backend);
+        let input_tensor = backend.copy_from(&cpu_input)?;
+
+        let prefill_logits_buf = memory.alloc(prefill_len * vocab_size * 4, DType::F32)?;
+        let mut prefill_logits = Tensor::new(
+            Shape::new(vec![1, prefill_len, vocab_size]),
+            prefill_logits_buf,
+            backend.clone(),
+        );
+
+        if let Some(acc) = score_accumulator.as_mut() {
+            acc.begin_step();
+        }
+
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            kv_caches,
+            backend,
+            memory,
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: score_accumulator.as_mut(),
+            profiler: None,
+            skip_config: None,
+        })?;
+
+        // Read all prefill logits to CPU
+        let mut all_logits = vec![0.0f32; prefill_len * vocab_size];
+        unsafe {
+            let ptr = all_logits.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, all_logits.len() * 4);
+            backend.read_buffer(&prefill_logits, slice)?;
+        }
+
+        // Score tokens 1..prefill_len: logits[i] predicts token[i+1]
+        for i in 0..prefill_len - 1 {
+            let offset = i * vocab_size;
+            let lp = sampling::compute_log_prob(
+                &all_logits[offset..offset + vocab_size],
+                token_ids[i + 1],
+                vocab_size,
+            );
+            total_nll -= lp;
+            nll_count += 1;
+        }
+
+        eprintln!(
+            "[PPL] Prefill NLL: {:.4}, count={}, running PPL={:.4}",
+            total_nll,
+            nll_count,
+            (total_nll / nll_count as f64).exp()
+        );
+    }
+
+    // ── 5. Decode phase (teacher-forcing) ──
+    let mut start_pos = prefill_len;
+
+    for i in prefill_len..eval_tokens - 1 {
+        let input_token = token_ids[i];
+        let target_token = token_ids[i + 1];
+
+        // Score accumulator begin step
+        if let Some(acc) = score_accumulator.as_mut() {
+            acc.begin_step();
+        }
+
+        // Feed true token
+        unsafe {
+            *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = input_token;
+        }
+        let gen_input = backend.copy_from(&cpu_gen_input)?;
+
+        model.forward_into(LlamaModelForwardArgs {
+            input_tokens: &gen_input,
+            start_pos,
+            kv_caches,
+            backend,
+            memory,
+            logits_out: &mut decode_logits,
+            x_gen: Some(&mut x_gen),
+            workspace: Some(&mut gen_ws),
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: score_accumulator.as_mut(),
+            profiler: None,
+            skip_config: None,
+        })?;
+        start_pos += 1;
+
+        // Read logits and score target
+        unsafe {
+            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+            backend.read_buffer(&decode_logits, slice)?;
+        }
+        let lp = sampling::compute_log_prob(&logits_cpu, target_token, vocab_size);
+        total_nll -= lp;
+        nll_count += 1;
+
+        // ── Auto-eviction ──
+        if auto_eviction {
+            let before_len = kv_caches[0].current_pos;
+            let capacity = kv_caches[0].capacity();
+
+            let result = if score_based_eviction && before_len >= capacity * 9 / 10 {
+                if let Some(acc) = score_accumulator.as_ref() {
+                    if acc.is_active() {
+                        // Collect proxy before eviction
+                        let scores = acc.importance_scores();
+                        let target_len =
+                            ((before_len as f32) * args.eviction_target_ratio) as usize;
+                        let evicted = llm_rs2::core::proxy::identify_evicted_h2o(
+                            scores,
+                            protected_prefix,
+                            args.h2o_keep_ratio,
+                            before_len,
+                            target_len,
+                        );
+                        if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty() {
+                            let metric = llm_rs2::core::proxy::compute_eviction_proxy(
+                                &evicted,
+                                &kv_caches[0],
+                                &proxy_config,
+                            );
+                            proxy_metrics.push(serde_json::json!({
+                                "step": i,
+                                "action": metric.action,
+                                "raw_value": metric.raw_value,
+                                "tokens_affected": metric.tokens_affected,
+                                "cache_pos_before": before_len,
+                            }));
+                        }
+
+                        cache_manager.force_evict_with_scores(
+                            kv_caches,
+                            args.eviction_target_ratio,
+                            scores,
+                        )?
+                    } else {
+                        cache_manager.force_evict(kv_caches, args.eviction_target_ratio)?
+                    }
+                } else {
+                    cache_manager.force_evict(kv_caches, args.eviction_target_ratio)?
+                }
+            } else if let Some(acc) = score_accumulator.as_ref() {
+                if acc.is_active() {
+                    cache_manager.maybe_evict_with_scores(kv_caches, acc.importance_scores())?
+                } else {
+                    cache_manager.maybe_evict(kv_caches)?
+                }
+            } else {
+                cache_manager.maybe_evict(kv_caches)?
+            };
+
+            if result.evicted {
+                // Sliding window proxy (works for all KV types)
+                if !score_based_eviction {
+                    let metric = llm_rs2::core::proxy::compute_sliding_proxy(
+                        result.tokens_removed,
+                        before_len,
+                    );
+                    proxy_metrics.push(serde_json::json!({
+                        "step": i,
+                        "action": metric.action,
+                        "raw_value": metric.raw_value,
+                        "tokens_affected": metric.tokens_affected,
+                        "cache_pos_before": before_len,
+                        "cache_pos_after": result.new_pos,
+                    }));
+                }
+
+                start_pos = kv_caches[0].current_pos;
+                if let Some(acc) = score_accumulator.as_mut() {
+                    acc.reset();
+                }
+
+                eprintln!(
+                    "[PPL] Eviction at step {}: {} → {} tokens (removed {})",
+                    i, before_len, result.new_pos, result.tokens_removed
+                );
+            }
+        }
+
+        // Progress
+        if (i + 1) % 200 == 0 {
+            let ppl = (total_nll / nll_count as f64).exp();
+            eprintln!(
+                "[PPL] step {}/{}: NLL={:.4}, PPL={:.4}, cache_pos={}",
+                i + 1,
+                eval_tokens,
+                total_nll,
+                ppl,
+                kv_caches[0].current_pos
+            );
+        }
+    }
+
+    // ── 6. Output results ──
+    let wall_time = overall_start.elapsed().as_secs_f64();
+    let ppl = (total_nll / nll_count as f64).exp();
+    let tok_per_sec = nll_count as f64 / wall_time;
+
+    let output = serde_json::json!({
+        "ppl": ppl,
+        "total_nll": total_nll,
+        "token_count": nll_count,
+        "tokens_per_second": tok_per_sec,
+        "wall_time_s": wall_time,
+        "proxy_metrics": proxy_metrics,
+        "eviction_count": proxy_metrics.len(),
+        "config": {
+            "model": args.model_path,
+            "text_file": text_file,
+            "eviction_policy": args.eviction_policy,
+            "kv_budget": args.kv_budget,
+            "kv_type": args.kv_type,
+            "max_seq_len": max_seq_len,
+            "eviction_target_ratio": args.eviction_target_ratio,
+            "h2o_keep_ratio": args.h2o_keep_ratio,
+            "protected_prefix": protected_prefix,
+        }
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+
+    eprintln!(
+        "\n[PPL] Final: PPL={:.4}, NLL={:.4}, tokens={}, {:.1} tok/s, {:.1}s",
+        ppl, total_nll, nll_count, tok_per_sec, wall_time
     );
 
     Ok(())
