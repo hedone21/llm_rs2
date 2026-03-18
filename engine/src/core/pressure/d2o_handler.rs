@@ -822,7 +822,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -871,7 +871,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -893,7 +893,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -938,7 +938,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -970,7 +970,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
         let result = handler.handle(&mut ctx).unwrap();
         assert!(!result.is_action());
@@ -1011,7 +1011,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1062,7 +1062,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1116,7 +1116,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1278,7 +1278,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1332,7 +1332,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1399,7 +1399,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
         let result_seq = handler_seq.handle(&mut ctx_seq).unwrap();
 
@@ -1416,7 +1416,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
         let result_hm = handler_hm.handle(&mut ctx_hm).unwrap();
 

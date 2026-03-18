@@ -63,7 +63,7 @@ pub enum CacheEvent {
     /// Score distribution snapshot taken at eviction time.
     ScoreDiagnostic(ScoreSnapshot),
     /// Proxy metric computed during a lossy cache action.
-    ProxyComputed(crate::core::proxy::ProxyMetric),
+    ProxyComputed(crate::core::qcf::QcfMetric),
 }
 
 // ── Sink trait ────────────────────────────────────────────────

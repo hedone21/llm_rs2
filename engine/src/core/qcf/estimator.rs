@@ -3,7 +3,7 @@
 //! Converts raw proxy values to estimated PPL increase via offline-calibrated
 //! coefficients. Supports JSON calibration files and runtime EMA updates.
 
-use super::ProxyMetric;
+use super::QcfMetric;
 use std::collections::HashMap;
 
 /// Piecewise-linear function with one breakpoint.
@@ -134,7 +134,7 @@ impl DegradationEstimator {
     /// Estimate degradation (PPL increase) from a proxy metric.
     ///
     /// Returns `α(proxy_value)` clamped to `[0, d_max]`, with optional EMA correction.
-    pub fn estimate(&self, metric: &ProxyMetric) -> f32 {
+    pub fn estimate(&self, metric: &QcfMetric) -> f32 {
         let curve = self
             .curves
             .get(&metric.action)
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn test_estimator_defaults() {
         let est = DegradationEstimator::with_defaults(5.0);
-        let metric = ProxyMetric {
+        let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.3,
             per_head: None,
@@ -232,7 +232,7 @@ mod tests {
     #[test]
     fn test_estimator_d_max_clamp() {
         let est = DegradationEstimator::with_defaults(2.0);
-        let metric = ProxyMetric {
+        let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 5.0, // Would give d=5.0 but clamped to 2.0
             per_head: None,
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn test_estimator_unknown_action() {
         let est = DegradationEstimator::with_defaults(5.0);
-        let metric = ProxyMetric {
+        let metric = QcfMetric {
             action: "unknown_action".to_string(),
             raw_value: 0.5,
             per_head: None,
@@ -262,7 +262,7 @@ mod tests {
         curves.insert("eviction".to_string(), PiecewiseLinear::new(0.3, 2.0, 10.0));
 
         let est = DegradationEstimator::new(curves, 5.0, 0.0);
-        let metric = ProxyMetric {
+        let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.1, // Below breakpoint: 2.0 * 0.1 = 0.2
             per_head: None,
@@ -291,7 +291,7 @@ mod tests {
         assert!((correction - 1.5).abs() < 1e-5);
 
         // Now estimate with correction
-        let metric = ProxyMetric {
+        let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.3,
             per_head: None,
@@ -336,7 +336,7 @@ mod tests {
         std::fs::write(&path, json).unwrap();
 
         let est = DegradationEstimator::load(path.to_str().unwrap()).unwrap();
-        let metric = ProxyMetric {
+        let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.2,
             per_head: None,

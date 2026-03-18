@@ -1,37 +1,39 @@
-//! Proxy-based degradation estimation for lossy KV cache actions.
+//! QCF (Quality Cost Function) based degradation estimation for lossy actions.
 //!
 //! Each lossy action (H2O eviction, SnapKV compression, KIVI quantization,
-//! SWIFT layer skip) produces a `ProxyMetric` as a side effect.
-//! A `DegradationEstimator` converts proxy values to estimated PPL increase
+//! SWIFT layer skip) produces a `QcfMetric` as a side effect.
+//! A `DegradationEstimator` converts QCF values to estimated PPL increase
 //! via offline-calibrated piecewise-linear coefficients.
 
 pub mod estimator;
-pub mod eviction_proxy;
-pub mod quant_proxy;
-pub mod skip_proxy;
+pub mod eviction_qcf;
+pub mod layer_importance;
+pub mod quant_qcf;
+pub mod skip_qcf;
 
 pub use estimator::DegradationEstimator;
-pub use eviction_proxy::{compute_eviction_proxy, compute_sliding_proxy, identify_evicted_h2o};
-pub use quant_proxy::{FlushProxyParams, compute_flush_proxy};
-pub use skip_proxy::SkipProxyTracker;
+pub use eviction_qcf::{compute_eviction_qcf, compute_sliding_qcf, identify_evicted_h2o};
+pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
+pub use quant_qcf::{FlushQcfParams, compute_flush_qcf};
+pub use skip_qcf::SkipQcfTracker;
 
-/// A proxy metric collected from a single lossy action execution.
+/// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]
-pub struct ProxyMetric {
+pub struct QcfMetric {
     /// Action that produced this metric (e.g., "h2o", "snapkv", "kivi", "swift").
     pub action: String,
-    /// Aggregated proxy value in [0, 1] range (higher = more degradation).
+    /// Aggregated QCF value in [0, 1] range (higher = more degradation).
     pub raw_value: f32,
-    /// Per-head proxy values (if applicable). Layout: `[n_kv_heads]`.
+    /// Per-head QCF values (if applicable). Layout: `[n_kv_heads]`.
     pub per_head: Option<Vec<f32>>,
     /// Number of tokens affected by the action.
     pub tokens_affected: usize,
 }
 
-/// Configuration for proxy metric collection.
+/// Configuration for QCF metric collection.
 #[derive(Debug, Clone)]
-pub struct ProxyConfig {
-    /// Whether proxy collection is enabled.
+pub struct QcfConfig {
+    /// Whether QCF collection is enabled.
     pub enabled: bool,
     /// Head aggregation strategy.
     pub aggregation: AggregationMode,
@@ -41,7 +43,7 @@ pub struct ProxyConfig {
     pub epsilon: f32,
 }
 
-impl Default for ProxyConfig {
+impl Default for QcfConfig {
     fn default() -> Self {
         Self {
             enabled: true,
@@ -52,7 +54,7 @@ impl Default for ProxyConfig {
     }
 }
 
-/// Head-level proxy aggregation strategy.
+/// Head-level QCF aggregation strategy.
 #[derive(Debug, Clone)]
 pub enum AggregationMode {
     /// Simple mean across heads.
@@ -62,7 +64,7 @@ pub enum AggregationMode {
     Defensive { temperature: f32 },
 }
 
-/// Aggregate per-head proxy values into a single scalar.
+/// Aggregate per-head QCF values into a single scalar.
 ///
 /// - `Mean`: arithmetic mean.
 /// - `Defensive`: softmax-weighted mean (DefensiveKV, 2025) emphasizing worst-case heads.
@@ -107,7 +109,6 @@ mod tests {
         let values = vec![0.1, 0.1, 0.9];
         let mean = aggregate_heads(&values, &AggregationMode::Mean);
         let defensive = aggregate_heads(&values, &AggregationMode::Defensive { temperature: 0.1 });
-        // Defensive should be higher than mean (closer to 0.9)
         assert!(
             defensive > mean,
             "defensive={defensive} should > mean={mean}"

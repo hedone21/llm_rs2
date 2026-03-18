@@ -464,6 +464,7 @@ fn main() -> anyhow::Result<()> {
             score_accumulator: None,
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
 
         // Sample last token
@@ -616,6 +617,7 @@ fn main() -> anyhow::Result<()> {
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
 
         // ── Resilience checkpoint (CommandExecutor) ──────

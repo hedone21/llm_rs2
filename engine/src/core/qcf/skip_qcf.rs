@@ -3,14 +3,14 @@
 //! The proxy is `1 - acceptance_rate` (rejection rate), averaged over a
 //! sliding window. Zero additional computation — uses existing verify results.
 
-use super::ProxyMetric;
+use super::QcfMetric;
 use std::collections::VecDeque;
 
 /// Tracks SWIFT speculative decoding acceptance rates as a proxy for skip quality.
 ///
 /// Maintains a sliding window of recent `(accepted, drafted)` pairs and
 /// computes a moving-average rejection rate as the proxy value.
-pub struct SkipProxyTracker {
+pub struct SkipQcfTracker {
     /// Recent rejection rates (1 - acceptance_rate per step).
     window: VecDeque<f32>,
     /// Maximum window size for moving average.
@@ -20,7 +20,7 @@ pub struct SkipProxyTracker {
     total_drafted: usize,
 }
 
-impl SkipProxyTracker {
+impl SkipQcfTracker {
     /// Create a new tracker with the given window size (default: 50).
     pub fn new(window_size: usize) -> Self {
         Self {
@@ -47,14 +47,14 @@ impl SkipProxyTracker {
     }
 
     /// Current proxy value: moving-average rejection rate.
-    pub fn current_proxy(&self) -> ProxyMetric {
+    pub fn current_proxy(&self) -> QcfMetric {
         let raw_value = if self.window.is_empty() {
             0.0
         } else {
             self.window.iter().sum::<f32>() / self.window.len() as f32
         };
 
-        ProxyMetric {
+        QcfMetric {
             action: "swift".to_string(),
             raw_value,
             per_head: None,
@@ -84,7 +84,7 @@ impl SkipProxyTracker {
     }
 }
 
-impl Default for SkipProxyTracker {
+impl Default for SkipQcfTracker {
     fn default() -> Self {
         Self::new(50)
     }
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn test_empty_tracker() {
-        let tracker = SkipProxyTracker::new(10);
+        let tracker = SkipQcfTracker::new(10);
         let metric = tracker.current_proxy();
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.action, "swift");
@@ -105,7 +105,7 @@ mod tests {
 
     #[test]
     fn test_perfect_acceptance() {
-        let mut tracker = SkipProxyTracker::new(10);
+        let mut tracker = SkipQcfTracker::new(10);
         tracker.record(5, 5); // 100% acceptance → 0% rejection
         tracker.record(3, 3);
 
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_total_rejection() {
-        let mut tracker = SkipProxyTracker::new(10);
+        let mut tracker = SkipQcfTracker::new(10);
         tracker.record(0, 5); // 0% acceptance → 100% rejection
 
         let metric = tracker.current_proxy();
@@ -125,7 +125,7 @@ mod tests {
 
     #[test]
     fn test_partial_acceptance() {
-        let mut tracker = SkipProxyTracker::new(10);
+        let mut tracker = SkipQcfTracker::new(10);
         tracker.record(3, 5); // 60% acceptance → 40% rejection
 
         let metric = tracker.current_proxy();
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_window_rolling() {
-        let mut tracker = SkipProxyTracker::new(3);
+        let mut tracker = SkipQcfTracker::new(3);
         tracker.record(5, 5); // rejection = 0.0
         tracker.record(0, 5); // rejection = 1.0
         tracker.record(5, 5); // rejection = 0.0
@@ -161,14 +161,14 @@ mod tests {
 
     #[test]
     fn test_zero_drafted_ignored() {
-        let mut tracker = SkipProxyTracker::new(10);
+        let mut tracker = SkipQcfTracker::new(10);
         tracker.record(0, 0); // Should be ignored
         assert_eq!(tracker.window_len(), 0);
     }
 
     #[test]
     fn test_lifetime_rate() {
-        let mut tracker = SkipProxyTracker::new(10);
+        let mut tracker = SkipQcfTracker::new(10);
         tracker.record(3, 5);
         tracker.record(4, 5);
         // Lifetime: 7/10 = 0.7
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn test_reset() {
-        let mut tracker = SkipProxyTracker::new(10);
+        let mut tracker = SkipQcfTracker::new(10);
         tracker.record(3, 5);
         tracker.record(4, 5);
         tracker.reset();

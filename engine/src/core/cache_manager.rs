@@ -234,7 +234,7 @@ impl CacheManager {
             pressure_level: pressure,
             mem_available,
             target_ratio: force_target_ratio,
-            proxy_sink: None,
+            qcf_sink: None,
         };
         let results = self.pipeline.execute(&mut ctx)?;
         let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);

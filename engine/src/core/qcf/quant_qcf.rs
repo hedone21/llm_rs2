@@ -3,7 +3,7 @@
 //! NMSE = MSE(X, X') / Var(X) where X' = dequantize(quantize(X)).
 //! Computed inline during residual buffer flush when FP32 originals are available.
 
-use super::{ProxyConfig, ProxyMetric, aggregate_heads};
+use super::{QcfConfig, QcfMetric, aggregate_heads};
 use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 
 /// Compute NMSE for a single quantization group of QKKV (32) values.
@@ -49,7 +49,7 @@ pub fn compute_nmse_block(original: &[f32; QKKV], bits: u8, epsilon: f32) -> f32
 }
 
 /// Parameters for flush proxy computation.
-pub struct FlushProxyParams<'a> {
+pub struct FlushQcfParams<'a> {
     pub res_k: &'a [f32],
     pub res_v: &'a [f32],
     pub kv_heads: usize,
@@ -66,8 +66,8 @@ pub struct FlushProxyParams<'a> {
 /// `proxy = 0.6 × NMSE_K + 0.4 × NMSE_V` (Key is more sensitive per KIVI Table 2).
 ///
 /// Layout: `res_k`/`res_v` are `[kv_heads][flush_tokens][head_dim]` contiguous.
-pub fn compute_flush_proxy(params: &FlushProxyParams, config: &ProxyConfig) -> ProxyMetric {
-    let FlushProxyParams {
+pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetric {
+    let FlushQcfParams {
         res_k,
         res_v,
         kv_heads,
@@ -79,7 +79,7 @@ pub fn compute_flush_proxy(params: &FlushProxyParams, config: &ProxyConfig) -> P
     let (kv_heads, head_dim, flush_tokens, res_cap, bits) =
         (*kv_heads, *head_dim, *flush_tokens, *res_cap, *bits);
     if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 {
-        return ProxyMetric {
+        return QcfMetric {
             action: "kivi".to_string(),
             raw_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -90,7 +90,7 @@ pub fn compute_flush_proxy(params: &FlushProxyParams, config: &ProxyConfig) -> P
     let blocks_per_group = QKKV;
     let n_groups = flush_tokens / blocks_per_group;
     if n_groups == 0 {
-        return ProxyMetric {
+        return QcfMetric {
             action: "kivi".to_string(),
             raw_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -158,7 +158,7 @@ pub fn compute_flush_proxy(params: &FlushProxyParams, config: &ProxyConfig) -> P
 
     let raw_value = aggregate_heads(&per_head, &config.aggregation);
 
-    ProxyMetric {
+    QcfMetric {
         action: "kivi".to_string(),
         raw_value,
         per_head: Some(per_head),
@@ -235,8 +235,8 @@ mod tests {
         let res_k: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.01).collect();
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
-        let config = ProxyConfig::default();
-        let params = FlushProxyParams {
+        let config = QcfConfig::default();
+        let params = FlushQcfParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -245,7 +245,7 @@ mod tests {
             res_cap,
             bits: 4,
         };
-        let metric = compute_flush_proxy(&params, &config);
+        let metric = compute_flush_qcf(&params, &config);
 
         assert_eq!(metric.action, "kivi");
         assert!(metric.raw_value >= 0.0);
@@ -256,8 +256,8 @@ mod tests {
 
     #[test]
     fn test_flush_proxy_empty() {
-        let config = ProxyConfig::default();
-        let params = FlushProxyParams {
+        let config = QcfConfig::default();
+        let params = FlushQcfParams {
             res_k: &[],
             res_v: &[],
             kv_heads: 0,
@@ -266,7 +266,7 @@ mod tests {
             res_cap: 0,
             bits: 4,
         };
-        let metric = compute_flush_proxy(&params, &config);
+        let metric = compute_flush_qcf(&params, &config);
         assert_eq!(metric.raw_value, 0.0);
     }
 
@@ -281,8 +281,8 @@ mod tests {
         let res_k: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.01).collect();
         let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
 
-        let config = ProxyConfig::default();
-        let params = FlushProxyParams {
+        let config = QcfConfig::default();
+        let params = FlushQcfParams {
             res_k: &res_k,
             res_v: &res_v,
             kv_heads,
@@ -291,7 +291,7 @@ mod tests {
             res_cap,
             bits: 2,
         };
-        let metric = compute_flush_proxy(&params, &config);
+        let metric = compute_flush_qcf(&params, &config);
 
         assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
         for &h_val in metric.per_head.as_ref().unwrap() {
@@ -310,9 +310,9 @@ mod tests {
         let res_k: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
         let res_v: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
 
-        let config = ProxyConfig::default();
-        let proxy_q2 = compute_flush_proxy(
-            &FlushProxyParams {
+        let config = QcfConfig::default();
+        let proxy_q2 = compute_flush_qcf(
+            &FlushQcfParams {
                 res_k: &res_k,
                 res_v: &res_v,
                 kv_heads,
@@ -323,8 +323,8 @@ mod tests {
             },
             &config,
         );
-        let proxy_q8 = compute_flush_proxy(
-            &FlushProxyParams {
+        let proxy_q8 = compute_flush_qcf(
+            &FlushQcfParams {
                 res_k: &res_k,
                 res_v: &res_v,
                 kv_heads,

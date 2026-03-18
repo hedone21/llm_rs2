@@ -64,6 +64,9 @@ pub struct LlamaModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub profiler: Option<&'a mut crate::profile::ops::OpProfiler>,
     /// Optional SWIFT skip configuration for layer skipping.
     pub skip_config: Option<&'a crate::core::skip_config::SkipConfig>,
+    /// Optional importance collector for Layer Skip QCF.
+    /// When provided during prefill, captures per-layer cosine similarity.
+    pub importance_collector: Option<&'a mut crate::core::qcf::ImportanceCollector>,
 }
 
 impl LlamaModel {
@@ -477,6 +480,7 @@ impl LlamaModel {
 
         let mut score_accumulator = args.score_accumulator;
         let skip_config = args.skip_config;
+        let mut importance_collector = args.importance_collector;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -516,6 +520,12 @@ impl LlamaModel {
             let (s_attn, s_mlp) =
                 skip_config.map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
 
+            // Snapshot hidden state before layer for importance collection
+            if let Some(ref mut coll) = importance_collector {
+                let x_data = x.as_slice::<f32>();
+                coll.snapshot_before(x_data, seq_len, hidden_size);
+            }
+
             layer.forward(LlamaLayerForwardArgs {
                 x: &mut x,
                 kv_cache: &mut kv_caches[i],
@@ -533,6 +543,18 @@ impl LlamaModel {
                 skip_attn: s_attn,
                 skip_mlp: s_mlp,
             })?;
+
+            // Record importance after layer forward
+            if let Some(ref mut coll) = importance_collector {
+                let x_data = x.as_slice::<f32>();
+                coll.record_after(
+                    x_data,
+                    seq_len,
+                    hidden_size,
+                    i,
+                    crate::core::qcf::SubLayer::Full,
+                );
+            }
 
             // Capture attention scores for H2O/H2O+ accumulator
             if let (Some(acc), Some(ws)) = (&mut score_accumulator, &workspace)
@@ -740,6 +762,7 @@ impl LlamaModel {
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
         let use_gpu_attn = args.use_gpu_attn;
+        let _importance_collector = args.importance_collector; // unused in offload path
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];

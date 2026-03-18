@@ -3,22 +3,26 @@
 //! Shared by H2O, SnapKV, and StreamingLLM eviction actions.
 //! Formula: `proxy = Σ_evicted attn(t)×‖V(t)‖₁ / Σ_all attn(t)×‖V(t)‖₁`
 
-use super::{ProxyConfig, ProxyMetric, aggregate_heads};
+use super::{QcfConfig, QcfMetric, aggregate_heads};
 use crate::core::kv_cache::{KVCache, KVLayout};
 
 /// Compute eviction proxy from identified evicted tokens and their attention scores.
 ///
 /// Uses attention × V-norm importance: each token's contribution is
 /// `attn(t) × ‖V(t)‖₁`. The proxy is the fraction of total importance
-/// that is being removed.
+/// that is being removed:
+///
+/// `proxy = Σ_evicted attn(t)×‖V(t)‖₁ / Σ_all attn(t)×‖V(t)‖₁`
 ///
 /// `evicted`: slice of `(position, attention_score)` pairs for tokens about to be evicted.
-/// Returns a `ProxyMetric` with per-head breakdown and aggregated value.
-pub fn compute_eviction_proxy(
+/// `all_scores`: attention scores for ALL active tokens `[max_seq_len]`.
+/// Returns a `QcfMetric` with per-head breakdown and aggregated value.
+pub fn compute_eviction_qcf(
     evicted: &[(usize, f32)],
+    all_scores: &[f32],
     cache: &KVCache,
-    config: &ProxyConfig,
-) -> ProxyMetric {
+    config: &QcfConfig,
+) -> QcfMetric {
     let kv_heads = cache.kv_heads();
     let head_dim = cache.head_dim();
     let current_pos = cache.current_pos;
@@ -27,7 +31,7 @@ pub fn compute_eviction_proxy(
     let epsilon = config.epsilon;
 
     if evicted.is_empty() || current_pos == 0 || kv_heads == 0 {
-        return ProxyMetric {
+        return QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
@@ -41,18 +45,22 @@ pub fn compute_eviction_proxy(
     let mut per_head = vec![0.0f32; kv_heads];
 
     for (h, ph) in per_head.iter_mut().enumerate() {
-        // Compute total importance and evicted importance for this head
         let mut total_importance = 0.0f32;
         let mut evicted_importance = 0.0f32;
 
-        // First pass: compute V norms for all active positions
+        // First pass: compute attn(t) × ‖V(t)‖₁ for ALL active positions
         for pos in 0..current_pos {
             let offset = compute_v_offset(layout, h, pos, head_dim, capacity, kv_heads);
             let v_norm = l1_norm(&v_data[offset..offset + head_dim]);
-            total_importance += v_norm;
+            let attn = if pos < all_scores.len() {
+                all_scores[pos]
+            } else {
+                0.0
+            };
+            total_importance += attn * v_norm;
         }
 
-        // Second pass: compute evicted importance (attn × v_norm)
+        // Second pass: compute attn(t) × ‖V(t)‖₁ for evicted tokens
         for &(pos, attn_score) in evicted {
             if pos < current_pos {
                 let offset = compute_v_offset(layout, h, pos, head_dim, capacity, kv_heads);
@@ -61,16 +69,8 @@ pub fn compute_eviction_proxy(
             }
         }
 
-        // Normalize: attn-weighted V norm of evicted / total V norm
-        let avg_attn = if !evicted.is_empty() {
-            evicted.iter().map(|(_, s)| s).sum::<f32>() / evicted.len() as f32
-        } else {
-            1.0
-        };
-        let total_weighted = total_importance * avg_attn;
-
-        *ph = if total_weighted > epsilon {
-            (evicted_importance / total_weighted).clamp(0.0, 1.0)
+        *ph = if total_importance > epsilon {
+            (evicted_importance / total_importance).clamp(0.0, 1.0)
         } else {
             0.0
         };
@@ -78,7 +78,7 @@ pub fn compute_eviction_proxy(
 
     let raw_value = aggregate_heads(&per_head, &config.aggregation);
 
-    ProxyMetric {
+    QcfMetric {
         action: "eviction".to_string(),
         raw_value,
         per_head: Some(per_head),
@@ -90,14 +90,14 @@ pub fn compute_eviction_proxy(
 ///
 /// `proxy = prune_count / total_active` — fraction of active tokens removed.
 /// No V-buffer access needed since sliding window is position-based.
-pub fn compute_sliding_proxy(prune_count: usize, total_active: usize) -> ProxyMetric {
+pub fn compute_sliding_qcf(prune_count: usize, total_active: usize) -> QcfMetric {
     let raw_value = if total_active > 0 {
         (prune_count as f32 / total_active as f32).clamp(0.0, 1.0)
     } else {
         0.0
     };
 
-    ProxyMetric {
+    QcfMetric {
         action: "sliding".to_string(),
         raw_value,
         per_head: None,
@@ -191,7 +191,7 @@ mod tests {
     use crate::buffer::shared_buffer::SharedBuffer;
     use crate::core::buffer::{Buffer, DType};
     use crate::core::kv_cache::KVLayout;
-    use crate::core::proxy::AggregationMode;
+    use crate::core::qcf::AggregationMode;
     use crate::core::shape::Shape;
     use crate::core::tensor::Tensor;
     use std::sync::Arc;
@@ -249,14 +249,16 @@ mod tests {
         let cache =
             make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
 
-        let config = ProxyConfig::default();
+        let config = QcfConfig::default();
         // Evict 2 tokens (positions 2 and 3) with equal attention scores
+        // All tokens have uniform attn=1.0
+        let all_scores = vec![1.0f32; num_tokens];
         let evicted = vec![(2, 1.0), (3, 1.0)];
-        let metric = compute_eviction_proxy(&evicted, &cache, &config);
+        let metric = compute_eviction_qcf(&evicted, &all_scores, &cache, &config);
 
         assert_eq!(metric.action, "eviction");
         assert_eq!(metric.tokens_affected, 2);
-        // With uniform V norms: proxy = 2/8 = 0.25
+        // With uniform V norms and uniform attn: proxy = 2/8 = 0.25
         assert!(
             (metric.raw_value - 0.25).abs() < 0.01,
             "expected ~0.25, got {}",
@@ -272,8 +274,9 @@ mod tests {
         let v_data = vec![1.0f32; max_seq * kv_heads * head_dim];
         let cache = make_cache_with_v_data(kv_heads, head_dim, 10, KVLayout::HeadMajor, &v_data);
 
-        let config = ProxyConfig::default();
-        let metric = compute_eviction_proxy(&[], &cache, &config);
+        let config = QcfConfig::default();
+        let all_scores = vec![1.0f32; 10];
+        let metric = compute_eviction_qcf(&[], &all_scores, &cache, &config);
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.tokens_affected, 0);
     }
@@ -300,12 +303,13 @@ mod tests {
 
         let cache =
             make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
-        let config = ProxyConfig::default();
+        let config = QcfConfig::default();
+        let all_scores = vec![1.0f32; num_tokens];
 
         // Evict high-norm tokens → higher proxy
-        let metric_high = compute_eviction_proxy(&[(2, 1.0), (3, 1.0)], &cache, &config);
+        let metric_high = compute_eviction_qcf(&[(2, 1.0), (3, 1.0)], &all_scores, &cache, &config);
         // Evict low-norm tokens → lower proxy
-        let metric_low = compute_eviction_proxy(&[(0, 1.0), (1, 1.0)], &cache, &config);
+        let metric_low = compute_eviction_qcf(&[(0, 1.0), (1, 1.0)], &all_scores, &cache, &config);
 
         assert!(
             metric_high.raw_value > metric_low.raw_value,
@@ -317,7 +321,7 @@ mod tests {
 
     #[test]
     fn test_sliding_proxy() {
-        let metric = compute_sliding_proxy(10, 100);
+        let metric = compute_sliding_qcf(10, 100);
         assert_eq!(metric.action, "sliding");
         assert!((metric.raw_value - 0.1).abs() < 1e-6);
         assert_eq!(metric.tokens_affected, 10);
@@ -325,13 +329,13 @@ mod tests {
 
     #[test]
     fn test_sliding_proxy_zero_total() {
-        let metric = compute_sliding_proxy(0, 0);
+        let metric = compute_sliding_qcf(0, 0);
         assert_eq!(metric.raw_value, 0.0);
     }
 
     #[test]
     fn test_sliding_proxy_full_eviction() {
-        let metric = compute_sliding_proxy(50, 50);
+        let metric = compute_sliding_qcf(50, 50);
         assert!((metric.raw_value - 1.0).abs() < 1e-6);
     }
 
@@ -394,12 +398,56 @@ mod tests {
 
         let cache =
             make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::SeqMajor, &v_data);
-        let config = ProxyConfig::default();
+        let config = QcfConfig::default();
+        let all_scores = vec![1.0f32; num_tokens];
         let evicted = vec![(1, 1.0)];
-        let metric = compute_eviction_proxy(&evicted, &cache, &config);
+        let metric = compute_eviction_qcf(&evicted, &all_scores, &cache, &config);
 
         assert!(metric.raw_value > 0.0);
         assert!(metric.raw_value <= 1.0);
         assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
+    }
+
+    #[test]
+    fn test_eviction_proxy_nonuniform_attn_scores() {
+        // Verify that all_scores affects the denominator correctly
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 4;
+        let max_seq = 64;
+
+        // All tokens have same V norm = 4.0
+        let mut v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
+        for t in 0..num_tokens {
+            for d in 0..head_dim {
+                v_data[t * head_dim + d] = 1.0;
+            }
+        }
+
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+
+        // Token 0 has very high attn score in all_scores
+        // Evict token 0 (high attn) vs token 1 (low attn)
+        let all_scores = vec![10.0, 1.0, 1.0, 1.0];
+
+        // Evict token 0 (attn=10.0): evicted_imp = 10*4 = 40, total_imp = 10*4+1*4+1*4+1*4 = 52
+        let metric_high = compute_eviction_qcf(&[(0, 10.0)], &all_scores, &cache, &config);
+        // Evict token 1 (attn=1.0): evicted_imp = 1*4 = 4, total_imp = 52
+        let metric_low = compute_eviction_qcf(&[(1, 1.0)], &all_scores, &cache, &config);
+
+        assert!(
+            metric_high.raw_value > metric_low.raw_value,
+            "evicting high-attn token ({}) should > low-attn ({})",
+            metric_high.raw_value,
+            metric_low.raw_value
+        );
+        // metric_high ≈ 40/52 ≈ 0.769
+        assert!(
+            (metric_high.raw_value - 40.0 / 52.0).abs() < 0.01,
+            "expected ~0.769, got {}",
+            metric_high.raw_value
+        );
     }
 }

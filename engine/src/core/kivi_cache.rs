@@ -157,7 +157,7 @@ pub struct KiviCache {
     group_size: usize,
 
     /// Last flush proxy metric (NMSE). Set during `flush_residual()`.
-    last_flush_proxy: Option<crate::core::proxy::ProxyMetric>,
+    last_flush_proxy: Option<crate::core::qcf::QcfMetric>,
 }
 
 impl KiviCache {
@@ -230,8 +230,8 @@ impl KiviCache {
 
     /// Take the last flush proxy metric (NMSE), consuming it.
     ///
-    /// Returns `Some(ProxyMetric)` if a flush occurred since the last call.
-    pub fn take_flush_proxy(&mut self) -> Option<crate::core::proxy::ProxyMetric> {
+    /// Returns `Some(QcfMetric)` if a flush occurred since the last call.
+    pub fn take_flush_proxy(&mut self) -> Option<crate::core::qcf::QcfMetric> {
         self.last_flush_proxy.take()
     }
 
@@ -276,8 +276,8 @@ impl KiviCache {
         let flush_tokens = n_groups * gs;
 
         // Compute NMSE proxy before quantization (FP32 originals still available)
-        let proxy_config = crate::core::proxy::ProxyConfig::default();
-        let proxy_params = crate::core::proxy::FlushProxyParams {
+        let qcf_config = crate::core::qcf::QcfConfig::default();
+        let proxy_params = crate::core::qcf::FlushQcfParams {
             res_k: &self.res_k,
             res_v: &self.res_v,
             kv_heads: self.kv_heads,
@@ -286,9 +286,9 @@ impl KiviCache {
             res_cap: self.res_cap,
             bits: self.bits,
         };
-        self.last_flush_proxy = Some(crate::core::proxy::compute_flush_proxy(
+        self.last_flush_proxy = Some(crate::core::qcf::compute_flush_qcf(
             &proxy_params,
-            &proxy_config,
+            &qcf_config,
         ));
 
         // === Key: per-channel quantization ===

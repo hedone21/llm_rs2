@@ -818,6 +818,7 @@ fn main() -> anyhow::Result<()> {
             score_accumulator: None, // No score tracking during prefill
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
@@ -1009,6 +1010,7 @@ fn main() -> anyhow::Result<()> {
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
                     skip_config: None,
+                    importance_collector: None,
                 })?;
 
                 // Rebuild plan after fallback (KV cache may have grown)
@@ -1847,6 +1849,7 @@ fn run_eval_ll(
                 score_accumulator: None,
                 profiler: None,
                 skip_config: None,
+                importance_collector: None,
             })?;
 
             let mut start_pos = first_chunk_len;
@@ -1885,6 +1888,7 @@ fn run_eval_ll(
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: None,
                     skip_config: None,
+                    importance_collector: None,
                 })?;
                 start_pos += 1;
 
@@ -1950,6 +1954,7 @@ fn run_eval_ll(
                 score_accumulator: None,
                 profiler: None,
                 skip_config: None,
+                importance_collector: None,
             })?;
 
             start_pos_after_prompt = prompt_len;
@@ -2018,6 +2023,7 @@ fn run_eval_ll(
                         score_accumulator: None,
                         profiler: None,
                         skip_config: None,
+                        importance_collector: None,
                     })?;
                     sp += 1;
 
@@ -2280,6 +2286,7 @@ fn run_kivi_eval_ll(
             score_accumulator: None,
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
 
         let start_pos_after_prompt = prompt_len;
@@ -2348,6 +2355,7 @@ fn run_kivi_eval_ll(
                         score_accumulator: None,
                         profiler: None,
                         skip_config: None,
+                        importance_collector: None,
                     })?;
                     sp += 1;
 
@@ -2573,6 +2581,7 @@ fn run_kivi(
             score_accumulator: None,
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2663,6 +2672,7 @@ fn run_kivi(
             score_accumulator: None,
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -2941,6 +2951,7 @@ fn run_offload(
             score_accumulator: None,
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
 
         // Sample last token from prefill logits
@@ -3036,6 +3047,7 @@ fn run_offload(
                 score_accumulator: None,
                 profiler: None,
                 skip_config: None,
+                importance_collector: None,
             },
             &mut prefetch,
         )?;
@@ -3150,7 +3162,7 @@ fn run_ppl(
     score_based_eviction: bool,
     protected_prefix: usize,
 ) -> anyhow::Result<()> {
-    use llm_rs2::core::proxy::{ProxyConfig, ProxyMetric};
+    use llm_rs2::core::qcf::{QcfConfig, QcfMetric};
 
     // ── 1. Read and tokenize reference text ──
     let text = std::fs::read_to_string(text_file)
@@ -3241,13 +3253,16 @@ fn run_ppl(
     };
 
     if has_budget {
-        eprintln!("[PPL] Effective budget: {} tokens (deterministic eviction)", effective_budget);
+        eprintln!(
+            "[PPL] Effective budget: {} tokens (deterministic eviction)",
+            effective_budget
+        );
     }
 
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
-    let mut proxy_metrics: Vec<serde_json::Value> = Vec::new();
-    let proxy_config = ProxyConfig::default();
+    let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
+    let qcf_config = QcfConfig::default();
     let overall_start = std::time::Instant::now();
 
     // ── 4. Prefill phase ──
@@ -3290,6 +3305,7 @@ fn run_ppl(
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
 
         // Read all prefill logits to CPU
@@ -3351,6 +3367,7 @@ fn run_ppl(
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
             skip_config: None,
+            importance_collector: None,
         })?;
         start_pos += 1;
 
@@ -3379,23 +3396,21 @@ fn run_ppl(
                         let scores = acc.importance_scores();
                         // Pre-identify evicted tokens for proxy
                         let target_len = ((before_len as f32) * ratio) as usize;
-                        let evicted = llm_rs2::core::proxy::identify_evicted_h2o(
+                        let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
                             scores,
                             protected_prefix,
                             args.h2o_keep_ratio,
                             before_len,
                             target_len,
                         );
-                        if !evicted.is_empty()
-                            && args.kv_type == "f32"
-                            && !kv_caches.is_empty()
-                        {
-                            let metric = llm_rs2::core::proxy::compute_eviction_proxy(
+                        if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty() {
+                            let metric = llm_rs2::core::qcf::compute_eviction_qcf(
                                 &evicted,
+                                scores,
                                 &kv_caches[0],
-                                &proxy_config,
+                                &qcf_config,
                             );
-                            proxy_metrics.push(serde_json::json!({
+                            qcf_metrics.push(serde_json::json!({
                                 "step": i,
                                 "action": metric.action,
                                 "raw_value": metric.raw_value,
@@ -3411,11 +3426,9 @@ fn run_ppl(
                     // Sliding window: position-based proxy
                     let r = cache_manager.force_evict(kv_caches, ratio)?;
                     if r.evicted {
-                        let metric = llm_rs2::core::proxy::compute_sliding_proxy(
-                            r.tokens_removed,
-                            before_len,
-                        );
-                        proxy_metrics.push(serde_json::json!({
+                        let metric =
+                            llm_rs2::core::qcf::compute_sliding_qcf(r.tokens_removed, before_len);
+                        qcf_metrics.push(serde_json::json!({
                             "step": i,
                             "action": metric.action,
                             "raw_value": metric.raw_value,
@@ -3465,8 +3478,8 @@ fn run_ppl(
         "token_count": nll_count,
         "tokens_per_second": tok_per_sec,
         "wall_time_s": wall_time,
-        "proxy_metrics": proxy_metrics,
-        "eviction_count": proxy_metrics.len(),
+        "qcf_metrics": qcf_metrics,
+        "eviction_count": qcf_metrics.len(),
         "config": {
             "model": args.model_path,
             "text_file": text_file,

@@ -55,7 +55,7 @@ mod tests {
             pressure_level: PressureLevel::Critical,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
         let result = handler.handle(&mut ctx).unwrap();
         assert!(!result.is_action());

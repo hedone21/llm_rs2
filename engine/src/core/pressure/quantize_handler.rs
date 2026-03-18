@@ -81,7 +81,7 @@ mod tests {
             pressure_level: PressureLevel::Warning,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
         let result = handler.handle(&mut ctx).unwrap();
         // Returns NoOp because standard KVCache doesn't support bit transition

@@ -8,7 +8,7 @@
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
 use crate::core::math_utils::{avg_pool_1d, topk_indices_per_head};
-use crate::core::proxy::ProxyConfig;
+use crate::core::qcf::QcfConfig;
 use anyhow::Result;
 
 /// SnapKV-based one-shot KV cache compression.
@@ -23,7 +23,7 @@ pub struct SnapKVHandler {
     /// 1D average pooling kernel size for vote smoothing. Default: 5.
     pub kernel_size: usize,
     /// Optional proxy config for degradation estimation.
-    pub proxy_config: Option<ProxyConfig>,
+    pub qcf_config: Option<QcfConfig>,
 }
 
 impl Default for SnapKVHandler {
@@ -32,7 +32,7 @@ impl Default for SnapKVHandler {
             window_size: 32,
             max_capacity: 1024,
             kernel_size: 5,
-            proxy_config: None,
+            qcf_config: None,
         }
     }
 }
@@ -43,13 +43,13 @@ impl SnapKVHandler {
             window_size,
             max_capacity,
             kernel_size,
-            proxy_config: None,
+            qcf_config: None,
         }
     }
 
     /// Enable proxy metric collection.
-    pub fn with_proxy(mut self, config: ProxyConfig) -> Self {
-        self.proxy_config = Some(config);
+    pub fn with_qcf(mut self, config: QcfConfig) -> Self {
+        self.qcf_config = Some(config);
         self
     }
 }
@@ -110,9 +110,9 @@ impl CachePressureHandler for SnapKVHandler {
             };
 
             // Compute proxy before compression (V buffer still intact)
-            if let Some(ref proxy_cfg) = self.proxy_config
-                && proxy_cfg.enabled
-                && let Some(ref mut sink) = ctx.proxy_sink
+            if let Some(ref qcf_cfg) = self.qcf_config
+                && qcf_cfg.enabled
+                && let Some(ref mut sink) = ctx.qcf_sink
             {
                 // Build set of kept positions (union across heads)
                 let mut kept = vec![false; prefix_len];
@@ -135,8 +135,10 @@ impl CachePressureHandler for SnapKVHandler {
                     })
                     .collect();
                 if !evicted.is_empty() {
-                    let mut metric =
-                        crate::core::proxy::compute_eviction_proxy(&evicted, cache, proxy_cfg);
+                    let all_scores = ctx.importance.unwrap_or(&[]);
+                    let mut metric = crate::core::qcf::compute_eviction_qcf(
+                        &evicted, all_scores, cache, qcf_cfg,
+                    );
                     metric.action = "snapkv".to_string();
                     sink.push(metric);
                 }
@@ -244,7 +246,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -271,7 +273,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -295,7 +297,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -334,7 +336,7 @@ mod tests {
             pressure_level: PressureLevel::Emergency,
             mem_available: 0,
             target_ratio: None,
-            proxy_sink: None,
+            qcf_sink: None,
         };
 
         handler.handle(&mut ctx).unwrap();
