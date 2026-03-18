@@ -1,0 +1,1363 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-3b
+[Config] Weight dtype: F16
+Shard index: 254 tensors across 2 shards
+Loading 2 safetensors shards...
+lm_head not found, using embed_tokens as lm_head...
+Prompt: Hello, world! I am a
+Token Length: 8
+Model config: layers=28, kv_heads=8, head_dim=128, max_seq_len=2048
+KV cache type: F32, layout: HeadMajor (initial capacity: 2048 tokens, 8388608B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+Eviction: policy=streaming, window=1600, prefix=4, ratio=0.75, threshold=256MB
+[PPL] Warning: text has 2757 tokens, truncating to max_seq_len=2048
+[PPL] 2048 tokens, policy=streaming, kv_budget=1600, kv_type=f32
+[PPL] Effective budget: 1600 tokens (deterministic eviction)
+[PPL] Prefill: 1600 tokens
+[PPL] Prefill NLL: 3043.6719, count=1599, running PPL=6.7092
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1600: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1601: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1602: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1603: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1604: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1605: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1606: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1607: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1608: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1609: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1610: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1611: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1612: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1613: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1614: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1615: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1616: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1617: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1618: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1619: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1620: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1621: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1622: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1623: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1624: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1625: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1626: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1627: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1628: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1629: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1630: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1631: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1632: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1633: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1634: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1635: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1636: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1637: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1638: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1639: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1640: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1641: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1642: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1643: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1644: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1645: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1646: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1647: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1648: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1649: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1650: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1651: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1652: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1653: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1654: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1655: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1656: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1657: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1658: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1659: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1660: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1661: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1662: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1663: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1664: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1665: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1666: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1667: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1668: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1669: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1670: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1671: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1672: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1673: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1674: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1675: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1676: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1677: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1678: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1679: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1680: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1681: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1682: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1683: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1684: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1685: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1686: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1687: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1688: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1689: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1690: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1691: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1692: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1693: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1694: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1695: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1696: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1697: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1698: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1699: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1700: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1701: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1702: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1703: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1704: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1705: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1706: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1707: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1708: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1709: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1710: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1711: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1712: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1713: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1714: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1715: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1716: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1717: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1718: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1719: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1720: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1721: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1722: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1723: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1724: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1725: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1726: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1727: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1728: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1729: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1730: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1731: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1732: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1733: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1734: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1735: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1736: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1737: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1738: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1739: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1740: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1741: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1742: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1743: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1744: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1745: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1746: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1747: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1748: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1749: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1750: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1751: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1752: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1753: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1754: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1755: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1756: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1757: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1758: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1759: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1760: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1761: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1762: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1763: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1764: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1765: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1766: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1767: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1768: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1769: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1770: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1771: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1772: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1773: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1774: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1775: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1776: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1777: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1778: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1779: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1780: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1781: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1782: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1783: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1784: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1785: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1786: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1787: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1788: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1789: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1790: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1791: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1792: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1793: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1794: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1795: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1796: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1797: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1798: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1799: 1601 → 1600 tokens (removed 1)
+[PPL] step 1800/2048: NLL=3950.6316, PPL=8.9891, cache_pos=1600
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1800: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1801: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1802: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1803: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1804: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1805: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1806: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1807: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1808: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1809: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1810: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1811: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1812: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1813: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1814: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1815: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1816: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1817: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1818: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1819: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1820: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1821: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1822: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1823: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1824: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1825: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1826: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1827: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1828: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1829: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1830: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1831: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1832: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1833: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1834: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1835: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1836: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1837: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1838: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1839: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1840: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1841: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1842: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1843: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1844: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1845: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1846: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1847: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1848: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1849: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1850: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1851: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1852: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1853: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1854: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1855: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1856: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1857: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1858: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1859: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1860: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1861: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1862: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1863: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1864: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1865: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1866: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1867: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1868: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1869: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1870: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1871: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1872: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1873: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1874: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1875: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1876: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1877: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1878: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1879: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1880: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1881: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1882: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1883: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1884: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1885: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1886: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1887: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1888: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1889: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1890: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1891: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1892: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1893: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1894: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1895: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1896: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1897: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1898: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1899: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1900: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1901: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1902: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1903: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1904: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1905: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1906: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1907: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1908: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1909: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1910: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1911: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1912: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1913: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1914: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1915: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1916: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1917: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1918: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1919: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1920: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1921: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1922: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1923: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1924: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1925: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1926: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1927: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1928: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1929: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1930: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1931: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1932: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1933: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1934: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1935: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1936: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1937: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1938: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1939: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1940: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1941: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1942: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1943: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1944: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1945: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1946: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1947: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1948: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1949: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1950: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1951: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1952: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1953: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1954: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1955: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1956: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1957: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1958: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1959: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1960: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1961: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1962: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1963: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1964: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1965: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1966: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1967: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1968: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1969: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1970: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1971: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1972: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1973: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1974: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1975: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1976: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1977: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1978: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1979: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1980: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1981: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1982: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1983: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1984: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1985: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1986: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1987: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1988: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1989: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1990: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1991: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1992: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1993: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1994: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1995: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1996: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1997: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1998: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 1999: 1601 → 1600 tokens (removed 1)
+[PPL] step 2000/2048: NLL=5009.0849, PPL=12.2533, cache_pos=1600
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2000: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2001: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2002: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2003: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2004: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2005: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2006: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2007: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2008: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2009: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2010: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2011: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2012: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2013: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2014: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2015: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2016: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2017: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2018: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2019: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2020: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2021: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2022: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2023: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2024: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2025: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2026: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2027: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2028: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2029: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2030: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2031: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2032: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2033: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2034: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2035: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2036: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2037: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2038: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2039: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2040: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2041: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2042: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2043: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2044: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2045: 1601 → 1600 tokens (removed 1)
+[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='sliding_window@Warning', removed=1, new_pos=1600
+[PPL] Eviction at step 2046: 1601 → 1600 tokens (removed 1)
+
+[PPL] Final: PPL=12.5598, NLL=5177.4083, tokens=2046, 11.9 tok/s, 171.8s

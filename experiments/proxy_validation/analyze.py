@@ -17,7 +17,7 @@ def analyze_model(model_dir: str, model_name: str):
     print(f"{'='*60}")
 
     results = {}
-    for policy in ["sliding", "h2o"]:
+    for policy in ["sliding", "h2o", "d2o", "streaming", "h2o_plus"]:
         policy_results = []
         for f in sorted(glob.glob(f"{model_dir}/{policy}_*.json")):
             try:

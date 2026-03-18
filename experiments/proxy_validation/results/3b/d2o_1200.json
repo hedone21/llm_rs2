@@ -1,0 +1,5950 @@
+{
+  "config": {
+    "eviction_policy": "d2o",
+    "eviction_target_ratio": 0.75,
+    "h2o_keep_ratio": 0.5,
+    "kv_budget": 1200,
+    "kv_type": "f32",
+    "max_seq_len": 2048,
+    "model": "models/llama3.2-3b",
+    "protected_prefix": 4,
+    "text_file": "experiments/proxy_validation/texts/eval_text.txt"
+  },
+  "eviction_count": 847,
+  "ppl": 29.700075257368198,
+  "proxy_metrics": [
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010971326846629381,
+      "step": 1200,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010979052167385817,
+      "step": 1201,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010281468275934458,
+      "step": 1202,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005474773934110999,
+      "step": 1203,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005474414210766554,
+      "step": 1204,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010017408058047295,
+      "step": 1205,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010271745268255472,
+      "step": 1206,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009630100685171783,
+      "step": 1207,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00041928491555154324,
+      "step": 1208,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001144104404374957,
+      "step": 1209,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005479355459101498,
+      "step": 1210,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001024855999276042,
+      "step": 1211,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011018429649993777,
+      "step": 1212,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006078639416955411,
+      "step": 1213,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00038832033169455826,
+      "step": 1214,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007675389642827213,
+      "step": 1215,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001141316257417202,
+      "step": 1216,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005737090250477195,
+      "step": 1217,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010385019704699516,
+      "step": 1218,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005453272024169564,
+      "step": 1219,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010302276350557804,
+      "step": 1220,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007405875949189067,
+      "step": 1221,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010567029239609838,
+      "step": 1222,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010485327802598476,
+      "step": 1223,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00048554677050560713,
+      "step": 1224,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007404275820590556,
+      "step": 1225,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000600838044192642,
+      "step": 1226,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00109586538746953,
+      "step": 1227,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004983501858077943,
+      "step": 1228,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011463694972917438,
+      "step": 1229,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005684432107955217,
+      "step": 1230,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005683150957338512,
+      "step": 1231,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010129548609256744,
+      "step": 1232,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001036457484588027,
+      "step": 1233,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001064617303200066,
+      "step": 1234,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008546111057512462,
+      "step": 1235,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010582137620076537,
+      "step": 1236,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005746780661866069,
+      "step": 1237,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005691485712304711,
+      "step": 1238,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010214160429313779,
+      "step": 1239,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008504277211613953,
+      "step": 1240,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005466239526867867,
+      "step": 1241,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001225416548550129,
+      "step": 1242,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006095157004892826,
+      "step": 1243,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001087751123122871,
+      "step": 1244,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00107598549220711,
+      "step": 1245,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005497889360412955,
+      "step": 1246,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009818621911108494,
+      "step": 1247,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010740704601630569,
+      "step": 1248,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006565648363903165,
+      "step": 1249,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011328579857945442,
+      "step": 1250,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005701307090930641,
+      "step": 1251,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010745765175670385,
+      "step": 1252,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010473739821463823,
+      "step": 1253,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010506227845326066,
+      "step": 1254,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004989745211787522,
+      "step": 1255,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011075182119384408,
+      "step": 1256,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012224498204886913,
+      "step": 1257,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000876539561431855,
+      "step": 1258,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005228638765402138,
+      "step": 1259,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006662699161097407,
+      "step": 1260,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005228855879977345,
+      "step": 1261,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012003373121842742,
+      "step": 1262,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001002536853775382,
+      "step": 1263,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011338426265865564,
+      "step": 1264,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010879365727305412,
+      "step": 1265,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010690598282963037,
+      "step": 1266,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005712156416848302,
+      "step": 1267,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010303399758413434,
+      "step": 1268,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011090117041021585,
+      "step": 1269,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009798927931115031,
+      "step": 1270,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010088852141052485,
+      "step": 1271,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006247565615922213,
+      "step": 1272,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010799674782902002,
+      "step": 1273,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005717501044273376,
+      "step": 1274,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000928746594581753,
+      "step": 1275,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010149312438443303,
+      "step": 1276,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009581382037140429,
+      "step": 1277,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001106384675949812,
+      "step": 1278,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008445482235401869,
+      "step": 1279,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00066936737857759,
+      "step": 1280,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007820142200216651,
+      "step": 1281,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000978368683718145,
+      "step": 1282,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009644057718105614,
+      "step": 1283,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008304286166094244,
+      "step": 1284,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006678900681436062,
+      "step": 1285,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00042244550422765315,
+      "step": 1286,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010462106438353658,
+      "step": 1287,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010093215387314558,
+      "step": 1288,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005697486340068281,
+      "step": 1289,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000819520908407867,
+      "step": 1290,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001086739357560873,
+      "step": 1291,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008440347155556083,
+      "step": 1292,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008272878476418555,
+      "step": 1293,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010150533635169268,
+      "step": 1294,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000872153090313077,
+      "step": 1295,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010547047713771462,
+      "step": 1296,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010544200194999576,
+      "step": 1297,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005256613367237151,
+      "step": 1298,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007770527736283839,
+      "step": 1299,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010211978806182742,
+      "step": 1300,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006647330010309815,
+      "step": 1301,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005734519218094647,
+      "step": 1302,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00088446622248739,
+      "step": 1303,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005226967041380703,
+      "step": 1304,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010931321885436773,
+      "step": 1305,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010904830414801836,
+      "step": 1306,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005512380157597363,
+      "step": 1307,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005263761267997324,
+      "step": 1308,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011570134665817022,
+      "step": 1309,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010254583321511745,
+      "step": 1310,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006708515575155616,
+      "step": 1311,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005265361396595836,
+      "step": 1312,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010198194067925215,
+      "step": 1313,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005747057148255408,
+      "step": 1314,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00043996176100336015,
+      "step": 1315,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008362935623154044,
+      "step": 1316,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009209941490553319,
+      "step": 1317,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008944729925133288,
+      "step": 1318,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010225841542705894,
+      "step": 1319,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000858148152474314,
+      "step": 1320,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009379519615322351,
+      "step": 1321,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000960910227149725,
+      "step": 1322,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011085385922342539,
+      "step": 1323,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000717214890755713,
+      "step": 1324,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006721124518662691,
+      "step": 1325,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005746617680415511,
+      "step": 1326,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010232498170807958,
+      "step": 1327,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010921976063400507,
+      "step": 1328,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000899262260645628,
+      "step": 1329,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009591909474693239,
+      "step": 1330,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010180938988924026,
+      "step": 1331,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001017726375721395,
+      "step": 1332,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009731141617521644,
+      "step": 1333,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007169486489146948,
+      "step": 1334,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010610255412757397,
+      "step": 1335,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007259069243445992,
+      "step": 1336,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007494358578696847,
+      "step": 1337,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005751196295022964,
+      "step": 1338,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005520741106010973,
+      "step": 1339,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005750139243900776,
+      "step": 1340,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001032424159348011,
+      "step": 1341,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007175290957093239,
+      "step": 1342,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000917886383831501,
+      "step": 1343,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010335356928408146,
+      "step": 1344,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010505699319764972,
+      "step": 1345,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00047210551565513015,
+      "step": 1346,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000766780402045697,
+      "step": 1347,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007465635426342487,
+      "step": 1348,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006403965526260436,
+      "step": 1349,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008060702821239829,
+      "step": 1350,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010488751577213407,
+      "step": 1351,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009990407852455974,
+      "step": 1352,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010404320200905204,
+      "step": 1353,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006405463791452348,
+      "step": 1354,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010235216468572617,
+      "step": 1355,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011240120511502028,
+      "step": 1356,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008665908244438469,
+      "step": 1357,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006201149662956595,
+      "step": 1358,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005280785844661295,
+      "step": 1359,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005531311617232859,
+      "step": 1360,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004962725797668099,
+      "step": 1361,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001020168187096715,
+      "step": 1362,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005241808830760419,
+      "step": 1363,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010957919294014573,
+      "step": 1364,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011002710089087486,
+      "step": 1365,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005762117216363549,
+      "step": 1366,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009801809210330248,
+      "step": 1367,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001022682641632855,
+      "step": 1368,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00044128624722361565,
+      "step": 1369,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006173510337248445,
+      "step": 1370,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011237263679504395,
+      "step": 1371,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010176937794312835,
+      "step": 1372,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005244165076874197,
+      "step": 1373,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005762720829807222,
+      "step": 1374,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009594178991392255,
+      "step": 1375,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000576044141780585,
+      "step": 1376,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009809924522414804,
+      "step": 1377,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007631576736457646,
+      "step": 1378,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009588774992153049,
+      "step": 1379,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009687753045000136,
+      "step": 1380,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009854226373136044,
+      "step": 1381,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005762921646237373,
+      "step": 1382,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001134394551627338,
+      "step": 1383,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000528356118593365,
+      "step": 1384,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005731647834181786,
+      "step": 1385,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005706765805371106,
+      "step": 1386,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005280639161355793,
+      "step": 1387,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009951181709766388,
+      "step": 1388,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009556483128108084,
+      "step": 1389,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004369084199424833,
+      "step": 1390,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001046603312715888,
+      "step": 1391,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004552480240818113,
+      "step": 1392,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001020848867483437,
+      "step": 1393,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004755052214022726,
+      "step": 1394,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010334658436477184,
+      "step": 1395,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010001942282542586,
+      "step": 1396,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006414276431314647,
+      "step": 1397,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009147217497229576,
+      "step": 1398,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001135517843067646,
+      "step": 1399,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004685019957832992,
+      "step": 1400,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000528219505213201,
+      "step": 1401,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011496226070448756,
+      "step": 1402,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006412813090719283,
+      "step": 1403,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011242955224588513,
+      "step": 1404,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008237665169872344,
+      "step": 1405,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007709084893576801,
+      "step": 1406,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011096871457993984,
+      "step": 1407,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008652690448798239,
+      "step": 1408,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011132428189739585,
+      "step": 1409,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00111617601942271,
+      "step": 1410,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008356355247087777,
+      "step": 1411,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011018422665074468,
+      "step": 1412,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005772265139967203,
+      "step": 1413,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007918415940366685,
+      "step": 1414,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008157208212651312,
+      "step": 1415,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010133016621693969,
+      "step": 1416,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010163336992263794,
+      "step": 1417,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009509552619419992,
+      "step": 1418,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000992049928754568,
+      "step": 1419,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010729753412306309,
+      "step": 1420,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010343051981180906,
+      "step": 1421,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011452595936134458,
+      "step": 1422,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00048722419887781143,
+      "step": 1423,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011048781452700496,
+      "step": 1424,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010961178923025727,
+      "step": 1425,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001077052322216332,
+      "step": 1426,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012306190328672528,
+      "step": 1427,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005788412527181208,
+      "step": 1428,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00044128368608653545,
+      "step": 1429,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008208653307519853,
+      "step": 1430,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005785662797279656,
+      "step": 1431,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010056117316707969,
+      "step": 1432,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010641044937074184,
+      "step": 1433,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010963056702166796,
+      "step": 1434,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012258978094905615,
+      "step": 1435,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010950014693662524,
+      "step": 1436,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000574045698158443,
+      "step": 1437,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005306913517415524,
+      "step": 1438,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005848032888025045,
+      "step": 1439,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001130811870098114,
+      "step": 1440,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010002405615523458,
+      "step": 1441,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00046571125858463347,
+      "step": 1442,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009976852452382445,
+      "step": 1443,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011544430162757635,
+      "step": 1444,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009663172531872988,
+      "step": 1445,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011548014590516686,
+      "step": 1446,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009047710918821394,
+      "step": 1447,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000877353479154408,
+      "step": 1448,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005798363708890975,
+      "step": 1449,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012338689994066954,
+      "step": 1450,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011320222401991487,
+      "step": 1451,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000531321857124567,
+      "step": 1452,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012275672052055597,
+      "step": 1453,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010469836415722966,
+      "step": 1454,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010898661566898227,
+      "step": 1455,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005801328225061297,
+      "step": 1456,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001046186313033104,
+      "step": 1457,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004583472618833184,
+      "step": 1458,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007326202467083931,
+      "step": 1459,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005801798542961478,
+      "step": 1460,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009905812330543995,
+      "step": 1461,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001091848243959248,
+      "step": 1462,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010912910802289844,
+      "step": 1463,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001058919820934534,
+      "step": 1464,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001008613733574748,
+      "step": 1465,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010006485972553492,
+      "step": 1466,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005326870596036315,
+      "step": 1467,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005813196185044944,
+      "step": 1468,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010565456468611956,
+      "step": 1469,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008705638465471566,
+      "step": 1470,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010577336652204394,
+      "step": 1471,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005327419494278729,
+      "step": 1472,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007037206669338048,
+      "step": 1473,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009777973173186183,
+      "step": 1474,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005612308159470558,
+      "step": 1475,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001056130975484848,
+      "step": 1476,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005613458924926817,
+      "step": 1477,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006791509804315865,
+      "step": 1478,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010346685303375125,
+      "step": 1479,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010803689947351813,
+      "step": 1480,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000999524025246501,
+      "step": 1481,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005613146349787712,
+      "step": 1482,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010109924478456378,
+      "step": 1483,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00095437589334324,
+      "step": 1484,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010962523519992828,
+      "step": 1485,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005480703548528254,
+      "step": 1486,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001026559853926301,
+      "step": 1487,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000581743021029979,
+      "step": 1488,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010239154798910022,
+      "step": 1489,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008407391142100096,
+      "step": 1490,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009252667077817023,
+      "step": 1491,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010837417794391513,
+      "step": 1492,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010771695524454117,
+      "step": 1493,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004405034414958209,
+      "step": 1494,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010554823093116283,
+      "step": 1495,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005334854940883815,
+      "step": 1496,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011470225872471929,
+      "step": 1497,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005825557163916528,
+      "step": 1498,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001157191814854741,
+      "step": 1499,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005466312868520617,
+      "step": 1500,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010516467737033963,
+      "step": 1501,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010145427659153938,
+      "step": 1502,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010273691732436419,
+      "step": 1503,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011320492485538125,
+      "step": 1504,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005834777839481831,
+      "step": 1505,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007897655596025288,
+      "step": 1506,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001076401211321354,
+      "step": 1507,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009899400174617767,
+      "step": 1508,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00043066678335890174,
+      "step": 1509,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008581107249483466,
+      "step": 1510,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001056084525771439,
+      "step": 1511,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009059402509592474,
+      "step": 1512,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000583870627451688,
+      "step": 1513,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008452751208096743,
+      "step": 1514,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010394409764558077,
+      "step": 1515,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011515417136251926,
+      "step": 1516,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007754424586892128,
+      "step": 1517,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006379210390150547,
+      "step": 1518,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004596711660269648,
+      "step": 1519,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005633308901451528,
+      "step": 1520,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006488473154604435,
+      "step": 1521,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008397477213293314,
+      "step": 1522,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009351479820907116,
+      "step": 1523,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001161094638518989,
+      "step": 1524,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001098989974707365,
+      "step": 1525,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010705561144277453,
+      "step": 1526,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010142568498849869,
+      "step": 1527,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009827455505728722,
+      "step": 1528,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001097974251024425,
+      "step": 1529,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011195051483809948,
+      "step": 1530,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001106169307604432,
+      "step": 1531,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007656000088900328,
+      "step": 1532,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009653340093791485,
+      "step": 1533,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00037592119770124555,
+      "step": 1534,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006681823870167136,
+      "step": 1535,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005891859764233232,
+      "step": 1536,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009033480891957879,
+      "step": 1537,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011675389250740409,
+      "step": 1538,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005808288115076721,
+      "step": 1539,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007887095562182367,
+      "step": 1540,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010912592988461256,
+      "step": 1541,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010858331806957722,
+      "step": 1542,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011980998096987605,
+      "step": 1543,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010222234996035695,
+      "step": 1544,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005895143840461969,
+      "step": 1545,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011093594366684556,
+      "step": 1546,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008715501753613353,
+      "step": 1547,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005790454451926053,
+      "step": 1548,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011050833854824305,
+      "step": 1549,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001077583758160472,
+      "step": 1550,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005894216592423618,
+      "step": 1551,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008707556989975274,
+      "step": 1552,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010855025611817837,
+      "step": 1553,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010404170025140047,
+      "step": 1554,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005840371013619006,
+      "step": 1555,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008198008290491998,
+      "step": 1556,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005916178342886269,
+      "step": 1557,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001143042929470539,
+      "step": 1558,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008457030635327101,
+      "step": 1559,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009886818006634712,
+      "step": 1560,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000583689718041569,
+      "step": 1561,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009416360408067703,
+      "step": 1562,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005083006108179688,
+      "step": 1563,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006252070306800306,
+      "step": 1564,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001132655655965209,
+      "step": 1565,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001107249641790986,
+      "step": 1566,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011830744333565235,
+      "step": 1567,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011051350738853216,
+      "step": 1568,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000592581054661423,
+      "step": 1569,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008513456559740007,
+      "step": 1570,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00046505816862918437,
+      "step": 1571,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008102543652057648,
+      "step": 1572,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011368885170668364,
+      "step": 1573,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007855670992285013,
+      "step": 1574,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001040961011312902,
+      "step": 1575,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004676810931414366,
+      "step": 1576,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008441037498414516,
+      "step": 1577,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011003445833921432,
+      "step": 1578,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007630016189068556,
+      "step": 1579,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00101732078474015,
+      "step": 1580,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011849591974169016,
+      "step": 1581,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010939330095425248,
+      "step": 1582,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010129876900464296,
+      "step": 1583,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009746081195771694,
+      "step": 1584,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010290525387972593,
+      "step": 1585,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000434177927672863,
+      "step": 1586,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011213574325665832,
+      "step": 1587,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005366394761949778,
+      "step": 1588,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007636425434611738,
+      "step": 1589,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008120381971821189,
+      "step": 1590,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008746844250708818,
+      "step": 1591,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009513371624052525,
+      "step": 1592,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008721986669115722,
+      "step": 1593,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005862516118213534,
+      "step": 1594,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007313656387850642,
+      "step": 1595,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007766976486891508,
+      "step": 1596,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005658442387357354,
+      "step": 1597,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00045772717567160726,
+      "step": 1598,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004725567705463618,
+      "step": 1599,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010395592544227839,
+      "step": 1600,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011708858655765653,
+      "step": 1601,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006351902848109603,
+      "step": 1602,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005654446431435645,
+      "step": 1603,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008057851810008287,
+      "step": 1604,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009588117245584726,
+      "step": 1605,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011528352042660117,
+      "step": 1606,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010561379604041576,
+      "step": 1607,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004873897705692798,
+      "step": 1608,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00104623066727072,
+      "step": 1609,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010730007197707891,
+      "step": 1610,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008304188959300518,
+      "step": 1611,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007373671396635473,
+      "step": 1612,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000853928504511714,
+      "step": 1613,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008947784663178027,
+      "step": 1614,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001031656051054597,
+      "step": 1615,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006179985357448459,
+      "step": 1616,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004719275457318872,
+      "step": 1617,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011528482427820563,
+      "step": 1618,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005863955011591315,
+      "step": 1619,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010651007760316133,
+      "step": 1620,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006282986723817885,
+      "step": 1621,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008696322329342365,
+      "step": 1622,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010989217553287745,
+      "step": 1623,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008189986692741513,
+      "step": 1624,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004873256548307836,
+      "step": 1625,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008915031794458628,
+      "step": 1626,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011587482877075672,
+      "step": 1627,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007771950331516564,
+      "step": 1628,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008920067921280861,
+      "step": 1629,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010531017323955894,
+      "step": 1630,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010305200703442097,
+      "step": 1631,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001038003247231245,
+      "step": 1632,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010718771954998374,
+      "step": 1633,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005671759718097746,
+      "step": 1634,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011537307873368263,
+      "step": 1635,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00048761771176941693,
+      "step": 1636,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010373499244451523,
+      "step": 1637,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008590359939262271,
+      "step": 1638,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006648169946856797,
+      "step": 1639,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005669473903253675,
+      "step": 1640,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011695194989442825,
+      "step": 1641,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001037884852848947,
+      "step": 1642,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010829762322828174,
+      "step": 1643,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009968485683202744,
+      "step": 1644,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009051781962625682,
+      "step": 1645,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010932071600109339,
+      "step": 1646,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001200590399093926,
+      "step": 1647,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000982474535703659,
+      "step": 1648,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000820799614302814,
+      "step": 1649,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009559395257383585,
+      "step": 1650,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010503054363653064,
+      "step": 1651,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004694275266956538,
+      "step": 1652,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00041276600677520037,
+      "step": 1653,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005376421613618731,
+      "step": 1654,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009886815678328276,
+      "step": 1655,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006215536268427968,
+      "step": 1656,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010320820147171617,
+      "step": 1657,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001113399281166494,
+      "step": 1658,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004639210819732398,
+      "step": 1659,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010017773602157831,
+      "step": 1660,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008149194763973355,
+      "step": 1661,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011336759198457003,
+      "step": 1662,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001141387620009482,
+      "step": 1663,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011345259845256805,
+      "step": 1664,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011006527347490191,
+      "step": 1665,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008868877193890512,
+      "step": 1666,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009768340969458222,
+      "step": 1667,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010663472348824143,
+      "step": 1668,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008546222234144807,
+      "step": 1669,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005390601581893861,
+      "step": 1670,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00038672168739140034,
+      "step": 1671,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009525570785626769,
+      "step": 1672,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010729024652391672,
+      "step": 1673,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009383928263559937,
+      "step": 1674,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00038725309423170984,
+      "step": 1675,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005139675340615213,
+      "step": 1676,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000445748824859038,
+      "step": 1677,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010729507775977254,
+      "step": 1678,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005651144310832024,
+      "step": 1679,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008058952516876161,
+      "step": 1680,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0003870681975968182,
+      "step": 1681,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011373877059668303,
+      "step": 1682,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008425923879258335,
+      "step": 1683,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00038684927858412266,
+      "step": 1684,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008070944459177554,
+      "step": 1685,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007296096882782876,
+      "step": 1686,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011668666265904903,
+      "step": 1687,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011376761831343174,
+      "step": 1688,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009072601096704602,
+      "step": 1689,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00043478718725964427,
+      "step": 1690,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006548782112076879,
+      "step": 1691,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010511110303923488,
+      "step": 1692,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001093527302145958,
+      "step": 1693,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010646070586517453,
+      "step": 1694,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010896262247115374,
+      "step": 1695,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009123302879743278,
+      "step": 1696,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011724326759576797,
+      "step": 1697,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010947509435936809,
+      "step": 1698,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011148958001285791,
+      "step": 1699,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011337499599903822,
+      "step": 1700,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00048549060011282563,
+      "step": 1701,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001061046146787703,
+      "step": 1702,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00042947809561155736,
+      "step": 1703,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005402099341154099,
+      "step": 1704,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008586251060478389,
+      "step": 1705,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004798200388904661,
+      "step": 1706,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010416175937280059,
+      "step": 1707,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001052639214321971,
+      "step": 1708,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010704841697588563,
+      "step": 1709,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006397297838702798,
+      "step": 1710,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005907365120947361,
+      "step": 1711,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009190215496346354,
+      "step": 1712,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00105039041955024,
+      "step": 1713,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009970237733796239,
+      "step": 1714,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010648522293195128,
+      "step": 1715,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009564094361849129,
+      "step": 1716,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007930106949061155,
+      "step": 1717,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010897808242589235,
+      "step": 1718,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009657088667154312,
+      "step": 1719,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010309785138815641,
+      "step": 1720,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010419979225844145,
+      "step": 1721,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009387716418132186,
+      "step": 1722,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008771029533818364,
+      "step": 1723,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009165034280158579,
+      "step": 1724,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010450190166011453,
+      "step": 1725,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007944023818708956,
+      "step": 1726,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006765577709302306,
+      "step": 1727,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007898680632933974,
+      "step": 1728,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006408349727280438,
+      "step": 1729,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010591665050014853,
+      "step": 1730,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008532048086635768,
+      "step": 1731,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000462016963865608,
+      "step": 1732,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010925180977210402,
+      "step": 1733,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011431396706029773,
+      "step": 1734,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009363232529722154,
+      "step": 1735,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009785406291484833,
+      "step": 1736,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00038904519169591367,
+      "step": 1737,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009559219470247626,
+      "step": 1738,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000592550728470087,
+      "step": 1739,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001130559016019106,
+      "step": 1740,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001912376465043053,
+      "step": 1741,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006338813691399992,
+      "step": 1742,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007918604533188045,
+      "step": 1743,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008531478815712035,
+      "step": 1744,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010003617499023676,
+      "step": 1745,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005383078241720796,
+      "step": 1746,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011429970618337393,
+      "step": 1747,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009684365359134972,
+      "step": 1748,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005672980914823711,
+      "step": 1749,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009055226691998541,
+      "step": 1750,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008297230815514922,
+      "step": 1751,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008659029263071716,
+      "step": 1752,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011483384296298027,
+      "step": 1753,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011365237878635526,
+      "step": 1754,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006583823123946786,
+      "step": 1755,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006341953994706273,
+      "step": 1756,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001085155876353383,
+      "step": 1757,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011095937807112932,
+      "step": 1758,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008264599018730223,
+      "step": 1759,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011841238010674715,
+      "step": 1760,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010581568349152803,
+      "step": 1761,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009138822206296027,
+      "step": 1762,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005724249640479684,
+      "step": 1763,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007739458815194666,
+      "step": 1764,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001147933304309845,
+      "step": 1765,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009646782418712974,
+      "step": 1766,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005428711883723736,
+      "step": 1767,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005070882616564631,
+      "step": 1768,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012163994833827019,
+      "step": 1769,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000961730198469013,
+      "step": 1770,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000964594422839582,
+      "step": 1771,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008409761358052492,
+      "step": 1772,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010453598806634545,
+      "step": 1773,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011184175964444876,
+      "step": 1774,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010951744625344872,
+      "step": 1775,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011606368934735656,
+      "step": 1776,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00089282012777403,
+      "step": 1777,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001040097326040268,
+      "step": 1778,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008491802145726979,
+      "step": 1779,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001070792437531054,
+      "step": 1780,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019225795404054224,
+      "step": 1781,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009617722244001925,
+      "step": 1782,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011159596033394337,
+      "step": 1783,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009714644402265549,
+      "step": 1784,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011076873634010553,
+      "step": 1785,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001007429207675159,
+      "step": 1786,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011399200884625316,
+      "step": 1787,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010601094691082835,
+      "step": 1788,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011752455029636621,
+      "step": 1789,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009367960738018155,
+      "step": 1790,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001127314753830433,
+      "step": 1791,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010261484421789646,
+      "step": 1792,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011006020940840244,
+      "step": 1793,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007899883785285056,
+      "step": 1794,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008763779187574983,
+      "step": 1795,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0003911544044967741,
+      "step": 1796,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011571028735488653,
+      "step": 1797,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019246450392529368,
+      "step": 1798,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004956166376359761,
+      "step": 1799,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001078004133887589,
+      "step": 1800,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009293718612752855,
+      "step": 1801,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005602011806331575,
+      "step": 1802,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009974525310099125,
+      "step": 1803,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011284814681857824,
+      "step": 1804,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011324279475957155,
+      "step": 1805,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00037722408887930214,
+      "step": 1806,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011268859962001443,
+      "step": 1807,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010660949628800154,
+      "step": 1808,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009653651504777372,
+      "step": 1809,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007981311064213514,
+      "step": 1810,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007650100742466748,
+      "step": 1811,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012140540638938546,
+      "step": 1812,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005708569078706205,
+      "step": 1813,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00035089856828562915,
+      "step": 1814,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011389270657673478,
+      "step": 1815,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011002570390701294,
+      "step": 1816,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010845358483493328,
+      "step": 1817,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001022231881506741,
+      "step": 1818,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005706776864826679,
+      "step": 1819,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009171720594167709,
+      "step": 1820,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009155104635283351,
+      "step": 1821,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010935842292383313,
+      "step": 1822,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010767208877950907,
+      "step": 1823,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011407650308683515,
+      "step": 1824,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004871275741606951,
+      "step": 1825,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005962330615147948,
+      "step": 1826,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008394385222345591,
+      "step": 1827,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001150259398855269,
+      "step": 1828,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008890252793207765,
+      "step": 1829,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000973035697825253,
+      "step": 1830,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00113235367462039,
+      "step": 1831,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005763103254139423,
+      "step": 1832,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010959607316181064,
+      "step": 1833,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011341539211571217,
+      "step": 1834,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004404107457958162,
+      "step": 1835,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010541502851992846,
+      "step": 1836,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011226239148527384,
+      "step": 1837,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010081746149808168,
+      "step": 1838,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011756432941183448,
+      "step": 1839,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010356158018112183,
+      "step": 1840,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006883647292852402,
+      "step": 1841,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008307434618473053,
+      "step": 1842,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008634526166133583,
+      "step": 1843,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0003924487973563373,
+      "step": 1844,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010161593090742826,
+      "step": 1845,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008393258322030306,
+      "step": 1846,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006785903824493289,
+      "step": 1847,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008928863680921495,
+      "step": 1848,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010079682106152177,
+      "step": 1849,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011324102524667978,
+      "step": 1850,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008451350731775165,
+      "step": 1851,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009090608218684793,
+      "step": 1852,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008101665298454463,
+      "step": 1853,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011897704098373652,
+      "step": 1854,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008916697697713971,
+      "step": 1855,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001056948909536004,
+      "step": 1856,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000590662588365376,
+      "step": 1857,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007456708699464798,
+      "step": 1858,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005981567082926631,
+      "step": 1859,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00039249807014130056,
+      "step": 1860,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001084640040062368,
+      "step": 1861,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007759600994177163,
+      "step": 1862,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007997542852535844,
+      "step": 1863,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010509511921554804,
+      "step": 1864,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008916154620237648,
+      "step": 1865,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005436809733510017,
+      "step": 1866,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010398485464975238,
+      "step": 1867,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008618443389423192,
+      "step": 1868,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008932289201766253,
+      "step": 1869,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011348214466124773,
+      "step": 1870,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006032958626747131,
+      "step": 1871,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010460919002071023,
+      "step": 1872,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011228510411456227,
+      "step": 1873,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010818002047017217,
+      "step": 1874,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00087085145059973,
+      "step": 1875,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009737217333167791,
+      "step": 1876,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00108638487290591,
+      "step": 1877,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005539170233532786,
+      "step": 1878,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006537307635881007,
+      "step": 1879,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011365975951775908,
+      "step": 1880,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008530125487595797,
+      "step": 1881,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001061737071722746,
+      "step": 1882,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000573175901081413,
+      "step": 1883,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005960151320323348,
+      "step": 1884,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008861803216859698,
+      "step": 1885,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012063616886734962,
+      "step": 1886,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005779139464721084,
+      "step": 1887,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010352320969104767,
+      "step": 1888,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007714104722253978,
+      "step": 1889,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00039314324385486543,
+      "step": 1890,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008463714621029794,
+      "step": 1891,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00040556181920692325,
+      "step": 1892,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004191762418486178,
+      "step": 1893,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00048168253852054477,
+      "step": 1894,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004477140319067985,
+      "step": 1895,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006532819825224578,
+      "step": 1896,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011521130800247192,
+      "step": 1897,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0003926088975276798,
+      "step": 1898,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006397290853783488,
+      "step": 1899,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011897203512489796,
+      "step": 1900,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005979853449389338,
+      "step": 1901,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007170345634222031,
+      "step": 1902,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007605094579048455,
+      "step": 1903,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004899637424387038,
+      "step": 1904,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009123049094341695,
+      "step": 1905,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001007067272439599,
+      "step": 1906,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000732088868971914,
+      "step": 1907,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007886550156399608,
+      "step": 1908,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011949698673561215,
+      "step": 1909,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000869447598233819,
+      "step": 1910,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011395886540412903,
+      "step": 1911,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008183908648788929,
+      "step": 1912,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005772268632426858,
+      "step": 1913,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011494334321469069,
+      "step": 1914,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011545780580490828,
+      "step": 1915,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008709524408914149,
+      "step": 1916,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000577450031414628,
+      "step": 1917,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011091376654803753,
+      "step": 1918,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006977490265853703,
+      "step": 1919,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011082382407039404,
+      "step": 1920,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001010232139378786,
+      "step": 1921,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019317791156936437,
+      "step": 1922,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001100609079003334,
+      "step": 1923,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001121184672228992,
+      "step": 1924,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011102257994934916,
+      "step": 1925,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005778732011094689,
+      "step": 1926,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012162125203758478,
+      "step": 1927,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004595888894982636,
+      "step": 1928,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001214160700328648,
+      "step": 1929,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010097268968820572,
+      "step": 1930,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000983359175734222,
+      "step": 1931,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005205058841966093,
+      "step": 1932,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007468150579370558,
+      "step": 1933,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00044079776853322983,
+      "step": 1934,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009191715507768095,
+      "step": 1935,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012744945706799626,
+      "step": 1936,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010306177427992225,
+      "step": 1937,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000663449929561466,
+      "step": 1938,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008813398890197277,
+      "step": 1939,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009142497438006103,
+      "step": 1940,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001076086307875812,
+      "step": 1941,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008876487263478339,
+      "step": 1942,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009564695646986365,
+      "step": 1943,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006040247390046716,
+      "step": 1944,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001934568863362074,
+      "step": 1945,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000892016978468746,
+      "step": 1946,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001271143089979887,
+      "step": 1947,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008853410836309195,
+      "step": 1948,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011374239111319184,
+      "step": 1949,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010490126442164183,
+      "step": 1950,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006398718105629086,
+      "step": 1951,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001933882595039904,
+      "step": 1952,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00039307825500145555,
+      "step": 1953,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010083189699798822,
+      "step": 1954,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004313872195780277,
+      "step": 1955,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000471679144538939,
+      "step": 1956,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009047086350619793,
+      "step": 1957,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006405605236068368,
+      "step": 1958,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006405903259292245,
+      "step": 1959,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006454990361817181,
+      "step": 1960,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007913206936791539,
+      "step": 1961,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019297718245070428,
+      "step": 1962,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010635709622874856,
+      "step": 1963,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00043413866660557687,
+      "step": 1964,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011677136644721031,
+      "step": 1965,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0003888212377205491,
+      "step": 1966,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005979784182272851,
+      "step": 1967,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010632837656885386,
+      "step": 1968,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010794567642733455,
+      "step": 1969,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010862282942980528,
+      "step": 1970,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010572841856628656,
+      "step": 1971,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001929989957716316,
+      "step": 1972,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007966223638504744,
+      "step": 1973,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008747037500143051,
+      "step": 1974,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001120106317102909,
+      "step": 1975,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006417821859940886,
+      "step": 1976,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000863394234329462,
+      "step": 1977,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010728166671469808,
+      "step": 1978,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005730298580601811,
+      "step": 1979,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009189700940623879,
+      "step": 1980,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008177778217941523,
+      "step": 1981,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001930563012138009,
+      "step": 1982,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011995058739557862,
+      "step": 1983,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005375418113544583,
+      "step": 1984,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010572505416348577,
+      "step": 1985,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009980350732803345,
+      "step": 1986,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006532699335366488,
+      "step": 1987,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010171015746891499,
+      "step": 1988,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00047135454951785505,
+      "step": 1989,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008324059890583158,
+      "step": 1990,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006400850834324956,
+      "step": 1991,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019302118744235486,
+      "step": 1992,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000840181834064424,
+      "step": 1993,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011233665281906724,
+      "step": 1994,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006204572273418307,
+      "step": 1995,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009796873200684786,
+      "step": 1996,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004949677386321127,
+      "step": 1997,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000765270262490958,
+      "step": 1998,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011368471896275878,
+      "step": 1999,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005979238194413483,
+      "step": 2000,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004956315970048308,
+      "step": 2001,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019285781309008598,
+      "step": 2002,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012136331060901284,
+      "step": 2003,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000858999730553478,
+      "step": 2004,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008811929728835821,
+      "step": 2005,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001101057045161724,
+      "step": 2006,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0003902037860825658,
+      "step": 2007,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.001177844125777483,
+      "step": 2008,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010573676554486156,
+      "step": 2009,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004946711705997586,
+      "step": 2010,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011425403645262122,
+      "step": 2011,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001929651334648952,
+      "step": 2012,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005609571817331016,
+      "step": 2013,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000763320887926966,
+      "step": 2014,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008482457487843931,
+      "step": 2015,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0009818333201110363,
+      "step": 2016,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010853046551346779,
+      "step": 2017,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008070725598372519,
+      "step": 2018,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011139955604448915,
+      "step": 2019,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00046297532389871776,
+      "step": 2020,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011347950203344226,
+      "step": 2021,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010933992452919483,
+      "step": 2022,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007337299175560474,
+      "step": 2023,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006522307521663606,
+      "step": 2024,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019290974887553602,
+      "step": 2025,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010359592270106077,
+      "step": 2026,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0007334293331950903,
+      "step": 2027,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008540398557670414,
+      "step": 2028,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00040527372038923204,
+      "step": 2029,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0006190385320223868,
+      "step": 2030,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005970073980279267,
+      "step": 2031,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008478679810650647,
+      "step": 2032,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000681412173435092,
+      "step": 2033,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011918002273887396,
+      "step": 2034,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010861250339075923,
+      "step": 2035,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010516784386709332,
+      "step": 2036,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0004941869992762804,
+      "step": 2037,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0011403030948713422,
+      "step": 2038,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0010944724781438708,
+      "step": 2039,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0008943144348450005,
+      "step": 2040,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005973913939669728,
+      "step": 2041,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.00019282393623143435,
+      "step": 2042,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0005758467596024275,
+      "step": 2043,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0012414657976478338,
+      "step": 2044,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.0001927551784319803,
+      "step": 2045,
+      "tokens_affected": 1
+    },
+    {
+      "action": "eviction",
+      "cache_pos_before": 1201,
+      "raw_value": 0.000885719433426857,
+      "step": 2046,
+      "tokens_affected": 1
+    }
+  ],
+  "token_count": 2046,
+  "tokens_per_second": 7.280301649238498,
+  "total_nll": 6938.292040114413,
+  "wall_time_s": 281.032311376
+}
