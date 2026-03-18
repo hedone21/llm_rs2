@@ -9,6 +9,9 @@ use rayon::prelude::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
 
+/// Minimum number of elements before using Rayon parallelism.
+const PARALLEL_THRESHOLD: usize = 16384;
+
 pub struct CpuBackendAVX2;
 
 impl Default for CpuBackendAVX2 {
@@ -76,23 +79,67 @@ impl Backend for CpuBackendAVX2 {
     }
 
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
-        CpuBackendCommon::new().add_assign(a, b)
+        let a_data = a.as_mut_slice::<f32>();
+        let b_data = b.as_slice::<f32>();
+        if a_data.len() != b_data.len() {
+            return Err(anyhow!("Size mismatch for add_assign"));
+        }
+        if a_data.len() < PARALLEL_THRESHOLD {
+            unsafe { Self::vec_add_f32(a_data, b_data) };
+        } else {
+            a_data
+                .par_chunks_mut(PARALLEL_THRESHOLD)
+                .zip(b_data.par_chunks(PARALLEL_THRESHOLD))
+                .for_each(|(ac, bc)| unsafe { Self::vec_add_f32(ac, bc) });
+        }
+        Ok(())
     }
 
     fn scale(&self, x: &mut Tensor, v: f32) -> Result<()> {
-        CpuBackendCommon::new().scale(x, v)
+        let x_data = x.as_mut_slice::<f32>();
+        if x_data.len() < PARALLEL_THRESHOLD {
+            unsafe { Self::vec_scale_f32(x_data, v) };
+        } else {
+            x_data
+                .par_chunks_mut(PARALLEL_THRESHOLD)
+                .for_each(|chunk| unsafe { Self::vec_scale_f32(chunk, v) });
+        }
+        Ok(())
     }
 
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
-        CpuBackendCommon::new().silu_mul(a, b)
+        let a_data = a.as_mut_slice::<f32>();
+        let b_data = b.as_slice::<f32>();
+        if a_data.len() < PARALLEL_THRESHOLD {
+            unsafe { Self::vec_silu_mul_f32(a_data, b_data) };
+        } else {
+            a_data
+                .par_chunks_mut(PARALLEL_THRESHOLD)
+                .zip(b_data.par_chunks(PARALLEL_THRESHOLD))
+                .for_each(|(ac, bc)| unsafe { Self::vec_silu_mul_f32(ac, bc) });
+        }
+        Ok(())
     }
 
     fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
-        CpuBackendCommon::new().rms_norm(x, w, eps)
+        let dims = x.shape().dims();
+        let dim = dims[dims.len() - 1];
+        let x_data = x.as_mut_slice::<f32>();
+        let w_data = w.as_slice::<f32>();
+        x_data.par_chunks_mut(dim).for_each(|row| {
+            unsafe { Self::rms_norm_row(row, w_data, eps) };
+        });
+        Ok(())
     }
 
     fn softmax(&self, x: &mut Tensor) -> Result<()> {
-        CpuBackendCommon::new().softmax(x)
+        let dims = x.shape().dims();
+        let dim = dims[dims.len() - 1];
+        let x_data = x.as_mut_slice::<f32>();
+        x_data.par_chunks_mut(dim).for_each(|row| {
+            unsafe { Self::softmax_row(row) };
+        });
+        Ok(())
     }
 
     fn rope_inplace(&self, x: &mut Tensor, start_pos: usize, theta: f32) -> Result<()> {
@@ -104,9 +151,24 @@ impl Backend for CpuBackendAVX2 {
     }
 
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()> {
-        CpuBackendCommon::new().cast(src, dst)
+        match (src.dtype(), dst.dtype()) {
+            (DType::F32, DType::F16) => {
+                let s = src.as_slice::<f32>();
+                let d = dst.as_mut_slice::<half::f16>();
+                unsafe { Self::cast_f32_to_f16(s, d) };
+                Ok(())
+            }
+            (DType::F16, DType::F32) => {
+                let s = src.as_slice::<half::f16>();
+                let d = dst.as_mut_slice::<f32>();
+                unsafe { Self::cast_f16_to_f32(s, d) };
+                Ok(())
+            }
+            _ => CpuBackendCommon::new().cast(src, dst),
+        }
     }
 
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -118,16 +180,135 @@ impl Backend for CpuBackendAVX2 {
         head_dim: usize,
         cache_seq_len: usize,
     ) -> Result<()> {
-        CpuBackendCommon::new().attention_gen(
-            q,
-            k_cache,
-            v_cache,
-            out,
-            num_heads_q,
-            num_heads_kv,
-            head_dim,
-            cache_seq_len,
-        )
+        let q_data = q.as_slice::<f32>();
+        let out_data = out.as_mut_slice::<f32>();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = num_heads_q / num_heads_kv;
+
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        let capacity = if is_head_major { k_shape[2] } else { 0 };
+
+        match k_cache.dtype() {
+            DType::F32 => {
+                let k_data = k_cache.as_slice::<f32>();
+                let v_data = v_cache.as_slice::<f32>();
+                out_data
+                    .par_chunks_mut(head_dim)
+                    .enumerate()
+                    .for_each(|(h, out_h)| {
+                        let kv_h = h / gqa_ratio;
+                        let q_off = h * head_dim;
+                        let q_vec = &q_data[q_off..q_off + head_dim];
+                        let mut scores = vec![0.0f32; cache_seq_len];
+
+                        // Q * K^T with AVX2
+                        for t in 0..cache_seq_len {
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
+                            let k_vec = &k_data[off..off + head_dim];
+                            scores[t] = unsafe { Self::vec_dot_f32(q_vec, k_vec) * scale };
+                        }
+
+                        // Inline softmax with AVX2
+                        unsafe { Self::softmax_row(&mut scores) };
+
+                        // Weighted V sum with AVX2
+                        for d in out_h.iter_mut() {
+                            *d = 0.0;
+                        }
+                        for t in 0..cache_seq_len {
+                            let w = scores[t];
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
+                            let v_vec = &v_data[off..off + head_dim];
+                            unsafe { Self::vec_fma_f32(out_h, v_vec, w) };
+                        }
+                    });
+            }
+            DType::F16 => {
+                let k_data = k_cache.as_slice::<half::f16>();
+                let v_data = v_cache.as_slice::<half::f16>();
+                out_data
+                    .par_chunks_mut(head_dim)
+                    .enumerate()
+                    .for_each(|(h, out_h)| {
+                        let kv_h = h / gqa_ratio;
+                        let q_off = h * head_dim;
+                        let q_vec = &q_data[q_off..q_off + head_dim];
+                        let mut scores = vec![0.0f32; cache_seq_len];
+
+                        // Q * K^T: inline F16C convert + FMA dot
+                        for t in 0..cache_seq_len {
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
+                            let k_row = &k_data[off..off + head_dim];
+                            scores[t] = unsafe {
+                                Self::vec_dot_f16_f32_avx2(
+                                    head_dim,
+                                    q_vec.as_ptr(),
+                                    k_row.as_ptr() as *const u16,
+                                ) * scale
+                            };
+                        }
+
+                        // Inline softmax with AVX2
+                        unsafe { Self::softmax_row(&mut scores) };
+
+                        // Weighted V sum: F16C + FMA
+                        for d in out_h.iter_mut() {
+                            *d = 0.0;
+                        }
+                        for t in 0..cache_seq_len {
+                            let w = scores[t];
+                            let off = if is_head_major {
+                                (kv_h * capacity + t) * head_dim
+                            } else {
+                                (t * num_heads_kv + kv_h) * head_dim
+                            };
+                            let v_row = &v_data[off..off + head_dim];
+                            unsafe {
+                                Self::vec_mad_f16_avx2(
+                                    head_dim,
+                                    out_h.as_mut_ptr(),
+                                    v_row.as_ptr() as *const u16,
+                                    w,
+                                );
+                            }
+                        }
+                    });
+            }
+            DType::Q4_0 => {
+                // Q4_0 attention: fall back to common (dequant path)
+                return CpuBackendCommon::new().attention_gen(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    num_heads_q,
+                    num_heads_kv,
+                    head_dim,
+                    cache_seq_len,
+                );
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported KV cache dtype for attention: {:?}",
+                    k_cache.dtype()
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -906,5 +1087,986 @@ impl CpuBackendAVX2 {
             return CpuBackendCommon::new().matmul_transposed_q4_1(a, b, out);
         }
         CpuBackendCommon::new().matmul_transposed_q4_1(a, b, out)
+    }
+
+    // =========================================================
+    // AVX2 F16↔F32 Bulk Cast
+    // =========================================================
+
+    /// AVX2+F16C bulk F32→F16 cast.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "f16c")]
+    unsafe fn cast_f32_to_f16(src: &[f32], dst: &mut [half::f16]) {
+        unsafe {
+            let n = src.len();
+            let s_ptr = src.as_ptr();
+            let d_ptr = dst.as_mut_ptr() as *mut u16;
+            let mut i = 0;
+            while i + 8 <= n {
+                let v = _mm256_loadu_ps(s_ptr.add(i));
+                let h = _mm256_cvtps_ph(v, _MM_ROUND_NEAREST as i32);
+                _mm_storeu_si128(d_ptr.add(i) as *mut __m128i, h);
+                i += 8;
+            }
+            while i < n {
+                *d_ptr.add(i) = half::f16::from_f32(*s_ptr.add(i)).to_bits();
+                i += 1;
+            }
+        }
+    }
+
+    /// AVX2+F16C bulk F16→F32 cast.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "f16c")]
+    unsafe fn cast_f16_to_f32(src: &[half::f16], dst: &mut [f32]) {
+        unsafe {
+            let n = src.len();
+            let s_ptr = src.as_ptr() as *const u16;
+            let d_ptr = dst.as_mut_ptr();
+            let mut i = 0;
+            while i + 8 <= n {
+                let h = _mm_loadu_si128(s_ptr.add(i) as *const __m128i);
+                let v = _mm256_cvtph_ps(h);
+                _mm256_storeu_ps(d_ptr.add(i), v);
+                i += 8;
+            }
+            while i < n {
+                *d_ptr.add(i) = half::f16::from_bits(*s_ptr.add(i)).to_f32();
+                i += 1;
+            }
+        }
+    }
+
+    // =========================================================
+    // AVX2 Dot Product / FMA Helpers for Attention
+    // =========================================================
+
+    /// AVX2 dot product of two f32 slices.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn vec_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+        unsafe {
+            let n = a.len();
+            let a_ptr = a.as_ptr();
+            let b_ptr = b.as_ptr();
+            let mut acc0 = _mm256_setzero_ps();
+            let mut acc1 = _mm256_setzero_ps();
+            let mut i = 0;
+            while i + 16 <= n {
+                acc0 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a_ptr.add(i)),
+                    _mm256_loadu_ps(b_ptr.add(i)),
+                    acc0,
+                );
+                acc1 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a_ptr.add(i + 8)),
+                    _mm256_loadu_ps(b_ptr.add(i + 8)),
+                    acc1,
+                );
+                i += 16;
+            }
+            while i + 8 <= n {
+                acc0 = _mm256_fmadd_ps(
+                    _mm256_loadu_ps(a_ptr.add(i)),
+                    _mm256_loadu_ps(b_ptr.add(i)),
+                    acc0,
+                );
+                i += 8;
+            }
+            acc0 = _mm256_add_ps(acc0, acc1);
+            let mut sum = Self::hsum_f32x8(acc0);
+            while i < n {
+                sum += *a_ptr.add(i) * *b_ptr.add(i);
+                i += 1;
+            }
+            sum
+        }
+    }
+
+    /// AVX2 fused multiply-add: out[i] += v[i] * weight
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn vec_fma_f32(out: &mut [f32], v: &[f32], weight: f32) {
+        unsafe {
+            let n = out.len();
+            let o_ptr = out.as_mut_ptr();
+            let v_ptr = v.as_ptr();
+            let w = _mm256_set1_ps(weight);
+            let mut i = 0;
+            while i + 16 <= n {
+                _mm256_storeu_ps(
+                    o_ptr.add(i),
+                    _mm256_fmadd_ps(
+                        w,
+                        _mm256_loadu_ps(v_ptr.add(i)),
+                        _mm256_loadu_ps(o_ptr.add(i)),
+                    ),
+                );
+                _mm256_storeu_ps(
+                    o_ptr.add(i + 8),
+                    _mm256_fmadd_ps(
+                        w,
+                        _mm256_loadu_ps(v_ptr.add(i + 8)),
+                        _mm256_loadu_ps(o_ptr.add(i + 8)),
+                    ),
+                );
+                i += 16;
+            }
+            while i + 8 <= n {
+                _mm256_storeu_ps(
+                    o_ptr.add(i),
+                    _mm256_fmadd_ps(
+                        w,
+                        _mm256_loadu_ps(v_ptr.add(i)),
+                        _mm256_loadu_ps(o_ptr.add(i)),
+                    ),
+                );
+                i += 8;
+            }
+            while i < n {
+                *o_ptr.add(i) += weight * *v_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+
+    // =========================================================
+    // AVX2 Element-wise Helpers
+    // =========================================================
+
+    /// Horizontal sum of 8 floats in AVX register (static version).
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hsum_f32x8(x: __m256) -> f32 {
+        unsafe {
+            let hi = _mm256_extractf128_ps(x, 1);
+            let lo = _mm256_castps256_ps128(x);
+            let sum128 = _mm_add_ps(hi, lo);
+            let sum128 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+            let sum128 = _mm_add_ss(sum128, _mm_movehdup_ps(sum128));
+            _mm_cvtss_f32(sum128)
+        }
+    }
+
+    /// Horizontal max of 8 floats in AVX register.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn hmax_f32x8(x: __m256) -> f32 {
+        unsafe {
+            let hi = _mm256_extractf128_ps(x, 1);
+            let lo = _mm256_castps256_ps128(x);
+            let max128 = _mm_max_ps(hi, lo);
+            let max128 = _mm_max_ps(max128, _mm_movehl_ps(max128, max128));
+            let max128 = _mm_max_ss(max128, _mm_movehdup_ps(max128));
+            _mm_cvtss_f32(max128)
+        }
+    }
+
+    /// Fast vectorized exp(x) for 8 floats.
+    /// Cephes-based minimax polynomial, max relative error < 1.5e-7.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    #[inline]
+    #[allow(clippy::excessive_precision)]
+    pub(crate) unsafe fn exp_ps(x: __m256) -> __m256 {
+        unsafe {
+            let exp_hi = _mm256_set1_ps(88.376_26f32);
+            let exp_lo = _mm256_set1_ps(-88.376_26f32);
+            let log2ef = _mm256_set1_ps(std::f32::consts::LOG2_E);
+            let c1 = _mm256_set1_ps(0.693_359_4f32);
+            let c2 = _mm256_set1_ps(-2.121_944_4e-4f32);
+            let one = _mm256_set1_ps(1.0f32);
+
+            // Minimax polynomial coefficients for (exp(r) - 1 - r) / r²
+            let p0 = _mm256_set1_ps(1.987_569_1e-4f32);
+            let p1 = _mm256_set1_ps(1.398_200_0e-3f32);
+            let p2 = _mm256_set1_ps(8.333_452e-3f32);
+            let p3 = _mm256_set1_ps(4.166_580e-2f32);
+            let p4 = _mm256_set1_ps(1.666_666_6e-1f32);
+            let p5 = _mm256_set1_ps(5.000_000_1e-1f32);
+
+            // Clamp to prevent overflow/underflow
+            let x = _mm256_min_ps(x, exp_hi);
+            let x = _mm256_max_ps(x, exp_lo);
+
+            // n = round(x * log2(e))
+            let fx = _mm256_round_ps(_mm256_mul_ps(x, log2ef), _MM_ROUND_NEAREST as i32);
+
+            // Range reduction: r = x - n * ln(2) using Cahan summation
+            let r = _mm256_fnmadd_ps(fx, c1, x);
+            let r = _mm256_fnmadd_ps(fx, c2, r);
+
+            let z = _mm256_mul_ps(r, r);
+
+            // Horner polynomial: P(r) such that exp(r) ≈ 1 + r + r²·P(r)
+            let mut y = p0;
+            y = _mm256_fmadd_ps(y, r, p1);
+            y = _mm256_fmadd_ps(y, r, p2);
+            y = _mm256_fmadd_ps(y, r, p3);
+            y = _mm256_fmadd_ps(y, r, p4);
+            y = _mm256_fmadd_ps(y, r, p5);
+            y = _mm256_fmadd_ps(y, z, r);
+            y = _mm256_add_ps(y, one);
+
+            // 2^n via IEEE754 exponent manipulation
+            let n = _mm256_cvtps_epi32(fx);
+            let pow2n = _mm256_castsi256_ps(_mm256_slli_epi32(
+                _mm256_add_epi32(n, _mm256_set1_epi32(0x7f)),
+                23,
+            ));
+
+            _mm256_mul_ps(y, pow2n)
+        }
+    }
+
+    /// AVX2 vector add: a[i] += b[i]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn vec_add_f32(a: &mut [f32], b: &[f32]) {
+        unsafe {
+            let n = a.len();
+            let a_ptr = a.as_mut_ptr();
+            let b_ptr = b.as_ptr();
+            let mut i = 0;
+            while i + 32 <= n {
+                let va0 = _mm256_loadu_ps(a_ptr.add(i));
+                let vb0 = _mm256_loadu_ps(b_ptr.add(i));
+                _mm256_storeu_ps(a_ptr.add(i), _mm256_add_ps(va0, vb0));
+                let va1 = _mm256_loadu_ps(a_ptr.add(i + 8));
+                let vb1 = _mm256_loadu_ps(b_ptr.add(i + 8));
+                _mm256_storeu_ps(a_ptr.add(i + 8), _mm256_add_ps(va1, vb1));
+                let va2 = _mm256_loadu_ps(a_ptr.add(i + 16));
+                let vb2 = _mm256_loadu_ps(b_ptr.add(i + 16));
+                _mm256_storeu_ps(a_ptr.add(i + 16), _mm256_add_ps(va2, vb2));
+                let va3 = _mm256_loadu_ps(a_ptr.add(i + 24));
+                let vb3 = _mm256_loadu_ps(b_ptr.add(i + 24));
+                _mm256_storeu_ps(a_ptr.add(i + 24), _mm256_add_ps(va3, vb3));
+                i += 32;
+            }
+            while i + 8 <= n {
+                let va = _mm256_loadu_ps(a_ptr.add(i));
+                let vb = _mm256_loadu_ps(b_ptr.add(i));
+                _mm256_storeu_ps(a_ptr.add(i), _mm256_add_ps(va, vb));
+                i += 8;
+            }
+            while i < n {
+                *a_ptr.add(i) += *b_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+
+    /// AVX2 vector scale: x[i] *= v
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn vec_scale_f32(x: &mut [f32], v: f32) {
+        unsafe {
+            let n = x.len();
+            let ptr = x.as_mut_ptr();
+            let vv = _mm256_set1_ps(v);
+            let mut i = 0;
+            while i + 32 <= n {
+                _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i)), vv));
+                _mm256_storeu_ps(
+                    ptr.add(i + 8),
+                    _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i + 8)), vv),
+                );
+                _mm256_storeu_ps(
+                    ptr.add(i + 16),
+                    _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i + 16)), vv),
+                );
+                _mm256_storeu_ps(
+                    ptr.add(i + 24),
+                    _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i + 24)), vv),
+                );
+                i += 32;
+            }
+            while i + 8 <= n {
+                _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i)), vv));
+                i += 8;
+            }
+            while i < n {
+                *ptr.add(i) *= v;
+                i += 1;
+            }
+        }
+    }
+
+    /// AVX2 SiLU gate: a[i] = silu(a[i]) * b[i] = (a[i] / (1 + exp(-a[i]))) * b[i]
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn vec_silu_mul_f32(a: &mut [f32], b: &[f32]) {
+        unsafe {
+            let n = a.len();
+            let a_ptr = a.as_mut_ptr();
+            let b_ptr = b.as_ptr();
+            let one = _mm256_set1_ps(1.0f32);
+            let sign_mask = _mm256_set1_ps(-0.0f32);
+            let mut i = 0;
+            while i + 8 <= n {
+                let x = _mm256_loadu_ps(a_ptr.add(i));
+                let bv = _mm256_loadu_ps(b_ptr.add(i));
+                // silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                let neg_x = _mm256_xor_ps(x, sign_mask);
+                let exp_neg_x = Self::exp_ps(neg_x);
+                let sigmoid = _mm256_div_ps(one, _mm256_add_ps(one, exp_neg_x));
+                let silu = _mm256_mul_ps(x, sigmoid);
+                _mm256_storeu_ps(a_ptr.add(i), _mm256_mul_ps(silu, bv));
+                i += 8;
+            }
+            while i < n {
+                let x = *a_ptr.add(i);
+                let silu_x = x / (1.0 + (-x).exp());
+                *a_ptr.add(i) = silu_x * *b_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+
+    /// AVX2 RMS norm for a single row.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn rms_norm_row(row: &mut [f32], w: &[f32], eps: f32) {
+        unsafe {
+            let dim = row.len();
+            let ptr = row.as_mut_ptr();
+            let w_ptr = w.as_ptr();
+
+            // Pass 1: sum of squares with 2-accumulator unroll
+            let mut sum_v0 = _mm256_setzero_ps();
+            let mut sum_v1 = _mm256_setzero_ps();
+            let mut i = 0;
+            while i + 16 <= dim {
+                let v0 = _mm256_loadu_ps(ptr.add(i));
+                let v1 = _mm256_loadu_ps(ptr.add(i + 8));
+                sum_v0 = _mm256_fmadd_ps(v0, v0, sum_v0);
+                sum_v1 = _mm256_fmadd_ps(v1, v1, sum_v1);
+                i += 16;
+            }
+            while i + 8 <= dim {
+                let v = _mm256_loadu_ps(ptr.add(i));
+                sum_v0 = _mm256_fmadd_ps(v, v, sum_v0);
+                i += 8;
+            }
+            sum_v0 = _mm256_add_ps(sum_v0, sum_v1);
+            let mut sum_sq = Self::hsum_f32x8(sum_v0);
+            while i < dim {
+                sum_sq += *ptr.add(i) * *ptr.add(i);
+                i += 1;
+            }
+
+            let scale = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+            let scale_v = _mm256_set1_ps(scale);
+
+            // Pass 2: x[i] = x[i] * scale * w[i]
+            i = 0;
+            while i + 8 <= dim {
+                let v = _mm256_loadu_ps(ptr.add(i));
+                let wv = _mm256_loadu_ps(w_ptr.add(i));
+                _mm256_storeu_ps(ptr.add(i), _mm256_mul_ps(_mm256_mul_ps(v, scale_v), wv));
+                i += 8;
+            }
+            while i < dim {
+                *ptr.add(i) = (*ptr.add(i) * scale) * *w_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+
+    /// AVX2 softmax for a single row.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2", enable = "fma")]
+    unsafe fn softmax_row(row: &mut [f32]) {
+        unsafe {
+            let dim = row.len();
+            let ptr = row.as_mut_ptr();
+
+            // Pass 1: find max
+            let mut max_v = _mm256_set1_ps(f32::NEG_INFINITY);
+            let mut i = 0;
+            while i + 8 <= dim {
+                max_v = _mm256_max_ps(max_v, _mm256_loadu_ps(ptr.add(i)));
+                i += 8;
+            }
+            let mut max_val = Self::hmax_f32x8(max_v);
+            while i < dim {
+                max_val = max_val.max(*ptr.add(i));
+                i += 1;
+            }
+
+            // Pass 2: exp(x - max) and accumulate sum
+            let max_v = _mm256_set1_ps(max_val);
+            let mut sum_v = _mm256_setzero_ps();
+            i = 0;
+            while i + 8 <= dim {
+                let x = _mm256_loadu_ps(ptr.add(i));
+                let e = Self::exp_ps(_mm256_sub_ps(x, max_v));
+                _mm256_storeu_ps(ptr.add(i), e);
+                sum_v = _mm256_add_ps(sum_v, e);
+                i += 8;
+            }
+            let mut sum_exp = Self::hsum_f32x8(sum_v);
+            while i < dim {
+                let e = (*ptr.add(i) - max_val).exp();
+                *ptr.add(i) = e;
+                sum_exp += e;
+                i += 1;
+            }
+
+            // Pass 3: normalize
+            let inv_sum = _mm256_set1_ps(1.0 / sum_exp);
+            i = 0;
+            while i + 8 <= dim {
+                _mm256_storeu_ps(
+                    ptr.add(i),
+                    _mm256_mul_ps(_mm256_loadu_ps(ptr.add(i)), inv_sum),
+                );
+                i += 8;
+            }
+            let inv = 1.0 / sum_exp;
+            while i < dim {
+                *ptr.add(i) *= inv;
+                i += 1;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackendCommon;
+    use crate::core::backend::Backend;
+    use crate::core::buffer::{Buffer, DType};
+    use crate::core::memory::Memory;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::Tensor;
+    use crate::memory::galloc::Galloc;
+    use std::sync::Arc;
+
+    fn gen_data(n: usize, seed: u32) -> Vec<f32> {
+        let mut data = Vec::with_capacity(n);
+        let mut s = seed;
+        for _ in 0..n {
+            s = s.wrapping_mul(1103515245).wrapping_add(12345);
+            data.push(((s >> 16) as i16 as f32) / 32768.0);
+        }
+        data
+    }
+
+    fn make_f32_tensor(backend: &Arc<dyn Backend>, shape: Vec<usize>, data: &[f32]) -> Tensor {
+        let memory = Galloc::new();
+        let n = data.len();
+        let buf = memory.alloc(n * 4, DType::F32).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr() as *const u8, buf.as_mut_ptr(), n * 4);
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    fn make_f32_tensor_zeros(backend: &Arc<dyn Backend>, shape: Vec<usize>) -> Tensor {
+        let n: usize = shape.iter().product();
+        let memory = Galloc::new();
+        let buf = memory.alloc(n * 4, DType::F32).unwrap();
+        unsafe {
+            std::ptr::write_bytes(buf.as_mut_ptr(), 0, n * 4);
+        }
+        Tensor::new(Shape::new(shape), buf, backend.clone())
+    }
+
+    fn scalar_backend() -> Arc<dyn Backend> {
+        Arc::new(CpuBackendCommon::new())
+    }
+
+    fn avx2_backend() -> Arc<dyn Backend> {
+        Arc::new(CpuBackendAVX2::new())
+    }
+
+    fn assert_close(a: &[f32], b: &[f32], tol: f32, msg: &str) {
+        assert_eq!(
+            a.len(),
+            b.len(),
+            "{}: length mismatch {} vs {}",
+            msg,
+            a.len(),
+            b.len()
+        );
+        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+            let diff = (va - vb).abs();
+            assert!(
+                diff <= tol,
+                "{}: element [{}] differs: {} vs {}, diff={}, tol={}",
+                msg,
+                i,
+                va,
+                vb,
+                diff,
+                tol
+            );
+        }
+    }
+
+    // ---- exp_ps accuracy test ----
+
+    #[test]
+    fn test_exp_ps_accuracy() {
+        // Test within the clamped range [-88, 88] where exp_ps is precise
+        let test_values: Vec<f32> = (-176..=176).map(|i| i as f32 * 0.5).collect();
+        for &x in &test_values {
+            let expected = x.exp();
+            let result = unsafe {
+                let v = _mm256_set1_ps(x);
+                let r = CpuBackendAVX2::exp_ps(v);
+                let mut out = [0.0f32; 8];
+                _mm256_storeu_ps(out.as_mut_ptr(), r);
+                out[0]
+            };
+            if expected.is_infinite() || expected < 1e-38 || expected == 0.0 {
+                continue; // skip denormals and extremes
+            }
+            let rel_err = ((result - expected) / expected).abs();
+            assert!(
+                rel_err < 2e-6,
+                "exp({}) = {} (expected {}), rel_err = {}",
+                x,
+                result,
+                expected,
+                rel_err
+            );
+        }
+    }
+
+    // ---- add_assign ----
+
+    #[test]
+    fn test_add_assign_avx2() {
+        for &n in &[7, 64, 2048, 20000] {
+            let a_data = gen_data(n, 7);
+            let b_data = gen_data(n, 13);
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let mut a_s = make_f32_tensor(&scalar, vec![n], &a_data);
+            let b_s = make_f32_tensor(&scalar, vec![n], &b_data);
+            let mut a_a = make_f32_tensor(&avx2, vec![n], &a_data);
+            let b_a = make_f32_tensor(&avx2, vec![n], &b_data);
+
+            scalar.add_assign(&mut a_s, &b_s).unwrap();
+            avx2.add_assign(&mut a_a, &b_a).unwrap();
+
+            assert_close(
+                a_s.as_slice::<f32>(),
+                a_a.as_slice::<f32>(),
+                1e-7,
+                &format!("add_assign n={}", n),
+            );
+        }
+    }
+
+    // ---- scale ----
+
+    #[test]
+    fn test_scale_avx2() {
+        for &n in &[3, 64, 2048, 20000] {
+            let x_data = gen_data(n, 41);
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let mut x_s = make_f32_tensor(&scalar, vec![n], &x_data);
+            let mut x_a = make_f32_tensor(&avx2, vec![n], &x_data);
+
+            scalar.scale(&mut x_s, 2.5).unwrap();
+            avx2.scale(&mut x_a, 2.5).unwrap();
+
+            assert_close(
+                x_s.as_slice::<f32>(),
+                x_a.as_slice::<f32>(),
+                1e-7,
+                &format!("scale n={}", n),
+            );
+        }
+    }
+
+    // ---- silu_mul ----
+
+    #[test]
+    fn test_silu_mul_avx2() {
+        for &n in &[3, 64, 2048, 20000] {
+            let a_data = gen_data(n, 11);
+            let b_data = gen_data(n, 29);
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let mut a_s = make_f32_tensor(&scalar, vec![n], &a_data);
+            let b_s = make_f32_tensor(&scalar, vec![n], &b_data);
+            let mut a_a = make_f32_tensor(&avx2, vec![n], &a_data);
+            let b_a = make_f32_tensor(&avx2, vec![n], &b_data);
+
+            scalar.silu_mul(&mut a_s, &b_s).unwrap();
+            avx2.silu_mul(&mut a_a, &b_a).unwrap();
+
+            assert_close(
+                a_s.as_slice::<f32>(),
+                a_a.as_slice::<f32>(),
+                1e-5,
+                &format!("silu_mul n={}", n),
+            );
+        }
+    }
+
+    // ---- rms_norm ----
+
+    #[test]
+    fn test_rms_norm_avx2() {
+        for &(rows, dim) in &[(1, 7), (4, 64), (2, 256)] {
+            let x_data = gen_data(rows * dim, 19);
+            let w_data: Vec<f32> = (0..dim).map(|i| 0.5 + (i as f32 * 0.01)).collect();
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let mut x_s = make_f32_tensor(&scalar, vec![rows, dim], &x_data);
+            let w_s = make_f32_tensor(&scalar, vec![dim], &w_data);
+            let mut x_a = make_f32_tensor(&avx2, vec![rows, dim], &x_data);
+            let w_a = make_f32_tensor(&avx2, vec![dim], &w_data);
+
+            scalar.rms_norm(&mut x_s, &w_s, 1e-5).unwrap();
+            avx2.rms_norm(&mut x_a, &w_a, 1e-5).unwrap();
+
+            assert_close(
+                x_s.as_slice::<f32>(),
+                x_a.as_slice::<f32>(),
+                1e-5,
+                &format!("rms_norm rows={} dim={}", rows, dim),
+            );
+        }
+    }
+
+    #[test]
+    fn test_rms_norm_avx2_large() {
+        // Large dim requires relaxed tolerance due to FP accumulation order
+        let (rows, dim) = (2, 2048);
+        let x_data = gen_data(rows * dim, 19);
+        let w_data: Vec<f32> = (0..dim).map(|i| 0.5 + (i as f32 * 0.01)).collect();
+        let scalar = scalar_backend();
+        let avx2 = avx2_backend();
+
+        let mut x_s = make_f32_tensor(&scalar, vec![rows, dim], &x_data);
+        let w_s = make_f32_tensor(&scalar, vec![dim], &w_data);
+        let mut x_a = make_f32_tensor(&avx2, vec![rows, dim], &x_data);
+        let w_a = make_f32_tensor(&avx2, vec![dim], &w_data);
+
+        scalar.rms_norm(&mut x_s, &w_s, 1e-5).unwrap();
+        avx2.rms_norm(&mut x_a, &w_a, 1e-5).unwrap();
+
+        assert_close(
+            x_s.as_slice::<f32>(),
+            x_a.as_slice::<f32>(),
+            5e-5,
+            "rms_norm_large rows=2 dim=2048",
+        );
+    }
+
+    // ---- softmax ----
+
+    #[test]
+    fn test_softmax_avx2() {
+        for &(rows, dim) in &[(1, 3), (4, 32), (2, 2048)] {
+            let x_data = gen_data(rows * dim, 23);
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let mut x_s = make_f32_tensor(&scalar, vec![rows, dim], &x_data);
+            let mut x_a = make_f32_tensor(&avx2, vec![rows, dim], &x_data);
+
+            scalar.softmax(&mut x_s).unwrap();
+            avx2.softmax(&mut x_a).unwrap();
+
+            assert_close(
+                x_s.as_slice::<f32>(),
+                x_a.as_slice::<f32>(),
+                1e-5,
+                &format!("softmax rows={} dim={}", rows, dim),
+            );
+        }
+    }
+
+    // ---- edge cases ----
+
+    #[test]
+    fn test_softmax_all_zeros() {
+        let dim = 64;
+        let x_data = vec![0.0f32; dim];
+        let avx2 = avx2_backend();
+        let mut x = make_f32_tensor(&avx2, vec![1, dim], &x_data);
+        avx2.softmax(&mut x).unwrap();
+        let result = x.as_slice::<f32>();
+        let expected = 1.0 / dim as f32;
+        for &v in result {
+            assert!((v - expected).abs() < 1e-6, "uniform softmax: got {}", v);
+        }
+    }
+
+    // ---- attention_gen F32 ----
+
+    #[test]
+    fn test_attention_gen_f32_avx2() {
+        let num_heads_q = 4;
+        let num_heads_kv = 2;
+        let head_dim = 64;
+        let cache_seq_len = 16;
+        let capacity = 32;
+
+        // HeadMajor layout: [1, kv_heads, capacity, head_dim]
+        let q_data = gen_data(num_heads_q * head_dim, 42);
+        let k_data = gen_data(num_heads_kv * capacity * head_dim, 137);
+        let v_data = gen_data(num_heads_kv * capacity * head_dim, 53);
+
+        let scalar = scalar_backend();
+        let avx2 = avx2_backend();
+
+        let q_s = make_f32_tensor(&scalar, vec![num_heads_q, head_dim], &q_data);
+        let k_s = make_f32_tensor(&scalar, vec![1, num_heads_kv, capacity, head_dim], &k_data);
+        let v_s = make_f32_tensor(&scalar, vec![1, num_heads_kv, capacity, head_dim], &v_data);
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![num_heads_q, head_dim]);
+
+        let q_a = make_f32_tensor(&avx2, vec![num_heads_q, head_dim], &q_data);
+        let k_a = make_f32_tensor(&avx2, vec![1, num_heads_kv, capacity, head_dim], &k_data);
+        let v_a = make_f32_tensor(&avx2, vec![1, num_heads_kv, capacity, head_dim], &v_data);
+        let mut out_a = make_f32_tensor_zeros(&avx2, vec![num_heads_q, head_dim]);
+
+        scalar
+            .attention_gen(
+                &q_s,
+                &k_s,
+                &v_s,
+                &mut out_s,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+            )
+            .unwrap();
+        avx2.attention_gen(
+            &q_a,
+            &k_a,
+            &v_a,
+            &mut out_a,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+        )
+        .unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-4,
+            "attention_gen F32 HeadMajor",
+        );
+    }
+
+    // ---- attention_gen F16 ----
+
+    #[test]
+    fn test_attention_gen_f16_avx2() {
+        let num_heads_q = 4;
+        let num_heads_kv = 2;
+        let head_dim = 64;
+        let cache_seq_len = 16;
+        let capacity = 32;
+
+        let q_data = gen_data(num_heads_q * head_dim, 42);
+        // F16 KV cache
+        let k_f32 = gen_data(num_heads_kv * capacity * head_dim, 137);
+        let v_f32 = gen_data(num_heads_kv * capacity * head_dim, 53);
+        let k_f16: Vec<half::f16> = k_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+        let v_f16: Vec<half::f16> = v_f32.iter().map(|&v| half::f16::from_f32(v)).collect();
+
+        let scalar = scalar_backend();
+        let avx2 = avx2_backend();
+
+        let q_s = make_f32_tensor(&scalar, vec![num_heads_q, head_dim], &q_data);
+        let q_a = make_f32_tensor(&avx2, vec![num_heads_q, head_dim], &q_data);
+
+        let kv_shape = vec![1, num_heads_kv, capacity, head_dim];
+        let kv_numel = num_heads_kv * capacity * head_dim;
+
+        // Create F16 tensors
+        let memory = Galloc::new();
+        let k_buf_s = memory.alloc(kv_numel * 2, DType::F16).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                k_f16.as_ptr() as *const u8,
+                k_buf_s.as_mut_ptr(),
+                kv_numel * 2,
+            );
+        }
+        let k_s = Tensor::new(Shape::new(kv_shape.clone()), k_buf_s, scalar.clone());
+
+        let v_buf_s = memory.alloc(kv_numel * 2, DType::F16).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                v_f16.as_ptr() as *const u8,
+                v_buf_s.as_mut_ptr(),
+                kv_numel * 2,
+            );
+        }
+        let v_s = Tensor::new(Shape::new(kv_shape.clone()), v_buf_s, scalar.clone());
+
+        let k_buf_a = memory.alloc(kv_numel * 2, DType::F16).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                k_f16.as_ptr() as *const u8,
+                k_buf_a.as_mut_ptr(),
+                kv_numel * 2,
+            );
+        }
+        let k_a = Tensor::new(Shape::new(kv_shape.clone()), k_buf_a, avx2.clone());
+
+        let v_buf_a = memory.alloc(kv_numel * 2, DType::F16).unwrap();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                v_f16.as_ptr() as *const u8,
+                v_buf_a.as_mut_ptr(),
+                kv_numel * 2,
+            );
+        }
+        let v_a = Tensor::new(Shape::new(kv_shape), v_buf_a, avx2.clone());
+
+        let mut out_s = make_f32_tensor_zeros(&scalar, vec![num_heads_q, head_dim]);
+        let mut out_a = make_f32_tensor_zeros(&avx2, vec![num_heads_q, head_dim]);
+
+        scalar
+            .attention_gen(
+                &q_s,
+                &k_s,
+                &v_s,
+                &mut out_s,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+            )
+            .unwrap();
+        avx2.attention_gen(
+            &q_a,
+            &k_a,
+            &v_a,
+            &mut out_a,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+        )
+        .unwrap();
+
+        assert_close(
+            out_s.as_slice::<f32>(),
+            out_a.as_slice::<f32>(),
+            1e-3,
+            "attention_gen F16 HeadMajor",
+        );
+    }
+
+    // ---- cast F16↔F32 ----
+
+    #[test]
+    fn test_cast_f32_to_f16_avx2() {
+        for &n in &[3, 64, 2048] {
+            let src_data = gen_data(n, 59);
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let src_s = make_f32_tensor(&scalar, vec![n], &src_data);
+            let src_a = make_f32_tensor(&avx2, vec![n], &src_data);
+
+            let memory = Galloc::new();
+            let dst_buf_s = memory.alloc(n * 2, DType::F16).unwrap();
+            let mut dst_s = Tensor::new(Shape::new(vec![n]), dst_buf_s, scalar.clone());
+            let dst_buf_a = memory.alloc(n * 2, DType::F16).unwrap();
+            let mut dst_a = Tensor::new(Shape::new(vec![n]), dst_buf_a, avx2.clone());
+
+            scalar.cast(&src_s, &mut dst_s).unwrap();
+            avx2.cast(&src_a, &mut dst_a).unwrap();
+
+            let s_data = dst_s.as_slice::<half::f16>();
+            let a_data = dst_a.as_slice::<half::f16>();
+            for i in 0..n {
+                assert_eq!(
+                    s_data[i].to_bits(),
+                    a_data[i].to_bits(),
+                    "cast F32→F16 mismatch at [{}]",
+                    i
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cast_f16_to_f32_avx2() {
+        for &n in &[3, 64, 2048] {
+            let f32_data = gen_data(n, 71);
+            let f16_data: Vec<half::f16> =
+                f32_data.iter().map(|&v| half::f16::from_f32(v)).collect();
+
+            let scalar = scalar_backend();
+            let avx2 = avx2_backend();
+
+            let memory = Galloc::new();
+            // Create F16 source tensors
+            let src_buf_s = memory.alloc(n * 2, DType::F16).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    f16_data.as_ptr() as *const u8,
+                    src_buf_s.as_mut_ptr(),
+                    n * 2,
+                );
+            }
+            let src_s = Tensor::new(Shape::new(vec![n]), src_buf_s, scalar.clone());
+
+            let src_buf_a = memory.alloc(n * 2, DType::F16).unwrap();
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    f16_data.as_ptr() as *const u8,
+                    src_buf_a.as_mut_ptr(),
+                    n * 2,
+                );
+            }
+            let src_a = Tensor::new(Shape::new(vec![n]), src_buf_a, avx2.clone());
+
+            let mut dst_s = make_f32_tensor_zeros(&scalar, vec![n]);
+            let mut dst_a = make_f32_tensor_zeros(&avx2, vec![n]);
+
+            scalar.cast(&src_s, &mut dst_s).unwrap();
+            avx2.cast(&src_a, &mut dst_a).unwrap();
+
+            assert_close(
+                dst_s.as_slice::<f32>(),
+                dst_a.as_slice::<f32>(),
+                0.0,
+                &format!("cast F16→F32 n={}", n),
+            );
+        }
+    }
+
+    // ---- edge cases ----
+
+    #[test]
+    fn test_rms_norm_all_ones() {
+        let dim = 64;
+        let x_data = vec![1.0f32; dim];
+        let w_data = vec![1.0f32; dim];
+        let avx2 = avx2_backend();
+        let mut x = make_f32_tensor(&avx2, vec![1, dim], &x_data);
+        let w = make_f32_tensor(&avx2, vec![dim], &w_data);
+        avx2.rms_norm(&mut x, &w, 1e-5).unwrap();
+        let result = x.as_slice::<f32>();
+        // RMS of all ones = 1.0, so scale ≈ 1.0, result ≈ 1.0
+        for &v in result {
+            assert!((v - 1.0).abs() < 1e-4, "rms_norm all ones: got {}", v);
+        }
     }
 }
