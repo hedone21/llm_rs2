@@ -1,3 +1,4 @@
+use crate::core::buffer::DType;
 use crate::core::tensor::Tensor;
 use anyhow::Result;
 
@@ -216,25 +217,52 @@ pub trait Backend: Send + Sync {
     // indices: [NumIndices] (Indices)
     // dst: [NumIndices, Cols] (Output)
     fn gather(&self, src: &Tensor, indices: &Tensor, dst: &mut Tensor) -> Result<()> {
-        // Default CPU implementation
-        let src_data =
-            unsafe { std::slice::from_raw_parts(src.as_ptr() as *const f32, src.size() / 4) };
+        // Default CPU implementation — supports F32 and F16 src → F32 dst
         let idx_data = unsafe {
             std::slice::from_raw_parts(indices.as_ptr() as *const u32, indices.size() / 4)
-        }; // U8 buffer, U32 data
+        };
         let dst_data =
             unsafe { std::slice::from_raw_parts_mut(dst.as_mut_ptr() as *mut f32, dst.size() / 4) };
 
         let cols = src.shape().dims()[1];
+        let src_rows = src.shape().dims()[0];
 
-        // Validation?
-
-        for (i, &idx) in idx_data.iter().enumerate() {
-            let offset = idx as usize * cols;
-            let target_offset = i * cols;
-            if offset + cols <= src_data.len() && target_offset + cols <= dst_data.len() {
-                dst_data[target_offset..target_offset + cols]
-                    .copy_from_slice(&src_data[offset..offset + cols]);
+        match src.dtype() {
+            DType::F32 => {
+                let src_data = unsafe {
+                    std::slice::from_raw_parts(src.as_ptr() as *const f32, src_rows * cols)
+                };
+                for (i, &idx) in idx_data.iter().enumerate() {
+                    let offset = idx as usize * cols;
+                    let target_offset = i * cols;
+                    if offset + cols <= src_data.len() && target_offset + cols <= dst_data.len() {
+                        dst_data[target_offset..target_offset + cols]
+                            .copy_from_slice(&src_data[offset..offset + cols]);
+                    }
+                }
+            }
+            DType::F16 => {
+                let src_data = unsafe {
+                    std::slice::from_raw_parts(
+                        src.as_ptr() as *const half::f16,
+                        src_rows * cols,
+                    )
+                };
+                for (i, &idx) in idx_data.iter().enumerate() {
+                    let offset = idx as usize * cols;
+                    let target_offset = i * cols;
+                    if offset + cols <= src_data.len() && target_offset + cols <= dst_data.len() {
+                        for d in 0..cols {
+                            dst_data[target_offset + d] = src_data[offset + d].to_f32();
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "gather: unsupported src dtype {:?}",
+                    src.dtype()
+                ));
             }
         }
         Ok(())

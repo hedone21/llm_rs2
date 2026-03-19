@@ -423,7 +423,13 @@ impl TransformerModel {
         }
 
         // 4. Load Other Components
-        let embed_tokens = load_tensor(mapper.embed_name(), false)?;
+        // CPU + F16 weights: load embed_tokens as F16 MmapBuffer (gather supports F16→F32)
+        // Otherwise: load as F32 (GPU gather requires F32)
+        let embed_tokens = if is_cpu && weight_dtype == DType::F16 {
+            load_tensor(mapper.embed_name(), true)?
+        } else {
+            load_tensor(mapper.embed_name(), false)?
+        };
         let norm = load_tensor(mapper.norm_name(), false)?;
 
         let lm_head_name = mapper.lm_head_name();
@@ -441,22 +447,37 @@ impl TransformerModel {
                 "lm_head not found, casting embed_tokens to {:?} for lm_head...",
                 weight_dtype
             );
-            if weight_dtype == DType::F32 {
-                // F32 mode: share buffer directly (zero-copy)
+            if embed_tokens.dtype() == weight_dtype || weight_dtype == DType::F32 {
+                // Same dtype or F32 mode: share buffer directly (zero-copy)
                 embed_tokens.clone()
-            } else if backend.name().contains("CPU") {
-                // CPU: convert F32 → F16 in memory (no safetensors re-read)
+            } else if is_cpu {
+                // CPU: convert embed_tokens → weight_dtype in memory
                 let num_elements: usize = embed_tokens.shape().dims().iter().product();
                 let dst_buf = cpu_memory.alloc(num_elements * weight_dtype.size(), weight_dtype)?;
-                let src_data = unsafe {
-                    std::slice::from_raw_parts(
-                        embed_tokens.as_ptr() as *const f32,
-                        num_elements,
-                    )
-                };
                 let dst_ptr = dst_buf.as_mut_ptr() as *mut half::f16;
-                for (i, &v) in src_data.iter().enumerate() {
-                    unsafe { *dst_ptr.add(i) = half::f16::from_f32(v) };
+                match embed_tokens.dtype() {
+                    DType::F32 => {
+                        let src = unsafe {
+                            std::slice::from_raw_parts(
+                                embed_tokens.as_ptr() as *const f32,
+                                num_elements,
+                            )
+                        };
+                        for (i, &v) in src.iter().enumerate() {
+                            unsafe { *dst_ptr.add(i) = half::f16::from_f32(v) };
+                        }
+                    }
+                    DType::F16 => {
+                        // Already F16 — just copy bytes
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                embed_tokens.as_ptr(),
+                                dst_buf.as_mut_ptr(),
+                                num_elements * 2,
+                            );
+                        }
+                    }
+                    _ => {}
                 }
                 Tensor::new(embed_tokens.shape().clone(), dst_buf, backend.clone())
             } else {
