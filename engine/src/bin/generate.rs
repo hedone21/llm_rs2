@@ -810,6 +810,7 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         );
 
+        let prefill_timer = std::time::Instant::now();
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
@@ -825,6 +826,8 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
         })?;
+        backend.synchronize()?;
+        let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
             cache_manager.maybe_evict(&mut kv_caches).ok();
@@ -852,6 +855,12 @@ fn main() -> anyhow::Result<()> {
         );
 
         _ttft_ms = start_time.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "Prefill: {:.2} ms ({} tokens, {:.1} tok/s)",
+            prefill_forward_ms,
+            process_len,
+            process_len as f64 / (prefill_forward_ms / 1000.0),
+        );
         _last_token_time = std::time::Instant::now();
 
         tokens.push(next_token_id);
@@ -1024,6 +1033,7 @@ fn main() -> anyhow::Result<()> {
                     gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                 }
             }
+            backend.synchronize()?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
             // ── H2O Debug: per-step diagnostics ──
@@ -1521,6 +1531,16 @@ fn main() -> anyhow::Result<()> {
     println!("\nDone.");
     println!("[Profile] Event: End");
     println!("TTFT: {:.2} ms", _ttft_ms);
+    if !forward_ms_values.is_empty() {
+        let avg_forward: f64 =
+            forward_ms_values.iter().sum::<f64>() / forward_ms_values.len() as f64;
+        println!(
+            "Decode: {:.2} ms/tok ({:.1} tok/s) [{} tokens, forward only]",
+            avg_forward,
+            1000.0 / avg_forward,
+            forward_ms_values.len(),
+        );
+    }
     if !tbt_values.is_empty() {
         let avg_tbt: f64 = tbt_values.iter().sum::<f64>() / tbt_values.len() as f64;
         println!(
