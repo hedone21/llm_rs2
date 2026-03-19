@@ -403,9 +403,55 @@ impl TransformerModel {
         let lm_head = if has_lm_head {
             load_tensor(lm_head_name, true)?
         } else {
-            // Tied weights: use embed_tokens with weight_dtype for lm_head
-            eprintln!("lm_head not found, using embed_tokens as lm_head...");
-            load_tensor(mapper.embed_name(), true)?
+            // Tied weights: cast embed_tokens F32 → weight_dtype on device
+            // Avoids re-reading safetensors; reuses already-loaded GPU data
+            eprintln!(
+                "lm_head not found, casting embed_tokens to {:?} for lm_head...",
+                weight_dtype
+            );
+            if weight_dtype == DType::F32 {
+                // F32 mode: share buffer directly (zero-copy)
+                embed_tokens.clone()
+            } else if backend.name().contains("CPU") {
+                // CPU: convert F32 → F16 in memory (no safetensors re-read)
+                let num_elements: usize = embed_tokens.shape().dims().iter().product();
+                let dst_buf = cpu_memory.alloc(num_elements * weight_dtype.size(), weight_dtype)?;
+                let src_data = unsafe {
+                    std::slice::from_raw_parts(
+                        embed_tokens.as_ptr() as *const f32,
+                        num_elements,
+                    )
+                };
+                let dst_ptr = dst_buf.as_mut_ptr() as *mut half::f16;
+                for (i, &v) in src_data.iter().enumerate() {
+                    unsafe { *dst_ptr.add(i) = half::f16::from_f32(v) };
+                }
+                Tensor::new(embed_tokens.shape().clone(), dst_buf, backend.clone())
+            } else {
+                // GPU: cast F32 → F16 on device via kernel (no safetensors re-read)
+                let num_elements: usize = embed_tokens.shape().dims().iter().product();
+                let dst_size = num_elements * weight_dtype.size();
+                let memory = crate::backend::opencl::memory::OpenCLMemory::new(
+                    backend
+                        .as_any()
+                        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                        .ok_or_else(|| anyhow!("Expected OpenCL backend"))?
+                        .context
+                        .clone(),
+                    backend
+                        .as_any()
+                        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                        .ok_or_else(|| anyhow!("Expected OpenCL backend"))?
+                        .queue
+                        .clone(),
+                    false,
+                );
+                let dst_buf = memory.alloc(dst_size, weight_dtype)?;
+                let mut lm_tensor =
+                    Tensor::new(embed_tokens.shape().clone(), dst_buf, backend.clone());
+                backend.cast(&embed_tokens, &mut lm_tensor)?;
+                lm_tensor
+            }
         };
 
         Ok(Self {
