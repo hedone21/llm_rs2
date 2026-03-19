@@ -83,6 +83,8 @@ struct KernelCache {
     kernel_kv_scatter_f32_to_f16: CoreKernel,
     kernel_rms_norm_oop: CoreKernel,
     kernel_add_rms_norm_oop: CoreKernel,
+    kernel_flash_attn_f32: Option<CoreKernel>,
+    kernel_flash_attn_f32_f16: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -104,6 +106,10 @@ pub struct OpenCLBackend {
     pub f16_program: Program,
     pub quant_q4_0_program: Program,
     pub get_rows_program: Program,
+
+    // Flash attention programs (optional — compiled with head_dim-specific defines)
+    pub flash_attn_f32_program: Option<Program>,
+    pub flash_attn_f32_f16_program: Option<Program>,
 
     // Cached kernels — inference is single-threaded, no lock needed.
     // UnsafeCell avoids Mutex overhead (~170us/lock on Adreno).
@@ -352,6 +358,48 @@ impl OpenCLBackend {
             }
         };
 
+        // Flash attention kernels — compiled with head_dim-specific defines
+        // DK/DV=64 matches Llama 3.2 1B head_dim; BLOCK_M=64 (WG), BLOCK_N=32 (KV tile)
+        let flash_attn_defines = "-DDK=64 -DDV=64 -DBLOCK_M=64 -DBLOCK_N=32";
+        let flash_attn_f32_opts = format!("{} {}", cl_opts, flash_attn_defines);
+
+        let flash_attn_f32_src = include_str!("../../../kernels/flash_attn_f32.cl");
+        let flash_attn_f32_program = match Program::builder()
+            .devices(device)
+            .src(flash_attn_f32_src)
+            .cmplr_opt(&flash_attn_f32_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("flash_attn_f32.cl compiled (BLOCK_M=64, BLOCK_N=32, DK=64)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!("flash_attn_f32.cl failed: {}. GPU prefill F32 disabled.", e);
+                None
+            }
+        };
+
+        let flash_attn_f32_f16_src = include_str!("../../../kernels/flash_attn_f32_f16.cl");
+        let flash_attn_f32_f16_program = match Program::builder()
+            .devices(device)
+            .src(flash_attn_f32_f16_src)
+            .cmplr_opt(&flash_attn_f32_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("flash_attn_f32_f16.cl compiled (Q=F32, KV=F16)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "flash_attn_f32_f16.cl failed: {}. GPU prefill F16 KV disabled.",
+                    e
+                );
+                None
+            }
+        };
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -420,6 +468,12 @@ impl OpenCLBackend {
                 &simple_ops_program,
                 "kernel_add_rms_norm_oop",
             )?,
+            kernel_flash_attn_f32: flash_attn_f32_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32").ok()),
+            kernel_flash_attn_f32_f16: flash_attn_f32_f16_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16").ok()),
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -434,6 +488,8 @@ impl OpenCLBackend {
             f16_program,
             quant_q4_0_program,
             get_rows_program,
+            flash_attn_f32_program,
+            flash_attn_f32_f16_program,
             kernels: UnsafeCell::new(kernel_cache),
         })
     }
@@ -572,6 +628,171 @@ impl OpenCLBackend {
             )?;
         }
         Ok(())
+    }
+
+    /// GPU flash attention for prefill. Dispatches flash_attn_f32 or flash_attn_f32_f16 kernel.
+    /// Returns Ok(true) if GPU kernel was dispatched, Ok(false) if unsupported (caller should
+    /// fall back to CPU).
+    ///
+    /// Q: [batch, seq_len, n_heads_q, head_dim] F32 (on GPU)
+    /// K/V cache: HeadMajor [1, kv_heads, capacity, head_dim] F32 or F16 (on GPU)
+    /// Output: [batch, seq_len, n_heads_q * head_dim] F32 (on GPU)
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_prefill(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        head_dim: usize,
+        kv_capacity: usize,
+        batch_size: usize,
+        is_head_major: bool,
+    ) -> Result<bool> {
+        // Compiled with DK=DV=64; only support matching head_dim
+        if head_dim != 64 {
+            return Ok(false);
+        }
+
+        let kv_dtype = k_cache.dtype();
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = match kv_dtype {
+            DType::F32 => match &kernels.kernel_flash_attn_f32 {
+                Some(k) => k,
+                None => return Ok(false),
+            },
+            DType::F16 => match &kernels.kernel_flash_attn_f32_f16 {
+                Some(k) => k,
+                None => return Ok(false),
+            },
+            _ => return Ok(false), // Q4_0 not supported by flash attn kernel
+        };
+
+        let q_buf = get_cl_mem(q.buffer().as_ref())?;
+        let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
+        let v_buf = get_cl_mem(v_cache.buffer().as_ref())?;
+        let o_buf = get_cl_mem(out.buffer().as_ref())?;
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let kv_elem_size: usize = match kv_dtype {
+            DType::F16 => 2,
+            _ => 4,
+        };
+
+        // Q strides in bytes (F32, row-major [batch, seq_len, n_heads_q, head_dim])
+        let q_nb1 = (n_heads_q * head_dim * 4) as u64; // position stride
+        let q_nb2 = (head_dim * 4) as u64; // head stride
+        let q_nb3 = seq_len as u64 * q_nb1; // batch stride
+
+        // KV strides in bytes
+        let (k_nb1, k_nb2, k_nb3) = if is_head_major {
+            // HeadMajor: [batch, kv_heads, capacity, head_dim]
+            let pos_stride = (head_dim * kv_elem_size) as u64;
+            let head_stride = (kv_capacity * head_dim * kv_elem_size) as u64;
+            let batch_stride = n_heads_kv as u64 * head_stride;
+            (pos_stride, head_stride, batch_stride)
+        } else {
+            // SeqMajor: [batch, capacity, kv_heads, head_dim]
+            let pos_stride = (n_heads_kv * head_dim * kv_elem_size) as u64;
+            let head_stride = (head_dim * kv_elem_size) as u64;
+            let batch_stride = kv_capacity as u64 * pos_stride;
+            (pos_stride, head_stride, batch_stride)
+        };
+        let (v_nb1, v_nb2, v_nb3) = (k_nb1, k_nb2, k_nb3);
+
+        // Output strides in bytes (F32, [batch, seq_len, n_heads_q, head_dim])
+        let o_nb1 = (head_dim * 4) as u64; // head stride
+        let o_nb2 = (n_heads_q * head_dim * 4) as u64; // position stride
+        let o_nb3 = seq_len as u64 * o_nb2; // batch stride
+
+        let n_q = seq_len as i32;
+        let n_kv = cache_seq_len as i32;
+        let is_causal = 1i32;
+        let n_head = n_heads_q as i32;
+        let n_head_kv_arg = n_heads_kv as i32;
+        let max_bias = 0.0f32;
+        let m0 = 0.0f32;
+        let m1 = 0.0f32;
+        let n_head_log2 = 0i32;
+        let logit_softcap = 0.0f32;
+        let zero_u64 = 0u64;
+        let zero_i32 = 0i32;
+
+        unsafe {
+            // Q, K, V, O buffers + offsets (args 0-7)
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(k_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(v_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::mem(o_buf))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
+            // Scalar params (args 8-12)
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&n_kv))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
+            // Q strides (args 13-15)
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
+            // K strides (args 16-18)
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
+            // V strides (args 19-21)
+            ocl::core::set_kernel_arg(kernel, 19, ocl::core::ArgVal::scalar(&v_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 20, ocl::core::ArgVal::scalar(&v_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 21, ocl::core::ArgVal::scalar(&v_nb3))?;
+            // O strides (args 22-24)
+            ocl::core::set_kernel_arg(kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
+            // ALiBi params — unused (args 25-29)
+            ocl::core::set_kernel_arg(kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
+            ocl::core::set_kernel_arg(kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
+            ocl::core::set_kernel_arg(kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
+            ocl::core::set_kernel_arg(kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
+            ocl::core::set_kernel_arg(kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
+            // n_head_kv (arg 30)
+            ocl::core::set_kernel_arg(kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
+            // mask = NULL (args 31-37)
+            ocl::core::set_kernel_arg(kernel, 31, ocl::core::ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
+            ocl::core::set_kernel_arg(kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
+            // sinks = NULL (args 38-39)
+            ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+
+            // Work size: [ceil(n_q/BLOCK_M) * BLOCK_M, n_heads_q * batch_size, 1]
+            const BLOCK_M: usize = 64;
+            let n_groups_q = seq_len.div_ceil(BLOCK_M);
+            let global_work_size: [usize; 3] = [n_groups_q * BLOCK_M, n_heads_q * batch_size, 1];
+            let local_work_size: [usize; 3] = [BLOCK_M, 1, 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                2,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        Ok(true)
     }
 }
 

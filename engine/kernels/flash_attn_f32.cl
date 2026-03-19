@@ -109,6 +109,8 @@ __kernel void flash_attn_f32(
             if (k_row_idx < n_kv) {
                 const ulong k_row_offset = batch_idx * k_nb3 + head_kv_idx * k_nb2 + k_row_idx * k_nb1;
                 l_k[row][col] = ((__global DATA_TYPE4*)(k_base + k_row_offset))[col];
+            } else {
+                l_k[row][col] = (DATA_TYPE4)(0.0f);
             }
         }
         for (int i = tid; i < BLOCK_N * DV_VEC; i += WG_SIZE) {
@@ -118,6 +120,8 @@ __kernel void flash_attn_f32(
             if (v_row_idx < n_kv) {
                 const ulong v_row_offset = batch_idx * v_nb3 + head_kv_idx * v_nb2 + v_row_idx * v_nb1;
                 l_v[row][col] = ((__global DATA_TYPE4*)(v_base + v_row_offset))[col];
+            } else {
+                l_v[row][col] = (DATA_TYPE4)(0.0f);
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
