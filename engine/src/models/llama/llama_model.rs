@@ -22,6 +22,27 @@ use crate::memory::galloc::Galloc;
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
 
+/// Release mmap pages after tensor data has been converted.
+/// Calls MADV_DONTNEED on the page-aligned region so the kernel can reclaim
+/// the source (e.g. BF16) pages that are no longer needed.
+#[cfg(unix)]
+fn release_source_pages(data: &[u8]) {
+    const PAGE_SIZE: usize = 4096;
+    let start = data.as_ptr() as usize;
+    let end = start + data.len();
+    let aligned_start = (start + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let aligned_end = end & !(PAGE_SIZE - 1);
+    if aligned_end > aligned_start {
+        unsafe {
+            libc::madvise(
+                aligned_start as *mut libc::c_void,
+                aligned_end - aligned_start,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct LlamaConfig {
     pub hidden_size: usize,
@@ -115,7 +136,9 @@ impl LlamaModel {
                 // madvise hints for weight mmap:
                 // - HUGEPAGE: request 2MB THP (reduces TLB misses ~500x)
                 // - SEQUENTIAL: hint sequential readahead (matches GEMV access)
-                // - WILLNEED: prefault all pages (avoid faults during inference)
+                // NOTE: MADV_WILLNEED removed — it prefaults the entire file into RSS
+                // (~2.4 GB for 1B model), inflating peak memory during loading.
+                // Pages are faulted on-demand during tensor conversion instead.
                 #[cfg(unix)]
                 {
                     let ptr = mmap.as_ptr() as *mut libc::c_void;
@@ -123,7 +146,6 @@ impl LlamaModel {
                     unsafe {
                         libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
                         libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
-                        libc::madvise(ptr, len, libc::MADV_WILLNEED);
                     }
                 }
                 Ok(Arc::new(mmap))
@@ -212,6 +234,13 @@ impl LlamaModel {
                     }
                 }
 
+                // Release source mmap pages — conversion is complete, BF16 data no longer needed
+                #[cfg(unix)]
+                {
+                    let data = tensor_view.data();
+                    release_source_pages(data);
+                }
+
                 let size_bytes = num_elements * 2;
                 let buffer = cpu_memory.alloc(size_bytes, DType::F16)?;
                 unsafe {
@@ -260,6 +289,13 @@ impl LlamaModel {
                         tensor_view.dtype()
                     ));
                 }
+            }
+
+            // Release source mmap pages — data has been read into f32_data
+            #[cfg(unix)]
+            {
+                let data = tensor_view.data();
+                release_source_pages(data);
             }
 
             if target_dtype == DType::Q4_0 {
