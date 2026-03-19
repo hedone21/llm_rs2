@@ -152,6 +152,19 @@ impl TransformerModel {
 
         // Helper to load a specific tensor by name (supports multi-shard lookup)
         // is_weight: true for weight matrices (use weight_dtype), false for norms/embeddings (always F32)
+        let is_cpu = backend.name().contains("CPU");
+
+        // Helper: return tensor for the right backend (skip copy_from on CPU)
+        let finalize_tensor =
+            |shape: Shape, buffer: Arc<dyn crate::core::buffer::Buffer>| -> Result<Tensor> {
+                if is_cpu {
+                    Ok(Tensor::new(shape, buffer, backend.clone()))
+                } else {
+                    let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
+                    backend.copy_from(&cpu_tensor)
+                }
+            };
+
         let load_tensor = |name: &str, is_weight: bool| -> Result<Tensor> {
             let shard_idx = weight_map.get(name).copied().unwrap_or(0);
             let tensor_view = match shard_tensors[shard_idx].tensor(name) {
@@ -166,11 +179,10 @@ impl TransformerModel {
 
             let target_dtype = if is_weight { weight_dtype } else { DType::F32 };
 
-            // F16 weight path: zero-copy mmap when safetensors is already F16 (CPU backend)
+            // F16 weight path
             if target_dtype == DType::F16 {
                 // Fast path: safetensors stores F16 → reference mmap directly (0 copies)
-                if tensor_view.dtype() == safetensors::Dtype::F16 && backend.name().contains("CPU")
-                {
+                if tensor_view.dtype() == safetensors::Dtype::F16 && is_cpu {
                     use crate::buffer::mmap_buffer::MmapBuffer;
                     let data = tensor_view.data();
                     let data_offset =
@@ -182,9 +194,16 @@ impl TransformerModel {
                     return Ok(Tensor::new(shape, buffer, backend.clone()));
                 }
 
-                // Conversion path: BF16/F32 → F16 (requires copy)
+                // Conversion path: convert directly into Galloc buffer (no intermediate Vec)
                 use half::f16;
-                let mut f16_data = vec![f16::from_f32(0.0); num_elements];
+                let size_bytes = num_elements * 2;
+                let buffer = cpu_memory.alloc(size_bytes, DType::F16)?;
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        buffer.as_mut_ptr() as *mut f16,
+                        num_elements,
+                    )
+                };
 
                 match tensor_view.dtype() {
                     safetensors::Dtype::F16 => {
@@ -192,27 +211,27 @@ impl TransformerModel {
                         unsafe {
                             std::ptr::copy_nonoverlapping(
                                 data.as_ptr(),
-                                f16_data.as_mut_ptr() as *mut u8,
+                                buffer.as_mut_ptr(),
                                 data.len(),
                             );
                         }
                     }
                     safetensors::Dtype::BF16 => {
                         let data = tensor_view.data();
-                        let u16_data = unsafe {
+                        let src = unsafe {
                             std::slice::from_raw_parts(data.as_ptr() as *const u16, num_elements)
                         };
-                        for (i, &b) in u16_data.iter().enumerate() {
-                            f16_data[i] = f16::from_f32(half::bf16::from_bits(b).to_f32());
+                        for (i, &b) in src.iter().enumerate() {
+                            dst[i] = f16::from_f32(half::bf16::from_bits(b).to_f32());
                         }
                     }
                     safetensors::Dtype::F32 => {
                         let data = tensor_view.data();
-                        let f32_slice = unsafe {
+                        let src = unsafe {
                             std::slice::from_raw_parts(data.as_ptr() as *const f32, num_elements)
                         };
-                        for (i, &v) in f32_slice.iter().enumerate() {
-                            f16_data[i] = f16::from_f32(v);
+                        for (i, &v) in src.iter().enumerate() {
+                            dst[i] = f16::from_f32(v);
                         }
                     }
                     _ => {
@@ -223,78 +242,60 @@ impl TransformerModel {
                     }
                 }
 
-                // Release source mmap pages — conversion is complete, BF16 data no longer needed
                 #[cfg(unix)]
-                {
-                    let data = tensor_view.data();
-                    release_source_pages(data);
-                }
+                release_source_pages(tensor_view.data());
 
-                let size_bytes = num_elements * 2;
-                let buffer = cpu_memory.alloc(size_bytes, DType::F16)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        f16_data.as_ptr() as *const u8,
-                        buffer.as_mut_ptr(),
-                        size_bytes,
-                    );
-                }
-                let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
-                return backend.copy_from(&cpu_tensor);
+                return finalize_tensor(shape, buffer);
             }
 
-            // F32 / Q4_0 path: read as F32 first
-            let mut f32_data = vec![0.0f32; num_elements];
-
-            match tensor_view.dtype() {
-                safetensors::Dtype::F32 => unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        tensor_view.data().as_ptr(),
-                        f32_data.as_mut_ptr() as *mut u8,
-                        tensor_view.data().len(),
-                    );
-                },
-                safetensors::Dtype::BF16 => {
-                    let data = tensor_view.data();
-                    let u16_data = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const u16, num_elements)
-                    };
-                    for (i, &b) in u16_data.iter().enumerate() {
-                        f32_data[i] = half::bf16::from_bits(b).to_f32();
-                    }
-                }
-                safetensors::Dtype::F16 => {
-                    let data = tensor_view.data();
-                    let u16_data = unsafe {
-                        std::slice::from_raw_parts(data.as_ptr() as *const u16, num_elements)
-                    };
-                    for (i, &b) in u16_data.iter().enumerate() {
-                        f32_data[i] = half::f16::from_bits(b).to_f32();
-                    }
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unsupported dtype in safetensors: {:?}",
-                        tensor_view.dtype()
-                    ));
-                }
-            }
-
-            // Release source mmap pages — data has been read into f32_data
-            #[cfg(unix)]
-            {
-                let data = tensor_view.data();
-                release_source_pages(data);
-            }
-
+            // Q4_0 path: needs intermediate f32_data for quantization
             if target_dtype == DType::Q4_0 {
-                // Quantize to Q4_0
+                let mut f32_data = vec![0.0f32; num_elements];
+                match tensor_view.dtype() {
+                    safetensors::Dtype::F32 => unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            tensor_view.data().as_ptr(),
+                            f32_data.as_mut_ptr() as *mut u8,
+                            tensor_view.data().len(),
+                        );
+                    },
+                    safetensors::Dtype::BF16 => {
+                        let src = unsafe {
+                            std::slice::from_raw_parts(
+                                tensor_view.data().as_ptr() as *const u16,
+                                num_elements,
+                            )
+                        };
+                        for (i, &b) in src.iter().enumerate() {
+                            f32_data[i] = half::bf16::from_bits(b).to_f32();
+                        }
+                    }
+                    safetensors::Dtype::F16 => {
+                        let src = unsafe {
+                            std::slice::from_raw_parts(
+                                tensor_view.data().as_ptr() as *const u16,
+                                num_elements,
+                            )
+                        };
+                        for (i, &b) in src.iter().enumerate() {
+                            f32_data[i] = half::f16::from_bits(b).to_f32();
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "Unsupported dtype: {:?}",
+                            tensor_view.dtype()
+                        ));
+                    }
+                }
+
+                #[cfg(unix)]
+                release_source_pages(tensor_view.data());
+
                 let rows = shape.dims()[0];
                 let cols = shape.dims()[1];
-
                 let nb_k = cols / crate::core::quant::QK4_0;
                 if !cols.is_multiple_of(crate::core::quant::QK4_0) {
-                    // Fallback to F32
                     let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
                     unsafe {
                         std::ptr::copy_nonoverlapping(
@@ -303,8 +304,7 @@ impl TransformerModel {
                             num_elements,
                         );
                     }
-                    let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
-                    return backend.copy_from(&cpu_tensor);
+                    return finalize_tensor(shape, buffer);
                 }
 
                 use crate::core::quant::{BlockQ4_0, QK4_0};
@@ -319,18 +319,14 @@ impl TransformerModel {
                             d: f16::from_f32(0.0),
                             qs: [0; 16],
                         };
-
                         let max_val = src.iter().map(|v| v.abs()).fold(0.0f32, |x, y| x.max(y));
                         let d = max_val / 7.0;
                         let id = if d == 0.0 { 0.0 } else { 1.0 / d };
-
                         block.d = f16::from_f32(d);
                         for z in 0..16 {
                             let v0 = (src[z] * id).round().clamp(-8.0, 7.0) as i8;
                             let v1 = (src[z + 16] * id).round().clamp(-8.0, 7.0) as i8;
-                            let b0 = (v0 + 8) as u8;
-                            let b1 = (v1 + 8) as u8;
-                            block.qs[z] = b0 | (b1 << 4);
+                            block.qs[z] = (v0 + 8) as u8 | (((v1 + 8) as u8) << 4);
                         }
                         blocks.push(block);
                     }
@@ -345,21 +341,57 @@ impl TransformerModel {
                         blocks.len(),
                     );
                 }
-                let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
-                backend.copy_from(&cpu_tensor)
-            } else {
-                // F32 (norms, embeddings)
-                let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        f32_data.as_ptr(),
-                        buffer.as_mut_ptr() as *mut f32,
-                        num_elements,
-                    );
-                }
-                let cpu_tensor = Tensor::new(shape, buffer, cpu_backend.clone());
-                backend.copy_from(&cpu_tensor)
+                return finalize_tensor(shape, buffer);
             }
+
+            // F32 path (norms, embeddings): convert directly into Galloc buffer (no intermediate Vec)
+            let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut f32, num_elements)
+            };
+
+            match tensor_view.dtype() {
+                safetensors::Dtype::F32 => unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        tensor_view.data().as_ptr(),
+                        buffer.as_mut_ptr(),
+                        tensor_view.data().len(),
+                    );
+                },
+                safetensors::Dtype::BF16 => {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            tensor_view.data().as_ptr() as *const u16,
+                            num_elements,
+                        )
+                    };
+                    for (i, &b) in src.iter().enumerate() {
+                        dst[i] = half::bf16::from_bits(b).to_f32();
+                    }
+                }
+                safetensors::Dtype::F16 => {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            tensor_view.data().as_ptr() as *const u16,
+                            num_elements,
+                        )
+                    };
+                    for (i, &b) in src.iter().enumerate() {
+                        dst[i] = half::f16::from_bits(b).to_f32();
+                    }
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "Unsupported dtype: {:?}",
+                        tensor_view.dtype()
+                    ));
+                }
+            }
+
+            #[cfg(unix)]
+            release_source_pages(tensor_view.data());
+
+            finalize_tensor(shape, buffer)
         };
 
         // 3. Load Layers
