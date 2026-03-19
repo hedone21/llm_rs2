@@ -255,11 +255,15 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     threads: usize,
 
-    /// KV cache offload mode: none or raw.
-    /// raw: lossless in-memory offload.
+    /// KV cache offload mode: none, raw (in-memory), or disk (file-based).
     /// Requires --kv-layout seq and --kv-type f16 or f32.
     #[arg(long, default_value = "none")]
     kv_offload: String,
+
+    /// Directory for disk offload files (used with --kv-offload disk).
+    /// Defaults to system temp dir if not specified.
+    #[arg(long, default_value = "")]
+    offload_path: String,
 
     /// Maximum adaptive prefetch depth for offload KV cache pipeline.
     /// Higher values use more memory but can hide preload latency.
@@ -439,6 +443,7 @@ fn main() -> anyhow::Result<()> {
             &args.kv_offload,
             &args.kv_type,
             args.max_prefetch_depth,
+            &args.offload_path,
         );
     }
 
@@ -2835,6 +2840,7 @@ fn run_offload(
     offload_mode: &str,
     kv_type_str: &str,
     max_prefetch_depth: usize,
+    offload_path: &str,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
@@ -2852,16 +2858,42 @@ fn run_offload(
 
     let token_bytes = kv_heads * head_dim * kv_dtype.size();
 
-    eprintln!(
-        "[Offload] mode={}, dtype={:?}, layers={}, token_bytes={}, max_seq={}",
-        offload_mode, kv_dtype, num_layers, token_bytes, max_seq_len,
-    );
+    // Resolve disk offload directory
+    let disk_dir = if offload_path.is_empty() {
+        std::env::temp_dir().join("llm_rs2_kv_offload")
+    } else {
+        std::path::PathBuf::from(offload_path)
+    };
+
+    if offload_mode == "disk" {
+        eprintln!(
+            "[Offload] mode=disk, path={}, dtype={:?}, layers={}, token_bytes={}, max_seq={}",
+            disk_dir.display(),
+            kv_dtype,
+            num_layers,
+            token_bytes,
+            max_seq_len,
+        );
+    } else {
+        eprintln!(
+            "[Offload] mode={}, dtype={:?}, layers={}, token_bytes={}, max_seq={}",
+            offload_mode, kv_dtype, num_layers, token_bytes, max_seq_len,
+        );
+    }
 
     // Create OffloadKVCache per layer
     let mut kv_caches: Vec<OffloadKVCache> = (0..num_layers)
         .map(|layer_id| {
             let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> = match offload_mode {
                 "raw" => Box::new(RawStore::new(token_bytes)),
+                "disk" => Box::new(
+                    llm_rs2::core::offload::disk_store::DiskStore::new(
+                        disk_dir.clone(),
+                        layer_id,
+                        token_bytes,
+                    )
+                    .expect("Failed to create DiskStore"),
+                ),
                 _ => panic!("Unknown offload mode: {}", offload_mode),
             };
             OffloadKVCache::new(layer_id, kv_heads, head_dim, kv_dtype, max_seq_len, store)

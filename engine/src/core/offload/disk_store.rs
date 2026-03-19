@@ -15,6 +15,7 @@ use std::path::PathBuf;
 /// Supports incremental append (decode) and bulk load (recall).
 pub struct DiskStore {
     dir: PathBuf,
+    layer_id: usize,
     k_file: File,
     v_file: File,
     stored_tokens: usize,
@@ -47,6 +48,7 @@ impl DiskStore {
 
         Ok(Self {
             dir,
+            layer_id,
             k_file,
             v_file,
             stored_tokens: 0,
@@ -57,15 +59,17 @@ impl DiskStore {
 
 impl OffloadStore for DiskStore {
     fn store(&mut self, k_data: &[u8], v_data: &[u8], num_tokens: usize) -> Result<()> {
-        self.k_file.seek(SeekFrom::End(0))?;
+        self.k_file.seek(SeekFrom::Start(0))?;
+        self.k_file.set_len(0)?;
         self.k_file.write_all(k_data)?;
         self.k_file.flush()?;
 
-        self.v_file.seek(SeekFrom::End(0))?;
+        self.v_file.seek(SeekFrom::Start(0))?;
+        self.v_file.set_len(0)?;
         self.v_file.write_all(v_data)?;
         self.v_file.flush()?;
 
-        self.stored_tokens += num_tokens;
+        self.stored_tokens = num_tokens;
         Ok(())
     }
 
@@ -91,7 +95,16 @@ impl OffloadStore for DiskStore {
     }
 
     fn append_token(&mut self, k_token: &[u8], v_token: &[u8]) -> Result<()> {
-        self.store(k_token, v_token, 1)
+        self.k_file.seek(SeekFrom::End(0))?;
+        self.k_file.write_all(k_token)?;
+        self.k_file.flush()?;
+
+        self.v_file.seek(SeekFrom::End(0))?;
+        self.v_file.write_all(v_token)?;
+        self.v_file.flush()?;
+
+        self.stored_tokens += 1;
+        Ok(())
     }
 
     fn storage_size(&self) -> usize {
@@ -111,9 +124,8 @@ impl OffloadStore for DiskStore {
 
 impl Drop for DiskStore {
     fn drop(&mut self) {
-        // Clean up files
-        let _ = fs::remove_file(self.dir.join(format!("layer{}_k.bin", 0)));
-        let _ = fs::remove_file(self.dir.join(format!("layer{}_v.bin", 0)));
+        let _ = fs::remove_file(self.dir.join(format!("layer{}_k.bin", self.layer_id)));
+        let _ = fs::remove_file(self.dir.join(format!("layer{}_v.bin", self.layer_id)));
     }
 }
 
@@ -236,6 +248,91 @@ mod tests {
 
         assert_eq!(k_buf, k_data);
         assert_eq!(v_buf, v_data);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_disk_store_overwrite() {
+        let dir = temp_dir("overwrite");
+        let _ = fs::remove_dir_all(&dir);
+        let bpt = 8;
+
+        let mut store = DiskStore::new(dir.clone(), 0, bpt).unwrap();
+
+        // First write: 4 tokens
+        let k1 = vec![0xAAu8; 4 * bpt];
+        let v1 = vec![0xBBu8; 4 * bpt];
+        store.store(&k1, &v1, 4).unwrap();
+        assert_eq!(store.stored_tokens(), 4);
+
+        // Overwrite with 2 tokens — must replace, not append
+        let k2 = vec![0xCCu8; 2 * bpt];
+        let v2 = vec![0xDDu8; 2 * bpt];
+        store.store(&k2, &v2, 2).unwrap();
+        assert_eq!(store.stored_tokens(), 2);
+        assert_eq!(store.storage_size(), 2 * bpt * 2);
+
+        let mut k_buf = vec![0u8; 2 * bpt];
+        let mut v_buf = vec![0u8; 2 * bpt];
+        let n = store.load_into(&mut k_buf, &mut v_buf).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(k_buf, k2);
+        assert_eq!(v_buf, v2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_disk_store_drop_cleanup() {
+        let dir = temp_dir("drop_cleanup");
+        let _ = fs::remove_dir_all(&dir);
+        let bpt = 8;
+
+        let layer_id = 3;
+        {
+            let mut store = DiskStore::new(dir.clone(), layer_id, bpt).unwrap();
+            store.store(&vec![1u8; bpt], &vec![2u8; bpt], 1).unwrap();
+            // Files should exist
+            assert!(dir.join(format!("layer{layer_id}_k.bin")).exists());
+            assert!(dir.join(format!("layer{layer_id}_v.bin")).exists());
+        }
+        // After drop, files should be cleaned up
+        assert!(!dir.join(format!("layer{layer_id}_k.bin")).exists());
+        assert!(!dir.join(format!("layer{layer_id}_v.bin")).exists());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_disk_store_append_after_store() {
+        let dir = temp_dir("append_after_store");
+        let _ = fs::remove_dir_all(&dir);
+        let bpt = 8;
+
+        let mut store = DiskStore::new(dir.clone(), 0, bpt).unwrap();
+
+        // Bulk store 2 tokens
+        let k_init = vec![0xAAu8; 2 * bpt];
+        let v_init = vec![0xBBu8; 2 * bpt];
+        store.store(&k_init, &v_init, 2).unwrap();
+
+        // Append 1 more token
+        let k_tok = vec![0xCCu8; bpt];
+        let v_tok = vec![0xDDu8; bpt];
+        store.append_token(&k_tok, &v_tok).unwrap();
+
+        assert_eq!(store.stored_tokens(), 3);
+
+        let mut k_buf = vec![0u8; 3 * bpt];
+        let mut v_buf = vec![0u8; 3 * bpt];
+        store.load_into(&mut k_buf, &mut v_buf).unwrap();
+
+        // First 2 tokens from store, 3rd from append
+        assert_eq!(&k_buf[..2 * bpt], &k_init);
+        assert_eq!(&k_buf[2 * bpt..], &k_tok);
+        assert_eq!(&v_buf[..2 * bpt], &v_init);
+        assert_eq!(&v_buf[2 * bpt..], &v_tok);
 
         let _ = fs::remove_dir_all(&dir);
     }
