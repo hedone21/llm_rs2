@@ -1084,10 +1084,12 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     const NR: usize = 4;
     let ctx = &*(ctx_ptr as *const FusedGemvCtx);
 
-    // Determine which matmul this chunk belongs to
+    // Determine which matmul this chunk belongs to.
+    // chunk_offsets[i] = cumulative start chunk for matmul i.
+    // For n_matmuls==2, chunk_offsets[2] is unused — route via n_matmuls check.
     let (mat_idx, local_chunk) = if chunk_id < ctx.chunk_offsets[1] {
         (0, chunk_id - ctx.chunk_offsets[0])
-    } else if ctx.n_matmuls > 1 && chunk_id < ctx.chunk_offsets[2] {
+    } else if ctx.n_matmuls == 2 || chunk_id < ctx.chunk_offsets[2] {
         (1, chunk_id - ctx.chunk_offsets[1])
     } else {
         (2, chunk_id - ctx.chunk_offsets[2])
