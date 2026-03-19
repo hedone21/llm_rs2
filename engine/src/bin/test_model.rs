@@ -1,6 +1,6 @@
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::llama::llama_model::LlamaModel;
+use llm_rs2::models::transformer::TransformerModel;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     println!("Loading model from: {}", model_path);
 
     let start = Instant::now();
-    let model = LlamaModel::load(model_path, backend.clone(), &memory)?;
+    let model = TransformerModel::load(model_path, backend.clone(), &memory)?;
     let duration = start.elapsed();
 
     println!("Model loaded successfully in {:?}", duration);

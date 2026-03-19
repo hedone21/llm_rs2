@@ -15,7 +15,7 @@ use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
+use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use llm_rs2::resilience::{CommandExecutor, KVSnapshot, MessageLoop, ResourceLevel};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
@@ -273,7 +273,7 @@ fn main() -> anyhow::Result<()> {
 
     // Load Model on CPU initially
     println!("[Hybrid] Loading model on CPU...");
-    let model = LlamaModel::load(model_path, current_backend.clone(), &*cpu_memory)?;
+    let model = TransformerModel::load(model_path, current_backend.clone(), &*cpu_memory)?;
 
     // Tokenizer
     let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
@@ -451,7 +451,7 @@ fn main() -> anyhow::Result<()> {
             cpu_backend.clone(),
         );
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
             kv_caches: &mut kv_caches,
@@ -600,7 +600,7 @@ fn main() -> anyhow::Result<()> {
             acc.begin_step();
         }
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
             kv_caches: &mut kv_caches,

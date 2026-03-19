@@ -15,11 +15,11 @@ use crate::core::memory::Memory;
 use crate::core::offload::preload_pool::{self, PreloadPool};
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
-use crate::layers::transformer_layer::{TransformerLayer, LayerForwardArgs};
+use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::galloc::Galloc;
 use crate::models::config::ModelConfig;
-use crate::models::mappers::{create_mapper, WeightMapper};
+use crate::models::mappers::create_mapper;
 
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
@@ -635,11 +635,10 @@ impl TransformerModel {
     ) -> Option<FullKernelPlan> {
         use crate::backend::opencl::get_cl_mem;
         use crate::backend::opencl::plan::*;
-        use crate::core::buffer::Buffer;
         use crate::core::kv_cache::KVLayout;
 
         if self.config.has_qkv_bias {
-            return None;  // Bias not yet supported in GPU plan
+            return None; // Bias not yet supported in GPU plan
         }
 
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
@@ -742,6 +741,7 @@ impl TransformerModel {
     /// Execute a pre-built GPU kernel plan for a single decode token.
     /// Falls back to forward_into() on plan invalidation.
     #[cfg(feature = "opencl")]
+    #[allow(clippy::too_many_arguments)]
     pub fn execute_plan(
         &self,
         plan: &FullKernelPlan,
@@ -749,7 +749,7 @@ impl TransformerModel {
         start_pos: usize,
         x_gen: &mut Tensor,
         kv_caches: &mut [KVCache],
-        logits_out: &mut Tensor,
+        _logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
         // 1. Embedding lookup

@@ -22,6 +22,20 @@ pub trait Backend: Send + Sync {
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()>;
     fn scale(&self, x: &mut Tensor, v: f32) -> Result<()>;
 
+    /// Broadcast-add a 1D bias to each row of a tensor.
+    /// x: [..., dim], bias: [dim]. Adds bias to every row of x.
+    fn add_row_bias(&self, x: &mut Tensor, bias: &Tensor) -> Result<()> {
+        let x_data = x.as_mut_slice::<f32>();
+        let b_data = bias.as_slice::<f32>();
+        let dim = b_data.len();
+        for row in x_data.chunks_mut(dim) {
+            for (v, &b) in row.iter_mut().zip(b_data.iter()) {
+                *v += b;
+            }
+        }
+        Ok(())
+    }
+
     // Activation & Norm
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()>;
     fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()>;

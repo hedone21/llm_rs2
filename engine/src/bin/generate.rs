@@ -20,7 +20,7 @@ use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::llama::llama_model::{LlamaModel, LlamaModelForwardArgs};
+use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use std::sync::Arc;
 use tokenizers::Tokenizer;
 
@@ -352,7 +352,7 @@ fn main() -> anyhow::Result<()> {
         ),
     };
     eprintln!("[Config] Weight dtype: {:?}", w_dtype);
-    let model = LlamaModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
+    let model = TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
 
     // 2. Tokenizer
     let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
@@ -810,7 +810,7 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         );
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
             kv_caches: &mut kv_caches,
@@ -1002,7 +1002,7 @@ fn main() -> anyhow::Result<()> {
             let used_plan = false;
 
             if !used_plan {
-                model.forward_into(LlamaModelForwardArgs {
+                model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
                     start_pos,
                     kv_caches: &mut kv_caches,
@@ -1659,7 +1659,7 @@ fn restore_kv(kv_caches: &mut [KVCache], snapshot: &EvalKVSnapshot) {
 #[allow(clippy::too_many_arguments)]
 fn run_eval_ll(
     args: &Args,
-    model: &LlamaModel,
+    model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
@@ -1841,7 +1841,7 @@ fn run_eval_ll(
                 backend.clone(),
             );
 
-            model.forward_into(LlamaModelForwardArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: 0,
                 kv_caches,
@@ -1880,7 +1880,7 @@ fn run_eval_ll(
                     acc.begin_step();
                 }
 
-                model.forward_into(LlamaModelForwardArgs {
+                model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input,
                     start_pos,
                     kv_caches,
@@ -1946,7 +1946,7 @@ fn run_eval_ll(
                 backend.clone(),
             );
 
-            model.forward_into(LlamaModelForwardArgs {
+            model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: 0,
                 kv_caches,
@@ -2015,7 +2015,7 @@ fn run_eval_ll(
                     }
                     let gen_input = backend.copy_from(&cpu_gen_input)?;
 
-                    model.forward_into(LlamaModelForwardArgs {
+                    model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &gen_input,
                         start_pos: sp,
                         kv_caches,
@@ -2134,7 +2134,7 @@ fn run_eval_ll(
 #[allow(clippy::too_many_arguments)]
 fn run_kivi_eval_ll(
     args: &Args,
-    model: &LlamaModel,
+    model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &Arc<dyn Memory>,
@@ -2278,7 +2278,7 @@ fn run_kivi_eval_ll(
             backend.clone(),
         );
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
             kv_caches: &mut kv_caches,
@@ -2347,7 +2347,7 @@ fn run_kivi_eval_ll(
                     }
                     let gen_input = backend.copy_from(&cpu_gen_input)?;
 
-                    model.forward_into(LlamaModelForwardArgs {
+                    model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &gen_input,
                         start_pos: sp,
                         kv_caches: &mut kv_caches,
@@ -2460,7 +2460,7 @@ fn run_kivi_eval_ll(
 
 #[allow(clippy::too_many_arguments)]
 fn run_kivi(
-    model: &LlamaModel,
+    model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &Arc<dyn Memory>,
@@ -2573,7 +2573,7 @@ fn run_kivi(
             backend.clone(),
         );
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
             kv_caches: &mut kv_caches,
@@ -2664,7 +2664,7 @@ fn run_kivi(
         let gen_input = backend.copy_from(&cpu_gen_input)?;
 
         let fwd_start = std::time::Instant::now();
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &gen_input,
             start_pos,
             kv_caches: &mut kv_caches,
@@ -2823,7 +2823,7 @@ fn run_kivi(
 
 #[allow(clippy::too_many_arguments)]
 fn run_offload(
-    model: &LlamaModel,
+    model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &Arc<dyn Memory>,
@@ -2970,7 +2970,7 @@ fn run_offload(
         );
 
         // Prefill uses standard forward_into (no prefetch needed for batch)
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos,
             kv_caches: &mut kv_caches,
@@ -3066,7 +3066,7 @@ fn run_offload(
 
         let fwd_start = std::time::Instant::now();
         model.forward_into_offload(
-            LlamaModelForwardArgs {
+            TransformerModelForwardArgs {
                 input_tokens: &gen_input,
                 start_pos,
                 kv_caches: &mut kv_caches,
@@ -3179,7 +3179,7 @@ fn run_offload(
 #[allow(clippy::too_many_arguments)]
 fn run_ppl(
     args: &Args,
-    model: &LlamaModel,
+    model: &TransformerModel,
     tokenizer: &Tokenizer,
     backend: &Arc<dyn Backend>,
     memory: &dyn Memory,
@@ -3324,7 +3324,7 @@ fn run_ppl(
             acc.begin_step();
         }
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &input_tensor,
             start_pos: 0,
             kv_caches,
@@ -3386,7 +3386,7 @@ fn run_ppl(
         }
         let gen_input = backend.copy_from(&cpu_gen_input)?;
 
-        model.forward_into(LlamaModelForwardArgs {
+        model.forward_into(TransformerModelForwardArgs {
             input_tokens: &gen_input,
             start_pos,
             kv_caches,
