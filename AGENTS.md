@@ -1,10 +1,10 @@
-# AGENTS.md
+# llm.rs Project Guide
 
-This file provides guidance to AI coding agents when working with code in this repository.
+프로젝트의 AI 에이전트 작업 가이드.
 
 ## System Instructions
 
-- **Translation Requirement**: You MUST translate your responses, reports, plans, and explanations into Korean and provide them at the very end of your output. (응답, 리포트, 계획, 설명은 마지막에 한국어로 번역해서 제공해야 합니다.)
+- **Language**: 모든 응답, 리포트, 계획, 설명은 한국어로 작성한다. 기술 용어와 코드 식별자는 원문 유지.
 
 ## Project Overview
 
@@ -99,10 +99,31 @@ cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "
 
 Conventional Commits: `type(scope): subject` — imperative present tense. Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
 
+## Agent System
+
+5개 특화 서브에이전트가 `.claude/agents/`에 정의되어 있다. 메인 세션이 오케스트레이터 역할을 하며 에이전트 간 결과를 전달한다.
+
+| Agent | Role | Tools | Scope |
+|-------|------|-------|-------|
+| **PM** | 계획 수립, TODO 관리, 우선순위 조정, 작업 배분 제안 | Read, Glob, Grep, Edit | `.agent/todos/*.md`만 수정 |
+| **Architect** | 코드 분석, SOLID 설계, 아키텍처 문서 작성 | Read, Glob, Grep, Edit | `docs/*.md`, `ARCHITECTURE.md`만 수정 |
+| **Implementer** | 코드 구현, 유닛 테스트, 버그 수정, sanity check | Read, Edit, Write, Glob, Grep, Bash | `engine/`, `shared/`, `manager/` 소스 코드 |
+| **Tester** | 호스트/디바이스 테스트 실행, 결과 분석, 품질 게이트 검증 | Read, Glob, Grep, Bash | 수정 불가, 실행만 |
+| **Researcher** | 논문 분석, 기술 조사, 적용 가능성 평가 | Read, Glob, Grep, WebSearch, WebFetch | 수정 불가, 조사 결과 반환만 |
+
+**Workflow**:
+```
+[PM] 계획/TODO → [Architect] 설계 → [Implementer] 구현+테스트 → [Tester] 검증
+                                       ↑
+                               [Researcher] 기법 조사
+```
+
+**제약**: 서브에이전트는 다른 서브에이전트를 호출할 수 없다 (최대 1단계). 작업 위임은 메인 세션이 담당.
+
 ## Workflow Rules
 
-- **Auto-commit on completion**: When finishing a task, automatically commit the changes without asking. Do not leave uncommitted work.
-- **Desktop notification on completion**: After completing a task, send a desktop notification via `notify-send "llm.rs" "<task summary>"` so the user knows work is done.
+- **Auto-commit on completion**: Implementer가 작업을 완료하면 자동으로 커밋한다. 미커밋 작업을 남기지 않는다.
+- **Desktop notification on completion**: 작업 완료 후 `notify-send "llm.rs" "<task summary>"`로 데스크톱 알림을 보낸다.
 
 ## Profiling & Benchmarks
 
@@ -143,6 +164,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/28_experiment_guide.md` — Experiment guide
 - `docs/29_manager_monitor_redesign.md` — Manager monitor redesign
 - `docs/30_evaluation_methodology.md` — KV Cache Eviction evaluation methodology (related work survey + benchmark design)
+- `docs/35_experiment_runner_guide.md` — **실험 에이전트 인수인계 문서** (바이너리, 러너, 디바이스, CLI, 스키마, 트러블슈팅)
 - `docs/31_memory_architecture.md` — Memory architecture overview (Buffer → KV Cache → Policy unified view)
 - `docs/32_kv_offload.md` — KV cache offload (RawStore, PrefetchController, PreloadPool)
 - `docs/34_profiling_framework_design.md` — Inference profiling framework design
@@ -196,4 +218,15 @@ Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoi
 
 ## TODO System
 
-Team task tracking in `.agent/todos/` — see `.agent/todos/README.md` for format, roles, and workflow rules. View in dashboard via Todos tab or `curl http://localhost:5000/api/todos`.
+`.agent/todos/`에서 역할별 작업 추적. 형식 및 워크플로우 규칙은 `.agent/todos/README.md` 참고.
+
+| TODO 파일 | 담당 Agent |
+|-----------|-----------|
+| `backlog.md` | PM이 관리, 미배정 작업 |
+| `architect.md` | Architect |
+| `rust_developer.md` | Implementer |
+| `tester.md` | Tester |
+| `tech_writer.md` | Researcher |
+| `frontend_developer.md` | (메인 세션 직접 처리) |
+
+Dashboard에서 조회: Todos 탭 또는 `curl http://localhost:5000/api/todos`.
