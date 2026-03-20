@@ -1,5 +1,5 @@
 use clap::Parser;
-use llm_manager::config::Config;
+use llm_manager::config::{Config, PolicyConfig};
 use llm_manager::emitter::Emitter;
 use llm_manager::monitor::Monitor;
 use llm_manager::monitor::compute::ComputeMonitor;
@@ -7,8 +7,9 @@ use llm_manager::monitor::energy::EnergyMonitor;
 use llm_manager::monitor::external::ExternalMonitor;
 use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
+use llm_manager::pipeline::PolicyPipeline;
 use llm_manager::policy::{MonitorSnapshot, PolicyEngine};
-use llm_shared::{ManagerMessage, SystemSignal};
+use llm_shared::SystemSignal;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -44,6 +45,11 @@ struct Args {
     /// Enable legacy passthrough mode (emit raw SystemSignals instead of directives).
     #[arg(long, default_value_t = false)]
     legacy_passthrough: bool,
+
+    /// Path to policy configuration TOML (for hierarchical policy pipeline mode).
+    /// When omitted, built-in defaults are used.
+    #[arg(long)]
+    policy_config: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -92,16 +98,32 @@ fn main() -> anyhow::Result<()> {
     let handles = spawn_monitors(monitors, tx, shutdown.clone());
     log::info!("Started {} monitor threads", handles.len());
 
-    // PolicyEngine for directive generation
-    let mut policy = PolicyEngine::new(args.policy_cooldown_ms);
-    let mut snapshot = MonitorSnapshot::default();
+    // ── Policy 초기화 ─────────────────────────────────────────────────────────
 
-    // Initialize snapshot from initial signals
+    // Legacy PolicyEngine (snapshot 기반, 이전 방식)
+    let mut legacy_policy = PolicyEngine::new(args.policy_cooldown_ms);
+    let mut snapshot = MonitorSnapshot::default();
     for signal in &initial_signals {
         snapshot.update(signal);
     }
 
-    // Main loop
+    // 새 계층형 Policy Pipeline (non-legacy 경로)
+    let mut pipeline: Option<PolicyPipeline> = if !args.legacy_passthrough {
+        let policy_cfg = load_policy_config(&args);
+        let mut p = PolicyPipeline::new(&policy_cfg);
+        let model_path = format!(
+            "{}/default_relief.json",
+            policy_cfg.relief_model.storage_dir
+        );
+        p.set_relief_model_path(model_path);
+        log::info!("PolicyPipeline initialized (hierarchical mode)");
+        Some(p)
+    } else {
+        log::info!("Legacy passthrough mode — PolicyPipeline disabled");
+        None
+    };
+
+    // ── Main loop ─────────────────────────────────────────────────────────────
     log::info!(
         "Entering main loop (legacy_passthrough={})",
         args.legacy_passthrough
@@ -117,31 +139,35 @@ fn main() -> anyhow::Result<()> {
                 log::info!("Signal: {:?}", signal);
 
                 if args.legacy_passthrough {
-                    // Legacy mode: pass raw signals directly
+                    // Legacy mode: pass raw signals directly to emitter
                     if let Err(e) = emitter.emit(&signal) {
                         log::error!("Emit failed: {}", e);
                     }
-                } else {
-                    // New mode: update snapshot and evaluate policy
-                    snapshot.update(&signal);
-
-                    if let Some(directive) = policy.evaluate(&snapshot, None) {
+                } else if let Some(ref mut p) = pipeline {
+                    // New hierarchical pipeline mode
+                    if let Some(directive) = p.process_signal(&signal) {
                         log::info!(
-                            "Directive seq={}: {} commands",
+                            "Directive seq={}: {} commands [mode={:?}]",
+                            directive.seq_id,
+                            directive.commands.len(),
+                            p.mode()
+                        );
+                        if let Err(e) = emitter.emit_directive(&directive) {
+                            log::error!("Emit directive failed: {}", e);
+                        }
+                    }
+                } else {
+                    // Fallback: snapshot-based PolicyEngine (should not reach here normally)
+                    snapshot.update(&signal);
+                    if let Some(directive) = legacy_policy.evaluate(&snapshot, None) {
+                        log::info!(
+                            "Legacy directive seq={}: {} commands",
                             directive.seq_id,
                             directive.commands.len()
                         );
-                        let msg = ManagerMessage::Directive(directive);
-                        let json = serde_json::to_vec(&msg).unwrap_or_default();
-                        // Wrap as a SystemSignal for the emitter (temporary bridge)
-                        // TODO: Update Emitter trait to support ManagerMessage directly
-                        log::debug!("Directive JSON: {} bytes", json.len());
-
-                        // For now, emit the directive as a memory pressure signal
-                        // with the JSON in the available_bytes field (hack for backward compat)
-                        // In the real implementation, the emitter should send ManagerMessage
-                        // directly over the transport. This is handled by the UnixSocket
-                        // emitter's enhanced send_directive method.
+                        if let Err(e) = emitter.emit_directive(&directive) {
+                            log::error!("Emit legacy directive failed: {}", e);
+                        }
                     }
                 }
             }
@@ -155,12 +181,48 @@ fn main() -> anyhow::Result<()> {
 
     log::info!("Shutting down...");
     shutdown.store(true, Ordering::Relaxed);
+
+    // Relief model 저장
+    if let Some(p) = &pipeline {
+        p.save_model();
+    }
+
     for handle in handles {
         let _ = handle.join();
     }
     log::info!("LLM Manager stopped");
 
     Ok(())
+}
+
+/// `--policy-config` 인자 또는 메인 config의 `[policy]` 섹션에서 PolicyConfig를 로드한다.
+/// 둘 다 없으면 기본값을 사용한다.
+fn load_policy_config(args: &Args) -> PolicyConfig {
+    if let Some(path) = &args.policy_config {
+        match std::fs::read_to_string(path) {
+            Ok(content) => match toml::from_str::<PolicyConfig>(&content) {
+                Ok(cfg) => {
+                    log::info!("Loaded policy config from {}", path.display());
+                    return cfg;
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to parse policy config {}: {} — using defaults",
+                        path.display(),
+                        e
+                    );
+                }
+            },
+            Err(e) => {
+                log::error!(
+                    "Failed to read policy config {}: {} — using defaults",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    }
+    PolicyConfig::default()
 }
 
 fn create_emitter(args: &Args, shutdown: &Arc<AtomicBool>) -> anyhow::Result<Box<dyn Emitter>> {
