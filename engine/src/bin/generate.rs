@@ -778,6 +778,63 @@ fn main() -> anyhow::Result<()> {
         .copied()
         .unwrap_or(u32::MAX);
 
+    // === WARMUP: trigger DVFS ramp-up before timed prefill ===
+    // Runs a forward pass and brief CPU spin to ensure governor reaches max clock.
+    // Without this, idle CPU starts at ~2.2GHz and ramp-up time
+    // pollutes the prefill measurement (llama.cpp's model loading + warmup
+    // achieves the same effect).
+    {
+        let warmup_buf = Galloc::new().alloc(4, DType::U8)?;
+        unsafe {
+            *(warmup_buf.as_mut_ptr() as *mut u32) = tokens[0];
+        }
+        let warmup_input = Tensor::new(
+            Shape::new(vec![1, 1]),
+            warmup_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let warmup_input = backend.copy_from(&warmup_input)?;
+
+        let warmup_logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+        let mut warmup_logits = Tensor::new(
+            Shape::new(vec![1, 1, vocab_size]),
+            warmup_logits_buf,
+            backend.clone(),
+        );
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &warmup_input,
+            start_pos: 0,
+            kv_caches: &mut kv_caches,
+            backend: &backend,
+            memory: memory.as_ref(),
+            logits_out: &mut warmup_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+        })?;
+        backend.synchronize()?;
+
+        // Brief all-core spin to push DVFS governor to max frequency.
+        // 50ms is enough for walt governor to ramp up.
+        use rayon::prelude::*;
+        let spin_until = std::time::Instant::now() + std::time::Duration::from_millis(50);
+        (0..rayon::current_num_threads()).into_par_iter().for_each(|_| {
+            while std::time::Instant::now() < spin_until {
+                std::hint::spin_loop();
+            }
+        });
+
+        // Reset KV caches
+        for cache in kv_caches.iter_mut() {
+            cache.current_pos = 0;
+        }
+    }
+
     // === PREFILL PHASE ===
     {
         println!("[Profile] Event: PrefillStart");
