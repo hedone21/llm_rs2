@@ -278,6 +278,20 @@ struct Args {
     /// Measures PPL and collects proxy metrics during eviction.
     #[arg(long)]
     ppl: Option<String>,
+
+    /// Comma-separated layer indices to skip (both attn+mlp).
+    /// Example: --skip-layers 1,3,5,7
+    #[arg(long, value_delimiter = ',')]
+    skip_layers: Option<Vec<usize>>,
+
+    /// Skip ratio (0.0-1.0). Uses SkipConfig::uniform_init() to select layers.
+    #[arg(long)]
+    skip_ratio: Option<f32>,
+
+    /// Dump per-layer importance table and exit (no inference).
+    /// Runs prefill with ImportanceCollector on the given prompt.
+    #[arg(long, default_value_t = false)]
+    dump_importance: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -713,12 +727,116 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // Build SkipConfig from CLI options
+    use llm_rs2::core::skip_config::SkipConfig;
+    let skip_config = if let Some(ref layers) = args.skip_layers {
+        let mut sc = SkipConfig::new();
+        for &l in layers {
+            sc.attn_skip.insert(l);
+            sc.mlp_skip.insert(l);
+        }
+        assert!(
+            sc.validate(model.config.num_hidden_layers),
+            "Cannot skip layer 0 or last layer (SWIFT constraint)"
+        );
+        eprintln!(
+            "[Skip] Explicit layers: {:?} ({} sub-layers skipped)",
+            layers,
+            sc.total_skips()
+        );
+        Some(sc)
+    } else if let Some(ratio) = args.skip_ratio {
+        let sc = SkipConfig::uniform_init(model.config.num_hidden_layers, ratio);
+        eprintln!(
+            "[Skip] Uniform ratio={:.1}% → {} sub-layers skipped",
+            ratio * 100.0,
+            sc.total_skips()
+        );
+        Some(sc)
+    } else {
+        None
+    };
+
     // Auto-eviction: non-experiment mode evicts automatically.
     // - Sliding window: triggers on memory pressure after each forward pass.
     // - Score-based (H2O/H2O+/D2O): triggers when cache utilization >= 90% capacity,
     //   using force_evict_with_scores to bypass memory pressure checks.
     let auto_eviction = args.eviction_policy != "none" && experiment_schedule.is_none();
     let score_based_eviction = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
+
+    // ════════════════════════════════════════════════════════════
+    //  DUMP-IMPORTANCE MODE: Measure per-layer importance and exit
+    // ════════════════════════════════════════════════════════════
+    if args.dump_importance {
+        use llm_rs2::core::qcf::ImportanceCollector;
+
+        let mut collector = ImportanceCollector::new();
+
+        let prompt_enc = tokenizer
+            .encode(prompt.as_str(), true)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        let prompt_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
+        let prompt_len = prompt_ids.len();
+        eprintln!("[Importance] Prefill {} tokens...", prompt_len);
+
+        let cpu_buf = Galloc::new().alloc(prompt_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = cpu_buf.as_mut_ptr() as *mut u32;
+            std::ptr::copy_nonoverlapping(prompt_ids.as_ptr(), ptr, prompt_len);
+        }
+        let cpu_input = Tensor::new(
+            Shape::new(vec![1, prompt_len]),
+            cpu_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let input_tensor = backend.copy_from(&cpu_input)?;
+
+        let logits_buf = memory.alloc(prompt_len * vocab_size * 4, DType::F32)?;
+        let mut logits = Tensor::new(
+            Shape::new(vec![1, prompt_len, vocab_size]),
+            logits_buf,
+            backend.clone(),
+        );
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            kv_caches: &mut kv_caches,
+            backend: &backend,
+            memory: &*memory,
+            logits_out: &mut logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: Some(&mut collector),
+        })?;
+
+        let table = collector.build();
+
+        let importance_entries: Vec<serde_json::Value> = table
+            .entries()
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "layer": e.layer_id,
+                    "sublayer": format!("{:?}", e.sublayer),
+                    "importance": e.importance,
+                })
+            })
+            .collect();
+
+        let output = serde_json::json!({
+            "model": args.model_path,
+            "num_layers": model.config.num_hidden_layers,
+            "prompt_tokens": prompt_len,
+            "importance": importance_entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
 
     // ════════════════════════════════════════════════════════════
     //  EVAL-LL MODE: Log-likelihood evaluation for downstream tasks
@@ -738,6 +856,7 @@ fn main() -> anyhow::Result<()> {
             max_seq_len,
             &prompt,
             actual_protected_prefix,
+            skip_config.as_ref(),
         );
     }
 
@@ -761,6 +880,7 @@ fn main() -> anyhow::Result<()> {
             auto_eviction,
             score_based_eviction,
             actual_protected_prefix,
+            skip_config.as_ref(),
         );
     }
 
@@ -1751,6 +1871,7 @@ fn run_eval_ll(
     max_seq_len: usize,
     default_prompt: &str,
     protected_prefix: usize,
+    skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
 ) -> anyhow::Result<()> {
     let hidden_size = model.config.hidden_size;
 
@@ -1852,6 +1973,94 @@ fn run_eval_ll(
     let overall_start = std::time::Instant::now();
     let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
 
+    // ── Importance 2-pass: measure layer importance before evaluation ──
+    // Only when skip_config is active and there are questions to evaluate.
+    let (importance_table, layer_skip_qcf) = if let Some(sc) = skip_config {
+        if questions.is_empty() {
+            (None, None)
+        } else {
+            use llm_rs2::core::qcf::{ImportanceCollector, SubLayer};
+
+            let first_q = &questions[0];
+            let prompt_enc = tokenizer
+                .encode(first_q.prompt.as_str(), true)
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let prompt_ids_imp: Vec<u32> = prompt_enc.get_ids().to_vec();
+            let imp_len = prompt_ids_imp.len();
+
+            // Reset KV caches for importance measurement
+            for cache in kv_caches.iter_mut() {
+                cache.current_pos = 0;
+            }
+            if let Some(acc) = score_accumulator.as_mut() {
+                acc.reset();
+            }
+
+            let cpu_buf = Galloc::new().alloc(imp_len * 4, DType::U8)?;
+            unsafe {
+                let ptr = cpu_buf.as_mut_ptr() as *mut u32;
+                std::ptr::copy_nonoverlapping(prompt_ids_imp.as_ptr(), ptr, imp_len);
+            }
+            let cpu_input = Tensor::new(
+                Shape::new(vec![1, imp_len]),
+                cpu_buf,
+                Arc::new(CpuBackend::new()),
+            );
+            let input_tensor = backend.copy_from(&cpu_input)?;
+
+            let imp_logits_buf = memory.alloc(imp_len * vocab_size * 4, DType::F32)?;
+            let mut imp_logits = Tensor::new(
+                Shape::new(vec![1, imp_len, vocab_size]),
+                imp_logits_buf,
+                backend.clone(),
+            );
+
+            let mut collector = ImportanceCollector::new();
+            model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: 0,
+                kv_caches,
+                backend,
+                memory,
+                logits_out: &mut imp_logits,
+                x_gen: None,
+                workspace: None,
+                use_gpu_attn: args.gpu_attn,
+                score_accumulator: None,
+                profiler: None,
+                skip_config: None, // No skip for importance measurement
+                importance_collector: Some(&mut collector),
+            })?;
+
+            let table = collector.build();
+
+            // Deduplicate via union of attn_skip and mlp_skip
+            let skip_set: Vec<(usize, SubLayer)> = sc
+                .attn_skip
+                .union(&sc.mlp_skip)
+                .map(|&l| (l, SubLayer::Full))
+                .collect();
+            let qcf = table.compute_qcf(&skip_set);
+
+            eprintln!(
+                "[Skip] Importance measured on {} tokens, layer_skip_qcf={:.4}",
+                imp_len, qcf
+            );
+
+            // Reset KV caches for actual evaluation
+            for cache in kv_caches.iter_mut() {
+                cache.current_pos = 0;
+            }
+            if let Some(acc) = score_accumulator.as_mut() {
+                acc.reset();
+            }
+
+            (Some(table), Some(qcf))
+        }
+    } else {
+        (None, None)
+    };
+
     for (q_idx, question) in questions.iter().enumerate() {
         let q_start = std::time::Instant::now();
 
@@ -1940,7 +2149,7 @@ fn run_eval_ll(
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: score_accumulator.as_mut(),
                 profiler: None,
-                skip_config: None,
+                skip_config,
                 importance_collector: None,
             })?;
 
@@ -1993,7 +2202,7 @@ fn run_eval_ll(
                     use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: None,
-                    skip_config: None,
+                    skip_config,
                     importance_collector: None,
                 })?;
                 start_pos += 1;
@@ -2105,7 +2314,7 @@ fn run_eval_ll(
                 use_gpu_attn: args.gpu_attn,
                 score_accumulator: None,
                 profiler: None,
-                skip_config: None,
+                skip_config,
                 importance_collector: None,
             })?;
 
@@ -2174,7 +2383,7 @@ fn run_eval_ll(
                         use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
-                        skip_config: None,
+                        skip_config,
                         importance_collector: None,
                     })?;
                     sp += 1;
@@ -2262,7 +2471,7 @@ fn run_eval_ll(
     }
 
     let elapsed = overall_start.elapsed().as_secs_f64();
-    let output = serde_json::json!({
+    let mut output = serde_json::json!({
         "results": results,
         "config": {
             "model": args.model_path,
@@ -2274,9 +2483,28 @@ fn run_eval_ll(
             "h2o_keep_ratio": args.h2o_keep_ratio,
             "h2o_decay": args.h2o_decay,
             "time_normalized": !args.h2o_raw_scores,
+            "skip_layers": args.skip_layers,
+            "skip_ratio": args.skip_ratio,
         },
         "wall_time_s": elapsed,
     });
+
+    if let Some(ref table) = importance_table {
+        output["layer_importance"] = serde_json::json!(
+            table
+                .entries()
+                .iter()
+                .map(|e| serde_json::json!({
+                    "layer": e.layer_id,
+                    "sublayer": format!("{:?}", e.sublayer),
+                    "importance": e.importance,
+                }))
+                .collect::<Vec<serde_json::Value>>()
+        );
+    }
+    if let Some(qcf) = layer_skip_qcf {
+        output["layer_skip_qcf"] = serde_json::json!(qcf);
+    }
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
@@ -3383,6 +3611,7 @@ fn run_ppl(
     auto_eviction: bool,
     _score_based_eviction: bool,
     protected_prefix: usize,
+    skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::qcf::QcfConfig;
 
@@ -3526,7 +3755,7 @@ fn run_ppl(
             use_gpu_attn: args.gpu_attn,
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
-            skip_config: None,
+            skip_config,
             importance_collector: None,
         })?;
 
@@ -3588,7 +3817,7 @@ fn run_ppl(
             use_gpu_attn: args.gpu_attn,
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
-            skip_config: None,
+            skip_config,
             importance_collector: None,
         })?;
         start_pos += 1;
@@ -3712,6 +3941,8 @@ fn run_ppl(
             "eviction_target_ratio": args.eviction_target_ratio,
             "h2o_keep_ratio": args.h2o_keep_ratio,
             "protected_prefix": protected_prefix,
+            "skip_layers": args.skip_layers,
+            "skip_ratio": args.skip_ratio,
         }
     });
 
