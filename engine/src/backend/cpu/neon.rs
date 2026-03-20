@@ -938,21 +938,21 @@ impl CpuBackendNeon {
                 let av3: uint16x8_t = vld1q_u16(a_ptrs[3].add($off));
 
                 macro_rules! col {
-                    ($bi:expr, $c0:ident, $c1:ident, $c2:ident, $c3:ident) => {
-                        let bv: uint16x8_t = vld1q_u16(b_ptrs[$bi].add($off));
-                        std::arch::asm!(
-                            "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
-                            "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
-                            "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
-                            "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
-                            d0 = inout(vreg) $c0, d1 = inout(vreg) $c1,
-                            d2 = inout(vreg) $c2, d3 = inout(vreg) $c3,
-                            a0 = in(vreg) av0, a1 = in(vreg) av1,
-                            a2 = in(vreg) av2, a3 = in(vreg) av3,
-                            b = in(vreg) bv,
-                        );
-                    };
-                }
+                                    ($bi:expr, $c0:ident, $c1:ident, $c2:ident, $c3:ident) => {
+                                        let bv: uint16x8_t = vld1q_u16(b_ptrs[$bi].add($off));
+                                        std::arch::asm!(
+                                            "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
+                                            "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
+                                            "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
+                                            "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
+                                            d0 = inout(vreg) $c0, d1 = inout(vreg) $c1,
+                                            d2 = inout(vreg) $c2, d3 = inout(vreg) $c3,
+                                            a0 = in(vreg) av0, a1 = in(vreg) av1,
+                                            a2 = in(vreg) av2, a3 = in(vreg) av3,
+                                            b = in(vreg) bv,
+                                        );
+                                    };
+                                }
                 col!(0, a0b0, a1b0, a2b0, a3b0);
                 col!(1, a0b1, a1b1, a2b1, a3b1);
                 col!(2, a0b2, a1b2, a2b2, a3b2);
@@ -985,10 +985,30 @@ impl CpuBackendNeon {
             }};
         }
 
-        out[0] = [reduce_f16!(a0b0), reduce_f16!(a0b1), reduce_f16!(a0b2), reduce_f16!(a0b3)];
-        out[1] = [reduce_f16!(a1b0), reduce_f16!(a1b1), reduce_f16!(a1b2), reduce_f16!(a1b3)];
-        out[2] = [reduce_f16!(a2b0), reduce_f16!(a2b1), reduce_f16!(a2b2), reduce_f16!(a2b3)];
-        out[3] = [reduce_f16!(a3b0), reduce_f16!(a3b1), reduce_f16!(a3b2), reduce_f16!(a3b3)];
+        out[0] = [
+            reduce_f16!(a0b0),
+            reduce_f16!(a0b1),
+            reduce_f16!(a0b2),
+            reduce_f16!(a0b3),
+        ];
+        out[1] = [
+            reduce_f16!(a1b0),
+            reduce_f16!(a1b1),
+            reduce_f16!(a1b2),
+            reduce_f16!(a1b3),
+        ];
+        out[2] = [
+            reduce_f16!(a2b0),
+            reduce_f16!(a2b1),
+            reduce_f16!(a2b2),
+            reduce_f16!(a2b3),
+        ];
+        out[3] = [
+            reduce_f16!(a3b0),
+            reduce_f16!(a3b1),
+            reduce_f16!(a3b2),
+            reduce_f16!(a3b3),
+        ];
 
         // Scalar tail (K not multiple of 8)
         while idx < k {
@@ -1569,10 +1589,10 @@ struct F16GemvCtx {
 /// so the same core reuses B data from L1 across all M activation rows.
 #[repr(C)]
 struct F16GemmCtx {
-    a_base: *const f32,    // A[M, K] row-major
+    a_base: *const f32,     // A[M, K] row-major
     a_f16_base: *const u16, // Pre-converted A[M, K] in F16 for FMLAL
-    b_base: *const u16,    // B[N, K] row-major (F16, transposed)
-    out_base: *mut f32,    // Out[M, N] row-major
+    b_base: *const u16,     // B[N, K] row-major (F16, transposed)
+    out_base: *mut f32,     // Out[M, N] row-major
     m: usize,
     n: usize,
     k: usize,
@@ -1791,11 +1811,8 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
         // Tail: remaining B columns (< NR)
         while j < j_end {
             for r in 0..MR {
-                *out_ptrs[r].add(j) = CpuBackendNeon::vec_dot_fmlal(
-                    ctx.k,
-                    a_ptrs[r],
-                    ctx.b_base.add(j * ctx.k),
-                );
+                *out_ptrs[r].add(j) =
+                    CpuBackendNeon::vec_dot_fmlal(ctx.k, a_ptrs[r], ctx.b_base.add(j * ctx.k));
             }
             j += 1;
         }
@@ -1818,11 +1835,8 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
                 j += NR;
             }
             while j < j_end {
-                *out_ptr.add(j) = CpuBackendNeon::vec_dot_fmlal(
-                    ctx.k,
-                    a_f16,
-                    ctx.b_base.add(j * ctx.k),
-                );
+                *out_ptr.add(j) =
+                    CpuBackendNeon::vec_dot_fmlal(ctx.k, a_f16, ctx.b_base.add(j * ctx.k));
                 j += 1;
             }
         }

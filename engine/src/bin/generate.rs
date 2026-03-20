@@ -2390,6 +2390,8 @@ fn run_kivi_eval_ll(
 
     for (q_idx, question) in questions.iter().enumerate() {
         let q_start = std::time::Instant::now();
+        let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
+        let mut flush_count: usize = 0;
 
         // Reset KiviCaches
         for cache in kv_caches.iter_mut() {
@@ -2446,6 +2448,21 @@ fn run_kivi_eval_ll(
             skip_config: None,
             importance_collector: None,
         })?;
+
+        // Collect flush QCF metrics from prefill (layer 0 as representative)
+        for metric in kv_caches[0].take_flush_proxies() {
+            qcf_metrics.push(serde_json::json!({
+                "flush": flush_count,
+                "action": metric.action,
+                "raw_value": metric.raw_value,
+                "tokens_quantized": metric.tokens_affected,
+            }));
+            flush_count += 1;
+        }
+        // Drain other layers (discard — layer 0 is representative)
+        for cache in kv_caches[1..].iter_mut() {
+            cache.take_flush_proxies();
+        }
 
         let start_pos_after_prompt = prompt_len;
 
@@ -2517,6 +2534,20 @@ fn run_kivi_eval_ll(
                     })?;
                     sp += 1;
 
+                    // Collect flush QCF from decode step
+                    for metric in kv_caches[0].take_flush_proxies() {
+                        qcf_metrics.push(serde_json::json!({
+                            "flush": flush_count,
+                            "action": metric.action,
+                            "raw_value": metric.raw_value,
+                            "tokens_quantized": metric.tokens_affected,
+                        }));
+                        flush_count += 1;
+                    }
+                    for cache in kv_caches[1..].iter_mut() {
+                        cache.take_flush_proxies();
+                    }
+
                     let mut step_logits = vec![0.0f32; vocab_size];
                     unsafe {
                         let ptr = step_logits.as_mut_ptr() as *mut u8;
@@ -2574,6 +2605,10 @@ fn run_kivi_eval_ll(
             elapsed_q,
         );
 
+        let qcf_total: f64 = qcf_metrics
+            .iter()
+            .filter_map(|m| m["raw_value"].as_f64())
+            .sum();
         results.push(serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
@@ -2589,6 +2624,8 @@ fn run_kivi_eval_ll(
             "final_cache_pos": kv_caches[0].current_pos(),
             "kivi_q2_tokens": kv_caches[0].q2_tokens,
             "kivi_res_pos": kv_caches[0].res_pos,
+            "qcf_metrics": qcf_metrics,
+            "qcf_total": qcf_total,
         }));
     }
 

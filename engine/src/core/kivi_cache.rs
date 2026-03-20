@@ -159,8 +159,8 @@ pub struct KiviCache {
     // Group size for quantization (= QKKV = 32)
     group_size: usize,
 
-    /// Last flush proxy metric (NMSE). Set during `flush_residual()`.
-    last_flush_proxy: Option<crate::core::qcf::QcfMetric>,
+    /// Accumulated flush proxy metrics (NMSE). Pushed during `flush_residual()`.
+    flush_proxies: Vec<crate::core::qcf::QcfMetric>,
 }
 
 impl KiviCache {
@@ -217,7 +217,7 @@ impl KiviCache {
             head_dim,
             max_seq_len,
             group_size: QKKV,
-            last_flush_proxy: None,
+            flush_proxies: Vec::new(),
         }
     }
 
@@ -231,11 +231,9 @@ impl KiviCache {
         self.bits
     }
 
-    /// Take the last flush proxy metric (NMSE), consuming it.
-    ///
-    /// Returns `Some(QcfMetric)` if a flush occurred since the last call.
-    pub fn take_flush_proxy(&mut self) -> Option<crate::core::qcf::QcfMetric> {
-        self.last_flush_proxy.take()
+    /// Take all accumulated flush proxy metrics (NMSE), draining the internal buffer.
+    pub fn take_flush_proxies(&mut self) -> Vec<crate::core::qcf::QcfMetric> {
+        std::mem::take(&mut self.flush_proxies)
     }
 
     /// Total number of valid tokens (Q2 + residual).
@@ -254,7 +252,7 @@ impl KiviCache {
         self.attn_k_buf.fill(0.0);
         self.attn_v_buf.fill(0.0);
         self.q2_deq_tokens = 0;
-        self.last_flush_proxy = None;
+        self.flush_proxies.clear();
     }
 
     /// Flush residual buffer to quantized storage.
@@ -289,7 +287,7 @@ impl KiviCache {
             res_cap: self.res_cap,
             bits: self.bits,
         };
-        self.last_flush_proxy = Some(crate::core::qcf::compute_flush_qcf(
+        self.flush_proxies.push(crate::core::qcf::compute_flush_qcf(
             &proxy_params,
             &qcf_config,
         ));
@@ -1321,5 +1319,79 @@ mod tests {
         cache.transition_bits(2).unwrap();
         assert_eq!(cache.bits(), 2);
         assert_eq!(cache.q2_tokens, 0);
+    }
+
+    #[test]
+    fn test_take_flush_proxies_accumulates_multiple_flushes() {
+        // residual_size=32 → flush triggers when res_pos reaches res_cap (32).
+        // Flush #1 fires on token index 32 (before inserting it, res_pos==32).
+        // Flush #2 fires on token index 65 (before inserting it, res_pos==32 again).
+        // So we need 65+1=66 tokens to observe 2 flushes.
+        let mut cache = KiviCache::new(1, 32, 256, 32);
+
+        // Insert 66 tokens → 2 flushes should have occurred
+        for i in 0..66 {
+            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
+            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1 + 5.0);
+            cache.update(&k, &v).unwrap();
+        }
+
+        let proxies = cache.take_flush_proxies();
+        assert_eq!(
+            proxies.len(),
+            2,
+            "expected 2 flush proxies after 66 tokens with residual_size=32, got {}",
+            proxies.len()
+        );
+        for p in &proxies {
+            assert_eq!(p.action, "kivi");
+            assert!(p.raw_value >= 0.0, "NMSE should be non-negative");
+            assert_eq!(p.tokens_affected, 32);
+        }
+
+        // After take, buffer should be drained
+        let proxies2 = cache.take_flush_proxies();
+        assert!(proxies2.is_empty(), "buffer should be empty after take");
+    }
+
+    #[test]
+    fn test_take_flush_proxies_empty_when_no_flush() {
+        // residual_size=32 → no flush until 32 tokens are inserted
+        let mut cache = KiviCache::new(1, 32, 256, 32);
+
+        // Insert only 16 tokens (< residual_size) → no flush
+        for i in 0..16 {
+            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
+            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1 + 5.0);
+            cache.update(&k, &v).unwrap();
+        }
+
+        let proxies = cache.take_flush_proxies();
+        assert!(
+            proxies.is_empty(),
+            "no flush should occur below residual_size"
+        );
+    }
+
+    #[test]
+    fn test_reset_clears_flush_proxies() {
+        let mut cache = KiviCache::new(1, 32, 256, 32);
+
+        // Flush fires when res_pos reaches res_cap before inserting the 33rd token.
+        for i in 0..33 {
+            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
+            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1 + 5.0);
+            cache.update(&k, &v).unwrap();
+        }
+        assert!(
+            !cache.flush_proxies.is_empty(),
+            "flush_proxies should have entries after flush"
+        );
+
+        cache.reset();
+        assert!(
+            cache.flush_proxies.is_empty(),
+            "reset() must clear flush_proxies"
+        );
     }
 }
