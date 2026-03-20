@@ -16,6 +16,22 @@ pub enum ActionId {
 }
 
 impl ActionId {
+    /// 문자열 식별자로부터 ActionId 변환
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<ActionId> {
+        match s {
+            "switch_hw" => Some(ActionId::SwitchHw),
+            "throttle" => Some(ActionId::Throttle),
+            "kv_offload_disk" => Some(ActionId::KvOffloadDisk),
+            "kv_evict_sliding" => Some(ActionId::KvEvictSliding),
+            "kv_evict_h2o" => Some(ActionId::KvEvictH2o),
+            "kv_quant_dynamic" => Some(ActionId::KvQuantDynamic),
+            "layer_skip" => Some(ActionId::LayerSkip),
+            "snapkv_compress" => Some(ActionId::SnapkvCompress),
+            _ => None,
+        }
+    }
+
     /// 모든 ActionId 값을 반환
     pub fn all() -> &'static [ActionId] {
         &[
