@@ -307,12 +307,25 @@ impl CpuBackendNeon {
             let rows_per_chunk = rows_per_chunk.max(NR);
             let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
 
+            // Pre-convert A from F32 to F16 for FMLAL kernels (one-time cost)
+            let mut a_f16_buf: Vec<u16> = vec![0u16; m * k];
+            unsafe {
+                for i in 0..m {
+                    Self::f32_to_f16_neon(
+                        a_data.as_ptr().add(i * k),
+                        a_f16_buf.as_mut_ptr().add(i * k),
+                        k,
+                    );
+                }
+            }
+
             if m > 1 {
                 // N-major GEMM: single dispatch, B stays in L1 across M rows.
                 // chunk_id = n_chunk_idx * m + m_row — consecutive ids share B rows.
                 let total_tasks = n_chunks * m;
                 let ctx = F16GemmCtx {
                     a_base: a_data.as_ptr(),
+                    a_f16_base: a_f16_buf.as_ptr(),
                     b_base: b_data.as_ptr() as *const u16,
                     out_base: out_data.as_mut_ptr(),
                     m,
@@ -328,9 +341,10 @@ impl CpuBackendNeon {
                     );
                 }
             } else {
-                // M=1: existing GEMV path
+                // M=1: GEMV path with FMLAL
                 let ctx = F16GemvCtx {
                     a_ptr: a_data.as_ptr(),
+                    a_f16_ptr: a_f16_buf.as_ptr(),
                     b_base: b_data.as_ptr() as *const u16,
                     out_ptr: out_data.as_mut_ptr(),
                     k,
@@ -576,6 +590,186 @@ impl CpuBackendNeon {
             k_idx += 1;
         }
 
+        sum
+    }
+
+    // --- FMLAL kernels: F16×F16→F32 accumulation (eliminates fcvtl dependency chain) ---
+
+    /// Convert F32 slice to F16 using NEON fcvtn. One-time cost before FMLAL inner loop.
+    #[target_feature(enable = "neon")]
+    unsafe fn f32_to_f16_neon(src: *const f32, dst: *mut u16, len: usize) {
+        let mut i = 0;
+        while i + 8 <= len {
+            let v0 = vld1q_f32(src.add(i));
+            let v1 = vld1q_f32(src.add(i + 4));
+            let h0: uint16x4_t;
+            let h1: uint16x4_t;
+            std::arch::asm!("fcvtn {o:v}.4h, {i:v}.4s", o = lateout(vreg) h0, i = in(vreg) v0);
+            std::arch::asm!("fcvtn {o:v}.4h, {i:v}.4s", o = lateout(vreg) h1, i = in(vreg) v1);
+            vst1_u16(dst.add(i), h0);
+            vst1_u16(dst.add(i + 4), h1);
+            i += 8;
+        }
+        while i < len {
+            *dst.add(i) = half::f16::from_f32(*src.add(i)).to_bits();
+            i += 1;
+        }
+    }
+
+    /// FMLAL 4-row dot product: A(F16) · B[0..3](F16) → 4×F32 outputs.
+    /// Uses fmlal/fmlal2 (F16×F16→F32 accumulation) — no fcvtl conversion needed.
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_fmlal_4rows(
+        k: usize,
+        a_f16: *const u16,
+        b_ptrs: [*const u16; 4],
+        out: &mut [f32; 4],
+    ) {
+        let mut s00 = vdupq_n_f32(0.0);
+        let mut s01 = vdupq_n_f32(0.0);
+        let mut s02 = vdupq_n_f32(0.0);
+        let mut s03 = vdupq_n_f32(0.0);
+        let mut s10 = vdupq_n_f32(0.0);
+        let mut s11 = vdupq_n_f32(0.0);
+        let mut s12 = vdupq_n_f32(0.0);
+        let mut s13 = vdupq_n_f32(0.0);
+        let mut s20 = vdupq_n_f32(0.0);
+        let mut s21 = vdupq_n_f32(0.0);
+        let mut s22 = vdupq_n_f32(0.0);
+        let mut s23 = vdupq_n_f32(0.0);
+        let mut s30 = vdupq_n_f32(0.0);
+        let mut s31 = vdupq_n_f32(0.0);
+        let mut s32 = vdupq_n_f32(0.0);
+        let mut s33 = vdupq_n_f32(0.0);
+
+        let mut idx = 0;
+
+        // Main loop: 16 F16 elements per iteration × 4 B rows
+        while idx + 16 <= k {
+            let a0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let a1: uint16x8_t = vld1q_u16(a_f16.add(idx + 8));
+
+            macro_rules! fmlal16_row {
+                ($bp:expr, $sa:ident, $sb:ident, $sc:ident, $sd:ident) => {
+                    let br0: uint16x8_t = vld1q_u16($bp.add(idx));
+                    let br1: uint16x8_t = vld1q_u16($bp.add(idx + 8));
+                    std::arch::asm!(
+                        "fmlal  {s0:v}.4s, {a0:v}.4h, {b0:v}.4h",
+                        "fmlal2 {s1:v}.4s, {a0:v}.4h, {b0:v}.4h",
+                        "fmlal  {s2:v}.4s, {a1:v}.4h, {b1:v}.4h",
+                        "fmlal2 {s3:v}.4s, {a1:v}.4h, {b1:v}.4h",
+                        s0 = inout(vreg) $sa,
+                        s1 = inout(vreg) $sb,
+                        s2 = inout(vreg) $sc,
+                        s3 = inout(vreg) $sd,
+                        a0 = in(vreg) a0,
+                        a1 = in(vreg) a1,
+                        b0 = in(vreg) br0,
+                        b1 = in(vreg) br1,
+                    );
+                };
+            }
+            fmlal16_row!(b_ptrs[0], s00, s01, s02, s03);
+            fmlal16_row!(b_ptrs[1], s10, s11, s12, s13);
+            fmlal16_row!(b_ptrs[2], s20, s21, s22, s23);
+            fmlal16_row!(b_ptrs[3], s30, s31, s32, s33);
+
+            idx += 16;
+        }
+
+        // 8-element tail
+        while idx + 8 <= k {
+            let a_raw: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            macro_rules! fmlal8_row {
+                ($bp:expr, $s0:ident, $s1:ident) => {
+                    let br: uint16x8_t = vld1q_u16($bp.add(idx));
+                    std::arch::asm!(
+                        "fmlal  {s0:v}.4s, {a:v}.4h, {b:v}.4h",
+                        "fmlal2 {s1:v}.4s, {a:v}.4h, {b:v}.4h",
+                        s0 = inout(vreg) $s0,
+                        s1 = inout(vreg) $s1,
+                        a = in(vreg) a_raw,
+                        b = in(vreg) br,
+                    );
+                };
+            }
+            fmlal8_row!(b_ptrs[0], s00, s01);
+            fmlal8_row!(b_ptrs[1], s10, s11);
+            fmlal8_row!(b_ptrs[2], s20, s21);
+            fmlal8_row!(b_ptrs[3], s30, s31);
+            idx += 8;
+        }
+
+        out[0] = vaddvq_f32(vaddq_f32(vaddq_f32(s00, s01), vaddq_f32(s02, s03)));
+        out[1] = vaddvq_f32(vaddq_f32(vaddq_f32(s10, s11), vaddq_f32(s12, s13)));
+        out[2] = vaddvq_f32(vaddq_f32(vaddq_f32(s20, s21), vaddq_f32(s22, s23)));
+        out[3] = vaddvq_f32(vaddq_f32(vaddq_f32(s30, s31), vaddq_f32(s32, s33)));
+
+        // Scalar tail
+        while idx < k {
+            let a_val = half::f16::from_bits(*a_f16.add(idx)).to_f32();
+            for r in 0..4 {
+                out[r] += a_val * half::f16::from_bits(*b_ptrs[r].add(idx)).to_f32();
+            }
+            idx += 1;
+        }
+    }
+
+    /// FMLAL single-row dot product: A(F16) · B(F16) → scalar F32.
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_fmlal(k: usize, a_f16: *const u16, b_ptr: *const u16) -> f32 {
+        let mut s0 = vdupq_n_f32(0.0);
+        let mut s1 = vdupq_n_f32(0.0);
+        let mut s2 = vdupq_n_f32(0.0);
+        let mut s3 = vdupq_n_f32(0.0);
+
+        let mut idx = 0;
+        while idx + 16 <= k {
+            let a0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let a1: uint16x8_t = vld1q_u16(a_f16.add(idx + 8));
+            let b0: uint16x8_t = vld1q_u16(b_ptr.add(idx));
+            let b1: uint16x8_t = vld1q_u16(b_ptr.add(idx + 8));
+            std::arch::asm!(
+                "fmlal  {s0:v}.4s, {a0:v}.4h, {b0:v}.4h",
+                "fmlal2 {s1:v}.4s, {a0:v}.4h, {b0:v}.4h",
+                "fmlal  {s2:v}.4s, {a1:v}.4h, {b1:v}.4h",
+                "fmlal2 {s3:v}.4s, {a1:v}.4h, {b1:v}.4h",
+                s0 = inout(vreg) s0,
+                s1 = inout(vreg) s1,
+                s2 = inout(vreg) s2,
+                s3 = inout(vreg) s3,
+                a0 = in(vreg) a0,
+                a1 = in(vreg) a1,
+                b0 = in(vreg) b0,
+                b1 = in(vreg) b1,
+            );
+            idx += 16;
+        }
+
+        while idx + 8 <= k {
+            let a_raw: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let b_raw: uint16x8_t = vld1q_u16(b_ptr.add(idx));
+            std::arch::asm!(
+                "fmlal  {s0:v}.4s, {a:v}.4h, {b:v}.4h",
+                "fmlal2 {s1:v}.4s, {a:v}.4h, {b:v}.4h",
+                s0 = inout(vreg) s0,
+                s1 = inout(vreg) s1,
+                a = in(vreg) a_raw,
+                b = in(vreg) b_raw,
+            );
+            idx += 8;
+        }
+
+        s0 = vaddq_f32(s0, s1);
+        s2 = vaddq_f32(s2, s3);
+        s0 = vaddq_f32(s0, s2);
+        let mut sum = vaddvq_f32(s0);
+
+        while idx < k {
+            sum += half::f16::from_bits(*a_f16.add(idx)).to_f32()
+                * half::f16::from_bits(*b_ptr.add(idx)).to_f32();
+            idx += 1;
+        }
         sum
     }
 
@@ -1072,6 +1266,7 @@ impl CpuBackendNeon {
 #[repr(C)]
 struct F16GemvCtx {
     a_ptr: *const f32,
+    a_f16_ptr: *const u16, // Pre-converted A in F16 for FMLAL kernels
     b_base: *const u16,
     out_ptr: *mut f32,
     k: usize,
@@ -1087,9 +1282,10 @@ struct F16GemvCtx {
 /// so the same core reuses B data from L1 across all M activation rows.
 #[repr(C)]
 struct F16GemmCtx {
-    a_base: *const f32, // A[M, K] row-major
-    b_base: *const u16, // B[N, K] row-major (F16, transposed)
-    out_base: *mut f32, // Out[M, N] row-major
+    a_base: *const f32,    // A[M, K] row-major
+    a_f16_base: *const u16, // Pre-converted A[M, K] in F16 for FMLAL
+    b_base: *const u16,    // B[N, K] row-major (F16, transposed)
+    out_base: *mut f32,    // Out[M, N] row-major
     m: usize,
     n: usize,
     k: usize,
@@ -1107,6 +1303,7 @@ unsafe impl Sync for F16GemmCtx {}
 #[repr(C)]
 struct FusedGemvCtx {
     a_ptr: *const f32,
+    a_f16_ptr: *const u16, // Pre-converted A in F16 for FMLAL kernels
     k: usize,
     rows_per_chunk: usize,
     n_matmuls: usize,
@@ -1126,8 +1323,6 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     let ctx = &*(ctx_ptr as *const FusedGemvCtx);
 
     // Determine which matmul this chunk belongs to.
-    // chunk_offsets[i] = cumulative start chunk for matmul i.
-    // For n_matmuls==2, chunk_offsets[2] is unused — route via n_matmuls check.
     let (mat_idx, local_chunk) = if chunk_id < ctx.chunk_offsets[1] {
         (0, chunk_id - ctx.chunk_offsets[0])
     } else if ctx.n_matmuls == 2 || chunk_id < ctx.chunk_offsets[2] {
@@ -1152,12 +1347,13 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
             b_base.add((j + 3) * ctx.k),
         ];
         let mut results = [0.0f32; NR];
-        CpuBackendNeon::vec_dot_f16_f32_4rows(ctx.k, ctx.a_ptr, b_ptrs, &mut results);
+        CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, ctx.a_f16_ptr, b_ptrs, &mut results);
         std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
         j += NR;
     }
     while j < j_end {
-        *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_f32(ctx.k, ctx.a_ptr, b_base.add(j * ctx.k));
+        *out_ptr.add(j) =
+            CpuBackendNeon::vec_dot_fmlal(ctx.k, ctx.a_f16_ptr, b_base.add(j * ctx.k));
         j += 1;
     }
 }
@@ -1183,6 +1379,10 @@ pub unsafe fn fused_matmul_f16(
     let rows_per_chunk = ((total_rows + target_chunks - 1) / target_chunks + NR - 1) / NR * NR;
     let rows_per_chunk = rows_per_chunk.max(NR);
 
+    // Pre-convert A from F32 to F16 for FMLAL kernels
+    let mut a_f16_buf: Vec<u16> = vec![0u16; k];
+    CpuBackendNeon::f32_to_f16_neon(a_data, a_f16_buf.as_mut_ptr(), k);
+
     let mut b_bases = [std::ptr::null::<u16>(); 3];
     let mut out_ptrs = [std::ptr::null_mut::<f32>(); 3];
     let mut ns = [0usize; 3];
@@ -1199,6 +1399,7 @@ pub unsafe fn fused_matmul_f16(
 
     let ctx = FusedGemvCtx {
         a_ptr: a_data,
+        a_f16_ptr: a_f16_buf.as_ptr(),
         k,
         rows_per_chunk,
         n_matmuls: matmuls.len(),
@@ -1235,14 +1436,13 @@ unsafe fn f16_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
             ctx.b_base.add((j + 3) * ctx.k),
         ];
         let mut results = [0.0f32; NR];
-        CpuBackendNeon::vec_dot_f16_f32_4rows(ctx.k, ctx.a_ptr, b_ptrs, &mut results);
+        CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, ctx.a_f16_ptr, b_ptrs, &mut results);
         std::ptr::copy_nonoverlapping(results.as_ptr(), ctx.out_ptr.add(j), NR);
         j += NR;
     }
-    // Scalar tail within chunk
     while j < j_end {
         *ctx.out_ptr.add(j) =
-            CpuBackendNeon::vec_dot_f16_f32(ctx.k, ctx.a_ptr, ctx.b_base.add(j * ctx.k));
+            CpuBackendNeon::vec_dot_fmlal(ctx.k, ctx.a_f16_ptr, ctx.b_base.add(j * ctx.k));
         j += 1;
     }
 }
@@ -1265,7 +1465,7 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     let j_start = n_chunk_idx * ctx.rows_per_chunk;
     let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
 
-    let a_ptr = ctx.a_base.add(m_row * ctx.k);
+    let a_f16_ptr = ctx.a_f16_base.add(m_row * ctx.k);
     let out_ptr = ctx.out_base.add(m_row * ctx.n);
 
     let mut j = j_start;
@@ -1277,13 +1477,13 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
             ctx.b_base.add((j + 3) * ctx.k),
         ];
         let mut results = [0.0f32; NR];
-        CpuBackendNeon::vec_dot_f16_f32_4rows(ctx.k, a_ptr, b_ptrs, &mut results);
+        CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, a_f16_ptr, b_ptrs, &mut results);
         std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
         j += NR;
     }
-    // Scalar tail within chunk
     while j < j_end {
-        *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_f32(ctx.k, a_ptr, ctx.b_base.add(j * ctx.k));
+        *out_ptr.add(j) =
+            CpuBackendNeon::vec_dot_fmlal(ctx.k, a_f16_ptr, ctx.b_base.add(j * ctx.k));
         j += 1;
     }
 }
