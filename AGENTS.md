@@ -61,7 +61,7 @@ cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "
 - `manager/` — System resource manager service (`llm_manager` crate)
 
 **Non-Rust components**:
-- `dashboard/` — Web dashboard (Python/Flask)
+- `web_dashboard/` — Web dashboard (Python/Flask)
 
 **Engine module structure** (`engine/src/lib.rs`):
 - `core/` — Traits and abstractions: `Backend` (17+ ops), `Buffer`, `Tensor`, `KVCache`, eviction policies
@@ -120,6 +120,19 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 
 **제약**: 서브에이전트는 다른 서브에이전트를 호출할 수 없다 (최대 1단계). 작업 위임은 메인 세션이 담당.
 
+## Skill System
+
+`.claude/skills/`에 에이전트별 특화 스킬이 정의되어 있다. 스크립트는 `.agent/skills/*/scripts/`에 위치.
+
+| Skill | 용도 | 주 사용 Agent |
+|-------|------|--------------|
+| **sanity-check** | cargo fmt + clippy + test | Implementer |
+| **deploy-test** | Android 빌드→배포→테스트 | Tester |
+| **profile** | 온디바이스 프로파일링 + 시각화 | Tester, Implementer |
+| **dashboard** | 웹 대시보드 실행/관리 | (공용) |
+| **design-review** | SOLID 원칙 기반 코드 구조 검토 | Architect |
+| **research** | 논문/기술 조사 + 적용 가능성 평가 | Researcher |
+
 ## Workflow Rules
 
 - **Auto-commit on completion**: Implementer가 작업을 완료하면 자동으로 커밋한다. 미커밋 작업을 남기지 않는다.
@@ -129,7 +142,7 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 
 - `scripts/android_profile.py` — On-device profiling with JSON output
 - `scripts/visualize_profile.py` — Generate performance graphs
-- `dashboard/` — Flask dashboard for benchmark visualization (`cd dashboard && python app.py`)
+- `web_dashboard/` — Flask dashboard for benchmark visualization (`cd web_dashboard && python app.py`)
 - Results stored in `results/data/` (JSON) — **committed to repo as test data**, plots in `results/plots/` (gitignored)
 
 ## Key Documentation
@@ -211,10 +224,10 @@ Package: `scripts/device_registry/` — config.py (TOML loader), connection.py (
 ## Web Dashboard
 
 ```bash
-cd dashboard && .venv/bin/python app.py   # http://localhost:5000
+cd web_dashboard && .venv/bin/python app.py   # http://localhost:5000
 ```
 
-Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoints under `/api/`. Dashboard uses Flask + Plotly.js, venv at `dashboard/.venv/`.
+Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoints under `/api/`. Dashboard uses Flask + Plotly.js, venv at `web_dashboard/.venv/`.
 
 ## TODO System
 
