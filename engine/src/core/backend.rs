@@ -158,7 +158,7 @@ pub trait Backend: Send + Sync {
     /// Fused F32→F16 cast + HeadMajor scatter for KV cache update.
     /// Replaces 2× cast + 16× copy_slice with a single GPU kernel.
     /// Default: falls back to separate cast + copy.
-    #[allow(unused_variables)]
+    #[allow(unused_variables, clippy::too_many_arguments)]
     fn kv_scatter_f32_to_f16(
         &self,
         k_src: &Tensor,

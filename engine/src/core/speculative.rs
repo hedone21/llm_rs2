@@ -141,7 +141,7 @@ impl SkipOptimizer {
             .wrapping_add(1442695040888963407)
             >> 33) as usize;
         let layer = 1 + (idx % (num_layers.saturating_sub(2)).max(1));
-        let is_attn = (idx / num_layers) % 2 == 0;
+        let is_attn = (idx / num_layers).is_multiple_of(2);
 
         if is_attn {
             if new_config.attn_skip.contains(&layer) {

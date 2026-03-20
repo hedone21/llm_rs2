@@ -13,7 +13,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::shared_buffer::SharedBuffer;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout};
-use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QK2_0, QKKV};
+use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use anyhow::Result;
@@ -54,6 +54,7 @@ impl QuantizedBlocks {
         }
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         match self {
             QuantizedBlocks::Q2(v) => v.len(),
@@ -88,6 +89,7 @@ impl QuantizedBlocks {
         }
     }
 
+    #[allow(dead_code)]
     fn capacity(&self) -> usize {
         match self {
             QuantizedBlocks::Q2(v) => v.capacity(),
@@ -96,6 +98,7 @@ impl QuantizedBlocks {
         }
     }
 
+    #[allow(dead_code)]
     fn bits(&self) -> u8 {
         match self {
             QuantizedBlocks::Q2(_) => 2,

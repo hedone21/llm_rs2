@@ -12,11 +12,11 @@ pub fn avg_pool_1d(data: &mut [f32], kernel_size: usize) {
     let len = data.len();
     let mut buf = vec![0.0f32; len];
 
-    for i in 0..len {
+    for (i, out) in buf.iter_mut().enumerate().take(len) {
         let start = i.saturating_sub(pad);
         let end = (i + pad + 1).min(len);
         let sum: f32 = data[start..end].iter().sum();
-        buf[i] = sum / (end - start) as f32;
+        *out = sum / (end - start) as f32;
     }
 
     data.copy_from_slice(&buf);

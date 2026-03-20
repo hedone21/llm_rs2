@@ -725,11 +725,11 @@ impl KVCache {
         let n_kv_heads = keep_indices.len();
         let window_tokens = self.current_pos.saturating_sub(window_start);
 
-        for h in 0..n_kv_heads {
+        for (h, head_indices) in keep_indices.iter().enumerate().take(n_kv_heads) {
             let mut write_pos = 0;
 
             // 1. Gather selected prefix tokens
-            for &src_pos in &keep_indices[h] {
+            for &src_pos in head_indices {
                 if src_pos != write_pos {
                     self.shift_positions_for_head(h, src_pos, write_pos, 1)?;
                 }
@@ -747,7 +747,7 @@ impl KVCache {
         }
 
         let new_pos = keep_indices
-            .get(0)
+            .first()
             .map_or(window_tokens, |k| k.len() + window_tokens);
         self.current_pos = new_pos;
 

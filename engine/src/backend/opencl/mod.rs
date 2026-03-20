@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use ocl::core::Kernel as CoreKernel;
 use ocl::{Context, Device, Platform, Program, Queue, flags};
 use std::cell::UnsafeCell;
+#[cfg(test)]
 use std::sync::Arc;
 
 pub mod buffer;

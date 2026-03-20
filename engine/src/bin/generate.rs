@@ -737,6 +737,7 @@ fn main() -> anyhow::Result<()> {
             hidden_size,
             max_seq_len,
             &prompt,
+            actual_protected_prefix,
         );
     }
 
@@ -823,11 +824,13 @@ fn main() -> anyhow::Result<()> {
         // 50ms is enough for walt governor to ramp up.
         use rayon::prelude::*;
         let spin_until = std::time::Instant::now() + std::time::Duration::from_millis(50);
-        (0..rayon::current_num_threads()).into_par_iter().for_each(|_| {
-            while std::time::Instant::now() < spin_until {
-                std::hint::spin_loop();
-            }
-        });
+        (0..rayon::current_num_threads())
+            .into_par_iter()
+            .for_each(|_| {
+                while std::time::Instant::now() < spin_until {
+                    std::hint::spin_loop();
+                }
+            });
 
         // Reset KV caches
         for cache in kv_caches.iter_mut() {
@@ -1747,6 +1750,7 @@ fn run_eval_ll(
     _hidden_size: usize,
     max_seq_len: usize,
     default_prompt: &str,
+    protected_prefix: usize,
 ) -> anyhow::Result<()> {
     let hidden_size = model.config.hidden_size;
 
@@ -1846,6 +1850,7 @@ fn run_eval_ll(
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let overall_start = std::time::Instant::now();
+    let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
 
     for (q_idx, question) in questions.iter().enumerate() {
         let q_start = std::time::Instant::now();
@@ -1875,6 +1880,7 @@ fn run_eval_ll(
 
         let mut eviction_count: usize = 0;
         let mut evicted_total: usize = 0;
+        let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
         let start_pos_after_prompt: usize;
 
         // Compute effective budget: ratio-based (per question) or absolute
@@ -1918,6 +1924,10 @@ fn run_eval_ll(
                 backend.clone(),
             );
 
+            if let Some(acc) = score_accumulator.as_mut() {
+                acc.begin_step();
+            }
+
             model.forward_into(TransformerModelForwardArgs {
                 input_tokens: &input_tensor,
                 start_pos: 0,
@@ -1928,7 +1938,7 @@ fn run_eval_ll(
                 x_gen: None,
                 workspace: None,
                 use_gpu_attn: args.gpu_attn,
-                score_accumulator: None,
+                score_accumulator: score_accumulator.as_mut(),
                 profiler: None,
                 skip_config: None,
                 importance_collector: None,
@@ -1938,16 +1948,30 @@ fn run_eval_ll(
 
             // Evict to make room
             if kv_caches[0].current_pos > effective_budget {
-                let ratio = effective_budget as f32 / kv_caches[0].current_pos as f32;
+                let before_len = kv_caches[0].current_pos;
+                let ratio = effective_budget as f32 / before_len as f32;
                 let r = cache_manager.force_evict(kv_caches, ratio)?;
                 if r.evicted {
                     eviction_count += 1;
                     evicted_total += r.tokens_removed;
+                    let metric =
+                        llm_rs2::core::qcf::compute_sliding_qcf(r.tokens_removed, before_len);
+                    qcf_metrics.push(serde_json::json!({
+                        "step": "prefill",
+                        "action": metric.action,
+                        "raw_value": metric.raw_value,
+                        "tokens_affected": metric.tokens_affected,
+                        "cache_pos_before": before_len,
+                        "cache_pos_after": r.new_pos,
+                    }));
+                    if let Some(acc) = score_accumulator.as_mut() {
+                        acc.reset();
+                    }
                 }
             }
 
             // Decode remaining prompt tokens one-by-one
-            for &token_id in &prompt_ids[first_chunk_len..] {
+            for (decode_idx, &token_id) in prompt_ids[first_chunk_len..].iter().enumerate() {
                 unsafe {
                     *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token_id;
                 }
@@ -1975,19 +1999,65 @@ fn run_eval_ll(
                 start_pos += 1;
 
                 if kv_caches[0].current_pos > effective_budget {
-                    let ratio = effective_budget as f32 / kv_caches[0].current_pos as f32;
-                    let evict_result = if let Some(acc) = score_accumulator.as_ref() {
-                        cache_manager.force_evict_with_scores(
-                            kv_caches,
-                            ratio,
-                            acc.importance_scores(),
-                        )?
+                    let before_len = kv_caches[0].current_pos;
+                    let ratio = effective_budget as f32 / before_len as f32;
+
+                    let result = if let Some(acc) = score_accumulator.as_ref() {
+                        if acc.is_active() {
+                            let scores = acc.importance_scores();
+                            let target_len = ((before_len as f32) * ratio) as usize;
+                            let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
+                                scores,
+                                protected_prefix,
+                                args.h2o_keep_ratio,
+                                before_len,
+                                target_len,
+                            );
+                            if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty()
+                            {
+                                let metric = llm_rs2::core::qcf::compute_eviction_qcf(
+                                    &evicted,
+                                    scores,
+                                    &kv_caches[0],
+                                    &qcf_config,
+                                );
+                                qcf_metrics.push(serde_json::json!({
+                                    "step": decode_idx,
+                                    "action": metric.action,
+                                    "raw_value": metric.raw_value,
+                                    "tokens_affected": metric.tokens_affected,
+                                    "cache_pos_before": before_len,
+                                }));
+                            }
+                            cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
+                        } else {
+                            cache_manager.force_evict(kv_caches, ratio)?
+                        }
                     } else {
-                        cache_manager.force_evict(kv_caches, ratio)?
+                        let r = cache_manager.force_evict(kv_caches, ratio)?;
+                        if r.evicted {
+                            let metric = llm_rs2::core::qcf::compute_sliding_qcf(
+                                r.tokens_removed,
+                                before_len,
+                            );
+                            qcf_metrics.push(serde_json::json!({
+                                "step": decode_idx,
+                                "action": metric.action,
+                                "raw_value": metric.raw_value,
+                                "tokens_affected": metric.tokens_affected,
+                                "cache_pos_before": before_len,
+                                "cache_pos_after": r.new_pos,
+                            }));
+                        }
+                        r
                     };
-                    if evict_result.evicted {
+
+                    if result.evicted {
                         eviction_count += 1;
-                        evicted_total += evict_result.tokens_removed;
+                        evicted_total += result.tokens_removed;
+                        if let Some(acc) = score_accumulator.as_mut() {
+                            acc.reset();
+                        }
                     }
                 }
             }
@@ -2169,6 +2239,10 @@ fn run_eval_ll(
             elapsed_q,
         );
 
+        let qcf_total: f64 = qcf_metrics
+            .iter()
+            .filter_map(|m| m["raw_value"].as_f64())
+            .sum();
         results.push(serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
@@ -2181,6 +2255,8 @@ fn run_eval_ll(
             "effective_budget": effective_budget,
             "eviction_count": eviction_count,
             "evicted_tokens": evicted_total,
+            "qcf_metrics": qcf_metrics,
+            "qcf_total": qcf_total,
             "final_cache_pos": kv_caches[0].current_pos,
         }));
     }
@@ -3268,10 +3344,10 @@ fn run_ppl(
     max_seq_len: usize,
     text_file: &str,
     auto_eviction: bool,
-    score_based_eviction: bool,
+    _score_based_eviction: bool,
     protected_prefix: usize,
 ) -> anyhow::Result<()> {
-    use llm_rs2::core::qcf::{QcfConfig, QcfMetric};
+    use llm_rs2::core::qcf::QcfConfig;
 
     // ── 1. Read and tokenize reference text ──
     let text = std::fs::read_to_string(text_file)
