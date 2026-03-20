@@ -320,9 +320,10 @@ impl CpuBackendNeon {
             }
 
             if m > 1 {
-                // N-major GEMM: single dispatch, B stays in L1 across M rows.
-                // chunk_id = n_chunk_idx * m + m_row — consecutive ids share B rows.
-                let total_tasks = n_chunks * m;
+                // N-major GEMM with MR=2: pairs of A rows share B loads.
+                // chunk_id = n_chunk_idx * m_groups + m_group, where m_groups = ceil(m/2)
+                let m_groups = (m + 1) / 2;
+                let total_tasks = n_chunks * m_groups;
                 let ctx = F16GemmCtx {
                     a_base: a_data.as_ptr(),
                     a_f16_base: a_f16_buf.as_ptr(),
@@ -710,6 +711,102 @@ impl CpuBackendNeon {
             let a_val = half::f16::from_bits(*a_f16.add(idx)).to_f32();
             for r in 0..4 {
                 out[r] += a_val * half::f16::from_bits(*b_ptrs[r].add(idx)).to_f32();
+            }
+            idx += 1;
+        }
+    }
+
+    /// FMLAL MR=2 tiled kernel: 2 A rows × 4 B rows → 8 F32 outputs.
+    /// B loads are shared across both A rows, shifting bottleneck from LOAD to FMA.
+    ///
+    /// Pipeline (8 K-elements/iter): Load=6(3cy), FMA=16(4cy) → FMA-bound @ 4cy
+    /// vs MR=1: Load=10(5cy), FMA=16(4cy) → LOAD-bound @ 5cy → 1.25x improvement
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_fmlal_2x4rows(
+        k: usize,
+        a0_f16: *const u16,
+        a1_f16: *const u16,
+        b_ptrs: [*const u16; 4],
+        out0: &mut [f32; 4],
+        out1: &mut [f32; 4],
+    ) {
+        // 2 A rows × 4 B rows × 2 accumulators = 16 F32 registers
+        // Row 0 (A0 × B[0..3])
+        let mut r0b0_0 = vdupq_n_f32(0.0);
+        let mut r0b0_1 = vdupq_n_f32(0.0);
+        let mut r0b1_0 = vdupq_n_f32(0.0);
+        let mut r0b1_1 = vdupq_n_f32(0.0);
+        let mut r0b2_0 = vdupq_n_f32(0.0);
+        let mut r0b2_1 = vdupq_n_f32(0.0);
+        let mut r0b3_0 = vdupq_n_f32(0.0);
+        let mut r0b3_1 = vdupq_n_f32(0.0);
+        // Row 1 (A1 × B[0..3])
+        let mut r1b0_0 = vdupq_n_f32(0.0);
+        let mut r1b0_1 = vdupq_n_f32(0.0);
+        let mut r1b1_0 = vdupq_n_f32(0.0);
+        let mut r1b1_1 = vdupq_n_f32(0.0);
+        let mut r1b2_0 = vdupq_n_f32(0.0);
+        let mut r1b2_1 = vdupq_n_f32(0.0);
+        let mut r1b3_0 = vdupq_n_f32(0.0);
+        let mut r1b3_1 = vdupq_n_f32(0.0);
+
+        let mut idx = 0;
+
+        // Main loop: 8 K-elements per iteration
+        // 6 loads + 16 fmlal = 22 instructions; FMA-bound @ 4 cycles
+        while idx + 8 <= k {
+            let a0: uint16x8_t = vld1q_u16(a0_f16.add(idx));
+            let a1: uint16x8_t = vld1q_u16(a1_f16.add(idx));
+
+            macro_rules! fmlal_2row {
+                ($bp:expr, $r0a:ident, $r0b:ident, $r1a:ident, $r1b:ident) => {
+                    let br: uint16x8_t = vld1q_u16($bp.add(idx));
+                    std::arch::asm!(
+                        "fmlal  {r0a:v}.4s, {a0:v}.4h, {b:v}.4h",
+                        "fmlal2 {r0b:v}.4s, {a0:v}.4h, {b:v}.4h",
+                        "fmlal  {r1a:v}.4s, {a1:v}.4h, {b:v}.4h",
+                        "fmlal2 {r1b:v}.4s, {a1:v}.4h, {b:v}.4h",
+                        r0a = inout(vreg) $r0a,
+                        r0b = inout(vreg) $r0b,
+                        r1a = inout(vreg) $r1a,
+                        r1b = inout(vreg) $r1b,
+                        a0 = in(vreg) a0,
+                        a1 = in(vreg) a1,
+                        b = in(vreg) br,
+                    );
+                };
+            }
+            fmlal_2row!(b_ptrs[0], r0b0_0, r0b0_1, r1b0_0, r1b0_1);
+            fmlal_2row!(b_ptrs[1], r0b1_0, r0b1_1, r1b1_0, r1b1_1);
+            fmlal_2row!(b_ptrs[2], r0b2_0, r0b2_1, r1b2_0, r1b2_1);
+            fmlal_2row!(b_ptrs[3], r0b3_0, r0b3_1, r1b3_0, r1b3_1);
+
+            idx += 8;
+        }
+
+        // Reduce: 2 accumulators per (A_row, B_row) → 1 F32 scalar
+        macro_rules! reduce2 {
+            ($a:expr, $b:expr) => {
+                vaddvq_f32(vaddq_f32($a, $b))
+            };
+        }
+        out0[0] = reduce2!(r0b0_0, r0b0_1);
+        out0[1] = reduce2!(r0b1_0, r0b1_1);
+        out0[2] = reduce2!(r0b2_0, r0b2_1);
+        out0[3] = reduce2!(r0b3_0, r0b3_1);
+        out1[0] = reduce2!(r1b0_0, r1b0_1);
+        out1[1] = reduce2!(r1b1_0, r1b1_1);
+        out1[2] = reduce2!(r1b2_0, r1b2_1);
+        out1[3] = reduce2!(r1b3_0, r1b3_1);
+
+        // Scalar tail (K not multiple of 8)
+        while idx < k {
+            let a0_val = half::f16::from_bits(*a0_f16.add(idx)).to_f32();
+            let a1_val = half::f16::from_bits(*a1_f16.add(idx)).to_f32();
+            for r in 0..4 {
+                let b_val = half::f16::from_bits(*b_ptrs[r].add(idx)).to_f32();
+                out0[r] += a0_val * b_val;
+                out1[r] += a1_val * b_val;
             }
             idx += 1;
         }
@@ -1447,9 +1544,10 @@ unsafe fn f16_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     }
 }
 
-/// N-major GEMM work function: processes one (n_chunk, m_row) pair.
-/// Consecutive chunk_ids share the same N-chunk (B rows), enabling L1 reuse
-/// when the same core picks up sequential tasks via SpinPool's fetch_add.
+/// N-major GEMM work function with MR=2 tiling.
+/// Processes (n_chunk, m_group) where m_group = pair of 2 A rows.
+/// B loads are shared across both A rows within vec_dot_fmlal_2x4rows,
+/// shifting the bottleneck from LOAD (5cy) to FMA (4cy).
 ///
 /// # Safety
 /// Called by SpinPool workers with valid F16GemmCtx pointer.
@@ -1457,33 +1555,67 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     const NR: usize = 4;
     let ctx = &*(ctx_ptr as *const F16GemmCtx);
 
-    // N-major mapping: chunk_id = n_chunk_idx * m + m_row
-    // Consecutive chunk_ids iterate m_row first → same B rows stay in L1
-    let n_chunk_idx = chunk_id / ctx.m;
-    let m_row = chunk_id % ctx.m;
+    // MR=2 mapping: chunk_id = n_chunk_idx * m_groups + m_group
+    let m_groups = (ctx.m + 1) / 2;
+    let n_chunk_idx = chunk_id / m_groups;
+    let m_group = chunk_id % m_groups;
+    let m_row0 = m_group * 2;
+    let m_row1 = m_row0 + 1; // may be == ctx.m (odd M)
 
     let j_start = n_chunk_idx * ctx.rows_per_chunk;
     let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
 
-    let a_f16_ptr = ctx.a_f16_base.add(m_row * ctx.k);
-    let out_ptr = ctx.out_base.add(m_row * ctx.n);
+    let a0_f16 = ctx.a_f16_base.add(m_row0 * ctx.k);
+    let out0 = ctx.out_base.add(m_row0 * ctx.n);
 
-    let mut j = j_start;
-    while j + NR <= j_end {
-        let b_ptrs = [
-            ctx.b_base.add(j * ctx.k),
-            ctx.b_base.add((j + 1) * ctx.k),
-            ctx.b_base.add((j + 2) * ctx.k),
-            ctx.b_base.add((j + 3) * ctx.k),
-        ];
-        let mut results = [0.0f32; NR];
-        CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, a_f16_ptr, b_ptrs, &mut results);
-        std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
-        j += NR;
-    }
-    while j < j_end {
-        *out_ptr.add(j) =
-            CpuBackendNeon::vec_dot_fmlal(ctx.k, a_f16_ptr, ctx.b_base.add(j * ctx.k));
-        j += 1;
+    if m_row1 < ctx.m {
+        // MR=2: process both A rows with shared B loads
+        let a1_f16 = ctx.a_f16_base.add(m_row1 * ctx.k);
+        let out1 = ctx.out_base.add(m_row1 * ctx.n);
+
+        let mut j = j_start;
+        while j + NR <= j_end {
+            let b_ptrs = [
+                ctx.b_base.add(j * ctx.k),
+                ctx.b_base.add((j + 1) * ctx.k),
+                ctx.b_base.add((j + 2) * ctx.k),
+                ctx.b_base.add((j + 3) * ctx.k),
+            ];
+            let mut res0 = [0.0f32; NR];
+            let mut res1 = [0.0f32; NR];
+            CpuBackendNeon::vec_dot_fmlal_2x4rows(
+                ctx.k, a0_f16, a1_f16, b_ptrs, &mut res0, &mut res1,
+            );
+            std::ptr::copy_nonoverlapping(res0.as_ptr(), out0.add(j), NR);
+            std::ptr::copy_nonoverlapping(res1.as_ptr(), out1.add(j), NR);
+            j += NR;
+        }
+        while j < j_end {
+            *out0.add(j) =
+                CpuBackendNeon::vec_dot_fmlal(ctx.k, a0_f16, ctx.b_base.add(j * ctx.k));
+            *out1.add(j) =
+                CpuBackendNeon::vec_dot_fmlal(ctx.k, a1_f16, ctx.b_base.add(j * ctx.k));
+            j += 1;
+        }
+    } else {
+        // Odd M tail: single row fallback (MR=1)
+        let mut j = j_start;
+        while j + NR <= j_end {
+            let b_ptrs = [
+                ctx.b_base.add(j * ctx.k),
+                ctx.b_base.add((j + 1) * ctx.k),
+                ctx.b_base.add((j + 2) * ctx.k),
+                ctx.b_base.add((j + 3) * ctx.k),
+            ];
+            let mut results = [0.0f32; NR];
+            CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, a0_f16, b_ptrs, &mut results);
+            std::ptr::copy_nonoverlapping(results.as_ptr(), out0.add(j), NR);
+            j += NR;
+        }
+        while j < j_end {
+            *out0.add(j) =
+                CpuBackendNeon::vec_dot_fmlal(ctx.k, a0_f16, ctx.b_base.add(j * ctx.k));
+            j += 1;
+        }
     }
 }
