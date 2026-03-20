@@ -929,70 +929,48 @@ impl CpuBackendNeon {
 
         let mut idx = 0;
 
-        // Main loop: 8 K-elements per iteration
-        // 8 loads (4A + 4B) + 16 fmla = 24 instructions; balanced @ 4 cycles
-        while idx + 8 <= k {
-            let av0: uint16x8_t = vld1q_u16(a_ptrs[0].add(idx));
-            let av1: uint16x8_t = vld1q_u16(a_ptrs[1].add(idx));
-            let av2: uint16x8_t = vld1q_u16(a_ptrs[2].add(idx));
-            let av3: uint16x8_t = vld1q_u16(a_ptrs[3].add(idx));
+        // K-loop macro: process 8 K-elements (1 K-step)
+        macro_rules! k_step {
+            ($off:expr) => {
+                let av0: uint16x8_t = vld1q_u16(a_ptrs[0].add($off));
+                let av1: uint16x8_t = vld1q_u16(a_ptrs[1].add($off));
+                let av2: uint16x8_t = vld1q_u16(a_ptrs[2].add($off));
+                let av3: uint16x8_t = vld1q_u16(a_ptrs[3].add($off));
 
-            // B col 0: load once, FMA against all 4 A rows
-            let bv: uint16x8_t = vld1q_u16(b_ptrs[0].add(idx));
-            std::arch::asm!(
-                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
-                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
-                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
-                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
-                d0 = inout(vreg) a0b0, d1 = inout(vreg) a1b0,
-                d2 = inout(vreg) a2b0, d3 = inout(vreg) a3b0,
-                a0 = in(vreg) av0, a1 = in(vreg) av1,
-                a2 = in(vreg) av2, a3 = in(vreg) av3,
-                b = in(vreg) bv,
-            );
+                macro_rules! col {
+                    ($bi:expr, $c0:ident, $c1:ident, $c2:ident, $c3:ident) => {
+                        let bv: uint16x8_t = vld1q_u16(b_ptrs[$bi].add($off));
+                        std::arch::asm!(
+                            "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
+                            "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
+                            "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
+                            "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
+                            d0 = inout(vreg) $c0, d1 = inout(vreg) $c1,
+                            d2 = inout(vreg) $c2, d3 = inout(vreg) $c3,
+                            a0 = in(vreg) av0, a1 = in(vreg) av1,
+                            a2 = in(vreg) av2, a3 = in(vreg) av3,
+                            b = in(vreg) bv,
+                        );
+                    };
+                }
+                col!(0, a0b0, a1b0, a2b0, a3b0);
+                col!(1, a0b1, a1b1, a2b1, a3b1);
+                col!(2, a0b2, a1b2, a2b2, a3b2);
+                col!(3, a0b3, a1b3, a2b3, a3b3);
+            };
+        }
 
-            // B col 1
-            let bv: uint16x8_t = vld1q_u16(b_ptrs[1].add(idx));
-            std::arch::asm!(
-                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
-                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
-                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
-                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
-                d0 = inout(vreg) a0b1, d1 = inout(vreg) a1b1,
-                d2 = inout(vreg) a2b1, d3 = inout(vreg) a3b1,
-                a0 = in(vreg) av0, a1 = in(vreg) av1,
-                a2 = in(vreg) av2, a3 = in(vreg) av3,
-                b = in(vreg) bv,
-            );
+        // Main loop: 2x unrolled (16 K-elements per iteration)
+        // Halves branch overhead; gives OOO engine 48 instructions to schedule
+        while idx + 16 <= k {
+            k_step!(idx);
+            k_step!(idx + 8);
+            idx += 16;
+        }
 
-            // B col 2
-            let bv: uint16x8_t = vld1q_u16(b_ptrs[2].add(idx));
-            std::arch::asm!(
-                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
-                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
-                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
-                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
-                d0 = inout(vreg) a0b2, d1 = inout(vreg) a1b2,
-                d2 = inout(vreg) a2b2, d3 = inout(vreg) a3b2,
-                a0 = in(vreg) av0, a1 = in(vreg) av1,
-                a2 = in(vreg) av2, a3 = in(vreg) av3,
-                b = in(vreg) bv,
-            );
-
-            // B col 3
-            let bv: uint16x8_t = vld1q_u16(b_ptrs[3].add(idx));
-            std::arch::asm!(
-                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
-                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
-                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
-                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
-                d0 = inout(vreg) a0b3, d1 = inout(vreg) a1b3,
-                d2 = inout(vreg) a2b3, d3 = inout(vreg) a3b3,
-                a0 = in(vreg) av0, a1 = in(vreg) av1,
-                a2 = in(vreg) av2, a3 = in(vreg) av3,
-                b = in(vreg) bv,
-            );
-
+        // 8-element tail
+        if idx + 8 <= k {
+            k_step!(idx);
             idx += 8;
         }
 
