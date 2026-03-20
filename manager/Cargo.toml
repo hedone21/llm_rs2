@@ -21,3 +21,7 @@ tempfile = "3"
 [[bin]]
 name = "mock_manager"
 path = "src/bin/mock_manager.rs"
+
+[[bin]]
+name = "mock_engine"
+path = "src/bin/mock_engine.rs"
