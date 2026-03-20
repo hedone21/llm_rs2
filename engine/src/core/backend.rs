@@ -243,10 +243,7 @@ pub trait Backend: Send + Sync {
             }
             DType::F16 => {
                 let src_data = unsafe {
-                    std::slice::from_raw_parts(
-                        src.as_ptr() as *const half::f16,
-                        src_rows * cols,
-                    )
+                    std::slice::from_raw_parts(src.as_ptr() as *const half::f16, src_rows * cols)
                 };
                 for (i, &idx) in idx_data.iter().enumerate() {
                     let offset = idx as usize * cols;

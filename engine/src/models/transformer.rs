@@ -199,10 +199,7 @@ impl TransformerModel {
                 let size_bytes = num_elements * 2;
                 let buffer = cpu_memory.alloc(size_bytes, DType::F16)?;
                 let dst = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        buffer.as_mut_ptr() as *mut f16,
-                        num_elements,
-                    )
+                    std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut f16, num_elements)
                 };
 
                 match tensor_view.dtype() {
@@ -282,10 +279,7 @@ impl TransformerModel {
                         }
                     }
                     _ => {
-                        return Err(anyhow!(
-                            "Unsupported dtype: {:?}",
-                            tensor_view.dtype()
-                        ));
+                        return Err(anyhow!("Unsupported dtype: {:?}", tensor_view.dtype()));
                     }
                 }
 
@@ -381,10 +375,7 @@ impl TransformerModel {
                     }
                 }
                 _ => {
-                    return Err(anyhow!(
-                        "Unsupported dtype: {:?}",
-                        tensor_view.dtype()
-                    ));
+                    return Err(anyhow!("Unsupported dtype: {:?}", tensor_view.dtype()));
                 }
             }
 
