@@ -1,0 +1,65 @@
+# Hierarchical Policy Configuration
+# See docs/36_policy_design.md for design rationale.
+
+[pi_controller]
+compute_kp = 1.5
+compute_ki = 0.3
+compute_setpoint = 0.70
+memory_kp = 2.0
+memory_ki = 0.5
+memory_setpoint = 0.75
+thermal_kp = 1.0
+thermal_ki = 0.2
+thermal_setpoint = 0.80
+integral_clamp = 2.0
+
+[supervisory]
+warning_threshold = 0.4
+critical_threshold = 0.7
+warning_release = 0.25
+critical_release = 0.50
+hold_time_secs = 4.0
+
+[selector]
+latency_budget = 0.5
+algorithm = "exhaustive"
+
+[relief_model]
+forgetting_factor = 0.995
+prior_weight = 5
+storage_dir = "~/.llm_rs/models"
+
+[actions.switch_hw]
+alpha = 0.0
+reversible = true
+
+[actions.throttle]
+alpha = 0.0
+reversible = true
+
+[actions.kv_offload_disk]
+alpha = 0.0
+reversible = true
+
+[actions.kv_evict_sliding]
+alpha = 0.12
+reversible = false
+
+[actions.kv_evict_h2o]
+alpha = 0.15
+reversible = false
+
+[actions.kv_quant_dynamic]
+alpha = 0.08
+reversible = true
+
+[actions.layer_skip]
+alpha = 0.25
+reversible = true
+
+[actions.snapkv_compress]
+alpha = 0.10
+reversible = false
+
+[exclusion_groups]
+eviction = ["kv_evict_sliding", "kv_evict_h2o"]

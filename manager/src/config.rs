@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::collections::HashMap;
 
 /// Top-level Manager configuration, loadable from TOML.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -10,6 +11,7 @@ pub struct Config {
     pub compute: Option<ComputeMonitorConfig>,
     pub energy: Option<EnergyMonitorConfig>,
     pub external: Option<ExternalMonitorConfig>,
+    pub policy: Option<PolicyConfig>,
 }
 
 impl Config {
@@ -166,6 +168,127 @@ impl Default for ExternalMonitorConfig {
     }
 }
 
+/// 계층형 정책 설정 (PI Controller + Supervisory + Selector + Relief Model)
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct PolicyConfig {
+    pub pi_controller: PiControllerConfig,
+    pub supervisory: SupervisoryConfig,
+    pub selector: SelectorConfig,
+    pub relief_model: ReliefModelConfig,
+    pub actions: HashMap<String, ActionConfig>,
+    pub exclusion_groups: HashMap<String, Vec<String>>,
+}
+
+/// PI Controller 설정
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PiControllerConfig {
+    pub compute_kp: f32,
+    pub compute_ki: f32,
+    pub compute_setpoint: f32,
+    pub memory_kp: f32,
+    pub memory_ki: f32,
+    pub memory_setpoint: f32,
+    pub thermal_kp: f32,
+    pub thermal_ki: f32,
+    pub thermal_setpoint: f32,
+    pub integral_clamp: f32,
+}
+
+impl Default for PiControllerConfig {
+    fn default() -> Self {
+        Self {
+            compute_kp: 1.5,
+            compute_ki: 0.3,
+            compute_setpoint: 0.70,
+            memory_kp: 2.0,
+            memory_ki: 0.5,
+            memory_setpoint: 0.75,
+            thermal_kp: 1.0,
+            thermal_ki: 0.2,
+            thermal_setpoint: 0.80,
+            integral_clamp: 2.0,
+        }
+    }
+}
+
+/// Supervisory 모드 전환 임계값 설정
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SupervisoryConfig {
+    pub warning_threshold: f32,
+    pub critical_threshold: f32,
+    pub warning_release: f32,
+    pub critical_release: f32,
+    pub hold_time_secs: f32,
+}
+
+impl Default for SupervisoryConfig {
+    fn default() -> Self {
+        Self {
+            warning_threshold: 0.4,
+            critical_threshold: 0.7,
+            warning_release: 0.25,
+            critical_release: 0.50,
+            hold_time_secs: 4.0,
+        }
+    }
+}
+
+/// Action Selector 설정
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SelectorConfig {
+    pub latency_budget: f32,
+    pub algorithm: String,
+}
+
+impl Default for SelectorConfig {
+    fn default() -> Self {
+        Self {
+            latency_budget: 0.5,
+            algorithm: "exhaustive".to_string(),
+        }
+    }
+}
+
+/// Relief Estimator 모델 설정
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ReliefModelConfig {
+    pub forgetting_factor: f32,
+    pub prior_weight: u32,
+    pub storage_dir: String,
+}
+
+impl Default for ReliefModelConfig {
+    fn default() -> Self {
+        Self {
+            forgetting_factor: 0.995,
+            prior_weight: 5,
+            storage_dir: "~/.llm_rs/models".to_string(),
+        }
+    }
+}
+
+/// 액션별 메타데이터 설정
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ActionConfig {
+    pub alpha: f32,
+    pub reversible: bool,
+}
+
+impl Default for ActionConfig {
+    fn default() -> Self {
+        Self {
+            alpha: 0.0,
+            reversible: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,5 +376,59 @@ transport = "stdin"
         );
         assert!(!config.energy.unwrap().enabled);
         assert!(config.external.unwrap().enabled);
+    }
+
+    #[test]
+    fn parse_policy_config() {
+        let toml_str = r#"
+[policy.pi_controller]
+compute_kp = 1.5
+compute_ki = 0.3
+
+[policy.supervisory]
+warning_threshold = 0.4
+critical_threshold = 0.7
+
+[policy.selector]
+latency_budget = 0.5
+
+[policy.actions.switch_hw]
+alpha = 0.0
+reversible = true
+
+[policy.actions.kv_evict_sliding]
+alpha = 0.12
+reversible = false
+
+[policy.exclusion_groups]
+eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let policy = config.policy.unwrap();
+        assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
+        assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
+        let switch = policy.actions.get("switch_hw").unwrap();
+        assert!((switch.alpha).abs() < f32::EPSILON);
+        assert!(switch.reversible);
+        let eviction = policy.exclusion_groups.get("eviction").unwrap();
+        assert_eq!(eviction.len(), 2);
+    }
+
+    #[test]
+    fn policy_config_defaults() {
+        let policy = PolicyConfig::default();
+        assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
+        assert!((policy.pi_controller.memory_kp - 2.0).abs() < f32::EPSILON);
+        assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
+        assert!((policy.supervisory.hold_time_secs - 4.0).abs() < f32::EPSILON);
+        assert_eq!(policy.selector.algorithm, "exhaustive");
+        assert!((policy.relief_model.forgetting_factor - 0.995).abs() < f32::EPSILON);
+        assert_eq!(policy.relief_model.prior_weight, 5);
+    }
+
+    #[test]
+    fn config_policy_optional_none_by_default() {
+        let config = Config::default();
+        assert!(config.policy.is_none());
     }
 }
