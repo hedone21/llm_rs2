@@ -2,7 +2,7 @@
 # NDK 경로와 API 레벨을 자신의 환경에 맞게 수정해야 합니다.
 linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
 ar = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-rustflags = ["-C", "target-feature=+neon,+dotprod,+fhm", "-C", "link-arg=-Wl,--allow-shlib-undefined", "-L", "libs/aarch64"]
+rustflags = ["-C", "target-feature=+neon,+dotprod,+fhm,+fp16", "-C", "link-arg=-Wl,--allow-shlib-undefined", "-L", "libs/aarch64"]
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+avx2,+fma"]

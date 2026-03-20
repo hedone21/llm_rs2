@@ -320,9 +320,9 @@ impl CpuBackendNeon {
             }
 
             if m > 1 {
-                // N-major GEMM with MR=2: pairs of A rows share B loads.
-                // chunk_id = n_chunk_idx * m_groups + m_group, where m_groups = ceil(m/2)
-                let m_groups = (m + 1) / 2;
+                // N-major GEMM with MR=4: groups of 4 A rows share B loads via F16 FMA.
+                // chunk_id = n_chunk_idx * m_groups + m_group, where m_groups = ceil(m/4)
+                let m_groups = (m + 3) / 4;
                 let total_tasks = n_chunks * m_groups;
                 let ctx = F16GemmCtx {
                     a_base: a_data.as_ptr(),
@@ -807,6 +807,136 @@ impl CpuBackendNeon {
                 let b_val = half::f16::from_bits(*b_ptrs[r].add(idx)).to_f32();
                 out0[r] += a0_val * b_val;
                 out1[r] += a1_val * b_val;
+            }
+            idx += 1;
+        }
+    }
+
+    /// RM=4 × NR=4 tiled GEMM with native F16 FMA and F16 accumulators.
+    /// Processes 4 A rows × 4 B rows = 16 output cells per call.
+    ///
+    /// Pipeline (8 K-elem/iter): Load=8(4cy), FMA=16(4cy) → balanced @ 4cy
+    /// Output: 16 / 4cy = 4.0 per cycle (2x over MR=2 FMLAL's 2.0)
+    ///
+    /// F16 accumulators (uint16x8_t) use half the registers of F32,
+    /// enabling the 4×4 tile that would be impossible with F32 (32 regs needed).
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_f16_native_4x4(
+        k: usize,
+        a_ptrs: [*const u16; 4],
+        b_ptrs: [*const u16; 4],
+        out: &mut [[f32; 4]; 4], // out[a_row][b_col]
+    ) {
+        // 16 F16 accumulators: acc_AxBy = A row x × B col y
+        let mut a0b0: uint16x8_t = vdupq_n_u16(0);
+        let mut a0b1: uint16x8_t = vdupq_n_u16(0);
+        let mut a0b2: uint16x8_t = vdupq_n_u16(0);
+        let mut a0b3: uint16x8_t = vdupq_n_u16(0);
+        let mut a1b0: uint16x8_t = vdupq_n_u16(0);
+        let mut a1b1: uint16x8_t = vdupq_n_u16(0);
+        let mut a1b2: uint16x8_t = vdupq_n_u16(0);
+        let mut a1b3: uint16x8_t = vdupq_n_u16(0);
+        let mut a2b0: uint16x8_t = vdupq_n_u16(0);
+        let mut a2b1: uint16x8_t = vdupq_n_u16(0);
+        let mut a2b2: uint16x8_t = vdupq_n_u16(0);
+        let mut a2b3: uint16x8_t = vdupq_n_u16(0);
+        let mut a3b0: uint16x8_t = vdupq_n_u16(0);
+        let mut a3b1: uint16x8_t = vdupq_n_u16(0);
+        let mut a3b2: uint16x8_t = vdupq_n_u16(0);
+        let mut a3b3: uint16x8_t = vdupq_n_u16(0);
+
+        let mut idx = 0;
+
+        // Main loop: 8 K-elements per iteration
+        // 8 loads (4A + 4B) + 16 fmla = 24 instructions; balanced @ 4 cycles
+        while idx + 8 <= k {
+            let av0: uint16x8_t = vld1q_u16(a_ptrs[0].add(idx));
+            let av1: uint16x8_t = vld1q_u16(a_ptrs[1].add(idx));
+            let av2: uint16x8_t = vld1q_u16(a_ptrs[2].add(idx));
+            let av3: uint16x8_t = vld1q_u16(a_ptrs[3].add(idx));
+
+            // B col 0: load once, FMA against all 4 A rows
+            let bv: uint16x8_t = vld1q_u16(b_ptrs[0].add(idx));
+            std::arch::asm!(
+                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
+                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
+                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
+                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
+                d0 = inout(vreg) a0b0, d1 = inout(vreg) a1b0,
+                d2 = inout(vreg) a2b0, d3 = inout(vreg) a3b0,
+                a0 = in(vreg) av0, a1 = in(vreg) av1,
+                a2 = in(vreg) av2, a3 = in(vreg) av3,
+                b = in(vreg) bv,
+            );
+
+            // B col 1
+            let bv: uint16x8_t = vld1q_u16(b_ptrs[1].add(idx));
+            std::arch::asm!(
+                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
+                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
+                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
+                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
+                d0 = inout(vreg) a0b1, d1 = inout(vreg) a1b1,
+                d2 = inout(vreg) a2b1, d3 = inout(vreg) a3b1,
+                a0 = in(vreg) av0, a1 = in(vreg) av1,
+                a2 = in(vreg) av2, a3 = in(vreg) av3,
+                b = in(vreg) bv,
+            );
+
+            // B col 2
+            let bv: uint16x8_t = vld1q_u16(b_ptrs[2].add(idx));
+            std::arch::asm!(
+                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
+                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
+                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
+                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
+                d0 = inout(vreg) a0b2, d1 = inout(vreg) a1b2,
+                d2 = inout(vreg) a2b2, d3 = inout(vreg) a3b2,
+                a0 = in(vreg) av0, a1 = in(vreg) av1,
+                a2 = in(vreg) av2, a3 = in(vreg) av3,
+                b = in(vreg) bv,
+            );
+
+            // B col 3
+            let bv: uint16x8_t = vld1q_u16(b_ptrs[3].add(idx));
+            std::arch::asm!(
+                "fmla {d0:v}.8h, {a0:v}.8h, {b:v}.8h",
+                "fmla {d1:v}.8h, {a1:v}.8h, {b:v}.8h",
+                "fmla {d2:v}.8h, {a2:v}.8h, {b:v}.8h",
+                "fmla {d3:v}.8h, {a3:v}.8h, {b:v}.8h",
+                d0 = inout(vreg) a0b3, d1 = inout(vreg) a1b3,
+                d2 = inout(vreg) a2b3, d3 = inout(vreg) a3b3,
+                a0 = in(vreg) av0, a1 = in(vreg) av1,
+                a2 = in(vreg) av2, a3 = in(vreg) av3,
+                b = in(vreg) bv,
+            );
+
+            idx += 8;
+        }
+
+        // Reduce F16 accumulators → F32 scalars
+        macro_rules! reduce_f16 {
+            ($acc:expr) => {{
+                let lo: float32x4_t;
+                let hi: float32x4_t;
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) lo, i = in(vreg) $acc);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) hi, i = in(vreg) $acc);
+                vaddvq_f32(vaddq_f32(lo, hi))
+            }};
+        }
+
+        out[0] = [reduce_f16!(a0b0), reduce_f16!(a0b1), reduce_f16!(a0b2), reduce_f16!(a0b3)];
+        out[1] = [reduce_f16!(a1b0), reduce_f16!(a1b1), reduce_f16!(a1b2), reduce_f16!(a1b3)];
+        out[2] = [reduce_f16!(a2b0), reduce_f16!(a2b1), reduce_f16!(a2b2), reduce_f16!(a2b3)];
+        out[3] = [reduce_f16!(a3b0), reduce_f16!(a3b1), reduce_f16!(a3b2), reduce_f16!(a3b3)];
+
+        // Scalar tail (K not multiple of 8)
+        while idx < k {
+            for ar in 0..4 {
+                let a_val = half::f16::from_bits(*a_ptrs[ar].add(idx)).to_f32();
+                for bc in 0..4 {
+                    out[ar][bc] += a_val * half::f16::from_bits(*b_ptrs[bc].add(idx)).to_f32();
+                }
             }
             idx += 1;
         }
@@ -1544,34 +1674,44 @@ unsafe fn f16_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     }
 }
 
-/// N-major GEMM work function with MR=2 tiling.
-/// Processes (n_chunk, m_group) where m_group = pair of 2 A rows.
-/// B loads are shared across both A rows within vec_dot_fmlal_2x4rows,
-/// shifting the bottleneck from LOAD (5cy) to FMA (4cy).
+/// N-major GEMM with RM=4 tiling + native F16 FMA.
+/// Processes (n_chunk, m_group) where m_group = group of 4 A rows.
+/// 4×4 micro-tile: B loaded once, shared across 4 A rows.
+/// F16 accumulators enable 16-output tile in 16 registers.
+///
+/// Pipeline: Load=8(4cy), FMA=16(4cy) → balanced @ 4cy, 4.0 output/cy
 ///
 /// # Safety
 /// Called by SpinPool workers with valid F16GemmCtx pointer.
 unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     const NR: usize = 4;
+    const MR: usize = 4;
     let ctx = &*(ctx_ptr as *const F16GemmCtx);
 
-    // MR=2 mapping: chunk_id = n_chunk_idx * m_groups + m_group
-    let m_groups = (ctx.m + 1) / 2;
+    // MR=4 mapping: chunk_id = n_chunk_idx * m_groups + m_group
+    let m_groups = (ctx.m + MR - 1) / MR;
     let n_chunk_idx = chunk_id / m_groups;
     let m_group = chunk_id % m_groups;
-    let m_row0 = m_group * 2;
-    let m_row1 = m_row0 + 1; // may be == ctx.m (odd M)
+    let m_row0 = m_group * MR;
+    let m_remaining = ctx.m - m_row0; // 1..=4 rows in this group
 
     let j_start = n_chunk_idx * ctx.rows_per_chunk;
     let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
 
-    let a0_f16 = ctx.a_f16_base.add(m_row0 * ctx.k);
-    let out0 = ctx.out_base.add(m_row0 * ctx.n);
-
-    if m_row1 < ctx.m {
-        // MR=2: process both A rows with shared B loads
-        let a1_f16 = ctx.a_f16_base.add(m_row1 * ctx.k);
-        let out1 = ctx.out_base.add(m_row1 * ctx.n);
+    if m_remaining >= MR {
+        // Full MR=4 tile: use native F16 FMA 4×4 kernel
+        let a_ptrs = [
+            ctx.a_f16_base.add(m_row0 * ctx.k),
+            ctx.a_f16_base.add((m_row0 + 1) * ctx.k),
+            ctx.a_f16_base.add((m_row0 + 2) * ctx.k),
+            ctx.a_f16_base.add((m_row0 + 3) * ctx.k),
+        ];
+        let out_ptrs = [
+            ctx.out_base.add(m_row0 * ctx.n),
+            ctx.out_base.add((m_row0 + 1) * ctx.n),
+            ctx.out_base.add((m_row0 + 2) * ctx.n),
+            ctx.out_base.add((m_row0 + 3) * ctx.n),
+        ];
 
         let mut j = j_start;
         while j + NR <= j_end {
@@ -1581,41 +1721,50 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
                 ctx.b_base.add((j + 2) * ctx.k),
                 ctx.b_base.add((j + 3) * ctx.k),
             ];
-            let mut res0 = [0.0f32; NR];
-            let mut res1 = [0.0f32; NR];
-            CpuBackendNeon::vec_dot_fmlal_2x4rows(
-                ctx.k, a0_f16, a1_f16, b_ptrs, &mut res0, &mut res1,
-            );
-            std::ptr::copy_nonoverlapping(res0.as_ptr(), out0.add(j), NR);
-            std::ptr::copy_nonoverlapping(res1.as_ptr(), out1.add(j), NR);
+            let mut results = [[0.0f32; NR]; MR];
+            CpuBackendNeon::vec_dot_f16_native_4x4(ctx.k, a_ptrs, b_ptrs, &mut results);
+            for r in 0..MR {
+                std::ptr::copy_nonoverlapping(results[r].as_ptr(), out_ptrs[r].add(j), NR);
+            }
             j += NR;
         }
+        // Tail: remaining B columns (< NR)
         while j < j_end {
-            *out0.add(j) =
-                CpuBackendNeon::vec_dot_fmlal(ctx.k, a0_f16, ctx.b_base.add(j * ctx.k));
-            *out1.add(j) =
-                CpuBackendNeon::vec_dot_fmlal(ctx.k, a1_f16, ctx.b_base.add(j * ctx.k));
+            for r in 0..MR {
+                *out_ptrs[r].add(j) = CpuBackendNeon::vec_dot_fmlal(
+                    ctx.k,
+                    a_ptrs[r],
+                    ctx.b_base.add(j * ctx.k),
+                );
+            }
             j += 1;
         }
     } else {
-        // Odd M tail: single row fallback (MR=1)
-        let mut j = j_start;
-        while j + NR <= j_end {
-            let b_ptrs = [
-                ctx.b_base.add(j * ctx.k),
-                ctx.b_base.add((j + 1) * ctx.k),
-                ctx.b_base.add((j + 2) * ctx.k),
-                ctx.b_base.add((j + 3) * ctx.k),
-            ];
-            let mut results = [0.0f32; NR];
-            CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, a0_f16, b_ptrs, &mut results);
-            std::ptr::copy_nonoverlapping(results.as_ptr(), out0.add(j), NR);
-            j += NR;
-        }
-        while j < j_end {
-            *out0.add(j) =
-                CpuBackendNeon::vec_dot_fmlal(ctx.k, a0_f16, ctx.b_base.add(j * ctx.k));
-            j += 1;
+        // Tail group (1-3 rows): fallback to per-row FMLAL
+        for r in 0..m_remaining {
+            let a_f16 = ctx.a_f16_base.add((m_row0 + r) * ctx.k);
+            let out_ptr = ctx.out_base.add((m_row0 + r) * ctx.n);
+            let mut j = j_start;
+            while j + NR <= j_end {
+                let b_ptrs = [
+                    ctx.b_base.add(j * ctx.k),
+                    ctx.b_base.add((j + 1) * ctx.k),
+                    ctx.b_base.add((j + 2) * ctx.k),
+                    ctx.b_base.add((j + 3) * ctx.k),
+                ];
+                let mut results = [0.0f32; NR];
+                CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, a_f16, b_ptrs, &mut results);
+                std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
+                j += NR;
+            }
+            while j < j_end {
+                *out_ptr.add(j) = CpuBackendNeon::vec_dot_fmlal(
+                    ctx.k,
+                    a_f16,
+                    ctx.b_base.add(j * ctx.k),
+                );
+                j += 1;
+            }
         }
     }
 }
