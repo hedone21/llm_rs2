@@ -307,11 +307,32 @@ impl CpuBackendNeon {
             let rows_per_chunk = rows_per_chunk.max(NR);
             let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
 
-            for i in 0..m {
-                let ctx = F16GemvCtx {
-                    a_ptr: unsafe { a_data.as_ptr().add(i * k) },
+            if m > 1 {
+                // N-major GEMM: single dispatch, B stays in L1 across M rows.
+                // chunk_id = n_chunk_idx * m + m_row — consecutive ids share B rows.
+                let total_tasks = n_chunks * m;
+                let ctx = F16GemmCtx {
+                    a_base: a_data.as_ptr(),
                     b_base: b_data.as_ptr() as *const u16,
-                    out_ptr: unsafe { out_data.as_mut_ptr().add(i * n) },
+                    out_base: out_data.as_mut_ptr(),
+                    m,
+                    n,
+                    k,
+                    rows_per_chunk,
+                };
+                unsafe {
+                    pool.dispatch(
+                        total_tasks,
+                        f16_gemm_chunk,
+                        &ctx as *const F16GemmCtx as *const u8,
+                    );
+                }
+            } else {
+                // M=1: existing GEMV path
+                let ctx = F16GemvCtx {
+                    a_ptr: a_data.as_ptr(),
+                    b_base: b_data.as_ptr() as *const u16,
+                    out_ptr: out_data.as_mut_ptr(),
                     k,
                     n,
                     rows_per_chunk,
@@ -1058,6 +1079,26 @@ struct F16GemvCtx {
     rows_per_chunk: usize,
 }
 
+// --- N-major GEMM context (prefill, M > 1) ---
+
+/// Context for N-major GEMM dispatch.
+/// Instead of dispatching M times (one per activation row), we dispatch once
+/// with M × n_chunks tasks. Consecutive chunk_ids share the same B rows,
+/// so the same core reuses B data from L1 across all M activation rows.
+#[repr(C)]
+struct F16GemmCtx {
+    a_base: *const f32, // A[M, K] row-major
+    b_base: *const u16, // B[N, K] row-major (F16, transposed)
+    out_base: *mut f32, // Out[M, N] row-major
+    m: usize,
+    n: usize,
+    k: usize,
+    rows_per_chunk: usize, // NR-aligned N rows per chunk
+}
+
+unsafe impl Send for F16GemmCtx {}
+unsafe impl Sync for F16GemmCtx {}
+
 // --- Fused multi-matmul dispatch (QKV / gate+up) ---
 
 /// Context for fused multi-matmul dispatch.
@@ -1202,6 +1243,47 @@ unsafe fn f16_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     while j < j_end {
         *ctx.out_ptr.add(j) =
             CpuBackendNeon::vec_dot_f16_f32(ctx.k, ctx.a_ptr, ctx.b_base.add(j * ctx.k));
+        j += 1;
+    }
+}
+
+/// N-major GEMM work function: processes one (n_chunk, m_row) pair.
+/// Consecutive chunk_ids share the same N-chunk (B rows), enabling L1 reuse
+/// when the same core picks up sequential tasks via SpinPool's fetch_add.
+///
+/// # Safety
+/// Called by SpinPool workers with valid F16GemmCtx pointer.
+unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
+    const NR: usize = 4;
+    let ctx = &*(ctx_ptr as *const F16GemmCtx);
+
+    // N-major mapping: chunk_id = n_chunk_idx * m + m_row
+    // Consecutive chunk_ids iterate m_row first → same B rows stay in L1
+    let n_chunk_idx = chunk_id / ctx.m;
+    let m_row = chunk_id % ctx.m;
+
+    let j_start = n_chunk_idx * ctx.rows_per_chunk;
+    let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
+
+    let a_ptr = ctx.a_base.add(m_row * ctx.k);
+    let out_ptr = ctx.out_base.add(m_row * ctx.n);
+
+    let mut j = j_start;
+    while j + NR <= j_end {
+        let b_ptrs = [
+            ctx.b_base.add(j * ctx.k),
+            ctx.b_base.add((j + 1) * ctx.k),
+            ctx.b_base.add((j + 2) * ctx.k),
+            ctx.b_base.add((j + 3) * ctx.k),
+        ];
+        let mut results = [0.0f32; NR];
+        CpuBackendNeon::vec_dot_f16_f32_4rows(ctx.k, a_ptr, b_ptrs, &mut results);
+        std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
+        j += NR;
+    }
+    // Scalar tail within chunk
+    while j < j_end {
+        *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_f32(ctx.k, a_ptr, ctx.b_base.add(j * ctx.k));
         j += 1;
     }
 }
