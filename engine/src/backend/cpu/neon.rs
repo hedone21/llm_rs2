@@ -73,7 +73,10 @@ impl Backend for CpuBackendNeon {
     }
 
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
-        CpuBackendCommon::new().silu_mul(a, b)
+        let a_data = a.as_mut_slice::<f32>();
+        let b_data = b.as_slice::<f32>();
+        unsafe { Self::swiglu_neon(a_data, b_data) };
+        Ok(())
     }
 
     fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
@@ -592,6 +595,85 @@ impl CpuBackendNeon {
         }
 
         sum
+    }
+
+    // --- NEON vectorized exp/silu/swiglu (ported from llama.cpp ggml_v_expf) ---
+
+    /// NEON vectorized exp(x) — polynomial approximation from ARM optimized routine.
+    /// Maximum error: 1.45358 + 0.5 ULP. Matches llama.cpp's ggml_v_expf().
+    #[inline(always)]
+    unsafe fn v_expf(x: float32x4_t) -> float32x4_t {
+        let r = vdupq_n_f32(f32::from_bits(0x4b00_0000)); // 0x1.8p23
+        let z = vfmaq_f32(r, x, vdupq_n_f32(f32::from_bits(0x3fb8_aa3b))); // 0x1.715476p+0
+        let n = vsubq_f32(z, r);
+        let b = vfmsq_f32(
+            vfmsq_f32(x, n, vdupq_n_f32(f32::from_bits(0x3eb1_7200))), // 0x1.62e4p-1
+            n,
+            vdupq_n_f32(f32::from_bits(0x35bf_be8e)), // 0x1.7f7d1cp-20
+        );
+        let e = vshlq_n_u32::<23>(vreinterpretq_u32_f32(z));
+        let k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1.0))));
+        let c = vcagtq_f32(n, vdupq_n_f32(126.0));
+        let u = vmulq_f32(b, b);
+        let j = vfmaq_f32(
+            vmulq_f32(vdupq_n_f32(f32::from_bits(0x3f7f_fff6)), b), // 0x1.ffffecp-1
+            vfmaq_f32(
+                vfmaq_f32(
+                    vdupq_n_f32(f32::from_bits(0x3f7f_fedb)), // 0x1.fffdb6p-2
+                    vdupq_n_f32(f32::from_bits(0x3e2a_af33)), // 0x1.555e66p-3
+                    b,
+                ),
+                vfmaq_f32(
+                    vdupq_n_f32(f32::from_bits(0x3d2b_9f17)), // 0x1.573e2ep-5
+                    vdupq_n_f32(f32::from_bits(0x3c07_2010)), // 0x1.0e4020p-7
+                    b,
+                ),
+                u,
+            ),
+            u,
+        );
+        // Fast path: no overflow/underflow
+        if vpaddd_u64(vreinterpretq_u64_u32(c)) == 0 {
+            return vfmaq_f32(k, j, k);
+        }
+        // Slow path: handle overflow/underflow
+        let d = vandq_u32(vclezq_f32(n), vdupq_n_u32(0x8200_0000));
+        let s1 = vreinterpretq_f32_u32(vaddq_u32(d, vdupq_n_u32(0x7f00_0000)));
+        let s2 = vreinterpretq_f32_u32(vsubq_u32(e, d));
+        vbslq_f32(
+            vcagtq_f32(n, vdupq_n_f32(192.0)),
+            vmulq_f32(s1, s1),
+            vbslq_f32(c, vmulq_f32(vfmaq_f32(s2, s2, j), s1), vfmaq_f32(k, k, j)),
+        )
+    }
+
+    /// NEON vectorized silu: x / (1 + exp(-x))
+    #[inline(always)]
+    unsafe fn v_silu(x: float32x4_t) -> float32x4_t {
+        let neg_x = vnegq_f32(x);
+        let exp_neg_x = Self::v_expf(neg_x);
+        let one_plus = vaddq_f32(vdupq_n_f32(1.0), exp_neg_x);
+        vdivq_f32(x, one_plus)
+    }
+
+    /// NEON vectorized swiglu: silu(a) * b — matches llama.cpp's ggml_vec_swiglu_f32.
+    #[target_feature(enable = "neon")]
+    unsafe fn swiglu_neon(a: &mut [f32], b: &[f32]) {
+        let n = a.len();
+        let mut i = 0;
+        while i + 4 <= n {
+            let av = vld1q_f32(a.as_ptr().add(i));
+            let bv = vld1q_f32(b.as_ptr().add(i));
+            let result = vmulq_f32(Self::v_silu(av), bv);
+            vst1q_f32(a.as_mut_ptr().add(i), result);
+            i += 4;
+        }
+        // Scalar tail
+        while i < n {
+            let x = a[i];
+            a[i] = (x / (1.0 + (-x).exp())) * b[i];
+            i += 1;
+        }
     }
 
     // --- FMLAL kernels: F16×F16→F32 accumulation (eliminates fcvtl dependency chain) ---
