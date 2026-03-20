@@ -85,6 +85,9 @@ struct KernelCache {
     kernel_add_rms_norm_oop: CoreKernel,
     kernel_flash_attn_f32: Option<CoreKernel>,
     kernel_flash_attn_f32_f16: Option<CoreKernel>,
+    // GEMM kernels for prefill (tiled matrix multiply, M > 1)
+    kernel_mul_mm_f16_f32: Option<CoreKernel>,
+    kernel_mul_mm_f32_f32: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -110,6 +113,10 @@ pub struct OpenCLBackend {
     // Flash attention programs (optional — compiled with head_dim-specific defines)
     pub flash_attn_f32_program: Option<Program>,
     pub flash_attn_f32_f16_program: Option<Program>,
+
+    // GEMM programs for prefill (tiled matmul, optional — fallback to GEMV)
+    pub gemm_f16_program: Option<Program>,
+    pub gemm_f32_program: Option<Program>,
 
     // Cached kernels — inference is single-threaded, no lock needed.
     // UnsafeCell avoids Mutex overhead (~170us/lock on Adreno).
@@ -400,6 +407,47 @@ impl OpenCLBackend {
             }
         };
 
+        // GEMM kernels for prefill — tiled matmul (BM=64, BN=64, BK=16)
+        let gemm_f16_src = include_str!("../../../kernels/mul_mm_f16_f32_l4_lm.cl");
+        let gemm_f16_program = match Program::builder()
+            .devices(device)
+            .src(gemm_f16_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("mul_mm_f16_f32_l4_lm.cl compiled (GEMM prefill F16)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "mul_mm_f16_f32_l4_lm.cl failed: {}. Prefill will use GEMV.",
+                    e
+                );
+                None
+            }
+        };
+
+        let gemm_f32_src = include_str!("../../../kernels/mul_mm_f32_f32_l4_lm.cl");
+        let gemm_f32_program = match Program::builder()
+            .devices(device)
+            .src(gemm_f32_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("mul_mm_f32_f32_l4_lm.cl compiled (GEMM prefill F32)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "mul_mm_f32_f32_l4_lm.cl failed: {}. Prefill will use GEMV.",
+                    e
+                );
+                None
+            }
+        };
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -474,6 +522,12 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16: flash_attn_f32_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16").ok()),
+            kernel_mul_mm_f16_f32: gemm_f16_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f16_f32_l4_lm").ok()),
+            kernel_mul_mm_f32_f32: gemm_f32_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f32_f32_l4_lm").ok()),
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -490,12 +544,164 @@ impl OpenCLBackend {
             get_rows_program,
             flash_attn_f32_program,
             flash_attn_f32_f16_program,
+            gemm_f16_program,
+            gemm_f32_program,
             kernels: UnsafeCell::new(kernel_cache),
         })
     }
 
+    /// Tiled GEMM for F16 weights: A(F32,[M,K]) x B^T(F16,[N,K]) -> Out(F32,[M,N])
+    /// Uses mul_mm_f16_f32_l4_lm kernel with BM=64, BN=64, BK=16 tiling.
+    fn matmul_gemm_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+        let (m, k) = if a_dims.len() == 3 {
+            (a_dims[0] * a_dims[1], a_dims[2])
+        } else {
+            (a_dims[0], a_dims[1])
+        };
+        let n = b_dims[0];
+
+        let a_buf = get_cl_mem(a.buffer().as_ref())?;
+        let b_buf = get_cl_mem(b.buffer().as_ref())?;
+        let out_buf = get_cl_mem(out.buffer().as_ref())?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_mul_mm_f16_f32
+            .as_ref()
+            .ok_or_else(|| anyhow!("GEMM F16 kernel not available"))?;
+
+        // All strides in ELEMENT counts (kernel divides by LOAD_VEC internally)
+        let ne00 = k as i32;
+        let ne01 = n as i32;
+        let ne02 = 1i32;
+        let ne11 = m as i32;
+        let ne12 = 1i32;
+        let stride_a = k as i32;
+        let stride_b = k as i32;
+        let stride_d = n as i32;
+        let batch_stride_a = (n * k) as i32;
+        let batch_stride_b = (m * k) as i32;
+        let batch_stride_d = (m * n) as i32;
+        let r2 = 1i32;
+        let r3 = 1i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(b_buf))?; // src0=weight(F16)
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(a_buf))?; // src1=activation(F32)
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&ne11))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&ne12))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&stride_a))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&stride_b))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&stride_d))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&batch_stride_a))?;
+            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&batch_stride_b))?;
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&batch_stride_d))?;
+            ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::scalar(&r2))?;
+            ocl::core::set_kernel_arg(kernel, 18, ocl::core::ArgVal::scalar(&r3))?;
+
+            // BM=64, BN=64, TM=4, TN=8 → 128 threads/WG
+            // group_id(0) tiles N (weight rows), group_id(1) tiles M (activation rows)
+            let local_work_size: [usize; 3] = [128, 1, 1];
+            let global_work_size: [usize; 3] = [n.div_ceil(64) * 128, m.div_ceil(64), 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Tiled GEMM for F32 weights: A(F32,[M,K]) x B^T(F32,[N,K]) -> Out(F32,[M,N])
+    fn matmul_gemm_f32(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
+        let a_dims = a.shape().dims();
+        let b_dims = b.shape().dims();
+        let (m, k) = if a_dims.len() == 3 {
+            (a_dims[0] * a_dims[1], a_dims[2])
+        } else {
+            (a_dims[0], a_dims[1])
+        };
+        let n = b_dims[0];
+
+        let a_buf = get_cl_mem(a.buffer().as_ref())?;
+        let b_buf = get_cl_mem(b.buffer().as_ref())?;
+        let out_buf = get_cl_mem(out.buffer().as_ref())?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_mul_mm_f32_f32
+            .as_ref()
+            .ok_or_else(|| anyhow!("GEMM F32 kernel not available"))?;
+
+        let ne00 = k as i32;
+        let ne01 = n as i32;
+        let ne02 = 1i32;
+        let ne11 = m as i32;
+        let ne12 = 1i32;
+        let stride_a = k as i32;
+        let stride_b = k as i32;
+        let stride_d = n as i32;
+        let batch_stride_a = (n * k) as i32;
+        let batch_stride_b = (m * k) as i32;
+        let batch_stride_d = (m * n) as i32;
+        let r2 = 1i32;
+        let r3 = 1i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(b_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(a_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&0u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&ne11))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&ne12))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&stride_a))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&stride_b))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&stride_d))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&batch_stride_a))?;
+            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&batch_stride_b))?;
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&batch_stride_d))?;
+            ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::scalar(&r2))?;
+            ocl::core::set_kernel_arg(kernel, 18, ocl::core::ArgVal::scalar(&r3))?;
+
+            let local_work_size: [usize; 3] = [128, 1, 1];
+            let global_work_size: [usize; 3] = [n.div_ceil(64) * 128, m.div_ceil(64), 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
     /// F16 weight matmul: A(F32) x B^T(F16) -> Out(F32)
-    /// Uses the mul_mat_f16_f32 kernel. B is the F16 weight matrix (row-major, transposed).
+    /// Routes to GEMM kernel for prefill (M > 4) or GEMV kernel for decode.
     pub fn matmul_f16(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_dims = a.shape().dims();
         let b_dims = b.shape().dims();
@@ -507,6 +713,17 @@ impl OpenCLBackend {
         };
         let n = b_dims[0];
 
+        // Use tiled GEMM for prefill (M > 8), GEMV for decode/short sequences.
+        // GEMM BM=64 tiling wastes work for small M; GEMV N_DST=4 is optimal there.
+        const GEMM_THRESHOLD: usize = 8;
+        if m > GEMM_THRESHOLD {
+            let kernels = unsafe { &*self.kernels.get() };
+            if kernels.kernel_mul_mm_f16_f32.is_some() {
+                return self.matmul_gemm_f16(a, b, out);
+            }
+        }
+
+        // GEMV path (decode or GEMM unavailable)
         let a_buf =
             get_cl_mem(a.buffer().as_ref()).map_err(|_| anyhow!("A is not OpenCL buffer"))?;
         let b_buf =
@@ -949,6 +1166,15 @@ impl Backend for OpenCLBackend {
                 n,
                 b_dims[1]
             ));
+        }
+
+        // Use tiled GEMM for prefill (M > 8), GEMV for decode
+        const GEMM_THRESHOLD: usize = 8;
+        if m > GEMM_THRESHOLD {
+            let kernels = unsafe { &*self.kernels.get() };
+            if kernels.kernel_mul_mm_f32_f32.is_some() {
+                return self.matmul_gemm_f32(a, b, out);
+            }
         }
 
         let a_buf =
