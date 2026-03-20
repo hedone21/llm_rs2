@@ -1,0 +1,1000 @@
+{
+  "config": {
+    "tokens": 256,
+    "dtype": "both"
+  },
+  "timestamp": "20260319_113835",
+  "results": {
+    "Q4": [
+      {
+        "name": "llm.rs (Q4)",
+        "key": "llm_rs_q4",
+        "samples": [
+          {
+            "time_s": 0.0,
+            "rss_mb": 117.95,
+            "vss_mb": 13109.59
+          },
+          {
+            "time_s": 0.19,
+            "rss_mb": 283.63,
+            "vss_mb": 13142.3
+          },
+          {
+            "time_s": 0.37,
+            "rss_mb": 473.46,
+            "vss_mb": 13184.02
+          },
+          {
+            "time_s": 0.54,
+            "rss_mb": 627.86,
+            "vss_mb": 13168.57
+          },
+          {
+            "time_s": 0.72,
+            "rss_mb": 890.04,
+            "vss_mb": 13273.12
+          },
+          {
+            "time_s": 0.9,
+            "rss_mb": 1104.32,
+            "vss_mb": 13323.86
+          },
+          {
+            "time_s": 1.07,
+            "rss_mb": 1269.32,
+            "vss_mb": 13371.25
+          },
+          {
+            "time_s": 1.25,
+            "rss_mb": 1511.36,
+            "vss_mb": 13412.96
+          },
+          {
+            "time_s": 1.42,
+            "rss_mb": 1703.9,
+            "vss_mb": 13406.68
+          },
+          {
+            "time_s": 1.59,
+            "rss_mb": 1916.48,
+            "vss_mb": 13502.07
+          },
+          {
+            "time_s": 1.76,
+            "rss_mb": 2085.91,
+            "vss_mb": 13552.8
+          },
+          {
+            "time_s": 1.94,
+            "rss_mb": 2278.27,
+            "vss_mb": 13591.18
+          },
+          {
+            "time_s": 2.12,
+            "rss_mb": 2975.75,
+            "vss_mb": 14556.22
+          },
+          {
+            "time_s": 2.29,
+            "rss_mb": 3536.13,
+            "vss_mb": 14556.22
+          },
+          {
+            "time_s": 2.46,
+            "rss_mb": 4111.88,
+            "vss_mb": 15558.23
+          },
+          {
+            "time_s": 2.64,
+            "rss_mb": 4620.88,
+            "vss_mb": 15558.23
+          },
+          {
+            "time_s": 2.82,
+            "rss_mb": 4713.75,
+            "vss_mb": 16560.24
+          },
+          {
+            "time_s": 2.99,
+            "rss_mb": 4733.75,
+            "vss_mb": 16560.24
+          },
+          {
+            "time_s": 3.16,
+            "rss_mb": 3284.01,
+            "vss_mb": 15558.23
+          },
+          {
+            "time_s": 3.34,
+            "rss_mb": 3359.52,
+            "vss_mb": 15558.23
+          },
+          {
+            "time_s": 3.51,
+            "rss_mb": 3713.14,
+            "vss_mb": 15699.15
+          },
+          {
+            "time_s": 3.68,
+            "rss_mb": 3770.77,
+            "vss_mb": 15699.15
+          },
+          {
+            "time_s": 3.86,
+            "rss_mb": 3838.14,
+            "vss_mb": 15840.07
+          },
+          {
+            "time_s": 4.03,
+            "rss_mb": 1956.18,
+            "vss_mb": 14697.14
+          },
+          {
+            "time_s": 4.2,
+            "rss_mb": 1732.53,
+            "vss_mb": 12372.83
+          },
+          {
+            "time_s": 4.38,
+            "rss_mb": 1755.78,
+            "vss_mb": 12393.35
+          },
+          {
+            "time_s": 4.55,
+            "rss_mb": 1740.5,
+            "vss_mb": 12383.73
+          },
+          {
+            "time_s": 4.74,
+            "rss_mb": 1741.04,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 4.91,
+            "rss_mb": 1741.27,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 5.09,
+            "rss_mb": 1741.29,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 5.27,
+            "rss_mb": 1725.44,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 5.45,
+            "rss_mb": 1726.36,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 5.62,
+            "rss_mb": 1726.43,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 5.8,
+            "rss_mb": 1726.43,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 5.98,
+            "rss_mb": 1726.43,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 6.16,
+            "rss_mb": 1726.55,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 6.34,
+            "rss_mb": 1726.62,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 6.51,
+            "rss_mb": 1726.62,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 6.69,
+            "rss_mb": 1727.5,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 6.87,
+            "rss_mb": 1727.51,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 7.04,
+            "rss_mb": 1727.57,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 7.22,
+            "rss_mb": 1727.57,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 7.4,
+            "rss_mb": 1727.58,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 7.58,
+            "rss_mb": 1727.59,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 7.76,
+            "rss_mb": 1727.66,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 7.93,
+            "rss_mb": 1728.6,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 8.11,
+            "rss_mb": 1728.67,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 8.29,
+            "rss_mb": 1728.67,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 8.47,
+            "rss_mb": 1728.67,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 8.64,
+            "rss_mb": 1728.68,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 8.82,
+            "rss_mb": 1728.68,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 9.01,
+            "rss_mb": 1728.68,
+            "vss_mb": 12505.01
+          },
+          {
+            "time_s": 9.18,
+            "rss_mb": 1729.3,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 9.37,
+            "rss_mb": 1729.43,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 9.55,
+            "rss_mb": 1729.55,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 9.73,
+            "rss_mb": 1729.57,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 9.9,
+            "rss_mb": 1729.63,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 10.08,
+            "rss_mb": 1729.63,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 10.26,
+            "rss_mb": 1729.63,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 10.44,
+            "rss_mb": 1729.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 10.62,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 10.8,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 10.99,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 11.17,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 11.34,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 11.52,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 11.7,
+            "rss_mb": 1730.69,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 11.88,
+            "rss_mb": 1731.34,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 12.06,
+            "rss_mb": 1731.57,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 12.24,
+            "rss_mb": 1731.65,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 12.43,
+            "rss_mb": 1731.65,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 12.61,
+            "rss_mb": 1731.65,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 12.79,
+            "rss_mb": 1731.65,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 12.97,
+            "rss_mb": 1731.65,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 13.14,
+            "rss_mb": 1731.9,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 13.32,
+            "rss_mb": 1732.4,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 13.5,
+            "rss_mb": 1732.46,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 13.68,
+            "rss_mb": 1732.59,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 13.86,
+            "rss_mb": 1732.59,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 14.04,
+            "rss_mb": 1732.59,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 14.22,
+            "rss_mb": 1732.59,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 14.4,
+            "rss_mb": 1733.03,
+            "vss_mb": 12505.21
+          },
+          {
+            "time_s": 14.59,
+            "rss_mb": 1733.4,
+            "vss_mb": 12517.09
+          },
+          {
+            "time_s": 14.77,
+            "rss_mb": 1733.53,
+            "vss_mb": 12517.09
+          },
+          {
+            "time_s": 14.95,
+            "rss_mb": 1733.59,
+            "vss_mb": 12517.09
+          }
+        ],
+        "peak_rss_mb": 4733.75,
+        "avg_rss_mb": 1934.9,
+        "peak_vss_mb": 16560.24,
+        "duration_s": 14.95,
+        "output": "[Config] Using 8 threads\n[Profile] Event: ModelLoadStart\nLoading model from /data/local/tmp/models/llama3.2-1b\n[Config] Weight dtype: Q4_0\nlm_head not found, using embed_tokens as lm_head...\nPrompt: The quick brown fox jumps over the lazy dog and then\nToken Length: 12\nModel config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048\nKV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)\nGenerating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...\n[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nThe quick brown fox jumps over the lazy dog and then he runs away. He is a fast runner, but not as good at jumping as the lazy dog.\nA. The quick brown fox jumps over the lazy dog.\nB. The quick brown fox jumped over the lazy dog.\nC. A fast runner, but not as good at jumping as a slow walker\nD.The quick brown fox jumps and runs away from him\nAnswer: CQuestion 1: What is the main idea of this text?\nA. A person can be a fast runner or not.\nB. The lazy dog is faster than the quick brown fox.\nC. A person should always do what they want to do, even if it\u2019s dangerous.\nD.The quick brown fox jumps and runs away from him\nAnswer: CQuestion 2: What does \u201cA\u201d mean?\nA. The word \u201ca\u201d means a fast runner, but not as good at jumping as the lazy dog.\nB. A person should always do what they want to do, even if it\u2019s dangerous.\nC.The quick brown fox jumps and runs away from him\nAnswer: BQuestion 3: What is the main idea of this text?\nA. The word \u201ca\u201d means a fast runner, but not as good at jumping as the\nDone.\n[Profile] Event: End\nTTFT: 289.54 ms\nAvg TBT: 40.45 ms (24.7 tokens/sec)"
+      },
+      {
+        "name": "llama.cpp (Q4)",
+        "key": "llamacpp_q4",
+        "samples": [],
+        "peak_rss_mb": 0,
+        "avg_rss_mb": 0,
+        "peak_vss_mb": 0,
+        "duration_s": 0,
+        "output": "libc++abi: terminating due to uncaught exception of type std::__ndk1::__fs::filesystem::filesystem_error: filesystem error: in posix_stat: failed to determine attributes for the specified path: Permission denied [\"/init\"]"
+      }
+    ],
+    "F16": [
+      {
+        "name": "llm.rs (F16)",
+        "key": "llm_rs_f16",
+        "samples": [
+          {
+            "time_s": 0.0,
+            "rss_mb": 157.76,
+            "vss_mb": 13127.82
+          },
+          {
+            "time_s": 0.18,
+            "rss_mb": 377.1,
+            "vss_mb": 13243.9
+          },
+          {
+            "time_s": 0.37,
+            "rss_mb": 549.63,
+            "vss_mb": 13327.97
+          },
+          {
+            "time_s": 0.55,
+            "rss_mb": 712.99,
+            "vss_mb": 13416.03
+          },
+          {
+            "time_s": 0.74,
+            "rss_mb": 908.6,
+            "vss_mb": 13508.07
+          },
+          {
+            "time_s": 0.93,
+            "rss_mb": 1076.68,
+            "vss_mb": 13592.14
+          },
+          {
+            "time_s": 1.11,
+            "rss_mb": 1248.81,
+            "vss_mb": 13676.21
+          },
+          {
+            "time_s": 1.3,
+            "rss_mb": 1461.16,
+            "vss_mb": 13748.25
+          },
+          {
+            "time_s": 1.49,
+            "rss_mb": 1585.95,
+            "vss_mb": 13888.33
+          },
+          {
+            "time_s": 1.67,
+            "rss_mb": 1720.87,
+            "vss_mb": 13908.38
+          },
+          {
+            "time_s": 1.86,
+            "rss_mb": 1856.38,
+            "vss_mb": 14004.41
+          },
+          {
+            "time_s": 2.04,
+            "rss_mb": 2000.54,
+            "vss_mb": 14056.47
+          },
+          {
+            "time_s": 2.23,
+            "rss_mb": 2117.36,
+            "vss_mb": 14100.52
+          },
+          {
+            "time_s": 2.41,
+            "rss_mb": 2261.77,
+            "vss_mb": 14204.57
+          },
+          {
+            "time_s": 2.6,
+            "rss_mb": 2390.38,
+            "vss_mb": 14256.62
+          },
+          {
+            "time_s": 2.79,
+            "rss_mb": 2515.02,
+            "vss_mb": 14320.65
+          },
+          {
+            "time_s": 2.97,
+            "rss_mb": 2649.23,
+            "vss_mb": 14372.71
+          },
+          {
+            "time_s": 3.16,
+            "rss_mb": 2776.86,
+            "vss_mb": 14436.73
+          },
+          {
+            "time_s": 3.34,
+            "rss_mb": 2907.02,
+            "vss_mb": 14520.8
+          },
+          {
+            "time_s": 3.53,
+            "rss_mb": 3045.68,
+            "vss_mb": 14572.86
+          },
+          {
+            "time_s": 3.71,
+            "rss_mb": 3190.7,
+            "vss_mb": 14668.89
+          },
+          {
+            "time_s": 3.9,
+            "rss_mb": 3381.12,
+            "vss_mb": 14784.98
+          },
+          {
+            "time_s": 4.09,
+            "rss_mb": 3499.52,
+            "vss_mb": 14792.99
+          },
+          {
+            "time_s": 4.27,
+            "rss_mb": 3665.21,
+            "vss_mb": 14901.06
+          },
+          {
+            "time_s": 4.46,
+            "rss_mb": 3930.7,
+            "vss_mb": 15903.07
+          },
+          {
+            "time_s": 4.64,
+            "rss_mb": 4380.08,
+            "vss_mb": 15903.07
+          },
+          {
+            "time_s": 4.83,
+            "rss_mb": 4556.7,
+            "vss_mb": 15903.07
+          },
+          {
+            "time_s": 5.02,
+            "rss_mb": 4684.08,
+            "vss_mb": 16905.08
+          },
+          {
+            "time_s": 5.21,
+            "rss_mb": 4666.2,
+            "vss_mb": 16905.08
+          },
+          {
+            "time_s": 5.4,
+            "rss_mb": 4998.97,
+            "vss_mb": 16905.08
+          },
+          {
+            "time_s": 5.6,
+            "rss_mb": 5393.73,
+            "vss_mb": 17907.09
+          },
+          {
+            "time_s": 5.83,
+            "rss_mb": 5736.86,
+            "vss_mb": 17907.09
+          },
+          {
+            "time_s": 6.03,
+            "rss_mb": 5844.48,
+            "vss_mb": 17907.09
+          },
+          {
+            "time_s": 6.22,
+            "rss_mb": 3878.21,
+            "vss_mb": 16404.08
+          },
+          {
+            "time_s": 6.39,
+            "rss_mb": 4358.84,
+            "vss_mb": 16404.08
+          },
+          {
+            "time_s": 6.57,
+            "rss_mb": 4514.96,
+            "vss_mb": 16404.08
+          },
+          {
+            "time_s": 6.74,
+            "rss_mb": 4673.84,
+            "vss_mb": 16404.08
+          },
+          {
+            "time_s": 6.91,
+            "rss_mb": 4834.96,
+            "vss_mb": 16404.08
+          },
+          {
+            "time_s": 7.08,
+            "rss_mb": 5351.59,
+            "vss_mb": 17406.11
+          },
+          {
+            "time_s": 7.26,
+            "rss_mb": 5729.03,
+            "vss_mb": 17406.11
+          },
+          {
+            "time_s": 7.43,
+            "rss_mb": 3418.48,
+            "vss_mb": 14097.94
+          },
+          {
+            "time_s": 7.6,
+            "rss_mb": 3446.26,
+            "vss_mb": 14102.23
+          },
+          {
+            "time_s": 7.78,
+            "rss_mb": 3434.54,
+            "vss_mb": 14217.23
+          },
+          {
+            "time_s": 7.97,
+            "rss_mb": 3434.95,
+            "vss_mb": 14217.23
+          },
+          {
+            "time_s": 8.16,
+            "rss_mb": 3435.79,
+            "vss_mb": 14217.23
+          },
+          {
+            "time_s": 8.34,
+            "rss_mb": 3435.3,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 8.54,
+            "rss_mb": 3435.3,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 8.73,
+            "rss_mb": 3419.41,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 8.92,
+            "rss_mb": 3419.52,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 9.11,
+            "rss_mb": 3420.52,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 9.3,
+            "rss_mb": 3420.52,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 9.5,
+            "rss_mb": 3420.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 9.7,
+            "rss_mb": 3420.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 9.89,
+            "rss_mb": 3420.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 10.08,
+            "rss_mb": 3420.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 10.28,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 10.47,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 10.66,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 10.86,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 11.05,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 11.24,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 11.44,
+            "rss_mb": 3421.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 11.63,
+            "rss_mb": 3422.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 11.81,
+            "rss_mb": 3422.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 12.01,
+            "rss_mb": 3422.53,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 12.21,
+            "rss_mb": 3422.62,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 12.42,
+            "rss_mb": 3422.62,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 12.62,
+            "rss_mb": 3422.62,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 12.81,
+            "rss_mb": 3422.62,
+            "vss_mb": 14211.84
+          },
+          {
+            "time_s": 13.0,
+            "rss_mb": 3423.99,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 13.19,
+            "rss_mb": 3423.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 13.39,
+            "rss_mb": 3423.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 13.58,
+            "rss_mb": 3423.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 13.77,
+            "rss_mb": 3423.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 13.95,
+            "rss_mb": 3423.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 14.15,
+            "rss_mb": 3423.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 14.34,
+            "rss_mb": 3424.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 14.53,
+            "rss_mb": 3424.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 14.72,
+            "rss_mb": 3424.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 14.92,
+            "rss_mb": 3424.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 15.11,
+            "rss_mb": 3424.62,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 15.3,
+            "rss_mb": 3424.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 15.49,
+            "rss_mb": 3424.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 15.69,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 15.87,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 16.06,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 16.26,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 16.46,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 16.67,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 16.88,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 17.08,
+            "rss_mb": 3425.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 17.28,
+            "rss_mb": 3426.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 17.49,
+            "rss_mb": 3426.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 17.69,
+            "rss_mb": 3426.63,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 17.9,
+            "rss_mb": 3426.73,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 18.11,
+            "rss_mb": 3426.73,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 18.31,
+            "rss_mb": 3426.73,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 18.51,
+            "rss_mb": 3426.73,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 18.72,
+            "rss_mb": 3426.73,
+            "vss_mb": 14213.3
+          },
+          {
+            "time_s": 18.93,
+            "rss_mb": 3427.23,
+            "vss_mb": 14222.3
+          },
+          {
+            "time_s": 19.13,
+            "rss_mb": 3427.73,
+            "vss_mb": 14225.18
+          },
+          {
+            "time_s": 19.33,
+            "rss_mb": 3427.73,
+            "vss_mb": 14225.18
+          },
+          {
+            "time_s": 19.54,
+            "rss_mb": 2496.96,
+            "vss_mb": 13177.5
+          },
+          {
+            "time_s": 19.75,
+            "rss_mb": 234.7,
+            "vss_mb": 11330.91
+          }
+        ],
+        "peak_rss_mb": 5844.48,
+        "avg_rss_mb": 3275.69,
+        "peak_vss_mb": 17907.09,
+        "duration_s": 19.75,
+        "output": "[Config] Using 8 threads\n[Profile] Event: ModelLoadStart\nLoading model from /data/local/tmp/models/llama3.2-1b\n[Config] Weight dtype: F16\nlm_head not found, using embed_tokens as lm_head...\nPrompt: The quick brown fox jumps over the lazy dog and then\nToken Length: 12\nModel config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048\nKV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)\nGenerating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...\n[Profile] Event: PrefillStart\n[Profile] Event: DecodingStart\nThe quick brown fox jumps over the lazy dog and then he he s s s s s test test test test Test TestTESTTEST-test-testtesttest tests tests testing testing testers testers testersTESTTESTTestTest Test test\u6d4b\u8bd5\u6d4b\u8bd5 tes tes tes tesTestIdTestIdTestIdTestId.Test.Test.TEST.TEST Tests Tests-tests-tests-tests tests teststeststests \u0442\u0435\u0441\u0442 \u0442\u0435\u0441\u0442\u6d4b\u8bd5\u6d4b\u8bd5 testers testers testing TestingTesting-testing-testing-testing_testing_testingTesting Testing testing test test test test Test TestTESTTEST-test-testtesttesttest tests tests TestsTestsTests testers testers testersTESTTestTest Test TEST\u6d4b\u8bd5\u6d4b\u8bd5 testing testing tes tes tes tesTestIdTestIdTestIdTestId.TEST.TEST Tests Tests-tests-tests-tests tests teststeststests \u0442\u0435\u0441\u0442 \u0442\u0435\u0441\u0442\u6d4b\u8bd5\u6d4b\u8bd5 testers testers.Test.Test.Test teste teste teste-testingTesting TestingTesting testing test test test test TestTESTTESTTEST-test-testtesttesttest tests TestsTestsTestsTests testers testers testers testersTest Test TestTest\u6d4b\u8bd5\u6d4b\u8bd5 testing testing Testing_testing tes tes tesTestIdTestIdTestIdTestId.TEST.TEST Tests Tests-tests-tests tests teststeststests \u0442\u0435\u0441\u0442 \u0442\u0435\u0441\u0442\u6d4b\u8bd5\u6d4b\u8bd5-tests-tests tests.Test.Test.Test teste teste-testingTestingTesting Testing testing test test test testTESTTESTTESTTEST-test-testtesttesttesttest TestsTestsTests testers testers testers testers testers Test TestTestTest\u6d4b\u8bd5\u6d4b\u8bd5 testing testing TestingTesting_testing tes tes tesTestIdTestIdTestId.TEST.TEST Tests Tests-tests tests tests teststeststests \u0442\u0435\u0441\u0442 \u0442\u0435\u0441\u0442\u6d4b\u8bd5\nDone.\n[Profile] Event: End\nTTFT: 587.21 ms\nAvg TBT: 43.98 ms (22.7 tokens/sec)"
+      },
+      {
+        "name": "llama.cpp (F16)",
+        "key": "llamacpp_f16",
+        "samples": [],
+        "peak_rss_mb": 0,
+        "avg_rss_mb": 0,
+        "peak_vss_mb": 0,
+        "duration_s": 0,
+        "output": "libc++abi: terminating due to uncaught exception of type std::__ndk1::__fs::filesystem::filesystem_error: filesystem error: in posix_stat: failed to determine attributes for the specified path: Permission denied [\"/init\"]"
+      }
+    ]
+  }
+}

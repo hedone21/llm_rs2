@@ -1,0 +1,21 @@
+{
+  "piqa_none_kivi_r32": {
+    "task": "piqa",
+    "policy": "kivi_r32",
+    "kv_budget": 0,
+    "kv_budget_ratio": 0.0,
+    "kv_type": "q2+f32",
+    "model": "models/llama3.2-1b",
+    "accuracy": 0.6666666666666666,
+    "correct": 2,
+    "total": 3,
+    "wall_time_s": 3.74626213,
+    "config": {
+      "eviction_policy": "kivi",
+      "kivi_residual_size": 32,
+      "kv_type": "q2+f32_residual",
+      "max_seq_len": 2048,
+      "model": "models/llama3.2-1b"
+    }
+  }
+}
