@@ -747,6 +747,10 @@ fn main() -> anyhow::Result<()> {
         Some(sc)
     } else if let Some(ratio) = args.skip_ratio {
         let sc = SkipConfig::uniform_init(model.config.num_hidden_layers, ratio);
+        assert!(
+            sc.validate(model.config.num_hidden_layers),
+            "uniform_init produced invalid SkipConfig (layer 0 or last layer skipped)"
+        );
         eprintln!(
             "[Skip] Uniform ratio={:.1}% → {} sub-layers skipped",
             ratio * 100.0,
