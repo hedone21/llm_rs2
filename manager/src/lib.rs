@@ -6,5 +6,6 @@ pub mod monitor;
 pub mod pi_controller;
 pub mod policy;
 pub mod relief;
+pub mod selector;
 pub mod supervisory;
 pub mod types;
