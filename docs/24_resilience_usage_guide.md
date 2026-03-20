@@ -199,9 +199,127 @@ RUST_LOG=debug ./target/release/generate --enable-resilience ...
 
 ---
 
-## 7. 아키텍처 참조
+## 7. Hierarchical Policy Mode (신규)
 
-상세 설계: [`docs/22_resilience_integration.md`](22_resilience_integration.md)
+> **설계 문서**: [36. Policy Design](36_policy_design.md) | [37. Protocol Design](37_protocol_design.md)
+
+기존 threshold 기반 정책(§5)을 대체하는 계층형 정책 모드. PI Controller → Supervisory Layer → Cross-Domain Action Selector 파이프라인으로 동작한다.
+
+### 7.1 Manager 실행
+
+```bash
+# Manager 시작 (hierarchical mode + Unix socket)
+RUST_LOG=info cargo run -p llm_manager -- \
+    --transport unix:/tmp/llm_manager.sock \
+    --policy-config policy_config.toml \
+    --client-timeout 10
+```
+
+| 플래그 | 설명 | 기본값 |
+|--------|------|--------|
+| `--transport unix:<path>` | Unix socket 경로 | `dbus` |
+| `--policy-config <path>` | 정책 설정 파일 (TOML) | 내장 기본값 |
+| `--client-timeout <sec>` | Engine 연결 대기 시간 | 60 |
+| `--legacy-passthrough` | 기존 SystemSignal 직접 방출 모드 | false |
+
+`--legacy-passthrough`를 지정하지 않으면 자동으로 hierarchical pipeline 모드로 동작한다.
+
+### 7.2 Mock Engine (프로토콜 검증)
+
+Manager의 directive 전송을 검증하기 위한 Mock Engine:
+
+```bash
+# Mock Engine 연결
+RUST_LOG=info cargo run -p llm_manager --bin mock_engine -- \
+    --socket /tmp/llm_manager.sock \
+    --heartbeat-ms 100 \
+    --duration-secs 30
+```
+
+| 플래그 | 설명 | 기본값 |
+|--------|------|--------|
+| `--socket <path>` | Manager의 Unix socket 경로 | (필수) |
+| `--heartbeat-ms <ms>` | Heartbeat 전송 주기 | 100 |
+| `--kv-occupancy <f32>` | 초기 KV cache 점유율 (0.0~1.0) | 0.5 |
+| `--device <str>` | 초기 활성 디바이스 | `opencl` |
+| `--duration-secs <sec>` | 실행 시간 | 30 |
+
+Mock Engine은:
+- Manager로부터 `EngineDirective`를 수신하여 로그 출력
+- 수신한 커맨드에 따라 내부 상태 업데이트 (kv_occupancy, device 전환 등)
+- `CommandResponse`를 Manager에 전송
+
+### 7.3 E2E 테스트 절차
+
+```bash
+# 터미널 1: Manager 시작
+RUST_LOG=info cargo run -p llm_manager -- \
+    --transport unix:/tmp/llm_manager.sock \
+    --policy-config policy_config.toml \
+    --client-timeout 10
+
+# 터미널 2: Mock Engine 연결
+RUST_LOG=info cargo run -p llm_manager --bin mock_engine -- \
+    --socket /tmp/llm_manager.sock \
+    --duration-secs 30
+
+# 터미널 3: 외부 신호 주입 (선택)
+# ExternalMonitor를 통해 SystemSignal을 직접 주입할 수 있다.
+# Manager config에 [external] enabled=true 설정 후,
+# mock_manager로 D-Bus 신호를 주입한다.
+```
+
+Manager의 Monitor들이 실제 시스템 자원을 읽어 pressure가 발생하면, PolicyPipeline이 directive를 생성하여 Mock Engine에 전달한다.
+
+### 7.4 정책 설정 파일
+
+`policy_config.toml` (프로젝트 루트에 기본 파일 제공):
+
+```toml
+[pi_controller]
+compute_kp = 1.5
+compute_ki = 0.3
+compute_setpoint = 0.70    # CPU 70% 이상에서 pressure 발생
+
+[supervisory]
+warning_threshold = 0.4    # pressure > 0.4 → Warning mode
+critical_threshold = 0.7   # pressure > 0.7 → Critical mode
+hold_time_secs = 4.0       # 하강 시 안정 유지 시간
+
+[selector]
+latency_budget = 0.5       # 허용 TBT 증가율 (50%)
+algorithm = "exhaustive"
+
+[actions.kv_evict_sliding]
+alpha = 0.12               # QCF→cost 변환 계수
+reversible = false
+
+[exclusion_groups]
+eviction = ["kv_evict_sliding", "kv_evict_h2o"]
+```
+
+전체 설정은 `policy_config.toml` 참조. 상세 설계는 `docs/36_policy_design.md` §7, §13 참조.
+
+### 7.5 로그 확인
+
+```bash
+RUST_LOG=info cargo run -p llm_manager -- ...
+```
+
+| 로그 | 의미 |
+|------|------|
+| `PolicyPipeline initialized (hierarchical mode)` | 파이프라인 초기화 성공 |
+| `Directive seq=N: M commands [mode=Warning]` | Directive 생성 및 전송 |
+| `[MockEngine] Directive #N seq=M: K commands` | Mock Engine이 directive 수신 |
+
+---
+
+## 8. 아키텍처 참조
+
+상세 설계:
+- [`docs/22_resilience_integration.md`](22_resilience_integration.md) — (구) Engine 측 통합 설계
+- [`docs/36_policy_design.md`](36_policy_design.md) — Hierarchical Policy 설계
+- [`docs/37_protocol_design.md`](37_protocol_design.md) — Manager ↔ Engine 프로토콜
 
 ```mermaid
 flowchart TD

@@ -1,5 +1,7 @@
 # 28. Manager Monitor Pattern Redesign
 
+> **⚠️ Superseded**: 이 문서는 `36_policy_design.md`로 대체되었습니다. Monitor 패턴 자체는 채택되었으나, Monitor 이후의 정책 결정 구조가 전면 재설계되었습니다.
+
 ## Overview
 
 Manager 서비스를 3-layer (Collector → PolicyEngine → Emitter) 에서 **Monitor 패턴**으로 재설계한다.

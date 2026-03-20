@@ -1,5 +1,7 @@
 # D-Bus IPC Specification
 
+> **⚠️ Partially Superseded**: 이 문서의 wire protocol 및 메시지 포맷 섹션은 `37_protocol_design.md`로 대체되었습니다. D-Bus 인터페이스 정의와 시그널 이름은 하위 호환을 위해 유효합니다.
+
 > Phase 0 설계 문서 | llm.rs LLM Resilience System
 > Version: 2.0 (redesigned)
 

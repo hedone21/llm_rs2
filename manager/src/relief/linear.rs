@@ -93,7 +93,12 @@ impl LinearModel {
         }
 
         // denom = λ + φᵀ × Pφ
-        let denom = lambda + phi.iter().zip(p_phi.iter()).map(|(&x, &pp)| x * pp).sum::<f32>();
+        let denom = lambda
+            + phi
+                .iter()
+                .zip(p_phi.iter())
+                .map(|(&x, &pp)| x * pp)
+                .sum::<f32>();
 
         // k = Pφ / denom (D-벡터, gain vector)
         let k: Vec<f32> = p_phi.iter().map(|&v| v / denom).collect();

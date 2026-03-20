@@ -79,6 +79,12 @@ model: sonnet
 - 성능 최적화보다 구조적 정확성을 우선한다
 - 설계안은 반드시 기존 코드베이스와의 호환성을 고려한다
 
+## 다이어그램 규칙
+
+- 아키텍처/UML/컴포넌트 다이어그램은 **가능하면 Mermaid를 사용**한다
+- `flowchart`, `sequenceDiagram`, `stateDiagram`, `classDiagram` 등을 활용
+- Mermaid 코드블록: ` ```mermaid `
+
 ## 응답 언어
 
 모든 응답은 한국어로 작성한다.

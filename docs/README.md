@@ -10,6 +10,7 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 14-15 | Quality & Testing | 컴포넌트 품질 게이트, 테스트 전략 |
 | 20-26 | Resilience | D-Bus IPC, 아키텍처, 통합, 테스트, 사용 가이드, API |
 | 27 | Manager | Manager 서비스 아키텍처 |
+| 36-37 | Policy & Protocol | Manager 정책 시스템, Manager↔Engine 프로토콜 |
 | 30+ | Evaluation & Memory | 평가 방법론, 메모리 아키텍처, KV 캐시 오프로드 |
 
 ## 문서 목록
@@ -40,6 +41,9 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 25 | [25_troubleshooting.md](25_troubleshooting.md) | 트러블슈팅 가이드 |
 | 26 | [26_api_reference.md](26_api_reference.md) | Resilience API 레퍼런스 |
 | 27 | [27_manager_architecture.md](27_manager_architecture.md) | Manager 서비스 내부 아키텍처 |
+| 29 | [29_manager_monitor_redesign.md](29_manager_monitor_redesign.md) | ~~Manager Monitor 재설계~~ → 36번으로 대체 |
+| 36 | [36_policy_design.md](36_policy_design.md) | **Hierarchical Policy 설계** (PI Controller, Supervisory, Action Selector) |
+| 37 | [37_protocol_design.md](37_protocol_design.md) | **Manager ↔ Engine 프로토콜** (Registration, Heartbeat, QCF, Directive) |
 | 30 | [30_evaluation_methodology.md](30_evaluation_methodology.md) | KV Cache Eviction 평가 방법론 |
 | 31 | [31_memory_architecture.md](31_memory_architecture.md) | **메모리 아키텍처 통합 개요** (Buffer → KV Cache → 정책) |
 | 32 | [32_kv_offload.md](32_kv_offload.md) | KV 캐시 오프로드 (RawStore, PrefetchController, PreloadPool) |
@@ -51,7 +55,7 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 
 **기여자**: CLAUDE.md -> ARCHITECTURE.md -> 14 -> 13
 
-**Resilience 기능 관련**: 20 -> 21 -> 22 -> 24 -> 25 -> 26
+**Resilience 기능 관련**: 36 (정책 설계) -> 37 (프로토콜) -> 21 -> 24 -> 25 -> 26
 
 **메모리 & KV 캐시**: 31 (개요) -> 08 (버퍼) -> 11 (Eviction) -> 32 (오프로드)
 

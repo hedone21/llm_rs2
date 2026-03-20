@@ -22,6 +22,11 @@ cargo check --workspace    # syntax check (all crates)
 cargo test -p llm_rs2      # unit tests (engine)
 cargo test -p llm_shared   # unit tests (shared types)
 
+# Manager build & test
+cargo test -p llm_manager      # unit tests (manager)
+cargo run -p llm_manager -- --transport unix:/tmp/llm.sock --policy-config policy_config.toml
+cargo run -p llm_manager --bin mock_engine -- --socket /tmp/llm.sock
+
 # Code quality
 ./.agent/skills/developing/scripts/sanity_check.sh   # runs cargo fmt + cargo clippy (workspace)
 ```
@@ -178,6 +183,8 @@ Conventional Commits: `type(scope): subject` — imperative present tense. Types
 - `docs/29_manager_monitor_redesign.md` — Manager monitor redesign
 - `docs/30_evaluation_methodology.md` — KV Cache Eviction evaluation methodology (related work survey + benchmark design)
 - `docs/35_experiment_runner_guide.md` — **실험 에이전트 인수인계 문서** (바이너리, 러너, 디바이스, CLI, 스키마, 트러블슈팅)
+- `docs/36_policy_design.md` — Hierarchical Policy 설계 (PI Controller, Supervisory, Action Selector)
+- `docs/37_protocol_design.md` — Manager ↔ Engine 프로토콜 (Registration, Heartbeat, QCF, Directive)
 - `docs/31_memory_architecture.md` — Memory architecture overview (Buffer → KV Cache → Policy unified view)
 - `docs/32_kv_offload.md` — KV cache offload (RawStore, PrefetchController, PreloadPool)
 - `docs/34_profiling_framework_design.md` — Inference profiling framework design

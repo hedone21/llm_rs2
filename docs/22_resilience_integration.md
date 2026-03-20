@@ -1,5 +1,7 @@
 # 22. Resilience Manager — generate.rs 통합 설계
 
+> **⚠️ Partially Superseded**: 이 문서의 ResilienceManager 기반 통합 설계는 `36_policy_design.md`와 `37_protocol_design.md`의 CommandExecutor + EngineDirective 기반 설계로 대체되었습니다. CLI 인자 및 초기화 절차는 참고 가능합니다.
+
 > **상태**: 구현 완료
 > **선행 완료**: Phase 1 (타입/전략), Phase 2 (D-Bus 리스너)
 > **대상**: Phase 3 — generate.rs 메인 루프 통합
