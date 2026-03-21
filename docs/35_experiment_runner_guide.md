@@ -326,6 +326,14 @@ generate --model-path <path> --prompt "..." -n 128 \
 | `--kivi` | false | Q2 KV 압축 활성화. eviction과 상호배타 |
 | `--kivi-residual-size` | 32 | 잔여 버퍼 크기 (32의 배수) |
 
+### QCF
+
+| 플래그 | 기본값 | 설명 |
+|--------|--------|------|
+| `--qcf-mode` | `attn` | `attn` (기존), `caote` (CAOTE), `both` (둘 다 출력) |
+
+`caote` 또는 `both` 지정 시 모든 정책에서 GQA-aware score accumulator가 자동 활성화됨.
+
 ### 가중치
 
 | 플래그 | 기본값 | 설명 |
@@ -451,20 +459,65 @@ Q: QCF 값, 추가 forward pass 없이 eviction 시 부수적으로 수집
 α: 오프라인 calibration 계수
 ```
 
-### QCF 유형
+### QCF 변형
 
-| 유형 | 수식 |
+#### QCF-Attn (기본)
+
+Attention × V-norm importance ratio. 제거된 토큰의 importance 비율을 측정.
+
+| 유형 | action 문자열 | 수식 |
+|------|-------------|------|
+| Eviction (H2O) | `eviction_attn` | `Σ_evicted attn(t)×‖V(t)‖₁ / Σ_all attn(t)×‖V(t)‖₁` |
+| Sliding | `sliding_attn` | `prune_count / total_active` |
+| Quantization | `flush` | `0.6×NMSE(K) + 0.4×NMSE(V)` |
+
+#### QCF-CAOTE (신규)
+
+CAOTE (Cached Attention Output Total Error) 기반. Softmax 재분배와 value 방향을 반영하는 비선형 error 추정.
+
+| 유형 | action 문자열 | 수식 |
+|------|-------------|------|
+| Eviction (H2O) | `eviction_caote` | `(1/(1-Σα)) × ‖Σ α_j(o-v_j)‖₂ / ‖o‖₂` |
+| Sliding | `sliding_caote` | 동일 (position-based가 아닌 실제 error 계산) |
+
+여기서 `α_j` = 직전 decode step의 per-KV-head softmax attention, `o = Σ α_i v_i` = attention output.
+
+QCF-Attn 대비 개선점:
+- `1/(1-Σα)` 항: softmax 재정규화 증폭 반영
+- `‖o - v_j‖`: value 방향 (대체 가능성) 반영
+- 비선형: linear α calibration 불필요
+
+#### 사용법
+
+```bash
+# QCF-Attn만 (기본, 기존 호환)
+--qcf-mode attn
+
+# QCF-CAOTE만
+--qcf-mode caote
+
+# 둘 다 수집 (비교 실험용)
+--qcf-mode both
+```
+
+#### JSON 출력 필드
+
+| 필드 | 설명 |
 |------|------|
-| Eviction | `Σ_evicted attn(t)×‖V(t)‖₁ / Σ_all attn(t)×‖V(t)‖₁` |
-| Sliding | `prune_count / total_active` |
-| Quantization | `0.6×NMSE(K) + 0.4×NMSE(V)` |
+| `qcf_metrics` | 모든 QCF 메트릭 배열 (action 필드로 구분) |
+| `qcf_total` | QCF-Attn 합계 (backward compat) |
+| `qcf_attn_total` | QCF-Attn 합계 |
+| `qcf_caote_total` | QCF-CAOTE 합계 (`--qcf-mode caote|both` 시에만 출력) |
+
+`--qcf-mode both` 시 동일 eviction event에 대해 `eviction_attn` + `eviction_caote` 두 메트릭이 쌍으로 기록됨.
 
 ### 핵심 규칙
 
-- **`--kv-type f32` 필수**: QCF V-norm 계산은 F32에서만 동작
+- **`--kv-type f32` 필수**: QCF V-norm / CAOTE 계산은 F32에서만 동작
 - **`--temperature 0`**: 결정론적 실험 필수
 - **cumulative total 사용**: avg는 sliding에서 비단조. 항상 `sum(m["raw_value"] for m in metrics)`
 - **`--protected-prefix 4` 명시**: 미지정 시 sliding은 전체 prompt 보호 → eviction 안 일어남
+- **CAOTE + sliding**: `--qcf-mode caote` 지정 시 sliding/streaming에도 score accumulator가 자동 생성됨
 - JSON 키: 신버전 `"qcf_metrics"`, 구버전 `"proxy_metrics"` — 둘 다 확인
 
 ### Round 1 결과 요약
