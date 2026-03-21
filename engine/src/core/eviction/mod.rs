@@ -55,8 +55,10 @@ pub mod h2o;
 pub mod h2o_plus;
 pub mod no_eviction;
 pub mod sliding_window;
+pub mod streaming_llm;
 
 pub use h2o::H2OPolicy;
 pub use h2o_plus::H2OPlusPolicy;
 pub use no_eviction::NoEvictionPolicy;
 pub use sliding_window::SlidingWindowPolicy;
+pub use streaming_llm::StreamingLLMPolicy;

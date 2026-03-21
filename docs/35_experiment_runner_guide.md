@@ -300,7 +300,8 @@ generate --model-path <path> --prompt "..." -n 128 \
 | `--protected-prefix` | 자동 | score-based→4, sliding→prompt길이. **실험 시 명시 필수** |
 | `--eviction-window` | 1024 | sliding window 크기 |
 | `--eviction-target-ratio` | 0.75 | eviction 시 유지 비율 |
-| `--sink-size` | 4 | StreamingLLM sink tokens |
+| `--sink-size` | 4 | StreamingLLM attention sink tokens |
+| `--streaming-window` | 0 (자동) | StreamingLLM recent window 크기. 0이면 `kv_budget - sink_size` |
 
 ### H2O 전용
 
@@ -441,11 +442,13 @@ huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
 | 정책 | CLI | 동작 | QCF 수집 |
 |------|-----|------|---------|
 | `none` | `--eviction-policy none` | eviction 없음 | — |
-| `sliding` | `--eviction-policy sliding --kv-budget N` | budget 초과 시 oldest 1토큰 삭제 | `compute_sliding_qcf()` |
-| `streaming` | `--eviction-policy streaming --sink-size 4` | sink 보존 + sliding | `compute_sliding_qcf()` |
-| `h2o` | `--eviction-policy h2o --h2o-keep-ratio 0.5` | 3-partition: prefix+HH+recent | `compute_eviction_qcf()` |
-| `h2o_plus` | `--eviction-policy h2o_plus` | per-head GQA-aware H2O | `compute_eviction_qcf()` |
+| `sliding` | `--eviction-policy sliding --kv-budget N` | budget 초과 시 prefix 뒤 oldest부터 제거 | `sliding_attn` / `sliding_caote` |
+| `streaming` | `--eviction-policy streaming --sink-size 4` | **StreamingLLM**: sink(S) + recent(W) 고정 구조. target_len 무시, 항상 S+W로 compact | `sliding_attn` / `sliding_caote` |
+| `h2o` | `--eviction-policy h2o --h2o-keep-ratio 0.5` | 3-partition: prefix+HH+recent | `eviction_attn` / `eviction_caote` |
+| `h2o_plus` | `--eviction-policy h2o_plus` | per-head GQA-aware H2O | `eviction_attn` / `eviction_caote` |
 | `d2o` | `--eviction-policy d2o --d2o-keep-ratio 0.75` | H2O + cosine merge | D2OHandler |
+
+**Streaming vs Sliding 차이**: Sliding은 `target_len`에 따라 유연하게 제거량 조절. Streaming은 `target_len`을 무시하고 항상 `sink_size + streaming_window` 크기로 압축. 긴 프롬프트에서 중간부를 과감히 제거.
 
 ---
 

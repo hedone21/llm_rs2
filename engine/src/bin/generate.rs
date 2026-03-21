@@ -123,6 +123,11 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     sink_size: usize,
 
+    /// StreamingLLM recent window size. 0 = auto (kv_budget - sink_size).
+    /// Only used with --eviction-policy streaming.
+    #[arg(long, default_value_t = 0)]
+    streaming_window: usize,
+
     /// Deprecated: recent window is now derived from budget split. Kept for CLI compatibility.
     #[arg(long, default_value_t = 128, hide = true)]
     h2o_recent_window: usize,
@@ -662,13 +667,15 @@ fn main() -> anyhow::Result<()> {
                     actual_protected_prefix,
                 )),
                 "streaming" => {
-                    // StreamingLLM: default window=2000 if user didn't override
-                    let window = if args.eviction_window == 1024 {
-                        2000
+                    use llm_rs2::core::eviction::StreamingLLMPolicy;
+                    let window = if args.streaming_window > 0 {
+                        args.streaming_window
+                    } else if args.kv_budget > 0 {
+                        args.kv_budget.saturating_sub(args.sink_size)
                     } else {
                         args.eviction_window
                     };
-                    Box::new(SlidingWindowPolicy::new(window, actual_protected_prefix))
+                    Box::new(StreamingLLMPolicy::new(args.sink_size, window))
                 }
                 "h2o" => Box::new(H2OPolicy::new(
                     args.h2o_recent_window,
