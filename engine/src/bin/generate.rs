@@ -2315,31 +2315,29 @@ fn run_eval_ll(
                                     "cache_pos_after": r.new_pos,
                                 }));
                             }
-                            if qcf_config.mode.has_caote() {
-                                if let Some(acc) = score_accumulator.as_ref() {
-                                    if let Some(head_attn) = acc.last_step_head_attn() {
-                                        let positions =
-                                            llm_rs2::core::qcf::identify_evicted_sliding(
-                                                protected_prefix,
-                                                r.tokens_removed,
-                                                before_len,
-                                            );
-                                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_caote(
-                                            &positions,
-                                            head_attn,
-                                            &kv_caches[0],
-                                            &qcf_config,
-                                        );
-                                        qcf_metrics.push(serde_json::json!({
-                                            "step": decode_idx,
-                                            "action": metric.action,
-                                            "raw_value": metric.raw_value,
-                                            "tokens_affected": metric.tokens_affected,
-                                            "cache_pos_before": before_len,
-                                            "cache_pos_after": r.new_pos,
-                                        }));
-                                    }
-                                }
+                            if qcf_config.mode.has_caote()
+                                && let Some(acc) = score_accumulator.as_ref()
+                                && let Some(head_attn) = acc.last_step_head_attn()
+                            {
+                                let positions = llm_rs2::core::qcf::identify_evicted_sliding(
+                                    protected_prefix,
+                                    r.tokens_removed,
+                                    before_len,
+                                );
+                                let metric = llm_rs2::core::qcf::compute_sliding_qcf_caote(
+                                    &positions,
+                                    head_attn,
+                                    &kv_caches[0],
+                                    &qcf_config,
+                                );
+                                qcf_metrics.push(serde_json::json!({
+                                    "step": decode_idx,
+                                    "action": metric.action,
+                                    "raw_value": metric.raw_value,
+                                    "tokens_affected": metric.tokens_affected,
+                                    "cache_pos_before": before_len,
+                                    "cache_pos_after": r.new_pos,
+                                }));
                             }
                         }
                         r
@@ -3974,24 +3972,24 @@ fn run_ppl(
                                     "cache_pos_before": before_len,
                                 }));
                             }
-                            if qcf_config.mode.has_caote() {
-                                if let Some(head_attn) = acc.last_step_head_attn() {
-                                    let positions: Vec<usize> =
-                                        evicted.iter().map(|(pos, _)| *pos).collect();
-                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
-                                        &positions,
-                                        head_attn,
-                                        &kv_caches[0],
-                                        &qcf_config,
-                                    );
-                                    qcf_metrics.push(serde_json::json!({
-                                        "step": i,
-                                        "action": metric.action,
-                                        "raw_value": metric.raw_value,
-                                        "tokens_affected": metric.tokens_affected,
-                                        "cache_pos_before": before_len,
-                                    }));
-                                }
+                            if qcf_config.mode.has_caote()
+                                && let Some(head_attn) = acc.last_step_head_attn()
+                            {
+                                let positions: Vec<usize> =
+                                    evicted.iter().map(|(pos, _)| *pos).collect();
+                                let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                    &positions,
+                                    head_attn,
+                                    &kv_caches[0],
+                                    &qcf_config,
+                                );
+                                qcf_metrics.push(serde_json::json!({
+                                    "step": i,
+                                    "action": metric.action,
+                                    "raw_value": metric.raw_value,
+                                    "tokens_affected": metric.tokens_affected,
+                                    "cache_pos_before": before_len,
+                                }));
                             }
                         }
                         cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
@@ -4016,30 +4014,29 @@ fn run_ppl(
                                 "cache_pos_after": r.new_pos,
                             }));
                         }
-                        if qcf_config.mode.has_caote() {
-                            if let Some(acc) = score_accumulator.as_ref() {
-                                if let Some(head_attn) = acc.last_step_head_attn() {
-                                    let positions = llm_rs2::core::qcf::identify_evicted_sliding(
-                                        protected_prefix,
-                                        r.tokens_removed,
-                                        before_len,
-                                    );
-                                    let metric = llm_rs2::core::qcf::compute_sliding_qcf_caote(
-                                        &positions,
-                                        head_attn,
-                                        &kv_caches[0],
-                                        &qcf_config,
-                                    );
-                                    qcf_metrics.push(serde_json::json!({
-                                        "step": i,
-                                        "action": metric.action,
-                                        "raw_value": metric.raw_value,
-                                        "tokens_affected": metric.tokens_affected,
-                                        "cache_pos_before": before_len,
-                                        "cache_pos_after": r.new_pos,
-                                    }));
-                                }
-                            }
+                        if qcf_config.mode.has_caote()
+                            && let Some(acc) = score_accumulator.as_ref()
+                            && let Some(head_attn) = acc.last_step_head_attn()
+                        {
+                            let positions = llm_rs2::core::qcf::identify_evicted_sliding(
+                                protected_prefix,
+                                r.tokens_removed,
+                                before_len,
+                            );
+                            let metric = llm_rs2::core::qcf::compute_sliding_qcf_caote(
+                                &positions,
+                                head_attn,
+                                &kv_caches[0],
+                                &qcf_config,
+                            );
+                            qcf_metrics.push(serde_json::json!({
+                                "step": i,
+                                "action": metric.action,
+                                "raw_value": metric.raw_value,
+                                "tokens_affected": metric.tokens_affected,
+                                "cache_pos_before": before_len,
+                                "cache_pos_after": r.new_pos,
+                            }));
                         }
                     }
                     r

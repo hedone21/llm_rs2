@@ -32,6 +32,12 @@ pub struct AttentionScoreAccumulator {
     head_importance: Vec<f32>,
     /// Per-KV-head step-local buffer (same layout).
     head_step_importance: Vec<f32>,
+    // ── CAOTE fields ──
+    /// Last tracked layer's per-KV-head attention from the most recent decode step.
+    /// Layout: `[n_kv_heads * max_seq_len]`, row-major. Overwritten each layer
+    /// (not MAX), so after a decode step it holds the last tracked layer's values.
+    /// These are proper softmax-derived scores (sum ≈ 1.0 per head).
+    last_layer_head_attn: Vec<f32>,
     // ── Time-normalization fields ──
     /// Per-token count of steps in which this position was active.
     step_count: Vec<u32>,
@@ -68,6 +74,7 @@ impl AttentionScoreAccumulator {
             n_kv_heads: 0,
             head_importance: Vec::new(),
             head_step_importance: Vec::new(),
+            last_layer_head_attn: Vec::new(),
             step_count: vec![0; max_seq_len],
             normalized: vec![0.0; max_seq_len],
             time_normalize: false,
@@ -106,6 +113,7 @@ impl AttentionScoreAccumulator {
             n_kv_heads,
             head_importance: vec![0.0; head_buf_size],
             head_step_importance: vec![0.0; head_buf_size],
+            last_layer_head_attn: vec![0.0; head_buf_size],
             step_count: vec![0; max_seq_len],
             normalized: vec![0.0; max_seq_len],
             time_normalize: false,
@@ -142,6 +150,7 @@ impl AttentionScoreAccumulator {
         }
         self.step_importance.fill(0.0);
         self.head_step_importance.fill(0.0);
+        self.last_layer_head_attn.fill(0.0);
     }
 
     /// Accumulate post-softmax attention scores from one layer.
@@ -212,6 +221,8 @@ impl AttentionScoreAccumulator {
                 group_score *= inv_rep;
                 let idx = kv_h * self.max_seq_len + t;
                 self.head_step_importance[idx] = self.head_step_importance[idx].max(group_score);
+                // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
+                self.last_layer_head_attn[idx] = group_score;
             }
         }
     }
@@ -266,6 +277,7 @@ impl AttentionScoreAccumulator {
         self.step_importance.fill(0.0);
         self.head_importance.fill(0.0);
         self.head_step_importance.fill(0.0);
+        self.last_layer_head_attn.fill(0.0);
         self.step_count.fill(0);
         self.normalized.fill(0.0);
     }
@@ -292,6 +304,19 @@ impl AttentionScoreAccumulator {
     /// Number of KV heads (0 = GQA mode disabled).
     pub fn n_kv_heads(&self) -> usize {
         self.n_kv_heads
+    }
+
+    /// Returns the last tracked layer's per-KV-head attention from the most
+    /// recent decode step, if GQA mode is active.
+    ///
+    /// Layout: `[n_kv_heads * max_seq_len]`, row-major.
+    /// Values are softmax-derived (sum ≈ 1.0 per head for active positions).
+    pub fn last_step_head_attn(&self) -> Option<&[f32]> {
+        if self.n_kv_heads > 0 {
+            Some(&self.last_layer_head_attn)
+        } else {
+            None
+        }
     }
 }
 

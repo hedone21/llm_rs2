@@ -12,7 +12,10 @@ pub mod quant_qcf;
 pub mod skip_qcf;
 
 pub use estimator::DegradationEstimator;
-pub use eviction_qcf::{compute_eviction_qcf_attn, compute_sliding_qcf_attn, identify_evicted_h2o};
+pub use eviction_qcf::{
+    compute_eviction_qcf_attn, compute_eviction_qcf_caote, compute_sliding_qcf_attn,
+    compute_sliding_qcf_caote, identify_evicted_h2o, identify_evicted_sliding,
+};
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{FlushQcfParams, compute_flush_qcf};
 pub use skip_qcf::SkipQcfTracker;
@@ -30,11 +33,34 @@ pub struct QcfMetric {
     pub tokens_affected: usize,
 }
 
+/// Which QCF variant(s) to compute for eviction events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QcfMode {
+    /// Attention × V-norm ratio (original proxy).
+    Attn,
+    /// CAOTE-based eviction error (softmax redistribution + value direction).
+    Caote,
+    /// Compute both variants.
+    Both,
+}
+
+impl QcfMode {
+    pub fn has_attn(self) -> bool {
+        matches!(self, QcfMode::Attn | QcfMode::Both)
+    }
+
+    pub fn has_caote(self) -> bool {
+        matches!(self, QcfMode::Caote | QcfMode::Both)
+    }
+}
+
 /// Configuration for QCF metric collection.
 #[derive(Debug, Clone)]
 pub struct QcfConfig {
     /// Whether QCF collection is enabled.
     pub enabled: bool,
+    /// Which QCF variant(s) to compute.
+    pub mode: QcfMode,
     /// Head aggregation strategy.
     pub aggregation: AggregationMode,
     /// Maximum degradation estimate (clamp ceiling). Default: 5.0.
@@ -47,6 +73,7 @@ impl Default for QcfConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: QcfMode::Attn,
             aggregation: AggregationMode::Mean,
             d_max: 5.0,
             epsilon: 1e-8,
