@@ -1,7 +1,7 @@
 //! QCF (Quality Cost Function) based degradation estimation for lossy actions.
 //!
-//! Each lossy action (H2O eviction, SnapKV compression, KIVI quantization,
-//! SWIFT layer skip) produces a `QcfMetric` as a side effect.
+//! Each lossy action (H2O eviction, KIVI quantization, SWIFT layer skip)
+//! produces a `QcfMetric` as a side effect.
 //! A `DegradationEstimator` converts QCF values to estimated PPL increase
 //! via offline-calibrated piecewise-linear coefficients.
 

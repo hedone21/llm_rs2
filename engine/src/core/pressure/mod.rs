@@ -8,7 +8,6 @@
 use crate::core::kv_cache::KVCache;
 use anyhow::Result;
 
-pub mod compress_handler;
 pub mod d2o_handler;
 pub mod eviction_handler;
 pub mod merge_handler;
@@ -16,7 +15,6 @@ pub mod quantize_handler;
 pub mod sparse_handler;
 pub mod swap_handler;
 
-pub use compress_handler::SnapKVHandler;
 pub use d2o_handler::D2OHandler;
 pub use eviction_handler::EvictionHandler;
 pub use merge_handler::MergeHandler;
@@ -72,8 +70,6 @@ pub enum ActionResult {
     Quantized,
     /// Similar tokens were merged (stub).
     Merged,
-    /// KV data was compressed (e.g., SnapKV prefill-time compression).
-    Compressed { tokens_removed: usize },
     /// KV data was swapped to secondary storage (disk offload).
     Swapped { tokens_swapped: usize },
     /// Sparse attention mask was applied (stub).
@@ -481,7 +477,6 @@ mod tests {
         );
         assert!(ActionResult::Quantized.is_action());
         assert!(ActionResult::Merged.is_action());
-        assert!(ActionResult::Compressed { tokens_removed: 0 }.is_action());
         assert!(ActionResult::Swapped { tokens_swapped: 0 }.is_action());
         assert!(ActionResult::Sparsified.is_action());
     }

@@ -364,13 +364,6 @@ impl PolicyPipeline {
                         deadline_ms: Some(2000),
                     });
                 }
-                (ActionId::SnapkvCompress, Operation::Apply(_)) => {
-                    result.push(EngineCommand::SetMemoryLevel {
-                        level: ResourceLevel::Warning,
-                        target_ratio: 0.85,
-                        deadline_ms: Some(3000),
-                    });
-                }
                 (_, Operation::Release) => {
                     // Release 명령은 restore directive에서 일괄 처리 — 여기서는 무시
                 }

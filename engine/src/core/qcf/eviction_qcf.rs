@@ -1,6 +1,6 @@
 //! Eviction proxy: estimates information loss from KV token removal.
 //!
-//! Shared by H2O, SnapKV, and StreamingLLM eviction actions.
+//! Shared by H2O and StreamingLLM eviction actions.
 //! Formula: `proxy = Σ_evicted attn(t)×‖V(t)‖₁ / Σ_all attn(t)×‖V(t)‖₁`
 
 use super::{QcfConfig, QcfMetric, aggregate_heads};

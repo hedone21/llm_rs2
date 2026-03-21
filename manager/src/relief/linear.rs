@@ -192,7 +192,6 @@ impl OnlineLinearEstimator {
             ActionId::KvEvictH2o => "kv_evict_h2o",
             ActionId::KvQuantDynamic => "kv_quant_dynamic",
             ActionId::LayerSkip => "layer_skip",
-            ActionId::SnapkvCompress => "snapkv_compress",
         }
     }
 

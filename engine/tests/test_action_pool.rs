@@ -8,10 +8,8 @@ use llm_rs2::core::kv_cache::{KVCache, KVCacheOps, KVLayout};
 use llm_rs2::core::math_utils::{avg_pool_1d, topk_indices_per_head};
 use llm_rs2::core::offload::store::OffloadStore;
 use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
-use llm_rs2::core::pressure::{
-    ActionResult, CachePressureHandler, HandlerContext, PressureLevel, SnapKVHandler, SwapHandler,
-};
-use llm_rs2::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
+use llm_rs2::core::pressure::{CachePressureHandler, HandlerContext, PressureLevel, SwapHandler};
+use llm_rs2::core::quant::{BlockKVQ4, BlockKVQ8, QKKV};
 use llm_rs2::core::skip_config::SkipConfig;
 use llm_rs2::core::speculative::{SkipOptimizer, rollback_kv_positions, verify_greedy};
 
@@ -204,54 +202,6 @@ fn test_quantize_handler_pressure_mapping() {
 // ── AP-4-2: Cross-action integration tests ──────────────────────────────────
 
 #[test]
-fn test_snapkv_then_sliding_eviction() {
-    // SnapKV compresses from 100 → 50 (prefill compression) using HeadMajor.
-    // Then verify the compressed cache size is correct.
-    // Note: actual sliding eviction after SnapKV requires same layout.
-    // This test validates the composition at the size/state level.
-
-    let kv_heads = 2;
-    let head_dim = 4;
-
-    let max_seq = 256;
-    let mut importance = vec![0.0f32; max_seq];
-    for i in 0..100 {
-        importance[i] = i as f32;
-    }
-    let mut head_importance = vec![0.0f32; kv_heads * max_seq];
-    for h in 0..kv_heads {
-        for i in 0..100 {
-            head_importance[h * max_seq + i] = i as f32;
-        }
-    }
-
-    let handler = SnapKVHandler::new(16, 50, 5);
-    let mut caches = vec![make_headmajor_cache(100, kv_heads, head_dim)];
-    let mut ctx = HandlerContext {
-        caches: &mut caches,
-        importance: Some(&importance),
-        head_importance: Some(&head_importance),
-        n_kv_heads: kv_heads,
-        pressure_level: PressureLevel::Emergency,
-        mem_available: 0,
-        target_ratio: None,
-        qcf_sink: None,
-    };
-    let result = handler.handle(&mut ctx).unwrap();
-    assert!(result.is_action());
-    assert_eq!(ctx.caches[0].current_pos, 50);
-
-    // Verify should_evict works on the compressed cache
-    use llm_rs2::core::eviction::EvictionPolicy;
-    use llm_rs2::core::eviction::sliding_window::SlidingWindowPolicy;
-
-    let sliding = SlidingWindowPolicy::new(20, 4);
-    // 50 > 20 + 4 = 24, should want to evict
-    assert!(sliding.should_evict(&ctx.caches[0], 0));
-    // (Actual eviction requires SeqMajor layout conversion; tested separately)
-}
-
-#[test]
 fn test_throttle_plus_eviction_independence() {
     // W3 (throttle) + C4 (eviction) are independent actions.
     // Throttle only inserts delay (tested in resilience tests).
@@ -337,9 +287,6 @@ fn test_all_actions_data_flow() {
     // C8: KIVI multi-bit
     let cache = KiviCache::new_with_bits(8, 64, 2048, 32, 4);
     assert_eq!(cache.bits(), 4);
-
-    // C5: SnapKV handler
-    let _handler = SnapKVHandler::new(32, 1024, 5);
 
     // W2: DiskStore
     use llm_rs2::core::offload::disk_store::DiskStore;

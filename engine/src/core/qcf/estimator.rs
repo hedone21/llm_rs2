@@ -73,7 +73,6 @@ impl DegradationEstimator {
         curves.insert("sliding".to_string(), PiecewiseLinear::linear(1.0));
         curves.insert("kivi".to_string(), PiecewiseLinear::linear(1.0));
         curves.insert("swift".to_string(), PiecewiseLinear::linear(1.0));
-        curves.insert("snapkv".to_string(), PiecewiseLinear::linear(1.0));
 
         Self {
             curves,

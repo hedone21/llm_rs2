@@ -702,57 +702,6 @@ impl KVCache {
 
         Ok(())
     }
-
-    /// Per-head compression: each head independently selects which prefix tokens to keep.
-    ///
-    /// `keep_indices`: `[n_kv_heads][variable]` — per-head sorted position indices to keep.
-    /// `window_start`: start of observation window (all tokens from here to current_pos are kept).
-    ///
-    /// After compression: `current_pos = keep_indices[0].len() + window_tokens`
-    /// (all heads end up with the same total length).
-    ///
-    /// **Requires HeadMajor layout** — per-head gather is only possible with head-major data.
-    pub fn compress_per_head(
-        &mut self,
-        keep_indices: &[Vec<usize>],
-        window_start: usize,
-    ) -> Result<usize> {
-        assert_eq!(
-            self.layout,
-            KVLayout::HeadMajor,
-            "compress_per_head requires HeadMajor layout"
-        );
-        let n_kv_heads = keep_indices.len();
-        let window_tokens = self.current_pos.saturating_sub(window_start);
-
-        for (h, head_indices) in keep_indices.iter().enumerate().take(n_kv_heads) {
-            let mut write_pos = 0;
-
-            // 1. Gather selected prefix tokens
-            for &src_pos in head_indices {
-                if src_pos != write_pos {
-                    self.shift_positions_for_head(h, src_pos, write_pos, 1)?;
-                }
-                write_pos += 1;
-            }
-
-            // 2. Move observation window tokens
-            for offset in 0..window_tokens {
-                let src = window_start + offset;
-                if src != write_pos {
-                    self.shift_positions_for_head(h, src, write_pos, 1)?;
-                }
-                write_pos += 1;
-            }
-        }
-
-        let new_pos = keep_indices
-            .first()
-            .map_or(window_tokens, |k| k.len() + window_tokens);
-        self.current_pos = new_pos;
-
-        Ok(new_pos)
-    }
 }
 
 // ── KVCacheOps implementation for KVCache ───────────────────────────────────
