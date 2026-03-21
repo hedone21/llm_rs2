@@ -17,7 +17,7 @@ use crate::core::kv_cache::{KVCache, KVLayout};
 /// `evicted`: slice of `(position, attention_score)` pairs for tokens about to be evicted.
 /// `all_scores`: attention scores for ALL active tokens `[max_seq_len]`.
 /// Returns a `QcfMetric` with per-head breakdown and aggregated value.
-pub fn compute_eviction_qcf(
+pub fn compute_eviction_qcf_attn(
     evicted: &[(usize, f32)],
     all_scores: &[f32],
     cache: &KVCache,
@@ -32,7 +32,7 @@ pub fn compute_eviction_qcf(
 
     if evicted.is_empty() || current_pos == 0 || kv_heads == 0 {
         return QcfMetric {
-            action: "eviction".to_string(),
+            action: "eviction_attn".to_string(),
             raw_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
             tokens_affected: 0,
@@ -79,7 +79,7 @@ pub fn compute_eviction_qcf(
     let raw_value = aggregate_heads(&per_head, &config.aggregation);
 
     QcfMetric {
-        action: "eviction".to_string(),
+        action: "eviction_attn".to_string(),
         raw_value,
         per_head: Some(per_head),
         tokens_affected: evicted.len(),
@@ -90,7 +90,7 @@ pub fn compute_eviction_qcf(
 ///
 /// `proxy = prune_count / total_active` — fraction of active tokens removed.
 /// No V-buffer access needed since sliding window is position-based.
-pub fn compute_sliding_qcf(prune_count: usize, total_active: usize) -> QcfMetric {
+pub fn compute_sliding_qcf_attn(prune_count: usize, total_active: usize) -> QcfMetric {
     let raw_value = if total_active > 0 {
         (prune_count as f32 / total_active as f32).clamp(0.0, 1.0)
     } else {
@@ -98,7 +98,7 @@ pub fn compute_sliding_qcf(prune_count: usize, total_active: usize) -> QcfMetric
     };
 
     QcfMetric {
-        action: "sliding".to_string(),
+        action: "sliding_attn".to_string(),
         raw_value,
         per_head: None,
         tokens_affected: prune_count,
@@ -254,9 +254,9 @@ mod tests {
         // All tokens have uniform attn=1.0
         let all_scores = vec![1.0f32; num_tokens];
         let evicted = vec![(2, 1.0), (3, 1.0)];
-        let metric = compute_eviction_qcf(&evicted, &all_scores, &cache, &config);
+        let metric = compute_eviction_qcf_attn(&evicted, &all_scores, &cache, &config);
 
-        assert_eq!(metric.action, "eviction");
+        assert_eq!(metric.action, "eviction_attn");
         assert_eq!(metric.tokens_affected, 2);
         // With uniform V norms and uniform attn: proxy = 2/8 = 0.25
         assert!(
@@ -276,7 +276,7 @@ mod tests {
 
         let config = QcfConfig::default();
         let all_scores = vec![1.0f32; 10];
-        let metric = compute_eviction_qcf(&[], &all_scores, &cache, &config);
+        let metric = compute_eviction_qcf_attn(&[], &all_scores, &cache, &config);
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.tokens_affected, 0);
     }
@@ -307,9 +307,11 @@ mod tests {
         let all_scores = vec![1.0f32; num_tokens];
 
         // Evict high-norm tokens → higher proxy
-        let metric_high = compute_eviction_qcf(&[(2, 1.0), (3, 1.0)], &all_scores, &cache, &config);
+        let metric_high =
+            compute_eviction_qcf_attn(&[(2, 1.0), (3, 1.0)], &all_scores, &cache, &config);
         // Evict low-norm tokens → lower proxy
-        let metric_low = compute_eviction_qcf(&[(0, 1.0), (1, 1.0)], &all_scores, &cache, &config);
+        let metric_low =
+            compute_eviction_qcf_attn(&[(0, 1.0), (1, 1.0)], &all_scores, &cache, &config);
 
         assert!(
             metric_high.raw_value > metric_low.raw_value,
@@ -321,21 +323,21 @@ mod tests {
 
     #[test]
     fn test_sliding_proxy() {
-        let metric = compute_sliding_qcf(10, 100);
-        assert_eq!(metric.action, "sliding");
+        let metric = compute_sliding_qcf_attn(10, 100);
+        assert_eq!(metric.action, "sliding_attn");
         assert!((metric.raw_value - 0.1).abs() < 1e-6);
         assert_eq!(metric.tokens_affected, 10);
     }
 
     #[test]
     fn test_sliding_proxy_zero_total() {
-        let metric = compute_sliding_qcf(0, 0);
+        let metric = compute_sliding_qcf_attn(0, 0);
         assert_eq!(metric.raw_value, 0.0);
     }
 
     #[test]
     fn test_sliding_proxy_full_eviction() {
-        let metric = compute_sliding_qcf(50, 50);
+        let metric = compute_sliding_qcf_attn(50, 50);
         assert!((metric.raw_value - 1.0).abs() < 1e-6);
     }
 
@@ -401,7 +403,7 @@ mod tests {
         let config = QcfConfig::default();
         let all_scores = vec![1.0f32; num_tokens];
         let evicted = vec![(1, 1.0)];
-        let metric = compute_eviction_qcf(&evicted, &all_scores, &cache, &config);
+        let metric = compute_eviction_qcf_attn(&evicted, &all_scores, &cache, &config);
 
         assert!(metric.raw_value > 0.0);
         assert!(metric.raw_value <= 1.0);
@@ -433,9 +435,9 @@ mod tests {
         let all_scores = vec![10.0, 1.0, 1.0, 1.0];
 
         // Evict token 0 (attn=10.0): evicted_imp = 10*4 = 40, total_imp = 10*4+1*4+1*4+1*4 = 52
-        let metric_high = compute_eviction_qcf(&[(0, 10.0)], &all_scores, &cache, &config);
+        let metric_high = compute_eviction_qcf_attn(&[(0, 10.0)], &all_scores, &cache, &config);
         // Evict token 1 (attn=1.0): evicted_imp = 1*4 = 4, total_imp = 52
-        let metric_low = compute_eviction_qcf(&[(1, 1.0)], &all_scores, &cache, &config);
+        let metric_low = compute_eviction_qcf_attn(&[(1, 1.0)], &all_scores, &cache, &config);
 
         assert!(
             metric_high.raw_value > metric_low.raw_value,

@@ -2168,7 +2168,7 @@ fn run_eval_ll(
                     eviction_count += 1;
                     evicted_total += r.tokens_removed;
                     let metric =
-                        llm_rs2::core::qcf::compute_sliding_qcf(r.tokens_removed, before_len);
+                        llm_rs2::core::qcf::compute_sliding_qcf_attn(r.tokens_removed, before_len);
                     qcf_metrics.push(serde_json::json!({
                         "step": "prefill",
                         "action": metric.action,
@@ -2228,7 +2228,7 @@ fn run_eval_ll(
                             );
                             if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty()
                             {
-                                let metric = llm_rs2::core::qcf::compute_eviction_qcf(
+                                let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
                                     &evicted,
                                     scores,
                                     &kv_caches[0],
@@ -2249,7 +2249,7 @@ fn run_eval_ll(
                     } else {
                         let r = cache_manager.force_evict(kv_caches, ratio)?;
                         if r.evicted {
-                            let metric = llm_rs2::core::qcf::compute_sliding_qcf(
+                            let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
                                 r.tokens_removed,
                                 before_len,
                             );
@@ -2470,6 +2470,7 @@ fn run_eval_ll(
             "evicted_tokens": evicted_total,
             "qcf_metrics": qcf_metrics,
             "qcf_total": qcf_total,
+            "qcf_attn_total": qcf_total,
             "final_cache_pos": kv_caches[0].current_pos,
         }));
     }
@@ -2858,6 +2859,7 @@ fn run_kivi_eval_ll(
             "kivi_res_pos": kv_caches[0].res_pos,
             "qcf_metrics": qcf_metrics,
             "qcf_total": qcf_total,
+            "qcf_attn_total": qcf_total,
         }));
     }
 
@@ -3859,7 +3861,7 @@ fn run_ppl(
                             target_len,
                         );
                         if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty() {
-                            let metric = llm_rs2::core::qcf::compute_eviction_qcf(
+                            let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
                                 &evicted,
                                 scores,
                                 &kv_caches[0],
@@ -3881,8 +3883,10 @@ fn run_ppl(
                     // Sliding window: position-based proxy
                     let r = cache_manager.force_evict(kv_caches, ratio)?;
                     if r.evicted {
-                        let metric =
-                            llm_rs2::core::qcf::compute_sliding_qcf(r.tokens_removed, before_len);
+                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                            r.tokens_removed,
+                            before_len,
+                        );
                         qcf_metrics.push(serde_json::json!({
                             "step": i,
                             "action": metric.action,

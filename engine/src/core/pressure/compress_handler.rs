@@ -136,7 +136,7 @@ impl CachePressureHandler for SnapKVHandler {
                     .collect();
                 if !evicted.is_empty() {
                     let all_scores = ctx.importance.unwrap_or(&[]);
-                    let mut metric = crate::core::qcf::compute_eviction_qcf(
+                    let mut metric = crate::core::qcf::compute_eviction_qcf_attn(
                         &evicted, all_scores, cache, qcf_cfg,
                     );
                     metric.action = "snapkv".to_string();

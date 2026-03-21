@@ -64,7 +64,7 @@ impl EvictionHandler {
         if policy_name == "sliding_window" {
             // Position-based proxy: fraction of tokens removed
             let prune_count = current_pos.saturating_sub(target_len);
-            let metric = crate::core::qcf::compute_sliding_qcf(prune_count, current_pos);
+            let metric = crate::core::qcf::compute_sliding_qcf_attn(prune_count, current_pos);
             sink.push(metric);
         } else if let Some(importance) = ctx.importance {
             // Score-based proxy (H2O, etc.): identify evicted tokens + V-norm computation
@@ -79,7 +79,7 @@ impl EvictionHandler {
                 target_len,
             );
             if !evicted.is_empty() && !ctx.caches.is_empty() {
-                let metric = crate::core::qcf::compute_eviction_qcf(
+                let metric = crate::core::qcf::compute_eviction_qcf_attn(
                     &evicted,
                     importance,
                     &ctx.caches[0],

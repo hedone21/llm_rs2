@@ -12,7 +12,7 @@ pub mod quant_qcf;
 pub mod skip_qcf;
 
 pub use estimator::DegradationEstimator;
-pub use eviction_qcf::{compute_eviction_qcf, compute_sliding_qcf, identify_evicted_h2o};
+pub use eviction_qcf::{compute_eviction_qcf_attn, compute_sliding_qcf_attn, identify_evicted_h2o};
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{FlushQcfParams, compute_flush_qcf};
 pub use skip_qcf::SkipQcfTracker;
