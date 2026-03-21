@@ -215,6 +215,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     h2o_raw_scores: bool,
 
+    /// QCF variant to compute: "attn" (default), "caote", or "both".
+    #[arg(long, default_value = "attn")]
+    qcf_mode: String,
+
     // ── Eval-LL mode (log-likelihood evaluation) ──
     /// Enable log-likelihood evaluation mode (downstream task accuracy)
     #[arg(long, default_value_t = false)]
@@ -688,27 +692,42 @@ fn main() -> anyhow::Result<()> {
     // Setup event sink for score diagnostics
     cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
 
-    // Setup AttentionScoreAccumulator for H2O / H2O+ / D2O
-    let mut score_accumulator = if args.eviction_policy == "h2o" || args.eviction_policy == "d2o" {
-        let mut acc = AttentionScoreAccumulator::new(
-            max_seq_len,
-            model.config.num_attention_heads,
-            model.config.num_hidden_layers,
-            args.h2o_tracked_layers,
-            args.h2o_decay,
-        );
-        acc.set_active(true);
-        acc.set_time_normalize(!args.h2o_raw_scores);
-        Some(acc)
-    } else if args.eviction_policy == "h2o_plus" {
-        let mut acc = AttentionScoreAccumulator::new_gqa(
-            max_seq_len,
-            model.config.num_attention_heads,
-            model.config.num_key_value_heads,
-            model.config.num_hidden_layers,
-            args.h2o_tracked_layers,
-            args.h2o_decay,
-        );
+    // Parse QCF mode
+    let qcf_mode = match args.qcf_mode.as_str() {
+        "caote" => llm_rs2::core::qcf::QcfMode::Caote,
+        "both" => llm_rs2::core::qcf::QcfMode::Both,
+        _ => llm_rs2::core::qcf::QcfMode::Attn,
+    };
+    let needs_caote = qcf_mode.has_caote();
+
+    // Setup AttentionScoreAccumulator for H2O / H2O+ / D2O / CAOTE
+    // When CAOTE is requested, always use GQA-aware accumulator (for per-KV-head attention).
+    let needs_score_based = args.eviction_policy == "h2o"
+        || args.eviction_policy == "d2o"
+        || args.eviction_policy == "h2o_plus";
+    let needs_accumulator = needs_score_based || needs_caote;
+    let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote;
+
+    let mut score_accumulator = if needs_accumulator {
+        let acc = if use_gqa {
+            AttentionScoreAccumulator::new_gqa(
+                max_seq_len,
+                model.config.num_attention_heads,
+                model.config.num_key_value_heads,
+                model.config.num_hidden_layers,
+                args.h2o_tracked_layers,
+                args.h2o_decay,
+            )
+        } else {
+            AttentionScoreAccumulator::new(
+                max_seq_len,
+                model.config.num_attention_heads,
+                model.config.num_hidden_layers,
+                args.h2o_tracked_layers,
+                args.h2o_decay,
+            )
+        };
+        let mut acc = acc;
         acc.set_active(true);
         acc.set_time_normalize(!args.h2o_raw_scores);
         Some(acc)
@@ -1975,7 +1994,14 @@ fn run_eval_ll(
 
     let mut results: Vec<serde_json::Value> = Vec::new();
     let overall_start = std::time::Instant::now();
-    let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
+    let qcf_config = llm_rs2::core::qcf::QcfConfig {
+        mode: match args.qcf_mode.as_str() {
+            "caote" => llm_rs2::core::qcf::QcfMode::Caote,
+            "both" => llm_rs2::core::qcf::QcfMode::Both,
+            _ => llm_rs2::core::qcf::QcfMode::Attn,
+        },
+        ..llm_rs2::core::qcf::QcfConfig::default()
+    };
 
     // ── Importance 2-pass: measure layer importance before evaluation ──
     // Only when skip_config is active and there are questions to evaluate.
@@ -2167,16 +2193,21 @@ fn run_eval_ll(
                 if r.evicted {
                     eviction_count += 1;
                     evicted_total += r.tokens_removed;
-                    let metric =
-                        llm_rs2::core::qcf::compute_sliding_qcf_attn(r.tokens_removed, before_len);
-                    qcf_metrics.push(serde_json::json!({
-                        "step": "prefill",
-                        "action": metric.action,
-                        "raw_value": metric.raw_value,
-                        "tokens_affected": metric.tokens_affected,
-                        "cache_pos_before": before_len,
-                        "cache_pos_after": r.new_pos,
-                    }));
+                    if qcf_config.mode.has_attn() {
+                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                            r.tokens_removed,
+                            before_len,
+                        );
+                        qcf_metrics.push(serde_json::json!({
+                            "step": "prefill",
+                            "action": metric.action,
+                            "raw_value": metric.raw_value,
+                            "tokens_affected": metric.tokens_affected,
+                            "cache_pos_before": before_len,
+                            "cache_pos_after": r.new_pos,
+                        }));
+                    }
+                    // Note: CAOTE not available for prefill eviction (no decode step yet)
                     if let Some(acc) = score_accumulator.as_mut() {
                         acc.reset();
                     }
@@ -2228,19 +2259,40 @@ fn run_eval_ll(
                             );
                             if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty()
                             {
-                                let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
-                                    &evicted,
-                                    scores,
-                                    &kv_caches[0],
-                                    &qcf_config,
-                                );
-                                qcf_metrics.push(serde_json::json!({
-                                    "step": decode_idx,
-                                    "action": metric.action,
-                                    "raw_value": metric.raw_value,
-                                    "tokens_affected": metric.tokens_affected,
-                                    "cache_pos_before": before_len,
-                                }));
+                                if qcf_config.mode.has_attn() {
+                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
+                                        &evicted,
+                                        scores,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                    );
+                                    qcf_metrics.push(serde_json::json!({
+                                        "step": decode_idx,
+                                        "action": metric.action,
+                                        "raw_value": metric.raw_value,
+                                        "tokens_affected": metric.tokens_affected,
+                                        "cache_pos_before": before_len,
+                                    }));
+                                }
+                                if qcf_config.mode.has_caote()
+                                    && let Some(head_attn) = acc.last_step_head_attn()
+                                {
+                                    let positions: Vec<usize> =
+                                        evicted.iter().map(|(pos, _)| *pos).collect();
+                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                        &positions,
+                                        head_attn,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                    );
+                                    qcf_metrics.push(serde_json::json!({
+                                        "step": decode_idx,
+                                        "action": metric.action,
+                                        "raw_value": metric.raw_value,
+                                        "tokens_affected": metric.tokens_affected,
+                                        "cache_pos_before": before_len,
+                                    }));
+                                }
                             }
                             cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
                         } else {
@@ -2249,18 +2301,46 @@ fn run_eval_ll(
                     } else {
                         let r = cache_manager.force_evict(kv_caches, ratio)?;
                         if r.evicted {
-                            let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
-                                r.tokens_removed,
-                                before_len,
-                            );
-                            qcf_metrics.push(serde_json::json!({
-                                "step": decode_idx,
-                                "action": metric.action,
-                                "raw_value": metric.raw_value,
-                                "tokens_affected": metric.tokens_affected,
-                                "cache_pos_before": before_len,
-                                "cache_pos_after": r.new_pos,
-                            }));
+                            if qcf_config.mode.has_attn() {
+                                let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                                    r.tokens_removed,
+                                    before_len,
+                                );
+                                qcf_metrics.push(serde_json::json!({
+                                    "step": decode_idx,
+                                    "action": metric.action,
+                                    "raw_value": metric.raw_value,
+                                    "tokens_affected": metric.tokens_affected,
+                                    "cache_pos_before": before_len,
+                                    "cache_pos_after": r.new_pos,
+                                }));
+                            }
+                            if qcf_config.mode.has_caote() {
+                                if let Some(acc) = score_accumulator.as_ref() {
+                                    if let Some(head_attn) = acc.last_step_head_attn() {
+                                        let positions =
+                                            llm_rs2::core::qcf::identify_evicted_sliding(
+                                                protected_prefix,
+                                                r.tokens_removed,
+                                                before_len,
+                                            );
+                                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_caote(
+                                            &positions,
+                                            head_attn,
+                                            &kv_caches[0],
+                                            &qcf_config,
+                                        );
+                                        qcf_metrics.push(serde_json::json!({
+                                            "step": decode_idx,
+                                            "action": metric.action,
+                                            "raw_value": metric.raw_value,
+                                            "tokens_affected": metric.tokens_affected,
+                                            "cache_pos_before": before_len,
+                                            "cache_pos_after": r.new_pos,
+                                        }));
+                                    }
+                                }
+                            }
                         }
                         r
                     };
@@ -2452,11 +2532,17 @@ fn run_eval_ll(
             elapsed_q,
         );
 
-        let qcf_total: f64 = qcf_metrics
+        let qcf_attn_total: f64 = qcf_metrics
             .iter()
+            .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
             .filter_map(|m| m["raw_value"].as_f64())
             .sum();
-        results.push(serde_json::json!({
+        let qcf_caote_total: f64 = qcf_metrics
+            .iter()
+            .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
+            .filter_map(|m| m["raw_value"].as_f64())
+            .sum();
+        let mut result_obj = serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
             "choice_byte_lens": choice_byte_lens,
@@ -2469,10 +2555,14 @@ fn run_eval_ll(
             "eviction_count": eviction_count,
             "evicted_tokens": evicted_total,
             "qcf_metrics": qcf_metrics,
-            "qcf_total": qcf_total,
-            "qcf_attn_total": qcf_total,
+            "qcf_total": qcf_attn_total,
+            "qcf_attn_total": qcf_attn_total,
             "final_cache_pos": kv_caches[0].current_pos,
-        }));
+        });
+        if qcf_config.mode.has_caote() {
+            result_obj["qcf_caote_total"] = serde_json::json!(qcf_caote_total);
+        }
+        results.push(result_obj);
     }
 
     let elapsed = overall_start.elapsed().as_secs_f64();
@@ -2861,6 +2951,7 @@ fn run_kivi_eval_ll(
             "qcf_total": qcf_total,
             "qcf_attn_total": qcf_total,
         }));
+        // Note: KIVI mode uses quantization QCF, not eviction. CAOTE not applicable.
     }
 
     let elapsed = overall_start.elapsed().as_secs_f64();
@@ -3719,7 +3810,14 @@ fn run_ppl(
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
     let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
-    let qcf_config = QcfConfig::default();
+    let qcf_config = QcfConfig {
+        mode: match args.qcf_mode.as_str() {
+            "caote" => llm_rs2::core::qcf::QcfMode::Caote,
+            "both" => llm_rs2::core::qcf::QcfMode::Both,
+            _ => llm_rs2::core::qcf::QcfMode::Attn,
+        },
+        ..QcfConfig::default()
+    };
     let overall_start = std::time::Instant::now();
 
     // ── 4. Prefill phase ──
@@ -3861,19 +3959,40 @@ fn run_ppl(
                             target_len,
                         );
                         if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty() {
-                            let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
-                                &evicted,
-                                scores,
-                                &kv_caches[0],
-                                &qcf_config,
-                            );
-                            qcf_metrics.push(serde_json::json!({
-                                "step": i,
-                                "action": metric.action,
-                                "raw_value": metric.raw_value,
-                                "tokens_affected": metric.tokens_affected,
-                                "cache_pos_before": before_len,
-                            }));
+                            if qcf_config.mode.has_attn() {
+                                let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
+                                    &evicted,
+                                    scores,
+                                    &kv_caches[0],
+                                    &qcf_config,
+                                );
+                                qcf_metrics.push(serde_json::json!({
+                                    "step": i,
+                                    "action": metric.action,
+                                    "raw_value": metric.raw_value,
+                                    "tokens_affected": metric.tokens_affected,
+                                    "cache_pos_before": before_len,
+                                }));
+                            }
+                            if qcf_config.mode.has_caote() {
+                                if let Some(head_attn) = acc.last_step_head_attn() {
+                                    let positions: Vec<usize> =
+                                        evicted.iter().map(|(pos, _)| *pos).collect();
+                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                        &positions,
+                                        head_attn,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                    );
+                                    qcf_metrics.push(serde_json::json!({
+                                        "step": i,
+                                        "action": metric.action,
+                                        "raw_value": metric.raw_value,
+                                        "tokens_affected": metric.tokens_affected,
+                                        "cache_pos_before": before_len,
+                                    }));
+                                }
+                            }
                         }
                         cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
                     } else {
@@ -3883,18 +4002,45 @@ fn run_ppl(
                     // Sliding window: position-based proxy
                     let r = cache_manager.force_evict(kv_caches, ratio)?;
                     if r.evicted {
-                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
-                            r.tokens_removed,
-                            before_len,
-                        );
-                        qcf_metrics.push(serde_json::json!({
-                            "step": i,
-                            "action": metric.action,
-                            "raw_value": metric.raw_value,
-                            "tokens_affected": metric.tokens_affected,
-                            "cache_pos_before": before_len,
-                            "cache_pos_after": r.new_pos,
-                        }));
+                        if qcf_config.mode.has_attn() {
+                            let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                                r.tokens_removed,
+                                before_len,
+                            );
+                            qcf_metrics.push(serde_json::json!({
+                                "step": i,
+                                "action": metric.action,
+                                "raw_value": metric.raw_value,
+                                "tokens_affected": metric.tokens_affected,
+                                "cache_pos_before": before_len,
+                                "cache_pos_after": r.new_pos,
+                            }));
+                        }
+                        if qcf_config.mode.has_caote() {
+                            if let Some(acc) = score_accumulator.as_ref() {
+                                if let Some(head_attn) = acc.last_step_head_attn() {
+                                    let positions = llm_rs2::core::qcf::identify_evicted_sliding(
+                                        protected_prefix,
+                                        r.tokens_removed,
+                                        before_len,
+                                    );
+                                    let metric = llm_rs2::core::qcf::compute_sliding_qcf_caote(
+                                        &positions,
+                                        head_attn,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                    );
+                                    qcf_metrics.push(serde_json::json!({
+                                        "step": i,
+                                        "action": metric.action,
+                                        "raw_value": metric.raw_value,
+                                        "tokens_affected": metric.tokens_affected,
+                                        "cache_pos_before": before_len,
+                                        "cache_pos_after": r.new_pos,
+                                    }));
+                                }
+                            }
+                        }
                     }
                     r
                 };
