@@ -2654,6 +2654,15 @@ fn run_eval_ll(
     }
     if let Some(qcf) = layer_skip_qcf {
         output["layer_skip_qcf"] = serde_json::json!(qcf);
+        // normalized = skipped / remaining = raw / (1 - raw)
+        // Cap when raw ≈ 1.0 (nearly all layers skipped) to avoid infinity.
+        const NORMALIZED_CAP: f32 = 100.0;
+        let normalized = if qcf >= 1.0 - 1e-7 {
+            NORMALIZED_CAP
+        } else {
+            qcf / (1.0 - qcf)
+        };
+        output["layer_skip_qcf_normalized"] = serde_json::json!(normalized);
     }
 
     println!("{}", serde_json::to_string_pretty(&output)?);
