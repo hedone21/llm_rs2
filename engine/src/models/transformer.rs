@@ -128,7 +128,7 @@ impl TransformerModel {
                 // NOTE: MADV_WILLNEED removed — it prefaults the entire file into RSS
                 // (~2.4 GB for 1B model), inflating peak memory during loading.
                 // Pages are faulted on-demand during tensor conversion instead.
-                #[cfg(unix)]
+                #[cfg(target_os = "linux")]
                 {
                     let ptr = mmap.as_ptr() as *mut libc::c_void;
                     let len = mmap.len();
