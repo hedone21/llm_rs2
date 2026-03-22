@@ -2196,15 +2196,23 @@ fn run_eval_ll(
                 if r.evicted {
                     eviction_count += 1;
                     evicted_total += r.tokens_removed;
-                    if qcf_config.mode.has_attn() {
-                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                    if qcf_config.mode.has_attn() && args.kv_type == "f32" {
+                        let positions = llm_rs2::core::qcf::identify_evicted_sliding(
+                            protected_prefix,
                             r.tokens_removed,
                             before_len,
+                        );
+                        let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                            &positions,
+                            &kv_caches[0],
+                            before_len,
+                            &qcf_config,
                         );
                         qcf_metrics.push(serde_json::json!({
                             "step": "prefill",
                             "action": metric.action,
                             "raw_value": metric.raw_value,
+                            "normalized_value": metric.normalized_value,
                             "tokens_affected": metric.tokens_affected,
                             "cache_pos_before": before_len,
                             "cache_pos_after": r.new_pos,
@@ -2273,6 +2281,7 @@ fn run_eval_ll(
                                         "step": decode_idx,
                                         "action": metric.action,
                                         "raw_value": metric.raw_value,
+                                        "normalized_value": metric.normalized_value,
                                         "tokens_affected": metric.tokens_affected,
                                         "cache_pos_before": before_len,
                                     }));
@@ -2292,6 +2301,7 @@ fn run_eval_ll(
                                         "step": decode_idx,
                                         "action": metric.action,
                                         "raw_value": metric.raw_value,
+                                        "normalized_value": metric.normalized_value,
                                         "tokens_affected": metric.tokens_affected,
                                         "cache_pos_before": before_len,
                                     }));
@@ -2304,15 +2314,23 @@ fn run_eval_ll(
                     } else {
                         let r = cache_manager.force_evict(kv_caches, ratio)?;
                         if r.evicted {
-                            if qcf_config.mode.has_attn() {
-                                let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                            if qcf_config.mode.has_attn() && args.kv_type == "f32" {
+                                let positions = llm_rs2::core::qcf::identify_evicted_sliding(
+                                    protected_prefix,
                                     r.tokens_removed,
                                     before_len,
+                                );
+                                let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                                    &positions,
+                                    &kv_caches[0],
+                                    before_len,
+                                    &qcf_config,
                                 );
                                 qcf_metrics.push(serde_json::json!({
                                     "step": decode_idx,
                                     "action": metric.action,
                                     "raw_value": metric.raw_value,
+                                    "normalized_value": metric.normalized_value,
                                     "tokens_affected": metric.tokens_affected,
                                     "cache_pos_before": before_len,
                                     "cache_pos_after": r.new_pos,
@@ -2337,6 +2355,7 @@ fn run_eval_ll(
                                     "step": decode_idx,
                                     "action": metric.action,
                                     "raw_value": metric.raw_value,
+                                    "normalized_value": metric.normalized_value,
                                     "tokens_affected": metric.tokens_affected,
                                     "cache_pos_before": before_len,
                                     "cache_pos_after": r.new_pos,
@@ -3963,6 +3982,7 @@ fn run_ppl(
                                     "step": i,
                                     "action": metric.action,
                                     "raw_value": metric.raw_value,
+                                    "normalized_value": metric.normalized_value,
                                     "tokens_affected": metric.tokens_affected,
                                     "cache_pos_before": before_len,
                                 }));
@@ -3982,6 +4002,7 @@ fn run_ppl(
                                     "step": i,
                                     "action": metric.action,
                                     "raw_value": metric.raw_value,
+                                    "normalized_value": metric.normalized_value,
                                     "tokens_affected": metric.tokens_affected,
                                     "cache_pos_before": before_len,
                                 }));
@@ -3992,18 +4013,26 @@ fn run_ppl(
                         cache_manager.force_evict(kv_caches, ratio)?
                     }
                 } else {
-                    // Sliding window: position-based proxy
+                    // Sliding window: V-norm based proxy
                     let r = cache_manager.force_evict(kv_caches, ratio)?;
                     if r.evicted {
-                        if qcf_config.mode.has_attn() {
-                            let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                        if qcf_config.mode.has_attn() && args.kv_type == "f32" {
+                            let positions = llm_rs2::core::qcf::identify_evicted_sliding(
+                                protected_prefix,
                                 r.tokens_removed,
                                 before_len,
+                            );
+                            let metric = llm_rs2::core::qcf::compute_sliding_qcf_attn(
+                                &positions,
+                                &kv_caches[0],
+                                before_len,
+                                &qcf_config,
                             );
                             qcf_metrics.push(serde_json::json!({
                                 "step": i,
                                 "action": metric.action,
                                 "raw_value": metric.raw_value,
+                                "normalized_value": metric.normalized_value,
                                 "tokens_affected": metric.tokens_affected,
                                 "cache_pos_before": before_len,
                                 "cache_pos_after": r.new_pos,
@@ -4028,6 +4057,7 @@ fn run_ppl(
                                 "step": i,
                                 "action": metric.action,
                                 "raw_value": metric.raw_value,
+                                "normalized_value": metric.normalized_value,
                                 "tokens_affected": metric.tokens_affected,
                                 "cache_pos_before": before_len,
                                 "cache_pos_after": r.new_pos,

@@ -34,6 +34,7 @@ pub fn compute_eviction_qcf_attn(
         return QcfMetric {
             action: "eviction_attn".to_string(),
             raw_value: 0.0,
+            normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
             tokens_affected: 0,
         };
@@ -43,6 +44,7 @@ pub fn compute_eviction_qcf_attn(
     let v_data = cache.v_buffer.as_slice::<f32>();
 
     let mut per_head = vec![0.0f32; kv_heads];
+    let mut per_head_normalized = vec![0.0f32; kv_heads];
 
     for (h, ph) in per_head.iter_mut().enumerate() {
         let mut total_importance = 0.0f32;
@@ -74,34 +76,105 @@ pub fn compute_eviction_qcf_attn(
         } else {
             0.0
         };
+
+        // normalized: evicted / remaining = evicted / (total - evicted)
+        let remaining_importance = total_importance - evicted_importance;
+        per_head_normalized[h] = if remaining_importance > epsilon {
+            evicted_importance / remaining_importance
+        } else {
+            0.0
+        };
     }
 
     let raw_value = aggregate_heads(&per_head, &config.aggregation);
+    let normalized_value = aggregate_heads(&per_head_normalized, &config.aggregation);
 
     QcfMetric {
         action: "eviction_attn".to_string(),
         raw_value,
+        normalized_value,
         per_head: Some(per_head),
         tokens_affected: evicted.len(),
     }
 }
 
-/// Compute a simple position-based proxy for sliding window eviction.
+/// Compute V-norm based proxy for sliding window eviction.
 ///
-/// `proxy = prune_count / total_active` — fraction of active tokens removed.
-/// No V-buffer access needed since sliding window is position-based.
-pub fn compute_sliding_qcf_attn(prune_count: usize, total_active: usize) -> QcfMetric {
-    let raw_value = if total_active > 0 {
-        (prune_count as f32 / total_active as f32).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
+/// Uses L1 norm of value vectors as importance weight (no attention weighting).
+/// Per head:
+/// ```text
+/// total_vnorm   = Σ_{t=0..current_pos} ‖V(h,t)‖₁
+/// evicted_vnorm = Σ_{t∈evicted} ‖V(h,t)‖₁
+/// raw[h]        = evicted_vnorm / total_vnorm       (clamp [0,1])
+/// normalized[h] = evicted_vnorm / remaining_vnorm
+/// ```
+pub fn compute_sliding_qcf_attn(
+    evicted_positions: &[usize],
+    cache: &KVCache,
+    current_pos: usize,
+    config: &QcfConfig,
+) -> QcfMetric {
+    let kv_heads = cache.kv_heads();
+    let head_dim = cache.head_dim();
+    let capacity = cache.capacity();
+    let layout = cache.layout();
+    let epsilon = config.epsilon;
+
+    if evicted_positions.is_empty() || current_pos == 0 || kv_heads == 0 {
+        return QcfMetric {
+            action: "sliding_attn".to_string(),
+            raw_value: 0.0,
+            normalized_value: 0.0,
+            per_head: None,
+            tokens_affected: 0,
+        };
+    }
+
+    let v_data = cache.v_buffer.as_slice::<f32>();
+    let mut per_head_raw = vec![0.0f32; kv_heads];
+    let mut per_head_normalized = vec![0.0f32; kv_heads];
+
+    for h in 0..kv_heads {
+        let mut total_vnorm = 0.0f32;
+        let mut evicted_vnorm = 0.0f32;
+
+        // total V-norm over all active positions
+        for pos in 0..current_pos {
+            let offset = compute_v_offset(layout, h, pos, head_dim, capacity, kv_heads);
+            total_vnorm += l1_norm(&v_data[offset..offset + head_dim]);
+        }
+
+        // evicted V-norm
+        for &pos in evicted_positions {
+            if pos < current_pos {
+                let offset = compute_v_offset(layout, h, pos, head_dim, capacity, kv_heads);
+                evicted_vnorm += l1_norm(&v_data[offset..offset + head_dim]);
+            }
+        }
+
+        per_head_raw[h] = if total_vnorm > epsilon {
+            (evicted_vnorm / total_vnorm).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let remaining_vnorm = total_vnorm - evicted_vnorm;
+        per_head_normalized[h] = if remaining_vnorm > epsilon {
+            evicted_vnorm / remaining_vnorm
+        } else {
+            0.0
+        };
+    }
+
+    let raw_value = aggregate_heads(&per_head_raw, &config.aggregation);
+    let normalized_value = aggregate_heads(&per_head_normalized, &config.aggregation);
 
     QcfMetric {
         action: "sliding_attn".to_string(),
         raw_value,
-        per_head: None,
-        tokens_affected: prune_count,
+        normalized_value,
+        per_head: Some(per_head_raw),
+        tokens_affected: evicted_positions.len(),
     }
 }
 
@@ -218,6 +291,7 @@ pub fn compute_eviction_qcf_caote(
         return QcfMetric {
             action: "eviction_caote".to_string(),
             raw_value: 0.0,
+            normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
             tokens_affected: 0,
         };
@@ -297,6 +371,7 @@ pub fn compute_eviction_qcf_caote(
     QcfMetric {
         action: "eviction_caote".to_string(),
         raw_value,
+        normalized_value: raw_value, // CAOTE is already a normalized error metric
         per_head: Some(per_head),
         tokens_affected: evicted_positions.len(),
     }
@@ -408,11 +483,17 @@ mod tests {
 
         assert_eq!(metric.action, "eviction_attn");
         assert_eq!(metric.tokens_affected, 2);
-        // With uniform V norms and uniform attn: proxy = 2/8 = 0.25
+        // With uniform V norms and uniform attn: raw = 2/8 = 0.25
         assert!(
             (metric.raw_value - 0.25).abs() < 0.01,
-            "expected ~0.25, got {}",
+            "expected raw ~0.25, got {}",
             metric.raw_value
+        );
+        // normalized = evicted / remaining = 0.25 / (1 - 0.25) ≈ 0.333
+        assert!(
+            (metric.normalized_value - 1.0 / 3.0).abs() < 0.01,
+            "expected normalized ~0.333, got {}",
+            metric.normalized_value
         );
     }
 
@@ -428,6 +509,7 @@ mod tests {
         let all_scores = vec![1.0f32; 10];
         let metric = compute_eviction_qcf_attn(&[], &all_scores, &cache, &config);
         assert_eq!(metric.raw_value, 0.0);
+        assert_eq!(metric.normalized_value, 0.0);
         assert_eq!(metric.tokens_affected, 0);
     }
 
@@ -469,26 +551,80 @@ mod tests {
             metric_high.raw_value,
             metric_low.raw_value
         );
+        // normalized_value should also reflect this ordering
+        assert!(
+            metric_high.normalized_value > metric_low.normalized_value,
+            "normalized: high({}) > low({})",
+            metric_high.normalized_value,
+            metric_low.normalized_value
+        );
     }
 
     #[test]
     fn test_sliding_proxy() {
-        let metric = compute_sliding_qcf_attn(10, 100);
+        // 20 tokens, each V = [1,1,1,1] (L1 = 4), evict 2 oldest → raw = 2/20 = 0.1
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 20;
+        let max_seq = 64; // make_cache_with_v_data uses max_seq=64 internally
+        let v_data = vec![1.0f32; max_seq * kv_heads * head_dim];
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+        let evicted_positions: Vec<usize> = vec![0, 1];
+        let metric = compute_sliding_qcf_attn(&evicted_positions, &cache, num_tokens, &config);
+
         assert_eq!(metric.action, "sliding_attn");
-        assert!((metric.raw_value - 0.1).abs() < 1e-6);
-        assert_eq!(metric.tokens_affected, 10);
+        assert!(
+            (metric.raw_value - 0.1).abs() < 1e-5,
+            "raw={}",
+            metric.raw_value
+        );
+        assert_eq!(metric.tokens_affected, 2);
+        // normalized = 0.1 / 0.9 ≈ 0.111
+        assert!(
+            (metric.normalized_value - 1.0 / 9.0).abs() < 1e-4,
+            "normalized={}",
+            metric.normalized_value
+        );
     }
 
     #[test]
     fn test_sliding_proxy_zero_total() {
-        let metric = compute_sliding_qcf_attn(0, 0);
+        // Empty evicted positions → raw = 0
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 0;
+        let max_seq = 64;
+        let v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+        let metric = compute_sliding_qcf_attn(&[], &cache, 0, &config);
         assert_eq!(metric.raw_value, 0.0);
+        assert_eq!(metric.normalized_value, 0.0);
     }
 
     #[test]
     fn test_sliding_proxy_full_eviction() {
-        let metric = compute_sliding_qcf_attn(50, 50);
-        assert!((metric.raw_value - 1.0).abs() < 1e-6);
+        // All 50 tokens evicted → raw = 1.0
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 50;
+        let max_seq = 64;
+        let v_data = vec![1.0f32; max_seq * kv_heads * head_dim];
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+        let evicted_positions: Vec<usize> = (0..50).collect();
+        let metric = compute_sliding_qcf_attn(&evicted_positions, &cache, num_tokens, &config);
+        assert!(
+            (metric.raw_value - 1.0).abs() < 1e-5,
+            "raw={}",
+            metric.raw_value
+        );
+        // remaining ≈ 0, so normalized = 0.0 (division guard)
+        assert!(metric.normalized_value >= 0.0);
     }
 
     #[test]
@@ -827,5 +963,176 @@ mod tests {
     fn test_l2_norm() {
         assert!((l2_norm(&[3.0, 4.0]) - 5.0).abs() < 1e-6);
         assert_eq!(l2_norm(&[]), 0.0);
+    }
+
+    // ── New tests for normalized_value ──
+
+    /// H2O evicts low-importance tokens → lower normalized_value than
+    /// Sliding which evicts oldest (possibly high-V-norm) tokens.
+    ///
+    /// Setup: 8 tokens. Tokens 0..4 have low V-norm (1.0), tokens 4..8 have high V-norm (10.0).
+    /// - H2O: evicts low-importance (position 0, low attn) → evicts low V-norm tokens
+    /// - Sliding: evicts oldest (positions 0..2) but here we specifically choose high V-norm
+    ///   tokens (positions 4..6) to force sliding_normalized > h2o_normalized.
+    #[test]
+    fn test_normalized_h2o_vs_sliding() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 8;
+        let max_seq = 64;
+
+        // Tokens 0..4: V-norm = 1.0 × head_dim = 4.0 each
+        // Tokens 4..8: V-norm = 10.0 × head_dim = 40.0 each
+        let mut v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
+        for t in 0..4 {
+            for d in 0..head_dim {
+                v_data[t * head_dim + d] = 1.0;
+            }
+        }
+        for t in 4..8 {
+            for d in 0..head_dim {
+                v_data[t * head_dim + d] = 10.0;
+            }
+        }
+
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+
+        // H2O: evicts 2 low-norm tokens (positions 0, 1)
+        // total_imp = Σ attn×vnorm; with uniform attn=1.0:
+        //   total = 4×4 + 4×40 = 16+160 = 176
+        //   evicted = 2×4 = 8 → raw = 8/176 ≈ 0.045, normalized = 8/168 ≈ 0.048
+        let all_scores = vec![1.0f32; num_tokens];
+        let h2o_evicted = vec![(0usize, 1.0f32), (1, 1.0)];
+        let h2o_metric = compute_eviction_qcf_attn(&h2o_evicted, &all_scores, &cache, &config);
+
+        // Sliding: evicts 2 high-norm tokens (positions 4, 5) (oldest in the high-value region)
+        //   evicted = 2×40 = 80 → raw = 80/176 ≈ 0.455, normalized = 80/96 ≈ 0.833
+        let sliding_evicted_pos = vec![4usize, 5];
+        let sliding_metric =
+            compute_sliding_qcf_attn(&sliding_evicted_pos, &cache, num_tokens, &config);
+
+        assert!(
+            h2o_metric.normalized_value < sliding_metric.normalized_value,
+            "H2O normalized ({:.4}) should be < Sliding normalized ({:.4}) when H2O evicts low-norm tokens",
+            h2o_metric.normalized_value,
+            sliding_metric.normalized_value
+        );
+    }
+
+    /// Verify sliding QCF with non-uniform V-norms.
+    #[test]
+    fn test_sliding_vnorm_nonuniform() {
+        // 4 tokens: V-norm values [1, 1, 10, 10] × head_dim
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 4;
+        let max_seq = 64;
+
+        let mut v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
+        for d in 0..head_dim {
+            v_data[0 * head_dim + d] = 1.0;
+            v_data[1 * head_dim + d] = 1.0;
+            v_data[2 * head_dim + d] = 10.0;
+            v_data[3 * head_dim + d] = 10.0;
+        }
+
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+
+        // Evict positions 0, 1 (low-norm): total_vnorm = (1+1+10+10)*4 = 88
+        //   evicted_vnorm = (1+1)*4 = 8
+        //   raw = 8/88 ≈ 0.0909, normalized = 8/80 = 0.1
+        let evicted = vec![0usize, 1];
+        let metric = compute_sliding_qcf_attn(&evicted, &cache, num_tokens, &config);
+
+        assert_eq!(metric.action, "sliding_attn");
+        assert_eq!(metric.tokens_affected, 2);
+        assert!(
+            (metric.raw_value - 8.0 / 88.0).abs() < 1e-4,
+            "raw={}",
+            metric.raw_value
+        );
+        assert!(
+            (metric.normalized_value - 8.0 / 80.0).abs() < 1e-4,
+            "norm={}",
+            metric.normalized_value
+        );
+
+        // Evict positions 2, 3 (high-norm): evicted_vnorm = 80
+        //   raw = 80/88 ≈ 0.909, normalized = 80/8 = 10.0
+        let evicted_high = vec![2usize, 3];
+        let metric_high = compute_sliding_qcf_attn(&evicted_high, &cache, num_tokens, &config);
+        assert!(
+            (metric_high.raw_value - 80.0 / 88.0).abs() < 1e-4,
+            "raw_high={}",
+            metric_high.raw_value
+        );
+        assert!(
+            (metric_high.normalized_value - 10.0).abs() < 1e-3,
+            "norm_high={}",
+            metric_high.normalized_value
+        );
+    }
+
+    /// Verify multi-head sliding QCF with V-norm.
+    #[test]
+    fn test_sliding_vnorm_per_head() {
+        // 2 heads, 2 tokens each.
+        // Head 0: all V = [1,1,1,1] → L1 = 4 each
+        // Head 1: token 0 = [5,5,5,5] (L1=20), token 1 = [1,1,1,1] (L1=4)
+        // HeadMajor layout: head * max_seq * head_dim + pos * head_dim
+        let kv_heads = 2;
+        let head_dim = 4;
+        let num_tokens = 2;
+        let max_seq = 64;
+
+        let mut v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
+        // Head 0
+        for t in 0..2 {
+            for d in 0..head_dim {
+                v_data[0 * max_seq * head_dim + t * head_dim + d] = 1.0;
+            }
+        }
+        // Head 1: token 0 high, token 1 low
+        for d in 0..head_dim {
+            v_data[1 * max_seq * head_dim + 0 * head_dim + d] = 5.0;
+            v_data[1 * max_seq * head_dim + 1 * head_dim + d] = 1.0;
+        }
+
+        let cache =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
+        let config = QcfConfig::default();
+
+        // Evict position 0
+        // Head 0: total=8, evicted=4 → raw=0.5, norm=4/4=1.0
+        // Head 1: total=24, evicted=20 → raw=20/24≈0.833, norm=20/4=5.0
+        let evicted = vec![0usize];
+        let metric = compute_sliding_qcf_attn(&evicted, &cache, num_tokens, &config);
+
+        assert_eq!(metric.action, "sliding_attn");
+        assert_eq!(metric.tokens_affected, 1);
+
+        let ph = metric.per_head.as_ref().unwrap();
+        assert_eq!(ph.len(), 2);
+        // Head 0: raw ≈ 0.5
+        assert!((ph[0] - 0.5).abs() < 1e-4, "head0 raw={}", ph[0]);
+        // Head 1: raw ≈ 0.833
+        assert!((ph[1] - 20.0 / 24.0).abs() < 1e-4, "head1 raw={}", ph[1]);
+
+        // Mean raw = (0.5 + 0.833) / 2 ≈ 0.667
+        assert!(
+            (metric.raw_value - (0.5 + 20.0 / 24.0) / 2.0).abs() < 1e-4,
+            "raw={}",
+            metric.raw_value
+        );
+        // Mean normalized = (1.0 + 5.0) / 2 = 3.0
+        assert!(
+            (metric.normalized_value - 3.0).abs() < 1e-4,
+            "norm={}",
+            metric.normalized_value
+        );
     }
 }

@@ -82,6 +82,7 @@ pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetr
         return QcfMetric {
             action: "kivi".to_string(),
             raw_value: 0.0,
+            normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
             tokens_affected: 0,
         };
@@ -93,6 +94,7 @@ pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetr
         return QcfMetric {
             action: "kivi".to_string(),
             raw_value: 0.0,
+            normalized_value: 0.0,
             per_head: Some(vec![0.0; kv_heads]),
             tokens_affected: flush_tokens,
         };
@@ -161,6 +163,7 @@ pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetr
     QcfMetric {
         action: "kivi".to_string(),
         raw_value,
+        normalized_value: raw_value, // NMSE is already a normalized metric
         per_head: Some(per_head),
         tokens_affected: flush_tokens,
     }

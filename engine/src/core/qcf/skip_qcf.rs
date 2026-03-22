@@ -57,6 +57,7 @@ impl SkipQcfTracker {
         QcfMetric {
             action: "swift".to_string(),
             raw_value,
+            normalized_value: raw_value, // rejection rate is already normalized
             per_head: None,
             tokens_affected: self.total_drafted,
         }

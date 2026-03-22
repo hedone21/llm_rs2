@@ -27,6 +27,10 @@ pub struct QcfMetric {
     pub action: String,
     /// Aggregated QCF value in [0, 1] range (higher = more degradation).
     pub raw_value: f32,
+    /// Normalized QCF value for cross-policy comparison.
+    /// For eviction: `evicted_importance / remaining_importance` (unbounded above 1).
+    /// For non-eviction actions: same as `raw_value`.
+    pub normalized_value: f32,
     /// Per-head QCF values (if applicable). Layout: `[n_kv_heads]`.
     pub per_head: Option<Vec<f32>>,
     /// Number of tokens affected by the action.

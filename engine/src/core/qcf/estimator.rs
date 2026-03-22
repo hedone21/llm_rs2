@@ -221,6 +221,7 @@ mod tests {
         let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.3,
+            normalized_value: 0.3,
             per_head: None,
             tokens_affected: 10,
         };
@@ -234,6 +235,7 @@ mod tests {
         let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 5.0, // Would give d=5.0 but clamped to 2.0
+            normalized_value: 5.0,
             per_head: None,
             tokens_affected: 10,
         };
@@ -247,6 +249,7 @@ mod tests {
         let metric = QcfMetric {
             action: "unknown_action".to_string(),
             raw_value: 0.5,
+            normalized_value: 0.5,
             per_head: None,
             tokens_affected: 1,
         };
@@ -264,6 +267,7 @@ mod tests {
         let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.1, // Below breakpoint: 2.0 * 0.1 = 0.2
+            normalized_value: 0.1,
             per_head: None,
             tokens_affected: 5,
         };
@@ -293,6 +297,7 @@ mod tests {
         let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.3,
+            normalized_value: 0.3,
             per_head: None,
             tokens_affected: 5,
         };
@@ -338,6 +343,7 @@ mod tests {
         let metric = QcfMetric {
             action: "eviction".to_string(),
             raw_value: 0.2,
+            normalized_value: 0.2,
             per_head: None,
             tokens_affected: 5,
         };
