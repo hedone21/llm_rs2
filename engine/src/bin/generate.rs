@@ -922,12 +922,8 @@ fn main() -> anyhow::Result<()> {
         backend.clone(),
     );
 
-    // Cache EOS token ID
-    let eos_id = tokenizer
-        .get_vocab(true)
-        .get("</s>")
-        .copied()
-        .unwrap_or(u32::MAX);
+    // Cache EOS token ID from config.json (model-agnostic)
+    let eos_id = model.config.eos_token_id;
 
     // === WARMUP: trigger DVFS ramp-up before timed prefill ===
     // Runs a forward pass and brief CPU spin to ensure governor reaches max clock.
@@ -3159,11 +3155,7 @@ fn run_kivi(
         Arc::new(CpuBackend::new()),
     );
 
-    let eos_id = tokenizer
-        .get_vocab(true)
-        .get("</s>")
-        .copied()
-        .unwrap_or(u32::MAX);
+    let eos_id = model.config.eos_token_id;
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;
@@ -3553,11 +3545,7 @@ fn run_offload(
         Arc::new(CpuBackend::new()),
     );
 
-    let eos_id = tokenizer
-        .get_vocab(true)
-        .get("</s>")
-        .copied()
-        .unwrap_or(u32::MAX);
+    let eos_id = model.config.eos_token_id;
 
     let mut prefetch =
         llm_rs2::core::offload::prefetch::PrefetchController::new(max_prefetch_depth, num_layers);

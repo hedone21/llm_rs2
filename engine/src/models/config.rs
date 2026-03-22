@@ -26,6 +26,7 @@ pub struct ModelConfig {
     pub rope_theta: f64,
     pub has_qkv_bias: bool,
     pub tie_word_embeddings: bool,
+    pub eos_token_id: u32,
 }
 
 /// Raw HuggingFace config.json — supports both Llama and Qwen2 via Option fields.
@@ -43,6 +44,7 @@ struct RawHfConfig {
     rms_norm_eps: Option<f64>,
     rope_theta: Option<f64>,
     tie_word_embeddings: Option<bool>,
+    eos_token_id: Option<u32>,
 }
 
 impl ModelConfig {
@@ -77,6 +79,7 @@ impl ModelConfig {
             rope_theta: raw.rope_theta.unwrap_or(10000.0),
             has_qkv_bias,
             tie_word_embeddings: raw.tie_word_embeddings.unwrap_or(false),
+            eos_token_id: raw.eos_token_id.unwrap_or(u32::MAX),
         })
     }
 
@@ -129,6 +132,7 @@ mod tests {
         assert_eq!(config.num_hidden_layers, 16);
         assert_eq!(config.num_attention_heads, 32);
         assert_eq!(config.num_key_value_heads, 8);
+        assert_eq!(config.eos_token_id, 128001);
     }
 
     #[test]
@@ -151,5 +155,6 @@ mod tests {
         assert_eq!(config.num_attention_heads, 12);
         assert_eq!(config.num_key_value_heads, 2);
         assert!(config.tie_word_embeddings);
+        assert_eq!(config.eos_token_id, 151643);
     }
 }

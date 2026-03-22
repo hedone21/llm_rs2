@@ -422,11 +422,7 @@ fn main() -> anyhow::Result<()> {
         current_backend.clone(),
     );
 
-    let eos_id = tokenizer
-        .get_vocab(true)
-        .get("</s>")
-        .copied()
-        .unwrap_or(u32::MAX);
+    let eos_id = model.config.eos_token_id;
 
     // === PREFILL ===
     {
