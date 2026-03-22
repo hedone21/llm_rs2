@@ -66,6 +66,8 @@ def run_ppl(text_file: str, policy: str, budget: int, **extra_args) -> dict:
     if policy in ("h2o", "h2o_plus"):
         cmd += ["--h2o-keep-ratio", str(extra_args.get("keep_ratio", 0.5))]
 
+    cmd += ["--qcf-mode", "both"]
+
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     if result.returncode != 0:
         print(f"[ERROR] PPL failed: {result.stderr[-500:]}", file=sys.stderr)
@@ -151,6 +153,8 @@ def run_eval_ll(batch_json_path: str, policy: str, budget: int,
 
     if policy in ("h2o", "h2o_plus"):
         cmd += ["--h2o-keep-ratio", str(extra_args.get("keep_ratio", 0.5))]
+
+    cmd += ["--qcf-mode", "both"]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if result.returncode != 0:
