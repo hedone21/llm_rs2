@@ -419,7 +419,27 @@ fn main() -> anyhow::Result<()> {
             num_layers,
             max_seq_len,
             args.kivi_residual_size,
+            &prompt,
         );
+    }
+
+    // ── KIVI + PPL mode: KiviCache with perplexity evaluation ──
+    if args.kivi {
+        if let Some(ref ppl_path) = args.ppl {
+            return run_kivi_ppl(
+                &args,
+                &model,
+                &tokenizer,
+                &backend,
+                &memory,
+                kv_heads,
+                head_dim,
+                num_layers,
+                max_seq_len,
+                args.kivi_residual_size,
+                ppl_path,
+            );
+        }
     }
 
     // ── KIVI mode: separate path with KiviCache ──
@@ -2654,6 +2674,7 @@ fn run_kivi_eval_ll(
     num_layers: usize,
     max_seq_len: usize,
     residual_size: usize,
+    resolved_prompt: &str,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
@@ -2674,7 +2695,7 @@ fn run_kivi_eval_ll(
         let cont = args.eval_continuation.as_deref().ok_or_else(|| {
             anyhow::anyhow!("--eval-ll requires --eval-continuation or --eval-batch")
         })?;
-        let prompt_text = args.prompt.as_str();
+        let prompt_text = resolved_prompt;
         vec![serde_json::json!({
             "id": "single",
             "prompt": prompt_text,
@@ -2813,6 +2834,7 @@ fn run_kivi_eval_ll(
                 "flush": flush_count,
                 "action": metric.action,
                 "raw_value": metric.raw_value,
+                "normalized_value": metric.normalized_value,
                 "tokens_quantized": metric.tokens_affected,
             }));
             flush_count += 1;
@@ -2898,6 +2920,7 @@ fn run_kivi_eval_ll(
                             "flush": flush_count,
                             "action": metric.action,
                             "raw_value": metric.raw_value,
+                            "normalized_value": metric.normalized_value,
                             "tokens_quantized": metric.tokens_affected,
                         }));
                         flush_count += 1;
@@ -2967,6 +2990,10 @@ fn run_kivi_eval_ll(
             .iter()
             .filter_map(|m| m["raw_value"].as_f64())
             .sum();
+        let qcf_normalized_total: f64 = qcf_metrics
+            .iter()
+            .filter_map(|m| m["normalized_value"].as_f64())
+            .sum();
         results.push(serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
@@ -2985,6 +3012,7 @@ fn run_kivi_eval_ll(
             "qcf_metrics": qcf_metrics,
             "qcf_total": qcf_total,
             "qcf_attn_total": qcf_total,
+            "qcf_attn_normalized_total": qcf_normalized_total,
         }));
         // Note: KIVI mode uses quantization QCF, not eviction. CAOTE not applicable.
     }
@@ -3003,6 +3031,299 @@ fn run_kivi_eval_ll(
     });
 
     println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+// ── KIVI + PPL mode: KiviCache-based perplexity evaluation ───────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn run_kivi_ppl(
+    args: &Args,
+    model: &TransformerModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &Arc<dyn Memory>,
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    max_seq_len: usize,
+    residual_size: usize,
+    text_file: &str,
+) -> anyhow::Result<()> {
+    use llm_rs2::core::kv_cache::KVCacheOps;
+
+    let hidden_size = model.config.hidden_size;
+    let vocab_size = model.config.vocab_size;
+
+    // ── 1. Read and tokenize reference text ──
+    let text = std::fs::read_to_string(text_file)
+        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", text_file, e))?;
+    let encoding = tokenizer
+        .encode(text.as_str(), true)
+        .map_err(|e| anyhow::anyhow!("Tokenize error: {}", e))?;
+    let all_ids: Vec<u32> = encoding.get_ids().to_vec();
+    let total_tokens = all_ids.len();
+
+    if total_tokens < 2 {
+        anyhow::bail!("PPL requires at least 2 tokens, got {}", total_tokens);
+    }
+
+    let eval_tokens = total_tokens.min(max_seq_len);
+    if total_tokens > max_seq_len {
+        eprintln!(
+            "[KIVI-PPL] Warning: text has {} tokens, truncating to max_seq_len={}",
+            total_tokens, max_seq_len
+        );
+    }
+    let token_ids = &all_ids[..eval_tokens];
+
+    eprintln!(
+        "[KIVI-PPL] {} tokens, kivi_residual_size={}, max_seq_len={}",
+        eval_tokens, residual_size, max_seq_len
+    );
+
+    // ── 2. Create KiviCache per layer ──
+    let mut kv_caches: Vec<KiviCache> = (0..num_layers)
+        .map(|_| KiviCache::new(kv_heads, head_dim, max_seq_len, residual_size))
+        .collect();
+
+    // ── 3. Pre-allocate decode buffers ──
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut decode_logits =
+        Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let q_dim = model.config.num_attention_heads * head_dim;
+    let k_dim = kv_heads * head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = model.config.intermediate_size;
+    let mut gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len: args.max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+    let mut logits_cpu = vec![0.0f32; vocab_size];
+
+    let mut total_nll: f64 = 0.0;
+    let mut nll_count: usize = 0;
+    let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
+    let mut flush_count: usize = 0;
+    let overall_start = std::time::Instant::now();
+
+    // ── 4. Prefill phase ──
+    let prefill_len = eval_tokens.min(max_seq_len);
+    eprintln!("[KIVI-PPL] Prefill: {} tokens", prefill_len);
+
+    {
+        let cpu_backend = Arc::new(CpuBackend::new());
+        let input_buf = Galloc::new().alloc(prefill_len * 4, DType::U8)?;
+        unsafe {
+            let ptr = input_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in token_ids[..prefill_len].iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_input = Tensor::new(Shape::new(vec![1, prefill_len]), input_buf, cpu_backend);
+        let input_tensor = backend.copy_from(&cpu_input)?;
+
+        let prefill_logits_buf = memory.alloc(prefill_len * vocab_size * 4, DType::F32)?;
+        let mut prefill_logits = Tensor::new(
+            Shape::new(vec![1, prefill_len, vocab_size]),
+            prefill_logits_buf,
+            backend.clone(),
+        );
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos: 0,
+            kv_caches: &mut kv_caches,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut prefill_logits,
+            x_gen: None,
+            workspace: None,
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+        })?;
+
+        // Collect flush QCF metrics from prefill
+        for metric in kv_caches[0].take_flush_proxies() {
+            qcf_metrics.push(serde_json::json!({
+                "flush": flush_count,
+                "action": metric.action,
+                "raw_value": metric.raw_value,
+                "normalized_value": metric.normalized_value,
+                "tokens_quantized": metric.tokens_affected,
+            }));
+            flush_count += 1;
+        }
+        for cache in kv_caches[1..].iter_mut() {
+            cache.take_flush_proxies();
+        }
+
+        // Read all prefill logits to CPU
+        let mut all_logits = vec![0.0f32; prefill_len * vocab_size];
+        unsafe {
+            let ptr = all_logits.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, all_logits.len() * 4);
+            backend.read_buffer(&prefill_logits, slice)?;
+        }
+
+        // Score tokens 1..prefill_len: logits[i] predicts token[i+1]
+        for i in 0..prefill_len - 1 {
+            let offset = i * vocab_size;
+            let lp = sampling::compute_log_prob(
+                &all_logits[offset..offset + vocab_size],
+                token_ids[i + 1],
+                vocab_size,
+            );
+            total_nll -= lp;
+            nll_count += 1;
+        }
+
+        eprintln!(
+            "[KIVI-PPL] Prefill NLL: {:.4}, count={}, running PPL={:.4}, Q2_tokens={}, res_pos={}",
+            total_nll,
+            nll_count,
+            (total_nll / nll_count as f64).exp(),
+            kv_caches[0].q2_tokens,
+            kv_caches[0].res_pos,
+        );
+    }
+
+    // ── 5. Decode phase (teacher-forcing) ──
+    let mut start_pos = prefill_len;
+
+    for i in prefill_len..eval_tokens - 1 {
+        let input_token = token_ids[i];
+        let target_token = token_ids[i + 1];
+
+        // Feed true token
+        unsafe {
+            *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = input_token;
+        }
+        let gen_input = backend.copy_from(&cpu_gen_input)?;
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &gen_input,
+            start_pos,
+            kv_caches: &mut kv_caches,
+            backend,
+            memory: memory.as_ref(),
+            logits_out: &mut decode_logits,
+            x_gen: Some(&mut x_gen),
+            workspace: Some(&mut gen_ws),
+            use_gpu_attn: args.gpu_attn,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+        })?;
+        start_pos += 1;
+
+        // Collect flush QCF from decode step
+        for metric in kv_caches[0].take_flush_proxies() {
+            qcf_metrics.push(serde_json::json!({
+                "flush": flush_count,
+                "action": metric.action,
+                "raw_value": metric.raw_value,
+                "normalized_value": metric.normalized_value,
+                "tokens_quantized": metric.tokens_affected,
+            }));
+            flush_count += 1;
+        }
+        for cache in kv_caches[1..].iter_mut() {
+            cache.take_flush_proxies();
+        }
+
+        // Read logits and score target
+        unsafe {
+            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+            backend.read_buffer(&decode_logits, slice)?;
+        }
+        let lp = sampling::compute_log_prob(&logits_cpu, target_token, vocab_size);
+        total_nll -= lp;
+        nll_count += 1;
+
+        // Progress
+        if (i + 1) % 200 == 0 {
+            let ppl = (total_nll / nll_count as f64).exp();
+            eprintln!(
+                "[KIVI-PPL] step {}/{}: NLL={:.4}, PPL={:.4}, cache_pos={}, Q2_tokens={}",
+                i + 1,
+                eval_tokens,
+                total_nll,
+                ppl,
+                kv_caches[0].current_pos(),
+                kv_caches[0].q2_tokens,
+            );
+        }
+    }
+
+    // ── 6. Output results ──
+    let wall_time = overall_start.elapsed().as_secs_f64();
+    let ppl = (total_nll / nll_count as f64).exp();
+    let tok_per_sec = nll_count as f64 / wall_time;
+
+    let qcf_total: f64 = qcf_metrics
+        .iter()
+        .filter_map(|m| m["raw_value"].as_f64())
+        .sum();
+    let qcf_normalized_total: f64 = qcf_metrics
+        .iter()
+        .filter_map(|m| m["normalized_value"].as_f64())
+        .sum();
+
+    let output = serde_json::json!({
+        "ppl": ppl,
+        "total_nll": total_nll,
+        "token_count": nll_count,
+        "tokens_per_second": tok_per_sec,
+        "wall_time_s": wall_time,
+        "qcf_metrics": qcf_metrics,
+        "flush_count": qcf_metrics.len(),
+        "qcf_total": qcf_total,
+        "qcf_attn_total": qcf_total,
+        "qcf_attn_normalized_total": qcf_normalized_total,
+        "final_cache_pos": kv_caches[0].current_pos(),
+        "kivi_q2_tokens": kv_caches[0].q2_tokens,
+        "kivi_res_pos": kv_caches[0].res_pos,
+        "config": {
+            "model": args.model_path,
+            "text_file": text_file,
+            "eviction_policy": "kivi",
+            "kivi_residual_size": residual_size,
+            "max_seq_len": max_seq_len,
+            "kv_type": "q2+f32_residual",
+        }
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+
+    eprintln!(
+        "\n[KIVI-PPL] Final: PPL={:.4}, NLL={:.4}, tokens={}, {:.1} tok/s, {:.1}s, Q2_tokens={}",
+        ppl, total_nll, nll_count, tok_per_sec, wall_time, kv_caches[0].q2_tokens
+    );
+
     Ok(())
 }
 
