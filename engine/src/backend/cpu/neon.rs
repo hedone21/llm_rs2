@@ -648,15 +648,19 @@ impl CpuBackendNeon {
     }
 
     /// NEON vectorized silu: x / (1 + exp(-x))
+    /// Uses scalar exp() per lane for correctness on all ARM64 implementations.
     #[inline(always)]
     unsafe fn v_silu(x: float32x4_t) -> float32x4_t {
-        let neg_x = vnegq_f32(x);
-        let exp_neg_x = Self::v_expf(neg_x);
-        let one_plus = vaddq_f32(vdupq_n_f32(1.0), exp_neg_x);
-        vdivq_f32(x, one_plus)
+        // Scalar exp per lane — avoids v_expf bit-manipulation issues on Apple Silicon
+        let mut vals = [0.0f32; 4];
+        vst1q_f32(vals.as_mut_ptr(), x);
+        for v in vals.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp());
+        }
+        vld1q_f32(vals.as_ptr())
     }
 
-    /// NEON vectorized swiglu: silu(a) * b — matches llama.cpp's ggml_vec_swiglu_f32.
+    /// NEON vectorized swiglu: silu(a) * b
     #[target_feature(enable = "neon")]
     unsafe fn swiglu_neon(a: &mut [f32], b: &[f32]) {
         let n = a.len();
