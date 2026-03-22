@@ -1621,6 +1621,41 @@ mod tests {
     }
 
     #[test]
+    fn test_silu_mul_large_values_oracle() {
+        // Test with large values ([-100, 100]) to catch exp() approximation errors.
+        // Qwen 2.5 gate values reach ~52, which triggered NaN with buggy v_expf.
+        let n = 256;
+        let a_data: Vec<f32> = (0..n)
+            .map(|i| (i as f32 / n as f32) * 200.0 - 100.0) // [-100, 100]
+            .collect();
+        let b_data: Vec<f32> = (0..n)
+            .map(|i| ((i as f32 * 1.7 + 3.0) % 100.0) - 50.0) // [-50, 50]
+            .collect();
+
+        let scalar = scalar_backend();
+        let auto = auto_backend();
+
+        let mut a_s = make_f32_tensor(&scalar, vec![1, n], &a_data);
+        let b_s = make_f32_tensor(&scalar, vec![1, n], &b_data);
+        let mut a_a = make_f32_tensor(&auto, vec![1, n], &a_data);
+        let b_a = make_f32_tensor(&auto, vec![1, n], &b_data);
+
+        scalar.silu_mul(&mut a_s, &b_s).unwrap();
+        auto.silu_mul(&mut a_a, &b_a).unwrap();
+
+        let result_s = a_s.as_slice::<f32>();
+        let result_a = a_a.as_slice::<f32>();
+
+        // No NaN allowed
+        assert!(
+            !result_a.iter().any(|v| v.is_nan()),
+            "silu_mul produced NaN for large values"
+        );
+
+        assert_close(result_s, result_a, 1e-4, "silu_mul_large_values");
+    }
+
+    #[test]
     fn test_add_assign_oracle() {
         let n = 64;
         let a_data = gen_data(n, 7);
