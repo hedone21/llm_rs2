@@ -887,6 +887,7 @@ fn main() -> anyhow::Result<()> {
             &prompt,
             actual_protected_prefix,
             skip_config.as_ref(),
+            score_based_eviction,
         );
     }
 
@@ -1898,6 +1899,7 @@ fn run_eval_ll(
     default_prompt: &str,
     protected_prefix: usize,
     skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
+    score_based_eviction: bool,
 ) -> anyhow::Result<()> {
     let hidden_size = model.config.hidden_size;
 
@@ -2257,64 +2259,71 @@ fn run_eval_ll(
                     let before_len = kv_caches[0].current_pos;
                     let ratio = effective_budget as f32 / before_len as f32;
 
-                    let result = if let Some(acc) = score_accumulator.as_ref() {
-                        if acc.is_active() {
-                            let scores = acc.importance_scores();
-                            let target_len = ((before_len as f32) * ratio) as usize;
-                            let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
-                                scores,
-                                protected_prefix,
-                                args.h2o_keep_ratio,
-                                before_len,
-                                target_len,
-                            );
-                            if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty()
-                            {
-                                if qcf_config.mode.has_attn() {
-                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
-                                        &evicted,
-                                        scores,
-                                        &kv_caches[0],
-                                        &qcf_config,
-                                    );
-                                    qcf_metrics.push(serde_json::json!({
-                                        "step": decode_idx,
-                                        "action": metric.action,
-                                        "raw_value": metric.raw_value,
-                                        "normalized_value": metric.normalized_value,
-                                        "tokens_affected": metric.tokens_affected,
-                                        "cache_pos_before": before_len,
-                                    }));
-                                }
-                                if qcf_config.mode.has_caote()
-                                    && let Some(head_attn) = acc.last_step_head_attn()
+                    let result = if score_based_eviction {
+                        if let Some(acc) = score_accumulator.as_ref() {
+                            if acc.is_active() {
+                                let scores = acc.importance_scores();
+                                let target_len = ((before_len as f32) * ratio) as usize;
+                                let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
+                                    scores,
+                                    protected_prefix,
+                                    args.h2o_keep_ratio,
+                                    before_len,
+                                    target_len,
+                                );
+                                if !evicted.is_empty()
+                                    && args.kv_type == "f32"
+                                    && !kv_caches.is_empty()
                                 {
-                                    let positions: Vec<usize> =
-                                        evicted.iter().map(|(pos, _)| *pos).collect();
-                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
-                                        &positions,
-                                        head_attn,
-                                        &kv_caches[0],
-                                        &qcf_config,
-                                    );
-                                    qcf_metrics.push(serde_json::json!({
-                                        "step": decode_idx,
-                                        "action": metric.action,
-                                        "raw_value": metric.raw_value,
-                                        "normalized_value": metric.normalized_value,
-                                        "tokens_affected": metric.tokens_affected,
-                                        "cache_pos_before": before_len,
-                                    }));
+                                    if qcf_config.mode.has_attn() {
+                                        let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
+                                            &evicted,
+                                            scores,
+                                            &kv_caches[0],
+                                            &qcf_config,
+                                        );
+                                        qcf_metrics.push(serde_json::json!({
+                                            "step": decode_idx,
+                                            "action": metric.action,
+                                            "raw_value": metric.raw_value,
+                                            "normalized_value": metric.normalized_value,
+                                            "tokens_affected": metric.tokens_affected,
+                                            "cache_pos_before": before_len,
+                                        }));
+                                    }
+                                    if qcf_config.mode.has_caote()
+                                        && let Some(head_attn) = acc.last_step_head_attn()
+                                    {
+                                        let positions: Vec<usize> =
+                                            evicted.iter().map(|(pos, _)| *pos).collect();
+                                        let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                            &positions,
+                                            head_attn,
+                                            &kv_caches[0],
+                                            &qcf_config,
+                                        );
+                                        qcf_metrics.push(serde_json::json!({
+                                            "step": decode_idx,
+                                            "action": metric.action,
+                                            "raw_value": metric.raw_value,
+                                            "normalized_value": metric.normalized_value,
+                                            "tokens_affected": metric.tokens_affected,
+                                            "cache_pos_before": before_len,
+                                        }));
+                                    }
                                 }
+                                cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
+                            } else {
+                                cache_manager.force_evict(kv_caches, ratio)?
                             }
-                            cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
                         } else {
                             cache_manager.force_evict(kv_caches, ratio)?
                         }
                     } else {
+                        // Sliding/Streaming: position-based eviction
                         let r = cache_manager.force_evict(kv_caches, ratio)?;
-                        if r.evicted {
-                            if qcf_config.mode.has_attn() && args.kv_type == "f32" {
+                        if r.evicted && args.kv_type == "f32" && !kv_caches.is_empty() {
+                            if qcf_config.mode.has_attn() {
                                 let positions = llm_rs2::core::qcf::identify_evicted_sliding(
                                     protected_prefix,
                                     r.tokens_removed,
@@ -2562,6 +2571,11 @@ fn run_eval_ll(
             .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
             .filter_map(|m| m["raw_value"].as_f64())
             .sum();
+        let qcf_attn_normalized_total: f64 = qcf_metrics
+            .iter()
+            .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
+            .filter_map(|m| m["normalized_value"].as_f64())
+            .sum();
         let mut result_obj = serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
@@ -2577,6 +2591,7 @@ fn run_eval_ll(
             "qcf_metrics": qcf_metrics,
             "qcf_total": qcf_attn_total,
             "qcf_attn_total": qcf_attn_total,
+            "qcf_attn_normalized_total": qcf_attn_normalized_total,
             "final_cache_pos": kv_caches[0].current_pos,
         });
         if qcf_config.mode.has_caote() {
@@ -3718,7 +3733,7 @@ fn run_ppl(
     max_seq_len: usize,
     text_file: &str,
     auto_eviction: bool,
-    _score_based_eviction: bool,
+    score_based_eviction: bool,
     protected_prefix: usize,
     skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
 ) -> anyhow::Result<()> {
@@ -3958,65 +3973,70 @@ fn run_ppl(
                 let ratio = effective_budget as f32 / before_len as f32;
 
                 // Collect proxy metric before eviction
-                let result = if let Some(acc) = score_accumulator.as_ref() {
-                    if acc.is_active() {
-                        let scores = acc.importance_scores();
-                        // Pre-identify evicted tokens for proxy
-                        let target_len = ((before_len as f32) * ratio) as usize;
-                        let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
-                            scores,
-                            protected_prefix,
-                            args.h2o_keep_ratio,
-                            before_len,
-                            target_len,
-                        );
-                        if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty() {
-                            if qcf_config.mode.has_attn() {
-                                let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
-                                    &evicted,
-                                    scores,
-                                    &kv_caches[0],
-                                    &qcf_config,
-                                );
-                                qcf_metrics.push(serde_json::json!({
-                                    "step": i,
-                                    "action": metric.action,
-                                    "raw_value": metric.raw_value,
-                                    "normalized_value": metric.normalized_value,
-                                    "tokens_affected": metric.tokens_affected,
-                                    "cache_pos_before": before_len,
-                                }));
-                            }
-                            if qcf_config.mode.has_caote()
-                                && let Some(head_attn) = acc.last_step_head_attn()
+                let result = if score_based_eviction {
+                    if let Some(acc) = score_accumulator.as_ref() {
+                        if acc.is_active() {
+                            let scores = acc.importance_scores();
+                            // Pre-identify evicted tokens for proxy
+                            let target_len = ((before_len as f32) * ratio) as usize;
+                            let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
+                                scores,
+                                protected_prefix,
+                                args.h2o_keep_ratio,
+                                before_len,
+                                target_len,
+                            );
+                            if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty()
                             {
-                                let positions: Vec<usize> =
-                                    evicted.iter().map(|(pos, _)| *pos).collect();
-                                let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
-                                    &positions,
-                                    head_attn,
-                                    &kv_caches[0],
-                                    &qcf_config,
-                                );
-                                qcf_metrics.push(serde_json::json!({
-                                    "step": i,
-                                    "action": metric.action,
-                                    "raw_value": metric.raw_value,
-                                    "normalized_value": metric.normalized_value,
-                                    "tokens_affected": metric.tokens_affected,
-                                    "cache_pos_before": before_len,
-                                }));
+                                if qcf_config.mode.has_attn() {
+                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
+                                        &evicted,
+                                        scores,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                    );
+                                    qcf_metrics.push(serde_json::json!({
+                                        "step": i,
+                                        "action": metric.action,
+                                        "raw_value": metric.raw_value,
+                                        "normalized_value": metric.normalized_value,
+                                        "tokens_affected": metric.tokens_affected,
+                                        "cache_pos_before": before_len,
+                                    }));
+                                }
+                                if qcf_config.mode.has_caote()
+                                    && let Some(head_attn) = acc.last_step_head_attn()
+                                {
+                                    let positions: Vec<usize> =
+                                        evicted.iter().map(|(pos, _)| *pos).collect();
+                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                        &positions,
+                                        head_attn,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                    );
+                                    qcf_metrics.push(serde_json::json!({
+                                        "step": i,
+                                        "action": metric.action,
+                                        "raw_value": metric.raw_value,
+                                        "normalized_value": metric.normalized_value,
+                                        "tokens_affected": metric.tokens_affected,
+                                        "cache_pos_before": before_len,
+                                    }));
+                                }
                             }
+                            cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
+                        } else {
+                            cache_manager.force_evict(kv_caches, ratio)?
                         }
-                        cache_manager.force_evict_with_scores(kv_caches, ratio, scores)?
                     } else {
                         cache_manager.force_evict(kv_caches, ratio)?
                     }
                 } else {
-                    // Sliding window: V-norm based proxy
+                    // Sliding/Streaming: position-based eviction
                     let r = cache_manager.force_evict(kv_caches, ratio)?;
-                    if r.evicted {
-                        if qcf_config.mode.has_attn() && args.kv_type == "f32" {
+                    if r.evicted && args.kv_type == "f32" && !kv_caches.is_empty() {
+                        if qcf_config.mode.has_attn() {
                             let positions = llm_rs2::core::qcf::identify_evicted_sliding(
                                 protected_prefix,
                                 r.tokens_removed,
@@ -4099,6 +4119,22 @@ fn run_ppl(
     let ppl = (total_nll / nll_count as f64).exp();
     let tok_per_sec = nll_count as f64 / wall_time;
 
+    let qcf_attn_total: f64 = qcf_metrics
+        .iter()
+        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
+        .filter_map(|m| m["raw_value"].as_f64())
+        .sum();
+    let qcf_caote_total: f64 = qcf_metrics
+        .iter()
+        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
+        .filter_map(|m| m["raw_value"].as_f64())
+        .sum();
+    let qcf_attn_normalized_total: f64 = qcf_metrics
+        .iter()
+        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
+        .filter_map(|m| m["normalized_value"].as_f64())
+        .sum();
+
     let output = serde_json::json!({
         "ppl": ppl,
         "total_nll": total_nll,
@@ -4107,6 +4143,10 @@ fn run_ppl(
         "wall_time_s": wall_time,
         "qcf_metrics": qcf_metrics,
         "eviction_count": qcf_metrics.len(),
+        "qcf_total": qcf_attn_total,
+        "qcf_attn_total": qcf_attn_total,
+        "qcf_attn_normalized_total": qcf_attn_normalized_total,
+        "qcf_caote_total": qcf_caote_total,
         "config": {
             "model": args.model_path,
             "text_file": text_file,
