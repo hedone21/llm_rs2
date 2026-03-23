@@ -271,7 +271,7 @@ pub fn compute_flush_opr(params: &FlushQcfParams, _config: &QcfConfig) -> QcfMet
         };
     }
 
-    let raw_value: f32 = per_head_opr.iter().sum();
+    let raw_value: f32 = per_head_opr.iter().sum::<f32>() / kv_heads as f32;
 
     QcfMetric {
         action: "kivi_opr".to_string(),
@@ -585,13 +585,13 @@ mod tests {
         for (h, &opr) in ph.iter().enumerate() {
             assert!(opr >= 0.0, "head {h} OPR ({opr}) must be non-negative");
         }
-        // raw_value must equal sum of per_head
-        let expected_sum: f32 = ph.iter().sum();
+        // raw_value must equal mean of per_head
+        let expected_mean: f32 = ph.iter().sum::<f32>() / ph.len() as f32;
         assert!(
-            (metric.raw_value - expected_sum).abs() < 1e-5,
-            "raw_value ({}) must equal sum of per_head ({})",
+            (metric.raw_value - expected_mean).abs() < 1e-5,
+            "raw_value ({}) must equal mean of per_head ({})",
             metric.raw_value,
-            expected_sum
+            expected_mean
         );
     }
 }
