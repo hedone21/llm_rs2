@@ -77,6 +77,7 @@ struct KernelCache {
     kernel_scale_simple: CoreKernel,
     kernel_get_rows_q4_0: CoreKernel,
     kernel_get_rows_f32: CoreKernel,
+    kernel_get_rows_f16: CoreKernel,
     kernel_attn_gen: CoreKernel,
     kernel_cast_f32_to_f16: CoreKernel,
     kernel_attn_gen_half: CoreKernel,
@@ -203,6 +204,19 @@ impl OpenCLBackend {
             has_khr_subgroups,
             has_intel_subgroups
         );
+        // Log memory limits
+        if let Ok(global_mem) = device.info(ocl::core::DeviceInfo::GlobalMemSize) {
+            log::info!(
+                "GPU Global Memory: {} MB",
+                global_mem.to_string().trim().parse::<u64>().unwrap_or(0) / (1024 * 1024)
+            );
+        }
+        if let Ok(max_alloc) = device.info(ocl::core::DeviceInfo::MaxMemAllocSize) {
+            log::info!(
+                "GPU Max Alloc Size: {} MB",
+                max_alloc.to_string().trim().parse::<u64>().unwrap_or(0) / (1024 * 1024)
+            );
+        }
 
         let context = Context::builder()
             .platform(platform)
@@ -322,7 +336,7 @@ impl OpenCLBackend {
                 log::warn!("get_rows.cl failed: {}. Using dummy.", e);
                 Program::builder()
                     .devices(device)
-                    .src("__kernel void kernel_get_rows_q4_0() {} __kernel void kernel_get_rows_f32() {}")
+                    .src("__kernel void kernel_get_rows_q4_0() {} __kernel void kernel_get_rows_f32() {} __kernel void kernel_get_rows_f16() {}")
                     .build(&context)?
             }
         };
@@ -491,6 +505,10 @@ impl OpenCLBackend {
             kernel_get_rows_f32: ocl::core::create_kernel(
                 &get_rows_program,
                 "kernel_get_rows_f32",
+            )?,
+            kernel_get_rows_f16: ocl::core::create_kernel(
+                &get_rows_program,
+                "kernel_get_rows_f16",
             )?,
             kernel_attn_gen: ocl::core::create_kernel(&simple_ops_program, "kernel_attn_gen")?,
             kernel_cast_f32_to_f16: ocl::core::create_kernel(
@@ -1045,11 +1063,13 @@ impl Backend for OpenCLBackend {
 
     fn copy_from(&self, src: &Tensor) -> Result<Tensor> {
         let size = src.size();
-        // Use device-only memory for copies (faster)
+        // Use zero-copy unified memory (CL_MEM_ALLOC_HOST_PTR) for weight tensors.
+        // On UMA devices (Adreno), this allocates from system RAM accessible by GPU,
+        // avoiding the GPU global memory limit (~5.5GB) for large models (3B+).
         let memory = crate::backend::opencl::memory::OpenCLMemory::new(
             self.context.clone(),
             self.queue.clone(),
-            false,
+            true,
         );
         let buffer = memory.alloc(size, src.dtype())?;
 
@@ -1133,6 +1153,40 @@ impl Backend for OpenCLBackend {
                 unsafe {
                     std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn write_buffer(&self, t: &mut Tensor, src: &[u8]) -> Result<()> {
+        assert_eq!(
+            src.len(),
+            t.size(),
+            "write_buffer: size mismatch ({} vs {})",
+            src.len(),
+            t.size()
+        );
+        if let Ok(dst_mem) = get_cl_mem(t.buffer().as_ref()) {
+            // GPU buffer: use OpenCL write (blocking=true to synchronize)
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &self.queue,
+                    dst_mem,
+                    true,
+                    0,
+                    src,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        } else {
+            // Mapped / host-ptr buffer: direct memcpy
+            let dst_ptr = t.as_mut_ptr();
+            if dst_ptr.is_null() {
+                anyhow::bail!("write_buffer: null pointer in destination tensor");
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, src.len());
             }
         }
         Ok(())
@@ -1793,6 +1847,7 @@ impl Backend for OpenCLBackend {
         let ne00 = k as i32;
         let nb01 = match src.dtype() {
             DType::F32 => (k * 4) as u64,
+            DType::F16 => (k * 2) as u64,
             DType::Q4_0 => (k / 32 * 18) as u64,
             _ => {
                 return Err(anyhow!(
@@ -1815,6 +1870,7 @@ impl Backend for OpenCLBackend {
         let kernel = match src.dtype() {
             DType::Q4_0 => &kernels.kernel_get_rows_q4_0,
             DType::F32 => &kernels.kernel_get_rows_f32,
+            DType::F16 => &kernels.kernel_get_rows_f16,
             _ => return Err(anyhow!("Unsupported dtype")),
         };
 

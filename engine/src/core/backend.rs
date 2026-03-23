@@ -198,6 +198,27 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Write host bytes into a backend buffer (CPU→GPU upload).
+    /// Default: memcpy from src slice to tensor's mapped pointer.
+    /// GPU backends should override with enqueue_write_buffer.
+    fn write_buffer(&self, t: &mut Tensor, src: &[u8]) -> Result<()> {
+        let dst_ptr = t.as_mut_ptr();
+        if dst_ptr.is_null() {
+            anyhow::bail!("Cannot write to null buffer (not mapped)");
+        }
+        assert_eq!(
+            src.len(),
+            t.size(),
+            "write_buffer: size mismatch ({} vs {})",
+            src.len(),
+            t.size()
+        );
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr, src.len());
+        }
+        Ok(())
+    }
+
     // Type casting (e.g. F32 → F16)
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()>;
 

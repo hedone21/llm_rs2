@@ -48,9 +48,15 @@ fn release_source_pages(data: &[u8]) {
 pub struct TransformerModel {
     pub config: ModelConfig,
     pub layers: Vec<TransformerLayer>,
+    /// embed_tokens is always kept on CPU to save GPU memory (llama.cpp strategy).
+    /// gather is performed on CPU, then the result is uploaded to the GPU x-buffer.
     pub embed_tokens: Tensor,
     pub norm: Tensor,
+    /// lm_head is on the device backend (GPU or CPU).
     pub lm_head: Tensor,
+    /// CPU backend used for embed_tokens gather when the main backend is GPU.
+    /// None when the main backend is already CPU.
+    cpu_backend: Option<Arc<dyn Backend>>,
     /// Persistent thread pool for offload preload operations.
     /// Lazily initialized on first `forward_into_offload` call.
     /// Uses `Mutex` for interior mutability (`forward_into_offload` takes `&self`).
@@ -414,15 +420,138 @@ impl TransformerModel {
         }
 
         // 4. Load Other Components
-        // CPU + F16 weights: load embed_tokens as F16 MmapBuffer (gather supports F16→F32)
-        // Otherwise: load as F32 (GPU gather requires F32)
-        let embed_tokens = if is_cpu && weight_dtype == DType::F16 {
-            load_tensor(mapper.embed_name(), true)?
-        } else {
-            load_tensor(mapper.embed_name(), false)?
+        //
+        // embed_tokens is always kept on CPU (same strategy as llama.cpp) to save
+        // GPU memory (~300MB for Llama 3.2 1B F16).  Gather is performed on CPU
+        // then the resulting F32 embedding is written to the GPU x-buffer.
+        //
+        // Helper that loads into a CPU tensor regardless of the main backend.
+        let load_tensor_cpu = |name: &str, is_weight: bool| -> Result<Tensor> {
+            let shard_idx = weight_map.get(name).copied().unwrap_or(0);
+            let tensor_view = match shard_tensors[shard_idx].tensor(name) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("Error finding tensor '{}' in shard {}", name, shard_idx);
+                    return Err(anyhow!("{}", e));
+                }
+            };
+            let shape = Shape::new(tensor_view.shape().to_vec());
+            let num_elements: usize = tensor_view.shape().iter().product();
+            let target_dtype = if is_weight { weight_dtype } else { DType::F32 };
+
+            // F16 weight path: prefer MmapBuffer for zero-copy on CPU
+            if target_dtype == DType::F16 {
+                if tensor_view.dtype() == safetensors::Dtype::F16 {
+                    use crate::buffer::mmap_buffer::MmapBuffer;
+                    let data = tensor_view.data();
+                    let data_offset =
+                        data.as_ptr() as usize - shard_mmap_arcs[shard_idx].as_ptr() as usize;
+                    let mmap_arc = shard_mmap_arcs[shard_idx].clone();
+                    let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
+                        MmapBuffer::new(mmap_arc, data_offset, data.len(), DType::F16)
+                    });
+                    return Ok(Tensor::new(shape, buffer, cpu_backend.clone()));
+                }
+
+                // Conversion into Galloc buffer
+                use half::f16;
+                let size_bytes = num_elements * 2;
+                let buffer = cpu_memory.alloc(size_bytes, DType::F16)?;
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut f16, num_elements)
+                };
+                match tensor_view.dtype() {
+                    safetensors::Dtype::F16 => {
+                        let data = tensor_view.data();
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                data.as_ptr(),
+                                buffer.as_mut_ptr(),
+                                data.len(),
+                            );
+                        }
+                    }
+                    safetensors::Dtype::BF16 => {
+                        let data = tensor_view.data();
+                        let src = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const u16, num_elements)
+                        };
+                        for (i, &b) in src.iter().enumerate() {
+                            dst[i] = f16::from_f32(half::bf16::from_bits(b).to_f32());
+                        }
+                    }
+                    safetensors::Dtype::F32 => {
+                        let data = tensor_view.data();
+                        let src = unsafe {
+                            std::slice::from_raw_parts(data.as_ptr() as *const f32, num_elements)
+                        };
+                        for (i, &v) in src.iter().enumerate() {
+                            dst[i] = f16::from_f32(v);
+                        }
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "Unsupported dtype in safetensors: {:?}",
+                            tensor_view.dtype()
+                        ));
+                    }
+                }
+                #[cfg(unix)]
+                release_source_pages(tensor_view.data());
+                return Ok(Tensor::new(shape, buffer, cpu_backend.clone()));
+            }
+
+            // F32 path
+            let buffer = cpu_memory.alloc(num_elements * 4, DType::F32)?;
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(buffer.as_mut_ptr() as *mut f32, num_elements)
+            };
+            match tensor_view.dtype() {
+                safetensors::Dtype::F32 => unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        tensor_view.data().as_ptr(),
+                        buffer.as_mut_ptr(),
+                        tensor_view.data().len(),
+                    );
+                },
+                safetensors::Dtype::BF16 => {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            tensor_view.data().as_ptr() as *const u16,
+                            num_elements,
+                        )
+                    };
+                    for (i, &b) in src.iter().enumerate() {
+                        dst[i] = half::bf16::from_bits(b).to_f32();
+                    }
+                }
+                safetensors::Dtype::F16 => {
+                    let src = unsafe {
+                        std::slice::from_raw_parts(
+                            tensor_view.data().as_ptr() as *const u16,
+                            num_elements,
+                        )
+                    };
+                    for (i, &b) in src.iter().enumerate() {
+                        dst[i] = half::f16::from_bits(b).to_f32();
+                    }
+                }
+                _ => {
+                    return Err(anyhow!("Unsupported dtype: {:?}", tensor_view.dtype()));
+                }
+            }
+            #[cfg(unix)]
+            release_source_pages(tensor_view.data());
+            Ok(Tensor::new(shape, buffer, cpu_backend.clone()))
         };
+
+        // embed_tokens: always CPU (saves GPU memory; gather is CPU-side)
+        let embed_tokens = load_tensor_cpu(mapper.embed_name(), weight_dtype == DType::F16)?;
+
         let norm = load_tensor(mapper.norm_name(), false)?;
 
+        // lm_head: loaded onto the main backend (GPU if applicable).
+        // Tied weights path also goes to main backend so matmul_transposed runs on GPU.
         let lm_head_name = mapper.lm_head_name();
         let has_lm_head = if weight_map.is_empty() {
             shard_tensors[0].names().contains(&lm_head_name)
@@ -432,70 +561,33 @@ impl TransformerModel {
         let lm_head = if has_lm_head {
             load_tensor(lm_head_name, true)?
         } else {
-            // Tied weights: cast embed_tokens F32 → weight_dtype on device
-            // Avoids re-reading safetensors; reuses already-loaded GPU data
+            // Tied weights: build lm_head from the CPU embed_tokens and upload to device.
             eprintln!(
-                "lm_head not found, casting embed_tokens to {:?} for lm_head...",
+                "lm_head not found, deriving from embed_tokens ({:?}) for lm_head...",
                 weight_dtype
             );
-            if embed_tokens.dtype() == weight_dtype || weight_dtype == DType::F32 {
-                // Same dtype or F32 mode: share buffer directly (zero-copy)
+            if is_cpu {
+                // CPU: reuse embed_tokens buffer directly (zero-copy, same backend)
                 embed_tokens.clone()
-            } else if is_cpu {
-                // CPU: convert embed_tokens → weight_dtype in memory
-                let num_elements: usize = embed_tokens.shape().dims().iter().product();
-                let dst_buf = cpu_memory.alloc(num_elements * weight_dtype.size(), weight_dtype)?;
-                let dst_ptr = dst_buf.as_mut_ptr() as *mut half::f16;
-                match embed_tokens.dtype() {
-                    DType::F32 => {
-                        let src = unsafe {
-                            std::slice::from_raw_parts(
-                                embed_tokens.as_ptr() as *const f32,
-                                num_elements,
-                            )
-                        };
-                        for (i, &v) in src.iter().enumerate() {
-                            unsafe { *dst_ptr.add(i) = half::f16::from_f32(v) };
-                        }
-                    }
-                    DType::F16 => {
-                        // Already F16 — just copy bytes
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                embed_tokens.as_ptr(),
-                                dst_buf.as_mut_ptr(),
-                                num_elements * 2,
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-                Tensor::new(embed_tokens.shape().clone(), dst_buf, backend.clone())
             } else {
-                // GPU: cast F32 → F16 on device via kernel (no safetensors re-read)
-                let num_elements: usize = embed_tokens.shape().dims().iter().product();
-                let dst_size = num_elements * weight_dtype.size();
-                let memory = crate::backend::opencl::memory::OpenCLMemory::new(
-                    backend
-                        .as_any()
-                        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                        .ok_or_else(|| anyhow!("Expected OpenCL backend"))?
-                        .context
-                        .clone(),
-                    backend
-                        .as_any()
-                        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                        .ok_or_else(|| anyhow!("Expected OpenCL backend"))?
-                        .queue
-                        .clone(),
-                    false,
-                );
-                let dst_buf = memory.alloc(dst_size, weight_dtype)?;
-                let mut lm_tensor =
-                    Tensor::new(embed_tokens.shape().clone(), dst_buf, backend.clone());
-                backend.cast(&embed_tokens, &mut lm_tensor)?;
-                lm_tensor
+                // GPU: upload CPU embed_tokens to device.
+                // If weight_dtype != embed_tokens.dtype() we need a cast first.
+                if embed_tokens.dtype() == weight_dtype || weight_dtype == DType::F32 {
+                    // Same dtype: upload as-is
+                    backend.copy_from(&embed_tokens)?
+                } else {
+                    // Different dtype (e.g. embed is F16, weight_dtype is Q4_0): not supported
+                    // for tied weights, fall back to F16 upload
+                    backend.copy_from(&embed_tokens)?
+                }
             }
+        };
+
+        // Keep a cpu_backend reference only when the main backend is GPU
+        let stored_cpu_backend = if is_cpu {
+            None
+        } else {
+            Some(cpu_backend as Arc<dyn Backend>)
         };
 
         Ok(Self {
@@ -504,6 +596,7 @@ impl TransformerModel {
             embed_tokens,
             norm,
             lm_head,
+            cpu_backend: stored_cpu_backend,
             preload_pool: std::sync::Mutex::new(None),
         })
     }
@@ -539,9 +632,8 @@ impl TransformerModel {
             backend.clone(),
         );
 
-        // Use gather for embedding lookup
-        // input_tokens should be on the same backend as embed_tokens
-        backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
+        // Embedding lookup: CPU gather + upload to backend buffer
+        self.gather_embed(input_tokens, &mut x, backend)?;
 
         // Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -628,8 +720,8 @@ impl TransformerModel {
             )
         };
 
-        // Use gather
-        backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
+        // Embedding lookup: CPU gather + upload to backend buffer
+        self.gather_embed(input_tokens, &mut x, backend)?;
 
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -842,8 +934,8 @@ impl TransformerModel {
         _logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
-        // 1. Embedding lookup
-        backend.gather(&self.embed_tokens, input_tokens, x_gen)?;
+        // 1. Embedding lookup: CPU gather + upload to GPU x-buffer
+        self.gather_embed(input_tokens, x_gen, backend)?;
 
         // 2. Execute plan (all layers + final norm + lm_head)
         let ocl_backend = backend
@@ -912,7 +1004,8 @@ impl TransformerModel {
                 backend.clone(),
             )
         };
-        backend.gather(&self.embed_tokens, input_tokens, &mut x)?;
+        // Embedding lookup: CPU gather + upload to backend buffer
+        self.gather_embed(input_tokens, &mut x, backend)?;
 
         let num_layers = self.layers.len();
         let depth = prefetch.depth();
@@ -1039,6 +1132,60 @@ impl TransformerModel {
         Ok(())
     }
 
+    /// Perform embedding lookup using CPU gather, then upload the result to the
+    /// target backend buffer `dst`.
+    ///
+    /// When `self.cpu_backend` is Some (i.e. main backend is GPU), embed_tokens
+    /// lives on CPU, so we:
+    ///   1. Copy input token indices to a CPU buffer (if they are on GPU).
+    ///   2. Gather into a temporary CPU F32 buffer.
+    ///   3. Write the bytes to the pre-allocated GPU `dst` tensor via `write_buffer`.
+    ///
+    /// When main backend is CPU, `cpu_backend` is None and we call `gather` directly.
+    fn gather_embed(
+        &self,
+        input_tokens: &Tensor,
+        dst: &mut Tensor,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<()> {
+        if let Some(ref cpu_be) = self.cpu_backend {
+            // GPU path: indices may be on GPU — read them to a CPU buffer first
+            let num_tokens = input_tokens.size() / 4; // u32 elements
+            let hidden_size = self.config.hidden_size;
+            let galloc = crate::memory::galloc::Galloc::new();
+
+            // Read indices to CPU (even if already CPU this is a cheap memcpy)
+            let idx_size = num_tokens * 4;
+            let idx_buf = galloc
+                .alloc(idx_size, DType::F32) // DType doesn't matter for raw bytes here
+                .map_err(|e| anyhow!("gather_embed: idx alloc failed: {e}"))?;
+            let cpu_indices = Tensor::new(input_tokens.shape().clone(), idx_buf, cpu_be.clone());
+            let idx_bytes_mut =
+                unsafe { std::slice::from_raw_parts_mut(cpu_indices.as_mut_ptr(), idx_size) };
+            backend.read_buffer(input_tokens, idx_bytes_mut)?;
+
+            // Gather on CPU
+            let tmp_size = num_tokens * hidden_size * 4; // F32 bytes
+            let tmp_buf = galloc
+                .alloc(tmp_size, DType::F32)
+                .map_err(|e| anyhow!("gather_embed: tmp alloc failed: {e}"))?;
+            let mut tmp = Tensor::new(
+                Shape::new(vec![1, num_tokens, hidden_size]),
+                tmp_buf,
+                cpu_be.clone(),
+            );
+            cpu_be.gather(&self.embed_tokens, &cpu_indices, &mut tmp)?;
+
+            // Upload F32 result to GPU dst buffer
+            let bytes =
+                unsafe { std::slice::from_raw_parts(tmp.as_ptr(), num_tokens * hidden_size * 4) };
+            backend.write_buffer(dst, bytes)
+        } else {
+            // CPU path: direct gather (embed_tokens already on CPU backend)
+            backend.gather(&self.embed_tokens, input_tokens, dst)
+        }
+    }
+
     /// Parse `model.safetensors.index.json` and return (shard_filenames, tensor→shard_idx map).
     fn parse_shard_index(index_path: &Path) -> Result<(Vec<String>, HashMap<String, usize>)> {
         #[derive(Deserialize)]
@@ -1070,5 +1217,148 @@ impl TransformerModel {
         );
 
         Ok((shard_files, weight_map))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::cpu::CpuBackend;
+    use crate::core::buffer::DType;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::Tensor;
+    use crate::memory::galloc::Galloc;
+    use std::sync::Arc;
+
+    /// Build a minimal TransformerModel-like object with CPU backend and
+    /// a small embed_tokens table for gather_embed testing.
+    fn make_cpu_model_with_embed(vocab: usize, dim: usize) -> (TransformerModel, Arc<dyn Backend>) {
+        let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+
+        // Build embed table: row i = [i as f32; dim]
+        let buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
+        {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, vocab * dim)
+            };
+            for r in 0..vocab {
+                for c in 0..dim {
+                    slice[r * dim + c] = r as f32;
+                }
+            }
+        }
+        let embed_tokens = Tensor::new(Shape::new(vec![vocab, dim]), buf, cpu_be.clone());
+
+        // Build a trivial norm weight (all 1s)
+        let norm_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        {
+            let slice =
+                unsafe { std::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, dim) };
+            for v in slice.iter_mut() {
+                *v = 1.0;
+            }
+        }
+        let norm = Tensor::new(Shape::new(vec![dim]), norm_buf, cpu_be.clone());
+        let lm_head = norm.clone(); // dummy
+
+        let config = ModelConfig {
+            vocab_size: vocab,
+            hidden_size: dim,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            head_dim: dim,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 2,
+            arch: crate::models::config::ModelArch::Llama,
+        };
+
+        let model = TransformerModel {
+            config,
+            layers: vec![],
+            embed_tokens,
+            norm,
+            lm_head,
+            cpu_backend: None, // CPU-only model
+            preload_pool: std::sync::Mutex::new(None),
+        };
+        (model, cpu_be)
+    }
+
+    #[test]
+    fn test_gather_embed_cpu_path() {
+        // CPU model: gather_embed should produce correct rows from embed table
+        let vocab = 8usize;
+        let dim = 4usize;
+        let (model, cpu_be) = make_cpu_model_with_embed(vocab, dim);
+
+        let mem = Galloc::new();
+        let idx_buf = mem.alloc(2 * 4, DType::F32).unwrap();
+        // indices = [3, 5]
+        let idx_slice =
+            unsafe { std::slice::from_raw_parts_mut(idx_buf.as_mut_ptr() as *mut u32, 2) };
+        idx_slice[0] = 3;
+        idx_slice[1] = 5;
+        let indices = Tensor::new(Shape::new(vec![1, 2]), idx_buf, cpu_be.clone());
+
+        let dst_buf = mem.alloc(2 * dim * 4, DType::F32).unwrap();
+        let mut dst = Tensor::new(Shape::new(vec![1, 2, dim]), dst_buf, cpu_be.clone());
+
+        model.gather_embed(&indices, &mut dst, &cpu_be).unwrap();
+
+        let result = unsafe { std::slice::from_raw_parts(dst.as_ptr() as *const f32, 2 * dim) };
+        // Row 3 → all 3.0, row 5 → all 5.0
+        for v in &result[..dim] {
+            assert_eq!(*v, 3.0, "row 3 mismatch");
+        }
+        for v in &result[dim..] {
+            assert_eq!(*v, 5.0, "row 5 mismatch");
+        }
+    }
+
+    #[test]
+    fn test_gather_embed_cpu_backend_none_means_direct() {
+        // When cpu_backend is None, gather_embed routes through backend.gather directly
+        let vocab = 4usize;
+        let dim = 2usize;
+        let (model, cpu_be) = make_cpu_model_with_embed(vocab, dim);
+        assert!(model.cpu_backend.is_none());
+
+        let mem = Galloc::new();
+        let idx_buf = mem.alloc(4, DType::F32).unwrap();
+        let idx_slice =
+            unsafe { std::slice::from_raw_parts_mut(idx_buf.as_mut_ptr() as *mut u32, 1) };
+        idx_slice[0] = 2;
+        let indices = Tensor::new(Shape::new(vec![1, 1]), idx_buf, cpu_be.clone());
+
+        let dst_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        let mut dst = Tensor::new(Shape::new(vec![1, 1, dim]), dst_buf, cpu_be.clone());
+
+        model.gather_embed(&indices, &mut dst, &cpu_be).unwrap();
+
+        let result = unsafe { std::slice::from_raw_parts(dst.as_ptr() as *const f32, dim) };
+        for v in result {
+            assert_eq!(*v, 2.0, "row 2 mismatch");
+        }
+    }
+
+    #[test]
+    fn test_write_buffer_default_impl() {
+        // Verify the default write_buffer impl copies bytes correctly (CPU backend)
+        let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+        let buf = mem.alloc(8, DType::F32).unwrap();
+        let mut t = Tensor::new(Shape::new(vec![2]), buf, cpu_be.clone());
+
+        let src: Vec<u8> = (0u8..8).collect();
+        cpu_be.write_buffer(&mut t, &src).unwrap();
+
+        let got = unsafe { std::slice::from_raw_parts(t.as_ptr(), 8) };
+        assert_eq!(got, src.as_slice());
     }
 }
