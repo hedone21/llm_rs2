@@ -17,7 +17,7 @@ pub use eviction_qcf::{
     compute_sliding_qcf_caote, identify_evicted_h2o, identify_evicted_sliding,
 };
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
-pub use quant_qcf::{FlushQcfParams, compute_flush_qcf};
+pub use quant_qcf::{FlushQcfParams, compute_flush_opr, compute_flush_qcf};
 pub use skip_qcf::SkipQcfTracker;
 
 /// A QCF metric collected from a single lossy action execution.

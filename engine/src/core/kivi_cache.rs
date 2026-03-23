@@ -291,6 +291,10 @@ impl KiviCache {
             &proxy_params,
             &qcf_config,
         ));
+        self.flush_proxies.push(crate::core::qcf::compute_flush_opr(
+            &proxy_params,
+            &qcf_config,
+        ));
 
         // === Key: per-channel quantization ===
         for h in 0..self.kv_heads {

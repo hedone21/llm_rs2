@@ -169,6 +169,119 @@ pub fn compute_flush_qcf(params: &FlushQcfParams, config: &QcfConfig) -> QcfMetr
     }
 }
 
+/// Compute KIVI OPR (Output Perturbation Ratio) for V cache quantization.
+///
+/// OPR = ||Σ ΔV|| / ||Σ V_orig|| per head, where ΔV = V_quant - V_orig.
+/// V_quant is obtained via quantize → dequantize round-trip.
+/// Uniform weight (1/n) is used, cancelling in numerator and denominator.
+///
+/// Only V is considered; K quantization's primary effect is on attention weights
+/// (a second-order effect ignored per design decision B-6).
+///
+/// Returns `QcfMetric` with:
+/// - `action`: "kivi_opr"
+/// - `raw_value`: sum of per-head OPR values
+/// - `normalized_value`: same as raw_value
+/// - `per_head`: per-head OPR vector
+/// - `tokens_affected`: flush_tokens
+pub fn compute_flush_opr(params: &FlushQcfParams, _config: &QcfConfig) -> QcfMetric {
+    let FlushQcfParams {
+        res_v,
+        kv_heads,
+        head_dim,
+        flush_tokens,
+        res_cap,
+        bits,
+        ..
+    } = params;
+    let (kv_heads, head_dim, flush_tokens, res_cap, bits) =
+        (*kv_heads, *head_dim, *flush_tokens, *res_cap, *bits);
+
+    if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 {
+        return QcfMetric {
+            action: "kivi_opr".to_string(),
+            raw_value: 0.0,
+            normalized_value: 0.0,
+            per_head: Some(vec![0.0; kv_heads]),
+            tokens_affected: 0,
+        };
+    }
+
+    let blocks_per_token = head_dim / QKKV;
+    let mut per_head_opr = vec![0.0f32; kv_heads];
+
+    for (h, opr_slot) in per_head_opr.iter_mut().enumerate() {
+        let head_base = h * res_cap * head_dim;
+
+        let mut sum_delta = vec![0.0f32; head_dim];
+        let mut sum_orig = vec![0.0f32; head_dim];
+
+        for t in 0..flush_tokens {
+            let tok_base = head_base + t * head_dim;
+
+            // Reconstruct V_quant for this token via quantize → dequantize per block
+            let mut v_quant_token = vec![0.0f32; head_dim];
+            for b in 0..blocks_per_token {
+                let start = tok_base + b * QKKV;
+                if start + QKKV > res_v.len() {
+                    continue;
+                }
+                let chunk: &[f32; QKKV] = res_v[start..start + QKKV].try_into().unwrap();
+                let out = &mut v_quant_token[b * QKKV..(b + 1) * QKKV];
+                let out_arr: &mut [f32; QKKV] = out.try_into().unwrap();
+                match bits {
+                    2 => {
+                        let block = BlockQ2_0::quantize(chunk);
+                        block.dequantize(out_arr);
+                    }
+                    4 => {
+                        let block = BlockKVQ4::quantize(chunk);
+                        block.dequantize(out_arr);
+                    }
+                    8 => {
+                        let block = BlockKVQ8::quantize(chunk);
+                        block.dequantize(out_arr);
+                    }
+                    _ => {
+                        // Unsupported bits: treat as zero error (copy original)
+                        out_arr.copy_from_slice(chunk);
+                    }
+                }
+            }
+
+            // Accumulate sum_delta and sum_orig across tokens
+            for d in 0..head_dim {
+                let idx = tok_base + d;
+                if idx < res_v.len() {
+                    let v_orig = res_v[idx];
+                    sum_orig[d] += v_orig;
+                    sum_delta[d] += v_quant_token[d] - v_orig;
+                }
+            }
+        }
+
+        // OPR = L2(sum_delta) / L2(sum_orig)
+        let norm_delta = sum_delta.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let norm_orig = sum_orig.iter().map(|&x| x * x).sum::<f32>().sqrt();
+
+        *opr_slot = if norm_orig < 1e-12 {
+            0.0
+        } else {
+            norm_delta / norm_orig
+        };
+    }
+
+    let raw_value: f32 = per_head_opr.iter().sum();
+
+    QcfMetric {
+        action: "kivi_opr".to_string(),
+        raw_value,
+        normalized_value: raw_value,
+        per_head: Some(per_head_opr),
+        tokens_affected: flush_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +457,141 @@ mod tests {
             "Q2 proxy ({}) should >= Q8 proxy ({})",
             proxy_q2.raw_value,
             proxy_q8.raw_value
+        );
+    }
+
+    // ── compute_flush_opr tests ──────────────────────────────────────────────
+
+    #[test]
+    fn test_flush_opr_basic() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let elems = kv_heads * res_cap * head_dim;
+
+        let res_k: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.01).collect();
+        let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02).collect();
+
+        let config = QcfConfig::default();
+        let params = FlushQcfParams {
+            res_k: &res_k,
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+        };
+        let metric = compute_flush_opr(&params, &config);
+
+        assert_eq!(metric.action, "kivi_opr");
+        assert!(metric.raw_value >= 0.0, "OPR must be non-negative");
+        assert_eq!(metric.tokens_affected, flush_tokens);
+        assert!(metric.per_head.is_some());
+        assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
+        assert!(
+            (metric.raw_value - metric.normalized_value).abs() < 1e-6,
+            "raw_value and normalized_value must be equal"
+        );
+    }
+
+    #[test]
+    fn test_flush_opr_q2_higher_than_q8() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let elems = kv_heads * res_cap * head_dim;
+
+        // Use values with meaningful variance so quantization error is detectable
+        let res_k: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
+        let res_v: Vec<f32> = (0..elems).map(|i| ((i % 100) as f32) * 0.1).collect();
+
+        let config = QcfConfig::default();
+        let make_params = |bits: u8| FlushQcfParams {
+            res_k: &res_k,
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits,
+        };
+
+        let opr_q2 = compute_flush_opr(&make_params(2), &config);
+        let opr_q8 = compute_flush_opr(&make_params(8), &config);
+
+        assert!(
+            opr_q2.raw_value >= opr_q8.raw_value,
+            "Q2 OPR ({}) should >= Q8 OPR ({})",
+            opr_q2.raw_value,
+            opr_q8.raw_value
+        );
+    }
+
+    #[test]
+    fn test_flush_opr_zero_input() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let elems = kv_heads * res_cap * head_dim;
+
+        let res_k = vec![0.0f32; elems];
+        let res_v = vec![0.0f32; elems];
+
+        let config = QcfConfig::default();
+        let params = FlushQcfParams {
+            res_k: &res_k,
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+        };
+        let metric = compute_flush_opr(&params, &config);
+
+        assert_eq!(metric.raw_value, 0.0, "zero input → OPR must be 0.0");
+        assert_eq!(metric.per_head.as_ref().unwrap()[0], 0.0);
+    }
+
+    #[test]
+    fn test_flush_opr_multi_head() {
+        let kv_heads = 4;
+        let head_dim = 64;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let elems = kv_heads * res_cap * head_dim;
+
+        let res_k: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.01).collect();
+        let res_v: Vec<f32> = (0..elems).map(|i| (i as f32) * 0.02 + 1.0).collect();
+
+        let config = QcfConfig::default();
+        let params = FlushQcfParams {
+            res_k: &res_k,
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 2,
+        };
+        let metric = compute_flush_opr(&params, &config);
+
+        let ph = metric.per_head.as_ref().unwrap();
+        assert_eq!(ph.len(), kv_heads, "per_head length must equal kv_heads");
+        for (h, &opr) in ph.iter().enumerate() {
+            assert!(opr >= 0.0, "head {h} OPR ({opr}) must be non-negative");
+        }
+        // raw_value must equal sum of per_head
+        let expected_sum: f32 = ph.iter().sum();
+        assert!(
+            (metric.raw_value - expected_sum).abs() < 1e-5,
+            "raw_value ({}) must equal sum of per_head ({})",
+            metric.raw_value,
+            expected_sum
         );
     }
 }
