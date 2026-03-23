@@ -2684,6 +2684,11 @@ fn run_eval_ll(
         };
         output["layer_skip_qcf_normalized"] = serde_json::json!(normalized);
     }
+    // Top-level OPR fields (in addition to per-question fields in results[])
+    if let Some(opr) = layer_skip_opr {
+        output["opr_layer_skip"] = serde_json::json!(opr as f64);
+        output["opr_layer_skip_layers"] = serde_json::json!(layer_skip_set_len);
+    }
 
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
