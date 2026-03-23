@@ -11,6 +11,10 @@ pub struct EvalConfig {
     pub kv_type: String,
     pub use_gpu_attn: bool,
     pub qcf_mode: String,
+    /// Model vocabulary size (used for logits buffer allocation).
+    pub vocab_size: usize,
+    /// Model hidden dimension (used for x_gen buffer allocation).
+    pub hidden_size: usize,
 }
 
 /// A single evaluation question (grouped format).

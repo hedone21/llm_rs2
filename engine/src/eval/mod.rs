@@ -15,12 +15,14 @@
 //!
 //! See `docs/38_eval_refactoring.md` for the full design document.
 
+pub mod eval_loop;
 pub mod eviction_hook;
 pub mod hook;
 pub mod kivi_hook;
 pub mod output;
 pub mod qcf_helpers;
 
+pub use eval_loop::run_eval_ll_generic;
 pub use eviction_hook::EvictionHook;
 pub use hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 pub use kivi_hook::KiviHook;
