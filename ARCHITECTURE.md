@@ -271,6 +271,10 @@ graph TB
 | **QcfMetric** | lossy action의 품질 열화 측정값 (action, raw_value, per_head, tokens_affected) | `engine/src/core/qcf/mod.rs` |
 | **DegradationEstimator** | QCF→PPL 증가량 변환 (offline-calibrated PiecewiseLinear + runtime EMA 보정) | `engine/src/core/qcf/estimator.rs` |
 | **ImportanceTable** | Prefill 시 cosine similarity 기반 레이어 중요도 테이블. Layer Skip QCF 계산용 | `engine/src/core/qcf/layer_importance.rs` |
+| **StepHook** | Eval 루프의 캐시 관리 정책 추상화 trait (`before_importance_pass`, `before_question`, `after_question`) | `engine/src/eval/hook.rs` |
+| **EvictionHook** | KVCache 전용 eval hook — importance 2-pass, eviction 트리거, 스냅샷 | `engine/src/eval/eviction_hook.rs` |
+| **KiviHook** | KiviCache 전용 eval hook — KIVI 압축 정책 연동 | `engine/src/eval/kivi_hook.rs` |
+| **EvalOutput** | Eval-LL 결과 구조체 (NLL, QCF, OPR 메트릭 포함) | `engine/src/eval/output.rs` |
 
 ---
 
@@ -313,6 +317,26 @@ sequenceDiagram
         Note over User: start_pos += 1 (항상 단조 증가)
     end
 ```
+
+### Eval-LL Flow
+
+Log-likelihood 평가 루프는 `StepHook` trait으로 캐시 관리 정책을 추상화하여, KVCache와 KiviCache 경로의 코드 중복을 제거합니다.
+
+```
+generate.rs main()
+  → Hook 생성: EvictionHook | KiviHook
+  → run_eval_ll_generic<C: KVCacheOps>(model, caches, hook, questions)
+      → [Importance 2-pass] hook.before_importance_pass()
+      → [Question loop]
+          hook.before_question()          # 캐시 초기화 / 스냅샷 복원
+          prefill(context tokens)
+          hook.after_prefill()            # eviction 트리거 (선택)
+          choice decode → NLL 계산
+          hook.after_question()
+      → EvalOutput JSON
+```
+
+`EvictionHook`은 `KVCache`를, `KiviHook`은 `KiviCache`를 각각 전담하며, `generate.rs`는 Hook 생성만 담당합니다. 상세: [`docs/38_eval_refactoring.md`](docs/38_eval_refactoring.md)
 
 ### RoPE와 Eviction의 관계 (중요!)
 
@@ -521,6 +545,15 @@ llm_rs2/
 │       │       ├── swap_handler.rs    # SwapHandler (LRU 디스크 오프로드)
 │       │       └── {merge,sparse}_handler.rs  # stubs
 │       │
+│       ├── eval/                      # 평가 프레임워크 (StepHook 기반 제네릭 eval 루프)
+│       │   ├── mod.rs                 # 모듈 공개 인터페이스
+│       │   ├── hook.rs                # StepHook trait, CacheSnapshot trait
+│       │   ├── eval_loop.rs           # run_eval_ll_generic<C: KVCacheOps>
+│       │   ├── eviction_hook.rs       # EvictionHook (KVCache 전용)
+│       │   ├── kivi_hook.rs           # KiviHook (KiviCache 전용)
+│       │   ├── output.rs              # EvalOutput, EvalConfig, EvalQuestion
+│       │   └── qcf_helpers.rs         # QCF/OPR 메트릭 집계 유틸리티
+│       │
 │       ├── models/llama/
 │       │   └── llama_model.rs    # LlamaModel (from_dir, forward_into)
 │       │
@@ -657,7 +690,8 @@ llm_rs2/
 │   ├── 30_evaluation_methodology.md  # KV Cache Eviction 평가 방법론
 │   ├── 31_memory_architecture.md     # 메모리 아키텍처 통합 개요
 │   ├── 32_kv_offload.md              # KV 캐시 오프로드 (RawStore, PrefetchController)
-│   └── 34_profiling_framework_design.md # 추론 프로파일링 프레임워크 설계
+│   ├── 34_profiling_framework_design.md # 추론 프로파일링 프레임워크 설계
+│   └── 38_eval_refactoring.md          # Eval 루프 리팩토링 설계 (StepHook 추상화)
 │
 ├── dashboard/                # 벤치마크 시각화 웹 대시보드 (Flask + Plotly.js)
 │   ├── app.py                # Flask 진입점 (port 5000)
