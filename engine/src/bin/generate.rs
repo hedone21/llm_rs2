@@ -424,22 +424,22 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ── KIVI + PPL mode: KiviCache with perplexity evaluation ──
-    if args.kivi {
-        if let Some(ref ppl_path) = args.ppl {
-            return run_kivi_ppl(
-                &args,
-                &model,
-                &tokenizer,
-                &backend,
-                &memory,
-                kv_heads,
-                head_dim,
-                num_layers,
-                max_seq_len,
-                args.kivi_residual_size,
-                ppl_path,
-            );
-        }
+    if args.kivi
+        && let Some(ref ppl_path) = args.ppl
+    {
+        return run_kivi_ppl(
+            &args,
+            &model,
+            &tokenizer,
+            &backend,
+            &memory,
+            kv_heads,
+            head_dim,
+            num_layers,
+            max_seq_len,
+            args.kivi_residual_size,
+            ppl_path,
+        );
     }
 
     // ── KIVI mode: separate path with KiviCache ──

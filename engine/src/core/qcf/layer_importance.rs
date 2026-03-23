@@ -24,6 +24,9 @@ pub struct ImportanceEntry {
     pub layer_id: usize,
     pub sublayer: SubLayer,
     pub importance: f32,
+    /// Output-to-input Perturbation Ratio for layer skip:
+    /// `||output - input|| / ||input||`.
+    pub opr: f32,
 }
 
 /// Pre-computed importance table for all layers.
@@ -44,6 +47,18 @@ impl ImportanceTable {
             entries,
             total_importance,
         }
+    }
+
+    /// Compute total OPR for skipped layers (sum of per-layer OPR).
+    ///
+    /// `skip_set`: list of `(layer_id, SubLayer)` pairs being skipped.
+    /// Returns the sum of `opr` values for matched entries.
+    pub fn compute_opr_skip(&self, skip_set: &[(usize, SubLayer)]) -> f32 {
+        self.entries
+            .iter()
+            .filter(|e| skip_set.contains(&(e.layer_id, e.sublayer)))
+            .map(|e| e.opr)
+            .sum()
     }
 
     /// Compute QCF for a given skip set.
@@ -203,11 +218,13 @@ impl ImportanceCollector {
 
         let cos_sim = cosine_similarity(&self.before_snapshot, &after);
         let importance = (1.0 - cos_sim).max(0.0);
+        let opr = residual_norm_ratio(&self.before_snapshot, &after);
 
         self.entries.push(ImportanceEntry {
             layer_id,
             sublayer,
             importance,
+            opr,
         });
     }
 
@@ -220,6 +237,29 @@ impl ImportanceCollector {
 impl Default for ImportanceCollector {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// OPR for layer skip: `||output - input|| / ||input||`.
+///
+/// Returns 0.0 if `input` has zero magnitude.
+fn residual_norm_ratio(before: &[f32], after: &[f32]) -> f32 {
+    let len = before.len().min(after.len());
+    if len == 0 {
+        return 0.0;
+    }
+    let mut diff_sq = 0.0f32;
+    let mut before_sq = 0.0f32;
+    for i in 0..len {
+        let d = after[i] - before[i];
+        diff_sq += d * d;
+        before_sq += before[i] * before[i];
+    }
+    let denom = before_sq.sqrt();
+    if denom < 1e-12 {
+        0.0
+    } else {
+        diff_sq.sqrt() / denom
     }
 }
 
@@ -292,11 +332,13 @@ mod tests {
                 layer_id: 0,
                 sublayer: SubLayer::Full,
                 importance: 0.5,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
+                opr: 0.0,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -310,11 +352,13 @@ mod tests {
                 layer_id: 0,
                 sublayer: SubLayer::Full,
                 importance: 0.5,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
+                opr: 0.0,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -330,21 +374,25 @@ mod tests {
                 layer_id: 0,
                 sublayer: SubLayer::Full,
                 importance: 0.42,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.08,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.31,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 3,
                 sublayer: SubLayer::Full,
                 importance: 0.05,
+                opr: 0.0,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -365,21 +413,25 @@ mod tests {
                 layer_id: 0,
                 sublayer: SubLayer::Full,
                 importance: 0.9,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.1,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.2,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 3,
                 sublayer: SubLayer::Full,
                 importance: 0.8,
+                opr: 0.0,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -401,26 +453,31 @@ mod tests {
                 layer_id: 0,
                 sublayer: SubLayer::Full,
                 importance: 0.9,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Full,
                 importance: 0.5,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 2,
                 sublayer: SubLayer::Full,
                 importance: 0.1,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 3,
                 sublayer: SubLayer::Full,
                 importance: 0.3,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 4,
                 sublayer: SubLayer::Full,
                 importance: 0.7,
+                opr: 0.0,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -483,21 +540,25 @@ mod tests {
                 layer_id: 0,
                 sublayer: SubLayer::Attention,
                 importance: 0.4,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 0,
                 sublayer: SubLayer::Mlp,
                 importance: 0.1,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Attention,
                 importance: 0.3,
+                opr: 0.0,
             },
             ImportanceEntry {
                 layer_id: 1,
                 sublayer: SubLayer::Mlp,
                 importance: 0.2,
+                opr: 0.0,
             },
         ];
         let table = ImportanceTable::from_entries(entries);
@@ -506,5 +567,99 @@ mod tests {
         let qcf = table.compute_qcf(&[(0, SubLayer::Mlp), (1, SubLayer::Attention)]);
         // (0.1 + 0.3) / 1.0 = 0.4
         assert!((qcf - 0.4).abs() < 1e-6, "sublayer qcf={qcf}");
+    }
+
+    // --- OPR tests ---
+
+    #[test]
+    fn test_residual_norm_ratio_identity() {
+        // output == input → residual = 0 → OPR = 0
+        let v = vec![1.0, 2.0, 3.0];
+        let opr = residual_norm_ratio(&v, &v);
+        assert!(opr.abs() < 1e-6, "identity opr={opr}");
+    }
+
+    #[test]
+    fn test_residual_norm_ratio_orthogonal() {
+        // before=[1,0], after=[0,1]: diff=[−1,1], ||diff||=√2, ||before||=1 → OPR=√2
+        let before = vec![1.0, 0.0];
+        let after = vec![0.0, 1.0];
+        let opr = residual_norm_ratio(&before, &after);
+        let expected = 2.0_f32.sqrt();
+        assert!(
+            (opr - expected).abs() < 1e-5,
+            "orthogonal opr={opr}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn test_residual_norm_ratio_zero_input() {
+        // zero input → OPR = 0 (no division by zero)
+        let before = vec![0.0, 0.0, 0.0];
+        let after = vec![1.0, 2.0, 3.0];
+        let opr = residual_norm_ratio(&before, &after);
+        assert_eq!(opr, 0.0, "zero input opr={opr}");
+    }
+
+    #[test]
+    fn test_compute_opr_skip() {
+        let entries = vec![
+            ImportanceEntry {
+                layer_id: 0,
+                sublayer: SubLayer::Full,
+                importance: 0.5,
+                opr: 0.2,
+            },
+            ImportanceEntry {
+                layer_id: 1,
+                sublayer: SubLayer::Full,
+                importance: 0.3,
+                opr: 0.4,
+            },
+            ImportanceEntry {
+                layer_id: 2,
+                sublayer: SubLayer::Full,
+                importance: 0.2,
+                opr: 0.1,
+            },
+        ];
+        let table = ImportanceTable::from_entries(entries);
+
+        // Skip layers 0 and 2 → OPR sum = 0.2 + 0.1 = 0.3
+        let opr_sum = table.compute_opr_skip(&[(0, SubLayer::Full), (2, SubLayer::Full)]);
+        assert!((opr_sum - 0.3).abs() < 1e-6, "opr_sum={opr_sum}");
+
+        // Empty skip set → 0.0
+        assert_eq!(table.compute_opr_skip(&[]), 0.0);
+    }
+
+    #[test]
+    fn test_collector_records_opr() {
+        let dim = 4;
+        let seq_len = 1;
+
+        // before=[1,0,0,0], after=[0,1,0,0]
+        // residual=[-1,1,0,0], ||residual||=√2, ||before||=1 → OPR=√2
+        let before_data = vec![1.0, 0.0, 0.0, 0.0];
+        let after_data = vec![0.0, 1.0, 0.0, 0.0];
+
+        let mut collector = ImportanceCollector::new();
+        collector.snapshot_before(&before_data, seq_len, dim);
+        collector.record_after(&after_data, seq_len, dim, 0, SubLayer::Full);
+
+        let table = collector.build();
+        let entry = &table.entries()[0];
+        let expected_opr = 2.0_f32.sqrt();
+        assert!(
+            (entry.opr - expected_opr).abs() < 1e-5,
+            "collector opr={}, expected {expected_opr}",
+            entry.opr
+        );
+        // importance should still be 1.0 (orthogonal vectors)
+        assert!(
+            (entry.importance - 1.0).abs() < 0.01,
+            "importance should be 1.0, got {}",
+            entry.importance
+        );
     }
 }
