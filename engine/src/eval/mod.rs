@@ -17,6 +17,11 @@
 
 pub mod hook;
 pub mod output;
+pub mod qcf_helpers;
 
 pub use hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 pub use output::{EvalConfig, EvalOutput, EvalQuestion};
+pub use qcf_helpers::{
+    aggregate_eviction_metrics, aggregate_kivi_metrics, build_opr_fields, flush_metric_to_json,
+    metric_to_json,
+};
