@@ -3406,30 +3406,7 @@ fn run_ppl(
     let ppl = (total_nll / nll_count as f64).exp();
     let tok_per_sec = nll_count as f64 / wall_time;
 
-    let qcf_attn_total: f64 = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
-        .filter_map(|m| m["raw_value"].as_f64())
-        .sum();
-    let qcf_caote_total: f64 = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
-        .filter_map(|m| m["raw_value"].as_f64())
-        .sum();
-    let qcf_attn_normalized_total: f64 = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
-        .filter_map(|m| m["normalized_value"].as_f64())
-        .sum();
-    let opr_eviction: Option<f64> = if qcf_caote_total > 0.0 {
-        Some(qcf_caote_total)
-    } else {
-        None
-    };
-    let opr_eviction_events: usize = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
-        .count();
+    let ms = llm_rs2::eval::aggregate_eviction_metrics(&qcf_metrics);
 
     let output = serde_json::json!({
         "ppl": ppl,
@@ -3439,12 +3416,12 @@ fn run_ppl(
         "wall_time_s": wall_time,
         "qcf_metrics": qcf_metrics,
         "eviction_count": qcf_metrics.len(),
-        "qcf_total": qcf_attn_total,
-        "qcf_attn_total": qcf_attn_total,
-        "qcf_attn_normalized_total": qcf_attn_normalized_total,
-        "qcf_caote_total": qcf_caote_total,
-        "opr_eviction": opr_eviction,
-        "opr_eviction_events": opr_eviction.map(|_| opr_eviction_events),
+        "qcf_total": ms.qcf_attn_total,
+        "qcf_attn_total": ms.qcf_attn_total,
+        "qcf_attn_normalized_total": ms.qcf_normalized_total,
+        "qcf_caote_total": ms.qcf_caote_total,
+        "opr_eviction": ms.opr_eviction,
+        "opr_eviction_events": ms.opr_eviction.map(|_| ms.opr_eviction_events),
         "opr_quantization": serde_json::Value::Null,
         "opr_quantization_events": serde_json::Value::Null,
         "opr_layer_skip": serde_json::Value::Null,
