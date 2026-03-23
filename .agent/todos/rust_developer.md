@@ -252,3 +252,137 @@ Per-token 시간 분해 (F16, 7T):
 | 03-16 | NEON SIMD | 15.1 | 30.5 | 1.9 | Q4 목표 달성 |
 | 03-16 | multi-row GEMV | 15.5 | 30.9 | - | inner loop 최적화 한계 확인 |
 | 03-16 | thread scaling | 15.9(7T) | 30.9 | - | **1T 동일, 멀티스레드 병목 확인** |
+
+---
+
+# generate.rs eval 루프 리팩토링 (StepHook 추상화)
+
+> **목표**: generate.rs의 eval 루프 중복 코드를 StepHook 추상화로 제거하고, eval/kivi/ppl 3개 모드를 단일 generic 루프로 통합
+> **설계 문서**: `docs/38_eval_refactoring.md`
+> **구현 순서**: 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 (순차 진행 권장)
+
+---
+
+## [P1] EVAL-1. eval 모듈 골격 생성
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음
+- **Description**: `engine/src/eval/` 디렉토리 신규 생성. 다음 파일 및 타입 정의.
+  - `mod.rs`: 모듈 선언, pub re-export
+  - `hook.rs`: `StepHook` trait, `CacheSnapshot` trait, `PostStepResult` 타입
+  - `output.rs`: `MetricsSummary`, `EvalOutput`, `EvalConfig` 타입
+  - `engine/src/lib.rs`에 `pub mod eval` 추가
+- **Acceptance Criteria**:
+  - `cargo check` 통과
+  - 각 trait/타입에 doc comment 작성
+  - `StepHook` trait: `pre_step()`, `post_decode_step()`, `summarize()` 메서드 포함
+
+## [P1] EVAL-2. qcf_helpers.rs 추출
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: EVAL-1 완료 후
+- **Description**: `generate.rs`에 산재한 QCF 집계 중복 코드를 `engine/src/eval/qcf_helpers.rs`로 이동.
+  이동 대상 함수: `aggregate_metrics`, `build_opr_fields`, `create_qcf_metric_json`
+- **Acceptance Criteria**:
+  - `generate.rs`에서 해당 함수 직접 정의 제거
+  - `qcf_helpers` 모듈에서 import하여 사용
+  - 기존 동작 변경 없음 (출력 동일)
+  - `cargo test` 통과
+
+## [P1] EVAL-3. EvictionHook 구현
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: EVAL-2 완료 후
+- **Description**: `engine/src/eval/eviction_hook.rs` 신규 작성.
+  - `CacheManager` + `score_accumulator` 소유
+  - `post_decode_step()`에서: budget 검사 → eviction 수행 → attn/caote QCF 수집
+  - `KVCacheSnapshot` 구현 (byte copy 방식)
+  - `StepHook` trait 구현
+- **Acceptance Criteria**:
+  - 기존 run_eval_ll 경로와 동일한 eviction 타이밍 및 QCF 값 출력
+  - unit test: eviction 발생 여부, QCF 집계 값 검증
+
+## [P1] EVAL-4. KiviHook 구현
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: EVAL-2 완료 후
+- **Description**: `engine/src/eval/kivi_hook.rs` 신규 작성.
+  - `take_flush_proxies()`로 NMSE + OPR 수집
+  - `KiviCacheSnapshot` 구현 (Vec clone 방식)
+  - `StepHook` trait 구현
+- **Acceptance Criteria**:
+  - 기존 run_kivi_eval_ll 경로와 동일한 NMSE/OPR 값 출력
+  - unit test: flush 시점, metric 수집 검증
+
+## [P1] EVAL-5. eval_loop.rs 작성
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: EVAL-3, EVAL-4 완료 후
+- **Description**: `engine/src/eval/eval_loop.rs` 신규 작성.
+  `run_eval_ll_generic<C: KVCacheOps>` 함수 구현.
+  - question-choice 루프 통합
+  - importance 2-pass 지원
+  - chunked prefill 지원
+  - 훅 주입(dependency injection)으로 eviction/kivi 분기
+- **Acceptance Criteria**:
+  - EvictionHook, KiviHook 모두 generic 루프에서 동작 확인
+  - 기존 출력과 동일한 JSON 생성
+
+## [P1] EVAL-6. generate.rs 전환
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: EVAL-5 완료 후
+- **Description**: `generate.rs`의 `run_eval_ll`, `run_kivi_eval_ll` 함수를 `eval_loop` 호출로 교체.
+  교체 완료 후 기존 함수 본체 삭제 (래퍼만 유지하거나 완전 제거).
+- **Acceptance Criteria**:
+  - generate.rs LOC 순감소
+  - eval-ll, kivi 모드 CLI 인터페이스 변경 없음
+  - `cargo test` 통과
+
+## [P1] EVAL-7. run_ppl qcf_helpers 전환
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: EVAL-2 완료 후 (EVAL-6과 병렬 가능)
+- **Description**: `run_ppl` 함수 내 QCF 집계/OPR 코드를 `qcf_helpers` 모듈 호출로 교체.
+  중복 인라인 집계 로직 제거.
+- **Acceptance Criteria**:
+  - PPL 모드 출력 변경 없음
+  - `cargo test` 통과
+
+## [P1] EVAL-8. JSON regression test
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: EVAL-6, EVAL-7 완료 후
+- **Description**: 리팩토링 전후 출력 동일성 검증을 위한 golden test 작성.
+  대상 모드 4가지: eval-ll, kivi, skip-layers, ppl.
+  기존 출력 JSON을 golden file로 저장하고 테스트에서 비교.
+- **Acceptance Criteria**:
+  - 4개 모드 golden test 모두 통과
+  - `cargo test` 통과
+  - 테스트 위치: `engine/tests/eval_regression.rs` 또는 각 모듈 내 `#[cfg(test)]`
+
+## [P1] EVAL-9. sanity-check 전체 통과
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: EVAL-8 완료 후
+- **Description**: 리팩토링 완료 후 전체 품질 게이트 통과 확인.
+  `.agent/skills/developing/scripts/sanity_check.sh` 실행.
+  - `cargo fmt` — 포맷 경고 없음
+  - `cargo clippy` — 경고 없음
+  - `cargo test` — 전체 통과
+- **Acceptance Criteria**:
+  - sanity_check.sh 스크립트 exit 0
+  - 새로 추가된 코드에 clippy allow 어트리뷰트 없음
+
+## [P1] EVAL-10. ARCHITECTURE.md 업데이트
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: EVAL-6 완료 후
+- **Description**: ARCHITECTURE.md에 `eval/` 모듈 구조 반영.
+  - 디렉토리 트리에 `engine/src/eval/` 추가
+  - StepHook 기반 eval 루프 구조 설명 추가
+  - generate.rs 설명을 monolithic → hook dispatch 구조로 업데이트
+  - 설계 상세는 `docs/38_eval_refactoring.md` 참조로 연결
+- **Acceptance Criteria**:
+  - ARCHITECTURE.md의 디렉토리 트리가 실제 코드와 일치
+  - eval 모듈의 역할과 흐름이 설명됨
