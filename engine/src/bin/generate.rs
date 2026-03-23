@@ -874,6 +874,7 @@ fn main() -> anyhow::Result<()> {
                     "layer": e.layer_id,
                     "sublayer": format!("{:?}", e.sublayer),
                     "importance": e.importance,
+                    "opr": e.opr,
                 })
             })
             .collect();
@@ -2030,91 +2031,94 @@ fn run_eval_ll(
 
     // ── Importance 2-pass: measure layer importance before evaluation ──
     // Only when skip_config is active and there are questions to evaluate.
-    let (importance_table, layer_skip_qcf) = if let Some(sc) = skip_config {
-        if questions.is_empty() {
-            (None, None)
+    let (importance_table, layer_skip_qcf, layer_skip_opr, layer_skip_set_len) =
+        if let Some(sc) = skip_config {
+            if questions.is_empty() {
+                (None, None, None, 0usize)
+            } else {
+                use llm_rs2::core::qcf::{ImportanceCollector, SubLayer};
+
+                let first_q = &questions[0];
+                let prompt_enc = tokenizer
+                    .encode(first_q.prompt.as_str(), true)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let prompt_ids_imp: Vec<u32> = prompt_enc.get_ids().to_vec();
+                let imp_len = prompt_ids_imp.len();
+
+                // Reset KV caches for importance measurement
+                for cache in kv_caches.iter_mut() {
+                    cache.current_pos = 0;
+                }
+                if let Some(acc) = score_accumulator.as_mut() {
+                    acc.reset();
+                }
+
+                let cpu_buf = Galloc::new().alloc(imp_len * 4, DType::U8)?;
+                unsafe {
+                    let ptr = cpu_buf.as_mut_ptr() as *mut u32;
+                    std::ptr::copy_nonoverlapping(prompt_ids_imp.as_ptr(), ptr, imp_len);
+                }
+                let cpu_input = Tensor::new(
+                    Shape::new(vec![1, imp_len]),
+                    cpu_buf,
+                    Arc::new(CpuBackend::new()),
+                );
+                let input_tensor = backend.copy_from(&cpu_input)?;
+
+                let imp_logits_buf = memory.alloc(imp_len * vocab_size * 4, DType::F32)?;
+                let mut imp_logits = Tensor::new(
+                    Shape::new(vec![1, imp_len, vocab_size]),
+                    imp_logits_buf,
+                    backend.clone(),
+                );
+
+                let mut collector = ImportanceCollector::new();
+                model.forward_into(TransformerModelForwardArgs {
+                    input_tokens: &input_tensor,
+                    start_pos: 0,
+                    kv_caches,
+                    backend,
+                    memory,
+                    logits_out: &mut imp_logits,
+                    x_gen: None,
+                    workspace: None,
+                    use_gpu_attn: args.gpu_attn,
+                    score_accumulator: None,
+                    profiler: None,
+                    skip_config: None, // No skip for importance measurement
+                    importance_collector: Some(&mut collector),
+                })?;
+
+                let table = collector.build();
+
+                // Deduplicate via union of attn_skip and mlp_skip
+                let skip_set: Vec<(usize, SubLayer)> = sc
+                    .attn_skip
+                    .union(&sc.mlp_skip)
+                    .map(|&l| (l, SubLayer::Full))
+                    .collect();
+                let qcf = table.compute_qcf(&skip_set);
+                let opr_skip = table.compute_opr_skip(&skip_set);
+                let skip_set_len = skip_set.len();
+
+                eprintln!(
+                    "[Skip] Importance measured on {} tokens, layer_skip_qcf={:.4}",
+                    imp_len, qcf
+                );
+
+                // Reset KV caches for actual evaluation
+                for cache in kv_caches.iter_mut() {
+                    cache.current_pos = 0;
+                }
+                if let Some(acc) = score_accumulator.as_mut() {
+                    acc.reset();
+                }
+
+                (Some(table), Some(qcf), Some(opr_skip), skip_set_len)
+            }
         } else {
-            use llm_rs2::core::qcf::{ImportanceCollector, SubLayer};
-
-            let first_q = &questions[0];
-            let prompt_enc = tokenizer
-                .encode(first_q.prompt.as_str(), true)
-                .map_err(|e| anyhow::anyhow!(e))?;
-            let prompt_ids_imp: Vec<u32> = prompt_enc.get_ids().to_vec();
-            let imp_len = prompt_ids_imp.len();
-
-            // Reset KV caches for importance measurement
-            for cache in kv_caches.iter_mut() {
-                cache.current_pos = 0;
-            }
-            if let Some(acc) = score_accumulator.as_mut() {
-                acc.reset();
-            }
-
-            let cpu_buf = Galloc::new().alloc(imp_len * 4, DType::U8)?;
-            unsafe {
-                let ptr = cpu_buf.as_mut_ptr() as *mut u32;
-                std::ptr::copy_nonoverlapping(prompt_ids_imp.as_ptr(), ptr, imp_len);
-            }
-            let cpu_input = Tensor::new(
-                Shape::new(vec![1, imp_len]),
-                cpu_buf,
-                Arc::new(CpuBackend::new()),
-            );
-            let input_tensor = backend.copy_from(&cpu_input)?;
-
-            let imp_logits_buf = memory.alloc(imp_len * vocab_size * 4, DType::F32)?;
-            let mut imp_logits = Tensor::new(
-                Shape::new(vec![1, imp_len, vocab_size]),
-                imp_logits_buf,
-                backend.clone(),
-            );
-
-            let mut collector = ImportanceCollector::new();
-            model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &input_tensor,
-                start_pos: 0,
-                kv_caches,
-                backend,
-                memory,
-                logits_out: &mut imp_logits,
-                x_gen: None,
-                workspace: None,
-                use_gpu_attn: args.gpu_attn,
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None, // No skip for importance measurement
-                importance_collector: Some(&mut collector),
-            })?;
-
-            let table = collector.build();
-
-            // Deduplicate via union of attn_skip and mlp_skip
-            let skip_set: Vec<(usize, SubLayer)> = sc
-                .attn_skip
-                .union(&sc.mlp_skip)
-                .map(|&l| (l, SubLayer::Full))
-                .collect();
-            let qcf = table.compute_qcf(&skip_set);
-
-            eprintln!(
-                "[Skip] Importance measured on {} tokens, layer_skip_qcf={:.4}",
-                imp_len, qcf
-            );
-
-            // Reset KV caches for actual evaluation
-            for cache in kv_caches.iter_mut() {
-                cache.current_pos = 0;
-            }
-            if let Some(acc) = score_accumulator.as_mut() {
-                acc.reset();
-            }
-
-            (Some(table), Some(qcf))
-        }
-    } else {
-        (None, None)
-    };
+            (None, None, None, 0usize)
+        };
 
     for (q_idx, question) in questions.iter().enumerate() {
         let q_start = std::time::Instant::now();
@@ -2596,6 +2600,15 @@ fn run_eval_ll(
             .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
             .filter_map(|m| m["normalized_value"].as_f64())
             .sum();
+        let opr_eviction: Option<f64> = if qcf_config.mode.has_caote() && qcf_caote_total > 0.0 {
+            Some(qcf_caote_total)
+        } else {
+            None
+        };
+        let opr_eviction_events: usize = qcf_metrics
+            .iter()
+            .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
+            .count();
         let mut result_obj = serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
@@ -2613,6 +2626,12 @@ fn run_eval_ll(
             "qcf_attn_total": qcf_attn_total,
             "qcf_attn_normalized_total": qcf_attn_normalized_total,
             "final_cache_pos": kv_caches[0].current_pos,
+            "opr_eviction": opr_eviction,
+            "opr_eviction_events": opr_eviction.map(|_| opr_eviction_events),
+            "opr_quantization": serde_json::Value::Null,
+            "opr_quantization_events": serde_json::Value::Null,
+            "opr_layer_skip": layer_skip_opr.map(|v| v as f64),
+            "opr_layer_skip_layers": layer_skip_opr.map(|_| layer_skip_set_len),
         });
         if qcf_config.mode.has_caote() {
             result_obj["qcf_caote_total"] = serde_json::json!(qcf_caote_total);
@@ -2648,6 +2667,7 @@ fn run_eval_ll(
                     "layer": e.layer_id,
                     "sublayer": format!("{:?}", e.sublayer),
                     "importance": e.importance,
+                    "opr": e.opr,
                 }))
                 .collect::<Vec<serde_json::Value>>()
         );
@@ -2995,14 +3015,26 @@ fn run_kivi_eval_ll(
             elapsed_q,
         );
 
+        // qcf_total: NMSE only (exclude "kivi_opr" which is OPR, not NMSE)
         let qcf_total: f64 = qcf_metrics
             .iter()
+            .filter(|m| m["action"].as_str() != Some("kivi_opr"))
             .filter_map(|m| m["raw_value"].as_f64())
             .sum();
         let qcf_normalized_total: f64 = qcf_metrics
             .iter()
+            .filter(|m| m["action"].as_str() != Some("kivi_opr"))
             .filter_map(|m| m["normalized_value"].as_f64())
             .sum();
+        let opr_quantization: f64 = qcf_metrics
+            .iter()
+            .filter(|m| m["action"].as_str() == Some("kivi_opr"))
+            .filter_map(|m| m["raw_value"].as_f64())
+            .sum();
+        let opr_quantization_events: usize = qcf_metrics
+            .iter()
+            .filter(|m| m["action"].as_str() == Some("kivi_opr"))
+            .count();
         results.push(serde_json::json!({
             "id": question.id,
             "choice_nlls": choice_nlls,
@@ -3022,6 +3054,12 @@ fn run_kivi_eval_ll(
             "qcf_total": qcf_total,
             "qcf_attn_total": qcf_total,
             "qcf_attn_normalized_total": qcf_normalized_total,
+            "opr_eviction": serde_json::Value::Null,
+            "opr_eviction_events": serde_json::Value::Null,
+            "opr_quantization": if opr_quantization > 0.0 { serde_json::json!(opr_quantization) } else { serde_json::Value::Null },
+            "opr_quantization_events": if opr_quantization > 0.0 { serde_json::json!(opr_quantization_events) } else { serde_json::Value::Null },
+            "opr_layer_skip": serde_json::Value::Null,
+            "opr_layer_skip_layers": serde_json::Value::Null,
         }));
         // Note: KIVI mode uses quantization QCF, not eviction. CAOTE not applicable.
     }
@@ -4464,6 +4502,15 @@ fn run_ppl(
         .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
+    let opr_eviction: Option<f64> = if qcf_caote_total > 0.0 {
+        Some(qcf_caote_total)
+    } else {
+        None
+    };
+    let opr_eviction_events: usize = qcf_metrics
+        .iter()
+        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
+        .count();
 
     let output = serde_json::json!({
         "ppl": ppl,
@@ -4477,6 +4524,12 @@ fn run_ppl(
         "qcf_attn_total": qcf_attn_total,
         "qcf_attn_normalized_total": qcf_attn_normalized_total,
         "qcf_caote_total": qcf_caote_total,
+        "opr_eviction": opr_eviction,
+        "opr_eviction_events": opr_eviction.map(|_| opr_eviction_events),
+        "opr_quantization": serde_json::Value::Null,
+        "opr_quantization_events": serde_json::Value::Null,
+        "opr_layer_skip": serde_json::Value::Null,
+        "opr_layer_skip_layers": serde_json::Value::Null,
         "config": {
             "model": args.model_path,
             "text_file": text_file,
