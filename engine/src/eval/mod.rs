@@ -15,11 +15,15 @@
 //!
 //! See `docs/38_eval_refactoring.md` for the full design document.
 
+pub mod eviction_hook;
 pub mod hook;
+pub mod kivi_hook;
 pub mod output;
 pub mod qcf_helpers;
 
+pub use eviction_hook::EvictionHook;
 pub use hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
+pub use kivi_hook::KiviHook;
 pub use output::{EvalConfig, EvalOutput, EvalQuestion};
 pub use qcf_helpers::{
     aggregate_eviction_metrics, aggregate_kivi_metrics, build_opr_fields, flush_metric_to_json,

@@ -86,7 +86,11 @@ pub fn aggregate_kivi_metrics(qcf_metrics: &[serde_json::Value]) -> MetricsSumma
 }
 
 /// Convert a QcfMetric to a JSON value for the qcf_metrics array.
-pub fn metric_to_json(metric: &QcfMetric, step: usize, cache_pos_before: usize) -> serde_json::Value {
+pub fn metric_to_json(
+    metric: &QcfMetric,
+    step: usize,
+    cache_pos_before: usize,
+) -> serde_json::Value {
     serde_json::json!({
         "step": step,
         "action": metric.action,

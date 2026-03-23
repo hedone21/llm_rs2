@@ -53,11 +53,7 @@ pub trait StepHook<C: KVCacheOps> {
 
     /// Called after prefill completes. Handles chunked-prefill eviction
     /// residuals or flush proxy collection.
-    fn post_prefill(
-        &mut self,
-        caches: &mut [C],
-        qcf_metrics: &mut Vec<serde_json::Value>,
-    );
+    fn post_prefill(&mut self, caches: &mut [C], qcf_metrics: &mut Vec<serde_json::Value>);
 
     /// Reset caches for a new question evaluation.
     fn reset_caches(&mut self, caches: &mut [C]);
