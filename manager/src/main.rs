@@ -88,10 +88,9 @@ fn main() -> anyhow::Result<()> {
     let monitors = build_monitors(&config);
     log::info!("Monitors: {}", monitors.len());
 
-    // Emit initial state
+    // Collect initial state from monitors
     let initial_signals: Vec<SystemSignal> =
         monitors.iter().filter_map(|m| m.initial_signal()).collect();
-    emitter.emit_initial(&initial_signals)?;
 
     // Spawn monitor threads
     let (tx, rx) = mpsc::channel::<SystemSignal>();
@@ -122,6 +121,22 @@ fn main() -> anyhow::Result<()> {
         log::info!("Legacy passthrough mode — PolicyPipeline disabled");
         None
     };
+
+    // Emit initial state: pipeline mode uses Directive format, legacy uses raw signal
+    if args.legacy_passthrough {
+        emitter.emit_initial(&initial_signals)?;
+    } else if let Some(ref mut p) = pipeline {
+        for signal in &initial_signals {
+            if let Some(directive) = p.process_signal(signal) {
+                log::info!(
+                    "Initial directive seq={}: {} commands",
+                    directive.seq_id,
+                    directive.commands.len()
+                );
+                emitter.emit_directive(&directive)?;
+            }
+        }
+    }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     log::info!(
