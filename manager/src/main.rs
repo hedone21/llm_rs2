@@ -108,12 +108,15 @@ fn main() -> anyhow::Result<()> {
 
     // 새 계층형 Policy Pipeline (non-legacy 경로)
     let mut pipeline: Option<PolicyPipeline> = if !args.legacy_passthrough {
-        let policy_cfg = load_policy_config(&args);
+        let policy_cfg = load_policy_config(&args, &config);
         let mut p = PolicyPipeline::new(&policy_cfg);
-        let model_path = format!(
-            "{}/default_relief.json",
-            policy_cfg.relief_model.storage_dir
-        );
+        let storage_dir = if policy_cfg.relief_model.storage_dir.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            policy_cfg.relief_model.storage_dir.replacen('~', &home, 1)
+        } else {
+            policy_cfg.relief_model.storage_dir.clone()
+        };
+        let model_path = format!("{}/default_relief.json", storage_dir);
         p.set_relief_model_path(model_path);
         log::info!("PolicyPipeline initialized (hierarchical mode)");
         Some(p)
@@ -212,7 +215,12 @@ fn main() -> anyhow::Result<()> {
 
 /// `--policy-config` 인자 또는 메인 config의 `[policy]` 섹션에서 PolicyConfig를 로드한다.
 /// 둘 다 없으면 기본값을 사용한다.
-fn load_policy_config(args: &Args) -> PolicyConfig {
+///
+/// 우선순위:
+/// 1. `--policy-config` CLI 플래그
+/// 2. 메인 config의 `[policy]` 섹션
+/// 3. 기본값 (`PolicyConfig::default()`)
+fn load_policy_config(args: &Args, config: &Config) -> PolicyConfig {
     if let Some(path) = &args.policy_config {
         match std::fs::read_to_string(path) {
             Ok(content) => match toml::from_str::<PolicyConfig>(&content) {
@@ -236,6 +244,10 @@ fn load_policy_config(args: &Args) -> PolicyConfig {
                 );
             }
         }
+    }
+    if let Some(ref policy) = config.policy {
+        log::info!("Using policy config from main config file");
+        return policy.clone();
     }
     PolicyConfig::default()
 }

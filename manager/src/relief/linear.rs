@@ -201,11 +201,61 @@ impl OnlineLinearEstimator {
     }
 }
 
+/// 학습 데이터 없을 때 사용하는 도메인 기반 default relief.
+///
+/// 각 액션의 주 효과를 전문 지식 기반으로 사전 지정한다.
+fn default_relief(action: &ActionId) -> ReliefVector {
+    match action {
+        ActionId::SwitchHw => ReliefVector {
+            compute: 0.5,
+            memory: 0.0,
+            thermal: 0.3,
+            latency: -0.1,
+        },
+        ActionId::Throttle => ReliefVector {
+            compute: 0.3,
+            memory: 0.0,
+            thermal: 0.2,
+            latency: -0.3,
+        },
+        ActionId::KvOffloadDisk => ReliefVector {
+            compute: 0.0,
+            memory: 0.4,
+            thermal: 0.0,
+            latency: -0.2,
+        },
+        ActionId::KvEvictSliding => ReliefVector {
+            compute: 0.0,
+            memory: 0.7,
+            thermal: 0.0,
+            latency: 0.0,
+        },
+        ActionId::KvEvictH2o => ReliefVector {
+            compute: 0.0,
+            memory: 0.6,
+            thermal: 0.0,
+            latency: 0.0,
+        },
+        ActionId::KvQuantDynamic => ReliefVector {
+            compute: 0.0,
+            memory: 0.3,
+            thermal: 0.0,
+            latency: 0.0,
+        },
+        ActionId::LayerSkip => ReliefVector {
+            compute: 0.3,
+            memory: 0.0,
+            thermal: 0.1,
+            latency: -0.2,
+        },
+    }
+}
+
 impl ReliefEstimator for OnlineLinearEstimator {
     fn predict(&self, action: &ActionId, state: &FeatureVector) -> ReliefVector {
         match self.models.get(action) {
-            Some(model) => model.predict(&state.values),
-            None => ReliefVector::zero(),
+            Some(model) if model.observation_count > 0 => model.predict(&state.values),
+            _ => default_relief(action),
         }
     }
 
@@ -283,31 +333,80 @@ mod tests {
         }
     }
 
-    /// 초기 모델의 predict는 (0,0,0,0)을 반환해야 한다.
+    /// 관측 없는 초기 predict는 도메인 기반 default relief를 반환해야 한다.
     #[test]
-    fn test_predict_initial_zeros() {
+    fn test_predict_initial_returns_default_relief() {
         let estimator = OnlineLinearEstimator::default_config();
         let state = simple_state();
         let pred = estimator.predict(&ActionId::KvEvictSliding, &state);
+        // KvEvictSliding default: compute=0.0, memory=0.7, thermal=0.0, latency=0.0
         assert!(
             pred.compute.abs() < 1e-6,
-            "initial compute should be 0, got {}",
+            "initial compute should be 0.0 (default), got {}",
             pred.compute
         );
         assert!(
-            pred.memory.abs() < 1e-6,
-            "initial memory should be 0, got {}",
+            (pred.memory - 0.7).abs() < 1e-6,
+            "initial memory should be 0.7 (default), got {}",
             pred.memory
         );
         assert!(
             pred.thermal.abs() < 1e-6,
-            "initial thermal should be 0, got {}",
+            "initial thermal should be 0.0 (default), got {}",
             pred.thermal
         );
         assert!(
             pred.latency.abs() < 1e-6,
-            "initial latency should be 0, got {}",
+            "initial latency should be 0.0 (default), got {}",
             pred.latency
+        );
+    }
+
+    /// 학습 전 default_relief 값이 각 액션에 올바르게 매핑된다.
+    #[test]
+    fn test_default_relief_values() {
+        let estimator = OnlineLinearEstimator::default_config();
+        let state = simple_state();
+
+        let sw = estimator.predict(&ActionId::SwitchHw, &state);
+        assert!(
+            (sw.compute - 0.5).abs() < 1e-6,
+            "SwitchHw compute={}",
+            sw.compute
+        );
+        assert!(
+            (sw.thermal - 0.3).abs() < 1e-6,
+            "SwitchHw thermal={}",
+            sw.thermal
+        );
+        assert!(
+            (sw.latency - (-0.1)).abs() < 1e-6,
+            "SwitchHw latency={}",
+            sw.latency
+        );
+
+        let thr = estimator.predict(&ActionId::Throttle, &state);
+        assert!(
+            (thr.compute - 0.3).abs() < 1e-6,
+            "Throttle compute={}",
+            thr.compute
+        );
+        assert!(
+            (thr.latency - (-0.3)).abs() < 1e-6,
+            "Throttle latency={}",
+            thr.latency
+        );
+
+        let ls = estimator.predict(&ActionId::LayerSkip, &state);
+        assert!(
+            (ls.compute - 0.3).abs() < 1e-6,
+            "LayerSkip compute={}",
+            ls.compute
+        );
+        assert!(
+            (ls.latency - (-0.2)).abs() < 1e-6,
+            "LayerSkip latency={}",
+            ls.latency
         );
     }
 
@@ -359,16 +458,17 @@ mod tests {
             estimator.observe(&ActionId::KvEvictSliding, &state, &actual);
         }
 
-        // Action B는 아직 학습하지 않음 → 초기값(0) 유지
+        // Action B는 아직 학습하지 않음 → default_relief(SwitchHw) 반환
+        // SwitchHw: compute=0.5, memory=0.0, thermal=0.3, latency=-0.1
         let pred_b = estimator.predict(&ActionId::SwitchHw, &state);
         assert!(
-            pred_b.compute.abs() < 1e-6,
-            "untrained action should still predict 0, got {}",
+            (pred_b.compute - 0.5).abs() < 1e-6,
+            "untrained SwitchHw should return default compute=0.5, got {}",
             pred_b.compute
         );
         assert!(
             pred_b.memory.abs() < 1e-6,
-            "untrained action should still predict 0, got {}",
+            "untrained SwitchHw should return default memory=0.0, got {}",
             pred_b.memory
         );
     }
