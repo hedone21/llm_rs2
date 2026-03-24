@@ -52,8 +52,13 @@ struct Args {
     #[arg(short, long, default_value_t = 20)]
     num_tokens: usize,
 
+    /// Backend to use: "cpu", "opencl", or "hybrid" (CPU→GPU auto-switch)
     #[arg(short, long, default_value = "cpu")]
     backend: String,
+
+    /// Switch threshold for hybrid mode: auto-switch CPU→GPU at this token count (0=disabled)
+    #[arg(long, default_value_t = 0)]
+    switch_threshold: usize,
 
     /// Use zero-copy shared memory (slower but enables CPU-GPU sharing)
     #[arg(long, default_value_t = false)]
@@ -348,21 +353,62 @@ fn main() -> anyhow::Result<()> {
     // 1. Setup
     eprintln!("[Profile] Event: ModelLoadStart");
     eprintln!("Loading model from {}", model_path);
-    let backend: Arc<dyn Backend> = match args.backend.as_str() {
-        "cpu" => Arc::new(CpuBackend::new()),
-        "opencl" => Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?),
-        _ => anyhow::bail!("Unknown backend: {}", args.backend),
+
+    // Hybrid mode: dual-backend (CPU primary, GPU secondary). Starts inference on CPU.
+    // gpu_backend_arc / gpu_memory_arc hold the secondary backend for CPU↔GPU switching.
+    let (mut backend, memory, gpu_backend_arc, gpu_memory_arc, mut is_gpu): (
+        Arc<dyn Backend>,
+        Arc<dyn Memory>,
+        Option<Arc<dyn Backend>>,
+        Option<Arc<dyn Memory>>,
+        bool,
+    ) = match args.backend.as_str() {
+        #[cfg(feature = "opencl")]
+        "hybrid" => {
+            let cpu = Arc::new(CpuBackend::new()) as Arc<dyn Backend>;
+            let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
+            let gpu_mem: Arc<dyn Memory> =
+                Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+                    gpu_concrete.context.clone(),
+                    gpu_concrete.queue.clone(),
+                    args.zero_copy,
+                ));
+            let gpu = gpu_concrete as Arc<dyn Backend>;
+            let cpu_mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+            eprintln!("[Hybrid] Initialized CPU+GPU backends (start on CPU)");
+            (cpu, cpu_mem, Some(gpu), Some(gpu_mem), false)
+        }
+        "cpu" => {
+            let cpu = Arc::new(CpuBackend::new()) as Arc<dyn Backend>;
+            let cpu_mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+            (cpu, cpu_mem, None, None, false)
+        }
+        "opencl" => {
+            let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
+            let gpu_mem: Arc<dyn Memory> =
+                Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+                    gpu_concrete.context.clone(),
+                    gpu_concrete.queue.clone(),
+                    args.zero_copy,
+                ));
+            let gpu = gpu_concrete as Arc<dyn Backend>;
+            (gpu, gpu_mem, None, None, true)
+        }
+        _ => anyhow::bail!(
+            "Unknown backend: {}. Use cpu, opencl, or hybrid.",
+            args.backend
+        ),
     };
-    let memory: Arc<dyn Memory> = if args.backend == "opencl" {
-        let ocl_backend = backend
-            .as_any()
-            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-            .ok_or(anyhow::anyhow!("Failed into cast to OpenCLBackend"))?;
-        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
-            ocl_backend.context.clone(),
-            ocl_backend.queue.clone(),
-            args.zero_copy,
-        ))
+    // cpu_backend_arc: always a CPU backend, used as migration helper in hybrid mode.
+    // In non-hybrid modes this is unused (but declared for uniform migration call-sites).
+    let cpu_backend_arc: Arc<dyn Backend> = if args.backend == "cpu" || args.backend == "hybrid" {
+        backend.clone()
+    } else {
+        Arc::new(CpuBackend::new())
+    };
+    // cpu_memory_arc: CPU allocator for migration intermediates.
+    let cpu_memory_arc: Arc<dyn Memory> = if args.backend == "cpu" || args.backend == "hybrid" {
+        memory.clone()
     } else {
         Arc::new(Galloc::new())
     };
@@ -1342,6 +1388,62 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
+            // ── Hybrid mode: auto-switch CPU→GPU at threshold ──────────────
+            if !is_gpu
+                && args.switch_threshold > 0
+                && gpu_backend_arc.is_some()
+                && kv_caches[0].current_pos >= args.switch_threshold
+            {
+                let gpu_be = gpu_backend_arc.as_ref().unwrap();
+                let gpu_mem = gpu_memory_arc.as_ref().unwrap();
+                eprintln!(
+                    "[Hybrid] Auto-switch CPU→GPU at token {}",
+                    kv_caches[0].current_pos
+                );
+                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                    &mut kv_caches,
+                    &backend,
+                    gpu_be,
+                    &cpu_backend_arc,
+                    &cpu_memory_arc,
+                    gpu_mem,
+                    kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    true,
+                )?;
+                backend = gpu_be.clone();
+                let logits_gpu_buf = gpu_mem.alloc(vocab_size * 4, DType::F32)?;
+                logits = Tensor::new(
+                    Shape::new(vec![1, 1, vocab_size]),
+                    logits_gpu_buf,
+                    backend.clone(),
+                );
+                let xg_buf = gpu_mem.alloc(hidden_size * 4, DType::F32)?;
+                x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+                gen_ws = LayerWorkspace::new(
+                    WorkspaceConfig {
+                        batch_size: 1,
+                        dim: model.config.hidden_size,
+                        q_dim,
+                        k_dim,
+                        v_dim,
+                        ffn_hidden,
+                        n_heads: model.config.num_attention_heads,
+                        max_seq_len: args.max_seq_len,
+                    },
+                    gpu_mem.as_ref(),
+                    backend.clone(),
+                )?;
+                #[cfg(feature = "opencl")]
+                {
+                    gpu_plan = None; // invalidate; will rebuild after first forward
+                }
+                is_gpu = true;
+                eprintln!("[Hybrid] Switched to GPU successfully.");
+            }
+            // ── End hybrid auto-switch ──────────────────────────────────────
+
             let last_token = tokens[tokens.len() - 1];
             unsafe {
                 *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
@@ -1387,16 +1489,26 @@ fn main() -> anyhow::Result<()> {
             let used_plan = false;
 
             if !used_plan {
+                // In hybrid mode, use GPU memory when on GPU; otherwise use the primary memory.
+                let effective_mem: &dyn Memory = if is_gpu {
+                    gpu_memory_arc.as_deref().unwrap_or_else(|| memory.as_ref())
+                } else {
+                    memory.as_ref()
+                };
                 model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
                     start_pos,
                     kv_caches: &mut kv_caches,
                     backend: &backend,
-                    memory: memory.as_ref(),
+                    memory: effective_mem,
                     logits_out: &mut logits,
                     x_gen: Some(&mut x_gen),
                     workspace: Some(&mut gen_ws),
-                    use_gpu_attn: args.gpu_attn,
+                    use_gpu_attn: if args.backend == "hybrid" {
+                        is_gpu
+                    } else {
+                        args.gpu_attn
+                    },
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
                     skip_config: skip_config.as_ref(),
@@ -1723,8 +1835,118 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                if let Some(ref _device) = plan.switch_device {
-                    log::warn!("[Resilience] SwitchHw not supported in single-backend mode");
+                if let Some(ref device) = plan.switch_device {
+                    if let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc) {
+                        match device.as_str() {
+                            "cpu" if is_gpu => {
+                                eprintln!(
+                                    "[Hybrid] Resilience: GPU→CPU at token {}",
+                                    kv_caches[0].current_pos
+                                );
+                                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                    &mut kv_caches,
+                                    &backend,
+                                    &cpu_backend_arc,
+                                    &cpu_backend_arc,
+                                    &cpu_memory_arc,
+                                    &cpu_memory_arc,
+                                    kv_heads,
+                                    head_dim,
+                                    max_seq_len,
+                                    false,
+                                )?;
+                                backend = cpu_backend_arc.clone();
+                                let lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
+                                logits = Tensor::new(
+                                    Shape::new(vec![1, 1, vocab_size]),
+                                    lb,
+                                    backend.clone(),
+                                );
+                                let xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
+                                x_gen = Tensor::new(
+                                    Shape::new(vec![1, 1, hidden_size]),
+                                    xb,
+                                    backend.clone(),
+                                );
+                                gen_ws = LayerWorkspace::new(
+                                    WorkspaceConfig {
+                                        batch_size: 1,
+                                        dim: model.config.hidden_size,
+                                        q_dim,
+                                        k_dim,
+                                        v_dim,
+                                        ffn_hidden,
+                                        n_heads: model.config.num_attention_heads,
+                                        max_seq_len: args.max_seq_len,
+                                    },
+                                    cpu_memory_arc.as_ref(),
+                                    backend.clone(),
+                                )?;
+                                #[cfg(feature = "opencl")]
+                                {
+                                    gpu_plan = None;
+                                }
+                                is_gpu = false;
+                                eprintln!("[Hybrid] Resilience: Switched to CPU.");
+                            }
+                            "gpu" | "opencl" if !is_gpu => {
+                                eprintln!(
+                                    "[Hybrid] Resilience: CPU→GPU at token {}",
+                                    kv_caches[0].current_pos
+                                );
+                                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                    &mut kv_caches,
+                                    &backend,
+                                    gpu_be,
+                                    &cpu_backend_arc,
+                                    &cpu_memory_arc,
+                                    gpu_mem,
+                                    kv_heads,
+                                    head_dim,
+                                    max_seq_len,
+                                    true,
+                                )?;
+                                backend = gpu_be.clone();
+                                let lb = gpu_mem.alloc(vocab_size * 4, DType::F32)?;
+                                logits = Tensor::new(
+                                    Shape::new(vec![1, 1, vocab_size]),
+                                    lb,
+                                    backend.clone(),
+                                );
+                                let xb = gpu_mem.alloc(hidden_size * 4, DType::F32)?;
+                                x_gen = Tensor::new(
+                                    Shape::new(vec![1, 1, hidden_size]),
+                                    xb,
+                                    backend.clone(),
+                                );
+                                gen_ws = LayerWorkspace::new(
+                                    WorkspaceConfig {
+                                        batch_size: 1,
+                                        dim: model.config.hidden_size,
+                                        q_dim,
+                                        k_dim,
+                                        v_dim,
+                                        ffn_hidden,
+                                        n_heads: model.config.num_attention_heads,
+                                        max_seq_len: args.max_seq_len,
+                                    },
+                                    gpu_mem.as_ref(),
+                                    backend.clone(),
+                                )?;
+                                #[cfg(feature = "opencl")]
+                                {
+                                    gpu_plan = None;
+                                }
+                                is_gpu = true;
+                                eprintln!("[Hybrid] Resilience: Switched to GPU.");
+                            }
+                            _ => {} // Already on requested backend
+                        }
+                    } else {
+                        log::warn!(
+                            "[Resilience] SwitchHw: no secondary backend (use --backend hybrid)"
+                        );
+                    }
                 }
 
                 throttle_delay_ms = plan.throttle_delay_ms;

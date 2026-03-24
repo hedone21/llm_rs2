@@ -12,7 +12,7 @@
 
 | # | Action | 상태 | 동적 제어 | 비고 |
 |---|--------|------|----------|------|
-| W1 | GPU↔CPU Switch | ✅ 완전 | `generate_hybrid` | KV migration 포함 |
+| W1 | GPU↔CPU Switch | ✅ 완전 | `generate --backend hybrid` | KV migration 포함, generate에 통합 |
 | W2 | KV Offload Disk | ❌ 스텁 | — | DiskStore 의도적 제거됨 |
 | W3 | Throttle | ✅ 완전 | Resilience signal | Thermal/Compute/Energy 전략 |
 | C1 | SWIFT Layer Skip | ❌ 전무 | — | 코드 전무, 가장 복잡 |

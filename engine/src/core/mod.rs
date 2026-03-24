@@ -6,6 +6,7 @@ pub mod events;
 pub mod eviction;
 pub mod kivi_cache;
 pub mod kv_cache;
+pub mod kv_migrate;
 pub mod math_utils;
 pub mod memory;
 pub mod offload;

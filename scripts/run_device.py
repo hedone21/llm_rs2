@@ -104,7 +104,7 @@ def main() -> int:
             deploy_eval_files(conn, device, _PROJECT_ROOT / "experiments" / "prompts", dry_run=args.dry_run)
 
         # Verify model if it's an inference binary
-        if binary_name in ("generate", "generate_hybrid") and not args.dry_run:
+        if binary_name in ("generate", "generate") and not args.dry_run:
             verify_model(conn, device)
     else:
         print("\n[2/3] Deploy skipped")
@@ -129,7 +129,7 @@ def main() -> int:
         if (
             device.paths.model_dir
             and "--model-path" not in args_str
-            and binary_name in ("generate", "generate_hybrid")
+            and binary_name in ("generate", "generate")
         ):
             args_str = f"--model-path {device.paths.model_dir} {args_str}"
 
