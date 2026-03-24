@@ -339,9 +339,9 @@ mod tests {
         let json = r#"{
             "name": "test",
             "directives": [
-                {"at_token": 10, "directive": {"seq_id": 1, "commands": [{"type": "set_memory_level", "level": "critical", "target_ratio": 0.5}]}},
-                {"at_token": 10, "directive": {"seq_id": 2, "commands": [{"type": "set_compute_level", "level": "warning", "target_throughput": 0.7}]}},
-                {"at_token": 20, "directive": {"seq_id": 3, "commands": [{"type": "set_compute_level", "level": "normal", "target_throughput": 1.0}]}}
+                {"at_token": 10, "directive": {"seq_id": 1, "commands": [{"type": "kv_evict_h2o", "keep_ratio": 0.5}]}},
+                {"at_token": 10, "directive": {"seq_id": 2, "commands": [{"type": "throttle", "delay_ms": 30}]}},
+                {"at_token": 20, "directive": {"seq_id": 3, "commands": [{"type": "restore_defaults"}]}}
             ]
         }"#;
         let schedule: ExperimentSchedule = serde_json::from_str(json).unwrap();

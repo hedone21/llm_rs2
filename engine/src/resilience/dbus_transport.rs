@@ -1,6 +1,6 @@
 use super::signal::{ComputeReason, EnergyReason, Level, RecommendedBackend, SystemSignal};
 use super::transport::{Transport, TransportError};
-use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage, ResourceLevel};
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
 
 /// D-Bus well-known name for the LLM resource manager.
 const MANAGER_DEST: &str = "org.llm.Manager1";
@@ -34,102 +34,76 @@ impl DbusTransport {
     fn signal_to_manager_message(&mut self, signal: SystemSignal) -> ManagerMessage {
         let commands = match signal {
             SystemSignal::MemoryPressure { level, .. } => {
-                let (res_level, target_ratio) = match level {
-                    Level::Normal => (ResourceLevel::Normal, 1.0),
-                    Level::Warning => (ResourceLevel::Warning, 0.85),
-                    Level::Critical => (ResourceLevel::Critical, 0.50),
+                match level {
+                    Level::Normal => vec![EngineCommand::RestoreDefaults],
+                    Level::Warning => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.85 }],
+                    Level::Critical => vec![EngineCommand::KvEvictH2o { keep_ratio: 0.50 }],
                     Level::Emergency => {
-                        // Emergency maps to Suspend
                         return ManagerMessage::Directive(EngineDirective {
                             seq_id: self.next_seq(),
                             commands: vec![EngineCommand::Suspend],
                         });
                     }
-                };
-                vec![EngineCommand::SetMemoryLevel {
-                    level: res_level,
-                    target_ratio,
-                    deadline_ms: None,
-                }]
+                }
             }
             SystemSignal::ComputeGuidance {
                 level,
                 recommended_backend,
                 ..
             } => {
-                let (res_level, throughput) = match level {
-                    Level::Normal => (ResourceLevel::Normal, 1.0),
-                    Level::Warning => (ResourceLevel::Warning, 0.7),
-                    Level::Critical => (ResourceLevel::Critical, 0.3),
+                let device = match recommended_backend {
+                    RecommendedBackend::Cpu => "cpu",
+                    RecommendedBackend::Gpu => "gpu",
+                    RecommendedBackend::Any => "any",
+                };
+                match level {
+                    Level::Normal => vec![EngineCommand::RestoreDefaults],
+                    Level::Warning => vec![
+                        EngineCommand::Throttle { delay_ms: 30 },
+                        EngineCommand::SwitchHw {
+                            device: device.to_string(),
+                        },
+                    ],
+                    Level::Critical => vec![
+                        EngineCommand::Throttle { delay_ms: 70 },
+                        EngineCommand::SwitchHw {
+                            device: device.to_string(),
+                        },
+                    ],
                     Level::Emergency => {
                         return ManagerMessage::Directive(EngineDirective {
                             seq_id: self.next_seq(),
                             commands: vec![EngineCommand::Suspend],
                         });
                     }
-                };
-                let device = match recommended_backend {
-                    RecommendedBackend::Cpu => "cpu",
-                    RecommendedBackend::Gpu => "gpu",
-                    RecommendedBackend::Any => "any",
-                };
-                vec![
-                    EngineCommand::SetComputeLevel {
-                        level: res_level,
-                        target_throughput: throughput,
-                        deadline_ms: None,
-                    },
-                    EngineCommand::SwitchComputeUnit {
-                        device: device.to_string(),
-                    },
-                ]
+                }
             }
             SystemSignal::ThermalAlert { level, .. } => match level {
-                Level::Normal => vec![EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Normal,
-                    target_throughput: 1.0,
-                    deadline_ms: None,
-                }],
+                Level::Normal => vec![EngineCommand::RestoreDefaults],
                 Level::Warning => vec![
-                    EngineCommand::SetComputeLevel {
-                        level: ResourceLevel::Warning,
-                        target_throughput: 0.7,
-                        deadline_ms: None,
-                    },
+                    EngineCommand::Throttle { delay_ms: 30 },
                     EngineCommand::PrepareComputeUnit {
                         device: "cpu".to_string(),
                     },
                 ],
                 Level::Critical => vec![
-                    EngineCommand::SetComputeLevel {
-                        level: ResourceLevel::Critical,
-                        target_throughput: 0.3,
-                        deadline_ms: Some(1000),
-                    },
-                    EngineCommand::SwitchComputeUnit {
+                    EngineCommand::Throttle { delay_ms: 70 },
+                    EngineCommand::SwitchHw {
                         device: "cpu".to_string(),
                     },
                 ],
                 Level::Emergency => vec![EngineCommand::Suspend],
             },
             SystemSignal::EnergyConstraint { level, .. } => match level {
-                Level::Normal => vec![EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Normal,
-                    target_throughput: 1.0,
-                    deadline_ms: None,
-                }],
-                Level::Warning => vec![EngineCommand::SwitchComputeUnit {
+                Level::Normal => vec![EngineCommand::RestoreDefaults],
+                Level::Warning => vec![EngineCommand::SwitchHw {
                     device: "cpu".to_string(),
                 }],
                 Level::Critical => vec![
-                    EngineCommand::SwitchComputeUnit {
+                    EngineCommand::SwitchHw {
                         device: "cpu".to_string(),
                     },
-                    EngineCommand::SetComputeLevel {
-                        level: ResourceLevel::Critical,
-                        target_throughput: 0.3,
-                        deadline_ms: None,
-                    },
+                    EngineCommand::Throttle { delay_ms: 70 },
                 ],
                 Level::Emergency => vec![EngineCommand::Suspend],
             },

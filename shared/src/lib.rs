@@ -163,27 +163,36 @@ pub enum EngineState {
 }
 
 /// Manager → Engine command.
+/// Action-specific variants that preserve Manager's cross-domain selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineCommand {
-    /// Set compute resource level with optional throughput target.
-    SetComputeLevel {
-        level: ResourceLevel,
-        target_throughput: f32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        deadline_ms: Option<u64>,
+    // ── Compute domain ──
+    /// Throttle token generation by inserting delay between tokens.
+    Throttle { delay_ms: u64 },
+    /// Skip transformer layers to reduce compute load.
+    LayerSkip { skip_ratio: f32 },
+
+    // ── Memory domain ──
+    /// Evict KV cache entries using H2O (Heavy-Hitter Oracle) policy.
+    KvEvictH2o { keep_ratio: f32 },
+    /// Evict KV cache entries using sliding window policy.
+    KvEvictSliding { keep_ratio: f32 },
+    /// Evict KV cache using StreamingLLM (sink + window) policy.
+    KvStreaming {
+        sink_size: usize,
+        window_size: usize,
     },
-    /// Switch active compute unit (e.g., "cpu", "gpu", "opencl").
-    SwitchComputeUnit { device: String },
+    /// Dynamically transition KV cache quantization bits.
+    KvQuantDynamic { target_bits: u8 },
+
+    // ── Lifecycle ──
+    /// Restore all action-induced state to defaults (skip→None, throttle→0).
+    RestoreDefaults,
+    /// Switch active compute unit (e.g., "cpu", "opencl").
+    SwitchHw { device: String },
     /// Pre-warm a compute unit for potential switch.
     PrepareComputeUnit { device: String },
-    /// Set memory pressure level with eviction target.
-    SetMemoryLevel {
-        level: ResourceLevel,
-        target_ratio: f32,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        deadline_ms: Option<u64>,
-    },
     /// Suspend inference immediately.
     Suspend,
     /// Resume from suspended state.
@@ -228,6 +237,21 @@ pub struct EngineStatus {
     pub memory_lossy_min: f32,
     pub state: EngineState,
     pub tokens_generated: usize,
+    /// Actions the Engine can currently execute (evaluated per heartbeat).
+    #[serde(default)]
+    pub available_actions: Vec<String>,
+    /// Actions currently applied (e.g., "kv_evict_h2o", "throttle").
+    #[serde(default)]
+    pub active_actions: Vec<String>,
+    /// Current eviction policy name ("none", "h2o", "sliding", etc.).
+    #[serde(default)]
+    pub eviction_policy: String,
+    /// Current KV cache dtype ("f16", "q8", "q4", "q2").
+    #[serde(default)]
+    pub kv_dtype: String,
+    /// Current layer skip ratio (0.0 = no skip).
+    #[serde(default)]
+    pub skip_ratio: f32,
 }
 
 /// Result of executing a single command.
@@ -331,65 +355,112 @@ mod tests {
     }
 
     #[test]
-    fn test_engine_command_serde_set_compute_level() {
-        let cmd = EngineCommand::SetComputeLevel {
-            level: ResourceLevel::Warning,
-            target_throughput: 0.7,
-            deadline_ms: None,
-        };
+    fn test_engine_command_serde_throttle() {
+        let cmd = EngineCommand::Throttle { delay_ms: 50 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"set_compute_level\""));
-        assert!(json.contains("\"level\":\"warning\""));
+        assert!(json.contains("\"type\":\"throttle\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
-            EngineCommand::SetComputeLevel {
-                level,
-                target_throughput,
-                deadline_ms,
-            } => {
-                assert_eq!(level, ResourceLevel::Warning);
-                assert!((target_throughput - 0.7).abs() < f32::EPSILON);
-                assert!(deadline_ms.is_none());
-            }
-            _ => panic!("Expected SetComputeLevel"),
+            EngineCommand::Throttle { delay_ms } => assert_eq!(delay_ms, 50),
+            _ => panic!("Expected Throttle"),
         }
     }
 
     #[test]
-    fn test_engine_command_serde_set_memory_level() {
-        let cmd = EngineCommand::SetMemoryLevel {
-            level: ResourceLevel::Critical,
-            target_ratio: 0.5,
-            deadline_ms: Some(1000),
-        };
+    fn test_engine_command_serde_layer_skip() {
+        let cmd = EngineCommand::LayerSkip { skip_ratio: 0.25 };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"type\":\"set_memory_level\""));
-        assert!(json.contains("\"deadline_ms\":1000"));
+        assert!(json.contains("\"type\":\"layer_skip\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
-            EngineCommand::SetMemoryLevel {
-                level,
-                target_ratio,
-                deadline_ms,
-            } => {
-                assert_eq!(level, ResourceLevel::Critical);
-                assert!((target_ratio - 0.5).abs() < f32::EPSILON);
-                assert_eq!(deadline_ms, Some(1000));
+            EngineCommand::LayerSkip { skip_ratio } => {
+                assert!((skip_ratio - 0.25).abs() < f32::EPSILON);
             }
-            _ => panic!("Expected SetMemoryLevel"),
+            _ => panic!("Expected LayerSkip"),
         }
     }
 
     #[test]
-    fn test_engine_command_serde_switch_compute_unit() {
-        let cmd = EngineCommand::SwitchComputeUnit {
+    fn test_engine_command_serde_kv_evict_h2o() {
+        let cmd = EngineCommand::KvEvictH2o { keep_ratio: 0.48 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv_evict_h2o\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvEvictH2o { keep_ratio } => {
+                assert!((keep_ratio - 0.48).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvEvictH2o"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_kv_evict_sliding() {
+        let cmd = EngineCommand::KvEvictSliding { keep_ratio: 0.6 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv_evict_sliding\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                assert!((keep_ratio - 0.6).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvEvictSliding"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_kv_streaming() {
+        let cmd = EngineCommand::KvStreaming {
+            sink_size: 4,
+            window_size: 256,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv_streaming\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvStreaming {
+                sink_size,
+                window_size,
+            } => {
+                assert_eq!(sink_size, 4);
+                assert_eq!(window_size, 256);
+            }
+            _ => panic!("Expected KvStreaming"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_kv_quant_dynamic() {
+        let cmd = EngineCommand::KvQuantDynamic { target_bits: 4 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv_quant_dynamic\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvQuantDynamic { target_bits } => assert_eq!(target_bits, 4),
+            _ => panic!("Expected KvQuantDynamic"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_restore_defaults() {
+        let cmd = EngineCommand::RestoreDefaults;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"restore_defaults\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EngineCommand::RestoreDefaults));
+    }
+
+    #[test]
+    fn test_engine_command_serde_switch_hw() {
+        let cmd = EngineCommand::SwitchHw {
             device: "cpu".to_string(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"switch_hw\""));
         let back: EngineCommand = serde_json::from_str(&json).unwrap();
         match back {
-            EngineCommand::SwitchComputeUnit { device } => assert_eq!(device, "cpu"),
-            _ => panic!("Expected SwitchComputeUnit"),
+            EngineCommand::SwitchHw { device } => assert_eq!(device, "cpu"),
+            _ => panic!("Expected SwitchHw"),
         }
     }
 
@@ -413,16 +484,8 @@ mod tests {
         let directive = EngineDirective {
             seq_id: 42,
             commands: vec![
-                EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Warning,
-                    target_throughput: 0.7,
-                    deadline_ms: None,
-                },
-                EngineCommand::SetMemoryLevel {
-                    level: ResourceLevel::Critical,
-                    target_ratio: 0.5,
-                    deadline_ms: Some(1000),
-                },
+                EngineCommand::KvEvictH2o { keep_ratio: 0.48 },
+                EngineCommand::Throttle { delay_ms: 30 },
             ],
         };
         let json = serde_json::to_string(&directive).unwrap();
@@ -465,13 +528,12 @@ mod tests {
         assert_eq!(back.num_layers, 16);
     }
 
-    #[test]
-    fn test_engine_status_serde() {
-        let status = EngineStatus {
+    fn make_test_status() -> EngineStatus {
+        EngineStatus {
             active_device: "cpu".to_string(),
             compute_level: ResourceLevel::Normal,
             actual_throughput: 15.0,
-            memory_level: ResourceLevel::Warning,
+            memory_level: ResourceLevel::Normal,
             kv_cache_bytes: 1024 * 1024,
             kv_cache_tokens: 512,
             kv_cache_utilization: 0.25,
@@ -479,12 +541,44 @@ mod tests {
             memory_lossy_min: 0.01,
             state: EngineState::Running,
             tokens_generated: 100,
-        };
+            available_actions: vec!["throttle".into(), "kv_evict_h2o".into()],
+            active_actions: vec!["throttle".into()],
+            eviction_policy: "none".into(),
+            kv_dtype: "f16".into(),
+            skip_ratio: 0.0,
+        }
+    }
+
+    #[test]
+    fn test_engine_status_serde() {
+        let status = make_test_status();
         let json = serde_json::to_string(&status).unwrap();
         let back: EngineStatus = serde_json::from_str(&json).unwrap();
         assert_eq!(back.state, EngineState::Running);
         assert!((back.actual_throughput - 15.0).abs() < f32::EPSILON);
         assert_eq!(back.kv_cache_tokens, 512);
+        assert_eq!(back.available_actions, vec!["throttle", "kv_evict_h2o"]);
+        assert_eq!(back.active_actions, vec!["throttle"]);
+        assert_eq!(back.eviction_policy, "none");
+        assert_eq!(back.kv_dtype, "f16");
+        assert!((back.skip_ratio - 0.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_engine_status_new_fields_default_on_missing() {
+        // Backward compat: old JSON without new fields should deserialize with defaults
+        let old_json = r#"{
+            "active_device":"cpu","compute_level":"normal","actual_throughput":10.0,
+            "memory_level":"normal","kv_cache_bytes":0,"kv_cache_tokens":0,
+            "kv_cache_utilization":0.0,"memory_lossless_min":1.0,"memory_lossy_min":0.01,
+            "state":"running","tokens_generated":0
+        }"#;
+        let back: EngineStatus = serde_json::from_str(old_json).unwrap();
+        assert!(back.available_actions.is_empty());
+        assert!(back.active_actions.is_empty());
+        assert_eq!(back.eviction_policy, "");
+        assert_eq!(back.kv_dtype, "");
+        assert!((back.skip_ratio - 0.0).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -545,19 +639,7 @@ mod tests {
         assert!(matches!(back, EngineMessage::Capability(_)));
 
         // Heartbeat
-        let msg = EngineMessage::Heartbeat(EngineStatus {
-            active_device: "cpu".into(),
-            compute_level: ResourceLevel::Normal,
-            actual_throughput: 10.0,
-            memory_level: ResourceLevel::Normal,
-            kv_cache_bytes: 0,
-            kv_cache_tokens: 0,
-            kv_cache_utilization: 0.0,
-            memory_lossless_min: 1.0,
-            memory_lossy_min: 0.01,
-            state: EngineState::Idle,
-            tokens_generated: 0,
-        });
+        let msg = EngineMessage::Heartbeat(make_test_status());
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"heartbeat\""));
 

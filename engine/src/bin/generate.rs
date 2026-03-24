@@ -1691,7 +1691,7 @@ fn main() -> anyhow::Result<()> {
 
                 if let Some(ref _device) = plan.switch_device {
                     log::warn!(
-                        "[Resilience] SwitchComputeUnit not supported in single-backend mode"
+                        "[Resilience] SwitchHw not supported in single-backend mode"
                     );
                 }
 
