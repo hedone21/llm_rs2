@@ -1,5 +1,4 @@
 #![allow(unused_unsafe)]
-use crate::backend::cpu::common::CpuBackendCommon;
 use crate::buffer::unified_buffer::UnifiedBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::Buffer;
@@ -1322,10 +1321,6 @@ impl Backend for OpenCLBackend {
         epsilon: f32,
         add_unit: bool,
     ) -> Result<()> {
-        if add_unit {
-            // add_unit (Gemma3 style) falls back to CPU in Phase 1
-            return CpuBackendCommon::new().rms_norm(x, weight, epsilon, add_unit);
-        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
@@ -1339,6 +1334,7 @@ impl Backend for OpenCLBackend {
         let kernel = &kernels.kernel_rms_norm_opt;
         let local_size = 64usize;
         let local_mem_size = local_size * std::mem::size_of::<f32>();
+        let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
 
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
@@ -1346,6 +1342,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&epsilon))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&add_unit_i32))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
@@ -1372,11 +1369,6 @@ impl Backend for OpenCLBackend {
         epsilon: f32,
         add_unit: bool,
     ) -> Result<()> {
-        if add_unit {
-            // add_unit (Gemma3 style) falls back to default trait impl which calls CPU rms_norm
-            self.copy_into(x, out)?;
-            return CpuBackendCommon::new().rms_norm(out, weight, epsilon, add_unit);
-        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
@@ -1392,6 +1384,7 @@ impl Backend for OpenCLBackend {
         let kernel = &kernels.kernel_rms_norm_oop;
         let local_size = 64usize;
         let local_mem_size = local_size * std::mem::size_of::<f32>();
+        let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
 
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
@@ -1400,6 +1393,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&epsilon))?;
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&add_unit_i32))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
@@ -1427,12 +1421,6 @@ impl Backend for OpenCLBackend {
         epsilon: f32,
         add_unit: bool,
     ) -> Result<()> {
-        if add_unit {
-            // add_unit (Gemma3 style) falls back to CPU
-            self.add_assign(x, residual)?;
-            self.copy_into(x, out)?;
-            return CpuBackendCommon::new().rms_norm(out, weight, epsilon, add_unit);
-        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
@@ -1450,6 +1438,7 @@ impl Backend for OpenCLBackend {
         let kernel = &kernels.kernel_add_rms_norm_oop;
         let local_size = 64usize;
         let local_mem_size = local_size * std::mem::size_of::<f32>();
+        let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
 
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
@@ -1459,6 +1448,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&epsilon))?;
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&add_unit_i32))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];

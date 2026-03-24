@@ -34,50 +34,52 @@ kernel void kernel_rms_norm_opt(
     global float * weight,
     int dim,
     float eps,
-    local float * scratch  // local memory for reduction
+    local float * scratch,  // local memory for reduction
+    int add_unit            // Gemma3 style: weight = 1 + weight when nonzero
 ) {
     int row = get_group_id(0);
     int lid = get_local_id(0);
     int local_size = get_local_size(0);
-    
+
     global float * row_ptr = x + row * dim;
-    
+
     // Phase 1: Parallel sum of squares
     float sum_sq = 0.0f;
     for (int i = lid; i < dim; i += local_size) {
         float val = row_ptr[i];
         sum_sq += val * val;
     }
-    
+
     // Subgroup reduction first
     sum_sq = sub_group_reduce_add(sum_sq);
-    
+
     // Store subgroup results to local memory
     if (get_sub_group_local_id() == 0) {
         scratch[get_sub_group_id()] = sum_sq;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
-    
+
     // Final reduction in first subgroup
     int num_subgroups = local_size / get_max_sub_group_size();
     if (get_sub_group_id() == 0) {
         float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
         sum_sq = sub_group_reduce_add(val);
     }
-    
+
     // Broadcast final result
     if (lid == 0) {
         scratch[0] = sum_sq;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     sum_sq = scratch[0];
-    
+
     // Phase 2: Apply normalization
     float rms = sqrt(sum_sq / (float)dim + eps);
     float scale = 1.0f / rms;
-    
+
     for (int i = lid; i < dim; i += local_size) {
-        row_ptr[i] = row_ptr[i] * scale * weight[i];
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        row_ptr[i] = row_ptr[i] * scale * w;
     }
 }
 
@@ -93,7 +95,8 @@ kernel void kernel_add_rms_norm_oop(
     global float * weight,
     int dim,
     float eps,
-    local float * scratch
+    local float * scratch,
+    int add_unit            // Gemma3 style: weight = 1 + weight when nonzero
 ) {
     int row = get_group_id(0);
     int lid = get_local_id(0);
@@ -134,7 +137,8 @@ kernel void kernel_add_rms_norm_oop(
     float scale = 1.0f / rms;
 
     for (int i = lid; i < dim; i += local_size) {
-        out_row[i] = x_row[i] * scale * weight[i];
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        out_row[i] = x_row[i] * scale * w;
     }
 }
 
@@ -149,7 +153,8 @@ kernel void kernel_rms_norm_oop(
     global float * weight,
     int dim,
     float eps,
-    local float * scratch
+    local float * scratch,
+    int add_unit            // Gemma3 style: weight = 1 + weight when nonzero
 ) {
     int row = get_group_id(0);
     int lid = get_local_id(0);
@@ -186,7 +191,8 @@ kernel void kernel_rms_norm_oop(
     float scale = 1.0f / rms;
 
     for (int i = lid; i < dim; i += local_size) {
-        out_row[i] = x_row[i] * scale * weight[i];
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        out_row[i] = x_row[i] * scale * w;
     }
 }
 
