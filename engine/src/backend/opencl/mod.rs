@@ -363,6 +363,7 @@ impl OpenCLBackend {
 
         // F16 GEMV: Adreno-optimized multi-row kernel (Q4 pattern ported to F16)
         let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
+        let f16_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
         let f16_program = match Program::builder()
             .devices(device)
             .src(f16_src)
@@ -374,11 +375,25 @@ impl OpenCLBackend {
                 p
             }
             Err(e) => {
-                log::warn!("mul_mv_f16_f32.cl failed: {}. Using dummy.", e);
-                Program::builder()
+                log::warn!("mul_mv_f16_f32.cl failed: {}. Trying fallback.", e);
+                match Program::builder()
                     .devices(device)
-                    .src("__kernel void kernel_mul_mat_f16_f32() {}")
-                    .build(&context)?
+                    .src(f16_fallback_src)
+                    .cmplr_opt(&cl_opts)
+                    .build(&context)
+                {
+                    Ok(p) => {
+                        log::info!("Using fallback/mul_mv_f16_f32_nosub.cl");
+                        p
+                    }
+                    Err(e2) => {
+                        log::warn!("Fallback F16 also failed: {}. Using dummy.", e2);
+                        Program::builder()
+                            .devices(device)
+                            .src("__kernel void kernel_mul_mat_f16_f32() {}")
+                            .build(&context)?
+                    }
+                }
             }
         };
 
