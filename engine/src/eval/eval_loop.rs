@@ -117,6 +117,9 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
 
         // Reset caches and hook state for this question
         hook.reset_caches(kv_caches);
+        // Flush GPU queue to release deferred OpenCL buffers from previous question.
+        // Without this, NVIDIA's runtime accumulates pending buffer releases → OOM.
+        backend.synchronize()?;
 
         // Tokenize prompt
         let prompt_enc = tokenizer
@@ -238,6 +241,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         profiler: None,
                         skip_config,
                         importance_collector: None,
+                        logits_last_only: false,
                     })?;
                     sp += 1;
 
@@ -473,6 +477,7 @@ fn run_importance_pass<C: KVCacheOps>(
         profiler: None,
         skip_config: None, // intentionally None for importance measurement
         importance_collector: Some(&mut collector),
+        logits_last_only: false,
     })?;
 
     let table = collector.build();
@@ -586,15 +591,14 @@ fn run_full_prefill<C: KVCacheOps>(
     );
     let input_tensor = backend.copy_from(&cpu_input)?;
 
-    let prefill_logits_buf = memory.alloc(prompt_len * vocab_size * 4, DType::F32)?;
+    // Only allocate for last position's logits (saves ~3GB vs full prompt × vocab).
+    let prefill_logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
     let mut prefill_logits = Tensor::new(
-        Shape::new(vec![1, prompt_len, vocab_size]),
+        Shape::new(vec![1, 1, vocab_size]),
         prefill_logits_buf,
         backend.clone(),
     );
 
-    // score_accumulator: full prefill does not need score tracking
-    // (choices are scored via decode steps which use hook.score_accumulator())
     model.forward_into(TransformerModelForwardArgs {
         input_tokens: &input_tensor,
         start_pos: 0,
@@ -609,18 +613,21 @@ fn run_full_prefill<C: KVCacheOps>(
         profiler: None,
         skip_config,
         importance_collector: None,
+        logits_last_only: true,
     })?;
 
-    // Read last-position logits
-    let mut all_logits = vec![0.0f32; prompt_len * vocab_size];
-    // SAFETY: buffer size is prompt_len * vocab_size * 4 bytes.
+    // Read logits (only last position — much smaller than full prompt × vocab)
+    let mut prompt_logits_cpu = vec![0.0f32; vocab_size];
     unsafe {
-        let ptr = all_logits.as_mut_ptr() as *mut u8;
-        let slice = std::slice::from_raw_parts_mut(ptr, all_logits.len() * 4);
+        let ptr = prompt_logits_cpu.as_mut_ptr() as *mut u8;
+        let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
         backend.read_buffer(&prefill_logits, slice)?;
     }
-    let off = (prompt_len - 1) * vocab_size;
-    let prompt_logits_cpu = all_logits[off..off + vocab_size].to_vec();
+
+    // Explicitly drop GPU buffers and flush queue to free VRAM.
+    drop(prefill_logits);
+    drop(input_tensor);
+    backend.synchronize()?;
 
     Ok((prompt_logits_cpu, prompt_len))
 }
@@ -686,6 +693,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
         profiler: None,
         skip_config,
         importance_collector: None,
+        logits_last_only: false,
     })?;
 
     // Evict if over budget after first chunk
@@ -721,6 +729,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
             profiler: None,
             skip_config,
             importance_collector: None,
+            logits_last_only: false,
         })?;
         start_pos += 1;
 

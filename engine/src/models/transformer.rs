@@ -94,6 +94,10 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Optional importance collector for Layer Skip QCF.
     /// When provided during prefill, captures per-layer cosine similarity.
     pub importance_collector: Option<&'a mut crate::core::qcf::ImportanceCollector>,
+    /// When true, only compute logits for the last sequence position.
+    /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
+    /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
+    pub logits_last_only: bool,
 }
 
 impl TransformerModel {
@@ -845,6 +849,13 @@ impl TransformerModel {
                 local_attn_window: self.config.sliding_window,
             })?;
 
+            // Flush GPU queue periodically during prefill to let the driver reclaim
+            // temp buffers. Without this, NVIDIA's OpenCL driver accumulates deferred
+            // releases across 28 layers × 8+ alloc_temp calls and eventually segfaults.
+            if seq_len > 1 && backend.name() == "OpenCL" && (i + 1) % 4 == 0 {
+                backend.synchronize()?;
+            }
+
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
                 let x_data = x.as_slice::<f32>();
@@ -892,8 +903,22 @@ impl TransformerModel {
             is_gemma3,
         )?;
 
-        // 4. Head
-        backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+        // 4. Head — optionally only compute last position's logits to save VRAM
+        if args.logits_last_only && seq_len > 1 {
+            // Extract last hidden state: x[..., seq_len-1, :] → [1, 1, hidden_size]
+            let hidden_size = self.config.hidden_size;
+            let last_offset = (seq_len - 1) * hidden_size;
+            let last_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+            let mut x_last = Tensor::new(
+                Shape::new(vec![1, 1, hidden_size]),
+                last_buf,
+                backend.clone(),
+            );
+            backend.copy_slice(&x, &mut x_last, last_offset, 0, hidden_size)?;
+            backend.matmul_transposed(&x_last, &self.lm_head, logits_out)?;
+        } else {
+            backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+        }
 
         Ok(())
     }

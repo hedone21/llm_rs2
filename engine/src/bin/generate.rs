@@ -907,6 +907,7 @@ fn main() -> anyhow::Result<()> {
             profiler: None,
             skip_config: None,
             importance_collector: Some(&mut collector),
+            logits_last_only: false,
         })?;
 
         let table = collector.build();
@@ -1102,6 +1103,7 @@ fn main() -> anyhow::Result<()> {
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
         backend.synchronize()?;
 
@@ -1170,6 +1172,7 @@ fn main() -> anyhow::Result<()> {
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
         backend.synchronize()?;
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
@@ -1374,6 +1377,7 @@ fn main() -> anyhow::Result<()> {
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
                     skip_config: None,
                     importance_collector: None,
+                    logits_last_only: false,
                 })?;
 
                 // Rebuild plan after fallback (KV cache may have grown)
@@ -2141,6 +2145,7 @@ fn run_kivi_ppl(
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -2215,6 +2220,7 @@ fn run_kivi_ppl(
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
         start_pos += 1;
 
@@ -2437,6 +2443,7 @@ fn run_kivi(
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
 
         // Sample last token from prefill logits
@@ -2524,6 +2531,7 @@ fn run_kivi(
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -2830,6 +2838,7 @@ fn run_offload(
             profiler: None,
             skip_config: None,
             importance_collector: None,
+            logits_last_only: false,
         })?;
 
         // Sample last token from prefill logits
@@ -2922,6 +2931,7 @@ fn run_offload(
                 profiler: None,
                 skip_config: None,
                 importance_collector: None,
+                logits_last_only: false,
             },
             &mut prefetch,
         )?;
@@ -3188,6 +3198,7 @@ fn run_ppl(
             profiler: None,
             skip_config,
             importance_collector: None,
+            logits_last_only: false,
         })?;
 
         // Read all prefill logits to CPU
@@ -3250,6 +3261,7 @@ fn run_ppl(
             profiler: None,
             skip_config,
             importance_collector: None,
+            logits_last_only: false,
         })?;
         start_pos += 1;
 

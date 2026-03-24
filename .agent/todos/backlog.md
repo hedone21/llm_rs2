@@ -58,7 +58,7 @@
 - **Notes**: regression_test.py 3/3 FAIL (nvidia), 2/3 PASS (cpu)
 
 ## [P1] Manager ↔ Engine 프로토콜 이슈 (E2E 테스트에서 발견)
-- **Status**: TODO
+- **Status**: DONE
 - **Sprint**: next
 - **Dependencies**: 없음
 - **Description**: |
