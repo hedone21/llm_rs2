@@ -12,7 +12,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use llm_shared::{EngineCommand, EngineDirective, Level, ResourceLevel, SystemSignal};
+use llm_shared::{
+    EngineCommand, EngineDirective, EngineMessage, Level, ResourceLevel, SystemSignal,
+};
 
 use crate::action_registry::ActionRegistry;
 use crate::config::PolicyConfig;
@@ -23,6 +25,7 @@ use crate::selector::ActionSelector;
 use crate::supervisory::SupervisoryLayer;
 use crate::types::{
     ActionCommand, ActionId, FEATURE_DIM, FeatureVector, OperatingMode, Operation, PressureVector,
+    feature,
 };
 
 /// 이전 액션 효과 관측을 위한 컨텍스트.
@@ -248,6 +251,46 @@ impl PolicyPipeline {
                 log::info!("Saved relief model to {}", path);
             }
         }
+    }
+
+    /// Engine heartbeat에서 `engine_state` feature vector를 갱신한다.
+    ///
+    /// `37_protocol_design.md §6`의 Feature Vector 스키마를 따른다.
+    /// Heartbeat 이외의 메시지 (Capability, Response)는 무시한다.
+    pub fn update_engine_state(&mut self, msg: &EngineMessage) {
+        let EngineMessage::Heartbeat(status) = msg else {
+            return;
+        };
+
+        let v = &mut self.engine_state.values;
+
+        // [0] KV 점유율 (0.0 ~ 1.0)
+        v[feature::KV_OCCUPANCY] = status.kv_cache_utilization;
+
+        // [1] GPU 사용 여부 (active_device에 "opencl" 포함 시 1.0)
+        v[feature::IS_GPU] = if status.active_device.contains("opencl") {
+            1.0
+        } else {
+            0.0
+        };
+
+        // [2] 토큰 진행률 (kv_cache_tokens / 2048)
+        const DEFAULT_MAX_TOKENS: f32 = 2048.0;
+        v[feature::TOKEN_PROGRESS] = (status.kv_cache_tokens as f32 / DEFAULT_MAX_TOKENS).min(1.0);
+
+        // [5] TBT 비율 (actual_throughput / 100.0 으로 정규화)
+        v[feature::TBT_RATIO] = (status.actual_throughput / 100.0).clamp(0.0, 1.0);
+
+        // [6] 생성 토큰 정규화 (tokens_generated / 2048)
+        v[feature::TOKENS_GENERATED_NORM] =
+            (status.tokens_generated as f32 / DEFAULT_MAX_TOKENS).min(1.0);
+
+        // [10] 활성 eviction 여부 (memory_level이 Normal이 아니면 1.0)
+        v[feature::ACTIVE_EVICTION] = if status.memory_level != llm_shared::ResourceLevel::Normal {
+            1.0
+        } else {
+            0.0
+        };
     }
 
     // ── 내부 헬퍼 ──────────────────────────────────────────────────────────
@@ -640,6 +683,91 @@ mod tests {
             engine_cmds.is_empty(),
             "Release should produce no engine command"
         );
+    }
+
+    // ── update_engine_state 테스트 ─────────────────────────────────────────
+
+    fn make_heartbeat_msg(
+        kv: f32,
+        device: &str,
+        memory_level: llm_shared::ResourceLevel,
+    ) -> llm_shared::EngineMessage {
+        use llm_shared::{EngineMessage, EngineState, EngineStatus, ResourceLevel};
+        EngineMessage::Heartbeat(EngineStatus {
+            active_device: device.to_string(),
+            compute_level: ResourceLevel::Normal,
+            actual_throughput: 20.0,
+            memory_level,
+            kv_cache_bytes: 0,
+            kv_cache_tokens: (kv * 2048.0) as usize,
+            kv_cache_utilization: kv,
+            memory_lossless_min: 1.0,
+            memory_lossy_min: 0.01,
+            state: EngineState::Running,
+            tokens_generated: 512,
+        })
+    }
+
+    /// Heartbeat에서 engine_state feature vector가 갱신된다
+    #[test]
+    fn engine_state_updated_from_heartbeat() {
+        use crate::types::feature;
+        let mut p = make_pipeline();
+
+        // 초기값은 zero
+        assert_eq!(p.engine_state.values[feature::KV_OCCUPANCY], 0.0);
+
+        let msg = make_heartbeat_msg(0.75, "opencl", llm_shared::ResourceLevel::Critical);
+        p.update_engine_state(&msg);
+
+        assert!((p.engine_state.values[feature::KV_OCCUPANCY] - 0.75).abs() < 1e-5);
+        assert!((p.engine_state.values[feature::IS_GPU] - 1.0).abs() < 1e-5);
+        assert!((p.engine_state.values[feature::TOKEN_PROGRESS] - 0.75).abs() < 1e-5);
+        assert!((p.engine_state.values[feature::TBT_RATIO] - 0.2).abs() < 1e-5);
+        assert!(
+            (p.engine_state.values[feature::TOKENS_GENERATED_NORM] - 512.0 / 2048.0).abs() < 1e-5
+        );
+        assert!((p.engine_state.values[feature::ACTIVE_EVICTION] - 1.0).abs() < 1e-5);
+    }
+
+    /// CPU 디바이스이면 IS_GPU = 0.0
+    #[test]
+    fn engine_state_cpu_device_gives_is_gpu_zero() {
+        use crate::types::feature;
+        let mut p = make_pipeline();
+
+        let msg = make_heartbeat_msg(0.5, "cpu", llm_shared::ResourceLevel::Normal);
+        p.update_engine_state(&msg);
+
+        assert!((p.engine_state.values[feature::IS_GPU]).abs() < 1e-5);
+        assert!((p.engine_state.values[feature::ACTIVE_EVICTION]).abs() < 1e-5);
+    }
+
+    /// Capability, Response 메시지는 engine_state를 변경하지 않음
+    #[test]
+    fn non_heartbeat_message_does_not_change_engine_state() {
+        use crate::types::feature;
+        use llm_shared::{CommandResponse, CommandResult, EngineCapability, EngineMessage};
+        let mut p = make_pipeline();
+
+        let before = p.engine_state.values[feature::KV_OCCUPANCY];
+
+        // Capability 메시지
+        p.update_engine_state(&EngineMessage::Capability(EngineCapability {
+            available_devices: vec!["cpu".into()],
+            active_device: "cpu".into(),
+            max_kv_tokens: 2048,
+            bytes_per_kv_token: 256,
+            num_layers: 16,
+        }));
+        assert!((p.engine_state.values[feature::KV_OCCUPANCY] - before).abs() < 1e-5);
+
+        // Response 메시지
+        p.update_engine_state(&EngineMessage::Response(CommandResponse {
+            seq_id: 1,
+            results: vec![CommandResult::Ok],
+        }));
+        assert!((p.engine_state.values[feature::KV_OCCUPANCY] - before).abs() < 1e-5);
     }
 
     /// prev_mode 추적: Normal → process_signal 후 mode 갱신 확인

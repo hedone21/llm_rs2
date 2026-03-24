@@ -1,4 +1,5 @@
 pub mod action_registry;
+pub mod channel;
 pub mod config;
 pub mod emitter;
 pub mod evaluator;

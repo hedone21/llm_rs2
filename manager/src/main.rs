@@ -1,4 +1,6 @@
 use clap::Parser;
+use llm_manager::channel::EngineReceiver;
+use llm_manager::channel::unix_socket::UnixSocketChannel;
 use llm_manager::config::{Config, PolicyConfig};
 use llm_manager::emitter::Emitter;
 use llm_manager::monitor::Monitor;
@@ -9,11 +11,44 @@ use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
 use llm_manager::pipeline::PolicyPipeline;
 use llm_manager::policy::{MonitorSnapshot, PolicyEngine};
-use llm_shared::SystemSignal;
+use llm_shared::{EngineMessage, SystemSignal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// Transport 핸들. unix socket은 양방향, dbus는 emit-only.
+enum TransportHandle {
+    /// Unix socket — Emitter + EngineReceiver 겸용.
+    Unix(UnixSocketChannel),
+    /// D-Bus 또는 기타 단방향 emitter.
+    EmitterOnly(Box<dyn Emitter>),
+}
+
+impl TransportHandle {
+    fn emitter(&mut self) -> &mut dyn Emitter {
+        match self {
+            Self::Unix(ch) => ch,
+            Self::EmitterOnly(em) => em.as_mut(),
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Unix(ch) => ch.name(),
+            Self::EmitterOnly(em) => em.name(),
+        }
+    }
+
+    /// Engine으로부터 메시지를 non-blocking으로 수신한다.
+    /// Unix transport일 때만 실제 수신 시도. dbus는 항상 None.
+    fn try_recv_engine_message(&mut self) -> Option<EngineMessage> {
+        match self {
+            Self::Unix(ch) => ch.try_recv().ok().flatten(),
+            Self::EmitterOnly(_) => None,
+        }
+    }
+}
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
@@ -80,9 +115,9 @@ fn main() -> anyhow::Result<()> {
 
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Create emitter
-    let mut emitter: Box<dyn Emitter> = create_emitter(&args, &shutdown)?;
-    log::info!("Emitter: {}", emitter.name());
+    // Create transport (unix: 양방향, dbus: 단방향)
+    let mut transport = create_transport(&args, &shutdown)?;
+    log::info!("Transport: {}", transport.name());
 
     // Build monitors
     let monitors = build_monitors(&config);
@@ -127,7 +162,7 @@ fn main() -> anyhow::Result<()> {
 
     // Emit initial state: pipeline mode uses Directive format, legacy uses raw signal
     if args.legacy_passthrough {
-        emitter.emit_initial(&initial_signals)?;
+        transport.emitter().emit_initial(&initial_signals)?;
     } else if let Some(ref mut p) = pipeline {
         for signal in &initial_signals {
             if let Some(directive) = p.process_signal(signal) {
@@ -136,7 +171,7 @@ fn main() -> anyhow::Result<()> {
                     directive.seq_id,
                     directive.commands.len()
                 );
-                emitter.emit_directive(&directive)?;
+                transport.emitter().emit_directive(&directive)?;
             }
         }
     }
@@ -152,13 +187,39 @@ fn main() -> anyhow::Result<()> {
             break;
         }
 
+        // ── Engine message 수신 (unix transport일 때만 유효) ──────────────
+        while let Some(msg) = transport.try_recv_engine_message() {
+            match &msg {
+                EngineMessage::Heartbeat(status) => {
+                    if let Some(ref mut p) = pipeline {
+                        p.update_engine_state(&msg);
+                    }
+                    log::debug!(
+                        "Engine heartbeat: kv={:.2} device={}",
+                        status.kv_cache_utilization,
+                        status.active_device
+                    );
+                }
+                EngineMessage::Response(resp) => {
+                    log::info!(
+                        "Engine response seq={}: {} results",
+                        resp.seq_id,
+                        resp.results.len()
+                    );
+                }
+                EngineMessage::Capability(cap) => {
+                    log::info!("Engine capability: devices={:?}", cap.available_devices);
+                }
+            }
+        }
+
         match rx.recv_timeout(Duration::from_millis(50)) {
             Ok(signal) => {
                 log::info!("Signal: {:?}", signal);
 
                 if args.legacy_passthrough {
                     // Legacy mode: pass raw signals directly to emitter
-                    if let Err(e) = emitter.emit(&signal) {
+                    if let Err(e) = transport.emitter().emit(&signal) {
                         log::error!("Emit failed: {}", e);
                     }
                 } else if let Some(ref mut p) = pipeline {
@@ -170,7 +231,7 @@ fn main() -> anyhow::Result<()> {
                             directive.commands.len(),
                             p.mode()
                         );
-                        if let Err(e) = emitter.emit_directive(&directive) {
+                        if let Err(e) = transport.emitter().emit_directive(&directive) {
                             log::error!("Emit directive failed: {}", e);
                         }
                     }
@@ -183,7 +244,7 @@ fn main() -> anyhow::Result<()> {
                             directive.seq_id,
                             directive.commands.len()
                         );
-                        if let Err(e) = emitter.emit_directive(&directive) {
+                        if let Err(e) = transport.emitter().emit_directive(&directive) {
                             log::error!("Emit legacy directive failed: {}", e);
                         }
                     }
@@ -252,24 +313,23 @@ fn load_policy_config(args: &Args, config: &Config) -> PolicyConfig {
     PolicyConfig::default()
 }
 
-fn create_emitter(args: &Args, shutdown: &Arc<AtomicBool>) -> anyhow::Result<Box<dyn Emitter>> {
+fn create_transport(args: &Args, shutdown: &Arc<AtomicBool>) -> anyhow::Result<TransportHandle> {
     if let Some(path) = args.transport.strip_prefix("unix:") {
-        let mut emitter =
-            llm_manager::emitter::unix_socket::UnixSocketEmitter::new(std::path::Path::new(path))?;
+        let mut channel = UnixSocketChannel::new(std::path::Path::new(path))?;
         log::info!(
             "Waiting for client on {} (timeout={}s)...",
             path,
             args.client_timeout
         );
-        if !emitter.wait_for_client(Duration::from_secs(args.client_timeout), shutdown) {
+        if !channel.wait_for_client(Duration::from_secs(args.client_timeout), shutdown) {
             if shutdown.load(Ordering::Relaxed) {
                 anyhow::bail!("Shutdown during client wait");
             }
             log::warn!("No client connected within timeout, proceeding anyway");
         }
-        Ok(Box::new(emitter))
+        Ok(TransportHandle::Unix(channel))
     } else if args.transport == "dbus" {
-        create_dbus_emitter()
+        Ok(TransportHandle::EmitterOnly(create_dbus_emitter()?))
     } else {
         anyhow::bail!(
             "Unknown transport: {}. Use 'dbus' or 'unix:<path>'",
