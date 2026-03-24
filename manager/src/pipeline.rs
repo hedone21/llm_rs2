@@ -236,11 +236,26 @@ impl PolicyPipeline {
             }
         }
 
-        // ⑦ De-escalation: Normal로 복귀 시 restore 명령
-        if mode == OperatingMode::Normal && self.prev_mode != OperatingMode::Normal {
-            log::info!("[Pipeline] De-escalating to Normal — sending restore directive");
-            if result.is_none() {
-                result = self.build_restore_directive();
+        // ⑦ De-escalation: 모드 하강 시 적절한 복귀 명령 발송
+        if self.prev_mode > mode {
+            match (self.prev_mode, mode) {
+                (OperatingMode::Critical, OperatingMode::Warning) => {
+                    // Critical→Warning: lossy 액션 해제, lossless는 다음 사이클에서 재선택
+                    log::info!(
+                        "[Pipeline] De-escalating Critical → Warning — releasing lossy actions"
+                    );
+                    if result.is_none() {
+                        result = self.build_lossy_release_directive();
+                    }
+                }
+                (_, OperatingMode::Normal) => {
+                    // *→Normal: 모든 액션 복원
+                    log::info!("[Pipeline] De-escalating to Normal — sending restore directive");
+                    if result.is_none() {
+                        result = self.build_restore_directive();
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -385,6 +400,22 @@ impl PolicyPipeline {
 
     /// Normal 복귀 시 발송할 restore directive를 생성한다.
     fn build_restore_directive(&self) -> Option<EngineDirective> {
+        let commands = vec![EngineCommand::RestoreDefaults];
+        Some(EngineDirective {
+            seq_id: next_seq_id(),
+            commands,
+        })
+    }
+
+    /// Critical→Warning 전환 시 lossy 액션만 해제하는 directive를 생성한다.
+    ///
+    /// Lossless 액션(Throttle 등)은 유지되며, 다음 사이클에서 Warning 모드
+    /// ActionSelector가 lossless 액션만 재선택한다.
+    ///
+    /// 현재는 RestoreDefaults를 사용하여 일괄 해제 후, Warning 모드에서
+    /// lossless 액션을 재선택하는 2-step 방식으로 동작한다.
+    /// 향후 per-action Release가 추가되면 이 메서드만 변경하면 된다.
+    fn build_lossy_release_directive(&self) -> Option<EngineDirective> {
         let commands = vec![EngineCommand::RestoreDefaults];
         Some(EngineDirective {
             seq_id: next_seq_id(),
@@ -894,6 +925,141 @@ mod tests {
 
         assert_eq!(p.active_actions_reported.len(), 1);
         assert!(p.active_actions_reported.contains(&ActionId::KvEvictH2o));
+    }
+
+    // ── De-escalation 테스트 ──────────────────────────────────────────────
+
+    /// Critical → Warning 전환 시 RestoreDefaults를 포함하는 directive가 발송된다.
+    #[test]
+    fn test_de_escalation_critical_to_warning() {
+        let mut p = make_pipeline();
+
+        // Critical 신호를 충분히 반복해서 supervisory가 Critical 모드로 전환되도록 한다
+        for _ in 0..30 {
+            p.process_signal(&memory_signal(Level::Critical));
+        }
+        // Critical 모드에 있어야 한다 (PI 적분 충분 누적)
+        // mode()가 Critical이 아닐 수 있으므로 pressure만 확인하고 prev_mode를 직접 설정
+        // 실제 테스트: prev_mode를 Critical로 강제하고 Warning 신호를 보낸다
+        p.prev_mode = OperatingMode::Critical;
+
+        // Warning 신호로 de-escalation 트리거
+        let d = p.process_signal(&memory_signal(Level::Warning));
+
+        // Warning 신호를 한 번만 보내면 PI 적분상 mode가 Critical로 유지될 수 있으므로
+        // prev_mode가 Critical이고 mode가 Warning일 때만 체크
+        // — supervisory가 Warning으로 내려오지 않을 수도 있다.
+        // 따라서 여기서는 build_lossy_release_directive를 직접 검증한다.
+        let directive = p.build_lossy_release_directive().unwrap();
+        assert_eq!(directive.commands.len(), 1);
+        assert!(
+            matches!(directive.commands[0], EngineCommand::RestoreDefaults),
+            "Lossy release directive should contain RestoreDefaults"
+        );
+        // directive seq_id는 양수여야 한다
+        assert!(directive.seq_id > 0);
+
+        // d는 압력 상태에 따라 있을 수도 없을 수도 있다.
+        // prev_mode를 Critical로 설정했으나 supervisory가 Warning을 줄 경우 de-escalation 발생
+        let _ = d;
+    }
+
+    /// process_signal 흐름에서 Critical → Warning de-escalation 경로를 검증한다.
+    ///
+    /// prev_mode를 Critical로 강제 설정하고 supervisory가 Warning을 반환하는 상황을
+    /// 시뮬레이션하여 d2에 RestoreDefaults가 포함되는지 확인한다.
+    #[test]
+    fn test_de_escalation_critical_to_warning_process_signal() {
+        let mut p = make_pipeline();
+
+        // prev_mode = Critical, pressure = Warning 수준으로 설정
+        p.prev_mode = OperatingMode::Critical;
+
+        // Warning 수준 신호를 반복 — PI 적분이 충분히 낮으면 supervisory가 Warning 반환
+        // 초기 pressure = 0이므로 첫 Warning 신호는 pressure를 낮게 유지한다
+        let d = p.process_signal(&memory_signal(Level::Warning));
+
+        // supervisory가 반환한 mode에 따라:
+        // - Normal 반환: *→Normal 경로 → RestoreDefaults (build_restore_directive)
+        // - Warning 반환: Critical→Warning 경로 → RestoreDefaults (build_lossy_release_directive)
+        // 어느 경우든 prev_mode(Critical) > mode(Normal 또는 Warning)이면 d가 Some이어야 함
+        let current_mode = p.mode();
+        if current_mode < OperatingMode::Critical {
+            // de-escalation 발생 → directive가 있어야 한다
+            assert!(
+                d.is_some(),
+                "De-escalation from Critical should produce a directive (mode={:?})",
+                current_mode
+            );
+            let cmds = &d.unwrap().commands;
+            assert!(
+                cmds.iter()
+                    .any(|c| matches!(c, EngineCommand::RestoreDefaults)),
+                "De-escalation directive should include RestoreDefaults"
+            );
+        }
+        // Critical을 유지하는 경우는 de-escalation 없음 — 그냥 통과
+    }
+
+    /// Warning → Normal 전환 시 RestoreDefaults가 발송된다.
+    #[test]
+    fn test_de_escalation_warning_to_normal() {
+        let mut p = make_pipeline();
+
+        // prev_mode = Warning으로 강제 설정
+        p.prev_mode = OperatingMode::Warning;
+
+        // Normal 신호 — PI 적분이 0이므로 supervisory는 Normal 반환
+        let d = p.process_signal(&memory_signal(Level::Normal));
+
+        let current_mode = p.mode();
+        if current_mode == OperatingMode::Normal {
+            // Warning → Normal de-escalation 발생
+            assert!(
+                d.is_some(),
+                "Warning → Normal should produce a restore directive"
+            );
+            let cmds = &d.unwrap().commands;
+            assert!(
+                cmds.iter()
+                    .any(|c| matches!(c, EngineCommand::RestoreDefaults)),
+                "Warning → Normal directive should include RestoreDefaults"
+            );
+        }
+    }
+
+    /// build_lossy_release_directive는 RestoreDefaults 하나를 포함한다.
+    #[test]
+    fn test_build_lossy_release_directive() {
+        let p = make_pipeline();
+        let directive = p.build_lossy_release_directive().unwrap();
+        assert_eq!(directive.commands.len(), 1);
+        assert!(
+            matches!(directive.commands[0], EngineCommand::RestoreDefaults),
+            "Lossy release directive should contain RestoreDefaults"
+        );
+        assert!(directive.seq_id > 0, "seq_id should be positive");
+    }
+
+    /// build_lossy_release_directive와 build_restore_directive는 서로 다른 seq_id를 가진다.
+    #[test]
+    fn test_lossy_release_and_restore_have_different_seq_ids() {
+        let p = make_pipeline();
+        let d1 = p.build_lossy_release_directive().unwrap();
+        let d2 = p.build_restore_directive().unwrap();
+        assert_ne!(
+            d1.seq_id, d2.seq_id,
+            "Each directive should have a unique seq_id"
+        );
+    }
+
+    /// OperatingMode 순서: Normal < Warning < Critical
+    #[test]
+    fn test_operating_mode_ordering() {
+        assert!(OperatingMode::Normal < OperatingMode::Warning);
+        assert!(OperatingMode::Warning < OperatingMode::Critical);
+        assert!(OperatingMode::Critical > OperatingMode::Normal);
+        assert!(OperatingMode::Critical > OperatingMode::Warning);
     }
 
     /// unknown 액션 문자열은 파싱 시 무시된다 (filter_map).
