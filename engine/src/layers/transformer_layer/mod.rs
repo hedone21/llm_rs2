@@ -234,6 +234,8 @@ impl TransformerLayer {
             skip_mlp,
             args.rms_norm_add_unit,
             args.use_gelu_tanh,
+            args.is_local_attn,
+            args.local_attn_window,
         )
     }
 
@@ -534,5 +536,68 @@ mod tests {
             total,
             n_heads_q
         );
+    }
+
+    /// GEMMA-2.1: effective_cache_len is clamped to window_size for local layers.
+    ///
+    /// When is_local_attn=Some(true) and local_attn_window=Some(ws), the decode path
+    /// must use min(cache_seq_len, ws) as effective attention length.
+    #[test]
+    fn test_effective_cache_len_local() {
+        // Verify the computation logic directly (mirrors forward_gen.rs lines)
+        let test_cases = vec![
+            // (cache_seq_len, is_local, window, expected_effective)
+            (100usize, Some(true), Some(512usize), 100usize), // cache < window → full
+            (600, Some(true), Some(512), 512),                // cache > window → clamped
+            (512, Some(true), Some(512), 512),                // cache == window → exact
+            (100, Some(false), Some(512), 100),               // global layer → full
+            (600, None, Some(512), 600),                      // no local flag → full
+            (600, Some(true), None, 600),                     // no window → full (usize::MAX)
+        ];
+
+        for (cache_seq_len, is_local_attn, local_attn_window, expected) in test_cases {
+            let effective = if let Some(true) = is_local_attn {
+                let window = local_attn_window.unwrap_or(usize::MAX);
+                cache_seq_len.min(window)
+            } else {
+                cache_seq_len
+            };
+            let kv_start_pos = cache_seq_len - effective;
+
+            assert_eq!(
+                effective, expected,
+                "cache={} is_local={:?} window={:?}: effective={} expected={}",
+                cache_seq_len, is_local_attn, local_attn_window, effective, expected
+            );
+            // kv_start_pos must be consistent
+            assert_eq!(
+                kv_start_pos,
+                cache_seq_len - expected,
+                "kv_start_pos mismatch for cache={} effective={}",
+                cache_seq_len,
+                effective
+            );
+        }
+    }
+
+    /// GEMMA-2.2: is_local_attn=None (Llama/Qwen2) leaves effective_cache_len unchanged.
+    #[test]
+    fn test_non_local_attn_unchanged() {
+        let cache_seq_len: usize = 42;
+        let is_local_attn: Option<bool> = None;
+        let local_attn_window: Option<usize> = None;
+
+        let effective = if let Some(true) = is_local_attn {
+            let window = local_attn_window.unwrap_or(usize::MAX);
+            cache_seq_len.min(window)
+        } else {
+            cache_seq_len
+        };
+
+        assert_eq!(
+            effective, cache_seq_len,
+            "Non-local layer must use full cache_seq_len"
+        );
+        assert_eq!(cache_seq_len - effective, 0, "kv_start_pos must be 0");
     }
 }

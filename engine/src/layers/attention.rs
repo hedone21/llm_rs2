@@ -66,11 +66,14 @@ pub fn naive_attention_head(
 /// Flash Attention implementation (Forward pass)
 ///
 /// Uses tiling and online softmax to avoid O(N^2) memory usage.
-/// Supports causal masking and arbitrary strides.
+/// Supports causal masking, arbitrary strides, and optional sliding window.
 ///
 /// Arguments:
 /// - `q_stride`, `k_stride`, `v_stride`, `out_stride`: Stride (in elements) between consecutive rows (tokens).
 /// - `q_start_pos`: The global position of the first query token (for causal masking check `c <= r + q_start_pos`).
+/// - `window_size`: Optional sliding window size. When `Some(ws)`, keys at global position
+///   `global_c < (global_r + q_start_pos).saturating_sub(ws - 1)` are masked out (`-inf`).
+///   `None` = full causal attention (default).
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn flash_attention_head(
     q: &[f32],
@@ -87,6 +90,7 @@ pub fn flash_attention_head(
     q_start_pos: usize,
     br: usize,
     bc: usize,
+    window_size: Option<usize>,
 ) {
     let scale = 1.0 / (head_dim as f32).sqrt();
     let tr = q_len.div_ceil(br);
@@ -111,8 +115,18 @@ pub fn flash_attention_head(
             // r_end - 1 is the last query LOCAL index in this block.
             // Global Q index: (r_end - 1) + q_start_pos.
             // We can skip block if c_start > (r_end - 1) + q_start_pos.
-            if c_start > (r_end - 1) + q_start_pos {
+            let max_global_q_in_block = (r_end - 1) + q_start_pos;
+            if c_start > max_global_q_in_block {
                 continue;
+            }
+            // Sliding window: skip block if all keys are outside the window.
+            // Block keys span [c_start, c_end). Min global_q in block = r_start + q_start_pos.
+            // All keys out of window iff c_end + window_size - 1 <= r_start + q_start_pos.
+            if let Some(ws) = window_size {
+                let min_global_q_in_block = r_start + q_start_pos;
+                if c_end + ws <= min_global_q_in_block + 1 {
+                    continue;
+                }
             }
 
             for r in 0..cur_br {
@@ -121,10 +135,17 @@ pub fn flash_attention_head(
                 let mut sij = vec![f32::NEG_INFINITY; cur_bc];
                 let mut any_valid = false;
 
+                let global_q = global_r + q_start_pos;
                 for c in 0..cur_bc {
                     let global_c = c_start + c;
 
-                    if global_c <= global_r + q_start_pos {
+                    let causal_ok = global_c <= global_q;
+                    let window_ok = match window_size {
+                        Some(ws) => global_c + ws > global_q,
+                        None => true,
+                    };
+
+                    if causal_ok && window_ok {
                         let mut dot = 0.0;
                         let q_ptr = global_r * q_stride;
                         let k_ptr = global_c * k_stride;
@@ -171,7 +192,12 @@ pub fn flash_attention_head(
                     let mut pv_sum = 0.0;
                     for c in 0..cur_bc {
                         let global_c = c_start + c;
-                        if global_c <= global_r + q_start_pos {
+                        let causal_ok = global_c <= global_q;
+                        let window_ok = match window_size {
+                            Some(ws) => global_c + ws > global_q,
+                            None => true,
+                        };
+                        if causal_ok && window_ok {
                             // v[global_c, d] -> v[global_c * v_stride + d]
                             pv_sum += p_row[c] * v[global_c * v_stride + d];
                         }
@@ -240,12 +266,15 @@ pub fn flash_attention_forward(
         q_start_pos,
         br,
         bc,
+        None, // window_size: full causal attention
     );
 }
 
 /// Like `flash_attention_forward` but with explicit `kv_head_stride` for layout-awareness.
 /// - SeqMajor: kv_head_stride = head_dim
 /// - HeadMajor: kv_head_stride = capacity * head_dim
+///
+/// `window_size`: Optional sliding window size. `None` = full causal attention.
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_forward_strided(
     q: &[f32],
@@ -265,6 +294,7 @@ pub fn flash_attention_forward_strided(
     q_start_pos: usize,
     br: usize,
     bc: usize,
+    window_size: Option<usize>,
 ) {
     let n_rep = n_heads_q / n_heads_kv;
 
@@ -318,6 +348,7 @@ pub fn flash_attention_forward_strided(
                 q_start_pos,
                 br,
                 bc,
+                window_size,
             );
         }
     });
@@ -436,6 +467,7 @@ mod tests {
             0,
             br,
             bc,
+            None,
         );
 
         // Floating point error accumulates slightly differently due to online softmax vs standard softmax
@@ -467,7 +499,8 @@ mod tests {
         let mut out = vec![0.0; head_dim];
 
         flash_attention_head(
-            &q, head_dim, &k, head_dim, &v, head_dim, &mut out, head_dim, 1, 1, head_dim, 0, 16, 16,
+            &q, head_dim, &k, head_dim, &v, head_dim, &mut out, head_dim, 1, 1, head_dim, 0, 16,
+            16, None,
         );
 
         // With seq_len=1, out should exactly equal V
@@ -491,7 +524,7 @@ mod tests {
         flash_attention_head(
             &q, head_dim, &k, head_dim, &v, head_dim, &mut out, head_dim, 1, 4, head_dim,
             3, // q_start_pos=3 → can attend to all 4 KV positions
-            4, 4,
+            4, 4, None,
         );
 
         // With q_start_pos=3 and q_len=1, causal mask allows positions 0..3.
@@ -517,7 +550,7 @@ mod tests {
         flash_attention_head(
             &q, head_dim, &k, head_dim, &v, head_dim, &mut out2, head_dim, 1, 4, head_dim,
             1, // q_start_pos=1 → can see positions 0,1 only
-            4, 4,
+            4, 4, None,
         );
         // Positions 2,3 are masked. V[2] and V[3] should not contribute.
         assert!(
@@ -530,5 +563,152 @@ mod tests {
             "Position 3 should be masked: out2[3]={}",
             out2[3]
         );
+    }
+
+    /// Sliding window attention: query at global position 5 with window_size=2
+    /// should only attend to keys at positions 4 and 5 (not 0..3).
+    #[test]
+    fn test_flash_attention_sliding_window_mask() {
+        // 6 KV positions (0..5), query at global pos 5, window_size=2
+        // Allowed: positions 4 and 5 (global_c + ws > global_q → c+2 > 5 → c >= 4)
+        let head_dim = 4;
+        let kv_len = 6;
+
+        // K: identity-like so each position has a unique signature
+        // K[i] = e_i (one-hot-ish): each row has a 1.0 at position i%4
+        let mut k = vec![0.0f32; kv_len * head_dim];
+        for i in 0..kv_len {
+            k[i * head_dim + i % head_dim] = 1.0;
+        }
+
+        // V: V[i] = (i+1) * 10 in first dim, 0 elsewhere
+        let mut v = vec![0.0f32; kv_len * head_dim];
+        for i in 0..kv_len {
+            v[i * head_dim] = (i + 1) as f32 * 10.0;
+        }
+
+        // Q: aligned with position 5's K pattern to get high attention weight there
+        let q = vec![0.0f32, 1.0, 0.0, 0.0]; // matches K[5] (5%4=1)
+
+        let mut out = vec![0.0f32; head_dim];
+        flash_attention_head(
+            &q,
+            head_dim,
+            &k,
+            head_dim,
+            &v,
+            head_dim,
+            &mut out,
+            head_dim,
+            1,      // q_len=1
+            kv_len, // kv_len=6
+            head_dim,
+            5, // q_start_pos=5
+            8,
+            8,
+            Some(2), // window_size=2: only positions 4,5 visible
+        );
+
+        // out[0] = weighted sum of V[i][0] for i in {4,5} = 50 and 60
+        // Positions 0..3 are masked, V[0][0]=10..V[3][0]=40 must NOT contribute
+        // Since only positions 4 and 5 are attended to, out[0] must be between 50 and 60
+        assert!(
+            out[0] >= 50.0 - 1e-4 && out[0] <= 60.0 + 1e-4,
+            "out[0]={} should be in [50, 60] (only positions 4,5 visible)",
+            out[0]
+        );
+
+        // With full causal (no window), out[0] would be dragged toward [10,60] average
+        let mut out_full = vec![0.0f32; head_dim];
+        flash_attention_head(
+            &q,
+            head_dim,
+            &k,
+            head_dim,
+            &v,
+            head_dim,
+            &mut out_full,
+            head_dim,
+            1,
+            kv_len,
+            head_dim,
+            5,
+            8,
+            8,
+            None,
+        );
+        // With full causal, positions 0..5 all contribute → out[0] pulled lower
+        assert!(
+            out_full[0] < out[0],
+            "full-causal out[0]={} should be < window-2 out[0]={}",
+            out_full[0],
+            out[0]
+        );
+    }
+
+    /// Sliding window with window_size >= seq_len should behave same as full causal.
+    #[test]
+    fn test_sliding_window_large_window_equals_full() {
+        let head_dim = 4;
+        let kv_len = 4;
+        let mut rng_state = 42u64;
+        let mut pseudo_rand = || {
+            rng_state ^= rng_state << 13;
+            rng_state ^= rng_state >> 7;
+            rng_state ^= rng_state << 17;
+            ((rng_state & 0xFFFF) as f32) / 65536.0 - 0.5
+        };
+
+        let q: Vec<f32> = (0..head_dim).map(|_| pseudo_rand()).collect();
+        let k: Vec<f32> = (0..kv_len * head_dim).map(|_| pseudo_rand()).collect();
+        let v: Vec<f32> = (0..kv_len * head_dim).map(|_| pseudo_rand()).collect();
+
+        let mut out_full = vec![0.0f32; head_dim];
+        flash_attention_head(
+            &q,
+            head_dim,
+            &k,
+            head_dim,
+            &v,
+            head_dim,
+            &mut out_full,
+            head_dim,
+            1,
+            kv_len,
+            head_dim,
+            3,
+            4,
+            4,
+            None,
+        );
+
+        let mut out_big_window = vec![0.0f32; head_dim];
+        flash_attention_head(
+            &q,
+            head_dim,
+            &k,
+            head_dim,
+            &v,
+            head_dim,
+            &mut out_big_window,
+            head_dim,
+            1,
+            kv_len,
+            head_dim,
+            3,
+            4,
+            4,
+            Some(1000),
+        );
+
+        for i in 0..head_dim {
+            assert!(
+                (out_full[i] - out_big_window[i]).abs() < 1e-5,
+                "Mismatch at dim {}: full={} large_window={}",
+                i,
+                out_full[i],
+                out_big_window[i]
+            );
+        }
     }
 }

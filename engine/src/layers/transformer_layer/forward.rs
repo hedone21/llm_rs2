@@ -22,6 +22,8 @@ impl TransformerLayer {
         _skip_mlp: bool,
         rms_norm_add_unit: bool,
         use_gelu_tanh: bool,
+        is_local_attn: Option<bool>,
+        local_attn_window: Option<usize>,
     ) -> Result<()> {
         // Standard forward path (Prefill or dynamic generation)
         let residual = backend.copy_from(x)?;
@@ -340,6 +342,13 @@ impl TransformerLayer {
                     let k_slice = &k_data[k_start..k_start + k_valid_len];
                     let v_slice = &v_data[v_start..v_start + k_valid_len];
 
+                    // Sliding window for local attention (Gemma3): None = full causal
+                    let window_size = if let Some(true) = is_local_attn {
+                        local_attn_window
+                    } else {
+                        None
+                    };
+
                     flash_attention_forward_strided(
                         q_slice,
                         k_slice,
@@ -358,6 +367,7 @@ impl TransformerLayer {
                         start_pos,            // q_start_pos for causal mask
                         32,                   // br
                         32,                   // bc
+                        window_size,
                     );
                 }
             }

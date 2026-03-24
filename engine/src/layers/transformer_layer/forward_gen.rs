@@ -217,6 +217,18 @@ impl TransformerLayer {
         // 5. Attention - use GPU kernel for OpenCL
         let t = prof_start!();
         let cache_seq_len = kv_cache.current_pos();
+
+        // Sliding window attention (Gemma3 local layers):
+        // Restrict attention to the most recent `window_size` tokens.
+        let effective_cache_len = if let Some(true) = args.is_local_attn {
+            let window = args.local_attn_window.unwrap_or(usize::MAX);
+            cache_seq_len.min(window)
+        } else {
+            cache_seq_len
+        };
+        // Physical start offset in the KV cache for the window.
+        let kv_start_pos = cache_seq_len - effective_cache_len;
+
         let (k_cache, v_cache) = kv_cache.get_view();
 
         let need_scores = args.need_scores;
@@ -231,7 +243,7 @@ impl TransformerLayer {
                 n_heads_q,
                 n_heads_kv,
                 head_dim,
-                cache_seq_len,
+                effective_cache_len,
             )?;
 
             // Separate score computation pass for non-F32 KV cache.
@@ -245,7 +257,7 @@ impl TransformerLayer {
                     n_heads_q,
                     n_heads_kv,
                     head_dim,
-                    cache_seq_len,
+                    effective_cache_len,
                     kv_cache.layout() == KVLayout::HeadMajor,
                     kv_cache.capacity(),
                     backend,
@@ -304,10 +316,10 @@ impl TransformerLayer {
             // But we can just use linear indexing: h * max_seq_len + t
             let all_scores = &mut ws.scores;
             // Ensure we have enough space (should be guaranteed by new LayerWorkspace)
-            if all_scores.len() < n_heads_q * cache_seq_len {
+            if all_scores.len() < n_heads_q * effective_cache_len {
                 // Fallback or panic, but expecting correct size
                 // Dynamic resize just in case (e.g. if max_seq_len valid but cache grew?)
-                // Actually cache_seq_len <= max_seq_len.
+                // Actually effective_cache_len <= cache_seq_len <= max_seq_len.
             }
 
             // Parallelize over heads
@@ -316,7 +328,7 @@ impl TransformerLayer {
             //    out:    [n_heads_q, head_dim] -> split into chunks of head_dim
 
             // Parallelize over heads for longer sequences, Serial for short (to avoid overhead)
-            let use_parallel = cache_seq_len >= 256;
+            let use_parallel = effective_cache_len >= 256;
 
             if use_parallel {
                 let scores_chunks = ws.scores.par_chunks_mut(stride).take(n_heads_q);
@@ -334,11 +346,13 @@ impl TransformerLayer {
                             let q_ptr = q_data.as_ptr().add(q_off);
 
                             // --- Step 1: Q * K^T (NEON Vectorized) ---
-                            for t in 0..cache_seq_len {
+                            // t iterates over [0, effective_cache_len); physical position = kv_start_pos + t
+                            for t in 0..effective_cache_len {
+                                let phys_t = kv_start_pos + t;
                                 let k_off = if is_head_major {
-                                    (kv_h * kv_capacity + t) * head_dim
+                                    (kv_h * kv_capacity + phys_t) * head_dim
                                 } else {
-                                    (t * n_heads_kv + kv_h) * head_dim
+                                    (phys_t * n_heads_kv + kv_h) * head_dim
                                 };
                                 let k_ptr = k_data.as_ptr().add(k_off);
 
@@ -404,10 +418,10 @@ impl TransformerLayer {
                             }
 
                             // --- Step 2: Softmax ---
-                            let active_scores = &mut scores_h[0..cache_seq_len];
+                            let active_scores = &mut scores_h[0..effective_cache_len];
 
                             let mut max_val = f32::NEG_INFINITY;
-                            for i in 0..cache_seq_len {
+                            for i in 0..effective_cache_len {
                                 let s = *active_scores.get_unchecked(i);
                                 if s > max_val {
                                     max_val = s;
@@ -415,14 +429,14 @@ impl TransformerLayer {
                             }
 
                             let mut sum_exp = 0.0;
-                            for i in 0..cache_seq_len {
+                            for i in 0..effective_cache_len {
                                 let s = (*active_scores.get_unchecked(i) - max_val).exp();
                                 *active_scores.get_unchecked_mut(i) = s;
                                 sum_exp += s;
                             }
 
                             let inv_sum = 1.0 / sum_exp;
-                            for i in 0..cache_seq_len {
+                            for i in 0..effective_cache_len {
                                 *active_scores.get_unchecked_mut(i) *= inv_sum;
                             }
 
@@ -447,12 +461,13 @@ impl TransformerLayer {
                                 *x = 0.0;
                             }
 
-                            for t in 0..cache_seq_len {
+                            for t in 0..effective_cache_len {
+                                let phys_t = kv_start_pos + t;
                                 let weight = *active_scores.get_unchecked(t);
                                 let v_off = if is_head_major {
-                                    (kv_h * kv_capacity + t) * head_dim
+                                    (kv_h * kv_capacity + phys_t) * head_dim
                                 } else {
-                                    (t * n_heads_kv + kv_h) * head_dim
+                                    (phys_t * n_heads_kv + kv_h) * head_dim
                                 };
                                 let v_ptr = v_data.as_ptr().add(v_off);
 
@@ -526,11 +541,13 @@ impl TransformerLayer {
                             let q_ptr = q_data.as_ptr().add(q_off);
 
                             // --- Step 1: Q * K^T (NEON Vectorized) ---
-                            for t in 0..cache_seq_len {
+                            // t iterates over [0, effective_cache_len); physical position = kv_start_pos + t
+                            for t in 0..effective_cache_len {
+                                let phys_t = kv_start_pos + t;
                                 let k_off = if is_head_major {
-                                    (kv_h * kv_capacity + t) * head_dim
+                                    (kv_h * kv_capacity + phys_t) * head_dim
                                 } else {
-                                    (t * n_heads_kv + kv_h) * head_dim
+                                    (phys_t * n_heads_kv + kv_h) * head_dim
                                 };
                                 let k_ptr = k_data.as_ptr().add(k_off);
 
@@ -582,22 +599,22 @@ impl TransformerLayer {
                             }
 
                             // --- Step 2: Softmax ---
-                            let active_scores = &mut scores_h[0..cache_seq_len];
+                            let active_scores = &mut scores_h[0..effective_cache_len];
                             let mut max_val = f32::NEG_INFINITY;
-                            for i in 0..cache_seq_len {
+                            for i in 0..effective_cache_len {
                                 let s = *active_scores.get_unchecked(i);
                                 if s > max_val {
                                     max_val = s;
                                 }
                             }
                             let mut sum_exp = 0.0;
-                            for i in 0..cache_seq_len {
+                            for i in 0..effective_cache_len {
                                 let s = (*active_scores.get_unchecked(i) - max_val).exp();
                                 *active_scores.get_unchecked_mut(i) = s;
                                 sum_exp += s;
                             }
                             let inv_sum = 1.0 / sum_exp;
-                            for i in 0..cache_seq_len {
+                            for i in 0..effective_cache_len {
                                 *active_scores.get_unchecked_mut(i) *= inv_sum;
                             }
 
@@ -621,12 +638,13 @@ impl TransformerLayer {
                                 *x = 0.0;
                             }
 
-                            for t in 0..cache_seq_len {
+                            for t in 0..effective_cache_len {
+                                let phys_t = kv_start_pos + t;
                                 let weight = *active_scores.get_unchecked(t);
                                 let v_off = if is_head_major {
-                                    (kv_h * kv_capacity + t) * head_dim
+                                    (kv_h * kv_capacity + phys_t) * head_dim
                                 } else {
-                                    (t * n_heads_kv + kv_h) * head_dim
+                                    (phys_t * n_heads_kv + kv_h) * head_dim
                                 };
                                 let v_ptr = v_data.as_ptr().add(v_off);
                                 #[cfg(target_arch = "aarch64")]
