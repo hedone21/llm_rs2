@@ -284,6 +284,10 @@ impl StepHook<KVCache> for EvictionHook {
         Box::new(KVCacheSnapshot { data, positions })
     }
 
+    fn set_effective_budget(&mut self, budget: usize) {
+        self.effective_budget = budget;
+    }
+
     fn score_accumulator(&mut self) -> Option<&mut AttentionScoreAccumulator> {
         self.score_accumulator.as_mut()
     }

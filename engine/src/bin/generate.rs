@@ -414,6 +414,7 @@ fn main() -> anyhow::Result<()> {
         let eval_config = llm_rs2::eval::EvalConfig {
             max_seq_len,
             effective_budget: 0,
+            kv_budget_ratio: 0.0,
             greedy: args.greedy,
             kv_type: "q2+f32_residual".to_string(),
             use_gpu_attn: args.gpu_attn,
@@ -924,22 +925,9 @@ fn main() -> anyhow::Result<()> {
         let ratio_mode = args.kv_budget_ratio > 0.0;
         let budget_mode = args.kv_budget > 0 || ratio_mode;
 
-        // For ratio mode, effective_budget is computed per-question; pass 0 here to
-        // trigger full-prefill mode, then the hook handles per-question budget.
-        // For absolute budget mode, pass the fixed budget.
-        // NOTE: ratio-mode per-question budget computation is preserved below.
-        let effective_budget = if ratio_mode {
-            // ratio-mode: will be overridden per question in the hook via EvalConfig.
-            // We pass 0 here to avoid premature chunking at the loop level.
-            // The existing run_eval_ll computes it per-question inside the loop.
-            // Since eval_loop uses a single EvalConfig, we must pick a representative.
-            // For ratio mode, pass 0 and fall back to full prefill
-            // (ratio budget was only for score-based eviction during prompt decode
-            //  which is handled inside hook.post_decode_step anyway).
-            0
-        } else {
-            args.kv_budget
-        };
+        // For ratio mode, effective_budget is computed per-question inside eval_loop.
+        // Pass 0 here; the loop will use kv_budget_ratio × prompt_len.
+        let effective_budget = if ratio_mode { 0 } else { args.kv_budget };
 
         eprintln!(
             "[Eval-LL] {} questions, policy={}, kv_budget={}, kv_budget_ratio={}, mode={}",
@@ -948,7 +936,11 @@ fn main() -> anyhow::Result<()> {
             args.kv_budget,
             args.kv_budget_ratio,
             if budget_mode {
-                "chunked"
+                if ratio_mode {
+                    "ratio-per-question"
+                } else {
+                    "chunked"
+                }
             } else {
                 "full-prefill"
             }
@@ -967,6 +959,7 @@ fn main() -> anyhow::Result<()> {
         let eval_config = llm_rs2::eval::EvalConfig {
             max_seq_len,
             effective_budget,
+            kv_budget_ratio: args.kv_budget_ratio,
             greedy: args.greedy,
             kv_type: args.kv_type.clone(),
             use_gpu_attn: args.gpu_attn,
@@ -975,15 +968,13 @@ fn main() -> anyhow::Result<()> {
             hidden_size,
         };
 
+        // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
+        let hook_budget = if ratio_mode { 0 } else { effective_budget };
         let mut hook = llm_rs2::eval::EvictionHook::new(
             cache_manager,
             score_accumulator,
             qcf_config,
-            if effective_budget > 0 {
-                effective_budget
-            } else {
-                args.kv_budget
-            },
+            hook_budget,
             actual_protected_prefix,
             score_based_eviction,
             args.h2o_keep_ratio,

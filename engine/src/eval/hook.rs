@@ -65,6 +65,10 @@ pub trait StepHook<C: KVCacheOps> {
     /// EvictionHook returns Some; KiviHook returns None.
     fn score_accumulator(&mut self) -> Option<&mut AttentionScoreAccumulator>;
 
+    /// Update the effective budget (used by ratio-mode per-question budget).
+    /// Default is no-op (e.g., KiviHook ignores budget).
+    fn set_effective_budget(&mut self, _budget: usize) {}
+
     /// Cache-specific per-question JSON fields (e.g., kivi_q2_tokens).
     fn extra_question_fields(&self, caches: &[C]) -> serde_json::Value;
 

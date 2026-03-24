@@ -7,6 +7,9 @@ use super::hook::MetricsSummary;
 pub struct EvalConfig {
     pub max_seq_len: usize,
     pub effective_budget: usize,
+    /// KV budget as ratio of prompt length (0.0 = disabled, use effective_budget).
+    /// When > 0.0, effective_budget is recomputed per-question as `prompt_len * ratio`.
+    pub kv_budget_ratio: f32,
     pub greedy: bool,
     pub kv_type: String,
     pub use_gpu_attn: bool,

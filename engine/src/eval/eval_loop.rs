@@ -135,6 +135,21 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
 
         let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
 
+        // ── Per-question budget (ratio mode) ──
+        let q_eval_config;
+        let effective_eval_config = if eval_config.kv_budget_ratio > 0.0 {
+            let budget = ((prompt_len as f32) * eval_config.kv_budget_ratio) as usize;
+            let budget = budget.max(1);
+            hook.set_effective_budget(budget);
+            q_eval_config = EvalConfig {
+                effective_budget: budget,
+                ..eval_config.clone()
+            };
+            &q_eval_config
+        } else {
+            eval_config
+        };
+
         // ── Prefill ──
         let (prompt_logits_cpu, start_pos_after_prompt) = run_prefill(
             model,
@@ -149,7 +164,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             &cpu_gen_input,
             &mut qcf_metrics,
             vocab_size,
-            eval_config,
+            effective_eval_config,
             skip_config,
         )?;
 
@@ -218,7 +233,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         logits_out: &mut decode_logits,
                         x_gen: Some(&mut x_gen),
                         workspace: Some(&mut gen_ws),
-                        use_gpu_attn: eval_config.use_gpu_attn,
+                        use_gpu_attn: effective_eval_config.use_gpu_attn,
                         score_accumulator: hook.score_accumulator(),
                         profiler: None,
                         skip_config,
@@ -735,6 +750,7 @@ mod tests {
         EvalConfig {
             max_seq_len: 2048,
             effective_budget: 0,
+            kv_budget_ratio: 0.0,
             greedy: true,
             kv_type: "f32".to_string(),
             use_gpu_attn: false,
