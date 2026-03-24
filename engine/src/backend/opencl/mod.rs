@@ -75,6 +75,7 @@ struct KernelCache {
     kernel_silu_mul_simple: CoreKernel,
     kernel_gelu_tanh_mul: CoreKernel,
     kernel_add_assign_simple: CoreKernel,
+    kernel_add_row_bias: CoreKernel,
     kernel_scale_simple: CoreKernel,
     kernel_get_rows_q4_0: CoreKernel,
     kernel_get_rows_f32: CoreKernel,
@@ -498,6 +499,10 @@ impl OpenCLBackend {
             kernel_add_assign_simple: ocl::core::create_kernel(
                 &simple_ops_program,
                 "kernel_add_assign_simple",
+            )?,
+            kernel_add_row_bias: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_add_row_bias",
             )?,
             kernel_scale_simple: ocl::core::create_kernel(
                 &simple_ops_program,
@@ -1801,6 +1806,39 @@ impl Backend for OpenCLBackend {
                 1,
                 None,
                 &[size4, 1, 1],
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn add_row_bias(&self, x: &mut Tensor, bias: &Tensor) -> Result<()> {
+        let x_dims = x.shape().dims();
+        let dim = x_dims[x_dims.len() - 1];
+        let total: usize = x_dims.iter().product();
+
+        let x_buf =
+            get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
+        let b_buf =
+            get_cl_mem(bias.buffer().as_ref()).map_err(|_| anyhow!("Bias is not OpenCL buffer"))?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = &kernels.kernel_add_row_bias;
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(b_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(total as i32)))?;
+
+            let gws = total.div_ceil(64) * 64;
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                1,
+                None,
+                &[gws, 1, 1],
                 None::<[usize; 3]>,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,

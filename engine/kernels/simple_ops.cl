@@ -482,6 +482,20 @@ kernel void kernel_add_assign_simple(
     }
 }
 
+// Broadcast-add a 1D bias to each row of x.
+// x: [rows * dim], bias: [dim]. bias is added to each row.
+kernel void kernel_add_row_bias(
+    global float * x,
+    global const float * bias,
+    int dim,
+    int total_elements
+) {
+    int gid = get_global_id(0);
+    if (gid < total_elements) {
+        x[gid] += bias[gid % dim];
+    }
+}
+
 kernel void kernel_silu_mul_simple(
     global float4 * x,
     global float4 * y,

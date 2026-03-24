@@ -567,3 +567,17 @@ kernel void kernel_kv_scatter_f32_to_f16(
     k_dst[dst_idx] = (half)k_src[src_idx];
     v_dst[dst_idx] = (half)v_src[src_idx];
 }
+
+// Broadcast-add a 1D bias to each row of x.
+// x: [rows * dim], bias: [dim]. bias is added to each row.
+kernel void kernel_add_row_bias(
+    global float * x,
+    global const float * bias,
+    int dim,
+    int total_elements
+) {
+    int gid = get_global_id(0);
+    if (gid < total_elements) {
+        x[gid] += bias[gid % dim];
+    }
+}
