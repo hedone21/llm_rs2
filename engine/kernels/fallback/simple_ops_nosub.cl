@@ -143,52 +143,53 @@ kernel void kernel_rope_simple(
     x[i1] = x0 * sin_val + x1 * cos_val;
 }
 
+// Vectorized float4 versions — must match dispatch which passes size4 = size/4
 kernel void kernel_scale_simple(
-    global float * x,
+    global float4 * x,
     float scale,
-    int size
+    int size4
 ) {
     int i = get_global_id(0);
-    if (i < size) {
+    if (i < size4) {
         x[i] *= scale;
     }
 }
 
 kernel void kernel_add_assign_simple(
-    global float * x,
-    global float * y,
-    int size
+    global float4 * x,
+    global float4 * y,
+    int size4
 ) {
     int i = get_global_id(0);
-    if (i < size) {
+    if (i < size4) {
         x[i] += y[i];
     }
 }
 
 kernel void kernel_silu_mul_simple(
-    global float * x,
-    global float * y,
-    int size
+    global float4 * x,
+    global float4 * y,
+    int size4
 ) {
     int i = get_global_id(0);
-    if (i < size) {
-        float val = x[i];
-        float sigmoid = 1.0f / (1.0f + exp(-val));
+    if (i < size4) {
+        float4 val = x[i];
+        float4 sigmoid = 1.0f / (1.0f + exp(-val));
         x[i] = val * sigmoid * y[i];
     }
 }
 
 kernel void kernel_gelu_tanh_mul(
-    global float * x,
-    global float * y,
-    int size
+    global float4 * x,
+    global float4 * y,
+    int size4
 ) {
     int i = get_global_id(0);
-    if (i < size) {
-        float val = x[i];
-        float inner = 0.7978845608f * (val + 0.044715f * val * val * val);
-        float gelu = 0.5f * val * (1.0f + tanh(inner));
-        x[i] = gelu * y[i];
+    if (i < size4) {
+        float4 val = x[i];
+        float4 inner = 0.7978845608f * (val + 0.044715f * val * val * val);
+        float4 gelu_val = 0.5f * val * (1.0f + tanh(inner));
+        x[i] = gelu_val * y[i];
     }
 }
 

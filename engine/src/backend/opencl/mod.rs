@@ -125,6 +125,10 @@ pub struct OpenCLBackend {
     // Cached kernels — inference is single-threaded, no lock needed.
     // UnsafeCell avoids Mutex overhead (~170us/lock on Adreno).
     kernels: UnsafeCell<KernelCache>,
+
+    // true on UMA devices (Adreno, Mali): CL_MEM_ALLOC_HOST_PTR for zero-copy.
+    // false on discrete GPUs (NVIDIA): device-only buffers for correct behavior.
+    pub use_zero_copy: bool,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -576,6 +580,32 @@ impl OpenCLBackend {
 
         log::info!("OpenCL kernels cached successfully");
 
+        // Auto-detect UMA (integrated GPU) vs discrete GPU for zero-copy decision.
+        // CL_DEVICE_HOST_UNIFIED_MEMORY is the standard way; fall back to name heuristic.
+        let use_zero_copy = {
+            let unified_mem = device
+                .info(ocl::core::DeviceInfo::HostUnifiedMemory)
+                .map(|v| v.to_string().trim().to_lowercase())
+                .unwrap_or_default();
+            if unified_mem == "true" || unified_mem == "1" {
+                true
+            } else {
+                let name_lower = device_name.to_lowercase();
+                name_lower.contains("adreno")
+                    || name_lower.contains("mali")
+                    || name_lower.contains("powervr")
+            }
+        };
+        log::info!(
+            "Memory mode: {} (zero_copy={})",
+            if use_zero_copy {
+                "UMA/integrated"
+            } else {
+                "discrete"
+            },
+            use_zero_copy
+        );
+
         Ok(Self {
             context,
             queue,
@@ -591,6 +621,7 @@ impl OpenCLBackend {
             gemm_f16_program,
             gemm_f32_program,
             kernels: UnsafeCell::new(kernel_cache),
+            use_zero_copy,
         })
     }
 
@@ -1088,13 +1119,12 @@ impl Backend for OpenCLBackend {
 
     fn copy_from(&self, src: &Tensor) -> Result<Tensor> {
         let size = src.size();
-        // Use zero-copy unified memory (CL_MEM_ALLOC_HOST_PTR) for weight tensors.
-        // On UMA devices (Adreno), this allocates from system RAM accessible by GPU,
-        // avoiding the GPU global memory limit (~5.5GB) for large models (3B+).
+        // On UMA devices (Adreno): CL_MEM_ALLOC_HOST_PTR for zero-copy shared memory.
+        // On discrete GPUs (NVIDIA): device-only buffers for correct behavior.
         let memory = crate::backend::opencl::memory::OpenCLMemory::new(
             self.context.clone(),
             self.queue.clone(),
-            true,
+            self.use_zero_copy,
         );
         let buffer = memory.alloc(size, src.dtype())?;
 
