@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -10,6 +11,7 @@ use crate::core::pressure::{
     PressureStageConfig,
 };
 use crate::core::sys_monitor::SystemMonitor;
+use crate::resilience::EvictMethod;
 
 /// Result of an eviction attempt.
 #[derive(Debug, Clone)]
@@ -23,7 +25,7 @@ pub struct EvictionResult {
 }
 
 /// Score context variants for the unified dispatch path.
-enum ScoreContext<'a> {
+pub enum ScoreContext<'a> {
     /// No importance scores available.
     None,
     /// Flat per-token importance scores.
@@ -53,6 +55,8 @@ pub struct CacheManager {
     threshold_bytes: usize,
     /// Event sink for observability. Defaults to `NoOpSink` (zero overhead).
     event_sink: Arc<dyn EventSink>,
+    /// Named eviction policies for Manager-directed dispatch (resilience).
+    policies: HashMap<EvictMethod, Box<dyn EvictionPolicy>>,
 }
 
 impl CacheManager {
@@ -75,6 +79,7 @@ impl CacheManager {
             monitor,
             threshold_bytes,
             event_sink: Arc::new(NoOpSink),
+            policies: HashMap::new(),
         }
     }
 
@@ -92,6 +97,7 @@ impl CacheManager {
             monitor,
             threshold_bytes,
             event_sink: Arc::new(NoOpSink),
+            policies: HashMap::new(),
         }
     }
 
@@ -346,6 +352,107 @@ impl CacheManager {
     /// Returns the name of the active policy or pipeline.
     pub fn policy_name(&self) -> String {
         self.pipeline.name()
+    }
+
+    // ── Named policy registry (Manager-directed dispatch) ──────────
+
+    /// Register an eviction policy for Manager-directed dispatch.
+    pub fn register_policy(&mut self, method: EvictMethod, policy: Box<dyn EvictionPolicy>) {
+        self.policies.insert(method, policy);
+    }
+
+    /// Force eviction using a specific named policy (for resilience directives).
+    ///
+    /// Bypasses the default pipeline and directly invokes the registered policy.
+    /// Events are emitted through the same event_sink as auto-eviction.
+    pub fn force_evict_by_policy(
+        &self,
+        method: EvictMethod,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        scores: ScoreContext,
+    ) -> Result<EvictionResult> {
+        let policy = self
+            .policies
+            .get(&method)
+            .ok_or_else(|| anyhow::anyhow!("no registered policy for {:?}", method))?;
+
+        let result = Self::run_policy_eviction(policy.as_ref(), caches, target_ratio, scores)?;
+
+        if result.evicted {
+            self.event_sink.emit(CacheEvent::EvictionCompleted {
+                policy: policy.name().to_string(),
+                tokens_removed: result.tokens_removed,
+                new_pos: result.new_pos,
+            });
+        }
+
+        Ok(result)
+    }
+
+    /// Shared eviction logic: compute target_len, dispatch to policy methods.
+    /// Used by both `force_evict_by_policy()` and can be reused by EvictionHandler.
+    fn run_policy_eviction(
+        policy: &dyn EvictionPolicy,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        scores: ScoreContext,
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        let current_pos = caches[0].current_pos;
+        let target_len = ((current_pos as f32) * target_ratio).max(1.0) as usize;
+        if current_pos <= target_len {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: current_pos,
+            });
+        }
+
+        log::debug!(
+            "[CacheManager] policy='{}': {} → {} tokens",
+            policy.name(),
+            current_pos,
+            target_len,
+        );
+
+        let (importance, head_importance, n_kv_heads) = match &scores {
+            ScoreContext::None => (None, None, 0),
+            ScoreContext::Flat { importance } => (Some(*importance), None, 0),
+            ScoreContext::PerHead {
+                flat,
+                head,
+                n_kv_heads,
+            } => (Some(*flat), Some(*head), *n_kv_heads),
+        };
+
+        for cache in caches.iter_mut() {
+            if let (Some(flat), Some(head_imp)) = (importance, head_importance) {
+                if n_kv_heads > 0 {
+                    policy.evict_with_head_scores(cache, target_len, flat, head_imp, n_kv_heads)?;
+                } else {
+                    policy.evict_with_scores(cache, target_len, flat)?;
+                }
+            } else if let Some(imp) = importance {
+                policy.evict_with_scores(cache, target_len, imp)?;
+            } else {
+                policy.evict(cache, target_len)?;
+            }
+        }
+
+        let new_pos = caches[0].current_pos;
+        Ok(EvictionResult {
+            evicted: true,
+            tokens_removed: current_pos - new_pos,
+            new_pos,
+        })
     }
 }
 

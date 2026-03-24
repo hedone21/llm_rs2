@@ -33,19 +33,17 @@ impl DbusTransport {
     /// Convert a legacy SystemSignal to the new ManagerMessage format.
     fn signal_to_manager_message(&mut self, signal: SystemSignal) -> ManagerMessage {
         let commands = match signal {
-            SystemSignal::MemoryPressure { level, .. } => {
-                match level {
-                    Level::Normal => vec![EngineCommand::RestoreDefaults],
-                    Level::Warning => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.85 }],
-                    Level::Critical => vec![EngineCommand::KvEvictH2o { keep_ratio: 0.50 }],
-                    Level::Emergency => {
-                        return ManagerMessage::Directive(EngineDirective {
-                            seq_id: self.next_seq(),
-                            commands: vec![EngineCommand::Suspend],
-                        });
-                    }
+            SystemSignal::MemoryPressure { level, .. } => match level {
+                Level::Normal => vec![EngineCommand::RestoreDefaults],
+                Level::Warning => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.85 }],
+                Level::Critical => vec![EngineCommand::KvEvictH2o { keep_ratio: 0.50 }],
+                Level::Emergency => {
+                    return ManagerMessage::Directive(EngineDirective {
+                        seq_id: self.next_seq(),
+                        commands: vec![EngineCommand::Suspend],
+                    });
                 }
-            }
+            },
             SystemSignal::ComputeGuidance {
                 level,
                 recommended_backend,

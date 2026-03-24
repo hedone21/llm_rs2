@@ -31,6 +31,14 @@ pub struct ExecutionPlan {
     pub restore_defaults: bool,
 }
 
+/// Eviction method identifier (engine-internal, not in shared protocol).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EvictMethod {
+    H2o,
+    Sliding,
+    Streaming,
+}
+
 /// Eviction plan parameters.
 #[derive(Debug, Clone)]
 pub struct EvictPlan {
@@ -38,8 +46,8 @@ pub struct EvictPlan {
     pub target_ratio: f32,
     /// Resource level: Warning = lossless only, Critical = lossy OK.
     pub level: ResourceLevel,
-    /// Eviction policy name: "h2o", "sliding", "streaming".
-    pub policy: String,
+    /// Which eviction algorithm to use.
+    pub method: EvictMethod,
 }
 
 /// Snapshot of KV cache state for status reporting.
@@ -221,7 +229,7 @@ impl CommandExecutor {
                 plan.evict = Some(EvictPlan {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
-                    policy: "h2o".to_string(),
+                    method: EvictMethod::H2o,
                 });
                 if !self.active_actions.contains(&"kv_evict_h2o".to_string()) {
                     self.active_actions.push("kv_evict_h2o".to_string());
@@ -232,7 +240,7 @@ impl CommandExecutor {
                 plan.evict = Some(EvictPlan {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
-                    policy: "sliding".to_string(),
+                    method: EvictMethod::Sliding,
                 });
                 if !self
                     .active_actions
@@ -455,7 +463,7 @@ mod tests {
         let evict = plan.evict.unwrap();
         assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
         assert_eq!(evict.level, ResourceLevel::Critical);
-        assert_eq!(evict.policy, "h2o");
+        assert_eq!(evict.method, EvictMethod::H2o);
         assert!(
             executor
                 .active_actions()
@@ -486,7 +494,7 @@ mod tests {
         assert!(plan.evict.is_some());
         let evict = plan.evict.unwrap();
         assert!((evict.target_ratio - 0.6).abs() < f32::EPSILON);
-        assert_eq!(evict.policy, "sliding");
+        assert_eq!(evict.method, EvictMethod::Sliding);
         assert!(
             executor
                 .active_actions()
@@ -651,7 +659,7 @@ mod tests {
         // 두 번째 명령이 승리
         let evict = plan.evict.unwrap();
         assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
-        assert_eq!(evict.policy, "sliding");
+        assert_eq!(evict.method, EvictMethod::Sliding);
 
         // 두 응답 모두 전송돼야 함
         let r1 = rx.recv().unwrap();
