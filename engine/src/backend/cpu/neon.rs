@@ -79,8 +79,8 @@ impl Backend for CpuBackendNeon {
         Ok(())
     }
 
-    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
-        CpuBackendCommon::new().rms_norm(x, w, eps)
+    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()> {
+        CpuBackendCommon::new().rms_norm(x, w, eps, add_unit)
     }
 
     fn softmax(&self, x: &mut Tensor) -> Result<()> {

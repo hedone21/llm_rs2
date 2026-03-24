@@ -192,7 +192,13 @@ mod tests {
         fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
             Ok(())
         }
-        fn rms_norm(&self, _x: &mut Tensor, _weight: &Tensor, _epsilon: f32) -> Result<()> {
+        fn rms_norm(
+            &self,
+            _x: &mut Tensor,
+            _weight: &Tensor,
+            _epsilon: f32,
+            _add_unit: bool,
+        ) -> Result<()> {
             Ok(())
         }
         fn softmax(&self, _x: &mut Tensor) -> Result<()> {
@@ -295,7 +301,13 @@ mod tests {
         fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
             Ok(())
         }
-        fn rms_norm(&self, _x: &mut Tensor, _weight: &Tensor, _epsilon: f32) -> Result<()> {
+        fn rms_norm(
+            &self,
+            _x: &mut Tensor,
+            _weight: &Tensor,
+            _epsilon: f32,
+            _add_unit: bool,
+        ) -> Result<()> {
             Ok(())
         }
         fn softmax(&self, _x: &mut Tensor) -> Result<()> {
@@ -381,7 +393,13 @@ mod tests {
             fn silu_mul(&self, _a: &mut Tensor, _b: &Tensor) -> Result<()> {
                 Ok(())
             }
-            fn rms_norm(&self, _x: &mut Tensor, _w: &Tensor, _e: f32) -> Result<()> {
+            fn rms_norm(
+                &self,
+                _x: &mut Tensor,
+                _w: &Tensor,
+                _e: f32,
+                _add_unit: bool,
+            ) -> Result<()> {
                 Ok(())
             }
             fn softmax(&self, _x: &mut Tensor) -> Result<()> {

@@ -1,4 +1,5 @@
 #![allow(unused_unsafe)]
+use crate::backend::cpu::common::CpuBackendCommon;
 use crate::buffer::unified_buffer::UnifiedBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::Buffer;
@@ -1314,7 +1315,17 @@ impl Backend for OpenCLBackend {
         }
     }
 
-    fn rms_norm(&self, x: &mut Tensor, weight: &Tensor, epsilon: f32) -> Result<()> {
+    fn rms_norm(
+        &self,
+        x: &mut Tensor,
+        weight: &Tensor,
+        epsilon: f32,
+        add_unit: bool,
+    ) -> Result<()> {
+        if add_unit {
+            // add_unit (Gemma3 style) falls back to CPU in Phase 1
+            return CpuBackendCommon::new().rms_norm(x, weight, epsilon, add_unit);
+        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
@@ -1359,7 +1370,13 @@ impl Backend for OpenCLBackend {
         out: &mut Tensor,
         weight: &Tensor,
         epsilon: f32,
+        add_unit: bool,
     ) -> Result<()> {
+        if add_unit {
+            // add_unit (Gemma3 style) falls back to default trait impl which calls CPU rms_norm
+            self.copy_into(x, out)?;
+            return CpuBackendCommon::new().rms_norm(out, weight, epsilon, add_unit);
+        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();
@@ -1408,7 +1425,14 @@ impl Backend for OpenCLBackend {
         out: &mut Tensor,
         weight: &Tensor,
         epsilon: f32,
+        add_unit: bool,
     ) -> Result<()> {
+        if add_unit {
+            // add_unit (Gemma3 style) falls back to CPU
+            self.add_assign(x, residual)?;
+            self.copy_into(x, out)?;
+            return CpuBackendCommon::new().rms_norm(out, weight, epsilon, add_unit);
+        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let rows: usize = dims[..dims.len() - 1].iter().product();

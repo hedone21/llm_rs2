@@ -162,7 +162,7 @@ impl Backend for CpuBackendCommon {
         Ok(())
     }
 
-    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
+    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()> {
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1]; // Last dim
 
@@ -175,7 +175,8 @@ impl Backend for CpuBackendCommon {
             let scale = 1.0 / rms;
 
             for (val, weight) in row.iter_mut().zip(w_data.iter()) {
-                *val = (*val * scale) * weight;
+                let w_eff = if add_unit { 1.0 + weight } else { *weight };
+                *val = (*val * scale) * w_eff;
             }
         });
 
@@ -1530,14 +1531,75 @@ mod tests {
         let mut x_a = make_f32_tensor(&auto, vec![rows, dim], &x_data);
         let w_a = make_f32_tensor(&auto, vec![dim], &w_data);
 
-        scalar.rms_norm(&mut x_s, &w_s, 1e-5).unwrap();
-        auto.rms_norm(&mut x_a, &w_a, 1e-5).unwrap();
+        scalar.rms_norm(&mut x_s, &w_s, 1e-5, false).unwrap();
+        auto.rms_norm(&mut x_a, &w_a, 1e-5, false).unwrap();
 
         assert_close(
             x_s.as_slice::<f32>(),
             x_a.as_slice::<f32>(),
             1e-5,
             "rms_norm",
+        );
+    }
+
+    #[test]
+    fn test_rms_norm_add_unit() {
+        // input [1.0, 2.0, 3.0, 4.0], weight [0.1, 0.2, 0.3, 0.4]
+        // rms = sqrt((1+4+9+16)/4 + eps) = sqrt(7.5 + eps)
+        // expected[i] = x[i] * (1.0 + w[i]) / rms
+        let x_data = vec![1.0f32, 2.0, 3.0, 4.0];
+        let w_data = vec![0.1f32, 0.2, 0.3, 0.4];
+        let eps = 1e-6f32;
+        let dim = 4usize;
+
+        let backend = scalar_backend();
+        let mut x = make_f32_tensor(&backend, vec![1, dim], &x_data);
+        let w = make_f32_tensor(&backend, vec![dim], &w_data);
+        backend.rms_norm(&mut x, &w, eps, true).unwrap();
+
+        let rms = (7.5_f32 + eps).sqrt();
+        let expected: Vec<f32> = x_data
+            .iter()
+            .zip(w_data.iter())
+            .map(|(&xi, &wi)| xi * (1.0 + wi) / rms)
+            .collect();
+
+        let result = x.as_slice::<f32>();
+        for (i, (&got, &exp)) in result.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "add_unit rms_norm[{}]: got={} expected={}",
+                i,
+                got,
+                exp
+            );
+        }
+
+        // Verify it differs from add_unit=false
+        let mut x2 = make_f32_tensor(&backend, vec![1, dim], &x_data);
+        let w2 = make_f32_tensor(&backend, vec![dim], &w_data);
+        backend.rms_norm(&mut x2, &w2, eps, false).unwrap();
+
+        let plain: Vec<f32> = x_data
+            .iter()
+            .zip(w_data.iter())
+            .map(|(&xi, &wi)| xi * wi / rms)
+            .collect();
+        let result2 = x2.as_slice::<f32>();
+        for (i, (&got, &exp)) in result2.iter().zip(plain.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-5,
+                "plain rms_norm[{}]: got={} expected={}",
+                i,
+                got,
+                exp
+            );
+        }
+
+        // add_unit=true results should differ from add_unit=false
+        assert!(
+            (result[0] - result2[0]).abs() > 1e-5,
+            "add_unit and plain should differ"
         );
     }
 

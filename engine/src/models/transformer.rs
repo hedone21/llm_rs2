@@ -657,7 +657,7 @@ impl TransformerModel {
         }
 
         // Final Norm
-        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
+        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32, false)?;
 
         // Head
         let vocab_size = self.config.vocab_size;
@@ -796,7 +796,7 @@ impl TransformerModel {
         }
 
         // 3. Final Norm
-        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
+        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32, false)?;
 
         // 4. Head
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
@@ -1126,7 +1126,7 @@ impl TransformerModel {
         prefetch.adjust();
 
         // 4. Final Norm + Head (identical to forward_into)
-        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32)?;
+        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32, false)?;
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
         Ok(())
@@ -1276,6 +1276,11 @@ mod tests {
             tie_word_embeddings: false,
             eos_token_id: 2,
             arch: crate::models::config::ModelArch::Llama,
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
         };
 
         let model = TransformerModel {

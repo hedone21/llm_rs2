@@ -23,7 +23,7 @@ impl TransformerLayer {
     ) -> Result<()> {
         // Standard forward path (Prefill or dynamic generation)
         let residual = backend.copy_from(x)?;
-        backend.rms_norm(x, &self.attention_norm, rms_norm_eps)?;
+        backend.rms_norm(x, &self.attention_norm, rms_norm_eps, false)?;
 
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
@@ -368,7 +368,7 @@ impl TransformerLayer {
         *x = attn_out_projected;
 
         let residual_ffn = backend.copy_from(x)?;
-        backend.rms_norm(x, &self.ffn_norm, rms_norm_eps)?;
+        backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
 
         let ffn_hidden = self.w_up.shape().dims()[0];
         let mut gate = self.alloc_temp(vec![batch_size, seq_len, ffn_hidden], memory, backend)?;

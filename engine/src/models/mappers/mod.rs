@@ -55,6 +55,8 @@ pub fn create_mapper(arch: ModelArch) -> Box<dyn WeightMapper> {
     match arch {
         ModelArch::Llama => Box::new(llama::LlamaMapper),
         ModelArch::Qwen2 => Box::new(qwen2::Qwen2Mapper),
+        // Gemma3 uses Llama-style weight naming (Phase 1 stub — full mapper in Phase 2)
+        ModelArch::Gemma3 => Box::new(llama::LlamaMapper),
     }
 }
 

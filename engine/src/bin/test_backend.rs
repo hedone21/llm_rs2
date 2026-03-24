@@ -469,7 +469,7 @@ fn perform_matmul_test(
             OpType::MatMul => backend.matmul(&a_gpu, &b_gpu, &mut c_gpu)?,
             OpType::MatMulTransposed => backend.matmul_transposed(&a_gpu, &b_gpu, &mut c_gpu)?,
             OpType::MatMulSlice => backend.matmul_slice(&a_gpu, &b_gpu, m, n, &mut c_gpu)?,
-            OpType::RMSNorm => backend.rms_norm(&mut c_gpu, &b_gpu, 1e-5)?,
+            OpType::RMSNorm => backend.rms_norm(&mut c_gpu, &b_gpu, 1e-5, false)?,
             OpType::Softmax => backend.softmax(&mut c_gpu)?,
             OpType::RoPE => {
                 let head_dim = 128;

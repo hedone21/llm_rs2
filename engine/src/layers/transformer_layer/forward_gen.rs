@@ -53,7 +53,13 @@ impl TransformerLayer {
 
         // 1. Attention Norm — out-of-place: ws.residual = norm(x), x preserved for skip connection
         let t = prof_start!();
-        backend.rms_norm_oop(x, &mut ws.residual, &self.attention_norm, rms_norm_eps)?;
+        backend.rms_norm_oop(
+            x,
+            &mut ws.residual,
+            &self.attention_norm,
+            rms_norm_eps,
+            false,
+        )?;
         prof_record!(t, rms_norm);
 
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
@@ -690,6 +696,7 @@ impl TransformerLayer {
             &mut ws.residual,
             &self.ffn_norm,
             rms_norm_eps,
+            false,
         )?;
         prof_record!(t, rms_norm);
 

@@ -121,7 +121,11 @@ impl Backend for CpuBackendAVX2 {
         Ok(())
     }
 
-    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
+    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()> {
+        if add_unit {
+            // add_unit path: fall back to scalar (Gemma3 only, not on hot path)
+            return CpuBackendCommon::new().rms_norm(x, w, eps, add_unit);
+        }
         let dims = x.shape().dims();
         let dim = dims[dims.len() - 1];
         let x_data = x.as_mut_slice::<f32>();
@@ -1731,8 +1735,8 @@ mod tests {
             let mut x_a = make_f32_tensor(&avx2, vec![rows, dim], &x_data);
             let w_a = make_f32_tensor(&avx2, vec![dim], &w_data);
 
-            scalar.rms_norm(&mut x_s, &w_s, 1e-5).unwrap();
-            avx2.rms_norm(&mut x_a, &w_a, 1e-5).unwrap();
+            scalar.rms_norm(&mut x_s, &w_s, 1e-5, false).unwrap();
+            avx2.rms_norm(&mut x_a, &w_a, 1e-5, false).unwrap();
 
             assert_close(
                 x_s.as_slice::<f32>(),
@@ -1757,8 +1761,8 @@ mod tests {
         let mut x_a = make_f32_tensor(&avx2, vec![rows, dim], &x_data);
         let w_a = make_f32_tensor(&avx2, vec![dim], &w_data);
 
-        scalar.rms_norm(&mut x_s, &w_s, 1e-5).unwrap();
-        avx2.rms_norm(&mut x_a, &w_a, 1e-5).unwrap();
+        scalar.rms_norm(&mut x_s, &w_s, 1e-5, false).unwrap();
+        avx2.rms_norm(&mut x_a, &w_a, 1e-5, false).unwrap();
 
         assert_close(
             x_s.as_slice::<f32>(),
@@ -2062,7 +2066,7 @@ mod tests {
         let avx2 = avx2_backend();
         let mut x = make_f32_tensor(&avx2, vec![1, dim], &x_data);
         let w = make_f32_tensor(&avx2, vec![dim], &w_data);
-        avx2.rms_norm(&mut x, &w, 1e-5).unwrap();
+        avx2.rms_norm(&mut x, &w, 1e-5, false).unwrap();
         let result = x.as_slice::<f32>();
         // RMS of all ones = 1.0, so scale ≈ 1.0, result ≈ 1.0
         for &v in result {

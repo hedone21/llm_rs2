@@ -39,12 +39,36 @@ pub trait Backend: Send + Sync {
 
     // Activation & Norm
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()>;
-    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32) -> Result<()>;
+    /// GELU tanh approximation fused with elementwise multiply.
+    /// gate[i] = gelu_tanh(gate[i]) * up[i]
+    /// Used by Gemma 3 FFN (hidden_activation = "gelu_pytorch_tanh").
+    /// Default: scalar CPU fallback — backends may override for performance.
+    fn gelu_tanh_mul(&self, gate: &mut Tensor, up: &Tensor) -> Result<()> {
+        let gate_data = gate.as_mut_slice::<f32>();
+        let up_data = up.as_slice::<f32>();
+        let sqrt_2_over_pi: f32 = (2.0_f32 / std::f32::consts::PI).sqrt();
+        for (g, &u) in gate_data.iter_mut().zip(up_data.iter()) {
+            let x = *g;
+            let inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+            *g = 0.5 * x * (1.0 + inner.tanh()) * u;
+        }
+        Ok(())
+    }
+    /// In-place RMS norm: x = x * w / rms(x).
+    /// If `add_unit` is true (Gemma 3 style), applies `x * (1 + w) / rms(x)` instead.
+    fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()>;
     /// Out-of-place RMS norm: out = norm(x) * w. x is preserved.
     /// Default: copy x → out, then in-place rms_norm(out).
-    fn rms_norm_oop(&self, x: &Tensor, out: &mut Tensor, w: &Tensor, eps: f32) -> Result<()> {
+    fn rms_norm_oop(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        w: &Tensor,
+        eps: f32,
+        add_unit: bool,
+    ) -> Result<()> {
         self.copy_into(x, out)?;
-        self.rms_norm(out, w, eps)
+        self.rms_norm(out, w, eps, add_unit)
     }
     /// Fused add + out-of-place RMS norm: x += residual; out = norm(x) * w.
     /// Eliminates a separate add_assign dispatch.
@@ -55,9 +79,10 @@ pub trait Backend: Send + Sync {
         out: &mut Tensor,
         w: &Tensor,
         eps: f32,
+        add_unit: bool,
     ) -> Result<()> {
         self.add_assign(x, residual)?;
-        self.rms_norm_oop(x, out, w, eps)
+        self.rms_norm_oop(x, out, w, eps, add_unit)
     }
     fn softmax(&self, x: &mut Tensor) -> Result<()>;
 
@@ -365,5 +390,67 @@ pub trait Backend: Send + Sync {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Backend;
+    use crate::backend::cpu::common::CpuBackendCommon;
+    use crate::core::buffer::DType;
+    use crate::core::memory::Memory;
+    use crate::core::shape::Shape;
+    use crate::core::tensor::Tensor;
+    use crate::memory::galloc::Galloc;
+    use std::sync::Arc;
+
+    fn make_cpu_tensor(data: &[f32]) -> Tensor {
+        let memory = Galloc::new();
+        let buf = memory.alloc(data.len() * 4, DType::F32).unwrap();
+        let mut t = Tensor::new(
+            Shape::new(vec![data.len()]),
+            buf,
+            Arc::new(CpuBackendCommon::new()),
+        );
+        t.as_mut_slice::<f32>().copy_from_slice(data);
+        t
+    }
+
+    #[test]
+    fn test_gelu_tanh_known_values() {
+        let backend = CpuBackendCommon::new();
+
+        // gelu_tanh(0.0) * 1.0 ≈ 0.0
+        let mut gate = make_cpu_tensor(&[0.0f32]);
+        let up = make_cpu_tensor(&[1.0f32]);
+        backend.gelu_tanh_mul(&mut gate, &up).unwrap();
+        let result = gate.as_slice::<f32>()[0];
+        assert!(
+            result.abs() < 1e-6,
+            "gelu_tanh(0)*1 should be ~0, got {}",
+            result
+        );
+
+        // gelu_tanh(1.0) * 1.0 ≈ 0.8412
+        let mut gate = make_cpu_tensor(&[1.0f32]);
+        let up = make_cpu_tensor(&[1.0f32]);
+        backend.gelu_tanh_mul(&mut gate, &up).unwrap();
+        let result = gate.as_slice::<f32>()[0];
+        assert!(
+            (result - 0.8412).abs() < 1e-3,
+            "gelu_tanh(1)*1 should be ~0.8412, got {}",
+            result
+        );
+
+        // gelu_tanh(-1.0) * 1.0 ≈ -0.1588
+        let mut gate = make_cpu_tensor(&[-1.0f32]);
+        let up = make_cpu_tensor(&[1.0f32]);
+        backend.gelu_tanh_mul(&mut gate, &up).unwrap();
+        let result = gate.as_slice::<f32>()[0];
+        assert!(
+            (result - (-0.1588)).abs() < 1e-3,
+            "gelu_tanh(-1)*1 should be ~-0.1588, got {}",
+            result
+        );
     }
 }
