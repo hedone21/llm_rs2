@@ -23,6 +23,22 @@
 
 ---
 
+## [P1] Gemma 3 1B 온디바이스 검증
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: Rust Developer의 GEMMA-1.11 완료 후
+- **Description**: Gemma 3 1B 모델의 온디바이스 추론 검증.
+  - CPU backend: 생성 텍스트 품질, tok/s 측정
+  - OpenCL backend: 생성 텍스트 품질, tok/s 측정
+  - Llama 3.2 1B 회귀 테스트: 기존 모델 성능/정확성 변경 없음 확인
+  - Qwen 2.5 1.5B 회귀 테스트: 기존 모델 성능/정확성 변경 없음 확인
+- **Acceptance Criteria**:
+  - CPU/OpenCL 양 백엔드에서 coherent 텍스트 생성
+  - Llama/Qwen2 tok/s가 ±5% 이내 (회귀 없음)
+  - test_backend 통과
+
+---
+
 ## [P1] ZramStore Blosc 필터 실험 검증
 - **Status**: TODO
 - **Sprint**: current

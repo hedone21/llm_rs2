@@ -49,6 +49,7 @@ llm.rs (llm_rs2) 프로젝트의 기술 문서 인덱스입니다. 프로젝트 
 | 32 | [32_kv_offload.md](32_kv_offload.md) | KV 캐시 오프로드 (RawStore, PrefetchController, PreloadPool) |
 | 34 | [34_profiling_framework_design.md](34_profiling_framework_design.md) | 추론 프로파일링 프레임워크 설계 |
 | 38 | [38_eval_refactoring.md](38_eval_refactoring.md) | **eval 루프 리팩토링 설계** (StepHook, EvictionHook, KiviHook, 제네릭 eval 루프) |
+| 40 | [40_gemma3_support.md](40_gemma3_support.md) | **Gemma 3 1B 지원 설계** (Gemma RMSNorm, QK-Norm, GELU_tanh, Sliding Window Attention) |
 
 ## 추천 읽기 순서
 

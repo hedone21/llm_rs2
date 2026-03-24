@@ -386,3 +386,231 @@ Per-token 시간 분해 (F16, 7T):
 - **Acceptance Criteria**:
   - ARCHITECTURE.md의 디렉토리 트리가 실제 코드와 일치
   - eval 모듈의 역할과 흐름이 설명됨
+
+---
+
+# Gemma 3 1B 지원
+
+> **목표**: Gemma 3 1B (google/gemma-3-1b-pt) 아키텍처 지원 추가
+> **설계 문서**: `docs/40_gemma3_support.md`
+> **모델 경로**: `models/gemma3-1b/` (호스트), `/data/local/tmp/models/gemma3-1b` (디바이스)
+> **구현 순서**: Phase 1 (1.1→1.6→1.2~1.5→1.7~1.10→1.11→1.12) → Phase 2 (2.1~2.4) → Phase 3
+
+---
+
+## Phase 1: 최소 동작 (CPU, full-context attention)
+
+### [P1] GEMMA-1.1. ModelArch::Gemma3 및 ModelConfig 확장
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음
+- **Description**: `engine/src/models/config.rs` 수정.
+  - `ModelArch` enum에 `Gemma3` 추가
+  - `RawHfConfig`에 `rope_local_base_freq`, `sliding_window`, `sliding_window_pattern`, `query_pre_attn_scalar`, `hidden_activation` 필드 추가
+  - `ModelConfig`에 `rope_local_theta`, `sliding_window`, `sliding_window_pattern`, `query_pre_attn_scalar`, `embed_scale` 필드 추가 (모두 Option)
+  - `detect_arch()`에 `"Gemma3ForCausalLM"`, `"gemma3_text"` 케이스 추가
+  - `from_json()`에서 Gemma3 분기: `embed_scale = Some(sqrt(hidden_size))`
+- **Acceptance Criteria**:
+  - `cargo check` 통과
+  - `test_parse_gemma3_config` 단위 테스트 통과
+  - Llama/Qwen2 config 파싱에 영향 없음
+
+### [P1] GEMMA-1.2. Backend rms_norm 시그니처 변경 (add_unit: bool)
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (1.1과 병렬 가능)
+- **Description**: `Backend` trait의 `rms_norm()`, `rms_norm_oop()`, `add_rms_norm_oop()` 시그니처에 `add_unit: bool` 파라미터 추가.
+  - trait 정의 변경 (`core/backend.rs`)
+  - CPU 구현체 변경 (`backend/cpu/common.rs`, `neon.rs`, `x86.rs`)
+  - OpenCL 구현체 변경 (`backend/opencl/mod.rs`)
+  - 기존 호출부 ~20개에 `false` 추가 (forward.rs, forward_gen.rs, transformer.rs, test_backend.rs, 테스트)
+  - `add_unit == true` 구현: weight 적용 시 `(1.0 + wi)` 사용
+- **Acceptance Criteria**:
+  - `cargo test` 전체 통과 (기존 경로 회귀 없음)
+  - `test_rms_norm_add_unit` 단위 테스트 통과 (add_unit=true 수치 검증)
+
+### [P1] GEMMA-1.3. Backend gelu_tanh_mul() 추가
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (1.2와 병렬 가능)
+- **Description**: `Backend` trait에 `gelu_tanh_mul()` default 구현 추가.
+  - 공식: `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³))) * up`
+  - default 구현은 scalar 루프 (Phase 1)
+- **Acceptance Criteria**:
+  - `test_gelu_tanh_known_values` 단위 테스트 통과 (gelu(0)=0, gelu(1)≈0.8413)
+
+### [P1] GEMMA-1.4. Gemma3Mapper 및 LayerWeightNames 확장
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.1 완료 후
+- **Description**:
+  - `models/mappers/mod.rs`: `LayerWeightNames`에 `pre_ffn_norm`, `post_ffn_norm`, `q_norm`, `k_norm` 4개 `Option<String>` 필드 추가. Llama/Qwen2 mapper에서 `None` 반환.
+  - `models/mappers/gemma3.rs` 신규: `Gemma3Mapper` 구현. 13개 텐서 이름 패턴.
+    - `ffn_norm` → `post_attention_layernorm` (Gemma3에서 post-attn norm 역할)
+    - `pre_ffn_norm` → `pre_feedforward_layernorm`
+    - `post_ffn_norm` → `post_feedforward_layernorm`
+    - `q_norm` → `self_attn.q_norm.weight`
+    - `k_norm` → `self_attn.k_norm.weight`
+  - `create_mapper()`에 `ModelArch::Gemma3` 분기 추가
+- **Acceptance Criteria**:
+  - `test_gemma3_mapper_names` 단위 테스트 통과
+  - Llama/Qwen2 mapper 테스트 변경 없음
+
+### [P1] GEMMA-1.5. TransformerLayer 구조체 확장
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.4 완료 후
+- **Description**: `layers/transformer_layer/mod.rs` 수정.
+  - `TransformerLayer`에 `q_norm`, `k_norm`, `pre_ffn_norm`, `post_ffn_norm` (모두 `Option<Tensor>`) 추가
+  - `LayerForwardArgs`에 `rms_norm_add_unit: bool`, `use_gelu_tanh: bool`, `is_local_attn: Option<bool>`, `local_attn_window: Option<usize>` 추가
+  - `ForwardGenArgs`에도 동일 필드 추가
+  - 기존 호출부에서 새 필드에 기본값 전달 (false/None)
+- **Acceptance Criteria**:
+  - `cargo check` 통과
+  - 기존 Llama/Qwen2 forward 경로 변경 없음
+
+### [P1] GEMMA-1.6. TransformerModel 로딩 확장
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.4, GEMMA-1.5 완료 후
+- **Description**: `models/transformer.rs` 의 `load_with_dtype()` 수정.
+  - `mapper.weight_names(i)`의 Optional 필드가 Some이면 해당 텐서 로딩 (q_norm, k_norm, pre_ffn_norm, post_ffn_norm)
+  - `TransformerLayer` 생성 시 Optional 필드 채움
+  - norm 텐서는 `is_weight: false` (F32 변환)
+- **Acceptance Criteria**:
+  - Gemma 3 1B safetensors 로드 시 26개 레이어 × 4 추가 텐서 정상 로딩
+  - Llama/Qwen2 로딩 경로 영향 없음
+
+### [P1] GEMMA-1.7. forward_prefill() Gemma3 분기
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.2, GEMMA-1.3, GEMMA-1.5 완료 후
+- **Description**: `layers/transformer_layer/forward.rs` 수정.
+  - `rms_norm()` 호출 시 `args.rms_norm_add_unit` 전달
+  - QKV projection 후 `if let Some(ref qn) = self.q_norm` → head 단위 rms_norm(add_unit=true) 적용 (RoPE 전)
+  - post-attn norm: `if args.rms_norm_add_unit` → `ffn_norm`을 post-attn norm으로 사용, residual add 전에 적용
+  - pre-ffn norm: `if let Some(ref pfn) = self.pre_ffn_norm` → pre-FFN norm 적용
+  - FFN activation: `if args.use_gelu_tanh` → `gelu_tanh_mul()` 사용, else → `silu_mul()`
+  - post-ffn norm: `if let Some(ref pfn) = self.post_ffn_norm` → post-FFN norm 적용
+- **Acceptance Criteria**:
+  - `cargo check` 통과
+  - Llama/Qwen2 forward_prefill 경로 영향 없음 (새 필드가 false/None)
+
+### [P1] GEMMA-1.8. forward_gen() Gemma3 분기
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.7과 동일
+- **Description**: `layers/transformer_layer/forward_gen.rs` 수정.
+  - GEMMA-1.7과 동일한 분기를 decode (seq_len==1) 경로에 적용
+  - `add_rms_norm_oop()` 호출 시 `add_unit` 전달
+- **Acceptance Criteria**:
+  - `cargo check` 통과
+  - Llama/Qwen2 forward_gen 경로 영향 없음
+
+### [P1] GEMMA-1.9. forward_into() Gemma3 분기
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.6, GEMMA-1.7, GEMMA-1.8 완료 후
+- **Description**: `models/transformer.rs`의 `forward_into()` 수정.
+  - embed gather 후 `if let Some(scale) = self.config.embed_scale` → `backend.scale(&mut x, scale)`
+  - 레이어 루프에서: `is_local_layer(i, config.sliding_window_pattern)` 판별
+  - `rope_theta`: 로컬 → `config.rope_local_theta`, 글로벌 → `config.rope_theta`
+  - `LayerForwardArgs`에 `rms_norm_add_unit`, `use_gelu_tanh`, `is_local_attn`, `local_attn_window` 전달
+  - final norm: `rms_norm(&mut x, &self.norm, eps, is_gemma3)` (add_unit)
+- **Acceptance Criteria**:
+  - `cargo check` 통과
+  - Llama/Qwen2 forward_into 경로 영향 없음
+
+### [P1] GEMMA-1.10. 모델 다운로드 및 호스트 동작 확인
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.9 완료 후
+- **Description**:
+  - `huggingface-cli download google/gemma-3-1b-pt --local-dir models/gemma3-1b`
+  - `cargo run --release --bin generate -- --model-path models/gemma3-1b --prompt "Hello" -n 64`
+  - 출력이 coherent한 영어 텍스트인지 확인
+  - `cargo test` 전체 통과 확인
+- **Acceptance Criteria**:
+  - 모델 로딩 성공, 텍스트 생성 가능
+  - 출력 품질이 명백히 nonsense가 아닌 것을 확인
+
+### [P1] GEMMA-1.11. sanity-check 통과
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.10 완료 후
+- **Description**: `.agent/skills/developing/scripts/sanity_check.sh` 실행.
+  - `cargo fmt` 경고 없음
+  - `cargo clippy` 경고 없음
+  - `cargo test` 전체 통과
+- **Acceptance Criteria**: sanity_check.sh exit 0
+
+### [P1] GEMMA-1.12. 온디바이스 동작 확인
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: GEMMA-1.11 완료 후
+- **Description**:
+  - Android 크로스 빌드: `source android.source && cargo build --target aarch64-linux-android --release`
+  - 모델/바이너리 디바이스 전송
+  - CPU 추론: `./generate --model-path models/gemma3-1b --prompt "Hello" -n 64 -b cpu`
+  - OpenCL 추론: `./generate --model-path models/gemma3-1b --prompt "Hello" -n 64 -b opencl`
+- **Acceptance Criteria**:
+  - CPU 및 OpenCL 백엔드에서 텍스트 생성 성공
+  - 성능 수치 기록 (tok/s)
+
+---
+
+## Phase 2: Sliding Window Attention
+
+### [P2] GEMMA-2.1. flash_attention에 window_size 파라미터 추가
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: Phase 1 완료 후
+- **Description**: `layers/attention.rs`의 `flash_attention_forward_strided()`에 `window_size: Option<usize>` 파라미터 추가.
+  - causal mask 생성 시 window 바깥 토큰을 `-inf`로 설정
+  - `None`이면 기존 full-context 동작
+- **Acceptance Criteria**:
+  - 기존 Llama/Qwen2 flash attention 경로 변경 없음 (window_size=None)
+  - window_size 적용 시 지정 범위만 attend
+
+### [P2] GEMMA-2.2. prefill 로컬 레이어 window_size 전달
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: GEMMA-2.1 완료 후
+- **Description**: `forward.rs`에서 로컬 레이어일 때 `flash_attention_forward_strided()`에 `window_size = args.local_attn_window` 전달.
+- **Acceptance Criteria**: 로컬 레이어 prefill에서 window mask 적용 확인
+
+### [P2] GEMMA-2.3. decode 로컬 레이어 effective_cache_len 계산
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: GEMMA-2.1 완료 후
+- **Description**: `forward_gen.rs`에서 로컬 레이어일 때 `effective_cache_len = min(cache_seq_len, window_size)`.
+  - KV cache offset 계산: `kv_start_pos = cache_seq_len - effective_cache_len`
+- **Acceptance Criteria**: 로컬 레이어 decode에서 최근 window_size 토큰에만 attend
+
+### [P2] GEMMA-2.4. SW attention 정확도 검증
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: GEMMA-2.2, GEMMA-2.3 완료 후
+- **Description**: Phase 1 (full context) vs Phase 2 (SW) 출력 비교.
+  - 짧은 프롬프트 (< 512 tok): 동일 출력 기대 (window 내)
+  - 긴 프롬프트 (> 512 tok): 차이 발생 확인
+- **Acceptance Criteria**: 짧은 프롬프트에서 동일 출력, 긴 프롬프트에서 품질 유지
+
+---
+
+## Phase 3: 최적화 (선택적)
+
+### [P3] GEMMA-3.1. rms_norm(add_unit=true) NEON 가속
+- **Status**: TODO
+- **Sprint**: backlog
+- **Description**: NEON SIMD 경로에서 add_unit=true 분기 최적화
+
+### [P3] GEMMA-3.2. gelu_tanh_mul() NEON 가속
+- **Status**: TODO
+- **Sprint**: backlog
+- **Description**: GELU_tanh의 tanh 근사 NEON 벡터화
+
+### [P3] GEMMA-3.3. OpenCL RMSNorm add_unit 커널
+- **Status**: TODO
+- **Sprint**: backlog
+- **Description**: 별도 `.cl` 파일로 add_unit RMSNorm 커널 추가
