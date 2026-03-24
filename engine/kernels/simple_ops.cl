@@ -602,7 +602,7 @@ kernel void kernel_attn_gen(
     // Then we reduce across threads
 
     // Initialize output accumulator per thread
-    float out_local[64]; // Assuming head_dim <= 64
+    float out_local[256]; // Max head_dim across supported models (Gemma 3: 256, Qwen2: 128, Llama: 64)
     for (int d = 0; d < head_dim; d++) {
         out_local[d] = 0.0f;
     }
@@ -725,7 +725,7 @@ kernel void kernel_attn_gen_half(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // === PASS 2: Weighted V sum ===
-    float out_local[64];
+    float out_local[256]; // Max head_dim across supported models (Gemma 3: 256, Qwen2: 128, Llama: 64)
     for (int d = 0; d < head_dim; d++) {
         out_local[d] = 0.0f;
     }
