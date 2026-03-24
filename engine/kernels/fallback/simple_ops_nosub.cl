@@ -176,6 +176,20 @@ kernel void kernel_silu_mul_simple(
     }
 }
 
+kernel void kernel_gelu_tanh_mul(
+    global float * x,
+    global float * y,
+    int size
+) {
+    int i = get_global_id(0);
+    if (i < size) {
+        float val = x[i];
+        float inner = 0.7978845608f * (val + 0.044715f * val * val * val);
+        float gelu = 0.5f * val * (1.0f + tanh(inner));
+        x[i] = gelu * y[i];
+    }
+}
+
 //------------------------------------------------------------------------------
 // Simple fallback versions (kept for compatibility)
 //------------------------------------------------------------------------------

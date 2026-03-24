@@ -496,6 +496,24 @@ kernel void kernel_silu_mul_simple(
 }
 
 //------------------------------------------------------------------------------
+// GELU tanh approximation * mul: x[i] = gelu_tanh(x[i]) * y[i] (vectorized float4)
+// gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+//------------------------------------------------------------------------------
+kernel void kernel_gelu_tanh_mul(
+    global float4 * x,
+    global float4 * y,
+    int size4
+) {
+    int i = get_global_id(0);
+    if (i < size4) {
+        float4 val = x[i];
+        float4 inner = 0.7978845608f * (val + 0.044715f * val * val * val);
+        float4 gelu = 0.5f * val * (1.0f + tanh(inner));
+        x[i] = gelu * y[i];
+    }
+}
+
+//------------------------------------------------------------------------------
 // Optimized Single-Query Attention Kernel for Generation (GQA-aware)
 // Q: [num_heads_q, head_dim] - single query token
 // K: [cache_seq_len, num_heads_kv, head_dim] - key cache

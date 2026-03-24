@@ -73,6 +73,7 @@ struct KernelCache {
     kernel_softmax_opt: CoreKernel,
     kernel_rope_simple: CoreKernel,
     kernel_silu_mul_simple: CoreKernel,
+    kernel_gelu_tanh_mul: CoreKernel,
     kernel_add_assign_simple: CoreKernel,
     kernel_scale_simple: CoreKernel,
     kernel_get_rows_q4_0: CoreKernel,
@@ -489,6 +490,10 @@ impl OpenCLBackend {
             kernel_silu_mul_simple: ocl::core::create_kernel(
                 &simple_ops_program,
                 "kernel_silu_mul_simple",
+            )?,
+            kernel_gelu_tanh_mul: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_gelu_tanh_mul",
             )?,
             kernel_add_assign_simple: ocl::core::create_kernel(
                 &simple_ops_program,
@@ -1725,6 +1730,36 @@ impl Backend for OpenCLBackend {
 
         let kernels = unsafe { &*self.kernels.get() };
         let kernel = &kernels.kernel_silu_mul_simple;
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size4 as i32)))?;
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                1,
+                None,
+                &[size4, 1, 1],
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn gelu_tanh_mul(&self, x: &mut Tensor, y: &Tensor) -> Result<()> {
+        let size = x.shape().dims().iter().product::<usize>();
+        let size4 = size / 4;
+
+        let x_buf =
+            get_cl_mem(x.buffer().as_ref()).map_err(|_| anyhow!("X is not OpenCL buffer"))?;
+        let y_buf =
+            get_cl_mem(y.buffer().as_ref()).map_err(|_| anyhow!("Y is not OpenCL buffer"))?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = &kernels.kernel_gelu_tanh_mul;
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
