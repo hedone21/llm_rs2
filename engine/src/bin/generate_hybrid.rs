@@ -462,6 +462,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         // Sample last token
@@ -616,6 +617,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         // ── Resilience checkpoint (CommandExecutor) ──────

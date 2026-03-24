@@ -236,6 +236,7 @@ impl TransformerLayer {
             args.use_gelu_tanh,
             args.is_local_attn,
             args.local_attn_window,
+            args.prefill_ws,
         )
     }
 
@@ -309,6 +310,8 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub is_local_attn: Option<bool>,
     /// Gemma3: local attention window size (sliding_window value).
     pub local_attn_window: Option<usize>,
+    /// Pre-allocated prefill workspace for GPU buffer reuse across layers.
+    pub prefill_ws: Option<&'a mut crate::layers::workspace::PrefillWorkspace>,
 }
 
 // OpProfiler has been moved to crate::profile::ops.

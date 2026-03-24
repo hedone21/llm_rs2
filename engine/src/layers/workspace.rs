@@ -66,6 +66,61 @@ pub struct WorkspaceConfig {
     pub max_seq_len: usize,
 }
 
+/// Pre-allocated workspace for prefill (batch token processing).
+/// Reuses GPU buffers across layers to avoid alloc/free churn that crashes NVIDIA's OpenCL driver.
+pub struct PrefillWorkspace {
+    pub q: Tensor,
+    pub k: Tensor,
+    pub v: Tensor,
+    pub out_attn: Tensor,
+    pub attn_out_proj: Tensor,
+    pub gate: Tensor,
+    pub up: Tensor,
+    pub down: Tensor,
+    pub residual: Tensor,
+    pub residual_ffn: Tensor,
+    /// Lazily initialized cast buffers for F16/Q4 KV cache
+    pub k_cast: Option<Tensor>,
+    pub v_cast: Option<Tensor>,
+    seq_len: usize,
+}
+
+impl PrefillWorkspace {
+    pub fn new(
+        config: &WorkspaceConfig,
+        seq_len: usize,
+        memory: &dyn Memory,
+        backend: Arc<dyn Backend>,
+    ) -> Result<Self> {
+        let alloc = |shape: Vec<usize>| -> Result<Tensor> {
+            let size: usize = shape.iter().product();
+            let buf = memory.alloc(size * 4, DType::F32)?;
+            Ok(Tensor::new(Shape::new(shape), buf, backend.clone()))
+        };
+        let b = config.batch_size;
+        Ok(Self {
+            q: alloc(vec![b, seq_len, config.q_dim])?,
+            k: alloc(vec![b, seq_len, config.k_dim])?,
+            v: alloc(vec![b, seq_len, config.v_dim])?,
+            out_attn: alloc(vec![b, seq_len, config.q_dim])?,
+            attn_out_proj: alloc(vec![b, seq_len, config.dim])?,
+            gate: alloc(vec![b, seq_len, config.ffn_hidden])?,
+            up: alloc(vec![b, seq_len, config.ffn_hidden])?,
+            down: alloc(vec![b, seq_len, config.dim])?,
+            residual: alloc(vec![b, seq_len, config.dim])?,
+            residual_ffn: alloc(vec![b, seq_len, config.dim])?,
+            k_cast: None,
+            v_cast: None,
+            seq_len,
+        })
+    }
+
+    /// Current sequence length this workspace is sized for.
+    pub fn seq_len(&self) -> usize {
+        self.seq_len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -14,10 +14,12 @@ use crate::core::qcf::QcfConfig;
 /// KV cache snapshot for save/restore between multi-token choice scoring.
 ///
 /// Stores raw byte copies of K and V buffers for each layer, along with
-/// their `current_pos` counters.
+/// their `current_pos` counters. Supports both CPU and GPU (OpenCL) buffers.
 pub struct KVCacheSnapshot {
     /// Per-layer raw bytes: K buffer followed immediately by V buffer.
     data: Vec<Vec<u8>>,
+    /// Backend reference for GPU read/write operations.
+    backend: std::sync::Arc<dyn crate::core::backend::Backend>,
     /// Per-layer `current_pos` values.
     positions: Vec<usize>,
 }
@@ -26,19 +28,26 @@ impl CacheSnapshot<KVCache> for KVCacheSnapshot {
     fn restore_to(&self, caches: &mut [KVCache]) {
         for (i, cache) in caches.iter_mut().enumerate() {
             let k_size = cache.k_buffer.buffer().size();
-            // SAFETY: we allocated `data[i]` from the same K+V buffer sizes;
-            // pointer arithmetic mirrors the snapshot_kv() copy exactly.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.data[i].as_ptr(),
-                    cache.k_buffer.buffer().as_mut_ptr(),
-                    k_size,
-                );
-                std::ptr::copy_nonoverlapping(
-                    self.data[i].as_ptr().add(k_size),
-                    cache.v_buffer.buffer().as_mut_ptr(),
-                    self.data[i].len() - k_size,
-                );
+            let v_size = self.data[i].len() - k_size;
+            let k_ptr = cache.k_buffer.buffer().as_mut_ptr();
+            if !k_ptr.is_null() {
+                // CPU path: direct memcpy
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.data[i].as_ptr(), k_ptr, k_size);
+                    std::ptr::copy_nonoverlapping(
+                        self.data[i].as_ptr().add(k_size),
+                        cache.v_buffer.buffer().as_mut_ptr(),
+                        v_size,
+                    );
+                }
+            } else {
+                // GPU path: write via OpenCL
+                let _ = self
+                    .backend
+                    .write_buffer(&mut cache.k_buffer, &self.data[i][..k_size]);
+                let _ = self
+                    .backend
+                    .write_buffer(&mut cache.v_buffer, &self.data[i][k_size..]);
             }
             cache.current_pos = self.positions[i];
         }
@@ -72,6 +81,8 @@ pub struct EvictionHook {
     pub h2o_keep_ratio: f32,
     /// KV cache dtype string for QCF gating (only "f32" collects QCF).
     pub kv_type: String,
+    /// Backend reference for GPU buffer read/write in snapshot/restore.
+    pub backend: std::sync::Arc<dyn crate::core::backend::Backend>,
 
     // -- Statistics (reset per question) --
     /// Number of eviction events this question.
@@ -91,6 +102,7 @@ impl EvictionHook {
         score_based_eviction: bool,
         h2o_keep_ratio: f32,
         kv_type: String,
+        backend: std::sync::Arc<dyn crate::core::backend::Backend>,
     ) -> Self {
         Self {
             cache_manager,
@@ -101,6 +113,7 @@ impl EvictionHook {
             score_based_eviction,
             h2o_keep_ratio,
             kv_type,
+            backend,
             eviction_count: 0,
             evicted_total: 0,
         }
@@ -265,23 +278,34 @@ impl StepHook<KVCache> for EvictionHook {
             let k_size = cache.k_buffer.buffer().size();
             let v_size = cache.v_buffer.buffer().size();
             let mut buf = vec![0u8; k_size + v_size];
-            // SAFETY: K/V buffers are valid, sizes come from the same buffer objects.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    cache.k_buffer.buffer().as_ptr(),
-                    buf.as_mut_ptr(),
-                    k_size,
-                );
-                std::ptr::copy_nonoverlapping(
-                    cache.v_buffer.buffer().as_ptr(),
-                    buf.as_mut_ptr().add(k_size),
-                    v_size,
-                );
+            let k_ptr = cache.k_buffer.buffer().as_ptr();
+            if !k_ptr.is_null() {
+                // CPU path: direct memcpy
+                unsafe {
+                    std::ptr::copy_nonoverlapping(k_ptr, buf.as_mut_ptr(), k_size);
+                    std::ptr::copy_nonoverlapping(
+                        cache.v_buffer.buffer().as_ptr(),
+                        buf.as_mut_ptr().add(k_size),
+                        v_size,
+                    );
+                }
+            } else {
+                // GPU path: read via OpenCL
+                let _ = self
+                    .backend
+                    .read_buffer(&cache.k_buffer, &mut buf[..k_size]);
+                let _ = self
+                    .backend
+                    .read_buffer(&cache.v_buffer, &mut buf[k_size..]);
             }
             data.push(buf);
             positions.push(cache.current_pos);
         }
-        Box::new(KVCacheSnapshot { data, positions })
+        Box::new(KVCacheSnapshot {
+            data,
+            positions,
+            backend: self.backend.clone(),
+        })
     }
 
     fn set_effective_budget(&mut self, budget: usize) {
@@ -350,6 +374,7 @@ mod tests {
             score_based,
             0.5,
             "f32".to_string(),
+            std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
         )
     }
 

@@ -908,6 +908,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: Some(&mut collector),
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         let table = collector.build();
@@ -998,6 +999,7 @@ fn main() -> anyhow::Result<()> {
             score_based_eviction,
             args.h2o_keep_ratio,
             args.kv_type.clone(),
+            backend.clone(),
         );
 
         let output = llm_rs2::eval::run_eval_ll_generic(
@@ -1104,6 +1106,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
         backend.synchronize()?;
 
@@ -1173,6 +1176,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
         backend.synchronize()?;
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
@@ -1378,6 +1382,7 @@ fn main() -> anyhow::Result<()> {
                     skip_config: None,
                     importance_collector: None,
                     logits_last_only: false,
+                    prefill_ws: None,
                 })?;
 
                 // Rebuild plan after fallback (KV cache may have grown)
@@ -2146,6 +2151,7 @@ fn run_kivi_ppl(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -2221,6 +2227,7 @@ fn run_kivi_ppl(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
         start_pos += 1;
 
@@ -2444,6 +2451,7 @@ fn run_kivi(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2532,6 +2540,7 @@ fn run_kivi(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -2839,6 +2848,7 @@ fn run_offload(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2932,6 +2942,7 @@ fn run_offload(
                 skip_config: None,
                 importance_collector: None,
                 logits_last_only: false,
+                prefill_ws: None,
             },
             &mut prefetch,
         )?;
@@ -3199,6 +3210,7 @@ fn run_ppl(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
 
         // Read all prefill logits to CPU
@@ -3262,6 +3274,7 @@ fn run_ppl(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
         start_pos += 1;
 

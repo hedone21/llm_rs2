@@ -98,6 +98,9 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
     pub logits_last_only: bool,
+    /// Pre-allocated prefill workspace for GPU buffer reuse across questions.
+    /// When provided, avoids per-layer alloc/free that crashes NVIDIA's OpenCL driver.
+    pub prefill_ws: Option<&'a mut crate::layers::workspace::PrefillWorkspace>,
 }
 
 impl TransformerModel {
@@ -712,6 +715,7 @@ impl TransformerModel {
                 is_local_attn: is_local,
                 local_attn_window: self.config.sliding_window,
                 need_scores: false,
+                prefill_ws: None,
                 head_dim: self.config.head_dim,
                 profiler: None,
                 layer_id: i,
@@ -799,6 +803,26 @@ impl TransformerModel {
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
+        // Use caller-provided prefill workspace or create one for this call.
+        let mut prefill_ws = args.prefill_ws;
+        let mut owned_prefill_ws;
+        if prefill_ws.is_none() && seq_len > 1 && backend.name() == "OpenCL" {
+            use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
+            let ws_cfg = WsCfg {
+                batch_size,
+                dim: hidden_size,
+                q_dim: self.config.num_attention_heads * self.config.head_dim,
+                k_dim: self.config.num_key_value_heads * self.config.head_dim,
+                v_dim: self.config.num_key_value_heads * self.config.head_dim,
+                ffn_hidden: self.config.intermediate_size,
+                n_heads: self.config.num_attention_heads,
+                max_seq_len: 0,
+            };
+            owned_prefill_ws =
+                PrefillWorkspace::new(&ws_cfg, seq_len, memory, backend.clone()).ok();
+            prefill_ws = owned_prefill_ws.as_mut();
+        }
+
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
             let need_scores = score_accumulator
@@ -847,14 +871,8 @@ impl TransformerModel {
                 use_gelu_tanh: is_gemma3,
                 is_local_attn: is_local,
                 local_attn_window: self.config.sliding_window,
+                prefill_ws: prefill_ws.as_mut().map(|ws| &mut **ws),
             })?;
-
-            // Flush GPU queue periodically during prefill to let the driver reclaim
-            // temp buffers. Without this, NVIDIA's OpenCL driver accumulates deferred
-            // releases across 28 layers × 8+ alloc_temp calls and eventually segfaults.
-            if seq_len > 1 && backend.name() == "OpenCL" && (i + 1) % 4 == 0 {
-                backend.synchronize()?;
-            }
 
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
@@ -1237,6 +1255,7 @@ impl TransformerModel {
                 use_gelu_tanh: is_gemma3,
                 is_local_attn: is_local_i,
                 local_attn_window: self.config.sliding_window,
+                prefill_ws: None,
             })?;
             let fwd_dur = fwd_t0.elapsed();
             prefetch.record_forward(fwd_dur);

@@ -82,6 +82,31 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         backend.clone(),
     )?;
 
+    // Pre-allocate prefill workspace for GPU buffer reuse across questions.
+    // Allocated once at max_seq_len; prevents NVIDIA OpenCL driver crash from
+    // accumulated alloc/free cycles during multi-question eval-ll.
+    let mut prefill_ws = if backend.name() == "OpenCL" {
+        use crate::layers::workspace::PrefillWorkspace;
+        PrefillWorkspace::new(
+            &WorkspaceConfig {
+                batch_size: 1,
+                dim: hidden_size,
+                q_dim,
+                k_dim,
+                v_dim,
+                ffn_hidden,
+                n_heads: model.config.num_attention_heads,
+                max_seq_len,
+            },
+            max_seq_len,
+            memory,
+            backend.clone(),
+        )
+        .ok()
+    } else {
+        None
+    };
+
     // Single-token CPU input tensor (reused for decode steps)
     let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
     let cpu_gen_input = Tensor::new(
@@ -169,6 +194,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             vocab_size,
             effective_eval_config,
             skip_config,
+            prefill_ws.as_mut(),
         )?;
 
         // ── post_prefill hook ──
@@ -242,6 +268,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         skip_config,
                         importance_collector: None,
                         logits_last_only: false,
+                        prefill_ws: None,
                     })?;
                     sp += 1;
 
@@ -478,6 +505,7 @@ fn run_importance_pass<C: KVCacheOps>(
         skip_config: None, // intentionally None for importance measurement
         importance_collector: Some(&mut collector),
         logits_last_only: false,
+        prefill_ws: None,
     })?;
 
     let table = collector.build();
@@ -524,6 +552,7 @@ fn run_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
+    prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let prompt_len = prompt_ids.len();
     let effective_budget = eval_config.effective_budget;
@@ -558,6 +587,7 @@ fn run_prefill<C: KVCacheOps>(
             vocab_size,
             eval_config,
             skip_config,
+            prefill_ws,
         )
     }
 }
@@ -575,6 +605,7 @@ fn run_full_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
+    mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let prompt_len = prompt_ids.len();
 
@@ -614,6 +645,7 @@ fn run_full_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
+        prefill_ws: prefill_ws.as_mut().map(|ws| &mut **ws),
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -694,6 +726,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: false,
+        prefill_ws: None,
     })?;
 
     // Evict if over budget after first chunk
@@ -730,6 +763,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
+            prefill_ws: None,
         })?;
         start_pos += 1;
 
