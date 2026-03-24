@@ -230,7 +230,7 @@ mod tests {
 
     #[test]
     fn roundtrip_directive_over_socket() {
-        use llm_shared::{EngineCommand, EngineDirective, ManagerMessage, ResourceLevel};
+        use llm_shared::{EngineCommand, EngineDirective, ManagerMessage};
 
         let dir = tempfile::tempdir().unwrap();
         let sock_path = dir.path().join("test3.sock");
@@ -247,11 +247,7 @@ mod tests {
         // Emit a directive
         let directive = EngineDirective {
             seq_id: 42,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Critical,
-                target_ratio: 0.5,
-                deadline_ms: Some(1000),
-            }],
+            commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }],
         };
         emitter.emit_directive(&directive).unwrap();
 
@@ -270,7 +266,7 @@ mod tests {
                 assert_eq!(d.commands.len(), 1);
                 assert!(matches!(
                     d.commands[0],
-                    EngineCommand::SetMemoryLevel { .. }
+                    EngineCommand::KvEvictSliding { .. }
                 ));
             }
         }

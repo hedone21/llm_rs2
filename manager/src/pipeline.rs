@@ -12,9 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use llm_shared::{
-    EngineCommand, EngineDirective, EngineMessage, Level, ResourceLevel, SystemSignal,
-};
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, Level, SystemSignal};
 
 use crate::action_registry::ActionRegistry;
 use crate::config::PolicyConfig;
@@ -285,12 +283,16 @@ impl PolicyPipeline {
         v[feature::TOKENS_GENERATED_NORM] =
             (status.tokens_generated as f32 / DEFAULT_MAX_TOKENS).min(1.0);
 
-        // [10] 활성 eviction 여부 (memory_level이 Normal이 아니면 1.0)
-        v[feature::ACTIVE_EVICTION] = if status.memory_level != llm_shared::ResourceLevel::Normal {
-            1.0
-        } else {
-            0.0
-        };
+        // [10] 활성 eviction 여부 (eviction_policy가 "none" 또는 빈 문자열이 아니면 1.0)
+        v[feature::ACTIVE_EVICTION] =
+            if !status.eviction_policy.is_empty() && status.eviction_policy != "none" {
+                1.0
+            } else {
+                0.0
+            };
+
+        // [11] 활성 layer skip 여부 (skip_ratio > 0)
+        v[feature::ACTIVE_LAYER_SKIP] = if status.skip_ratio > 0.0 { 1.0 } else { 0.0 };
     }
 
     // ── 내부 헬퍼 ──────────────────────────────────────────────────────────
@@ -351,88 +353,61 @@ impl PolicyPipeline {
         }
     }
 
-    /// ActionCommand 목록을 기존 `EngineCommand`로 변환한다.
-    ///
-    /// Engine은 아직 `ActionCommand` 프로토콜을 지원하지 않으므로
-    /// 기존 `EngineCommand` 체계로 변환하여 전송한다.
+    /// ActionCommand를 `EngineCommand`로 직접 변환한다.
     fn convert_to_engine_commands(&self, commands: &[ActionCommand]) -> Vec<EngineCommand> {
-        let mut result = Vec::new();
-        for cmd in commands {
-            match (&cmd.action, &cmd.operation) {
-                (ActionId::SwitchHw, Operation::Apply(_)) => {
-                    result.push(EngineCommand::SwitchComputeUnit {
-                        device: "cpu".to_string(),
-                    });
-                }
-                (ActionId::Throttle, Operation::Apply(params)) => {
-                    let delay_ms = params.values.get("delay_ms").copied().unwrap_or(0.0);
-                    // delay_ms [0, 100] → throughput [1.0, 0.1]
-                    let throughput = (1.0 - delay_ms / 100.0).clamp(0.1, 1.0);
-                    result.push(EngineCommand::SetComputeLevel {
-                        level: ResourceLevel::Warning,
-                        target_throughput: throughput,
-                        deadline_ms: Some(2000),
-                    });
-                }
-                (ActionId::KvEvictSliding | ActionId::KvEvictH2o, Operation::Apply(params)) => {
-                    let keep_ratio = params.values.get("keep_ratio").copied().unwrap_or(0.5);
-                    result.push(EngineCommand::SetMemoryLevel {
-                        level: ResourceLevel::Critical,
-                        target_ratio: keep_ratio,
-                        deadline_ms: Some(1000),
-                    });
-                }
-                (ActionId::KvOffloadDisk, Operation::Apply(_)) => {
-                    result.push(EngineCommand::SetMemoryLevel {
-                        level: ResourceLevel::Warning,
-                        target_ratio: 0.8,
-                        deadline_ms: Some(2000),
-                    });
-                }
-                (ActionId::LayerSkip, Operation::Apply(params)) => {
-                    let skip = params.values.get("skip_layers").copied().unwrap_or(1.0);
-                    // skip_layers가 많을수록 throughput 감소
-                    let throughput = (1.0 - skip / 16.0).clamp(0.1, 1.0);
-                    result.push(EngineCommand::SetComputeLevel {
-                        level: ResourceLevel::Critical,
-                        target_throughput: throughput,
-                        deadline_ms: Some(1000),
-                    });
-                }
-                (ActionId::KvQuantDynamic, Operation::Apply(_)) => {
-                    // KV quantization은 memory level로 표현
-                    result.push(EngineCommand::SetMemoryLevel {
-                        level: ResourceLevel::Warning,
-                        target_ratio: 0.9,
-                        deadline_ms: Some(2000),
-                    });
-                }
-                (_, Operation::Release) => {
-                    // Release 명령은 restore directive에서 일괄 처리 — 여기서는 무시
-                }
-            }
-        }
-        result
+        commands
+            .iter()
+            .filter_map(action_to_engine_command)
+            .collect()
     }
 
     /// Normal 복귀 시 발송할 restore directive를 생성한다.
     fn build_restore_directive(&self) -> Option<EngineDirective> {
-        let commands = vec![
-            EngineCommand::SetComputeLevel {
-                level: ResourceLevel::Normal,
-                target_throughput: 1.0,
-                deadline_ms: None,
-            },
-            EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Normal,
-                target_ratio: 1.0,
-                deadline_ms: None,
-            },
-        ];
+        let commands = vec![EngineCommand::RestoreDefaults];
         Some(EngineDirective {
             seq_id: next_seq_id(),
             commands,
         })
+    }
+}
+
+/// ActionCommand 하나를 EngineCommand로 변환한다.
+/// Release 명령은 `None`을 반환한다 (restore directive에서 일괄 처리).
+fn action_to_engine_command(cmd: &ActionCommand) -> Option<EngineCommand> {
+    match (&cmd.action, &cmd.operation) {
+        (ActionId::SwitchHw, Operation::Apply(_)) => Some(EngineCommand::SwitchHw {
+            device: "cpu".to_string(),
+        }),
+        (ActionId::Throttle, Operation::Apply(params)) => {
+            let delay_ms = params.values.get("delay_ms").copied().unwrap_or(0.0) as u64;
+            Some(EngineCommand::Throttle { delay_ms })
+        }
+        (ActionId::KvEvictSliding, Operation::Apply(params)) => {
+            let keep_ratio = params.values.get("keep_ratio").copied().unwrap_or(0.5);
+            Some(EngineCommand::KvEvictSliding { keep_ratio })
+        }
+        (ActionId::KvEvictH2o, Operation::Apply(params)) => {
+            let keep_ratio = params.values.get("keep_ratio").copied().unwrap_or(0.5);
+            Some(EngineCommand::KvEvictH2o { keep_ratio })
+        }
+        (ActionId::KvOffloadDisk, Operation::Apply(_)) => {
+            // KvOffloadDisk은 fallback으로 sliding window eviction 사용
+            Some(EngineCommand::KvEvictSliding { keep_ratio: 0.8 })
+        }
+        (ActionId::KvQuantDynamic, Operation::Apply(params)) => {
+            let target_bits = params.values.get("target_bits").copied().unwrap_or(4.0) as u8;
+            Some(EngineCommand::KvQuantDynamic { target_bits })
+        }
+        (ActionId::LayerSkip, Operation::Apply(params)) => {
+            let skip_layers = params.values.get("skip_layers").copied().unwrap_or(1.0);
+            let total_layers = params.values.get("total_layers").copied().unwrap_or(16.0);
+            let skip_ratio = (skip_layers / total_layers).clamp(0.0, 1.0);
+            Some(EngineCommand::LayerSkip { skip_ratio })
+        }
+        (_, Operation::Release) => {
+            // Release 명령은 restore directive에서 일괄 처리 — 여기서는 무시
+            None
+        }
     }
 }
 
@@ -570,37 +545,15 @@ mod tests {
         );
     }
 
-    /// restore directive에는 Normal 레벨 명령이 포함된다
+    /// restore directive에는 RestoreDefaults 명령이 포함된다
     #[test]
-    fn test_restore_directive_has_normal_commands() {
+    fn test_restore_directive_has_restore_defaults() {
         let p = make_pipeline();
         let directive = p.build_restore_directive().unwrap();
-        assert_eq!(directive.commands.len(), 2);
-        let has_compute_normal = directive.commands.iter().any(|c| {
-            matches!(
-                c,
-                EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Normal,
-                    ..
-                }
-            )
-        });
-        let has_memory_normal = directive.commands.iter().any(|c| {
-            matches!(
-                c,
-                EngineCommand::SetMemoryLevel {
-                    level: ResourceLevel::Normal,
-                    ..
-                }
-            )
-        });
+        assert_eq!(directive.commands.len(), 1);
         assert!(
-            has_compute_normal,
-            "Restore should include Normal compute level"
-        );
-        assert!(
-            has_memory_normal,
-            "Restore should include Normal memory level"
+            matches!(directive.commands[0], EngineCommand::RestoreDefaults),
+            "Restore directive should contain RestoreDefaults"
         );
     }
 
@@ -620,9 +573,9 @@ mod tests {
         p.save_model();
     }
 
-    /// ActionCommand → EngineCommand 변환: KvEvictSliding → SetMemoryLevel
+    /// ActionCommand → EngineCommand 변환: KvEvictSliding → KvEvictSliding
     #[test]
-    fn test_convert_kv_evict_to_set_memory_level() {
+    fn test_convert_kv_evict_sliding_to_engine_command() {
         use crate::types::{ActionParams, Operation};
         use std::collections::HashMap;
 
@@ -636,21 +589,39 @@ mod tests {
         let engine_cmds = p.convert_to_engine_commands(&[cmd]);
         assert_eq!(engine_cmds.len(), 1);
         match &engine_cmds[0] {
-            EngineCommand::SetMemoryLevel {
-                level,
-                target_ratio,
-                ..
-            } => {
-                assert_eq!(*level, ResourceLevel::Critical);
-                assert!((*target_ratio - 0.6).abs() < f32::EPSILON);
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                assert!((*keep_ratio - 0.6).abs() < f32::EPSILON);
             }
-            _ => panic!("Expected SetMemoryLevel"),
+            _ => panic!("Expected KvEvictSliding"),
         }
     }
 
-    /// ActionCommand → EngineCommand 변환: SwitchHw → SwitchComputeUnit
+    /// ActionCommand → EngineCommand 변환: KvEvictH2o → KvEvictH2o
     #[test]
-    fn test_convert_switch_hw_to_switch_compute_unit() {
+    fn test_convert_kv_evict_h2o_to_engine_command() {
+        use crate::types::{ActionParams, Operation};
+        use std::collections::HashMap;
+
+        let p = make_pipeline();
+        let mut values = HashMap::new();
+        values.insert("keep_ratio".to_string(), 0.48_f32);
+        let cmd = ActionCommand {
+            action: ActionId::KvEvictH2o,
+            operation: Operation::Apply(ActionParams { values }),
+        };
+        let engine_cmds = p.convert_to_engine_commands(&[cmd]);
+        assert_eq!(engine_cmds.len(), 1);
+        match &engine_cmds[0] {
+            EngineCommand::KvEvictH2o { keep_ratio } => {
+                assert!((*keep_ratio - 0.48).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvEvictH2o"),
+        }
+    }
+
+    /// ActionCommand → EngineCommand 변환: SwitchHw → SwitchHw
+    #[test]
+    fn test_convert_switch_hw_to_engine_command() {
         use crate::types::{ActionParams, Operation};
 
         let p = make_pipeline();
@@ -661,10 +632,77 @@ mod tests {
         let engine_cmds = p.convert_to_engine_commands(&[cmd]);
         assert_eq!(engine_cmds.len(), 1);
         match &engine_cmds[0] {
-            EngineCommand::SwitchComputeUnit { device } => {
+            EngineCommand::SwitchHw { device } => {
                 assert_eq!(device, "cpu");
             }
-            _ => panic!("Expected SwitchComputeUnit"),
+            _ => panic!("Expected SwitchHw"),
+        }
+    }
+
+    /// ActionCommand → EngineCommand 변환: Throttle → Throttle
+    #[test]
+    fn test_convert_throttle_to_engine_command() {
+        use crate::types::{ActionParams, Operation};
+        use std::collections::HashMap;
+
+        let p = make_pipeline();
+        let mut values = HashMap::new();
+        values.insert("delay_ms".to_string(), 50.0_f32);
+        let cmd = ActionCommand {
+            action: ActionId::Throttle,
+            operation: Operation::Apply(ActionParams { values }),
+        };
+        let engine_cmds = p.convert_to_engine_commands(&[cmd]);
+        assert_eq!(engine_cmds.len(), 1);
+        match &engine_cmds[0] {
+            EngineCommand::Throttle { delay_ms } => {
+                assert_eq!(*delay_ms, 50u64);
+            }
+            _ => panic!("Expected Throttle"),
+        }
+    }
+
+    /// ActionCommand → EngineCommand 변환: LayerSkip → LayerSkip
+    #[test]
+    fn test_convert_layer_skip_to_engine_command() {
+        use crate::types::{ActionParams, Operation};
+        use std::collections::HashMap;
+
+        let p = make_pipeline();
+        let mut values = HashMap::new();
+        values.insert("skip_layers".to_string(), 4.0_f32);
+        values.insert("total_layers".to_string(), 16.0_f32);
+        let cmd = ActionCommand {
+            action: ActionId::LayerSkip,
+            operation: Operation::Apply(ActionParams { values }),
+        };
+        let engine_cmds = p.convert_to_engine_commands(&[cmd]);
+        assert_eq!(engine_cmds.len(), 1);
+        match &engine_cmds[0] {
+            EngineCommand::LayerSkip { skip_ratio } => {
+                assert!((*skip_ratio - 0.25).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected LayerSkip"),
+        }
+    }
+
+    /// ActionCommand → EngineCommand 변환: KvOffloadDisk → KvEvictSliding(fallback)
+    #[test]
+    fn test_convert_kv_offload_disk_fallback() {
+        use crate::types::{ActionParams, Operation};
+
+        let p = make_pipeline();
+        let cmd = ActionCommand {
+            action: ActionId::KvOffloadDisk,
+            operation: Operation::Apply(ActionParams::default()),
+        };
+        let engine_cmds = p.convert_to_engine_commands(&[cmd]);
+        assert_eq!(engine_cmds.len(), 1);
+        match &engine_cmds[0] {
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                assert!((*keep_ratio - 0.8).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvEvictSliding as fallback for KvOffloadDisk"),
         }
     }
 
@@ -690,14 +728,14 @@ mod tests {
     fn make_heartbeat_msg(
         kv: f32,
         device: &str,
-        memory_level: llm_shared::ResourceLevel,
+        eviction_policy: &str,
     ) -> llm_shared::EngineMessage {
         use llm_shared::{EngineMessage, EngineState, EngineStatus, ResourceLevel};
         EngineMessage::Heartbeat(EngineStatus {
             active_device: device.to_string(),
             compute_level: ResourceLevel::Normal,
             actual_throughput: 20.0,
-            memory_level,
+            memory_level: ResourceLevel::Normal,
             kv_cache_bytes: 0,
             kv_cache_tokens: (kv * 2048.0) as usize,
             kv_cache_utilization: kv,
@@ -705,6 +743,11 @@ mod tests {
             memory_lossy_min: 0.01,
             state: EngineState::Running,
             tokens_generated: 512,
+            available_actions: vec![],
+            active_actions: vec![],
+            eviction_policy: eviction_policy.to_string(),
+            kv_dtype: "f16".to_string(),
+            skip_ratio: 0.0,
         })
     }
 
@@ -717,7 +760,7 @@ mod tests {
         // 초기값은 zero
         assert_eq!(p.engine_state.values[feature::KV_OCCUPANCY], 0.0);
 
-        let msg = make_heartbeat_msg(0.75, "opencl", llm_shared::ResourceLevel::Critical);
+        let msg = make_heartbeat_msg(0.75, "opencl", "h2o");
         p.update_engine_state(&msg);
 
         assert!((p.engine_state.values[feature::KV_OCCUPANCY] - 0.75).abs() < 1e-5);
@@ -736,7 +779,7 @@ mod tests {
         use crate::types::feature;
         let mut p = make_pipeline();
 
-        let msg = make_heartbeat_msg(0.5, "cpu", llm_shared::ResourceLevel::Normal);
+        let msg = make_heartbeat_msg(0.5, "cpu", "none");
         p.update_engine_state(&msg);
 
         assert!((p.engine_state.values[feature::IS_GPU]).abs() < 1e-5);

@@ -345,6 +345,11 @@ mod tests {
             memory_lossy_min: 0.01,
             state: EngineState::Running,
             tokens_generated: 0,
+            available_actions: vec![],
+            active_actions: vec![],
+            eviction_policy: "none".to_string(),
+            kv_dtype: "f16".to_string(),
+            skip_ratio: 0.0,
         })
     }
 
@@ -556,11 +561,7 @@ mod tests {
 
         let directive = EngineDirective {
             seq_id: 99,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Critical,
-                target_ratio: 0.5,
-                deadline_ms: Some(1000),
-            }],
+            commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }],
         };
         channel.emit_directive(&directive).unwrap();
 

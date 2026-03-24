@@ -391,11 +391,7 @@ mod tests {
     fn sample_directive() -> ManagerMessage {
         ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Warning,
-                target_ratio: 0.85,
-                deadline_ms: None,
-            }],
+            commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.85 }],
         })
     }
 
@@ -494,11 +490,7 @@ mod tests {
         for i in 1..=5 {
             let directive = ManagerMessage::Directive(EngineDirective {
                 seq_id: i,
-                commands: vec![EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Warning,
-                    target_throughput: 0.7,
-                    deadline_ms: None,
-                }],
+                commands: vec![EngineCommand::Throttle { delay_ms: 30 }],
             });
             mgr.send(directive).unwrap();
             let msg = transport.recv().unwrap();
@@ -613,11 +605,7 @@ mod tests {
             for seq_id in 1..=3 {
                 let msg = ManagerMessage::Directive(EngineDirective {
                     seq_id,
-                    commands: vec![EngineCommand::SetMemoryLevel {
-                        level: ResourceLevel::Normal,
-                        target_ratio: 1.0,
-                        deadline_ms: None,
-                    }],
+                    commands: vec![EngineCommand::Throttle { delay_ms: 0 }],
                 });
                 write_manager_message(&mut server_stream, &msg).unwrap();
             }

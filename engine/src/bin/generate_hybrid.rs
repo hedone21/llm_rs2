@@ -630,6 +630,10 @@ fn main() -> anyhow::Result<()> {
                 total_tokens: kv_caches[0].current_pos,
                 capacity: kv_caches[0].capacity(),
                 protected_prefix: actual_protected_prefix,
+                // Phase 3에서 실제 정책/dtype/skip 정보로 채울 예정
+                kv_dtype: "f16".to_string(),
+                eviction_policy: "none".to_string(),
+                skip_ratio: 0.0,
             };
 
             let plan = executor.poll(&kv_snap);

@@ -1562,6 +1562,10 @@ fn main() -> anyhow::Result<()> {
                     total_tokens: kv_caches[0].current_pos,
                     capacity: kv_caches[0].capacity(),
                     protected_prefix: actual_protected_prefix,
+                    // Phase 3에서 실제 정책/dtype/skip 정보로 채울 예정
+                    kv_dtype: "f16".to_string(),
+                    eviction_policy: args.eviction_policy.clone(),
+                    skip_ratio: 0.0,
                 };
 
                 let plan = executor.poll(&kv_snap);
@@ -1924,22 +1928,22 @@ fn directive_summary(msg: &ManagerMessage) -> String {
 
 fn command_summary(cmd: &EngineCommand) -> String {
     match cmd {
-        EngineCommand::SetComputeLevel {
-            level,
-            target_throughput,
-            ..
-        } => {
-            format!("SetCompute({:?}, thr={:.1})", level, target_throughput)
+        EngineCommand::Throttle { delay_ms } => format!("Throttle({}ms)", delay_ms),
+        EngineCommand::LayerSkip { skip_ratio } => format!("LayerSkip({:.2})", skip_ratio),
+        EngineCommand::KvEvictH2o { keep_ratio } => format!("KvEvictH2o({:.2})", keep_ratio),
+        EngineCommand::KvEvictSliding { keep_ratio } => {
+            format!("KvEvictSliding({:.2})", keep_ratio)
         }
-        EngineCommand::SwitchComputeUnit { device } => format!("Switch({})", device),
+        EngineCommand::KvStreaming {
+            sink_size,
+            window_size,
+        } => format!("KvStreaming(sink={}, win={})", sink_size, window_size),
+        EngineCommand::KvQuantDynamic { target_bits } => {
+            format!("KvQuantDynamic({}bit)", target_bits)
+        }
+        EngineCommand::RestoreDefaults => "RestoreDefaults".to_string(),
+        EngineCommand::SwitchHw { device } => format!("SwitchHw({})", device),
         EngineCommand::PrepareComputeUnit { device } => format!("Prepare({})", device),
-        EngineCommand::SetMemoryLevel {
-            level,
-            target_ratio,
-            ..
-        } => {
-            format!("SetMem({:?}, ratio={:.2})", level, target_ratio)
-        }
         EngineCommand::Suspend => "Suspend".to_string(),
         EngineCommand::Resume => "Resume".to_string(),
     }

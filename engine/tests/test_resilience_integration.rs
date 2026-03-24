@@ -8,7 +8,7 @@
 use std::sync::mpsc;
 use std::time::Duration;
 
-use llm_rs2::resilience::{CommandExecutor, KVSnapshot, MessageLoop, MockTransport, ResourceLevel};
+use llm_rs2::resilience::{CommandExecutor, KVSnapshot, MessageLoop, MockTransport};
 use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineState, ManagerMessage};
 
 // ── Helpers ───────────────────────────────────────────────
@@ -24,7 +24,7 @@ fn make_executor() -> (
         cmd_rx,
         resp_tx,
         "cpu".to_string(),
-        Duration::from_secs(60), // Long interval to avoid heartbeat noise in tests
+        Duration::from_secs(60), // 테스트에서 하트비트 노이즈 방지용 긴 간격
     );
     (executor, cmd_tx, resp_rx)
 }
@@ -39,6 +39,7 @@ fn snap(tokens: usize, capacity: usize, prefix: usize) -> KVSnapshot {
         total_tokens: tokens,
         capacity,
         protected_prefix: prefix,
+        ..KVSnapshot::default()
     }
 }
 
@@ -50,48 +51,56 @@ fn send_directive(tx: &mpsc::Sender<ManagerMessage>, seq_id: u64, commands: Vec<
     .unwrap();
 }
 
-// ── Test: Eviction flow ──────────────────────────────────
+// ── Test: Eviction flow (H2O) ────────────────────────────
 
 #[test]
 fn test_resilience_eviction_flow() {
     let (mut executor, tx, rx) = make_executor();
 
-    // Send SetMemoryLevel(Critical) → should produce EvictPlan
-    send_directive(
-        &tx,
-        1,
-        vec![EngineCommand::SetMemoryLevel {
-            level: ResourceLevel::Critical,
-            target_ratio: 0.5,
-            deadline_ms: Some(1000),
-        }],
-    );
+    // KvEvictH2o → EvictPlan 생성 확인
+    send_directive(&tx, 1, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }]);
 
     let plan = executor.poll(&snap(500, 2048, 4));
     assert!(
         plan.evict.is_some(),
-        "Should produce evict plan for Critical memory"
+        "KvEvictH2o 명령에 대해 evict plan이 생성돼야 함"
     );
 
     let evict = plan.evict.unwrap();
     assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
-    assert_eq!(evict.level, ResourceLevel::Critical);
+    assert_eq!(evict.policy, "h2o");
 
-    // Simulate KV cache eviction (like generate.rs does)
+    // generate.rs처럼 KV 캐시 축소 시뮬레이션
     let current_pos: usize = 500;
     let target_len = (current_pos as f32 * evict.target_ratio) as usize;
     let remove = current_pos.saturating_sub(target_len);
-    assert!(remove > 0, "Should remove some tokens");
+    assert!(remove > 0, "일부 토큰이 제거돼야 함");
 
     let new_pos = current_pos - remove;
-    assert!(
-        new_pos < current_pos,
-        "Position should decrease after eviction"
-    );
+    assert!(new_pos < current_pos, "축출 후 포지션이 감소해야 함");
 
-    // Verify response was sent
+    // 응답이 전송돼야 함
     let resp = rx.recv().unwrap();
     assert!(matches!(resp, EngineMessage::Response(_)));
+}
+
+// ── Test: Eviction flow (Sliding) ────────────────────────
+
+#[test]
+fn test_resilience_eviction_sliding_flow() {
+    let (mut executor, tx, _rx) = make_executor();
+
+    send_directive(
+        &tx,
+        1,
+        vec![EngineCommand::KvEvictSliding { keep_ratio: 0.7 }],
+    );
+
+    let plan = executor.poll(&snap(500, 2048, 4));
+    assert!(plan.evict.is_some());
+    let evict = plan.evict.unwrap();
+    assert!((evict.target_ratio - 0.7).abs() < f32::EPSILON);
+    assert_eq!(evict.policy, "sliding");
 }
 
 // ── Test: Throttle flow ──────────────────────────────────
@@ -100,25 +109,17 @@ fn test_resilience_eviction_flow() {
 fn test_resilience_throttle_flow() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // SetComputeLevel(Warning) → should produce throttle delay
-    send_directive(
-        &tx,
-        1,
-        vec![EngineCommand::SetComputeLevel {
-            level: ResourceLevel::Warning,
-            target_throughput: 0.7,
-            deadline_ms: None,
-        }],
-    );
+    // Throttle 명령 → 딜레이 직접 설정
+    send_directive(&tx, 1, vec![EngineCommand::Throttle { delay_ms: 50 }]);
 
     let plan = executor.poll(&empty_snap());
     assert!(
         plan.throttle_delay_ms > 0,
-        "Throttle delay should be set, got {}",
+        "Throttle 딜레이가 설정돼야 함, 현재값: {}",
         plan.throttle_delay_ms
     );
-    assert!(!plan.suspended, "Should not be suspended on Warning");
-    assert_eq!(executor.compute_level(), ResourceLevel::Warning);
+    assert_eq!(plan.throttle_delay_ms, 50);
+    assert!(!plan.suspended, "Throttle 명령에서 suspended여선 안 됨");
 }
 
 // ── Test: Suspend flow ───────────────────────────────────
@@ -127,14 +128,14 @@ fn test_resilience_throttle_flow() {
 fn test_resilience_suspend_flow() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // Suspend command
+    // Suspend 명령
     send_directive(&tx, 1, vec![EngineCommand::Suspend]);
 
     let plan = executor.poll(&empty_snap());
-    assert!(plan.suspended, "Should be suspended after Suspend command");
+    assert!(plan.suspended, "Suspend 명령 후 suspended여야 함");
     assert_eq!(executor.state(), EngineState::Suspended);
 
-    // Suspend should override any other plan fields
+    // Suspend는 다른 plan 필드를 초기화해야 함
     assert!(plan.evict.is_none());
     assert!(plan.switch_device.is_none());
 }
@@ -143,7 +144,7 @@ fn test_resilience_suspend_flow() {
 
 #[test]
 fn test_resilience_disabled_noop() {
-    // When command_executor is None, no poll happens.
+    // command_executor가 None일 때 poll이 발생하지 않아야 함
     let command_executor: Option<CommandExecutor> = None;
 
     let mut throttle_delay_ms = 0u64;
@@ -153,7 +154,7 @@ fn test_resilience_disabled_noop() {
 
     assert_eq!(
         throttle_delay_ms, 0,
-        "Disabled resilience should not affect state"
+        "비활성화된 resilience는 상태에 영향을 주지 않아야 함"
     );
 }
 
@@ -163,31 +164,21 @@ fn test_resilience_disabled_noop() {
 fn test_resilience_resume_clears_constraints() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // First: set to critical
-    send_directive(
-        &tx,
-        1,
-        vec![EngineCommand::SetComputeLevel {
-            level: ResourceLevel::Critical,
-            target_throughput: 0.3,
-            deadline_ms: None,
-        }],
-    );
+    // 먼저 스로틀 설정
+    send_directive(&tx, 1, vec![EngineCommand::Throttle { delay_ms: 100 }]);
     executor.poll(&empty_snap());
-    assert!(executor.throttle_delay_ms() > 0, "Throttle should be set");
+    assert!(executor.throttle_delay_ms() > 0, "스로틀이 설정돼야 함");
 
-    // Then: suspend
+    // 중단
     send_directive(&tx, 2, vec![EngineCommand::Suspend]);
     executor.poll(&empty_snap());
     assert_eq!(executor.state(), EngineState::Suspended);
 
-    // Resume should restore Normal
+    // Resume은 Normal로 복구해야 함
     send_directive(&tx, 3, vec![EngineCommand::Resume]);
     let plan = executor.poll(&empty_snap());
     assert!(plan.resumed);
     assert_eq!(executor.state(), EngineState::Running);
-    assert_eq!(executor.compute_level(), ResourceLevel::Normal);
-    assert_eq!(executor.memory_level(), ResourceLevel::Normal);
     assert_eq!(executor.throttle_delay_ms(), 0);
 }
 
@@ -197,27 +188,17 @@ fn test_resilience_resume_clears_constraints() {
 fn test_resilience_channel_disconnect_graceful() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // Send directive then drop sender (simulates transport crash)
-    send_directive(
-        &tx,
-        1,
-        vec![EngineCommand::SetMemoryLevel {
-            level: ResourceLevel::Warning,
-            target_ratio: 0.85,
-            deadline_ms: None,
-        }],
-    );
+    // 디렉티브를 보낸 후 sender 드롭 (트랜스포트 크래시 시뮬레이션)
+    send_directive(&tx, 1, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.85 }]);
     drop(tx);
 
-    // First poll: processes buffered directive
+    // 첫 번째 poll: 버퍼된 디렉티브 처리
     let plan = executor.poll(&empty_snap());
     assert!(plan.evict.is_some());
-    assert_eq!(executor.memory_level(), ResourceLevel::Warning);
 
-    // Second poll: channel dead, no panic, state preserved
+    // 두 번째 poll: 채널 종료 후 패닉 없이 동작
     let plan = executor.poll(&empty_snap());
-    assert!(plan.evict.is_none()); // No new commands
-    assert_eq!(executor.memory_level(), ResourceLevel::Warning);
+    assert!(plan.evict.is_none()); // 새 명령 없음
 }
 
 // ── Transport integration tests ──────────────────────────
@@ -227,19 +208,11 @@ fn test_mock_transport_e2e() {
     let messages = vec![
         ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Warning,
-                target_ratio: 0.85,
-                deadline_ms: None,
-            }],
+            commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.85 }],
         }),
         ManagerMessage::Directive(EngineDirective {
             seq_id: 2,
-            commands: vec![EngineCommand::SetComputeLevel {
-                level: ResourceLevel::Critical,
-                target_throughput: 0.3,
-                deadline_ms: Some(1000),
-            }],
+            commands: vec![EngineCommand::Throttle { delay_ms: 50 }],
         }),
     ];
     let transport = MockTransport::from_messages(messages);
@@ -248,13 +221,13 @@ fn test_mock_transport_e2e() {
     let mut executor =
         CommandExecutor::new(cmd_rx, resp_tx, "cpu".to_string(), Duration::from_secs(60));
 
-    // Wait for MessageLoop to forward messages
+    // MessageLoop가 메시지를 전달할 때까지 대기
     std::thread::sleep(Duration::from_millis(50));
 
     let plan = executor.poll(&snap(500, 2048, 4));
     assert!(
         plan.evict.is_some() || plan.throttle_delay_ms > 0,
-        "Should have actions from mock transport pipeline"
+        "모의 트랜스포트 파이프라인에서 액션이 있어야 함"
     );
 }
 
@@ -298,11 +271,7 @@ fn test_unix_socket_e2e() {
     let (mut server_stream, _) = listener.accept().unwrap();
     let msg = ManagerMessage::Directive(EngineDirective {
         seq_id: 1,
-        commands: vec![EngineCommand::SetMemoryLevel {
-            level: ResourceLevel::Critical,
-            target_ratio: 0.5,
-            deadline_ms: None,
-        }],
+        commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }],
     });
     let json = serde_json::to_vec(&msg).unwrap();
     let len = (json.len() as u32).to_be_bytes();
@@ -319,7 +288,7 @@ fn test_unix_socket_e2e() {
     let plan = executor.poll(&snap(500, 2048, 4));
     assert!(
         plan.evict.is_some(),
-        "Should have evict plan from unix socket pipeline"
+        "unix socket 파이프라인에서 evict plan이 있어야 함"
     );
     std::fs::remove_file(&path).ok();
 }
@@ -330,31 +299,19 @@ fn test_unix_socket_e2e() {
 fn test_resilience_superseding_directives() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // Memory Warning, then Memory Critical in quick succession
-    send_directive(
-        &tx,
-        1,
-        vec![EngineCommand::SetMemoryLevel {
-            level: ResourceLevel::Warning,
-            target_ratio: 0.85,
-            deadline_ms: None,
-        }],
-    );
+    // H2O 먼저, 이후 Sliding으로 덮어씀
+    send_directive(&tx, 1, vec![EngineCommand::KvEvictH2o { keep_ratio: 0.85 }]);
     send_directive(
         &tx,
         2,
-        vec![EngineCommand::SetMemoryLevel {
-            level: ResourceLevel::Critical,
-            target_ratio: 0.5,
-            deadline_ms: None,
-        }],
+        vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }],
     );
 
     let plan = executor.poll(&empty_snap());
-    // The second (more severe) should supersede
+    // 두 번째(더 최신) 명령이 승리
     let evict = plan.evict.unwrap();
     assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
-    assert_eq!(evict.level, ResourceLevel::Critical);
+    assert_eq!(evict.policy, "sliding");
 }
 
 // ── Test: Multi-domain directives ────────────────────────
@@ -363,27 +320,19 @@ fn test_resilience_superseding_directives() {
 fn test_resilience_multi_domain_directive() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // Single directive with both compute and memory commands
+    // 하나의 디렉티브에 compute와 memory 명령 동시 포함
     send_directive(
         &tx,
         1,
         vec![
-            EngineCommand::SetComputeLevel {
-                level: ResourceLevel::Warning,
-                target_throughput: 0.7,
-                deadline_ms: None,
-            },
-            EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Critical,
-                target_ratio: 0.5,
-                deadline_ms: Some(1000),
-            },
+            EngineCommand::Throttle { delay_ms: 50 },
+            EngineCommand::KvEvictH2o { keep_ratio: 0.5 },
         ],
     );
 
     let plan = executor.poll(&empty_snap());
-    assert!(plan.evict.is_some(), "Should have evict plan");
-    assert!(plan.throttle_delay_ms > 0, "Should have throttle");
+    assert!(plan.evict.is_some(), "evict plan이 있어야 함");
+    assert!(plan.throttle_delay_ms > 0, "스로틀이 있어야 함");
 }
 
 // ── Test: Suspend overrides everything ───────────────────
@@ -392,17 +341,13 @@ fn test_resilience_multi_domain_directive() {
 fn test_resilience_suspend_overrides_all() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // Memory + Compute + Suspend in one directive
+    // Memory + Compute + Suspend를 하나의 디렉티브로
     send_directive(
         &tx,
         1,
         vec![
-            EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Critical,
-                target_ratio: 0.5,
-                deadline_ms: None,
-            },
-            EngineCommand::SwitchComputeUnit {
+            EngineCommand::KvEvictH2o { keep_ratio: 0.5 },
+            EngineCommand::SwitchHw {
                 device: "gpu".to_string(),
             },
             EngineCommand::Suspend,
@@ -410,9 +355,12 @@ fn test_resilience_suspend_overrides_all() {
     );
 
     let plan = executor.poll(&empty_snap());
-    assert!(plan.suspended, "Suspend should be set");
-    assert!(plan.evict.is_none(), "Suspend should clear evict");
-    assert!(plan.switch_device.is_none(), "Suspend should clear switch");
+    assert!(plan.suspended, "Suspend가 설정돼야 함");
+    assert!(plan.evict.is_none(), "Suspend가 evict를 초기화해야 함");
+    assert!(
+        plan.switch_device.is_none(),
+        "Suspend가 switch를 초기화해야 함"
+    );
 }
 
 // ── Test: Rapid signal buffering ─────────────────────────
@@ -421,32 +369,88 @@ fn test_resilience_suspend_overrides_all() {
 fn test_resilience_signal_buffering() {
     let (mut executor, tx, _rx) = make_executor();
 
-    // Send 50 directives rapidly
+    // 50개의 디렉티브를 빠르게 전송
     for i in 0..50 {
-        let level = match i % 3 {
-            0 => ResourceLevel::Normal,
-            1 => ResourceLevel::Warning,
-            _ => ResourceLevel::Critical,
-        };
-        send_directive(
-            &tx,
-            i + 1,
-            vec![EngineCommand::SetMemoryLevel {
-                level,
-                target_ratio: match level {
-                    ResourceLevel::Normal => 1.0,
-                    ResourceLevel::Warning => 0.85,
-                    ResourceLevel::Critical => 0.5,
-                },
-                deadline_ms: None,
-            }],
-        );
+        let keep_ratio = if i % 2 == 0 { 0.85 } else { 0.5 };
+        send_directive(&tx, i + 1, vec![EngineCommand::KvEvictH2o { keep_ratio }]);
     }
 
-    // poll() should drain all without panic
+    // poll()이 모두 처리하고 패닉 없어야 함
     let plan = executor.poll(&empty_snap());
-    // Last directive: i=49, 49%3=1 → Warning
-    assert_eq!(executor.memory_level(), ResourceLevel::Warning);
-    // Should have an evict plan from the last superseding command
+    // 마지막 디렉티브: i=49(짝수) → keep_ratio=0.85
     assert!(plan.evict.is_some());
+    let evict = plan.evict.unwrap();
+    assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON); // i=49(홀수) → 0.5
+}
+
+// ── Test: LayerSkip command ───────────────────────────────
+
+#[test]
+fn test_resilience_layer_skip() {
+    let (mut executor, tx, _rx) = make_executor();
+
+    send_directive(&tx, 1, vec![EngineCommand::LayerSkip { skip_ratio: 0.25 }]);
+
+    let plan = executor.poll(&empty_snap());
+    assert_eq!(plan.layer_skip, Some(0.25));
+}
+
+// ── Test: KvStreaming is rejected ─────────────────────────
+
+#[test]
+fn test_resilience_kv_streaming_rejected() {
+    use llm_shared::CommandResult;
+
+    let (mut executor, tx, rx) = make_executor();
+
+    send_directive(
+        &tx,
+        1,
+        vec![EngineCommand::KvStreaming {
+            sink_size: 4,
+            window_size: 256,
+        }],
+    );
+
+    let plan = executor.poll(&empty_snap());
+    assert!(
+        plan.evict.is_none(),
+        "KvStreaming은 evict plan을 생성하지 않아야 함"
+    );
+
+    let resp = rx.recv().unwrap();
+    match resp {
+        EngineMessage::Response(r) => {
+            assert_eq!(r.seq_id, 1);
+            assert!(matches!(r.results[0], CommandResult::Rejected { .. }));
+        }
+        _ => panic!("Expected Response"),
+    }
+}
+
+// ── Test: RestoreDefaults ─────────────────────────────────
+
+#[test]
+fn test_resilience_restore_defaults() {
+    let (mut executor, tx, _rx) = make_executor();
+
+    // 상태 설정
+    send_directive(
+        &tx,
+        1,
+        vec![
+            EngineCommand::Throttle { delay_ms: 100 },
+            EngineCommand::LayerSkip { skip_ratio: 0.3 },
+        ],
+    );
+    executor.poll(&empty_snap());
+    assert!(!executor.active_actions().is_empty());
+
+    // RestoreDefaults
+    send_directive(&tx, 2, vec![EngineCommand::RestoreDefaults]);
+    let plan = executor.poll(&empty_snap());
+    assert!(plan.restore_defaults);
+    assert_eq!(plan.throttle_delay_ms, 0);
+    assert_eq!(executor.throttle_delay_ms(), 0);
+    assert!(executor.active_actions().is_empty());
 }

@@ -155,15 +155,15 @@ impl PolicyEngine {
 
         // Compute domain commands
         if effective_compute != self.last_compute_level || target_device != self.last_device {
-            let (throughput, deadline) = Self::compute_params(effective_compute);
-            commands.push(EngineCommand::SetComputeLevel {
-                level: effective_compute,
-                target_throughput: throughput,
-                deadline_ms: deadline,
-            });
+            let (delay_ms, _deadline) = Self::compute_params(effective_compute);
+            if delay_ms > 0 {
+                commands.push(EngineCommand::Throttle { delay_ms });
+            } else {
+                commands.push(EngineCommand::RestoreDefaults);
+            }
 
             if target_device != self.last_device && !target_device.is_empty() {
-                commands.push(EngineCommand::SwitchComputeUnit {
+                commands.push(EngineCommand::SwitchHw {
                     device: target_device.clone(),
                 });
             }
@@ -178,12 +178,12 @@ impl PolicyEngine {
 
         // Memory domain commands
         if effective_memory != self.last_memory_level {
-            let (ratio, deadline) = Self::memory_params(effective_memory);
-            commands.push(EngineCommand::SetMemoryLevel {
-                level: effective_memory,
-                target_ratio: ratio,
-                deadline_ms: deadline,
-            });
+            let (keep_ratio, _deadline) = Self::memory_params(effective_memory);
+            if keep_ratio < 1.0 {
+                commands.push(EngineCommand::KvEvictSliding { keep_ratio });
+            } else {
+                commands.push(EngineCommand::RestoreDefaults);
+            }
         }
 
         if commands.is_empty() {
@@ -251,14 +251,17 @@ impl PolicyEngine {
         String::new()
     }
 
-    fn compute_params(level: ResourceLevel) -> (f32, Option<u64>) {
+    /// 반환: (delay_ms, deadline_ms)
+    /// Normal → delay 없음(0), Warning → 30ms delay, Critical → 100ms delay
+    fn compute_params(level: ResourceLevel) -> (u64, Option<u64>) {
         match level {
-            ResourceLevel::Normal => (1.0, None),
-            ResourceLevel::Warning => (0.7, None),
-            ResourceLevel::Critical => (0.3, Some(1000)),
+            ResourceLevel::Normal => (0, None),
+            ResourceLevel::Warning => (30, None),
+            ResourceLevel::Critical => (100, Some(1000)),
         }
     }
 
+    /// 반환: (keep_ratio, deadline_ms)
     fn memory_params(level: ResourceLevel) -> (f32, Option<u64>) {
         match level {
             ResourceLevel::Normal => (1.0, None),
@@ -319,16 +322,11 @@ mod tests {
         let mem_cmd = directive
             .commands
             .iter()
-            .find(|c| matches!(c, EngineCommand::SetMemoryLevel { .. }));
+            .find(|c| matches!(c, EngineCommand::KvEvictSliding { .. }));
         assert!(mem_cmd.is_some());
         match mem_cmd.unwrap() {
-            EngineCommand::SetMemoryLevel {
-                level,
-                target_ratio,
-                ..
-            } => {
-                assert_eq!(*level, ResourceLevel::Warning);
-                assert!((*target_ratio - 0.85).abs() < f32::EPSILON);
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                assert!((*keep_ratio - 0.85).abs() < f32::EPSILON);
             }
             _ => unreachable!(),
         }
@@ -343,15 +341,11 @@ mod tests {
         let mem_cmd = directive
             .commands
             .iter()
-            .find(|c| matches!(c, EngineCommand::SetMemoryLevel { .. }));
+            .find(|c| matches!(c, EngineCommand::KvEvictSliding { .. }));
+        assert!(mem_cmd.is_some(), "Expected KvEvictSliding command");
         match mem_cmd.unwrap() {
-            EngineCommand::SetMemoryLevel {
-                level,
-                target_ratio,
-                ..
-            } => {
-                assert_eq!(*level, ResourceLevel::Critical);
-                assert!((*target_ratio - 0.50).abs() < f32::EPSILON);
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                assert!((*keep_ratio - 0.50).abs() < f32::EPSILON);
             }
             _ => unreachable!(),
         }
@@ -363,15 +357,15 @@ mod tests {
         let snap = snap_with(Level::Normal, Level::Normal, Level::Critical, Level::Normal);
         let directive = policy.evaluate(&snap, None).unwrap();
 
-        // Should have SetComputeLevel(Critical) + SwitchComputeUnit("cpu")
-        let compute_cmd = directive
+        // Should have Throttle (compute Critical) + SwitchHw("cpu")
+        let throttle_cmd = directive
             .commands
             .iter()
-            .find(|c| matches!(c, EngineCommand::SetComputeLevel { .. }));
-        assert!(compute_cmd.is_some());
-        match compute_cmd.unwrap() {
-            EngineCommand::SetComputeLevel { level, .. } => {
-                assert_eq!(*level, ResourceLevel::Critical);
+            .find(|c| matches!(c, EngineCommand::Throttle { .. }));
+        assert!(throttle_cmd.is_some(), "Expected Throttle command");
+        match throttle_cmd.unwrap() {
+            EngineCommand::Throttle { delay_ms } => {
+                assert!(*delay_ms > 0, "Critical should have non-zero delay");
             }
             _ => unreachable!(),
         }
@@ -379,10 +373,10 @@ mod tests {
         let switch_cmd = directive
             .commands
             .iter()
-            .find(|c| matches!(c, EngineCommand::SwitchComputeUnit { .. }));
-        assert!(switch_cmd.is_some());
+            .find(|c| matches!(c, EngineCommand::SwitchHw { .. }));
+        assert!(switch_cmd.is_some(), "Expected SwitchHw command");
         match switch_cmd.unwrap() {
-            EngineCommand::SwitchComputeUnit { device } => {
+            EngineCommand::SwitchHw { device } => {
                 assert_eq!(device, "cpu");
             }
             _ => unreachable!(),
@@ -415,15 +409,19 @@ mod tests {
         );
         let directive = policy.evaluate(&snap, None).unwrap();
 
-        // Should have both compute and memory commands
-        let has_compute = directive
-            .commands
-            .iter()
-            .any(|c| matches!(c, EngineCommand::SetComputeLevel { .. }));
-        let has_memory = directive
-            .commands
-            .iter()
-            .any(|c| matches!(c, EngineCommand::SetMemoryLevel { .. }));
+        // Should have both compute (Throttle) and memory (KvEvictSliding) commands
+        let has_compute = directive.commands.iter().any(|c| {
+            matches!(
+                c,
+                EngineCommand::Throttle { .. } | EngineCommand::RestoreDefaults
+            )
+        });
+        let has_memory = directive.commands.iter().any(|c| {
+            matches!(
+                c,
+                EngineCommand::KvEvictSliding { .. } | EngineCommand::RestoreDefaults
+            )
+        });
         assert!(has_compute, "Should have compute command");
         assert!(has_memory, "Should have memory command");
     }

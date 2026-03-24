@@ -23,6 +23,12 @@ pub struct ExecutionPlan {
     pub suspended: bool,
     /// Whether inference should resume from suspension.
     pub resumed: bool,
+    /// Layer skip ratio: 0.0 = no skip, from LayerSkip command.
+    pub layer_skip: Option<f32>,
+    /// KV quantization bits, from KvQuantDynamic command.
+    pub kv_quant_bits: Option<u8>,
+    /// Whether to restore all action-induced state to defaults.
+    pub restore_defaults: bool,
 }
 
 /// Eviction plan parameters.
@@ -32,6 +38,8 @@ pub struct EvictPlan {
     pub target_ratio: f32,
     /// Resource level: Warning = lossless only, Critical = lossy OK.
     pub level: ResourceLevel,
+    /// Eviction policy name: "h2o", "sliding", "streaming".
+    pub policy: String,
 }
 
 /// Snapshot of KV cache state for status reporting.
@@ -41,6 +49,12 @@ pub struct KVSnapshot {
     pub total_tokens: usize,
     pub capacity: usize,
     pub protected_prefix: usize,
+    /// Current KV dtype name for heartbeat reporting ("f16", "q8", "q4").
+    pub kv_dtype: String,
+    /// Current eviction policy name for heartbeat reporting.
+    pub eviction_policy: String,
+    /// Current layer skip ratio for heartbeat reporting.
+    pub skip_ratio: f32,
 }
 
 // ── CommandExecutor ─────────────────────────────────────────
@@ -51,12 +65,15 @@ pub struct CommandExecutor {
     cmd_rx: mpsc::Receiver<ManagerMessage>,
     resp_tx: mpsc::Sender<EngineMessage>,
 
-    // Current state
+    // Current state (deprecated fields kept for EngineStatus backward compat)
     compute_level: ResourceLevel,
     memory_level: ResourceLevel,
     engine_state: EngineState,
     active_device: String,
     throttle_delay_ms: u64,
+
+    // Currently active action names (e.g. "kv_evict_h2o", "throttle")
+    active_actions: Vec<String>,
 
     // Throughput tracking
     throughput_ema: f32,
@@ -83,6 +100,7 @@ impl CommandExecutor {
             engine_state: EngineState::Idle,
             active_device,
             throttle_delay_ms: 0,
+            active_actions: Vec::new(),
             throughput_ema: 0.0,
             last_token_time: None,
             tokens_generated: 0,
@@ -180,48 +198,82 @@ impl CommandExecutor {
 
     fn apply_command(&mut self, cmd: &EngineCommand, plan: &mut ExecutionPlan) -> CommandResult {
         match cmd {
-            EngineCommand::SetComputeLevel {
-                level,
-                target_throughput,
-                ..
-            } => {
-                self.compute_level = *level;
-                // Calculate throttle delay from target_throughput
-                // target_throughput is a ratio (0.0-1.0) of max throughput
-                if *target_throughput < 1.0 && *target_throughput > 0.0 {
-                    // Simple mapping: lower throughput → longer delay
-                    // At 0.7 → ~43ms, at 0.3 → ~233ms
-                    let delay = ((1.0 / target_throughput - 1.0) * 100.0) as u64;
-                    plan.throttle_delay_ms = plan.throttle_delay_ms.max(delay);
-                } else if *target_throughput >= 1.0 {
-                    // No throttle needed at full throughput
-                    // Only reset if no other command set a throttle
-                    if plan.throttle_delay_ms == 0 {
-                        plan.throttle_delay_ms = 0;
+            EngineCommand::Throttle { delay_ms } => {
+                // 직접 지정된 딜레이를 적용한다 (처리량 비율 변환 없이)
+                plan.throttle_delay_ms = *delay_ms;
+                if *delay_ms > 0 {
+                    if !self.active_actions.contains(&"throttle".to_string()) {
+                        self.active_actions.push("throttle".to_string());
                     }
+                } else {
+                    self.active_actions.retain(|a| a != "throttle");
                 }
                 CommandResult::Ok
             }
-            EngineCommand::SwitchComputeUnit { device } => {
-                // Supersedes any previous switch in this batch
+            EngineCommand::LayerSkip { skip_ratio } => {
+                plan.layer_skip = Some(*skip_ratio);
+                if !self.active_actions.contains(&"layer_skip".to_string()) {
+                    self.active_actions.push("layer_skip".to_string());
+                }
+                CommandResult::Ok
+            }
+            EngineCommand::KvEvictH2o { keep_ratio } => {
+                plan.evict = Some(EvictPlan {
+                    target_ratio: *keep_ratio,
+                    level: ResourceLevel::Critical,
+                    policy: "h2o".to_string(),
+                });
+                if !self.active_actions.contains(&"kv_evict_h2o".to_string()) {
+                    self.active_actions.push("kv_evict_h2o".to_string());
+                }
+                CommandResult::Ok
+            }
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                plan.evict = Some(EvictPlan {
+                    target_ratio: *keep_ratio,
+                    level: ResourceLevel::Critical,
+                    policy: "sliding".to_string(),
+                });
+                if !self
+                    .active_actions
+                    .contains(&"kv_evict_sliding".to_string())
+                {
+                    self.active_actions.push("kv_evict_sliding".to_string());
+                }
+                CommandResult::Ok
+            }
+            EngineCommand::KvStreaming { .. } => {
+                // StreamingLLM 정책은 아직 미구현 — Phase 3에서 처리 예정
+                CommandResult::Rejected {
+                    reason: "KvStreaming not yet implemented".to_string(),
+                }
+            }
+            EngineCommand::KvQuantDynamic { target_bits } => {
+                plan.kv_quant_bits = Some(*target_bits);
+                if !self
+                    .active_actions
+                    .contains(&"kv_quant_dynamic".to_string())
+                {
+                    self.active_actions.push("kv_quant_dynamic".to_string());
+                }
+                CommandResult::Ok
+            }
+            EngineCommand::RestoreDefaults => {
+                plan.restore_defaults = true;
+                plan.throttle_delay_ms = 0;
+                self.throttle_delay_ms = 0;
+                self.compute_level = ResourceLevel::Normal;
+                self.memory_level = ResourceLevel::Normal;
+                self.active_actions.clear();
+                CommandResult::Ok
+            }
+            EngineCommand::SwitchHw { device } => {
+                // 배치 내 이전 스위치를 덮어쓴다
                 plan.switch_device = Some(device.clone());
                 CommandResult::Ok
             }
             EngineCommand::PrepareComputeUnit { device } => {
                 plan.prepare_device = Some(device.clone());
-                CommandResult::Ok
-            }
-            EngineCommand::SetMemoryLevel {
-                level,
-                target_ratio,
-                ..
-            } => {
-                self.memory_level = *level;
-                // Supersedes previous eviction in same batch
-                plan.evict = Some(EvictPlan {
-                    target_ratio: *target_ratio,
-                    level: *level,
-                });
                 CommandResult::Ok
             }
             EngineCommand::Suspend => {
@@ -232,7 +284,7 @@ impl CommandExecutor {
             EngineCommand::Resume => {
                 plan.resumed = true;
                 self.engine_state = EngineState::Running;
-                // Reset levels to normal on resume
+                // Resume 시 레벨과 스로틀을 Normal로 초기화
                 self.compute_level = ResourceLevel::Normal;
                 self.memory_level = ResourceLevel::Normal;
                 self.throttle_delay_ms = 0;
@@ -255,6 +307,18 @@ impl CommandExecutor {
             0.01
         };
 
+        let eviction_policy = if kv_snap.eviction_policy.is_empty() {
+            "none".to_string()
+        } else {
+            kv_snap.eviction_policy.clone()
+        };
+
+        let kv_dtype = if kv_snap.kv_dtype.is_empty() {
+            "f16".to_string()
+        } else {
+            kv_snap.kv_dtype.clone()
+        };
+
         let status = EngineStatus {
             active_device: self.active_device.clone(),
             compute_level: self.compute_level,
@@ -263,10 +327,15 @@ impl CommandExecutor {
             kv_cache_bytes: kv_snap.total_bytes,
             kv_cache_tokens: kv_snap.total_tokens,
             kv_cache_utilization: utilization,
-            memory_lossless_min: 1.0, // No lossless shrink available currently
+            memory_lossless_min: 1.0, // 현재 무손실 축소 불가
             memory_lossy_min,
             state: self.engine_state,
             tokens_generated: self.tokens_generated,
+            available_actions: Vec::new(), // Phase 3에서 동적 계산 예정
+            active_actions: self.active_actions.clone(),
+            eviction_policy,
+            kv_dtype,
+            skip_ratio: kv_snap.skip_ratio,
         };
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));
@@ -277,12 +346,12 @@ impl CommandExecutor {
         self.engine_state
     }
 
-    /// Current compute level.
+    /// Current compute level (deprecated, always Normal unless set by legacy path).
     pub fn compute_level(&self) -> ResourceLevel {
         self.compute_level
     }
 
-    /// Current memory level.
+    /// Current memory level (deprecated, always Normal unless set by legacy path).
     pub fn memory_level(&self) -> ResourceLevel {
         self.memory_level
     }
@@ -290,6 +359,11 @@ impl CommandExecutor {
     /// Current throttle delay.
     pub fn throttle_delay_ms(&self) -> u64 {
         self.throttle_delay_ms
+    }
+
+    /// Currently active action names.
+    pub fn active_actions(&self) -> &[String] {
+        &self.active_actions
     }
 }
 
@@ -309,7 +383,7 @@ mod tests {
             cmd_rx,
             resp_tx,
             "cpu".to_string(),
-            Duration::from_secs(10), // Long interval to avoid heartbeat noise in tests
+            Duration::from_secs(10), // 테스트에서 하트비트 노이즈 방지용 긴 간격
         );
         (executor, cmd_tx, resp_rx)
     }
@@ -324,6 +398,9 @@ mod tests {
             total_tokens: tokens,
             capacity,
             protected_prefix: prefix,
+            kv_dtype: "f16".to_string(),
+            eviction_policy: "none".to_string(),
+            skip_ratio: 0.0,
         }
     }
 
@@ -339,16 +416,37 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_set_memory_critical() {
+    fn test_executor_throttle_direct() {
         let (mut executor, tx, rx) = make_executor();
 
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Critical,
-                target_ratio: 0.5,
-                deadline_ms: Some(1000),
-            }],
+            commands: vec![EngineCommand::Throttle { delay_ms: 50 }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.throttle_delay_ms, 50);
+        assert!(executor.active_actions().contains(&"throttle".to_string()));
+
+        // 응답 확인
+        let resp = rx.recv().unwrap();
+        match resp {
+            EngineMessage::Response(r) => {
+                assert_eq!(r.seq_id, 1);
+                assert!(matches!(r.results[0], CommandResult::Ok));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_executor_kv_evict_h2o() {
+        let (mut executor, tx, rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }],
         }))
         .unwrap();
 
@@ -357,14 +455,17 @@ mod tests {
         let evict = plan.evict.unwrap();
         assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
         assert_eq!(evict.level, ResourceLevel::Critical);
-        assert_eq!(executor.memory_level(), ResourceLevel::Critical);
+        assert_eq!(evict.policy, "h2o");
+        assert!(
+            executor
+                .active_actions()
+                .contains(&"kv_evict_h2o".to_string())
+        );
 
-        // Check response
         let resp = rx.recv().unwrap();
         match resp {
             EngineMessage::Response(r) => {
                 assert_eq!(r.seq_id, 1);
-                assert_eq!(r.results.len(), 1);
                 assert!(matches!(r.results[0], CommandResult::Ok));
             }
             _ => panic!("Expected Response"),
@@ -372,22 +473,137 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_set_compute_warning() {
+    fn test_executor_kv_evict_sliding() {
         let (mut executor, tx, _rx) = make_executor();
 
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::SetComputeLevel {
-                level: ResourceLevel::Warning,
-                target_throughput: 0.7,
-                deadline_ms: None,
+            commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.6 }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert!(plan.evict.is_some());
+        let evict = plan.evict.unwrap();
+        assert!((evict.target_ratio - 0.6).abs() < f32::EPSILON);
+        assert_eq!(evict.policy, "sliding");
+        assert!(
+            executor
+                .active_actions()
+                .contains(&"kv_evict_sliding".to_string())
+        );
+    }
+
+    #[test]
+    fn test_executor_kv_streaming_rejected() {
+        let (mut executor, tx, rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvStreaming {
+                sink_size: 4,
+                window_size: 256,
             }],
         }))
         .unwrap();
 
         let plan = executor.poll(&empty_snap());
-        assert!(plan.throttle_delay_ms > 0);
-        assert_eq!(executor.compute_level(), ResourceLevel::Warning);
+        assert!(
+            plan.evict.is_none(),
+            "KvStreaming은 evict plan을 생성하지 않아야 함"
+        );
+
+        let resp = rx.recv().unwrap();
+        match resp {
+            EngineMessage::Response(r) => {
+                assert_eq!(r.seq_id, 1);
+                assert!(matches!(r.results[0], CommandResult::Rejected { .. }));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_executor_kv_quant_dynamic() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvQuantDynamic { target_bits: 4 }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.kv_quant_bits, Some(4));
+        assert!(
+            executor
+                .active_actions()
+                .contains(&"kv_quant_dynamic".to_string())
+        );
+    }
+
+    #[test]
+    fn test_executor_layer_skip() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::LayerSkip { skip_ratio: 0.25 }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.layer_skip, Some(0.25));
+        assert!(
+            executor
+                .active_actions()
+                .contains(&"layer_skip".to_string())
+        );
+    }
+
+    #[test]
+    fn test_executor_restore_defaults() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // 먼저 스로틀과 액션 설정
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![
+                EngineCommand::Throttle { delay_ms: 50 },
+                EngineCommand::LayerSkip { skip_ratio: 0.3 },
+            ],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+        assert!(!executor.active_actions().is_empty());
+
+        // RestoreDefaults로 초기화
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::RestoreDefaults],
+        }))
+        .unwrap();
+        let plan = executor.poll(&empty_snap());
+        assert!(plan.restore_defaults);
+        assert_eq!(plan.throttle_delay_ms, 0);
+        assert_eq!(executor.throttle_delay_ms(), 0);
+        assert!(executor.active_actions().is_empty());
+    }
+
+    #[test]
+    fn test_executor_switch_hw() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SwitchHw {
+                device: "opencl".to_string(),
+            }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.switch_device.as_deref(), Some("opencl"));
     }
 
     #[test]
@@ -397,12 +613,8 @@ mod tests {
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
             commands: vec![
-                EngineCommand::SetMemoryLevel {
-                    level: ResourceLevel::Critical,
-                    target_ratio: 0.5,
-                    deadline_ms: None,
-                },
-                EngineCommand::SwitchComputeUnit {
+                EngineCommand::KvEvictH2o { keep_ratio: 0.5 },
+                EngineCommand::SwitchHw {
                     device: "cpu".to_string(),
                 },
                 EngineCommand::Suspend,
@@ -412,44 +624,36 @@ mod tests {
 
         let plan = executor.poll(&empty_snap());
         assert!(plan.suspended);
-        // Suspend should clear other plan fields
+        // Suspend는 다른 plan 필드를 초기화해야 함
         assert!(plan.evict.is_none());
         assert!(plan.switch_device.is_none());
         assert_eq!(executor.state(), EngineState::Suspended);
     }
 
     #[test]
-    fn test_executor_superseding() {
+    fn test_executor_superseding_evict() {
         let (mut executor, tx, rx) = make_executor();
 
-        // Two directives in queue — second should supersede first for same domain
+        // 두 개의 evict 명령 — 두 번째가 첫 번째를 덮어씀
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Warning,
-                target_ratio: 0.85,
-                deadline_ms: None,
-            }],
+            commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.8 }],
         }))
         .unwrap();
 
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 2,
-            commands: vec![EngineCommand::SetMemoryLevel {
-                level: ResourceLevel::Critical,
-                target_ratio: 0.5,
-                deadline_ms: None,
-            }],
+            commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }],
         }))
         .unwrap();
 
         let plan = executor.poll(&empty_snap());
-        // The second (more severe) directive should win
+        // 두 번째 명령이 승리
         let evict = plan.evict.unwrap();
         assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
-        assert_eq!(evict.level, ResourceLevel::Critical);
+        assert_eq!(evict.policy, "sliding");
 
-        // Both responses should be sent
+        // 두 응답 모두 전송돼야 함
         let r1 = rx.recv().unwrap();
         let r2 = rx.recv().unwrap();
         match (r1, r2) {
@@ -469,17 +673,17 @@ mod tests {
             cmd_rx,
             resp_tx,
             "cpu".to_string(),
-            Duration::from_millis(10), // Very short interval
+            Duration::from_millis(10), // 매우 짧은 간격으로 하트비트 유도
         );
         executor.set_running();
 
-        // Wait for heartbeat interval to pass
+        // 하트비트 간격이 지나길 기다림
         std::thread::sleep(Duration::from_millis(20));
 
         let snap = snap_with_tokens(100, 2048, 4);
         let _plan = executor.poll(&snap);
 
-        // Should have sent a heartbeat
+        // 하트비트가 전송돼야 함
         let msg = resp_rx.recv().unwrap();
         match msg {
             EngineMessage::Heartbeat(status) => {
@@ -489,23 +693,67 @@ mod tests {
                 assert!((status.kv_cache_utilization - 100.0 / 2048.0).abs() < 0.01);
                 assert!((status.memory_lossy_min - 4.0 / 100.0).abs() < 0.01);
                 assert_eq!(status.memory_lossless_min, 1.0);
+                assert_eq!(status.eviction_policy, "none");
+                assert_eq!(status.kv_dtype, "f16");
             }
             _ => panic!("Expected Heartbeat"),
         }
 
-        drop(cmd_tx); // suppress warning
+        drop(cmd_tx); // 미사용 경고 억제
+    }
+
+    #[test]
+    fn test_executor_heartbeat_active_actions() {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (resp_tx, resp_rx) = mpsc::channel();
+        let mut executor = CommandExecutor::new(
+            cmd_rx,
+            resp_tx,
+            "cpu".to_string(),
+            Duration::from_millis(10),
+        );
+        executor.set_running();
+
+        // 스로틀 액션 활성화
+        cmd_tx
+            .send(ManagerMessage::Directive(EngineDirective {
+                seq_id: 1,
+                commands: vec![EngineCommand::Throttle { delay_ms: 30 }],
+            }))
+            .unwrap();
+        executor.poll(&empty_snap());
+
+        std::thread::sleep(Duration::from_millis(20));
+        let _plan = executor.poll(&empty_snap());
+
+        // 하트비트에 active_actions가 포함돼야 함
+        // Response와 Heartbeat가 순서대로 올 수 있음
+        let mut found_heartbeat = false;
+        for _ in 0..3 {
+            if let Ok(msg) = resp_rx.try_recv() {
+                if let EngineMessage::Heartbeat(status) = msg {
+                    assert!(status.active_actions.contains(&"throttle".to_string()));
+                    found_heartbeat = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            found_heartbeat,
+            "Should have received heartbeat with active_actions"
+        );
     }
 
     #[test]
     fn test_executor_throughput_ema() {
         let (mut executor, _tx, _rx) = make_executor();
 
-        // Simulate token generation at ~10 tok/s
+        // ~10 tok/s 속도로 토큰 생성 시뮬레이션
         executor.on_token_generated();
         std::thread::sleep(Duration::from_millis(100));
         executor.on_token_generated();
 
-        // EMA should be approximately 10 tok/s (within bounds)
+        // EMA가 약 10 tok/s 범위에 있어야 함
         assert!(executor.throughput_ema > 5.0);
         assert!(executor.throughput_ema < 20.0);
     }
@@ -517,11 +765,7 @@ mod tests {
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 42,
             commands: vec![
-                EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Normal,
-                    target_throughput: 1.0,
-                    deadline_ms: None,
-                },
+                EngineCommand::Throttle { delay_ms: 0 },
                 EngineCommand::PrepareComputeUnit {
                     device: "gpu".to_string(),
                 },
@@ -544,23 +788,19 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_resume_preserves_levels() {
+    fn test_executor_resume_resets_state() {
         let (mut executor, tx, _rx) = make_executor();
 
-        // First: set to critical
+        // 스로틀 설정
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 1,
-            commands: vec![EngineCommand::SetComputeLevel {
-                level: ResourceLevel::Critical,
-                target_throughput: 0.3,
-                deadline_ms: None,
-            }],
+            commands: vec![EngineCommand::Throttle { delay_ms: 100 }],
         }))
         .unwrap();
         executor.poll(&empty_snap());
-        assert_eq!(executor.compute_level(), ResourceLevel::Critical);
+        assert_eq!(executor.throttle_delay_ms(), 100);
 
-        // Then: suspend
+        // 중단
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 2,
             commands: vec![EngineCommand::Suspend],
@@ -569,7 +809,7 @@ mod tests {
         executor.poll(&empty_snap());
         assert_eq!(executor.state(), EngineState::Suspended);
 
-        // Resume should reset levels to Normal
+        // Resume은 스로틀을 Normal로 초기화해야 함
         tx.send(ManagerMessage::Directive(EngineDirective {
             seq_id: 3,
             commands: vec![EngineCommand::Resume],
@@ -593,7 +833,7 @@ mod tests {
                 EngineCommand::PrepareComputeUnit {
                     device: "gpu".to_string(),
                 },
-                EngineCommand::SwitchComputeUnit {
+                EngineCommand::SwitchHw {
                     device: "gpu".to_string(),
                 },
             ],
@@ -603,34 +843,6 @@ mod tests {
         let plan = executor.poll(&empty_snap());
         assert_eq!(plan.prepare_device.as_deref(), Some("gpu"));
         assert_eq!(plan.switch_device.as_deref(), Some("gpu"));
-    }
-
-    #[test]
-    fn test_executor_multiple_compute_levels_max_throttle() {
-        let (mut executor, tx, _rx) = make_executor();
-
-        // Two compute commands in one directive — second supersedes
-        tx.send(ManagerMessage::Directive(EngineDirective {
-            seq_id: 1,
-            commands: vec![
-                EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Warning,
-                    target_throughput: 0.7,
-                    deadline_ms: None,
-                },
-                EngineCommand::SetComputeLevel {
-                    level: ResourceLevel::Critical,
-                    target_throughput: 0.3,
-                    deadline_ms: None,
-                },
-            ],
-        }))
-        .unwrap();
-
-        let plan = executor.poll(&empty_snap());
-        // The max throttle delay should reflect the most severe command
-        assert!(plan.throttle_delay_ms > 0);
-        assert_eq!(executor.compute_level(), ResourceLevel::Critical);
     }
 
     #[test]
@@ -653,5 +865,33 @@ mod tests {
             }
             _ => panic!("Expected Capability"),
         }
+    }
+
+    #[test]
+    fn test_executor_restore_clears_active_actions() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // 여러 액션 활성화
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![
+                EngineCommand::Throttle { delay_ms: 50 },
+                EngineCommand::KvEvictH2o { keep_ratio: 0.5 },
+                EngineCommand::LayerSkip { skip_ratio: 0.2 },
+            ],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+        assert_eq!(executor.active_actions().len(), 3);
+
+        // RestoreDefaults로 모두 초기화
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::RestoreDefaults],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+        assert!(executor.active_actions().is_empty());
+        assert_eq!(executor.throttle_delay_ms(), 0);
     }
 }
