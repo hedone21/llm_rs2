@@ -76,6 +76,10 @@ pub struct PolicyPipeline {
     dt: f32,
     /// Relief model 저장/불러오기 경로.
     relief_model_path: Option<String>,
+    /// Engine이 보고한 실행 가능 액션 목록 (heartbeat로 갱신).
+    available_actions: Vec<ActionId>,
+    /// Engine이 보고한 현재 활성 액션 목록 (heartbeat로 갱신).
+    active_actions_reported: Vec<ActionId>,
 }
 
 impl PolicyPipeline {
@@ -115,6 +119,8 @@ impl PolicyPipeline {
             latency_budget: config.selector.latency_budget,
             dt: 0.1,
             relief_model_path: None,
+            available_actions: vec![],
+            active_actions_reported: vec![],
         }
     }
 
@@ -193,6 +199,8 @@ impl PolicyPipeline {
                 &self.engine_state,
                 &qcf_values,
                 self.latency_budget,
+                &self.active_actions_reported,
+                &self.available_actions,
             );
 
             if !commands.is_empty() {
@@ -284,6 +292,7 @@ impl PolicyPipeline {
             (status.tokens_generated as f32 / DEFAULT_MAX_TOKENS).min(1.0);
 
         // [10] 활성 eviction 여부 (eviction_policy가 "none" 또는 빈 문자열이 아니면 1.0)
+        // ReliefEstimator 예측에 사용되므로 유지한다.
         v[feature::ACTIVE_EVICTION] =
             if !status.eviction_policy.is_empty() && status.eviction_policy != "none" {
                 1.0
@@ -293,6 +302,19 @@ impl PolicyPipeline {
 
         // [11] 활성 layer skip 여부 (skip_ratio > 0)
         v[feature::ACTIVE_LAYER_SKIP] = if status.skip_ratio > 0.0 { 1.0 } else { 0.0 };
+
+        // EngineStatus의 available_actions / active_actions를 ActionId로 파싱하여 캐싱.
+        // 액션 필터링에는 FeatureVector 대신 이 목록을 사용한다.
+        self.available_actions = status
+            .available_actions
+            .iter()
+            .filter_map(|s| ActionId::from_str(s))
+            .collect();
+        self.active_actions_reported = status
+            .active_actions
+            .iter()
+            .filter_map(|s| ActionId::from_str(s))
+            .collect();
     }
 
     // ── 내부 헬퍼 ──────────────────────────────────────────────────────────
@@ -826,5 +848,85 @@ mod tests {
         // prev_mode가 Normal이 아닌 값으로 바뀌었어야 한다
         // (실제 mode 전환은 PI 누적에 따라 다르므로, pressure만 확인)
         assert!(p.pressure().memory > 0.0);
+    }
+
+    /// Heartbeat에서 available_actions / active_actions_reported가 파싱된다.
+    #[test]
+    fn engine_state_parses_available_and_active_actions() {
+        use crate::types::ActionId;
+        use llm_shared::{EngineMessage, EngineState, EngineStatus, ResourceLevel};
+
+        let mut p = make_pipeline();
+
+        // 초기값은 비어있어야 한다
+        assert!(p.available_actions.is_empty());
+        assert!(p.active_actions_reported.is_empty());
+
+        let msg = EngineMessage::Heartbeat(EngineStatus {
+            active_device: "cpu".to_string(),
+            compute_level: ResourceLevel::Normal,
+            actual_throughput: 20.0,
+            memory_level: ResourceLevel::Normal,
+            kv_cache_bytes: 0,
+            kv_cache_tokens: 512,
+            kv_cache_utilization: 0.25,
+            memory_lossless_min: 1.0,
+            memory_lossy_min: 0.01,
+            state: EngineState::Running,
+            tokens_generated: 100,
+            available_actions: vec![
+                "kv_evict_h2o".to_string(),
+                "kv_evict_sliding".to_string(),
+                "throttle".to_string(),
+            ],
+            active_actions: vec!["kv_evict_h2o".to_string()],
+            eviction_policy: "h2o".to_string(),
+            kv_dtype: "f16".to_string(),
+            skip_ratio: 0.0,
+        });
+
+        p.update_engine_state(&msg);
+
+        assert_eq!(p.available_actions.len(), 3);
+        assert!(p.available_actions.contains(&ActionId::KvEvictH2o));
+        assert!(p.available_actions.contains(&ActionId::KvEvictSliding));
+        assert!(p.available_actions.contains(&ActionId::Throttle));
+
+        assert_eq!(p.active_actions_reported.len(), 1);
+        assert!(p.active_actions_reported.contains(&ActionId::KvEvictH2o));
+    }
+
+    /// unknown 액션 문자열은 파싱 시 무시된다 (filter_map).
+    #[test]
+    fn engine_state_ignores_unknown_action_strings() {
+        use llm_shared::{EngineMessage, EngineState, EngineStatus, ResourceLevel};
+
+        let mut p = make_pipeline();
+
+        let msg = EngineMessage::Heartbeat(EngineStatus {
+            active_device: "cpu".to_string(),
+            compute_level: ResourceLevel::Normal,
+            actual_throughput: 20.0,
+            memory_level: ResourceLevel::Normal,
+            kv_cache_bytes: 0,
+            kv_cache_tokens: 0,
+            kv_cache_utilization: 0.0,
+            memory_lossless_min: 1.0,
+            memory_lossy_min: 0.01,
+            state: EngineState::Running,
+            tokens_generated: 0,
+            available_actions: vec!["unknown_action".to_string(), "throttle".to_string()],
+            active_actions: vec!["another_unknown".to_string()],
+            eviction_policy: "none".to_string(),
+            kv_dtype: "f16".to_string(),
+            skip_ratio: 0.0,
+        });
+
+        p.update_engine_state(&msg);
+
+        // "throttle"만 파싱됨, "unknown_action"은 무시
+        assert_eq!(p.available_actions.len(), 1);
+        // "another_unknown"은 무시 → 빈 목록
+        assert!(p.active_actions_reported.is_empty());
     }
 }

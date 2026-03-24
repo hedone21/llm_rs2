@@ -4,7 +4,7 @@ use crate::action_registry::ActionRegistry;
 use crate::relief::ReliefEstimator;
 use crate::types::{
     ActionCommand, ActionId, ActionKind, ActionParams, Domain, FeatureVector, OperatingMode,
-    Operation, PressureVector, ReliefVector, feature,
+    Operation, PressureVector, ReliefVector,
 };
 
 /// Cross-Domain Action Selector.
@@ -28,9 +28,12 @@ impl ActionSelector {
     /// - `estimator`: Relief 예측기
     /// - `pressure`: 현재 pressure 벡터
     /// - `mode`: 운영 모드 (Warning → lossless만, Critical → lossy 허용)
-    /// - `engine_state`: 엔진 feature 벡터
+    /// - `engine_state`: 엔진 feature 벡터 (ReliefEstimator 예측에 사용)
     /// - `qcf_values`: 각 lossy 액션의 QCF 추정값 (on-demand)
     /// - `latency_budget`: 허용 가능한 latency 악화 상한 (양수)
+    /// - `active_actions`: Engine이 현재 적용 중인 액션 목록 (EngineStatus에서 직접 전달)
+    /// - `available_actions`: Engine이 실행 가능하다고 보고한 액션 목록 (비어있으면 필터링 안함)
+    #[allow(clippy::too_many_arguments)]
     pub fn select(
         registry: &ActionRegistry,
         estimator: &dyn ReliefEstimator,
@@ -39,14 +42,16 @@ impl ActionSelector {
         engine_state: &FeatureVector,
         qcf_values: &HashMap<ActionId, f32>,
         latency_budget: f32,
+        active_actions: &[ActionId],
+        available_actions: &[ActionId],
     ) -> Vec<ActionCommand> {
         // pressure가 전혀 없으면 빈 조합(cost=0)이 모든 제약을 충족하므로 즉시 반환
         if pressure.compute <= 0.0 && pressure.memory <= 0.0 && pressure.thermal <= 0.0 {
             return vec![];
         }
 
-        let active = active_actions_from_features(engine_state);
-        let candidate_ids = Self::filter_candidates(registry, mode, &active);
+        let candidate_ids =
+            Self::filter_candidates(registry, mode, active_actions, available_actions);
 
         if candidate_ids.is_empty() {
             return vec![];
@@ -86,10 +91,12 @@ impl ActionSelector {
     ///
     /// - Warning mode: lossy 액션 제외
     /// - 이미 활성화된 액션 제외
+    /// - available_actions가 비어있지 않으면 그 목록에 없는 액션 제외 (backward compat: 비어있으면 필터링 안함)
     fn filter_candidates(
         registry: &ActionRegistry,
         mode: OperatingMode,
         active_actions: &[ActionId],
+        available_actions: &[ActionId],
     ) -> Vec<ActionId> {
         registry
             .all_actions()
@@ -100,6 +107,11 @@ impl ActionSelector {
                 }
                 // 이미 활성 중인 액션 제외
                 if active_actions.contains(&meta.id) {
+                    return false;
+                }
+                // Engine이 실행 가능하다고 보고한 것만 포함
+                // available_actions가 비어있으면 필터링 안 함 (backward compat: Engine이 아직 보고 안 할 때)
+                if !available_actions.is_empty() && !available_actions.contains(&meta.id) {
                     return false;
                 }
                 true
@@ -259,36 +271,11 @@ impl ActionSelector {
     }
 }
 
-/// FeatureVector의 active action feature (index 7~12)에서 현재 활성 ActionId 목록을 추출한다.
-fn active_actions_from_features(state: &FeatureVector) -> Vec<ActionId> {
-    let mut result = vec![];
-    if state.values[feature::ACTIVE_SWITCH_HW] > 0.5 {
-        result.push(ActionId::SwitchHw);
-    }
-    if state.values[feature::ACTIVE_THROTTLE] > 0.5 {
-        result.push(ActionId::Throttle);
-    }
-    if state.values[feature::ACTIVE_KV_OFFLOAD] > 0.5 {
-        result.push(ActionId::KvOffloadDisk);
-    }
-    if state.values[feature::ACTIVE_EVICTION] > 0.5 {
-        // eviction 종류를 구분 못하므로 둘 다 제외
-        result.push(ActionId::KvEvictSliding);
-        result.push(ActionId::KvEvictH2o);
-    }
-    if state.values[feature::ACTIVE_LAYER_SKIP] > 0.5 {
-        result.push(ActionId::LayerSkip);
-    }
-    if state.values[feature::ACTIVE_KV_QUANT] > 0.5 {
-        result.push(ActionId::KvQuantDynamic);
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{ActionConfig, PolicyConfig};
+    use crate::types::feature;
     use std::collections::HashMap;
     use std::io;
     use std::path::Path;
@@ -424,6 +411,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         let ids = command_ids(&cmds);
@@ -472,6 +461,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         let ids = command_ids(&cmds);
@@ -521,6 +512,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         let ids = command_ids(&cmds);
@@ -566,6 +559,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         let ids = command_ids(&cmds);
@@ -608,6 +603,8 @@ mod tests {
             &state,
             &qcf,
             0.6, // latency_budget = 0.6
+            &[],
+            &[],
         );
 
         let ids = command_ids(&cmds);
@@ -645,6 +642,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         // 완전 해소는 불가하지만, 최대 coverage를 위해 둘 다 선택해야 함
@@ -687,6 +686,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         assert!(
@@ -719,6 +720,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         assert_eq!(cmds.len(), 1);
@@ -763,6 +766,8 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &[],
+            &[],
         );
 
         assert!(cmds.is_empty(), "no action needed when pressure is zero");
@@ -778,12 +783,15 @@ mod tests {
         predictions.insert(ActionId::Throttle, rv(0.4, 0.0, 0.2, -0.3));
         let estimator = MockEstimator::new(predictions);
 
-        // switch_hw가 이미 활성화된 상태
+        // switch_hw가 이미 활성화된 상태 — FeatureVector는 ReliefEstimator 컨텍스트용,
+        // 액션 필터링은 active_actions 파라미터로 직접 전달
         let mut state = FeatureVector::zeros();
         state.values[feature::ACTIVE_SWITCH_HW] = 1.0;
 
         let pressure = pv(0.5, 0.0, 0.0);
         let qcf = HashMap::new();
+        // EngineStatus에서 직접 전달된 active_actions
+        let active_actions = [ActionId::SwitchHw];
 
         let cmds = ActionSelector::select(
             &registry,
@@ -793,12 +801,101 @@ mod tests {
             &state,
             &qcf,
             1.0,
+            &active_actions,
+            &[],
         );
 
         let ids = command_ids(&cmds);
         assert!(
             !ids.contains(&ActionId::SwitchHw),
             "already active action should not be selected again"
+        );
+    }
+
+    /// available_actions가 비어있지 않으면 그 목록에 없는 액션은 후보에서 제외된다.
+    #[test]
+    fn test_available_actions_filters_candidates() {
+        let registry = make_registry(
+            &[
+                ("switch_hw", 0.0, true),
+                ("throttle", 0.0, true),
+                ("kv_evict_h2o", 0.12, false),
+            ],
+            &[],
+        );
+
+        let mut predictions = HashMap::new();
+        predictions.insert(ActionId::SwitchHw, rv(0.8, 0.0, 0.5, 0.0));
+        predictions.insert(ActionId::Throttle, rv(0.4, 0.0, 0.3, 0.0));
+        predictions.insert(ActionId::KvEvictH2o, rv(0.0, 0.9, 0.0, 0.0));
+        let estimator = MockEstimator::new(predictions);
+
+        let pressure = pv(0.6, 0.0, 0.0);
+        let state = no_active_state();
+        let qcf = HashMap::new();
+        // Engine이 throttle만 실행 가능하다고 보고
+        let available = [ActionId::Throttle];
+
+        let cmds = ActionSelector::select(
+            &registry,
+            &estimator,
+            &pressure,
+            OperatingMode::Critical,
+            &state,
+            &qcf,
+            1.0,
+            &[],
+            &available,
+        );
+
+        let ids = command_ids(&cmds);
+        // switch_hw와 kv_evict_h2o는 available_actions에 없으므로 제외됨
+        assert!(
+            !ids.contains(&ActionId::SwitchHw),
+            "switch_hw not in available_actions must be excluded"
+        );
+        assert!(
+            !ids.contains(&ActionId::KvEvictH2o),
+            "kv_evict_h2o not in available_actions must be excluded"
+        );
+        // throttle은 available_actions에 있으므로 선택될 수 있음
+        assert!(
+            ids.contains(&ActionId::Throttle),
+            "throttle is in available_actions and should be selectable"
+        );
+    }
+
+    /// available_actions가 비어있으면 모든 액션이 후보가 된다 (backward compat).
+    #[test]
+    fn test_empty_available_actions_no_filtering() {
+        let registry = make_registry(&[("switch_hw", 0.0, true), ("throttle", 0.0, true)], &[]);
+
+        let mut predictions = HashMap::new();
+        predictions.insert(ActionId::SwitchHw, rv(0.8, 0.0, 0.5, 0.0));
+        predictions.insert(ActionId::Throttle, rv(0.4, 0.0, 0.3, 0.0));
+        let estimator = MockEstimator::new(predictions);
+
+        let pressure = pv(0.6, 0.0, 0.0);
+        let state = no_active_state();
+        let qcf = HashMap::new();
+
+        let cmds = ActionSelector::select(
+            &registry,
+            &estimator,
+            &pressure,
+            OperatingMode::Critical,
+            &state,
+            &qcf,
+            1.0,
+            &[],
+            &[], // available_actions 비어있음 → 필터링 없음
+        );
+
+        // switch_hw가 더 많은 relief를 제공하므로 선택됨
+        let ids = command_ids(&cmds);
+        assert!(
+            ids.contains(&ActionId::SwitchHw),
+            "switch_hw should be selectable when available_actions is empty"
         );
     }
 }
