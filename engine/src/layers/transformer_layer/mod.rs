@@ -145,11 +145,23 @@ pub struct TransformerLayer {
     pub w_down: Tensor,
 
     // Norms
+    /// Pre-attention norm (all architectures).
     pub attention_norm: Tensor,
+    /// Llama/Qwen2: pre-FFN norm. Gemma3: post-attention norm.
     pub ffn_norm: Tensor,
 
     // Optional QKV bias (e.g. for Qwen, Phi models)
     pub qkv_bias: Option<QkvBias>,
+
+    // Gemma3-only optional fields
+    /// QK-Norm: per-head RMSNorm weight for Q [n_heads_q * head_dim] (Gemma3).
+    pub q_norm: Option<Tensor>,
+    /// QK-Norm: per-head RMSNorm weight for K [n_heads_kv * head_dim] (Gemma3).
+    pub k_norm: Option<Tensor>,
+    /// Pre-FFN norm (Gemma3: pre_feedforward_layernorm). None for Llama/Qwen2.
+    pub pre_ffn_norm: Option<Tensor>,
+    /// Post-FFN norm (Gemma3: post_feedforward_layernorm). None for Llama/Qwen2.
+    pub post_ffn_norm: Option<Tensor>,
 }
 
 impl TransformerLayer {
@@ -197,6 +209,10 @@ impl TransformerLayer {
                 profiler: args.profiler,
                 skip_attn,
                 skip_mlp,
+                rms_norm_add_unit: args.rms_norm_add_unit,
+                use_gelu_tanh: args.use_gelu_tanh,
+                is_local_attn: args.is_local_attn,
+                local_attn_window: args.local_attn_window,
             });
         }
 
@@ -251,6 +267,14 @@ pub struct ForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub skip_attn: bool,
     /// SWIFT: skip MLP/FFN sub-layer (identity pass).
     pub skip_mlp: bool,
+    /// Gemma3: true → `x * (1 + w) / rms(x)`, false → `x * w / rms(x)` (Llama/Qwen2).
+    pub rms_norm_add_unit: bool,
+    /// Gemma3: true → GELU_tanh activation, false → SiLU (Llama/Qwen2).
+    pub use_gelu_tanh: bool,
+    /// Gemma3: whether this layer uses local (sliding window) attention.
+    pub is_local_attn: Option<bool>,
+    /// Gemma3: local attention window size (sliding_window value).
+    pub local_attn_window: Option<usize>,
 }
 
 pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -273,6 +297,14 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub skip_attn: bool,
     /// If true, skip the MLP/FFN sub-layer (identity pass).
     pub skip_mlp: bool,
+    /// Gemma3: true → `x * (1 + w) / rms(x)`, false → `x * w / rms(x)` (Llama/Qwen2).
+    pub rms_norm_add_unit: bool,
+    /// Gemma3: true → GELU_tanh activation, false → SiLU (Llama/Qwen2).
+    pub use_gelu_tanh: bool,
+    /// Gemma3: whether this layer uses local (sliding window) attention.
+    pub is_local_attn: Option<bool>,
+    /// Gemma3: local attention window size (sliding_window value).
+    pub local_attn_window: Option<usize>,
 }
 
 // OpProfiler has been moved to crate::profile::ops.

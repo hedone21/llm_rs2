@@ -404,6 +404,27 @@ impl TransformerModel {
             } else {
                 None
             };
+            // Gemma3 optional tensors (norm weights are always F32)
+            let q_norm = if let Some(ref name) = names.q_norm {
+                Some(load_tensor(name, false)?)
+            } else {
+                None
+            };
+            let k_norm = if let Some(ref name) = names.k_norm {
+                Some(load_tensor(name, false)?)
+            } else {
+                None
+            };
+            let pre_ffn_norm = if let Some(ref name) = names.pre_ffn_norm {
+                Some(load_tensor(name, false)?)
+            } else {
+                None
+            };
+            let post_ffn_norm = if let Some(ref name) = names.post_ffn_norm {
+                Some(load_tensor(name, false)?)
+            } else {
+                None
+            };
             let layer = TransformerLayer {
                 wq: load_tensor(&names.wq, true)?,
                 wk: load_tensor(&names.wk, true)?,
@@ -415,6 +436,10 @@ impl TransformerModel {
                 attention_norm: load_tensor(&names.attention_norm, false)?,
                 ffn_norm: load_tensor(&names.ffn_norm, false)?,
                 qkv_bias,
+                q_norm,
+                k_norm,
+                pre_ffn_norm,
+                post_ffn_norm,
             };
             layers.push(layer);
         }
@@ -647,6 +672,10 @@ impl TransformerModel {
                 rope_theta: self.config.rope_theta as f32,
                 workspace: None,
                 use_gpu_attn: true,
+                rms_norm_add_unit: false,
+                use_gelu_tanh: false,
+                is_local_attn: None,
+                local_attn_window: None,
                 need_scores: false,
                 head_dim: self.config.head_dim,
                 profiler: None,
@@ -754,6 +783,10 @@ impl TransformerModel {
                 layer_id: i,
                 skip_attn: s_attn,
                 skip_mlp: s_mlp,
+                rms_norm_add_unit: false,
+                use_gelu_tanh: false,
+                is_local_attn: None,
+                local_attn_window: None,
             })?;
 
             // Record importance after layer forward
@@ -1095,6 +1128,10 @@ impl TransformerModel {
                 layer_id: i,
                 skip_attn: false,
                 skip_mlp: false,
+                rms_norm_add_unit: false,
+                use_gelu_tanh: false,
+                is_local_attn: None,
+                local_attn_window: None,
             })?;
             let fwd_dur = fwd_t0.elapsed();
             prefetch.record_forward(fwd_dur);

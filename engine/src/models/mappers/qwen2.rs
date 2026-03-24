@@ -15,6 +15,10 @@ impl WeightMapper for Qwen2Mapper {
             w_down: format!("model.layers.{i}.mlp.down_proj.weight"),
             attention_norm: format!("model.layers.{i}.input_layernorm.weight"),
             ffn_norm: format!("model.layers.{i}.post_attention_layernorm.weight"),
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            q_norm: None,
+            k_norm: None,
         }
     }
 
