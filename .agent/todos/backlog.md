@@ -12,6 +12,86 @@
 - **Acceptance Criteria**: 매트릭스 문서, 디바이스별 최대 지원 모델 크기 명시
 - **Notes**: 실제 테스트는 디바이스 확보 후 진행
 
+## [P2] NVIDIA GPU OpenCL 추론 정확성 문제
+- **Status**: DONE
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: |
+  NVIDIA RTX 3090 Ti에서 OpenCL 백엔드로 추론 시 garbage 출력 발생.
+  개별 커널(rms_norm, F16 matmul, softmax, half 읽기)은 pyopencl 단위 테스트에서 정확하나,
+  전체 추론 파이프라인에서 garbage 발생. Q4 weight + F32 KV cache에서도 동일 → F16 커널 무관.
+
+  ### 조사된 사항 (2026-03-24)
+  - fallback 커널 컴파일: F32, Q4_0, Simple Ops, F16 모두 nosub 컴파일 성공
+  - PoCL CPU OpenCL: 정상 추론 (subgroup 지원 → 원본 커널 사용)
+  - 개별 커널 정확성: rms_norm, matmul_f16 모두 pyopencl 테스트 통과
+  - `CL_MEM_ALLOC_HOST_PTR` (UnifiedBuffer): NVIDIA discrete GPU에서의 동작 미검증
+  - `unified_buffer::test_map_write_unmap_cycle`: 호스트에서 panic 발생 (기존 이슈)
+
+  ### 의심 원인 (우선순위순)
+  1. UnifiedBuffer + CL_MEM_ALLOC_HOST_PTR의 NVIDIA 호환성 (버퍼 동기화/매핑)
+  2. 커널 간 데이터 전달 시 GPU↔Host 메모리 일관성 문제
+  3. nosub 커널 내 미세 인자 불일치 (dispatch parameter vs kernel expectation)
+- **Acceptance Criteria**: NVIDIA GPU에서 CPU 백엔드와 동일한 coherent 텍스트 생성
+- **Notes**: |
+  - 환경: NVIDIA RTX 3090 Ti, OpenCL 3.0 CUDA, cl_khr_subgroups 미지원
+  - F16 nosub fallback 커널은 구현 완료 (17b2763)
+  - 디버깅 접근: UnifiedBuffer를 비활성화(use_zero_copy=false)하여 discrete GPU용 버퍼 할당으로 전환 테스트 권장
+
+## [P2] Gemma 3 1B NVIDIA GPU 추론 실패
+- **Status**: DONE
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: |
+  Gemma 3 1B이 NVIDIA RTX 3090 Ti에서 `<unused6241>` 토큰만 생성.
+  CPU에서는 정상 동작. Llama/Qwen은 NVIDIA에서도 정상.
+
+  Gemma 3 특이사항:
+  - head_dim=256 (Llama=64, Qwen=128)
+  - `kernel_attn_gen_half`에서 `float out_local[256]` → 256 registers/thread
+  - NVIDIA register limit (255) 초과 → spill to local memory → 가능한 정확성 문제
+  - sliding_window=512 (로컬 어텐션)
+  - gelu_pytorch_tanh 활성화
+
+  회귀 테스트 baseline에서 확인됨 (735ba71).
+- **Acceptance Criteria**: Gemma 3 1B NVIDIA GPU에서 coherent 텍스트 생성
+- **Notes**: regression_test.py 3/3 FAIL (nvidia), 2/3 PASS (cpu)
+
+## [P1] Manager ↔ Engine 프로토콜 이슈 (E2E 테스트에서 발견)
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: |
+  2026-03-24 E2E 테스트(Manager + mock_engine, Unix socket)에서 발견된 이슈 목록.
+
+  ### 1. Relief Model cold-start 문제
+  relief model이 없으면 모든 예측이 `ReliefVector::zero()` → ActionSelector가 액션을 선택 불가.
+  **수정 방향**: ActionSelector에서 observation_count==0인 액션에 대해 domain 기반 default relief를 반환하는 fallback 추가.
+
+  ### 2. `~` 경로 미확장
+  `ReliefModelConfig::default()`의 `storage_dir: "~/.llm_rs/models"`가 셸 확장 안 됨.
+  **수정 방향**: `dirs::home_dir()` 또는 `std::env::var("HOME")` 기반 절대 경로로 확장.
+
+  ### 3. main config `[policy]` 섹션 미사용
+  `Config`에 `policy: Option<PolicyConfig>` 필드가 있으나, `load_policy_config()`는 `--policy-config` CLI 플래그만 읽음. main config의 `[policy.*]` 섹션이 무시됨.
+  **수정 방향**: `--policy-config` 미지정 시 `config.policy`를 fallback으로 사용.
+
+  ### 4. 단방향 소켓 (Manager가 Engine 메시지를 읽지 않음)
+  `UnixSocketEmitter`는 write-only. Engine이 보내는 Capability/Heartbeat/Response를 Manager가 수신하지 않음.
+  프로토콜 스펙(docs/37)은 양방향이나 구현은 단방향.
+  **수정 방향**: UnixSocketEmitter를 양방향 `UnixSocketTransport`로 리팩토링, reader 스레드 추가, Heartbeat → Pipeline의 `engine_state` 갱신.
+
+- **Acceptance Criteria**: |
+  1. Seed model 없이도 cold-start에서 directive 생성 가능
+  2. `~` 경로가 올바르게 확장됨
+  3. main config의 `[policy]` 섹션이 인식됨
+  4. Manager가 Engine Heartbeat를 수신하여 pipeline engine_state 갱신
+- **Notes**: |
+  - 이슈 #1, #2, #3은 독립적으로 수정 가능 (각각 소규모)
+  - 이슈 #4는 아키텍처 변경 (UnixSocketEmitter → 양방향 transport). 설계 검토 후 진행
+  - E2E 테스트 커맨드: `manager --transport unix:<sock> --policy-config <toml>` + `mock_engine --socket <sock>`
+  - emit_initial 프로토콜 불일치는 수정 완료 (7895824)
+
 ## [P3] ThermalCollector zone 패턴 매칭 auto-discovery
 - **Status**: TODO
 - **Sprint**: backlog
