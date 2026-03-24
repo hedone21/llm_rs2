@@ -68,7 +68,7 @@ fn test_resilience_eviction_flow() {
 
     let evict = plan.evict.unwrap();
     assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
-    assert_eq!(evict.policy, "h2o");
+    assert_eq!(evict.method, llm_rs2::resilience::EvictMethod::H2o);
 
     // generate.rs처럼 KV 캐시 축소 시뮬레이션
     let current_pos: usize = 500;
@@ -100,7 +100,7 @@ fn test_resilience_eviction_sliding_flow() {
     assert!(plan.evict.is_some());
     let evict = plan.evict.unwrap();
     assert!((evict.target_ratio - 0.7).abs() < f32::EPSILON);
-    assert_eq!(evict.policy, "sliding");
+    assert_eq!(evict.method, llm_rs2::resilience::EvictMethod::Sliding);
 }
 
 // ── Test: Throttle flow ──────────────────────────────────
@@ -311,7 +311,7 @@ fn test_resilience_superseding_directives() {
     // 두 번째(더 최신) 명령이 승리
     let evict = plan.evict.unwrap();
     assert!((evict.target_ratio - 0.5).abs() < f32::EPSILON);
-    assert_eq!(evict.policy, "sliding");
+    assert_eq!(evict.method, llm_rs2::resilience::EvictMethod::Sliding);
 }
 
 // ── Test: Multi-domain directives ────────────────────────

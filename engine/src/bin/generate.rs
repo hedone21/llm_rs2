@@ -33,7 +33,7 @@ use llm_rs2::resilience::DbusTransport;
 #[cfg(unix)]
 use llm_rs2::resilience::UnixSocketTransport;
 use llm_rs2::resilience::{
-    CommandExecutor, EngineCommand, KVSnapshot, ManagerMessage, MessageLoop, ResourceLevel,
+    CommandExecutor, EngineCommand, KVSnapshot, ManagerMessage, MessageLoop,
 };
 
 #[derive(Parser, Debug)]
@@ -469,30 +469,6 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ── KIVI mode: separate path with KiviCache ──
-    if args.kivi {
-        return run_kivi(
-            &model,
-            &tokenizer,
-            &backend,
-            &memory,
-            &input_ids,
-            &sampling_config,
-            kv_heads,
-            head_dim,
-            num_layers,
-            max_seq_len,
-            args.kivi_residual_size,
-            args.num_tokens,
-            args.gpu_attn,
-            args.experiment_output.as_deref(),
-            args.experiment_logits_topk,
-            args.experiment_sample_interval,
-            &prompt,
-            &args.backend,
-        );
-    }
-
     // ── Offload mode: separate path with OffloadKVCache ──
     if args.kv_offload != "none" {
         return run_offload(
@@ -657,6 +633,32 @@ fn main() -> anyhow::Result<()> {
     };
     let mut throttle_delay_ms: u64 = 0;
 
+    // ── KIVI mode: separate path with KiviCache ──
+    // Placed after executor creation so resilience is available in the token loop.
+    if args.kivi {
+        return run_kivi(
+            &model,
+            &tokenizer,
+            &backend,
+            &memory,
+            &input_ids,
+            &sampling_config,
+            kv_heads,
+            head_dim,
+            num_layers,
+            max_seq_len,
+            args.kivi_residual_size,
+            args.num_tokens,
+            args.gpu_attn,
+            args.experiment_output.as_deref(),
+            args.experiment_logits_topk,
+            args.experiment_sample_interval,
+            &prompt,
+            &args.backend,
+            &mut command_executor,
+        );
+    }
+
     // Experiment JSONL writer + system sampler
     let mut experiment_writer = if let Some(ref path) = args.experiment_output {
         Some(JsonlWriter::new(path)?)
@@ -764,6 +766,23 @@ fn main() -> anyhow::Result<()> {
     // Setup event sink for score diagnostics
     cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
 
+    // Register policies for Manager-directed eviction dispatch
+    cache_manager.register_policy(
+        llm_rs2::resilience::EvictMethod::H2o,
+        Box::new(H2OPolicy::new(
+            args.h2o_recent_window,
+            args.h2o_keep_ratio,
+            actual_protected_prefix,
+        )),
+    );
+    cache_manager.register_policy(
+        llm_rs2::resilience::EvictMethod::Sliding,
+        Box::new(SlidingWindowPolicy::new(
+            args.eviction_window,
+            actual_protected_prefix,
+        )),
+    );
+
     // Parse QCF mode
     let qcf_mode = match args.qcf_mode.as_str() {
         "caote" => llm_rs2::core::qcf::QcfMode::Caote,
@@ -777,7 +796,7 @@ fn main() -> anyhow::Result<()> {
     let needs_score_based = args.eviction_policy == "h2o"
         || args.eviction_policy == "d2o"
         || args.eviction_policy == "h2o_plus";
-    let needs_accumulator = needs_score_based || needs_caote;
+    let needs_accumulator = needs_score_based || needs_caote || args.enable_resilience;
     let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote;
 
     let mut score_accumulator = if needs_accumulator {
@@ -820,7 +839,7 @@ fn main() -> anyhow::Result<()> {
 
     // Build SkipConfig from CLI options
     use llm_rs2::core::skip_config::SkipConfig;
-    let skip_config = if let Some(ref layers) = args.skip_layers {
+    let mut skip_config = if let Some(ref layers) = args.skip_layers {
         let mut sc = SkipConfig::new();
         for &l in layers {
             sc.attn_skip.insert(l);
@@ -851,6 +870,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let mut last_skip_ratio: Option<f32> = args.skip_ratio;
 
     // Auto-eviction: non-experiment mode evicts automatically.
     // - Sliding window: triggers on memory pressure after each forward pass.
@@ -1379,7 +1399,7 @@ fn main() -> anyhow::Result<()> {
                     use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
-                    skip_config: None,
+                    skip_config: skip_config.as_ref(),
                     importance_collector: None,
                     logits_last_only: false,
                     prefill_ws: None,
@@ -1601,98 +1621,110 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    // Warning level = lossless only (currently no-op)
-                    // Critical level = force evict (lossy OK)
-                    if evict.level >= ResourceLevel::Critical
-                        || args.experiment_eviction_ratio.is_some()
-                    {
-                        let result = if let Some(acc) = score_accumulator.as_ref() {
-                            if let Some(head_imp) = acc.head_importance_scores() {
-                                cache_manager.force_evict_with_head_scores(
-                                    &mut kv_caches,
-                                    effective_ratio,
-                                    acc.importance_scores(),
-                                    head_imp,
-                                    acc.n_kv_heads(),
-                                )
-                            } else {
-                                cache_manager.force_evict_with_scores(
-                                    &mut kv_caches,
-                                    effective_ratio,
-                                    acc.importance_scores(),
-                                )
+                    // Build ScoreContext from accumulator for policy-directed eviction
+                    let scores = if let Some(acc) = score_accumulator.as_ref() {
+                        if let Some(head_imp) = acc.head_importance_scores() {
+                            llm_rs2::core::cache_manager::ScoreContext::PerHead {
+                                flat: acc.importance_scores(),
+                                head: head_imp,
+                                n_kv_heads: acc.n_kv_heads(),
+                            }
+                        } else if acc.is_active() {
+                            llm_rs2::core::cache_manager::ScoreContext::Flat {
+                                importance: acc.importance_scores(),
                             }
                         } else {
-                            cache_manager.force_evict(&mut kv_caches, effective_ratio)
-                        };
-                        match result {
-                            Ok(r) if r.evicted => {
-                                eprintln!(
-                                    "[Resilience] Evicted {} tokens (pos: {} → {})",
-                                    r.tokens_removed,
-                                    r.new_pos + r.tokens_removed,
-                                    r.new_pos
-                                );
-                                if args.h2o_debug {
-                                    if let Some(acc) = score_accumulator.as_ref() {
-                                        let scores = acc.importance_scores();
-                                        let pre_pos = r.new_pos + r.tokens_removed;
-                                        let valid = &scores[..pre_pos.min(scores.len())];
-                                        if !valid.is_empty() {
-                                            let total: f32 = valid.iter().sum();
-                                            let max_s = valid
-                                                .iter()
-                                                .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                                            let min_s =
-                                                valid.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-                                            let avg_s = total / valid.len() as f32;
-                                            eprintln!(
-                                                "[H2O-Debug] Pre-eviction scores: min={:.3} avg={:.3} max={:.3} total={:.1} tokens={}",
-                                                min_s,
-                                                avg_s,
-                                                max_s,
-                                                total,
-                                                valid.len()
-                                            );
-                                        }
-                                    }
-                                    eprintln!(
-                                        "[H2O-Debug] Eviction: ratio={:.3} removed={} new_pos={}",
-                                        effective_ratio, r.tokens_removed, r.new_pos
-                                    );
-                                }
-                                if let Some(ref mut p) = profiler {
-                                    p.on_eviction(llm_rs2::profile::EvictionEvent {
-                                        step: decode_token_index,
-                                        policy: args.eviction_policy.clone(),
-                                        before_len: r.new_pos + r.tokens_removed,
-                                        after_len: r.new_pos,
-                                        evicted_count: r.tokens_removed,
-                                        partition: llm_rs2::profile::PartitionInfo {
-                                            prefix_end: actual_protected_prefix,
-                                            hh_count: 0,
-                                            recent_start: r.new_pos,
-                                        },
-                                        evicted_indices: vec![],
-                                        pre_eviction_scores: vec![],
-                                    });
-                                }
-                                experiment_eviction_count += 1;
-                                experiment_evicted_total += r.tokens_removed;
-                                if let Some(acc) = score_accumulator.as_mut() {
-                                    acc.reset();
-                                }
-                            }
-                            Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
-                            _ => {}
+                            llm_rs2::core::cache_manager::ScoreContext::None
                         }
+                    } else {
+                        llm_rs2::core::cache_manager::ScoreContext::None
+                    };
+
+                    // Manager already decided to evict — always execute via named policy
+                    let result = cache_manager.force_evict_by_policy(
+                        evict.method,
+                        &mut kv_caches,
+                        effective_ratio,
+                        scores,
+                    );
+                    match result {
+                        Ok(r) if r.evicted => {
+                            eprintln!(
+                                "[Resilience] Evicted {} tokens (pos: {} → {})",
+                                r.tokens_removed,
+                                r.new_pos + r.tokens_removed,
+                                r.new_pos
+                            );
+                            if args.h2o_debug {
+                                if let Some(acc) = score_accumulator.as_ref() {
+                                    let scores = acc.importance_scores();
+                                    let pre_pos = r.new_pos + r.tokens_removed;
+                                    let valid = &scores[..pre_pos.min(scores.len())];
+                                    if !valid.is_empty() {
+                                        let total: f32 = valid.iter().sum();
+                                        let max_s =
+                                            valid.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                                        let min_s =
+                                            valid.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                                        let avg_s = total / valid.len() as f32;
+                                        eprintln!(
+                                            "[H2O-Debug] Pre-eviction scores: min={:.3} avg={:.3} max={:.3} total={:.1} tokens={}",
+                                            min_s,
+                                            avg_s,
+                                            max_s,
+                                            total,
+                                            valid.len()
+                                        );
+                                    }
+                                }
+                                eprintln!(
+                                    "[H2O-Debug] Eviction: ratio={:.3} removed={} new_pos={}",
+                                    effective_ratio, r.tokens_removed, r.new_pos
+                                );
+                            }
+                            if let Some(ref mut p) = profiler {
+                                p.on_eviction(llm_rs2::profile::EvictionEvent {
+                                    step: decode_token_index,
+                                    policy: args.eviction_policy.clone(),
+                                    before_len: r.new_pos + r.tokens_removed,
+                                    after_len: r.new_pos,
+                                    evicted_count: r.tokens_removed,
+                                    partition: llm_rs2::profile::PartitionInfo {
+                                        prefix_end: actual_protected_prefix,
+                                        hh_count: 0,
+                                        recent_start: r.new_pos,
+                                    },
+                                    evicted_indices: vec![],
+                                    pre_eviction_scores: vec![],
+                                });
+                            }
+                            experiment_eviction_count += 1;
+                            experiment_evicted_total += r.tokens_removed;
+                            if let Some(acc) = score_accumulator.as_mut() {
+                                acc.reset();
+                            }
+                        }
+                        Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
+                        _ => {}
+                    }
+                }
+
+                // Dynamic layer skip / restore_defaults handling
+                if plan.restore_defaults {
+                    skip_config = None;
+                    last_skip_ratio = None;
+                } else if let Some(ratio) = plan.layer_skip {
+                    if last_skip_ratio != Some(ratio) {
+                        skip_config = Some(SkipConfig::uniform_init(
+                            model.config.num_hidden_layers,
+                            ratio,
+                        ));
+                        last_skip_ratio = Some(ratio);
                     }
                 }
 
                 if let Some(ref _device) = plan.switch_device {
-                    log::warn!(
-                        "[Resilience] SwitchHw not supported in single-backend mode"
-                    );
+                    log::warn!("[Resilience] SwitchHw not supported in single-backend mode");
                 }
 
                 throttle_delay_ms = plan.throttle_delay_ms;
@@ -1953,8 +1985,8 @@ fn plan_summary(plan: &llm_rs2::resilience::ExecutionPlan) -> Vec<String> {
     let mut names = Vec::new();
     if let Some(ref evict) = plan.evict {
         names.push(format!(
-            "Evict({:.2}, {:?})",
-            evict.target_ratio, evict.level
+            "Evict({:.2}, {:?}, {:?})",
+            evict.target_ratio, evict.method, evict.level
         ));
     }
     if let Some(ref dev) = plan.switch_device {
@@ -2345,6 +2377,7 @@ fn run_kivi(
     experiment_sample_interval: usize,
     prompt: &str,
     backend_name: &str,
+    command_executor: &mut Option<llm_rs2::resilience::CommandExecutor>,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
@@ -2516,6 +2549,11 @@ fn run_kivi(
     let mut forward_ms_values: Vec<f64> = Vec::new();
     let mut last_token_time = std::time::Instant::now();
 
+    // Dynamic skip_config for KIVI resilience path
+    use llm_rs2::core::skip_config::SkipConfig;
+    let mut kivi_skip_config: Option<SkipConfig> = None;
+    let mut kivi_last_skip_ratio: Option<f32> = None;
+
     for decode_idx in 0..(num_tokens - 1) {
         if kv_caches[0].current_pos() >= max_seq_len {
             eprintln!("\n[Stopped: Max context length reached]");
@@ -2541,7 +2579,7 @@ fn run_kivi(
             use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
-            skip_config: None,
+            skip_config: kivi_skip_config.as_ref(),
             importance_collector: None,
             logits_last_only: false,
             prefill_ws: None,
@@ -2551,6 +2589,66 @@ fn run_kivi(
 
         start_pos += 1;
         generated_count += 1;
+
+        // ── KIVI resilience checkpoint ──
+        if let Some(executor) = command_executor.as_mut() {
+            let current_bits = kv_caches[0].bits();
+            let kv_dtype = match current_bits {
+                8 => "q8".to_string(),
+                4 => "q4".to_string(),
+                2 => "q2".to_string(),
+                _ => format!("q{}", current_bits),
+            };
+            let kv_snap = llm_rs2::resilience::KVSnapshot {
+                total_bytes: kv_caches
+                    .iter()
+                    .map(|c| c.memory_usage_bytes() as u64)
+                    .sum(),
+                total_tokens: kv_caches[0].current_pos(),
+                capacity: kv_caches[0].capacity(),
+                protected_prefix: 0,
+                kv_dtype,
+                eviction_policy: "kivi".to_string(),
+                skip_ratio: kivi_last_skip_ratio.unwrap_or(0.0),
+            };
+            let plan = executor.poll(&kv_snap);
+
+            // kv_quant_bits: transition KiviCache bit-width
+            if let Some(bits) = plan.kv_quant_bits {
+                for cache in kv_caches.iter_mut() {
+                    if let Err(e) = cache.transition_bits(bits) {
+                        eprintln!("[KIVI-Resilience] transition_bits({}) error: {}", bits, e);
+                    }
+                }
+                eprintln!("[KIVI-Resilience] Transitioned KV cache to {}bit", bits);
+            }
+
+            // layer_skip / restore_defaults
+            if plan.restore_defaults {
+                kivi_skip_config = None;
+                kivi_last_skip_ratio = None;
+            } else if let Some(ratio) = plan.layer_skip {
+                if kivi_last_skip_ratio != Some(ratio) {
+                    kivi_skip_config = Some(SkipConfig::uniform_init(
+                        model.config.num_hidden_layers,
+                        ratio,
+                    ));
+                    kivi_last_skip_ratio = Some(ratio);
+                }
+            }
+
+            // throttle
+            if plan.throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            }
+
+            if plan.suspended {
+                eprintln!("\n[KIVI-Resilience] Inference suspended by system signal");
+                break;
+            }
+
+            executor.on_token_generated();
+        }
 
         // Read logits to CPU
         let mut logits_cpu = vec![0.0f32; vocab_size];
