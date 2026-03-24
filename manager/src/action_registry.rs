@@ -12,7 +12,7 @@ pub struct ActionRegistry {
 impl ActionRegistry {
     /// PolicyConfig로부터 ActionRegistry를 구성한다.
     ///
-    /// - alpha == 0.0 → Lossless, alpha > 0.0 → Lossy
+    /// - lossy == false → Lossless, lossy == true → Lossy
     /// - exclusion_groups의 문자열을 ActionId로 변환 (알 수 없는 이름은 무시)
     pub fn from_config(config: &PolicyConfig) -> Self {
         let mut actions: HashMap<ActionId, ActionMeta> = HashMap::new();
@@ -21,15 +21,14 @@ impl ActionRegistry {
             let Some(id) = ActionId::from_str(name) else {
                 continue;
             };
-            let kind = if action_cfg.alpha == 0.0 {
-                ActionKind::Lossless
-            } else {
+            let kind = if action_cfg.lossy {
                 ActionKind::Lossy
+            } else {
+                ActionKind::Lossless
             };
             let meta = ActionMeta {
                 id,
                 kind,
-                alpha: action_cfg.alpha,
                 reversible: action_cfg.reversible,
                 param_range: default_param_range(id),
                 exclusion_group: None, // 이후 exclusion_groups 처리에서 채움
@@ -142,15 +141,15 @@ mod tests {
 
     /// 테스트용 기본 PolicyConfig 생성
     fn make_policy_config(
-        actions: &[(&str, f32, bool)],
+        actions: &[(&str, bool, bool)],
         exclusion_groups: &[(&str, &[&str])],
     ) -> PolicyConfig {
         let mut action_map = HashMap::new();
-        for (name, alpha, reversible) in actions {
+        for (name, lossy, reversible) in actions {
             action_map.insert(
                 name.to_string(),
                 ActionConfig {
-                    alpha: *alpha,
+                    lossy: *lossy,
                     reversible: *reversible,
                 },
             );
@@ -174,9 +173,9 @@ mod tests {
     fn test_from_config_basic() {
         let config = make_policy_config(
             &[
-                ("switch_hw", 0.0, true),
-                ("kv_evict_sliding", 0.12, false),
-                ("throttle", 0.0, true),
+                ("switch_hw", false, true),
+                ("kv_evict_sliding", true, false),
+                ("throttle", false, true),
             ],
             &[],
         );
@@ -189,17 +188,17 @@ mod tests {
         assert!(registry.get(&ActionId::LayerSkip).is_none());
     }
 
-    /// alpha 기반 Lossy/Lossless 분류가 올바르게 동작해야 한다.
+    /// lossy 플래그 기반 Lossy/Lossless 분류가 올바르게 동작해야 한다.
     #[test]
     fn test_lossy_lossless_classification() {
         let config = make_policy_config(
             &[
-                ("switch_hw", 0.0, true),          // Lossless
-                ("throttle", 0.0, true),           // Lossless
-                ("kv_evict_sliding", 0.12, false), // Lossy
-                ("kv_evict_h2o", 0.12, false),     // Lossy
-                ("kv_quant_dynamic", 0.08, false), // Lossy
-                ("layer_skip", 0.25, true),        // Lossy
+                ("switch_hw", false, true),        // Lossless
+                ("throttle", false, true),         // Lossless
+                ("kv_evict_sliding", true, false), // Lossy
+                ("kv_evict_h2o", true, false),     // Lossy
+                ("kv_quant_dynamic", true, false), // Lossy
+                ("layer_skip", true, true),        // Lossy
             ],
             &[],
         );
@@ -235,9 +234,9 @@ mod tests {
     fn test_exclusion_groups() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("kv_evict_h2o", 0.12, false),
-                ("switch_hw", 0.0, true),
+                ("kv_evict_sliding", true, false),
+                ("kv_evict_h2o", true, false),
+                ("switch_hw", false, true),
             ],
             &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
         );
@@ -260,9 +259,9 @@ mod tests {
     fn test_is_excluded() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("kv_evict_h2o", 0.12, false),
-                ("switch_hw", 0.0, true),
+                ("kv_evict_sliding", true, false),
+                ("kv_evict_h2o", true, false),
+                ("switch_hw", false, true),
             ],
             &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
         );
@@ -282,8 +281,8 @@ mod tests {
     fn test_unknown_action_ignored() {
         let config = make_policy_config(
             &[
-                ("switch_hw", 0.0, true),
-                ("unknown_action_xyz", 0.5, false), // 알 수 없는 액션
+                ("switch_hw", false, true),
+                ("unknown_action_xyz", true, false), // 알 수 없는 액션
             ],
             &[("bad_group", &["unknown_action_xyz", "also_unknown"])],
         );
@@ -299,24 +298,24 @@ mod tests {
         );
     }
 
-    /// 등록된 액션의 alpha, reversible 값이 설정과 일치해야 한다.
+    /// 등록된 액션의 kind, reversible 값이 설정과 일치해야 한다.
     #[test]
     fn test_action_meta_fields() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("layer_skip", 0.25, true),
+                ("kv_evict_sliding", true, false),
+                ("layer_skip", true, true),
             ],
             &[],
         );
         let registry = ActionRegistry::from_config(&config);
 
         let evict_meta = registry.get(&ActionId::KvEvictSliding).unwrap();
-        assert!((evict_meta.alpha - 0.12).abs() < f32::EPSILON);
+        assert_eq!(evict_meta.kind, ActionKind::Lossy);
         assert!(!evict_meta.reversible);
 
         let skip_meta = registry.get(&ActionId::LayerSkip).unwrap();
-        assert!((skip_meta.alpha - 0.25).abs() < f32::EPSILON);
+        assert_eq!(skip_meta.kind, ActionKind::Lossy);
         assert!(skip_meta.reversible);
     }
 
@@ -325,9 +324,9 @@ mod tests {
     fn test_default_param_ranges() {
         let config = make_policy_config(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("kv_quant_dynamic", 0.08, false),
-                ("switch_hw", 0.0, true), // param_range 없음
+                ("kv_evict_sliding", true, false),
+                ("kv_quant_dynamic", true, false),
+                ("switch_hw", false, true), // param_range 없음
             ],
             &[],
         );

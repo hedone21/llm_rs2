@@ -179,7 +179,6 @@ pub mod feature {
 pub struct ActionMeta {
     pub id: ActionId,
     pub kind: ActionKind,
-    pub alpha: f32, // QCF→cost 변환 계수
     pub reversible: bool,
     pub param_range: Option<ParamRange>,
     pub exclusion_group: Option<String>,

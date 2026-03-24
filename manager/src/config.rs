@@ -273,20 +273,11 @@ impl Default for ReliefModelConfig {
 }
 
 /// 액션별 메타데이터 설정
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct ActionConfig {
-    pub alpha: f32,
+    pub lossy: bool,
     pub reversible: bool,
-}
-
-impl Default for ActionConfig {
-    fn default() -> Self {
-        Self {
-            alpha: 0.0,
-            reversible: false,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -393,11 +384,11 @@ critical_threshold = 0.7
 latency_budget = 0.5
 
 [policy.actions.switch_hw]
-alpha = 0.0
+lossy = false
 reversible = true
 
 [policy.actions.kv_evict_sliding]
-alpha = 0.12
+lossy = true
 reversible = false
 
 [policy.exclusion_groups]
@@ -408,8 +399,10 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o"]
         assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
         assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
         let switch = policy.actions.get("switch_hw").unwrap();
-        assert!((switch.alpha).abs() < f32::EPSILON);
+        assert!(!switch.lossy);
         assert!(switch.reversible);
+        let kv_evict = policy.actions.get("kv_evict_sliding").unwrap();
+        assert!(kv_evict.lossy);
         let eviction = policy.exclusion_groups.get("eviction").unwrap();
         assert_eq!(eviction.len(), 2);
     }

@@ -30,35 +30,35 @@ prior_weight = 5
 storage_dir = "~/.llm_rs/models"
 
 [actions.switch_hw]
-alpha = 0.0
+lossy = false
 reversible = true
 
 [actions.throttle]
-alpha = 0.0
+lossy = false
 reversible = true
 
 [actions.kv_offload_disk]
-alpha = 0.0
+lossy = false
 reversible = true
 
 [actions.kv_evict_sliding]
-alpha = 0.12
+lossy = true
 reversible = false
 
 [actions.kv_evict_h2o]
-alpha = 0.15
+lossy = true
 reversible = false
 
 [actions.kv_quant_dynamic]
-alpha = 0.08
+lossy = true
 reversible = true
 
 [actions.layer_skip]
-alpha = 0.25
+lossy = true
 reversible = true
 
 [actions.snapkv_compress]
-alpha = 0.10
+lossy = true
 reversible = false
 
 [exclusion_groups]

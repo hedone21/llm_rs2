@@ -122,7 +122,7 @@ impl ActionSelector {
 
     /// 액션의 cost 계산.
     ///
-    /// cost = alpha * qcf_value (lossy)
+    /// cost = qcf_value (lossy)
     /// Lossless이면 0.
     /// Lossy이지만 qcf_values에 없으면 INFINITY (사실상 선택 안됨).
     fn compute_cost(
@@ -136,9 +136,8 @@ impl ActionSelector {
         if meta.kind == ActionKind::Lossless {
             return 0.0;
         }
-        // Lossy: alpha * qcf
-        let qcf = qcf_values.get(&action).copied().unwrap_or(f32::INFINITY);
-        meta.alpha * qcf
+        // QCF/OPR already normalizes quality cost across domains; no alpha needed
+        qcf_values.get(&action).copied().unwrap_or(f32::INFINITY)
     }
 
     /// Phase 3: Exhaustive 조합 탐색으로 최적 액션 조합을 반환한다.
@@ -319,15 +318,15 @@ mod tests {
     // -------------------------------------------------------------------------
 
     fn make_policy_config(
-        actions: &[(&str, f32, bool)],
+        actions: &[(&str, bool, bool)],
         exclusion_groups: &[(&str, &[&str])],
     ) -> PolicyConfig {
         let mut action_map = HashMap::new();
-        for (name, alpha, reversible) in actions {
+        for (name, lossy, reversible) in actions {
             action_map.insert(
                 name.to_string(),
                 ActionConfig {
-                    alpha: *alpha,
+                    lossy: *lossy,
                     reversible: *reversible,
                 },
             );
@@ -347,7 +346,7 @@ mod tests {
     }
 
     fn make_registry(
-        actions: &[(&str, f32, bool)],
+        actions: &[(&str, bool, bool)],
         exclusion_groups: &[(&str, &[&str])],
     ) -> ActionRegistry {
         let config = make_policy_config(actions, exclusion_groups);
@@ -389,7 +388,10 @@ mod tests {
         // switch_hw: lossless, compute+thermal 해소
         // kv_evict_sliding: lossy, memory 해소
         let registry = make_registry(
-            &[("switch_hw", 0.0, true), ("kv_evict_sliding", 0.12, false)],
+            &[
+                ("switch_hw", false, true),
+                ("kv_evict_sliding", true, false),
+            ],
             &[],
         );
 
@@ -432,12 +434,12 @@ mod tests {
     #[test]
     fn test_critical_mode_minimum_cost() {
         // 두 evict 액션 모두 memory pressure 해소 가능하지만 different cost
-        // kv_evict_sliding: alpha=0.12, qcf=0.5 → cost=0.06
-        // kv_evict_h2o: alpha=0.12, qcf=2.0 → cost=0.24
+        // kv_evict_sliding: qcf=0.5 → cost=0.5
+        // kv_evict_h2o: qcf=2.0 → cost=2.0
         let registry = make_registry(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("kv_evict_h2o", 0.12, false),
+                ("kv_evict_sliding", true, false),
+                ("kv_evict_h2o", true, false),
             ],
             &[], // exclusion group 없음 (이 테스트에서는 동시 선택 가능하게)
         );
@@ -483,9 +485,9 @@ mod tests {
     fn test_cross_domain_single_action() {
         let registry = make_registry(
             &[
-                ("switch_hw", 0.0, true),
-                ("throttle", 0.0, true),
-                ("kv_evict_sliding", 0.12, false),
+                ("switch_hw", false, true),
+                ("throttle", false, true),
+                ("kv_evict_sliding", true, false),
             ],
             &[],
         );
@@ -533,8 +535,8 @@ mod tests {
     fn test_exclusion_group() {
         let registry = make_registry(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("kv_evict_h2o", 0.12, false),
+                ("kv_evict_sliding", true, false),
+                ("kv_evict_h2o", true, false),
             ],
             &[("eviction", &["kv_evict_sliding", "kv_evict_h2o"])],
         );
@@ -581,7 +583,7 @@ mod tests {
         // throttle: latency -0.4, offload: latency -0.4 → 합산 -0.8
         // latency_budget = 0.6 → -0.8 < -0.6 이므로 조합 불가
         let registry = make_registry(
-            &[("throttle", 0.0, true), ("kv_offload_disk", 0.0, true)],
+            &[("throttle", false, true), ("kv_offload_disk", false, true)],
             &[],
         );
 
@@ -623,7 +625,10 @@ mod tests {
         // switch_hw: compute 0.3 (pressure 0.8 해소 불가)
         // throttle: compute 0.2
         // 둘 합쳐도 0.5 < 0.8
-        let registry = make_registry(&[("switch_hw", 0.0, true), ("throttle", 0.0, true)], &[]);
+        let registry = make_registry(
+            &[("switch_hw", false, true), ("throttle", false, true)],
+            &[],
+        );
 
         let mut predictions = HashMap::new();
         predictions.insert(ActionId::SwitchHw, rv(0.3, 0.0, 0.0, 0.0));
@@ -663,8 +668,8 @@ mod tests {
     fn test_empty_candidates() {
         let registry = make_registry(
             &[
-                ("kv_evict_sliding", 0.12, false),
-                ("layer_skip", 0.25, true),
+                ("kv_evict_sliding", true, false),
+                ("layer_skip", true, true),
             ],
             &[],
         );
@@ -701,7 +706,7 @@ mod tests {
     fn test_parametrize_proportional() {
         // kv_evict_sliding: keep_ratio range [0.3, 0.9]
         // memory pressure = 0.5 → value = 0.9 - 0.5*(0.9-0.3) = 0.9 - 0.3 = 0.6
-        let registry = make_registry(&[("kv_evict_sliding", 0.12, false)], &[]);
+        let registry = make_registry(&[("kv_evict_sliding", true, false)], &[]);
 
         let mut predictions = HashMap::new();
         predictions.insert(ActionId::KvEvictSliding, rv(0.0, 0.9, 0.0, 0.0));
@@ -745,7 +750,10 @@ mod tests {
     #[test]
     fn test_no_action_when_no_pressure() {
         let registry = make_registry(
-            &[("switch_hw", 0.0, true), ("kv_evict_sliding", 0.12, false)],
+            &[
+                ("switch_hw", false, true),
+                ("kv_evict_sliding", true, false),
+            ],
             &[],
         );
 
@@ -776,7 +784,10 @@ mod tests {
     /// active 액션은 후보에서 제외된다.
     #[test]
     fn test_active_action_excluded() {
-        let registry = make_registry(&[("switch_hw", 0.0, true), ("throttle", 0.0, true)], &[]);
+        let registry = make_registry(
+            &[("switch_hw", false, true), ("throttle", false, true)],
+            &[],
+        );
 
         let mut predictions = HashMap::new();
         predictions.insert(ActionId::SwitchHw, rv(0.8, 0.0, 0.5, 0.0));
@@ -817,9 +828,9 @@ mod tests {
     fn test_available_actions_filters_candidates() {
         let registry = make_registry(
             &[
-                ("switch_hw", 0.0, true),
-                ("throttle", 0.0, true),
-                ("kv_evict_h2o", 0.12, false),
+                ("switch_hw", false, true),
+                ("throttle", false, true),
+                ("kv_evict_h2o", true, false),
             ],
             &[],
         );
@@ -868,7 +879,10 @@ mod tests {
     /// available_actions가 비어있으면 모든 액션이 후보가 된다 (backward compat).
     #[test]
     fn test_empty_available_actions_no_filtering() {
-        let registry = make_registry(&[("switch_hw", 0.0, true), ("throttle", 0.0, true)], &[]);
+        let registry = make_registry(
+            &[("switch_hw", false, true), ("throttle", false, true)],
+            &[],
+        );
 
         let mut predictions = HashMap::new();
         predictions.insert(ActionId::SwitchHw, rv(0.8, 0.0, 0.5, 0.0));
