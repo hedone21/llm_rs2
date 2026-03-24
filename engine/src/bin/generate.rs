@@ -1227,7 +1227,7 @@ fn main() -> anyhow::Result<()> {
     {
         println!("[Profile] Event: DecodingStart");
         // Pre-allocate workspace for generation
-        let q_dim = hidden_size;
+        let q_dim = model.config.num_attention_heads * model.config.head_dim;
         let k_dim = model.config.num_key_value_heads * model.config.head_dim;
         let v_dim = k_dim;
         let ffn_hidden = model.config.intermediate_size;
@@ -3050,7 +3050,7 @@ fn run_ppl(
         Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
     let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
     let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
-    let q_dim = hidden_size;
+    let q_dim = model.config.num_attention_heads * model.config.head_dim;
     let k_dim = model.config.num_key_value_heads * model.config.head_dim;
     let v_dim = k_dim;
     let ffn_hidden = model.config.intermediate_size;
