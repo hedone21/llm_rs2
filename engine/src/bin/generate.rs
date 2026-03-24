@@ -1274,8 +1274,12 @@ fn main() -> anyhow::Result<()> {
         stdout.flush().ok();
 
         // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
+        // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
         #[cfg(feature = "opencl")]
-        let mut gpu_plan = if backend.name() == "OpenCL" && !args.profile {
+        let mut gpu_plan = if backend.name() == "OpenCL"
+            && !args.profile
+            && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+        {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
         } else {
             None
