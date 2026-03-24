@@ -517,7 +517,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let kv_type = match args.kv_type.as_str() {
+    let mut kv_type = match args.kv_type.as_str() {
         "f32" => DType::F32,
         "f16" => DType::F16,
         "q4" => DType::Q4_0,
@@ -526,6 +526,24 @@ fn main() -> anyhow::Result<()> {
             args.kv_type
         ),
     };
+
+    // On discrete GPUs without flash attention for this head_dim, F16 KV + GPU attention
+    // produces incorrect results. Auto-promote to F32 KV for correctness.
+    // Flash attention is compiled with DK=64; models with head_dim != 64 can't use it.
+    if args.backend == "opencl" && kv_type == DType::F16 && head_dim != 64 {
+        if let Some(ocl_backend) = backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+        {
+            if !ocl_backend.use_zero_copy {
+                eprintln!(
+                    "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} != flash_attn DK=64)",
+                    head_dim
+                );
+                kv_type = DType::F32;
+            }
+        }
+    }
 
     // Determine initial KV cache capacity (dynamic grow-on-demand)
     let initial_kv_capacity = if args.eval_ll || args.ppl.is_some() {
