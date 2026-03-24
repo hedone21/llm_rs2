@@ -13,6 +13,7 @@ kernel void kernel_rms_norm_opt(
     global float * weight,
     int dim,
     float eps,
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
     local float * scratch
 ) {
     int row = get_group_id(0);
@@ -43,7 +44,8 @@ kernel void kernel_rms_norm_opt(
     float scale = 1.0f / rms;
 
     for (int i = lid; i < dim; i += local_size) {
-        row_ptr[i] = row_ptr[i] * scale * weight[i];
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        row_ptr[i] = row_ptr[i] * scale * w;
     }
 }
 
@@ -344,6 +346,95 @@ kernel void kernel_attn_gen(
 }
 
 //------------------------------------------------------------------------------
+// Out-of-place RMSNorm: reads x, writes normalized result to out.
+//------------------------------------------------------------------------------
+kernel void kernel_rms_norm_oop(
+    global float * x,
+    global float * out,
+    global float * weight,
+    int dim,
+    float eps,
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float * x_row = x + row * dim;
+    global float * out_row = out + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim; i += local_size) {
+        float val = x_row[i];
+        sum_sq += val * val;
+    }
+
+    scratch[lid] = sum_sq;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    sum_sq = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+
+    for (int i = lid; i < dim; i += local_size) {
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        out_row[i] = x_row[i] * scale * w;
+    }
+}
+
+//------------------------------------------------------------------------------
+// Fused add + out-of-place RMSNorm: x += residual; out = norm(x) * weight
+//------------------------------------------------------------------------------
+kernel void kernel_add_rms_norm_oop(
+    global float * x,
+    global float * residual,
+    global float * out,
+    global float * weight,
+    int dim,
+    float eps,
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float * x_row = x + row * dim;
+    global float * res_row = residual + row * dim;
+    global float * out_row = out + row * dim;
+
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim; i += local_size) {
+        float val = x_row[i] + res_row[i];
+        x_row[i] = val;
+        sum_sq += val * val;
+    }
+
+    scratch[lid] = sum_sq;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    sum_sq = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+
+    for (int i = lid; i < dim; i += local_size) {
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        out_row[i] = x_row[i] * scale * w;
+    }
+}
+
+//------------------------------------------------------------------------------
 // F16 KV Cache Support Kernels
 //------------------------------------------------------------------------------
 
@@ -452,4 +543,27 @@ kernel void kernel_attn_gen_half(
         }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
+}
+
+//------------------------------------------------------------------------------
+// Fused F32->F16 Cast + HeadMajor Scatter for KV Cache Update
+//------------------------------------------------------------------------------
+kernel void kernel_kv_scatter_f32_to_f16(
+    global const float * k_src,
+    global const float * v_src,
+    global half * k_dst,
+    global half * v_dst,
+    int head_dim,
+    int capacity,
+    int write_pos
+) {
+    int gid = get_global_id(0);
+    int h = gid / head_dim;
+    int d = gid % head_dim;
+
+    int src_idx = h * head_dim + d;
+    int dst_idx = h * capacity * head_dim + write_pos * head_dim + d;
+
+    k_dst[dst_idx] = (half)k_src[src_idx];
+    v_dst[dst_idx] = (half)v_src[src_idx];
 }

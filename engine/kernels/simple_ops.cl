@@ -34,8 +34,8 @@ kernel void kernel_rms_norm_opt(
     global float * weight,
     int dim,
     float eps,
-    local float * scratch,  // local memory for reduction
-    int add_unit            // Gemma3 style: weight = 1 + weight when nonzero
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
+    local float * scratch   // local memory for reduction
 ) {
     int row = get_group_id(0);
     int lid = get_local_id(0);
@@ -95,8 +95,8 @@ kernel void kernel_add_rms_norm_oop(
     global float * weight,
     int dim,
     float eps,
-    local float * scratch,
-    int add_unit            // Gemma3 style: weight = 1 + weight when nonzero
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
+    local float * scratch
 ) {
     int row = get_group_id(0);
     int lid = get_local_id(0);
@@ -153,8 +153,8 @@ kernel void kernel_rms_norm_oop(
     global float * weight,
     int dim,
     float eps,
-    local float * scratch,
-    int add_unit            // Gemma3 style: weight = 1 + weight when nonzero
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
+    local float * scratch
 ) {
     int row = get_group_id(0);
     int lid = get_local_id(0);

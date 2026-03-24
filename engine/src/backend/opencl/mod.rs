@@ -1346,8 +1346,8 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(w_buf))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&epsilon))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
@@ -1397,8 +1397,8 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(w_buf))?;
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&epsilon))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
@@ -1452,8 +1452,8 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(w_buf))?;
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(dim as i32)))?;
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&epsilon))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
-            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
 
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
