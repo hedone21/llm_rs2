@@ -20,10 +20,12 @@ impl TransformerLayer {
         dim: usize,
         _skip_attn: bool,
         _skip_mlp: bool,
+        rms_norm_add_unit: bool,
+        use_gelu_tanh: bool,
     ) -> Result<()> {
         // Standard forward path (Prefill or dynamic generation)
         let residual = backend.copy_from(x)?;
-        backend.rms_norm(x, &self.attention_norm, rms_norm_eps, false)?;
+        backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
 
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
@@ -46,6 +48,24 @@ impl TransformerLayer {
 
         let n_heads_q = q_dim / head_dim;
         let n_heads_kv = k_dim / head_dim;
+
+        // Gemma3 QK-Norm: per-head RMSNorm on Q and K before RoPE
+        if let Some(ref q_norm_w) = self.q_norm {
+            // Q: [batch, seq_len, n_heads_q * head_dim] → reshape to [batch*seq_len*n_heads_q, head_dim]
+            let total_q_heads = batch_size * seq_len * n_heads_q;
+            let saved_shape = q.shape().clone();
+            q.reshape(Shape::new(vec![total_q_heads, head_dim]));
+            backend.rms_norm(&mut q, q_norm_w, rms_norm_eps, true)?;
+            q.reshape(saved_shape);
+        }
+        if let Some(ref k_norm_w) = self.k_norm {
+            // K: [batch, seq_len, n_heads_kv * head_dim] → reshape to [batch*seq_len*n_heads_kv, head_dim]
+            let total_k_heads = batch_size * seq_len * n_heads_kv;
+            let saved_shape = k.shape().clone();
+            k.reshape(Shape::new(vec![total_k_heads, head_dim]));
+            backend.rms_norm(&mut k, k_norm_w, rms_norm_eps, true)?;
+            k.reshape(saved_shape);
+        }
 
         let mut q_rope = Tensor::new(
             Shape::new(vec![batch_size, seq_len, n_heads_q, head_dim]),
@@ -364,11 +384,21 @@ impl TransformerLayer {
             self.alloc_temp(vec![batch_size, seq_len, dim], memory, backend)?;
         backend.matmul_transposed(&out_attn, &self.wo, &mut attn_out_projected)?;
 
+        // Gemma3: apply post-attention norm (ffn_norm) to O-proj output before residual add.
+        // Llama/Qwen2: no post-attention norm here.
+        if rms_norm_add_unit {
+            backend.rms_norm(&mut attn_out_projected, &self.ffn_norm, rms_norm_eps, true)?;
+        }
         backend.add_assign(&mut attn_out_projected, &residual)?;
         *x = attn_out_projected;
 
         let residual_ffn = backend.copy_from(x)?;
-        backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
+        // Gemma3: use dedicated pre_ffn_norm. Llama/Qwen2: use ffn_norm as pre-FFN norm.
+        if let Some(ref pfn) = self.pre_ffn_norm {
+            backend.rms_norm(x, pfn, rms_norm_eps, true)?;
+        } else {
+            backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
+        }
 
         let ffn_hidden = self.w_up.shape().dims()[0];
         let mut gate = self.alloc_temp(vec![batch_size, seq_len, ffn_hidden], memory, backend)?;
@@ -377,11 +407,19 @@ impl TransformerLayer {
         backend.matmul_transposed(x, &self.w_gate, &mut gate)?;
         backend.matmul_transposed(x, &self.w_up, &mut up)?;
 
-        backend.silu_mul(&mut gate, &up)?;
+        if use_gelu_tanh {
+            backend.gelu_tanh_mul(&mut gate, &up)?;
+        } else {
+            backend.silu_mul(&mut gate, &up)?;
+        }
 
         let mut down = self.alloc_temp(vec![batch_size, seq_len, dim], memory, backend)?;
         backend.matmul_transposed(&gate, &self.w_down, &mut down)?;
 
+        // Gemma3: apply post-FFN norm to FFN output before residual add.
+        if let Some(ref pfn) = self.post_ffn_norm {
+            backend.rms_norm(&mut down, pfn, rms_norm_eps, true)?;
+        }
         backend.add_assign(&mut down, &residual_ffn)?;
         *x = down;
 

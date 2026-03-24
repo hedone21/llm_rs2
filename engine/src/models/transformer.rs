@@ -18,11 +18,22 @@ use crate::core::tensor::Tensor;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::memory::galloc::Galloc;
-use crate::models::config::ModelConfig;
+use crate::models::config::{ModelArch, ModelConfig};
 use crate::models::mappers::create_mapper;
 
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
+
+/// Returns true if this layer uses local (sliding window) attention.
+/// Gemma3 pattern: every `pattern`-th layer (1-indexed) uses global attention;
+/// all other layers use local attention.
+/// Example: pattern=6 → layers 5,11,17,... (0-indexed) are global.
+fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
+    match pattern {
+        Some(p) if p > 0 => !(layer_idx + 1).is_multiple_of(p),
+        _ => false,
+    }
+}
 
 /// Release mmap pages after tensor data has been converted.
 /// Calls MADV_DONTNEED on the page-aligned region so the kernel can reclaim
@@ -660,8 +671,28 @@ impl TransformerModel {
         // Embedding lookup: CPU gather + upload to backend buffer
         self.gather_embed(input_tokens, &mut x, backend)?;
 
+        // Gemma3: scale embeddings by sqrt(hidden_size)
+        if let Some(scale) = self.config.embed_scale {
+            backend.scale(&mut x, scale)?;
+        }
+
+        let is_gemma3 = self.config.arch == ModelArch::Gemma3;
+
         // Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
+            let rope_theta = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
+                self.config
+                    .rope_local_theta
+                    .unwrap_or(self.config.rope_theta) as f32
+            } else {
+                self.config.rope_theta as f32
+            };
+            let is_local = if is_gemma3 {
+                Some(is_local_layer(i, self.config.sliding_window_pattern))
+            } else {
+                None
+            };
+
             layer.forward(LayerForwardArgs {
                 x: &mut x,
                 kv_cache: &mut kv_caches[i],
@@ -669,13 +700,13 @@ impl TransformerModel {
                 backend,
                 memory,
                 rms_norm_eps: self.config.rms_norm_eps as f32,
-                rope_theta: self.config.rope_theta as f32,
+                rope_theta,
                 workspace: None,
                 use_gpu_attn: true,
-                rms_norm_add_unit: false,
-                use_gelu_tanh: false,
-                is_local_attn: None,
-                local_attn_window: None,
+                rms_norm_add_unit: is_gemma3,
+                use_gelu_tanh: is_gemma3,
+                is_local_attn: is_local,
+                local_attn_window: self.config.sliding_window,
                 need_scores: false,
                 head_dim: self.config.head_dim,
                 profiler: None,
@@ -686,7 +717,12 @@ impl TransformerModel {
         }
 
         // Final Norm
-        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32, false)?;
+        backend.rms_norm(
+            &mut x,
+            &self.norm,
+            self.config.rms_norm_eps as f32,
+            is_gemma3,
+        )?;
 
         // Head
         let vocab_size = self.config.vocab_size;
@@ -752,6 +788,13 @@ impl TransformerModel {
         // Embedding lookup: CPU gather + upload to backend buffer
         self.gather_embed(input_tokens, &mut x, backend)?;
 
+        // Gemma3: scale embeddings by sqrt(hidden_size)
+        if let Some(scale) = self.config.embed_scale {
+            backend.scale(&mut x, scale)?;
+        }
+
+        let is_gemma3 = self.config.arch == ModelArch::Gemma3;
+
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
             let need_scores = score_accumulator
@@ -760,6 +803,19 @@ impl TransformerModel {
 
             let (s_attn, s_mlp) =
                 skip_config.map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
+
+            let rope_theta = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
+                self.config
+                    .rope_local_theta
+                    .unwrap_or(self.config.rope_theta) as f32
+            } else {
+                self.config.rope_theta as f32
+            };
+            let is_local = if is_gemma3 {
+                Some(is_local_layer(i, self.config.sliding_window_pattern))
+            } else {
+                None
+            };
 
             // Snapshot hidden state before layer for importance collection
             if let Some(ref mut coll) = importance_collector {
@@ -774,7 +830,7 @@ impl TransformerModel {
                 backend,
                 memory,
                 rms_norm_eps: self.config.rms_norm_eps as f32,
-                rope_theta: self.config.rope_theta as f32,
+                rope_theta,
                 workspace: workspace.as_deref_mut(),
                 use_gpu_attn,
                 need_scores,
@@ -783,10 +839,10 @@ impl TransformerModel {
                 layer_id: i,
                 skip_attn: s_attn,
                 skip_mlp: s_mlp,
-                rms_norm_add_unit: false,
-                use_gelu_tanh: false,
-                is_local_attn: None,
-                local_attn_window: None,
+                rms_norm_add_unit: is_gemma3,
+                use_gelu_tanh: is_gemma3,
+                is_local_attn: is_local,
+                local_attn_window: self.config.sliding_window,
             })?;
 
             // Record importance after layer forward
@@ -829,7 +885,12 @@ impl TransformerModel {
         }
 
         // 3. Final Norm
-        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32, false)?;
+        backend.rms_norm(
+            &mut x,
+            &self.norm,
+            self.config.rms_norm_eps as f32,
+            is_gemma3,
+        )?;
 
         // 4. Head
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
@@ -1040,6 +1101,12 @@ impl TransformerModel {
         // Embedding lookup: CPU gather + upload to backend buffer
         self.gather_embed(input_tokens, &mut x, backend)?;
 
+        // Gemma3: scale embeddings by sqrt(hidden_size)
+        if let Some(scale) = self.config.embed_scale {
+            backend.scale(&mut x, scale)?;
+        }
+
+        let is_gemma3 = self.config.arch == ModelArch::Gemma3;
         let num_layers = self.layers.len();
         let depth = prefetch.depth();
         let caches_ptr = kv_caches.as_mut_ptr();
@@ -1112,6 +1179,19 @@ impl TransformerModel {
             // Forward current layer
             let current = unsafe { &mut *caches_ptr.add(i) };
             let fwd_t0 = std::time::Instant::now();
+            let rope_theta_i = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern)
+            {
+                self.config
+                    .rope_local_theta
+                    .unwrap_or(self.config.rope_theta) as f32
+            } else {
+                self.config.rope_theta as f32
+            };
+            let is_local_i = if is_gemma3 {
+                Some(is_local_layer(i, self.config.sliding_window_pattern))
+            } else {
+                None
+            };
             self.layers[i].forward(LayerForwardArgs {
                 x: &mut x,
                 kv_cache: current,
@@ -1119,7 +1199,7 @@ impl TransformerModel {
                 backend,
                 memory,
                 rms_norm_eps: self.config.rms_norm_eps as f32,
-                rope_theta: self.config.rope_theta as f32,
+                rope_theta: rope_theta_i,
                 workspace: workspace.as_deref_mut(),
                 use_gpu_attn,
                 need_scores: false,
@@ -1128,10 +1208,10 @@ impl TransformerModel {
                 layer_id: i,
                 skip_attn: false,
                 skip_mlp: false,
-                rms_norm_add_unit: false,
-                use_gelu_tanh: false,
-                is_local_attn: None,
-                local_attn_window: None,
+                rms_norm_add_unit: is_gemma3,
+                use_gelu_tanh: is_gemma3,
+                is_local_attn: is_local_i,
+                local_attn_window: self.config.sliding_window,
             })?;
             let fwd_dur = fwd_t0.elapsed();
             prefetch.record_forward(fwd_dur);
@@ -1163,7 +1243,12 @@ impl TransformerModel {
         prefetch.adjust();
 
         // 4. Final Norm + Head (identical to forward_into)
-        backend.rms_norm(&mut x, &self.norm, self.config.rms_norm_eps as f32, false)?;
+        backend.rms_norm(
+            &mut x,
+            &self.norm,
+            self.config.rms_norm_eps as f32,
+            is_gemma3,
+        )?;
         backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
 
         Ok(())
@@ -1386,6 +1471,112 @@ mod tests {
         let result = unsafe { std::slice::from_raw_parts(dst.as_ptr() as *const f32, dim) };
         for v in result {
             assert_eq!(*v, 2.0, "row 2 mismatch");
+        }
+    }
+
+    #[test]
+    fn test_is_local_layer() {
+        // pattern=None → all global
+        assert!(!is_local_layer(0, None));
+        assert!(!is_local_layer(5, None));
+
+        // pattern=0 → all global (degenerate)
+        assert!(!is_local_layer(0, Some(0)));
+        assert!(!is_local_layer(3, Some(0)));
+
+        // Gemma3 1B: pattern=6 → layer indices 5,11,17,23 are global (1-indexed: 6,12,18,24)
+        // All other layers are local.
+        assert!(is_local_layer(0, Some(6))); // layer 1 → local
+        assert!(is_local_layer(1, Some(6))); // layer 2 → local
+        assert!(!is_local_layer(5, Some(6))); // layer 6 → global
+        assert!(is_local_layer(6, Some(6))); // layer 7 → local
+        assert!(!is_local_layer(11, Some(6))); // layer 12 → global
+        assert!(is_local_layer(10, Some(6))); // layer 11 → local
+    }
+
+    #[test]
+    fn test_embed_scale_applied() {
+        // Verify that embed_scale is applied after gather_embed.
+        // Build a Gemma3-like model config with embed_scale and run gather_embed + scale.
+        use crate::backend::cpu::CpuBackend;
+        let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+
+        let vocab = 4usize;
+        let dim = 2usize;
+        let scale = 2.0f32;
+
+        // embed table: row i = [1.0; dim]
+        let buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
+        {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, vocab * dim)
+            };
+            for v in slice.iter_mut() {
+                *v = 1.0;
+            }
+        }
+        let embed_tokens = Tensor::new(Shape::new(vec![vocab, dim]), buf, cpu_be.clone());
+
+        let norm_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        {
+            let s =
+                unsafe { std::slice::from_raw_parts_mut(norm_buf.as_mut_ptr() as *mut f32, dim) };
+            s.iter_mut().for_each(|v| *v = 1.0);
+        }
+        let norm = Tensor::new(Shape::new(vec![dim]), norm_buf, cpu_be.clone());
+
+        let config = ModelConfig {
+            vocab_size: vocab,
+            hidden_size: dim,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10000.0,
+            head_dim: dim,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 1,
+            arch: ModelArch::Gemma3,
+            rope_local_theta: Some(10000.0),
+            sliding_window: Some(512),
+            sliding_window_pattern: Some(6),
+            query_pre_attn_scalar: None,
+            embed_scale: Some(scale),
+        };
+
+        let lm_head = norm.clone();
+        let model = TransformerModel {
+            config,
+            layers: vec![],
+            embed_tokens,
+            norm,
+            lm_head,
+            cpu_backend: None,
+            preload_pool: std::sync::Mutex::new(None),
+        };
+
+        // Gather token 0 → should be [1.0, 1.0], then scale → [2.0, 2.0]
+        let idx_buf = mem.alloc(4, DType::F32).unwrap();
+        let idx_slice =
+            unsafe { std::slice::from_raw_parts_mut(idx_buf.as_mut_ptr() as *mut u32, 1) };
+        idx_slice[0] = 0;
+        let indices = Tensor::new(Shape::new(vec![1, 1]), idx_buf, cpu_be.clone());
+
+        let dst_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        let mut dst = Tensor::new(Shape::new(vec![1, 1, dim]), dst_buf, cpu_be.clone());
+
+        model.gather_embed(&indices, &mut dst, &cpu_be).unwrap();
+        cpu_be.scale(&mut dst, scale).unwrap();
+
+        let result = unsafe { std::slice::from_raw_parts(dst.as_ptr() as *const f32, dim) };
+        for &v in result {
+            assert!(
+                (v - scale).abs() < 1e-5,
+                "Expected {scale}, got {v} after embed_scale"
+            );
         }
     }
 

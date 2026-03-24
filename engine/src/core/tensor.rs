@@ -81,6 +81,19 @@ impl Tensor {
         Err(anyhow!("Use backend.matmul directly for now"))
     }
 
+    /// Reshape this tensor in-place, changing only the shape metadata.
+    /// The underlying buffer is unchanged; numel must remain the same.
+    pub fn reshape(&mut self, new_shape: Shape) {
+        debug_assert_eq!(
+            self.shape.numel(),
+            new_shape.numel(),
+            "reshape: numel mismatch ({} vs {})",
+            self.shape.numel(),
+            new_shape.numel()
+        );
+        self.shape = new_shape;
+    }
+
     pub fn to_device(&mut self, backend: Arc<dyn Backend>) -> Result<()> {
         // If current backend is same, no-op
         if self.backend.name() == backend.name() {
@@ -325,6 +338,25 @@ mod tests {
         fn cast(&self, _src: &Tensor, _dst: &mut Tensor) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn test_tensor_reshape() {
+        let shape = Shape::new(vec![2, 6]);
+        let buffer = Arc::new(DummyBuffer::new(48, DType::F32)); // 12 f32 = 48 bytes
+        let backend = Arc::new(DummyBackend);
+        let mut tensor = Tensor::new(shape, buffer, backend);
+
+        assert_eq!(tensor.shape().dims(), &[2, 6]);
+        assert_eq!(tensor.numel(), 12);
+
+        tensor.reshape(Shape::new(vec![3, 4]));
+        assert_eq!(tensor.shape().dims(), &[3, 4]);
+        assert_eq!(tensor.numel(), 12);
+
+        tensor.reshape(Shape::new(vec![12]));
+        assert_eq!(tensor.shape().dims(), &[12]);
+        assert_eq!(tensor.numel(), 12);
     }
 
     #[test]

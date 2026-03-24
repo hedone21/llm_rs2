@@ -51,6 +51,9 @@ impl TransformerLayer {
             };
         }
 
+        let rms_norm_add_unit = args.rms_norm_add_unit;
+        let use_gelu_tanh = args.use_gelu_tanh;
+
         // 1. Attention Norm — out-of-place: ws.residual = norm(x), x preserved for skip connection
         let t = prof_start!();
         backend.rms_norm_oop(
@@ -58,7 +61,7 @@ impl TransformerLayer {
             &mut ws.residual,
             &self.attention_norm,
             rms_norm_eps,
-            false,
+            rms_norm_add_unit,
         )?;
         prof_record!(t, rms_norm);
 
@@ -129,6 +132,24 @@ impl TransformerLayer {
         let k_dim = self.wk.shape().dims()[0];
         let n_heads_q = q_dim / head_dim;
         let n_heads_kv = k_dim / head_dim;
+
+        // Gemma3 QK-Norm: per-head RMSNorm on Q and K before RoPE
+        if let Some(ref q_norm_w) = self.q_norm {
+            // ws.q shape: [batch, 1, n_heads_q * head_dim] → reshape to [batch*n_heads_q, head_dim]
+            let total_q_heads = batch_size * n_heads_q;
+            let saved_shape = ws.q.shape().clone();
+            ws.q.reshape(Shape::new(vec![total_q_heads, head_dim]));
+            backend.rms_norm(&mut ws.q, q_norm_w, rms_norm_eps, true)?;
+            ws.q.reshape(saved_shape);
+        }
+        if let Some(ref k_norm_w) = self.k_norm {
+            // ws.k shape: [batch, 1, n_heads_kv * head_dim] → reshape to [batch*n_heads_kv, head_dim]
+            let total_k_heads = batch_size * n_heads_kv;
+            let saved_shape = ws.k.shape().clone();
+            ws.k.reshape(Shape::new(vec![total_k_heads, head_dim]));
+            backend.rms_norm(&mut ws.k, k_norm_w, rms_norm_eps, true)?;
+            ws.k.reshape(saved_shape);
+        }
 
         let mut q_rope = Tensor::new(
             Shape::new(vec![batch_size, 1, n_heads_q, head_dim]),
@@ -688,16 +709,30 @@ impl TransformerLayer {
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
         prof_record!(t, matmul_wo);
 
-        // 7+8. Fused: x += attn_out; ws.residual = norm(x) * ffn_norm
+        // 7+8. Post-attention residual + pre-FFN norm
         let t = prof_start!();
-        backend.add_rms_norm_oop(
-            x,
-            &ws.attn_out,
-            &mut ws.residual,
-            &self.ffn_norm,
-            rms_norm_eps,
-            false,
-        )?;
+        if rms_norm_add_unit {
+            // Gemma3: apply post-attention norm (ffn_norm) to attn_out before residual add,
+            // then apply pre_ffn_norm to get ws.residual for FFN input.
+            backend.rms_norm(&mut ws.attn_out, &self.ffn_norm, rms_norm_eps, true)?;
+            backend.add_assign(x, &ws.attn_out)?;
+            if let Some(ref pfn) = self.pre_ffn_norm {
+                backend.rms_norm_oop(x, &mut ws.residual, pfn, rms_norm_eps, true)?;
+            } else {
+                // Fallback: no pre_ffn_norm (should not happen for Gemma3)
+                backend.copy_into(x, &mut ws.residual)?;
+            }
+        } else {
+            // Llama/Qwen2: fused add + norm (ffn_norm as pre-FFN norm)
+            backend.add_rms_norm_oop(
+                x,
+                &ws.attn_out,
+                &mut ws.residual,
+                &self.ffn_norm,
+                rms_norm_eps,
+                false,
+            )?;
+        }
         prof_record!(t, rms_norm);
 
         // 9. FFN — fused gate+up dispatch for F16 CPU (1 dispatch instead of 2)
@@ -737,7 +772,11 @@ impl TransformerLayer {
         prof_record!(t, matmul_ffn);
 
         let t = prof_start!();
-        backend.silu_mul(&mut ws.gate, &ws.up)?;
+        if use_gelu_tanh {
+            backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
+        } else {
+            backend.silu_mul(&mut ws.gate, &ws.up)?;
+        }
         prof_record!(t, silu_mul);
 
         let t = prof_start!();
@@ -746,6 +785,10 @@ impl TransformerLayer {
 
         // 10. Residual 2 — accumulate FFN result into x (skip connection)
         let t = prof_start!();
+        // Gemma3: apply post-FFN norm to FFN output before residual add.
+        if let Some(ref pfn) = self.post_ffn_norm {
+            backend.rms_norm(&mut ws.down, pfn, rms_norm_eps, true)?;
+        }
         backend.add_assign(x, &ws.down)?;
         prof_record!(t, add_assign);
 

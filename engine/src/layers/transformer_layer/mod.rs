@@ -232,6 +232,8 @@ impl TransformerLayer {
             dim,
             skip_attn,
             skip_mlp,
+            args.rms_norm_add_unit,
+            args.use_gelu_tanh,
         )
     }
 
