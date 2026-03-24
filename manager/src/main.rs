@@ -242,14 +242,24 @@ fn create_emitter(args: &Args, shutdown: &Arc<AtomicBool>) -> anyhow::Result<Box
         }
         Ok(Box::new(emitter))
     } else if args.transport == "dbus" {
-        let emitter = llm_manager::emitter::dbus::DbusEmitter::new()?;
-        Ok(Box::new(emitter))
+        create_dbus_emitter()
     } else {
         anyhow::bail!(
             "Unknown transport: {}. Use 'dbus' or 'unix:<path>'",
             args.transport
         );
     }
+}
+
+#[cfg(feature = "dbus")]
+fn create_dbus_emitter() -> anyhow::Result<Box<dyn Emitter>> {
+    let emitter = llm_manager::emitter::dbus::DbusEmitter::new()?;
+    Ok(Box::new(emitter))
+}
+
+#[cfg(not(feature = "dbus"))]
+fn create_dbus_emitter() -> anyhow::Result<Box<dyn Emitter>> {
+    anyhow::bail!("Transport 'dbus' requires the 'dbus' feature (compiled without it)")
 }
 
 fn build_monitors(config: &Config) -> Vec<Box<dyn Monitor>> {

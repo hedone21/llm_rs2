@@ -1,3 +1,4 @@
+#[cfg(feature = "dbus")]
 pub mod dbus;
 pub mod unix_socket;
 
