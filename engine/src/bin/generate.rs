@@ -2566,14 +2566,32 @@ fn run_kivi_ppl(
     let ppl = (total_nll / nll_count as f64).exp();
     let tok_per_sec = nll_count as f64 / wall_time;
 
+    // Separate QCF (NMSE) and OPR metrics from flush proxies
     let qcf_total: f64 = qcf_metrics
         .iter()
+        .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["raw_value"].as_f64())
         .sum();
     let qcf_normalized_total: f64 = qcf_metrics
         .iter()
+        .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
+    let opr_values: Vec<f64> = qcf_metrics
+        .iter()
+        .filter(|m| m["action"].as_str() == Some("kivi_opr"))
+        .filter_map(|m| m["raw_value"].as_f64())
+        .collect();
+    let opr_quantization: Option<f64> = if opr_values.is_empty() {
+        None
+    } else {
+        Some(opr_values.iter().sum::<f64>() / opr_values.len() as f64)
+    };
+    let opr_quantization_events = if opr_values.is_empty() {
+        None
+    } else {
+        Some(opr_values.len())
+    };
 
     let output = serde_json::json!({
         "ppl": ppl,
@@ -2586,6 +2604,8 @@ fn run_kivi_ppl(
         "qcf_total": qcf_total,
         "qcf_attn_total": qcf_total,
         "qcf_attn_normalized_total": qcf_normalized_total,
+        "opr_quantization": opr_quantization,
+        "opr_quantization_events": opr_quantization_events,
         "final_cache_pos": kv_caches[0].current_pos(),
         "kivi_q2_tokens": kv_caches[0].q2_tokens,
         "kivi_res_pos": kv_caches[0].res_pos,
