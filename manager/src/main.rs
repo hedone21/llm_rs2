@@ -9,8 +9,7 @@ use llm_manager::monitor::energy::EnergyMonitor;
 use llm_manager::monitor::external::ExternalMonitor;
 use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
-use llm_manager::pipeline::PolicyPipeline;
-use llm_manager::policy::{MonitorSnapshot, PolicyEngine};
+use llm_manager::pipeline::{HierarchicalPolicy, PolicyStrategy};
 use llm_shared::{EngineMessage, SystemSignal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,15 +72,7 @@ struct Args {
     #[arg(long, default_value_t = 60)]
     client_timeout: u64,
 
-    /// PolicyEngine cooldown between directives (ms).
-    #[arg(long, default_value_t = 500)]
-    policy_cooldown_ms: u64,
-
-    /// Enable legacy passthrough mode (emit raw SystemSignals instead of directives).
-    #[arg(long, default_value_t = false)]
-    legacy_passthrough: bool,
-
-    /// Path to policy configuration TOML (for hierarchical policy pipeline mode).
+    /// Path to policy configuration TOML.
     /// When omitted, built-in defaults are used.
     #[arg(long)]
     policy_config: Option<std::path::PathBuf>,
@@ -134,17 +125,9 @@ fn main() -> anyhow::Result<()> {
 
     // ── Policy 초기화 ─────────────────────────────────────────────────────────
 
-    // Legacy PolicyEngine (snapshot 기반, 이전 방식)
-    let mut legacy_policy = PolicyEngine::new(args.policy_cooldown_ms);
-    let mut snapshot = MonitorSnapshot::default();
-    for signal in &initial_signals {
-        snapshot.update(signal);
-    }
-
-    // 새 계층형 Policy Pipeline (non-legacy 경로)
-    let mut pipeline: Option<PolicyPipeline> = if !args.legacy_passthrough {
-        let policy_cfg = load_policy_config(&args, &config);
-        let mut p = PolicyPipeline::new(&policy_cfg);
+    let policy_cfg = load_policy_config(&args, &config);
+    let mut policy: Box<dyn PolicyStrategy> = {
+        let mut p = HierarchicalPolicy::new(&policy_cfg);
         let storage_dir = if policy_cfg.relief_model.storage_dir.starts_with('~') {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
             policy_cfg.relief_model.storage_dir.replacen('~', &home, 1)
@@ -153,34 +136,24 @@ fn main() -> anyhow::Result<()> {
         };
         let model_path = format!("{}/default_relief.json", storage_dir);
         p.set_relief_model_path(model_path);
-        log::info!("PolicyPipeline initialized (hierarchical mode)");
-        Some(p)
-    } else {
-        log::info!("Legacy passthrough mode — PolicyPipeline disabled");
-        None
+        log::info!("HierarchicalPolicy initialized");
+        Box::new(p)
     };
 
-    // Emit initial state: pipeline mode uses Directive format, legacy uses raw signal
-    if args.legacy_passthrough {
-        transport.emitter().emit_initial(&initial_signals)?;
-    } else if let Some(ref mut p) = pipeline {
-        for signal in &initial_signals {
-            if let Some(directive) = p.process_signal(signal) {
-                log::info!(
-                    "Initial directive seq={}: {} commands",
-                    directive.seq_id,
-                    directive.commands.len()
-                );
-                transport.emitter().emit_directive(&directive)?;
-            }
+    // Emit initial state
+    for signal in &initial_signals {
+        if let Some(directive) = policy.process_signal(signal) {
+            log::info!(
+                "Initial directive seq={}: {} commands",
+                directive.seq_id,
+                directive.commands.len()
+            );
+            transport.emitter().emit_directive(&directive)?;
         }
     }
 
     // ── Main loop ─────────────────────────────────────────────────────────────
-    log::info!(
-        "Entering main loop (legacy_passthrough={})",
-        args.legacy_passthrough
-    );
+    log::info!("Entering main loop");
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             shutdown.store(true, Ordering::Relaxed);
@@ -191,9 +164,7 @@ fn main() -> anyhow::Result<()> {
         while let Some(msg) = transport.try_recv_engine_message() {
             match &msg {
                 EngineMessage::Heartbeat(status) => {
-                    if let Some(ref mut p) = pipeline {
-                        p.update_engine_state(&msg);
-                    }
+                    policy.update_engine_state(&msg);
                     log::debug!(
                         "Engine heartbeat: kv={:.2} device={}",
                         status.kv_cache_utilization,
@@ -217,36 +188,15 @@ fn main() -> anyhow::Result<()> {
             Ok(signal) => {
                 log::info!("Signal: {:?}", signal);
 
-                if args.legacy_passthrough {
-                    // Legacy mode: pass raw signals directly to emitter
-                    if let Err(e) = transport.emitter().emit(&signal) {
-                        log::error!("Emit failed: {}", e);
-                    }
-                } else if let Some(ref mut p) = pipeline {
-                    // New hierarchical pipeline mode
-                    if let Some(directive) = p.process_signal(&signal) {
-                        log::info!(
-                            "Directive seq={}: {} commands [mode={:?}]",
-                            directive.seq_id,
-                            directive.commands.len(),
-                            p.mode()
-                        );
-                        if let Err(e) = transport.emitter().emit_directive(&directive) {
-                            log::error!("Emit directive failed: {}", e);
-                        }
-                    }
-                } else {
-                    // Fallback: snapshot-based PolicyEngine (should not reach here normally)
-                    snapshot.update(&signal);
-                    if let Some(directive) = legacy_policy.evaluate(&snapshot, None) {
-                        log::info!(
-                            "Legacy directive seq={}: {} commands",
-                            directive.seq_id,
-                            directive.commands.len()
-                        );
-                        if let Err(e) = transport.emitter().emit_directive(&directive) {
-                            log::error!("Emit legacy directive failed: {}", e);
-                        }
+                if let Some(directive) = policy.process_signal(&signal) {
+                    log::info!(
+                        "Directive seq={}: {} commands [mode={:?}]",
+                        directive.seq_id,
+                        directive.commands.len(),
+                        policy.mode()
+                    );
+                    if let Err(e) = transport.emitter().emit_directive(&directive) {
+                        log::error!("Emit directive failed: {}", e);
                     }
                 }
             }
@@ -262,9 +212,7 @@ fn main() -> anyhow::Result<()> {
     shutdown.store(true, Ordering::Relaxed);
 
     // Relief model 저장
-    if let Some(p) = &pipeline {
-        p.save_model();
-    }
+    policy.save_model();
 
     for handle in handles {
         let _ = handle.join();

@@ -6,7 +6,6 @@ pub mod evaluator;
 pub mod monitor;
 pub mod pi_controller;
 pub mod pipeline;
-pub mod policy;
 pub mod relief;
 pub mod selector;
 pub mod supervisory;

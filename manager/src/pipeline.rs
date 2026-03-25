@@ -1,6 +1,6 @@
 //! Policy pipeline — 새 계층형 정책 메인 루프용 상태 캡슐화.
 //!
-//! `PolicyPipeline`은 PI Controller, Supervisory Layer, Action Selector,
+//! `HierarchicalPolicy`는 PI Controller, Supervisory Layer, Action Selector,
 //! Relief Estimator를 연결하여 `SystemSignal` 입력에서 `EngineDirective`를
 //! 생성하는 전체 파이프라인을 담당한다.
 //!
@@ -25,6 +25,25 @@ use crate::types::{
     ActionCommand, ActionId, FEATURE_DIM, FeatureVector, OperatingMode, Operation, PressureVector,
     feature,
 };
+
+/// 정책 판단 계층의 공통 인터페이스.
+///
+/// Monitor가 수집한 SystemSignal을 처리하여 EngineDirective를 생성한다.
+/// 구현체에 따라 PI+Supervisory+Selector(HierarchicalPolicy) 또는
+/// 규칙 기반(ThresholdPolicy) 등 다양한 전략이 가능하다.
+pub trait PolicyStrategy: Send {
+    /// SystemSignal을 처리하여 필요 시 EngineDirective를 반환한다.
+    fn process_signal(&mut self, signal: &SystemSignal) -> Option<EngineDirective>;
+
+    /// Engine의 heartbeat/capability/response 메시지로 내부 상태를 갱신한다.
+    fn update_engine_state(&mut self, msg: &EngineMessage);
+
+    /// 현재 operating mode를 반환한다 (로깅/모니터링용).
+    fn mode(&self) -> OperatingMode;
+
+    /// 세션 종료 시 내부 모델을 저장한다. 기본 구현은 no-op.
+    fn save_model(&self) {}
+}
 
 /// 이전 액션 효과 관측을 위한 컨텍스트.
 struct ObservationContext {
@@ -53,7 +72,7 @@ fn next_seq_id() -> u64 {
 ///
 /// PI Controller 3개 (compute / memory / thermal) → Supervisory Layer →
 /// Action Selector → EngineDirective 생성의 전체 흐름을 캡슐화한다.
-pub struct PolicyPipeline {
+pub struct HierarchicalPolicy {
     pi_compute: PiController,
     pi_memory: PiController,
     pi_thermal: PiController,
@@ -84,7 +103,7 @@ pub struct PolicyPipeline {
     last_signal_time: HashMap<&'static str, Instant>,
 }
 
-impl PolicyPipeline {
+impl HierarchicalPolicy {
     /// PolicyConfig로 초기화한다.
     pub fn new(config: &PolicyConfig) -> Self {
         let pi_cfg = &config.pi_controller;
@@ -143,199 +162,9 @@ impl PolicyPipeline {
         self.dt = dt;
     }
 
-    /// 현재 operating mode를 반환한다.
-    pub fn mode(&self) -> OperatingMode {
-        self.supervisory.mode()
-    }
-
     /// 현재 pressure vector를 반환한다.
     pub fn pressure(&self) -> &PressureVector {
         &self.pressure
-    }
-
-    /// SystemSignal을 처리하여 필요한 경우 `EngineDirective`를 반환한다.
-    ///
-    /// # 처리 순서
-    ///
-    /// ① 신호에서 측정값 추출 → PI Controller 갱신 → pressure 업데이트
-    /// ② Supervisory Layer → mode 결정
-    /// ③ 이전 액션의 실측 relief 관측 갱신
-    /// ④ 액션 필요 여부 판단
-    /// ⑤ Action Selection (필요 시)
-    /// ⑥ EngineDirective 생성 및 관측 컨텍스트 기록
-    /// ⑦ De-escalation (Normal 복귀 시 restore directive)
-    pub fn process_signal(&mut self, signal: &SystemSignal) -> Option<EngineDirective> {
-        // ① PI Controller 갱신
-        self.update_pressure(signal);
-
-        // ② Supervisory → mode
-        let mode = self.supervisory.evaluate(&self.pressure);
-
-        // ③ 관측 갱신
-        self.update_observation();
-
-        // ④ 액션 필요 여부
-        let needs_action = match mode {
-            OperatingMode::Normal => false,
-            OperatingMode::Warning | OperatingMode::Critical => {
-                mode != self.prev_mode || self.pressure.max() > self.last_acted_pressure * 1.2
-            }
-        };
-
-        let mut result = None;
-
-        if needs_action {
-            // ⑤ QCF proxy (engine 미연결 시 config default_cost 사용)
-            let qcf_values: HashMap<ActionId, f32> = self
-                .registry
-                .lossy_actions()
-                .into_iter()
-                .map(|id| {
-                    let cost = self.registry.default_cost(&id);
-                    (id, cost)
-                })
-                .collect();
-
-            // ⑥ Action Selection
-            let commands = ActionSelector::select(
-                &self.registry,
-                &self.estimator,
-                &self.pressure,
-                mode,
-                &self.engine_state,
-                &qcf_values,
-                self.latency_budget,
-                &self.active_actions_reported,
-                &self.available_actions,
-            );
-
-            if !commands.is_empty() {
-                let engine_commands = self.convert_to_engine_commands(&commands);
-                if !engine_commands.is_empty() {
-                    let seq = next_seq_id();
-                    let directive = EngineDirective {
-                        seq_id: seq,
-                        commands: engine_commands,
-                    };
-
-                    // 관측 컨텍스트 기록
-                    self.pending_observation = Some(ObservationContext {
-                        pressure_before: self.pressure,
-                        feature_vec: self.engine_state.clone(),
-                        applied_actions: commands.iter().map(|c| c.action).collect(),
-                        applied_at: Instant::now(),
-                    });
-                    self.last_acted_pressure = self.pressure.max();
-
-                    log::debug!(
-                        "[Pipeline] mode={:?} pressure={:.2}/{:.2}/{:.2} → directive seq={} ({} cmds)",
-                        mode,
-                        self.pressure.compute,
-                        self.pressure.memory,
-                        self.pressure.thermal,
-                        seq,
-                        directive.commands.len()
-                    );
-
-                    result = Some(directive);
-                }
-            }
-        }
-
-        // ⑦ De-escalation: 모드 하강 시 적절한 복귀 명령 발송
-        if self.prev_mode > mode {
-            match (self.prev_mode, mode) {
-                (OperatingMode::Critical, OperatingMode::Warning) => {
-                    // Critical→Warning: lossy 액션 해제, lossless는 다음 사이클에서 재선택
-                    log::info!(
-                        "[Pipeline] De-escalating Critical → Warning — releasing lossy actions"
-                    );
-                    if result.is_none() {
-                        result = self.build_lossy_release_directive();
-                    }
-                }
-                (_, OperatingMode::Normal) => {
-                    // *→Normal: 모든 액션 복원
-                    log::info!("[Pipeline] De-escalating to Normal — sending restore directive");
-                    if result.is_none() {
-                        result = self.build_restore_directive();
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        self.prev_mode = mode;
-        result
-    }
-
-    /// 세션 종료 시 Relief model을 디스크에 저장한다.
-    pub fn save_model(&self) {
-        if let Some(path) = &self.relief_model_path {
-            if let Err(e) = self.estimator.save(Path::new(path)) {
-                log::warn!("Failed to save relief model to {}: {}", path, e);
-            } else {
-                log::info!("Saved relief model to {}", path);
-            }
-        }
-    }
-
-    /// Engine heartbeat에서 `engine_state` feature vector를 갱신한다.
-    ///
-    /// `37_protocol_design.md §6`의 Feature Vector 스키마를 따른다.
-    /// Heartbeat 이외의 메시지 (Capability, Response)는 무시한다.
-    pub fn update_engine_state(&mut self, msg: &EngineMessage) {
-        let EngineMessage::Heartbeat(status) = msg else {
-            return;
-        };
-
-        let v = &mut self.engine_state.values;
-
-        // [0] KV 점유율 (0.0 ~ 1.0)
-        v[feature::KV_OCCUPANCY] = status.kv_cache_utilization;
-
-        // [1] GPU 사용 여부 (active_device에 "opencl" 포함 시 1.0)
-        v[feature::IS_GPU] = if status.active_device.contains("opencl") {
-            1.0
-        } else {
-            0.0
-        };
-
-        // [2] 토큰 진행률 (kv_cache_tokens / 2048)
-        const DEFAULT_MAX_TOKENS: f32 = 2048.0;
-        v[feature::TOKEN_PROGRESS] = (status.kv_cache_tokens as f32 / DEFAULT_MAX_TOKENS).min(1.0);
-
-        // [5] TBT 비율 (actual_throughput / 100.0 으로 정규화)
-        v[feature::TBT_RATIO] = (status.actual_throughput / 100.0).clamp(0.0, 1.0);
-
-        // [6] 생성 토큰 정규화 (tokens_generated / 2048)
-        v[feature::TOKENS_GENERATED_NORM] =
-            (status.tokens_generated as f32 / DEFAULT_MAX_TOKENS).min(1.0);
-
-        // [10] 활성 eviction 여부 (eviction_policy가 "none" 또는 빈 문자열이 아니면 1.0)
-        // ReliefEstimator 예측에 사용되므로 유지한다.
-        v[feature::ACTIVE_EVICTION] =
-            if !status.eviction_policy.is_empty() && status.eviction_policy != "none" {
-                1.0
-            } else {
-                0.0
-            };
-
-        // [11] 활성 layer skip 여부 (skip_ratio > 0)
-        v[feature::ACTIVE_LAYER_SKIP] = if status.skip_ratio > 0.0 { 1.0 } else { 0.0 };
-
-        // EngineStatus의 available_actions / active_actions를 ActionId로 파싱하여 캐싱.
-        // 액션 필터링에는 FeatureVector 대신 이 목록을 사용한다.
-        self.available_actions = status
-            .available_actions
-            .iter()
-            .filter_map(|s| ActionId::from_str(s))
-            .collect();
-        self.active_actions_reported = status
-            .active_actions
-            .iter()
-            .filter_map(|s| ActionId::from_str(s))
-            .collect();
     }
 
     // ── 내부 헬퍼 ──────────────────────────────────────────────────────────
@@ -456,6 +285,197 @@ impl PolicyPipeline {
     }
 }
 
+impl PolicyStrategy for HierarchicalPolicy {
+    /// SystemSignal을 처리하여 필요한 경우 `EngineDirective`를 반환한다.
+    ///
+    /// # 처리 순서
+    ///
+    /// ① 신호에서 측정값 추출 → PI Controller 갱신 → pressure 업데이트
+    /// ② Supervisory Layer → mode 결정
+    /// ③ 이전 액션의 실측 relief 관측 갱신
+    /// ④ 액션 필요 여부 판단
+    /// ⑤ Action Selection (필요 시)
+    /// ⑥ EngineDirective 생성 및 관측 컨텍스트 기록
+    /// ⑦ De-escalation (Normal 복귀 시 restore directive)
+    fn process_signal(&mut self, signal: &SystemSignal) -> Option<EngineDirective> {
+        // ① PI Controller 갱신
+        self.update_pressure(signal);
+
+        // ② Supervisory → mode
+        let mode = self.supervisory.evaluate(&self.pressure);
+
+        // ③ 관측 갱신
+        self.update_observation();
+
+        // ④ 액션 필요 여부
+        let needs_action = match mode {
+            OperatingMode::Normal => false,
+            OperatingMode::Warning | OperatingMode::Critical => {
+                mode != self.prev_mode || self.pressure.max() > self.last_acted_pressure * 1.2
+            }
+        };
+
+        let mut result = None;
+
+        if needs_action {
+            // ⑤ QCF proxy (engine 미연결 시 config default_cost 사용)
+            let qcf_values: HashMap<ActionId, f32> = self
+                .registry
+                .lossy_actions()
+                .into_iter()
+                .map(|id| {
+                    let cost = self.registry.default_cost(&id);
+                    (id, cost)
+                })
+                .collect();
+
+            // ⑥ Action Selection
+            let commands = ActionSelector::select(
+                &self.registry,
+                &self.estimator,
+                &self.pressure,
+                mode,
+                &self.engine_state,
+                &qcf_values,
+                self.latency_budget,
+                &self.active_actions_reported,
+                &self.available_actions,
+            );
+
+            if !commands.is_empty() {
+                let engine_commands = self.convert_to_engine_commands(&commands);
+                if !engine_commands.is_empty() {
+                    let seq = next_seq_id();
+                    let directive = EngineDirective {
+                        seq_id: seq,
+                        commands: engine_commands,
+                    };
+
+                    // 관측 컨텍스트 기록
+                    self.pending_observation = Some(ObservationContext {
+                        pressure_before: self.pressure,
+                        feature_vec: self.engine_state.clone(),
+                        applied_actions: commands.iter().map(|c| c.action).collect(),
+                        applied_at: Instant::now(),
+                    });
+                    self.last_acted_pressure = self.pressure.max();
+
+                    log::debug!(
+                        "[Pipeline] mode={:?} pressure={:.2}/{:.2}/{:.2} → directive seq={} ({} cmds)",
+                        mode,
+                        self.pressure.compute,
+                        self.pressure.memory,
+                        self.pressure.thermal,
+                        seq,
+                        directive.commands.len()
+                    );
+
+                    result = Some(directive);
+                }
+            }
+        }
+
+        // ⑦ De-escalation: 모드 하강 시 적절한 복귀 명령 발송
+        if self.prev_mode > mode {
+            match (self.prev_mode, mode) {
+                (OperatingMode::Critical, OperatingMode::Warning) => {
+                    // Critical→Warning: lossy 액션 해제, lossless는 다음 사이클에서 재선택
+                    log::info!(
+                        "[Pipeline] De-escalating Critical → Warning — releasing lossy actions"
+                    );
+                    if result.is_none() {
+                        result = self.build_lossy_release_directive();
+                    }
+                }
+                (_, OperatingMode::Normal) => {
+                    // *→Normal: 모든 액션 복원
+                    log::info!("[Pipeline] De-escalating to Normal — sending restore directive");
+                    if result.is_none() {
+                        result = self.build_restore_directive();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        self.prev_mode = mode;
+        result
+    }
+
+    /// Engine heartbeat에서 `engine_state` feature vector를 갱신한다.
+    ///
+    /// `37_protocol_design.md §6`의 Feature Vector 스키마를 따른다.
+    /// Heartbeat 이외의 메시지 (Capability, Response)는 무시한다.
+    fn update_engine_state(&mut self, msg: &EngineMessage) {
+        let EngineMessage::Heartbeat(status) = msg else {
+            return;
+        };
+
+        let v = &mut self.engine_state.values;
+
+        // [0] KV 점유율 (0.0 ~ 1.0)
+        v[feature::KV_OCCUPANCY] = status.kv_cache_utilization;
+
+        // [1] GPU 사용 여부 (active_device에 "opencl" 포함 시 1.0)
+        v[feature::IS_GPU] = if status.active_device.contains("opencl") {
+            1.0
+        } else {
+            0.0
+        };
+
+        // [2] 토큰 진행률 (kv_cache_tokens / 2048)
+        const DEFAULT_MAX_TOKENS: f32 = 2048.0;
+        v[feature::TOKEN_PROGRESS] = (status.kv_cache_tokens as f32 / DEFAULT_MAX_TOKENS).min(1.0);
+
+        // [5] TBT 비율 (actual_throughput / 100.0 으로 정규화)
+        v[feature::TBT_RATIO] = (status.actual_throughput / 100.0).clamp(0.0, 1.0);
+
+        // [6] 생성 토큰 정규화 (tokens_generated / 2048)
+        v[feature::TOKENS_GENERATED_NORM] =
+            (status.tokens_generated as f32 / DEFAULT_MAX_TOKENS).min(1.0);
+
+        // [10] 활성 eviction 여부 (eviction_policy가 "none" 또는 빈 문자열이 아니면 1.0)
+        // ReliefEstimator 예측에 사용되므로 유지한다.
+        v[feature::ACTIVE_EVICTION] =
+            if !status.eviction_policy.is_empty() && status.eviction_policy != "none" {
+                1.0
+            } else {
+                0.0
+            };
+
+        // [11] 활성 layer skip 여부 (skip_ratio > 0)
+        v[feature::ACTIVE_LAYER_SKIP] = if status.skip_ratio > 0.0 { 1.0 } else { 0.0 };
+
+        // EngineStatus의 available_actions / active_actions를 ActionId로 파싱하여 캐싱.
+        // 액션 필터링에는 FeatureVector 대신 이 목록을 사용한다.
+        self.available_actions = status
+            .available_actions
+            .iter()
+            .filter_map(|s| ActionId::from_str(s))
+            .collect();
+        self.active_actions_reported = status
+            .active_actions
+            .iter()
+            .filter_map(|s| ActionId::from_str(s))
+            .collect();
+    }
+
+    fn mode(&self) -> OperatingMode {
+        self.supervisory.mode()
+    }
+
+    /// 세션 종료 시 Relief model을 디스크에 저장한다.
+    fn save_model(&self) {
+        if let Some(path) = &self.relief_model_path {
+            if let Err(e) = self.estimator.save(Path::new(path)) {
+                log::warn!("Failed to save relief model to {}: {}", path, e);
+            } else {
+                log::info!("Saved relief model to {}", path);
+            }
+        }
+    }
+}
+
 /// ActionCommand 하나를 EngineCommand로 변환한다.
 /// Release 명령은 `None`을 반환한다 (restore directive에서 일괄 처리).
 fn action_to_engine_command(cmd: &ActionCommand) -> Option<EngineCommand> {
@@ -511,8 +531,8 @@ mod tests {
     use super::*;
     use crate::config::PolicyConfig;
 
-    fn make_pipeline() -> PolicyPipeline {
-        PolicyPipeline::new(&PolicyConfig::default())
+    fn make_pipeline() -> HierarchicalPolicy {
+        HierarchicalPolicy::new(&PolicyConfig::default())
     }
 
     fn memory_signal(level: Level) -> SystemSignal {
@@ -1247,7 +1267,7 @@ mod tests {
             actions: action_map,
             ..Default::default()
         };
-        let pipeline = PolicyPipeline::new(&policy);
+        let pipeline = HierarchicalPolicy::new(&policy);
 
         // registry.default_cost()가 config에서 로드된 값을 반환하는지 확인
         assert!(
