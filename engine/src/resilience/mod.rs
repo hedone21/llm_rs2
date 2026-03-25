@@ -20,7 +20,7 @@ pub use strategy::{ResilienceAction, ResilienceStrategy};
 #[cfg(unix)]
 pub use transport::UnixSocketTransport;
 pub use transport::{
-    MessageLoop, MockManagerEnd, MockSender, MockTransport, Transport, TransportError,
+    MessageLoop, MockManagerEnd, MockSender, MockTransport, TcpTransport, Transport, TransportError,
 };
 
 #[cfg(feature = "resilience")]

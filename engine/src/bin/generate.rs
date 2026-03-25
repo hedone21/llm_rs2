@@ -30,6 +30,7 @@ use llm_rs2::experiment::{
 };
 #[cfg(feature = "resilience")]
 use llm_rs2::resilience::DbusTransport;
+use llm_rs2::resilience::TcpTransport;
 #[cfg(unix)]
 use llm_rs2::resilience::UnixSocketTransport;
 use llm_rs2::resilience::{
@@ -677,6 +678,10 @@ fn main() -> anyhow::Result<()> {
             s if s.starts_with("unix:") => {
                 let path = std::path::PathBuf::from(&s[5..]);
                 MessageLoop::spawn(UnixSocketTransport::new(path))?
+            }
+            s if s.starts_with("tcp:") => {
+                let addr = s[4..].to_string();
+                MessageLoop::spawn(TcpTransport::new(addr))?
             }
             other => {
                 eprintln!("[Resilience] Unknown transport: {}", other);
