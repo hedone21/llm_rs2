@@ -92,6 +92,11 @@ struct KernelCache {
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_f32_f32: Option<CoreKernel>,
+    // KIVI Q2 kernels (optional — dequantize/scatter for GPU-native KiviCache)
+    kernel_kivi_deq_value_q2: Option<CoreKernel>,
+    kernel_kivi_deq_key_q2: Option<CoreKernel>,
+    kernel_kivi_scatter_residual: Option<CoreKernel>,
+    kernel_kivi_gather_update: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -484,6 +489,20 @@ impl OpenCLBackend {
             }
         };
 
+        // KIVI Q2 kernels (optional — dequantize/scatter for GPU-native KiviCache)
+        let kivi_q2_src = include_str!("../../../kernels/kivi_q2.cl");
+        let kivi_q2_kernels = Program::builder()
+            .devices(device)
+            .src(kivi_q2_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if kivi_q2_kernels.is_some() {
+            log::info!("kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)");
+        } else {
+            log::warn!("kivi_q2.cl failed to compile. KIVI Q2 GPU kernels disabled.");
+        }
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -576,6 +595,18 @@ impl OpenCLBackend {
             kernel_mul_mm_f32_f32: gemm_f32_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f32_f32_l4_lm").ok()),
+            kernel_kivi_deq_value_q2: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_value_q2").ok()),
+            kernel_kivi_deq_key_q2: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_key_q2").ok()),
+            kernel_kivi_scatter_residual: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_scatter_residual").ok()),
+            kernel_kivi_gather_update: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_gather_update").ok()),
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -2240,6 +2271,223 @@ impl Backend for OpenCLBackend {
         Err(anyhow!(
             "Unsupported copy_slice combination in OpenCL backend or null pointers"
         ))
+    }
+}
+
+// ── KIVI Q2 dispatch functions (OpenCLBackend-specific, not part of Backend trait) ──
+impl OpenCLBackend {
+    /// Dequantize Q2 value blocks on GPU (per-token layout).
+    /// `q2_buf`: raw Q2 block data on GPU (uchar buffer)
+    /// `attn_v`: F32 attention V buffer on GPU [max_seq, kv_heads, head_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_dequantize_value_q2(
+        &self,
+        q2_buf: &Tensor,
+        attn_v: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        flush_tokens: usize,
+        tok_base: usize,
+        block_offset: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_deq_value_q2
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
+
+        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
+        let attn_v_mem = get_cl_mem(attn_v.buffer().as_ref())?;
+
+        let total_blocks = kv_heads * flush_tokens * (head_dim / 32);
+        let kv_heads_i = kv_heads as i32;
+        let head_dim_i = head_dim as i32;
+        let flush_tokens_i = flush_tokens as i32;
+        let tok_base_i = tok_base as i32;
+        let block_offset_i = block_offset as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_v_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&flush_tokens_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
+
+            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize Q2 key blocks on GPU (per-channel scatter layout).
+    /// `q2_buf`: raw Q2 block data on GPU (uchar buffer)
+    /// `attn_k`: F32 attention K buffer on GPU [max_seq, kv_heads, head_dim]
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_dequantize_key_q2(
+        &self,
+        q2_buf: &Tensor,
+        attn_k: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        groups_per_flush: usize,
+        tok_base: usize,
+        block_offset: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_deq_key_q2
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
+
+        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
+        let attn_k_mem = get_cl_mem(attn_k.buffer().as_ref())?;
+
+        let total_blocks = kv_heads * groups_per_flush * head_dim;
+        let kv_heads_i = kv_heads as i32;
+        let head_dim_i = head_dim as i32;
+        let groups_per_flush_i = groups_per_flush as i32;
+        let tok_base_i = tok_base as i32;
+        let block_offset_i = block_offset as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_k_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&groups_per_flush_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
+
+            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Scatter residual F32 buffer [kv_heads, res_cap, head_dim] into SeqMajor
+    /// attention buffer [max_seq, kv_heads, head_dim].
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_scatter_residual(
+        &self,
+        residual: &Tensor,
+        attn: &mut Tensor,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        res_pos: usize,
+        tok_base: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_scatter_residual
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
+
+        let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
+        let attn_mem = get_cl_mem(attn.buffer().as_ref())?;
+
+        let total = kv_heads * res_pos * head_dim;
+        let kv_heads_i = kv_heads as i32;
+        let res_cap_i = res_cap as i32;
+        let head_dim_i = head_dim as i32;
+        let res_pos_i = res_pos as i32;
+        let tok_base_i = tok_base as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(residual_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&res_pos_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&tok_base_i))?;
+
+            let global_work_size: [usize; 3] = [total, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Gather new K/V tokens from SeqMajor input [seq_len, kv_heads, head_dim]
+    /// into head-first residual buffer [kv_heads, res_cap, head_dim].
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_gather_update(
+        &self,
+        input: &Tensor,
+        residual: &mut Tensor,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        seq_len: usize,
+        res_pos: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_gather_update
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
+
+        let input_mem = get_cl_mem(input.buffer().as_ref())?;
+        let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
+
+        let total = seq_len * kv_heads * head_dim;
+        let kv_heads_i = kv_heads as i32;
+        let res_cap_i = res_cap as i32;
+        let head_dim_i = head_dim as i32;
+        let seq_len_i = seq_len as i32;
+        let res_pos_i = res_pos as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(input_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(residual_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&seq_len_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&res_pos_i))?;
+
+            let global_work_size: [usize; 3] = [total, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
     }
 }
 

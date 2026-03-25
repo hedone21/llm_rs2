@@ -4,7 +4,6 @@
 //! work seamlessly inside a `CachePressurePipeline`.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
-use crate::core::buffer::Buffer;
 use crate::core::eviction::EvictionPolicy;
 use crate::core::qcf::QcfConfig;
 use anyhow::Result;

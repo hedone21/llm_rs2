@@ -871,7 +871,7 @@ impl TransformerModel {
                 use_gelu_tanh: is_gemma3,
                 is_local_attn: is_local,
                 local_attn_window: self.config.sliding_window,
-                prefill_ws: prefill_ws.as_mut().map(|ws| &mut **ws),
+                prefill_ws: prefill_ws.as_deref_mut(),
             })?;
 
             // Record importance after layer forward

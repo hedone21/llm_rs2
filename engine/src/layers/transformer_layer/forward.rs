@@ -34,7 +34,7 @@ impl TransformerLayer {
 
         // Use prefill workspace if provided, otherwise allocate temp buffers
         let (mut q, mut k, mut v, mut out_attn, mut attn_out_projected, mut gate, mut up, mut down);
-        let (residual_tensor, residual_ffn_tensor): (Tensor, Tensor);
+        let (_residual_tensor, residual_ffn_tensor): (Tensor, Tensor);
 
         if let Some(ws) = prefill_ws {
             // Reshape ALL workspace tensors to match actual seq_len (may be < max_seq_len)

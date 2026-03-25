@@ -3,9 +3,9 @@ mod forward_gen;
 
 use crate::backend::cpu::CpuBackend;
 use crate::core::backend::Backend;
-use crate::core::buffer::DType;
 use crate::core::buffer::Buffer;
-use crate::core::kv_cache::{KVCache, KVCacheOps, KVLayout};
+use crate::core::buffer::DType;
+use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;

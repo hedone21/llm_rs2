@@ -356,6 +356,7 @@ fn main() -> anyhow::Result<()> {
 
     // Hybrid mode: dual-backend (CPU primary, GPU secondary). Starts inference on CPU.
     // gpu_backend_arc / gpu_memory_arc hold the secondary backend for CPU↔GPU switching.
+    #[allow(clippy::type_complexity)]
     let (mut backend, memory, gpu_backend_arc, gpu_memory_arc, mut is_gpu): (
         Arc<dyn Backend>,
         Arc<dyn Memory>,
@@ -552,19 +553,19 @@ fn main() -> anyhow::Result<()> {
     // On discrete GPUs without flash attention for this head_dim, F16 KV + GPU attention
     // produces incorrect results. Auto-promote to F32 KV for correctness.
     // Flash attention is compiled with DK=64; models with head_dim != 64 can't use it.
-    if args.backend == "opencl" && kv_type == DType::F16 && head_dim != 64 {
-        if let Some(ocl_backend) = backend
+    if args.backend == "opencl"
+        && kv_type == DType::F16
+        && head_dim != 64
+        && let Some(ocl_backend) = backend
             .as_any()
             .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-        {
-            if !ocl_backend.use_zero_copy {
-                eprintln!(
-                    "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} != flash_attn DK=64)",
-                    head_dim
-                );
-                kv_type = DType::F32;
-            }
-        }
+        && !ocl_backend.use_zero_copy
+    {
+        eprintln!(
+            "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} != flash_attn DK=64)",
+            head_dim
+        );
+        kv_type = DType::F32;
     }
 
     // Determine initial KV cache capacity (dynamic grow-on-demand)
@@ -1391,11 +1392,10 @@ fn main() -> anyhow::Result<()> {
             // ── Hybrid mode: auto-switch CPU→GPU at threshold ──────────────
             if !is_gpu
                 && args.switch_threshold > 0
-                && gpu_backend_arc.is_some()
                 && kv_caches[0].current_pos >= args.switch_threshold
+                && let (Some(gpu_be), Some(gpu_mem)) =
+                    (gpu_backend_arc.as_ref(), gpu_memory_arc.as_ref())
             {
-                let gpu_be = gpu_backend_arc.as_ref().unwrap();
-                let gpu_mem = gpu_memory_arc.as_ref().unwrap();
                 eprintln!(
                     "[Hybrid] Auto-switch CPU→GPU at token {}",
                     kv_caches[0].current_pos
@@ -1825,14 +1825,14 @@ fn main() -> anyhow::Result<()> {
                 if plan.restore_defaults {
                     skip_config = None;
                     last_skip_ratio = None;
-                } else if let Some(ratio) = plan.layer_skip {
-                    if last_skip_ratio != Some(ratio) {
-                        skip_config = Some(SkipConfig::uniform_init(
-                            model.config.num_hidden_layers,
-                            ratio,
-                        ));
-                        last_skip_ratio = Some(ratio);
-                    }
+                } else if let Some(ratio) = plan.layer_skip
+                    && last_skip_ratio != Some(ratio)
+                {
+                    skip_config = Some(SkipConfig::uniform_init(
+                        model.config.num_hidden_layers,
+                        ratio,
+                    ));
+                    last_skip_ratio = Some(ratio);
                 }
 
                 if let Some(ref device) = plan.switch_device {
@@ -2849,14 +2849,14 @@ fn run_kivi(
             if plan.restore_defaults {
                 kivi_skip_config = None;
                 kivi_last_skip_ratio = None;
-            } else if let Some(ratio) = plan.layer_skip {
-                if kivi_last_skip_ratio != Some(ratio) {
-                    kivi_skip_config = Some(SkipConfig::uniform_init(
-                        model.config.num_hidden_layers,
-                        ratio,
-                    ));
-                    kivi_last_skip_ratio = Some(ratio);
-                }
+            } else if let Some(ratio) = plan.layer_skip
+                && kivi_last_skip_ratio != Some(ratio)
+            {
+                kivi_skip_config = Some(SkipConfig::uniform_init(
+                    model.config.num_hidden_layers,
+                    ratio,
+                ));
+                kivi_last_skip_ratio = Some(ratio);
             }
 
             // throttle

@@ -7,7 +7,6 @@
 use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 use super::qcf_helpers::{aggregate_eviction_metrics, metric_to_json};
 use crate::core::attention_scores::AttentionScoreAccumulator;
-use crate::core::buffer::Buffer;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::qcf::QcfConfig;

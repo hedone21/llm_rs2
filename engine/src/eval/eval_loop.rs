@@ -606,7 +606,7 @@ fn run_full_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
-    mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
+    prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let prompt_len = prompt_ids.len();
 
@@ -646,7 +646,7 @@ fn run_full_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
-        prefill_ws: prefill_ws.as_mut().map(|ws| &mut **ws),
+        prefill_ws,
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -683,7 +683,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
-    mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
+    prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let effective_budget = eval_config.effective_budget;
     let first_chunk_len = effective_budget;
@@ -731,7 +731,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
-        prefill_ws: prefill_ws.as_deref_mut(),
+        prefill_ws,
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
