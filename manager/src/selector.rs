@@ -328,6 +328,7 @@ mod tests {
                 ActionConfig {
                     lossy: *lossy,
                     reversible: *reversible,
+                    ..Default::default()
                 },
             );
         }

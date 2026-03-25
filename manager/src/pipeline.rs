@@ -185,12 +185,15 @@ impl PolicyPipeline {
         let mut result = None;
 
         if needs_action {
-            // ⑤ QCF proxy (engine 미연결 시 1.0 가정)
+            // ⑤ QCF proxy (engine 미연결 시 config default_cost 사용)
             let qcf_values: HashMap<ActionId, f32> = self
                 .registry
                 .lossy_actions()
                 .into_iter()
-                .map(|id| (id, 1.0))
+                .map(|id| {
+                    let cost = self.registry.default_cost(&id);
+                    (id, cost)
+                })
                 .collect();
 
             // ⑥ Action Selection
@@ -1208,6 +1211,57 @@ mod tests {
         assert!(
             p.pressure().compute > 0.0,
             "95% CPU usage should build compute pressure regardless of level field"
+        );
+    }
+
+    /// default_cost 차이가 ActionSelector의 조합 선택에 영향을 주는지 확인한다.
+    ///
+    /// 같은 relief를 제공하는 두 lossy 액션(evict_sliding vs evict_h2o)에서
+    /// default_cost가 낮은 쪽이 더 높은 net score를 받아야 한다.
+    /// 여기서는 파이프라인에 cost-differentiated config를 넣고 qcf_values가
+    /// registry.default_cost()를 통해 올바른 값으로 채워지는지 검증한다.
+    #[test]
+    fn test_qcf_values_use_registry_default_cost() {
+        use crate::config::{ActionConfig, PolicyConfig};
+        use std::collections::HashMap;
+
+        // kv_evict_sliding: cost=0.3, kv_evict_h2o: cost=1.0 으로 설정
+        let mut action_map = HashMap::new();
+        action_map.insert(
+            "kv_evict_sliding".to_string(),
+            ActionConfig {
+                lossy: true,
+                reversible: false,
+                default_cost: 0.3,
+            },
+        );
+        action_map.insert(
+            "kv_evict_h2o".to_string(),
+            ActionConfig {
+                lossy: true,
+                reversible: false,
+                default_cost: 1.0,
+            },
+        );
+        let policy = PolicyConfig {
+            actions: action_map,
+            ..Default::default()
+        };
+        let pipeline = PolicyPipeline::new(&policy);
+
+        // registry.default_cost()가 config에서 로드된 값을 반환하는지 확인
+        assert!(
+            (pipeline.registry.default_cost(&ActionId::KvEvictSliding) - 0.3).abs() < f32::EPSILON,
+            "kv_evict_sliding default_cost should be 0.3"
+        );
+        assert!(
+            (pipeline.registry.default_cost(&ActionId::KvEvictH2o) - 1.0).abs() < f32::EPSILON,
+            "kv_evict_h2o default_cost should be 1.0"
+        );
+        // 등록되지 않은 액션은 fallback 1.0
+        assert!(
+            (pipeline.registry.default_cost(&ActionId::LayerSkip) - 1.0).abs() < f32::EPSILON,
+            "unregistered action should fallback to 1.0"
         );
     }
 

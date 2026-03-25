@@ -32,6 +32,7 @@ impl ActionRegistry {
                 reversible: action_cfg.reversible,
                 param_range: default_param_range(id),
                 exclusion_group: None, // 이후 exclusion_groups 처리에서 채움
+                default_cost: action_cfg.default_cost,
             };
             actions.insert(id, meta);
         }
@@ -104,6 +105,15 @@ impl ActionRegistry {
         }
         false
     }
+
+    /// 액션의 기본 QCF 비용(default_cost)을 반환한다.
+    /// 등록되지 않은 액션은 1.0을 반환한다.
+    pub fn default_cost(&self, action: &ActionId) -> f32 {
+        self.actions
+            .get(action)
+            .map(|m| m.default_cost)
+            .unwrap_or(1.0)
+    }
 }
 
 /// 액션별 기본 파라미터 범위.
@@ -151,6 +161,7 @@ mod tests {
                 ActionConfig {
                     lossy: *lossy,
                     reversible: *reversible,
+                    ..Default::default()
                 },
             );
         }
@@ -353,5 +364,45 @@ mod tests {
         // switch_hw는 param_range 없음
         let switch_meta = registry.get(&ActionId::SwitchHw).unwrap();
         assert!(switch_meta.param_range.is_none());
+    }
+
+    /// default_cost 기본값은 1.0이어야 한다.
+    #[test]
+    fn test_default_cost_fallback_is_one() {
+        let config = make_policy_config(&[("kv_evict_sliding", true, false)], &[]);
+        let registry = ActionRegistry::from_config(&config);
+        // default_cost 미지정 → 1.0 반환
+        assert!((registry.default_cost(&ActionId::KvEvictSliding) - 1.0).abs() < f32::EPSILON);
+        // 등록되지 않은 액션 → 1.0 반환
+        assert!((registry.default_cost(&ActionId::LayerSkip) - 1.0).abs() < f32::EPSILON);
+    }
+
+    /// 명시적으로 설정된 default_cost가 정확히 반환되어야 한다.
+    #[test]
+    fn test_default_cost_explicit_value() {
+        let mut action_map = HashMap::new();
+        action_map.insert(
+            "kv_evict_sliding".to_string(),
+            ActionConfig {
+                lossy: true,
+                reversible: false,
+                default_cost: 0.4,
+            },
+        );
+        action_map.insert(
+            "layer_skip".to_string(),
+            ActionConfig {
+                lossy: true,
+                reversible: true,
+                default_cost: 1.8,
+            },
+        );
+        let config = PolicyConfig {
+            actions: action_map,
+            ..Default::default()
+        };
+        let registry = ActionRegistry::from_config(&config);
+        assert!((registry.default_cost(&ActionId::KvEvictSliding) - 0.4).abs() < f32::EPSILON);
+        assert!((registry.default_cost(&ActionId::LayerSkip) - 1.8).abs() < f32::EPSILON);
     }
 }

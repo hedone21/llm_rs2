@@ -182,6 +182,7 @@ pub struct ActionMeta {
     pub reversible: bool,
     pub param_range: Option<ParamRange>,
     pub exclusion_group: Option<String>,
+    pub default_cost: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -273,11 +273,27 @@ impl Default for ReliefModelConfig {
 }
 
 /// 액션별 메타데이터 설정
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ActionConfig {
     pub lossy: bool,
     pub reversible: bool,
+    #[serde(default = "default_cost")]
+    pub default_cost: f32,
+}
+
+impl Default for ActionConfig {
+    fn default() -> Self {
+        Self {
+            lossy: false,
+            reversible: false,
+            default_cost: default_cost(),
+        }
+    }
+}
+
+fn default_cost() -> f32 {
+    1.0
 }
 
 #[cfg(test)]
@@ -423,5 +439,47 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o"]
     fn config_policy_optional_none_by_default() {
         let config = Config::default();
         assert!(config.policy.is_none());
+    }
+
+    #[test]
+    fn action_config_default_cost_fallback_is_one() {
+        // default_cost 필드 없이 파싱 시 1.0으로 폴백되어야 한다
+        let toml_str = r#"
+[policy.actions.kv_evict_sliding]
+lossy = true
+reversible = false
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let policy = config.policy.unwrap();
+        let action = policy.actions.get("kv_evict_sliding").unwrap();
+        assert!((action.default_cost - 1.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn action_config_explicit_default_cost_loaded() {
+        // 명시적 default_cost 값이 정확히 로드되어야 한다
+        let toml_str = r#"
+[policy.actions.kv_evict_sliding]
+lossy = true
+reversible = false
+default_cost = 0.5
+
+[policy.actions.layer_skip]
+lossy = true
+reversible = true
+default_cost = 2.0
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        let policy = config.policy.unwrap();
+        let evict = policy.actions.get("kv_evict_sliding").unwrap();
+        assert!((evict.default_cost - 0.5).abs() < f32::EPSILON);
+        let skip = policy.actions.get("layer_skip").unwrap();
+        assert!((skip.default_cost - 2.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn action_config_default_impl_has_cost_one() {
+        let cfg = ActionConfig::default();
+        assert!((cfg.default_cost - 1.0).abs() < f32::EPSILON);
     }
 }
