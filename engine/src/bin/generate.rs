@@ -3512,6 +3512,12 @@ fn run_ppl(
         );
     }
 
+    // Headroom-based threshold: evict only when cache exceeds budget + headroom.
+    // This prevents 1-by-1 evictions every step and ensures batch evictions (~2 total).
+    // Example: budget=1500 → headroom=375 → threshold=1875.
+    let eviction_headroom = (effective_budget / 4).max(16);
+    let eviction_threshold = effective_budget.saturating_add(eviction_headroom);
+
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
     let mut qcf_metrics: Vec<serde_json::Value> = Vec::new();
@@ -3644,13 +3650,40 @@ fn run_ppl(
         nll_count += 1;
 
         // ── Budget-based eviction (deterministic, experiment-reproducible) ──
-        // Eviction triggers when cache_pos exceeds the effective budget.
+        // Eviction triggers when cache_pos exceeds eviction_threshold (budget + headroom).
+        // Using headroom prevents 1-by-1 evictions: evictions occur in ~2 large batches
+        // rather than 500+ tiny steps, preserving PPL measurement validity.
         // This is deterministic: same text + same budget = same eviction positions.
         // No dependency on memory pressure or hardware state.
         if auto_eviction && has_budget {
             let before_len = kv_caches[0].current_pos;
-            if before_len > effective_budget {
+            if before_len > eviction_threshold {
                 let ratio = effective_budget as f32 / before_len as f32;
+
+                // GPU V buffer readback for QCF computation.
+                // On OpenCL backends, v_buffer.as_ptr() returns null (GPU-only memory);
+                // as_slice() on a null pointer causes SIGSEGV. Read the buffer to CPU first.
+                let v_cpu_data: Option<Vec<f32>> = if args.kv_type == "f32"
+                    && !kv_caches.is_empty()
+                    && kv_caches[0].v_buffer.buffer().as_ptr().is_null()
+                {
+                    let v_elems = kv_caches[0].v_buffer.buffer().size() / 4;
+                    let mut v_buf = vec![0.0f32; v_elems];
+                    let byte_slice = unsafe {
+                        std::slice::from_raw_parts_mut(v_buf.as_mut_ptr() as *mut u8, v_elems * 4)
+                    };
+                    match backend.read_buffer(&kv_caches[0].v_buffer, byte_slice) {
+                        Ok(()) => Some(v_buf),
+                        Err(_) => None,
+                    }
+                } else {
+                    None
+                };
+                // QCF computation is only valid when V data is CPU-accessible:
+                // either via readback (v_cpu_data) or direct CPU pointer (non-null as_ptr).
+                let can_compute_qcf = args.kv_type == "f32"
+                    && !kv_caches.is_empty()
+                    && (v_cpu_data.is_some() || !kv_caches[0].v_buffer.buffer().as_ptr().is_null());
 
                 // Collect proxy metric before eviction
                 let result = if score_based_eviction {
@@ -3666,15 +3699,14 @@ fn run_ppl(
                                 before_len,
                                 target_len,
                             );
-                            if !evicted.is_empty() && args.kv_type == "f32" && !kv_caches.is_empty()
-                            {
+                            if !evicted.is_empty() && can_compute_qcf {
                                 if qcf_config.mode.has_attn() {
                                     let metric = llm_rs2::core::qcf::compute_eviction_qcf_attn(
                                         &evicted,
                                         scores,
                                         &kv_caches[0],
                                         &qcf_config,
-                                        None,
+                                        v_cpu_data.as_deref(),
                                     );
                                     qcf_metrics.push(serde_json::json!({
                                         "step": i,
@@ -3695,7 +3727,7 @@ fn run_ppl(
                                         head_attn,
                                         &kv_caches[0],
                                         &qcf_config,
-                                        None,
+                                        v_cpu_data.as_deref(),
                                     );
                                     qcf_metrics.push(serde_json::json!({
                                         "step": i,
@@ -3717,7 +3749,7 @@ fn run_ppl(
                 } else {
                     // Sliding/Streaming: position-based eviction
                     let r = cache_manager.force_evict(kv_caches, ratio)?;
-                    if r.evicted && args.kv_type == "f32" && !kv_caches.is_empty() {
+                    if r.evicted && can_compute_qcf {
                         if qcf_config.mode.has_attn() {
                             let positions = llm_rs2::core::qcf::identify_evicted_sliding(
                                 protected_prefix,
@@ -3729,7 +3761,7 @@ fn run_ppl(
                                 &kv_caches[0],
                                 before_len,
                                 &qcf_config,
-                                None,
+                                v_cpu_data.as_deref(),
                             );
                             qcf_metrics.push(serde_json::json!({
                                 "step": i,
@@ -3755,7 +3787,7 @@ fn run_ppl(
                                 head_attn,
                                 &kv_caches[0],
                                 &qcf_config,
-                                None,
+                                v_cpu_data.as_deref(),
                             );
                             qcf_metrics.push(serde_json::json!({
                                 "step": i,
