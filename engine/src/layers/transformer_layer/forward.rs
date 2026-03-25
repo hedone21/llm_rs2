@@ -129,8 +129,13 @@ impl TransformerLayer {
                 .reshape(Shape::new(vec![batch_size, seq_len, q_dim]));
             let is_opencl = backend.name() == "OpenCL";
 
-            // GPU flash attention
-            let gpu_dispatched = if is_opencl {
+            // GPU flash attention — only if KV buffers are actually OpenCL buffers.
+            // CPU-only caches (e.g. KiviCache with SharedBuffer) skip to CPU fallback.
+            #[cfg(feature = "opencl")]
+            let kv_is_gpu = k_cache.buffer().cl_mem().is_some();
+            #[cfg(not(feature = "opencl"))]
+            let kv_is_gpu = false;
+            let gpu_dispatched = if is_opencl && kv_is_gpu {
                 if let Some(ocl_backend) = backend
                     .as_any()
                     .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
@@ -527,7 +532,11 @@ impl TransformerLayer {
 
             let is_opencl = backend.name() == "OpenCL";
 
-            let gpu_dispatched = if is_opencl {
+            #[cfg(feature = "opencl")]
+            let kv_is_gpu2 = k_cache.buffer().cl_mem().is_some();
+            #[cfg(not(feature = "opencl"))]
+            let kv_is_gpu2 = false;
+            let gpu_dispatched = if is_opencl && kv_is_gpu2 {
                 if let Some(ocl_backend) = backend
                     .as_any()
                     .downcast_ref::<crate::backend::opencl::OpenCLBackend>()

@@ -4,6 +4,7 @@
 //! work seamlessly inside a `CachePressurePipeline`.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
+use crate::core::buffer::Buffer;
 use crate::core::eviction::EvictionPolicy;
 use crate::core::qcf::QcfConfig;
 use anyhow::Result;
@@ -58,6 +59,11 @@ impl EvictionHandler {
             Some(s) => s,
             None => return,
         };
+        // QCF V-norm metrics require CPU-accessible V buffers (as_slice).
+        // Skip on GPU backends where as_ptr() returns null to avoid SIGSEGV.
+        if !ctx.caches.is_empty() && ctx.caches[0].v_buffer.buffer().as_ptr().is_null() {
+            return;
+        }
 
         let policy_name = self.policy.name();
 

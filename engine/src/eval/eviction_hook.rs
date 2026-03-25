@@ -7,6 +7,7 @@
 use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 use super::qcf_helpers::{aggregate_eviction_metrics, metric_to_json};
 use crate::core::attention_scores::AttentionScoreAccumulator;
+use crate::core::buffer::Buffer;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::qcf::QcfConfig;
@@ -133,7 +134,11 @@ impl StepHook<KVCache> for EvictionHook {
 
         let before_len = caches[0].current_pos();
         let ratio = self.effective_budget as f32 / before_len as f32;
-        let kv_type_is_f32 = self.kv_type == "f32";
+        // QCF V-norm metrics require CPU-accessible V buffers (as_slice).
+        // On NVIDIA GPU, UnifiedBuffer::as_ptr() returns null, so skip QCF
+        // to avoid SIGSEGV. QCF is a research metric — correctness unaffected.
+        let can_compute_qcf =
+            self.kv_type == "f32" && !caches[0].v_buffer.buffer().as_ptr().is_null();
 
         let result = if self.score_based_eviction {
             let active = self
@@ -157,7 +162,7 @@ impl StepHook<KVCache> for EvictionHook {
                     target_len,
                 );
 
-                if !evicted.is_empty() && kv_type_is_f32 && !caches.is_empty() {
+                if !evicted.is_empty() && can_compute_qcf && !caches.is_empty() {
                     if self.qcf_config.mode.has_attn() {
                         let metric = crate::core::qcf::compute_eviction_qcf_attn(
                             &evicted,
@@ -194,7 +199,7 @@ impl StepHook<KVCache> for EvictionHook {
             let r = self.cache_manager.force_evict(caches, ratio);
             if let Ok(ref evict_result) = r
                 && evict_result.evicted
-                && kv_type_is_f32
+                && can_compute_qcf
                 && !caches.is_empty()
             {
                 if self.qcf_config.mode.has_attn() {
