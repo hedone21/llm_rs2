@@ -471,7 +471,17 @@ fn main() -> anyhow::Result<()> {
         };
         let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
         let mut kv_caches: Vec<KiviCache> = (0..num_layers)
-            .map(|_| KiviCache::new(kv_heads, head_dim, max_seq_len, args.kivi_residual_size))
+            .map(|_| {
+                KiviCache::new_gpu(
+                    kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    args.kivi_residual_size,
+                    2,
+                    backend.clone(),
+                    memory.clone(),
+                )
+            })
             .collect();
         let mut hook = llm_rs2::eval::KiviHook::new(qcf_config);
         let output = llm_rs2::eval::run_eval_ll_generic(
@@ -2330,7 +2340,7 @@ fn run_kivi_ppl(
 
     // ── 2. Create KiviCache per layer ──
     let mut kv_caches: Vec<KiviCache> = (0..num_layers)
-        .map(|_| KiviCache::new(kv_heads, head_dim, max_seq_len, residual_size))
+        .map(|_| KiviCache::new_gpu(kv_heads, head_dim, max_seq_len, residual_size, 2, backend.clone(), memory.clone()))
         .collect();
 
     // ── 3. Pre-allocate decode buffers ──
@@ -2623,7 +2633,7 @@ fn run_kivi(
 
     // Create KiviCache per layer
     let mut kv_caches: Vec<KiviCache> = (0..num_layers)
-        .map(|_| KiviCache::new(kv_heads, head_dim, max_seq_len, residual_size))
+        .map(|_| KiviCache::new_gpu(kv_heads, head_dim, max_seq_len, residual_size, 2, backend.clone(), memory.clone()))
         .collect();
 
     let vocab_size = model.config.vocab_size;
