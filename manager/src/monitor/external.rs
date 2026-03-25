@@ -2,6 +2,7 @@ use super::Monitor;
 use crate::config::ExternalMonitorConfig;
 use llm_shared::SystemSignal;
 use std::io::{BufRead, BufReader};
+use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,16 +21,21 @@ pub enum ExternalTransport {
     /// Listen on a Unix socket for incoming signals.
     /// Wire format: one JSON object per line (JSON Lines).
     UnixSocket(String),
+    /// Listen on a TCP socket for incoming signals.
+    /// Wire format: one JSON object per line (JSON Lines).
+    Tcp(String),
     /// Read from stdin (for pipe mode).
     Stdin,
 }
 
 impl ExternalMonitor {
     pub fn new(config: &ExternalMonitorConfig) -> Self {
-        let transport = if config.transport == "stdin" {
+        let transport = if config.transport == "stdin" || config.transport == "-" {
             ExternalTransport::Stdin
         } else if let Some(path) = config.transport.strip_prefix("unix:") {
             ExternalTransport::UnixSocket(path.to_string())
+        } else if let Some(addr) = config.transport.strip_prefix("tcp:") {
+            ExternalTransport::Tcp(addr.to_string())
         } else {
             log::warn!(
                 "[ExternalMonitor] Unknown transport '{}', defaulting to stdin",
@@ -117,6 +123,42 @@ impl ExternalMonitor {
         let _ = std::fs::remove_file(path);
         Ok(())
     }
+
+    fn run_tcp_socket(
+        &self,
+        addr: &str,
+        tx: &mpsc::Sender<SystemSignal>,
+        shutdown: &Arc<AtomicBool>,
+    ) -> anyhow::Result<()> {
+        let listener = TcpListener::bind(addr)?;
+        listener.set_nonblocking(true)?;
+        log::info!("[ExternalMonitor] TCP listening on {}", addr);
+
+        loop {
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+
+            match listener.accept() {
+                Ok((stream, peer)) => {
+                    log::info!("[ExternalMonitor] TCP client connected from {}", peer);
+                    stream.set_nonblocking(false)?;
+                    let reader = BufReader::new(stream);
+                    self.run_with_reader(reader, tx, shutdown);
+                    log::info!("[ExternalMonitor] TCP client disconnected, waiting for next...");
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => {
+                    log::error!("[ExternalMonitor] TCP accept error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl Monitor for ExternalMonitor {
@@ -136,6 +178,10 @@ impl Monitor for ExternalMonitor {
             ExternalTransport::UnixSocket(path) => {
                 let path = path.clone();
                 self.run_unix_socket(&path, &tx, &shutdown)?;
+            }
+            ExternalTransport::Tcp(addr) => {
+                let addr = addr.clone();
+                self.run_tcp_socket(&addr, &tx, &shutdown)?;
             }
         }
 

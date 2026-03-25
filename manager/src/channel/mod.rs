@@ -1,4 +1,7 @@
+pub mod tcp;
 pub mod unix_socket;
+
+pub use tcp::TcpChannel;
 
 use llm_shared::EngineMessage;
 

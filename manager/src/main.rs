@@ -1,5 +1,6 @@
 use clap::Parser;
 use llm_manager::channel::EngineReceiver;
+use llm_manager::channel::TcpChannel;
 use llm_manager::channel::unix_socket::UnixSocketChannel;
 use llm_manager::config::{Config, PolicyConfig};
 use llm_manager::emitter::Emitter;
@@ -16,10 +17,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Transport 핸들. unix socket은 양방향, dbus는 emit-only.
+/// Transport 핸들. unix socket / tcp는 양방향, dbus는 emit-only.
 enum TransportHandle {
     /// Unix socket — Emitter + EngineReceiver 겸용.
     Unix(UnixSocketChannel),
+    /// TCP socket — Emitter + EngineReceiver 겸용.
+    Tcp(TcpChannel),
     /// D-Bus 또는 기타 단방향 emitter.
     EmitterOnly(Box<dyn Emitter>),
 }
@@ -28,6 +31,7 @@ impl TransportHandle {
     fn emitter(&mut self) -> &mut dyn Emitter {
         match self {
             Self::Unix(ch) => ch,
+            Self::Tcp(ch) => ch,
             Self::EmitterOnly(em) => em.as_mut(),
         }
     }
@@ -35,15 +39,17 @@ impl TransportHandle {
     fn name(&self) -> &str {
         match self {
             Self::Unix(ch) => ch.name(),
+            Self::Tcp(ch) => ch.name(),
             Self::EmitterOnly(em) => em.name(),
         }
     }
 
     /// Engine으로부터 메시지를 non-blocking으로 수신한다.
-    /// Unix transport일 때만 실제 수신 시도. dbus는 항상 None.
+    /// Unix / TCP transport일 때만 실제 수신 시도. dbus는 항상 None.
     fn try_recv_engine_message(&mut self) -> Option<EngineMessage> {
         match self {
             Self::Unix(ch) => ch.try_recv().ok().flatten(),
+            Self::Tcp(ch) => ch.try_recv().ok().flatten(),
             Self::EmitterOnly(_) => None,
         }
     }
@@ -64,7 +70,7 @@ struct Args {
     #[arg(short, long, default_value = "/etc/llm-manager/config.toml")]
     config: std::path::PathBuf,
 
-    /// Transport: "dbus" (Linux System Bus) or "unix:<socket_path>".
+    /// Transport: "dbus" (Linux System Bus), "unix:<socket_path>", or "tcp:<host:port>".
     #[arg(short, long, default_value = "dbus")]
     transport: String,
 
@@ -276,11 +282,25 @@ fn create_transport(args: &Args, shutdown: &Arc<AtomicBool>) -> anyhow::Result<T
             log::warn!("No client connected within timeout, proceeding anyway");
         }
         Ok(TransportHandle::Unix(channel))
+    } else if let Some(addr) = args.transport.strip_prefix("tcp:") {
+        let mut channel = TcpChannel::new(addr)?;
+        log::info!(
+            "TCP transport: waiting for client on {} (timeout={}s)...",
+            addr,
+            args.client_timeout
+        );
+        if !channel.wait_for_client(Duration::from_secs(args.client_timeout), shutdown) {
+            if shutdown.load(Ordering::Relaxed) {
+                anyhow::bail!("Shutdown during client wait");
+            }
+            anyhow::bail!("TCP: no client connected within {}s", args.client_timeout);
+        }
+        Ok(TransportHandle::Tcp(channel))
     } else if args.transport == "dbus" {
         Ok(TransportHandle::EmitterOnly(create_dbus_emitter()?))
     } else {
         anyhow::bail!(
-            "Unknown transport: {}. Use 'dbus' or 'unix:<path>'",
+            "Unknown transport: {}. Use 'dbus', 'unix:<path>', or 'tcp:<host:port>'",
             args.transport
         );
     }
