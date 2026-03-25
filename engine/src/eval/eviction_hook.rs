@@ -8,7 +8,7 @@ use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 use super::qcf_helpers::{aggregate_eviction_metrics, metric_to_json};
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
-use crate::core::kv_cache::{KVCache, KVCacheOps};
+use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::QcfConfig;
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
@@ -127,11 +127,11 @@ impl StepHook<KVCache> for EvictionHook {
         step: usize,
         qcf_metrics: &mut Vec<serde_json::Value>,
     ) -> PostStepResult {
-        if caches.is_empty() || caches[0].current_pos() <= self.effective_budget {
+        if caches.is_empty() || max_cache_pos(caches) <= self.effective_budget {
             return PostStepResult::default();
         }
 
-        let before_len = caches[0].current_pos();
+        let before_len = max_cache_pos(caches);
         let ratio = self.effective_budget as f32 / before_len as f32;
 
         // For GPU backends (as_ptr() == null), read V buffer back to CPU so that

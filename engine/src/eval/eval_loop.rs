@@ -339,11 +339,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         );
 
         // ── Per-question result JSON ──
-        let final_cache_pos = if kv_caches.is_empty() {
-            0
-        } else {
-            kv_caches[0].current_pos()
-        };
+        let final_cache_pos = kv_caches.iter().map(|c| c.current_pos()).max().unwrap_or(0);
 
         let extra = hook.extra_question_fields(kv_caches);
 
@@ -775,7 +771,8 @@ fn run_chunked_prefill<C: KVCacheOps>(
     }
 
     // Single eviction after all prompt tokens: evict from prompt_len to budget
-    if !kv_caches.is_empty() && kv_caches[0].current_pos() > effective_budget {
+    let max_pos = kv_caches.iter().map(|c| c.current_pos()).max().unwrap_or(0);
+    if max_pos > effective_budget {
         hook.post_decode_step(kv_caches, start_pos, qcf_metrics);
     }
 

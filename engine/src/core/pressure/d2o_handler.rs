@@ -12,7 +12,7 @@
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
 use crate::core::buffer::DType;
-use crate::core::kv_cache::KVCache;
+use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::quant::{BlockQ4_0, QK4_0};
 use anyhow::Result;
 use half::f16;
@@ -102,6 +102,20 @@ impl D2OHandler {
             config,
             state: Mutex::new(D2OState::new()),
         }
+    }
+
+    /// Check if a layer should be protected from eviction.
+    fn is_protected(&self, layer_idx: usize, num_layers: usize) -> bool {
+        // Protected layers from config
+        if self.config.protected_layers.contains(&layer_idx) {
+            return true;
+        }
+        // When layer allocation is active, always protect the last layer
+        // (matching official D2O code behavior)
+        if self.config.use_layer_allocation && layer_idx == num_layers - 1 {
+            return true;
+        }
+        false
     }
 
     /// Create with default configuration.
@@ -254,7 +268,7 @@ impl CachePressureHandler for D2OHandler {
             return Ok(ActionResult::NoOp);
         }
 
-        // Validate: all caches must use the same layout.
+        // Validate layout consistency
         debug_assert!(
             ctx.caches
                 .windows(2)
@@ -267,13 +281,15 @@ impl CachePressureHandler for D2OHandler {
             None => return Ok(ActionResult::NoOp),
         };
 
-        let current_pos = ctx.caches[0].current_pos;
-        // Use signal's target_ratio if provided, otherwise fall back to config
+        let num_layers = ctx.caches.len();
+        let current_pos = max_cache_pos(ctx.caches);
         let effective_ratio = ctx.target_ratio.unwrap_or(self.config.target_ratio);
-        let target_len = ((current_pos as f32) * effective_ratio) as usize;
-        let target_len = target_len.max(1);
 
-        if current_pos <= target_len {
+        // Default uniform target_len (used when layer_ratios is None)
+        let uniform_target = ((current_pos as f32) * effective_ratio) as usize;
+        let uniform_target = uniform_target.max(1);
+
+        if current_pos <= uniform_target && ctx.layer_ratios.is_none() {
             return Ok(ActionResult::NoOp);
         }
 
@@ -281,25 +297,51 @@ impl CachePressureHandler for D2OHandler {
         let mut total_removed = 0;
         let mut min_new_pos = usize::MAX;
 
-        for cache in ctx.caches.iter_mut() {
-            // Phase A: uniform budget (same target_len for all layers)
-            // Phase B will use per-layer α_l from attention variance
-            let removed = self.evict_and_merge(cache, target_len, importance, &mut state)?;
+        for (layer_idx, cache) in ctx.caches.iter_mut().enumerate() {
+            // Layer protection
+            if self.is_protected(layer_idx, num_layers) {
+                min_new_pos = min_new_pos.min(cache.current_pos);
+                continue;
+            }
+
+            // Per-layer target from layer_ratios or uniform fallback
+            let layer_target = if let Some(ratios) = ctx.layer_ratios {
+                if layer_idx < ratios.len() {
+                    let (hh_r, rec_r) = ratios[layer_idx];
+                    let ratio = (hh_r + rec_r).clamp(0.01, 1.0);
+                    ((cache.current_pos as f32 * ratio) as usize).max(1)
+                } else {
+                    uniform_target
+                }
+            } else {
+                uniform_target
+            };
+
+            if cache.current_pos <= layer_target {
+                min_new_pos = min_new_pos.min(cache.current_pos);
+                continue;
+            }
+
+            let removed = self.evict_and_merge(cache, layer_target, importance, &mut state)?;
             total_removed += removed;
             min_new_pos = min_new_pos.min(cache.current_pos);
         }
 
         if total_removed > 0 {
+            let active_layers = (0..num_layers)
+                .filter(|&l| !self.is_protected(l, num_layers))
+                .count()
+                .max(1);
             log::info!(
                 "[D2O] Evicted {} tokens across {} layers (merged={}, deleted={}), new_pos={}",
                 total_removed,
-                ctx.caches.len(),
+                active_layers,
                 state.total_merged,
                 state.total_deleted,
                 min_new_pos,
             );
             Ok(ActionResult::Evicted {
-                tokens_removed: total_removed / ctx.caches.len(), // per-layer average
+                tokens_removed: total_removed / active_layers,
                 new_pos: min_new_pos,
             })
         } else {
@@ -702,6 +744,11 @@ mod tests {
     use std::sync::Arc;
 
     // ── Test helpers ──
+
+    /// Create multiple KVCaches all at the same position (for multi-layer tests).
+    fn make_caches(n_layers: usize, pos: usize) -> Vec<KVCache> {
+        (0..n_layers).map(|_| make_cache(100, 1, 4, pos)).collect()
+    }
 
     /// Create a KVCache with known K/V values for testing.
     /// Layout: SeqMajor [1, max_seq, kv_heads, head_dim].
@@ -1777,5 +1824,103 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Layer protection tests ──
+
+    #[test]
+    fn test_layer_protection() {
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.75,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: true,
+            protected_layers: vec![0, 1],
+        });
+
+        // 4 layers, all at pos 20
+        let mut caches = make_caches(4, 20);
+        let importance: Vec<f32> = (0..20).map(|i| i as f32).collect();
+
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Emergency,
+            mem_available: 0,
+            target_ratio: Some(0.5),
+            qcf_sink: None,
+            layer_ratios: None,
+        };
+
+        handler.handle(&mut ctx).unwrap();
+
+        // Layers 0, 1 are protected (from config)
+        // Layer 3 is protected (last layer, use_layer_allocation=true)
+        // Only layer 2 should be evicted
+        assert_eq!(ctx.caches[0].current_pos, 20, "Layer 0 should be protected");
+        assert_eq!(ctx.caches[1].current_pos, 20, "Layer 1 should be protected");
+        assert!(ctx.caches[2].current_pos < 20, "Layer 2 should be evicted");
+        assert_eq!(
+            ctx.caches[3].current_pos, 20,
+            "Layer 3 (last) should be protected"
+        );
+    }
+
+    #[test]
+    fn test_per_layer_different_budgets() {
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.75,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
+        });
+
+        // 3 layers, all at pos 40
+        let mut caches = make_caches(3, 40);
+        // Write distinct K vectors so similarity calculations work
+        for cache in caches.iter_mut() {
+            for pos in 0..40 {
+                let angle = pos as f32 * 0.2;
+                let off = cache.offset(pos, 0);
+                let k = cache.k_buffer.as_mut_slice::<f32>();
+                k[off] = angle.cos();
+                k[off + 1] = angle.sin();
+                k[off + 2] = 0.0;
+                k[off + 3] = 0.0;
+            }
+        }
+        let importance: Vec<f32> = (0..40).map(|i| i as f32).collect();
+
+        // Different ratios per layer: layer 0 keeps 80%, layer 1 keeps 50%, layer 2 keeps 20%
+        let layer_ratios = vec![(0.6, 0.2), (0.375, 0.125), (0.15, 0.05)];
+
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Emergency,
+            mem_available: 0,
+            target_ratio: Some(0.5),
+            qcf_sink: None,
+            layer_ratios: Some(&layer_ratios),
+        };
+
+        handler.handle(&mut ctx).unwrap();
+
+        // Layer 0 should keep more tokens than layer 2
+        assert!(
+            ctx.caches[0].current_pos > ctx.caches[2].current_pos,
+            "Layer 0 (high budget) should keep more tokens than layer 2 (low budget): {} vs {}",
+            ctx.caches[0].current_pos,
+            ctx.caches[2].current_pos,
+        );
     }
 }
