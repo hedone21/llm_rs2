@@ -117,7 +117,7 @@ impl TransformerLayer {
                 backend.cast(&ws.v, v_c)?;
                 kv_cache.update(k_c, v_c)?;
             } else {
-                kv_cache.update(&k_rope, &ws.v)?;
+                super::update_kv_cache(kv_cache, &k_rope, &ws.v, backend)?;
             }
 
             let cache_seq_len = kv_cache.current_pos();
@@ -515,7 +515,7 @@ impl TransformerLayer {
                 backend.cast(&v, &mut v_cast)?;
                 kv_cache.update(&k_cast, &v_cast)?;
             } else {
-                kv_cache.update(&k_rope, &v)?;
+                super::update_kv_cache(kv_cache, &k_rope, &v, backend)?;
             }
 
             let cache_seq_len = kv_cache.current_pos();

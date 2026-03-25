@@ -574,6 +574,7 @@ fn run_prefill<C: KVCacheOps>(
             vocab_size,
             eval_config,
             skip_config,
+            prefill_ws,
         )
     } else {
         run_full_prefill(
@@ -682,6 +683,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
+    mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let effective_budget = eval_config.effective_budget;
     let first_chunk_len = effective_budget;
@@ -700,9 +702,12 @@ fn run_chunked_prefill<C: KVCacheOps>(
     );
     let input_tensor = backend.copy_from(&cpu_input)?;
 
-    let prefill_buf = memory.alloc(first_chunk_len * vocab_size * 4, DType::F32)?;
+    // Only allocate for last position's logits — the first chunk logits are
+    // never read (only the final decode-step logits are returned). This saves
+    // ~116 MB of GPU memory for vocab_size=151936 × budget=200.
+    let prefill_buf = memory.alloc(vocab_size * 4, DType::F32)?;
     let mut prefill_logits = Tensor::new(
-        Shape::new(vec![1, first_chunk_len, vocab_size]),
+        Shape::new(vec![1, 1, vocab_size]),
         prefill_buf,
         backend.clone(),
     );
@@ -725,9 +730,16 @@ fn run_chunked_prefill<C: KVCacheOps>(
         profiler: None,
         skip_config,
         importance_collector: None,
-        logits_last_only: false,
-        prefill_ws: None,
+        logits_last_only: true,
+        prefill_ws: prefill_ws.as_deref_mut(),
     })?;
+
+    // Explicitly drop GPU buffers and flush queue to free VRAM before the
+    // decode loop. Mirrors the cleanup in run_full_prefill that prevents
+    // NVIDIA OpenCL driver crashes from accumulated deferred buffer releases.
+    drop(prefill_logits);
+    drop(input_tensor);
+    backend.synchronize()?;
 
     // Evict if over budget after first chunk
     if !kv_caches.is_empty() && kv_caches[0].current_pos() > effective_budget {

@@ -4,6 +4,7 @@ mod forward_gen;
 use crate::backend::cpu::CpuBackend;
 use crate::core::backend::Backend;
 use crate::core::buffer::DType;
+use crate::core::buffer::Buffer;
 use crate::core::kv_cache::{KVCache, KVCacheOps, KVLayout};
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
@@ -13,8 +14,58 @@ use anyhow::Result;
 use rayon::prelude::*;
 use std::sync::Arc;
 
+use crate::buffer::shared_buffer::SharedBuffer;
+
 // Re-export OpProfiler from its canonical location for backward compatibility.
 pub use crate::profile::ops::OpProfiler;
+
+/// Update KV cache with K/V tensors, handling GPU→CPU readback when needed.
+///
+/// GPU-only tensors (`as_ptr()` returns null, e.g. NVIDIA UnifiedBuffer) are
+/// read back to CPU when the cache does not support direct GPU buffer access
+/// (e.g. `KiviCache`). Regular `KVCache` handles GPU tensors internally via
+/// `backend.copy_slice`, so no readback occurs for the common case.
+pub(super) fn update_kv_cache<C: KVCacheOps>(
+    kv_cache: &mut C,
+    k: &Tensor,
+    v: &Tensor,
+    backend: &Arc<dyn Backend>,
+) -> Result<()> {
+    // Fast path: tensors have CPU pointers (ARM shared memory or CPU backend)
+    if !k.as_ptr().is_null() {
+        return kv_cache.update(k, v);
+    }
+
+    // GPU-only tensors: check if cache can handle them directly.
+    // KVCache.get_buffers_mut() returns Some (GPU copy_slice works);
+    // KiviCache returns None (CPU-only, needs readback).
+    {
+        let has_gpu_buffers = kv_cache.get_buffers_mut().is_some();
+        if has_gpu_buffers {
+            return kv_cache.update(k, v);
+        }
+    }
+
+    // CPU-only cache (e.g. KiviCache): read GPU data back to CPU
+    let k_cpu = gpu_readback(k, backend)?;
+    let v_cpu = gpu_readback(v, backend)?;
+    kv_cache.update(&k_cpu, &v_cpu)
+}
+
+/// Read a GPU tensor back to a CPU SharedBuffer tensor.
+fn gpu_readback(tensor: &Tensor, backend: &Arc<dyn Backend>) -> Result<Tensor> {
+    let byte_size = tensor.buffer().size();
+    let cpu_buf = Arc::new(SharedBuffer::new(byte_size, tensor.dtype()));
+    unsafe {
+        let dst = std::slice::from_raw_parts_mut(cpu_buf.as_mut_ptr(), byte_size);
+        backend.read_buffer(tensor, dst)?;
+    }
+    Ok(Tensor::new(
+        tensor.shape().clone(),
+        cpu_buf,
+        Arc::new(CpuBackend::new()),
+    ))
+}
 
 // --- x86_64 AVX2 SIMD helpers for attention ---
 

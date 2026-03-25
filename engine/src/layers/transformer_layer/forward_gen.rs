@@ -210,7 +210,7 @@ impl TransformerLayer {
             backend.cast(&ws.v, v_cast)?;
             kv_cache.update(k_cast, v_cast)?;
         } else {
-            kv_cache.update(&k_rope, &ws.v)?;
+            super::update_kv_cache(kv_cache, &k_rope, &ws.v, backend)?;
         }
         prof_record!(t, kv_update);
 
