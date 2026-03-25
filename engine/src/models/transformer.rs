@@ -806,7 +806,9 @@ impl TransformerModel {
         // Use caller-provided prefill workspace or create one for this call.
         let mut prefill_ws = args.prefill_ws;
         let mut owned_prefill_ws;
-        if prefill_ws.is_none() && seq_len > 1 && backend.name() == "OpenCL" {
+        let no_prefill_ws = std::env::var("LLM_NO_PREFILL_WS").is_ok();
+        let mut needs_ws_sync = false; // synchronize before owned_prefill_ws drop
+        if prefill_ws.is_none() && seq_len > 1 && backend.name() == "OpenCL" && !no_prefill_ws {
             use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
             let ws_cfg = WsCfg {
                 batch_size,
@@ -821,6 +823,7 @@ impl TransformerModel {
             owned_prefill_ws =
                 PrefillWorkspace::new(&ws_cfg, seq_len, memory, backend.clone()).ok();
             prefill_ws = owned_prefill_ws.as_mut();
+            needs_ws_sync = prefill_ws.is_some();
         }
 
         // 2. Iterate layers
@@ -938,6 +941,13 @@ impl TransformerModel {
             backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
         }
 
+        // Synchronize before owned PrefillWorkspace drop — ensures all GPU kernels
+        // referencing workspace buffers have completed before clReleaseMemObject.
+        // Without this, Adreno drivers may reclaim mapped memory prematurely.
+        if needs_ws_sync {
+            backend.synchronize()?;
+        }
+
         Ok(())
     }
 
@@ -958,6 +968,11 @@ impl TransformerModel {
 
         if self.config.has_qkv_bias {
             return None; // Bias not yet supported in GPU plan
+        }
+
+        // GPU plan only supports F16 weights (kernel_mul_mat_f16_f32)
+        if self.layers[0].wq.dtype() != crate::core::buffer::DType::F16 {
+            return None;
         }
 
         if backend.name() != "OpenCL" || kv_caches.is_empty() {

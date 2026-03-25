@@ -86,6 +86,14 @@ struct Args {
     #[arg(long, default_value_t = false)]
     gpu_attn: bool,
 
+    /// Disable GPU kernel plan for decode (fallback to forward_into every token)
+    #[arg(long, default_value_t = false)]
+    no_gpu_plan: bool,
+
+    /// Disable PrefillWorkspace (fallback to per-layer alloc during prefill)
+    #[arg(long, default_value_t = false)]
+    no_prefill_ws: bool,
+
     /// Enable profiling (per-op timing, latency, score snapshots).
     #[arg(long, default_value_t = false)]
     profile: bool,
@@ -1380,6 +1388,7 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "opencl")]
         let mut gpu_plan = if backend.name() == "OpenCL"
             && !args.profile
+            && !args.no_gpu_plan
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
@@ -1529,7 +1538,11 @@ fn main() -> anyhow::Result<()> {
 
                 // Rebuild plan after fallback (KV cache may have grown)
                 #[cfg(feature = "opencl")]
-                if gpu_plan.is_none() && backend.name() == "OpenCL" && !args.profile {
+                if gpu_plan.is_none()
+                    && backend.name() == "OpenCL"
+                    && !args.profile
+                    && !args.no_gpu_plan
+                {
                     gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                 }
             }
