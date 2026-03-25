@@ -2340,7 +2340,17 @@ fn run_kivi_ppl(
 
     // ── 2. Create KiviCache per layer ──
     let mut kv_caches: Vec<KiviCache> = (0..num_layers)
-        .map(|_| KiviCache::new_gpu(kv_heads, head_dim, max_seq_len, residual_size, 2, backend.clone(), memory.clone()))
+        .map(|_| {
+            KiviCache::new_gpu(
+                kv_heads,
+                head_dim,
+                max_seq_len,
+                residual_size,
+                2,
+                backend.clone(),
+                memory.clone(),
+            )
+        })
         .collect();
 
     // ── 3. Pre-allocate decode buffers ──
@@ -2633,7 +2643,17 @@ fn run_kivi(
 
     // Create KiviCache per layer
     let mut kv_caches: Vec<KiviCache> = (0..num_layers)
-        .map(|_| KiviCache::new_gpu(kv_heads, head_dim, max_seq_len, residual_size, 2, backend.clone(), memory.clone()))
+        .map(|_| {
+            KiviCache::new_gpu(
+                kv_heads,
+                head_dim,
+                max_seq_len,
+                residual_size,
+                2,
+                backend.clone(),
+                memory.clone(),
+            )
+        })
         .collect();
 
     let vocab_size = model.config.vocab_size;
@@ -3653,6 +3673,7 @@ fn run_ppl(
                                         scores,
                                         &kv_caches[0],
                                         &qcf_config,
+                                        None,
                                     );
                                     qcf_metrics.push(serde_json::json!({
                                         "step": i,
@@ -3673,6 +3694,7 @@ fn run_ppl(
                                         head_attn,
                                         &kv_caches[0],
                                         &qcf_config,
+                                        None,
                                     );
                                     qcf_metrics.push(serde_json::json!({
                                         "step": i,
@@ -3706,6 +3728,7 @@ fn run_ppl(
                                 &kv_caches[0],
                                 before_len,
                                 &qcf_config,
+                                None,
                             );
                             qcf_metrics.push(serde_json::json!({
                                 "step": i,
@@ -3731,6 +3754,7 @@ fn run_ppl(
                                 head_attn,
                                 &kv_caches[0],
                                 &qcf_config,
+                                None,
                             );
                             qcf_metrics.push(serde_json::json!({
                                 "step": i,

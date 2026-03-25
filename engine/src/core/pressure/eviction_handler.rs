@@ -77,6 +77,7 @@ impl EvictionHandler {
                     &ctx.caches[0],
                     current_pos,
                     config,
+                    None, // EvictionHandler has no backend reference; GPU path falls through
                 );
                 sink.push(metric);
             }
@@ -98,6 +99,7 @@ impl EvictionHandler {
                     importance,
                     &ctx.caches[0],
                     config,
+                    None, // EvictionHandler has no backend reference; GPU path falls through
                 );
                 sink.push(metric);
             }

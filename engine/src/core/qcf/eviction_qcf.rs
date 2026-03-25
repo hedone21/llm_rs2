@@ -22,6 +22,7 @@ pub fn compute_eviction_qcf_attn(
     all_scores: &[f32],
     cache: &KVCache,
     config: &QcfConfig,
+    v_data_override: Option<&[f32]>,
 ) -> QcfMetric {
     let kv_heads = cache.kv_heads();
     let head_dim = cache.head_dim();
@@ -40,8 +41,8 @@ pub fn compute_eviction_qcf_attn(
         };
     }
 
-    // Access V buffer as f32 slice
-    let v_data = cache.v_buffer.as_slice::<f32>();
+    // Access V buffer: use readback data if provided (GPU path), otherwise CPU-direct
+    let v_data = v_data_override.unwrap_or_else(|| cache.v_buffer.as_slice::<f32>());
 
     let mut per_head = vec![0.0f32; kv_heads];
     let mut per_head_normalized = vec![0.0f32; kv_heads];
@@ -113,6 +114,7 @@ pub fn compute_sliding_qcf_attn(
     cache: &KVCache,
     current_pos: usize,
     config: &QcfConfig,
+    v_data_override: Option<&[f32]>,
 ) -> QcfMetric {
     let kv_heads = cache.kv_heads();
     let head_dim = cache.head_dim();
@@ -130,7 +132,8 @@ pub fn compute_sliding_qcf_attn(
         };
     }
 
-    let v_data = cache.v_buffer.as_slice::<f32>();
+    // Access V buffer: use readback data if provided (GPU path), otherwise CPU-direct
+    let v_data = v_data_override.unwrap_or_else(|| cache.v_buffer.as_slice::<f32>());
     let mut per_head_raw = vec![0.0f32; kv_heads];
     let mut per_head_normalized = vec![0.0f32; kv_heads];
 
@@ -279,6 +282,7 @@ pub fn compute_eviction_qcf_caote(
     last_step_head_attn: &[f32],
     cache: &KVCache,
     config: &QcfConfig,
+    v_data_override: Option<&[f32]>,
 ) -> QcfMetric {
     let kv_heads = cache.kv_heads();
     let head_dim = cache.head_dim();
@@ -298,7 +302,8 @@ pub fn compute_eviction_qcf_caote(
     }
 
     let max_seq_len = last_step_head_attn.len() / kv_heads.max(1);
-    let v_data = cache.v_buffer.as_slice::<f32>();
+    // Access V buffer: use readback data if provided (GPU path), otherwise CPU-direct
+    let v_data = v_data_override.unwrap_or_else(|| cache.v_buffer.as_slice::<f32>());
     let mut per_head = vec![0.0f32; kv_heads];
 
     for (h, ph) in per_head.iter_mut().enumerate() {
@@ -385,9 +390,15 @@ pub fn compute_sliding_qcf_caote(
     last_step_head_attn: &[f32],
     cache: &KVCache,
     config: &QcfConfig,
+    v_data_override: Option<&[f32]>,
 ) -> QcfMetric {
-    let mut metric =
-        compute_eviction_qcf_caote(evicted_positions, last_step_head_attn, cache, config);
+    let mut metric = compute_eviction_qcf_caote(
+        evicted_positions,
+        last_step_head_attn,
+        cache,
+        config,
+        v_data_override,
+    );
     metric.action = "sliding_caote".to_string();
     metric
 }
@@ -479,7 +490,7 @@ mod tests {
         // All tokens have uniform attn=1.0
         let all_scores = vec![1.0f32; num_tokens];
         let evicted = vec![(2, 1.0), (3, 1.0)];
-        let metric = compute_eviction_qcf_attn(&evicted, &all_scores, &cache, &config);
+        let metric = compute_eviction_qcf_attn(&evicted, &all_scores, &cache, &config, None);
 
         assert_eq!(metric.action, "eviction_attn");
         assert_eq!(metric.tokens_affected, 2);
@@ -507,7 +518,7 @@ mod tests {
 
         let config = QcfConfig::default();
         let all_scores = vec![1.0f32; 10];
-        let metric = compute_eviction_qcf_attn(&[], &all_scores, &cache, &config);
+        let metric = compute_eviction_qcf_attn(&[], &all_scores, &cache, &config, None);
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.normalized_value, 0.0);
         assert_eq!(metric.tokens_affected, 0);
@@ -540,10 +551,10 @@ mod tests {
 
         // Evict high-norm tokens → higher proxy
         let metric_high =
-            compute_eviction_qcf_attn(&[(2, 1.0), (3, 1.0)], &all_scores, &cache, &config);
+            compute_eviction_qcf_attn(&[(2, 1.0), (3, 1.0)], &all_scores, &cache, &config, None);
         // Evict low-norm tokens → lower proxy
         let metric_low =
-            compute_eviction_qcf_attn(&[(0, 1.0), (1, 1.0)], &all_scores, &cache, &config);
+            compute_eviction_qcf_attn(&[(0, 1.0), (1, 1.0)], &all_scores, &cache, &config, None);
 
         assert!(
             metric_high.raw_value > metric_low.raw_value,
@@ -572,7 +583,8 @@ mod tests {
             make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
         let config = QcfConfig::default();
         let evicted_positions: Vec<usize> = vec![0, 1];
-        let metric = compute_sliding_qcf_attn(&evicted_positions, &cache, num_tokens, &config);
+        let metric =
+            compute_sliding_qcf_attn(&evicted_positions, &cache, num_tokens, &config, None);
 
         assert_eq!(metric.action, "sliding_attn");
         assert!(
@@ -600,7 +612,7 @@ mod tests {
         let cache =
             make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
         let config = QcfConfig::default();
-        let metric = compute_sliding_qcf_attn(&[], &cache, 0, &config);
+        let metric = compute_sliding_qcf_attn(&[], &cache, 0, &config, None);
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.normalized_value, 0.0);
     }
@@ -617,7 +629,8 @@ mod tests {
             make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_data);
         let config = QcfConfig::default();
         let evicted_positions: Vec<usize> = (0..50).collect();
-        let metric = compute_sliding_qcf_attn(&evicted_positions, &cache, num_tokens, &config);
+        let metric =
+            compute_sliding_qcf_attn(&evicted_positions, &cache, num_tokens, &config, None);
         assert!(
             (metric.raw_value - 1.0).abs() < 1e-5,
             "raw={}",
@@ -689,7 +702,7 @@ mod tests {
         let config = QcfConfig::default();
         let all_scores = vec![1.0f32; num_tokens];
         let evicted = vec![(1, 1.0)];
-        let metric = compute_eviction_qcf_attn(&evicted, &all_scores, &cache, &config);
+        let metric = compute_eviction_qcf_attn(&evicted, &all_scores, &cache, &config, None);
 
         assert!(metric.raw_value > 0.0);
         assert!(metric.raw_value <= 1.0);
@@ -721,9 +734,10 @@ mod tests {
         let all_scores = vec![10.0, 1.0, 1.0, 1.0];
 
         // Evict token 0 (attn=10.0): evicted_imp = 10*4 = 40, total_imp = 10*4+1*4+1*4+1*4 = 52
-        let metric_high = compute_eviction_qcf_attn(&[(0, 10.0)], &all_scores, &cache, &config);
+        let metric_high =
+            compute_eviction_qcf_attn(&[(0, 10.0)], &all_scores, &cache, &config, None);
         // Evict token 1 (attn=1.0): evicted_imp = 1*4 = 4, total_imp = 52
-        let metric_low = compute_eviction_qcf_attn(&[(1, 1.0)], &all_scores, &cache, &config);
+        let metric_low = compute_eviction_qcf_attn(&[(1, 1.0)], &all_scores, &cache, &config, None);
 
         assert!(
             metric_high.raw_value > metric_low.raw_value,
@@ -767,7 +781,7 @@ mod tests {
             head_attn[t] = 0.25;
         }
 
-        let metric = compute_eviction_qcf_caote(&[0, 1], &head_attn, &cache, &config);
+        let metric = compute_eviction_qcf_caote(&[0, 1], &head_attn, &cache, &config, None);
         assert_eq!(metric.action, "eviction_caote");
         assert_eq!(metric.tokens_affected, 2);
         // All values identical → residual = 0 → error = 0
@@ -808,9 +822,9 @@ mod tests {
         }
 
         // Evict token 0 (outlier) → high error
-        let metric_outlier = compute_eviction_qcf_caote(&[0], &head_attn, &cache, &config);
+        let metric_outlier = compute_eviction_qcf_caote(&[0], &head_attn, &cache, &config, None);
         // Evict token 1 (normal) → lower error
-        let metric_normal = compute_eviction_qcf_caote(&[1], &head_attn, &cache, &config);
+        let metric_normal = compute_eviction_qcf_caote(&[1], &head_attn, &cache, &config, None);
 
         assert!(
             metric_outlier.raw_value > metric_normal.raw_value,
@@ -859,9 +873,9 @@ mod tests {
         }
 
         // Evict token 0 with high attention → amplification factor 1/(1-0.7) = 3.33
-        let metric_high = compute_eviction_qcf_caote(&[0], &high_attn, &cache, &config);
+        let metric_high = compute_eviction_qcf_caote(&[0], &high_attn, &cache, &config, None);
         // Evict token 0 with uniform attention → amplification factor 1/(1-0.25) = 1.33
-        let metric_uniform = compute_eviction_qcf_caote(&[0], &uniform_attn, &cache, &config);
+        let metric_uniform = compute_eviction_qcf_caote(&[0], &uniform_attn, &cache, &config, None);
 
         assert!(
             metric_high.raw_value > metric_uniform.raw_value,
@@ -881,7 +895,7 @@ mod tests {
         let config = QcfConfig::default();
         let head_attn = vec![0.1f32; kv_heads * max_seq];
 
-        let metric = compute_eviction_qcf_caote(&[], &head_attn, &cache, &config);
+        let metric = compute_eviction_qcf_caote(&[], &head_attn, &cache, &config, None);
         assert_eq!(metric.raw_value, 0.0);
         assert_eq!(metric.tokens_affected, 0);
     }
@@ -918,7 +932,7 @@ mod tests {
         }
 
         // Evict token 0
-        let metric = compute_eviction_qcf_caote(&[0], &head_attn, &cache, &config);
+        let metric = compute_eviction_qcf_caote(&[0], &head_attn, &cache, &config, None);
         let heads = metric.per_head.as_ref().unwrap();
 
         // Head 0: all values identical → error ≈ 0
@@ -937,7 +951,7 @@ mod tests {
         let config = QcfConfig::default();
         let head_attn = vec![0.25f32; kv_heads * max_seq];
 
-        let metric = compute_sliding_qcf_caote(&[0, 1], &head_attn, &cache, &config);
+        let metric = compute_sliding_qcf_caote(&[0, 1], &head_attn, &cache, &config, None);
         assert_eq!(metric.action, "sliding_caote");
     }
 
@@ -1005,13 +1019,14 @@ mod tests {
         //   evicted = 2×4 = 8 → raw = 8/176 ≈ 0.045, normalized = 8/168 ≈ 0.048
         let all_scores = vec![1.0f32; num_tokens];
         let h2o_evicted = vec![(0usize, 1.0f32), (1, 1.0)];
-        let h2o_metric = compute_eviction_qcf_attn(&h2o_evicted, &all_scores, &cache, &config);
+        let h2o_metric =
+            compute_eviction_qcf_attn(&h2o_evicted, &all_scores, &cache, &config, None);
 
         // Sliding: evicts 2 high-norm tokens (positions 4, 5) (oldest in the high-value region)
         //   evicted = 2×40 = 80 → raw = 80/176 ≈ 0.455, normalized = 80/96 ≈ 0.833
         let sliding_evicted_pos = vec![4usize, 5];
         let sliding_metric =
-            compute_sliding_qcf_attn(&sliding_evicted_pos, &cache, num_tokens, &config);
+            compute_sliding_qcf_attn(&sliding_evicted_pos, &cache, num_tokens, &config, None);
 
         assert!(
             h2o_metric.normalized_value < sliding_metric.normalized_value,
@@ -1046,7 +1061,7 @@ mod tests {
         //   evicted_vnorm = (1+1)*4 = 8
         //   raw = 8/88 ≈ 0.0909, normalized = 8/80 = 0.1
         let evicted = vec![0usize, 1];
-        let metric = compute_sliding_qcf_attn(&evicted, &cache, num_tokens, &config);
+        let metric = compute_sliding_qcf_attn(&evicted, &cache, num_tokens, &config, None);
 
         assert_eq!(metric.action, "sliding_attn");
         assert_eq!(metric.tokens_affected, 2);
@@ -1064,7 +1079,8 @@ mod tests {
         // Evict positions 2, 3 (high-norm): evicted_vnorm = 80
         //   raw = 80/88 ≈ 0.909, normalized = 80/8 = 10.0
         let evicted_high = vec![2usize, 3];
-        let metric_high = compute_sliding_qcf_attn(&evicted_high, &cache, num_tokens, &config);
+        let metric_high =
+            compute_sliding_qcf_attn(&evicted_high, &cache, num_tokens, &config, None);
         assert!(
             (metric_high.raw_value - 80.0 / 88.0).abs() < 1e-4,
             "raw_high={}",
@@ -1110,7 +1126,7 @@ mod tests {
         // Head 0: total=8, evicted=4 → raw=0.5, norm=4/4=1.0
         // Head 1: total=24, evicted=20 → raw=20/24≈0.833, norm=20/4=5.0
         let evicted = vec![0usize];
-        let metric = compute_sliding_qcf_attn(&evicted, &cache, num_tokens, &config);
+        let metric = compute_sliding_qcf_attn(&evicted, &cache, num_tokens, &config, None);
 
         assert_eq!(metric.action, "sliding_attn");
         assert_eq!(metric.tokens_affected, 1);
@@ -1133,6 +1149,114 @@ mod tests {
             (metric.normalized_value - 3.0).abs() < 1e-4,
             "norm={}",
             metric.normalized_value
+        );
+    }
+
+    /// Verify that v_data_override replaces cache.v_buffer.as_slice().
+    ///
+    /// The cache V buffer contains 0.0 for all entries, but the override
+    /// slice contains 1.0. If override is respected, results should match
+    /// the non-override call with a cache filled with 1.0.
+    #[test]
+    fn test_v_data_override_replaces_cache_v_buffer() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 4;
+        let max_seq = 64;
+
+        // Cache V buffer: all zeros
+        let v_zeros = vec![0.0f32; max_seq * kv_heads * head_dim];
+        let cache_zero = make_cache_with_v_data(
+            kv_heads,
+            head_dim,
+            num_tokens,
+            KVLayout::HeadMajor,
+            &v_zeros,
+        );
+
+        // Override slice: all 1.0 (same as a normal cache with 1.0 V values)
+        let v_ones = vec![1.0f32; max_seq * kv_heads * head_dim];
+        let cache_ones =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_ones);
+
+        let config = QcfConfig::default();
+        let all_scores = vec![1.0f32; num_tokens];
+        let evicted = vec![(1, 1.0f32), (2, 1.0f32)];
+
+        // Without override: cache_zero gives raw=0 (all V-norms are 0)
+        let metric_zero =
+            compute_eviction_qcf_attn(&evicted, &all_scores, &cache_zero, &config, None);
+        assert_eq!(
+            metric_zero.raw_value, 0.0,
+            "cache_zero without override should give 0"
+        );
+
+        // With override using v_ones data: should give same result as cache_ones
+        let metric_with_override =
+            compute_eviction_qcf_attn(&evicted, &all_scores, &cache_zero, &config, Some(&v_ones));
+        let metric_ones =
+            compute_eviction_qcf_attn(&evicted, &all_scores, &cache_ones, &config, None);
+
+        assert!(
+            (metric_with_override.raw_value - metric_ones.raw_value).abs() < 1e-6,
+            "override should give same result as cache with 1.0 V: override={}, reference={}",
+            metric_with_override.raw_value,
+            metric_ones.raw_value
+        );
+        assert!(
+            metric_with_override.raw_value > 0.0,
+            "override should produce non-zero QCF"
+        );
+    }
+
+    /// Verify v_data_override for compute_sliding_qcf_attn.
+    #[test]
+    fn test_sliding_v_data_override() {
+        let kv_heads = 1;
+        let head_dim = 4;
+        let num_tokens = 6;
+        let max_seq = 64;
+
+        let v_zeros = vec![0.0f32; max_seq * kv_heads * head_dim];
+        let cache_zero = make_cache_with_v_data(
+            kv_heads,
+            head_dim,
+            num_tokens,
+            KVLayout::HeadMajor,
+            &v_zeros,
+        );
+
+        let v_ones = vec![1.0f32; max_seq * kv_heads * head_dim];
+        let cache_ones =
+            make_cache_with_v_data(kv_heads, head_dim, num_tokens, KVLayout::HeadMajor, &v_ones);
+
+        let config = QcfConfig::default();
+        let evicted_positions = vec![0usize, 1];
+
+        // Without override: zeros → raw=0
+        let metric_zero =
+            compute_sliding_qcf_attn(&evicted_positions, &cache_zero, num_tokens, &config, None);
+        assert_eq!(
+            metric_zero.raw_value, 0.0,
+            "zeros without override should give 0"
+        );
+
+        // With override: should match cache_ones result
+        let metric_override = compute_sliding_qcf_attn(
+            &evicted_positions,
+            &cache_zero,
+            num_tokens,
+            &config,
+            Some(&v_ones),
+        );
+        let metric_ones =
+            compute_sliding_qcf_attn(&evicted_positions, &cache_ones, num_tokens, &config, None);
+
+        assert!(
+            (metric_override.raw_value - metric_ones.raw_value).abs() < 1e-6,
+            "sliding override={}, reference={}",
+            metric_override.raw_value,
+            metric_ones.raw_value
         );
     }
 }

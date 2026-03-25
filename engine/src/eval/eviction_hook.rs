@@ -133,11 +133,30 @@ impl StepHook<KVCache> for EvictionHook {
 
         let before_len = caches[0].current_pos();
         let ratio = self.effective_budget as f32 / before_len as f32;
-        // QCF V-norm metrics require CPU-accessible V buffers (as_slice).
-        // On NVIDIA GPU, UnifiedBuffer::as_ptr() returns null, so skip QCF
-        // to avoid SIGSEGV. QCF is a research metric — correctness unaffected.
-        let can_compute_qcf =
-            self.kv_type == "f32" && !caches[0].v_buffer.buffer().as_ptr().is_null();
+
+        // For GPU backends (as_ptr() == null), read V buffer back to CPU so that
+        // QCF/OPR metrics can be computed. Falls back to None on readback failure.
+        let can_compute_qcf = self.kv_type == "f32";
+        let v_cpu_data: Option<Vec<f32>> = if can_compute_qcf
+            && !caches.is_empty()
+            && caches[0].v_buffer.buffer().as_ptr().is_null()
+        {
+            let v_elems = caches[0].v_buffer.buffer().size() / 4;
+            let mut v_buf = vec![0.0f32; v_elems];
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts_mut(v_buf.as_mut_ptr() as *mut u8, v_elems * 4)
+            };
+            match self.backend.read_buffer(&caches[0].v_buffer, byte_slice) {
+                Ok(()) => Some(v_buf),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        // Effective QCF: either CPU-direct or GPU-readback succeeded
+        let can_compute_qcf = can_compute_qcf
+            && !caches.is_empty()
+            && (v_cpu_data.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
 
         let result = if self.score_based_eviction {
             let active = self
@@ -168,6 +187,7 @@ impl StepHook<KVCache> for EvictionHook {
                             &scores,
                             &caches[0],
                             &self.qcf_config,
+                            v_cpu_data.as_deref(),
                         );
                         qcf_metrics.push(metric_to_json(&metric, step, before_len));
                     }
@@ -183,6 +203,7 @@ impl StepHook<KVCache> for EvictionHook {
                             head_attn,
                             &caches[0],
                             &self.qcf_config,
+                            v_cpu_data.as_deref(),
                         );
                         qcf_metrics.push(metric_to_json(&metric, step, before_len));
                     }
@@ -212,6 +233,7 @@ impl StepHook<KVCache> for EvictionHook {
                         &caches[0],
                         before_len,
                         &self.qcf_config,
+                        v_cpu_data.as_deref(),
                     );
                     let mut entry = metric_to_json(&metric, step, before_len);
                     entry["cache_pos_after"] = serde_json::json!(evict_result.new_pos);
@@ -233,6 +255,7 @@ impl StepHook<KVCache> for EvictionHook {
                         head_attn,
                         &caches[0],
                         &self.qcf_config,
+                        v_cpu_data.as_deref(),
                     );
                     let mut entry = metric_to_json(&metric, step, before_len);
                     entry["cache_pos_after"] = serde_json::json!(evict_result.new_pos);
