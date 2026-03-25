@@ -288,6 +288,8 @@ impl TransformerLayer {
             args.is_local_attn,
             args.local_attn_window,
             None, // prefill_ws: passed separately via forward_into dispatch
+            0,    // layer_idx: unknown in this path (no variance collector)
+            None, // variance_collector: not available here
         )
     }
 

@@ -25,6 +25,10 @@ impl TransformerLayer {
         is_local_attn: Option<bool>,
         local_attn_window: Option<usize>,
         prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
+        layer_idx: usize,
+        mut variance_collector: Option<
+            &mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector,
+        >,
     ) -> Result<()> {
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
@@ -355,6 +359,24 @@ impl TransformerLayer {
                         };
                         let k_slice = &k_data[k_start..k_start + k_valid_len];
                         let v_slice = &v_data[v_start..v_start + k_valid_len];
+
+                        // D2O: collect per-layer attention column-sums for layer-level allocation.
+                        // Only collect for the first batch element (LLM inference always has batch_size=1).
+                        if b == 0 {
+                            if let Some(ref mut vc) = variance_collector {
+                                vc.collect_layer(
+                                    layer_idx,
+                                    q_slice,
+                                    k_slice,
+                                    seq_len,
+                                    cache_seq_len,
+                                    n_heads_q * head_dim,
+                                    k_pos_stride,
+                                    kv_head_stride,
+                                    start_pos,
+                                );
+                            }
+                        }
 
                         flash_attention_forward_strided(
                             q_slice,

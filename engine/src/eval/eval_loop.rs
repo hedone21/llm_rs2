@@ -268,6 +268,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         skip_config,
                         importance_collector: None,
                         logits_last_only: false,
+                        variance_collector: None,
                     })?;
                     sp += 1;
 
@@ -500,6 +501,7 @@ fn run_importance_pass<C: KVCacheOps>(
         skip_config: None, // intentionally None for importance measurement
         importance_collector: Some(&mut collector),
         logits_last_only: false,
+        variance_collector: None,
     })?;
 
     let table = collector.build();
@@ -640,6 +642,7 @@ fn run_full_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
+        variance_collector: None,
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -724,6 +727,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
+        variance_collector: None,
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
@@ -766,6 +770,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
         start_pos += 1;
     }

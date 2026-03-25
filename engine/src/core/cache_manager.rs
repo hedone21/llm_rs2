@@ -322,6 +322,66 @@ impl CacheManager {
         )
     }
 
+    /// Force eviction with importance scores and per-layer budget ratios.
+    ///
+    /// Used when D2O layer-level allocation is active. Passes `layer_ratios`
+    /// into `HandlerContext` so the D2OHandler can apply per-layer targets.
+    /// Runs at `Emergency` pressure level with scores.
+    pub fn force_evict_with_scores_and_budgets(
+        &self,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        importance: &[f32],
+        layer_ratios: &[(f32, f32)],
+    ) -> Result<EvictionResult> {
+        if caches.is_empty() {
+            return Ok(EvictionResult {
+                evicted: false,
+                tokens_removed: 0,
+                new_pos: 0,
+            });
+        }
+
+        let pressure = PressureLevel::Emergency;
+        let mem_available = 0;
+
+        self.event_sink.emit(CacheEvent::PressureDetected {
+            level: pressure,
+            mem_available,
+            forced: true,
+        });
+
+        log::info!(
+            "[CacheManager] pressure={:?} (forced+layer_ratios), executing '{}'",
+            pressure,
+            self.pipeline.name(),
+        );
+
+        let mut ctx = HandlerContext {
+            caches,
+            importance: Some(importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: pressure,
+            mem_available,
+            target_ratio: Some(target_ratio),
+            qcf_sink: None,
+            layer_ratios: Some(layer_ratios),
+        };
+        let results = self.pipeline.execute(&mut ctx)?;
+        let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);
+
+        if eviction_result.evicted {
+            self.event_sink.emit(CacheEvent::EvictionCompleted {
+                policy: self.pipeline.name(),
+                tokens_removed: eviction_result.tokens_removed,
+                new_pos: eviction_result.new_pos,
+            });
+        }
+
+        Ok(eviction_result)
+    }
+
     /// Force eviction with per-KV-head importance scores.
     ///
     /// Used when H2O+ (GQA-aware) policy needs per-head eviction.

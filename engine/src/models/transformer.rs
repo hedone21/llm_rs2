@@ -98,6 +98,10 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
     pub logits_last_only: bool,
+    /// Optional D2O variance collector for layer-level allocation.
+    /// When provided during prefill, captures per-layer attention column-sums.
+    pub variance_collector:
+        Option<&'a mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector>,
 }
 
 impl TransformerModel {
@@ -762,6 +766,7 @@ impl TransformerModel {
         let mut score_accumulator = args.score_accumulator;
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
+        let mut variance_collector = args.variance_collector;
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -874,6 +879,8 @@ impl TransformerModel {
                         is_local,
                         self.config.sliding_window,
                         Some(pws),
+                        i,
+                        variance_collector.as_deref_mut(),
                     )?;
                 } else {
                     layer.forward(LayerForwardArgs {

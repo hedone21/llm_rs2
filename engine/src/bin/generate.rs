@@ -170,6 +170,14 @@ struct Args {
     #[arg(long, default_value_t = 0.5)]
     d2o_ema_beta: f32,
 
+    /// Enable D2O layer-level dynamic allocation (uses per-layer attention variance from prefill)
+    #[arg(long, default_value_t = false)]
+    d2o_layer_alloc: bool,
+
+    /// Protected layers for D2O layer allocation (comma-separated layer indices, e.g. 0,1,2)
+    #[arg(long, value_delimiter = ',')]
+    d2o_protected_layers: Option<Vec<usize>>,
+
     /// Number of prefix tokens to protect from eviction.
     /// Defaults to 4 for score-based policies (h2o, h2o_plus, d2o) and prompt length for sliding.
     #[arg(long)]
@@ -787,8 +795,8 @@ fn main() -> anyhow::Result<()> {
                 target_ratio: args.eviction_target_ratio,
                 ema_alpha: args.d2o_ema_alpha,
                 ema_beta: args.d2o_ema_beta,
-                use_layer_allocation: false,
-                protected_layers: vec![],
+                use_layer_allocation: args.d2o_layer_alloc,
+                protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
             });
             let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
                 min_level: PressureLevel::Warning,
@@ -1000,6 +1008,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: Some(&mut collector),
             logits_last_only: false,
+            variance_collector: None,
         })?;
 
         let table = collector.build();
@@ -1197,6 +1206,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
         backend.synchronize()?;
 
@@ -1217,6 +1227,22 @@ fn main() -> anyhow::Result<()> {
             cache.current_pos = 0;
         }
     }
+
+    // D2O layer-level allocation: create variance collector before prefill.
+    // Only active when --eviction-policy d2o and --d2o-layer-alloc are both set.
+    let mut variance_collector = if args.d2o_layer_alloc && args.eviction_policy == "d2o" {
+        Some(
+            llm_rs2::core::pressure::d2o_layer_alloc::D2OVarianceCollector::new(
+                model.config.num_hidden_layers,
+                model.config.num_key_value_heads,
+                model.config.num_attention_heads,
+                model.config.head_dim,
+                tokens.len(),
+            ),
+        )
+    } else {
+        None
+    };
 
     // === PREFILL PHASE ===
     {
@@ -1266,6 +1292,7 @@ fn main() -> anyhow::Result<()> {
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: variance_collector.as_mut(),
         })?;
         backend.synchronize()?;
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
@@ -1307,6 +1334,22 @@ fn main() -> anyhow::Result<()> {
         tokens.push(next_token_id);
         start_pos += process_len;
     }
+
+    // D2O: compute per-layer budgets from prefill attention variance.
+    let d2o_layer_ratios: Option<Vec<(f32, f32)>> = if let Some(ref collector) = variance_collector
+    {
+        let budgets = collector.compute_budgets(
+            args.d2o_keep_ratio * args.eviction_target_ratio,
+            (1.0 - args.d2o_keep_ratio) * args.eviction_target_ratio,
+        );
+        log::info!(
+            "[D2O] Layer budgets computed: {:?}",
+            budgets.iter().map(|(h, r)| h + r).collect::<Vec<_>>()
+        );
+        Some(budgets)
+    } else {
+        None
+    };
 
     // Inference profiler (only when --profile is set)
     let mut profiler = if args.profile {
@@ -1537,6 +1580,7 @@ fn main() -> anyhow::Result<()> {
                     skip_config: skip_config.as_ref(),
                     importance_collector: None,
                     logits_last_only: false,
+                    variance_collector: None,
                 })?;
 
                 // Rebuild plan after fallback (KV cache may have grown)
@@ -1617,11 +1661,21 @@ fn main() -> anyhow::Result<()> {
                     // Score-based policies: force evict when cache >= 90% full
                     if let Some(acc) = score_accumulator.as_ref() {
                         if acc.is_active() {
-                            cache_manager.force_evict_with_scores(
-                                &mut kv_caches,
-                                args.eviction_target_ratio,
-                                acc.importance_scores(),
-                            )?
+                            // D2O layer-level allocation: use per-layer budgets if available
+                            if let Some(ref ratios) = d2o_layer_ratios {
+                                cache_manager.force_evict_with_scores_and_budgets(
+                                    &mut kv_caches,
+                                    args.eviction_target_ratio,
+                                    acc.importance_scores(),
+                                    ratios,
+                                )?
+                            } else {
+                                cache_manager.force_evict_with_scores(
+                                    &mut kv_caches,
+                                    args.eviction_target_ratio,
+                                    acc.importance_scores(),
+                                )?
+                            }
                         } else {
                             cache_manager.force_evict(&mut kv_caches, args.eviction_target_ratio)?
                         }
@@ -2445,6 +2499,7 @@ fn run_kivi_ppl(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -2520,6 +2575,7 @@ fn run_kivi_ppl(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
         start_pos += 1;
 
@@ -2774,6 +2830,7 @@ fn run_kivi(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
 
         // Sample last token from prefill logits
@@ -2867,6 +2924,7 @@ fn run_kivi(
             skip_config: kivi_skip_config.as_ref(),
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
@@ -3234,6 +3292,7 @@ fn run_offload(
             skip_config: None,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
 
         // Sample last token from prefill logits
@@ -3327,6 +3386,7 @@ fn run_offload(
                 skip_config: None,
                 importance_collector: None,
                 logits_last_only: false,
+                variance_collector: None,
             },
             &mut prefetch,
         )?;
@@ -3600,6 +3660,7 @@ fn run_ppl(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
 
         // Read all prefill logits to CPU
@@ -3663,6 +3724,7 @@ fn run_ppl(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
+            variance_collector: None,
         })?;
         start_pos += 1;
 
