@@ -1103,6 +1103,17 @@ impl KVCacheOps for KiviCache {
         Ok(())
     }
 
+    fn get_buffers_mut(&mut self) -> Option<(&mut Tensor, &mut Tensor)> {
+        // GPU mode: return residual buffers to signal GPU tensor compatibility.
+        // This tells update_kv_cache() to pass GPU tensors directly instead of
+        // reading back to CPU. The actual data flow goes through update_gpu().
+        if let (Some(k), Some(v)) = (&mut self.gpu_res_k, &mut self.gpu_res_v) {
+            Some((k, v))
+        } else {
+            None
+        }
+    }
+
     fn get_view(&mut self) -> (Tensor, Tensor) {
         // GPU path: return tensors backed by GPU attention buffers
         if self.gpu_backend.is_some() {
