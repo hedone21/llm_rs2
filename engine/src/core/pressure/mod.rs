@@ -9,6 +9,7 @@ use crate::core::kv_cache::KVCache;
 use anyhow::Result;
 
 pub mod d2o_handler;
+pub mod d2o_layer_alloc;
 pub mod eviction_handler;
 pub mod merge_handler;
 pub mod quantize_handler;
@@ -52,6 +53,11 @@ pub struct HandlerContext<'a> {
     /// Optional sink for proxy metrics collected during handler execution.
     /// When `Some`, handlers push `QcfMetric` values for degradation estimation.
     pub qcf_sink: Option<&'a mut Vec<crate::core::qcf::QcfMetric>>,
+    /// Optional per-layer budget ratios from D2O layer-level allocation.
+    /// When Some, D2OHandler uses per-layer target_len instead of uniform.
+    /// Length must equal caches.len().
+    /// Each element: (hh_ratio, recent_ratio) for that layer.
+    pub layer_ratios: Option<&'a [(f32, f32)]>,
 }
 
 // ── Action result ──────────────────────────────────────────────────
@@ -315,6 +321,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -352,6 +359,7 @@ mod tests {
             mem_available: 1024 * 1024 * 1024,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -390,6 +398,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -412,6 +421,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -444,6 +454,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();
@@ -528,6 +539,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let results = pipeline.execute(&mut ctx).unwrap();

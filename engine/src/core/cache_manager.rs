@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::core::events::{CacheEvent, EventSink, NoOpSink};
 use crate::core::eviction::EvictionPolicy;
-use crate::core::kv_cache::KVCache;
+use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::pressure::{
     ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, PressureLevel,
     PressureStageConfig,
@@ -136,11 +136,7 @@ impl CacheManager {
     ) -> EvictionResult {
         let mut total_removed = 0usize;
         let mut any_action = false;
-        let mut last_new_pos = if caches.is_empty() {
-            0
-        } else {
-            caches[0].current_pos
-        };
+        let mut last_new_pos = max_cache_pos(caches);
 
         for r in results {
             match r {
@@ -194,7 +190,7 @@ impl CacheManager {
                     return Ok(EvictionResult {
                         evicted: false,
                         tokens_removed: 0,
-                        new_pos: caches[0].current_pos,
+                        new_pos: max_cache_pos(caches),
                     });
                 }
             };
@@ -203,7 +199,7 @@ impl CacheManager {
                 return Ok(EvictionResult {
                     evicted: false,
                     tokens_removed: 0,
-                    new_pos: caches[0].current_pos,
+                    new_pos: max_cache_pos(caches),
                 });
             }
             (pressure, mem_available)
@@ -241,6 +237,7 @@ impl CacheManager {
             mem_available,
             target_ratio: force_target_ratio,
             qcf_sink: None,
+            layer_ratios: None,
         };
         let results = self.pipeline.execute(&mut ctx)?;
         let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);
@@ -406,7 +403,7 @@ impl CacheManager {
             });
         }
 
-        let current_pos = caches[0].current_pos;
+        let current_pos = max_cache_pos(caches);
         let target_len = ((current_pos as f32) * target_ratio).max(1.0) as usize;
         if current_pos <= target_len {
             return Ok(EvictionResult {
@@ -447,7 +444,7 @@ impl CacheManager {
             }
         }
 
-        let new_pos = caches[0].current_pos;
+        let new_pos = max_cache_pos(caches);
         Ok(EvictionResult {
             evicted: true,
             tokens_removed: current_pos - new_pos,

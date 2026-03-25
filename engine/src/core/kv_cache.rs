@@ -767,6 +767,13 @@ impl KVCacheOps for KVCache {
     }
 }
 
+/// Get the maximum current_pos across all KV caches.
+/// Returns 0 if the slice is empty.
+#[inline]
+pub fn max_cache_pos(caches: &[KVCache]) -> usize {
+    caches.iter().map(|c| c.current_pos).max().unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

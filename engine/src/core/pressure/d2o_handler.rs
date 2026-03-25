@@ -1059,6 +1059,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1156,6 +1157,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1178,6 +1180,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1225,6 +1228,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1257,6 +1261,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
         let result = handler.handle(&mut ctx).unwrap();
         assert!(!result.is_action());
@@ -1300,6 +1305,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1353,6 +1359,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1409,6 +1416,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1585,6 +1593,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         handler.handle(&mut ctx).unwrap();
@@ -1641,6 +1650,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
 
         let result = handler.handle(&mut ctx).unwrap();
@@ -1710,6 +1720,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
         let result_seq = handler_seq.handle(&mut ctx_seq).unwrap();
 
@@ -1727,6 +1738,7 @@ mod tests {
             mem_available: 0,
             target_ratio: None,
             qcf_sink: None,
+            layer_ratios: None,
         };
         let result_hm = handler_hm.handle(&mut ctx_hm).unwrap();
 
