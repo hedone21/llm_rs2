@@ -741,22 +741,14 @@ fn run_chunked_prefill<C: KVCacheOps>(
     drop(input_tensor);
     backend.synchronize()?;
 
-    // Batch eviction headroom: accumulate tokens before triggering eviction to
-    // amortize the cost of shift_positions. Without headroom, each token beyond
-    // the budget triggers a 1-token eviction (O(N) events). With headroom H,
-    // eviction fires every H tokens → ~N/H events, each evicting H tokens.
-    let eviction_headroom = (effective_budget / 4).max(16);
-    let eviction_threshold = effective_budget + eviction_headroom;
-
-    // Evict if over budget after first chunk
-    if !kv_caches.is_empty() && kv_caches[0].current_pos() > eviction_threshold {
-        hook.post_decode_step(kv_caches, 0, qcf_metrics);
-    }
-
     let mut start_pos = first_chunk_len;
 
     // ── Decode remaining prompt tokens one-by-one ──
-    for (decode_idx, &token_id) in prompt_ids[first_chunk_len..].iter().enumerate() {
+    // No eviction during prefill: let KV cache grow to full prompt length.
+    // KV cache has capacity for max_seq_len, so prompt always fits.
+    // Eviction happens once after all prompt tokens are processed — this gives
+    // H2O the full importance picture before selecting heavy hitters.
+    for &token_id in &prompt_ids[first_chunk_len..] {
         // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
         unsafe {
             *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token_id;
@@ -785,11 +777,11 @@ fn run_chunked_prefill<C: KVCacheOps>(
             prefill_ws: None,
         })?;
         start_pos += 1;
+    }
 
-        // Batch eviction: only trigger when accumulated tokens exceed headroom
-        if !kv_caches.is_empty() && kv_caches[0].current_pos() > eviction_threshold {
-            hook.post_decode_step(kv_caches, decode_idx + 1, qcf_metrics);
-        }
+    // Single eviction after all prompt tokens: evict from prompt_len to budget
+    if !kv_caches.is_empty() && kv_caches[0].current_pos() > effective_budget {
+        hook.post_decode_step(kv_caches, start_pos, qcf_metrics);
     }
 
     // Read logits from last decode step
