@@ -741,8 +741,15 @@ fn run_chunked_prefill<C: KVCacheOps>(
     drop(input_tensor);
     backend.synchronize()?;
 
+    // Batch eviction headroom: accumulate tokens before triggering eviction to
+    // amortize the cost of shift_positions. Without headroom, each token beyond
+    // the budget triggers a 1-token eviction (O(N) events). With headroom H,
+    // eviction fires every H tokens → ~N/H events, each evicting H tokens.
+    let eviction_headroom = (effective_budget / 4).max(16);
+    let eviction_threshold = effective_budget + eviction_headroom;
+
     // Evict if over budget after first chunk
-    if !kv_caches.is_empty() && kv_caches[0].current_pos() > effective_budget {
+    if !kv_caches.is_empty() && kv_caches[0].current_pos() > eviction_threshold {
         hook.post_decode_step(kv_caches, 0, qcf_metrics);
     }
 
@@ -779,8 +786,8 @@ fn run_chunked_prefill<C: KVCacheOps>(
         })?;
         start_pos += 1;
 
-        // Check budget and evict if needed
-        if !kv_caches.is_empty() && kv_caches[0].current_pos() > effective_budget {
+        // Batch eviction: only trigger when accumulated tokens exceed headroom
+        if !kv_caches.is_empty() && kv_caches[0].current_pos() > eviction_threshold {
             hook.post_decode_step(kv_caches, decode_idx + 1, qcf_metrics);
         }
     }
