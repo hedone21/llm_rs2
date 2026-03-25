@@ -2,10 +2,12 @@
 //!
 //! Implements the D2O paper (Wan et al., 2024): H2O-style 3-partition eviction
 //! with token merging compensation. Evicted tokens are matched to their nearest
-//! retained neighbor by cosine similarity; if similarity exceeds an EMA threshold,
-//! the evicted token is merged (weighted average) rather than permanently deleted.
+//! retained neighbor by per-head cosine similarity; if head-averaged similarity
+//! exceeds an EMA threshold, the evicted token is merged via scatter-reduce rather
+//! than permanently deleted.
 //!
-//! Phase 1: Uniform per-layer budget (layer-level variance allocation deferred).
+//! Phase A: Per-head scatter-reduce merge + EMA correction (mean-based, alpha/beta=0.5).
+//! Phase B: Layer-level dynamic allocation (deferred).
 //! Supports F32, F16, and Q4_0 KV cache dtypes.
 
 use super::{ActionResult, CachePressureHandler, HandlerContext};
@@ -28,12 +30,14 @@ pub struct D2OConfig {
     /// Target cache ratio: keep this fraction of current_pos after eviction.
     /// E.g. 0.5 = keep 50% of tokens.
     pub target_ratio: f32,
-    /// EMA smoothing constant for similarity threshold (0.0–1.0).
-    /// Higher = more sensitive to current similarities. Paper default: 0.7.
-    pub beta: f32,
-    /// Stability constant for merge weight formula.
-    /// w_retain = e / (exp(sim) + e), w_evict = exp(sim) / (exp(sim) + e).
-    pub merge_e: f32,
+    /// EMA old-threshold weight (official code default 0.5).
+    pub ema_alpha: f32,
+    /// EMA new-mean weight (official code default 0.5).
+    pub ema_beta: f32,
+    /// Enable per-layer dynamic budget allocation (Phase B).
+    pub use_layer_allocation: bool,
+    /// Layer indices to skip eviction entirely.
+    pub protected_layers: Vec<usize>,
 }
 
 impl Default for D2OConfig {
@@ -42,8 +46,10 @@ impl Default for D2OConfig {
             keep_ratio: 0.75,
             protected_prefix: 4,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         }
     }
 }
@@ -70,6 +76,16 @@ impl D2OState {
             total_deleted: 0,
         }
     }
+}
+
+// ── PerHeadMatch ─────────────────────────────────────────────────
+
+/// Per-head nearest neighbor matching result for a single evicted token.
+struct PerHeadMatch {
+    /// Per-head (nearest_retain_pos, cosine_similarity). Length = kv_heads.
+    per_head: Vec<(usize, f32)>,
+    /// Head-averaged similarity (for EMA threshold filtering).
+    mean_sim: f32,
 }
 
 // ── D2OHandler ───────────────────────────────────────────────────
@@ -150,7 +166,7 @@ impl D2OHandler {
             .collect();
         retain_all.sort();
 
-        // ── Step 2: Cosine similarity + merge decision ──
+        // ── Step 2: Per-head nearest neighbor ──
         let kv_heads = cache.kv_heads();
         let head_dim = cache.head_dim();
 
@@ -161,87 +177,66 @@ impl D2OHandler {
             .filter(|&p| p >= prefix)
             .collect();
 
-        if !evict_positions.is_empty() && !merge_targets.is_empty() {
-            // Collect max similarities for EMA initialization
-            let mut max_sims: Vec<f32> = Vec::with_capacity(evict_positions.len());
+        let all_matches: Vec<PerHeadMatch> = evict_positions
+            .iter()
+            .map(|&pos| find_nearest_per_head(cache, pos, &merge_targets, kv_heads, head_dim))
+            .collect();
+        let mean_sims: Vec<f32> = all_matches.iter().map(|m| m.mean_sim).collect();
 
-            // For each evicted token, find nearest retained neighbor and decide merge/delete
-            // Group by nearest neighbor: Vec<(evict_pos, nearest_retain_pos, similarity)>
-            let mut merge_ops: Vec<(usize, usize, f32)> = Vec::new();
-
-            for &evict_pos in &evict_positions {
-                let (nearest_retain_pos, max_sim) =
-                    find_nearest_cosine(cache, evict_pos, &merge_targets, kv_heads, head_dim);
-                max_sims.push(max_sim);
-
-                // Initialize EMA on first eviction
-                if !state.initialized {
-                    // τ_0 = average of max similarities (paper Eq. 10)
-                    // We'll compute after collecting all max_sims
-                } else if max_sim >= state.ema_threshold {
-                    merge_ops.push((evict_pos, nearest_retain_pos, max_sim));
-                }
-            }
-
-            // EMA initialization: τ_0 = mean(max_sims)
-            if !state.initialized && !max_sims.is_empty() {
-                let sum: f32 = max_sims.iter().sum();
-                state.ema_threshold = sum / max_sims.len() as f32;
+        // ── Step 3: EMA threshold ──
+        let just_initialized;
+        if !mean_sims.is_empty() {
+            let mean_of_sims = mean_sims.iter().sum::<f32>() / mean_sims.len() as f32;
+            if !state.initialized {
+                state.ema_threshold = mean_of_sims;
                 state.initialized = true;
-
-                // Re-evaluate merge decisions with the new threshold
-                for (i, &evict_pos) in evict_positions.iter().enumerate() {
-                    if max_sims[i] >= state.ema_threshold {
-                        let (nearest_retain_pos, _) = find_nearest_cosine(
-                            cache,
-                            evict_pos,
-                            &merge_targets,
-                            kv_heads,
-                            head_dim,
-                        );
-                        merge_ops.push((evict_pos, nearest_retain_pos, max_sims[i]));
-                    }
-                }
+                just_initialized = true;
+            } else {
+                state.ema_threshold = self.config.ema_alpha * state.ema_threshold
+                    + self.config.ema_beta * mean_of_sims;
+                just_initialized = false;
             }
+        } else {
+            just_initialized = false;
+        }
+        let _ = just_initialized; // used for clarity in comments
 
-            // Update EMA threshold: τ_t = β * max(U_t) + (1-β) * τ_{t-1}
-            if let Some(&global_max_sim) = max_sims
+        // ── Step 4: Global filter — mean_sim >= threshold ──
+        let passing_indices: Vec<usize> = (0..evict_positions.len())
+            .filter(|&i| mean_sims[i] >= state.ema_threshold)
+            .collect();
+
+        let merge_count = passing_indices.len();
+        let delete_count = evict_positions.len() - merge_count;
+
+        // ── Step 5: Per-head scatter-reduce merge ──
+        if !passing_indices.is_empty() {
+            let passing_positions: Vec<usize> = passing_indices
                 .iter()
-                .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .filter(|_| state.initialized)
-            {
-                state.ema_threshold = self.config.beta * global_max_sim
-                    + (1.0 - self.config.beta) * state.ema_threshold;
-            }
-
-            // ── Step 3: Apply merges ──
-            let merge_count = merge_ops.len();
-            let delete_count = evict_positions.len() - merge_count;
-
-            for (evict_pos, retain_pos, sim) in &merge_ops {
-                weighted_merge(
-                    cache,
-                    *evict_pos,
-                    *retain_pos,
-                    *sim,
-                    self.config.merge_e,
-                    kv_heads,
-                    head_dim,
-                );
-            }
-
-            state.total_merged += merge_count;
-            state.total_deleted += delete_count;
-
-            log::debug!(
-                "[D2O] merged={}, deleted={}, threshold={:.4}",
-                merge_count,
-                delete_count,
-                state.ema_threshold,
+                .map(|&i| evict_positions[i])
+                .collect();
+            let passing_matches: Vec<&PerHeadMatch> =
+                passing_indices.iter().map(|&i| &all_matches[i]).collect();
+            scatter_reduce_merge_per_head(
+                cache,
+                &passing_positions,
+                &passing_matches,
+                kv_heads,
+                head_dim,
             );
         }
 
-        // ── Step 4: Compact cache ──
+        state.total_merged += merge_count;
+        state.total_deleted += delete_count;
+
+        log::debug!(
+            "[D2O] merged={}, deleted={}, threshold={:.4}",
+            merge_count,
+            delete_count,
+            state.ema_threshold,
+        );
+
+        // ── Step 6: Compact cache ──
         for (write_pos, &src_pos) in retain_all.iter().enumerate() {
             if src_pos != write_pos {
                 cache.shift_positions(src_pos, write_pos, 1)?;
@@ -287,8 +282,8 @@ impl CachePressureHandler for D2OHandler {
         let mut min_new_pos = usize::MAX;
 
         for cache in ctx.caches.iter_mut() {
-            // Phase 1: uniform budget (same target_len for all layers)
-            // Phase 2 will use per-layer α_l from attention variance
+            // Phase A: uniform budget (same target_len for all layers)
+            // Phase B will use per-layer α_l from attention variance
             let removed = self.evict_and_merge(cache, target_len, importance, &mut state)?;
             total_removed += removed;
             min_new_pos = min_new_pos.min(cache.current_pos);
@@ -365,197 +360,328 @@ fn dequantize_k(cache: &KVCache, pos: usize, head: usize, head_dim: usize, out: 
     }
 }
 
-/// Find the nearest retained token to `evict_pos` by average cosine similarity
-/// across all KV heads. Returns (retain_position, max_similarity).
-/// Supports F32, F16, and Q4_0 KV cache dtypes.
-fn find_nearest_cosine(
+/// Find the nearest retained token per head independently.
+///
+/// For each KV head, scans all retain positions and finds the one with the
+/// highest cosine similarity to the evicted token at that head.
+/// Returns a `PerHeadMatch` with per-head results and their average.
+#[allow(clippy::needless_range_loop)]
+fn find_nearest_per_head(
     cache: &KVCache,
     evict_pos: usize,
     retain_set: &[usize],
     kv_heads: usize,
     head_dim: usize,
-) -> (usize, f32) {
-    let mut best_pos = retain_set[0];
-    let mut best_sim = f32::NEG_INFINITY;
+) -> PerHeadMatch {
+    let mut per_head = Vec::with_capacity(kv_heads);
     let mut evict_buf = vec![0.0f32; head_dim];
     let mut retain_buf = vec![0.0f32; head_dim];
 
-    for &retain_pos in retain_set {
-        if retain_pos == evict_pos {
-            continue;
-        }
-        let mut total_sim = 0.0f32;
-        for h in 0..kv_heads {
-            dequantize_k(cache, evict_pos, h, head_dim, &mut evict_buf);
+    for h in 0..kv_heads {
+        dequantize_k(cache, evict_pos, h, head_dim, &mut evict_buf);
+
+        let mut best_pos = retain_set[0];
+        let mut best_sim = f32::NEG_INFINITY;
+
+        for &retain_pos in retain_set {
+            if retain_pos == evict_pos {
+                continue;
+            }
             dequantize_k(cache, retain_pos, h, head_dim, &mut retain_buf);
-            total_sim += cosine_similarity(&evict_buf[..head_dim], &retain_buf[..head_dim]);
+            let sim = cosine_similarity(&evict_buf[..head_dim], &retain_buf[..head_dim]);
+            if sim > best_sim {
+                best_sim = sim;
+                best_pos = retain_pos;
+            }
         }
-        total_sim /= kv_heads as f32;
-        if total_sim > best_sim {
-            best_sim = total_sim;
-            best_pos = retain_pos;
-        }
+        per_head.push((best_pos, best_sim));
     }
-    (best_pos, best_sim)
+
+    let mean_sim = if kv_heads > 0 {
+        per_head.iter().map(|(_, s)| s).sum::<f32>() / kv_heads as f32
+    } else {
+        0.0
+    };
+
+    PerHeadMatch { per_head, mean_sim }
 }
 
-/// Weighted merge of evicted token into retained token (both K and V).
+/// Scatter-reduce merge: for each head independently, group evicted tokens by
+/// their per-head nearest retain target and apply mean pooling.
 ///
-/// D2O paper formula:
-///   w_retain = e / (exp(sim) + e)
-///   w_evict  = exp(sim) / (exp(sim) + e)
-///   K[retain] = w_retain * K[retain] + w_evict * K[evict]
-///   V[retain] = w_retain * V[retain] + w_evict * V[evict]
-///
-/// Supports F32 (in-place), F16 (f16↔f32), Q4_0 (deq→merge→req).
-fn weighted_merge(
+/// For each group (retain_pos ← [evict_0, evict_1, ...]):
+///   K[retain, h] = (K[retain, h] + Σ sim_i[h] · K[evict_i, h]) / (1 + N)
+///   V[retain, h] = (V[retain, h] + Σ sim_i[h] · V[evict_i, h]) / (1 + N)
+#[allow(clippy::needless_range_loop)]
+fn scatter_reduce_merge_per_head(
     cache: &mut KVCache,
-    evict_pos: usize,
-    retain_pos: usize,
-    sim: f32,
-    e: f32,
+    passing_positions: &[usize],
+    matches: &[&PerHeadMatch],
     kv_heads: usize,
     head_dim: usize,
 ) {
-    let exp_sim = sim.exp();
-    let denom = exp_sim + e;
-    let w_retain = e / denom;
-    let w_evict = exp_sim / denom;
-
     let dtype = cache.k_buffer.dtype();
     match dtype {
         DType::F32 => {
-            weighted_merge_f32(
-                cache, evict_pos, retain_pos, w_retain, w_evict, kv_heads, head_dim,
-            );
+            scatter_reduce_f32(cache, passing_positions, matches, kv_heads, head_dim);
         }
         DType::F16 => {
-            weighted_merge_f16(
-                cache, evict_pos, retain_pos, w_retain, w_evict, kv_heads, head_dim,
-            );
+            scatter_reduce_f16(cache, passing_positions, matches, kv_heads, head_dim);
         }
         DType::Q4_0 => {
-            weighted_merge_q4(
-                cache, evict_pos, retain_pos, w_retain, w_evict, kv_heads, head_dim,
-            );
+            scatter_reduce_q4(cache, passing_positions, matches, kv_heads, head_dim);
         }
         _ => {}
     }
 }
 
-fn weighted_merge_f32(
+#[allow(clippy::needless_range_loop)]
+fn scatter_reduce_f32(
     cache: &mut KVCache,
-    evict_pos: usize,
-    retain_pos: usize,
-    w_retain: f32,
-    w_evict: f32,
+    passing_positions: &[usize],
+    matches: &[&PerHeadMatch],
     kv_heads: usize,
     head_dim: usize,
 ) {
-    let offsets: Vec<(usize, usize)> = (0..kv_heads)
-        .map(|h| (cache.offset(retain_pos, h), cache.offset(evict_pos, h)))
-        .collect();
-    {
-        let k = cache.k_buffer.as_mut_slice::<f32>();
-        for &(off_r, off_e) in &offsets {
-            for d in 0..head_dim {
-                k[off_r + d] = w_retain * k[off_r + d] + w_evict * k[off_e + d];
-            }
+    use std::collections::HashMap;
+
+    for h in 0..kv_heads {
+        // Group: retain_pos → Vec<(evict_pos, similarity_at_this_head)>
+        let mut groups: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for (i, &evict_pos) in passing_positions.iter().enumerate() {
+            let (retain_pos, sim) = matches[i].per_head[h];
+            groups.entry(retain_pos).or_default().push((evict_pos, sim));
         }
-    }
-    {
-        let v = cache.v_buffer.as_mut_slice::<f32>();
-        for &(off_r, off_e) in &offsets {
-            for d in 0..head_dim {
-                v[off_r + d] = w_retain * v[off_r + d] + w_evict * v[off_e + d];
+
+        for (retain_pos, evicted_list) in &groups {
+            let count = evicted_list.len() + 1; // include retain itself
+            let inv_count = 1.0f32 / count as f32;
+
+            let retain_off = cache.offset(*retain_pos, h);
+
+            // Accumulate weighted sum into retain slot (K)
+            {
+                // Collect evict contributions first to avoid borrow conflict
+                let evict_contributions: Vec<(usize, f32)> = evicted_list
+                    .iter()
+                    .map(|&(ep, s)| (cache.offset(ep, h), s))
+                    .collect();
+                let k = cache.k_buffer.as_mut_slice::<f32>();
+                for d in 0..head_dim {
+                    let mut acc = k[retain_off + d];
+                    for &(evict_off, sim) in &evict_contributions {
+                        acc += sim * k[evict_off + d];
+                    }
+                    k[retain_off + d] = acc * inv_count;
+                }
+            }
+            // V
+            {
+                let evict_contributions: Vec<(usize, f32)> = evicted_list
+                    .iter()
+                    .map(|&(ep, s)| (cache.offset(ep, h), s))
+                    .collect();
+                let v = cache.v_buffer.as_mut_slice::<f32>();
+                for d in 0..head_dim {
+                    let mut acc = v[retain_off + d];
+                    for &(evict_off, sim) in &evict_contributions {
+                        acc += sim * v[evict_off + d];
+                    }
+                    v[retain_off + d] = acc * inv_count;
+                }
             }
         }
     }
 }
 
-fn weighted_merge_f16(
+#[allow(clippy::needless_range_loop)]
+fn scatter_reduce_f16(
     cache: &mut KVCache,
-    evict_pos: usize,
-    retain_pos: usize,
-    w_retain: f32,
-    w_evict: f32,
+    passing_positions: &[usize],
+    matches: &[&PerHeadMatch],
     kv_heads: usize,
     head_dim: usize,
 ) {
-    let offsets: Vec<(usize, usize)> = (0..kv_heads)
-        .map(|h| (cache.offset(retain_pos, h), cache.offset(evict_pos, h)))
-        .collect();
-    {
-        let k = cache.k_buffer.as_mut_slice::<f16>();
-        for &(off_r, off_e) in &offsets {
-            for d in 0..head_dim {
-                let vr = k[off_r + d].to_f32();
-                let ve = k[off_e + d].to_f32();
-                k[off_r + d] = f16::from_f32(w_retain * vr + w_evict * ve);
-            }
+    use std::collections::HashMap;
+
+    for h in 0..kv_heads {
+        let mut groups: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for (i, &evict_pos) in passing_positions.iter().enumerate() {
+            let (retain_pos, sim) = matches[i].per_head[h];
+            groups.entry(retain_pos).or_default().push((evict_pos, sim));
         }
-    }
-    {
-        let v = cache.v_buffer.as_mut_slice::<f16>();
-        for &(off_r, off_e) in &offsets {
-            for d in 0..head_dim {
-                let vr = v[off_r + d].to_f32();
-                let ve = v[off_e + d].to_f32();
-                v[off_r + d] = f16::from_f32(w_retain * vr + w_evict * ve);
+
+        for (retain_pos, evicted_list) in &groups {
+            let count = evicted_list.len() + 1;
+            let inv_count = 1.0f32 / count as f32;
+
+            let retain_off = cache.offset(*retain_pos, h);
+
+            // K
+            {
+                let evict_contributions: Vec<(usize, f32)> = evicted_list
+                    .iter()
+                    .map(|&(ep, s)| (cache.offset(ep, h), s))
+                    .collect();
+                let k = cache.k_buffer.as_mut_slice::<f16>();
+                for d in 0..head_dim {
+                    let mut acc = k[retain_off + d].to_f32();
+                    for &(evict_off, sim) in &evict_contributions {
+                        acc += sim * k[evict_off + d].to_f32();
+                    }
+                    k[retain_off + d] = f16::from_f32(acc * inv_count);
+                }
+            }
+            // V
+            {
+                let evict_contributions: Vec<(usize, f32)> = evicted_list
+                    .iter()
+                    .map(|&(ep, s)| (cache.offset(ep, h), s))
+                    .collect();
+                let v = cache.v_buffer.as_mut_slice::<f16>();
+                for d in 0..head_dim {
+                    let mut acc = v[retain_off + d].to_f32();
+                    for &(evict_off, sim) in &evict_contributions {
+                        acc += sim * v[evict_off + d].to_f32();
+                    }
+                    v[retain_off + d] = f16::from_f32(acc * inv_count);
+                }
             }
         }
     }
 }
 
-fn weighted_merge_q4(
+#[allow(clippy::needless_range_loop)]
+fn scatter_reduce_q4(
     cache: &mut KVCache,
-    evict_pos: usize,
-    retain_pos: usize,
-    w_retain: f32,
-    w_evict: f32,
+    passing_positions: &[usize],
+    matches: &[&PerHeadMatch],
     kv_heads: usize,
     head_dim: usize,
 ) {
+    use std::collections::HashMap;
+
     let blocks_per_pos = head_dim / QK4_0;
-    let block_offsets: Vec<(usize, usize)> = (0..kv_heads)
-        .map(|h| {
-            (
-                cache.q4_block_offset(retain_pos, h, blocks_per_pos),
-                cache.q4_block_offset(evict_pos, h, blocks_per_pos),
-            )
-        })
-        .collect();
 
-    // Merge K
-    {
-        let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
-        let mut r_f32 = [0.0f32; QK4_0];
-        let mut e_f32 = [0.0f32; QK4_0];
-        for &(off_r, off_e) in &block_offsets {
-            for bi in 0..blocks_per_pos {
-                k[off_r + bi].dequantize(&mut r_f32);
-                k[off_e + bi].dequantize(&mut e_f32);
-                for i in 0..QK4_0 {
-                    r_f32[i] = w_retain * r_f32[i] + w_evict * e_f32[i];
-                }
-                k[off_r + bi] = BlockQ4_0::quantize(&r_f32);
-            }
+    for h in 0..kv_heads {
+        let mut groups: HashMap<usize, Vec<(usize, f32)>> = HashMap::new();
+        for (i, &evict_pos) in passing_positions.iter().enumerate() {
+            let (retain_pos, sim) = matches[i].per_head[h];
+            groups.entry(retain_pos).or_default().push((evict_pos, sim));
         }
-    }
 
-    // Merge V
-    {
-        let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
-        let mut r_f32 = [0.0f32; QK4_0];
-        let mut e_f32 = [0.0f32; QK4_0];
-        for &(off_r, off_e) in &block_offsets {
-            for bi in 0..blocks_per_pos {
-                v[off_r + bi].dequantize(&mut r_f32);
-                v[off_e + bi].dequantize(&mut e_f32);
-                for i in 0..QK4_0 {
-                    r_f32[i] = w_retain * r_f32[i] + w_evict * e_f32[i];
+        for (retain_pos, evicted_list) in &groups {
+            let count = evicted_list.len() + 1;
+            let inv_count = 1.0f32 / count as f32;
+
+            let retain_block_off = cache.q4_block_offset(*retain_pos, h, blocks_per_pos);
+
+            // Dequantize evict tokens upfront to avoid repeated borrow
+            let evict_f32s: Vec<(Vec<f32>, f32)> = evicted_list
+                .iter()
+                .map(|&(ep, sim)| {
+                    let mut buf = vec![0.0f32; head_dim];
+                    dequantize_k(cache, ep, h, head_dim, &mut buf);
+                    (buf, sim)
+                })
+                .collect();
+
+            // Also dequantize the V evict tokens
+            let evict_v_f32s: Vec<(Vec<f32>, f32)> = evicted_list
+                .iter()
+                .map(|&(ep, sim)| {
+                    let mut buf = vec![0.0f32; head_dim];
+                    let v_off = cache.offset(ep, h); // for V we need offset, but V may be F32 — check dtype
+                    // V buffer for Q4_0 uses same dtype
+                    match cache.v_buffer.dtype() {
+                        DType::Q4_0 => {
+                            let v = cache.v_buffer.as_slice::<BlockQ4_0>();
+                            let ep_block_off = cache.q4_block_offset(ep, h, blocks_per_pos);
+                            for bi in 0..blocks_per_pos {
+                                let mut tmp = [0.0f32; QK4_0];
+                                v[ep_block_off + bi].dequantize(&mut tmp);
+                                let dst = bi * QK4_0;
+                                buf[dst..dst + QK4_0].copy_from_slice(&tmp);
+                            }
+                        }
+                        DType::F32 => {
+                            let v = cache.v_buffer.as_slice::<f32>();
+                            buf.copy_from_slice(&v[v_off..v_off + head_dim]);
+                        }
+                        DType::F16 => {
+                            let v = cache.v_buffer.as_slice::<f16>();
+                            for d in 0..head_dim {
+                                buf[d] = v[v_off + d].to_f32();
+                            }
+                        }
+                        _ => {}
+                    }
+                    (buf, sim)
+                })
+                .collect();
+
+            // K merge
+            {
+                let k = cache.k_buffer.as_mut_slice::<BlockQ4_0>();
+                for bi in 0..blocks_per_pos {
+                    let mut r_f32 = [0.0f32; QK4_0];
+                    k[retain_block_off + bi].dequantize(&mut r_f32);
+                    for (e_buf, sim) in &evict_f32s {
+                        let base = bi * QK4_0;
+                        for i in 0..QK4_0 {
+                            r_f32[i] += sim * e_buf[base + i];
+                        }
+                    }
+                    for i in 0..QK4_0 {
+                        r_f32[i] *= inv_count;
+                    }
+                    k[retain_block_off + bi] = BlockQ4_0::quantize(&r_f32);
                 }
-                v[off_r + bi] = BlockQ4_0::quantize(&r_f32);
+            }
+
+            // V merge
+            let retain_v_block_off = cache.q4_block_offset(*retain_pos, h, blocks_per_pos);
+            match cache.v_buffer.dtype() {
+                DType::Q4_0 => {
+                    let v = cache.v_buffer.as_mut_slice::<BlockQ4_0>();
+                    for bi in 0..blocks_per_pos {
+                        let mut r_f32 = [0.0f32; QK4_0];
+                        v[retain_v_block_off + bi].dequantize(&mut r_f32);
+                        for (e_buf, sim) in &evict_v_f32s {
+                            let base = bi * QK4_0;
+                            for i in 0..QK4_0 {
+                                r_f32[i] += sim * e_buf[base + i];
+                            }
+                        }
+                        for i in 0..QK4_0 {
+                            r_f32[i] *= inv_count;
+                        }
+                        v[retain_v_block_off + bi] = BlockQ4_0::quantize(&r_f32);
+                    }
+                }
+                DType::F32 => {
+                    let retain_v_off = cache.offset(*retain_pos, h);
+                    let v = cache.v_buffer.as_mut_slice::<f32>();
+                    for d in 0..head_dim {
+                        let mut acc = v[retain_v_off + d];
+                        for (e_buf, sim) in &evict_v_f32s {
+                            acc += sim * e_buf[d];
+                        }
+                        v[retain_v_off + d] = acc * inv_count;
+                    }
+                }
+                DType::F16 => {
+                    let retain_v_off = cache.offset(*retain_pos, h);
+                    let v = cache.v_buffer.as_mut_slice::<f16>();
+                    for d in 0..head_dim {
+                        let mut acc = v[retain_v_off + d].to_f32();
+                        for (e_buf, sim) in &evict_v_f32s {
+                            acc += sim * e_buf[d];
+                        }
+                        v[retain_v_off + d] = f16::from_f32(acc * inv_count);
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -683,10 +809,10 @@ mod tests {
         assert!(sim.abs() < 1e-6, "zero vector: sim={sim}");
     }
 
-    // ── Nearest neighbor tests ──
+    // ── find_nearest_per_head tests ──
 
     #[test]
-    fn test_find_nearest_cosine_seq_major() {
+    fn test_find_nearest_per_head_seq_major() {
         let mut cache = make_cache(10, 1, 4, 5);
 
         // Write distinct K vectors
@@ -697,14 +823,26 @@ mod tests {
         write_k(&mut cache, 4, 0, &[0.0, 0.0, 0.0, 1.0]); // pos 4
 
         let retain = vec![0, 1, 3, 4];
-        let (nearest, sim) = find_nearest_cosine(&cache, 2, &retain, 1, 4);
+        let m = find_nearest_per_head(&cache, 2, &retain, 1, 4);
 
-        assert_eq!(nearest, 0, "pos 2 should be nearest to pos 0");
-        assert!(sim > 0.9, "similarity should be high, got {sim}");
+        assert_eq!(
+            m.per_head[0].0, 0,
+            "pos 2 should be nearest to pos 0 at head 0"
+        );
+        assert!(
+            m.per_head[0].1 > 0.9,
+            "similarity should be high, got {}",
+            m.per_head[0].1
+        );
+        assert!(
+            m.mean_sim > 0.9,
+            "mean_sim should match single head, got {}",
+            m.mean_sim
+        );
     }
 
     #[test]
-    fn test_find_nearest_cosine_head_major() {
+    fn test_find_nearest_per_head_head_major() {
         let mut cache = make_cache_head_major(10, 2, 4, 5);
 
         // Head 0
@@ -714,76 +852,172 @@ mod tests {
         // Head 1
         write_k(&mut cache, 0, 1, &[0.0, 0.0, 1.0, 0.0]);
         write_k(&mut cache, 1, 1, &[0.0, 0.0, 0.0, 1.0]);
-        write_k(&mut cache, 2, 1, &[0.0, 0.0, 0.9, 0.1]); // similar to pos 0
+        write_k(&mut cache, 2, 1, &[0.0, 0.0, 0.9, 0.1]); // similar to pos 0 in head 1
 
         let retain = vec![0, 1];
-        let (nearest, _sim) = find_nearest_cosine(&cache, 2, &retain, 2, 4);
-        assert_eq!(
-            nearest, 0,
-            "pos 2 should be nearest to pos 0 (averaged across heads)"
+        let m = find_nearest_per_head(&cache, 2, &retain, 2, 4);
+        assert_eq!(m.per_head[0].0, 0, "head 0: pos 2 → pos 0");
+        assert_eq!(m.per_head[1].0, 0, "head 1: pos 2 → pos 0");
+    }
+
+    #[test]
+    fn test_per_head_different_targets() {
+        // 2 heads where each head's nearest neighbor differs
+        let mut cache = make_cache(10, 2, 4, 4);
+
+        // head 0: evict_pos(2) is most similar to pos 0
+        write_k(&mut cache, 0, 0, &[1.0, 0.0, 0.0, 0.0]);
+        write_k(&mut cache, 1, 0, &[0.0, 1.0, 0.0, 0.0]);
+        write_k(&mut cache, 2, 0, &[0.95, 0.05, 0.0, 0.0]); // evict
+
+        // head 1: evict_pos(2) is most similar to pos 1
+        write_k(&mut cache, 0, 1, &[0.0, 1.0, 0.0, 0.0]);
+        write_k(&mut cache, 1, 1, &[1.0, 0.0, 0.0, 0.0]);
+        write_k(&mut cache, 2, 1, &[0.95, 0.05, 0.0, 0.0]); // evict — similar to pos 1 in this head
+
+        let retain = vec![0, 1];
+        let m = find_nearest_per_head(&cache, 2, &retain, 2, 4);
+
+        // head 0: pos 2 → pos 0 (both have high [1,0,0,0] component)
+        assert_eq!(m.per_head[0].0, 0, "head 0 should match pos 0");
+        // head 1: pos 2 = [0.95,0.05,...], pos 1 = [1.0,0,...] → more similar than pos 0=[0,1,0,0]
+        assert_eq!(m.per_head[1].0, 1, "head 1 should match pos 1");
+        // Heads have different targets — this is the key assertion
+        assert_ne!(
+            m.per_head[0].0, m.per_head[1].0,
+            "per-head targets should differ"
         );
     }
 
-    // ── Weighted merge tests ──
+    // ── scatter_reduce_merge_per_head tests ──
 
     #[test]
-    fn test_weighted_merge_values() {
+    fn test_scatter_reduce_1to1() {
+        // Single evict → single retain: K[j] = (K[j] + sim * K[e]) / 2
         let mut cache = make_cache(10, 1, 4, 3);
 
-        write_k(&mut cache, 0, 0, &[1.0, 0.0, 0.0, 0.0]); // retain
-        write_k(&mut cache, 1, 0, &[0.0, 1.0, 0.0, 0.0]); // evict
+        // retain at pos 0, evict at pos 1
+        write_k(&mut cache, 0, 0, &[1.0, 2.0, 3.0, 4.0]); // retain
+        write_k(&mut cache, 1, 0, &[5.0, 6.0, 7.0, 8.0]); // evict
+        write_v(&mut cache, 0, 0, &[10.0, 20.0, 30.0, 40.0]); // retain V
+        write_v(&mut cache, 1, 0, &[50.0, 60.0, 70.0, 80.0]); // evict V
 
-        write_v(&mut cache, 0, 0, &[10.0, 0.0, 0.0, 0.0]); // retain
-        write_v(&mut cache, 1, 0, &[0.0, 10.0, 0.0, 0.0]); // evict
+        let sim = 0.8f32;
+        let match0 = PerHeadMatch {
+            per_head: vec![(0, sim)],
+            mean_sim: sim,
+        };
+        let passing = vec![1usize]; // evict pos 1
+        let matches: Vec<&PerHeadMatch> = vec![&match0];
 
-        let sim = 0.5;
-        let e = 1.0;
-        weighted_merge(&mut cache, 1, 0, sim, e, 1, 4);
-
-        let exp_sim = (0.5f32).exp(); // ≈ 1.6487
-        let w_retain = e / (exp_sim + e); // ≈ 0.3775
-        let w_evict = exp_sim / (exp_sim + e); // ≈ 0.6225
+        scatter_reduce_merge_per_head(&mut cache, &passing, &matches, 1, 4);
 
         let k = read_k(&cache, 0, 0, 4);
-        assert!(
-            (k[0] - w_retain * 1.0).abs() < 1e-4,
-            "k[0]={}, expected {}",
-            k[0],
-            w_retain
-        );
-        assert!(
-            (k[1] - w_evict * 1.0).abs() < 1e-4,
-            "k[1]={}, expected {}",
-            k[1],
-            w_evict
-        );
-
         let v = read_v(&cache, 0, 0, 4);
-        assert!(
-            (v[0] - w_retain * 10.0).abs() < 1e-3,
-            "v[0]={}, expected {}",
-            v[0],
-            w_retain * 10.0
-        );
-        assert!(
-            (v[1] - w_evict * 10.0).abs() < 1e-3,
-            "v[1]={}, expected {}",
-            v[1],
-            w_evict * 10.0
-        );
+
+        // Expected: (K[retain] + sim * K[evict]) / 2
+        let expected_k: Vec<f32> = vec![
+            (1.0 + 0.8 * 5.0) / 2.0,
+            (2.0 + 0.8 * 6.0) / 2.0,
+            (3.0 + 0.8 * 7.0) / 2.0,
+            (4.0 + 0.8 * 8.0) / 2.0,
+        ];
+        let expected_v: Vec<f32> = vec![
+            (10.0 + 0.8 * 50.0) / 2.0,
+            (20.0 + 0.8 * 60.0) / 2.0,
+            (30.0 + 0.8 * 70.0) / 2.0,
+            (40.0 + 0.8 * 80.0) / 2.0,
+        ];
+
+        for d in 0..4 {
+            assert!(
+                (k[d] - expected_k[d]).abs() < 1e-5,
+                "K[{d}]: got {}, expected {}",
+                k[d],
+                expected_k[d]
+            );
+            assert!(
+                (v[d] - expected_v[d]).abs() < 1e-5,
+                "V[{d}]: got {}, expected {}",
+                v[d],
+                expected_v[d]
+            );
+        }
     }
 
     #[test]
-    fn test_merge_weights_sum_to_one() {
-        for sim_x10 in 0..=10 {
-            let sim = sim_x10 as f32 * 0.1;
-            let exp_sim = sim.exp();
-            let e = 1.0;
-            let w_r = e / (exp_sim + e);
-            let w_e = exp_sim / (exp_sim + e);
+    fn test_scatter_reduce_nto1() {
+        // Two evicts → same retain: K[j] = (K[j] + s1*K[e1] + s2*K[e2]) / 3
+        let mut cache = make_cache(10, 1, 4, 4);
+
+        write_k(&mut cache, 0, 0, &[1.0, 0.0, 0.0, 0.0]); // retain pos 0
+        write_k(&mut cache, 1, 0, &[0.0, 1.0, 0.0, 0.0]); // evict pos 1
+        write_k(&mut cache, 2, 0, &[0.0, 0.0, 1.0, 0.0]); // evict pos 2
+
+        let s1 = 0.6f32;
+        let s2 = 0.4f32;
+
+        // Both evicts → retain pos 0
+        let match1 = PerHeadMatch {
+            per_head: vec![(0, s1)],
+            mean_sim: s1,
+        };
+        let match2 = PerHeadMatch {
+            per_head: vec![(0, s2)],
+            mean_sim: s2,
+        };
+        let passing = vec![1usize, 2usize];
+        let matches: Vec<&PerHeadMatch> = vec![&match1, &match2];
+
+        scatter_reduce_merge_per_head(&mut cache, &passing, &matches, 1, 4);
+
+        let k = read_k(&cache, 0, 0, 4);
+
+        // Expected: (K[0] + s1*K[1] + s2*K[2]) / 3
+        // K[0]=[1,0,0,0], K[1]=[0,1,0,0], K[2]=[0,0,1,0]
+        let expected_k = vec![
+            (1.0 + 0.6 * 0.0 + 0.4 * 0.0) / 3.0, // = 1/3
+            (0.0 + 0.6 * 1.0 + 0.4 * 0.0) / 3.0, // = 0.2
+            (0.0 + 0.6 * 0.0 + 0.4 * 1.0) / 3.0, // ≈ 0.133
+            0.0f32,
+        ];
+
+        for d in 0..4 {
             assert!(
-                (w_r + w_e - 1.0).abs() < 1e-6,
-                "weights don't sum to 1 at sim={sim}: w_r={w_r}, w_e={w_e}"
+                (k[d] - expected_k[d]).abs() < 1e-5,
+                "K[{d}]: got {}, expected {}",
+                k[d],
+                expected_k[d]
+            );
+        }
+    }
+
+    #[test]
+    fn test_scatter_reduce_no_mapping_unchanged() {
+        // Retain pos 1 is never a merge target — its values must not change
+        let mut cache = make_cache(10, 1, 4, 3);
+
+        write_k(&mut cache, 0, 0, &[1.0, 0.0, 0.0, 0.0]); // retain pos 0 (merge target)
+        write_k(&mut cache, 1, 0, &[9.9, 9.9, 9.9, 9.9]); // retain pos 1 (NOT merge target)
+        write_k(&mut cache, 2, 0, &[0.9, 0.1, 0.0, 0.0]); // evict → maps to pos 0
+
+        let sim = 0.99f32;
+        let match0 = PerHeadMatch {
+            per_head: vec![(0, sim)], // evict 2 → retain 0, NOT retain 1
+            mean_sim: sim,
+        };
+        let passing = vec![2usize];
+        let matches: Vec<&PerHeadMatch> = vec![&match0];
+
+        scatter_reduce_merge_per_head(&mut cache, &passing, &matches, 1, 4);
+
+        // pos 1 must be unchanged
+        let k1 = read_k(&cache, 1, 0, 4);
+        for d in 0..4 {
+            assert!(
+                (k1[d] - 9.9).abs() < 1e-5,
+                "unmapped retain pos 1 K[{d}] should be unchanged: got {}",
+                k1[d]
             );
         }
     }
@@ -796,8 +1030,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut cache = make_cache(20, 1, 4, 10);
@@ -836,21 +1072,69 @@ mod tests {
     }
 
     #[test]
+    fn test_ema_init_no_double_update() {
+        // First call: threshold = mean(sims), no EMA update applied on top
+        // We test this by calling evict_and_merge with controlled sims
+        let handler = D2OHandler::new(D2OConfig::default());
+        let mut state = D2OState::new();
+        let mut cache = make_cache(20, 1, 4, 12);
+
+        // Write identical vectors → cosine sim = 1.0 for all pairs
+        for pos in 0..12 {
+            write_k(&mut cache, pos, 0, &[1.0, 0.0, 0.0, 0.0]);
+        }
+        let importance: Vec<f32> = (0..12).map(|i| 12.0 - i as f32).collect();
+
+        handler
+            .evict_and_merge(&mut cache, 6, &importance, &mut state)
+            .unwrap();
+
+        // All sims ≈ 1.0 → mean = 1.0 → threshold = 1.0 (no EMA on first call)
+        assert!(state.initialized, "should be initialized");
+        // With identical vectors sim = 1.0, threshold should be set to that mean
+        assert!(
+            state.ema_threshold > 0.5,
+            "threshold should reflect mean sim ≈ 1.0, got {}",
+            state.ema_threshold
+        );
+    }
+
+    #[test]
+    fn test_ema_update_uses_mean() {
+        // Second call applies α·τ + β·mean(sims)
+        let alpha = 0.5f32;
+        let beta = 0.5f32;
+        let initial_threshold = 0.8f32;
+        let mean_sim = 0.4f32;
+
+        let expected = alpha * initial_threshold + beta * mean_sim; // = 0.6
+
+        let mut threshold = initial_threshold;
+        threshold = alpha * threshold + beta * mean_sim;
+
+        assert!(
+            (threshold - expected).abs() < 1e-6,
+            "EMA update: got {threshold}, expected {expected}"
+        );
+    }
+
+    #[test]
     fn test_ema_update() {
-        let beta: f32 = 0.7;
+        let alpha: f32 = 0.5;
+        let beta: f32 = 0.5;
         let mut threshold: f32 = 0.5; // initial
 
-        // Update with new max similarity = 0.8
-        threshold = beta * 0.8 + (1.0 - beta) * threshold;
-        let expected = 0.7 * 0.8 + 0.3 * 0.5; // = 0.56 + 0.15 = 0.71
+        // Update with new mean similarity = 0.8
+        threshold = alpha * threshold + beta * 0.8;
+        let expected = 0.5 * 0.5 + 0.5 * 0.8; // = 0.25 + 0.4 = 0.65
         assert!(
             (threshold - expected).abs() < 1e-6,
             "threshold={threshold}, expected={expected}"
         );
 
-        // Update with lower similarity = 0.3
-        threshold = beta * 0.3 + (1.0 - beta) * threshold;
-        let expected2 = 0.7 * 0.3 + 0.3 * expected; // = 0.21 + 0.213 = 0.423
+        // Update with lower mean similarity = 0.3
+        threshold = alpha * threshold + beta * 0.3;
+        let expected2 = 0.5 * expected + 0.5 * 0.3;
         assert!(
             (threshold - expected2).abs() < 1e-6,
             "threshold={threshold}, expected={expected2}"
@@ -908,8 +1192,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut cache = make_cache(50, 1, 4, 30);
@@ -982,8 +1268,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut caches: Vec<KVCache> = (0..4)
@@ -1036,8 +1324,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 4,
             target_ratio: 0.3, // aggressive
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut cache = make_cache(50, 1, 4, 20);
@@ -1085,8 +1375,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut cache = make_cache(50, 1, 4, 40);
@@ -1206,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn test_q4_find_nearest_cosine() {
+    fn test_q4_find_nearest_per_head() {
         // head_dim must be multiple of QK4_0=32, use 32
         let mut cache = make_cache_q4(10, 1, 32, 3);
         // pos 0: all positive
@@ -1220,21 +1512,33 @@ mod tests {
         write_k_q4(&mut cache, 2, 0, &v2);
 
         let retain = vec![0, 1];
-        let (nearest, sim) = find_nearest_cosine(&cache, 2, &retain, 1, 32);
-        assert_eq!(nearest, 0, "pos 2 should be nearest to pos 0");
-        assert!(sim > 0.9, "similarity should be high, got {sim}");
+        let m = find_nearest_per_head(&cache, 2, &retain, 1, 32);
+        assert_eq!(m.per_head[0].0, 0, "pos 2 should be nearest to pos 0");
+        assert!(
+            m.per_head[0].1 > 0.9,
+            "similarity should be high, got {}",
+            m.per_head[0].1
+        );
     }
 
     #[test]
-    fn test_q4_weighted_merge() {
+    fn test_q4_scatter_reduce() {
         let mut cache = make_cache_q4(10, 1, 32, 3);
         let v_retain: Vec<f32> = (0..32).map(|i| 2.0 + i as f32 * 0.1).collect();
         let v_evict: Vec<f32> = (0..32).map(|i| 4.0 + i as f32 * 0.1).collect();
         write_k_q4(&mut cache, 0, 0, &v_retain);
         write_k_q4(&mut cache, 1, 0, &v_evict);
 
-        // sim=0 → w_retain=e/(1+e)=0.5, w_evict=1/(1+1)=0.5 (equal weights)
-        weighted_merge(&mut cache, 1, 0, 0.0, 1.0, 1, 32);
+        // sim = 1.0 → K[retain] = (K[retain] + 1.0 * K[evict]) / 2 ≈ average
+        let sim = 1.0f32;
+        let match0 = PerHeadMatch {
+            per_head: vec![(0, sim)],
+            mean_sim: sim,
+        };
+        let passing = vec![1usize];
+        let matches: Vec<&PerHeadMatch> = vec![&match0];
+
+        scatter_reduce_merge_per_head(&mut cache, &passing, &matches, 1, 32);
 
         let merged = read_k_q4(&cache, 0, 0, 32);
         // After merge: approximately (v_retain + v_evict) / 2
@@ -1257,8 +1561,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut cache = make_cache_q4(50, 1, 32, 20);
@@ -1301,8 +1607,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         });
 
         let mut cache = make_cache_head_major(50, 2, 4, 30);
@@ -1369,8 +1677,10 @@ mod tests {
             keep_ratio: 0.75,
             protected_prefix: 2,
             target_ratio: 0.5,
-            beta: 0.7,
-            merge_e: 1.0,
+            ema_alpha: 0.5,
+            ema_beta: 0.5,
+            use_layer_allocation: false,
+            protected_layers: vec![],
         };
 
         let mut importance = vec![0.1; 50];

@@ -162,13 +162,13 @@ struct Args {
     #[arg(long, default_value_t = 0.75)]
     d2o_keep_ratio: f32,
 
-    /// D2O EMA beta for similarity threshold (0.0–1.0, paper default 0.7)
-    #[arg(long, default_value_t = 0.7)]
-    d2o_beta: f32,
+    /// D2O EMA old-threshold weight α (official default 0.5)
+    #[arg(long, default_value_t = 0.5)]
+    d2o_ema_alpha: f32,
 
-    /// D2O merge stability constant (paper default 1.0)
-    #[arg(long, default_value_t = 1.0)]
-    d2o_merge_e: f32,
+    /// D2O EMA new-mean weight β (official default 0.5)
+    #[arg(long, default_value_t = 0.5)]
+    d2o_ema_beta: f32,
 
     /// Number of prefix tokens to protect from eviction.
     /// Defaults to 4 for score-based policies (h2o, h2o_plus, d2o) and prompt length for sliding.
@@ -785,8 +785,10 @@ fn main() -> anyhow::Result<()> {
                 keep_ratio: args.d2o_keep_ratio,
                 protected_prefix: actual_protected_prefix,
                 target_ratio: args.eviction_target_ratio,
-                beta: args.d2o_beta,
-                merge_e: args.d2o_merge_e,
+                ema_alpha: args.d2o_ema_alpha,
+                ema_beta: args.d2o_ema_beta,
+                use_layer_allocation: false,
+                protected_layers: vec![],
             });
             let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
                 min_level: PressureLevel::Warning,
