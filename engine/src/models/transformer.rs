@@ -98,9 +98,6 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     /// Saves ~3GB GPU memory for long-context prefill (e.g., eval-ll with 5K+ tokens).
     /// logits_out shape should be [1, 1, vocab_size] instead of [1, seq_len, vocab_size].
     pub logits_last_only: bool,
-    /// Pre-allocated prefill workspace for GPU buffer reuse across questions.
-    /// When provided, avoids per-layer alloc/free that crashes NVIDIA's OpenCL driver.
-    pub prefill_ws: Option<&'a mut crate::layers::workspace::PrefillWorkspace>,
 }
 
 impl TransformerModel {
@@ -715,7 +712,6 @@ impl TransformerModel {
                 is_local_attn: is_local,
                 local_attn_window: self.config.sliding_window,
                 need_scores: false,
-                prefill_ws: None,
                 head_dim: self.config.head_dim,
                 profiler: None,
                 layer_id: i,
@@ -804,11 +800,10 @@ impl TransformerModel {
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
         // Use caller-provided prefill workspace or create one for this call.
-        let mut prefill_ws = args.prefill_ws;
-        let mut owned_prefill_ws;
+        let mut prefill_ws: Option<crate::layers::workspace::PrefillWorkspace> = None;
         let no_prefill_ws = std::env::var("LLM_NO_PREFILL_WS").is_ok();
         let mut needs_ws_sync = false; // synchronize before owned_prefill_ws drop
-        if prefill_ws.is_none() && seq_len > 1 && backend.name() == "OpenCL" && !no_prefill_ws {
+        if seq_len > 1 && backend.name() == "OpenCL" && !no_prefill_ws {
             use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
             let ws_cfg = WsCfg {
                 batch_size,
@@ -820,9 +815,7 @@ impl TransformerModel {
                 n_heads: self.config.num_attention_heads,
                 max_seq_len: 0,
             };
-            owned_prefill_ws =
-                PrefillWorkspace::new(&ws_cfg, seq_len, memory, backend.clone()).ok();
-            prefill_ws = owned_prefill_ws.as_mut();
+            prefill_ws = PrefillWorkspace::new(&ws_cfg, seq_len, memory, backend.clone()).ok();
             needs_ws_sync = prefill_ws.is_some();
         }
 
@@ -854,28 +847,80 @@ impl TransformerModel {
                 coll.snapshot_before(x_data, seq_len, hidden_size);
             }
 
-            layer.forward(LayerForwardArgs {
-                x: &mut x,
-                kv_cache: &mut kv_caches[i],
-                start_pos,
-                backend,
-                memory,
-                rms_norm_eps: self.config.rms_norm_eps as f32,
-                rope_theta,
-                workspace: workspace.as_deref_mut(),
-                use_gpu_attn,
-                need_scores,
-                head_dim: self.config.head_dim,
-                profiler: profiler.as_deref_mut(),
-                layer_id: i,
-                skip_attn: s_attn,
-                skip_mlp: s_mlp,
-                rms_norm_add_unit: is_gemma3,
-                use_gelu_tanh: is_gemma3,
-                is_local_attn: is_local,
-                local_attn_window: self.config.sliding_window,
-                prefill_ws: prefill_ws.as_deref_mut(),
-            })?;
+            // Prefill with workspace: call forward_prefill directly to avoid
+            // carrying prefill_ws through LayerForwardArgs (which changes the
+            // struct layout and triggers ARM64 codegen regression — see ae62391).
+            if seq_len > 1 {
+                if let Some(ref mut pws) = prefill_ws {
+                    let dim = hidden_size;
+                    layer.forward_prefill(
+                        &mut x,
+                        &mut kv_caches[i],
+                        start_pos,
+                        backend,
+                        memory,
+                        self.config.rms_norm_eps as f32,
+                        rope_theta,
+                        use_gpu_attn,
+                        need_scores,
+                        self.config.head_dim,
+                        batch_size,
+                        seq_len,
+                        dim,
+                        s_attn,
+                        s_mlp,
+                        is_gemma3,
+                        is_gemma3,
+                        is_local,
+                        self.config.sliding_window,
+                        Some(pws),
+                    )?;
+                } else {
+                    layer.forward(LayerForwardArgs {
+                        x: &mut x,
+                        kv_cache: &mut kv_caches[i],
+                        start_pos,
+                        backend,
+                        memory,
+                        rms_norm_eps: self.config.rms_norm_eps as f32,
+                        rope_theta,
+                        workspace: None,
+                        use_gpu_attn,
+                        need_scores,
+                        head_dim: self.config.head_dim,
+                        profiler: profiler.as_deref_mut(),
+                        layer_id: i,
+                        skip_attn: s_attn,
+                        skip_mlp: s_mlp,
+                        rms_norm_add_unit: is_gemma3,
+                        use_gelu_tanh: is_gemma3,
+                        is_local_attn: is_local,
+                        local_attn_window: self.config.sliding_window,
+                    })?;
+                }
+            } else {
+                layer.forward(LayerForwardArgs {
+                    x: &mut x,
+                    kv_cache: &mut kv_caches[i],
+                    start_pos,
+                    backend,
+                    memory,
+                    rms_norm_eps: self.config.rms_norm_eps as f32,
+                    rope_theta,
+                    workspace: workspace.as_deref_mut(),
+                    use_gpu_attn,
+                    need_scores,
+                    head_dim: self.config.head_dim,
+                    profiler: profiler.as_deref_mut(),
+                    layer_id: i,
+                    skip_attn: s_attn,
+                    skip_mlp: s_mlp,
+                    rms_norm_add_unit: is_gemma3,
+                    use_gelu_tanh: is_gemma3,
+                    is_local_attn: is_local,
+                    local_attn_window: self.config.sliding_window,
+                })?;
+            }
 
             // Record importance after layer forward
             if let Some(ref mut coll) = importance_collector {
@@ -1270,7 +1315,6 @@ impl TransformerModel {
                 use_gelu_tanh: is_gemma3,
                 is_local_attn: is_local_i,
                 local_attn_window: self.config.sliding_window,
-                prefill_ws: None,
             })?;
             let fwd_dur = fwd_t0.elapsed();
             prefetch.record_forward(fwd_dur);

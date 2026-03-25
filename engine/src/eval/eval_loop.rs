@@ -268,7 +268,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         skip_config,
                         importance_collector: None,
                         logits_last_only: false,
-                        prefill_ws: None,
                     })?;
                     sp += 1;
 
@@ -505,7 +504,6 @@ fn run_importance_pass<C: KVCacheOps>(
         skip_config: None, // intentionally None for importance measurement
         importance_collector: Some(&mut collector),
         logits_last_only: false,
-        prefill_ws: None,
     })?;
 
     let table = collector.build();
@@ -606,7 +604,7 @@ fn run_full_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
-    prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
+    _prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let prompt_len = prompt_ids.len();
 
@@ -646,7 +644,6 @@ fn run_full_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
-        prefill_ws,
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -683,7 +680,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
-    prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
+    _prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
     let effective_budget = eval_config.effective_budget;
     let first_chunk_len = effective_budget;
@@ -731,7 +728,6 @@ fn run_chunked_prefill<C: KVCacheOps>(
         skip_config,
         importance_collector: None,
         logits_last_only: true,
-        prefill_ws,
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
@@ -774,7 +770,6 @@ fn run_chunked_prefill<C: KVCacheOps>(
             skip_config,
             importance_collector: None,
             logits_last_only: false,
-            prefill_ws: None,
         })?;
         start_pos += 1;
     }

@@ -3,7 +3,7 @@ use super::*;
 impl TransformerLayer {
     /// Standard forward path (Prefill or dynamic generation)
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn forward_prefill<C: KVCacheOps>(
+    pub(crate) fn forward_prefill<C: KVCacheOps>(
         &self,
         x: &mut Tensor,
         kv_cache: &mut C,
