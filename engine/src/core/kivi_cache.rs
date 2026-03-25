@@ -8,11 +8,20 @@
 //!
 //! `kv_dtype()` returns `F32` so LlamaLayer passes F32 data to `update()`.
 //! `get_view()` returns dequantized F32 tensors for the existing attention path.
+//!
+//! ## GPU mode
+//!
+//! When constructed with `new_gpu()`, KiviCache allocates persistent GPU buffers for
+//! residual and attention data. The hot path (update, get_view) runs GPU kernels.
+//! The cold path (quantize during flush) still runs on CPU since it is infrequent.
+//! CPU-only mode is fully preserved for backward compatibility.
 
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::shared_buffer::SharedBuffer;
+use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout};
+use crate::core::memory::Memory;
 use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
@@ -121,6 +130,12 @@ impl QuantizedBlocks {
 ///
 /// Supports 2-bit (Q2), 4-bit (Q4), and 8-bit (Q8) quantization.
 /// Dynamic bit transition via `transition_bits()`.
+///
+/// ## GPU mode
+///
+/// Set `gpu_backend` to `Some(...)` via `new_gpu()`. GPU buffers hold persistent
+/// residual and attention F32 data. CPU residual vectors are still allocated for
+/// the quantize step (cold path). All hot-path operations dispatch GPU kernels.
 #[derive(Clone)]
 pub struct KiviCache {
     /// Current quantization bit-width (2, 4, or 8).
@@ -161,6 +176,29 @@ pub struct KiviCache {
 
     /// Accumulated flush proxy metrics (NMSE). Pushed during `flush_residual()`.
     flush_proxies: Vec<crate::core::qcf::QcfMetric>,
+
+    // ── GPU-native buffers (None = CPU-only mode, backward compatible) ──
+    /// GPU backend handle. Some ↔ GPU mode enabled.
+    gpu_backend: Option<Arc<dyn Backend>>,
+    /// Memory allocator used to create GPU buffers.
+    #[allow(dead_code)]
+    gpu_memory: Option<Arc<dyn Memory>>,
+    /// GPU F32 residual K buffer: [kv_heads, res_cap, head_dim]
+    gpu_res_k: Option<Tensor>,
+    /// GPU F32 residual V buffer: [kv_heads, res_cap, head_dim]
+    gpu_res_v: Option<Tensor>,
+    /// GPU F32 attention K output: [max_seq_len, kv_heads, head_dim]
+    gpu_attn_k: Option<Tensor>,
+    /// GPU F32 attention V output: [max_seq_len, kv_heads, head_dim]
+    gpu_attn_v: Option<Tensor>,
+    /// GPU byte buffer for Q2 key blocks (12 bytes per block).
+    gpu_q2k: Option<Tensor>,
+    /// GPU byte buffer for Q2 value blocks (12 bytes per block).
+    gpu_q2v: Option<Tensor>,
+    /// Number of Q2 key blocks written to `gpu_q2k`.
+    gpu_q2k_blocks: usize,
+    /// Number of Q2 value blocks written to `gpu_q2v`.
+    gpu_q2v_blocks: usize,
 }
 
 impl KiviCache {
@@ -218,6 +256,17 @@ impl KiviCache {
             max_seq_len,
             group_size: QKKV,
             flush_proxies: Vec::new(),
+            // GPU fields — None in CPU-only mode
+            gpu_backend: None,
+            gpu_memory: None,
+            gpu_res_k: None,
+            gpu_res_v: None,
+            gpu_attn_k: None,
+            gpu_attn_v: None,
+            gpu_q2k: None,
+            gpu_q2v: None,
+            gpu_q2k_blocks: 0,
+            gpu_q2v_blocks: 0,
         }
     }
 
@@ -241,6 +290,107 @@ impl KiviCache {
         self.q2_tokens + self.res_pos
     }
 
+    /// Create a GPU-native KiviCache.
+    ///
+    /// When `backend` is an OpenCL backend, allocates persistent GPU buffers for
+    /// residual and attention data. Falls back to CPU-only mode if GPU allocation fails.
+    pub fn new_gpu(
+        kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        residual_size: usize,
+        bits: u8,
+        backend: Arc<dyn Backend>,
+        memory: Arc<dyn Memory>,
+    ) -> Self {
+        let mut cache = Self::new_with_bits(kv_heads, head_dim, max_seq_len, residual_size, bits);
+
+        if backend.name() != "OpenCL" {
+            return cache;
+        }
+
+        let res_elems = kv_heads * residual_size * head_dim;
+        let attn_elems = max_seq_len * kv_heads * head_dim;
+
+        // Q2 storage: max blocks needed
+        let gs = QKKV;
+        let groups_per_flush = residual_size / gs;
+        let max_flushes = max_seq_len.div_ceil(residual_size);
+        let blocks_per_token_v = head_dim / gs;
+        let max_k_blocks = max_flushes * groups_per_flush * kv_heads * head_dim;
+        let max_v_blocks = max_flushes * kv_heads * residual_size * blocks_per_token_v;
+
+        let result = (|| -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+            let res_k_buf = memory.alloc(res_elems * 4, DType::F32)?;
+            let res_k = Tensor::new(
+                Shape::new(vec![kv_heads, residual_size, head_dim]),
+                res_k_buf,
+                backend.clone(),
+            );
+            let res_v_buf = memory.alloc(res_elems * 4, DType::F32)?;
+            let res_v = Tensor::new(
+                Shape::new(vec![kv_heads, residual_size, head_dim]),
+                res_v_buf,
+                backend.clone(),
+            );
+
+            let attn_k_buf = memory.alloc(attn_elems * 4, DType::F32)?;
+            let attn_k = Tensor::new(
+                Shape::new(vec![max_seq_len, kv_heads, head_dim]),
+                attn_k_buf,
+                backend.clone(),
+            );
+            let attn_v_buf = memory.alloc(attn_elems * 4, DType::F32)?;
+            let attn_v = Tensor::new(
+                Shape::new(vec![max_seq_len, kv_heads, head_dim]),
+                attn_v_buf,
+                backend.clone(),
+            );
+
+            // Q2 block storage: 12 bytes per block
+            let q2k_bytes = max_k_blocks * 12;
+            let q2k_buf = memory.alloc(q2k_bytes.max(12), DType::U8)?;
+            let q2k = Tensor::new(
+                Shape::new(vec![q2k_bytes.max(12)]),
+                q2k_buf,
+                backend.clone(),
+            );
+            let q2v_bytes = max_v_blocks * 12;
+            let q2v_buf = memory.alloc(q2v_bytes.max(12), DType::U8)?;
+            let q2v = Tensor::new(
+                Shape::new(vec![q2v_bytes.max(12)]),
+                q2v_buf,
+                backend.clone(),
+            );
+
+            Ok((res_k, res_v, attn_k, attn_v, q2k, q2v))
+        })();
+
+        match result {
+            Ok((res_k, res_v, attn_k, attn_v, q2k, q2v)) => {
+                cache.gpu_backend = Some(backend);
+                cache.gpu_memory = Some(memory);
+                cache.gpu_res_k = Some(res_k);
+                cache.gpu_res_v = Some(res_v);
+                cache.gpu_attn_k = Some(attn_k);
+                cache.gpu_attn_v = Some(attn_v);
+                cache.gpu_q2k = Some(q2k);
+                cache.gpu_q2v = Some(q2v);
+                log::info!("KiviCache: GPU mode enabled");
+            }
+            Err(e) => {
+                log::warn!("KiviCache: GPU alloc failed ({}), using CPU mode", e);
+            }
+        }
+
+        cache
+    }
+
+    /// Returns `true` if GPU buffers are active.
+    pub fn is_gpu(&self) -> bool {
+        self.gpu_backend.is_some()
+    }
+
     /// Reset cache to empty state (reuse allocations).
     pub fn reset(&mut self) {
         self.qk.clear();
@@ -253,6 +403,9 @@ impl KiviCache {
         self.attn_v_buf.fill(0.0);
         self.q2_deq_tokens = 0;
         self.flush_proxies.clear();
+        // GPU position counters reset; buffers are reused (valid data region tracked by positions)
+        self.gpu_q2k_blocks = 0;
+        self.gpu_q2v_blocks = 0;
     }
 
     /// Flush residual buffer to quantized storage.
@@ -480,6 +633,397 @@ impl KiviCache {
             }
         }
     }
+
+    // ── GPU-mode private helpers ──────────────────────────────────────────────
+
+    /// GPU update path: scatter input tokens into GPU residual buffer using
+    /// `kivi_gather_update` kernel, flushing when the residual is full.
+    fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
+        #[cfg(feature = "opencl")]
+        {
+            use crate::backend::opencl::OpenCLBackend;
+
+            let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
+            let ocl = backend_arc
+                .as_any()
+                .downcast_ref::<OpenCLBackend>()
+                .ok_or_else(|| anyhow::anyhow!("GPU mode requires OpenCLBackend"))?;
+
+            let mut written = 0usize;
+            while written < seq_len {
+                if self.res_pos >= self.res_cap {
+                    self.flush_residual_gpu()?;
+                }
+                // How many tokens we can write in this batch without overflow
+                let batch = (seq_len - written).min(self.res_cap - self.res_pos);
+
+                // We need to call the kernel for the [written..written+batch] slice of new_k/v.
+                // The kernel signature is: input[seq_len, kv_heads, head_dim] → residual[kv_heads, res_cap, head_dim]
+                // But our input tensor contains all seq_len tokens; we need a view of [batch] tokens starting at `written`.
+                // Since GPU tensors may not support views, we create a lightweight wrapper pointing into the same buffer.
+                // SAFETY: We rely on the kernel only reading `seq_len` tokens from the start of the input buffer.
+                // To avoid GPU sub-buffer complexity, if written==0 and batch==seq_len we pass as-is.
+                // Otherwise, we fall back to the CPU copy_slice approach per token.
+                if written == 0 && batch == seq_len {
+                    // Fast path: pass entire input at once
+                    let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
+                    let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                    ocl.kivi_gather_update(
+                        new_k,
+                        gpu_res_k,
+                        self.kv_heads,
+                        self.res_cap,
+                        self.head_dim,
+                        batch,
+                        self.res_pos,
+                    )?;
+                    ocl.kivi_gather_update(
+                        new_v,
+                        gpu_res_v,
+                        self.kv_heads,
+                        self.res_cap,
+                        self.head_dim,
+                        batch,
+                        self.res_pos,
+                    )?;
+                } else {
+                    // Slow path: token-by-token copy_slice for the sub-range
+                    for s in written..written + batch {
+                        let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
+                        let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                        for h in 0..self.kv_heads {
+                            let src_off = s * self.kv_heads * self.head_dim + h * self.head_dim;
+                            let dst_off = h * self.res_cap * self.head_dim
+                                + (self.res_pos + (s - written)) * self.head_dim;
+                            ocl.copy_slice(new_k, gpu_res_k, src_off, dst_off, self.head_dim)?;
+                            ocl.copy_slice(new_v, gpu_res_v, src_off, dst_off, self.head_dim)?;
+                        }
+                    }
+                }
+                self.res_pos += batch;
+                written += batch;
+            }
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        Err(anyhow::anyhow!(
+            "update_gpu called but opencl feature not enabled"
+        ))
+    }
+
+    /// GPU flush: read GPU residual → CPU quantize → upload Q2 blocks to GPU →
+    /// dispatch GPU dequant kernels to fill attention buffers.
+    fn flush_residual_gpu(&mut self) -> Result<()> {
+        let gs = self.group_size;
+        let n_groups = self.res_pos / gs;
+        let flush_tokens = n_groups * gs;
+
+        if flush_tokens == 0 {
+            return Ok(());
+        }
+
+        // 1. Read GPU residual to CPU (needed for quantization)
+        let res_bytes = self.kv_heads * self.res_cap * self.head_dim * 4;
+        {
+            let backend = self.gpu_backend.as_ref().unwrap();
+            let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
+            let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+            let k_dst = unsafe {
+                std::slice::from_raw_parts_mut(self.res_k.as_mut_ptr() as *mut u8, res_bytes)
+            };
+            backend.read_buffer(gpu_res_k, k_dst)?;
+            let v_dst = unsafe {
+                std::slice::from_raw_parts_mut(self.res_v.as_mut_ptr() as *mut u8, res_bytes)
+            };
+            backend.read_buffer(gpu_res_v, v_dst)?;
+        }
+
+        // 2. Compute QCF proxy metrics (same as CPU path)
+        let qcf_config = crate::core::qcf::QcfConfig::default();
+        let proxy_params = crate::core::qcf::FlushQcfParams {
+            res_k: &self.res_k,
+            res_v: &self.res_v,
+            kv_heads: self.kv_heads,
+            head_dim: self.head_dim,
+            flush_tokens,
+            res_cap: self.res_cap,
+            bits: self.bits,
+        };
+        self.flush_proxies.push(crate::core::qcf::compute_flush_qcf(
+            &proxy_params,
+            &qcf_config,
+        ));
+        self.flush_proxies.push(crate::core::qcf::compute_flush_opr(
+            &proxy_params,
+            &qcf_config,
+        ));
+
+        // 3. CPU quantize → fills self.qk / self.qv
+        for h in 0..self.kv_heads {
+            let head_base = h * self.res_cap * self.head_dim;
+            for group in 0..n_groups {
+                let tok_start = group * gs;
+                for ch in 0..self.head_dim {
+                    let mut vals = [0.0f32; QKKV];
+                    for (t, v) in vals.iter_mut().enumerate().take(gs) {
+                        *v = self.res_k[head_base + (tok_start + t) * self.head_dim + ch];
+                    }
+                    self.qk.push_quantized(&vals);
+                }
+            }
+        }
+        let blocks_per_token = self.head_dim / QKKV;
+        for h in 0..self.kv_heads {
+            let head_base = h * self.res_cap * self.head_dim;
+            for t in 0..flush_tokens {
+                let tok_base = head_base + t * self.head_dim;
+                for b in 0..blocks_per_token {
+                    let start = tok_base + b * QKKV;
+                    let chunk: &[f32; QKKV] = self.res_v[start..start + QKKV].try_into().unwrap();
+                    self.qv.push_quantized(chunk);
+                }
+            }
+        }
+
+        // 4. Upload Q2 blocks to GPU and run dequant kernels into attention buffers
+        let tok_base = self.q2_tokens;
+        self.upload_and_dequant_flush(flush_tokens, n_groups, tok_base)?;
+
+        self.q2_tokens += flush_tokens;
+        self.q2_deq_tokens = self.q2_tokens; // GPU dequant already done above
+
+        // 5. Shift remaining residual tokens on GPU
+        let remaining = self.res_pos - flush_tokens;
+        if remaining > 0 {
+            let backend = self.gpu_backend.as_ref().unwrap().clone();
+            let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
+            for h in 0..self.kv_heads {
+                let base = h * self.res_cap * self.head_dim;
+                let src = base + flush_tokens * self.head_dim;
+                let count = remaining * self.head_dim;
+                backend.buffer_shift(gpu_res_k, src, base, count)?;
+            }
+            let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+            for h in 0..self.kv_heads {
+                let base = h * self.res_cap * self.head_dim;
+                let src = base + flush_tokens * self.head_dim;
+                let count = remaining * self.head_dim;
+                backend.buffer_shift(gpu_res_v, src, base, count)?;
+            }
+        }
+        self.res_pos = remaining;
+
+        Ok(())
+    }
+
+    /// Upload newly quantized Q2 blocks to GPU buffers and dispatch dequant kernels.
+    ///
+    /// `flush_tokens`: number of tokens in this flush
+    /// `n_groups`: number of Q2 key groups (= flush_tokens / group_size)
+    /// `tok_base`: token offset in the attention buffer for this flush
+    fn upload_and_dequant_flush(
+        &mut self,
+        flush_tokens: usize,
+        n_groups: usize,
+        tok_base: usize,
+    ) -> Result<()> {
+        let k_block_start = self.gpu_q2k_blocks;
+        let v_block_start = self.gpu_q2v_blocks;
+
+        let new_k_blocks = n_groups * self.kv_heads * self.head_dim;
+        let blocks_per_token = self.head_dim / QKKV;
+        let new_v_blocks = self.kv_heads * flush_tokens * blocks_per_token;
+
+        // Serialize Q2 blocks to raw bytes and upload with byte offset.
+        // BlockQ2_0 is repr(C) with fixed 12-byte size.
+        const BLOCK_BYTES: usize = 12; // size_of::<BlockQ2_0>()
+
+        let total_k_blocks_so_far = self.qk.len(); // after push in flush_residual_gpu
+        let k_byte_offset = k_block_start * BLOCK_BYTES;
+        let v_byte_offset = v_block_start * BLOCK_BYTES;
+
+        // Collect the new blocks into contiguous byte slices
+        let k_bytes =
+            self.serialize_quantized_blocks_k(total_k_blocks_so_far - new_k_blocks, new_k_blocks);
+        let total_v_blocks_so_far = self.qv.len();
+        let v_bytes =
+            self.serialize_quantized_blocks_v(total_v_blocks_so_far - new_v_blocks, new_v_blocks);
+
+        #[cfg(feature = "opencl")]
+        {
+            use crate::backend::opencl::{OpenCLBackend, get_cl_mem};
+
+            let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
+            if let Some(ocl) = backend_arc.as_any().downcast_ref::<OpenCLBackend>() {
+                // Upload Q2 key blocks at byte offset
+                {
+                    let gpu_q2k = self.gpu_q2k.as_ref().unwrap();
+                    let cl_mem = get_cl_mem(gpu_q2k.buffer().as_ref())?;
+                    unsafe {
+                        ocl::core::enqueue_write_buffer(
+                            &ocl.queue,
+                            cl_mem,
+                            true,
+                            k_byte_offset,
+                            &k_bytes,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                    }
+                }
+                // Upload Q2 value blocks at byte offset
+                {
+                    let gpu_q2v = self.gpu_q2v.as_ref().unwrap();
+                    let cl_mem = get_cl_mem(gpu_q2v.buffer().as_ref())?;
+                    unsafe {
+                        ocl::core::enqueue_write_buffer(
+                            &ocl.queue,
+                            cl_mem,
+                            true,
+                            v_byte_offset,
+                            &v_bytes,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                    }
+                }
+
+                // Dispatch GPU dequant kernels
+                {
+                    let gpu_q2k = self.gpu_q2k.as_ref().unwrap();
+                    let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
+                    ocl.kivi_dequantize_key_q2(
+                        gpu_q2k,
+                        gpu_attn_k,
+                        self.kv_heads,
+                        self.head_dim,
+                        n_groups,
+                        tok_base,
+                        k_block_start,
+                    )?;
+                }
+                {
+                    let gpu_q2v = self.gpu_q2v.as_ref().unwrap();
+                    let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
+                    ocl.kivi_dequantize_value_q2(
+                        gpu_q2v,
+                        gpu_attn_v,
+                        self.kv_heads,
+                        self.head_dim,
+                        flush_tokens,
+                        tok_base,
+                        v_block_start,
+                    )?;
+                }
+            }
+        }
+
+        self.gpu_q2k_blocks += new_k_blocks;
+        self.gpu_q2v_blocks += new_v_blocks;
+
+        Ok(())
+    }
+
+    /// Serialize Q2 key blocks [block_start..block_start+count] to raw bytes.
+    fn serialize_quantized_blocks_k(&self, block_start: usize, count: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(count * 12);
+        // Q4/Q8 GPU mode not yet supported; only Q2 blocks are serialized
+        if let QuantizedBlocks::Q2(v) = &self.qk {
+            for b in &v[block_start..block_start + count] {
+                // SAFETY: BlockQ2_0 is repr(C), packed, 12 bytes
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(b as *const BlockQ2_0 as *const u8, 12) };
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
+
+    /// Serialize Q2 value blocks [block_start..block_start+count] to raw bytes.
+    fn serialize_quantized_blocks_v(&self, block_start: usize, count: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(count * 12);
+        if let QuantizedBlocks::Q2(v) = &self.qv {
+            for b in &v[block_start..block_start + count] {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(b as *const BlockQ2_0 as *const u8, 12) };
+                out.extend_from_slice(bytes);
+            }
+        }
+        out
+    }
+
+    /// GPU assemble_view: ensure GPU attention buffers are up to date.
+    ///
+    /// - `q2_deq_tokens` is kept in sync with `q2_tokens` during `flush_residual_gpu`,
+    ///   so no incremental dequant is needed here.
+    /// - Residual scatter: uses `kivi_scatter_residual` kernel (always re-done each call).
+    fn assemble_view_gpu(&mut self) -> Result<()> {
+        #[cfg(feature = "opencl")]
+        {
+            use crate::backend::opencl::OpenCLBackend;
+
+            if self.res_pos > 0 {
+                let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
+                if let Some(ocl) = backend_arc.as_any().downcast_ref::<OpenCLBackend>() {
+                    let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
+                    let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
+                    ocl.kivi_scatter_residual(
+                        gpu_res_k,
+                        gpu_attn_k,
+                        self.kv_heads,
+                        self.res_cap,
+                        self.head_dim,
+                        self.res_pos,
+                        self.q2_tokens,
+                    )?;
+                    let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+                    let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
+                    ocl.kivi_scatter_residual(
+                        gpu_res_v,
+                        gpu_attn_v,
+                        self.kv_heads,
+                        self.res_cap,
+                        self.head_dim,
+                        self.res_pos,
+                        self.q2_tokens,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
+        #[allow(unreachable_code)]
+        Ok(())
+    }
+
+    /// GPU get_view: return Tensors backed by GPU attention buffers.
+    fn get_view_gpu(&mut self) -> (Tensor, Tensor) {
+        if let Err(e) = self.assemble_view_gpu() {
+            log::warn!("KiviCache assemble_view_gpu error: {}", e);
+        }
+
+        let total = self.total_tokens();
+        let backend = self.gpu_backend.as_ref().unwrap().clone();
+
+        if total == 0 {
+            let buf = Arc::new(SharedBuffer::new(0, DType::F32));
+            let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
+            let t = Tensor::new(shape.clone(), buf.clone(), backend);
+            return (t.clone(), t);
+        }
+
+        let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
+        let k = Tensor::new(
+            shape.clone(),
+            self.gpu_attn_k.as_ref().unwrap().buffer().clone(),
+            backend.clone(),
+        );
+        let v = Tensor::new(
+            shape,
+            self.gpu_attn_v.as_ref().unwrap().buffer().clone(),
+            backend,
+        );
+        (k, v)
+    }
 }
 
 impl KVCacheOps for KiviCache {
@@ -525,6 +1069,12 @@ impl KVCacheOps for KiviCache {
             ));
         }
 
+        // GPU path: dispatch GPU kernels for residual update
+        if self.gpu_backend.is_some() {
+            return self.update_gpu(new_k, new_v, seq_len);
+        }
+
+        // === CPU path (unchanged) ===
         // Input layout: [batch=1, seq_len, kv_heads, head_dim] (SeqMajor, F32)
         let k_data = new_k.as_slice::<f32>();
         let v_data = new_v.as_slice::<f32>();
@@ -554,8 +1104,14 @@ impl KVCacheOps for KiviCache {
     }
 
     fn get_view(&mut self) -> (Tensor, Tensor) {
+        // GPU path: return tensors backed by GPU attention buffers
+        if self.gpu_backend.is_some() {
+            return self.get_view_gpu();
+        }
+
+        // === CPU path (unchanged) ===
         let total = self.total_tokens();
-        let backend: Arc<dyn crate::core::backend::Backend> = self.out_backend.clone();
+        let backend: Arc<dyn Backend> = self.out_backend.clone();
         if total == 0 {
             let buf = Arc::new(SharedBuffer::new(0, DType::F32));
             let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
@@ -1341,14 +1897,20 @@ mod tests {
         }
 
         let proxies = cache.take_flush_proxies();
+        // Each flush pushes 2 QCF metrics (compute_flush_qcf → "kivi",
+        // compute_flush_opr → "kivi_opr"). 2 flushes × 2 metrics = 4 total.
         assert_eq!(
             proxies.len(),
-            2,
-            "expected 2 flush proxies after 66 tokens with residual_size=32, got {}",
+            4,
+            "expected 4 flush proxies after 66 tokens with residual_size=32 (2 flushes × 2 metrics), got {}",
             proxies.len()
         );
         for p in &proxies {
-            assert_eq!(p.action, "kivi");
+            assert!(
+                p.action == "kivi" || p.action == "kivi_opr",
+                "unexpected action: {}",
+                p.action
+            );
             assert!(p.raw_value >= 0.0, "NMSE should be non-negative");
             assert_eq!(p.tokens_affected, 32);
         }
@@ -1397,5 +1959,68 @@ mod tests {
             cache.flush_proxies.is_empty(),
             "reset() must clear flush_proxies"
         );
+    }
+
+    // ── GPU-mode tests ────────────────────────────────────────────────────────
+
+    /// `new()` / `new_with_bits()` must always create CPU-mode caches.
+    #[test]
+    fn test_cpu_mode_is_default() {
+        let cache = KiviCache::new(2, 64, 256, 32);
+        assert!(!cache.is_gpu(), "new() must return CPU-mode cache");
+        assert!(cache.gpu_backend.is_none());
+        assert!(cache.gpu_res_k.is_none());
+        assert!(cache.gpu_attn_k.is_none());
+    }
+
+    /// `new_gpu()` with a non-OpenCL backend must silently fall back to CPU mode.
+    #[test]
+    fn test_new_gpu_non_opencl_falls_back_to_cpu() {
+        use crate::memory::galloc::Galloc;
+        let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn crate::core::memory::Memory> = Arc::new(Galloc::new());
+        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
+        // CpuBackend.name() != "OpenCL" → must fall back to CPU mode
+        assert!(
+            !cache.is_gpu(),
+            "new_gpu() with non-OpenCL backend must use CPU mode"
+        );
+    }
+
+    /// `reset()` must clear GPU position counters.
+    #[test]
+    fn test_reset_clears_gpu_counters() {
+        let mut cache = KiviCache::new(2, 64, 256, 32);
+        // Manually poke GPU counters to non-zero values (simulating partial GPU use)
+        cache.gpu_q2k_blocks = 42;
+        cache.gpu_q2v_blocks = 17;
+        cache.reset();
+        assert_eq!(cache.gpu_q2k_blocks, 0, "reset() must zero gpu_q2k_blocks");
+        assert_eq!(cache.gpu_q2v_blocks, 0, "reset() must zero gpu_q2v_blocks");
+    }
+
+    /// Existing CPU tests must not be affected by GPU fields being None.
+    #[test]
+    fn test_cpu_path_unaffected_by_gpu_fields() {
+        let kv_heads = 2;
+        let head_dim = 64;
+        let max_seq = 128;
+        let res_cap = 32;
+
+        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        // Fill 33 tokens → triggers one flush
+        for i in 0..33 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 10.0);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.q2_tokens, 32);
+        assert_eq!(cache.res_pos, 1);
+        assert_eq!(
+            cache.gpu_q2k_blocks, 0,
+            "cpu mode must not touch gpu counters"
+        );
+        let (k_view, _) = cache.get_view();
+        assert_eq!(k_view.shape().dims(), &[1, 33, kv_heads, head_dim]);
     }
 }
