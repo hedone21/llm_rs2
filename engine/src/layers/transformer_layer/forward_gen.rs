@@ -233,15 +233,21 @@ impl TransformerLayer {
 
         let need_scores = args.need_scores;
 
-        // Guard: only use GPU attention if KV buffers are actual OpenCL buffers.
-        // CPU-only caches (e.g. KiviCache with SharedBuffer) must use CPU fallback.
+        // Use dtype-aware attention for non-F32 KV caches (F16, Q4_0).
+        // On OpenCL: also guard that KV buffers are actual GPU buffers (not CPU-only
+        // KiviCache with SharedBuffer) — CPU-only caches must use the F32 fallback.
         #[cfg(feature = "opencl")]
         let kv_is_gpu = k_cache.buffer().cl_mem().is_some();
         #[cfg(not(feature = "opencl"))]
         let kv_is_gpu = true;
-        if ((backend.name() == "OpenCL" && use_gpu_attn) || k_cache.dtype() != DType::F32)
-            && kv_is_gpu
-        {
+        let use_typed_attn = if backend.name() == "OpenCL" {
+            (use_gpu_attn || k_cache.dtype() != DType::F32) && kv_is_gpu
+        } else {
+            // CPU backend: always use typed attention for non-F32 KV cache.
+            // CpuBackend::attention_gen handles F16/Q4_0 via dequantization.
+            k_cache.dtype() != DType::F32
+        };
+        if use_typed_attn {
             // GPU attention or F16 KV cache - use backend's dtype-aware implementation
             backend.attention_gen(
                 &q_rope,
