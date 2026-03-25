@@ -1,6 +1,8 @@
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use crate::pi_controller::GainZone;
+
 /// Top-level Manager configuration, loadable from TOML.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -194,6 +196,10 @@ pub struct PiControllerConfig {
     pub thermal_ki: f32,
     pub thermal_setpoint: f32,
     pub integral_clamp: f32,
+    /// Memory 도메인의 gain scheduling 구간.
+    /// 미설정 시 고정 memory_kp를 사용한다.
+    #[serde(default)]
+    pub memory_gain_zones: Vec<GainZone>,
 }
 
 impl Default for PiControllerConfig {
@@ -209,6 +215,7 @@ impl Default for PiControllerConfig {
             thermal_ki: 0.2,
             thermal_setpoint: 0.80,
             integral_clamp: 2.0,
+            memory_gain_zones: Vec::new(),
         }
     }
 }

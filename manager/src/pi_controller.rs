@@ -1,3 +1,13 @@
+use serde::Deserialize;
+
+/// Gain scheduling의 구간 정의.
+/// measurement가 `above` 이상일 때 `kp`를 적용한다.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GainZone {
+    pub above: f32,
+    pub kp: f32,
+}
+
 /// 단일 도메인용 PI 컨트롤러.
 ///
 /// 원시 측정값(0.0~1.0)을 연속적인 pressure intensity(0.0~1.0)로 변환한다.
@@ -12,6 +22,8 @@ pub struct PiController {
     integral_clamp: f32,
     /// false 이면 적분을 동결한다 (anti-windup: 해소 가능한 액션이 없을 때).
     can_act: bool,
+    /// Gain scheduling 구간 목록. 비어있으면 고정 Kp를 사용한다.
+    gain_zones: Vec<GainZone>,
 }
 
 impl PiController {
@@ -23,7 +35,25 @@ impl PiController {
             integral: 0.0,
             integral_clamp,
             can_act: true,
+            gain_zones: Vec::new(),
         }
+    }
+
+    /// gain_zones를 설정하는 builder 메서드.
+    pub fn with_gain_zones(mut self, zones: Vec<GainZone>) -> Self {
+        self.gain_zones = zones;
+        self
+    }
+
+    /// measurement에 따라 적용할 Kp를 결정한다.
+    /// gain_zones가 비어있으면 고정 Kp를 반환한다.
+    fn effective_kp(&self, measurement: f32) -> f32 {
+        for zone in self.gain_zones.iter().rev() {
+            if measurement >= zone.above {
+                return zone.kp;
+            }
+        }
+        self.kp
     }
 
     /// pressure intensity를 계산한다.
@@ -36,7 +66,8 @@ impl PiController {
             self.integral = (self.integral + error * dt).clamp(0.0, self.integral_clamp);
         }
 
-        (self.kp * error + self.ki * self.integral).clamp(0.0, 1.0)
+        let kp = self.effective_kp(measurement);
+        (kp * error + self.ki * self.integral).clamp(0.0, 1.0)
     }
 
     /// 해소 가능한 액션 존재 여부를 설정한다.
@@ -196,6 +227,119 @@ mod tests {
         assert!(
             out.abs() < EPS,
             "after reset, output should be 0.0, got {out}"
+        );
+    }
+
+    /// gain_zones가 비어있으면 기존 고정 Kp와 동일하게 동작해야 한다.
+    #[test]
+    fn test_gain_zones_empty_uses_base_kp() {
+        let kp = 2.0_f32;
+        let setpoint = 0.7_f32;
+        let measurement = 0.9_f32;
+
+        let mut ctrl_base = PiController::new(kp, 0.0, setpoint, 2.0);
+        let mut ctrl_zones = PiController::new(kp, 0.0, setpoint, 2.0).with_gain_zones(vec![]);
+
+        let out_base = ctrl_base.update(measurement, 0.1);
+        let out_zones = ctrl_zones.update(measurement, 0.1);
+        assert!(
+            (out_base - out_zones).abs() < EPS,
+            "empty gain_zones should behave identically: base={out_base}, zones={out_zones}"
+        );
+    }
+
+    /// measurement가 첫 zone의 above 미만이면 base Kp를 사용해야 한다.
+    #[test]
+    fn test_gain_zones_low_measurement_uses_base() {
+        let base_kp = 1.0_f32;
+        let setpoint = 0.5_f32;
+        // measurement=0.6, zone.above=0.8 → base Kp 적용
+        let zones = vec![GainZone {
+            above: 0.8,
+            kp: 5.0,
+        }];
+        let mut ctrl = PiController::new(base_kp, 0.0, setpoint, 2.0).with_gain_zones(zones);
+        let out = ctrl.update(0.6, 0.0);
+        let expected = (base_kp * (0.6 - setpoint)).clamp(0.0, 1.0);
+        assert!(
+            (out - expected).abs() < EPS,
+            "below zone threshold should use base_kp: expected={expected}, got={out}"
+        );
+    }
+
+    /// measurement가 mid zone에 있으면 해당 zone의 Kp를 적용해야 한다.
+    #[test]
+    fn test_gain_zones_mid_zone() {
+        let base_kp = 1.0_f32;
+        let setpoint = 0.5_f32;
+        // measurement=0.82 — zone1(above=0.8, kp=3.0) 적용, zone2(above=0.9, kp=8.0) 미적용
+        let zones = vec![
+            GainZone {
+                above: 0.8,
+                kp: 3.0,
+            },
+            GainZone {
+                above: 0.9,
+                kp: 8.0,
+            },
+        ];
+        let mut ctrl = PiController::new(base_kp, 0.0, setpoint, 2.0).with_gain_zones(zones);
+        let measurement = 0.82_f32;
+        let out = ctrl.update(measurement, 0.0);
+        let expected = (3.0_f32 * (measurement - setpoint)).clamp(0.0, 1.0);
+        assert!(
+            (out - expected).abs() < EPS,
+            "mid zone should use kp=3.0: expected={expected}, got={out}"
+        );
+    }
+
+    /// measurement가 가장 높은 zone에 있으면 최고 Kp를 적용해야 한다.
+    #[test]
+    fn test_gain_zones_high_zone() {
+        let base_kp = 1.0_f32;
+        let setpoint = 0.5_f32;
+        // measurement=0.95 — zone2(above=0.9, kp=8.0) 적용
+        let zones = vec![
+            GainZone {
+                above: 0.8,
+                kp: 3.0,
+            },
+            GainZone {
+                above: 0.9,
+                kp: 8.0,
+            },
+        ];
+        let mut ctrl = PiController::new(base_kp, 0.0, setpoint, 2.0).with_gain_zones(zones);
+        let measurement = 0.95_f32;
+        let out = ctrl.update(measurement, 0.0);
+        let expected = (8.0_f32 * (measurement - setpoint)).clamp(0.0, 1.0);
+        assert!(
+            (out - expected).abs() < EPS,
+            "high zone should use kp=8.0: expected={expected}, got={out}"
+        );
+    }
+
+    /// 90% 메모리 사용 + Kp=10 → 출력이 Critical threshold(0.70) 이상이어야 한다.
+    #[test]
+    fn test_gain_zones_critical_reaches_critical_threshold() {
+        // memory_setpoint=0.75, measurement=0.90, high zone kp=10.0
+        let setpoint = 0.75_f32;
+        let zones = vec![
+            GainZone {
+                above: 0.80,
+                kp: 4.0,
+            },
+            GainZone {
+                above: 0.88,
+                kp: 10.0,
+            },
+        ];
+        let mut ctrl = PiController::new(2.0, 0.0, setpoint, 2.0).with_gain_zones(zones);
+        let out = ctrl.update(0.90, 0.0);
+        let critical_threshold = 0.70_f32;
+        assert!(
+            out >= critical_threshold,
+            "90% memory with kp=10 should reach critical threshold {critical_threshold}, got {out}"
         );
     }
 }

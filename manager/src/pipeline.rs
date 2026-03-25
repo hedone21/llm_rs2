@@ -119,7 +119,8 @@ impl HierarchicalPolicy {
                 pi_cfg.memory_ki,
                 pi_cfg.memory_setpoint,
                 pi_cfg.integral_clamp,
-            ),
+            )
+            .with_gain_zones(pi_cfg.memory_gain_zones.clone()),
             pi_thermal: PiController::new(
                 pi_cfg.thermal_kp,
                 pi_cfg.thermal_ki,
