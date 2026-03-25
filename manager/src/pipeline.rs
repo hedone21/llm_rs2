@@ -80,6 +80,8 @@ pub struct PolicyPipeline {
     available_actions: Vec<ActionId>,
     /// Engine이 보고한 현재 활성 액션 목록 (heartbeat로 갱신).
     active_actions_reported: Vec<ActionId>,
+    /// 도메인별 마지막 신호 수신 시각 (실측 dt 계산용).
+    last_signal_time: HashMap<&'static str, Instant>,
 }
 
 impl PolicyPipeline {
@@ -121,6 +123,7 @@ impl PolicyPipeline {
             relief_model_path: None,
             available_actions: vec![],
             active_actions_reported: vec![],
+            last_signal_time: HashMap::new(),
         }
     }
 
@@ -334,34 +337,60 @@ impl PolicyPipeline {
 
     // ── 내부 헬퍼 ──────────────────────────────────────────────────────────
 
+    /// 도메인별 실측 dt를 계산하고 last_signal_time을 갱신한다.
+    ///
+    /// 첫 신호 시에는 `self.dt` 기본값을 반환한다.
+    /// 결과는 [0.001, 10.0] 범위로 clamp하여 이상값을 방지한다.
+    fn elapsed_dt(&mut self, domain: &'static str) -> f32 {
+        let now = Instant::now();
+        let dt = self
+            .last_signal_time
+            .get(domain)
+            .map(|prev| now.duration_since(*prev).as_secs_f32())
+            .unwrap_or(self.dt);
+        self.last_signal_time.insert(domain, now);
+        dt.clamp(0.001, 10.0)
+    }
+
     /// SystemSignal에서 도메인별 측정값을 추출하여 해당 PI Controller에 입력한다.
     fn update_pressure(&mut self, signal: &SystemSignal) {
         match signal {
-            SystemSignal::MemoryPressure { level, .. } => {
-                let m = level_to_measurement(*level);
-                self.pressure.memory = self.pi_memory.update(m, self.dt);
+            SystemSignal::MemoryPressure {
+                available_bytes,
+                total_bytes,
+                ..
+            } => {
+                let m = if *total_bytes > 0 {
+                    (1.0 - *available_bytes as f32 / *total_bytes as f32).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                let dt = self.elapsed_dt("memory");
+                self.pressure.memory = self.pi_memory.update(m, dt);
             }
             SystemSignal::ThermalAlert { temperature_mc, .. } => {
                 // 85°C (85000 mc) = 1.0 기준 정규화
                 let m = (*temperature_mc as f32 / 85_000.0).clamp(0.0, 1.0);
-                self.pressure.thermal = self.pi_thermal.update(m, self.dt);
+                let dt = self.elapsed_dt("thermal");
+                self.pressure.thermal = self.pi_thermal.update(m, dt);
             }
             SystemSignal::ComputeGuidance {
-                level,
                 cpu_usage_pct,
+                gpu_usage_pct,
                 ..
             } => {
-                // level 기반 측정값 + CPU 사용률 보조 입력 (둘 중 큰 값)
-                let m_level = level_to_measurement(*level);
                 let m_cpu = (*cpu_usage_pct as f32 / 100.0).clamp(0.0, 1.0);
-                let m = m_level.max(m_cpu);
-                self.pressure.compute = self.pi_compute.update(m, self.dt);
+                let m_gpu = (*gpu_usage_pct as f32 / 100.0).clamp(0.0, 1.0);
+                let m = m_cpu.max(m_gpu);
+                let dt = self.elapsed_dt("compute");
+                self.pressure.compute = self.pi_compute.update(m, dt);
             }
             SystemSignal::EnergyConstraint { level, .. } => {
                 // Energy → compute pressure에 보조 기여 (0.5 가중치)
                 let m = level_to_measurement(*level) * 0.5;
                 let combined = self.pressure.compute.max(m);
-                self.pressure.compute = self.pi_compute.update(combined, self.dt);
+                let dt = self.elapsed_dt("compute");
+                self.pressure.compute = self.pi_compute.update(combined, dt);
             }
         }
     }
@@ -484,9 +513,16 @@ mod tests {
     }
 
     fn memory_signal(level: Level) -> SystemSignal {
+        let (available_bytes, total_bytes) = match level {
+            Level::Normal => (1_800_000_000u64, 2_000_000_000u64),
+            Level::Warning => (800_000_000u64, 2_000_000_000u64),
+            Level::Critical => (300_000_000u64, 2_000_000_000u64),
+            Level::Emergency => (100_000_000u64, 2_000_000_000u64),
+        };
         SystemSignal::MemoryPressure {
             level,
-            available_bytes: 1_000_000_000,
+            available_bytes,
+            total_bytes,
             reclaim_target_bytes: 0,
         }
     }
@@ -1094,5 +1130,104 @@ mod tests {
         assert_eq!(p.available_actions.len(), 1);
         // "another_unknown"은 무시 → 빈 목록
         assert!(p.active_actions_reported.is_empty());
+    }
+
+    // ── raw metric 기반 PI 입력 검증 ─────────────────────────────────────
+
+    /// total_bytes=0 이면 memory pressure = 0.0 (division guard)
+    #[test]
+    fn test_memory_raw_metric_zero_total_gives_zero_pressure() {
+        let mut p = make_pipeline();
+        let sig = SystemSignal::MemoryPressure {
+            level: Level::Emergency,
+            available_bytes: 0,
+            total_bytes: 0,
+            reclaim_target_bytes: 0,
+        };
+        p.process_signal(&sig);
+        // total_bytes=0 → m=0.0 → setpoint 미만 → pressure=0
+        assert!(
+            p.pressure().memory.abs() < f32::EPSILON,
+            "Zero total_bytes should yield zero memory pressure"
+        );
+    }
+
+    /// 90% 사용률(available=10%) 신호를 반복하면 memory pressure가 setpoint(0.75)를 넘는다
+    #[test]
+    fn test_memory_raw_metric_high_usage_builds_pressure() {
+        let mut p = make_pipeline();
+        // available=10%, total=100% → m=0.90, setpoint=0.75 → PI error > 0 → 적분 누적
+        let sig = SystemSignal::MemoryPressure {
+            level: Level::Critical,
+            available_bytes: 100_000_000,
+            total_bytes: 1_000_000_000,
+            reclaim_target_bytes: 0,
+        };
+        for _ in 0..10 {
+            p.process_signal(&sig);
+        }
+        assert!(
+            p.pressure().memory > 0.0,
+            "90% memory usage should build positive pressure"
+        );
+    }
+
+    /// 낮은 사용률(available=95%) 신호는 memory pressure를 0으로 유지한다
+    #[test]
+    fn test_memory_raw_metric_low_usage_keeps_zero_pressure() {
+        let mut p = make_pipeline();
+        // available=95%, total=100% → m=0.05, setpoint=0.75 → PI error < 0 → pressure clamped to 0
+        let sig = SystemSignal::MemoryPressure {
+            level: Level::Normal,
+            available_bytes: 950_000_000,
+            total_bytes: 1_000_000_000,
+            reclaim_target_bytes: 0,
+        };
+        p.process_signal(&sig);
+        assert!(
+            p.pressure().memory.abs() < f32::EPSILON,
+            "Low memory usage (5%) should not build pressure (setpoint=0.75)"
+        );
+    }
+
+    /// compute 신호에서 level 없이 CPU 사용률만으로 pressure가 누적된다
+    #[test]
+    fn test_compute_raw_metric_cpu_only_builds_pressure() {
+        let mut p = make_pipeline();
+        // CPU 95%, GPU 0% → m=0.95, setpoint=0.70 → 적분 누적
+        let sig = SystemSignal::ComputeGuidance {
+            level: Level::Normal, // level은 이제 사용 안 함
+            recommended_backend: llm_shared::RecommendedBackend::Any,
+            reason: llm_shared::ComputeReason::Balanced,
+            cpu_usage_pct: 95.0,
+            gpu_usage_pct: 0.0,
+        };
+        for _ in 0..5 {
+            p.process_signal(&sig);
+        }
+        assert!(
+            p.pressure().compute > 0.0,
+            "95% CPU usage should build compute pressure regardless of level field"
+        );
+    }
+
+    /// elapsed_dt()는 두 번째 호출부터 실측 dt를 반환한다
+    #[test]
+    fn test_elapsed_dt_returns_measured_dt_on_second_call() {
+        let mut p = make_pipeline();
+        // 첫 번째 호출 → 기본값 dt=0.1
+        let first = p.elapsed_dt("test_domain");
+        assert!(
+            (first - 0.1).abs() < 0.01,
+            "First elapsed_dt should return default dt=0.1"
+        );
+        // 두 번째 호출 → 첫 번째 이후 경과 시간 (매우 짧음)
+        let second = p.elapsed_dt("test_domain");
+        assert!(
+            second < 0.1,
+            "Second elapsed_dt should be shorter than default (measured real interval)"
+        );
+        // clamp 하한: 0.001
+        assert!(second >= 0.001, "elapsed_dt should be at least 0.001s");
     }
 }

@@ -194,6 +194,7 @@ mod tests {
         let signal = SystemSignal::MemoryPressure {
             level: Level::Warning,
             available_bytes: 500_000_000,
+            total_bytes: 2_000_000_000,
             reclaim_target_bytes: 50_000_000,
         };
         emitter.emit(&signal).unwrap();

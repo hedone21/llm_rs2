@@ -199,6 +199,7 @@ mod tests {
             SystemSignal::MemoryPressure {
                 level: Level::Critical,
                 available_bytes: 50 * 1024 * 1024,
+                total_bytes: 4 * 1024 * 1024 * 1024,
                 reclaim_target_bytes: 100 * 1024 * 1024,
             },
         );
@@ -224,6 +225,7 @@ mod tests {
             SystemSignal::MemoryPressure {
                 level: Level::Warning,
                 available_bytes: 200 * 1024 * 1024,
+                total_bytes: 4 * 1024 * 1024 * 1024,
                 reclaim_target_bytes: 50 * 1024 * 1024,
             },
         );
@@ -256,6 +258,7 @@ mod tests {
             SystemSignal::MemoryPressure {
                 level: Level::Warning,
                 available_bytes: 200 * 1024 * 1024,
+                total_bytes: 4 * 1024 * 1024 * 1024,
                 reclaim_target_bytes: 50 * 1024 * 1024,
             },
         );
@@ -293,6 +296,7 @@ mod tests {
             SystemSignal::MemoryPressure {
                 level: Level::Normal,
                 available_bytes: 1024 * 1024 * 1024,
+                total_bytes: 4 * 1024 * 1024 * 1024,
                 reclaim_target_bytes: 0,
             },
         );
@@ -328,6 +332,7 @@ mod tests {
             SystemSignal::MemoryPressure {
                 level: Level::Warning,
                 available_bytes: 200 * 1024 * 1024,
+                total_bytes: 4 * 1024 * 1024 * 1024,
                 reclaim_target_bytes: 50 * 1024 * 1024,
             },
         );

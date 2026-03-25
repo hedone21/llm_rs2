@@ -168,7 +168,7 @@ mod tests {
 
     #[test]
     fn parse_memory_signal() {
-        let json = r#"{"memory_pressure":{"level":"warning","available_bytes":100000000,"reclaim_target_bytes":50000000}}"#;
+        let json = r#"{"memory_pressure":{"level":"warning","available_bytes":100000000,"total_bytes":1000000000,"reclaim_target_bytes":50000000}}"#;
         let signal: SystemSignal = serde_json::from_str(json).unwrap();
         assert_eq!(signal.level(), Level::Warning);
     }
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn skips_invalid_lines() {
-        let input = "not json\n{\"memory_pressure\":{\"level\":\"normal\",\"available_bytes\":500000000,\"reclaim_target_bytes\":0}}\n";
+        let input = "not json\n{\"memory_pressure\":{\"level\":\"normal\",\"available_bytes\":500000000,\"total_bytes\":2000000000,\"reclaim_target_bytes\":0}}\n";
         let reader = BufReader::new(input.as_bytes());
 
         let config = ExternalMonitorConfig {

@@ -58,6 +58,7 @@ mod tests {
         SystemSignal::MemoryPressure {
             level,
             available_bytes: 1024 * 1024,
+            total_bytes: 4 * 1024 * 1024,
             reclaim_target_bytes: 512 * 1024,
         }
     }

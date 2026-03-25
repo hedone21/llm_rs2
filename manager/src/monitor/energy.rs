@@ -159,9 +159,8 @@ impl Monitor for EnergyMonitor {
                 None => (None, false, None),
             };
 
-            if self.evaluate_energy(battery_pct, charging).is_some()
-                && tx.send(self.build_signal()).is_err()
-            {
+            self.evaluate_energy(battery_pct, charging);
+            if tx.send(self.build_signal()).is_err() {
                 break;
             }
 

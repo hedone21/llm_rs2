@@ -107,6 +107,7 @@ pub enum SystemSignal {
     MemoryPressure {
         level: Level,
         available_bytes: u64,
+        total_bytes: u64,
         reclaim_target_bytes: u64,
     },
     ComputeGuidance {
@@ -338,6 +339,7 @@ mod tests {
         let sig = SystemSignal::MemoryPressure {
             level: Level::Critical,
             available_bytes: 1024,
+            total_bytes: 4096,
             reclaim_target_bytes: 512,
         };
         let json = serde_json::to_string(&sig).unwrap();

@@ -215,10 +215,10 @@ impl Transport for DbusTransport {
     }
 }
 
-/// Parse MemoryPressure signal: (level: s, available_bytes: t, reclaim_target_bytes: t)
+/// Parse MemoryPressure signal: (level: s, available_bytes: t, total_bytes: t, reclaim_target_bytes: t)
 fn parse_memory_pressure(msg: &zbus::Message) -> anyhow::Result<SystemSignal> {
     let body = msg.body();
-    let (level_str, available_bytes, reclaim_target_bytes): (String, u64, u64) =
+    let (level_str, available_bytes, total_bytes, reclaim_target_bytes): (String, u64, u64, u64) =
         body.deserialize()?;
 
     let level = Level::from_dbus_str(&level_str)
@@ -227,6 +227,7 @@ fn parse_memory_pressure(msg: &zbus::Message) -> anyhow::Result<SystemSignal> {
     Ok(SystemSignal::MemoryPressure {
         level,
         available_bytes,
+        total_bytes,
         reclaim_target_bytes,
     })
 }

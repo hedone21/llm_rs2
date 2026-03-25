@@ -25,6 +25,7 @@ impl DbusEmitter {
             SystemSignal::MemoryPressure {
                 level,
                 available_bytes,
+                total_bytes,
                 reclaim_target_bytes,
             } => {
                 let level_str = level_to_str(*level);
@@ -33,7 +34,12 @@ impl DbusEmitter {
                     MANAGER_PATH,
                     MANAGER_IFACE,
                     "MemoryPressure",
-                    &(level_str, *available_bytes, *reclaim_target_bytes),
+                    &(
+                        level_str,
+                        *available_bytes,
+                        *total_bytes,
+                        *reclaim_target_bytes,
+                    ),
                 )?;
             }
             SystemSignal::ComputeGuidance {

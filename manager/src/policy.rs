@@ -522,6 +522,7 @@ mod tests {
         snap.update(&SystemSignal::MemoryPressure {
             level: Level::Warning,
             available_bytes: 100_000_000,
+            total_bytes: 1_000_000_000,
             reclaim_target_bytes: 50_000_000,
         });
         assert_eq!(snap.memory_level, Level::Warning);

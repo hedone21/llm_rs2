@@ -112,21 +112,18 @@ impl Monitor for ComputeMonitor {
             match self.read_once() {
                 Ok(true) => {
                     let worst = self.last_cpu.max(self.last_gpu);
-                    let level_changed = self.evaluator.evaluate(worst).is_some();
+                    self.evaluator.evaluate(worst);
 
                     let (new_rec, new_reason) = compute_recommendation(
                         self.last_cpu,
                         self.last_gpu,
                         self.warning_usage_pct,
                     );
-                    let rec_changed = new_rec != self.recommended;
+                    self.recommended = new_rec;
+                    self.reason = new_reason;
 
-                    if level_changed || rec_changed {
-                        self.recommended = new_rec;
-                        self.reason = new_reason;
-                        if tx.send(self.build_signal()).is_err() {
-                            break;
-                        }
+                    if tx.send(self.build_signal()).is_err() {
+                        break;
                     }
                 }
                 Ok(false) => {} // First snapshot, no delta yet

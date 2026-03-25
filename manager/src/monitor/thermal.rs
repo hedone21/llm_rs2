@@ -143,9 +143,8 @@ impl Monitor for ThermalMonitor {
 
             match self.read_once() {
                 Ok(()) => {
-                    if self.evaluator.evaluate(self.last_temp_mc as f64).is_some()
-                        && tx.send(self.build_signal()).is_err()
-                    {
+                    self.evaluator.evaluate(self.last_temp_mc as f64);
+                    if tx.send(self.build_signal()).is_err() {
                         break;
                     }
                 }

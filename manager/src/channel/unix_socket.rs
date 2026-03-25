@@ -469,6 +469,7 @@ mod tests {
         let signal = SystemSignal::MemoryPressure {
             level: Level::Warning,
             available_bytes: 500_000_000,
+            total_bytes: 2_000_000_000,
             reclaim_target_bytes: 50_000_000,
         };
         // emit은 에러를 전파하지 않고 Disconnected로 전이한다
@@ -501,6 +502,7 @@ mod tests {
         let signal = SystemSignal::MemoryPressure {
             level: Level::Normal,
             available_bytes: 1_000_000_000,
+            total_bytes: 2_000_000_000,
             reclaim_target_bytes: 0,
         };
         channel.emit(&signal).unwrap();

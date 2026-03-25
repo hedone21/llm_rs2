@@ -57,6 +57,7 @@ impl MemoryMonitor {
         SystemSignal::MemoryPressure {
             level: self.evaluator.level(),
             available_bytes: self.last_available,
+            total_bytes: self.last_total,
             reclaim_target_bytes: reclaim,
         }
     }
@@ -89,9 +90,8 @@ impl Monitor for MemoryMonitor {
                         (available as f64 / total as f64) * 100.0
                     };
 
-                    if self.evaluator.evaluate(pct).is_some()
-                        && tx.send(self.build_signal()).is_err()
-                    {
+                    self.evaluator.evaluate(pct);
+                    if tx.send(self.build_signal()).is_err() {
                         break;
                     }
                 }
