@@ -2640,20 +2640,28 @@ fn run_kivi_ppl(
         .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
-    let opr_values: Vec<f64> = qcf_metrics
+
+    // KIVI OPR: per-flush events and summary stats
+    let qcf_kivi_events: Vec<&serde_json::Value> = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() == Some("kivi_opr"))
+        .collect();
+    let n_kivi_flushes = qcf_kivi_events.len();
+    let opr_raw_values: Vec<f64> = qcf_kivi_events
+        .iter()
         .filter_map(|m| m["raw_value"].as_f64())
         .collect();
-    let qcf_kivi_opr_total: Option<f64> = if opr_values.is_empty() {
+    let qcf_kivi_opr_sum: f64 = opr_raw_values.iter().sum();
+    let qcf_kivi_opr_max: f64 = opr_raw_values.iter().cloned().fold(0.0f64, f64::max);
+    let qcf_kivi_opr_total: Option<f64> = if opr_raw_values.is_empty() {
         None
     } else {
-        Some(opr_values.iter().sum::<f64>() / opr_values.len() as f64)
+        Some(qcf_kivi_opr_sum / opr_raw_values.len() as f64)
     };
-    let qcf_kivi_opr_events: Option<usize> = if opr_values.is_empty() {
+    let qcf_kivi_opr_events: Option<usize> = if opr_raw_values.is_empty() {
         None
     } else {
-        Some(opr_values.len())
+        Some(opr_raw_values.len())
     };
 
     let output = serde_json::json!({
@@ -2664,9 +2672,13 @@ fn run_kivi_ppl(
         "wall_time_s": wall_time,
         "qcf_metrics": qcf_metrics,
         "flush_count": qcf_metrics.len(),
+        "n_kivi_flushes": n_kivi_flushes,
+        "qcf_kivi_events": qcf_kivi_events,
         "qcf_kivi_nmse_total": qcf_kivi_nmse_total,
         "qcf_attn_total": qcf_kivi_nmse_total,
         "qcf_attn_normalized_total": qcf_attn_normalized_total,
+        "qcf_kivi_opr_sum": qcf_kivi_opr_sum,
+        "qcf_kivi_opr_max": qcf_kivi_opr_max,
         "qcf_kivi_opr_total": qcf_kivi_opr_total,
         "qcf_kivi_opr_events": qcf_kivi_opr_events,
         "final_cache_pos": kv_caches[0].current_pos(),
@@ -3612,9 +3624,8 @@ fn run_ppl(
 
     let mut total_nll: f64 = 0.0;
     let mut nll_count: usize = 0;
-    // PPL: only collect QCF at first eviction event (scalar, not array)
-    let mut first_eviction_done = false;
-    let mut eviction_event: Option<serde_json::Value> = None;
+    // PPL v3: collect QCF for every eviction event
+    let mut qcf_events: Vec<serde_json::Value> = Vec::new();
     let qcf_config = QcfConfig {
         mode: match args.qcf_mode.as_str() {
             "caote" => llm_rs2::core::qcf::QcfMode::Caote,
@@ -3794,88 +3805,77 @@ fn run_ppl(
                 };
 
                 if result.evicted {
-                    // Collect QCF at first eviction event only
-                    if !first_eviction_done {
-                        first_eviction_done = true;
-                        let eviction_ratio = result.tokens_removed as f32 / before_len as f32;
-                        let ppl_at_event = (total_nll / nll_count as f64).exp();
+                    let eviction_ratio = result.tokens_removed as f32 / before_len as f32;
+                    let ppl_at_event = (total_nll / nll_count as f64).exp();
 
-                        let (qcf_attn_raw, qcf_attn_norm, qcf_caote_value) =
-                            if let Some(acc) = score_accumulator.as_ref() {
-                                if let Some(head_attn) = acc.last_step_head_attn() {
-                                    let positions = if score_based_eviction {
-                                        let scores = acc.importance_scores();
-                                        let target_len =
-                                            ((before_len as f32) * ratio) as usize;
-                                        let evicted =
-                                            llm_rs2::core::qcf::identify_evicted_h2o(
-                                                scores,
-                                                protected_prefix,
-                                                args.h2o_keep_ratio,
-                                                before_len,
-                                                target_len,
-                                            );
-                                        evicted
-                                            .iter()
-                                            .map(|(pos, _)| *pos)
-                                            .collect::<Vec<_>>()
-                                    } else {
-                                        llm_rs2::core::qcf::identify_evicted_sliding(
-                                            protected_prefix,
-                                            result.tokens_removed,
-                                            before_len,
-                                        )
-                                    };
-
-                                    // QCF-ATTN v2 (closed-form)
-                                    let n_kv_heads = kv_caches[0].kv_heads().max(1);
-                                    let max_seq_len = head_attn.len() / n_kv_heads;
-                                    let attn_metric =
-                                        llm_rs2::core::qcf::compute_qcf_attn_v2(
-                                            head_attn,
-                                            &positions,
-                                            n_kv_heads,
-                                            max_seq_len,
-                                            eviction_ratio,
-                                        );
-
-                                    // QCF-CAOTE
-                                    let caote = if can_compute_qcf && !positions.is_empty() {
-                                        let metric =
-                                            llm_rs2::core::qcf::compute_eviction_qcf_caote(
-                                                &positions,
-                                                head_attn,
-                                                &kv_caches[0],
-                                                &qcf_config,
-                                                v_cpu_data.as_deref(),
-                                            );
-                                        metric.raw_value as f64
-                                    } else {
-                                        0.0
-                                    };
-
-                                    (
-                                        attn_metric.raw_value as f64,
-                                        attn_metric.normalized_value as f64,
-                                        caote,
-                                    )
+                    let (qcf_attn_raw, qcf_attn_norm, qcf_caote_value) =
+                        if let Some(acc) = score_accumulator.as_ref() {
+                            if let Some(head_attn) = acc.last_step_head_attn() {
+                                let positions = if score_based_eviction {
+                                    let scores = acc.importance_scores();
+                                    let target_len = ((before_len as f32) * ratio) as usize;
+                                    let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
+                                        scores,
+                                        protected_prefix,
+                                        args.h2o_keep_ratio,
+                                        before_len,
+                                        target_len,
+                                    );
+                                    evicted.iter().map(|(pos, _)| *pos).collect::<Vec<_>>()
                                 } else {
-                                    (0.0, 0.0, 0.0)
-                                }
+                                    llm_rs2::core::qcf::identify_evicted_sliding(
+                                        protected_prefix,
+                                        result.tokens_removed,
+                                        before_len,
+                                    )
+                                };
+
+                                // QCF-ATTN v2 (closed-form)
+                                let n_kv_heads = kv_caches[0].kv_heads().max(1);
+                                let max_seq_len = head_attn.len() / n_kv_heads;
+                                let attn_metric = llm_rs2::core::qcf::compute_qcf_attn_v2(
+                                    head_attn,
+                                    &positions,
+                                    n_kv_heads,
+                                    max_seq_len,
+                                    eviction_ratio,
+                                );
+
+                                // QCF-CAOTE
+                                let caote = if can_compute_qcf && !positions.is_empty() {
+                                    let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                        &positions,
+                                        head_attn,
+                                        &kv_caches[0],
+                                        &qcf_config,
+                                        v_cpu_data.as_deref(),
+                                    );
+                                    metric.raw_value as f64
+                                } else {
+                                    0.0
+                                };
+
+                                (
+                                    attn_metric.raw_value as f64,
+                                    attn_metric.normalized_value as f64,
+                                    caote,
+                                )
                             } else {
                                 (0.0, 0.0, 0.0)
-                            };
+                            }
+                        } else {
+                            (0.0, 0.0, 0.0)
+                        };
 
-                        eviction_event = Some(serde_json::json!({
-                            "token_index": i,
-                            "tokens_evicted": result.tokens_removed,
-                            "eviction_ratio": eviction_ratio,
-                            "qcf_attn_raw": qcf_attn_raw,
-                            "qcf_attn_norm": qcf_attn_norm,
-                            "qcf_caote": qcf_caote_value,
-                            "ppl_at_event": ppl_at_event,
-                        }));
-                    }
+                    qcf_events.push(serde_json::json!({
+                        "step": i,
+                        "tokens_evicted": result.tokens_removed,
+                        "eviction_ratio": eviction_ratio,
+                        "qcf_attn_raw": qcf_attn_raw,
+                        "qcf_attn_norm": qcf_attn_norm,
+                        "qcf_caote": qcf_caote_value,
+                        "ppl_at_step": ppl_at_event,
+                    }));
 
                     start_pos = kv_caches[0].current_pos;
                     if let Some(acc) = score_accumulator.as_mut() {
@@ -3908,13 +3908,37 @@ fn run_ppl(
     let ppl = (total_nll / nll_count as f64).exp();
     let tok_per_sec = nll_count as f64 / wall_time;
 
+    // Compute summary stats from all eviction events (v3)
+    let n_evictions = qcf_events.len();
+    let qcf_sum_attn_norm: f64 = qcf_events
+        .iter()
+        .filter_map(|e| e["qcf_attn_norm"].as_f64())
+        .sum();
+    let qcf_sum_caote: f64 = qcf_events
+        .iter()
+        .filter_map(|e| e["qcf_caote"].as_f64())
+        .sum();
+    let qcf_max_attn_norm: f64 = qcf_events
+        .iter()
+        .filter_map(|e| e["qcf_attn_norm"].as_f64())
+        .fold(0.0f64, f64::max);
+    let qcf_max_caote: f64 = qcf_events
+        .iter()
+        .filter_map(|e| e["qcf_caote"].as_f64())
+        .fold(0.0f64, f64::max);
+
     let output = serde_json::json!({
         "ppl": ppl,
         "total_nll": total_nll,
         "token_count": nll_count,
         "tokens_per_second": tok_per_sec,
         "wall_time_s": wall_time,
-        "eviction_event": eviction_event,
+        "n_evictions": n_evictions,
+        "qcf_events": qcf_events,
+        "qcf_sum_attn_norm": qcf_sum_attn_norm,
+        "qcf_sum_caote": qcf_sum_caote,
+        "qcf_max_attn_norm": qcf_max_attn_norm,
+        "qcf_max_caote": qcf_max_caote,
         "config": {
             "model": args.model_path,
             "text_file": text_file,
