@@ -5,11 +5,20 @@
 //! and collects QCF/CAOTE metrics at each eviction event.
 
 use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
-use super::qcf_helpers::{aggregate_eviction_metrics, metric_to_json};
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::cache_manager::CacheManager;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::qcf::QcfConfig;
+
+/// QCF result from the single post-prefill eviction event (eval-ll mode).
+#[derive(Debug, Clone)]
+pub struct EvictionQcfResult {
+    pub tokens_evicted: usize,
+    pub eviction_ratio: f32,
+    pub qcf_attn_raw: f32,
+    pub qcf_attn_norm: f32,
+    pub qcf_caote: f32,
+}
 
 /// KV cache snapshot for save/restore between multi-token choice scoring.
 ///
@@ -89,6 +98,8 @@ pub struct EvictionHook {
     eviction_count: usize,
     /// Total tokens evicted this question.
     evicted_total: usize,
+    /// QCF result from the single post-prefill eviction event (eval-ll mode).
+    eviction_qcf: Option<EvictionQcfResult>,
 }
 
 impl EvictionHook {
@@ -116,6 +127,7 @@ impl EvictionHook {
             backend,
             eviction_count: 0,
             evicted_total: 0,
+            eviction_qcf: None,
         }
     }
 }
@@ -124,8 +136,8 @@ impl StepHook<KVCache> for EvictionHook {
     fn post_decode_step(
         &mut self,
         caches: &mut [KVCache],
-        step: usize,
-        qcf_metrics: &mut Vec<serde_json::Value>,
+        _step: usize,
+        _qcf_metrics: &mut Vec<serde_json::Value>,
     ) -> PostStepResult {
         if caches.is_empty() || max_cache_pos(caches) <= self.effective_budget {
             return PostStepResult::default();
@@ -134,30 +146,7 @@ impl StepHook<KVCache> for EvictionHook {
         let before_len = max_cache_pos(caches);
         let ratio = self.effective_budget as f32 / before_len as f32;
 
-        // For GPU backends (as_ptr() == null), read V buffer back to CPU so that
-        // QCF/OPR metrics can be computed. Falls back to None on readback failure.
-        let can_compute_qcf = self.kv_type == "f32";
-        let v_cpu_data: Option<Vec<f32>> = if can_compute_qcf
-            && !caches.is_empty()
-            && caches[0].v_buffer.buffer().as_ptr().is_null()
-        {
-            let v_elems = caches[0].v_buffer.buffer().size() / 4;
-            let mut v_buf = vec![0.0f32; v_elems];
-            let byte_slice = unsafe {
-                std::slice::from_raw_parts_mut(v_buf.as_mut_ptr() as *mut u8, v_elems * 4)
-            };
-            match self.backend.read_buffer(&caches[0].v_buffer, byte_slice) {
-                Ok(()) => Some(v_buf),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
-        // Effective QCF: either CPU-direct or GPU-readback succeeded
-        let can_compute_qcf = can_compute_qcf
-            && !caches.is_empty()
-            && (v_cpu_data.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
-
+        // Perform eviction (QCF collection removed — eval-ll uses single post_prefill event)
         let result = if self.score_based_eviction {
             let active = self
                 .score_accumulator
@@ -171,98 +160,13 @@ impl StepHook<KVCache> for EvictionHook {
                     .unwrap()
                     .importance_scores()
                     .to_vec();
-                let target_len = ((before_len as f32) * ratio) as usize;
-                let evicted = crate::core::qcf::identify_evicted_h2o(
-                    &scores,
-                    self.protected_prefix,
-                    self.h2o_keep_ratio,
-                    before_len,
-                    target_len,
-                );
-
-                if !evicted.is_empty() && can_compute_qcf && !caches.is_empty() {
-                    if self.qcf_config.mode.has_attn() {
-                        let metric = crate::core::qcf::compute_eviction_qcf_attn(
-                            &evicted,
-                            &scores,
-                            &caches[0],
-                            &self.qcf_config,
-                            v_cpu_data.as_deref(),
-                        );
-                        qcf_metrics.push(metric_to_json(&metric, step, before_len));
-                    }
-                    if self.qcf_config.mode.has_caote()
-                        && let Some(head_attn) = self
-                            .score_accumulator
-                            .as_ref()
-                            .and_then(|acc| acc.last_step_head_attn())
-                    {
-                        let positions: Vec<usize> = evicted.iter().map(|(pos, _)| *pos).collect();
-                        let metric = crate::core::qcf::compute_eviction_qcf_caote(
-                            &positions,
-                            head_attn,
-                            &caches[0],
-                            &self.qcf_config,
-                            v_cpu_data.as_deref(),
-                        );
-                        qcf_metrics.push(metric_to_json(&metric, step, before_len));
-                    }
-                }
-
                 self.cache_manager
                     .force_evict_with_scores(caches, ratio, &scores)
             } else {
                 self.cache_manager.force_evict(caches, ratio)
             }
         } else {
-            // Sliding / position-based eviction
-            let r = self.cache_manager.force_evict(caches, ratio);
-            if let Ok(ref evict_result) = r
-                && evict_result.evicted
-                && can_compute_qcf
-                && !caches.is_empty()
-            {
-                if self.qcf_config.mode.has_attn() {
-                    let positions = crate::core::qcf::identify_evicted_sliding(
-                        self.protected_prefix,
-                        evict_result.tokens_removed,
-                        before_len,
-                    );
-                    let metric = crate::core::qcf::compute_sliding_qcf_attn(
-                        &positions,
-                        &caches[0],
-                        before_len,
-                        &self.qcf_config,
-                        v_cpu_data.as_deref(),
-                    );
-                    let mut entry = metric_to_json(&metric, step, before_len);
-                    entry["cache_pos_after"] = serde_json::json!(evict_result.new_pos);
-                    qcf_metrics.push(entry);
-                }
-                if self.qcf_config.mode.has_caote()
-                    && let Some(head_attn) = self
-                        .score_accumulator
-                        .as_ref()
-                        .and_then(|acc| acc.last_step_head_attn())
-                {
-                    let positions = crate::core::qcf::identify_evicted_sliding(
-                        self.protected_prefix,
-                        evict_result.tokens_removed,
-                        before_len,
-                    );
-                    let metric = crate::core::qcf::compute_sliding_qcf_caote(
-                        &positions,
-                        head_attn,
-                        &caches[0],
-                        &self.qcf_config,
-                        v_cpu_data.as_deref(),
-                    );
-                    let mut entry = metric_to_json(&metric, step, before_len);
-                    entry["cache_pos_after"] = serde_json::json!(evict_result.new_pos);
-                    qcf_metrics.push(entry);
-                }
-            }
-            r
+            self.cache_manager.force_evict(caches, ratio)
         };
 
         match result {
@@ -282,7 +186,7 @@ impl StepHook<KVCache> for EvictionHook {
         }
     }
 
-    fn post_prefill(&mut self, caches: &mut [KVCache], qcf_metrics: &mut Vec<serde_json::Value>) {
+    fn post_prefill(&mut self, caches: &mut [KVCache], _qcf_metrics: &mut Vec<serde_json::Value>) {
         // After full batch prefill, evict if cache exceeds budget.
         // This replaces the old chunked-prefill approach that decoded overflow
         // tokens one-by-one (causing 2-3.3x slowdown).
@@ -292,8 +196,9 @@ impl StepHook<KVCache> for EvictionHook {
 
         let before_len = max_cache_pos(caches);
         let ratio = self.effective_budget as f32 / before_len as f32;
+        let eviction_ratio = 1.0 - ratio;
 
-        // V buffer readback for QCF (GPU backends)
+        // V buffer readback for QCF-CAOTE (GPU backends)
         let can_compute_qcf = self.kv_type == "f32";
         let v_cpu_data: Option<Vec<f32>> = if can_compute_qcf
             && !caches.is_empty()
@@ -315,8 +220,10 @@ impl StepHook<KVCache> for EvictionHook {
             && !caches.is_empty()
             && (v_cpu_data.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
 
-        // Eviction with QCF collection (mirrors post_decode_step logic)
-        let result = if self.score_based_eviction {
+        // Collect QCF metrics before eviction
+        let (_evicted_positions_for_qcf, qcf_attn_raw, qcf_attn_norm, qcf_caote) = if self
+            .score_based_eviction
+        {
             let active = self
                 .score_accumulator
                 .as_ref()
@@ -337,25 +244,38 @@ impl StepHook<KVCache> for EvictionHook {
                     before_len,
                     target_len,
                 );
+                let positions: Vec<usize> = evicted.iter().map(|(pos, _)| *pos).collect::<Vec<_>>();
 
-                if !evicted.is_empty() && can_compute_qcf && !caches.is_empty() {
-                    if self.qcf_config.mode.has_attn() {
-                        let metric = crate::core::qcf::compute_eviction_qcf_attn(
-                            &evicted,
-                            &scores,
-                            &caches[0],
-                            &self.qcf_config,
-                            v_cpu_data.as_deref(),
+                // QCF-ATTN v2: use last_step_head_attn if available
+                let (attn_raw, attn_norm) = self
+                    .score_accumulator
+                    .as_ref()
+                    .and_then(|acc| acc.last_step_head_attn())
+                    .map(|head_attn| {
+                        let n_kv_heads = if !caches.is_empty() {
+                            caches[0].kv_heads()
+                        } else {
+                            1
+                        };
+                        let max_seq_len = head_attn.len() / n_kv_heads.max(1);
+                        let m = crate::core::qcf::compute_qcf_attn_v2(
+                            head_attn,
+                            &positions,
+                            n_kv_heads,
+                            max_seq_len,
+                            eviction_ratio,
                         );
-                        qcf_metrics.push(metric_to_json(&metric, 0, before_len));
-                    }
-                    if self.qcf_config.mode.has_caote()
-                        && let Some(head_attn) = self
-                            .score_accumulator
-                            .as_ref()
-                            .and_then(|acc| acc.last_step_head_attn())
+                        (m.raw_value, m.normalized_value)
+                    })
+                    .unwrap_or((0.0, 0.0));
+
+                // QCF-CAOTE
+                let caote = if can_compute_qcf && !positions.is_empty() {
+                    if let Some(head_attn) = self
+                        .score_accumulator
+                        .as_ref()
+                        .and_then(|acc| acc.last_step_head_attn())
                     {
-                        let positions: Vec<usize> = evicted.iter().map(|(pos, _)| *pos).collect();
                         let metric = crate::core::qcf::compute_eviction_qcf_caote(
                             &positions,
                             head_attn,
@@ -363,10 +283,89 @@ impl StepHook<KVCache> for EvictionHook {
                             &self.qcf_config,
                             v_cpu_data.as_deref(),
                         );
-                        qcf_metrics.push(metric_to_json(&metric, 0, before_len));
+                        metric.raw_value
+                    } else {
+                        0.0
                     }
-                }
+                } else {
+                    0.0
+                };
 
+                (positions, attn_raw, attn_norm, caote)
+            } else {
+                (Vec::new(), 0.0, 0.0, 0.0)
+            }
+        } else {
+            // Sliding: compute positions that will be evicted
+            let target_len = ((before_len as f32) * ratio) as usize;
+            let prune_count = before_len.saturating_sub(target_len);
+            let positions = crate::core::qcf::identify_evicted_sliding(
+                self.protected_prefix,
+                prune_count,
+                before_len,
+            );
+
+            // QCF-ATTN v2: use last_step_head_attn if available
+            let (attn_raw, attn_norm) = self
+                .score_accumulator
+                .as_ref()
+                .and_then(|acc| acc.last_step_head_attn())
+                .map(|head_attn| {
+                    let n_kv_heads = if !caches.is_empty() {
+                        caches[0].kv_heads()
+                    } else {
+                        1
+                    };
+                    let max_seq_len = head_attn.len() / n_kv_heads.max(1);
+                    let m = crate::core::qcf::compute_qcf_attn_v2(
+                        head_attn,
+                        &positions,
+                        n_kv_heads,
+                        max_seq_len,
+                        eviction_ratio,
+                    );
+                    (m.raw_value, m.normalized_value)
+                })
+                .unwrap_or((0.0, 0.0));
+
+            // QCF-CAOTE
+            let caote = if can_compute_qcf && !positions.is_empty() {
+                if let Some(head_attn) = self
+                    .score_accumulator
+                    .as_ref()
+                    .and_then(|acc| acc.last_step_head_attn())
+                {
+                    let metric = crate::core::qcf::compute_sliding_qcf_caote(
+                        &positions,
+                        head_attn,
+                        &caches[0],
+                        &self.qcf_config,
+                        v_cpu_data.as_deref(),
+                    );
+                    metric.raw_value
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+
+            (positions, attn_raw, attn_norm, caote)
+        };
+
+        // Perform eviction
+        let result = if self.score_based_eviction {
+            let active = self
+                .score_accumulator
+                .as_ref()
+                .is_some_and(|acc| acc.is_active());
+            if active {
+                let scores = self
+                    .score_accumulator
+                    .as_ref()
+                    .unwrap()
+                    .importance_scores()
+                    .to_vec();
                 self.cache_manager
                     .force_evict_with_scores(caches, ratio, &scores)
             } else {
@@ -376,14 +375,23 @@ impl StepHook<KVCache> for EvictionHook {
             self.cache_manager.force_evict(caches, ratio)
         };
 
-        if let Ok(evict_result) = result {
-            if evict_result.evicted {
-                self.eviction_count += 1;
-                self.evicted_total += evict_result.tokens_removed;
-                if let Some(acc) = self.score_accumulator.as_mut() {
-                    acc.reset();
-                }
+        if let Ok(evict_result) = result
+            && evict_result.evicted
+        {
+            self.eviction_count += 1;
+            self.evicted_total += evict_result.tokens_removed;
+            if let Some(acc) = self.score_accumulator.as_mut() {
+                acc.reset();
             }
+
+            // Store QCF result for extra_question_fields
+            self.eviction_qcf = Some(EvictionQcfResult {
+                tokens_evicted: evict_result.tokens_removed,
+                eviction_ratio,
+                qcf_attn_raw,
+                qcf_attn_norm,
+                qcf_caote,
+            });
         }
     }
 
@@ -396,6 +404,7 @@ impl StepHook<KVCache> for EvictionHook {
         }
         self.eviction_count = 0;
         self.evicted_total = 0;
+        self.eviction_qcf = None;
     }
 
     fn snapshot(&self, caches: &[KVCache]) -> Box<dyn CacheSnapshot<KVCache>> {
@@ -443,12 +452,26 @@ impl StepHook<KVCache> for EvictionHook {
         self.score_accumulator.as_mut()
     }
 
+    fn needs_score_probe(&self, caches: &[KVCache]) -> bool {
+        // Probe is needed when the cache already exceeds the budget after prefill,
+        // so that score_accumulator is populated before post_prefill eviction.
+        !caches.is_empty() && max_cache_pos(caches) > self.effective_budget
+    }
+
     fn extra_question_fields(&self, _caches: &[KVCache]) -> serde_json::Value {
-        serde_json::json!({
+        let mut obj = serde_json::json!({
             "effective_budget": self.effective_budget,
             "eviction_count": self.eviction_count,
             "evicted_tokens": self.evicted_total,
-        })
+        });
+        if let Some(ref qcf) = self.eviction_qcf {
+            obj["tokens_evicted"] = serde_json::json!(qcf.tokens_evicted);
+            obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
+            obj["qcf_attn_raw"] = serde_json::json!(qcf.qcf_attn_raw);
+            obj["qcf_attn_norm"] = serde_json::json!(qcf.qcf_attn_norm);
+            obj["qcf_caote"] = serde_json::json!(qcf.qcf_caote);
+        }
+        obj
     }
 
     fn extra_config_fields(&self) -> serde_json::Value {
@@ -461,8 +484,11 @@ impl StepHook<KVCache> for EvictionHook {
         })
     }
 
-    fn aggregate_metrics(&self, qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
-        aggregate_eviction_metrics(qcf_metrics)
+    fn aggregate_metrics(&self, _qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
+        // Eviction metrics are now stored in self.eviction_qcf (via extra_question_fields).
+        // Return default so the eval_loop's KIVI OPR check (summary.qcf_kivi_opr.is_some())
+        // correctly returns None for the eviction path.
+        MetricsSummary::default()
     }
 }
 
@@ -524,18 +550,21 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_metrics_delegates_to_eviction() {
+    fn test_aggregate_metrics_returns_default() {
+        // EvictionHook.aggregate_metrics() now always returns MetricsSummary::default().
+        // Eviction QCF data is stored in self.eviction_qcf and emitted via extra_question_fields.
         let hook = make_hook(512, false);
         let metrics = vec![
             serde_json::json!({"action": "sliding_attn", "raw_value": 0.3, "normalized_value": 0.4}),
             serde_json::json!({"action": "sliding_caote", "raw_value": 0.1, "normalized_value": 0.1}),
         ];
         let summary = hook.aggregate_metrics(&metrics);
-        assert!((summary.qcf_attn_total - 0.3).abs() < 1e-10);
-        assert!((summary.qcf_caote_total - 0.1).abs() < 1e-10);
-        // eviction 모드에서는 qcf_kivi_opr이 없다
+        // Default: no KIVI OPR (eviction path does not use OPR)
         assert!(summary.qcf_kivi_opr.is_none());
         assert_eq!(summary.qcf_kivi_opr_events, 0);
+        // Eviction attn/caote totals are now 0 in aggregate (moved to extra_question_fields)
+        assert_eq!(summary.qcf_attn_total, 0.0);
+        assert_eq!(summary.qcf_caote_total, 0.0);
     }
 
     #[test]

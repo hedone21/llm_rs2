@@ -403,6 +403,68 @@ pub fn compute_sliding_qcf_caote(
     metric
 }
 
+/// QCF-ATTN v2: measures total variation distance of attention distribution
+/// caused by eviction, using closed-form derivation.
+///
+/// Since softmax logits for surviving positions don't change after eviction
+/// (same Q, same K with RoPE already applied), α_after is exactly:
+///   α_after[h,pos] = α_before[h,pos] / (1 - Σ_evicted α_before[h,t])
+///
+/// Therefore the L1 distance per head simplifies to:
+///   Σ_pos |α_after[h,pos] - α_before[h,pos]| = 2 × Σ_evicted α_before[h,t]
+///
+/// `head_attn`: per-KV-head attention from last decode step, layout [n_kv_heads × max_seq_len]
+/// `evicted_positions`: cache positions about to be evicted
+/// `n_kv_heads`: number of KV heads
+/// `max_seq_len`: stride between heads in head_attn
+/// `eviction_ratio`: tokens_evicted / tokens_before (for normalization)
+pub fn compute_qcf_attn_v2(
+    head_attn: &[f32],
+    evicted_positions: &[usize],
+    n_kv_heads: usize,
+    max_seq_len: usize,
+    eviction_ratio: f32,
+) -> QcfMetric {
+    if evicted_positions.is_empty() || n_kv_heads == 0 || eviction_ratio <= 0.0 {
+        return QcfMetric {
+            action: "eviction_attn".to_string(),
+            raw_value: 0.0,
+            normalized_value: 0.0,
+            per_head: Some(vec![0.0; n_kv_heads]),
+            tokens_affected: 0,
+        };
+    }
+
+    let mut per_head_raw = vec![0.0f32; n_kv_heads];
+    for (h, ph) in per_head_raw.iter_mut().enumerate() {
+        let offset = h * max_seq_len;
+        let mut sum_evicted = 0.0f32;
+        for &pos in evicted_positions {
+            if offset + pos < head_attn.len() {
+                sum_evicted += head_attn[offset + pos];
+            }
+        }
+        *ph = sum_evicted; // Σ_evicted α_before[h,t]
+    }
+
+    // raw = mean_h(Σ_evicted α_h)  — evicted attention mass averaged over heads
+    let raw_value = per_head_raw.iter().sum::<f32>() / n_kv_heads as f32;
+    // normalized = 2 × raw / eviction_ratio  — L1 distance, ratio-normalized
+    let normalized_value = if eviction_ratio > 0.0 {
+        2.0 * raw_value / eviction_ratio
+    } else {
+        0.0
+    };
+
+    QcfMetric {
+        action: "eviction_attn".to_string(),
+        raw_value,
+        normalized_value,
+        per_head: Some(per_head_raw),
+        tokens_affected: evicted_positions.len(),
+    }
+}
+
 /// Identify positions that will be evicted by sliding window pruning.
 ///
 /// Sliding window evicts the oldest tokens after the protected prefix,
@@ -1258,5 +1320,72 @@ mod tests {
             metric_override.raw_value,
             metric_ones.raw_value
         );
+    }
+
+    // ── compute_qcf_attn_v2 tests ──
+
+    #[test]
+    fn test_qcf_attn_v2_basic() {
+        // 2 heads, max_seq_len=8, 8 positions active
+        // head0: uniform attention 1/8 each
+        // head1: concentrated on pos 0 (0.5) + rest (0.5/7)
+        let mut head_attn = vec![0.0f32; 16];
+        for i in 0..8 {
+            head_attn[i] = 0.125;
+        } // head 0
+        head_attn[8] = 0.5; // head 1, pos 0
+        for i in 9..16 {
+            head_attn[i] = 0.5 / 7.0;
+        } // head 1, rest
+
+        let evicted = vec![0, 1, 2, 3]; // evict first 4 positions
+        let m = compute_qcf_attn_v2(&head_attn, &evicted, 2, 8, 0.5);
+        assert_eq!(m.tokens_affected, 4);
+        // head0: 4 × 0.125 = 0.5
+        // head1: 0.5 + 3 × (0.5/7) ≈ 0.714
+        // raw = (0.5 + 0.714) / 2 ≈ 0.607
+        // normalized = 2 × 0.607 / 0.5 ≈ 2.429
+        assert!((m.raw_value - 0.607).abs() < 0.01, "raw={:.4}", m.raw_value);
+        assert!(
+            (m.normalized_value - 2.429).abs() < 0.02,
+            "norm={:.4}",
+            m.normalized_value
+        );
+    }
+
+    #[test]
+    fn test_qcf_attn_v2_no_eviction() {
+        let head_attn = vec![0.25f32; 8]; // 2 heads × 4 positions
+        let m = compute_qcf_attn_v2(&head_attn, &[], 2, 4, 0.5);
+        assert_eq!(m.raw_value, 0.0);
+        assert_eq!(m.tokens_affected, 0);
+    }
+
+    #[test]
+    fn test_qcf_attn_v2_zero_eviction_ratio() {
+        let head_attn = vec![0.25f32; 8];
+        let evicted = vec![0, 1];
+        let m = compute_qcf_attn_v2(&head_attn, &evicted, 2, 4, 0.0);
+        // eviction_ratio = 0.0 → returns zero metric
+        assert_eq!(m.raw_value, 0.0);
+        assert_eq!(m.tokens_affected, 0);
+    }
+
+    #[test]
+    fn test_qcf_attn_v2_single_head_uniform() {
+        // 1 head, 4 positions, uniform attn = 0.25, evict 2
+        let head_attn = vec![0.25f32; 4];
+        let evicted = vec![0, 1];
+        let m = compute_qcf_attn_v2(&head_attn, &evicted, 1, 4, 0.5);
+        // raw = (0.25 + 0.25) / 1 = 0.5
+        // normalized = 2 * 0.5 / 0.5 = 2.0
+        assert!((m.raw_value - 0.5).abs() < 1e-6, "raw={}", m.raw_value);
+        assert!(
+            (m.normalized_value - 2.0).abs() < 1e-6,
+            "norm={}",
+            m.normalized_value
+        );
+        assert_eq!(m.tokens_affected, 2);
+        assert_eq!(m.per_head.as_ref().unwrap().len(), 1);
     }
 }

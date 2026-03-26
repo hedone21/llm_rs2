@@ -197,6 +197,41 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             prefill_ws.as_mut(),
         )?;
 
+        // ── Score collection probe: capture attention weights for QCF-ATTN v2 ──
+        // Batch prefill doesn't populate score_accumulator (workspace: None).
+        // Re-feed the last token as a decode step to capture per-head attention.
+        // This is a no-op for KV cache content (overwrites identical values at prompt_len-1).
+        if hook.needs_score_probe(kv_caches) {
+            let last_token_id = prompt_ids[prompt_len - 1];
+            // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
+            unsafe {
+                *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token_id;
+            }
+            let probe_input = backend.copy_from(&cpu_gen_input)?;
+
+            if let Some(acc) = hook.score_accumulator() {
+                acc.begin_step();
+            }
+
+            model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &probe_input,
+                start_pos: start_pos_after_prompt - 1,
+                kv_caches,
+                backend,
+                memory,
+                logits_out: &mut decode_logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                use_gpu_attn: effective_eval_config.use_gpu_attn,
+                score_accumulator: hook.score_accumulator(),
+                profiler: None,
+                skip_config,
+                importance_collector: None,
+                logits_last_only: false,
+                variance_collector: None,
+            })?;
+        }
+
         // ── post_prefill hook (eviction if cache exceeds budget) ──
         hook.post_prefill(kv_caches, &mut qcf_metrics);
 
@@ -328,7 +363,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
 
         let elapsed_q = q_start.elapsed().as_secs_f64();
 
-        // ── Aggregate QCF metrics ──
+        // ── Aggregate QCF metrics (KIVI path uses this; eviction path uses extra_question_fields) ──
         let summary: MetricsSummary = hook.aggregate_metrics(&qcf_metrics);
 
         eprintln!(
@@ -361,21 +396,19 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             "n_choices": question.choices.len(),
             "n_prompt_tokens": prompt_len,
             "final_cache_pos": final_cache_pos,
-            "qcf_metrics": qcf_metrics,
-            "qcf_attn_total": summary.qcf_attn_total,
-            "qcf_attn_normalized_total": summary.qcf_normalized_total,
-            "qcf_kivi_opr_total": summary.qcf_kivi_opr,
-            "qcf_kivi_opr_events": summary.qcf_kivi_opr.map(|_| summary.qcf_kivi_opr_events),
             "qcf_layer_skip": qcf_layer_skip,
             "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
-        // Conditionally include caote total (only when QCF mode has caote)
-        if summary.qcf_caote_total > 0.0 {
-            result_obj["qcf_caote_total"] = serde_json::json!(summary.qcf_caote_total);
+        // Include KIVI OPR fields only when KIVI is active (qcf_kivi_opr is Some)
+        if let Some(kivi_opr) = summary.qcf_kivi_opr {
+            result_obj["qcf_kivi_opr_total"] = serde_json::json!(kivi_opr);
+            result_obj["qcf_kivi_opr_events"] = serde_json::json!(summary.qcf_kivi_opr_events);
+            // KIVI metrics array (for detailed per-flush analysis)
+            result_obj["qcf_metrics"] = serde_json::json!(qcf_metrics);
         }
 
-        // Merge hook-specific fields (effective_budget, eviction_count, kivi_q2_tokens, etc.)
+        // Merge hook-specific fields (eviction_qcf, effective_budget, kivi_q2_tokens, etc.)
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 result_obj[k] = v.clone();

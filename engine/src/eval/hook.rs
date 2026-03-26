@@ -67,6 +67,14 @@ pub trait StepHook<C: KVCacheOps> {
     /// Default is no-op (e.g., KiviHook ignores budget).
     fn set_effective_budget(&mut self, _budget: usize) {}
 
+    /// Returns true if this hook needs a score probe step after prefill.
+    /// True when score-based eviction will be needed (cache exceeds budget).
+    /// The probe re-feeds the last prompt token as a decode step to populate
+    /// the score accumulator before post_prefill eviction.
+    fn needs_score_probe(&self, _caches: &[C]) -> bool {
+        false
+    }
+
     /// Cache-specific per-question JSON fields (e.g., kivi_q2_tokens).
     fn extra_question_fields(&self, caches: &[C]) -> serde_json::Value;
 
