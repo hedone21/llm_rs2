@@ -207,8 +207,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         // current_pos afterwards so eviction sees the correct token count.
         if hook.needs_score_probe(kv_caches) {
             // Save current_pos before probe (will be prompt_len)
-            let saved_positions: Vec<usize> =
-                kv_caches.iter().map(|c| c.current_pos()).collect();
+            let saved_positions: Vec<usize> = kv_caches.iter().map(|c| c.current_pos()).collect();
 
             let last_token_id = prompt_ids[prompt_len - 1];
             // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
@@ -583,33 +582,59 @@ fn run_prefill<C: KVCacheOps>(
     kv_caches: &mut [C],
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
-    _decode_logits: &mut Tensor,
-    _x_gen: &mut Tensor,
-    _gen_ws: &mut LayerWorkspace,
-    _cpu_gen_input: &Tensor,
-    _qcf_metrics: &mut Vec<serde_json::Value>,
+    decode_logits: &mut Tensor,
+    x_gen: &mut Tensor,
+    gen_ws: &mut LayerWorkspace,
+    cpu_gen_input: &Tensor,
+    qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
     prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
-    // Always use full batch prefill regardless of budget.
-    // Post-prefill eviction (in hook.post_prefill) handles cache compaction.
-    // This avoids the O(prompt_len - budget) token-by-token decode that caused
-    // 2-3.3x slowdown when prompt > budget (issue D).
-    run_full_prefill(
-        model,
-        backend,
-        memory,
-        kv_caches,
-        hook,
-        prompt_ids,
-        _qcf_metrics,
-        vocab_size,
-        eval_config,
-        skip_config,
-        prefill_ws,
-    )
+    let effective_budget = eval_config.effective_budget;
+    let prompt_len = prompt_ids.len();
+
+    // When eviction is needed (prompt > budget), use chunked prefill:
+    // batch-prefill first `budget` tokens, then decode the rest one-by-one.
+    // This accumulates H2O attention scores across ~(prompt_len - budget)
+    // decode steps, giving high-quality eviction decisions in post_prefill.
+    //
+    // Without this, the probe step's single-step scores produce inferior
+    // eviction that degrades NLL by up to 2-3x compared to accumulated scores.
+    if effective_budget > 0 && effective_budget < prompt_len {
+        run_chunked_prefill(
+            model,
+            backend,
+            memory,
+            kv_caches,
+            hook,
+            prompt_ids,
+            decode_logits,
+            x_gen,
+            gen_ws,
+            cpu_gen_input,
+            qcf_metrics,
+            vocab_size,
+            eval_config,
+            skip_config,
+            prefill_ws,
+        )
+    } else {
+        run_full_prefill(
+            model,
+            backend,
+            memory,
+            kv_caches,
+            hook,
+            prompt_ids,
+            qcf_metrics,
+            vocab_size,
+            eval_config,
+            skip_config,
+            prefill_ws,
+        )
+    }
 }
 
 /// Full prefill: forward all prompt tokens in a single batched pass.
@@ -685,12 +710,12 @@ fn run_full_prefill<C: KVCacheOps>(
 }
 
 /// Chunked prefill: forward first `effective_budget` tokens as a batch, then
-/// decode the remaining prompt tokens one-by-one (with eviction between steps).
+/// decode the remaining prompt tokens one-by-one.
 ///
-/// **Deprecated**: No longer called from `run_prefill`. Full batch prefill +
-/// post_prefill eviction is faster and produces equivalent results.
-/// Retained for reference; will be removed in a future cleanup.
-#[allow(dead_code, clippy::too_many_arguments)]
+/// Used when eviction is active (prompt > budget) to accumulate H2O attention
+/// scores during the decode phase. This gives post_prefill high-quality scores
+/// for eviction decisions, matching the quality of decode-step accumulation.
+#[allow(clippy::too_many_arguments)]
 fn run_chunked_prefill<C: KVCacheOps>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
@@ -766,11 +791,11 @@ fn run_chunked_prefill<C: KVCacheOps>(
 
     let mut start_pos = first_chunk_len;
 
-    // ── Decode remaining prompt tokens one-by-one ──
-    // No eviction during prefill: let KV cache grow to full prompt length.
-    // KV cache has capacity for max_seq_len, so prompt always fits.
-    // Eviction happens once after all prompt tokens are processed — this gives
-    // H2O the full importance picture before selecting heavy hitters.
+    // ── Decode remaining prompt tokens one-by-one with eviction ──
+    // Each decode step: forward one token, accumulate H2O scores, then
+    // check budget via post_decode_step (which may trigger eviction).
+    // This matches the OLD eval-ll behavior: multiple small evictions
+    // during decode, producing logits from the progressively evicted cache.
     for &token_id in &prompt_ids[first_chunk_len..] {
         // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
         unsafe {
@@ -800,11 +825,10 @@ fn run_chunked_prefill<C: KVCacheOps>(
             variance_collector: None,
         })?;
         start_pos += 1;
-    }
 
-    // Single eviction after all prompt tokens: evict from prompt_len to budget
-    let max_pos = kv_caches.iter().map(|c| c.current_pos()).max().unwrap_or(0);
-    if max_pos > effective_budget {
+        // Eviction if cache exceeds budget (post_decode_step handles threshold).
+        // After eviction, current_pos may decrease (compaction), but start_pos
+        // continues incrementing — RoPE position must be monotonic.
         hook.post_decode_step(kv_caches, start_pos, qcf_metrics);
     }
 
