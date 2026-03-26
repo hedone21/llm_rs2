@@ -27,4 +27,3 @@ pub use eviction_hook::EvictionHook;
 pub use hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 pub use kivi_hook::KiviHook;
 pub use output::{EvalConfig, EvalOutput, EvalQuestion};
-pub use qcf_helpers::{aggregate_kivi_metrics, flush_metric_to_json, metric_to_json};

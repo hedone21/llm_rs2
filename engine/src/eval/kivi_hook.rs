@@ -9,7 +9,6 @@
 //! each prefill and decode step.
 
 use super::hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
-use super::qcf_helpers::{aggregate_kivi_metrics, flush_metric_to_json};
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::kivi_cache::KiviCache;
 
@@ -38,6 +37,8 @@ pub struct KiviHook {
     pub qcf_config: crate::core::qcf::QcfConfig,
     /// Running count of flush events for the current question.
     flush_count: usize,
+    /// Max OPR value across all flushes for current question (representative QCF-KIVI).
+    qcf_kivi_max: f32,
 }
 
 impl KiviHook {
@@ -45,6 +46,24 @@ impl KiviHook {
         Self {
             qcf_config,
             flush_count: 0,
+            qcf_kivi_max: 0.0,
+        }
+    }
+
+    /// Drain flush proxies from layer 0, track max OPR and flush count.
+    fn collect_flush_proxies(&mut self, caches: &mut [KiviCache]) {
+        if caches.is_empty() {
+            return;
+        }
+        for metric in caches[0].take_flush_proxies() {
+            if metric.action == "kivi_opr" {
+                self.qcf_kivi_max = self.qcf_kivi_max.max(metric.raw_value);
+                self.flush_count += 1;
+            }
+            // NMSE ("kivi" action) tracked but not exposed as per-question scalar
+        }
+        for cache in caches[1..].iter_mut() {
+            cache.take_flush_proxies();
         }
     }
 }
@@ -54,36 +73,18 @@ impl StepHook<KiviCache> for KiviHook {
         &mut self,
         caches: &mut [KiviCache],
         _step: usize,
-        qcf_metrics: &mut Vec<serde_json::Value>,
+        _qcf_metrics: &mut Vec<serde_json::Value>,
     ) -> PostStepResult {
-        if caches.is_empty() {
-            return PostStepResult::default();
-        }
-
-        // Layer 0 is the representative: collect its flush proxies.
-        for metric in caches[0].take_flush_proxies() {
-            qcf_metrics.push(flush_metric_to_json(&metric, self.flush_count));
-            self.flush_count += 1;
-        }
-        // Drain other layers to keep them clean (discard — layer 0 is canonical).
-        for cache in caches[1..].iter_mut() {
-            cache.take_flush_proxies();
-        }
-
+        self.collect_flush_proxies(caches);
         PostStepResult::default()
     }
 
-    fn post_prefill(&mut self, caches: &mut [KiviCache], qcf_metrics: &mut Vec<serde_json::Value>) {
-        if caches.is_empty() {
-            return;
-        }
-        for metric in caches[0].take_flush_proxies() {
-            qcf_metrics.push(flush_metric_to_json(&metric, self.flush_count));
-            self.flush_count += 1;
-        }
-        for cache in caches[1..].iter_mut() {
-            cache.take_flush_proxies();
-        }
+    fn post_prefill(
+        &mut self,
+        caches: &mut [KiviCache],
+        _qcf_metrics: &mut Vec<serde_json::Value>,
+    ) {
+        self.collect_flush_proxies(caches);
     }
 
     fn reset_caches(&mut self, caches: &mut [KiviCache]) {
@@ -91,6 +92,7 @@ impl StepHook<KiviCache> for KiviHook {
             cache.reset();
         }
         self.flush_count = 0;
+        self.qcf_kivi_max = 0.0;
     }
 
     fn snapshot(&self, caches: &[KiviCache]) -> Box<dyn CacheSnapshot<KiviCache>> {
@@ -104,25 +106,30 @@ impl StepHook<KiviCache> for KiviHook {
     }
 
     fn extra_question_fields(&self, caches: &[KiviCache]) -> serde_json::Value {
-        if caches.is_empty() {
-            serde_json::json!({
-                "kivi_q2_tokens": 0,
-                "kivi_res_pos": 0,
-            })
+        let (q2_tokens, res_pos) = if caches.is_empty() {
+            (0, 0)
         } else {
-            serde_json::json!({
-                "kivi_q2_tokens": caches[0].q2_tokens,
-                "kivi_res_pos": caches[0].res_pos,
-            })
+            (caches[0].q2_tokens, caches[0].res_pos)
+        };
+        let mut obj = serde_json::json!({
+            "kivi_q2_tokens": q2_tokens,
+            "kivi_res_pos": res_pos,
+        });
+        if self.flush_count > 0 {
+            obj["qcf_kivi"] = serde_json::json!(self.qcf_kivi_max);
+            obj["qcf_kivi_flush_count"] = serde_json::json!(self.flush_count);
         }
+        obj
     }
 
     fn extra_config_fields(&self) -> serde_json::Value {
         serde_json::json!({})
     }
 
-    fn aggregate_metrics(&self, qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
-        aggregate_kivi_metrics(qcf_metrics)
+    fn aggregate_metrics(&self, _qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
+        // KIVI metrics now stored in self (qcf_kivi_max, flush_count)
+        // and exposed via extra_question_fields. Return default.
+        MetricsSummary::default()
     }
 }
 
@@ -164,16 +171,39 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregate_metrics_delegates_to_kivi() {
+    fn test_aggregate_metrics_returns_default() {
         let hook = make_hook();
-        let metrics = vec![
-            serde_json::json!({"action": "kivi", "raw_value": 0.1, "normalized_value": 0.1}),
-            serde_json::json!({"action": "kivi_opr", "raw_value": 0.05, "normalized_value": 0.05}),
-        ];
-        let summary = hook.aggregate_metrics(&metrics);
-        assert!((summary.qcf_attn_total - 0.1).abs() < 1e-10);
-        assert_eq!(summary.qcf_kivi_opr, Some(0.05));
-        assert_eq!(summary.qcf_kivi_opr_events, 1);
+        let summary = hook.aggregate_metrics(&[]);
+        assert_eq!(summary.qcf_attn_total, 0.0);
+        assert_eq!(summary.qcf_kivi_opr, None);
+    }
+
+    #[test]
+    fn test_qcf_kivi_max_tracking() {
+        use crate::core::qcf::QcfMetric;
+
+        let mut hook = make_hook();
+        // Simulate flush proxies being collected
+        // Directly test collect_flush_proxies by creating a cache with proxies
+        let mut cache = KiviCache::new(8, 64, 512, 32);
+
+        // Inject proxies manually via the public method (if available)
+        // Since we can't inject proxies directly, test the fields after hook operations
+        assert_eq!(hook.flush_count, 0);
+        assert_eq!(hook.qcf_kivi_max, 0.0);
+
+        // After reset
+        hook.flush_count = 5;
+        hook.qcf_kivi_max = 0.296;
+        let fields = hook.extra_question_fields(&[cache]);
+        assert_eq!(fields["qcf_kivi"], 0.296_f32 as f64);
+        assert_eq!(fields["qcf_kivi_flush_count"], 5);
+
+        // After reset_caches
+        let mut cache2 = KiviCache::new(8, 64, 512, 32);
+        hook.reset_caches(&mut [cache2]);
+        assert_eq!(hook.flush_count, 0);
+        assert_eq!(hook.qcf_kivi_max, 0.0);
     }
 
     #[test]

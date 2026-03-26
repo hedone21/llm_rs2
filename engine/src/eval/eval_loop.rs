@@ -363,9 +363,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
 
         let elapsed_q = q_start.elapsed().as_secs_f64();
 
-        // ── Aggregate QCF metrics (KIVI path uses this; eviction path uses extra_question_fields) ──
-        let summary: MetricsSummary = hook.aggregate_metrics(&qcf_metrics);
-
         eprintln!(
             "[Eval-LL] {}/{} {} — norm={} raw={} nlls=[{}] {:.1}s",
             q_idx + 1,
@@ -400,15 +397,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
-        // Include KIVI OPR fields only when KIVI is active (qcf_kivi_opr is Some)
-        if let Some(kivi_opr) = summary.qcf_kivi_opr {
-            result_obj["qcf_kivi_opr_total"] = serde_json::json!(kivi_opr);
-            result_obj["qcf_kivi_opr_events"] = serde_json::json!(summary.qcf_kivi_opr_events);
-            // KIVI metrics array (for detailed per-flush analysis)
-            result_obj["qcf_metrics"] = serde_json::json!(qcf_metrics);
-        }
-
-        // Merge hook-specific fields (eviction_qcf, effective_budget, kivi_q2_tokens, etc.)
+        // Merge hook-specific fields (qcf_kivi, eviction_qcf, effective_budget, etc.)
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 result_obj[k] = v.clone();
