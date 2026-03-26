@@ -881,7 +881,8 @@ fn main() -> anyhow::Result<()> {
     let has_eviction_policy = args.eviction_policy != "none";
     let needs_accumulator =
         needs_score_based || needs_caote || args.enable_resilience || has_eviction_policy;
-    let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote;
+    // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
+    let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote || has_eviction_policy;
 
     let mut score_accumulator = if needs_accumulator {
         let acc = if use_gqa {
