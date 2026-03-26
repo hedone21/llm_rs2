@@ -91,6 +91,13 @@ impl PressureVector {
     pub fn max(&self) -> f32 {
         self.compute.max(self.memory).max(self.thermal)
     }
+
+    /// 하나라도 도메인의 pressure가 reference의 factor배를 초과하면 true.
+    pub fn any_domain_exceeds(&self, reference: &PressureVector, factor: f32) -> bool {
+        self.compute > reference.compute * factor
+            || self.memory > reference.memory * factor
+            || self.thermal > reference.thermal * factor
+    }
 }
 
 impl std::ops::Sub for PressureVector {

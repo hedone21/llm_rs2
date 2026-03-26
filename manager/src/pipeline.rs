@@ -85,8 +85,8 @@ pub struct HierarchicalPolicy {
     pressure: PressureVector,
     /// 직전 루프의 operating mode.
     prev_mode: OperatingMode,
-    /// 마지막으로 액션을 취했을 때의 pressure.max() 값.
-    last_acted_pressure: f32,
+    /// 마지막으로 액션을 취했을 때의 도메인별 pressure 스냅샷.
+    last_acted_pressure: PressureVector,
     /// 이전 액션의 실측 relief 수집을 위한 컨텍스트.
     pending_observation: Option<ObservationContext>,
     /// 허용 가능한 latency 악화 상한.
@@ -136,7 +136,7 @@ impl HierarchicalPolicy {
             engine_state: FeatureVector::zeros(),
             pressure: PressureVector::default(),
             prev_mode: OperatingMode::Normal,
-            last_acted_pressure: 0.0,
+            last_acted_pressure: PressureVector::default(),
             pending_observation: None,
             latency_budget: config.selector.latency_budget,
             dt: 0.1,
@@ -308,11 +308,12 @@ impl PolicyStrategy for HierarchicalPolicy {
         // ③ 관측 갱신
         self.update_observation();
 
-        // ④ 액션 필요 여부
+        // ④ 액션 필요 여부 — 도메인별 독립 판정
         let needs_action = match mode {
             OperatingMode::Normal => false,
             OperatingMode::Warning | OperatingMode::Critical => {
-                mode != self.prev_mode || self.pressure.max() > self.last_acted_pressure * 1.2
+                mode != self.prev_mode
+                    || self.pressure.any_domain_exceeds(&self.last_acted_pressure, 1.2)
             }
         };
 
@@ -359,7 +360,7 @@ impl PolicyStrategy for HierarchicalPolicy {
                         applied_actions: commands.iter().map(|c| c.action).collect(),
                         applied_at: Instant::now(),
                     });
-                    self.last_acted_pressure = self.pressure.max();
+                    self.last_acted_pressure = self.pressure;
 
                     log::debug!(
                         "[Pipeline] mode={:?} pressure={:.2}/{:.2}/{:.2} → directive seq={} ({} cmds)",
@@ -1304,5 +1305,62 @@ mod tests {
         );
         // clamp 하한: 0.001
         assert!(second >= 0.001, "elapsed_dt should be at least 0.001s");
+    }
+
+    /// Thermal directive 발행 후 memory pressure 상승 시 needs_action=true 확인.
+    ///
+    /// S25에서 Thermal Critical이 먼저 발생하고, 이후 MemoryPressure가 올라가는 시나리오에서
+    /// `any_domain_exceeds`가 도메인별 독립 비교를 수행하는지 검증한다.
+    ///
+    /// 이전 버그: `last_acted_pressure`가 f32 스칼라로 `pressure.max()`만 저장하여,
+    /// thermal 지배 시 memory 상승을 감지하지 못함.
+    /// 수정 후: 도메인별 PressureVector로 비교하여 각 도메인 독립적으로 판정.
+    #[test]
+    fn test_needs_action_memory_after_thermal() {
+        // Scenario: Thermal directive 발행 후 상태 (thermal=0.8, memory=0)
+        let last_acted = PressureVector {
+            compute: 0.0,
+            memory: 0.0,
+            thermal: 0.8,
+        };
+        // 이후 memory pressure 상승 (thermal 유지)
+        let current = PressureVector {
+            compute: 0.0,
+            memory: 0.3,
+            thermal: 0.8,
+        };
+
+        // 수정 전 스칼라 로직: pressure.max() > last_acted_scalar * 1.2
+        // 0.8 > 0.8 * 1.2 = 0.96? NO → memory 변화를 놓침 (BUG)
+        let old_scalar = last_acted.max();
+        assert!(
+            !(current.max() > old_scalar * 1.2),
+            "Old scalar logic should miss memory-only change"
+        );
+
+        // 수정 후 도메인별 로직: any_domain_exceeds
+        // memory: 0.3 > 0.0 * 1.2 = 0.0? YES → 감지 (FIXED)
+        assert!(
+            current.any_domain_exceeds(&last_acted, 1.2),
+            "New domain-independent logic should detect memory rise after thermal directive"
+        );
+
+        // Edge case: 모든 도메인이 동일하면 false
+        assert!(
+            !last_acted.any_domain_exceeds(&last_acted, 1.2),
+            "Same pressure should not exceed itself by 1.2x"
+        );
+
+        // Edge case: 모든 도메인이 0이면 어떤 양수 pressure든 감지
+        let zero = PressureVector::default();
+        let tiny = PressureVector {
+            compute: 0.0,
+            memory: 0.01,
+            thermal: 0.0,
+        };
+        assert!(
+            tiny.any_domain_exceeds(&zero, 1.2),
+            "Any positive pressure should exceed zero reference"
+        );
     }
 }
