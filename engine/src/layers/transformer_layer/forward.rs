@@ -362,20 +362,20 @@ impl TransformerLayer {
 
                         // D2O: collect per-layer attention column-sums for layer-level allocation.
                         // Only collect for the first batch element (LLM inference always has batch_size=1).
-                        if b == 0 {
-                            if let Some(ref mut vc) = variance_collector {
-                                vc.collect_layer(
-                                    layer_idx,
-                                    q_slice,
-                                    k_slice,
-                                    seq_len,
-                                    cache_seq_len,
-                                    n_heads_q * head_dim,
-                                    k_pos_stride,
-                                    kv_head_stride,
-                                    start_pos,
-                                );
-                            }
+                        if b == 0
+                            && let Some(ref mut vc) = variance_collector
+                        {
+                            vc.collect_layer(
+                                layer_idx,
+                                q_slice,
+                                k_slice,
+                                seq_len,
+                                cache_seq_len,
+                                n_heads_q * head_dim,
+                                k_pos_stride,
+                                kv_head_stride,
+                                start_pos,
+                            );
                         }
 
                         flash_attention_forward_strided(

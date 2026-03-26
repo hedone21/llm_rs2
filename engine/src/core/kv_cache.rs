@@ -550,6 +550,7 @@ impl KVCache {
         }
 
         self.current_pos = remaining;
+        self.release_unused_pages();
         Ok(())
     }
 
@@ -702,6 +703,119 @@ impl KVCache {
 
         Ok(())
     }
+
+    /// Release physical pages for the unused portion of KV buffers via `madvise(MADV_DONTNEED)`.
+    ///
+    /// After eviction reduces `current_pos`, the buffer region beyond `current_pos`
+    /// is no longer needed. This method advises the OS to reclaim those physical pages,
+    /// reducing RSS and increasing MemAvailable — without reallocating the buffer.
+    ///
+    /// Only applies to CPU heap buffers (`SharedBuffer` / `Vec<u8>`).
+    /// GPU-managed buffers (`UnifiedBuffer` with `CL_MEM_ALLOC_HOST_PTR`) are skipped
+    /// because their physical pages are pinned by the OpenCL driver.
+    ///
+    /// Returns the total bytes released (page-aligned) across K and V buffers.
+    pub fn release_unused_pages(&self) -> usize {
+        // Guard: GPU-managed buffer — driver pins pages, madvise is ineffective
+        if self.k_buffer.buffer().cl_mem().is_some() {
+            return 0;
+        }
+
+        let type_size = match self.k_buffer.dtype() {
+            DType::F16 => 2,
+            DType::F32 => 4,
+            // Q4_0/Q4_1: block-quantized layout, skip for now (F16-only KV cache in practice)
+            _ => return 0,
+        };
+
+        let mut total_released = 0usize;
+
+        match self.layout {
+            KVLayout::SeqMajor => {
+                // Contiguous: [pos0_all_heads | pos1_all_heads | ... | posN_all_heads]
+                let row_bytes = self.kv_heads * self.head_dim * type_size;
+                let used_bytes = self.current_pos * row_bytes;
+                let total_bytes = self.capacity * row_bytes;
+                total_released += madvise_dontneed(self.k_buffer.as_ptr(), used_bytes, total_bytes);
+                total_released += madvise_dontneed(self.v_buffer.as_ptr(), used_bytes, total_bytes);
+            }
+            KVLayout::HeadMajor => {
+                // Per-head: [head0: pos0..posN | head1: pos0..posN | ...]
+                let head_stride_bytes = self.capacity * self.head_dim * type_size;
+                let used_per_head_bytes = self.current_pos * self.head_dim * type_size;
+                for h in 0..self.kv_heads {
+                    let base = h * head_stride_bytes;
+                    let from = base + used_per_head_bytes;
+                    let to = base + head_stride_bytes;
+                    total_released += madvise_dontneed(self.k_buffer.as_ptr(), from, to);
+                    total_released += madvise_dontneed(self.v_buffer.as_ptr(), from, to);
+                }
+            }
+        }
+
+        if total_released > 0 {
+            log::debug!(
+                "[KVCache] released {} bytes of unused pages (pos={}, cap={})",
+                total_released,
+                self.current_pos,
+                self.capacity,
+            );
+        }
+
+        total_released
+    }
+}
+
+// ── madvise helpers ─────────────────────────────────────────────────────────
+
+/// Advise the OS to release physical pages in `[from_offset..to_offset)` relative to `base_ptr`.
+///
+/// Addresses are rounded to page boundaries (start up, end down) to satisfy madvise requirements.
+/// Returns the number of bytes actually advised for release.
+fn madvise_dontneed(base_ptr: *const u8, from_offset: usize, to_offset: usize) -> usize {
+    if from_offset >= to_offset || base_ptr.is_null() {
+        return 0;
+    }
+
+    let page_size = page_size();
+    let abs_start = base_ptr as usize + from_offset;
+    let abs_end = base_ptr as usize + to_offset;
+
+    // Round start UP (don't release partially-used page), end DOWN
+    let aligned_start = round_up(abs_start, page_size);
+    let aligned_end = round_down(abs_end, page_size);
+
+    if aligned_start >= aligned_end {
+        return 0;
+    }
+
+    let len = aligned_end - aligned_start;
+    // SAFETY: The range [aligned_start..aligned_end) lies within the buffer's allocation.
+    // MADV_DONTNEED on anonymous private mappings releases physical pages; re-access
+    // triggers zero-fill page faults (safe for KV cache — overwritten before read).
+    let ret =
+        unsafe { libc::madvise(aligned_start as *mut libc::c_void, len, libc::MADV_DONTNEED) };
+    if ret == 0 { len } else { 0 }
+}
+
+#[inline]
+fn round_up(x: usize, align: usize) -> usize {
+    (x + align - 1) & !(align - 1)
+}
+
+#[inline]
+fn round_down(x: usize, align: usize) -> usize {
+    x & !(align - 1)
+}
+
+/// Cached page size (4096 on most ARM64/x86_64 systems).
+fn page_size() -> usize {
+    static PAGE_SIZE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PAGE_SIZE.get_or_init(|| {
+        // SAFETY: sysconf(_SC_PAGESIZE) is always safe and returns a positive value on Linux.
+        let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if ps > 0 { ps as usize } else { 4096 }
+    })
 }
 
 // ── KVCacheOps implementation for KVCache ───────────────────────────────────
@@ -1693,5 +1807,353 @@ mod tests {
         cache.shift_positions_for_head(0, 3, 1, 0).unwrap();
         // src==dst should be noop
         cache.shift_positions_for_head(0, 3, 3, 1).unwrap();
+    }
+
+    // ── madvise / release_unused_pages tests ──
+
+    /// Helper: make a large F16 SeqMajor cache (buffer > 1 page).
+    fn make_large_f16_cache(max_seq_len: usize, heads: usize, dim: usize) -> KVCache {
+        let size_bytes = max_seq_len * heads * dim * 2; // F16
+        let k_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F16));
+        let v_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F16));
+        let backend = Arc::new(CpuBackend::new());
+        let k = Tensor::new(
+            Shape::new(vec![1, max_seq_len, heads, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, max_seq_len, heads, dim]), v_buf, backend);
+        KVCache::new(k, v, max_seq_len)
+    }
+
+    fn make_large_f16_headmajor_cache(max_seq_len: usize, heads: usize, dim: usize) -> KVCache {
+        let size_bytes = max_seq_len * heads * dim * 2; // F16
+        let k_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F16));
+        let v_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F16));
+        let backend = Arc::new(CpuBackend::new());
+        let k = Tensor::new(
+            Shape::new(vec![1, heads, max_seq_len, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, heads, max_seq_len, dim]), v_buf, backend);
+        KVCache {
+            k_buffer: k,
+            v_buffer: v,
+            current_pos: 0,
+            max_seq_len,
+            capacity: max_seq_len,
+            kv_heads: heads,
+            head_dim: dim,
+            layout: KVLayout::HeadMajor,
+            memory: None,
+        }
+    }
+
+    /// Read VmRSS from /proc/self/status in bytes.
+    fn read_rss_bytes() -> usize {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if line.starts_with("VmRSS:") {
+                let kb: usize = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                return kb * 1024;
+            }
+        }
+        0
+    }
+
+    #[test]
+    fn test_release_unused_pages_returns_bytes_seqmajor() {
+        // 8192 positions * 8 heads * 64 dim * 2 bytes = 8 MB per buffer
+        let mut cache = make_large_f16_cache(8192, 8, 64);
+        cache.current_pos = 8192;
+
+        // Touch all pages to ensure physical allocation
+        let ptr = cache.k_buffer.as_mut_ptr();
+        if !ptr.is_null() {
+            for i in (0..cache.k_buffer.size()).step_by(4096) {
+                unsafe { std::ptr::write_volatile(ptr.add(i), 0xABu8) };
+            }
+        }
+
+        // Evict most tokens: keep 100 out of 8192
+        cache.current_pos = 100;
+        let released = cache.release_unused_pages();
+
+        // With SeqMajor, single contiguous region.
+        // used = 100 * 8 * 64 * 2 = 102400 bytes (~25 pages)
+        // total = 8192 * 8 * 64 * 2 = 8388608 bytes (~2048 pages)
+        // Released should be significant (> 7 MB from K+V)
+        assert!(
+            released > 7_000_000,
+            "Expected >7MB released, got {} bytes",
+            released
+        );
+    }
+
+    #[test]
+    fn test_release_unused_pages_returns_bytes_headmajor() {
+        // 8192 positions * 8 heads * 64 dim * 2 bytes = 8 MB per buffer
+        let mut cache = make_large_f16_headmajor_cache(8192, 8, 64);
+        cache.current_pos = 8192;
+
+        // Touch all pages
+        let ptr = cache.k_buffer.as_mut_ptr();
+        if !ptr.is_null() {
+            for i in (0..cache.k_buffer.size()).step_by(4096) {
+                unsafe { std::ptr::write_volatile(ptr.add(i), 0xABu8) };
+            }
+        }
+
+        cache.current_pos = 100;
+        let released = cache.release_unused_pages();
+
+        // HeadMajor: per head = 8192 * 64 * 2 = 1048576 bytes = 1MB
+        // used per head = 100 * 64 * 2 = 12800 bytes (~3 pages used)
+        // ~253 pages released per head, 8 heads = ~2024 pages per buffer, x2 (K+V)
+        assert!(
+            released > 7_000_000,
+            "Expected >7MB released, got {} bytes",
+            released
+        );
+    }
+
+    #[test]
+    fn test_release_unused_pages_rss_reduction() {
+        // Allocate large cache, touch pages, then release and check RSS drops
+        let mut cache = make_large_f16_cache(16384, 8, 64);
+        cache.current_pos = 16384;
+
+        // Touch all pages in both K and V
+        for buf_ptr in [cache.k_buffer.as_mut_ptr(), cache.v_buffer.as_mut_ptr()] {
+            if !buf_ptr.is_null() {
+                let size = 16384 * 8 * 64 * 2;
+                for i in (0..size).step_by(4096) {
+                    unsafe { std::ptr::write_volatile(buf_ptr.add(i), 0xCDu8) };
+                }
+            }
+        }
+
+        let rss_before = read_rss_bytes();
+
+        // Evict most: keep 10 tokens out of 16384
+        cache.current_pos = 10;
+        cache.release_unused_pages();
+
+        let rss_after = read_rss_bytes();
+
+        // KV buffer total = 16384 * 8 * 64 * 2 * 2 (K+V) = 32 MB
+        // After eviction: ~0.02 MB used, ~32 MB released
+        // RSS should drop by at least 20 MB (allowing margin for test runtime overhead)
+        let rss_drop = rss_before.saturating_sub(rss_after);
+        assert!(
+            rss_drop > 20_000_000,
+            "Expected RSS drop > 20MB, got {} MB drop (before={}, after={})",
+            rss_drop / (1024 * 1024),
+            rss_before / (1024 * 1024),
+            rss_after / (1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn test_release_unused_pages_regrowth_integrity() {
+        // After release, new data written to madvise'd region should work
+        let mut cache = make_large_f16_cache(4096, 2, 64);
+        cache.current_pos = 4096;
+
+        // Touch all pages
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        if !k_ptr.is_null() {
+            for i in (0..cache.k_buffer.size()).step_by(4096) {
+                unsafe { std::ptr::write_volatile(k_ptr.add(i), 0xABu8) };
+            }
+        }
+
+        // Evict to 10 tokens and release
+        cache.current_pos = 10;
+        cache.release_unused_pages();
+
+        // "Regrow": write new data into the released region
+        cache.current_pos = 2000;
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        if !k_ptr.is_null() {
+            let type_size = 2; // F16
+            let row_size = 2 * 64 * type_size; // heads * dim * type_size
+            // Write a marker at position 1000
+            let offset = 1000 * row_size;
+            unsafe {
+                std::ptr::write_volatile(k_ptr.add(offset), 0x42u8);
+                // Read it back
+                let val = std::ptr::read_volatile(k_ptr.add(offset));
+                assert_eq!(
+                    val, 0x42u8,
+                    "Data written to released region should be readable"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_release_unused_pages_noop_on_full_cache() {
+        let mut cache = make_large_f16_cache(1024, 2, 64);
+        cache.current_pos = 1024; // Full cache
+        let released = cache.release_unused_pages();
+        assert_eq!(released, 0, "Full cache should release 0 bytes");
+    }
+
+    #[test]
+    fn test_release_unused_pages_noop_on_small_eviction() {
+        let mut cache = make_large_f16_cache(1024, 2, 64);
+        cache.current_pos = 1024;
+
+        // Touch pages
+        let ptr = cache.k_buffer.as_mut_ptr();
+        if !ptr.is_null() {
+            for i in (0..cache.k_buffer.size()).step_by(4096) {
+                unsafe { std::ptr::write_volatile(ptr.add(i), 0xABu8) };
+            }
+        }
+
+        // Evict just 1 token — likely < 1 page for most configs
+        cache.current_pos = 1023;
+        let released = cache.release_unused_pages();
+        // 1 token = 2 * 64 * 2 = 256 bytes, well under page size → 0 released
+        assert_eq!(released, 0, "Evicting < 1 page should release 0 bytes");
+    }
+
+    #[test]
+    fn test_release_unused_pages_headmajor_boundary_safety() {
+        // Verify HeadMajor madvise doesn't corrupt adjacent head data
+        let heads = 4;
+        let dim = 64;
+        let cap = 4096;
+        let mut cache = make_large_f16_headmajor_cache(cap, heads, dim);
+        cache.current_pos = cap;
+
+        let type_size = 2; // F16
+        let head_stride = cap * dim * type_size;
+
+        // Write a marker at the START of each head region (position 0)
+        let k_ptr = cache.k_buffer.as_mut_ptr();
+        if k_ptr.is_null() {
+            return;
+        }
+        for h in 0..heads {
+            unsafe {
+                let head_base = k_ptr.add(h * head_stride);
+                std::ptr::write_volatile(head_base, (0x10 + h) as u8);
+            }
+        }
+
+        // Evict to 10 tokens and release unused pages
+        cache.current_pos = 10;
+        cache.release_unused_pages();
+
+        // Verify markers at head starts are preserved (they're in the "used" region)
+        for h in 0..heads {
+            unsafe {
+                let head_base = k_ptr.add(h * head_stride);
+                let val = std::ptr::read_volatile(head_base);
+                assert_eq!(
+                    val,
+                    (0x10 + h) as u8,
+                    "Head {} start marker should be preserved after madvise",
+                    h
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_prune_prefix_calls_release_unused_pages() {
+        // prune_prefix should release pages (verified via RSS)
+        // Use large buffers (32 MB total) and touch both K and V for clear signal.
+        let mut cache = make_large_f16_cache(16384, 8, 64);
+        cache.current_pos = 16384;
+
+        // Touch all pages in both K and V buffers
+        for buf_ptr in [cache.k_buffer.as_mut_ptr(), cache.v_buffer.as_mut_ptr()] {
+            if !buf_ptr.is_null() {
+                let size = 16384 * 8 * 64 * 2;
+                for i in (0..size).step_by(4096) {
+                    unsafe { std::ptr::write_volatile(buf_ptr.add(i), 0xABu8) };
+                }
+            }
+        }
+
+        let rss_before = read_rss_bytes();
+        cache.prune_prefix(16000).unwrap(); // Keep 384 tokens
+        let rss_after = read_rss_bytes();
+
+        assert_eq!(cache.current_pos, 384);
+        // 32 MB total, ~97% evicted → expect > 20 MB RSS drop
+        let rss_drop = rss_before.saturating_sub(rss_after);
+        assert!(
+            rss_drop > 20_000_000,
+            "Expected RSS drop > 20MB from prune_prefix, got {} MB (before={}, after={})",
+            rss_drop / (1024 * 1024),
+            rss_before / (1024 * 1024),
+            rss_after / (1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn test_release_unused_pages_noop_on_q4_dtype() {
+        // Q4_0 dtype should be skipped (returns 0)
+        use crate::core::quant::QK4_0;
+        let heads = 2;
+        let dim = 64;
+        let max_seq = 1024;
+        let blocks_per_pos = heads * dim / QK4_0;
+        let block_size = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let buf_size = max_seq * blocks_per_pos * block_size;
+        let k_buf = Arc::new(SharedBuffer::new(buf_size, DType::Q4_0));
+        let v_buf = Arc::new(SharedBuffer::new(buf_size, DType::Q4_0));
+        let backend = Arc::new(CpuBackend::new());
+        let k = Tensor::new(
+            Shape::new(vec![1, max_seq, heads, dim]),
+            k_buf,
+            backend.clone(),
+        );
+        let v = Tensor::new(Shape::new(vec![1, max_seq, heads, dim]), v_buf, backend);
+        let mut cache = KVCache::new(k, v, max_seq);
+        cache.current_pos = 512;
+        let released = cache.release_unused_pages();
+        assert_eq!(released, 0, "Q4_0 dtype should not trigger madvise");
+    }
+
+    #[test]
+    fn test_round_up_and_round_down() {
+        assert_eq!(super::round_up(0, 4096), 0);
+        assert_eq!(super::round_up(1, 4096), 4096);
+        assert_eq!(super::round_up(4095, 4096), 4096);
+        assert_eq!(super::round_up(4096, 4096), 4096);
+        assert_eq!(super::round_up(4097, 4096), 8192);
+
+        assert_eq!(super::round_down(0, 4096), 0);
+        assert_eq!(super::round_down(1, 4096), 0);
+        assert_eq!(super::round_down(4095, 4096), 0);
+        assert_eq!(super::round_down(4096, 4096), 4096);
+        assert_eq!(super::round_down(4097, 4096), 4096);
+    }
+
+    #[test]
+    fn test_madvise_dontneed_null_ptr() {
+        // Null pointer should return 0 without crashing
+        let released = super::madvise_dontneed(std::ptr::null(), 0, 4096);
+        assert_eq!(released, 0);
+    }
+
+    #[test]
+    fn test_madvise_dontneed_empty_range() {
+        let buf = vec![0u8; 8192];
+        let released = super::madvise_dontneed(buf.as_ptr(), 4096, 4096);
+        assert_eq!(released, 0, "from == to should release 0");
+        let released = super::madvise_dontneed(buf.as_ptr(), 4096, 100);
+        assert_eq!(released, 0, "from > to should release 0");
     }
 }
