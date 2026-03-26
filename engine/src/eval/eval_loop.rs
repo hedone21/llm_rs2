@@ -197,8 +197,15 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             prefill_ws.as_mut(),
         )?;
 
-        // ── post_prefill hook ──
+        // ── post_prefill hook (eviction if cache exceeds budget) ──
         hook.post_prefill(kv_caches, &mut qcf_metrics);
+
+        // Update start_pos: post_prefill may have evicted (compacted) the cache.
+        let start_pos_after_prompt = kv_caches
+            .iter()
+            .map(|c| c.current_pos())
+            .max()
+            .unwrap_or(start_pos_after_prompt);
 
         // ── Snapshot KV cache after prompt ──
         let snap = hook.snapshot(kv_caches);
@@ -537,53 +544,33 @@ fn run_prefill<C: KVCacheOps>(
     kv_caches: &mut [C],
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
-    decode_logits: &mut Tensor,
-    x_gen: &mut Tensor,
-    gen_ws: &mut LayerWorkspace,
-    cpu_gen_input: &Tensor,
-    qcf_metrics: &mut Vec<serde_json::Value>,
+    _decode_logits: &mut Tensor,
+    _x_gen: &mut Tensor,
+    _gen_ws: &mut LayerWorkspace,
+    _cpu_gen_input: &Tensor,
+    _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
     prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
-    let prompt_len = prompt_ids.len();
-    let effective_budget = eval_config.effective_budget;
-    let budget_mode = effective_budget > 0;
-
-    if budget_mode && prompt_len > effective_budget {
-        run_chunked_prefill(
-            model,
-            backend,
-            memory,
-            kv_caches,
-            hook,
-            prompt_ids,
-            decode_logits,
-            x_gen,
-            gen_ws,
-            cpu_gen_input,
-            qcf_metrics,
-            vocab_size,
-            eval_config,
-            skip_config,
-            prefill_ws,
-        )
-    } else {
-        run_full_prefill(
-            model,
-            backend,
-            memory,
-            kv_caches,
-            hook,
-            prompt_ids,
-            qcf_metrics,
-            vocab_size,
-            eval_config,
-            skip_config,
-            prefill_ws,
-        )
-    }
+    // Always use full batch prefill regardless of budget.
+    // Post-prefill eviction (in hook.post_prefill) handles cache compaction.
+    // This avoids the O(prompt_len - budget) token-by-token decode that caused
+    // 2-3.3x slowdown when prompt > budget (issue D).
+    run_full_prefill(
+        model,
+        backend,
+        memory,
+        kv_caches,
+        hook,
+        prompt_ids,
+        _qcf_metrics,
+        vocab_size,
+        eval_config,
+        skip_config,
+        prefill_ws,
+    )
 }
 
 /// Full prefill: forward all prompt tokens in a single batched pass.
@@ -660,7 +647,11 @@ fn run_full_prefill<C: KVCacheOps>(
 
 /// Chunked prefill: forward first `effective_budget` tokens as a batch, then
 /// decode the remaining prompt tokens one-by-one (with eviction between steps).
-#[allow(clippy::too_many_arguments)]
+///
+/// **Deprecated**: No longer called from `run_prefill`. Full batch prefill +
+/// post_prefill eviction is faster and produces equivalent results.
+/// Retained for reference; will be removed in a future cleanup.
+#[allow(dead_code, clippy::too_many_arguments)]
 fn run_chunked_prefill<C: KVCacheOps>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,

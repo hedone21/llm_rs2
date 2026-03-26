@@ -282,9 +282,109 @@ impl StepHook<KVCache> for EvictionHook {
         }
     }
 
-    fn post_prefill(&mut self, _caches: &mut [KVCache], _qcf_metrics: &mut Vec<serde_json::Value>) {
-        // Prefill eviction is handled by the caller (budget-check before entering
-        // the decode loop). Nothing to do here for the generic hook interface.
+    fn post_prefill(&mut self, caches: &mut [KVCache], qcf_metrics: &mut Vec<serde_json::Value>) {
+        // After full batch prefill, evict if cache exceeds budget.
+        // This replaces the old chunked-prefill approach that decoded overflow
+        // tokens one-by-one (causing 2-3.3x slowdown).
+        if caches.is_empty() || max_cache_pos(caches) <= self.effective_budget {
+            return;
+        }
+
+        let before_len = max_cache_pos(caches);
+        let ratio = self.effective_budget as f32 / before_len as f32;
+
+        // V buffer readback for QCF (GPU backends)
+        let can_compute_qcf = self.kv_type == "f32";
+        let v_cpu_data: Option<Vec<f32>> = if can_compute_qcf
+            && !caches.is_empty()
+            && caches[0].v_buffer.buffer().as_ptr().is_null()
+        {
+            let v_elems = caches[0].v_buffer.buffer().size() / 4;
+            let mut v_buf = vec![0.0f32; v_elems];
+            let byte_slice = unsafe {
+                std::slice::from_raw_parts_mut(v_buf.as_mut_ptr() as *mut u8, v_elems * 4)
+            };
+            match self.backend.read_buffer(&caches[0].v_buffer, byte_slice) {
+                Ok(()) => Some(v_buf),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let can_compute_qcf = can_compute_qcf
+            && !caches.is_empty()
+            && (v_cpu_data.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
+
+        // Eviction with QCF collection (mirrors post_decode_step logic)
+        let result = if self.score_based_eviction {
+            let active = self
+                .score_accumulator
+                .as_ref()
+                .is_some_and(|acc| acc.is_active());
+
+            if active {
+                let scores = self
+                    .score_accumulator
+                    .as_ref()
+                    .unwrap()
+                    .importance_scores()
+                    .to_vec();
+                let target_len = ((before_len as f32) * ratio) as usize;
+                let evicted = crate::core::qcf::identify_evicted_h2o(
+                    &scores,
+                    self.protected_prefix,
+                    self.h2o_keep_ratio,
+                    before_len,
+                    target_len,
+                );
+
+                if !evicted.is_empty() && can_compute_qcf && !caches.is_empty() {
+                    if self.qcf_config.mode.has_attn() {
+                        let metric = crate::core::qcf::compute_eviction_qcf_attn(
+                            &evicted,
+                            &scores,
+                            &caches[0],
+                            &self.qcf_config,
+                            v_cpu_data.as_deref(),
+                        );
+                        qcf_metrics.push(metric_to_json(&metric, 0, before_len));
+                    }
+                    if self.qcf_config.mode.has_caote()
+                        && let Some(head_attn) = self
+                            .score_accumulator
+                            .as_ref()
+                            .and_then(|acc| acc.last_step_head_attn())
+                    {
+                        let positions: Vec<usize> = evicted.iter().map(|(pos, _)| *pos).collect();
+                        let metric = crate::core::qcf::compute_eviction_qcf_caote(
+                            &positions,
+                            head_attn,
+                            &caches[0],
+                            &self.qcf_config,
+                            v_cpu_data.as_deref(),
+                        );
+                        qcf_metrics.push(metric_to_json(&metric, 0, before_len));
+                    }
+                }
+
+                self.cache_manager
+                    .force_evict_with_scores(caches, ratio, &scores)
+            } else {
+                self.cache_manager.force_evict(caches, ratio)
+            }
+        } else {
+            self.cache_manager.force_evict(caches, ratio)
+        };
+
+        if let Ok(evict_result) = result {
+            if evict_result.evicted {
+                self.eviction_count += 1;
+                self.evicted_total += evict_result.tokens_removed;
+                if let Some(acc) = self.score_accumulator.as_mut() {
+                    acc.reset();
+                }
+            }
+        }
     }
 
     fn reset_caches(&mut self, caches: &mut [KVCache]) {
