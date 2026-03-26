@@ -159,19 +159,16 @@ impl EvictionPolicy for H2OPolicy {
             }
         }
 
-        // 4. Build final keep list: [prefix positions] ++ [heavy hitters] ++ [recent positions]
-        let recent_positions: Vec<usize> = (recent_start..current).collect();
+        // 4. Build final keep list: [heavy hitters] ++ [recent positions]
+        let recent_len = current - recent_start;
+        let mut keep_all: Vec<usize> = Vec::with_capacity(hh_positions.len() + recent_len);
+        keep_all.extend_from_slice(&hh_positions);
+        keep_all.extend(recent_start..current);
 
         // 5. Compact the KV cache: [prefix..., heavy hitters in order..., recent in order...]
-        let mut write_pos = self.protected_prefix;
-        for &src_pos in hh_positions.iter().chain(recent_positions.iter()) {
-            if src_pos != write_pos {
-                cache.shift_positions(src_pos, write_pos, 1)?;
-            }
-            write_pos += 1;
-        }
+        cache.compact_keep_positions(&keep_all, self.protected_prefix)?;
 
-        cache.current_pos = self.protected_prefix + hh_positions.len() + recent_positions.len();
+        cache.current_pos = self.protected_prefix + keep_all.len();
 
         log::debug!("H2O: compacted cache to {} tokens", cache.current_pos);
 

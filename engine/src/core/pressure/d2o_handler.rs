@@ -251,11 +251,7 @@ impl D2OHandler {
         );
 
         // ── Step 6: Compact cache ──
-        for (write_pos, &src_pos) in retain_all.iter().enumerate() {
-            if src_pos != write_pos {
-                cache.shift_positions(src_pos, write_pos, 1)?;
-            }
-        }
+        cache.compact_keep_positions(&retain_all, 0)?;
         cache.current_pos = retain_all.len();
 
         Ok(current - cache.current_pos)

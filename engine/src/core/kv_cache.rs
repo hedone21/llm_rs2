@@ -764,6 +764,103 @@ impl KVCache {
 
         total_released
     }
+
+    /// Compact the KV cache by moving `keep` positions to a contiguous region
+    /// starting at `write_start`.
+    ///
+    /// `keep` must be sorted in ascending order. Consecutive source positions are
+    /// merged into a single `shift_positions` call, reducing the number of
+    /// `buffer_shift` invocations by up to 200x compared to per-token shifting.
+    ///
+    /// This method does **not** update `current_pos`; the caller is responsible
+    /// for setting it to `write_start + keep.len()` after compaction.
+    pub fn compact_keep_positions(&mut self, keep: &[usize], write_start: usize) -> Result<()> {
+        if keep.is_empty() {
+            return Ok(());
+        }
+
+        let mut write_pos = write_start;
+        let mut batch_src_start = keep[0];
+        let mut batch_dst_start = write_pos;
+        let mut batch_count = 1usize;
+        write_pos += 1;
+
+        for &src_pos in &keep[1..] {
+            if src_pos == batch_src_start + batch_count {
+                // Extend current batch
+                batch_count += 1;
+            } else {
+                // Flush current batch
+                if batch_src_start != batch_dst_start {
+                    self.shift_positions(batch_src_start, batch_dst_start, batch_count)?;
+                }
+                // Start new batch
+                batch_src_start = src_pos;
+                batch_dst_start = write_pos;
+                batch_count = 1;
+            }
+            write_pos += 1;
+        }
+
+        // Flush final batch
+        if batch_src_start != batch_dst_start {
+            self.shift_positions(batch_src_start, batch_dst_start, batch_count)?;
+        }
+
+        Ok(())
+    }
+
+    /// Per-head variant of `compact_keep_positions` for H2O+ per-head eviction.
+    ///
+    /// Only moves data for the specified `head`; other heads are untouched.
+    /// `keep` must be sorted in ascending order.
+    ///
+    /// **Requires HeadMajor layout** — delegates to `shift_positions_for_head`.
+    pub fn compact_keep_positions_for_head(
+        &mut self,
+        head: usize,
+        keep: &[usize],
+        write_start: usize,
+    ) -> Result<()> {
+        if keep.is_empty() {
+            return Ok(());
+        }
+
+        let mut write_pos = write_start;
+        let mut batch_src_start = keep[0];
+        let mut batch_dst_start = write_pos;
+        let mut batch_count = 1usize;
+        write_pos += 1;
+
+        for &src_pos in &keep[1..] {
+            if src_pos == batch_src_start + batch_count {
+                // Extend current batch
+                batch_count += 1;
+            } else {
+                // Flush current batch
+                if batch_src_start != batch_dst_start {
+                    self.shift_positions_for_head(
+                        head,
+                        batch_src_start,
+                        batch_dst_start,
+                        batch_count,
+                    )?;
+                }
+                // Start new batch
+                batch_src_start = src_pos;
+                batch_dst_start = write_pos;
+                batch_count = 1;
+            }
+            write_pos += 1;
+        }
+
+        // Flush final batch
+        if batch_src_start != batch_dst_start {
+            self.shift_positions_for_head(head, batch_src_start, batch_dst_start, batch_count)?;
+        }
+
+        Ok(())
+    }
 }
 
 // ── madvise helpers ─────────────────────────────────────────────────────────
@@ -2155,5 +2252,197 @@ mod tests {
         assert_eq!(released, 0, "from == to should release 0");
         let released = super::madvise_dontneed(buf.as_ptr(), 4096, 100);
         assert_eq!(released, 0, "from > to should release 0");
+    }
+
+    // ── compact_keep_positions tests ──
+
+    /// Write value `val` at (pos, all heads, d=0) in a HeadMajor F32 cache.
+    fn hm_write_pos(cache: &mut KVCache, pos: usize, val: f32) {
+        let heads = cache.kv_heads;
+        let dim = cache.head_dim;
+        let cap = cache.capacity;
+        let k_slice = cache.k_buffer.as_mut_slice::<f32>();
+        let v_slice = cache.v_buffer.as_mut_slice::<f32>();
+        for h in 0..heads {
+            let base = h * cap * dim;
+            k_slice[base + pos * dim] = val;
+            v_slice[base + pos * dim] = val * 10.0;
+        }
+    }
+
+    /// Read the K value at (pos, head=0, d=0) in a HeadMajor F32 cache.
+    fn hm_read_k(cache: &KVCache, pos: usize) -> f32 {
+        let off = cache.offset(pos, 0);
+        cache.k_buffer.as_slice::<f32>()[off]
+    }
+
+    /// Read the V value at (pos, head=0, d=0) in a HeadMajor F32 cache.
+    fn hm_read_v_d0(cache: &KVCache, pos: usize) -> f32 {
+        let off = cache.offset(pos, 0);
+        cache.v_buffer.as_slice::<f32>()[off]
+    }
+
+    /// Make a HeadMajor F32 cache pre-filled with distinct values (pos+1) at every position.
+    fn make_filled_hm_cache(max_seq: usize, heads: usize, dim: usize) -> KVCache {
+        let mut cache = make_head_major_cache(max_seq, heads, dim);
+        for pos in 0..max_seq {
+            hm_write_pos(&mut cache, pos, (pos + 1) as f32);
+        }
+        cache.current_pos = max_seq;
+        cache
+    }
+
+    #[test]
+    fn test_compact_keep_positions_consecutive() {
+        // keep = [2, 3, 4] — a single consecutive run
+        // write_start = 0
+        // Expected: pos 0←2, 1←3, 2←4 in a single batch shift
+        let mut cache = make_filled_hm_cache(10, 2, 4);
+        let keep = vec![2usize, 3, 4];
+        cache.compact_keep_positions(&keep, 0).unwrap();
+        cache.current_pos = keep.len();
+
+        // pos 0 should have old pos 2 value = 3.0
+        assert_eq!(hm_read_k(&cache, 0), 3.0);
+        assert_eq!(hm_read_k(&cache, 1), 4.0);
+        assert_eq!(hm_read_k(&cache, 2), 5.0);
+        assert_eq!(hm_read_v_d0(&cache, 0), 30.0);
+    }
+
+    #[test]
+    fn test_compact_keep_positions_scattered() {
+        // keep = [1, 3, 5, 7] — scattered, no consecutive pairs
+        // write_start = 0
+        let mut cache = make_filled_hm_cache(10, 2, 4);
+        let keep = vec![1usize, 3, 5, 7];
+        cache.compact_keep_positions(&keep, 0).unwrap();
+        cache.current_pos = keep.len();
+
+        // Each is shifted individually: dst 0←1, 1←3, 2←5, 3←7
+        assert_eq!(hm_read_k(&cache, 0), 2.0); // was pos 1 → value 2
+        assert_eq!(hm_read_k(&cache, 1), 4.0); // was pos 3 → value 4
+        assert_eq!(hm_read_k(&cache, 2), 6.0); // was pos 5 → value 6
+        assert_eq!(hm_read_k(&cache, 3), 8.0); // was pos 7 → value 8
+    }
+
+    #[test]
+    fn test_compact_keep_positions_one_gap() {
+        // Classic H2O scenario: keep HH at [0,2,4] and recent [7,8,9]
+        // write_start = 0 (no protected prefix)
+        // Batching: [0] in-place, [2] single, [4] single, [7,8,9] batch of 3
+        let mut cache = make_filled_hm_cache(10, 2, 4);
+        let keep = vec![0usize, 2, 4, 7, 8, 9];
+        cache.compact_keep_positions(&keep, 0).unwrap();
+        cache.current_pos = keep.len();
+
+        assert_eq!(hm_read_k(&cache, 0), 1.0); // pos 0, in-place
+        assert_eq!(hm_read_k(&cache, 1), 3.0); // pos 1 ← old pos 2
+        assert_eq!(hm_read_k(&cache, 2), 5.0); // pos 2 ← old pos 4
+        assert_eq!(hm_read_k(&cache, 3), 8.0); // pos 3 ← old pos 7
+        assert_eq!(hm_read_k(&cache, 4), 9.0); // pos 4 ← old pos 8
+        assert_eq!(hm_read_k(&cache, 5), 10.0); // pos 5 ← old pos 9
+    }
+
+    #[test]
+    fn test_compact_keep_positions_all_in_place() {
+        // keep = [0, 1, 2] with write_start = 0 — nothing to move
+        let mut cache = make_filled_hm_cache(10, 2, 4);
+        cache.compact_keep_positions(&[0, 1, 2], 0).unwrap();
+        cache.current_pos = 3;
+
+        // Values unchanged
+        assert_eq!(hm_read_k(&cache, 0), 1.0);
+        assert_eq!(hm_read_k(&cache, 1), 2.0);
+        assert_eq!(hm_read_k(&cache, 2), 3.0);
+    }
+
+    #[test]
+    fn test_compact_keep_positions_empty() {
+        // Empty keep list → no-op, no panic
+        let mut cache = make_filled_hm_cache(10, 2, 4);
+        cache.compact_keep_positions(&[], 0).unwrap();
+        // Values at original positions are untouched
+        assert_eq!(hm_read_k(&cache, 0), 1.0);
+    }
+
+    #[test]
+    fn test_compact_keep_positions_with_write_start() {
+        // Simulate protected prefix: write_start = 2, keep = [4, 5, 8, 9]
+        // 4,5 consecutive batch → shift to 2,3; 8,9 consecutive batch → shift to 4,5
+        let mut cache = make_filled_hm_cache(12, 2, 4);
+        let keep = vec![4usize, 5, 8, 9];
+        cache.compact_keep_positions(&keep, 2).unwrap();
+        cache.current_pos = 2 + keep.len();
+
+        assert_eq!(hm_read_k(&cache, 2), 5.0); // old pos 4
+        assert_eq!(hm_read_k(&cache, 3), 6.0); // old pos 5
+        assert_eq!(hm_read_k(&cache, 4), 9.0); // old pos 8
+        assert_eq!(hm_read_k(&cache, 5), 10.0); // old pos 9
+        // Protected prefix (pos 0,1) untouched
+        assert_eq!(hm_read_k(&cache, 0), 1.0);
+        assert_eq!(hm_read_k(&cache, 1), 2.0);
+    }
+
+    #[test]
+    fn test_compact_keep_positions_for_head() {
+        // Per-head version: only head 0 is modified; head 1 untouched.
+        // Cache: heads=2, dim=2, max_seq=10
+        // Fill each head differently: head 0 = (pos+1)*1.0, head 1 = (pos+1)*100.0
+        let heads = 2;
+        let dim = 2;
+        let cap = 10;
+        let size_bytes = cap * heads * dim * 4;
+        let k_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F32));
+        let v_buf = Arc::new(SharedBuffer::new(size_bytes, DType::F32));
+        let backend = Arc::new(CpuBackend::new());
+        let k = Tensor::new(Shape::new(vec![1, heads, cap, dim]), k_buf, backend.clone());
+        let v = Tensor::new(Shape::new(vec![1, heads, cap, dim]), v_buf, backend);
+        let mut cache = KVCache {
+            k_buffer: k,
+            v_buffer: v,
+            current_pos: cap,
+            max_seq_len: cap,
+            capacity: cap,
+            kv_heads: heads,
+            head_dim: dim,
+            layout: KVLayout::HeadMajor,
+            memory: None,
+        };
+
+        // Write distinct values per head
+        {
+            let k_slice = cache.k_buffer.as_mut_slice::<f32>();
+            // head 0: stride = cap * dim = 20
+            for pos in 0..cap {
+                k_slice[pos * dim] = (pos + 1) as f32; // head 0
+                k_slice[cap * dim + pos * dim] = (pos + 1) as f32 * 100.0; // head 1
+            }
+        }
+
+        // Compact head 0 only: keep positions [2, 3, 7, 8, 9] → write_start=0
+        let keep = vec![2usize, 3, 7, 8, 9];
+        cache.compact_keep_positions_for_head(0, &keep, 0).unwrap();
+
+        {
+            let k_slice = cache.k_buffer.as_slice::<f32>();
+            // Head 0 at pos 0 ← old pos 2 = 3.0; pos 1 ← old pos 3 = 4.0
+            assert_eq!(k_slice[0 * dim], 3.0, "head0 pos0 should be old pos2");
+            assert_eq!(k_slice[1 * dim], 4.0, "head0 pos1 should be old pos3");
+            // pos 2,3,4 ← old pos 7,8,9 (consecutive batch)
+            assert_eq!(k_slice[2 * dim], 8.0, "head0 pos2 should be old pos7");
+            assert_eq!(k_slice[3 * dim], 9.0, "head0 pos3 should be old pos8");
+            assert_eq!(k_slice[4 * dim], 10.0, "head0 pos4 should be old pos9");
+
+            // Head 1 is completely untouched
+            for pos in 0..cap {
+                let expected = (pos + 1) as f32 * 100.0;
+                assert_eq!(
+                    k_slice[cap * dim + pos * dim],
+                    expected,
+                    "head1 pos{} should be unchanged",
+                    pos
+                );
+            }
+        }
     }
 }

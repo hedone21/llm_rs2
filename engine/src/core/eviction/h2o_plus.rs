@@ -93,17 +93,14 @@ impl EvictionPolicy for H2OPlusPolicy {
             .collect();
         hh_positions.sort();
 
-        let recent_positions: Vec<usize> = (recent_start..current).collect();
+        let recent_len = current - recent_start;
+        let mut keep_all: Vec<usize> = Vec::with_capacity(hh_positions.len() + recent_len);
+        keep_all.extend_from_slice(&hh_positions);
+        keep_all.extend(recent_start..current);
 
-        let mut write_pos = self.protected_prefix;
-        for &src_pos in hh_positions.iter().chain(recent_positions.iter()) {
-            if src_pos != write_pos {
-                cache.shift_positions(src_pos, write_pos, 1)?;
-            }
-            write_pos += 1;
-        }
+        cache.compact_keep_positions(&keep_all, self.protected_prefix)?;
 
-        cache.current_pos = self.protected_prefix + hh_positions.len() + recent_positions.len();
+        cache.current_pos = self.protected_prefix + keep_all.len();
         Ok(())
     }
 
@@ -131,8 +128,6 @@ impl EvictionPolicy for H2OPlusPolicy {
         let actual_recent = current - recent_start;
         let max_seq = head_importance.len() / n_kv_heads;
 
-        let recent_positions: Vec<usize> = (recent_start..current).collect();
-
         log::debug!(
             "H2O+: per-head eviction, keeping {}/{} tokens (prefix={}, hh={}, recent={}, kv_heads={})",
             keep,
@@ -158,14 +153,11 @@ impl EvictionPolicy for H2OPlusPolicy {
                 .collect();
             hh_positions.sort();
 
-            // Compact this head only
-            let mut write_pos = self.protected_prefix;
-            for &src_pos in hh_positions.iter().chain(recent_positions.iter()) {
-                if src_pos != write_pos {
-                    cache.shift_positions_for_head(kv_h, src_pos, write_pos, 1)?;
-                }
-                write_pos += 1;
-            }
+            // Compact this head only — batch consecutive positions together
+            let mut keep_all: Vec<usize> = Vec::with_capacity(hh_positions.len() + actual_recent);
+            keep_all.extend_from_slice(&hh_positions);
+            keep_all.extend(recent_start..current);
+            cache.compact_keep_positions_for_head(kv_h, &keep_all, self.protected_prefix)?;
         }
 
         cache.current_pos = self.protected_prefix + hh_budget + actual_recent;
