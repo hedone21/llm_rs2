@@ -28,6 +28,6 @@ pub use hook::{CacheSnapshot, MetricsSummary, PostStepResult, StepHook};
 pub use kivi_hook::KiviHook;
 pub use output::{EvalConfig, EvalOutput, EvalQuestion};
 pub use qcf_helpers::{
-    aggregate_eviction_metrics, aggregate_kivi_metrics, build_opr_fields, flush_metric_to_json,
+    aggregate_eviction_metrics, aggregate_kivi_metrics, build_qcf_fields, flush_metric_to_json,
     metric_to_json,
 };

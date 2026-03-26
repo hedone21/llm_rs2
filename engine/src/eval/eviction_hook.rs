@@ -433,8 +433,9 @@ mod tests {
         let summary = hook.aggregate_metrics(&metrics);
         assert!((summary.qcf_attn_total - 0.3).abs() < 1e-10);
         assert!((summary.qcf_caote_total - 0.1).abs() < 1e-10);
-        assert_eq!(summary.opr_eviction, Some(0.1));
-        assert_eq!(summary.opr_eviction_events, 1);
+        // eviction 모드에서는 qcf_kivi_opr이 없다
+        assert!(summary.qcf_kivi_opr.is_none());
+        assert_eq!(summary.qcf_kivi_opr_events, 0);
     }
 
     #[test]

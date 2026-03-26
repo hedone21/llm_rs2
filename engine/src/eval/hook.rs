@@ -24,10 +24,8 @@ pub struct MetricsSummary {
     pub qcf_attn_total: f64,
     pub qcf_caote_total: f64,
     pub qcf_normalized_total: f64,
-    pub opr_eviction: Option<f64>,
-    pub opr_eviction_events: usize,
-    pub opr_quantization: Option<f64>,
-    pub opr_quantization_events: usize,
+    pub qcf_kivi_opr: Option<f64>,
+    pub qcf_kivi_opr_events: usize,
 }
 
 /// Snapshot of KV cache state for choice-level restore.

@@ -45,10 +45,10 @@ pub struct EvalOutput {
     pub layer_skip_qcf: Option<f32>,
     /// Layer skip QCF normalized.
     pub layer_skip_qcf_normalized: Option<f32>,
-    /// Layer skip OPR (residual norm ratio).
-    pub opr_layer_skip: Option<f64>,
+    /// Layer skip QCF (residual norm ratio).
+    pub qcf_layer_skip: Option<f64>,
     /// Number of skipped layers.
-    pub opr_layer_skip_layers: Option<usize>,
+    pub qcf_layer_skip_layers: Option<usize>,
 }
 
 impl EvalOutput {
@@ -69,11 +69,11 @@ impl EvalOutput {
         if let Some(n) = self.layer_skip_qcf_normalized {
             output["layer_skip_qcf_normalized"] = serde_json::json!(n);
         }
-        if let Some(opr) = self.opr_layer_skip {
-            output["opr_layer_skip"] = serde_json::json!(opr);
+        if let Some(opr) = self.qcf_layer_skip {
+            output["qcf_layer_skip"] = serde_json::json!(opr);
         }
-        if let Some(n) = self.opr_layer_skip_layers {
-            output["opr_layer_skip_layers"] = serde_json::json!(n);
+        if let Some(n) = self.qcf_layer_skip_layers {
+            output["qcf_layer_skip_layers"] = serde_json::json!(n);
         }
 
         serde_json::to_string_pretty(&output).map_err(Into::into)
@@ -83,7 +83,7 @@ impl EvalOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::eval::qcf_helpers::build_opr_fields;
+    use crate::eval::qcf_helpers::build_qcf_fields;
 
     // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -96,8 +96,8 @@ mod tests {
             layer_importance: None,
             layer_skip_qcf: None,
             layer_skip_qcf_normalized: None,
-            opr_layer_skip: None,
-            opr_layer_skip_layers: None,
+            qcf_layer_skip: None,
+            qcf_layer_skip_layers: None,
         }
     }
 
@@ -149,8 +149,8 @@ mod tests {
         let output = EvalOutput {
             layer_skip_qcf: Some(0.15),
             layer_skip_qcf_normalized: Some(0.176),
-            opr_layer_skip: Some(0.384),
-            opr_layer_skip_layers: Some(3),
+            qcf_layer_skip: Some(0.384),
+            qcf_layer_skip_layers: Some(3),
             ..minimal_output()
         };
         let v = parse(&output);
@@ -165,12 +165,12 @@ mod tests {
             "layer_skip_qcf_normalized should be present"
         );
         assert!(
-            !v["opr_layer_skip"].is_null(),
-            "opr_layer_skip should be present"
+            !v["qcf_layer_skip"].is_null(),
+            "qcf_layer_skip should be present"
         );
         assert!(
-            !v["opr_layer_skip_layers"].is_null(),
-            "opr_layer_skip_layers should be present"
+            !v["qcf_layer_skip_layers"].is_null(),
+            "qcf_layer_skip_layers should be present"
         );
 
         // 값 정확도 확인 (f32 → JSON → f64 변환 허용 오차)
@@ -186,8 +186,8 @@ mod tests {
             "layer_skip_qcf_normalized value mismatch: {}",
             norm
         );
-        assert!((v["opr_layer_skip"].as_f64().unwrap() - 0.384).abs() < 1e-9);
-        assert_eq!(v["opr_layer_skip_layers"].as_u64().unwrap(), 3);
+        assert!((v["qcf_layer_skip"].as_f64().unwrap() - 0.384).abs() < 1e-9);
+        assert_eq!(v["qcf_layer_skip_layers"].as_u64().unwrap(), 3);
     }
 
     // ── 3. layer_skip 없을 때 필드 부재 확인 ─────────────────────────────────
@@ -208,12 +208,12 @@ mod tests {
             "layer_skip_qcf_normalized should be absent when None"
         );
         assert!(
-            v.get("opr_layer_skip").is_none(),
-            "opr_layer_skip should be absent when None"
+            v.get("qcf_layer_skip").is_none(),
+            "qcf_layer_skip should be absent when None"
         );
         assert!(
-            v.get("opr_layer_skip_layers").is_none(),
-            "opr_layer_skip_layers should be absent when None"
+            v.get("qcf_layer_skip_layers").is_none(),
+            "qcf_layer_skip_layers should be absent when None"
         );
     }
 
@@ -240,75 +240,52 @@ mod tests {
         assert_eq!(li.as_array().unwrap().len(), 1);
     }
 
-    // ── 4. build_opr_fields — eviction 경로 검증 ─────────────────────────────
+    // ── 4. build_qcf_fields — eviction 경로 검증 ─────────────────────────────
 
-    /// opr_eviction이 Some일 때 opr_eviction과 opr_eviction_events가 숫자로 포함된다.
+    /// eviction 모드에서 qcf_kivi_opr_total은 null이어야 한다.
     #[test]
-    fn test_build_opr_fields_eviction_present() {
+    fn test_build_qcf_fields_eviction_mode() {
         let ms = MetricsSummary {
-            opr_eviction: Some(0.232),
-            opr_eviction_events: 100,
-            opr_quantization: None,
-            opr_quantization_events: 0,
+            qcf_kivi_opr: None,
+            qcf_kivi_opr_events: 0,
             ..Default::default()
         };
-        let fields = build_opr_fields(&ms);
+        let fields = build_qcf_fields(&ms);
 
-        assert!((fields["opr_eviction"].as_f64().unwrap() - 0.232).abs() < 1e-9);
-        assert_eq!(fields["opr_eviction_events"].as_u64().unwrap(), 100);
-        // quantization 필드는 null이어야 한다
-        assert!(fields["opr_quantization"].is_null());
-        assert!(fields["opr_quantization_events"].is_null());
+        // eviction 모드에서 KIVI OPR 필드는 null이어야 한다
+        assert!(fields["qcf_kivi_opr_total"].is_null());
+        assert!(fields["qcf_kivi_opr_events"].is_null());
     }
 
-    /// opr_eviction이 None일 때 opr_eviction_events도 null이어야 한다.
+    // ── 5. build_qcf_fields — KIVI 경로 검증 ─────────────────────────────────
+
+    /// qcf_kivi_opr이 Some일 때 qcf_kivi_opr_total과 qcf_kivi_opr_events가
+    /// 숫자로 포함되어야 한다.
     #[test]
-    fn test_build_opr_fields_eviction_absent() {
+    fn test_build_qcf_fields_kivi_present() {
         let ms = MetricsSummary {
-            opr_eviction: None,
-            opr_eviction_events: 5, // None이면 events도 null로 억제됨
+            qcf_kivi_opr: Some(0.089),
+            qcf_kivi_opr_events: 12,
             ..Default::default()
         };
-        let fields = build_opr_fields(&ms);
+        let fields = build_qcf_fields(&ms);
 
-        assert!(fields["opr_eviction"].is_null());
-        // opr_eviction이 None → opr_eviction_events도 null (map 패턴)
-        assert!(fields["opr_eviction_events"].is_null());
+        assert!((fields["qcf_kivi_opr_total"].as_f64().unwrap() - 0.089).abs() < 1e-9);
+        assert_eq!(fields["qcf_kivi_opr_events"].as_u64().unwrap(), 12);
     }
 
-    // ── 5. build_opr_fields — KIVI 경로 검증 ─────────────────────────────────
-
-    /// opr_quantization이 Some일 때 opr_quantization과 opr_quantization_events가
-    /// 숫자로 포함되고, eviction 필드는 null이어야 한다.
+    /// qcf_kivi_opr이 None일 때 qcf_kivi_opr_events도 null이어야 한다.
     #[test]
-    fn test_build_opr_fields_kivi_present() {
+    fn test_build_qcf_fields_kivi_absent() {
         let ms = MetricsSummary {
-            opr_eviction: None,
-            opr_eviction_events: 0,
-            opr_quantization: Some(0.089),
-            opr_quantization_events: 12,
+            qcf_kivi_opr: None,
+            qcf_kivi_opr_events: 7,
             ..Default::default()
         };
-        let fields = build_opr_fields(&ms);
+        let fields = build_qcf_fields(&ms);
 
-        assert!(fields["opr_eviction"].is_null());
-        assert!(fields["opr_eviction_events"].is_null());
-        assert!((fields["opr_quantization"].as_f64().unwrap() - 0.089).abs() < 1e-9);
-        assert_eq!(fields["opr_quantization_events"].as_u64().unwrap(), 12);
-    }
-
-    /// opr_quantization이 None일 때 opr_quantization_events도 null이어야 한다.
-    #[test]
-    fn test_build_opr_fields_kivi_absent() {
-        let ms = MetricsSummary {
-            opr_quantization: None,
-            opr_quantization_events: 7,
-            ..Default::default()
-        };
-        let fields = build_opr_fields(&ms);
-
-        assert!(fields["opr_quantization"].is_null());
-        assert!(fields["opr_quantization_events"].is_null());
+        assert!(fields["qcf_kivi_opr_total"].is_null());
+        assert!(fields["qcf_kivi_opr_events"].is_null());
     }
 
     // ── 6. MetricsSummary Default 검증 ────────────────────────────────────────
@@ -317,10 +294,8 @@ mod tests {
     #[test]
     fn test_metrics_summary_default_none_fields() {
         let ms = MetricsSummary::default();
-        assert!(ms.opr_eviction.is_none());
-        assert!(ms.opr_quantization.is_none());
-        assert_eq!(ms.opr_eviction_events, 0);
-        assert_eq!(ms.opr_quantization_events, 0);
+        assert!(ms.qcf_kivi_opr.is_none());
+        assert_eq!(ms.qcf_kivi_opr_events, 0);
         assert_eq!(ms.qcf_attn_total, 0.0);
         assert_eq!(ms.qcf_caote_total, 0.0);
         assert_eq!(ms.qcf_normalized_total, 0.0);
@@ -337,8 +312,8 @@ mod tests {
             wall_time_s: 3.14,
             layer_skip_qcf: Some(0.25),
             layer_skip_qcf_normalized: Some(0.333),
-            opr_layer_skip: Some(0.5),
-            opr_layer_skip_layers: Some(2),
+            qcf_layer_skip: Some(0.5),
+            qcf_layer_skip_layers: Some(2),
             ..minimal_output()
         };
         let json1 = output.to_json().unwrap();

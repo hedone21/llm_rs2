@@ -172,8 +172,8 @@ mod tests {
         ];
         let summary = hook.aggregate_metrics(&metrics);
         assert!((summary.qcf_attn_total - 0.1).abs() < 1e-10);
-        assert_eq!(summary.opr_quantization, Some(0.05));
-        assert_eq!(summary.opr_quantization_events, 1);
+        assert_eq!(summary.qcf_kivi_opr, Some(0.05));
+        assert_eq!(summary.qcf_kivi_opr_events, 1);
     }
 
     #[test]

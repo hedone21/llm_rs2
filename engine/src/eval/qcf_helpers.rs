@@ -25,24 +25,12 @@ pub fn aggregate_eviction_metrics(qcf_metrics: &[serde_json::Value]) -> MetricsS
         .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_attn")))
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
-    let opr_eviction_events: usize = qcf_metrics
-        .iter()
-        .filter(|m| m["action"].as_str().is_some_and(|a| a.ends_with("_caote")))
-        .count();
-    let opr_eviction = if qcf_caote_total > 0.0 {
-        Some(qcf_caote_total)
-    } else {
-        None
-    };
-
     MetricsSummary {
         qcf_attn_total,
         qcf_caote_total,
         qcf_normalized_total,
-        opr_eviction,
-        opr_eviction_events,
-        opr_quantization: None,
-        opr_quantization_events: 0,
+        qcf_kivi_opr: None,
+        qcf_kivi_opr_events: 0,
     }
 }
 
@@ -50,7 +38,7 @@ pub fn aggregate_eviction_metrics(qcf_metrics: &[serde_json::Value]) -> MetricsS
 ///
 /// Separates NMSE ("kivi" action) from OPR ("kivi_opr" action).
 pub fn aggregate_kivi_metrics(qcf_metrics: &[serde_json::Value]) -> MetricsSummary {
-    let qcf_total: f64 = qcf_metrics
+    let qcf_attn_total: f64 = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["raw_value"].as_f64())
@@ -60,28 +48,26 @@ pub fn aggregate_kivi_metrics(qcf_metrics: &[serde_json::Value]) -> MetricsSumma
         .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["normalized_value"].as_f64())
         .sum();
-    let opr_quantization: f64 = qcf_metrics
+    let kivi_opr_sum: f64 = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() == Some("kivi_opr"))
         .filter_map(|m| m["raw_value"].as_f64())
         .sum();
-    let opr_quantization_events: usize = qcf_metrics
+    let qcf_kivi_opr_events: usize = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() == Some("kivi_opr"))
         .count();
 
     MetricsSummary {
-        qcf_attn_total: qcf_total,
+        qcf_attn_total,
         qcf_caote_total: 0.0,
         qcf_normalized_total,
-        opr_eviction: None,
-        opr_eviction_events: 0,
-        opr_quantization: if opr_quantization > 0.0 {
-            Some(opr_quantization)
+        qcf_kivi_opr: if kivi_opr_sum > 0.0 {
+            Some(kivi_opr_sum)
         } else {
             None
         },
-        opr_quantization_events,
+        qcf_kivi_opr_events,
     }
 }
 
@@ -112,13 +98,11 @@ pub fn flush_metric_to_json(metric: &QcfMetric, flush_count: usize) -> serde_jso
     })
 }
 
-/// Build OPR JSON fields from a MetricsSummary.
-pub fn build_opr_fields(summary: &MetricsSummary) -> serde_json::Value {
+/// Build QCF JSON fields from a MetricsSummary.
+pub fn build_qcf_fields(summary: &MetricsSummary) -> serde_json::Value {
     serde_json::json!({
-        "opr_eviction": summary.opr_eviction,
-        "opr_eviction_events": summary.opr_eviction.map(|_| summary.opr_eviction_events),
-        "opr_quantization": summary.opr_quantization,
-        "opr_quantization_events": summary.opr_quantization.map(|_| summary.opr_quantization_events),
+        "qcf_kivi_opr_total": summary.qcf_kivi_opr,
+        "qcf_kivi_opr_events": summary.qcf_kivi_opr.map(|_| summary.qcf_kivi_opr_events),
     })
 }
 
@@ -131,7 +115,7 @@ mod tests {
         let summary = aggregate_eviction_metrics(&[]);
         assert_eq!(summary.qcf_attn_total, 0.0);
         assert_eq!(summary.qcf_caote_total, 0.0);
-        assert!(summary.opr_eviction.is_none());
+        assert!(summary.qcf_kivi_opr.is_none());
     }
 
     #[test]
@@ -145,8 +129,9 @@ mod tests {
         assert!((summary.qcf_attn_total - 0.7).abs() < 1e-10);
         assert!((summary.qcf_caote_total - 0.3).abs() < 1e-10);
         assert!((summary.qcf_normalized_total - 0.85).abs() < 1e-10);
-        assert_eq!(summary.opr_eviction, Some(0.3));
-        assert_eq!(summary.opr_eviction_events, 1);
+        // eviction 모드에서는 qcf_kivi_opr이 없어야 한다
+        assert!(summary.qcf_kivi_opr.is_none());
+        assert_eq!(summary.qcf_kivi_opr_events, 0);
     }
 
     #[test]
@@ -159,8 +144,8 @@ mod tests {
         ];
         let summary = aggregate_kivi_metrics(&metrics);
         assert!((summary.qcf_attn_total - 0.3).abs() < 1e-10); // NMSE only
-        assert_eq!(summary.opr_quantization, Some(0.08));
-        assert_eq!(summary.opr_quantization_events, 2);
+        assert_eq!(summary.qcf_kivi_opr, Some(0.08));
+        assert_eq!(summary.qcf_kivi_opr_events, 2);
     }
 
     #[test]

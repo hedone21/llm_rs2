@@ -2156,7 +2156,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if next_token_id == eos_id {
+            if next_token_id == eos_id && std::env::var("IGNORE_EOS").is_err() {
                 break;
             }
         }
@@ -2625,12 +2625,12 @@ fn run_kivi_ppl(
     let tok_per_sec = nll_count as f64 / wall_time;
 
     // Separate QCF (NMSE) and OPR metrics from flush proxies
-    let qcf_total: f64 = qcf_metrics
+    let qcf_kivi_nmse_total: f64 = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["raw_value"].as_f64())
         .sum();
-    let qcf_normalized_total: f64 = qcf_metrics
+    let qcf_attn_normalized_total: f64 = qcf_metrics
         .iter()
         .filter(|m| m["action"].as_str() != Some("kivi_opr"))
         .filter_map(|m| m["normalized_value"].as_f64())
@@ -2640,12 +2640,12 @@ fn run_kivi_ppl(
         .filter(|m| m["action"].as_str() == Some("kivi_opr"))
         .filter_map(|m| m["raw_value"].as_f64())
         .collect();
-    let opr_quantization: Option<f64> = if opr_values.is_empty() {
+    let qcf_kivi_opr_total: Option<f64> = if opr_values.is_empty() {
         None
     } else {
         Some(opr_values.iter().sum::<f64>() / opr_values.len() as f64)
     };
-    let opr_quantization_events = if opr_values.is_empty() {
+    let qcf_kivi_opr_events: Option<usize> = if opr_values.is_empty() {
         None
     } else {
         Some(opr_values.len())
@@ -2659,11 +2659,11 @@ fn run_kivi_ppl(
         "wall_time_s": wall_time,
         "qcf_metrics": qcf_metrics,
         "flush_count": qcf_metrics.len(),
-        "qcf_total": qcf_total,
-        "qcf_attn_total": qcf_total,
-        "qcf_attn_normalized_total": qcf_normalized_total,
-        "opr_quantization": opr_quantization,
-        "opr_quantization_events": opr_quantization_events,
+        "qcf_kivi_nmse_total": qcf_kivi_nmse_total,
+        "qcf_attn_total": qcf_kivi_nmse_total,
+        "qcf_attn_normalized_total": qcf_attn_normalized_total,
+        "qcf_kivi_opr_total": qcf_kivi_opr_total,
+        "qcf_kivi_opr_events": qcf_kivi_opr_events,
         "final_cache_pos": kv_caches[0].current_pos(),
         "kivi_q2_tokens": kv_caches[0].q2_tokens,
         "kivi_res_pos": kv_caches[0].res_pos,
@@ -3045,7 +3045,7 @@ fn run_kivi(
             stdout.flush().ok();
         }
 
-        if next_token == eos_id {
+        if next_token == eos_id && std::env::var("IGNORE_EOS").is_err() {
             break;
         }
     }
@@ -3420,7 +3420,7 @@ fn run_offload(
         print!("\r{}{}", initial_text, new_text);
         stdout.flush().ok();
 
-        if next_token == eos_id {
+        if next_token == eos_id && std::env::var("IGNORE_EOS").is_err() {
             break;
         }
     }
@@ -3934,16 +3934,13 @@ fn run_ppl(
         "wall_time_s": wall_time,
         "qcf_metrics": qcf_metrics,
         "eviction_count": qcf_metrics.len(),
-        "qcf_total": ms.qcf_attn_total,
         "qcf_attn_total": ms.qcf_attn_total,
         "qcf_attn_normalized_total": ms.qcf_normalized_total,
         "qcf_caote_total": ms.qcf_caote_total,
-        "opr_eviction": ms.opr_eviction,
-        "opr_eviction_events": ms.opr_eviction.map(|_| ms.opr_eviction_events),
-        "opr_quantization": serde_json::Value::Null,
-        "opr_quantization_events": serde_json::Value::Null,
-        "opr_layer_skip": serde_json::Value::Null,
-        "opr_layer_skip_layers": serde_json::Value::Null,
+        "qcf_kivi_opr_total": serde_json::Value::Null,
+        "qcf_kivi_opr_events": serde_json::Value::Null,
+        "qcf_layer_skip": serde_json::Value::Null,
+        "qcf_layer_skip_layers": serde_json::Value::Null,
         "config": {
             "model": args.model_path,
             "text_file": text_file,

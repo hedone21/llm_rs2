@@ -134,8 +134,8 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
     let mut results: Vec<serde_json::Value> = Vec::new();
     let overall_start = std::time::Instant::now();
 
-    let opr_layer_skip = layer_skip_opr.map(|v| v as f64);
-    let opr_layer_skip_layers = layer_skip_opr.map(|_| layer_skip_set_len);
+    let qcf_layer_skip = layer_skip_opr.map(|v| v as f64);
+    let qcf_layer_skip_layers = layer_skip_opr.map(|_| layer_skip_set_len);
 
     for (q_idx, question) in questions.iter().enumerate() {
         let q_start = std::time::Instant::now();
@@ -355,15 +355,12 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             "n_prompt_tokens": prompt_len,
             "final_cache_pos": final_cache_pos,
             "qcf_metrics": qcf_metrics,
-            "qcf_total": summary.qcf_attn_total,
             "qcf_attn_total": summary.qcf_attn_total,
             "qcf_attn_normalized_total": summary.qcf_normalized_total,
-            "opr_eviction": summary.opr_eviction,
-            "opr_eviction_events": summary.opr_eviction.map(|_| summary.opr_eviction_events),
-            "opr_quantization": summary.opr_quantization,
-            "opr_quantization_events": summary.opr_quantization.map(|_| summary.opr_quantization_events),
-            "opr_layer_skip": opr_layer_skip,
-            "opr_layer_skip_layers": opr_layer_skip_layers,
+            "qcf_kivi_opr_total": summary.qcf_kivi_opr,
+            "qcf_kivi_opr_events": summary.qcf_kivi_opr.map(|_| summary.qcf_kivi_opr_events),
+            "qcf_layer_skip": qcf_layer_skip,
+            "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
         // Conditionally include caote total (only when QCF mode has caote)
@@ -417,8 +414,8 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         layer_importance: layer_importance_json,
         layer_skip_qcf,
         layer_skip_qcf_normalized,
-        opr_layer_skip,
-        opr_layer_skip_layers,
+        qcf_layer_skip,
+        qcf_layer_skip_layers,
     })
 }
 
