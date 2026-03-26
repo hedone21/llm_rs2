@@ -3794,26 +3794,31 @@ fn run_ppl(
                 };
 
                 if result.evicted {
-                    // Collect QCF-CAOTE only at first eviction event
+                    // Collect QCF at first eviction event only
                     if !first_eviction_done {
                         first_eviction_done = true;
                         let eviction_ratio = result.tokens_removed as f32 / before_len as f32;
                         let ppl_at_event = (total_nll / nll_count as f64).exp();
 
-                        let qcf_caote_value = if can_compute_qcf {
+                        let (qcf_attn_raw, qcf_attn_norm, qcf_caote_value) =
                             if let Some(acc) = score_accumulator.as_ref() {
                                 if let Some(head_attn) = acc.last_step_head_attn() {
                                     let positions = if score_based_eviction {
                                         let scores = acc.importance_scores();
-                                        let target_len = ((before_len as f32) * ratio) as usize;
-                                        let evicted = llm_rs2::core::qcf::identify_evicted_h2o(
-                                            scores,
-                                            protected_prefix,
-                                            args.h2o_keep_ratio,
-                                            before_len,
-                                            target_len,
-                                        );
-                                        evicted.iter().map(|(pos, _)| *pos).collect::<Vec<_>>()
+                                        let target_len =
+                                            ((before_len as f32) * ratio) as usize;
+                                        let evicted =
+                                            llm_rs2::core::qcf::identify_evicted_h2o(
+                                                scores,
+                                                protected_prefix,
+                                                args.h2o_keep_ratio,
+                                                before_len,
+                                                target_len,
+                                            );
+                                        evicted
+                                            .iter()
+                                            .map(|(pos, _)| *pos)
+                                            .collect::<Vec<_>>()
                                     } else {
                                         llm_rs2::core::qcf::identify_evicted_sliding(
                                             protected_prefix,
@@ -3821,32 +3826,52 @@ fn run_ppl(
                                             before_len,
                                         )
                                     };
-                                    if !positions.is_empty() {
-                                        let metric = llm_rs2::core::qcf::compute_eviction_qcf_caote(
-                                            &positions,
+
+                                    // QCF-ATTN v2 (closed-form)
+                                    let n_kv_heads = kv_caches[0].kv_heads().max(1);
+                                    let max_seq_len = head_attn.len() / n_kv_heads;
+                                    let attn_metric =
+                                        llm_rs2::core::qcf::compute_qcf_attn_v2(
                                             head_attn,
-                                            &kv_caches[0],
-                                            &qcf_config,
-                                            v_cpu_data.as_deref(),
+                                            &positions,
+                                            n_kv_heads,
+                                            max_seq_len,
+                                            eviction_ratio,
                                         );
+
+                                    // QCF-CAOTE
+                                    let caote = if can_compute_qcf && !positions.is_empty() {
+                                        let metric =
+                                            llm_rs2::core::qcf::compute_eviction_qcf_caote(
+                                                &positions,
+                                                head_attn,
+                                                &kv_caches[0],
+                                                &qcf_config,
+                                                v_cpu_data.as_deref(),
+                                            );
                                         metric.raw_value as f64
                                     } else {
                                         0.0
-                                    }
+                                    };
+
+                                    (
+                                        attn_metric.raw_value as f64,
+                                        attn_metric.normalized_value as f64,
+                                        caote,
+                                    )
                                 } else {
-                                    0.0
+                                    (0.0, 0.0, 0.0)
                                 }
                             } else {
-                                0.0
-                            }
-                        } else {
-                            0.0
-                        };
+                                (0.0, 0.0, 0.0)
+                            };
 
                         eviction_event = Some(serde_json::json!({
                             "token_index": i,
                             "tokens_evicted": result.tokens_removed,
                             "eviction_ratio": eviction_ratio,
+                            "qcf_attn_raw": qcf_attn_raw,
+                            "qcf_attn_norm": qcf_attn_norm,
                             "qcf_caote": qcf_caote_value,
                             "ppl_at_event": ppl_at_event,
                         }));
