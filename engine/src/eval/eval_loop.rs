@@ -327,11 +327,10 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                     })?;
                     sp += 1;
 
-                    // Per-step eviction during choice decode: keeps cache at budget.
-                    // Each eviction removes ~1 token (201→200), matching OLD behavior.
-                    // Score accumulator is shared across choices but the per-step
-                    // evictions are tiny (1 token) and don't significantly affect NLL.
-                    hook.post_decode_step(kv_caches, sp, &mut qcf_metrics);
+                    // No eviction during choice decode. Cache may grow slightly
+                    // beyond budget (by continuation length), but snapshot restore
+                    // resets it between choices. This gives deterministic, isolated
+                    // per-choice evaluation without cross-choice score contamination.
 
                     // Read logits and accumulate NLL
                     let mut step_logits = vec![0.0f32; vocab_size];
@@ -582,59 +581,36 @@ fn run_prefill<C: KVCacheOps>(
     kv_caches: &mut [C],
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
-    decode_logits: &mut Tensor,
-    x_gen: &mut Tensor,
-    gen_ws: &mut LayerWorkspace,
-    cpu_gen_input: &Tensor,
-    qcf_metrics: &mut Vec<serde_json::Value>,
+    _decode_logits: &mut Tensor,
+    _x_gen: &mut Tensor,
+    _gen_ws: &mut LayerWorkspace,
+    _cpu_gen_input: &Tensor,
+    _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
     prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
-    let effective_budget = eval_config.effective_budget;
-    let prompt_len = prompt_ids.len();
-
-    // When eviction is needed (prompt > budget), use chunked prefill:
-    // batch-prefill first `budget` tokens, then decode the rest one-by-one.
-    // This accumulates H2O attention scores across ~(prompt_len - budget)
-    // decode steps, giving high-quality eviction decisions in post_prefill.
+    // Always use full batch prefill. Post-prefill eviction (in hook.post_prefill)
+    // handles cache compaction. The probe step (before post_prefill) populates
+    // the score accumulator for H2O decisions and QCF-ATTN measurement.
     //
-    // Without this, the probe step's single-step scores produce inferior
-    // eviction that degrades NLL by up to 2-3x compared to accumulated scores.
-    if effective_budget > 0 && effective_budget < prompt_len {
-        run_chunked_prefill(
-            model,
-            backend,
-            memory,
-            kv_caches,
-            hook,
-            prompt_ids,
-            decode_logits,
-            x_gen,
-            gen_ws,
-            cpu_gen_input,
-            qcf_metrics,
-            vocab_size,
-            eval_config,
-            skip_config,
-            prefill_ws,
-        )
-    } else {
-        run_full_prefill(
-            model,
-            backend,
-            memory,
-            kv_caches,
-            hook,
-            prompt_ids,
-            qcf_metrics,
-            vocab_size,
-            eval_config,
-            skip_config,
-            prefill_ws,
-        )
-    }
+    // This differs from the OLD per-step eviction approach but is the standard
+    // for eval-ll benchmarks: deterministic, single-event eviction with clean
+    // QCF measurement at a well-defined point.
+    run_full_prefill(
+        model,
+        backend,
+        memory,
+        kv_caches,
+        hook,
+        prompt_ids,
+        _qcf_metrics,
+        vocab_size,
+        eval_config,
+        skip_config,
+        prefill_ws,
+    )
 }
 
 /// Full prefill: forward all prompt tokens in a single batched pass.

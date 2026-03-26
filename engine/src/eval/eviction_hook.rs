@@ -453,23 +453,10 @@ impl StepHook<KVCache> for EvictionHook {
     }
 
     fn needs_score_probe(&self, caches: &[KVCache]) -> bool {
-        // Probe is needed only when:
-        // 1. Cache exceeds budget (eviction will happen), AND
-        // 2. Score accumulator has no data yet (full prefill path, not chunked)
-        //
-        // When chunked prefill was used, scores are already accumulated from
-        // the one-by-one decode steps — probe would be redundant and harmful
-        // (it adds an extra token via kv_cache.update()).
-        if caches.is_empty() || max_cache_pos(caches) <= self.effective_budget {
-            return false;
-        }
-        // Check if accumulator already has non-zero scores (from chunked decode)
-        if let Some(acc) = &self.score_accumulator {
-            if acc.is_active() && acc.importance_scores().iter().any(|&s| s > 0.0) {
-                return false; // scores already populated by chunked prefill
-            }
-        }
-        true
+        // Probe is needed when cache exceeds budget (eviction will happen).
+        // The probe step populates score_accumulator for H2O decisions and
+        // captures last_step_head_attn for QCF-ATTN measurement.
+        !caches.is_empty() && max_cache_pos(caches) > self.effective_budget
     }
 
     fn extra_question_fields(&self, _caches: &[KVCache]) -> serde_json::Value {
