@@ -327,11 +327,11 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                     })?;
                     sp += 1;
 
-                    // NOTE: No post_decode_step here. Eviction is done once at
-                    // post_prefill; choice continuations are short (~5-15 tokens)
-                    // and restoring the snapshot between choices handles cleanup.
-                    // Evicting during choice decode would contaminate cross-choice
-                    // comparisons (score_accumulator shared across choices).
+                    // Per-step eviction during choice decode: keeps cache at budget.
+                    // Each eviction removes ~1 token (201→200), matching OLD behavior.
+                    // Score accumulator is shared across choices but the per-step
+                    // evictions are tiny (1 token) and don't significantly affect NLL.
+                    hook.post_decode_step(kv_caches, sp, &mut qcf_metrics);
 
                     // Read logits and accumulate NLL
                     let mut step_logits = vec![0.0f32; vocab_size];
