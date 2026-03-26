@@ -224,6 +224,10 @@ impl KVCacheOps for OffloadKVCache {
         self.current_pos
     }
 
+    fn set_current_pos(&mut self, pos: usize) {
+        self.current_pos = pos;
+    }
+
     fn capacity(&self) -> usize {
         self.max_seq_len
     }

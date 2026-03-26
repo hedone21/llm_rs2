@@ -18,6 +18,10 @@ pub trait KVCacheOps: Send {
     /// Number of valid tokens currently in the cache.
     fn current_pos(&self) -> usize;
 
+    /// Override the current position counter.
+    /// Used to undo a probe step's `update()` increment without modifying buffer contents.
+    fn set_current_pos(&mut self, pos: usize);
+
     /// Physical buffer capacity in tokens.
     fn capacity(&self) -> usize;
 
@@ -920,6 +924,10 @@ fn page_size() -> usize {
 impl KVCacheOps for KVCache {
     fn current_pos(&self) -> usize {
         self.current_pos
+    }
+
+    fn set_current_pos(&mut self, pos: usize) {
+        self.current_pos = pos;
     }
 
     fn capacity(&self) -> usize {

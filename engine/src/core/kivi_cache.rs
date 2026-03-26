@@ -1031,6 +1031,10 @@ impl KVCacheOps for KiviCache {
         self.total_tokens()
     }
 
+    fn set_current_pos(&mut self, _pos: usize) {
+        // KiviCache position is derived from q2_tokens + res_pos; no-op.
+    }
+
     fn capacity(&self) -> usize {
         self.max_seq_len
     }

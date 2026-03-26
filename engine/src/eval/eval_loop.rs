@@ -200,8 +200,16 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         // ── Score collection probe: capture attention weights for QCF-ATTN v2 ──
         // Batch prefill doesn't populate score_accumulator (workspace: None).
         // Re-feed the last token as a decode step to capture per-head attention.
-        // This is a no-op for KV cache content (overwrites identical values at prompt_len-1).
+        //
+        // IMPORTANT: kv_cache.update() always writes at current_pos and increments it,
+        // ignoring start_pos (which only affects RoPE). The probe adds an extra entry
+        // at position prompt_len with RoPE for position prompt_len-1. We must restore
+        // current_pos afterwards so eviction sees the correct token count.
         if hook.needs_score_probe(kv_caches) {
+            // Save current_pos before probe (will be prompt_len)
+            let saved_positions: Vec<usize> =
+                kv_caches.iter().map(|c| c.current_pos()).collect();
+
             let last_token_id = prompt_ids[prompt_len - 1];
             // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
             unsafe {
@@ -230,6 +238,12 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                 logits_last_only: false,
                 variance_collector: None,
             })?;
+
+            // Restore current_pos: undo the probe's kv_cache.update() increment.
+            // The extra entry at position prompt_len is beyond current_pos and invisible.
+            for (cache, &pos) in kv_caches.iter_mut().zip(saved_positions.iter()) {
+                cache.set_current_pos(pos);
+            }
         }
 
         // ── post_prefill hook (eviction if cache exceeds budget) ──
