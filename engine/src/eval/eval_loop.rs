@@ -328,8 +328,11 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                     })?;
                     sp += 1;
 
-                    // post_decode_step hook (eviction / flush collection)
-                    hook.post_decode_step(kv_caches, sp, &mut qcf_metrics);
+                    // NOTE: No post_decode_step here. Eviction is done once at
+                    // post_prefill; choice continuations are short (~5-15 tokens)
+                    // and restoring the snapshot between choices handles cleanup.
+                    // Evicting during choice decode would contaminate cross-choice
+                    // comparisons (score_accumulator shared across choices).
 
                     // Read logits and accumulate NLL
                     let mut step_logits = vec![0.0f32; vocab_size];
