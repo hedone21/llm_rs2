@@ -791,11 +791,11 @@ fn run_chunked_prefill<C: KVCacheOps>(
 
     let mut start_pos = first_chunk_len;
 
-    // ── Decode remaining prompt tokens one-by-one with eviction ──
-    // Each decode step: forward one token, accumulate H2O scores, then
-    // check budget via post_decode_step (which may trigger eviction).
-    // This matches the OLD eval-ll behavior: multiple small evictions
-    // during decode, producing logits from the progressively evicted cache.
+    // ── Decode remaining prompt tokens one-by-one (no eviction during decode) ──
+    // Let KV cache grow to full prompt length so H2O scores accumulate across
+    // ALL decode steps. Eviction happens once after the loop (in post_prefill),
+    // giving H2O the full importance picture before selecting heavy hitters.
+    // This matches the OLD eval-ll behavior at 9f033a3.
     for &token_id in &prompt_ids[first_chunk_len..] {
         // SAFETY: cpu_gen_input was allocated with 4 bytes (one u32).
         unsafe {
@@ -825,11 +825,6 @@ fn run_chunked_prefill<C: KVCacheOps>(
             variance_collector: None,
         })?;
         start_pos += 1;
-
-        // Eviction if cache exceeds budget (post_decode_step handles threshold).
-        // After eviction, current_pos may decrease (compaction), but start_pos
-        // continues incrementing — RoPE position must be monotonic.
-        hook.post_decode_step(kv_caches, start_pos, qcf_metrics);
     }
 
     // Read logits from last decode step
