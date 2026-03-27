@@ -245,7 +245,7 @@ impl CacheManager {
         if eviction_result.evicted {
             // Release physical pages for unused KV buffer regions (madvise MADV_DONTNEED)
             let mut bytes_released = 0usize;
-            for cache in ctx.caches.iter() {
+            for cache in ctx.caches.iter_mut() {
                 bytes_released += cache.release_unused_pages();
             }
             self.event_sink.emit(CacheEvent::EvictionCompleted {
@@ -383,7 +383,7 @@ impl CacheManager {
         let eviction_result = Self::pipeline_results_to_eviction_result(&results, ctx.caches);
 
         if eviction_result.evicted {
-            for cache in ctx.caches.iter() {
+            for cache in ctx.caches.iter_mut() {
                 cache.release_unused_pages();
             }
             self.event_sink.emit(CacheEvent::EvictionCompleted {
@@ -451,7 +451,7 @@ impl CacheManager {
         let result = Self::run_policy_eviction(policy.as_ref(), caches, target_ratio, scores)?;
 
         if result.evicted {
-            for cache in caches.iter() {
+            for cache in caches.iter_mut() {
                 cache.release_unused_pages();
             }
             self.event_sink.emit(CacheEvent::EvictionCompleted {

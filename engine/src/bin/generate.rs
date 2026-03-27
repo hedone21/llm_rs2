@@ -1234,6 +1234,7 @@ fn main() -> anyhow::Result<()> {
         // Reset KV caches
         for cache in kv_caches.iter_mut() {
             cache.current_pos = 0;
+            cache.high_water_pos = 0;
         }
     }
 

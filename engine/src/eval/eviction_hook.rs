@@ -398,6 +398,7 @@ impl StepHook<KVCache> for EvictionHook {
     fn reset_caches(&mut self, caches: &mut [KVCache]) {
         for cache in caches.iter_mut() {
             cache.current_pos = 0;
+            cache.high_water_pos = 0;
         }
         if let Some(acc) = self.score_accumulator.as_mut() {
             acc.reset();

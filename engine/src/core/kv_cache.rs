@@ -122,6 +122,13 @@ pub struct KVCache {
     pub k_buffer: Tensor,
     pub v_buffer: Tensor,
     pub current_pos: usize,
+    /// High-water mark: the maximum `current_pos` ever reached.
+    ///
+    /// Invariant: `current_pos <= high_water_pos <= capacity`.
+    /// Used by `release_unused_pages()` to limit madvise to the
+    /// region that was actually written, avoiding spurious page faults
+    /// in the never-touched tail of the buffer.
+    pub high_water_pos: usize,
     pub max_seq_len: usize,
     capacity: usize,
     kv_heads: usize,
@@ -141,6 +148,7 @@ impl KVCache {
             k_buffer: k,
             v_buffer: v,
             current_pos: 0,
+            high_water_pos: 0,
             max_seq_len,
             capacity: max_seq_len,
             kv_heads,
@@ -166,6 +174,7 @@ impl KVCache {
             k_buffer: k,
             v_buffer: v,
             current_pos: 0,
+            high_water_pos: 0,
             max_seq_len,
             capacity: initial_capacity,
             kv_heads,
@@ -483,6 +492,7 @@ impl KVCache {
         }
 
         self.current_pos += seq_len;
+        self.high_water_pos = self.high_water_pos.max(self.current_pos);
 
         Ok(())
     }
@@ -512,6 +522,7 @@ impl KVCache {
 
         if remaining == 0 {
             self.current_pos = 0;
+            self.high_water_pos = 0;
             return Ok(());
         }
 
@@ -738,7 +749,7 @@ impl KVCache {
     /// because their physical pages are pinned by the OpenCL driver.
     ///
     /// Returns the total bytes released (page-aligned) across K and V buffers.
-    pub fn release_unused_pages(&self) -> usize {
+    pub fn release_unused_pages(&mut self) -> usize {
         // Guard: GPU-managed buffer — driver pins pages, madvise is ineffective
         if self.k_buffer.buffer().cl_mem().is_some() {
             return 0;
@@ -751,25 +762,28 @@ impl KVCache {
             _ => return 0,
         };
 
+        let hwm = self.high_water_pos;
         let mut total_released = 0usize;
 
         match self.layout {
             KVLayout::SeqMajor => {
                 // Contiguous: [pos0_all_heads | pos1_all_heads | ... | posN_all_heads]
+                // Only advise up to high_water_pos — never-touched tail pages are already free.
                 let row_bytes = self.kv_heads * self.head_dim * type_size;
                 let used_bytes = self.current_pos * row_bytes;
-                let total_bytes = self.capacity * row_bytes;
-                total_released += madvise_dontneed(self.k_buffer.as_ptr(), used_bytes, total_bytes);
-                total_released += madvise_dontneed(self.v_buffer.as_ptr(), used_bytes, total_bytes);
+                let hwm_bytes = hwm * row_bytes;
+                total_released += madvise_dontneed(self.k_buffer.as_ptr(), used_bytes, hwm_bytes);
+                total_released += madvise_dontneed(self.v_buffer.as_ptr(), used_bytes, hwm_bytes);
             }
             KVLayout::HeadMajor => {
                 // Per-head: [head0: pos0..posN | head1: pos0..posN | ...]
                 let head_stride_bytes = self.capacity * self.head_dim * type_size;
                 let used_per_head_bytes = self.current_pos * self.head_dim * type_size;
+                let hwm_per_head_bytes = hwm * self.head_dim * type_size;
                 for h in 0..self.kv_heads {
                     let base = h * head_stride_bytes;
                     let from = base + used_per_head_bytes;
-                    let to = base + head_stride_bytes;
+                    let to = base + hwm_per_head_bytes;
                     total_released += madvise_dontneed(self.k_buffer.as_ptr(), from, to);
                     total_released += madvise_dontneed(self.v_buffer.as_ptr(), from, to);
                 }
@@ -778,12 +792,17 @@ impl KVCache {
 
         if total_released > 0 {
             log::debug!(
-                "[KVCache] released {} bytes of unused pages (pos={}, cap={})",
+                "[KVCache] released {} bytes of unused pages (pos={}, hwm={}, cap={})",
                 total_released,
                 self.current_pos,
+                hwm,
                 self.capacity,
             );
         }
+
+        // After releasing, high_water_pos shrinks to current_pos.
+        // Pages between current_pos and old hwm have been advised away.
+        self.high_water_pos = self.current_pos;
 
         total_released
     }
@@ -947,6 +966,9 @@ impl KVCacheOps for KVCache {
 
     fn set_current_pos(&mut self, pos: usize) {
         self.current_pos = pos;
+        if pos == 0 {
+            self.high_water_pos = 0;
+        }
     }
 
     fn capacity(&self) -> usize {
@@ -987,6 +1009,7 @@ impl KVCacheOps for KVCache {
 
     fn advance_pos(&mut self, n: usize) {
         self.current_pos += n;
+        self.high_water_pos = self.high_water_pos.max(self.current_pos);
     }
 
     fn ensure_capacity(&mut self, min_tokens: usize) -> Result<bool> {
@@ -1469,6 +1492,7 @@ mod tests {
             k_buffer: k,
             v_buffer: v,
             current_pos: 0,
+            high_water_pos: 0,
             max_seq_len,
             capacity: max_seq_len,
             kv_heads: heads,
@@ -1503,6 +1527,7 @@ mod tests {
             k_buffer: k,
             v_buffer: v,
             current_pos: 0,
+            high_water_pos: 0,
             max_seq_len,
             capacity: initial_capacity,
             kv_heads: heads,
@@ -1965,6 +1990,7 @@ mod tests {
             k_buffer: k,
             v_buffer: v,
             current_pos: 0,
+            high_water_pos: 0,
             max_seq_len,
             capacity: max_seq_len,
             kv_heads: heads,
@@ -1995,6 +2021,7 @@ mod tests {
         // 8192 positions * 8 heads * 64 dim * 2 bytes = 8 MB per buffer
         let mut cache = make_large_f16_cache(8192, 8, 64);
         cache.current_pos = 8192;
+        cache.high_water_pos = 8192;
 
         // Touch all pages to ensure physical allocation
         let ptr = cache.k_buffer.as_mut_ptr();
@@ -2024,6 +2051,7 @@ mod tests {
         // 8192 positions * 8 heads * 64 dim * 2 bytes = 8 MB per buffer
         let mut cache = make_large_f16_headmajor_cache(8192, 8, 64);
         cache.current_pos = 8192;
+        cache.high_water_pos = 8192;
 
         // Touch all pages
         let ptr = cache.k_buffer.as_mut_ptr();
@@ -2051,6 +2079,7 @@ mod tests {
         // Allocate large cache, touch pages, then release and check RSS drops
         let mut cache = make_large_f16_cache(16384, 8, 64);
         cache.current_pos = 16384;
+        cache.high_water_pos = 16384;
 
         // Touch all pages in both K and V
         for buf_ptr in [cache.k_buffer.as_mut_ptr(), cache.v_buffer.as_mut_ptr()] {
@@ -2088,6 +2117,7 @@ mod tests {
         // After release, new data written to madvise'd region should work
         let mut cache = make_large_f16_cache(4096, 2, 64);
         cache.current_pos = 4096;
+        cache.high_water_pos = 4096;
 
         // Touch all pages
         let k_ptr = cache.k_buffer.as_mut_ptr();
@@ -2125,6 +2155,7 @@ mod tests {
     fn test_release_unused_pages_noop_on_full_cache() {
         let mut cache = make_large_f16_cache(1024, 2, 64);
         cache.current_pos = 1024; // Full cache
+        cache.high_water_pos = 1024;
         let released = cache.release_unused_pages();
         assert_eq!(released, 0, "Full cache should release 0 bytes");
     }
@@ -2133,6 +2164,7 @@ mod tests {
     fn test_release_unused_pages_noop_on_small_eviction() {
         let mut cache = make_large_f16_cache(1024, 2, 64);
         cache.current_pos = 1024;
+        cache.high_water_pos = 1024;
 
         // Touch pages
         let ptr = cache.k_buffer.as_mut_ptr();
@@ -2157,6 +2189,7 @@ mod tests {
         let cap = 4096;
         let mut cache = make_large_f16_headmajor_cache(cap, heads, dim);
         cache.current_pos = cap;
+        cache.high_water_pos = cap;
 
         let type_size = 2; // F16
         let head_stride = cap * dim * type_size;
@@ -2198,6 +2231,7 @@ mod tests {
         // Use large buffers (32 MB total) and touch both K and V for clear signal.
         let mut cache = make_large_f16_cache(16384, 8, 64);
         cache.current_pos = 16384;
+        cache.high_water_pos = 16384;
 
         // Touch all pages in both K and V buffers
         for buf_ptr in [cache.k_buffer.as_mut_ptr(), cache.v_buffer.as_mut_ptr()] {
@@ -2428,6 +2462,7 @@ mod tests {
             k_buffer: k,
             v_buffer: v,
             current_pos: cap,
+            high_water_pos: cap,
             max_seq_len: cap,
             capacity: cap,
             kv_heads: heads,
@@ -2471,5 +2506,123 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── high_water_pos tracking tests ──
+
+    /// Test that high_water_pos is correctly maintained across
+    /// update → eviction → release_unused_pages flow.
+    #[test]
+    fn test_high_water_pos_tracking() {
+        let mut cache = make_cache(100, 1, 4);
+
+        // Initially both counters are zero
+        assert_eq!(cache.current_pos, 0);
+        assert_eq!(cache.high_water_pos, 0);
+
+        // update() should advance high_water_pos monotonically
+        for i in 0..10 {
+            let (k, v) = make_token_tensor((i + 1) as f32, 1, 4);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.current_pos, 10);
+        assert_eq!(cache.high_water_pos, 10);
+
+        // Simulate eviction: current_pos drops, high_water_pos stays
+        cache.current_pos = 5;
+        assert_eq!(
+            cache.high_water_pos, 10,
+            "hwm must not decrease on eviction"
+        );
+
+        // release_unused_pages uses hwm as upper bound, then resets hwm to current_pos
+        let released = cache.release_unused_pages();
+        // Buffer is F32: 5 tokens * 1 head * 4 dim * 4 bytes = 80 bytes — below page granularity.
+        // released may be 0 due to alignment, but high_water_pos must be reset.
+        let _ = released; // don't assert bytes — page alignment makes it zero on small caches
+        assert_eq!(
+            cache.high_water_pos, 5,
+            "hwm reset to current_pos after release"
+        );
+
+        // Continuing to update advances hwm again
+        for i in 0..3 {
+            let (k, v) = make_token_tensor((100 + i) as f32, 1, 4);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.current_pos, 8);
+        assert_eq!(cache.high_water_pos, 8);
+
+        // advance_pos also tracks hwm
+        cache.advance_pos(4);
+        assert_eq!(cache.current_pos, 12);
+        assert_eq!(cache.high_water_pos, 12);
+
+        // set_current_pos(0) resets hwm
+        cache.set_current_pos(0);
+        assert_eq!(cache.high_water_pos, 0, "set_current_pos(0) must reset hwm");
+
+        // set_current_pos to a non-zero value does NOT reset hwm (only zero resets)
+        cache.current_pos = 20;
+        cache.high_water_pos = 20;
+        cache.set_current_pos(10);
+        assert_eq!(
+            cache.high_water_pos, 20,
+            "set_current_pos(non-zero) must not change hwm"
+        );
+    }
+
+    /// Test that prune_prefix(all) resets high_water_pos via the remaining==0 path.
+    #[test]
+    fn test_high_water_pos_reset_on_prune_all() {
+        let mut cache = make_cache(100, 1, 4);
+
+        for i in 0..5 {
+            let (k, v) = make_token_tensor((i + 1) as f32, 1, 4);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.high_water_pos, 5);
+
+        // prune_prefix(all) → remaining == 0 path
+        cache.prune_prefix(5).unwrap();
+        assert_eq!(cache.current_pos, 0);
+        assert_eq!(cache.high_water_pos, 0, "prune_prefix(all) must reset hwm");
+    }
+
+    /// Test that release_unused_pages with hwm as upper bound narrows the madvise range
+    /// compared to using capacity as the upper bound.
+    #[test]
+    fn test_high_water_pos_limits_madvise_range() {
+        // Large cache: 8192 positions, but only touch the first 1024 positions.
+        // high_water_pos = 1024 → madvise range is current_pos..1024 (not ..8192).
+        let mut cache = make_large_f16_cache(8192, 8, 64);
+
+        // Only touch first 1024 positions worth of pages
+        let row_bytes = 8 * 64 * 2; // heads * dim * F16
+        let touch_bytes = 1024 * row_bytes;
+        let ptr = cache.k_buffer.as_mut_ptr();
+        if !ptr.is_null() {
+            for i in (0..touch_bytes).step_by(4096) {
+                unsafe { std::ptr::write_volatile(ptr.add(i), 0xBBu8) };
+            }
+        }
+
+        // Set hwm to 1024 (matching the touched region), current_pos to 100
+        cache.current_pos = 1024;
+        cache.high_water_pos = 1024;
+        cache.current_pos = 100;
+
+        // release_unused_pages should only advise 100..1024 (not 100..8192)
+        let released = cache.release_unused_pages();
+        // Expected range: (1024 - 100) * 8 * 64 * 2 * 2 (K+V) = ~2 MB
+        // Full-capacity range would be (8192 - 100) * 8 * 64 * 2 * 2 = ~16 MB
+        // We assert > 1 MB to confirm madvise fired over meaningful range
+        assert!(
+            released > 1_000_000,
+            "Expected >1MB released (hwm-bounded), got {} bytes",
+            released
+        );
+        // And hwm must be reset to current_pos after release
+        assert_eq!(cache.high_water_pos, 100);
     }
 }
