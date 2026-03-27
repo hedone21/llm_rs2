@@ -224,6 +224,10 @@ struct Args {
     #[arg(long, default_value_t = false)]
     greedy: bool,
 
+    /// Ignore EOS token and continue generating (for long-running experiments)
+    #[arg(long, default_value_t = false)]
+    ignore_eos: bool,
+
     /// KV cache memory layout: "head" (head-major) or "seq" (seq-major)
     #[arg(long, default_value = "head")]
     kv_layout: String,
@@ -2161,7 +2165,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            if next_token_id == eos_id && std::env::var("IGNORE_EOS").is_err() {
+            if next_token_id == eos_id && !args.ignore_eos && std::env::var("IGNORE_EOS").is_err() {
                 break;
             }
         }
