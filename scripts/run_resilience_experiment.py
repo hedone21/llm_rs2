@@ -94,20 +94,28 @@ def run_experiment(
     print(f"  Completed in {elapsed:.1f}s")
 
     # Parse summary from JSONL (last line with _summary=true)
-    jsonl_path = output_path if device.is_local else f"/tmp/_resil_exp_{Path(output_path).name}"
-    if not device.is_local:
-        conn.pull(output_path, str(jsonl_path))
+    # For remote devices, pull to temp file first
+    if device.is_local:
+        jsonl_path = output_path
+    else:
+        jsonl_path = f"/tmp/_resil_exp_{Path(output_path).name}"
+        try:
+            conn.pull(output_path, jsonl_path)
+        except Exception as e:
+            print(f"  Warning: could not pull {output_path}: {e}")
+            return None
 
     try:
+        summary = None
         with open(jsonl_path) as f:
             for line in f:
                 record = json.loads(line)
                 if record.get("_summary"):
-                    return record
+                    summary = record
+        return summary
     except Exception as e:
         print(f"  Warning: could not parse summary: {e}")
-
-    return None
+        return None
 
 
 def deploy_configs(conn: Connection, device: DeviceConfig, config_paths: list[str]):
@@ -194,38 +202,34 @@ def main():
     for run_idx in range(args.runs):
         tag = f"_r{run_idx}" if args.runs > 1 else ""
 
-        # Mode A
-        out_a = f"{out_prefix}/mode_a{tag}.jsonl"
-        print(f"\n  --- Mode A (run {run_idx+1}/{args.runs}) ---")
-        summary = run_experiment(
-            conn, device, schedule_a, out_a, prompt_file,
-            args.tokens, [], args.dry_run,
-        )
-        if summary:
-            summaries["mode_a"].append(summary)
-            # Pull result to local
-            if not device.is_local:
-                conn.pull(out_a, str(output_dir / f"mode_a{tag}.jsonl"))
-
-        # Mode C
-        out_c = f"{out_prefix}/mode_c{tag}.jsonl"
-        print(f"\n  --- Mode C (run {run_idx+1}/{args.runs}) ---")
-        summary = run_experiment(
-            conn, device, schedule_c, out_c, prompt_file,
-            args.tokens, mode_c_extra, args.dry_run,
-        )
-        if summary:
-            summaries["mode_c"].append(summary)
-            if not device.is_local:
-                conn.pull(out_c, str(output_dir / f"mode_c{tag}.jsonl"))
+        for mode, schedule, extra, label in [
+            ("mode_a", schedule_a, [], "A"),
+            ("mode_c", schedule_c, mode_c_extra, "C"),
+        ]:
+            remote_out = f"{out_prefix}/{mode}{tag}.jsonl"
+            local_out = str(output_dir / f"{mode}{tag}.jsonl")
+            print(f"\n  --- Mode {label} (run {run_idx+1}/{args.runs}) ---")
+            summary = run_experiment(
+                conn, device, schedule, remote_out, prompt_file,
+                args.tokens, extra, args.dry_run,
+            )
+            # Pull from device to local results dir
+            if not args.dry_run and not device.is_local:
+                try:
+                    conn.pull(remote_out, local_out)
+                except Exception as e:
+                    print(f"  Warning: pull failed: {e}")
+            if summary:
+                summaries[mode].append(summary)
 
     if args.dry_run:
         return 0
 
-    # Analysis
+    # Analysis — compare first run of each mode
     print(f"\n[4/4] Generating comparison report...")
-    local_a = output_dir / "mode_a.jsonl"
-    local_c = output_dir / "mode_c.jsonl"
+    first_tag = "_r0" if args.runs > 1 else ""
+    local_a = output_dir / f"mode_a{first_tag}.jsonl"
+    local_c = output_dir / f"mode_c{first_tag}.jsonl"
     report_path = output_dir / "comparison.md"
 
     if local_a.exists() and local_c.exists():
@@ -237,6 +241,13 @@ def main():
             "--output", str(report_path),
         ])
         print(f"\nReport: {report_path}")
+    else:
+        missing = []
+        if not local_a.exists():
+            missing.append(str(local_a))
+        if not local_c.exists():
+            missing.append(str(local_c))
+        print(f"  Skipping comparison — missing: {', '.join(missing)}")
 
     # Print summary table
     if summaries["mode_a"] and summaries["mode_c"]:

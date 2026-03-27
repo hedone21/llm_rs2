@@ -34,7 +34,7 @@ binary_dir = "target/release"
 
 [devices.host.paths]
 work_dir = "/tmp/llm_rs2"
-model_dir = "models/llama3.2-1b"
+model_dir = "models/qwen2.5-1.5b"
 
 [devices.host.capabilities]
 arch = "x86_64"
@@ -55,7 +55,7 @@ binary_dir = "target/aarch64-linux-android/release"
 
 [devices.pixel.paths]
 work_dir = "/data/local/tmp"
-model_dir = "/data/local/tmp/models/llama3.2-1b"
+model_dir = "/data/local/tmp/models/qwen2.5-1.5b"
 eval_dir = "/data/local/tmp/llm_rs2/eval"
 lib_dir = "/data/local/tmp"
 
