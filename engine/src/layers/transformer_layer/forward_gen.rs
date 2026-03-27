@@ -231,7 +231,8 @@ impl TransformerLayer {
 
         let (k_cache, v_cache) = kv_cache.get_view();
 
-        let need_scores = args.need_scores;
+        // AWQE: cache가 attention scores를 요구하면 score 계산 강제
+        let need_scores = args.need_scores || kv_cache.needs_attn_scores();
 
         // Use dtype-aware attention for non-F32 KV caches (F16, Q4_0).
         // On OpenCL: also guard that KV buffers are actual GPU buffers (not CPU-only
@@ -732,6 +733,12 @@ impl TransformerLayer {
                 // Note: ws.out_attn is &mut Tensor, so this updates the GPU buffer contents
                 ws.out_attn = backend.copy_from(&cpu_out)?;
             }
+        }
+
+        // Store post-softmax scores for KiviCache AWQE (used during next flush).
+        {
+            let stride = ws.scores.len() / n_heads_q;
+            kv_cache.set_attn_scores(&ws.scores, n_heads_q, stride, effective_cache_len);
         }
 
         // 6. Output Projection

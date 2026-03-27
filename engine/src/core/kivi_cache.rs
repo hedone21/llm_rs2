@@ -28,6 +28,20 @@ use crate::core::tensor::Tensor;
 use anyhow::Result;
 use std::sync::Arc;
 
+/// Snapshot of post-softmax attention scores from the previous decode step.
+/// Used for AWQE (Attention-Weighted Quantization Error) during flush.
+#[derive(Clone)]
+struct AttnScoresSnapshot {
+    /// Flattened scores: [n_heads_q * stride]. Post-softmax values.
+    scores: Vec<f32>,
+    /// Number of Q heads.
+    n_heads_q: usize,
+    /// Stride between heads (= max_seq_len allocation).
+    stride: usize,
+    /// Number of valid positions per head at snapshot time.
+    valid_len: usize,
+}
+
 /// Enum wrapping different quantization bit-widths for KV cache blocks.
 #[derive(Clone)]
 enum QuantizedBlocks {
@@ -177,6 +191,11 @@ pub struct KiviCache {
     /// Accumulated flush proxy metrics (NMSE). Pushed during `flush_residual()`.
     flush_proxies: Vec<crate::core::qcf::QcfMetric>,
 
+    /// Whether AWQE computation is enabled (set via set_awqe_enabled()).
+    awqe_enabled: bool,
+    /// Attention scores from the previous decode step (for AWQE).
+    last_attn_scores: Option<AttnScoresSnapshot>,
+
     // ── GPU-native buffers (None = CPU-only mode, backward compatible) ──
     /// GPU backend handle. Some ↔ GPU mode enabled.
     gpu_backend: Option<Arc<dyn Backend>>,
@@ -256,6 +275,8 @@ impl KiviCache {
             max_seq_len,
             group_size: QKKV,
             flush_proxies: Vec::new(),
+            awqe_enabled: false,
+            last_attn_scores: None,
             // GPU fields — None in CPU-only mode
             gpu_backend: None,
             gpu_memory: None,
@@ -283,6 +304,13 @@ impl KiviCache {
     /// Take all accumulated flush proxy metrics (NMSE), draining the internal buffer.
     pub fn take_flush_proxies(&mut self) -> Vec<crate::core::qcf::QcfMetric> {
         std::mem::take(&mut self.flush_proxies)
+    }
+
+    /// Enable/disable AWQE computation during flush.
+    /// When enabled, `needs_attn_scores()` returns true, which causes
+    /// the layer to compute attention scores even on GPU attention paths.
+    pub fn set_awqe_enabled(&mut self, enabled: bool) {
+        self.awqe_enabled = enabled;
     }
 
     /// Total number of valid tokens (Q2 + residual).
@@ -448,6 +476,36 @@ impl KiviCache {
             &proxy_params,
             &qcf_config,
         ));
+
+        // AWQE: attention-weighted quantization error (V-only)
+        if let Some(ref attn) = self.last_attn_scores {
+            let gqa_group_size = if self.kv_heads > 0 {
+                attn.n_heads_q / self.kv_heads
+            } else {
+                0
+            };
+            if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
+                let awqe_params = crate::core::qcf::FlushAwqeParams {
+                    res_v: &self.res_v,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    flush_tokens,
+                    res_cap: self.res_cap,
+                    bits: self.bits,
+                    attn_scores: &attn.scores,
+                    n_heads_q: attn.n_heads_q,
+                    scores_stride: attn.stride,
+                    gqa_group_size,
+                    flush_cache_start: self.q2_tokens,
+                    scores_valid_len: attn.valid_len,
+                };
+                self.flush_proxies
+                    .push(crate::core::qcf::compute_flush_awqe(
+                        &awqe_params,
+                        &qcf_config,
+                    ));
+            }
+        }
 
         // === Key: per-channel quantization ===
         for h in 0..self.kv_heads {
@@ -757,6 +815,36 @@ impl KiviCache {
             &proxy_params,
             &qcf_config,
         ));
+
+        // AWQE (same logic as CPU flush_residual)
+        if let Some(ref attn) = self.last_attn_scores {
+            let gqa_group_size = if self.kv_heads > 0 {
+                attn.n_heads_q / self.kv_heads
+            } else {
+                0
+            };
+            if gqa_group_size > 0 && self.q2_tokens < attn.valid_len {
+                let awqe_params = crate::core::qcf::FlushAwqeParams {
+                    res_v: &self.res_v,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    flush_tokens,
+                    res_cap: self.res_cap,
+                    bits: self.bits,
+                    attn_scores: &attn.scores,
+                    n_heads_q: attn.n_heads_q,
+                    scores_stride: attn.stride,
+                    gqa_group_size,
+                    flush_cache_start: self.q2_tokens,
+                    scores_valid_len: attn.valid_len,
+                };
+                self.flush_proxies
+                    .push(crate::core::qcf::compute_flush_awqe(
+                        &awqe_params,
+                        &qcf_config,
+                    ));
+            }
+        }
 
         // 3. CPU quantize → fills self.qk / self.qv
         for h in 0..self.kv_heads {
@@ -1160,6 +1248,36 @@ impl KVCacheOps for KiviCache {
         let v_tensor = Tensor::new(shape, v_buf, backend);
 
         (k_tensor, v_tensor)
+    }
+
+    fn needs_attn_scores(&self) -> bool {
+        self.awqe_enabled
+    }
+
+    fn set_attn_scores(
+        &mut self,
+        scores: &[f32],
+        n_heads_q: usize,
+        stride: usize,
+        valid_len: usize,
+    ) {
+        if !self.awqe_enabled {
+            return;
+        }
+        let snapshot = self
+            .last_attn_scores
+            .get_or_insert_with(|| AttnScoresSnapshot {
+                scores: Vec::new(),
+                n_heads_q,
+                stride,
+                valid_len,
+            });
+        // Reuse allocation when possible
+        snapshot.scores.clear();
+        snapshot.scores.extend_from_slice(scores);
+        snapshot.n_heads_q = n_heads_q;
+        snapshot.stride = stride;
+        snapshot.valid_len = valid_len;
     }
 }
 
@@ -2037,5 +2155,140 @@ mod tests {
         );
         let (k_view, _) = cache.get_view();
         assert_eq!(k_view.shape().dims(), &[1, 33, kv_heads, head_dim]);
+    }
+
+    // ── AWQE tests ────────────────────────────────────────────────────────────
+
+    /// Test 10: awqe_enabled=false → set_attn_scores is no-op, last_attn_scores stays None.
+    #[test]
+    fn test_kivi_awqe_disabled_no_scores_stored() {
+        let mut cache = KiviCache::new(1, 32, 256, 32);
+        assert!(!cache.awqe_enabled);
+
+        // Call set_attn_scores with some data
+        let scores = vec![0.1f32; 64];
+        cache.set_attn_scores(&scores, 1, 64, 32);
+
+        // awqe_enabled=false → must not store anything
+        assert!(
+            cache.last_attn_scores.is_none(),
+            "set_attn_scores must be no-op when awqe_enabled=false"
+        );
+    }
+
+    /// Test 11: awqe_enabled=true → set_attn_scores stores scores, flush produces kivi_awqe metric.
+    #[test]
+    fn test_kivi_awqe_enabled_scores_stored() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let max_seq = 256;
+
+        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        cache.set_awqe_enabled(true);
+
+        // valid_len must cover flush tokens (q2_tokens=0 .. flush_tokens=32)
+        // So valid_len >= 32
+        let valid_len = 64usize;
+        let stride = valid_len;
+        let scores: Vec<f32> = (0..n_heads_q * stride)
+            .map(|i| {
+                if i < valid_len {
+                    1.0 / valid_len as f32
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+
+        // Store scores (simulating previous decode step)
+        cache.set_attn_scores(&scores, n_heads_q, stride, valid_len);
+        assert!(cache.last_attn_scores.is_some(), "scores must be stored");
+
+        // Insert 33 tokens to trigger one flush at the 33rd token
+        for i in 0..33 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 1.0);
+            cache.update(&k, &v).unwrap();
+        }
+
+        let proxies = cache.take_flush_proxies();
+        // Must have NMSE, OPR, and AWQE
+        let awqe_metric = proxies.iter().find(|m| m.action == "kivi_awqe");
+        assert!(
+            awqe_metric.is_some(),
+            "flush_proxies must contain 'kivi_awqe' when awqe_enabled=true and scores present; got: {:?}",
+            proxies.iter().map(|m| &m.action).collect::<Vec<_>>()
+        );
+        assert!(
+            awqe_metric.unwrap().raw_value >= 0.0,
+            "AWQE raw_value must be non-negative"
+        );
+    }
+
+    /// Test 12: awqe_enabled=true but set_attn_scores never called → no AWQE in flush_proxies.
+    #[test]
+    fn test_kivi_awqe_no_scores_no_awqe() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let res_cap = 32;
+        let max_seq = 256;
+
+        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+        cache.set_awqe_enabled(true);
+
+        // Do NOT call set_attn_scores
+        // Insert tokens to trigger a flush
+        for i in 0..33 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 1.0);
+            cache.update(&k, &v).unwrap();
+        }
+
+        let proxies = cache.take_flush_proxies();
+        let awqe_metric = proxies.iter().find(|m| m.action == "kivi_awqe");
+        assert!(
+            awqe_metric.is_none(),
+            "flush_proxies must NOT contain 'kivi_awqe' when no scores were provided; got: {:?}",
+            proxies.iter().map(|m| &m.action).collect::<Vec<_>>()
+        );
+        // But NMSE and OPR should still be present
+        assert!(
+            proxies.iter().any(|m| m.action == "kivi"),
+            "NMSE proxy must still be present"
+        );
+        assert!(
+            proxies.iter().any(|m| m.action == "kivi_opr"),
+            "OPR proxy must still be present"
+        );
+    }
+
+    /// Test 13: needs_attn_scores() mirrors awqe_enabled.
+    #[test]
+    fn test_kivi_needs_attn_scores() {
+        use crate::core::kv_cache::KVCacheOps;
+
+        let mut cache = KiviCache::new(1, 32, 256, 32);
+
+        // Default: false
+        assert!(
+            !cache.needs_attn_scores(),
+            "needs_attn_scores() must be false by default"
+        );
+
+        // After enabling
+        cache.set_awqe_enabled(true);
+        assert!(
+            cache.needs_attn_scores(),
+            "needs_attn_scores() must be true after set_awqe_enabled(true)"
+        );
+
+        // After disabling again
+        cache.set_awqe_enabled(false);
+        assert!(
+            !cache.needs_attn_scores(),
+            "needs_attn_scores() must be false after set_awqe_enabled(false)"
+        );
     }
 }

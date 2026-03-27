@@ -64,6 +64,25 @@ pub trait KVCacheOps: Send {
     fn ensure_capacity(&mut self, _min_tokens: usize) -> Result<bool> {
         Ok(false)
     }
+
+    /// Whether this cache needs post-softmax attention scores computed
+    /// during decode (even when no eviction policy requests them).
+    /// Used by KiviCache for AWQE. Default: false.
+    fn needs_attn_scores(&self) -> bool {
+        false
+    }
+
+    /// Store post-softmax attention scores from the latest decode step.
+    /// Used by KiviCache for AWQE (Attention-Weighted Quantization Error).
+    /// Called after each decode step's attention; consumed during the next flush.
+    fn set_attn_scores(
+        &mut self,
+        _scores: &[f32],
+        _n_heads_q: usize,
+        _stride: usize,
+        _valid_len: usize,
+    ) {
+    }
 }
 
 /// Extension trait for KV caches that support prefetch pipelines.

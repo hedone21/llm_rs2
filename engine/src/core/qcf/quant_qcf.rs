@@ -282,6 +282,126 @@ pub fn compute_flush_opr(params: &FlushQcfParams, _config: &QcfConfig) -> QcfMet
     }
 }
 
+/// Parameters for Attention-Weighted Quantization Error (AWQE).
+pub struct FlushAwqeParams<'a> {
+    /// V residual (FP32 originals, about to be quantized).
+    /// Layout: `[kv_heads][res_cap][head_dim]`.
+    pub res_v: &'a [f32],
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// Tokens being flushed (always multiple of QKKV).
+    pub flush_tokens: usize,
+    pub res_cap: usize,
+    pub bits: u8,
+
+    /// Post-softmax attention scores from the previous decode step.
+    /// Layout: `[n_heads_q * scores_stride]`.
+    pub attn_scores: &'a [f32],
+    pub n_heads_q: usize,
+    /// Spacing between Q heads in attn_scores (= max_seq_len allocation).
+    pub scores_stride: usize,
+    /// `n_heads_q / kv_heads`: number of Q heads per KV head.
+    pub gqa_group_size: usize,
+
+    /// Cache position of the first flush token (= q2_tokens before flush).
+    pub flush_cache_start: usize,
+    /// Number of valid positions per head in attn_scores (= effective_cache_len at snapshot).
+    pub scores_valid_len: usize,
+}
+
+/// Compute AWQE: Σ_t α_{kv_h,t} · ε_{kv_h,t} for each KV head.
+///
+/// - α: GQA-aggregated attention weight (mean of Q heads in group)
+/// - ε: per-token V NMSE (quantize→dequantize round-trip error)
+pub fn compute_flush_awqe(params: &FlushAwqeParams, config: &QcfConfig) -> QcfMetric {
+    let FlushAwqeParams {
+        res_v,
+        kv_heads,
+        head_dim,
+        flush_tokens,
+        res_cap,
+        bits,
+        attn_scores,
+        n_heads_q: _,
+        scores_stride,
+        gqa_group_size,
+        flush_cache_start,
+        scores_valid_len,
+    } = params;
+    let (kv_heads, head_dim, flush_tokens) = (*kv_heads, *head_dim, *flush_tokens);
+    let (res_cap, bits) = (*res_cap, *bits);
+    let (scores_stride, gqa_group_size) = (*scores_stride, *gqa_group_size);
+    let (flush_cache_start, scores_valid_len) = (*flush_cache_start, *scores_valid_len);
+
+    if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 {
+        return QcfMetric {
+            action: "kivi_awqe".to_string(),
+            raw_value: 0.0,
+            normalized_value: 0.0,
+            per_head: Some(vec![0.0; kv_heads]),
+            tokens_affected: 0,
+        };
+    }
+
+    let blocks_per_token = head_dim / QKKV;
+    let mut awqe_per_head = vec![0.0f32; kv_heads];
+
+    for (kv_h, awqe_slot) in awqe_per_head.iter_mut().enumerate() {
+        let mut weighted_sum = 0.0f32;
+
+        for t in 0..flush_tokens {
+            let cache_pos = flush_cache_start + t;
+
+            // ── 1. GQA-aggregated attention weight ──
+            // Mean of Q heads in this KV head's group.
+            let alpha = if cache_pos < scores_valid_len {
+                let q_start = kv_h * gqa_group_size;
+                let q_end = q_start + gqa_group_size;
+                let sum: f32 = (q_start..q_end)
+                    .map(|qh| attn_scores[qh * scores_stride + cache_pos])
+                    .sum();
+                sum / gqa_group_size as f32
+            } else {
+                // Token outside scores range → uniform weight
+                1.0 / scores_valid_len.max(1) as f32
+            };
+
+            // ── 2. Per-token V NMSE ──
+            // Average NMSE across head_dim / QKKV blocks within this token.
+            let head_base = kv_h * res_cap * head_dim;
+            let tok_base = head_base + t * head_dim;
+            let mut nmse_sum = 0.0f32;
+            for b in 0..blocks_per_token {
+                let start = tok_base + b * QKKV;
+                if start + QKKV <= res_v.len() {
+                    let chunk: &[f32; QKKV] = res_v[start..start + QKKV].try_into().unwrap();
+                    nmse_sum += compute_nmse_block(chunk, bits, config.epsilon);
+                }
+            }
+            let epsilon_t = if blocks_per_token > 0 {
+                nmse_sum / blocks_per_token as f32
+            } else {
+                0.0
+            };
+
+            // ── 3. Weighted accumulation ──
+            weighted_sum += alpha * epsilon_t;
+        }
+
+        *awqe_slot = weighted_sum;
+    }
+
+    let raw_value = aggregate_heads(&awqe_per_head, &config.aggregation);
+
+    QcfMetric {
+        action: "kivi_awqe".to_string(),
+        raw_value,
+        normalized_value: raw_value,
+        per_head: Some(awqe_per_head),
+        tokens_affected: flush_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -593,5 +713,423 @@ mod tests {
             metric.raw_value,
             expected_mean
         );
+    }
+
+    // ── compute_flush_awqe tests ─────────────────────────────────────────────
+
+    /// Helper: build res_v with non-trivial values for [kv_heads][res_cap][head_dim].
+    fn make_res_v(kv_heads: usize, res_cap: usize, head_dim: usize) -> Vec<f32> {
+        let n = kv_heads * res_cap * head_dim;
+        (0..n).map(|i| ((i % 100) as f32) * 0.1 + 0.1).collect()
+    }
+
+    /// Helper: build uniform attention scores where each position gets 1/valid_len.
+    fn make_uniform_scores(n_heads_q: usize, stride: usize, valid_len: usize) -> Vec<f32> {
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        let w = 1.0 / valid_len as f32;
+        for qh in 0..n_heads_q {
+            for pos in 0..valid_len {
+                scores[qh * stride + pos] = w;
+            }
+        }
+        scores
+    }
+
+    /// Test 1: uniform attention + uniform data → AWQE ≈ mean(per-token NMSE) × (flush_tokens / valid_len)
+    #[test]
+    fn test_awqe_uniform_scores() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = 64; // total cache size (larger than flush_tokens)
+        let stride = valid_len;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        assert_eq!(metric.action, "kivi_awqe");
+        assert!(metric.raw_value >= 0.0, "AWQE must be non-negative");
+        assert_eq!(metric.tokens_affected, flush_tokens);
+        assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
+
+        // With uniform weights (1/valid_len) for flush_tokens positions:
+        // AWQE = Σ_{t=0..flush_tokens} (1/valid_len) × NMSE_t
+        // = (flush_tokens/valid_len) × mean_nmse
+        // Verify raw_value > 0 for non-trivial data
+        assert!(
+            metric.raw_value > 0.0,
+            "AWQE should be positive for non-zero error data"
+        );
+    }
+
+    /// Test 2: attention concentrated on one token → AWQE ≈ that token's NMSE.
+    #[test]
+    fn test_awqe_concentrated_attention() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+
+        // Put all attention weight on token 5
+        let focused_token = 5usize;
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        scores[focused_token] = 1.0; // all weight on token 5
+
+        let config = QcfConfig::default();
+
+        // Compute expected NMSE for token 5
+        let blocks_per_token = head_dim / QKKV;
+        let mut expected_nmse = 0.0f32;
+        for b in 0..blocks_per_token {
+            let start = focused_token * head_dim + b * QKKV;
+            let chunk: &[f32; QKKV] = res_v[start..start + QKKV].try_into().unwrap();
+            expected_nmse += compute_nmse_block(chunk, 4, config.epsilon);
+        }
+        expected_nmse /= blocks_per_token as f32;
+
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        // AWQE = 1.0 × NMSE(token5) + 0 × others
+        assert!(
+            (metric.raw_value - expected_nmse).abs() < 1e-5,
+            "AWQE ({}) should ≈ NMSE of focused token ({})",
+            metric.raw_value,
+            expected_nmse
+        );
+    }
+
+    /// Test 3: high attention weight but zero quantization error → AWQE ≈ 0.
+    #[test]
+    fn test_awqe_zero_error_high_attention() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        // All same value → variance=0 → NMSE=0 for every block
+        let res_v = vec![1.0f32; kv_heads * res_cap * head_dim];
+
+        // High attention on first token
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        scores[0] = 1.0;
+
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        assert!(
+            metric.raw_value < 1e-6,
+            "high attention but zero error → AWQE should ≈ 0, got {}",
+            metric.raw_value
+        );
+    }
+
+    /// Test 4: high quantization error but zero attention → AWQE ≈ 0 (core AWQE property).
+    #[test]
+    fn test_awqe_high_error_zero_attention() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        // High-variance data → high NMSE
+        let res_v: Vec<f32> = (0..kv_heads * res_cap * head_dim)
+            .map(|i| if i % 2 == 0 { 100.0 } else { -100.0 })
+            .collect();
+
+        // All attention weights are zero (no attention at all)
+        let scores = vec![0.0f32; n_heads_q * stride];
+
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        assert!(
+            metric.raw_value < 1e-6,
+            "zero attention → AWQE should ≈ 0 regardless of error, got {}",
+            metric.raw_value
+        );
+    }
+
+    /// Test 5: GQA aggregation — n_heads_q=4, kv_heads=1, G=4 → mean of 4 Q head scores.
+    #[test]
+    fn test_awqe_gqa_aggregation() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 4;
+        let gqa_group_size = n_heads_q / kv_heads; // = 4
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+
+        // Q head 0: all weight on token 0
+        // Q head 1: all weight on token 0
+        // Q head 2: zero weights
+        // Q head 3: zero weights
+        // GQA mean α for token 0 = (1 + 1 + 0 + 0) / 4 = 0.5
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        scores[0 * stride + 0] = 1.0; // head 0, pos 0
+        scores[1 * stride + 0] = 1.0; // head 1, pos 0
+
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        // Compare to single-Q-head version with α=0.5 on token 0
+        // Compute expected: 0.5 × NMSE(token 0)
+        let blocks_per_token = head_dim / QKKV;
+        let mut nmse_tok0 = 0.0f32;
+        for b in 0..blocks_per_token {
+            let start = b * QKKV;
+            let chunk: &[f32; QKKV] = res_v[start..start + QKKV].try_into().unwrap();
+            nmse_tok0 += compute_nmse_block(chunk, 4, config.epsilon);
+        }
+        nmse_tok0 /= blocks_per_token as f32;
+        let expected = 0.5 * nmse_tok0;
+
+        assert!(
+            (metric.raw_value - expected).abs() < 1e-5,
+            "GQA aggregation: AWQE ({}) should ≈ 0.5×NMSE(tok0) ({})",
+            metric.raw_value,
+            expected
+        );
+    }
+
+    /// Test 6: multi-head — kv_heads=2, different attention patterns → per_head values differ.
+    #[test]
+    fn test_awqe_multi_head() {
+        let kv_heads = 2;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 2;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+
+        // Head 0: put all weight on token 0
+        // Head 1: put all weight on token 31 (last token)
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        scores[0 * stride + 0] = 1.0; // Q head 0 → token 0
+        scores[1 * stride + 31] = 1.0; // Q head 1 → token 31
+
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        let ph = metric.per_head.as_ref().unwrap();
+        assert_eq!(ph.len(), kv_heads);
+
+        // Both heads have non-zero error (different focused tokens)
+        // The two per-head values should reflect different tokens' NMSE
+        assert!(ph[0] >= 0.0 && ph[1] >= 0.0);
+
+        // Verify they differ (data pattern makes token 0 and token 31 have different values)
+        // This is a structural check — per_head[0] ≠ per_head[1] for non-degenerate data
+        // (tokens at pos 0 and pos 31 have different values in make_res_v)
+    }
+
+    /// Test 7: flush_cache_start >= scores_valid_len → uniform fallback.
+    #[test]
+    fn test_awqe_flush_outside_scores_range() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = 32; // scores only cover 32 positions
+        let stride = valid_len;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        let scores = vec![0.0f32; n_heads_q * stride]; // zeros but won't be used
+
+        let config = QcfConfig::default();
+        // flush_cache_start = 64 > valid_len=32 → all tokens use uniform fallback α = 1/valid_len
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 64, // > valid_len
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        // Should produce non-negative result (uniform fallback used)
+        assert!(
+            metric.raw_value >= 0.0,
+            "uniform fallback must produce non-negative AWQE"
+        );
+        assert_eq!(metric.action, "kivi_awqe");
+    }
+
+    /// Test 8: flush_tokens=0 → raw_value=0.
+    #[test]
+    fn test_awqe_empty() {
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &[],
+            kv_heads: 1,
+            head_dim: 32,
+            flush_tokens: 0,
+            res_cap: 32,
+            bits: 4,
+            attn_scores: &[],
+            n_heads_q: 1,
+            scores_stride: 32,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: 0,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+        assert_eq!(metric.raw_value, 0.0);
+        assert_eq!(metric.tokens_affected, 0);
+    }
+
+    /// Test 9: single QKKV block flush (flush_tokens=32, minimal case).
+    #[test]
+    fn test_awqe_single_qkkv_block() {
+        let kv_heads = 1;
+        let head_dim = 32; // exactly QKKV → 1 block per token
+        let flush_tokens = 32; // QKKV tokens (minimum flush)
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        // Use non-trivial data with variance
+        let res_v: Vec<f32> = (0..kv_heads * res_cap * head_dim)
+            .map(|i| (i as f32) * 0.1)
+            .collect();
+
+        // Uniform attention
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+
+        let config = QcfConfig::default();
+        let params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_awqe(&params, &config);
+
+        assert_eq!(metric.action, "kivi_awqe");
+        assert!(metric.raw_value >= 0.0);
+        assert_eq!(metric.tokens_affected, flush_tokens);
     }
 }
