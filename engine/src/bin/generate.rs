@@ -552,30 +552,6 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ── Offload mode: separate path with OffloadKVCache ──
-    if args.kv_offload != "none" {
-        return run_offload(
-            &model,
-            &tokenizer,
-            &backend,
-            &memory,
-            &input_ids,
-            &sampling_config,
-            kv_heads,
-            head_dim,
-            num_layers,
-            max_seq_len,
-            args.num_tokens,
-            args.gpu_attn,
-            &prompt,
-            &args.backend,
-            &args.kv_offload,
-            &args.kv_type,
-            args.max_prefetch_depth,
-            &args.offload_path,
-        );
-    }
-
     let mut kv_type = match args.kv_type.as_str() {
         "f32" => DType::F32,
         "f16" => DType::F16,
@@ -742,6 +718,32 @@ fn main() -> anyhow::Result<()> {
             args.experiment_sample_interval,
             &prompt,
             &args.backend,
+            &mut command_executor,
+        );
+    }
+
+    // ── Offload mode: separate path with OffloadKVCache ──
+    // Placed after executor creation so resilience is available in the decode loop.
+    if args.kv_offload != "none" {
+        return run_offload(
+            &model,
+            &tokenizer,
+            &backend,
+            &memory,
+            &input_ids,
+            &sampling_config,
+            kv_heads,
+            head_dim,
+            num_layers,
+            max_seq_len,
+            args.num_tokens,
+            args.gpu_attn,
+            &prompt,
+            &args.backend,
+            &args.kv_offload,
+            &args.kv_type,
+            args.max_prefetch_depth,
+            &args.offload_path,
             &mut command_executor,
         );
     }
@@ -3227,6 +3229,7 @@ fn run_offload(
     kv_type_str: &str,
     max_prefetch_depth: usize,
     offload_path: &str,
+    command_executor: &mut Option<CommandExecutor>,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
@@ -3471,6 +3474,38 @@ fn run_offload(
         )?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
+
+        // ── Offload resilience checkpoint ──
+        if let Some(executor) = command_executor.as_mut() {
+            let kv_snap = KVSnapshot {
+                total_bytes: kv_caches
+                    .iter()
+                    .map(|c| c.memory_usage_bytes() as u64)
+                    .sum(),
+                total_tokens: kv_caches[0].current_pos(),
+                capacity: kv_caches[0].capacity(),
+                protected_prefix: 0,
+                kv_dtype: kv_type_str.to_string(),
+                eviction_policy: "none".to_string(),
+                skip_ratio: 0.0,
+            };
+            let plan = executor.poll(&kv_snap);
+
+            if plan.throttle_delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            }
+            if plan.suspended {
+                eprintln!("\n[Offload-Resilience] Inference suspended by system signal");
+                break;
+            }
+            // evict, kv_quant_bits, layer_skip 등은 OffloadKVCache에서 미지원 — 무시
+            if plan.evict.is_some() {
+                eprintln!("[Offload-Resilience] KvEvict requested but OffloadKVCache has no eviction support — ignored");
+            }
+
+            executor.on_token_generated();
+        }
+        // ── End checkpoint ──
 
         start_pos += 1;
         generated_count += 1;
