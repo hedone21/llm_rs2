@@ -95,6 +95,11 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_prefill_ws: bool,
 
+    /// Chunked prefill: split long prompts into chunks to limit peak memory.
+    /// 0 = disabled (default, process entire prompt as one batch).
+    #[arg(long, default_value_t = 0)]
+    prefill_chunk_size: usize,
+
     /// Enable profiling (per-op timing, latency, score snapshots).
     #[arg(long, default_value_t = false)]
     profile: bool,
@@ -1266,63 +1271,115 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        // Create CPU tensor for input
-        let cpu_indices_buf = Galloc::new().alloc(process_len * 4, DType::U8)?;
-        unsafe {
-            let ptr = cpu_indices_buf.as_mut_ptr() as *mut u32;
-            std::ptr::copy_nonoverlapping(tokens.as_ptr(), ptr, process_len);
+        // Determine effective chunk size.
+        // 0 or >= process_len → use full prompt as single chunk (original behaviour).
+        let chunk_size = if args.prefill_chunk_size > 0 && args.prefill_chunk_size < process_len {
+            args.prefill_chunk_size
+        } else {
+            process_len
+        };
+        let chunked = chunk_size < process_len;
+        if chunked {
+            eprintln!(
+                "[Prefill] Chunked mode: {} tokens in chunks of {}",
+                process_len, chunk_size
+            );
         }
-        let cpu_input_tensor = Tensor::new(
-            Shape::new(vec![1, process_len]),
-            cpu_indices_buf,
-            Arc::new(CpuBackend::new()),
-        );
-        let input_tensor = backend.copy_from(&cpu_input_tensor)?;
 
-        let prefill_logits_buf = memory.alloc(process_len * vocab_size * 4, DType::F32)?;
-        let mut prefill_logits = Tensor::new(
-            Shape::new(vec![1, process_len, vocab_size]),
-            prefill_logits_buf,
-            backend.clone(),
-        );
+        // Reusable logits buffer: [1, 1, vocab_size] when chunked, else [1, process_len, vocab_size].
+        // Chunked mode always uses logits_last_only=true so only 1 position is written per chunk.
+        let (logits_shape, logits_buf_size) = if chunked {
+            (Shape::new(vec![1, 1, vocab_size]), vocab_size * 4)
+        } else {
+            (
+                Shape::new(vec![1, process_len, vocab_size]),
+                process_len * vocab_size * 4,
+            )
+        };
+        let prefill_logits_buf = memory.alloc(logits_buf_size, DType::F32)?;
+        let mut prefill_logits = Tensor::new(logits_shape, prefill_logits_buf, backend.clone());
 
         let prefill_timer = std::time::Instant::now();
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &input_tensor,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend: &backend,
-            memory: memory.as_ref(),
-            logits_out: &mut prefill_logits,
-            x_gen: None,
-            workspace: None,
-            use_gpu_attn: args.gpu_attn,
-            score_accumulator: None, // No score tracking during prefill
-            profiler: None,
-            skip_config: None,
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: variance_collector.as_mut(),
-        })?;
-        backend.synchronize()?;
+
+        let mut chunk_start = 0;
+        while chunk_start < process_len {
+            let chunk_end = (chunk_start + chunk_size).min(process_len);
+            let chunk_tokens = &tokens[chunk_start..chunk_end];
+            let chunk_len = chunk_tokens.len();
+
+            // Build CPU input tensor for this chunk.
+            let cpu_chunk_buf = Galloc::new().alloc(chunk_len * 4, DType::U8)?;
+            unsafe {
+                let ptr = cpu_chunk_buf.as_mut_ptr() as *mut u32;
+                std::ptr::copy_nonoverlapping(chunk_tokens.as_ptr(), ptr, chunk_len);
+            }
+            let cpu_chunk_tensor = Tensor::new(
+                Shape::new(vec![1, chunk_len]),
+                cpu_chunk_buf,
+                Arc::new(CpuBackend::new()),
+            );
+            let input_tensor = backend.copy_from(&cpu_chunk_tensor)?;
+
+            // RoPE position for this chunk: start_pos (0 during prefill) + offset within prompt.
+            let chunk_start_pos = start_pos + chunk_start;
+
+            model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: chunk_start_pos,
+                kv_caches: &mut kv_caches,
+                backend: &backend,
+                memory: memory.as_ref(),
+                logits_out: &mut prefill_logits,
+                x_gen: None,
+                workspace: None,
+                use_gpu_attn: args.gpu_attn,
+                score_accumulator: None, // No score tracking during prefill
+                profiler: None,
+                skip_config: None,
+                importance_collector: None,
+                // Chunked mode: only the last position's logits needed (saves GPU memory).
+                // Non-chunked: write all positions (original behaviour).
+                logits_last_only: chunked,
+                variance_collector: variance_collector.as_mut(),
+            })?;
+            backend.synchronize()?;
+
+            // Immediately release the GPU input buffer for this chunk.
+            drop(input_tensor);
+
+            chunk_start = chunk_end;
+        }
+
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
+
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
             cache_manager.maybe_evict(&mut kv_caches).ok();
         }
 
-        // Sample last token
-        // Read logits to CPU
-        let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
+        // Sample last token — read logits from the last chunk's output.
+        // When chunked: prefill_logits is [1,1,vocab_size], last_logits = the only row.
+        // When not chunked: prefill_logits is [1,process_len,vocab_size], take last row.
+        let mut last_logits = vec![0.0f32; vocab_size];
         unsafe {
-            let ptr = logits_cpu.as_mut_ptr() as *mut u8;
-            let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);
-            backend.read_buffer(&prefill_logits, slice)?;
+            let ptr = last_logits.as_mut_ptr() as *mut u8;
+            let byte_len = vocab_size * 4;
+            if chunked {
+                // Single-row buffer; read all of it.
+                let slice = std::slice::from_raw_parts_mut(ptr, byte_len);
+                backend.read_buffer(&prefill_logits, slice)?;
+            } else {
+                // Multi-row buffer; read only the last row.
+                // read_buffer reads from offset 0, so we read the full buffer and
+                // then take the last vocab_size elements.
+                let mut logits_cpu = vec![0.0f32; process_len * vocab_size];
+                let full_ptr = logits_cpu.as_mut_ptr() as *mut u8;
+                let full_slice = std::slice::from_raw_parts_mut(full_ptr, logits_cpu.len() * 4);
+                backend.read_buffer(&prefill_logits, full_slice)?;
+                let start_idx = (process_len - 1) * vocab_size;
+                last_logits.copy_from_slice(&logits_cpu[start_idx..start_idx + vocab_size]);
+            }
         }
-
-        // Extract last token logits
-        let start_idx = (process_len - 1) * vocab_size;
-        let mut last_logits = logits_cpu[start_idx..start_idx + vocab_size].to_vec();
 
         let next_token_id = sampling::sample(
             &mut last_logits,
