@@ -1,0 +1,5 @@
+{
+  "name": "resil-baseline",
+  "description": "Mode A: No resilience intervention — baseline measurement",
+  "directives": []
+}

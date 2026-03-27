@@ -1,0 +1,15 @@
+{
+  "name": "resil-mode-c-single",
+  "description": "Mode C: Single memory Critical at token 256 — H2O eviction (keep 50%)",
+  "directives": [
+    {
+      "at_token": 256,
+      "directive": {
+        "seq_id": 1,
+        "commands": [
+          { "type": "kv_evict_h2o", "keep_ratio": 0.50 }
+        ]
+      }
+    }
+  ]
+}

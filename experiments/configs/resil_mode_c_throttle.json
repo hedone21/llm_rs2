@@ -1,0 +1,43 @@
+{
+  "name": "resil-mode-c-throttle",
+  "description": "Mode C: Throttle + H2O eviction — simulates Warning(throttle) then Critical(eviction)",
+  "directives": [
+    {
+      "at_token": 128,
+      "directive": {
+        "seq_id": 1,
+        "commands": [
+          { "type": "throttle", "delay_ms": 50 }
+        ]
+      }
+    },
+    {
+      "at_token": 256,
+      "directive": {
+        "seq_id": 2,
+        "commands": [
+          { "type": "kv_evict_h2o", "keep_ratio": 0.50 }
+        ]
+      }
+    },
+    {
+      "at_token": 512,
+      "directive": {
+        "seq_id": 3,
+        "commands": [
+          { "type": "kv_evict_h2o", "keep_ratio": 0.50 },
+          { "type": "throttle", "delay_ms": 100 }
+        ]
+      }
+    },
+    {
+      "at_token": 768,
+      "directive": {
+        "seq_id": 4,
+        "commands": [
+          { "type": "restore_defaults" }
+        ]
+      }
+    }
+  ]
+}
