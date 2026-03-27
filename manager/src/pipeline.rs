@@ -313,7 +313,9 @@ impl PolicyStrategy for HierarchicalPolicy {
             OperatingMode::Normal => false,
             OperatingMode::Warning | OperatingMode::Critical => {
                 mode != self.prev_mode
-                    || self.pressure.any_domain_exceeds(&self.last_acted_pressure, 1.2)
+                    || self
+                        .pressure
+                        .any_domain_exceeds(&self.last_acted_pressure, 1.2)
             }
         };
 
