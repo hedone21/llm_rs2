@@ -614,3 +614,103 @@ Per-token 시간 분해 (F16, 7T):
 - **Status**: TODO
 - **Sprint**: backlog
 - **Description**: 별도 `.cl` 파일로 add_unit RMSNorm 커널 추가
+
+---
+
+# Resilience 실효성 확보 (impl-request-v13)
+
+> **목표**: On-device 실험에서 Mode A/B/C 생존율 분리를 안정적으로 재현
+> **요청 문서**: `papers/pact2026/plan/impl-request-v13.md`
+> **타겟 모델**: Qwen 2.5 1.5B (주력), Gemma 2 2B (보조)
+> **우선순위**: RESIL-1~4 (P0) → RESIL-5~6 (P0) → RESIL-7~8 (P1)
+> **의존성**: RESIL-1~4는 독립적으로 병렬 진행 가능, RESIL-5는 RESIL-1 완료 후
+
+---
+
+## [P0] RESIL-1. KVCache에 high_water_pos 추적 추가
+- **Status**: DONE
+- **Sprint**: current
+- **Dependencies**: 없음
+- **Notes**: 커밋 aefcdcb. release_unused_pages()를 &mut self로 변경, cache_manager.rs iter→iter_mut 수정.
+- **Description**: `engine/src/core/kv_cache.rs`의 `KVCache` 구조체에 `high_water_pos: usize` 필드 추가.
+  - `KVCache::new()`: `high_water_pos = 0`
+  - `append()` / `update_pos()` 등 pos 증가 경로: `high_water_pos = max(high_water_pos, current_pos)`
+  - `release_unused_pages()`: madvise 범위를 `current_pos..capacity` → `current_pos..high_water_pos`로 변경
+  - Eviction 후 (release 완료 시점): `high_water_pos = current_pos`로 리셋
+- **Acceptance Criteria**:
+  - `cargo test` 통과
+  - `test_high_water_pos_tracking` 단위 테스트: append → eviction → release 시 high_water_pos 값 검증
+  - 기존 eviction 경로 회귀 없음
+- **Notes**: 실제 해제 바이트 수는 기존과 동일. 효과는 로그 정확도 + 커널 오버헤드 감소.
+
+## [P0] RESIL-2. madvise_dontneed 로그 정확도 개선
+- **Status**: DONE
+- **Sprint**: current
+- **Dependencies**: RESIL-1 완료 후
+- **Notes**: RESIL-1에서 high_water_pos 도입으로 자동 해결. madvise 범위가 [current_pos..high_water_pos]로 정밀해져 반환값 = 실제 해제량.
+
+## [P0] RESIL-3. generate 경로 Chunked Prefill 구현
+- **Status**: DONE
+- **Sprint**: current
+- **Dependencies**: 없음
+- **Notes**: 커밋 0bc87c7. --prefill-chunk-size CLI 추가, logits_last_only=true 적용, 모든 chunk batch 처리.
+- **Description**: `generate.rs`의 PREFILL PHASE (line 1256-1344)를 chunk 단위로 분할.
+  **핵심 설계**:
+  1. `--prefill-chunk-size <N>` CLI 인자 추가 (default: 0 = 기존 동작, 전체 한 번에)
+  2. chunk_size > 0이면 프롬프트를 chunk 단위로 `forward_into()` 호출
+  3. **`logits_last_only: true`** 적용 — 각 chunk에서 마지막 토큰의 logits만 출력 (shape [1,1,vocab])
+     → logits 메모리: 기존 `process_len × vocab × 4` (~1.95 GB for Qwen) → `1 × vocab × 4` (~600 KB) 고정
+  4. 마지막 chunk의 logits로 next token sampling
+
+  **eval-ll과의 차이**: `eval_loop.rs:695`의 `run_chunked_prefill()`은 첫 chunk만 batch, 나머지는 token-by-token.
+  generate 경로에서는 **모든 chunk를 batch로** 처리 (prefill throughput 유지).
+
+  ```
+  for (i, chunk) in prompt_ids.chunks(chunk_size).enumerate() {
+      let start_pos = i * chunk_size;
+      forward_into(chunk, start_pos, kv_caches, logits_last_only=true, ...)?;
+  }
+  // 마지막 chunk의 logits로 sampling
+  ```
+- **Acceptance Criteria**:
+  - `cargo test` 통과
+  - 호스트에서 Qwen 2.5 1.5B, `--prefill-chunk-size 512`로 3K+ prompt 정상 처리
+  - `--prefill-chunk-size 0` (기본값)에서 기존 동작과 동일
+  - 피크 RSS가 기존 대비 ~1.9 GB 감소 (Qwen vocab=151936 기준)
+- **Notes**: Gemma 2 2B (vocab=256000)에서는 기존 logits가 ~3.24 GB → 더 극적인 절감
+
+## [P0] RESIL-4. Chunked Prefill 중 Resilience 폴링 (optional)
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: RESIL-3 완료 후
+- **Description**: Chunked prefill의 chunk 경계에서 `executor.poll()` 삽입.
+  resilience가 활성화된 경우에만 동작. Prefill 중 pressure 감지 → eviction 수행 가능.
+  다만 prefill 중 eviction은 아직 생성 안 된 token을 건드리지 않으므로 효과 제한적.
+  **구현 후 실험으로 유효성 평가 → 불필요하면 제거**.
+- **Acceptance Criteria**:
+  - resilience 비활성화 시 기존 동작과 동일
+  - resilience 활성화 + chunked prefill 시 poll 로그 확인
+- **Notes**: 평가 후 제거 가능. 논문 실험에서 유의미한 차이가 없으면 드롭.
+
+## [P0] RESIL-5. Model weights mmap 여부 사전 조사
+- **Status**: DONE
+- **Sprint**: current
+- **Dependencies**: 없음
+- **Description**: §1.4 방향 2 (model weights madvise) 실현 가능성 사전 조사.
+- **결론**: safetensors 원본은 file-backed mmap(`memmap2::Mmap`)이지만, 실제 추론 weights는 대부분 heap(`Vec<u8>`, SharedBuffer)에 변환 복사됨. MADV_DONTNEED 적용 불가.
+  - F16 CPU path (source=F16): MmapBuffer(file-backed) → 적용 가능하나 BF16 배포 모델에서는 비활성화
+  - Q4_0/BF16→F16/F32 변환 path: Galloc→SharedBuffer(Vec) → 적용 불가 (zero fill)
+  - 로딩 시점 원본 mmap 해제: `release_source_pages()`로 이미 구현됨 (`transformer.rs:38-57`)
+  - 근거: `transformer.rs:144-167` (mmap 열기), `193-411` (분기), `buffer/shared_buffer.rs` (Vec)
+- **Notes**: 실현하려면 SharedBuffer를 anonymous mmap으로 교체하는 아키텍처 변경 필요. 별도 impl-request 범위.
+
+## [P1] RESIL-6. run_offload()에 Resilience Executor 통합
+- **Status**: DONE
+- **Sprint**: current
+- **Dependencies**: 없음
+- **Notes**: 커밋 bdf4252. KIVI 패턴 적용: offload 분기를 executor 생성 이후로 이동, `&mut Option<CommandExecutor>` 전달. decode loop에 resilience checkpoint 삽입 (throttle, suspend 지원, evict는 경고 후 무시).
+
+## [P1] RESIL-7. Resilience 통합 sanity-check
+- **Status**: DONE
+- **Sprint**: current
+- **Notes**: cargo fmt 통과 (9558f0d), cargo clippy 기존 에러 1개 (neon.rs set_len — 변경 무관), cargo test 722/724 통과 (2 실패: macOS /proc 미지원, 변경 무관)

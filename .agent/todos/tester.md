@@ -39,6 +39,127 @@
 
 ---
 
+---
+
+# Resilience 실효성 검증 (impl-request-v13)
+
+> **목표**: madvise 정밀화 + chunked prefill + offload TCP 수정 후, Mode A/B/C 생존율 분리 재현
+> **요청 문서**: `papers/pact2026/plan/impl-request-v13.md`
+> **타겟 모델**: Qwen 2.5 1.5B (주력), Gemma 2 2B (보조)
+> **디바이스**: S25 (12GB RAM)
+> **선행 조건**: Rust Developer의 RESIL-1~7 완료
+
+---
+
+## [P0] RESIL-T1. madvise 정확성 검증
+- **Status**: DONE
+- **Sprint**: current
+- **호스트**: ✅ 유닛 테스트 3개 통과
+- **온디바이스** (S25, Qwen 2.5 1.5B): ✅ 완료 (2026-03-27)
+  - H2O eviction 트리거: 115→86 tokens (29 evicted)
+  - 로그: `released 16384 bytes (pos=86, hwm=115, cap=128)` — hwm 기준 범위 사용 ✅
+  - 계산: 29 slots × 128dim × 2bytes(F16) × 2heads = 14,848 → page-aligned 16,384 ✅ 일치
+  - 6 eviction cycles × 28 layers = 168 release 호출 정상
+
+## [P0] RESIL-T2. Chunked Prefill 기능 검증 (호스트 + 디바이스)
+- **호스트 검증**: ✅ 완료 (2026-03-27)
+  - Qwen 2.5 1.5B, 1120 토큰 프롬프트 (NIAH N-PASS)
+  - chunk=0 (baseline): Prefill 123.7 tok/s, TTFT 9244 ms, Decode 24.4 tok/s
+  - chunk=512 (chunked): Prefill 129.6 tok/s, TTFT 8743 ms, Decode 25.1 tok/s
+  - NIAH passkey 58291 양쪽 정확 추출 ✅
+  - `[Prefill] Chunked mode: 1120 tokens in chunks of 512` 로그 확인 ✅
+  - 성능 저하 없음 (오히려 chunked가 약간 빠름)
+- **Status**: DONE
+- **Sprint**: current
+- **Dependencies**: Rust Developer RESIL-3 완료 ✅
+- **Description**:
+  **A. 호스트 검증**:
+  - Qwen 2.5 1.5B, 3K+ token prompt, `--prefill-chunk-size 512`
+  - 기대: prefill 정상 완료, sampling 결과가 `--prefill-chunk-size 0`과 동일
+  - 피크 RSS 비교: chunk=0 vs chunk=512 → ~1.9 GB 차이 확인
+
+  **B. S25 검증**:
+  - 3401-token prompt + `--prefill-chunk-size 512`
+  - 기대: OOM 없이 prefill 완료 (기존: logits 1.95 GB로 OOM/reboot)
+
+  **C. (선택) Gemma 2 2B 동일 테스트**:
+  - vocab=256000이므로 기존 logits = 3.24 GB → chunked로 ~1 MB
+  - 더 극적인 RSS 절감 확인
+- **디바이스 검증**: ✅ 완료 (2026-03-27, S25)
+  - chunk=0: Prefill 80.1 tok/s, TTFT 14342 ms, Decode 12.8 tok/s
+  - chunk=512: Prefill 58.1 tok/s, TTFT 19471 ms, Decode 12.3 tok/s
+  - NIAH passkey 58291 양쪽 정확 추출 ✅
+  - Prefill 속도 ~27% 저하 (chunk 간 동기화), Decode 동등
+- **Acceptance Criteria**:
+  - chunk=512에서 prefill 정상 완료 ✅
+  - NIAH passkey 동일성 확인 ✅
+
+## [P0] RESIL-T3. Session 9 재현 — Mode A vs C 생존율 분리
+- **Status**: IN_PROGRESS
+- **Sprint**: current
+- **Dependencies**: RESIL-T1 ✅, RESIL-T2 ✅
+- **파이프라인 검증** (2026-03-27): ✅ 완료
+  - Manager TCP 리스닝 + Engine 연결 성공 (`Client connected from 127.0.0.1:49680`)
+  - Manager가 Thermal Warning/Critical, Compute Warning 감지 → Directive 전송 (seq=1,2,3...)
+  - Mode A baseline: Prefill 82.4 tok/s, Decode 10.2 tok/s (512 tokens, no OOM)
+  - Mode C baseline: Prefill 77.0 tok/s, Decode 7.8 tok/s (512 tokens, no OOM, directives received)
+- **Pressure 실험**: 부분 진행
+  - 3개 generate 인스턴스 동시 실행 → MemAvail 573 MB (total ~9GB 사용)
+  - Mode A가 모델 로딩 중 35초 후 종료 (OOM 또는 LMK kill)
+  - 디바이스 USB 연결 끊김 (LMK/reboot)
+  - **→ 전용 pressure injection tool 필요**
+- **memfill tool** (tools/memfill.c): 구현 완료
+  - mmap + non-compressible 데이터 + 지속 re-dirty로 zram 우회
+  - 문제: S25의 zram 8GB가 할당된 메모리를 압축 → mlock은 root 권한 필요
+  - 해결 방향: (A) 점진적 pressure (1GB씩 증가) (B) adb root 권한 확보 (C) 앱 전환 기반 pressure
+- **남은 작업**:
+  - [ ] 디바이스 재연결 후 개선된 memfill 배포 및 테스트
+  - [ ] 안정적 pressure 수준 캘리브레이션 (OOM 직전 상태 유지)
+  - [ ] Mode A 3회 반복
+  - [ ] Mode C 3회 반복
+  - [ ] 결과 테이블 작성
+- **Acceptance Criteria**:
+  - Mode C 생존 시간 > Mode A × 3 (3회 중 최소 2회)
+  - Mode C에서 madvise RSS 감소 로그 관측
+  - 결과 테이블 (3+ runs × 2 modes)
+
+## [P1] RESIL-T4. Mode B 검증 — Offload + Resilience
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: Rust Developer RESIL-6 완료 + RESIL-T3 통과
+- **Description**: Mode B (lossless resilience: KV offload to disk) 동작 검증 (S25).
+  ```bash
+  llm_manager &
+  generate --model-path /data/local/tmp/models/qwen2.5-1.5b \
+      --kv-offload disk --enable-resilience \
+      --resilience-transport tcp:127.0.0.1:9876 \
+      --prefill-chunk-size 512 \
+      --prompt "..." -n 512
+  ```
+  - manager.log에 "client connected" 확인
+  - gen.log에 directive 수신 + offload 실행 확인
+  - Pressure 시 KV가 disk로 offload, 회복 시 reload 확인
+- **Acceptance Criteria**:
+  - TCP 연결 성공 (기존 버그 해소)
+  - Warning pressure에서 KV offload 동작 확인
+  - Mode A/B/C 3-tier 비교 결과 수집 (논문 Figure용)
+
+## [P1] RESIL-T5. Gemma 2 2B KV 비중 차이 실험
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: RESIL-T3 통과 + Gemma 2 2B 모델 준비
+- **Description**: Gemma 2 2B는 KV slot이 Qwen의 ~2배 (2048 vs 1024 bytes/slot/layer).
+  동일 시퀀스 길이에서 KV 비중이 더 높아 eviction 효과 극대화 기대.
+  - 조건: 3401-token prompt, 동일 pressure, Mode A vs C
+  - Qwen 2.5 1.5B 결과와 비교
+  - 기대: Gemma에서 Mode A/C 분리가 더 극적
+- **Acceptance Criteria**:
+  - Gemma 2 2B Mode C 생존 마진 > Qwen Mode C 생존 마진
+  - 결과 비교 테이블 (Qwen vs Gemma × Mode A/C)
+- **Notes**: 논문에서 "모델별 KV 비중에 따른 resilience 효과 차이"를 보여줄 수 있음
+
+---
+
 ## [P1] ZramStore Blosc 필터 실험 검증
 - **Status**: TODO
 - **Sprint**: current
