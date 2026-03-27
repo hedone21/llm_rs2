@@ -30,3 +30,4 @@ benchmarks/plots/
 # Misc
 kernels/kernels
 llama.cpp-kernels/
+tools/memfill_android
