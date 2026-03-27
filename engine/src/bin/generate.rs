@@ -3500,7 +3500,9 @@ fn run_offload(
             }
             // evict, kv_quant_bits, layer_skip 등은 OffloadKVCache에서 미지원 — 무시
             if plan.evict.is_some() {
-                eprintln!("[Offload-Resilience] KvEvict requested but OffloadKVCache has no eviction support — ignored");
+                eprintln!(
+                    "[Offload-Resilience] KvEvict requested but OffloadKVCache has no eviction support — ignored"
+                );
             }
 
             executor.on_token_generated();
