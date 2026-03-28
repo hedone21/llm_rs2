@@ -109,6 +109,7 @@ impl Backend for CpuBackendNeon {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         CpuBackendCommon::new().attention_gen(
             q,
@@ -119,6 +120,7 @@ impl Backend for CpuBackendNeon {
             num_heads_kv,
             head_dim,
             cache_seq_len,
+            scores_out,
         )
     }
 }

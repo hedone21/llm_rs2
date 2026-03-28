@@ -249,7 +249,9 @@ impl TransformerLayer {
             k_cache.dtype() != DType::F32
         };
         if use_typed_attn {
-            // GPU attention or F16 KV cache - use backend's dtype-aware implementation
+            // GPU attention or F16 KV cache - use backend's dtype-aware implementation.
+            // When need_scores is true, attention_gen() writes post-softmax scores
+            // directly into ws.scores, eliminating the separate CPU score recomputation.
             backend.attention_gen(
                 &q_rope,
                 &k_cache,
@@ -259,25 +261,12 @@ impl TransformerLayer {
                 n_heads_kv,
                 head_dim,
                 effective_cache_len,
+                if need_scores {
+                    Some(&mut ws.scores)
+                } else {
+                    None
+                },
             )?;
-
-            // Separate score computation pass for non-F32 KV cache.
-            // attention_gen() does NOT write to ws.scores, so we compute
-            // Q·K^T + softmax on CPU for score accumulation.
-            if need_scores {
-                Self::compute_attention_scores(
-                    &q_rope,
-                    &k_cache,
-                    &mut ws.scores,
-                    n_heads_q,
-                    n_heads_kv,
-                    head_dim,
-                    effective_cache_len,
-                    kv_cache.layout() == KVLayout::HeadMajor,
-                    kv_cache.capacity(),
-                    backend,
-                )?;
-            }
         } else {
             // CPU attention path (Fallback for OpenCL or native CPU F32)
             let mut q_vec = Vec::new();

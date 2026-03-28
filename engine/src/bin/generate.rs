@@ -1501,10 +1501,13 @@ fn main() -> anyhow::Result<()> {
 
         // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
         // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
+        // Disable GPU plan when score accumulator is active — plan path bypasses
+        // forward_into() and doesn't collect attention scores for H2O eviction.
         #[cfg(feature = "opencl")]
         let mut gpu_plan = if backend.name() == "OpenCL"
             && !args.profile
             && !args.no_gpu_plan
+            && score_accumulator.is_none()
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)

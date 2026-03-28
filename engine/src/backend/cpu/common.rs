@@ -369,11 +369,25 @@ impl Backend for CpuBackendCommon {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         let q_data = q.as_slice::<f32>();
         let out_data = out.as_mut_slice::<f32>();
         let scale = 1.0 / (head_dim as f32).sqrt();
         let gqa_ratio = num_heads_q / num_heads_kv;
+
+        // Wrap raw pointer for Send+Sync so it can be captured by Rayon par_chunks_mut.
+        // Safety: each head h writes to non-overlapping region [h*stride .. h*stride+cache_seq_len].
+        #[derive(Clone, Copy)]
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+
+        let scores_ptr = scores_out.as_ref().map(|s| SendPtr(s.as_ptr() as *mut f32));
+        let scores_stride = scores_out
+            .as_ref()
+            .map(|s| s.len() / num_heads_q)
+            .unwrap_or(0);
 
         // Detect layout: HeadMajor [batch, kv_heads, capacity, head_dim]
         let k_shape = k_cache.shape().dims();
@@ -412,6 +426,15 @@ impl Backend for CpuBackendCommon {
                         }
                         for s in scores.iter_mut() {
                             *s /= sum_e;
+                        }
+                        if let Some(SendPtr(ptr)) = scores_ptr {
+                            unsafe {
+                                let dst = std::slice::from_raw_parts_mut(
+                                    ptr.add(h * scores_stride),
+                                    cache_seq_len,
+                                );
+                                dst.copy_from_slice(&scores[..cache_seq_len]);
+                            }
                         }
                         // weighted sum
                         for d in 0..head_dim {
@@ -520,6 +543,15 @@ impl Backend for CpuBackendCommon {
                         }
                         for s in scores.iter_mut() {
                             *s /= sum_e;
+                        }
+                        if let Some(SendPtr(ptr)) = scores_ptr {
+                            unsafe {
+                                let dst = std::slice::from_raw_parts_mut(
+                                    ptr.add(h * scores_stride),
+                                    cache_seq_len,
+                                );
+                                dst.copy_from_slice(&scores[..cache_seq_len]);
+                            }
                         }
 
                         // Weighted V sum
@@ -701,6 +733,15 @@ impl Backend for CpuBackendCommon {
                         }
                         for s in scores.iter_mut() {
                             *s /= sum_e;
+                        }
+                        if let Some(SendPtr(ptr)) = scores_ptr {
+                            unsafe {
+                                let dst = std::slice::from_raw_parts_mut(
+                                    ptr.add(h * scores_stride),
+                                    cache_seq_len,
+                                );
+                                dst.copy_from_slice(&scores[..cache_seq_len]);
+                            }
                         }
 
                         // Weighted V sum: dequantize V row, then NEON FMA

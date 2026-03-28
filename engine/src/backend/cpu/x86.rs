@@ -183,6 +183,7 @@ impl Backend for CpuBackendAVX2 {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         let q_data = q.as_slice::<f32>();
         let out_data = out.as_mut_slice::<f32>();
@@ -194,10 +195,20 @@ impl Backend for CpuBackendAVX2 {
             k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
         let capacity = if is_head_major { k_shape[2] } else { 0 };
 
+        #[derive(Clone, Copy)]
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+
         match k_cache.dtype() {
             DType::F32 => {
                 let k_data = k_cache.as_slice::<f32>();
                 let v_data = v_cache.as_slice::<f32>();
+                let scores_ptr = scores_out.as_ref().map(|s| SendPtr(s.as_ptr() as *mut f32));
+                let scores_stride = scores_out
+                    .as_ref()
+                    .map(|s| s.len() / num_heads_q)
+                    .unwrap_or(0);
                 out_data
                     .par_chunks_mut(head_dim)
                     .enumerate()
@@ -221,6 +232,17 @@ impl Backend for CpuBackendAVX2 {
                         // Inline softmax with AVX2
                         unsafe { Self::softmax_row(&mut scores) };
 
+                        // Copy softmax scores to scores_out if provided
+                        if let Some(SendPtr(ptr)) = scores_ptr {
+                            unsafe {
+                                let dst = std::slice::from_raw_parts_mut(
+                                    ptr.add(h * scores_stride),
+                                    cache_seq_len,
+                                );
+                                dst.copy_from_slice(&scores[..cache_seq_len]);
+                            }
+                        }
+
                         // Weighted V sum with AVX2
                         for d in out_h.iter_mut() {
                             *d = 0.0;
@@ -240,6 +262,11 @@ impl Backend for CpuBackendAVX2 {
             DType::F16 => {
                 let k_data = k_cache.as_slice::<half::f16>();
                 let v_data = v_cache.as_slice::<half::f16>();
+                let scores_ptr = scores_out.as_ref().map(|s| SendPtr(s.as_ptr() as *mut f32));
+                let scores_stride = scores_out
+                    .as_ref()
+                    .map(|s| s.len() / num_heads_q)
+                    .unwrap_or(0);
                 out_data
                     .par_chunks_mut(head_dim)
                     .enumerate()
@@ -268,6 +295,17 @@ impl Backend for CpuBackendAVX2 {
 
                         // Inline softmax with AVX2
                         unsafe { Self::softmax_row(&mut scores) };
+
+                        // Copy softmax scores to scores_out if provided
+                        if let Some(SendPtr(ptr)) = scores_ptr {
+                            unsafe {
+                                let dst = std::slice::from_raw_parts_mut(
+                                    ptr.add(h * scores_stride),
+                                    cache_seq_len,
+                                );
+                                dst.copy_from_slice(&scores[..cache_seq_len]);
+                            }
+                        }
 
                         // Weighted V sum: F16C + FMA
                         for d in out_h.iter_mut() {
@@ -303,6 +341,7 @@ impl Backend for CpuBackendAVX2 {
                     num_heads_kv,
                     head_dim,
                     cache_seq_len,
+                    scores_out,
                 );
             }
             _ => {
@@ -1850,6 +1889,7 @@ mod tests {
                 num_heads_kv,
                 head_dim,
                 cache_seq_len,
+                None,
             )
             .unwrap();
         avx2.attention_gen(
@@ -1861,6 +1901,7 @@ mod tests {
             num_heads_kv,
             head_dim,
             cache_seq_len,
+            None,
         )
         .unwrap();
 
@@ -1953,6 +1994,7 @@ mod tests {
                 num_heads_kv,
                 head_dim,
                 cache_seq_len,
+                None,
             )
             .unwrap();
         avx2.attention_gen(
@@ -1964,6 +2006,7 @@ mod tests {
             num_heads_kv,
             head_dim,
             cache_seq_len,
+            None,
         )
         .unwrap();
 

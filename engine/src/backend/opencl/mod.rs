@@ -1723,6 +1723,7 @@ impl Backend for OpenCLBackend {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         let q_buf =
             get_cl_mem(q.buffer().as_ref()).map_err(|_| anyhow!("Q is not OpenCL buffer"))?;
@@ -1757,29 +1758,69 @@ impl Backend for OpenCLBackend {
             _ => &kernels.kernel_attn_gen,
         };
 
+        let write_scores = scores_out.is_some() as i32;
+        let score_stride = scores_out
+            .as_ref()
+            .map(|s| (s.len() / num_heads_q) as i32)
+            .unwrap_or(0);
+
+        // Allocate GPU score buffer if needed (lazy, reused via thread-local or per-call)
+        let score_buf = if scores_out.is_some() {
+            let size = num_heads_q * score_stride as usize * std::mem::size_of::<f32>();
+            Some(unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE | ocl::core::MEM_ALLOC_HOST_PTR,
+                    num_heads_q * score_stride as usize,
+                    None,
+                )?
+            })
+        } else {
+            None
+        };
+        // Dummy buffer for when scores are not needed (kernel still expects the arg)
+        let dummy_buf = if score_buf.is_none() {
+            Some(unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    1,
+                    None,
+                )?
+            })
+        } else {
+            None
+        };
+        let s_buf = score_buf
+            .as_ref()
+            .unwrap_or_else(|| dummy_buf.as_ref().unwrap());
+
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(k_buf))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(v_buf))?;
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(o_buf))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(s_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
             ocl::core::set_kernel_arg(
                 kernel,
-                6,
+                7,
                 ocl::core::ArgVal::scalar(&(num_heads_kv as i32)),
             )?;
             ocl::core::set_kernel_arg(
                 kernel,
-                7,
+                8,
                 ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
             )?;
-            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
-            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&kv_pos_stride))?;
-            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&kv_head_stride))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&kv_pos_stride))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&kv_head_stride))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&write_scores))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&score_stride))?;
             ocl::core::set_kernel_arg(
                 kernel,
-                11,
+                14,
                 ocl::core::ArgVal::local::<f32>(&local_mem_size),
             )?;
 
@@ -1797,6 +1838,22 @@ impl Backend for OpenCLBackend {
                 None::<&mut ocl::core::Event>,
             )?;
         }
+
+        // Readback scores from GPU to CPU
+        if let (Some(scores), Some(buf)) = (scores_out, &score_buf) {
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &self.queue,
+                    buf,
+                    true, // blocking read
+                    0,
+                    scores,
+                    None::<ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }
+
         Ok(())
     }
 

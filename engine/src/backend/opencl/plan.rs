@@ -225,6 +225,8 @@ impl FullKernelPlan {
 
 /// All references needed to build a pre-bound kernel plan for one layer.
 pub struct LayerPlanConfig<'a> {
+    // Context for buffer creation
+    pub context: &'a ocl::Context,
     // Programs for kernel creation
     pub f16_program: &'a ocl::Program,
     pub simple_ops_program: &'a ocl::Program,
@@ -528,41 +530,56 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             .context("create kernel_attn_gen_half")?;
         let scale = 1.0f32 / (config.head_dim as f32).sqrt();
         let cache_seq_len_init = 0i32;
+        let write_scores = 0i32; // Plan path does not collect scores
+        let score_stride = 0i32;
+        // Dummy 1-element buffer for S (score) arg — plan path never writes scores
+        let dummy_score_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                config.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                1,
+                None,
+            )
+        }
+        .context("create dummy score buffer for plan")?;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.k_cache_buf))?;
             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.v_cache_buf))?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::mem(config.out_attn_buf))?;
+            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(&dummy_score_buf))?;
             ocl::core::set_kernel_arg(
                 &kernel,
-                4,
+                5,
                 ocl::core::ArgVal::scalar(&(config.head_dim as i32)),
             )?;
             ocl::core::set_kernel_arg(
                 &kernel,
-                5,
+                6,
                 ocl::core::ArgVal::scalar(&(config.n_heads_q as i32)),
             )?;
             ocl::core::set_kernel_arg(
                 &kernel,
-                6,
+                7,
                 ocl::core::ArgVal::scalar(&(config.n_kv_heads as i32)),
             )?;
-            ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&cache_seq_len_init))?;
-            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&cache_seq_len_init))?;
+            ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&scale))?;
             ocl::core::set_kernel_arg(
                 &kernel,
-                9,
+                10,
                 ocl::core::ArgVal::scalar(&config.kv_pos_stride),
             )?;
             ocl::core::set_kernel_arg(
                 &kernel,
-                10,
+                11,
                 ocl::core::ArgVal::scalar(&config.kv_head_stride),
             )?;
+            ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&write_scores))?;
+            ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&score_stride))?;
             ocl::core::set_kernel_arg(
                 &kernel,
-                11,
+                14,
                 ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
             )?;
         }
@@ -571,7 +588,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ndim: 1,
             global_work_size: [config.n_heads_q * local_size, 1, 1],
             local_work_size: Some([local_size, 1, 1]),
-            dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 7 }],
+            dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 8 }],
             op_tag: OpTag::Attention,
         });
     }
@@ -717,6 +734,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 
 /// Config for building the full model plan (all layers + final norm + lm_head).
 pub struct FullPlanConfig<'a> {
+    pub context: &'a ocl::Context,
     pub f16_program: &'a ocl::Program,
     pub simple_ops_program: &'a ocl::Program,
     // Per-layer weight buffers: Vec<(wq, wk, wv, wo, w_gate, w_up, w_down, attn_norm, ffn_norm)>
@@ -785,6 +803,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         .enumerate()
     {
         let layer_config = LayerPlanConfig {
+            context: config.context,
             f16_program: config.f16_program,
             simple_ops_program: config.simple_ops_program,
             x_buf: config.x_buf,

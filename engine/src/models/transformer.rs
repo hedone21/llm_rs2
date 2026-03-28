@@ -1078,6 +1078,7 @@ impl TransformerModel {
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
 
         let full_config = FullPlanConfig {
+            context: &ocl_backend.context,
             f16_program: &ocl_backend.f16_program,
             simple_ops_program: &ocl_backend.simple_ops_program,
             layer_bufs,

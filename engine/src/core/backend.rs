@@ -93,6 +93,8 @@ pub trait Backend: Send + Sync {
     // Q: [num_heads_q, head_dim]
     // K/V cache: SeqMajor [cache_seq_len, num_heads_kv, head_dim] or HeadMajor [num_heads_kv, capacity, head_dim]
     // Output: [num_heads_q, head_dim]
+    // scores_out: Optional [num_heads_q * stride] buffer for post-softmax attention scores.
+    //             stride = scores_out.len() / num_heads_q. Each head's [0..cache_seq_len] filled.
     #[allow(clippy::too_many_arguments)]
     fn attention_gen(
         &self,
@@ -104,6 +106,7 @@ pub trait Backend: Send + Sync {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         // Default CPU implementation
         let q_data = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const f32, q.size() / 4) };
@@ -124,6 +127,11 @@ pub trait Backend: Send + Sync {
         let is_head_major =
             k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
         let capacity = if is_head_major { k_shape[2] } else { 0 };
+        let scores_stride = scores_out
+            .as_ref()
+            .map(|s| s.len() / num_heads_q)
+            .unwrap_or(0);
+        let scores_ptr = scores_out.map(|s| s.as_mut_ptr());
 
         for h in 0..num_heads_q {
             let kv_h = h / gqa_ratio;
@@ -153,6 +161,15 @@ pub trait Backend: Send + Sync {
             }
             for s in scores.iter_mut() {
                 *s /= sum_exp;
+            }
+
+            // Copy scores to output buffer if requested
+            if let Some(ptr) = scores_ptr {
+                unsafe {
+                    let dst =
+                        std::slice::from_raw_parts_mut(ptr.add(h * scores_stride), cache_seq_len);
+                    dst.copy_from_slice(&scores[..cache_seq_len]);
+                }
             }
 
             // Weighted sum of V

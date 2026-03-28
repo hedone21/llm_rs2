@@ -547,6 +547,7 @@ kernel void kernel_attn_gen(
     global float * K,            // SeqMajor: [seq, kv_heads, head_dim] or HeadMajor: [kv_heads, cap, head_dim]
     global float * V,            // same layout as K
     global float * O,            // [num_heads_q, head_dim]
+    global float * S,            // score output [num_heads_q, score_stride]
     int head_dim,
     int num_heads_q,
     int num_heads_kv,
@@ -554,6 +555,8 @@ kernel void kernel_attn_gen(
     float scale,
     int kv_pos_stride,           // stride between positions (SeqMajor: kv_heads*head_dim, HeadMajor: head_dim)
     int kv_head_stride,          // stride between heads (SeqMajor: head_dim, HeadMajor: cap*head_dim)
+    int write_scores,            // 0=skip, 1=write
+    int score_stride,            // stride between heads in S
     local float * scratch        // size = local_size
 ) {
     int head_idx = get_group_id(0);    // which Q head
@@ -632,6 +635,10 @@ kernel void kernel_attn_gen(
         }
         float weight = exp(score * scale - max_score) / total_sum;
 
+        if (write_scores) {
+            S[head_idx * score_stride + t] = weight;
+        }
+
         // Accumulate V contribution
         global float * v_ptr = V + kv_base + t * kv_pos_stride;
         for (int d = 0; d < head_dim; d++) {
@@ -678,6 +685,7 @@ kernel void kernel_attn_gen_half(
     global half * K,             // SeqMajor: [seq, kv_heads, head_dim] or HeadMajor: [kv_heads, cap, head_dim]
     global half * V,             // same layout as K
     global float * O,            // [num_heads_q, head_dim]
+    global float * S,            // score output [num_heads_q, score_stride]
     int head_dim,
     int num_heads_q,
     int num_heads_kv,
@@ -685,6 +693,8 @@ kernel void kernel_attn_gen_half(
     float scale,
     int kv_pos_stride,           // stride between positions (SeqMajor: kv_heads*head_dim, HeadMajor: head_dim)
     int kv_head_stride,          // stride between heads (SeqMajor: head_dim, HeadMajor: cap*head_dim)
+    int write_scores,            // 0=skip, 1=write
+    int score_stride,            // stride between heads in S
     local float * scratch        // size = local_size
 ) {
     int head_idx = get_group_id(0);
@@ -751,6 +761,10 @@ kernel void kernel_attn_gen_half(
             score += q_ptr[d] * vload_half(d, k_ptr);
         }
         float weight = exp(score * scale - max_score) / total_sum;
+
+        if (write_scores) {
+            S[head_idx * score_stride + t] = weight;
+        }
 
         global half * v_ptr = V + kv_base + t * kv_pos_stride;
         for (int d = 0; d < head_dim; d++) {
