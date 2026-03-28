@@ -65,4 +65,8 @@ impl Buffer for OpenCLBuffer {
         self.queue.finish()?;
         Ok(())
     }
+
+    fn is_host_managed(&self) -> bool {
+        false // Device-only GPU memory
+    }
 }

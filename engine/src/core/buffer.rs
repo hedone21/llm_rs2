@@ -71,6 +71,13 @@ pub trait Buffer: Send + Sync {
     fn is_mapped(&self) -> bool {
         true
     }
+
+    /// Whether the host (app) manages the backing memory so that madvise is effective.
+    /// true: SharedBuffer, MadviseableGPUBuffer (app-managed mmap/heap)
+    /// false: UnifiedBuffer (driver-pinned), OpenCLBuffer (device-only)
+    fn is_host_managed(&self) -> bool {
+        true // default: CPU buffers are host-managed
+    }
 }
 
 #[cfg(test)]

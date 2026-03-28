@@ -616,8 +616,8 @@ fn main() -> anyhow::Result<()> {
 
     let mut kv_caches = Vec::new();
     for _ in 0..num_layers {
-        let k_buf = memory.alloc(kv_buf_size, kv_type)?;
-        let v_buf = memory.alloc(kv_buf_size, kv_type)?;
+        let k_buf = memory.alloc_kv(kv_buf_size, kv_type)?;
+        let v_buf = memory.alloc_kv(kv_buf_size, kv_type)?;
 
         let shape = if use_head_major {
             Shape::new(vec![1, kv_heads, initial_kv_capacity, head_dim])

@@ -1,4 +1,5 @@
 use super::buffer::OpenCLBuffer;
+use crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer;
 use crate::buffer::unified_buffer::UnifiedBuffer;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
@@ -54,6 +55,22 @@ impl Memory for OpenCLMemory {
         }
 
         Ok(buffer)
+    }
+
+    fn alloc_kv(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
+        if self.use_zero_copy {
+            // KV cache: host-managed memory with CL_MEM_USE_HOST_PTR.
+            // madvise works (app owns the pages), GPU accesses same physical memory (UMA).
+            let buffer: Arc<dyn Buffer> =
+                Arc::new(MadviseableGPUBuffer::new(&self.context, size, dtype)?);
+            {
+                let mut mem = self.used_memory.lock().unwrap();
+                *mem += size;
+            }
+            Ok(buffer)
+        } else {
+            self.alloc(size, dtype)
+        }
     }
 
     fn used_memory(&self) -> usize {

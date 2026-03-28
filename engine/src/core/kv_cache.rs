@@ -274,10 +274,10 @@ impl KVCache {
             KVLayout::HeadMajor => Shape::new(vec![1, self.kv_heads, new_cap, self.head_dim]),
         };
 
-        // Allocate new buffers
-        let new_k_buf = memory.alloc(buf_size, dtype)?;
+        // Allocate new buffers (alloc_kv for madvise-capable path)
+        let new_k_buf = memory.alloc_kv(buf_size, dtype)?;
         let mut new_k = Tensor::new(new_shape.clone(), new_k_buf, backend.clone());
-        let new_v_buf = memory.alloc(buf_size, dtype)?;
+        let new_v_buf = memory.alloc_kv(buf_size, dtype)?;
         let mut new_v = Tensor::new(new_shape, new_v_buf, backend.clone());
 
         // Copy existing data
@@ -750,8 +750,9 @@ impl KVCache {
     ///
     /// Returns the total bytes released (page-aligned) across K and V buffers.
     pub fn release_unused_pages(&mut self) -> usize {
-        // Guard: GPU-managed buffer — driver pins pages, madvise is ineffective
-        if self.k_buffer.buffer().cl_mem().is_some() {
+        // Guard: skip buffers where madvise is ineffective (driver-pinned GPU memory).
+        // MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR) is host-managed → madvise works.
+        if !self.k_buffer.buffer().is_host_managed() {
             return 0;
         }
 

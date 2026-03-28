@@ -196,6 +196,10 @@ impl Buffer for UnifiedBuffer {
     fn is_mapped(&self) -> bool {
         self.is_mapped.load(Ordering::Acquire)
     }
+
+    fn is_host_managed(&self) -> bool {
+        false // Driver-pinned (CL_MEM_ALLOC_HOST_PTR), madvise ineffective
+    }
 }
 
 impl Drop for UnifiedBuffer {
