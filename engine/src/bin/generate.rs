@@ -1959,6 +1959,10 @@ fn main() -> anyhow::Result<()> {
                                     pre_eviction_scores: vec![],
                                 });
                             }
+                            // Release physical pages (madvise MADV_DONTNEED)
+                            for cache in kv_caches.iter_mut() {
+                                cache.release_unused_pages();
+                            }
                             experiment_eviction_count += 1;
                             experiment_evicted_total += r.tokens_removed;
                             if let Some(acc) = score_accumulator.as_mut() {
