@@ -1960,8 +1960,15 @@ fn main() -> anyhow::Result<()> {
                                 });
                             }
                             // Release physical pages (madvise MADV_DONTNEED)
+                            let mut bytes_released = 0usize;
                             for cache in kv_caches.iter_mut() {
-                                cache.release_unused_pages();
+                                bytes_released += cache.release_unused_pages();
+                            }
+                            if bytes_released > 0 {
+                                eprintln!(
+                                    "[Resilience] Released {} MB of physical pages",
+                                    bytes_released / (1024 * 1024)
+                                );
                             }
                             experiment_eviction_count += 1;
                             experiment_evicted_total += r.tokens_removed;
@@ -2100,6 +2107,15 @@ fn main() -> anyhow::Result<()> {
                             "[Resilience] SwitchHw: no secondary backend (use --backend hybrid)"
                         );
                     }
+                }
+
+                // kv_quant_bits: not supported on F16 KVCache path
+                if let Some(bits) = plan.kv_quant_bits {
+                    eprintln!(
+                        "[Resilience] Warning: kv_quant_dynamic(bits={}) requested but KV cache is F16 (not KIVI). \
+                         Dynamic quantization requires --kv-type q2/q4. Ignoring.",
+                        bits
+                    );
                 }
 
                 throttle_delay_ms = plan.throttle_delay_ms;
@@ -2375,6 +2391,15 @@ fn plan_summary(plan: &llm_rs2::resilience::ExecutionPlan) -> Vec<String> {
     }
     if plan.resumed {
         names.push("Resume".to_string());
+    }
+    if let Some(bits) = plan.kv_quant_bits {
+        names.push(format!("KvQuant({}bit)", bits));
+    }
+    if let Some(ratio) = plan.layer_skip {
+        names.push(format!("LayerSkip({:.2})", ratio));
+    }
+    if plan.restore_defaults {
+        names.push("RestoreDefaults".to_string());
     }
     names
 }

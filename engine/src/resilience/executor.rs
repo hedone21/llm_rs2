@@ -339,7 +339,7 @@ impl CommandExecutor {
             memory_lossy_min,
             state: self.engine_state,
             tokens_generated: self.tokens_generated,
-            available_actions: Vec::new(), // Phase 3에서 동적 계산 예정
+            available_actions: Self::compute_available_actions(&eviction_policy, &kv_dtype),
             active_actions: self.active_actions.clone(),
             eviction_policy,
             kv_dtype,
@@ -347,6 +347,25 @@ impl CommandExecutor {
         };
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));
+    }
+
+    /// Compute available actions based on engine capabilities.
+    fn compute_available_actions(eviction_policy: &str, kv_dtype: &str) -> Vec<String> {
+        let mut actions = vec![
+            "throttle".to_string(),
+            "switch_hw".to_string(),
+            "layer_skip".to_string(),
+        ];
+        // Eviction actions: only if an eviction policy is configured
+        if eviction_policy != "none" {
+            actions.push("kv_evict_h2o".to_string());
+            actions.push("kv_evict_sliding".to_string());
+        }
+        // KV quantization: only available with KIVI cache (q2/q4/q8)
+        if kv_dtype.starts_with('q') {
+            actions.push("kv_quant_dynamic".to_string());
+        }
+        actions
     }
 
     /// Current engine state.
