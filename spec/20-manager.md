@@ -32,7 +32,7 @@
 | **Policy Layer** | Manager 두 번째 계층. 메인 스레드에서 PI Controller → Supervisory → Action Selector 파이프라인을 순차 실행한다. |
 | **Emitter Layer** | Manager 세 번째 계층. Policy가 생성한 EngineDirective를 Engine에 전송한다. |
 | **SystemSignal** | Monitor가 생성하는 도메인별 시스템 상태 메시지. 4종: MemoryPressure, ThermalAlert, ComputeGuidance, EnergyConstraint. |
-| **ThresholdEvaluator** | 히스테리시스 기반 임계값 평가기. 원시 측정값 → Level (Normal/Warning/Critical/Emergency) 변환. Emergency는 Monitor Layer 전용 레벨로, 극단 상황(배터리 5% 이하, 85°C 이상 등)을 PI Controller에 최대 압력(1.0)으로 전달하기 위해 존재한다. Manager의 OperatingMode에는 Emergency가 없으며, Emergency 신호는 Supervisory에서 Critical로 처리된다. |
+| **ThresholdEvaluator** | 히스테리시스 기반 임계값 평가기. 원시 측정값 → Level (Normal/Warning/Critical/Emergency) 변환. Monitor 내부의 보조 도구로, SystemSignal의 `level` 필드 산출과 D-Bus 전송 경로에 사용된다. **Policy Layer는 `level`을 사용하지 않고 raw 필드에서 직접 압력을 계산한다.** |
 | **HierarchicalPolicy** | PolicyStrategy trait 구현체. PI + Supervisory + ActionSelector + ReliefEstimator를 조합한다. |
 | **ActionRegistry** | 액션 메타데이터 저장소. 종류, 가역성, 파라미터 범위, 배타 그룹, 기본 비용을 관리한다. |
 
@@ -82,18 +82,15 @@
 
 **[MGR-016]** MemoryMonitor는 `/proc/meminfo`를 읽어 MemoryPressure 신호를 생성한다. *(MUST)*
 
-- 방향: Descending (가용 메모리가 낮을수록 위험)
-- ThresholdEvaluator 사용
-- `reclaim_target_bytes` 계산: Level별 총 메모리 대비 비율 (Normal=0, Warning=5%, Critical=10%, Emergency=20%)
-- 상태 전이 테이블 → `21-manager-state.md` MGR-067~073
+- Raw 데이터: `available_bytes`, `total_bytes`
+- `reclaim_target_bytes`: Level 보조 계산 (Normal=0, Warning=5%, Critical=10%, Emergency=20%)
+- Policy는 `available_bytes/total_bytes`에서 직접 압력을 계산한다 (MGR-ALG-013a)
 
 **[MGR-017]** ThermalMonitor는 `/sys/class/thermal/`을 읽어 ThermalAlert 신호를 생성한다. *(MUST)*
 
-- 방향: Ascending (온도가 높을수록 위험)
-- `zone_types` 필터링 적용
-- 다중 zone 중 최대 온도 기준
-- `throttle_ratio` 포함
-- 상태 전이 테이블 → `21-manager-state.md` MGR-067~073
+- Raw 데이터: `temperature_mc` (밀리섭씨), `throttle_ratio`
+- `zone_types` 필터링, 다중 zone 중 최대 온도 기준
+- Policy는 `temperature_mc`에서 직접 압력을 계산한다 (PI Controller, MGR-ALG-014)
 
 **[MGR-018]** ComputeMonitor는 `/proc/stat` CPU delta를 계산하여 ComputeGuidance 신호를 생성한다. *(MUST)*
 
@@ -103,23 +100,18 @@
 
 **[MGR-019]** EnergyMonitor는 `/sys/class/power_supply/`를 읽어 EnergyConstraint 신호를 생성한다. *(MUST)*
 
-- 방향: Descending (배터리 잔량이 낮을수록 위험)
-- 4-level: Normal, Warning, Critical, Emergency
-- `ignore_when_charging=true` 시 충전 중 항상 Normal
-- `power_budget_mw` 포함
-
-> **참고**: `01-architecture.md`의 표에는 EnergyMonitor Emergency가 명시되지 않으나, 코드에서 `emergency_pct = 5.0`으로 4-level을 모두 지원한다.
+- Raw 데이터: `battery_pct` (배터리 잔량 %), `power_budget_mw` (전력 예산)
+- `ignore_when_charging=true` 시 충전 중 신호를 발행하지 않는다
+- Policy는 `battery_pct`에서 직접 압력을 계산한다 (compute PI 보조 기여, MGR-ALG-015)
 
 **[MGR-020]** ExternalMonitor는 stdin 또는 Unix socket에서 JSON Lines로 SystemSignal을 수신한다. 연구 및 테스트 용도이다. *(MAY)*
 
-**[MGR-021]** ThresholdEvaluator는 히스테리시스 기반으로 Level을 판정한다. *(MUST)*
+**[MGR-021]** ThresholdEvaluator는 Monitor 내부의 보조 도구이다. 히스테리시스 기반으로 원시 측정값을 Level로 변환하여 SystemSignal의 `level` 필드와 `reclaim_target_bytes` 등 보조 필드를 산출한다. *(SHOULD)*
 
 - Direction: Ascending (높을수록 위험) / Descending (낮을수록 위험)
-- Thresholds: warning, critical, emergency, hysteresis
-- 에스컬레이션: 즉시 (단계 건너뛰기 가능)
-- 회복: threshold +/- hysteresis 교차 필요
 - 상태 전이 테이블 → `21-manager-state.md` MGR-067~073
-- SystemSignal 필드 정의 → `23-manager-data.md`
+
+> **설계 원칙**: Monitor의 주 책임은 raw 센서 데이터 수집과 전달이다. ThresholdEvaluator는 `level` 필드 산출을 위한 보조 도구이며, **Policy Layer는 `level`을 사용하지 않고 raw 필드(available_bytes, temperature_mc, cpu_usage_pct, battery_pct)에서 직접 압력을 계산한다.** 이 분리는 Monitor를 단순하게 유지하고, 압력 계산 전략을 Policy에서 독립적으로 교체할 수 있게 한다.
 
 **[MGR-022]** 기본 폴링 주기는 `poll_interval_ms = 1000ms`이다. Monitor별 개별 설정이 가능하다. *(SHOULD)*
 
@@ -185,26 +177,15 @@
 
 각 액션은 종류(Lossless/Lossy), 가역 여부, 파라미터 범위, 배타 그룹, 기본 비용을 메타데이터로 보유한다.
 
-**[MGR-029]** EnergyConstraint 처리 — 별도 PI 인스턴스 없이 compute PI에 반영한다. *(MUST)*
-
-EnergyConstraint 수신 시, `level_to_measurement(level)` 값에 0.5를 곱한 뒤 현재 compute pressure와 `max` 연산하여 compute PI의 floor를 설정한다:
+**[MGR-029]** EnergyConstraint 처리 — 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. raw 값(`battery_pct`)에서 직접 측정값을 산출한다. *(MUST)*
 
 ```
-measurement = level_to_measurement(level) * 0.5
-combined = max(current_compute_pressure, measurement)
+energy_measurement = clamp(1.0 - battery_pct / 100.0, 0, 1) * 0.5
+combined = max(pressure.compute, energy_measurement)
 compute_pressure = pi_compute.update(combined, dt)
 ```
 
-> **참고 (비규범)**: `level_to_measurement` 값:
->
-> | Level | measurement |
-> |-------|-------------|
-> | Normal | 0.0 |
-> | Warning | 0.55 |
-> | Critical | 0.80 |
-> | Emergency | 1.0 |
->
-> 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. (SYS-088 확장)
+> 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다. 알고리즘 상세 → `22-manager-algorithms.md` MGR-ALG-015.
 
 **[MGR-030]** Observation Window — 액션 적용 후 OBSERVATION_DELAY_SECS (3.0초) 관찰 대기를 수행한다. *(MUST)*
 

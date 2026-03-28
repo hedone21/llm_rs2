@@ -136,35 +136,33 @@ SystemSignal에서 도메인별 측정값을 추출하여 [0, 1]로 정규화한
 | MemoryPressure | `m = clamp(1 - available_bytes / total_bytes, 0, 1)` | **직접 매핑** (MGR-ALG-013a) |
 | ThermalAlert | `m = clamp(temperature_mc / 85000, 0, 1)` | PI Controller (pi_thermal) |
 | ComputeGuidance | `m = max(clamp(cpu_usage_pct/100, 0, 1), clamp(gpu_usage_pct/100, 0, 1))` | PI Controller (pi_compute) |
-| EnergyConstraint | MGR-ALG-015 참조 | pi_compute |
+| EnergyConstraint | `m = clamp(1 - battery_pct / 100, 0, 1)` | compute PI 보조 (MGR-ALG-015) |
 
 - total_bytes = 0 인 경우 m = 0 (방어적 처리).
 - Thermal 정규화 기준: 85000 mc (85 C) = 1.0.
 - Compute: CPU와 GPU 사용률 중 최대값.
 
-#### MGR-ALG-015: EnergyConstraint Max-Floor Processing
+#### MGR-ALG-015: EnergyConstraint Raw Processing
 
-EnergyConstraint는 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. *(MUST)*
+EnergyConstraint는 별도 PI 인스턴스 없이 compute PI에 보조 기여한다. **level이 아닌 raw 값(battery_pct)에서 직접 측정값을 산출한다.** *(MUST)*
 
 ```
-PRE:  level in {Normal, Warning, Critical, Emergency}
+PRE:  battery_pct in [0, 100] (EnergyConstraint raw 필드)
 POST: compute pressure 갱신
 
-energy_measurement = level_to_measurement(level) * 0.5
+energy_measurement = clamp(1.0 - battery_pct / 100.0, 0, 1) * 0.5
 combined = max(pressure.compute, energy_measurement)
 compute_pressure = pi_compute.update(combined, dt)
 ```
 
-level_to_measurement 매핑:
+| battery_pct | energy_measurement | 의미 |
+|-------------|-------------------|------|
+| 100% | 0.0 | 배터리 완충, compute 영향 없음 |
+| 70% | 0.15 | 정상 사용 |
+| 30% | 0.35 | 배터리 부족, compute floor 상승 |
+| 5% | 0.475 | 극단 부족, compute 강한 제약 |
 
-| Level | measurement |
-|-------|-------------|
-| Normal | 0.0 |
-| Warning | 0.55 |
-| Critical | 0.80 |
-| Emergency | 1.0 |
-
-> **Rationale (non-normative)**: 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다.
+> **설계 원칙**: Monitor는 raw 데이터만 전달하고, Policy가 raw 값에서 직접 압력을 계산한다. 이전 설계에서 사용하던 `level_to_measurement(level)` 경로는 폐기한다. 전력 상태의 시간 스케일(분~시간)이 PI의 초 단위 제어와 상이하므로 별도 도메인 대신 compute 보조 신호로 반영한다. 0.5 가중치는 energy가 compute를 과도하게 지배하지 않도록 한다.
 
 #### MGR-ALG-016: Elapsed dt Calculation
 
