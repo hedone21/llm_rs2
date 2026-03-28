@@ -915,7 +915,11 @@ fn main() -> anyhow::Result<()> {
             )
         };
         let mut acc = acc;
-        acc.set_active(true);
+        // Start inactive when resilience-only (no eviction policy).
+        // Activated on-demand when eviction is requested.
+        // When an eviction policy is configured, always active (non-resilience eviction).
+        let start_active = args.eviction_policy != "none";
+        acc.set_active(start_active);
         acc.set_time_normalize(!args.h2o_raw_scores);
         Some(acc)
     } else {
@@ -1854,6 +1858,15 @@ fn main() -> anyhow::Result<()> {
 
                 let plan = executor.poll(&kv_snap);
                 action_names = plan_summary(&plan);
+
+                // Activate score collection on-demand: only when eviction is
+                // requested or imminent. Avoids GPU score readback overhead
+                // (~129ms/token) during Normal operation.
+                if let Some(ref mut acc) = score_accumulator {
+                    if !acc.is_active() && plan.evict.is_some() {
+                        acc.set_active(true);
+                    }
+                }
 
                 if let Some(evict) = &plan.evict {
                     let effective_ratio =

@@ -357,6 +357,98 @@ impl KVCache {
         Ok(())
     }
 
+    /// Shrink the KV cache buffers to fit `current_pos`, releasing excess memory.
+    /// This is the inverse of `grow()` — reallocates smaller buffers and copies data.
+    /// Returns the number of bytes freed.
+    pub fn shrink_to_fit(&mut self) -> Result<usize> {
+        let memory = match self.memory.as_ref() {
+            Some(m) => m,
+            None => return Ok(0),
+        };
+
+        // Only shrink if using less than half capacity (avoid thrashing)
+        let new_cap = self.current_pos.next_power_of_two().max(64);
+        if new_cap >= self.capacity {
+            return Ok(0);
+        }
+
+        let dtype = self.k_buffer.dtype();
+        let backend = self.k_buffer.backend().clone();
+
+        let n_values = new_cap * self.kv_heads * self.head_dim;
+        let buf_size = match dtype {
+            crate::core::buffer::DType::Q4_0 => {
+                (n_values / crate::core::quant::QK4_0)
+                    * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            }
+            _ => n_values * dtype.size(),
+        };
+
+        let old_n_values = self.capacity * self.kv_heads * self.head_dim;
+        let old_buf_size = match dtype {
+            crate::core::buffer::DType::Q4_0 => {
+                (old_n_values / crate::core::quant::QK4_0)
+                    * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            }
+            _ => old_n_values * dtype.size(),
+        };
+
+        let new_shape = match self.layout {
+            KVLayout::SeqMajor => Shape::new(vec![1, new_cap, self.kv_heads, self.head_dim]),
+            KVLayout::HeadMajor => Shape::new(vec![1, self.kv_heads, new_cap, self.head_dim]),
+        };
+
+        let new_k_buf = memory.alloc_kv(buf_size, dtype)?;
+        let mut new_k = Tensor::new(new_shape.clone(), new_k_buf, backend.clone());
+        let new_v_buf = memory.alloc_kv(buf_size, dtype)?;
+        let mut new_v = Tensor::new(new_shape, new_v_buf, backend.clone());
+
+        // Copy existing data (same logic as grow())
+        if self.current_pos > 0 {
+            match self.layout {
+                KVLayout::SeqMajor => {
+                    let copy_count = self.current_pos * self.kv_heads * self.head_dim;
+                    backend.copy_slice(&self.k_buffer, &mut new_k, 0, 0, copy_count)?;
+                    backend.copy_slice(&self.v_buffer, &mut new_v, 0, 0, copy_count)?;
+                }
+                KVLayout::HeadMajor => {
+                    let old_head_stride = self.capacity * self.head_dim;
+                    let new_head_stride = new_cap * self.head_dim;
+                    let copy_per_head = self.current_pos * self.head_dim;
+                    for h in 0..self.kv_heads {
+                        backend.copy_slice(
+                            &self.k_buffer,
+                            &mut new_k,
+                            h * old_head_stride,
+                            h * new_head_stride,
+                            copy_per_head,
+                        )?;
+                        backend.copy_slice(
+                            &self.v_buffer,
+                            &mut new_v,
+                            h * old_head_stride,
+                            h * new_head_stride,
+                            copy_per_head,
+                        )?;
+                    }
+                }
+            }
+        }
+
+        let freed = old_buf_size.saturating_sub(buf_size) * 2; // K + V
+        eprintln!(
+            "[KVCache] Shrunk capacity: {} → {} tokens (freed {} bytes)",
+            self.capacity, new_cap, freed
+        );
+
+        self.k_buffer = new_k;
+        self.v_buffer = new_v;
+        self.capacity = new_cap;
+        self.high_water_pos = self.current_pos;
+
+        Ok(freed)
+    }
+
     /// Append new K/V data to the cache.
     ///
     /// Input tensors are always seq-major `[batch, seq_len, kv_heads, head_dim]`
@@ -750,8 +842,17 @@ impl KVCache {
     ///
     /// Returns the total bytes released (page-aligned) across K and V buffers.
     pub fn release_unused_pages(&mut self) -> usize {
-        // Guard: skip buffers where madvise is ineffective (driver-pinned GPU memory).
-        // MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR) is host-managed → madvise works.
+        // Shrink buffers when significantly underutilized (works for any buffer type).
+        // Reallocates smaller buffers, guaranteeing physical memory release.
+        if self.memory.is_some() && self.current_pos < self.capacity / 2 {
+            return self.shrink_to_fit().unwrap_or_else(|e| {
+                eprintln!("[KVCache] shrink_to_fit failed: {}", e);
+                0
+            });
+        }
+
+        // madvise path: only for host-managed buffers (SharedBuffer, MadviseableGPUBuffer).
+        // GPU-managed buffers (UnifiedBuffer with CL_MEM_ALLOC_HOST_PTR) are driver-pinned.
         if !self.k_buffer.buffer().is_host_managed() {
             return 0;
         }
@@ -759,7 +860,6 @@ impl KVCache {
         let type_size = match self.k_buffer.dtype() {
             DType::F16 => 2,
             DType::F32 => 4,
-            // Q4_0/Q4_1: block-quantized layout, skip for now (F16-only KV cache in practice)
             _ => return 0,
         };
 
