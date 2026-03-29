@@ -2008,6 +2008,7 @@ fn main() -> anyhow::Result<()> {
                             experiment_evicted_total += r.tokens_removed;
                             if let Some(acc) = score_accumulator.as_mut() {
                                 acc.reset();
+                                acc.set_active(false);
                             }
                         }
                         Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
