@@ -698,7 +698,17 @@ fn main() -> anyhow::Result<()> {
 
     // ── KIVI mode: separate path with KiviCache ──
     // Placed after executor creation so resilience is available in the token loop.
-    if args.kivi {
+    if args.kivi || args.enable_resilience {
+        // KIVI mode: --kivi starts at Q2, --enable-resilience starts at bits=16
+        // (F16-equivalent) and allows dynamic transition via kv_quant_dynamic.
+        let initial_bits: u8 = if args.kivi { 2 } else { 16 };
+        let residual_size = if initial_bits == 16 {
+            // bits=16: all tokens stay in residual (no quantization flush)
+            // Round down to QKKV (32) multiple for KiviCache alignment
+            (max_seq_len / 32) * 32
+        } else {
+            args.kivi_residual_size
+        };
         return run_kivi(
             &model,
             &tokenizer,
@@ -710,7 +720,7 @@ fn main() -> anyhow::Result<()> {
             head_dim,
             num_layers,
             max_seq_len,
-            args.kivi_residual_size,
+            residual_size,
             args.num_tokens,
             args.gpu_attn,
             args.experiment_output.as_deref(),
@@ -719,6 +729,7 @@ fn main() -> anyhow::Result<()> {
             &prompt,
             &args.backend,
             &mut command_executor,
+            initial_bits,
         );
     }
 
@@ -2816,6 +2827,7 @@ fn run_kivi_ppl(
 // ── KIVI mode: KiviCache-based inference ────────────────────────────────────
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn run_kivi(
     model: &TransformerModel,
     tokenizer: &Tokenizer,
@@ -2836,12 +2848,13 @@ fn run_kivi(
     prompt: &str,
     backend_name: &str,
     command_executor: &mut Option<llm_rs2::resilience::CommandExecutor>,
+    initial_bits: u8,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
     println!(
-        "[KIVI] Q2 KV cache enabled — residual_size={}, max_seq_len={}",
-        residual_size, max_seq_len
+        "[KIVI] KV cache enabled — bits={}, residual_size={}, max_seq_len={}",
+        initial_bits, residual_size, max_seq_len
     );
 
     // Experiment infrastructure
@@ -2865,7 +2878,7 @@ fn run_kivi(
                 head_dim,
                 max_seq_len,
                 residual_size,
-                2,
+                initial_bits,
                 backend.clone(),
                 memory.clone(),
             )
@@ -3062,6 +3075,7 @@ fn run_kivi(
         if let Some(executor) = command_executor.as_mut() {
             let current_bits = kv_caches[0].bits();
             let kv_dtype = match current_bits {
+                16 => "f16".to_string(),
                 8 => "q8".to_string(),
                 4 => "q4".to_string(),
                 2 => "q2".to_string(),

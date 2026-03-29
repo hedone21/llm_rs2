@@ -45,6 +45,7 @@ struct AttnScoresSnapshot {
 /// Enum wrapping different quantization bit-widths for KV cache blocks.
 #[derive(Clone)]
 enum QuantizedBlocks {
+    Unquantized, // bits=16: residual-only mode, no quantized data
     Q2(Vec<BlockQ2_0>),
     Q4(Vec<BlockKVQ4>),
     Q8(Vec<BlockKVQ8>),
@@ -53,6 +54,7 @@ enum QuantizedBlocks {
 impl QuantizedBlocks {
     fn new(bits: u8) -> Self {
         match bits {
+            16 => QuantizedBlocks::Unquantized,
             2 => QuantizedBlocks::Q2(Vec::new()),
             4 => QuantizedBlocks::Q4(Vec::new()),
             8 => QuantizedBlocks::Q8(Vec::new()),
@@ -62,6 +64,7 @@ impl QuantizedBlocks {
 
     fn with_capacity(bits: u8, cap: usize) -> Self {
         match bits {
+            16 => QuantizedBlocks::Unquantized,
             2 => QuantizedBlocks::Q2(Vec::with_capacity(cap)),
             4 => QuantizedBlocks::Q4(Vec::with_capacity(cap)),
             8 => QuantizedBlocks::Q8(Vec::with_capacity(cap)),
@@ -71,6 +74,7 @@ impl QuantizedBlocks {
 
     fn clear(&mut self) {
         match self {
+            QuantizedBlocks::Unquantized => {}
             QuantizedBlocks::Q2(v) => v.clear(),
             QuantizedBlocks::Q4(v) => v.clear(),
             QuantizedBlocks::Q8(v) => v.clear(),
@@ -80,6 +84,7 @@ impl QuantizedBlocks {
     #[allow(dead_code)]
     fn len(&self) -> usize {
         match self {
+            QuantizedBlocks::Unquantized => 0,
             QuantizedBlocks::Q2(v) => v.len(),
             QuantizedBlocks::Q4(v) => v.len(),
             QuantizedBlocks::Q8(v) => v.len(),
@@ -88,6 +93,7 @@ impl QuantizedBlocks {
 
     fn memory_bytes(&self) -> usize {
         match self {
+            QuantizedBlocks::Unquantized => 0,
             QuantizedBlocks::Q2(v) => v.len() * std::mem::size_of::<BlockQ2_0>(),
             QuantizedBlocks::Q4(v) => v.len() * std::mem::size_of::<BlockKVQ4>(),
             QuantizedBlocks::Q8(v) => v.len() * std::mem::size_of::<BlockKVQ8>(),
@@ -97,6 +103,7 @@ impl QuantizedBlocks {
     /// Quantize a group of QKKV f32 values and push to storage.
     fn push_quantized(&mut self, src: &[f32; QKKV]) {
         match self {
+            QuantizedBlocks::Unquantized => panic!("push_quantized called on Unquantized"),
             QuantizedBlocks::Q2(v) => v.push(BlockQ2_0::quantize(src)),
             QuantizedBlocks::Q4(v) => v.push(BlockKVQ4::quantize(src)),
             QuantizedBlocks::Q8(v) => v.push(BlockKVQ8::quantize(src)),
@@ -106,6 +113,7 @@ impl QuantizedBlocks {
     /// Dequantize block at given index into output buffer.
     fn dequantize_block(&self, idx: usize, out: &mut [f32; QKKV]) {
         match self {
+            QuantizedBlocks::Unquantized => panic!("dequantize_block called on Unquantized"),
             QuantizedBlocks::Q2(v) => v[idx].dequantize(out),
             QuantizedBlocks::Q4(v) => v[idx].dequantize(out),
             QuantizedBlocks::Q8(v) => v[idx].dequantize(out),
@@ -115,6 +123,7 @@ impl QuantizedBlocks {
     #[allow(dead_code)]
     fn capacity(&self) -> usize {
         match self {
+            QuantizedBlocks::Unquantized => 0,
             QuantizedBlocks::Q2(v) => v.capacity(),
             QuantizedBlocks::Q4(v) => v.capacity(),
             QuantizedBlocks::Q8(v) => v.capacity(),
@@ -124,6 +133,7 @@ impl QuantizedBlocks {
     #[allow(dead_code)]
     fn bits(&self) -> u8 {
         match self {
+            QuantizedBlocks::Unquantized => 16,
             QuantizedBlocks::Q2(_) => 2,
             QuantizedBlocks::Q4(_) => 4,
             QuantizedBlocks::Q8(_) => 8,
@@ -226,8 +236,10 @@ impl KiviCache {
     /// - `kv_heads`: number of KV heads
     /// - `head_dim`: dimension per head (must be a multiple of QKKV)
     /// - `max_seq_len`: maximum sequence length
-    /// - `residual_size`: FP32 residual buffer size in tokens (must be a multiple of QKKV)
-    /// - `bits`: quantization bits (2, 4, or 8). Default: 2.
+    /// - `residual_size`: FP32 residual buffer size in tokens (must be a multiple of QKKV).
+    ///   For bits=16, the residual buffer is sized to `max_seq_len` regardless of this value.
+    /// - `bits`: quantization bits (2, 4, 8, or 16). Default: 2.
+    ///   bits=16 means unquantized/residual-only mode: all tokens are kept in FP32.
     pub fn new_with_bits(
         kv_heads: usize,
         head_dim: usize,
@@ -244,11 +256,18 @@ impl KiviCache {
             "head_dim ({head_dim}) must be a multiple of {QKKV}"
         );
         assert!(
-            bits == 2 || bits == 4 || bits == 8,
-            "bits must be 2, 4, or 8, got {bits}"
+            bits == 2 || bits == 4 || bits == 8 || bits == 16,
+            "bits must be 2, 4, 8, or 16, got {bits}"
         );
 
-        let res_elems = kv_heads * residual_size * head_dim;
+        // bits=16: residual covers the full sequence (no quantized storage needed)
+        let actual_res_cap = if bits == 16 {
+            max_seq_len
+        } else {
+            residual_size
+        };
+        let res_elems = kv_heads * actual_res_cap * head_dim;
+
         let groups_per_flush = residual_size / QKKV;
         let max_flushes = max_seq_len / residual_size;
         let max_k_blocks = max_flushes * groups_per_flush * kv_heads * head_dim;
@@ -265,7 +284,7 @@ impl KiviCache {
             res_k: vec![0.0; res_elems],
             res_v: vec![0.0; res_elems],
             res_pos: 0,
-            res_cap: residual_size,
+            res_cap: actual_res_cap,
             attn_k_buf: vec![0.0; attn_buf_size],
             attn_v_buf: vec![0.0; attn_buf_size],
             q2_deq_tokens: 0,
@@ -444,6 +463,10 @@ impl KiviCache {
     /// Value quantization: per-token (for each head, each token's `head_dim`
     /// values are quantized in groups of QKKV).
     fn flush_residual(&mut self) {
+        if self.bits == 16 {
+            // bits=16: residual-only mode, no quantization
+            return;
+        }
         let gs = self.group_size; // = QKKV
         assert!(self.res_pos >= gs, "not enough tokens to flush");
         debug_assert!(
@@ -559,14 +582,103 @@ impl KiviCache {
     ///
     /// Dequantizes existing blocks to FP32, then re-quantizes at the new bit-width.
     /// Error accumulates through the dequant→requant cycle.
+    ///
+    /// Supports transitions to/from bits=16 (unquantized/residual-only mode).
     pub fn transition_bits(&mut self, new_bits: u8) -> Result<()> {
         assert!(
-            new_bits == 2 || new_bits == 4 || new_bits == 8,
-            "bits must be 2, 4, or 8, got {new_bits}"
+            new_bits == 2 || new_bits == 4 || new_bits == 8 || new_bits == 16,
+            "bits must be 2, 4, 8, or 16, got {new_bits}"
+        );
+        assert!(
+            self.bits == 2 || self.bits == 4 || self.bits == 8 || self.bits == 16,
+            "current bits must be 2, 4, 8, or 16, got {}",
+            self.bits
         );
         if new_bits == self.bits {
             return Ok(());
         }
+
+        // ── 2/4/8 → 16: restore to unquantized residual-only mode ──────────
+        if new_bits == 16 {
+            // Populate attn_k_buf / attn_v_buf with all tokens (Q + residual)
+            self.assemble_view();
+
+            let total_tokens = self.q2_tokens + self.res_pos;
+            let new_res_cap = self.max_seq_len;
+            let new_elems = self.kv_heads * new_res_cap * self.head_dim;
+
+            // Expand residual buffers to max_seq_len capacity
+            self.res_k.resize(new_elems, 0.0);
+            self.res_v.resize(new_elems, 0.0);
+
+            // Copy from attn buffers (SeqMajor) into expanded residual (HeadMajor)
+            for h in 0..self.kv_heads {
+                let res_base = h * new_res_cap * self.head_dim;
+                for t in 0..total_tokens {
+                    let attn_idx = t * self.kv_heads * self.head_dim + h * self.head_dim;
+                    let res_idx = res_base + t * self.head_dim;
+                    self.res_k[res_idx..res_idx + self.head_dim]
+                        .copy_from_slice(&self.attn_k_buf[attn_idx..attn_idx + self.head_dim]);
+                    self.res_v[res_idx..res_idx + self.head_dim]
+                        .copy_from_slice(&self.attn_v_buf[attn_idx..attn_idx + self.head_dim]);
+                }
+            }
+
+            self.res_pos = total_tokens;
+            self.res_cap = new_res_cap;
+            self.q2_tokens = 0;
+            self.q2_deq_tokens = 0;
+            self.bits = 16;
+            self.qk = QuantizedBlocks::Unquantized;
+            self.qv = QuantizedBlocks::Unquantized;
+            return Ok(());
+        }
+
+        // ── 16 → 2/4/8: quantize all residual data ──────────────────────────
+        if self.bits == 16 {
+            // Switch to target bit-width so flush_residual() uses correct format
+            self.bits = new_bits;
+            self.qk = QuantizedBlocks::new(new_bits);
+            self.qv = QuantizedBlocks::new(new_bits);
+
+            // Flush as many full groups as possible from residual
+            if self.res_pos >= self.group_size {
+                self.flush_residual();
+            }
+
+            // Compact remaining residual data from HeadMajor[old_res_cap] → HeadMajor[new_res_cap]
+            // Before: res_k layout is [kv_heads][old_res_cap][head_dim]
+            // After:  res_k layout must be [kv_heads][new_res_cap][head_dim]
+            // Remaining tokens (res_pos) for each head must be packed at head-base offsets.
+            let new_res_cap = self.group_size; // QKKV = 32
+            if self.res_cap > new_res_cap {
+                let remaining = self.res_pos; // tokens still in residual after flush
+                if remaining > 0 && self.kv_heads > 1 {
+                    // Move each head's slice into its new packed position
+                    // head 0 is already at index 0, no move needed.
+                    // heads 1..kv_heads need to be moved.
+                    let elem_per_head = new_res_cap * self.head_dim;
+                    for h in 1..self.kv_heads {
+                        let old_src = h * self.res_cap * self.head_dim;
+                        let new_dst = h * elem_per_head;
+                        let count = remaining * self.head_dim;
+                        self.res_k.copy_within(old_src..old_src + count, new_dst);
+                        self.res_v.copy_within(old_src..old_src + count, new_dst);
+                    }
+                }
+                let new_elems = self.kv_heads * new_res_cap * self.head_dim;
+                self.res_k.truncate(new_elems);
+                self.res_k.shrink_to_fit();
+                self.res_v.truncate(new_elems);
+                self.res_v.shrink_to_fit();
+                self.res_cap = new_res_cap;
+            }
+
+            self.q2_deq_tokens = 0;
+            return Ok(());
+        }
+
+        // ── Q2/Q4/Q8 → Q2/Q4/Q8: re-quantize existing blocks ───────────────
         if self.q2_tokens == 0 {
             // No quantized data — just switch the format
             self.qk = QuantizedBlocks::new(new_bits);
@@ -2290,5 +2402,159 @@ mod tests {
             !cache.needs_attn_scores(),
             "needs_attn_scores() must be false after set_awqe_enabled(false)"
         );
+    }
+
+    // ── bits=16 (unquantized) mode tests ─────────────────────────────────────
+
+    /// bits=16 construction: res_cap must be max_seq_len and no quantized blocks.
+    #[test]
+    fn test_kivi_bits16_construction() {
+        let kv_heads = 2;
+        let head_dim = 64;
+        let max_seq = 256;
+        let res_cap = 32; // ignored for bits=16
+
+        let cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 16);
+        assert_eq!(cache.bits(), 16);
+        assert_eq!(cache.res_cap, max_seq, "bits=16 must set res_cap to max_seq_len");
+        assert_eq!(cache.q2_tokens, 0);
+        assert_eq!(cache.res_pos, 0);
+    }
+
+    /// bits=16 mode stores all tokens in residual; no flush is ever performed.
+    #[test]
+    fn test_kivi_bits16_no_flush() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let max_seq = 128;
+
+        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
+
+        // Insert 100 tokens — well beyond a normal residual_size=32 flush threshold
+        for i in 0..100 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1 + 50.0);
+            cache.update(&k, &v).unwrap();
+        }
+
+        // In bits=16 mode, nothing should ever be flushed to quantized storage
+        assert_eq!(cache.q2_tokens, 0, "bits=16 must never quantize tokens");
+        assert_eq!(cache.res_pos, 100);
+        assert_eq!(cache.current_pos(), 100);
+    }
+
+    /// bits=16 get_view returns exact FP32 data (no quantization loss).
+    #[test]
+    fn test_kivi_bits16_exact_roundtrip() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let max_seq = 128;
+
+        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
+
+        let mut all_k = Vec::new();
+        for i in 0..50 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.1 + 50.0);
+            all_k.extend_from_slice(k.as_slice::<f32>());
+            cache.update(&k, &v).unwrap();
+        }
+
+        let (k_view, _) = cache.get_view();
+        let k_out = k_view.as_slice::<f32>();
+
+        // Must be exact (FP32 residual, no quantization)
+        for (i, (&expected, &got)) in all_k.iter().zip(k_out.iter()).enumerate() {
+            assert!(
+                (expected - got).abs() < 1e-6,
+                "bits=16 roundtrip mismatch at idx {i}: expected={expected}, got={got}"
+            );
+        }
+    }
+
+    /// Transition Q2 → 16: all tokens restored to FP32 residual, qk/qv cleared.
+    #[test]
+    fn test_kivi_transition_q2_to_16() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let max_seq = 256;
+
+        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 2);
+
+        // Insert 65 tokens → 2 flushes (32+32) + 1 residual
+        let mut all_k = Vec::new();
+        for i in 0..65 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 10.0);
+            all_k.extend_from_slice(k.as_slice::<f32>());
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.q2_tokens, 64);
+        assert_eq!(cache.bits(), 2);
+
+        // Transition to unquantized mode
+        cache.transition_bits(16).unwrap();
+        assert_eq!(cache.bits(), 16);
+        assert_eq!(cache.q2_tokens, 0, "q2_tokens must be 0 after 16 transition");
+        assert_eq!(cache.res_pos, 65, "all 65 tokens must be in residual");
+        assert_eq!(cache.res_cap, max_seq, "res_cap must be max_seq_len after 16 transition");
+
+        // get_view should return all 65 tokens (with some Q2 dequant error for the first 64)
+        let (k_view, _) = cache.get_view();
+        let k_out = k_view.as_slice::<f32>();
+        assert_eq!(k_out.len(), 65 * kv_heads * head_dim);
+
+        // Last token (was in residual before transition) must be exact
+        let last_start = 64 * kv_heads * head_dim;
+        for d in 0..head_dim {
+            assert!(
+                (all_k[last_start + d] - k_out[last_start + d]).abs() < 1e-5,
+                "last token (residual) must be exact after Q2→16 transition"
+            );
+        }
+    }
+
+    /// Transition 16 → Q2: tokens are quantized from residual, residual shrinks.
+    #[test]
+    fn test_kivi_transition_16_to_q2() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let max_seq = 256;
+
+        let mut cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, 32, 16);
+
+        // Insert 65 tokens in unquantized mode
+        for i in 0..65 {
+            let k = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05);
+            let v = make_input_tensor(1, kv_heads, head_dim, i as f32 * 0.05 + 10.0);
+            cache.update(&k, &v).unwrap();
+        }
+        assert_eq!(cache.bits(), 16);
+        assert_eq!(cache.res_pos, 65);
+
+        // Transition to Q2
+        cache.transition_bits(2).unwrap();
+        assert_eq!(cache.bits(), 2);
+        // 64 tokens flushed (2 full groups of 32), 1 remains in residual
+        assert_eq!(cache.q2_tokens, 64);
+        assert_eq!(cache.res_pos, 1);
+        // res_cap must be shrunk to standard size (QKKV = 32)
+        assert_eq!(cache.res_cap, QKKV);
+        assert_eq!(cache.current_pos(), 65);
+    }
+
+    /// Transition 16 → 16 is a no-op.
+    #[test]
+    fn test_kivi_transition_16_noop() {
+        let mut cache = KiviCache::new_with_bits(1, 32, 128, 32, 16);
+        for i in 0..10 {
+            let k = make_input_tensor(1, 1, 32, i as f32 * 0.1);
+            let v = make_input_tensor(1, 1, 32, i as f32 * 0.1);
+            cache.update(&k, &v).unwrap();
+        }
+        cache.transition_bits(16).unwrap();
+        assert_eq!(cache.bits(), 16);
+        assert_eq!(cache.res_pos, 10);
+        assert_eq!(cache.q2_tokens, 0);
     }
 }
