@@ -188,7 +188,7 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 - `eviction_policy != "none"` 이면: `+ ["kv_evict_h2o", "kv_evict_sliding"]`
 - `kv_dtype.starts_with('q')` 이면: `+ ["kv_quant_dynamic"]`
 
-**[ENG-ST-033]** EngineCommand 처리 결과 상태 전이 -- 11종 전수 열거: *(MUST)*
+**[ENG-ST-033]** EngineCommand 처리 결과 상태 전이 -- 13종 전수 열거: *(MUST)*
 
 | 명령 | 내부 상태 변경 | ExecutionPlan 필드 | CommandResult |
 |------|--------------|-------------------|---------------|
@@ -196,8 +196,10 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 | LayerSkip { skip_ratio } | -- | plan.layer_skip = Some(ratio) | Ok |
 | KvEvictH2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { H2o, ratio, Critical }) | Ok |
 | KvEvictSliding { keep_ratio } | -- | plan.evict = Some(EvictPlan { Sliding, ratio, Critical }) | Ok |
+| KvMergeD2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { D2o, ratio, Critical }) | Ok (미구현: 향후 추가) |
 | KvStreaming { .. } | -- | (plan 변경 없음) | Rejected("KvStreaming not yet implemented") |
 | KvQuantDynamic { target_bits } | -- | plan.kv_quant_bits = Some(bits) | Ok |
+| RequestQcf | -- | plan.request_qcf = true | Ok (QcfEstimate를 별도 EngineMessage로 전송, SEQ-095~098) |
 | RestoreDefaults | throttle=0, compute/memory=Normal, active_actions=[] | plan.restore_defaults = true, plan.throttle_delay_ms = 0 | Ok |
 | SwitchHw { device } | -- | plan.switch_device = Some(device) | Ok |
 | PrepareComputeUnit { device } | -- | plan.prepare_device = Some(device) | Ok |
@@ -480,13 +482,13 @@ KVSnapshot은 Heartbeat의 EngineStatus 필드를 채우는 데 사용된다 (`s
 
 | ID | 불변식 |
 |----|--------|
-| INV-040 | `OperatingMode.from_levels()`는 순수 함수이다. 입력 4종 Level만으로 결과가 결정되며 이전 상태에 의존하지 않는다 |
-| INV-041 | EngineState 전이는 CommandExecutor 내부에서만 발생한다. 외부에서 직접 변경하지 않는다 |
-| INV-042 | `resolve_conflicts()`에서 Suspend 존재 시 반환 리스트는 정확히 `[Suspend]`이다 |
-| INV-043 | `resolve_conflicts()`에서 RestoreDefaults는 다른 제약이 하나도 없을 때만 반환된다 |
-| INV-044 | `CommandExecutor.poll()`의 `plan.suspended == true`일 때 `plan.evict`, `plan.switch_device`, `plan.prepare_device`는 모두 None이다 |
-| INV-045 | Resume 명령은 compute_level, memory_level을 Normal로, throttle_delay_ms를 0으로 초기화한다 |
-| INV-046 | RestoreDefaults 명령은 active_actions를 비우고, throttle_delay_ms를 0으로, compute/memory_level을 Normal로 초기화한다 |
+| INV-070 | `OperatingMode.from_levels()`는 순수 함수이다. 입력 4종 Level만으로 결과가 결정되며 이전 상태에 의존하지 않는다 |
+| INV-071 | EngineState 전이는 CommandExecutor 내부에서만 발생한다. 외부에서 직접 변경하지 않는다 |
+| INV-072 | `resolve_conflicts()`에서 Suspend 존재 시 반환 리스트는 정확히 `[Suspend]`이다 |
+| INV-073 | `resolve_conflicts()`에서 RestoreDefaults는 다른 제약이 하나도 없을 때만 반환된다 |
+| INV-074 | `CommandExecutor.poll()`의 `plan.suspended == true`일 때 `plan.evict`, `plan.switch_device`, `plan.prepare_device`는 모두 None이다 |
+| INV-075 | Resume 명령은 compute_level, memory_level을 Normal로, throttle_delay_ms를 0으로 초기화한다 |
+| INV-076 | RestoreDefaults 명령은 active_actions를 비우고, throttle_delay_ms를 0으로, compute/memory_level을 Normal로 초기화한다 |
 
 ## 6. Examples
 

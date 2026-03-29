@@ -269,7 +269,7 @@ TransportError 변종: `ConnectionFailed(String)`, `Disconnected`, `ParseError(S
 | MemoryPressure | Normal | RestoreDefaults |
 | MemoryPressure | Warning | KvEvictSliding { keep_ratio: 0.85 } |
 | MemoryPressure | Critical | KvEvictH2o { keep_ratio: 0.50 } |
-| MemoryPressure | Emergency | Suspend |
+| MemoryPressure | Emergency | KvEvictH2o { keep_ratio: 0.25 } (SYS-055: Suspend 불필요, 공격적 eviction) |
 | ComputeGuidance | Normal | RestoreDefaults |
 | ComputeGuidance | Warning | Throttle { delay_ms: 30 } + SwitchHw { device } |
 | ComputeGuidance | Critical | Throttle { delay_ms: 70 } + SwitchHw { device } |
@@ -471,12 +471,12 @@ Resilience -- Transport -- MessageLoop
 
 | ID | 불변식 |
 |----|--------|
-| INV-030 | `CommandExecutor.poll()`은 토큰당 최대 1회 호출된다 |
-| INV-031 | ExecutionPlan은 생성한 `poll()` 호출이 반환한 즉시 소비되며, 다음 `poll()` 전에 폐기된다 |
-| INV-032 | Suspend가 포함된 ExecutionPlan에서 evict, switch_device, prepare_device는 None이다 |
-| INV-033 | MessageLoop 스레드는 Transport의 유일한 소유자이다 |
-| INV-034 | heartbeat_interval 내에 최소 1회 Heartbeat가 전송된다 (`poll()` 호출이 있을 때) |
-| INV-035 | Backend trait 구현체는 `Send + Sync`이다 |
+| INV-060 | `CommandExecutor.poll()`은 토큰당 최대 1회 호출된다 |
+| INV-061 | ExecutionPlan은 생성한 `poll()` 호출이 반환한 즉시 소비되며, 다음 `poll()` 전에 폐기된다 |
+| INV-062 | Suspend가 포함된 ExecutionPlan에서 evict, switch_device, prepare_device는 None이다 |
+| INV-063 | MessageLoop 스레드는 Transport의 유일한 소유자이다 |
+| INV-064 | heartbeat_interval 내에 최소 1회 Heartbeat가 전송된다 (`poll()` 호출이 있을 때) |
+| INV-065 | Backend trait 구현체는 `Send + Sync`이다 |
 
 ## 6. Examples
 

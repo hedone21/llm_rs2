@@ -438,7 +438,7 @@ Manager                                    Engine
 | MemoryPressure | Normal | `RestoreDefaults` |
 | MemoryPressure | Warning | `KvEvictSliding { keep_ratio: 0.85 }` |
 | MemoryPressure | Critical | `KvEvictH2o { keep_ratio: 0.50 }` |
-| MemoryPressure | Emergency | `Suspend` |
+| MemoryPressure | Emergency | `KvEvictH2o { keep_ratio: 0.25 }` (SYS-055: Suspend 불필요, 공격적 eviction으로 대응) |
 | ComputeGuidance | Normal | `RestoreDefaults` |
 | ComputeGuidance | Warning | `Throttle { delay_ms: 30 }` + `SwitchHw { device }` |
 | ComputeGuidance | Critical | `Throttle { delay_ms: 70 }` + `SwitchHw { device }` |
