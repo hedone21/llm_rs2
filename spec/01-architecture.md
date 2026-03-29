@@ -219,10 +219,10 @@ Layer 1: Monitor Layer ──SystemSignal──→ Layer 2: Policy Layer ──E
 
 | Monitor | 도메인 | 센서 소스 | 출력 SystemSignal |
 |---------|--------|----------|------------------|
-| MemoryMonitor | 메모리 | `/proc/meminfo` | MemoryPressure { level, available_bytes, total_bytes, reclaim_target_bytes } |
-| ThermalMonitor | 열 | `/sys/class/thermal/` | ThermalAlert { level, temperature_mc, throttling_active, throttle_ratio } |
-| ComputeMonitor | 연산 | `/proc/stat` (CPU delta) | ComputeGuidance { level, recommended_backend, reason, cpu_usage_pct, gpu_usage_pct } |
-| EnergyMonitor | 전력 | `/sys/class/power_supply/` | EnergyConstraint { level, reason, power_budget_mw } |
+| MemoryMonitor | 메모리 | `/proc/meminfo` | MemoryPressure { available_bytes, total_bytes } |
+| ThermalMonitor | 열 | `/sys/class/thermal/` | ThermalAlert { temperature_mc, throttling_active, throttle_ratio } |
+| ComputeMonitor | 연산 | `/proc/stat` (CPU delta) | ComputeGuidance { recommended_backend, reason, cpu_usage_pct, gpu_usage_pct } |
+| EnergyMonitor | 전력 | `/sys/class/power_supply/` | EnergyConstraint { reason, battery_pct, power_budget_mw } |
 | ExternalMonitor | 외부 | stdin/socket | (임의 SystemSignal, 연구/테스트용) |
 
 각 Monitor는 Monitor trait을 구현한다. trait 인터페이스:

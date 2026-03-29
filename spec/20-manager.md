@@ -32,7 +32,7 @@
 | **Policy Layer** | Manager 두 번째 계층. 메인 스레드에서 PI Controller → Supervisory → Action Selector 파이프라인을 순차 실행한다. |
 | **Emitter Layer** | Manager 세 번째 계층. Policy가 생성한 EngineDirective를 Engine에 전송한다. |
 | **SystemSignal** | Monitor가 생성하는 도메인별 시스템 상태 메시지. 4종: MemoryPressure, ThermalAlert, ComputeGuidance, EnergyConstraint. |
-| **ThresholdEvaluator** | 히스테리시스 기반 임계값 평가기. 원시 측정값 → Level (Normal/Warning/Critical/Emergency) 변환. Monitor 내부의 보조 도구로, SystemSignal의 `level` 필드 산출과 D-Bus 전송 경로에 사용된다. **Policy Layer는 `level`을 사용하지 않고 raw 필드에서 직접 압력을 계산한다.** |
+| **ThresholdEvaluator** | 히스테리시스 기반 임계값 평가기. 원시 측정값 → Level (Normal/Warning/Critical/Emergency) 변환. **D-Bus Emitter 전용**으로, D-Bus 전송 시 raw 값에서 Level을 산출하여 와이어 메시지에 포함한다. 내부 SystemSignal에는 Level이 포함되지 않으며, Policy Layer에서도 사용하지 않는다. |
 | **HierarchicalPolicy** | PolicyStrategy trait 구현체. PI + Supervisory + ActionSelector + ReliefEstimator를 조합한다. |
 | **ActionRegistry** | 액션 메타데이터 저장소. 종류, 가역성, 파라미터 범위, 배타 그룹, 기본 비용을 관리한다. |
 
@@ -106,12 +106,12 @@
 
 **[MGR-020]** ExternalMonitor는 stdin 또는 Unix socket에서 JSON Lines로 SystemSignal을 수신한다. 연구 및 테스트 용도이다. *(MAY)*
 
-**[MGR-021]** ThresholdEvaluator는 Monitor 내부의 보조 도구이다. 히스테리시스 기반으로 원시 측정값을 Level로 변환하여 SystemSignal의 `level` 필드와 `reclaim_target_bytes` 등 보조 필드를 산출한다. *(SHOULD)*
+**[MGR-021]** ThresholdEvaluator는 D-Bus Emitter 전용 도구이다. D-Bus 전송 경로에서 raw 센서 값을 Level로 변환하여 D-Bus 와이어 메시지(`11-protocol-messages.md` MSG-100~104)에 포함한다. 내부 SystemSignal에는 Level이 포함되지 않는다. *(SHOULD)*
 
 - Direction: Ascending (높을수록 위험) / Descending (낮을수록 위험)
 - 상태 전이 테이블 → `21-manager-state.md` MGR-067~073
 
-> **설계 원칙**: Monitor의 주 책임은 raw 센서 데이터 수집과 전달이다. ThresholdEvaluator는 `level` 필드 산출을 위한 보조 도구이며, **Policy Layer는 `level`을 사용하지 않고 raw 필드(available_bytes, temperature_mc, cpu_usage_pct, battery_pct)에서 직접 압력을 계산한다.** 이 분리는 Monitor를 단순하게 유지하고, 압력 계산 전략을 Policy에서 독립적으로 교체할 수 있게 한다.
+> **설계 원칙**: Monitor의 유일한 책임은 raw 센서 데이터 수집과 전달이다. 심각도 평가(Level)는 Monitor의 책임이 아니다. D-Bus 전송이 필요한 경우에만 Emitter Layer의 ThresholdEvaluator가 Level을 산출한다. **Policy Layer는 raw 필드(available_bytes, temperature_mc, cpu_usage_pct, battery_pct)에서 직접 압력을 계산한다.** 이 분리는 Monitor를 단순하게 유지하고, 압력 계산 전략을 Policy에서 독립적으로 교체할 수 있게 한다.
 
 **[MGR-022]** 기본 폴링 주기는 `poll_interval_ms = 1000ms`이다. Monitor별 개별 설정이 가능하다. *(SHOULD)*
 
