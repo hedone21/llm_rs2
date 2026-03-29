@@ -2416,7 +2416,10 @@ mod tests {
 
         let cache = KiviCache::new_with_bits(kv_heads, head_dim, max_seq, res_cap, 16);
         assert_eq!(cache.bits(), 16);
-        assert_eq!(cache.res_cap, max_seq, "bits=16 must set res_cap to max_seq_len");
+        assert_eq!(
+            cache.res_cap, max_seq,
+            "bits=16 must set res_cap to max_seq_len"
+        );
         assert_eq!(cache.q2_tokens, 0);
         assert_eq!(cache.res_pos, 0);
     }
@@ -2495,9 +2498,15 @@ mod tests {
         // Transition to unquantized mode
         cache.transition_bits(16).unwrap();
         assert_eq!(cache.bits(), 16);
-        assert_eq!(cache.q2_tokens, 0, "q2_tokens must be 0 after 16 transition");
+        assert_eq!(
+            cache.q2_tokens, 0,
+            "q2_tokens must be 0 after 16 transition"
+        );
         assert_eq!(cache.res_pos, 65, "all 65 tokens must be in residual");
-        assert_eq!(cache.res_cap, max_seq, "res_cap must be max_seq_len after 16 transition");
+        assert_eq!(
+            cache.res_cap, max_seq,
+            "res_cap must be max_seq_len after 16 transition"
+        );
 
         // get_view should return all 65 tokens (with some Q2 dequant error for the first 64)
         let (k_view, _) = cache.get_view();
