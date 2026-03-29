@@ -285,6 +285,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     kivi: bool,
 
+    /// Enable dynamic KV cache quantization for resilience.
+    /// Starts with bits=16 (F16-equivalent KiviCache) and allows runtime
+    /// transition to Q2/Q4/Q8 via kv_quant_dynamic resilience command.
+    #[arg(long, default_value_t = false)]
+    kv_dynamic_quant: bool,
+
     /// KIVI residual buffer size in tokens (must be multiple of 32).
     /// Default: 32. Larger values improve quality but use more memory.
     #[arg(long, default_value_t = 32)]
@@ -698,9 +704,10 @@ fn main() -> anyhow::Result<()> {
 
     // ── KIVI mode: separate path with KiviCache ──
     // Placed after executor creation so resilience is available in the token loop.
-    if args.kivi || args.enable_resilience {
-        // KIVI mode: --kivi starts at Q2, --enable-resilience starts at bits=16
-        // (F16-equivalent) and allows dynamic transition via kv_quant_dynamic.
+    if args.kivi || args.kv_dynamic_quant {
+        // KIVI mode: --kivi starts at Q2, --kv-dynamic-quant starts at bits=16
+        // (F16-equivalent) and allows runtime transition via kv_quant_dynamic.
+        // Note: --enable-resilience alone stays on main path (F16 KVCache + eviction).
         let initial_bits: u8 = if args.kivi { 2 } else { 16 };
         let residual_size = if initial_bits == 16 {
             // bits=16: all tokens stay in residual (no quantization flush)
