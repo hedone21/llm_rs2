@@ -298,7 +298,65 @@ impl SkipQcfTracker {
 }
 ```
 
-### 4.5 Head Aggregation
+### 4.5 AW-VOPR (ENG-ALG-049)
+
+#### 설계 결정
+AWQE(ENG-ALG-047)는 스칼라 NMSE를 attention으로 가중 합산하여 벡터 상쇄를 반영하지 못한다.
+AW-VOPR은 ΔV를 벡터로 유지한 채 attention-weighted 합산 후 norm을 취해 상쇄를 반영한다.
+K 양자화 에러는 무시한다 (Phase 2에서 Taylor 근사로 확장 가능).
+
+GQA 집계: norm-first-then-mean — Q-head 간 ΔO 방향이 다르면 vector-mean에서 과소추정되므로,
+각 Q-head별 스칼라 ratio를 먼저 계산 후 평균한다.
+
+#### 인터페이스
+```rust
+pub struct FlushAwVoprParams<'a> {
+    pub res_v: &'a [f32],           // [kv_heads][res_cap][head_dim]
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub flush_tokens: usize,
+    pub res_cap: usize,
+    pub bits: u8,
+    pub attn_scores: &'a [f32],     // [n_heads_q * scores_stride]
+    pub n_heads_q: usize,
+    pub scores_stride: usize,
+    pub gqa_group_size: usize,
+    pub flush_cache_start: usize,
+    pub scores_valid_len: usize,
+}
+
+pub fn compute_flush_aw_vopr(params: &FlushAwVoprParams, config: &QcfConfig) -> QcfMetric
+// 전제: flush_cache_start + flush_tokens <= scores_valid_len
+// 전제: attn_scores는 post-softmax (Σ=1)
+// 후조건: QcfMetric { action: "aw_vopr", raw_value ∈ [0, ∞) }
+```
+
+#### 처리 흐름
+```mermaid
+flowchart TD
+    A[for each kv_head h] --> B[for each Q-head qh in GQA group]
+    B --> C[for each flush token t]
+    C --> D["α = attn_scores at cache_pos"]
+    C --> E["ΔV = V_orig - dequant(quant(V_orig))"]
+    D --> F["delta_o += α × ΔV"]
+    E --> F
+    D --> G["orig_o += α × V_orig"]
+    F --> H["ratio_qh = ‖delta_o‖ / max(‖orig_o‖, ε)"]
+    G --> H
+    H --> I["aw_vopr_h = mean(ratio_qh)"]
+    I --> J["aw_vopr = mean(aw_vopr_h)"]
+```
+
+#### 호출 위치
+`kivi_cache.rs::flush_residual()` 내, AWQE 계산 직후에 호출.
+`kivi_hook.rs`에서 `aw_vopr` action으로 수집.
+
+#### Config
+| 키/플래그 | 타입 | 기본값 | 설명 |
+|-----------|------|--------|------|
+| `--awqe` | bool | false | AWQE + AW-VOPR 동시 활성화 |
+
+### 4.6 Head Aggregation
 
 ```rust
 pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32;

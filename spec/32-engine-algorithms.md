@@ -519,6 +519,29 @@ function current_proxy():
     normalized_value = raw_value   // 이미 0~1 범위
 ```
 
+#### 3.4.9 AW-VOPR (Attention-Weighted Vector Output Perturbation Ratio) [ENG-ALG-049]
+
+**[ENG-ALG-049]** KIVI residual flush 시, attention-weighted V 양자화 에러의 벡터 합산 norm을 원본 attention output norm으로 나누어 output-level 양자화 영향을 추정한다. AWQE(ENG-ALG-047)의 벡터 확장으로, 반대 방향 에러의 상쇄를 반영한다. `set_awqe_enabled(true)` 시에만 활성화된다. *(MAY)*
+
+수학적 정의:
+
+```
+O_orig_h = Σ_t α_t × V_t                    (head_dim 벡터)
+ΔV_t = V_t - dequant(quant(V_t))
+ΔO_h = Σ_t α_t × ΔV_t                      (head_dim 벡터)
+
+per-head:  AW_VOPR_h = ‖ΔO_h‖₂ / max(‖O_orig_h‖₂, ε)
+per-layer: AW_VOPR = mean_h(AW_VOPR_h)      (norm-first-then-mean)
+```
+
+**AWQE와의 차이**:
+- AWQE: `Σ_t α × scalar_error` → 스칼라 합산 (방향 무시)
+- AW-VOPR: `‖Σ_t α × vector_ΔV‖` → 벡터 합산 후 norm (상쇄 반영)
+
+GQA 처리: kv_head당 gqa_group_size개 Q-head의 attention weight를 평균하여 α로 사용한다. 집계는 norm-first-then-mean: 각 Q-head별 ‖ΔO‖/‖O_orig‖을 계산한 뒤 평균한다.
+
+복잡도: O(kv_heads × flush_tokens × head_dim). AWQE와 동일. 추가 메모리: head_dim floats (임시 벡터 2개).
+
 ---
 
 ### 3.5 RequestQcf -> QcfEstimate 흐름 [ENG-ALG-050]
