@@ -84,7 +84,7 @@ Backend 구현체:
 | CpuBackendCommon | 기본 | 기타 | 스칼라 폴백 |
 | OpenCLBackend | `opencl` | 모든 아키텍처 | GPU kernel, plan-based decode |
 
-> **하이브리드 모드**: `--backend hybrid` 시 CPU(primary) + GPU(secondary)를 `Arc<dyn Backend>`로 동시 보유한다. SwitchHw 명령으로 런타임 전환이 가능하다.
+> **참고 (non-normative)**: `--backend hybrid` 시 CPU(primary) + GPU(secondary)를 `Arc<dyn Backend>`로 동시 보유한다. SwitchHw 명령으로 런타임 전환이 가능하다.
 
 **[ENG-014] KV Cache Subsystem** *(MUST)*
 

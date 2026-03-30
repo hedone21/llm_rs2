@@ -111,7 +111,7 @@
 - Direction: Ascending (높을수록 위험) / Descending (낮을수록 위험)
 - 상태 전이 테이블 → `21-manager-state.md` MGR-067~073
 
-> **설계 원칙**: Monitor의 유일한 책임은 raw 센서 데이터 수집과 전달이다. 심각도 평가(Level)는 Monitor의 책임이 아니다. D-Bus 전송이 필요한 경우에만 Emitter Layer의 ThresholdEvaluator가 Level을 산출한다. **Policy Layer는 raw 필드(available_bytes, temperature_mc, cpu_usage_pct, battery_pct)에서 직접 압력을 계산한다.** 이 분리는 Monitor를 단순하게 유지하고, 압력 계산 전략을 Policy에서 독립적으로 교체할 수 있게 한다.
+> **참고 (non-normative)**: Monitor의 유일한 책임은 raw 센서 데이터 수집과 전달이다. 심각도 평가(Level)는 Monitor의 책임이 아니다. D-Bus 전송이 필요한 경우에만 Emitter Layer의 ThresholdEvaluator가 Level을 산출한다. **Policy Layer는 raw 필드(available_bytes, temperature_mc, cpu_usage_pct, battery_pct)에서 직접 압력을 계산한다.** 이 분리는 Monitor를 단순하게 유지하고, 압력 계산 전략을 Policy에서 독립적으로 교체할 수 있게 한다.
 
 **[MGR-022]** 기본 폴링 주기는 `poll_interval_ms = 1000ms`이다. Monitor별 개별 설정이 가능하다. *(SHOULD)*
 
@@ -133,7 +133,7 @@
 - **임계값 기반** (Memory): Monitor의 측정값 또는 Level을 압력에 직접 매핑. PI 평활화를 거치지 않는다.
 - 알고리즘 상세 → `22-manager-algorithms.md`
 
-> **설계 원칙**: 도메인별 압력 계산 전략은 **전략 패턴으로 교체 가능**하다. 현재 구성(PI 2개 + 임계값 1개)은 하나의 설정이며, 향후 모든 도메인에 PI를 적용하거나, PID로 교체하거나, 학습 기반 전략으로 전환할 수 있다. PolicyStrategy trait(MGR-023)이 정책 전체를, 도메인별 전략이 개별 압력 계산을 각각 추상화한다.
+> **참고 (non-normative)**: 도메인별 압력 계산 전략은 **전략 패턴으로 교체 가능**하다. 현재 구성(PI 2개 + 임계값 1개)은 하나의 설정이며, 향후 모든 도메인에 PI를 적용하거나, PID로 교체하거나, 학습 기반 전략으로 전환할 수 있다. PolicyStrategy trait(MGR-023)이 정책 전체를, 도메인별 전략이 개별 압력 계산을 각각 추상화한다.
 
 **[MGR-025]** Supervisory — PressureVector → OperatingMode (Normal/Warning/Critical) 변환을 수행한다. *(MUST)*
 
@@ -241,7 +241,7 @@ loop:
 
 **[MGR-036]** 처리 우선순위 — Engine 메시지를 먼저 drain한 후 Monitor 신호를 처리한다. 코드 순서에 의한 암묵적 우선순위이다. *(MUST)*
 
-> **Rationale**: 최신 Engine 상태(FeatureVector, available_actions)로 압력 계산 정확도를 보장하기 위함.
+> **참고 (non-normative)**: 최신 Engine 상태(FeatureVector, available_actions)로 압력 계산 정확도를 보장하기 위함.
 
 **[MGR-037]** Engine 메시지 처리: *(MUST)*
 

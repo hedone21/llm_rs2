@@ -47,7 +47,7 @@ JSON 예시:
 }
 ```
 
-> **참고**: Internally tagged enum이므로 `EngineDirective`의 필드(`seq_id`, `commands`)가 동일 JSON 객체에 flat merge된다.
+> **참고 (non-normative)**: Internally tagged enum이므로 `EngineDirective`의 필드(`seq_id`, `commands`)가 동일 JSON 객체에 flat merge된다.
 
 **[MSG-011]** EngineMessage — Engine → Manager 최상위 envelope. `tag = "type"`, `rename_all = "snake_case"`. *(MUST)*
 
@@ -123,7 +123,7 @@ JSON 예시:
 }
 ```
 
-> **참고**: ManagerMessage envelope에 감싸여 전송되므로 실제 와이어에서는 `"type": "directive"` 태그가 추가된다.
+> **참고 (non-normative)**: ManagerMessage envelope에 감싸여 전송되므로 실제 와이어에서는 `"type": "directive"` 태그가 추가된다.
 
 **[MSG-021]** seq_id 불변식 — 세션 내 단조 증가한다 (INV-020 참조). 동일 seq_id를 재사용해서는 안 된다 (INV-021 참조). *(MUST)*
 
@@ -150,7 +150,7 @@ JSON 예시:
 | `"suspend"` | Suspend | Lifecycle | (없음) | — | — | 추론 즉시 중지. |
 | `"resume"` | Resume | Lifecycle | (없음) | — | — | 추론 재개. |
 
-> **참고** *(non-normative)*: 위 '도메인' 칼럼은 각 액션의 **주 대상(primary target) 도메인** 분류이다. 실제 cross-domain relief effect(하나의 액션이 여러 도메인에 동시 영향을 미침)는 Action Pool(`01-architecture.md` SYS-095)과 `22-manager-algorithms.md`에서 모델링된다.
+> **참고 (non-normative)**: 위 '도메인' 칼럼은 각 액션의 **주 대상(primary target) 도메인** 분류이다. 실제 cross-domain relief effect(하나의 액션이 여러 도메인에 동시 영향을 미침)는 Action Pool(`01-architecture.md` SYS-095)과 `22-manager-algorithms.md`에서 모델링된다.
 
 #### MSG-031: Throttle
 
@@ -462,7 +462,7 @@ JSON 예시:
 }
 ```
 
-> **참고** *(non-normative)*: Manager의 ActionSelector는 이 값을 lossy 액션의 비용으로 사용한다. Lossless 액션의 비용은 0이다. QcfEstimate가 없으면(Engine 미연결 등) ActionRegistry의 default_cost를 fallback으로 사용한다.
+> **참고 (non-normative)**: Manager의 ActionSelector는 이 값을 lossy 액션의 비용으로 사용한다. Lossless 액션의 비용은 0이다. QcfEstimate가 없으면(Engine 미연결 등) ActionRegistry의 default_cost를 fallback으로 사용한다.
 
 ### 3.9 Supporting Enums [MSG-090 ~ MSG-095]
 
@@ -474,7 +474,7 @@ JSON 예시:
 | `"warning"` | Warning | 1 |
 | `"critical"` | Critical | 2 (최고) |
 
-> **참고**: `PartialOrd`/`Ord` derive로 순서 비교가 가능하다 (Normal < Warning < Critical).
+> **참고 (non-normative)**: `PartialOrd`/`Ord` derive로 순서 비교가 가능하다 (Normal < Warning < Critical).
 
 **[MSG-091]** EngineState — Engine 운영 상태. `rename_all = "snake_case"`. EngineStatus에서 사용. *(MUST)*
 
@@ -493,7 +493,7 @@ JSON 예시:
 | `"critical"` | Critical | 2 |
 | `"emergency"` | Emergency | 3 |
 
-> **참고**: ResourceLevel(3단계)과 Level(4단계)의 차이 — Emergency는 프로토콜 수준에서 Suspend 명령으로 대체된다. Level은 D-Bus 전송 경로에서 사용한다.
+> **참고 (non-normative)**: ResourceLevel(3단계)과 Level(4단계)의 차이 — Emergency는 프로토콜 수준에서 Suspend 명령으로 대체된다. Level은 D-Bus 전송 경로에서 사용한다.
 
 **[MSG-093]** RecommendedBackend — SystemSignal.ComputeGuidance에서 사용. `rename_all = "snake_case"`. *(MUST)*
 

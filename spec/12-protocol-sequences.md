@@ -176,7 +176,7 @@ needs_action ← CASE mode OF
 
 **[SEQ-044]** 액션 선택: `ActionSelector::select()`를 호출한다. 입력: registry, estimator, pressure, mode, engine_state (FeatureVector), qcf_values, latency_budget, active_actions_reported, available_actions. 출력: ActionCommand 리스트. *(MUST)*
 
-> **참고** (non-normative): `qcf_values`는 현재 Manager의 `DegradationEstimator`가 내부 계산한 값을 사용한다. 향후 `QcfRequest`/`QcfResponse` 메시지 (MSG-014 확장)가 구현되면 Engine으로부터 어텐션 기반 QCF 프록시를 수신하여 사용할 수 있다. QCF 값의 산출 로직과 액션 선택 최적화에의 활용은 `22-manager-algorithms.md` 범위이다.
+> **참고 (non-normative)**: `qcf_values`는 현재 Manager의 `DegradationEstimator`가 내부 계산한 값을 사용한다. 향후 `QcfRequest`/`QcfResponse` 메시지 (MSG-014 확장)가 구현되면 Engine으로부터 어텐션 기반 QCF 프록시를 수신하여 사용할 수 있다. QCF 값의 산출 로직과 액션 선택 최적화에의 활용은 `22-manager-algorithms.md` 범위이다.
 
 **[SEQ-045]** Directive 생성: `next_seq_id()`로 단조 증가 seq_id를 생성한다 (초기값 1, AtomicU64). ActionSelector 결과를 EngineCommand로 변환하여 `EngineDirective { seq_id, commands }` 구성. *(MUST)*
 
@@ -266,7 +266,7 @@ ObservationContext {
 1. Critical → Warning: `RestoreDefaults` 전송 → 모든 액션 해제 → 다음 사이클에서 Warning 모드 lossless 액션 재선택
 2. Warning → Normal: `RestoreDefaults` 전송 → 모든 액션 해제
 
-> **참고**: 현재 구현에서 `build_lossy_release_directive()`와 `build_restore_directive()`는 모두 `RestoreDefaults`만 전송한다. 세분화된 per-action release는 향후 확장 가능하다.
+> **참고 (non-normative)**: 현재 구현에서 `build_lossy_release_directive()`와 `build_restore_directive()`는 모두 `RestoreDefaults`만 전송한다. 세분화된 per-action release는 향후 확장 가능하다.
 
 ```
   Manager                               Engine
@@ -351,7 +351,7 @@ ObservationContext {
 
 **[SEQ-081]** 페이로드 크기 초과: 64KB 초과 프레임 수신 시 ParseError로 처리한다 (PROTO-060). 연결을 유지한다. *(SHOULD)*
 
-> **참고**: Engine Transport에 `MAX_PAYLOAD_SIZE = 64 * 1024` 가드가 구현되어 있다. Manager 측 Channel에는 현재 이 가드가 미적용이다.
+> **참고 (non-normative)**: Engine Transport에 `MAX_PAYLOAD_SIZE = 64 * 1024` 가드가 구현되어 있다. Manager 측 Channel에는 현재 이 가드가 미적용이다.
 
 **[SEQ-082]** 쓰기 오류: *(MUST)*
 
@@ -362,7 +362,7 @@ ObservationContext {
 
 **[SEQ-084]** Rejected 응답 처리: `CommandResult::Rejected` 수신은 프로토콜 오류가 아니다 (PROTO-065). Manager는 로그에 기록한다. *(MUST)*
 
-> **설계 의도** (non-normative): `docs/37_protocol_design.md` §9-2는 3회 연속 Rejected 시 해당 액션을 후보에서 제외하도록 권장한다. 현재 미구현.
+> **참고 (non-normative)**: `docs/37_protocol_design.md` §9-2는 3회 연속 Rejected 시 해당 액션을 후보에서 제외하도록 권장한다. 현재 미구현.
 
 **[SEQ-085]** Partial 응답 처리: `CommandResult::Partial { achieved, reason }` 수신. Manager는 `achieved` 값을 Relief 계산에 반영할 수 있다 (`22-manager-algorithms.md` 범위). *(MAY)*
 
@@ -370,11 +370,11 @@ ObservationContext {
 
 **[SEQ-087]** Heartbeat 부재 시나리오: Manager는 특정 Heartbeat 주기를 가정하지 않는다 (PROTO-070). Heartbeat가 오래 도착하지 않아도 연결을 유지한다. *(MUST)*
 
-> **설계 의도** (non-normative): `docs/37_protocol_design.md` §9-1은 3초 Heartbeat 타임아웃을 제안한다. 현재 미구현.
+> **참고 (non-normative)**: `docs/37_protocol_design.md` §9-1은 3초 Heartbeat 타임아웃을 제안한다. 현재 미구현.
 
 **[SEQ-088]** Directive 응답 부재 시나리오: Manager는 현재 Response 타임아웃을 적용하지 않는다. 다음 Directive는 새 seq_id로 독립 전송한다. *(MUST)*
 
-> **설계 의도** (non-normative): `docs/37_protocol_design.md` §9-1은 500ms 응답 타임아웃을 제안한다. 현재 미구현.
+> **참고 (non-normative)**: `docs/37_protocol_design.md` §9-1은 500ms 응답 타임아웃을 제안한다. 현재 미구현.
 
 ### 3.9 Backpressure Sequences [SEQ-090 ~ SEQ-093]
 
@@ -452,7 +452,7 @@ Manager                                    Engine
 | EnergyConstraint | Critical | `SwitchHw { device: "cpu" }` + `Throttle { delay_ms: 70 }` |
 | EnergyConstraint | Emergency | `Suspend` |
 
-> **참고**: ComputeGuidance의 `device`는 `recommended_backend` 필드에서 결정된다 (`Cpu` → `"cpu"`, `Gpu` → `"gpu"`, `Any` → `"any"`).
+> **참고 (non-normative)**: ComputeGuidance의 `device`는 `recommended_backend` 필드에서 결정된다 (`Cpu` → `"cpu"`, `Gpu` → `"gpu"`, `Any` → `"any"`).
 
 **[SEQ-103]** D-Bus 비대칭: Engine → Manager Response는 best-effort D-Bus signal (`"EngineMessage"` member로 JSON 직렬화하여 emit)이다. 프로토콜 보장이 없다. *(MUST)*
 

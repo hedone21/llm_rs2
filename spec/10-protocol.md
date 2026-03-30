@@ -50,7 +50,7 @@
 
 **[PROTO-012]** 최대 페이로드 크기는 **65,536 바이트 (64 KB)**이다. 수신측은 이 크기를 초과하는 프레임을 ParseError로 거부해야 한다. *(SHOULD)*
 
-> **참고**: Engine Transport(`engine/src/resilience/transport.rs`)에서 `MAX_PAYLOAD_SIZE = 64 * 1024` 가드가 구현되어 있다. Manager 측 Channel(`unix_socket.rs`, `tcp.rs`)의 `read_engine_message()`에는 현재 이 가드가 미적용되어 있다. 향후 Manager 측에도 동일 가드를 추가하는 것을 권장한다.
+> **참고 (non-normative)**: Engine Transport(`engine/src/resilience/transport.rs`)에서 `MAX_PAYLOAD_SIZE = 64 * 1024` 가드가 구현되어 있다. Manager 측 Channel(`unix_socket.rs`, `tcp.rs`)의 `read_engine_message()`에는 현재 이 가드가 미적용되어 있다. 향후 Manager 측에도 동일 가드를 추가하는 것을 권장한다.
 
 **[PROTO-013]** Payload는 UTF-8 인코딩이다. BOM(Byte Order Mark)을 포함해서는 안 된다. *(MUST NOT)*
 
