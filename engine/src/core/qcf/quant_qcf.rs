@@ -402,6 +402,177 @@ pub fn compute_flush_awqe(params: &FlushAwqeParams, config: &QcfConfig) -> QcfMe
     }
 }
 
+/// Parameters for Attention-Weighted Vector Output Perturbation Ratio (AW-VOPR).
+///
+/// Same fields as [`FlushAwqeParams`]. AW-VOPR measures vector-level quantization
+/// error weighted by attention, capturing directional cancellation that scalar
+/// AWQE misses.
+pub struct FlushAwVoprParams<'a> {
+    /// V residual (FP32 originals, about to be quantized).
+    /// Layout: `[kv_heads][res_cap][head_dim]`.
+    pub res_v: &'a [f32],
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    /// Tokens being flushed (always multiple of QKKV).
+    pub flush_tokens: usize,
+    pub res_cap: usize,
+    pub bits: u8,
+
+    /// Post-softmax attention scores from the previous decode step.
+    /// Layout: `[n_heads_q * scores_stride]`.
+    pub attn_scores: &'a [f32],
+    pub n_heads_q: usize,
+    /// Spacing between Q heads in attn_scores (= max_seq_len allocation).
+    pub scores_stride: usize,
+    /// `n_heads_q / kv_heads`: number of Q heads per KV head.
+    pub gqa_group_size: usize,
+
+    /// Cache position of the first flush token (= q2_tokens before flush).
+    pub flush_cache_start: usize,
+    /// Number of valid positions per head in attn_scores (= effective_cache_len at snapshot).
+    pub scores_valid_len: usize,
+}
+
+/// Compute AW-VOPR (Attention-Weighted Vector Output Perturbation Ratio).
+///
+/// Unlike AWQE which sums scalar NMSE weighted by attention, AW-VOPR accumulates
+/// the attention-weighted V quantization error as a **vector** per Q-head, then
+/// takes the L2 norm. Opposite-direction errors cancel in the vector sum, so
+/// AW-VOPR reflects the *actual* output perturbation more faithfully.
+///
+/// GQA aggregation: **norm-first-then-mean**.
+///   1. Per Q-head: `ratio_qh = ||sum_t alpha_t * delta_V_t|| / max(||sum_t alpha_t * V_t||, eps)`
+///   2. Per KV-head: `aw_vopr_h = mean(ratio_qh for qh in gqa_group)`
+///   3. Final: `aw_vopr = mean(aw_vopr_h for all kv_heads)`
+pub fn compute_flush_aw_vopr(params: &FlushAwVoprParams, config: &QcfConfig) -> QcfMetric {
+    let FlushAwVoprParams {
+        res_v,
+        kv_heads,
+        head_dim,
+        flush_tokens,
+        res_cap,
+        bits,
+        attn_scores,
+        n_heads_q: _,
+        scores_stride,
+        gqa_group_size,
+        flush_cache_start,
+        scores_valid_len,
+    } = params;
+    let (kv_heads, head_dim, flush_tokens) = (*kv_heads, *head_dim, *flush_tokens);
+    let (res_cap, bits) = (*res_cap, *bits);
+    let (scores_stride, gqa_group_size) = (*scores_stride, *gqa_group_size);
+    let (flush_cache_start, scores_valid_len) = (*flush_cache_start, *scores_valid_len);
+
+    if flush_tokens == 0 || kv_heads == 0 || head_dim == 0 || gqa_group_size == 0 {
+        return QcfMetric {
+            action: "aw_vopr".to_string(),
+            raw_value: 0.0,
+            normalized_value: 0.0,
+            per_head: Some(vec![0.0; kv_heads]),
+            tokens_affected: 0,
+        };
+    }
+
+    let blocks_per_token = head_dim / QKKV;
+    let eps = config.epsilon.max(1e-10);
+    let mut per_head_vopr = vec![0.0f32; kv_heads];
+
+    // Pre-compute dequantized V for the flush region to avoid redundant quantize round-trips
+    // across Q-heads within the same KV-head.
+    // Layout: [kv_heads][flush_tokens][head_dim]
+    let mut v_quant_all = vec![0.0f32; kv_heads * flush_tokens * head_dim];
+    for h in 0..kv_heads {
+        let head_base = h * res_cap * head_dim;
+        for t in 0..flush_tokens {
+            let tok_base = head_base + t * head_dim;
+            let out_base = h * flush_tokens * head_dim + t * head_dim;
+            for b in 0..blocks_per_token {
+                let src_start = tok_base + b * QKKV;
+                if src_start + QKKV > res_v.len() {
+                    continue;
+                }
+                let chunk: &[f32; QKKV] = res_v[src_start..src_start + QKKV].try_into().unwrap();
+                let out = &mut v_quant_all[out_base + b * QKKV..out_base + (b + 1) * QKKV];
+                let out_arr: &mut [f32; QKKV] = out.try_into().unwrap();
+                match bits {
+                    2 => {
+                        let block = BlockQ2_0::quantize(chunk);
+                        block.dequantize(out_arr);
+                    }
+                    4 => {
+                        let block = BlockKVQ4::quantize(chunk);
+                        block.dequantize(out_arr);
+                    }
+                    8 => {
+                        let block = BlockKVQ8::quantize(chunk);
+                        block.dequantize(out_arr);
+                    }
+                    _ => {
+                        out_arr.copy_from_slice(chunk);
+                    }
+                }
+            }
+        }
+    }
+
+    for (kv_h, vopr_slot) in per_head_vopr.iter_mut().enumerate() {
+        let head_base = kv_h * res_cap * head_dim;
+        let quant_head_base = kv_h * flush_tokens * head_dim;
+        let mut ratio_sum = 0.0f32;
+
+        for g in 0..gqa_group_size {
+            let qh = kv_h * gqa_group_size + g;
+            let mut delta_o = vec![0.0f32; head_dim];
+            let mut orig_o = vec![0.0f32; head_dim];
+
+            for t in 0..flush_tokens {
+                let cache_pos = flush_cache_start + t;
+
+                // Attention weight for this Q-head at this position
+                let alpha = if cache_pos < scores_valid_len {
+                    attn_scores[qh * scores_stride + cache_pos]
+                } else {
+                    1.0 / scores_valid_len.max(1) as f32
+                };
+
+                let tok_base = head_base + t * head_dim;
+                let quant_tok_base = quant_head_base + t * head_dim;
+
+                for d in 0..head_dim {
+                    let idx = tok_base + d;
+                    if idx < res_v.len() {
+                        let v_orig = res_v[idx];
+                        let v_quant = v_quant_all[quant_tok_base + d];
+                        let delta_v = v_orig - v_quant;
+
+                        delta_o[d] += alpha * delta_v;
+                        orig_o[d] += alpha * v_orig;
+                    }
+                }
+            }
+
+            let norm_delta = delta_o.iter().map(|&x| x * x).sum::<f32>().sqrt();
+            let norm_orig = orig_o.iter().map(|&x| x * x).sum::<f32>().sqrt();
+            let ratio_qh = norm_delta / norm_orig.max(eps);
+
+            ratio_sum += ratio_qh;
+        }
+
+        *vopr_slot = ratio_sum / gqa_group_size as f32;
+    }
+
+    let raw_value = per_head_vopr.iter().sum::<f32>() / kv_heads as f32;
+
+    QcfMetric {
+        action: "aw_vopr".to_string(),
+        raw_value,
+        normalized_value: raw_value,
+        per_head: Some(per_head_vopr),
+        tokens_affected: flush_tokens,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1131,5 +1302,298 @@ mod tests {
         assert_eq!(metric.action, "kivi_awqe");
         assert!(metric.raw_value >= 0.0);
         assert_eq!(metric.tokens_affected, flush_tokens);
+    }
+
+    // ── AW-VOPR tests ─────────────────────────────────────────────────────────
+
+    /// AW-VOPR with empty input returns zero.
+    #[test]
+    fn test_aw_vopr_empty() {
+        let config = QcfConfig::default();
+        let params = FlushAwVoprParams {
+            res_v: &[],
+            kv_heads: 1,
+            head_dim: 32,
+            flush_tokens: 0,
+            res_cap: 32,
+            bits: 4,
+            attn_scores: &[],
+            n_heads_q: 1,
+            scores_stride: 32,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: 0,
+        };
+        let metric = compute_flush_aw_vopr(&params, &config);
+        assert_eq!(metric.action, "aw_vopr");
+        assert_eq!(metric.raw_value, 0.0);
+        assert_eq!(metric.tokens_affected, 0);
+    }
+
+    /// AW-VOPR is non-negative for non-trivial data.
+    #[test]
+    fn test_aw_vopr_basic_non_negative() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+
+        let config = QcfConfig::default();
+        let params = FlushAwVoprParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_aw_vopr(&params, &config);
+
+        assert_eq!(metric.action, "aw_vopr");
+        assert!(
+            metric.raw_value >= 0.0,
+            "AW-VOPR must be non-negative, got {}",
+            metric.raw_value
+        );
+        assert_eq!(metric.tokens_affected, flush_tokens);
+        assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
+    }
+
+    /// AW-VOPR with zero attention weights returns zero (no output perturbation).
+    #[test]
+    fn test_aw_vopr_zero_attention() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        // All attention weights zero
+        let scores = vec![0.0f32; n_heads_q * stride];
+
+        let config = QcfConfig::default();
+        let params = FlushAwVoprParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_aw_vopr(&params, &config);
+
+        assert!(
+            metric.raw_value < 1e-6,
+            "zero attention -> AW-VOPR should be ~0, got {}",
+            metric.raw_value
+        );
+    }
+
+    /// AW-VOPR with constant V (zero quantization error) returns zero.
+    #[test]
+    fn test_aw_vopr_zero_quant_error() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        // All same value -> variance=0 -> quant error=0
+        let res_v = vec![1.0f32; kv_heads * res_cap * head_dim];
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+
+        let config = QcfConfig::default();
+        let params = FlushAwVoprParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_aw_vopr(&params, &config);
+
+        assert!(
+            metric.raw_value < 1e-6,
+            "constant V -> zero quant error -> AW-VOPR should be ~0, got {}",
+            metric.raw_value
+        );
+    }
+
+    /// AW-VOPR <= AWQE conceptually: vector cancellation should reduce measured error.
+    /// With uniform attention and non-trivial data, AW-VOPR captures directional
+    /// cancellation that AWQE does not.
+    #[test]
+    fn test_aw_vopr_le_awqe_uniform_attention() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+        let config = QcfConfig::default();
+
+        let awqe_params = FlushAwqeParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let awqe = compute_flush_awqe(&awqe_params, &config);
+
+        let vopr_params = FlushAwVoprParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let vopr = compute_flush_aw_vopr(&vopr_params, &config);
+
+        // Both should be non-negative
+        assert!(awqe.raw_value >= 0.0);
+        assert!(vopr.raw_value >= 0.0);
+
+        // AW-VOPR should be smaller or comparable to AWQE (vector cancellation)
+        // Allow small margin for numerical differences
+        assert!(
+            vopr.raw_value <= awqe.raw_value + 0.01,
+            "AW-VOPR ({}) should be <= AWQE ({}) + margin (vector cancellation)",
+            vopr.raw_value,
+            awqe.raw_value
+        );
+    }
+
+    /// AW-VOPR with GQA: n_heads_q=4, kv_heads=2 (G=2).
+    #[test]
+    fn test_aw_vopr_gqa() {
+        let kv_heads = 2;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 4;
+        let gqa_group_size = n_heads_q / kv_heads; // = 2
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+
+        let config = QcfConfig::default();
+        let params = FlushAwVoprParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits: 4,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+        let metric = compute_flush_aw_vopr(&params, &config);
+
+        assert_eq!(metric.action, "aw_vopr");
+        assert!(metric.raw_value >= 0.0);
+        assert_eq!(metric.per_head.as_ref().unwrap().len(), kv_heads);
+        // Both heads should have non-negative per-head values
+        for &ph in metric.per_head.as_ref().unwrap() {
+            assert!(ph >= 0.0, "per-head AW-VOPR must be non-negative, got {ph}");
+        }
+    }
+
+    /// AW-VOPR bits=2 should produce higher error than bits=4.
+    #[test]
+    fn test_aw_vopr_bits_ordering() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let flush_tokens = 32;
+        let res_cap = 32;
+        let n_heads_q = 1;
+        let valid_len = flush_tokens;
+        let stride = flush_tokens;
+
+        let res_v = make_res_v(kv_heads, res_cap, head_dim);
+        let scores = make_uniform_scores(n_heads_q, stride, valid_len);
+        let config = QcfConfig::default();
+
+        let make_params = |bits: u8| FlushAwVoprParams {
+            res_v: &res_v,
+            kv_heads,
+            head_dim,
+            flush_tokens,
+            res_cap,
+            bits,
+            attn_scores: &scores,
+            n_heads_q,
+            scores_stride: stride,
+            gqa_group_size: 1,
+            flush_cache_start: 0,
+            scores_valid_len: valid_len,
+        };
+
+        let vopr_q2 = compute_flush_aw_vopr(&make_params(2), &config).raw_value;
+        let vopr_q4 = compute_flush_aw_vopr(&make_params(4), &config).raw_value;
+        let vopr_q8 = compute_flush_aw_vopr(&make_params(8), &config).raw_value;
+
+        assert!(
+            vopr_q2 >= vopr_q4,
+            "Q2 AW-VOPR ({vopr_q2}) should be >= Q4 ({vopr_q4})"
+        );
+        assert!(
+            vopr_q4 >= vopr_q8,
+            "Q4 AW-VOPR ({vopr_q4}) should be >= Q8 ({vopr_q8})"
+        );
     }
 }

@@ -39,6 +39,12 @@ pub struct KiviHook {
     flush_count: usize,
     /// Max OPR value across all flushes for current question (representative QCF-KIVI).
     qcf_kivi_max: f32,
+    /// Max AW-VOPR value across all flushes for current question.
+    qcf_aw_vopr_max: f32,
+    /// Sum of AW-VOPR values across all flushes for current question.
+    qcf_aw_vopr_sum: f32,
+    /// Count of AW-VOPR metrics collected for current question.
+    aw_vopr_count: usize,
 }
 
 impl KiviHook {
@@ -47,6 +53,9 @@ impl KiviHook {
             qcf_config,
             flush_count: 0,
             qcf_kivi_max: 0.0,
+            qcf_aw_vopr_max: 0.0,
+            qcf_aw_vopr_sum: 0.0,
+            aw_vopr_count: 0,
         }
     }
 
@@ -59,6 +68,10 @@ impl KiviHook {
             if metric.action == "kivi_opr" {
                 self.qcf_kivi_max = self.qcf_kivi_max.max(metric.raw_value);
                 self.flush_count += 1;
+            } else if metric.action == "aw_vopr" {
+                self.qcf_aw_vopr_max = self.qcf_aw_vopr_max.max(metric.raw_value);
+                self.qcf_aw_vopr_sum += metric.raw_value;
+                self.aw_vopr_count += 1;
             }
             // NMSE ("kivi" action) tracked but not exposed as per-question scalar
         }
@@ -93,6 +106,9 @@ impl StepHook<KiviCache> for KiviHook {
         }
         self.flush_count = 0;
         self.qcf_kivi_max = 0.0;
+        self.qcf_aw_vopr_max = 0.0;
+        self.qcf_aw_vopr_sum = 0.0;
+        self.aw_vopr_count = 0;
     }
 
     fn snapshot(&self, caches: &[KiviCache]) -> Box<dyn CacheSnapshot<KiviCache>> {
@@ -118,6 +134,13 @@ impl StepHook<KiviCache> for KiviHook {
         if self.flush_count > 0 {
             obj["qcf_kivi"] = serde_json::json!(self.qcf_kivi_max);
             obj["qcf_kivi_flush_count"] = serde_json::json!(self.flush_count);
+        }
+        if self.aw_vopr_count > 0 {
+            obj["qcf_kivi_aw_vopr_max"] = serde_json::json!(self.qcf_aw_vopr_max);
+            obj["qcf_kivi_aw_vopr_sum"] = serde_json::json!(self.qcf_aw_vopr_sum);
+            obj["qcf_kivi_aw_vopr_mean"] =
+                serde_json::json!(self.qcf_aw_vopr_sum / self.aw_vopr_count as f32);
+            obj["qcf_kivi_aw_vopr_count"] = serde_json::json!(self.aw_vopr_count);
         }
         obj
     }

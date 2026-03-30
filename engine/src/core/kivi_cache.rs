@@ -527,6 +527,27 @@ impl KiviCache {
                         &awqe_params,
                         &qcf_config,
                     ));
+
+                // AW-VOPR: attention-weighted vector output perturbation ratio
+                let vopr_params = crate::core::qcf::FlushAwVoprParams {
+                    res_v: &self.res_v,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    flush_tokens,
+                    res_cap: self.res_cap,
+                    bits: self.bits,
+                    attn_scores: &attn.scores,
+                    n_heads_q: attn.n_heads_q,
+                    scores_stride: attn.stride,
+                    gqa_group_size,
+                    flush_cache_start: self.q2_tokens,
+                    scores_valid_len: attn.valid_len,
+                };
+                self.flush_proxies
+                    .push(crate::core::qcf::compute_flush_aw_vopr(
+                        &vopr_params,
+                        &qcf_config,
+                    ));
             }
         }
 
@@ -953,6 +974,27 @@ impl KiviCache {
                 self.flush_proxies
                     .push(crate::core::qcf::compute_flush_awqe(
                         &awqe_params,
+                        &qcf_config,
+                    ));
+
+                // AW-VOPR: attention-weighted vector output perturbation ratio
+                let vopr_params = crate::core::qcf::FlushAwVoprParams {
+                    res_v: &self.res_v,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    flush_tokens,
+                    res_cap: self.res_cap,
+                    bits: self.bits,
+                    attn_scores: &attn.scores,
+                    n_heads_q: attn.n_heads_q,
+                    scores_stride: attn.stride,
+                    gqa_group_size,
+                    flush_cache_start: self.q2_tokens,
+                    scores_valid_len: attn.valid_len,
+                };
+                self.flush_proxies
+                    .push(crate::core::qcf::compute_flush_aw_vopr(
+                        &vopr_params,
                         &qcf_config,
                     ));
             }

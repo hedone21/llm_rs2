@@ -19,7 +19,8 @@ pub use eviction_qcf::{
 };
 pub use layer_importance::{ImportanceCollector, ImportanceTable, SubLayer};
 pub use quant_qcf::{
-    FlushAwqeParams, FlushQcfParams, compute_flush_awqe, compute_flush_opr, compute_flush_qcf,
+    FlushAwVoprParams, FlushAwqeParams, FlushQcfParams, compute_flush_aw_vopr, compute_flush_awqe,
+    compute_flush_opr, compute_flush_qcf,
 };
 pub use skip_qcf::SkipQcfTracker;
 
