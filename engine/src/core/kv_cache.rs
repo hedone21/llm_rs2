@@ -2102,6 +2102,7 @@ mod tests {
     }
 
     /// Read VmRSS from /proc/self/status in bytes.
+    #[cfg(target_os = "linux")]
     fn read_rss_bytes() -> usize {
         let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
         for line in status.lines() {
@@ -2175,6 +2176,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_release_unused_pages_rss_reduction() {
         // Allocate large cache, touch pages, then release and check RSS drops
@@ -2326,6 +2328,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_prune_prefix_calls_release_unused_pages() {
         // prune_prefix should release pages (verified via RSS)

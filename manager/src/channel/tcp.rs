@@ -444,7 +444,7 @@ mod tests {
         assert!(channel.is_connected());
 
         drop(client);
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(300));
 
         let signal = SystemSignal::MemoryPressure {
             level: Level::Warning,
@@ -452,7 +452,13 @@ mod tests {
             total_bytes: 2_000_000_000,
             reclaim_target_bytes: 50_000_000,
         };
+        // On macOS, the first write after peer close may succeed (buffered in kernel).
+        // The second write reliably triggers Broken pipe / EPIPE after RST is received.
         channel.emit(&signal).unwrap();
+        if channel.is_connected() {
+            std::thread::sleep(Duration::from_millis(100));
+            channel.emit(&signal).unwrap();
+        }
         assert!(!channel.is_connected());
     }
 
