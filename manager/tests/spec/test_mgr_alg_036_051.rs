@@ -185,13 +185,7 @@ fn test_mgr_081_engine_state_parses_actions() {
     let mut p = make_pipeline();
 
     // available_actions에 throttle만 설정
-    let msg = make_heartbeat(
-        0.25,
-        "cpu",
-        "none",
-        vec!["throttle".to_string()],
-        vec![],
-    );
+    let msg = make_heartbeat(0.25, "cpu", "none", vec!["throttle".to_string()], vec![]);
     p.update_engine_state(&msg);
 
     // 이후 process_signal에서 ActionSelector가 available_actions를 참조하여

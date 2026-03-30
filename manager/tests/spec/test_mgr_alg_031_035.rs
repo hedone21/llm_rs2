@@ -6,11 +6,9 @@
 use std::collections::HashMap;
 
 use llm_manager::selector::ActionSelector;
-use llm_manager::types::{
-    ActionCommand, ActionId, OperatingMode, Operation, PressureVector,
-};
+use llm_manager::types::{ActionCommand, ActionId, OperatingMode, Operation, PressureVector};
 
-use super::helpers::{make_registry, no_state, rv, MockEstimator};
+use super::helpers::{MockEstimator, make_registry, no_state, rv};
 
 fn pv(compute: f32, memory: f32, thermal: f32) -> PressureVector {
     PressureVector {
@@ -389,8 +387,7 @@ fn test_mgr_alg_033_latency_budget_constraint() {
     );
 
     let ids = command_ids(&cmds);
-    let both_selected =
-        ids.contains(&ActionId::Throttle) && ids.contains(&ActionId::KvOffloadDisk);
+    let both_selected = ids.contains(&ActionId::Throttle) && ids.contains(&ActionId::KvOffloadDisk);
     assert!(
         !both_selected,
         "throttle+offload together exceeds latency budget"

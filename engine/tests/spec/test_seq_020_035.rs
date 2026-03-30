@@ -1,5 +1,6 @@
 //! SEQ-011 ~ SEQ-035: 핸드셰이크 및 정상 운영 시퀀스 (Engine-side)
 //!
+//! 커버: SEQ-020 (Handshake), SEQ-030 (Steady-State)
 //! CommandExecutor의 capability 전송, heartbeat 발생, 빈 inbox 처리,
 //! EOF disconnect 내성, MessageLoop E2E 파이프라인을 검증한다.
 

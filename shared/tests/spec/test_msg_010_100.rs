@@ -1,5 +1,6 @@
 //! MSG-010 ~ MSG-100: Shared Protocol Types Serde + Ordering
 //!
+//! 커버: MSG-010, MSG-011, MSG-020, MSG-030 (EngineCommand 13종 serde)
 //! ManagerMessage/EngineMessage serde, EngineDirective/EngineCommand 10종 serde,
 //! EngineCapability, EngineStatus (backward compat), CommandResult/CommandResponse,
 //! ResourceLevel ordering, EngineState serde, Level ordering,

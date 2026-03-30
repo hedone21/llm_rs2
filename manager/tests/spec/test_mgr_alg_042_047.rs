@@ -3,8 +3,8 @@
 //! OnlineLinearEstimator의 초기 default relief, 학습 수렴,
 //! 액션 독립성, observation count, save/load roundtrip을 검증한다.
 
-use llm_manager::relief::linear::OnlineLinearEstimator;
 use llm_manager::relief::ReliefEstimator;
+use llm_manager::relief::linear::OnlineLinearEstimator;
 use llm_manager::types::{ActionId, FEATURE_DIM, FeatureVector, ReliefVector};
 
 fn make_state(values: [f32; FEATURE_DIM]) -> FeatureVector {

@@ -1,5 +1,6 @@
 /// INV-020 ~ INV-026 (+ INV-014, INV-025): Protocol seq_id 및 Directive/Response 불변식 테스트
 ///
+/// 추가 커버: PROTO-074 (seq_id 생성), PROTO-075 (Directive-Response 1:1)
 /// - INV-014: seq_id 단조 증가 (01-architecture SYS-094, INV-020 재확인)
 /// - INV-020: seq_id 단조 증가 — seq_id(N+1) > seq_id(N)
 /// - INV-021: seq_id 재사용 금지

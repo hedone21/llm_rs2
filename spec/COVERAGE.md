@@ -104,3 +104,116 @@
 | INV-083 | PI Controller output은 [0, 1] 범위 내. | Correctness | ✅ | `manager/tests/spec/test_inv_083_085.rs` |
 | INV-084 | ActionSelector = stateless. ReliefEstimator.predict = 읽기 전용. | Correctness | 🔶 | (static: 코드 구조) |
 | INV-085 | Normal 모드에서 액션 미발행. | Correctness | ✅ | `manager/tests/spec/test_inv_083_085.rs` |
+
+---
+
+# Part II — 행위 명세 (PREFIX-NNN) 추적
+
+> 추적 대상: ~55개 | ✅ 43 | ⬜ 0
+
+## 선별 기준
+
+| 분류 | 설명 | 예시 |
+|------|------|------|
+| (A) Pseudocode | PRE/POST가 있는 함수/알고리즘 | eviction, PI controller |
+| (B) Formula | 수학 공식, 계산식 | EnergyConstraint 수식, 타이밍 관계 |
+| (C) Transition Table | 상태 전이 완전 열거 | OperatingMode FSM, ConnectionState |
+| (D) Field Spec | 필드명, 타입, 범위가 구체적인 데이터 구조 | Frame 구조, Config 기본값 |
+| (E) Sequence | 단계별 시퀀스 정의 | Handshake, Steady-State |
+
+## Protocol
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| PROTO-010 | (D) | Frame 구조 (4-byte BE length prefix) | ✅ | `engine/tests/spec/test_proto_010_062.rs` |
+| PROTO-012 | (D) | MAX_PAYLOAD 64KB 가드 | ✅ | `engine/tests/spec/test_proto_010_062.rs` |
+| PROTO-042 | (C) | Connection 3-state FSM (Listening/Connected/Disconnected) | ✅ | `engine/tests/spec/test_proto_042_073.rs` |
+| PROTO-073 | (A) | try_recv 드레인 (while let Ok 배치 처리) | ✅ | `engine/tests/spec/test_proto_042_073.rs` |
+| PROTO-074 | (A) | seq_id 단조 증가 생성 | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| PROTO-075 | (D) | Directive-Response 1:1 대응 | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+
+## Message (Shared)
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| MSG-010 | (D) | ManagerMessage serde round-trip | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+| MSG-011 | (D) | EngineMessage 4종 serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+| MSG-020 | (D) | EngineDirective serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+| MSG-030 | (D) | EngineCommand 13종 serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+
+## Sequence
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| SEQ-020 | (E) | Handshake 시퀀스 | ✅ | `engine/tests/spec/test_seq_020_035.rs` |
+| SEQ-030 | (E) | Steady-State 루프 | ✅ | `engine/tests/spec/test_seq_020_035.rs` |
+| SEQ-040 | (E) | Pressure Escalation 시퀀스 | ✅ | `engine/tests/spec/test_seq_040_064.rs` |
+
+## Manager Algorithm
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| MGR-ALG-010 | (B) | PI Controller 비례+적분 계산 | ✅ | `manager/tests/spec/test_mgr_alg_010_014.rs` |
+| MGR-ALG-011 | (A) | Gain Scheduling (구간별 Kp) | ✅ | `manager/tests/spec/test_mgr_alg_010_014.rs` |
+| MGR-ALG-012 | (A) | Anti-Windup (can_act=false 시 적분 동결) | ✅ | `manager/tests/spec/test_mgr_alg_010_014.rs` |
+| MGR-ALG-013 | (D) | PI 인스턴스 파라미터 (Kp/Ki/setpoint) | ✅ | `manager/tests/spec/test_mgr_alg_010_014.rs` |
+| MGR-ALG-013a | (A) | Memory 임계값 직접 매핑 (Descending ThresholdEvaluator) | ✅ | `manager/tests/spec/test_mgr_alg_013a_016.rs` |
+| MGR-ALG-014 | (A) | Measurement Normalization (CPU/온도/메모리 → [0,1]) | ✅ | `manager/tests/spec/test_mgr_alg_013a_016.rs` |
+| MGR-ALG-015 | (B) | EnergyConstraint → compute 보조 압력 수식 | ✅ | `manager/tests/spec/test_mgr_alg_013a_016.rs` |
+| MGR-ALG-016 | (A) | Elapsed dt 계산 (첫 호출=기본값, 후속=실측) | ✅ | `manager/tests/spec/test_mgr_alg_013a_016.rs` |
+
+## Manager State
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| MGR-050 | (C) | OperatingMode FSM (Normal/Warning/Critical) | ✅ | `manager/tests/spec/test_mgr_050_054.rs` |
+| MGR-055 | (C) | OperatingMode 하강 hold_time | ✅ | `manager/tests/spec/test_mgr_050_054.rs` |
+| MGR-060 | (C) | ConnectionState FSM (Listening/Connected/Disconnected) | ✅ | `manager/tests/spec/test_mgr_060_061.rs` |
+| MGR-061 | (C) | ConnectionState 재연결 (Disconnected→Connected) | ✅ | `manager/tests/spec/test_mgr_060_061.rs` |
+| MGR-067 | (C) | ThresholdEvaluator Ascending 에스컬레이션 | ✅ | `manager/tests/spec/test_mgr_067_072.rs` |
+| MGR-072 | (C) | ThresholdEvaluator Descending 에스컬레이션 | ✅ | `manager/tests/spec/test_mgr_067_072.rs` |
+
+## Manager Data
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| MGR-DAT-020 | (D) | Config 최상위 구조 | ✅ | `manager/tests/spec/test_mgr_dat_020_056.rs` |
+| MGR-DAT-021 | (D) | PolicyConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_020_056.rs` |
+| MGR-DAT-022 | (D) | MemoryMonitorConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_022_024.rs` |
+| MGR-DAT-023 | (D) | ThermalMonitorConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_022_024.rs` |
+| MGR-DAT-024 | (D) | ComputeMonitorConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_022_024.rs` |
+
+## Engine State
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| ENG-ST-011 | (A) | OperatingMode worst-wins 결정 | ✅ | `engine/tests/spec/test_fsm_operating_mode.rs` |
+| ENG-ST-013 | (C) | OperatingMode 전이 테이블 | ✅ | `engine/tests/spec/test_fsm_operating_mode.rs` |
+| ENG-ST-020 | (C) | EngineState 전이 (Idle→Running→Suspended) | ✅ | `engine/tests/spec/test_eng_st_010_035.rs` |
+| ENG-ST-021 | (C) | EngineState 전이 (Resume→Running) | ✅ | `engine/tests/spec/test_eng_st_010_035.rs` |
+| ENG-ST-031 | (D) | active_actions 추적 | ✅ | `engine/tests/spec/test_eng_st_010_035.rs` |
+| ENG-ST-032 | (D) | available_actions 동적 계산 | ✅ | `engine/tests/spec/test_eng_st_032.rs` |
+| ENG-ST-033 | (C) | Command 13종 처리 결과 | ✅ | `engine/tests/spec/test_eng_st_010_035.rs` |
+
+## Engine Algorithm
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| ENG-ALG-010 | (A) | H2O Eviction 알고리즘 | ✅ | `engine/tests/spec/test_eng_alg_010_012.rs` |
+| ENG-ALG-011 | (A) | Sliding Window Eviction | ✅ | `engine/tests/spec/test_eng_alg_010_012.rs` |
+| ENG-ALG-012 | (A) | D2O Compensation | ✅ | `engine/tests/spec/test_eng_alg_010_012.rs` |
+| ENG-ALG-020 | (A) | KIVI 양자화 | ✅ | `engine/tests/spec/test_eng_alg_020_022.rs` |
+
+## Engine Data
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| ENG-DAT-012 | (D) | KVCache 구현 | ✅ | `engine/tests/spec/test_eng_dat_012_031.rs` |
+| ENG-DAT-020 | (D) | Buffer trait | ✅ | `engine/tests/spec/test_eng_dat_012_031.rs` |
+
+## Cross-cutting
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| CROSS-060 | (D) | 타이밍 상수 정의 (heartbeat_interval, MAX_PAYLOAD_SIZE) | ✅ | `engine/tests/spec/test_cross_060_061.rs` |
+| CROSS-061 | (B) | 타이밍 관계 수식 (heartbeat > recv_timeout) | ✅ | `engine/tests/spec/test_cross_060_061.rs` |

@@ -24,20 +24,28 @@ mod test_inv_050;
 mod test_inv_083_085;
 
 // 비-INV 요구사항 Spec 테스트
-#[path = "spec/test_mgr_alg_010_014.rs"]
-mod test_mgr_alg_010_014;
 #[path = "spec/test_mgr_050_054.rs"]
 mod test_mgr_050_054;
-#[path = "spec/test_mgr_alg_031_035.rs"]
-mod test_mgr_alg_031_035;
 #[path = "spec/test_mgr_067_072.rs"]
 mod test_mgr_067_072;
+#[path = "spec/test_mgr_alg_010_014.rs"]
+mod test_mgr_alg_010_014;
+#[path = "spec/test_mgr_alg_031_035.rs"]
+mod test_mgr_alg_031_035;
+#[path = "spec/test_mgr_alg_036_051.rs"]
+mod test_mgr_alg_036_051;
 #[path = "spec/test_mgr_alg_042_047.rs"]
 mod test_mgr_alg_042_047;
 #[path = "spec/test_mgr_dat_020_056.rs"]
 mod test_mgr_dat_020_056;
-#[path = "spec/test_mgr_alg_036_051.rs"]
-mod test_mgr_alg_036_051;
+
+// ── 갭 테스트 (MGR-ALG / MGR-060 / MGR-DAT) ──
+#[path = "spec/test_mgr_060_061.rs"]
+mod test_mgr_060_061;
+#[path = "spec/test_mgr_alg_013a_016.rs"]
+mod test_mgr_alg_013a_016;
+#[path = "spec/test_mgr_dat_022_024.rs"]
+mod test_mgr_dat_022_024;
 
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_040_064_mgr.rs"]

@@ -37,6 +37,14 @@ mod test_eng_st_052_060;
 #[path = "spec/test_proto_010_062.rs"]
 mod test_proto_010_062;
 
+// ── Protocol / State / Cross-cutting 테스트 ──
+#[path = "spec/test_cross_060_061.rs"]
+mod test_cross_060_061;
+#[path = "spec/test_eng_st_032.rs"]
+mod test_eng_st_032;
+#[path = "spec/test_proto_042_073.rs"]
+mod test_proto_042_073;
+
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;

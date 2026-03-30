@@ -130,6 +130,70 @@ fi
 rm -f "$ALL_IDS_FILE" "$TEST_IDS_FILE"
 
 # ═══════════════════════════════════════════════════
+# [4b] Part II — PREFIX-NNN 행위 명세 추적
+# ═══════════════════════════════════════════════════
+echo ""
+echo "[4b/Part II 행위 명세] COVERAGE.md Part II 추적 대상 PREFIX-NNN 커버리지"
+
+# COVERAGE.md Part II에서 추적 대상 PREFIX-NNN 목록 (하드코딩)
+PART2_IDS="PROTO-010 PROTO-012 PROTO-042 PROTO-073 PROTO-074 PROTO-075 \
+MSG-010 MSG-011 MSG-020 MSG-030 \
+SEQ-020 SEQ-030 SEQ-040 \
+MGR-ALG-010 MGR-ALG-011 MGR-ALG-012 MGR-ALG-013 MGR-ALG-013a MGR-ALG-014 MGR-ALG-015 MGR-ALG-016 \
+MGR-050 MGR-055 MGR-060 MGR-061 MGR-067 MGR-072 \
+MGR-DAT-020 MGR-DAT-021 MGR-DAT-022 MGR-DAT-023 MGR-DAT-024 \
+ENG-ST-011 ENG-ST-013 ENG-ST-020 ENG-ST-021 ENG-ST-031 ENG-ST-032 ENG-ST-033 \
+ENG-ALG-010 ENG-ALG-011 ENG-ALG-012 ENG-ALG-020 \
+ENG-DAT-012 ENG-DAT-020 \
+CROSS-060 CROSS-061"
+
+# tests/spec/ 및 shared/tests/spec/ 에서 참조 ID 수집
+PART2_TEST_IDS=$(mktemp)
+{
+  grep -rohE '(PROTO|MSG|SEQ|MGR-ALG|MGR-DAT|MGR|ENG-ST|ENG-ALG|ENG-DAT|CROSS)-[0-9a-z]+' \
+    engine/tests/spec/ manager/tests/spec/ shared/tests/spec/ 2>/dev/null || true
+  # 파일명에서 ID 추출 (test_mgr_alg_013a → MGR-ALG-013a 등)
+  for f in engine/tests/spec/test_*.rs manager/tests/spec/test_*.rs shared/tests/spec/test_*.rs; do
+    [ -f "$f" ] || continue
+    basename "$f" .rs | sed 's/^test_//' | tr '_' '-' | tr '[:lower:]' '[:upper:]'
+  done
+} | sort -u > "$PART2_TEST_IDS"
+
+P2_TOTAL=0
+P2_COVERED=0
+P2_MISSING=""
+for id in $PART2_IDS; do
+  P2_TOTAL=$((P2_TOTAL + 1))
+  # 검색: ID가 테스트 파일/코드에서 참조되는지 (대소문자 무시로 파일명+내용 매칭)
+  id_lower=$(echo "$id" | tr '[:upper:]' '[:lower:]' | tr '-' '_')
+  # 파일 내용 검색 + 파일명 검색 (test_proto_074 → PROTO-074 등)
+  found=false
+  if grep -rqiE "(${id}|${id_lower})" engine/tests/spec/ manager/tests/spec/ shared/tests/spec/ 2>/dev/null; then
+    found=true
+  elif ls engine/tests/spec/test_*${id_lower}*.rs manager/tests/spec/test_*${id_lower}*.rs shared/tests/spec/test_*${id_lower}*.rs 2>/dev/null | grep -q .; then
+    found=true
+  fi
+  if [ "$found" = true ]; then
+    P2_COVERED=$((P2_COVERED + 1))
+  else
+    P2_MISSING="${P2_MISSING}  ${id}\n"
+  fi
+done
+
+if [ "$P2_TOTAL" -gt 0 ]; then
+  P2_PCT=$((P2_COVERED * 100 / P2_TOTAL))
+else
+  P2_PCT=0
+fi
+echo "  추적 대상: ${P2_TOTAL}"
+echo "  테스트 존재: ${P2_COVERED} (${P2_PCT}%)"
+echo "  누락: $((P2_TOTAL - P2_COVERED))"
+if [ -n "$P2_MISSING" ]; then
+  echo "  누락 목록:"
+  echo -e "$P2_MISSING"
+fi
+
+# ═══════════════════════════════════════════════════
 # [5] INV 커버리지 통합 통계
 # ═══════════════════════════════════════════════════
 echo ""

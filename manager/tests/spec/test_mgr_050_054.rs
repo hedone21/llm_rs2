@@ -1,5 +1,6 @@
-//! MGR-050 ~ MGR-054: Supervisory FSM Spec 테스트
+//! MGR-050 ~ MGR-055: Supervisory FSM Spec 테스트
 //!
+//! 커버: MGR-050 (OperatingMode FSM), MGR-055 (하강 hold_time)
 //! Supervisory Layer의 상승/하강 전환 로직, hold_time 기반 hysteresis,
 //! spike 시 stable_since 리셋을 검증한다.
 
