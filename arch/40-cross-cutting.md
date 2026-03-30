@@ -1,115 +1,270 @@
 # Cross-cutting Concerns -- Architecture
 
-> spec/40-cross-cutting.md의 구현 상세.
+> spec/40-cross-cutting.md의 구현 상세. 컴포넌트 중심 기술.
 
-## 코드 매핑
+---
 
-### 3.1 Fail-Safety
+## 1. Fail-Safety 전략 (Engine/Manager 독립성)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-010 (독립성) | Cargo.toml 의존 구조 | Engine, Manager = 별도 바이너리 (별도 OS 프로세스) | Shared가 유일한 공유 의존성 |
-| CROSS-011 (Engine 독립) | `engine/src/bin/generate.rs` | `command_executor = None` 시 resilience checkpoint skip, 순수 추론 | Manager 연결 끊김 시 MessageLoop 종료 |
-| CROSS-011 | `engine/src/resilience/executor.rs` | `CommandExecutor` — `poll()` 내부에서 Heartbeat 자동 전송 | Manager 연결 끊김 후에도 추론 계속 |
-| CROSS-012 (Manager 독립) | `manager/src/pipeline.rs` | `emit_directive()` → `ensure_connected()` — accept 실패 시 skip, Ok 반환 | Policy 루프 계속 |
-| CROSS-012 | `manager/src/emitter/unix_socket.rs`, `manager/src/emitter/dbus.rs` | Emitter — 쓰기 오류 시 Disconnected 전이, Ok 반환 | |
-| CROSS-013 (Emergency) | `engine/src/resilience/dbus_transport.rs` | D-Bus 경로: Emergency SystemSignal → Suspend EngineCommand | Engine 자율 대응 |
-| CROSS-013 | `engine/src/resilience/strategy/memory.rs` | MemoryStrategy: Emergency → Evict(0.25) + RejectNew | |
-| CROSS-013 | `engine/src/resilience/strategy/thermal.rs` | ThermalStrategy: Emergency → Suspend | |
-| CROSS-013 | `engine/src/resilience/strategy/energy.rs` | EnergyStrategy: Emergency → Suspend + RejectNew | |
+### 설계 결정
 
-### 3.2 Shared Crate Boundary
+Engine과 Manager는 별도 OS 프로세스로, 상대방 장애가 자신의 핵심 루프를 중단시키지 않는다 (INV-005, INV-006). 공유 의존성은 `llm_shared` 크레이트뿐이며, 런타임 통신은 IPC(Unix Socket/TCP)로만 이루어진다.
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-020 | `engine/Cargo.toml`, `manager/Cargo.toml`, `shared/Cargo.toml` | Engine→Shared, Manager→Shared 의존만 존재 | Engine↔Manager 직접 의존 없음 |
-| CROSS-021 | `shared/src/lib.rs` | ManagerMessage, EngineMessage, EngineDirective, EngineCommand, CommandResponse, CommandResult, EngineCapability, EngineStatus, QcfEstimate, ResourceLevel, EngineState, Level, SystemSignal 등 | |
-| CROSS-022 | `shared/src/lib.rs` | serde 어노테이션: `tag="type"`, `rename_all="snake_case"` (internally tagged) | SystemSignal은 externally tagged |
+```mermaid
+flowchart TB
+    subgraph Engine["Engine Process"]
+        InfLoop[Inference Loop<br>generate.rs] --> |poll| Executor[CommandExecutor]
+        Executor --> |mpsc| MsgLoop[MessageLoop thread]
+        MsgLoop --> |Transport| IPC((IPC))
+    end
+    subgraph Manager["Manager Process"]
+        Monitors[Monitor threads] --> |mpsc| Policy[HierarchicalPolicy]
+        Policy --> |emit| Emitter[Emitter]
+        Emitter --> IPC
+    end
+    subgraph Shared["llm_shared crate"]
+        Types[SystemSignal, EngineCommand,<br>EngineMessage, ManagerMessage]
+    end
+    Engine -.->|compile dep| Shared
+    Manager -.->|compile dep| Shared
+```
 
-### 3.3 Protocol Version Compatibility
+### Engine 독립 동작 (CROSS-011)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-030 | `shared/src/lib.rs` | 새 필드에 `#[serde(default)]` 적용 | EngineStatus 5개 필드 등 |
-| CROSS-031 | (정적 보증) | 기존 필드 삭제/변경 금지 — 코드 리뷰로 보장 | |
-| CROSS-032 | `shared/Cargo.toml` | 외부 의존성: serde, serde_json만 | |
+| 장애 시나리오 | 구현 컴포넌트 | 동작 |
+|-------------|-------------|------|
+| Manager 미연결 | `generate.rs` | `command_executor = None` → resilience checkpoint skip, 순수 추론 |
+| Manager 연결 끊김 | `CommandExecutor::poll()` | MessageLoop 종료 → mpsc 수신 중단 → 마지막 plan 유지, 추론 계속 |
+| Transport 에러 | `engine/src/resilience/transport.rs` | `TransportError::Disconnected` → MessageLoop thread 종료 |
 
-### 3.4 Logging Strategy
+### Manager 독립 동작 (CROSS-012)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-040 | `engine/src/bin/generate.rs`, `manager/src/main.rs` | `env_logger` 또는 `RUST_LOG` 환경 변수 | 별도 프로세스 → 별도 로그 스트림 |
-| CROSS-041 | `manager/src/pipeline.rs`, `manager/src/supervisory.rs` | `log::info!`, `log::warn!` 등 | 모드 전이, Directive 발행, Response 수신 |
-| CROSS-042 | `engine/src/resilience/executor.rs`, `engine/src/resilience/transport.rs` | `log::info!`, `log::warn!` 등 | EngineState 전이, ParseError, Transport 연결 |
+| 장애 시나리오 | 구현 컴포넌트 | 동작 |
+|-------------|-------------|------|
+| Engine 미연결 | `UnixSocketEmitter::wait_for_client()` | timeout 후 반환, Policy 루프 계속 |
+| Engine 연결 끊김 | `UnixSocketEmitter::emit_directive()` | 쓰기 오류 → Disconnected 전이, `Ok(())` 반환 |
+| JSON 파싱 실패 | `channel/unix_socket.rs`, `channel/tcp.rs` | `warn!` 로그 → frame skip, 루프 계속 |
 
-### 3.5 Error Propagation Strategy
+### Emergency 자율 대응 (CROSS-013)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-050 (Manager) | `manager/src/emitter/unix_socket.rs` | 쓰기 오류 → Disconnected, Ok 반환 | Policy 루프 계속 |
-| CROSS-050 | `manager/src/channel/unix_socket.rs`, `manager/src/channel/tcp.rs` | JSON ParseError → warn 로그, frame skip | |
-| CROSS-051 (Engine) | `engine/src/resilience/transport.rs` | Transport 끊김 → MessageLoop 종료 | 마지막 상태 유지, 추론 계속 |
-| CROSS-051 | `engine/src/resilience/executor.rs` | Command 실행 실패 → Rejected/Partial 반환 | 추론 중단 없음 |
-| CROSS-052 | `shared/src/lib.rs` | `CommandResult { Completed, Rejected, Partial }` | 비즈니스 응답, 연결 미영향 |
+Emergency 시그널은 Manager 없이도 Engine이 자율적으로 처리한다:
 
-### 3.6 Timing Constraints
+| Strategy | 파일 | Emergency 대응 |
+|----------|------|---------------|
+| MemoryStrategy | `engine/src/resilience/strategy/memory.rs` | `Evict(0.25)` + `RejectNew` |
+| ThermalStrategy | `engine/src/resilience/strategy/thermal.rs` | `Suspend` |
+| EnergyStrategy | `engine/src/resilience/strategy/energy.rs` | `Suspend` + `RejectNew` |
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-060 (Heartbeat) | `engine/src/resilience/executor.rs` | 1000ms 간격 하드코딩 | poll() 내부 타이머 |
-| CROSS-060 (recv_timeout) | `manager/src/pipeline.rs` | 50ms recv_timeout | 메인 루프 |
-| CROSS-060 (MemoryMonitor) | `manager/src/monitor/memory.rs` | <=100ms 폴링 | `/proc/meminfo` |
-| CROSS-060 (sync_channel) | `manager/src/channel/unix_socket.rs:152`, `manager/src/channel/tcp.rs:144` | `mpsc::sync_channel(64)` | 배압 제어 |
-| CROSS-060 (MAX_PAYLOAD) | `engine/src/resilience/transport.rs:245` | `MAX_PAYLOAD_SIZE = 64 * 1024` | |
-| CROSS-061 | (아키텍처 제약) | 타이밍 관계: MemoryMonitor(100ms) + recv_timeout(50ms) = ~150ms 대응 | |
+---
 
-### 3.7 Platform Dependencies
+## 2. Shared Crate 경계 (llm_shared)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-070 (NEON) | `engine/src/backend/cpu/neon.rs` | `#[cfg(target_arch = "aarch64")]` | CpuBackendNeon |
-| CROSS-070 (x86) | `engine/src/backend/cpu/x86.rs` | `#[cfg(target_arch = "x86_64")]` | CpuBackendAVX2 |
-| CROSS-071 (OpenCL) | `engine/src/backend/opencl/mod.rs` | `#[cfg(feature = "opencl")]` | OpenCLBackend |
-| CROSS-071 | `engine/kernels/*.cl` | ~80 kernel 파일 | MatMul, RoPE, Softmax 등 |
-| CROSS-072 (OS 인터페이스) | `manager/src/monitor/memory.rs` | `/proc/meminfo` 파싱 | |
-| CROSS-072 | `manager/src/monitor/compute.rs` | `/proc/stat` CPU delta | |
-| CROSS-072 | `manager/src/monitor/thermal.rs` | `/sys/class/thermal/` | |
-| CROSS-072 | `manager/src/monitor/energy.rs` | `/sys/class/power_supply/` | |
-| CROSS-072 | `manager/src/channel/unix_socket.rs` | Unix Domain Socket — Manager 서버 | |
-| CROSS-072 | `engine/src/resilience/transport.rs` | Unix Domain Socket — Engine 클라이언트 | |
-| CROSS-073 (SELinux) | `manager/src/channel/tcp.rs` | TCP loopback fallback `127.0.0.1:port` | CLI: `--transport tcp:<host:port>` |
+### 설계 결정
 
-### 3.8 Memory Management Strategy
+`llm_shared`는 Engine/Manager 간 유일한 공유 의존성이다 (INV-001, INV-010). Shared 자체는 Engine/Manager 내부 구현에 의존하지 않는다 (INV-011).
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-080 (mmap) | `engine/src/models/` | Safetensors mmap 로딩 | OS 페이지 캐시, demand paging |
-| CROSS-081 (madvise) | `engine/src/core/kv_cache.rs:1015` | `madvise_dontneed()` — `MADV_DONTNEED` (Linux) | high_water_pos 범위 제한 |
-| CROSS-081 | `engine/src/core/kv_cache.rs:363` | `shrink_to_fit()` — 재할당으로 물리 메모리 해제 | dynamic cache 전용 |
-| CROSS-082 (zero-copy UMA) | `engine/src/buffer/unified_buffer.rs` | `CL_MEM_ALLOC_HOST_PTR` (SharedBuffer) | GPU pin — madvise 무효 |
-| CROSS-082 | `engine/src/buffer/madviseable_gpu_buffer.rs` | `CL_MEM_USE_HOST_PTR` (MadviseableGPUBuffer) | is_host_managed=true — madvise 가능 |
+### 의존 구조
 
-### 3.9 Security Model
+```
+engine/Cargo.toml  → [dependencies] llm_shared (path)
+manager/Cargo.toml → [dependencies] llm_shared (path)
+shared/Cargo.toml  → [dependencies] serde, serde_json (외부만)
+```
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CROSS-090 (1:1 신뢰) | `manager/src/channel/unix_socket.rs` | 단일 accept, 1:1 클라이언트 | 인증/암호화 없음 |
-| CROSS-091 (크기 제한) | `engine/src/resilience/transport.rs:245` | `MAX_PAYLOAD_SIZE = 64KB` | Manager 측 미적용 |
-| CROSS-092 (소켓 정리) | `manager/src/channel/unix_socket.rs` | Drop 시 소켓 파일 삭제 | |
+**위반 감지**: `shared/Cargo.toml`에 `llm_rs2` 또는 `llm_manager` 의존 추가 = INV-011 위반.
 
-## Config
+### Shared에 정의된 타입 목록
 
-| config 키 | 타입 | 기본값 | spec/ 근거 |
-|-----------|------|--------|-----------|
-| (하드코딩) Heartbeat 주기 | u64 | 1000ms | CROSS-060 |
-| (하드코딩) recv_timeout | Duration | 50ms | CROSS-060 |
-| (하드코딩) sync_channel 버퍼 | usize | 64 | CROSS-060 |
-| (하드코딩) MAX_PAYLOAD_SIZE | u32 | 64KB | CROSS-060 |
+| 범주 | 타입 | serde 태깅 |
+|------|------|-----------|
+| Signal | `SystemSignal`, `Level`, `RecommendedBackend`, `ComputeReason`, `EnergyReason` | externally tagged, `rename_all = "snake_case"` |
+| Protocol (Manager→Engine) | `ManagerMessage`, `EngineDirective`, `EngineCommand` | `tag = "type"`, `rename_all = "snake_case"` |
+| Protocol (Engine→Manager) | `EngineMessage`, `EngineCapability`, `EngineStatus`, `CommandResponse`, `CommandResult` | `tag = "type"` / `tag = "status"` |
+| State | `ResourceLevel`, `EngineState` | `rename_all = "snake_case"` |
 
-## CLI
+### 프로토콜 호환성 규칙
 
-| 플래그 | 설명 | spec/ 근거 |
-|--------|------|-----------|
-| `--transport` (Manager) | 전송 방식: unix/tcp | CROSS-073 |
-| `--resilience-transport` (Engine) | 전송 방식: dbus/unix/tcp | CROSS-073 |
-| `--client-timeout` (Manager) | 초기 연결 대기 (기본 60초) | CROSS-060 |
+| 규칙 | 보장 방법 | 관련 INV |
+|------|----------|---------|
+| 새 필드 추가 시 `#[serde(default)]` 필수 | 코드 리뷰 | INV-028, CROSS-030 |
+| 기존 필드 삭제/이름 변경 금지 | 코드 리뷰 | INV-027, CROSS-031 |
+| serde 어노테이션 변경 = 프로토콜 버전 변경 | 코드 리뷰 | INV-027 |
+| 외부 의존성: serde, serde_json만 | `shared/Cargo.toml` | INV-081, CROSS-032 |
+
+---
+
+## 3. 로깅 전략
+
+### 설계 결정
+
+Engine과 Manager는 별도 프로세스이므로 별도 로그 스트림을 가진다. 양쪽 모두 `env_logger` + `RUST_LOG` 환경 변수를 사용한다.
+
+### 로그 포인트
+
+| 프로세스 | 컴포넌트 | 주요 로그 이벤트 |
+|---------|---------|----------------|
+| Manager | `pipeline.rs` | 모드 전이, Directive 발행, Response 수신, 관측 업데이트 |
+| Manager | `supervisory.rs` | 운영 모드 상승/하강 결정 |
+| Manager | `emitter/*.rs` | 클라이언트 연결/연결 끊김 |
+| Engine | `executor.rs` | EngineState 전이, Command 실행 결과 |
+| Engine | `transport.rs` | Transport 연결/끊김, ParseError |
+| Engine | `generate.rs` | 추론 시작/완료, eviction 이벤트 |
+
+---
+
+## 4. 에러 전파 패턴
+
+### 설계 결정
+
+IPC 에러는 연결 상태에만 영향을 주고, 비즈니스 로직(추론/모니터링)을 중단하지 않는다. Command 실행 실패는 `CommandResult` 타입으로 응답하며, Transport 에러와 분리된다.
+
+### Manager 에러 전파
+
+```mermaid
+flowchart LR
+    Write["Emitter.emit()"] -->|쓰기 오류| Disc["Disconnected 상태"]
+    Disc --> Ok["Ok(()) 반환"]
+    Ok --> Loop["Policy 루프 계속"]
+
+    Parse["JSON 파싱 실패"] -->|warn 로그| Skip["Frame skip"]
+    Skip --> Loop
+```
+
+### Engine 에러 전파
+
+```mermaid
+flowchart LR
+    TransErr["Transport 끊김"] --> End["MessageLoop 종료"]
+    End --> Keep["마지막 상태 유지"]
+    Keep --> Infer["추론 계속"]
+
+    CmdFail["Command 실행 실패"] --> Resp["Rejected/Partial 반환"]
+    Resp --> Infer
+```
+
+### CommandResult 타입
+
+```rust
+pub enum CommandResult {
+    Ok,
+    Partial { achieved: f32, reason: String },
+    Rejected { reason: String },
+}
+```
+
+비즈니스 응답이며, 연결 상태에 영향을 주지 않는다.
+
+---
+
+## 5. 타이밍 규약 (Heartbeat, Timeout)
+
+### 설계 결정
+
+모든 타이밍 상수는 하드코딩이다. 설정 가능한 타이밍은 Manager의 `poll_interval_ms`와 각 Monitor의 `poll_interval_ms`뿐이다.
+
+### 하드코딩 타이밍 상수
+
+| 상수 | 값 | 위치 | 역할 |
+|------|---|------|------|
+| Heartbeat 주기 | 1000ms | `executor.rs` — `poll()` 내부 타이머 | Engine → Manager 상태 보고 |
+| recv_timeout | 50ms | `pipeline.rs` — 메인 루프 | Manager mpsc 수신 타임아웃 |
+| sync_channel 버퍼 | 64 | `channel/unix_socket.rs`, `channel/tcp.rs` | 배압 제어 |
+| MAX_PAYLOAD_SIZE | 64KB | `transport.rs` — `read_frame()` | 악의적 크기 페이로드 차단 |
+| OBSERVATION_DELAY | 3.0초 | `pipeline.rs` — `OBSERVATION_DELAY_SECS` | Relief 관측 대기 |
+
+### 타이밍 관계
+
+```
+MemoryMonitor 폴링 (기본 1000ms, 설정 가능)
+      ↓ SystemSignal
+recv_timeout (50ms) → 정책 평가 → Directive 발행
+      ↓ IPC
+Engine poll() (토큰당 1회) → ExecutionPlan 소비
+      ↓
+Heartbeat (1000ms 간격) → Manager로 상태 보고
+```
+
+Emergency 시그널에 대한 최악 대응 지연: Monitor 폴링 + recv_timeout + IPC 왕복 ~= 수백ms.
+
+### CLI 타이밍 옵션
+
+| 플래그 | 대상 | 설명 | 기본값 |
+|--------|------|------|--------|
+| `--client-timeout` | Manager | Engine 초기 연결 대기 | 60초 |
+
+---
+
+## 6. 플랫폼 의존성
+
+### 설계 결정
+
+플랫폼별 코드는 `#[cfg]` feature gate로 격리한다. 크로스 컴파일(x86→ARM64) 시 잘못된 SIMD 코드가 포함되지 않도록 보장한다 (INV-002).
+
+### Engine 플랫폼 게이트
+
+| 컴포넌트 | 게이트 | 파일 |
+|---------|--------|------|
+| CpuBackendNeon | `#[cfg(target_arch = "aarch64")]` | `engine/src/backend/cpu/neon.rs` |
+| CpuBackendAVX2 | `#[cfg(target_arch = "x86_64")]` | `engine/src/backend/cpu/x86.rs` |
+| OpenCLBackend | `#[cfg(feature = "opencl")]` | `engine/src/backend/opencl/mod.rs` |
+| GPU 커널 | N/A (런타임 로딩) | `engine/kernels/*.cl` (~80 파일) |
+
+### Manager OS 인터페이스
+
+| Monitor | 데이터 소스 | OS |
+|---------|-----------|-----|
+| MemoryMonitor | `/proc/meminfo` | Linux |
+| ComputeMonitor | `/proc/stat` (CPU delta) | Linux |
+| ThermalMonitor | `/sys/class/thermal/` | Linux |
+| EnergyMonitor | `/sys/class/power_supply/` | Linux |
+
+### IPC Transport
+
+| Transport | 파일 (Manager 측) | 파일 (Engine 측) | 비고 |
+|-----------|------------------|-----------------|------|
+| Unix Domain Socket | `manager/src/channel/unix_socket.rs` | `engine/src/resilience/transport.rs` | 기본 |
+| TCP loopback | `manager/src/channel/tcp.rs` | `engine/src/resilience/transport.rs` | SELinux fallback |
+
+CLI: Manager `--transport unix|tcp:<host:port>`, Engine `--resilience-transport dbus|unix|tcp`.
+
+---
+
+## 7. 메모리 관리 전략
+
+### 설계 결정
+
+모델 가중치는 mmap으로 로딩하여 OS 페이지 캐시와 demand paging을 활용한다. KV 캐시는 grow-on-demand이며, eviction 후 물리 메모리 반환을 위해 `madvise(MADV_DONTNEED)` 또는 `shrink_to_fit()`을 사용한다.
+
+| 전략 | 컴포넌트 | 구현 |
+|------|---------|------|
+| mmap 가중치 로딩 | `engine/src/models/` | Safetensors mmap, demand paging |
+| madvise(DONTNEED) | `engine/src/core/kv_cache.rs` — `madvise_dontneed()` | `high_water_pos` 이후 페이지 해제 |
+| shrink_to_fit | `engine/src/core/kv_cache.rs` — `shrink_to_fit()` | 재할당으로 물리 메모리 해제 (dynamic cache) |
+| Zero-copy UMA | `engine/src/buffer/unified_buffer.rs` | `CL_MEM_ALLOC_HOST_PTR` — GPU pin, madvise 무효 |
+| Host-managed GPU | `engine/src/buffer/madviseable_gpu_buffer.rs` | `CL_MEM_USE_HOST_PTR` — madvise 가능 |
+
+---
+
+## 8. 보안 모델
+
+### 설계 결정
+
+Manager-Engine 간 IPC는 1:1 신뢰 모델이다 (INV-082). 인증/암호화 없음. 페이로드 크기 제한으로 기본적인 DoS 방어만 제공.
+
+| 규칙 | 구현 | 비고 |
+|------|------|------|
+| 단일 클라이언트 연결 | `UnixSocketEmitter` — 단일 `accept()` | 다중 Engine 미지원 |
+| 페이로드 크기 제한 | `transport.rs` — `MAX_PAYLOAD_SIZE = 64KB` | Engine 측만 적용 |
+| 소켓 파일 정리 | `UnixSocketEmitter::Drop` — 소켓 파일 삭제 | stale socket 방지 |
+
+---
+
+## 9. 하드코딩 상수 요약
+
+| 상수 | 값 | 위치 | spec 근거 |
+|------|---|------|----------|
+| Heartbeat 주기 | 1000ms | `executor.rs` | CROSS-060 |
+| recv_timeout | 50ms | `pipeline.rs` | CROSS-060 |
+| sync_channel 버퍼 | 64 | `channel/{unix_socket,tcp}.rs` | CROSS-060 |
+| MAX_PAYLOAD_SIZE | 64KB | `transport.rs` | CROSS-060 |
+| OBSERVATION_DELAY_SECS | 3.0 | `pipeline.rs` | CROSS-061 |

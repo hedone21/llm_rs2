@@ -1,131 +1,216 @@
 # Wire Protocol -- Architecture
 
-> spec/10-protocol.md의 구현 상세.
+> spec/10-protocol.md의 구현 상세. Wire format, Transport trait 구현체, 연결 수명주기, 타이밍 상수를 기술한다.
 
-## 코드 매핑
+## 1. Wire Format
 
-### 3.1 Wire Format [PROTO-010 ~ PROTO-014]
+### 설계 결정
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-010 | `engine/src/resilience/transport.rs` | `write_frame()`, `read_frame()` | 4B BE u32 + UTF-8 JSON |
-| PROTO-010 | `manager/src/channel/unix_socket.rs` | `write_manager_message()`, `read_engine_message()` | 동일 프레이밍 |
-| PROTO-010 | `manager/src/channel/tcp.rs` | `write_manager_message()`, `read_engine_message()` | 동일 프레이밍 |
-| PROTO-012 | `engine/src/resilience/transport.rs:245` | `const MAX_PAYLOAD_SIZE: u32 = 64 * 1024` | Engine측 64KB 가드 |
-| PROTO-012 | `engine/src/resilience/transport.rs:267` | `if len > MAX_PAYLOAD_SIZE { ... ParseError }` | |
-| PROTO-012 | (Manager측) | **미구현** — `read_engine_message()`에 크기 가드 없음 | spec에서 향후 추가 권장 |
-| INV-020 | `manager/src/pipeline.rs:65-68` | `SEQ_COUNTER: AtomicU64::new(1)` + `fetch_add(1, Relaxed)` | |
-| INV-021 | `manager/src/pipeline.rs:65-68` | AtomicU64 단조 증가로 보장 | |
+모든 메시지는 length-prefixed JSON으로 직렬화한다. 프레이밍 형식은 Engine측과 Manager측에서 동일하다.
 
-### 3.2 Serialization Convention [PROTO-020 ~ PROTO-026]
+```
++──────────────+──────────────────────────+
+│ 4 bytes BE   │ UTF-8 JSON payload       │
+│ u32 length   │ (serde_json compact)     │
++──────────────+──────────────────────────+
+```
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-020 | `engine/src/resilience/transport.rs` | `serde_json::to_vec()` — compact JSON | |
-| PROTO-021 | `shared/src/lib.rs` | `#[serde(tag = "type", rename_all = "snake_case")]` 등 | 타입별 serde 어노테이션 |
-| PROTO-022 | `shared/src/lib.rs` | snake_case 필드명 그대로 JSON 키 | rename 미사용 |
-| PROTO-026 | `shared/src/lib.rs` | `#[serde(default)]` — EngineStatus 필드 12~16 등 | |
+### 핵심 함수 (Engine측)
 
-#### serde 어노테이션 상세 — `shared/src/lib.rs`
+```rust
+// engine/src/resilience/transport.rs
 
-| 타입 | 라인 | serde 어노테이션 |
-|------|------|-----------------|
-| `Level` | 7 | `#[serde(rename_all = "snake_case")]` |
-| `RecommendedBackend` | 17 | `#[serde(rename_all = "snake_case")]` |
-| `ComputeReason` | 26 | `#[serde(rename_all = "snake_case")]` |
-| `EnergyReason` | 38 | `#[serde(rename_all = "snake_case")]` |
-| `SystemSignal` | 106 | `#[serde(rename_all = "snake_case")]` — externally tagged (serde 기본) |
-| `ResourceLevel` | 151 | `#[serde(rename_all = "snake_case")]` |
-| `EngineState` | 160 | `#[serde(rename_all = "snake_case")]` |
-| `EngineCommand` | 170 | `#[serde(tag = "type", rename_all = "snake_case")]` |
-| `EngineDirective` | 205 | (struct, internally tagged via ManagerMessage) |
-| `ManagerMessage` | 213 | `#[serde(tag = "type", rename_all = "snake_case")]` |
-| `EngineCapability` | 219 | (struct) |
-| `EngineStatus` | 229 | (struct, `#[serde(default)]` on 필드 12~16) |
-| `CommandResult` | 261 | `#[serde(tag = "status", rename_all = "snake_case")]` |
-| `CommandResponse` | 269 | (struct) |
-| `EngineMessage` | 277 | `#[serde(tag = "type", rename_all = "snake_case")]` |
+/// Read a length-prefixed JSON message from reader.
+fn read_length_prefixed<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T, TransportError>;
 
-### 3.3 Transport Layer [PROTO-030 ~ PROTO-036]
+/// Write a length-prefixed JSON message to writer.
+fn write_length_prefixed<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> Result<(), TransportError>;
+```
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-030 | `engine/src/resilience/transport.rs` | `UnixSocketTransport` — Unix Stream | Engine 클라이언트 |
-| PROTO-030 | `manager/src/channel/unix_socket.rs` | `UnixSocketChannel` — bind + listen | Manager 서버 |
-| PROTO-031 | `engine/src/resilience/transport.rs` | `TcpTransport` | |
-| PROTO-031 | `manager/src/channel/tcp.rs` | `TcpChannel` | |
-| PROTO-032 | `engine/src/resilience/dbus_transport.rs` | `DbusTransport` — `zbus::blocking::Connection::system()` | |
-| PROTO-032 | `manager/src/emitter/dbus.rs` | `DbusEmitter` | D-Bus 시그널 emit |
-| PROTO-036 | `engine/src/resilience/transport.rs` | `MockTransport` — mpsc 채널 | 테스트 전용 |
+**Pre-condition**: `reader`/`writer`가 유효한 스트림이어야 한다.
+**Post-condition**: `read_length_prefixed`는 payload 크기가 `MAX_PAYLOAD_SIZE`를 초과하면 `ParseError`를 반환한다.
 
-#### Transport 파일 경로 전체
+### 페이로드 크기 가드
 
-| 측 | 전송 매체 | 파일 |
-|----|----------|------|
-| Engine | Unix Socket | `engine/src/resilience/transport.rs` (UnixSocketTransport) |
-| Engine | TCP | `engine/src/resilience/transport.rs` (TcpTransport) |
-| Engine | D-Bus | `engine/src/resilience/dbus_transport.rs` (DbusTransport) |
-| Engine | Mock | `engine/src/resilience/transport.rs` (MockTransport) |
-| Manager | Unix Socket | `manager/src/channel/unix_socket.rs` (UnixSocketChannel) |
-| Manager | TCP | `manager/src/channel/tcp.rs` (TcpChannel) |
-| Manager | D-Bus | `manager/src/emitter/dbus.rs` (DbusEmitter) |
+```rust
+const MAX_PAYLOAD_SIZE: u32 = 64 * 1024;  // 64KB
+```
 
-### 3.4 Connection Lifecycle [PROTO-040 ~ PROTO-046]
+- Engine측: `read_length_prefixed()`에서 `len > MAX_PAYLOAD_SIZE` 시 `ParseError` 반환
+- **Manager측: 크기 가드 미구현** — `read_engine_message()`에 검증 없음 (spec 대비 차이)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-040 | `manager/src/channel/unix_socket.rs` | `bind()` + `listen()` | Manager가 서버 |
-| PROTO-040 | `engine/src/resilience/transport.rs` | `connect()` | Engine이 클라이언트 |
-| PROTO-042 | `manager/src/channel/unix_socket.rs` | `state` 필드: Listening/Connected/Disconnected | 3-state |
-| PROTO-043 | `engine/src/resilience/transport.rs` | `Transport::connect()` → `ConnectionFailed` | |
-| PROTO-044 | `engine/src/resilience/executor.rs` | 연결 직후 Capability 전송 | |
-| PROTO-045 | `manager/src/channel/unix_socket.rs` | `ensure_connected()` — non-blocking accept | |
+### 직렬화 전략
 
-### 3.5 Message Flow Direction [PROTO-050 ~ PROTO-052]
+- `serde_json::to_vec()` — compact JSON (pretty print 없음)
+- 필드명은 Rust struct 필드의 snake_case를 그대로 사용 (rename 없음)
+- Enum tagging 전략은 arch/11-protocol-messages.md에서 상세 기술
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-050 | `shared/src/lib.rs:213` | `ManagerMessage::Directive(EngineDirective)` | M→E |
-| PROTO-051 | `shared/src/lib.rs:277` | `EngineMessage` — 4종 변형 | E→M |
-| PROTO-052 | `engine/src/resilience/dbus_transport.rs` | SystemSignal 4종 수신 | D-Bus 경로 |
+### Spec 매핑
 
-### 3.6 Error Handling [PROTO-060 ~ PROTO-065]
+PROTO-010 (와이어 포맷), PROTO-012 (페이로드 크기 가드), PROTO-020~026 (직렬화), INV-020~021 (seq_id 단조 증가)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-060 | `engine/src/resilience/transport.rs:267` | `MAX_PAYLOAD_SIZE` 초과 시 `ParseError` | Engine측만 구현 |
-| PROTO-061 | `engine/src/resilience/transport.rs` | MessageLoop 내 `continue` | |
-| PROTO-062 | `engine/src/resilience/transport.rs` | EOF → `TransportError::Disconnected` | |
+---
 
-### 3.7 Timing and Backpressure [PROTO-070 ~ PROTO-075]
+## 2. Transport trait 및 구현체
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| PROTO-070 | `engine/src/bin/generate.rs:670` | `heartbeat_interval = Duration::from_millis(1000)` | 기본 1000ms |
-| PROTO-071 | `manager/src/channel/unix_socket.rs:152` | `sync_channel(64)` | |
-| PROTO-071 | `manager/src/channel/tcp.rs:144` | `sync_channel(64)` | |
-| PROTO-072 | `manager/src/main.rs:193` | `recv_timeout(Duration::from_millis(50))` | |
-| PROTO-073 | `engine/src/resilience/executor.rs` | `poll()` 내 `try_recv` 반복 | |
-| PROTO-074 | `manager/src/pipeline.rs:65-68` | `static SEQ_COUNTER: AtomicU64::new(1)`, `fetch_add(1, Relaxed)` | 프로세스 수명 |
-| PROTO-074 | `engine/src/resilience/dbus_transport.rs:20` | `next_seq_id: u64` (초기값 1, 자체 카운터) | D-Bus 경로 전용 |
-| PROTO-075 | `engine/src/resilience/executor.rs` | Directive당 1개 CommandResponse 전송 | INV-022 |
-| INV-022 | `engine/src/resilience/executor.rs` | `poll()` 내 각 Directive → 1 Response | |
-| INV-023 | `engine/src/resilience/executor.rs` | `CommandResponse.seq_id = directive.seq_id` | |
-| INV-024 | `engine/src/resilience/executor.rs` | `results.len() == commands.len()` | |
+### 설계 결정
 
-## Config
+Engine측은 `Transport` trait으로 전송 매체를 추상화한다. Manager측은 `Emitter` + `EngineReceiver` trait 조합으로 양방향 통신을 추상화한다 (ISP 준수).
 
-| config 키 | 타입 | 기본값 | spec/ 근거 |
-|-----------|------|--------|-----------|
-| (heartbeat_interval은 현재 하드코딩) | `Duration` | `1000ms` | PROTO-070 |
-| (MAX_PAYLOAD_SIZE는 상수) | `u32` | `64 * 1024` | PROTO-012 |
-| (sync_channel 용량은 하드코딩) | `usize` | `64` | PROTO-071 |
-| (recv_timeout은 하드코딩) | `Duration` | `50ms` | PROTO-072 |
+### Engine측 Transport
 
-## CLI
+```rust
+// engine/src/resilience/transport.rs
+pub trait Transport: Send + 'static {
+    fn connect(&mut self) -> Result<(), TransportError>;
+    fn recv(&mut self) -> Result<ManagerMessage, TransportError>;
+    fn send(&mut self, msg: &EngineMessage) -> Result<(), TransportError>;
+    fn name(&self) -> &str;
+}
+```
 
-| 플래그 | 설명 | spec/ 근거 |
-|--------|------|-----------|
-| `--resilience-transport` (Engine) | `dbus`, `unix:<path>`, `tcp:<host:port>` (기본: `dbus`) | PROTO-033 |
-| `--transport` (Manager) | `dbus`, `unix:<path>`, `tcp:<host:port>` (기본: `dbus`) | PROTO-033 |
-| `--client-timeout` (Manager) | Unix socket 클라이언트 대기 타임아웃(초) (기본: 60) | PROTO-040 |
+#### TransportError
+
+```rust
+pub enum TransportError {
+    ConnectionFailed(String),  // connect() 실패
+    Disconnected,              // EOF, 상대측 연결 종료
+    ParseError(String),        // JSON 파싱 실패, 페이로드 크기 초과
+    Io(std::io::Error),        // 기타 I/O 오류
+}
+```
+
+#### 구현체 상세
+
+| 구현체 | 초기화 | connect() 동작 | 비고 |
+|--------|--------|---------------|------|
+| `UnixSocketTransport` | `new(path: PathBuf)` | `UnixStream::connect(path)` → reader/writer 분리 (`try_clone`) | `#[cfg(unix)]` |
+| `TcpTransport` | `new(addr: String)` | `TcpStream::connect(addr)` → reader/writer 분리 | Android SELinux 환경용 |
+| `DbusTransport` | `new()` | `zbus::blocking::Connection::system()` + proxy + signal iterator | `#[cfg(feature = "resilience")]` |
+| `MockTransport` | `channel()` / `bidirectional()` / `from_messages(msgs)` | no-op (항상 Ok) | 테스트 전용 |
+
+### Manager측 Channel
+
+| 구현체 | 모듈 | 초기화 |
+|--------|------|--------|
+| `UnixSocketChannel` | `manager/src/channel/unix_socket.rs` | `new(socket_path: &Path)` → `UnixListener::bind()` + `set_nonblocking(true)` |
+| `TcpChannel` | `manager/src/channel/tcp.rs` | `new(addr: &str)` → `TcpListener::bind()` + `set_nonblocking(true)` |
+| `DbusEmitter` | `manager/src/emitter/dbus.rs` | `new()` → `zbus::blocking::Connection::system()` + `request_name("org.llm.Manager1")` |
+
+### MessageLoop (Engine측 메시지 루프)
+
+```rust
+// engine/src/resilience/transport.rs
+pub struct MessageLoop;
+
+impl MessageLoop {
+    pub fn spawn<T: Transport>(transport: T) -> Result<(
+        mpsc::Receiver<ManagerMessage>,  // cmd_rx: 수신 명령
+        mpsc::Sender<EngineMessage>,     // resp_tx: 응답 전송
+        JoinHandle<()>,                  // 스레드 핸들
+    ), TransportError>;
+}
+```
+
+**처리 흐름**:
+1. `transport.connect()` 호출
+2. 별도 스레드에서 `run_loop()` 실행
+3. 루프: pending 응답 `try_recv` drain → blocking `transport.recv()` → `cmd_tx.send()`
+4. `ParseError` → warn 로그 + continue (연결 유지)
+5. `Disconnected` / 기타 에러 → 루프 종료
+
+### Spec 매핑
+
+PROTO-030 (Unix), PROTO-031 (TCP), PROTO-032 (D-Bus), PROTO-036 (Mock)
+
+---
+
+## 3. Connection Lifecycle
+
+### 설계 결정
+
+Manager가 서버 역할, Engine이 클라이언트 역할을 한다. Manager측 채널은 3-상태 FSM으로 연결 상태를 관리한다.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Listening : bind()
+    Listening --> Connected : accept()
+    Connected --> Disconnected : write error / reader EOF
+    Disconnected --> Connected : ensure_connected() (non-blocking accept)
+```
+
+### Manager측 연결 관리
+
+```rust
+// manager/src/channel/unix_socket.rs
+enum ConnectionState {
+    Listening,
+    Connected { writer: UnixStream, inbox: mpsc::Receiver<EngineMessage>, _reader: ReaderHandle },
+    Disconnected,
+}
+```
+
+| 메서드 | Pre-condition | 동작 | Post-condition |
+|--------|-------------|------|---------------|
+| `wait_for_client(timeout, shutdown)` | Listening | 블로킹 accept (100ms 폴링) | Connected 또는 timeout |
+| `ensure_connected()` | Disconnected | non-blocking accept 시도 | Connected 또는 Disconnected 유지 |
+| `transition_to_connected(stream)` | any | writer `try_clone`, reader thread spawn, `sync_channel(64)` | Connected |
+
+Connected 전이 시 reader 스레드가 `spawn_reader(stream, inbox_tx)` 로 생성된다. Reader는 blocking `read_engine_message()` 루프를 실행하며, EOF/에러 시 자연 종료하여 inbox_tx가 drop되고, `try_recv()`에서 `Disconnected`를 반환한다.
+
+### Engine측 연결 관리
+
+- `Transport::connect()` 호출 — 실패 시 `ConnectionFailed` 반환
+- 연결 후 `CommandExecutor::send_capability()` 1회 호출 (INV-015)
+- MessageLoop 내에서 `Disconnected` 감지 시 스레드 종료
+
+### Spec 매핑
+
+PROTO-040 (Manager=서버), PROTO-042 (3-state), PROTO-043 (연결 실패), PROTO-044 (Capability 전송), PROTO-045 (ensure_connected)
+
+---
+
+## 4. 타이밍 상수
+
+### 설계 결정
+
+모든 타이밍 값은 현재 하드코딩되어 있다.
+
+| 상수 | 값 | 위치 | 역할 | spec 근거 |
+|------|---|------|------|----------|
+| `heartbeat_interval` | 1000ms | `CommandExecutor::new()` 인자 | Heartbeat 전송 주기 | PROTO-070 |
+| `MAX_PAYLOAD_SIZE` | 64KB | `engine/src/resilience/transport.rs` | 페이로드 크기 가드 | PROTO-012 |
+| `sync_channel` 용량 | 64 | `manager/src/channel/{unix_socket,tcp}.rs` | Reader→Main 배압 | PROTO-071 |
+| `recv_timeout` | 50ms | `manager/src/main.rs` | Monitor 신호 대기 | PROTO-072 |
+| `client_timeout` | 60초 | CLI `--client-timeout` | 클라이언트 연결 대기 | PROTO-040 |
+
+---
+
+## 5. 예외 처리
+
+| 에러 상황 | Engine 동작 | Manager 동작 |
+|----------|------------|-------------|
+| JSON 파싱 실패 | MessageLoop: warn 로그 + continue | Reader: 에러 로그 + 루프 종료 |
+| 페이로드 크기 초과 | `ParseError` 반환 | **미구현** |
+| EOF (상대측 종료) | `Disconnected` → MessageLoop 종료 | inbox Disconnected → 상태 전이 |
+| 쓰기 에러 | MessageLoop 종료 | Connected → Disconnected 전이 |
+| 연결 실패 | `ConnectionFailed` → 추론 독립 실행 (fail-open) | 프로세스 종료 또는 재시도 |
+
+---
+
+## 6. 코드-스펙 차이
+
+| 항목 | spec | 코드 | 비고 |
+|------|------|------|------|
+| Manager측 페이로드 크기 가드 | PROTO-012 권장 | 미구현 | Engine측만 64KB 가드 |
+| Seq ID 카운터 | INV-020 프로세스 수명 | Manager: `AtomicU64`, D-Bus: 자체 카운터 | 일치 |
+
+---
+
+## 7. CLI
+
+| 플래그 | 설명 | 기본값 | spec 근거 |
+|--------|------|--------|----------|
+| `--resilience-transport` (Engine) | 전송 매체 선택 | `dbus` | PROTO-033 |
+| `--transport` (Manager) | 전송 매체 선택 | `dbus` | PROTO-033 |
+| `--client-timeout` (Manager) | 클라이언트 대기 타임아웃(초) | `60` | PROTO-040 |

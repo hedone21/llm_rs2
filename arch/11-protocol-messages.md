@@ -1,178 +1,308 @@
 # Protocol Messages -- Architecture
 
-> spec/11-protocol-messages.md의 구현 상세.
+> spec/11-protocol-messages.md의 구현 상세. 모든 메시지 타입은 `shared/src/lib.rs` 단일 파일에 정의되어 있다. EngineDirective/EngineCommand, EngineMessage/EngineStatus, SystemSignal, serde 직렬화 전략을 기술한다.
 
-## 코드 매핑
+## 1. Envelope Types (최상위 메시지)
 
-모든 메시지 타입은 `shared/src/lib.rs` 단일 파일에 정의되어 있다.
+### 설계 결정
 
-### 3.1 Envelope Types [MSG-010 ~ MSG-014]
+Manager→Engine, Engine→Manager 방향 각각에 하나의 enum wrapper를 두어 메시지 종류를 구분한다.
+internally tagged (`"type"` 키) + snake_case 전략을 일관 사용한다.
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-010 | `shared/src/lib.rs:213` | `pub enum ManagerMessage` — `#[serde(tag = "type", rename_all = "snake_case")]` | 1종: Directive |
-| MSG-011 | `shared/src/lib.rs:277` | `pub enum EngineMessage` — `#[serde(tag = "type", rename_all = "snake_case")]` | 4종: Capability, Heartbeat, Response, QcfEstimate |
-| MSG-014 | — | QcfEstimate는 `shared/src/lib.rs`에 **미정의** | spec에 명세되었으나 코드 미구현 |
+```mermaid
+graph LR
+    subgraph "Manager → Engine"
+        MM["ManagerMessage"]
+        MM -->|"directive"| ED["EngineDirective"]
+    end
 
-### 3.2 EngineDirective [MSG-020 ~ MSG-022]
+    subgraph "Engine → Manager"
+        EM["EngineMessage"]
+        EM -->|"capability"| EC["EngineCapability"]
+        EM -->|"heartbeat"| ES["EngineStatus"]
+        EM -->|"response"| CR["CommandResponse"]
+    end
+```
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-020 | `shared/src/lib.rs:205` | `pub struct EngineDirective { pub seq_id: u64, pub commands: Vec<EngineCommand> }` | |
-| MSG-021 | `manager/src/pipeline.rs:65-68` | `SEQ_COUNTER: AtomicU64::new(1)` | 단조 증가 보장 |
+### ManagerMessage
 
-### 3.3 EngineCommand [MSG-030 ~ MSG-041]
+```rust
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ManagerMessage {
+    Directive(EngineDirective),
+}
+```
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-030 | `shared/src/lib.rs:170` | `pub enum EngineCommand` — `#[serde(tag = "type", rename_all = "snake_case")]` | 13종 |
+현재 1종 변형만 존재. 향후 확장 가능하도록 enum으로 정의.
 
-#### EngineCommand 변형 — shared/src/lib.rs 내 위치
+### EngineMessage
 
-| Tag Value | Variant | 필드 | 라인 (approx) |
-|-----------|---------|------|--------------|
-| `"throttle"` | Throttle | `delay_ms: u64` | ~172 |
-| `"layer_skip"` | LayerSkip | `skip_ratio: f32` | ~174 |
-| `"kv_evict_h2o"` | KvEvictH2o | `keep_ratio: f32` | ~176 |
-| `"kv_evict_sliding"` | KvEvictSliding | `keep_ratio: f32` | ~178 |
-| `"kv_merge_d2o"` | KvMergeD2o | `keep_ratio: f32` | ~180 |
-| `"kv_streaming"` | KvStreaming | `sink_size: usize, window_size: usize` | ~182 |
-| `"kv_quant_dynamic"` | KvQuantDynamic | `target_bits: u8` | ~185 |
-| `"request_qcf"` | RequestQcf | (없음) | ~187 |
-| `"restore_defaults"` | RestoreDefaults | (없음) | ~189 |
-| `"switch_hw"` | SwitchHw | `device: String` | ~191 |
-| `"prepare_compute_unit"` | PrepareComputeUnit | `device: String` | ~193 |
-| `"suspend"` | Suspend | (없음) | ~195 |
-| `"resume"` | Resume | (없음) | ~197 |
+```rust
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EngineMessage {
+    Capability(EngineCapability),
+    Heartbeat(EngineStatus),
+    Response(CommandResponse),
+}
+```
 
-#### 명령 실행 매핑 (Engine측)
+3종 변형. spec에서 명세된 `QcfEstimate` 변형은 **미구현**.
 
-| EngineCommand | 실행 위치 | 메서드 |
-|---------------|----------|--------|
-| Throttle | `engine/src/resilience/executor.rs` | `apply_command()` → `plan.throttle_delay_ms` |
-| LayerSkip | `engine/src/resilience/executor.rs` | `apply_command()` → `plan.skip_ratio` |
-| KvEvictH2o | `engine/src/resilience/executor.rs` | `apply_command()` → eviction 실행 |
-| KvEvictSliding | `engine/src/resilience/executor.rs` | `apply_command()` → eviction 실행 |
-| KvMergeD2o | `engine/src/resilience/executor.rs` | `apply_command()` → D2O merge |
-| KvStreaming | `engine/src/resilience/executor.rs` | `apply_command()` → Rejected (미구현) |
-| KvQuantDynamic | `engine/src/resilience/executor.rs` | `apply_command()` → KIVI bits 전환 |
-| RequestQcf | `engine/src/resilience/executor.rs` | `apply_command()` → QCF 계산 |
-| RestoreDefaults | `engine/src/resilience/executor.rs` | `apply_command()` → 전체 리셋 |
-| SwitchHw | `engine/src/resilience/executor.rs` | `apply_command()` → backend 전환 |
-| PrepareComputeUnit | `engine/src/resilience/executor.rs` | `apply_command()` → 워밍업 |
-| Suspend | `engine/src/resilience/executor.rs` | `apply_command()` → plan override |
-| Resume | `engine/src/resilience/executor.rs` | `apply_command()` → resume |
+### Spec 매핑
 
-### 3.4 EngineCapability [MSG-050 ~ MSG-052]
+MSG-010 (ManagerMessage), MSG-011 (EngineMessage), MSG-014 (QcfEstimate — 미구현)
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-050 | `shared/src/lib.rs:219` | `pub struct EngineCapability` — 5필드 | |
+---
 
-#### 필드 → 코드
+## 2. EngineDirective / EngineCommand
 
-| 필드 | 타입 (Rust) |
-|------|-----------|
-| `available_devices` | `Vec<String>` |
-| `active_device` | `String` |
-| `max_kv_tokens` | `usize` |
-| `bytes_per_kv_token` | `usize` |
-| `num_layers` | `usize` |
+### 설계 결정
 
-### 3.5 EngineStatus (Heartbeat) [MSG-060 ~ MSG-066]
+Manager가 Engine에 내리는 명령을 배치(batch)로 전송한다. 각 Directive에 단조 증가하는 `seq_id`를 부여하여 Response와 매칭한다.
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-060 | `shared/src/lib.rs:229` | `pub struct EngineStatus` — 16필드 | |
-| MSG-061 | `shared/src/lib.rs` | 필드 12~16에 `#[serde(default)]` | 하위 호환 |
+### EngineDirective
 
-#### 필드 → 코드 (serde(default) 여부)
+```rust
+pub struct EngineDirective {
+    pub seq_id: u64,
+    pub commands: Vec<EngineCommand>,
+}
+```
 
-| # | 필드 | 타입 (Rust) | serde(default) |
-|---|------|-----------|---------------|
-| 1 | `active_device` | `String` | X |
-| 2 | `compute_level` | `ResourceLevel` | X |
-| 3 | `actual_throughput` | `f32` | X |
-| 4 | `memory_level` | `ResourceLevel` | X |
-| 5 | `kv_cache_bytes` | `u64` | X |
-| 6 | `kv_cache_tokens` | `usize` | X |
-| 7 | `kv_cache_utilization` | `f32` | X |
-| 8 | `memory_lossless_min` | `f32` | X |
-| 9 | `memory_lossy_min` | `f32` | X |
-| 10 | `state` | `EngineState` | X |
-| 11 | `tokens_generated` | `usize` | X |
-| 12 | `available_actions` | `Vec<String>` | O |
-| 13 | `active_actions` | `Vec<String>` | O |
-| 14 | `eviction_policy` | `String` | O |
-| 15 | `kv_dtype` | `String` | O |
-| 16 | `skip_ratio` | `f32` | O |
+**seq_id 생성**: `manager/src/pipeline.rs` — `static SEQ_COUNTER: AtomicU64::new(1)`, `fetch_add(1, Relaxed)` (INV-020, INV-021)
 
-### 3.6 CommandResponse [MSG-070 ~ MSG-073]
+### EngineCommand
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-070 | `shared/src/lib.rs:269` | `pub struct CommandResponse { pub seq_id: u64, pub results: Vec<CommandResult> }` | |
-| INV-025 | `engine/src/resilience/executor.rs` | `results.len() == commands.len()` 보장 | |
-| INV-026 | `engine/src/resilience/executor.rs` | 수신 seq_id에 대해서만 Response 전송 | |
+```rust
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EngineCommand {
+    // Compute 도메인
+    Throttle { delay_ms: u64 },
+    LayerSkip { skip_ratio: f32 },
 
-### 3.7 CommandResult [MSG-080 ~ MSG-083]
+    // Memory 도메인
+    KvEvictH2o { keep_ratio: f32 },
+    KvEvictSliding { keep_ratio: f32 },
+    KvStreaming { sink_size: usize, window_size: usize },
+    KvQuantDynamic { target_bits: u8 },
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-080 | `shared/src/lib.rs:261` | `pub enum CommandResult` — `#[serde(tag = "status", rename_all = "snake_case")]` | 3종 |
+    // Lifecycle
+    RestoreDefaults,
+    SwitchHw { device: String },
+    PrepareComputeUnit { device: String },
+    Suspend,
+    Resume,
+}
+```
 
-#### CommandResult 변형
+코드에 11종 변형이 존재한다 (spec에 명세된 `KvMergeD2o`, `RequestQcf`는 실제 코드에서 확인 필요).
 
-| Tag Value | Variant | 추가 필드 |
-|-----------|---------|----------|
-| `"ok"` | Ok | (없음) |
-| `"partial"` | Partial | `achieved: f32, reason: String` |
-| `"rejected"` | Rejected | `reason: String` |
+### Engine측 명령 실행
 
-### 3.8 QcfEstimate [MSG-085 ~ MSG-087]
+모든 명령은 `CommandExecutor::apply_command()` (`engine/src/resilience/executor.rs`)에서 처리되어 `ExecutionPlan`에 반영된다.
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-085 | — | `shared/src/lib.rs`에 **미정의** | spec에 명세되었으나 struct 미구현. EngineMessage에 QcfEstimate 변형만 존재할 수 있음 |
+```rust
+pub struct ExecutionPlan {
+    pub evict: Option<EvictPlan>,
+    pub switch_device: Option<String>,
+    pub prepare_device: Option<String>,
+    pub throttle_delay_ms: u64,
+    pub suspended: bool,
+    pub resumed: bool,
+    pub layer_skip: Option<f32>,
+    pub kv_quant_bits: Option<u8>,
+    pub restore_defaults: bool,
+}
+```
 
-### 3.9 Supporting Enums [MSG-090 ~ MSG-095]
+| EngineCommand | ExecutionPlan 필드 | CommandResult |
+|---------------|-------------------|---------------|
+| `Throttle` | `throttle_delay_ms` | Ok |
+| `LayerSkip` | `layer_skip` | Ok |
+| `KvEvictH2o` | `evict` (EvictPlan, method=H2o) | Ok |
+| `KvEvictSliding` | `evict` (EvictPlan, method=Sliding) | Ok |
+| `KvStreaming` | — | **Rejected** ("not yet implemented") |
+| `KvQuantDynamic` | `kv_quant_bits` | Ok |
+| `RestoreDefaults` | `restore_defaults`, 전체 리셋 | Ok |
+| `SwitchHw` | `switch_device` | Ok |
+| `PrepareComputeUnit` | `prepare_device` | Ok |
+| `Suspend` | `suspended` (모든 다른 필드 override) | Ok |
+| `Resume` | `resumed`, 레벨/스로틀 Normal 초기화 | Ok |
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-090 | `shared/src/lib.rs:151` | `pub enum ResourceLevel` — Normal, Warning, Critical | PartialOrd derive |
-| MSG-091 | `shared/src/lib.rs:160` | `pub enum EngineState` — Idle, Running, Suspended | |
-| MSG-092 | `shared/src/lib.rs:7` | `pub enum Level` — Normal, Warning, Critical, Emergency | PartialOrd, Ord derive |
-| MSG-093 | `shared/src/lib.rs:17` | `pub enum RecommendedBackend` — Cpu, Gpu, Any | |
-| MSG-094 | `shared/src/lib.rs:26` | `pub enum ComputeReason` — 6종 | |
-| MSG-095 | `shared/src/lib.rs:38` | `pub enum EnergyReason` — 6종 | `None` 변형에 명시적 `#[serde(rename = "none")]` |
+**Suspend 후처리**: Suspend가 포함된 Directive를 처리한 후, evict/switch/prepare/throttle을 모두 무효화하고 `EngineState::Suspended`로 전이한다.
 
-### 3.10 D-Bus SystemSignal [MSG-100 ~ MSG-104]
+### Spec 매핑
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| MSG-100 | `shared/src/lib.rs:106` | `pub enum SystemSignal` — 4종 (externally tagged) | |
-| MSG-101 | `shared/src/lib.rs` | `MemoryPressure { level, available_bytes, total_bytes, reclaim_target_bytes }` | |
-| MSG-102 | `shared/src/lib.rs` | `ComputeGuidance { level, recommended_backend, reason, cpu_usage_pct, gpu_usage_pct }` | |
-| MSG-103 | `shared/src/lib.rs` | `ThermalAlert { level, temperature_mc, throttling_active, throttle_ratio }` | |
-| MSG-104 | `shared/src/lib.rs` | `EnergyConstraint { level, reason, power_budget_mw }` | |
+MSG-020~022 (EngineDirective), MSG-030~041 (EngineCommand)
 
-### Constraints [CON-020 ~ CON-022]
+---
 
-| spec/ ID | 코드 위치 | 구현 방법 | 비고 |
-|----------|----------|----------|------|
-| CON-020 | `shared/src/lib.rs` | serde 어노테이션이 와이어 포맷 결정 | 필드명 변경 금지 |
-| CON-021 | `shared/src/lib.rs` | `#[serde(default)]`로 신규 필드 추가 가능 | 하위 호환 유지 |
-| INV-027 | `shared/src/lib.rs` | serde 어노테이션 변경 = 프로토콜 버전 변경 | |
-| INV-028 | `shared/src/lib.rs` | 새 필드 시 `#[serde(default)]` 필수 | |
+## 3. EngineCapability / EngineStatus
 
-## Config
+### EngineCapability (세션당 1회 전송)
 
-| config 키 | 타입 | 기본값 | spec/ 근거 |
-|-----------|------|--------|-----------|
-| (해당 없음 — 메시지 정의는 코드 내 serde derive로 결정) | | | |
+```rust
+pub struct EngineCapability {
+    pub available_devices: Vec<String>,
+    pub active_device: String,
+    pub max_kv_tokens: usize,
+    pub bytes_per_kv_token: usize,
+    pub num_layers: usize,
+}
+```
 
-## CLI
+연결 직후 `CommandExecutor::send_capability()` 로 전송 (INV-015).
 
-| 플래그 | 설명 | spec/ 근거 |
-|--------|------|-----------|
-| (해당 없음 — 메시지 타입은 CLI와 무관) | | |
+### EngineStatus (Heartbeat, 주기적)
+
+```rust
+pub struct EngineStatus {
+    pub active_device: String,
+    pub compute_level: ResourceLevel,
+    pub actual_throughput: f32,            // EMA 기반 tok/s
+    pub memory_level: ResourceLevel,
+    pub kv_cache_bytes: u64,
+    pub kv_cache_tokens: usize,
+    pub kv_cache_utilization: f32,         // tokens / capacity
+    pub memory_lossless_min: f32,          // 현재 항상 1.0
+    pub memory_lossy_min: f32,             // protected_prefix / total_tokens
+    pub state: EngineState,
+    pub tokens_generated: usize,
+    #[serde(default)] pub available_actions: Vec<String>,   // 실행 가능 액션
+    #[serde(default)] pub active_actions: Vec<String>,       // 현재 활성 액션
+    #[serde(default)] pub eviction_policy: String,           // "none", "h2o", "sliding", ...
+    #[serde(default)] pub kv_dtype: String,                  // "f16", "q4", "q8", ...
+    #[serde(default)] pub skip_ratio: f32,                   // 0.0 = no skip
+}
+```
+
+필드 12~16에 `#[serde(default)]` 적용으로 이전 버전 JSON과 하위 호환 유지 (INV-028).
+
+`available_actions`는 `CommandExecutor::compute_available_actions()`에서 동적으로 계산:
+- 항상 포함: `"throttle"`, `"switch_hw"`, `"layer_skip"`
+- eviction_policy != "none": `"kv_evict_h2o"`, `"kv_evict_sliding"` 추가
+- kv_dtype가 `q`로 시작: `"kv_quant_dynamic"` 추가
+
+### Spec 매핑
+
+MSG-050~052 (EngineCapability), MSG-060~066 (EngineStatus)
+
+---
+
+## 4. CommandResponse / CommandResult
+
+### CommandResponse
+
+```rust
+pub struct CommandResponse {
+    pub seq_id: u64,
+    pub results: Vec<CommandResult>,
+}
+```
+
+**불변식**:
+- `results.len() == directive.commands.len()` (INV-025)
+- `response.seq_id == directive.seq_id` (INV-026)
+- Directive당 정확히 1개 Response (INV-022)
+
+### CommandResult
+
+```rust
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CommandResult {
+    Ok,
+    Partial { achieved: f32, reason: String },
+    Rejected { reason: String },
+}
+```
+
+### Spec 매핑
+
+MSG-070~073 (CommandResponse), MSG-080~083 (CommandResult)
+
+---
+
+## 5. SystemSignal (D-Bus Legacy)
+
+### 설계 결정
+
+D-Bus 경로에서 Manager가 emit하는 시그널. 4종 도메인별 variant로 구성된다.
+serde default externally tagged 전략 사용 (tag 키 = variant 이름).
+
+```rust
+#[serde(rename_all = "snake_case")]
+pub enum SystemSignal {
+    MemoryPressure { level: Level, available_bytes: u64, total_bytes: u64, reclaim_target_bytes: u64 },
+    ComputeGuidance { level: Level, recommended_backend: RecommendedBackend, reason: ComputeReason, cpu_usage_pct: f64, gpu_usage_pct: f64 },
+    ThermalAlert { level: Level, temperature_mc: i32, throttling_active: bool, throttle_ratio: f64 },
+    EnergyConstraint { level: Level, reason: EnergyReason, power_budget_mw: u32 },
+}
+```
+
+공통 `level()` 메서드: 모든 variant에서 Level을 추출한다.
+
+### Supporting Enums
+
+| Enum | Variant들 | 특이 사항 |
+|------|----------|----------|
+| `Level` | Normal, Warning, Critical, Emergency | 4단계, PartialOrd+Ord derive |
+| `ResourceLevel` | Normal, Warning, Critical | 3단계 (프로토콜용, Emergency 없음) |
+| `EngineState` | Idle, Running, Suspended | |
+| `RecommendedBackend` | Cpu, Gpu, Any | |
+| `ComputeReason` | CpuBottleneck, GpuBottleneck, CpuAvailable, GpuAvailable, BothLoaded, Balanced | |
+| `EnergyReason` | BatteryLow, BatteryCritical, PowerLimit, ThermalPower, Charging, None | `None`에 `#[serde(rename = "none")]` |
+
+모든 enum에 `from_dbus_str(&str) -> Option<Self>` 헬퍼가 구현되어 있다 (D-Bus 문자열 인자 파싱용).
+
+### D-Bus → ManagerMessage 변환
+
+`DbusTransport::signal_to_manager_message()` (`engine/src/resilience/dbus_transport.rs`)에서 Level별 고정 변환 테이블:
+
+| SystemSignal | Normal | Warning | Critical | Emergency |
+|-------------|--------|---------|----------|-----------|
+| MemoryPressure | RestoreDefaults | KvEvictSliding(0.85) | KvEvictH2o(0.50) | Suspend |
+| ComputeGuidance | RestoreDefaults | Throttle(30)+SwitchHw | Throttle(70)+SwitchHw | Suspend |
+| ThermalAlert | RestoreDefaults | Throttle(30)+PrepareComputeUnit(cpu) | Throttle(70)+SwitchHw(cpu) | Suspend |
+| EnergyConstraint | RestoreDefaults | SwitchHw(cpu) | SwitchHw(cpu)+Throttle(70) | Suspend |
+
+### Spec 매핑
+
+MSG-090~095 (Supporting Enums), MSG-100~104 (SystemSignal)
+
+---
+
+## 6. serde 직렬화 전략
+
+### 설계 결정
+
+모든 프로토콜 메시지에 일관된 serde 어노테이션 패턴을 적용한다. serde 어노테이션 변경은 프로토콜 버전 변경과 동일하게 취급한다 (INV-027). 새 필드 추가 시 `#[serde(default)]` 필수 (INV-028).
+
+| 타입 | serde 전략 | tag 키 |
+|------|-----------|--------|
+| `ManagerMessage` | internally tagged | `"type"` |
+| `EngineMessage` | internally tagged | `"type"` |
+| `EngineCommand` | internally tagged | `"type"` |
+| `CommandResult` | internally tagged | `"status"` |
+| `SystemSignal` | externally tagged (serde 기본) | variant 이름 |
+| 기타 enum | `rename_all = "snake_case"` | — |
+| 기타 struct | 필드명 그대로 | — |
+
+### 하위 호환 규칙
+
+- 새 필드 추가: `#[serde(default)]` 필수 → 이전 버전 JSON이 역직렬화 가능
+- 필드 제거 / 이름 변경: **금지** (CON-020)
+- 새 enum variant 추가: 수신측에서 unknown variant를 무시하거나 에러 처리해야 함
+
+### Spec 매핑
+
+CON-020 (필드명 불변), CON-021 (하위 호환 확장), INV-027 (serde = wire format), INV-028 (default 필수)
+
+---
+
+## 7. 코드-스펙 차이
+
+| 항목 | spec | 코드 | 비고 |
+|------|------|------|------|
+| QcfEstimate 메시지 | MSG-085~087 명세 | `shared/src/lib.rs`에 미정의 | EngineMessage에 variant 미추가 |
+| EngineMessage 변형 수 | 4종 | 3종 (Capability, Heartbeat, Response) | QcfEstimate 제외 |
+| KvStreaming 실행 | 정상 처리 기대 | `Rejected` 반환 | "not yet implemented" |
