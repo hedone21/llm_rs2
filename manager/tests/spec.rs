@@ -1,5 +1,7 @@
 #[path = "spec/helpers.rs"]
 mod helpers;
+#[path = "spec/test_inv_016.rs"]
+mod test_inv_016;
 #[path = "spec/test_inv_030_031.rs"]
 mod test_inv_030_031;
 #[path = "spec/test_inv_032_033.rs"]
