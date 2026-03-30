@@ -8,7 +8,7 @@ allowed-tools: Read, Glob, Grep, Edit
 
 llm.rs의 **Spec(불변) → Arch(가변) → Test(검증)** 3계층 문서를 관리한다.
 
-상세 규칙은 `spec/CONTRIBUTING.md`에 정의되어 있다. 이 스킬은 핵심 절차를 요약하고 실행 가이드를 제공한다.
+이 스킬이 Spec 관리의 유일한 참조점이다.
 
 ## 3계층 구조
 
@@ -178,7 +178,52 @@ flowchart TD
 - 행을 삭제하지 않는다. 취소선 + DEPRECATED 표기
 - 번호를 재사용하지 않는다
 
-## 7. 일관성 검사
+## 7. ID 할당 범위 상세
+
+### INV 범위별 다음 가용 번호
+
+| INV 범위 | 원본 파일 | 다음 가용 번호 |
+|----------|----------|-------------|
+| INV-001~006 | 00-overview | INV-007 |
+| INV-010~018 | 01-architecture | INV-019 |
+| INV-020~028 | 10/11-protocol | INV-029 |
+| INV-030~051 | 22-manager-algorithms | INV-052 |
+| INV-060~065 | 30-engine | INV-066 |
+| INV-070~076 | 31-engine-state | INV-077 |
+| INV-080~085 | 41-invariants (cross-cutting) | INV-086 |
+
+### Constraint (CON-*) 범위
+
+| 범위 | 원본 파일 |
+|------|----------|
+| CON-010~012 | 10-protocol |
+| CON-020~022 | 11-protocol-messages |
+| CON-030~033 | 12-protocol-sequences |
+| CON-040~042 | 40-cross-cutting |
+
+### Manager/Engine Constraint 범위
+
+| 접두사 | 범위 | 원본 파일 |
+|--------|------|----------|
+| MGR-C01~C02 | 20-manager | Manager 개요 제약 |
+| MGR-C03~C05 | 21-manager-state | Manager 상태 제약 |
+| MGR-C06~C10 | 22-manager-algorithms | Manager 알고리즘 제약 |
+| MGR-DAT-C01~C02 | 23-manager-data | Manager 데이터 제약 |
+| ENG-ALG-C01~C08 | 32-engine-algorithms | Engine 알고리즘 제약 |
+| ENG-DAT-C01~C07 | 33-engine-data | Engine 데이터 제약 |
+
+## 8. COVERAGE.md 형식
+
+`spec/COVERAGE.md`의 상태 기호:
+
+| 기호 | 의미 |
+|------|------|
+| ✅ | 테스트 존재 + 통과 |
+| ❌ | 테스트 존재 + 실패 |
+| ⬜ | 테스트 미작성 |
+| 🔶 | 자동 테스트 불가 (static 전용). 사유 명시. |
+
+## 9. 일관성 검사
 
 Spec 변경 완료 후 실행:
 
@@ -186,11 +231,11 @@ Spec 변경 완료 후 실행:
 # ID 충돌 검사
 grep -roE '\[[A-Z]+-[A-Z]*-?[0-9]+[a-z]?\]' spec/*.md | sed 's/.*://' | sort | uniq -d
 
-# INV 테스트 커버리지 (tests/spec/ 존재 시)
-# spec/CONTRIBUTING.md 섹션 9.1 참조
+# 3계층 + INV 커버리지 + 비-INV 추적성 통합 검사
+scripts/check_spec_coverage.sh
 ```
 
-## 8. 산출물 체크리스트
+## 10. 산출물 체크리스트
 
 Spec 작업 완료 후 확인:
 
@@ -200,3 +245,11 @@ Spec 작업 완료 후 확인:
 - [ ] arch/에 불변식이 없음 (HOW만)
 - [ ] Normative 변경 시 arch/ + tests/spec/ 요구 사항 명시됨
 - [ ] ID 형식: `[PREFIX-NNN]` + RFC 2119 키워드 (MUST/SHOULD/MAY)
+
+## FAQ
+
+**Q: spec에 있는데 코드에 없는 것은?** — 구현 의무. spec/이 source of truth. 즉시 구현이 어려우면 arch/에 `TODO: 미구현` 표기.
+
+**Q: arch/ 없이 테스트 작성 가능한가?** — spec/만으로 가능. spec/은 WHAT을 정의하므로 입출력 조건으로 테스트 작성 가능. arch/는 편의 참조.
+
+**Q: INV-ID를 변경하면?** — **절대 변경 금지.** 의미가 바뀌면 DEPRECATED + 새 ID 할당. 번호 재사용 금지.

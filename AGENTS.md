@@ -105,7 +105,7 @@ Conventional Commits: `type(scope): subject` — 명령형 현재 시제. Types:
 | Android 배포, 디바이스 테스트 | `/deploy-test` |
 | 프로파일링 | `/profile` |
 | 대시보드 | `/dashboard` |
-| Spec 관리 | `/spec-manage` — 상세: `spec/CONTRIBUTING.md` |
+| Spec 관리 | `/spec-manage` |
 | 실험 벤치마크 | `experiments/PLAN.md`, `docs/35_experiment_runner_guide.md` |
 | TODO 관리 | `.agent/todos/` — 형식: `.agent/todos/README.md` |
 | 설계 문서 | `ARCHITECTURE.md`, `spec/`, `docs/` |

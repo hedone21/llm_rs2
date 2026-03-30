@@ -1,8 +1,8 @@
 ---
 name: sanity-check
-description: cargo fmt + clippy + unit test를 실행하여 코드 품질을 검증한다. 코드 구현 완료 후 반드시 실행. '빌드', 'cargo check', 'cargo test', '컴파일', '린트', 'clippy', 'fmt' 등의 요청 시에도 이 스킬을 사용.
+description: cargo fmt + clippy + unit test를 실행하여 코드 품질을 검증한다. --spec으로 Spec 불변식 테스트 + 커버리지도 실행 가능. 코드 구현 완료 후 반드시 실행. '빌드', 'cargo check', 'cargo test', '컴파일', '린트', 'clippy', 'fmt' 등의 요청 시에도 이 스킬을 사용.
 allowed-tools: Bash, Read
-argument-hint: "[--no-test]"
+argument-hint: "[--no-test] [--spec]"
 ---
 
 # Sanity Check
@@ -53,6 +53,25 @@ cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "
 - **fmt 실패**: `cargo fmt --all`로 자동 수정 후 재확인
 - **clippy 경고**: 경고 내용을 분석하고 코드 수정
 - **test 실패**: 실패한 테스트를 분석하고 원인 보고
+
+## Spec 검증 (--spec 플래그)
+
+`--spec` 플래그가 지정되면 기본 검사에 추가하여 Spec 관련 테스트를 실행한다.
+
+```bash
+# Spec 통합 테스트
+cargo test -p llm_rs2 --test spec          # Engine INV 테스트
+cargo test -p llm_manager --test spec      # Manager INV 테스트
+
+# 3계층 커버리지 통합 검사 (Static INV + 비-INV 추적성 + 품질)
+scripts/check_spec_coverage.sh
+```
+
+### --spec 실패 시 대응
+
+- **spec 테스트 실패**: 실패한 INV를 식별하고 관련 spec/ 문서와 대조
+- **static INV 위반**: 위반된 INV에 대해 Cargo.toml 또는 코드 구조 수정 필요
+- **커버리지 누락**: 새 INV 추가 시 tests/spec/ 테스트 작성이 필요함을 보고
 
 ## 규칙
 

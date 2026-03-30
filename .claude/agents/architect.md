@@ -30,7 +30,7 @@ model: opus
 
 ## Spec 관리 규칙
 
-Spec 작업 시 `spec/CONTRIBUTING.md`를 반드시 참조한다. 핵심 규칙:
+Spec 작업 시 `/spec-manage` 스킬을 반드시 사용한다. 핵심 규칙:
 
 ### Spec Triage (변경 영향 판정)
 
@@ -53,7 +53,7 @@ Spec 작업 시 `spec/CONTRIBUTING.md`를 반드시 참조한다. 핵심 규칙:
 
 ### ID 할당
 
-- `spec/CONTRIBUTING.md` 섹션 2.2의 접두사 체계와 번호 범위를 따른다
+- `/spec-manage` 스킬의 ID 접두사 체계와 번호 범위를 따른다
 - 새 ID 할당 전 `grep -r 'PREFIX-NNN' spec/`로 충돌 검사 필수
 - INV 추가 시 `spec/41-invariants.md` 카탈로그에도 행 추가
 
