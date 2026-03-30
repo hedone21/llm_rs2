@@ -1,6 +1,6 @@
 # INV Coverage Tracker
 
-> 전체: 65개 | ✅ 19 | ⬜ 29 | 🔶 17
+> 전체: 65개 | ✅ 29 | ⬜ 19 | 🔶 17
 
 ## 범례
 
@@ -24,9 +24,9 @@
 | INV-011 | Shared는 Engine/Manager 내부 구현에 의존 금지. | Safety | 🔶 | (static: Cargo.toml) |
 | INV-012 | Backend trait이 유일한 하드웨어 추상화점. Backend 우회 직접 호출 금지. | Correctness | 🔶 | (static: 코드 리뷰) |
 | INV-013 | Monitor 스레드 장애가 다른 Monitor에 전파 금지. | Safety | 🔶 | (static, test: 아키텍처) |
-| INV-014 | EngineDirective.seq_id는 세션 내 단조 증가. | Correctness | ⬜ | |
-| INV-015 | Capability는 세션당 정확히 1회 전송. | Correctness | ⬜ | |
-| INV-016 | 동일 배타 그룹 액션 동시 활성화 금지. | Correctness | ⬜ | |
+| INV-014 | EngineDirective.seq_id는 세션 내 단조 증가. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-015 | Capability는 세션당 정확히 1회 전송. | Correctness | ✅ | `engine/tests/spec/test_inv_015.rs` |
+| INV-016 | 동일 배타 그룹 액션 동시 활성화 금지. | Correctness | ✅ | `manager/tests/spec/test_inv_016.rs` |
 | INV-017 | QCF 수집 활성 + lossy action 실행 시 QcfMetric 생성 필수. (=> INV-004) | Correctness | ⬜ | |
 | INV-018 | 추론 루프(Prefill/Decode)는 단일 스레드. | Safety | 🔶 | (static: 아키텍처) |
 
@@ -34,13 +34,13 @@
 
 | INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
 |-----|------|---------|------|-----------|
-| INV-020 | seq_id 단조 증가: `seq_id(N+1) > seq_id(N)`. | Correctness | ⬜ | |
-| INV-021 | 동일 seq_id 재사용 금지. | Correctness | ⬜ | |
-| INV-022 | 모든 Directive는 정확히 1개 Response를 유발. | Correctness | ⬜ | |
-| INV-023 | `CommandResponse.seq_id == EngineDirective.seq_id`. | Correctness | ⬜ | |
-| INV-024 | `len(CommandResponse.results) == len(EngineDirective.commands)`. | Correctness | ⬜ | |
-| INV-025 | `len(CommandResponse.results) == len(EngineDirective.commands)`. (=> INV-024) | Correctness | ⬜ | |
-| INV-026 | Engine은 수신한 seq_id에 대해서만 Response 전송. | Correctness | ⬜ | |
+| INV-020 | seq_id 단조 증가: `seq_id(N+1) > seq_id(N)`. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-021 | 동일 seq_id 재사용 금지. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-022 | 모든 Directive는 정확히 1개 Response를 유발. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-023 | `CommandResponse.seq_id == EngineDirective.seq_id`. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-024 | `len(CommandResponse.results) == len(EngineDirective.commands)`. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-025 | `len(CommandResponse.results) == len(EngineDirective.commands)`. (=> INV-024) | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
+| INV-026 | Engine은 수신한 seq_id에 대해서만 Response 전송. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
 | INV-027 | Shared serde 어노테이션 변경 = 프로토콜 버전 변경. | Compatibility | 🔶 | (static: 코드 리뷰) |
 | INV-028 | 새 필드 추가 시 `#[serde(default)]` 필수. 하위 호환 유지. | Compatibility | 🔶 | (static: 코드 리뷰) |
 
