@@ -36,3 +36,11 @@ mod test_eng_st_010_035;
 mod test_eng_st_052_060;
 #[path = "spec/test_proto_010_062.rs"]
 mod test_proto_010_062;
+
+// ── SEQ 통합 테스트 ──
+#[path = "spec/test_seq_020_035.rs"]
+mod test_seq_020_035;
+#[path = "spec/test_seq_040_064.rs"]
+mod test_seq_040_064;
+#[path = "spec/test_seq_070_093.rs"]
+mod test_seq_070_093;

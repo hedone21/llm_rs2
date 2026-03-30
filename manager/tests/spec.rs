@@ -38,3 +38,7 @@ mod test_mgr_alg_042_047;
 mod test_mgr_dat_020_056;
 #[path = "spec/test_mgr_alg_036_051.rs"]
 mod test_mgr_alg_036_051;
+
+// ── SEQ 통합 테스트 ──
+#[path = "spec/test_seq_040_064_mgr.rs"]
+mod test_seq_040_064_mgr;
