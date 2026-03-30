@@ -1,6 +1,6 @@
 # INV Coverage Tracker
 
-> 전체: 65개 | ✅ 29 | ⬜ 19 | 🔶 17
+> 전체: 65개 | ✅ 48 | ⬜ 0 | 🔶 17
 
 ## 범례
 
@@ -16,10 +16,10 @@
 |-----|------|---------|------|-----------|
 | INV-001 | 시스템 = 2 독립 프로세스. Engine-Manager 직접 코드 의존 금지. | Safety | 🔶 | (static: Cargo workspace 의존 구조) |
 | INV-002 | NEON SIMD는 ARM64에서만 활성화. | Safety | 🔶 | (static: `#[cfg(target_arch)]`) |
-| INV-003 | `config.json`의 `architectures`가 지원 목록에 없으면 로딩 거부. | Correctness | ⬜ | |
-| INV-004 | QCF 수집 활성 상태에서 lossy action 실행 시 QcfMetric 생성 필수. | Correctness | ⬜ | |
-| INV-005 | Manager 장애가 Engine 추론 루프를 중단시키지 않음. | Safety | ⬜ | |
-| INV-006 | Engine 장애가 Manager 모니터링 루프를 중단시키지 않음. | Safety | ⬜ | |
+| INV-003 | `config.json`의 `architectures`가 지원 목록에 없으면 로딩 거부. | Correctness | ✅ | `engine/tests/spec/test_inv_003.rs` |
+| INV-004 | QCF 수집 활성 상태에서 lossy action 실행 시 QcfMetric 생성 필수. | Correctness | ✅ | `engine/tests/spec/test_inv_004_017.rs` |
+| INV-005 | Manager 장애가 Engine 추론 루프를 중단시키지 않음. | Safety | ✅ | `engine/tests/spec/test_inv_005_006.rs` |
+| INV-006 | Engine 장애가 Manager 모니터링 루프를 중단시키지 않음. | Safety | ✅ | `engine/tests/spec/test_inv_005_006.rs` |
 | INV-010 | Engine-Manager 직접 코드 의존 금지. Shared가 유일한 공유 의존성. | Safety | 🔶 | (static: Cargo.toml) |
 | INV-011 | Shared는 Engine/Manager 내부 구현에 의존 금지. | Safety | 🔶 | (static: Cargo.toml) |
 | INV-012 | Backend trait이 유일한 하드웨어 추상화점. Backend 우회 직접 호출 금지. | Correctness | 🔶 | (static: 코드 리뷰) |
@@ -27,7 +27,7 @@
 | INV-014 | EngineDirective.seq_id는 세션 내 단조 증가. | Correctness | ✅ | `engine/tests/spec/test_inv_020_026.rs` |
 | INV-015 | Capability는 세션당 정확히 1회 전송. | Correctness | ✅ | `engine/tests/spec/test_inv_015.rs` |
 | INV-016 | 동일 배타 그룹 액션 동시 활성화 금지. | Correctness | ✅ | `manager/tests/spec/test_inv_016.rs` |
-| INV-017 | QCF 수집 활성 + lossy action 실행 시 QcfMetric 생성 필수. (=> INV-004) | Correctness | ⬜ | |
+| INV-017 | QCF 수집 활성 + lossy action 실행 시 QcfMetric 생성 필수. (=> INV-004) | Correctness | ✅ | `engine/tests/spec/test_inv_004_017.rs` |
 | INV-018 | 추론 루프(Prefill/Decode)는 단일 스레드. | Safety | 🔶 | (static: 아키텍처) |
 
 ## Protocol (INV-020 ~ INV-028)
@@ -55,19 +55,19 @@
 | INV-034 | `warning_release < warning_threshold`. | Correctness | ✅ | `manager/tests/spec/test_inv_034_036.rs` |
 | INV-035 | `critical_release < critical_threshold`. | Correctness | ✅ | `manager/tests/spec/test_inv_034_036.rs` |
 | INV-036 | `warning_threshold < critical_threshold`. | Correctness | ✅ | `manager/tests/spec/test_inv_034_036.rs` |
-| INV-037 | Warning 모드에서 Lossy 액션 선택 금지. | Correctness | ⬜ | |
-| INV-038 | 이미 활성 중인 액션은 재선택 금지. | Correctness | ⬜ | |
+| INV-037 | Warning 모드에서 Lossy 액션 선택 금지. | Correctness | ✅ | `manager/tests/spec/test_inv_037_038.rs` |
+| INV-038 | 이미 활성 중인 액션은 재선택 금지. | Correctness | ✅ | `manager/tests/spec/test_inv_037_038.rs` |
 | INV-039 | Lossless 액션의 cost = 항상 0. | Correctness | ✅ | `manager/tests/spec/test_inv_039_040.rs` |
 | INV-040 | QCF 값 없는 Lossy 액션 = INFINITY cost. | Correctness | ✅ | `manager/tests/spec/test_inv_039_040.rs` |
-| INV-041 | 동일 배타 그룹 액션은 하나의 조합에 동시 미포함. (=> INV-016) | Correctness | ⬜ | |
-| INV-042 | 조합의 총 latency 악화 > latency_budget이면 배제. | Performance | ⬜ | |
+| INV-041 | 동일 배타 그룹 액션은 하나의 조합에 동시 미포함. (=> INV-016) | Correctness | ✅ | `manager/tests/spec/test_inv_041_042.rs` |
+| INV-042 | 조합의 총 latency 악화 > latency_budget이면 배제. | Performance | ✅ | `manager/tests/spec/test_inv_041_042.rs` |
 | INV-043 | 완전 해소 가능 조합 > best-effort 조합 (항상 우선). | Correctness | ✅ | `manager/tests/spec/test_inv_043_044.rs` |
 | INV-044 | parametrize 출력 value는 [range.min, range.max] 범위 내. | Correctness | ✅ | `manager/tests/spec/test_inv_043_044.rs` |
 | INV-045 | primary_domain 매핑: SwitchHw/Throttle/LayerSkip -> Compute. | Correctness | 🔶 | (static: 코드) |
-| INV-046 | RLS gain vector k = f(P, phi). lambda는 망각 인수. | Correctness | ⬜ | |
-| INV-047 | bias는 W 갱신 후 잔여 오차에 EMA(lr=0.1) 적용. | Correctness | ⬜ | |
-| INV-048 | P matrix: D x D 대칭 양정치. 초기값 100 * I. | Correctness | ⬜ | |
-| INV-049 | `lambda in (0, 1]`. lambda=1.0이면 forgetting 없음. | Correctness | ⬜ | |
+| INV-046 | RLS gain vector k = f(P, phi). lambda는 망각 인수. | Correctness | ✅ | `manager/tests/spec/test_inv_046_049.rs` |
+| INV-047 | bias는 W 갱신 후 잔여 오차에 EMA(lr=0.1) 적용. | Correctness | ✅ | `manager/tests/spec/test_inv_046_049.rs` |
+| INV-048 | P matrix: D x D 대칭 양정치. 초기값 100 * I. | Correctness | ✅ | `manager/tests/spec/test_inv_046_049.rs` |
+| INV-049 | `lambda in (0, 1]`. lambda=1.0이면 forgetting 없음. | Correctness | ✅ | `manager/tests/spec/test_inv_046_049.rs` |
 | INV-050 | 관찰 relief의 latency 차원 = 항상 0.0. | Correctness | ✅ | `manager/tests/spec/test_inv_050.rs` |
 | INV-051 | 동시 적용 시 전체 relief가 각 액션에 귀속 (개별 분리 불가). | Correctness | 🔶 | (static: 설계 한계) |
 
@@ -77,9 +77,9 @@
 |-----|------|---------|------|-----------|
 | INV-060 | `CommandExecutor.poll()`은 토큰당 최대 1회 호출. | Performance | 🔶 | (static: 코드 구조) |
 | INV-061 | ExecutionPlan: 생성 즉시 소비, 1회성. | Safety | 🔶 | (static: 코드 구조) |
-| INV-062 | Suspend 포함 ExecutionPlan: evict/switch_device/prepare_device = None. | Safety | ⬜ | |
+| INV-062 | Suspend 포함 ExecutionPlan: evict/switch_device/prepare_device = None. | Safety | ✅ | `engine/tests/spec/test_inv_062_064.rs` |
 | INV-063 | MessageLoop 스레드는 Transport의 유일한 소유자. | Safety | 🔶 | (static: ownership) |
-| INV-064 | heartbeat_interval 내 최소 1회 Heartbeat 전송. | Correctness | ⬜ | |
+| INV-064 | heartbeat_interval 내 최소 1회 Heartbeat 전송. | Correctness | ✅ | `engine/tests/spec/test_inv_062_064.rs` |
 | INV-065 | Backend trait 구현체는 `Send + Sync`. | Safety | 🔶 | (static: trait bound) |
 
 ## Engine State Machine (INV-070 ~ INV-076)
@@ -99,8 +99,8 @@
 | INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
 |-----|------|---------|------|-----------|
 | INV-080 | async 런타임 사용 금지. std::thread + mpsc만 허용. | Safety | 🔶 | (static: Cargo.toml, 코드 리뷰) |
-| INV-081 | IPC 직렬화는 JSON (serde_json) 전용. | Compatibility | ⬜ | |
-| INV-082 | 1:1 단일 클라이언트 연결. 다중 Engine 동시 연결 금지. | Safety | ⬜ | |
-| INV-083 | PI Controller output은 [0, 1] 범위 내. | Correctness | ⬜ | |
+| INV-081 | IPC 직렬화는 JSON (serde_json) 전용. | Compatibility | ✅ | `engine/tests/spec/test_inv_081_082.rs` |
+| INV-082 | 1:1 단일 클라이언트 연결. 다중 Engine 동시 연결 금지. | Safety | ✅ | `engine/tests/spec/test_inv_081_082.rs` |
+| INV-083 | PI Controller output은 [0, 1] 범위 내. | Correctness | ✅ | `manager/tests/spec/test_inv_083_085.rs` |
 | INV-084 | ActionSelector = stateless. ReliefEstimator.predict = 읽기 전용. | Correctness | 🔶 | (static: 코드 구조) |
-| INV-085 | Normal 모드에서 액션 미발행. | Correctness | ⬜ | |
+| INV-085 | Normal 모드에서 액션 미발행. | Correctness | ✅ | `manager/tests/spec/test_inv_083_085.rs` |
