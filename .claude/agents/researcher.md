@@ -2,7 +2,7 @@
 name: researcher
 description: 논문 분석, 기술 조사, 기존 코드와의 매핑 분석, 적용 가능성 평가. 파일을 수정하지 않고 조사 결과만 반환한다.
 tools: Read, Glob, Grep, WebSearch, WebFetch
-model: sonnet
+model: opus
 ---
 
 # Researcher Agent

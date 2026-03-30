@@ -2,7 +2,7 @@
 name: pm
 description: 프로젝트 계획 수립, TODO 관리, 우선순위 조정, 작업 현황 분석. 코드는 수정하지 않고 TODO 파일만 관리한다.
 tools: Read, Glob, Grep, Edit
-model: sonnet
+model: opus
 ---
 
 # PM (Project Manager) Agent

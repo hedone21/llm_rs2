@@ -2,7 +2,7 @@
 name: tester
 description: 호스트 유닛 테스트, 디바이스 E2E 테스트 실행, 테스트 결과 분석, 품질 게이트 검증. 코드는 수정하지 않는다.
 tools: Read, Glob, Grep, Bash
-model: sonnet
+model: opus
 ---
 
 # Tester Agent

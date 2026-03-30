@@ -1,252 +1,111 @@
-# llm.rs Project Guide
+# llm.rs 프로젝트 가이드
 
 프로젝트의 AI 에이전트 작업 가이드.
 
-## System Instructions
+## 시스템 지시
 
-- **Language**: 모든 응답, 리포트, 계획, 설명은 한국어로 작성한다. 기술 용어와 코드 식별자는 원문 유지.
+- **언어**: 모든 응답, 리포트, 계획, 설명은 한국어로 작성한다. 기술 용어와 코드 식별자는 원문 유지.
 
-## Project Overview
+## 프로젝트 개요
 
-llm.rs (repo: llm_rs2) — a high-performance on-device LLM inference framework in Rust, targeting ARM64 Android/edge devices. Supports Llama 3.2 models in HuggingFace Safetensors format with Q4_0/Q8_0 quantization and OpenCL GPU acceleration.
+llm.rs (repo: llm_rs2) — Rust로 작성된 고성능 온디바이스 LLM 추론 프레임워크. ARM64 Android/엣지 디바이스를 타겟으로 하며, HuggingFace Safetensors 포맷의 Llama 3.2 모델을 Q4_0/Q8_0 양자화 및 OpenCL GPU 가속으로 지원한다.
 
-## Build Commands
+## 아키텍처
 
-```bash
-# Android cross-compilation (MUST source env first)
-source android.source
-cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
+**Cargo workspace** — 3개 Rust 크레이트:
+- `engine/` — LLM 추론 엔진 (`llm_rs2` 크레이트)
+- `shared/` — 공유 시그널 타입 (`llm_shared` 크레이트)
+- `manager/` — 시스템 리소스 매니저 서비스 (`llm_manager` 크레이트)
 
-# Host build (CPU-only, for development)
-cargo check --workspace    # syntax check (all crates)
-cargo test -p llm_rs2      # unit tests (engine)
-cargo test -p llm_shared   # unit tests (shared types)
+**비-Rust 컴포넌트**:
+- `web_dashboard/` — 웹 대시보드 (Python/Flask)
 
-# Manager build & test
-cargo test -p llm_manager      # unit tests (manager)
-cargo run -p llm_manager -- --transport unix:/tmp/llm.sock --policy-config policy_config.toml
-cargo run -p llm_manager --bin mock_engine -- --socket /tmp/llm.sock
+**엔진 모듈 구조** (`engine/src/lib.rs`):
+- `core/` — 트레이트와 추상화: `Backend` (17+ ops), `Buffer`, `Tensor`, `KVCache`, eviction 정책
+- `backend/cpu/` — CPU 백엔드, ARM64 NEON (`neon.rs`) 및 x86 AVX2 (`x86.rs`) 특화
+- `backend/opencl/` — OpenCL GPU 백엔드; 커널 파일: `engine/kernels/*.cl` (~80개)
+- `models/llama/` — Llama 3.2 모델 로딩 및 forward pass
+- `layers/` — Transformer 레이어, attention (naive + flash), 사전 할당 workspace 버퍼
+- `memory/` — Galloc 공유 할당자
+- `buffer/` — SharedBuffer (zero-copy GPU↔CPU) 및 UnifiedBuffer
+- `resilience/` — Resilience 매니저 (D-Bus/UnixSocket IPC, strategy 패턴)
 
-# Code quality
-./.agent/skills/developing/scripts/sanity_check.sh   # runs cargo fmt + cargo clippy (workspace)
-```
+**주요 바이너리**:
+- `generate` (`engine/src/bin/`) — 메인 추론 바이너리 (단일 백엔드, CPU 또는 OpenCL)
+- `test_backend` (`engine/src/bin/`) — 백엔드 정확성 검증 (CPU vs OpenCL 비교, Tier 2 테스트)
+- `llm_manager` (`manager/src/main.rs`) — 시스템 리소스 매니저 서비스 (PI 컨트롤러, 정책 엔진)
+- `mock_engine` (`manager/src/bin/`) — 매니저 테스트용 엔진 모의 클라이언트
+- `mock_manager` (`manager/src/bin/`) — 엔진 테스트용 매니저 모의 서버
 
-## Testing
+**추론 흐름**: Prefill (배치 토큰) → Decode (토큰 단위). 레이어별: RMSNorm → QKV matmul → RoPE → KV 캐시 갱신 → Attention → FFN. 모델은 `forward_into()`로 통합 forward pass 수행; eviction은 `CacheManager`를 통해 호출자 책임. `LlamaLayer::forward()`는 `seq_len == 1`일 때 private `forward_gen()` 경로로 분기.
 
-3-tier strategy:
+**Zero-copy 메모리**: ARM SoC에서 `CL_MEM_ALLOC_HOST_PTR`이 GPU 버퍼를 CPU 포인터로 매핑하여 CPU↔GPU 간 memcpy를 제거한다.
 
-1. **Host unit tests**: `cargo test` — tests tokenizer, shape inference, platform-agnostic logic
-2. **Backend verification (on-device)**: `./.agent/skills/testing/scripts/run_android.sh test_backend` — validates OpenCL/CPU kernel correctness
-3. **E2E inference (on-device)**: `./.agent/skills/testing/scripts/run_android.sh generate --prompt "Hello" -n 128`
+**KV 캐시 eviction**: `EvictionPolicy` 트레이트 — `NoEvictionPolicy`, `SlidingWindowPolicy` (최근 N 토큰 유지), `H2OPolicy` (3-파티션: prefix + heavy hitters + recent window), `H2OPlusPolicy` (per-head GQA-aware 변형). `D2OHandler` (merge compensation, `CachePressureHandler` 기반). RoPE 포지션은 eviction 후에도 단조 증가; 물리적 KV 캐시 위치는 `prune_prefix()`로 감소 가능.
 
-Unit tests go in `#[cfg(test)] mod tests` within the same file. Every feature/fix requires a test.
+## 핵심 제약사항
 
-## Model Weights
+- **`.cl` 커널 파일을 수정하지 않는다** — 명시적 지시가 없는 한. 고도로 최적화되어 있고 안정적이다.
+- **`--gpu-attn` 플래그를 사용하지 않는다** — 명시적 지시가 없는 한.
+- `opencl` feature는 기본 활성화. GPU 없는 호스트에서도 컴파일은 되지만 GPU 연산은 실행되지 않는다.
+- Release 프로필: `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`.
+- Android 타겟: NEON+dotprod 필수; x86 타겟: AVX2+FMA 활성화 (`.cargo/config.toml`에 설정).
+- Android 크로스 컴파일 시 `cargo build` 전에 반드시 `source android.source` 실행.
 
-`models/` 디렉토리는 `.gitignore`에 등록되어 git에 포함되지 않습니다. 호스트 PC에서 테스트할 때 모델 가중치를 이 경로에 저장합니다.
+## 커밋 컨벤션
 
-```bash
-# HuggingFace에서 모델 다운로드
-huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
+Conventional Commits: `type(scope): subject` — 명령형 현재 시제. Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
 
-# 호스트에서 추론 테스트
-cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "Hello" -n 128
-```
-
-| 경로 | 용도 |
-|------|------|
-| `models/llama3.2-1b/` | 호스트 PC 테스트용 (gitignored) |
-| `/data/local/tmp/models/llama3.2-1b` | Android 디바이스용 |
-
-## Architecture
-
-**Cargo workspace** with 3 Rust crates:
-- `engine/` — LLM inference engine (`llm_rs2` crate)
-- `shared/` — Shared signal types (`llm_shared` crate)
-- `manager/` — System resource manager service (`llm_manager` crate)
-
-**Non-Rust components**:
-- `web_dashboard/` — Web dashboard (Python/Flask)
-
-**Engine module structure** (`engine/src/lib.rs`):
-- `core/` — Traits and abstractions: `Backend` (17+ ops), `Buffer`, `Tensor`, `KVCache`, eviction policies
-- `backend/cpu/` — CPU backend with ARM64 NEON (`neon.rs`) and x86 AVX2 (`x86.rs`) specializations
-- `backend/opencl/` — OpenCL GPU backend; kernels live in `engine/kernels/*.cl` (~80 files)
-- `models/llama/` — Llama 3.2 model loading and forward pass
-- `layers/` — Transformer layer, attention (naive + flash), pre-allocated workspace buffers
-- `memory/` — Galloc shared allocator
-- `buffer/` — SharedBuffer (zero-copy GPU↔CPU) and UnifiedBuffer
-- `resilience/` — Resilience manager (D-Bus/UnixSocket IPC, strategy patterns)
-
-**Key binaries** (`engine/src/bin/`):
-- `generate` — Main inference binary (single backend, CPU or OpenCL)
-- `generate_hybrid` — Dynamic CPU↔GPU switching based on sequence length
-- `test_backend` — Backend correctness verification (compares CPU vs OpenCL)
-- `micro_bench` — Individual operator benchmarks
-- `test_model` — Model loading verification
-- `signal_injector` — Resilience signal injection for testing
-
-**Inference flow**: Prefill (batch tokens) → Decode (token-by-token). Each layer: RMSNorm → QKV matmul → RoPE → KV cache update → Attention → FFN. Model uses `forward_into()` for unified forward pass; eviction is caller's responsibility via `CacheManager`. `LlamaLayer::forward()` internally dispatches to a private `forward_gen()` path when `seq_len == 1`.
-
-**Zero-copy memory**: On ARM SoCs, `CL_MEM_ALLOC_HOST_PTR` maps GPU buffers to CPU pointers, eliminating memcpy between CPU and GPU.
-
-**KV cache eviction**: `EvictionPolicy` trait with `NoEvictionPolicy`, `SlidingWindowPolicy` (keep recent N tokens), `H2OPolicy` (3-partition: prefix + heavy hitters + recent window), and `H2OPlusPolicy` (per-head GQA-aware variant). Also `D2OHandler` (merge compensation via `CachePressureHandler`). RoPE position increments monotonically even after eviction; physical KV cache position can decrease via `prune_prefix()`.
-
-## Important Constraints
-
-- **Do NOT modify `.cl` kernel files** unless explicitly instructed. They are highly optimized and stable.
-- **Do NOT use `--gpu-attn` flag** unless explicitly instructed.
-- The `opencl` feature is enabled by default. Host builds without a GPU will still compile but GPU ops won't run.
-- Release profile uses `lto = "fat"`, `codegen-units = 1`, `opt-level = 3`.
-- Android target requires NEON+dotprod; x86 target enables AVX2+FMA (set in `.cargo/config.toml`).
-
-## Commit Convention
-
-Conventional Commits: `type(scope): subject` — imperative present tense. Types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.
-
-## Agent System
+## 에이전트 시스템
 
 5개 특화 서브에이전트가 `.claude/agents/`에 정의되어 있다. 메인 세션이 오케스트레이터 역할을 하며 에이전트 간 결과를 전달한다.
 
-| Agent | Role | Tools | Scope |
-|-------|------|-------|-------|
+| 에이전트 | 역할 | 도구 | 범위 |
+|---------|------|------|------|
 | **PM** | 계획 수립, TODO 관리, 우선순위 조정, 작업 배분 제안 | Read, Glob, Grep, Edit | `.agent/todos/*.md`만 수정 |
-| **Architect** | 코드 분석, SOLID 설계, 아키텍처 문서 작성 | Read, Glob, Grep, Edit | `docs/*.md`, `ARCHITECTURE.md`만 수정 |
+| **Architect** | 코드 분석, SOLID 설계, Spec/Arch/아키텍처 문서 관리 | Read, Glob, Grep, Edit | `spec/`, `arch/`, `docs/*.md`, `ARCHITECTURE.md` 수정 |
 | **Implementer** | 코드 구현, 유닛 테스트, 버그 수정, sanity check | Read, Edit, Write, Glob, Grep, Bash | `engine/`, `shared/`, `manager/` 소스 코드 |
 | **Tester** | 호스트/디바이스 테스트 실행, 결과 분석, 품질 게이트 검증 | Read, Glob, Grep, Bash | 수정 불가, 실행만 |
 | **Researcher** | 논문 분석, 기술 조사, 적용 가능성 평가 | Read, Glob, Grep, WebSearch, WebFetch | 수정 불가, 조사 결과 반환만 |
 
-**Workflow**:
+**워크플로우**:
 ```
-[PM] 계획/TODO → [Architect] 설계 → [Implementer] 구현+테스트 → [Tester] 검증
-                                       ↑
-                               [Researcher] 기법 조사
+[PM] 계획/TODO → [Architect] 설계+Spec → [Implementer] 구현+테스트 → [Tester] 검증
+                                            ↑
+                                    [Researcher] 기법 조사
 ```
 
 **제약**: 서브에이전트는 다른 서브에이전트를 호출할 수 없다 (최대 1단계). 작업 위임은 메인 세션이 담당.
 
-## Skill System
+## 스킬 시스템
 
-`.claude/skills/`에 에이전트별 특화 스킬이 정의되어 있다. 스크립트는 `.agent/skills/*/scripts/`에 위치.
+`.claude/skills/`에 에이전트별 특화 스킬이 정의되어 있다. 상세 절차와 명령어는 각 스킬 참조.
 
-| Skill | 용도 | 주 사용 Agent |
-|-------|------|--------------|
-| **sanity-check** | cargo fmt + clippy + test | Implementer |
-| **deploy-test** | Android 빌드→배포→테스트 | Tester |
+| 스킬 | 용도 | 주 사용 에이전트 |
+|------|------|----------------|
+| **sanity-check** | 빌드 + cargo fmt + clippy + test | Implementer |
+| **deploy-test** | Android 빌드→배포→테스트 + 디바이스 관리 | Tester |
 | **profile** | 온디바이스 프로파일링 + 시각화 | Tester, Implementer |
 | **dashboard** | 웹 대시보드 실행/관리 | (공용) |
 | **design-review** | SOLID 원칙 기반 코드 구조 검토 | Architect |
 | **research** | 논문/기술 조사 + 적용 가능성 평가 | Researcher |
+| **spec-manage** | Spec/Arch/Test 3계층 문서 관리 (ID 할당, 동기화) | Architect |
+| **develop** | 개발 파이프라인 오케스트레이터 (워크플로우 조율) | 메인 세션 (오케스트레이터) |
 
-## Workflow Rules
+## 워크플로우 규칙
 
-- **Auto-commit on completion**: Implementer가 작업을 완료하면 자동으로 커밋한다. 미커밋 작업을 남기지 않는다.
-- **Desktop notification on completion**: 작업 완료 후 `notify-send "llm.rs" "<task summary>"`로 데스크톱 알림을 보낸다.
+- **완료 시 자동 커밋**: Implementer가 작업을 완료하면 자동으로 커밋한다. 미커밋 작업을 남기지 않는다.
+- **완료 시 데스크톱 알림**: 작업 완료 후 `notify-send "llm.rs" "<작업 요약>"`으로 알림을 보낸다.
 
-## Profiling & Benchmarks
+## 빠른 참조
 
-- `scripts/android_profile.py` — On-device profiling with JSON output
-- `scripts/visualize_profile.py` — Generate performance graphs
-- `web_dashboard/` — Flask dashboard for benchmark visualization (`cd web_dashboard && python app.py`)
-- Results stored in `results/data/` (JSON) — **committed to repo as test data**, plots in `results/plots/` (gitignored)
-
-## Key Documentation
-
-- `ARCHITECTURE.md` — Detailed component design, trait interfaces, execution flow
-- `docs/PROJECT_CONTEXT.md` — Implementation status and development cheat sheet
-- `docs/00_build_guide.md` — Step-by-step implementation guide (build order)
-- `docs/01_design_rationale.md` — Why decisions were made (Rust, OpenCL, Q4_0, etc.)
-- `docs/02_core_abstractions.md` — Tensor, Buffer, Shape, DType, KVCache details
-- `docs/03_cpu_backend.md` — CPU scalar + NEON SIMD + AVX2 implementation
-- `docs/04_model_loading.md` — Safetensors loading, HF name mapping, Q4_0 quantization
-- `docs/05_tokenizer_and_sampling.md` — Tokenizer integration and sampling algorithm
-- `docs/06_opencl_backend.md` — OpenCL backend struct, init, kernel dispatch
-- `docs/07_kernel_implementation.md` — OpenCL kernel algorithms and Adreno optimizations
-- `docs/08_memory_management.md` — Buffer types, zero-copy, transfer patterns
-- `docs/09_attention_mechanism.md` — GPU attention kernel, GQA, performance
-- `docs/10_model_inference.md` — Llama 3.2 config, forward pass, LayerWorkspace
-- `docs/11_kv_cache_management.md` — KV cache eviction system design
-- `docs/12_hybrid_inference.md` — CPU→GPU dynamic switching strategy
-- `docs/13_testing_and_benchmarks.md` — Oracle testing, micro_bench, profiling
-- `docs/20_dbus_ipc_spec.md` — D-Bus IPC specification for Resilience Manager
-- `docs/21_resilience_architecture.md` — Resilience system architecture and strategy patterns
-- `docs/22_resilience_integration.md` — Phase 3 generate.rs integration design spec
-- `docs/README.md` — Documentation index and reading order guide
-- `docs/14_component_status.md` — Component quality gates and test status
-- `docs/15_test_strategy.md` — Resilience test strategy (T1-T4 tiers)
-- `docs/23_resilience_test_strategy.md` — Resilience integration test summary
-- `docs/24_resilience_usage_guide.md` — Resilience system usage guide
-- `docs/25_troubleshooting.md` — Troubleshooting guide
-- `docs/26_api_reference.md` — Resilience API reference
-- `docs/27_manager_architecture.md` — Manager service internal architecture (3-layer, OCP PolicyEngine)
-- `docs/28_experiment_guide.md` — Experiment guide
-- `docs/29_manager_monitor_redesign.md` — Manager monitor redesign
-- `docs/30_evaluation_methodology.md` — KV Cache Eviction evaluation methodology (related work survey + benchmark design)
-- `docs/35_experiment_runner_guide.md` — **실험 에이전트 인수인계 문서** (바이너리, 러너, 디바이스, CLI, 스키마, 트러블슈팅)
-- `docs/36_policy_design.md` — Hierarchical Policy 설계 (PI Controller, Supervisory, Action Selector)
-- `docs/37_protocol_design.md` — Manager ↔ Engine 프로토콜 (Registration, Heartbeat, QCF, Directive)
-- `docs/31_memory_architecture.md` — Memory architecture overview (Buffer → KV Cache → Policy unified view)
-- `docs/32_kv_offload.md` — KV cache offload (RawStore, PrefetchController, PreloadPool)
-- `docs/34_profiling_framework_design.md` — Inference profiling framework design
-
-## Experiment Benchmarks
-
-Benchmark prompts for KV cache eviction evaluation in `experiments/prompts/`:
-
-```bash
-# Perplexity: 5 domain prompts (PPL-01 ~ PPL-05)
-# NIAH: Parameterized needle-in-a-haystack prompts
-python experiments/prompts/assemble_niah.py --needle N-PASS --depth 0.25 --blocks 4
-python experiments/prompts/assemble_niah.py --all --output niah_all.json
-
-# QA: LongBench-style single-doc QA, summarization, few-shot, multi-hop
-# All prompts defined in experiments/prompts/benchmark_prompts.json
-```
-
-See `experiments/PLAN.md` Section 10 for experiment matrix (Round 10-12).
-
-## Device Registry
-
-TOML-based device configuration at `devices.toml` (project root). Manages build targets, connection info, and device paths for all scripts.
-
-```bash
-# CLI commands
-python scripts/device_registry.py discover          # scan & register devices
-python scripts/device_registry.py list               # show registered devices
-python scripts/device_registry.py validate           # check TOML schema
-
-# Unified runner (build -> deploy -> execute)
-python scripts/run_device.py -d pixel generate --prompt "Hello" -n 128
-python scripts/run_device.py -d host test_backend
-python scripts/run_device.py -d pixel --skip-build generate -b opencl
-
-# Existing scripts with --device option
-python scripts/stress_test_device.py --device pixel --phases 1,4
-python scripts/run_benchmark_suite.py --device pixel --dry-run
-python scripts/run_comparison_benchmark.py --device pixel --dry-run
-```
-
-Package: `scripts/device_registry/` — config.py (TOML loader), connection.py (Connection ABC), builder.py (cargo build), deployer.py (binary push), discover.py (device scan).
-
-## Web Dashboard
-
-```bash
-cd web_dashboard && .venv/bin/python app.py   # http://localhost:5000
-```
-
-Tabs: Overview, Table, Detail, Compare, Trends, Runner, Gates, Todos. API endpoints under `/api/`. Dashboard uses Flask + Plotly.js, venv at `web_dashboard/.venv/`.
-
-## TODO System
-
-`.agent/todos/`에서 역할별 작업 추적. 형식 및 워크플로우 규칙은 `.agent/todos/README.md` 참고.
-
-| TODO 파일 | 담당 Agent |
-|-----------|-----------|
-| `backlog.md` | PM이 관리, 미배정 작업 |
-| `architect.md` | Architect |
-| `rust_developer.md` | Implementer |
-| `tester.md` | Tester |
-| `tech_writer.md` | Researcher |
-| `frontend_developer.md` | (메인 세션 직접 처리) |
-
-Dashboard에서 조회: Todos 탭 또는 `curl http://localhost:5000/api/todos`.
+| 작업 | 스킬/참조 |
+|------|----------|
+| 빌드, 린트, 유닛 테스트 | `/sanity-check` |
+| Android 배포, 디바이스 테스트 | `/deploy-test` |
+| 프로파일링 | `/profile` |
+| 대시보드 | `/dashboard` |
+| Spec 관리 | `/spec-manage` — 상세: `spec/CONTRIBUTING.md` |
+| 실험 벤치마크 | `experiments/PLAN.md`, `docs/35_experiment_runner_guide.md` |
+| TODO 관리 | `.agent/todos/` — 형식: `.agent/todos/README.md` |
+| 설계 문서 | `ARCHITECTURE.md`, `spec/`, `docs/` |

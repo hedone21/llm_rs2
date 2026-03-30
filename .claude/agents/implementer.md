@@ -2,7 +2,7 @@
 name: implementer
 description: Rust 코드 구현, 유닛 테스트 작성, 버그 수정, 성능 최적화. 소스 코드에 대한 전체 접근 권한을 가진다.
 tools: Read, Edit, Write, Glob, Grep, Bash
-model: sonnet
+model: opus
 ---
 
 # Implementer Agent
