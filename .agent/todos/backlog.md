@@ -92,6 +92,104 @@
   - E2E 테스트 커맨드: `manager --transport unix:<sock> --policy-config <toml>` + `mock_engine --socket <sock>`
   - emit_initial 프로토콜 불일치는 수정 완료 (7895824)
 
+---
+
+# Spec-Implementation Divergence (2026-03-31 조사)
+
+> spec/에 정의되어 있지만 코드에 구현되지 않은 항목. 우선순위 순.
+
+## [P1] QcfEstimate 메시지 + RequestQcf 커맨드 구현
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: |
+  MSG-014: EngineMessage에 QcfEstimate variant 없음.
+  MSG-036b: EngineCommand에 RequestQcf variant 없음.
+  Manager가 Critical 모드에서 QCF 비용 기반 액션 선택을 못 함.
+
+  필요 구현:
+  1. shared/src/lib.rs — QcfEstimate 구조체 + EngineMessage variant 추가
+  2. shared/src/lib.rs — EngineCommand::RequestQcf variant 추가
+  3. Engine — QCF 계산 후 QcfEstimate 전송 로직
+  4. Manager — Critical 진입 시 RequestQcf Directive 발행 + 1초 타임아웃 수신
+- **Acceptance Criteria**: Manager가 Critical 모드에서 RequestQcf → QcfEstimate 수신 → Lossy 액션 cost 반영
+- **Notes**: 프로토콜 레벨 변경이므로 Architect spec 검토 필요. SEQ-090~098 참조.
+
+## [P2] Manager 페이로드 크기 가드 추가
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: |
+  PROTO-012: Engine측은 64KB MAX_PAYLOAD 검증 구현 완료.
+  Manager측(unix_socket.rs, tcp.rs)의 read_engine_message()에 페이로드 크기 검증 없음.
+  악의적/버그 Engine이 거대 페이로드를 보내면 OOM 위험.
+- **Acceptance Criteria**: Manager가 64KB 초과 메시지를 거부하고 연결 유지
+- **Notes**: 소규모 변경. manager/src/channel/unix_socket.rs:311, tcp.rs:299.
+
+## [P2] Heartbeat/Response 타임아웃 구현
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: |
+  SEQ-087: Manager가 Engine Heartbeat 부재를 감지하지 못함 (권장 3초).
+  SEQ-088: Directive 후 Response 무한 대기 가능 (권장 500ms).
+  Engine 장애 시 Manager가 대응 불가.
+- **Acceptance Criteria**: Heartbeat 3초 미수신 시 Disconnected 전이. Response 500ms 초과 시 타임아웃 처리.
+- **Notes**: 타이밍 상수는 Config로 설정 가능하게.
+
+## [P2] KvStreaming 커맨드 정상 구현
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: |
+  MSG-032: executor.rs에서 Rejected("not yet implemented") 반환 중.
+  StreamingLLM 정책 (sink + window 기반) 미구현.
+- **Acceptance Criteria**: KvStreaming 커맨드에 sink_size/window_size 파라미터로 정상 eviction 수행
+- **Notes**: engine/src/resilience/executor.rs:253-257.
+
+## [P2] KvMergeD2o 액션 추가
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: MergeHandler 구현 (#8)
+- **Description**: |
+  MGR-028: 스펙 ActionId 8종 중 KvMergeD2o 누락 (코드 7종만).
+  shared/src/lib.rs ActionId enum + manager/src/relief/linear.rs default_relief 추가 필요.
+- **Acceptance Criteria**: ActionId에 KvMergeD2o 포함, Manager가 merge 액션 선택 가능
+- **Notes**: MergeHandler stub 해소와 함께 진행.
+
+## [P3] MergeHandler 정상 구현
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: |
+  engine/src/core/pressure/merge_handler.rs — 항상 NoOp 반환하는 stub.
+  인접 토큰 cosine similarity + 가중 평균 merge 알고리즘 구현 필요.
+- **Acceptance Criteria**: MergeHandler가 유사 토큰을 merge하여 캐시 크기 축소
+- **Notes**: 실험적 기능. D2O eviction과 연계.
+
+## [P3] SparseHandler 정상 구현
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: |
+  engine/src/core/pressure/sparse_handler.rs — 항상 NoOp 반환하는 stub.
+  Local window + strided global sparse attention mask 구현 필요.
+- **Acceptance Criteria**: SparseHandler가 sparse attention으로 연산량 감소
+- **Notes**: 실험적 기능.
+
+## [P3] EnergyConstraint 스펙-코드 Divergence 해소
+- **Status**: TODO
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: |
+  MGR-ALG-015: 스펙은 raw battery_pct → 연속 pressure (m = clamp(1-pct/100, 0, 1) * 0.5).
+  코드는 Level enum → 4단계 이산값 (Normal=0.0, Warning=0.55, Critical=0.80, Emergency=1.0).
+  기능적으로 동작하지만 스펙과 다름.
+- **Acceptance Criteria**: 스펙 수식대로 연속 변환하거나, 스펙을 현재 구현에 맞게 갱신
+- **Notes**: 스펙 갱신이 더 현실적일 수 있음. Architect 판단 필요.
+
+---
+
 ## [P3] ThermalCollector zone 패턴 매칭 auto-discovery
 - **Status**: TODO
 - **Sprint**: backlog
