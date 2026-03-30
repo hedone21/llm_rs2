@@ -18,3 +18,21 @@ mod test_inv_062_064;
 mod test_inv_072_076;
 #[path = "spec/test_inv_081_082.rs"]
 mod test_inv_081_082;
+
+// ── 비-INV Spec 테스트 ──
+#[path = "spec/test_eng_alg_010_012.rs"]
+mod test_eng_alg_010_012;
+#[path = "spec/test_eng_alg_020_022.rs"]
+mod test_eng_alg_020_022;
+#[path = "spec/test_eng_alg_030_048.rs"]
+mod test_eng_alg_030_048;
+#[path = "spec/test_eng_alg_060_092.rs"]
+mod test_eng_alg_060_092;
+#[path = "spec/test_eng_dat_012_031.rs"]
+mod test_eng_dat_012_031;
+#[path = "spec/test_eng_st_010_035.rs"]
+mod test_eng_st_010_035;
+#[path = "spec/test_eng_st_052_060.rs"]
+mod test_eng_st_052_060;
+#[path = "spec/test_proto_010_062.rs"]
+mod test_proto_010_062;

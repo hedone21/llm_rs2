@@ -22,3 +22,19 @@ mod test_inv_046_049;
 mod test_inv_050;
 #[path = "spec/test_inv_083_085.rs"]
 mod test_inv_083_085;
+
+// 비-INV 요구사항 Spec 테스트
+#[path = "spec/test_mgr_alg_010_014.rs"]
+mod test_mgr_alg_010_014;
+#[path = "spec/test_mgr_050_054.rs"]
+mod test_mgr_050_054;
+#[path = "spec/test_mgr_alg_031_035.rs"]
+mod test_mgr_alg_031_035;
+#[path = "spec/test_mgr_067_072.rs"]
+mod test_mgr_067_072;
+#[path = "spec/test_mgr_alg_042_047.rs"]
+mod test_mgr_alg_042_047;
+#[path = "spec/test_mgr_dat_020_056.rs"]
+mod test_mgr_dat_020_056;
+#[path = "spec/test_mgr_alg_036_051.rs"]
+mod test_mgr_alg_036_051;
