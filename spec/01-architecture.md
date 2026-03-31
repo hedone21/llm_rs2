@@ -165,8 +165,6 @@ KVCacheOps trait이 정의하는 인터페이스:
 | D2OHandler | H2O 변형. Eviction 시 토큰 병합 보상 (scatter-reduce merge). | 활성 |
 | SwapHandler | LRU 전략으로 오래된 토큰을 디스크로 오프로드. | 활성 |
 | QuantizeHandler | 압력 수준에 따라 KIVI 양자화 비트 수 조절 (Normal=유지, Warning=8bit, Critical=4bit, Emergency=2bit). KiviCache 전용; 표준 KVCache에서는 NoOp. | 활성 (간접) |
-| MergeHandler | 유사 인접 토큰 병합 (cosine similarity 기반). | 스텁 |
-| SparseHandler | 스파스 어텐션 마스크 적용. KV 데이터 미수정. | 스텁 |
 
 **[SYS-084]** Resilience 서브시스템은 Transport trait을 통해 Manager와 통신한다. Transport trait은 연결, 수신, 전송 인터페이스를 추상화한다. *(MUST)*
 

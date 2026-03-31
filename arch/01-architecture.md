@@ -91,8 +91,6 @@ pub trait CachePressureHandler { ... }
 | `D2OHandler` | `engine/src/core/pressure/d2o_handler.rs` | 활성 |
 | `SwapHandler` | `engine/src/core/pressure/swap_handler.rs` | 활성 |
 | `QuantizeHandler` | `engine/src/core/pressure/quantize_handler.rs` | 활성 (간접) |
-| `MergeHandler` | `engine/src/core/pressure/merge_handler.rs` | 스텁 |
-| `SparseHandler` | `engine/src/core/pressure/sparse_handler.rs` | 스텁 |
 
 #### Transport trait
 

@@ -602,9 +602,7 @@
 | `NoOp` | - | 액션 미수행 |
 | `Evicted` | `tokens_removed: usize`, `new_pos: usize` | 토큰 제거됨 |
 | `Quantized` | - | KV 정밀도 감소 (stub) |
-| `Merged` | - | 유사 토큰 병합 (stub) |
 | `Swapped` | `tokens_swapped: usize` | 토큰 offload됨 |
-| `Sparsified` | - | Sparse attention mask 적용 (stub) |
 
 **HandlerContext**: 각 CachePressureHandler에 전달되는 컨텍스트.
 

@@ -817,8 +817,6 @@ PressureStageConfig {
 | D2OHandler | **완료** | H2O eviction + cosine merge, EMA threshold | `Evicted { tokens_removed, new_pos }` |
 | SwapHandler | **완료** | LRU offload via prune_prefix | `Swapped { tokens_swapped }` |
 | QuantizeHandler | **완료** | pressure → target bits 매핑 (Warning=8, Critical=4, Emergency=2). KIVI 외부 처리 | `NoOp` (KIVI는 외부) |
-| MergeHandler | **stub** | 유사 토큰 병합 (미구현) | `Merged` |
-| SparseHandler | **stub** | Sparse attention mask (미구현) | `Sparsified` |
 
 **HandlerContext**: 각 handler에 전달되는 컨텍스트. 상세 필드 정의는 `33-engine-data.md` ENG-DAT-080 참조.
 

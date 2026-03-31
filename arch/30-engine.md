@@ -378,8 +378,6 @@ pub trait CachePressureHandler: Send + Sync {
 | D2OHandler | 완성 | `pressure/d2o_handler.rs` |
 | SwapHandler | 완성 | `pressure/swap_handler.rs` |
 | QuantizeHandler | 간접 | `pressure/quantize_handler.rs` |
-| MergeHandler | 스텁 | `pressure/merge_handler.rs` |
-| SparseHandler | 스텁 | `pressure/sparse_handler.rs` |
 
 ### EventSink trait (Observability)
 

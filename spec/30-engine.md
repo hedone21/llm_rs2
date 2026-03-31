@@ -120,8 +120,6 @@ CachePressureHandler 6종:
 | D2OHandler | 구현 완료 | D2O (Dynamic Token Dropping) |
 | SwapHandler | 구현 완료 | Disk offload |
 | QuantizeHandler | 간접 활성 | KiviCache 경로에서 간접 호출. `handle()`은 NoOp |
-| MergeHandler | 스텁 | 미구현 |
-| SparseHandler | 스텁 | 미구현 |
 
 EvictionPolicy 구현체 5종:
 

@@ -471,8 +471,6 @@ flowchart TD
 | `D2OHandler` | `d2o_handler.rs` | 완료 | H2O eviction + cosine merge + EMA |
 | `SwapHandler` | `swap_handler.rs` | 완료 | LRU 기반 oldest token offload (prune_prefix) |
 | `QuantizeHandler` | `quantize_handler.rs` | 완료 | Pressure→bits 매핑 (KIVI 외부 처리) |
-| `MergeHandler` | `merge_handler.rs` | stub | Adjacent token merge (미구현, NoOp 반환) |
-| `SparseHandler` | `sparse_handler.rs` | stub | Sparse attention mask (미구현, NoOp 반환) |
 
 ### 6.5 EvictionHandler QCF 연동
 

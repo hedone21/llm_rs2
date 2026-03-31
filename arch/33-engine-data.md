@@ -433,7 +433,7 @@ sequenceDiagram
     CM->>CM: Pipeline execute (Emergency level)
     CM->>D: handle(ctx{target_ratio: 0.75})
     D->>D: H2O 3-partition + cosine merge compensation
-    D-->>CM: ActionResult::Merged{...}
+    D-->>CM: ActionResult::Evicted{tokens_removed, new_pos}
     CM-->>G: eviction 완료
 ```
 
@@ -521,9 +521,7 @@ pub enum ActionResult {
     NoOp,
     Evicted { tokens_removed: usize, new_pos: usize },
     Quantized,
-    Merged,
     Swapped { tokens_swapped: usize },
-    Sparsified,
 }
 
 impl ActionResult {

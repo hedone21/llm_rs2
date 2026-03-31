@@ -11,16 +11,12 @@ use anyhow::Result;
 pub mod d2o_handler;
 pub mod d2o_layer_alloc;
 pub mod eviction_handler;
-pub mod merge_handler;
 pub mod quantize_handler;
-pub mod sparse_handler;
 pub mod swap_handler;
 
 pub use d2o_handler::D2OHandler;
 pub use eviction_handler::EvictionHandler;
-pub use merge_handler::MergeHandler;
 pub use quantize_handler::QuantizeHandler;
-pub use sparse_handler::SparseHandler;
 pub use swap_handler::SwapHandler;
 
 // ── Pressure level ─────────────────────────────────────────────────
@@ -74,12 +70,8 @@ pub enum ActionResult {
     },
     /// KV precision was reduced (stub).
     Quantized,
-    /// Similar tokens were merged (stub).
-    Merged,
     /// KV data was swapped to secondary storage (disk offload).
     Swapped { tokens_swapped: usize },
-    /// Sparse attention mask was applied (stub).
-    Sparsified,
 }
 
 impl ActionResult {
@@ -487,9 +479,7 @@ mod tests {
             .is_action()
         );
         assert!(ActionResult::Quantized.is_action());
-        assert!(ActionResult::Merged.is_action());
         assert!(ActionResult::Swapped { tokens_swapped: 0 }.is_action());
-        assert!(ActionResult::Sparsified.is_action());
     }
 
     #[test]
