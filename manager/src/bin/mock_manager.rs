@@ -1,12 +1,15 @@
 //! Mock Manager binary for protocol validation and E2E testing.
 //!
-//! Supports two transport modes:
+//! Supports three transport modes:
 //!
 //! 1. **Unix socket (default)**: Listens on a Unix socket, accepts an Engine
 //!    connection, receives Capability + Heartbeats, and sends Directive commands.
 //!    Supports single-command and scenario replay modes.
 //!
-//! 2. **D-Bus (legacy, `--dbus`)**: Emits D-Bus signals on the System Bus.
+//! 2. **TCP socket (`--tcp`)**: Same protocol over TCP. Useful on Android where
+//!    Unix domain socket bind may fail with Permission denied.
+//!
+//! 3. **D-Bus (legacy, `--dbus`)**: Emits D-Bus signals on the System Bus.
 //!    Requires the `dbus` cargo feature.
 //!
 //! # Usage
@@ -15,6 +18,10 @@
 //! # Unix socket — single command
 //! cargo run -p llm_manager --no-default-features --bin mock_manager -- \
 //!     --command KvEvictSliding --keep-ratio 0.7
+//!
+//! # TCP socket — single command
+//! cargo run -p llm_manager --no-default-features --bin mock_manager -- \
+//!     --tcp 127.0.0.1:9999 --command KvEvictSliding --keep-ratio 0.7
 //!
 //! # Unix socket — scenario replay
 //! cargo run -p llm_manager --no-default-features --bin mock_manager -- \
@@ -26,7 +33,9 @@
 //! ```
 
 use std::io::{Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -44,10 +53,15 @@ use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
     about = "Mock Manager for Engine protocol validation and E2E testing"
 )]
 struct Args {
-    // ── Unix socket mode (default) ──
-    /// Unix socket path to listen on.
+    // ── Socket transport ──
+    /// Unix socket path to listen on (default, ignored when --tcp is set).
     #[arg(long, default_value = "/tmp/llm_manager.sock")]
     socket: String,
+
+    /// TCP address to listen on (e.g. 127.0.0.1:9999).
+    /// When set, TCP is used instead of Unix socket.
+    #[arg(long)]
+    tcp: Option<String>,
 
     /// Command to send (KvEvictSliding, KvEvictH2o, KvStreaming, KvMergeD2o,
     /// Throttle, SwitchHw, KvQuantDynamic, LayerSkip, Suspend, Resume,
@@ -162,7 +176,7 @@ struct Args {
 // ── Wire format helpers ─────────────────────────────────────────────────────
 
 /// Serialise `msg` as length-prefixed JSON and write to `stream`.
-fn send_message(stream: &mut UnixStream, msg: &ManagerMessage) -> anyhow::Result<()> {
+fn send_message(stream: &mut (impl Read + Write), msg: &ManagerMessage) -> anyhow::Result<()> {
     let json = serde_json::to_vec(msg).context("serialise ManagerMessage")?;
     let len = (json.len() as u32).to_be_bytes();
     stream.write_all(&len).context("write length prefix")?;
@@ -174,7 +188,7 @@ fn send_message(stream: &mut UnixStream, msg: &ManagerMessage) -> anyhow::Result
 /// Try to read one `EngineMessage` from `stream`.
 ///
 /// Returns `Ok(None)` on read timeout / would-block (non-blocking read).
-fn recv_message(stream: &mut UnixStream) -> anyhow::Result<Option<EngineMessage>> {
+fn recv_message(stream: &mut (impl Read + Write)) -> anyhow::Result<Option<EngineMessage>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -339,24 +353,54 @@ fn validate_response(
     valid
 }
 
-// ── Unix socket mode ────────────────────────────────────────────────────────
+// ── Socket mode (Unix / TCP) ────────────────────────────────────────────────
 
-fn run_unix_mode(args: &Args) -> anyhow::Result<()> {
-    // Clean up stale socket
-    let _ = std::fs::remove_file(&args.socket);
-
-    let listener =
-        UnixListener::bind(&args.socket).with_context(|| format!("bind to {}", args.socket))?;
-    println!("[MockManager] Listening on {}...", args.socket);
-
-    let (mut stream, _addr) = listener.accept().context("accept connection")?;
+/// Accept a connection via TCP.
+fn accept_tcp(addr: &str) -> anyhow::Result<std::net::TcpStream> {
+    let listener = TcpListener::bind(addr).with_context(|| format!("TCP bind to {}", addr))?;
+    println!("[MockManager] Listening on TCP {}...", addr);
+    let (stream, peer) = listener.accept().context("TCP accept")?;
+    println!("[MockManager] Engine connected from {}", peer);
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .context("set_read_timeout")?;
+    Ok(stream)
+}
 
+/// Accept a connection via Unix domain socket.
+#[cfg(unix)]
+fn accept_unix(path: &str) -> anyhow::Result<std::os::unix::net::UnixStream> {
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path).with_context(|| format!("Unix bind to {}", path))?;
+    println!("[MockManager] Listening on {}...", path);
+    let (stream, _addr) = listener.accept().context("Unix accept")?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .context("set_read_timeout")?;
+    Ok(stream)
+}
+
+fn run_socket_mode(args: &Args) -> anyhow::Result<()> {
+    if let Some(ref addr) = args.tcp {
+        let mut stream = accept_tcp(addr)?;
+        run_protocol(args, &mut stream)
+    } else {
+        #[cfg(unix)]
+        {
+            let mut stream = accept_unix(&args.socket)?;
+            run_protocol(args, &mut stream)
+        }
+        #[cfg(not(unix))]
+        {
+            bail!("Unix sockets not supported on this platform; use --tcp instead");
+        }
+    }
+}
+
+fn run_protocol(args: &Args, stream: &mut (impl Read + Write)) -> anyhow::Result<()> {
     // Step 1: Receive Capability
     println!("[MockManager] Engine connected, waiting for Capability...");
-    let capability = recv_blocking_with_timeout(&mut stream, Duration::from_secs(5))?;
+    let capability = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
     match &capability {
         EngineMessage::Capability(cap) => {
             println!(
@@ -376,7 +420,7 @@ fn run_unix_mode(args: &Args) -> anyhow::Result<()> {
     let wait_until = std::time::Instant::now() + Duration::from_secs(args.wait_secs);
     let mut heartbeat_count = 0u32;
     while std::time::Instant::now() < wait_until {
-        match recv_message(&mut stream)? {
+        match recv_message(stream)? {
             Some(EngineMessage::Heartbeat(status)) => {
                 heartbeat_count += 1;
                 println!(
@@ -408,13 +452,13 @@ fn run_unix_mode(args: &Args) -> anyhow::Result<()> {
 
     // Step 3: Send directive(s)
     if let Some(scenario_path) = &args.scenario {
-        run_unix_scenario(&mut stream, scenario_path)?;
+        run_scenario(stream, scenario_path)?;
     } else if let Some(cmd_name) = &args.command {
-        run_unix_single_command(args, &mut stream, cmd_name)?;
+        run_single_command(args, stream, cmd_name)?;
     } else {
         #[cfg(feature = "dbus")]
         if !args.dbus {
-            bail!("Either --command or --scenario must be specified for Unix socket mode");
+            bail!("Either --command or --scenario must be specified for socket mode");
         }
         #[cfg(not(feature = "dbus"))]
         bail!("Either --command or --scenario must be specified");
@@ -424,7 +468,7 @@ fn run_unix_mode(args: &Args) -> anyhow::Result<()> {
     println!("[MockManager] Observing post-directive heartbeats...");
     let observe_until = std::time::Instant::now() + Duration::from_secs(2);
     while std::time::Instant::now() < observe_until {
-        match recv_message(&mut stream)? {
+        match recv_message(stream)? {
             Some(EngineMessage::Heartbeat(status)) => {
                 heartbeat_count += 1;
                 println!(
@@ -446,7 +490,7 @@ fn run_unix_mode(args: &Args) -> anyhow::Result<()> {
 
 /// Receive a message with a hard timeout, retrying on WouldBlock.
 fn recv_blocking_with_timeout(
-    stream: &mut UnixStream,
+    stream: &mut (impl Read + Write),
     timeout: Duration,
 ) -> anyhow::Result<EngineMessage> {
     let deadline = std::time::Instant::now() + timeout;
@@ -463,9 +507,9 @@ fn recv_blocking_with_timeout(
     }
 }
 
-fn run_unix_single_command(
+fn run_single_command(
     args: &Args,
-    stream: &mut UnixStream,
+    stream: &mut (impl Read + Write),
     cmd_name: &str,
 ) -> anyhow::Result<()> {
     let cmd = build_command(&CommandParams {
@@ -536,7 +580,7 @@ fn run_unix_single_command(
     Ok(())
 }
 
-fn run_unix_scenario(stream: &mut UnixStream, path: &PathBuf) -> anyhow::Result<()> {
+fn run_scenario(stream: &mut (impl Read + Write), path: &PathBuf) -> anyhow::Result<()> {
     let content =
         std::fs::read_to_string(path).with_context(|| format!("read scenario file: {:?}", path))?;
     let scenario: CommandScenario =
@@ -888,7 +932,7 @@ fn main() -> anyhow::Result<()> {
         return dbus_mode::run_dbus_mode(&args);
     }
 
-    run_unix_mode(&args)
+    run_socket_mode(&args)
 }
 
 // ── Unit tests ──────────────────────────────────────────────────────────────
@@ -899,7 +943,7 @@ mod tests {
     use llm_shared::{
         CommandResponse, CommandResult, EngineCapability, EngineState, EngineStatus, ResourceLevel,
     };
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
 
     fn tmp_sock() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
@@ -1192,5 +1236,71 @@ mod tests {
         assert!((scenario.commands[0].keep_ratio.unwrap() - 0.8).abs() < f32::EPSILON);
         assert_eq!(scenario.commands[1].command, "RestoreDefaults");
         assert!(scenario.commands[1].keep_ratio.is_none());
+    }
+
+    // ── TCP transport tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn send_recv_over_tcp_stream() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        // Engine sends Capability over TCP
+        let cap_msg = EngineMessage::Capability(make_capability());
+        let json = serde_json::to_vec(&cap_msg).unwrap();
+        let len = (json.len() as u32).to_be_bytes();
+        client.write_all(&len).unwrap();
+        client.write_all(&json).unwrap();
+        client.flush().unwrap();
+
+        // Manager side receives it via recv_message (generic over TcpStream)
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let received = recv_message(&mut server).unwrap().unwrap();
+        assert!(matches!(received, EngineMessage::Capability(_)));
+
+        // Manager side sends Directive over TCP via send_message
+        let directive = ManagerMessage::Directive(EngineDirective {
+            seq_id: 42,
+            commands: vec![EngineCommand::Resume],
+        });
+        send_message(&mut server, &directive).unwrap();
+
+        // Engine side reads raw length-prefixed JSON and parses as ManagerMessage
+        let mut len_buf = [0u8; 4];
+        client.read_exact(&mut len_buf).unwrap();
+        let payload_len = u32::from_be_bytes(len_buf) as usize;
+        let mut json_buf = vec![0u8; payload_len];
+        client.read_exact(&mut json_buf).unwrap();
+        let msg: ManagerMessage = serde_json::from_slice(&json_buf).unwrap();
+        match msg {
+            ManagerMessage::Directive(d) => {
+                assert_eq!(d.seq_id, 42);
+                assert!(matches!(d.commands[0], EngineCommand::Resume));
+            }
+        }
+    }
+
+    #[test]
+    fn recv_message_tcp_returns_none_on_timeout() {
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let result = recv_message(&mut client).unwrap();
+        assert!(result.is_none());
     }
 }
