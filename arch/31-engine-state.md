@@ -166,7 +166,7 @@ flowchart TD
 
 ### 3.4 EngineCommand → ExecutionPlan 매핑
 
-11종 EngineCommand(shared 크레이트 정의)를 ExecutionPlan 필드에 매핑한다.
+12종 EngineCommand(shared 크레이트 정의)를 ExecutionPlan 필드에 매핑한다.
 
 | EngineCommand | Plan 필드 | CommandResult | 부수 효과 |
 |---------------|----------|---------------|----------|
@@ -174,6 +174,7 @@ flowchart TD
 | `LayerSkip { skip_ratio }` | `layer_skip = Some(ratio)` | Ok | active_actions: "layer_skip" 추가 |
 | `KvEvictH2o { keep_ratio }` | `evict = Some(EvictPlan { H2o, ratio, Critical })` | Ok | active_actions: "kv_evict_h2o" 추가 |
 | `KvEvictSliding { keep_ratio }` | `evict = Some(EvictPlan { Sliding, ratio, Critical })` | Ok | active_actions: "kv_evict_sliding" 추가 |
+| `KvMergeD2o { keep_ratio }` | `evict = Some(EvictPlan { D2o, ratio, Critical })` | Ok | active_actions: "kv_merge_d2o" 추가 |
 | `KvStreaming { sink_size, window_size }` | `evict = Some(EvictPlan { Streaming, 0.0, Critical, streaming_params: Some({sink_size, window_size}) })` | Ok | active_actions: "kv_evict_streaming" 추가 |
 | `KvQuantDynamic { target_bits }` | `kv_quant_bits = Some(bits)` | Ok | active_actions: "kv_quant_dynamic" 추가 |
 | `RestoreDefaults` | `restore_defaults = true, throttle_delay_ms = 0` | Ok | active_actions.clear(), levels→Normal |
@@ -247,7 +248,7 @@ pub struct StreamingParams {
     pub window_size: usize,            // recent window 크기
 }
 
-pub enum EvictMethod { H2o, Sliding, Streaming }
+pub enum EvictMethod { H2o, Sliding, Streaming, D2o }
 ```
 
 ### 4.3 소비 순서 (generate.rs decode loop)

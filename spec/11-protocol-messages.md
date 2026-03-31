@@ -427,7 +427,7 @@ JSON 예시:
 ```
 
 ```json
-{"status": "rejected", "reason": "KvMergeD2o not yet implemented"}
+{"status": "rejected", "reason": "D2O handler not configured (requires --eviction-policy d2o)"}
 ```
 
 **[MSG-083]** Ok — 추가 필드 없음. *(MUST)*

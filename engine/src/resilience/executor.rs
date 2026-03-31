@@ -39,6 +39,7 @@ pub enum EvictMethod {
     H2o,
     Sliding,
     Streaming,
+    D2o,
 }
 
 /// StreamingLLM eviction parameters (sink + window).
@@ -289,6 +290,18 @@ impl CommandExecutor {
                 }
                 CommandResult::Ok
             }
+            EngineCommand::KvMergeD2o { keep_ratio } => {
+                plan.evict = Some(EvictPlan {
+                    target_ratio: *keep_ratio,
+                    level: ResourceLevel::Critical,
+                    method: EvictMethod::D2o,
+                    streaming_params: None,
+                });
+                if !self.active_actions.contains(&"kv_merge_d2o".to_string()) {
+                    self.active_actions.push("kv_merge_d2o".to_string());
+                }
+                CommandResult::Ok
+            }
             EngineCommand::KvQuantDynamic { target_bits } => {
                 plan.kv_quant_bits = Some(*target_bits);
                 if !self
@@ -398,6 +411,7 @@ impl CommandExecutor {
             actions.push("kv_evict_h2o".to_string());
             actions.push("kv_evict_sliding".to_string());
             actions.push("kv_evict_streaming".to_string());
+            actions.push("kv_merge_d2o".to_string());
         }
         // KV quantization: only available with KIVI cache (q2/q4/q8)
         if kv_dtype.starts_with('q') {

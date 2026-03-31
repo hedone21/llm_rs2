@@ -110,7 +110,7 @@ pub enum EngineCommand {
 }
 ```
 
-코드에 12종 변형이 존재한다 (`RequestQcf` 구현 완료, `KvMergeD2o`는 미구현).
+코드에 13종 변형이 존재한다 (`RequestQcf`, `KvMergeD2o` 모두 구현 완료).
 
 ### Engine측 명령 실행
 

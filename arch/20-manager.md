@@ -397,7 +397,7 @@ flowchart TD
 | 항목 | 스펙 | 코드 | 영향 |
 |------|------|------|------|
 | EnergyConstraint 처리 (MGR-029) | raw `battery_pct`에서 `m = clamp(1 - battery_pct/100, 0, 1) * 0.5` | `level_to_measurement(level) * 0.5` -- Level enum 기반 4단계 이산 변환: Normal=0.0, Warning=0.55, Critical=0.80, Emergency=1.0 | 스펙은 raw 값 직접 사용을 명세. 코드는 Level 기반 변환. 향후 raw 전환 필요 |
-| ActionId 7종 vs 8종 (MGR-028) | 8종 (`KvMergeD2o` 포함) | 7종 (`KvMergeD2o` variant 없음) | 스펙 향후 호환용. Engine 측 merge 미구현 |
+| ActionId 8종 (MGR-028) | 8종 (`KvMergeD2o` 포함) | 8종 (`KvMergeD2o` variant 포함) | 스펙-코드 일치 |
 
 ## Config
 

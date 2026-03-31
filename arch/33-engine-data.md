@@ -403,6 +403,40 @@ sequenceDiagram
     S-->>G: current_pos = 260
 ```
 
+### 6.5 D2OHandler 프로토콜 경로
+
+D2OHandler는 두 가지 경로로 호출된다:
+
+1. **CLI 경로** (`--eviction-policy d2o`): CacheManager 생성 시 D2OHandler가 CachePressurePipeline에 등록되어, `force_evict_with_scores()` 호출 시 Pipeline 내에서 자동 실행.
+
+2. **프로토콜 경로** (Manager Directive `KvMergeD2o { keep_ratio }`):
+   - executor.rs에서 `EvictPlan { method: D2o, target_ratio: keep_ratio, pressure_level: Critical }` 생성
+   - `active_actions.insert(ActionId::KvMergeD2o)` -- C4/C5/C7/C8 eviction 배타 그룹
+   - generate.rs에서 `EvictMethod::D2o` 분기 → `CacheManager::force_evict_with_scores(target_ratio)` 호출
+   - Pipeline 내 persistent D2OHandler가 실행됨. `HandlerContext.target_ratio`가 Directive의 keep_ratio로 override됨
+   - 전제조건: `--eviction-policy d2o`로 시작된 Engine에서만 유효 (Pipeline에 D2OHandler가 존재해야 함)
+
+```mermaid
+sequenceDiagram
+    participant M as Manager
+    participant E as Executor
+    participant G as Generate
+    participant CM as CacheManager
+    participant D as D2OHandler
+
+    M->>E: KvMergeD2o{keep_ratio: 0.75}
+    E->>E: plan.evict = EvictPlan{D2o, 0.75, Critical}
+    E->>E: active_actions.insert(KvMergeD2o)
+    E-->>M: CommandResult::Ok
+    G->>G: consume plan.evict (method == D2o)
+    G->>CM: force_evict_with_scores(0.75)
+    CM->>CM: Pipeline execute (Emergency level)
+    CM->>D: handle(ctx{target_ratio: 0.75})
+    D->>D: H2O 3-partition + cosine merge compensation
+    D-->>CM: ActionResult::Merged{...}
+    CM-->>G: eviction 완료
+```
+
 ---
 
 ## 7. QcfMetric / QcfConfig

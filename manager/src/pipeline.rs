@@ -615,6 +615,10 @@ fn action_to_engine_command(cmd: &ActionCommand) -> Option<EngineCommand> {
                 window_size,
             })
         }
+        (ActionId::KvMergeD2o, Operation::Apply(params)) => {
+            let keep_ratio = params.values.get("keep_ratio").copied().unwrap_or(0.5);
+            Some(EngineCommand::KvMergeD2o { keep_ratio })
+        }
         (ActionId::KvOffloadDisk, Operation::Apply(_)) => {
             // KvOffloadDisk은 fallback으로 sliding window eviction 사용
             Some(EngineCommand::KvEvictSliding { keep_ratio: 0.8 })

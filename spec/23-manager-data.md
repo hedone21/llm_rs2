@@ -342,16 +342,16 @@ eviction = ["kv_evict_sliding", "kv_evict_h2o", "kv_merge_d2o"]
 | KvOffloadDisk | `kv_offload_disk` | Memory | 구현 |
 | KvEvictSliding | `kv_evict_sliding` | Memory | 구현 |
 | KvEvictH2o | `kv_evict_h2o` | Memory | 구현 |
-| KvMergeD2o | `kv_merge_d2o` | Memory | **미구현** (스펙 전용) |
+| KvMergeD2o | `kv_merge_d2o` | Memory | 구현 |
 | KvQuantDynamic | `kv_quant_dynamic` | Memory | 구현 |
 | LayerSkip | `layer_skip` | Compute | 구현 |
 
 - serde: `rename_all = "snake_case"`. JSON 직렬화/역직렬화 시 snake_case 문자열 사용.
 - `ActionId::from_str(s)`: snake_case 문자열 → ActionId 변환. 실패 시 None.
-- `ActionId::all()`: 현재 코드는 7종 반환 (KvMergeD2o 제외). 스펙은 8종을 정의한다.
+- `ActionId::all()`: 8종 반환 (KvMergeD2o 포함).
 - `ActionId::primary_domain()`: SwitchHw / Throttle / LayerSkip → Compute, 나머지 → Memory.
 
-> **코드-스펙 차이**: `types.rs`의 ActionId enum에 KvMergeD2o variant가 없다. D2O (Dynamic Discriminative Operations)는 구현 복잡도가 높아 Engine 측 KV cache merging 로직이 미완성이다. 프로토콜(`11-protocol-messages.md` MSG-034b)과 `20-manager.md` MGR-028에서 정의되어 있으며, 스펙에서 8종을 유지하여 향후 구현 시 스펙 변경 없이 코드를 추가할 수 있게 한다.
+> `types.rs`의 ActionId enum에 KvMergeD2o variant가 추가되어 스펙과 코드가 일치한다 (8종). Engine 측에서는 `EvictMethod::D2o` 분기를 통해 CachePressurePipeline 내 D2OHandler를 재활용한다.
 
 **[MGR-DAT-041]** ActionKind enum — 액션의 품질 영향 분류. *(MUST)*
 
@@ -522,7 +522,7 @@ Operation enum:
 
 SwitchHw와 KvOffloadDisk는 파라미터 없는 액션이다 (param_range = None).
 
-KvMergeD2o는 코드에 ActionId variant가 없으므로 `default_param_range()`에 분기가 없다. 스펙에서 keep_ratio [0.3, 0.9]을 정의한다.
+KvMergeD2o는 `default_param_range()`에서 keep_ratio [0.3, 0.9]을 반환한다.
 
 > 파라미터 범위는 Engine의 물리적 제약에 의해 결정된다 (keep_ratio 0.3 미만이면 품질 붕괴, target_bits 4 미만은 양자화 정밀도 한계 등). 향후 TOML 설정 가능하게 확장할 수 있다.
 
@@ -703,9 +703,9 @@ enabled = true
 
 파라미터 범위는 Engine의 물리적 제약에 의해 결정된다 (keep_ratio 0.3 미만이면 품질 붕괴, target_bits 4 미만은 양자화 정밀도 한계 등). 사용자가 임의 범위를 설정하면 Engine이 Rejected를 반환할 가능성이 높다. 향후 TOML 설정 가능하게 확장할 수 있다.
 
-### 왜 ActionId에 KvMergeD2o가 코드에 없는가
+### KvMergeD2o 구현 전략
 
-D2O (Dynamic Discriminative Operations)는 구현 복잡도가 높다. 프로토콜(`11-protocol-messages.md` MSG-034b)과 `20-manager.md` MGR-028에는 정의되어 있으나, Engine 측 KV cache merging 로직이 미완성이다. 스펙에서 8종을 유지하여 향후 구현 시 스펙 변경 없이 코드를 추가할 수 있게 한다.
+D2O (Dynamic Discriminative Operations)는 ActionId::KvMergeD2o로 Manager에 등록되었다. Engine 측에서는 executor.rs가 `KvMergeD2o { keep_ratio }` 명령을 `EvictPlan { method: D2o, target_ratio: keep_ratio }` 로 변환하고, generate.rs의 `EvictMethod::D2o` 분기에서 `CacheManager::force_evict_with_scores(target_ratio)`를 호출하여 CachePressurePipeline 내 persistent D2OHandler를 재활용한다. D2OHandler.handle()이 ctx.target_ratio를 우선 사용하므로 Directive의 keep_ratio가 자연스럽게 override된다. 전제조건: `--eviction-policy d2o`로 시작된 Engine에서만 유효하다.
 
 ### default_relief prior 값의 한계
 

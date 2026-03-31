@@ -185,6 +185,8 @@ pub enum EngineCommand {
         sink_size: usize,
         window_size: usize,
     },
+    /// Evict and merge KV cache entries using D2O (Dynamic Discriminative Operations) policy.
+    KvMergeD2o { keep_ratio: f32 },
     /// Dynamically transition KV cache quantization bits.
     KvQuantDynamic { target_bits: u8 },
 
@@ -445,6 +447,20 @@ mod tests {
                 assert_eq!(window_size, 256);
             }
             _ => panic!("Expected KvStreaming"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_kv_merge_d2o() {
+        let cmd = EngineCommand::KvMergeD2o { keep_ratio: 0.75 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv_merge_d2o\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvMergeD2o { keep_ratio } => {
+                assert!((keep_ratio - 0.75).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvMergeD2o"),
         }
     }
 

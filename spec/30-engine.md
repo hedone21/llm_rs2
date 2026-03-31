@@ -143,7 +143,7 @@ EvictionPolicy 구현체 5종:
 > | KvEvictSliding | `EvictMethod::Sliding` -- `CacheManager::force_evict_by_policy()` |
 > | KvStreaming | `EvictMethod::Streaming` -- `StreamingLLMPolicy::new(sink_size, window_size).evict()` 즉석 호출. `ActionId::KvEvictStreaming` 등록. C4/C5/C7과 eviction 배타 그룹 |
 > | KvQuantDynamic | `plan.kv_quant_bits` -- KIVI 경로에서 소비 |
-> | KvMergeD2o | **스펙 전용. 코드 미등록, 미구현** |
+> | KvMergeD2o | `EvictMethod::D2o` -- `CacheManager::force_evict_with_scores(target_ratio)` via Pipeline D2OHandler. 전제: `--eviction-policy d2o`. C4/C5/C7/C8 eviction 배타 그룹 |
 > | LayerSkip | `plan.layer_skip` -- SkipConfig 갱신 |
 
 **[ENG-016] Resilience Subsystem** *(MUST)*

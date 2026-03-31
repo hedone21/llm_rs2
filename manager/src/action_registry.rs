@@ -119,11 +119,13 @@ impl ActionRegistry {
 /// 액션별 기본 파라미터 범위.
 fn default_param_range(id: ActionId) -> Option<ParamRange> {
     match id {
-        ActionId::KvEvictSliding | ActionId::KvEvictH2o => Some(ParamRange {
-            param_name: "keep_ratio".into(),
-            min: 0.3,
-            max: 0.9,
-        }),
+        ActionId::KvEvictSliding | ActionId::KvEvictH2o | ActionId::KvMergeD2o => {
+            Some(ParamRange {
+                param_name: "keep_ratio".into(),
+                min: 0.3,
+                max: 0.9,
+            })
+        }
         ActionId::KvEvictStreaming => Some(ParamRange {
             param_name: "window_size".into(),
             min: 64.0,

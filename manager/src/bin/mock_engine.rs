@@ -169,6 +169,16 @@ impl EngineState_ {
                 );
                 CommandResult::Ok
             }
+            EngineCommand::KvMergeD2o { keep_ratio } => {
+                let before = self.kv_occupancy;
+                self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
+                self.eviction_policy = "d2o".to_string();
+                println!(
+                    "  → KvMergeD2o: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
+                    before, self.kv_occupancy, keep_ratio
+                );
+                CommandResult::Ok
+            }
             EngineCommand::KvQuantDynamic { target_bits } => {
                 println!("  → KvQuantDynamic: target_bits={}", target_bits);
                 CommandResult::Ok

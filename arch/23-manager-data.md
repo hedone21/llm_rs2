@@ -421,6 +421,6 @@ impl ActionRegistry {
 | 항목 | 스펙 | 코드 | 영향 |
 |------|------|------|------|
 | SystemSignal level 필드 | raw 전용 (level 없음) | 모든 variant에 `level: Level` 포함 | Monitor가 Level 산출 담당. 스펙 갱신 권장 |
-| ActionId 7종 vs 스펙 8종 | 8종 (KvMergeD2o 포함) | 7종 (KvMergeD2o 미구현) | variant 추가 시 스펙 변경 불필요 |
+| ActionId 8종 | 8종 (KvMergeD2o 포함) | 8종 (KvMergeD2o 구현 완료) | 스펙-코드 일치 |
 | EnergyMonitor hysteresis | 하드코딩 2.0 | Config 필드 없음, 코드 내 고정값 | 일치 (하드코딩 의도) |
-| default_relief 7종 vs 스펙 8종 | 8종 (KvMergeD2o 포함) | 7종 | ActionId 추가 시 함께 추가 필요 |
+| default_relief 8종 | 8종 (KvMergeD2o 포함) | 8종 (KvMergeD2o 포함) | 스펙-코드 일치 |

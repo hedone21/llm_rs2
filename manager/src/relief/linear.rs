@@ -191,6 +191,7 @@ impl OnlineLinearEstimator {
             ActionId::KvEvictSliding => "kv_evict_sliding",
             ActionId::KvEvictH2o => "kv_evict_h2o",
             ActionId::KvEvictStreaming => "kv_evict_streaming",
+            ActionId::KvMergeD2o => "kv_merge_d2o",
             ActionId::KvQuantDynamic => "kv_quant_dynamic",
             ActionId::LayerSkip => "layer_skip",
         }
@@ -240,6 +241,12 @@ fn default_relief(action: &ActionId) -> ReliefVector {
         ActionId::KvEvictStreaming => ReliefVector {
             compute: 0.0,
             memory: 0.7,
+            thermal: 0.0,
+            latency: 0.0,
+        },
+        ActionId::KvMergeD2o => ReliefVector {
+            compute: 0.0,
+            memory: 0.6,
             thermal: 0.0,
             latency: 0.0,
         },

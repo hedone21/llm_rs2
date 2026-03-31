@@ -1962,8 +1962,24 @@ fn main() -> anyhow::Result<()> {
                     };
 
                     // Manager already decided to evict — execute via named policy
+                    // D2O uses Pipeline (force_evict_with_scores), not named policy registry
                     // StreamingLLM uses on-demand instantiation (params from directive)
-                    let result = if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
+                    let result = if evict.method == llm_rs2::resilience::EvictMethod::D2o {
+                        let importance = if let Some(acc) = score_accumulator.as_ref() {
+                            acc.importance_scores().to_vec()
+                        } else {
+                            vec![]
+                        };
+                        if importance.is_empty() {
+                            cache_manager.force_evict(&mut kv_caches, effective_ratio)
+                        } else {
+                            cache_manager.force_evict_with_scores(
+                                &mut kv_caches,
+                                effective_ratio,
+                                &importance,
+                            )
+                        }
+                    } else if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
                         use llm_rs2::core::eviction::StreamingLLMPolicy;
                         if let Some(ref sp) = evict.streaming_params {
                             let policy = StreamingLLMPolicy::new(sp.sink_size, sp.window_size);
@@ -2501,6 +2517,9 @@ fn command_summary(cmd: &EngineCommand) -> String {
             sink_size,
             window_size,
         } => format!("KvStreaming(sink={}, win={})", sink_size, window_size),
+        EngineCommand::KvMergeD2o { keep_ratio } => {
+            format!("KvMergeD2o(ratio={})", keep_ratio)
+        }
         EngineCommand::KvQuantDynamic { target_bits } => {
             format!("KvQuantDynamic({}bit)", target_bits)
         }

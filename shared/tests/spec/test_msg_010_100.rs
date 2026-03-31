@@ -176,6 +176,20 @@ fn test_msg_021_engine_command_serde_kv_streaming() {
 }
 
 #[test]
+fn test_msg_021_engine_command_serde_kv_merge_d2o() {
+    let cmd = EngineCommand::KvMergeD2o { keep_ratio: 0.75 };
+    let json = serde_json::to_string(&cmd).unwrap();
+    assert!(json.contains("\"type\":\"kv_merge_d2o\""));
+    let back: EngineCommand = serde_json::from_str(&json).unwrap();
+    match back {
+        EngineCommand::KvMergeD2o { keep_ratio } => {
+            assert!((keep_ratio - 0.75).abs() < f32::EPSILON);
+        }
+        _ => panic!("Expected KvMergeD2o"),
+    }
+}
+
+#[test]
 fn test_msg_021_engine_command_serde_kv_quant_dynamic() {
     let cmd = EngineCommand::KvQuantDynamic { target_bits: 4 };
     let json = serde_json::to_string(&cmd).unwrap();

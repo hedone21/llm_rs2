@@ -760,7 +760,7 @@ sequenceDiagram
 | KvEvictSliding | `evict` (Sliding) | `CacheManager::force_evict_by_policy(EvictMethod::Sliding, ...)` | 구현 완료 |
 | KvStreaming | `evict` (Streaming) | `StreamingLLMPolicy::new(sink_size, window_size).evict()` 즉석 호출 | 구현 완료 |
 | KvQuantDynamic | `kv_quant_bits` | KIVI 경로에서 양자화 비트 갱신 | 구현 완료 |
-| KvMergeD2o | (미매핑) | -- | 스펙 전용, 미구현 |
+| KvMergeD2o | `evict` (D2o) | `CacheManager::force_evict_with_scores(target_ratio)` via Pipeline D2OHandler | 구현 완료 |
 | LayerSkip | `layer_skip` | `generate.rs` — SkipConfig 갱신 | 구현 완료 |
 
 ---

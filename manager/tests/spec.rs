@@ -46,6 +46,8 @@ mod test_mgr_060_061;
 mod test_mgr_alg_013a_016;
 #[path = "spec/test_mgr_dat_022_024.rs"]
 mod test_mgr_dat_022_024;
+#[path = "spec/test_mgr_dat_d2o.rs"]
+mod test_mgr_dat_d2o;
 #[path = "spec/test_mgr_dat_streaming.rs"]
 mod test_mgr_dat_streaming;
 

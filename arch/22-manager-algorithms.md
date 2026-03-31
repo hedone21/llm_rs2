@@ -421,9 +421,8 @@ flowchart TD
 | KvEvictSliding | 0.0 | 0.7 | 0.0 | 0.0 |
 | KvEvictH2o | 0.0 | 0.6 | 0.0 | 0.0 |
 | KvQuantDynamic | 0.0 | 0.3 | 0.0 | 0.0 |
+| KvMergeD2o | 0.0 | 0.6 | 0.0 | 0.0 |
 | LayerSkip | 0.3 | 0.0 | 0.1 | -0.2 |
-
-**코드-스펙 차이**: spec의 `KvMergeD2o` (compute=0.0, memory=0.6) 엔트리는 코드에 없다 (ActionId enum에 미정의).
 
 ### 4.6 Persistence (MGR-ALG-047)
 
@@ -742,7 +741,7 @@ impl ActionRegistry {
 |------|------------|-----------|------|--------|
 | Memory 압력 계산 (MGR-ALG-013a) | `pressure.memory = m` (직접 매핑, PI 미경유) | `self.pi_memory.update(m, dt)` (PI 경유) | PI 평활화로 OOM 즉각 대응 지연 | 높음 |
 | EnergyConstraint (MGR-ALG-015) | raw `battery_pct` → 연속 변환 | `level_to_measurement(level)` → 4단계 이산 | 중간 배터리 수준(30~70%)에서 세밀한 압력 반영 불가 | 중간 |
-| KvMergeD2o default relief | spec 테이블에 포함 (memory=0.6) | ActionId enum에 미정의 | D2O 지원 시 추가 필요 | 낮음 |
+| KvMergeD2o default relief | spec 테이블에 포함 (memory=0.6) | ActionId enum에 KvMergeD2o 정의, default_relief 포함 | 스펙-코드 일치 | 해소 |
 
 ---
 

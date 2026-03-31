@@ -196,7 +196,7 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 | LayerSkip { skip_ratio } | -- | plan.layer_skip = Some(ratio) | Ok |
 | KvEvictH2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { H2o, ratio, Critical }) | Ok |
 | KvEvictSliding { keep_ratio } | -- | plan.evict = Some(EvictPlan { Sliding, ratio, Critical }) | Ok |
-| KvMergeD2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { D2o, ratio, Critical }) | Ok (미구현: 향후 추가) |
+| KvMergeD2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { D2o, ratio, Critical }) | Ok |
 | KvStreaming { sink_size, window_size } | -- | plan.evict = Some(EvictPlan { Streaming, 0.0, Critical, streaming_params: Some(StreamingParams { sink_size, window_size }) }) | Ok |
 | KvQuantDynamic { target_bits } | -- | plan.kv_quant_bits = Some(bits) | Ok |
 | RequestQcf | -- | plan.request_qcf = true | Ok (QcfEstimate를 별도 EngineMessage로 전송, SEQ-095~098) |
