@@ -52,3 +52,5 @@ mod test_seq_020_035;
 mod test_seq_040_064;
 #[path = "spec/test_seq_070_093.rs"]
 mod test_seq_070_093;
+#[path = "spec/test_seq_095_098.rs"]
+mod test_seq_095_098;

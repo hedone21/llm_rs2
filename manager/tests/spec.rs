@@ -50,3 +50,5 @@ mod test_mgr_dat_022_024;
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_040_064_mgr.rs"]
 mod test_seq_040_064_mgr;
+#[path = "spec/test_seq_095_098.rs"]
+mod test_seq_095_098;
