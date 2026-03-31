@@ -882,10 +882,12 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            // N_DST=4 rows per workgroup, 64 threads (1 subgroup)
-            let local_work_size: [usize; 3] = [64, 1, 1];
-            let group_size_0 = n.div_ceil(4);
-            let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], m, 1];
+            // N_DST=2, N_SIMDGROUP=4: 128 rows/WG, 4 waves split K
+            const N_SIMDGROUP: usize = 4;
+            const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
+            let local_work_size: [usize; 3] = [64, N_SIMDGROUP, 1];
+            let n_groups = n.div_ceil(ROWS_PER_WG);
+            let global_work_size: [usize; 3] = [n_groups * 64, N_SIMDGROUP, m];
 
             ocl::core::enqueue_kernel(
                 &self.queue,

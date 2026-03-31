@@ -317,13 +317,15 @@ fn make_f16_matmul_step(
         ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
     }
 
-    // N_DST=4 rows per workgroup, 64 threads
-    let group_size_0 = n.div_ceil(4);
+    // N_DST=2, N_SIMDGROUP=4: 128 rows/WG, 4 waves split K
+    const N_SIMDGROUP: usize = 4;
+    const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
+    let n_groups = n.div_ceil(ROWS_PER_WG);
     Ok(KernelStep {
         kernel,
         ndim: 3,
-        global_work_size: [group_size_0 * 64, 1, 1],
-        local_work_size: Some([64, 1, 1]),
+        global_work_size: [n_groups * 64, N_SIMDGROUP, 1], // m=1 for decode
+        local_work_size: Some([64, N_SIMDGROUP, 1]),
         dynamic_args: vec![],
         op_tag,
     })
