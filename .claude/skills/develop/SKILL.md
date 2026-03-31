@@ -36,13 +36,14 @@ llm.rs 개발 작업을 에이전트 파이프라인으로 오케스트레이션
 
 ### 판정 기준
 
-| Spec 변경 필요 (O) | Spec 무관 (X) |
-|---------------------|---------------|
-| 새 트레이트/인터페이스 정의 | 기존 트레이트 구현 추가 |
-| FSM 상태/전이 추가·변경 | 코드 리팩토링 (동작 불변) |
-| 프로토콜 메시지 추가 | 버그 수정 |
-| 값 범위/제약 조건 변경 (INV) | 성능 최적화 |
-| 새 시스템 요구사항 | config 키 추가 (arch만) |
+| Spec 관련 (O) — tests/spec/ 필수 | Spec 무관 (X) |
+|-----------------------------------|---------------|
+| 새 트레이트/인터페이스 정의 | 코드 리팩토링 (동작 불변) |
+| FSM 상태/전이 추가·변경 | 버그 수정 (spec 동작 불변) |
+| 프로토콜 메시지 추가 | 성능 최적화 |
+| 값 범위/제약 조건 변경 (INV) | config 키 추가 (arch만) |
+| 새 시스템 요구사항 | |
+| **기존 미구현 spec ID 구현** (가장 흔한 케이스) | |
 
 ### Spec 변경이 필요한 경우
 
@@ -76,15 +77,22 @@ Architect에게 spec-manage 스킬 사용을 명시하여 다음을 요청한다
 - 필요 시 Researcher를 Phase 2와 병렬로 호출하여 관련 기법 조사
 
 **Phase 3: 구현** (Implementer)
-- 코드 작성, 유닛 테스트, sanity check (fmt + clippy + test)
-- Spec 변경이 있었다면: Architect가 작성한 테스트 명세에 따라 tests/spec/ 테스트 코드도 작성
+- 코드 작성, 유닛 테스트 (`#[cfg(test)]`), sanity check (fmt + clippy + test)
+- **Spec ID가 관련된 작업 (Spec Triage O)**: 반드시 `tests/spec/` 테스트를 작성해야 한다
+  - `{crate}/tests/spec/test_{prefix}_{nnn}.rs` 파일 생성
+  - `{crate}/tests/spec.rs` harness에 모듈 등록
+  - 테스트 함수명에 spec ID 포함 (예: `test_seq_095_...`)
+  - `#[cfg(test)]` inline 테스트는 **spec 추적성에 포함되지 않음** — 반드시 `tests/spec/` 필수
 - prompt에 포함: Architect 설계안 + Spec 테스트 명세 + (있으면) Researcher 조사 결과
 - Implementer에게 sanity check 실행을 명시적으로 요청
 
 **Phase 4: 검증** (Tester)
 - 호스트 유닛 테스트 전체 실행, 회귀 확인
-- Spec 테스트가 추가되었다면: tests/spec/ 테스트 통과 확인
-- prompt에 포함: 변경된 파일/모듈 목록
+- **Spec ID가 관련된 작업**: `/sanity-check --spec` 실행 필수 (spec 테스트 + 커버리지 검증)
+  - `cargo test --test spec` (engine + manager + shared)
+  - `scripts/check_spec_coverage.sh` — 3계층 추적성 검증
+  - 커버리지 스크립트에서 새 spec ID가 누락되면 Implementer에 tests/spec/ 추가 요청
+- prompt에 포함: 변경된 파일/모듈 목록 + Spec ID 목록
 
 **Phase 5: 완료**
 - 결과 종합 + 커밋 + 알림
@@ -178,8 +186,9 @@ Architect에게 spec-manage 스킬 사용을 명시하여 다음을 요청한다
 모든 워크플로우 완료 후:
 
 1. **결과 요약**: 변경 파일, 테스트 결과, 주의사항을 간결히 보고
-2. **커밋**: Implementer가 코드를 변경한 경우, Conventional Commits 형식으로 커밋
-3. **알림**: `notify-send "llm.rs" "{워크플로우}: {요약}"`
+2. **Spec 관련 작업 시**: `scripts/check_spec_coverage.sh` 실행하여 3계층 추적성 확인. 누락 시 Implementer에 tests/spec/ 추가 요청
+3. **커밋**: Implementer가 코드를 변경한 경우, Conventional Commits 형식으로 커밋
+4. **알림**: `notify-send "llm.rs" "{워크플로우}: {요약}"`
 
 ## Phase 건너뛰기
 
