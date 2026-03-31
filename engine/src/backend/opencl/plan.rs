@@ -724,7 +724,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 
     Ok(LayerKernelPlan {
         steps,
-        flush_after: true,
+        flush_after: false, // Caller sets flush_after on the last layer only
     })
 }
 
@@ -845,6 +845,11 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             build_layer_plan(&layer_config)
                 .with_context(|| format!("build plan for layer {}", i))?,
         );
+    }
+
+    // Only the last layer needs clFlush before final norm + lm_head
+    if let Some(last) = layers.last_mut() {
+        last.flush_after = true;
     }
 
     // Final RMSNorm (in-place on x)

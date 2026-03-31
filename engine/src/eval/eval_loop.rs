@@ -115,6 +115,14 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         Arc::new(CpuBackend::new()),
     );
 
+    // Pre-allocate GPU input tensor for decode loops (avoids per-token GPU alloc)
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let mut gpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        gpu_gen_buf,
+        backend.clone() as Arc<dyn Backend>,
+    );
+
     // ── Importance 2-pass (only when skip_config is active) ──
     let (importance_table, layer_skip_qcf, layer_skip_opr, layer_skip_set_len) =
         run_importance_pass(
@@ -214,14 +222,17 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             unsafe {
                 *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token_id;
             }
-            let probe_input = backend.copy_from(&cpu_gen_input)?;
+            // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+            backend.write_buffer(&mut gpu_gen_input, unsafe {
+                std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+            })?;
 
             if let Some(acc) = hook.score_accumulator() {
                 acc.begin_step();
             }
 
             model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &probe_input,
+                input_tokens: &gpu_gen_input,
                 start_pos: start_pos_after_prompt - 1,
                 kv_caches,
                 backend,
@@ -301,7 +312,10 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                     unsafe {
                         *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = input_token;
                     }
-                    let gen_input = backend.copy_from(&cpu_gen_input)?;
+                    // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+                    backend.write_buffer(&mut gpu_gen_input, unsafe {
+                        std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+                    })?;
 
                     // Score accumulator begin_step only during choice decode
                     if let Some(acc) = hook.score_accumulator() {
@@ -309,7 +323,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                     }
 
                     model.forward_into(TransformerModelForwardArgs {
-                        input_tokens: &gen_input,
+                        input_tokens: &gpu_gen_input,
                         start_pos: sp,
                         kv_caches,
                         backend,
@@ -581,23 +595,38 @@ fn run_prefill<C: KVCacheOps>(
     kv_caches: &mut [C],
     hook: &mut dyn StepHook<C>,
     prompt_ids: &[u32],
-    _decode_logits: &mut Tensor,
-    _x_gen: &mut Tensor,
-    _gen_ws: &mut LayerWorkspace,
-    _cpu_gen_input: &Tensor,
-    _qcf_metrics: &mut Vec<serde_json::Value>,
+    decode_logits: &mut Tensor,
+    x_gen: &mut Tensor,
+    gen_ws: &mut LayerWorkspace,
+    cpu_gen_input: &Tensor,
+    qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
     prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
-    // Always use full batch prefill. Post-prefill eviction (in hook.post_prefill)
-    // handles cache compaction. The probe step (before post_prefill) populates
-    // the score accumulator for H2O decisions and QCF-ATTN measurement.
-    //
-    // This differs from the OLD per-step eviction approach but is the standard
-    // for eval-ll benchmarks: deterministic, single-event eviction with clean
-    // QCF measurement at a well-defined point.
+    // When KV caches need attention scores (KIVI+AWQE/AW-VOPR), use token-by-token
+    // prefill so each KIVI flush has scores from the previous step.
+    let needs_scores = !kv_caches.is_empty() && kv_caches[0].needs_attn_scores();
+    if needs_scores && prompt_ids.len() > 1 {
+        return run_token_by_token_prefill(
+            model,
+            backend,
+            memory,
+            kv_caches,
+            hook,
+            prompt_ids,
+            decode_logits,
+            x_gen,
+            gen_ws,
+            cpu_gen_input,
+            qcf_metrics,
+            vocab_size,
+            eval_config,
+            skip_config,
+        );
+    }
+
     run_full_prefill(
         model,
         backend,
@@ -605,12 +634,80 @@ fn run_prefill<C: KVCacheOps>(
         kv_caches,
         hook,
         prompt_ids,
-        _qcf_metrics,
+        qcf_metrics,
         vocab_size,
         eval_config,
         skip_config,
         prefill_ws,
     )
+}
+
+/// Token-by-token prefill for KIVI AWQE/AW-VOPR: processes each token individually
+/// so `set_attn_scores()` is called between tokens, giving KIVI flushes access to
+/// attention scores for weighted error computation.
+#[allow(clippy::too_many_arguments)]
+fn run_token_by_token_prefill<C: KVCacheOps>(
+    model: &TransformerModel,
+    backend: &Arc<dyn Backend>,
+    memory: &dyn Memory,
+    kv_caches: &mut [C],
+    hook: &mut dyn StepHook<C>,
+    prompt_ids: &[u32],
+    decode_logits: &mut Tensor,
+    x_gen: &mut Tensor,
+    gen_ws: &mut LayerWorkspace,
+    cpu_gen_input: &Tensor,
+    _qcf_metrics: &mut Vec<serde_json::Value>,
+    vocab_size: usize,
+    eval_config: &EvalConfig,
+    skip_config: Option<&SkipConfig>,
+) -> Result<(Vec<f32>, usize)> {
+    let prompt_len = prompt_ids.len();
+
+    // Pre-allocate GPU input tensor (avoids per-token GPU alloc in loop)
+    let gpu_buf = memory.alloc(4, DType::U8)?;
+    let mut gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        gpu_buf,
+        backend.clone() as Arc<dyn Backend>,
+    );
+
+    for (i, &token_id) in prompt_ids.iter().enumerate() {
+        unsafe {
+            *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token_id;
+        }
+        // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+        backend.write_buffer(&mut gen_input, unsafe {
+            std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
+
+        model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &gen_input,
+            start_pos: i,
+            kv_caches,
+            backend,
+            memory,
+            logits_out: decode_logits,
+            x_gen: Some(x_gen),
+            workspace: Some(gen_ws),
+            use_gpu_attn: eval_config.use_gpu_attn,
+            score_accumulator: hook.score_accumulator(),
+            profiler: None,
+            skip_config,
+            importance_collector: None,
+            logits_last_only: false,
+            variance_collector: None,
+        })?;
+    }
+
+    let mut prompt_logits_cpu = vec![0.0f32; vocab_size];
+    unsafe {
+        let ptr = prompt_logits_cpu.as_mut_ptr() as *mut u8;
+        let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+        backend.read_buffer(decode_logits, slice)?;
+    }
+
+    Ok((prompt_logits_cpu, prompt_len))
 }
 
 /// Full prefill: forward all prompt tokens in a single batched pass.
@@ -691,7 +788,7 @@ fn run_full_prefill<C: KVCacheOps>(
 /// Used when eviction is active (prompt > budget) to accumulate H2O attention
 /// scores during the decode phase. This gives post_prefill high-quality scores
 /// for eviction decisions, matching the quality of decode-step accumulation.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code, clippy::ptr_arg)]
 fn run_chunked_prefill<C: KVCacheOps>(
     model: &TransformerModel,
     backend: &Arc<dyn Backend>,
@@ -703,7 +800,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
     x_gen: &mut Tensor,
     gen_ws: &mut LayerWorkspace,
     cpu_gen_input: &Tensor,
-    qcf_metrics: &mut Vec<serde_json::Value>,
+    _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
     eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
@@ -767,6 +864,14 @@ fn run_chunked_prefill<C: KVCacheOps>(
 
     let mut start_pos = first_chunk_len;
 
+    // Pre-allocate GPU input tensor for the decode loop (avoids per-token GPU alloc)
+    let gpu_buf = memory.alloc(4, DType::U8)?;
+    let mut gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        gpu_buf,
+        backend.clone() as Arc<dyn Backend>,
+    );
+
     // ── Decode remaining prompt tokens one-by-one (no eviction during decode) ──
     // Let KV cache grow to full prompt length so H2O scores accumulate across
     // ALL decode steps. Eviction happens once after the loop (in post_prefill),
@@ -777,7 +882,10 @@ fn run_chunked_prefill<C: KVCacheOps>(
         unsafe {
             *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token_id;
         }
-        let gen_input = backend.copy_from(cpu_gen_input)?;
+        // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+        backend.write_buffer(&mut gen_input, unsafe {
+            std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
 
         if let Some(acc) = hook.score_accumulator() {
             acc.begin_step();

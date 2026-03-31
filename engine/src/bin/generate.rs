@@ -1529,6 +1529,11 @@ fn main() -> anyhow::Result<()> {
             Arc::new(CpuBackend::new()),
         );
 
+        // Pre-allocate GPU input tensor for decode loop (avoids per-token GPU alloc)
+        let gpu_gen_input_buf = memory.alloc(4, DType::U8)?;
+        let mut gen_input_tensor =
+            Tensor::new(Shape::new(vec![1, 1]), gpu_gen_input_buf, backend.clone());
+
         // Streaming setup
         use std::io::Write;
         let mut stdout = std::io::stdout();
@@ -1618,6 +1623,9 @@ fn main() -> anyhow::Result<()> {
                 {
                     gpu_plan = None; // invalidate; will rebuild after first forward
                 }
+                // Re-allocate gen_input_tensor on new GPU backend
+                let gi_buf = gpu_mem.alloc(4, DType::U8)?;
+                gen_input_tensor = Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
                 is_gpu = true;
                 eprintln!("[Hybrid] Switched to GPU successfully.");
             }
@@ -1627,7 +1635,10 @@ fn main() -> anyhow::Result<()> {
             unsafe {
                 *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
             }
-            let gen_input_tensor = backend.copy_from(&cpu_gen_input)?;
+            // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+            backend.write_buffer(&mut gen_input_tensor, unsafe {
+                std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+            })?;
 
             // Apply decay to accumulated importance scores before this step
             if let Some(acc) = score_accumulator.as_mut() {
@@ -2192,6 +2203,10 @@ fn main() -> anyhow::Result<()> {
                                 {
                                     gpu_plan = None;
                                 }
+                                // Re-allocate gen_input_tensor on new GPU backend
+                                let gi_buf = gpu_mem.alloc(4, DType::U8)?;
+                                gen_input_tensor =
+                                    Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
                                 is_gpu = true;
                                 eprintln!("[Hybrid] Resilience: Switched to GPU.");
                             }
@@ -2711,6 +2726,9 @@ fn run_kivi_ppl(
         cpu_gen_buf,
         Arc::new(CpuBackend::new()),
     );
+    // Pre-allocate GPU input tensor for decode loop (avoids per-token GPU alloc)
+    let gpu_gen_buf_kp = memory.alloc(4, DType::U8)?;
+    let mut gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf_kp, backend.clone());
     let mut logits_cpu = vec![0.0f32; vocab_size];
 
     let mut total_nll: f64 = 0.0;
@@ -2816,10 +2834,13 @@ fn run_kivi_ppl(
         unsafe {
             *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = input_token;
         }
-        let gen_input = backend.copy_from(&cpu_gen_input)?;
+        // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+        backend.write_buffer(&mut gen_input_gpu, unsafe {
+            std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
 
         model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input,
+            input_tokens: &gen_input_gpu,
             start_pos,
             kv_caches: &mut kv_caches,
             backend,
@@ -2959,7 +2980,6 @@ fn run_kivi_ppl(
 
 // ── KIVI mode: KiviCache-based inference ────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
 fn run_kivi(
     model: &TransformerModel,
@@ -3155,6 +3175,10 @@ fn run_kivi(
         Arc::new(CpuBackend::new()),
     );
 
+    // Pre-allocate GPU input tensor for decode loop (avoids per-token GPU alloc)
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let mut gen_input = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
+
     let eos_id = model.config.eos_token_id;
 
     let decode_start = std::time::Instant::now();
@@ -3178,7 +3202,10 @@ fn run_kivi(
         unsafe {
             *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
         }
-        let gen_input = backend.copy_from(&cpu_gen_input)?;
+        // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+        backend.write_buffer(&mut gen_input, unsafe {
+            std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
 
         let fwd_start = std::time::Instant::now();
         model.forward_into(TransformerModelForwardArgs {
@@ -3616,6 +3643,10 @@ fn run_offload(
         Arc::new(CpuBackend::new()),
     );
 
+    // Pre-allocate GPU input tensor for decode loop (avoids per-token GPU alloc)
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let mut gen_input = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
+
     let eos_id = model.config.eos_token_id;
 
     let mut prefetch =
@@ -3637,7 +3668,10 @@ fn run_offload(
         unsafe {
             *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = last_token;
         }
-        let gen_input = backend.copy_from(&cpu_gen_input)?;
+        // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+        backend.write_buffer(&mut gen_input, unsafe {
+            std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
 
         // Preload state managed by forward_into_offload:
         // - retained layers: retain_preload() keeps preloaded=true
@@ -3869,6 +3903,9 @@ fn run_ppl(
         cpu_gen_buf,
         Arc::new(CpuBackend::new()),
     );
+    // Pre-allocate GPU input tensor for decode loop (avoids per-token GPU alloc)
+    let gpu_gen_buf_ppl = memory.alloc(4, DType::U8)?;
+    let mut gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf_ppl, backend.clone());
     let mut logits_cpu = vec![0.0f32; vocab_size];
 
     // ── 3. Determine prefill chunk size ──
@@ -4016,10 +4053,13 @@ fn run_ppl(
         unsafe {
             *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = input_token;
         }
-        let gen_input = backend.copy_from(&cpu_gen_input)?;
+        // Reuse pre-allocated GPU buffer — write data instead of alloc+copy
+        backend.write_buffer(&mut gen_input_gpu, unsafe {
+            std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
 
         model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input,
+            input_tokens: &gen_input_gpu,
             start_pos,
             kv_caches,
             backend,

@@ -134,6 +134,10 @@ pub struct OpenCLBackend {
     // true on UMA devices (Adreno, Mali): CL_MEM_ALLOC_HOST_PTR for zero-copy.
     // false on discrete GPUs (NVIDIA): device-only buffers for correct behavior.
     pub use_zero_copy: bool,
+
+    // Pre-allocated 1-element dummy buffer for attention_gen when scores_out is None.
+    // Avoids per-call GPU buffer allocation (16 layers x every token).
+    dummy_score_buf: ocl::core::Mem,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -637,6 +641,16 @@ impl OpenCLBackend {
             use_zero_copy
         );
 
+        // Pre-allocate 1-element dummy buffer for attention_gen (scores_out=None path)
+        let dummy_score_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                1,
+                None,
+            )?
+        };
+
         Ok(Self {
             context,
             queue,
@@ -653,6 +667,7 @@ impl OpenCLBackend {
             gemm_f32_program,
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
+            dummy_score_buf,
         })
     }
 
@@ -1253,7 +1268,8 @@ impl Backend for OpenCLBackend {
             t.size()
         );
         if let Ok(dst_mem) = get_cl_mem(t.buffer().as_ref()) {
-            // GPU buffer: use OpenCL write (blocking=true to synchronize)
+            // GPU buffer: blocking write to ensure src data is consumed before return.
+            // For small transfers (e.g., 4-byte token id), overhead is negligible.
             unsafe {
                 ocl::core::enqueue_write_buffer(
                     &self.queue,
@@ -1764,9 +1780,10 @@ impl Backend for OpenCLBackend {
             .map(|s| (s.len() / num_heads_q) as i32)
             .unwrap_or(0);
 
-        // Allocate GPU score buffer if needed (lazy, reused via thread-local or per-call)
+        // Allocate GPU score buffer only when scores are actually needed.
+        // When scores_out is None, reuse the pre-allocated dummy buffer to avoid
+        // per-call GPU allocation (16 layers x every token).
         let score_buf = if scores_out.is_some() {
-            let size = num_heads_q * score_stride as usize * std::mem::size_of::<f32>();
             Some(unsafe {
                 ocl::core::create_buffer::<_, f32>(
                     self.context.as_core(),
@@ -1778,22 +1795,7 @@ impl Backend for OpenCLBackend {
         } else {
             None
         };
-        // Dummy buffer for when scores are not needed (kernel still expects the arg)
-        let dummy_buf = if score_buf.is_none() {
-            Some(unsafe {
-                ocl::core::create_buffer::<_, f32>(
-                    self.context.as_core(),
-                    ocl::core::MEM_READ_WRITE,
-                    1,
-                    None,
-                )?
-            })
-        } else {
-            None
-        };
-        let s_buf = score_buf
-            .as_ref()
-            .unwrap_or_else(|| dummy_buf.as_ref().unwrap());
+        let s_buf = score_buf.as_ref().unwrap_or(&self.dummy_score_buf);
 
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;

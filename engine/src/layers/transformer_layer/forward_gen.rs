@@ -832,7 +832,7 @@ impl TransformerLayer {
     /// Compute post-softmax attention scores for non-F32 KV cache (Q4_0, F16).
     /// This is a score-only pass — does NOT compute the attention output.
     /// Scores are written to `scores_out` in [n_heads_q, stride] layout.
-    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop, dead_code)]
     pub(super) fn compute_attention_scores(
         q: &Tensor,
         k_cache: &Tensor,
