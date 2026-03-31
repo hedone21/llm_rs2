@@ -90,6 +90,50 @@ impl Backend for CpuBackendNeon {
         Ok(())
     }
 
+    fn rms_norm_oop(
+        &self,
+        x: &Tensor,
+        out: &mut Tensor,
+        w: &Tensor,
+        eps: f32,
+        add_unit: bool,
+    ) -> Result<()> {
+        let dims = x.shape().dims();
+        let dim = dims[dims.len() - 1];
+        let x_data = x.as_slice::<f32>();
+        let out_data = out.as_mut_slice::<f32>();
+        let w_data = w.as_slice::<f32>();
+        for (x_row, out_row) in x_data.chunks(dim).zip(out_data.chunks_mut(dim)) {
+            unsafe { Self::rms_norm_oop_neon(x_row, out_row, w_data, eps, add_unit) };
+        }
+        Ok(())
+    }
+
+    fn add_rms_norm_oop(
+        &self,
+        x: &mut Tensor,
+        residual: &Tensor,
+        out: &mut Tensor,
+        w: &Tensor,
+        eps: f32,
+        add_unit: bool,
+    ) -> Result<()> {
+        let dims = x.shape().dims();
+        let dim = dims[dims.len() - 1];
+        let x_data = x.as_mut_slice::<f32>();
+        let res_data = residual.as_slice::<f32>();
+        let out_data = out.as_mut_slice::<f32>();
+        let w_data = w.as_slice::<f32>();
+        for ((x_row, res_row), out_row) in x_data
+            .chunks_mut(dim)
+            .zip(res_data.chunks(dim))
+            .zip(out_data.chunks_mut(dim))
+        {
+            unsafe { Self::add_rms_norm_oop_neon(x_row, res_row, out_row, w_data, eps, add_unit) };
+        }
+        Ok(())
+    }
+
     fn gelu_tanh_mul(&self, gate: &mut Tensor, up: &Tensor) -> Result<()> {
         let gate_data = gate.as_mut_slice::<f32>();
         let up_data = up.as_slice::<f32>();
@@ -807,6 +851,164 @@ impl CpuBackendNeon {
             }
             while i < dim {
                 *ptr.add(i) = (*ptr.add(i) * scale) * *w_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+
+    /// NEON single-pass out-of-place RMS norm.
+    /// Pass 1: read x → copy to out, compute sum-of-squares (saves one memcpy pass)
+    /// Pass 2: out[i] = out[i] * scale * w_eff
+    #[target_feature(enable = "neon")]
+    unsafe fn rms_norm_oop_neon(x: &[f32], out: &mut [f32], w: &[f32], eps: f32, add_unit: bool) {
+        let dim = x.len();
+        let x_ptr = x.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        let w_ptr = w.as_ptr();
+
+        // Pass 1: copy x → out, accumulate sum-of-squares
+        let mut sum_v0 = vdupq_n_f32(0.0);
+        let mut sum_v1 = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 8 <= dim {
+            let v0 = vld1q_f32(x_ptr.add(i));
+            let v1 = vld1q_f32(x_ptr.add(i + 4));
+            vst1q_f32(out_ptr.add(i), v0);
+            vst1q_f32(out_ptr.add(i + 4), v1);
+            sum_v0 = vfmaq_f32(sum_v0, v0, v0);
+            sum_v1 = vfmaq_f32(sum_v1, v1, v1);
+            i += 8;
+        }
+        while i + 4 <= dim {
+            let v = vld1q_f32(x_ptr.add(i));
+            vst1q_f32(out_ptr.add(i), v);
+            sum_v0 = vfmaq_f32(sum_v0, v, v);
+            i += 4;
+        }
+        sum_v0 = vaddq_f32(sum_v0, sum_v1);
+        let mut sum_sq = vaddvq_f32(sum_v0);
+        while i < dim {
+            let val = *x_ptr.add(i);
+            *out_ptr.add(i) = val;
+            sum_sq += val * val;
+            i += 1;
+        }
+
+        let scale = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+        let scale_v = vdupq_n_f32(scale);
+
+        // Pass 2: out[i] *= scale * w_eff
+        i = 0;
+        if add_unit {
+            let one_v = vdupq_n_f32(1.0);
+            while i + 4 <= dim {
+                let v = vld1q_f32(out_ptr.add(i));
+                let wv = vld1q_f32(w_ptr.add(i));
+                let w_eff = vaddq_f32(one_v, wv);
+                vst1q_f32(out_ptr.add(i), vmulq_f32(vmulq_f32(v, scale_v), w_eff));
+                i += 4;
+            }
+            while i < dim {
+                *out_ptr.add(i) = (*out_ptr.add(i) * scale) * (1.0 + *w_ptr.add(i));
+                i += 1;
+            }
+        } else {
+            while i + 4 <= dim {
+                let v = vld1q_f32(out_ptr.add(i));
+                let wv = vld1q_f32(w_ptr.add(i));
+                vst1q_f32(out_ptr.add(i), vmulq_f32(vmulq_f32(v, scale_v), wv));
+                i += 4;
+            }
+            while i < dim {
+                *out_ptr.add(i) = (*out_ptr.add(i) * scale) * *w_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+
+    /// NEON fused add + out-of-place RMS norm.
+    /// Pass 1: x[i] += res[i], copy sum to out, accumulate sum-of-squares
+    /// Pass 2: out[i] = out[i] * scale * w_eff
+    #[target_feature(enable = "neon")]
+    unsafe fn add_rms_norm_oop_neon(
+        x: &mut [f32],
+        res: &[f32],
+        out: &mut [f32],
+        w: &[f32],
+        eps: f32,
+        add_unit: bool,
+    ) {
+        let dim = x.len();
+        let x_ptr = x.as_mut_ptr();
+        let res_ptr = res.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+        let w_ptr = w.as_ptr();
+
+        // Pass 1: x += res, copy to out, accumulate sum-of-squares
+        let mut sum_v0 = vdupq_n_f32(0.0);
+        let mut sum_v1 = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 8 <= dim {
+            let xv0 = vld1q_f32(x_ptr.add(i));
+            let xv1 = vld1q_f32(x_ptr.add(i + 4));
+            let rv0 = vld1q_f32(res_ptr.add(i));
+            let rv1 = vld1q_f32(res_ptr.add(i + 4));
+            let s0 = vaddq_f32(xv0, rv0);
+            let s1 = vaddq_f32(xv1, rv1);
+            vst1q_f32(x_ptr.add(i), s0);
+            vst1q_f32(x_ptr.add(i + 4), s1);
+            vst1q_f32(out_ptr.add(i), s0);
+            vst1q_f32(out_ptr.add(i + 4), s1);
+            sum_v0 = vfmaq_f32(sum_v0, s0, s0);
+            sum_v1 = vfmaq_f32(sum_v1, s1, s1);
+            i += 8;
+        }
+        while i + 4 <= dim {
+            let xv = vld1q_f32(x_ptr.add(i));
+            let rv = vld1q_f32(res_ptr.add(i));
+            let s = vaddq_f32(xv, rv);
+            vst1q_f32(x_ptr.add(i), s);
+            vst1q_f32(out_ptr.add(i), s);
+            sum_v0 = vfmaq_f32(sum_v0, s, s);
+            i += 4;
+        }
+        sum_v0 = vaddq_f32(sum_v0, sum_v1);
+        let mut sum_sq = vaddvq_f32(sum_v0);
+        while i < dim {
+            let val = *x_ptr.add(i) + *res_ptr.add(i);
+            *x_ptr.add(i) = val;
+            *out_ptr.add(i) = val;
+            sum_sq += val * val;
+            i += 1;
+        }
+
+        let scale = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+        let scale_v = vdupq_n_f32(scale);
+
+        // Pass 2: out[i] *= scale * w_eff
+        i = 0;
+        if add_unit {
+            let one_v = vdupq_n_f32(1.0);
+            while i + 4 <= dim {
+                let v = vld1q_f32(out_ptr.add(i));
+                let wv = vld1q_f32(w_ptr.add(i));
+                let w_eff = vaddq_f32(one_v, wv);
+                vst1q_f32(out_ptr.add(i), vmulq_f32(vmulq_f32(v, scale_v), w_eff));
+                i += 4;
+            }
+            while i < dim {
+                *out_ptr.add(i) = (*out_ptr.add(i) * scale) * (1.0 + *w_ptr.add(i));
+                i += 1;
+            }
+        } else {
+            while i + 4 <= dim {
+                let v = vld1q_f32(out_ptr.add(i));
+                let wv = vld1q_f32(w_ptr.add(i));
+                vst1q_f32(out_ptr.add(i), vmulq_f32(vmulq_f32(v, scale_v), wv));
+                i += 4;
+            }
+            while i < dim {
+                *out_ptr.add(i) = (*out_ptr.add(i) * scale) * *w_ptr.add(i);
                 i += 1;
             }
         }

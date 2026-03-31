@@ -741,13 +741,21 @@ impl TransformerLayer {
         let t = prof_start!();
         if rms_norm_add_unit {
             // Gemma3: apply post-attention norm (ffn_norm) to attn_out before residual add,
-            // then apply pre_ffn_norm to get ws.residual for FFN input.
+            // then fused add + pre_ffn_norm for FFN input.
             backend.rms_norm(&mut ws.attn_out, &self.ffn_norm, rms_norm_eps, true)?;
-            backend.add_assign(x, &ws.attn_out)?;
             if let Some(ref pfn) = self.pre_ffn_norm {
-                backend.rms_norm_oop(x, &mut ws.residual, pfn, rms_norm_eps, true)?;
+                // Fused: x += attn_out; residual = norm(x) * (1 + pfn)
+                backend.add_rms_norm_oop(
+                    x,
+                    &ws.attn_out,
+                    &mut ws.residual,
+                    pfn,
+                    rms_norm_eps,
+                    true,
+                )?;
             } else {
                 // Fallback: no pre_ffn_norm (should not happen for Gemma3)
+                backend.add_assign(x, &ws.attn_out)?;
                 backend.copy_into(x, &mut ws.residual)?;
             }
         } else {
