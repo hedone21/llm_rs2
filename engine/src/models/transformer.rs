@@ -1101,6 +1101,7 @@ impl TransformerModel {
         let full_config = FullPlanConfig {
             context: &ocl_backend.context,
             f16_program: &ocl_backend.f16_program,
+            f16_l4_program: ocl_backend.f16_l4_program.as_ref(),
             simple_ops_program: &ocl_backend.simple_ops_program,
             layer_bufs,
             x_buf: cl!(x),

@@ -97,6 +97,8 @@ struct KernelCache {
     kernel_kivi_deq_key_q2: Option<CoreKernel>,
     kernel_kivi_scatter_residual: Option<CoreKernel>,
     kernel_kivi_gather_update: Option<CoreKernel>,
+    // F16 GEMV N_DST=4 variant for large-N matmuls (lm_head, FFN)
+    kernel_mul_mat_f16_f32_l4: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -122,6 +124,9 @@ pub struct OpenCLBackend {
     // Flash attention programs (optional — compiled with head_dim-specific defines)
     pub flash_attn_f32_program: Option<Program>,
     pub flash_attn_f32_f16_program: Option<Program>,
+
+    // F16 GEMV N_DST=4 for large-N decode (lm_head, FFN)
+    pub f16_l4_program: Option<Program>,
 
     // GEMM programs for prefill (tiled matmul, optional — fallback to GEMV)
     pub gemm_f16_program: Option<Program>,
@@ -410,6 +415,27 @@ impl OpenCLBackend {
             }
         };
 
+        // F16 GEMV N_DST=4 variant for large-N decode (lm_head, FFN)
+        let f16_l4_src = include_str!("../../../kernels/mul_mv_f16_f32_l4.cl");
+        let f16_l4_program = match Program::builder()
+            .devices(device)
+            .src(f16_l4_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("mul_mv_f16_f32_l4.cl compiled (GEMV N_DST=4 for large N)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "mul_mv_f16_f32_l4.cl failed: {}. Large-N will use N_DST=2 fallback.",
+                    e
+                );
+                None
+            }
+        };
+
         // Flash attention kernels — compiled with head_dim-specific defines
         // DK/DV=64 matches Llama 3.2 1B head_dim; BLOCK_M=64 (WG), BLOCK_N=32 (KV tile)
         let flash_attn_defines = "-DDK=64 -DDV=64 -DBLOCK_M=64 -DBLOCK_N=32";
@@ -611,6 +637,9 @@ impl OpenCLBackend {
             kernel_kivi_gather_update: kivi_q2_kernels
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kivi_gather_update").ok()),
+            kernel_mul_mat_f16_f32_l4: f16_l4_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_l4").ok()),
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -663,6 +692,7 @@ impl OpenCLBackend {
             get_rows_program,
             flash_attn_f32_program,
             flash_attn_f32_f16_program,
+            f16_l4_program,
             gemm_f16_program,
             gemm_f32_program,
             kernels: UnsafeCell::new(kernel_cache),
@@ -853,7 +883,15 @@ impl OpenCLBackend {
             get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
 
         let kernels = unsafe { &*self.kernels.get() };
-        let kernel = &kernels.kernel_mul_mat_f16_f32;
+
+        // Large-N dispatch: use N_DST=4 kernel for lm_head/FFN (fewer WGs, better activation reuse)
+        const LARGE_N_THRESHOLD: usize = 4096;
+        let use_l4 = n > LARGE_N_THRESHOLD && kernels.kernel_mul_mat_f16_f32_l4.is_some();
+        let kernel = if use_l4 {
+            kernels.kernel_mul_mat_f16_f32_l4.as_ref().unwrap()
+        } else {
+            &kernels.kernel_mul_mat_f16_f32
+        };
 
         let ne00 = k as i32;
         let ne01 = n as i32;
@@ -882,23 +920,39 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            // N_DST=2, N_SIMDGROUP=4: 128 rows/WG, 4 waves split K
             const N_SIMDGROUP: usize = 4;
-            const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
             let local_work_size: [usize; 3] = [64, N_SIMDGROUP, 1];
-            let n_groups = n.div_ceil(ROWS_PER_WG);
-            let global_work_size: [usize; 3] = [n_groups * 64, N_SIMDGROUP, m];
-
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            if use_l4 {
+                // N_DST=4: 256 rows/WG
+                const ROWS_PER_WG_L4: usize = 256; // N_SIMDWIDTH(64) * N_DST(4)
+                let n_groups = n.div_ceil(ROWS_PER_WG_L4);
+                let global_work_size: [usize; 3] = [n_groups * 64, N_SIMDGROUP, m];
+                ocl::core::enqueue_kernel(
+                    &self.queue,
+                    kernel,
+                    3,
+                    None,
+                    &global_work_size,
+                    Some(local_work_size),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            } else {
+                // N_DST=2: 128 rows/WG
+                const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
+                let n_groups = n.div_ceil(ROWS_PER_WG);
+                let global_work_size: [usize; 3] = [n_groups * 64, N_SIMDGROUP, m];
+                ocl::core::enqueue_kernel(
+                    &self.queue,
+                    kernel,
+                    3,
+                    None,
+                    &global_work_size,
+                    Some(local_work_size),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
         }
         Ok(())
     }

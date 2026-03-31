@@ -229,6 +229,7 @@ pub struct LayerPlanConfig<'a> {
     pub context: &'a ocl::Context,
     // Programs for kernel creation
     pub f16_program: &'a ocl::Program,
+    pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
     // Buffer handles (cl_mem) — model weights
     pub x_buf: &'a Mem,
@@ -271,12 +272,20 @@ pub struct LayerPlanConfig<'a> {
     pub kv_head_stride: i32,
 }
 
+/// N threshold for switching from N_DST=2 to N_DST=4 GEMV kernel.
+/// At N > 4096, the l4 kernel halves WG count and reuses activation across 4 rows.
+const LARGE_N_THRESHOLD: usize = 4096;
+
 /// Helper: create a dedicated kernel and pre-bind F16 matmul arguments.
 ///
 /// Matches the dispatch in `OpenClBackend::matmul_f16` for the decode case (m=1):
 ///   kernel_mul_mat_f16_f32(weight, 0, src, 0, dst, 0, ne00=k, ne01=n, ne02=1,
 ///                          ne10=k, ne12=1, ne0=n, ne1=1, r2=1, r3=1)
-///   ndim=3, global=[ceil(n/4)*64, 1, 1], local=[64,1,1]
+///   ndim=3, global=[ceil(n/128)*64, 4, 1], local=[64,4,1]
+///
+/// When `l4_program` is provided and `n > LARGE_N_THRESHOLD`, uses the N_DST=4 variant
+/// (256 rows/WG) instead of N_DST=2 (128 rows/WG).
+#[allow(clippy::too_many_arguments)]
 fn make_f16_matmul_step(
     program: &ocl::Program,
     src_buf: &Mem,
@@ -285,9 +294,16 @@ fn make_f16_matmul_step(
     n: usize,
     k: usize,
     op_tag: OpTag,
+    l4_program: Option<&ocl::Program>,
 ) -> Result<KernelStep> {
-    let kernel = ocl::core::create_kernel(program, "kernel_mul_mat_f16_f32")
-        .context("create kernel_mul_mat_f16_f32")?;
+    let use_l4 = n > LARGE_N_THRESHOLD && l4_program.is_some();
+    let kernel = if use_l4 {
+        ocl::core::create_kernel(l4_program.unwrap(), "kernel_mul_mat_f16_f32_l4")
+            .context("create kernel_mul_mat_f16_f32_l4")?
+    } else {
+        ocl::core::create_kernel(program, "kernel_mul_mat_f16_f32")
+            .context("create kernel_mul_mat_f16_f32")?
+    };
 
     let ne00 = k as i32;
     let ne01 = n as i32;
@@ -317,18 +333,32 @@ fn make_f16_matmul_step(
         ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
     }
 
-    // N_DST=2, N_SIMDGROUP=4: 128 rows/WG, 4 waves split K
     const N_SIMDGROUP: usize = 4;
-    const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
-    let n_groups = n.div_ceil(ROWS_PER_WG);
-    Ok(KernelStep {
-        kernel,
-        ndim: 3,
-        global_work_size: [n_groups * 64, N_SIMDGROUP, 1], // m=1 for decode
-        local_work_size: Some([64, N_SIMDGROUP, 1]),
-        dynamic_args: vec![],
-        op_tag,
-    })
+    if use_l4 {
+        // N_DST=4: 256 rows/WG
+        const ROWS_PER_WG: usize = 256; // N_SIMDWIDTH(64) * N_DST(4)
+        let n_groups = n.div_ceil(ROWS_PER_WG);
+        Ok(KernelStep {
+            kernel,
+            ndim: 3,
+            global_work_size: [n_groups * 64, N_SIMDGROUP, 1],
+            local_work_size: Some([64, N_SIMDGROUP, 1]),
+            dynamic_args: vec![],
+            op_tag,
+        })
+    } else {
+        // N_DST=2: 128 rows/WG
+        const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
+        let n_groups = n.div_ceil(ROWS_PER_WG);
+        Ok(KernelStep {
+            kernel,
+            ndim: 3,
+            global_work_size: [n_groups * 64, N_SIMDGROUP, 1],
+            local_work_size: Some([64, N_SIMDGROUP, 1]),
+            dynamic_args: vec![],
+            op_tag,
+        })
+    }
 }
 
 /// Build a pre-bound kernel execution plan for one transformer layer's decode
@@ -385,6 +415,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.n_q,
         k,
         OpTag::MatmulQKV,
+        None,
     )?);
 
     // -----------------------------------------------------------------------
@@ -398,6 +429,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.n_k,
         k,
         OpTag::MatmulQKV,
+        None,
     )?);
 
     // -----------------------------------------------------------------------
@@ -411,6 +443,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.n_v,
         k,
         OpTag::MatmulQKV,
+        None,
     )?);
 
     // -----------------------------------------------------------------------
@@ -606,6 +639,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         dim, // wo output dim = hidden dim
         dim, // wo inner dim = n_heads_q * head_dim = dim
         OpTag::MatmulWo,
+        None,
     )?);
 
     // -----------------------------------------------------------------------
@@ -649,6 +683,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.ffn_hidden,
         k,
         OpTag::MatmulGateUp,
+        config.f16_l4_program,
     )?);
 
     // -----------------------------------------------------------------------
@@ -662,6 +697,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.ffn_hidden,
         k,
         OpTag::MatmulGateUp,
+        config.f16_l4_program,
     )?);
 
     // -----------------------------------------------------------------------
@@ -698,6 +734,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         dim,
         config.ffn_hidden,
         OpTag::MatmulDown,
+        None,
     )?);
 
     // -----------------------------------------------------------------------
@@ -738,6 +775,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 pub struct FullPlanConfig<'a> {
     pub context: &'a ocl::Context,
     pub f16_program: &'a ocl::Program,
+    pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
     // Per-layer weight buffers: Vec<(wq, wk, wv, wo, w_gate, w_up, w_down, attn_norm, ffn_norm)>
     pub layer_bufs: Vec<LayerBufs<'a>>,
@@ -807,6 +845,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         let layer_config = LayerPlanConfig {
             context: config.context,
             f16_program: config.f16_program,
+            f16_l4_program: config.f16_l4_program,
             simple_ops_program: config.simple_ops_program,
             x_buf: config.x_buf,
             wq_buf: lb.wq,
@@ -890,6 +929,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         config.vocab_size,
         config.dim,
         OpTag::LmHead,
+        config.f16_l4_program,
     )
     .context("build lm_head matmul step")?;
 
