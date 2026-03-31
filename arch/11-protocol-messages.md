@@ -21,6 +21,7 @@ graph LR
         EM -->|"capability"| EC["EngineCapability"]
         EM -->|"heartbeat"| ES["EngineStatus"]
         EM -->|"response"| CR["CommandResponse"]
+        EM -->|"qcf_estimate"| QE["QcfEstimate"]
     end
 ```
 
@@ -43,14 +44,25 @@ pub enum EngineMessage {
     Capability(EngineCapability),
     Heartbeat(EngineStatus),
     Response(CommandResponse),
+    QcfEstimate(QcfEstimate),
 }
 ```
 
-3종 변형. spec에서 명세된 `QcfEstimate` 변형은 **미구현**.
+### QcfEstimate (MSG-085~087)
+
+```rust
+pub struct QcfEstimate {
+    pub estimates: HashMap<String, f32>,
+}
+```
+
+Engine이 RequestQcf에 대한 응답으로 전송. `estimates` keys는 현재 계산 가능한 lossy action 한정 (MSG-086). 값은 ≥ 0.0 (MSG-087).
+
+4종 변형. spec MSG-085~087에 명세된 `QcfEstimate` 포함.
 
 ### Spec 매핑
 
-MSG-010 (ManagerMessage), MSG-011 (EngineMessage), MSG-014 (QcfEstimate — 미구현)
+MSG-010 (ManagerMessage), MSG-011 (EngineMessage), MSG-014/085~087 (QcfEstimate)
 
 ---
 
@@ -303,6 +315,6 @@ CON-020 (필드명 불변), CON-021 (하위 호환 확장), INV-027 (serde = wir
 
 | 항목 | spec | 코드 | 비고 |
 |------|------|------|------|
-| QcfEstimate 메시지 | MSG-085~087 명세 | `shared/src/lib.rs`에 미정의 | EngineMessage에 variant 미추가 |
-| EngineMessage 변형 수 | 4종 | 3종 (Capability, Heartbeat, Response) | QcfEstimate 제외 |
+| ~~QcfEstimate 메시지~~ | ~~MSG-085~087~~ | ~~미정의~~ | **구현 완료** |
+| EngineMessage 변형 수 | 4종 | 4종 (Capability, Heartbeat, Response, QcfEstimate) | 일치 |
 | KvStreaming 실행 | 정상 처리 기대 | `Rejected` 반환 | "not yet implemented" |
