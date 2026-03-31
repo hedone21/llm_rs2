@@ -963,11 +963,10 @@ fn main() -> anyhow::Result<()> {
             )
         };
         let mut acc = acc;
-        // Start inactive when resilience-only (no eviction policy).
-        // Activated on-demand when eviction is requested.
-        // When an eviction policy is configured, always active (non-resilience eviction).
-        let start_active = args.eviction_policy != "none";
-        acc.set_active(start_active);
+        // Always active: GPU acc overhead is ~0.6ms/token (1.7%),
+        // CPU NEON acc overhead is ~0.66ms/token (1.1%).
+        // This ensures first RequestQcf returns accurate H2O/D2O estimates.
+        acc.set_active(true);
         acc.set_time_normalize(!args.h2o_raw_scores);
         Some(acc)
     } else {
@@ -990,10 +989,8 @@ fn main() -> anyhow::Result<()> {
             args.h2o_decay,
         ) {
             Ok(()) => {
-                // Set GPU acc active state to match CPU accumulator
                 if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
-                    let start_active = args.eviction_policy != "none";
-                    gpu_acc.set_active(start_active);
+                    gpu_acc.set_active(true);
                 }
                 eprintln!("[GPU Score] Accumulator initialized — per-token readback eliminated");
             }
