@@ -548,7 +548,7 @@ GQA 처리: kv_head당 gqa_group_size개 Q-head의 attention weight를 평균하
 
 **[ENG-ALG-050]** Manager가 RequestQcf를 보내면 Engine은 **읽기 전용 스캔**으로 per-action QCF 비용을 산출하여 QcfEstimate를 반환한다. *(MUST)*
 
-> **구현 상태**: RequestQcf/QcfEstimate는 프로토콜(MSG-036b, SEQ-095~098)과 스펙에서 정의되었으나, EngineCommand enum과 CommandExecutor에 아직 미구현이다. 코드 구현이 필요하다.
+> **구현 상태**: RequestQcf/QcfEstimate는 프로토콜(MSG-036b, SEQ-095~098)과 스펙에서 정의되며, `EngineCommand::RequestQcf` variant와 `CommandExecutor` 핸들러가 구현 완료되었다 (`shared/src/lib.rs`, `engine/src/resilience/executor.rs`).
 
 **단계**:
 
