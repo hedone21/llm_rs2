@@ -209,6 +209,10 @@ impl EngineState_ {
                 self.state = EngineState::Running;
                 CommandResult::Ok
             }
+            EngineCommand::RequestQcf => {
+                println!("  → RequestQcf (returning Ok)");
+                CommandResult::Ok
+            }
         }
     }
 

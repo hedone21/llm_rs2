@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use llm_shared::{
     CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineMessage, EngineState,
-    EngineStatus, ManagerMessage, ResourceLevel,
+    EngineStatus, ManagerMessage, QcfEstimate, ResourceLevel,
 };
 
 // ── Public types ────────────────────────────────────────────
@@ -29,6 +29,8 @@ pub struct ExecutionPlan {
     pub kv_quant_bits: Option<u8>,
     /// Whether to restore all action-induced state to defaults.
     pub restore_defaults: bool,
+    /// Whether Engine should compute and send QCF estimates.
+    pub request_qcf: bool,
 }
 
 /// Eviction method identifier (engine-internal, not in shared protocol).
@@ -120,6 +122,11 @@ impl CommandExecutor {
     /// Send initial capability report to Manager.
     pub fn send_capability(&self, cap: EngineCapability) {
         let _ = self.resp_tx.send(EngineMessage::Capability(cap));
+    }
+
+    /// Send QCF estimate to Manager (SEQ-096).
+    pub fn send_qcf_estimate(&self, qcf: QcfEstimate) {
+        let _ = self.resp_tx.send(EngineMessage::QcfEstimate(qcf));
     }
 
     /// Notify executor that inference has started.
@@ -297,6 +304,10 @@ impl CommandExecutor {
                 self.memory_level = ResourceLevel::Normal;
                 self.throttle_delay_ms = 0;
                 plan.throttle_delay_ms = 0;
+                CommandResult::Ok
+            }
+            EngineCommand::RequestQcf => {
+                plan.request_qcf = true;
                 CommandResult::Ok
             }
         }
@@ -920,5 +931,80 @@ mod tests {
         executor.poll(&empty_snap());
         assert!(executor.active_actions().is_empty());
         assert_eq!(executor.throttle_delay_ms(), 0);
+    }
+
+    #[test]
+    fn test_request_qcf_sets_plan_flag() {
+        let (mut executor, tx, rx) = make_executor();
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 10,
+            commands: vec![EngineCommand::RequestQcf],
+        }))
+        .unwrap();
+        let plan = executor.poll(&empty_snap());
+        assert!(plan.request_qcf);
+
+        // Should receive Response with Ok
+        let resp = rx.try_recv().unwrap();
+        match resp {
+            EngineMessage::Response(r) => {
+                assert_eq!(r.seq_id, 10);
+                assert_eq!(r.results.len(), 1);
+                assert!(matches!(r.results[0], CommandResult::Ok));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_request_qcf_with_other_commands() {
+        let (mut executor, tx, rx) = make_executor();
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 11,
+            commands: vec![
+                EngineCommand::Throttle { delay_ms: 30 },
+                EngineCommand::RequestQcf,
+            ],
+        }))
+        .unwrap();
+        let plan = executor.poll(&empty_snap());
+        assert!(plan.request_qcf);
+        assert_eq!(plan.throttle_delay_ms, 30);
+
+        let resp = rx.try_recv().unwrap();
+        match resp {
+            EngineMessage::Response(r) => {
+                assert_eq!(r.results.len(), 2);
+                assert!(matches!(r.results[0], CommandResult::Ok));
+                assert!(matches!(r.results[1], CommandResult::Ok));
+            }
+            _ => panic!("Expected Response"),
+        }
+    }
+
+    #[test]
+    fn test_request_qcf_default_false() {
+        let (mut executor, _tx, _rx) = make_executor();
+        let plan = executor.poll(&empty_snap());
+        assert!(!plan.request_qcf);
+    }
+
+    #[test]
+    fn test_send_qcf_estimate() {
+        let (executor, _tx, rx) = make_executor();
+        let mut estimates = std::collections::HashMap::new();
+        estimates.insert("kv_evict_sliding".to_string(), 0.5);
+        estimates.insert("kv_evict_h2o".to_string(), 0.1);
+        executor.send_qcf_estimate(QcfEstimate { estimates });
+
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            EngineMessage::QcfEstimate(qcf) => {
+                assert_eq!(qcf.estimates.len(), 2);
+                assert!((qcf.estimates["kv_evict_sliding"] - 0.5).abs() < f32::EPSILON);
+                assert!((qcf.estimates["kv_evict_h2o"] - 0.1).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected QcfEstimate"),
+        }
     }
 }

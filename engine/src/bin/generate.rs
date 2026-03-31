@@ -255,6 +255,10 @@ struct Args {
     #[arg(long, default_value = "attn")]
     qcf_mode: String,
 
+    /// Enable AWQE + AW-VOPR metrics for KIVI.
+    #[arg(long, default_value_t = false)]
+    awqe: bool,
+
     // ── Eval-LL mode (log-likelihood evaluation) ──
     /// Enable log-likelihood evaluation mode (downstream task accuracy)
     #[arg(long, default_value_t = false)]
@@ -290,6 +294,10 @@ struct Args {
     /// transition to Q2/Q4/Q8 via kv_quant_dynamic resilience command.
     #[arg(long, default_value_t = false)]
     kv_dynamic_quant: bool,
+
+    /// KIVI quantization bit-width (2, 4, or 8). Default: 2.
+    #[arg(long, default_value_t = 2)]
+    kivi_bits: u8,
 
     /// KIVI residual buffer size in tokens (must be multiple of 32).
     /// Default: 32. Larger values improve quality but use more memory.
@@ -495,13 +503,14 @@ fn main() -> anyhow::Result<()> {
             effective_budget: 0,
             kv_budget_ratio: 0.0,
             greedy: args.greedy,
-            kv_type: "q2+f32_residual".to_string(),
+            kv_type: format!("q{}+f32_residual", args.kivi_bits),
             use_gpu_attn: args.gpu_attn,
             qcf_mode: args.qcf_mode.clone(),
             vocab_size,
             hidden_size,
         };
         let qcf_config = llm_rs2::core::qcf::QcfConfig::default();
+        let kivi_bits = args.kivi_bits;
         let mut kv_caches: Vec<KiviCache> = (0..num_layers)
             .map(|_| {
                 KiviCache::new_gpu(
@@ -509,12 +518,18 @@ fn main() -> anyhow::Result<()> {
                     head_dim,
                     max_seq_len,
                     args.kivi_residual_size,
-                    2,
+                    kivi_bits,
                     backend.clone(),
                     memory.clone(),
                 )
             })
             .collect();
+        if args.awqe {
+            for cache in kv_caches.iter_mut() {
+                cache.set_awqe_enabled(true);
+            }
+            eprintln!("[KIVI] AWQE + AW-VOPR enabled");
+        }
         let mut hook = llm_rs2::eval::KiviHook::new(qcf_config);
         let output = llm_rs2::eval::run_eval_ll_generic(
             &model,
@@ -531,9 +546,10 @@ fn main() -> anyhow::Result<()> {
         json_val["config"] = serde_json::json!({
             "model": args.model_path,
             "eviction_policy": "kivi",
+            "kivi_bits": args.kivi_bits,
             "kivi_residual_size": args.kivi_residual_size,
             "max_seq_len": max_seq_len,
-            "kv_type": "q2+f32_residual",
+            "kv_type": format!("q{}+f32_residual", args.kivi_bits),
         });
         println!("{}", serde_json::to_string_pretty(&json_val)?);
         return Ok(());
@@ -1880,10 +1896,17 @@ fn main() -> anyhow::Result<()> {
                 // Activate score collection on-demand: only when eviction is
                 // requested or imminent. Avoids GPU score readback overhead
                 // (~129ms/token) during Normal operation.
-                if let Some(ref mut acc) = score_accumulator {
-                    if !acc.is_active() && plan.evict.is_some() {
-                        acc.set_active(true);
-                    }
+                if let Some(ref mut acc) = score_accumulator
+                    && !acc.is_active()
+                    && (plan.evict.is_some() || plan.request_qcf)
+                {
+                    acc.set_active(true);
+                }
+
+                // SEQ-095/096: Compute and send QCF estimates if requested
+                if plan.request_qcf {
+                    let estimates = compute_qcf_estimates(&kv_caches, score_accumulator.as_ref());
+                    executor.send_qcf_estimate(llm_shared::QcfEstimate { estimates });
                 }
 
                 if let Some(evict) = &plan.evict {
@@ -2384,6 +2407,67 @@ fn directive_summary(msg: &ManagerMessage) -> String {
     }
 }
 
+/// Compute dry-run QCF estimates for applicable eviction policies (ENG-ALG-050).
+/// Read-only: does not modify KV caches.
+fn compute_qcf_estimates(
+    kv_caches: &[KVCache],
+    score_accumulator: Option<&AttentionScoreAccumulator>,
+) -> std::collections::HashMap<String, f32> {
+    use std::collections::HashMap;
+    let mut estimates = HashMap::new();
+
+    if kv_caches.is_empty() || kv_caches[0].current_pos == 0 {
+        return estimates;
+    }
+
+    let current_pos = kv_caches[0].current_pos;
+
+    // Default keep_ratio for dry-run simulation
+    let keep_ratio = 0.5f32;
+    let target_len = (current_pos as f32 * keep_ratio) as usize;
+
+    if target_len >= current_pos {
+        return estimates; // Nothing to evict
+    }
+
+    // Sliding window QCF: fraction of cache being evicted
+    {
+        let evict_count = current_pos - target_len;
+        let qcf_sliding = evict_count as f32 / current_pos as f32;
+        estimates.insert("kv_evict_sliding".to_string(), qcf_sliding);
+    }
+
+    // H2O eviction QCF: requires attention scores from score_accumulator
+    if let Some(acc) = score_accumulator.filter(|a| a.is_active()) {
+        let scores = acc.importance_scores();
+        if scores.len() >= current_pos && current_pos > 0 {
+            // Simulate H2O: sort by importance, evict lowest
+            let mut indexed_scores: Vec<(usize, f32)> = scores[..current_pos]
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| (i, s))
+                .collect();
+            indexed_scores
+                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+            let evict_count = current_pos - target_len;
+            let evicted = &indexed_scores[..evict_count.min(indexed_scores.len())];
+
+            // QCF = sum of importance of evicted tokens / total importance
+            let total_importance: f32 = scores[..current_pos].iter().sum();
+            let evicted_importance: f32 = evicted.iter().map(|(_, s)| s).sum();
+            let qcf_h2o = if total_importance > 0.0 {
+                evicted_importance / total_importance
+            } else {
+                0.0
+            };
+            estimates.insert("kv_evict_h2o".to_string(), qcf_h2o);
+        }
+    }
+
+    estimates
+}
+
 fn command_summary(cmd: &EngineCommand) -> String {
     match cmd {
         EngineCommand::Throttle { delay_ms } => format!("Throttle({}ms)", delay_ms),
@@ -2404,6 +2488,7 @@ fn command_summary(cmd: &EngineCommand) -> String {
         EngineCommand::PrepareComputeUnit { device } => format!("Prepare({})", device),
         EngineCommand::Suspend => "Suspend".to_string(),
         EngineCommand::Resume => "Resume".to_string(),
+        EngineCommand::RequestQcf => "RequestQcf".to_string(),
     }
 }
 
