@@ -367,6 +367,89 @@ pub fn aggregate_heads(per_head: &[f32], mode: &AggregationMode) -> f32;
 
 ---
 
+## 4b. RequestQcf -> QcfEstimate (Dry-Run Scan)
+
+**모듈**: `engine/src/bin/generate.rs` (`compute_qcf_estimates()`)
+**Spec**: ENG-ALG-050
+
+### 4b.1 설계 결정
+
+Manager가 `RequestQcf` 명령을 보내면, Engine은 캐시 상태를 변경하지 않고 6종 action의 QCF 비용을 시뮬레이션한다. 각 action의 가용성 조건이 충족되지 않으면 해당 항목은 결과에서 생략된다. Manager는 반환된 항목만으로 action 선택을 결정한다.
+
+### 4b.2 처리 흐름
+
+```mermaid
+flowchart TD
+    A["Manager → RequestQcf"] --> B["CommandExecutor.poll()"]
+    B --> C["plan.request_qcf = true"]
+    C --> D["compute_qcf_estimates(kv_caches, score_acc)"]
+    D --> E{Sliding}
+    D --> F{H2O}
+    D --> G{Streaming}
+    D --> H{D2O}
+    D --> I{KIVI}
+    D --> J{LayerSkip}
+    E --> K["evict_count / current_pos"]
+    F -->|"score_acc 활성?"| L["identify_evicted → importance ratio"]
+    G --> M["(current_pos - keep_size) / current_pos"]
+    H -->|"score_acc 활성?"| N["H2O QCF × merge_discount"]
+    I -->|"KiviCache?"| O["compute_flush_qcf (NMSE)"]
+    J -->|"ImportanceTable?"| P["estimate_qcf_for_count"]
+    K --> Q["HashMap 집계"]
+    L --> Q
+    M --> Q
+    N --> Q
+    O --> Q
+    P --> Q
+    Q --> R["QcfEstimate 응답"]
+```
+
+### 4b.3 Action별 구현 매핑
+
+| Action | 키 이름 | 구현 함수/경로 | 가용성 조건 |
+|--------|---------|---------------|------------|
+| Sliding | `kv_evict_sliding` | `generate.rs::compute_qcf_estimates()` inline | 항상 |
+| H2O | `kv_evict_h2o` | `generate.rs::compute_qcf_estimates()` inline | `AttentionScoreAccumulator.is_active()` |
+| Streaming | `kv_evict_streaming` | `generate.rs::compute_qcf_estimates()` — 미구현, 추가 필요 | config에 `sink_size`, `window_size` 존재 |
+| D2O | `kv_merge_d2o` | `generate.rs::compute_qcf_estimates()` — 미구현, 추가 필요 | `AttentionScoreAccumulator.is_active()` |
+| KIVI | `kv_quant_kivi` | `kivi_cache.rs::compute_flush_qcf()` — dry-run 호출 미구현, 추가 필요 | `KiviCache` 인스턴스 존재 |
+| LayerSkip | `layer_skip` | `ImportanceTable::estimate_qcf_for_count()` — dry-run 호출 미구현, 추가 필요 | `ImportanceTable` 수집 완료 |
+
+### 4b.4 현재 구현 상태와 코드-스펙 차이
+
+현재 `compute_qcf_estimates()`는 **Sliding**과 **H2O** 2종만 구현되어 있다.
+Streaming, D2O, KIVI, LayerSkip의 dry-run은 스펙에 정의되었으나 구현이 누락된 상태이다.
+
+**D2O dry-run의 merge_discount 설계**:
+- H2O와 동일하게 evicted 토큰을 식별한 뒤, D2OHandler의 EMA threshold 통계에서 추정 merge rate를 산출
+- `merge_discount = 1 - estimated_merge_rate * merge_retention`
+- merge_retention은 merge가 보존하는 정보 비율의 근사 (e.g., 평균 cosine similarity)
+- 최종 QCF = H2O_QCF * merge_discount
+
+**Streaming dry-run의 특성**:
+- Attention score 불필요 — config의 `sink_size`와 `window_size`만으로 결정적 계산
+- `compute_qcf_estimates()`에 config 파라미터 전달이 필요 (현재 시그니처에 없음)
+
+### 4b.5 구현 시 필요한 시그니처 변경
+
+현재:
+```rust
+fn compute_qcf_estimates(
+    kv_caches: &[KVCache],
+    score_accumulator: Option<&AttentionScoreAccumulator>,
+) -> HashMap<String, f32>
+```
+
+Streaming/D2O/KIVI/LayerSkip 지원을 위해 추가 context가 필요:
+- `streaming_config: Option<(usize, usize)>` — (sink_size, window_size)
+- `d2o_state: Option<&D2OHandler>` — EMA threshold 참조 (merge discount 계산)
+- `kivi_caches: Option<&[KiviCache]>` — KIVI residual 접근
+- `importance_table: Option<&ImportanceTable>` — layer skip QCF
+
+별도 context struct로 묶는 것이 SRP에 부합한다.
+
+---
+
 ## 5. DegradationEstimator
 
 **모듈**: `engine/src/core/qcf/estimator.rs`

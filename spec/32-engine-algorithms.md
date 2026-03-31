@@ -1,6 +1,6 @@
 # Engine Algorithms
 
-> **TL;DR**: Engine 내부 알고리즘의 상세를 정의한다. KV 캐시 eviction 3종(H2O, Sliding Window, D2O), KIVI 비대칭 양자화(flush, bit transition, incremental dequant, GPU mode), SWIFT 기반 layer skip, QCF proxy 8종 수식, DegradationEstimator의 piecewise-linear 보정, madvise/shrink_to_fit 물리 메모리 해제, chunked prefill, CachePressurePipeline의 Handler 체인, 추론 루프 resilience checkpoint를 기술한다. 변수명과 타입 표현은 자유이나, 의사코드/불변식/example trace를 포함한다.
+> **TL;DR**: Engine 내부 알고리즘의 상세를 정의한다. KV 캐시 eviction 4종(H2O, Sliding Window, D2O, StreamingLLM), KIVI 비대칭 양자화(flush, bit transition, incremental dequant, GPU mode), SWIFT 기반 layer skip, QCF proxy 8종 수식, RequestQcf dry-run 6종 action 스캔, DegradationEstimator의 piecewise-linear 보정, madvise/shrink_to_fit 물리 메모리 해제, chunked prefill, CachePressurePipeline의 Handler 체인, 추론 루프 resilience checkpoint를 기술한다. 변수명과 타입 표현은 자유이나, 의사코드/불변식/example trace를 포함한다.
 
 ## 1. Purpose and Scope
 
@@ -8,7 +8,7 @@
 
 **이 파일이 명세하는 것:**
 
-- KV Cache Eviction 알고리즘 3종 (H2O, Sliding Window, D2O)
+- KV Cache Eviction 알고리즘 4종 (H2O, Sliding Window, D2O, StreamingLLM)
 - KV Cache Quantization (KIVI): flush cycle, bit transition, incremental dequant, GPU mode
 - Layer Skip: SkipConfig 초기화, layer importance 계산
 - QCF 계산 수식 8종 (eviction 4종, quantization 3종, skip 1종)
@@ -590,14 +590,33 @@ GQA 처리: kv_head당 gqa_group_size개 Q-head의 attention weight를 평균하
 1. **Manager -> Engine**: `RequestQcf { budget_ratio: f32 }` (Directive로 전달)
 2. **Engine poll()**: CommandExecutor가 RequestQcf를 수신
 3. **읽기 전용 스캔**: 캐시 상태를 변경하지 않고 각 액션의 QCF를 시뮬레이션
-   - H2O eviction: `identify_evicted_h2o()` → `compute_eviction_qcf_attn()` (dry-run)
-   - Sliding: 제거 대상 위치 계산 → `compute_sliding_qcf_attn()` (dry-run)
-   - KIVI: 현재 residual 상태에서 `compute_flush_qcf()` (dry-run)
-   - Layer skip: `ImportanceTable.estimate_qcf_for_count()` (테이블 참조만)
+
+   **6종 Action dry-run 명세**:
+
+   | Action | 필요 입력 | 계산 | 출력 범위 | 가용성 조건 |
+   |--------|----------|------|-----------|------------|
+   | Sliding | `current_pos`, `target_len` | `evict_count / current_pos` | [0, 1] | 항상 계산 가능 |
+   | H2O | `current_pos`, importance scores, `keep_ratio` | `evicted_importance / total_importance` | [0, 1] | AttentionScoreAccumulator 활성 필요 |
+   | Streaming | `current_pos`, `sink_size`, `window_size` | `(current_pos - keep_size) / current_pos` where `keep_size = sink_size + window_size` | [0, 1] | 항상 계산 가능 (`sink_size`, `window_size`는 config에서 취득) |
+   | D2O | importance scores, `keep_ratio` | H2O QCF x `merge_discount` (merge가 정보 일부 보존하므로 순수 eviction보다 낮은 비용) | [0, 1] | AttentionScoreAccumulator 활성 필요 |
+   | KIVI | KiviCache residual 상태 | `compute_flush_qcf()` (NMSE) | [0, 1] | KiviCache 사용 시에만 (F16/F32 KV cache에서는 N/A) |
+   | LayerSkip | `ImportanceTable`, `skip_ratio` | `estimate_qcf_for_count()` (테이블 참조만) | [0, 1] | prefill 시 ImportanceTable이 수집되어야 함 |
+
+   **Action별 dry-run 상세**:
+
+   - **Sliding**: 제거 대상 위치 계산 → `compute_sliding_qcf_attn()` (dry-run). `evict_count = current_pos - target_len`.
+   - **H2O**: `identify_evicted_h2o()` → importance score 기반 하위 토큰 식별 → `compute_eviction_qcf_attn()` (dry-run). Evicted tokens의 importance 합 / 전체 importance 합.
+   - **Streaming**: `sink_size + window_size`로 `keep_size` 결정 → eviction fraction 계산. `(current_pos - keep_size) / current_pos`. Attention score 불필요.
+   - **D2O**: `identify_evicted_h2o()` + merge compensation 보정. H2O dry-run과 동일하게 evicted 토큰을 식별한 뒤, merge discount factor를 적용하여 보정된 QCF를 산출. `merge_discount = 1 - estimated_merge_rate * merge_retention` (merge가 일부 정보를 보존하므로 순수 deletion보다 낮은 cost).
+   - **KIVI**: 현재 residual 상태에서 `compute_flush_qcf()` (dry-run). Flush 대상 토큰에 대한 NMSE 계산.
+   - **LayerSkip**: `ImportanceTable.estimate_qcf_for_count()` (테이블 참조만). Skip 대상 레이어의 importance 합으로 QCF 추정.
+
+   **가용성 판정**: 각 action의 가용성 조건이 충족되지 않으면 해당 action의 QcfMetric은 QcfEstimate에 포함되지 않는다 (N/A). Manager는 반환된 estimate 목록에 존재하는 action만으로 의사결정한다.
+
 4. **QcfEstimate 생성**: per-action QcfMetric 리스트 + DegradationEstimator로 PPL 증가 추정
 5. **Engine -> Manager**: `EngineMessage::QcfEstimate(...)` 응답
 
-**불변식**: 스캔 중 캐시 데이터 변경 없음. KiviCache의 경우 `set_current_pos()`로 probe step의 update 되돌리기 가능.
+**불변식**: 스캔 중 캐시 데이터 변경 없음. KiviCache의 경우 `set_current_pos()`로 probe step의 update 되돌리기 가능. 모든 dry-run 출력은 [0, 1] 범위 (KIVI의 NMSE 포함).
 
 ---
 
