@@ -2011,6 +2011,7 @@ fn main() -> anyhow::Result<()> {
                         streaming_config: Some((args.sink_size, streaming_window_size)),
                         importance_table: None, // Not collected in standard decode path
                         num_layers: model.config.num_hidden_layers,
+                        kivi_caches: None,
                     };
                     let estimates = compute_qcf_estimates(&ctx);
                     executor.send_qcf_estimate(llm_shared::QcfEstimate { estimates });
@@ -2589,6 +2590,8 @@ struct QcfEstimateContext<'a> {
     importance_table: Option<&'a llm_rs2::core::qcf::ImportanceTable>,
     /// Total number of transformer layers (needed for LayerSkip).
     num_layers: usize,
+    /// KIVI caches for dynamic quantization QCF dry-run. None = skip.
+    kivi_caches: Option<&'a [KiviCache]>,
 }
 
 /// Compute dry-run QCF estimates for all 6 lossy actions (ENG-ALG-050).
@@ -2605,81 +2608,92 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     use std::collections::HashMap;
     let mut estimates = HashMap::new();
 
-    if ctx.kv_caches.is_empty() || ctx.kv_caches[0].current_pos == 0 {
-        return estimates;
-    }
+    // ── 1-4. KVCache-based eviction QCF: requires standard KVCache ──
+    if !ctx.kv_caches.is_empty() && ctx.kv_caches[0].current_pos > 0 {
+        let current_pos = ctx.kv_caches[0].current_pos;
 
-    let current_pos = ctx.kv_caches[0].current_pos;
+        // Default keep_ratio for dry-run simulation
+        let keep_ratio = 0.5f32;
+        let target_len = (current_pos as f32 * keep_ratio) as usize;
 
-    // Default keep_ratio for dry-run simulation
-    let keep_ratio = 0.5f32;
-    let target_len = (current_pos as f32 * keep_ratio) as usize;
+        if target_len < current_pos {
+            // ── 1. Sliding window QCF: fraction of cache being evicted ──
+            {
+                let evict_count = current_pos - target_len;
+                let qcf_sliding = evict_count as f32 / current_pos as f32;
+                estimates.insert("kv_evict_sliding".to_string(), qcf_sliding);
+            }
 
-    if target_len >= current_pos {
-        return estimates; // Nothing to evict
-    }
+            // ── 2. H2O eviction QCF: requires attention scores ──
+            let mut qcf_h2o: Option<f32> = None;
+            if let Some(acc) = ctx.score_accumulator.filter(|a| a.is_active()) {
+                let scores = acc.importance_scores();
+                if scores.len() >= current_pos && current_pos > 0 {
+                    // Simulate H2O: sort by importance, evict lowest
+                    let mut indexed_scores: Vec<(usize, f32)> = scores[..current_pos]
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &s)| (i, s))
+                        .collect();
+                    indexed_scores
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
-    // ── 1. Sliding window QCF: fraction of cache being evicted ──
-    {
-        let evict_count = current_pos - target_len;
-        let qcf_sliding = evict_count as f32 / current_pos as f32;
-        estimates.insert("kv_evict_sliding".to_string(), qcf_sliding);
-    }
+                    let evict_count = current_pos - target_len;
+                    let evicted = &indexed_scores[..evict_count.min(indexed_scores.len())];
 
-    // ── 2. H2O eviction QCF: requires attention scores ──
-    let mut qcf_h2o: Option<f32> = None;
-    if let Some(acc) = ctx.score_accumulator.filter(|a| a.is_active()) {
-        let scores = acc.importance_scores();
-        if scores.len() >= current_pos && current_pos > 0 {
-            // Simulate H2O: sort by importance, evict lowest
-            let mut indexed_scores: Vec<(usize, f32)> = scores[..current_pos]
-                .iter()
-                .enumerate()
-                .map(|(i, &s)| (i, s))
-                .collect();
-            indexed_scores
-                .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    // QCF = sum of importance of evicted tokens / total importance
+                    let total_importance: f32 = scores[..current_pos].iter().sum();
+                    let evicted_importance: f32 = evicted.iter().map(|(_, s)| s).sum();
+                    let h2o_val = if total_importance > 0.0 {
+                        evicted_importance / total_importance
+                    } else {
+                        0.0
+                    };
+                    estimates.insert("kv_evict_h2o".to_string(), h2o_val);
+                    qcf_h2o = Some(h2o_val);
+                }
+            }
 
-            let evict_count = current_pos - target_len;
-            let evicted = &indexed_scores[..evict_count.min(indexed_scores.len())];
+            // ── 3. Streaming QCF: (current_pos - keep_size) / current_pos ──
+            if let Some((sink_size, window_size)) = ctx.streaming_config {
+                let keep_size = sink_size + window_size;
+                let qcf_streaming = if current_pos > keep_size {
+                    (current_pos - keep_size) as f32 / current_pos as f32
+                } else {
+                    0.0
+                };
+                estimates.insert("kv_evict_streaming".to_string(), qcf_streaming);
+            }
 
-            // QCF = sum of importance of evicted tokens / total importance
-            let total_importance: f32 = scores[..current_pos].iter().sum();
-            let evicted_importance: f32 = evicted.iter().map(|(_, s)| s).sum();
-            let h2o_val = if total_importance > 0.0 {
-                evicted_importance / total_importance
-            } else {
-                0.0
-            };
-            estimates.insert("kv_evict_h2o".to_string(), h2o_val);
-            qcf_h2o = Some(h2o_val);
+            // ── 4. D2O merge QCF: H2O QCF * merge_discount ──
+            // Merge preserves ~30% of evicted information, so quality loss is discounted.
+            // Uses constant discount factor 0.7 (D2O paper empirical estimate).
+            if let Some(h2o_val) = qcf_h2o {
+                const D2O_MERGE_DISCOUNT: f32 = 0.7;
+                let qcf_d2o = h2o_val * D2O_MERGE_DISCOUNT;
+                estimates.insert("kv_merge_d2o".to_string(), qcf_d2o);
+            }
         }
     }
 
-    // ── 3. Streaming QCF: (current_pos - keep_size) / current_pos ──
-    if let Some((sink_size, window_size)) = ctx.streaming_config {
-        let keep_size = sink_size + window_size;
-        let qcf_streaming = if current_pos > keep_size {
-            (current_pos - keep_size) as f32 / current_pos as f32
-        } else {
-            0.0
-        };
-        estimates.insert("kv_evict_streaming".to_string(), qcf_streaming);
+    // ── 5. KIVI dynamic quantization QCF ──
+    if let Some(kivi_caches) = ctx.kivi_caches
+        && !kivi_caches.is_empty()
+    {
+        let mut total_qcf = 0.0f32;
+        let mut count = 0u32;
+        for cache in kivi_caches {
+            let qcf = cache.estimate_dryrun_qcf();
+            if qcf > 0.0 {
+                total_qcf += qcf;
+                count += 1;
+            }
+        }
+        if count > 0 {
+            let avg_qcf = total_qcf / count as f32;
+            estimates.insert("kv_quant_dynamic".to_string(), avg_qcf.min(1.0));
+        }
     }
-
-    // ── 4. D2O merge QCF: H2O QCF * merge_discount ──
-    // Merge preserves ~30% of evicted information, so quality loss is discounted.
-    // Uses constant discount factor 0.7 (D2O paper empirical estimate).
-    if let Some(h2o_val) = qcf_h2o {
-        const D2O_MERGE_DISCOUNT: f32 = 0.7;
-        let qcf_d2o = h2o_val * D2O_MERGE_DISCOUNT;
-        estimates.insert("kv_merge_d2o".to_string(), qcf_d2o);
-    }
-
-    // ── 5. KIVI dynamic quantization QCF: skipped in non-KiviCache path ──
-    // KiviCache dry-run requires access to FP32 residual buffers which are
-    // only available in the run_kivi() code path. In the standard KVCache path
-    // this action is not applicable.
 
     // ── 6. LayerSkip QCF: importance-table based skip cost estimate ──
     if let Some(table) = ctx.importance_table {
@@ -3430,6 +3444,20 @@ fn run_kivi(
                 skip_ratio: kivi_last_skip_ratio.unwrap_or(0.0),
             };
             let plan = executor.poll(&kv_snap);
+
+            // QCF estimate: dry-run KIVI quantization NMSE
+            if plan.request_qcf {
+                let ctx = QcfEstimateContext {
+                    kv_caches: &[], // KIVI path has no standard KVCache
+                    score_accumulator: None,
+                    streaming_config: None,
+                    importance_table: None,
+                    num_layers,
+                    kivi_caches: Some(&kv_caches),
+                };
+                let estimates = compute_qcf_estimates(&ctx);
+                executor.send_qcf_estimate(llm_shared::QcfEstimate { estimates });
+            }
 
             // kv_quant_bits: transition KiviCache bit-width
             if let Some(bits) = plan.kv_quant_bits {

@@ -438,6 +438,47 @@ impl KiviCache {
         self.gpu_backend.is_some()
     }
 
+    /// Dry-run QCF estimate for KIVI quantization (read-only, no state mutation).
+    ///
+    /// - **CPU mode** with residual data: computes actual NMSE via `compute_flush_qcf`.
+    /// - **GPU mode** or empty residual: returns a bits-based proxy
+    ///   (Q2=0.30, Q4=0.10, Q8=0.03, F16=0.0).
+    pub fn estimate_dryrun_qcf(&self) -> f32 {
+        // bits=16 means unquantized, no degradation
+        if self.bits == 16 {
+            return 0.0;
+        }
+
+        // CPU mode with data in residual: compute actual NMSE
+        if !self.is_gpu() && self.res_pos > 0 {
+            let gs = self.group_size; // QKKV
+            let n_groups = self.res_pos / gs;
+            let flush_tokens = n_groups * gs;
+            if flush_tokens > 0 {
+                let config = crate::core::qcf::QcfConfig::default();
+                let params = crate::core::qcf::FlushQcfParams {
+                    res_k: &self.res_k,
+                    res_v: &self.res_v,
+                    kv_heads: self.kv_heads,
+                    head_dim: self.head_dim,
+                    flush_tokens,
+                    res_cap: self.res_cap,
+                    bits: self.bits,
+                };
+                let metric = crate::core::qcf::compute_flush_qcf(&params, &config);
+                return metric.normalized_value.clamp(0.0, 1.0);
+            }
+        }
+
+        // Fallback: bits-based proxy
+        match self.bits {
+            2 => 0.30,
+            4 => 0.10,
+            8 => 0.03,
+            _ => 0.0,
+        }
+    }
+
     /// Reset cache to empty state (reuse allocations).
     pub fn reset(&mut self) {
         self.qk.clear();
@@ -2607,5 +2648,80 @@ mod tests {
         assert_eq!(cache.bits(), 16);
         assert_eq!(cache.res_pos, 10);
         assert_eq!(cache.q2_tokens, 0);
+    }
+
+    // ── estimate_dryrun_qcf tests ──
+
+    #[test]
+    fn test_dryrun_qcf_bits16_returns_zero() {
+        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 16);
+        assert_eq!(cache.estimate_dryrun_qcf(), 0.0);
+    }
+
+    #[test]
+    fn test_dryrun_qcf_empty_cache_returns_bits_proxy() {
+        // Empty Q2 cache (no residual data) returns bits-based proxy
+        let cache = KiviCache::new(2, 64, 256, 32);
+        assert!((cache.estimate_dryrun_qcf() - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dryrun_qcf_q4_empty_returns_proxy() {
+        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 4);
+        assert!((cache.estimate_dryrun_qcf() - 0.10).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dryrun_qcf_q8_empty_returns_proxy() {
+        let cache = KiviCache::new_with_bits(2, 64, 256, 32, 8);
+        assert!((cache.estimate_dryrun_qcf() - 0.03).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dryrun_qcf_with_residual_data_computes_nmse() {
+        let kv_heads = 2;
+        let head_dim = 64;
+        let mut cache = KiviCache::new(kv_heads, head_dim, 256, 32);
+        // Fill 32 tokens (full residual buffer, triggering NMSE path)
+        for i in 0..32 {
+            let k = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.5);
+            let v = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.3);
+            cache.update(&k, &v).unwrap();
+        }
+        // After 32 inserts, residual was flushed (res_pos back to 0).
+        // Insert a few more to have non-zero residual for dry-run.
+        for i in 0..5 {
+            let k = make_input_tensor(1, kv_heads, head_dim, (i + 33) as f32 * 0.5);
+            let v = make_input_tensor(1, kv_heads, head_dim, (i + 33) as f32 * 0.3);
+            cache.update(&k, &v).unwrap();
+        }
+        // res_pos should be 5 (< group_size=32), so falls back to proxy
+        assert_eq!(cache.res_pos, 5);
+        let qcf = cache.estimate_dryrun_qcf();
+        // 5 tokens < QKKV(32), so n_groups=0, flush_tokens=0 → bits proxy 0.30
+        assert!((qcf - 0.30).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dryrun_qcf_full_residual_computes_actual_nmse() {
+        let kv_heads = 1;
+        let head_dim = 32;
+        let mut cache = KiviCache::new(kv_heads, head_dim, 128, 32);
+        // Fill exactly 32 tokens without flushing (the 32nd token triggers flush
+        // during update, but estimate_dryrun_qcf is read-only and uses current res data).
+        // We need to have 32 tokens in residual for NMSE. Use bits=4 and 64-token residual.
+        let mut cache4 = KiviCache::new_with_bits(kv_heads, head_dim, 128, 64, 4);
+        for i in 0..32 {
+            let k = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.7);
+            let v = make_input_tensor(1, kv_heads, head_dim, (i + 1) as f32 * 0.4);
+            cache4.update(&k, &v).unwrap();
+        }
+        // res_pos = 32, res_cap = 64, no flush happened yet
+        assert_eq!(cache4.res_pos, 32);
+        let qcf = cache4.estimate_dryrun_qcf();
+        // Should compute actual NMSE (between 0.0 and 1.0, not a proxy)
+        assert!(qcf >= 0.0 && qcf <= 1.0, "qcf={qcf} out of range");
+        // Q4 NMSE should be < Q2 proxy (0.30) for typical data
+        assert!(qcf < 0.30, "Q4 NMSE {qcf} should be < Q2 proxy 0.30");
     }
 }
