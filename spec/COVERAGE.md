@@ -223,3 +223,21 @@
 |------------|------|------|------|-----------|
 | CROSS-060 | (D) | 타이밍 상수 정의 (heartbeat_interval, MAX_PAYLOAD_SIZE) | ✅ | `engine/tests/spec/test_cross_060_061.rs` |
 | CROSS-061 | (B) | 타이밍 관계 수식 (heartbeat > recv_timeout) | ✅ | `engine/tests/spec/test_cross_060_061.rs` |
+
+## Test Tools
+
+| PREFIX-NNN | 분류 | 설명 | 상태 | 테스트 위치 |
+|------------|------|------|------|-----------|
+| TOOL-010 | (E) | mock_engine: Capability 전송 (SEQ-022) | ✅ | `manager/src/bin/mock_engine.rs` (inline) |
+| TOOL-013 | (E) | mock_engine: Heartbeat 주기 전송 | ✅ | `manager/src/bin/mock_engine.rs` (inline) |
+| TOOL-014 | (D) | mock_engine: EngineStatus 필드 정확성 | 🔶 | active_actions/available_actions 미반영 |
+| TOOL-016 | (A) | mock_engine: 13종 command 처리 | ✅ | `manager/src/bin/mock_engine.rs` (inline) |
+| TOOL-017 | (E) | mock_engine: INV-022 (1 Directive = 1 Response) | ✅ | `manager/src/bin/mock_engine.rs` (inline) |
+| TOOL-018 | (E) | mock_engine: INV-023/024 (seq_id/results 일치) | ✅ | `manager/src/bin/mock_engine.rs` (inline) |
+| TOOL-019 | (E) | mock_engine: QcfEstimate 전송 (SEQ-096) | ⬜ | 미구현 |
+| TOOL-030 | (E) | mock_manager: Unix 소켓 서버 | ⬜ | 미구현 |
+| TOOL-035 | (E) | mock_manager: Directive 전송 | ⬜ | 미구현 |
+| TOOL-036 | (A) | mock_manager: seq_id 단조 증가 (INV-020/021) | ⬜ | 미구현 |
+| TOOL-038 | (E) | mock_manager: QcfEstimate 수신 | ⬜ | 미구현 |
+| TOOL-048 | (B) | mock_manager: 프로토콜 불변식 검증 출력 | ⬜ | 미구현 |
+| TOOL-050 | (E) | 상호운용: mock_engine ↔ mock_manager E2E | ⬜ | 미구현 |

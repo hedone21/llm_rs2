@@ -29,6 +29,7 @@
 | `ENG-DAT` | 010–099 | Engine 데이터 (33) |
 | `XC` | 010–099 | 횡단관심사 (40) |
 | `INV` | 001–999 | 불변식 (41) — 전체 수집 |
+| `TOOL` | 010–099 | 테스트 도구 (50) |
 | `CON` | 001–999 | 적합성 기준 (90) |
 | `TRC` | 001–999 | 추적성 (91) |
 
@@ -84,6 +85,8 @@ spec/
 ├── 40-cross-cutting.md          # 에러 처리, 로깅, 타이밍 규약
 ├── 41-invariants.md             # 시스템 전체 불변식 수집
 │
+├── 50-test-tools.md             # mock_engine, mock_manager 테스트 도구
+│
 ├── 90-conformance.md            # 적합성 기준 (MUST → 테스트 assertion)
 └── 91-traceability.md           # HLR → LLR → spec → test 매핑
 ```
@@ -95,6 +98,7 @@ spec/
 - `2x`: Manager 컴포넌트
 - `3x`: Engine 컴포넌트
 - `4x`: 횡단관심사
+- `5x`: 테스트 도구
 - `9x`: 검증
 
 ## 읽기 순서
