@@ -188,6 +188,11 @@ pub enum EngineCommand {
     /// Dynamically transition KV cache quantization bits.
     KvQuantDynamic { target_bits: u8 },
 
+    // ── Query ──
+    /// Request QCF cost estimates for lossy actions (MSG-036b).
+    /// Engine responds with Ok, then sends separate QcfEstimate message.
+    RequestQcf,
+
     // ── Lifecycle ──
     /// Restore all action-induced state to defaults (skip→None, throttle→0).
     RestoreDefaults,
@@ -453,6 +458,15 @@ mod tests {
             EngineCommand::KvQuantDynamic { target_bits } => assert_eq!(target_bits, 4),
             _ => panic!("Expected KvQuantDynamic"),
         }
+    }
+
+    #[test]
+    fn test_engine_command_serde_request_qcf() {
+        let cmd = EngineCommand::RequestQcf;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"request_qcf\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EngineCommand::RequestQcf));
     }
 
     #[test]

@@ -183,6 +183,15 @@ fn test_msg_021_engine_command_serde_kv_quant_dynamic() {
 }
 
 #[test]
+fn test_msg_036b_engine_command_serde_request_qcf() {
+    let cmd = EngineCommand::RequestQcf;
+    let json = serde_json::to_string(&cmd).unwrap();
+    assert!(json.contains("\"type\":\"request_qcf\""));
+    let back: EngineCommand = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, EngineCommand::RequestQcf));
+}
+
+#[test]
 fn test_msg_021_engine_command_serde_restore_defaults() {
     let cmd = EngineCommand::RestoreDefaults;
     let json = serde_json::to_string(&cmd).unwrap();
