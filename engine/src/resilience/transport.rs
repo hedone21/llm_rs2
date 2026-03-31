@@ -15,6 +15,7 @@ use llm_shared::{EngineMessage, ManagerMessage};
 pub enum TransportError {
     ConnectionFailed(String),
     Disconnected,
+    Timeout,
     ParseError(String),
     Io(std::io::Error),
 }
@@ -24,6 +25,7 @@ impl fmt::Display for TransportError {
         match self {
             TransportError::ConnectionFailed(msg) => write!(f, "connection failed: {}", msg),
             TransportError::Disconnected => write!(f, "disconnected"),
+            TransportError::Timeout => write!(f, "timeout"),
             TransportError::ParseError(msg) => write!(f, "parse error: {}", msg),
             TransportError::Io(e) => write!(f, "I/O error: {}", e),
         }
@@ -125,6 +127,11 @@ impl MessageLoop {
                         );
                         break;
                     }
+                }
+                Err(TransportError::Timeout) => {
+                    // Read timeout — normal for non-blocking poll cycle.
+                    // Loop back to try_recv to drain outgoing messages.
+                    continue;
                 }
                 Err(TransportError::ParseError(msg)) => {
                     log::warn!("{} parse error: {}. Skipping.", transport.name(), msg);
@@ -250,6 +257,12 @@ fn read_exact_from<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<(), Transp
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
             Err(TransportError::Disconnected)
+        }
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            Err(TransportError::Timeout)
         }
         Err(e) => Err(TransportError::Io(e)),
     }
