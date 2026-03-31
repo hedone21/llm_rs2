@@ -98,6 +98,9 @@ pub enum EngineCommand {
     KvStreaming { sink_size: usize, window_size: usize },
     KvQuantDynamic { target_bits: u8 },
 
+    // Query
+    RequestQcf,
+
     // Lifecycle
     RestoreDefaults,
     SwitchHw { device: String },
@@ -107,7 +110,7 @@ pub enum EngineCommand {
 }
 ```
 
-코드에 11종 변형이 존재한다 (spec에 명세된 `KvMergeD2o`, `RequestQcf`는 실제 코드에서 확인 필요).
+코드에 12종 변형이 존재한다 (`RequestQcf` 구현 완료, `KvMergeD2o`는 미구현).
 
 ### Engine측 명령 실행
 
@@ -135,6 +138,7 @@ pub struct ExecutionPlan {
 | `KvEvictSliding` | `evict` (EvictPlan, method=Sliding) | Ok |
 | `KvStreaming` | — | **Rejected** ("not yet implemented") |
 | `KvQuantDynamic` | `kv_quant_bits` | Ok |
+| `RequestQcf` | `request_qcf` (generate.rs에서 QCF 계산 후 QcfEstimate 전송) | Ok |
 | `RestoreDefaults` | `restore_defaults`, 전체 리셋 | Ok |
 | `SwitchHw` | `switch_device` | Ok |
 | `PrepareComputeUnit` | `prepare_device` | Ok |

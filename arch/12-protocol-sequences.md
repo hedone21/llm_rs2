@@ -292,7 +292,7 @@ SEQ-100~104 (D-Bus Sequence)
 
 Manager가 Critical 모드 전환 시 `RequestQcf` Directive를 전송 → Engine이 QCF 계산 후 Response(Ok) + QcfEstimate 전송 → Manager의 Selector가 lossy 액션 비용으로 사용.
 
-**현재 QcfEstimate 수신 타임아웃 미구현** (spec SHOULD: 1초).
+**구현 완료**: Critical 전환 → RequestQcf 전송 (SEQ-095) → Engine Response(Ok) + QcfEstimate (SEQ-096) → ActionSelector에 real QCF 사용 (SEQ-097) → 1초 타임아웃 시 default_cost 폴백 (SEQ-098).
 
 ### Spec 매핑
 
@@ -319,8 +319,8 @@ SEQ-090~093 (Backpressure), SEQ-095~098 (QCF Request)
 | Manager측 페이로드 가드 | SEQ-081 | 미구현 | Engine측만 64KB 검증 |
 | Heartbeat 타임아웃 | SEQ-087 | 미구현 | docs/37 제안: 3초 |
 | Response 타임아웃 | SEQ-088 | 미구현 | docs/37 제안: 500ms |
-| QcfEstimate 타임아웃 | SEQ-098 | 미구현 | spec SHOULD: 1초 |
-| QcfEstimate 구조체 | MSG-014 | shared/src/lib.rs에 미정의 | EngineMessage variant 미추가 |
+| ~~QcfEstimate 타임아웃~~ | ~~SEQ-098~~ | ~~미구현~~ | **구현 완료** (1초 타임아웃 + default_cost 폴백) |
+| ~~QcfEstimate 구조체~~ | ~~MSG-014~~ | ~~미정의~~ | **구현 완료** (EngineMessage::QcfEstimate) |
 
 ---
 
