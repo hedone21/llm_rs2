@@ -13,6 +13,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 
 pub mod buffer;
+pub mod gpu_score;
 pub mod memory;
 pub mod plan;
 
@@ -143,6 +144,15 @@ pub struct OpenCLBackend {
     // Pre-allocated 1-element dummy buffer for attention_gen when scores_out is None.
     // Avoids per-call GPU buffer allocation (16 layers x every token).
     dummy_score_buf: ocl::core::Mem,
+
+    // GPU-side attention score accumulator (optional).
+    // When active, attention_gen writes to a persistent GPU buffer and
+    // reduce_layer aggregates scores without CPU readback.
+    // UnsafeCell follows the same pattern as `kernels` — single-threaded access.
+    gpu_score_acc: UnsafeCell<Option<gpu_score::GpuScoreAccumulator>>,
+
+    // Cached compiler options for building additional programs (e.g., score_reduce.cl).
+    cl_opts: String,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -698,7 +708,63 @@ impl OpenCLBackend {
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
             dummy_score_buf,
+            gpu_score_acc: UnsafeCell::new(None),
+            cl_opts: cl_opts.clone(),
         })
+    }
+
+    /// Initialize the GPU-side attention score accumulator.
+    ///
+    /// Compiles `score_reduce.cl` and allocates persistent GPU buffers for
+    /// score accumulation. If compilation fails, the accumulator is not
+    /// created (graceful degradation — falls back to CPU score path).
+    ///
+    /// Must be called before the decode loop starts.
+    pub fn init_gpu_score_acc(
+        &self,
+        n_heads_q: usize,
+        n_kv_heads: usize,
+        max_seq_len: usize,
+        decay: f32,
+    ) -> Result<()> {
+        let acc = gpu_score::GpuScoreAccumulator::new(
+            self.queue.as_core(),
+            self.context.as_core(),
+            self.device.as_core(),
+            &self.cl_opts,
+            n_heads_q,
+            n_kv_heads,
+            max_seq_len,
+            decay,
+        )?;
+        // SAFETY: single-threaded access (same as kernels UnsafeCell pattern)
+        unsafe {
+            *self.gpu_score_acc.get() = Some(acc);
+        }
+        log::info!(
+            "GPU score accumulator initialized (n_heads_q={}, n_kv_heads={}, max_seq={})",
+            n_heads_q,
+            n_kv_heads,
+            max_seq_len
+        );
+        Ok(())
+    }
+
+    /// Get a reference to the GPU score accumulator (if initialized).
+    pub fn gpu_score_acc(&self) -> Option<&gpu_score::GpuScoreAccumulator> {
+        // SAFETY: single-threaded access
+        unsafe { (*self.gpu_score_acc.get()).as_ref() }
+    }
+
+    /// Get a mutable reference to the GPU score accumulator (if initialized).
+    ///
+    /// # Safety
+    /// Uses UnsafeCell — caller must ensure single-threaded access.
+    /// The `&self -> &mut T` pattern is intentional (same as kernels UnsafeCell).
+    #[allow(clippy::mut_from_ref)]
+    pub fn gpu_score_acc_mut(&self) -> Option<&mut gpu_score::GpuScoreAccumulator> {
+        // SAFETY: single-threaded inference, same as kernels UnsafeCell pattern
+        unsafe { (*self.gpu_score_acc.get()).as_mut() }
     }
 
     /// Tiled GEMM for F16 weights: A(F32,[M,K]) x B^T(F16,[N,K]) -> Out(F32,[M,N])
@@ -1830,28 +1896,48 @@ impl Backend for OpenCLBackend {
             _ => &kernels.kernel_attn_gen,
         };
 
-        let write_scores = scores_out.is_some() as i32;
-        let score_stride = scores_out
-            .as_ref()
-            .map(|s| (s.len() / num_heads_q) as i32)
-            .unwrap_or(0);
+        // GPU score accumulator path: when active, use persistent GPU score buffer
+        // and skip CPU readback. Scores are reduced on-device and read only at eviction.
+        // SAFETY: single-threaded access (same as kernels UnsafeCell pattern)
+        let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
+        let use_gpu_acc = gpu_acc.as_ref().is_some_and(|acc| acc.is_active());
 
-        // Allocate GPU score buffer only when scores are actually needed.
-        // When scores_out is None, reuse the pre-allocated dummy buffer to avoid
-        // per-call GPU allocation (16 layers x every token).
-        let score_buf = if scores_out.is_some() {
+        let (write_scores, score_stride_val) = if use_gpu_acc {
+            let acc = gpu_acc.as_ref().unwrap();
+            (1i32, acc.score_stride() as i32)
+        } else {
+            (
+                scores_out.is_some() as i32,
+                scores_out
+                    .as_ref()
+                    .map(|s| (s.len() / num_heads_q) as i32)
+                    .unwrap_or(0),
+            )
+        };
+
+        // GPU score buffer selection:
+        // 1. GPU acc active -> persistent score_buf (no per-call alloc, no readback)
+        // 2. scores_out requested -> per-call GPU alloc + CPU readback
+        // 3. Neither -> dummy 1-element buffer
+        let score_buf = if use_gpu_acc {
+            None // using gpu_acc's persistent buffer
+        } else if scores_out.is_some() {
             Some(unsafe {
                 ocl::core::create_buffer::<_, f32>(
                     self.context.as_core(),
                     ocl::core::MEM_READ_WRITE | ocl::core::MEM_ALLOC_HOST_PTR,
-                    num_heads_q * score_stride as usize,
+                    num_heads_q * score_stride_val as usize,
                     None,
                 )?
             })
         } else {
             None
         };
-        let s_buf = score_buf.as_ref().unwrap_or(&self.dummy_score_buf);
+        let s_buf = if use_gpu_acc {
+            gpu_acc.as_ref().unwrap().score_buf_mem()
+        } else {
+            score_buf.as_ref().unwrap_or(&self.dummy_score_buf)
+        };
 
         unsafe {
             ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
@@ -1875,7 +1961,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&kv_pos_stride))?;
             ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&kv_head_stride))?;
             ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&write_scores))?;
-            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&score_stride))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&score_stride_val))?;
             ocl::core::set_kernel_arg(
                 kernel,
                 14,
@@ -1897,8 +1983,16 @@ impl Backend for OpenCLBackend {
             )?;
         }
 
-        // Readback scores from GPU to CPU
-        if let (Some(scores), Some(buf)) = (scores_out, &score_buf) {
+        // Post-kernel score handling:
+        // GPU acc path: run reduce_layer kernel (no CPU readback)
+        // Legacy path: blocking GPU->CPU readback of scores
+        if use_gpu_acc {
+            // SAFETY: single-threaded access
+            let acc = unsafe { &*self.gpu_score_acc.get() };
+            if let Some(acc) = acc.as_ref() {
+                acc.reduce_layer(self.queue.as_core(), cache_seq_len)?;
+            }
+        } else if let (Some(scores), Some(buf)) = (scores_out, &score_buf) {
             unsafe {
                 ocl::core::enqueue_read_buffer(
                     &self.queue,

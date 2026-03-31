@@ -271,6 +271,33 @@ impl AttentionScoreAccumulator {
         &self.importance
     }
 
+    /// Import cumulative scores computed on GPU.
+    ///
+    /// Called after `GpuScoreAccumulator::sync_to_cpu()` to transfer GPU-accumulated
+    /// importance into this CPU-side accumulator. Overwrites (not adds to) the
+    /// current importance scores since the GPU accumulator already includes decay
+    /// and cumulative aggregation.
+    ///
+    /// `flat`: `[max_seq_len]` cumulative flat importance from GPU.
+    /// `head`: `[n_kv_heads * max_seq_len]` cumulative per-head importance from GPU.
+    pub fn import_gpu_scores(&mut self, flat: &[f32], head: &[f32]) {
+        let len = flat.len().min(self.importance.len());
+        self.importance[..len].copy_from_slice(&flat[..len]);
+
+        if self.n_kv_heads > 0 {
+            let head_len = head.len().min(self.head_importance.len());
+            self.head_importance[..head_len].copy_from_slice(&head[..head_len]);
+        }
+
+        // Recompute time-normalized scores if enabled
+        if self.time_normalize {
+            for t in 0..len {
+                let count = self.step_count[t].max(1) as f32;
+                self.normalized[t] = self.importance[t] / count;
+            }
+        }
+    }
+
     /// Reset all accumulated scores (e.g., after eviction).
     pub fn reset(&mut self) {
         self.importance.fill(0.0);
@@ -1404,5 +1431,88 @@ mod tests {
             raw_pearson,
             norm_pearson
         );
+    }
+
+    // ── GPU score import tests ──
+
+    #[test]
+    fn test_import_gpu_scores_flat() {
+        let mut acc = AttentionScoreAccumulator::new(8, 2, 4, 0, 0.0);
+        acc.set_active(true);
+
+        // Simulate GPU-accumulated scores
+        let flat = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let head = vec![];
+        acc.import_gpu_scores(&flat, &head);
+
+        let imp = acc.importance_scores();
+        assert!((imp[0] - 1.0).abs() < 1e-6);
+        assert!((imp[7] - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_import_gpu_scores_gqa() {
+        // 4 Q-heads, 2 KV-heads, max_seq=4
+        let mut acc = AttentionScoreAccumulator::new_gqa(4, 4, 2, 1, 0, 0.0);
+        acc.set_active(true);
+
+        let flat = vec![10.0, 20.0, 30.0, 40.0];
+        // head layout: [n_kv_heads * max_seq_len] = [2 * 4] = 8
+        let head = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        acc.import_gpu_scores(&flat, &head);
+
+        assert!((acc.importance_scores()[0] - 10.0).abs() < 1e-6);
+        assert!((acc.importance_scores()[3] - 40.0).abs() < 1e-6);
+
+        let head_imp = acc.head_importance_scores().unwrap();
+        assert!((head_imp[0] - 1.0).abs() < 1e-6);
+        assert!((head_imp[7] - 8.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_import_gpu_scores_overwrites() {
+        // import_gpu_scores should overwrite existing CPU scores
+        let mut acc = AttentionScoreAccumulator::new(4, 1, 1, 0, 0.0);
+        acc.set_active(true);
+
+        // First accumulate via CPU path
+        acc.begin_step();
+        acc.accumulate_layer(&[100.0, 200.0, 300.0, 400.0], 4, 4, 1);
+        acc.end_step();
+
+        assert!((acc.importance_scores()[0] - 100.0).abs() < 1e-6);
+
+        // GPU import overwrites
+        let flat = vec![1.0, 2.0, 3.0, 4.0];
+        acc.import_gpu_scores(&flat, &[]);
+
+        assert!((acc.importance_scores()[0] - 1.0).abs() < 1e-6);
+        assert!((acc.importance_scores()[3] - 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_import_gpu_scores_with_time_normalize() {
+        let mut acc = AttentionScoreAccumulator::new(4, 1, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.set_time_normalize(true);
+
+        // Simulate some steps to build step_count
+        acc.begin_step();
+        acc.accumulate_layer(&[1.0, 1.0, 1.0, 1.0], 4, 4, 1);
+        acc.end_step(); // step_count[0..4] = 1
+        acc.begin_step();
+        acc.accumulate_layer(&[1.0, 1.0, 0.0, 0.0], 4, 4, 1);
+        acc.end_step(); // step_count = [2, 2, 1, 1]
+
+        // GPU import with known values
+        let flat = vec![10.0, 20.0, 30.0, 40.0];
+        acc.import_gpu_scores(&flat, &[]);
+
+        // With time_normalize: importance[t] / step_count[t]
+        let imp = acc.importance_scores();
+        assert!((imp[0] - 5.0).abs() < 1e-6); // 10/2
+        assert!((imp[1] - 10.0).abs() < 1e-6); // 20/2
+        assert!((imp[2] - 30.0).abs() < 1e-6); // 30/1
+        assert!((imp[3] - 40.0).abs() < 1e-6); // 40/1
     }
 }

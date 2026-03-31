@@ -974,6 +974,38 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Initialize GPU-side score accumulator when using OpenCL backend.
+    // This compiles score_reduce.cl and allocates persistent GPU buffers.
+    // Eliminates per-token GPU->CPU blocking readback (~129ms/token).
+    #[cfg(feature = "opencl")]
+    if score_accumulator.is_some()
+        && let Some(ocl_be) = backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+    {
+        match ocl_be.init_gpu_score_acc(
+            model.config.num_attention_heads,
+            model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay,
+        ) {
+            Ok(()) => {
+                // Set GPU acc active state to match CPU accumulator
+                if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
+                    let start_active = args.eviction_policy != "none";
+                    gpu_acc.set_active(start_active);
+                }
+                eprintln!("[GPU Score] Accumulator initialized — per-token readback eliminated");
+            }
+            Err(e) => {
+                eprintln!(
+                    "[GPU Score] Failed to initialize (falling back to CPU path): {}",
+                    e
+                );
+            }
+        }
+    }
+
     if args.eviction_policy != "none" {
         eprintln!(
             "Eviction: policy={}, window={}, prefix={}, ratio={}, threshold={}MB",
@@ -1775,6 +1807,25 @@ fn main() -> anyhow::Result<()> {
                 let before_len = kv_caches[0].current_pos;
                 let capacity = kv_caches[0].capacity();
 
+                // GPU score sync: transfer GPU-accumulated scores to CPU accumulator
+                // before any score-based eviction decision. Only syncs when:
+                // 1. GPU score acc is active AND
+                // 2. Eviction is imminent (score-based at 90% capacity) OR non-score-based with acc
+                #[cfg(feature = "opencl")]
+                if (score_based_eviction && before_len >= capacity * 9 / 10
+                    || score_accumulator.as_ref().is_some_and(|a| a.is_active()))
+                    && let Some(ocl_be) = backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                    && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+                    && gpu_acc.is_active()
+                {
+                    let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
+                    if let Some(ref mut acc) = score_accumulator {
+                        acc.import_gpu_scores(&flat, &head);
+                    }
+                }
+
                 // Capture pre-eviction scores for profiling (before eviction mutates state)
                 let pre_eviction_scores: Vec<f32> = if profiler.is_some()
                     && score_based_eviction
@@ -1884,6 +1935,16 @@ fn main() -> anyhow::Result<()> {
                     if let Some(acc) = score_accumulator.as_mut() {
                         acc.reset();
                     }
+                    // Reset GPU score accumulator after eviction
+                    #[cfg(feature = "opencl")]
+                    if let Some(ocl_be) = backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                        && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                        && gpu_acc.is_active()
+                    {
+                        gpu_acc.reset(ocl_be.queue.as_core())?;
+                    }
                 }
             }
             forward_ms_values.push(forward_ms);
@@ -1919,13 +1980,22 @@ fn main() -> anyhow::Result<()> {
                 action_names = plan_summary(&plan);
 
                 // Activate score collection on-demand: only when eviction is
-                // requested or imminent. Avoids GPU score readback overhead
-                // (~129ms/token) during Normal operation.
+                // requested or imminent. With GPU score accumulator, there is
+                // no per-token overhead (scores are accumulated on-device).
                 if let Some(ref mut acc) = score_accumulator
                     && !acc.is_active()
                     && (plan.evict.is_some() || plan.request_qcf)
                 {
                     acc.set_active(true);
+                    // Also activate GPU score accumulator if available
+                    #[cfg(feature = "opencl")]
+                    if let Some(ocl_be) = backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                        && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                    {
+                        gpu_acc.set_active(true);
+                    }
                 }
 
                 // SEQ-095/096: Compute and send QCF estimates if requested
@@ -1952,6 +2022,20 @@ fn main() -> anyhow::Result<()> {
                 if let Some(evict) = &plan.evict {
                     let effective_ratio =
                         args.experiment_eviction_ratio.unwrap_or(evict.target_ratio);
+
+                    // GPU score sync before resilience eviction
+                    #[cfg(feature = "opencl")]
+                    if let Some(ocl_be) = backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                        && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+                        && gpu_acc.is_active()
+                    {
+                        let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
+                        if let Some(ref mut acc) = score_accumulator {
+                            acc.import_gpu_scores(&flat, &head);
+                        }
+                    }
 
                     // ── Score distribution diagnostic (via events system) ──
                     if let Some(acc) = score_accumulator.as_ref() {
@@ -2106,6 +2190,17 @@ fn main() -> anyhow::Result<()> {
                             if let Some(acc) = score_accumulator.as_mut() {
                                 acc.reset();
                                 acc.set_active(false);
+                            }
+                            // Reset GPU score accumulator after resilience eviction
+                            #[cfg(feature = "opencl")]
+                            if let Some(ocl_be) = backend
+                                .as_any()
+                                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>(
+                            ) && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                                && gpu_acc.is_active()
+                            {
+                                gpu_acc.reset(ocl_be.queue.as_core())?;
+                                gpu_acc.set_active(false);
                             }
                         }
                         Err(e) => eprintln!("[Resilience] Eviction error: {}", e),

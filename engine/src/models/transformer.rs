@@ -845,11 +845,30 @@ impl TransformerModel {
             needs_ws_sync = prefill_ws.is_some();
         }
 
+        // Check if GPU-side score accumulator is active.
+        // When active, attention_gen writes scores to a persistent GPU buffer and
+        // reduce_layer runs on-device — no CPU readback needed per layer.
+        // This means we set need_scores=false for the layer forward path.
+        #[cfg(feature = "opencl")]
+        let gpu_score_active = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .and_then(|ocl_be| ocl_be.gpu_score_acc())
+            .is_some_and(|acc| acc.is_active());
+        #[cfg(not(feature = "opencl"))]
+        let gpu_score_active = false;
+
         // 2. Iterate layers
         for (i, layer) in self.layers.iter().enumerate() {
-            let need_scores = score_accumulator
-                .as_ref()
-                .is_some_and(|acc| acc.should_track_layer(i));
+            // GPU acc active -> GPU handles score collection internally in attention_gen.
+            // CPU accumulator still needs need_scores=false to avoid redundant CPU path.
+            let need_scores = if gpu_score_active {
+                false
+            } else {
+                score_accumulator
+                    .as_ref()
+                    .is_some_and(|acc| acc.should_track_layer(i))
+            };
 
             let (s_attn, s_mlp) =
                 skip_config.map_or((false, false), |sc| (sc.skip_attn(i), sc.skip_mlp(i)));
@@ -987,6 +1006,19 @@ impl TransformerModel {
         // Flush step-local importance (per-layer MAX) into cumulative importance
         if let Some(ref mut acc) = score_accumulator {
             acc.end_step();
+        }
+
+        // GPU score accumulator: flush step scores into cumulative importance.
+        // This runs kernel_score_end_step + kernel_score_clear on the device.
+        #[cfg(feature = "opencl")]
+        if gpu_score_active
+            && let Some(ocl_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+        {
+            let cache_seq_len = kv_caches[0].current_pos();
+            gpu_acc.end_step(ocl_be.queue.as_core(), cache_seq_len)?;
         }
 
         // 3. Final Norm
