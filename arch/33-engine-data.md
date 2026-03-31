@@ -373,6 +373,36 @@ classDiagram
     EvictionPolicy <|.. H2OPlusPolicy
 ```
 
+### 6.4 StreamingLLMPolicy 프로토콜 경로
+
+StreamingLLMPolicy는 두 가지 경로로 호출된다:
+
+1. **CLI 경로** (`--eviction-policy streaming`): CacheManager에 등록되어 auto-eviction (`should_evict()` → `evict()`) 수행. `--sink-size`, `--streaming-window` CLI 플래그로 파라미터 지정.
+
+2. **프로토콜 경로** (Manager Directive `KvStreaming { sink_size, window_size }`):
+   - executor.rs에서 `EvictPlan { method: Streaming, target_ratio: 0.0, pressure_level: Critical, streaming_params: Some(StreamingParams { sink_size, window_size }) }` 생성
+   - `active_actions.insert(ActionId::KvEvictStreaming)` — C4/C5/C7과 eviction 배타 그룹
+   - generate.rs에서 `StreamingLLMPolicy::new(sink_size, window_size).evict(cache, 0)` 즉석 호출 (target_len 무시됨)
+   - CacheManager에 등록된 정책과 무관하게, Directive 파라미터로 즉석 생성한 인스턴스로 실행
+
+```mermaid
+sequenceDiagram
+    participant M as Manager
+    participant E as Executor
+    participant G as Generate
+    participant S as StreamingLLMPolicy
+
+    M->>E: KvStreaming{sink_size: 4, window_size: 256}
+    E->>E: plan.evict = EvictPlan{Streaming, params}
+    E->>E: active_actions.insert(KvEvictStreaming)
+    E-->>M: CommandResult::Ok
+    G->>G: consume plan.evict
+    G->>S: new(4, 256).evict(cache, 0)
+    S->>S: keep sink[0..4) + recent[pos-256..pos)
+    S->>S: remove middle, compact
+    S-->>G: current_pos = 260
+```
+
 ---
 
 ## 7. QcfMetric / QcfConfig

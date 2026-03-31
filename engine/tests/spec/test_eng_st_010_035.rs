@@ -270,7 +270,7 @@ fn test_eng_st_033_kv_evict_sliding_creates_plan() {
 }
 
 #[test]
-fn test_eng_st_033_kv_streaming_rejected() {
+fn test_eng_st_033_kv_streaming_ok() {
     let (mut executor, tx, rx) = make_executor();
     send_directive(
         &tx,
@@ -281,12 +281,22 @@ fn test_eng_st_033_kv_streaming_rejected() {
         }],
     );
     let plan = executor.poll(&empty_snap());
-    assert!(plan.evict.is_none());
+    let evict = plan.evict.expect("KvStreaming은 evict plan을 생성해야 함");
+    assert_eq!(evict.method, EvictMethod::Streaming);
+    assert!((evict.target_ratio - 0.0).abs() < f32::EPSILON);
+    let params = evict.streaming_params.expect("streaming_params 있어야 함");
+    assert_eq!(params.sink_size, 4);
+    assert_eq!(params.window_size, 256);
+    assert!(
+        executor
+            .active_actions()
+            .contains(&"kv_evict_streaming".to_string())
+    );
 
     let resp = rx.recv().unwrap();
     match resp {
         EngineMessage::Response(r) => {
-            assert!(matches!(r.results[0], CommandResult::Rejected { .. }));
+            assert!(matches!(r.results[0], CommandResult::Ok));
         }
         _ => panic!("Expected Response"),
     }

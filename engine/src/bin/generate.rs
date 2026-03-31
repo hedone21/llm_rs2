@@ -907,6 +907,9 @@ fn main() -> anyhow::Result<()> {
             actual_protected_prefix,
         )),
     );
+    // Note: Streaming policy is NOT pre-registered because its parameters
+    // (sink_size, window_size) come from the Manager directive at runtime.
+    // It is instantiated on-demand in the eviction dispatch below.
 
     // Parse QCF mode
     let qcf_mode = match args.qcf_mode.as_str() {
@@ -1958,13 +1961,31 @@ fn main() -> anyhow::Result<()> {
                         llm_rs2::core::cache_manager::ScoreContext::None
                     };
 
-                    // Manager already decided to evict — always execute via named policy
-                    let result = cache_manager.force_evict_by_policy(
-                        evict.method,
-                        &mut kv_caches,
-                        effective_ratio,
-                        scores,
-                    );
+                    // Manager already decided to evict — execute via named policy
+                    // StreamingLLM uses on-demand instantiation (params from directive)
+                    let result = if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
+                        use llm_rs2::core::eviction::StreamingLLMPolicy;
+                        if let Some(ref sp) = evict.streaming_params {
+                            let policy = StreamingLLMPolicy::new(sp.sink_size, sp.window_size);
+                            cache_manager.force_evict_by_policy_ref(
+                                &policy,
+                                &mut kv_caches,
+                                effective_ratio,
+                                scores,
+                            )
+                        } else {
+                            Err(anyhow::anyhow!(
+                                "KvStreaming evict plan missing streaming_params"
+                            ))
+                        }
+                    } else {
+                        cache_manager.force_evict_by_policy(
+                            evict.method,
+                            &mut kv_caches,
+                            effective_ratio,
+                            scores,
+                        )
+                    };
                     match result {
                         Ok(r) if r.evicted => {
                             eprintln!(

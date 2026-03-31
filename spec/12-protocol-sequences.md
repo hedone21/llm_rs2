@@ -807,9 +807,9 @@ t=3050ms  Monitor: MemoryPressure Warning
           }
 ```
 
-### 6.4 Rejected 처리 trace
+### 6.4 KvStreaming 정상 처리 trace
 
-Directive(KvStreaming) → Response(Rejected) → 다음 Directive에서 KvStreaming 제외
+Directive(KvStreaming) → Response(Ok) → Engine이 StreamingLLM eviction 실행
 
 ```
 t=0ms     mode=Warning
@@ -823,34 +823,51 @@ t=0ms     mode=Warning
             ]
           }
 
-t=50ms    Engine → Manager
+t=50ms    Engine: executor.rs — apply_command(KvStreaming{4, 256})
+          → plan.evict = Some(EvictPlan { Streaming, 0.0, Critical,
+              streaming_params: Some({sink_size: 4, window_size: 256}) })
+          → active_actions.insert("kv_evict_streaming")
+
+          Engine → Manager
           {
             "type": "response", "seq_id": 10,
-            "results": [
-              {
-                "status": "rejected",
-                "reason": "KvStreaming not yet implemented"
-              }
-            ]
+            "results": [{"status": "ok"}]
           }
 
-          Manager: log "Engine rejected KvStreaming: KvStreaming not yet implemented"
+t=55ms    generate.rs decode loop: plan.evict consumed
+          → StreamingLLMPolicy::new(4, 256).evict(cache, 0)
+          → sink [0..4) 유지, recent [pos-256..pos) 유지, 중간 제거
+          → current_pos = 260 (4 + 256)
+```
 
-t=1000ms  다음 process_signal()
-          needs_action=true (pressure 증가)
-          ActionSelector → [Throttle{30}] (KvStreaming 회피는 22-manager-algorithms.md 범위)
+### 6.5 Rejected 처리 trace
+
+Directive(SwitchHw) → Response(Rejected) → single backend 환경에서 거부
+
+```
+t=0ms     mode=Critical
+          ActionSelector → [SwitchHw{device: "opencl"}]
 
           Manager → Engine
           {
             "type": "directive", "seq_id": 11,
-            "commands": [{"type": "throttle", "delay_ms": 30}]
+            "commands": [
+              {"type": "switch_hw", "device": "opencl"}
+            ]
           }
 
-          Engine → Manager
+t=50ms    Engine → Manager
           {
             "type": "response", "seq_id": 11,
-            "results": [{"status": "ok"}]
+            "results": [
+              {
+                "status": "rejected",
+                "reason": "single backend"
+              }
+            ]
           }
+
+          Manager: log "Engine rejected SwitchHw: single backend"
 ```
 
 ## 7. Rationale (non-normative)

@@ -194,7 +194,7 @@ D2O (Dynamic Discriminative Operations) 정책으로 KV 캐시를 eviction한다
 
 #### MSG-035: KvStreaming
 
-StreamingLLM (attention sink + sliding window) 정책. 현재 미구현 — Engine은 `Rejected`를 반환한다.
+StreamingLLM (attention sink + sliding window) 정책. Engine은 `Ok`를 반환하고, 다음 토큰 생성 전에 sink 영역과 recent window를 유지하며 중간 토큰을 제거한다. executor.rs에서 `EvictPlan { method: Streaming, streaming_params: Some(StreamingParams { sink_size, window_size }) }`를 생성하고, generate.rs에서 `StreamingLLMPolicy`를 즉석 호출하여 실행한다.
 
 ```json
 {"type": "kv_streaming", "sink_size": 4, "window_size": 256}
@@ -399,7 +399,7 @@ JSON 예시:
   "results": [
     {"status": "ok"},
     {"status": "partial", "achieved": 0.7, "reason": "insufficient cache tokens"},
-    {"status": "rejected", "reason": "KvStreaming not yet implemented"}
+    {"status": "rejected", "reason": "single backend"}
   ]
 }
 ```
@@ -423,11 +423,11 @@ JSON 예시:
 **[MSG-082]** Rejected — `reason`은 거부 사유. *(MUST)*
 
 ```json
-{"status": "rejected", "reason": "KvStreaming not yet implemented"}
+{"status": "rejected", "reason": "single backend"}
 ```
 
 ```json
-{"status": "rejected", "reason": "single backend"}
+{"status": "rejected", "reason": "KvMergeD2o not yet implemented"}
 ```
 
 **[MSG-083]** Ok — 추가 필드 없음. *(MUST)*
@@ -660,7 +660,7 @@ D-Bus 전송 경로 전용 메시지. **Externally tagged** (serde 기본 방식
 ```json
 {"status": "ok"}
 {"status": "partial", "achieved": 0.7, "reason": "insufficient cache tokens"}
-{"status": "rejected", "reason": "KvStreaming not yet implemented"}
+{"status": "rejected", "reason": "single backend"}
 ```
 
 ### 6.4 SystemSignal 4종 JSON (D-Bus 전송 참조용)

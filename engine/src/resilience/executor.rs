@@ -41,6 +41,13 @@ pub enum EvictMethod {
     Streaming,
 }
 
+/// StreamingLLM eviction parameters (sink + window).
+#[derive(Debug, Clone)]
+pub struct StreamingParams {
+    pub sink_size: usize,
+    pub window_size: usize,
+}
+
 /// Eviction plan parameters.
 #[derive(Debug, Clone)]
 pub struct EvictPlan {
@@ -50,6 +57,8 @@ pub struct EvictPlan {
     pub level: ResourceLevel,
     /// Which eviction algorithm to use.
     pub method: EvictMethod,
+    /// StreamingLLM-specific parameters (only set when method == Streaming).
+    pub streaming_params: Option<StreamingParams>,
 }
 
 /// Snapshot of KV cache state for status reporting.
@@ -237,6 +246,7 @@ impl CommandExecutor {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
                     method: EvictMethod::H2o,
+                    streaming_params: None,
                 });
                 if !self.active_actions.contains(&"kv_evict_h2o".to_string()) {
                     self.active_actions.push("kv_evict_h2o".to_string());
@@ -248,6 +258,7 @@ impl CommandExecutor {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
                     method: EvictMethod::Sliding,
+                    streaming_params: None,
                 });
                 if !self
                     .active_actions
@@ -257,11 +268,26 @@ impl CommandExecutor {
                 }
                 CommandResult::Ok
             }
-            EngineCommand::KvStreaming { .. } => {
-                // StreamingLLM 정책은 아직 미구현 — Phase 3에서 처리 예정
-                CommandResult::Rejected {
-                    reason: "KvStreaming not yet implemented".to_string(),
+            EngineCommand::KvStreaming {
+                sink_size,
+                window_size,
+            } => {
+                plan.evict = Some(EvictPlan {
+                    target_ratio: 0.0, // StreamingLLMPolicy는 target_len 무시
+                    level: ResourceLevel::Critical,
+                    method: EvictMethod::Streaming,
+                    streaming_params: Some(StreamingParams {
+                        sink_size: *sink_size,
+                        window_size: *window_size,
+                    }),
+                });
+                if !self
+                    .active_actions
+                    .contains(&"kv_evict_streaming".to_string())
+                {
+                    self.active_actions.push("kv_evict_streaming".to_string());
                 }
+                CommandResult::Ok
             }
             EngineCommand::KvQuantDynamic { target_bits } => {
                 plan.kv_quant_bits = Some(*target_bits);
@@ -371,6 +397,7 @@ impl CommandExecutor {
         if eviction_policy != "none" {
             actions.push("kv_evict_h2o".to_string());
             actions.push("kv_evict_sliding".to_string());
+            actions.push("kv_evict_streaming".to_string());
         }
         // KV quantization: only available with KIVI cache (q2/q4/q8)
         if kv_dtype.starts_with('q') {
@@ -533,7 +560,7 @@ mod tests {
     }
 
     #[test]
-    fn test_executor_kv_streaming_rejected() {
+    fn test_executor_kv_streaming_ok() {
         let (mut executor, tx, rx) = make_executor();
 
         tx.send(ManagerMessage::Directive(EngineDirective {
@@ -547,15 +574,29 @@ mod tests {
 
         let plan = executor.poll(&empty_snap());
         assert!(
-            plan.evict.is_none(),
-            "KvStreaming은 evict plan을 생성하지 않아야 함"
+            plan.evict.is_some(),
+            "KvStreaming은 evict plan을 생성해야 함"
+        );
+        let evict = plan.evict.unwrap();
+        assert_eq!(evict.method, EvictMethod::Streaming);
+        assert!((evict.target_ratio - 0.0).abs() < f32::EPSILON);
+        assert_eq!(evict.level, ResourceLevel::Critical);
+        let params = evict
+            .streaming_params
+            .expect("streaming_params가 있어야 함");
+        assert_eq!(params.sink_size, 4);
+        assert_eq!(params.window_size, 256);
+        assert!(
+            executor
+                .active_actions()
+                .contains(&"kv_evict_streaming".to_string())
         );
 
         let resp = rx.recv().unwrap();
         match resp {
             EngineMessage::Response(r) => {
                 assert_eq!(r.seq_id, 1);
-                assert!(matches!(r.results[0], CommandResult::Rejected { .. }));
+                assert!(matches!(r.results[0], CommandResult::Ok));
             }
             _ => panic!("Expected Response"),
         }

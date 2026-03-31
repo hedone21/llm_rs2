@@ -177,7 +177,7 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 | KvQuantDynamic | "kv_quant_dynamic" 추가 |
 | RestoreDefaults | `active_actions.clear()` |
 | Resume | 초기화하지 않음 (compute_level/memory_level만 리셋) |
-| KvStreaming | **Rejected** -- active_actions 변경 없음 |
+| KvStreaming | "kv_evict_streaming" 추가 |
 | SwitchHw, PrepareComputeUnit, Suspend | active_actions 변경 없음 |
 
 **[ENG-ST-032]** available_actions 계산 규칙: *(MUST)*
@@ -185,7 +185,7 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 매 Heartbeat 전송 시 `compute_available_actions(eviction_policy, kv_dtype)` 호출:
 
 - 기본: `["throttle", "switch_hw", "layer_skip"]`
-- `eviction_policy != "none"` 이면: `+ ["kv_evict_h2o", "kv_evict_sliding"]`
+- `eviction_policy != "none"` 이면: `+ ["kv_evict_h2o", "kv_evict_sliding", "kv_evict_streaming"]`
 - `kv_dtype.starts_with('q')` 이면: `+ ["kv_quant_dynamic"]`
 
 **[ENG-ST-033]** EngineCommand 처리 결과 상태 전이 -- 13종 전수 열거: *(MUST)*
@@ -197,7 +197,7 @@ D-Bus 경로에서 Emergency level signal 수신 시:
 | KvEvictH2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { H2o, ratio, Critical }) | Ok |
 | KvEvictSliding { keep_ratio } | -- | plan.evict = Some(EvictPlan { Sliding, ratio, Critical }) | Ok |
 | KvMergeD2o { keep_ratio } | -- | plan.evict = Some(EvictPlan { D2o, ratio, Critical }) | Ok (미구현: 향후 추가) |
-| KvStreaming { .. } | -- | (plan 변경 없음) | Rejected("KvStreaming not yet implemented") |
+| KvStreaming { sink_size, window_size } | -- | plan.evict = Some(EvictPlan { Streaming, 0.0, Critical, streaming_params: Some(StreamingParams { sink_size, window_size }) }) | Ok |
 | KvQuantDynamic { target_bits } | -- | plan.kv_quant_bits = Some(bits) | Ok |
 | RequestQcf | -- | plan.request_qcf = true | Ok (QcfEstimate를 별도 EngineMessage로 전송, SEQ-095~098) |
 | RestoreDefaults | throttle=0, compute/memory=Normal, active_actions=[] | plan.restore_defaults = true, plan.throttle_delay_ms = 0 | Ok |
@@ -254,11 +254,14 @@ function poll(kv_snap: &KVSnapshot) -> ExecutionPlan:
 
 | 필드 | 타입 | 설명 |
 |------|------|------|
-| target_ratio | f32 | 유지할 캐시 비율 (0.0~1.0) |
+| target_ratio | f32 | 유지할 캐시 비율 (0.0~1.0). Streaming에서는 0.0 (사용되지 않음) |
 | level | ResourceLevel | 리소스 레벨 (현재 항상 Critical) |
 | method | EvictMethod | H2o, Sliding, Streaming |
+| streaming_params | Option\<StreamingParams\> | Streaming 전용. sink_size + window_size. 나머지 method에서는 None |
 
 EvictMethod 변종: `H2o`, `Sliding`, `Streaming`. Engine 내부 타입이며 shared 프로토콜에 포함되지 않는다.
+
+StreamingParams: `struct { sink_size: usize, window_size: usize }`. Streaming eviction의 파라미터를 전달한다.
 
 **[ENG-ST-042]** 수명 규칙: *(MUST)*
 

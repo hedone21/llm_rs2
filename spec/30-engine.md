@@ -141,7 +141,7 @@ EvictionPolicy 구현체 5종:
 > | Throttle | `plan.throttle_delay_ms` -- 토큰 간 sleep |
 > | KvEvictH2o | `EvictMethod::H2o` -- `CacheManager::force_evict_by_policy()` |
 > | KvEvictSliding | `EvictMethod::Sliding` -- `CacheManager::force_evict_by_policy()` |
-> | KvStreaming | **프로토콜 정의 완료, Engine 실행 미구현** -- `CommandResult::Rejected` 반환 |
+> | KvStreaming | `EvictMethod::Streaming` -- `StreamingLLMPolicy::new(sink_size, window_size).evict()` 즉석 호출. `ActionId::KvEvictStreaming` 등록. C4/C5/C7과 eviction 배타 그룹 |
 > | KvQuantDynamic | `plan.kv_quant_bits` -- KIVI 경로에서 소비 |
 > | KvMergeD2o | **스펙 전용. 코드 미등록, 미구현** |
 > | LayerSkip | `plan.layer_skip` -- SkipConfig 갱신 |

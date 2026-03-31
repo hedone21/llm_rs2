@@ -395,10 +395,11 @@ fn test_resilience_layer_skip() {
     assert_eq!(plan.layer_skip, Some(0.25));
 }
 
-// ── Test: KvStreaming is rejected ─────────────────────────
+// ── Test: KvStreaming produces EvictPlan ──────────────────
 
 #[test]
-fn test_resilience_kv_streaming_rejected() {
+fn test_resilience_kv_streaming_ok() {
+    use llm_rs2::resilience::EvictMethod;
     use llm_shared::CommandResult;
 
     let (mut executor, tx, rx) = make_executor();
@@ -413,16 +414,17 @@ fn test_resilience_kv_streaming_rejected() {
     );
 
     let plan = executor.poll(&empty_snap());
-    assert!(
-        plan.evict.is_none(),
-        "KvStreaming은 evict plan을 생성하지 않아야 함"
-    );
+    let evict = plan.evict.expect("KvStreaming은 evict plan을 생성해야 함");
+    assert_eq!(evict.method, EvictMethod::Streaming);
+    let params = evict.streaming_params.expect("streaming_params 있어야 함");
+    assert_eq!(params.sink_size, 4);
+    assert_eq!(params.window_size, 256);
 
     let resp = rx.recv().unwrap();
     match resp {
         EngineMessage::Response(r) => {
             assert_eq!(r.seq_id, 1);
-            assert!(matches!(r.results[0], CommandResult::Rejected { .. }));
+            assert!(matches!(r.results[0], CommandResult::Ok));
         }
         _ => panic!("Expected Response"),
     }

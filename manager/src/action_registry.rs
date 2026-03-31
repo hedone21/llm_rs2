@@ -124,6 +124,11 @@ fn default_param_range(id: ActionId) -> Option<ParamRange> {
             min: 0.3,
             max: 0.9,
         }),
+        ActionId::KvEvictStreaming => Some(ParamRange {
+            param_name: "window_size".into(),
+            min: 64.0,
+            max: 2048.0,
+        }),
         ActionId::KvQuantDynamic => Some(ParamRange {
             param_name: "target_bits".into(),
             min: 4.0,

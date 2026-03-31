@@ -398,13 +398,12 @@ fn test_inv_025_results_len_reconfirm() {
     }
 }
 
-/// Rejected 명령이 포함되어도 results 길이는 commands 길이와 같아야 한다.
+/// 다양한 명령을 혼합해도 results 길이는 commands 길이와 같아야 한다.
 #[test]
-fn test_inv_024_rejected_commands_still_counted() {
+fn test_inv_024_all_commands_counted() {
     let (mut executor, tx, rx) = helpers::make_executor();
     let snap = helpers::empty_snap();
 
-    // KvStreaming은 현재 Rejected로 처리됨
     helpers::send_directive(
         &tx,
         1,
@@ -426,11 +425,11 @@ fn test_inv_024_rejected_commands_still_counted() {
             assert_eq!(
                 resp.results.len(),
                 3,
-                "INV-024: Rejected 포함해도 results.len() == commands.len()"
+                "INV-024: results.len() == commands.len()"
             );
-            // 첫 번째는 Ok, 두 번째는 Rejected, 세 번째는 Ok
+            // 모든 명령이 Ok
             assert!(matches!(resp.results[0], CommandResult::Ok));
-            assert!(matches!(resp.results[1], CommandResult::Rejected { .. }));
+            assert!(matches!(resp.results[1], CommandResult::Ok));
             assert!(matches!(resp.results[2], CommandResult::Ok));
         }
         _ => panic!("Expected Response"),

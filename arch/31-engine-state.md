@@ -174,7 +174,7 @@ flowchart TD
 | `LayerSkip { skip_ratio }` | `layer_skip = Some(ratio)` | Ok | active_actions: "layer_skip" 추가 |
 | `KvEvictH2o { keep_ratio }` | `evict = Some(EvictPlan { H2o, ratio, Critical })` | Ok | active_actions: "kv_evict_h2o" 추가 |
 | `KvEvictSliding { keep_ratio }` | `evict = Some(EvictPlan { Sliding, ratio, Critical })` | Ok | active_actions: "kv_evict_sliding" 추가 |
-| `KvStreaming { .. }` | (변경 없음) | Rejected | 미구현 |
+| `KvStreaming { sink_size, window_size }` | `evict = Some(EvictPlan { Streaming, 0.0, Critical, streaming_params: Some({sink_size, window_size}) })` | Ok | active_actions: "kv_evict_streaming" 추가 |
 | `KvQuantDynamic { target_bits }` | `kv_quant_bits = Some(bits)` | Ok | active_actions: "kv_quant_dynamic" 추가 |
 | `RestoreDefaults` | `restore_defaults = true, throttle_delay_ms = 0` | Ok | active_actions.clear(), levels→Normal |
 | `SwitchHw { device }` | `switch_device = Some(device)` | Ok | -- |
@@ -236,9 +236,15 @@ pub struct ExecutionPlan {
 }
 
 pub struct EvictPlan {
-    pub target_ratio: f32,             // 0.0~1.0
+    pub target_ratio: f32,             // 0.0~1.0 (Streaming에서는 0.0)
     pub level: ResourceLevel,          // 항상 Critical
     pub method: EvictMethod,
+    pub streaming_params: Option<StreamingParams>,  // Streaming 전용
+}
+
+pub struct StreamingParams {
+    pub sink_size: usize,              // attention sink 토큰 수
+    pub window_size: usize,            // recent window 크기
 }
 
 pub enum EvictMethod { H2o, Sliding, Streaming }
@@ -246,7 +252,7 @@ pub enum EvictMethod { H2o, Sliding, Streaming }
 
 ### 4.3 소비 순서 (generate.rs decode loop)
 
-1. `evict` → CacheManager 실행
+1. `evict` → method별 분기: H2o/Sliding은 CacheManager 실행, Streaming은 `StreamingLLMPolicy::new(params.sink_size, params.window_size).evict()` 즉석 호출
 2. `switch_device` → Backend 전환
 3. `prepare_device` → Backend pre-warm
 4. `kv_quant_bits` → KIVI transition_bits()

@@ -8,7 +8,9 @@ pub mod transport;
 #[cfg(feature = "resilience")]
 pub mod dbus_transport;
 
-pub use executor::{CommandExecutor, EvictMethod, EvictPlan, ExecutionPlan, KVSnapshot};
+pub use executor::{
+    CommandExecutor, EvictMethod, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams,
+};
 pub use manager::{InferenceContext, ResilienceManager, execute_action};
 pub use signal::{
     CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineDirective,

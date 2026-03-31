@@ -296,10 +296,18 @@
 | `target_ratio` | f32 | 0.0-1.0 | 보존 비율 |
 | `level` | ResourceLevel | - | Warning = lossless only, Critical = lossy OK |
 | `method` | EvictMethod | - | H2o, Sliding, Streaming |
+| `streaming_params` | Option\<StreamingParams\> | - | Streaming 전용 파라미터. 나머지 method에서는 None |
 
 **EvictMethod**: `enum { H2o, Sliding, Streaming }`
 
-- `Streaming`: 프로토콜 정의 완료, Engine 실행 미구현 (Rejected 반환)
+- `Streaming`: StreamingLLM 정책 실행. `streaming_params`에서 sink_size, window_size를 추출하여 `StreamingLLMPolicy::new(sink_size, window_size).evict()` 호출
+
+**StreamingParams**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `sink_size` | usize | Attention sink 토큰 수 (시퀀스 선두 유지) |
+| `window_size` | usize | Recent window 크기 (시퀀스 후미 유지) |
 
 **KVSnapshot**:
 
@@ -626,7 +634,7 @@
 
 **[ENG-DAT-C04]** KVLayout 변경은 KV 캐시 재생성을 요구한다. 런타임 layout 전환은 지원하지 않는다. *(MUST NOT)*
 
-**[ENG-DAT-C05]** EvictMethod::Streaming은 프로토콜에만 정의되어 있으며, Engine 실행 시 Rejected를 반환한다. *(MUST)*
+**[ENG-DAT-C05]** ~~(폐기)~~ EvictMethod::Streaming은 구현 완료되었다. executor.rs에서 `KvStreaming` 수신 시 `EvictPlan { method: Streaming, streaming_params: Some(StreamingParams { sink_size, window_size }), target_ratio: 0.0, pressure_level: Critical }`을 생성하고 `CommandResult::Ok`를 반환한다. generate.rs에서 `StreamingLLMPolicy::new(sink_size, window_size).evict()` 즉석 호출로 실행한다. *(MUST)*
 
 **[ENG-DAT-C06]** QcfMetric의 `action` 필드 값은 이 스펙에 명시된 9종 문자열 중 하나여야 한다. *(MUST)*
 

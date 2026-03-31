@@ -45,6 +45,10 @@ mod test_eng_st_032;
 #[path = "spec/test_proto_042_073.rs"]
 mod test_proto_042_073;
 
+// ── Data / Protocol path 테스트 ──
+#[path = "spec/test_eng_dat_c05_streaming.rs"]
+mod test_eng_dat_c05_streaming;
+
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;

@@ -607,6 +607,14 @@ fn action_to_engine_command(cmd: &ActionCommand) -> Option<EngineCommand> {
             let keep_ratio = params.values.get("keep_ratio").copied().unwrap_or(0.5);
             Some(EngineCommand::KvEvictH2o { keep_ratio })
         }
+        (ActionId::KvEvictStreaming, Operation::Apply(params)) => {
+            let sink_size = params.values.get("sink_size").copied().unwrap_or(4.0) as usize;
+            let window_size = params.values.get("window_size").copied().unwrap_or(256.0) as usize;
+            Some(EngineCommand::KvStreaming {
+                sink_size,
+                window_size,
+            })
+        }
         (ActionId::KvOffloadDisk, Operation::Apply(_)) => {
             // KvOffloadDisk은 fallback으로 sliding window eviction 사용
             Some(EngineCommand::KvEvictSliding { keep_ratio: 0.8 })

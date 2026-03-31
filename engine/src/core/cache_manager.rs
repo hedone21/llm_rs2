@@ -464,6 +464,34 @@ impl CacheManager {
         Ok(result)
     }
 
+    /// Force eviction using a caller-provided policy reference.
+    ///
+    /// Like `force_evict_by_policy()` but takes a `&dyn EvictionPolicy` directly
+    /// instead of looking up a registered policy by method. Useful for policies
+    /// whose parameters are determined at runtime (e.g. StreamingLLM).
+    pub fn force_evict_by_policy_ref(
+        &self,
+        policy: &dyn EvictionPolicy,
+        caches: &mut [KVCache],
+        target_ratio: f32,
+        scores: ScoreContext,
+    ) -> Result<EvictionResult> {
+        let result = Self::run_policy_eviction(policy, caches, target_ratio, scores)?;
+
+        if result.evicted {
+            for cache in caches.iter_mut() {
+                cache.release_unused_pages();
+            }
+            self.event_sink.emit(CacheEvent::EvictionCompleted {
+                policy: policy.name().to_string(),
+                tokens_removed: result.tokens_removed,
+                new_pos: result.new_pos,
+            });
+        }
+
+        Ok(result)
+    }
+
     /// Shared eviction logic: compute target_len, dispatch to policy methods.
     /// Used by both `force_evict_by_policy()` and can be reused by EvictionHandler.
     fn run_policy_eviction(

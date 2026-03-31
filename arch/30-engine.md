@@ -442,9 +442,15 @@ pub struct ExecutionPlan {
 }
 
 pub struct EvictPlan {
-    pub target_ratio: f32,                  // 0.0-1.0
+    pub target_ratio: f32,                  // 0.0-1.0 (Streaming에서는 0.0)
     pub level: ResourceLevel,
     pub method: EvictMethod,                // H2o | Sliding | Streaming
+    pub streaming_params: Option<StreamingParams>,  // Streaming 전용
+}
+
+pub struct StreamingParams {
+    pub sink_size: usize,                   // attention sink 토큰 수
+    pub window_size: usize,                 // recent window 크기
 }
 
 pub enum EvictMethod { H2o, Sliding, Streaming }
@@ -522,7 +528,7 @@ sequenceDiagram
 | LayerSkip { skip_ratio } | `layer_skip = Some(ratio)` | active_actions에 "layer_skip" |
 | KvEvictH2o { keep_ratio } | `evict = Some(EvictPlan{H2o, ratio, Critical})` | |
 | KvEvictSliding { keep_ratio } | `evict = Some(EvictPlan{Sliding, ratio, Critical})` | |
-| KvStreaming { .. } | (무시) | `CommandResult::Rejected` 반환 |
+| KvStreaming { sink_size, window_size } | `evict = Some(EvictPlan{Streaming, 0.0, Critical, streaming_params: Some({sink_size, window_size})})` | active_actions에 "kv_evict_streaming" 추가 |
 | KvQuantDynamic { target_bits } | `kv_quant_bits = Some(bits)` | KIVI 경로에서 소비 |
 | RestoreDefaults | `restore_defaults = true` | 모든 active_actions 초기화 |
 | SwitchHw { device } | `switch_device = Some(device)` | 후행 명령이 선행을 덮어씀 |
@@ -752,7 +758,7 @@ sequenceDiagram
 | Throttle | `throttle_delay_ms` | `generate.rs` — 토큰 간 `thread::sleep` | 구현 완료 |
 | KvEvictH2o | `evict` (H2o) | `CacheManager::force_evict_by_policy(EvictMethod::H2o, ...)` | 구현 완료 |
 | KvEvictSliding | `evict` (Sliding) | `CacheManager::force_evict_by_policy(EvictMethod::Sliding, ...)` | 구현 완료 |
-| KvStreaming | (미매핑) | `CommandResult::Rejected` 반환 | 프로토콜만 정의 |
+| KvStreaming | `evict` (Streaming) | `StreamingLLMPolicy::new(sink_size, window_size).evict()` 즉석 호출 | 구현 완료 |
 | KvQuantDynamic | `kv_quant_bits` | KIVI 경로에서 양자화 비트 갱신 | 구현 완료 |
 | KvMergeD2o | (미매핑) | -- | 스펙 전용, 미구현 |
 | LayerSkip | `layer_skip` | `generate.rs` — SkipConfig 갱신 | 구현 완료 |

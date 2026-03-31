@@ -136,7 +136,7 @@ pub struct ExecutionPlan {
 | `LayerSkip` | `layer_skip` | Ok |
 | `KvEvictH2o` | `evict` (EvictPlan, method=H2o) | Ok |
 | `KvEvictSliding` | `evict` (EvictPlan, method=Sliding) | Ok |
-| `KvStreaming` | — | **Rejected** ("not yet implemented") |
+| `KvStreaming` | `evict` (EvictPlan, method=Streaming, streaming_params=Some) | Ok |
 | `KvQuantDynamic` | `kv_quant_bits` | Ok |
 | `RequestQcf` | `request_qcf` (generate.rs에서 QCF 계산 후 QcfEstimate 전송) | Ok |
 | `RestoreDefaults` | `restore_defaults`, 전체 리셋 | Ok |
@@ -321,4 +321,4 @@ CON-020 (필드명 불변), CON-021 (하위 호환 확장), INV-027 (serde = wir
 |------|------|------|------|
 | ~~QcfEstimate 메시지~~ | ~~MSG-085~087~~ | ~~미정의~~ | **구현 완료** |
 | EngineMessage 변형 수 | 4종 | 4종 (Capability, Heartbeat, Response, QcfEstimate) | 일치 |
-| KvStreaming 실행 | 정상 처리 기대 | `Rejected` 반환 | "not yet implemented" |
+| ~~KvStreaming 실행~~ | ~~정상 처리 기대~~ | ~~`Rejected` 반환~~ | **해소됨** — 구현 완료, Ok 반환 |

@@ -179,6 +179,41 @@ function d2o_evict(cache, target_len, importance[], config):
 
 ---
 
+#### 3.1.4 StreamingLLM Eviction [ENG-ALG-013]
+
+**[ENG-ALG-013]** StreamingLLM Eviction은 attention sink (시퀀스 선두 토큰)과 recent window (시퀀스 후미 토큰)를 유지하고 중간 토큰을 제거한다. target_len 파라미터를 사용하지 않으며, sink_size + window_size로 유지할 범위가 결정된다. *(MUST)*
+
+**알고리즘**:
+
+```
+function streaming_evict(cache, sink_size, window_size):
+    keep_len = sink_size + window_size
+    if current_pos <= keep_len:
+        return  // 제거할 토큰 없음
+
+    // sink 영역: positions [0, sink_size)  — 유지
+    // 제거 영역: positions [sink_size, current_pos - window_size)
+    // recent 영역: positions [current_pos - window_size, current_pos)  — 유지
+
+    remove_start = sink_size
+    remove_end = current_pos - window_size
+    remove_count = remove_end - remove_start
+
+    // recent window를 sink 바로 뒤로 이동
+    cache.shift_positions(remove_end, remove_start, window_size)
+    cache.set_current_pos(keep_len)
+```
+
+**불변식**:
+
+- eviction 후 `current_pos = sink_size + window_size`
+- positions [0, sink_size)는 항상 보존 (attention sink)
+- positions [sink_size, sink_size + window_size)는 eviction 전 가장 최근 window_size개 토큰
+
+**프로토콜 경로**: Manager가 `KvStreaming { sink_size, window_size }` EngineCommand를 전송하면, executor.rs에서 `EvictPlan { method: Streaming, streaming_params: Some(StreamingParams { sink_size, window_size }), target_ratio: 0.0, pressure_level: Critical }`을 생성한다. generate.rs의 eviction 분기에서 `StreamingLLMPolicy::new(sink_size, window_size).evict(cache, 0)` 즉석 호출로 실행한다 (target_len은 무시됨).
+
+---
+
 ### 3.2 KV Cache Quantization (KIVI)
 
 #### 3.2.1 Residual Buffer + Flush Cycle [ENG-ALG-020]
@@ -842,11 +877,16 @@ function per_token_checkpoint(executor, caches, model_state):
 
     // 2. Eviction
     if plan.evict is Some(evict_plan):
-        target_len = floor(current_pos * evict_plan.target_ratio)
         match evict_plan.method:
-            H2o -> evict_with_scores(cache, target_len, importance)
-            Sliding -> evict(cache, target_len)
-            Streaming -> rejected (미구현)
+            H2o ->
+                target_len = floor(current_pos * evict_plan.target_ratio)
+                evict_with_scores(cache, target_len, importance)
+            Sliding ->
+                target_len = floor(current_pos * evict_plan.target_ratio)
+                evict(cache, target_len)
+            Streaming ->
+                params = evict_plan.streaming_params.unwrap()
+                streaming_evict(cache, params.sink_size, params.window_size)
 
     // 3. Device switch
     if plan.switch_device is Some(device):

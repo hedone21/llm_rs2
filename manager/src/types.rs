@@ -10,6 +10,7 @@ pub enum ActionId {
     KvOffloadDisk,
     KvEvictSliding,
     KvEvictH2o,
+    KvEvictStreaming,
     KvQuantDynamic,
     LayerSkip,
 }
@@ -24,6 +25,7 @@ impl ActionId {
             "kv_offload_disk" => Some(ActionId::KvOffloadDisk),
             "kv_evict_sliding" => Some(ActionId::KvEvictSliding),
             "kv_evict_h2o" => Some(ActionId::KvEvictH2o),
+            "kv_evict_streaming" => Some(ActionId::KvEvictStreaming),
             "kv_quant_dynamic" => Some(ActionId::KvQuantDynamic),
             "layer_skip" => Some(ActionId::LayerSkip),
             _ => None,
@@ -38,6 +40,7 @@ impl ActionId {
             ActionId::KvOffloadDisk,
             ActionId::KvEvictSliding,
             ActionId::KvEvictH2o,
+            ActionId::KvEvictStreaming,
             ActionId::KvQuantDynamic,
             ActionId::LayerSkip,
         ]
@@ -50,6 +53,7 @@ impl ActionId {
             ActionId::KvOffloadDisk
             | ActionId::KvEvictSliding
             | ActionId::KvEvictH2o
+            | ActionId::KvEvictStreaming
             | ActionId::KvQuantDynamic => Domain::Memory,
         }
     }

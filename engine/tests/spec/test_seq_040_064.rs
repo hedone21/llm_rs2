@@ -230,11 +230,13 @@ fn test_seq_suspend_resume_full_cycle() {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// SEQ-048: Rejected command (KvStreaming)
+// SEQ-048: KvStreaming command → Ok + EvictPlan
 // ═══════════════════════════════════════════════════════════════
 
 #[test]
-fn test_seq_048_rejected_command() {
+fn test_seq_048_kv_streaming_ok() {
+    use llm_rs2::resilience::EvictMethod;
+
     let (mut executor, tx, resp_rx) = make_executor();
 
     send_directive(
@@ -247,18 +249,21 @@ fn test_seq_048_rejected_command() {
     );
 
     let plan = executor.poll(&empty_snap());
-    assert!(
-        plan.evict.is_none(),
-        "KvStreaming은 evict plan을 생성하지 않아야 함"
-    );
+    let evict = plan.evict.expect("KvStreaming은 evict plan을 생성해야 함");
+    assert_eq!(evict.method, EvictMethod::Streaming);
+    let params = evict
+        .streaming_params
+        .expect("streaming_params가 있어야 함");
+    assert_eq!(params.sink_size, 4);
+    assert_eq!(params.window_size, 256);
 
     let msg = resp_rx.recv().unwrap();
     match msg {
         EngineMessage::Response(r) => {
             assert_eq!(r.seq_id, 1);
             assert!(
-                matches!(r.results[0], CommandResult::Rejected { .. }),
-                "KvStreaming은 Rejected여야 함"
+                matches!(r.results[0], CommandResult::Ok),
+                "KvStreaming은 Ok여야 함"
             );
         }
         other => panic!("Response를 기대했으나 {:?} 수신", other),
