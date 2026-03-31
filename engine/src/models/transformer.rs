@@ -59,12 +59,18 @@ fn release_source_pages(data: &[u8]) {
 pub struct TransformerModel {
     pub config: ModelConfig,
     pub layers: Vec<TransformerLayer>,
-    /// embed_tokens is always kept on CPU to save GPU memory (llama.cpp strategy).
-    /// gather is performed on CPU, then the result is uploaded to the GPU x-buffer.
+    /// embed_tokens is always kept on CPU for model loading.
+    /// When the main backend is GPU, `gpu_embed_tokens` holds a device-side copy
+    /// so that `gather_embed` can run entirely on the GPU without CPU round-trips.
     pub embed_tokens: Tensor,
     pub norm: Tensor,
     /// lm_head is on the device backend (GPU or CPU).
     pub lm_head: Tensor,
+    /// GPU-side copy of embed_tokens for zero-sync gather on GPU backends.
+    /// - Tied weights: shares the same GPU buffer as `lm_head` (zero extra memory).
+    /// - Untied weights: a separate GPU copy uploaded once at load time.
+    /// - CPU backend: None (unnecessary, gather runs on CPU directly).
+    gpu_embed_tokens: Option<Tensor>,
     /// CPU backend used for embed_tokens gather when the main backend is GPU.
     /// None when the main backend is already CPU.
     cpu_backend: Option<Arc<dyn Backend>>,
@@ -634,12 +640,27 @@ impl TransformerModel {
             Some(cpu_backend as Arc<dyn Backend>)
         };
 
+        // GPU-side embed_tokens for zero-sync gather during decode.
+        // Tied weights: lm_head IS the GPU copy of embed_tokens — reuse it (0 extra memory).
+        // Untied weights + GPU backend: upload embed_tokens to GPU once.
+        // CPU backend: None (gather runs on CPU directly).
+        let gpu_embed_tokens = if is_cpu {
+            None
+        } else if !has_lm_head {
+            // Tied weights: lm_head already holds the GPU copy of embed_tokens.
+            Some(lm_head.clone())
+        } else {
+            // Untied weights: upload a separate GPU copy.
+            Some(backend.copy_from(&embed_tokens)?)
+        };
+
         Ok(Self {
             config,
             layers,
             embed_tokens,
             norm,
             lm_head,
+            gpu_embed_tokens,
             cpu_backend: stored_cpu_backend,
             preload_pool: std::sync::Mutex::new(None),
         })
@@ -1381,8 +1402,13 @@ impl TransformerModel {
         dst: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<()> {
-        if let Some(ref cpu_be) = self.cpu_backend {
-            // GPU path: indices may be on GPU — read them to a CPU buffer first
+        if let Some(ref gpu_embed) = self.gpu_embed_tokens {
+            // GPU-direct path: both embed table and indices are on GPU.
+            // Single kernel launch, no CPU round-trip or blocking sync.
+            backend.gather(gpu_embed, input_tokens, dst)
+        } else if let Some(ref cpu_be) = self.cpu_backend {
+            // Fallback GPU path (gpu_embed_tokens not available):
+            // indices may be on GPU — read them to a CPU buffer first.
             let num_tokens = input_tokens.size() / 4; // u32 elements
             let hidden_size = self.config.hidden_size;
             let galloc = crate::memory::galloc::Galloc::new();
@@ -1522,7 +1548,8 @@ mod tests {
             embed_tokens,
             norm,
             lm_head,
-            cpu_backend: None, // CPU-only model
+            gpu_embed_tokens: None, // CPU-only model
+            cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
         };
         (model, cpu_be)
@@ -1665,6 +1692,7 @@ mod tests {
             embed_tokens,
             norm,
             lm_head,
+            gpu_embed_tokens: None,
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
         };
@@ -1704,5 +1732,190 @@ mod tests {
 
         let got = unsafe { std::slice::from_raw_parts(t.as_ptr(), 8) };
         assert_eq!(got, src.as_slice());
+    }
+
+    #[test]
+    fn test_gather_embed_gpu_direct_path() {
+        // When gpu_embed_tokens is Some, gather_embed should use it directly
+        // (simulated with CPU backend acting as the "GPU" backend).
+        let vocab = 8usize;
+        let dim = 4usize;
+        let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+
+        // Build embed table on "CPU" side
+        let buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
+        {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, vocab * dim)
+            };
+            for r in 0..vocab {
+                for c in 0..dim {
+                    slice[r * dim + c] = r as f32;
+                }
+            }
+        }
+        let embed_tokens = Tensor::new(Shape::new(vec![vocab, dim]), buf, cpu_be.clone());
+
+        // Build "GPU" embed table (same data, simulates GPU copy)
+        let gpu_buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
+        {
+            let src = unsafe {
+                std::slice::from_raw_parts(embed_tokens.as_ptr() as *const u8, vocab * dim * 4)
+            };
+            let dst =
+                unsafe { std::slice::from_raw_parts_mut(gpu_buf.as_mut_ptr(), vocab * dim * 4) };
+            dst.copy_from_slice(src);
+        }
+        let gpu_embed = Tensor::new(Shape::new(vec![vocab, dim]), gpu_buf, cpu_be.clone());
+
+        let norm_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        let norm = Tensor::new(Shape::new(vec![dim]), norm_buf, cpu_be.clone());
+        let lm_head = norm.clone();
+
+        let config = ModelConfig {
+            vocab_size: vocab,
+            hidden_size: dim,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            head_dim: dim,
+            has_qkv_bias: false,
+            tie_word_embeddings: true,
+            eos_token_id: 2,
+            arch: crate::models::config::ModelArch::Llama,
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+        };
+
+        let model = TransformerModel {
+            config,
+            layers: vec![],
+            embed_tokens,
+            norm,
+            lm_head,
+            gpu_embed_tokens: Some(gpu_embed),
+            cpu_backend: None,
+            preload_pool: std::sync::Mutex::new(None),
+        };
+
+        // Gather tokens [1, 6]
+        let idx_buf = mem.alloc(2 * 4, DType::F32).unwrap();
+        let idx_slice =
+            unsafe { std::slice::from_raw_parts_mut(idx_buf.as_mut_ptr() as *mut u32, 2) };
+        idx_slice[0] = 1;
+        idx_slice[1] = 6;
+        let indices = Tensor::new(Shape::new(vec![1, 2]), idx_buf, cpu_be.clone());
+
+        let dst_buf = mem.alloc(2 * dim * 4, DType::F32).unwrap();
+        let mut dst = Tensor::new(Shape::new(vec![1, 2, dim]), dst_buf, cpu_be.clone());
+
+        model.gather_embed(&indices, &mut dst, &cpu_be).unwrap();
+
+        let result = unsafe { std::slice::from_raw_parts(dst.as_ptr() as *const f32, 2 * dim) };
+        for v in &result[..dim] {
+            assert_eq!(*v, 1.0, "row 1 mismatch");
+        }
+        for v in &result[dim..] {
+            assert_eq!(*v, 6.0, "row 6 mismatch");
+        }
+    }
+
+    #[test]
+    fn test_gather_embed_gpu_path_takes_priority_over_cpu_fallback() {
+        // When both gpu_embed_tokens and cpu_backend are set,
+        // the GPU-direct path should take priority.
+        let vocab = 4usize;
+        let dim = 2usize;
+        let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+
+        // CPU embed table: row i = [i as f32; dim]
+        let buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
+        {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut f32, vocab * dim)
+            };
+            for r in 0..vocab {
+                for c in 0..dim {
+                    slice[r * dim + c] = r as f32;
+                }
+            }
+        }
+        let embed_tokens = Tensor::new(Shape::new(vec![vocab, dim]), buf, cpu_be.clone());
+
+        // "GPU" embed table: row i = [(i + 100) as f32; dim]
+        // Different values to prove the GPU path is used, not the CPU fallback.
+        let gpu_buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
+        {
+            let slice = unsafe {
+                std::slice::from_raw_parts_mut(gpu_buf.as_mut_ptr() as *mut f32, vocab * dim)
+            };
+            for r in 0..vocab {
+                for c in 0..dim {
+                    slice[r * dim + c] = (r + 100) as f32;
+                }
+            }
+        }
+        let gpu_embed = Tensor::new(Shape::new(vec![vocab, dim]), gpu_buf, cpu_be.clone());
+
+        let norm_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        let norm = Tensor::new(Shape::new(vec![dim]), norm_buf, cpu_be.clone());
+        let lm_head = norm.clone();
+
+        let config = ModelConfig {
+            vocab_size: vocab,
+            hidden_size: dim,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: dim,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            head_dim: dim,
+            has_qkv_bias: false,
+            tie_word_embeddings: true,
+            eos_token_id: 2,
+            arch: crate::models::config::ModelArch::Llama,
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+        };
+
+        let model = TransformerModel {
+            config,
+            layers: vec![],
+            embed_tokens,
+            norm,
+            lm_head,
+            gpu_embed_tokens: Some(gpu_embed),
+            cpu_backend: Some(cpu_be.clone()), // both set
+            preload_pool: std::sync::Mutex::new(None),
+        };
+
+        let idx_buf = mem.alloc(4, DType::F32).unwrap();
+        let idx_slice =
+            unsafe { std::slice::from_raw_parts_mut(idx_buf.as_mut_ptr() as *mut u32, 1) };
+        idx_slice[0] = 2;
+        let indices = Tensor::new(Shape::new(vec![1, 1]), idx_buf, cpu_be.clone());
+
+        let dst_buf = mem.alloc(dim * 4, DType::F32).unwrap();
+        let mut dst = Tensor::new(Shape::new(vec![1, 1, dim]), dst_buf, cpu_be.clone());
+
+        model.gather_embed(&indices, &mut dst, &cpu_be).unwrap();
+
+        let result = unsafe { std::slice::from_raw_parts(dst.as_ptr() as *const f32, dim) };
+        // Should get GPU values (102.0), not CPU values (2.0)
+        for v in result {
+            assert_eq!(*v, 102.0, "GPU path should take priority, expected 102.0");
+        }
     }
 }
