@@ -187,6 +187,9 @@ fn main() -> anyhow::Result<()> {
                 EngineMessage::Capability(cap) => {
                     log::info!("Engine capability: devices={:?}", cap.available_devices);
                 }
+                EngineMessage::QcfEstimate(qcf) => {
+                    log::info!("Engine QCF estimate: {} actions", qcf.estimates.len());
+                }
             }
         }
 

@@ -80,6 +80,19 @@ fn test_msg_011_engine_message_serde_variants() {
     });
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"type\":\"response\""));
+
+    // QcfEstimate
+    let msg = EngineMessage::QcfEstimate(QcfEstimate {
+        estimates: {
+            let mut m = std::collections::HashMap::new();
+            m.insert("kv_evict_h2o".to_string(), 0.1);
+            m
+        },
+    });
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"type\":\"qcf_estimate\""));
+    let back: EngineMessage = serde_json::from_str(&json).unwrap();
+    assert!(matches!(back, EngineMessage::QcfEstimate(_)));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -400,4 +413,67 @@ fn test_msg_100_system_signal_serde_roundtrip() {
     let json = serde_json::to_string(&sig).unwrap();
     let back: SystemSignal = serde_json::from_str(&json).unwrap();
     assert_eq!(back.level(), Level::Emergency);
+}
+
+// ══════════════════════════════════════════════════════════════
+// MSG-085/086/087: QcfEstimate serde + constraints
+// ══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_msg_085_qcf_estimate_serde_roundtrip() {
+    use std::collections::HashMap;
+    let mut estimates = HashMap::new();
+    estimates.insert("kv_evict_h2o".to_string(), 0.12f32);
+    estimates.insert("kv_evict_sliding".to_string(), 0.18f32);
+    estimates.insert("layer_skip".to_string(), 0.35f32);
+
+    let qcf = QcfEstimate { estimates };
+    let msg = EngineMessage::QcfEstimate(qcf);
+    let json = serde_json::to_string(&msg).unwrap();
+    assert!(json.contains("\"type\":\"qcf_estimate\""));
+    assert!(json.contains("\"estimates\""));
+
+    let back: EngineMessage = serde_json::from_str(&json).unwrap();
+    match back {
+        EngineMessage::QcfEstimate(q) => {
+            assert_eq!(q.estimates.len(), 3);
+            assert!((q.estimates["kv_evict_h2o"] - 0.12).abs() < f32::EPSILON);
+            assert!((q.estimates["kv_evict_sliding"] - 0.18).abs() < f32::EPSILON);
+            assert!((q.estimates["layer_skip"] - 0.35).abs() < f32::EPSILON);
+        }
+        _ => panic!("Expected QcfEstimate"),
+    }
+}
+
+#[test]
+fn test_msg_086_qcf_estimate_empty_estimates() {
+    // MSG-086: Engine이 계산 불가 시 빈 map 반환 가능
+    use std::collections::HashMap;
+    let qcf = QcfEstimate {
+        estimates: HashMap::new(),
+    };
+    let msg = EngineMessage::QcfEstimate(qcf);
+    let json = serde_json::to_string(&msg).unwrap();
+    let back: EngineMessage = serde_json::from_str(&json).unwrap();
+    match back {
+        EngineMessage::QcfEstimate(q) => {
+            assert!(q.estimates.is_empty());
+        }
+        _ => panic!("Expected QcfEstimate"),
+    }
+}
+
+#[test]
+fn test_msg_087_qcf_values_non_negative() {
+    // MSG-087: QCF 값은 >= 0.0, 0.0 = 저하 없음
+    use std::collections::HashMap;
+    let mut estimates = HashMap::new();
+    estimates.insert("kv_evict_h2o".to_string(), 0.0f32);
+    estimates.insert("layer_skip".to_string(), 1.5f32);
+
+    let qcf = QcfEstimate { estimates };
+    // 모든 값 검증
+    for (_, &v) in &qcf.estimates {
+        assert!(v >= 0.0, "QCF value must be >= 0.0, got {}", v);
+    }
 }

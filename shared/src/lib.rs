@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Common severity level shared by all signals.
 /// Ordered by severity: Normal < Warning < Critical < Emergency.
@@ -271,6 +272,16 @@ pub struct CommandResponse {
     pub results: Vec<CommandResult>,
 }
 
+/// QCF cost estimates from Engine (MSG-085).
+/// Sent as a separate EngineMessage after CommandResponse for RequestQcf.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QcfEstimate {
+    /// Per-lossy-action estimated quality cost.
+    /// Keys: action identifier (e.g., "kv_evict_h2o"). Values: QCF cost >= 0.0 (MSG-087).
+    /// Only actions the Engine can currently compute are included (MSG-086).
+    pub estimates: HashMap<String, f32>,
+}
+
 /// Top-level message from Engine to Manager.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -278,6 +289,7 @@ pub enum EngineMessage {
     Capability(EngineCapability),
     Heartbeat(EngineStatus),
     Response(CommandResponse),
+    QcfEstimate(QcfEstimate),
 }
 
 #[cfg(test)]
@@ -652,6 +664,19 @@ mod tests {
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"response\""));
+
+        // QcfEstimate
+        let msg = EngineMessage::QcfEstimate(QcfEstimate {
+            estimates: {
+                let mut m = HashMap::new();
+                m.insert("kv_evict_h2o".to_string(), 0.1);
+                m
+            },
+        });
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"qcf_estimate\""));
+        let back: EngineMessage = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EngineMessage::QcfEstimate(_)));
     }
 
     #[test]
