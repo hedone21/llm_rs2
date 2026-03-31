@@ -1,3 +1,208 @@
+// ── NEON-optimized score accumulation helpers ──
+
+#[cfg(target_arch = "aarch64")]
+mod neon_scores {
+    use std::arch::aarch64::*;
+
+    /// NEON-accelerated sum-across-heads + MAX for `accumulate_layer`.
+    /// Processes 4 tokens per iteration for contiguous memory access.
+    ///
+    /// # Safety
+    /// Caller must ensure `scores.len() >= (n_heads_q - 1) * stride + len`
+    /// and `step_importance.len() >= len`.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn accumulate_layer_neon(
+        step_importance: &mut [f32],
+        scores: &[f32],
+        stride: usize,
+        len: usize,
+        n_heads_q: usize,
+    ) {
+        let mut t = 0usize;
+        while t + 4 <= len {
+            // Sum across all Q-heads for 4 consecutive tokens
+            let mut sum_v = vdupq_n_f32(0.0);
+            for h in 0..n_heads_q {
+                let base = h * stride + t;
+                let v = vld1q_f32(scores.as_ptr().add(base));
+                sum_v = vaddq_f32(sum_v, v);
+            }
+            // MAX with existing step_importance
+            let existing = vld1q_f32(step_importance.as_ptr().add(t));
+            let maxed = vmaxq_f32(existing, sum_v);
+            vst1q_f32(step_importance.as_mut_ptr().add(t), maxed);
+            t += 4;
+        }
+        // Scalar tail
+        while t < len {
+            let mut layer_score = 0.0f32;
+            for h in 0..n_heads_q {
+                layer_score += *scores.get_unchecked(h * stride + t);
+            }
+            let existing = *step_importance.get_unchecked(t);
+            *step_importance.get_unchecked_mut(t) = existing.max(layer_score);
+            t += 1;
+        }
+    }
+
+    /// NEON-accelerated GQA accumulation: flat sum + per-KV-head group average.
+    /// Processes 4 tokens per iteration.
+    ///
+    /// # Safety
+    /// Caller must ensure all slice accesses are in bounds.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn accumulate_layer_gqa_neon(
+        step_importance: &mut [f32],
+        head_step_importance: &mut [f32],
+        last_layer_head_attn: &mut [f32],
+        scores: &[f32],
+        stride: usize,
+        len: usize,
+        n_heads_q: usize,
+        n_kv_heads: usize,
+        max_seq_len: usize,
+    ) {
+        let n_rep = n_heads_q / n_kv_heads;
+        let inv_rep = 1.0 / n_rep as f32;
+        let inv_rep_v = vdupq_n_f32(inv_rep);
+
+        let mut t = 0usize;
+        while t + 4 <= len {
+            // Flat: sum across all Q-heads for 4 tokens
+            let mut sum_v = vdupq_n_f32(0.0);
+            for h in 0..n_heads_q {
+                let base = h * stride + t;
+                let v = vld1q_f32(scores.as_ptr().add(base));
+                sum_v = vaddq_f32(sum_v, v);
+            }
+            // MAX with existing step_importance
+            let existing = vld1q_f32(step_importance.as_ptr().add(t));
+            let maxed = vmaxq_f32(existing, sum_v);
+            vst1q_f32(step_importance.as_mut_ptr().add(t), maxed);
+
+            // Per-KV-head GQA group average
+            for kv_h in 0..n_kv_heads {
+                let mut group_v = vdupq_n_f32(0.0);
+                for r in 0..n_rep {
+                    let base = (kv_h * n_rep + r) * stride + t;
+                    let v = vld1q_f32(scores.as_ptr().add(base));
+                    group_v = vaddq_f32(group_v, v);
+                }
+                group_v = vmulq_f32(group_v, inv_rep_v);
+
+                let idx = kv_h * max_seq_len + t;
+                let existing_h = vld1q_f32(head_step_importance.as_ptr().add(idx));
+                let maxed_h = vmaxq_f32(existing_h, group_v);
+                vst1q_f32(head_step_importance.as_mut_ptr().add(idx), maxed_h);
+                vst1q_f32(last_layer_head_attn.as_mut_ptr().add(idx), group_v);
+            }
+
+            t += 4;
+        }
+        // Scalar tail
+        while t < len {
+            let mut layer_score = 0.0f32;
+            for h in 0..n_heads_q {
+                layer_score += *scores.get_unchecked(h * stride + t);
+            }
+            let existing = *step_importance.get_unchecked(t);
+            *step_importance.get_unchecked_mut(t) = existing.max(layer_score);
+
+            for kv_h in 0..n_kv_heads {
+                let mut group_score = 0.0f32;
+                for r in 0..n_rep {
+                    group_score += *scores.get_unchecked((kv_h * n_rep + r) * stride + t);
+                }
+                group_score *= inv_rep;
+                let idx = kv_h * max_seq_len + t;
+                let prev = *head_step_importance.get_unchecked(idx);
+                *head_step_importance.get_unchecked_mut(idx) = prev.max(group_score);
+                *last_layer_head_attn.get_unchecked_mut(idx) = group_score;
+            }
+            t += 1;
+        }
+    }
+
+    /// NEON-accelerated `end_step`: importance accumulation, step_count increment,
+    /// optional time normalization, and head_importance accumulation.
+    ///
+    /// # Safety
+    /// All slices must have length >= `max_seq_len`. `head_importance` and
+    /// `head_step_importance` must have the same length.
+    #[target_feature(enable = "neon")]
+    pub unsafe fn end_step_neon(
+        importance: &mut [f32],
+        step_importance: &[f32],
+        step_count: &mut [u32],
+        normalized: &mut [f32],
+        head_importance: &mut [f32],
+        head_step_importance: &[f32],
+        max_seq_len: usize,
+        time_normalize: bool,
+    ) {
+        let zero_v = vdupq_n_f32(0.0);
+        let one_u32_v = vdupq_n_u32(1);
+
+        // ── Flat importance + step_count ──
+        let mut t = 0usize;
+        while t + 4 <= max_seq_len {
+            let step_v = vld1q_f32(step_importance.as_ptr().add(t));
+            let imp_v = vld1q_f32(importance.as_ptr().add(t));
+            let new_imp = vaddq_f32(imp_v, step_v);
+            vst1q_f32(importance.as_mut_ptr().add(t), new_imp);
+
+            // step_count[t] += (step_val > 0.0) ? 1 : 0
+            let mask = vcgtq_f32(step_v, zero_v);
+            let inc = vandq_u32(
+                vreinterpretq_u32_f32(vreinterpretq_f32_u32(one_u32_v)),
+                mask,
+            );
+            let count_v = vld1q_u32(step_count.as_ptr().add(t));
+            let new_count = vaddq_u32(count_v, inc);
+            vst1q_u32(step_count.as_mut_ptr().add(t), new_count);
+
+            if time_normalize {
+                // normalized[t] = importance[t] / max(step_count[t], 1)
+                let count_clamped = vmaxq_u32(new_count, one_u32_v);
+                let count_f32 = vcvtq_f32_u32(count_clamped);
+                let norm_v = vdivq_f32(new_imp, count_f32);
+                vst1q_f32(normalized.as_mut_ptr().add(t), norm_v);
+            }
+            t += 4;
+        }
+        // Scalar tail for flat
+        while t < max_seq_len {
+            let step_val = *step_importance.get_unchecked(t);
+            *importance.get_unchecked_mut(t) += step_val;
+            if step_val > 0.0 {
+                *step_count.get_unchecked_mut(t) += 1;
+            }
+            if time_normalize {
+                let count = (*step_count.get_unchecked(t)).max(1) as f32;
+                *normalized.get_unchecked_mut(t) = *importance.get_unchecked(t) / count;
+            }
+            t += 1;
+        }
+
+        // ── Head importance: head_importance[i] += head_step_importance[i] ──
+        let head_len = head_importance.len();
+        let mut i = 0usize;
+        while i + 4 <= head_len {
+            let cum_v = vld1q_f32(head_importance.as_ptr().add(i));
+            let step_v = vld1q_f32(head_step_importance.as_ptr().add(i));
+            vst1q_f32(
+                head_importance.as_mut_ptr().add(i),
+                vaddq_f32(cum_v, step_v),
+            );
+            i += 4;
+        }
+        while i < head_len {
+            *head_importance.get_unchecked_mut(i) += *head_step_importance.get_unchecked(i);
+            i += 1;
+        }
+    }
+}
+
 /// Accumulates per-token attention importance scores across layers.
 ///
 /// During decode, each layer's post-softmax attention weights are aggregated
@@ -175,14 +380,31 @@ impl AttentionScoreAccumulator {
     ) {
         let len = cache_seq_len.min(self.max_seq_len);
 
-        // Sum across query heads to get a single per-token score for this layer
-        // Then take MAX with existing step_importance (per-layer MAX)
-        for t in 0..len {
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += scores[h * stride + t];
+        #[cfg(target_arch = "aarch64")]
+        {
+            // Safety: bounds are checked — scores has n_heads_q * stride elements,
+            // step_importance has max_seq_len elements, and len <= max_seq_len.
+            unsafe {
+                neon_scores::accumulate_layer_neon(
+                    &mut self.step_importance,
+                    scores,
+                    stride,
+                    len,
+                    n_heads_q,
+                );
             }
-            self.step_importance[t] = self.step_importance[t].max(layer_score);
+            return;
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for t in 0..len {
+                let mut layer_score = 0.0f32;
+                for h in 0..n_heads_q {
+                    layer_score += scores[h * stride + t];
+                }
+                self.step_importance[t] = self.step_importance[t].max(layer_score);
+            }
         }
     }
 
@@ -201,28 +423,54 @@ impl AttentionScoreAccumulator {
         n_kv_heads: usize,
     ) {
         let len = cache_seq_len.min(self.max_seq_len);
-        let n_rep = n_heads_q / n_kv_heads;
-        let inv_rep = 1.0 / n_rep as f32;
 
-        for t in 0..len {
-            // Flat accumulation (backward compatible with H2O)
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += scores[h * stride + t];
+        #[cfg(target_arch = "aarch64")]
+        {
+            let max_seq_len = self.max_seq_len;
+            // Safety: all buffer sizes are checked at construction (new_gqa).
+            // head_step_importance and last_layer_head_attn are n_kv_heads * max_seq_len.
+            unsafe {
+                neon_scores::accumulate_layer_gqa_neon(
+                    &mut self.step_importance,
+                    &mut self.head_step_importance,
+                    &mut self.last_layer_head_attn,
+                    scores,
+                    stride,
+                    len,
+                    n_heads_q,
+                    n_kv_heads,
+                    max_seq_len,
+                );
             }
-            self.step_importance[t] = self.step_importance[t].max(layer_score);
+            return;
+        }
 
-            // Per-KV-head: average Q-heads within each GQA group
-            for kv_h in 0..n_kv_heads {
-                let mut group_score = 0.0f32;
-                for r in 0..n_rep {
-                    group_score += scores[(kv_h * n_rep + r) * stride + t];
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let n_rep = n_heads_q / n_kv_heads;
+            let inv_rep = 1.0 / n_rep as f32;
+
+            for t in 0..len {
+                // Flat accumulation (backward compatible with H2O)
+                let mut layer_score = 0.0f32;
+                for h in 0..n_heads_q {
+                    layer_score += scores[h * stride + t];
                 }
-                group_score *= inv_rep;
-                let idx = kv_h * self.max_seq_len + t;
-                self.head_step_importance[idx] = self.head_step_importance[idx].max(group_score);
-                // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
-                self.last_layer_head_attn[idx] = group_score;
+                self.step_importance[t] = self.step_importance[t].max(layer_score);
+
+                // Per-KV-head: average Q-heads within each GQA group
+                for kv_h in 0..n_kv_heads {
+                    let mut group_score = 0.0f32;
+                    for r in 0..n_rep {
+                        group_score += scores[(kv_h * n_rep + r) * stride + t];
+                    }
+                    group_score *= inv_rep;
+                    let idx = kv_h * self.max_seq_len + t;
+                    self.head_step_importance[idx] =
+                        self.head_step_importance[idx].max(group_score);
+                    // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
+                    self.last_layer_head_attn[idx] = group_score;
+                }
             }
         }
     }
@@ -233,25 +481,48 @@ impl AttentionScoreAccumulator {
         if !self.active {
             return;
         }
-        for t in 0..self.max_seq_len {
-            let step_val = self.step_importance[t];
-            self.importance[t] += step_val;
-            // Track step count: increment for positions that were in cache this step
-            if step_val > 0.0 {
-                self.step_count[t] += 1;
-            }
-            // Compute time-normalized score
-            if self.time_normalize {
-                let count = self.step_count[t].max(1) as f32;
-                self.normalized[t] = self.importance[t] / count;
-            }
-        }
-        for (cum, &step) in self
-            .head_importance
-            .iter_mut()
-            .zip(self.head_step_importance.iter())
+
+        #[cfg(target_arch = "aarch64")]
         {
-            *cum += step;
+            // Safety: all buffers are allocated with max_seq_len capacity in new/new_gqa.
+            // head_importance and head_step_importance have the same length.
+            unsafe {
+                neon_scores::end_step_neon(
+                    &mut self.importance,
+                    &self.step_importance,
+                    &mut self.step_count,
+                    &mut self.normalized,
+                    &mut self.head_importance,
+                    &self.head_step_importance,
+                    self.max_seq_len,
+                    self.time_normalize,
+                );
+            }
+            return;
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            for t in 0..self.max_seq_len {
+                let step_val = self.step_importance[t];
+                self.importance[t] += step_val;
+                // Track step count: increment for positions that were in cache this step
+                if step_val > 0.0 {
+                    self.step_count[t] += 1;
+                }
+                // Compute time-normalized score
+                if self.time_normalize {
+                    let count = self.step_count[t].max(1) as f32;
+                    self.normalized[t] = self.importance[t] / count;
+                }
+            }
+            for (cum, &step) in self
+                .head_importance
+                .iter_mut()
+                .zip(self.head_step_importance.iter())
+            {
+                *cum += step;
+            }
         }
     }
 
@@ -1514,5 +1785,287 @@ mod tests {
         assert!((imp[1] - 10.0).abs() < 1e-6); // 20/2
         assert!((imp[2] - 30.0).abs() < 1e-6); // 30/1
         assert!((imp[3] - 40.0).abs() < 1e-6); // 40/1
+    }
+
+    // ── NEON vectorization correctness tests ──
+    // These verify the NEON path (on aarch64) and scalar path (on x86) produce
+    // identical results by using sizes that exercise both the 4-wide main loop
+    // and the scalar tail.
+
+    /// Helper: scalar reference implementation of accumulate_layer.
+    fn accumulate_layer_scalar(
+        step_importance: &mut [f32],
+        scores: &[f32],
+        stride: usize,
+        len: usize,
+        n_heads_q: usize,
+    ) {
+        for t in 0..len {
+            let mut layer_score = 0.0f32;
+            for h in 0..n_heads_q {
+                layer_score += scores[h * stride + t];
+            }
+            step_importance[t] = step_importance[t].max(layer_score);
+        }
+    }
+
+    /// Helper: scalar reference implementation of accumulate_layer_gqa.
+    fn accumulate_layer_gqa_scalar(
+        step_importance: &mut [f32],
+        head_step_importance: &mut [f32],
+        last_layer_head_attn: &mut [f32],
+        scores: &[f32],
+        stride: usize,
+        len: usize,
+        n_heads_q: usize,
+        n_kv_heads: usize,
+        max_seq_len: usize,
+    ) {
+        let n_rep = n_heads_q / n_kv_heads;
+        let inv_rep = 1.0 / n_rep as f32;
+        for t in 0..len {
+            let mut layer_score = 0.0f32;
+            for h in 0..n_heads_q {
+                layer_score += scores[h * stride + t];
+            }
+            step_importance[t] = step_importance[t].max(layer_score);
+
+            for kv_h in 0..n_kv_heads {
+                let mut group_score = 0.0f32;
+                for r in 0..n_rep {
+                    group_score += scores[(kv_h * n_rep + r) * stride + t];
+                }
+                group_score *= inv_rep;
+                let idx = kv_h * max_seq_len + t;
+                head_step_importance[idx] = head_step_importance[idx].max(group_score);
+                last_layer_head_attn[idx] = group_score;
+            }
+        }
+    }
+
+    #[test]
+    fn test_accumulate_layer_vectorized_vs_scalar() {
+        // 13 tokens: exercises 3 full NEON iterations (12) + 1 scalar tail
+        let max_seq = 16;
+        let cache_seq = 13;
+        let n_heads_q = 8;
+        let stride = max_seq;
+
+        // Deterministic scores
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        for h in 0..n_heads_q {
+            for t in 0..cache_seq {
+                scores[h * stride + t] = ((h * 13 + t * 7 + 3) % 100) as f32 / 100.0;
+            }
+        }
+
+        // Scalar reference
+        let mut step_ref = vec![0.0f32; max_seq];
+        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q);
+
+        // Through the struct (uses NEON on aarch64, scalar on x86)
+        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q);
+
+        for t in 0..cache_seq {
+            assert!(
+                (acc.step_importance[t] - step_ref[t]).abs() < 1e-5,
+                "mismatch at t={}: got {}, expected {}",
+                t,
+                acc.step_importance[t],
+                step_ref[t]
+            );
+        }
+    }
+
+    #[test]
+    fn test_accumulate_layer_gqa_vectorized_vs_scalar() {
+        // 11 tokens: 2 full NEON iterations (8) + 3 scalar tail
+        let max_seq = 16;
+        let cache_seq = 11;
+        let n_heads_q = 32;
+        let n_kv_heads = 8;
+        let stride = max_seq;
+
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        for h in 0..n_heads_q {
+            for t in 0..cache_seq {
+                scores[h * stride + t] = ((h * 11 + t * 5 + 7) % 97) as f32 / 97.0;
+            }
+        }
+
+        // Scalar reference
+        let mut step_ref = vec![0.0f32; max_seq];
+        let mut head_step_ref = vec![0.0f32; n_kv_heads * max_seq];
+        let mut last_attn_ref = vec![0.0f32; n_kv_heads * max_seq];
+        accumulate_layer_gqa_scalar(
+            &mut step_ref,
+            &mut head_step_ref,
+            &mut last_attn_ref,
+            &scores,
+            stride,
+            cache_seq,
+            n_heads_q,
+            n_kv_heads,
+            max_seq,
+        );
+
+        // Through the struct
+        let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        acc.accumulate_layer_gqa(&scores, stride, cache_seq, n_heads_q, n_kv_heads);
+
+        for t in 0..cache_seq {
+            assert!(
+                (acc.step_importance[t] - step_ref[t]).abs() < 1e-5,
+                "flat mismatch at t={}: got {}, expected {}",
+                t,
+                acc.step_importance[t],
+                step_ref[t]
+            );
+        }
+        for kv_h in 0..n_kv_heads {
+            for t in 0..cache_seq {
+                let idx = kv_h * max_seq + t;
+                assert!(
+                    (acc.head_step_importance[idx] - head_step_ref[idx]).abs() < 1e-5,
+                    "head_step mismatch kv_h={} t={}: got {}, expected {}",
+                    kv_h,
+                    t,
+                    acc.head_step_importance[idx],
+                    head_step_ref[idx]
+                );
+                assert!(
+                    (acc.last_layer_head_attn[idx] - last_attn_ref[idx]).abs() < 1e-5,
+                    "last_attn mismatch kv_h={} t={}: got {}, expected {}",
+                    kv_h,
+                    t,
+                    acc.last_layer_head_attn[idx],
+                    last_attn_ref[idx]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_end_step_vectorized_time_normalize() {
+        // 7 tokens: 1 full NEON iteration (4) + 3 scalar tail, with time normalization
+        let max_seq = 7;
+        let n_heads_q = 4;
+        let n_kv_heads = 2;
+
+        let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 1, 0, 0.0);
+        acc.set_time_normalize(true);
+        acc.set_active(true);
+
+        // Step 1
+        acc.begin_step();
+        let mut scores1 = vec![0.0f32; n_heads_q * max_seq];
+        for h in 0..n_heads_q {
+            for t in 0..5 {
+                scores1[h * max_seq + t] = (t + 1) as f32 * 0.1 + h as f32 * 0.01;
+            }
+        }
+        acc.accumulate_layer_gqa(&scores1, max_seq, 5, n_heads_q, n_kv_heads);
+        acc.end_step();
+
+        // Step 2
+        acc.begin_step();
+        let mut scores2 = vec![0.0f32; n_heads_q * max_seq];
+        for h in 0..n_heads_q {
+            for t in 0..7 {
+                scores2[h * max_seq + t] = (7 - t) as f32 * 0.15 + h as f32 * 0.02;
+            }
+        }
+        acc.accumulate_layer_gqa(&scores2, max_seq, 7, n_heads_q, n_kv_heads);
+        acc.end_step();
+
+        // Verify: positions 0..5 have step_count=2, positions 5..7 have step_count=1
+        assert_eq!(acc.step_count[0], 2);
+        assert_eq!(acc.step_count[4], 2);
+        assert_eq!(acc.step_count[5], 1);
+        assert_eq!(acc.step_count[6], 1);
+
+        // Time-normalized scores should be importance / step_count
+        let imp = acc.importance_scores();
+        let raw = acc.raw_importance_scores();
+        for t in 0..max_seq {
+            let count = acc.step_count[t].max(1) as f32;
+            let expected = raw[t] / count;
+            assert!(
+                (imp[t] - expected).abs() < 1e-5,
+                "time_normalize mismatch at t={}: got {}, expected {}",
+                t,
+                imp[t],
+                expected,
+            );
+        }
+
+        // Head importance should be sum of head_step from both steps
+        let head_imp = acc.head_importance_scores().unwrap();
+        for i in 0..head_imp.len() {
+            assert!(head_imp[i].is_finite(), "head_imp[{}] not finite", i);
+        }
+    }
+
+    #[test]
+    fn test_accumulate_layer_exact_multiple_of_4() {
+        // 8 tokens: exactly 2 NEON iterations, no scalar tail
+        let max_seq = 8;
+        let cache_seq = 8;
+        let n_heads_q = 4;
+        let stride = max_seq;
+
+        let mut scores = vec![0.0f32; n_heads_q * stride];
+        for h in 0..n_heads_q {
+            for t in 0..cache_seq {
+                scores[h * stride + t] = (h as f32 + 1.0) * (t as f32 + 1.0) * 0.1;
+            }
+        }
+
+        let mut step_ref = vec![0.0f32; max_seq];
+        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q);
+
+        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q);
+
+        for t in 0..cache_seq {
+            assert!(
+                (acc.step_importance[t] - step_ref[t]).abs() < 1e-5,
+                "t={}: got {}, expected {}",
+                t,
+                acc.step_importance[t],
+                step_ref[t]
+            );
+        }
+    }
+
+    #[test]
+    fn test_accumulate_layer_fewer_than_4_tokens() {
+        // 3 tokens: no NEON iterations at all, pure scalar tail
+        let max_seq = 8;
+        let cache_seq = 3;
+        let n_heads_q = 2;
+        let stride = max_seq;
+
+        let scores = vec![
+            1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0, 0.0, // head 0
+            4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0, 0.0, // head 1
+        ];
+
+        let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q);
+
+        // sum: [5.0, 7.0, 9.0]
+        assert!((acc.step_importance[0] - 5.0).abs() < 1e-6);
+        assert!((acc.step_importance[1] - 7.0).abs() < 1e-6);
+        assert!((acc.step_importance[2] - 9.0).abs() < 1e-6);
     }
 }
