@@ -80,7 +80,21 @@ impl Backend for CpuBackendNeon {
     }
 
     fn rms_norm(&self, x: &mut Tensor, w: &Tensor, eps: f32, add_unit: bool) -> Result<()> {
-        CpuBackendCommon::new().rms_norm(x, w, eps, add_unit)
+        let dims = x.shape().dims();
+        let dim = dims[dims.len() - 1];
+        let x_data = x.as_mut_slice::<f32>();
+        let w_data = w.as_slice::<f32>();
+        x_data.par_chunks_mut(dim).for_each(|row| {
+            unsafe { Self::rms_norm_neon(row, w_data, eps, add_unit) };
+        });
+        Ok(())
+    }
+
+    fn gelu_tanh_mul(&self, gate: &mut Tensor, up: &Tensor) -> Result<()> {
+        let gate_data = gate.as_mut_slice::<f32>();
+        let up_data = up.as_slice::<f32>();
+        unsafe { Self::gelu_tanh_mul_neon(gate_data, up_data) };
+        Ok(())
     }
 
     fn softmax(&self, x: &mut Tensor) -> Result<()> {
@@ -679,6 +693,122 @@ impl CpuBackendNeon {
             let x = a[i];
             a[i] = (x / (1.0 + (-x).exp())) * b[i];
             i += 1;
+        }
+    }
+
+    /// NEON vectorized tanh via identity: tanh(x) = 1 - 2/(1 + exp(2x))
+    /// Uses v_expf for fast exp approximation.
+    #[inline(always)]
+    unsafe fn v_tanh(x: float32x4_t) -> float32x4_t {
+        let two = vdupq_n_f32(2.0);
+        let one = vdupq_n_f32(1.0);
+        // exp(2x)
+        let exp2x = Self::v_expf(vmulq_f32(two, x));
+        // tanh(x) = 1 - 2 / (1 + exp(2x))
+        let denom = vaddq_f32(one, exp2x);
+        // Use reciprocal estimate + Newton-Raphson for division
+        let recip = vrecpeq_f32(denom);
+        let recip = vmulq_f32(recip, vrecpsq_f32(denom, recip));
+        vsubq_f32(one, vmulq_f32(two, recip))
+    }
+
+    /// NEON vectorized GELU-tanh-mul: gate[i] = gelu_tanh(gate[i]) * up[i]
+    /// gelu_tanh(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    #[target_feature(enable = "neon")]
+    unsafe fn gelu_tanh_mul_neon(gate: &mut [f32], up: &[f32]) {
+        let n = gate.len();
+        let sqrt_2_over_pi = vdupq_n_f32((2.0_f32 / std::f32::consts::PI).sqrt());
+        let coeff = vdupq_n_f32(0.044715);
+        let half = vdupq_n_f32(0.5);
+        let one = vdupq_n_f32(1.0);
+
+        let mut i = 0;
+        while i + 4 <= n {
+            let x = vld1q_f32(gate.as_ptr().add(i));
+            let u = vld1q_f32(up.as_ptr().add(i));
+
+            // x^3
+            let x2 = vmulq_f32(x, x);
+            let x3 = vmulq_f32(x2, x);
+            // inner = sqrt(2/pi) * (x + 0.044715 * x^3)
+            let inner = vmulq_f32(sqrt_2_over_pi, vfmaq_f32(x, coeff, x3));
+            // 0.5 * x * (1 + tanh(inner)) * up
+            let tanh_val = Self::v_tanh(inner);
+            let result = vmulq_f32(vmulq_f32(vmulq_f32(half, x), vaddq_f32(one, tanh_val)), u);
+            vst1q_f32(gate.as_mut_ptr().add(i), result);
+            i += 4;
+        }
+        // Scalar tail
+        let sqrt_2_over_pi_s: f32 = (2.0_f32 / std::f32::consts::PI).sqrt();
+        while i < n {
+            let x = gate[i];
+            let inner = sqrt_2_over_pi_s * (x + 0.044715 * x * x * x);
+            gate[i] = 0.5 * x * (1.0 + inner.tanh()) * up[i];
+            i += 1;
+        }
+    }
+
+    /// NEON vectorized RMS norm with add_unit support.
+    /// Pass 1: sum of squares (2-accumulator unroll)
+    /// Pass 2: x[i] = x[i] * scale * w_eff, where w_eff = (1+w[i]) or w[i]
+    #[target_feature(enable = "neon")]
+    unsafe fn rms_norm_neon(row: &mut [f32], w: &[f32], eps: f32, add_unit: bool) {
+        let dim = row.len();
+        let ptr = row.as_mut_ptr();
+        let w_ptr = w.as_ptr();
+
+        // Pass 1: sum of squares with 2-accumulator unroll
+        let mut sum_v0 = vdupq_n_f32(0.0);
+        let mut sum_v1 = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 8 <= dim {
+            let v0 = vld1q_f32(ptr.add(i));
+            let v1 = vld1q_f32(ptr.add(i + 4));
+            sum_v0 = vfmaq_f32(sum_v0, v0, v0);
+            sum_v1 = vfmaq_f32(sum_v1, v1, v1);
+            i += 8;
+        }
+        while i + 4 <= dim {
+            let v = vld1q_f32(ptr.add(i));
+            sum_v0 = vfmaq_f32(sum_v0, v, v);
+            i += 4;
+        }
+        sum_v0 = vaddq_f32(sum_v0, sum_v1);
+        let mut sum_sq = vaddvq_f32(sum_v0);
+        while i < dim {
+            sum_sq += *ptr.add(i) * *ptr.add(i);
+            i += 1;
+        }
+
+        let scale = 1.0 / (sum_sq / dim as f32 + eps).sqrt();
+        let scale_v = vdupq_n_f32(scale);
+
+        // Pass 2: x[i] = x[i] * scale * w_eff
+        i = 0;
+        if add_unit {
+            let one_v = vdupq_n_f32(1.0);
+            while i + 4 <= dim {
+                let v = vld1q_f32(ptr.add(i));
+                let wv = vld1q_f32(w_ptr.add(i));
+                let w_eff = vaddq_f32(one_v, wv);
+                vst1q_f32(ptr.add(i), vmulq_f32(vmulq_f32(v, scale_v), w_eff));
+                i += 4;
+            }
+            while i < dim {
+                *ptr.add(i) = (*ptr.add(i) * scale) * (1.0 + *w_ptr.add(i));
+                i += 1;
+            }
+        } else {
+            while i + 4 <= dim {
+                let v = vld1q_f32(ptr.add(i));
+                let wv = vld1q_f32(w_ptr.add(i));
+                vst1q_f32(ptr.add(i), vmulq_f32(vmulq_f32(v, scale_v), wv));
+                i += 4;
+            }
+            while i < dim {
+                *ptr.add(i) = (*ptr.add(i) * scale) * *w_ptr.add(i);
+                i += 1;
+            }
         }
     }
 
