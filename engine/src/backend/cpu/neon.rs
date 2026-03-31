@@ -323,7 +323,11 @@ impl CpuBackendNeon {
         let b_data = b.as_slice::<half::f16>();
         let out_data = out.as_mut_slice::<f32>();
 
-        if (m * n * k) < 100_000 {
+        // M=1 decode: serial path uses F32×F16 dot directly (vec_dot_f16_f32_4rows),
+        // avoiding F32→F16 conversion + heap alloc + SpinPool dispatch overhead.
+        // Threshold: n*k < 2M covers Wk/Wv/Wq/Wo but keeps FFN gate/up/down parallel.
+        let serial_threshold = if m == 1 { 2_000_000 } else { 100_000 };
+        if (m * n * k) < serial_threshold {
             return self.matmul_transposed_f16_serial(a_data, b_data, out_data, m, n, k);
         }
 
