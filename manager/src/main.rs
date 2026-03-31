@@ -189,7 +189,29 @@ fn main() -> anyhow::Result<()> {
                 }
                 EngineMessage::QcfEstimate(qcf) => {
                     log::info!("Engine QCF estimate: {} actions", qcf.estimates.len());
+                    if let Some(directive) = policy.complete_qcf_selection(qcf) {
+                        log::info!(
+                            "QCF-based directive seq={}: {} commands",
+                            directive.seq_id,
+                            directive.commands.len()
+                        );
+                        if let Err(e) = transport.emitter().emit_directive(&directive) {
+                            log::error!("Emit QCF directive failed: {}", e);
+                        }
+                    }
                 }
+            }
+        }
+
+        // QCF timeout check (SEQ-098) — 매 tick(50ms)마다 체크
+        if let Some(directive) = policy.check_qcf_timeout() {
+            log::info!(
+                "QCF timeout fallback directive seq={}: {} commands",
+                directive.seq_id,
+                directive.commands.len()
+            );
+            if let Err(e) = transport.emitter().emit_directive(&directive) {
+                log::error!("Emit QCF timeout directive failed: {}", e);
             }
         }
 

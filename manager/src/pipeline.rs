@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use llm_shared::{EngineCommand, EngineDirective, EngineMessage, Level, SystemSignal};
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, Level, QcfEstimate, SystemSignal};
 
 use crate::action_registry::ActionRegistry;
 use crate::config::PolicyConfig;
@@ -43,6 +43,18 @@ pub trait PolicyStrategy: Send {
 
     /// 세션 종료 시 내부 모델을 저장한다. 기본 구현은 no-op.
     fn save_model(&self) {}
+
+    /// Engine이 보낸 QcfEstimate로 보류 중인 액션 선택을 완료한다 (SEQ-097).
+    /// 기본 구현은 no-op.
+    fn complete_qcf_selection(&mut self, _qcf: &QcfEstimate) -> Option<EngineDirective> {
+        None
+    }
+
+    /// 보류 중인 QCF 요청의 타임아웃을 체크한다 (SEQ-098, 1초).
+    /// 기본 구현은 no-op.
+    fn check_qcf_timeout(&mut self) -> Option<EngineDirective> {
+        None
+    }
 }
 
 /// 이전 액션 효과 관측을 위한 컨텍스트.
@@ -60,6 +72,19 @@ struct ObservationContext {
 /// 액션 효과 관측 대기 시간(초).
 /// 액션 적용 후 이 시간이 지나야 pressure 변화로 실측 relief를 계산한다.
 const OBSERVATION_DELAY_SECS: f32 = 3.0;
+
+/// QCF 요청 타임아웃 (SEQ-098).
+const QCF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Pending QCF request state (SEQ-095~098).
+struct QcfPending {
+    /// Pressure snapshot at the time of request.
+    pressure: PressureVector,
+    /// Operating mode that triggered the request.
+    mode: OperatingMode,
+    /// When the request was sent.
+    requested_at: Instant,
+}
 
 /// Seq ID 생성을 위한 단조 증가 카운터.
 static SEQ_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -101,6 +126,8 @@ pub struct HierarchicalPolicy {
     active_actions_reported: Vec<ActionId>,
     /// 도메인별 마지막 신호 수신 시각 (실측 dt 계산용).
     last_signal_time: HashMap<&'static str, Instant>,
+    /// Pending QCF request state (SEQ-095~098).
+    qcf_pending: Option<QcfPending>,
 }
 
 impl HierarchicalPolicy {
@@ -144,6 +171,7 @@ impl HierarchicalPolicy {
             available_actions: vec![],
             active_actions_reported: vec![],
             last_signal_time: HashMap::new(),
+            qcf_pending: None,
         }
     }
 
@@ -284,6 +312,60 @@ impl HierarchicalPolicy {
             commands,
         })
     }
+
+    /// default_cost로 QCF values를 구성한다 (기존 inline 코드의 메서드 추출).
+    fn build_default_qcf_values(&self) -> HashMap<ActionId, f32> {
+        self.registry
+            .lossy_actions()
+            .into_iter()
+            .map(|id| {
+                let cost = self.registry.default_cost(&id);
+                (id, cost)
+            })
+            .collect()
+    }
+
+    /// 보류된 QCF 컨텍스트와 QCF values로 액션 선택을 실행한다 (공통 로직).
+    fn run_action_selection_with_qcf(
+        &mut self,
+        pending: &QcfPending,
+        qcf_values: &HashMap<ActionId, f32>,
+    ) -> Option<EngineDirective> {
+        let commands = ActionSelector::select(
+            &self.registry,
+            &self.estimator,
+            &pending.pressure,
+            pending.mode,
+            &self.engine_state,
+            qcf_values,
+            self.latency_budget,
+            &self.active_actions_reported,
+            &self.available_actions,
+        );
+
+        if commands.is_empty() {
+            return None;
+        }
+
+        let engine_commands = self.convert_to_engine_commands(&commands);
+        if engine_commands.is_empty() {
+            return None;
+        }
+
+        // 관측 컨텍스트 기록
+        self.pending_observation = Some(ObservationContext {
+            pressure_before: pending.pressure,
+            feature_vec: self.engine_state.clone(),
+            applied_actions: commands.iter().map(|c| c.action).collect(),
+            applied_at: Instant::now(),
+        });
+        self.last_acted_pressure = pending.pressure;
+
+        Some(EngineDirective {
+            seq_id: next_seq_id(),
+            commands: engine_commands,
+        })
+    }
 }
 
 impl PolicyStrategy for HierarchicalPolicy {
@@ -322,60 +404,49 @@ impl PolicyStrategy for HierarchicalPolicy {
         let mut result = None;
 
         if needs_action {
-            // ⑤ QCF proxy (engine 미연결 시 config default_cost 사용)
-            let qcf_values: HashMap<ActionId, f32> = self
-                .registry
-                .lossy_actions()
-                .into_iter()
-                .map(|id| {
-                    let cost = self.registry.default_cost(&id);
-                    (id, cost)
-                })
-                .collect();
+            // ⑤ Critical 전환 시 QCF 요청 (SEQ-095)
+            let is_critical_transition = mode == OperatingMode::Critical
+                && self.prev_mode != OperatingMode::Critical
+                && self.qcf_pending.is_none();
 
-            // ⑥ Action Selection
-            let commands = ActionSelector::select(
-                &self.registry,
-                &self.estimator,
-                &self.pressure,
+            if is_critical_transition {
+                self.qcf_pending = Some(QcfPending {
+                    pressure: self.pressure,
+                    mode,
+                    requested_at: Instant::now(),
+                });
+                let directive = EngineDirective {
+                    seq_id: next_seq_id(),
+                    commands: vec![EngineCommand::RequestQcf],
+                };
+                log::debug!(
+                    "[Pipeline] Critical transition — sending RequestQcf (pressure={:.2}/{:.2}/{:.2})",
+                    self.pressure.compute,
+                    self.pressure.memory,
+                    self.pressure.thermal,
+                );
+                self.prev_mode = mode;
+                return Some(directive);
+            }
+
+            // ⑥ 기존 로직: default_cost로 즉시 액션 선택
+            let qcf_values = self.build_default_qcf_values();
+            let pending_ctx = QcfPending {
+                pressure: self.pressure,
                 mode,
-                &self.engine_state,
-                &qcf_values,
-                self.latency_budget,
-                &self.active_actions_reported,
-                &self.available_actions,
-            );
-
-            if !commands.is_empty() {
-                let engine_commands = self.convert_to_engine_commands(&commands);
-                if !engine_commands.is_empty() {
-                    let seq = next_seq_id();
-                    let directive = EngineDirective {
-                        seq_id: seq,
-                        commands: engine_commands,
-                    };
-
-                    // 관측 컨텍스트 기록
-                    self.pending_observation = Some(ObservationContext {
-                        pressure_before: self.pressure,
-                        feature_vec: self.engine_state.clone(),
-                        applied_actions: commands.iter().map(|c| c.action).collect(),
-                        applied_at: Instant::now(),
-                    });
-                    self.last_acted_pressure = self.pressure;
-
-                    log::debug!(
-                        "[Pipeline] mode={:?} pressure={:.2}/{:.2}/{:.2} → directive seq={} ({} cmds)",
-                        mode,
-                        self.pressure.compute,
-                        self.pressure.memory,
-                        self.pressure.thermal,
-                        seq,
-                        directive.commands.len()
-                    );
-
-                    result = Some(directive);
-                }
+                requested_at: Instant::now(),
+            };
+            if let Some(directive) = self.run_action_selection_with_qcf(&pending_ctx, &qcf_values) {
+                log::debug!(
+                    "[Pipeline] mode={:?} pressure={:.2}/{:.2}/{:.2} → directive seq={} ({} cmds)",
+                    mode,
+                    self.pressure.compute,
+                    self.pressure.memory,
+                    self.pressure.thermal,
+                    directive.seq_id,
+                    directive.commands.len()
+                );
+                result = Some(directive);
             }
         }
 
@@ -466,6 +537,43 @@ impl PolicyStrategy for HierarchicalPolicy {
 
     fn mode(&self) -> OperatingMode {
         self.supervisory.mode()
+    }
+
+    /// Engine이 보낸 QcfEstimate로 보류 중인 액션 선택을 완료한다 (SEQ-097).
+    fn complete_qcf_selection(&mut self, qcf: &QcfEstimate) -> Option<EngineDirective> {
+        let pending = self.qcf_pending.take()?;
+
+        // QcfEstimate의 String key → ActionId 변환
+        let mut qcf_values: HashMap<ActionId, f32> = HashMap::new();
+        for (name, &cost) in &qcf.estimates {
+            if let Some(id) = ActionId::from_str(name) {
+                qcf_values.insert(id, cost);
+            }
+        }
+        // QcfEstimate에 없는 lossy action은 default_cost 폴백
+        for id in self.registry.lossy_actions() {
+            qcf_values
+                .entry(id)
+                .or_insert_with(|| self.registry.default_cost(&id));
+        }
+
+        self.run_action_selection_with_qcf(&pending, &qcf_values)
+    }
+
+    /// 보류 중인 QCF 요청의 타임아웃을 체크한다 (SEQ-098, 1초).
+    fn check_qcf_timeout(&mut self) -> Option<EngineDirective> {
+        let timed_out = self
+            .qcf_pending
+            .as_ref()
+            .is_some_and(|p| p.requested_at.elapsed() >= QCF_TIMEOUT);
+        if timed_out {
+            log::warn!("QCF estimate timeout (1s) — falling back to default costs");
+            let pending = self.qcf_pending.take().unwrap();
+            let qcf_values = self.build_default_qcf_values();
+            self.run_action_selection_with_qcf(&pending, &qcf_values)
+        } else {
+            None
+        }
     }
 
     /// 세션 종료 시 Relief model을 디스크에 저장한다.
@@ -1364,5 +1472,210 @@ mod tests {
             tiny.any_domain_exceeds(&zero, 1.2),
             "Any positive pressure should exceed zero reference"
         );
+    }
+
+    // ── QCF 2-phase 테스트 (SEQ-095~098) ────────────────────────────────
+
+    /// SEQ-095: Critical 전환 시 RequestQcf Directive 반환
+    #[test]
+    fn test_seq_095_critical_transition_sends_request_qcf() {
+        let mut p = make_pipeline();
+
+        // Emergency 신호를 반복하여 supervisory가 Critical을 반환하도록 pressure 누적
+        for _ in 0..30 {
+            let _ = p.process_signal(&memory_signal(Level::Emergency));
+        }
+
+        // prev_mode를 Warning으로 리셋하고 다시 시도 — Critical 전환을 트리거
+        p.prev_mode = OperatingMode::Warning;
+        p.qcf_pending = None;
+
+        let result = p.process_signal(&memory_signal(Level::Emergency));
+        let current_mode = p.mode();
+
+        if current_mode == OperatingMode::Critical {
+            // Critical 전환 발생 → RequestQcf가 반환되어야 한다
+            assert!(
+                result.is_some(),
+                "Critical transition should produce a directive"
+            );
+            let directive = result.unwrap();
+            assert_eq!(directive.commands.len(), 1);
+            assert!(
+                matches!(directive.commands[0], EngineCommand::RequestQcf),
+                "Critical transition should send RequestQcf, got {:?}",
+                directive.commands[0]
+            );
+            assert!(
+                p.qcf_pending.is_some(),
+                "qcf_pending should be set after RequestQcf"
+            );
+        }
+    }
+
+    /// SEQ-097: QcfEstimate 수신 후 실제 Directive 반환 (qcf_pending 소비)
+    #[test]
+    fn test_seq_097_qcf_estimate_triggers_action_selection() {
+        let mut p = make_pipeline();
+
+        p.qcf_pending = Some(QcfPending {
+            pressure: PressureVector {
+                compute: 0.0,
+                memory: 0.9,
+                thermal: 0.0,
+            },
+            mode: OperatingMode::Critical,
+            requested_at: Instant::now(),
+        });
+
+        let qcf = llm_shared::QcfEstimate {
+            estimates: {
+                let mut m = HashMap::new();
+                m.insert("kv_evict_sliding".to_string(), 0.2);
+                m.insert("kv_evict_h2o".to_string(), 0.8);
+                m
+            },
+        };
+
+        let _ = p.complete_qcf_selection(&qcf);
+        assert!(
+            p.qcf_pending.is_none(),
+            "qcf_pending should be consumed after complete_qcf_selection"
+        );
+    }
+
+    /// SEQ-097: qcf_pending이 없을 때 complete_qcf_selection은 None 반환
+    #[test]
+    fn test_seq_097_no_pending_returns_none() {
+        let mut p = make_pipeline();
+        assert!(p.qcf_pending.is_none());
+
+        let qcf = llm_shared::QcfEstimate {
+            estimates: HashMap::new(),
+        };
+        let result = p.complete_qcf_selection(&qcf);
+        assert!(result.is_none(), "No pending QCF should return None");
+    }
+
+    /// SEQ-098: 1초 타임아웃 후 default cost로 폴백 (qcf_pending 소비)
+    #[test]
+    fn test_seq_098_qcf_timeout_fallback() {
+        let mut p = make_pipeline();
+
+        p.qcf_pending = Some(QcfPending {
+            pressure: PressureVector {
+                compute: 0.0,
+                memory: 0.9,
+                thermal: 0.0,
+            },
+            mode: OperatingMode::Critical,
+            requested_at: Instant::now() - std::time::Duration::from_secs(2),
+        });
+
+        let _ = p.check_qcf_timeout();
+        assert!(
+            p.qcf_pending.is_none(),
+            "qcf_pending should be consumed after timeout"
+        );
+    }
+
+    /// SEQ-098: 타임아웃 전에는 check_qcf_timeout이 None 반환
+    #[test]
+    fn test_seq_098_no_timeout_returns_none() {
+        let mut p = make_pipeline();
+
+        p.qcf_pending = Some(QcfPending {
+            pressure: PressureVector {
+                compute: 0.0,
+                memory: 0.9,
+                thermal: 0.0,
+            },
+            mode: OperatingMode::Critical,
+            requested_at: Instant::now(),
+        });
+
+        let result = p.check_qcf_timeout();
+        assert!(result.is_none(), "Should not timeout immediately");
+        assert!(
+            p.qcf_pending.is_some(),
+            "qcf_pending should remain if not timed out"
+        );
+    }
+
+    /// SEQ-095: Warning 전환에서는 RequestQcf 미전송
+    #[test]
+    fn test_seq_095_warning_does_not_send_request_qcf() {
+        let mut p = make_pipeline();
+        p.prev_mode = OperatingMode::Normal;
+
+        // Warning 수준 신호를 반복
+        for _ in 0..20 {
+            let _ = p.process_signal(&memory_signal(Level::Warning));
+        }
+
+        p.prev_mode = OperatingMode::Normal;
+        p.qcf_pending = None;
+        let result = p.process_signal(&memory_signal(Level::Warning));
+
+        if let Some(directive) = result {
+            for cmd in &directive.commands {
+                assert!(
+                    !matches!(cmd, EngineCommand::RequestQcf),
+                    "Warning transition should NOT send RequestQcf"
+                );
+            }
+        }
+        assert!(
+            p.qcf_pending.is_none(),
+            "qcf_pending should not be set for Warning transition"
+        );
+    }
+
+    /// SEQ-097: QcfEstimate의 unknown action key는 무시된다
+    #[test]
+    fn test_seq_097_unknown_action_keys_ignored() {
+        let mut p = make_pipeline();
+
+        p.qcf_pending = Some(QcfPending {
+            pressure: PressureVector {
+                compute: 0.0,
+                memory: 0.9,
+                thermal: 0.0,
+            },
+            mode: OperatingMode::Critical,
+            requested_at: Instant::now(),
+        });
+
+        let qcf = llm_shared::QcfEstimate {
+            estimates: {
+                let mut m = HashMap::new();
+                m.insert("unknown_action".to_string(), 0.5);
+                m.insert("kv_evict_sliding".to_string(), 0.1);
+                m
+            },
+        };
+
+        let _ = p.complete_qcf_selection(&qcf);
+        assert!(p.qcf_pending.is_none());
+    }
+
+    /// build_default_qcf_values는 registry의 lossy_actions를 반환한다
+    #[test]
+    fn test_build_default_qcf_values() {
+        let p = make_pipeline();
+        let values = p.build_default_qcf_values();
+
+        let lossy = p.registry.lossy_actions();
+        assert_eq!(values.len(), lossy.len());
+
+        for id in &lossy {
+            assert!(values.contains_key(id));
+            let expected = p.registry.default_cost(id);
+            assert!(
+                (values[id] - expected).abs() < f32::EPSILON,
+                "QCF value for {:?} should match registry default_cost",
+                id
+            );
+        }
     }
 }
