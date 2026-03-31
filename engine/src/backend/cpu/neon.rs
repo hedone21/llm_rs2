@@ -157,6 +157,7 @@ impl Backend for CpuBackendNeon {
         CpuBackendCommon::new().cast(src, dst)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -169,6 +170,21 @@ impl Backend for CpuBackendNeon {
         cache_seq_len: usize,
         scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
+        // F16 KV cache: use NEON-optimized path (direct F16·F32 dot, vectorized softmax)
+        if k_cache.dtype() == DType::F16 {
+            return Self::attention_gen_f16_neon(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+                scores_out,
+            );
+        }
+        // F32 / Q4_0: delegate to common implementation
         CpuBackendCommon::new().attention_gen(
             q,
             k_cache,
@@ -184,6 +200,257 @@ impl Backend for CpuBackendNeon {
 }
 
 impl CpuBackendNeon {
+    /// NEON-optimized attention for F16 KV cache.
+    ///
+    /// Three optimizations over the generic common.rs F16 path:
+    /// 1. Direct F16·F32 dot via `vec_dot_f16_f32` — eliminates intermediate F32 buffer
+    /// 2. Vectorized softmax using NEON `v_expf` — 4-wide exp instead of scalar
+    /// 3. Stack-allocated scores buffer for typical sequence lengths (<=4096)
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_f16_neon(
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        let q_data = q.as_slice::<f32>();
+        let out_data = out.as_mut_slice::<f32>();
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = num_heads_q / num_heads_kv;
+
+        let k_data = k_cache.as_slice::<half::f16>();
+        let v_data = v_cache.as_slice::<half::f16>();
+
+        // Wrap raw pointer for Send+Sync (Rayon par_chunks_mut capture).
+        // Safety: each head h writes to non-overlapping region [h*stride .. h*stride+cache_seq_len].
+        #[derive(Clone, Copy)]
+        struct SendPtr(*mut f32);
+        unsafe impl Send for SendPtr {}
+        unsafe impl Sync for SendPtr {}
+
+        let scores_ptr = scores_out.as_ref().map(|s| SendPtr(s.as_ptr() as *mut f32));
+        let scores_stride = scores_out
+            .as_ref()
+            .map(|s| s.len() / num_heads_q)
+            .unwrap_or(0);
+
+        // Detect layout: HeadMajor [batch, kv_heads, capacity, head_dim]
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        let capacity = if is_head_major { k_shape[2] } else { 0 };
+
+        // Stack threshold: avoid heap alloc for typical decode sequences
+        const STACK_SCORES_MAX: usize = 4096;
+
+        out_data
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(h, out_h)| {
+                let kv_h = h / gqa_ratio;
+                let q_off = h * head_dim;
+                let q_ptr = unsafe { q_data.as_ptr().add(q_off) };
+
+                // Fix 3: stack-allocated scores for typical lengths, heap fallback
+                let mut stack_scores = [0.0f32; STACK_SCORES_MAX];
+                let mut heap_scores: Vec<f32>;
+                let scores: &mut [f32] = if cache_seq_len <= STACK_SCORES_MAX {
+                    &mut stack_scores[..cache_seq_len]
+                } else {
+                    heap_scores = vec![0.0f32; cache_seq_len];
+                    &mut heap_scores[..]
+                };
+
+                // --- Q * K^T: direct F16·F32 dot (Fix 1) ---
+                // Process 4 timesteps at once using vec_dot_f16_f32_4rows
+                let k_f16_ptr = k_data.as_ptr() as *const u16;
+                let full_4 = cache_seq_len / 4;
+                for chunk in 0..full_4 {
+                    let t_base = chunk * 4;
+                    let mut b_ptrs = [std::ptr::null::<u16>(); 4];
+                    for r in 0..4 {
+                        let t = t_base + r;
+                        let off = if is_head_major {
+                            (kv_h * capacity + t) * head_dim
+                        } else {
+                            (t * num_heads_kv + kv_h) * head_dim
+                        };
+                        b_ptrs[r] = unsafe { k_f16_ptr.add(off) };
+                    }
+                    let mut dots = [0.0f32; 4];
+                    unsafe {
+                        Self::vec_dot_f16_f32_4rows(head_dim, q_ptr, b_ptrs, &mut dots);
+                    }
+                    for r in 0..4 {
+                        scores[t_base + r] = dots[r] * scale;
+                    }
+                }
+                // Remaining timesteps (0-3)
+                for t in (full_4 * 4)..cache_seq_len {
+                    let off = if is_head_major {
+                        (kv_h * capacity + t) * head_dim
+                    } else {
+                        (t * num_heads_kv + kv_h) * head_dim
+                    };
+                    let k_ptr = unsafe { k_f16_ptr.add(off) };
+                    let dot =
+                        unsafe { Self::vec_dot_f16_f32(head_dim, q_ptr, k_ptr) };
+                    scores[t] = dot * scale;
+                }
+
+                // --- Softmax with NEON v_expf (Fix 2) ---
+                // Pass 1: find max
+                let mut max_val = f32::NEG_INFINITY;
+                unsafe {
+                    let s_ptr = scores.as_ptr();
+                    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
+                    let mut i = 0;
+                    while i + 4 <= cache_seq_len {
+                        max_v = vmaxq_f32(max_v, vld1q_f32(s_ptr.add(i)));
+                        i += 4;
+                    }
+                    max_val = vmaxvq_f32(max_v);
+                    while i < cache_seq_len {
+                        max_val = max_val.max(*s_ptr.add(i));
+                        i += 1;
+                    }
+                }
+
+                // Pass 2: exp(x - max) and sum
+                let mut sum_exp = 0.0f32;
+                unsafe {
+                    let s_ptr = scores.as_mut_ptr();
+                    let max_v = vdupq_n_f32(max_val);
+                    let mut sum_v = vdupq_n_f32(0.0);
+                    let mut i = 0;
+                    while i + 4 <= cache_seq_len {
+                        let x = vsubq_f32(vld1q_f32(s_ptr.add(i)), max_v);
+                        let e = Self::v_expf(x);
+                        vst1q_f32(s_ptr.add(i), e);
+                        sum_v = vaddq_f32(sum_v, e);
+                        i += 4;
+                    }
+                    sum_exp = vaddvq_f32(sum_v);
+                    while i < cache_seq_len {
+                        let e = (*s_ptr.add(i) - max_val).exp();
+                        *s_ptr.add(i) = e;
+                        sum_exp += e;
+                        i += 1;
+                    }
+                }
+
+                // Pass 3: normalize
+                let inv_sum = 1.0 / sum_exp;
+                unsafe {
+                    let s_ptr = scores.as_mut_ptr();
+                    let inv_v = vdupq_n_f32(inv_sum);
+                    let mut i = 0;
+                    while i + 4 <= cache_seq_len {
+                        let x = vld1q_f32(s_ptr.add(i));
+                        vst1q_f32(s_ptr.add(i), vmulq_f32(x, inv_v));
+                        i += 4;
+                    }
+                    while i < cache_seq_len {
+                        *s_ptr.add(i) *= inv_sum;
+                        i += 1;
+                    }
+                }
+
+                // Copy scores for diagnostics if requested
+                if let Some(SendPtr(ptr)) = scores_ptr {
+                    unsafe {
+                        let dst = std::slice::from_raw_parts_mut(
+                            ptr.add(h * scores_stride),
+                            cache_seq_len,
+                        );
+                        dst.copy_from_slice(&scores[..cache_seq_len]);
+                    }
+                }
+
+                // --- Weighted V sum: fused F16→F32 convert + FMA ---
+                for d in 0..head_dim {
+                    out_h[d] = 0.0;
+                }
+                let v_f16_ptr = v_data.as_ptr() as *const u16;
+                for t in 0..cache_seq_len {
+                    let w = scores[t];
+                    if w == 0.0 {
+                        continue;
+                    }
+                    let off = if is_head_major {
+                        (kv_h * capacity + t) * head_dim
+                    } else {
+                        (t * num_heads_kv + kv_h) * head_dim
+                    };
+                    // Fused F16→F32 + weighted accumulation with NEON
+                    unsafe {
+                        let vp = v_f16_ptr.add(off);
+                        let o_ptr = out_h.as_mut_ptr();
+                        let w_v = vdupq_n_f32(w);
+                        let mut i = 0;
+                        while i + 16 <= head_dim {
+                            // Load 16 F16 values → 4 F32x4 vectors
+                            let raw0: uint16x8_t = vld1q_u16(vp.add(i));
+                            let raw1: uint16x8_t = vld1q_u16(vp.add(i + 8));
+                            let f0: float32x4_t;
+                            let f1: float32x4_t;
+                            let f2: float32x4_t;
+                            let f3: float32x4_t;
+                            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f0, i = in(vreg) raw0);
+                            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f1, i = in(vreg) raw0);
+                            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f2, i = in(vreg) raw1);
+                            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f3, i = in(vreg) raw1);
+
+                            vst1q_f32(
+                                o_ptr.add(i),
+                                vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, f0),
+                            );
+                            vst1q_f32(
+                                o_ptr.add(i + 4),
+                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 4)), w_v, f1),
+                            );
+                            vst1q_f32(
+                                o_ptr.add(i + 8),
+                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 8)), w_v, f2),
+                            );
+                            vst1q_f32(
+                                o_ptr.add(i + 12),
+                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 12)), w_v, f3),
+                            );
+                            i += 16;
+                        }
+                        while i + 8 <= head_dim {
+                            let raw: uint16x8_t = vld1q_u16(vp.add(i));
+                            let fl: float32x4_t;
+                            let fh: float32x4_t;
+                            std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) fl, i = in(vreg) raw);
+                            std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) fh, i = in(vreg) raw);
+                            vst1q_f32(
+                                o_ptr.add(i),
+                                vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, fl),
+                            );
+                            vst1q_f32(
+                                o_ptr.add(i + 4),
+                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 4)), w_v, fh),
+                            );
+                            i += 8;
+                        }
+                        while i < head_dim {
+                            *o_ptr.add(i) += w * half::f16::from_bits(*vp.add(i)).to_f32();
+                            i += 1;
+                        }
+                    }
+                }
+            });
+
+        Ok(())
+    }
+
     fn matmul_transposed_f32(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         let a_shape = a.shape().dims();
         let b_shape = b.shape().dims();
