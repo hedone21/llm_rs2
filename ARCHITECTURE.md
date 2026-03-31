@@ -408,8 +408,6 @@ Pipeline Pattern 기반 캐시 관리 핸들러 (PressureLevel별 순차 실행)
 | **SnapKVHandler** | ✅ 완전 구현 | Prefill-time 1회 압축 (observation window voting + pooling + per-head top-k) |
 | **QuantizeHandler** | ✅ 완전 구현 | Pressure→KIVI bits 매핑 (Warning→8, Critical→4, Emergency→2) |
 | **SwapHandler** | ✅ 완전 구현 | LRU 기반 KV 캐시 디스크 오프로드 |
-| **MergeHandler** | ⚠️ 스텁 | 유사 토큰 병합 (미구현) |
-| **SparseHandler** | ⚠️ 스텁 | 희소 attention 마스크 (미구현) |
 
 **Eviction 후 데이터 흐름**:
 ```

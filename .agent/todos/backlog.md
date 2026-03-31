@@ -138,44 +138,22 @@
 - **Notes**: 타이밍 상수는 Config로 설정 가능하게.
 
 ## [P2] KvStreaming 커맨드 정상 구현
-- **Status**: TODO
+- **Status**: DONE (2026-03-31)
 - **Sprint**: backlog
-- **Dependencies**: 없음
-- **Description**: |
-  MSG-032: executor.rs에서 Rejected("not yet implemented") 반환 중.
-  StreamingLLM 정책 (sink + window 기반) 미구현.
-- **Acceptance Criteria**: KvStreaming 커맨드에 sink_size/window_size 파라미터로 정상 eviction 수행
-- **Notes**: engine/src/resilience/executor.rs:253-257.
+- **Notes**: cc0b9ce — EngineCommand::KvStreaming → StreamingLLMPolicy 연결 완료
 
 ## [P2] KvMergeD2o 액션 추가
-- **Status**: TODO
+- **Status**: DONE (2026-03-31)
 - **Sprint**: backlog
-- **Dependencies**: MergeHandler 구현 (#8)
-- **Description**: |
-  MGR-028: 스펙 ActionId 8종 중 KvMergeD2o 누락 (코드 7종만).
-  shared/src/lib.rs ActionId enum + manager/src/relief/linear.rs default_relief 추가 필요.
-- **Acceptance Criteria**: ActionId에 KvMergeD2o 포함, Manager가 merge 액션 선택 가능
-- **Notes**: MergeHandler stub 해소와 함께 진행.
+- **Notes**: ffce391 — Pipeline 재활용 설계, D2OHandler 수정 0줄
 
 ## [P3] MergeHandler 정상 구현
-- **Status**: TODO
-- **Sprint**: backlog
-- **Dependencies**: 없음
-- **Description**: |
-  engine/src/core/pressure/merge_handler.rs — 항상 NoOp 반환하는 stub.
-  인접 토큰 cosine similarity + 가중 평균 merge 알고리즘 구현 필요.
-- **Acceptance Criteria**: MergeHandler가 유사 토큰을 merge하여 캐시 크기 축소
-- **Notes**: 실험적 기능. D2O eviction과 연계.
+- **Status**: CANCELLED (2026-03-31)
+- **Notes**: D2OHandler가 cosine merge를 이미 수행. 기능 중복으로 stub 삭제 (7742543)
 
 ## [P3] SparseHandler 정상 구현
-- **Status**: TODO
-- **Sprint**: backlog
-- **Dependencies**: 없음
-- **Description**: |
-  engine/src/core/pressure/sparse_handler.rs — 항상 NoOp 반환하는 stub.
-  Local window + strided global sparse attention mask 구현 필요.
-- **Acceptance Criteria**: SparseHandler가 sparse attention으로 연산량 감소
-- **Notes**: 실험적 기능.
+- **Status**: CANCELLED (2026-03-31)
+- **Notes**: 1B+2048ctx 타겟에서 실익 없음. stub 삭제 (7742543)
 
 ## [P3] EnergyConstraint 스펙-코드 Divergence 해소
 - **Status**: TODO

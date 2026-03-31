@@ -109,7 +109,7 @@
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
 
-> 추적 대상: ~55개 | ✅ 43 | ⬜ 0
+> 추적 대상: ~61개 | ✅ 49 | ⬜ 0
 
 ## 선별 기준
 
@@ -140,6 +140,8 @@
 | MSG-011 | (D) | EngineMessage 4종 serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
 | MSG-020 | (D) | EngineDirective serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
 | MSG-030 | (D) | EngineCommand 13종 serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+| MSG-034b | (D) | KvMergeD2o serde round-trip | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+| MSG-035 | (D) | KvStreaming serde round-trip | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
 
 ## Sequence
 
@@ -148,6 +150,8 @@
 | SEQ-020 | (E) | Handshake 시퀀스 | ✅ | `engine/tests/spec/test_seq_020_035.rs` |
 | SEQ-030 | (E) | Steady-State 루프 | ✅ | `engine/tests/spec/test_seq_020_035.rs` |
 | SEQ-040 | (E) | Pressure Escalation 시퀀스 | ✅ | `engine/tests/spec/test_seq_040_064.rs` |
+| SEQ-095 | (E) | RequestQcf 시퀀스 | ✅ | `engine/tests/spec/test_seq_095_098.rs` |
+| SEQ-096 | (E) | QcfEstimate 응답 | ✅ | `engine/tests/spec/test_seq_095_098.rs` |
 
 ## Manager Algorithm
 
@@ -210,6 +214,8 @@
 |------------|------|------|------|-----------|
 | ENG-DAT-012 | (D) | KVCache 구현 | ✅ | `engine/tests/spec/test_eng_dat_012_031.rs` |
 | ENG-DAT-020 | (D) | Buffer trait | ✅ | `engine/tests/spec/test_eng_dat_012_031.rs` |
+| ENG-DAT-C05 | (D) | KvStreaming protocol path (EvictPlan 생성, active/available_actions) | ✅ | `engine/tests/spec/test_eng_dat_c05_streaming.rs` |
+| ENG-DAT-C06 | (D) | KvMergeD2o protocol path (EvictPlan 생성, Pipeline dispatch) | ✅ | `engine/tests/spec/test_eng_dat_c06_d2o.rs` |
 
 ## Cross-cutting
 
