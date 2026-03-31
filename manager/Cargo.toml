@@ -25,7 +25,6 @@ tempfile = "3"
 [[bin]]
 name = "mock_manager"
 path = "src/bin/mock_manager.rs"
-required-features = ["dbus"]
 
 [[bin]]
 name = "mock_engine"

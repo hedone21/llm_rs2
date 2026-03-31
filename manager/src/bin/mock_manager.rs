@@ -1,316 +1,1196 @@
-//! Mock D-Bus Manager for T3 testing.
+//! Mock Manager binary for protocol validation and E2E testing.
 //!
-//! Emits `org.llm.Manager1` signals on the System Bus for testing
-//! the DbusListener. Supports single-signal CLI mode and scenario replay.
+//! Supports two transport modes:
+//!
+//! 1. **Unix socket (default)**: Listens on a Unix socket, accepts an Engine
+//!    connection, receives Capability + Heartbeats, and sends Directive commands.
+//!    Supports single-command and scenario replay modes.
+//!
+//! 2. **D-Bus (legacy, `--dbus`)**: Emits D-Bus signals on the System Bus.
+//!    Requires the `dbus` cargo feature.
 //!
 //! # Usage
 //!
 //! ```bash
-//! # Single signal
-//! mock_manager --signal MemoryPressure --level critical \
-//!     --available-bytes 50000000 --reclaim-target 100000000
+//! # Unix socket — single command
+//! cargo run -p llm_manager --no-default-features --bin mock_manager -- \
+//!     --command KvEvictSliding --keep-ratio 0.7
 //!
-//! # Scenario replay
-//! mock_manager --scenario scenarios/thermal_spike.json
+//! # Unix socket — scenario replay
+//! cargo run -p llm_manager --no-default-features --bin mock_manager -- \
+//!     --scenario scenario.json
+//!
+//! # D-Bus (legacy) — requires `dbus` feature
+//! cargo run -p llm_manager --bin mock_manager -- \
+//!     --dbus --signal MemoryPressure --level critical
 //! ```
 
+use std::io::{Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{Context, bail};
 use clap::Parser;
 use serde::Deserialize;
-use std::path::PathBuf;
 
-const MANAGER_NAME: &str = "org.llm.Manager1";
-const MANAGER_PATH: &str = "/org/llm/Manager1";
-const MANAGER_IFACE: &str = "org.llm.Manager1";
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
+
+// ── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug)]
 #[command(
     name = "mock_manager",
-    about = "Mock D-Bus Manager for resilience testing"
+    about = "Mock Manager for Engine protocol validation and E2E testing"
 )]
 struct Args {
-    /// Signal to emit (MemoryPressure, ComputeGuidance, ThermalAlert, EnergyConstraint)
-    #[arg(long)]
-    signal: Option<String>,
+    // ── Unix socket mode (default) ──
+    /// Unix socket path to listen on.
+    #[arg(long, default_value = "/tmp/llm_manager.sock")]
+    socket: String,
 
-    /// Scenario JSON file to replay
+    /// Command to send (KvEvictSliding, KvEvictH2o, KvStreaming, KvMergeD2o,
+    /// Throttle, SwitchHw, KvQuantDynamic, LayerSkip, Suspend, Resume,
+    /// RestoreDefaults, RequestQcf).
+    #[arg(long)]
+    command: Option<String>,
+
+    /// Scenario JSON file to replay (Unix socket mode).
     #[arg(long)]
     scenario: Option<PathBuf>,
 
-    // --- MemoryPressure args ---
+    /// Seconds to wait for Heartbeats before sending Directive.
+    #[arg(long, default_value_t = 2)]
+    wait_secs: u64,
+
+    // ── Command parameters ──
+    /// keep_ratio for KvEvictSliding, KvEvictH2o, KvMergeD2o.
+    #[arg(long)]
+    keep_ratio: Option<f32>,
+
+    /// sink_size for KvStreaming.
+    #[arg(long)]
+    sink_size: Option<usize>,
+
+    /// window_size for KvStreaming.
+    #[arg(long)]
+    window_size: Option<usize>,
+
+    /// delay_ms for Throttle.
+    #[arg(long)]
+    delay_ms: Option<u64>,
+
+    /// device for SwitchHw.
+    #[arg(long)]
+    device: Option<String>,
+
+    /// target_bits for KvQuantDynamic.
+    #[arg(long)]
+    target_bits: Option<u8>,
+
+    /// skip_ratio for LayerSkip.
+    #[arg(long)]
+    skip_ratio: Option<f32>,
+
+    // ── D-Bus mode (legacy) ──
+    /// Use D-Bus transport instead of Unix socket.
+    #[cfg(feature = "dbus")]
+    #[arg(long)]
+    dbus: bool,
+
+    /// D-Bus signal to emit (MemoryPressure, ComputeGuidance, ThermalAlert, EnergyConstraint).
+    #[cfg(feature = "dbus")]
+    #[arg(long)]
+    signal: Option<String>,
+
+    /// Signal level for D-Bus mode.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     level: Option<String>,
 
+    /// D-Bus: available_bytes for MemoryPressure.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     available_bytes: Option<u64>,
 
+    /// D-Bus: reclaim_target for MemoryPressure.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     reclaim_target: Option<u64>,
 
-    // --- ComputeGuidance args ---
+    /// D-Bus: recommended_backend for ComputeGuidance.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     recommended_backend: Option<String>,
 
+    /// D-Bus: reason for ComputeGuidance/EnergyConstraint.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     reason: Option<String>,
 
+    /// D-Bus: cpu_usage for ComputeGuidance.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     cpu_usage: Option<f64>,
 
+    /// D-Bus: gpu_usage for ComputeGuidance.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     gpu_usage: Option<f64>,
 
-    // --- ThermalAlert args ---
+    /// D-Bus: temperature_mc for ThermalAlert.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     temperature_mc: Option<i32>,
 
+    /// D-Bus: throttling_active for ThermalAlert.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     throttling_active: Option<bool>,
 
+    /// D-Bus: throttle_ratio for ThermalAlert.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     throttle_ratio: Option<f64>,
 
-    // --- EnergyConstraint args ---
+    /// D-Bus: power_budget_mw for EnergyConstraint.
+    #[cfg(feature = "dbus")]
     #[arg(long)]
     power_budget_mw: Option<u32>,
 }
 
-/// Scenario file format for replaying signal sequences.
+// ── Wire format helpers ─────────────────────────────────────────────────────
+
+/// Serialise `msg` as length-prefixed JSON and write to `stream`.
+fn send_message(stream: &mut UnixStream, msg: &ManagerMessage) -> anyhow::Result<()> {
+    let json = serde_json::to_vec(msg).context("serialise ManagerMessage")?;
+    let len = (json.len() as u32).to_be_bytes();
+    stream.write_all(&len).context("write length prefix")?;
+    stream.write_all(&json).context("write JSON payload")?;
+    stream.flush().context("flush stream")?;
+    Ok(())
+}
+
+/// Try to read one `EngineMessage` from `stream`.
+///
+/// Returns `Ok(None)` on read timeout / would-block (non-blocking read).
+fn recv_message(stream: &mut UnixStream) -> anyhow::Result<Option<EngineMessage>> {
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e).context("read length prefix"),
+    }
+
+    let payload_len = u32::from_be_bytes(len_buf) as usize;
+    let mut json_buf = vec![0u8; payload_len];
+    stream
+        .read_exact(&mut json_buf)
+        .context("read JSON payload")?;
+
+    let msg: EngineMessage =
+        serde_json::from_slice(&json_buf).context("deserialise EngineMessage")?;
+    Ok(Some(msg))
+}
+
+// ── Scenario types ──────────────────────────────────────────────────────────
+
+/// Command-based scenario file format for Unix socket mode.
 #[derive(Debug, Deserialize)]
-struct Scenario {
+struct CommandScenario {
     name: String,
     #[serde(default)]
     description: Option<String>,
-    signals: Vec<ScenarioSignal>,
+    commands: Vec<ScenarioCommand>,
 }
 
-/// A single signal entry in a scenario file.
+/// A single command entry in a scenario file.
 #[derive(Debug, Deserialize)]
-struct ScenarioSignal {
+struct ScenarioCommand {
     delay_ms: u64,
-    signal: String,
-    level: String,
-    // MemoryPressure
+    command: String,
     #[serde(default)]
-    available_bytes: Option<u64>,
+    keep_ratio: Option<f32>,
     #[serde(default)]
-    reclaim_target_bytes: Option<u64>,
-    // ComputeGuidance
+    sink_size: Option<usize>,
     #[serde(default)]
-    recommended_backend: Option<String>,
+    window_size: Option<usize>,
     #[serde(default)]
-    reason: Option<String>,
+    delay_ms_param: Option<u64>,
     #[serde(default)]
-    cpu_usage_pct: Option<f64>,
+    device: Option<String>,
     #[serde(default)]
-    gpu_usage_pct: Option<f64>,
-    // ThermalAlert
+    target_bits: Option<u8>,
     #[serde(default)]
-    temperature_mc: Option<i32>,
-    #[serde(default)]
-    throttling_active: Option<bool>,
-    #[serde(default)]
-    throttle_ratio: Option<f64>,
-    // EnergyConstraint
-    #[serde(default)]
-    power_budget_mw: Option<u32>,
+    skip_ratio: Option<f32>,
 }
 
-fn main() -> anyhow::Result<()> {
-    env_logger::init();
-    let args = Args::parse();
+// ── Command construction ────────────────────────────────────────────────────
 
-    // Connect to System Bus and request well-known name
-    let conn = zbus::blocking::Connection::system()?;
-    conn.request_name(MANAGER_NAME)?;
-    println!("Registered as {} on System Bus", MANAGER_NAME);
+/// Parameters for building an EngineCommand from CLI or scenario input.
+struct CommandParams<'a> {
+    name: &'a str,
+    keep_ratio: Option<f32>,
+    sink_size: Option<usize>,
+    window_size: Option<usize>,
+    delay_ms: Option<u64>,
+    device: Option<&'a str>,
+    target_bits: Option<u8>,
+    skip_ratio: Option<f32>,
+}
 
+fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
+    match params.name {
+        "KvEvictSliding" => {
+            let ratio = params
+                .keep_ratio
+                .context("--keep-ratio required for KvEvictSliding")?;
+            Ok(EngineCommand::KvEvictSliding { keep_ratio: ratio })
+        }
+        "KvEvictH2o" => {
+            let ratio = params
+                .keep_ratio
+                .context("--keep-ratio required for KvEvictH2o")?;
+            Ok(EngineCommand::KvEvictH2o { keep_ratio: ratio })
+        }
+        "KvStreaming" => {
+            let sink = params
+                .sink_size
+                .context("--sink-size required for KvStreaming")?;
+            let window = params
+                .window_size
+                .context("--window-size required for KvStreaming")?;
+            Ok(EngineCommand::KvStreaming {
+                sink_size: sink,
+                window_size: window,
+            })
+        }
+        "KvMergeD2o" => {
+            let ratio = params
+                .keep_ratio
+                .context("--keep-ratio required for KvMergeD2o")?;
+            Ok(EngineCommand::KvMergeD2o { keep_ratio: ratio })
+        }
+        "Throttle" => {
+            let ms = params
+                .delay_ms
+                .context("--delay-ms required for Throttle")?;
+            Ok(EngineCommand::Throttle { delay_ms: ms })
+        }
+        "SwitchHw" => {
+            let dev = params.device.context("--device required for SwitchHw")?;
+            Ok(EngineCommand::SwitchHw {
+                device: dev.to_string(),
+            })
+        }
+        "KvQuantDynamic" => {
+            let bits = params
+                .target_bits
+                .context("--target-bits required for KvQuantDynamic")?;
+            Ok(EngineCommand::KvQuantDynamic { target_bits: bits })
+        }
+        "LayerSkip" => {
+            let ratio = params
+                .skip_ratio
+                .context("--skip-ratio required for LayerSkip")?;
+            Ok(EngineCommand::LayerSkip { skip_ratio: ratio })
+        }
+        "Suspend" => Ok(EngineCommand::Suspend),
+        "Resume" => Ok(EngineCommand::Resume),
+        "RestoreDefaults" => Ok(EngineCommand::RestoreDefaults),
+        "RequestQcf" => Ok(EngineCommand::RequestQcf),
+        other => bail!("Unknown command: {}", other),
+    }
+}
+
+// ── Protocol invariant validation (TOOL-048) ────────────────────────────────
+
+fn validate_response(
+    seq_id: u64,
+    response: &llm_shared::CommandResponse,
+    num_commands: usize,
+) -> bool {
+    let mut valid = true;
+
+    // INV-023: seq_id must match
+    if response.seq_id != seq_id {
+        eprintln!(
+            "[PROTOCOL VIOLATION] INV-023: seq_id mismatch: sent {} but received {}",
+            seq_id, response.seq_id
+        );
+        valid = false;
+    }
+
+    // INV-024: results.len() must equal commands.len()
+    if response.results.len() != num_commands {
+        eprintln!(
+            "[PROTOCOL VIOLATION] INV-024: results count mismatch: sent {} commands but received {} results",
+            num_commands,
+            response.results.len()
+        );
+        valid = false;
+    }
+
+    valid
+}
+
+// ── Unix socket mode ────────────────────────────────────────────────────────
+
+fn run_unix_mode(args: &Args) -> anyhow::Result<()> {
+    // Clean up stale socket
+    let _ = std::fs::remove_file(&args.socket);
+
+    let listener =
+        UnixListener::bind(&args.socket).with_context(|| format!("bind to {}", args.socket))?;
+    println!("[MockManager] Listening on {}...", args.socket);
+
+    let (mut stream, _addr) = listener.accept().context("accept connection")?;
+    stream
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .context("set_read_timeout")?;
+
+    // Step 1: Receive Capability
+    println!("[MockManager] Engine connected, waiting for Capability...");
+    let capability = recv_blocking_with_timeout(&mut stream, Duration::from_secs(5))?;
+    match &capability {
+        EngineMessage::Capability(cap) => {
+            println!(
+                "[MockManager] Engine Capability: devices={:?}, active={}, max_kv={}, layers={}",
+                cap.available_devices, cap.active_device, cap.max_kv_tokens, cap.num_layers
+            );
+        }
+        other => {
+            bail!(
+                "Expected Capability as first message, got: {:?}",
+                std::mem::discriminant(other)
+            );
+        }
+    }
+
+    // Step 2: Wait for Heartbeats
+    let wait_until = std::time::Instant::now() + Duration::from_secs(args.wait_secs);
+    let mut heartbeat_count = 0u32;
+    while std::time::Instant::now() < wait_until {
+        match recv_message(&mut stream)? {
+            Some(EngineMessage::Heartbeat(status)) => {
+                heartbeat_count += 1;
+                println!(
+                    "[MockManager] Heartbeat #{}: device={}, kv_util={:.3}, tokens={}, state={:?}, \
+                     active_actions={:?}",
+                    heartbeat_count,
+                    status.active_device,
+                    status.kv_cache_utilization,
+                    status.tokens_generated,
+                    status.state,
+                    status.active_actions,
+                );
+            }
+            Some(other) => {
+                println!(
+                    "[MockManager] Unexpected message during wait: {:?}",
+                    std::mem::discriminant(&other)
+                );
+            }
+            None => {
+                // Timeout, continue waiting
+            }
+        }
+    }
+    println!(
+        "[MockManager] Received {} heartbeats during {}s wait",
+        heartbeat_count, args.wait_secs
+    );
+
+    // Step 3: Send directive(s)
     if let Some(scenario_path) = &args.scenario {
-        run_scenario(&conn, scenario_path)?;
-    } else if let Some(signal_name) = &args.signal {
-        emit_single(&conn, &args, signal_name)?;
+        run_unix_scenario(&mut stream, scenario_path)?;
+    } else if let Some(cmd_name) = &args.command {
+        run_unix_single_command(args, &mut stream, cmd_name)?;
     } else {
-        anyhow::bail!("Either --signal or --scenario must be specified");
+        #[cfg(feature = "dbus")]
+        if !args.dbus {
+            bail!("Either --command or --scenario must be specified for Unix socket mode");
+        }
+        #[cfg(not(feature = "dbus"))]
+        bail!("Either --command or --scenario must be specified");
+    }
+
+    // Step 4: Receive a few more heartbeats to observe effect
+    println!("[MockManager] Observing post-directive heartbeats...");
+    let observe_until = std::time::Instant::now() + Duration::from_secs(2);
+    while std::time::Instant::now() < observe_until {
+        match recv_message(&mut stream)? {
+            Some(EngineMessage::Heartbeat(status)) => {
+                heartbeat_count += 1;
+                println!(
+                    "[MockManager] Heartbeat #{}: device={}, kv_util={:.3}, active_actions={:?}",
+                    heartbeat_count,
+                    status.active_device,
+                    status.kv_cache_utilization,
+                    status.active_actions,
+                );
+            }
+            Some(_) => {}
+            None => {}
+        }
+    }
+
+    println!("[MockManager] Done.");
+    Ok(())
+}
+
+/// Receive a message with a hard timeout, retrying on WouldBlock.
+fn recv_blocking_with_timeout(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> anyhow::Result<EngineMessage> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::time::Instant::now() >= deadline {
+            bail!("Timed out waiting for message ({:?})", timeout);
+        }
+        match recv_message(stream)? {
+            Some(msg) => return Ok(msg),
+            None => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+fn run_unix_single_command(
+    args: &Args,
+    stream: &mut UnixStream,
+    cmd_name: &str,
+) -> anyhow::Result<()> {
+    let cmd = build_command(&CommandParams {
+        name: cmd_name,
+        keep_ratio: args.keep_ratio,
+        sink_size: args.sink_size,
+        window_size: args.window_size,
+        delay_ms: args.delay_ms,
+        device: args.device.as_deref(),
+        target_bits: args.target_bits,
+        skip_ratio: args.skip_ratio,
+    })?;
+
+    let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
+    let seq_id = 1u64;
+
+    let directive = ManagerMessage::Directive(EngineDirective {
+        seq_id,
+        commands: vec![cmd],
+    });
+
+    send_message(stream, &directive)?;
+    println!(
+        "[MockManager] Sent: Directive seq_id={} [{}]",
+        seq_id, cmd_name
+    );
+
+    // Wait for Response
+    let response_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
+    match response_msg {
+        EngineMessage::Response(resp) => {
+            validate_response(seq_id, &resp, 1);
+            println!(
+                "[MockManager] Response seq_id={}: {:?}",
+                resp.seq_id, resp.results
+            );
+        }
+        other => {
+            println!(
+                "[MockManager] Unexpected message (expected Response): {:?}",
+                std::mem::discriminant(&other)
+            );
+        }
+    }
+
+    // TOOL-038: If RequestQcf, wait for QcfEstimate
+    if is_request_qcf {
+        let qcf_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
+        match qcf_msg {
+            EngineMessage::QcfEstimate(qcf) => {
+                println!(
+                    "[MockManager] QcfEstimate received: {} entries",
+                    qcf.estimates.len()
+                );
+                for (action, cost) in &qcf.estimates {
+                    println!("  {}: {:.4}", action, cost);
+                }
+            }
+            other => {
+                println!(
+                    "[MockManager] Unexpected message (expected QcfEstimate): {:?}",
+                    std::mem::discriminant(&other)
+                );
+            }
+        }
     }
 
     Ok(())
 }
 
-fn run_scenario(conn: &zbus::blocking::Connection, path: &PathBuf) -> anyhow::Result<()> {
-    let content = std::fs::read_to_string(path)?;
-    let scenario: Scenario = serde_json::from_str(&content)?;
+fn run_unix_scenario(stream: &mut UnixStream, path: &PathBuf) -> anyhow::Result<()> {
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read scenario file: {:?}", path))?;
+    let scenario: CommandScenario =
+        serde_json::from_str(&content).context("parse scenario JSON")?;
 
     println!(
-        "Playing scenario: {} ({} signals)",
+        "[MockManager] Playing scenario: {} ({} commands)",
         scenario.name,
-        scenario.signals.len()
+        scenario.commands.len()
     );
     if let Some(desc) = &scenario.description {
         println!("  {}", desc);
     }
 
-    for (i, entry) in scenario.signals.iter().enumerate() {
+    let mut seq_id = 0u64;
+
+    for (i, entry) in scenario.commands.iter().enumerate() {
         if entry.delay_ms > 0 {
             println!("  Waiting {}ms...", entry.delay_ms);
-            std::thread::sleep(std::time::Duration::from_millis(entry.delay_ms));
+
+            // Drain heartbeats during wait
+            let wait_until = std::time::Instant::now() + Duration::from_millis(entry.delay_ms);
+            while std::time::Instant::now() < wait_until {
+                match recv_message(stream) {
+                    Ok(Some(EngineMessage::Heartbeat(status))) => {
+                        println!(
+                            "  (heartbeat: kv_util={:.3}, actions={:?})",
+                            status.kv_cache_utilization, status.active_actions
+                        );
+                    }
+                    _ => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
         }
 
-        emit_scenario_signal(conn, entry)?;
+        let cmd = build_command(&CommandParams {
+            name: &entry.command,
+            keep_ratio: entry.keep_ratio,
+            sink_size: entry.sink_size,
+            window_size: entry.window_size,
+            delay_ms: entry.delay_ms_param,
+            device: entry.device.as_deref(),
+            target_bits: entry.target_bits,
+            skip_ratio: entry.skip_ratio,
+        })?;
+
+        let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
+        seq_id += 1;
+
+        let directive = ManagerMessage::Directive(EngineDirective {
+            seq_id,
+            commands: vec![cmd],
+        });
+
+        send_message(stream, &directive)?;
         println!(
-            "  [{}/{}] Emitted {} (level={})",
+            "  [{}/{}] Sent: {} (seq_id={})",
             i + 1,
-            scenario.signals.len(),
-            entry.signal,
-            entry.level
+            scenario.commands.len(),
+            entry.command,
+            seq_id
         );
+
+        // Wait for Response
+        let response_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
+        match response_msg {
+            EngineMessage::Response(resp) => {
+                validate_response(seq_id, &resp, 1);
+                println!("  Response: {:?}", resp.results);
+            }
+            other => {
+                println!("  Unexpected: {:?}", std::mem::discriminant(&other));
+            }
+        }
+
+        if is_request_qcf {
+            let qcf_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
+            match qcf_msg {
+                EngineMessage::QcfEstimate(qcf) => {
+                    println!("  QcfEstimate: {} entries", qcf.estimates.len());
+                }
+                other => {
+                    println!(
+                        "  Unexpected (expected QcfEstimate): {:?}",
+                        std::mem::discriminant(&other)
+                    );
+                }
+            }
+        }
     }
 
-    println!("Scenario complete.");
+    println!("[MockManager] Scenario complete.");
     Ok(())
 }
 
-fn emit_scenario_signal(
-    conn: &zbus::blocking::Connection,
-    entry: &ScenarioSignal,
-) -> anyhow::Result<()> {
-    match entry.signal.as_str() {
-        "MemoryPressure" => {
-            let body = (
-                &entry.level,
-                entry.available_bytes.unwrap_or(0),
-                entry.reclaim_target_bytes.unwrap_or(0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "MemoryPressure",
-                &body,
-            )?;
-        }
-        "ComputeGuidance" => {
-            let body = (
-                &entry.level,
-                entry.recommended_backend.as_deref().unwrap_or("any"),
-                entry.reason.as_deref().unwrap_or("balanced"),
-                entry.cpu_usage_pct.unwrap_or(0.0),
-                entry.gpu_usage_pct.unwrap_or(0.0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "ComputeGuidance",
-                &body,
-            )?;
-        }
-        "ThermalAlert" => {
-            let body = (
-                &entry.level,
-                entry.temperature_mc.unwrap_or(25000),
-                entry.throttling_active.unwrap_or(false),
-                entry.throttle_ratio.unwrap_or(1.0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "ThermalAlert",
-                &body,
-            )?;
-        }
-        "EnergyConstraint" => {
-            let body = (
-                &entry.level,
-                entry.reason.as_deref().unwrap_or("none"),
-                entry.power_budget_mw.unwrap_or(0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "EnergyConstraint",
-                &body,
-            )?;
-        }
-        other => {
-            anyhow::bail!("Unknown signal type: {}", other);
-        }
+// ── D-Bus mode (legacy) ─────────────────────────────────────────────────────
+
+#[cfg(feature = "dbus")]
+mod dbus_mode {
+    use super::*;
+
+    const MANAGER_NAME: &str = "org.llm.Manager1";
+    const MANAGER_PATH: &str = "/org/llm/Manager1";
+    const MANAGER_IFACE: &str = "org.llm.Manager1";
+
+    /// D-Bus scenario file format.
+    #[derive(Debug, Deserialize)]
+    pub struct DbusScenario {
+        pub name: String,
+        #[serde(default)]
+        pub description: Option<String>,
+        pub signals: Vec<DbusScenarioSignal>,
     }
-    Ok(())
+
+    #[derive(Debug, Deserialize)]
+    pub struct DbusScenarioSignal {
+        pub delay_ms: u64,
+        pub signal: String,
+        pub level: String,
+        #[serde(default)]
+        pub available_bytes: Option<u64>,
+        #[serde(default)]
+        pub reclaim_target_bytes: Option<u64>,
+        #[serde(default)]
+        pub recommended_backend: Option<String>,
+        #[serde(default)]
+        pub reason: Option<String>,
+        #[serde(default)]
+        pub cpu_usage_pct: Option<f64>,
+        #[serde(default)]
+        pub gpu_usage_pct: Option<f64>,
+        #[serde(default)]
+        pub temperature_mc: Option<i32>,
+        #[serde(default)]
+        pub throttling_active: Option<bool>,
+        #[serde(default)]
+        pub throttle_ratio: Option<f64>,
+        #[serde(default)]
+        pub power_budget_mw: Option<u32>,
+    }
+
+    pub fn run_dbus_mode(args: &Args) -> anyhow::Result<()> {
+        let conn = zbus::blocking::Connection::system()?;
+        conn.request_name(MANAGER_NAME)?;
+        println!("Registered as {} on System Bus", MANAGER_NAME);
+
+        if let Some(scenario_path) = &args.scenario {
+            run_dbus_scenario(&conn, scenario_path)?;
+        } else if let Some(signal_name) = &args.signal {
+            emit_single(&conn, args, signal_name)?;
+        } else {
+            anyhow::bail!("D-Bus mode requires --signal or --scenario");
+        }
+
+        Ok(())
+    }
+
+    fn run_dbus_scenario(conn: &zbus::blocking::Connection, path: &PathBuf) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        let scenario: DbusScenario = serde_json::from_str(&content)?;
+
+        println!(
+            "Playing scenario: {} ({} signals)",
+            scenario.name,
+            scenario.signals.len()
+        );
+        if let Some(desc) = &scenario.description {
+            println!("  {}", desc);
+        }
+
+        for (i, entry) in scenario.signals.iter().enumerate() {
+            if entry.delay_ms > 0 {
+                println!("  Waiting {}ms...", entry.delay_ms);
+                std::thread::sleep(Duration::from_millis(entry.delay_ms));
+            }
+
+            emit_scenario_signal(conn, entry)?;
+            println!(
+                "  [{}/{}] Emitted {} (level={})",
+                i + 1,
+                scenario.signals.len(),
+                entry.signal,
+                entry.level
+            );
+        }
+
+        println!("Scenario complete.");
+        Ok(())
+    }
+
+    fn emit_scenario_signal(
+        conn: &zbus::blocking::Connection,
+        entry: &DbusScenarioSignal,
+    ) -> anyhow::Result<()> {
+        match entry.signal.as_str() {
+            "MemoryPressure" => {
+                let body = (
+                    &entry.level,
+                    entry.available_bytes.unwrap_or(0),
+                    entry.reclaim_target_bytes.unwrap_or(0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "MemoryPressure",
+                    &body,
+                )?;
+            }
+            "ComputeGuidance" => {
+                let body = (
+                    &entry.level,
+                    entry.recommended_backend.as_deref().unwrap_or("any"),
+                    entry.reason.as_deref().unwrap_or("balanced"),
+                    entry.cpu_usage_pct.unwrap_or(0.0),
+                    entry.gpu_usage_pct.unwrap_or(0.0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "ComputeGuidance",
+                    &body,
+                )?;
+            }
+            "ThermalAlert" => {
+                let body = (
+                    &entry.level,
+                    entry.temperature_mc.unwrap_or(25000),
+                    entry.throttling_active.unwrap_or(false),
+                    entry.throttle_ratio.unwrap_or(1.0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "ThermalAlert",
+                    &body,
+                )?;
+            }
+            "EnergyConstraint" => {
+                let body = (
+                    &entry.level,
+                    entry.reason.as_deref().unwrap_or("none"),
+                    entry.power_budget_mw.unwrap_or(0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "EnergyConstraint",
+                    &body,
+                )?;
+            }
+            other => {
+                anyhow::bail!("Unknown signal type: {}", other);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_single(
+        conn: &zbus::blocking::Connection,
+        args: &Args,
+        signal_name: &str,
+    ) -> anyhow::Result<()> {
+        let level = args.level.as_deref().unwrap_or("normal");
+
+        match signal_name {
+            "MemoryPressure" => {
+                let body = (
+                    level,
+                    args.available_bytes.unwrap_or(0),
+                    args.reclaim_target.unwrap_or(0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "MemoryPressure",
+                    &body,
+                )?;
+            }
+            "ComputeGuidance" => {
+                let body = (
+                    level,
+                    args.recommended_backend.as_deref().unwrap_or("any"),
+                    args.reason.as_deref().unwrap_or("balanced"),
+                    args.cpu_usage.unwrap_or(0.0),
+                    args.gpu_usage.unwrap_or(0.0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "ComputeGuidance",
+                    &body,
+                )?;
+            }
+            "ThermalAlert" => {
+                let body = (
+                    level,
+                    args.temperature_mc.unwrap_or(25000),
+                    args.throttling_active.unwrap_or(false),
+                    args.throttle_ratio.unwrap_or(1.0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "ThermalAlert",
+                    &body,
+                )?;
+            }
+            "EnergyConstraint" => {
+                let body = (
+                    level,
+                    args.reason.as_deref().unwrap_or("none"),
+                    args.power_budget_mw.unwrap_or(0),
+                );
+                conn.emit_signal(
+                    Option::<&str>::None,
+                    MANAGER_PATH,
+                    MANAGER_IFACE,
+                    "EnergyConstraint",
+                    &body,
+                )?;
+            }
+            other => {
+                anyhow::bail!("Unknown signal: {}", other);
+            }
+        }
+
+        println!("Emitted {} (level={})", signal_name, level);
+        Ok(())
+    }
 }
 
-fn emit_single(
-    conn: &zbus::blocking::Connection,
-    args: &Args,
-    signal_name: &str,
-) -> anyhow::Result<()> {
-    let level = args.level.as_deref().unwrap_or("normal");
+// ── Entry point ─────────────────────────────────────────────────────────────
 
-    match signal_name {
-        "MemoryPressure" => {
-            let body = (
-                level,
-                args.available_bytes.unwrap_or(0),
-                args.reclaim_target.unwrap_or(0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "MemoryPressure",
-                &body,
-            )?;
-        }
-        "ComputeGuidance" => {
-            let body = (
-                level,
-                args.recommended_backend.as_deref().unwrap_or("any"),
-                args.reason.as_deref().unwrap_or("balanced"),
-                args.cpu_usage.unwrap_or(0.0),
-                args.gpu_usage.unwrap_or(0.0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "ComputeGuidance",
-                &body,
-            )?;
-        }
-        "ThermalAlert" => {
-            let body = (
-                level,
-                args.temperature_mc.unwrap_or(25000),
-                args.throttling_active.unwrap_or(false),
-                args.throttle_ratio.unwrap_or(1.0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "ThermalAlert",
-                &body,
-            )?;
-        }
-        "EnergyConstraint" => {
-            let body = (
-                level,
-                args.reason.as_deref().unwrap_or("none"),
-                args.power_budget_mw.unwrap_or(0),
-            );
-            conn.emit_signal(
-                Option::<&str>::None,
-                MANAGER_PATH,
-                MANAGER_IFACE,
-                "EnergyConstraint",
-                &body,
-            )?;
-        }
-        other => {
-            anyhow::bail!("Unknown signal: {}", other);
+fn main() -> anyhow::Result<()> {
+    env_logger::init();
+    let args = Args::parse();
+
+    #[cfg(feature = "dbus")]
+    if args.dbus {
+        return dbus_mode::run_dbus_mode(&args);
+    }
+
+    run_unix_mode(&args)
+}
+
+// ── Unit tests ──────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use llm_shared::{
+        CommandResponse, CommandResult, EngineCapability, EngineState, EngineStatus, ResourceLevel,
+    };
+    use std::os::unix::net::UnixListener;
+
+    fn tmp_sock() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mock_manager_test.sock");
+        (dir, path)
+    }
+
+    // Helper: send an EngineMessage over a stream (engine side)
+    fn engine_send(stream: &mut UnixStream, msg: &EngineMessage) {
+        let json = serde_json::to_vec(msg).unwrap();
+        let len = (json.len() as u32).to_be_bytes();
+        stream.write_all(&len).unwrap();
+        stream.write_all(&json).unwrap();
+        stream.flush().unwrap();
+    }
+
+    // Helper: receive a ManagerMessage from a stream (engine side)
+    #[allow(dead_code)]
+    fn engine_recv(stream: &mut UnixStream) -> ManagerMessage {
+        let mut len_buf = [0u8; 4];
+        stream.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut json_buf = vec![0u8; len];
+        stream.read_exact(&mut json_buf).unwrap();
+        serde_json::from_slice(&json_buf).unwrap()
+    }
+
+    fn make_capability() -> EngineCapability {
+        EngineCapability {
+            available_devices: vec!["cpu".into(), "opencl".into()],
+            active_device: "opencl".into(),
+            max_kv_tokens: 2048,
+            bytes_per_kv_token: 256,
+            num_layers: 16,
         }
     }
 
-    println!("Emitted {} (level={})", signal_name, level);
-    Ok(())
+    #[allow(dead_code)]
+    fn make_heartbeat_status() -> EngineStatus {
+        EngineStatus {
+            active_device: "opencl".to_string(),
+            compute_level: ResourceLevel::Normal,
+            actual_throughput: 15.0,
+            memory_level: ResourceLevel::Normal,
+            kv_cache_bytes: 128_000,
+            kv_cache_tokens: 500,
+            kv_cache_utilization: 0.5,
+            memory_lossless_min: 1.0,
+            memory_lossy_min: 0.01,
+            state: EngineState::Running,
+            tokens_generated: 10,
+            available_actions: vec!["throttle".into(), "kv_evict_sliding".into()],
+            active_actions: vec![],
+            eviction_policy: "none".into(),
+            kv_dtype: "f16".into(),
+            skip_ratio: 0.0,
+        }
+    }
+
+    // ── Wire format round-trip tests ─────────────────────────────────────────
+
+    #[test]
+    fn send_message_writes_length_prefixed_json() {
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let directive = ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::Suspend],
+        });
+
+        send_message(&mut client, &directive).unwrap();
+
+        // Read on server side
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut json_buf = vec![0u8; len];
+        server.read_exact(&mut json_buf).unwrap();
+
+        let msg: ManagerMessage = serde_json::from_slice(&json_buf).unwrap();
+        match msg {
+            ManagerMessage::Directive(d) => {
+                assert_eq!(d.seq_id, 1);
+                assert!(matches!(d.commands[0], EngineCommand::Suspend));
+            }
+        }
+    }
+
+    #[test]
+    fn recv_message_returns_none_on_timeout() {
+        let (_dir, sock_path) = tmp_sock();
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+
+        let result = recv_message(&mut client).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn recv_message_parses_engine_message() {
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        engine_send(&mut server, &EngineMessage::Capability(make_capability()));
+
+        client
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let msg = recv_message(&mut client).unwrap().unwrap();
+        assert!(matches!(msg, EngineMessage::Capability(_)));
+    }
+
+    // ── build_command tests ──────────────────────────────────────────────────
+
+    fn params(name: &str) -> CommandParams<'_> {
+        CommandParams {
+            name,
+            keep_ratio: None,
+            sink_size: None,
+            window_size: None,
+            delay_ms: None,
+            device: None,
+            target_bits: None,
+            skip_ratio: None,
+        }
+    }
+
+    #[test]
+    fn build_command_kv_evict_sliding() {
+        let cmd = build_command(&CommandParams {
+            keep_ratio: Some(0.7),
+            ..params("KvEvictSliding")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::KvEvictSliding { keep_ratio } => {
+                assert!((keep_ratio - 0.7).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvEvictSliding"),
+        }
+    }
+
+    #[test]
+    fn build_command_kv_evict_sliding_missing_ratio() {
+        let result = build_command(&params("KvEvictSliding"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_command_kv_streaming() {
+        let cmd = build_command(&CommandParams {
+            sink_size: Some(4),
+            window_size: Some(256),
+            ..params("KvStreaming")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::KvStreaming {
+                sink_size,
+                window_size,
+            } => {
+                assert_eq!(sink_size, 4);
+                assert_eq!(window_size, 256);
+            }
+            _ => panic!("Expected KvStreaming"),
+        }
+    }
+
+    #[test]
+    fn build_command_throttle() {
+        let cmd = build_command(&CommandParams {
+            delay_ms: Some(50),
+            ..params("Throttle")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::Throttle { delay_ms } => assert_eq!(delay_ms, 50),
+            _ => panic!("Expected Throttle"),
+        }
+    }
+
+    #[test]
+    fn build_command_switch_hw() {
+        let cmd = build_command(&CommandParams {
+            device: Some("cpu"),
+            ..params("SwitchHw")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::SwitchHw { device } => assert_eq!(device, "cpu"),
+            _ => panic!("Expected SwitchHw"),
+        }
+    }
+
+    #[test]
+    fn build_command_layer_skip() {
+        let cmd = build_command(&CommandParams {
+            skip_ratio: Some(0.3),
+            ..params("LayerSkip")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::LayerSkip { skip_ratio } => {
+                assert!((skip_ratio - 0.3).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected LayerSkip"),
+        }
+    }
+
+    #[test]
+    fn build_command_parameterless_variants() {
+        assert!(matches!(
+            build_command(&params("Suspend")).unwrap(),
+            EngineCommand::Suspend
+        ));
+        assert!(matches!(
+            build_command(&params("Resume")).unwrap(),
+            EngineCommand::Resume
+        ));
+        assert!(matches!(
+            build_command(&params("RestoreDefaults")).unwrap(),
+            EngineCommand::RestoreDefaults
+        ));
+        assert!(matches!(
+            build_command(&params("RequestQcf")).unwrap(),
+            EngineCommand::RequestQcf
+        ));
+    }
+
+    #[test]
+    fn build_command_unknown() {
+        let result = build_command(&params("FooBar"));
+        assert!(result.is_err());
+    }
+
+    // ── validate_response tests ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_response_ok() {
+        let resp = CommandResponse {
+            seq_id: 1,
+            results: vec![CommandResult::Ok],
+        };
+        assert!(validate_response(1, &resp, 1));
+    }
+
+    #[test]
+    fn validate_response_seq_id_mismatch() {
+        let resp = CommandResponse {
+            seq_id: 2,
+            results: vec![CommandResult::Ok],
+        };
+        assert!(!validate_response(1, &resp, 1));
+    }
+
+    #[test]
+    fn validate_response_results_count_mismatch() {
+        let resp = CommandResponse {
+            seq_id: 1,
+            results: vec![CommandResult::Ok, CommandResult::Ok],
+        };
+        assert!(!validate_response(1, &resp, 1));
+    }
+
+    // ── Scenario deserialization tests ────────────────────────────────────────
+
+    #[test]
+    fn command_scenario_deserialize() {
+        let json = r#"{
+            "name": "test_scenario",
+            "description": "A test",
+            "commands": [
+                { "delay_ms": 1000, "command": "KvEvictSliding", "keep_ratio": 0.8 },
+                { "delay_ms": 500, "command": "RestoreDefaults" },
+                { "delay_ms": 0, "command": "RequestQcf" }
+            ]
+        }"#;
+        let scenario: CommandScenario = serde_json::from_str(json).unwrap();
+        assert_eq!(scenario.name, "test_scenario");
+        assert_eq!(scenario.commands.len(), 3);
+        assert_eq!(scenario.commands[0].command, "KvEvictSliding");
+        assert!((scenario.commands[0].keep_ratio.unwrap() - 0.8).abs() < f32::EPSILON);
+        assert_eq!(scenario.commands[1].command, "RestoreDefaults");
+        assert!(scenario.commands[1].keep_ratio.is_none());
+    }
 }

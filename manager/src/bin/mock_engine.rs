@@ -25,6 +25,7 @@
 //!     --duration-secs 30
 //! ```
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -33,7 +34,7 @@ use anyhow::Context;
 use clap::Parser;
 use llm_shared::{
     CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineDirective,
-    EngineMessage, EngineState, EngineStatus, ManagerMessage, ResourceLevel,
+    EngineMessage, EngineState, EngineStatus, ManagerMessage, QcfEstimate, ResourceLevel,
 };
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
@@ -110,6 +111,18 @@ fn recv_message(stream: &mut UnixStream) -> anyhow::Result<Option<ManagerMessage
 
 // ── State ────────────────────────────────────────────────────────────────────
 
+/// All action identifiers the engine can support.
+const ALL_AVAILABLE_ACTIONS: &[&str] = &[
+    "switch_hw",
+    "throttle",
+    "kv_evict_sliding",
+    "kv_evict_h2o",
+    "kv_evict_streaming",
+    "kv_merge_d2o",
+    "kv_quant_dynamic",
+    "layer_skip",
+];
+
 /// Mutable engine state that updates in response to received Directives.
 struct EngineState_ {
     kv_occupancy: f32,
@@ -119,6 +132,8 @@ struct EngineState_ {
     skip_ratio: f32,
     state: EngineState,
     tokens_generated: usize,
+    active_actions: Vec<String>,
+    available_actions: Vec<String>,
 }
 
 impl EngineState_ {
@@ -131,6 +146,18 @@ impl EngineState_ {
             skip_ratio: 0.0,
             state: EngineState::Running,
             tokens_generated: 0,
+            active_actions: vec![],
+            available_actions: ALL_AVAILABLE_ACTIONS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+
+    /// Add an action to active_actions if not already present.
+    fn activate_action(&mut self, action: &str) {
+        if !self.active_actions.iter().any(|a| a == action) {
+            self.active_actions.push(action.to_string());
         }
     }
 
@@ -142,6 +169,7 @@ impl EngineState_ {
                 let before = self.kv_occupancy;
                 self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
                 self.eviction_policy = "sliding".to_string();
+                self.activate_action("kv_evict_sliding");
                 println!(
                     "  → KvEvictSliding: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
                     before, self.kv_occupancy, keep_ratio
@@ -152,6 +180,7 @@ impl EngineState_ {
                 let before = self.kv_occupancy;
                 self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
                 self.eviction_policy = "h2o".to_string();
+                self.activate_action("kv_evict_h2o");
                 println!(
                     "  → KvEvictH2o: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
                     before, self.kv_occupancy, keep_ratio
@@ -163,6 +192,7 @@ impl EngineState_ {
                 window_size,
             } => {
                 self.eviction_policy = "streaming".to_string();
+                self.activate_action("kv_evict_streaming");
                 println!(
                     "  → KvStreaming: sink_size={} window_size={}",
                     sink_size, window_size
@@ -173,6 +203,7 @@ impl EngineState_ {
                 let before = self.kv_occupancy;
                 self.kv_occupancy = (self.kv_occupancy * keep_ratio).clamp(0.01, 1.0);
                 self.eviction_policy = "d2o".to_string();
+                self.activate_action("kv_merge_d2o");
                 println!(
                     "  → KvMergeD2o: kv_occupancy {:.3} → {:.3} (keep_ratio={:.2})",
                     before, self.kv_occupancy, keep_ratio
@@ -180,22 +211,26 @@ impl EngineState_ {
                 CommandResult::Ok
             }
             EngineCommand::KvQuantDynamic { target_bits } => {
+                self.activate_action("kv_quant_dynamic");
                 println!("  → KvQuantDynamic: target_bits={}", target_bits);
                 CommandResult::Ok
             }
             EngineCommand::Throttle { delay_ms } => {
                 self.throttle_delay_ms = *delay_ms;
+                self.activate_action("throttle");
                 println!("  → Throttle: delay_ms={}", delay_ms);
                 CommandResult::Ok
             }
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.skip_ratio = *skip_ratio;
+                self.activate_action("layer_skip");
                 println!("  → LayerSkip: skip_ratio={:.2}", skip_ratio);
                 CommandResult::Ok
             }
             EngineCommand::SwitchHw { device } => {
                 println!("  → SwitchHw: {} → {}", self.active_device, device);
                 self.active_device = device.clone();
+                self.activate_action("switch_hw");
                 CommandResult::Ok
             }
             EngineCommand::PrepareComputeUnit { device } => {
@@ -206,6 +241,7 @@ impl EngineState_ {
                 self.throttle_delay_ms = 0;
                 self.skip_ratio = 0.0;
                 self.eviction_policy = "none".to_string();
+                self.active_actions.clear();
                 println!("  → RestoreDefaults");
                 CommandResult::Ok
             }
@@ -220,7 +256,7 @@ impl EngineState_ {
                 CommandResult::Ok
             }
             EngineCommand::RequestQcf => {
-                println!("  → RequestQcf (returning Ok)");
+                println!("  → RequestQcf (returning Ok + QcfEstimate)");
                 CommandResult::Ok
             }
         }
@@ -243,8 +279,8 @@ impl EngineState_ {
             memory_lossy_min: 0.01,
             state: self.state,
             tokens_generated: self.tokens_generated,
-            available_actions: vec![],
-            active_actions: vec![],
+            available_actions: self.available_actions.clone(),
+            active_actions: self.active_actions.clone(),
             eviction_policy: self.eviction_policy.clone(),
             kv_dtype: "f16".to_string(),
             skip_ratio: self.skip_ratio,
@@ -388,8 +424,31 @@ fn handle_directive(
             "[MockEngine] Failed to send Response for seq={}: {}",
             directive.seq_id, e
         );
-    } else {
-        println!("[MockEngine] Response sent for seq={}", directive.seq_id);
+        return;
+    }
+    println!("[MockEngine] Response sent for seq={}", directive.seq_id);
+
+    // TOOL-019: If any command was RequestQcf, send a separate QcfEstimate message
+    let has_request_qcf = directive
+        .commands
+        .iter()
+        .any(|c| matches!(c, EngineCommand::RequestQcf));
+    if has_request_qcf {
+        let mut estimates = HashMap::new();
+        estimates.insert("kv_evict_sliding".to_string(), 0.05_f32);
+        estimates.insert("kv_evict_h2o".to_string(), 0.12);
+        estimates.insert("kv_merge_d2o".to_string(), 0.08);
+        estimates.insert("kv_quant_dynamic".to_string(), 0.15);
+        estimates.insert("layer_skip".to_string(), 0.20);
+        let qcf = QcfEstimate { estimates };
+        if let Err(e) = send_message(stream, &EngineMessage::QcfEstimate(qcf)) {
+            eprintln!(
+                "[MockEngine] Failed to send QcfEstimate for seq={}: {}",
+                directive.seq_id, e
+            );
+        } else {
+            println!("[MockEngine] QcfEstimate sent for seq={}", directive.seq_id);
+        }
     }
 }
 
@@ -602,6 +661,112 @@ mod tests {
         // kv_cache_tokens should equal floor(0.6 * 2048) = 1228
         assert_eq!(status.kv_cache_tokens, (0.6 * 2048.0_f32) as usize);
         assert_eq!(status.kv_cache_bytes, status.kv_cache_tokens as u64 * 256);
+        // available_actions should contain all supported actions
+        assert_eq!(status.available_actions.len(), ALL_AVAILABLE_ACTIONS.len());
+        assert!(status.active_actions.is_empty());
+    }
+
+    #[test]
+    fn apply_tracks_active_actions() {
+        let mut s = EngineState_::new(0.5, "cpu".into());
+        assert!(s.active_actions.is_empty());
+
+        s.apply(&EngineCommand::KvEvictSliding { keep_ratio: 0.8 });
+        assert!(s.active_actions.contains(&"kv_evict_sliding".to_string()));
+
+        s.apply(&EngineCommand::Throttle { delay_ms: 50 });
+        assert!(s.active_actions.contains(&"throttle".to_string()));
+        assert_eq!(s.active_actions.len(), 2);
+
+        // Duplicate action should not add twice
+        s.apply(&EngineCommand::Throttle { delay_ms: 100 });
+        assert_eq!(
+            s.active_actions.iter().filter(|a| *a == "throttle").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn restore_defaults_clears_active_actions() {
+        let mut s = EngineState_::new(0.5, "cpu".into());
+        s.apply(&EngineCommand::KvEvictH2o { keep_ratio: 0.5 });
+        s.apply(&EngineCommand::LayerSkip { skip_ratio: 0.3 });
+        assert_eq!(s.active_actions.len(), 2);
+
+        s.apply(&EngineCommand::RestoreDefaults);
+        assert!(s.active_actions.is_empty());
+    }
+
+    #[test]
+    fn all_command_types_track_active_actions() {
+        let mut s = EngineState_::new(0.5, "cpu".into());
+        s.apply(&EngineCommand::KvEvictSliding { keep_ratio: 0.8 });
+        s.apply(&EngineCommand::KvEvictH2o { keep_ratio: 0.7 });
+        s.apply(&EngineCommand::KvStreaming {
+            sink_size: 4,
+            window_size: 256,
+        });
+        s.apply(&EngineCommand::KvMergeD2o { keep_ratio: 0.75 });
+        s.apply(&EngineCommand::KvQuantDynamic { target_bits: 4 });
+        s.apply(&EngineCommand::Throttle { delay_ms: 50 });
+        s.apply(&EngineCommand::LayerSkip { skip_ratio: 0.3 });
+        s.apply(&EngineCommand::SwitchHw {
+            device: "opencl".into(),
+        });
+
+        assert!(s.active_actions.contains(&"kv_evict_sliding".to_string()));
+        assert!(s.active_actions.contains(&"kv_evict_h2o".to_string()));
+        assert!(s.active_actions.contains(&"kv_evict_streaming".to_string()));
+        assert!(s.active_actions.contains(&"kv_merge_d2o".to_string()));
+        assert!(s.active_actions.contains(&"kv_quant_dynamic".to_string()));
+        assert!(s.active_actions.contains(&"throttle".to_string()));
+        assert!(s.active_actions.contains(&"layer_skip".to_string()));
+        assert!(s.active_actions.contains(&"switch_hw".to_string()));
+        assert_eq!(s.active_actions.len(), 8);
+    }
+
+    #[test]
+    fn handle_directive_sends_qcf_estimate_on_request_qcf() {
+        use llm_shared::EngineDirective;
+        use std::io::Read;
+
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        let directive = EngineDirective {
+            seq_id: 10,
+            commands: vec![EngineCommand::RequestQcf],
+        };
+
+        let mut engine = EngineState_::new(0.5, "opencl".into());
+        let mut count = 0u32;
+        handle_directive(&directive, &mut engine, &mut count, &mut client);
+
+        // First message: Response
+        let mut len_buf = [0u8; 4];
+        server.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut json_buf = vec![0u8; len];
+        server.read_exact(&mut json_buf).unwrap();
+        let msg: EngineMessage = serde_json::from_slice(&json_buf).unwrap();
+        assert!(matches!(msg, EngineMessage::Response(_)));
+
+        // Second message: QcfEstimate
+        server.read_exact(&mut len_buf).unwrap();
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut json_buf = vec![0u8; len];
+        server.read_exact(&mut json_buf).unwrap();
+        let msg: EngineMessage = serde_json::from_slice(&json_buf).unwrap();
+        match msg {
+            EngineMessage::QcfEstimate(qcf) => {
+                assert!(!qcf.estimates.is_empty());
+                assert!(qcf.estimates.contains_key("kv_evict_h2o"));
+                assert!(qcf.estimates.contains_key("kv_evict_sliding"));
+            }
+            _ => panic!("Expected QcfEstimate"),
+        }
     }
 
     // ── handle_directive ─────────────────────────────────────────────────────
