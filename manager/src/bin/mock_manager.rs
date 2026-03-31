@@ -507,6 +507,74 @@ fn recv_blocking_with_timeout(
     }
 }
 
+/// Receive a `CommandResponse`, skipping any interleaved Heartbeat messages.
+///
+/// Engine's MessageLoop sends Heartbeats asynchronously, so one or more may
+/// arrive between our Directive and its Response. This helper logs and
+/// discards them until a Response is found or the timeout expires.
+fn recv_response_skip_heartbeats(
+    stream: &mut (impl Read + Write),
+    timeout: Duration,
+) -> anyhow::Result<Option<llm_shared::CommandResponse>> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match recv_message(stream)? {
+            Some(EngineMessage::Response(resp)) => return Ok(Some(resp)),
+            Some(EngineMessage::Heartbeat(status)) => {
+                println!(
+                    "[MockManager] (skipping heartbeat while waiting for Response: \
+                     kv_util={:.3}, tokens={})",
+                    status.kv_cache_utilization, status.tokens_generated,
+                );
+            }
+            Some(EngineMessage::QcfEstimate(_)) => {
+                println!("[MockManager] (unexpected QcfEstimate before Response, skipping)");
+            }
+            Some(EngineMessage::Capability(_)) => {
+                println!("[MockManager] (unexpected Capability after handshake, skipping)");
+            }
+            None => {
+                // read timeout / would-block, retry
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Receive a `QcfEstimate`, skipping any interleaved Heartbeat messages.
+fn recv_qcf_skip_heartbeats(
+    stream: &mut (impl Read + Write),
+    timeout: Duration,
+) -> anyhow::Result<Option<llm_shared::QcfEstimate>> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        match recv_message(stream)? {
+            Some(EngineMessage::QcfEstimate(est)) => return Ok(Some(est)),
+            Some(EngineMessage::Heartbeat(status)) => {
+                println!(
+                    "[MockManager] (skipping heartbeat while waiting for QcfEstimate: \
+                     kv_util={:.3}, tokens={})",
+                    status.kv_cache_utilization, status.tokens_generated,
+                );
+            }
+            Some(EngineMessage::Response(resp)) => {
+                println!(
+                    "[MockManager] (unexpected Response seq_id={} while waiting for QcfEstimate, skipping)",
+                    resp.seq_id,
+                );
+            }
+            Some(EngineMessage::Capability(_)) => {
+                println!("[MockManager] (unexpected Capability after handshake, skipping)");
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn run_single_command(
     args: &Args,
     stream: &mut (impl Read + Write),
@@ -537,29 +605,27 @@ fn run_single_command(
         seq_id, cmd_name
     );
 
-    // Wait for Response
-    let response_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
-    match response_msg {
-        EngineMessage::Response(resp) => {
+    // Wait for Response (skip interleaved Heartbeats)
+    match recv_response_skip_heartbeats(stream, Duration::from_secs(5))? {
+        Some(resp) => {
             validate_response(seq_id, &resp, 1);
             println!(
                 "[MockManager] Response seq_id={}: {:?}",
                 resp.seq_id, resp.results
             );
         }
-        other => {
+        None => {
             println!(
-                "[MockManager] Unexpected message (expected Response): {:?}",
-                std::mem::discriminant(&other)
+                "[MockManager] Timed out waiting for Response (seq_id={})",
+                seq_id
             );
         }
     }
 
-    // TOOL-038: If RequestQcf, wait for QcfEstimate
+    // TOOL-038: If RequestQcf, wait for QcfEstimate (skip interleaved Heartbeats)
     if is_request_qcf {
-        let qcf_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
-        match qcf_msg {
-            EngineMessage::QcfEstimate(qcf) => {
+        match recv_qcf_skip_heartbeats(stream, Duration::from_secs(5))? {
+            Some(qcf) => {
                 println!(
                     "[MockManager] QcfEstimate received: {} entries",
                     qcf.estimates.len()
@@ -568,11 +634,8 @@ fn run_single_command(
                     println!("  {}: {:.4}", action, cost);
                 }
             }
-            other => {
-                println!(
-                    "[MockManager] Unexpected message (expected QcfEstimate): {:?}",
-                    std::mem::discriminant(&other)
-                );
+            None => {
+                println!("[MockManager] Timed out waiting for QcfEstimate");
             }
         }
     }
@@ -646,29 +709,24 @@ fn run_scenario(stream: &mut (impl Read + Write), path: &PathBuf) -> anyhow::Res
             seq_id
         );
 
-        // Wait for Response
-        let response_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
-        match response_msg {
-            EngineMessage::Response(resp) => {
+        // Wait for Response (skip interleaved Heartbeats)
+        match recv_response_skip_heartbeats(stream, Duration::from_secs(5))? {
+            Some(resp) => {
                 validate_response(seq_id, &resp, 1);
                 println!("  Response: {:?}", resp.results);
             }
-            other => {
-                println!("  Unexpected: {:?}", std::mem::discriminant(&other));
+            None => {
+                println!("  Timed out waiting for Response (seq_id={})", seq_id);
             }
         }
 
         if is_request_qcf {
-            let qcf_msg = recv_blocking_with_timeout(stream, Duration::from_secs(5))?;
-            match qcf_msg {
-                EngineMessage::QcfEstimate(qcf) => {
+            match recv_qcf_skip_heartbeats(stream, Duration::from_secs(5))? {
+                Some(qcf) => {
                     println!("  QcfEstimate: {} entries", qcf.estimates.len());
                 }
-                other => {
-                    println!(
-                        "  Unexpected (expected QcfEstimate): {:?}",
-                        std::mem::discriminant(&other)
-                    );
+                None => {
+                    println!("  Timed out waiting for QcfEstimate");
                 }
             }
         }
@@ -1301,6 +1359,147 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
         let result = recv_message(&mut client).unwrap();
+        assert!(result.is_none());
+    }
+
+    // ── recv_response_skip_heartbeats tests ─────────────────────────────────
+
+    #[test]
+    fn recv_response_skip_heartbeats_skips_heartbeats() {
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Engine sends: Heartbeat, Heartbeat, Response
+        engine_send(
+            &mut client,
+            &EngineMessage::Heartbeat(make_heartbeat_status()),
+        );
+        engine_send(
+            &mut client,
+            &EngineMessage::Heartbeat(make_heartbeat_status()),
+        );
+        engine_send(
+            &mut client,
+            &EngineMessage::Response(CommandResponse {
+                seq_id: 1,
+                results: vec![CommandResult::Ok],
+            }),
+        );
+
+        let resp = recv_response_skip_heartbeats(&mut server, Duration::from_secs(2))
+            .unwrap()
+            .expect("should receive Response");
+        assert_eq!(resp.seq_id, 1);
+        assert_eq!(resp.results.len(), 1);
+    }
+
+    #[test]
+    fn recv_response_skip_heartbeats_returns_none_on_timeout() {
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        // Engine sends only heartbeats, no Response
+        engine_send(
+            &mut client,
+            &EngineMessage::Heartbeat(make_heartbeat_status()),
+        );
+
+        let result =
+            recv_response_skip_heartbeats(&mut server, Duration::from_millis(200)).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn recv_response_skip_heartbeats_immediate_response() {
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Engine sends Response immediately (no heartbeats in between)
+        engine_send(
+            &mut client,
+            &EngineMessage::Response(CommandResponse {
+                seq_id: 42,
+                results: vec![CommandResult::Ok, CommandResult::Ok],
+            }),
+        );
+
+        let resp = recv_response_skip_heartbeats(&mut server, Duration::from_secs(2))
+            .unwrap()
+            .expect("should receive Response");
+        assert_eq!(resp.seq_id, 42);
+        assert_eq!(resp.results.len(), 2);
+    }
+
+    // ── recv_qcf_skip_heartbeats tests ──────────────────────────────────────
+
+    #[test]
+    fn recv_qcf_skip_heartbeats_skips_heartbeats() {
+        use std::collections::HashMap;
+
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Engine sends: Heartbeat, QcfEstimate
+        engine_send(
+            &mut client,
+            &EngineMessage::Heartbeat(make_heartbeat_status()),
+        );
+        let mut estimates = HashMap::new();
+        estimates.insert("kv_evict_h2o".to_string(), 0.15f32);
+        engine_send(
+            &mut client,
+            &EngineMessage::QcfEstimate(llm_shared::QcfEstimate { estimates }),
+        );
+
+        let qcf = recv_qcf_skip_heartbeats(&mut server, Duration::from_secs(2))
+            .unwrap()
+            .expect("should receive QcfEstimate");
+        assert_eq!(qcf.estimates.len(), 1);
+        assert!((qcf.estimates["kv_evict_h2o"] - 0.15).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn recv_qcf_skip_heartbeats_returns_none_on_timeout() {
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        // Engine sends only heartbeat
+        engine_send(
+            &mut client,
+            &EngineMessage::Heartbeat(make_heartbeat_status()),
+        );
+
+        let result = recv_qcf_skip_heartbeats(&mut server, Duration::from_millis(200)).unwrap();
         assert!(result.is_none());
     }
 }

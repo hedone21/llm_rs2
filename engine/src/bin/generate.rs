@@ -707,12 +707,22 @@ fn main() -> anyhow::Result<()> {
             "[Resilience] Executor enabled — transport: {}",
             args.resilience_transport
         );
-        Some(CommandExecutor::new(
-            cmd_rx,
-            resp_tx,
-            args.backend.clone(),
-            heartbeat_interval,
-        ))
+        let executor =
+            CommandExecutor::new(cmd_rx, resp_tx, args.backend.clone(), heartbeat_interval);
+
+        // Send Capability as first message (SEQ-022).
+        // num_layers and bytes_per_kv_token are not yet known before model load;
+        // the Manager will receive accurate values via subsequent Heartbeats.
+        executor.send_capability(llm_shared::EngineCapability {
+            available_devices: vec!["cpu".to_string(), "opencl".to_string()],
+            active_device: args.backend.clone(),
+            max_kv_tokens: args.max_seq_len,
+            bytes_per_kv_token: 0,
+            num_layers: 0,
+        });
+        eprintln!("[Resilience] Capability sent to Manager");
+
+        Some(executor)
     } else {
         None
     };

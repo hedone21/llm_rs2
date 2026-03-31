@@ -350,6 +350,9 @@ impl Transport for TcpTransport {
     fn connect(&mut self) -> Result<(), TransportError> {
         match TcpStream::connect(&self.addr) {
             Ok(stream) => {
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+                    .map_err(TransportError::Io)?;
                 let writer = stream.try_clone().map_err(TransportError::Io)?;
                 self.reader = Some(stream);
                 self.writer = Some(writer);

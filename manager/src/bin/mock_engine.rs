@@ -27,6 +27,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::TcpStream;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
@@ -45,9 +47,14 @@ use llm_shared::{
     about = "Mock Engine for Manager protocol validation and E2E testing"
 )]
 struct Args {
-    /// Unix socket path that Manager is listening on.
+    /// Unix socket path that Manager is listening on (ignored when --tcp is set).
     #[arg(long, default_value = "/tmp/llm_manager.sock")]
     socket: String,
+
+    /// TCP address to connect to (e.g. 127.0.0.1:9999).
+    /// When set, TCP is used instead of Unix socket.
+    #[arg(long)]
+    tcp: Option<String>,
 
     /// Heartbeat send interval in milliseconds.
     #[arg(long, default_value_t = 100)]
@@ -72,7 +79,7 @@ struct Args {
 ///
 /// Wire format: `[4-byte BE u32 length][UTF-8 JSON]`
 /// This matches the format used by `UnixSocketEmitter` on the Manager side.
-fn send_message(stream: &mut UnixStream, msg: &EngineMessage) -> anyhow::Result<()> {
+fn send_message(stream: &mut (impl Read + Write), msg: &EngineMessage) -> anyhow::Result<()> {
     let json = serde_json::to_vec(msg).context("serialise EngineMessage")?;
     let len = (json.len() as u32).to_be_bytes();
     stream.write_all(&len).context("write length prefix")?;
@@ -85,7 +92,7 @@ fn send_message(stream: &mut UnixStream, msg: &EngineMessage) -> anyhow::Result<
 ///
 /// Returns `Ok(None)` on read timeout / would-block (non-blocking read).
 /// Returns `Err` on unrecoverable I/O or JSON parse errors.
-fn recv_message(stream: &mut UnixStream) -> anyhow::Result<Option<ManagerMessage>> {
+fn recv_message(stream: &mut (impl Read + Write)) -> anyhow::Result<Option<ManagerMessage>> {
     let mut len_buf = [0u8; 4];
     match stream.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -294,15 +301,33 @@ fn main() -> anyhow::Result<()> {
     env_logger::init();
     let args = Args::parse();
 
-    println!("[MockEngine] Connecting to {}", args.socket);
-    let mut stream =
-        UnixStream::connect(&args.socket).with_context(|| format!("connect to {}", args.socket))?;
+    if let Some(ref addr) = args.tcp {
+        println!("[MockEngine] Connecting via TCP to {}", addr);
+        let mut stream =
+            TcpStream::connect(addr).with_context(|| format!("TCP connect to {}", addr))?;
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .context("set_read_timeout")?;
+        run_protocol(&args, &mut stream)
+    } else {
+        #[cfg(unix)]
+        {
+            println!("[MockEngine] Connecting to {}", args.socket);
+            let mut stream = UnixStream::connect(&args.socket)
+                .with_context(|| format!("connect to {}", args.socket))?;
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .context("set_read_timeout")?;
+            run_protocol(&args, &mut stream)
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("Unix sockets not supported on this platform; use --tcp instead");
+        }
+    }
+}
 
-    // Non-blocking recv via read timeout (50 ms is fine-grained enough).
-    stream
-        .set_read_timeout(Some(Duration::from_millis(50)))
-        .context("set_read_timeout")?;
-
+fn run_protocol(args: &Args, stream: &mut (impl Read + Write)) -> anyhow::Result<()> {
     // ── Step 1: Capability ────────────────────────────────────────────────────
     let capability = EngineCapability {
         available_devices: vec!["cpu".to_string(), "opencl".to_string()],
@@ -311,7 +336,7 @@ fn main() -> anyhow::Result<()> {
         bytes_per_kv_token: 256,
         num_layers: 16,
     };
-    send_message(&mut stream, &EngineMessage::Capability(capability)).context("send Capability")?;
+    send_message(stream, &EngineMessage::Capability(capability)).context("send Capability")?;
     println!("[MockEngine] Sent Capability (device={})", args.device);
 
     // ── Step 2: Main loop ─────────────────────────────────────────────────────
@@ -334,7 +359,7 @@ fn main() -> anyhow::Result<()> {
         if last_heartbeat.elapsed() >= heartbeat_interval {
             engine.tokens_generated += 1; // simulate token generation
             let status = engine.status();
-            match send_message(&mut stream, &EngineMessage::Heartbeat(status)) {
+            match send_message(stream, &EngineMessage::Heartbeat(status)) {
                 Ok(()) => {
                     heartbeats_sent += 1;
                     log::debug!("[MockEngine] Heartbeat #{} sent", heartbeats_sent);
@@ -348,14 +373,9 @@ fn main() -> anyhow::Result<()> {
         }
 
         // ── Receive Directive (non-blocking) ──────────────────────────────────
-        match recv_message(&mut stream) {
+        match recv_message(stream) {
             Ok(Some(ManagerMessage::Directive(directive))) => {
-                handle_directive(
-                    &directive,
-                    &mut engine,
-                    &mut directives_received,
-                    &mut stream,
-                );
+                handle_directive(&directive, &mut engine, &mut directives_received, stream);
             }
             Ok(None) => {
                 // Timeout — no message yet; loop back
@@ -394,7 +414,7 @@ fn handle_directive(
     directive: &EngineDirective,
     engine: &mut EngineState_,
     count: &mut u32,
-    stream: &mut UnixStream,
+    stream: &mut (impl Read + Write),
 ) {
     *count += 1;
     println!(
