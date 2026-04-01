@@ -242,7 +242,11 @@ impl TransformerLayer {
         #[cfg(not(feature = "opencl"))]
         let kv_is_gpu = true;
         let use_typed_attn = if backend.name() == "OpenCL" {
-            (use_gpu_attn || k_cache.dtype() != DType::F32) && kv_is_gpu
+            // When KV buffers are on GPU (cl_mem present), always use GPU attention.
+            // CPU fallback cannot safely read device-only buffers (NVIDIA discrete GPU)
+            // and is slower than GPU attention even on zero-copy (Adreno UMA) devices.
+            // This also enables KiviCache GPU mode where dequantized F32 views live on GPU.
+            kv_is_gpu || (use_gpu_attn || k_cache.dtype() != DType::F32)
         } else {
             // CPU backend: always use typed attention for non-F32 KV cache.
             // CpuBackend::attention_gen handles F16/Q4_0 via dequantization.
