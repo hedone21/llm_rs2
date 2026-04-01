@@ -83,6 +83,38 @@ pub trait KVCacheOps: Send {
         _valid_len: usize,
     ) {
     }
+
+    /// Get raw GPU buffers for native KIVI fused attention.
+    ///
+    /// Only KiviCache in GPU mode returns `Some`. Other caches return `None` (default).
+    /// When `Some`, the caller can dispatch `attention_gen_kivi` directly,
+    /// bypassing the intermediate F32 dequant + scatter step.
+    fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+        None
+    }
+}
+
+/// Raw GPU buffer references for native KIVI fused attention.
+///
+/// Provides direct access to quantized KV blocks and F32 residual buffers
+/// without intermediate dequantization. Used by `attention_gen_kivi` kernel.
+pub struct KiviRawBuffers<'a> {
+    /// Quantized key blocks (Q2/Q4/Q8 packed).
+    pub qk_buf: &'a Tensor,
+    /// Quantized value blocks (Q2/Q4/Q8 packed).
+    pub qv_buf: &'a Tensor,
+    /// F32 residual keys [kv_heads, res_cap, head_dim].
+    pub res_k: &'a Tensor,
+    /// F32 residual values [kv_heads, res_cap, head_dim].
+    pub res_v: &'a Tensor,
+    /// Number of tokens in quantized storage.
+    pub q_tokens: usize,
+    /// Number of valid tokens in residual buffer.
+    pub res_tokens: usize,
+    /// Residual buffer capacity.
+    pub res_cap: usize,
+    /// Quantization bit-width (2, 4, or 8).
+    pub bits: u8,
 }
 
 /// Extension trait for KV caches that support prefetch pipelines.

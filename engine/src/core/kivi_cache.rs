@@ -20,7 +20,7 @@ use crate::backend::cpu::CpuBackend;
 use crate::buffer::shared_buffer::SharedBuffer;
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
-use crate::core::kv_cache::{KVCacheOps, KVLayout};
+use crate::core::kv_cache::{KVCacheOps, KVLayout, KiviRawBuffers};
 use crate::core::memory::Memory;
 use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
 use crate::core::shape::Shape;
@@ -436,6 +436,26 @@ impl KiviCache {
     /// Returns `true` if GPU buffers are active.
     pub fn is_gpu(&self) -> bool {
         self.gpu_backend.is_some()
+    }
+
+    /// Get raw GPU buffers for native KIVI attention (no F32 intermediate).
+    ///
+    /// Returns `None` if GPU mode is not active, no quantized tokens exist, or
+    /// the quantization mode is unquantized (bits=16).
+    pub fn get_raw_gpu_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+        if !self.is_gpu() || self.bits == 16 {
+            return None;
+        }
+        Some(KiviRawBuffers {
+            qk_buf: self.gpu_q2k.as_ref()?,
+            qv_buf: self.gpu_q2v.as_ref()?,
+            res_k: self.gpu_res_k.as_ref()?,
+            res_v: self.gpu_res_v.as_ref()?,
+            q_tokens: self.q2_tokens,
+            res_tokens: self.res_pos,
+            res_cap: self.res_cap,
+            bits: self.bits,
+        })
     }
 
     /// Dry-run QCF estimate for KIVI quantization (read-only, no state mutation).
@@ -1473,6 +1493,10 @@ impl KVCacheOps for KiviCache {
         snapshot.n_heads_q = n_heads_q;
         snapshot.stride = stride;
         snapshot.valid_len = valid_len;
+    }
+
+    fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
+        self.get_raw_gpu_buffers()
     }
 }
 
@@ -2723,5 +2747,49 @@ mod tests {
         assert!(qcf >= 0.0 && qcf <= 1.0, "qcf={qcf} out of range");
         // Q4 NMSE should be < Q2 proxy (0.30) for typical data
         assert!(qcf < 0.30, "Q4 NMSE {qcf} should be < Q2 proxy 0.30");
+    }
+
+    #[test]
+    fn test_raw_gpu_buffers_none_for_cpu_mode() {
+        let cache = KiviCache::new(8, 64, 2048, 64);
+        assert!(
+            cache.get_raw_gpu_buffers().is_none(),
+            "CPU-only cache should return None"
+        );
+    }
+
+    #[test]
+    fn test_raw_gpu_buffers_none_for_bits16() {
+        let cache = KiviCache::new_with_bits(8, 64, 2048, 64, 16);
+        assert!(
+            cache.get_raw_gpu_buffers().is_none(),
+            "bits=16 (unquantized) should return None"
+        );
+    }
+
+    #[test]
+    fn test_get_kivi_raw_buffers_trait_default_none() {
+        use crate::core::kv_cache::KVCache;
+        // Standard KVCache should return None via trait default
+        let backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let buf_k = Arc::new(SharedBuffer::new(8 * 2048 * 64 * 4, DType::F32));
+        let buf_v = Arc::new(SharedBuffer::new(8 * 2048 * 64 * 4, DType::F32));
+        let k = Tensor::new(Shape::new(vec![1, 2048, 8, 64]), buf_k, backend.clone());
+        let v = Tensor::new(Shape::new(vec![1, 2048, 8, 64]), buf_v, backend);
+        let cache = KVCache::new(k, v, 2048);
+        assert!(
+            cache.get_kivi_raw_buffers().is_none(),
+            "KVCache trait default should return None"
+        );
+    }
+
+    #[test]
+    fn test_kivi_raw_buffers_trait_none_for_cpu() {
+        // KiviCache in CPU mode should also return None via the trait method
+        let cache = KiviCache::new(8, 64, 2048, 64);
+        assert!(
+            cache.get_kivi_raw_buffers().is_none(),
+            "CPU-only KiviCache trait method should return None"
+        );
     }
 }

@@ -98,6 +98,10 @@ struct KernelCache {
     kernel_kivi_deq_key_q2: Option<CoreKernel>,
     kernel_kivi_scatter_residual: Option<CoreKernel>,
     kernel_kivi_gather_update: Option<CoreKernel>,
+    // KIVI fused attention kernels (optional — direct Q2/Q4/Q8 attention without F32 dequant)
+    kernel_attn_gen_kivi_q2: Option<CoreKernel>,
+    kernel_attn_gen_kivi_q4: Option<CoreKernel>,
+    kernel_attn_gen_kivi_q8: Option<CoreKernel>,
     // F16 GEMV N_DST=4 variant for large-N matmuls (lm_head, FFN)
     kernel_mul_mat_f16_f32_l4: Option<CoreKernel>,
     // true when f16 kernel is the nosub fallback (1D work group, N_DST=4 rows/WG)
@@ -547,6 +551,20 @@ impl OpenCLBackend {
             log::warn!("kivi_q2.cl failed to compile. KIVI Q2 GPU kernels disabled.");
         }
 
+        // KIVI fused attention kernels (optional — native Q2/Q4/Q8 attention)
+        let kivi_attn_src = include_str!("../../../kernels/kivi_attn.cl");
+        let kivi_attn_program = Program::builder()
+            .devices(device)
+            .src(kivi_attn_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if kivi_attn_program.is_some() {
+            log::info!("kivi_attn.cl compiled (KIVI fused attention kernels)");
+        } else {
+            log::warn!("kivi_attn.cl failed to compile. KIVI fused attention disabled.");
+        }
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -651,6 +669,15 @@ impl OpenCLBackend {
             kernel_kivi_gather_update: kivi_q2_kernels
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kivi_gather_update").ok()),
+            kernel_attn_gen_kivi_q2: kivi_attn_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q2").ok()),
+            kernel_attn_gen_kivi_q4: kivi_attn_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q4").ok()),
+            kernel_attn_gen_kivi_q8: kivi_attn_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q8").ok()),
             kernel_mul_mat_f16_f32_l4: f16_l4_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_l4").ok()),
@@ -2725,6 +2752,151 @@ impl OpenCLBackend {
             )?;
         }
         Ok(())
+    }
+
+    /// KIVI fused attention: Q2/Q4/Q8 quantized KV + F32 residual, single kernel.
+    ///
+    /// Eliminates the intermediate F32 dequant buffer by performing on-the-fly
+    /// dequantization inside the attention kernel.
+    ///
+    /// `bits` selects the kernel variant: 2 → Q2, 4 → Q4, 8 → Q8.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_gen_kivi(
+        &self,
+        q: &Tensor,
+        qk_buf: &Tensor,
+        qv_buf: &Tensor,
+        res_k: &Tensor,
+        res_v: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        q_tokens: usize,
+        res_tokens: usize,
+        res_cap: usize,
+        scale: f32,
+        scores_out: Option<&mut [f32]>,
+        bits: u8,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = match bits {
+            2 => kernels
+                .kernel_attn_gen_kivi_q2
+                .as_ref()
+                .ok_or_else(|| anyhow!("KIVI Q2 attention kernel not available"))?,
+            4 => kernels
+                .kernel_attn_gen_kivi_q4
+                .as_ref()
+                .ok_or_else(|| anyhow!("KIVI Q4 attention kernel not available"))?,
+            8 => kernels
+                .kernel_attn_gen_kivi_q8
+                .as_ref()
+                .ok_or_else(|| anyhow!("KIVI Q8 attention kernel not available"))?,
+            _ => return Err(anyhow!("Unsupported KIVI bits: {}", bits)),
+        };
+
+        let q_buf = get_cl_mem(q.buffer().as_ref())?;
+        let qk_mem = get_cl_mem(qk_buf.buffer().as_ref())?;
+        let qv_mem = get_cl_mem(qv_buf.buffer().as_ref())?;
+        let res_k_mem = get_cl_mem(res_k.buffer().as_ref())?;
+        let res_v_mem = get_cl_mem(res_v.buffer().as_ref())?;
+        let o_buf = get_cl_mem(out.buffer().as_ref())?;
+
+        let has_scores = scores_out.is_some() as i32;
+        let total_tokens = q_tokens + res_tokens;
+        let score_stride_val = scores_out
+            .as_ref()
+            .map(|s| (s.len() / num_heads_q) as i32)
+            .unwrap_or(total_tokens as i32);
+
+        // Allocate GPU score buffer if needed, otherwise use dummy
+        let score_buf = if scores_out.is_some() {
+            Some(unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE | ocl::core::MEM_ALLOC_HOST_PTR,
+                    num_heads_q * score_stride_val as usize,
+                    None,
+                )?
+            })
+        } else {
+            None
+        };
+        let s_buf = score_buf.as_ref().unwrap_or(&self.dummy_score_buf);
+
+        let local_size = 64usize;
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(qk_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(qv_mem))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(res_k_mem))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(res_v_mem))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(o_buf))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::mem(s_buf))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                8,
+                ocl::core::ArgVal::scalar(&(num_heads_kv as i32)),
+            )?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&(q_tokens as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&(res_tokens as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&(res_cap as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&score_stride_val))?;
+            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&has_scores))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                16,
+                ocl::core::ArgVal::local::<f32>(&local_mem_size),
+            )?;
+
+            let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                1,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        // Read back scores to CPU if requested
+        if let (Some(scores), Some(buf)) = (scores_out, &score_buf) {
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &self.queue,
+                    buf,
+                    true,
+                    0,
+                    scores,
+                    None::<ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if KIVI fused attention kernel is available for the given bit-width.
+    pub fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
+        let kernels = unsafe { &*self.kernels.get() };
+        match bits {
+            2 => kernels.kernel_attn_gen_kivi_q2.is_some(),
+            4 => kernels.kernel_attn_gen_kivi_q4.is_some(),
+            8 => kernels.kernel_attn_gen_kivi_q8.is_some(),
+            _ => false,
+        }
     }
 }
 
