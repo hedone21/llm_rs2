@@ -278,7 +278,6 @@ impl FullKernelPlan {
                     rt,
                 );
             }
-
             // Step 7: KV update
             match &layer_plan.kv_update {
                 KvUpdateVariant::Standard(step) => {
@@ -326,7 +325,6 @@ impl FullKernelPlan {
             // Step 8: Attention
             match &layer_plan.attention {
                 AttentionVariant::Standard(step) => {
-                    // Matches original behavior: cache_seq_len = current_pos (before advance)
                     Self::dispatch_step(
                         queue,
                         step,
@@ -411,7 +409,6 @@ impl FullKernelPlan {
                     rt,
                 );
             }
-
             cache.advance_pos(1);
 
             if layer_plan.flush_after {
