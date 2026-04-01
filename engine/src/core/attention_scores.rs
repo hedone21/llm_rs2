@@ -1,207 +1,7 @@
-// ── NEON-optimized score accumulation helpers ──
-
-#[cfg(target_arch = "aarch64")]
-mod neon_scores {
-    use std::arch::aarch64::*;
-
-    /// NEON-accelerated sum-across-heads + MAX for `accumulate_layer`.
-    /// Processes 4 tokens per iteration for contiguous memory access.
-    ///
-    /// # Safety
-    /// Caller must ensure `scores.len() >= (n_heads_q - 1) * stride + len`
-    /// and `step_importance.len() >= len`.
-    #[target_feature(enable = "neon")]
-    pub unsafe fn accumulate_layer_neon(
-        step_importance: &mut [f32],
-        scores: &[f32],
-        stride: usize,
-        len: usize,
-        n_heads_q: usize,
-    ) {
-        let mut t = 0usize;
-        while t + 4 <= len {
-            // Sum across all Q-heads for 4 consecutive tokens
-            let mut sum_v = vdupq_n_f32(0.0);
-            for h in 0..n_heads_q {
-                let base = h * stride + t;
-                let v = vld1q_f32(scores.as_ptr().add(base));
-                sum_v = vaddq_f32(sum_v, v);
-            }
-            // MAX with existing step_importance
-            let existing = vld1q_f32(step_importance.as_ptr().add(t));
-            let maxed = vmaxq_f32(existing, sum_v);
-            vst1q_f32(step_importance.as_mut_ptr().add(t), maxed);
-            t += 4;
-        }
-        // Scalar tail
-        while t < len {
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += *scores.get_unchecked(h * stride + t);
-            }
-            let existing = *step_importance.get_unchecked(t);
-            *step_importance.get_unchecked_mut(t) = existing.max(layer_score);
-            t += 1;
-        }
-    }
-
-    /// NEON-accelerated GQA accumulation: flat sum + per-KV-head group average.
-    /// Processes 4 tokens per iteration.
-    ///
-    /// # Safety
-    /// Caller must ensure all slice accesses are in bounds.
-    #[target_feature(enable = "neon")]
-    pub unsafe fn accumulate_layer_gqa_neon(
-        step_importance: &mut [f32],
-        head_step_importance: &mut [f32],
-        last_layer_head_attn: &mut [f32],
-        scores: &[f32],
-        stride: usize,
-        len: usize,
-        n_heads_q: usize,
-        n_kv_heads: usize,
-        max_seq_len: usize,
-    ) {
-        let n_rep = n_heads_q / n_kv_heads;
-        let inv_rep = 1.0 / n_rep as f32;
-        let inv_rep_v = vdupq_n_f32(inv_rep);
-
-        let mut t = 0usize;
-        while t + 4 <= len {
-            // Flat: sum across all Q-heads for 4 tokens
-            let mut sum_v = vdupq_n_f32(0.0);
-            for h in 0..n_heads_q {
-                let base = h * stride + t;
-                let v = vld1q_f32(scores.as_ptr().add(base));
-                sum_v = vaddq_f32(sum_v, v);
-            }
-            // MAX with existing step_importance
-            let existing = vld1q_f32(step_importance.as_ptr().add(t));
-            let maxed = vmaxq_f32(existing, sum_v);
-            vst1q_f32(step_importance.as_mut_ptr().add(t), maxed);
-
-            // Per-KV-head GQA group average
-            for kv_h in 0..n_kv_heads {
-                let mut group_v = vdupq_n_f32(0.0);
-                for r in 0..n_rep {
-                    let base = (kv_h * n_rep + r) * stride + t;
-                    let v = vld1q_f32(scores.as_ptr().add(base));
-                    group_v = vaddq_f32(group_v, v);
-                }
-                group_v = vmulq_f32(group_v, inv_rep_v);
-
-                let idx = kv_h * max_seq_len + t;
-                let existing_h = vld1q_f32(head_step_importance.as_ptr().add(idx));
-                let maxed_h = vmaxq_f32(existing_h, group_v);
-                vst1q_f32(head_step_importance.as_mut_ptr().add(idx), maxed_h);
-                vst1q_f32(last_layer_head_attn.as_mut_ptr().add(idx), group_v);
-            }
-
-            t += 4;
-        }
-        // Scalar tail
-        while t < len {
-            let mut layer_score = 0.0f32;
-            for h in 0..n_heads_q {
-                layer_score += *scores.get_unchecked(h * stride + t);
-            }
-            let existing = *step_importance.get_unchecked(t);
-            *step_importance.get_unchecked_mut(t) = existing.max(layer_score);
-
-            for kv_h in 0..n_kv_heads {
-                let mut group_score = 0.0f32;
-                for r in 0..n_rep {
-                    group_score += *scores.get_unchecked((kv_h * n_rep + r) * stride + t);
-                }
-                group_score *= inv_rep;
-                let idx = kv_h * max_seq_len + t;
-                let prev = *head_step_importance.get_unchecked(idx);
-                *head_step_importance.get_unchecked_mut(idx) = prev.max(group_score);
-                *last_layer_head_attn.get_unchecked_mut(idx) = group_score;
-            }
-            t += 1;
-        }
-    }
-
-    /// NEON-accelerated `end_step`: importance accumulation, step_count increment,
-    /// optional time normalization, and head_importance accumulation.
-    ///
-    /// # Safety
-    /// All slices must have length >= `max_seq_len`. `head_importance` and
-    /// `head_step_importance` must have the same length.
-    #[target_feature(enable = "neon")]
-    pub unsafe fn end_step_neon(
-        importance: &mut [f32],
-        step_importance: &[f32],
-        step_count: &mut [u32],
-        normalized: &mut [f32],
-        head_importance: &mut [f32],
-        head_step_importance: &[f32],
-        max_seq_len: usize,
-        time_normalize: bool,
-    ) {
-        let zero_v = vdupq_n_f32(0.0);
-        let one_u32_v = vdupq_n_u32(1);
-
-        // ── Flat importance + step_count ──
-        let mut t = 0usize;
-        while t + 4 <= max_seq_len {
-            let step_v = vld1q_f32(step_importance.as_ptr().add(t));
-            let imp_v = vld1q_f32(importance.as_ptr().add(t));
-            let new_imp = vaddq_f32(imp_v, step_v);
-            vst1q_f32(importance.as_mut_ptr().add(t), new_imp);
-
-            // step_count[t] += (step_val > 0.0) ? 1 : 0
-            let mask = vcgtq_f32(step_v, zero_v);
-            let inc = vandq_u32(
-                vreinterpretq_u32_f32(vreinterpretq_f32_u32(one_u32_v)),
-                mask,
-            );
-            let count_v = vld1q_u32(step_count.as_ptr().add(t));
-            let new_count = vaddq_u32(count_v, inc);
-            vst1q_u32(step_count.as_mut_ptr().add(t), new_count);
-
-            if time_normalize {
-                // normalized[t] = importance[t] / max(step_count[t], 1)
-                let count_clamped = vmaxq_u32(new_count, one_u32_v);
-                let count_f32 = vcvtq_f32_u32(count_clamped);
-                let norm_v = vdivq_f32(new_imp, count_f32);
-                vst1q_f32(normalized.as_mut_ptr().add(t), norm_v);
-            }
-            t += 4;
-        }
-        // Scalar tail for flat
-        while t < max_seq_len {
-            let step_val = *step_importance.get_unchecked(t);
-            *importance.get_unchecked_mut(t) += step_val;
-            if step_val > 0.0 {
-                *step_count.get_unchecked_mut(t) += 1;
-            }
-            if time_normalize {
-                let count = (*step_count.get_unchecked(t)).max(1) as f32;
-                *normalized.get_unchecked_mut(t) = *importance.get_unchecked(t) / count;
-            }
-            t += 1;
-        }
-
-        // ── Head importance: head_importance[i] += head_step_importance[i] ──
-        let head_len = head_importance.len();
-        let mut i = 0usize;
-        while i + 4 <= head_len {
-            let cum_v = vld1q_f32(head_importance.as_ptr().add(i));
-            let step_v = vld1q_f32(head_step_importance.as_ptr().add(i));
-            vst1q_f32(
-                head_importance.as_mut_ptr().add(i),
-                vaddq_f32(cum_v, step_v),
-            );
-            i += 4;
-        }
-        while i < head_len {
-            *head_importance.get_unchecked_mut(i) += *head_step_importance.get_unchecked(i);
-            i += 1;
-        }
-    }
-}
+// NEON-optimized score accumulation removed: scalar path is used for all
+// architectures. The NEON specialization produced incorrect results on ARM
+// (all-zero importance / NaN sum) while the performance difference was
+// negligible (~0.66ms). See git history for the removed neon_scores module.
 
 /// Accumulates per-token attention importance scores across layers.
 ///
@@ -380,31 +180,12 @@ impl AttentionScoreAccumulator {
     ) {
         let len = cache_seq_len.min(self.max_seq_len);
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Safety: bounds are checked — scores has n_heads_q * stride elements,
-            // step_importance has max_seq_len elements, and len <= max_seq_len.
-            unsafe {
-                neon_scores::accumulate_layer_neon(
-                    &mut self.step_importance,
-                    scores,
-                    stride,
-                    len,
-                    n_heads_q,
-                );
+        for t in 0..len {
+            let mut layer_score = 0.0f32;
+            for h in 0..n_heads_q {
+                layer_score += scores[h * stride + t];
             }
-            return;
-        }
-
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            for t in 0..len {
-                let mut layer_score = 0.0f32;
-                for h in 0..n_heads_q {
-                    layer_score += scores[h * stride + t];
-                }
-                self.step_importance[t] = self.step_importance[t].max(layer_score);
-            }
+            self.step_importance[t] = self.step_importance[t].max(layer_score);
         }
     }
 
@@ -424,53 +205,35 @@ impl AttentionScoreAccumulator {
     ) {
         let len = cache_seq_len.min(self.max_seq_len);
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            let max_seq_len = self.max_seq_len;
-            // Safety: all buffer sizes are checked at construction (new_gqa).
-            // head_step_importance and last_layer_head_attn are n_kv_heads * max_seq_len.
-            unsafe {
-                neon_scores::accumulate_layer_gqa_neon(
-                    &mut self.step_importance,
-                    &mut self.head_step_importance,
-                    &mut self.last_layer_head_attn,
-                    scores,
-                    stride,
-                    len,
-                    n_heads_q,
-                    n_kv_heads,
-                    max_seq_len,
-                );
+        let n_rep = n_heads_q / n_kv_heads;
+        let inv_rep = 1.0 / n_rep as f32;
+
+        for t in 0..len {
+            // Flat accumulation (backward compatible with H2O)
+            let mut layer_score = 0.0f32;
+            for h in 0..n_heads_q {
+                layer_score += scores[h * stride + t];
             }
-            return;
-        }
+            self.step_importance[t] = self.step_importance[t].max(layer_score);
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            let n_rep = n_heads_q / n_kv_heads;
-            let inv_rep = 1.0 / n_rep as f32;
-
-            for t in 0..len {
-                // Flat accumulation (backward compatible with H2O)
-                let mut layer_score = 0.0f32;
-                for h in 0..n_heads_q {
-                    layer_score += scores[h * stride + t];
+            // Per-KV-head: average Q-heads within each GQA group
+            for kv_h in 0..n_kv_heads {
+                let mut group_score = 0.0f32;
+                for r in 0..n_rep {
+                    group_score += scores[(kv_h * n_rep + r) * stride + t];
                 }
-                self.step_importance[t] = self.step_importance[t].max(layer_score);
-
-                // Per-KV-head: average Q-heads within each GQA group
-                for kv_h in 0..n_kv_heads {
-                    let mut group_score = 0.0f32;
-                    for r in 0..n_rep {
-                        group_score += scores[(kv_h * n_rep + r) * stride + t];
-                    }
-                    group_score *= inv_rep;
-                    let idx = kv_h * self.max_seq_len + t;
-                    self.head_step_importance[idx] =
-                        self.head_step_importance[idx].max(group_score);
-                    // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
-                    self.last_layer_head_attn[idx] = group_score;
-                }
+                group_score *= inv_rep;
+                let idx = kv_h * self.max_seq_len + t;
+                self.head_step_importance[idx] = self.head_step_importance[idx].max(group_score);
+                // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
+                // NaN guard: softmax can produce NaN when all logits are -inf (e.g.
+                // masked tokens). f32::max() silently swallows NaN for the other
+                // accumulators, but direct assignment propagates it here.
+                self.last_layer_head_attn[idx] = if group_score.is_nan() {
+                    0.0
+                } else {
+                    group_score
+                };
             }
         }
     }
@@ -482,47 +245,25 @@ impl AttentionScoreAccumulator {
             return;
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            // Safety: all buffers are allocated with max_seq_len capacity in new/new_gqa.
-            // head_importance and head_step_importance have the same length.
-            unsafe {
-                neon_scores::end_step_neon(
-                    &mut self.importance,
-                    &self.step_importance,
-                    &mut self.step_count,
-                    &mut self.normalized,
-                    &mut self.head_importance,
-                    &self.head_step_importance,
-                    self.max_seq_len,
-                    self.time_normalize,
-                );
+        for t in 0..self.max_seq_len {
+            let step_val = self.step_importance[t];
+            self.importance[t] += step_val;
+            // Track step count: increment for positions that were in cache this step
+            if step_val > 0.0 {
+                self.step_count[t] += 1;
             }
-            return;
+            // Compute time-normalized score
+            if self.time_normalize {
+                let count = self.step_count[t].max(1) as f32;
+                self.normalized[t] = self.importance[t] / count;
+            }
         }
-
-        #[cfg(not(target_arch = "aarch64"))]
+        for (cum, &step) in self
+            .head_importance
+            .iter_mut()
+            .zip(self.head_step_importance.iter())
         {
-            for t in 0..self.max_seq_len {
-                let step_val = self.step_importance[t];
-                self.importance[t] += step_val;
-                // Track step count: increment for positions that were in cache this step
-                if step_val > 0.0 {
-                    self.step_count[t] += 1;
-                }
-                // Compute time-normalized score
-                if self.time_normalize {
-                    let count = self.step_count[t].max(1) as f32;
-                    self.normalized[t] = self.importance[t] / count;
-                }
-            }
-            for (cum, &step) in self
-                .head_importance
-                .iter_mut()
-                .zip(self.head_step_importance.iter())
-            {
-                *cum += step;
-            }
+            *cum += step;
         }
     }
 

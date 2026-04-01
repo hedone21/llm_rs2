@@ -90,30 +90,43 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
 
     for (h, ph) in per_head.iter_mut().enumerate() {
         // 1. Get alpha_h[t] for this KV-head
-        let alpha_h: Vec<f32> = if let Some(head_attn) = params.head_attn {
-            let head_offset = h * (head_attn.len() / n_kv_heads.max(1));
-            (0..current_pos)
-                .map(|t| {
-                    let idx = head_offset + t;
-                    if idx < head_attn.len() {
-                        head_attn[idx]
-                    } else {
-                        0.0
-                    }
-                })
-                .collect()
-        } else {
-            (0..current_pos)
-                .map(|t| {
-                    if t < max_seq_len {
-                        params.attention_scores[t]
-                    } else {
-                        0.0
-                    }
-                })
-                .collect()
+        //    Try per-head attention first; fall back to flat scores if the
+        //    per-head slice is all-zero (can happen when softmax produces NaN
+        //    in attention weights, which the NaN guard converts to 0).
+        let alpha_h: Vec<f32> = {
+            let mut alpha = if let Some(head_attn) = params.head_attn {
+                let head_offset = h * (head_attn.len() / n_kv_heads.max(1));
+                (0..current_pos)
+                    .map(|t| {
+                        let idx = head_offset + t;
+                        if idx < head_attn.len() {
+                            head_attn[idx]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect::<Vec<f32>>()
+            } else {
+                Vec::new() // will trigger flat fallback below
+            };
+
+            // Fallback: if per-head alpha is empty or all-zero, use flat scores
+            let alpha_sum: f32 = alpha.iter().sum();
+            if alpha.is_empty() || alpha_sum <= 0.0 {
+                alpha = (0..current_pos)
+                    .map(|t| {
+                        if t < max_seq_len {
+                            params.attention_scores[t]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+            }
+            alpha
         };
 
+        // DEBUG: diagnose QCF intermediate values for first head
         // 2. Compute O_before = sum alpha_h[t] * V[h][t]
         let mut o_before = vec![0.0f32; head_dim];
         for (t, &alpha_t) in alpha_h.iter().enumerate().take(current_pos) {
@@ -126,6 +139,8 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
                 n_kv_heads,
                 layout,
             );
+            {
+            }
             for d in 0..head_dim {
                 o_before[d] += alpha_t * v_t[d];
             }
