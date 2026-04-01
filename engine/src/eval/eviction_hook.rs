@@ -27,38 +27,74 @@ pub struct EvictionQcfResult {
 pub struct KVCacheSnapshot {
     /// Per-layer raw bytes: K buffer followed immediately by V buffer.
     data: Vec<Vec<u8>>,
+    /// Per-layer K buffer size at snapshot time (used for K/V split in restore).
+    k_sizes: Vec<usize>,
     /// Backend reference for GPU read/write operations.
     backend: std::sync::Arc<dyn crate::core::backend::Backend>,
     /// Per-layer `current_pos` values.
     positions: Vec<usize>,
+    /// Per-layer capacity at snapshot time.
+    capacities: Vec<usize>,
 }
 
 impl CacheSnapshot<KVCache> for KVCacheSnapshot {
     fn restore_to(&self, caches: &mut [KVCache]) {
         for (i, cache) in caches.iter_mut().enumerate() {
-            let k_size = cache.k_buffer.buffer().size();
-            let v_size = self.data[i].len() - k_size;
+            // Use snapshot-time buffer sizes, not current sizes.
+            // Cache may have grown/shrunk between snapshot and restore.
+            let snap_k_size = self.k_sizes[i];
+            let snap_v_size = self.data[i].len() - snap_k_size;
+
+            // If cache grew since snapshot, the current buffer is larger — write only
+            // snapshot-sized data (snap_k_size bytes). Extra bytes are harmless garbage.
+            // If cache shrunk since snapshot (shouldn't happen in eval-ll flow), skip
+            // write to avoid buffer overrun — the cache will be reset next question anyway.
+
+            let cur_k_size = cache.k_buffer.buffer().size();
+            let cur_v_size = cache.v_buffer.buffer().size();
             let k_ptr = cache.k_buffer.buffer().as_mut_ptr();
+
             if !k_ptr.is_null() {
-                // CPU path: direct memcpy
+                // CPU path: direct memcpy (copy min of snapshot and current sizes)
+                let k_copy = snap_k_size.min(cur_k_size);
+                let v_copy = snap_v_size.min(cur_v_size);
                 unsafe {
-                    std::ptr::copy_nonoverlapping(self.data[i].as_ptr(), k_ptr, k_size);
+                    std::ptr::copy_nonoverlapping(self.data[i].as_ptr(), k_ptr, k_copy);
                     std::ptr::copy_nonoverlapping(
-                        self.data[i].as_ptr().add(k_size),
+                        self.data[i].as_ptr().add(snap_k_size),
                         cache.v_buffer.buffer().as_mut_ptr(),
-                        v_size,
+                        v_copy,
                     );
                 }
             } else {
-                // GPU path: write via OpenCL
-                let _ = self
-                    .backend
-                    .write_buffer(&mut cache.k_buffer, &self.data[i][..k_size]);
-                let _ = self
-                    .backend
-                    .write_buffer(&mut cache.v_buffer, &self.data[i][k_size..]);
+                // GPU path: write_buffer requires exact size match.
+                // If cache grew since snapshot, pad with zeros to match current buffer size.
+                if snap_k_size == cur_k_size {
+                    let _ = self.backend.write_buffer(
+                        &mut cache.k_buffer,
+                        &self.data[i][..snap_k_size],
+                    );
+                } else {
+                    let mut padded = vec![0u8; cur_k_size];
+                    let copy_len = snap_k_size.min(cur_k_size);
+                    padded[..copy_len].copy_from_slice(&self.data[i][..copy_len]);
+                    let _ = self.backend.write_buffer(&mut cache.k_buffer, &padded);
+                }
+                if snap_v_size == cur_v_size {
+                    let _ = self.backend.write_buffer(
+                        &mut cache.v_buffer,
+                        &self.data[i][snap_k_size..],
+                    );
+                } else {
+                    let mut padded = vec![0u8; cur_v_size];
+                    let copy_len = snap_v_size.min(cur_v_size);
+                    padded[..copy_len]
+                        .copy_from_slice(&self.data[i][snap_k_size..snap_k_size + copy_len]);
+                    let _ = self.backend.write_buffer(&mut cache.v_buffer, &padded);
+                }
             }
             cache.current_pos = self.positions[i];
+            cache.high_water_pos = self.positions[i];
         }
     }
 }
@@ -484,7 +520,9 @@ impl StepHook<KVCache> for EvictionHook {
 
     fn snapshot(&self, caches: &[KVCache]) -> Box<dyn CacheSnapshot<KVCache>> {
         let mut data = Vec::with_capacity(caches.len());
+        let mut k_sizes = Vec::with_capacity(caches.len());
         let mut positions = Vec::with_capacity(caches.len());
+        let mut capacities = Vec::with_capacity(caches.len());
         for cache in caches {
             let k_size = cache.k_buffer.buffer().size();
             let v_size = cache.v_buffer.buffer().size();
@@ -510,11 +548,15 @@ impl StepHook<KVCache> for EvictionHook {
                     .read_buffer(&cache.v_buffer, &mut buf[k_size..]);
             }
             data.push(buf);
+            k_sizes.push(k_size);
             positions.push(cache.current_pos);
+            capacities.push(cache.capacity());
         }
         Box::new(KVCacheSnapshot {
             data,
+            k_sizes,
             positions,
+            capacities,
             backend: self.backend.clone(),
         })
     }
