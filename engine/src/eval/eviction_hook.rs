@@ -88,6 +88,8 @@ pub struct EvictionHook {
     pub score_based_eviction: bool,
     /// H2O keep ratio (fraction of non-prefix tokens kept as heavy hitters).
     pub h2o_keep_ratio: f32,
+    /// Whether to use D2O merge compensation (vs. plain H2O eviction) for QCF-CAOTE.
+    pub is_d2o: bool,
     /// KV cache dtype string for QCF gating (only "f32" collects QCF).
     pub kv_type: String,
     /// Backend reference for GPU buffer read/write in snapshot/restore.
@@ -112,6 +114,7 @@ impl EvictionHook {
         protected_prefix: usize,
         score_based_eviction: bool,
         h2o_keep_ratio: f32,
+        is_d2o: bool,
         kv_type: String,
         backend: std::sync::Arc<dyn crate::core::backend::Backend>,
     ) -> Self {
@@ -123,6 +126,7 @@ impl EvictionHook {
             protected_prefix,
             score_based_eviction,
             h2o_keep_ratio,
+            is_d2o,
             kv_type,
             backend,
             eviction_count: 0,
@@ -269,8 +273,57 @@ impl StepHook<KVCache> for EvictionHook {
                     })
                     .unwrap_or((0.0, 0.0));
 
-                // QCF-CAOTE
-                let caote = if can_compute_qcf && !positions.is_empty() {
+                // QCF-CAOTE: D2O uses unified QCF with merge compensation;
+                // H2O uses the legacy eviction-only CAOTE.
+                let caote = if self.is_d2o && can_compute_qcf && !positions.is_empty() {
+                    // D2O path: compute_unified_qcf with MergeD2o action
+                    use crate::core::buffer::DType;
+                    use crate::core::qcf::{
+                        AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
+                        compute_unified_qcf,
+                    };
+                    let cache = &caches[0];
+                    let v_slice_f32: &[f32];
+                    let v_slice_u16: &[u16];
+                    let v_source = if let Some(ref cpu_data) = v_cpu_data {
+                        v_slice_f32 = cpu_data;
+                        VDataSource::F32(v_slice_f32)
+                    } else {
+                        match cache.v_buffer.dtype() {
+                            DType::F16 => {
+                                v_slice_u16 = cache.v_buffer.as_slice::<u16>();
+                                VDataSource::F16(v_slice_u16)
+                            }
+                            _ => {
+                                v_slice_f32 = cache.v_buffer.as_slice::<f32>();
+                                VDataSource::F32(v_slice_f32)
+                            }
+                        }
+                    };
+                    let head_attn_opt = self
+                        .score_accumulator
+                        .as_ref()
+                        .and_then(|acc| acc.last_step_head_attn());
+                    let params = UnifiedQcfParams {
+                        action: QcfActionType::MergeD2o {
+                            target_len,
+                            keep_ratio: self.h2o_keep_ratio,
+                            protected_prefix: self.protected_prefix,
+                        },
+                        v_source,
+                        attention_scores: &scores,
+                        head_attn: head_attn_opt,
+                        n_kv_heads: cache.kv_heads(),
+                        head_dim: cache.head_dim(),
+                        current_pos: before_len,
+                        capacity: cache.capacity(),
+                        layout: cache.layout(),
+                        aggregation: AggregationMode::Mean,
+                    };
+                    let (qcf, _) = compute_unified_qcf(&params);
+                    qcf
+                } else if can_compute_qcf && !positions.is_empty() {
+                    // H2O path: legacy eviction-only CAOTE
                     if let Some(head_attn) = self
                         .score_accumulator
                         .as_ref()
@@ -482,6 +535,7 @@ impl StepHook<KVCache> for EvictionHook {
             "protected_prefix": self.protected_prefix,
             "score_based_eviction": self.score_based_eviction,
             "h2o_keep_ratio": self.h2o_keep_ratio,
+            "is_d2o": self.is_d2o,
             "kv_type": self.kv_type,
         })
     }
@@ -515,6 +569,10 @@ mod tests {
     }
 
     fn make_hook(budget: usize, score_based: bool) -> EvictionHook {
+        make_hook_with_d2o(budget, score_based, false)
+    }
+
+    fn make_hook_with_d2o(budget: usize, score_based: bool, is_d2o: bool) -> EvictionHook {
         let policy = Box::new(NoEvictionPolicy::new());
         let monitor = Box::new(AlwaysOkMonitor);
         let manager = CacheManager::new(policy, monitor, 0, 1.0);
@@ -528,6 +586,7 @@ mod tests {
             0,
             score_based,
             0.5,
+            is_d2o,
             "f32".to_string(),
             std::sync::Arc::new(crate::backend::cpu::CpuBackend::new()),
         )
@@ -548,7 +607,16 @@ mod tests {
         let fields = hook.extra_config_fields();
         assert_eq!(fields["effective_budget"], 256);
         assert_eq!(fields["score_based_eviction"], true);
+        assert_eq!(fields["is_d2o"], false);
         assert_eq!(fields["kv_type"], "f32");
+    }
+
+    #[test]
+    fn test_extra_config_fields_d2o() {
+        let hook = make_hook_with_d2o(256, true, true);
+        let fields = hook.extra_config_fields();
+        assert_eq!(fields["is_d2o"], true);
+        assert_eq!(fields["score_based_eviction"], true);
     }
 
     #[test]

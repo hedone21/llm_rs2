@@ -398,7 +398,7 @@ fn compute_o_d2o_merge(
     for &e in &evicted {
         let v_e = read_v_f32(v_src, head, e, head_dim, capacity, n_kv_heads, layout);
         let (nearest_idx, sim) = find_nearest_cosine_with_sim(&v_e, &v_merged);
-        let exp_sim = sim.max(-10.0).min(10.0).exp(); // clamp to avoid overflow
+        let exp_sim = sim.clamp(-10.0, 10.0).exp(); // clamp to avoid overflow
         let merge_weight = exp_sim / (exp_sim + MERGE_E);
         for d in 0..head_dim {
             v_merged[nearest_idx][d] += merge_weight * v_e[d];

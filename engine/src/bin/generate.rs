@@ -1187,6 +1187,7 @@ fn main() -> anyhow::Result<()> {
 
         // For ratio mode, hook starts with budget=0; eval_loop updates it per-question.
         let hook_budget = if ratio_mode { 0 } else { effective_budget };
+        let is_d2o = args.eviction_policy == "d2o";
         let mut hook = llm_rs2::eval::EvictionHook::new(
             cache_manager,
             score_accumulator,
@@ -1195,6 +1196,7 @@ fn main() -> anyhow::Result<()> {
             actual_protected_prefix,
             score_based_eviction,
             args.h2o_keep_ratio,
+            is_d2o,
             args.kv_type.clone(),
             backend.clone(),
         );

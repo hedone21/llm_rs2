@@ -9,8 +9,9 @@ use anyhow::Result;
 /// [Sink Tokens (S)] [Recent Window (W)]
 /// ```
 ///
-/// Unlike `SlidingWindowPolicy` which respects `target_len`, this policy
-/// always compacts to exactly `S + W` tokens when eviction triggers.
+/// When `target_len` is 0 or >= `S + W`, compacts to exactly `S + W` tokens.
+/// When `target_len` is specified and < `S + W`, the window is shrunk to fit
+/// within the target budget (minimum 1 token window).
 /// All tokens between the sink region and the recent window are removed at once.
 ///
 /// ## Example
@@ -49,20 +50,29 @@ impl EvictionPolicy for StreamingLLMPolicy {
         cache.current_pos > self.keep_size()
     }
 
-    fn evict(&self, cache: &mut KVCache, _target_len: usize) -> Result<()> {
+    fn evict(&self, cache: &mut KVCache, target_len: usize) -> Result<()> {
         let current = cache.current_pos;
         let keep = self.keep_size();
 
-        if current <= keep {
+        // When target_len is specified and smaller than keep_size,
+        // shrink the window to fit within the target budget.
+        let effective_window = if target_len > 0 && target_len < keep {
+            target_len.saturating_sub(self.sink_size).max(1)
+        } else {
+            self.window_size
+        };
+        let effective_keep = self.sink_size + effective_window;
+
+        if current <= effective_keep {
             return Ok(());
         }
 
-        // Recent window starts at (current - window_size)
-        let recent_start = current - self.window_size;
+        // Recent window starts at (current - effective_window)
+        let recent_start = current - effective_window;
 
         // Move recent window right after sink region
-        cache.shift_positions(recent_start, self.sink_size, self.window_size)?;
-        cache.current_pos = keep;
+        cache.shift_positions(recent_start, self.sink_size, effective_window)?;
+        cache.current_pos = effective_keep;
 
         Ok(())
     }
@@ -145,14 +155,52 @@ mod tests {
     }
 
     #[test]
-    fn test_evict_ignores_target_len() {
-        // StreamingLLM always compacts to sink+window regardless of target_len
+    fn test_evict_respects_target_len() {
+        let policy = StreamingLLMPolicy::new(4, 6); // keep = 10
+
+        // target_len=0: uses default keep_size (sink+window=10)
+        let mut cache = make_cache_with_data(20);
+        policy.evict(&mut cache, 0).unwrap();
+        assert_eq!(cache.current_pos, 10);
+
+        // target_len >= keep_size: uses default keep_size (sink+window=10)
+        let mut cache = make_cache_with_data(20);
+        policy.evict(&mut cache, 18).unwrap();
+        assert_eq!(cache.current_pos, 10);
+
+        // target_len < keep_size: shrink window to fit
+        // target_len=7, sink=4, effective_window = 7-4 = 3, effective_keep = 7
+        let mut cache = make_cache_with_data(20);
+        policy.evict(&mut cache, 7).unwrap();
+        assert_eq!(cache.current_pos, 7);
+
+        // Verify data: sink [1,2,3,4] + last 3 tokens [18,19,20]
+        let k_data = cache.k_buffer.as_slice::<f32>();
+        let dim = 4;
+        assert_eq!(k_data[0 * dim], 1.0); // sink pos 0
+        assert_eq!(k_data[3 * dim], 4.0); // sink pos 3
+        assert_eq!(k_data[4 * dim], 18.0); // original pos 17 (value=18)
+        assert_eq!(k_data[6 * dim], 20.0); // original pos 19 (value=20)
+    }
+
+    #[test]
+    fn test_evict_target_len_smaller_than_sink() {
+        // target_len < sink_size: window shrinks to 1 (minimum)
         let policy = StreamingLLMPolicy::new(4, 6);
         let mut cache = make_cache_with_data(20);
 
-        // target_len=18 would keep 18 tokens in sliding, but streaming compacts to 10
-        policy.evict(&mut cache, 18).unwrap();
-        assert_eq!(cache.current_pos, 10);
+        // target_len=2 < sink_size=4, effective_window = max(2-4, 1) = 1
+        // effective_keep = 4 + 1 = 5
+        policy.evict(&mut cache, 2).unwrap();
+        assert_eq!(cache.current_pos, 5);
+
+        let k_data = cache.k_buffer.as_slice::<f32>();
+        let dim = 4;
+        // Sink preserved
+        assert_eq!(k_data[0 * dim], 1.0);
+        assert_eq!(k_data[3 * dim], 4.0);
+        // Only last 1 token: original pos 19 (value=20)
+        assert_eq!(k_data[4 * dim], 20.0);
     }
 
     #[test]
@@ -202,12 +250,13 @@ mod tests {
     fn test_differs_from_sliding() {
         // Key difference: with protected_prefix=4, window=6, current=20
         // Sliding with target_len=15: keeps 15 tokens (removes 5 oldest after prefix)
-        // StreamingLLM: always compacts to 10 regardless of target_len
+        // StreamingLLM with target_len=15 (>= keep_size=10): compacts to 10
 
         let streaming = StreamingLLMPolicy::new(4, 6);
         let mut cache_s = make_cache_with_data(20);
         streaming.evict(&mut cache_s, 15).unwrap();
-        assert_eq!(cache_s.current_pos, 10); // StreamingLLM: always 10
+        // target_len=15 >= keep_size=10, so default behavior: compacts to 10
+        assert_eq!(cache_s.current_pos, 10);
 
         use crate::core::eviction::SlidingWindowPolicy;
         let sliding = SlidingWindowPolicy::new(6, 4);
@@ -227,7 +276,7 @@ mod tests {
         let streaming_small = StreamingLLMPolicy::new(4, 6);
         let mut cache_s2 = make_cache_with_data(30);
         streaming_small.evict(&mut cache_s2, 20).unwrap();
-        // StreamingLLM: always 10
+        // StreamingLLM: target_len=20 >= keep_size=10, so default: compacts to 10
         assert_eq!(cache_s2.current_pos, 10);
     }
 }
