@@ -233,6 +233,17 @@ struct Args {
     #[arg(long, default_value_t = false)]
     ignore_eos: bool,
 
+    /// Target TBT in milliseconds for pacing (0=disabled).
+    /// After each decode step, sleeps to maintain the target TBT.
+    /// Used for fair resource comparison across different actions at the same QoS.
+    #[arg(long, default_value_t = 0.0)]
+    target_tbt: f64,
+
+    /// Path to write per-token TBT JSONL log.
+    /// Each line: {"token_idx":N,"tbt_ms":X,"forward_ms":Y,"cache_pos":Z,"pacing_ms":W}
+    #[arg(long)]
+    tbt_log: Option<String>,
+
     /// KV cache memory layout: "head" (head-major) or "seq" (seq-major)
     #[arg(long, default_value = "head")]
     kv_layout: String,
@@ -728,6 +739,11 @@ fn main() -> anyhow::Result<()> {
         None
     };
     let mut throttle_delay_ms: u64 = 0;
+    let mut tbt_log_writer: Option<std::io::BufWriter<std::fs::File>> = args.tbt_log.as_ref().map(|path| {
+        let file = std::fs::File::create(path).expect("failed to create tbt-log file");
+        std::io::BufWriter::new(file)
+    });
+    let target_tbt_ms = args.target_tbt;
 
     // ── KIVI mode: separate path with KiviCache ──
     // Placed after executor creation so resilience is available in the token loop.
@@ -2271,6 +2287,13 @@ fn main() -> anyhow::Result<()> {
                                     cpu_memory_arc.as_ref(),
                                     backend.clone(),
                                 )?;
+                                // Re-allocate gen_input_tensor on CPU backend
+                                let gi_buf = cpu_memory_arc.alloc(4, DType::U8)?;
+                                gen_input_tensor = Tensor::new(
+                                    Shape::new(vec![1, 1]),
+                                    gi_buf,
+                                    backend.clone(),
+                                );
                                 #[cfg(feature = "opencl")]
                                 {
                                     gpu_plan = None;
@@ -2392,8 +2415,28 @@ fn main() -> anyhow::Result<()> {
             let sample_us = sample_start.elapsed().as_micros() as u64;
 
             let now = std::time::Instant::now();
-            let tbt = now.duration_since(_last_token_time).as_secs_f64() * 1000.0;
+            let mut tbt = now.duration_since(_last_token_time).as_secs_f64() * 1000.0;
+
+            // ── Target TBT pacing: sleep to maintain target throughput ──
+            let pacing_ms = if target_tbt_ms > 0.0 && tbt < target_tbt_ms {
+                let sleep_ms = target_tbt_ms - tbt;
+                std::thread::sleep(std::time::Duration::from_secs_f64(sleep_ms / 1000.0));
+                tbt = target_tbt_ms; // effective TBT = target
+                sleep_ms
+            } else {
+                0.0
+            };
+
             tbt_values.push(tbt);
+
+            // ── TBT log: write per-token JSONL ──
+            if let Some(ref mut w) = tbt_log_writer {
+                use std::io::Write;
+                writeln!(w,
+                    "{{\"token_idx\":{},\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":{:.2}}}",
+                    decode_token_index, tbt, forward_ms, kv_caches[0].current_pos, pacing_ms
+                ).ok();
+            }
 
             // ── Profiler: record step data ──
             if let Some(ref mut p) = profiler {
