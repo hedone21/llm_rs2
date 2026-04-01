@@ -988,6 +988,7 @@ impl TransformerModel {
                 let cache_seq_len = kv_caches[i].current_pos();
                 let n_heads_q = self.config.num_attention_heads;
                 let stride = ws.scores.len() / n_heads_q;
+
                 if acc.n_kv_heads() > 0 {
                     let n_kv_heads = self.config.num_key_value_heads;
                     acc.accumulate_layer_gqa(
@@ -1205,6 +1206,163 @@ impl TransformerModel {
         match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
             Ok(()) => Ok(true),
             Err(_) => Ok(false), // plan invalidated, caller should rebuild
+        }
+    }
+
+    /// Build a pre-bound GPU kernel execution plan for KIVI decode (seq_len=1).
+    /// Returns None if the backend is not OpenCL, plan construction fails,
+    /// or KIVI GPU buffers are not available.
+    #[cfg(feature = "opencl")]
+    pub fn build_plan_for_kivi(
+        &self,
+        x: &Tensor,
+        logits: &Tensor,
+        ws: &LayerWorkspace,
+        kv_caches: &[crate::core::kivi_cache::KiviCache],
+        backend: &Arc<dyn Backend>,
+    ) -> Option<FullKernelPlan> {
+        use crate::backend::opencl::get_cl_mem;
+        use crate::backend::opencl::plan::*;
+
+        if self.config.has_qkv_bias {
+            return None;
+        }
+        if self.layers[0].wq.dtype() != crate::core::buffer::DType::F16 {
+            return None;
+        }
+        if backend.name() != "OpenCL" || kv_caches.is_empty() {
+            return None;
+        }
+        if !kv_caches[0].is_gpu() {
+            return None;
+        }
+
+        macro_rules! cl {
+            ($t:expr) => {
+                match get_cl_mem($t.buffer().as_ref()) {
+                    Ok(m) => m,
+                    Err(_) => return None,
+                }
+            };
+        }
+
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
+
+        let kivi_q2_program = ocl_backend.kivi_q2_program.as_ref()?;
+
+        let bits = kv_caches[0].bits();
+        let use_native = ocl_backend.is_nosub() && ocl_backend.has_kivi_attn_kernel(bits);
+
+        let dim = self.config.hidden_size;
+        let head_dim = self.config.head_dim;
+        let n_kv_heads = self.config.num_key_value_heads;
+        let max_seq_len = kv_caches[0].capacity();
+
+        let mut layer_bufs = Vec::new();
+        let mut kivi_kv_bufs_vec = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            layer_bufs.push(LayerBufs {
+                wq: cl!(layer.wq),
+                wk: cl!(layer.wk),
+                wv: cl!(layer.wv),
+                wo: cl!(layer.wo),
+                w_gate: cl!(layer.w_gate),
+                w_up: cl!(layer.w_up),
+                w_down: cl!(layer.w_down),
+                attn_norm: cl!(layer.attention_norm),
+                ffn_norm: cl!(layer.ffn_norm),
+            });
+
+            let plan_bufs = kv_caches[i].get_plan_gpu_buffers()?;
+            kivi_kv_bufs_vec.push(KiviKvBufs {
+                res_k: cl!(plan_bufs.res_k),
+                res_v: cl!(plan_bufs.res_v),
+                q2k: cl!(plan_bufs.q2k),
+                q2v: cl!(plan_bufs.q2v),
+                attn_k: cl!(plan_bufs.attn_k),
+                attn_v: cl!(plan_bufs.attn_v),
+                res_cap: plan_bufs.res_cap,
+            });
+        }
+
+        let kivi_config = KiviFullPlanConfig {
+            context: &ocl_backend.context,
+            f16_program: &ocl_backend.f16_program,
+            f16_l4_program: ocl_backend.f16_l4_program.as_ref(),
+            simple_ops_program: &ocl_backend.simple_ops_program,
+            kivi_q2_program,
+            kivi_attn_program: ocl_backend.kivi_attn_program.as_ref(),
+            layer_bufs,
+            x_buf: cl!(x),
+            q_buf: cl!(ws.q),
+            k_buf: cl!(ws.k),
+            v_buf: cl!(ws.v),
+            out_attn_buf: cl!(ws.out_attn),
+            attn_out_buf: cl!(ws.attn_out),
+            gate_buf: cl!(ws.gate),
+            up_buf: cl!(ws.up),
+            down_buf: cl!(ws.down),
+            residual_buf: cl!(ws.residual),
+            kivi_kv_bufs: kivi_kv_bufs_vec,
+            final_norm_buf: cl!(self.norm),
+            lm_head_buf: cl!(self.lm_head),
+            logits_buf: cl!(logits),
+            dim,
+            n_heads_q: self.config.num_attention_heads,
+            n_kv_heads,
+            head_dim,
+            ffn_hidden: self.config.intermediate_size,
+            vocab_size: self.config.vocab_size,
+            rms_norm_eps: self.config.rms_norm_eps as f32,
+            rope_theta: self.config.rope_theta as f32,
+            max_seq_len,
+            bits,
+            use_native_attn: use_native,
+        };
+
+        match build_kivi_full_plan(&kivi_config) {
+            Ok(plan) => {
+                log::info!(
+                    "KIVI GPU kernel plan built ({} layers, bits={}, native_attn={})",
+                    self.layers.len(),
+                    bits,
+                    use_native
+                );
+                Some(plan)
+            }
+            Err(e) => {
+                log::warn!("Failed to build KIVI GPU kernel plan: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Execute a pre-built KIVI GPU kernel plan for a single decode token.
+    /// Falls back if plan is invalidated.
+    #[cfg(feature = "opencl")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_plan_for_kivi(
+        &self,
+        plan: &FullKernelPlan,
+        input_tokens: &Tensor,
+        start_pos: usize,
+        x_gen: &mut Tensor,
+        kv_caches: &mut [crate::core::kivi_cache::KiviCache],
+        _logits_out: &mut Tensor,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<bool> {
+        self.gather_embed(input_tokens, x_gen, backend)?;
+
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
+
+        match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
         }
     }
 

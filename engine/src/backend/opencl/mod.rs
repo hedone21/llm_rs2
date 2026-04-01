@@ -139,6 +139,10 @@ pub struct OpenCLBackend {
     pub gemm_f16_program: Option<Program>,
     pub gemm_f32_program: Option<Program>,
 
+    // KIVI kernel programs (optional — needed for plan-based KIVI decode)
+    pub kivi_q2_program: Option<Program>,
+    pub kivi_attn_program: Option<Program>,
+
     // Cached kernels — inference is single-threaded, no lock needed.
     // UnsafeCell avoids Mutex overhead (~170us/lock on Adreno).
     kernels: UnsafeCell<KernelCache>,
@@ -737,6 +741,8 @@ impl OpenCLBackend {
             f16_l4_program,
             gemm_f16_program,
             gemm_f32_program,
+            kivi_q2_program: kivi_q2_kernels,
+            kivi_attn_program,
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
             dummy_score_buf,

@@ -92,6 +92,33 @@ pub trait KVCacheOps: Send {
     fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
         None
     }
+
+    // ── KIVI Plan support methods ──
+
+    /// Current residual write position. Only meaningful for KiviCache.
+    fn res_pos(&self) -> usize {
+        0
+    }
+
+    /// Number of quantized tokens in compressed storage. Only meaningful for KiviCache.
+    fn q2_tokens(&self) -> usize {
+        0
+    }
+
+    /// Residual buffer capacity in tokens. Only meaningful for KiviCache.
+    fn res_cap(&self) -> usize {
+        0
+    }
+
+    /// Whether the residual buffer is full and needs flushing before next update.
+    fn needs_flush(&self) -> bool {
+        false
+    }
+
+    /// Flush residual to quantized storage if full. Returns Ok(true) if flushed.
+    fn flush_if_needed(&mut self) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Raw GPU buffer references for native KIVI fused attention.

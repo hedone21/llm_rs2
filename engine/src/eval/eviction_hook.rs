@@ -34,6 +34,7 @@ pub struct KVCacheSnapshot {
     /// Per-layer `current_pos` values.
     positions: Vec<usize>,
     /// Per-layer capacity at snapshot time.
+    #[allow(dead_code)]
     capacities: Vec<usize>,
 }
 
@@ -70,10 +71,9 @@ impl CacheSnapshot<KVCache> for KVCacheSnapshot {
                 // GPU path: write_buffer requires exact size match.
                 // If cache grew since snapshot, pad with zeros to match current buffer size.
                 if snap_k_size == cur_k_size {
-                    let _ = self.backend.write_buffer(
-                        &mut cache.k_buffer,
-                        &self.data[i][..snap_k_size],
-                    );
+                    let _ = self
+                        .backend
+                        .write_buffer(&mut cache.k_buffer, &self.data[i][..snap_k_size]);
                 } else {
                     let mut padded = vec![0u8; cur_k_size];
                     let copy_len = snap_k_size.min(cur_k_size);
@@ -81,10 +81,9 @@ impl CacheSnapshot<KVCache> for KVCacheSnapshot {
                     let _ = self.backend.write_buffer(&mut cache.k_buffer, &padded);
                 }
                 if snap_v_size == cur_v_size {
-                    let _ = self.backend.write_buffer(
-                        &mut cache.v_buffer,
-                        &self.data[i][snap_k_size..],
-                    );
+                    let _ = self
+                        .backend
+                        .write_buffer(&mut cache.v_buffer, &self.data[i][snap_k_size..]);
                 } else {
                     let mut padded = vec![0u8; cur_v_size];
                     let copy_len = snap_v_size.min(cur_v_size);

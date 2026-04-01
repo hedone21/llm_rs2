@@ -764,6 +764,7 @@ fn main() -> anyhow::Result<()> {
             &args.backend,
             &mut command_executor,
             initial_bits,
+            args.no_gpu_plan,
         );
     }
 
@@ -3279,6 +3280,7 @@ fn run_kivi(
     backend_name: &str,
     command_executor: &mut Option<llm_rs2::resilience::CommandExecutor>,
     initial_bits: u8,
+    no_gpu_plan: bool,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
@@ -3469,10 +3471,28 @@ fn run_kivi(
     let mut kivi_skip_config: Option<SkipConfig> = None;
     let mut kivi_last_skip_ratio: Option<f32> = None;
 
+    // Build GPU kernel plan for KIVI decode (OpenCL only)
+    #[cfg(feature = "opencl")]
+    let mut gpu_plan = if backend.name() == "OpenCL" && !no_gpu_plan {
+        model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "opencl"))]
+    let gpu_plan: Option<()> = None;
+
     for decode_idx in 0..(num_tokens - 1) {
         if kv_caches[0].current_pos() >= max_seq_len {
             eprintln!("\n[Stopped: Max context length reached]");
             break;
+        }
+
+        // Flush residual if needed (before plan dispatch writes new token)
+        for cache in kv_caches.iter_mut() {
+            if cache.needs_flush() {
+                let _ = cache.flush_if_needed();
+                // Flush changes Q2 state — plan remains valid (q2_tokens/res_pos are dynamic)
+            }
         }
 
         let last_token = tokens[tokens.len() - 1];
@@ -3485,23 +3505,58 @@ fn run_kivi(
         })?;
 
         let fwd_start = std::time::Instant::now();
-        model.forward_into(TransformerModelForwardArgs {
-            input_tokens: &gen_input,
-            start_pos,
-            kv_caches: &mut kv_caches,
-            backend,
-            memory: memory.as_ref(),
-            logits_out: &mut logits,
-            x_gen: Some(&mut x_gen),
-            workspace: Some(&mut gen_ws),
-            use_gpu_attn: gpu_attn,
-            score_accumulator: None,
-            profiler: None,
-            skip_config: kivi_skip_config.as_ref(),
-            importance_collector: None,
-            logits_last_only: false,
-            variance_collector: None,
-        })?;
+
+        // Try GPU plan path first
+        #[cfg(feature = "opencl")]
+        let plan_ok = if let Some(ref plan) = gpu_plan {
+            match model.execute_plan_for_kivi(
+                plan,
+                &gen_input,
+                start_pos,
+                &mut x_gen,
+                &mut kv_caches,
+                &mut logits,
+                backend,
+            ) {
+                Ok(true) => true,
+                _ => {
+                    gpu_plan = None;
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        #[cfg(not(feature = "opencl"))]
+        let plan_ok = false;
+
+        if !plan_ok {
+            model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &gen_input,
+                start_pos,
+                kv_caches: &mut kv_caches,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                use_gpu_attn: gpu_attn,
+                score_accumulator: None,
+                profiler: None,
+                skip_config: kivi_skip_config.as_ref(),
+                importance_collector: None,
+                logits_last_only: false,
+                variance_collector: None,
+            })?;
+
+            // Rebuild plan after fallback
+            #[cfg(feature = "opencl")]
+            if gpu_plan.is_none() && backend.name() == "OpenCL" && !no_gpu_plan {
+                gpu_plan = model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend);
+            }
+        }
+
+        backend.synchronize()?;
         let forward_ms = fwd_start.elapsed().as_secs_f64() * 1000.0;
         forward_ms_values.push(forward_ms);
 

@@ -141,6 +141,21 @@ impl QuantizedBlocks {
     }
 }
 
+/// All GPU buffer references needed for KIVI Plan building.
+///
+/// Unlike `KiviRawBuffers`, this includes the F32 attention buffers (attn_k/attn_v)
+/// used by the assembled attention path.
+pub struct KiviPlanBuffers<'a> {
+    pub res_k: &'a Tensor,
+    pub res_v: &'a Tensor,
+    pub q2k: &'a Tensor,
+    pub q2v: &'a Tensor,
+    pub attn_k: &'a Tensor,
+    pub attn_v: &'a Tensor,
+    pub res_cap: usize,
+    pub bits: u8,
+}
+
 /// KIVI KV cache: quantized compressed storage + FP32 residual buffer.
 ///
 /// SeqMajor layout only (Phase 1). Data layout for residual:
@@ -453,6 +468,37 @@ impl KiviCache {
             res_v: self.gpu_res_v.as_ref()?,
             q_tokens: self.q2_tokens,
             res_tokens: self.res_pos,
+            res_cap: self.res_cap,
+            bits: self.bits,
+        })
+    }
+
+    /// Get GPU attention buffer references for Plan building.
+    ///
+    /// Returns (attn_k, attn_v) GPU tensors used as the F32 scatter target for
+    /// assembled attention path. Returns None if GPU mode is not active.
+    pub fn get_gpu_attn_buffers(&self) -> Option<(&Tensor, &Tensor)> {
+        if !self.is_gpu() {
+            return None;
+        }
+        Some((self.gpu_attn_k.as_ref()?, self.gpu_attn_v.as_ref()?))
+    }
+
+    /// Get all GPU buffer references needed for KIVI Plan building.
+    ///
+    /// Unlike `get_raw_gpu_buffers()`, this always returns buffers if GPU mode is active
+    /// (even before first flush, when q2_tokens == 0). Returns None only in CPU mode.
+    pub fn get_plan_gpu_buffers(&self) -> Option<KiviPlanBuffers<'_>> {
+        if !self.is_gpu() || self.bits == 16 {
+            return None;
+        }
+        Some(KiviPlanBuffers {
+            res_k: self.gpu_res_k.as_ref()?,
+            res_v: self.gpu_res_v.as_ref()?,
+            q2k: self.gpu_q2k.as_ref()?,
+            q2v: self.gpu_q2v.as_ref()?,
+            attn_k: self.gpu_attn_k.as_ref()?,
+            attn_v: self.gpu_attn_v.as_ref()?,
             res_cap: self.res_cap,
             bits: self.bits,
         })
@@ -1497,6 +1543,41 @@ impl KVCacheOps for KiviCache {
 
     fn get_kivi_raw_buffers(&self) -> Option<KiviRawBuffers<'_>> {
         self.get_raw_gpu_buffers()
+    }
+
+    fn advance_pos(&mut self, n: usize) {
+        // In Plan mode, the GPU gather kernel already wrote data to the residual buffer.
+        // We only need to advance res_pos so the CPU state tracks GPU state.
+        self.res_pos += n;
+    }
+
+    fn res_pos(&self) -> usize {
+        self.res_pos
+    }
+
+    fn q2_tokens(&self) -> usize {
+        self.q2_tokens
+    }
+
+    fn res_cap(&self) -> usize {
+        self.res_cap
+    }
+
+    fn needs_flush(&self) -> bool {
+        self.res_pos >= self.res_cap
+    }
+
+    fn flush_if_needed(&mut self) -> Result<bool> {
+        if self.res_pos >= self.res_cap {
+            if self.gpu_backend.is_some() {
+                self.flush_residual_gpu()?;
+            } else {
+                self.flush_residual();
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 }
 
