@@ -739,10 +739,11 @@ fn main() -> anyhow::Result<()> {
         None
     };
     let mut throttle_delay_ms: u64 = 0;
-    let mut tbt_log_writer: Option<std::io::BufWriter<std::fs::File>> = args.tbt_log.as_ref().map(|path| {
-        let file = std::fs::File::create(path).expect("failed to create tbt-log file");
-        std::io::BufWriter::new(file)
-    });
+    let mut tbt_log_writer: Option<std::io::BufWriter<std::fs::File>> =
+        args.tbt_log.as_ref().map(|path| {
+            let file = std::fs::File::create(path).expect("failed to create tbt-log file");
+            std::io::BufWriter::new(file)
+        });
     let target_tbt_ms = args.target_tbt;
 
     // ── KIVI mode: separate path with KiviCache ──
@@ -781,6 +782,9 @@ fn main() -> anyhow::Result<()> {
             &mut command_executor,
             initial_bits,
             args.no_gpu_plan,
+            args.target_tbt,
+            args.tbt_log.as_deref(),
+            args.ignore_eos,
         );
     }
 
@@ -2220,6 +2224,12 @@ fn main() -> anyhow::Result<()> {
                                 gpu_acc.reset(ocl_be.queue.as_core())?;
                                 gpu_acc.set_active(false);
                             }
+                            // Invalidate GPU Plan — cache size changed after eviction,
+                            // stale plan would use wrong attention sequence length.
+                            #[cfg(feature = "opencl")]
+                            {
+                                gpu_plan = None;
+                            }
                         }
                         Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
                         _ => {}
@@ -2289,11 +2299,8 @@ fn main() -> anyhow::Result<()> {
                                 )?;
                                 // Re-allocate gen_input_tensor on CPU backend
                                 let gi_buf = cpu_memory_arc.alloc(4, DType::U8)?;
-                                gen_input_tensor = Tensor::new(
-                                    Shape::new(vec![1, 1]),
-                                    gi_buf,
-                                    backend.clone(),
-                                );
+                                gen_input_tensor =
+                                    Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
                                 #[cfg(feature = "opencl")]
                                 {
                                     gpu_plan = None;
@@ -3325,6 +3332,9 @@ fn run_kivi(
     command_executor: &mut Option<llm_rs2::resilience::CommandExecutor>,
     initial_bits: u8,
     no_gpu_plan: bool,
+    target_tbt_ms: f64,
+    tbt_log_path: Option<&str>,
+    ignore_eos: bool,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
@@ -3503,6 +3513,11 @@ fn run_kivi(
     let mut gen_input = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
 
     let eos_id = model.config.eos_token_id;
+
+    let mut tbt_writer: Option<std::io::BufWriter<std::fs::File>> = tbt_log_path.map(|p| {
+        let f = std::fs::File::create(p).expect("failed to create tbt-log file");
+        std::io::BufWriter::new(f)
+    });
 
     let decode_start = std::time::Instant::now();
     let mut generated_count = 0usize;
@@ -3701,9 +3716,29 @@ fn run_kivi(
             sampling::sample(&mut logits_cpu, &tokens, vocab_size, sampling_config, None);
 
         let now = std::time::Instant::now();
-        let tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
+        let mut tbt = now.duration_since(last_token_time).as_secs_f64() * 1000.0;
+
+        // Target TBT pacing
+        let pacing_ms = if target_tbt_ms > 0.0 && tbt < target_tbt_ms {
+            let sleep_ms = target_tbt_ms - tbt;
+            std::thread::sleep(std::time::Duration::from_secs_f64(sleep_ms / 1000.0));
+            tbt = target_tbt_ms;
+            sleep_ms
+        } else {
+            0.0
+        };
+
         tbt_values.push(tbt);
-        last_token_time = now;
+        last_token_time = std::time::Instant::now();
+
+        // TBT log
+        if let Some(ref mut w) = tbt_writer {
+            use std::io::Write;
+            writeln!(w,
+                "{{\"token_idx\":{},\"tbt_ms\":{:.2},\"forward_ms\":{:.2},\"cache_pos\":{},\"pacing_ms\":{:.2}}}",
+                decode_idx, tbt, forward_ms, kv_caches[0].current_pos(), pacing_ms
+            ).ok();
+        }
 
         tokens.push(next_token);
 
@@ -3735,9 +3770,15 @@ fn run_kivi(
             stdout.flush().ok();
         }
 
-        if next_token == eos_id && std::env::var("IGNORE_EOS").is_err() {
+        if next_token == eos_id && !ignore_eos && std::env::var("IGNORE_EOS").is_err() {
             break;
         }
+    }
+
+    // Flush TBT log
+    if let Some(ref mut w) = tbt_writer {
+        use std::io::Write;
+        w.flush().ok();
     }
 
     let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
