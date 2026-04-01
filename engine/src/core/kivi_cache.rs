@@ -409,18 +409,24 @@ impl KiviCache {
                 backend.clone(),
             );
 
-            // Q2 block storage: 12 bytes per block
-            let q2k_bytes = max_k_blocks * 12;
-            let q2k_buf = memory.alloc(q2k_bytes.max(12), DType::U8)?;
+            // Quantized block storage: size depends on bits
+            let block_bytes = match bits {
+                2 => 12,  // BlockQ2_0
+                4 => 20,  // BlockKVQ4
+                8 => 36,  // BlockKVQ8
+                _ => 12,  // fallback
+            };
+            let q2k_bytes = max_k_blocks * block_bytes;
+            let q2k_buf = memory.alloc(q2k_bytes.max(block_bytes), DType::U8)?;
             let q2k = Tensor::new(
-                Shape::new(vec![q2k_bytes.max(12)]),
+                Shape::new(vec![q2k_bytes.max(block_bytes)]),
                 q2k_buf,
                 backend.clone(),
             );
-            let q2v_bytes = max_v_blocks * 12;
-            let q2v_buf = memory.alloc(q2v_bytes.max(12), DType::U8)?;
+            let q2v_bytes = max_v_blocks * block_bytes;
+            let q2v_buf = memory.alloc(q2v_bytes.max(block_bytes), DType::U8)?;
             let q2v = Tensor::new(
-                Shape::new(vec![q2v_bytes.max(12)]),
+                Shape::new(vec![q2v_bytes.max(block_bytes)]),
                 q2v_buf,
                 backend.clone(),
             );
@@ -1183,13 +1189,17 @@ impl KiviCache {
         let blocks_per_token = self.head_dim / QKKV;
         let new_v_blocks = self.kv_heads * flush_tokens * blocks_per_token;
 
-        // Serialize Q2 blocks to raw bytes and upload with byte offset.
-        // BlockQ2_0 is repr(C) with fixed 12-byte size.
-        const BLOCK_BYTES: usize = 12; // size_of::<BlockQ2_0>()
+        // Serialize quantized blocks to raw bytes and upload with byte offset.
+        let block_bytes = match self.bits {
+            2 => 12, // size_of::<BlockQ2_0>()
+            4 => 20, // size_of::<BlockKVQ4>()
+            8 => 36, // size_of::<BlockKVQ8>()
+            _ => return Err(anyhow::anyhow!("unsupported bits {} for GPU upload", self.bits)),
+        };
 
         let total_k_blocks_so_far = self.qk.len(); // after push in flush_residual_gpu
-        let k_byte_offset = k_block_start * BLOCK_BYTES;
-        let v_byte_offset = v_block_start * BLOCK_BYTES;
+        let k_byte_offset = k_block_start * block_bytes;
+        let v_byte_offset = v_block_start * block_bytes;
 
         // Collect the new blocks into contiguous byte slices
         let k_bytes =
@@ -1237,8 +1247,10 @@ impl KiviCache {
                     }
                 }
 
-                // Dispatch GPU dequant kernels
-                {
+                // Dispatch GPU dequant: fill F32 attention buffers for the assembled path.
+                // Q2: use dedicated GPU dequant kernel (fast).
+                // Q4/Q8: no GPU dequant kernel yet — CPU dequant + upload F32 (cold path).
+                if self.bits == 2 {
                     let gpu_q2k = self.gpu_q2k.as_ref().unwrap();
                     let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
                     ocl.kivi_dequantize_key_q2(
@@ -1250,8 +1262,6 @@ impl KiviCache {
                         tok_base,
                         k_block_start,
                     )?;
-                }
-                {
                     let gpu_q2v = self.gpu_q2v.as_ref().unwrap();
                     let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
                     ocl.kivi_dequantize_value_q2(
@@ -1263,6 +1273,70 @@ impl KiviCache {
                         tok_base,
                         v_block_start,
                     )?;
+                } else {
+                    // Q4/Q8: CPU dequant into attn buffers, then upload to GPU.
+                    // This is slower but correct until GPU Q4/Q8 dequant kernels are added.
+                    let gs = self.group_size;
+                    let total_k_blocks = self.qk.len();
+                    let k_start = total_k_blocks - new_k_blocks;
+                    let mut deq_buf = [0.0f32; QKKV];
+
+                    // Key: per-channel dequant (same loop as assemble_view)
+                    for h in 0..self.kv_heads {
+                        for g in 0..n_groups {
+                            let tok_start_in_attn = tok_base + g * gs;
+                            for ch in 0..self.head_dim {
+                                let block_idx =
+                                    k_start + h * n_groups * self.head_dim + g * self.head_dim + ch;
+                                self.qk.dequantize_block(block_idx, &mut deq_buf);
+                                for (t, &val) in deq_buf.iter().enumerate().take(gs) {
+                                    let pos = tok_start_in_attn + t;
+                                    let out_idx = pos * self.kv_heads * self.head_dim
+                                        + h * self.head_dim
+                                        + ch;
+                                    self.attn_k_buf[out_idx] = val;
+                                }
+                            }
+                        }
+                    }
+                    // Value: per-token dequant
+                    let blocks_per_token_v = self.head_dim / QKKV;
+                    let total_v_blocks = self.qv.len();
+                    let v_start = total_v_blocks - new_v_blocks;
+                    let mut v_idx = v_start;
+                    for h in 0..self.kv_heads {
+                        for t in 0..flush_tokens {
+                            let pos = tok_base + t;
+                            let out_base =
+                                pos * self.kv_heads * self.head_dim + h * self.head_dim;
+                            for b in 0..blocks_per_token_v {
+                                self.qv.dequantize_block(v_idx, &mut deq_buf);
+                                v_idx += 1;
+                                let start = out_base + b * QKKV;
+                                self.attn_v_buf[start..start + QKKV]
+                                    .copy_from_slice(&deq_buf);
+                            }
+                        }
+                    }
+
+                    // Upload dequanted F32 to GPU attention buffers
+                    let backend = self.gpu_backend.as_ref().unwrap();
+                    let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
+                    let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
+                    let k_f32_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            self.attn_k_buf.as_ptr() as *const u8,
+                            self.attn_k_buf.len() * 4,
+                        )
+                    };
+                    backend.write_buffer(gpu_attn_k, k_f32_bytes)?;
+                    let v_f32_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            self.attn_v_buf.as_ptr() as *const u8,
+                            self.attn_v_buf.len() * 4,
+                        )
+                    };
+                    backend.write_buffer(gpu_attn_v, v_f32_bytes)?;
                 }
             }
         }
@@ -1273,32 +1347,50 @@ impl KiviCache {
         Ok(())
     }
 
-    /// Serialize Q2 key blocks [block_start..block_start+count] to raw bytes.
+    /// Serialize quantized key blocks [block_start..block_start+count] to raw bytes.
     fn serialize_quantized_blocks_k(&self, block_start: usize, count: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(count * 12);
-        // Q4/Q8 GPU mode not yet supported; only Q2 blocks are serialized
-        if let QuantizedBlocks::Q2(v) = &self.qk {
-            for b in &v[block_start..block_start + count] {
-                // SAFETY: BlockQ2_0 is repr(C), packed, 12 bytes
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(b as *const BlockQ2_0 as *const u8, 12) };
-                out.extend_from_slice(bytes);
-            }
-        }
-        out
+        self.serialize_blocks(&self.qk, block_start, count)
     }
 
-    /// Serialize Q2 value blocks [block_start..block_start+count] to raw bytes.
+    /// Serialize quantized value blocks [block_start..block_start+count] to raw bytes.
     fn serialize_quantized_blocks_v(&self, block_start: usize, count: usize) -> Vec<u8> {
-        let mut out = Vec::with_capacity(count * 12);
-        if let QuantizedBlocks::Q2(v) = &self.qv {
-            for b in &v[block_start..block_start + count] {
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(b as *const BlockQ2_0 as *const u8, 12) };
-                out.extend_from_slice(bytes);
+        self.serialize_blocks(&self.qv, block_start, count)
+    }
+
+    fn serialize_blocks(&self, blocks: &QuantizedBlocks, start: usize, count: usize) -> Vec<u8> {
+        match blocks {
+            QuantizedBlocks::Unquantized => Vec::new(),
+            QuantizedBlocks::Q2(v) => {
+                let mut out = Vec::with_capacity(count * 12);
+                for b in &v[start..start + count] {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(b as *const BlockQ2_0 as *const u8, 12)
+                    };
+                    out.extend_from_slice(bytes);
+                }
+                out
+            }
+            QuantizedBlocks::Q4(v) => {
+                let mut out = Vec::with_capacity(count * 20);
+                for b in &v[start..start + count] {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(b as *const BlockKVQ4 as *const u8, 20)
+                    };
+                    out.extend_from_slice(bytes);
+                }
+                out
+            }
+            QuantizedBlocks::Q8(v) => {
+                let mut out = Vec::with_capacity(count * 36);
+                for b in &v[start..start + count] {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(b as *const BlockKVQ8 as *const u8, 36)
+                    };
+                    out.extend_from_slice(bytes);
+                }
+                out
             }
         }
-        out
     }
 
     /// GPU assemble_view: ensure GPU attention buffers are up to date.

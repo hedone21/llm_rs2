@@ -7,9 +7,15 @@
 // Each thread processes a subset of tokens (strided), accumulates dot products
 // and weighted V sums using private registers.
 //
-// KV layout (from KiviCache):
-//   Key (per-channel): block_idx = h * groups_per_head * head_dim + g * head_dim + ch
-//   Value (per-token): block_idx = h * q_tokens * blocks_per_tok + t * blocks_per_tok + b
+// KV layout (from KiviCache flush_residual — flush-interleaved):
+//   Key (per-channel): blocks are pushed per-flush:
+//     for each flush, for each head, for each group_in_flush, for each channel
+//     block_idx = flush * kv_heads * gpf * head_dim + kv_head * gpf * head_dim + gif * head_dim + ch
+//     where gpf = groups_per_flush = res_cap / GROUP_SIZE, gif = group % gpf
+//   Value (per-token): blocks are pushed per-flush:
+//     for each flush, for each head, for each token_in_flush, for each block
+//     block_idx = flush * kv_heads * res_cap * bpt + kv_head * res_cap * bpt + tif * bpt + b
+//     where tif = t % res_cap
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 
@@ -60,8 +66,10 @@ kernel void kernel_attn_gen_kivi_q2(
     global float * q_ptr = Q + head_idx * head_dim;
     int total_tokens = q2_tokens + res_tokens;
 
-    // Pre-compute Q2 key indexing constants
-    int groups_per_head = q2_tokens / GROUP_SIZE;
+    // Flush-interleaved layout constants.
+    // CPU pushes blocks in per-flush order: for each flush, for each head, ...
+    // groups_per_flush = res_cap / GROUP_SIZE (tokens flushed per flush)
+    int groups_per_flush = res_cap / GROUP_SIZE;
     int blocks_per_tok_v = head_dim / GROUP_SIZE;
 
     // === PASS 1: max score ===
@@ -69,12 +77,16 @@ kernel void kernel_attn_gen_kivi_q2(
     for (int t = lid; t < total_tokens; t += local_size) {
         float score = 0.0f;
         if (t < q2_tokens) {
-            // On-the-fly Q2 key dequant (per-channel layout)
+            // On-the-fly Q2 key dequant (per-channel, flush-interleaved layout)
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;  // group-in-flush
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q2_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q2_BLOCK_BYTES;
                 float kval = deq_q2(q2_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -107,9 +119,13 @@ kernel void kernel_attn_gen_kivi_q2(
         if (t < q2_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q2_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q2_BLOCK_BYTES;
                 float kval = deq_q2(q2_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -144,9 +160,13 @@ kernel void kernel_attn_gen_kivi_q2(
         if (t < q2_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q2_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q2_BLOCK_BYTES;
                 float kval = deq_q2(q2_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -163,14 +183,17 @@ kernel void kernel_attn_gen_kivi_q2(
             S[head_idx * score_stride + t] = weight;
         }
 
-        // Accumulate V contribution
+        // Accumulate V contribution (per-token, flush-interleaved layout)
         if (t < q2_tokens) {
-            // Q2 value dequant (per-token layout)
+            int v_flush = t / res_cap;
+            int tif = t % res_cap;  // token-in-flush
+            int v_base = v_flush * num_heads_kv * res_cap * blocks_per_tok_v
+                       + kv_head * res_cap * blocks_per_tok_v
+                       + tif * blocks_per_tok_v;
             for (int d = 0; d < head_dim; d++) {
                 int b = d / GROUP_SIZE;
                 int within = d % GROUP_SIZE;
-                int block_idx = kv_head * q2_tokens * blocks_per_tok_v + t * blocks_per_tok_v + b;
-                int src_off = block_idx * Q2_BLOCK_BYTES;
+                int src_off = (v_base + b) * Q2_BLOCK_BYTES;
                 float vval = deq_q2(q2_v, src_off, within);
                 out_local[d] += weight * vval;
             }
@@ -241,7 +264,7 @@ kernel void kernel_attn_gen_kivi_q4(
     global float * q_ptr = Q + head_idx * head_dim;
     int total_tokens = q_tokens + res_tokens;
 
-    int groups_per_head = q_tokens / GROUP_SIZE;
+    int groups_per_flush = res_cap / GROUP_SIZE;
     int blocks_per_tok_v = head_dim / GROUP_SIZE;
 
     // === PASS 1: max score ===
@@ -251,9 +274,13 @@ kernel void kernel_attn_gen_kivi_q4(
         if (t < q_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q4_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q4_BLOCK_BYTES;
                 float kval = deq_q4(q4_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -283,9 +310,13 @@ kernel void kernel_attn_gen_kivi_q4(
         if (t < q_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q4_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q4_BLOCK_BYTES;
                 float kval = deq_q4(q4_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -319,9 +350,13 @@ kernel void kernel_attn_gen_kivi_q4(
         if (t < q_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q4_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q4_BLOCK_BYTES;
                 float kval = deq_q4(q4_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -339,11 +374,15 @@ kernel void kernel_attn_gen_kivi_q4(
         }
 
         if (t < q_tokens) {
+            int v_flush = t / res_cap;
+            int tif = t % res_cap;
+            int v_base = v_flush * num_heads_kv * res_cap * blocks_per_tok_v
+                       + kv_head * res_cap * blocks_per_tok_v
+                       + tif * blocks_per_tok_v;
             for (int d = 0; d < head_dim; d++) {
                 int b = d / GROUP_SIZE;
                 int within = d % GROUP_SIZE;
-                int block_idx = kv_head * q_tokens * blocks_per_tok_v + t * blocks_per_tok_v + b;
-                int src_off = block_idx * Q4_BLOCK_BYTES;
+                int src_off = (v_base + b) * Q4_BLOCK_BYTES;
                 float vval = deq_q4(q4_v, src_off, within);
                 out_local[d] += weight * vval;
             }
@@ -412,7 +451,7 @@ kernel void kernel_attn_gen_kivi_q8(
     global float * q_ptr = Q + head_idx * head_dim;
     int total_tokens = q_tokens + res_tokens;
 
-    int groups_per_head = q_tokens / GROUP_SIZE;
+    int groups_per_flush = res_cap / GROUP_SIZE;
     int blocks_per_tok_v = head_dim / GROUP_SIZE;
 
     // === PASS 1: max score ===
@@ -422,9 +461,13 @@ kernel void kernel_attn_gen_kivi_q8(
         if (t < q_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q8_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q8_BLOCK_BYTES;
                 float kval = deq_q8(q8_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -454,9 +497,13 @@ kernel void kernel_attn_gen_kivi_q8(
         if (t < q_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q8_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q8_BLOCK_BYTES;
                 float kval = deq_q8(q8_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -490,9 +537,13 @@ kernel void kernel_attn_gen_kivi_q8(
         if (t < q_tokens) {
             int group = t / GROUP_SIZE;
             int within = t % GROUP_SIZE;
+            int flush = group / groups_per_flush;
+            int gif = group % groups_per_flush;
+            int block_idx = flush * num_heads_kv * groups_per_flush * head_dim
+                          + kv_head * groups_per_flush * head_dim
+                          + gif * head_dim;
             for (int ch = 0; ch < head_dim; ch++) {
-                int block_idx = kv_head * groups_per_head * head_dim + group * head_dim + ch;
-                int src_off = block_idx * Q8_BLOCK_BYTES;
+                int src_off = (block_idx + ch) * Q8_BLOCK_BYTES;
                 float kval = deq_q8(q8_k, src_off, within);
                 score += q_ptr[ch] * kval;
             }
@@ -510,11 +561,15 @@ kernel void kernel_attn_gen_kivi_q8(
         }
 
         if (t < q_tokens) {
+            int v_flush = t / res_cap;
+            int tif = t % res_cap;
+            int v_base = v_flush * num_heads_kv * res_cap * blocks_per_tok_v
+                       + kv_head * res_cap * blocks_per_tok_v
+                       + tif * blocks_per_tok_v;
             for (int d = 0; d < head_dim; d++) {
                 int b = d / GROUP_SIZE;
                 int within = d % GROUP_SIZE;
-                int block_idx = kv_head * q_tokens * blocks_per_tok_v + t * blocks_per_tok_v + b;
-                int src_off = block_idx * Q8_BLOCK_BYTES;
+                int src_off = (v_base + b) * Q8_BLOCK_BYTES;
                 float vval = deq_q8(q8_v, src_off, within);
                 out_local[d] += weight * vval;
             }
