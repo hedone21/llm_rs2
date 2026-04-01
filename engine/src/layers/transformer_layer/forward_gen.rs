@@ -241,7 +241,12 @@ impl TransformerLayer {
                     .as_any()
                     .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
                 {
-                    if ocl_be.has_kivi_attn_kernel(raw.bits) && (raw.q_tokens + raw.res_tokens) > 0
+                    // Only use native KIVI attention on non-subgroup devices (NVIDIA).
+                    // On Adreno (subgroups), the F32 dequant + subgroup attention_gen is faster
+                    // because the native kernel uses workgroup reduction instead of subgroup ops.
+                    if ocl_be.has_kivi_attn_kernel(raw.bits)
+                        && ocl_be.is_nosub()
+                        && (raw.q_tokens + raw.res_tokens) > 0
                     {
                         let scale = 1.0 / (head_dim as f32).sqrt();
                         ocl_be.attention_gen_kivi(

@@ -2888,6 +2888,14 @@ impl OpenCLBackend {
         Ok(())
     }
 
+    /// Returns true if this device lacks subgroup support (using nosub fallback kernels).
+    /// Native KIVI attention (workgroup reduction) is preferred on these devices since
+    /// the standard attention_gen also uses workgroup reduction.
+    pub fn is_nosub(&self) -> bool {
+        let kernels = unsafe { &*self.kernels.get() };
+        kernels.f16_is_nosub
+    }
+
     /// Check if KIVI fused attention kernel is available for the given bit-width.
     pub fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
         let kernels = unsafe { &*self.kernels.get() };
