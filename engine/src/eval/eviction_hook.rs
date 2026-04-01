@@ -220,6 +220,23 @@ impl StepHook<KVCache> for EvictionHook {
         } else {
             None
         };
+        // GPU score sync before QCF computation (eval-ll path).
+        // In the main decode loop (generate.rs), GPU scores are synced before eviction.
+        // The eval-ll hook needs the same sync since forward_into() accumulates on GPU only.
+        #[cfg(feature = "opencl")]
+        if let Some(ref mut acc) = self.score_accumulator
+            && acc.is_active()
+            && let Some(ocl_be) = self
+                .backend
+                .as_any()
+                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+            && gpu_acc.is_active()
+            && let Ok((flat, head)) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())
+        {
+            acc.import_gpu_scores(&flat, &head);
+        }
+
         let can_compute_qcf = can_compute_qcf
             && !caches.is_empty()
             && (v_cpu_data.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
