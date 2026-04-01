@@ -1,6 +1,6 @@
 # Engine Algorithms
 
-> **TL;DR**: Engine 내부 알고리즘의 상세를 정의한다. KV 캐시 eviction 4종(H2O, Sliding Window, D2O, StreamingLLM), KIVI 비대칭 양자화(flush, bit transition, incremental dequant, GPU mode), SWIFT 기반 layer skip, QCF proxy 8종 수식, RequestQcf dry-run 6종 action 스캔, DegradationEstimator의 piecewise-linear 보정, madvise/shrink_to_fit 물리 메모리 해제, chunked prefill, CachePressurePipeline의 Handler 체인, 추론 루프 resilience checkpoint를 기술한다. 변수명과 타입 표현은 자유이나, 의사코드/불변식/example trace를 포함한다.
+> **TL;DR**: Engine 내부 알고리즘의 상세를 정의한다. KV 캐시 eviction 4종(H2O, Sliding Window, D2O, StreamingLLM), KIVI 비대칭 양자화(flush, bit transition, incremental dequant, GPU mode), SWIFT 기반 layer skip, Unified QCF (ENG-ALG-051, attention output perturbation 통합 메트릭) + legacy proxy 8종(deprecated) 수식, RequestQcf dry-run 6종 action 스캔, DegradationEstimator의 piecewise-linear 보정, madvise/shrink_to_fit 물리 메모리 해제, chunked prefill, CachePressurePipeline의 Handler 체인, 추론 루프 resilience checkpoint를 기술한다. 변수명과 타입 표현은 자유이나, 의사코드/불변식/example trace를 포함한다.
 
 ## 1. Purpose and Scope
 
@@ -11,7 +11,7 @@
 - KV Cache Eviction 알고리즘 4종 (H2O, Sliding Window, D2O, StreamingLLM)
 - KV Cache Quantization (KIVI): flush cycle, bit transition, incremental dequant, GPU mode
 - Layer Skip: SkipConfig 초기화, layer importance 계산
-- QCF 계산 수식 8종 (eviction 4종, quantization 3종, skip 1종)
+- Unified QCF (ENG-ALG-051): attention output perturbation 통합 메트릭 + legacy proxy 8종 (deprecated)
 - RequestQcf → QcfEstimate 흐름 (F-01 해결)
 - DegradationEstimator: piecewise-linear + EMA 보정
 - madvise/release_unused_pages: CPU path, shrink_to_fit, GPU MadviseableGPUBuffer (F-02, F-04 해결)
@@ -413,9 +413,9 @@ QCF_skip = Sigma importance(skipped_layers) / Sigma importance(all_layers)
 
 ### 3.4 QCF 계산
 
-#### 3.4.1 Eviction QCF -- Attention x V-norm [ENG-ALG-041]
+#### 3.4.1 Eviction QCF -- Attention x V-norm [ENG-ALG-041] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-041]** H2O eviction 시 정보 손실을 추정하는 기본 proxy. Per-head importance를 attention score와 V-norm의 곱으로 계산한다. *(MUST)*
+**[ENG-ALG-041]** H2O eviction 시 정보 손실을 추정하는 기본 proxy. Per-head importance를 attention score와 V-norm의 곱으로 계산한다. *(MUST)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 **수식** (per-head):
 
@@ -441,9 +441,9 @@ AggregationMode::Defensive { temperature }:
 
 ---
 
-#### 3.4.2 Sliding Window QCF -- V-norm Only [ENG-ALG-042]
+#### 3.4.2 Sliding Window QCF -- V-norm Only [ENG-ALG-042] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-042]** Sliding window eviction 시 V-norm만으로 proxy를 계산한다 (attention score 불필요). *(MUST)*
+**[ENG-ALG-042]** Sliding window eviction 시 V-norm만으로 proxy를 계산한다 (attention score 불필요). *(MUST)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 ```
 per head h:
@@ -455,9 +455,9 @@ per head h:
 
 ---
 
-#### 3.4.3 CAOTE Eviction QCF [ENG-ALG-043]
+#### 3.4.3 CAOTE Eviction QCF [ENG-ALG-043] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-043]** Context-Aware Output Token Error. Softmax 재분배 효과와 value 방향 오차를 함께 고려한다. *(MUST)*
+**[ENG-ALG-043]** Context-Aware Output Token Error. Softmax 재분배 효과와 value 방향 오차를 함께 고려한다. *(MUST)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 ```
 per head h:
@@ -472,9 +472,9 @@ per head h:
 
 ---
 
-#### 3.4.4 QCF Attention V2 (경량) [ENG-ALG-044]
+#### 3.4.4 QCF Attention V2 (경량) [ENG-ALG-044] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-044]** V-norm 계산 없이 attention score만으로 QCF를 계산하는 경량 variant. *(MAY)*
+**[ENG-ALG-044]** V-norm 계산 없이 attention score만으로 QCF를 계산하는 경량 variant. *(MAY)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 ```
 per head h:
@@ -485,9 +485,9 @@ per head h:
 
 ---
 
-#### 3.4.5 KIVI Flush QCF -- NMSE [ENG-ALG-045]
+#### 3.4.5 KIVI Flush QCF -- NMSE [ENG-ALG-045] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-045]** KIVI residual flush 시 quantize-dequantize round-trip NMSE로 양자화 오차를 추정한다. *(MUST)*
+**[ENG-ALG-045]** KIVI residual flush 시 quantize-dequantize round-trip NMSE로 양자화 오차를 추정한다. *(MUST)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 ```
 function compute_nmse_block(original[32], bits):
@@ -511,9 +511,9 @@ combined[h] = 0.6 * NMSE_K[h] + 0.4 * NMSE_V[h]
 
 ---
 
-#### 3.4.6 KIVI Flush OPR [ENG-ALG-046]
+#### 3.4.6 KIVI Flush OPR [ENG-ALG-046] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-046]** V cache 양자화의 output perturbation ratio. K는 2차 효과로 무시한다. *(MUST)*
+**[ENG-ALG-046]** V cache 양자화의 output perturbation ratio. K는 2차 효과로 무시한다. *(MUST)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 ```
 per head h:
@@ -524,9 +524,9 @@ per head h:
 
 ---
 
-#### 3.4.7 AWQE (Attention-Weighted Quantization Error) [ENG-ALG-047]
+#### 3.4.7 AWQE (Attention-Weighted Quantization Error) [ENG-ALG-047] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-047]** Post-softmax attention score로 가중된 V 양자화 오차. `set_awqe_enabled(true)` 시에만 활성화된다 (기본 비활성). *(MAY)*
+**[ENG-ALG-047]** Post-softmax attention score로 가중된 V 양자화 오차. `set_awqe_enabled(true)` 시에만 활성화된다 (기본 비활성). *(MAY)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 ```
 per head h:
@@ -554,9 +554,9 @@ function current_proxy():
     normalized_value = raw_value   // 이미 0~1 범위
 ```
 
-#### 3.4.9 AW-VOPR (Attention-Weighted Vector Output Perturbation Ratio) [ENG-ALG-049]
+#### 3.4.9 AW-VOPR (Attention-Weighted Vector Output Perturbation Ratio) [ENG-ALG-049] [DEPRECATED — superseded by ENG-ALG-051]
 
-**[ENG-ALG-049]** KIVI residual flush 시, attention-weighted V 양자화 에러의 벡터 합산 norm을 원본 attention output norm으로 나누어 output-level 양자화 영향을 추정한다. AWQE(ENG-ALG-047)의 벡터 확장으로, 반대 방향 에러의 상쇄를 반영한다. `set_awqe_enabled(true)` 시에만 활성화된다. *(MAY)*
+**[ENG-ALG-049]** KIVI residual flush 시, attention-weighted V 양자화 에러의 벡터 합산 norm을 원본 attention output norm으로 나누어 output-level 양자화 영향을 추정한다. AWQE(ENG-ALG-047)의 벡터 확장으로, 반대 방향 에러의 상쇄를 반영한다. `set_awqe_enabled(true)` 시에만 활성화된다. *(MAY)* **[DEPRECATED — superseded by ENG-ALG-051]**
 
 수학적 정의:
 
@@ -579,6 +579,76 @@ GQA 처리: kv_head당 gqa_group_size개 Q-head의 attention weight를 평균하
 
 ---
 
+#### 3.4.10 Unified QCF -- Attention Output Perturbation [ENG-ALG-051]
+
+**[ENG-ALG-051]** Unified QCF: 모든 KV cache lossy action의 품질 비용을 attention output perturbation으로 통합 측정한다. *(MUST)*
+
+ENG-ALG-041~047, 049의 개별 proxy를 대체하는 단일 통합 메트릭. Action 종류에 관계없이 동일한 수식 프레임워크로 QCF를 계산하여, action 간 비용 비교를 가능하게 한다.
+
+**수식**:
+
+```
+QCF = ‖O_before - O_after‖ / ‖O_before‖
+
+O_before = Σ_t α_t × V_t                       (현재 attention output, head_dim 벡터)
+```
+
+**Action별 O_after 정의**:
+
+```
+Eviction (Sliding/H2O/Streaming):
+    O_after = Σ_{t ∈ retained} (α_t / Σ_{t ∈ retained} α_t) × V_t
+    -- softmax 재정규화: evicted 토큰의 attention mass가 retained에 재분배
+
+D2O merge:
+    O_after = Σ_{t ∈ retained} (α_t / Σ_{t ∈ retained} α_t) × V'_t
+    -- V'_t = merge-compensated V (D2O의 cosine similarity 기반 merge 보상 적용)
+
+KIVI quantization:
+    O_after = Σ_t α_t × dequant(quant(V_t))
+    -- quantize-dequantize round-trip이 V에 미치는 영향
+```
+
+**Per-KV-head 계산 후 집계**:
+
+```
+per kv_head h:
+    QCF_h = ‖O_before_h - O_after_h‖₂ / max(‖O_before_h‖₂, ε)
+
+aggregate_heads():
+    QCF = mean(QCF_h for h in 0..n_kv_heads)
+```
+
+**GQA 처리**: Q-head 그룹의 attention weight를 평균하여 KV-head별 α를 생성한다.
+
+```
+α_kv[h][t] = mean(α_q[q][t] for q in gqa_group(h))
+```
+
+**불변식**:
+
+- `QCF ∈ [0, 1]` — 정규화된 상대 오차
+- Action이 V를 변경하지 않으면 `QCF = 0` (항등 변환)
+- Eviction 토큰 수 증가 → QCF 단조 증가 (정보 손실 증가)
+- KIVI quantization bit 감소에 대해 QCF 단조 증가: `QCF(Q2) > QCF(Q4) > QCF(Q8) > QCF(F16)`
+
+**ENG-ALG-041~047, 049 대체 관계**:
+
+| 대체되는 ID | 기존 proxy | Unified QCF에서의 대응 |
+|------------|-----------|----------------------|
+| ENG-ALG-041 | Attention x V-norm | Eviction O_after (H2O retained set) |
+| ENG-ALG-042 | V-norm only | Eviction O_after (Sliding retained set) |
+| ENG-ALG-043 | CAOTE | Eviction O_after (softmax 재분배 효과가 수식에 내재) |
+| ENG-ALG-044 | Attention V2 (경량) | Eviction O_after (attention-only 근사는 별도 fast path로 가능) |
+| ENG-ALG-045 | KIVI NMSE | KIVI O_after (dequant round-trip) |
+| ENG-ALG-046 | KIVI OPR | KIVI O_after (attention-weighted 벡터 perturbation) |
+| ENG-ALG-047 | AWQE | KIVI O_after (스칼라 합산 → 벡터 합산으로 통합) |
+| ENG-ALG-049 | AW-VOPR | KIVI O_after (동일 수식; AW-VOPR이 ENG-ALG-051의 KIVI 경우와 수학적 동치) |
+
+> **ENG-ALG-048 (Layer Skip QCF)**: speculative decoding rejection rate 기반이며, KV cache lossy action이 아니므로 이 통합 메트릭의 대상이 아니다. ENG-ALG-048은 그대로 유지된다.
+
+---
+
 ### 3.5 RequestQcf -> QcfEstimate 흐름 [ENG-ALG-050]
 
 **[ENG-ALG-050]** Manager가 RequestQcf를 보내면 Engine은 **읽기 전용 스캔**으로 per-action QCF 비용을 산출하여 QcfEstimate를 반환한다. *(MUST)*
@@ -593,23 +663,25 @@ GQA 처리: kv_head당 gqa_group_size개 Q-head의 attention weight를 평균하
 
    **6종 Action dry-run 명세**:
 
+   > 계산 컬럼: Eviction/D2O/KIVI의 QCF 계산은 Unified QCF (ENG-ALG-051)의 attention output perturbation 수식을 따른다. LayerSkip은 ENG-ALG-048 (별도 proxy)을 사용한다.
+
    | Action | 필요 입력 | 계산 | 출력 범위 | 가용성 조건 |
    |--------|----------|------|-----------|------------|
-   | Sliding | `current_pos`, `target_len` | `evict_count / current_pos` | [0, 1] | 항상 계산 가능 |
-   | H2O | `current_pos`, importance scores, `keep_ratio` | `evicted_importance / total_importance` | [0, 1] | AttentionScoreAccumulator 활성 필요 |
-   | Streaming | `current_pos`, `sink_size`, `window_size` | `(current_pos - keep_size) / current_pos` where `keep_size = sink_size + window_size` | [0, 1] | 항상 계산 가능 (`sink_size`, `window_size`는 config에서 취득) |
-   | D2O | importance scores, `keep_ratio` | H2O QCF x `merge_discount` (merge가 정보 일부 보존하므로 순수 eviction보다 낮은 비용) | [0, 1] | AttentionScoreAccumulator 활성 필요 |
-   | KIVI | KiviCache residual 상태 | `compute_flush_qcf()` (NMSE) | [0, 1] | KiviCache 사용 시에만 (F16/F32 KV cache에서는 N/A) |
-   | LayerSkip | `ImportanceTable`, `skip_ratio` | `estimate_qcf_for_count()` (테이블 참조만) | [0, 1] | prefill 시 ImportanceTable이 수집되어야 함 |
+   | Sliding | `current_pos`, `target_len`, attention weights α, V cache | Unified QCF (ENG-ALG-051): Eviction O_after with Sliding retained set | [0, 1] | 항상 계산 가능 |
+   | H2O | `current_pos`, importance scores, `keep_ratio`, attention weights α, V cache | Unified QCF (ENG-ALG-051): Eviction O_after with H2O retained set | [0, 1] | AttentionScoreAccumulator 활성 필요 |
+   | Streaming | `current_pos`, `sink_size`, `window_size`, attention weights α, V cache | Unified QCF (ENG-ALG-051): Eviction O_after with Streaming retained set (`sink + window`) | [0, 1] | 항상 계산 가능 (`sink_size`, `window_size`는 config에서 취득) |
+   | D2O | importance scores, `keep_ratio`, attention weights α, V cache | Unified QCF (ENG-ALG-051): D2O O_after with merge-compensated V' | [0, 1] | AttentionScoreAccumulator 활성 필요 |
+   | KIVI | KiviCache residual 상태, attention weights α, V cache | Unified QCF (ENG-ALG-051): KIVI O_after with `dequant(quant(V))` | [0, 1] | KiviCache 사용 시에만 (F16/F32 KV cache에서는 N/A) |
+   | LayerSkip | `ImportanceTable`, `skip_ratio` | `estimate_qcf_for_count()` (ENG-ALG-048, 테이블 참조만) | [0, 1] | prefill 시 ImportanceTable이 수집되어야 함 |
 
    **Action별 dry-run 상세**:
 
-   - **Sliding**: 제거 대상 위치 계산 → `compute_sliding_qcf_attn()` (dry-run). `evict_count = current_pos - target_len`.
-   - **H2O**: `identify_evicted_h2o()` → importance score 기반 하위 토큰 식별 → `compute_eviction_qcf_attn()` (dry-run). Evicted tokens의 importance 합 / 전체 importance 합.
-   - **Streaming**: `sink_size + window_size`로 `keep_size` 결정 → eviction fraction 계산. `(current_pos - keep_size) / current_pos`. Attention score 불필요.
-   - **D2O**: `identify_evicted_h2o()` + merge compensation 보정. H2O dry-run과 동일하게 evicted 토큰을 식별한 뒤, merge discount factor를 적용하여 보정된 QCF를 산출. `merge_discount = 1 - estimated_merge_rate * merge_retention` (merge가 일부 정보를 보존하므로 순수 deletion보다 낮은 cost).
-   - **KIVI**: 현재 residual 상태에서 `compute_flush_qcf()` (dry-run). Flush 대상 토큰에 대한 NMSE 계산.
-   - **LayerSkip**: `ImportanceTable.estimate_qcf_for_count()` (테이블 참조만). Skip 대상 레이어의 importance 합으로 QCF 추정.
+   - **Sliding**: 제거 대상 위치 계산 → Unified QCF (ENG-ALG-051) Eviction 수식 적용. retained set = `[evict_count..current_pos]`. `evict_count = current_pos - target_len`.
+   - **H2O**: `identify_evicted_h2o()` → importance score 기반 하위 토큰 식별 → Unified QCF (ENG-ALG-051) Eviction 수식 적용. retained set = prefix + heavy hitters + recent window.
+   - **Streaming**: `sink_size + window_size`로 retained set 결정 (sink + recent window) → Unified QCF (ENG-ALG-051) Eviction 수식 적용.
+   - **D2O**: `identify_evicted_h2o()` + merge compensation으로 V' 생성 → Unified QCF (ENG-ALG-051) D2O 수식 적용. merge-compensated V'를 사용하므로 순수 eviction보다 낮은 QCF.
+   - **KIVI**: 현재 residual 상태에서 Unified QCF (ENG-ALG-051) KIVI 수식 적용. `dequant(quant(V))` round-trip으로 O_after 계산.
+   - **LayerSkip**: `ImportanceTable.estimate_qcf_for_count()` (ENG-ALG-048, 테이블 참조만). Skip 대상 레이어의 importance 합으로 QCF 추정. (Unified QCF 대상 아님)
 
    **가용성 판정**: 각 action의 가용성 조건이 충족되지 않으면 해당 action의 QcfMetric은 QcfEstimate에 포함되지 않는다 (N/A). Manager는 반환된 estimate 목록에 존재하는 action만으로 의사결정한다.
 

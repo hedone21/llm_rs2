@@ -10,6 +10,7 @@ pub mod eviction_qcf;
 pub mod layer_importance;
 pub mod quant_qcf;
 pub mod skip_qcf;
+pub mod unified_qcf;
 
 pub use estimator::DegradationEstimator;
 pub use eviction_qcf::{
@@ -23,6 +24,7 @@ pub use quant_qcf::{
     compute_flush_opr, compute_flush_qcf,
 };
 pub use skip_qcf::SkipQcfTracker;
+pub use unified_qcf::{QcfActionType, UnifiedQcfParams, VDataSource, compute_unified_qcf};
 
 /// A QCF metric collected from a single lossy action execution.
 #[derive(Debug, Clone)]

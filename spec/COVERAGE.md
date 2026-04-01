@@ -109,7 +109,7 @@
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
 
-> 추적 대상: ~61개 | ✅ 49 | ⬜ 0
+> 추적 대상: ~62개 | ✅ 49 | ⬜ 1
 
 ## 선별 기준
 
@@ -207,6 +207,7 @@
 | ENG-ALG-011 | (A) | Sliding Window Eviction | ✅ | `engine/tests/spec/test_eng_alg_010_012.rs` |
 | ENG-ALG-012 | (A) | D2O Compensation | ✅ | `engine/tests/spec/test_eng_alg_010_012.rs` |
 | ENG-ALG-020 | (A) | KIVI 양자화 | ✅ | `engine/tests/spec/test_eng_alg_020_022.rs` |
+| ENG-ALG-051 | (B) | Unified QCF (attention output perturbation 통합 메트릭) | ⬜ | 미구현 |
 
 ## Engine Data
 
