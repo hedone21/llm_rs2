@@ -2258,7 +2258,7 @@ impl Backend for OpenCLBackend {
         };
         let nb02 = nb01 * dims[0] as u64;
         let nb03 = nb02;
-        let ne10 = indices.size() as i32;
+        let ne10 = (indices.size() / 4) as i32; // u32 element count, not byte size
         let nb10 = 4u64;
         let nb11 = nb10 * ne10 as u64;
         let nb12 = nb11;
@@ -2294,7 +2294,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&nb3))?;
 
             let local_size = 64usize;
-            let num_indices = indices.size();
+            let num_indices = indices.size() / 4; // u32 element count, not byte size
             let global_work_size: [usize; 3] = [num_indices * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 

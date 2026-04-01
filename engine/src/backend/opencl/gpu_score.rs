@@ -256,7 +256,7 @@ impl GpuScoreAccumulator {
             )?;
 
             let gws = [Self::round_up(cache_seq_len, 64), 1, 1];
-            let lws = [64usize.min(cache_seq_len), 1, 1];
+            let lws = [64, 1, 1];
 
             ocl::core::enqueue_kernel(
                 queue,
@@ -310,7 +310,7 @@ impl GpuScoreAccumulator {
             )?;
 
             let gws = [Self::round_up(cache_seq_len, 64), 1, 1];
-            let lws = [64usize.min(cache_seq_len), 1, 1];
+            let lws = [64, 1, 1];
 
             ocl::core::enqueue_kernel(
                 queue,
@@ -415,7 +415,7 @@ impl GpuScoreAccumulator {
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&(n as i32)))?;
 
             let gws = [Self::round_up(n, 256), 1, 1];
-            let lws = [256usize.min(n), 1, 1];
+            let lws = [256, 1, 1];
 
             ocl::core::enqueue_kernel(
                 queue,
