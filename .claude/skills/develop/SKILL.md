@@ -25,10 +25,19 @@ llm.rs 개발 작업을 에이전트 파이프라인으로 오케스트레이션
 
 ## 에이전트 호출 공통 규칙
 
-- 모든 Agent 호출에 `model: "opus"` 명시
-- `subagent_type`: 에이전트 정의 이름 사용 (pm, architect, implementer, tester, researcher)
+- `subagent_type`: 에이전트 정의 이름 사용 (pm, architect, implementer, senior-implementer, tester, researcher)
 - 이전 에이전트 결과를 다음 에이전트의 prompt에 포함하여 전달
 - 독립적인 에이전트는 `run_in_background: true`로 병렬 실행 가능
+
+### Implementer 선택 기준
+
+| 조건 | 에이전트 | 모델 |
+|------|---------|------|
+| `.cl` 커널, NEON/SIMD, GPU 백엔드, 성능 커널, 복잡한 알고리즘 (D2O, KIVI, QCF) | **senior-implementer** | `model: "opus"` |
+| 일반 Rust 구현, 프로토콜 연결, CLI, Manager 크레이트, 테스트, spec 테스트 | **implementer** | `model: "sonnet"` |
+| 판단 불확실 시 → senior-implementer 사용 | **senior-implementer** | `model: "opus"` |
+
+구현 작업에 두 영역이 혼합된 경우, 고급 부분은 senior-implementer, 나머지는 implementer에게 병렬 위임한다.
 
 ## Spec Triage (모든 워크플로우 공통)
 
