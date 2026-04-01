@@ -259,12 +259,11 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         // ── post_prefill hook (eviction if cache exceeds budget) ──
         hook.post_prefill(kv_caches, &mut qcf_metrics);
 
-        // Update start_pos: post_prefill may have evicted (compacted) the cache.
-        let start_pos_after_prompt = kv_caches
-            .iter()
-            .map(|c| c.current_pos())
-            .max()
-            .unwrap_or(start_pos_after_prompt);
+        // IMPORTANT: Do NOT update start_pos_after_prompt to current_pos after eviction.
+        // After shift_positions(), cached K vectors retain their original RoPE positions.
+        // The next decode token's RoPE must continue from prompt_len (original position)
+        // to maintain correct relative distances. Using current_pos (compacted) would
+        // create a RoPE discontinuity where cached tokens appear as "future" tokens.
 
         // ── Snapshot KV cache after prompt ──
         let snap = hook.snapshot(kv_caches);

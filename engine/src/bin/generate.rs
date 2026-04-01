@@ -4555,7 +4555,13 @@ fn run_ppl(
                         "ppl_at_step": ppl_at_event,
                     }));
 
-                    start_pos = kv_caches[0].current_pos;
+                    // IMPORTANT: Do NOT reset start_pos to current_pos after eviction.
+                    // After shift_positions(), cached K vectors retain their original RoPE
+                    // positions. start_pos must continue incrementing from the original
+                    // position to maintain correct RoPE relative distances. Using current_pos
+                    // (compacted) creates a RoPE discontinuity where cached tokens appear
+                    // as "future" tokens, causing severe NLL degradation.
+                    // start_pos continues via `start_pos += 1` in the main loop.
                     if let Some(acc) = score_accumulator.as_mut() {
                         acc.reset();
                     }
