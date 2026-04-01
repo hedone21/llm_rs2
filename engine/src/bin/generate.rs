@@ -1590,12 +1590,18 @@ fn main() -> anyhow::Result<()> {
 
         // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
         // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
-        // Standard GPU plan is disabled — kernel arg mismatch in Plan builder
-        // causes SIGSEGV on NVIDIA (rms_norm add_unit param + other issues).
-        // The Plan was previously never built due to score_accumulator always-on guard.
-        // TODO: audit all kernel arg bindings in plan.rs against current kernel signatures.
+        // Disable when score_accumulator is active: plan doesn't collect attention scores
         #[cfg(feature = "opencl")]
-        let mut gpu_plan: Option<llm_rs2::backend::opencl::plan::FullKernelPlan> = None;
+        let mut gpu_plan = if backend.name() == "OpenCL"
+            && !args.profile
+            && !args.no_gpu_plan
+            && score_accumulator.is_none()
+            && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+        {
+            model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
+        } else {
+            None
+        };
 
         // Pre-allocate decode buffers (reused across tokens)
         let mut logits_cpu = vec![0.0f32; vocab_size];
@@ -1743,8 +1749,17 @@ fn main() -> anyhow::Result<()> {
                     variance_collector: None,
                 })?;
 
-                // Standard Plan rebuild disabled (see initial gpu_plan comment above).
-                // TODO: re-enable after Plan kernel arg audit.
+                // Rebuild plan if it was invalidated (e.g. KV cache resize)
+                #[cfg(feature = "opencl")]
+                if gpu_plan.is_none()
+                    && backend.name() == "OpenCL"
+                    && !args.profile
+                    && !args.no_gpu_plan
+                    && score_accumulator.is_none()
+                    && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+                {
+                    gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
+                }
             }
             backend.synchronize()?;
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;

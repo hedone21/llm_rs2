@@ -65,6 +65,11 @@ pub struct KernelStep {
     pub dynamic_args: Vec<DynamicArg>,
     /// Operation tag for profiling
     pub op_tag: OpTag,
+    /// Buffers created during plan build that must be kept alive while the plan
+    /// exists. Dropping them would invalidate the cl_mem handles pre-bound to
+    /// the kernel, leading to SIGSEGV on dispatch.
+    #[allow(dead_code)]
+    pub retained_bufs: Vec<Mem>,
 }
 
 // SAFETY: CoreKernel is a raw cl_kernel pointer. We guarantee single-threaded access
@@ -84,6 +89,7 @@ pub enum KvUpdateVariant {
 }
 
 /// Attention variant — Standard half-precision or KIVI fused attention.
+#[allow(clippy::large_enum_variant)]
 pub enum AttentionVariant {
     /// Standard attention: kernel_attn_gen_half on F16 KV cache
     Standard(KernelStep),
@@ -152,77 +158,85 @@ impl FullKernelPlan {
         res_tokens: i32,
     ) {
         for dyn_arg in &step.dynamic_args {
-            unsafe {
+            let (arg_idx, result) = unsafe {
                 match dyn_arg {
-                    DynamicArg::StartPos { arg_idx } => {
+                    DynamicArg::StartPos { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&start_pos),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::CacheSeqLen { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::CacheSeqLen { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&cache_seq_len),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::WritePos { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::WritePos { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&write_pos),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::KvCapacity { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::KvCapacity { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&kv_capacity),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::ResPos { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::ResPos { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&res_pos),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::Q2Tokens { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::Q2Tokens { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&q2_tokens),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::ResTokens { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::ResTokens { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&res_tokens),
-                        )
-                        .ok();
-                    }
-                    DynamicArg::TokBase { arg_idx } => {
+                        ),
+                    ),
+                    DynamicArg::TokBase { arg_idx } => (
+                        *arg_idx,
                         ocl::core::set_kernel_arg(
                             &step.kernel,
                             *arg_idx,
                             ocl::core::ArgVal::scalar(&q2_tokens),
-                        )
-                        .ok();
-                    }
+                        ),
+                    ),
                 }
+            };
+            if let Err(e) = result {
+                log::error!(
+                    "Plan set_kernel_arg failed: op={:?} arg_idx={}: {}",
+                    step.op_tag,
+                    arg_idx,
+                    e
+                );
             }
         }
         unsafe {
-            ocl::core::enqueue_kernel(
+            if let Err(e) = ocl::core::enqueue_kernel(
                 queue,
                 &step.kernel,
                 step.ndim,
@@ -231,8 +245,14 @@ impl FullKernelPlan {
                 step.local_work_size,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
-            )
-            .ok();
+            ) {
+                log::error!(
+                    "Plan enqueue_kernel failed: op={:?} gws={:?}: {}",
+                    step.op_tag,
+                    step.global_work_size,
+                    e
+                );
+            }
         }
     }
 
@@ -248,6 +268,8 @@ impl FullKernelPlan {
         start_pos: usize,
         kv_caches: &mut [C],
     ) -> std::result::Result<(), PlanInvalidated> {
+        let debug_sync = std::env::var("PLAN_DEBUG").is_ok();
+
         for (i, layer_plan) in self.layers.iter().enumerate() {
             let cache = &mut kv_caches[i];
 
@@ -264,8 +286,11 @@ impl FullKernelPlan {
             let q2t = cache.q2_tokens() as i32;
             let rt = rp; // res_tokens = res_pos before advance
 
+            // Attention sees the token we just scattered
+            let attn_seq_len = cache_seq_len + 1;
+
             // Steps 1-6: pre-KV steps
-            for step in &layer_plan.steps_pre_kv {
+            for (si, step) in layer_plan.steps_pre_kv.iter().enumerate() {
                 Self::dispatch_step(
                     queue,
                     step,
@@ -277,6 +302,13 @@ impl FullKernelPlan {
                     q2t,
                     rt,
                 );
+                if debug_sync {
+                    ocl::core::finish(queue).ok();
+                    eprintln!(
+                        "[Plan] L{} pre_kv[{}] {:?} OK (pos={}, cap={})",
+                        i, si, step.op_tag, start_pos, kv_cap
+                    );
+                }
             }
             // Step 7: KV update
             match &layer_plan.kv_update {
@@ -292,6 +324,13 @@ impl FullKernelPlan {
                         q2t,
                         rt,
                     );
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!(
+                            "[Plan] L{} kv_scatter OK (write_pos={}, cap={})",
+                            i, write_pos, kv_cap
+                        );
+                    }
                 }
                 KvUpdateVariant::Kivi { gather_k, gather_v } => {
                     Self::dispatch_step(
@@ -322,20 +361,31 @@ impl FullKernelPlan {
             // After KV update, res_tokens is res_pos + 1 for attention
             let rt_after = rp + 1;
 
-            // Step 8: Attention
+            // Step 8: Attention — uses attn_seq_len (includes just-scattered token)
             match &layer_plan.attention {
                 AttentionVariant::Standard(step) => {
+                    if debug_sync {
+                        eprintln!(
+                            "[Plan] L{} attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                            i, attn_seq_len, step.global_work_size, step.local_work_size
+                        );
+                    }
                     Self::dispatch_step(
                         queue,
                         step,
                         start_pos_i32,
-                        cache_seq_len,
+                        attn_seq_len,
                         write_pos,
                         kv_cap,
                         rp,
                         q2t,
                         rt,
                     );
+                    if debug_sync {
+                        eprintln!("[Plan] L{} attention enqueued, calling finish...", i);
+                        ocl::core::finish(queue).ok();
+                        eprintln!("[Plan] L{} attention OK (attn_seq_len={})", i, attn_seq_len);
+                    }
                 }
                 AttentionVariant::KiviAssembled {
                     scatter_k,
@@ -396,7 +446,7 @@ impl FullKernelPlan {
             }
 
             // Steps 9-15: post-attention steps
-            for step in &layer_plan.steps_post_attn {
+            for (si, step) in layer_plan.steps_post_attn.iter().enumerate() {
                 Self::dispatch_step(
                     queue,
                     step,
@@ -408,17 +458,23 @@ impl FullKernelPlan {
                     q2t,
                     rt,
                 );
+                if debug_sync {
+                    ocl::core::finish(queue).ok();
+                    eprintln!("[Plan] L{} post_attn[{}] {:?} OK", i, si, step.op_tag);
+                }
             }
             cache.advance_pos(1);
 
-            if layer_plan.flush_after {
-                ocl::core::flush(queue).ok();
+            if layer_plan.flush_after
+                && let Err(e) = ocl::core::flush(queue)
+            {
+                log::error!("Plan flush failed: {}", e);
             }
         }
 
         // Final norm
         unsafe {
-            ocl::core::enqueue_kernel(
+            if let Err(e) = ocl::core::enqueue_kernel(
                 queue,
                 &self.final_norm.kernel,
                 self.final_norm.ndim,
@@ -427,13 +483,14 @@ impl FullKernelPlan {
                 self.final_norm.local_work_size,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
-            )
-            .ok();
+            ) {
+                log::error!("Plan enqueue final_norm failed: {}", e);
+            }
         }
 
         // lm_head matmul
         unsafe {
-            ocl::core::enqueue_kernel(
+            if let Err(e) = ocl::core::enqueue_kernel(
                 queue,
                 &self.lm_head.kernel,
                 self.lm_head.ndim,
@@ -442,8 +499,9 @@ impl FullKernelPlan {
                 self.lm_head.local_work_size,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
-            )
-            .ok();
+            ) {
+                log::error!("Plan enqueue lm_head failed: {}", e);
+            }
         }
 
         Ok(())
@@ -501,6 +559,8 @@ pub struct LayerPlanConfig<'a> {
     // Attention layout info
     pub kv_pos_stride: i32,
     pub kv_head_stride: i32,
+    /// Whether the device lacks subgroup support (nosub fallback path).
+    pub is_nosub: bool,
 }
 
 /// N threshold for switching from N_DST=2 to N_DST=4 GEMV kernel.
@@ -526,8 +586,10 @@ fn make_f16_matmul_step(
     k: usize,
     op_tag: OpTag,
     l4_program: Option<&ocl::Program>,
+    is_nosub: bool,
 ) -> Result<KernelStep> {
-    let use_l4 = n > LARGE_N_THRESHOLD && l4_program.is_some();
+    // nosub fallback: L4 kernel also requires subgroups
+    let use_l4 = !is_nosub && n > LARGE_N_THRESHOLD && l4_program.is_some();
     let kernel = if use_l4 {
         ocl::core::create_kernel(l4_program.unwrap(), "kernel_mul_mat_f16_f32_l4")
             .context("create kernel_mul_mat_f16_f32_l4")?
@@ -564,8 +626,21 @@ fn make_f16_matmul_step(
         ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
     }
 
-    const N_SIMDGROUP: usize = 4;
-    if use_l4 {
+    if is_nosub {
+        // Nosub kernel: 1D work group, N_DST=4, m=1 in dim 1
+        const NOSUB_N_DST: usize = 4;
+        let n_groups = n.div_ceil(NOSUB_N_DST);
+        Ok(KernelStep {
+            kernel,
+            ndim: 3,
+            global_work_size: [n_groups * 64, 1, 1], // m=1 for decode
+            local_work_size: Some([64, 1, 1]),
+            dynamic_args: vec![],
+            op_tag,
+            retained_bufs: vec![],
+        })
+    } else if use_l4 {
+        const N_SIMDGROUP: usize = 4;
         // N_DST=4: 256 rows/WG
         const ROWS_PER_WG: usize = 256; // N_SIMDWIDTH(64) * N_DST(4)
         let n_groups = n.div_ceil(ROWS_PER_WG);
@@ -576,8 +651,10 @@ fn make_f16_matmul_step(
             local_work_size: Some([64, N_SIMDGROUP, 1]),
             dynamic_args: vec![],
             op_tag,
+            retained_bufs: vec![],
         })
     } else {
+        const N_SIMDGROUP: usize = 4;
         // N_DST=2: 128 rows/WG
         const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
         let n_groups = n.div_ceil(ROWS_PER_WG);
@@ -588,6 +665,7 @@ fn make_f16_matmul_step(
             local_work_size: Some([64, N_SIMDGROUP, 1]),
             dynamic_args: vec![],
             op_tag,
+            retained_bufs: vec![],
         })
     }
 }
@@ -633,6 +711,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: Some([local_size, 1, 1]),
             dynamic_args: vec![],
             op_tag: OpTag::RmsNorm,
+            retained_bufs: vec![],
         });
     }
 
@@ -648,6 +727,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         k,
         OpTag::MatmulQKV,
         None,
+        config.is_nosub,
     )?);
 
     // -----------------------------------------------------------------------
@@ -662,6 +742,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         k,
         OpTag::MatmulQKV,
         None,
+        config.is_nosub,
     )?);
 
     // -----------------------------------------------------------------------
@@ -676,6 +757,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         k,
         OpTag::MatmulQKV,
         None,
+        config.is_nosub,
     )?);
 
     // -----------------------------------------------------------------------
@@ -710,6 +792,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: None,
             dynamic_args: vec![DynamicArg::StartPos { arg_idx: 4 }],
             op_tag: OpTag::Rope,
+            retained_bufs: vec![],
         });
     }
 
@@ -745,6 +828,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: None,
             dynamic_args: vec![DynamicArg::StartPos { arg_idx: 4 }],
             op_tag: OpTag::Rope,
+            retained_bufs: vec![],
         });
     }
 
@@ -781,6 +865,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
                 DynamicArg::WritePos { arg_idx: 6 },
             ],
             op_tag: OpTag::KvScatter,
+            retained_bufs: vec![],
         })
     };
 
@@ -851,6 +936,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: Some([local_size, 1, 1]),
             dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 8 }],
             op_tag: OpTag::Attention,
+            retained_bufs: vec![dummy_score_buf],
         })
     };
 
@@ -869,6 +955,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         dim,
         OpTag::MatmulWo,
         None,
+        config.is_nosub,
     )?);
 
     // 10. add_rms_norm_oop (x += attn_out, then norm -> residual)
@@ -897,6 +984,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: Some([local_size, 1, 1]),
             dynamic_args: vec![],
             op_tag: OpTag::AddRmsNorm,
+            retained_bufs: vec![],
         });
     }
 
@@ -910,6 +998,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         k,
         OpTag::MatmulGateUp,
         config.f16_l4_program,
+        config.is_nosub,
     )?);
 
     // 12. matmul up (residual -> up)
@@ -922,6 +1011,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         k,
         OpTag::MatmulGateUp,
         config.f16_l4_program,
+        config.is_nosub,
     )?);
 
     // 13. silu_mul (gate = silu(gate) * up)
@@ -941,6 +1031,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: None,
             dynamic_args: vec![],
             op_tag: OpTag::SiluMul,
+            retained_bufs: vec![],
         });
     }
 
@@ -954,6 +1045,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.ffn_hidden,
         OpTag::MatmulDown,
         None,
+        config.is_nosub,
     )?);
 
     // 15. add_assign (x += down)
@@ -974,6 +1066,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             local_work_size: None,
             dynamic_args: vec![],
             op_tag: OpTag::AddAssign,
+            retained_bufs: vec![],
         });
     }
 
@@ -1027,6 +1120,8 @@ pub struct FullPlanConfig<'a> {
     pub kv_capacity: usize,
     pub kv_pos_stride: i32,
     pub kv_head_stride: i32,
+    /// Whether the device lacks subgroup support (nosub fallback path).
+    pub is_nosub: bool,
 }
 
 /// Per-layer weight buffer references.
@@ -1100,6 +1195,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             kv_capacity: config.kv_capacity,
             kv_pos_stride: config.kv_pos_stride,
             kv_head_stride: config.kv_head_stride,
+            is_nosub: config.is_nosub,
         };
         layers.push(
             build_layer_plan(&layer_config)
@@ -1138,6 +1234,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             local_work_size: Some([local_size, 1, 1]),
             dynamic_args: vec![],
             op_tag: OpTag::FinalNorm,
+            retained_bufs: vec![],
         }
     };
 
@@ -1151,6 +1248,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         config.dim,
         OpTag::LmHead,
         config.f16_l4_program,
+        config.is_nosub,
     )
     .context("build lm_head matmul step")?;
 
@@ -1224,6 +1322,8 @@ pub struct KiviFullPlanConfig<'a> {
     pub bits: u8,
     /// Whether to use native KIVI attention (true on nosub devices)
     pub use_native_attn: bool,
+    /// Whether the device lacks subgroup support (nosub fallback path).
+    pub is_nosub: bool,
 }
 
 /// Build a KIVI gather_update kernel step for K or V.
@@ -1259,6 +1359,7 @@ fn make_kivi_gather_step(
         local_work_size: None,
         dynamic_args: vec![DynamicArg::ResPos { arg_idx: 6 }],
         op_tag: OpTag::KvScatter, // reuse tag for profiling
+        retained_bufs: vec![],
     })
 }
 
@@ -1300,6 +1401,7 @@ fn make_kivi_scatter_step(
             DynamicArg::TokBase { arg_idx: 6 },
         ],
         op_tag: OpTag::KvScatter,
+        retained_bufs: vec![],
     })
 }
 
@@ -1382,6 +1484,7 @@ fn make_kivi_native_attn_step(
             DynamicArg::ResTokens { arg_idx: 11 },
         ],
         op_tag: OpTag::Attention,
+        retained_bufs: vec![dummy_score_buf],
     })
 }
 
@@ -1451,6 +1554,7 @@ fn make_kivi_assembled_attn_step(
         // CacheSeqLen is reused: dispatch_step sets it to total = q2_tokens + res_tokens
         dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 8 }],
         op_tag: OpTag::Attention,
+        retained_bufs: vec![dummy_score_buf],
     })
 }
 
@@ -1605,6 +1709,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             kv_capacity: config.max_seq_len,
             kv_pos_stride: (config.n_kv_heads * config.head_dim) as i32,
             kv_head_stride: config.head_dim as i32,
+            is_nosub: config.is_nosub,
         };
         layers.push(
             build_kivi_layer_plan(
@@ -1649,6 +1754,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             local_work_size: Some([local_size, 1, 1]),
             dynamic_args: vec![],
             op_tag: OpTag::FinalNorm,
+            retained_bufs: vec![],
         }
     };
 
@@ -1662,6 +1768,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
         config.dim,
         OpTag::LmHead,
         config.f16_l4_program,
+        config.is_nosub,
     )
     .context("build lm_head matmul step for KIVI plan")?;
 

@@ -1162,6 +1162,7 @@ impl TransformerModel {
             kv_capacity: capacity,
             kv_pos_stride,
             kv_head_stride,
+            is_nosub: ocl_backend.is_nosub(),
         };
 
         match build_full_plan(&full_config) {
@@ -1320,6 +1321,7 @@ impl TransformerModel {
             max_seq_len,
             bits,
             use_native_attn: use_native,
+            is_nosub: ocl_backend.is_nosub(),
         };
 
         match build_kivi_full_plan(&kivi_config) {
