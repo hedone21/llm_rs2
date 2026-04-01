@@ -29,7 +29,8 @@ pub enum QcfActionType {
         sink_size: usize,
         window_size: usize,
     },
-    /// D2O merge: same retained set as H2O (merge compensation is secondary).
+    /// D2O merge: same retained set as H2O, but evicted tokens are additively
+    /// merged into their nearest (cosine similarity) retained token.
     MergeD2o {
         target_len: usize,
         keep_ratio: f32,
@@ -139,8 +140,7 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
                 n_kv_heads,
                 layout,
             );
-            {
-            }
+            {}
             for d in 0..head_dim {
                 o_before[d] += alpha_t * v_t[d];
             }
@@ -233,11 +233,12 @@ pub fn compute_unified_qcf(params: &UnifiedQcfParams) -> (f32, Vec<f32>) {
                         *keep_ratio,
                         *protected_prefix,
                     );
-                    compute_o_eviction(
+                    compute_o_d2o_merge(
                         &alpha_h,
                         &params.v_source,
                         h,
-                        retained.iter().copied(),
+                        &retained,
+                        current_pos,
                         head_dim,
                         capacity,
                         n_kv_heads,
@@ -355,6 +356,96 @@ fn compute_o_eviction(
         }
     }
     o
+}
+
+// ── Helper: D2O merge O_after with scatter-reduce compensation ──
+
+/// Compute O_after for D2O merge: same retained set as H2O, but evicted
+/// tokens are additively merged into their nearest (cosine similarity)
+/// retained token before computing the output.
+#[allow(clippy::too_many_arguments)]
+fn compute_o_d2o_merge(
+    alpha: &[f32],
+    v_src: &VDataSource,
+    head: usize,
+    retained: &[usize],
+    current_pos: usize,
+    head_dim: usize,
+    capacity: usize,
+    n_kv_heads: usize,
+    layout: KVLayout,
+) -> Vec<f32> {
+    if retained.is_empty() {
+        return vec![0.0; head_dim];
+    }
+
+    // Build merged V: start with original V of retained tokens
+    let mut v_merged: Vec<Vec<f32>> = retained
+        .iter()
+        .map(|&t| read_v_f32(v_src, head, t, head_dim, capacity, n_kv_heads, layout))
+        .collect();
+
+    // Identify evicted tokens
+    let retained_set: std::collections::HashSet<usize> = retained.iter().copied().collect();
+    let evicted: Vec<usize> = (0..current_pos)
+        .filter(|t| !retained_set.contains(t))
+        .collect();
+
+    // Scatter-reduce with D2O merge weight: w = exp(sim) / (exp(sim) + e)
+    // where e = 1.0 (D2O default merge_e parameter).
+    // This prevents V magnitude explosion from raw additive merge.
+    const MERGE_E: f32 = 1.0;
+    for &e in &evicted {
+        let v_e = read_v_f32(v_src, head, e, head_dim, capacity, n_kv_heads, layout);
+        let (nearest_idx, sim) = find_nearest_cosine_with_sim(&v_e, &v_merged);
+        let exp_sim = sim.max(-10.0).min(10.0).exp(); // clamp to avoid overflow
+        let merge_weight = exp_sim / (exp_sim + MERGE_E);
+        for d in 0..head_dim {
+            v_merged[nearest_idx][d] += merge_weight * v_e[d];
+        }
+    }
+
+    // O_after with merged V
+    let alpha_sum: f32 = retained.iter().map(|&t| alpha[t]).sum();
+    if alpha_sum <= 0.0 {
+        return vec![0.0; head_dim];
+    }
+
+    let mut o = vec![0.0f32; head_dim];
+    for (i, &t) in retained.iter().enumerate() {
+        let w = alpha[t] / alpha_sum;
+        for d in 0..head_dim {
+            o[d] += w * v_merged[i][d];
+        }
+    }
+    o
+}
+
+/// Find the index of the candidate vector with highest cosine similarity
+/// to the query vector. Returns (index, similarity).
+fn find_nearest_cosine_with_sim(query: &[f32], candidates: &[Vec<f32>]) -> (usize, f32) {
+    let q_norm = l2_norm(query);
+    if q_norm < 1e-10 || candidates.is_empty() {
+        return (0, 0.0);
+    }
+
+    let mut best_idx = 0;
+    let mut best_sim = f32::NEG_INFINITY;
+
+    for (i, c) in candidates.iter().enumerate() {
+        let dot: f32 = query.iter().zip(c).map(|(a, b)| a * b).sum();
+        let c_norm = l2_norm(c);
+        let sim = if c_norm > 1e-10 {
+            dot / (q_norm * c_norm)
+        } else {
+            0.0
+        };
+        if sim > best_sim {
+            best_sim = sim;
+            best_idx = i;
+        }
+    }
+    (best_idx, best_sim)
 }
 
 // ── Helper: H2O retained token identification ───────────────────
@@ -901,14 +992,20 @@ mod tests {
     }
 
     #[test]
-    fn test_d2o_same_as_h2o_for_now() {
-        // MergeD2o uses same retained set as H2O, so QCF should be identical
-        let n_kv_heads = 1;
+    fn test_d2o_less_than_h2o() {
+        // D2O merge compensation preserves evicted token information,
+        // so D2O QCF should be strictly less than H2O QCF.
+        let n_kv_heads = 2;
         let head_dim = 4;
         let capacity = 32;
         let current_pos = 16;
         let v_data = make_v_data(n_kv_heads, capacity, head_dim);
-        let scores = uniform_scores(current_pos);
+
+        // Non-uniform scores: early tokens important, later less so
+        let mut scores = vec![0.1f32; current_pos];
+        scores[0] = 10.0;
+        scores[1] = 8.0;
+        scores[2] = 5.0;
 
         let target_len = 8;
         let keep_ratio = 0.5;
@@ -948,13 +1045,83 @@ mod tests {
             aggregation: AggregationMode::Mean,
         };
 
-        let (qcf_h2o, _) = compute_unified_qcf(&h2o_params);
-        let (qcf_d2o, _) = compute_unified_qcf(&d2o_params);
+        let (qcf_h2o, ph_h2o) = compute_unified_qcf(&h2o_params);
+        let (qcf_d2o, ph_d2o) = compute_unified_qcf(&d2o_params);
 
+        // D2O should produce lower QCF than H2O (merge preserves info)
         assert!(
-            (qcf_h2o - qcf_d2o).abs() < 1e-6,
-            "D2O ({qcf_d2o}) should equal H2O ({qcf_h2o}) for now"
+            qcf_d2o <= qcf_h2o + 1e-6,
+            "D2O ({qcf_d2o}) should have QCF <= H2O ({qcf_h2o})"
         );
+        // D2O should not be identical to H2O (merge has an effect)
+        assert!(
+            (qcf_h2o - qcf_d2o).abs() > 1e-6,
+            "D2O ({qcf_d2o}) should differ from H2O ({qcf_h2o}); merge should change the result"
+        );
+        // Both should be positive (eviction happens)
+        assert!(qcf_h2o > 0.0, "H2O QCF should be positive, got {qcf_h2o}");
+        assert!(qcf_d2o > 0.0, "D2O QCF should be positive, got {qcf_d2o}");
+
+        // Per-head: D2O <= H2O for each head
+        for h in 0..n_kv_heads {
+            assert!(
+                ph_d2o[h] <= ph_h2o[h] + 1e-6,
+                "head {h}: D2O ({}) should have QCF <= H2O ({})",
+                ph_d2o[h],
+                ph_h2o[h]
+            );
+        }
+    }
+
+    #[test]
+    fn test_d2o_no_eviction_equals_zero() {
+        // When current_pos <= target_len, no eviction happens, QCF = 0
+        let n_kv_heads = 1;
+        let head_dim = 4;
+        let capacity = 16;
+        let current_pos = 8;
+        let v_data = make_v_data(n_kv_heads, capacity, head_dim);
+        let scores = uniform_scores(current_pos);
+
+        let params = UnifiedQcfParams {
+            action: QcfActionType::MergeD2o {
+                target_len: current_pos,
+                keep_ratio: 0.5,
+                protected_prefix: 2,
+            },
+            v_source: VDataSource::F32(&v_data),
+            attention_scores: &scores,
+            head_attn: None,
+            n_kv_heads,
+            head_dim,
+            current_pos,
+            capacity,
+            layout: KVLayout::HeadMajor,
+            aggregation: AggregationMode::Mean,
+        };
+
+        let (qcf, _) = compute_unified_qcf(&params);
+        assert!(
+            qcf.abs() < 1e-6,
+            "D2O with no eviction should give QCF=0, got {qcf}"
+        );
+    }
+
+    #[test]
+    fn test_find_nearest_cosine_basic() {
+        // query = [1, 0], candidates = [[0, 1], [1, 0.1]]
+        // cosine sim to [0,1] = 0, to [1,0.1] ~= 0.995
+        let query = vec![1.0, 0.0];
+        let candidates = vec![vec![0.0, 1.0], vec![1.0, 0.1]];
+        assert_eq!(find_nearest_cosine_with_sim(&query, &candidates).0, 1);
+    }
+
+    #[test]
+    fn test_find_nearest_cosine_zero_query() {
+        let query = vec![0.0, 0.0];
+        let candidates = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        // Zero query norm -> returns (0, 0.0)
+        assert_eq!(find_nearest_cosine_with_sim(&query, &candidates).0, 0);
     }
 
     #[test]
