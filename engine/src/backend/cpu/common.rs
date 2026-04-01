@@ -417,15 +417,36 @@ impl Backend for CpuBackendCommon {
                             let s: f32 = q_vec.iter().zip(k_vec.iter()).map(|(a, b)| a * b).sum();
                             scores[t] = s * scale;
                         }
+                        // NaN guard: replace NaN logits with -inf before softmax
+                        for s in scores.iter_mut() {
+                            if s.is_nan() {
+                                *s = f32::NEG_INFINITY;
+                            }
+                        }
                         // softmax
                         let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                        let mut sum_e = 0.0;
-                        for s in scores.iter_mut() {
-                            *s = (*s - max_v).exp();
-                            sum_e += *s;
-                        }
-                        for s in scores.iter_mut() {
-                            *s /= sum_e;
+                        if max_v == f32::NEG_INFINITY {
+                            // All logits are -inf: uniform distribution
+                            let u = 1.0 / cache_seq_len as f32;
+                            for s in scores.iter_mut() {
+                                *s = u;
+                            }
+                        } else {
+                            let mut sum_e = 0.0f32;
+                            for s in scores.iter_mut() {
+                                *s = (*s - max_v).exp();
+                                sum_e += *s;
+                            }
+                            if sum_e.is_nan() || sum_e <= 0.0 || sum_e.is_infinite() {
+                                let u = 1.0 / cache_seq_len as f32;
+                                for s in scores.iter_mut() {
+                                    *s = u;
+                                }
+                            } else {
+                                for s in scores.iter_mut() {
+                                    *s /= sum_e;
+                                }
+                            }
                         }
                         if let Some(SendPtr(ptr)) = scores_ptr {
                             unsafe {
@@ -534,15 +555,35 @@ impl Backend for CpuBackendCommon {
                             scores[t] = score * scale;
                         }
 
+                        // NaN guard: replace NaN logits with -inf before softmax
+                        for s in scores.iter_mut() {
+                            if s.is_nan() {
+                                *s = f32::NEG_INFINITY;
+                            }
+                        }
                         // Softmax
                         let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                        let mut sum_e = 0.0;
-                        for s in scores.iter_mut() {
-                            *s = (*s - max_v).exp();
-                            sum_e += *s;
-                        }
-                        for s in scores.iter_mut() {
-                            *s /= sum_e;
+                        if max_v == f32::NEG_INFINITY {
+                            let u = 1.0 / cache_seq_len as f32;
+                            for s in scores.iter_mut() {
+                                *s = u;
+                            }
+                        } else {
+                            let mut sum_e = 0.0f32;
+                            for s in scores.iter_mut() {
+                                *s = (*s - max_v).exp();
+                                sum_e += *s;
+                            }
+                            if sum_e.is_nan() || sum_e <= 0.0 || sum_e.is_infinite() {
+                                let u = 1.0 / cache_seq_len as f32;
+                                for s in scores.iter_mut() {
+                                    *s = u;
+                                }
+                            } else {
+                                for s in scores.iter_mut() {
+                                    *s /= sum_e;
+                                }
+                            }
                         }
                         if let Some(SendPtr(ptr)) = scores_ptr {
                             unsafe {
@@ -724,15 +765,35 @@ impl Backend for CpuBackendCommon {
                             scores[t] = score * scale;
                         }
 
+                        // NaN guard: replace NaN logits with -inf before softmax
+                        for s in scores.iter_mut() {
+                            if s.is_nan() {
+                                *s = f32::NEG_INFINITY;
+                            }
+                        }
                         // Softmax
                         let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                        let mut sum_e = 0.0;
-                        for s in scores.iter_mut() {
-                            *s = (*s - max_v).exp();
-                            sum_e += *s;
-                        }
-                        for s in scores.iter_mut() {
-                            *s /= sum_e;
+                        if max_v == f32::NEG_INFINITY {
+                            let u = 1.0 / cache_seq_len as f32;
+                            for s in scores.iter_mut() {
+                                *s = u;
+                            }
+                        } else {
+                            let mut sum_e = 0.0f32;
+                            for s in scores.iter_mut() {
+                                *s = (*s - max_v).exp();
+                                sum_e += *s;
+                            }
+                            if sum_e.is_nan() || sum_e <= 0.0 || sum_e.is_infinite() {
+                                let u = 1.0 / cache_seq_len as f32;
+                                for s in scores.iter_mut() {
+                                    *s = u;
+                                }
+                            } else {
+                                for s in scores.iter_mut() {
+                                    *s /= sum_e;
+                                }
+                            }
                         }
                         if let Some(SendPtr(ptr)) = scores_ptr {
                             unsafe {

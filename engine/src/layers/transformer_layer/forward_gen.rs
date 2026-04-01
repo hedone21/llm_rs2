@@ -424,6 +424,13 @@ impl TransformerLayer {
                             // --- Step 2: Softmax ---
                             let active_scores = &mut scores_h[0..effective_cache_len];
 
+                            // NaN guard: replace NaN logits with -inf
+                            for i in 0..effective_cache_len {
+                                if active_scores.get_unchecked(i).is_nan() {
+                                    *active_scores.get_unchecked_mut(i) = f32::NEG_INFINITY;
+                                }
+                            }
+
                             let mut max_val = f32::NEG_INFINITY;
                             for i in 0..effective_cache_len {
                                 let s = *active_scores.get_unchecked(i);
@@ -432,17 +439,31 @@ impl TransformerLayer {
                                 }
                             }
 
-                            let mut sum_exp = 0.0;
-                            for i in 0..effective_cache_len {
-                                let s = (*active_scores.get_unchecked(i) - max_val).exp();
-                                *active_scores.get_unchecked_mut(i) = s;
-                                sum_exp += s;
-                            }
+                            if max_val == f32::NEG_INFINITY {
+                                let u = 1.0 / effective_cache_len as f32;
+                                for i in 0..effective_cache_len {
+                                    *active_scores.get_unchecked_mut(i) = u;
+                                }
+                            } else {
+                                let mut sum_exp = 0.0;
+                                for i in 0..effective_cache_len {
+                                    let s = (*active_scores.get_unchecked(i) - max_val).exp();
+                                    *active_scores.get_unchecked_mut(i) = s;
+                                    sum_exp += s;
+                                }
 
-                            let inv_sum = 1.0 / sum_exp;
-                            for i in 0..effective_cache_len {
-                                *active_scores.get_unchecked_mut(i) *= inv_sum;
-                            }
+                                if sum_exp.is_nan() || sum_exp <= 0.0 || sum_exp.is_infinite() {
+                                    let u = 1.0 / effective_cache_len as f32;
+                                    for i in 0..effective_cache_len {
+                                        *active_scores.get_unchecked_mut(i) = u;
+                                    }
+                                } else {
+                                    let inv_sum = 1.0 / sum_exp;
+                                    for i in 0..effective_cache_len {
+                                        *active_scores.get_unchecked_mut(i) *= inv_sum;
+                                    }
+                                } // end sum_exp guard
+                            } // end max_val guard
 
                             // --- Step 3: Score * V (SIMD Vectorized) ---
                             // Zero out output
@@ -604,6 +625,14 @@ impl TransformerLayer {
 
                             // --- Step 2: Softmax ---
                             let active_scores = &mut scores_h[0..effective_cache_len];
+
+                            // NaN guard: replace NaN logits with -inf
+                            for i in 0..effective_cache_len {
+                                if active_scores.get_unchecked(i).is_nan() {
+                                    *active_scores.get_unchecked_mut(i) = f32::NEG_INFINITY;
+                                }
+                            }
+
                             let mut max_val = f32::NEG_INFINITY;
                             for i in 0..effective_cache_len {
                                 let s = *active_scores.get_unchecked(i);
@@ -611,16 +640,31 @@ impl TransformerLayer {
                                     max_val = s;
                                 }
                             }
-                            let mut sum_exp = 0.0;
-                            for i in 0..effective_cache_len {
-                                let s = (*active_scores.get_unchecked(i) - max_val).exp();
-                                *active_scores.get_unchecked_mut(i) = s;
-                                sum_exp += s;
-                            }
-                            let inv_sum = 1.0 / sum_exp;
-                            for i in 0..effective_cache_len {
-                                *active_scores.get_unchecked_mut(i) *= inv_sum;
-                            }
+
+                            if max_val == f32::NEG_INFINITY {
+                                let u = 1.0 / effective_cache_len as f32;
+                                for i in 0..effective_cache_len {
+                                    *active_scores.get_unchecked_mut(i) = u;
+                                }
+                            } else {
+                                let mut sum_exp = 0.0;
+                                for i in 0..effective_cache_len {
+                                    let s = (*active_scores.get_unchecked(i) - max_val).exp();
+                                    *active_scores.get_unchecked_mut(i) = s;
+                                    sum_exp += s;
+                                }
+                                if sum_exp.is_nan() || sum_exp <= 0.0 || sum_exp.is_infinite() {
+                                    let u = 1.0 / effective_cache_len as f32;
+                                    for i in 0..effective_cache_len {
+                                        *active_scores.get_unchecked_mut(i) = u;
+                                    }
+                                } else {
+                                    let inv_sum = 1.0 / sum_exp;
+                                    for i in 0..effective_cache_len {
+                                        *active_scores.get_unchecked_mut(i) *= inv_sum;
+                                    }
+                                } // end sum_exp guard
+                            } // end max_val guard
 
                             // --- Step 3: Score * V (NEON Vectorized) ---
                             #[cfg(target_arch = "aarch64")]

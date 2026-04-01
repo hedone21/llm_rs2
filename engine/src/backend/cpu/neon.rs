@@ -304,6 +304,31 @@ impl CpuBackendNeon {
                 }
 
                 // --- Softmax with NEON v_expf (Fix 2) ---
+                // Pass 0: sanitize NaN in Q*K^T scores.
+                // NaN can arise from dot(Q,K) when Q contains NaN (propagated
+                // from a previous layer whose softmax produced NaN).  Replace
+                // NaN with -inf so softmax assigns zero probability to those
+                // positions instead of poisoning the entire distribution.
+                unsafe {
+                    let s_ptr = scores.as_mut_ptr();
+                    let mut i = 0;
+                    while i + 4 <= cache_seq_len {
+                        let v = vld1q_f32(s_ptr.add(i));
+                        // NaN != NaN → comparison yields 0 for NaN lanes
+                        let nan_mask = vmvnq_u32(vceqq_f32(v, v));
+                        // Replace NaN lanes with -inf
+                        let clean = vbslq_f32(nan_mask, vdupq_n_f32(f32::NEG_INFINITY), v);
+                        vst1q_f32(s_ptr.add(i), clean);
+                        i += 4;
+                    }
+                    while i < cache_seq_len {
+                        if (*s_ptr.add(i)).is_nan() {
+                            *s_ptr.add(i) = f32::NEG_INFINITY;
+                        }
+                        i += 1;
+                    }
+                }
+
                 // Pass 1: find max
                 let mut max_val = f32::NEG_INFINITY;
                 unsafe {
@@ -321,6 +346,15 @@ impl CpuBackendNeon {
                     }
                 }
 
+                // Guard: if all logits were NaN (now all -inf), max_val stays
+                // -inf.  exp(-inf - (-inf)) = exp(NaN) would poison everything.
+                // Fall back to uniform distribution in that case.
+                if max_val.is_infinite() && max_val.is_sign_negative() {
+                    let uniform = 1.0 / cache_seq_len as f32;
+                    for s in scores[..cache_seq_len].iter_mut() {
+                        *s = uniform;
+                    }
+                } else {
                 // Pass 2: exp(x - max) and sum
                 let mut sum_exp = 0.0f32;
                 unsafe {
@@ -345,6 +379,13 @@ impl CpuBackendNeon {
                 }
 
                 // Pass 3: normalize
+                // Guard: if sum_exp is 0, NaN, or inf, fall back to uniform.
+                if sum_exp.is_nan() || sum_exp <= 0.0 || sum_exp.is_infinite() {
+                    let uniform = 1.0 / cache_seq_len as f32;
+                    for s in scores[..cache_seq_len].iter_mut() {
+                        *s = uniform;
+                    }
+                } else {
                 let inv_sum = 1.0 / sum_exp;
                 unsafe {
                     let s_ptr = scores.as_mut_ptr();
@@ -360,6 +401,8 @@ impl CpuBackendNeon {
                         i += 1;
                     }
                 }
+                } // end sum_exp guard
+                } // end max_val guard
 
                 // Copy scores for diagnostics if requested
                 if let Some(SendPtr(ptr)) = scores_ptr {

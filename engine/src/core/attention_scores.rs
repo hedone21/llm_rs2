@@ -1809,4 +1809,81 @@ mod tests {
         assert!((acc.step_importance[1] - 7.0).abs() < 1e-6);
         assert!((acc.step_importance[2] - 9.0).abs() < 1e-6);
     }
+
+    /// Verify that NaN scores in accumulate_layer_gqa are handled gracefully.
+    /// NaN in attention scores (from softmax on NaN Q*K^T) should not poison
+    /// head_step_importance or last_layer_head_attn — they should remain at
+    /// their prior values (or 0 if this is the first layer).
+    #[test]
+    fn test_accumulate_gqa_nan_scores_handled() {
+        let max_seq = 8;
+        let n_heads_q = 4;
+        let n_kv_heads = 2;
+        let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 2, 0, 0.0);
+        acc.set_active(true);
+        acc.begin_step();
+
+        let stride = max_seq;
+        let cache_seq_len = 4;
+
+        // Layer 0: valid scores (softmax-like, sum to ~1.0 per head)
+        let mut scores_l0 = vec![0.0f32; n_heads_q * stride];
+        for h in 0..n_heads_q {
+            scores_l0[h * stride + 0] = 0.4;
+            scores_l0[h * stride + 1] = 0.3;
+            scores_l0[h * stride + 2] = 0.2;
+            scores_l0[h * stride + 3] = 0.1;
+        }
+        acc.accumulate_layer_gqa(&scores_l0, stride, cache_seq_len, n_heads_q, n_kv_heads);
+
+        // Verify layer 0 accumulated correctly
+        assert!(
+            acc.step_importance[0] > 0.0,
+            "flat step_importance[0] should be > 0 after L0"
+        );
+        let idx0 = 0 * max_seq + 0; // kv_h=0, t=0
+        assert!(
+            acc.head_step_importance[idx0] > 0.0,
+            "head_step_importance[0] should be > 0 after L0"
+        );
+        assert!(
+            acc.last_layer_head_attn[idx0] > 0.0,
+            "last_layer_head_attn[0] should be > 0 after L0"
+        );
+
+        // Layer 1: all NaN scores (simulates NaN cascade from Q*K^T)
+        let scores_l1 = vec![f32::NAN; n_heads_q * stride];
+        acc.accumulate_layer_gqa(&scores_l1, stride, cache_seq_len, n_heads_q, n_kv_heads);
+
+        // After NaN layer: flat step_importance should retain L0 values (max(0.4*4, NaN) = 0.4*4)
+        // f32::max(valid, NaN) = valid (IEEE 754)
+        assert!(
+            acc.step_importance[0] > 0.0,
+            "flat step_importance[0] must survive NaN layer: got {}",
+            acc.step_importance[0]
+        );
+        // head_step_importance should retain L0 values (max(valid, NaN) = valid)
+        assert!(
+            acc.head_step_importance[idx0] > 0.0,
+            "head_step_importance[0] must survive NaN layer: got {}",
+            acc.head_step_importance[idx0]
+        );
+        // last_layer_head_attn: NaN guard → 0 (overwritten, not MAX)
+        assert_eq!(
+            acc.last_layer_head_attn[idx0], 0.0,
+            "last_layer_head_attn should be 0 after NaN layer (NaN guard)"
+        );
+
+        // end_step should flush correctly
+        acc.end_step();
+        assert!(
+            acc.importance[0] > 0.0,
+            "cumulative importance[0] should be > 0 after end_step"
+        );
+        let hi = acc.head_importance_scores().unwrap();
+        assert!(
+            hi[idx0] > 0.0,
+            "cumulative head_importance[0] should be > 0 after end_step"
+        );
+    }
 }
