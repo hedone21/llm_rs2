@@ -299,6 +299,14 @@ impl AttentionScoreAccumulator {
         if self.n_kv_heads > 0 {
             let head_len = head.len().min(self.head_importance.len());
             self.head_importance[..head_len].copy_from_slice(&head[..head_len]);
+
+            // Also populate last_layer_head_attn from GPU head importance.
+            // On GPU backends, accumulate_layer_gqa() cannot read GPU-only
+            // score buffers, so last_layer_head_attn remains empty.
+            // Using cumulative head importance as a proxy provides reasonable
+            // QCF estimates (proportional to attention distribution).
+            let attn_len = head_len.min(self.last_layer_head_attn.len());
+            self.last_layer_head_attn[..attn_len].copy_from_slice(&head[..attn_len]);
         }
 
         // Recompute time-normalized scores if enabled

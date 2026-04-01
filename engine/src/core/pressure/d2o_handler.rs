@@ -127,12 +127,18 @@ impl D2OHandler {
     }
 
     /// Process a single layer's cache: partition → similarity → merge/delete → compact.
+    ///
+    /// When `merge_enabled` is false, the similarity matching and scatter-reduce
+    /// merge steps are skipped, reducing behavior to H2O-style score-based eviction.
+    /// This is used when KV buffers are GPU-only (discrete GPU, no zero-copy)
+    /// and cannot be safely accessed from the CPU.
     fn evict_and_merge(
         &self,
         cache: &mut KVCache,
         target_len: usize,
         importance: &[f32],
         state: &mut D2OState,
+        merge_enabled: bool,
     ) -> Result<usize> {
         let current = cache.current_pos;
         let prefix = self.config.protected_prefix.min(current);
@@ -180,75 +186,85 @@ impl D2OHandler {
             .collect();
         retain_all.sort();
 
-        // ── Step 2: Per-head nearest neighbor ──
-        let kv_heads = cache.kv_heads();
-        let head_dim = cache.head_dim();
+        if merge_enabled {
+            // ── Step 2: Per-head nearest neighbor ──
+            let kv_heads = cache.kv_heads();
+            let head_dim = cache.head_dim();
 
-        // Merge targets exclude prefix tokens (prefix must remain unmodified)
-        let merge_targets: Vec<usize> = retain_all
-            .iter()
-            .copied()
-            .filter(|&p| p >= prefix)
-            .collect();
+            // Merge targets exclude prefix tokens (prefix must remain unmodified)
+            let merge_targets: Vec<usize> = retain_all
+                .iter()
+                .copied()
+                .filter(|&p| p >= prefix)
+                .collect();
 
-        let all_matches: Vec<PerHeadMatch> = evict_positions
-            .iter()
-            .map(|&pos| find_nearest_per_head(cache, pos, &merge_targets, kv_heads, head_dim))
-            .collect();
-        let mean_sims: Vec<f32> = all_matches.iter().map(|m| m.mean_sim).collect();
+            let all_matches: Vec<PerHeadMatch> = evict_positions
+                .iter()
+                .map(|&pos| find_nearest_per_head(cache, pos, &merge_targets, kv_heads, head_dim))
+                .collect();
+            let mean_sims: Vec<f32> = all_matches.iter().map(|m| m.mean_sim).collect();
 
-        // ── Step 3: EMA threshold ──
-        let just_initialized;
-        if !mean_sims.is_empty() {
-            let mean_of_sims = mean_sims.iter().sum::<f32>() / mean_sims.len() as f32;
-            if !state.initialized {
-                state.ema_threshold = mean_of_sims;
-                state.initialized = true;
-                just_initialized = true;
+            // ── Step 3: EMA threshold ──
+            let just_initialized;
+            if !mean_sims.is_empty() {
+                let mean_of_sims = mean_sims.iter().sum::<f32>() / mean_sims.len() as f32;
+                if !state.initialized {
+                    state.ema_threshold = mean_of_sims;
+                    state.initialized = true;
+                    just_initialized = true;
+                } else {
+                    state.ema_threshold = self.config.ema_alpha * state.ema_threshold
+                        + self.config.ema_beta * mean_of_sims;
+                    just_initialized = false;
+                }
             } else {
-                state.ema_threshold = self.config.ema_alpha * state.ema_threshold
-                    + self.config.ema_beta * mean_of_sims;
                 just_initialized = false;
             }
-        } else {
-            just_initialized = false;
-        }
-        let _ = just_initialized; // used for clarity in comments
+            let _ = just_initialized; // used for clarity in comments
 
-        // ── Step 4: Global filter — mean_sim >= threshold ──
-        let passing_indices: Vec<usize> = (0..evict_positions.len())
-            .filter(|&i| mean_sims[i] >= state.ema_threshold)
-            .collect();
-
-        let merge_count = passing_indices.len();
-        let delete_count = evict_positions.len() - merge_count;
-
-        // ── Step 5: Per-head scatter-reduce merge ──
-        if !passing_indices.is_empty() {
-            let passing_positions: Vec<usize> = passing_indices
-                .iter()
-                .map(|&i| evict_positions[i])
+            // ── Step 4: Global filter — mean_sim >= threshold ──
+            let passing_indices: Vec<usize> = (0..evict_positions.len())
+                .filter(|&i| mean_sims[i] >= state.ema_threshold)
                 .collect();
-            let passing_matches: Vec<&PerHeadMatch> =
-                passing_indices.iter().map(|&i| &all_matches[i]).collect();
-            scatter_reduce_merge_per_head(
-                cache,
-                &passing_positions,
-                &passing_matches,
-                kv_heads,
-                head_dim,
+
+            let merge_count = passing_indices.len();
+            let delete_count = evict_positions.len() - merge_count;
+
+            // ── Step 5: Per-head scatter-reduce merge ──
+            if !passing_indices.is_empty() {
+                let passing_positions: Vec<usize> = passing_indices
+                    .iter()
+                    .map(|&i| evict_positions[i])
+                    .collect();
+                let passing_matches: Vec<&PerHeadMatch> =
+                    passing_indices.iter().map(|&i| &all_matches[i]).collect();
+                scatter_reduce_merge_per_head(
+                    cache,
+                    &passing_positions,
+                    &passing_matches,
+                    kv_heads,
+                    head_dim,
+                );
+            }
+
+            state.total_merged += merge_count;
+            state.total_deleted += delete_count;
+
+            log::debug!(
+                "[D2O] merged={}, deleted={}, threshold={:.4}",
+                merge_count,
+                delete_count,
+                state.ema_threshold,
+            );
+        } else {
+            // GPU-only buffers: skip merge, count all evicted tokens as deleted
+            state.total_deleted += evict_positions.len();
+
+            log::debug!(
+                "[D2O] merge skipped (GPU-only buffers), deleted={}",
+                evict_positions.len(),
             );
         }
-
-        state.total_merged += merge_count;
-        state.total_deleted += delete_count;
-
-        log::debug!(
-            "[D2O] merged={}, deleted={}, threshold={:.4}",
-            merge_count,
-            delete_count,
-            state.ema_threshold,
-        );
 
         // ── Step 6: Compact cache ──
         cache.compact_keep_positions(&retain_all, 0)?;
@@ -289,6 +305,18 @@ impl CachePressureHandler for D2OHandler {
             return Ok(ActionResult::NoOp);
         }
 
+        // Check if KV buffers are CPU-accessible (zero-copy or CPU backend).
+        // Discrete GPUs (e.g. NVIDIA) allocate device-only buffers where as_ptr()
+        // returns null — CPU access would SIGSEGV. In that case, skip the merge
+        // step and fall back to score-based eviction only (same behavior as H2O).
+        let merge_enabled = !ctx.caches[0].k_buffer.as_ptr().is_null();
+        if !merge_enabled {
+            log::warn!(
+                "[D2O] KV buffers are GPU-only (as_ptr is null); \
+                 merge compensation disabled, falling back to eviction-only mode"
+            );
+        }
+
         let mut state = self.state.lock().unwrap();
         let mut total_removed = 0;
         let mut min_new_pos = usize::MAX;
@@ -318,7 +346,8 @@ impl CachePressureHandler for D2OHandler {
                 continue;
             }
 
-            let removed = self.evict_and_merge(cache, layer_target, importance, &mut state)?;
+            let removed =
+                self.evict_and_merge(cache, layer_target, importance, &mut state, merge_enabled)?;
             total_removed += removed;
             min_new_pos = min_new_pos.min(cache.current_pos);
         }
@@ -1130,7 +1159,7 @@ mod tests {
         let importance: Vec<f32> = (0..12).map(|i| 12.0 - i as f32).collect();
 
         handler
-            .evict_and_merge(&mut cache, 6, &importance, &mut state)
+            .evict_and_merge(&mut cache, 6, &importance, &mut state, true)
             .unwrap();
 
         // All sims ≈ 1.0 → mean = 1.0 → threshold = 1.0 (no EMA on first call)
@@ -1917,6 +1946,107 @@ mod tests {
             "Layer 0 (high budget) should keep more tokens than layer 2 (low budget): {} vs {}",
             ctx.caches[0].current_pos,
             ctx.caches[2].current_pos,
+        );
+    }
+
+    // ── GPU-only buffer fallback tests ──
+
+    #[test]
+    fn test_merge_disabled_evicts_without_crash() {
+        // When merge_enabled=false, evict_and_merge should perform H2O-style
+        // score-based eviction without attempting to read buffer contents for
+        // cosine similarity computation.
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.5,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            ..D2OConfig::default()
+        });
+        let mut state = D2OState::new();
+        let mut cache = make_cache(100, 1, 4, 20);
+
+        // Write some K values (would be used by merge if enabled)
+        for pos in 0..20 {
+            write_k(&mut cache, pos, 0, &[pos as f32, 0.0, 0.0, 0.0]);
+        }
+
+        let importance: Vec<f32> = (0..20).map(|i| 20.0 - i as f32).collect();
+
+        let removed = handler
+            .evict_and_merge(&mut cache, 10, &importance, &mut state, false)
+            .unwrap();
+
+        // Should have evicted tokens
+        assert!(
+            removed > 0,
+            "should evict some tokens, got removed={removed}"
+        );
+        assert_eq!(cache.current_pos, 10, "cache should be compacted to target");
+
+        // With merge disabled, all evicted tokens counted as deleted (not merged)
+        assert_eq!(state.total_merged, 0, "no tokens should be merged");
+        assert_eq!(
+            state.total_deleted, removed,
+            "all evicted tokens should be deleted"
+        );
+
+        // EMA state should NOT be initialized (merge path was skipped)
+        assert!(
+            !state.initialized,
+            "EMA should not be initialized when merge is disabled"
+        );
+    }
+
+    #[test]
+    fn test_merge_disabled_via_handle_with_cpu_buffers() {
+        // CPU buffers have non-null as_ptr, so merge_enabled should be true.
+        // This verifies the detection logic in handle() — CPU buffers should
+        // still get full D2O behavior (merge + evict).
+        let handler = D2OHandler::new(D2OConfig {
+            keep_ratio: 0.5,
+            protected_prefix: 2,
+            target_ratio: 0.5,
+            ..D2OConfig::default()
+        });
+
+        let mut caches = make_caches(2, 20);
+        for cache in caches.iter_mut() {
+            for pos in 0..20 {
+                write_k(cache, pos, 0, &[1.0, 0.0, 0.0, 0.0]);
+            }
+        }
+
+        let importance: Vec<f32> = (0..20).map(|i| 20.0 - i as f32).collect();
+
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: Some(&importance),
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Emergency,
+            mem_available: 0,
+            target_ratio: Some(0.5),
+            qcf_sink: None,
+            layer_ratios: None,
+        };
+
+        let result = handler.handle(&mut ctx).unwrap();
+
+        // CPU buffers → merge_enabled=true → full D2O behavior
+        match result {
+            ActionResult::Evicted { tokens_removed, .. } => {
+                assert!(tokens_removed > 0, "should evict tokens");
+            }
+            _ => panic!("expected Evicted result"),
+        }
+
+        // With CPU buffers and identical vectors (sim=1.0), merge should have happened
+        let state = handler.state.lock().unwrap();
+        assert!(
+            state.total_merged > 0,
+            "CPU buffers should allow merge: merged={}, deleted={}",
+            state.total_merged,
+            state.total_deleted,
         );
     }
 }

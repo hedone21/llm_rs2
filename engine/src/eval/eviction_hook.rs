@@ -221,8 +221,12 @@ impl StepHook<KVCache> for EvictionHook {
             None
         };
         // GPU score sync before QCF computation (eval-ll path).
-        // In the main decode loop (generate.rs), GPU scores are synced before eviction.
-        // The eval-ll hook needs the same sync since forward_into() accumulates on GPU only.
+        // On GPU backends, forward_into() accumulates scores entirely on the device.
+        // The CPU accumulator's importance and last_layer_head_attn are empty.
+        // We sync both: (1) cumulative importance via import_gpu_scores, and
+        // (2) head importance as proxy for last_layer_head_attn (the GPU path
+        // doesn't have raw per-step attention weights, but cumulative head
+        // importance is proportional and sufficient for QCF computation).
         #[cfg(feature = "opencl")]
         if let Some(ref mut acc) = self.score_accumulator
             && acc.is_active()
