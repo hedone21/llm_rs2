@@ -509,8 +509,15 @@ impl CacheManager {
         }
 
         let current_pos = max_cache_pos(caches);
-        let target_len = ((current_pos as f32) * target_ratio).max(1.0) as usize;
-        if current_pos <= target_len {
+        // target_ratio=0.0 means "let the policy decide" (e.g. StreamingLLM uses
+        // its own sink_size + window_size). Pass target_len=0 so the policy's
+        // default keep_size is used instead of forcing target_len=1.
+        let target_len = if target_ratio <= 0.0 {
+            0
+        } else {
+            ((current_pos as f32) * target_ratio).max(1.0) as usize
+        };
+        if target_len > 0 && current_pos <= target_len {
             return Ok(EvictionResult {
                 evicted: false,
                 tokens_removed: 0,
