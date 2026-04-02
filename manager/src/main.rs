@@ -82,6 +82,12 @@ struct Args {
     /// When omitted, built-in defaults are used.
     #[arg(long)]
     policy_config: Option<std::path::PathBuf>,
+
+    /// Path to a Lua policy script.
+    /// When specified, the Lua script replaces the built-in HierarchicalPolicy.
+    /// Requires the `lua` feature to be enabled at compile time.
+    #[arg(long)]
+    policy_script: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -131,20 +137,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Policy 초기화 ─────────────────────────────────────────────────────────
 
-    let policy_cfg = load_policy_config(&args, &config);
-    let mut policy: Box<dyn PolicyStrategy> = {
-        let mut p = HierarchicalPolicy::new(&policy_cfg);
-        let storage_dir = if policy_cfg.relief_model.storage_dir.starts_with('~') {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            policy_cfg.relief_model.storage_dir.replacen('~', &home, 1)
-        } else {
-            policy_cfg.relief_model.storage_dir.clone()
-        };
-        let model_path = format!("{}/default_relief.json", storage_dir);
-        p.set_relief_model_path(model_path);
-        log::info!("HierarchicalPolicy initialized");
-        Box::new(p)
-    };
+    let mut policy: Box<dyn PolicyStrategy> = create_policy(&args, &config)?;
 
     // Emit initial state
     for signal in &initial_signals {
@@ -251,6 +244,45 @@ fn main() -> anyhow::Result<()> {
     log::info!("LLM Manager stopped");
 
     Ok(())
+}
+
+/// `--policy-script`가 지정되면 LuaPolicy를, 아니면 HierarchicalPolicy를 생성한다.
+fn create_policy(args: &Args, config: &Config) -> anyhow::Result<Box<dyn PolicyStrategy>> {
+    // Lua policy script 지정 시
+    if let Some(ref script_path) = args.policy_script {
+        return create_lua_policy(script_path);
+    }
+
+    // 기본: HierarchicalPolicy
+    let policy_cfg = load_policy_config(args, config);
+    let mut p = HierarchicalPolicy::new(&policy_cfg);
+    let storage_dir = if policy_cfg.relief_model.storage_dir.starts_with('~') {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        policy_cfg.relief_model.storage_dir.replacen('~', &home, 1)
+    } else {
+        policy_cfg.relief_model.storage_dir.clone()
+    };
+    let model_path = format!("{}/default_relief.json", storage_dir);
+    p.set_relief_model_path(model_path);
+    log::info!("HierarchicalPolicy initialized");
+    Ok(Box::new(p))
+}
+
+#[cfg(feature = "lua")]
+fn create_lua_policy(script_path: &std::path::Path) -> anyhow::Result<Box<dyn PolicyStrategy>> {
+    let path_str = script_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in policy script path"))?;
+    let policy = llm_manager::lua_policy::LuaPolicy::new(path_str)?;
+    log::info!("LuaPolicy initialized from {}", path_str);
+    Ok(Box::new(policy))
+}
+
+#[cfg(not(feature = "lua"))]
+fn create_lua_policy(_script_path: &std::path::Path) -> anyhow::Result<Box<dyn PolicyStrategy>> {
+    anyhow::bail!(
+        "--policy-script requires the 'lua' feature (compile with: cargo build --features lua)"
+    )
 }
 
 /// `--policy-config` 인자 또는 메인 config의 `[policy]` 섹션에서 PolicyConfig를 로드한다.

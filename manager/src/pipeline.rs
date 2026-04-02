@@ -89,7 +89,7 @@ struct QcfPending {
 /// Seq ID 생성을 위한 단조 증가 카운터.
 static SEQ_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_seq_id() -> u64 {
+pub fn next_seq_id() -> u64 {
     SEQ_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 

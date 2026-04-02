@@ -3,6 +3,8 @@ pub mod channel;
 pub mod config;
 pub mod emitter;
 pub mod evaluator;
+#[cfg(feature = "lua")]
+pub mod lua_policy;
 pub mod monitor;
 pub mod pi_controller;
 pub mod pipeline;
