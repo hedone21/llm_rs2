@@ -90,6 +90,7 @@ pub struct EngineDirective {
 pub enum EngineCommand {
     // Compute 도메인
     Throttle { delay_ms: u64 },
+    SetTargetTbt { target_ms: u64 },
     LayerSkip { skip_ratio: f32 },
 
     // Memory 도메인
@@ -110,7 +111,7 @@ pub enum EngineCommand {
 }
 ```
 
-코드에 13종 변형이 존재한다 (`RequestQcf`, `KvMergeD2o` 모두 구현 완료).
+코드에 14종 변형이 존재한다 (`RequestQcf`, `KvMergeD2o`, `SetTargetTbt` 모두 구현 완료).
 
 ### Engine측 명령 실행
 
@@ -122,6 +123,7 @@ pub struct ExecutionPlan {
     pub switch_device: Option<String>,
     pub prepare_device: Option<String>,
     pub throttle_delay_ms: u64,
+    pub target_tbt_ms: u64,
     pub suspended: bool,
     pub resumed: bool,
     pub layer_skip: Option<f32>,
@@ -133,6 +135,7 @@ pub struct ExecutionPlan {
 | EngineCommand | ExecutionPlan 필드 | CommandResult |
 |---------------|-------------------|---------------|
 | `Throttle` | `throttle_delay_ms` | Ok |
+| `SetTargetTbt` | `target_tbt_ms` | Ok |
 | `LayerSkip` | `layer_skip` | Ok |
 | `KvEvictH2o` | `evict` (EvictPlan, method=H2o) | Ok |
 | `KvEvictSliding` | `evict` (EvictPlan, method=Sliding) | Ok |
