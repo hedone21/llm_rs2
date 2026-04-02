@@ -1229,4 +1229,134 @@ mod tests {
         assert!(!result.evicted);
         assert_eq!(result.new_pos, 40);
     }
+
+    // ── Resilience eviction integration tests ──
+    // These test the END-TO-END eviction result (cache_pos after eviction),
+    // not just plan structure. They catch bugs where eviction appears to succeed
+    // but the cache size doesn't actually decrease.
+
+    #[test]
+    fn test_resilience_sliding_eviction_reduces_cache_pos() {
+        // Simulate Manager-directed sliding eviction with small protected_prefix.
+        // Keep ratio = 0.5: should reduce 80 tokens to ~40.
+        let policy = SlidingWindowPolicy::new(50, 4); // protected_prefix=4, NOT prompt length
+        let mut cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor { available: usize::MAX }),
+            0,
+            1.0,
+        );
+        cm.register_policy(
+            crate::resilience::EvictMethod::Sliding,
+            Box::new(policy),
+        );
+
+        let mut caches = make_caches(4, 80);
+        let result = cm
+            .force_evict_by_policy(
+                crate::resilience::EvictMethod::Sliding,
+                &mut caches,
+                0.5,
+                ScoreContext::None,
+            )
+            .unwrap();
+
+        assert!(result.evicted);
+        assert_eq!(result.new_pos, 40, "cache should be halved to 40 tokens");
+        assert_eq!(result.tokens_removed, 40);
+    }
+
+    #[test]
+    fn test_resilience_sliding_large_protected_prefix_limits_eviction() {
+        // If protected_prefix is too large (e.g. entire prompt), eviction is limited.
+        // This documents the behavior the undershoot warning catches.
+        let policy = SlidingWindowPolicy::new(50, 70); // protected_prefix=70 out of 80 tokens
+        let mut cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor { available: usize::MAX }),
+            0,
+            1.0,
+        );
+        cm.register_policy(
+            crate::resilience::EvictMethod::Sliding,
+            Box::new(policy),
+        );
+
+        let mut caches = make_caches(4, 80);
+        let result = cm
+            .force_evict_by_policy(
+                crate::resilience::EvictMethod::Sliding,
+                &mut caches,
+                0.5,
+                ScoreContext::None,
+            )
+            .unwrap();
+
+        // target_len=40, but min_keep=(70+16).min(120)=86 > 80 → clamp to 80
+        // current_pos(80) <= keep(80) → no meaningful eviction
+        assert!(
+            result.tokens_removed < 5,
+            "large protected_prefix should severely limit eviction (removed {})",
+            result.tokens_removed
+        );
+    }
+
+    #[test]
+    fn test_resilience_streaming_keeps_sink_plus_window() {
+        use crate::core::eviction::StreamingLLMPolicy;
+
+        // Streaming with sink=4, window=20 should keep exactly 24 tokens.
+        let policy = StreamingLLMPolicy::new(4, 20);
+        let cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor { available: usize::MAX }),
+            0,
+            1.0,
+        );
+
+        let mut caches = make_caches(4, 80);
+        // target_ratio=0.0 means "let the policy decide"
+        let result = cm
+            .force_evict_by_policy_ref(&policy, &mut caches, 0.0, ScoreContext::None)
+            .unwrap();
+
+        assert!(result.evicted);
+        assert_eq!(
+            result.new_pos, 24,
+            "streaming should keep sink(4) + window(20) = 24 tokens, got {}",
+            result.new_pos
+        );
+    }
+
+    #[test]
+    fn test_resilience_h2o_eviction_respects_keep_ratio() {
+        use crate::core::eviction::h2o::H2OPolicy;
+
+        // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens → ~40 tokens
+        let policy = H2OPolicy::new(20, 0.5, 4);
+        let mut cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor { available: usize::MAX }),
+            0,
+            1.0,
+        );
+        cm.register_policy(crate::resilience::EvictMethod::H2o, Box::new(policy));
+
+        let mut caches = make_caches(4, 80);
+        let result = cm
+            .force_evict_by_policy(
+                crate::resilience::EvictMethod::H2o,
+                &mut caches,
+                0.5,
+                ScoreContext::None,
+            )
+            .unwrap();
+
+        assert!(result.evicted);
+        assert_eq!(
+            result.new_pos, 40,
+            "H2O should reduce to 40 tokens (ratio 0.5), got {}",
+            result.new_pos
+        );
+    }
 }
