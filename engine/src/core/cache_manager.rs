@@ -550,9 +550,25 @@ impl CacheManager {
         }
 
         let new_pos = max_cache_pos(caches);
+        let tokens_removed = current_pos - new_pos;
+        let expected_removed = current_pos - target_len;
+
+        // Warn when eviction achieved significantly less than requested.
+        // This catches silent clamping by policies (e.g. protected_prefix > target_len).
+        if expected_removed > 0 && tokens_removed < expected_removed / 2 {
+            log::warn!(
+                "[CacheManager] policy='{}': eviction undershot — removed {} tokens but target was {} ({}% of request). \
+                 Check protected_prefix or policy constraints.",
+                policy.name(),
+                tokens_removed,
+                expected_removed,
+                tokens_removed * 100 / expected_removed,
+            );
+        }
+
         Ok(EvictionResult {
             evicted: true,
-            tokens_removed: current_pos - new_pos,
+            tokens_removed,
             new_pos,
         })
     }
