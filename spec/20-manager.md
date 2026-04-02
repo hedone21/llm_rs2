@@ -119,7 +119,7 @@
 
 ### 3.3 Policy Layer [MGR-023 ~ MGR-030]
 
-**[MGR-023]** Policy Layer는 메인 스레드에서 순차 실행된다. PolicyStrategy trait으로 추상화되며, HierarchicalPolicy가 현재 유일한 구현체이다. *(MUST)* (SYS-088 확장)
+**[MGR-023]** Policy Layer는 메인 스레드에서 순차 실행된다. PolicyStrategy trait으로 추상화되며, HierarchicalPolicy(Rust 내장)와 LuaPolicy(스크립트 기반, MGR-049)가 구현체이다. *(MUST)* (SYS-088 확장)
 
 **[MGR-024]** 도메인별 압력 계산 — 각 도메인은 독립적인 전략으로 원시 측정값 [0, 1]을 연속 압력 [0, 1]로 변환한다. *(MUST)*
 
@@ -310,8 +310,20 @@ loop:
 | `--transport` | `dbus` | 전송 매체 |
 | `--client-timeout` | `60` | Engine 연결 대기 시간 (초) |
 | `--policy-config` | (없음) | 별도 정책 설정 파일 경로 |
+| `--policy-script` | (없음) | Lua 정책 스크립트 경로 (MGR-049). 지정 시 LuaPolicy 사용. |
 
 **[MGR-048]** Relief 모델 영속화 — 종료 시 `save()`, 시작 시 `load()`를 수행한다. 경로: `ReliefModelConfig.storage_dir` (기본 `~/.llm_rs/models`). *(SHOULD)*
+
+**[MGR-049]** Lua 정책 스크립팅 — `--policy-script <path>` 지정 시 Lua 5.4 VM을 임베딩하여 정책 결정을 Lua 스크립트에 위임한다. *(MAY)* Feature-gated (`lua`).
+
+- Lua VM은 Manager 시작 시 1회 생성되며, 세션 동안 상태를 유지한다 (글로벌 변수, EMA 등).
+- 스크립트는 `decide(ctx)` 함수를 정의해야 한다 (MUST). 이 함수는 SystemSignal 수신마다 호출된다.
+- `ctx` 입력: `ctx.engine` (EngineStatus heartbeat 필드), `ctx.active` (현재 활성 액션 목록).
+- `sys.*` 헬퍼: `sys.read(path)`, `sys.meminfo()`, `sys.thermal(zone)`, `sys.gpu_busy()`, `sys.gpu_freq()`, `sys.cpu_freq(n)` — 시스템 센서를 Lua에서 직접 읽는다.
+- 반환: EngineCommand 테이블 배열. 빈 배열이면 액션 없음.
+- 에러 처리: Lua 런타임 에러 시 `log::error`로 기록하고 빈 액션을 반환한다. Manager는 crash하지 않는다.
+- 메모리 제한: 4MB. 샌드박스: TABLE, STRING, MATH 라이브러리만 허용 (IO, OS 차단).
+- `--policy-script` 미지정 시 기존 HierarchicalPolicy(MGR-023~028)가 사용된다.
 
 ## 4. Alternative Behavior
 

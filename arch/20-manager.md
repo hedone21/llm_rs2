@@ -10,7 +10,7 @@
 
 ### 설계 결정
 
-- `PolicyStrategy` 트레이트로 정책 구현을 추상화한다. `HierarchicalPolicy`는 유일한 구현체이지만, 트레이트 기반이므로 규칙 기반 정책 등 대체 구현이 가능하다.
+- `PolicyStrategy` 트레이트로 정책 구현을 추상화한다. `HierarchicalPolicy`(Rust 내장)와 `LuaPolicy`(스크립트 기반, §6)가 구현체이다.
 - PI Controller 3개(compute, memory, thermal)를 독립 운영하여 도메인별 pressure를 산출한다.
 - `EnergyConstraint` 신호는 독립 PI가 아니라 compute PI에 0.5 가중치로 보조 기여한다.
 - 액션 효과 관측(observation)은 `OBSERVATION_DELAY_SECS = 3.0`초 대기 후 실측 relief를 계산한다.
@@ -488,3 +488,69 @@ manager/src/
 | MGR-028 | ActionRegistry | `action_registry.rs` |
 | MGR-031~034 | Emitter/Channel | `emitter/`, `channel/` |
 | MGR-048 | Relief model persistence | `pipeline.rs` (`set_relief_model_path`, `save_model`) |
+| MGR-049 | LuaPolicy | `lua_policy.rs` (feature-gated: `lua`) |
+
+## 6. LuaPolicy -- Lua 스크립트 기반 정책 (관련 spec: MGR-049)
+
+### 설계 결정
+
+- Lua 5.4 VM을 `mlua` 크레이트로 임베딩한다 (optional `lua` feature, vendored 정적 빌드).
+- `PolicyStrategy` trait의 두 번째 구현체로, `--policy-script <path>` 지정 시 `HierarchicalPolicy` 대신 사용된다.
+- Lua VM은 Manager 시작 시 1회 생성, 세션 동안 상태를 유지한다 (글로벌 변수, 이력 테이블 등 호출 간 보존).
+- Monitor 스레드의 `SystemSignal` 수신 시 `decide(ctx)` 호출. 센서 데이터는 Lua가 `sys.*` 헬퍼로 직접 읽는다 (확장성: Rust 수정 없이 디바이스별 커스텀 센서 추가 가능).
+- 샌드박스: TABLE, STRING, MATH만 허용. IO/OS 차단. 메모리 4MB 제한.
+
+### 인터페이스
+
+```rust
+// manager/src/lua_policy.rs  (#[cfg(feature = "lua")])
+
+pub struct LuaPolicy { /* mlua::Lua + cached EngineStatus */ }
+
+impl LuaPolicy {
+    pub fn new(script_path: &str) -> Result<Self>;
+}
+
+impl PolicyStrategy for LuaPolicy {
+    fn process_signal(&mut self, signal: &SystemSignal) -> Option<EngineDirective>;
+    fn update_engine_state(&mut self, msg: &EngineMessage);
+    fn mode(&self) -> OperatingMode;  // 기본 Normal
+}
+```
+
+### Lua `decide(ctx)` 호출 규약
+
+```lua
+-- 입력: ctx 테이블
+ctx = {
+    engine = {device, throughput, kv_util, cache_tokens, cache_bytes,
+              tokens_generated, state, kv_dtype, skip_ratio},
+    active = {"throttle", ...},
+}
+
+-- sys 헬퍼 (Rust에서 등록, sysfs/procfs 직접 읽기)
+sys.read(path)         -- 범용 파일 읽기 → string
+sys.meminfo()          -- {total, available, free} (KB)
+sys.thermal(zone)      -- °C (float)
+sys.gpu_busy()         -- 0-100
+sys.gpu_freq()         -- MHz
+sys.cpu_freq(cluster)  -- MHz
+
+-- 출력: EngineCommand 테이블 배열
+return {
+    {type = "kv_evict_h2o", keep_ratio = 0.5},
+    {type = "set_target_tbt", target_ms = 150},
+}
+```
+
+### 에러 처리
+
+- Lua 문법/런타임 에러: `log::error` 기록, `None` 반환 (Manager crash 방지).
+- `sys.*` 헬퍼 파일 읽기 실패: 기본값 반환 (thermal → -1.0, meminfo → 0 등).
+- `decide()` 함수 미정의: 로드 시 에러, Manager는 기존 HierarchicalPolicy로 fallback하지 않고 에러 반환.
+
+### Config / CLI
+
+| 플래그 | 타입 | 기본값 | spec 근거 |
+|--------|------|--------|-----------|
+| `--policy-script` | `Option<String>` | None | MGR-049 |
