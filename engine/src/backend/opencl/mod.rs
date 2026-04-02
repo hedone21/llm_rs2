@@ -402,15 +402,14 @@ impl OpenCLBackend {
         // F16 GEMV: Adreno-optimized multi-row kernel (Q4 pattern ported to F16)
         let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
         let f16_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
-        // F16 GEMV: use nosub (local memory reduction) by default.
-        // The subgroup kernel (mul_mv_f16_f32.cl) assumes subgroup_size==64 via
-        // get_sub_group_local_id(), which may not hold on all Adreno generations
-        // (e.g., Adreno 830 on Snapdragon 8 Elite). The nosub kernel is safe on
-        // all devices and only ~10% slower. Use FORCE_F16_SUBGROUP=1 to opt-in
-        // to the subgroup kernel for testing.
-        let force_subgroup = std::env::var("FORCE_F16_SUBGROUP").is_ok();
-        let mut f16_is_nosub = !force_subgroup;
-        let f16_program = if force_subgroup {
+        // F16 GEMV: use subgroup-reduce kernel (fallback/mul_mv_f16_f32_nosub.cl)
+        // by default. It uses sub_group_reduce_add() + get_max_sub_group_size()
+        // for dynamic subgroup-size-safe operation (zero barriers).
+        // The old 4-wave subgroup kernel (mul_mv_f16_f32.cl) is available via
+        // FORCE_F16_4WAVE=1 for testing (broken on Adreno 830).
+        let force_4wave = std::env::var("FORCE_F16_4WAVE").is_ok();
+        let mut f16_is_nosub = false; // both kernels use subgroup ops now
+        let f16_program = if force_4wave {
             match Program::builder()
                 .devices(device)
                 .src(f16_src)
@@ -418,13 +417,11 @@ impl OpenCLBackend {
                 .build(&context)
             {
                 Ok(p) => {
-                    log::info!("mul_mv_f16_f32.cl compiled (subgroup, forced)");
-                    f16_is_nosub = false;
+                    log::info!("mul_mv_f16_f32.cl compiled (4-wave, forced)");
                     p
                 }
                 Err(e) => {
-                    log::warn!("Subgroup F16 failed: {}. Falling back to nosub.", e);
-                    f16_is_nosub = true;
+                    log::warn!("4-wave F16 failed: {}. Using subgroup-reduce.", e);
                     Program::builder()
                         .devices(device)
                         .src(f16_fallback_src)
@@ -440,11 +437,11 @@ impl OpenCLBackend {
                 .build(&context)
             {
                 Ok(p) => {
-                    log::info!("mul_mv_f16_f32_nosub.cl compiled (F16 GEMV)");
+                    log::info!("F16 GEMV compiled (subgroup-reduce, N_DST=4)");
                     p
                 }
                 Err(e) => {
-                    log::warn!("Nosub F16 failed: {}. Trying subgroup.", e);
+                    log::warn!("Subgroup-reduce F16 failed: {}. Trying 4-wave.", e);
                     match Program::builder()
                         .devices(device)
                         .src(f16_src)
@@ -452,12 +449,12 @@ impl OpenCLBackend {
                         .build(&context)
                     {
                         Ok(p) => {
-                            log::info!("mul_mv_f16_f32.cl compiled (subgroup fallback)");
-                            f16_is_nosub = false;
+                            log::info!("mul_mv_f16_f32.cl compiled (4-wave fallback)");
                             p
                         }
                         Err(e2) => {
-                            log::warn!("Both F16 kernels failed: {}. Using dummy.", e2);
+                            log::warn!("Both F16 kernels failed: {}. Using nosub tree.", e2);
+                            f16_is_nosub = true;
                             Program::builder()
                                 .devices(device)
                                 .src("__kernel void kernel_mul_mat_f16_f32() {}")
@@ -723,7 +720,10 @@ impl OpenCLBackend {
 
         // Auto-detect UMA (integrated GPU) vs discrete GPU for zero-copy decision.
         // CL_DEVICE_HOST_UNIFIED_MEMORY is the standard way; fall back to name heuristic.
-        let use_zero_copy = {
+        let use_zero_copy = if std::env::var("FORCE_DEVICE_ONLY").is_ok() {
+            log::info!("FORCE_DEVICE_ONLY: disabling zero-copy, using device-only buffers");
+            false
+        } else {
             let unified_mem = device
                 .info(ocl::core::DeviceInfo::HostUnifiedMemory)
                 .map(|v| v.to_string().trim().to_lowercase())
@@ -1020,8 +1020,9 @@ impl OpenCLBackend {
         let kernels = unsafe { &*self.kernels.get() };
         let f16_nosub = kernels.f16_is_nosub;
 
-        // nosub fallback uses 1D work group — L4 kernel also requires subgroups
-        let use_l4 = if f16_nosub {
+        // L4 kernel uses 4-wave K-split which is broken on Adreno 830.
+        // Disable L4 unless explicitly using the 4-wave subgroup kernel.
+        let use_l4 = if f16_nosub || !std::env::var("FORCE_F16_4WAVE").is_ok() {
             false
         } else {
             const LARGE_N_THRESHOLD: usize = 4096;
@@ -1077,39 +1078,21 @@ impl OpenCLBackend {
                     None::<&mut ocl::core::Event>,
                 )?;
             } else {
-                const N_SIMDGROUP: usize = 4;
-                let local_work_size: [usize; 3] = [64, N_SIMDGROUP, 1];
-                if use_l4 {
-                    // N_DST=4: 256 rows/WG
-                    const ROWS_PER_WG_L4: usize = 256; // N_SIMDWIDTH(64) * N_DST(4)
-                    let n_groups = n.div_ceil(ROWS_PER_WG_L4);
-                    let global_work_size: [usize; 3] = [n_groups * 64, N_SIMDGROUP, m];
-                    ocl::core::enqueue_kernel(
-                        &self.queue,
-                        kernel,
-                        3,
-                        None,
-                        &global_work_size,
-                        Some(local_work_size),
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )?;
-                } else {
-                    // N_DST=2: 128 rows/WG
-                    const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
-                    let n_groups = n.div_ceil(ROWS_PER_WG);
-                    let global_work_size: [usize; 3] = [n_groups * 64, N_SIMDGROUP, m];
-                    ocl::core::enqueue_kernel(
-                        &self.queue,
-                        kernel,
-                        3,
-                        None,
-                        &global_work_size,
-                        Some(local_work_size),
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )?;
-                }
+                // Subgroup-reduce kernel: 1D WG [64], N_DST=4, sub_group_reduce_add()
+                const SUBGROUP_N_DST: usize = 4;
+                let n_groups = n.div_ceil(SUBGROUP_N_DST);
+                let local_work_size: [usize; 3] = [64, 1, 1];
+                let global_work_size: [usize; 3] = [n_groups * 64, m, 1];
+                ocl::core::enqueue_kernel(
+                    &self.queue,
+                    kernel,
+                    3,
+                    None,
+                    &global_work_size,
+                    Some(local_work_size),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
             }
         }
         Ok(())

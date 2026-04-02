@@ -588,15 +588,11 @@ fn make_f16_matmul_step(
     l4_program: Option<&ocl::Program>,
     is_nosub: bool,
 ) -> Result<KernelStep> {
-    // nosub fallback: L4 kernel also requires subgroups
-    let use_l4 = !is_nosub && n > LARGE_N_THRESHOLD && l4_program.is_some();
-    let kernel = if use_l4 {
-        ocl::core::create_kernel(l4_program.unwrap(), "kernel_mul_mat_f16_f32_l4")
-            .context("create kernel_mul_mat_f16_f32_l4")?
-    } else {
-        ocl::core::create_kernel(program, "kernel_mul_mat_f16_f32")
-            .context("create kernel_mul_mat_f16_f32")?
-    };
+    // L4 (4-wave K-split) kernel disabled — broken on Adreno 830.
+    // All sizes use the single-WG N_DST=4 kernel from f16_program.
+    let _ = l4_program; // suppress unused warning
+    let kernel = ocl::core::create_kernel(program, "kernel_mul_mat_f16_f32")
+        .context("create kernel_mul_mat_f16_f32")?;
 
     let ne00 = k as i32;
     let ne01 = n as i32;
@@ -626,43 +622,15 @@ fn make_f16_matmul_step(
         ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
     }
 
-    if is_nosub {
-        // Nosub kernel: 1D work group, N_DST=4, m=1 in dim 1
-        const NOSUB_N_DST: usize = 4;
-        let n_groups = n.div_ceil(NOSUB_N_DST);
+    // All paths use the same N_DST=4 1D dispatch (subgroup-reduce or tree reduction)
+    {
+        const N_DST: usize = 4;
+        let n_groups = n.div_ceil(N_DST);
         Ok(KernelStep {
             kernel,
             ndim: 3,
             global_work_size: [n_groups * 64, 1, 1], // m=1 for decode
             local_work_size: Some([64, 1, 1]),
-            dynamic_args: vec![],
-            op_tag,
-            retained_bufs: vec![],
-        })
-    } else if use_l4 {
-        const N_SIMDGROUP: usize = 4;
-        // N_DST=4: 256 rows/WG
-        const ROWS_PER_WG: usize = 256; // N_SIMDWIDTH(64) * N_DST(4)
-        let n_groups = n.div_ceil(ROWS_PER_WG);
-        Ok(KernelStep {
-            kernel,
-            ndim: 3,
-            global_work_size: [n_groups * 64, N_SIMDGROUP, 1],
-            local_work_size: Some([64, N_SIMDGROUP, 1]),
-            dynamic_args: vec![],
-            op_tag,
-            retained_bufs: vec![],
-        })
-    } else {
-        const N_SIMDGROUP: usize = 4;
-        // N_DST=2: 128 rows/WG
-        const ROWS_PER_WG: usize = 128; // N_SIMDWIDTH(64) * N_DST(2)
-        let n_groups = n.div_ceil(ROWS_PER_WG);
-        Ok(KernelStep {
-            kernel,
-            ndim: 3,
-            global_work_size: [n_groups * 64, N_SIMDGROUP, 1],
-            local_work_size: Some([64, N_SIMDGROUP, 1]),
             dynamic_args: vec![],
             op_tag,
             retained_bufs: vec![],
