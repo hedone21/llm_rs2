@@ -1061,7 +1061,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
             if f16_nosub {
-                // Nosub kernel: 1D local work group, N_DST=4 rows per WG
+                // Nosub kernel: 1D WG [64], N_DST=4, vectorized float4 loop + tree reduction
                 const NOSUB_N_DST: usize = 4;
                 let n_groups = n.div_ceil(NOSUB_N_DST);
                 let local_work_size: [usize; 3] = [64, 1, 1];
