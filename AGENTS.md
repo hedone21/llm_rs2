@@ -58,19 +58,20 @@ Conventional Commits: `type(scope): subject` — 명령형 현재 시제. Types:
 
 ## 에이전트 시스템
 
-5개 특화 서브에이전트가 `.claude/agents/`에 정의되어 있다. 메인 세션이 오케스트레이터 역할을 하며 에이전트 간 결과를 전달한다.
+6개 특화 서브에이전트가 `.claude/agents/`에 정의되어 있다. 메인 세션이 오케스트레이터 역할을 하며 에이전트 간 결과를 전달한다.
 
-| 에이전트 | 역할 | 도구 | 범위 |
+| 에이전트 | 모델 | 역할 | 범위 |
 |---------|------|------|------|
-| **PM** | 계획 수립, TODO 관리, 우선순위 조정, 작업 배분 제안 | Read, Glob, Grep, Edit | `.agent/todos/*.md`만 수정 |
-| **Architect** | 코드 분석, SOLID 설계, Spec/Arch/아키텍처 문서 관리 | Read, Glob, Grep, Edit | `spec/`, `arch/`, `docs/*.md`, `ARCHITECTURE.md` 수정 |
-| **Implementer** | 코드 구현, 유닛 테스트, 버그 수정, sanity check | Read, Edit, Write, Glob, Grep, Bash | `engine/`, `shared/`, `manager/` 소스 코드 |
-| **Tester** | 호스트/디바이스 테스트 실행, 결과 분석, 품질 게이트 검증 | Read, Glob, Grep, Bash | 수정 불가, 실행만 |
-| **Researcher** | 논문 분석, 기술 조사, 적용 가능성 평가 | Read, Glob, Grep, WebSearch, WebFetch | 수정 불가, 조사 결과 반환만 |
+| **PM** | opus | 계획 수립, TODO 관리, 우선순위 조정 | `.agent/todos/*.md`만 수정 |
+| **Architect** | opus | 코드 분석, SOLID 설계, Spec/Arch 문서 관리 | `spec/`, `arch/`, `docs/*.md` |
+| **Senior Implementer** | opus | GPU 커널(.cl), NEON/SIMD, 성능 최적화, 복잡 알고리즘 | `kernels/`, `backend/opencl/`, `neon.rs`, `kivi_cache.rs`, `qcf/` |
+| **Implementer** | sonnet | 일반 Rust 구현, 프로토콜 연결, CLI, Manager, 테스트 | `engine/`, `shared/`, `manager/` (GPU/SIMD 제외) |
+| **Tester** | opus | 호스트/디바이스 테스트, 결과 분석, 품질 게이트 | 수정 불가, 실행만 |
+| **Researcher** | opus | 논문 분석, 기술 조사, 적용 가능성 평가 | 수정 불가, 조사만 |
 
 **워크플로우**:
 ```
-[PM] 계획/TODO → [Architect] 설계+Spec → [Implementer] 구현+테스트 → [Tester] 검증
+[PM] 계획/TODO → [Architect] 설계+Spec → [Senior Impl / Impl] 구현+테스트 → [Tester] 검증
                                             ↑
                                     [Researcher] 기법 조사
 ```

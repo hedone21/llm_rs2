@@ -9,7 +9,7 @@
 
 1. [Quick Start](#1-quick-start)
 2. [generate 모드별 가이드](#2-generate-모드별-가이드)
-   - [2.1 기본 추론 (CPU / GPU / Hybrid)](#21-기본-추론-cpu--gpu--hybrid)
+   - [2.1 기본 추론 (CPU / GPU)](#21-기본-추론-cpu--gpu)
    - [2.2 eval-ll (NLL 평가)](#22-eval-ll-nll-평가)
    - [2.3 PPL (Perplexity)](#23-ppl-perplexity)
    - [2.4 KIVI (양자화 캐시)](#24-kivi-양자화-캐시)
@@ -70,7 +70,7 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
 
 ## 2. generate 모드별 가이드
 
-### 2.1 기본 추론 (CPU / GPU / Hybrid)
+### 2.1 기본 추론 (CPU / GPU)
 
 **CPU 추론 (기본)**
 
@@ -102,14 +102,15 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
   -n 200
 ```
 
-**Hybrid 추론 (CPU prefill → GPU decode)**
+**CPU→GPU 자동 전환 (CPU prefill → GPU decode)**
 
-prefill은 CPU, decode는 GPU로 자동 전환. `--switch-threshold N`에서 GPU로 전환.
+prefill은 CPU, decode는 GPU로 자동 전환. `--switch-threshold N` 토큰에서 GPU로 전환.
+GPU가 사용 가능하면 보조 백엔드로 자동 초기화되어 SwitchHw 명령도 동작.
 
 ```bash
 ./target/release/generate \
   -m models/qwen2.5-1.5b \
-  -b hybrid \
+  -b cpu \
   --switch-threshold 50 \
   --weight-dtype q4 \
   --prompt "Explain quantum computing" \
@@ -988,8 +989,8 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `-b, --backend` | `cpu` | `cpu`, `opencl`, `hybrid` |
-| `--switch-threshold` | 0 | hybrid 모드에서 GPU로 전환할 토큰 수 |
+| `-b, --backend` | `cpu` | `cpu` 또는 `opencl` (GPU 보조 자동 초기화) |
+| `--switch-threshold` | 0 | CPU→GPU 자동 전환 토큰 수 (0=비활성) |
 | `--threads` | 자동 | CPU 스레드 수 (0=auto) |
 | `--prefill-chunk-size` | 0 | chunked prefill 청크 크기 (0=비활성) |
 

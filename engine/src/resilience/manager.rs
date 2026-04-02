@@ -149,7 +149,7 @@ pub fn execute_action(action: &ResilienceAction, ctx: &mut InferenceContext) {
             );
         }
         ResilienceAction::SwitchBackend { to } => {
-            // Handled by generate binary hybrid mode (--backend hybrid)
+            // Handled by generate binary via ExecutionPlan.switch_device
             log::info!("[Resilience] Backend switch requested: {:?}", to);
         }
         ResilienceAction::LimitTokens { max_tokens } => {

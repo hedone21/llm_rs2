@@ -53,11 +53,11 @@ struct Args {
     #[arg(short, long, default_value_t = 20)]
     num_tokens: usize,
 
-    /// Backend to use: "cpu", "opencl", or "hybrid" (CPU→GPU auto-switch)
+    /// Backend to use: "cpu" or "opencl" (GPU secondary auto-initialized when available)
     #[arg(short, long, default_value = "cpu")]
     backend: String,
 
-    /// Switch threshold for hybrid mode: auto-switch CPU→GPU at this token count (0=disabled)
+    /// Auto-switch CPU→GPU at this token count (0=disabled). Requires GPU availability.
     #[arg(long, default_value_t = 0)]
     switch_threshold: usize,
 
@@ -405,8 +405,8 @@ fn main() -> anyhow::Result<()> {
     eprintln!("[Profile] Event: ModelLoadStart");
     eprintln!("Loading model from {}", model_path);
 
-    // Hybrid mode: dual-backend (CPU primary, GPU secondary). Starts inference on CPU.
-    // gpu_backend_arc / gpu_memory_arc hold the secondary backend for CPU↔GPU switching.
+    // Backend initialization: primary backend + secondary for SwitchHw resilience.
+    // GPU secondary is auto-initialized when available (soft failure OK).
     #[allow(clippy::type_complexity)]
     let (mut backend, memory, gpu_backend_arc, gpu_memory_arc, mut is_gpu): (
         Arc<dyn Backend>,
@@ -415,27 +415,36 @@ fn main() -> anyhow::Result<()> {
         Option<Arc<dyn Memory>>,
         bool,
     ) = match args.backend.as_str() {
-        #[cfg(feature = "opencl")]
-        "hybrid" => {
-            let cpu = Arc::new(CpuBackend::new()) as Arc<dyn Backend>;
-            let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
-            let gpu_mem: Arc<dyn Memory> =
-                Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
-                    gpu_concrete.context.clone(),
-                    gpu_concrete.queue.clone(),
-                    args.zero_copy,
-                ));
-            let gpu = gpu_concrete as Arc<dyn Backend>;
-            let cpu_mem: Arc<dyn Memory> = Arc::new(Galloc::new());
-            eprintln!("[Hybrid] Initialized CPU+GPU backends (start on CPU)");
-            (cpu, cpu_mem, Some(gpu), Some(gpu_mem), false)
-        }
         "cpu" => {
             let cpu = Arc::new(CpuBackend::new()) as Arc<dyn Backend>;
             let cpu_mem: Arc<dyn Memory> = Arc::new(Galloc::new());
-            (cpu, cpu_mem, None, None, false)
+            // Try to init GPU as secondary for SwitchHw resilience
+            #[cfg(feature = "opencl")]
+            let (gpu_be, gpu_mem_arc) = match llm_rs2::backend::opencl::OpenCLBackend::new() {
+                Ok(gpu_concrete) => {
+                    let gpu_concrete = Arc::new(gpu_concrete);
+                    let gm: Arc<dyn Memory> =
+                        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+                            gpu_concrete.context.clone(),
+                            gpu_concrete.queue.clone(),
+                            args.zero_copy,
+                        ));
+                    let g = gpu_concrete as Arc<dyn Backend>;
+                    eprintln!("[Backend] CPU primary, GPU secondary available (SwitchHw ready)");
+                    (Some(g), Some(gm))
+                }
+                Err(e) => {
+                    eprintln!("[Backend] CPU only (GPU init failed: {})", e);
+                    (None, None)
+                }
+            };
+            #[cfg(not(feature = "opencl"))]
+            let (gpu_be, gpu_mem_arc): (Option<Arc<dyn Backend>>, Option<Arc<dyn Memory>>) =
+                (None, None);
+            (cpu, cpu_mem, gpu_be, gpu_mem_arc, false)
         }
-        "opencl" => {
+        #[cfg(feature = "opencl")]
+        "opencl" | "gpu" => {
             let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
             let gpu_mem: Arc<dyn Memory> =
                 Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
@@ -443,23 +452,28 @@ fn main() -> anyhow::Result<()> {
                     gpu_concrete.queue.clone(),
                     args.zero_copy,
                 ));
-            let gpu = gpu_concrete as Arc<dyn Backend>;
-            (gpu, gpu_mem, None, None, true)
+            let gpu: Arc<dyn Backend> = gpu_concrete;
+            // GPU is primary; keep a ref as secondary for SwitchHw round-trip
+            (
+                gpu.clone(),
+                gpu_mem.clone(),
+                Some(gpu),
+                Some(gpu_mem),
+                true,
+            )
         }
         _ => anyhow::bail!(
-            "Unknown backend: {}. Use cpu, opencl, or hybrid.",
+            "Unknown backend: {}. Use cpu or opencl.",
             args.backend
         ),
     };
-    // cpu_backend_arc: always a CPU backend, used as migration helper in hybrid mode.
-    // In non-hybrid modes this is unused (but declared for uniform migration call-sites).
-    let cpu_backend_arc: Arc<dyn Backend> = if args.backend == "cpu" || args.backend == "hybrid" {
+    // cpu_backend_arc: always available for migration and SwitchHw fallback.
+    let cpu_backend_arc: Arc<dyn Backend> = if args.backend == "cpu" {
         backend.clone()
     } else {
         Arc::new(CpuBackend::new())
     };
-    // cpu_memory_arc: CPU allocator for migration intermediates.
-    let cpu_memory_arc: Arc<dyn Memory> = if args.backend == "cpu" || args.backend == "hybrid" {
+    let cpu_memory_arc: Arc<dyn Memory> = if args.backend == "cpu" {
         memory.clone()
     } else {
         Arc::new(Galloc::new())
@@ -474,6 +488,15 @@ fn main() -> anyhow::Result<()> {
     };
     eprintln!("[Config] Weight dtype: {:?}", w_dtype);
     let model = TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
+
+    // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch
+    #[cfg(feature = "opencl")]
+    let weights_on_gpu = llm_rs2::backend::opencl::get_cl_mem(
+        model.layers[0].wq.buffer().as_ref(),
+    )
+    .is_ok();
+    #[cfg(not(feature = "opencl"))]
+    let weights_on_gpu = false;
 
     // 2. Tokenizer
     let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
@@ -1640,15 +1663,16 @@ fn main() -> anyhow::Result<()> {
                 break;
             }
 
-            // ── Hybrid mode: auto-switch CPU→GPU at threshold ──────────────
+            // ── Auto-switch CPU→GPU at threshold ─────────────────────────
             if !is_gpu
+                && weights_on_gpu
                 && args.switch_threshold > 0
                 && kv_caches[0].current_pos >= args.switch_threshold
                 && let (Some(gpu_be), Some(gpu_mem)) =
                     (gpu_backend_arc.as_ref(), gpu_memory_arc.as_ref())
             {
                 eprintln!(
-                    "[Hybrid] Auto-switch CPU→GPU at token {}",
+                    "[Switch] Auto-switch CPU→GPU at token {}",
                     kv_caches[0].current_pos
                 );
                 llm_rs2::core::kv_migrate::migrate_kv_caches(
@@ -1694,9 +1718,9 @@ fn main() -> anyhow::Result<()> {
                 let gi_buf = gpu_mem.alloc(4, DType::U8)?;
                 gen_input_tensor = Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
                 is_gpu = true;
-                eprintln!("[Hybrid] Switched to GPU successfully.");
+                eprintln!("[Switch] Switched to GPU successfully.");
             }
-            // ── End hybrid auto-switch ──────────────────────────────────────
+            // ── End auto-switch ──────────────────────────────────────────
 
             let last_token = tokens[tokens.len() - 1];
             unsafe {
@@ -1746,7 +1770,7 @@ fn main() -> anyhow::Result<()> {
             let used_plan = false;
 
             if !used_plan {
-                // In hybrid mode, use GPU memory when on GPU; otherwise use the primary memory.
+                // Use GPU memory when on GPU; otherwise use the primary memory.
                 let effective_mem: &dyn Memory = if is_gpu {
                     gpu_memory_arc.as_deref().unwrap_or_else(|| memory.as_ref())
                 } else {
@@ -1761,11 +1785,7 @@ fn main() -> anyhow::Result<()> {
                     logits_out: &mut logits,
                     x_gen: Some(&mut x_gen),
                     workspace: Some(&mut gen_ws),
-                    use_gpu_attn: if args.backend == "hybrid" {
-                        is_gpu
-                    } else {
-                        args.gpu_attn
-                    },
+                    use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
                     skip_config: skip_config.as_ref(),
@@ -2243,11 +2263,13 @@ fn main() -> anyhow::Result<()> {
 
                 // Dynamic layer skip / restore_defaults handling
                 if plan.restore_defaults {
+                    eprintln!("[Resilience] RestoreDefaults");
                     skip_config = None;
                     last_skip_ratio = None;
                 } else if let Some(ratio) = plan.layer_skip
                     && last_skip_ratio != Some(ratio)
                 {
+                    eprintln!("[Resilience] LayerSkip: ratio={:.2}", ratio);
                     skip_config = Some(SkipConfig::uniform_init(
                         model.config.num_hidden_layers,
                         ratio,
@@ -2260,7 +2282,7 @@ fn main() -> anyhow::Result<()> {
                         match device.as_str() {
                             "cpu" if is_gpu => {
                                 eprintln!(
-                                    "[Hybrid] Resilience: GPU→CPU at token {}",
+                                    "[Switch] Resilience: GPU→CPU at token {}",
                                     kv_caches[0].current_pos
                                 );
                                 llm_rs2::core::kv_migrate::migrate_kv_caches(
@@ -2311,11 +2333,11 @@ fn main() -> anyhow::Result<()> {
                                     gpu_plan = None;
                                 }
                                 is_gpu = false;
-                                eprintln!("[Hybrid] Resilience: Switched to CPU.");
+                                eprintln!("[Switch] Resilience: Switched to CPU.");
                             }
-                            "gpu" | "opencl" if !is_gpu => {
+                            "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
                                 eprintln!(
-                                    "[Hybrid] Resilience: CPU→GPU at token {}",
+                                    "[Switch] Resilience: CPU→GPU at token {}",
                                     kv_caches[0].current_pos
                                 );
                                 llm_rs2::core::kv_migrate::migrate_kv_caches(
@@ -2366,13 +2388,20 @@ fn main() -> anyhow::Result<()> {
                                 gen_input_tensor =
                                     Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
                                 is_gpu = true;
-                                eprintln!("[Hybrid] Resilience: Switched to GPU.");
+                                eprintln!("[Switch] Resilience: Switched to GPU.");
+                            }
+                            "gpu" | "opencl" if !is_gpu && !weights_on_gpu => {
+                                eprintln!(
+                                    "[Resilience] SwitchHw(gpu): model weights on CPU, not GPU-accessible. \
+                                     Start with --backend opencl for GPU switching."
+                                );
                             }
                             _ => {} // Already on requested backend
                         }
                     } else {
-                        log::warn!(
-                            "[Resilience] SwitchHw: no secondary backend (use --backend hybrid)"
+                        eprintln!(
+                            "[Resilience] SwitchHw({}): no secondary backend available",
+                            device
                         );
                     }
                 }
@@ -2386,10 +2415,22 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
 
+                if plan.throttle_delay_ms != throttle_delay_ms {
+                    eprintln!(
+                        "[Resilience] Throttle: {}ms → {}ms",
+                        throttle_delay_ms, plan.throttle_delay_ms
+                    );
+                }
                 throttle_delay_ms = plan.throttle_delay_ms;
 
                 // Update target TBT from Manager directive (overrides CLI --target-tbt)
-                if plan.target_tbt_ms > 0 {
+                if plan.target_tbt_ms > 0 && plan.target_tbt_ms as f64 != target_tbt_ms {
+                    eprintln!(
+                        "[Resilience] SetTargetTbt: {:.1}ms → {}ms",
+                        target_tbt_ms, plan.target_tbt_ms
+                    );
+                    target_tbt_ms = plan.target_tbt_ms as f64;
+                } else if plan.target_tbt_ms > 0 {
                     target_tbt_ms = plan.target_tbt_ms as f64;
                 } else if plan.restore_defaults {
                     target_tbt_ms = args.target_tbt; // restore CLI default
@@ -3690,11 +3731,13 @@ fn run_kivi(
 
             // layer_skip / restore_defaults
             if plan.restore_defaults {
+                eprintln!("[KIVI-Resilience] RestoreDefaults");
                 kivi_skip_config = None;
                 kivi_last_skip_ratio = None;
             } else if let Some(ratio) = plan.layer_skip
                 && kivi_last_skip_ratio != Some(ratio)
             {
+                eprintln!("[KIVI-Resilience] LayerSkip: ratio={:.2}", ratio);
                 kivi_skip_config = Some(SkipConfig::uniform_init(
                     model.config.num_hidden_layers,
                     ratio,
@@ -3708,7 +3751,13 @@ fn run_kivi(
             }
 
             // Update target TBT from Manager directive
-            if plan.target_tbt_ms > 0 {
+            if plan.target_tbt_ms > 0 && plan.target_tbt_ms as f64 != target_tbt_ms {
+                eprintln!(
+                    "[KIVI-Resilience] SetTargetTbt: {:.1}ms → {}ms",
+                    target_tbt_ms, plan.target_tbt_ms
+                );
+                target_tbt_ms = plan.target_tbt_ms as f64;
+            } else if plan.target_tbt_ms > 0 {
                 target_tbt_ms = plan.target_tbt_ms as f64;
             } else if plan.restore_defaults {
                 target_tbt_ms = 0.0;
