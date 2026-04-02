@@ -124,8 +124,10 @@ pub struct FullKernelPlan {
     pub layers: Vec<LayerKernelPlan>,
     /// Final RMSNorm step (model.norm)
     pub final_norm: KernelStep,
-    /// lm_head matmul step
-    pub lm_head: KernelStep,
+    /// lm_head matmul step.
+    /// `None` when lm_head is kept on CPU (e.g. gemma3's 604 MB tied embedding).
+    /// The caller must run CPU-side matmul when this is `None`.
+    pub lm_head: Option<KernelStep>,
     /// KV cache capacity at plan creation time (for invalidation check)
     pub kv_capacity: usize,
 }
@@ -488,19 +490,21 @@ impl FullKernelPlan {
             }
         }
 
-        // lm_head matmul
-        unsafe {
-            if let Err(e) = ocl::core::enqueue_kernel(
-                queue,
-                &self.lm_head.kernel,
-                self.lm_head.ndim,
-                None,
-                &self.lm_head.global_work_size,
-                self.lm_head.local_work_size,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            ) {
-                log::error!("Plan enqueue lm_head failed: {}", e);
+        // lm_head matmul (skipped when lm_head is on CPU)
+        if let Some(ref lm_head) = self.lm_head {
+            unsafe {
+                if let Err(e) = ocl::core::enqueue_kernel(
+                    queue,
+                    &lm_head.kernel,
+                    lm_head.ndim,
+                    None,
+                    &lm_head.global_work_size,
+                    lm_head.local_work_size,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                ) {
+                    log::error!("Plan enqueue lm_head failed: {}", e);
+                }
             }
         }
 
@@ -565,6 +569,7 @@ pub struct LayerPlanConfig<'a> {
 
 /// N threshold for switching from N_DST=2 to N_DST=4 GEMV kernel.
 /// At N > 4096, the l4 kernel halves WG count and reuses activation across 4 rows.
+#[allow(dead_code)]
 const LARGE_N_THRESHOLD: usize = 4096;
 
 /// Helper: create a dedicated kernel and pre-bind F16 matmul arguments.
@@ -586,7 +591,7 @@ fn make_f16_matmul_step(
     k: usize,
     op_tag: OpTag,
     l4_program: Option<&ocl::Program>,
-    is_nosub: bool,
+    _is_nosub: bool,
 ) -> Result<KernelStep> {
     // L4 (4-wave K-split) kernel disabled — broken on Adreno 830.
     // All sizes use the single-WG N_DST=4 kernel from f16_program.
@@ -1074,7 +1079,8 @@ pub struct FullPlanConfig<'a> {
     pub kv_bufs: Vec<KvBufs<'a>>,
     // Final norm + lm_head
     pub final_norm_buf: &'a Mem,
-    pub lm_head_buf: &'a Mem,
+    /// `None` when lm_head is kept on CPU (large tied embedding).
+    pub lm_head_buf: Option<&'a Mem>,
     pub logits_buf: &'a Mem,
     // Model config
     pub dim: usize,
@@ -1207,18 +1213,25 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     };
 
     // lm_head matmul: x [1, dim] × lm_head [vocab, dim]^T → logits [1, vocab]
-    let lm_head = make_f16_matmul_step(
-        config.f16_program,
-        config.x_buf,
-        config.lm_head_buf,
-        config.logits_buf,
-        config.vocab_size,
-        config.dim,
-        OpTag::LmHead,
-        config.f16_l4_program,
-        config.is_nosub,
-    )
-    .context("build lm_head matmul step")?;
+    // None when lm_head is on CPU (large tied embedding that exceeds GPU alloc limit).
+    let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
+        Some(
+            make_f16_matmul_step(
+                config.f16_program,
+                config.x_buf,
+                lm_head_buf,
+                config.logits_buf,
+                config.vocab_size,
+                config.dim,
+                OpTag::LmHead,
+                config.f16_l4_program,
+                config.is_nosub,
+            )
+            .context("build lm_head matmul step")?,
+        )
+    } else {
+        None
+    };
 
     Ok(FullKernelPlan {
         layers,
@@ -1274,7 +1287,8 @@ pub struct KiviFullPlanConfig<'a> {
     pub kivi_kv_bufs: Vec<KiviKvBufs<'a>>,
     // Final norm + lm_head
     pub final_norm_buf: &'a Mem,
-    pub lm_head_buf: &'a Mem,
+    /// `None` when lm_head is kept on CPU (large tied embedding).
+    pub lm_head_buf: Option<&'a Mem>,
     pub logits_buf: &'a Mem,
     // Model config
     pub dim: usize,
@@ -1726,19 +1740,25 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
         }
     };
 
-    // lm_head
-    let lm_head = make_f16_matmul_step(
-        config.f16_program,
-        config.x_buf,
-        config.lm_head_buf,
-        config.logits_buf,
-        config.vocab_size,
-        config.dim,
-        OpTag::LmHead,
-        config.f16_l4_program,
-        config.is_nosub,
-    )
-    .context("build lm_head matmul step for KIVI plan")?;
+    // lm_head (None when kept on CPU)
+    let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
+        Some(
+            make_f16_matmul_step(
+                config.f16_program,
+                config.x_buf,
+                lm_head_buf,
+                config.logits_buf,
+                config.vocab_size,
+                config.dim,
+                OpTag::LmHead,
+                config.f16_l4_program,
+                config.is_nosub,
+            )
+            .context("build lm_head matmul step for KIVI plan")?,
+        )
+    } else {
+        None
+    };
 
     Ok(FullKernelPlan {
         layers,

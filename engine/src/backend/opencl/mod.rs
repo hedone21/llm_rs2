@@ -1022,7 +1022,7 @@ impl OpenCLBackend {
 
         // L4 kernel uses 4-wave K-split which is broken on Adreno 830.
         // Disable L4 unless explicitly using the 4-wave subgroup kernel.
-        let use_l4 = if f16_nosub || !std::env::var("FORCE_F16_4WAVE").is_ok() {
+        let use_l4 = if f16_nosub || std::env::var("FORCE_F16_4WAVE").is_err() {
             false
         } else {
             const LARGE_N_THRESHOLD: usize = 4096;

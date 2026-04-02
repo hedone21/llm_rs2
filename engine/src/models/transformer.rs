@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use crate::core::attention_scores::AttentionScoreAccumulator;
 use crate::core::backend::Backend;
-use crate::core::buffer::DType;
+use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCache, KVCacheOps};
 use crate::core::memory::Memory;
 use crate::core::offload::preload_pool::{self, PreloadPool};
@@ -56,6 +56,11 @@ fn release_source_pages(data: &[u8]) {
     }
 }
 
+/// Maximum single GPU buffer allocation size (bytes).
+/// Buffers exceeding this threshold are kept on CPU to avoid
+/// `CL_INVALID_BUFFER_SIZE` on devices with limited VRAM (e.g., mobile SoCs).
+const MAX_GPU_SINGLE_ALLOC: usize = 512 * 1024 * 1024; // 512 MB
+
 pub struct TransformerModel {
     pub config: ModelConfig,
     pub layers: Vec<TransformerLayer>,
@@ -64,8 +69,15 @@ pub struct TransformerModel {
     /// so that `gather_embed` can run entirely on the GPU without CPU round-trips.
     pub embed_tokens: Tensor,
     pub norm: Tensor,
-    /// lm_head is on the device backend (GPU or CPU).
+    /// lm_head weight tensor.
+    /// When `lm_head_on_cpu` is true, this lives on the CPU backend even when the
+    /// main backend is GPU (avoids `CL_INVALID_BUFFER_SIZE` for large vocabs).
     pub lm_head: Tensor,
+    /// When true, `lm_head` is on CPU and the final matmul must be done via CPU
+    /// fallback: read x from GPU → CPU matmul → write logits back.
+    /// This happens for models with large tied embeddings (e.g., gemma3-1b:
+    /// 262144 × 1152 × 2 = ~604 MB exceeds typical mobile GPU alloc limits).
+    pub lm_head_on_cpu: bool,
     /// GPU-side copy of embed_tokens for zero-sync gather on GPU backends.
     /// - Tied weights: shares the same GPU buffer as `lm_head` (zero extra memory).
     /// - Untied weights: a separate GPU copy uploaded once at load time.
@@ -608,8 +620,8 @@ impl TransformerModel {
         } else {
             weight_map.contains_key(lm_head_name)
         };
-        let lm_head = if has_lm_head {
-            load_tensor(lm_head_name, true)?
+        let (lm_head, lm_head_on_cpu) = if has_lm_head {
+            (load_tensor(lm_head_name, true)?, false)
         } else {
             // Tied weights: build lm_head from the CPU embed_tokens and upload to device.
             eprintln!(
@@ -618,17 +630,31 @@ impl TransformerModel {
             );
             if is_cpu {
                 // CPU: reuse embed_tokens buffer directly (zero-copy, same backend)
-                embed_tokens.clone()
+                (embed_tokens.clone(), false)
             } else {
-                // GPU: upload CPU embed_tokens to device.
-                // If weight_dtype != embed_tokens.dtype() we need a cast first.
-                if embed_tokens.dtype() == weight_dtype || weight_dtype == DType::F32 {
-                    // Same dtype: upload as-is
-                    backend.copy_from(&embed_tokens)?
+                // GPU: check if the embedding tensor fits in a single GPU allocation.
+                // Models with huge vocabs (e.g., gemma3-1b: 262144 × 1152 × 2 = ~604 MB)
+                // can exceed CL_DEVICE_MAX_MEM_ALLOC_SIZE or cause OOM on mobile SoCs.
+                let embed_size = embed_tokens.size();
+                if embed_size > MAX_GPU_SINGLE_ALLOC {
+                    eprintln!(
+                        "lm_head too large for GPU ({:.0} MB > {:.0} MB limit), keeping on CPU",
+                        embed_size as f64 / (1024.0 * 1024.0),
+                        MAX_GPU_SINGLE_ALLOC as f64 / (1024.0 * 1024.0),
+                    );
+                    // Keep lm_head on CPU; forward paths will use CPU fallback matmul.
+                    (embed_tokens.clone(), true)
                 } else {
-                    // Different dtype (e.g. embed is F16, weight_dtype is Q4_0): not supported
-                    // for tied weights, fall back to F16 upload
-                    backend.copy_from(&embed_tokens)?
+                    // GPU: upload CPU embed_tokens to device.
+                    // If weight_dtype != embed_tokens.dtype() we need a cast first.
+                    if embed_tokens.dtype() == weight_dtype || weight_dtype == DType::F32 {
+                        // Same dtype: upload as-is
+                        (backend.copy_from(&embed_tokens)?, false)
+                    } else {
+                        // Different dtype (e.g. embed is F16, weight_dtype is Q4_0): not supported
+                        // for tied weights, fall back to F16 upload
+                        (backend.copy_from(&embed_tokens)?, false)
+                    }
                 }
             }
         };
@@ -646,12 +672,25 @@ impl TransformerModel {
         // CPU backend: None (gather runs on CPU directly).
         let gpu_embed_tokens = if is_cpu {
             None
-        } else if !has_lm_head {
-            // Tied weights: lm_head already holds the GPU copy of embed_tokens.
+        } else if !has_lm_head && !lm_head_on_cpu {
+            // Tied weights with GPU lm_head: reuse the same GPU buffer (zero extra memory).
             Some(lm_head.clone())
         } else {
-            // Untied weights: upload a separate GPU copy.
-            Some(backend.copy_from(&embed_tokens)?)
+            // Untied weights, or tied-but-CPU lm_head: upload embed_tokens to GPU separately.
+            // For lm_head_on_cpu, the embedding is too large for a single GPU alloc but we
+            // still need GPU-side embed for gather_embed. If this also exceeds the limit,
+            // gather_embed falls back to CPU gather + upload — try the GPU upload and
+            // fall back gracefully if it fails.
+            match backend.copy_from(&embed_tokens) {
+                Ok(gpu_t) => Some(gpu_t),
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to upload embed_tokens to GPU ({e}), \
+                         gather will use CPU path"
+                    );
+                    None
+                }
+            }
         };
 
         Ok(Self {
@@ -660,6 +699,7 @@ impl TransformerModel {
             embed_tokens,
             norm,
             lm_head,
+            lm_head_on_cpu,
             gpu_embed_tokens,
             cpu_backend: stored_cpu_backend,
             preload_pool: std::sync::Mutex::new(None),
@@ -762,7 +802,11 @@ impl TransformerModel {
             backend.clone(),
         );
 
-        backend.matmul_transposed(&x, &self.lm_head, &mut logits)?;
+        if self.lm_head_on_cpu {
+            self.lm_head_matmul_cpu(&x, &mut logits, backend)?;
+        } else {
+            backend.matmul_transposed(&x, &self.lm_head, &mut logits)?;
+        }
 
         Ok(logits)
     }
@@ -1042,7 +1086,13 @@ impl TransformerModel {
                 backend.clone(),
             );
             backend.copy_slice(&x, &mut x_last, last_offset, 0, hidden_size)?;
-            backend.matmul_transposed(&x_last, &self.lm_head, logits_out)?;
+            if self.lm_head_on_cpu {
+                self.lm_head_matmul_cpu(&x_last, logits_out, backend)?;
+            } else {
+                backend.matmul_transposed(&x_last, &self.lm_head, logits_out)?;
+            }
+        } else if self.lm_head_on_cpu {
+            self.lm_head_matmul_cpu(&x, logits_out, backend)?;
         } else {
             backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
         }
@@ -1149,7 +1199,11 @@ impl TransformerModel {
             residual_buf: cl!(ws.residual),
             kv_bufs: kv_bufs_vec,
             final_norm_buf: cl!(self.norm),
-            lm_head_buf: cl!(self.lm_head),
+            lm_head_buf: if self.lm_head_on_cpu {
+                None
+            } else {
+                Some(cl!(self.lm_head))
+            },
             logits_buf: cl!(logits),
             dim,
             n_heads_q: self.config.num_attention_heads,
@@ -1192,20 +1246,26 @@ impl TransformerModel {
         start_pos: usize,
         x_gen: &mut Tensor,
         kv_caches: &mut [KVCache],
-        _logits_out: &mut Tensor,
+        logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
         // 1. Embedding lookup: CPU gather + upload to GPU x-buffer
         self.gather_embed(input_tokens, x_gen, backend)?;
 
-        // 2. Execute plan (all layers + final norm + lm_head)
+        // 2. Execute plan (all layers + final norm + optionally lm_head)
         let ocl_backend = backend
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
         match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // If lm_head was skipped in the plan (on CPU), run CPU fallback.
+                if plan.lm_head.is_none() {
+                    self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                }
+                Ok(true)
+            }
             Err(_) => Ok(false), // plan invalidated, caller should rebuild
         }
     }
@@ -1308,7 +1368,11 @@ impl TransformerModel {
             residual_buf: cl!(ws.residual),
             kivi_kv_bufs: kivi_kv_bufs_vec,
             final_norm_buf: cl!(self.norm),
-            lm_head_buf: cl!(self.lm_head),
+            lm_head_buf: if self.lm_head_on_cpu {
+                None
+            } else {
+                Some(cl!(self.lm_head))
+            },
             logits_buf: cl!(logits),
             dim,
             n_heads_q: self.config.num_attention_heads,
@@ -1352,7 +1416,7 @@ impl TransformerModel {
         start_pos: usize,
         x_gen: &mut Tensor,
         kv_caches: &mut [crate::core::kivi_cache::KiviCache],
-        _logits_out: &mut Tensor,
+        logits_out: &mut Tensor,
         backend: &Arc<dyn Backend>,
     ) -> Result<bool> {
         self.gather_embed(input_tokens, x_gen, backend)?;
@@ -1363,7 +1427,12 @@ impl TransformerModel {
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
         match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                if plan.lm_head.is_none() {
+                    self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                }
+                Ok(true)
+            }
             Err(_) => Ok(false),
         }
     }
@@ -1574,7 +1643,72 @@ impl TransformerModel {
             self.config.rms_norm_eps as f32,
             is_gemma3,
         )?;
-        backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+        if self.lm_head_on_cpu {
+            self.lm_head_matmul_cpu(&x, logits_out, backend)?;
+        } else {
+            backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+        }
+
+        Ok(())
+    }
+
+    /// Run lm_head matmul on CPU when `self.lm_head_on_cpu` is true.
+    ///
+    /// 1. Synchronize GPU (ensure x is ready).
+    /// 2. Read the normalized hidden state `x` from GPU to a CPU buffer.
+    /// 3. Perform `matmul_transposed(x_cpu, lm_head_cpu, logits_cpu)` on CPU.
+    /// 4. Write the F32 logits back to the GPU `logits_out` buffer.
+    ///
+    /// This is only called for models with huge tied embeddings (e.g., gemma3-1b's
+    /// 604 MB embed_tokens) that exceed the GPU single-buffer allocation limit.
+    fn lm_head_matmul_cpu(
+        &self,
+        x: &Tensor,
+        logits_out: &mut Tensor,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<()> {
+        let cpu_be = self
+            .cpu_backend
+            .as_ref()
+            .ok_or_else(|| anyhow!("lm_head_on_cpu requires cpu_backend"))?;
+
+        // 1. Synchronize GPU to ensure x is fully computed.
+        backend.synchronize()?;
+
+        // 2. Read x from GPU into a CPU-backed tensor.
+        let x_size = x.size(); // F32 bytes
+        let x_cpu_buf = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+            x_size,
+            DType::F32,
+        ));
+        let x_cpu = Tensor::new(
+            x.shape().clone(),
+            x_cpu_buf as Arc<dyn Buffer>,
+            cpu_be.clone(),
+        );
+        // SAFETY: SharedBuffer guarantees a valid writable pointer of `x_size` bytes.
+        let x_dst = unsafe { std::slice::from_raw_parts_mut(x_cpu.as_mut_ptr(), x_size) };
+        backend.read_buffer(x, x_dst)?;
+
+        // 3. Allocate CPU logits buffer and run matmul.
+        let logits_size = logits_out.size();
+        let logits_cpu_buf = Arc::new(crate::buffer::shared_buffer::SharedBuffer::new(
+            logits_size,
+            DType::F32,
+        ));
+        let mut logits_cpu = Tensor::new(
+            logits_out.shape().clone(),
+            logits_cpu_buf as Arc<dyn Buffer>,
+            cpu_be.clone(),
+        );
+
+        cpu_be.matmul_transposed(&x_cpu, &self.lm_head, &mut logits_cpu)?;
+
+        // 4. Write CPU logits to GPU buffer.
+        let logits_ptr = logits_cpu.as_ptr();
+        // SAFETY: logits_cpu is a valid SharedBuffer with logits_size bytes.
+        let logits_bytes = unsafe { std::slice::from_raw_parts(logits_ptr, logits_size) };
+        backend.write_buffer(logits_out, logits_bytes)?;
 
         Ok(())
     }
@@ -1741,6 +1875,7 @@ mod tests {
             embed_tokens,
             norm,
             lm_head,
+            lm_head_on_cpu: false,
             gpu_embed_tokens: None, // CPU-only model
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
@@ -1885,6 +2020,7 @@ mod tests {
             embed_tokens,
             norm,
             lm_head,
+            lm_head_on_cpu: false,
             gpu_embed_tokens: None,
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
@@ -1993,6 +2129,7 @@ mod tests {
             embed_tokens,
             norm,
             lm_head,
+            lm_head_on_cpu: false,
             gpu_embed_tokens: Some(gpu_embed),
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
@@ -2089,6 +2226,7 @@ mod tests {
             embed_tokens,
             norm,
             lm_head,
+            lm_head_on_cpu: false,
             gpu_embed_tokens: Some(gpu_embed),
             cpu_backend: Some(cpu_be.clone()), // both set
             preload_pool: std::sync::Mutex::new(None),

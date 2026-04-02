@@ -1054,20 +1054,17 @@ impl CpuBackendNeon {
         }
     }
 
-    /// NEON vectorized tanh via identity: tanh(x) = 1 - 2/(1 + exp(2x))
-    /// Uses v_expf for fast exp approximation.
+    /// NEON vectorized tanh — scalar per lane for correctness on all ARM64.
+    /// Uses scalar tanh() to avoid v_expf bit-manipulation issues
+    /// (same approach as v_silu — see Apple Silicon / Cortex-A720 errata).
     #[inline(always)]
     unsafe fn v_tanh(x: float32x4_t) -> float32x4_t {
-        let two = vdupq_n_f32(2.0);
-        let one = vdupq_n_f32(1.0);
-        // exp(2x)
-        let exp2x = Self::v_expf(vmulq_f32(two, x));
-        // tanh(x) = 1 - 2 / (1 + exp(2x))
-        let denom = vaddq_f32(one, exp2x);
-        // Use reciprocal estimate + Newton-Raphson for division
-        let recip = vrecpeq_f32(denom);
-        let recip = vmulq_f32(recip, vrecpsq_f32(denom, recip));
-        vsubq_f32(one, vmulq_f32(two, recip))
+        let mut vals = [0.0f32; 4];
+        vst1q_f32(vals.as_mut_ptr(), x);
+        for v in vals.iter_mut() {
+            *v = v.tanh();
+        }
+        vld1q_f32(vals.as_ptr())
     }
 
     /// NEON vectorized GELU-tanh-mul: gate[i] = gelu_tanh(gate[i]) * up[i]
