@@ -228,6 +228,11 @@ impl EngineState_ {
                 println!("  → Throttle: delay_ms={}", delay_ms);
                 CommandResult::Ok
             }
+            EngineCommand::SetTargetTbt { target_ms } => {
+                self.activate_action("target_tbt");
+                println!("  → SetTargetTbt: target_ms={}", target_ms);
+                CommandResult::Ok
+            }
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.skip_ratio = *skip_ratio;
                 self.activate_action("layer_skip");

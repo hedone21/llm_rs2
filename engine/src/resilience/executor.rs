@@ -19,6 +19,9 @@ pub struct ExecutionPlan {
     pub prepare_device: Option<String>,
     /// Throttle delay between tokens (ms). 0 = no throttle.
     pub throttle_delay_ms: u64,
+    /// Target TBT in ms. Engine sleeps max(0, target - actual_tbt) per token.
+    /// 0 = disabled. Set via SetTargetTbt command.
+    pub target_tbt_ms: u64,
     /// Whether inference should be suspended.
     pub suspended: bool,
     /// Whether inference should resume from suspension.
@@ -91,6 +94,7 @@ pub struct CommandExecutor {
     engine_state: EngineState,
     active_device: String,
     throttle_delay_ms: u64,
+    target_tbt_ms: u64,
 
     // Currently active action names (e.g. "kv_evict_h2o", "throttle")
     active_actions: Vec<String>,
@@ -120,6 +124,7 @@ impl CommandExecutor {
             engine_state: EngineState::Idle,
             active_device,
             throttle_delay_ms: 0,
+            target_tbt_ms: 0,
             active_actions: Vec::new(),
             throughput_ema: 0.0,
             last_token_time: None,
@@ -184,8 +189,9 @@ impl CommandExecutor {
         }
 
         if directives.is_empty() {
-            // Maintain existing throttle
+            // Maintain existing throttle and target TBT
             plan.throttle_delay_ms = self.throttle_delay_ms;
+            plan.target_tbt_ms = self.target_tbt_ms;
             return plan;
         }
 
@@ -224,7 +230,6 @@ impl CommandExecutor {
     fn apply_command(&mut self, cmd: &EngineCommand, plan: &mut ExecutionPlan) -> CommandResult {
         match cmd {
             EngineCommand::Throttle { delay_ms } => {
-                // 직접 지정된 딜레이를 적용한다 (처리량 비율 변환 없이)
                 plan.throttle_delay_ms = *delay_ms;
                 if *delay_ms > 0 {
                     if !self.active_actions.contains(&"throttle".to_string()) {
@@ -232,6 +237,18 @@ impl CommandExecutor {
                     }
                 } else {
                     self.active_actions.retain(|a| a != "throttle");
+                }
+                CommandResult::Ok
+            }
+            EngineCommand::SetTargetTbt { target_ms } => {
+                plan.target_tbt_ms = *target_ms;
+                self.target_tbt_ms = *target_ms;
+                if *target_ms > 0 {
+                    if !self.active_actions.contains(&"target_tbt".to_string()) {
+                        self.active_actions.push("target_tbt".to_string());
+                    }
+                } else {
+                    self.active_actions.retain(|a| a != "target_tbt");
                 }
                 CommandResult::Ok
             }
@@ -315,7 +332,9 @@ impl CommandExecutor {
             EngineCommand::RestoreDefaults => {
                 plan.restore_defaults = true;
                 plan.throttle_delay_ms = 0;
+                plan.target_tbt_ms = 0;
                 self.throttle_delay_ms = 0;
+                self.target_tbt_ms = 0;
                 self.compute_level = ResourceLevel::Normal;
                 self.memory_level = ResourceLevel::Normal;
                 self.active_actions.clear();

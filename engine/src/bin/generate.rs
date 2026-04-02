@@ -744,7 +744,7 @@ fn main() -> anyhow::Result<()> {
             let file = std::fs::File::create(path).expect("failed to create tbt-log file");
             std::io::BufWriter::new(file)
         });
-    let target_tbt_ms = args.target_tbt;
+    let mut target_tbt_ms = args.target_tbt;
 
     // ── KIVI mode: separate path with KiviCache ──
     // Placed after executor creation so resilience is available in the token loop.
@@ -2388,6 +2388,13 @@ fn main() -> anyhow::Result<()> {
 
                 throttle_delay_ms = plan.throttle_delay_ms;
 
+                // Update target TBT from Manager directive (overrides CLI --target-tbt)
+                if plan.target_tbt_ms > 0 {
+                    target_tbt_ms = plan.target_tbt_ms as f64;
+                } else if plan.restore_defaults {
+                    target_tbt_ms = args.target_tbt; // restore CLI default
+                }
+
                 if plan.suspended {
                     eprintln!("\n[Resilience] Inference suspended by system signal");
                     break;
@@ -2857,6 +2864,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
 fn command_summary(cmd: &EngineCommand) -> String {
     match cmd {
         EngineCommand::Throttle { delay_ms } => format!("Throttle({}ms)", delay_ms),
+        EngineCommand::SetTargetTbt { target_ms } => format!("SetTargetTbt({}ms)", target_ms),
         EngineCommand::LayerSkip { skip_ratio } => format!("LayerSkip({:.2})", skip_ratio),
         EngineCommand::KvEvictH2o { keep_ratio } => format!("KvEvictH2o({:.2})", keep_ratio),
         EngineCommand::KvEvictSliding { keep_ratio } => {
@@ -3337,7 +3345,7 @@ fn run_kivi(
     command_executor: &mut Option<llm_rs2::resilience::CommandExecutor>,
     initial_bits: u8,
     no_gpu_plan: bool,
-    target_tbt_ms: f64,
+    mut target_tbt_ms: f64,
     tbt_log_path: Option<&str>,
     ignore_eos: bool,
 ) -> anyhow::Result<()> {
@@ -3697,6 +3705,13 @@ fn run_kivi(
             // throttle
             if plan.throttle_delay_ms > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
+            }
+
+            // Update target TBT from Manager directive
+            if plan.target_tbt_ms > 0 {
+                target_tbt_ms = plan.target_tbt_ms as f64;
+            } else if plan.restore_defaults {
+                target_tbt_ms = 0.0;
             }
 
             if plan.suspended {

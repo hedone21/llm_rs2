@@ -64,8 +64,8 @@ struct Args {
     tcp: Option<String>,
 
     /// Command to send (KvEvictSliding, KvEvictH2o, KvStreaming, KvMergeD2o,
-    /// Throttle, SwitchHw, KvQuantDynamic, LayerSkip, Suspend, Resume,
-    /// RestoreDefaults, RequestQcf).
+    /// Throttle, SetTargetTbt, SwitchHw, KvQuantDynamic, LayerSkip,
+    /// Suspend, Resume, RestoreDefaults, RequestQcf).
     #[arg(long)]
     command: Option<String>,
 
@@ -105,6 +105,10 @@ struct Args {
     /// skip_ratio for LayerSkip.
     #[arg(long)]
     skip_ratio: Option<f32>,
+
+    /// target_ms for SetTargetTbt.
+    #[arg(long)]
+    target_ms: Option<u64>,
 
     // ── D-Bus mode (legacy) ──
     /// Use D-Bus transport instead of Unix socket.
@@ -256,6 +260,7 @@ struct CommandParams<'a> {
     device: Option<&'a str>,
     target_bits: Option<u8>,
     skip_ratio: Option<f32>,
+    target_ms: Option<u64>,
 }
 
 fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
@@ -313,6 +318,12 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
                 .skip_ratio
                 .context("--skip-ratio required for LayerSkip")?;
             Ok(EngineCommand::LayerSkip { skip_ratio: ratio })
+        }
+        "SetTargetTbt" => {
+            let ms = params
+                .target_ms
+                .context("--target-ms required for SetTargetTbt")?;
+            Ok(EngineCommand::SetTargetTbt { target_ms: ms })
         }
         "Suspend" => Ok(EngineCommand::Suspend),
         "Resume" => Ok(EngineCommand::Resume),
@@ -589,6 +600,7 @@ fn run_single_command(
         device: args.device.as_deref(),
         target_bits: args.target_bits,
         skip_ratio: args.skip_ratio,
+        target_ms: args.target_ms,
     })?;
 
     let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
@@ -690,6 +702,7 @@ fn run_scenario(stream: &mut (impl Read + Write), path: &PathBuf) -> anyhow::Res
             device: entry.device.as_deref(),
             target_bits: entry.target_bits,
             skip_ratio: entry.skip_ratio,
+            target_ms: entry.delay_ms_param, // reuse delay_ms for target_ms in scenario
         })?;
 
         let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
@@ -1134,6 +1147,7 @@ mod tests {
             device: None,
             target_bits: None,
             skip_ratio: None,
+            target_ms: None,
         }
     }
 

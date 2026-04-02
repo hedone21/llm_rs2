@@ -170,8 +170,12 @@ pub enum EngineState {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum EngineCommand {
     // ── Compute domain ──
-    /// Throttle token generation by inserting delay between tokens.
+    /// Throttle token generation by inserting fixed delay between tokens.
     Throttle { delay_ms: u64 },
+    /// Set target TBT (time between tokens) in milliseconds.
+    /// Engine dynamically sleeps after each token to maintain target TBT.
+    /// 0 = disable pacing. More precise than Throttle for QoS control.
+    SetTargetTbt { target_ms: u64 },
     /// Skip transformer layers to reduce compute load.
     LayerSkip { skip_ratio: f32 },
 
