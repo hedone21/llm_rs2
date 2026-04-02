@@ -3672,6 +3672,11 @@ fn run_kivi(
                         eprintln!("[KIVI-Resilience] transition_bits({}) error: {}", bits, e);
                     }
                 }
+                // Invalidate GPU Plan — cache structure changed after bit transition
+                #[cfg(feature = "opencl")]
+                {
+                    gpu_plan = None;
+                }
                 eprintln!("[KIVI-Resilience] Transitioned KV cache to {}bit", bits);
             }
 
