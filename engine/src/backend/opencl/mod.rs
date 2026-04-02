@@ -402,36 +402,67 @@ impl OpenCLBackend {
         // F16 GEMV: Adreno-optimized multi-row kernel (Q4 pattern ported to F16)
         let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
         let f16_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
-        let mut f16_is_nosub = false;
-        let f16_program = match Program::builder()
-            .devices(device)
-            .src(f16_src)
-            .cmplr_opt(&cl_opts)
-            .build(&context)
-        {
-            Ok(p) => {
-                log::info!("mul_mv_f16_f32.cl compiled (GEMV optimized)");
-                p
+        // F16 GEMV: use nosub (local memory reduction) by default.
+        // The subgroup kernel (mul_mv_f16_f32.cl) assumes subgroup_size==64 via
+        // get_sub_group_local_id(), which may not hold on all Adreno generations
+        // (e.g., Adreno 830 on Snapdragon 8 Elite). The nosub kernel is safe on
+        // all devices and only ~10% slower. Use FORCE_F16_SUBGROUP=1 to opt-in
+        // to the subgroup kernel for testing.
+        let force_subgroup = std::env::var("FORCE_F16_SUBGROUP").is_ok();
+        let mut f16_is_nosub = !force_subgroup;
+        let f16_program = if force_subgroup {
+            match Program::builder()
+                .devices(device)
+                .src(f16_src)
+                .cmplr_opt(&cl_opts)
+                .build(&context)
+            {
+                Ok(p) => {
+                    log::info!("mul_mv_f16_f32.cl compiled (subgroup, forced)");
+                    f16_is_nosub = false;
+                    p
+                }
+                Err(e) => {
+                    log::warn!("Subgroup F16 failed: {}. Falling back to nosub.", e);
+                    f16_is_nosub = true;
+                    Program::builder()
+                        .devices(device)
+                        .src(f16_fallback_src)
+                        .cmplr_opt(&cl_opts)
+                        .build(&context)?
+                }
             }
-            Err(e) => {
-                log::warn!("mul_mv_f16_f32.cl failed: {}. Trying fallback.", e);
-                match Program::builder()
-                    .devices(device)
-                    .src(f16_fallback_src)
-                    .cmplr_opt(&cl_opts)
-                    .build(&context)
-                {
-                    Ok(p) => {
-                        log::info!("Using fallback/mul_mv_f16_f32_nosub.cl");
-                        f16_is_nosub = true;
-                        p
-                    }
-                    Err(e2) => {
-                        log::warn!("Fallback F16 also failed: {}. Using dummy.", e2);
-                        Program::builder()
-                            .devices(device)
-                            .src("__kernel void kernel_mul_mat_f16_f32() {}")
-                            .build(&context)?
+        } else {
+            match Program::builder()
+                .devices(device)
+                .src(f16_fallback_src)
+                .cmplr_opt(&cl_opts)
+                .build(&context)
+            {
+                Ok(p) => {
+                    log::info!("mul_mv_f16_f32_nosub.cl compiled (F16 GEMV)");
+                    p
+                }
+                Err(e) => {
+                    log::warn!("Nosub F16 failed: {}. Trying subgroup.", e);
+                    match Program::builder()
+                        .devices(device)
+                        .src(f16_src)
+                        .cmplr_opt(&cl_opts)
+                        .build(&context)
+                    {
+                        Ok(p) => {
+                            log::info!("mul_mv_f16_f32.cl compiled (subgroup fallback)");
+                            f16_is_nosub = false;
+                            p
+                        }
+                        Err(e2) => {
+                            log::warn!("Both F16 kernels failed: {}. Using dummy.", e2);
+                            Program::builder()
+                                .devices(device)
+                                .src("__kernel void kernel_mul_mat_f16_f32() {}")
+                                .build(&context)?
+                        }
                     }
                 }
             }
