@@ -410,11 +410,13 @@ impl KiviCache {
             );
 
             // Quantized block storage: size depends on bits
+            // bits=16 (dynamic quant): allocate for worst-case Q8 (36B/block)
+            // since runtime transition to any bit width is possible.
             let block_bytes = match bits {
-                2 => 12,  // BlockQ2_0
-                4 => 20,  // BlockKVQ4
-                8 => 36,  // BlockKVQ8
-                _ => 12,  // fallback
+                2 => 12,      // BlockQ2_0
+                4 => 20,      // BlockKVQ4
+                8 | 16 => 36, // BlockKVQ8 (16: dynamic, worst-case)
+                _ => 36,
             };
             let q2k_bytes = max_k_blocks * block_bytes;
             let q2k_buf = memory.alloc(q2k_bytes.max(block_bytes), DType::U8)?;
@@ -770,14 +772,20 @@ impl KiviCache {
 
         // ── 16 → 2/4/8: quantize all residual data ──────────────────────────
         if self.bits == 16 {
-            // Switch to target bit-width so flush_residual() uses correct format
+            // Switch to target bit-width so flush uses correct format
             self.bits = new_bits;
             self.qk = QuantizedBlocks::new(new_bits);
             self.qv = QuantizedBlocks::new(new_bits);
 
-            // Flush as many full groups as possible from residual
+            // Flush as many full groups as possible from residual.
+            // GPU mode: use flush_residual_gpu() to keep GPU buffers in sync
+            // (upload quantized blocks + update GPU attention buffers).
             if self.res_pos >= self.group_size {
-                self.flush_residual();
+                if self.gpu_backend.is_some() {
+                    self.flush_residual_gpu()?;
+                } else {
+                    self.flush_residual();
+                }
             }
 
             // Compact remaining residual data from HeadMajor[old_res_cap] → HeadMajor[new_res_cap]
@@ -787,6 +795,12 @@ impl KiviCache {
             let new_res_cap = self.group_size; // QKKV = 32
             if self.res_cap > new_res_cap {
                 let remaining = self.res_pos; // tokens still in residual after flush
+
+                // Compact GPU residual: write CPU residual (already compacted below) to GPU.
+                // The GPU buffer retains old stride (res_cap=4096), so we overwrite with
+                // correctly-strided CPU data after CPU compaction.
+                let needs_gpu_sync = self.gpu_backend.is_some() && remaining > 0;
+
                 if remaining > 0 && self.kv_heads > 1 {
                     // Move each head's slice into its new packed position
                     // head 0 is already at index 0, no move needed.
@@ -806,6 +820,40 @@ impl KiviCache {
                 self.res_v.truncate(new_elems);
                 self.res_v.shrink_to_fit();
                 self.res_cap = new_res_cap;
+
+                // Sync compacted CPU residual to GPU.
+                // GPU buffer is larger (old allocation) but only the first
+                // kv_heads × new_res_cap × head_dim elements are used.
+                if needs_gpu_sync {
+                    let backend = self.gpu_backend.as_ref().unwrap();
+                    let k_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            self.res_k.as_ptr() as *const u8,
+                            new_elems * 4,
+                        )
+                    };
+                    let v_bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            self.res_v.as_ptr() as *const u8,
+                            new_elems * 4,
+                        )
+                    };
+                    // Write compacted data to the start of GPU buffer.
+                    // Remaining space is unused (gpu_res_k/v are oversized but
+                    // res_cap now tracks the correct stride).
+                    if let Some(gpu_rk) = self.gpu_res_k.as_mut() {
+                        let gpu_size = gpu_rk.buffer().size();
+                        let mut padded = vec![0u8; gpu_size];
+                        padded[..k_bytes.len()].copy_from_slice(k_bytes);
+                        backend.write_buffer(gpu_rk, &padded)?;
+                    }
+                    if let Some(gpu_rv) = self.gpu_res_v.as_mut() {
+                        let gpu_size = gpu_rv.buffer().size();
+                        let mut padded = vec![0u8; gpu_size];
+                        padded[..v_bytes.len()].copy_from_slice(v_bytes);
+                        backend.write_buffer(gpu_rv, &padded)?;
+                    }
+                }
             }
 
             self.q2_deq_tokens = 0;
@@ -1194,7 +1242,12 @@ impl KiviCache {
             2 => 12, // size_of::<BlockQ2_0>()
             4 => 20, // size_of::<BlockKVQ4>()
             8 => 36, // size_of::<BlockKVQ8>()
-            _ => return Err(anyhow::anyhow!("unsupported bits {} for GPU upload", self.bits)),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "unsupported bits {} for GPU upload",
+                    self.bits
+                ));
+            }
         };
 
         let total_k_blocks_so_far = self.qk.len(); // after push in flush_residual_gpu
@@ -1307,14 +1360,12 @@ impl KiviCache {
                     for h in 0..self.kv_heads {
                         for t in 0..flush_tokens {
                             let pos = tok_base + t;
-                            let out_base =
-                                pos * self.kv_heads * self.head_dim + h * self.head_dim;
+                            let out_base = pos * self.kv_heads * self.head_dim + h * self.head_dim;
                             for b in 0..blocks_per_token_v {
                                 self.qv.dequantize_block(v_idx, &mut deq_buf);
                                 v_idx += 1;
                                 let start = out_base + b * QKKV;
-                                self.attn_v_buf[start..start + QKKV]
-                                    .copy_from_slice(&deq_buf);
+                                self.attn_v_buf[start..start + QKKV].copy_from_slice(&deq_buf);
                             }
                         }
                     }
