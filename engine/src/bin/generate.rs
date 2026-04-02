@@ -923,20 +923,25 @@ fn main() -> anyhow::Result<()> {
     // Setup event sink for score diagnostics
     cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
 
-    // Register policies for Manager-directed eviction dispatch
+    // Register policies for Manager-directed eviction dispatch.
+    // Use a small protected_prefix (4 = attention sinks) for Manager-directed policies,
+    // NOT actual_protected_prefix which may be the entire prompt length when
+    // --eviction-policy is "none". The Manager decides WHEN and HOW MUCH to evict;
+    // the policy should not silently prevent meaningful eviction.
+    let resilience_protected_prefix = 4usize; // attention sinks only
     cache_manager.register_policy(
         llm_rs2::resilience::EvictMethod::H2o,
         Box::new(H2OPolicy::new(
             args.h2o_recent_window,
             args.h2o_keep_ratio,
-            actual_protected_prefix,
+            resilience_protected_prefix,
         )),
     );
     cache_manager.register_policy(
         llm_rs2::resilience::EvictMethod::Sliding,
         Box::new(SlidingWindowPolicy::new(
             args.eviction_window,
-            actual_protected_prefix,
+            resilience_protected_prefix,
         )),
     );
     // Note: Streaming policy is NOT pre-registered because its parameters
