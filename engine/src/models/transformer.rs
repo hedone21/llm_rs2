@@ -706,6 +706,85 @@ impl TransformerModel {
         })
     }
 
+    /// Migrate all model weight tensors from CPU to GPU zero-copy memory.
+    /// Uses the provided Memory allocator (must be zero-copy OpenCL) to create
+    /// buffers with both host pointer (CPU) and cl_mem (GPU) access.
+    /// Returns the number of tensors migrated.
+    pub fn migrate_weights_to_gpu(
+        &mut self,
+        gpu_mem: &dyn Memory,
+        gpu_backend: &Arc<dyn Backend>,
+    ) -> Result<usize> {
+        let mut count = 0;
+        // Use MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR): host Vec<u8> is always
+        // accessible from CPU (as_ptr), and the cl_mem wraps the same memory for
+        // GPU kernels. No map/unmap needed — both sides access the same DRAM on UMA.
+        #[cfg(feature = "opencl")]
+        let ocl_context = gpu_backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .map(|be| be.context.clone());
+        #[cfg(not(feature = "opencl"))]
+        let ocl_context: Option<()> = None;
+        let context = ocl_context.ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+
+        let migrate_one = |t: &Tensor| -> Result<Tensor> {
+            let size = t.size();
+            let buf: Arc<dyn Buffer> = Arc::new(
+                crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer::new(
+                    &context,
+                    size,
+                    t.dtype(),
+                )?,
+            );
+            // Copy weight data into the host-owned buffer
+            let src = unsafe { std::slice::from_raw_parts(t.as_ptr(), size) };
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), size) };
+            dst.copy_from_slice(src);
+            Ok(Tensor::new(t.shape().clone(), buf, gpu_backend.clone()))
+        };
+        for layer in &mut self.layers {
+            macro_rules! migrate {
+                ($t:expr) => {
+                    $t = migrate_one(&$t)?;
+                    count += 1;
+                };
+            }
+            migrate!(layer.wq);
+            migrate!(layer.wk);
+            migrate!(layer.wv);
+            migrate!(layer.wo);
+            migrate!(layer.w_gate);
+            migrate!(layer.w_up);
+            migrate!(layer.w_down);
+            migrate!(layer.attention_norm);
+            migrate!(layer.ffn_norm);
+            if let Some(ref t) = layer.q_norm {
+                layer.q_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.k_norm {
+                layer.k_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.pre_ffn_norm {
+                layer.pre_ffn_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.post_ffn_norm {
+                layer.post_ffn_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+        }
+        self.norm = migrate_one(&self.norm)?;
+        count += 1;
+        if !self.lm_head_on_cpu {
+            self.lm_head = migrate_one(&self.lm_head)?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
     pub fn forward(
         &self,
         input_tokens: &Tensor,

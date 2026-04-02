@@ -480,7 +480,8 @@ fn main() -> anyhow::Result<()> {
         ),
     };
     eprintln!("[Config] Weight dtype: {:?}", w_dtype);
-    let model = TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
+    let model =
+        TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
 
     // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch
     #[cfg(feature = "opencl")]

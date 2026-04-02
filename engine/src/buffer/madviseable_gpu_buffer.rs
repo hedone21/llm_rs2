@@ -22,6 +22,11 @@ pub struct MadviseableGPUBuffer {
 }
 
 impl MadviseableGPUBuffer {
+    /// Get a reference to the underlying cl_mem for use in `get_cl_mem()`.
+    pub fn cl_mem_ref(&self) -> &Mem {
+        &self.cl_buffer
+    }
+
     /// Create a new MadviseableGPUBuffer.
     ///
     /// Allocates `size` bytes of host memory and creates a CL buffer
