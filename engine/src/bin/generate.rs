@@ -439,8 +439,10 @@ fn main() -> anyhow::Result<()> {
                 }
             };
             #[cfg(not(feature = "opencl"))]
-            let (gpu_be, gpu_mem_arc): (Option<Arc<dyn Backend>>, Option<Arc<dyn Memory>>) =
-                (None, None);
+            let (gpu_be, gpu_mem_arc): (
+                Option<Arc<dyn Backend>>,
+                Option<Arc<dyn Memory>>,
+            ) = (None, None);
             (cpu, cpu_mem, gpu_be, gpu_mem_arc, false)
         }
         #[cfg(feature = "opencl")]
@@ -454,18 +456,9 @@ fn main() -> anyhow::Result<()> {
                 ));
             let gpu: Arc<dyn Backend> = gpu_concrete;
             // GPU is primary; keep a ref as secondary for SwitchHw round-trip
-            (
-                gpu.clone(),
-                gpu_mem.clone(),
-                Some(gpu),
-                Some(gpu_mem),
-                true,
-            )
+            (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
         }
-        _ => anyhow::bail!(
-            "Unknown backend: {}. Use cpu or opencl.",
-            args.backend
-        ),
+        _ => anyhow::bail!("Unknown backend: {}. Use cpu or opencl.", args.backend),
     };
     // cpu_backend_arc: always available for migration and SwitchHw fallback.
     let cpu_backend_arc: Arc<dyn Backend> = if args.backend == "cpu" {
@@ -491,10 +484,8 @@ fn main() -> anyhow::Result<()> {
 
     // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch
     #[cfg(feature = "opencl")]
-    let weights_on_gpu = llm_rs2::backend::opencl::get_cl_mem(
-        model.layers[0].wq.buffer().as_ref(),
-    )
-    .is_ok();
+    let weights_on_gpu =
+        llm_rs2::backend::opencl::get_cl_mem(model.layers[0].wq.buffer().as_ref()).is_ok();
     #[cfg(not(feature = "opencl"))]
     let weights_on_gpu = false;
 

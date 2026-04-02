@@ -1242,14 +1242,13 @@ mod tests {
         let policy = SlidingWindowPolicy::new(50, 4); // protected_prefix=4, NOT prompt length
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
-            Box::new(MockMonitor { available: usize::MAX }),
+            Box::new(MockMonitor {
+                available: usize::MAX,
+            }),
             0,
             1.0,
         );
-        cm.register_policy(
-            crate::resilience::EvictMethod::Sliding,
-            Box::new(policy),
-        );
+        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
 
         let mut caches = make_caches(4, 80);
         let result = cm
@@ -1273,14 +1272,13 @@ mod tests {
         let policy = SlidingWindowPolicy::new(50, 70); // protected_prefix=70 out of 80 tokens
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
-            Box::new(MockMonitor { available: usize::MAX }),
+            Box::new(MockMonitor {
+                available: usize::MAX,
+            }),
             0,
             1.0,
         );
-        cm.register_policy(
-            crate::resilience::EvictMethod::Sliding,
-            Box::new(policy),
-        );
+        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
 
         let mut caches = make_caches(4, 80);
         let result = cm
@@ -1309,7 +1307,9 @@ mod tests {
         let policy = StreamingLLMPolicy::new(4, 20);
         let cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
-            Box::new(MockMonitor { available: usize::MAX }),
+            Box::new(MockMonitor {
+                available: usize::MAX,
+            }),
             0,
             1.0,
         );
@@ -1336,7 +1336,9 @@ mod tests {
         let policy = H2OPolicy::new(20, 0.5, 4);
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
-            Box::new(MockMonitor { available: usize::MAX }),
+            Box::new(MockMonitor {
+                available: usize::MAX,
+            }),
             0,
             1.0,
         );

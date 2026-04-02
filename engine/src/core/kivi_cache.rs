@@ -827,16 +827,10 @@ impl KiviCache {
                 if needs_gpu_sync {
                     let backend = self.gpu_backend.as_ref().unwrap();
                     let k_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            self.res_k.as_ptr() as *const u8,
-                            new_elems * 4,
-                        )
+                        std::slice::from_raw_parts(self.res_k.as_ptr() as *const u8, new_elems * 4)
                     };
                     let v_bytes = unsafe {
-                        std::slice::from_raw_parts(
-                            self.res_v.as_ptr() as *const u8,
-                            new_elems * 4,
-                        )
+                        std::slice::from_raw_parts(self.res_v.as_ptr() as *const u8, new_elems * 4)
                     };
                     // Write compacted data to the start of GPU buffer.
                     // Remaining space is unused (gpu_res_k/v are oversized but

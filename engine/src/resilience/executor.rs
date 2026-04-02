@@ -201,10 +201,7 @@ impl CommandExecutor {
             let mut results = Vec::with_capacity(directive.commands.len());
 
             for cmd in &directive.commands {
-                eprintln!(
-                    "[Resilience] Directive seq={}: {:?}",
-                    seq_id, cmd
-                );
+                eprintln!("[Resilience] Directive seq={}: {:?}", seq_id, cmd);
                 let result = self.apply_command(cmd, &mut plan);
                 results.push(result);
             }
