@@ -480,8 +480,21 @@ fn main() -> anyhow::Result<()> {
         ),
     };
     eprintln!("[Config] Weight dtype: {:?}", w_dtype);
-    let model =
+    let mut model =
         TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
+
+    // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory
+    // (MadviseableGPUBuffer = CL_MEM_USE_HOST_PTR: host Vec always valid + cl_mem for GPU).
+    // This enables CPU→GPU SwitchHw without weight re-upload.
+    #[cfg(feature = "opencl")]
+    if !is_gpu {
+        if let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc) {
+            match model.migrate_weights_to_gpu(gpu_mem.as_ref(), gpu_be) {
+                Ok(n) => eprintln!("[Backend] Migrated {} weight tensors to GPU zero-copy", n),
+                Err(e) => eprintln!("[Backend] Weight migration skipped: {}", e),
+            }
+        }
+    }
 
     // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch
     #[cfg(feature = "opencl")]

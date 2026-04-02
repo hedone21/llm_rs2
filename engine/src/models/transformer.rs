@@ -728,6 +728,13 @@ impl TransformerModel {
         let ocl_context: Option<()> = None;
         let context = ocl_context.ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
 
+        // Get queue for clEnqueueWriteBuffer (ensures GPU sees the data)
+        let queue = gpu_backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .map(|be| be.queue.clone())
+            .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+
         let migrate_one = |t: &Tensor| -> Result<Tensor> {
             let size = t.size();
             let buf: Arc<dyn Buffer> = Arc::new(
@@ -737,19 +744,32 @@ impl TransformerModel {
                     t.dtype(),
                 )?,
             );
-            // Copy weight data into the host-owned buffer
+            // Write weight data via clEnqueueWriteBuffer for GPU coherency.
+            // MadviseableGPUBuffer uses CL_MEM_USE_HOST_PTR — the host Vec owns
+            // the memory, but GPU may cache stale data. clEnqueueWriteBuffer
+            // ensures the driver flushes caches and sees the correct data.
             let src = unsafe { std::slice::from_raw_parts(t.as_ptr(), size) };
-            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), size) };
-            dst.copy_from_slice(src);
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &queue,
+                    buf.cl_mem().unwrap(),
+                    true, // blocking
+                    0,
+                    src,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
             Ok(Tensor::new(t.shape().clone(), buf, gpu_backend.clone()))
         };
+        // Layer weights (always small — Q4 ~6MB, F16 ~16MB max per tensor)
+        macro_rules! migrate {
+            ($t:expr) => {
+                $t = migrate_one(&$t)?;
+                count += 1;
+            };
+        }
         for layer in &mut self.layers {
-            macro_rules! migrate {
-                ($t:expr) => {
-                    $t = migrate_one(&$t)?;
-                    count += 1;
-                };
-            }
             migrate!(layer.wq);
             migrate!(layer.wk);
             migrate!(layer.wv);
@@ -759,6 +779,11 @@ impl TransformerModel {
             migrate!(layer.w_down);
             migrate!(layer.attention_norm);
             migrate!(layer.ffn_norm);
+            if let Some(ref mut bias) = layer.qkv_bias {
+                migrate!(bias.bq);
+                migrate!(bias.bk);
+                migrate!(bias.bv);
+            }
             if let Some(ref t) = layer.q_norm {
                 layer.q_norm = Some(migrate_one(t)?);
                 count += 1;
@@ -776,11 +801,24 @@ impl TransformerModel {
                 count += 1;
             }
         }
-        self.norm = migrate_one(&self.norm)?;
-        count += 1;
+        migrate!(self.norm);
+        // lm_head + embed_tokens: may be large (>512MB for big vocab).
+        // Migrate if possible, otherwise keep on CPU with fallback paths.
         if !self.lm_head_on_cpu {
-            self.lm_head = migrate_one(&self.lm_head)?;
+            if self.lm_head.size() <= MAX_GPU_SINGLE_ALLOC {
+                migrate!(self.lm_head);
+            } else {
+                self.lm_head_on_cpu = true;
+            }
+        }
+        if self.embed_tokens.size() <= MAX_GPU_SINGLE_ALLOC {
+            self.gpu_embed_tokens = Some(migrate_one(&self.embed_tokens)?);
             count += 1;
+        }
+        // Set cpu_backend for gather_embed fallback path
+        if self.cpu_backend.is_none() {
+            self.cpu_backend =
+                Some(Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>);
         }
         Ok(count)
     }
