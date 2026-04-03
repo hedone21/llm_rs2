@@ -744,16 +744,18 @@ impl TransformerModel {
                     t.dtype(),
                 )?,
             );
-            // Write weight data via clEnqueueWriteBuffer for GPU coherency.
-            // MadviseableGPUBuffer uses CL_MEM_USE_HOST_PTR — the host Vec owns
-            // the memory, but GPU may cache stale data. clEnqueueWriteBuffer
-            // ensures the driver flushes caches and sees the correct data.
             let src = unsafe { std::slice::from_raw_parts(t.as_ptr(), size) };
+            // 1. Copy to host Vec (CPU reads via as_ptr — essential on discrete GPU
+            //    where CL_MEM_USE_HOST_PTR host data and device memory are separate)
+            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), size) };
+            dst.copy_from_slice(src);
+            // 2. Write to GPU device copy (ensures GPU kernels see the data —
+            //    on ARM UMA this is redundant but harmless)
             unsafe {
                 ocl::core::enqueue_write_buffer(
                     &queue,
                     buf.cl_mem().unwrap(),
-                    true, // blocking
+                    true,
                     0,
                     src,
                     None::<&ocl::core::Event>,
