@@ -780,7 +780,7 @@ fn main() -> anyhow::Result<()> {
         // KIVI mode: --kivi starts at Q2, --kv-dynamic-quant starts at bits=16
         // (F16-equivalent) and allows runtime transition via kv_quant_dynamic.
         // Note: --enable-resilience alone stays on main path (F16 KVCache + eviction).
-        let initial_bits: u8 = if args.kivi { 2 } else { 16 };
+        let initial_bits: u8 = if args.kivi { args.kivi_bits } else { 16 };
         let residual_size = if initial_bits == 16 {
             // bits=16: all tokens stay in residual (no quantization flush)
             // Round down to QKKV (32) multiple for KiviCache alignment
