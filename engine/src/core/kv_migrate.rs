@@ -68,9 +68,13 @@ pub fn migrate_kv_caches(
             Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
 
         let (k_final, v_final) = if copy_to_dst {
+            // copy_from inherits src's backend — re-wrap with dst_backend so that
+            // grow()/copy_slice() dispatches to the GPU implementation.
+            let kf = dst_backend.copy_from(&k_cpu_tensor)?;
+            let vf = dst_backend.copy_from(&v_cpu_tensor)?;
             (
-                dst_backend.copy_from(&k_cpu_tensor)?,
-                dst_backend.copy_from(&v_cpu_tensor)?,
+                Tensor::new(kf.shape().clone(), kf.buffer().clone(), dst_backend.clone()),
+                Tensor::new(vf.shape().clone(), vf.buffer().clone(), dst_backend.clone()),
             )
         } else {
             (k_cpu_tensor, v_cpu_tensor)
