@@ -38,6 +38,13 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(m.cl_mem_ref());
     }
+    // ClWrappedBuffer (CL_MEM_USE_HOST_PTR wrapper around existing CPU buffer)
+    if let Some(m) = buf
+        .as_any()
+        .downcast_ref::<crate::buffer::cl_wrapped_buffer::ClWrappedBuffer>()
+    {
+        return Ok(m.cl_mem_ref());
+    }
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 

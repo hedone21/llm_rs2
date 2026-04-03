@@ -1,4 +1,6 @@
 #[cfg(feature = "opencl")]
+pub mod cl_wrapped_buffer;
+#[cfg(feature = "opencl")]
 pub mod madviseable_gpu_buffer;
 pub mod mmap_buffer;
 pub mod shared_buffer;

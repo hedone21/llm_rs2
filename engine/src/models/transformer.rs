@@ -716,9 +716,9 @@ impl TransformerModel {
         gpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
         let mut count = 0;
-        // Use MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR): host Vec<u8> is always
-        // accessible from CPU (as_ptr), and the cl_mem wraps the same memory for
-        // GPU kernels. No map/unmap needed — both sides access the same DRAM on UMA.
+        // Wrap existing CPU buffers with CL_MEM_USE_HOST_PTR handles.
+        // Zero additional memory: CL just maps the existing host pointer for GPU access.
+        // On ARM UMA (Adreno), CPU and GPU share the same physical DRAM — no copy needed.
         #[cfg(feature = "opencl")]
         let ocl_context = gpu_backend
             .as_any()
@@ -728,40 +728,14 @@ impl TransformerModel {
         let ocl_context: Option<()> = None;
         let context = ocl_context.ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
 
-        // Get queue for clEnqueueWriteBuffer (ensures GPU sees the data)
-        let queue = gpu_backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .map(|be| be.queue.clone())
-            .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
-
         let migrate_one = |t: &Tensor| -> Result<Tensor> {
-            let size = t.size();
             let buf: Arc<dyn Buffer> = Arc::new(
-                crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer::new(
+                crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
                     &context,
-                    size,
+                    t.buffer().clone(),
                     t.dtype(),
                 )?,
             );
-            let src = unsafe { std::slice::from_raw_parts(t.as_ptr(), size) };
-            // 1. Copy to host Vec (CPU reads via as_ptr — essential on discrete GPU
-            //    where CL_MEM_USE_HOST_PTR host data and device memory are separate)
-            let dst = unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr(), size) };
-            dst.copy_from_slice(src);
-            // 2. Write to GPU device copy (ensures GPU kernels see the data —
-            //    on ARM UMA this is redundant but harmless)
-            unsafe {
-                ocl::core::enqueue_write_buffer(
-                    &queue,
-                    buf.cl_mem().unwrap(),
-                    true,
-                    0,
-                    src,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
             Ok(Tensor::new(t.shape().clone(), buf, gpu_backend.clone()))
         };
         // Layer weights (always small — Q4 ~6MB, F16 ~16MB max per tensor)
