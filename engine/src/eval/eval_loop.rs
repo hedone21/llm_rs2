@@ -85,7 +85,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
     // Pre-allocate prefill workspace for GPU buffer reuse across questions.
     // Allocated once at max_seq_len; prevents NVIDIA OpenCL driver crash from
     // accumulated alloc/free cycles during multi-question eval-ll.
-    let mut prefill_ws = if backend.name() == "OpenCL" {
+    let mut prefill_ws = if backend.is_gpu() {
         use crate::layers::workspace::PrefillWorkspace;
         PrefillWorkspace::new(
             &WorkspaceConfig {

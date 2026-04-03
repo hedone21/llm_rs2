@@ -129,36 +129,26 @@ impl TransformerLayer {
 
             ws.out_attn
                 .reshape(Shape::new(vec![batch_size, seq_len, q_dim]));
-            let is_opencl = backend.name() == "OpenCL";
+            let is_gpu = backend.is_gpu();
 
-            // GPU flash attention — only if KV buffers are actually OpenCL buffers.
+            // GPU flash attention — only if KV buffers are actually GPU buffers.
             // CPU-only caches (e.g. KiviCache with SharedBuffer) skip to CPU fallback.
-            #[cfg(feature = "opencl")]
-            let kv_is_gpu = k_cache.buffer().cl_mem().is_some();
-            #[cfg(not(feature = "opencl"))]
-            let kv_is_gpu = false;
-            let gpu_dispatched = if is_opencl && kv_is_gpu {
-                if let Some(ocl_backend) = backend
-                    .as_any()
-                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                {
-                    ocl_backend.flash_attention_prefill(
-                        &q_rope,
-                        &k_cache,
-                        &v_cache,
-                        &mut ws.out_attn,
-                        n_heads_q,
-                        n_heads_kv,
-                        seq_len,
-                        cache_seq_len,
-                        head_dim,
-                        kv_capacity,
-                        batch_size,
-                        kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
-                    )?
-                } else {
-                    false
-                }
+            let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
+            let gpu_dispatched = if is_gpu && kv_is_gpu {
+                backend.flash_attention_prefill(
+                    &q_rope,
+                    &k_cache,
+                    &v_cache,
+                    &mut ws.out_attn,
+                    n_heads_q,
+                    n_heads_kv,
+                    seq_len,
+                    cache_seq_len,
+                    head_dim,
+                    kv_capacity,
+                    batch_size,
+                    kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
+                )?
             } else {
                 false
             };
@@ -177,7 +167,7 @@ impl TransformerLayer {
                     let mut k_vec = Vec::new();
                     let mut v_vec = Vec::new();
 
-                    let (q_data, k_data, v_data, out_ptr) = if is_opencl {
+                    let (q_data, k_data, v_data, out_ptr) = if is_gpu {
                         let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                             if t.dtype() == DType::Q4_0 {
                                 use crate::core::quant::{BlockQ4_0, QK4_0};
@@ -401,7 +391,8 @@ impl TransformerLayer {
                     }
                 }
 
-                if is_opencl {
+                #[cfg(feature = "opencl")]
+                if is_gpu {
                     // Write CPU attention result directly to workspace GPU buffer.
                     // Use partial write (out_vec may be smaller than ws.out_attn buffer).
                     let out_bytes = unsafe {
@@ -553,36 +544,26 @@ impl TransformerLayer {
 
         let mut out_attn = self.alloc_temp(vec![batch_size, seq_len, q_dim], memory, backend)?;
 
-        let is_opencl = backend.name() == "OpenCL";
+        let is_gpu = backend.is_gpu();
 
-        // GPU flash attention — only if KV buffers are actually OpenCL buffers.
+        // GPU flash attention — only if KV buffers are actually GPU buffers.
         // CPU-only caches (e.g. KiviCache with SharedBuffer) skip to CPU fallback.
-        #[cfg(feature = "opencl")]
-        let kv_is_gpu = k_cache.buffer().cl_mem().is_some();
-        #[cfg(not(feature = "opencl"))]
-        let kv_is_gpu = false;
-        let gpu_dispatched = if is_opencl && kv_is_gpu {
-            if let Some(ocl_backend) = backend
-                .as_any()
-                .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            {
-                ocl_backend.flash_attention_prefill(
-                    &q_rope,
-                    &k_cache,
-                    &v_cache,
-                    &mut out_attn,
-                    n_heads_q,
-                    n_heads_kv,
-                    seq_len,
-                    cache_seq_len,
-                    head_dim,
-                    kv_capacity,
-                    batch_size,
-                    kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
-                )?
-            } else {
-                false
-            }
+        let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
+        let gpu_dispatched = if is_gpu && kv_is_gpu {
+            backend.flash_attention_prefill(
+                &q_rope,
+                &k_cache,
+                &v_cache,
+                &mut out_attn,
+                n_heads_q,
+                n_heads_kv,
+                seq_len,
+                cache_seq_len,
+                head_dim,
+                kv_capacity,
+                batch_size,
+                kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
+            )?
         } else {
             false
         };
@@ -602,7 +583,7 @@ impl TransformerLayer {
                 let mut k_vec = Vec::new();
                 let mut v_vec = Vec::new();
 
-                let (q_data, k_data, v_data, out_ptr) = if is_opencl {
+                let (q_data, k_data, v_data, out_ptr) = if is_gpu {
                     let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                         if t.dtype() == DType::Q4_0 {
                             use crate::core::quant::{BlockQ4_0, QK4_0};
@@ -815,7 +796,7 @@ impl TransformerLayer {
                 }
             }
 
-            if is_opencl {
+            if is_gpu {
                 // Create temp CPU tensor from result and copy back
                 // Using Galloc directly
                 let size_bytes = out_vec.len() * 4;

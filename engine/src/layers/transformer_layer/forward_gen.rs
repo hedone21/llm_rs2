@@ -23,13 +23,13 @@ impl TransformerLayer {
         let batch_size = x.shape().dims()[0];
         let head_dim = args.head_dim;
         let mut profiler = args.profiler.as_deref_mut();
-        let is_opencl = backend.name() == "OpenCL";
+        let is_gpu = backend.is_gpu();
 
         macro_rules! prof_start {
             () => {
                 if profiler.is_some() {
                     // Drain GPU queue before timing to get accurate per-op measurement
-                    if is_opencl {
+                    if is_gpu {
                         backend.synchronize().ok();
                     }
                     std::time::Instant::now()
@@ -43,7 +43,7 @@ impl TransformerLayer {
             ($t:expr, $field:ident) => {
                 if let Some(ref mut p) = profiler {
                     // Wait for GPU kernel to actually complete before recording time
-                    if is_opencl {
+                    if is_gpu {
                         backend.synchronize().ok();
                     }
                     p.$field += $t.elapsed().as_micros() as u64;
@@ -114,7 +114,7 @@ impl TransformerLayer {
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
-        if is_opencl {
+        if is_gpu {
             backend.flush()?;
         }
         prof_record!(t, matmul_qkv);
@@ -170,10 +170,7 @@ impl TransformerLayer {
         let t = prof_start!();
         let kv_dtype = kv_cache.kv_dtype();
         use crate::core::kv_cache::KVLayout;
-        if kv_dtype == DType::F16
-            && is_opencl
-            && is_decode
-            && kv_cache.layout() == KVLayout::HeadMajor
+        if kv_dtype == DType::F16 && is_gpu && is_decode && kv_cache.layout() == KVLayout::HeadMajor
         {
             // GPU F16 HeadMajor: fused cast+scatter kernel (1 dispatch instead of 2+16)
             // Ensure capacity before direct scatter to prevent out-of-bounds GPU write
@@ -235,7 +232,7 @@ impl TransformerLayer {
         // KIVI native attention: bypass F32 dequant + scatter by fusing dequant
         // into the attention kernel. Only available for OpenCL GPU + KiviCache.
         #[cfg(feature = "opencl")]
-        let kivi_native_dispatched = if is_opencl {
+        let kivi_native_dispatched = if is_gpu {
             if let Some(raw) = kv_cache.get_kivi_raw_buffers() {
                 if let Some(ocl_be) = backend
                     .as_any()
@@ -290,13 +287,10 @@ impl TransformerLayer {
             let (k_cache, v_cache) = kv_cache.get_view();
 
             // Use dtype-aware attention for non-F32 KV caches (F16, Q4_0).
-            // On OpenCL: also guard that KV buffers are actual GPU buffers (not CPU-only
+            // On GPU: also guard that KV buffers are actual GPU buffers (not CPU-only
             // KiviCache with SharedBuffer) — CPU-only caches must use the F32 fallback.
-            #[cfg(feature = "opencl")]
-            let kv_is_gpu = k_cache.buffer().cl_mem().is_some();
-            #[cfg(not(feature = "opencl"))]
-            let kv_is_gpu = true;
-            let use_typed_attn = if backend.name() == "OpenCL" {
+            let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
+            let use_typed_attn = if is_gpu {
                 // When KV buffers are on GPU (cl_mem present), always use GPU attention.
                 // CPU fallback cannot safely read device-only buffers (NVIDIA discrete GPU)
                 // and is slower than GPU attention even on zero-copy (Adreno UMA) devices.
@@ -333,9 +327,7 @@ impl TransformerLayer {
                 let mut v_vec = Vec::new();
                 let mut out_vec = Vec::new();
 
-                let is_opencl = backend.name() == "OpenCL";
-
-                let (q_data, k_data, v_data, out_ptr) = if is_opencl {
+                let (q_data, k_data, v_data, out_ptr) = if is_gpu {
                     q_vec.resize(q_rope.size() / 4, 0.0);
                     k_vec.resize(k_cache.size() / 4, 0.0);
                     v_vec.resize(v_cache.size() / 4, 0.0);
@@ -817,7 +809,7 @@ impl TransformerLayer {
                         });
                 } // End of: if use_parallel { ... } else { ... }
 
-                if is_opencl {
+                if is_gpu {
                     // Determine size from the actual out_vec we used
                     let size_bytes = out_vec.len() * 4;
                     let buf = Galloc::new().alloc(size_bytes, DType::F32)?;
@@ -918,7 +910,7 @@ impl TransformerLayer {
             backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             crate::core::thread_pool::get_pool().end_batch();
         }
-        if is_opencl {
+        if is_gpu {
             backend.flush()?;
         }
         prof_record!(t, matmul_ffn);
@@ -974,7 +966,7 @@ impl TransformerLayer {
         let n_rep = n_heads_q / n_heads_kv;
 
         // Read Q to CPU (always F32)
-        let q_data: Vec<f32> = if backend.name() == "OpenCL" {
+        let q_data: Vec<f32> = if backend.is_gpu() {
             let mut buf = vec![0.0f32; q.size() / 4];
             let bytes = unsafe {
                 std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 4)
@@ -991,7 +983,7 @@ impl TransformerLayer {
                 let blocks_per_row = head_dim / QK4_0;
 
                 // Read K cache to CPU
-                let k_bytes = if backend.name() == "OpenCL" {
+                let k_bytes = if backend.is_gpu() {
                     let mut buf = vec![0u8; k_cache.size()];
                     backend.read_buffer(k_cache, &mut buf)?;
                     buf
@@ -1053,7 +1045,7 @@ impl TransformerLayer {
             }
             DType::F16 => {
                 // Read K cache to CPU as raw bytes
-                let k_bytes: Vec<u8> = if backend.name() == "OpenCL" {
+                let k_bytes: Vec<u8> = if backend.is_gpu() {
                     let mut buf = vec![0u8; k_cache.size()];
                     backend.read_buffer(k_cache, &mut buf)?;
                     buf

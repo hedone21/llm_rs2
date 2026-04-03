@@ -626,14 +626,7 @@ fn main() -> anyhow::Result<()> {
     // On discrete GPUs without flash attention for this head_dim, F16 KV + GPU attention
     // produces incorrect results. Auto-promote to F32 KV for correctness.
     // Flash attention is compiled with DK=64; models with head_dim != 64 can't use it.
-    if args.backend == "opencl"
-        && kv_type == DType::F16
-        && head_dim != 64
-        && let Some(ocl_backend) = backend
-            .as_any()
-            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-        && !ocl_backend.use_zero_copy
-    {
+    if backend.is_gpu() && kv_type == DType::F16 && head_dim != 64 && backend.is_discrete_gpu() {
         eprintln!(
             "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} != flash_attn DK=64)",
             head_dim

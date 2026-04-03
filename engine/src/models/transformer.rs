@@ -729,13 +729,12 @@ impl TransformerModel {
         let context = ocl_context.ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
 
         let migrate_one = |t: &Tensor| -> Result<Tensor> {
-            let buf: Arc<dyn Buffer> = Arc::new(
-                crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
+            let buf: Arc<dyn Buffer> =
+                Arc::new(crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
                     &context,
                     t.buffer().clone(),
                     t.dtype(),
-                )?,
-            );
+                )?);
             Ok(Tensor::new(t.shape().clone(), buf, gpu_backend.clone()))
         };
         // Layer weights (always small — Q4 ~6MB, F16 ~16MB max per tensor)
@@ -966,7 +965,7 @@ impl TransformerModel {
         let mut prefill_ws: Option<crate::layers::workspace::PrefillWorkspace> = None;
         let no_prefill_ws = std::env::var("LLM_NO_PREFILL_WS").is_ok();
         let mut needs_ws_sync = false; // synchronize before owned_prefill_ws drop
-        if seq_len > 1 && backend.name() == "OpenCL" && !no_prefill_ws {
+        if seq_len > 1 && backend.is_gpu() && !no_prefill_ws {
             use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
             let ws_cfg = WsCfg {
                 batch_size,
