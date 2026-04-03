@@ -275,6 +275,37 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// GPU 백엔드 여부. CPU: false, OpenCL/CUDA: true.
+    fn is_gpu(&self) -> bool {
+        false
+    }
+
+    /// Discrete GPU (non-UMA) 여부. UMA(Adreno/Jetson): false, discrete(NVIDIA desktop): true.
+    fn is_discrete_gpu(&self) -> bool {
+        false
+    }
+
+    /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
+    /// Default: CPU fallback (returns false).
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn flash_attention_prefill(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        head_dim: usize,
+        kv_capacity: usize,
+        batch_size: usize,
+        is_head_major: bool,
+    ) -> Result<bool> {
+        Ok(false)
+    }
+
     // Embedding Lookup / Gather
     // src: [Rows, Cols] (Embeddings)
     // indices: [NumIndices] (Indices)

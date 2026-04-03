@@ -69,4 +69,8 @@ impl Buffer for OpenCLBuffer {
     fn is_host_managed(&self) -> bool {
         false // Device-only GPU memory
     }
+
+    fn is_gpu_buffer(&self) -> bool {
+        true
+    }
 }

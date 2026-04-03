@@ -78,6 +78,13 @@ pub trait Buffer: Send + Sync {
     fn is_host_managed(&self) -> bool {
         true // default: CPU buffers are host-managed
     }
+
+    /// 이 버퍼가 GPU에 접근 가능한지 여부.
+    /// OpenCL cl_mem 또는 CUDA device pointer를 가진 버퍼는 true.
+    /// CPU-only 버퍼(SharedBuffer, MmapBuffer)는 false.
+    fn is_gpu_buffer(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

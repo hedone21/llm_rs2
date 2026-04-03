@@ -200,6 +200,10 @@ impl Buffer for UnifiedBuffer {
     fn is_host_managed(&self) -> bool {
         false // Driver-pinned (CL_MEM_ALLOC_HOST_PTR), madvise ineffective
     }
+
+    fn is_gpu_buffer(&self) -> bool {
+        true
+    }
 }
 
 impl Drop for UnifiedBuffer {

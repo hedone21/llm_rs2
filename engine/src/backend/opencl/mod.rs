@@ -1187,7 +1187,7 @@ impl OpenCLBackend {
     /// K/V cache: HeadMajor [1, kv_heads, capacity, head_dim] F32 or F16 (on GPU)
     /// Output: [batch, seq_len, n_heads_q * head_dim] F32 (on GPU)
     #[allow(clippy::too_many_arguments)]
-    pub fn flash_attention_prefill(
+    pub fn flash_attention_prefill_gpu(
         &self,
         q: &Tensor,
         k_cache: &Tensor,
@@ -1513,6 +1513,45 @@ impl Backend for OpenCLBackend {
     fn flush(&self) -> Result<()> {
         ocl::core::flush(&self.queue)?;
         Ok(())
+    }
+
+    fn is_gpu(&self) -> bool {
+        true
+    }
+
+    fn is_discrete_gpu(&self) -> bool {
+        !self.use_zero_copy
+    }
+
+    fn flash_attention_prefill(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        head_dim: usize,
+        kv_capacity: usize,
+        batch_size: usize,
+        is_head_major: bool,
+    ) -> Result<bool> {
+        self.flash_attention_prefill_gpu(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            head_dim,
+            kv_capacity,
+            batch_size,
+            is_head_major,
+        )
     }
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {

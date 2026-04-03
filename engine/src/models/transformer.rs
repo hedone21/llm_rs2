@@ -710,9 +710,10 @@ impl TransformerModel {
     /// Uses the provided Memory allocator (must be zero-copy OpenCL) to create
     /// buffers with both host pointer (CPU) and cl_mem (GPU) access.
     /// Returns the number of tensors migrated.
+    #[cfg(feature = "opencl")]
     pub fn migrate_weights_to_gpu(
         &mut self,
-        gpu_mem: &dyn Memory,
+        _gpu_mem: &dyn Memory,
         gpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
         let mut count = 0;

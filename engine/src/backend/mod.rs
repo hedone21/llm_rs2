@@ -1,4 +1,5 @@
 pub mod cpu;
 
-// Optional OpenCL
+// Optional GPU backends (mutually exclusive)
+#[cfg(feature = "opencl")]
 pub mod opencl;

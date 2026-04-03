@@ -91,6 +91,10 @@ impl Buffer for MadviseableGPUBuffer {
     fn is_host_managed(&self) -> bool {
         true // App-managed memory, madvise effective
     }
+
+    fn is_gpu_buffer(&self) -> bool {
+        true
+    }
 }
 
 // SAFETY: host_data (Vec) is Send+Sync, cl_buffer (Mem) is Send+Sync.

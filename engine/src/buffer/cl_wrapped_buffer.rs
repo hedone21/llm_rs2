@@ -34,11 +34,7 @@ impl ClWrappedBuffer {
     ///
     /// The buffer's `as_ptr()` must return a valid, non-null pointer.
     /// On ARM UMA, this is zero-cost: GPU accesses the same physical DRAM.
-    pub fn new(
-        context: &ocl::Context,
-        inner: Arc<dyn Buffer>,
-        dtype: DType,
-    ) -> Result<Self> {
+    pub fn new(context: &ocl::Context, inner: Arc<dyn Buffer>, dtype: DType) -> Result<Self> {
         let ptr = inner.as_ptr();
         let size = inner.size();
         if ptr.is_null() {
@@ -106,5 +102,9 @@ impl Buffer for ClWrappedBuffer {
 
     fn is_host_managed(&self) -> bool {
         self.inner.is_host_managed()
+    }
+
+    fn is_gpu_buffer(&self) -> bool {
+        true
     }
 }
