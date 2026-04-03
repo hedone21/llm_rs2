@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-080~085 (신규 6개) = 총 65개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) = 총 68개.
 
 ## 1. Purpose and Scope
 
@@ -121,6 +121,9 @@
 | INV-063 | 30-engine ENG-023 | MessageLoop 스레드는 Transport의 유일한 소유자. | Safety | static | ownership |
 | INV-064 | 30-engine ENG-033 | heartbeat_interval 내 최소 1회 Heartbeat 전송 (poll 호출 시). | Correctness | runtime | CROSS-060 |
 | INV-065 | 30-engine ENG-013 | Backend trait 구현체는 `Send + Sync`. | Safety | static | trait bound |
+| INV-066 | 34-engine-cuda ENG-CUDA-013 | CudaBackend 초기화 시 CC ≥ sm_72 검증. 미달 시 에러 반환. | Safety | runtime | `cudaGetDeviceProperties` |
+| INV-067 | 34-engine-cuda ENG-CUDA-050 | `cuda`와 `opencl` feature는 상호 배타적. 동시 활성화 시 컴파일 에러. | Compatibility | static | `build.rs` compile_error! |
+| INV-068 | 34-engine-cuda ENG-CUDA-011 | CudaBackend는 llama.cpp PTX 커널 + cudarc만 사용. 자체 CUDA 커널을 작성하지 않음. | Correctness | static | 코드 리뷰 |
 
 ### 3.5 Engine State Machine Invariants [INV-070 ~ INV-076]
 

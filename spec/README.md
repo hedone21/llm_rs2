@@ -27,6 +27,7 @@
 | `ENG` | 010–099 | Engine 개요/상태 (30, 31) |
 | `ENG-ALG` | 010–099 | Engine 알고리즘 (32) |
 | `ENG-DAT` | 010–099 | Engine 데이터 (33) |
+| `ENG-CUDA` | 010–099 | Engine CUDA 백엔드 (34) |
 | `XC` | 010–099 | 횡단관심사 (40) |
 | `INV` | 001–999 | 불변식 (41) — 전체 수집 |
 | `TOOL` | 010–099 | 테스트 도구 (50) |
@@ -81,6 +82,7 @@ spec/
 ├── 31-engine-state.md           # Engine 상태 머신
 ├── 32-engine-algorithms.md      # KV 캐시 연산, eviction, 양자화
 ├── 33-engine-data.md            # 텐서 레이아웃, 캐시 포맷
+├── 34-engine-cuda.md            # CUDA 백엔드 (Jetson, ggml FFI)
 │
 ├── 40-cross-cutting.md          # 에러 처리, 로깅, 타이밍 규약
 ├── 41-invariants.md             # 시스템 전체 불변식 수집

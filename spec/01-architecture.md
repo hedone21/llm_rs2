@@ -131,6 +131,18 @@ Backend trait이 정의하는 연산 범주:
 | 메모리 | copy_from, copy_into, read_buffer, write_buffer, cast, gather, buffer_shift, copy_slice |
 | 산술 | add_assign, scale, add_row_bias |
 
+Backend trait 구현체:
+
+| 구현체 | Feature Gate | 타겟 | 커널 소스 |
+|--------|-------------|------|----------|
+| CpuBackendNeon | 기본 | aarch64 | 인라인 NEON intrinsics |
+| CpuBackendAVX2 | 기본 | x86_64 | 인라인 AVX2 intrinsics |
+| CpuBackendCommon | 기본 | 기타 | 스칼라 Rust |
+| OpenCLBackend | `opencl` | 모든 아키텍처 | `engine/kernels/*.cl` |
+| CudaBackend | `cuda` | aarch64 (Jetson sm_72+) | cudarc + llama.cpp PTX (`vendor/ggml-cuda/*.cu` → `.ptx`) |
+
+> `opencl`과 `cuda` feature는 상호 배타적이다. 한 바이너리에서 하나만 활성화된다.
+
 **[SYS-082]** KVCacheOps trait은 모든 KV 캐시 구현의 공통 인터페이스이다. 다음 구현체가 존재한다: *(MUST)*
 
 | 구현체 | 설명 | 메모리 레이아웃 |

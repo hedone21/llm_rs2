@@ -82,9 +82,10 @@ Backend 구현체:
 | CpuBackendNeon | 기본 | aarch64 | NEON SIMD + Rayon 병렬, F16 네이티브 |
 | CpuBackendAVX2 | 기본 | x86_64 | AVX2 SIMD |
 | CpuBackendCommon | 기본 | 기타 | 스칼라 폴백 |
-| OpenCLBackend | `opencl` | 모든 아키텍처 | GPU kernel, plan-based decode |
+| OpenCLBackend | `opencl` | 모든 아키텍처 | GPU kernel (OpenCL), plan-based decode. Adreno/Mali 타겟. |
+| CudaBackend | `cuda` | aarch64 (Jetson) | cudarc + llama.cpp PTX 커널, Tensor Core, MMVQ/MMQ. sm_72+ 전용. → `34-engine-cuda.md` |
 
-> **참고 (non-normative)**: `--backend hybrid` 시 CPU(primary) + GPU(secondary)를 `Arc<dyn Backend>`로 동시 보유한다. SwitchHw 명령으로 런타임 전환이 가능하다.
+> **참고 (non-normative)**: `--backend cpu` 시 GPU secondary(OpenCL 또는 CUDA)를 자동 초기화한다. SwitchHw 명령으로 런타임 전환이 가능하다. `opencl`과 `cuda` feature는 상호 배타적이다.
 
 **[ENG-014] KV Cache Subsystem** *(MUST)*
 
@@ -363,7 +364,7 @@ KVSnapshot 필드 상세 → `31-engine-state.md` ENG-ST-070.
 
 | 플래그 | 타입 | 기본값 | 설명 |
 |--------|------|--------|------|
-| `--backend` | String | "cpu" | "cpu", "opencl", "hybrid" |
+| `--backend` | String | "cpu" | "cpu", "opencl", "cuda" |
 | `--switch-threshold` | usize | 0 | hybrid 모드 자동 전환 토큰 수 (0=비활성) |
 | `--gpu-attn` | bool | false | GPU attention kernel 사용 |
 | `--zero-copy` | bool | false | CPU-GPU 공유 메모리 |
