@@ -1,8 +1,20 @@
+# Android (Galaxy S25 등): Cortex-A/X — dotprod, fhm, fp16 지원
 [target.aarch64-linux-android]
-# NDK 경로와 API 레벨을 자신의 환경에 맞게 수정해야 합니다.
 linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
 ar = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 rustflags = ["-C", "target-feature=+neon,+dotprod,+fhm,+fp16", "-C", "link-arg=-Wl,--allow-shlib-undefined", "-L", "libs/aarch64"]
 
+# Jetson cross-compile (Orin sm_87: Cortex-A78AE — dotprod, fhm 지원)
+[target.aarch64-unknown-linux-gnu]
+linker = "aarch64-linux-gnu-gcc"
+rustflags = ["-C", "target-feature=+neon,+dotprod,+fhm,+fp16"]
+
+# Jetson cross-compile static (Xavier sm_72: Carmel ARMv8.2 — no dotprod, no fhm)
+# glibc 2.31(Ubuntu 20.04)과의 호환을 위해 musl 정적 링킹
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+neon,+fp16"]
+
+# Host PC (x86_64)
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "target-feature=+avx2,+fma"]
