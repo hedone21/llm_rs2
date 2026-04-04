@@ -66,6 +66,26 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
 
 > **권장 조합**: Android + OpenCL + Q4 weight. Adreno GPU에서 llama.cpp CPU 대비 약 +23% 속도.
 
+### 온디바이스 (Jetson, CPU) 추론
+
+```bash
+# 방법 1: Jetson에서 네이티브 빌드 (권장)
+# Jetson에 Rust 설치 후:
+RUSTFLAGS='-C target-feature=+neon,+fp16' cargo build --release --no-default-features
+./target/release/generate -m models/qwen2.5-1.5b --prompt "Hello" -n 50
+
+# 방법 2: 호스트에서 크로스 컴파일 (Orin — dotprod/fhm 지원)
+cargo build --release --target aarch64-unknown-linux-gnu --no-default-features
+scp target/aarch64-unknown-linux-gnu/release/generate user@jetson:~/
+
+# 방법 3: 호스트에서 크로스 컴파일 정적 링킹 (Xavier — dotprod/fhm 미지원, glibc 2.31)
+cargo build --release --target aarch64-unknown-linux-musl --no-default-features
+scp target/aarch64-unknown-linux-musl/release/generate user@jetson:~/
+```
+
+> **주의**: Jetson에는 OpenCL 런타임이 없으므로 `--no-default-features`로 빌드. CUDA 백엔드는 향후 지원 예정.
+> Xavier(Carmel ARMv8.2)는 dotprod/fhm 미지원 — 크로스 컴파일 시 musl 타겟 사용 또는 네이티브 빌드.
+
 ---
 
 ## 2. generate 모드별 가이드
@@ -854,7 +874,31 @@ cargo build --release --target aarch64-linux-android \
 # target/aarch64-linux-android/release/mock_manager
 ```
 
-**통합 러너 사용 (권장)**
+**Jetson 크로스 컴파일**
+
+```bash
+# Orin (Cortex-A78AE, dotprod/fhm 지원)
+cargo build --release --target aarch64-unknown-linux-gnu --no-default-features --bin generate
+scp target/aarch64-unknown-linux-gnu/release/generate user@jetson:~/
+
+# Xavier (Carmel ARMv8.2, dotprod/fhm 미지원) — musl 정적 링킹
+cargo build --release --target aarch64-unknown-linux-musl --no-default-features --bin generate
+scp target/aarch64-unknown-linux-musl/release/generate user@jetson:~/
+```
+
+**Jetson 네이티브 빌드 (권장)**
+
+```bash
+# Jetson에 SSH 접속 후:
+# Rust 미설치 시: wget -qO- https://sh.rustup.rs | sh -s -- -y && source ~/.cargo/env
+cd ~/llm_rs2 && git pull
+RUSTFLAGS='-C target-feature=+neon,+fp16' cargo build --release --no-default-features
+# 결과물: target/release/generate
+```
+
+> Jetson에는 OpenCL이 없으므로 `--no-default-features`(OpenCL 제외)로 빌드한다. CUDA 백엔드는 향후 `--features cuda`로 지원 예정.
+
+**통합 러너 사용 (권장, Android)**
 
 ```bash
 # 빌드 + 배포 + 실행 한번에
