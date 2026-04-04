@@ -1,3 +1,6 @@
+#[cfg(all(feature = "opencl", feature = "cuda"))]
+compile_error!("Features 'opencl' and 'cuda' are mutually exclusive. Enable only one.");
+
 pub mod backend;
 pub mod buffer;
 pub mod core;

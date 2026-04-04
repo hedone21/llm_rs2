@@ -458,7 +458,18 @@ fn main() -> anyhow::Result<()> {
             // GPU is primary; keep a ref as secondary for SwitchHw round-trip
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
         }
-        _ => anyhow::bail!("Unknown backend: {}. Use cpu or opencl.", args.backend),
+        #[cfg(feature = "cuda")]
+        "cuda" => {
+            let gpu_concrete = Arc::new(llm_rs2::backend::cuda::CudaBackend::new()?);
+            let gpu_mem: Arc<dyn Memory> =
+                Arc::new(llm_rs2::backend::cuda::memory::CudaMemory::new());
+            let gpu: Arc<dyn Backend> = gpu_concrete;
+            (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
+        }
+        _ => anyhow::bail!(
+            "Unknown backend: {}. Use cpu, opencl, or cuda.",
+            args.backend
+        ),
     };
     // cpu_backend_arc: always available for migration and SwitchHw fallback.
     let cpu_backend_arc: Arc<dyn Backend> = if args.backend == "cpu" {
@@ -487,12 +498,12 @@ fn main() -> anyhow::Result<()> {
     // (MadviseableGPUBuffer = CL_MEM_USE_HOST_PTR: host Vec always valid + cl_mem for GPU).
     // This enables CPU→GPU SwitchHw without weight re-upload.
     #[cfg(feature = "opencl")]
-    if !is_gpu {
-        if let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc) {
-            match model.migrate_weights_to_gpu(gpu_mem.as_ref(), gpu_be) {
-                Ok(n) => eprintln!("[Backend] Migrated {} weight tensors to GPU zero-copy", n),
-                Err(e) => eprintln!("[Backend] Weight migration skipped: {}", e),
-            }
+    if !is_gpu
+        && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
+    {
+        match model.migrate_weights_to_gpu(gpu_mem.as_ref(), gpu_be) {
+            Ok(n) => eprintln!("[Backend] Migrated {} weight tensors to GPU zero-copy", n),
+            Err(e) => eprintln!("[Backend] Weight migration skipped: {}", e),
         }
     }
 

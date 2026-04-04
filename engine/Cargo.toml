@@ -36,8 +36,14 @@ libc = "0.2"
 log = "0.4"
 env_logger = "0.11"
 
-# OpenCl
+# OpenCL
 ocl = { version = "0.19", optional = true }
+
+# CUDA (Jetson)
+cudarc = { version = "0.19", optional = true, default-features = false, features = [
+  "std", "driver", "nvrtc", "cublas", "f16", "fallback-dynamic-loading",
+  "cuda-11040",
+] }
 
 # D-Bus IPC (resilience)
 zbus = { version = "5", optional = true, default-features = false, features = ["blocking-api", "async-io"] }
@@ -45,4 +51,5 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 [features]
 default = ["opencl"]
 opencl = ["ocl"]
+cuda = ["cudarc"]
 resilience = ["zbus"]

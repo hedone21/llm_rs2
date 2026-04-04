@@ -5,7 +5,6 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use crate::core::backend::Backend;
-use crate::core::buffer::DType;
 use crate::core::kv_cache::KVCache;
 use crate::core::memory::Memory;
 use crate::core::tensor::Tensor;
@@ -57,15 +56,13 @@ pub fn migrate_kv_caches(
         unsafe {
             std::ptr::copy_nonoverlapping(k_data.as_ptr(), k_cpu_buf.as_mut_ptr(), k_size);
         }
-        let k_cpu_tensor =
-            Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
+        let k_cpu_tensor = Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
 
         let v_cpu_buf = cpu_memory.alloc(v_size, kv_dtype)?;
         unsafe {
             std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_cpu_buf.as_mut_ptr(), v_size);
         }
-        let v_cpu_tensor =
-            Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
+        let v_cpu_tensor = Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
 
         let (k_final, v_final) = if copy_to_dst {
             // copy_from inherits src's backend — re-wrap with dst_backend so that
