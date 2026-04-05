@@ -2318,6 +2318,13 @@ fn main() -> anyhow::Result<()> {
                                     max_seq_len,
                                     false,
                                 )?;
+                                // Keep old GPU buffers alive to avoid clReleaseMemObject
+                                // during concurrent GPU workload (prevents Adreno driver race).
+                                let _keep_gpu_logits = logits.buffer().clone();
+                                let _keep_gpu_xgen = x_gen.buffer().clone();
+                                let _keep_gpu_gi = gen_input_tensor.buffer().clone();
+                                let _keep_gpu_ws = gen_ws.take_buffers();
+
                                 backend = cpu_backend_arc.clone();
                                 let lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
                                 logits = Tensor::new(
@@ -2345,10 +2352,14 @@ fn main() -> anyhow::Result<()> {
                                     cpu_memory_arc.as_ref(),
                                     backend.clone(),
                                 )?;
-                                // Re-allocate gen_input_tensor on CPU backend
                                 let gi_buf = cpu_memory_arc.alloc(4, DType::U8)?;
                                 gen_input_tensor =
                                     Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
+                                // Leak: prevent CL buffer deallocation while game uses GPU
+                                std::mem::forget(_keep_gpu_logits);
+                                std::mem::forget(_keep_gpu_xgen);
+                                std::mem::forget(_keep_gpu_gi);
+                                std::mem::forget(_keep_gpu_ws);
                                 #[cfg(feature = "opencl")]
                                 {
                                     gpu_plan = None;

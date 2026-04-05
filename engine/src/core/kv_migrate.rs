@@ -1,4 +1,9 @@
 //! KV cache migration between backends (CPU↔GPU).
+//!
+//! On UMA devices (Adreno, Jetson) with zero-copy buffers, GPU and CPU share
+//! the same physical memory. Migration is a zero-copy re-tag of the backend —
+//! no data is copied. On discrete GPUs, a full copy via intermediate CPU
+//! buffers is performed.
 
 use std::sync::Arc;
 
@@ -11,9 +16,12 @@ use crate::core::tensor::Tensor;
 
 /// Migrate KV caches from one backend to another.
 ///
-/// Reads KV data from `src_backend`, creates intermediate CPU tensors via
-/// `cpu_backend`/`cpu_memory`, then copies to `dst_backend` if `copy_to_dst`
-/// is true. When migrating GPU→CPU, `copy_to_dst=false` keeps data on CPU.
+/// On UMA (zero-copy): re-tags existing buffers with the destination backend.
+/// No memory allocation or copy occurs — the same host_data backing the
+/// CL_MEM_USE_HOST_PTR buffer is directly accessible from both CPU and GPU.
+///
+/// On discrete GPU: reads KV data via `src_backend`, creates intermediate CPU
+/// tensors, then optionally copies to `dst_backend`.
 ///
 /// # Arguments
 /// * `kv_caches` - Mutable KV caches to migrate in-place
@@ -39,42 +47,62 @@ pub fn migrate_kv_caches(
     max_seq_len: usize,
     copy_to_dst: bool,
 ) -> Result<()> {
+    let is_uma = src_backend.is_gpu() && !src_backend.is_discrete_gpu();
+
     for kv in kv_caches.iter_mut() {
         let current_capacity = kv.capacity();
         let saved_pos = kv.current_pos;
-        let kv_dtype = kv.k_buffer.dtype();
-        // Use actual buffer size (respects F16/F32/Q4 dtype)
-        let k_size = kv.k_buffer.size();
-        let v_size = kv.v_buffer.size();
 
-        let mut k_data = vec![0u8; k_size];
-        let mut v_data = vec![0u8; v_size];
-        src_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
-        src_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
-
-        let k_cpu_buf = cpu_memory.alloc(k_size, kv_dtype)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(k_data.as_ptr(), k_cpu_buf.as_mut_ptr(), k_size);
-        }
-        let k_cpu_tensor = Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
-
-        let v_cpu_buf = cpu_memory.alloc(v_size, kv_dtype)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_cpu_buf.as_mut_ptr(), v_size);
-        }
-        let v_cpu_tensor = Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
-
-        let (k_final, v_final) = if copy_to_dst {
-            // copy_from inherits src's backend — re-wrap with dst_backend so that
-            // grow()/copy_slice() dispatches to the GPU implementation.
-            let kf = dst_backend.copy_from(&k_cpu_tensor)?;
-            let vf = dst_backend.copy_from(&v_cpu_tensor)?;
-            (
-                Tensor::new(kf.shape().clone(), kf.buffer().clone(), dst_backend.clone()),
-                Tensor::new(vf.shape().clone(), vf.buffer().clone(), dst_backend.clone()),
-            )
+        let (k_final, v_final) = if is_uma {
+            // UMA zero-copy path: reuse existing buffer, just swap backend tag.
+            // MadviseableGPUBuffer.as_ptr() returns host_data.as_ptr() which is
+            // directly CPU-accessible. No alloc, no copy.
+            let k = Tensor::new(
+                kv.k_buffer.shape().clone(),
+                kv.k_buffer.buffer().clone(),
+                dst_backend.clone(),
+            );
+            let v = Tensor::new(
+                kv.v_buffer.shape().clone(),
+                kv.v_buffer.buffer().clone(),
+                dst_backend.clone(),
+            );
+            (k, v)
         } else {
-            (k_cpu_tensor, v_cpu_tensor)
+            // Discrete GPU path: full copy through CPU intermediate buffers.
+            let kv_dtype = kv.k_buffer.dtype();
+            let k_size = kv.k_buffer.size();
+            let v_size = kv.v_buffer.size();
+
+            let mut k_data = vec![0u8; k_size];
+            let mut v_data = vec![0u8; v_size];
+            src_backend.read_buffer(&kv.k_buffer, &mut k_data)?;
+            src_backend.read_buffer(&kv.v_buffer, &mut v_data)?;
+
+            let k_cpu_buf = cpu_memory.alloc(k_size, kv_dtype)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(k_data.as_ptr(), k_cpu_buf.as_mut_ptr(), k_size);
+            }
+            let k_cpu_tensor =
+                Tensor::new(kv.k_buffer.shape().clone(), k_cpu_buf, cpu_backend.clone());
+
+            let v_cpu_buf = cpu_memory.alloc(v_size, kv_dtype)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(v_data.as_ptr(), v_cpu_buf.as_mut_ptr(), v_size);
+            }
+            let v_cpu_tensor =
+                Tensor::new(kv.v_buffer.shape().clone(), v_cpu_buf, cpu_backend.clone());
+
+            if copy_to_dst {
+                let kf = dst_backend.copy_from(&k_cpu_tensor)?;
+                let vf = dst_backend.copy_from(&v_cpu_tensor)?;
+                (
+                    Tensor::new(kf.shape().clone(), kf.buffer().clone(), dst_backend.clone()),
+                    Tensor::new(vf.shape().clone(), vf.buffer().clone(), dst_backend.clone()),
+                )
+            } else {
+                (k_cpu_tensor, v_cpu_tensor)
+            }
         };
 
         let saved_layout = kv.layout();
@@ -91,5 +119,11 @@ pub fn migrate_kv_caches(
         new_kv.current_pos = saved_pos;
         *kv = new_kv;
     }
+
+    eprintln!(
+        "[KV Migrate] {} layers migrated ({})",
+        kv_caches.len(),
+        if is_uma { "UMA zero-copy re-tag" } else { "discrete GPU copy" }
+    );
     Ok(())
 }

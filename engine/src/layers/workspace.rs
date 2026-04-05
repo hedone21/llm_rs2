@@ -27,6 +27,46 @@ pub struct LayerWorkspace {
 }
 
 impl LayerWorkspace {
+    /// Extract all buffer Arcs (for keeping GPU buffers alive during switch).
+    pub fn take_buffers(&self) -> Vec<Arc<dyn crate::core::buffer::Buffer>> {
+        let mut bufs = vec![
+            self.q.buffer().clone(),
+            self.k.buffer().clone(),
+            self.v.buffer().clone(),
+            self.out_attn.buffer().clone(),
+            self.gate.buffer().clone(),
+            self.up.buffer().clone(),
+            self.down.buffer().clone(),
+            self.residual.buffer().clone(),
+            self.attn_out.buffer().clone(),
+        ];
+        if let Some(ref t) = self.k_cast { bufs.push(t.buffer().clone()); }
+        if let Some(ref t) = self.v_cast { bufs.push(t.buffer().clone()); }
+        bufs
+    }
+
+    /// Re-tag all tensors with a new backend without reallocating buffers.
+    /// Used for UMA GPU↔CPU switch where buffers are already host-accessible.
+    pub fn retag_backend(self, backend: Arc<dyn Backend>) -> Self {
+        let retag = |t: Tensor| -> Tensor {
+            Tensor::new(t.shape().clone(), t.buffer().clone(), backend.clone())
+        };
+        Self {
+            q: retag(self.q),
+            k: retag(self.k),
+            v: retag(self.v),
+            out_attn: retag(self.out_attn),
+            gate: retag(self.gate),
+            up: retag(self.up),
+            down: retag(self.down),
+            residual: retag(self.residual),
+            attn_out: retag(self.attn_out),
+            scores: self.scores,
+            k_cast: self.k_cast.map(|t| retag(t)),
+            v_cast: self.v_cast.map(|t| retag(t)),
+        }
+    }
+
     pub fn new(
         config: WorkspaceConfig,
         memory: &dyn Memory,
