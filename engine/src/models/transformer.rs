@@ -831,18 +831,15 @@ impl TransformerModel {
             }
             // Read GPU data to CPU buffer
             let cpu_buf = cpu_memory.alloc(t.size(), t.dtype())?;
-            let dst = unsafe {
-                std::slice::from_raw_parts_mut(cpu_buf.as_mut_ptr(), t.size())
-            };
+            let dst = unsafe { std::slice::from_raw_parts_mut(cpu_buf.as_mut_ptr(), t.size()) };
             be.read_buffer(t, dst)?;
             // Wrap CPU buffer with CL handle for GPU access
-            let dual_buf: Arc<dyn Buffer> = Arc::new(
-                crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
+            let dual_buf: Arc<dyn Buffer> =
+                Arc::new(crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
                     &ocl_context,
                     cpu_buf,
                     t.dtype(),
-                )?,
-            );
+                )?);
             Ok(Tensor::new(t.shape().clone(), dual_buf, be.clone()))
         };
 

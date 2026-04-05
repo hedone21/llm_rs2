@@ -40,8 +40,12 @@ impl LayerWorkspace {
             self.residual.buffer().clone(),
             self.attn_out.buffer().clone(),
         ];
-        if let Some(ref t) = self.k_cast { bufs.push(t.buffer().clone()); }
-        if let Some(ref t) = self.v_cast { bufs.push(t.buffer().clone()); }
+        if let Some(ref t) = self.k_cast {
+            bufs.push(t.buffer().clone());
+        }
+        if let Some(ref t) = self.v_cast {
+            bufs.push(t.buffer().clone());
+        }
         bufs
     }
 

@@ -129,7 +129,11 @@ pub fn migrate_kv_caches(
     eprintln!(
         "[KV Migrate] {} layers migrated ({})",
         kv_caches.len(),
-        if host_accessible { "UMA zero-copy re-tag" } else { "GPU→CPU copy" }
+        if host_accessible {
+            "UMA zero-copy re-tag"
+        } else {
+            "GPU→CPU copy"
+        }
     );
     Ok(())
 }
