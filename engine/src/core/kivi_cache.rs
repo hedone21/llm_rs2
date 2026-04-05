@@ -984,6 +984,7 @@ impl KiviCache {
 
     /// GPU update path: scatter input tokens into GPU residual buffer using
     /// `kivi_gather_update` kernel, flushing when the residual is full.
+    #[allow(unused_variables)]
     fn update_gpu(&mut self, new_k: &Tensor, new_v: &Tensor, seq_len: usize) -> Result<()> {
         #[cfg(feature = "opencl")]
         {
@@ -1254,6 +1255,9 @@ impl KiviCache {
         let total_v_blocks_so_far = self.qv.len();
         let v_bytes =
             self.serialize_quantized_blocks_v(total_v_blocks_so_far - new_v_blocks, new_v_blocks);
+
+        // Suppress unused warnings when compiled without opencl feature.
+        let _ = (tok_base, &k_byte_offset, &v_byte_offset, &k_bytes, &v_bytes);
 
         #[cfg(feature = "opencl")]
         {

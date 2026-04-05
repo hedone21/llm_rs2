@@ -108,16 +108,41 @@ pub trait Backend: Send + Sync {
         cache_seq_len: usize,
         scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
-        // Default CPU implementation
+        // Default CPU implementation — supports F32 and F16 KV cache.
+        use crate::core::buffer::DType;
         let q_data = unsafe { std::slice::from_raw_parts(q.as_ptr() as *const f32, q.size() / 4) };
-        let k_data = unsafe {
-            std::slice::from_raw_parts(k_cache.as_ptr() as *const f32, k_cache.size() / 4)
-        };
-        let v_data = unsafe {
-            std::slice::from_raw_parts(v_cache.as_ptr() as *const f32, v_cache.size() / 4)
-        };
         let out_data =
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut f32, out.size() / 4) };
+
+        // For F16 KV, dequantize to temporary F32 buffers.
+        let kv_dtype = k_cache.dtype();
+        let (k_f32_buf, v_f32_buf);
+        let (k_data, v_data): (&[f32], &[f32]) = match kv_dtype {
+            DType::F32 => (
+                unsafe {
+                    std::slice::from_raw_parts(k_cache.as_ptr() as *const f32, k_cache.size() / 4)
+                },
+                unsafe {
+                    std::slice::from_raw_parts(v_cache.as_ptr() as *const f32, v_cache.size() / 4)
+                },
+            ),
+            DType::F16 => {
+                use half::f16;
+                let k_f16 = unsafe {
+                    std::slice::from_raw_parts(k_cache.as_ptr() as *const f16, k_cache.size() / 2)
+                };
+                let v_f16 = unsafe {
+                    std::slice::from_raw_parts(v_cache.as_ptr() as *const f16, v_cache.size() / 2)
+                };
+                k_f32_buf = k_f16.iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
+                v_f32_buf = v_f16.iter().map(|x| x.to_f32()).collect::<Vec<f32>>();
+                (k_f32_buf.as_slice(), v_f32_buf.as_slice())
+            }
+            _ => anyhow::bail!(
+                "attention_gen default impl: unsupported KV dtype {:?}",
+                kv_dtype
+            ),
+        };
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         let gqa_ratio = num_heads_q / num_heads_kv;
@@ -211,7 +236,36 @@ pub trait Backend: Send + Sync {
         capacity: usize,
         write_pos: usize,
     ) -> Result<()> {
-        anyhow::bail!("kv_scatter_f32_to_f16 not implemented for this backend")
+        // CPU fallback: F32→F16 cast + HeadMajor scatter per head.
+        // k_src: [1, seq_len, kv_heads * head_dim] F32
+        // k_dst: [1, kv_heads, capacity, head_dim] F16 HeadMajor
+        use half::f16;
+        let kv_heads = k_src.shape().dims().last().copied().unwrap_or(0) / head_dim;
+        let src_f32 =
+            unsafe { std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4) };
+        let dst_f16 = unsafe {
+            std::slice::from_raw_parts_mut(k_dst.as_mut_ptr() as *mut f16, k_dst.size() / 2)
+        };
+        for h in 0..kv_heads {
+            let src_off = h * head_dim;
+            let dst_off = h * capacity * head_dim + write_pos * head_dim;
+            for d in 0..head_dim {
+                dst_f16[dst_off + d] = f16::from_f32(src_f32[src_off + d]);
+            }
+        }
+        let v_src_f32 =
+            unsafe { std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4) };
+        let v_dst_f16 = unsafe {
+            std::slice::from_raw_parts_mut(v_dst.as_mut_ptr() as *mut f16, v_dst.size() / 2)
+        };
+        for h in 0..kv_heads {
+            let src_off = h * head_dim;
+            let dst_off = h * capacity * head_dim + write_pos * head_dim;
+            for d in 0..head_dim {
+                v_dst_f16[dst_off + d] = f16::from_f32(v_src_f32[src_off + d]);
+            }
+        }
+        Ok(())
     }
 
     /// Copy data from src into dst buffer (same shape/size required).

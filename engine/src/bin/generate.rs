@@ -498,12 +498,24 @@ fn main() -> anyhow::Result<()> {
     // (MadviseableGPUBuffer = CL_MEM_USE_HOST_PTR: host Vec always valid + cl_mem for GPU).
     // This enables CPU→GPU SwitchHw without weight re-upload.
     #[cfg(feature = "opencl")]
-    if !is_gpu
-        && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
-    {
+    if !is_gpu && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc) {
         match model.migrate_weights_to_gpu(gpu_mem.as_ref(), gpu_be) {
             Ok(n) => eprintln!("[Backend] Migrated {} weight tensors to GPU zero-copy", n),
             Err(e) => eprintln!("[Backend] Weight migration skipped: {}", e),
+        }
+    }
+
+    // CUDA: migrate weights to pinned host memory for cuBLAS access.
+    // Unlike OpenCL (CL_MEM_USE_HOST_PTR zero-copy wrap), CUDA requires a memcpy into
+    // cuMemHostAlloc'd buffers to get device pointers for cuBLAS.
+    #[cfg(feature = "cuda")]
+    if args.backend == "cuda" {
+        match model.migrate_weights_to_cuda(&backend) {
+            Ok(n) => eprintln!(
+                "[Backend] Migrated {} weight tensors to CUDA pinned memory",
+                n
+            ),
+            Err(e) => eprintln!("[Backend] CUDA weight migration failed: {}", e),
         }
     }
 

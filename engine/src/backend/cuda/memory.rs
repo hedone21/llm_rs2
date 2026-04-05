@@ -1,39 +1,41 @@
-//! CUDA Unified Memory allocator implementing the `Memory` trait.
+//! CUDA memory allocator implementing the `Memory` trait.
+//!
+//! Phase 3: uses CudaHostBuffer (cuMemHostAlloc with DEVICEMAP) for pinned
+//! zero-copy buffers accessible from both CPU and GPU via cuBLAS.
 
-use crate::buffer::cuda_buffer::CudaBuffer;
+use crate::buffer::cuda_buffer::CudaHostBuffer;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use anyhow::Result;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-/// Memory allocator that creates CUDA Unified Memory buffers.
+/// Memory allocator for the CUDA backend.
 ///
-/// Tracks total allocated bytes for memory pressure reporting.
-/// Requires a CUDA context to be current on the calling thread
-/// (set up by `CudaBackend::new()`).
-pub struct CudaMemory {
-    used: Mutex<usize>,
+/// Allocates pinned host memory (cuMemHostAlloc) with GPU device mapping.
+/// On Jetson (UMA), this provides zero-copy access from both CPU and GPU.
+/// The device pointer can be passed directly to cuBLAS for GPU-accelerated compute.
+pub struct CudaMemory;
+
+impl Default for CudaMemory {
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl CudaMemory {
-    /// Create a new CudaMemory allocator.
-    ///
-    /// The CUDA context must already be initialized (via `CudaBackend::new()`).
     pub fn new() -> Self {
-        Self {
-            used: Mutex::new(0),
-        }
+        Self
     }
 }
 
 impl Memory for CudaMemory {
     fn alloc(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
-        let buf = CudaBuffer::new(size, dtype)?;
-        *self.used.lock().unwrap() += size;
+        let buf = CudaHostBuffer::new(size, dtype)?;
         Ok(Arc::new(buf))
     }
 
     fn used_memory(&self) -> usize {
-        *self.used.lock().unwrap()
+        // TODO: track cumulative allocations if needed for pressure monitoring.
+        0
     }
 }

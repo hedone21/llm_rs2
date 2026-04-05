@@ -799,6 +799,84 @@ impl TransformerModel {
         Ok(count)
     }
 
+    /// Migrate all model weight tensors to CUDA pinned host memory (CudaHostBuffer).
+    ///
+    /// Uses `Backend::copy_from()` to allocate pinned memory and memcpy weight data.
+    /// On Jetson (UMA), pinned memory is zero-copy accessible from both CPU and GPU,
+    /// enabling cuBLAS to access the weight data via device pointers.
+    ///
+    /// Returns the number of tensors migrated.
+    #[cfg(feature = "cuda")]
+    pub fn migrate_weights_to_cuda(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
+        let mut count = 0;
+
+        let migrate_one = |t: &Tensor| -> Result<Tensor> { gpu_backend.copy_from(t) };
+
+        macro_rules! migrate {
+            ($t:expr) => {
+                $t = migrate_one(&$t)?;
+                count += 1;
+            };
+        }
+
+        for layer in &mut self.layers {
+            migrate!(layer.wq);
+            migrate!(layer.wk);
+            migrate!(layer.wv);
+            migrate!(layer.wo);
+            migrate!(layer.w_gate);
+            migrate!(layer.w_up);
+            migrate!(layer.w_down);
+            migrate!(layer.attention_norm);
+            migrate!(layer.ffn_norm);
+            if let Some(ref mut bias) = layer.qkv_bias {
+                migrate!(bias.bq);
+                migrate!(bias.bk);
+                migrate!(bias.bv);
+            }
+            if let Some(ref t) = layer.q_norm {
+                layer.q_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.k_norm {
+                layer.k_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.pre_ffn_norm {
+                layer.pre_ffn_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.post_ffn_norm {
+                layer.post_ffn_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+        }
+
+        migrate!(self.norm);
+
+        // lm_head + embed_tokens: may be large, but Jetson has plenty of unified memory.
+        // Still apply the same size guard for safety.
+        if !self.lm_head_on_cpu {
+            if self.lm_head.size() <= MAX_GPU_SINGLE_ALLOC {
+                migrate!(self.lm_head);
+            } else {
+                self.lm_head_on_cpu = true;
+            }
+        }
+        if self.embed_tokens.size() <= MAX_GPU_SINGLE_ALLOC {
+            self.gpu_embed_tokens = Some(migrate_one(&self.embed_tokens)?);
+            count += 1;
+        }
+
+        // Set cpu_backend for gather_embed fallback path
+        if self.cpu_backend.is_none() {
+            self.cpu_backend =
+                Some(Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>);
+        }
+
+        Ok(count)
+    }
+
     pub fn forward(
         &self,
         input_tokens: &Tensor,

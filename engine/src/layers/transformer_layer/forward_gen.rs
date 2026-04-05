@@ -290,15 +290,14 @@ impl TransformerLayer {
             // On GPU: also guard that KV buffers are actual GPU buffers (not CPU-only
             // KiviCache with SharedBuffer) — CPU-only caches must use the F32 fallback.
             let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
-            let use_typed_attn = if is_gpu {
-                // When KV buffers are on GPU (cl_mem present), always use GPU attention.
-                // CPU fallback cannot safely read device-only buffers (NVIDIA discrete GPU)
-                // and is slower than GPU attention even on zero-copy (Adreno UMA) devices.
-                // This also enables KiviCache GPU mode where dequantized F32 views live on GPU.
+            let use_typed_attn = if is_gpu && k_cache.as_ptr().is_null() {
+                // Device-only buffers (null CPU pointer): must use GPU attention.
+                // This applies to OpenCL device-only buffers on discrete GPUs.
                 kv_is_gpu || (use_gpu_attn || k_cache.dtype() != DType::F32)
             } else {
-                // CPU backend: always use typed attention for non-F32 KV cache.
-                // CpuBackend::attention_gen handles F16/Q4_0 via dequantization.
+                // CPU-accessible buffers (UMA/pinned/CPU): use typed attention
+                // only for non-F32 KV cache. The F32 path in the else branch
+                // uses flash_attention_forward_strided which is well-tested.
                 k_cache.dtype() != DType::F32
             };
             if use_typed_attn {

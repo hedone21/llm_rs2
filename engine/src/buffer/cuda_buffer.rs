@@ -50,6 +50,11 @@ impl CudaBuffer {
             cuda_result::malloc_managed(size, cuda_sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL)
                 .map_err(|e| anyhow!("cuMemAllocManaged({size} bytes) failed: {e}"))?
         };
+        // Zero-initialize: CUDA managed memory is uninitialized by default.
+        // Many code paths assume buffers start at zero (KV cache, workspace, etc).
+        unsafe {
+            std::ptr::write_bytes(dev_ptr as *mut u8, 0, size);
+        }
         Ok(Self {
             dev_ptr,
             size,
@@ -121,6 +126,156 @@ impl Buffer for CudaBuffer {
     }
 
     /// This buffer is GPU-accessible.
+    fn is_gpu_buffer(&self) -> bool {
+        true
+    }
+}
+
+/// A CUDA pinned host memory buffer with GPU-mapped device pointer.
+///
+/// Uses `cuMemHostAlloc` with `CU_MEMHOSTALLOC_DEVICEMAP | CU_MEMHOSTALLOC_PORTABLE`
+/// to allocate page-locked host memory that is also GPU-accessible via a device pointer.
+/// On Jetson (UMA), the host and device pointers refer to the same physical DRAM.
+///
+/// Key properties:
+/// - `as_ptr()` returns the host pointer for zero-cost CPU access
+/// - `device_ptr()` returns the `CUdeviceptr` for cuBLAS/CUDA kernel calls
+/// - Drop calls `cuMemFreeHost` to release the allocation
+pub struct CudaHostBuffer {
+    /// CPU-accessible host pointer (page-locked).
+    host_ptr: *mut u8,
+    /// GPU-accessible device pointer (mapped from host_ptr).
+    dev_ptr: cuda_sys::CUdeviceptr,
+    /// Total allocation size in bytes.
+    size: usize,
+    /// Logical data type for this buffer.
+    dtype: DType,
+}
+
+// SAFETY: The underlying pinned memory with CU_MEMHOSTALLOC_PORTABLE is accessible
+// from any CUDA context and any CPU thread. Access synchronization is the caller's
+// responsibility (same as CudaBuffer and OpenCL zero-copy buffers).
+unsafe impl Send for CudaHostBuffer {}
+unsafe impl Sync for CudaHostBuffer {}
+
+impl CudaHostBuffer {
+    /// Allocate `size` bytes of pinned host memory with GPU mapping.
+    ///
+    /// Flags: `CU_MEMHOSTALLOC_DEVICEMAP` (GPU can access via device pointer)
+    ///      + `CU_MEMHOSTALLOC_PORTABLE` (accessible from any CUDA context).
+    ///
+    /// # Requirements
+    /// A CUDA context must be current on the calling thread.
+    pub fn new(size: usize, dtype: DType) -> Result<Self> {
+        if size == 0 {
+            return Err(anyhow!("CudaHostBuffer: cannot allocate 0 bytes"));
+        }
+
+        let flags = cuda_sys::CU_MEMHOSTALLOC_DEVICEMAP | cuda_sys::CU_MEMHOSTALLOC_PORTABLE;
+
+        // SAFETY: cuMemHostAlloc requires a valid CUDA context on the current thread.
+        // CudaBackend::new() ensures this. The returned pointer is uninitialized.
+        let host_ptr = unsafe {
+            cuda_result::malloc_host(size, flags)
+                .map_err(|e| anyhow!("cuMemHostAlloc({size} bytes) failed: {e}"))?
+        } as *mut u8;
+
+        // Get the device pointer mapped to this host allocation.
+        // SAFETY: host_ptr was just allocated with CU_MEMHOSTALLOC_DEVICEMAP,
+        // so cuMemHostGetDevicePointer_v2 is guaranteed to succeed.
+        let dev_ptr = {
+            let mut dptr: cuda_sys::CUdeviceptr = 0;
+            let result = unsafe {
+                cuda_sys::cuMemHostGetDevicePointer_v2(
+                    &mut dptr,
+                    host_ptr as *mut std::ffi::c_void,
+                    0,
+                )
+            };
+            if result != cuda_sys::CUresult::CUDA_SUCCESS {
+                // Clean up host allocation on failure
+                unsafe {
+                    let _ = cuda_result::free_host(host_ptr as *mut std::ffi::c_void);
+                }
+                return Err(anyhow!("cuMemHostGetDevicePointer_v2 failed: {:?}", result));
+            }
+            dptr
+        };
+
+        // Zero-initialize: pinned memory is uninitialized by default.
+        // Many code paths assume buffers start at zero (KV cache, workspace, etc).
+        unsafe {
+            std::ptr::write_bytes(host_ptr, 0, size);
+        }
+
+        Ok(Self {
+            host_ptr,
+            dev_ptr,
+            size,
+            dtype,
+        })
+    }
+
+    /// Return the raw `CUdeviceptr` for passing to cuBLAS/CUDA kernels.
+    pub fn device_ptr(&self) -> cuda_sys::CUdeviceptr {
+        self.dev_ptr
+    }
+}
+
+impl Drop for CudaHostBuffer {
+    fn drop(&mut self) {
+        // SAFETY: We own this allocation (created in new()) and only free it once (here in Drop).
+        // Any async work must have been synchronized before dropping.
+        unsafe {
+            let _ = cuda_result::free_host(self.host_ptr as *mut std::ffi::c_void);
+        }
+    }
+}
+
+impl Buffer for CudaHostBuffer {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    /// CPU-accessible host pointer (page-locked, zero-cost access).
+    fn as_ptr(&self) -> *const u8 {
+        self.host_ptr
+    }
+
+    /// Mutable CPU-accessible host pointer.
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.host_ptr
+    }
+
+    #[cfg(feature = "opencl")]
+    fn cl_mem(&self) -> Option<&ocl::core::Mem> {
+        None
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    fn cl_mem(&self) -> Option<()> {
+        None
+    }
+
+    /// On UMA (Jetson), host/device coherence is automatic for pinned memory.
+    fn sync_device(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Pinned memory is driver-managed, not eligible for madvise.
+    fn is_host_managed(&self) -> bool {
+        false
+    }
+
+    /// This buffer is GPU-accessible via its device pointer.
     fn is_gpu_buffer(&self) -> bool {
         true
     }

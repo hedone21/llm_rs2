@@ -153,6 +153,9 @@ impl TransformerLayer {
                 false
             };
 
+            // Use read_buffer path only when buffers are not CPU-accessible (device-only).
+            // UMA/pinned buffers (CUDA, OpenCL zero-copy) have valid as_ptr().
+            let is_device_only = is_gpu && q_rope.as_ptr().is_null();
             if !gpu_dispatched {
                 // CPU attention fallback
                 let mut out_vec = Vec::new();
@@ -167,7 +170,7 @@ impl TransformerLayer {
                     let mut k_vec = Vec::new();
                     let mut v_vec = Vec::new();
 
-                    let (q_data, k_data, v_data, out_ptr) = if is_gpu {
+                    let (q_data, k_data, v_data, out_ptr) = if is_device_only {
                         let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                             if t.dtype() == DType::Q4_0 {
                                 use crate::core::quant::{BlockQ4_0, QK4_0};
@@ -391,30 +394,44 @@ impl TransformerLayer {
                     }
                 }
 
-                #[cfg(feature = "opencl")]
-                if is_gpu {
-                    // Write CPU attention result directly to workspace GPU buffer.
-                    // Use partial write (out_vec may be smaller than ws.out_attn buffer).
+                if is_device_only {
+                    // Write CPU attention result back to workspace GPU buffer.
                     let out_bytes = unsafe {
                         std::slice::from_raw_parts(out_vec.as_ptr() as *const u8, out_vec.len() * 4)
                     };
-                    if let Ok(dst_mem) =
-                        crate::backend::opencl::get_cl_mem(ws.out_attn.buffer().as_ref())
-                    {
+                    let dst_ptr = ws.out_attn.as_mut_ptr();
+                    if !dst_ptr.is_null() {
+                        // UMA / pinned memory: direct memcpy is sufficient.
                         unsafe {
-                            ocl::core::enqueue_write_buffer(
-                                &backend
-                                    .as_any()
-                                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-                                    .unwrap()
-                                    .queue,
-                                dst_mem,
-                                true,
-                                0,
-                                out_bytes,
-                                None::<&ocl::core::Event>,
-                                None::<&mut ocl::core::Event>,
-                            )?;
+                            std::ptr::copy_nonoverlapping(
+                                out_bytes.as_ptr(),
+                                dst_ptr,
+                                out_bytes.len(),
+                            );
+                        }
+                    }
+                    #[cfg(feature = "opencl")]
+                    {
+                        // OpenCL device-only buffers need enqueue_write_buffer.
+                        if dst_ptr.is_null()
+                            && let Ok(dst_mem) =
+                                crate::backend::opencl::get_cl_mem(ws.out_attn.buffer().as_ref())
+                        {
+                            unsafe {
+                                ocl::core::enqueue_write_buffer(
+                                    &backend
+                                        .as_any()
+                                        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                                        .unwrap()
+                                        .queue,
+                                    dst_mem,
+                                    true,
+                                    0,
+                                    out_bytes,
+                                    None::<&ocl::core::Event>,
+                                    None::<&mut ocl::core::Event>,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -568,6 +585,7 @@ impl TransformerLayer {
             false
         };
 
+        let is_device_only2 = is_gpu && q_rope.as_ptr().is_null();
         if !gpu_dispatched {
             // ---- CPU flash attention path (also used as GPU fallback) ----
             let mut out_vec = Vec::new();
@@ -583,7 +601,7 @@ impl TransformerLayer {
                 let mut k_vec = Vec::new();
                 let mut v_vec = Vec::new();
 
-                let (q_data, k_data, v_data, out_ptr) = if is_gpu {
+                let (q_data, k_data, v_data, out_ptr) = if is_device_only2 {
                     let read_to_f32 = |t: &Tensor, vec: &mut Vec<f32>| -> Result<()> {
                         if t.dtype() == DType::Q4_0 {
                             use crate::core::quant::{BlockQ4_0, QK4_0};
@@ -796,7 +814,7 @@ impl TransformerLayer {
                 }
             }
 
-            if is_gpu {
+            if is_device_only2 {
                 // Create temp CPU tensor from result and copy back
                 // Using Galloc directly
                 let size_bytes = out_vec.len() * 4;
