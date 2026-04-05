@@ -204,6 +204,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     enable_resilience: bool,
 
+    /// Pre-allocate dual CPU/GPU buffers for zero-alloc SwitchHw.
+    /// Without this flag, only throttle/suspend directives work (no backend switch).
+    /// Enables: zero-copy KV memory + weight dual-access rewrap (increases RSS by ~model size).
+    #[arg(long, default_value_t = false)]
+    resilience_prealloc_switch: bool,
+
     /// Resilience signal transport: "dbus" or "unix:<path>"
     #[arg(long, default_value = "dbus")]
     resilience_transport: String,
@@ -451,8 +457,8 @@ fn main() -> anyhow::Result<()> {
             // When resilience is enabled, force zero-copy memory so KV cache uses
             // MadviseableGPUBuffer (host-accessible). This enables zero-alloc
             // UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
-            let effective_zero_copy = args.zero_copy || args.enable_resilience;
-            if !args.zero_copy && args.enable_resilience {
+            let effective_zero_copy = args.zero_copy || args.resilience_prealloc_switch;
+            if !args.zero_copy && args.resilience_prealloc_switch {
                 eprintln!("[Config] Forcing zero-copy memory for resilience SwitchHw support");
             }
             let gpu_mem: Arc<dyn Memory> =
@@ -516,9 +522,12 @@ fn main() -> anyhow::Result<()> {
     // GPU→CPU SwitchHw. Default OpenCLBuffer (device-only) has as_ptr()=null —
     // CpuBackend can't read them. Re-wrap as ClWrappedBuffer (CL_MEM_USE_HOST_PTR).
     #[cfg(feature = "opencl")]
-    if is_gpu && args.enable_resilience {
+    if is_gpu && args.resilience_prealloc_switch {
         match model.rewrap_weights_for_dual_access(&backend) {
-            Ok(n) if n > 0 => eprintln!("[Backend] Re-wrapped {} weight tensors for dual CPU/GPU access", n),
+            Ok(n) if n > 0 => eprintln!(
+                "[Backend] Re-wrapped {} weight tensors for dual CPU/GPU access",
+                n
+            ),
             Ok(_) => {} // All weights already CPU-accessible
             Err(e) => eprintln!("[Backend] Weight re-wrap failed (switch may crash): {}", e),
         }
@@ -1669,33 +1678,46 @@ fn main() -> anyhow::Result<()> {
         // Both sets (GPU active + CPU spare) stay alive for the process lifetime,
         // enabling instant swap without allocation/deallocation during switch.
         // This prevents Samsung LMKD from killing the process due to RSS spike.
-        let (mut spare_logits, mut spare_xgen, mut spare_gen_ws, mut spare_gen_input) = if is_gpu {
-            let cpu_lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
-            let cpu_xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
-            let cpu_gi = cpu_memory_arc.alloc(4, DType::U8)?;
-            eprintln!("[Switch] Pre-allocated CPU spare buffers for zero-alloc SwitchHw");
-            (
-                Some(Tensor::new(Shape::new(vec![1, 1, vocab_size]), cpu_lb, cpu_backend_arc.clone())),
-                Some(Tensor::new(Shape::new(vec![1, 1, hidden_size]), cpu_xb, cpu_backend_arc.clone())),
-                Some(LayerWorkspace::new(
-                    WorkspaceConfig {
-                        batch_size: 1,
-                        dim: model.config.hidden_size,
-                        q_dim,
-                        k_dim,
-                        v_dim,
-                        ffn_hidden,
-                        n_heads: model.config.num_attention_heads,
-                        max_seq_len: args.max_seq_len,
-                    },
-                    cpu_memory_arc.as_ref(),
-                    cpu_backend_arc.clone(),
-                )?),
-                Some(Tensor::new(Shape::new(vec![1, 1]), cpu_gi, cpu_backend_arc.clone())),
-            )
-        } else {
-            (None, None, None, None)
-        };
+        let (mut spare_logits, mut spare_xgen, mut spare_gen_ws, mut spare_gen_input) =
+            if is_gpu && args.resilience_prealloc_switch {
+                let cpu_lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
+                let cpu_xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
+                let cpu_gi = cpu_memory_arc.alloc(4, DType::U8)?;
+                eprintln!("[Switch] Pre-allocated CPU spare buffers for zero-alloc SwitchHw");
+                (
+                    Some(Tensor::new(
+                        Shape::new(vec![1, 1, vocab_size]),
+                        cpu_lb,
+                        cpu_backend_arc.clone(),
+                    )),
+                    Some(Tensor::new(
+                        Shape::new(vec![1, 1, hidden_size]),
+                        cpu_xb,
+                        cpu_backend_arc.clone(),
+                    )),
+                    Some(LayerWorkspace::new(
+                        WorkspaceConfig {
+                            batch_size: 1,
+                            dim: model.config.hidden_size,
+                            q_dim,
+                            k_dim,
+                            v_dim,
+                            ffn_hidden,
+                            n_heads: model.config.num_attention_heads,
+                            max_seq_len: args.max_seq_len,
+                        },
+                        cpu_memory_arc.as_ref(),
+                        cpu_backend_arc.clone(),
+                    )?),
+                    Some(Tensor::new(
+                        Shape::new(vec![1, 1]),
+                        cpu_gi,
+                        cpu_backend_arc.clone(),
+                    )),
+                )
+            } else {
+                (None, None, None, None)
+            };
 
         // Streaming setup
         use std::io::Write;
@@ -2357,81 +2379,93 @@ fn main() -> anyhow::Result<()> {
                     if let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc) {
                         match device.as_str() {
                             "cpu" if is_gpu => {
-                                eprintln!(
-                                    "[Switch] Resilience: GPU→CPU at token {}",
-                                    kv_caches[0].current_pos
-                                );
-                                llm_rs2::core::kv_migrate::migrate_kv_caches(
-                                    &mut kv_caches,
-                                    &backend,
-                                    &cpu_backend_arc,
-                                    &cpu_backend_arc,
-                                    &cpu_memory_arc,
-                                    &cpu_memory_arc,
-                                    kv_heads,
-                                    head_dim,
-                                    max_seq_len,
-                                    false,
-                                )?;
-                                backend = cpu_backend_arc.clone();
-                                // Zero-alloc swap: exchange active GPU buffers with
-                                // pre-allocated CPU spares. GPU buffers survive in spare_*
-                                // (no clReleaseMemObject, no RSS spike).
-                                if let (Some(sl), Some(sx), Some(sw), Some(si)) = (
-                                    spare_logits.as_mut(),
-                                    spare_xgen.as_mut(),
-                                    spare_gen_ws.as_mut(),
-                                    spare_gen_input.as_mut(),
-                                ) {
-                                    std::mem::swap(&mut logits, sl);
-                                    std::mem::swap(&mut x_gen, sx);
-                                    std::mem::swap(&mut gen_ws, sw);
-                                    std::mem::swap(&mut gen_input_tensor, si);
+                                if spare_logits.is_none() {
+                                    eprintln!(
+                                        "[Switch] ERROR: SwitchHw requires --resilience-prealloc-switch flag. Ignoring directive."
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[Switch] Resilience: GPU→CPU at token {}",
+                                        kv_caches[0].current_pos
+                                    );
+                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                        &mut kv_caches,
+                                        &backend,
+                                        &cpu_backend_arc,
+                                        &cpu_backend_arc,
+                                        &cpu_memory_arc,
+                                        &cpu_memory_arc,
+                                        kv_heads,
+                                        head_dim,
+                                        max_seq_len,
+                                        false,
+                                    )?;
+                                    backend = cpu_backend_arc.clone();
+                                    // Zero-alloc swap: exchange active GPU buffers with
+                                    // pre-allocated CPU spares. GPU buffers survive in spare_*
+                                    // (no clReleaseMemObject, no RSS spike).
+                                    if let (Some(sl), Some(sx), Some(sw), Some(si)) = (
+                                        spare_logits.as_mut(),
+                                        spare_xgen.as_mut(),
+                                        spare_gen_ws.as_mut(),
+                                        spare_gen_input.as_mut(),
+                                    ) {
+                                        std::mem::swap(&mut logits, sl);
+                                        std::mem::swap(&mut x_gen, sx);
+                                        std::mem::swap(&mut gen_ws, sw);
+                                        std::mem::swap(&mut gen_input_tensor, si);
+                                    }
+                                    #[cfg(feature = "opencl")]
+                                    {
+                                        gpu_plan = None;
+                                    }
+                                    is_gpu = false;
+                                    eprintln!("[Switch] Resilience: Switched to CPU (zero-alloc).");
                                 }
-                                #[cfg(feature = "opencl")]
-                                {
-                                    gpu_plan = None;
-                                }
-                                is_gpu = false;
-                                eprintln!("[Switch] Resilience: Switched to CPU (zero-alloc).");
                             }
                             "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
-                                eprintln!(
-                                    "[Switch] Resilience: CPU→GPU at token {}",
-                                    kv_caches[0].current_pos
-                                );
-                                llm_rs2::core::kv_migrate::migrate_kv_caches(
-                                    &mut kv_caches,
-                                    &backend,
-                                    gpu_be,
-                                    &cpu_backend_arc,
-                                    &cpu_memory_arc,
-                                    gpu_mem,
-                                    kv_heads,
-                                    head_dim,
-                                    max_seq_len,
-                                    true,
-                                )?;
-                                backend = gpu_be.clone();
-                                // Zero-alloc swap: exchange active CPU buffers with
-                                // spare GPU buffers (preserved from previous switch).
-                                if let (Some(sl), Some(sx), Some(sw), Some(si)) = (
-                                    spare_logits.as_mut(),
-                                    spare_xgen.as_mut(),
-                                    spare_gen_ws.as_mut(),
-                                    spare_gen_input.as_mut(),
-                                ) {
-                                    std::mem::swap(&mut logits, sl);
-                                    std::mem::swap(&mut x_gen, sx);
-                                    std::mem::swap(&mut gen_ws, sw);
-                                    std::mem::swap(&mut gen_input_tensor, si);
+                                if spare_logits.is_none() {
+                                    eprintln!(
+                                        "[Switch] ERROR: SwitchHw requires --resilience-prealloc-switch flag. Ignoring directive."
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[Switch] Resilience: CPU→GPU at token {}",
+                                        kv_caches[0].current_pos
+                                    );
+                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                        &mut kv_caches,
+                                        &backend,
+                                        gpu_be,
+                                        &cpu_backend_arc,
+                                        &cpu_memory_arc,
+                                        gpu_mem,
+                                        kv_heads,
+                                        head_dim,
+                                        max_seq_len,
+                                        true,
+                                    )?;
+                                    backend = gpu_be.clone();
+                                    // Zero-alloc swap: exchange active CPU buffers with
+                                    // spare GPU buffers (preserved from previous switch).
+                                    if let (Some(sl), Some(sx), Some(sw), Some(si)) = (
+                                        spare_logits.as_mut(),
+                                        spare_xgen.as_mut(),
+                                        spare_gen_ws.as_mut(),
+                                        spare_gen_input.as_mut(),
+                                    ) {
+                                        std::mem::swap(&mut logits, sl);
+                                        std::mem::swap(&mut x_gen, sx);
+                                        std::mem::swap(&mut gen_ws, sw);
+                                        std::mem::swap(&mut gen_input_tensor, si);
+                                    }
+                                    #[cfg(feature = "opencl")]
+                                    {
+                                        gpu_plan = None;
+                                    }
+                                    is_gpu = true;
+                                    eprintln!("[Switch] Resilience: Switched to GPU (zero-alloc).");
                                 }
-                                #[cfg(feature = "opencl")]
-                                {
-                                    gpu_plan = None;
-                                }
-                                is_gpu = true;
-                                eprintln!("[Switch] Resilience: Switched to GPU (zero-alloc).");
                             }
                             "gpu" | "opencl" if !is_gpu && !weights_on_gpu => {
                                 eprintln!(
