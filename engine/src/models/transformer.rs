@@ -799,6 +799,106 @@ impl TransformerModel {
         Ok(count)
     }
 
+    /// Re-wrap GPU-only weight buffers as dual-access ClWrappedBuffer.
+    ///
+    /// When `--backend opencl` with `use_zero_copy=false` (default), weights are in
+    /// OpenCLBuffer (device-only: `as_ptr()` = null). After a GPU→CPU SwitchHw, the
+    /// CPU backend needs `as_ptr()` to read weights.
+    ///
+    /// This method reads each GPU-only weight to a CPU buffer (Galloc) and wraps it
+    /// with CL_MEM_USE_HOST_PTR, making it accessible from both CPU and GPU.
+    /// On ARM UMA (Adreno), this is zero additional memory: same physical DRAM.
+    ///
+    /// Call at startup when resilience is enabled and backend is GPU.
+    #[cfg(feature = "opencl")]
+    pub fn rewrap_weights_for_dual_access(
+        &mut self,
+        gpu_backend: &Arc<dyn Backend>,
+    ) -> Result<usize> {
+        let ocl_context = gpu_backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .map(|be| be.context.clone())
+            .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+
+        let cpu_memory = crate::memory::galloc::Galloc::new();
+        let mut count = 0;
+
+        let rewrap_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<Tensor> {
+            // Skip if already CPU-accessible (ClWrappedBuffer, MadviseableGPUBuffer, etc.)
+            if !t.buffer().as_ptr().is_null() {
+                return Ok(t.clone());
+            }
+            // Read GPU data to CPU buffer
+            let cpu_buf = cpu_memory.alloc(t.size(), t.dtype())?;
+            let dst = unsafe {
+                std::slice::from_raw_parts_mut(cpu_buf.as_mut_ptr(), t.size())
+            };
+            be.read_buffer(t, dst)?;
+            // Wrap CPU buffer with CL handle for GPU access
+            let dual_buf: Arc<dyn Buffer> = Arc::new(
+                crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
+                    &ocl_context,
+                    cpu_buf,
+                    t.dtype(),
+                )?,
+            );
+            Ok(Tensor::new(t.shape().clone(), dual_buf, be.clone()))
+        };
+
+        macro_rules! rewrap {
+            ($t:expr) => {
+                let new = rewrap_one(&$t, gpu_backend)?;
+                if !std::ptr::eq($t.buffer().as_ref(), new.buffer().as_ref()) {
+                    $t = new;
+                    count += 1;
+                }
+            };
+        }
+        for layer in &mut self.layers {
+            rewrap!(layer.wq);
+            rewrap!(layer.wk);
+            rewrap!(layer.wv);
+            rewrap!(layer.wo);
+            rewrap!(layer.w_gate);
+            rewrap!(layer.w_up);
+            rewrap!(layer.w_down);
+            rewrap!(layer.attention_norm);
+            rewrap!(layer.ffn_norm);
+            if let Some(ref mut bias) = layer.qkv_bias {
+                rewrap!(bias.bq);
+                rewrap!(bias.bk);
+                rewrap!(bias.bv);
+            }
+            if let Some(ref t) = layer.q_norm {
+                layer.q_norm = Some(rewrap_one(t, gpu_backend)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.k_norm {
+                layer.k_norm = Some(rewrap_one(t, gpu_backend)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.pre_ffn_norm {
+                layer.pre_ffn_norm = Some(rewrap_one(t, gpu_backend)?);
+                count += 1;
+            }
+            if let Some(ref t) = layer.post_ffn_norm {
+                layer.post_ffn_norm = Some(rewrap_one(t, gpu_backend)?);
+                count += 1;
+            }
+        }
+        rewrap!(self.norm);
+        if !self.lm_head_on_cpu {
+            rewrap!(self.lm_head);
+        }
+        // embed_tokens: check gpu_embed_tokens first
+        if let Some(ref t) = self.gpu_embed_tokens {
+            self.gpu_embed_tokens = Some(rewrap_one(t, gpu_backend)?);
+            count += 1;
+        }
+        Ok(count)
+    }
+
     /// Migrate all model weight tensors to CUDA pinned host memory (CudaHostBuffer).
     ///
     /// Uses `Backend::copy_from()` to allocate pinned memory and memcpy weight data.

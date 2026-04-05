@@ -48,12 +48,18 @@ pub fn migrate_kv_caches(
     copy_to_dst: bool,
 ) -> Result<()> {
     let is_uma = src_backend.is_gpu() && !src_backend.is_discrete_gpu();
+    // Check first KV cache to see if buffers are host-accessible.
+    // All caches use the same allocator, so one check suffices.
+    let host_accessible = is_uma
+        && kv_caches
+            .first()
+            .is_some_and(|kv| !kv.k_buffer.as_ptr().is_null());
 
     for kv in kv_caches.iter_mut() {
         let current_capacity = kv.capacity();
         let saved_pos = kv.current_pos;
 
-        let (k_final, v_final) = if is_uma {
+        let (k_final, v_final) = if host_accessible {
             // UMA zero-copy path: reuse existing buffer, just swap backend tag.
             // MadviseableGPUBuffer.as_ptr() returns host_data.as_ptr() which is
             // directly CPU-accessible. No alloc, no copy.
@@ -123,7 +129,7 @@ pub fn migrate_kv_caches(
     eprintln!(
         "[KV Migrate] {} layers migrated ({})",
         kv_caches.len(),
-        if is_uma { "UMA zero-copy re-tag" } else { "discrete GPU copy" }
+        if host_accessible { "UMA zero-copy re-tag" } else { "GPU→CPU copy" }
     );
     Ok(())
 }

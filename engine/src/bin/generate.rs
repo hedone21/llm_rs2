@@ -505,6 +505,18 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // When GPU primary + resilience enabled: ensure weights are CPU-accessible for
+    // GPU→CPU SwitchHw. Default OpenCLBuffer (device-only) has as_ptr()=null —
+    // CpuBackend can't read them. Re-wrap as ClWrappedBuffer (CL_MEM_USE_HOST_PTR).
+    #[cfg(feature = "opencl")]
+    if is_gpu && args.enable_resilience {
+        match model.rewrap_weights_for_dual_access(&backend) {
+            Ok(n) if n > 0 => eprintln!("[Backend] Re-wrapped {} weight tensors for dual CPU/GPU access", n),
+            Ok(_) => {} // All weights already CPU-accessible
+            Err(e) => eprintln!("[Backend] Weight re-wrap failed (switch may crash): {}", e),
+        }
+    }
+
     // CUDA: migrate weights to pinned host memory for cuBLAS access.
     // Unlike OpenCL (CL_MEM_USE_HOST_PTR zero-copy wrap), CUDA requires a memcpy into
     // cuMemHostAlloc'd buffers to get device pointers for cuBLAS.
@@ -1646,6 +1658,38 @@ fn main() -> anyhow::Result<()> {
         let mut gen_input_tensor =
             Tensor::new(Shape::new(vec![1, 1]), gpu_gen_input_buf, backend.clone());
 
+        // Pre-allocate CPU spare decode buffers for zero-alloc GPU→CPU SwitchHw.
+        // Both sets (GPU active + CPU spare) stay alive for the process lifetime,
+        // enabling instant swap without allocation/deallocation during switch.
+        // This prevents Samsung LMKD from killing the process due to RSS spike.
+        let (mut spare_logits, mut spare_xgen, mut spare_gen_ws, mut spare_gen_input) = if is_gpu {
+            let cpu_lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
+            let cpu_xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
+            let cpu_gi = cpu_memory_arc.alloc(4, DType::U8)?;
+            eprintln!("[Switch] Pre-allocated CPU spare buffers for zero-alloc SwitchHw");
+            (
+                Some(Tensor::new(Shape::new(vec![1, 1, vocab_size]), cpu_lb, cpu_backend_arc.clone())),
+                Some(Tensor::new(Shape::new(vec![1, 1, hidden_size]), cpu_xb, cpu_backend_arc.clone())),
+                Some(LayerWorkspace::new(
+                    WorkspaceConfig {
+                        batch_size: 1,
+                        dim: model.config.hidden_size,
+                        q_dim,
+                        k_dim,
+                        v_dim,
+                        ffn_hidden,
+                        n_heads: model.config.num_attention_heads,
+                        max_seq_len: args.max_seq_len,
+                    },
+                    cpu_memory_arc.as_ref(),
+                    cpu_backend_arc.clone(),
+                )?),
+                Some(Tensor::new(Shape::new(vec![1, 1]), cpu_gi, cpu_backend_arc.clone())),
+            )
+        } else {
+            (None, None, None, None)
+        };
+
         // Streaming setup
         use std::io::Write;
         let mut stdout = std::io::stdout();
@@ -1791,11 +1835,15 @@ fn main() -> anyhow::Result<()> {
             let used_plan = false;
 
             if !used_plan {
-                // Use GPU memory when on GPU; otherwise use the primary memory.
+                // Use GPU memory when on GPU; CPU memory when on CPU.
+                // After SwitchHw GPU→CPU, `memory` is still OpenCL memory whose
+                // alloc() creates OpenCLBuffer (null as_ptr). We must use
+                // cpu_memory_arc to ensure lazy allocations (e.g. k_cast/v_cast)
+                // produce CPU-accessible buffers.
                 let effective_mem: &dyn Memory = if is_gpu {
                     gpu_memory_arc.as_deref().unwrap_or_else(|| memory.as_ref())
                 } else {
-                    memory.as_ref()
+                    cpu_memory_arc.as_ref()
                 };
                 model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
@@ -2318,54 +2366,27 @@ fn main() -> anyhow::Result<()> {
                                     max_seq_len,
                                     false,
                                 )?;
-                                // Keep old GPU buffers alive to avoid clReleaseMemObject
-                                // during concurrent GPU workload (prevents Adreno driver race).
-                                let _keep_gpu_logits = logits.buffer().clone();
-                                let _keep_gpu_xgen = x_gen.buffer().clone();
-                                let _keep_gpu_gi = gen_input_tensor.buffer().clone();
-                                let _keep_gpu_ws = gen_ws.take_buffers();
-
                                 backend = cpu_backend_arc.clone();
-                                let lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
-                                logits = Tensor::new(
-                                    Shape::new(vec![1, 1, vocab_size]),
-                                    lb,
-                                    backend.clone(),
-                                );
-                                let xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
-                                x_gen = Tensor::new(
-                                    Shape::new(vec![1, 1, hidden_size]),
-                                    xb,
-                                    backend.clone(),
-                                );
-                                gen_ws = LayerWorkspace::new(
-                                    WorkspaceConfig {
-                                        batch_size: 1,
-                                        dim: model.config.hidden_size,
-                                        q_dim,
-                                        k_dim,
-                                        v_dim,
-                                        ffn_hidden,
-                                        n_heads: model.config.num_attention_heads,
-                                        max_seq_len: args.max_seq_len,
-                                    },
-                                    cpu_memory_arc.as_ref(),
-                                    backend.clone(),
-                                )?;
-                                let gi_buf = cpu_memory_arc.alloc(4, DType::U8)?;
-                                gen_input_tensor =
-                                    Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
-                                // Leak: prevent CL buffer deallocation while game uses GPU
-                                std::mem::forget(_keep_gpu_logits);
-                                std::mem::forget(_keep_gpu_xgen);
-                                std::mem::forget(_keep_gpu_gi);
-                                std::mem::forget(_keep_gpu_ws);
+                                // Zero-alloc swap: exchange active GPU buffers with
+                                // pre-allocated CPU spares. GPU buffers survive in spare_*
+                                // (no clReleaseMemObject, no RSS spike).
+                                if let (Some(sl), Some(sx), Some(sw), Some(si)) = (
+                                    spare_logits.as_mut(),
+                                    spare_xgen.as_mut(),
+                                    spare_gen_ws.as_mut(),
+                                    spare_gen_input.as_mut(),
+                                ) {
+                                    std::mem::swap(&mut logits, sl);
+                                    std::mem::swap(&mut x_gen, sx);
+                                    std::mem::swap(&mut gen_ws, sw);
+                                    std::mem::swap(&mut gen_input_tensor, si);
+                                }
                                 #[cfg(feature = "opencl")]
                                 {
                                     gpu_plan = None;
                                 }
                                 is_gpu = false;
-                                eprintln!("[Switch] Resilience: Switched to CPU.");
+                                eprintln!("[Switch] Resilience: Switched to CPU (zero-alloc).");
                             }
                             "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
                                 eprintln!(
@@ -2385,42 +2406,25 @@ fn main() -> anyhow::Result<()> {
                                     true,
                                 )?;
                                 backend = gpu_be.clone();
-                                let lb = gpu_mem.alloc(vocab_size * 4, DType::F32)?;
-                                logits = Tensor::new(
-                                    Shape::new(vec![1, 1, vocab_size]),
-                                    lb,
-                                    backend.clone(),
-                                );
-                                let xb = gpu_mem.alloc(hidden_size * 4, DType::F32)?;
-                                x_gen = Tensor::new(
-                                    Shape::new(vec![1, 1, hidden_size]),
-                                    xb,
-                                    backend.clone(),
-                                );
-                                gen_ws = LayerWorkspace::new(
-                                    WorkspaceConfig {
-                                        batch_size: 1,
-                                        dim: model.config.hidden_size,
-                                        q_dim,
-                                        k_dim,
-                                        v_dim,
-                                        ffn_hidden,
-                                        n_heads: model.config.num_attention_heads,
-                                        max_seq_len: args.max_seq_len,
-                                    },
-                                    gpu_mem.as_ref(),
-                                    backend.clone(),
-                                )?;
+                                // Zero-alloc swap: exchange active CPU buffers with
+                                // spare GPU buffers (preserved from previous switch).
+                                if let (Some(sl), Some(sx), Some(sw), Some(si)) = (
+                                    spare_logits.as_mut(),
+                                    spare_xgen.as_mut(),
+                                    spare_gen_ws.as_mut(),
+                                    spare_gen_input.as_mut(),
+                                ) {
+                                    std::mem::swap(&mut logits, sl);
+                                    std::mem::swap(&mut x_gen, sx);
+                                    std::mem::swap(&mut gen_ws, sw);
+                                    std::mem::swap(&mut gen_input_tensor, si);
+                                }
                                 #[cfg(feature = "opencl")]
                                 {
                                     gpu_plan = None;
                                 }
-                                // Re-allocate gen_input_tensor on new GPU backend
-                                let gi_buf = gpu_mem.alloc(4, DType::U8)?;
-                                gen_input_tensor =
-                                    Tensor::new(Shape::new(vec![1, 1]), gi_buf, backend.clone());
                                 is_gpu = true;
-                                eprintln!("[Switch] Resilience: Switched to GPU.");
+                                eprintln!("[Switch] Resilience: Switched to GPU (zero-alloc).");
                             }
                             "gpu" | "opencl" if !is_gpu && !weights_on_gpu => {
                                 eprintln!(
