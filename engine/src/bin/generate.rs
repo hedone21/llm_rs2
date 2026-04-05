@@ -448,11 +448,18 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "opencl")]
         "opencl" | "gpu" => {
             let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
+            // When resilience is enabled, force zero-copy memory so KV cache uses
+            // MadviseableGPUBuffer (host-accessible). This enables zero-alloc
+            // UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
+            let effective_zero_copy = args.zero_copy || args.enable_resilience;
+            if !args.zero_copy && args.enable_resilience {
+                eprintln!("[Config] Forcing zero-copy memory for resilience SwitchHw support");
+            }
             let gpu_mem: Arc<dyn Memory> =
                 Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
                     gpu_concrete.context.clone(),
                     gpu_concrete.queue.clone(),
-                    args.zero_copy,
+                    effective_zero_copy,
                 ));
             let gpu: Arc<dyn Backend> = gpu_concrete;
             // GPU is primary; keep a ref as secondary for SwitchHw round-trip
