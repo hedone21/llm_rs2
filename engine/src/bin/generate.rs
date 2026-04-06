@@ -1493,7 +1493,14 @@ fn main() -> anyhow::Result<()> {
                         process_len * vocab_size * 4,
                     )
                 };
-                let prefill_logits_buf = memory.alloc(prefill_logits_buf_size, DType::F32)?;
+                // Use CPU memory when on CPU after SwitchHw; GPU memory otherwise.
+                let batch_effective_mem: &dyn Memory = if is_gpu {
+                    memory.as_ref()
+                } else {
+                    cpu_memory_arc.as_ref()
+                };
+                let prefill_logits_buf =
+                    batch_effective_mem.alloc(prefill_logits_buf_size, DType::F32)?;
                 let mut prefill_logits =
                     Tensor::new(prefill_logits_shape, prefill_logits_buf, backend.clone());
 
@@ -1523,7 +1530,7 @@ fn main() -> anyhow::Result<()> {
                         start_pos: chunk_start,
                         kv_caches: &mut kv_caches,
                         backend: &backend,
-                        memory: memory.as_ref(),
+                        memory: batch_effective_mem,
                         logits_out: &mut prefill_logits,
                         x_gen: None,
                         workspace: None,
@@ -1773,12 +1780,23 @@ fn main() -> anyhow::Result<()> {
                     })?;
 
                     let decode_start = std::time::Instant::now();
+                    // Use CPU memory when on CPU; GPU memory otherwise.
+                    // After SwitchHw GPU→CPU, `memory` is still OpenCL memory whose
+                    // alloc() creates OpenCLBuffer (null as_ptr). Must use
+                    // cpu_memory_arc for CPU-accessible lazy allocations.
+                    let effective_mem: &dyn Memory = if is_gpu {
+                        gpu_memory_arc
+                            .as_deref()
+                            .unwrap_or_else(|| memory.as_ref())
+                    } else {
+                        cpu_memory_arc.as_ref()
+                    };
                     model.forward_into(TransformerModelForwardArgs {
                         input_tokens: &gen_input_tensor,
                         start_pos: batch_start_pos,
                         kv_caches: &mut kv_caches,
                         backend: &backend,
-                        memory: memory.as_ref(),
+                        memory: effective_mem,
                         logits_out: &mut logits,
                         x_gen: Some(&mut x_gen),
                         workspace: Some(&mut gen_ws),
