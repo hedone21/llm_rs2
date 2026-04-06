@@ -913,7 +913,10 @@ impl TransformerLayer {
             backend.synchronize()?;
 
             // 4. Merge: concat [gpu_part | cpu_part] → full gate/up buffers.
-            // UnifiedBuffer::as_ptr() is null, so use read_buffer/write_buffer.
+            // GPU parts require read_buffer() for ARM cache coherency (direct
+            // as_ptr() reads stale data after GPU kernel writes).
+            // CPU parts use as_ptr() (SharedBuffer, always valid).
+            // ws.gate/ws.up use write_buffer() (may be UnifiedBuffer).
             {
                 let gpu_bytes = pw.gate_gpu.size();
                 let cpu_bytes = pw.gate_cpu.size();

@@ -1,5 +1,5 @@
 use crate::core::backend::Backend;
-use crate::core::buffer::DType;
+use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
@@ -207,14 +207,17 @@ impl PartitionWorkspace {
     ///
     /// `split_row`: number of output rows handled by GPU.
     /// `out_dim`: total output dimension of gate/up projections.
-    /// `memory`: allocator for buffer creation.
+    /// `dim`: hidden dimension (for residual_cpu).
+    /// `gpu_alloc`: allocator closure for GPU-side buffers. Caller decides the
+    ///              concrete buffer type (MadviseableGPUBuffer for zero-copy,
+    ///              UnifiedBuffer for standard OpenCL, CudaHostBuffer for CUDA, etc.).
     /// `gpu_backend`: backend for GPU-side tensors.
     /// `cpu_backend`: backend for CPU-side tensors.
     pub fn new(
         split_row: usize,
         out_dim: usize,
         dim: usize,
-        memory: &dyn Memory,
+        gpu_alloc: &dyn Fn(usize, DType) -> Result<Arc<dyn Buffer>>,
         gpu_backend: Arc<dyn Backend>,
         cpu_backend: Arc<dyn Backend>,
     ) -> Result<Self> {
@@ -223,9 +226,9 @@ impl PartitionWorkspace {
         let cpu_rows = out_dim - split_row;
         let cpu_mem = Galloc::new();
 
-        let gate_gpu_buf = memory.alloc(split_row * 4, DType::F32)?;
+        let gate_gpu_buf = gpu_alloc(split_row * 4, DType::F32)?;
         let gate_cpu_buf = cpu_mem.alloc(cpu_rows * 4, DType::F32)?;
-        let up_gpu_buf = memory.alloc(split_row * 4, DType::F32)?;
+        let up_gpu_buf = gpu_alloc(split_row * 4, DType::F32)?;
         let up_cpu_buf = cpu_mem.alloc(cpu_rows * 4, DType::F32)?;
 
         Ok(Self {

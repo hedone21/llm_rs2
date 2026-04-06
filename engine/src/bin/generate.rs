@@ -384,6 +384,41 @@ struct Args {
     max_iterations: usize,
 }
 
+/// Create a GPU buffer allocator for tensor partition workspace.
+///
+/// On OpenCL: allocates `MadviseableGPUBuffer` (CL_MEM_USE_HOST_PTR) so that
+/// `as_ptr()`/`as_mut_ptr()` always return valid host pointers while `cl_mem()`
+/// remains valid for GPU kernels.  This enables zero-copy merge in the
+/// partition forward path (no read_buffer/write_buffer round-trips).
+///
+/// On other backends (CPU, CUDA): falls back to `memory.alloc()` which already
+/// returns host-accessible buffers (SharedBuffer, CudaHostBuffer).
+fn make_partition_gpu_alloc<'a>(
+    backend: &'a dyn Backend,
+    memory: &'a dyn Memory,
+) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> + 'a {
+    // Try to extract OpenCL context for MadviseableGPUBuffer allocation.
+    #[cfg(feature = "opencl")]
+    let ocl_ctx: Option<ocl::Context> = backend
+        .as_any()
+        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+        .map(|b| b.context.clone());
+
+    #[cfg(not(feature = "opencl"))]
+    let _ = backend; // suppress unused warning
+
+    move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> {
+        #[cfg(feature = "opencl")]
+        if let Some(ref ctx) = ocl_ctx {
+            let buf = llm_rs2::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer::new(
+                ctx, size, dtype,
+            )?;
+            return Ok(Arc::new(buf));
+        }
+        memory.alloc(size, dtype)
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init();
 
@@ -1436,13 +1471,16 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         )?;
 
-        // Attach partition workspace if tensor partition is active
+        // Attach partition workspace if tensor partition is active.
+        // Use MadviseableGPUBuffer (host-accessible + GPU-accessible) for partition
+        // buffers so merge can use direct pointer access instead of read_buffer/write_buffer.
         if let Some(ref ctx) = model.layers[0].partition_ctx {
+            let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx.gate.split_row,
                 ffn_hidden,
                 hidden_size,
-                memory.as_ref(),
+                &gpu_alloc,
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?);
@@ -2363,13 +2401,15 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         )?;
 
-        // Attach partition workspace if tensor partition is active
+        // Attach partition workspace if tensor partition is active.
+        // Use MadviseableGPUBuffer for zero-copy merge (see batch path above).
         if let Some(ref ctx) = model.layers[0].partition_ctx {
+            let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx.gate.split_row,
                 ffn_hidden,
                 hidden_size,
-                memory.as_ref(),
+                &gpu_alloc,
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?);
