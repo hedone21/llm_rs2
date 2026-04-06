@@ -930,3 +930,372 @@ Phase B — Calibration + Manager 연동
 | Lua action type 추가 | `spec/22-manager-algorithms.md` | "set_gpu_budget" Lua action type 정의 | MGR-ALG 신규 |
 
 **판정 근거**: 새 프로토콜 메시지(MSG-042), 기존 메시지 확장(MSG-067), 새 알고리즘(calibration/controller)은 모두 spec 변경 대상이다. 단순 코드 리팩토링이나 성능 최적화가 아닌 새 인터페이스 추가이므로 spec 변경이 불가피하다.
+
+---
+
+## 13. CUDA 지원 설계
+
+> **상태**: Draft  
+> **작성**: 2026-04-06  
+> **대상**: Jetson UMA (SM >= 7.2) — cuMemHostAlloc zero-copy  
+> **전제**: Phase A (수동 ratio)가 OpenCL에서 구현 완료 상태
+
+### 13.1 CUDA 메모리 모델 분석
+
+#### 13.1.1 버퍼 타입 (코드 근거: `engine/src/buffer/cuda_buffer.rs`)
+
+CUDA 백엔드는 두 가지 버퍼 타입을 제공한다:
+
+| 타입 | 할당 API | `as_ptr()` 반환 | `device_ptr()` | 용도 |
+|------|---------|----------------|----------------|------|
+| `CudaBuffer` | `cuMemAllocManaged` (CU_MEM_ATTACH_GLOBAL) | `dev_ptr as *const u8` (UMA에서만 유효) | `dev_ptr` | 현재 미사용 (Phase 1 잔존) |
+| `CudaHostBuffer` | `cuMemHostAlloc` (DEVICEMAP + PORTABLE) | `host_ptr` (항상 유효한 page-locked host pointer) | `cuMemHostGetDevicePointer_v2` 결과 | **실제 사용**: CudaMemory::alloc(), CudaBackend::copy_from() |
+
+**핵심**: `CudaHostBuffer`는 OpenCL의 `CL_MEM_ALLOC_HOST_PTR` (zero-copy)과 동등한 의미를 가진다.
+- `as_ptr()` → CPU에서 직접 읽기/쓰기 가능한 host pointer
+- `device_ptr()` → cuBLAS/CUDA 커널에 전달할 수 있는 device pointer
+- Jetson UMA에서 host_ptr과 dev_ptr은 동일 물리 DRAM을 가리킴 (zero-copy)
+
+#### 13.1.2 CudaMemory 할당자 (코드 근거: `engine/src/backend/cuda/memory.rs`)
+
+```rust
+impl Memory for CudaMemory {
+    fn alloc(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
+        let buf = CudaHostBuffer::new(size, dtype)?;  // 항상 CudaHostBuffer
+        Ok(Arc::new(buf))
+    }
+}
+```
+
+모든 workspace 버퍼(`gate`, `up`, `residual` 등)가 `CudaHostBuffer`로 할당되므로,
+OpenCL과 달리 별도의 `zero_copy` 플래그가 불필요하다.
+**모든 CUDA 버퍼가 본질적으로 zero-copy이다**.
+
+#### 13.1.3 migrate_weights_to_cuda() (코드 근거: `engine/src/models/transformer.rs` L938~1008)
+
+```rust
+let migrate_one = |t: &Tensor| -> Result<Tensor> { gpu_backend.copy_from(t) };
+```
+
+`CudaBackend::copy_from()` (코드 근거: `engine/src/backend/cuda/mod.rs` L1097~1119):
+1. `synchronize()` — GPU 작업 완료 대기
+2. `CudaHostBuffer::new(size, dtype)` — page-locked host memory 할당 + device mapping
+3. `std::ptr::copy_nonoverlapping(src.as_ptr(), cuda_buf.as_mut_ptr(), size)` — memcpy
+4. 새 `Tensor` 반환 (CudaHostBuffer + CudaBackend)
+
+**결과**: `migrate_weights_to_cuda()` 이후 모든 weight는 `CudaHostBuffer`에 있으며,
+`as_ptr()`이 유효한 host pointer를 반환한다.
+
+### 13.2 OpenCL vs CUDA: Weight 준비 경로 비교
+
+```mermaid
+flowchart TD
+    subgraph "OpenCL 경로"
+        OA[모델 로딩<br/>SharedBuffer/MmapBuffer] --> OB[migrate_weights_to_gpu<br/>→ OpenCLBuffer<br/>as_ptr=null, cl_mem=valid]
+        OB --> OC[rewrap_weights_for_dual_access<br/>→ ClWrappedBuffer<br/>as_ptr=valid, cl_mem=valid]
+        OC --> OD[prepare_tensor_partition<br/>split_weight → copy_from]
+    end
+
+    subgraph "CUDA 경로"
+        CA[모델 로딩<br/>SharedBuffer/MmapBuffer] --> CB[migrate_weights_to_cuda<br/>→ CudaHostBuffer<br/>as_ptr=valid, dev_ptr=valid]
+        CB --> CD[prepare_tensor_partition<br/>split_weight → copy_from]
+    end
+
+    style OC fill:#faa,stroke:#f00
+    style CD fill:#afa,stroke:#0a0
+```
+
+**핵심 차이**: CUDA에서는 `rewrap_weights_for_dual_access()`가 불필요하다.
+`CudaHostBuffer`가 이미 dual-access (host + device) 특성을 가지므로,
+OpenCL의 3단계 과정(migrate → rewrap → partition)이 CUDA에서는
+2단계(migrate → partition)로 단순화된다.
+
+### 13.3 split_weight() 동작 분석 (CUDA)
+
+`split_weight()` (코드 근거: `engine/src/layers/tensor_partition.rs` L86~178) 경로를 CUDA에서 추적:
+
+1. **SliceBuffer 생성**: `SliceBuffer::new(parent_buf, offset, gpu_bytes, dtype)`
+   - `parent_buf`는 `CudaHostBuffer` (migrate 이후)
+   - `SliceBuffer::as_ptr()` = `CudaHostBuffer::as_ptr() + offset` = `host_ptr + offset` (유효)
+
+2. **GPU slice copy**: `weight.backend().copy_from(&tmp_gpu_tensor)`
+   - `weight.backend()` = CudaBackend
+   - `CudaBackend::copy_from()` → `CudaHostBuffer::new()` + memcpy(src.as_ptr() → dst)
+   - `src.as_ptr()` = SliceBuffer의 `host_ptr + offset` (유효)
+   - **결과**: 새로운 독립 `CudaHostBuffer` (GPU kernel에서 `device_ptr()`로 접근 가능)
+
+3. **CPU slice copy**: `cpu_backend.copy_from(&tmp_cpu_tensor)`
+   - `cpu_backend` = CpuBackend
+   - `CpuBackend::copy_from()` → `SharedBuffer` + memcpy
+   - `src.as_ptr()` = SliceBuffer의 `host_ptr + gpu_bytes` (유효)
+   - **결과**: 새로운 독립 `SharedBuffer` (CPU matmul에서 직접 접근)
+
+**결론**: split_weight()는 CUDA에서 코드 변경 없이 정상 동작한다.
+
+### 13.4 Forward Path 동작 분석 (CUDA)
+
+forward_gen.rs (코드 근거: L883~936) partition 분기의 각 단계를 CUDA에서 추적:
+
+| 단계 | 코드 | CUDA 동작 | 정상 여부 |
+|------|------|----------|----------|
+| 0. sync + residual copy | `backend.synchronize()` + `backend.read_buffer(&ws.residual, dst)` | cuStreamSynchronize + memcpy(CudaHostBuffer→cpu_buf) | O — `read_buffer`는 sync 후 `as_ptr()`로 memcpy |
+| 1. GPU matmul enqueue | `backend.matmul_transposed(residual, w_gate_gpu, gate_gpu)` | cuBLAS sgemm/gemmEx (device_ptr 경유) | O — 모든 버퍼가 CudaHostBuffer이므로 device_ptr 유효 |
+| 2. flush | `backend.flush()` | no-op (기본 구현) | O — CUDA는 default stream에서 동기 실행 |
+| 3. CPU matmul | `cpu.matmul_transposed(residual_cpu, w_gate_cpu, gate_cpu)` | CpuBackend NEON/AVX2 matmul | O — 모든 버퍼가 SharedBuffer |
+| 4. GPU sync | `backend.synchronize()` | cuStreamSynchronize | O |
+| 5. Merge read | `backend.read_buffer(&pw.gate_gpu, &mut combined)` | memcpy(CudaHostBuffer→Vec) | O — `as_ptr()` = host_ptr (유효) |
+| 6. CPU data copy | `std::slice::from_raw_parts(pw.gate_cpu.as_ptr(), ...)` | SharedBuffer의 host pointer | O |
+| 7. Merge write | `backend.write_buffer(&mut ws.gate, &combined)` | 기본 구현: memcpy(Vec→CudaHostBuffer) | O — `as_mut_ptr()` = host_ptr (유효) |
+
+**CUDA 특수 사항**: CudaBackend의 `matmul_transposed()`는 호출 전에 `self.synchronize()`를 수행하고,
+호출 후에도 `self.synchronize()`를 수행한다 (코드 근거: mod.rs L377, L427). 따라서 실질적으로
+모든 GPU 연산이 **동기적**으로 실행된다. OpenCL처럼 enqueue→flush→CPU→synchronize 패턴으로
+GPU/CPU 병렬 실행이 되지 않는다 — 이것은 성능 제약이지 정확성 문제는 아니다.
+
+### 13.5 발견된 문제점과 필요한 변경
+
+#### 문제 1: `is_gpu()` 반환값 오류 (버그)
+
+```rust
+// engine/src/backend/cuda/mod.rs L340-342
+fn is_gpu(&self) -> bool {
+    false  // BUG: CUDA backend는 GPU이다
+}
+```
+
+이 값은 forward_gen.rs에서 profiler sync와 `flush()` 호출 제어에 사용된다.
+`false`이면 GPU 커널 완료를 기다리지 않고 profiler 시간을 측정하므로 부정확한 프로파일링 결과가 나온다.
+partition 동작 자체에는 영향이 없다 (partition 분기는 `partition_ctx` 존재 여부로 결정).
+
+**변경**: `is_gpu() -> true`로 수정.
+
+**파일**: `engine/src/backend/cuda/mod.rs`
+
+#### 문제 2 (의도된 제약): CUDA 동기 실행으로 인한 GPU/CPU 병렬화 불가
+
+현재 CudaBackend의 `matmul_transposed()`는 내부에서 `synchronize()`를 2회 호출한다:
+- 진입 시: "Sync before cuBLAS" (L377)
+- 완료 시: sgemm/gemmEx 이후 (L427, L481, L513)
+
+이로 인해 partition 경로의 GPU enqueue가 사실상 blocking이 되어,
+GPU matmul이 완료된 후에야 CPU matmul이 시작된다.
+
+```
+현재 CUDA:  [GPU matmul (blocking)] → [CPU matmul] → [merge]
+기대 패턴:  [GPU matmul (async)]    → [merge]
+                  ↕ 병렬
+            [CPU matmul]
+```
+
+**변경 전략 (2단계)**:
+
+**Phase 1 — 정확성 우선**: 현재 동기 실행 방식으로 먼저 정확성을 검증한다.
+partition이 동작하되 성능 이득은 없다 (순차 실행). 변경 최소화.
+
+**Phase 2 — 비동기 실행**: CudaBackend에 별도 stream을 도입하여
+matmul을 비동기로 enqueue하고, 별도 `flush()`에서 stream submit,
+`synchronize()`에서 stream wait를 수행한다.
+
+```rust
+// Phase 2 구상 (CudaBackend 확장)
+pub struct CudaBackend {
+    // ... 기존 필드 ...
+    compute_stream: CudaStream,  // matmul 전용 stream
+}
+
+fn matmul_transposed_async(&self, ...) -> Result<()> {
+    // synchronize() 없이 cuBLAS enqueue만 수행
+    // compute_stream에 sgemm/gemmEx 발행
+}
+
+fn flush(&self) -> Result<()> {
+    // cuStreamQuery or no-op (stream은 enqueue 즉시 실행 시작)
+}
+
+fn synchronize(&self) -> Result<()> {
+    self.compute_stream.synchronize()
+}
+```
+
+**파일**: `engine/src/backend/cuda/mod.rs`
+
+#### 문제 3: generate.rs에서 CUDA 분기의 zero_copy 플래그 미처리
+
+현재 generate.rs의 CUDA 초기화 (L494~501):
+```rust
+"cuda" => {
+    let gpu_concrete = Arc::new(CudaBackend::new()?);
+    let gpu_mem = Arc::new(CudaMemory::new());
+    let gpu: Arc<dyn Backend> = gpu_concrete;
+    (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
+}
+```
+
+OpenCL 분기와 달리 `tensor_partition > 0.0` 조건에 따른 처리가 없다.
+그러나 `CudaMemory::alloc()`이 항상 `CudaHostBuffer`를 반환하므로 실질적 문제는 없다.
+다만 일관성을 위해 로그 메시지를 추가하는 것이 좋다.
+
+**변경**: CUDA 분기에서 `tensor_partition > 0.0`일 때 정보 로그 추가.
+
+**파일**: `engine/src/bin/generate.rs`
+
+### 13.6 파일별 변경 명세
+
+| 파일 | 변경 유형 | 변경 내용 | Phase |
+|------|----------|----------|-------|
+| `engine/src/backend/cuda/mod.rs` | 수정 | `is_gpu()` → `true` 반환 | 1 |
+| `engine/src/bin/generate.rs` | 수정 | CUDA + tensor_partition 시 로그 메시지 + `rewrap_weights_for_dual_access` 가드를 OpenCL/CUDA 공통 조건으로 분기 | 1 |
+| `engine/src/backend/cuda/mod.rs` | 수정 (Phase 2) | `matmul_transposed()`에서 동기화 제거, 비동기 enqueue 지원 | 2 |
+
+**변경하지 않아도 되는 파일** (코드 분석 결과):
+
+| 파일 | 이유 |
+|------|------|
+| `engine/src/layers/tensor_partition.rs` | `split_weight()`는 Backend trait의 `copy_from()`만 사용 — CUDA에서 동작 확인 |
+| `engine/src/layers/workspace.rs` | `PartitionWorkspace::new()`는 Memory trait의 `alloc()`만 사용 — CudaMemory에서 동작 |
+| `engine/src/layers/transformer_layer/forward_gen.rs` | partition 분기는 Backend trait의 `synchronize/read_buffer/write_buffer/flush/matmul_transposed`만 사용 — 모두 CUDA에서 기본 구현 또는 오버라이드 존재 |
+| `engine/src/models/transformer.rs` | `prepare_tensor_partition()`은 `split_weight()` 호출만 — CUDA에서 동작 |
+| `engine/src/buffer/slice_buffer.rs` | `as_ptr()`는 parent의 `as_ptr()` + offset — CudaHostBuffer parent에서 유효 |
+
+### 13.7 OpenCL/CUDA 공통 추상화 전략
+
+#### 13.7.1 현재 추상화 수준
+
+tensor partition 코드는 이미 Backend trait 수준에서 작성되어 있다:
+
+```
+split_weight()   → Backend::copy_from()
+forward_gen()    → Backend::synchronize/read_buffer/write_buffer/flush/matmul_transposed
+PartitionWorkspace → Memory::alloc()
+```
+
+OpenCL/CUDA 모두 동일한 trait 메서드를 구현하므로, **partition 코드 자체에 `#[cfg]` 가드가 필요 없다**.
+
+#### 13.7.2 `rewrap_weights_for_dual_access` 통합 (선택적)
+
+현재 이 함수는 `#[cfg(feature = "opencl")]`으로 OpenCL 전용이다.
+CUDA에서는 `migrate_weights_to_cuda()`가 동등한 역할을 수행한다.
+
+**통합 방안** (향후 리팩토링):
+
+```rust
+// Backend trait에 메서드 추가 (선택적)
+trait Backend {
+    /// Weight를 CPU+GPU 양쪽에서 접근 가능한 버퍼로 변환.
+    /// OpenCL: ClWrappedBuffer, CUDA: CudaHostBuffer, CPU: no-op.
+    fn ensure_dual_access(&self, t: &Tensor) -> Result<Tensor> {
+        Ok(t.clone())  // 기본: no-op
+    }
+}
+```
+
+그러나 현재 시점에서는 불필요하다:
+- OpenCL: `rewrap_weights_for_dual_access()` + `migrate_weights_to_gpu()`
+- CUDA: `migrate_weights_to_cuda()` (이미 dual-access)
+
+두 경로 모두 `prepare_tensor_partition()` 호출 전에 weight가 host-accessible 상태를 보장한다.
+generate.rs에서의 호출 순서가 이를 올바르게 처리하고 있다.
+
+#### 13.7.3 `is_gpu()` 의미 정리
+
+| 메서드 | OpenCL | CUDA | CPU |
+|--------|--------|------|-----|
+| `is_gpu()` | `true` | `true` (수정 필요) | `false` |
+| `is_discrete_gpu()` | `false` (UMA) | `!self.is_uma` | `false` |
+
+`is_gpu()`는 "GPU 커널을 실행할 수 있는 백엔드인가"의 의미이며,
+CudaBackend는 cuBLAS/CUDA 커널을 실행하므로 `true`가 올바르다.
+
+### 13.8 CUDA에서의 비동기 실행 패턴 (Phase 2 상세)
+
+#### 13.8.1 문제
+
+OpenCL에서 tensor partition의 성능 이득은 GPU/CPU 병렬 실행에서 온다:
+
+```
+OpenCL:
+  enqueue(gpu_matmul) → clFlush → [CPU matmul 동시 실행] → clFinish
+  총 시간 ≈ max(GPU_time, CPU_time)
+```
+
+CUDA CudaBackend의 현재 `matmul_transposed()`는 매 호출마다 `synchronize()`하므로:
+
+```
+CUDA (현재):
+  cuBLAS_sgemm + cuStreamSync → [CPU matmul] → cuStreamSync
+  총 시간 = GPU_time + CPU_time  (순차 실행)
+```
+
+#### 13.8.2 해결: cuBLAS 비동기 패턴
+
+cuBLAS API는 본질적으로 비동기이다. `cublasSgemm()`은 GPU에 작업을 enqueue만 하고
+즉시 반환한다. 현재 코드의 `self.synchronize()`가 이를 강제 동기화하고 있다.
+
+partition 전용 비동기 matmul 경로:
+
+```rust
+/// Partition-optimized: enqueue matmul without synchronization.
+/// Caller must call synchronize() explicitly after all enqueues.
+fn matmul_transposed_enqueue_only(
+    &self, a: &Tensor, b: &Tensor, out: &mut Tensor
+) -> Result<()> {
+    // synchronize() 호출 없이 cuBLAS enqueue만 수행
+    // 전제: 입력 버퍼가 이미 준비 완료 상태 (caller가 보장)
+}
+```
+
+그러나 이것은 Backend trait 확장이 필요하며, 프로토타입 범위를 넘는다.
+
+**대안: 기존 `matmul_transposed()`의 동기화 제거**
+
+현재 `matmul_transposed()`는 진입 시 + 완료 시 모두 synchronize한다.
+partition 경로에서는 caller (forward_gen.rs)가 명시적으로 synchronize를 관리하므로,
+`matmul_transposed()` 내부의 synchronize를 제거해도 partition 경로에서는 안전하다.
+
+그러나 **비-partition 경로에서의 호환성 검증**이 필요하다:
+- 다른 op (rms_norm, silu_mul 등)도 각각 synchronize를 호출하므로,
+  matmul → rms_norm 순서에서 rms_norm 진입 시 synchronize가 matmul 완료를 보장
+- Q4_0 CPU fallback 경로: sync 없이 cuBLAS enqueue 후 CPU fallback이 GPU buffer를 읽으면 race condition
+
+**결론**: Phase 2는 matmul_transposed 내부의 sync 제거가 아니라,
+partition 전용 비동기 경로(`matmul_transposed_async` 또는 `no_sync` 플래그)를 도입하는 것이 안전하다.
+
+### 13.9 리스크 분석
+
+| # | 리스크 | 심각도 | 발생 가능성 | 영향 | 완화 방안 |
+|---|--------|--------|-------------|------|-----------|
+| R14 | **CUDA 동기 실행으로 성능 이득 없음** — Phase 1에서 GPU/CPU가 순차 실행되어 partition 활성화가 오히려 overhead (merge memcpy)만 추가 | 중간 | 높음 | TBT가 단일 GPU 대비 악화할 수 있음 | Phase 1은 정확성 검증 목적. Phase 2에서 비동기 cuBLAS로 병렬화 도입 후 성능 측정 |
+| R15 | **is_gpu() 수정의 부작용** — `true`로 변경 시 forward_gen.rs의 profiler sync와 flush가 활성화됨. flush는 no-op이므로 무해하나, profiler sync가 추가 overhead 발생 | 낮음 | 높음 | 매 op 측정 시 cuStreamSync 추가 (profiler 활성 시에만) | profiler 비활성 시 영향 없음. profiler 활성 시에도 정확한 측정을 위해 필요한 동작 |
+| R16 | **CudaHostBuffer 할당 실패** — partition으로 weight 복사본(gpu_slice)이 추가로 CudaHostBuffer에 할당됨. Jetson의 pinned memory 한도 초과 가능 | 중간 | 낮음 | `cuMemHostAlloc` 실패 → partition 준비 실패 | prepare_tensor_partition 실패 시 graceful fallback (단일 GPU 경로 유지). 3B 모델 기준 FFN gate+up 전체 ~500MB, partition 복사 ~500MB 추가 — Jetson AGX Orin 32GB에서는 충분 |
+| R17 | **Phase 2 비동기 도입 시 race condition** — cuBLAS enqueue 후 sync 없이 CPU가 동일 버퍼를 읽으면 데이터 불일치 | 높음 | 중간 | 수치 오류 또는 segfault | partition 경로 전용 비동기 메서드 도입으로 기존 동기 경로와 격리. read_buffer/write_buffer는 반드시 synchronize 후 호출 (forward_gen.rs에서 이미 이 패턴을 따름) |
+| R18 | **Non-UMA CUDA 디바이스** — 데스크톱 GPU에서 CudaHostBuffer의 host_ptr과 device_ptr이 다른 물리 메모리를 가리킴. PCIe 전송 overhead 발생 | 낮음 | 낮음 | Jetson 타겟이므로 현재 무관. 향후 데스크톱 지원 시 고려 필요 | CudaBackend 초기화 시 `is_uma` 플래그로 분기 가능. non-UMA에서는 partition 비활성화 또는 경고 |
+
+### 13.10 구현 순서
+
+```
+Phase 1 — CUDA 정확성 검증 (변경 최소)
+  C1. CudaBackend::is_gpu() → true 수정
+  C2. generate.rs: CUDA + tensor_partition 시 정보 로그 추가
+  C3. 디바이스 테스트: Jetson에서 --backend cuda --tensor-partition 0.5 실행
+  C4. 정확성 검증: test_backend로 partition 결과 vs 단일 GPU 결과 비교
+
+Phase 2 — 비동기 실행 (성능 최적화)
+  C5. CudaBackend에 matmul enqueue-only 경로 추가 (sync 제거)
+  C6. flush() 오버라이드: cuStreamQuery 또는 no-op 유지
+  C7. forward_gen.rs: CUDA partition에서 enqueue → flush → CPU → sync 패턴 활성화
+  C8. TBT 벤치마크: 비동기 vs 동기 비교
+```
+
+### 13.11 개방 질문
+
+1. **Jetson pinned memory 한도**: `cuMemHostAlloc`의 총 할당량 제한이 있는가?
+   Jetson AGX Orin에서 전체 DRAM의 몇 %까지 pinned로 할당 가능한지 확인 필요
+2. **cuBLAS stream 동작**: cuBLAS 호출이 default stream에서 실행될 때,
+   커널 enqueue 후 즉시 반환되는지, 아니면 내부적으로 sync하는지 확인 필요
+   (cublasSetPointerMode, cublasSetStream 설정에 따라 다를 수 있음)
+3. **multi-stream 도입 시 cuBLAS handle**: cuBLAS handle을 별도 stream에 바인딩해야 하는가?
+   현재 코드는 `cublasSetStream(handle, ctx.default_stream())`으로 설정되어 있음
+4. **CudaBuffer (managed memory) 활용**: `cuMemAllocManaged`로 할당하면
+   CUDA runtime이 자동으로 host/device 간 페이지 마이그레이션을 수행한다.
+   pinned memory 대신 managed memory를 사용하면 할당 한도 문제를 피할 수 있으나,
+   첫 접근 시 page fault 오버헤드가 발생한다. 성능 비교 필요

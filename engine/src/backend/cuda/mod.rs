@@ -338,7 +338,7 @@ impl Backend for CudaBackend {
     }
 
     fn is_gpu(&self) -> bool {
-        false
+        true
     }
 
     fn is_discrete_gpu(&self) -> bool {
