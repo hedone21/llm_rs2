@@ -363,6 +363,20 @@ struct Args {
     /// Runs prefill with ImportanceCollector on the given prompt.
     #[arg(long, default_value_t = false)]
     dump_importance: bool,
+
+    /// Path to JSONL file for multi-prompt batch generation.
+    /// Each line: {"id":"...", "prompt":"..."} or {"id":"...", "prompt_file":"path"}
+    /// Mutually exclusive with --prompt, --prompt-file, --eval-batch.
+    #[arg(long)]
+    prompt_batch: Option<String>,
+
+    /// Loop prompt-batch: restart from beginning when all entries are processed.
+    #[arg(long, default_value_t = false)]
+    prompt_batch_loop: bool,
+
+    /// Maximum iterations for prompt-batch loop (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    max_iterations: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1351,6 +1365,326 @@ fn main() -> anyhow::Result<()> {
             actual_protected_prefix,
             skip_config.as_ref(),
         );
+    }
+
+    // ════════════════════════════════════════════════════════════
+    //  PROMPT-BATCH MODE: Sequential multi-prompt generation
+    // ════════════════════════════════════════════════════════════
+    if let Some(ref batch_path) = args.prompt_batch {
+        let entries = load_prompt_batch(batch_path)?;
+        if entries.is_empty() {
+            anyhow::bail!("prompt-batch file is empty: {}", batch_path);
+        }
+        eprintln!(
+            "[Batch] Loaded {} entries from {}",
+            entries.len(),
+            batch_path
+        );
+
+        let mut iteration = 0usize;
+
+        // Pre-allocate generation buffers (once)
+        let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+        let mut logits = Tensor::new(
+            Shape::new(vec![1, 1, vocab_size]),
+            logits_buf,
+            backend.clone(),
+        );
+        let eos_id = model.config.eos_token_id;
+
+        // Pre-allocate workspace (once)
+        let q_dim = model.config.num_attention_heads * model.config.head_dim;
+        let k_dim = model.config.num_key_value_heads * model.config.head_dim;
+        let v_dim = k_dim;
+        let ffn_hidden = model.config.intermediate_size;
+        let x_gen_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+        let mut x_gen = Tensor::new(
+            Shape::new(vec![1, 1, hidden_size]),
+            x_gen_buf,
+            backend.clone(),
+        );
+        let mut gen_ws = LayerWorkspace::new(
+            WorkspaceConfig {
+                batch_size: 1,
+                dim: model.config.hidden_size,
+                q_dim,
+                k_dim,
+                v_dim,
+                ffn_hidden,
+                n_heads: model.config.num_attention_heads,
+                max_seq_len: args.max_seq_len,
+            },
+            memory.as_ref(),
+            backend.clone(),
+        )?;
+
+        // Pre-allocate CPU/GPU single-token tensors
+        let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
+        let cpu_gen_input = Tensor::new(
+            Shape::new(vec![1, 1]),
+            cpu_gen_indices_buf,
+            Arc::new(CpuBackend::new()),
+        );
+        let gpu_gen_input_buf = memory.alloc(4, DType::U8)?;
+        let mut gen_input_tensor =
+            Tensor::new(Shape::new(vec![1, 1]), gpu_gen_input_buf, backend.clone());
+        let mut logits_cpu = vec![0.0f32; vocab_size];
+
+        'outer: loop {
+            for entry in &entries {
+                if args.max_iterations > 0 && iteration >= args.max_iterations {
+                    break 'outer;
+                }
+
+                let prompt_text = resolve_prompt(entry)?;
+                let encoding = tokenizer
+                    .encode(prompt_text.as_str(), true)
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let batch_input_ids: Vec<u32> = encoding.get_ids().to_vec();
+                let prompt_tokens = batch_input_ids.len();
+
+                eprintln!(
+                    "[Batch] #{} id={}, prompt_tokens={}",
+                    iteration, entry.id, prompt_tokens
+                );
+
+                let entry_start = std::time::Instant::now();
+
+                // === PREFILL ===
+                let process_len = batch_input_ids.len();
+                if process_len > max_seq_len {
+                    eprintln!(
+                        "[Batch] #{} id={}: prompt too long ({} > {}), skipping",
+                        iteration, entry.id, process_len, max_seq_len
+                    );
+                    let err_result = serde_json::json!({
+                        "id": entry.id,
+                        "error": format!("prompt too long: {} > {}", process_len, max_seq_len),
+                    });
+                    println!("{}", serde_json::to_string(&err_result)?);
+                    iteration += 1;
+                    continue;
+                }
+
+                // Chunked prefill
+                let chunk_size =
+                    if args.prefill_chunk_size > 0 && args.prefill_chunk_size < process_len {
+                        args.prefill_chunk_size
+                    } else {
+                        process_len
+                    };
+                let chunked = chunk_size < process_len;
+
+                let (prefill_logits_shape, prefill_logits_buf_size) = if chunked {
+                    (Shape::new(vec![1, 1, vocab_size]), vocab_size * 4)
+                } else {
+                    (
+                        Shape::new(vec![1, process_len, vocab_size]),
+                        process_len * vocab_size * 4,
+                    )
+                };
+                let prefill_logits_buf = memory.alloc(prefill_logits_buf_size, DType::F32)?;
+                let mut prefill_logits =
+                    Tensor::new(prefill_logits_shape, prefill_logits_buf, backend.clone());
+
+                let prefill_timer = std::time::Instant::now();
+
+                let mut chunk_start = 0;
+                while chunk_start < process_len {
+                    let chunk_end = (chunk_start + chunk_size).min(process_len);
+                    let chunk_tokens = &batch_input_ids[chunk_start..chunk_end];
+                    let chunk_len = chunk_tokens.len();
+
+                    let cpu_chunk_buf = Galloc::new().alloc(chunk_len * 4, DType::U8)?;
+                    unsafe {
+                        let ptr = cpu_chunk_buf.as_mut_ptr() as *mut u32;
+                        std::ptr::copy_nonoverlapping(chunk_tokens.as_ptr(), ptr, chunk_len);
+                    }
+                    let cpu_chunk_tensor = Tensor::new(
+                        Shape::new(vec![1, chunk_len]),
+                        cpu_chunk_buf,
+                        Arc::new(CpuBackend::new()),
+                    );
+                    let input_tensor = backend.copy_from(&cpu_chunk_tensor)?;
+
+                    model.forward_into(TransformerModelForwardArgs {
+                        input_tokens: &input_tensor,
+                        start_pos: chunk_start,
+                        kv_caches: &mut kv_caches,
+                        backend: &backend,
+                        memory: memory.as_ref(),
+                        logits_out: &mut prefill_logits,
+                        x_gen: None,
+                        workspace: None,
+                        use_gpu_attn: args.gpu_attn,
+                        score_accumulator: None,
+                        profiler: None,
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        logits_last_only: chunked,
+                        variance_collector: None,
+                    })?;
+                    backend.synchronize()?;
+                    drop(input_tensor);
+
+                    chunk_start = chunk_end;
+                }
+
+                let ttft_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
+
+                // Sample first token from prefill logits
+                let mut last_logits = vec![0.0f32; vocab_size];
+                unsafe {
+                    let ptr = last_logits.as_mut_ptr() as *mut u8;
+                    let byte_len = vocab_size * 4;
+                    if chunked {
+                        let slice = std::slice::from_raw_parts_mut(ptr, byte_len);
+                        backend.read_buffer(&prefill_logits, slice)?;
+                    } else {
+                        let mut full_logits = vec![0.0f32; process_len * vocab_size];
+                        let full_ptr = full_logits.as_mut_ptr() as *mut u8;
+                        let full_slice =
+                            std::slice::from_raw_parts_mut(full_ptr, full_logits.len() * 4);
+                        backend.read_buffer(&prefill_logits, full_slice)?;
+                        let start_idx = (process_len - 1) * vocab_size;
+                        last_logits
+                            .copy_from_slice(&full_logits[start_idx..start_idx + vocab_size]);
+                    }
+                }
+                drop(prefill_logits);
+
+                let mut batch_tokens = batch_input_ids.clone();
+                let next_token_id = sampling::sample(
+                    &mut last_logits,
+                    &batch_tokens,
+                    vocab_size,
+                    &sampling_config,
+                    None,
+                );
+                batch_tokens.push(next_token_id);
+                let mut batch_start_pos = process_len;
+
+                // === DECODE LOOP ===
+                let mut tbt_values_batch: Vec<f64> = Vec::new();
+                let mut generated_count: usize = 1; // first token already sampled
+                let mut last_token_time = std::time::Instant::now();
+
+                for _ in 0..(args.num_tokens - 1) {
+                    if kv_caches[0].current_pos >= max_seq_len {
+                        break;
+                    }
+
+                    // Throttle delay
+                    if throttle_delay_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
+                    }
+
+                    // Write token to CPU input
+                    let current_token = *batch_tokens.last().unwrap();
+                    unsafe {
+                        *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = current_token;
+                    }
+                    backend.write_buffer(&mut gen_input_tensor, unsafe {
+                        std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+                    })?;
+
+                    let decode_start = std::time::Instant::now();
+                    model.forward_into(TransformerModelForwardArgs {
+                        input_tokens: &gen_input_tensor,
+                        start_pos: batch_start_pos,
+                        kv_caches: &mut kv_caches,
+                        backend: &backend,
+                        memory: memory.as_ref(),
+                        logits_out: &mut logits,
+                        x_gen: Some(&mut x_gen),
+                        workspace: Some(&mut gen_ws),
+                        use_gpu_attn: args.gpu_attn,
+                        score_accumulator: None,
+                        profiler: None,
+                        skip_config: skip_config.as_ref(),
+                        importance_collector: None,
+                        logits_last_only: false,
+                        variance_collector: None,
+                    })?;
+                    backend.synchronize()?;
+
+                    let now = std::time::Instant::now();
+                    let tbt = (now - last_token_time).as_secs_f64() * 1000.0;
+                    tbt_values_batch.push(tbt);
+                    last_token_time = now;
+                    let _forward_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
+
+                    // Read logits and sample
+                    unsafe {
+                        let ptr = logits_cpu.as_mut_ptr() as *mut u8;
+                        let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+                        backend.read_buffer(&logits, slice)?;
+                    }
+
+                    let next_id = sampling::sample(
+                        &mut logits_cpu,
+                        &batch_tokens,
+                        vocab_size,
+                        &sampling_config,
+                        None,
+                    );
+                    batch_tokens.push(next_id);
+                    batch_start_pos += 1;
+                    generated_count += 1;
+
+                    if next_id == eos_id && !args.ignore_eos {
+                        break;
+                    }
+                }
+
+                let total_ms = entry_start.elapsed().as_secs_f64() * 1000.0;
+                let mean_tbt_ms = if tbt_values_batch.is_empty() {
+                    0.0
+                } else {
+                    tbt_values_batch.iter().sum::<f64>() / tbt_values_batch.len() as f64
+                };
+
+                // Decode generated text (skip prompt tokens)
+                let generated_ids = &batch_tokens[prompt_tokens..];
+                let text = tokenizer.decode(generated_ids, true).unwrap_or_default();
+
+                // Output JSONL
+                let result = serde_json::json!({
+                    "id": entry.id,
+                    "prompt_tokens": prompt_tokens,
+                    "generated_tokens": generated_count,
+                    "ttft_ms": (ttft_ms * 100.0).round() / 100.0,
+                    "mean_tbt_ms": (mean_tbt_ms * 100.0).round() / 100.0,
+                    "total_ms": (total_ms * 100.0).round() / 100.0,
+                    "text": text,
+                });
+                println!("{}", serde_json::to_string(&result)?);
+
+                eprintln!(
+                    "[Batch] #{} id={} done: {} tokens, ttft={:.1}ms, tbt={:.1}ms, total={:.1}ms",
+                    iteration, entry.id, generated_count, ttft_ms, mean_tbt_ms, total_ms
+                );
+
+                // === RESET KV CACHE ===
+                for cache in kv_caches.iter_mut() {
+                    cache.current_pos = 0;
+                    cache.high_water_pos = 0;
+                }
+                // Reset score accumulator if active
+                if let Some(ref mut acc) = score_accumulator {
+                    acc.reset();
+                }
+
+                iteration += 1;
+            }
+
+            if !args.prompt_batch_loop {
+                break;
+            }
+        }
+
+        eprintln!("[Batch] Complete: {} iterations", iteration);
+        return Ok(());
     }
 
     // Pre-allocate generation buffers
@@ -3037,6 +3371,47 @@ fn plan_summary(plan: &llm_rs2::resilience::ExecutionPlan) -> Vec<String> {
         names.push("RestoreDefaults".to_string());
     }
     names
+}
+
+// ════════════════════════════════════════════════════════════════
+//  Prompt-batch helpers
+// ════════════════════════════════════════════════════════════════
+
+#[derive(serde::Deserialize)]
+struct PromptBatchEntry {
+    id: String,
+    prompt: Option<String>,
+    prompt_file: Option<String>,
+}
+
+fn load_prompt_batch(path: &str) -> anyhow::Result<Vec<PromptBatchEntry>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open prompt batch {}: {}", path, e))?;
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+    for (i, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let entry: PromptBatchEntry =
+            serde_json::from_str(trimmed).map_err(|e| anyhow::anyhow!("Line {}: {}", i + 1, e))?;
+        entries.push(entry);
+    }
+    Ok(entries)
+}
+
+fn resolve_prompt(entry: &PromptBatchEntry) -> anyhow::Result<String> {
+    if let Some(ref text) = entry.prompt {
+        Ok(text.clone())
+    } else if let Some(ref path) = entry.prompt_file {
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read prompt_file {}: {}", path, e))
+    } else {
+        anyhow::bail!("Entry '{}': needs 'prompt' or 'prompt_file'", entry.id)
+    }
 }
 
 // ════════════════════════════════════════════════════════════════

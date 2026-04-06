@@ -66,8 +66,8 @@ impl LayerWorkspace {
             residual: retag(self.residual),
             attn_out: retag(self.attn_out),
             scores: self.scores,
-            k_cast: self.k_cast.map(|t| retag(t)),
-            v_cast: self.v_cast.map(|t| retag(t)),
+            k_cast: self.k_cast.map(retag),
+            v_cast: self.v_cast.map(retag),
         }
     }
 
