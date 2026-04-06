@@ -1498,6 +1498,7 @@ fn main() -> anyhow::Result<()> {
                     Tensor::new(prefill_logits_shape, prefill_logits_buf, backend.clone());
 
                 let prefill_timer = std::time::Instant::now();
+                let mut deferred_switch: Option<String> = None;
 
                 let mut chunk_start = 0;
                 while chunk_start < process_len {
@@ -1583,70 +1584,18 @@ fn main() -> anyhow::Result<()> {
                             last_skip_ratio = Some(ratio);
                         }
 
-                        // SwitchHw: migrate KV caches and reallocate prefill_logits
-                        if let Some(ref device) = plan.switch_device
-                            && let (Some(gpu_be), Some(gpu_mem)) =
-                                (&gpu_backend_arc, &gpu_memory_arc)
-                        {
-                            match device.as_str() {
-                                "cpu" if is_gpu => {
-                                    eprintln!(
-                                        "[Prefill] SwitchHw: GPU→CPU at chunk_pos={}",
-                                        kv_caches[0].current_pos
-                                    );
-                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
-                                        &mut kv_caches,
-                                        &backend,
-                                        &cpu_backend_arc,
-                                        &cpu_backend_arc,
-                                        &cpu_memory_arc,
-                                        &cpu_memory_arc,
-                                        kv_heads,
-                                        head_dim,
-                                        max_seq_len,
-                                        false,
-                                    )?;
-                                    backend = cpu_backend_arc.clone();
-                                    is_gpu = false;
-                                    let new_buf =
-                                        Galloc::new().alloc(prefill_logits_buf_size, DType::F32)?;
-                                    prefill_logits = Tensor::new(
-                                        prefill_logits.shape().clone(),
-                                        new_buf,
-                                        backend.clone(),
-                                    );
-                                    eprintln!("[Prefill] SwitchHw: Switched to CPU.");
-                                }
-                                "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
-                                    eprintln!(
-                                        "[Prefill] SwitchHw: CPU→GPU at chunk_pos={}",
-                                        kv_caches[0].current_pos
-                                    );
-                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
-                                        &mut kv_caches,
-                                        &backend,
-                                        gpu_be,
-                                        &cpu_backend_arc,
-                                        &cpu_memory_arc,
-                                        gpu_mem,
-                                        kv_heads,
-                                        head_dim,
-                                        max_seq_len,
-                                        true,
-                                    )?;
-                                    backend = gpu_be.clone();
-                                    is_gpu = true;
-                                    let new_buf =
-                                        gpu_mem.alloc(prefill_logits_buf_size, DType::F32)?;
-                                    prefill_logits = Tensor::new(
-                                        prefill_logits.shape().clone(),
-                                        new_buf,
-                                        backend.clone(),
-                                    );
-                                    eprintln!("[Prefill] SwitchHw: Switched to GPU.");
-                                }
-                                _ => {}
+                        // SwitchHw: defer to post-prefill boundary.
+                        // Mid-prefill switch causes segfault: model workspace buffers
+                        // remain on the old backend; the next chunk accesses them
+                        // from the new backend -> invalid memory reference.
+                        if let Some(ref device) = plan.switch_device {
+                            if deferred_switch.is_none() {
+                                eprintln!(
+                                    "[Prefill] SwitchHw: deferring '{}' to post-prefill (chunk_pos={})",
+                                    device, kv_caches[0].current_pos
+                                );
                             }
+                            deferred_switch = Some(device.clone());
                         }
                     }
 
@@ -1675,6 +1624,105 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
                 drop(prefill_logits);
+
+                // Execute deferred SwitchHw (from prefill checkpoint).
+                // Now safe: prefill is done, logits read, all workspace released.
+                if let Some(ref device) = deferred_switch
+                    && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
+                {
+                    match device.as_str() {
+                        "cpu" if is_gpu => {
+                            eprintln!("[Prefill->Decode] Executing deferred SwitchHw: GPU->CPU");
+                            llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                &mut kv_caches,
+                                &backend,
+                                &cpu_backend_arc,
+                                &cpu_backend_arc,
+                                &cpu_memory_arc,
+                                &cpu_memory_arc,
+                                kv_heads,
+                                head_dim,
+                                max_seq_len,
+                                false,
+                            )?;
+                            backend = cpu_backend_arc.clone();
+                            is_gpu = false;
+                            // Re-allocate decode buffers on CPU.
+                            let new_lb = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
+                            logits = Tensor::new(logits.shape().clone(), new_lb, backend.clone());
+                            let new_xb = cpu_memory_arc.alloc(hidden_size * 4, DType::F32)?;
+                            x_gen = Tensor::new(x_gen.shape().clone(), new_xb, backend.clone());
+                            gen_ws = LayerWorkspace::new(
+                                WorkspaceConfig {
+                                    batch_size: 1,
+                                    dim: model.config.hidden_size,
+                                    q_dim,
+                                    k_dim,
+                                    v_dim,
+                                    ffn_hidden,
+                                    n_heads: model.config.num_attention_heads,
+                                    max_seq_len: args.max_seq_len,
+                                },
+                                cpu_memory_arc.as_ref(),
+                                backend.clone(),
+                            )?;
+                            let new_gi = cpu_memory_arc.alloc(4, DType::U8)?;
+                            gen_input_tensor = Tensor::new(
+                                gen_input_tensor.shape().clone(),
+                                new_gi,
+                                backend.clone(),
+                            );
+                            eprintln!(
+                                "[Prefill->Decode] SwitchHw: Switched to CPU (decode buffers re-allocated)."
+                            );
+                        }
+                        "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
+                            eprintln!("[Prefill->Decode] Executing deferred SwitchHw: CPU->GPU");
+                            llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                &mut kv_caches,
+                                &backend,
+                                gpu_be,
+                                &cpu_backend_arc,
+                                &cpu_memory_arc,
+                                gpu_mem,
+                                kv_heads,
+                                head_dim,
+                                max_seq_len,
+                                true,
+                            )?;
+                            backend = gpu_be.clone();
+                            is_gpu = true;
+                            let new_lb = gpu_mem.alloc(vocab_size * 4, DType::F32)?;
+                            logits = Tensor::new(logits.shape().clone(), new_lb, backend.clone());
+                            let new_xb = gpu_mem.alloc(hidden_size * 4, DType::F32)?;
+                            x_gen = Tensor::new(x_gen.shape().clone(), new_xb, backend.clone());
+                            gen_ws = LayerWorkspace::new(
+                                WorkspaceConfig {
+                                    batch_size: 1,
+                                    dim: model.config.hidden_size,
+                                    q_dim,
+                                    k_dim,
+                                    v_dim,
+                                    ffn_hidden,
+                                    n_heads: model.config.num_attention_heads,
+                                    max_seq_len: args.max_seq_len,
+                                },
+                                gpu_mem.as_ref(),
+                                backend.clone(),
+                            )?;
+                            let new_gi = gpu_mem.alloc(4, DType::U8)?;
+                            gen_input_tensor = Tensor::new(
+                                gen_input_tensor.shape().clone(),
+                                new_gi,
+                                backend.clone(),
+                            );
+                            eprintln!(
+                                "[Prefill->Decode] SwitchHw: Switched to GPU (decode buffers re-allocated)."
+                            );
+                        }
+                        _ => {} // Already on requested backend
+                    }
+                }
 
                 let mut batch_tokens = batch_input_ids.clone();
                 let next_token_id = sampling::sample(
@@ -1920,6 +1968,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // === PREFILL PHASE ===
+    let mut deferred_switch: Option<String> = None;
     {
         println!("[Profile] Event: PrefillStart");
         let process_len = tokens.len();
@@ -2056,67 +2105,18 @@ fn main() -> anyhow::Result<()> {
                     last_skip_ratio = Some(ratio);
                 }
 
-                // SwitchHw: migrate KV caches and reallocate prefill_logits
-                if let Some(ref device) = plan.switch_device
-                    && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
-                {
-                    match device.as_str() {
-                        "cpu" if is_gpu => {
-                            eprintln!(
-                                "[Prefill] SwitchHw: GPU→CPU at chunk_pos={}",
-                                kv_caches[0].current_pos
-                            );
-                            llm_rs2::core::kv_migrate::migrate_kv_caches(
-                                &mut kv_caches,
-                                &backend,
-                                &cpu_backend_arc,
-                                &cpu_backend_arc,
-                                &cpu_memory_arc,
-                                &cpu_memory_arc,
-                                kv_heads,
-                                head_dim,
-                                max_seq_len,
-                                false,
-                            )?;
-                            backend = cpu_backend_arc.clone();
-                            is_gpu = false;
-                            let new_buf = Galloc::new().alloc(logits_buf_size, DType::F32)?;
-                            prefill_logits = Tensor::new(
-                                prefill_logits.shape().clone(),
-                                new_buf,
-                                backend.clone(),
-                            );
-                            eprintln!("[Prefill] SwitchHw: Switched to CPU.");
-                        }
-                        "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
-                            eprintln!(
-                                "[Prefill] SwitchHw: CPU→GPU at chunk_pos={}",
-                                kv_caches[0].current_pos
-                            );
-                            llm_rs2::core::kv_migrate::migrate_kv_caches(
-                                &mut kv_caches,
-                                &backend,
-                                gpu_be,
-                                &cpu_backend_arc,
-                                &cpu_memory_arc,
-                                gpu_mem,
-                                kv_heads,
-                                head_dim,
-                                max_seq_len,
-                                true,
-                            )?;
-                            backend = gpu_be.clone();
-                            is_gpu = true;
-                            let new_buf = gpu_mem.alloc(logits_buf_size, DType::F32)?;
-                            prefill_logits = Tensor::new(
-                                prefill_logits.shape().clone(),
-                                new_buf,
-                                backend.clone(),
-                            );
-                            eprintln!("[Prefill] SwitchHw: Switched to GPU.");
-                        }
-                        _ => {} // Already on requested backend or weights not on GPU
+                // SwitchHw: defer to post-prefill boundary.
+                // Mid-prefill switch causes segfault: model workspace buffers
+                // remain on the old backend; the next chunk accesses them
+                // from the new backend -> invalid memory reference.
+                if let Some(ref device) = plan.switch_device {
+                    if deferred_switch.is_none() {
+                        eprintln!(
+                            "[Prefill] SwitchHw: deferring '{}' to post-prefill (chunk_pos={})",
+                            device, kv_caches[0].current_pos
+                        );
                     }
+                    deferred_switch = Some(device.clone());
                 }
             }
 
@@ -2173,6 +2173,54 @@ fn main() -> anyhow::Result<()> {
 
         tokens.push(next_token_id);
         start_pos += process_len;
+    }
+
+    // Execute deferred SwitchHw (from prefill checkpoint).
+    // Now safe: prefill is done, logits read, all workspace released.
+    // Decode buffers are allocated *after* this point, so only KV migrate
+    // and backend/is_gpu update are needed here.
+    if let Some(ref device) = deferred_switch
+        && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
+    {
+        match device.as_str() {
+            "cpu" if is_gpu => {
+                eprintln!("[Prefill->Decode] Executing deferred SwitchHw: GPU->CPU");
+                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                    &mut kv_caches,
+                    &backend,
+                    &cpu_backend_arc,
+                    &cpu_backend_arc,
+                    &cpu_memory_arc,
+                    &cpu_memory_arc,
+                    kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    false,
+                )?;
+                backend = cpu_backend_arc.clone();
+                is_gpu = false;
+                eprintln!("[Prefill->Decode] SwitchHw: Switched to CPU.");
+            }
+            "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
+                eprintln!("[Prefill->Decode] Executing deferred SwitchHw: CPU->GPU");
+                llm_rs2::core::kv_migrate::migrate_kv_caches(
+                    &mut kv_caches,
+                    &backend,
+                    gpu_be,
+                    &cpu_backend_arc,
+                    &cpu_memory_arc,
+                    gpu_mem,
+                    kv_heads,
+                    head_dim,
+                    max_seq_len,
+                    true,
+                )?;
+                backend = gpu_be.clone();
+                is_gpu = true;
+                eprintln!("[Prefill->Decode] SwitchHw: Switched to GPU.");
+            }
+            _ => {}
+        }
     }
 
     // D2O: compute per-layer budgets from prefill attention variance.
