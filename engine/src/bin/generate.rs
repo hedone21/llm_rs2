@@ -1450,6 +1450,13 @@ fn main() -> anyhow::Result<()> {
 
                 let entry_start = std::time::Instant::now();
 
+                eprintln!(
+                    "[Batch] #{} id={} prefill_start ts={:.3}",
+                    iteration,
+                    entry.id,
+                    unix_ts()
+                );
+
                 // === PREFILL ===
                 let process_len = batch_input_ids.len();
                 if process_len > max_seq_len {
@@ -1680,6 +1687,19 @@ fn main() -> anyhow::Result<()> {
                 batch_tokens.push(next_token_id);
                 let mut batch_start_pos = process_len;
 
+                eprintln!(
+                    "[Batch] #{} id={} prefill_end ts={:.3}",
+                    iteration,
+                    entry.id,
+                    unix_ts()
+                );
+                eprintln!(
+                    "[Batch] #{} id={} decode_start ts={:.3}",
+                    iteration,
+                    entry.id,
+                    unix_ts()
+                );
+
                 // === DECODE LOOP ===
                 let mut tbt_values_batch: Vec<f64> = Vec::new();
                 let mut generated_count: usize = 1; // first token already sampled
@@ -1752,6 +1772,13 @@ fn main() -> anyhow::Result<()> {
                         break;
                     }
                 }
+
+                eprintln!(
+                    "[Batch] #{} id={} decode_end ts={:.3}",
+                    iteration,
+                    entry.id,
+                    unix_ts()
+                );
 
                 let total_ms = entry_start.elapsed().as_secs_f64() * 1000.0;
                 let mean_tbt_ms = if tbt_values_batch.is_empty() {
@@ -3605,6 +3632,13 @@ fn plan_summary(plan: &llm_rs2::resilience::ExecutionPlan) -> Vec<String> {
 // ════════════════════════════════════════════════════════════════
 //  Prompt-batch helpers
 // ════════════════════════════════════════════════════════════════
+
+fn unix_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64()
+}
 
 #[derive(serde::Deserialize)]
 struct PromptBatchEntry {
