@@ -887,9 +887,9 @@ impl TransformerLayer {
                 .as_mut()
                 .expect("partition_ws must be set when partition_ctx is active");
 
-            // 0. Sync + copy residual to CPU buffer.
-            // UnifiedBuffer::as_ptr() returns null when unmapped, so GPU residual
-            // cannot be read directly by CPU. Copy via read_buffer after sync.
+            // 0. Sync prior GPU ops (rms_norm → residual) then copy to CPU.
+            // Blocking read_buffer on in-order queue also syncs, but explicit
+            // synchronize() gives the driver a cleaner pipeline drain signal.
             backend.synchronize()?;
             unsafe {
                 let dst = std::slice::from_raw_parts_mut(
@@ -904,19 +904,13 @@ impl TransformerLayer {
             backend.matmul_transposed(&ws.residual, &part.up.gpu_slice, &mut pw.up_gpu)?;
             backend.flush()?;
 
-            // 2. CPU: blocking partial matmuls using CPU-side residual copy
+            // 2. CPU: blocking partial matmuls (GPU runs in parallel after flush)
             let cpu = &part.cpu_backend;
             cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
             cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
 
-            // 3. GPU: wait for completion
-            backend.synchronize()?;
-
-            // 4. Merge: concat [gpu_part | cpu_part] → full gate/up buffers.
-            // GPU parts require read_buffer() for ARM cache coherency (direct
-            // as_ptr() reads stale data after GPU kernel writes).
-            // CPU parts use as_ptr() (SharedBuffer, always valid).
-            // ws.gate/ws.up use write_buffer() (may be UnifiedBuffer).
+            // 3+4. Merge: blocking read_buffer implicitly waits for GPU matmuls.
+            // No explicit synchronize() needed before read.
             {
                 let gpu_bytes = pw.gate_gpu.size();
                 let cpu_bytes = pw.gate_cpu.size();
