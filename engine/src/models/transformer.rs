@@ -56,11 +56,6 @@ fn release_source_pages(data: &[u8]) {
     }
 }
 
-/// Maximum single GPU buffer allocation size (bytes).
-/// Buffers exceeding this threshold are kept on CPU to avoid
-/// `CL_INVALID_BUFFER_SIZE` on devices with limited VRAM (e.g., mobile SoCs).
-const MAX_GPU_SINGLE_ALLOC: usize = 512 * 1024 * 1024; // 512 MB
-
 pub struct TransformerModel {
     pub config: ModelConfig,
     pub layers: Vec<TransformerLayer>,
@@ -636,11 +631,12 @@ impl TransformerModel {
                 // Models with huge vocabs (e.g., gemma3-1b: 262144 × 1152 × 2 = ~604 MB)
                 // can exceed CL_DEVICE_MAX_MEM_ALLOC_SIZE or cause OOM on mobile SoCs.
                 let embed_size = embed_tokens.size();
-                if embed_size > MAX_GPU_SINGLE_ALLOC {
+                let max_alloc = backend.max_single_alloc();
+                if embed_size > max_alloc {
                     eprintln!(
                         "lm_head too large for GPU ({:.0} MB > {:.0} MB limit), keeping on CPU",
                         embed_size as f64 / (1024.0 * 1024.0),
-                        MAX_GPU_SINGLE_ALLOC as f64 / (1024.0 * 1024.0),
+                        max_alloc as f64 / (1024.0 * 1024.0),
                     );
                     // Keep lm_head on CPU; forward paths will use CPU fallback matmul.
                     (embed_tokens.clone(), true)
@@ -780,14 +776,15 @@ impl TransformerModel {
         migrate!(self.norm);
         // lm_head + embed_tokens: may be large (>512MB for big vocab).
         // Migrate if possible, otherwise keep on CPU with fallback paths.
+        let max_alloc = gpu_backend.max_single_alloc();
         if !self.lm_head_on_cpu {
-            if self.lm_head.size() <= MAX_GPU_SINGLE_ALLOC {
+            if self.lm_head.size() <= max_alloc {
                 migrate!(self.lm_head);
             } else {
                 self.lm_head_on_cpu = true;
             }
         }
-        if self.embed_tokens.size() <= MAX_GPU_SINGLE_ALLOC {
+        if self.embed_tokens.size() <= max_alloc {
             self.gpu_embed_tokens = Some(migrate_one(&self.embed_tokens)?);
             count += 1;
         }
@@ -953,14 +950,15 @@ impl TransformerModel {
 
         // lm_head + embed_tokens: may be large, but Jetson has plenty of unified memory.
         // Still apply the same size guard for safety.
+        let max_alloc = gpu_backend.max_single_alloc();
         if !self.lm_head_on_cpu {
-            if self.lm_head.size() <= MAX_GPU_SINGLE_ALLOC {
+            if self.lm_head.size() <= max_alloc {
                 migrate!(self.lm_head);
             } else {
                 self.lm_head_on_cpu = true;
             }
         }
-        if self.embed_tokens.size() <= MAX_GPU_SINGLE_ALLOC {
+        if self.embed_tokens.size() <= max_alloc {
             self.gpu_embed_tokens = Some(migrate_one(&self.embed_tokens)?);
             count += 1;
         }

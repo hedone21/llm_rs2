@@ -339,6 +339,12 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Maximum single buffer allocation size in bytes.
+    /// GPU backends return CL_DEVICE_MAX_MEM_ALLOC_SIZE; CPU returns usize::MAX.
+    fn max_single_alloc(&self) -> usize {
+        usize::MAX
+    }
+
     /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
     /// Default: CPU fallback (returns false).
     #[allow(unused_variables, clippy::too_many_arguments)]

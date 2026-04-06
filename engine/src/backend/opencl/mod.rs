@@ -177,6 +177,9 @@ pub struct OpenCLBackend {
 
     // Cached compiler options for building additional programs (e.g., score_reduce.cl).
     cl_opts: String,
+
+    // CL_DEVICE_MAX_MEM_ALLOC_SIZE: maximum single buffer allocation (bytes).
+    max_mem_alloc_size: usize,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -265,12 +268,15 @@ impl OpenCLBackend {
                 global_mem.to_string().trim().parse::<u64>().unwrap_or(0) / (1024 * 1024)
             );
         }
-        if let Ok(max_alloc) = device.info(ocl::core::DeviceInfo::MaxMemAllocSize) {
-            log::info!(
-                "GPU Max Alloc Size: {} MB",
-                max_alloc.to_string().trim().parse::<u64>().unwrap_or(0) / (1024 * 1024)
-            );
-        }
+        let max_mem_alloc_size: usize = device
+            .info(ocl::core::DeviceInfo::MaxMemAllocSize)
+            .ok()
+            .and_then(|v| v.to_string().trim().parse::<u64>().ok())
+            .unwrap_or(1024 * 1024 * 1024) as usize; // fallback 1GB
+        log::info!(
+            "GPU Max Alloc Size: {} MB",
+            max_mem_alloc_size / (1024 * 1024)
+        );
 
         let context = Context::builder()
             .platform(platform)
@@ -793,6 +799,7 @@ impl OpenCLBackend {
             dummy_score_buf,
             gpu_score_acc: UnsafeCell::new(None),
             cl_opts: cl_opts.clone(),
+            max_mem_alloc_size,
         })
     }
 
@@ -1521,6 +1528,10 @@ impl Backend for OpenCLBackend {
 
     fn is_discrete_gpu(&self) -> bool {
         !self.use_zero_copy
+    }
+
+    fn max_single_alloc(&self) -> usize {
+        self.max_mem_alloc_size
     }
 
     fn flash_attention_prefill(
