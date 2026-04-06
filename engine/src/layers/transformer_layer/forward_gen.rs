@@ -909,27 +909,22 @@ impl TransformerLayer {
             cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
             cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
 
-            // 3+4. Merge: blocking read_buffer implicitly waits for GPU matmuls.
-            // No explicit synchronize() needed before read.
+            // 3+4. Merge via copy_slice: GPU→GPU copy + CPU→GPU write, no host staging.
+            // On OpenCL in-order queue the copy_slice after GPU matmuls is serialized,
+            // so no explicit synchronize() is needed.
             {
-                let gpu_bytes = pw.gate_gpu.size();
-                let cpu_bytes = pw.gate_cpu.size();
-                let mut combined = vec![0u8; gpu_bytes + cpu_bytes];
-                backend.read_buffer(&pw.gate_gpu, &mut combined[..gpu_bytes])?;
-                combined[gpu_bytes..].copy_from_slice(unsafe {
-                    std::slice::from_raw_parts(pw.gate_cpu.as_ptr(), cpu_bytes)
-                });
-                backend.write_buffer(&mut ws.gate, &combined)?;
+                let gpu_elems = pw.gate_gpu.size() / 4; // F32 elements
+                let cpu_elems = pw.gate_cpu.size() / 4;
+                // GPU partial → ws.gate[0..gpu_elems]
+                backend.copy_slice(&pw.gate_gpu, &mut ws.gate, 0, 0, gpu_elems)?;
+                // CPU partial → ws.gate[gpu_elems..] (CPU→GPU write with offset)
+                backend.copy_slice(&pw.gate_cpu, &mut ws.gate, 0, gpu_elems, cpu_elems)?;
             }
             {
-                let gpu_bytes = pw.up_gpu.size();
-                let cpu_bytes = pw.up_cpu.size();
-                let mut combined = vec![0u8; gpu_bytes + cpu_bytes];
-                backend.read_buffer(&pw.up_gpu, &mut combined[..gpu_bytes])?;
-                combined[gpu_bytes..].copy_from_slice(unsafe {
-                    std::slice::from_raw_parts(pw.up_cpu.as_ptr(), cpu_bytes)
-                });
-                backend.write_buffer(&mut ws.up, &combined)?;
+                let gpu_elems = pw.up_gpu.size() / 4;
+                let cpu_elems = pw.up_cpu.size() / 4;
+                backend.copy_slice(&pw.up_gpu, &mut ws.up, 0, 0, gpu_elems)?;
+                backend.copy_slice(&pw.up_cpu, &mut ws.up, 0, gpu_elems, cpu_elems)?;
             }
         } else if is_cpu_f16 && is_decode {
             // ── Fused NEON F16 dispatch (aarch64 only) ──
