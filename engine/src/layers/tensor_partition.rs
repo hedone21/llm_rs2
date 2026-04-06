@@ -4,6 +4,7 @@ use crate::core::buffer::DType;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use anyhow::{Result, ensure};
+use log::debug;
 use std::sync::Arc;
 
 /// Row alignment granularity for weight splits.
@@ -16,7 +17,8 @@ const ROW_ALIGNMENT: usize = 128;
 ///   - `gpu_slice`: `W[0..split_row, :]`   (processed by GPU)
 ///   - `cpu_slice`: `W[split_row.., :]`     (processed by CPU)
 ///
-/// The two slices share the same backing memory via `SliceBuffer`.
+/// Each slice owns an independent buffer (pre-copied from the original weight).
+/// GPU slices have a valid `cl_mem` handle; CPU slices have valid host pointers.
 pub struct PartitionedWeight {
     pub gpu_slice: Tensor,
     pub cpu_slice: Tensor,
@@ -73,12 +75,14 @@ fn align_down(value: usize, align: usize) -> usize {
 ///
 /// Given a weight `W [out_dim, in_dim]` and a `gpu_ratio` (0.0 to 1.0),
 /// produces a `PartitionedWeight` with:
-///   - `gpu_slice`: rows `[0, split_row)` — stays with the original backend (GPU)
-///   - `cpu_slice`: rows `[split_row, out_dim)` — tagged with `cpu_backend`
+///   - `gpu_slice`: rows `[0, split_row)` — independent GPU buffer (copied from original)
+///   - `cpu_slice`: rows `[split_row, out_dim)` — independent CPU buffer (copied)
 ///
 /// `split_row` is aligned to `ROW_ALIGNMENT` (128), clamped to `[128, out_dim - 128]`.
 ///
-/// Both slices share the parent buffer via zero-copy `SliceBuffer`.
+/// Each slice owns its own buffer via `Backend::copy_from()`, ensuring that
+/// GPU slices have a valid `cl_mem` handle and CPU slices have a valid host pointer.
+/// This avoids `SliceBuffer`'s inability to provide `cl_mem` for sub-regions.
 pub fn split_weight(
     weight: &Tensor,
     gpu_ratio: f32,
@@ -123,20 +127,47 @@ pub fn split_weight(
         weight.size()
     );
 
+    // Create temporary SliceBuffer views to read the correct byte ranges,
+    // then copy into independent buffers via Backend::copy_from().
     let parent_buf = weight.buffer().clone();
 
-    let gpu_buf = Arc::new(SliceBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype)?);
-    let cpu_buf = Arc::new(SliceBuffer::new(parent_buf, gpu_bytes, cpu_bytes, dtype)?);
+    let tmp_gpu_buf = Arc::new(SliceBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype)?);
+    let tmp_cpu_buf = Arc::new(SliceBuffer::new(parent_buf, gpu_bytes, cpu_bytes, dtype)?);
 
+    let tmp_gpu_tensor = Tensor::new(
+        Shape::new(vec![split_row, in_dim]),
+        tmp_gpu_buf,
+        weight.backend().clone(),
+    );
+    let tmp_cpu_tensor = Tensor::new(
+        Shape::new(vec![out_dim - split_row, in_dim]),
+        tmp_cpu_buf,
+        cpu_backend.clone(),
+    );
+
+    // GPU slice: copy into a new buffer owned by the original (GPU) backend.
+    // On OpenCL, this creates a proper cl_mem buffer via Host-to-Device copy.
+    // On CPU-only tests, this is a simple memcpy into a SharedBuffer.
+    let gpu_tensor = weight.backend().copy_from(&tmp_gpu_tensor)?;
+
+    // CPU slice: copy into a new CPU buffer via the cpu_backend.
+    let cpu_tensor = cpu_backend.copy_from(&tmp_cpu_tensor)?;
+
+    // Re-wrap with correct backends to ensure forward dispatch uses the right one.
     let gpu_tensor = Tensor::new(
         Shape::new(vec![split_row, in_dim]),
-        gpu_buf,
+        gpu_tensor.buffer().clone(),
         weight.backend().clone(),
     );
     let cpu_tensor = Tensor::new(
         Shape::new(vec![out_dim - split_row, in_dim]),
-        cpu_buf,
+        cpu_tensor.buffer().clone(),
         cpu_backend.clone(),
+    );
+
+    debug!(
+        "split_weight: [{}x{}] split_row={}, gpu_bytes={}, cpu_bytes={} (pre-copy)",
+        out_dim, in_dim, split_row, gpu_bytes, cpu_bytes,
     );
 
     Ok(PartitionedWeight {
@@ -237,12 +268,12 @@ mod tests {
         let cpu_size = pw.cpu_slice.size();
         assert_eq!(gpu_size + cpu_size, w.size());
 
-        // Verify data continuity: last byte of gpu == byte before first byte of cpu
-        let orig_ptr = w.as_ptr();
-        let gpu_ptr = pw.gpu_slice.as_ptr();
-        let cpu_ptr = pw.cpu_slice.as_ptr();
-        assert_eq!(gpu_ptr, orig_ptr);
-        assert_eq!(cpu_ptr, unsafe { orig_ptr.add(gpu_size) });
+        // Verify data content matches original weight bytes (pre-copy creates independent buffers).
+        let orig = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.size()) };
+        let gpu_data = unsafe { std::slice::from_raw_parts(pw.gpu_slice.as_ptr(), gpu_size) };
+        let cpu_data = unsafe { std::slice::from_raw_parts(pw.cpu_slice.as_ptr(), cpu_size) };
+        assert_eq!(gpu_data, &orig[..gpu_size]);
+        assert_eq!(cpu_data, &orig[gpu_size..]);
     }
 
     // PA-T1-09: split -> concat roundtrip for F32.

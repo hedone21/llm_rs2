@@ -476,9 +476,10 @@ fn main() -> anyhow::Result<()> {
             // When resilience is enabled, force zero-copy memory so KV cache uses
             // MadviseableGPUBuffer (host-accessible). This enables zero-alloc
             // UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
-            let effective_zero_copy = args.zero_copy || args.resilience_prealloc_switch;
-            if !args.zero_copy && args.resilience_prealloc_switch {
-                eprintln!("[Config] Forcing zero-copy memory for resilience SwitchHw support");
+            let effective_zero_copy =
+                args.zero_copy || args.resilience_prealloc_switch || args.tensor_partition > 0.0;
+            if !args.zero_copy && (args.resilience_prealloc_switch || args.tensor_partition > 0.0) {
+                eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
             }
             let gpu_mem: Arc<dyn Memory> =
                 Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
@@ -541,7 +542,7 @@ fn main() -> anyhow::Result<()> {
     // GPU→CPU SwitchHw. Default OpenCLBuffer (device-only) has as_ptr()=null —
     // CpuBackend can't read them. Re-wrap as ClWrappedBuffer (CL_MEM_USE_HOST_PTR).
     #[cfg(feature = "opencl")]
-    if is_gpu && args.resilience_prealloc_switch {
+    if is_gpu && (args.resilience_prealloc_switch || args.tensor_partition > 0.0) {
         match model.rewrap_weights_for_dual_access(&backend) {
             Ok(n) if n > 0 => eprintln!(
                 "[Backend] Re-wrapped {} weight tensors for dual CPU/GPU access",
@@ -1440,6 +1441,7 @@ fn main() -> anyhow::Result<()> {
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx.gate.split_row,
                 ffn_hidden,
+                hidden_size,
                 memory.as_ref(),
                 backend.clone(),
                 cpu_backend_arc.clone(),
@@ -2366,6 +2368,7 @@ fn main() -> anyhow::Result<()> {
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx.gate.split_row,
                 ffn_hidden,
+                hidden_size,
                 memory.as_ref(),
                 backend.clone(),
                 cpu_backend_arc.clone(),

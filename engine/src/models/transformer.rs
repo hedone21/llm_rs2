@@ -900,8 +900,10 @@ impl TransformerModel {
     ///   - `[0, split_row)` stays on the current (GPU) backend
     ///   - `[split_row, out_dim)` is tagged with `cpu_backend`
     ///
-    /// Both slices share the same backing memory via zero-copy `SliceBuffer`.
-    /// Call after `rewrap_weights_for_dual_access()` so weights are CPU-accessible.
+    /// Each slice is pre-copied into an independent buffer via `Backend::copy_from()`,
+    /// ensuring GPU slices have a valid `cl_mem` handle for OpenCL kernel dispatch.
+    /// Call after `rewrap_weights_for_dual_access()` so weights are CPU-accessible
+    /// (needed for the Host-to-Device copy path).
     ///
     /// Returns the number of weights partitioned (2 per layer: gate + up).
     pub fn prepare_tensor_partition(

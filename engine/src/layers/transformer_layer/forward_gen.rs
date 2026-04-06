@@ -887,42 +887,52 @@ impl TransformerLayer {
                 .as_mut()
                 .expect("partition_ws must be set when partition_ctx is active");
 
+            // 0. Sync + copy residual to CPU buffer.
+            // UnifiedBuffer::as_ptr() returns null when unmapped, so GPU residual
+            // cannot be read directly by CPU. Copy via read_buffer after sync.
+            backend.synchronize()?;
+            unsafe {
+                let dst = std::slice::from_raw_parts_mut(
+                    pw.residual_cpu.as_mut_ptr(),
+                    pw.residual_cpu.size(),
+                );
+                backend.read_buffer(&ws.residual, dst)?;
+            }
+
             // 1. GPU: enqueue partial matmuls (non-blocking)
             backend.matmul_transposed(&ws.residual, &part.gate.gpu_slice, &mut pw.gate_gpu)?;
             backend.matmul_transposed(&ws.residual, &part.up.gpu_slice, &mut pw.up_gpu)?;
             backend.flush()?;
 
-            // 2. CPU: blocking partial matmuls (GPU runs in parallel)
+            // 2. CPU: blocking partial matmuls using CPU-side residual copy
             let cpu = &part.cpu_backend;
-            cpu.matmul_transposed(&ws.residual, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
-            cpu.matmul_transposed(&ws.residual, &part.up.cpu_slice, &mut pw.up_cpu)?;
+            cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
+            cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
 
             // 3. GPU: wait for completion
             backend.synchronize()?;
 
-            // 4. Merge: concat [gpu_part | cpu_part] → full gate/up output
-            // Safety: all pointers are host-accessible (UMA / ClWrappedBuffer).
-            // Sizes are exact: gpu_bytes + cpu_bytes == full output bytes.
-            unsafe {
-                let gate_dst = ws.gate.as_mut_ptr();
+            // 4. Merge: concat [gpu_part | cpu_part] → full gate/up buffers.
+            // UnifiedBuffer::as_ptr() is null, so use read_buffer/write_buffer.
+            {
                 let gpu_bytes = pw.gate_gpu.size();
                 let cpu_bytes = pw.gate_cpu.size();
-                std::ptr::copy_nonoverlapping(pw.gate_gpu.as_ptr(), gate_dst, gpu_bytes);
-                std::ptr::copy_nonoverlapping(
-                    pw.gate_cpu.as_ptr(),
-                    gate_dst.add(gpu_bytes),
-                    cpu_bytes,
-                );
-
-                let up_dst = ws.up.as_mut_ptr();
-                let up_gpu_bytes = pw.up_gpu.size();
-                let up_cpu_bytes = pw.up_cpu.size();
-                std::ptr::copy_nonoverlapping(pw.up_gpu.as_ptr(), up_dst, up_gpu_bytes);
-                std::ptr::copy_nonoverlapping(
-                    pw.up_cpu.as_ptr(),
-                    up_dst.add(up_gpu_bytes),
-                    up_cpu_bytes,
-                );
+                let mut combined = vec![0u8; gpu_bytes + cpu_bytes];
+                backend.read_buffer(&pw.gate_gpu, &mut combined[..gpu_bytes])?;
+                combined[gpu_bytes..].copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(pw.gate_cpu.as_ptr(), cpu_bytes)
+                });
+                backend.write_buffer(&mut ws.gate, &combined)?;
+            }
+            {
+                let gpu_bytes = pw.up_gpu.size();
+                let cpu_bytes = pw.up_cpu.size();
+                let mut combined = vec![0u8; gpu_bytes + cpu_bytes];
+                backend.read_buffer(&pw.up_gpu, &mut combined[..gpu_bytes])?;
+                combined[gpu_bytes..].copy_from_slice(unsafe {
+                    std::slice::from_raw_parts(pw.up_cpu.as_ptr(), cpu_bytes)
+                });
+                backend.write_buffer(&mut ws.up, &combined)?;
             }
         } else if is_cpu_f16 && is_decode {
             // ── Fused NEON F16 dispatch (aarch64 only) ──

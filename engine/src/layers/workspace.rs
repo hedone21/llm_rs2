@@ -54,6 +54,7 @@ impl LayerWorkspace {
             bufs.push(pw.gate_cpu.buffer().clone());
             bufs.push(pw.up_gpu.buffer().clone());
             bufs.push(pw.up_cpu.buffer().clone());
+            bufs.push(pw.residual_cpu.buffer().clone());
         }
         bufs
     }
@@ -82,6 +83,7 @@ impl LayerWorkspace {
                 gate_cpu: retag(pw.gate_cpu),
                 up_gpu: retag(pw.up_gpu),
                 up_cpu: retag(pw.up_cpu),
+                residual_cpu: retag(pw.residual_cpu),
             }),
         }
     }
@@ -194,6 +196,10 @@ pub struct PartitionWorkspace {
     pub up_gpu: Tensor,
     /// CPU partial output for up projection: [1, 1, out_dim - split_row]
     pub up_cpu: Tensor,
+    /// CPU-side copy of residual for CPU matmul input: [1, 1, dim]
+    /// UnifiedBuffer::as_ptr() returns null when unmapped, so we copy residual
+    /// to this CPU buffer via read_buffer() before CPU matmul.
+    pub residual_cpu: Tensor,
 }
 
 impl PartitionWorkspace {
@@ -207,16 +213,20 @@ impl PartitionWorkspace {
     pub fn new(
         split_row: usize,
         out_dim: usize,
+        dim: usize,
         memory: &dyn Memory,
         gpu_backend: Arc<dyn Backend>,
         cpu_backend: Arc<dyn Backend>,
     ) -> Result<Self> {
+        use crate::memory::galloc::Galloc;
+
         let cpu_rows = out_dim - split_row;
+        let cpu_mem = Galloc::new();
 
         let gate_gpu_buf = memory.alloc(split_row * 4, DType::F32)?;
-        let gate_cpu_buf = memory.alloc(cpu_rows * 4, DType::F32)?;
+        let gate_cpu_buf = cpu_mem.alloc(cpu_rows * 4, DType::F32)?;
         let up_gpu_buf = memory.alloc(split_row * 4, DType::F32)?;
-        let up_cpu_buf = memory.alloc(cpu_rows * 4, DType::F32)?;
+        let up_cpu_buf = cpu_mem.alloc(cpu_rows * 4, DType::F32)?;
 
         Ok(Self {
             gate_gpu: Tensor::new(
@@ -230,7 +240,15 @@ impl PartitionWorkspace {
                 cpu_backend.clone(),
             ),
             up_gpu: Tensor::new(Shape::new(vec![1, 1, split_row]), up_gpu_buf, gpu_backend),
-            up_cpu: Tensor::new(Shape::new(vec![1, 1, cpu_rows]), up_cpu_buf, cpu_backend),
+            up_cpu: Tensor::new(
+                Shape::new(vec![1, 1, cpu_rows]),
+                up_cpu_buf,
+                cpu_backend.clone(),
+            ),
+            residual_cpu: {
+                let buf = cpu_mem.alloc(dim * 4, DType::F32)?;
+                Tensor::new(Shape::new(vec![1, 1, dim]), buf, cpu_backend)
+            },
         })
     }
 }
