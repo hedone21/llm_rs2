@@ -24,6 +24,9 @@ pub struct LayerWorkspace {
     /// Avoids GPU memory allocation per token per layer.
     pub k_cast: Option<Tensor>,
     pub v_cast: Option<Tensor>,
+    /// Pre-allocated scratch buffers for CPU-GPU tensor partition (decode only).
+    /// None when tensor partition is disabled.
+    pub partition_ws: Option<PartitionWorkspace>,
 }
 
 impl LayerWorkspace {
@@ -46,6 +49,12 @@ impl LayerWorkspace {
         if let Some(ref t) = self.v_cast {
             bufs.push(t.buffer().clone());
         }
+        if let Some(ref pw) = self.partition_ws {
+            bufs.push(pw.gate_gpu.buffer().clone());
+            bufs.push(pw.gate_cpu.buffer().clone());
+            bufs.push(pw.up_gpu.buffer().clone());
+            bufs.push(pw.up_cpu.buffer().clone());
+        }
         bufs
     }
 
@@ -66,8 +75,14 @@ impl LayerWorkspace {
             residual: retag(self.residual),
             attn_out: retag(self.attn_out),
             scores: self.scores,
-            k_cast: self.k_cast.map(retag),
-            v_cast: self.v_cast.map(retag),
+            k_cast: self.k_cast.map(&retag),
+            v_cast: self.v_cast.map(&retag),
+            partition_ws: self.partition_ws.map(|pw| PartitionWorkspace {
+                gate_gpu: retag(pw.gate_gpu),
+                gate_cpu: retag(pw.gate_cpu),
+                up_gpu: retag(pw.up_gpu),
+                up_cpu: retag(pw.up_cpu),
+            }),
         }
     }
 
@@ -95,6 +110,7 @@ impl LayerWorkspace {
             scores: vec![0.0; config.n_heads * config.max_seq_len],
             k_cast: None, // Lazily initialized on first use with correct dtype
             v_cast: None,
+            partition_ws: None, // Set externally when tensor partition is enabled
         })
     }
 }
@@ -162,6 +178,60 @@ impl PrefillWorkspace {
     /// Current sequence length this workspace is sized for.
     pub fn seq_len(&self) -> usize {
         self.seq_len
+    }
+}
+
+/// Pre-allocated scratch tensors for partitioned FFN output (decode only).
+///
+/// Each pair (gpu, cpu) holds one partial result that together form the full
+/// output dimension. Created once during partition setup and reused every token.
+pub struct PartitionWorkspace {
+    /// GPU partial output for gate projection: [1, 1, split_row]
+    pub gate_gpu: Tensor,
+    /// CPU partial output for gate projection: [1, 1, out_dim - split_row]
+    pub gate_cpu: Tensor,
+    /// GPU partial output for up projection: [1, 1, split_row]
+    pub up_gpu: Tensor,
+    /// CPU partial output for up projection: [1, 1, out_dim - split_row]
+    pub up_cpu: Tensor,
+}
+
+impl PartitionWorkspace {
+    /// Allocate partition workspace buffers.
+    ///
+    /// `split_row`: number of output rows handled by GPU.
+    /// `out_dim`: total output dimension of gate/up projections.
+    /// `memory`: allocator for buffer creation.
+    /// `gpu_backend`: backend for GPU-side tensors.
+    /// `cpu_backend`: backend for CPU-side tensors.
+    pub fn new(
+        split_row: usize,
+        out_dim: usize,
+        memory: &dyn Memory,
+        gpu_backend: Arc<dyn Backend>,
+        cpu_backend: Arc<dyn Backend>,
+    ) -> Result<Self> {
+        let cpu_rows = out_dim - split_row;
+
+        let gate_gpu_buf = memory.alloc(split_row * 4, DType::F32)?;
+        let gate_cpu_buf = memory.alloc(cpu_rows * 4, DType::F32)?;
+        let up_gpu_buf = memory.alloc(split_row * 4, DType::F32)?;
+        let up_cpu_buf = memory.alloc(cpu_rows * 4, DType::F32)?;
+
+        Ok(Self {
+            gate_gpu: Tensor::new(
+                Shape::new(vec![1, 1, split_row]),
+                gate_gpu_buf,
+                gpu_backend.clone(),
+            ),
+            gate_cpu: Tensor::new(
+                Shape::new(vec![1, 1, cpu_rows]),
+                gate_cpu_buf,
+                cpu_backend.clone(),
+            ),
+            up_gpu: Tensor::new(Shape::new(vec![1, 1, split_row]), up_gpu_buf, gpu_backend),
+            up_cpu: Tensor::new(Shape::new(vec![1, 1, cpu_rows]), up_cpu_buf, cpu_backend),
+        })
     }
 }
 

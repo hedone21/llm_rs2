@@ -472,6 +472,7 @@ impl TransformerModel {
                 k_norm,
                 pre_ffn_norm,
                 post_ffn_norm,
+                partition_ctx: None,
             };
             layers.push(layer);
         }
@@ -889,6 +890,38 @@ impl TransformerModel {
         if let Some(ref t) = self.gpu_embed_tokens {
             self.gpu_embed_tokens = Some(rewrap_one(t, gpu_backend)?);
             count += 1;
+        }
+        Ok(count)
+    }
+
+    /// Prepare tensor partitioning for CPU-GPU cooperative FFN inference.
+    ///
+    /// Splits each layer's gate and up projection weights row-wise:
+    ///   - `[0, split_row)` stays on the current (GPU) backend
+    ///   - `[split_row, out_dim)` is tagged with `cpu_backend`
+    ///
+    /// Both slices share the same backing memory via zero-copy `SliceBuffer`.
+    /// Call after `rewrap_weights_for_dual_access()` so weights are CPU-accessible.
+    ///
+    /// Returns the number of weights partitioned (2 per layer: gate + up).
+    pub fn prepare_tensor_partition(
+        &mut self,
+        gpu_ratio: f32,
+        cpu_backend: &Arc<dyn Backend>,
+    ) -> Result<usize> {
+        use crate::layers::tensor_partition::{PartitionContext, split_weight};
+
+        let mut count = 0;
+        for layer in &mut self.layers {
+            let gate = split_weight(&layer.w_gate, gpu_ratio, cpu_backend)?;
+            let up = split_weight(&layer.w_up, gpu_ratio, cpu_backend)?;
+            layer.partition_ctx = Some(PartitionContext {
+                gpu_ratio,
+                cpu_backend: cpu_backend.clone(),
+                gate,
+                up,
+            });
+            count += 2;
         }
         Ok(count)
     }

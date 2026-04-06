@@ -15,6 +15,7 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::buffer::shared_buffer::SharedBuffer;
+use crate::layers::tensor_partition::PartitionContext;
 
 // Re-export OpProfiler from its canonical location for backward compatibility.
 pub use crate::profile::ops::OpProfiler;
@@ -213,6 +214,11 @@ pub struct TransformerLayer {
     pub pre_ffn_norm: Option<Tensor>,
     /// Post-FFN norm (Gemma3: post_feedforward_layernorm). None for Llama/Qwen2.
     pub post_ffn_norm: Option<Tensor>,
+
+    /// Tensor partition context for CPU-GPU cooperative FFN inference.
+    /// When set, FFN gate/up matmuls are split between GPU and CPU backends.
+    /// None when tensor partition is disabled (default).
+    pub partition_ctx: Option<PartitionContext>,
 }
 
 impl TransformerLayer {

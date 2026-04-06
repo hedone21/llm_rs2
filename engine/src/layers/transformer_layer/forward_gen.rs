@@ -878,9 +878,54 @@ impl TransformerLayer {
         }
         prof_record!(t, rms_norm);
 
-        // 9. FFN — fused gate+up dispatch for F16 CPU (1 dispatch instead of 2)
+        // 9. FFN — gate + up projections (3 paths: partition, fused NEON, generic)
         let t = prof_start!();
-        if is_cpu_f16 && is_decode {
+        if let Some(ref part) = self.partition_ctx {
+            // ── Partitioned FFN gate/up: cooperative GPU + CPU ──
+            let pw = ws
+                .partition_ws
+                .as_mut()
+                .expect("partition_ws must be set when partition_ctx is active");
+
+            // 1. GPU: enqueue partial matmuls (non-blocking)
+            backend.matmul_transposed(&ws.residual, &part.gate.gpu_slice, &mut pw.gate_gpu)?;
+            backend.matmul_transposed(&ws.residual, &part.up.gpu_slice, &mut pw.up_gpu)?;
+            backend.flush()?;
+
+            // 2. CPU: blocking partial matmuls (GPU runs in parallel)
+            let cpu = &part.cpu_backend;
+            cpu.matmul_transposed(&ws.residual, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
+            cpu.matmul_transposed(&ws.residual, &part.up.cpu_slice, &mut pw.up_cpu)?;
+
+            // 3. GPU: wait for completion
+            backend.synchronize()?;
+
+            // 4. Merge: concat [gpu_part | cpu_part] → full gate/up output
+            // Safety: all pointers are host-accessible (UMA / ClWrappedBuffer).
+            // Sizes are exact: gpu_bytes + cpu_bytes == full output bytes.
+            unsafe {
+                let gate_dst = ws.gate.as_mut_ptr();
+                let gpu_bytes = pw.gate_gpu.size();
+                let cpu_bytes = pw.gate_cpu.size();
+                std::ptr::copy_nonoverlapping(pw.gate_gpu.as_ptr(), gate_dst, gpu_bytes);
+                std::ptr::copy_nonoverlapping(
+                    pw.gate_cpu.as_ptr(),
+                    gate_dst.add(gpu_bytes),
+                    cpu_bytes,
+                );
+
+                let up_dst = ws.up.as_mut_ptr();
+                let up_gpu_bytes = pw.up_gpu.size();
+                let up_cpu_bytes = pw.up_cpu.size();
+                std::ptr::copy_nonoverlapping(pw.up_gpu.as_ptr(), up_dst, up_gpu_bytes);
+                std::ptr::copy_nonoverlapping(
+                    pw.up_cpu.as_ptr(),
+                    up_dst.add(up_gpu_bytes),
+                    up_cpu_bytes,
+                );
+            }
+        } else if is_cpu_f16 && is_decode {
+            // ── Fused NEON F16 dispatch (aarch64 only) ──
             #[cfg(target_arch = "aarch64")]
             {
                 let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
@@ -904,13 +949,14 @@ impl TransformerLayer {
                 }
             }
         } else {
+            // ── Generic path: sequential matmuls on active backend ──
             crate::core::thread_pool::get_pool().begin_batch();
             backend.matmul_transposed(&ws.residual, &self.w_gate, &mut ws.gate)?;
             backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             crate::core::thread_pool::get_pool().end_batch();
-        }
-        if is_gpu {
-            backend.flush()?;
+            if is_gpu {
+                backend.flush()?;
+            }
         }
         prof_record!(t, matmul_ffn);
 

@@ -18,7 +18,7 @@ use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
 use llm_rs2::core::tensor::Tensor;
-use llm_rs2::layers::workspace::{LayerWorkspace, WorkspaceConfig};
+use llm_rs2::layers::workspace::{LayerWorkspace, PartitionWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use std::sync::Arc;
@@ -90,6 +90,11 @@ struct Args {
     /// Disable GPU kernel plan for decode (fallback to forward_into every token)
     #[arg(long, default_value_t = false)]
     no_gpu_plan: bool,
+
+    /// GPU ratio for tensor partition (0.0~1.0). 0 = disabled.
+    /// Splits FFN gate/up matmul between GPU and CPU for cooperative execution.
+    #[arg(long, default_value_t = 0.0)]
+    tensor_partition: f32,
 
     /// Disable PrefillWorkspace (fallback to per-layer alloc during prefill)
     #[arg(long, default_value_t = false)]
@@ -558,6 +563,18 @@ fn main() -> anyhow::Result<()> {
                 n
             ),
             Err(e) => eprintln!("[Backend] CUDA weight migration failed: {}", e),
+        }
+    }
+
+    // Tensor partition: split FFN gate/up weights for CPU-GPU cooperative inference.
+    // Requires weights to be CPU-accessible (after rewrap_weights_for_dual_access).
+    if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
+        match model.prepare_tensor_partition(args.tensor_partition, &cpu_backend_arc) {
+            Ok(n) => eprintln!(
+                "[Partition] Prepared {} weights with ratio {:.2}",
+                n, args.tensor_partition
+            ),
+            Err(e) => eprintln!("[Partition] Failed to prepare tensor partition: {}", e),
         }
     }
 
@@ -1418,6 +1435,17 @@ fn main() -> anyhow::Result<()> {
             backend.clone(),
         )?;
 
+        // Attach partition workspace if tensor partition is active
+        if let Some(ref ctx) = model.layers[0].partition_ctx {
+            gen_ws.partition_ws = Some(PartitionWorkspace::new(
+                ctx.gate.split_row,
+                ffn_hidden,
+                memory.as_ref(),
+                backend.clone(),
+                cpu_backend_arc.clone(),
+            )?);
+        }
+
         // Pre-allocate CPU/GPU single-token tensors
         let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
         let cpu_gen_input = Tensor::new(
@@ -1577,7 +1605,9 @@ fn main() -> anyhow::Result<()> {
                         if throttle_delay_ms > 0 {
                             eprintln!(
                                 "[Prefill] Throttle: {}ms delay after chunk {}/{}",
-                                throttle_delay_ms, chunk_idx + 1, total_chunks
+                                throttle_delay_ms,
+                                chunk_idx + 1,
+                                total_chunks
                             );
                             std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
                         }
@@ -1792,9 +1822,7 @@ fn main() -> anyhow::Result<()> {
                     // alloc() creates OpenCLBuffer (null as_ptr). Must use
                     // cpu_memory_arc for CPU-accessible lazy allocations.
                     let effective_mem: &dyn Memory = if is_gpu {
-                        gpu_memory_arc
-                            .as_deref()
-                            .unwrap_or_else(|| memory.as_ref())
+                        gpu_memory_arc.as_deref().unwrap_or_else(|| memory.as_ref())
                     } else {
                         cpu_memory_arc.as_ref()
                     };
@@ -2116,7 +2144,9 @@ fn main() -> anyhow::Result<()> {
                 if throttle_delay_ms > 0 {
                     eprintln!(
                         "[Prefill] Throttle: {}ms delay after chunk {}/{}",
-                        throttle_delay_ms, chunk_idx + 1, total_chunks
+                        throttle_delay_ms,
+                        chunk_idx + 1,
+                        total_chunks
                     );
                     std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
                 }
@@ -2330,6 +2360,17 @@ fn main() -> anyhow::Result<()> {
             memory.as_ref(),
             backend.clone(),
         )?;
+
+        // Attach partition workspace if tensor partition is active
+        if let Some(ref ctx) = model.layers[0].partition_ctx {
+            gen_ws.partition_ws = Some(PartitionWorkspace::new(
+                ctx.gate.split_row,
+                ffn_hidden,
+                memory.as_ref(),
+                backend.clone(),
+                cpu_backend_arc.clone(),
+            )?);
+        }
 
         // Single token CPU tensor for generation loop
         let cpu_gen_indices_buf = Galloc::new().alloc(4, DType::U8)?;
