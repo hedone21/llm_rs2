@@ -1467,9 +1467,12 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Chunked prefill
+                // When resilience is enabled, auto-chunk at 256 for checkpoint support.
                 let chunk_size =
                     if args.prefill_chunk_size > 0 && args.prefill_chunk_size < process_len {
                         args.prefill_chunk_size
+                    } else if args.enable_resilience && process_len > 256 {
+                        256
                     } else {
                         process_len
                     };
@@ -1526,6 +1529,119 @@ fn main() -> anyhow::Result<()> {
                     })?;
                     backend.synchronize()?;
                     drop(input_tensor);
+
+                    // ── Prefill resilience checkpoint (chunk boundary) ──
+                    if chunked && let Some(executor) = &mut command_executor {
+                        let kv_snap = KVSnapshot {
+                            total_bytes: kv_caches
+                                .iter()
+                                .map(|c| {
+                                    (c.k_buffer.buffer().size() + c.v_buffer.buffer().size()) as u64
+                                })
+                                .sum(),
+                            total_tokens: kv_caches[0].current_pos,
+                            capacity: kv_caches[0].capacity(),
+                            protected_prefix: actual_protected_prefix,
+                            kv_dtype: args.kv_type.clone(),
+                            eviction_policy: args.eviction_policy.clone(),
+                            skip_ratio: 0.0,
+                        };
+                        let plan = executor.poll(&kv_snap);
+
+                        // Throttle: sleep between chunks
+                        if plan.throttle_delay_ms > 0 && plan.throttle_delay_ms != throttle_delay_ms
+                        {
+                            eprintln!(
+                                "[Prefill] Throttle: {}ms → {}ms",
+                                throttle_delay_ms, plan.throttle_delay_ms
+                            );
+                        }
+                        throttle_delay_ms = plan.throttle_delay_ms;
+                        if throttle_delay_ms > 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
+                        }
+
+                        // LayerSkip
+                        if plan.restore_defaults {
+                            skip_config = None;
+                            last_skip_ratio = None;
+                        } else if let Some(ratio) = plan.layer_skip
+                            && last_skip_ratio != Some(ratio)
+                        {
+                            eprintln!("[Prefill] LayerSkip: ratio={:.2}", ratio);
+                            skip_config = Some(SkipConfig::uniform_init(
+                                model.config.num_hidden_layers,
+                                ratio,
+                            ));
+                            last_skip_ratio = Some(ratio);
+                        }
+
+                        // SwitchHw: migrate KV caches and reallocate prefill_logits
+                        if let Some(ref device) = plan.switch_device
+                            && let (Some(gpu_be), Some(gpu_mem)) =
+                                (&gpu_backend_arc, &gpu_memory_arc)
+                        {
+                            match device.as_str() {
+                                "cpu" if is_gpu => {
+                                    eprintln!(
+                                        "[Prefill] SwitchHw: GPU→CPU at chunk_pos={}",
+                                        kv_caches[0].current_pos
+                                    );
+                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                        &mut kv_caches,
+                                        &backend,
+                                        &cpu_backend_arc,
+                                        &cpu_backend_arc,
+                                        &cpu_memory_arc,
+                                        &cpu_memory_arc,
+                                        kv_heads,
+                                        head_dim,
+                                        max_seq_len,
+                                        false,
+                                    )?;
+                                    backend = cpu_backend_arc.clone();
+                                    is_gpu = false;
+                                    let new_buf =
+                                        Galloc::new().alloc(prefill_logits_buf_size, DType::F32)?;
+                                    prefill_logits = Tensor::new(
+                                        prefill_logits.shape().clone(),
+                                        new_buf,
+                                        backend.clone(),
+                                    );
+                                    eprintln!("[Prefill] SwitchHw: Switched to CPU.");
+                                }
+                                "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
+                                    eprintln!(
+                                        "[Prefill] SwitchHw: CPU→GPU at chunk_pos={}",
+                                        kv_caches[0].current_pos
+                                    );
+                                    llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                        &mut kv_caches,
+                                        &backend,
+                                        gpu_be,
+                                        &cpu_backend_arc,
+                                        &cpu_memory_arc,
+                                        gpu_mem,
+                                        kv_heads,
+                                        head_dim,
+                                        max_seq_len,
+                                        true,
+                                    )?;
+                                    backend = gpu_be.clone();
+                                    is_gpu = true;
+                                    let new_buf =
+                                        gpu_mem.alloc(prefill_logits_buf_size, DType::F32)?;
+                                    prefill_logits = Tensor::new(
+                                        prefill_logits.shape().clone(),
+                                        new_buf,
+                                        backend.clone(),
+                                    );
+                                    eprintln!("[Prefill] SwitchHw: Switched to GPU.");
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
 
                     chunk_start = chunk_end;
                 }
@@ -1790,8 +1906,12 @@ fn main() -> anyhow::Result<()> {
 
         // Determine effective chunk size.
         // 0 or >= process_len → use full prompt as single chunk (original behaviour).
+        // When resilience is enabled, auto-chunk at 256 so that chunk boundaries
+        // serve as checkpoints for SwitchHw / Throttle / LayerSkip commands.
         let chunk_size = if args.prefill_chunk_size > 0 && args.prefill_chunk_size < process_len {
             args.prefill_chunk_size
+        } else if args.enable_resilience && process_len > 256 {
+            256
         } else {
             process_len
         };
@@ -1863,6 +1983,115 @@ fn main() -> anyhow::Result<()> {
 
             // Immediately release the GPU input buffer for this chunk.
             drop(input_tensor);
+
+            // ── Prefill resilience checkpoint (chunk boundary) ──
+            // Poll CommandExecutor between chunks to handle SwitchHw, Throttle,
+            // and LayerSkip commands mid-prefill. Only active in chunked mode.
+            if chunked && let Some(executor) = &mut command_executor {
+                let kv_snap = KVSnapshot {
+                    total_bytes: kv_caches
+                        .iter()
+                        .map(|c| (c.k_buffer.buffer().size() + c.v_buffer.buffer().size()) as u64)
+                        .sum(),
+                    total_tokens: kv_caches[0].current_pos,
+                    capacity: kv_caches[0].capacity(),
+                    protected_prefix: actual_protected_prefix,
+                    kv_dtype: args.kv_type.clone(),
+                    eviction_policy: args.eviction_policy.clone(),
+                    skip_ratio: 0.0,
+                };
+                let plan = executor.poll(&kv_snap);
+
+                // Throttle: sleep between chunks
+                if plan.throttle_delay_ms > 0 && plan.throttle_delay_ms != throttle_delay_ms {
+                    eprintln!(
+                        "[Prefill] Throttle: {}ms → {}ms",
+                        throttle_delay_ms, plan.throttle_delay_ms
+                    );
+                }
+                throttle_delay_ms = plan.throttle_delay_ms;
+                if throttle_delay_ms > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
+                }
+
+                // LayerSkip
+                if plan.restore_defaults {
+                    skip_config = None;
+                    last_skip_ratio = None;
+                } else if let Some(ratio) = plan.layer_skip
+                    && last_skip_ratio != Some(ratio)
+                {
+                    eprintln!("[Prefill] LayerSkip: ratio={:.2}", ratio);
+                    skip_config = Some(SkipConfig::uniform_init(
+                        model.config.num_hidden_layers,
+                        ratio,
+                    ));
+                    last_skip_ratio = Some(ratio);
+                }
+
+                // SwitchHw: migrate KV caches and reallocate prefill_logits
+                if let Some(ref device) = plan.switch_device
+                    && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc)
+                {
+                    match device.as_str() {
+                        "cpu" if is_gpu => {
+                            eprintln!(
+                                "[Prefill] SwitchHw: GPU→CPU at chunk_pos={}",
+                                kv_caches[0].current_pos
+                            );
+                            llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                &mut kv_caches,
+                                &backend,
+                                &cpu_backend_arc,
+                                &cpu_backend_arc,
+                                &cpu_memory_arc,
+                                &cpu_memory_arc,
+                                kv_heads,
+                                head_dim,
+                                max_seq_len,
+                                false,
+                            )?;
+                            backend = cpu_backend_arc.clone();
+                            is_gpu = false;
+                            let new_buf = Galloc::new().alloc(logits_buf_size, DType::F32)?;
+                            prefill_logits = Tensor::new(
+                                prefill_logits.shape().clone(),
+                                new_buf,
+                                backend.clone(),
+                            );
+                            eprintln!("[Prefill] SwitchHw: Switched to CPU.");
+                        }
+                        "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
+                            eprintln!(
+                                "[Prefill] SwitchHw: CPU→GPU at chunk_pos={}",
+                                kv_caches[0].current_pos
+                            );
+                            llm_rs2::core::kv_migrate::migrate_kv_caches(
+                                &mut kv_caches,
+                                &backend,
+                                gpu_be,
+                                &cpu_backend_arc,
+                                &cpu_memory_arc,
+                                gpu_mem,
+                                kv_heads,
+                                head_dim,
+                                max_seq_len,
+                                true,
+                            )?;
+                            backend = gpu_be.clone();
+                            is_gpu = true;
+                            let new_buf = gpu_mem.alloc(logits_buf_size, DType::F32)?;
+                            prefill_logits = Tensor::new(
+                                prefill_logits.shape().clone(),
+                                new_buf,
+                                backend.clone(),
+                            );
+                            eprintln!("[Prefill] SwitchHw: Switched to GPU.");
+                        }
+                        _ => {} // Already on requested backend or weights not on GPU
+                    }
+                }
+            }
 
             chunk_start = chunk_end;
         }
