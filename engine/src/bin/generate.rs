@@ -1506,8 +1506,10 @@ fn main() -> anyhow::Result<()> {
 
                 let prefill_timer = std::time::Instant::now();
                 let mut deferred_switch: Option<String> = None;
+                let total_chunks = (process_len + chunk_size - 1) / chunk_size;
 
                 let mut chunk_start = 0;
+                let mut chunk_idx = 0usize;
                 while chunk_start < process_len {
                     let chunk_end = (chunk_start + chunk_size).min(process_len);
                     let chunk_tokens = &batch_input_ids[chunk_start..chunk_end];
@@ -1567,12 +1569,16 @@ fn main() -> anyhow::Result<()> {
                         if plan.throttle_delay_ms > 0 && plan.throttle_delay_ms != throttle_delay_ms
                         {
                             eprintln!(
-                                "[Prefill] Throttle: {}ms → {}ms",
+                                "[Prefill] Throttle: {}ms -> {}ms",
                                 throttle_delay_ms, plan.throttle_delay_ms
                             );
                         }
                         throttle_delay_ms = plan.throttle_delay_ms;
                         if throttle_delay_ms > 0 {
+                            eprintln!(
+                                "[Prefill] Throttle: {}ms delay after chunk {}/{}",
+                                throttle_delay_ms, chunk_idx + 1, total_chunks
+                            );
                             std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
                         }
 
@@ -1607,6 +1613,7 @@ fn main() -> anyhow::Result<()> {
                     }
 
                     chunk_start = chunk_end;
+                    chunk_idx += 1;
                 }
 
                 let ttft_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
@@ -2031,8 +2038,10 @@ fn main() -> anyhow::Result<()> {
         let mut prefill_logits = Tensor::new(logits_shape, prefill_logits_buf, backend.clone());
 
         let prefill_timer = std::time::Instant::now();
+        let total_chunks = (process_len + chunk_size - 1) / chunk_size;
 
         let mut chunk_start = 0;
+        let mut chunk_idx = 0usize;
         while chunk_start < process_len {
             let chunk_end = (chunk_start + chunk_size).min(process_len);
             let chunk_tokens = &tokens[chunk_start..chunk_end];
@@ -2099,12 +2108,16 @@ fn main() -> anyhow::Result<()> {
                 // Throttle: sleep between chunks
                 if plan.throttle_delay_ms > 0 && plan.throttle_delay_ms != throttle_delay_ms {
                     eprintln!(
-                        "[Prefill] Throttle: {}ms → {}ms",
+                        "[Prefill] Throttle: {}ms -> {}ms",
                         throttle_delay_ms, plan.throttle_delay_ms
                     );
                 }
                 throttle_delay_ms = plan.throttle_delay_ms;
                 if throttle_delay_ms > 0 {
+                    eprintln!(
+                        "[Prefill] Throttle: {}ms delay after chunk {}/{}",
+                        throttle_delay_ms, chunk_idx + 1, total_chunks
+                    );
                     std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
                 }
 
@@ -2139,6 +2152,7 @@ fn main() -> anyhow::Result<()> {
             }
 
             chunk_start = chunk_end;
+            chunk_idx += 1;
         }
 
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
