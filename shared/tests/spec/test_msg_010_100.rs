@@ -28,6 +28,9 @@ fn make_test_status() -> EngineStatus {
         eviction_policy: "none".into(),
         kv_dtype: "f16".into(),
         skip_ratio: 0.0,
+        phase: "decode".into(),
+        prefill_pos: 0,
+        prefill_total: 0,
     }
 }
 

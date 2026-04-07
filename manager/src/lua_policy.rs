@@ -687,6 +687,9 @@ mod tests {
             eviction_policy: "sliding".to_string(),
             kv_dtype: "f16".to_string(),
             skip_ratio: 0.0,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
@@ -729,6 +732,9 @@ mod tests {
             eviction_policy: "none".to_string(),
             kv_dtype: "f16".to_string(),
             skip_ratio: 0.0,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 

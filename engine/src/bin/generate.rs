@@ -3758,6 +3758,14 @@ fn command_summary(cmd: &EngineCommand) -> String {
         EngineCommand::Suspend => "Suspend".to_string(),
         EngineCommand::Resume => "Resume".to_string(),
         EngineCommand::RequestQcf => "RequestQcf".to_string(),
+        EngineCommand::SetPrefillPolicy {
+            chunk_size,
+            yield_ms,
+            cpu_chunk_size,
+        } => format!(
+            "SetPrefillPolicy(chunk={:?}, yield={:?}, cpu_chunk={:?})",
+            chunk_size, yield_ms, cpu_chunk_size
+        ),
     }
 }
 

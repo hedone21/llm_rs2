@@ -1071,6 +1071,9 @@ mod tests {
             eviction_policy: "none".into(),
             kv_dtype: "f16".into(),
             skip_ratio: 0.0,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         }
     }
 

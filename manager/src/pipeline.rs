@@ -984,6 +984,9 @@ mod tests {
             eviction_policy: eviction_policy.to_string(),
             kv_dtype: "f16".to_string(),
             skip_ratio: 0.0,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         })
     }
 
@@ -1097,6 +1100,9 @@ mod tests {
             eviction_policy: "h2o".to_string(),
             kv_dtype: "f16".to_string(),
             skip_ratio: 0.0,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         });
 
         p.update_engine_state(&msg);
@@ -1269,6 +1275,9 @@ mod tests {
             eviction_policy: "none".to_string(),
             kv_dtype: "f16".to_string(),
             skip_ratio: 0.0,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         });
 
         p.update_engine_state(&msg);

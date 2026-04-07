@@ -210,6 +210,29 @@ pub enum EngineCommand {
     Suspend,
     /// Resume from suspended state.
     Resume,
+
+    // ── Prefill domain ──
+    /// Adjust prefill execution policy for GPU contention management.
+    /// All fields are Optional — only provided fields are updated;
+    /// omitted fields retain their current values.
+    SetPrefillPolicy {
+        /// Prefill chunk size (tokens per forward pass).
+        /// Smaller = shorter GPU occupancy per chunk = more game frames.
+        /// Default: 256.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        chunk_size: Option<usize>,
+        /// Inter-layer yield delay in milliseconds.
+        /// After each transformer layer, engine calls synchronize() + sleep(yield_ms).
+        /// 0 = no yield. Default: 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        yield_ms: Option<u32>,
+        /// CPU chunk size for GPU-CPU interleaving.
+        /// 0 = interleave disabled (GPU only).
+        /// Positive value = after each GPU chunk, CPU processes this many
+        /// tokens while GPU is free for the game. Default: 0.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cpu_chunk_size: Option<usize>,
+    },
 }
 
 /// Batch of commands from Manager to Engine.
@@ -265,6 +288,15 @@ pub struct EngineStatus {
     /// Current layer skip ratio (0.0 = no skip).
     #[serde(default)]
     pub skip_ratio: f32,
+    /// Current inference phase: "idle", "prefill", or "decode".
+    #[serde(default)]
+    pub phase: String,
+    /// Prefill progress: tokens processed so far. 0 if not prefilling.
+    #[serde(default)]
+    pub prefill_pos: usize,
+    /// Prefill total: prompt token count. 0 if not prefilling.
+    #[serde(default)]
+    pub prefill_total: usize,
 }
 
 /// Result of executing a single command.
@@ -528,6 +560,71 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_command_serde_set_prefill_policy_full() {
+        let cmd = EngineCommand::SetPrefillPolicy {
+            chunk_size: Some(48),
+            yield_ms: Some(10),
+            cpu_chunk_size: Some(16),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"set_prefill_policy\""));
+        assert!(json.contains("\"chunk_size\":48"));
+        assert!(json.contains("\"yield_ms\":10"));
+        assert!(json.contains("\"cpu_chunk_size\":16"));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(chunk_size, Some(48));
+                assert_eq!(yield_ms, Some(10));
+                assert_eq!(cpu_chunk_size, Some(16));
+            }
+            _ => panic!("Expected SetPrefillPolicy"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_set_prefill_policy_partial() {
+        // Only chunk_size provided — other fields should default to None
+        let json = r#"{"type":"set_prefill_policy","chunk_size":64}"#;
+        let back: EngineCommand = serde_json::from_str(json).unwrap();
+        match back {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(chunk_size, Some(64));
+                assert_eq!(yield_ms, None);
+                assert_eq!(cpu_chunk_size, None);
+            }
+            _ => panic!("Expected SetPrefillPolicy"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_set_prefill_policy_empty() {
+        // No fields — all None (valid: "update nothing, keep current")
+        let json = r#"{"type":"set_prefill_policy"}"#;
+        let back: EngineCommand = serde_json::from_str(json).unwrap();
+        match back {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(chunk_size, None);
+                assert_eq!(yield_ms, None);
+                assert_eq!(cpu_chunk_size, None);
+            }
+            _ => panic!("Expected SetPrefillPolicy"),
+        }
+    }
+
+    #[test]
     fn test_engine_directive_serde_roundtrip() {
         let directive = EngineDirective {
             seq_id: 42,
@@ -594,6 +691,9 @@ mod tests {
             eviction_policy: "none".into(),
             kv_dtype: "f16".into(),
             skip_ratio: 0.0,
+            phase: "decode".into(),
+            prefill_pos: 0,
+            prefill_total: 0,
         }
     }
 
@@ -610,6 +710,22 @@ mod tests {
         assert_eq!(back.eviction_policy, "none");
         assert_eq!(back.kv_dtype, "f16");
         assert!((back.skip_ratio - 0.0).abs() < f32::EPSILON);
+        assert_eq!(back.phase, "decode");
+        assert_eq!(back.prefill_pos, 0);
+        assert_eq!(back.prefill_total, 0);
+    }
+
+    #[test]
+    fn test_engine_status_prefill_phase() {
+        let mut status = make_test_status();
+        status.phase = "prefill".into();
+        status.prefill_pos = 420;
+        status.prefill_total = 1073;
+        let json = serde_json::to_string(&status).unwrap();
+        let back: EngineStatus = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.phase, "prefill");
+        assert_eq!(back.prefill_pos, 420);
+        assert_eq!(back.prefill_total, 1073);
     }
 
     #[test]
@@ -627,6 +743,10 @@ mod tests {
         assert_eq!(back.eviction_policy, "");
         assert_eq!(back.kv_dtype, "");
         assert!((back.skip_ratio - 0.0).abs() < f32::EPSILON);
+        // New prefill fields default to empty/zero on old JSON
+        assert_eq!(back.phase, "");
+        assert_eq!(back.prefill_pos, 0);
+        assert_eq!(back.prefill_total, 0);
     }
 
     #[test]

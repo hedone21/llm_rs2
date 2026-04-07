@@ -34,6 +34,10 @@ pub struct ExecutionPlan {
     pub restore_defaults: bool,
     /// Whether Engine should compute and send QCF estimates.
     pub request_qcf: bool,
+    /// Prefill policy update (partial — None fields mean "keep current").
+    pub prefill_chunk_size: Option<usize>,
+    pub prefill_yield_ms: Option<u32>,
+    pub prefill_cpu_chunk_size: Option<usize>,
 }
 
 /// Eviction method identifier (engine-internal, not in shared protocol).
@@ -369,6 +373,22 @@ impl CommandExecutor {
                 plan.request_qcf = true;
                 CommandResult::Ok
             }
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                if let Some(v) = chunk_size {
+                    plan.prefill_chunk_size = Some(*v);
+                }
+                if let Some(v) = yield_ms {
+                    plan.prefill_yield_ms = Some(*v);
+                }
+                if let Some(v) = cpu_chunk_size {
+                    plan.prefill_cpu_chunk_size = Some(*v);
+                }
+                CommandResult::Ok
+            }
         }
     }
 
@@ -414,6 +434,9 @@ impl CommandExecutor {
             eviction_policy,
             kv_dtype,
             skip_ratio: kv_snap.skip_ratio,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         };
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));

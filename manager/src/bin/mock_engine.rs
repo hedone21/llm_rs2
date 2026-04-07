@@ -271,6 +271,17 @@ impl EngineState_ {
                 println!("  → RequestQcf (returning Ok + QcfEstimate)");
                 CommandResult::Ok
             }
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                println!(
+                    "  → SetPrefillPolicy(chunk={:?}, yield={:?}, cpu_chunk={:?})",
+                    chunk_size, yield_ms, cpu_chunk_size
+                );
+                CommandResult::Ok
+            }
         }
     }
 
@@ -296,6 +307,9 @@ impl EngineState_ {
             eviction_policy: self.eviction_policy.clone(),
             kv_dtype: "f16".to_string(),
             skip_ratio: self.skip_ratio,
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
         }
     }
 }
