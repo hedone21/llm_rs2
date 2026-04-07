@@ -880,12 +880,8 @@ impl TransformerLayer {
 
         // 9. FFN — gate + up projections (3 paths: partition, fused NEON, generic)
         let t = prof_start!();
-        if let Some(ref part) = self.partition_ctx {
+        if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
             // ── Partitioned FFN gate/up: cooperative GPU + CPU ──
-            let pw = ws
-                .partition_ws
-                .as_mut()
-                .expect("partition_ws must be set when partition_ctx is active");
 
             // 0. Sync prior GPU ops (rms_norm → residual) then copy to CPU.
             // Blocking read_buffer on in-order queue also syncs, but explicit
