@@ -39,6 +39,8 @@ pub struct KiviHook {
     flush_count: usize,
     /// Max OPR value across all flushes for current question (legacy per-flush max).
     qcf_kivi_legacy: f32,
+    /// Sum of OPR values across all flushes for current question (for mean).
+    qcf_kivi_sum: f32,
     /// Unified QCF value computed via `compute_unified_qcf(QuantKivi)` at post-prefill.
     /// `None` when attention scores are unavailable (KiviHook currently has no
     /// score accumulator — this field is reserved for future integration).
@@ -57,6 +59,7 @@ impl KiviHook {
             qcf_config,
             flush_count: 0,
             qcf_kivi_legacy: 0.0,
+            qcf_kivi_sum: 0.0,
             qcf_unified: None,
             qcf_aw_vopr_max: 0.0,
             qcf_aw_vopr_sum: 0.0,
@@ -72,6 +75,7 @@ impl KiviHook {
         for metric in caches[0].take_flush_proxies() {
             if metric.action == "kivi_opr" {
                 self.qcf_kivi_legacy = self.qcf_kivi_legacy.max(metric.raw_value);
+                self.qcf_kivi_sum += metric.raw_value;
                 self.flush_count += 1;
             } else if metric.action == "aw_vopr" {
                 self.qcf_aw_vopr_max = self.qcf_aw_vopr_max.max(metric.raw_value);
@@ -111,6 +115,7 @@ impl StepHook<KiviCache> for KiviHook {
         }
         self.flush_count = 0;
         self.qcf_kivi_legacy = 0.0;
+        self.qcf_kivi_sum = 0.0;
         self.qcf_unified = None;
         self.qcf_aw_vopr_max = 0.0;
         self.qcf_aw_vopr_sum = 0.0;
@@ -138,12 +143,14 @@ impl StepHook<KiviCache> for KiviHook {
             "kivi_res_pos": res_pos,
         });
         if self.flush_count > 0 {
-            // Unified cross-action QCF field: prefer unified measurement, fallback to legacy.
-            let qcf_value = self.qcf_unified.unwrap_or(self.qcf_kivi_legacy);
+            let qcf_mean = self.qcf_kivi_sum / self.flush_count as f32;
+            // Unified cross-action QCF field: prefer unified, then per-flush mean.
+            let qcf_value = self.qcf_unified.unwrap_or(qcf_mean);
             obj["qcf"] = serde_json::json!(qcf_value);
 
-            // Legacy fields (backward compatibility with existing analysis scripts).
-            obj["qcf_kivi_legacy"] = serde_json::json!(self.qcf_kivi_legacy);
+            // Per-flush statistics.
+            obj["qcf_kivi_mean"] = serde_json::json!(qcf_mean);
+            obj["qcf_kivi_max"] = serde_json::json!(self.qcf_kivi_legacy);
             obj["qcf_kivi_flush_count"] = serde_json::json!(self.flush_count);
         }
         if self.aw_vopr_count > 0 {
@@ -224,13 +231,16 @@ mod tests {
         assert_eq!(hook.flush_count, 0);
         assert_eq!(hook.qcf_kivi_legacy, 0.0);
 
-        // Set legacy value and verify unified fallback in output fields
+        // Set values and verify output fields
         hook.flush_count = 5;
-        hook.qcf_kivi_legacy = 0.296;
+        hook.qcf_kivi_legacy = 0.5; // max
+        hook.qcf_kivi_sum = 1.48; // sum → mean = 1.48/5 = 0.296
         let fields = hook.extra_question_fields(&[cache]);
-        // "qcf" unified field falls back to legacy when qcf_unified is None
-        assert_eq!(fields["qcf"], 0.296_f32 as f64);
-        assert_eq!(fields["qcf_kivi_legacy"], 0.296_f32 as f64);
+        // "qcf" unified field falls back to per-flush mean when qcf_unified is None
+        let expected_mean = 1.48_f32 / 5.0;
+        assert!((fields["qcf"].as_f64().unwrap() - expected_mean as f64).abs() < 1e-5);
+        assert_eq!(fields["qcf_kivi_max"], 0.5_f32 as f64);
+        assert!((fields["qcf_kivi_mean"].as_f64().unwrap() - expected_mean as f64).abs() < 1e-5);
         assert_eq!(fields["qcf_kivi_flush_count"], 5);
 
         // After reset_caches
@@ -248,12 +258,13 @@ mod tests {
 
         hook.flush_count = 3;
         hook.qcf_kivi_legacy = 0.5;
+        hook.qcf_kivi_sum = 0.9;
         hook.qcf_unified = Some(0.123);
         let fields = hook.extra_question_fields(&[cache]);
         // "qcf" should use unified value when available
         assert_eq!(fields["qcf"], 0.123_f32 as f64);
-        // Legacy field still shows the per-flush max
-        assert_eq!(fields["qcf_kivi_legacy"], 0.5_f32 as f64);
+        // max field still shows the per-flush max
+        assert_eq!(fields["qcf_kivi_max"], 0.5_f32 as f64);
     }
 
     #[test]
