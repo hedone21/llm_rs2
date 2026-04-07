@@ -13,6 +13,8 @@
 
 use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineStatus, SystemSignal};
 use mlua::{Lua, Result as LuaResult, StdLib, Table, Value};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
@@ -109,6 +111,9 @@ impl LuaPolicy {
             engine_tbl.set("state", state_str)?;
             engine_tbl.set("kv_dtype", status.kv_dtype.as_str())?;
             engine_tbl.set("skip_ratio", status.skip_ratio)?;
+            engine_tbl.set("phase", status.phase.as_str())?;
+            engine_tbl.set("prefill_pos", status.prefill_pos)?;
+            engine_tbl.set("prefill_total", status.prefill_total)?;
         } else {
             // No heartbeat yet -- provide defaults
             engine_tbl.set("device", "unknown")?;
@@ -120,6 +125,9 @@ impl LuaPolicy {
             engine_tbl.set("state", "idle")?;
             engine_tbl.set("kv_dtype", "")?;
             engine_tbl.set("skip_ratio", 0.0)?;
+            engine_tbl.set("phase", "")?;
+            engine_tbl.set("prefill_pos", 0)?;
+            engine_tbl.set("prefill_total", 0)?;
         }
         ctx.set("engine", engine_tbl)?;
 
@@ -283,6 +291,16 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
         "restore_defaults" => EngineCommand::RestoreDefaults,
         "suspend" => EngineCommand::Suspend,
         "resume" => EngineCommand::Resume,
+        "set_prefill_policy" => {
+            let chunk_size: Option<usize> = entry.get("chunk_size").ok();
+            let yield_ms: Option<u32> = entry.get("yield_ms").ok();
+            let cpu_chunk_size: Option<usize> = entry.get("cpu_chunk_size").ok();
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            }
+        }
         unknown => {
             return Err(mlua::Error::external(format!(
                 "unknown action type: '{}'",
@@ -382,6 +400,88 @@ fn register_sys_helpers(lua: &Lua) -> LuaResult<()> {
             Ok(freq)
         })?,
     )?;
+
+    // sys.foreground_fps(pkg) -> float|nil
+    //
+    // Measures the foreground frame rate of `pkg` by reading SurfaceFlinger
+    // frame counters via `dumpsys SurfaceFlinger`. First call returns nil
+    // (only stores baseline). Subsequent calls return FPS since last call.
+    // Returns nil if the package surface is not found, or if called too soon
+    // (< 100 ms since last call).
+    //
+    // NOTE: `dumpsys` is an Android command and is not available on the host.
+    // The function will return nil gracefully when the command is unavailable.
+    {
+        struct FpsState {
+            prev_frame: u64,
+            prev_time: Instant,
+            initialized: bool,
+        }
+
+        let fps_state = Arc::new(Mutex::new(FpsState {
+            prev_frame: 0,
+            prev_time: Instant::now(),
+            initialized: false,
+        }));
+
+        sys.set(
+            "foreground_fps",
+            lua.create_function(move |_, pkg: String| -> LuaResult<Option<f32>> {
+                let output = match std::process::Command::new("dumpsys")
+                    .args(["SurfaceFlinger"])
+                    .output()
+                {
+                    Ok(o) => o,
+                    Err(_) => return Ok(None), // dumpsys not available (host dev)
+                };
+
+                let text = String::from_utf8_lossy(&output.stdout);
+
+                // Find "SurfaceView[{pkg}" marker
+                let marker = format!("SurfaceView[{}", pkg);
+                let pos = match text.find(&marker) {
+                    Some(p) => p,
+                    None => return Ok(None), // Game not running or not found
+                };
+
+                // Extract frame= value from the next few lines after the marker
+                let after = &text[pos..];
+                let frame_count: Option<u64> = after.lines().take(5).find_map(|line| {
+                    let idx = line.find("frame=")?;
+                    let rest = &line[idx + 6..];
+                    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    num_str.parse().ok()
+                });
+
+                let cur_frame = match frame_count {
+                    Some(f) => f,
+                    None => return Ok(None),
+                };
+
+                let mut state = fps_state.lock().unwrap();
+                if !state.initialized {
+                    state.prev_frame = cur_frame;
+                    state.prev_time = Instant::now();
+                    state.initialized = true;
+                    return Ok(None); // First call: no delta yet
+                }
+
+                let now = Instant::now();
+                let dt = now.duration_since(state.prev_time).as_secs_f32();
+                if dt < 0.1 {
+                    return Ok(None); // Too soon, skip
+                }
+
+                let delta_frames = cur_frame.saturating_sub(state.prev_frame);
+                let fps = delta_frames as f32 / dt;
+
+                state.prev_frame = cur_frame;
+                state.prev_time = now;
+
+                Ok(Some(fps))
+            })?,
+        )?;
+    }
 
     lua.globals().set("sys", sys)?;
     Ok(())
@@ -892,6 +992,179 @@ mod tests {
                 local temp = sys.thermal(999)
                 if temp < 0 then
                     return {{type = "throttle", delay_ms = 1}}
+                end
+                return {}
+            end"#,
+        );
+        let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+    }
+
+    #[test]
+    fn test_set_prefill_policy_action_parsing() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {
+                    { type = "set_prefill_policy", chunk_size = 48, yield_ms = 10, cpu_chunk_size = 16 },
+                }
+            end"#,
+        );
+        let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(*chunk_size, Some(48));
+                assert_eq!(*yield_ms, Some(10));
+                assert_eq!(*cpu_chunk_size, Some(16));
+            }
+            other => panic!("expected SetPrefillPolicy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_set_prefill_policy_partial() {
+        // Only chunk_size provided → yield_ms and cpu_chunk_size should be None
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {
+                    { type = "set_prefill_policy", chunk_size = 64 },
+                }
+            end"#,
+        );
+        let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(*chunk_size, Some(64));
+                assert_eq!(*yield_ms, None);
+                assert_eq!(*cpu_chunk_size, None);
+            }
+            other => panic!("expected SetPrefillPolicy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_set_prefill_policy_no_fields() {
+        // No fields at all — all None (valid: "update nothing, keep current")
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {
+                    { type = "set_prefill_policy" },
+                }
+            end"#,
+        );
+        let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(*chunk_size, None);
+                assert_eq!(*yield_ms, None);
+                assert_eq!(*cpu_chunk_size, None);
+            }
+            other => panic!("expected SetPrefillPolicy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_prefill_phase_in_ctx() {
+        // Verify ctx.engine.phase/prefill_pos/prefill_total are accessible from Lua
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                if ctx.engine.phase == "prefill" and ctx.engine.prefill_total > 0 then
+                    local progress = ctx.engine.prefill_pos / ctx.engine.prefill_total
+                    if progress < 0.5 then
+                        return {{ type = "set_prefill_policy", chunk_size = 32 }}
+                    end
+                end
+                return {}
+            end"#,
+        );
+        let mut policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+
+        // No heartbeat yet — phase defaults to ""
+        let cmds = policy.call_decide();
+        assert!(cmds.is_empty());
+
+        // Send heartbeat in prefill phase at 20%
+        let status = EngineStatus {
+            active_device: "opencl".to_string(),
+            compute_level: llm_shared::ResourceLevel::Normal,
+            actual_throughput: 0.0,
+            memory_level: llm_shared::ResourceLevel::Normal,
+            kv_cache_bytes: 0,
+            kv_cache_tokens: 0,
+            kv_cache_utilization: 0.0,
+            memory_lossless_min: 0.5,
+            memory_lossy_min: 0.25,
+            state: llm_shared::EngineState::Running,
+            tokens_generated: 0,
+            available_actions: vec![],
+            active_actions: vec![],
+            eviction_policy: "none".to_string(),
+            kv_dtype: "f16".to_string(),
+            skip_ratio: 0.0,
+            phase: "prefill".to_string(),
+            prefill_pos: 200,
+            prefill_total: 1000,
+        };
+        policy.update_engine_state(&EngineMessage::Heartbeat(status));
+
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SetPrefillPolicy { chunk_size, .. } => {
+                assert_eq!(*chunk_size, Some(32));
+            }
+            other => panic!("expected SetPrefillPolicy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_prefill_phase_defaults_when_no_heartbeat() {
+        // Verify default values are exposed before any heartbeat arrives
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                -- Verify all three fields exist and have correct defaults
+                if ctx.engine.phase == "" and
+                   ctx.engine.prefill_pos == 0 and
+                   ctx.engine.prefill_total == 0 then
+                    return {{ type = "throttle", delay_ms = 1 }}
+                end
+                return {}
+            end"#,
+        );
+        let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+        assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 1 }));
+    }
+
+    #[test]
+    fn test_sys_foreground_fps_registered() {
+        // Verify sys.foreground_fps is callable (returns nil on host since dumpsys is unavailable)
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                local fps = sys.foreground_fps("com.example.game")
+                -- On host, fps is nil (dumpsys not available)
+                -- Either nil or a number is acceptable
+                if fps == nil or type(fps) == "number" then
+                    return {{ type = "throttle", delay_ms = 1 }}
                 end
                 return {}
             end"#,
