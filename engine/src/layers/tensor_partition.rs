@@ -220,6 +220,58 @@ pub fn split_weight(
     })
 }
 
+/// Merge 2D partial results from GPU and CPU partitions (prefill path).
+///
+/// GPU partial: `[batch, seq_len, split_row]` (F32, on GPU)
+/// CPU partial: `[batch, seq_len, cpu_rows]` (F32, on CPU)
+/// Output:      `[batch, seq_len, out_dim]`  (F32, on GPU) where out_dim = split_row + cpu_rows
+///
+/// Strategy (approach C): read GPU partial to CPU temp, interleave rows, write to output.
+/// Prefill is bandwidth-bound, so the extra memcpy overhead is acceptable.
+pub fn merge_partials_2d(
+    backend: &dyn Backend,
+    gpu_partial: &Tensor,
+    cpu_partial: &Tensor,
+    output: &mut Tensor,
+    total_rows: usize, // batch_size * seq_len
+    split_row: usize,
+    cpu_rows: usize,
+) -> Result<()> {
+    let out_dim = split_row + cpu_rows;
+
+    // 1. Read GPU partial to CPU temp buffer
+    let gpu_bytes = total_rows * split_row * 4;
+    let mut gpu_temp = vec![0u8; gpu_bytes];
+    backend.read_buffer(gpu_partial, &mut gpu_temp)?;
+
+    // 2. Interleave: build merged [total_rows, out_dim] on CPU
+    let out_bytes = total_rows * out_dim * 4;
+    let mut merged = vec![0u8; out_bytes];
+
+    // Safety: cpu_partial is a CPU tensor with valid host pointer.
+    let cpu_data =
+        unsafe { std::slice::from_raw_parts(cpu_partial.as_ptr(), total_rows * cpu_rows * 4) };
+
+    for s in 0..total_rows {
+        let gpu_row_start = s * split_row * 4;
+        let cpu_row_start = s * cpu_rows * 4;
+        let out_row_start = s * out_dim * 4;
+
+        // GPU columns [0..split_row)
+        merged[out_row_start..out_row_start + split_row * 4]
+            .copy_from_slice(&gpu_temp[gpu_row_start..gpu_row_start + split_row * 4]);
+
+        // CPU columns [split_row..out_dim)
+        merged[out_row_start + split_row * 4..out_row_start + out_dim * 4]
+            .copy_from_slice(&cpu_data[cpu_row_start..cpu_row_start + cpu_rows * 4]);
+    }
+
+    // 3. Write merged result to GPU output
+    backend.write_buffer(output, &merged)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,5 +685,128 @@ mod tests {
         let cpu = cpu_backend();
         let result = super::split_weight_optional(&w, 0.5, &cpu).unwrap();
         assert!(result.is_some());
+    }
+
+    // ── merge_partials_2d tests ──
+
+    /// Verify that merge_partials_2d correctly interleaves GPU and CPU partials.
+    #[test]
+    fn test_merge_partials_2d_basic() {
+        let backend = cpu_backend();
+        let memory = Galloc::new();
+
+        let seq_len = 4;
+        let split_row = 3;
+        let cpu_rows = 2;
+        let out_dim = split_row + cpu_rows;
+
+        // GPU partial: [seq_len, split_row], values 100+
+        let gpu_buf = memory.alloc(seq_len * split_row * 4, DType::F32).unwrap();
+        let mut gpu_partial = Tensor::new(
+            Shape::new(vec![seq_len, split_row]),
+            gpu_buf,
+            backend.clone(),
+        );
+        let gpu_data = gpu_partial.as_mut_slice::<f32>();
+        for (i, v) in gpu_data.iter_mut().enumerate() {
+            *v = 100.0 + i as f32;
+        }
+
+        // CPU partial: [seq_len, cpu_rows], values 200+
+        let cpu_buf = memory.alloc(seq_len * cpu_rows * 4, DType::F32).unwrap();
+        let mut cpu_partial = Tensor::new(
+            Shape::new(vec![seq_len, cpu_rows]),
+            cpu_buf,
+            backend.clone(),
+        );
+        let cpu_data_w = cpu_partial.as_mut_slice::<f32>();
+        for (i, v) in cpu_data_w.iter_mut().enumerate() {
+            *v = 200.0 + i as f32;
+        }
+
+        // Output: [seq_len, out_dim]
+        let out_buf = memory.alloc(seq_len * out_dim * 4, DType::F32).unwrap();
+        let mut output = Tensor::new(Shape::new(vec![seq_len, out_dim]), out_buf, backend.clone());
+
+        super::merge_partials_2d(
+            backend.as_ref(),
+            &gpu_partial,
+            &cpu_partial,
+            &mut output,
+            seq_len,
+            split_row,
+            cpu_rows,
+        )
+        .unwrap();
+
+        let result = output.as_slice::<f32>();
+        for s in 0..seq_len {
+            // GPU part
+            for c in 0..split_row {
+                let expected = 100.0 + (s * split_row + c) as f32;
+                let actual = result[s * out_dim + c];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "row {} col {}: expected {}, got {}",
+                    s,
+                    c,
+                    expected,
+                    actual,
+                );
+            }
+            // CPU part
+            for c in 0..cpu_rows {
+                let expected = 200.0 + (s * cpu_rows + c) as f32;
+                let actual = result[s * out_dim + split_row + c];
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "row {} col {}: expected {}, got {}",
+                    s,
+                    split_row + c,
+                    expected,
+                    actual,
+                );
+            }
+        }
+    }
+
+    /// Verify merge_partials_2d with single-row input (degenerate case matching decode).
+    #[test]
+    fn test_merge_partials_2d_single_row() {
+        let backend = cpu_backend();
+        let memory = Galloc::new();
+
+        let split_row = 4;
+        let cpu_rows = 3;
+        let out_dim = split_row + cpu_rows;
+
+        let gpu_buf = memory.alloc(split_row * 4, DType::F32).unwrap();
+        let mut gpu_partial = Tensor::new(Shape::new(vec![1, split_row]), gpu_buf, backend.clone());
+        gpu_partial
+            .as_mut_slice::<f32>()
+            .copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+
+        let cpu_buf = memory.alloc(cpu_rows * 4, DType::F32).unwrap();
+        let mut cpu_partial = Tensor::new(Shape::new(vec![1, cpu_rows]), cpu_buf, backend.clone());
+        cpu_partial
+            .as_mut_slice::<f32>()
+            .copy_from_slice(&[5.0, 6.0, 7.0]);
+
+        let out_buf = memory.alloc(out_dim * 4, DType::F32).unwrap();
+        let mut output = Tensor::new(Shape::new(vec![1, out_dim]), out_buf, backend.clone());
+
+        super::merge_partials_2d(
+            backend.as_ref(),
+            &gpu_partial,
+            &cpu_partial,
+            &mut output,
+            1,
+            split_row,
+            cpu_rows,
+        )
+        .unwrap();
+
+        let result = output.as_slice::<f32>();
+        assert_eq!(result, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
     }
 }
