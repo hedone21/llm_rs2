@@ -582,6 +582,10 @@ impl StepHook<KVCache> for EvictionHook {
             "evicted_tokens": self.evicted_total,
         });
         if let Some(ref qcf) = self.eviction_qcf {
+            // Unified cross-action QCF field: uses CAOTE as the canonical eviction metric.
+            obj["qcf"] = serde_json::json!(qcf.qcf_caote);
+
+            // Existing fields (backward compatibility with analysis scripts).
             obj["tokens_evicted"] = serde_json::json!(qcf.tokens_evicted);
             obj["eviction_ratio"] = serde_json::json!(qcf.eviction_ratio);
             obj["qcf_attn_raw"] = serde_json::json!(qcf.qcf_attn_raw);

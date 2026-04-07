@@ -425,7 +425,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             "qcf_layer_skip_layers": qcf_layer_skip_layers,
         });
 
-        // Merge hook-specific fields (qcf_kivi, eviction_qcf, effective_budget, etc.)
+        // Merge hook-specific fields (qcf, qcf_kivi_legacy, qcf_caote, effective_budget, etc.)
         if let Some(obj) = extra.as_object() {
             for (k, v) in obj {
                 result_obj[k] = v.clone();
