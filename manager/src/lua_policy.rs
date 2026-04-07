@@ -437,21 +437,28 @@ fn register_sys_helpers(lua: &Lua) -> LuaResult<()> {
 
                 let text = String::from_utf8_lossy(&output.stdout);
 
-                // Find "SurfaceView[{pkg}" marker
+                // Find "SurfaceView[{pkg}" marker that has a "frame=" in its
+                // next few lines.  SurfaceFlinger may list multiple layers for the
+                // same package (e.g. Background layer without frame counter and
+                // BLAST layer with frame counter).  We iterate all occurrences.
                 let marker = format!("SurfaceView[{}", pkg);
-                let pos = match text.find(&marker) {
-                    Some(p) => p,
-                    None => return Ok(None), // Game not running or not found
-                };
-
-                // Extract frame= value from the next few lines after the marker
-                let after = &text[pos..];
-                let frame_count: Option<u64> = after.lines().take(5).find_map(|line| {
-                    let idx = line.find("frame=")?;
-                    let rest = &line[idx + 6..];
-                    let num_str: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-                    num_str.parse().ok()
-                });
+                let mut frame_count: Option<u64> = None;
+                let mut search_from = 0usize;
+                while let Some(rel) = text[search_from..].find(&marker) {
+                    let pos = search_from + rel;
+                    let after = &text[pos..];
+                    frame_count = after.lines().take(5).find_map(|line| {
+                        let idx = line.find("frame=")?;
+                        let rest = &line[idx + 6..];
+                        let num_str: String =
+                            rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+                        num_str.parse().ok()
+                    });
+                    if frame_count.is_some() {
+                        break; // Found a layer with frame counter
+                    }
+                    search_from = pos + marker.len();
+                }
 
                 let cur_frame = match frame_count {
                     Some(f) => f,

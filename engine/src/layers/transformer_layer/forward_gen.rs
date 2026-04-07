@@ -289,11 +289,27 @@ impl TransformerLayer {
             // Use dtype-aware attention for non-F32 KV caches (F16, Q4_0).
             // On GPU: also guard that KV buffers are actual GPU buffers (not CPU-only
             // KiviCache with SharedBuffer) — CPU-only caches must use the F32 fallback.
-            let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
-            let use_typed_attn = if is_gpu && k_cache.as_ptr().is_null() {
+            //
+            // Q4_0 + GPU: no GPU dequant-attention kernel exists, so we must NOT
+            // dispatch to backend.attention_gen() which would interpret BlockQ4_0
+            // data as raw floats (garbage).  Instead, fall through to the Q4_0
+            // CPU-dequant path below.
+            let is_q4_gpu = k_cache.dtype() == DType::Q4_0 && is_gpu;
+            let use_typed_attn = if is_q4_gpu {
+                // Q4_0 + GPU: force CPU dequant+attention path
+                false
+            } else if is_gpu && k_cache.as_ptr().is_null() {
                 // Device-only buffers (null CPU pointer): must use GPU attention.
                 // This applies to OpenCL device-only buffers on discrete GPUs.
-                kv_is_gpu || (use_gpu_attn || k_cache.dtype() != DType::F32)
+                // Exception: F32 KV (e.g. KiviCache attn view) should use the CPU
+                // fallback path which reads data via read_buffer + CPU attention.
+                // The GPU kernel_attn_gen assumes standard KVCache layout/strides
+                // which may not match KiviCache's assembled view.
+                if k_cache.dtype() == DType::F32 {
+                    use_gpu_attn // Only use GPU attention if explicitly requested
+                } else {
+                    true
+                }
             } else {
                 // CPU-accessible buffers (UMA/pinned/CPU): use typed attention
                 // only for non-F32 KV cache. The F32 path in the else branch
@@ -319,8 +335,32 @@ impl TransformerLayer {
                         None
                     },
                 )?;
+            } else if is_q4_gpu {
+                // Q4_0 + GPU: read raw Q4_0 bytes from GPU, dequantize on CPU,
+                // compute attention, then write result back to GPU.
+                Self::attention_q4_gpu_fallback(
+                    &q_rope,
+                    &k_cache,
+                    &v_cache,
+                    &mut ws.out_attn,
+                    &mut ws.scores,
+                    n_heads_q,
+                    n_heads_kv,
+                    head_dim,
+                    effective_cache_len,
+                    kv_start_pos,
+                    kv_cache.layout(),
+                    kv_cache.capacity(),
+                    need_scores,
+                    backend,
+                )?;
             } else {
                 // CPU attention path (Fallback for OpenCL or native CPU F32)
+                // Synchronize GPU queue to ensure all prior kernel writes
+                // (e.g. KiviCache scatter_residual) are visible to read_buffer.
+                if is_gpu {
+                    backend.synchronize()?;
+                }
                 let mut q_vec = Vec::new();
                 let mut k_vec = Vec::new();
                 let mut v_vec = Vec::new();
@@ -1156,6 +1196,174 @@ impl TransformerLayer {
                 // F32 should not reach here (handled by inline attention path)
             }
         }
+        Ok(())
+    }
+
+    /// Q4_0 KV cache + GPU backend: CPU dequant + attention fallback.
+    ///
+    /// The OpenCL backend has no Q4_0 dequant-attention kernel, so this path
+    /// reads Q4_0 raw bytes from GPU, dequantizes on CPU, computes full
+    /// attention (scores + weighted V sum), and writes the result back to GPU.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn attention_q4_gpu_fallback(
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out_attn: &mut Tensor,
+        scores_buf: &mut [f32],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        kv_start_pos: usize,
+        layout: crate::core::kv_cache::KVLayout,
+        capacity: usize,
+        need_scores: bool,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<()> {
+        use crate::core::quant::{BlockQ4_0, QK4_0};
+
+        if cache_seq_len == 0 {
+            return Ok(());
+        }
+
+        let blocks_per_row = head_dim / QK4_0;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let n_rep = n_heads_q / n_heads_kv;
+        let is_head_major = layout == crate::core::kv_cache::KVLayout::HeadMajor;
+
+        // 1. Read Q (F32) from GPU
+        let mut q_data = vec![0.0f32; q.size() / 4];
+        let q_bytes = unsafe {
+            std::slice::from_raw_parts_mut(q_data.as_mut_ptr() as *mut u8, q_data.len() * 4)
+        };
+        backend.read_buffer(q, q_bytes)?;
+
+        // 2. Read K/V (Q4_0 raw bytes) from GPU
+        let mut k_raw_bytes = vec![0u8; k_cache.size()];
+        let mut v_raw_bytes = vec![0u8; v_cache.size()];
+        backend.read_buffer(k_cache, &mut k_raw_bytes)?;
+        backend.read_buffer(v_cache, &mut v_raw_bytes)?;
+
+        let k_blocks = unsafe {
+            std::slice::from_raw_parts(
+                k_raw_bytes.as_ptr() as *const BlockQ4_0,
+                k_raw_bytes.len() / std::mem::size_of::<BlockQ4_0>(),
+            )
+        };
+        let v_blocks = unsafe {
+            std::slice::from_raw_parts(
+                v_raw_bytes.as_ptr() as *const BlockQ4_0,
+                v_raw_bytes.len() / std::mem::size_of::<BlockQ4_0>(),
+            )
+        };
+
+        // 3. CPU dequant + attention (per Q-head)
+        let mut out_f32 = vec![0.0f32; n_heads_q * head_dim];
+        let stride = scores_buf.len() / n_heads_q;
+
+        out_f32
+            .par_chunks_mut(head_dim)
+            .enumerate()
+            .for_each(|(h, out_h)| {
+                let kv_h = h / n_rep;
+                let q_off = h * head_dim;
+                let q_vec = &q_data[q_off..q_off + head_dim];
+                let mut kv_f32 = vec![0.0f32; head_dim];
+                let mut scores = vec![0.0f32; cache_seq_len];
+
+                // Q * K^T with dequantize
+                for t in 0..cache_seq_len {
+                    let phys_t = kv_start_pos + t;
+                    let block_off = if is_head_major {
+                        (kv_h * capacity + phys_t) * blocks_per_row
+                    } else {
+                        (phys_t * n_heads_kv + kv_h) * blocks_per_row
+                    };
+                    for bi in 0..blocks_per_row {
+                        let mut tmp = [0.0f32; QK4_0];
+                        k_blocks[block_off + bi].dequantize(&mut tmp);
+                        kv_f32[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                    }
+                    let score: f32 = q_vec.iter().zip(kv_f32.iter()).map(|(a, b)| a * b).sum();
+                    scores[t] = score * scale;
+                }
+
+                // NaN guard
+                for s in scores.iter_mut() {
+                    if s.is_nan() {
+                        *s = f32::NEG_INFINITY;
+                    }
+                }
+
+                // Softmax
+                let max_v = scores.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                if max_v == f32::NEG_INFINITY {
+                    let u = 1.0 / cache_seq_len as f32;
+                    for s in scores.iter_mut() {
+                        *s = u;
+                    }
+                } else {
+                    let mut sum_e = 0.0f32;
+                    for s in scores.iter_mut() {
+                        *s = (*s - max_v).exp();
+                        sum_e += *s;
+                    }
+                    if sum_e.is_nan() || sum_e <= 0.0 || sum_e.is_infinite() {
+                        let u = 1.0 / cache_seq_len as f32;
+                        for s in scores.iter_mut() {
+                            *s = u;
+                        }
+                    } else {
+                        let inv = 1.0 / sum_e;
+                        for s in scores.iter_mut() {
+                            *s *= inv;
+                        }
+                    }
+                }
+
+                // Copy scores to output buffer if needed
+                if need_scores {
+                    // Safety: each head writes to non-overlapping region in scores_buf
+                    unsafe {
+                        let len = cache_seq_len.min(stride);
+                        let dst = std::slice::from_raw_parts_mut(
+                            (scores_buf.as_ptr() as *mut f32).add(h * stride),
+                            len,
+                        );
+                        dst.copy_from_slice(&scores[..len]);
+                    }
+                }
+
+                // Weighted V sum with dequantize
+                for d in out_h.iter_mut() {
+                    *d = 0.0;
+                }
+                for t in 0..cache_seq_len {
+                    let phys_t = kv_start_pos + t;
+                    let w = scores[t];
+                    let block_off = if is_head_major {
+                        (kv_h * capacity + phys_t) * blocks_per_row
+                    } else {
+                        (phys_t * n_heads_kv + kv_h) * blocks_per_row
+                    };
+                    for bi in 0..blocks_per_row {
+                        let mut tmp = [0.0f32; QK4_0];
+                        v_blocks[block_off + bi].dequantize(&mut tmp);
+                        kv_f32[bi * QK4_0..(bi + 1) * QK4_0].copy_from_slice(&tmp);
+                    }
+                    for d in 0..head_dim {
+                        out_h[d] += w * kv_f32[d];
+                    }
+                }
+            });
+
+        // 4. Write result back to GPU out_attn buffer (in-place, no realloc)
+        let out_bytes = unsafe {
+            std::slice::from_raw_parts(out_f32.as_ptr() as *const u8, out_f32.len() * 4)
+        };
+        backend.write_buffer(out_attn, out_bytes)?;
+
         Ok(())
     }
 }

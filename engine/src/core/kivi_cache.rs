@@ -437,7 +437,27 @@ impl KiviCache {
         })();
 
         match result {
-            Ok((res_k, res_v, attn_k, attn_v, q2k, q2v)) => {
+            Ok((mut res_k, mut res_v, mut attn_k, mut attn_v, mut q2k, mut q2v)) => {
+                // Zero-initialize all GPU buffers to prevent garbage data in
+                // unwritten regions from corrupting attention computations.
+                let zero_init = |t: &mut Tensor| -> Result<()> {
+                    let zeros = vec![0u8; t.size()];
+                    backend.write_buffer(t, &zeros)
+                };
+                if let Err(e) = zero_init(&mut res_k)
+                    .and_then(|_| zero_init(&mut res_v))
+                    .and_then(|_| zero_init(&mut attn_k))
+                    .and_then(|_| zero_init(&mut attn_v))
+                    .and_then(|_| zero_init(&mut q2k))
+                    .and_then(|_| zero_init(&mut q2v))
+                {
+                    log::warn!(
+                        "KiviCache: GPU buffer zero-init failed ({}), falling back to CPU mode",
+                        e
+                    );
+                    return cache;
+                }
+
                 cache.gpu_backend = Some(backend);
                 cache.gpu_memory = Some(memory);
                 cache.gpu_res_k = Some(res_k);
@@ -446,7 +466,7 @@ impl KiviCache {
                 cache.gpu_attn_v = Some(attn_v);
                 cache.gpu_q2k = Some(q2k);
                 cache.gpu_q2v = Some(q2v);
-                log::info!("KiviCache: GPU mode enabled");
+                log::info!("KiviCache: GPU mode enabled (buffers zero-initialized)");
             }
             Err(e) => {
                 log::warn!("KiviCache: GPU alloc failed ({}), using CPU mode", e);
@@ -1486,9 +1506,48 @@ impl KiviCache {
     }
 
     /// GPU get_view: return Tensors backed by GPU attention buffers.
+    ///
+    /// If `assemble_view_gpu()` fails (e.g. kernel dispatch error), falls back
+    /// to CPU dequant + assemble path to avoid returning stale/garbage data.
     fn get_view_gpu(&mut self) -> (Tensor, Tensor) {
         if let Err(e) = self.assemble_view_gpu() {
-            log::warn!("KiviCache assemble_view_gpu error: {}", e);
+            log::warn!(
+                "KiviCache assemble_view_gpu error: {}, using CPU assemble fallback",
+                e
+            );
+            // Fall through: GPU attention buffers are zero-initialized at construction,
+            // so any previously scattered data is still valid. Only the latest residual
+            // scatter failed. For this call we fall back to the CPU get_view path which
+            // assembles a fresh F32 view from CPU-side Q2 blocks + residual.
+            self.assemble_view();
+            let total = self.total_tokens();
+            let backend: Arc<dyn Backend> = self.gpu_backend.as_ref().unwrap().clone();
+            if total == 0 {
+                let buf = Arc::new(SharedBuffer::new(0, DType::F32));
+                let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
+                let t = Tensor::new(shape.clone(), buf.clone(), backend);
+                return (t.clone(), t);
+            }
+            let buf_size = total * self.kv_heads * self.head_dim;
+            let byte_size = buf_size * 4;
+            let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
+            let k_buf = Arc::new(SharedBuffer::new(byte_size, DType::F32));
+            let v_buf = Arc::new(SharedBuffer::new(byte_size, DType::F32));
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.attn_k_buf.as_ptr(),
+                    k_buf.as_mut_ptr() as *mut f32,
+                    buf_size,
+                );
+                std::ptr::copy_nonoverlapping(
+                    self.attn_v_buf.as_ptr(),
+                    v_buf.as_mut_ptr() as *mut f32,
+                    buf_size,
+                );
+            }
+            let k_tensor = Tensor::new(shape.clone(), k_buf, backend.clone());
+            let v_tensor = Tensor::new(shape, v_buf, backend);
+            return (k_tensor, v_tensor);
         }
 
         let total = self.total_tokens();
