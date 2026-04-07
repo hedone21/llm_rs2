@@ -271,6 +271,10 @@ impl EngineState_ {
                 println!("  → RequestQcf (returning Ok + QcfEstimate)");
                 CommandResult::Ok
             }
+            EngineCommand::SetPartitionRatio { ratio } => {
+                println!("  → SetPartitionRatio({})", ratio);
+                CommandResult::Ok
+            }
             EngineCommand::SetPrefillPolicy {
                 chunk_size,
                 yield_ms,
@@ -310,6 +314,7 @@ impl EngineState_ {
             phase: String::new(),
             prefill_pos: 0,
             prefill_total: 0,
+            partition_ratio: 0.0,
         }
     }
 }

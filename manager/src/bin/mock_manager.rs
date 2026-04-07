@@ -1074,6 +1074,7 @@ mod tests {
             phase: String::new(),
             prefill_pos: 0,
             prefill_total: 0,
+            partition_ratio: 0.0,
         }
     }
 

@@ -114,6 +114,7 @@ impl LuaPolicy {
             engine_tbl.set("phase", status.phase.as_str())?;
             engine_tbl.set("prefill_pos", status.prefill_pos)?;
             engine_tbl.set("prefill_total", status.prefill_total)?;
+            engine_tbl.set("partition_ratio", status.partition_ratio)?;
         } else {
             // No heartbeat yet -- provide defaults
             engine_tbl.set("device", "unknown")?;
@@ -128,6 +129,7 @@ impl LuaPolicy {
             engine_tbl.set("phase", "")?;
             engine_tbl.set("prefill_pos", 0)?;
             engine_tbl.set("prefill_total", 0)?;
+            engine_tbl.set("partition_ratio", 0.0)?;
         }
         ctx.set("engine", engine_tbl)?;
 
@@ -291,6 +293,10 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
         "restore_defaults" => EngineCommand::RestoreDefaults,
         "suspend" => EngineCommand::Suspend,
         "resume" => EngineCommand::Resume,
+        "set_partition_ratio" => {
+            let ratio: f32 = entry.get("ratio")?;
+            EngineCommand::SetPartitionRatio { ratio }
+        }
         "set_prefill_policy" => {
             let chunk_size: Option<usize> = entry.get("chunk_size").ok();
             let yield_ms: Option<u32> = entry.get("yield_ms").ok();
@@ -797,6 +803,7 @@ mod tests {
             phase: String::new(),
             prefill_pos: 0,
             prefill_total: 0,
+            partition_ratio: 0.0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
@@ -842,6 +849,7 @@ mod tests {
             phase: String::new(),
             prefill_pos: 0,
             prefill_total: 0,
+            partition_ratio: 0.0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
@@ -1009,6 +1017,26 @@ mod tests {
     }
 
     #[test]
+    fn test_set_partition_ratio_action_parsing() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {
+                    { type = "set_partition_ratio", ratio = 0.65 },
+                }
+            end"#,
+        );
+        let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
+        let cmds = policy.call_decide();
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SetPartitionRatio { ratio } => {
+                assert!((*ratio - 0.65).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected SetPartitionRatio"),
+        }
+    }
+
+    #[test]
     fn test_set_prefill_policy_action_parsing() {
         let script = create_temp_script(
             r#"function decide(ctx)
@@ -1129,6 +1157,7 @@ mod tests {
             phase: "prefill".to_string(),
             prefill_pos: 200,
             prefill_total: 1000,
+            partition_ratio: 0.0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 

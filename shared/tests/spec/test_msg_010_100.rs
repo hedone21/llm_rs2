@@ -31,6 +31,7 @@ fn make_test_status() -> EngineStatus {
         phase: "decode".into(),
         prefill_pos: 0,
         prefill_total: 0,
+        partition_ratio: 0.0,
     }
 }
 

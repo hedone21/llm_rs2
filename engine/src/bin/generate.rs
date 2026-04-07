@@ -903,6 +903,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Set initial partition ratio from CLI for heartbeat reporting
+    if args.tensor_partition > 0.0
+        && args.tensor_partition < 1.0
+        && let Some(ref mut exec) = command_executor
+    {
+        exec.set_partition_ratio(args.tensor_partition);
+    }
     let mut throttle_delay_ms: u64 = 0;
     let mut tbt_log_writer: Option<std::io::BufWriter<std::fs::File>> =
         args.tbt_log.as_ref().map(|path| {
@@ -3414,6 +3421,51 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Dynamic tensor partition ratio
+                if let Some(ratio) = plan.partition_ratio {
+                    if ratio <= 0.0 || ratio >= 1.0 {
+                        // Disable partition: clear partition_ctx from all layers
+                        for layer in &mut model.layers {
+                            layer.partition_ctx = None;
+                        }
+                        gen_ws.partition_ws = None;
+                        eprintln!("[Partition] Disabled (ratio={})", ratio);
+                        executor.set_partition_ratio(0.0);
+                    } else if model.layers[0].wq.as_ptr().is_null() {
+                        eprintln!(
+                            "[Partition] ratio={} rejected — weights not CPU-accessible.",
+                            ratio
+                        );
+                    } else {
+                        // Re-split weights with new ratio
+                        match model.prepare_tensor_partition(ratio, &cpu_backend_arc) {
+                            Ok(n) => {
+                                eprintln!(
+                                    "[Partition] Re-split {} weights with ratio {:.2}",
+                                    n, ratio
+                                );
+                                // Reallocate workspace
+                                if let Some(ref ctx) = model.layers[0].partition_ctx {
+                                    let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
+                                    gen_ws.partition_ws = Some(PartitionWorkspace::new(
+                                        ctx,
+                                        ffn_hidden,
+                                        hidden_size,
+                                        q_dim,
+                                        k_dim,
+                                        v_dim,
+                                        &gpu_alloc,
+                                        backend.clone(),
+                                        cpu_backend_arc.clone(),
+                                    )?);
+                                }
+                                executor.set_partition_ratio(ratio);
+                            }
+                            Err(e) => eprintln!("[Partition] Re-split failed: {}", e),
+                        }
+                    }
+                }
+
                 // Dynamic layer skip / restore_defaults handling
                 if plan.restore_defaults {
                     eprintln!("[Resilience] RestoreDefaults");
@@ -3567,6 +3619,47 @@ fn main() -> anyhow::Result<()> {
                     target_tbt_ms = plan.target_tbt_ms as f64;
                 } else if plan.restore_defaults {
                     target_tbt_ms = args.target_tbt; // restore CLI default
+                }
+
+                // RestoreDefaults: restore partition ratio to CLI initial value
+                if plan.restore_defaults {
+                    let cli_ratio = args.tensor_partition;
+                    if cli_ratio > 0.0 && cli_ratio < 1.0 {
+                        // Restore to CLI partition ratio
+                        if !model.layers[0].wq.as_ptr().is_null()
+                            && let Ok(n) =
+                                model.prepare_tensor_partition(cli_ratio, &cpu_backend_arc)
+                        {
+                            eprintln!(
+                                "[Partition] RestoreDefaults: re-split {} weights with CLI ratio {:.2}",
+                                n, cli_ratio
+                            );
+                            if let Some(ref ctx) = model.layers[0].partition_ctx {
+                                let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
+                                if let Ok(ws) = PartitionWorkspace::new(
+                                    ctx,
+                                    ffn_hidden,
+                                    hidden_size,
+                                    q_dim,
+                                    k_dim,
+                                    v_dim,
+                                    &gpu_alloc,
+                                    backend.clone(),
+                                    cpu_backend_arc.clone(),
+                                ) {
+                                    gen_ws.partition_ws = Some(ws);
+                                }
+                            }
+                            executor.set_partition_ratio(cli_ratio);
+                        }
+                    } else {
+                        // CLI had no partition — disable
+                        for layer in &mut model.layers {
+                            layer.partition_ctx = None;
+                        }
+                        gen_ws.partition_ws = None;
+                        executor.set_partition_ratio(0.0);
+                    }
                 }
 
                 if plan.suspended {
@@ -4060,6 +4153,9 @@ fn command_summary(cmd: &EngineCommand) -> String {
         EngineCommand::Suspend => "Suspend".to_string(),
         EngineCommand::Resume => "Resume".to_string(),
         EngineCommand::RequestQcf => "RequestQcf".to_string(),
+        EngineCommand::SetPartitionRatio { ratio } => {
+            format!("SetPartitionRatio({})", ratio)
+        }
         EngineCommand::SetPrefillPolicy {
             chunk_size,
             yield_ms,
@@ -4099,6 +4195,9 @@ fn plan_summary(plan: &llm_rs2::resilience::ExecutionPlan) -> Vec<String> {
     }
     if plan.restore_defaults {
         names.push("RestoreDefaults".to_string());
+    }
+    if let Some(ratio) = plan.partition_ratio {
+        names.push(format!("PartitionRatio({:.2})", ratio));
     }
     names
 }

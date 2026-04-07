@@ -211,6 +211,12 @@ pub enum EngineCommand {
     /// Resume from suspended state.
     Resume,
 
+    // ── Tensor partition domain ──
+    /// Set GPU ratio for tensor partition (0.0~1.0).
+    /// 0.0 or 1.0 = disable partition (GPU-only).
+    /// Triggers weight re-split and workspace reallocation at next forward pass.
+    SetPartitionRatio { ratio: f32 },
+
     // ── Prefill domain ──
     /// Adjust prefill execution policy for GPU contention management.
     /// All fields are Optional — only provided fields are updated;
@@ -297,6 +303,9 @@ pub struct EngineStatus {
     /// Prefill total: prompt token count. 0 if not prefilling.
     #[serde(default)]
     pub prefill_total: usize,
+    /// Current tensor partition GPU ratio (0.0 = disabled).
+    #[serde(default)]
+    pub partition_ratio: f32,
 }
 
 /// Result of executing a single command.
@@ -560,6 +569,30 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_command_serde_set_partition_ratio() {
+        let cmd = EngineCommand::SetPartitionRatio { ratio: 0.65 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"set_partition_ratio\""));
+        assert!(json.contains("\"ratio\":0.65"));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::SetPartitionRatio { ratio } => {
+                assert!((ratio - 0.65).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected SetPartitionRatio"),
+        }
+    }
+
+    #[test]
+    fn test_engine_status_partition_ratio() {
+        let mut status = make_test_status();
+        status.partition_ratio = 0.75;
+        let json = serde_json::to_string(&status).unwrap();
+        let back: EngineStatus = serde_json::from_str(&json).unwrap();
+        assert!((back.partition_ratio - 0.75).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn test_engine_command_serde_set_prefill_policy_full() {
         let cmd = EngineCommand::SetPrefillPolicy {
             chunk_size: Some(48),
@@ -694,6 +727,7 @@ mod tests {
             phase: "decode".into(),
             prefill_pos: 0,
             prefill_total: 0,
+            partition_ratio: 0.0,
         }
     }
 

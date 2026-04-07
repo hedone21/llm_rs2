@@ -34,6 +34,8 @@ pub struct ExecutionPlan {
     pub restore_defaults: bool,
     /// Whether Engine should compute and send QCF estimates.
     pub request_qcf: bool,
+    /// Tensor partition ratio (0.0~1.0), set via SetPartitionRatio command.
+    pub partition_ratio: Option<f32>,
     /// Prefill policy update (partial — None fields mean "keep current").
     pub prefill_chunk_size: Option<usize>,
     pub prefill_yield_ms: Option<u32>,
@@ -103,6 +105,9 @@ pub struct CommandExecutor {
     // Currently active action names (e.g. "kv_evict_h2o", "throttle")
     active_actions: Vec<String>,
 
+    // Tensor partition ratio for heartbeat reporting
+    partition_ratio: f32,
+
     // Prefill progress reporting
     phase: String,
     prefill_pos: usize,
@@ -135,6 +140,7 @@ impl CommandExecutor {
             throttle_delay_ms: 0,
             target_tbt_ms: 0,
             active_actions: Vec::new(),
+            partition_ratio: 0.0,
             phase: String::new(),
             prefill_pos: 0,
             prefill_total: 0,
@@ -381,6 +387,10 @@ impl CommandExecutor {
                 plan.request_qcf = true;
                 CommandResult::Ok
             }
+            EngineCommand::SetPartitionRatio { ratio } => {
+                plan.partition_ratio = Some(*ratio);
+                CommandResult::Ok
+            }
             EngineCommand::SetPrefillPolicy {
                 chunk_size,
                 yield_ms,
@@ -445,6 +455,7 @@ impl CommandExecutor {
             phase: self.phase.clone(),
             prefill_pos: self.prefill_pos,
             prefill_total: self.prefill_total,
+            partition_ratio: self.partition_ratio,
         };
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));
@@ -489,6 +500,11 @@ impl CommandExecutor {
     /// Current throttle delay.
     pub fn throttle_delay_ms(&self) -> u64 {
         self.throttle_delay_ms
+    }
+
+    /// Update tensor partition ratio for heartbeat reporting.
+    pub fn set_partition_ratio(&mut self, ratio: f32) {
+        self.partition_ratio = ratio;
     }
 
     /// Update prefill progress for heartbeat reporting.
