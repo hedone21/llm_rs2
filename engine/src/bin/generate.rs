@@ -1503,9 +1503,12 @@ fn main() -> anyhow::Result<()> {
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
-                ctx.gate.split_row,
+                ctx,
                 ffn_hidden,
                 hidden_size,
+                q_dim,
+                k_dim,
+                v_dim,
                 &gpu_alloc,
                 backend.clone(),
                 cpu_backend_arc.clone(),
@@ -2701,9 +2704,12 @@ fn main() -> anyhow::Result<()> {
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
-                ctx.gate.split_row,
+                ctx,
                 ffn_hidden,
                 hidden_size,
+                q_dim,
+                k_dim,
+                v_dim,
                 &gpu_alloc,
                 backend.clone(),
                 cpu_backend_arc.clone(),

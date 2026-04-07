@@ -107,15 +107,93 @@ impl TransformerLayer {
                     );
                 }
             }
+        } else if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
+            // ── Partitioned QKV: cooperative GPU + CPU ──
+            if part.wq.is_some() {
+                // At least Q is partitioned — run partition path for all partitioned weights.
+                // Sync GPU (rms_norm → residual), then copy residual to CPU.
+                backend.synchronize()?;
+                unsafe {
+                    let dst = std::slice::from_raw_parts_mut(
+                        pw.residual_cpu.as_mut_ptr(),
+                        pw.residual_cpu.size(),
+                    );
+                    backend.read_buffer(&ws.residual, dst)?;
+                }
+
+                // GPU: enqueue partitioned matmuls (non-blocking).
+                // If a weight is not partitioned (None), use full weight on GPU.
+                macro_rules! gpu_matmul_part {
+                    ($pw_opt:expr, $full_w:expr, $part_gpu:expr, $out:expr) => {
+                        if let Some(pw_weight) = $pw_opt.as_ref() {
+                            backend.matmul_transposed(
+                                &ws.residual,
+                                &pw_weight.gpu_slice,
+                                $part_gpu.as_mut().unwrap(),
+                            )?;
+                        } else {
+                            backend.matmul_transposed(&ws.residual, $full_w, $out)?;
+                        }
+                    };
+                }
+                gpu_matmul_part!(part.wq, &self.wq, &mut pw.q_gpu, &mut ws.q);
+                gpu_matmul_part!(part.wk, &self.wk, &mut pw.k_gpu, &mut ws.k);
+                gpu_matmul_part!(part.wv, &self.wv, &mut pw.v_gpu, &mut ws.v);
+                backend.flush()?;
+
+                // CPU: blocking partial matmuls (GPU runs in parallel after flush).
+                let cpu = &part.cpu_backend;
+                macro_rules! cpu_matmul_part {
+                    ($pw_opt:expr, $part_cpu:expr) => {
+                        if let Some(pw_weight) = $pw_opt.as_ref() {
+                            cpu.matmul_transposed(
+                                &pw.residual_cpu,
+                                &pw_weight.cpu_slice,
+                                $part_cpu.as_mut().unwrap(),
+                            )?;
+                        }
+                    };
+                }
+                cpu_matmul_part!(part.wq, &mut pw.q_cpu);
+                cpu_matmul_part!(part.wk, &mut pw.k_cpu);
+                cpu_matmul_part!(part.wv, &mut pw.v_cpu);
+
+                // Merge: copy_slice GPU partial + CPU partial → full output.
+                macro_rules! merge_part {
+                    ($pw_opt:expr, $part_gpu:expr, $part_cpu:expr, $out:expr) => {
+                        if $pw_opt.is_some() {
+                            let g = $part_gpu.as_ref().unwrap();
+                            let c = $part_cpu.as_ref().unwrap();
+                            let ge = g.size() / 4;
+                            let ce = c.size() / 4;
+                            backend.copy_slice(g, $out, 0, 0, ge)?;
+                            backend.copy_slice(c, $out, 0, ge, ce)?;
+                        }
+                    };
+                }
+                merge_part!(part.wq, &pw.q_gpu, &pw.q_cpu, &mut ws.q);
+                merge_part!(part.wk, &pw.k_gpu, &pw.k_cpu, &mut ws.k);
+                merge_part!(part.wv, &pw.v_gpu, &pw.v_cpu, &mut ws.v);
+            } else {
+                // No attention partition — standard path
+                crate::core::thread_pool::get_pool().begin_batch();
+                backend.matmul_transposed(&ws.residual, &self.wq, &mut ws.q)?;
+                backend.matmul_transposed(&ws.residual, &self.wk, &mut ws.k)?;
+                backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
+                crate::core::thread_pool::get_pool().end_batch();
+            }
+            if is_gpu {
+                backend.flush()?;
+            }
         } else {
             crate::core::thread_pool::get_pool().begin_batch();
             backend.matmul_transposed(&ws.residual, &self.wq, &mut ws.q)?;
             backend.matmul_transposed(&ws.residual, &self.wk, &mut ws.k)?;
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             crate::core::thread_pool::get_pool().end_batch();
-        }
-        if is_gpu {
-            backend.flush()?;
+            if is_gpu {
+                backend.flush()?;
+            }
         }
         prof_record!(t, matmul_qkv);
 
@@ -881,7 +959,32 @@ impl TransformerLayer {
         prof_record!(t, attention);
 
         let t = prof_start!();
-        backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
+        if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
+            if let (Some(wo_part), Some(o_gpu), Some(o_cpu), Some(attn_cpu)) =
+                (&part.wo, &mut pw.o_gpu, &mut pw.o_cpu, &mut pw.attn_out_cpu)
+            {
+                // Partitioned wo: sync, copy out_attn to CPU, split matmul, merge
+                backend.synchronize()?;
+                unsafe {
+                    let dst =
+                        std::slice::from_raw_parts_mut(attn_cpu.as_mut_ptr(), attn_cpu.size());
+                    backend.read_buffer(&ws.out_attn, dst)?;
+                }
+                backend.matmul_transposed(&ws.out_attn, &wo_part.gpu_slice, o_gpu)?;
+                backend.flush()?;
+                let cpu = &part.cpu_backend;
+                cpu.matmul_transposed(attn_cpu, &wo_part.cpu_slice, o_cpu)?;
+                // Merge
+                let ge = o_gpu.size() / 4;
+                let ce = o_cpu.size() / 4;
+                backend.copy_slice(o_gpu, &mut ws.attn_out, 0, 0, ge)?;
+                backend.copy_slice(o_cpu, &mut ws.attn_out, 0, ge, ce)?;
+            } else {
+                backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
+            }
+        } else {
+            backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
+        }
         prof_record!(t, matmul_wo);
 
         // 7+8. Post-attention residual + pre-FFN norm
@@ -1007,7 +1110,28 @@ impl TransformerLayer {
         prof_record!(t, silu_mul);
 
         let t = prof_start!();
-        backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+        if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
+            // Partitioned down projection: sync, copy gate (FFN mid) to CPU, split matmul, merge
+            backend.synchronize()?;
+            unsafe {
+                let dst = std::slice::from_raw_parts_mut(
+                    pw.ffn_mid_cpu.as_mut_ptr(),
+                    pw.ffn_mid_cpu.size(),
+                );
+                backend.read_buffer(&ws.gate, dst)?;
+            }
+            backend.matmul_transposed(&ws.gate, &part.down.gpu_slice, &mut pw.down_gpu)?;
+            backend.flush()?;
+            let cpu = &part.cpu_backend;
+            cpu.matmul_transposed(&pw.ffn_mid_cpu, &part.down.cpu_slice, &mut pw.down_cpu)?;
+            // Merge
+            let ge = pw.down_gpu.size() / 4;
+            let ce = pw.down_cpu.size() / 4;
+            backend.copy_slice(&pw.down_gpu, &mut ws.down, 0, 0, ge)?;
+            backend.copy_slice(&pw.down_cpu, &mut ws.down, 0, ge, ce)?;
+        } else {
+            backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+        }
         prof_record!(t, matmul_ffn);
 
         // 10. Residual 2 — accumulate FFN result into x (skip connection)

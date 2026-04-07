@@ -25,15 +25,23 @@ pub struct PartitionedWeight {
     pub split_row: usize,
 }
 
-/// Per-layer partition context holding CPU backend and partitioned FFN weights.
+/// Per-layer partition context holding CPU backend and partitioned weights.
+///
+/// Attention weights (wq/wk/wv/wo) are `Option` because GQA models may have
+/// out_dim < 256 for K/V projections, making partitioning impossible.
+/// FFN weights (gate/up/down) are always partitioned since ffn_hidden is large enough.
 pub struct PartitionContext {
     pub gpu_ratio: f32,
     pub cpu_backend: Arc<dyn Backend>,
-    /// Partitioned gate projection weight.
+    // Attention projections (Option: GQA heads with out_dim < 256 are skipped)
+    pub wq: Option<PartitionedWeight>,
+    pub wk: Option<PartitionedWeight>,
+    pub wv: Option<PartitionedWeight>,
+    pub wo: Option<PartitionedWeight>,
+    // FFN projections (always partitioned — ffn_hidden is large enough)
     pub gate: PartitionedWeight,
-    /// Partitioned up projection weight.
     pub up: PartitionedWeight,
-    // NOTE: down projection is not partitioned in the prototype.
+    pub down: PartitionedWeight,
 }
 
 /// Compute the number of bytes per row for a given dtype and inner dimension.
@@ -69,6 +77,26 @@ fn bytes_per_row(dtype: DType, in_dim: usize) -> Result<usize> {
 /// Round `value` down to the nearest multiple of `align`.
 fn align_down(value: usize, align: usize) -> usize {
     (value / align) * align
+}
+
+/// Try to split a weight tensor row-wise; returns `None` if out_dim is too small.
+///
+/// This is useful for GQA attention projections where K/V weight out_dim may be
+/// smaller than `ROW_ALIGNMENT * 2` (256), making partitioning impossible.
+pub fn split_weight_optional(
+    weight: &Tensor,
+    gpu_ratio: f32,
+    cpu_backend: &Arc<dyn Backend>,
+) -> Result<Option<PartitionedWeight>> {
+    let dims = weight.shape().dims();
+    if dims.len() < 2 {
+        return Ok(None);
+    }
+    let out_dim = dims[0];
+    if out_dim < ROW_ALIGNMENT * 2 {
+        return Ok(None);
+    }
+    split_weight(weight, gpu_ratio, cpu_backend).map(Some)
 }
 
 /// Split a weight tensor row-wise for CPU-GPU cooperative inference.
@@ -558,5 +586,52 @@ mod tests {
         let cpu = cpu_backend();
         let result = split_weight(&w, 0.5, &cpu);
         assert!(result.is_err());
+    }
+
+    // ── split_weight_optional tests ──
+
+    // Returns Some for weights large enough to partition.
+    #[test]
+    fn test_split_optional_large() {
+        let w = make_f32_weight(512, 256);
+        let cpu = cpu_backend();
+        let result = super::split_weight_optional(&w, 0.5, &cpu).unwrap();
+        assert!(result.is_some());
+        let pw = result.unwrap();
+        assert_eq!(
+            pw.gpu_slice.shape().dims()[0] + pw.cpu_slice.shape().dims()[0],
+            512
+        );
+    }
+
+    // Returns None for weights too small (out_dim < 256).
+    #[test]
+    fn test_split_optional_too_small() {
+        let memory = Galloc::new();
+        let buf = memory.alloc(128 * 64 * 4, DType::F32).unwrap();
+        let w = Tensor::new(Shape::new(vec![128, 64]), buf, cpu_backend());
+        let cpu = cpu_backend();
+        let result = super::split_weight_optional(&w, 0.5, &cpu).unwrap();
+        assert!(result.is_none());
+    }
+
+    // Returns None for 1D tensor (dims.len() < 2).
+    #[test]
+    fn test_split_optional_1d() {
+        let memory = Galloc::new();
+        let buf = memory.alloc(1024 * 4, DType::F32).unwrap();
+        let w = Tensor::new(Shape::new(vec![1024]), buf, cpu_backend());
+        let cpu = cpu_backend();
+        let result = super::split_weight_optional(&w, 0.5, &cpu).unwrap();
+        assert!(result.is_none());
+    }
+
+    // Returns Some at exact boundary (out_dim = 256).
+    #[test]
+    fn test_split_optional_boundary() {
+        let w = make_f32_weight(256, 128);
+        let cpu = cpu_backend();
+        let result = super::split_weight_optional(&w, 0.5, &cpu).unwrap();
+        assert!(result.is_some());
     }
 }
