@@ -398,10 +398,9 @@ struct Args {
 
 /// Create a GPU buffer allocator for tensor partition workspace.
 ///
-/// On OpenCL: allocates `MadviseableGPUBuffer` (CL_MEM_USE_HOST_PTR) so that
-/// `as_ptr()`/`as_mut_ptr()` always return valid host pointers while `cl_mem()`
-/// remains valid for GPU kernels.  This enables zero-copy merge in the
-/// partition forward path (no read_buffer/write_buffer round-trips).
+/// On OpenCL: allocates `UnifiedBuffer` (CL_MEM_ALLOC_HOST_PTR) + permanent map.
+/// Single VMA: `as_ptr()`/`as_mut_ptr()` return valid host pointers while
+/// `cl_mem()` remains valid for GPU kernels. No PSS double-counting on Adreno.
 ///
 /// On other backends (CPU, CUDA): falls back to `memory.alloc()` which already
 /// returns host-accessible buffers (SharedBuffer, CudaHostBuffer).
@@ -409,22 +408,21 @@ fn make_partition_gpu_alloc<'a>(
     backend: &'a dyn Backend,
     memory: &'a dyn Memory,
 ) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> + 'a {
-    // Try to extract OpenCL context for MadviseableGPUBuffer allocation.
+    // Try to extract OpenCL queue for UnifiedBuffer allocation.
     #[cfg(feature = "opencl")]
-    let ocl_ctx: Option<ocl::Context> = backend
+    let ocl_queue: Option<ocl::Queue> = backend
         .as_any()
         .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-        .map(|b| b.context.clone());
+        .map(|b| b.queue.clone());
 
     #[cfg(not(feature = "opencl"))]
     let _ = backend; // suppress unused warning
 
     move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> {
         #[cfg(feature = "opencl")]
-        if let Some(ref ctx) = ocl_ctx {
-            let buf = llm_rs2::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer::new(
-                ctx, size, dtype,
-            )?;
+        if let Some(ref q) = ocl_queue {
+            let buf = llm_rs2::buffer::unified_buffer::UnifiedBuffer::new(q.clone(), size, dtype)?;
+            buf.map()?; // Permanent map for dual CPU/GPU access
             return Ok(Arc::new(buf));
         }
         memory.alloc(size, dtype)
@@ -521,8 +519,8 @@ fn main() -> anyhow::Result<()> {
         "opencl" | "gpu" => {
             let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
             // When resilience is enabled, force zero-copy memory so KV cache uses
-            // MadviseableGPUBuffer (host-accessible). This enables zero-alloc
-            // UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
+            // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, host-accessible). This enables
+            // zero-alloc UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
             let effective_zero_copy = args.zero_copy
                 || args.resilience_prealloc_switch
                 || args.tensor_partition > 0.0
@@ -580,33 +578,36 @@ fn main() -> anyhow::Result<()> {
     let mut model =
         TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
 
-    // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory
-    // (MadviseableGPUBuffer = CL_MEM_USE_HOST_PTR: host Vec always valid + cl_mem for GPU).
-    // This enables CPU→GPU SwitchHw without weight re-upload.
+    // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
+    // Creates UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR) + mapped: single VMA,
+    // as_ptr() valid for CPU, cl_mem() valid for GPU.
     #[cfg(feature = "opencl")]
     if !is_gpu && let (Some(gpu_be), Some(gpu_mem)) = (&gpu_backend_arc, &gpu_memory_arc) {
         match model.migrate_weights_to_gpu(gpu_mem.as_ref(), gpu_be) {
-            Ok(n) => eprintln!("[Backend] Migrated {} weight tensors to GPU zero-copy", n),
+            Ok(n) => eprintln!(
+                "[Backend] Migrated {} weight tensors to GPU zero-copy (ALLOC_HOST_PTR)",
+                n
+            ),
             Err(e) => eprintln!("[Backend] Weight migration skipped: {}", e),
         }
     }
 
-    // When GPU primary + resilience enabled: ensure weights are CPU-accessible for
-    // GPU→CPU SwitchHw. Default OpenCLBuffer (device-only) has as_ptr()=null —
-    // CpuBackend can't read them. Re-wrap as ClWrappedBuffer (CL_MEM_USE_HOST_PTR).
+    // When GPU primary + resilience/partition enabled: ensure weights are CPU-accessible.
+    // Maps UnifiedBuffer weights or reads device-only OpenCLBuffer into new UnifiedBuffer.
+    // Single VMA (ALLOC_HOST_PTR) — no PSS double-counting on Adreno.
     #[cfg(feature = "opencl")]
     if is_gpu
         && (args.resilience_prealloc_switch
             || args.tensor_partition > 0.0
             || args.prefill_cpu_chunk_size > 0)
     {
-        match model.rewrap_weights_for_dual_access(&backend) {
+        match model.map_weights_for_cpu(&backend) {
             Ok(n) if n > 0 => eprintln!(
-                "[Backend] Re-wrapped {} weight tensors for dual CPU/GPU access",
+                "[Backend] Mapped {} weight tensors for dual CPU/GPU access",
                 n
             ),
             Ok(_) => {} // All weights already CPU-accessible
-            Err(e) => eprintln!("[Backend] Weight re-wrap failed (switch may crash): {}", e),
+            Err(e) => eprintln!("[Backend] Weight mapping failed (switch may crash): {}", e),
         }
     }
 
@@ -625,7 +626,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Tensor partition: split FFN gate/up weights for CPU-GPU cooperative inference.
-    // Requires weights to be CPU-accessible (after rewrap_weights_for_dual_access).
+    // Requires weights to be CPU-accessible (after map_weights_for_cpu).
     if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
         match model.prepare_tensor_partition(args.tensor_partition, &cpu_backend_arc) {
             Ok(n) => eprintln!(
@@ -636,7 +637,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch
+    // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch.
     #[cfg(feature = "opencl")]
     let weights_on_gpu =
         llm_rs2::backend::opencl::get_cl_mem(model.layers[0].wq.buffer().as_ref()).is_ok();
@@ -1494,7 +1495,7 @@ fn main() -> anyhow::Result<()> {
         )?;
 
         // Attach partition workspace if tensor partition is active.
-        // Use MadviseableGPUBuffer (host-accessible + GPU-accessible) for partition
+        // Use UnifiedBuffer (ALLOC_HOST_PTR, host-accessible + GPU-accessible) for partition
         // buffers so merge can use direct pointer access instead of read_buffer/write_buffer.
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
@@ -1887,7 +1888,7 @@ fn main() -> anyhow::Result<()> {
                                 backend.clone(),
                             );
                             eprintln!(
-                                "[Prefill->Decode] SwitchHw: Switched to CPU (decode buffers re-allocated)."
+                                "[Prefill->Decode] SwitchHw: Switched to CPU (GPU handles released, decode buffers re-allocated)."
                             );
                         }
                         "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
@@ -2537,6 +2538,8 @@ fn main() -> anyhow::Result<()> {
                 )?;
                 backend = cpu_backend_arc.clone();
                 is_gpu = false;
+                // Re-tag weight tensors with CPU backend.
+                // UnifiedBuffer (ALLOC_HOST_PTR, mapped) stays valid for CPU.
                 eprintln!("[Prefill->Decode] SwitchHw: Switched to CPU.");
             }
             "gpu" | "opencl" if !is_gpu && weights_on_gpu => {
@@ -2615,7 +2618,15 @@ fn main() -> anyhow::Result<()> {
         let v_dim = k_dim;
         let ffn_hidden = model.config.intermediate_size;
 
-        let x_gen_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+        // After SwitchHw GPU->CPU, `memory` is still OpenCL memory whose
+        // alloc() creates OpenCLBuffer (null as_ptr). Use cpu_memory_arc when on CPU.
+        let decode_mem: &dyn Memory = if is_gpu {
+            memory.as_ref()
+        } else {
+            cpu_memory_arc.as_ref()
+        };
+
+        let x_gen_buf = decode_mem.alloc(hidden_size * 4, DType::F32)?;
         let mut x_gen = Tensor::new(
             Shape::new(vec![1, 1, hidden_size]),
             x_gen_buf,
@@ -2633,14 +2644,14 @@ fn main() -> anyhow::Result<()> {
                 n_heads: model.config.num_attention_heads,
                 max_seq_len: args.max_seq_len, // Use context window size
             },
-            memory.as_ref(),
+            decode_mem,
             backend.clone(),
         )?;
 
         // Attach partition workspace if tensor partition is active.
-        // Use MadviseableGPUBuffer for zero-copy merge (see batch path above).
+        // Use UnifiedBuffer (ALLOC_HOST_PTR) for zero-copy merge (see batch path above).
         if let Some(ref ctx) = model.layers[0].partition_ctx {
-            let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
+            let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx.gate.split_row,
                 ffn_hidden,
@@ -2659,8 +2670,8 @@ fn main() -> anyhow::Result<()> {
             Arc::new(CpuBackend::new()),
         );
 
-        // Pre-allocate GPU input tensor for decode loop (avoids per-token GPU alloc)
-        let gpu_gen_input_buf = memory.alloc(4, DType::U8)?;
+        // Pre-allocate input tensor for decode loop (avoids per-token alloc)
+        let gpu_gen_input_buf = decode_mem.alloc(4, DType::U8)?;
         let mut gen_input_tensor =
             Tensor::new(Shape::new(vec![1, 1]), gpu_gen_input_buf, backend.clone());
 
@@ -3410,7 +3421,8 @@ fn main() -> anyhow::Result<()> {
                                         gpu_plan = None;
                                     }
                                     is_gpu = false;
-                                    eprintln!("[Switch] Resilience: Switched to CPU (zero-alloc).");
+                                    // Re-tag weight tensors with CPU backend.
+                                    eprintln!("[Switch] Resilience: Switched to CPU.");
                                 }
                             }
                             "gpu" | "opencl" if !is_gpu && weights_on_gpu => {

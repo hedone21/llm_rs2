@@ -704,8 +704,13 @@ impl TransformerModel {
     }
 
     /// Migrate all model weight tensors from CPU to GPU zero-copy memory.
-    /// Uses the provided Memory allocator (must be zero-copy OpenCL) to create
-    /// buffers with both host pointer (CPU) and cl_mem (GPU) access.
+    ///
+    /// Creates `UnifiedBuffer` (CL_MEM_ALLOC_HOST_PTR) for each weight tensor,
+    /// maps it for CPU access, copies the data from the original CPU buffer,
+    /// and keeps the mapping alive. This gives single-VMA dual access:
+    /// - `as_ptr()` → mapped host pointer (valid for CPU backend)
+    /// - `cl_mem()` → OpenCL handle (valid for GPU kernels)
+    ///
     /// Returns the number of tensors migrated.
     #[cfg(feature = "opencl")]
     pub fn migrate_weights_to_gpu(
@@ -714,25 +719,31 @@ impl TransformerModel {
         gpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
         let mut count = 0;
-        // Wrap existing CPU buffers with CL_MEM_USE_HOST_PTR handles.
-        // Zero additional memory: CL just maps the existing host pointer for GPU access.
-        // On ARM UMA (Adreno), CPU and GPU share the same physical DRAM — no copy needed.
         #[cfg(feature = "opencl")]
-        let ocl_context = gpu_backend
+        let ocl_queue = gpu_backend
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .map(|be| be.context.clone());
+            .map(|be| be.queue.clone());
         #[cfg(not(feature = "opencl"))]
-        let ocl_context: Option<()> = None;
-        let context = ocl_context.ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+        let ocl_queue: Option<()> = None;
+        let queue = ocl_queue.ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
 
         let migrate_one = |t: &Tensor| -> Result<Tensor> {
-            let buf: Arc<dyn Buffer> =
-                Arc::new(crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
-                    &context,
-                    t.buffer().clone(),
-                    t.dtype(),
-                )?);
+            let size = t.size();
+            let src_ptr = t.as_ptr();
+            if src_ptr.is_null() {
+                return Err(anyhow!("Cannot migrate null-pointer buffer"));
+            }
+            // Create ALLOC_HOST_PTR buffer, map, copy data from CPU buffer.
+            let ub =
+                crate::buffer::unified_buffer::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+            ub.map()?; // clEnqueueMapBuffer → host pointer
+            // SAFETY: src_ptr is non-null (checked above), ub.as_mut_ptr() is valid after map().
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, ub.as_mut_ptr(), size);
+            }
+            // Keep mapped: as_ptr()=valid, cl_mem()=valid → dual access.
+            let buf: Arc<dyn Buffer> = Arc::new(ub);
             Ok(Tensor::new(t.shape().clone(), buf, gpu_backend.clone()))
         };
         // Layer weights (always small — Q4 ~6MB, F16 ~16MB max per tensor)
@@ -797,98 +808,100 @@ impl TransformerModel {
         Ok(count)
     }
 
-    /// Re-wrap GPU-only weight buffers as dual-access ClWrappedBuffer.
+    /// Make GPU-primary weight buffers CPU-accessible by mapping UnifiedBuffers.
     ///
-    /// When `--backend opencl` with `use_zero_copy=false` (default), weights are in
-    /// OpenCLBuffer (device-only: `as_ptr()` = null). After a GPU→CPU SwitchHw, the
-    /// CPU backend needs `as_ptr()` to read weights.
+    /// When `--backend opencl` with `use_zero_copy=true`, `copy_from()` creates
+    /// `UnifiedBuffer` (CL_MEM_ALLOC_HOST_PTR) for each weight. These start
+    /// unmapped (as_ptr()=null). This method maps each buffer so the CPU backend
+    /// can read weights via `as_ptr()` for GPU→CPU SwitchHw or tensor partition.
     ///
-    /// This method reads each GPU-only weight to a CPU buffer (Galloc) and wraps it
-    /// with CL_MEM_USE_HOST_PTR, making it accessible from both CPU and GPU.
-    /// On ARM UMA (Adreno), this is zero additional memory: same physical DRAM.
+    /// When `use_zero_copy=false`, weights are in `OpenCLBuffer` (device-only).
+    /// This method reads each GPU-only weight into a new `UnifiedBuffer`
+    /// (ALLOC_HOST_PTR + mapped), replacing the tensor. Single VMA, no
+    /// PSS double-counting.
     ///
-    /// Call at startup when resilience is enabled and backend is GPU.
+    /// Call at startup when resilience/tensor-partition is enabled and backend is GPU.
     #[cfg(feature = "opencl")]
-    pub fn rewrap_weights_for_dual_access(
-        &mut self,
-        gpu_backend: &Arc<dyn Backend>,
-    ) -> Result<usize> {
-        let ocl_context = gpu_backend
+    pub fn map_weights_for_cpu(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
+        let ocl_be = gpu_backend
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
-            .map(|be| be.context.clone())
             .ok_or_else(|| anyhow!("GPU backend is not OpenCL"))?;
+        let queue = ocl_be.queue.clone();
 
-        let cpu_memory = crate::memory::galloc::Galloc::new();
         let mut count = 0;
 
-        let rewrap_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<Tensor> {
-            // Skip if already CPU-accessible (ClWrappedBuffer, MadviseableGPUBuffer, etc.)
+        let map_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<(Tensor, bool)> {
+            // Already CPU-accessible (mapped UnifiedBuffer, etc.) → just map if needed.
             if !t.buffer().as_ptr().is_null() {
-                return Ok(t.clone());
+                t.buffer().map_for_cpu()?; // no-op if already mapped
+                return Ok((t.clone(), false));
             }
-            // Read GPU data to CPU buffer
-            let cpu_buf = cpu_memory.alloc(t.size(), t.dtype())?;
-            let dst = unsafe { std::slice::from_raw_parts_mut(cpu_buf.as_mut_ptr(), t.size()) };
+            // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.
+            let size = t.size();
+            let ub =
+                crate::buffer::unified_buffer::UnifiedBuffer::new(queue.clone(), size, t.dtype())?;
+            ub.map()?;
+            // SAFETY: ub.as_mut_ptr() is valid after map(). read_buffer copies from GPU.
+            let dst = unsafe { std::slice::from_raw_parts_mut(ub.as_mut_ptr(), size) };
             be.read_buffer(t, dst)?;
-            // Wrap CPU buffer with CL handle for GPU access
-            let dual_buf: Arc<dyn Buffer> =
-                Arc::new(crate::buffer::cl_wrapped_buffer::ClWrappedBuffer::new(
-                    &ocl_context,
-                    cpu_buf,
-                    t.dtype(),
-                )?);
-            Ok(Tensor::new(t.shape().clone(), dual_buf, be.clone()))
+            let buf: Arc<dyn Buffer> = Arc::new(ub);
+            Ok((Tensor::new(t.shape().clone(), buf, be.clone()), true))
         };
 
-        macro_rules! rewrap {
+        macro_rules! map_weight {
             ($t:expr) => {
-                let new = rewrap_one(&$t, gpu_backend)?;
-                if !std::ptr::eq($t.buffer().as_ref(), new.buffer().as_ref()) {
+                let (new, changed) = map_one(&$t, gpu_backend)?;
+                if changed {
                     $t = new;
                     count += 1;
                 }
             };
         }
         for layer in &mut self.layers {
-            rewrap!(layer.wq);
-            rewrap!(layer.wk);
-            rewrap!(layer.wv);
-            rewrap!(layer.wo);
-            rewrap!(layer.w_gate);
-            rewrap!(layer.w_up);
-            rewrap!(layer.w_down);
-            rewrap!(layer.attention_norm);
-            rewrap!(layer.ffn_norm);
+            map_weight!(layer.wq);
+            map_weight!(layer.wk);
+            map_weight!(layer.wv);
+            map_weight!(layer.wo);
+            map_weight!(layer.w_gate);
+            map_weight!(layer.w_up);
+            map_weight!(layer.w_down);
+            map_weight!(layer.attention_norm);
+            map_weight!(layer.ffn_norm);
             if let Some(ref mut bias) = layer.qkv_bias {
-                rewrap!(bias.bq);
-                rewrap!(bias.bk);
-                rewrap!(bias.bv);
+                map_weight!(bias.bq);
+                map_weight!(bias.bk);
+                map_weight!(bias.bv);
             }
             if let Some(ref t) = layer.q_norm {
-                layer.q_norm = Some(rewrap_one(t, gpu_backend)?);
+                let (new, _) = map_one(t, gpu_backend)?;
+                layer.q_norm = Some(new);
                 count += 1;
             }
             if let Some(ref t) = layer.k_norm {
-                layer.k_norm = Some(rewrap_one(t, gpu_backend)?);
+                let (new, _) = map_one(t, gpu_backend)?;
+                layer.k_norm = Some(new);
                 count += 1;
             }
             if let Some(ref t) = layer.pre_ffn_norm {
-                layer.pre_ffn_norm = Some(rewrap_one(t, gpu_backend)?);
+                let (new, _) = map_one(t, gpu_backend)?;
+                layer.pre_ffn_norm = Some(new);
                 count += 1;
             }
             if let Some(ref t) = layer.post_ffn_norm {
-                layer.post_ffn_norm = Some(rewrap_one(t, gpu_backend)?);
+                let (new, _) = map_one(t, gpu_backend)?;
+                layer.post_ffn_norm = Some(new);
                 count += 1;
             }
         }
-        rewrap!(self.norm);
+        map_weight!(self.norm);
         if !self.lm_head_on_cpu {
-            rewrap!(self.lm_head);
+            map_weight!(self.lm_head);
         }
         // embed_tokens: check gpu_embed_tokens first
         if let Some(ref t) = self.gpu_embed_tokens {
-            self.gpu_embed_tokens = Some(rewrap_one(t, gpu_backend)?);
+            let (new, _) = map_one(t, gpu_backend)?;
+            self.gpu_embed_tokens = Some(new);
             count += 1;
         }
         Ok(count)
@@ -902,7 +915,7 @@ impl TransformerModel {
     ///
     /// Each slice is pre-copied into an independent buffer via `Backend::copy_from()`,
     /// ensuring GPU slices have a valid `cl_mem` handle for OpenCL kernel dispatch.
-    /// Call after `rewrap_weights_for_dual_access()` so weights are CPU-accessible
+    /// Call after `map_weights_for_cpu()` so weights are CPU-accessible
     /// (needed for the Host-to-Device copy path).
     ///
     /// Returns the number of weights partitioned (2 per layer: gate + up).

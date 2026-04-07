@@ -209,8 +209,8 @@ impl PartitionWorkspace {
     /// `out_dim`: total output dimension of gate/up projections.
     /// `dim`: hidden dimension (for residual_cpu).
     /// `gpu_alloc`: allocator closure for GPU-side buffers. Caller decides the
-    ///              concrete buffer type (MadviseableGPUBuffer for zero-copy,
-    ///              UnifiedBuffer for standard OpenCL, CudaHostBuffer for CUDA, etc.).
+    ///              concrete buffer type (UnifiedBuffer for OpenCL zero-copy,
+    ///              CudaHostBuffer for CUDA, etc.).
     /// `gpu_backend`: backend for GPU-side tensors.
     /// `cpu_backend`: backend for CPU-side tensors.
     pub fn new(

@@ -11,11 +11,14 @@ use std::any::Any;
 /// - GPU kernels access the same physical pages (zero-copy on UMA)
 /// - `madvise(MADV_DONTNEED)` works because the app owns the memory (not driver-pinned)
 ///
-/// This is used for KV cache buffers where eviction needs to release physical pages.
+/// NOTE: This buffer type creates two VMAs on Adreno (one for Vec, one for
+/// KGSL DMA-BUF remap), causing PSS double-counting. Prefer `UnifiedBuffer`
+/// (CL_MEM_ALLOC_HOST_PTR) for new allocations. This type is retained for
+/// backward compatibility.
 pub struct MadviseableGPUBuffer {
     /// App-managed host memory (madvise target)
     host_data: Vec<u8>,
-    /// CL buffer wrapping host_data via CL_MEM_USE_HOST_PTR
+    /// CL buffer wrapping host_data via CL_MEM_USE_HOST_PTR.
     cl_buffer: Mem,
     size: usize,
     dtype: DType,

@@ -31,7 +31,7 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(ocl_buf.buffer.as_core());
     }
-    // MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR — used for zero-copy weight sharing)
+    // MadviseableGPUBuffer (CL_MEM_USE_HOST_PTR — legacy, retained for compatibility)
     if let Some(m) = buf
         .as_any()
         .downcast_ref::<crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer>()

@@ -1,5 +1,4 @@
 use super::buffer::OpenCLBuffer;
-use crate::buffer::madviseable_gpu_buffer::MadviseableGPUBuffer;
 use crate::buffer::unified_buffer::UnifiedBuffer;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
@@ -59,15 +58,17 @@ impl Memory for OpenCLMemory {
 
     fn alloc_kv(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
         if self.use_zero_copy {
-            // KV cache: host-managed memory with CL_MEM_USE_HOST_PTR.
-            // madvise works (app owns the pages), GPU accesses same physical memory (UMA).
-            let buffer: Arc<dyn Buffer> =
-                Arc::new(MadviseableGPUBuffer::new(&self.context, size, dtype)?);
+            // KV cache: CL_MEM_ALLOC_HOST_PTR (driver-managed, single VMA).
+            // Starts UNMAPPED — GPU writes via cl_mem during forward pass.
+            // Map for CPU access only during SwitchHw (via kv_migrate).
+            // Note: OpenCL spec says writing to a mapped buffer via cl_mem is UB.
+            let buffer = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
+            let buf: Arc<dyn Buffer> = Arc::new(buffer);
             {
                 let mut mem = self.used_memory.lock().unwrap();
                 *mem += size;
             }
-            Ok(buffer)
+            Ok(buf)
         } else {
             self.alloc(size, dtype)
         }
