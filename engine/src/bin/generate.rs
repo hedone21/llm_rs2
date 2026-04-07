@@ -1750,8 +1750,16 @@ fn main() -> anyhow::Result<()> {
                             eprintln!("[Prefill] Policy: yield_ms -> {}", v);
                         }
                         if let Some(v) = plan.prefill_cpu_chunk_size {
-                            effective_cpu_chunk_size = v;
-                            eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
+                            if v > 0 && model.layers[0].wq.as_ptr().is_null() {
+                                eprintln!(
+                                    "[Prefill] Policy: cpu_chunk_size={} rejected — weights not CPU-accessible. \
+                                     Use --resilience-prealloc-switch or --prefill-cpu-chunk-size at CLI.",
+                                    v
+                                );
+                            } else {
+                                effective_cpu_chunk_size = v;
+                                eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
+                            }
                         }
 
                         // Throttle: sleep between chunks
@@ -2396,8 +2404,16 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("[Prefill] Policy: yield_ms -> {}", v);
                 }
                 if let Some(v) = plan.prefill_cpu_chunk_size {
-                    effective_cpu_chunk_size = v;
-                    eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
+                    if v > 0 && model.layers[0].wq.as_ptr().is_null() {
+                        eprintln!(
+                            "[Prefill] Policy: cpu_chunk_size={} rejected — weights not CPU-accessible. \
+                             Use --resilience-prealloc-switch or --prefill-cpu-chunk-size at CLI.",
+                            v
+                        );
+                    } else {
+                        effective_cpu_chunk_size = v;
+                        eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
+                    }
                 }
 
                 // Throttle: sleep between chunks

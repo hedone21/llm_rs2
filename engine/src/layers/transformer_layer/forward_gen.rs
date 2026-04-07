@@ -1359,9 +1359,8 @@ impl TransformerLayer {
             });
 
         // 4. Write result back to GPU out_attn buffer (in-place, no realloc)
-        let out_bytes = unsafe {
-            std::slice::from_raw_parts(out_f32.as_ptr() as *const u8, out_f32.len() * 4)
-        };
+        let out_bytes =
+            unsafe { std::slice::from_raw_parts(out_f32.as_ptr() as *const u8, out_f32.len() * 4) };
         backend.write_buffer(out_attn, out_bytes)?;
 
         Ok(())
