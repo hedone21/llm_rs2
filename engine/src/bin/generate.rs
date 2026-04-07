@@ -524,11 +524,13 @@ fn main() -> anyhow::Result<()> {
             let effective_zero_copy = args.zero_copy
                 || args.resilience_prealloc_switch
                 || args.tensor_partition > 0.0
-                || args.prefill_cpu_chunk_size > 0;
+                || args.prefill_cpu_chunk_size > 0
+                || args.enable_resilience;
             if !args.zero_copy
                 && (args.resilience_prealloc_switch
                     || args.tensor_partition > 0.0
-                    || args.prefill_cpu_chunk_size > 0)
+                    || args.prefill_cpu_chunk_size > 0
+                    || args.enable_resilience)
             {
                 eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
             }
@@ -599,7 +601,8 @@ fn main() -> anyhow::Result<()> {
     if is_gpu
         && (args.resilience_prealloc_switch
             || args.tensor_partition > 0.0
-            || args.prefill_cpu_chunk_size > 0)
+            || args.prefill_cpu_chunk_size > 0
+            || args.enable_resilience)
     {
         match model.map_weights_for_cpu(&backend) {
             Ok(n) if n > 0 => eprintln!(
