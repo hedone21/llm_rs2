@@ -55,14 +55,40 @@ pub fn migrate_kv_caches(
             .first()
             .is_some_and(|kv| !kv.k_buffer.as_ptr().is_null());
 
+    // On ARM UMA, GPU writes may sit in GPU L1/L2 cache, not yet flushed to
+    // main memory. Direct as_ptr() reads would see stale CPU-cached data.
+    // read_buffer() (clEnqueueReadBuffer, blocking) forces a cache-coherent
+    // transfer to a temp buffer, which we then copy back to the host-managed
+    // backing store. This is the same pattern tensor_partition uses.
+    if host_accessible {
+        src_backend.synchronize()?;
+        let max_buf_size = kv_caches
+            .iter()
+            .map(|kv| kv.k_buffer.size().max(kv.v_buffer.size()))
+            .max()
+            .unwrap_or(0);
+        let mut tmp = vec![0u8; max_buf_size];
+        for kv in kv_caches.iter_mut() {
+            let k_size = kv.k_buffer.size();
+            src_backend.read_buffer(&kv.k_buffer, &mut tmp[..k_size])?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), kv.k_buffer.as_mut_ptr(), k_size);
+            }
+            let v_size = kv.v_buffer.size();
+            src_backend.read_buffer(&kv.v_buffer, &mut tmp[..v_size])?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(tmp.as_ptr(), kv.v_buffer.as_mut_ptr(), v_size);
+            }
+        }
+    }
+
     for kv in kv_caches.iter_mut() {
         let current_capacity = kv.capacity();
         let saved_pos = kv.current_pos;
 
         let (k_final, v_final) = if host_accessible {
             // UMA zero-copy path: reuse existing buffer, just swap backend tag.
-            // MadviseableGPUBuffer.as_ptr() returns host_data.as_ptr() which is
-            // directly CPU-accessible. No alloc, no copy.
+            // GPU cache was flushed above via read_buffer(), so as_ptr() is coherent.
             let k = Tensor::new(
                 kv.k_buffer.shape().clone(),
                 kv.k_buffer.buffer().clone(),
