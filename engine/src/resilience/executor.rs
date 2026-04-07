@@ -103,6 +103,11 @@ pub struct CommandExecutor {
     // Currently active action names (e.g. "kv_evict_h2o", "throttle")
     active_actions: Vec<String>,
 
+    // Prefill progress reporting
+    phase: String,
+    prefill_pos: usize,
+    prefill_total: usize,
+
     // Throughput tracking
     throughput_ema: f32,
     last_token_time: Option<Instant>,
@@ -130,6 +135,9 @@ impl CommandExecutor {
             throttle_delay_ms: 0,
             target_tbt_ms: 0,
             active_actions: Vec::new(),
+            phase: String::new(),
+            prefill_pos: 0,
+            prefill_total: 0,
             throughput_ema: 0.0,
             last_token_time: None,
             tokens_generated: 0,
@@ -434,9 +442,9 @@ impl CommandExecutor {
             eviction_policy,
             kv_dtype,
             skip_ratio: kv_snap.skip_ratio,
-            phase: String::new(),
-            prefill_pos: 0,
-            prefill_total: 0,
+            phase: self.phase.clone(),
+            prefill_pos: self.prefill_pos,
+            prefill_total: self.prefill_total,
         };
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));
@@ -481,6 +489,13 @@ impl CommandExecutor {
     /// Current throttle delay.
     pub fn throttle_delay_ms(&self) -> u64 {
         self.throttle_delay_ms
+    }
+
+    /// Update prefill progress for heartbeat reporting.
+    pub fn set_prefill_state(&mut self, phase: &str, pos: usize, total: usize) {
+        self.phase = phase.to_string();
+        self.prefill_pos = pos;
+        self.prefill_total = total;
     }
 
     /// Currently active action names.

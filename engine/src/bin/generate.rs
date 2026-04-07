@@ -105,6 +105,18 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     prefill_chunk_size: usize,
 
+    /// Inter-chunk yield delay in milliseconds during prefill.
+    /// After each prefill chunk, engine calls synchronize() + sleep(yield_ms).
+    /// 0 = no yield. Dynamically adjustable via SetPrefillPolicy.
+    #[arg(long, default_value_t = 0)]
+    prefill_yield_ms: u32,
+
+    /// CPU chunk size for GPU-CPU prefill interleaving.
+    /// 0 = disabled. After each GPU chunk, CPU processes this many tokens.
+    /// Requires --zero-copy or --resilience-prealloc-switch for weight access.
+    #[arg(long, default_value_t = 0)]
+    prefill_cpu_chunk_size: usize,
+
     /// Enable profiling (per-op timing, latency, score snapshots).
     #[arg(long, default_value_t = false)]
     profile: bool,
@@ -511,9 +523,15 @@ fn main() -> anyhow::Result<()> {
             // When resilience is enabled, force zero-copy memory so KV cache uses
             // MadviseableGPUBuffer (host-accessible). This enables zero-alloc
             // UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
-            let effective_zero_copy =
-                args.zero_copy || args.resilience_prealloc_switch || args.tensor_partition > 0.0;
-            if !args.zero_copy && (args.resilience_prealloc_switch || args.tensor_partition > 0.0) {
+            let effective_zero_copy = args.zero_copy
+                || args.resilience_prealloc_switch
+                || args.tensor_partition > 0.0
+                || args.prefill_cpu_chunk_size > 0;
+            if !args.zero_copy
+                && (args.resilience_prealloc_switch
+                    || args.tensor_partition > 0.0
+                    || args.prefill_cpu_chunk_size > 0)
+            {
                 eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
             }
             let gpu_mem: Arc<dyn Memory> =
@@ -577,7 +595,11 @@ fn main() -> anyhow::Result<()> {
     // GPU→CPU SwitchHw. Default OpenCLBuffer (device-only) has as_ptr()=null —
     // CpuBackend can't read them. Re-wrap as ClWrappedBuffer (CL_MEM_USE_HOST_PTR).
     #[cfg(feature = "opencl")]
-    if is_gpu && (args.resilience_prealloc_switch || args.tensor_partition > 0.0) {
+    if is_gpu
+        && (args.resilience_prealloc_switch
+            || args.tensor_partition > 0.0
+            || args.prefill_cpu_chunk_size > 0)
+    {
         match model.rewrap_weights_for_dual_access(&backend) {
             Ok(n) if n > 0 => eprintln!(
                 "[Backend] Re-wrapped {} weight tensors for dual CPU/GPU access",
@@ -1553,6 +1575,11 @@ fn main() -> anyhow::Result<()> {
                     };
                 let chunked = chunk_size < process_len;
 
+                // Dynamic prefill policy: start from CLI values, updated by SetPrefillPolicy.
+                let mut effective_chunk_size = chunk_size;
+                let mut effective_yield_ms = args.prefill_yield_ms;
+                let mut effective_cpu_chunk_size = args.prefill_cpu_chunk_size;
+
                 let (prefill_logits_shape, prefill_logits_buf_size) = if chunked {
                     (Shape::new(vec![1, 1, vocab_size]), vocab_size * 4)
                 } else {
@@ -1576,10 +1603,17 @@ fn main() -> anyhow::Result<()> {
                 let mut deferred_switch: Option<String> = None;
                 let total_chunks = process_len.div_ceil(chunk_size);
 
+                // Report prefill start to resilience manager.
+                if let Some(executor) = &mut command_executor {
+                    executor.set_prefill_state("prefill", 0, process_len);
+                }
+
                 let mut chunk_start = 0;
                 let mut chunk_idx = 0usize;
                 while chunk_start < process_len {
-                    let chunk_end = (chunk_start + chunk_size).min(process_len);
+                    // Guard: effective_chunk_size must be at least 1.
+                    let ecs = effective_chunk_size.max(1);
+                    let chunk_end = (chunk_start + ecs).min(process_len);
                     let chunk_tokens = &batch_input_ids[chunk_start..chunk_end];
                     let chunk_len = chunk_tokens.len();
 
@@ -1615,6 +1649,78 @@ fn main() -> anyhow::Result<()> {
                     backend.synchronize()?;
                     drop(input_tensor);
 
+                    chunk_start = chunk_end;
+
+                    // Inter-chunk yield: sleep after GPU chunk to release compute.
+                    if effective_yield_ms > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            effective_yield_ms as u64,
+                        ));
+                    }
+
+                    // CPU interleave: process next chunk on CPU while GPU is free.
+                    // Invariant: the last chunk must be processed by GPU so that
+                    // prefill_logits (GPU buffer) is valid at the end.
+                    if effective_cpu_chunk_size > 0 && chunk_start < process_len {
+                        let remaining = process_len - chunk_start;
+                        if remaining > effective_cpu_chunk_size {
+                            let cpu_end = (chunk_start + effective_cpu_chunk_size)
+                                .min(process_len.saturating_sub(1));
+                            if cpu_end > chunk_start {
+                                let cpu_tokens = &batch_input_ids[chunk_start..cpu_end];
+                                let cpu_len = cpu_tokens.len();
+
+                                let cpu_in_buf = Galloc::new().alloc(cpu_len * 4, DType::U8)?;
+                                unsafe {
+                                    let ptr = cpu_in_buf.as_mut_ptr() as *mut u32;
+                                    std::ptr::copy_nonoverlapping(
+                                        cpu_tokens.as_ptr(),
+                                        ptr,
+                                        cpu_len,
+                                    );
+                                }
+                                let cpu_in_tensor = Tensor::new(
+                                    Shape::new(vec![1, cpu_len]),
+                                    cpu_in_buf,
+                                    cpu_backend_arc.clone(),
+                                );
+
+                                let cpu_chunk_start_pos = chunk_start;
+
+                                // CPU prefill logits: separate CPU buffer (discarded).
+                                let cpu_logits_buf =
+                                    cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
+                                let mut cpu_logits = Tensor::new(
+                                    Shape::new(vec![1, 1, vocab_size]),
+                                    cpu_logits_buf,
+                                    cpu_backend_arc.clone(),
+                                );
+
+                                model.forward_into(TransformerModelForwardArgs {
+                                    input_tokens: &cpu_in_tensor,
+                                    start_pos: cpu_chunk_start_pos,
+                                    kv_caches: &mut kv_caches,
+                                    backend: &cpu_backend_arc,
+                                    memory: cpu_memory_arc.as_ref(),
+                                    logits_out: &mut cpu_logits,
+                                    x_gen: None,
+                                    workspace: None,
+                                    use_gpu_attn: false,
+                                    score_accumulator: None,
+                                    profiler: None,
+                                    skip_config: skip_config.as_ref(),
+                                    importance_collector: None,
+                                    logits_last_only: true,
+                                    variance_collector: None,
+                                })?;
+                                drop(cpu_in_tensor);
+                                drop(cpu_logits);
+
+                                chunk_start = cpu_end;
+                            }
+                        }
+                    }
+
                     // ── Prefill resilience checkpoint (chunk boundary) ──
                     if chunked && let Some(executor) = &mut command_executor {
                         let kv_snap = KVSnapshot {
@@ -1632,6 +1738,20 @@ fn main() -> anyhow::Result<()> {
                             skip_ratio: 0.0,
                         };
                         let plan = executor.poll(&kv_snap);
+
+                        // SetPrefillPolicy: dynamically adjust chunk/yield/cpu parameters.
+                        if let Some(v) = plan.prefill_chunk_size {
+                            effective_chunk_size = v;
+                            eprintln!("[Prefill] Policy: chunk_size -> {}", v);
+                        }
+                        if let Some(v) = plan.prefill_yield_ms {
+                            effective_yield_ms = v;
+                            eprintln!("[Prefill] Policy: yield_ms -> {}", v);
+                        }
+                        if let Some(v) = plan.prefill_cpu_chunk_size {
+                            effective_cpu_chunk_size = v;
+                            eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
+                        }
 
                         // Throttle: sleep between chunks
                         if plan.throttle_delay_ms > 0 && plan.throttle_delay_ms != throttle_delay_ms
@@ -1656,6 +1776,9 @@ fn main() -> anyhow::Result<()> {
                         if plan.restore_defaults {
                             skip_config = None;
                             last_skip_ratio = None;
+                            effective_chunk_size = chunk_size;
+                            effective_yield_ms = args.prefill_yield_ms;
+                            effective_cpu_chunk_size = args.prefill_cpu_chunk_size;
                         } else if let Some(ratio) = plan.layer_skip
                             && last_skip_ratio != Some(ratio)
                         {
@@ -1680,13 +1803,20 @@ fn main() -> anyhow::Result<()> {
                             }
                             deferred_switch = Some(device.clone());
                         }
+
+                        // Report prefill progress.
+                        executor.set_prefill_state("prefill", chunk_start, process_len);
                     }
 
-                    chunk_start = chunk_end;
                     chunk_idx += 1;
                 }
 
                 let ttft_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
+
+                // Report transition to decode phase.
+                if let Some(executor) = &mut command_executor {
+                    executor.set_prefill_state("decode", 0, 0);
+                }
 
                 // Sample first token from prefill logits
                 let mut last_logits = vec![0.0f32; vocab_size];
@@ -2092,6 +2222,11 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
+        // Dynamic prefill policy: start from CLI values, updated by SetPrefillPolicy.
+        let mut effective_chunk_size = chunk_size;
+        let mut effective_yield_ms = args.prefill_yield_ms;
+        let mut effective_cpu_chunk_size = args.prefill_cpu_chunk_size;
+
         // Reusable logits buffer: [1, 1, vocab_size] when chunked, else [1, process_len, vocab_size].
         // Chunked mode always uses logits_last_only=true so only 1 position is written per chunk.
         let (logits_shape, logits_buf_size) = if chunked {
@@ -2108,10 +2243,17 @@ fn main() -> anyhow::Result<()> {
         let prefill_timer = std::time::Instant::now();
         let total_chunks = process_len.div_ceil(chunk_size);
 
+        // Report prefill start to resilience manager.
+        if let Some(executor) = &mut command_executor {
+            executor.set_prefill_state("prefill", 0, process_len);
+        }
+
         let mut chunk_start = 0;
         let mut chunk_idx = 0usize;
         while chunk_start < process_len {
-            let chunk_end = (chunk_start + chunk_size).min(process_len);
+            // Guard: effective_chunk_size must be at least 1.
+            let ecs = effective_chunk_size.max(1);
+            let chunk_end = (chunk_start + ecs).min(process_len);
             let chunk_tokens = &tokens[chunk_start..chunk_end];
             let chunk_len = chunk_tokens.len();
 
@@ -2155,6 +2297,76 @@ fn main() -> anyhow::Result<()> {
             // Immediately release the GPU input buffer for this chunk.
             drop(input_tensor);
 
+            chunk_start = chunk_end;
+
+            // Inter-chunk yield: sleep after GPU chunk to release compute for other processes.
+            if effective_yield_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(effective_yield_ms as u64));
+            }
+
+            // CPU interleave: process next chunk on CPU while GPU is free.
+            // Invariant: the last chunk must be processed by GPU so that
+            // prefill_logits (GPU buffer) is valid at the end.
+            if effective_cpu_chunk_size > 0 && chunk_start < process_len {
+                let remaining = process_len - chunk_start;
+                // Only run CPU chunk if enough tokens remain for GPU to handle
+                // at least one more chunk afterwards.
+                if remaining > effective_cpu_chunk_size {
+                    let cpu_end =
+                        (chunk_start + effective_cpu_chunk_size).min(process_len.saturating_sub(1));
+                    if cpu_end > chunk_start {
+                        let cpu_tokens = &tokens[chunk_start..cpu_end];
+                        let cpu_len = cpu_tokens.len();
+
+                        let cpu_in_buf = Galloc::new().alloc(cpu_len * 4, DType::U8)?;
+                        unsafe {
+                            let ptr = cpu_in_buf.as_mut_ptr() as *mut u32;
+                            std::ptr::copy_nonoverlapping(cpu_tokens.as_ptr(), ptr, cpu_len);
+                        }
+                        let cpu_in_tensor = Tensor::new(
+                            Shape::new(vec![1, cpu_len]),
+                            cpu_in_buf,
+                            cpu_backend_arc.clone(),
+                        );
+
+                        let cpu_chunk_start_pos = start_pos + chunk_start;
+
+                        // CPU prefill logits: use a separate CPU buffer to avoid writing
+                        // to GPU prefill_logits. These intermediate logits are discarded.
+                        let cpu_logits_buf = cpu_memory_arc.alloc(vocab_size * 4, DType::F32)?;
+                        let mut cpu_logits = Tensor::new(
+                            Shape::new(vec![1, 1, vocab_size]),
+                            cpu_logits_buf,
+                            cpu_backend_arc.clone(),
+                        );
+
+                        model.forward_into(TransformerModelForwardArgs {
+                            input_tokens: &cpu_in_tensor,
+                            start_pos: cpu_chunk_start_pos,
+                            kv_caches: &mut kv_caches,
+                            backend: &cpu_backend_arc,
+                            memory: cpu_memory_arc.as_ref(),
+                            logits_out: &mut cpu_logits,
+                            x_gen: None,
+                            workspace: None,
+                            use_gpu_attn: false,
+                            score_accumulator: None,
+                            profiler: None,
+                            skip_config: None,
+                            importance_collector: None,
+                            logits_last_only: true,
+                            variance_collector: None,
+                        })?;
+                        // No backend.synchronize() needed — CPU forward is synchronous.
+                        drop(cpu_in_tensor);
+                        drop(cpu_logits);
+
+                        chunk_start = cpu_end;
+                    }
+                }
+                // else: remaining tokens fit in one GPU chunk → GPU finishes.
+            }
+
             // ── Prefill resilience checkpoint (chunk boundary) ──
             // Poll CommandExecutor between chunks to handle SwitchHw, Throttle,
             // and LayerSkip commands mid-prefill. Only active in chunked mode.
@@ -2172,6 +2384,20 @@ fn main() -> anyhow::Result<()> {
                     skip_ratio: 0.0,
                 };
                 let plan = executor.poll(&kv_snap);
+
+                // SetPrefillPolicy: dynamically adjust chunk/yield/cpu parameters.
+                if let Some(v) = plan.prefill_chunk_size {
+                    effective_chunk_size = v;
+                    eprintln!("[Prefill] Policy: chunk_size -> {}", v);
+                }
+                if let Some(v) = plan.prefill_yield_ms {
+                    effective_yield_ms = v;
+                    eprintln!("[Prefill] Policy: yield_ms -> {}", v);
+                }
+                if let Some(v) = plan.prefill_cpu_chunk_size {
+                    effective_cpu_chunk_size = v;
+                    eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
+                }
 
                 // Throttle: sleep between chunks
                 if plan.throttle_delay_ms > 0 && plan.throttle_delay_ms != throttle_delay_ms {
@@ -2195,6 +2421,9 @@ fn main() -> anyhow::Result<()> {
                 if plan.restore_defaults {
                     skip_config = None;
                     last_skip_ratio = None;
+                    effective_chunk_size = chunk_size;
+                    effective_yield_ms = args.prefill_yield_ms;
+                    effective_cpu_chunk_size = args.prefill_cpu_chunk_size;
                 } else if let Some(ratio) = plan.layer_skip
                     && last_skip_ratio != Some(ratio)
                 {
@@ -2219,13 +2448,20 @@ fn main() -> anyhow::Result<()> {
                     }
                     deferred_switch = Some(device.clone());
                 }
+
+                // Report prefill progress.
+                executor.set_prefill_state("prefill", chunk_start, process_len);
             }
 
-            chunk_start = chunk_end;
             chunk_idx += 1;
         }
 
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
+
+        // Report transition to decode phase.
+        if let Some(executor) = &mut command_executor {
+            executor.set_prefill_state("decode", 0, 0);
+        }
 
         // Auto-eviction after prefill (sliding window only, non-experiment mode)
         if auto_eviction {
