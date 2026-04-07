@@ -1524,6 +1524,12 @@ fn main() -> anyhow::Result<()> {
             Tensor::new(Shape::new(vec![1, 1]), gpu_gen_input_buf, backend.clone());
         let mut logits_cpu = vec![0.0f32; vocab_size];
 
+        // Persistent prefill policy state: survives across batches.
+        // Only reset by RestoreDefaults, not by prefill→decode transition.
+        let mut persistent_chunk_size: Option<usize> = None;
+        let mut persistent_yield_ms: Option<u32> = None;
+        let mut persistent_cpu_chunk_size: Option<usize> = None;
+
         'outer: loop {
             for entry in &entries {
                 if args.max_iterations > 0 && iteration >= args.max_iterations {
@@ -1579,10 +1585,12 @@ fn main() -> anyhow::Result<()> {
                     };
                 let chunked = chunk_size < process_len;
 
-                // Dynamic prefill policy: start from CLI values, updated by SetPrefillPolicy.
-                let mut effective_chunk_size = chunk_size;
-                let mut effective_yield_ms = args.prefill_yield_ms;
-                let mut effective_cpu_chunk_size = args.prefill_cpu_chunk_size;
+                // Dynamic prefill policy: use persistent values if set by prior
+                // SetPrefillPolicy, otherwise fall back to CLI defaults.
+                let mut effective_chunk_size = persistent_chunk_size.unwrap_or(chunk_size);
+                let mut effective_yield_ms = persistent_yield_ms.unwrap_or(args.prefill_yield_ms);
+                let mut effective_cpu_chunk_size =
+                    persistent_cpu_chunk_size.unwrap_or(args.prefill_cpu_chunk_size);
 
                 let (prefill_logits_shape, prefill_logits_buf_size) = if chunked {
                     (Shape::new(vec![1, 1, vocab_size]), vocab_size * 4)
@@ -1744,12 +1752,15 @@ fn main() -> anyhow::Result<()> {
                         let plan = executor.poll(&kv_snap);
 
                         // SetPrefillPolicy: dynamically adjust chunk/yield/cpu parameters.
+                        // Values persist across batches until RestoreDefaults.
                         if let Some(v) = plan.prefill_chunk_size {
                             effective_chunk_size = v;
+                            persistent_chunk_size = Some(v);
                             eprintln!("[Prefill] Policy: chunk_size -> {}", v);
                         }
                         if let Some(v) = plan.prefill_yield_ms {
                             effective_yield_ms = v;
+                            persistent_yield_ms = Some(v);
                             eprintln!("[Prefill] Policy: yield_ms -> {}", v);
                         }
                         if let Some(v) = plan.prefill_cpu_chunk_size {
@@ -1761,6 +1772,7 @@ fn main() -> anyhow::Result<()> {
                                 );
                             } else {
                                 effective_cpu_chunk_size = v;
+                                persistent_cpu_chunk_size = Some(v);
                                 eprintln!("[Prefill] Policy: cpu_chunk_size -> {}", v);
                             }
                         }
@@ -1791,6 +1803,9 @@ fn main() -> anyhow::Result<()> {
                             effective_chunk_size = chunk_size;
                             effective_yield_ms = args.prefill_yield_ms;
                             effective_cpu_chunk_size = args.prefill_cpu_chunk_size;
+                            persistent_chunk_size = None;
+                            persistent_yield_ms = None;
+                            persistent_cpu_chunk_size = None;
                         } else if let Some(ratio) = plan.layer_skip
                             && last_skip_ratio != Some(ratio)
                         {
