@@ -1574,7 +1574,7 @@ fn main() -> anyhow::Result<()> {
 
                 let prefill_timer = std::time::Instant::now();
                 let mut deferred_switch: Option<String> = None;
-                let total_chunks = (process_len + chunk_size - 1) / chunk_size;
+                let total_chunks = process_len.div_ceil(chunk_size);
 
                 let mut chunk_start = 0;
                 let mut chunk_idx = 0usize;
@@ -2106,7 +2106,7 @@ fn main() -> anyhow::Result<()> {
         let mut prefill_logits = Tensor::new(logits_shape, prefill_logits_buf, backend.clone());
 
         let prefill_timer = std::time::Instant::now();
-        let total_chunks = (process_len + chunk_size - 1) / chunk_size;
+        let total_chunks = process_len.div_ceil(chunk_size);
 
         let mut chunk_start = 0;
         let mut chunk_idx = 0usize;

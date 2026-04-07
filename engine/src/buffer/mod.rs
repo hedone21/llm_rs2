@@ -1,4 +1,6 @@
 #[cfg(feature = "opencl")]
+pub mod cl_sub_buffer;
+#[cfg(feature = "opencl")]
 pub mod cl_wrapped_buffer;
 #[cfg(feature = "cuda")]
 pub mod cuda_buffer;

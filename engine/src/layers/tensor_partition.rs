@@ -127,41 +127,56 @@ pub fn split_weight(
         weight.size()
     );
 
-    // Create temporary SliceBuffer views to read the correct byte ranges,
-    // then copy into independent buffers via Backend::copy_from().
     let parent_buf = weight.buffer().clone();
 
-    let tmp_gpu_buf = Arc::new(SliceBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype)?);
-    let tmp_cpu_buf = Arc::new(SliceBuffer::new(parent_buf, gpu_bytes, cpu_bytes, dtype)?);
+    // GPU slice: zero-copy sub-buffer if parent has cl_mem, else fallback to copy.
+    #[cfg(feature = "opencl")]
+    let gpu_tensor = {
+        use crate::buffer::cl_sub_buffer::ClSubBuffer;
+        match ClSubBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype) {
+            Ok(sub_buf) => Tensor::new(
+                Shape::new(vec![split_row, in_dim]),
+                Arc::new(sub_buf),
+                weight.backend().clone(),
+            ),
+            Err(_) => {
+                // Fallback: parent has no cl_mem (CPU-only backend). Copy as before.
+                let tmp_gpu_buf =
+                    Arc::new(SliceBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype)?);
+                let tmp_gpu_tensor = Tensor::new(
+                    Shape::new(vec![split_row, in_dim]),
+                    tmp_gpu_buf,
+                    weight.backend().clone(),
+                );
+                let copied = weight.backend().copy_from(&tmp_gpu_tensor)?;
+                Tensor::new(
+                    Shape::new(vec![split_row, in_dim]),
+                    copied.buffer().clone(),
+                    weight.backend().clone(),
+                )
+            }
+        }
+    };
+    #[cfg(not(feature = "opencl"))]
+    let gpu_tensor = {
+        let tmp_gpu_buf = Arc::new(SliceBuffer::new(parent_buf.clone(), 0, gpu_bytes, dtype)?);
+        let tmp_gpu_tensor = Tensor::new(
+            Shape::new(vec![split_row, in_dim]),
+            tmp_gpu_buf,
+            weight.backend().clone(),
+        );
+        let copied = weight.backend().copy_from(&tmp_gpu_tensor)?;
+        Tensor::new(
+            Shape::new(vec![split_row, in_dim]),
+            copied.buffer().clone(),
+            weight.backend().clone(),
+        )
+    };
 
-    let tmp_gpu_tensor = Tensor::new(
-        Shape::new(vec![split_row, in_dim]),
-        tmp_gpu_buf,
-        weight.backend().clone(),
-    );
-    let tmp_cpu_tensor = Tensor::new(
-        Shape::new(vec![out_dim - split_row, in_dim]),
-        tmp_cpu_buf,
-        cpu_backend.clone(),
-    );
-
-    // GPU slice: copy into a new buffer owned by the original (GPU) backend.
-    // On OpenCL, this creates a proper cl_mem buffer via Host-to-Device copy.
-    // On CPU-only tests, this is a simple memcpy into a SharedBuffer.
-    let gpu_tensor = weight.backend().copy_from(&tmp_gpu_tensor)?;
-
-    // CPU slice: copy into a new CPU buffer via the cpu_backend.
-    let cpu_tensor = cpu_backend.copy_from(&tmp_cpu_tensor)?;
-
-    // Re-wrap with correct backends to ensure forward dispatch uses the right one.
-    let gpu_tensor = Tensor::new(
-        Shape::new(vec![split_row, in_dim]),
-        gpu_tensor.buffer().clone(),
-        weight.backend().clone(),
-    );
+    // CPU slice: zero-copy SliceBuffer (cl_mem not needed for CPU matmul).
     let cpu_tensor = Tensor::new(
         Shape::new(vec![out_dim - split_row, in_dim]),
-        cpu_tensor.buffer().clone(),
+        Arc::new(SliceBuffer::new(parent_buf, gpu_bytes, cpu_bytes, dtype)?),
         cpu_backend.clone(),
     );
 

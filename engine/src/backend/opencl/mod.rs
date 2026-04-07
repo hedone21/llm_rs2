@@ -45,6 +45,13 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(m.cl_mem_ref());
     }
+    // ClSubBuffer (zero-copy sub-region of a parent CL buffer via clCreateSubBuffer)
+    if let Some(sb) = buf
+        .as_any()
+        .downcast_ref::<crate::buffer::cl_sub_buffer::ClSubBuffer>()
+    {
+        return Ok(sb.cl_mem_ref());
+    }
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 
