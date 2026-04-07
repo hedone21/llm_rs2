@@ -1676,6 +1676,12 @@ fn main() -> anyhow::Result<()> {
                     if effective_cpu_chunk_size > 0 && chunk_start < process_len {
                         let remaining = process_len - chunk_start;
                         if remaining > effective_cpu_chunk_size {
+                            // Flush GPU caches before CPU reads KV buffers (ARM UMA coherence).
+                            for kv in kv_caches.iter() {
+                                kv.k_buffer.buffer().map_for_cpu()?;
+                                kv.v_buffer.buffer().map_for_cpu()?;
+                            }
+
                             let cpu_end = (chunk_start + effective_cpu_chunk_size)
                                 .min(process_len.saturating_sub(1));
                             if cpu_end > chunk_start {
@@ -2339,6 +2345,14 @@ fn main() -> anyhow::Result<()> {
                 // Only run CPU chunk if enough tokens remain for GPU to handle
                 // at least one more chunk afterwards.
                 if remaining > effective_cpu_chunk_size {
+                    // Flush GPU caches to main memory before CPU reads KV buffers.
+                    // On ARM UMA, clFinish() alone may not flush GPU L1/L2 cache.
+                    // map_for_cpu() calls clEnqueueMapBuffer which ensures coherence.
+                    for kv in kv_caches.iter() {
+                        kv.k_buffer.buffer().map_for_cpu()?;
+                        kv.v_buffer.buffer().map_for_cpu()?;
+                    }
+
                     let cpu_end =
                         (chunk_start + effective_cpu_chunk_size).min(process_len.saturating_sub(1));
                     if cpu_end > chunk_start {
