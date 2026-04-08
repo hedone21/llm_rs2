@@ -2684,6 +2684,19 @@ fn main() -> anyhow::Result<()> {
             cpu_memory_arc.as_ref()
         };
 
+        // Re-allocate logits on the correct backend after deferred SwitchHw.
+        // The outer `logits` was allocated with `memory` (GPU) before the
+        // deferred switch. After GPU→CPU, the unmapped UnifiedBuffer has
+        // as_ptr() == null → segfault when CPU forward writes logits.
+        if !is_gpu && logits.as_ptr().is_null() {
+            let new_logits_buf = decode_mem.alloc(vocab_size * 4, DType::F32)?;
+            logits = Tensor::new(
+                Shape::new(vec![1, 1, vocab_size]),
+                new_logits_buf,
+                backend.clone(),
+            );
+        }
+
         let x_gen_buf = decode_mem.alloc(hidden_size * 4, DType::F32)?;
         let mut x_gen = Tensor::new(
             Shape::new(vec![1, 1, hidden_size]),
