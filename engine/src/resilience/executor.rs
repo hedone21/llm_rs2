@@ -105,6 +105,11 @@ pub struct CommandExecutor {
     // Currently active action names (e.g. "kv_evict_h2o", "throttle")
     active_actions: Vec<String>,
 
+    // Sticky eviction plan: retained until RestoreDefaults
+    evict_plan: Option<EvictPlan>,
+    // Sticky KV quantization bits: retained until RestoreDefaults
+    kv_quant_bits: Option<u8>,
+
     // Tensor partition ratio for heartbeat reporting
     partition_ratio: f32,
 
@@ -140,6 +145,8 @@ impl CommandExecutor {
             throttle_delay_ms: 0,
             target_tbt_ms: 0,
             active_actions: Vec::new(),
+            evict_plan: None,
+            kv_quant_bits: None,
             partition_ratio: 0.0,
             phase: String::new(),
             prefill_pos: 0,
@@ -207,9 +214,11 @@ impl CommandExecutor {
         }
 
         if directives.is_empty() {
-            // Maintain existing throttle and target TBT
+            // Maintain existing throttle, target TBT, and sticky evict/quant state
             plan.throttle_delay_ms = self.throttle_delay_ms;
             plan.target_tbt_ms = self.target_tbt_ms;
+            plan.evict = self.evict_plan.clone();
+            plan.kv_quant_bits = self.kv_quant_bits;
             return plan;
         }
 
@@ -230,7 +239,15 @@ impl CommandExecutor {
                 .send(EngineMessage::Response(CommandResponse { seq_id, results }));
         }
 
-        // 4. Suspend overrides everything
+        // 4. Carry forward sticky state if not overridden by this directive batch
+        if plan.evict.is_none() {
+            plan.evict = self.evict_plan.clone();
+        }
+        if plan.kv_quant_bits.is_none() {
+            plan.kv_quant_bits = self.kv_quant_bits;
+        }
+
+        // 5. Suspend overrides everything
         if plan.suspended {
             plan.evict = None;
             plan.switch_device = None;
@@ -279,24 +296,28 @@ impl CommandExecutor {
                 CommandResult::Ok
             }
             EngineCommand::KvEvictH2o { keep_ratio } => {
-                plan.evict = Some(EvictPlan {
+                let evict = EvictPlan {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
                     method: EvictMethod::H2o,
                     streaming_params: None,
-                });
+                };
+                self.evict_plan = Some(evict.clone());
+                plan.evict = Some(evict);
                 if !self.active_actions.contains(&"kv_evict_h2o".to_string()) {
                     self.active_actions.push("kv_evict_h2o".to_string());
                 }
                 CommandResult::Ok
             }
             EngineCommand::KvEvictSliding { keep_ratio } => {
-                plan.evict = Some(EvictPlan {
+                let evict = EvictPlan {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
                     method: EvictMethod::Sliding,
                     streaming_params: None,
-                });
+                };
+                self.evict_plan = Some(evict.clone());
+                plan.evict = Some(evict);
                 if !self
                     .active_actions
                     .contains(&"kv_evict_sliding".to_string())
@@ -309,7 +330,7 @@ impl CommandExecutor {
                 sink_size,
                 window_size,
             } => {
-                plan.evict = Some(EvictPlan {
+                let evict = EvictPlan {
                     target_ratio: 0.0, // StreamingLLMPolicy는 target_len 무시
                     level: ResourceLevel::Critical,
                     method: EvictMethod::Streaming,
@@ -317,7 +338,9 @@ impl CommandExecutor {
                         sink_size: *sink_size,
                         window_size: *window_size,
                     }),
-                });
+                };
+                self.evict_plan = Some(evict.clone());
+                plan.evict = Some(evict);
                 if !self
                     .active_actions
                     .contains(&"kv_evict_streaming".to_string())
@@ -327,18 +350,21 @@ impl CommandExecutor {
                 CommandResult::Ok
             }
             EngineCommand::KvMergeD2o { keep_ratio } => {
-                plan.evict = Some(EvictPlan {
+                let evict = EvictPlan {
                     target_ratio: *keep_ratio,
                     level: ResourceLevel::Critical,
                     method: EvictMethod::D2o,
                     streaming_params: None,
-                });
+                };
+                self.evict_plan = Some(evict.clone());
+                plan.evict = Some(evict);
                 if !self.active_actions.contains(&"kv_merge_d2o".to_string()) {
                     self.active_actions.push("kv_merge_d2o".to_string());
                 }
                 CommandResult::Ok
             }
             EngineCommand::KvQuantDynamic { target_bits } => {
+                self.kv_quant_bits = Some(*target_bits);
                 plan.kv_quant_bits = Some(*target_bits);
                 if !self
                     .active_actions
@@ -354,6 +380,8 @@ impl CommandExecutor {
                 plan.target_tbt_ms = 0;
                 self.throttle_delay_ms = 0;
                 self.target_tbt_ms = 0;
+                self.evict_plan = None;
+                self.kv_quant_bits = None;
                 self.compute_level = ResourceLevel::Normal;
                 self.memory_level = ResourceLevel::Normal;
                 self.active_actions.clear();
@@ -1116,6 +1144,122 @@ mod tests {
         let (mut executor, _tx, _rx) = make_executor();
         let plan = executor.poll(&empty_snap());
         assert!(!plan.request_qcf);
+    }
+
+    #[test]
+    fn test_evict_plan_is_sticky() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // KvEvictSliding 커맨드를 한 번만 보냄
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.7 }],
+        }))
+        .unwrap();
+        let plan1 = executor.poll(&empty_snap());
+        assert!(plan1.evict.is_some());
+        assert_eq!(plan1.evict.as_ref().unwrap().method, EvictMethod::Sliding);
+
+        // 다음 poll()에서는 커맨드 없이도 evict_plan이 유지돼야 함
+        let plan2 = executor.poll(&empty_snap());
+        assert!(
+            plan2.evict.is_some(),
+            "evict_plan should be sticky across polls"
+        );
+        let evict = plan2.evict.unwrap();
+        assert!((evict.target_ratio - 0.7).abs() < f32::EPSILON);
+        assert_eq!(evict.method, EvictMethod::Sliding);
+    }
+
+    #[test]
+    fn test_kv_quant_bits_is_sticky() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvQuantDynamic { target_bits: 4 }],
+        }))
+        .unwrap();
+        let plan1 = executor.poll(&empty_snap());
+        assert_eq!(plan1.kv_quant_bits, Some(4));
+
+        // 다음 poll()에서도 kv_quant_bits가 유지돼야 함
+        let plan2 = executor.poll(&empty_snap());
+        assert_eq!(
+            plan2.kv_quant_bits,
+            Some(4),
+            "kv_quant_bits should be sticky across polls"
+        );
+    }
+
+    #[test]
+    fn test_restore_defaults_clears_sticky_evict_and_quant() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // evict와 quant 설정
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![
+                EngineCommand::KvEvictH2o { keep_ratio: 0.5 },
+                EngineCommand::KvQuantDynamic { target_bits: 8 },
+            ],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+
+        // sticky 확인
+        let plan_mid = executor.poll(&empty_snap());
+        assert!(plan_mid.evict.is_some());
+        assert_eq!(plan_mid.kv_quant_bits, Some(8));
+
+        // RestoreDefaults로 초기화
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::RestoreDefaults],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+
+        // 이후 poll에서는 evict와 quant가 사라져야 함
+        let plan_after = executor.poll(&empty_snap());
+        assert!(
+            plan_after.evict.is_none(),
+            "evict_plan should be cleared after RestoreDefaults"
+        );
+        assert_eq!(
+            plan_after.kv_quant_bits, None,
+            "kv_quant_bits should be cleared after RestoreDefaults"
+        );
+    }
+
+    #[test]
+    fn test_new_evict_command_overrides_sticky() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // H2O로 설정
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvEvictH2o { keep_ratio: 0.5 }],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+
+        // Sliding으로 교체
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.8 }],
+        }))
+        .unwrap();
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.evict.as_ref().unwrap().method, EvictMethod::Sliding);
+        assert!((plan.evict.as_ref().unwrap().target_ratio - 0.8).abs() < f32::EPSILON);
+
+        // 이후 poll에서도 Sliding이 유지돼야 함
+        let plan_next = executor.poll(&empty_snap());
+        assert_eq!(
+            plan_next.evict.as_ref().unwrap().method,
+            EvictMethod::Sliding
+        );
     }
 
     #[test]

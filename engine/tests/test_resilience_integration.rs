@@ -196,9 +196,10 @@ fn test_resilience_channel_disconnect_graceful() {
     let plan = executor.poll(&empty_snap());
     assert!(plan.evict.is_some());
 
-    // 두 번째 poll: 채널 종료 후 패닉 없이 동작
+    // 두 번째 poll: 채널 종료 후 패닉 없이 동작.
+    // evict_plan은 sticky하므로 새 명령 없이도 유지됨.
     let plan = executor.poll(&empty_snap());
-    assert!(plan.evict.is_none()); // 새 명령 없음
+    assert!(plan.evict.is_some()); // sticky: KvEvictH2o 유지
 }
 
 // ── Transport integration tests ──────────────────────────

@@ -3237,195 +3237,214 @@ fn main() -> anyhow::Result<()> {
                     let effective_ratio =
                         args.experiment_eviction_ratio.unwrap_or(evict.target_ratio);
 
-                    // GPU score sync before resilience eviction
-                    #[cfg(feature = "opencl")]
-                    if let Some(ocl_be) = backend
-                        .as_any()
-                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-                        && let Some(gpu_acc) = ocl_be.gpu_score_acc()
-                        && gpu_acc.is_active()
-                    {
-                        let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
-                        if let Some(ref mut acc) = score_accumulator {
-                            acc.import_gpu_scores(&flat, &head);
+                    // Sticky eviction guard: skip if cache is already at or below target.
+                    // Streaming eviction (target_ratio == 0.0) bypasses this check since
+                    // it manages its own window logic internally.
+                    let skip_eviction = effective_ratio > 0.0 && {
+                        let current_pos = kv_caches[0].current_pos;
+                        let cache_capacity = kv_caches[0].capacity();
+                        let target_pos = (cache_capacity as f32 * effective_ratio) as usize;
+                        current_pos <= target_pos
+                    };
+
+                    if skip_eviction {
+                        // Cache already within target — no-op this step
+                    } else {
+                        // GPU score sync before resilience eviction
+                        #[cfg(feature = "opencl")]
+                        if let Some(ocl_be) = backend
+                            .as_any()
+                            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>(
+                        ) && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+                            && gpu_acc.is_active()
+                        {
+                            let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
+                            if let Some(ref mut acc) = score_accumulator {
+                                acc.import_gpu_scores(&flat, &head);
+                            }
                         }
-                    }
 
-                    // ── Score distribution diagnostic (via events system) ──
-                    if let Some(acc) = score_accumulator.as_ref() {
-                        let scores = acc.importance_scores();
-                        let cache_pos = kv_caches[0].current_pos;
+                        // ── Score distribution diagnostic (via events system) ──
+                        if let Some(acc) = score_accumulator.as_ref() {
+                            let scores = acc.importance_scores();
+                            let cache_pos = kv_caches[0].current_pos;
 
-                        if let Some(snapshot) = events::build_score_snapshot(
-                            scores,
-                            cache_pos,
-                            actual_protected_prefix,
-                            decode_token_index,
-                            10,
-                        ) {
-                            cache_manager
-                                .event_sink()
-                                .emit(CacheEvent::ScoreDiagnostic(snapshot));
+                            if let Some(snapshot) = events::build_score_snapshot(
+                                scores,
+                                cache_pos,
+                                actual_protected_prefix,
+                                decode_token_index,
+                                10,
+                            ) {
+                                cache_manager
+                                    .event_sink()
+                                    .emit(CacheEvent::ScoreDiagnostic(snapshot));
 
-                            if let Some(ref out_path) = args.experiment_output {
-                                let diag_path =
-                                    format!("{}.scores.csv", out_path.trim_end_matches(".jsonl"));
-                                if events::dump_scores_csv(scores, cache_pos, &diag_path).is_ok() {
-                                    eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
+                                if let Some(ref out_path) = args.experiment_output {
+                                    let diag_path = format!(
+                                        "{}.scores.csv",
+                                        out_path.trim_end_matches(".jsonl")
+                                    );
+                                    if events::dump_scores_csv(scores, cache_pos, &diag_path)
+                                        .is_ok()
+                                    {
+                                        eprintln!("[ScoreDiag] Scores dumped to {}", diag_path);
+                                    }
                                 }
                             }
                         }
-                    }
 
-                    // Build ScoreContext from accumulator for policy-directed eviction
-                    let scores = if let Some(acc) = score_accumulator.as_ref() {
-                        if let Some(head_imp) = acc.head_importance_scores() {
-                            llm_rs2::core::cache_manager::ScoreContext::PerHead {
-                                flat: acc.importance_scores(),
-                                head: head_imp,
-                                n_kv_heads: acc.n_kv_heads(),
-                            }
-                        } else if acc.is_active() {
-                            llm_rs2::core::cache_manager::ScoreContext::Flat {
-                                importance: acc.importance_scores(),
+                        // Build ScoreContext from accumulator for policy-directed eviction
+                        let scores = if let Some(acc) = score_accumulator.as_ref() {
+                            if let Some(head_imp) = acc.head_importance_scores() {
+                                llm_rs2::core::cache_manager::ScoreContext::PerHead {
+                                    flat: acc.importance_scores(),
+                                    head: head_imp,
+                                    n_kv_heads: acc.n_kv_heads(),
+                                }
+                            } else if acc.is_active() {
+                                llm_rs2::core::cache_manager::ScoreContext::Flat {
+                                    importance: acc.importance_scores(),
+                                }
+                            } else {
+                                llm_rs2::core::cache_manager::ScoreContext::None
                             }
                         } else {
                             llm_rs2::core::cache_manager::ScoreContext::None
-                        }
-                    } else {
-                        llm_rs2::core::cache_manager::ScoreContext::None
-                    };
-
-                    // Manager already decided to evict — execute via named policy
-                    // D2O uses Pipeline (force_evict_with_scores), not named policy registry
-                    // StreamingLLM uses on-demand instantiation (params from directive)
-                    let result = if evict.method == llm_rs2::resilience::EvictMethod::D2o {
-                        let importance = if let Some(acc) = score_accumulator.as_ref() {
-                            acc.importance_scores().to_vec()
-                        } else {
-                            vec![]
                         };
-                        if importance.is_empty() {
-                            cache_manager.force_evict(&mut kv_caches, effective_ratio)
+
+                        // Manager already decided to evict — execute via named policy
+                        // D2O uses Pipeline (force_evict_with_scores), not named policy registry
+                        // StreamingLLM uses on-demand instantiation (params from directive)
+                        let result = if evict.method == llm_rs2::resilience::EvictMethod::D2o {
+                            let importance = if let Some(acc) = score_accumulator.as_ref() {
+                                acc.importance_scores().to_vec()
+                            } else {
+                                vec![]
+                            };
+                            if importance.is_empty() {
+                                cache_manager.force_evict(&mut kv_caches, effective_ratio)
+                            } else {
+                                cache_manager.force_evict_with_scores(
+                                    &mut kv_caches,
+                                    effective_ratio,
+                                    &importance,
+                                )
+                            }
+                        } else if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
+                            use llm_rs2::core::eviction::StreamingLLMPolicy;
+                            if let Some(ref sp) = evict.streaming_params {
+                                let policy = StreamingLLMPolicy::new(sp.sink_size, sp.window_size);
+                                cache_manager.force_evict_by_policy_ref(
+                                    &policy,
+                                    &mut kv_caches,
+                                    effective_ratio,
+                                    scores,
+                                )
+                            } else {
+                                Err(anyhow::anyhow!(
+                                    "KvStreaming evict plan missing streaming_params"
+                                ))
+                            }
                         } else {
-                            cache_manager.force_evict_with_scores(
-                                &mut kv_caches,
-                                effective_ratio,
-                                &importance,
-                            )
-                        }
-                    } else if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
-                        use llm_rs2::core::eviction::StreamingLLMPolicy;
-                        if let Some(ref sp) = evict.streaming_params {
-                            let policy = StreamingLLMPolicy::new(sp.sink_size, sp.window_size);
-                            cache_manager.force_evict_by_policy_ref(
-                                &policy,
+                            cache_manager.force_evict_by_policy(
+                                evict.method,
                                 &mut kv_caches,
                                 effective_ratio,
                                 scores,
                             )
-                        } else {
-                            Err(anyhow::anyhow!(
-                                "KvStreaming evict plan missing streaming_params"
-                            ))
-                        }
-                    } else {
-                        cache_manager.force_evict_by_policy(
-                            evict.method,
-                            &mut kv_caches,
-                            effective_ratio,
-                            scores,
-                        )
-                    };
-                    match result {
-                        Ok(r) if r.evicted => {
-                            eprintln!(
-                                "[Resilience] Evicted {} tokens (pos: {} → {})",
-                                r.tokens_removed,
-                                r.new_pos + r.tokens_removed,
-                                r.new_pos
-                            );
-                            if args.h2o_debug {
-                                if let Some(acc) = score_accumulator.as_ref() {
-                                    let scores = acc.importance_scores();
-                                    let pre_pos = r.new_pos + r.tokens_removed;
-                                    let valid = &scores[..pre_pos.min(scores.len())];
-                                    if !valid.is_empty() {
-                                        let total: f32 = valid.iter().sum();
-                                        let max_s =
-                                            valid.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-                                        let min_s =
-                                            valid.iter().fold(f32::INFINITY, |a, &b| a.min(b));
-                                        let avg_s = total / valid.len() as f32;
-                                        eprintln!(
-                                            "[H2O-Debug] Pre-eviction scores: min={:.3} avg={:.3} max={:.3} total={:.1} tokens={}",
-                                            min_s,
-                                            avg_s,
-                                            max_s,
-                                            total,
-                                            valid.len()
-                                        );
+                        };
+                        match result {
+                            Ok(r) if r.evicted => {
+                                eprintln!(
+                                    "[Resilience] Evicted {} tokens (pos: {} → {})",
+                                    r.tokens_removed,
+                                    r.new_pos + r.tokens_removed,
+                                    r.new_pos
+                                );
+                                if args.h2o_debug {
+                                    if let Some(acc) = score_accumulator.as_ref() {
+                                        let scores = acc.importance_scores();
+                                        let pre_pos = r.new_pos + r.tokens_removed;
+                                        let valid = &scores[..pre_pos.min(scores.len())];
+                                        if !valid.is_empty() {
+                                            let total: f32 = valid.iter().sum();
+                                            let max_s = valid
+                                                .iter()
+                                                .fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                                            let min_s =
+                                                valid.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+                                            let avg_s = total / valid.len() as f32;
+                                            eprintln!(
+                                                "[H2O-Debug] Pre-eviction scores: min={:.3} avg={:.3} max={:.3} total={:.1} tokens={}",
+                                                min_s,
+                                                avg_s,
+                                                max_s,
+                                                total,
+                                                valid.len()
+                                            );
+                                        }
                                     }
+                                    eprintln!(
+                                        "[H2O-Debug] Eviction: ratio={:.3} removed={} new_pos={}",
+                                        effective_ratio, r.tokens_removed, r.new_pos
+                                    );
                                 }
-                                eprintln!(
-                                    "[H2O-Debug] Eviction: ratio={:.3} removed={} new_pos={}",
-                                    effective_ratio, r.tokens_removed, r.new_pos
-                                );
+                                if let Some(ref mut p) = profiler {
+                                    p.on_eviction(llm_rs2::profile::EvictionEvent {
+                                        step: decode_token_index,
+                                        policy: args.eviction_policy.clone(),
+                                        before_len: r.new_pos + r.tokens_removed,
+                                        after_len: r.new_pos,
+                                        evicted_count: r.tokens_removed,
+                                        partition: llm_rs2::profile::PartitionInfo {
+                                            prefix_end: actual_protected_prefix,
+                                            hh_count: 0,
+                                            recent_start: r.new_pos,
+                                        },
+                                        evicted_indices: vec![],
+                                        pre_eviction_scores: vec![],
+                                    });
+                                }
+                                // Release physical pages (madvise MADV_DONTNEED)
+                                let mut bytes_released = 0usize;
+                                for cache in kv_caches.iter_mut() {
+                                    bytes_released += cache.release_unused_pages();
+                                }
+                                if bytes_released > 0 {
+                                    eprintln!(
+                                        "[Resilience] Released {} MB of physical pages",
+                                        bytes_released / (1024 * 1024)
+                                    );
+                                }
+                                experiment_eviction_count += 1;
+                                experiment_evicted_total += r.tokens_removed;
+                                if let Some(acc) = score_accumulator.as_mut() {
+                                    acc.reset();
+                                    acc.set_active(false);
+                                }
+                                // Reset GPU score accumulator after resilience eviction
+                                #[cfg(feature = "opencl")]
+                                if let Some(ocl_be) = backend
+                                    .as_any()
+                                    .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>(
+                                ) && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                                    && gpu_acc.is_active()
+                                {
+                                    gpu_acc.reset(ocl_be.queue.as_core())?;
+                                    gpu_acc.set_active(false);
+                                }
+                                // Invalidate GPU Plan — cache size changed after eviction,
+                                // stale plan would use wrong attention sequence length.
+                                #[cfg(feature = "opencl")]
+                                {
+                                    gpu_plan = None;
+                                }
                             }
-                            if let Some(ref mut p) = profiler {
-                                p.on_eviction(llm_rs2::profile::EvictionEvent {
-                                    step: decode_token_index,
-                                    policy: args.eviction_policy.clone(),
-                                    before_len: r.new_pos + r.tokens_removed,
-                                    after_len: r.new_pos,
-                                    evicted_count: r.tokens_removed,
-                                    partition: llm_rs2::profile::PartitionInfo {
-                                        prefix_end: actual_protected_prefix,
-                                        hh_count: 0,
-                                        recent_start: r.new_pos,
-                                    },
-                                    evicted_indices: vec![],
-                                    pre_eviction_scores: vec![],
-                                });
-                            }
-                            // Release physical pages (madvise MADV_DONTNEED)
-                            let mut bytes_released = 0usize;
-                            for cache in kv_caches.iter_mut() {
-                                bytes_released += cache.release_unused_pages();
-                            }
-                            if bytes_released > 0 {
-                                eprintln!(
-                                    "[Resilience] Released {} MB of physical pages",
-                                    bytes_released / (1024 * 1024)
-                                );
-                            }
-                            experiment_eviction_count += 1;
-                            experiment_evicted_total += r.tokens_removed;
-                            if let Some(acc) = score_accumulator.as_mut() {
-                                acc.reset();
-                                acc.set_active(false);
-                            }
-                            // Reset GPU score accumulator after resilience eviction
-                            #[cfg(feature = "opencl")]
-                            if let Some(ocl_be) = backend
-                                .as_any()
-                                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>(
-                            ) && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
-                                && gpu_acc.is_active()
-                            {
-                                gpu_acc.reset(ocl_be.queue.as_core())?;
-                                gpu_acc.set_active(false);
-                            }
-                            // Invalidate GPU Plan — cache size changed after eviction,
-                            // stale plan would use wrong attention sequence length.
-                            #[cfg(feature = "opencl")]
-                            {
-                                gpu_plan = None;
-                            }
+                            Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
+                            _ => {}
                         }
-                        Err(e) => eprintln!("[Resilience] Eviction error: {}", e),
-                        _ => {}
-                    }
+                    } // end skip_eviction else
                 }
 
                 // Dynamic tensor partition ratio
@@ -4872,6 +4891,8 @@ fn run_kivi(
     use llm_rs2::core::skip_config::SkipConfig;
     let mut kivi_skip_config: Option<SkipConfig> = None;
     let mut kivi_last_skip_ratio: Option<f32> = None;
+    // Track last applied quant bits to avoid redundant transition_bits calls (sticky guard)
+    let mut kivi_last_quant_bits: Option<u8> = None;
 
     // Build GPU kernel plan for KIVI decode (OpenCL only)
     #[cfg(feature = "opencl")]
@@ -5004,7 +5025,10 @@ fn run_kivi(
             }
 
             // kv_quant_bits: transition KiviCache bit-width
-            if let Some(bits) = plan.kv_quant_bits {
+            // Sticky guard: skip if already at the requested bit-width
+            if let Some(bits) = plan.kv_quant_bits
+                && kivi_last_quant_bits != Some(bits)
+            {
                 for cache in kv_caches.iter_mut() {
                     if let Err(e) = cache.transition_bits(bits) {
                         eprintln!("[KIVI-Resilience] transition_bits({}) error: {}", bits, e);
@@ -5016,6 +5040,7 @@ fn run_kivi(
                     gpu_plan = None;
                 }
                 eprintln!("[KIVI-Resilience] Transitioned KV cache to {}bit", bits);
+                kivi_last_quant_bits = Some(bits);
             }
 
             // layer_skip / restore_defaults
@@ -5023,6 +5048,7 @@ fn run_kivi(
                 eprintln!("[KIVI-Resilience] RestoreDefaults");
                 kivi_skip_config = None;
                 kivi_last_skip_ratio = None;
+                kivi_last_quant_bits = None;
             } else if let Some(ratio) = plan.layer_skip
                 && kivi_last_skip_ratio != Some(ratio)
             {
