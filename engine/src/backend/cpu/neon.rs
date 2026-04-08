@@ -356,6 +356,10 @@ impl CpuBackendNeon {
                     }
                 } else {
                 // Pass 2: exp(x - max) and sum
+                // Use scalar exp() per lane — v_expf has bit-manipulation precision
+                // issues on certain ARM cores (Apple Silicon, Cortex-A720) that
+                // corrupt softmax distributions at longer sequence lengths (300+).
+                // Same rationale as v_silu / v_tanh scalar fallbacks.
                 let mut sum_exp = 0.0f32;
                 unsafe {
                     let s_ptr = scores.as_mut_ptr();
@@ -364,7 +368,14 @@ impl CpuBackendNeon {
                     let mut i = 0;
                     while i + 4 <= cache_seq_len {
                         let x = vsubq_f32(vld1q_f32(s_ptr.add(i)), max_v);
-                        let e = Self::v_expf(x);
+                        // Scalar exp per lane for correctness
+                        let mut vals = [0.0f32; 4];
+                        vst1q_f32(vals.as_mut_ptr(), x);
+                        vals[0] = vals[0].exp();
+                        vals[1] = vals[1].exp();
+                        vals[2] = vals[2].exp();
+                        vals[3] = vals[3].exp();
+                        let e = vld1q_f32(vals.as_ptr());
                         vst1q_f32(s_ptr.add(i), e);
                         sum_v = vaddq_f32(sum_v, e);
                         i += 4;
