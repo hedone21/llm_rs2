@@ -54,36 +54,6 @@ impl LayerWorkspace {
             bufs.push(pw.gate_cpu.buffer().clone());
             bufs.push(pw.up_gpu.buffer().clone());
             bufs.push(pw.up_cpu.buffer().clone());
-            bufs.push(pw.down_gpu.buffer().clone());
-            bufs.push(pw.down_cpu.buffer().clone());
-            bufs.push(pw.ffn_mid_cpu.buffer().clone());
-            if let Some(ref t) = pw.q_gpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.q_cpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.k_gpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.k_cpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.v_gpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.v_cpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.o_gpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.o_cpu {
-                bufs.push(t.buffer().clone());
-            }
-            if let Some(ref t) = pw.attn_out_cpu {
-                bufs.push(t.buffer().clone());
-            }
             bufs.push(pw.residual_cpu.buffer().clone());
         }
         bufs
@@ -113,18 +83,6 @@ impl LayerWorkspace {
                 gate_cpu: retag(pw.gate_cpu),
                 up_gpu: retag(pw.up_gpu),
                 up_cpu: retag(pw.up_cpu),
-                down_gpu: retag(pw.down_gpu),
-                down_cpu: retag(pw.down_cpu),
-                ffn_mid_cpu: retag(pw.ffn_mid_cpu),
-                q_gpu: pw.q_gpu.map(&retag),
-                q_cpu: pw.q_cpu.map(&retag),
-                k_gpu: pw.k_gpu.map(&retag),
-                k_cpu: pw.k_cpu.map(&retag),
-                v_gpu: pw.v_gpu.map(&retag),
-                v_cpu: pw.v_cpu.map(&retag),
-                o_gpu: pw.o_gpu.map(&retag),
-                o_cpu: pw.o_cpu.map(&retag),
-                attn_out_cpu: pw.attn_out_cpu.map(&retag),
                 residual_cpu: retag(pw.residual_cpu),
             }),
         }
@@ -225,13 +183,12 @@ impl PrefillWorkspace {
     }
 }
 
-/// Pre-allocated scratch tensors for partitioned output (decode only).
+/// Pre-allocated scratch tensors for partitioned FFN gate/up output (decode only).
 ///
 /// Each pair (gpu, cpu) holds one partial result that together form the full
 /// output dimension. Created once during partition setup and reused every token.
 ///
-/// FFN buffers are always present. Attention buffers are `Option` because
-/// GQA models may have K/V out_dim too small for partitioning.
+/// Only FFN gate/up are partitioned; attention and FFN down run GPU-only.
 pub struct PartitionWorkspace {
     // --- FFN gate/up ---
     /// GPU partial output for gate projection: [1, 1, gate_split_row]
@@ -242,24 +199,6 @@ pub struct PartitionWorkspace {
     pub up_gpu: Tensor,
     /// CPU partial output for up projection: [1, 1, ffn_hidden - up_split_row]
     pub up_cpu: Tensor,
-    // --- FFN down ---
-    /// GPU partial output for down projection: [1, 1, down_split_row]
-    pub down_gpu: Tensor,
-    /// CPU partial output for down projection: [1, 1, hidden_size - down_split_row]
-    pub down_cpu: Tensor,
-    /// CPU-side copy of FFN mid (gelu_tanh_mul result) for down CPU matmul: [1, 1, ffn_hidden]
-    pub ffn_mid_cpu: Tensor,
-    // --- Attention Q/K/V/O (Option — GQA skip when out_dim < 256) ---
-    pub q_gpu: Option<Tensor>,
-    pub q_cpu: Option<Tensor>,
-    pub k_gpu: Option<Tensor>,
-    pub k_cpu: Option<Tensor>,
-    pub v_gpu: Option<Tensor>,
-    pub v_cpu: Option<Tensor>,
-    pub o_gpu: Option<Tensor>,
-    pub o_cpu: Option<Tensor>,
-    /// CPU-side copy of attention output for wo CPU matmul: [1, 1, q_dim]
-    pub attn_out_cpu: Option<Tensor>,
     /// CPU-side copy of residual for CPU matmul input: [1, 1, dim]
     /// UnifiedBuffer::as_ptr() returns null when unmapped, so we copy residual
     /// to this CPU buffer via read_buffer() before CPU matmul.
@@ -267,25 +206,18 @@ pub struct PartitionWorkspace {
 }
 
 impl PartitionWorkspace {
-    /// Allocate partition workspace buffers for all partitioned projections.
+    /// Allocate partition workspace buffers for FFN gate/up partitioned projections.
     ///
     /// `ctx`: partition context from layer 0 (all layers share the same split geometry).
     /// `ffn_hidden`: FFN intermediate dimension (gate/up out_dim).
-    /// `hidden_size`: model hidden dimension (down out_dim, residual size).
-    /// `q_dim`: Q projection out_dim (n_heads_q * head_dim).
-    /// `k_dim`: K projection out_dim (n_kv_heads * head_dim).
-    /// `v_dim`: V projection out_dim (n_kv_heads * head_dim).
+    /// `hidden_size`: model hidden dimension (residual size).
     /// `gpu_alloc`: allocator closure for GPU-side buffers.
     /// `gpu_backend`: backend for GPU-side tensors.
     /// `cpu_backend`: backend for CPU-side tensors.
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ctx: &crate::layers::tensor_partition::PartitionContext,
         ffn_hidden: usize,
         hidden_size: usize,
-        q_dim: usize,
-        k_dim: usize,
-        v_dim: usize,
         gpu_alloc: &dyn Fn(usize, DType) -> Result<Arc<dyn Buffer>>,
         gpu_backend: Arc<dyn Backend>,
         cpu_backend: Arc<dyn Backend>,
@@ -308,64 +240,15 @@ impl PartitionWorkspace {
             ))
         };
 
-        // Helper: allocate optional (gpu, cpu) pair for attention weights.
-        let alloc_opt_pair =
-            |pw_opt: &Option<crate::layers::tensor_partition::PartitionedWeight>,
-             out_dim: usize|
-             -> Result<(Option<Tensor>, Option<Tensor>)> {
-                match pw_opt {
-                    Some(pw) => {
-                        let (g, c) = alloc_pair(pw, out_dim)?;
-                        Ok((Some(g), Some(c)))
-                    }
-                    None => Ok((None, None)),
-                }
-            };
-
-        // FFN gate/up
+        // FFN gate/up only
         let (gate_gpu, gate_cpu) = alloc_pair(&ctx.gate, ffn_hidden)?;
         let (up_gpu, up_cpu) = alloc_pair(&ctx.up, ffn_hidden)?;
-        // FFN down
-        let (down_gpu, down_cpu) = alloc_pair(&ctx.down, hidden_size)?;
-        let ffn_mid_cpu = {
-            let buf = cpu_mem.alloc(ffn_hidden * 4, DType::F32)?;
-            Tensor::new(Shape::new(vec![1, 1, ffn_hidden]), buf, cpu_backend.clone())
-        };
-
-        // Attention Q/K/V/O
-        let (q_gpu, q_cpu) = alloc_opt_pair(&ctx.wq, q_dim)?;
-        let (k_gpu, k_cpu) = alloc_opt_pair(&ctx.wk, k_dim)?;
-        let (v_gpu, v_cpu) = alloc_opt_pair(&ctx.wv, v_dim)?;
-        let (o_gpu, o_cpu) = alloc_opt_pair(&ctx.wo, hidden_size)?;
-        // attn_out_cpu: CPU-side copy of attention output for wo matmul
-        let attn_out_cpu = if ctx.wo.is_some() {
-            let buf = cpu_mem.alloc(q_dim * 4, DType::F32)?;
-            Some(Tensor::new(
-                Shape::new(vec![1, 1, q_dim]),
-                buf,
-                cpu_backend.clone(),
-            ))
-        } else {
-            None
-        };
 
         Ok(Self {
             gate_gpu,
             gate_cpu,
             up_gpu,
             up_cpu,
-            down_gpu,
-            down_cpu,
-            ffn_mid_cpu,
-            q_gpu,
-            q_cpu,
-            k_gpu,
-            k_cpu,
-            v_gpu,
-            v_cpu,
-            o_gpu,
-            o_cpu,
-            attn_out_cpu,
             residual_cpu: {
                 let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
                 Tensor::new(Shape::new(vec![1, 1, hidden_size]), buf, cpu_backend)

@@ -909,14 +909,12 @@ impl TransformerModel {
 
     /// Prepare tensor partitioning for CPU-GPU cooperative inference.
     ///
-    /// Splits each layer's 7 linear projections (wq, wk, wv, wo, gate, up, down)
-    /// row-wise into GPU and CPU partitions:
+    /// Splits FFN gate/up projections row-wise into GPU and CPU partitions:
     ///   - `[0, split_row)` stays on the current (GPU) backend
     ///   - `[split_row, out_dim)` is tagged with `cpu_backend`
     ///
-    /// Attention weights (wq/wk/wv/wo) use `split_weight_optional` — if out_dim
-    /// is too small for partitioning (e.g. GQA K/V with < 256 rows), that weight
-    /// falls back to the standard single-backend path.
+    /// Attention (wq/wk/wv/wo) and FFN down are not partitioned — their
+    /// merge overhead exceeds the compute benefit, especially during prefill.
     ///
     /// Each slice is pre-copied into an independent buffer via `Backend::copy_from()`,
     /// ensuring GPU slices have a valid `cl_mem` handle for OpenCL kernel dispatch.
@@ -928,35 +926,20 @@ impl TransformerModel {
         gpu_ratio: f32,
         cpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
-        use crate::layers::tensor_partition::{
-            PartitionContext, split_weight, split_weight_optional,
-        };
+        use crate::layers::tensor_partition::{PartitionContext, split_weight};
 
         let mut count = 0;
         for layer in &mut self.layers {
-            // Attention projections (optional — may be too small for GQA K/V)
-            let wq = split_weight_optional(&layer.wq, gpu_ratio, cpu_backend)?;
-            let wk = split_weight_optional(&layer.wk, gpu_ratio, cpu_backend)?;
-            let wv = split_weight_optional(&layer.wv, gpu_ratio, cpu_backend)?;
-            let wo = split_weight_optional(&layer.wo, gpu_ratio, cpu_backend)?;
-            // FFN projections (always large enough)
+            // Only partition FFN gate/up (large enough, no merge overhead concern)
             let gate = split_weight(&layer.w_gate, gpu_ratio, cpu_backend)?;
             let up = split_weight(&layer.w_up, gpu_ratio, cpu_backend)?;
-            let down = split_weight(&layer.w_down, gpu_ratio, cpu_backend)?;
-
-            let n_attn = [&wq, &wk, &wv, &wo].iter().filter(|w| w.is_some()).count();
-            count += n_attn + 3; // 3 FFN weights always partitioned
+            count += 2;
 
             layer.partition_ctx = Some(PartitionContext {
                 gpu_ratio,
                 cpu_backend: cpu_backend.clone(),
-                wq,
-                wk,
-                wv,
-                wo,
                 gate,
                 up,
-                down,
             });
         }
         Ok(count)

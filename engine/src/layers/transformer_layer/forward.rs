@@ -53,83 +53,10 @@ impl TransformerLayer {
             backend.copy_slice(x, &mut ws.residual, 0, 0, n_elem)?;
             backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
 
-            if let Some(ref part) = self.partition_ctx {
-                if part.wq.is_some() {
-                    // ── Partitioned QKV (prefill): cooperative GPU + CPU ──
-                    // 1. Copy normalized x to CPU for CPU-side matmul.
-                    let x_cpu_bytes = batch_size * seq_len * dim * 4;
-                    backend.synchronize()?;
-                    let x_cpu_buf = Galloc::new().alloc(x_cpu_bytes, DType::F32)?;
-                    let x_cpu = Tensor::new(x.shape().clone(), x_cpu_buf, part.cpu_backend.clone());
-                    unsafe {
-                        let dst =
-                            std::slice::from_raw_parts_mut(x_cpu.as_ptr() as *mut u8, x_cpu_bytes);
-                        backend.read_buffer(x, dst)?;
-                    }
-
-                    let total_rows = batch_size * seq_len;
-
-                    // Macro: partitioned matmul for a single projection.
-                    // Enqueues GPU partial, runs CPU partial, merges via merge_partials_2d.
-                    macro_rules! prefill_partition_matmul {
-                        ($pw_opt:expr, $full_w:expr, $out:expr, $out_dim:expr) => {
-                            if let Some(ref pw) = $pw_opt {
-                                let sr = pw.split_row;
-                                let cr = $out_dim - sr;
-                                // GPU partial buffer
-                                let gpu_buf = memory.alloc(total_rows * sr * 4, DType::F32)?;
-                                let mut gpu_partial = Tensor::new(
-                                    Shape::new(vec![batch_size, seq_len, sr]),
-                                    gpu_buf,
-                                    backend.clone(),
-                                );
-                                backend.matmul_transposed(x, &pw.gpu_slice, &mut gpu_partial)?;
-                                backend.flush()?;
-
-                                // CPU partial buffer
-                                let cpu_buf =
-                                    Galloc::new().alloc(total_rows * cr * 4, DType::F32)?;
-                                let mut cpu_partial = Tensor::new(
-                                    Shape::new(vec![batch_size, seq_len, cr]),
-                                    cpu_buf,
-                                    part.cpu_backend.clone(),
-                                );
-                                part.cpu_backend.matmul_transposed(
-                                    &x_cpu,
-                                    &pw.cpu_slice,
-                                    &mut cpu_partial,
-                                )?;
-
-                                // Merge 2D
-                                crate::layers::tensor_partition::merge_partials_2d(
-                                    backend.as_ref(),
-                                    &gpu_partial,
-                                    &cpu_partial,
-                                    $out,
-                                    total_rows,
-                                    sr,
-                                    cr,
-                                )?;
-                            } else {
-                                backend.matmul_transposed(x, $full_w, $out)?;
-                            }
-                        };
-                    }
-
-                    prefill_partition_matmul!(part.wq, &self.wq, &mut ws.q, q_dim);
-                    prefill_partition_matmul!(part.wk, &self.wk, &mut ws.k, k_dim);
-                    prefill_partition_matmul!(part.wv, &self.wv, &mut ws.v, v_dim);
-                } else {
-                    // No attention partition — standard path
-                    backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
-                    backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
-                    backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
-                }
-            } else {
-                backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
-                backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
-                backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
-            }
+            // QKV: always GPU-only (attention partition removed — merge overhead exceeds benefit)
+            backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
+            backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
+            backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
 
             if let Some(ref bias) = self.qkv_bias {
                 backend.add_row_bias(&mut ws.q, &bias.bq)?;
@@ -511,74 +438,10 @@ impl TransformerLayer {
                 }
             }
 
-            // O-proj
+            // O-proj: always GPU-only (wo partition removed — merge overhead exceeds benefit)
             ws.attn_out_proj
                 .reshape(Shape::new(vec![batch_size, seq_len, dim]));
-            if let Some(ref part) = self.partition_ctx {
-                if let Some(ref wo_part) = part.wo {
-                    // Partitioned wo (prefill): sync, copy out_attn to CPU, split matmul, merge
-                    let total_rows = batch_size * seq_len;
-                    let sr = wo_part.split_row;
-                    let cr = dim - sr;
-                    backend.synchronize()?;
-                    let attn_cpu_bytes = batch_size * seq_len * q_dim * 4;
-                    let attn_cpu_buf = Galloc::new().alloc(attn_cpu_bytes, DType::F32)?;
-                    let attn_cpu = Tensor::new(
-                        ws.out_attn.shape().clone(),
-                        attn_cpu_buf,
-                        part.cpu_backend.clone(),
-                    );
-                    unsafe {
-                        let dst = std::slice::from_raw_parts_mut(
-                            attn_cpu.as_ptr() as *mut u8,
-                            attn_cpu_bytes,
-                        );
-                        backend.read_buffer(&ws.out_attn, dst)?;
-                    }
-
-                    // GPU partial
-                    let gpu_buf = memory.alloc(total_rows * sr * 4, DType::F32)?;
-                    let mut gpu_partial = Tensor::new(
-                        Shape::new(vec![batch_size, seq_len, sr]),
-                        gpu_buf,
-                        backend.clone(),
-                    );
-                    backend.matmul_transposed(
-                        &ws.out_attn,
-                        &wo_part.gpu_slice,
-                        &mut gpu_partial,
-                    )?;
-                    backend.flush()?;
-
-                    // CPU partial
-                    let cpu_buf = Galloc::new().alloc(total_rows * cr * 4, DType::F32)?;
-                    let mut cpu_partial = Tensor::new(
-                        Shape::new(vec![batch_size, seq_len, cr]),
-                        cpu_buf,
-                        part.cpu_backend.clone(),
-                    );
-                    part.cpu_backend.matmul_transposed(
-                        &attn_cpu,
-                        &wo_part.cpu_slice,
-                        &mut cpu_partial,
-                    )?;
-
-                    // Merge 2D
-                    crate::layers::tensor_partition::merge_partials_2d(
-                        backend.as_ref(),
-                        &gpu_partial,
-                        &cpu_partial,
-                        &mut ws.attn_out_proj,
-                        total_rows,
-                        sr,
-                        cr,
-                    )?;
-                } else {
-                    backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out_proj)?;
-                }
-            } else {
-                backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out_proj)?;
-            }
+            backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out_proj)?;
             if rms_norm_add_unit {
                 backend.rms_norm(&mut ws.attn_out_proj, &self.ffn_norm, rms_norm_eps, true)?;
             }
@@ -699,65 +562,8 @@ impl TransformerLayer {
                 backend.silu_mul(&mut ws.gate, &ws.up)?;
             }
 
-            if let Some(ref part) = self.partition_ctx {
-                // Partitioned down projection (prefill)
-                let total_rows = batch_size * seq_len;
-                let sr = part.down.split_row;
-                let cr = dim - sr;
-
-                // Copy gate (silu_mul result) to CPU
-                let gate_cpu_bytes = batch_size * seq_len * ffn_hidden * 4;
-                backend.synchronize()?;
-                let gate_cpu_buf = Galloc::new().alloc(gate_cpu_bytes, DType::F32)?;
-                let gate_cpu = Tensor::new(
-                    ws.gate.shape().clone(),
-                    gate_cpu_buf,
-                    part.cpu_backend.clone(),
-                );
-                unsafe {
-                    let dst = std::slice::from_raw_parts_mut(
-                        gate_cpu.as_ptr() as *mut u8,
-                        gate_cpu_bytes,
-                    );
-                    backend.read_buffer(&ws.gate, dst)?;
-                }
-
-                // GPU partial
-                let gpu_buf = memory.alloc(total_rows * sr * 4, DType::F32)?;
-                let mut gpu_partial = Tensor::new(
-                    Shape::new(vec![batch_size, seq_len, sr]),
-                    gpu_buf,
-                    backend.clone(),
-                );
-                backend.matmul_transposed(&ws.gate, &part.down.gpu_slice, &mut gpu_partial)?;
-                backend.flush()?;
-
-                // CPU partial
-                let cpu_buf = Galloc::new().alloc(total_rows * cr * 4, DType::F32)?;
-                let mut cpu_partial = Tensor::new(
-                    Shape::new(vec![batch_size, seq_len, cr]),
-                    cpu_buf,
-                    part.cpu_backend.clone(),
-                );
-                part.cpu_backend.matmul_transposed(
-                    &gate_cpu,
-                    &part.down.cpu_slice,
-                    &mut cpu_partial,
-                )?;
-
-                // Merge 2D
-                crate::layers::tensor_partition::merge_partials_2d(
-                    backend.as_ref(),
-                    &gpu_partial,
-                    &cpu_partial,
-                    &mut ws.down,
-                    total_rows,
-                    sr,
-                    cr,
-                )?;
-            } else {
-                backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
-            }
+            // Down: always GPU-only (down partition removed — merge overhead exceeds benefit)
+            backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
             if let Some(ref pfn) = self.post_ffn_norm {
                 backend.rms_norm(&mut ws.down, pfn, rms_norm_eps, true)?;
             }
