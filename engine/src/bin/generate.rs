@@ -2818,6 +2818,11 @@ fn main() -> anyhow::Result<()> {
         let mut logits_cpu = vec![0.0f32; vocab_size];
         let mut sampling_indices: Vec<usize> = (0..vocab_size).collect();
 
+        // Ceiling for sticky eviction: records current_pos at first eviction trigger.
+        // Subsequent evictions use ceiling * ratio as a fixed target to prevent cascade
+        // (e.g. cache 33 → 16 → 8 → ... when target_ratio is applied to ever-shrinking pos).
+        let mut evict_ceiling: Option<usize> = None;
+
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
@@ -3237,14 +3242,19 @@ fn main() -> anyhow::Result<()> {
                     let effective_ratio =
                         args.experiment_eviction_ratio.unwrap_or(evict.target_ratio);
 
-                    // Sticky eviction guard: skip if cache is already at or below target.
+                    let current_pos = kv_caches[0].current_pos;
+
+                    // Ceiling: record current_pos at the first sticky eviction trigger.
+                    // All subsequent evictions use ceiling * ratio as fixed target to prevent
+                    // cascade shrinking (e.g. 33→16→8→... when ratio applied to shrinking pos).
                     // Streaming eviction (target_ratio == 0.0) bypasses this check since
                     // it manages its own window logic internally.
-                    let skip_eviction = effective_ratio > 0.0 && {
-                        let current_pos = kv_caches[0].current_pos;
-                        let cache_capacity = kv_caches[0].capacity();
-                        let target_pos = (cache_capacity as f32 * effective_ratio) as usize;
-                        current_pos <= target_pos
+                    let (skip_eviction, target_pos) = if effective_ratio > 0.0 {
+                        let ceiling = evict_ceiling.get_or_insert(current_pos);
+                        let tgt = (*ceiling as f32 * effective_ratio).max(1.0) as usize;
+                        (current_pos <= tgt, tgt)
+                    } else {
+                        (false, 0)
                     };
 
                     if skip_eviction {
@@ -3316,6 +3326,16 @@ fn main() -> anyhow::Result<()> {
                         // Manager already decided to evict — execute via named policy
                         // D2O uses Pipeline (force_evict_with_scores), not named policy registry
                         // StreamingLLM uses on-demand instantiation (params from directive)
+
+                        // Ceiling-based adjusted ratio: back-calculate ratio so that
+                        // force_evict's internal (current_pos * ratio) == target_pos.
+                        // This prevents the cascade effect when current_pos < ceiling.
+                        let adjusted_ratio = if effective_ratio > 0.0 && current_pos > 0 {
+                            target_pos as f32 / current_pos as f32
+                        } else {
+                            effective_ratio
+                        };
+
                         let result = if evict.method == llm_rs2::resilience::EvictMethod::D2o {
                             let importance = if let Some(acc) = score_accumulator.as_ref() {
                                 acc.importance_scores().to_vec()
@@ -3323,11 +3343,11 @@ fn main() -> anyhow::Result<()> {
                                 vec![]
                             };
                             if importance.is_empty() {
-                                cache_manager.force_evict(&mut kv_caches, effective_ratio)
+                                cache_manager.force_evict(&mut kv_caches, adjusted_ratio)
                             } else {
                                 cache_manager.force_evict_with_scores(
                                     &mut kv_caches,
-                                    effective_ratio,
+                                    adjusted_ratio,
                                     &importance,
                                 )
                             }
@@ -3338,7 +3358,7 @@ fn main() -> anyhow::Result<()> {
                                 cache_manager.force_evict_by_policy_ref(
                                     &policy,
                                     &mut kv_caches,
-                                    effective_ratio,
+                                    adjusted_ratio,
                                     scores,
                                 )
                             } else {
@@ -3350,7 +3370,7 @@ fn main() -> anyhow::Result<()> {
                             cache_manager.force_evict_by_policy(
                                 evict.method,
                                 &mut kv_caches,
-                                effective_ratio,
+                                adjusted_ratio,
                                 scores,
                             )
                         };
@@ -3494,6 +3514,7 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("[Resilience] RestoreDefaults");
                     skip_config = None;
                     last_skip_ratio = None;
+                    evict_ceiling = None;
                 } else if let Some(ratio) = plan.layer_skip
                     && last_skip_ratio != Some(ratio)
                 {
