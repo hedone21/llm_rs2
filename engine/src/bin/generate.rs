@@ -2528,6 +2528,72 @@ fn main() -> anyhow::Result<()> {
             cache_manager.maybe_evict(&mut kv_caches).ok();
         }
 
+        // Sticky eviction at prefill→decode boundary.
+        // If a KvEvict directive arrived during prefill, executor holds a sticky evict_plan.
+        // Execute it now (before decode starts) to reduce attention work from the first decode step.
+        // Score-based methods (H2O/D2O) are not available here — falls back to force_evict.
+        if let Some(ref mut exec) = command_executor {
+            let kv_snap = KVSnapshot {
+                total_bytes: kv_caches
+                    .iter()
+                    .map(|c| (c.k_buffer.buffer().size() + c.v_buffer.buffer().size()) as u64)
+                    .sum(),
+                total_tokens: kv_caches[0].current_pos,
+                capacity: kv_caches[0].capacity(),
+                protected_prefix: actual_protected_prefix,
+                kv_dtype: "f16".to_string(),
+                eviction_policy: args.eviction_policy.clone(),
+                skip_ratio: 0.0,
+            };
+            let plan = exec.poll(&kv_snap);
+            if let Some(evict) = &plan.evict {
+                let effective_ratio = args.experiment_eviction_ratio.unwrap_or(evict.target_ratio);
+                if effective_ratio > 0.0 {
+                    let current_pos = kv_caches[0].current_pos;
+                    // Use current_pos as ceiling (first and only boundary eviction).
+                    let tgt_raw = (current_pos as f32 * effective_ratio).max(1.0) as usize;
+                    let target_pos = tgt_raw.max(args.min_kv_cache);
+                    if current_pos > target_pos {
+                        // adjusted_ratio so force_evict(current_pos * adjusted) == target_pos.
+                        let adjusted_ratio = target_pos as f32 / current_pos as f32;
+                        // Dispatch by evict method (same as decode loop).
+                        // Scores are unavailable at prefill→decode boundary, so
+                        // D2O and score-based H2O fall back to force_evict.
+                        let result = if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
+                            if let Some(ref sp) = evict.streaming_params {
+                                let policy = llm_rs2::core::eviction::streaming_llm::StreamingLLMPolicy::new(
+                                    sp.sink_size, sp.window_size,
+                                );
+                                cache_manager.force_evict_by_policy_ref(
+                                    &policy, &mut kv_caches, adjusted_ratio,
+                                    llm_rs2::core::cache_manager::ScoreContext::None,
+                                )
+                            } else {
+                                cache_manager.force_evict(&mut kv_caches, adjusted_ratio)
+                            }
+                        } else {
+                            cache_manager.force_evict_by_policy(
+                                evict.method, &mut kv_caches, adjusted_ratio,
+                                llm_rs2::core::cache_manager::ScoreContext::None,
+                            )
+                        };
+                        match result {
+                            Ok(r) if r.evicted => {
+                                eprintln!(
+                                    "[Prefill→Decode] Evicted {} tokens (pos: {} → {})",
+                                    r.tokens_removed,
+                                    r.new_pos + r.tokens_removed,
+                                    r.new_pos
+                                );
+                            }
+                            Err(e) => eprintln!("[Prefill→Decode] Eviction error: {}", e),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+
         // Sample last token — read logits from the last chunk's output.
         // When chunked: prefill_logits is [1,1,vocab_size], last_logits = the only row.
         // When not chunked: prefill_logits is [1,process_len,vocab_size], take last row.
