@@ -2441,31 +2441,6 @@ impl Backend for OpenCLBackend {
             return Ok(());
         }
 
-        // If CPU pointer is available, use CPU memmove (SharedBuffer, mapped UnifiedBuffer)
-        let ptr = tensor.as_mut_ptr();
-        if !ptr.is_null() {
-            let type_size = match tensor.dtype() {
-                DType::F32 => 4,
-                DType::F16 => 2,
-                DType::U8 => 1,
-                DType::Q4_0 => std::mem::size_of::<crate::core::quant::BlockQ4_0>(),
-                _ => 1,
-            };
-            unsafe {
-                std::ptr::copy(
-                    ptr.add(src_offset * type_size),
-                    ptr.add(dst_offset * type_size),
-                    count * type_size,
-                );
-            }
-            return Ok(());
-        }
-
-        // GPU path: use enqueue_copy_buffer via cl_mem handle.
-        // No queue.finish() after enqueue — the in-order command queue guarantees
-        // that subsequent kernel dispatches on the same queue are serialized after
-        // this copy, so explicit synchronization would stall the GPU pipeline.
-        let buf_mem = get_cl_mem(tensor.buffer().as_ref())?;
         let type_size = match tensor.dtype() {
             DType::F32 => 4,
             DType::F16 => 2,
@@ -2479,62 +2454,111 @@ impl Backend for OpenCLBackend {
             }
         };
 
-        let src_byte = src_offset * type_size;
-        let dst_byte = dst_offset * type_size;
-        let byte_count = count * type_size;
+        // Prefer GPU copy (clEnqueueCopyBuffer) to avoid CPU cache pollution on
+        // zero-copy (CL_MEM_ALLOC_HOST_PTR) buffers. This is critical for tensor
+        // partition workloads where CPU memmove on mapped UMA buffers contends with
+        // the CPU-side matmul, causing ~21ms TBT regression.
+        if let Ok(buf_mem) = get_cl_mem(tensor.buffer().as_ref()) {
+            let src_byte = src_offset * type_size;
+            let dst_byte = dst_offset * type_size;
+            let byte_count = count * type_size;
 
-        // OpenCL spec: clEnqueueCopyBuffer with overlapping src/dst regions in the
-        // same buffer is undefined behavior. Detect overlap and use a temp buffer.
-        let no_overlap = (src_byte + byte_count <= dst_byte) || (dst_byte + byte_count <= src_byte);
+            // GPU copy path: use enqueue_copy_buffer via cl_mem handle.
+            // No queue.finish() after enqueue — the in-order command queue guarantees
+            // that subsequent kernel dispatches on the same queue are serialized after
+            // this copy, so explicit synchronization would stall the GPU pipeline.
+            let gpu_result = (|| -> Result<()> {
+                // OpenCL spec: clEnqueueCopyBuffer with overlapping src/dst regions in
+                // the same buffer is undefined behavior. Detect overlap and use a temp
+                // buffer.
+                let no_overlap =
+                    (src_byte + byte_count <= dst_byte) || (dst_byte + byte_count <= src_byte);
 
-        if no_overlap {
-            unsafe {
-                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
-                    &self.queue,
-                    buf_mem,
-                    buf_mem,
-                    src_byte,
-                    dst_byte,
-                    byte_count,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
-        } else {
-            // Overlap: 2-pass copy via temporary GPU buffer.
-            // Safe to drop temp after enqueue: clReleaseMemObject defers deallocation
-            // until pending commands referencing this buffer complete (OpenCL spec).
-            let temp = ocl::Buffer::<u8>::builder()
-                .queue(self.queue.clone())
-                .len(byte_count)
-                .build()?;
-            let temp_mem = temp.as_core();
+                if no_overlap {
+                    unsafe {
+                        ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                            &self.queue,
+                            buf_mem,
+                            buf_mem,
+                            src_byte,
+                            dst_byte,
+                            byte_count,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                    }
+                } else {
+                    // Overlap: 2-pass copy via temporary GPU buffer.
+                    // Safe to drop temp after enqueue: clReleaseMemObject defers
+                    // deallocation until pending commands referencing this buffer
+                    // complete (OpenCL spec).
+                    let temp = ocl::Buffer::<u8>::builder()
+                        .queue(self.queue.clone())
+                        .len(byte_count)
+                        .build()?;
+                    let temp_mem = temp.as_core();
 
-            unsafe {
-                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
-                    &self.queue,
-                    buf_mem,
-                    temp_mem,
-                    src_byte,
-                    0,
-                    byte_count,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-                ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
-                    &self.queue,
-                    temp_mem,
-                    buf_mem,
-                    0,
-                    dst_byte,
-                    byte_count,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
+                    unsafe {
+                        ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                            &self.queue,
+                            buf_mem,
+                            temp_mem,
+                            src_byte,
+                            0,
+                            byte_count,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                        ocl::core::enqueue_copy_buffer::<u8, _, _, _>(
+                            &self.queue,
+                            temp_mem,
+                            buf_mem,
+                            0,
+                            dst_byte,
+                            byte_count,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                    }
+                }
+                Ok(())
+            })();
+
+            match gpu_result {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    // Safety fallback: GPU copy failed, fall through to CPU memmove.
+                    // Use std::sync::Once to emit the warning only once per process.
+                    use std::sync::Once;
+                    static WARN_ONCE: Once = Once::new();
+                    WARN_ONCE.call_once(|| {
+                        eprintln!(
+                            "[buffer_shift] GPU enqueue_copy_buffer failed, \
+                             falling back to CPU memmove: {e}"
+                        );
+                    });
+                }
             }
         }
 
-        Ok(())
+        // CPU fallback: pure-CPU buffers (SharedBuffer) or GPU copy failure.
+        // Safety: as_mut_ptr() returns a valid mutable pointer for CPU-backed
+        // buffers. std::ptr::copy handles overlapping regions correctly (memmove).
+        let ptr = tensor.as_mut_ptr();
+        if !ptr.is_null() {
+            unsafe {
+                std::ptr::copy(
+                    ptr.add(src_offset * type_size),
+                    ptr.add(dst_offset * type_size),
+                    count * type_size,
+                );
+            }
+            return Ok(());
+        }
+
+        Err(anyhow!(
+            "buffer_shift: no GPU cl_mem and no CPU pointer available"
+        ))
     }
 
     fn copy_slice(
