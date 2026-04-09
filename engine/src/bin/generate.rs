@@ -271,6 +271,10 @@ struct Args {
     #[arg(long, default_value = "head")]
     kv_layout: String,
 
+    /// Minimum KV cache size in tokens. Eviction will not reduce cache below this.
+    #[arg(long, default_value_t = 256)]
+    min_kv_cache: usize,
+
     /// Override eviction target_ratio from resilience signals (experiment mode).
     /// When set, all Evict actions will use this ratio instead of the strategy default.
     #[arg(long)]
@@ -2822,6 +2826,7 @@ fn main() -> anyhow::Result<()> {
         // Subsequent evictions use ceiling * ratio as a fixed target to prevent cascade
         // (e.g. cache 33 → 16 → 8 → ... when target_ratio is applied to ever-shrinking pos).
         let mut evict_ceiling: Option<usize> = None;
+        let mut evict_floor_logged: Option<bool> = None;
 
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
@@ -3251,7 +3256,19 @@ fn main() -> anyhow::Result<()> {
                     // it manages its own window logic internally.
                     let (skip_eviction, target_pos) = if effective_ratio > 0.0 {
                         let ceiling = evict_ceiling.get_or_insert(current_pos);
-                        let tgt = (*ceiling as f32 * effective_ratio).max(1.0) as usize;
+                        let tgt_raw = (*ceiling as f32 * effective_ratio).max(1.0) as usize;
+                        let tgt = if tgt_raw < args.min_kv_cache {
+                            if evict_floor_logged.is_none() {
+                                eprintln!(
+                                    "[Eviction] target_pos {} clamped to min_kv_cache {}",
+                                    tgt_raw, args.min_kv_cache
+                                );
+                                evict_floor_logged = Some(true);
+                            }
+                            args.min_kv_cache
+                        } else {
+                            tgt_raw
+                        };
                         // Batch 32 tokens before evicting to amortize memmove overhead
                         // (~14ms/step → ~0.4ms/step on compact_keep_positions).
                         const EVICT_BATCH_HEADROOM: usize = 32;
@@ -3518,6 +3535,7 @@ fn main() -> anyhow::Result<()> {
                     skip_config = None;
                     last_skip_ratio = None;
                     evict_ceiling = None;
+                    evict_floor_logged = None;
                 } else if let Some(ratio) = plan.layer_skip
                     && last_skip_ratio != Some(ratio)
                 {
