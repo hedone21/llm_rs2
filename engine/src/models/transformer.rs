@@ -1506,7 +1506,7 @@ impl TransformerModel {
             f16_program: &ocl_backend.f16_program,
             f16_l4_program: ocl_backend.f16_l4_program.as_ref(),
             simple_ops_program: &ocl_backend.simple_ops_program,
-            flash_attn_f32_f16_program: ocl_backend.flash_attn_f32_f16_program.as_ref(),
+            flash_attn_f32_f16_program: ocl_backend.flash_attn_f32_f16_program_dk64.as_ref(),
             needs_attention_scores: plan_needs_scores,
             layer_bufs,
             x_buf: cl!(x),
