@@ -13,11 +13,95 @@
 
 use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineStatus, SystemSignal};
 use mlua::{Lua, Result as LuaResult, StdLib, Table, Value};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
+
+const RELIEF_DIMS: usize = 6; // gpu, cpu, memory, thermal, latency, main_app_qos
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReliefEntry {
+    relief: [f32; RELIEF_DIMS],
+    observation_count: u32,
+}
+
+#[derive(Debug)]
+struct EwmaReliefTable {
+    entries: HashMap<String, ReliefEntry>,
+    alpha: f32,
+    #[allow(dead_code)]
+    defaults: HashMap<String, Vec<f32>>,
+}
+
+impl EwmaReliefTable {
+    fn new(alpha: f32, defaults: HashMap<String, Vec<f32>>) -> Self {
+        Self {
+            entries: HashMap::new(),
+            alpha,
+            defaults,
+        }
+    }
+
+    fn predict(&self, action: &str) -> [f32; RELIEF_DIMS] {
+        if let Some(entry) = self.entries.get(action) {
+            return entry.relief;
+        }
+        if let Some(default) = self.defaults.get(action) {
+            let mut relief = [0.0f32; RELIEF_DIMS];
+            for (i, v) in default.iter().enumerate().take(RELIEF_DIMS) {
+                relief[i] = *v;
+            }
+            return relief;
+        }
+        [0.0; RELIEF_DIMS]
+    }
+
+    fn observe(&mut self, action: &str, observed: &[f32; RELIEF_DIMS]) {
+        let entry = self
+            .entries
+            .entry(action.to_string())
+            .or_insert_with(|| ReliefEntry {
+                relief: [0.0; RELIEF_DIMS],
+                observation_count: 0,
+            });
+
+        if entry.observation_count == 0 {
+            entry.relief = *observed;
+        } else {
+            let a = self.alpha;
+            for i in 0..RELIEF_DIMS {
+                entry.relief[i] = a * entry.relief[i] + (1.0 - a) * observed[i];
+            }
+        }
+        entry.observation_count += 1;
+    }
+
+    fn observation_count(&self, action: &str) -> u32 {
+        self.entries.get(action).map_or(0, |e| e.observation_count)
+    }
+
+    fn save(&self, path: &Path) -> std::io::Result<()> {
+        let json = serde_json::to_string_pretty(&self.entries)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, json)
+    }
+
+    fn load(path: &Path, alpha: f32, defaults: HashMap<String, Vec<f32>>) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        let entries: HashMap<String, ReliefEntry> = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        Ok(Self {
+            entries,
+            alpha,
+            defaults,
+        })
+    }
+}
 
 /// Lua-based policy strategy.
 ///
@@ -1208,5 +1292,75 @@ mod tests {
         let policy = LuaPolicy::new(script.path().to_str().unwrap()).unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
+    }
+
+    #[test]
+    fn ewma_first_observation_replaces_default() {
+        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        let observed = [0.6, -0.2, 0.0, 0.4, -0.1, 0.0];
+        table.observe("switch_hw", &observed);
+        let predicted = table.predict("switch_hw");
+        assert_eq!(predicted, observed);
+        assert_eq!(table.observation_count("switch_hw"), 1);
+    }
+
+    #[test]
+    fn ewma_converges_toward_observed() {
+        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        table.observe("throttle", &[0.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        for _ in 0..50 {
+            table.observe("throttle", &[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        }
+        let predicted = table.predict("throttle");
+        assert!(
+            (predicted[0] - 0.2).abs() < 0.01,
+            "gpu should converge to 0.2, got {}",
+            predicted[0]
+        );
+    }
+
+    #[test]
+    fn ewma_unknown_action_returns_default_from_config() {
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "switch_hw".to_string(),
+            vec![0.5, -0.3, 0.0, 0.3, -0.1, 0.0],
+        );
+        let table = EwmaReliefTable::new(0.875, defaults);
+        let predicted = table.predict("switch_hw");
+        assert_eq!(predicted, [0.5, -0.3, 0.0, 0.3, -0.1, 0.0]);
+    }
+
+    #[test]
+    fn ewma_unknown_action_no_config_returns_zeros() {
+        let table = EwmaReliefTable::new(0.875, HashMap::new());
+        let predicted = table.predict("nonexistent");
+        assert_eq!(predicted, [0.0; 6]);
+    }
+
+    #[test]
+    fn ewma_save_load_roundtrip() {
+        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        table.observe("switch_hw", &[0.5, -0.3, 0.0, 0.3, -0.1, 0.0]);
+        table.observe("throttle", &[0.0, 0.3, 0.0, 0.2, -0.2, 0.0]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("relief.json");
+
+        table.save(&path).unwrap();
+        let loaded = EwmaReliefTable::load(&path, 0.875, HashMap::new()).unwrap();
+
+        assert_eq!(loaded.predict("switch_hw"), table.predict("switch_hw"));
+        assert_eq!(loaded.predict("throttle"), table.predict("throttle"));
+        assert_eq!(loaded.observation_count("switch_hw"), 1);
+    }
+
+    #[test]
+    fn ewma_negative_relief_handled() {
+        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        table.observe("switch_hw", &[0.5, -0.3, 0.0, 0.3, -0.1, 0.0]);
+        let predicted = table.predict("switch_hw");
+        assert!(predicted[1] < 0.0, "cpu should be negative");
+        assert!(predicted[4] < 0.0, "latency should be negative");
     }
 }
