@@ -255,7 +255,7 @@ fn main() -> anyhow::Result<()> {
 fn create_policy(args: &Args, config: &Config) -> anyhow::Result<Box<dyn PolicyStrategy>> {
     // Lua policy script 지정 시
     if let Some(ref script_path) = args.policy_script {
-        return create_lua_policy(script_path);
+        return create_lua_policy(script_path, config);
     }
 
     // hierarchical feature 없이 script도 없으면 에러
@@ -287,17 +287,23 @@ fn create_policy(args: &Args, config: &Config) -> anyhow::Result<Box<dyn PolicyS
 }
 
 #[cfg(feature = "lua")]
-fn create_lua_policy(script_path: &std::path::Path) -> anyhow::Result<Box<dyn PolicyStrategy>> {
+fn create_lua_policy(
+    script_path: &std::path::Path,
+    config: &Config,
+) -> anyhow::Result<Box<dyn PolicyStrategy>> {
     let path_str = script_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in policy script path"))?;
-    let policy = llm_manager::lua_policy::LuaPolicy::new(path_str)?;
+    let policy = llm_manager::lua_policy::LuaPolicy::new(path_str, config.adaptation.clone())?;
     log::info!("LuaPolicy initialized from {}", path_str);
     Ok(Box::new(policy))
 }
 
 #[cfg(not(feature = "lua"))]
-fn create_lua_policy(_script_path: &std::path::Path) -> anyhow::Result<Box<dyn PolicyStrategy>> {
+fn create_lua_policy(
+    _script_path: &std::path::Path,
+    _config: &Config,
+) -> anyhow::Result<Box<dyn PolicyStrategy>> {
     anyhow::bail!(
         "--policy-script requires the 'lua' feature (compile with: cargo build --features lua)"
     )
