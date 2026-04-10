@@ -1015,6 +1015,17 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //
     // HeadMajor predicate matches the runtime check in `attention_gen` —
     // kv_pos_stride == head_dim and kv_head_stride == capacity * head_dim.
+    //
+    // Implicit invariants (safe today, must be revisited on refactor):
+    //   1. KV dtype is F16 — plan.rs is only invoked for F16 KV caches;
+    //      Q4_0 and KIVI use separate code paths. Add an explicit
+    //      `config.kv_dtype == DType::F16` check if a new KV dtype gets
+    //      plan-routed.
+    //   2. `is_head_major` is reverse-inferred from stride values set by
+    //      the caller. This assumes HeadMajor is the only layout that
+    //      sets `kv_pos_stride = head_dim` and
+    //      `kv_head_stride = capacity * head_dim` (see `attention_gen`
+    //      in mod.rs for the canonical assignment).
     let is_head_major = config.kv_pos_stride == config.head_dim as i32
         && config.kv_head_stride == (config.kv_capacity * config.head_dim) as i32;
     let use_flash = config.head_dim == 64
