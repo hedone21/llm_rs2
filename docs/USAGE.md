@@ -942,26 +942,22 @@ Manager가 런타임에 skip ratio를 조정할 수 있다:
 
 `llm_manager`는 시스템 리소스(메모리, 온도, CPU/GPU 사용률)를 모니터링하여
 LLM 엔진에 지시를 자동으로 전송하는 데몬이다.
+**`--policy-script`가 필수**이며, Lua 스크립트로 정책을 정의한다.
 
-**Unix socket으로 시작**
-
-```bash
-./target/release/llm_manager \
-  --transport unix:/tmp/llm.sock
-```
-
-**TCP으로 시작**
+**TCP으로 시작 (기본 정책 스크립트 사용)**
 
 ```bash
 ./target/release/llm_manager \
+  --policy-script manager/scripts/policy_example.lua \
   --transport tcp:127.0.0.1:19999
 ```
 
-**TOML 설정 파일 사용**
+**설정 파일 + Unix socket**
 
 ```bash
 ./target/release/llm_manager \
-  --config /etc/llm-manager/config.toml \
+  --policy-script manager/scripts/policy_example.lua \
+  --config manager/policy_config.toml \
   --transport unix:/tmp/llm.sock
 ```
 
@@ -969,7 +965,9 @@ LLM 엔진에 지시를 자동으로 전송하는 데몬이다.
 
 ```bash
 # Terminal 1: Manager 시작
-./target/release/llm_manager --transport unix:/tmp/llm.sock
+./target/release/llm_manager \
+  --policy-script manager/scripts/policy_example.lua \
+  --transport unix:/tmp/llm.sock
 
 # Terminal 2: generate (resilience 활성화)
 ./target/release/generate \
@@ -984,54 +982,188 @@ LLM 엔진에 지시를 자동으로 전송하는 데몬이다.
 
 ### 3.2 Lua 정책 스크립팅
 
-내장 정책 대신 Lua 스크립트로 커스텀 정책을 정의한다.
-`lua` feature로 빌드해야 한다.
+Lua 스크립트로 커스텀 정책을 정의한다. **기본 정책 모드**이며, `--policy-script`가 필수이다.
+
+> **참고**: 내장 HierarchicalPolicy (PI Controller + Supervisory + ActionSelector)는
+> deprecated되었다. `--features hierarchical`로 빌드 시에만 사용 가능.
 
 ```bash
-# Lua feature 포함 빌드
-cargo build --release -p llm_manager --features lua
+# 기본 빌드 (lua feature 포함)
+cargo build --release -p llm_manager
 
 ./target/release/llm_manager \
   --policy-script manager/scripts/policy_example.lua \
   --transport tcp:127.0.0.1:19999
 ```
 
-**policy_example.lua 핵심 구조**
+**policy_config.toml로 초기 relief 값 + trigger 임계값 설정**
+
+```bash
+./target/release/llm_manager \
+  --policy-script manager/scripts/policy_example.lua \
+  --config manager/policy_config.toml \
+  --transport tcp:127.0.0.1:19999
+```
+
+#### ctx 구조
+
+Lua `decide(ctx)` 함수에 전달되는 `ctx` 테이블:
+
+| 필드 | 내용 | 예시 |
+|------|------|------|
+| `ctx.engine` | Engine heartbeat 상태 | `ctx.engine.throughput`, `ctx.engine.phase` |
+| `ctx.active` | 현재 활성 액션 목록 | `{"kv_evict_h2o"}` |
+| `ctx.signal` | SystemSignal 원시값 | `ctx.signal.memory.available` |
+| `ctx.coef` | 동적 계수 (핵심) | pressure, trigger, relief |
+
+#### ctx.coef 상세
 
 ```lua
-local ema_temp = nil
+ctx.coef = {
+    pressure = {            -- 6D 정규화 압력 (0.0~1.0)
+        gpu = 0.82,         -- GPU 사용률
+        cpu = 0.45,         -- CPU 사용률 (big cluster)
+        memory = 0.25,      -- 메모리 사용률 (1 - available/total)
+        thermal = 0.41,     -- 열 (temp_safe~temp_critical 정규화)
+        latency = 0.35,     -- TBT baseline 대비 열화율
+        main_app = 0.0,     -- (미래 확장용)
+    },
+    trigger = {             -- 경합 증거 (hysteresis 적용)
+        tbt_degraded = true,   -- TBT 30%↑ 시 true, 10%↓ 시 false
+        mem_low = false,       -- 메모리 80%↑ 시 true, 60%↓ 시 false
+        temp_high = false,     -- 온도 70%↑ 시 true, 50%↓ 시 false
+    },
+    relief = {              -- per-action 학습된 relief (EWMA)
+        switch_hw = { gpu=0.5, cpu=-0.3, mem=0.0, therm=0.3, lat=-0.1, qos=0.0 },
+        kv_evict_h2o = { gpu=0.1, cpu=0.0, mem=0.4, therm=0.1, lat=0.0, qos=0.0 },
+        throttle = { gpu=0.0, cpu=0.3, mem=0.0, therm=0.2, lat=-0.2, qos=0.0 },
+        -- ... (10개 액션)
+    },
+}
+```
 
+- **pressure**: Rust가 SystemSignal에서 계산한 정규화 압력. GPU/CPU가 분리되어 `switch_hw`의 트레이드오프를 판단할 수 있다.
+- **trigger**: 하드코딩된 임계값이 아니라 hysteresis(enter/exit 분리)로 판정. 3개 중 하나라도 true이면 경합이 발생한 것.
+- **relief**: 각 액션이 얼마나 압력을 줄이는지. EWMA로 런타임에 학습되며, 초기값은 config에서 설정. 음수는 해당 도메인에 부하 증가를 의미 (예: `switch_hw`의 `cpu=-0.3`).
+
+#### policy_example.lua (기본 정책)
+
+```lua
 function decide(ctx)
-    local actions = {}
-    local temp = sys.thermal(0)
-    local mem = sys.meminfo()
+    local c = ctx.coef
+    local t = c.trigger
 
-    -- EMA 온도
-    if ema_temp == nil then ema_temp = temp
-    else ema_temp = 0.2 * temp + 0.8 * ema_temp
+    -- 경합 증거 없으면 개입하지 않음
+    if not t.tbt_degraded and not t.mem_low and not t.temp_high then
+        if #ctx.active > 0 then
+            local p = c.pressure
+            if p.gpu < 0.3 and p.memory < 0.3 and p.thermal < 0.3 then
+                return {{type = "restore_defaults"}}
+            end
+        end
+        return {}
     end
 
-    -- 메모리 15% 미만 → H2O eviction
-    if mem.total > 0 and (mem.available / mem.total) < 0.15 then
-        table.insert(actions, {type = "kv_evict_h2o", keep_ratio = 0.5})
-        return actions
+    -- 최고 압력 도메인 → relief 최대 액션 선택
+    local p = c.pressure
+    local domains = {gpu = p.gpu, cpu = p.cpu, memory = p.memory, thermal = p.thermal}
+    local max_domain, max_val = nil, 0
+    for k, v in pairs(domains) do
+        if v > max_val then max_domain, max_val = k, v end
     end
 
-    -- 온도 42°C 초과 → TBT 200ms 제한
-    if ema_temp > 42 then
-        table.insert(actions, {type = "set_target_tbt", target_ms = 200})
-        return actions
-    end
+    -- relief 테이블 키 매핑
+    local domain_key = max_domain
+    if domain_key == "memory" then domain_key = "mem" end
+    if domain_key == "thermal" then domain_key = "therm" end
 
-    -- 조건 회복 → 기본값 복원
-    if #ctx.active > 0 and ema_temp < 38 then
-        if mem.total > 0 and (mem.available / mem.total) > 0.3 then
-            table.insert(actions, {type = "restore_defaults"})
+    -- latency 예산 내에서 최적 액션 선택
+    local best, best_val = nil, -999
+    for action, r in pairs(c.relief) do
+        local rv = r[domain_key] or 0
+        if rv > best_val and (r.lat or 0) >= -0.15 then
+            best, best_val = action, rv
         end
     end
 
-    return actions
+    if best and best_val > 0 then
+        local cmd = {type = best}
+        -- 액션별 기본 파라미터
+        if best == "kv_evict_h2o" or best == "kv_evict_sliding" then
+            cmd.keep_ratio = 0.5
+        elseif best == "throttle" then cmd.delay_ms = 50
+        elseif best == "switch_hw" then cmd.device = "cpu"
+        end
+        return {cmd}
+    end
+    return {}
 end
+```
+
+#### 커스텀 정책 작성 팁
+
+- **trigger만 보면 된다**: `ctx.coef.trigger`의 3개 bool로 "개입할지" 결정
+- **pressure로 "어디가 문제인지" 판단**: 6D 중 가장 높은 도메인이 병목
+- **relief로 "뭘 할지" 결정**: 병목 도메인의 relief가 가장 큰 액션 선택
+- **음수 relief 주의**: `switch_hw`는 GPU를 해방하지만 CPU 부하 증가 (`cpu=-0.3`)
+- **relief는 자동 학습**: 처음에는 config의 초기값 사용, 액션 실행 후 3초 뒤 실제 relief 측정하여 EWMA 갱신
+
+#### EWMA Relief 학습 동작
+
+```
+1. Lua가 액션 선택 → Manager가 Engine에 전달
+2. 실행 전 pressure 스냅샷 (before)
+3. 3초 대기 (settling time)
+4. 실행 후 pressure 스냅샷 (after)
+5. observed_relief = before - after
+6. relief_table[action] = 0.875 × 이전값 + 0.125 × observed
+7. 다음 decide()에서 ctx.coef.relief에 업데이트된 값 노출
+```
+
+- 첫 관측 시 observed 값으로 직접 교체 (EWMA 아님)
+- 복수 액션 동시 적용 시 개별 EWMA 업데이트 건너뜀
+- `relief_table_path` config 설정 시 세션 종료 시 JSON으로 저장, 다음 세션에서 로드
+
+#### sys.* 헬퍼 (보조)
+
+`ctx.coef`와 별개로, Lua 스크립트에서 직접 sysfs를 읽을 수 있다:
+
+| 함수 | 반환 | 용도 |
+|------|------|------|
+| `sys.meminfo()` | `{total, available, free}` (KB) | 메모리 상태 |
+| `sys.thermal(zone)` | `float` (°C) | 온도 (zone 번호 지정) |
+| `sys.gpu_busy()` | `int` (0-100) | GPU 사용률 (Adreno) |
+| `sys.gpu_freq()` | `int` (Hz) | GPU 주파수 |
+| `sys.cpu_freq(n)` | `int` (KHz) | CPU 주파수 (코어 번호) |
+| `sys.foreground_fps(pkg)` | `float\|nil` | 포그라운드 앱 FPS |
+| `sys.read(path)` | `string` | sysfs 파일 읽기 |
+
+#### policy_config.toml 설정
+
+```toml
+[adaptation]
+ewma_alpha = 0.875              # EWMA 평활 인수 (7/8, Jacobson TCP RTT)
+relief_table_path = ""          # 학습 테이블 저장 경로 (빈 문자열 = 비활성화)
+temp_safe_c = 35.0              # 열 정규화 안전 온도 (°C)
+temp_critical_c = 50.0          # 열 정규화 임계 온도 (°C)
+
+[adaptation.trigger]
+tbt_enter = 0.30                # TBT 30% 악화 시 trigger 진입
+tbt_exit = 0.10                 # TBT 10% 이내로 회복 시 trigger 해제
+tbt_warmup_tokens = 20          # baseline 설정까지의 토큰 수
+mem_enter = 0.80                # 메모리 80% 사용 시 진입
+mem_exit = 0.60                 # 60% 미만 시 해제
+temp_enter = 0.70               # 열 정규화 70% 시 진입
+temp_exit = 0.50                # 50% 미만 시 해제
+
+[adaptation.default_relief]
+# [gpu, cpu, memory, thermal, latency, main_app_qos]
+switch_hw = [0.5, -0.3, 0.0, 0.3, -0.1, 0.0]
+kv_evict_h2o = [0.1, 0.0, 0.4, 0.1, 0.0, 0.0]
+throttle = [0.0, 0.3, 0.0, 0.2, -0.2, 0.0]
+layer_skip = [0.2, 0.1, 0.0, 0.1, -0.1, 0.0]
+kv_quant_dynamic = [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+# ... (전체 목록: manager/policy_config.toml 참조)
 ```
 
 **지원 action 타입**
