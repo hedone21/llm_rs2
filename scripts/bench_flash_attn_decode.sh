@@ -19,14 +19,29 @@ set -euo pipefail
 # llama-bench's markdown output without "multibyte conversion failure".
 export LC_ALL=C
 
-OUTDIR="results/data/flash_attn_decode"
+# Preflight: require adb and a connected device.
+command -v adb >/dev/null 2>&1 || {
+  echo "[bench] adb not on PATH" >&2
+  exit 2
+}
+adb get-state 1>/dev/null 2>&1 || {
+  echo "[bench] no device connected (adb get-state failed)" >&2
+  exit 2
+}
+
+# Resolve OUTDIR relative to the script's location (not the shell's cwd)
+# so the script works from any working directory.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+OUTDIR="$REPO_ROOT/results/data/flash_attn_decode"
 mkdir -p "$OUTDIR"
 
-TOLERANCE_PCT=5
-# 30s cooldown between runs — 15s was enough for a first cold run but the last
-# context drifted to ~47ms on a warm device (thermal carry-over from the prior
-# sweep). Doubling the cooldown keeps the sweep reproducible.
-COOLDOWN_SEC=30
+# Tolerances: llm.rs TBT <= llama.cpp TBT * (1 + TOLERANCE_PCT/100)
+TOLERANCE_PCT="${TOLERANCE_PCT:-5}"
+# Cooldown between adb runs. Empirically 15s was not enough on a warm
+# device — raise to 30s to avoid thermal drift in long_prompt. Override
+# with COOLDOWN_SEC=<n> for faster local iteration.
+COOLDOWN_SEC="${COOLDOWN_SEC:-30}"
 
 tbt_llm_rs() {
   local prompt_file="$1"
@@ -75,7 +90,7 @@ for i in 0 1 2 3; do
   depth="${DEPTHS[$i]}"
   echo "[bench] $f (approx seq ${depth})..."
 
-  ours=$(tbt_llm_rs "$f")
+  ours=$(tbt_llm_rs "$f") || ours=""
   if [ -z "$ours" ]; then
     echo "[FAIL] $f: failed to parse llm.rs TBT" | tee -a "$OUTDIR/after-task4.txt"
     fail=1
