@@ -1,0 +1,8 @@
+# Fri Apr 10 22:42:21 KST 2026 — flash attention decode benchmark vs llama.cpp CPU
+# Device: Samsung Galaxy S25 (Adreno 830)
+# Tolerance: llm.rs TBT <= llama.cpp TBT * 1.05
+
+[ OK ] p100.txt depth=170 llm_rs=40.39ms llama_cpp=40.06ms limit=42.06ms
+[ OK ] p300.txt depth=374 llm_rs=41.07ms llama_cpp=40.62ms limit=42.65ms
+[ OK ] p600.txt depth=676 llm_rs=41.70ms llama_cpp=43.12ms limit=45.28ms
+[ OK ] long_prompt.txt depth=720 llm_rs=41.86ms llama_cpp=47.48ms limit=49.85ms
