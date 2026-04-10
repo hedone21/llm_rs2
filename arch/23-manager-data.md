@@ -10,8 +10,9 @@
 
 Config 시스템은 2계층 구조를 따른다:
 
-1. **Top-level `Config`** -- 모니터 4종 + 외부 모니터 + 정책 엔진을 선택적으로 구성
-2. **PolicyConfig** -- PI Controller, Supervisory, Selector, Relief Model, Actions, Exclusion Groups의 6개 하위 설정
+1. **Top-level `Config`** -- 모니터 4종 + 외부 모니터 + 적응 설정 + (선택) 정책 엔진을 구성
+2. **AdaptationConfig** -- LuaPolicy 적응 엔진 설정 (EWMA, triggers, relief defaults) (**신규 2026-04**)
+3. **PolicyConfig** -- PI Controller, Supervisory, Selector, Relief Model, Actions, Exclusion Groups의 6개 하위 설정 (**`#[cfg(feature = "hierarchical")]` 뒤로 이동**)
 
 모든 모니터 섹션은 `Option<T>` 래핑이며, 미지정 시 `None` (비활성). 정책도 `Option<PolicyConfig>`. Config 전체는 `#[serde(default)]`로 부분 TOML 파일 허용.
 
@@ -24,10 +25,29 @@ classDiagram
         +compute: Option~ComputeMonitorConfig~
         +energy: Option~EnergyMonitorConfig~
         +external: Option~ExternalMonitorConfig~
-        +policy: Option~PolicyConfig~
+        +adaptation: AdaptationConfig
+        +policy: Option~PolicyConfig~ [hierarchical]
         +from_file(path) Result~Config~
     }
+    class AdaptationConfig {
+        +ewma_alpha: f32
+        +relief_table_path: String
+        +temp_safe_c: f32
+        +temp_critical_c: f32
+        +trigger: TriggerConfig
+        +default_relief: HashMap~String, Vec~f32~~
+    }
+    class TriggerConfig {
+        +tbt_enter: f64
+        +tbt_exit: f64
+        +tbt_warmup_tokens: u32
+        +mem_enter: f64
+        +mem_exit: f64
+        +temp_enter: f64
+        +temp_exit: f64
+    }
     class PolicyConfig {
+        <<hierarchical feature>>
         +pi_controller: PiControllerConfig
         +supervisory: SupervisoryConfig
         +selector: SelectorConfig
@@ -35,7 +55,9 @@ classDiagram
         +actions: HashMap~String, ActionConfig~
         +exclusion_groups: HashMap~String, Vec~String~~
     }
-    Config --> PolicyConfig
+    Config --> AdaptationConfig
+    AdaptationConfig --> TriggerConfig
+    Config --> PolicyConfig : [hierarchical]
     PolicyConfig --> PiControllerConfig
     PolicyConfig --> SupervisoryConfig
     PolicyConfig --> SelectorConfig
@@ -55,7 +77,10 @@ pub struct Config {
     pub compute: Option<ComputeMonitorConfig>,
     pub energy: Option<EnergyMonitorConfig>,
     pub external: Option<ExternalMonitorConfig>,
-    pub policy: Option<PolicyConfig>,
+    pub adaptation: AdaptationConfig,          // 신규 (2026-04): LuaPolicy 적응 설정
+
+    #[cfg(feature = "hierarchical")]
+    pub policy: Option<PolicyConfig>,          // DEPRECATED
 }
 
 impl Config {
@@ -138,7 +163,41 @@ impl Config {
 | `enabled` | bool | false | MGR-DAT-026 |
 | `transport` | String | "stdin" | MGR-DAT-026 |
 
-#### `[policy.pi_controller]` -- PiControllerConfig
+#### `[adaptation]` -- AdaptationConfig (신규 2026-04, LuaPolicy)
+
+| TOML 키 | 타입 | 기본값 | 설명 |
+|---------|------|--------|------|
+| `ewma_alpha` | f32 | 0.875 | EWMA 평활 계수 (Jacobson TCP RTT) |
+| `relief_table_path` | String | "" (비활성) | Relief table JSON 저장/복원 경로 |
+| `temp_safe_c` | f32 | 35.0 | Thermal 정규화 하한 (Celsius) |
+| `temp_critical_c` | f32 | 50.0 | Thermal 정규화 상한 (Celsius) |
+
+#### `[adaptation.trigger]` -- TriggerConfig (신규 2026-04)
+
+| TOML 키 | 타입 | 기본값 | 설명 |
+|---------|------|--------|------|
+| `tbt_enter` | f64 | 0.30 | TBT degradation trigger 진입 (baseline 대비 30% 악화) |
+| `tbt_exit` | f64 | 0.10 | TBT degradation trigger 해제 |
+| `tbt_warmup_tokens` | u32 | 20 | Baseline 확정 전 warmup 토큰 수 |
+| `mem_enter` | f64 | 0.80 | Memory pressure trigger 진입 |
+| `mem_exit` | f64 | 0.60 | Memory pressure trigger 해제 |
+| `temp_enter` | f64 | 0.70 | Temperature trigger 진입 (정규화 값) |
+| `temp_exit` | f64 | 0.50 | Temperature trigger 해제 |
+
+#### `[adaptation.default_relief]` -- Per-Action 6D Default Relief
+
+키는 액션 이름 (snake_case), 값은 6-element 배열 `[gpu, cpu, memory, thermal, latency, main_app_qos]`.
+
+```toml
+[adaptation.default_relief]
+switch_hw = [0.3, 0.0, 0.0, 0.2, -0.1, 0.0]
+throttle = [0.2, 0.1, 0.0, 0.15, -0.2, 0.0]
+kv_evict_sliding = [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+```
+
+---
+
+#### `[policy.pi_controller]` -- PiControllerConfig **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 | TOML 키 | 타입 | 기본값 | spec ID |
 |---------|------|--------|---------|
@@ -154,7 +213,7 @@ impl Config {
 | `integral_clamp` | f32 | 2.0 | MGR-DAT-031 |
 | `memory_gain_zones` | Vec\<GainZone\> | [] | MGR-DAT-031 |
 
-#### `[policy.supervisory]` -- SupervisoryConfig
+#### `[policy.supervisory]` -- SupervisoryConfig **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 | TOML 키 | 타입 | 기본값 | spec ID |
 |---------|------|--------|---------|
@@ -164,14 +223,14 @@ impl Config {
 | `critical_release` | f32 | 0.50 | MGR-DAT-032 |
 | `hold_time_secs` | f32 | 4.0 | MGR-DAT-032 |
 
-#### `[policy.selector]` -- SelectorConfig
+#### `[policy.selector]` -- SelectorConfig **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 | TOML 키 | 타입 | 기본값 | spec ID |
 |---------|------|--------|---------|
 | `latency_budget` | f32 | 0.5 | MGR-DAT-033 |
 | `algorithm` | String | "exhaustive" | MGR-DAT-033 |
 
-#### `[policy.relief_model]` -- ReliefModelConfig
+#### `[policy.relief_model]` -- ReliefModelConfig **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 | TOML 키 | 타입 | 기본값 | spec ID |
 |---------|------|--------|---------|
@@ -179,7 +238,7 @@ impl Config {
 | `prior_weight` | u32 | 5 | MGR-DAT-034 |
 | `storage_dir` | String | "~/.llm_rs/models" | MGR-DAT-034 |
 
-#### `[policy.actions.<name>]` -- ActionConfig
+#### `[policy.actions.<name>]` -- ActionConfig **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 | TOML 키 | 타입 | 기본값 | spec ID |
 |---------|------|--------|---------|
@@ -187,7 +246,7 @@ impl Config {
 | `reversible` | bool | false | MGR-DAT-035 |
 | `default_cost` | f32 | 1.0 | MGR-DAT-035 |
 
-#### `[policy.exclusion_groups]`
+#### `[policy.exclusion_groups]` **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 | TOML 키 | 타입 | 기본값 | spec ID |
 |---------|------|--------|---------|
@@ -262,7 +321,7 @@ flowchart LR
     CompMon[ComputeMonitor<br>/proc/stat] --> |SystemSignal| Bus
     EneMon[EnergyMonitor<br>/sys/class/power_supply/] --> |SystemSignal| Bus
     ExtMon[ExternalMonitor<br>stdin/unix socket] --> |SystemSignal| Bus
-    Bus --> PolicyEngine[HierarchicalPolicy]
+    Bus --> PolicyEngine["LuaPolicy (기본)<br/>또는 HierarchicalPolicy [hierarchical]"]
     PolicyEngine --> |EngineDirective| Emitter[Emitter]
 ```
 
@@ -308,11 +367,15 @@ pub trait Monitor: Send + 'static {
 
 ### 설계 결정
 
-Manager 정책 엔진의 핵심 타입은 `manager/src/types.rs`에 집중되어 있다. 이 타입들은 PI Controller → Supervisory → Selector → Directive 생성 파이프라인 전체에서 사용된다.
+Manager 정책 엔진의 핵심 타입은 두 계층으로 분리되어 있다:
 
-### ActionId 및 도메인 매핑
+- **공용**: `OperatingMode` (`manager/src/types.rs`) — LuaPolicy와 HierarchicalPolicy 모두 사용
+- **HierarchicalPolicy 전용** (`#[cfg(feature = "hierarchical")]`): `ActionId`, `PressureVector`, `ReliefVector`, `FeatureVector` 등 (`manager/src/types.rs` 내 `hierarchical_types` 모듈)
+- **LuaPolicy 전용**: `Pressure6D`, `SignalState`, `TriggerState`, `ReliefEntry` 등 (`manager/src/lua_policy.rs` 내 비공개 타입)
 
-**`ActionId`** (`manager/src/types.rs`)
+### ActionId 및 도메인 매핑 **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+**`ActionId`** (`manager/src/types.rs`, `hierarchical_types` 모듈 내)
 
 ```rust
 #[serde(rename_all = "snake_case")]
@@ -330,7 +393,9 @@ impl ActionId {
 
 - `primary_domain()` 매핑: SwitchHw/Throttle/LayerSkip -> `Domain::Compute`, 나머지 -> `Domain::Memory` (INV-045)
 
-### Pressure / Relief 벡터
+### Pressure / Relief 벡터 **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> LuaPolicy는 `Pressure6D`(6D)와 `[f32; 6]` relief 배열을 사용한다 (§4a 참조).
 
 ```rust
 pub struct PressureVector { pub compute: f32, pub memory: f32, pub thermal: f32 }
@@ -346,7 +411,7 @@ impl Add for ReliefVector { ... }
 impl AddAssign for ReliefVector { ... }
 ```
 
-### FeatureVector (Relief Estimator 입력)
+### FeatureVector (Relief Estimator 입력) **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 ```rust
 pub const FEATURE_DIM: usize = 13;
@@ -357,20 +422,82 @@ pub struct FeatureVector { pub values: [f32; FEATURE_DIM] }
 
 ### Action 관련 타입
 
-| 타입 | 역할 | 위치 |
-|------|------|------|
-| `ActionKind { Lossless, Lossy }` | 품질 영향 분류 | `types.rs` |
-| `Domain { Compute, Memory, Thermal }` | 압력 도메인 (내부 전용, serde 없음) | `types.rs` |
-| `OperatingMode { Normal, Warning, Critical }` | 시스템 운영 모드 (PartialOrd/Ord) | `types.rs` |
-| `ActionMeta { id, kind, reversible, param_range, exclusion_group, default_cost }` | 액션 메타데이터 | `types.rs` |
-| `ParamRange { param_name, min, max }` | 파라미터 범위 (Serialize/Deserialize) | `types.rs` |
-| `ActionParams { values: HashMap<String, f32> }` | 파라미터 집합 | `types.rs` |
-| `ActionCommand { action, operation }` | Selector 출력 | `types.rs` |
-| `Operation { Apply(ActionParams), Release }` | 적용/해제 | `types.rs` |
+| 타입 | 역할 | 위치 | Feature |
+|------|------|------|---------|
+| `OperatingMode { Normal, Warning, Critical }` | 시스템 운영 모드 (PartialOrd/Ord) | `types.rs` | 공용 |
+| `ActionKind { Lossless, Lossy }` | 품질 영향 분류 | `types.rs` | hierarchical |
+| `Domain { Compute, Memory, Thermal }` | 압력 도메인 (내부 전용, serde 없음) | `types.rs` | hierarchical |
+| `ActionMeta { id, kind, reversible, param_range, exclusion_group, default_cost }` | 액션 메타데이터 | `types.rs` | hierarchical |
+| `ParamRange { param_name, min, max }` | 파라미터 범위 (Serialize/Deserialize) | `types.rs` | hierarchical |
+| `ActionParams { values: HashMap<String, f32> }` | 파라미터 집합 | `types.rs` | hierarchical |
+| `ActionCommand { action, operation }` | Selector 출력 | `types.rs` | hierarchical |
+| `Operation { Apply(ActionParams), Release }` | 적용/해제 | `types.rs` | hierarchical |
+
+### 4a. LuaPolicy 전용 데이터 타입 (신규 2026-04)
+
+**파일**: `manager/src/lua_policy.rs` (비공개 타입)
+
+#### Pressure6D
+
+```rust
+struct Pressure6D {
+    gpu: f32,       // GPU 사용률 (0~1)
+    cpu: f32,       // CPU 사용률 (0~1)
+    memory: f32,    // 메모리 사용률 (0~1)
+    thermal: f32,   // 정규화 온도 (0~1)
+    latency: f32,   // TBT degradation ratio (0~inf)
+    main_app: f32,  // 예약 (0.0)
+}
+```
+
+HierarchicalPolicy의 `PressureVector`(3D: compute, memory, thermal)를 6D로 확장. GPU/CPU를 분리하고 latency/main_app 차원을 추가하여 Lua 스크립트에 세밀한 압력 정보를 제공한다.
+
+#### TriggerState
+
+```rust
+struct TriggerState {
+    tbt_degraded: bool,  // TBT baseline 대비 악화
+    mem_low: bool,       // 메모리 부족
+    temp_high: bool,     // 온도 과열
+}
+```
+
+#### ReliefEntry (EWMA 학습 데이터)
+
+```rust
+struct ReliefEntry {
+    relief: [f32; 6],         // 6D relief vector (RELIEF_DIMS)
+    observation_count: u32,   // 관측 횟수
+}
+```
+
+#### AdaptationConfig / TriggerConfig
+
+```rust
+// manager/src/config.rs
+pub struct AdaptationConfig {
+    pub ewma_alpha: f32,                              // default 0.875
+    pub relief_table_path: String,                    // default ""
+    pub temp_safe_c: f32,                             // default 35.0
+    pub temp_critical_c: f32,                         // default 50.0
+    pub trigger: TriggerConfig,
+    pub default_relief: HashMap<String, Vec<f32>>,    // per-action 6D prior
+}
+
+pub struct TriggerConfig {
+    pub tbt_enter: f64,          // default 0.30
+    pub tbt_exit: f64,           // default 0.10
+    pub tbt_warmup_tokens: u32,  // default 20
+    pub mem_enter: f64,          // default 0.80
+    pub mem_exit: f64,           // default 0.60
+    pub temp_enter: f64,         // default 0.70
+    pub temp_exit: f64,          // default 0.50
+}
+```
 
 ---
 
-## 5. ActionRegistry
+## 5. ActionRegistry **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
 
 ### 설계 결정
 
@@ -421,6 +548,9 @@ impl ActionRegistry {
 | 항목 | 스펙 | 코드 | 영향 |
 |------|------|------|------|
 | SystemSignal level 필드 | raw 전용 (level 없음) | 모든 variant에 `level: Level` 포함 | Monitor가 Level 산출 담당. 스펙 갱신 권장 |
-| ActionId 8종 | 8종 (KvMergeD2o 포함) | 8종 (KvMergeD2o 구현 완료) | 스펙-코드 일치 |
+| ActionId 8종 | 8종 (KvMergeD2o 포함) | 8종 (KvMergeD2o 구현 완료, hierarchical 뒤) | 스펙-코드 일치 |
 | EnergyMonitor hysteresis | 하드코딩 2.0 | Config 필드 없음, 코드 내 고정값 | 일치 (하드코딩 의도) |
-| default_relief 8종 | 8종 (KvMergeD2o 포함) | 8종 (KvMergeD2o 포함) | 스펙-코드 일치 |
+| default_relief 8종 | 8종 (KvMergeD2o 포함) | 8종 (KvMergeD2o 포함, hierarchical 뒤) | 스펙-코드 일치 |
+| ReliefVector 4D | 4D (compute, memory, thermal, latency) | LuaPolicy: 6D `[f32; 6]` (gpu, cpu, memory, thermal, latency, main_app) | LuaPolicy 전용 변경. 기존 4D는 hierarchical 뒤에 유지 |
+| 정책 기본값 | HierarchicalPolicy 기본 | LuaPolicy 기본 (`lua` feature default) | 2026-04 변경. hierarchical은 opt-in feature |
+| PressureVector 3D | 3D (compute, memory, thermal) | LuaPolicy: `Pressure6D` 6D (gpu/cpu 분리 + latency + main_app) | LuaPolicy 전용 변경 |

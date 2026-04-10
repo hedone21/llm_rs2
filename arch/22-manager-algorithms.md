@@ -5,7 +5,9 @@
 
 ---
 
-## 1. PiController (MGR-ALG-010~016, INV-030~031)
+## 1. PiController (MGR-ALG-010~016, INV-030~031) **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> **DEPRECATED (2026-04)**: `hierarchical` feature flag 뒤로 이동. LuaPolicy는 PI Controller 대신 `SignalState.pressure_with_thermal()`로 직접 pressure를 계산한다 (§8 참조).
 
 **파일**: `manager/src/pi_controller.rs`
 
@@ -110,7 +112,9 @@ flowchart TD
 
 ---
 
-## 2. SupervisoryLayer (MGR-ALG-020~024, INV-032~036)
+## 2. SupervisoryLayer (MGR-ALG-020~024, INV-032~036) **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> **DEPRECATED (2026-04)**: `hierarchical` feature flag 뒤로 이동. LuaPolicy는 `TriggerEngine`(3 triggers + hysteresis)으로 대체한다 (§9 참조).
 
 **파일**: `manager/src/supervisory.rs`
 
@@ -207,7 +211,9 @@ let needs_action = match mode {
 
 ---
 
-## 3. ActionSelector (MGR-ALG-030~037, INV-037~045)
+## 3. ActionSelector (MGR-ALG-030~037, INV-037~045) **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> **DEPRECATED (2026-04)**: `hierarchical` feature flag 뒤로 이동. LuaPolicy는 Lua 스크립트 내에서 직접 액션을 선택한다.
 
 **파일**: `manager/src/selector.rs`
 
@@ -335,7 +341,9 @@ flowchart TD
 
 ---
 
-## 4. ReliefEstimator / OnlineLinearEstimator (MGR-ALG-040~047, INV-046~049)
+## 4. ReliefEstimator / OnlineLinearEstimator (MGR-ALG-040~047, INV-046~049) **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> **DEPRECATED (2026-04)**: `hierarchical` feature flag 뒤로 이동. LuaPolicy는 `EwmaReliefTable`(6D EWMA)로 대체한다 (§10 참조).
 
 **파일**: `manager/src/relief/mod.rs` (trait), `manager/src/relief/linear.rs` (구현체)
 
@@ -438,7 +446,9 @@ flowchart TD
 
 ---
 
-## 5. 데이터 타입 (MGR-ALG-050~053, INV-045, INV-050)
+## 5. 데이터 타입 (MGR-ALG-050~053, INV-045, INV-050) **[DEPRECATED: `#[cfg(feature = "hierarchical")]` 일부]**
+
+> **일부 DEPRECATED (2026-04)**: `PressureVector`, `ReliefVector`, `FeatureVector`, `ActionId`, `ActionMeta`, `ParamRange`, `ActionParams`, `ActionCommand`, `Operation`은 `hierarchical` feature flag 뒤로 이동. `OperatingMode`는 공용 유지.
 
 **파일**: `manager/src/types.rs`
 
@@ -542,7 +552,9 @@ impl ActionId {
 
 ---
 
-## 6. HierarchicalPolicy 오케스트레이션 (MGR-ALG-060~072)
+## 6. HierarchicalPolicy 오케스트레이션 (MGR-ALG-060~072) **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> **DEPRECATED (2026-04)**: `hierarchical` feature flag 뒤로 이동. LuaPolicy가 기본 정책.
 
 **파일**: `manager/src/pipeline.rs`
 
@@ -664,7 +676,9 @@ Heartbeat 메시지에서만 FeatureVector를 갱신한다. Capability/Response 
 
 ---
 
-## 7. ActionRegistry
+## 7. ActionRegistry **[DEPRECATED: `#[cfg(feature = "hierarchical")]`]**
+
+> **DEPRECATED (2026-04)**: `hierarchical` feature flag 뒤로 이동.
 
 **파일**: `manager/src/action_registry.rs`
 
@@ -694,7 +708,9 @@ impl ActionRegistry {
 
 ---
 
-## 8. Config 종합
+## 8. Config 종합 **[DEPRECATED 섹션 — hierarchical feature 전용]**
+
+> 아래 config 키들은 `hierarchical` feature 활성 시에만 유효하다. LuaPolicy의 config는 §12 참조.
 
 | config 키 | 타입 | 기본값 | spec 근거 |
 |-----------|------|--------|-----------|
@@ -724,6 +740,8 @@ impl ActionRegistry {
 
 ## 9. 주요 상수
 
+### 9.1 HierarchicalPolicy 상수 [DEPRECATED: `#[cfg(feature = "hierarchical")]`]
+
 | 상수 | 값 | 코드 위치 | spec 근거 |
 |------|---|----------|-----------|
 | `OBSERVATION_DELAY_SECS` | 3.0 | `manager/src/pipeline.rs` | MGR-ALG-061 |
@@ -732,6 +750,13 @@ impl ActionRegistry {
 | `lr_bias` | 0.1 | `manager/src/relief/linear.rs` | MGR-ALG-044 |
 | `P_init` | 100.0 * I | `manager/src/relief/linear.rs` | MGR-ALG-045 (INV-048) |
 | `SEQ_COUNTER` | AtomicU64, 1부터 | `manager/src/pipeline.rs` | (내부 구현) |
+
+### 9.2 LuaPolicy 상수
+
+| 상수 | 값 | 코드 위치 | 설명 |
+|------|---|----------|------|
+| `RELIEF_DIMS` | 6 | `manager/src/lua_policy.rs` | 6D relief: gpu, cpu, memory, thermal, latency, main_app_qos |
+| `OBSERVATION_DELAY_SECS` | 3.0 | `manager/src/lua_policy.rs` | 관측 settling 시간 |
 
 ---
 
@@ -747,10 +772,12 @@ impl ActionRegistry {
 
 ## 11. 컴포넌트 의존성 다이어그램
 
+### 11.1 HierarchicalPolicy [DEPRECATED]
+
 ```mermaid
 flowchart LR
     subgraph pipeline.rs
-        HP[HierarchicalPolicy]
+        HP["HierarchicalPolicy<br/>[DEPRECATED]"]
     end
 
     subgraph pi_controller.rs
@@ -820,3 +847,199 @@ flowchart LR
     PI --> PIC
     SL --> SC
 ```
+
+### 11.2 LuaPolicy (기본 정책)
+
+```mermaid
+flowchart LR
+    subgraph lua_policy.rs
+        LP[LuaPolicy]
+        SS[SignalState]
+        P6D[Pressure6D]
+        TE[TriggerEngine]
+        TBT[TbtTracker]
+        ERT[EwmaReliefTable]
+        OC[ObservationContext]
+    end
+
+    subgraph config.rs
+        AC[AdaptationConfig]
+        TC[TriggerConfig]
+    end
+
+    subgraph pipeline.rs
+        PS["trait PolicyStrategy"]
+    end
+
+    LP -.->|implements| PS
+    LP --> SS
+    LP --> TE
+    LP --> ERT
+    LP --> OC
+    LP --> AC
+
+    SS --> P6D
+    TE --> TBT
+    TE --> TC
+    OC --> P6D
+    OC --> ERT
+```
+
+---
+
+## 12. LuaPolicy 적응 알고리즘 (신규 2026-04)
+
+> LuaPolicy의 Rust 측 적응 엔진 알고리즘. HierarchicalPolicy의 PI+Supervisory+Selector+RLS를 대체한다.
+
+### 12.1 Pressure6D 직접 정규화 (SignalState → Pressure6D)
+
+**기존 대비 차이**: HierarchicalPolicy는 PI Controller(적분+비례)를 경유하여 pressure를 평활화했다. LuaPolicy는 직접 정규화 매핑으로 **즉각적 반응**을 보장한다.
+
+**계산 규칙**:
+
+| 차원 | 입력 | 변환식 | 범위 |
+|------|------|--------|------|
+| `gpu` | `SignalState.gpu_pct` (0~100) | `gpu_pct / 100.0` | [0, 1] |
+| `cpu` | `SignalState.cpu_pct` (0~100) | `cpu_pct / 100.0` | [0, 1] |
+| `memory` | `mem_available / mem_total` | `1.0 - available/total` | [0, 1] |
+| `thermal` | `temp_mc` (millidegree) | `(temp_c - safe) / (critical - safe)` | [0, 1] |
+| `latency` | `TbtTracker.degradation_ratio()` | 직접 사용 (baseline 미확정 시 0.0) | [0, +inf) |
+| `main_app` | (예약) | 0.0 | 0.0 |
+
+**Thermal 정규화**: `temp_safe_c`(기본 35.0)과 `temp_critical_c`(기본 50.0)로 선형 보간. safe 이하 → 0.0, critical 이상 → 1.0.
+
+### 12.2 TBT Baseline 추적 (EWMA)
+
+**파일**: `manager/src/lua_policy.rs` — `TbtTracker`
+
+Engine heartbeat의 `throughput` (tokens/sec)에서 TBT(Time Between Tokens)를 역산하고 EWMA로 추적한다.
+
+**알고리즘**:
+
+```
+입력: throughput (tok/s, > 0 필수. <= 0 이면 skip)
+tbt_ms = 1000.0 / throughput
+
+if warmup_count == 0:
+    ewma = tbt_ms                          # 첫 관측: 직접 대입
+else:
+    ewma = 0.875 * ewma + 0.125 * tbt_ms   # alpha=0.875 (Jacobson TCP RTT)
+
+warmup_count += 1
+if baseline is None and warmup_count >= warmup_target (default 20):
+    baseline = ewma                        # baseline 확정
+
+degradation_ratio = (ewma - baseline) / baseline   # baseline 대비 악화 비율
+```
+
+**설계 근거**: Alpha=0.875 (= 7/8)는 Jacobson의 TCP RTT 추정에서 유래. 빠른 적응과 노이즈 필터링의 균형. 반감기 ~5.2 관측.
+
+### 12.3 Trigger Hysteresis
+
+**파일**: `manager/src/lua_policy.rs` — `TriggerEngine`
+
+각 trigger는 독립적인 **enter/exit threshold** 쌍으로 hysteresis를 구현한다.
+
+**상태 전이**:
+
+```
+비활성 상태:
+    if value > enter_threshold → 활성화
+
+활성 상태:
+    if value < exit_threshold → 비활성화
+    (enter_threshold > exit_threshold 이므로 진동 방지)
+```
+
+**3개 Trigger**:
+
+| Trigger | 입력 | enter | exit | Hysteresis gap |
+|---------|------|-------|------|---------------|
+| `tbt_degraded` | `degradation_ratio` | 0.30 (30% 악화) | 0.10 (10%) | 0.20 |
+| `mem_low` | `pressure.memory` | 0.80 | 0.60 | 0.20 |
+| `temp_high` | `pressure.thermal` (정규화) | 0.70 | 0.50 | 0.20 |
+
+**TBT trigger 특이사항**:
+- `throughput <= 0` 이면 관측 건너뜀 (0으로 나누기 방지)
+- `baseline` 미확정 시 (`warmup_count < warmup_target`) trigger 갱신 안 함
+
+### 12.4 EWMA Relief Learning
+
+**파일**: `manager/src/lua_policy.rs` — `EwmaReliefTable`
+
+액션별 6D relief 벡터를 EWMA로 학습한다.
+
+**알고리즘**:
+
+```
+observe(action, observed[6]):
+    entry = entries.get_or_create(action)
+    if entry.observation_count == 0:
+        entry.relief = observed             # 첫 관측: 직접 대입 (prior 대체)
+    else:
+        for i in 0..6:
+            entry.relief[i] = alpha * entry.relief[i] + (1 - alpha) * observed[i]
+    entry.observation_count += 1
+
+predict(action) -> [f32; 6]:
+    if entries.contains(action): return entries[action].relief
+    if defaults.contains(action): return defaults[action]   # cold start prior
+    return [0.0; 6]
+```
+
+**HierarchicalPolicy RLS 대비 차이**:
+
+| 측면 | RLS (OnlineLinearEstimator) | EWMA (EwmaReliefTable) |
+|------|---------------------------|------------------------|
+| 입력 | 13D FeatureVector (상태 의존) | 없음 (상태 무관) |
+| 모델 | 4 x D 가중치 행렬 + bias | 6D 스칼라 |
+| 차원 | 4D (compute, memory, thermal, latency) | 6D (gpu, cpu, memory, thermal, latency, main_app) |
+| 학습률 | 적응적 (P 행렬, forgetting factor) | 고정 alpha=0.875 |
+| 복잡도 | O(D^2) per update | O(6) per update |
+| 장점 | 상태 조건부 예측 가능 | 단순, 빠른 수렴, Lua 친화적 |
+
+### 12.5 Observation (3초 Settling)
+
+**파일**: `manager/src/lua_policy.rs` — `ObservationContext`
+
+**알고리즘**:
+
+```
+process_signal() 내 try_complete_observation():
+    if observation is None: return
+    if elapsed < 3.0s: return (observation 유지)
+
+    after = pressure_with_thermal()   # 현재 pressure 계산
+    observed[0..4] = before[0..4] - after[0..4]   # 감소=양수 (호전)
+    observed[5]    = after[5] - before[5]         # main_app: 증가=양수 (호전)
+    relief_table.observe(action, observed)
+    observation = None
+
+decide() 반환 후:
+    if commands 비어있지 않음:
+        첫 번째 커맨드의 action_name으로 ObservationContext 생성
+        (여러 커맨드가 반환되어도 단일 액션만 추적)
+```
+
+**단일 액션 제한 근거**: 여러 액션이 동시 적용되면 개별 기여를 분리할 수 없다. HierarchicalPolicy도 동일한 제한이 있었다 (INV-051). LuaPolicy는 이를 명시적으로 단일 액션만 추적하여 EWMA 오염을 방지한다.
+
+---
+
+## 13. LuaPolicy Config (AdaptationConfig)
+
+**파일**: `manager/src/config.rs`
+
+| config 키 | 타입 | 기본값 | 설명 |
+|-----------|------|--------|------|
+| `adaptation.ewma_alpha` | f32 | 0.875 | EWMA 평활 계수 (Jacobson TCP RTT) |
+| `adaptation.relief_table_path` | String | "" (비활성) | Relief table JSON 저장 경로 |
+| `adaptation.temp_safe_c` | f32 | 35.0 | Thermal 정규화 하한 (Celsius) |
+| `adaptation.temp_critical_c` | f32 | 50.0 | Thermal 정규화 상한 (Celsius) |
+| `adaptation.trigger.tbt_enter` | f64 | 0.30 | TBT degradation trigger 진입 threshold |
+| `adaptation.trigger.tbt_exit` | f64 | 0.10 | TBT degradation trigger 해제 threshold |
+| `adaptation.trigger.tbt_warmup_tokens` | u32 | 20 | TBT baseline 확정 전 warmup 토큰 수 |
+| `adaptation.trigger.mem_enter` | f64 | 0.80 | Memory trigger 진입 threshold |
+| `adaptation.trigger.mem_exit` | f64 | 0.60 | Memory trigger 해제 threshold |
+| `adaptation.trigger.temp_enter` | f64 | 0.70 | Temperature trigger 진입 threshold |
+| `adaptation.trigger.temp_exit` | f64 | 0.50 | Temperature trigger 해제 threshold |
+| `adaptation.default_relief` | `HashMap<String, Vec<f32>>` | {} | Per-action 6D default relief (cold start prior) |
