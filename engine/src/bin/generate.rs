@@ -83,10 +83,6 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     repetition_window: usize,
 
-    /// Use GPU kernel for attention computation (OpenCL only)
-    #[arg(long, default_value_t = false)]
-    gpu_attn: bool,
-
     /// Disable GPU kernel plan for decode (fallback to forward_into every token)
     #[arg(long, default_value_t = false)]
     no_gpu_plan: bool,
@@ -691,7 +687,6 @@ fn main() -> anyhow::Result<()> {
             kv_budget_ratio: 0.0,
             greedy: args.greedy,
             kv_type: format!("q{}+f32_residual", args.kivi_bits),
-            use_gpu_attn: args.gpu_attn,
             qcf_mode: args.qcf_mode.clone(),
             vocab_size,
             hidden_size,
@@ -949,7 +944,6 @@ fn main() -> anyhow::Result<()> {
             max_seq_len,
             residual_size,
             args.num_tokens,
-            args.gpu_attn,
             args.experiment_output.as_deref(),
             args.experiment_logits_topk,
             args.experiment_sample_interval,
@@ -979,7 +973,6 @@ fn main() -> anyhow::Result<()> {
             num_layers,
             max_seq_len,
             args.num_tokens,
-            args.gpu_attn,
             &prompt,
             &args.backend,
             &args.kv_offload,
@@ -1301,7 +1294,6 @@ fn main() -> anyhow::Result<()> {
             logits_out: &mut logits,
             x_gen: None,
             workspace: None,
-            use_gpu_attn: args.gpu_attn,
             score_accumulator: None,
             profiler: None,
             skip_config: None,
@@ -1381,7 +1373,6 @@ fn main() -> anyhow::Result<()> {
             kv_budget_ratio: args.kv_budget_ratio,
             greedy: args.greedy,
             kv_type: args.kv_type.clone(),
-            use_gpu_attn: args.gpu_attn,
             qcf_mode: args.qcf_mode.clone(),
             vocab_size,
             hidden_size,
@@ -1661,7 +1652,6 @@ fn main() -> anyhow::Result<()> {
                         logits_out: &mut prefill_logits,
                         x_gen: None,
                         workspace: None,
-                        use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
                         skip_config: skip_config.as_ref(),
@@ -1734,7 +1724,6 @@ fn main() -> anyhow::Result<()> {
                                     logits_out: &mut cpu_logits,
                                     x_gen: None,
                                     workspace: None,
-                                    use_gpu_attn: false,
                                     score_accumulator: None,
                                     profiler: None,
                                     skip_config: skip_config.as_ref(),
@@ -2049,7 +2038,6 @@ fn main() -> anyhow::Result<()> {
                         logits_out: &mut logits,
                         x_gen: Some(&mut x_gen),
                         workspace: Some(&mut gen_ws),
-                        use_gpu_attn: args.gpu_attn,
                         score_accumulator: None,
                         profiler: None,
                         skip_config: skip_config.as_ref(),
@@ -2189,7 +2177,6 @@ fn main() -> anyhow::Result<()> {
             logits_out: &mut warmup_logits,
             x_gen: None,
             workspace: None,
-            use_gpu_attn: args.gpu_attn,
             score_accumulator: None,
             profiler: None,
             skip_config: None,
@@ -2326,7 +2313,6 @@ fn main() -> anyhow::Result<()> {
                 logits_out: &mut prefill_logits,
                 x_gen: None,
                 workspace: None,
-                use_gpu_attn: args.gpu_attn,
                 score_accumulator: None, // No score tracking during prefill
                 profiler: None,
                 skip_config: None,
@@ -2401,7 +2387,6 @@ fn main() -> anyhow::Result<()> {
                             logits_out: &mut cpu_logits,
                             x_gen: None,
                             workspace: None,
-                            use_gpu_attn: false,
                             score_accumulator: None,
                             profiler: None,
                             skip_config: None,
@@ -2559,13 +2544,18 @@ fn main() -> anyhow::Result<()> {
                         // Dispatch by evict method (same as decode loop).
                         // Scores are unavailable at prefill→decode boundary, so
                         // D2O and score-based H2O fall back to force_evict.
-                        let result = if evict.method == llm_rs2::resilience::EvictMethod::Streaming {
+                        let result = if evict.method == llm_rs2::resilience::EvictMethod::Streaming
+                        {
                             if let Some(ref sp) = evict.streaming_params {
-                                let policy = llm_rs2::core::eviction::streaming_llm::StreamingLLMPolicy::new(
-                                    sp.sink_size, sp.window_size,
-                                );
+                                let policy =
+                                    llm_rs2::core::eviction::streaming_llm::StreamingLLMPolicy::new(
+                                        sp.sink_size,
+                                        sp.window_size,
+                                    );
                                 cache_manager.force_evict_by_policy_ref(
-                                    &policy, &mut kv_caches, adjusted_ratio,
+                                    &policy,
+                                    &mut kv_caches,
+                                    adjusted_ratio,
                                     llm_rs2::core::cache_manager::ScoreContext::None,
                                 )
                             } else {
@@ -2573,7 +2563,9 @@ fn main() -> anyhow::Result<()> {
                             }
                         } else {
                             cache_manager.force_evict_by_policy(
-                                evict.method, &mut kv_caches, adjusted_ratio,
+                                evict.method,
+                                &mut kv_caches,
+                                adjusted_ratio,
                                 llm_rs2::core::cache_manager::ScoreContext::None,
                             )
                         };
@@ -3028,7 +3020,6 @@ fn main() -> anyhow::Result<()> {
                     logits_out: &mut logits,
                     x_gen: Some(&mut x_gen),
                     workspace: Some(&mut gen_ws),
-                    use_gpu_attn: args.gpu_attn,
                     score_accumulator: score_accumulator.as_mut(),
                     profiler: profiler.as_mut().map(|p| &mut p.ops),
                     skip_config: skip_config.as_ref(),
@@ -4568,7 +4559,6 @@ fn run_kivi_ppl(
             logits_out: &mut prefill_logits,
             x_gen: None,
             workspace: None,
-            use_gpu_attn: args.gpu_attn,
             score_accumulator: None,
             profiler: None,
             skip_config: None,
@@ -4647,7 +4637,6 @@ fn run_kivi_ppl(
             logits_out: &mut decode_logits,
             x_gen: Some(&mut x_gen),
             workspace: Some(&mut gen_ws),
-            use_gpu_attn: args.gpu_attn,
             score_accumulator: None,
             profiler: None,
             skip_config: None,
@@ -4793,7 +4782,6 @@ fn run_kivi(
     max_seq_len: usize,
     residual_size: usize,
     num_tokens: usize,
-    gpu_attn: bool,
     experiment_output: Option<&str>,
     experiment_logits_topk: usize,
     experiment_sample_interval: usize,
@@ -4919,7 +4907,6 @@ fn run_kivi(
             logits_out: &mut prefill_logits,
             x_gen: None,
             workspace: None,
-            use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
             skip_config: None,
@@ -5071,7 +5058,6 @@ fn run_kivi(
                 logits_out: &mut logits,
                 x_gen: Some(&mut x_gen),
                 workspace: Some(&mut gen_ws),
-                use_gpu_attn: gpu_attn,
                 score_accumulator: None,
                 profiler: None,
                 skip_config: kivi_skip_config.as_ref(),
@@ -5369,7 +5355,6 @@ fn run_offload(
     num_layers: usize,
     max_seq_len: usize,
     num_tokens: usize,
-    gpu_attn: bool,
     _prompt: &str,
     _backend_name: &str,
     offload_mode: &str,
@@ -5515,7 +5500,6 @@ fn run_offload(
             logits_out: &mut prefill_logits,
             x_gen: None,
             workspace: None,
-            use_gpu_attn: gpu_attn,
             score_accumulator: None,
             profiler: None,
             skip_config: None,
@@ -5616,7 +5600,6 @@ fn run_offload(
                 logits_out: &mut logits,
                 x_gen: Some(&mut x_gen),
                 workspace: Some(&mut gen_ws),
-                use_gpu_attn: gpu_attn,
                 score_accumulator: None,
                 profiler: None,
                 skip_config: None,
@@ -5928,7 +5911,6 @@ fn run_ppl(
             logits_out: &mut prefill_logits,
             x_gen: None,
             workspace: None,
-            use_gpu_attn: args.gpu_attn,
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
             skip_config,
@@ -5995,7 +5977,6 @@ fn run_ppl(
             logits_out: &mut decode_logits,
             x_gen: Some(&mut x_gen),
             workspace: Some(&mut gen_ws),
-            use_gpu_attn: args.gpu_attn,
             score_accumulator: score_accumulator.as_mut(),
             profiler: None,
             skip_config,

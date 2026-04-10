@@ -96,7 +96,6 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub logits_out: &'a mut Tensor,
     pub x_gen: Option<&'a mut Tensor>,
     pub workspace: Option<&'a mut LayerWorkspace>,
-    pub use_gpu_attn: bool,
     /// Optional attention score accumulator for H2O-style eviction.
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
@@ -1089,7 +1088,6 @@ impl TransformerModel {
                 rms_norm_eps: self.config.rms_norm_eps as f32,
                 rope_theta,
                 workspace: None,
-                use_gpu_attn: true,
                 rms_norm_add_unit: is_gemma3,
                 use_gelu_tanh: is_gemma3,
                 is_local_attn: is_local,
@@ -1143,7 +1141,6 @@ impl TransformerModel {
         let logits_out = args.logits_out;
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
-        let use_gpu_attn = args.use_gpu_attn;
         let mut profiler = args.profiler;
 
         let mut score_accumulator = args.score_accumulator;
@@ -1268,7 +1265,6 @@ impl TransformerModel {
                         memory,
                         self.config.rms_norm_eps as f32,
                         rope_theta,
-                        use_gpu_attn,
                         need_scores,
                         self.config.head_dim,
                         batch_size,
@@ -1294,7 +1290,6 @@ impl TransformerModel {
                         rms_norm_eps: self.config.rms_norm_eps as f32,
                         rope_theta,
                         workspace: None,
-                        use_gpu_attn,
                         need_scores,
                         head_dim: self.config.head_dim,
                         profiler: profiler.as_deref_mut(),
@@ -1317,7 +1312,6 @@ impl TransformerModel {
                     rms_norm_eps: self.config.rms_norm_eps as f32,
                     rope_theta,
                     workspace: workspace.as_deref_mut(),
-                    use_gpu_attn,
                     need_scores,
                     head_dim: self.config.head_dim,
                     profiler: profiler.as_deref_mut(),
@@ -1783,7 +1777,6 @@ impl TransformerModel {
         let logits_out = args.logits_out;
         let x_gen = args.x_gen;
         let mut workspace = args.workspace;
-        let use_gpu_attn = args.use_gpu_attn;
         let _importance_collector = args.importance_collector; // unused in offload path
 
         let batch_size = input_tokens.shape().dims()[0];
@@ -1913,7 +1906,6 @@ impl TransformerModel {
                 rms_norm_eps: self.config.rms_norm_eps as f32,
                 rope_theta: rope_theta_i,
                 workspace: workspace.as_deref_mut(),
-                use_gpu_attn,
                 need_scores: false,
                 head_dim: self.config.head_dim,
                 profiler: None,

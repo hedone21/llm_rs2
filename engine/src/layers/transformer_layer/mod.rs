@@ -239,7 +239,6 @@ impl TransformerLayer {
         let rms_norm_eps = args.rms_norm_eps;
         let rope_theta = args.rope_theta;
         let workspace = args.workspace;
-        let use_gpu_attn = args.use_gpu_attn;
 
         let batch_size = x.shape().dims()[0];
         let seq_len = x.shape().dims()[1];
@@ -260,7 +259,6 @@ impl TransformerLayer {
                 ws,
                 rms_norm_eps,
                 rope_theta,
-                use_gpu_attn,
                 need_scores,
                 head_dim,
                 profiler: args.profiler,
@@ -281,7 +279,6 @@ impl TransformerLayer {
             memory,
             rms_norm_eps,
             rope_theta,
-            use_gpu_attn,
             need_scores,
             head_dim,
             batch_size,
@@ -320,7 +317,6 @@ pub struct ForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub ws: &'a mut crate::layers::workspace::LayerWorkspace,
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
-    pub use_gpu_attn: bool,
     /// When true, compute attention scores into ws.scores even for non-F32 KV cache.
     /// Required for H2O/H2O+ score accumulation with Q4_0/F16 KV cache.
     pub need_scores: bool,
@@ -350,7 +346,6 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub rms_norm_eps: f32,
     pub rope_theta: f32,
     pub workspace: Option<&'a mut crate::layers::workspace::LayerWorkspace>,
-    pub use_gpu_attn: bool,
     pub need_scores: bool,
     pub head_dim: usize,
     /// Optional per-op profiler for timing breakdown.

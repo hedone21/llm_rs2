@@ -240,7 +240,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                 logits_out: &mut decode_logits,
                 x_gen: Some(&mut x_gen),
                 workspace: Some(&mut gen_ws),
-                use_gpu_attn: effective_eval_config.use_gpu_attn,
                 score_accumulator: hook.score_accumulator(),
                 profiler: None,
                 skip_config,
@@ -330,7 +329,6 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         logits_out: &mut decode_logits,
                         x_gen: Some(&mut x_gen),
                         workspace: Some(&mut gen_ws),
-                        use_gpu_attn: effective_eval_config.use_gpu_attn,
                         score_accumulator: hook.score_accumulator(),
                         profiler: None,
                         skip_config,
@@ -498,7 +496,7 @@ fn run_importance_pass<C: KVCacheOps>(
     hook: &mut dyn StepHook<C>,
     questions: &[EvalQuestion],
     vocab_size: usize,
-    eval_config: &EvalConfig,
+    _eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
 ) -> Result<ImportancePassResult> {
     let sc = match skip_config {
@@ -549,7 +547,6 @@ fn run_importance_pass<C: KVCacheOps>(
         logits_out: &mut imp_logits,
         x_gen: None,
         workspace: None,
-        use_gpu_attn: eval_config.use_gpu_attn,
         score_accumulator: None,
         profiler: None,
         skip_config: None, // intentionally None for importance measurement
@@ -658,7 +655,7 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
     cpu_gen_input: &Tensor,
     _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
-    eval_config: &EvalConfig,
+    _eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
 ) -> Result<(Vec<f32>, usize)> {
     let prompt_len = prompt_ids.len();
@@ -689,7 +686,6 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
             logits_out: decode_logits,
             x_gen: Some(x_gen),
             workspace: Some(gen_ws),
-            use_gpu_attn: eval_config.use_gpu_attn,
             score_accumulator: hook.score_accumulator(),
             profiler: None,
             skip_config,
@@ -720,7 +716,7 @@ fn run_full_prefill<C: KVCacheOps>(
     prompt_ids: &[u32],
     _qcf_metrics: &mut Vec<serde_json::Value>,
     vocab_size: usize,
-    eval_config: &EvalConfig,
+    _eval_config: &EvalConfig,
     skip_config: Option<&SkipConfig>,
     _prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace>,
 ) -> Result<(Vec<f32>, usize)> {
@@ -756,7 +752,6 @@ fn run_full_prefill<C: KVCacheOps>(
         logits_out: &mut prefill_logits,
         x_gen: None,
         workspace: None,
-        use_gpu_attn: eval_config.use_gpu_attn,
         score_accumulator: hook.score_accumulator(),
         profiler: None,
         skip_config,
@@ -845,7 +840,6 @@ fn run_chunked_prefill<C: KVCacheOps>(
         logits_out: &mut prefill_logits,
         x_gen: None,
         workspace: None,
-        use_gpu_attn: eval_config.use_gpu_attn,
         score_accumulator: hook.score_accumulator(),
         profiler: None,
         skip_config,
@@ -899,7 +893,6 @@ fn run_chunked_prefill<C: KVCacheOps>(
             logits_out: decode_logits,
             x_gen: Some(x_gen),
             workspace: Some(gen_ws),
-            use_gpu_attn: eval_config.use_gpu_attn,
             score_accumulator: hook.score_accumulator(),
             profiler: None,
             skip_config,
@@ -933,7 +926,6 @@ mod tests {
             kv_budget_ratio: 0.0,
             greedy: true,
             kv_type: "f32".to_string(),
-            use_gpu_attn: false,
             qcf_mode: "attn".to_string(),
             vocab_size: 32000,
             hidden_size: 2048,
@@ -946,7 +938,6 @@ mod tests {
         assert_eq!(cfg.vocab_size, 32000);
         assert_eq!(cfg.hidden_size, 2048);
         assert_eq!(cfg.max_seq_len, 2048);
-        assert!(!cfg.use_gpu_attn);
     }
 
     #[test]

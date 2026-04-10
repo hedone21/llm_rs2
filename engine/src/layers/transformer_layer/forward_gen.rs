@@ -18,7 +18,6 @@ impl TransformerLayer {
         let ws = args.ws;
         let rms_norm_eps = args.rms_norm_eps;
         let rope_theta = args.rope_theta;
-        let use_gpu_attn = args.use_gpu_attn;
 
         let batch_size = x.shape().dims()[0];
         let head_dim = args.head_dim;
@@ -300,17 +299,13 @@ impl TransformerLayer {
                 // Q4_0 + GPU: force CPU dequant+attention path
                 false
             } else if is_gpu && k_cache.as_ptr().is_null() {
-                // Device-only buffers (null CPU pointer): must use GPU attention.
-                // This applies to OpenCL device-only buffers on discrete GPUs.
-                // Exception: F32 KV (e.g. KiviCache attn view) should use the CPU
-                // fallback path which reads data via read_buffer + CPU attention.
-                // The GPU kernel_attn_gen assumes standard KVCache layout/strides
-                // which may not match KiviCache's assembled view.
-                if k_cache.dtype() == DType::F32 {
-                    use_gpu_attn // Only use GPU attention if explicitly requested
-                } else {
-                    true
-                }
+                // Device-only buffers (null CPU pointer): must use GPU attention
+                // for non-F32 KV caches. F32 KV on device-only (e.g. KiviCache
+                // assembled view) falls through to the CPU fallback path, which
+                // reads data via read_buffer + CPU attention — the GPU kernel
+                // assumes standard KVCache layout/strides that may not match
+                // KiviCache's assembled view.
+                k_cache.dtype() != DType::F32
             } else {
                 // CPU-accessible buffers (UMA/pinned/CPU): use typed attention
                 // only for non-F32 KV cache. The F32 path in the else branch

@@ -12,7 +12,6 @@ pub struct EvalConfig {
     pub kv_budget_ratio: f32,
     pub greedy: bool,
     pub kv_type: String,
-    pub use_gpu_attn: bool,
     pub qcf_mode: String,
     /// Model vocabulary size (used for logits buffer allocation).
     pub vocab_size: usize,

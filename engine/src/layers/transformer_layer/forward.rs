@@ -12,7 +12,6 @@ impl TransformerLayer {
         memory: &dyn Memory,
         rms_norm_eps: f32,
         rope_theta: f32,
-        _use_gpu_attn: bool,
         _need_scores: bool,
         head_dim: usize,
         batch_size: usize,
