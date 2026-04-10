@@ -426,67 +426,54 @@ impl OpenCLBackend {
             }
         };
 
-        // F16 GEMV: Adreno-optimized multi-row kernel (Q4 pattern ported to F16)
+        // F16 GEMV: two kernel variants with different dispatch geometries.
+        //
+        // 1. `mul_mv_f16_f32.cl` — 4-wave K-split: local=[64,4,1], N_DST=2, 128 rows/WG.
+        //    4 subgroups split K dimension in parallel, partial sums reduced via local mem.
+        //    Faster on Adreno/Mali due to better parallelism and activation reuse.
+        //
+        // 2. `fallback/mul_mv_f16_f32_nosub.cl` — subgroup-reduce: local=[64,1,1], N_DST=4, 4 rows/WG.
+        //    Single subgroup per WG, uses sub_group_reduce_add(). Slower but works on any
+        //    device with subgroup ops (or falls through to tree reduction).
+        //
+        // `f16_is_nosub` tracks which variant was loaded so dispatch code uses the
+        // correct local/global geometry. Historically both paths shared a single
+        // (nosub) dispatch, which silently corrupted the 4-wave variant — the
+        // "broken on Adreno 830" story was a dispatch bug, not a kernel bug.
         let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
         let f16_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
-        // F16 GEMV: use subgroup-reduce kernel (fallback/mul_mv_f16_f32_nosub.cl)
-        // by default. It uses sub_group_reduce_add() + get_max_sub_group_size()
-        // for dynamic subgroup-size-safe operation (zero barriers).
-        // The old 4-wave subgroup kernel (mul_mv_f16_f32.cl) is available via
-        // FORCE_F16_4WAVE=1 for testing (broken on Adreno 830).
-        let force_4wave = std::env::var("FORCE_F16_4WAVE").is_ok();
-        let mut f16_is_nosub = false; // both kernels use subgroup ops now
-        let f16_program = if force_4wave {
-            match Program::builder()
-                .devices(device)
-                .src(f16_src)
-                .cmplr_opt(&cl_opts)
-                .build(&context)
-            {
-                Ok(p) => {
-                    log::info!("mul_mv_f16_f32.cl compiled (4-wave, forced)");
-                    p
-                }
-                Err(e) => {
-                    log::warn!("4-wave F16 failed: {}. Using subgroup-reduce.", e);
-                    Program::builder()
-                        .devices(device)
-                        .src(f16_fallback_src)
-                        .cmplr_opt(&cl_opts)
-                        .build(&context)?
-                }
+        let f16_is_nosub: bool;
+        let f16_program = match Program::builder()
+            .devices(device)
+            .src(f16_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("mul_mv_f16_f32.cl compiled (4-wave K-split, N_DST=2, 128 rows/WG)");
+                f16_is_nosub = false;
+                p
             }
-        } else {
-            match Program::builder()
-                .devices(device)
-                .src(f16_fallback_src)
-                .cmplr_opt(&cl_opts)
-                .build(&context)
-            {
-                Ok(p) => {
-                    log::info!("F16 GEMV compiled (subgroup-reduce, N_DST=4)");
-                    p
-                }
-                Err(e) => {
-                    log::warn!("Subgroup-reduce F16 failed: {}. Trying 4-wave.", e);
-                    match Program::builder()
-                        .devices(device)
-                        .src(f16_src)
-                        .cmplr_opt(&cl_opts)
-                        .build(&context)
-                    {
-                        Ok(p) => {
-                            log::info!("mul_mv_f16_f32.cl compiled (4-wave fallback)");
-                            p
-                        }
-                        Err(e2) => {
-                            log::warn!("Both F16 kernels failed: {}. Using nosub tree.", e2);
-                            f16_is_nosub = true;
-                            Program::builder()
-                                .devices(device)
-                                .src("__kernel void kernel_mul_mat_f16_f32() {}")
-                                .build(&context)?
-                        }
+            Err(e) => {
+                log::warn!("4-wave F16 compile failed: {}. Falling back to nosub.", e);
+                match Program::builder()
+                    .devices(device)
+                    .src(f16_fallback_src)
+                    .cmplr_opt(&cl_opts)
+                    .build(&context)
+                {
+                    Ok(p) => {
+                        log::info!("F16 GEMV compiled (subgroup-reduce fallback, N_DST=4)");
+                        f16_is_nosub = true;
+                        p
+                    }
+                    Err(e2) => {
+                        log::warn!("Both F16 kernels failed: {}. Using dummy stub.", e2);
+                        f16_is_nosub = true;
+                        Program::builder()
+                            .devices(device)
+                            .src("__kernel void kernel_mul_mat_f16_f32() {}")
+                            .build(&context)?
                     }
                 }
             }
@@ -1048,14 +1035,12 @@ impl OpenCLBackend {
         let kernels = unsafe { &*self.kernels.get() };
         let f16_nosub = kernels.f16_is_nosub;
 
-        // L4 kernel uses 4-wave K-split which is broken on Adreno 830.
-        // Disable L4 unless explicitly using the 4-wave subgroup kernel.
-        let use_l4 = if f16_nosub || std::env::var("FORCE_F16_4WAVE").is_err() {
-            false
-        } else {
-            const LARGE_N_THRESHOLD: usize = 4096;
-            n > LARGE_N_THRESHOLD && kernels.kernel_mul_mat_f16_f32_l4.is_some()
-        };
+        // L4 variant (mul_mv_f16_f32_l4.cl, N_DST=4 → 4 rows/WG) is also 4-wave
+        // K-split, so it only works when the main 4-wave kernel is loaded.
+        // Use it for large-N matmuls (lm_head, FFN) where halving WG count pays off.
+        const LARGE_N_THRESHOLD: usize = 4096;
+        let use_l4 =
+            !f16_nosub && n > LARGE_N_THRESHOLD && kernels.kernel_mul_mat_f16_f32_l4.is_some();
         let kernel = if use_l4 {
             kernels.kernel_mul_mat_f16_f32_l4.as_ref().unwrap()
         } else {
@@ -1089,39 +1074,37 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            if f16_nosub {
-                // Nosub kernel: 1D WG [64], N_DST=4, vectorized float4 loop + tree reduction
+            let (global_work_size, local_work_size) = if f16_nosub {
+                // Nosub kernel: local=[64,1,1], N_DST=4 → 4 rows/WG.
+                // Global: dim0 = ceil(n/4)*64, dim1 = m (batch), dim2 = 1.
                 const NOSUB_N_DST: usize = 4;
                 let n_groups = n.div_ceil(NOSUB_N_DST);
-                let local_work_size: [usize; 3] = [64, 1, 1];
-                let global_work_size: [usize; 3] = [n_groups * 64, m, 1];
-                ocl::core::enqueue_kernel(
-                    &self.queue,
-                    kernel,
-                    3,
-                    None,
-                    &global_work_size,
-                    Some(local_work_size),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
+                ([n_groups * 64, m, 1], [64usize, 1, 1])
+            } else if use_l4 {
+                // 4-wave L4 kernel: local=[64,4,1], N_DST=4 → 4 rows/WG, with
+                // 64 lanes × 4 waves cooperating on each row-group (256-way K parallelism).
+                // Global: dim0 = ceil(n/4)*64, dim1 = m*4 (4 waves per batch), dim2 = 1.
+                const L4_N_DST: usize = 4;
+                let n_groups = n.div_ceil(L4_N_DST);
+                ([n_groups * 64, m * 4, 1], [64usize, 4, 1])
             } else {
-                // Subgroup-reduce kernel: 1D WG [64], N_DST=4, sub_group_reduce_add()
-                const SUBGROUP_N_DST: usize = 4;
-                let n_groups = n.div_ceil(SUBGROUP_N_DST);
-                let local_work_size: [usize; 3] = [64, 1, 1];
-                let global_work_size: [usize; 3] = [n_groups * 64, m, 1];
-                ocl::core::enqueue_kernel(
-                    &self.queue,
-                    kernel,
-                    3,
-                    None,
-                    &global_work_size,
-                    Some(local_work_size),
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )?;
-            }
+                // 4-wave kernel: local=[64,4,1], N_DST=2 → 2 rows/WG, with
+                // 64 lanes × 4 waves cooperating on each row-pair (256-way K parallelism).
+                // Global: dim0 = ceil(n/2)*64, dim1 = m*4 (4 waves per batch), dim2 = 1.
+                const WAVE4_N_DST: usize = 2;
+                let n_groups = n.div_ceil(WAVE4_N_DST);
+                ([n_groups * 64, m * 4, 1], [64usize, 4, 1])
+            };
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
         }
         Ok(())
     }

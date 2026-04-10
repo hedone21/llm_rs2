@@ -567,20 +567,21 @@ pub struct LayerPlanConfig<'a> {
     pub is_nosub: bool,
 }
 
-/// N threshold for switching from N_DST=2 to N_DST=4 GEMV kernel.
-/// At N > 4096, the l4 kernel halves WG count and reuses activation across 4 rows.
-#[allow(dead_code)]
+/// N threshold for switching from N_DST=2 (128 rows/WG) to N_DST=4 (256 rows/WG) GEMV kernel.
+/// At N > 4096, the L4 kernel halves WG count and reuses activation across 4 rows.
 const LARGE_N_THRESHOLD: usize = 4096;
 
 /// Helper: create a dedicated kernel and pre-bind F16 matmul arguments.
 ///
-/// Matches the dispatch in `OpenClBackend::matmul_f16` for the decode case (m=1):
-///   kernel_mul_mat_f16_f32(weight, 0, src, 0, dst, 0, ne00=k, ne01=n, ne02=1,
-///                          ne10=k, ne12=1, ne0=n, ne1=1, r2=1, r3=1)
-///   ndim=3, global=[ceil(n/128)*64, 4, 1], local=[64,4,1]
+/// Must mirror `OpenClBackend::matmul_f16` dispatch exactly.
 ///
-/// When `l4_program` is provided and `n > LARGE_N_THRESHOLD`, uses the N_DST=4 variant
-/// (256 rows/WG) instead of N_DST=2 (128 rows/WG).
+/// Three dispatch shapes depending on which kernel is loaded:
+/// - 4-wave (default): local=[64,4,1], N_DST=2 → 128 rows/WG,
+///   global=[ceil(n/128)*64, 4, 1] for m=1 decode.
+/// - 4-wave L4 (large-N): local=[64,4,1], N_DST=4 → 256 rows/WG,
+///   global=[ceil(n/256)*64, 4, 1]. Used when l4_program is provided and n > LARGE_N_THRESHOLD.
+/// - Nosub fallback: local=[64,1,1], N_DST=4 → 4 rows/WG,
+///   global=[ceil(n/4)*64, 1, 1].
 #[allow(clippy::too_many_arguments)]
 fn make_f16_matmul_step(
     program: &ocl::Program,
@@ -591,13 +592,20 @@ fn make_f16_matmul_step(
     k: usize,
     op_tag: OpTag,
     l4_program: Option<&ocl::Program>,
-    _is_nosub: bool,
+    is_nosub: bool,
 ) -> Result<KernelStep> {
-    // L4 (4-wave K-split) kernel disabled — broken on Adreno 830.
-    // All sizes use the single-WG N_DST=4 kernel from f16_program.
-    let _ = l4_program; // suppress unused warning
-    let kernel = ocl::core::create_kernel(program, "kernel_mul_mat_f16_f32")
-        .context("create kernel_mul_mat_f16_f32")?;
+    // Prefer L4 (N_DST=4, 4 rows/WG) for large-N when both conditions hold:
+    // - 4-wave path is active (nosub fallback has incompatible dispatch)
+    // - l4_program compiled successfully
+    // - n exceeds the threshold where halving WG count pays off
+    let use_l4 = !is_nosub && l4_program.is_some() && n > LARGE_N_THRESHOLD;
+    let kernel = if use_l4 {
+        ocl::core::create_kernel(l4_program.unwrap(), "kernel_mul_mat_f16_f32_l4")
+            .context("create kernel_mul_mat_f16_f32_l4")?
+    } else {
+        ocl::core::create_kernel(program, "kernel_mul_mat_f16_f32")
+            .context("create kernel_mul_mat_f16_f32")?
+    };
 
     let ne00 = k as i32;
     let ne01 = n as i32;
@@ -627,20 +635,33 @@ fn make_f16_matmul_step(
         ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
     }
 
-    // All paths use the same N_DST=4 1D dispatch (subgroup-reduce or tree reduction)
-    {
-        const N_DST: usize = 4;
-        let n_groups = n.div_ceil(N_DST);
-        Ok(KernelStep {
-            kernel,
-            ndim: 3,
-            global_work_size: [n_groups * 64, 1, 1], // m=1 for decode
-            local_work_size: Some([64, 1, 1]),
-            dynamic_args: vec![],
-            op_tag,
-            retained_bufs: vec![],
-        })
-    }
+    let (global_work_size, local_work_size) = if is_nosub {
+        // Nosub: single-subgroup WG, 4 rows/WG.
+        const NOSUB_N_DST: usize = 4;
+        let n_groups = n.div_ceil(NOSUB_N_DST);
+        ([n_groups * 64, 1, 1], [64usize, 1, 1])
+    } else if use_l4 {
+        // 4-wave L4: 4 waves × 64 lanes cooperate per row-group, N_DST=4.
+        const L4_N_DST: usize = 4;
+        let n_groups = n.div_ceil(L4_N_DST);
+        // m=1 for decode → dim1 = m*4 = 4
+        ([n_groups * 64, 4, 1], [64usize, 4, 1])
+    } else {
+        // 4-wave: 4 waves × 64 lanes cooperate per row-group, N_DST=2.
+        const WAVE4_N_DST: usize = 2;
+        let n_groups = n.div_ceil(WAVE4_N_DST);
+        ([n_groups * 64, 4, 1], [64usize, 4, 1])
+    };
+
+    Ok(KernelStep {
+        kernel,
+        ndim: 3,
+        global_work_size,
+        local_work_size: Some(local_work_size),
+        dynamic_args: vec![],
+        op_tag,
+        retained_bufs: vec![],
+    })
 }
 
 /// Build a pre-bound kernel execution plan for one transformer layer's decode
