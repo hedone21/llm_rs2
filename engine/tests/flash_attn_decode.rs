@@ -114,9 +114,7 @@ fn flash_attn_decode_self_consistent() {
         // The gate in flash_attention_decode_gpu() then returns Ok(false),
         // which on device would fall back to kernel_attn_gen_half. Here we
         // skip cleanly — strong on-device verification lives in Task 3.
-        eprintln!(
-            "Skipping: flash kernel unavailable on this host (kernel compile likely failed)"
-        );
+        eprintln!("Skipping: flash kernel unavailable on this host (kernel compile likely failed)");
         return;
     }
     ocl_arc.synchronize().unwrap();
@@ -148,12 +146,10 @@ fn flash_attn_decode_self_consistent() {
     ocl_arc.read_buffer(&out_a, &mut raw_a).unwrap();
     ocl_arc.read_buffer(&out_b, &mut raw_b).unwrap();
 
-    let a: &[f32] = unsafe {
-        std::slice::from_raw_parts(raw_a.as_ptr() as *const f32, n_heads_q * head_dim)
-    };
-    let b: &[f32] = unsafe {
-        std::slice::from_raw_parts(raw_b.as_ptr() as *const f32, n_heads_q * head_dim)
-    };
+    let a: &[f32] =
+        unsafe { std::slice::from_raw_parts(raw_a.as_ptr() as *const f32, n_heads_q * head_dim) };
+    let b: &[f32] =
+        unsafe { std::slice::from_raw_parts(raw_b.as_ptr() as *const f32, n_heads_q * head_dim) };
     for (i, (x, y)) in a.iter().zip(b.iter()).enumerate() {
         assert!(
             (x - y).abs() < 1e-6,
@@ -182,8 +178,7 @@ fn upload_f32(
         buf,
         backend.clone(),
     );
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
     backend.write_buffer(&mut t, bytes).unwrap();
     t
 }
@@ -202,8 +197,7 @@ fn upload_f16(
         buf,
         backend.clone(),
     );
-    let bytes =
-        unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
+    let bytes = unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
     backend.write_buffer(&mut t, bytes).unwrap();
     t
 }
