@@ -39,11 +39,16 @@ mkdir -p "$OUTDIR"
 TOLERANCE_PCT="${TOLERANCE_PCT:-5}"
 COOLDOWN_SEC="${COOLDOWN_SEC:-30}"
 
-# Detect whether the Qwen GGUF is present for llama-bench comparison.
+# Detect whether both the Qwen GGUF AND the llama-bench binary are present
+# on the device. Both are required for the llama.cpp comparison mode; if
+# either is missing, fall back to recording llm.rs numbers only.
 HAS_LLAMA_BENCH=1
 if ! adb shell 'ls /data/local/tmp/Qwen2.5-1.5B-Instruct-f16.gguf' >/dev/null 2>&1; then
   HAS_LLAMA_BENCH=0
   echo "[bench-qwen] WARNING: Qwen GGUF not on device; recording llm.rs numbers only"
+elif ! adb shell 'ls /data/local/tmp/llama-bench' >/dev/null 2>&1; then
+  HAS_LLAMA_BENCH=0
+  echo "[bench-qwen] WARNING: llama-bench binary not on device; recording llm.rs numbers only"
 fi
 
 tbt_llm_rs() {
