@@ -1,0 +1,19 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/gemma3-1b
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: Hello
+Token Length: 2
+Model config: layers=26, kv_heads=1, head_dim=256, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 100.64 ms (2 tokens, 19.9 tok/s)
+[Profile] Event: DecodingStart
+Hello, I am a high school student and we are doing a project in which you have to create an app that will automatically generate code for the user from their input
+Done.
+[Profile] Event: End
+TTFT: 228.09 ms
+Decode: 51.80 ms/tok (19.3 tok/s) [31 tokens, forward only]
+Avg TBT: 54.59 ms (18.3 tokens/sec)

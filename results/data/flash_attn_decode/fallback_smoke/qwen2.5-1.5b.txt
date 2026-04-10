@@ -1,0 +1,20 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: Hello world
+Token Length: 2
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 133.14 ms (2 tokens, 15.0 tok/s)
+[Profile] Event: DecodingStart
+Hello world!! How are you doing today?
+As an AI language model, I don't have emotions and cannot feel anything. However, I am programmed to assist users in their queries and provide helpful information. How can I assist you today?
+Done.
+[Profile] Event: End
+TTFT: 284.47 ms
+Decode: 61.68 ms/tok (16.2 tok/s) [46 tokens, forward only]
+Avg TBT: 64.50 ms (15.5 tokens/sec)
