@@ -91,8 +91,12 @@ pub enum KvUpdateVariant {
 /// Attention variant — Standard half-precision or KIVI fused attention.
 #[allow(clippy::large_enum_variant)]
 pub enum AttentionVariant {
-    /// Standard attention: kernel_attn_gen_half on F16 KV cache
+    /// Legacy kernel_attn_gen_half — supports score writes, any head_dim.
     Standard(KernelStep),
+    /// Decode flash attention (flash_attn_f32_f16_q1). Single-pass online
+    /// softmax, no score output. Selected at plan-build time when
+    /// head_dim==64, F16 KV, HeadMajor, and no scores are needed.
+    StandardFlash(KernelStep),
     /// KIVI assembled: scatter residual to F32 attn buffer, then standard F32 attention.
     /// Used when native KIVI attention kernel is not available.
     KiviAssembled {
@@ -389,6 +393,32 @@ impl FullKernelPlan {
                         eprintln!("[Plan] L{} attention OK (attn_seq_len={})", i, attn_seq_len);
                     }
                 }
+                AttentionVariant::StandardFlash(step) => {
+                    if debug_sync {
+                        eprintln!(
+                            "[Plan] L{} flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                            i, attn_seq_len, step.global_work_size, step.local_work_size
+                        );
+                    }
+                    Self::dispatch_step(
+                        queue,
+                        step,
+                        start_pos_i32,
+                        attn_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!(
+                            "[Plan] L{} flash attention OK (attn_seq_len={})",
+                            i, attn_seq_len
+                        );
+                    }
+                }
                 AttentionVariant::KiviAssembled {
                     scatter_k,
                     scatter_v,
@@ -565,6 +595,15 @@ pub struct LayerPlanConfig<'a> {
     pub kv_head_stride: i32,
     /// Whether the device lacks subgroup support (nosub fallback path).
     pub is_nosub: bool,
+    /// The flash attention F32 Q / F16 KV program handle, if compiled.
+    /// Used to create `flash_attn_f32_f16_q1` at plan-build time when
+    /// runtime preconditions hold. `None` forces the legacy path.
+    pub flash_attn_f32_f16_program: Option<&'a ocl::Program>,
+    /// True if this decode plan must capture attention scores (H2O/H2O+ or
+    /// an active GPU score accumulator). When true, the builder must use
+    /// `AttentionVariant::Standard` because the flash kernel has no score
+    /// output.
+    pub needs_attention_scores: bool,
 }
 
 /// N threshold for switching from N_DST=2 (128 rows/WG) to N_DST=4 (256 rows/WG) GEMV kernel.
@@ -662,6 +701,110 @@ fn make_f16_matmul_step(
         op_tag,
         retained_bufs: vec![],
     })
+}
+
+/// Build a pre-bound `KernelStep` that dispatches `flash_attn_f32_f16_q1`.
+///
+/// Arg layout mirrors `OpenCLBackend::flash_attention_decode_gpu` — see that
+/// method in `engine/src/backend/opencl/mod.rs` for the canonical layout.
+/// All 40 args are static except `n_kv` at index 10, which is patched per
+/// decode step via `DynamicArg::CacheSeqLen`.
+fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVariant> {
+    let program = config
+        .flash_attn_f32_f16_program
+        .expect("caller must verify flash_attn_f32_f16_program.is_some()");
+
+    let kernel = ocl::core::create_kernel(program, "flash_attn_f32_f16_q1")
+        .context("create flash_attn_f32_f16_q1 for plan")?;
+
+    let n_heads_q = config.n_heads_q;
+    let n_heads_kv = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_capacity = config.kv_capacity;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    // Q strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
+    let q_nb1 = (n_heads_q * head_dim * 4) as u64;
+    let q_nb2 = (head_dim * 4) as u64;
+    let q_nb3 = q_nb1;
+
+    // KV strides (F16 HeadMajor [1, n_heads_kv, capacity, head_dim]), bytes
+    let kv_elem_size: u64 = 2;
+    let k_nb1 = (head_dim as u64) * kv_elem_size;
+    let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
+    let k_nb3 = (n_heads_kv as u64) * k_nb2;
+
+    // O strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
+    let o_nb1 = (head_dim * 4) as u64;
+    let o_nb2 = (n_heads_q * head_dim * 4) as u64;
+    let o_nb3 = o_nb2;
+
+    let n_q = 1i32;
+    let initial_n_kv = 0i32;
+    let is_causal = 0i32;
+    let n_head = n_heads_q as i32;
+    let n_head_kv_arg = n_heads_kv as i32;
+    let max_bias = 0.0f32;
+    let m0 = 0.0f32;
+    let m1 = 0.0f32;
+    let n_head_log2 = 0i32;
+    let logit_softcap = 0.0f32;
+    let zero_u64 = 0u64;
+    let zero_i32 = 0i32;
+
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.k_cache_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(config.v_cache_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::mem(config.out_attn_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+        ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
+        ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&initial_n_kv))?;
+        ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
+        ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
+        ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 19, ocl::core::ArgVal::scalar(&k_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 20, ocl::core::ArgVal::scalar(&k_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 21, ocl::core::ArgVal::scalar(&k_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
+        ocl::core::set_kernel_arg(&kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
+        ocl::core::set_kernel_arg(&kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
+        ocl::core::set_kernel_arg(&kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
+        ocl::core::set_kernel_arg(&kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
+        ocl::core::set_kernel_arg(&kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
+        ocl::core::set_kernel_arg(&kernel, 31, ocl::core::ArgVal::mem_null())?;
+        ocl::core::set_kernel_arg(&kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 38, ocl::core::ArgVal::mem_null())?;
+        ocl::core::set_kernel_arg(&kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+    }
+
+    const Q1_WG_SIZE: usize = 64;
+    Ok(AttentionVariant::StandardFlash(KernelStep {
+        kernel,
+        ndim: 2,
+        global_work_size: [Q1_WG_SIZE, n_heads_q, 1],
+        local_work_size: Some([Q1_WG_SIZE, 1, 1]),
+        dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 10 }],
+        op_tag: OpTag::Attention,
+        retained_bufs: vec![],
+    }))
 }
 
 /// Build a pre-bound kernel execution plan for one transformer layer's decode
@@ -864,9 +1007,24 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     };
 
     // -----------------------------------------------------------------------
-    // 8. attention (q, kv_cache -> out_attn) — Standard variant
+    // 8. attention (q, kv_cache -> out_attn)
     // -----------------------------------------------------------------------
-    let attention = {
+    // Precondition gate: select flash attention when all conditions hold at
+    // plan-build time. These are static for a given model + KV layout, so we
+    // pre-bake the choice instead of runtime-gating per step.
+    //
+    // HeadMajor predicate matches the runtime check in `attention_gen` —
+    // kv_pos_stride == head_dim and kv_head_stride == capacity * head_dim.
+    let is_head_major = config.kv_pos_stride == config.head_dim as i32
+        && config.kv_head_stride == (config.kv_capacity * config.head_dim) as i32;
+    let use_flash = config.head_dim == 64
+        && is_head_major
+        && config.flash_attn_f32_f16_program.is_some()
+        && !config.needs_attention_scores;
+
+    let attention = if use_flash {
+        build_flash_attention_step(config)?
+    } else {
         let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
             .context("create kernel_attn_gen_half")?;
         let scale = 1.0f32 / (config.head_dim as f32).sqrt();
@@ -1083,6 +1241,14 @@ pub struct FullPlanConfig<'a> {
     pub f16_program: &'a ocl::Program,
     pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
+    /// Optional flash attention program (`flash_attn_f32_f16`). When `Some`,
+    /// the layer builder may select `AttentionVariant::StandardFlash` if all
+    /// other preconditions hold.
+    pub flash_attn_f32_f16_program: Option<&'a ocl::Program>,
+    /// True if this decode plan must capture attention scores (H2O / GPU
+    /// score accumulator). Forces the legacy attention path because flash
+    /// attention has no score output.
+    pub needs_attention_scores: bool,
     // Per-layer weight buffers: Vec<(wq, wk, wv, wo, w_gate, w_up, w_down, attn_norm, ffn_norm)>
     pub layer_bufs: Vec<LayerBufs<'a>>,
     // Workspace buffers (shared across layers)
@@ -1191,6 +1357,8 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             kv_pos_stride: config.kv_pos_stride,
             kv_head_stride: config.kv_head_stride,
             is_nosub: config.is_nosub,
+            flash_attn_f32_f16_program: config.flash_attn_f32_f16_program,
+            needs_attention_scores: config.needs_attention_scores,
         };
         layers.push(
             build_layer_plan(&layer_config)
@@ -1713,6 +1881,11 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             kv_pos_stride: (config.n_kv_heads * config.head_dim) as i32,
             kv_head_stride: config.head_dim as i32,
             is_nosub: config.is_nosub,
+            // KIVI replaces the standard attention step with its own variant,
+            // so the flash gate never matters here. Force the legacy path
+            // (which build_kivi_layer_plan immediately overrides anyway).
+            flash_attn_f32_f16_program: None,
+            needs_attention_scores: false,
         };
         layers.push(
             build_kivi_layer_plan(

@@ -3175,6 +3175,15 @@ impl OpenCLBackend {
         kernels.f16_is_nosub
     }
 
+    /// Returns true if the flash attention decode kernel (flash_attn_f32_f16_q1)
+    /// was successfully created at backend init time. Used by plan.rs to gate
+    /// the StandardFlash attention variant, and by host tests to decide whether
+    /// to exercise the flash path.
+    pub fn has_flash_decode_kernel(&self) -> bool {
+        let kernels = unsafe { &*self.kernels.get() };
+        kernels.kernel_flash_attn_f32_f16_q1.is_some()
+    }
+
     /// Check if KIVI fused attention kernel is available for the given bit-width.
     pub fn has_kivi_attn_kernel(&self, bits: u8) -> bool {
         let kernels = unsafe { &*self.kernels.get() };

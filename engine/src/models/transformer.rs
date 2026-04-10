@@ -1493,11 +1493,21 @@ impl TransformerModel {
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
 
+        // Mirror the runtime gate in `attention_gen` — flash attention has no
+        // score output, so an active GPU score accumulator forces the legacy
+        // attention path. The CPU-side `score_accumulator` is already checked
+        // by callers of `build_plan` (see `generate.rs`).
+        let plan_needs_scores = ocl_backend
+            .gpu_score_acc()
+            .is_some_and(|acc| acc.is_active());
+
         let full_config = FullPlanConfig {
             context: &ocl_backend.context,
             f16_program: &ocl_backend.f16_program,
             f16_l4_program: ocl_backend.f16_l4_program.as_ref(),
             simple_ops_program: &ocl_backend.simple_ops_program,
+            flash_attn_f32_f16_program: ocl_backend.flash_attn_f32_f16_program.as_ref(),
+            needs_attention_scores: plan_needs_scores,
             layer_bufs,
             x_buf: cl!(x),
             q_buf: cl!(ws.q),
