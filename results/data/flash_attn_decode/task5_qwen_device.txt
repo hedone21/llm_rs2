@@ -1,0 +1,37 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] OpenCL Platform: QUALCOMM Snapdragon(TM)
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] OpenCL Device: QUALCOMM Adreno(TM) 830 (API 3.0, CL C: OpenCL C 3.0 Adreno(TM) 830)
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] Subgroup support: cl_khr_subgroups=true, cl_intel_subgroups=false
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] GPU Global Memory: 5557 MB
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] GPU Max Alloc Size: 1024 MB
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] OpenCL compiler options: -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+[2026-04-10T23:36:08Z INFO  llm_rs2::backend::opencl] simple_ops.cl compiled (subgroup path)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32.cl compiled (4-wave K-split, N_DST=2, 128 rows/WG)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32_l4.cl compiled (GEMV N_DST=4 for large N)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=64, BLOCK_N=32, DK=64)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=64)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] mul_mm_f16_f32_l4_lm.cl compiled (GEMM prefill F16)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] mul_mm_f32_f32_l4_lm.cl compiled (GEMM prefill F32)
+[2026-04-10T23:36:09Z INFO  llm_rs2::backend::opencl] kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)
+[2026-04-10T23:36:10Z INFO  llm_rs2::backend::opencl] kivi_attn.cl compiled (KIVI fused attention kernels)
+[2026-04-10T23:36:10Z INFO  llm_rs2::backend::opencl] OpenCL kernels cached successfully
+[2026-04-10T23:36:10Z INFO  llm_rs2::backend::opencl] Memory mode: UMA/integrated (zero_copy=true)
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: In the silent hours before dawn, when the world still slept beneath a blanket of soft darkness, the old lighthouse keeper made his final rounds. His name was Henrik, and for forty-seven years he had tended the great lamp at the edge of the rocky cape. The spiral staircase creaked beneath his worn leather boots, each step a familiar song after so many decades. He paused at the first landing to catch his breath, a habit of age, and looked out through the small arched window at the restless sea below. The waves crashed against the jagged rocks with a rhythm he knew better than his own heartbeat. Seagulls wheeled in the pre-dawn gloom, their cries carried on the salt wind that seeped through every crack in the ancient stone walls. Henrik continued his climb, passing portraits of previous keepers, men who had given their lives to this solitary duty. He remembered his grandfather among them, a stern man with kind eyes who had first taught him how to trim the wick and polish the great Fresnel lens until it gleamed like a captured star. The oil lamp had been replaced with electric light decades ago, but Henrik still performed the old rituals each night, a way of honoring those who came before. As he reached the lamp room, the eastern sky began to lighten with the faintest hint of rose and gold. The sea stretched endlessly before him, dotted with distant fishing boats returning to harbor with their morning catch. A massive cargo ship passed slowly along the horizon, its lights still b
+Token Length: 309
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 2517.63 ms (309 tokens, 122.7 tok/s)
+[Profile] Event: DecodingStart
+In the silent hours before dawn, when the world still slept beneath a blanket of soft darkness, the old lighthouse keeper made his final rounds. His name was Henrik, and for forty-seven years he had tended the great lamp at the edge of the rocky cape. The spiral staircase creaked beneath his worn leather boots, each step a familiar song after so many decades. He paused at the first landing to catch his breath, a habit of age, and looked out through the small arched window at the restless sea below. The waves crashed against the jagged rocks with a rhythm he knew better than his own heartbeat. Seagulls wheeled in the pre-dawn gloom, their cries carried on the salt wind that seeped through every crack in the ancient stone walls. Henrik continued his climb, passing portraits of previous keepers, men who had given their lives to this solitary duty. He remembered his grandfather among them, a stern man with kind eyes who had first taught him how to trim the wick and polish the great Fresnel lens until it gleamed like a captured star. The oil lamp had been replaced with electric light decades ago, but Henrik still performed the old rituals each night, a way of honoring those who came before. As he reached the lamp room, the eastern sky began to lighten with the faintest hint of rose and gold. The sea stretched endlessly before him, dotted with distant fishing boats returning to harbor with their morning catch. A massive cargo ship passed slowly along the horizon, its lights still basking in twilight as it steamed northward towards a continent far away from this lonely outpost. Henrik's heart swelled at the sight of progress; yet he knew that for every technological marvel brought forth by civilization, there were others lost to neglect or decay deep within our vast oceans. He stood quietly before the great lens, its intricate mechanism glowing softly under low-wattage bulbs powered by generators housed elsewhere on land. A sudden gust swept through his capacious brown suit jacket; one sleeve caught fire and fell away as though it had been set aflame rather than merely touched upon by warmth from below decks where no one could see or hear
+Done.
+[Profile] Event: End
+TTFT: 2854.56 ms
+Decode: 64.68 ms/tok (15.5 tok/s) [127 tokens, forward only]
+Avg TBT: 71.06 ms (14.1 tokens/sec)
