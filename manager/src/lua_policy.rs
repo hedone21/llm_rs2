@@ -19,10 +19,188 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::config::TriggerConfig;
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
 
 const RELIEF_DIMS: usize = 6; // gpu, cpu, memory, thermal, latency, main_app_qos
+
+#[derive(Debug, Clone, Default)]
+struct Pressure6D {
+    gpu: f32,
+    cpu: f32,
+    memory: f32,
+    thermal: f32,
+    #[allow(dead_code)]
+    latency: f32,
+    #[allow(dead_code)]
+    main_app: f32,
+}
+
+#[derive(Debug, Default)]
+struct SignalState {
+    cpu_pct: f64,
+    gpu_pct: f64,
+    mem_available: u64,
+    mem_total: u64,
+    temp_mc: i32,
+    throttling: bool,
+}
+
+impl SignalState {
+    fn update_compute(&mut self, cpu_pct: f64, gpu_pct: f64) {
+        self.cpu_pct = cpu_pct;
+        self.gpu_pct = gpu_pct;
+    }
+
+    fn update_memory(&mut self, available: u64, total: u64) {
+        self.mem_available = available;
+        self.mem_total = total;
+    }
+
+    fn update_thermal(&mut self, temp_mc: i32, throttling: bool) {
+        self.temp_mc = temp_mc;
+        self.throttling = throttling;
+    }
+
+    fn pressure_with_thermal(
+        &self,
+        temp_safe_c: f32,
+        temp_critical_c: f32,
+        latency_ratio: Option<f64>,
+    ) -> Pressure6D {
+        let mem_pressure = if self.mem_total > 0 {
+            1.0 - (self.mem_available as f32 / self.mem_total as f32)
+        } else {
+            0.0
+        };
+
+        let temp_c = self.temp_mc as f32 / 1000.0;
+        let temp_range = temp_critical_c - temp_safe_c;
+        let thermal = if temp_range > 0.0 {
+            ((temp_c - temp_safe_c) / temp_range).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        Pressure6D {
+            gpu: (self.gpu_pct as f32 / 100.0).clamp(0.0, 1.0),
+            cpu: (self.cpu_pct as f32 / 100.0).clamp(0.0, 1.0),
+            memory: mem_pressure.clamp(0.0, 1.0),
+            thermal,
+            latency: latency_ratio.unwrap_or(0.0) as f32,
+            main_app: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct TriggerState {
+    tbt_degraded: bool,
+    mem_low: bool,
+    temp_high: bool,
+}
+
+#[derive(Debug)]
+struct TbtTracker {
+    ewma: f64,
+    baseline: Option<f64>,
+    warmup_count: u32,
+    warmup_target: u32,
+}
+
+impl TbtTracker {
+    fn new(warmup_target: u32) -> Self {
+        Self {
+            ewma: 0.0,
+            baseline: None,
+            warmup_count: 0,
+            warmup_target,
+        }
+    }
+
+    fn observe(&mut self, tbt_ms: f64) {
+        if self.warmup_count == 0 {
+            self.ewma = tbt_ms;
+        } else {
+            self.ewma = 0.875 * self.ewma + 0.125 * tbt_ms;
+        }
+        self.warmup_count += 1;
+
+        if self.baseline.is_none() && self.warmup_count >= self.warmup_target {
+            self.baseline = Some(self.ewma);
+        }
+    }
+
+    fn degradation_ratio(&self) -> Option<f64> {
+        self.baseline
+            .map(|b| if b > 0.0 { (self.ewma - b) / b } else { 0.0 })
+    }
+}
+
+#[derive(Debug)]
+struct TriggerEngine {
+    config: TriggerConfig,
+    tbt: TbtTracker,
+    trigger: TriggerState,
+}
+
+impl TriggerEngine {
+    fn new(config: TriggerConfig) -> Self {
+        Self {
+            tbt: TbtTracker::new(config.tbt_warmup_tokens),
+            config,
+            trigger: TriggerState::default(),
+        }
+    }
+
+    fn update_tbt_from_throughput(&mut self, throughput: f32) {
+        if throughput <= 0.0 {
+            return;
+        }
+        let tbt_ms = 1000.0 / throughput as f64;
+        self.tbt.observe(tbt_ms);
+
+        if let Some(ratio) = self.tbt.degradation_ratio() {
+            if self.trigger.tbt_degraded {
+                if ratio < self.config.tbt_exit {
+                    self.trigger.tbt_degraded = false;
+                }
+            } else if ratio > self.config.tbt_enter {
+                self.trigger.tbt_degraded = true;
+            }
+        }
+    }
+
+    fn update_mem(&mut self, pressure: f64) {
+        if self.trigger.mem_low {
+            if pressure < self.config.mem_exit {
+                self.trigger.mem_low = false;
+            }
+        } else if pressure > self.config.mem_enter {
+            self.trigger.mem_low = true;
+        }
+    }
+
+    fn update_temp(&mut self, normalized: f64) {
+        if self.trigger.temp_high {
+            if normalized < self.config.temp_exit {
+                self.trigger.temp_high = false;
+            }
+        } else if normalized > self.config.temp_enter {
+            self.trigger.temp_high = true;
+        }
+    }
+
+    fn state(&self) -> &TriggerState {
+        &self.trigger
+    }
+
+    #[allow(dead_code)]
+    fn tbt_degradation_ratio(&self) -> Option<f64> {
+        self.tbt.degradation_ratio()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReliefEntry {
@@ -1362,5 +1540,116 @@ mod tests {
         let predicted = table.predict("switch_hw");
         assert!(predicted[1] < 0.0, "cpu should be negative");
         assert!(predicted[4] < 0.0, "latency should be negative");
+    }
+
+    #[test]
+    fn signal_state_pressure_from_compute() {
+        let mut state = SignalState::default();
+        state.update_compute(45.2, 82.1);
+        let p = state.pressure_with_thermal(35.0, 50.0, None);
+        assert!((p.gpu - 0.821).abs() < 0.001);
+        assert!((p.cpu - 0.452).abs() < 0.001);
+    }
+
+    #[test]
+    fn signal_state_pressure_from_memory() {
+        let mut state = SignalState::default();
+        state.update_memory(2_000_000, 8_000_000);
+        let p = state.pressure_with_thermal(35.0, 50.0, None);
+        assert!((p.memory - 0.75).abs() < 0.001);
+    }
+
+    #[test]
+    fn signal_state_pressure_thermal_normalized() {
+        let mut state = SignalState::default();
+        state.update_thermal(42500, false);
+        let p = state.pressure_with_thermal(35.0, 50.0, None);
+        assert!((p.thermal - 0.5).abs() < 0.01);
+    }
+
+    #[test]
+    fn signal_state_pressure_thermal_clamped() {
+        let mut state = SignalState::default();
+        state.update_thermal(55000, true);
+        let p = state.pressure_with_thermal(35.0, 50.0, None);
+        assert!((p.thermal - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn trigger_tbt_warmup_then_degrade() {
+        let config = TriggerConfig {
+            tbt_enter: 0.30,
+            tbt_exit: 0.10,
+            tbt_warmup_tokens: 5,
+            mem_enter: 0.80,
+            mem_exit: 0.60,
+            temp_enter: 0.70,
+            temp_exit: 0.50,
+        };
+        let mut engine = TriggerEngine::new(config);
+
+        for _ in 0..5 {
+            engine.update_tbt_from_throughput(10.0);
+        }
+        assert!(!engine.state().tbt_degraded);
+
+        for _ in 0..10 {
+            engine.update_tbt_from_throughput(5.0);
+        }
+        assert!(engine.state().tbt_degraded);
+    }
+
+    #[test]
+    fn trigger_tbt_zero_throughput_skipped() {
+        let config = TriggerConfig::default();
+        let mut engine = TriggerEngine::new(config);
+        engine.update_tbt_from_throughput(0.0);
+        assert!(!engine.state().tbt_degraded);
+    }
+
+    #[test]
+    fn trigger_hysteresis_mem() {
+        let config = TriggerConfig {
+            tbt_enter: 0.30,
+            tbt_exit: 0.10,
+            tbt_warmup_tokens: 20,
+            mem_enter: 0.80,
+            mem_exit: 0.60,
+            temp_enter: 0.70,
+            temp_exit: 0.50,
+        };
+        let mut engine = TriggerEngine::new(config);
+
+        engine.update_mem(0.85);
+        assert!(engine.state().mem_low);
+
+        engine.update_mem(0.65);
+        assert!(engine.state().mem_low); // still active (between exit and enter)
+
+        engine.update_mem(0.55);
+        assert!(!engine.state().mem_low); // below exit threshold
+    }
+
+    #[test]
+    fn trigger_hysteresis_temp() {
+        let config = TriggerConfig {
+            tbt_enter: 0.30,
+            tbt_exit: 0.10,
+            tbt_warmup_tokens: 20,
+            mem_enter: 0.80,
+            mem_exit: 0.60,
+            temp_enter: 0.70,
+            temp_exit: 0.50,
+        };
+        let mut engine = TriggerEngine::new(config);
+
+        engine.update_temp(0.75);
+        assert!(engine.state().temp_high);
+
+        engine.update_temp(0.55);
+        assert!(engine.state().temp_high);
+
+        engine.update_temp(0.45);
+        assert!(!engine.state().temp_high);
     }
 }
