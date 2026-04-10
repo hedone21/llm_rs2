@@ -10,6 +10,9 @@ pub struct Config {
     pub compute: Option<ComputeMonitorConfig>,
     pub energy: Option<EnergyMonitorConfig>,
     pub external: Option<ExternalMonitorConfig>,
+    /// Online adaptation settings for LuaPolicy.
+    #[serde(default)]
+    pub adaptation: AdaptationConfig,
     #[cfg(feature = "hierarchical")]
     pub policy: Option<PolicyConfig>,
 }
@@ -167,6 +170,90 @@ impl Default for ExternalMonitorConfig {
         }
     }
 }
+
+/// Configuration for LuaPolicy online adaptation (trigger, EWMA, relief defaults).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdaptationConfig {
+    /// EWMA smoothing factor (default: 0.875 = 7/8, Jacobson TCP RTT).
+    #[serde(default = "default_ewma_alpha")]
+    pub ewma_alpha: f32,
+
+    /// Path to save/load the learned relief table (empty = disabled).
+    #[serde(default)]
+    pub relief_table_path: String,
+
+    /// Safe temperature baseline for thermal normalization (Celsius).
+    #[serde(default = "default_temp_safe")]
+    pub temp_safe_c: f32,
+
+    /// Critical temperature ceiling for thermal normalization (Celsius).
+    #[serde(default = "default_temp_critical")]
+    pub temp_critical_c: f32,
+
+    /// Trigger thresholds.
+    #[serde(default)]
+    pub trigger: TriggerConfig,
+
+    /// Per-action default relief values [gpu, cpu, memory, thermal, latency, main_app_qos].
+    #[serde(default)]
+    pub default_relief: std::collections::HashMap<String, Vec<f32>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TriggerConfig {
+    #[serde(default = "default_tbt_enter")]
+    pub tbt_enter: f64,
+    #[serde(default = "default_tbt_exit")]
+    pub tbt_exit: f64,
+    #[serde(default = "default_tbt_warmup")]
+    pub tbt_warmup_tokens: u32,
+    #[serde(default = "default_mem_enter")]
+    pub mem_enter: f64,
+    #[serde(default = "default_mem_exit")]
+    pub mem_exit: f64,
+    #[serde(default = "default_temp_enter")]
+    pub temp_enter: f64,
+    #[serde(default = "default_temp_exit")]
+    pub temp_exit: f64,
+}
+
+impl Default for AdaptationConfig {
+    fn default() -> Self {
+        Self {
+            ewma_alpha: 0.875,
+            relief_table_path: String::new(),
+            temp_safe_c: 35.0,
+            temp_critical_c: 50.0,
+            trigger: TriggerConfig::default(),
+            default_relief: std::collections::HashMap::new(),
+        }
+    }
+}
+
+impl Default for TriggerConfig {
+    fn default() -> Self {
+        Self {
+            tbt_enter: 0.30,
+            tbt_exit: 0.10,
+            tbt_warmup_tokens: 20,
+            mem_enter: 0.80,
+            mem_exit: 0.60,
+            temp_enter: 0.70,
+            temp_exit: 0.50,
+        }
+    }
+}
+
+fn default_ewma_alpha() -> f32 { 0.875 }
+fn default_temp_safe() -> f32 { 35.0 }
+fn default_temp_critical() -> f32 { 50.0 }
+fn default_tbt_enter() -> f64 { 0.30 }
+fn default_tbt_exit() -> f64 { 0.10 }
+fn default_tbt_warmup() -> u32 { 20 }
+fn default_mem_enter() -> f64 { 0.80 }
+fn default_mem_exit() -> f64 { 0.60 }
+fn default_temp_enter() -> f64 { 0.70 }
+fn default_temp_exit() -> f64 { 0.50 }
 
 #[cfg(feature = "hierarchical")]
 mod hierarchical_config {
