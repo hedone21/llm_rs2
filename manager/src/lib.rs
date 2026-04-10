@@ -1,3 +1,4 @@
+#[cfg(feature = "hierarchical")]
 pub mod action_registry;
 pub mod channel;
 pub mod config;
@@ -6,9 +7,13 @@ pub mod evaluator;
 #[cfg(feature = "lua")]
 pub mod lua_policy;
 pub mod monitor;
+#[cfg(feature = "hierarchical")]
 pub mod pi_controller;
 pub mod pipeline;
+#[cfg(feature = "hierarchical")]
 pub mod relief;
+#[cfg(feature = "hierarchical")]
 pub mod selector;
+#[cfg(feature = "hierarchical")]
 pub mod supervisory;
 pub mod types;

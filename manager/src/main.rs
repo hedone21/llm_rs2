@@ -2,7 +2,7 @@ use clap::Parser;
 use llm_manager::channel::EngineReceiver;
 use llm_manager::channel::TcpChannel;
 use llm_manager::channel::unix_socket::UnixSocketChannel;
-use llm_manager::config::{Config, PolicyConfig};
+use llm_manager::config::Config;
 use llm_manager::emitter::Emitter;
 use llm_manager::monitor::Monitor;
 use llm_manager::monitor::compute::ComputeMonitor;
@@ -10,12 +10,17 @@ use llm_manager::monitor::energy::EnergyMonitor;
 use llm_manager::monitor::external::ExternalMonitor;
 use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
-use llm_manager::pipeline::{HierarchicalPolicy, PolicyStrategy};
+use llm_manager::pipeline::PolicyStrategy;
 use llm_shared::{EngineMessage, SystemSignal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+
+#[cfg(feature = "hierarchical")]
+use llm_manager::config::PolicyConfig;
+#[cfg(feature = "hierarchical")]
+use llm_manager::pipeline::HierarchicalPolicy;
 
 /// Transport 핸들. unix socket / tcp는 양방향, dbus는 emit-only.
 enum TransportHandle {
@@ -253,19 +258,32 @@ fn create_policy(args: &Args, config: &Config) -> anyhow::Result<Box<dyn PolicyS
         return create_lua_policy(script_path);
     }
 
-    // 기본: HierarchicalPolicy
-    let policy_cfg = load_policy_config(args, config);
-    let mut p = HierarchicalPolicy::new(&policy_cfg);
-    let storage_dir = if policy_cfg.relief_model.storage_dir.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        policy_cfg.relief_model.storage_dir.replacen('~', &home, 1)
-    } else {
-        policy_cfg.relief_model.storage_dir.clone()
-    };
-    let model_path = format!("{}/default_relief.json", storage_dir);
-    p.set_relief_model_path(model_path);
-    log::info!("HierarchicalPolicy initialized");
-    Ok(Box::new(p))
+    // hierarchical feature 없이 script도 없으면 에러
+    #[cfg(not(feature = "hierarchical"))]
+    {
+        let _ = config;
+        anyhow::bail!(
+            "--policy-script is required (built without 'hierarchical' feature; \
+             compile with: cargo build --features hierarchical)"
+        );
+    }
+
+    // 기본: HierarchicalPolicy (hierarchical feature 활성 시)
+    #[cfg(feature = "hierarchical")]
+    {
+        let policy_cfg = load_policy_config(args, config);
+        let mut p = HierarchicalPolicy::new(&policy_cfg);
+        let storage_dir = if policy_cfg.relief_model.storage_dir.starts_with('~') {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+            policy_cfg.relief_model.storage_dir.replacen('~', &home, 1)
+        } else {
+            policy_cfg.relief_model.storage_dir.clone()
+        };
+        let model_path = format!("{}/default_relief.json", storage_dir);
+        p.set_relief_model_path(model_path);
+        log::info!("HierarchicalPolicy initialized");
+        Ok(Box::new(p))
+    }
 }
 
 #[cfg(feature = "lua")]
@@ -292,6 +310,7 @@ fn create_lua_policy(_script_path: &std::path::Path) -> anyhow::Result<Box<dyn P
 /// 1. `--policy-config` CLI 플래그
 /// 2. 메인 config의 `[policy]` 섹션
 /// 3. 기본값 (`PolicyConfig::default()`)
+#[cfg(feature = "hierarchical")]
 fn load_policy_config(args: &Args, config: &Config) -> PolicyConfig {
     if let Some(path) = &args.policy_config {
         match std::fs::read_to_string(path) {

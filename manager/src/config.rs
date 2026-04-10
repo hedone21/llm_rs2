@@ -1,7 +1,4 @@
 use serde::Deserialize;
-use std::collections::HashMap;
-
-use crate::pi_controller::GainZone;
 
 /// Top-level Manager configuration, loadable from TOML.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -13,6 +10,7 @@ pub struct Config {
     pub compute: Option<ComputeMonitorConfig>,
     pub energy: Option<EnergyMonitorConfig>,
     pub external: Option<ExternalMonitorConfig>,
+    #[cfg(feature = "hierarchical")]
     pub policy: Option<PolicyConfig>,
 }
 
@@ -170,138 +168,148 @@ impl Default for ExternalMonitorConfig {
     }
 }
 
-/// 계층형 정책 설정 (PI Controller + Supervisory + Selector + Relief Model)
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(default)]
-pub struct PolicyConfig {
-    pub pi_controller: PiControllerConfig,
-    pub supervisory: SupervisoryConfig,
-    pub selector: SelectorConfig,
-    pub relief_model: ReliefModelConfig,
-    pub actions: HashMap<String, ActionConfig>,
-    pub exclusion_groups: HashMap<String, Vec<String>>,
-}
+#[cfg(feature = "hierarchical")]
+mod hierarchical_config {
+    use super::*;
+    use crate::pi_controller::GainZone;
+    use std::collections::HashMap;
 
-/// PI Controller 설정
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct PiControllerConfig {
-    pub compute_kp: f32,
-    pub compute_ki: f32,
-    pub compute_setpoint: f32,
-    pub memory_kp: f32,
-    pub memory_ki: f32,
-    pub memory_setpoint: f32,
-    pub thermal_kp: f32,
-    pub thermal_ki: f32,
-    pub thermal_setpoint: f32,
-    pub integral_clamp: f32,
-    /// Memory 도메인의 gain scheduling 구간.
-    /// 미설정 시 고정 memory_kp를 사용한다.
+    /// 계층형 정책 설정 (PI Controller + Supervisory + Selector + Relief Model)
+    #[derive(Debug, Clone, Default, Deserialize)]
     #[serde(default)]
-    pub memory_gain_zones: Vec<GainZone>,
-}
+    pub struct PolicyConfig {
+        pub pi_controller: PiControllerConfig,
+        pub supervisory: SupervisoryConfig,
+        pub selector: SelectorConfig,
+        pub relief_model: ReliefModelConfig,
+        pub actions: HashMap<String, ActionConfig>,
+        pub exclusion_groups: HashMap<String, Vec<String>>,
+    }
 
-impl Default for PiControllerConfig {
-    fn default() -> Self {
-        Self {
-            compute_kp: 1.5,
-            compute_ki: 0.3,
-            compute_setpoint: 0.70,
-            memory_kp: 2.0,
-            memory_ki: 0.5,
-            memory_setpoint: 0.75,
-            thermal_kp: 1.0,
-            thermal_ki: 0.2,
-            thermal_setpoint: 0.80,
-            integral_clamp: 2.0,
-            memory_gain_zones: Vec::new(),
+    /// PI Controller 설정
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    pub struct PiControllerConfig {
+        pub compute_kp: f32,
+        pub compute_ki: f32,
+        pub compute_setpoint: f32,
+        pub memory_kp: f32,
+        pub memory_ki: f32,
+        pub memory_setpoint: f32,
+        pub thermal_kp: f32,
+        pub thermal_ki: f32,
+        pub thermal_setpoint: f32,
+        pub integral_clamp: f32,
+        /// Memory 도메인의 gain scheduling 구간.
+        /// 미설정 시 고정 memory_kp를 사용한다.
+        #[serde(default)]
+        pub memory_gain_zones: Vec<GainZone>,
+    }
+
+    impl Default for PiControllerConfig {
+        fn default() -> Self {
+            Self {
+                compute_kp: 1.5,
+                compute_ki: 0.3,
+                compute_setpoint: 0.70,
+                memory_kp: 2.0,
+                memory_ki: 0.5,
+                memory_setpoint: 0.75,
+                thermal_kp: 1.0,
+                thermal_ki: 0.2,
+                thermal_setpoint: 0.80,
+                integral_clamp: 2.0,
+                memory_gain_zones: Vec::new(),
+            }
         }
+    }
+
+    /// Supervisory 모드 전환 임계값 설정
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    pub struct SupervisoryConfig {
+        pub warning_threshold: f32,
+        pub critical_threshold: f32,
+        pub warning_release: f32,
+        pub critical_release: f32,
+        pub hold_time_secs: f32,
+    }
+
+    impl Default for SupervisoryConfig {
+        fn default() -> Self {
+            Self {
+                warning_threshold: 0.4,
+                critical_threshold: 0.7,
+                warning_release: 0.25,
+                critical_release: 0.50,
+                hold_time_secs: 4.0,
+            }
+        }
+    }
+
+    /// Action Selector 설정
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    pub struct SelectorConfig {
+        pub latency_budget: f32,
+        pub algorithm: String,
+    }
+
+    impl Default for SelectorConfig {
+        fn default() -> Self {
+            Self {
+                latency_budget: 0.5,
+                algorithm: "exhaustive".to_string(),
+            }
+        }
+    }
+
+    /// Relief Estimator 모델 설정
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    pub struct ReliefModelConfig {
+        pub forgetting_factor: f32,
+        pub prior_weight: u32,
+        pub storage_dir: String,
+    }
+
+    impl Default for ReliefModelConfig {
+        fn default() -> Self {
+            Self {
+                forgetting_factor: 0.995,
+                prior_weight: 5,
+                storage_dir: "~/.llm_rs/models".to_string(),
+            }
+        }
+    }
+
+    /// 액션별 메타데이터 설정
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(default)]
+    pub struct ActionConfig {
+        pub lossy: bool,
+        pub reversible: bool,
+        #[serde(default = "default_cost")]
+        pub default_cost: f32,
+    }
+
+    impl Default for ActionConfig {
+        fn default() -> Self {
+            Self {
+                lossy: false,
+                reversible: false,
+                default_cost: default_cost(),
+            }
+        }
+    }
+
+    fn default_cost() -> f32 {
+        1.0
     }
 }
 
-/// Supervisory 모드 전환 임계값 설정
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct SupervisoryConfig {
-    pub warning_threshold: f32,
-    pub critical_threshold: f32,
-    pub warning_release: f32,
-    pub critical_release: f32,
-    pub hold_time_secs: f32,
-}
-
-impl Default for SupervisoryConfig {
-    fn default() -> Self {
-        Self {
-            warning_threshold: 0.4,
-            critical_threshold: 0.7,
-            warning_release: 0.25,
-            critical_release: 0.50,
-            hold_time_secs: 4.0,
-        }
-    }
-}
-
-/// Action Selector 설정
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct SelectorConfig {
-    pub latency_budget: f32,
-    pub algorithm: String,
-}
-
-impl Default for SelectorConfig {
-    fn default() -> Self {
-        Self {
-            latency_budget: 0.5,
-            algorithm: "exhaustive".to_string(),
-        }
-    }
-}
-
-/// Relief Estimator 모델 설정
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct ReliefModelConfig {
-    pub forgetting_factor: f32,
-    pub prior_weight: u32,
-    pub storage_dir: String,
-}
-
-impl Default for ReliefModelConfig {
-    fn default() -> Self {
-        Self {
-            forgetting_factor: 0.995,
-            prior_weight: 5,
-            storage_dir: "~/.llm_rs/models".to_string(),
-        }
-    }
-}
-
-/// 액션별 메타데이터 설정
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default)]
-pub struct ActionConfig {
-    pub lossy: bool,
-    pub reversible: bool,
-    #[serde(default = "default_cost")]
-    pub default_cost: f32,
-}
-
-impl Default for ActionConfig {
-    fn default() -> Self {
-        Self {
-            lossy: false,
-            reversible: false,
-            default_cost: default_cost(),
-        }
-    }
-}
-
-fn default_cost() -> f32 {
-    1.0
-}
+#[cfg(feature = "hierarchical")]
+pub use hierarchical_config::*;
 
 #[cfg(test)]
 mod tests {
@@ -392,9 +400,13 @@ transport = "stdin"
         assert!(config.external.unwrap().enabled);
     }
 
-    #[test]
-    fn parse_policy_config() {
-        let toml_str = r#"
+    #[cfg(feature = "hierarchical")]
+    mod hierarchical_tests {
+        use super::super::*;
+
+        #[test]
+        fn parse_policy_config() {
+            let toml_str = r#"
 [policy.pi_controller]
 compute_kp = 1.5
 compute_ki = 0.3
@@ -417,55 +429,55 @@ reversible = false
 [policy.exclusion_groups]
 eviction = ["kv_evict_sliding", "kv_evict_h2o"]
 "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let policy = config.policy.unwrap();
-        assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
-        assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
-        let switch = policy.actions.get("switch_hw").unwrap();
-        assert!(!switch.lossy);
-        assert!(switch.reversible);
-        let kv_evict = policy.actions.get("kv_evict_sliding").unwrap();
-        assert!(kv_evict.lossy);
-        let eviction = policy.exclusion_groups.get("eviction").unwrap();
-        assert_eq!(eviction.len(), 2);
-    }
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let policy = config.policy.unwrap();
+            assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
+            assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
+            let switch = policy.actions.get("switch_hw").unwrap();
+            assert!(!switch.lossy);
+            assert!(switch.reversible);
+            let kv_evict = policy.actions.get("kv_evict_sliding").unwrap();
+            assert!(kv_evict.lossy);
+            let eviction = policy.exclusion_groups.get("eviction").unwrap();
+            assert_eq!(eviction.len(), 2);
+        }
 
-    #[test]
-    fn policy_config_defaults() {
-        let policy = PolicyConfig::default();
-        assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
-        assert!((policy.pi_controller.memory_kp - 2.0).abs() < f32::EPSILON);
-        assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
-        assert!((policy.supervisory.hold_time_secs - 4.0).abs() < f32::EPSILON);
-        assert_eq!(policy.selector.algorithm, "exhaustive");
-        assert!((policy.relief_model.forgetting_factor - 0.995).abs() < f32::EPSILON);
-        assert_eq!(policy.relief_model.prior_weight, 5);
-    }
+        #[test]
+        fn policy_config_defaults() {
+            let policy = PolicyConfig::default();
+            assert!((policy.pi_controller.compute_kp - 1.5).abs() < f32::EPSILON);
+            assert!((policy.pi_controller.memory_kp - 2.0).abs() < f32::EPSILON);
+            assert!((policy.supervisory.warning_threshold - 0.4).abs() < f32::EPSILON);
+            assert!((policy.supervisory.hold_time_secs - 4.0).abs() < f32::EPSILON);
+            assert_eq!(policy.selector.algorithm, "exhaustive");
+            assert!((policy.relief_model.forgetting_factor - 0.995).abs() < f32::EPSILON);
+            assert_eq!(policy.relief_model.prior_weight, 5);
+        }
 
-    #[test]
-    fn config_policy_optional_none_by_default() {
-        let config = Config::default();
-        assert!(config.policy.is_none());
-    }
+        #[test]
+        fn config_policy_optional_none_by_default() {
+            let config = Config::default();
+            assert!(config.policy.is_none());
+        }
 
-    #[test]
-    fn action_config_default_cost_fallback_is_one() {
-        // default_cost 필드 없이 파싱 시 1.0으로 폴백되어야 한다
-        let toml_str = r#"
+        #[test]
+        fn action_config_default_cost_fallback_is_one() {
+            // default_cost 필드 없이 파싱 시 1.0으로 폴백되어야 한다
+            let toml_str = r#"
 [policy.actions.kv_evict_sliding]
 lossy = true
 reversible = false
 "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let policy = config.policy.unwrap();
-        let action = policy.actions.get("kv_evict_sliding").unwrap();
-        assert!((action.default_cost - 1.0).abs() < f32::EPSILON);
-    }
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let policy = config.policy.unwrap();
+            let action = policy.actions.get("kv_evict_sliding").unwrap();
+            assert!((action.default_cost - 1.0).abs() < f32::EPSILON);
+        }
 
-    #[test]
-    fn action_config_explicit_default_cost_loaded() {
-        // 명시적 default_cost 값이 정확히 로드되어야 한다
-        let toml_str = r#"
+        #[test]
+        fn action_config_explicit_default_cost_loaded() {
+            // 명시적 default_cost 값이 정확히 로드되어야 한다
+            let toml_str = r#"
 [policy.actions.kv_evict_sliding]
 lossy = true
 reversible = false
@@ -476,17 +488,18 @@ lossy = true
 reversible = true
 default_cost = 2.0
 "#;
-        let config: Config = toml::from_str(toml_str).unwrap();
-        let policy = config.policy.unwrap();
-        let evict = policy.actions.get("kv_evict_sliding").unwrap();
-        assert!((evict.default_cost - 0.5).abs() < f32::EPSILON);
-        let skip = policy.actions.get("layer_skip").unwrap();
-        assert!((skip.default_cost - 2.0).abs() < f32::EPSILON);
-    }
+            let config: Config = toml::from_str(toml_str).unwrap();
+            let policy = config.policy.unwrap();
+            let evict = policy.actions.get("kv_evict_sliding").unwrap();
+            assert!((evict.default_cost - 0.5).abs() < f32::EPSILON);
+            let skip = policy.actions.get("layer_skip").unwrap();
+            assert!((skip.default_cost - 2.0).abs() < f32::EPSILON);
+        }
 
-    #[test]
-    fn action_config_default_impl_has_cost_one() {
-        let cfg = ActionConfig::default();
-        assert!((cfg.default_cost - 1.0).abs() < f32::EPSILON);
+        #[test]
+        fn action_config_default_impl_has_cost_one() {
+            let cfg = ActionConfig::default();
+            assert!((cfg.default_cost - 1.0).abs() < f32::EPSILON);
+        }
     }
 }
