@@ -252,8 +252,8 @@ impl EwmaReliefTable {
             entry.relief = *observed;
         } else {
             let a = self.alpha;
-            for i in 0..RELIEF_DIMS {
-                entry.relief[i] = a * entry.relief[i] + (1.0 - a) * observed[i];
+            for (i, &obs_val) in observed.iter().enumerate() {
+                entry.relief[i] = a * entry.relief[i] + (1.0 - a) * obs_val;
             }
         }
         entry.observation_count += 1;
@@ -266,14 +266,14 @@ impl EwmaReliefTable {
 
     fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(&self.entries)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
     fn load(path: &Path, alpha: f32, defaults: HashMap<String, Vec<f32>>) -> std::io::Result<Self> {
         let json = std::fs::read_to_string(path)?;
         let entries: HashMap<String, ReliefEntry> = serde_json::from_str(&json)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(std::io::Error::other)?;
         Ok(Self {
             entries,
             alpha,
@@ -632,11 +632,11 @@ impl PolicyStrategy for LuaPolicy {
         }
 
         // 2. TBT 업데이트
-        if let Some(ref status) = self.engine_state {
-            if status.phase == "decode" {
-                self.trigger_engine
-                    .update_tbt_from_throughput(status.actual_throughput);
-            }
+        if let Some(ref status) = self.engine_state
+            && status.phase == "decode"
+        {
+            self.trigger_engine
+                .update_tbt_from_throughput(status.actual_throughput);
         }
 
         // 3. Observation 체크
@@ -1981,7 +1981,10 @@ mod tests {
         let config = AdaptationConfig {
             default_relief: {
                 let mut m = HashMap::new();
-                m.insert("switch_hw".to_string(), vec![0.5, -0.3, 0.0, 0.3, -0.1, 0.0]);
+                m.insert(
+                    "switch_hw".to_string(),
+                    vec![0.5, -0.3, 0.0, 0.3, -0.1, 0.0],
+                );
                 m
             },
             ..AdaptationConfig::default()
