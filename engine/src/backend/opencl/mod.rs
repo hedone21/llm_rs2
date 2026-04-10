@@ -111,6 +111,9 @@ struct KernelCache {
     kernel_add_rms_norm_oop: CoreKernel,
     kernel_flash_attn_f32: Option<CoreKernel>,
     kernel_flash_attn_f32_f16: Option<CoreKernel>,
+    /// Decode-specialized flash attention (single-query, online softmax).
+    /// Same program as kernel_flash_attn_f32_f16 (Q=F32, KV=F16, DK=DV=64).
+    kernel_flash_attn_f32_f16_q1: Option<CoreKernel>,
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_f32_f32: Option<CoreKernel>,
@@ -697,6 +700,9 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16: flash_attn_f32_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16").ok()),
+            kernel_flash_attn_f32_f16_q1: flash_attn_f32_f16_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
             kernel_mul_mm_f16_f32: gemm_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f16_f32_l4_lm").ok()),
@@ -1326,6 +1332,158 @@ impl OpenCLBackend {
             let global_work_size: [usize; 3] = [n_groups_q * BLOCK_M, n_heads_q * batch_size, 1];
             let local_work_size: [usize; 3] = [BLOCK_M, 1, 1];
 
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                2,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        Ok(true)
+    }
+
+    /// Decode-specialized flash attention: single query per head, online softmax,
+    /// zero intermediate score buffer. Dispatches `flash_attn_f32_f16_q1` from the
+    /// same program as `flash_attention_prefill_gpu`.
+    ///
+    /// Requires: head_dim=64 (DK/DV compile-time constant), F16 KV on GPU,
+    /// HeadMajor KV layout, `seq_len=1`, and no score output.
+    /// Returns Ok(true) if the kernel was dispatched; Ok(false) if preconditions
+    /// are not met and the caller should fall back to the legacy attention kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn flash_attention_decode_gpu(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+    ) -> Result<bool> {
+        // Head dim must match the DK/DV compile-time constant in flash_attn_f32_f16.cl.
+        if head_dim != 64 {
+            return Ok(false);
+        }
+        // Only F16 KV on HeadMajor GPU buffer is supported in this prototype.
+        if k_cache.dtype() != DType::F16 {
+            return Ok(false);
+        }
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == n_heads_kv && k_shape[1] != k_shape[2];
+        if !is_head_major {
+            return Ok(false);
+        }
+        let kv_capacity = k_shape[2];
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = match &kernels.kernel_flash_attn_f32_f16_q1 {
+            Some(k) => k,
+            None => return Ok(false),
+        };
+
+        let q_buf = get_cl_mem(q.buffer().as_ref())?;
+        let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
+        let v_buf = get_cl_mem(v_cache.buffer().as_ref())?;
+        let o_buf = get_cl_mem(out.buffer().as_ref())?;
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Q strides in bytes (F32 [batch=1, seq_len=1, n_heads_q, head_dim])
+        let q_nb1 = (n_heads_q * head_dim * 4) as u64; // position stride (unused, seq=1)
+        let q_nb2 = (head_dim * 4) as u64; // head stride
+        let q_nb3 = q_nb1; // batch stride (seq=1)
+
+        // KV strides in bytes — HeadMajor [1, kv_heads, capacity, head_dim]
+        let kv_elem_size: u64 = 2; // F16
+        let k_nb1 = (head_dim as u64) * kv_elem_size; // position stride within a head
+        let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size; // head stride
+        let k_nb3 = (n_heads_kv as u64) * k_nb2; // batch stride
+        let (v_nb1, v_nb2, v_nb3) = (k_nb1, k_nb2, k_nb3);
+
+        // Output strides in bytes (F32 [batch=1, seq_len=1, n_heads_q, head_dim])
+        let o_nb1 = (head_dim * 4) as u64; // head stride (q1 uses this for head offset)
+        let o_nb2 = (n_heads_q * head_dim * 4) as u64; // position stride (unused)
+        let o_nb3 = o_nb2; // batch stride
+
+        let n_q = 1i32;
+        let n_kv = cache_seq_len as i32;
+        let is_causal = 0i32; // single query, no causal mask needed
+        let n_head = n_heads_q as i32;
+        let n_head_kv_arg = n_heads_kv as i32;
+        let max_bias = 0.0f32;
+        let m0 = 0.0f32;
+        let m1 = 0.0f32;
+        let n_head_log2 = 0i32;
+        let logit_softcap = 0.0f32;
+        let zero_u64 = 0u64;
+        let zero_i32 = 0i32;
+
+        unsafe {
+            // Q, K, V, O buffers + offsets (args 0-7)
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(k_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(v_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::mem(o_buf))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
+            // Scalar params (args 8-12)
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
+            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&n_kv))?;
+            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
+            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
+            // Q strides (args 13-15)
+            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
+            // K strides (args 16-18)
+            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
+            // V strides (args 19-21)
+            ocl::core::set_kernel_arg(kernel, 19, ocl::core::ArgVal::scalar(&v_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 20, ocl::core::ArgVal::scalar(&v_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 21, ocl::core::ArgVal::scalar(&v_nb3))?;
+            // O strides (args 22-24)
+            ocl::core::set_kernel_arg(kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
+            ocl::core::set_kernel_arg(kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
+            ocl::core::set_kernel_arg(kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
+            // ALiBi params — unused (args 25-29)
+            ocl::core::set_kernel_arg(kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
+            ocl::core::set_kernel_arg(kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
+            ocl::core::set_kernel_arg(kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
+            ocl::core::set_kernel_arg(kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
+            ocl::core::set_kernel_arg(kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
+            // n_head_kv (arg 30)
+            ocl::core::set_kernel_arg(kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
+            // mask = NULL (args 31-37)
+            ocl::core::set_kernel_arg(kernel, 31, ocl::core::ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
+            ocl::core::set_kernel_arg(kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
+            // sinks = NULL (args 38-39)
+            ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+
+            // Q1_WG_SIZE = 64 (compile-time constant in the kernel)
+            const Q1_WG_SIZE: usize = 64;
+            // Global = [Q1_WG_SIZE, n_heads_q * batch (= n_heads_q for decode batch=1), 1]
+            // Each WG handles one (batch, head) pair.
+            let global_work_size: [usize; 3] = [Q1_WG_SIZE, n_heads_q, 1];
+            let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
             ocl::core::enqueue_kernel(
                 &self.queue,
                 kernel,
@@ -1992,6 +2150,29 @@ impl Backend for OpenCLBackend {
         cache_seq_len: usize,
         scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
+        // Flash-attention decode fast path: single-pass online softmax, vectorized
+        // float4 K/V reads, no local-memory output reduction. Used when none of the
+        // score-accumulator paths are active and the kernel's compile-time DK/DV
+        // matches the current head_dim.
+        let gpu_acc_active = {
+            let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
+            gpu_acc.as_ref().is_some_and(|acc| acc.is_active())
+        };
+        if !gpu_acc_active && scores_out.is_none() {
+            if self.flash_attention_decode_gpu(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+            )? {
+                return Ok(());
+            }
+        }
+
         let q_buf =
             get_cl_mem(q.buffer().as_ref()).map_err(|_| anyhow!("Q is not OpenCL buffer"))?;
         let k_buf =
