@@ -1951,4 +1951,93 @@ mod tests {
         engine.update_temp(0.45);
         assert!(!engine.state().temp_high);
     }
+
+    #[test]
+    fn lua_policy_e2e_signal_to_ctx() {
+        use crate::config::AdaptationConfig;
+        use crate::pipeline::PolicyStrategy;
+        use llm_shared::SystemSignal;
+
+        let script = r#"
+            function decide(ctx)
+                assert(ctx.coef, "ctx.coef missing")
+                assert(ctx.coef.pressure, "ctx.coef.pressure missing")
+                assert(ctx.coef.trigger, "ctx.coef.trigger missing")
+                assert(ctx.coef.relief, "ctx.coef.relief missing")
+                assert(ctx.coef.pressure.gpu >= 0)
+                assert(ctx.coef.pressure.memory >= 0)
+                assert(type(ctx.coef.trigger.tbt_degraded) == "boolean")
+                assert(type(ctx.coef.trigger.mem_low) == "boolean")
+                assert(ctx.coef.relief.switch_hw, "switch_hw relief missing")
+                assert(ctx.coef.relief.switch_hw.gpu, "switch_hw.gpu missing")
+                return {}
+            end
+        "#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("test_policy.lua");
+        std::fs::write(&script_path, script).unwrap();
+
+        let config = AdaptationConfig {
+            default_relief: {
+                let mut m = HashMap::new();
+                m.insert("switch_hw".to_string(), vec![0.5, -0.3, 0.0, 0.3, -0.1, 0.0]);
+                m
+            },
+            ..AdaptationConfig::default()
+        };
+
+        let mut policy = LuaPolicy::new(script_path.to_str().unwrap(), config).unwrap();
+
+        let signal = SystemSignal::ComputeGuidance {
+            level: llm_shared::Level::Warning,
+            recommended_backend: llm_shared::RecommendedBackend::Cpu,
+            reason: llm_shared::ComputeReason::CpuBottleneck,
+            cpu_usage_pct: 45.0,
+            gpu_usage_pct: 82.0,
+        };
+
+        let result = policy.process_signal(&signal);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn lua_policy_e2e_trigger_fires() {
+        use crate::config::AdaptationConfig;
+        use crate::pipeline::PolicyStrategy;
+        use llm_shared::{EngineCommand, SystemSignal};
+
+        let script = r#"
+            function decide(ctx)
+                if ctx.coef.trigger.mem_low then
+                    return {{type = "kv_evict_h2o", keep_ratio = 0.5}}
+                end
+                return {}
+            end
+        "#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("test_trigger.lua");
+        std::fs::write(&script_path, script).unwrap();
+
+        let config = AdaptationConfig::default();
+        let mut policy = LuaPolicy::new(script_path.to_str().unwrap(), config).unwrap();
+
+        // Memory pressure: available=1MB / total=8MB = 87.5% used > 80% enter
+        let signal = SystemSignal::MemoryPressure {
+            level: llm_shared::Level::Warning,
+            available_bytes: 1_000_000,
+            total_bytes: 8_000_000,
+            reclaim_target_bytes: 0,
+        };
+
+        let result = policy.process_signal(&signal);
+        assert!(result.is_some(), "Expected directive when mem_low triggers");
+        let directive = result.unwrap();
+        assert_eq!(directive.commands.len(), 1);
+        assert!(
+            matches!(directive.commands[0], EngineCommand::KvEvictH2o { keep_ratio } if (keep_ratio - 0.5).abs() < f32::EPSILON),
+            "Expected KvEvictH2o with keep_ratio=0.5"
+        );
+    }
 }
