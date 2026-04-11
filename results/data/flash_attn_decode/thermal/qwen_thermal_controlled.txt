@@ -1,0 +1,19 @@
+# Sat Apr 11 10:17:03 KST 2026 — Qwen thermal-controlled comparison
+# Device: Samsung Galaxy S25 (Adreno 830)
+# Thermal threshold: 55000mC (max of cpu-0-0-0 + gpuss-5)
+# Cooldown: min 45s, max 180s
+# Runs per combo: 3
+
+run=1 order=llm_first
+  A short(pf=7,dc=64): llm.rs=62.82 llama.cpp=52.66
+  B long (pf=720,dc=128): llm.rs=89.13 llama.cpp=70.03
+run=2 order=llc_first
+  A short(pf=7,dc=64): llm.rs=57.83 llama.cpp=52.44
+  B long (pf=720,dc=128): llm.rs=110.80 llama.cpp=61.20
+run=3 order=llm_first
+  A short(pf=7,dc=64): llm.rs=58.02 llama.cpp=50.20
+  B long (pf=720,dc=128): llm.rs=69.46 llama.cpp=67.52
+
+=== Medians across 3 runs ===
+  A short(pf=7,dc=64): llm.rs=58.02ms  llama.cpp=52.44ms  delta=+10.6%
+  B long (pf=720,dc=128): llm.rs=89.13ms  llama.cpp=67.52ms  delta=+32.0%
