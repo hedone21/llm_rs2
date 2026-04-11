@@ -1,0 +1,14 @@
+# Intrinsic kernel N=1 thermal-controlled 2026년  4월 11일 토요일 19시 30분 53초 KST
+# Binary: generate feat/f16-intrinsic-gemv HEAD fad1421 (vfmaq_f16 intrinsic)
+
+[short] rest 300s...
+[short] thermal_pre=[34600 35300 33500 33100 ]
+Prefill: 135.59 ms (6 tokens, 44.2 tok/s)
+Decode: 57.32 ms/tok (17.4 tok/s) [63 tokens, forward only]
+Avg TBT: 57.96 ms (17.3 tokens/sec)
+[long] rest 300s...
+[long] thermal_pre=[33800 34200 33500 33100 ]
+Prefill: 7999.39 ms (657 tokens, 82.1 tok/s)
+Decode: 70.17 ms/tok (14.3 tok/s) [3 tokens, forward only]
+Avg TBT: 75.05 ms (13.3 tokens/sec)
+=== Done 2026년  4월 11일 토요일 19시 41분 17초 KST ===

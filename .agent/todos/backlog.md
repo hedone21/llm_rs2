@@ -176,33 +176,58 @@
 - **Acceptance Criteria**: contains 기반 패턴 매칭, 기존 exact match와 공존, 테스트 추가
 - **Notes**: 필요성 미확정. 실제 다중 장치 배포 시점에 재평가
 
-## [P1] Qwen CPU decode GEMV load-to-use stall 해소
-- **Status**: TODO
+## [P1] Qwen CPU decode gap 해소 — matmul 외 원인 조사 필요
+- **Status**: TODO (재정의됨)
 - **Sprint**: next
-- **Dependencies**: 없음 (native FMA 기반 `a9cd3cc` 완료 후 선행 조건 충족)
+- **Dependencies**: 없음
 - **Description**: |
   Qwen 2.5-1.5B CPU decode가 llama.cpp CPU 대비 +14-15% 느린 gap이 남아 있음.
-  Native F16 FMA GEMV kernel 전환 (`a9cd3cc`) 후에도 short −0.5%, long +0.3% (mean)로
-  gap이 그대로. 원인은 `vec_dot_f16_native_gemv_4rows`의 inline `asm!` 매크로 구조가
-  컴파일러 instruction scheduling을 막아서 **B row 전환 시 load → first-use 거리가
-  2 instructions밖에 안 됨** (Oryon vector load latency ~5 cycles → stall 누적).
-  Disassembly 위치: `target/aarch64-linux-android/release/generate`
-  `0x369ee8`–`0x369f74` (main loop).
 
-  자세한 분석: `results/data/flash_attn_decode/thermal/FMA_ANALYSIS.md`
+  ### 이미 시도한 것 (모두 실측 효과 없음)
+  1. **Native F16 FMA 전환** (`a9cd3cc`, 2026-04-11): FMLAL → FMLA .8H inline asm.
+     Short −0.5% / long +0.3% (mean) — noise 범위. Commit 유지됨 (cleanup 가치).
+     분석: `results/data/flash_attn_decode/thermal/FMA_ANALYSIS.md`
+  2. **vfmaq_f16 intrinsic 포팅** (branch `feat/f16-intrinsic-gemv`, 2026-04-11,
+     revert): nightly toolchain + `stdarch_neon_f16`. Disassembly 상 main loop
+     36→30 instructions, load-to-use 거리 2→3-5로 명확히 개선. 그러나 실측 short
+     동등, long 데이터 부족, **prefill +15-20% regression**. Net negative → revert.
+     분석: `results/data/flash_attn_decode/thermal/INTRINSIC_EXPERIMENT.md`
 
-  ### 접근 후보 (ROI 순)
-  1. Inline asm → `vfmaq_f16` intrinsic 전환으로 컴파일러 scheduling 회복
-  2. 4개 per-row asm block을 하나의 multi-row asm으로 병합, explicit interleaving
-  3. Chunk size 튜닝 (llama.cpp: 64 rows/chunk vs 우리: n_threads*8=64 chunks)
-  4. Big.LITTLE affinity (variance 감소, gap 축소는 부차적)
+  ### 학습된 것
+  - **Kernel-level instruction scheduling 최적화는 실측에 반영되지 않음**: S25에서
+    FMA GEMV는 이미 memory subsystem ceiling에 가까움. Disassembly 개선이 runtime
+    개선을 보장하지 않는다.
+  - **Nightly toolchain 전환은 숨은 cost 있음**: 포팅 대상이 아닌 prefill 경로에서도
+    regression 관찰됨. LLVM/codegen 차이가 전체 binary에 영향.
+  - 과거 S24 `b25bc19` 교훈 재확인: "inner loop optimizations (multi-row, prefetch,
+    stride) have no effect because the bottleneck is DRAM bandwidth".
+
+  ### 이제 필요한 것: 진짜 병목 찾기
+  Kernel 최적화 루트는 exhausted. 다음 접근:
+
+  1. **Per-op 프로덕션 프로파일링** (--profile 없이). `simpleperf`, `perf`, 또는
+     수동 timestamp로 token당 어디에 시간이 쓰이는지 정확히 측정. matmul_ffn 외
+     candidate: RMSNorm, attention softmax, sampling, thread dispatch, SpinPool
+     overhead. **이 정보 없이는 추가 최적화가 다 hunch-driven이다.**
+  2. **Thread pool dispatch overhead 측정**: SpinPool 자체의 per-chunk cost.
+     llama.cpp threadpool과 어느 정도 차이 나는지.
+  3. **Chunk size A/B** (llama.cpp 64 rows/chunk vs 우리 140 rows/chunk). 1줄 변경,
+     빠른 실험 가치 있음.
+  4. **Big.LITTLE affinity**: Long decode가 bi-modal (±5.8% spread)인 이유가
+     Oryon Phoenix L/M 스케줄링 jitter일 가능성. Gap 축소보다 variance 축소.
+  5. **Single-asm super-block** (stable-friendly 최후 옵션): 4 rows 모두 한 asm
+     블록 안에서 explicit interleaving. 학습 결과(1) 기반으로 ROI 낮아 보이지만
+     theoretical latency-hiding 경로를 완전히 소진할 마지막 카드.
+
+  **(1)이 blocker** — 병목이 어디인지 모른 채로 (2)-(5) 시도는 또 다른 neutral
+  실험이 될 위험.
 - **Acceptance Criteria**: |
-  - CPU decode short <= llama.cpp + 5% (현재 +15.2% → 목표 50-53 ms/tok)
-  - CPU decode long <= llama.cpp + 5% (현재 +14.1% → 목표 54-57 ms/tok)
-  - H2O/profile/Llama/Qwen/Gemma3 regression 없음 (6-test sanity)
+  - 먼저 (1) 프로파일링으로 per-op breakdown 확보 → 보고
+  - 그 다음 가장 큰 op을 타겟으로 실측 최적화
+  - 최종 목표: CPU decode short ≤ llama.cpp + 5%, long ≤ llama.cpp + 5%
   - V10 strict thermal isolation 프로토콜로 검증
 - **Notes**: |
-  - 과거 `b25bc19` (S24)에서 prefetch 효과 없었음을 기억할 것 — 이번엔 native FMA로
-    instruction density가 낮아져 prefetch insertion 여유가 있을 가능성
+  - **시작점은 kernel이 아니라 measurement**. hunch에 기반한 kernel 변경은 금지.
   - Quality/Correctness는 `--greedy` byte-identical test로 보호
-  - Researcher 조사 결과 llama.cpp도 F16 경로에 software prefetch 없음, 기본 affinity 없음
+  - branch `feat/f16-intrinsic-gemv` 유지 (미래 참고용, merge 안 됨)
+  - Device backup `/data/local/tmp/generate.fma-asm.backup` 유지
