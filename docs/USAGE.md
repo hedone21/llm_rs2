@@ -1373,6 +1373,79 @@ mock_manager는 `--scenario` 옵션으로 JSON 파일을 입력받아 여러 com
 
 `--wait-secs`는 시나리오 재생 전 Heartbeat 수신 대기 시간이다. 시나리오 내부의 `delay_ms`와는 별개로 동작한다.
 
+**Command별 Engine 전제조건**
+
+각 command가 실제 효과를 내려면 `generate`를 적절한 플래그로 기동해야 한다. 전제조건이 미충족되면 command는 `Ok`를 반환하지만 효과 없이 경고 로그만 출력한다 (graceful degradation).
+
+| Command | 필수 generate 플래그 | 없을 때 동작 |
+|---------|---------------------|-------------|
+| `KvEvictSliding` | `--enable-resilience` | score accumulator 미활성, eviction 효과 제한 |
+| `KvEvictH2o` | `--enable-resilience` | 위와 동일 |
+| `KvStreaming` | `--enable-resilience` | 위와 동일 |
+| `KvMergeD2o` | `--enable-resilience` | 위와 동일 |
+| `KvQuantDynamic` | `--kv-dynamic-quant` | KIVI 코드 경로 자체가 비활성, 명령 미도달 |
+| `Throttle` | 없음 | 항상 작동 |
+| `SetTargetTbt` | 없음 | 항상 작동 |
+| `SwitchHw` | `--resilience-prealloc-switch` | 경고 로그 후 무시 |
+| `LayerSkip` | 없음 | 항상 작동 |
+| `SetPartitionRatio` | `--tensor-partition 0.001` 이상 (또는 `--resilience-prealloc-switch`) | weight CPU 미접근 시 "rejected" 경고 |
+| `SetPrefillPolicy` | `--chunk-size`/`--yield-ms`는 없음. `--cpu-chunk-size`는 zero-copy 필요 | cpu_chunk만 "rejected" 경고, 나머지 적용 |
+| `Suspend` | 없음 | 항상 작동. **주의: generate가 single-shot이라 Suspend 시 세션 종료 후 프로세스 exit** |
+| `Resume` | 없음 | 프로토콜 정상이나, Suspend 후 engine이 이미 exit한 상태에서는 도달 불가 |
+| `RestoreDefaults` | 없음 | 항상 작동. throttle, eviction, skip_ratio, partition_ratio, prefill 정책 모두 초기화 |
+| `RequestQcf` | `--enable-resilience` (score accumulator 활성화) | accumulator 미활성 시 비어 있는 QcfEstimate 반환 |
+
+**표준 Engine 기동 설정 (검증용)**
+
+command 검증 시 아래 4종 설정을 조합한다. 모든 설정에 `--ignore-eos`를 추가하면 EOS 토큰에 의한 조기 종료를 방지할 수 있어 장시간 시나리오 테스트에 유리하다.
+
+```bash
+# C1: 기본 — KV eviction, Throttle, Suspend/Resume, SetTargetTbt, RequestQcf 등
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
+  --enable-resilience --resilience-transport tcp:127.0.0.1:19999
+
+# C2: GPU + prealloc — SwitchHw 테스트용
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
+  -b opencl --resilience-prealloc-switch \
+  --enable-resilience --resilience-transport tcp:127.0.0.1:19999
+
+# C3: GPU + partition — SetPartitionRatio, SetPrefillPolicy(cpu_chunk) 테스트용
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
+  -b opencl --resilience-prealloc-switch --tensor-partition 0.001 \
+  --enable-resilience --resilience-transport tcp:127.0.0.1:19999
+
+# C4: KIVI — KvQuantDynamic 테스트용
+./generate -m $MODEL --prompt Hello -n 500 --greedy --ignore-eos \
+  --kv-dynamic-quant \
+  --enable-resilience --resilience-transport tcp:127.0.0.1:19999
+```
+
+**동작 특성 (검증 설계 시 참고)**
+
+- **정책 교체**: KV eviction 정책 (Sliding, H2O, Streaming)은 누적되지 않고 후속 정책이 이전을 대체한다.
+- **RestoreDefaults**: 모든 active_actions를 클리어한다 — throttle, eviction, skip_ratio, partition_ratio, prefill 정책, compute/memory level 모두 초기화.
+- **Suspend = 세션 종료**: `generate`는 single-shot 바이너리이므로, Suspend 수신 시 generation 종료 후 프로세스가 exit한다. 후속 command (Resume 등)는 broken pipe가 되며, 이는 정상 동작이다.
+- **Heartbeat 관찰**: mock_manager는 command 전송 전후로 Heartbeat를 로그한다. `kv_util`, `active_actions`, `active_device`, `state` 필드로 command 효과를 확인할 수 있다.
+- **delay_ms 산정**: 시나리오에서 command 간 `delay_ms`는 Heartbeat 1~2회를 관찰할 수 있을 만큼 (2000~3000ms) 설정한다. `--wait-secs`는 초기 연결 안정화용으로 3초가 적절하다. engine의 `-n` 토큰 수는 전체 시나리오 소요 시간보다 충분히 길어야 한다 (23 tok/s 기준: 10초 시나리오 → 최소 -n 300).
+
+**자동 검증 스크립트**
+
+`scripts/test_mock_commands.py`로 53개 테스트 케이스를 자동 실행할 수 있다:
+
+```bash
+# 빌드 포함 전체 실행
+python scripts/test_mock_commands.py
+
+# 빌드 건너뛰기 (바이너리가 이미 디바이스에 있을 때)
+python scripts/test_mock_commands.py --skip-build
+
+# 특정 Phase만
+python scripts/test_mock_commands.py --skip-build --phase 3
+
+# 특정 테스트만
+python scripts/test_mock_commands.py --skip-build --test 3-07 -v
+```
+
 ---
 
 ## 4. 실험 워크플로우 레시피
