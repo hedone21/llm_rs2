@@ -1,0 +1,31 @@
+# Sat Apr 11 14:25:51 KST 2026 — Qwen missing legs (llm.rs CPU + llama.cpp GPU)
+# Device: Samsung Galaxy S25 (Adreno 830)
+# Reuses c15a_qwen_strict_isolation.txt for llm.rs GPU and llama.cpp CPU
+# Rest=300s, inter-phase=300s, threshold=50000mC, runs=3
+# Short: decode=64
+# Long:  decode=128
+
+
+=== Phase A: llama.cpp OpenCL GPU ===
+  llc_gpu short r=1: 52.36ms
+  llc_gpu long  r=1: 68.49ms
+  llc_gpu short r=2: 52.63ms
+  llc_gpu long  r=2: 68.49ms
+  llc_gpu short r=3: 52.08ms
+  llc_gpu long  r=3: 68.03ms
+
+--- inter-phase ---
+
+=== Phase B: llm.rs CPU ===
+  llm_cpu short r=1: 57.85ms
+  llm_cpu long  r=1: 61.86ms
+  llm_cpu short r=2: 57.62ms
+  llm_cpu long  r=2: 61.24ms
+  llm_cpu short r=3: 57.87ms
+  llm_cpu long  r=3: 64.88ms
+
+=== Medians (missing legs) ===
+  llama.cpp GPU short: 52.36 ms (runs: 52.36 52.63 52.08)
+  llama.cpp GPU long:  68.49 ms (runs: 68.49 68.49 68.03)
+  llm.rs    CPU short: 57.85 ms (runs: 57.85 57.62 57.87)
+  llm.rs    CPU long:  61.86 ms (runs: 61.86 61.24 64.88)
