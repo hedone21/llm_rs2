@@ -824,6 +824,44 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
     }))
 }
 
+/// Build a pre-bound `kernel_add_row_bias` step that adds the given bias
+/// buffer to the given `x` buffer in-place. Used after QKV matmul steps
+/// for models with `has_qkv_bias=true` (Qwen2 etc.).
+///
+/// Kernel signature (from simple_ops.cl:487):
+///   kernel_add_row_bias(float* x, const float* bias, int dim, int total)
+///
+/// Dispatch: 1D, global = total.div_ceil(64) * 64, no local size.
+/// For decode seq_len=1 batch=1, `total == dim == n_heads * head_dim`.
+fn build_add_row_bias_step(
+    simple_ops_program: &ocl::Program,
+    x_buf: &Mem,
+    bias_buf: &Mem,
+    dim: usize,
+    op_tag: OpTag,
+) -> Result<KernelStep> {
+    let kernel = ocl::core::create_kernel(simple_ops_program, "kernel_add_row_bias")
+        .context("create kernel_add_row_bias for plan")?;
+    let dim_i32 = dim as i32;
+    let total_i32 = dim as i32; // decode: 1 row × dim elements
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(x_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(bias_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::scalar(&dim_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&total_i32))?;
+    }
+    let gws = dim.div_ceil(64) * 64;
+    Ok(KernelStep {
+        kernel,
+        ndim: 1,
+        global_work_size: [gws, 1, 1],
+        local_work_size: None,
+        dynamic_args: vec![],
+        op_tag,
+        retained_bufs: vec![],
+    })
+}
+
 /// Build a pre-bound kernel execution plan for one transformer layer's decode
 /// step (seq_len=1).
 ///
@@ -836,7 +874,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     let dim = config.dim;
     let k = dim; // matmul inner dim = hidden dim
 
-    let mut steps_pre_kv = Vec::with_capacity(6);
+    let mut steps_pre_kv = Vec::with_capacity(9);
 
     // -----------------------------------------------------------------------
     // 1. rms_norm_oop (x -> residual)
@@ -884,6 +922,17 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.is_nosub,
     )?);
 
+    // Optional: add Q bias (Qwen2 etc.) — non-bias models have bq_buf = None.
+    if let Some(bq) = config.bq_buf {
+        steps_pre_kv.push(build_add_row_bias_step(
+            config.simple_ops_program,
+            config.q_buf,
+            bq,
+            config.n_q,
+            OpTag::MatmulQKV,
+        )?);
+    }
+
     // -----------------------------------------------------------------------
     // 3. matmul K (residual -> k)
     // -----------------------------------------------------------------------
@@ -899,6 +948,17 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         config.is_nosub,
     )?);
 
+    // Optional: add K bias (Qwen2 etc.) — non-bias models have bk_buf = None.
+    if let Some(bk) = config.bk_buf {
+        steps_pre_kv.push(build_add_row_bias_step(
+            config.simple_ops_program,
+            config.k_buf,
+            bk,
+            config.n_k,
+            OpTag::MatmulQKV,
+        )?);
+    }
+
     // -----------------------------------------------------------------------
     // 4. matmul V (residual -> v)
     // -----------------------------------------------------------------------
@@ -913,6 +973,17 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         None,
         config.is_nosub,
     )?);
+
+    // Optional: add V bias (Qwen2 etc.) — non-bias models have bv_buf = None.
+    if let Some(bv) = config.bv_buf {
+        steps_pre_kv.push(build_add_row_bias_step(
+            config.simple_ops_program,
+            config.v_buf,
+            bv,
+            config.n_v,
+            OpTag::MatmulQKV,
+        )?);
+    }
 
     // -----------------------------------------------------------------------
     // 5. rope Q (q inplace)
