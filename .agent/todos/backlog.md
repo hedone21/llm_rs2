@@ -175,3 +175,34 @@
 - **Description**: 현재 `zone_types`는 exact match. substring/keyword 매칭으로 확장하면 다양한 장치 커버 가능
 - **Acceptance Criteria**: contains 기반 패턴 매칭, 기존 exact match와 공존, 테스트 추가
 - **Notes**: 필요성 미확정. 실제 다중 장치 배포 시점에 재평가
+
+## [P1] Qwen CPU decode GEMV load-to-use stall 해소
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음 (native FMA 기반 `a9cd3cc` 완료 후 선행 조건 충족)
+- **Description**: |
+  Qwen 2.5-1.5B CPU decode가 llama.cpp CPU 대비 +14-15% 느린 gap이 남아 있음.
+  Native F16 FMA GEMV kernel 전환 (`a9cd3cc`) 후에도 short −0.5%, long +0.3% (mean)로
+  gap이 그대로. 원인은 `vec_dot_f16_native_gemv_4rows`의 inline `asm!` 매크로 구조가
+  컴파일러 instruction scheduling을 막아서 **B row 전환 시 load → first-use 거리가
+  2 instructions밖에 안 됨** (Oryon vector load latency ~5 cycles → stall 누적).
+  Disassembly 위치: `target/aarch64-linux-android/release/generate`
+  `0x369ee8`–`0x369f74` (main loop).
+
+  자세한 분석: `results/data/flash_attn_decode/thermal/FMA_ANALYSIS.md`
+
+  ### 접근 후보 (ROI 순)
+  1. Inline asm → `vfmaq_f16` intrinsic 전환으로 컴파일러 scheduling 회복
+  2. 4개 per-row asm block을 하나의 multi-row asm으로 병합, explicit interleaving
+  3. Chunk size 튜닝 (llama.cpp: 64 rows/chunk vs 우리: n_threads*8=64 chunks)
+  4. Big.LITTLE affinity (variance 감소, gap 축소는 부차적)
+- **Acceptance Criteria**: |
+  - CPU decode short <= llama.cpp + 5% (현재 +15.2% → 목표 50-53 ms/tok)
+  - CPU decode long <= llama.cpp + 5% (현재 +14.1% → 목표 54-57 ms/tok)
+  - H2O/profile/Llama/Qwen/Gemma3 regression 없음 (6-test sanity)
+  - V10 strict thermal isolation 프로토콜로 검증
+- **Notes**: |
+  - 과거 `b25bc19` (S24)에서 prefetch 효과 없었음을 기억할 것 — 이번엔 native FMA로
+    instruction density가 낮아져 prefetch insertion 여유가 있을 가능성
+  - Quality/Correctness는 `--greedy` byte-identical test로 보호
+  - Researcher 조사 결과 llama.cpp도 F16 경로에 software prefetch 없음, 기본 affinity 없음

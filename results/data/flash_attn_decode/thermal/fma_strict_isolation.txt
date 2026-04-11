@@ -1,0 +1,40 @@
+# FMA CPU measurement 2026년  4월 11일 토요일 18시 19분 42초 KST
+# Device: Samsung Galaxy S25 (Adreno 830)
+# Binary: generate master a9cd3cc (native FMA GEMV)
+# Protocol: V10 strict — 5-min rest before each run
+
+=== Run 1 of 3 ===
+[short] rest 300s...
+[short] thermal_pre=[38000 37300 35400 35000 ]
+Prefill: 135.69 ms (6 tokens, 44.2 tok/s)
+Decode: 57.16 ms/tok (17.5 tok/s) [63 tokens, forward only]
+Avg TBT: 57.74 ms (17.3 tokens/sec)
+[long] rest 300s...
+[long] thermal_pre=[33400 34200 32300 32300 ]
+Prefill: 6684.98 ms (657 tokens, 98.3 tok/s)
+Decode: 64.35 ms/tok (15.5 tok/s) [51 tokens, forward only]
+Avg TBT: 65.80 ms (15.2 tokens/sec)
+=== Run 2 of 3 ===
+[short] rest 300s...
+[short] thermal_pre=[34600 36100 32300 32300 ]
+Prefill: 135.77 ms (6 tokens, 44.2 tok/s)
+Decode: 57.34 ms/tok (17.4 tok/s) [63 tokens, forward only]
+Avg TBT: 57.91 ms (17.3 tokens/sec)
+[long] rest 300s...
+[long] thermal_pre=[33400 33400 32300 31900 ]
+Prefill: 6525.14 ms (657 tokens, 100.7 tok/s)
+Decode: 59.86 ms/tok (16.7 tok/s) [127 tokens, forward only]
+Avg TBT: 60.91 ms (16.4 tokens/sec)
+=== Run 3 of 3 ===
+[short] rest 300s...
+[short] thermal_pre=[32600 33000 33100 32300 ]
+Prefill: 132.13 ms (6 tokens, 45.4 tok/s)
+Decode: 57.85 ms/tok (17.3 tok/s) [63 tokens, forward only]
+Avg TBT: 58.50 ms (17.1 tokens/sec)
+[long] rest 300s...
+[long] thermal_pre=[35700 36100 33500 33100 ]
+Prefill: 6940.21 ms (657 tokens, 94.7 tok/s)
+Decode: 64.36 ms/tok (15.5 tok/s) [127 tokens, forward only]
+Avg TBT: 65.65 ms (15.2 tokens/sec)
+
+=== Done 2026년  4월 11일 토요일 18시 51분 09초 KST ===
