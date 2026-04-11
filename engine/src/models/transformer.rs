@@ -1434,13 +1434,24 @@ impl TransformerModel {
         use crate::backend::opencl::plan::*;
         use crate::core::kv_cache::KVLayout;
 
-        if self.config.has_qkv_bias {
-            return None; // Bias not yet supported in GPU plan
-        }
-
         // GPU plan only supports F16 weights (kernel_mul_mat_f16_f32)
         if self.layers[0].wq.dtype() != crate::core::buffer::DType::F16 {
             return None;
+        }
+
+        // kernel_add_row_bias expects F32 bias buffers. If any layer has
+        // a QKV bias that isn't F32, fall back to the legacy path.
+        if self.config.has_qkv_bias {
+            for layer in &self.layers {
+                if let Some(ref bias) = layer.qkv_bias {
+                    if bias.bq.dtype() != crate::core::buffer::DType::F32
+                        || bias.bk.dtype() != crate::core::buffer::DType::F32
+                        || bias.bv.dtype() != crate::core::buffer::DType::F32
+                    {
+                        return None;
+                    }
+                }
+            }
         }
 
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
@@ -1472,6 +1483,18 @@ impl TransformerModel {
         let mut layer_bufs = Vec::new();
         let mut kv_bufs_vec = Vec::new();
         for (i, layer) in self.layers.iter().enumerate() {
+            // Extract optional QKV bias cl_mem handles. Non-bias models
+            // short-circuit this block with (None, None, None). For bias
+            // models (e.g. Qwen2), the `cl!` macro returns None from the
+            // outer function if any buffer lookup fails.
+            let (bq, bk, bv) = match layer.qkv_bias.as_ref() {
+                Some(bias) => (
+                    Some(cl!(bias.bq)),
+                    Some(cl!(bias.bk)),
+                    Some(cl!(bias.bv)),
+                ),
+                None => (None, None, None),
+            };
             layer_bufs.push(LayerBufs {
                 wq: cl!(layer.wq),
                 wk: cl!(layer.wk),
@@ -1482,6 +1505,9 @@ impl TransformerModel {
                 w_down: cl!(layer.w_down),
                 attn_norm: cl!(layer.attention_norm),
                 ffn_norm: cl!(layer.ffn_norm),
+                bq,
+                bk,
+                bv,
             });
             kv_bufs_vec.push(KvBufs {
                 k_cache: cl!(kv_caches[i].k_buffer),
@@ -1657,6 +1683,11 @@ impl TransformerModel {
                 w_down: cl!(layer.w_down),
                 attn_norm: cl!(layer.attention_norm),
                 ffn_norm: cl!(layer.ffn_norm),
+                // KIVI path shares the same QKV bias handling as the
+                // standard plan; Task 3 will populate from layer.qkv_bias.
+                bq: None,
+                bk: None,
+                bv: None,
             });
 
             let plan_bufs = kv_caches[i].get_plan_gpu_buffers()?;

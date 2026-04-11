@@ -1,0 +1,39 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/llama3.2-1b
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] OpenCL Platform: QUALCOMM Snapdragon(TM)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] OpenCL Device: QUALCOMM Adreno(TM) 830 (API 3.0, CL C: OpenCL C 3.0 Adreno(TM) 830)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] Subgroup support: cl_khr_subgroups=true, cl_intel_subgroups=false
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] GPU Global Memory: 5557 MB
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] GPU Max Alloc Size: 1024 MB
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] OpenCL compiler options: -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] simple_ops.cl compiled (subgroup path)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32.cl compiled (4-wave K-split, N_DST=2, 128 rows/WG)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32_l4.cl compiled (GEMV N_DST=4 for large N)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=64, BLOCK_N=32, DK=64)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=64)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] mul_mm_f16_f32_l4_lm.cl compiled (GEMM prefill F16)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] mul_mm_f32_f32_l4_lm.cl compiled (GEMM prefill F32)
+[2026-04-11T04:36:07Z INFO  llm_rs2::backend::opencl] kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)
+[2026-04-11T04:36:08Z INFO  llm_rs2::backend::opencl] kivi_attn.cl compiled (KIVI fused attention kernels)
+[2026-04-11T04:36:08Z INFO  llm_rs2::backend::opencl] OpenCL kernels cached successfully
+[2026-04-11T04:36:08Z INFO  llm_rs2::backend::opencl] Memory mode: UMA/integrated (zero_copy=true)
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: The quick brown fox jumps over
+Token Length: 7
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 270.92 ms (7 tokens, 25.8 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the[2026-04-11T04:36:10Z INFO  llm_rs2::models::transformer] GPU kernel plan built (16 layers, capacity=128)
+ lazy dog. What does this have to do with anything? That is one of the many metaphors that might be used in describing a person’s character.
+
+Done.
+[Profile] Event: End
+TTFT: 388.71 ms
+Decode: 40.18 ms/tok (24.9 tok/s) [31 tokens, forward only]
+Avg TBT: 45.45 ms (22.0 tokens/sec)

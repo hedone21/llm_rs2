@@ -1,0 +1,23 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 339 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+Prompt: The capital of France is
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 112.23 ms (5 tokens, 44.6 tok/s)
+[Profile] Event: DecodingStart
+The capital of France is the city where _________.____
+A. Parisian people come from everywhere in the world
+B. more than one million people live together happily and peace
+Done.
+[Profile] Event: End
+TTFT: 232.62 ms
+Decode: 57.45 ms/tok (17.4 tok/s) [31 tokens, forward only]
+Avg TBT: 58.14 ms (17.2 tokens/sec)
