@@ -1,0 +1,37 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/llama3.2-1b
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: The quick brown fox jumps over
+Token Length: 7
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 267.10 ms (7 tokens, 26.2 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+I was in a bookstore last week, looking at books on Japanese gardens. The cover of one book caught my eye: The Zen Garden by
+[Profile] Per-op breakdown (accumulated over 496 layer-calls):
+  Operation             Total(us)    Avg(us)        %
+  -------------------- ---------- ---------- --------
+  matmul_qkv               271454        547    11.6%
+  matmul_wo                189371        381     8.1%
+  matmul_ffn              1083790       2185    46.4%
+  attention                102793        207     4.4%
+  rms_norm                 228217        460     9.8%
+  rope                     136542        275     5.8%
+  silu_mul                 121223        244     5.2%
+  add_assign               104051        209     4.5%
+  copy_residual                 0          0     0.0%
+  kv_update                 97457        196     4.2%
+  cast                          0          0     0.0%
+  TOTAL                   2334898       4707
+[Profile] Exported to /data/local/tmp/profile_out/profile_opencl_none_31_1775866030.json
+
+Done.
+[Profile] Event: End
+TTFT: 385.69 ms
+Decode: 85.01 ms/tok (11.8 tok/s) [31 tokens, forward only]
+Avg TBT: 90.31 ms (11.1 tokens/sec)

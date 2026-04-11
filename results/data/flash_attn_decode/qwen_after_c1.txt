@@ -1,10 +1,9 @@
-# Sat Apr 11 08:46:10 KST 2026 — Qwen flash attention decode benchmark vs llama.cpp CPU
+# Sat Apr 11 09:08:56 KST 2026 — Qwen flash attention decode benchmark vs llama.cpp CPU
 # Device: Samsung Galaxy S25 (Adreno 830)
 # Model: Qwen 2.5-1.5B (head_dim=128)
 # Tolerance: llm.rs TBT <= llama.cpp TBT * 1.05
-# NOTE: Qwen GGUF missing — recording llm.rs only
 
-[ INFO ] p100.txt depth=170 llm_rs=61.04ms (no llama.cpp baseline)
-[ INFO ] p300.txt depth=374 llm_rs=64.31ms (no llama.cpp baseline)
-[ INFO ] p600.txt depth=676 llm_rs=68.62ms (no llama.cpp baseline)
-[ INFO ] long_prompt.txt depth=720 llm_rs=68.93ms (no llama.cpp baseline)
+[FAIL] p100.txt depth=170 llm_rs=61.06ms llama_cpp=50.97ms limit=53.52ms
+[FAIL] p300.txt depth=374 llm_rs=64.42ms llama_cpp=51.95ms limit=54.55ms
+[FAIL] p600.txt depth=676 llm_rs=69.18ms llama_cpp=52.99ms limit=55.64ms
+[FAIL] long_prompt.txt depth=720 llm_rs=69.96ms llama_cpp=55.56ms limit=58.34ms

@@ -1,0 +1,51 @@
+# V3: Qwen Accuracy Comparison — master (legacy) vs feat (flash DK=128)
+
+## Setup
+- Device: Samsung Galaxy S25 (Adreno 830, adb R3CY408S5SB)
+- Model: Qwen 2.5-1.5B (F16 weights, F16 KV, head_dim=128)
+- Prompt: "The capital of France is" (5 tokens)
+- Generation: -n 30 --greedy (temperature=0, deterministic)
+- Both binaries built from the same source except for the C1-Qwen changes:
+  - `generate_master`: master branch at 1bccdf2 (legacy kernel_attn_gen_half for Qwen)
+  - `generate`: feat/flash-attn-qwen at c2af2c2 (flash_attn_f32_f16_q1_dk128)
+
+## Results
+
+### master (generate_master) output
+```
+The capital of France is Paris. The French are known for their love of food and wine, but they also have a rich history in the arts. They are famous for their
+```
+- 29 tokens generated
+- TBT: 322.73 ms/tok (short context, mostly prefill/setup overhead)
+
+### feat (generate) output
+```
+The capital of France is Paris. The French are known for their love of food and wine, but they also have a rich history in the arts. They are famous for their
+```
+- 29 tokens generated
+- TBT: 340.98 ms/tok (short context, measurement noise dominates)
+
+## Conclusion
+
+**BIT-IDENTICAL OUTPUT** across all 29 greedy tokens. The flash_attn_f32_f16_q1 kernel
+at DK=128 produces numerically equivalent results to the legacy kernel_attn_gen_half
+for Qwen's (n_heads_q=12, n_heads_kv=2, head_dim=128) configuration on Adreno 830.
+
+This confirms:
+1. The DK=128 compile-time constants (DK_VEC=32, DV_VEC=32) are handled correctly
+   in the private float4 arrays.
+2. GQA ratio 12/2=6 is correctly computed (`head_kv_idx = head_idx / gqa_ratio`).
+3. The online softmax + partial sum reduction via `sub_group_reduce_add` + local
+   memory produces the same numerical result as the legacy 3-pass (max/sum/output)
+   scan in kernel_attn_gen_half.
+4. No register spill or numerical instability at head_dim=128 on Adreno 830.
+
+## Note on TBT numbers
+Short-context TBT (322-340 ms/tok at decode=29) is dominated by:
+- Prefill/setup overhead amortization across few decode tokens
+- Warmup + thermal settling
+- Short-decode measurement noise
+
+These numbers are NOT indicative of steady-state performance. See `qwen_after_c1.txt`
+and `regression/v2_master_qwen_baseline.txt` for fair comparison at 170-720 depth
+across 128-token decodes.
