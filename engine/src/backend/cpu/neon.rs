@@ -1682,6 +1682,273 @@ impl CpuBackendNeon {
         }
     }
 
+    /// Native F16 FMA GEMV: 1 A row × 4 B rows → 4 F32 outputs.
+    ///
+    /// Matches llama.cpp's `ggml_vec_dot_f16` instruction stream (`FMLA Vd.8H`)
+    /// while retaining our NR=4 A-reuse. Replaces `vec_dot_fmlal_4rows` on the
+    /// decode (M=1 GEMV) path.
+    ///
+    /// Layout: 16 F16 accumulators = 4 B rows × 4 K-slots.
+    /// K step = 32 per iter (llama.cpp `GGML_F16_STEP`).
+    ///
+    /// Instructions per iter: 4 A loads + 16 B loads + 16 FMA = 36 instrs,
+    /// vs FMLAL which needs 32 FMA (fmlal + fmlal2 × 16) + 4 A + 16 B = 52 instrs.
+    /// Roughly 1.4× fewer instructions for the same flops in the memory-bound
+    /// GEMV regime, letting the HW prefetcher run further ahead of load demand.
+    ///
+    /// F16 accumulator overflow: max K = 8960 (Qwen down_proj intermediate),
+    /// 32 partial lanes → K_eff = 280. Worst case ≤280 × |10| × |2| = 5,600,
+    /// well under F16 max 65,504 (~12× margin).
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_f16_native_gemv_4rows(
+        k: usize,
+        a_f16: *const u16,
+        b_ptrs: [*const u16; 4],
+        out: &mut [f32; 4],
+    ) {
+        // 16 F16 accumulators: acc[row][k_slot] for row 0..3, k_slot 0..3.
+        // Typed as uint16x8_t because inline `asm!` treats the bits opaquely;
+        // `fmla .8h` reinterprets them as half-precision floats. This matches
+        // `vec_dot_f16_native_4x4` and keeps us off the unstable `float16x8_t`
+        // intrinsic surface.
+        let mut r0s0: uint16x8_t = vdupq_n_u16(0);
+        let mut r0s1: uint16x8_t = vdupq_n_u16(0);
+        let mut r0s2: uint16x8_t = vdupq_n_u16(0);
+        let mut r0s3: uint16x8_t = vdupq_n_u16(0);
+        let mut r1s0: uint16x8_t = vdupq_n_u16(0);
+        let mut r1s1: uint16x8_t = vdupq_n_u16(0);
+        let mut r1s2: uint16x8_t = vdupq_n_u16(0);
+        let mut r1s3: uint16x8_t = vdupq_n_u16(0);
+        let mut r2s0: uint16x8_t = vdupq_n_u16(0);
+        let mut r2s1: uint16x8_t = vdupq_n_u16(0);
+        let mut r2s2: uint16x8_t = vdupq_n_u16(0);
+        let mut r2s3: uint16x8_t = vdupq_n_u16(0);
+        let mut r3s0: uint16x8_t = vdupq_n_u16(0);
+        let mut r3s1: uint16x8_t = vdupq_n_u16(0);
+        let mut r3s2: uint16x8_t = vdupq_n_u16(0);
+        let mut r3s3: uint16x8_t = vdupq_n_u16(0);
+
+        let mut idx = 0;
+
+        // Main loop: 32 F16 elements per iteration (llama.cpp GGML_F16_STEP=32).
+        // One A load set (4 × 8 lanes) is shared across all 4 B rows.
+        while idx + 32 <= k {
+            // Load 4 A vectors (32 f16 lanes total)
+            let av0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let av1: uint16x8_t = vld1q_u16(a_f16.add(idx + 8));
+            let av2: uint16x8_t = vld1q_u16(a_f16.add(idx + 16));
+            let av3: uint16x8_t = vld1q_u16(a_f16.add(idx + 24));
+
+            // Per-row macro: load 4 B vectors, issue 4 FMA .8h (independent
+            // accumulators, independent operands → max ILP).
+            macro_rules! fma_row {
+                ($bp:expr, $s0:ident, $s1:ident, $s2:ident, $s3:ident) => {
+                    let bv0: uint16x8_t = vld1q_u16($bp.add(idx));
+                    let bv1: uint16x8_t = vld1q_u16($bp.add(idx + 8));
+                    let bv2: uint16x8_t = vld1q_u16($bp.add(idx + 16));
+                    let bv3: uint16x8_t = vld1q_u16($bp.add(idx + 24));
+                    std::arch::asm!(
+                        "fmla {d0:v}.8h, {a0:v}.8h, {b0:v}.8h",
+                        "fmla {d1:v}.8h, {a1:v}.8h, {b1:v}.8h",
+                        "fmla {d2:v}.8h, {a2:v}.8h, {b2:v}.8h",
+                        "fmla {d3:v}.8h, {a3:v}.8h, {b3:v}.8h",
+                        d0 = inout(vreg) $s0, d1 = inout(vreg) $s1,
+                        d2 = inout(vreg) $s2, d3 = inout(vreg) $s3,
+                        a0 = in(vreg) av0, a1 = in(vreg) av1,
+                        a2 = in(vreg) av2, a3 = in(vreg) av3,
+                        b0 = in(vreg) bv0, b1 = in(vreg) bv1,
+                        b2 = in(vreg) bv2, b3 = in(vreg) bv3,
+                    );
+                };
+            }
+            fma_row!(b_ptrs[0], r0s0, r0s1, r0s2, r0s3);
+            fma_row!(b_ptrs[1], r1s0, r1s1, r1s2, r1s3);
+            fma_row!(b_ptrs[2], r2s0, r2s1, r2s2, r2s3);
+            fma_row!(b_ptrs[3], r3s0, r3s1, r3s2, r3s3);
+
+            idx += 32;
+        }
+
+        // 16-element tail (one half-step): 2 slots per row
+        if idx + 16 <= k {
+            let av0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let av1: uint16x8_t = vld1q_u16(a_f16.add(idx + 8));
+            macro_rules! fma_row16 {
+                ($bp:expr, $s0:ident, $s1:ident) => {
+                    let bv0: uint16x8_t = vld1q_u16($bp.add(idx));
+                    let bv1: uint16x8_t = vld1q_u16($bp.add(idx + 8));
+                    std::arch::asm!(
+                        "fmla {d0:v}.8h, {a0:v}.8h, {b0:v}.8h",
+                        "fmla {d1:v}.8h, {a1:v}.8h, {b1:v}.8h",
+                        d0 = inout(vreg) $s0, d1 = inout(vreg) $s1,
+                        a0 = in(vreg) av0, a1 = in(vreg) av1,
+                        b0 = in(vreg) bv0, b1 = in(vreg) bv1,
+                    );
+                };
+            }
+            fma_row16!(b_ptrs[0], r0s0, r0s1);
+            fma_row16!(b_ptrs[1], r1s0, r1s1);
+            fma_row16!(b_ptrs[2], r2s0, r2s1);
+            fma_row16!(b_ptrs[3], r3s0, r3s1);
+            idx += 16;
+        }
+
+        // 8-element tail: 1 slot per row
+        if idx + 8 <= k {
+            let av0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            macro_rules! fma_row8 {
+                ($bp:expr, $s0:ident) => {
+                    let bv0: uint16x8_t = vld1q_u16($bp.add(idx));
+                    std::arch::asm!(
+                        "fmla {d:v}.8h, {a:v}.8h, {b:v}.8h",
+                        d = inout(vreg) $s0,
+                        a = in(vreg) av0,
+                        b = in(vreg) bv0,
+                    );
+                };
+            }
+            fma_row8!(b_ptrs[0], r0s0);
+            fma_row8!(b_ptrs[1], r1s0);
+            fma_row8!(b_ptrs[2], r2s0);
+            fma_row8!(b_ptrs[3], r3s0);
+            idx += 8;
+        }
+
+        // Reduce: 4 F16 partials per row → F32 scalar.
+        // Each partial is converted via fcvtl/fcvtl2 to two f32x4 vectors and
+        // summed in F32 (preserves precision over an in-F16 pre-sum).
+        macro_rules! reduce_f16_partial {
+            ($acc:expr) => {{
+                let lo: float32x4_t;
+                let hi: float32x4_t;
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) lo, i = in(vreg) $acc);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) hi, i = in(vreg) $acc);
+                vaddq_f32(lo, hi)
+            }};
+        }
+        let r0 = vaddq_f32(
+            vaddq_f32(reduce_f16_partial!(r0s0), reduce_f16_partial!(r0s1)),
+            vaddq_f32(reduce_f16_partial!(r0s2), reduce_f16_partial!(r0s3)),
+        );
+        let r1 = vaddq_f32(
+            vaddq_f32(reduce_f16_partial!(r1s0), reduce_f16_partial!(r1s1)),
+            vaddq_f32(reduce_f16_partial!(r1s2), reduce_f16_partial!(r1s3)),
+        );
+        let r2 = vaddq_f32(
+            vaddq_f32(reduce_f16_partial!(r2s0), reduce_f16_partial!(r2s1)),
+            vaddq_f32(reduce_f16_partial!(r2s2), reduce_f16_partial!(r2s3)),
+        );
+        let r3 = vaddq_f32(
+            vaddq_f32(reduce_f16_partial!(r3s0), reduce_f16_partial!(r3s1)),
+            vaddq_f32(reduce_f16_partial!(r3s2), reduce_f16_partial!(r3s3)),
+        );
+        out[0] = vaddvq_f32(r0);
+        out[1] = vaddvq_f32(r1);
+        out[2] = vaddvq_f32(r2);
+        out[3] = vaddvq_f32(r3);
+
+        // Scalar tail (K not a multiple of 8)
+        while idx < k {
+            let a_val = half::f16::from_bits(*a_f16.add(idx)).to_f32();
+            for r in 0..4 {
+                out[r] += a_val * half::f16::from_bits(*b_ptrs[r].add(idx)).to_f32();
+            }
+            idx += 1;
+        }
+    }
+
+    /// Native F16 FMA single-row dot product: A(F16) · B(F16) → scalar F32.
+    ///
+    /// Replaces `vec_dot_fmlal` on the decode (M=1 GEMV) path. Used for the
+    /// (j < j_end) column tail of `f16_gemv_chunk` / `fused_gemv_chunk` when
+    /// the chunk width is not a multiple of NR=4 (e.g. tensor partition CPU
+    /// slices with non-aligned out_dim).
+    ///
+    /// Uses 4 F16 K-slot accumulators following llama.cpp's pattern.
+    #[target_feature(enable = "neon")]
+    unsafe fn vec_dot_f16_native_gemv_1row(k: usize, a_f16: *const u16, b_ptr: *const u16) -> f32 {
+        let mut s0: uint16x8_t = vdupq_n_u16(0);
+        let mut s1: uint16x8_t = vdupq_n_u16(0);
+        let mut s2: uint16x8_t = vdupq_n_u16(0);
+        let mut s3: uint16x8_t = vdupq_n_u16(0);
+
+        let mut idx = 0;
+
+        while idx + 32 <= k {
+            let av0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let av1: uint16x8_t = vld1q_u16(a_f16.add(idx + 8));
+            let av2: uint16x8_t = vld1q_u16(a_f16.add(idx + 16));
+            let av3: uint16x8_t = vld1q_u16(a_f16.add(idx + 24));
+            let bv0: uint16x8_t = vld1q_u16(b_ptr.add(idx));
+            let bv1: uint16x8_t = vld1q_u16(b_ptr.add(idx + 8));
+            let bv2: uint16x8_t = vld1q_u16(b_ptr.add(idx + 16));
+            let bv3: uint16x8_t = vld1q_u16(b_ptr.add(idx + 24));
+            std::arch::asm!(
+                "fmla {d0:v}.8h, {a0:v}.8h, {b0:v}.8h",
+                "fmla {d1:v}.8h, {a1:v}.8h, {b1:v}.8h",
+                "fmla {d2:v}.8h, {a2:v}.8h, {b2:v}.8h",
+                "fmla {d3:v}.8h, {a3:v}.8h, {b3:v}.8h",
+                d0 = inout(vreg) s0, d1 = inout(vreg) s1,
+                d2 = inout(vreg) s2, d3 = inout(vreg) s3,
+                a0 = in(vreg) av0, a1 = in(vreg) av1,
+                a2 = in(vreg) av2, a3 = in(vreg) av3,
+                b0 = in(vreg) bv0, b1 = in(vreg) bv1,
+                b2 = in(vreg) bv2, b3 = in(vreg) bv3,
+            );
+            idx += 32;
+        }
+
+        if idx + 16 <= k {
+            let av0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let av1: uint16x8_t = vld1q_u16(a_f16.add(idx + 8));
+            let bv0: uint16x8_t = vld1q_u16(b_ptr.add(idx));
+            let bv1: uint16x8_t = vld1q_u16(b_ptr.add(idx + 8));
+            std::arch::asm!(
+                "fmla {d0:v}.8h, {a0:v}.8h, {b0:v}.8h",
+                "fmla {d1:v}.8h, {a1:v}.8h, {b1:v}.8h",
+                d0 = inout(vreg) s0, d1 = inout(vreg) s1,
+                a0 = in(vreg) av0, a1 = in(vreg) av1,
+                b0 = in(vreg) bv0, b1 = in(vreg) bv1,
+            );
+            idx += 16;
+        }
+
+        if idx + 8 <= k {
+            let av0: uint16x8_t = vld1q_u16(a_f16.add(idx));
+            let bv0: uint16x8_t = vld1q_u16(b_ptr.add(idx));
+            std::arch::asm!(
+                "fmla {d:v}.8h, {a:v}.8h, {b:v}.8h",
+                d = inout(vreg) s0,
+                a = in(vreg) av0,
+                b = in(vreg) bv0,
+            );
+            idx += 8;
+        }
+
+        // Reduce 4 F16 partials → F32 scalar (sum in F32 for precision)
+        macro_rules! reduce_f16_partial {
+            ($acc:expr) => {{
+                let lo: float32x4_t;
+                let hi: float32x4_t;
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) lo, i = in(vreg) $acc);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) hi, i = in(vreg) $acc);
+                vaddq_f32(lo, hi)
+            }};
+        }
+        let v = vaddq_f32(
+            vaddq_f32(reduce_f16_partial!(s0), reduce_f16_partial!(s1)),
+            vaddq_f32(reduce_f16_partial!(s2), reduce_f16_partial!(s3)),
+        );
+        let mut sum = vaddvq_f32(v);
+
+        while idx < k {
+            sum += half::f16::from_bits(*a_f16.add(idx)).to_f32()
+                * half::f16::from_bits(*b_ptr.add(idx)).to_f32();
+            idx += 1;
+        }
+        sum
+    }
+
     /// FMLAL single-row dot product: A(F16) · B(F16) → scalar F32.
     #[target_feature(enable = "neon")]
     unsafe fn vec_dot_fmlal(k: usize, a_f16: *const u16, b_ptr: *const u16) -> f32 {
@@ -2499,6 +2766,263 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
                     CpuBackendNeon::vec_dot_fmlal(ctx.k, a_f16, ctx.b_base.add(j * ctx.k));
                 j += 1;
             }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    /// Scalar F32 reference dot product (ground truth).
+    fn ref_dot_f32(a_f16: &[half::f16], b_f16: &[half::f16]) -> f32 {
+        assert_eq!(a_f16.len(), b_f16.len());
+        let mut sum = 0.0f32;
+        for (&a, &b) in a_f16.iter().zip(b_f16.iter()) {
+            sum += a.to_f32() * b.to_f32();
+        }
+        sum
+    }
+
+    /// Deterministic pseudo-random F16 vector in range [lo, hi].
+    /// Uses a splitmix64-style hash to avoid pulling in `rand` as dev-dep.
+    fn gen_f16_vec(len: usize, seed: u64, lo: f32, hi: f32) -> Vec<half::f16> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        let mut out = Vec::with_capacity(len);
+        let span = hi - lo;
+        for _ in 0..len {
+            state = state.wrapping_add(0x9E3779B97F4A7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+            z ^= z >> 31;
+            // Map to [0, 1)
+            let u = ((z >> 11) as f64 / (1u64 << 53) as f64) as f32;
+            out.push(half::f16::from_f32(lo + u * span));
+        }
+        out
+    }
+
+    /// Assert `actual ≈ expected` under the standard numpy-style bound
+    /// `|a - e| ≤ atol + rtol × |e|`. F16 accumulators have a non-trivial
+    /// additive noise floor (`atol`) from ULP rounding during reduction, plus
+    /// a multiplicative precision limit (`rtol`) from mantissa truncation.
+    fn assert_close(
+        actual: &[f32],
+        expected: &[f32],
+        rtol: f32,
+        atol: f32,
+        ctx: &str,
+    ) {
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            let bound = atol + rtol * e.abs();
+            let diff = (a - e).abs();
+            assert!(
+                diff <= bound,
+                "{}: element {} diff={:e} > bound={:e} (actual={:e}, expected={:e})",
+                ctx,
+                i,
+                diff,
+                bound,
+                a,
+                e
+            );
+        }
+    }
+
+    /// Test that `vec_dot_f16_native_gemv_4rows` matches a scalar F32 reference
+    /// and stays within F16 precision tolerances across the K × N matrix of
+    /// shapes encountered in Qwen 2.5 decode (including NR-unaligned shapes
+    /// from tensor partition CPU slices).
+    #[test]
+    fn test_f16_native_gemv_4rows_matches_ref() {
+        // (K, N) pairs cover Qwen 2.5-1.5B decode matmul shapes plus
+        // partition-unaligned and small-K tail cases:
+        //   K=1536 → Q/K/V/O/Gate/Up (hidden_size)
+        //   K=8960 → Down (intermediate_size)
+        //   K in {32,33,40,64,72,256,1024} → K-step-32 main/tail/scalar-tail
+        //   N in {4,5,7,16} → NR=4 aligned + unaligned tail columns
+        //   N in {1536,8960} → Qwen output dims
+        //   N in {2688,2776} → typical tensor partition CPU-slice widths
+        let cases: &[(usize, usize)] = &[
+            (32, 4),
+            (32, 5),
+            (32, 7),
+            (32, 16),
+            (33, 4),
+            (33, 7),
+            (40, 16),
+            (64, 16),
+            (64, 2688),
+            (72, 7),
+            (256, 16),
+            (256, 1536),
+            (1024, 1536),
+            (1024, 2776),
+            (1536, 1536),
+            (1536, 2688),
+            (1536, 8960),
+            (8960, 1536),
+            (8960, 2691),
+        ];
+
+        for &(k, n) in cases {
+            // A in RMS-norm-like range (~unit magnitude).
+            let a = gen_f16_vec(k, 0xA1A1_u64 ^ (k as u64), -1.5, 1.5);
+            // B in Qwen-weight-like range (~0.25 typical magnitude).
+            let b_all =
+                gen_f16_vec(n * k, 0xB2B2_u64 ^ (k as u64 * 131 + n as u64), -0.5, 0.5);
+
+            // Reference: scalar F32 for each of N rows
+            let mut expected = vec![0.0f32; n];
+            for j in 0..n {
+                expected[j] = ref_dot_f32(&a, &b_all[j * k..(j + 1) * k]);
+            }
+
+            // Run the NR=4 kernel + 1-row tail, mirroring f16_gemv_chunk dispatch
+            let mut out = vec![0.0f32; n];
+            let a_ptr = a.as_ptr() as *const u16;
+            let b_ptr_base = b_all.as_ptr() as *const u16;
+            let mut j = 0;
+            while j + 4 <= n {
+                let b_ptrs = unsafe {
+                    [
+                        b_ptr_base.add(j * k),
+                        b_ptr_base.add((j + 1) * k),
+                        b_ptr_base.add((j + 2) * k),
+                        b_ptr_base.add((j + 3) * k),
+                    ]
+                };
+                let mut res = [0.0f32; 4];
+                unsafe {
+                    CpuBackendNeon::vec_dot_f16_native_gemv_4rows(k, a_ptr, b_ptrs, &mut res);
+                }
+                out[j..j + 4].copy_from_slice(&res);
+                j += 4;
+            }
+            while j < n {
+                out[j] = unsafe {
+                    CpuBackendNeon::vec_dot_f16_native_gemv_1row(
+                        k,
+                        a_ptr,
+                        b_ptr_base.add(j * k),
+                    )
+                };
+                j += 1;
+            }
+
+            // F16 accumulation precision envelope: rtol × |expected| + atol.
+            // rtol ≈ 1e-2 covers the multiplicative F16 mantissa loss
+            // (~11 bits); atol scales with sqrt(K) × input_scale to absorb
+            // near-zero cancellation cases where the accumulated F16 noise
+            // floor dominates relative error. Empirical constants tuned for
+            // Qwen-range inputs (|a| ≤ 1.5, |b| ≤ 0.5).
+            let atol = 3e-3 * (k as f32).sqrt() + 1e-2;
+            assert_close(
+                &out,
+                &expected,
+                1e-2,
+                atol,
+                &format!("k={}, n={}", k, n),
+            );
+        }
+    }
+
+    /// Test that `vec_dot_f16_native_gemv_1row` matches scalar F32 reference
+    /// in isolation (it is exercised indirectly by the 4rows test above, but
+    /// this covers the standalone code path used by e.g. the GEMM column tail).
+    #[test]
+    fn test_f16_native_gemv_1row_matches_ref() {
+        let k_cases = [32usize, 33, 40, 64, 72, 256, 1024, 1536, 8960];
+        for &k in &k_cases {
+            let a = gen_f16_vec(k, 0xC3C3_u64 ^ (k as u64), -1.5, 1.5);
+            let b = gen_f16_vec(k, 0xD4D4_u64 ^ (k as u64), -0.5, 0.5);
+            let expected = ref_dot_f32(&a, &b);
+            let actual = unsafe {
+                CpuBackendNeon::vec_dot_f16_native_gemv_1row(
+                    k,
+                    a.as_ptr() as *const u16,
+                    b.as_ptr() as *const u16,
+                )
+            };
+            // Same F16 accumulation precision budget as the 4rows test.
+            let atol = 3e-3 * (k as f32).sqrt() + 1e-2;
+            assert_close(
+                std::slice::from_ref(&actual),
+                std::slice::from_ref(&expected),
+                1e-2,
+                atol,
+                &format!("k={}", k),
+            );
+        }
+    }
+
+    /// Cross-check that the new native FMA kernel agrees with the existing
+    /// FMLAL kernel (both consume the same F16 inputs). This ensures a smooth
+    /// migration: if they differ, production decode would change numerically.
+    /// Removed in the follow-up commit when FMLAL kernels are deleted.
+    #[test]
+    fn test_f16_native_gemv_matches_fmlal() {
+        // Focus on shapes that stress tails and overflow margins.
+        let cases = [
+            (32usize, 4usize),
+            (40, 4),
+            (72, 5),
+            (256, 16),
+            (1536, 7),
+            (1536, 1536),
+            (8960, 2688),
+        ];
+        for &(k, n) in &cases {
+            let a = gen_f16_vec(k, 0xE5E5_u64 ^ (k as u64), -1.5, 1.5);
+            let b_all = gen_f16_vec(n * k, 0xF6F6_u64 ^ (k as u64 * 17 + n as u64), -0.5, 0.5);
+
+            let mut out_fma = vec![0.0f32; n];
+            let mut out_fmlal = vec![0.0f32; n];
+            let a_ptr = a.as_ptr() as *const u16;
+            let b_ptr = b_all.as_ptr() as *const u16;
+
+            let mut j = 0;
+            while j + 4 <= n {
+                let b_ptrs = unsafe {
+                    [
+                        b_ptr.add(j * k),
+                        b_ptr.add((j + 1) * k),
+                        b_ptr.add((j + 2) * k),
+                        b_ptr.add((j + 3) * k),
+                    ]
+                };
+                let mut r_fma = [0.0f32; 4];
+                let mut r_fmlal = [0.0f32; 4];
+                unsafe {
+                    CpuBackendNeon::vec_dot_f16_native_gemv_4rows(k, a_ptr, b_ptrs, &mut r_fma);
+                    CpuBackendNeon::vec_dot_fmlal_4rows(k, a_ptr, b_ptrs, &mut r_fmlal);
+                }
+                out_fma[j..j + 4].copy_from_slice(&r_fma);
+                out_fmlal[j..j + 4].copy_from_slice(&r_fmlal);
+                j += 4;
+            }
+            while j < n {
+                unsafe {
+                    out_fma[j] =
+                        CpuBackendNeon::vec_dot_f16_native_gemv_1row(k, a_ptr, b_ptr.add(j * k));
+                    out_fmlal[j] = CpuBackendNeon::vec_dot_fmlal(k, a_ptr, b_ptr.add(j * k));
+                }
+                j += 1;
+            }
+
+            // FMLAL accumulates in F32 while native FMA accumulates in F16,
+            // so exact equality is not expected. Use 2× the F32-reference
+            // tests' envelope since both accumulators drift independently
+            // from true F32.
+            let atol = 2e-3 * (k as f32).sqrt() + 2e-2;
+            assert_close(
+                &out_fma,
+                &out_fmlal,
+                3e-2,
+                atol,
+                &format!("fma vs fmlal k={}, n={}", k, n),
+            );
         }
     }
 }
