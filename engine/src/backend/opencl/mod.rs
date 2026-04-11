@@ -111,9 +111,12 @@ struct KernelCache {
     kernel_add_rms_norm_oop: CoreKernel,
     kernel_flash_attn_f32: Option<CoreKernel>,
     kernel_flash_attn_f32_f16: Option<CoreKernel>,
-    /// Decode-specialized flash attention (single-query, online softmax).
-    /// Same program as kernel_flash_attn_f32_f16 (Q=F32, KV=F16, DK=DV=64).
-    kernel_flash_attn_f32_f16_q1: Option<CoreKernel>,
+    /// Decode-specialized flash attention, head_dim=64 variant
+    /// (Q=F32, KV=F16, compiled with -DDK=64 -DDV=64).
+    kernel_flash_attn_f32_f16_q1_dk64: Option<CoreKernel>,
+    /// Decode-specialized flash attention, head_dim=128 variant
+    /// (Q=F32, KV=F16, compiled with -DDK=128 -DDV=128).
+    kernel_flash_attn_f32_f16_q1_dk128: Option<CoreKernel>,
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_f32_f32: Option<CoreKernel>,
@@ -154,7 +157,15 @@ pub struct OpenCLBackend {
 
     // Flash attention programs (optional — compiled with head_dim-specific defines)
     pub flash_attn_f32_program: Option<Program>,
-    pub flash_attn_f32_f16_program: Option<Program>,
+    /// Flash attention F32-Q / F16-KV program, head_dim=64 variant.
+    /// Used by prefill (`flash_attn_f32_f16` kernel) and decode
+    /// (`flash_attn_f32_f16_q1` kernel) at head_dim=64.
+    pub flash_attn_f32_f16_program_dk64: Option<Program>,
+    /// Flash attention F32-Q / F16-KV program, head_dim=128 variant.
+    /// Decode-only (no prefill dispatcher for this DK). Dispatched
+    /// by `flash_attention_decode_gpu` for models with head_dim=128
+    /// (e.g. Qwen 2.5-1.5B).
+    pub flash_attn_f32_f16_program_dk128: Option<Program>,
 
     // F16 GEMV N_DST=4 for large-N decode (lm_head, FFN)
     pub f16_l4_program: Option<Program>,
@@ -503,16 +514,20 @@ impl OpenCLBackend {
             }
         };
 
-        // Flash attention kernels — compiled with head_dim-specific defines
-        // DK/DV=64 matches Llama 3.2 1B head_dim; BLOCK_M=64 (WG), BLOCK_N=32 (KV tile)
-        let flash_attn_defines = "-DDK=64 -DDV=64 -DBLOCK_M=64 -DBLOCK_N=32";
-        let flash_attn_f32_opts = format!("{} {}", cl_opts, flash_attn_defines);
-
+        // Flash attention kernels — compiled with head_dim-specific defines.
+        // Each DK variant is a separate program because DK is a compile-time
+        // constant (q_priv[DK_VEC] / o_acc[DV_VEC] are private arrays).
+        let flash_attn_src = include_str!("../../../kernels/flash_attn_f32_f16.cl");
         let flash_attn_f32_src = include_str!("../../../kernels/flash_attn_f32.cl");
+
+        // DK=64 (Llama 3.2 1B, other head_dim=64 models)
+        let flash_attn_dk64_defines = "-DDK=64 -DDV=64 -DBLOCK_M=64 -DBLOCK_N=32";
+        let flash_attn_f32_opts_dk64 = format!("{} {}", cl_opts, flash_attn_dk64_defines);
+
         let flash_attn_f32_program = match Program::builder()
             .devices(device)
             .src(flash_attn_f32_src)
-            .cmplr_opt(&flash_attn_f32_opts)
+            .cmplr_opt(&flash_attn_f32_opts_dk64)
             .build(&context)
         {
             Ok(p) => {
@@ -525,20 +540,43 @@ impl OpenCLBackend {
             }
         };
 
-        let flash_attn_f32_f16_src = include_str!("../../../kernels/flash_attn_f32_f16.cl");
-        let flash_attn_f32_f16_program = match Program::builder()
+        let flash_attn_f32_f16_program_dk64 = match Program::builder()
             .devices(device)
-            .src(flash_attn_f32_f16_src)
-            .cmplr_opt(&flash_attn_f32_opts)
+            .src(flash_attn_src)
+            .cmplr_opt(&flash_attn_f32_opts_dk64)
             .build(&context)
         {
             Ok(p) => {
-                log::info!("flash_attn_f32_f16.cl compiled (Q=F32, KV=F16)");
+                log::info!("flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=64)");
                 Some(p)
             }
             Err(e) => {
                 log::warn!(
-                    "flash_attn_f32_f16.cl failed: {}. GPU prefill F16 KV disabled.",
+                    "flash_attn_f32_f16.cl DK=64 failed: {}. GPU flash F16 KV disabled for DK=64.",
+                    e
+                );
+                None
+            }
+        };
+
+        // DK=128 (Qwen 2.5-1.5B). Same source file, different macros.
+        // Decode-only; prefill at DK=128 is not routed through a kernel yet.
+        let flash_attn_dk128_defines = "-DDK=128 -DDV=128 -DBLOCK_M=64 -DBLOCK_N=32";
+        let flash_attn_f32_opts_dk128 = format!("{} {}", cl_opts, flash_attn_dk128_defines);
+
+        let flash_attn_f32_f16_program_dk128 = match Program::builder()
+            .devices(device)
+            .src(flash_attn_src)
+            .cmplr_opt(&flash_attn_f32_opts_dk128)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "flash_attn_f32_f16.cl DK=128 failed: {}. GPU flash F16 KV disabled for DK=128 (Qwen fallback).",
                     e
                 );
                 None
@@ -697,10 +735,13 @@ impl OpenCLBackend {
             kernel_flash_attn_f32: flash_attn_f32_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32").ok()),
-            kernel_flash_attn_f32_f16: flash_attn_f32_f16_program
+            kernel_flash_attn_f32_f16: flash_attn_f32_f16_program_dk64
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16").ok()),
-            kernel_flash_attn_f32_f16_q1: flash_attn_f32_f16_program
+            kernel_flash_attn_f32_f16_q1_dk64: flash_attn_f32_f16_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
+            kernel_flash_attn_f32_f16_q1_dk128: flash_attn_f32_f16_program_dk128
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
             kernel_mul_mm_f16_f32: gemm_f16_program
@@ -788,7 +829,8 @@ impl OpenCLBackend {
             quant_q4_0_program,
             get_rows_program,
             flash_attn_f32_program,
-            flash_attn_f32_f16_program,
+            flash_attn_f32_f16_program_dk64,
+            flash_attn_f32_f16_program_dk128,
             f16_l4_program,
             gemm_f16_program,
             gemm_f32_program,
@@ -1349,9 +1391,9 @@ impl OpenCLBackend {
 
     /// Decode-specialized flash attention: single query per head, online softmax,
     /// zero intermediate score buffer. Dispatches `flash_attn_f32_f16_q1` from the
-    /// same program as `flash_attention_prefill_gpu`.
+    /// DK variant program matching the runtime `head_dim`.
     ///
-    /// Requires: head_dim=64 (DK/DV compile-time constant), F16 KV on GPU,
+    /// Supports head_dim ∈ {64, 128} today. Requires F16 KV on GPU,
     /// HeadMajor KV layout, `seq_len=1`, and no score output.
     /// Returns Ok(true) if the kernel was dispatched; Ok(false) if preconditions
     /// are not met and the caller should fall back to the legacy attention kernel.
@@ -1367,11 +1409,7 @@ impl OpenCLBackend {
         head_dim: usize,
         cache_seq_len: usize,
     ) -> Result<bool> {
-        // Head dim must match the DK/DV compile-time constant in flash_attn_f32_f16.cl.
-        if head_dim != 64 {
-            return Ok(false);
-        }
-        // Only F16 KV on HeadMajor GPU buffer is supported in this prototype.
+        // Only F16 KV on HeadMajor GPU buffer is supported.
         if k_cache.dtype() != DType::F16 {
             return Ok(false);
         }
@@ -1383,10 +1421,21 @@ impl OpenCLBackend {
         }
         let kv_capacity = k_shape[2];
 
+        // Head dim must match the DK/DV compile-time constant of one of the
+        // compiled flash attention programs. Add new variants here when
+        // adding a new head_dim (remember to compile the program in
+        // `OpenCLBackend::new` and cache the kernel in `KernelCache`).
         let kernels = unsafe { &*self.kernels.get() };
-        let kernel = match &kernels.kernel_flash_attn_f32_f16_q1 {
-            Some(k) => k,
-            None => return Ok(false),
+        let kernel = match head_dim {
+            64 => match &kernels.kernel_flash_attn_f32_f16_q1_dk64 {
+                Some(k) => k,
+                None => return Ok(false),
+            },
+            128 => match &kernels.kernel_flash_attn_f32_f16_q1_dk128 {
+                Some(k) => k,
+                None => return Ok(false),
+            },
+            _ => return Ok(false),
         };
 
         let q_buf = get_cl_mem(q.buffer().as_ref())?;
@@ -3175,13 +3224,17 @@ impl OpenCLBackend {
         kernels.f16_is_nosub
     }
 
-    /// Returns true if the flash attention decode kernel (flash_attn_f32_f16_q1)
-    /// was successfully created at backend init time. Used by plan.rs to gate
-    /// the StandardFlash attention variant, and by host tests to decide whether
-    /// to exercise the flash path.
-    pub fn has_flash_decode_kernel(&self) -> bool {
+    /// Returns true if the flash attention decode kernel is available for the
+    /// given head_dim. Used by plan.rs to gate the `StandardFlash` attention
+    /// variant, and by host tests to decide whether to exercise the flash path.
+    /// Supported head_dim values match the DK variants compiled in `new()`.
+    pub fn has_flash_decode_kernel(&self, head_dim: usize) -> bool {
         let kernels = unsafe { &*self.kernels.get() };
-        kernels.kernel_flash_attn_f32_f16_q1.is_some()
+        match head_dim {
+            64 => kernels.kernel_flash_attn_f32_f16_q1_dk64.is_some(),
+            128 => kernels.kernel_flash_attn_f32_f16_q1_dk128.is_some(),
+            _ => false,
+        }
     }
 
     /// Check if KIVI fused attention kernel is available for the given bit-width.

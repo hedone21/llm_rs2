@@ -595,10 +595,15 @@ pub struct LayerPlanConfig<'a> {
     pub kv_head_stride: i32,
     /// Whether the device lacks subgroup support (nosub fallback path).
     pub is_nosub: bool,
-    /// The flash attention F32 Q / F16 KV program handle, if compiled.
+    /// Flash attention F32-Q / F16-KV program handle for head_dim=64.
     /// Used to create `flash_attn_f32_f16_q1` at plan-build time when
-    /// runtime preconditions hold. `None` forces the legacy path.
-    pub flash_attn_f32_f16_program: Option<&'a ocl::Program>,
+    /// runtime preconditions hold and the layer's head_dim is 64.
+    /// `None` forces the legacy path for head_dim=64 models.
+    pub flash_attn_f32_f16_program_dk64: Option<&'a ocl::Program>,
+    /// Flash attention F32-Q / F16-KV program handle for head_dim=128.
+    /// Used for Qwen 2.5-1.5B and other head_dim=128 models.
+    /// `None` forces the legacy path for head_dim=128 models.
+    pub flash_attn_f32_f16_program_dk128: Option<&'a ocl::Program>,
     /// True if this decode plan must capture attention scores (H2O/H2O+ or
     /// an active GPU score accumulator). When true, the builder must use
     /// `AttentionVariant::Standard` because the flash kernel has no score
@@ -710,9 +715,14 @@ fn make_f16_matmul_step(
 /// All 40 args are static except `n_kv` at index 10, which is patched per
 /// decode step via `DynamicArg::CacheSeqLen`.
 fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVariant> {
-    let program = config
-        .flash_attn_f32_f16_program
-        .expect("caller must verify flash_attn_f32_f16_program.is_some()");
+    // Pick the program matching this layer's head_dim. The caller
+    // (`use_flash` gate) guarantees the matching program is `Some`.
+    let program = match config.head_dim {
+        64 => config.flash_attn_f32_f16_program_dk64,
+        128 => config.flash_attn_f32_f16_program_dk128,
+        _ => None,
+    }
+    .expect("caller must verify flash program is Some for this head_dim");
 
     let kernel = ocl::core::create_kernel(program, "flash_attn_f32_f16_q1")
         .context("create flash_attn_f32_f16_q1 for plan")?;
@@ -1028,10 +1038,16 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     //      in mod.rs for the canonical assignment).
     let is_head_major = config.kv_pos_stride == config.head_dim as i32
         && config.kv_head_stride == (config.kv_capacity * config.head_dim) as i32;
-    let use_flash = config.head_dim == 64
-        && is_head_major
-        && config.flash_attn_f32_f16_program.is_some()
-        && !config.needs_attention_scores;
+    // Flash attention is gated per head_dim because each DK variant is a
+    // separate compiled program. Add a new arm here when adding DK=256
+    // (Gemma3) etc. `needs_attention_scores` forces legacy because no
+    // flash variant emits scores (see C2 follow-up plan).
+    let flash_program_available = match config.head_dim {
+        64 => config.flash_attn_f32_f16_program_dk64.is_some(),
+        128 => config.flash_attn_f32_f16_program_dk128.is_some(),
+        _ => false,
+    };
+    let use_flash = is_head_major && flash_program_available && !config.needs_attention_scores;
 
     let attention = if use_flash {
         build_flash_attention_step(config)?
@@ -1252,10 +1268,14 @@ pub struct FullPlanConfig<'a> {
     pub f16_program: &'a ocl::Program,
     pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
-    /// Optional flash attention program (`flash_attn_f32_f16`). When `Some`,
-    /// the layer builder may select `AttentionVariant::StandardFlash` if all
-    /// other preconditions hold.
-    pub flash_attn_f32_f16_program: Option<&'a ocl::Program>,
+    /// Flash attention program for head_dim=64. When `Some`, the layer
+    /// builder may select `AttentionVariant::StandardFlash` for layers
+    /// with head_dim=64.
+    pub flash_attn_f32_f16_program_dk64: Option<&'a ocl::Program>,
+    /// Flash attention program for head_dim=128. When `Some`, the layer
+    /// builder may select `AttentionVariant::StandardFlash` for layers
+    /// with head_dim=128 (e.g. Qwen 2.5-1.5B).
+    pub flash_attn_f32_f16_program_dk128: Option<&'a ocl::Program>,
     /// True if this decode plan must capture attention scores (H2O / GPU
     /// score accumulator). Forces the legacy attention path because flash
     /// attention has no score output.
@@ -1368,7 +1388,8 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             kv_pos_stride: config.kv_pos_stride,
             kv_head_stride: config.kv_head_stride,
             is_nosub: config.is_nosub,
-            flash_attn_f32_f16_program: config.flash_attn_f32_f16_program,
+            flash_attn_f32_f16_program_dk64: config.flash_attn_f32_f16_program_dk64,
+            flash_attn_f32_f16_program_dk128: config.flash_attn_f32_f16_program_dk128,
             needs_attention_scores: config.needs_attention_scores,
         };
         layers.push(
@@ -1895,7 +1916,8 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             // KIVI replaces the standard attention step with its own variant,
             // so the flash gate never matters here. Force the legacy path
             // (which build_kivi_layer_plan immediately overrides anyway).
-            flash_attn_f32_f16_program: None,
+            flash_attn_f32_f16_program_dk64: None,
+            flash_attn_f32_f16_program_dk128: None,
             needs_attention_scores: false,
         };
         layers.push(

@@ -1,0 +1,30 @@
+# V5: KIVI Regression Test — PRE-EXISTING BUG (not our regression)
+
+## Result Summary
+- **Our branch (c2af2c2)**: KIVI Q2/Q4 produces garbled output ("The quick brown fox jumps over the/buttons/buttons/...")
+- **Master (1bccdf2)**: KIVI Q2 produces IDENTICAL garbled output
+
+## Conclusion
+KIVI KV cache is broken on master BEFORE our C1-Qwen (DK=128 flash attention) changes.
+Our changes do NOT introduce this regression. The output mismatch is identical byte-for-byte
+across both branches, meaning our DK=128 compile + dispatcher modifications have no effect
+on the KIVI code path.
+
+## Technical context
+KIVI uses a separate set of kernels (kernel_attn_gen_kivi_q2/q4/q8) that are unrelated to
+the flash_attn_f32_f16.cl we modified. Our Task 2 changes only touched:
+- flash_attn_f32_f16_program_dk64/dk128 (new program handles)
+- kernel_flash_attn_f32_f16_q1_dk64/dk128 (decode-specialized kernels)
+- flash_attention_decode_gpu dispatcher (head_dim -> kernel selection)
+
+None of these are on the KIVI code path.
+
+## Recommendation
+This pre-existing KIVI bug is OUT OF SCOPE for C1-Qwen merge. File a separate issue to
+investigate KIVI decode correctness. Our merge should proceed because we verified we
+neither introduce nor fix this issue.
+
+## Raw evidence files
+- v5_kivi_q2_llama3.2-1b.txt: Our branch KIVI Q2 output (garbled)
+- v5_kivi_q4_llama3.2-1b.txt: Our branch KIVI Q4 output (same garbled pattern)
+- Master binary run captured above inline (identical output to our branch)

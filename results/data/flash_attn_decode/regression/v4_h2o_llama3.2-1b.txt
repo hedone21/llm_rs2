@@ -1,0 +1,26 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/llama3.2-1b
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: The quick brown fox jumps over
+Token Length: 7
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[GPU Score] Accumulator initialized — per-token readback eliminated
+Eviction: policy=h2o, window=1024, prefix=4, ratio=0.75, threshold=256MB
+[Profile] Event: PrefillStart
+Prefill: 266.22 ms (7 tokens, 26.3 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The wolf was caught in a trap by the hunters. It’s been too long since I’ve posted anything on my blog, but here goes.
+I thought it would be fun to make an outline of a book that you read when you were younger and then never returned to, because you loved it so much! Let me know if there is one of these that has haunted your memory from the past few years!
+You can go back in time with this 4D interactive story.
+Have a look at some great examples and[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='h2o@Warning', removed=29, new_pos=86
+ see how they work.
+Done.
+[Profile] Event: End
+TTFT: 405.42 ms
+Decode: 42.37 ms/tok (23.6 tok/s) [113 tokens, forward only]
+Avg TBT: 46.53 ms (21.5 tokens/sec)
