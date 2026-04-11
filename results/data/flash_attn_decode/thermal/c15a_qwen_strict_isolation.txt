@@ -1,0 +1,38 @@
+# Sat Apr 11 12:22:17 KST 2026 — Qwen strict thermal isolation (5 min rest, CPU/GPU batched)
+# Device: Samsung Galaxy S25 (Adreno 830)
+# Zones monitored: cpu-0-0-0 (zone1), cpu-0-4-1 (zone10), gpuss-5 (zone28), gpuss-7 (zone30)
+# Rest between runs: 300s (min) + threshold 50000mC
+# Inter-phase rest (CPU→GPU): 300s
+# Runs per combo: 3
+# Short combo: prefill=7, decode=64
+# Long combo:  prefill=720, decode=128
+
+
+=== Phase 1: llama.cpp CPU ===
+  cpu short run=1: 50.20ms
+  cpu long  run=1: 54.59ms
+  cpu short run=2: 50.20ms
+  cpu long  run=2: 53.28ms
+  cpu short run=3: 50.45ms
+  cpu long  run=3: 54.20ms
+
+--- inter-phase rest 300s ---
+
+=== Phase 2: llm.rs OpenCL GPU ===
+  gpu short run=1: 58.19ms
+  gpu long  run=1: 68.81ms
+  gpu short run=2: 58.11ms
+  gpu long  run=2: 69.19ms
+  gpu short run=3: 58.07ms
+  gpu long  run=3: 69.32ms
+
+=== Medians across 3 runs ===
+  Combo A short(pf=7,dc=64):
+    llama.cpp CPU : 50.20 ms/tok  (runs: 50.20 50.20 50.45)
+    llm.rs    GPU : 58.11 ms/tok  (runs: 58.19 58.11 58.07)
+    GPU vs CPU    : +15.8%
+
+  Combo B long (pf=720,dc=128):
+    llama.cpp CPU : 54.20 ms/tok  (runs: 54.59 53.28 54.20)
+    llm.rs    GPU : 69.19 ms/tok  (runs: 68.81 69.19 69.32)
+    GPU vs CPU    : +27.7%

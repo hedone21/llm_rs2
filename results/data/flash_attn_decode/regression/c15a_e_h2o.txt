@@ -1,0 +1,27 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/llama3.2-1b
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: The quick brown fox jumps over
+Token Length: 7
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[GPU Score] Accumulator initialized — per-token readback eliminated
+Eviction: policy=h2o, window=1024, prefix=4, ratio=0.75, threshold=256MB
+[Profile] Event: PrefillStart
+Prefill: 266.90 ms (7 tokens, 26.2 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. I'm a bit of a jokester, and I don't know if that's because my mom is actually a good girl or if it was just me being born too early.
+I really hate the smell of bleach and toilet cleaner. They remind me too much of Mommy Day Care.
+My Dad bought me an iPod Touch for Christmas one year, but I couldn’t figure out how to use it. He had to teach my how before I could play music on it at all!
+The quickest way for you or your[CacheEvent] Pressure Emergency, mem_available=0 MB (forced)
+[CacheEvent] Eviction completed: policy='h2o@Warning', removed=29, new_pos=86
+ kids to get a 2-year-old's attention is with the sound of a bell.
+I once
+Done.
+[Profile] Event: End
+TTFT: 391.92 ms
+Decode: 42.06 ms/tok (23.8 tok/s) [127 tokens, forward only]
+Avg TBT: 43.86 ms (22.8 tokens/sec)

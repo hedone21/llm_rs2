@@ -1,0 +1,43 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] OpenCL Platform: QUALCOMM Snapdragon(TM)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] OpenCL Device: QUALCOMM Adreno(TM) 830 (API 3.0, CL C: OpenCL C 3.0 Adreno(TM) 830)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] Subgroup support: cl_khr_subgroups=true, cl_intel_subgroups=false
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] GPU Global Memory: 5557 MB
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] GPU Max Alloc Size: 1024 MB
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] OpenCL compiler options: -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] simple_ops.cl compiled (subgroup path)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32.cl compiled (4-wave K-split, N_DST=2, 128 rows/WG)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32_l4.cl compiled (GEMV N_DST=4 for large N)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=64, BLOCK_N=32, DK=64)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=64)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] mul_mm_f16_f32_l4_lm.cl compiled (GEMM prefill F16)
+[2026-04-11T04:40:31Z INFO  llm_rs2::backend::opencl] mul_mm_f32_f32_l4_lm.cl compiled (GEMM prefill F32)
+[2026-04-11T04:40:32Z INFO  llm_rs2::backend::opencl] kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)
+[2026-04-11T04:40:32Z INFO  llm_rs2::backend::opencl] kivi_attn.cl compiled (KIVI fused attention kernels)
+[2026-04-11T04:40:32Z INFO  llm_rs2::backend::opencl] OpenCL kernels cached successfully
+[2026-04-11T04:40:32Z INFO  llm_rs2::backend::opencl] Memory mode: UMA/integrated (zero_copy=true)
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: The capital of France is
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 296.92 ms (5 tokens, 16.8 tok/s)
+[Profile] Event: DecodingStart
+The capital of France is Paris[2026-04-11T04:40:35Z INFO  llm_rs2::models::transformer] GPU kernel plan built (28 layers, capacity=128)
+, and it's considered to be the world's cultural capital. A. Correct B. Incorrect
+Answer:
+
+A
+
+In a three-phase four-wire
+Done.
+[Profile] Event: End
+TTFT: 454.75 ms
+Decode: 58.02 ms/tok (17.2 tok/s) [31 tokens, forward only]
+Avg TBT: 63.35 ms (15.8 tokens/sec)

@@ -1,0 +1,39 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/llama3.2-1b
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+Prompt: The quick brown fox jumps over
+Token Length: 7
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Profile] Event: PrefillStart
+Prefill: 266.50 ms (7 tokens, 26.3 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog.
+A. true
+B. false
+Answer: B
+[Profile] Per-op breakdown (accumulated over 240 layer-calls):
+  Operation             Total(us)    Avg(us)        %
+  -------------------- ---------- ---------- --------
+  matmul_qkv               129255        538    12.0%
+  matmul_wo                 91186        379     8.4%
+  matmul_ffn               510009       2125    47.2%
+  attention                 46663        194     4.3%
+  rms_norm                 104855        436     9.7%
+  rope                      61361        255     5.7%
+  silu_mul                  48456        201     4.5%
+  add_assign                42846        178     4.0%
+  copy_residual                 0          0     0.0%
+  kv_update                 45954        191     4.3%
+  cast                          0          0     0.0%
+  TOTAL                   1080585       4502
+[Profile] Exported to /data/local/tmp/profile_out/profile_opencl_none_15_1775882712.json
+
+Done.
+[Profile] Event: End
+TTFT: 383.99 ms
+Decode: 81.60 ms/tok (12.3 tok/s) [15 tokens, forward only]
+Avg TBT: 86.72 ms (11.5 tokens/sec)
