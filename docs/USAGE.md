@@ -594,7 +594,7 @@ zero-alloc SwitchHw를 위해 CPU/GPU 듀얼 버퍼를 미리 할당한다.
 
 실행 중 FFN 분할 비율을 변경한다.
 `ratio=0.0`이면 partition 비활성화(GPU-only), `ratio=1.0`이면 GPU 100% 할당.
-Lua policy에서 `set_partition_ratio` action으로 사용한다.
+Lua policy에서 `set_partition_ratio` action으로, mock_manager CLI에서 `--command SetPartitionRatio --ratio <값>`으로 사용한다.
 
 ```lua
 -- Lua policy: 메모리 압박 시 partition 비율 낮추기
@@ -603,7 +603,15 @@ if mem.available / mem.total < 0.15 then
 end
 ```
 
+```bash
+# mock_manager CLI: partition 비율 50%로 설정
+./target/release/mock_manager --tcp 127.0.0.1:19999 \
+  --command SetPartitionRatio --ratio 0.5 --wait-secs 10
+```
+
 **시나리오 재생 (여러 명령 순차 전송)**
+
+시나리오 JSON 형식의 상세 설명은 [§3.3 mock_manager 사용법](#33-mock_manager-사용법) 참조.
 
 ```json
 {
@@ -764,10 +772,17 @@ generate \
 
 **동적 ratio 변경 (Manager)**
 
-Manager가 런타임에 비율을 조정할 수 있다. Lua policy 또는 mock_manager에서:
+Manager가 런타임에 비율을 조정할 수 있다.
 
-```json
-{"type": "set_partition_ratio", "ratio": 0.5}
+```bash
+# mock_manager CLI
+./target/release/mock_manager --tcp 127.0.0.1:19999 \
+  --command SetPartitionRatio --ratio 0.5 --wait-secs 10
+```
+
+```lua
+-- Lua policy
+table.insert(actions, {type = "set_partition_ratio", ratio = 0.5})
 ```
 
 엔진은 다음 decode step부터 새 ratio를 적용한다.
@@ -1212,14 +1227,23 @@ cargo build --release --bin mock_manager
 | `SwitchHw` | `--device` | 백엔드 전환 (cpu/opencl) |
 | `KvQuantDynamic` | `--target-bits` | KV 양자화 비트 전환 |
 | `LayerSkip` | `--skip-ratio` | 레이어 건너뛰기 비율 |
+| `SetPartitionRatio` | `--ratio` | FFN tensor partition GPU 비율 (0.0~1.0) |
+| `SetPrefillPolicy` | (모두 선택) | prefill 정책 동적 변경 |
 | `Suspend` | — | 추론 일시 정지 |
 | `Resume` | — | 추론 재개 |
 | `RestoreDefaults` | — | 모든 제약 해제 |
 | `RequestQcf` | — | QCF 메트릭 요청 |
 
-> **참고**: `PrepareComputeUnit`과 `SetPartitionRatio`는 `EngineCommand` 프로토콜에 정의되어 있으나
-> mock_manager CLI에서는 아직 지원되지 않는다. 시나리오 JSON에서 직접 직렬화하거나 Lua policy
-> (`set_partition_ratio`)를 통해 사용한다.
+> **참고**: `PrepareComputeUnit`은 `EngineCommand` 프로토콜에 정의되어 있으나
+> mock_manager CLI에서는 아직 지원되지 않는다.
+
+**SetPrefillPolicy 파라미터**
+
+| 파라미터 | 타입 | 필수 | 설명 |
+|---------|------|------|------|
+| `--chunk-size` | usize | ❌ | prefill chunk 크기 (미지정 시 현재 값 유지) |
+| `--yield-ms` | u32 | ❌ | chunk 간 GPU yield 시간 ms |
+| `--cpu-chunk-size` | usize | ❌ | CPU interleave chunk 크기 |
 
 **사용 예시**
 
@@ -1247,7 +1271,107 @@ cargo build --release --bin mock_manager
 # TBT 목표 150ms 설정
 ./target/release/mock_manager --tcp 127.0.0.1:19999 \
   --command SetTargetTbt --target-ms 150 --wait-secs 5
+
+# Tensor partition GPU 비율 50%로 설정
+# (engine을 --tensor-partition 0.001 이상으로 기동해야 zero-copy 활성화됨)
+./target/release/mock_manager --tcp 127.0.0.1:19999 \
+  --command SetPartitionRatio --ratio 0.5 --wait-secs 10
+
+# Prefill 정책 변경 (chunk + yield + CPU interleave)
+./target/release/mock_manager --tcp 127.0.0.1:19999 \
+  --command SetPrefillPolicy --chunk-size 48 --yield-ms 10 --cpu-chunk-size 16 --wait-secs 10
+
+# Prefill chunk 크기만 변경 (나머지는 현재 값 유지)
+./target/release/mock_manager --tcp 127.0.0.1:19999 \
+  --command SetPrefillPolicy --chunk-size 64 --wait-secs 5
 ```
+
+**시나리오 JSON (여러 명령 순차 전송)**
+
+mock_manager는 `--scenario` 옵션으로 JSON 파일을 입력받아 여러 command를 시간 간격을 두고 순차 전송할 수 있다. 단일 `--command` 대신 복합 실험 시나리오를 스크립트 없이 실행할 때 유용하다.
+
+파일 형식:
+
+```json
+{
+  "name": "시나리오 이름",
+  "description": "선택적 설명",
+  "commands": [
+    { "delay_ms": <시작부터 대기 ms>, "command": "<Command 이름>", ...파라미터... },
+    ...
+  ]
+}
+```
+
+- `delay_ms`: 이 command 전송 전에 대기할 시간 (ms). 대기 중 수신되는 Heartbeat는 드레인된다.
+- `command`: 위 command 테이블의 이름 (예: `KvEvictSliding`, `SetPartitionRatio` 등).
+- 나머지 필드: 해당 command의 파라미터를 JSON 키로 직접 지정한다 (CLI flag 이름에서 `--` 제거, 하이픈을 언더스코어로).
+
+파라미터 키 매핑:
+
+| CLI flag | JSON 키 | 사용 command |
+|----------|---------|-------------|
+| `--keep-ratio` | `keep_ratio` | KvEvictSliding, KvEvictH2o, KvMergeD2o |
+| `--sink-size` | `sink_size` | KvStreaming |
+| `--window-size` | `window_size` | KvStreaming |
+| `--delay-ms` | `delay_ms_param` | Throttle |
+| `--device` | `device` | SwitchHw |
+| `--target-bits` | `target_bits` | KvQuantDynamic |
+| `--skip-ratio` | `skip_ratio` | LayerSkip |
+| `--ratio` | `ratio` | SetPartitionRatio |
+| `--chunk-size` | `chunk_size` | SetPrefillPolicy |
+| `--yield-ms` | `yield_ms` | SetPrefillPolicy |
+| `--cpu-chunk-size` | `cpu_chunk_size` | SetPrefillPolicy |
+
+> **주의**: Throttle의 delay_ms 파라미터는 시나리오의 `delay_ms`(대기 시간)와 구분하기 위해 JSON 키가 `delay_ms_param`이다.
+
+예시 1 — Eviction 후 복원:
+
+```json
+{
+  "name": "eviction-then-restore",
+  "commands": [
+    {"delay_ms": 10000, "command": "KvEvictSliding", "keep_ratio": 0.6},
+    {"delay_ms": 20000, "command": "RestoreDefaults"}
+  ]
+}
+```
+
+예시 2 — Tensor partition + Prefill 정책 순차 적용:
+
+```json
+{
+  "name": "partition-and-prefill",
+  "description": "GPU 비율 50% 설정 후 cooperative prefill 활성화",
+  "commands": [
+    {"delay_ms": 5000, "command": "SetPartitionRatio", "ratio": 0.5},
+    {"delay_ms": 3000, "command": "SetPrefillPolicy", "chunk_size": 48, "yield_ms": 10, "cpu_chunk_size": 16},
+    {"delay_ms": 10000, "command": "RestoreDefaults"}
+  ]
+}
+```
+
+예시 3 — SwitchHw + Throttle 복합:
+
+```json
+{
+  "name": "switch-then-throttle",
+  "commands": [
+    {"delay_ms": 5000, "command": "SwitchHw", "device": "opencl"},
+    {"delay_ms": 3000, "command": "Throttle", "delay_ms_param": 50},
+    {"delay_ms": 10000, "command": "RestoreDefaults"}
+  ]
+}
+```
+
+실행:
+
+```bash
+./target/release/mock_manager --tcp 127.0.0.1:19999 \
+  --scenario scenario.json --wait-secs 5
+```
+
+`--wait-secs`는 시나리오 재생 전 Heartbeat 수신 대기 시간이다. 시나리오 내부의 `delay_ms`와는 별개로 동작한다.
 
 ---
 

@@ -65,6 +65,7 @@ struct Args {
 
     /// Command to send (KvEvictSliding, KvEvictH2o, KvStreaming, KvMergeD2o,
     /// Throttle, SetTargetTbt, SwitchHw, KvQuantDynamic, LayerSkip,
+    /// SetPartitionRatio, SetPrefillPolicy,
     /// Suspend, Resume, RestoreDefaults, RequestQcf).
     #[arg(long)]
     command: Option<String>,
@@ -109,6 +110,22 @@ struct Args {
     /// target_ms for SetTargetTbt.
     #[arg(long)]
     target_ms: Option<u64>,
+
+    /// ratio for SetPartitionRatio (0.0~1.0).
+    #[arg(long)]
+    ratio: Option<f32>,
+
+    /// chunk_size for SetPrefillPolicy.
+    #[arg(long)]
+    chunk_size: Option<usize>,
+
+    /// yield_ms for SetPrefillPolicy.
+    #[arg(long)]
+    yield_ms: Option<u32>,
+
+    /// cpu_chunk_size for SetPrefillPolicy.
+    #[arg(long)]
+    cpu_chunk_size: Option<usize>,
 
     // ── D-Bus mode (legacy) ──
     /// Use D-Bus transport instead of Unix socket.
@@ -246,6 +263,14 @@ struct ScenarioCommand {
     target_bits: Option<u8>,
     #[serde(default)]
     skip_ratio: Option<f32>,
+    #[serde(default)]
+    ratio: Option<f32>,
+    #[serde(default)]
+    chunk_size: Option<usize>,
+    #[serde(default)]
+    yield_ms: Option<u32>,
+    #[serde(default)]
+    cpu_chunk_size: Option<usize>,
 }
 
 // ── Command construction ────────────────────────────────────────────────────
@@ -261,6 +286,10 @@ struct CommandParams<'a> {
     target_bits: Option<u8>,
     skip_ratio: Option<f32>,
     target_ms: Option<u64>,
+    ratio: Option<f32>,
+    chunk_size: Option<usize>,
+    yield_ms: Option<u32>,
+    cpu_chunk_size: Option<usize>,
 }
 
 fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
@@ -325,6 +354,17 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
                 .context("--target-ms required for SetTargetTbt")?;
             Ok(EngineCommand::SetTargetTbt { target_ms: ms })
         }
+        "SetPartitionRatio" => {
+            let ratio = params
+                .ratio
+                .context("--ratio required for SetPartitionRatio")?;
+            Ok(EngineCommand::SetPartitionRatio { ratio })
+        }
+        "SetPrefillPolicy" => Ok(EngineCommand::SetPrefillPolicy {
+            chunk_size: params.chunk_size,
+            yield_ms: params.yield_ms,
+            cpu_chunk_size: params.cpu_chunk_size,
+        }),
         "Suspend" => Ok(EngineCommand::Suspend),
         "Resume" => Ok(EngineCommand::Resume),
         "RestoreDefaults" => Ok(EngineCommand::RestoreDefaults),
@@ -601,6 +641,10 @@ fn run_single_command(
         target_bits: args.target_bits,
         skip_ratio: args.skip_ratio,
         target_ms: args.target_ms,
+        ratio: args.ratio,
+        chunk_size: args.chunk_size,
+        yield_ms: args.yield_ms,
+        cpu_chunk_size: args.cpu_chunk_size,
     })?;
 
     let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
@@ -703,6 +747,10 @@ fn run_scenario(stream: &mut (impl Read + Write), path: &PathBuf) -> anyhow::Res
             target_bits: entry.target_bits,
             skip_ratio: entry.skip_ratio,
             target_ms: entry.delay_ms_param, // reuse delay_ms for target_ms in scenario
+            ratio: entry.ratio,
+            chunk_size: entry.chunk_size,
+            yield_ms: entry.yield_ms,
+            cpu_chunk_size: entry.cpu_chunk_size,
         })?;
 
         let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
@@ -1152,6 +1200,10 @@ mod tests {
             target_bits: None,
             skip_ratio: None,
             target_ms: None,
+            ratio: None,
+            chunk_size: None,
+            yield_ms: None,
+            cpu_chunk_size: None,
         }
     }
 
@@ -1263,6 +1315,89 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn build_command_set_partition_ratio() {
+        let cmd = build_command(&CommandParams {
+            ratio: Some(0.5),
+            ..params("SetPartitionRatio")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::SetPartitionRatio { ratio } => {
+                assert!((ratio - 0.5).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected SetPartitionRatio"),
+        }
+    }
+
+    #[test]
+    fn build_command_set_partition_ratio_missing_ratio() {
+        let result = build_command(&params("SetPartitionRatio"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_command_set_prefill_policy_full() {
+        let cmd = build_command(&CommandParams {
+            chunk_size: Some(48),
+            yield_ms: Some(10),
+            cpu_chunk_size: Some(16),
+            ..params("SetPrefillPolicy")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(chunk_size, Some(48));
+                assert_eq!(yield_ms, Some(10));
+                assert_eq!(cpu_chunk_size, Some(16));
+            }
+            _ => panic!("Expected SetPrefillPolicy"),
+        }
+    }
+
+    #[test]
+    fn build_command_set_prefill_policy_partial() {
+        let cmd = build_command(&CommandParams {
+            chunk_size: Some(64),
+            ..params("SetPrefillPolicy")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert_eq!(chunk_size, Some(64));
+                assert!(yield_ms.is_none());
+                assert!(cpu_chunk_size.is_none());
+            }
+            _ => panic!("Expected SetPrefillPolicy"),
+        }
+    }
+
+    #[test]
+    fn build_command_set_prefill_policy_empty() {
+        // All None is valid — engine keeps current values
+        let cmd = build_command(&params("SetPrefillPolicy")).unwrap();
+        match cmd {
+            EngineCommand::SetPrefillPolicy {
+                chunk_size,
+                yield_ms,
+                cpu_chunk_size,
+            } => {
+                assert!(chunk_size.is_none());
+                assert!(yield_ms.is_none());
+                assert!(cpu_chunk_size.is_none());
+            }
+            _ => panic!("Expected SetPrefillPolicy"),
+        }
+    }
+
     // ── validate_response tests ──────────────────────────────────────────────
 
     #[test]
@@ -1312,6 +1447,30 @@ mod tests {
         assert!((scenario.commands[0].keep_ratio.unwrap() - 0.8).abs() < f32::EPSILON);
         assert_eq!(scenario.commands[1].command, "RestoreDefaults");
         assert!(scenario.commands[1].keep_ratio.is_none());
+    }
+
+    #[test]
+    fn command_scenario_deserialize_new_commands() {
+        let json = r#"{
+            "name": "partition_and_prefill",
+            "commands": [
+                { "delay_ms": 5000, "command": "SetPartitionRatio", "ratio": 0.5 },
+                { "delay_ms": 3000, "command": "SetPrefillPolicy", "chunk_size": 48, "yield_ms": 10, "cpu_chunk_size": 16 },
+                { "delay_ms": 1000, "command": "SetPrefillPolicy", "chunk_size": 64 }
+            ]
+        }"#;
+        let scenario: CommandScenario = serde_json::from_str(json).unwrap();
+        assert_eq!(scenario.name, "partition_and_prefill");
+        assert_eq!(scenario.commands.len(), 3);
+        assert_eq!(scenario.commands[0].command, "SetPartitionRatio");
+        assert!((scenario.commands[0].ratio.unwrap() - 0.5).abs() < f32::EPSILON);
+        assert_eq!(scenario.commands[1].command, "SetPrefillPolicy");
+        assert_eq!(scenario.commands[1].chunk_size, Some(48));
+        assert_eq!(scenario.commands[1].yield_ms, Some(10));
+        assert_eq!(scenario.commands[1].cpu_chunk_size, Some(16));
+        // partial: only chunk_size
+        assert_eq!(scenario.commands[2].chunk_size, Some(64));
+        assert!(scenario.commands[2].yield_ms.is_none());
     }
 
     // ── TCP transport tests ─────────────────────────────────────────────────
