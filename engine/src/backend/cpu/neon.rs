@@ -2581,13 +2581,21 @@ unsafe fn fused_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
             b_base.add((j + 3) * ctx.k),
         ];
         let mut results = [0.0f32; NR];
-        CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, ctx.a_f16_ptr, b_ptrs, &mut results);
+        CpuBackendNeon::vec_dot_f16_native_gemv_4rows(
+            ctx.k,
+            ctx.a_f16_ptr,
+            b_ptrs,
+            &mut results,
+        );
         std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
         j += NR;
     }
     while j < j_end {
-        *out_ptr.add(j) =
-            CpuBackendNeon::vec_dot_fmlal(ctx.k, ctx.a_f16_ptr, b_base.add(j * ctx.k));
+        *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_native_gemv_1row(
+            ctx.k,
+            ctx.a_f16_ptr,
+            b_base.add(j * ctx.k),
+        );
         j += 1;
     }
 }
@@ -2670,13 +2678,21 @@ unsafe fn f16_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
             ctx.b_base.add((j + 3) * ctx.k),
         ];
         let mut results = [0.0f32; NR];
-        CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, ctx.a_f16_ptr, b_ptrs, &mut results);
+        CpuBackendNeon::vec_dot_f16_native_gemv_4rows(
+            ctx.k,
+            ctx.a_f16_ptr,
+            b_ptrs,
+            &mut results,
+        );
         std::ptr::copy_nonoverlapping(results.as_ptr(), ctx.out_ptr.add(j), NR);
         j += NR;
     }
     while j < j_end {
-        *ctx.out_ptr.add(j) =
-            CpuBackendNeon::vec_dot_fmlal(ctx.k, ctx.a_f16_ptr, ctx.b_base.add(j * ctx.k));
+        *ctx.out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_native_gemv_1row(
+            ctx.k,
+            ctx.a_f16_ptr,
+            ctx.b_base.add(j * ctx.k),
+        );
         j += 1;
     }
 }
@@ -2738,13 +2754,16 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
         // Tail: remaining B columns (< NR)
         while j < j_end {
             for r in 0..MR {
-                *out_ptrs[r].add(j) =
-                    CpuBackendNeon::vec_dot_fmlal(ctx.k, a_ptrs[r], ctx.b_base.add(j * ctx.k));
+                *out_ptrs[r].add(j) = CpuBackendNeon::vec_dot_f16_native_gemv_1row(
+                    ctx.k,
+                    a_ptrs[r],
+                    ctx.b_base.add(j * ctx.k),
+                );
             }
             j += 1;
         }
     } else {
-        // Tail group (1-3 rows): fallback to per-row FMLAL
+        // Tail group (1-3 rows): fallback to per-row GEMV kernel
         for r in 0..m_remaining {
             let a_f16 = ctx.a_f16_base.add((m_row0 + r) * ctx.k);
             let out_ptr = ctx.out_base.add((m_row0 + r) * ctx.n);
@@ -2757,13 +2776,18 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
                     ctx.b_base.add((j + 3) * ctx.k),
                 ];
                 let mut results = [0.0f32; NR];
-                CpuBackendNeon::vec_dot_fmlal_4rows(ctx.k, a_f16, b_ptrs, &mut results);
+                CpuBackendNeon::vec_dot_f16_native_gemv_4rows(
+                    ctx.k, a_f16, b_ptrs, &mut results,
+                );
                 std::ptr::copy_nonoverlapping(results.as_ptr(), out_ptr.add(j), NR);
                 j += NR;
             }
             while j < j_end {
-                *out_ptr.add(j) =
-                    CpuBackendNeon::vec_dot_fmlal(ctx.k, a_f16, ctx.b_base.add(j * ctx.k));
+                *out_ptr.add(j) = CpuBackendNeon::vec_dot_f16_native_gemv_1row(
+                    ctx.k,
+                    a_f16,
+                    ctx.b_base.add(j * ctx.k),
+                );
                 j += 1;
             }
         }
