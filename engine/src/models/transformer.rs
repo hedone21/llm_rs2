@@ -1482,6 +1482,11 @@ impl TransformerModel {
                 w_down: cl!(layer.w_down),
                 attn_norm: cl!(layer.attention_norm),
                 ffn_norm: cl!(layer.ffn_norm),
+                // Task 3 will populate these from layer.qkv_bias when
+                // the model has has_qkv_bias=true (e.g. Qwen2).
+                bq: None,
+                bk: None,
+                bv: None,
             });
             kv_bufs_vec.push(KvBufs {
                 k_cache: cl!(kv_caches[i].k_buffer),
@@ -1657,6 +1662,11 @@ impl TransformerModel {
                 w_down: cl!(layer.w_down),
                 attn_norm: cl!(layer.attention_norm),
                 ffn_norm: cl!(layer.ffn_norm),
+                // KIVI path shares the same QKV bias handling as the
+                // standard plan; Task 3 will populate from layer.qkv_bias.
+                bq: None,
+                bk: None,
+                bv: None,
             });
 
             let plan_bufs = kv_caches[i].get_plan_gpu_buffers()?;

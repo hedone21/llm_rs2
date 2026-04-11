@@ -559,6 +559,13 @@ pub struct LayerPlanConfig<'a> {
     pub wq_buf: &'a Mem,
     pub wk_buf: &'a Mem,
     pub wv_buf: &'a Mem,
+    /// Optional QKV bias buffer for Q (F32). When `Some`, the plan
+    /// builder appends a `kernel_add_row_bias` step after the Q matmul.
+    pub bq_buf: Option<&'a Mem>,
+    /// Optional QKV bias buffer for K (F32).
+    pub bk_buf: Option<&'a Mem>,
+    /// Optional QKV bias buffer for V (F32).
+    pub bv_buf: Option<&'a Mem>,
     pub wo_buf: &'a Mem,
     pub w_gate_buf: &'a Mem,
     pub w_up_buf: &'a Mem,
@@ -1327,6 +1334,12 @@ pub struct LayerBufs<'a> {
     pub w_down: &'a Mem,
     pub attn_norm: &'a Mem,
     pub ffn_norm: &'a Mem,
+    /// Optional QKV bias buffers (F32). Present for models with
+    /// `has_qkv_bias=true` (e.g. Qwen2). When `None`, the plan builder
+    /// skips the `kernel_add_row_bias` step after each QKV matmul.
+    pub bq: Option<&'a Mem>,
+    pub bk: Option<&'a Mem>,
+    pub bv: Option<&'a Mem>,
 }
 
 /// Per-layer KV cache buffer references.
@@ -1357,6 +1370,9 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             wq_buf: lb.wq,
             wk_buf: lb.wk,
             wv_buf: lb.wv,
+            bq_buf: lb.bq,
+            bk_buf: lb.bk,
+            bv_buf: lb.bv,
             wo_buf: lb.wo,
             w_gate_buf: lb.w_gate,
             w_up_buf: lb.w_up,
@@ -1882,6 +1898,9 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             wq_buf: lb.wq,
             wk_buf: lb.wk,
             wv_buf: lb.wv,
+            bq_buf: None,
+            bk_buf: None,
+            bv_buf: None,
             wo_buf: lb.wo,
             w_gate_buf: lb.w_gate,
             w_up_buf: lb.w_up,
