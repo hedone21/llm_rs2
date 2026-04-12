@@ -18,6 +18,12 @@ impl SharedBuffer {
         let data = vec![0u8; size];
         Self { data, size, dtype }
     }
+
+    /// Create a SharedBuffer that takes ownership of an existing Vec<u8>.
+    pub fn from_vec(data: Vec<u8>, dtype: DType) -> Self {
+        let size = data.len();
+        Self { data, size, dtype }
+    }
 }
 
 impl Buffer for SharedBuffer {

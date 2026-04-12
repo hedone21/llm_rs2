@@ -20,13 +20,16 @@ use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::models::config::ModelConfig;
 
+use crate::buffer::shared_buffer::SharedBuffer;
+
+use super::convert::{dequant_q4_1, dequant_q4_k};
 use super::{LayerBiasKind, LayerWeightKind, TensorId, TensorSource};
 
 // ---------------------------------------------------------------------------
 // GGUF constants
 // ---------------------------------------------------------------------------
 
-const GGUF_MAGIC: u32 = 0x4647_5547; // 'GGUF' in LE
+const GGUF_MAGIC: u32 = 0x4655_4747; // 'GGUF' in LE: bytes [0x47, 0x47, 0x55, 0x46]
 const GGUF_VERSION_3: u32 = 3;
 const GGUF_DEFAULT_ALIGNMENT: usize = 32;
 
@@ -36,6 +39,7 @@ const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
 const GGML_TYPE_Q4_1: u32 = 3;
 const GGML_TYPE_Q8_0: u32 = 8;
+const GGML_TYPE_Q4_K: u32 = 12;
 
 // GGUF value types
 const GGUF_TYPE_U8: u32 = 0;
@@ -402,8 +406,45 @@ fn tensor_byte_size(info: &GgufTensorInfo) -> usize {
             let n_blocks = num_elements as usize / 32;
             n_blocks * 34
         }
+        GGML_TYPE_Q4_K => {
+            // 256 elements per super-block, 144 bytes per super-block
+            let n_blocks = num_elements as usize / 256;
+            n_blocks * 144
+        }
         _ => 0, // unsupported types get 0; validated elsewhere
     }
+}
+
+/// Check if a ggml_type requires dequantization to F32 at load time.
+fn needs_dequant_fallback(ggml_type: u32) -> bool {
+    matches!(ggml_type, GGML_TYPE_Q4_K)
+}
+
+/// Human-readable name for a ggml_type (for diagnostics).
+fn ggml_type_name(ggml_type: u32) -> &'static str {
+    match ggml_type {
+        GGML_TYPE_F32 => "F32",
+        GGML_TYPE_F16 => "F16",
+        GGML_TYPE_Q4_0 => "Q4_0",
+        GGML_TYPE_Q4_1 => "Q4_1",
+        GGML_TYPE_Q8_0 => "Q8_0",
+        GGML_TYPE_Q4_K => "Q4_K",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        _ => "unknown",
+    }
+}
+
+/// Convert a Vec<f32> into Vec<u8> by reinterpreting the memory (zero-copy).
+fn f32_vec_to_u8(v: Vec<f32>) -> Vec<u8> {
+    let mut v = std::mem::ManuallyDrop::new(v);
+    let ptr = v.as_mut_ptr() as *mut u8;
+    let len = v.len() * 4;
+    let cap = v.capacity() * 4;
+    // Safety: f32 has alignment >= u8, and we correctly scale len/cap by size_of::<f32>().
+    unsafe { Vec::from_raw_parts(ptr, len, cap) }
 }
 
 /// Convert ggml_type to our DType.
@@ -539,14 +580,21 @@ impl GgufSource {
             .find_tensor(name)
             .ok_or_else(|| anyhow!("GGUF: tensor '{}' not found", name))?;
 
-        let dtype = ggml_type_to_dtype(info.ggml_type)?;
         let data = self.gguf.tensor_data(info);
 
         // Shape: GGUF stores dims in reverse order (innermost first).
         // llm.rs uses [rows, cols] convention, i.e. outermost first.
         let shape = Shape::new(info.dims.iter().rev().map(|&d| d as usize).collect());
+        let num_elements: usize = info.dims.iter().map(|&d| d as usize).product();
 
         let is_cpu = backend.name().contains("CPU");
+
+        // Check if this is a type that needs dequantization to F32 at load time
+        if needs_dequant_fallback(info.ggml_type) {
+            return self.load_with_dequant(info.ggml_type, data, num_elements, shape, backend);
+        }
+
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
 
         // For norm/bias tensors (is_weight=false) that are in F32, use MmapBuffer directly.
         // For weight tensors that are already in their native quantized format, also use MmapBuffer.
@@ -574,10 +622,23 @@ impl GgufSource {
             .find_tensor(name)
             .ok_or_else(|| anyhow!("GGUF: tensor '{}' not found", name))?;
 
-        let dtype = ggml_type_to_dtype(info.ggml_type)?;
         let data = self.gguf.tensor_data(info);
         let shape = Shape::new(info.dims.iter().rev().map(|&d| d as usize).collect());
+        let num_elements: usize = info.dims.iter().map(|&d| d as usize).product();
 
+        // Check if this is a type that needs dequantization to F32 at load time
+        if needs_dequant_fallback(info.ggml_type) {
+            let cpu_backend_arc: Arc<dyn Backend> = self.cpu_backend.clone() as Arc<dyn Backend>;
+            return self.load_with_dequant(
+                info.ggml_type,
+                data,
+                num_elements,
+                shape,
+                &cpu_backend_arc,
+            );
+        }
+
+        let dtype = ggml_type_to_dtype(info.ggml_type)?;
         let abs_offset = self.gguf.tensor_data_offset + info.offset as usize;
 
         // Safety: abs_offset + data.len() <= mmap.len()
@@ -590,6 +651,51 @@ impl GgufSource {
             buffer,
             self.cpu_backend.clone() as Arc<dyn Backend>,
         ))
+    }
+
+    /// Dequantize a tensor with an unsupported quant type to F32 at load time.
+    ///
+    /// This is a cold path used only for the rare tensors (e.g. token_embd)
+    /// that use K-quant types in otherwise Q4_0/Q8_0 files.
+    fn load_with_dequant(
+        &self,
+        ggml_type: u32,
+        data: &[u8],
+        num_elements: usize,
+        shape: Shape,
+        backend: &Arc<dyn Backend>,
+    ) -> Result<Tensor> {
+        let type_name = ggml_type_name(ggml_type);
+        eprintln!(
+            "[GGUF] Dequantizing {} tensor ({} elements) to F32 at load time",
+            type_name, num_elements
+        );
+
+        let f32_data = match ggml_type {
+            GGML_TYPE_Q4_K => dequant_q4_k(data, num_elements),
+            GGML_TYPE_Q4_1 => dequant_q4_1(data, num_elements),
+            _ => {
+                return Err(anyhow!(
+                    "GGUF: no dequant implementation for type {} ({})",
+                    type_name,
+                    ggml_type
+                ));
+            }
+        };
+
+        // Convert Vec<f32> to Vec<u8> (zero-copy reinterpret)
+        let byte_data = f32_vec_to_u8(f32_data);
+        let buffer: Arc<dyn crate::core::buffer::Buffer> =
+            Arc::new(SharedBuffer::from_vec(byte_data, DType::F32));
+
+        let cpu_tensor = Tensor::new(shape, buffer, self.cpu_backend.clone() as Arc<dyn Backend>);
+
+        let is_cpu = backend.name().contains("CPU");
+        if is_cpu {
+            Ok(cpu_tensor)
+        } else {
+            backend.copy_from(&cpu_tensor)
+        }
     }
 
     /// Check if a tensor exists in the GGUF file.
@@ -1073,6 +1179,13 @@ mod tests {
             tensor_byte_size(&make_info(GGML_TYPE_Q4_0, vec![32, 4])),
             72
         );
+        // Q4_K: 256 elements = 1 super-block = 144 bytes
+        assert_eq!(tensor_byte_size(&make_info(GGML_TYPE_Q4_K, vec![256])), 144);
+        // Q4_K: 2D [256, 4] = 1024 elements = 4 super-blocks = 576 bytes
+        assert_eq!(
+            tensor_byte_size(&make_info(GGML_TYPE_Q4_K, vec![256, 4])),
+            576
+        );
     }
 
     #[test]
@@ -1175,5 +1288,96 @@ mod tests {
         let bytes = builder.build();
         let gguf = parse_from_bytes(&bytes).expect("parse");
         assert_eq!(gguf.get_u64("some.big_value"), Some(0xDEAD_BEEF_1234_5678));
+    }
+
+    #[test]
+    fn test_gguf_q4_k_dequant_load() {
+        use half::f16;
+
+        // Build a Q4_K tensor (1 super-block = 256 elements, 144 bytes)
+        // d=1.0, dmin=0.0, sub-blocks 0..3 sc=1, all nibbles=5
+        let mut q4k_data = [0u8; 144];
+        let d_bits = f16::from_f32(1.0).to_bits().to_le_bytes();
+        q4k_data[0] = d_bits[0];
+        q4k_data[1] = d_bits[1];
+        // dmin=0.0 (already zeroed)
+        // scales_raw[0..4] = 1
+        for i in 0..4 {
+            q4k_data[4 + i] = 1;
+        }
+        // All qs nibbles = 5 => byte = 0x55
+        for i in 0..128 {
+            q4k_data[16 + i] = 0x55;
+        }
+
+        let mut builder = GgufTestBuilder::new();
+        builder
+            .add_metadata_str("general.architecture", "llama")
+            .add_metadata_u32("llama.embedding_length", 256)
+            .add_metadata_u32("llama.block_count", 1)
+            .add_metadata_u32("llama.attention.head_count", 4)
+            .add_metadata_u32("llama.attention.head_count_kv", 2)
+            .add_metadata_u32("llama.feed_forward_length", 512)
+            .add_metadata_u32("llama.vocab_size", 256)
+            .add_metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .add_metadata_f32("llama.rope.freq_base", 10000.0)
+            .add_metadata_u32("llama.context_length", 2048)
+            .add_tensor(
+                "token_embd.weight",
+                &[256], // 256 elements in GGUF dim order
+                GGML_TYPE_Q4_K,
+                &q4k_data,
+            );
+        let bytes = builder.build();
+        let gguf = parse_from_bytes(&bytes).expect("parse");
+
+        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let source = GgufSource {
+            gguf,
+            config,
+            weight_dtype: DType::Q4_0,
+            cpu_backend: Arc::new(CpuBackend::new()),
+        };
+
+        // Load through load_raw_cpu (the normal embed path)
+        let tensor = source
+            .load_raw_cpu("token_embd.weight", false)
+            .expect("Q4_K tensor should load via dequant fallback");
+
+        // Verify it was dequantized to F32
+        assert_eq!(tensor.buffer().dtype(), DType::F32);
+        assert_eq!(tensor.shape().numel(), 256);
+
+        // Verify values: sub-blocks 0..3 => 1.0 * 1 * 5 = 5.0
+        let ptr = tensor.buffer().as_ptr() as *const f32;
+        for i in 0..128 {
+            let v = unsafe { *ptr.add(i) };
+            assert!(
+                (v - 5.0).abs() < 0.01,
+                "element {} = {}, expected 5.0",
+                i,
+                v
+            );
+        }
+        // sub-blocks 4..7 => sc=0, so 0.0
+        for i in 128..256 {
+            let v = unsafe { *ptr.add(i) };
+            assert!(
+                (v - 0.0).abs() < 0.01,
+                "element {} = {}, expected 0.0",
+                i,
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn test_gguf_needs_dequant_fallback() {
+        assert!(!needs_dequant_fallback(GGML_TYPE_F32));
+        assert!(!needs_dequant_fallback(GGML_TYPE_F16));
+        assert!(!needs_dequant_fallback(GGML_TYPE_Q4_0));
+        assert!(!needs_dequant_fallback(GGML_TYPE_Q4_1));
+        assert!(!needs_dequant_fallback(GGML_TYPE_Q8_0));
+        assert!(needs_dequant_fallback(GGML_TYPE_Q4_K));
     }
 }
