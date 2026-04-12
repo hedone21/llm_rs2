@@ -1988,7 +1988,12 @@ impl CpuBackendNeon {
                             let il_group_ptr = unsafe { il_base.add(group * nb_k * IL_BLOCK_SIZE) };
                             let mut results = [0.0f32; 4];
                             unsafe {
-                                self.vec_dot_q4_0_q8_0_i8mm_4rows_il(nb_k, il_group_ptr, a_ptr, &mut results);
+                                self.vec_dot_q4_0_q8_0_i8mm_4rows_il(
+                                    nb_k,
+                                    il_group_ptr,
+                                    a_ptr,
+                                    &mut results,
+                                );
                             }
                             chunk[li..li + 4].copy_from_slice(&results);
                             li += 4;
@@ -1998,7 +2003,14 @@ impl CpuBackendNeon {
                         while li < chunk.len() {
                             let j = start_idx + li;
                             let mut sum = 0.0;
-                            unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add(j * nb_k), a_ptr) }
+                            unsafe {
+                                self.vec_dot_q4_0_q8_0_sdot(
+                                    k,
+                                    &mut sum,
+                                    b_base.add(j * nb_k),
+                                    a_ptr,
+                                )
+                            }
                             chunk[li] = sum;
                             li += 1;
                         }
@@ -2011,14 +2023,25 @@ impl CpuBackendNeon {
                                 let (left, right) = chunk[li..].split_at_mut(1);
                                 unsafe {
                                     self.vec_dot_q4_0_q8_0_i8mm(
-                                        k, &mut left[0], &mut right[0],
-                                        b_base.add(j * nb_k), b_base.add((j + 1) * nb_k), a_ptr,
+                                        k,
+                                        &mut left[0],
+                                        &mut right[0],
+                                        b_base.add(j * nb_k),
+                                        b_base.add((j + 1) * nb_k),
+                                        a_ptr,
                                     );
                                 }
                                 li += 2;
                             } else {
                                 let mut sum = 0.0;
-                                unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add(j * nb_k), a_ptr) }
+                                unsafe {
+                                    self.vec_dot_q4_0_q8_0_sdot(
+                                        k,
+                                        &mut sum,
+                                        b_base.add(j * nb_k),
+                                        a_ptr,
+                                    )
+                                }
                                 chunk[li] = sum;
                                 li += 1;
                             }
@@ -2027,14 +2050,28 @@ impl CpuBackendNeon {
                         let b_base = b.as_ptr() as *const BlockQ4_0;
                         for (li, out_val) in chunk.iter_mut().enumerate() {
                             let mut sum = 0.0;
-                            unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add((start_idx + li) * nb_k), a_ptr) }
+                            unsafe {
+                                self.vec_dot_q4_0_q8_0_sdot(
+                                    k,
+                                    &mut sum,
+                                    b_base.add((start_idx + li) * nb_k),
+                                    a_ptr,
+                                )
+                            }
                             *out_val = sum;
                         }
                     } else {
                         let b_base = b.as_ptr() as *const BlockQ4_0;
                         for (li, out_val) in chunk.iter_mut().enumerate() {
                             let mut sum = 0.0;
-                            unsafe { self.vec_dot_q4_0_q8_0(k, &mut sum, b_base.add((start_idx + li) * nb_k), a_ptr) }
+                            unsafe {
+                                self.vec_dot_q4_0_q8_0(
+                                    k,
+                                    &mut sum,
+                                    b_base.add((start_idx + li) * nb_k),
+                                    a_ptr,
+                                )
+                            }
                             *out_val = sum;
                         }
                     }
@@ -2067,12 +2104,18 @@ impl CpuBackendNeon {
                     if il_usize != 0 && j + 3 < j_end {
                         // i8mm 4-row interleaved: weight data pre-arranged for smmla
                         let group = j / 4;
-                        let il_group = unsafe { (il_usize as *const u8).add(group * nb_k * IL_BLOCK_SIZE) };
+                        let il_group =
+                            unsafe { (il_usize as *const u8).add(group * nb_k * IL_BLOCK_SIZE) };
                         for i in 0..m {
                             let a_row = unsafe { a_q8_base.add(i * nb_k_q8) };
                             let mut results = [0.0f32; 4];
                             unsafe {
-                                backend.vec_dot_q4_0_q8_0_i8mm_4rows_il(nb_k, il_group, a_row, &mut results);
+                                backend.vec_dot_q4_0_q8_0_i8mm_4rows_il(
+                                    nb_k,
+                                    il_group,
+                                    a_row,
+                                    &mut results,
+                                );
                                 *out_base.add(i * n + j) = results[0];
                                 *out_base.add(i * n + j + 1) = results[1];
                                 *out_base.add(i * n + j + 2) = results[2];
@@ -2873,21 +2916,25 @@ impl CpuBackendNeon {
             let y_l = vld1q_s8(b_y.qs.as_ptr());
             let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
             let r0 = vreinterpretq_s8_s64(vzip1q_s64(
-                vreinterpretq_s64_s8(y_l), vreinterpretq_s64_s8(y_l),
+                vreinterpretq_s64_s8(y_l),
+                vreinterpretq_s64_s8(y_l),
             ));
             let r1 = vreinterpretq_s8_s64(vzip2q_s64(
-                vreinterpretq_s64_s8(y_l), vreinterpretq_s64_s8(y_l),
+                vreinterpretq_s64_s8(y_l),
+                vreinterpretq_s64_s8(y_l),
             ));
             let r2 = vreinterpretq_s8_s64(vzip1q_s64(
-                vreinterpretq_s64_s8(y_h), vreinterpretq_s64_s8(y_h),
+                vreinterpretq_s64_s8(y_h),
+                vreinterpretq_s64_s8(y_h),
             ));
             let r3 = vreinterpretq_s8_s64(vzip2q_s64(
-                vreinterpretq_s64_s8(y_h), vreinterpretq_s64_s8(y_h),
+                vreinterpretq_s64_s8(y_h),
+                vreinterpretq_s64_s8(y_h),
             ));
 
             // Pair 0+1: load pre-interleaved weights → unpack → smmla directly
-            let w01a = vld1q_u8(base.add(8));   // [r0.qs[0:8], r1.qs[0:8]]
-            let w01b = vld1q_u8(base.add(24));  // [r0.qs[8:16], r1.qs[8:16]]
+            let w01a = vld1q_u8(base.add(8)); // [r0.qs[0:8], r1.qs[0:8]]
+            let w01b = vld1q_u8(base.add(24)); // [r0.qs[8:16], r1.qs[8:16]]
             let l0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01a, m4b)), s8b);
             let l1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01b, m4b)), s8b);
             let l2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01a, 4)), s8b);
@@ -2963,7 +3010,7 @@ struct Q4GemvCtx {
     out_ptr: *mut f32,          // Output [N]
     k: usize,
     n: usize,
-    nb_k: usize,               // K / QK4_0 = number of Q4_0 blocks per row
+    nb_k: usize, // K / QK4_0 = number of Q4_0 blocks per row
     rows_per_chunk: usize,
 }
 
@@ -3203,9 +3250,7 @@ pub unsafe fn fused_matmul_q4_0(
                     let mut s0 = 0.0f32;
                     let mut s1 = 0.0f32;
                     unsafe {
-                        backend.vec_dot_q4_0_q8_0_i8mm(
-                            k, &mut s0, &mut s1, b0, b1, a_q8_ptr,
-                        );
+                        backend.vec_dot_q4_0_q8_0_i8mm(k, &mut s0, &mut s1, b0, b1, a_q8_ptr);
                         *out_base.add(j) = s0;
                         *out_base.add(j + 1) = s1;
                     }

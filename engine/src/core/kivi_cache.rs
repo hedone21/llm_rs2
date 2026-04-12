@@ -1654,26 +1654,24 @@ impl KiviCache {
                         v_block_start,
                     )?;
                 } else {
-                    // Q4/Q8: CPU dequant into temporary F32 buffer, convert to F16, upload.
-                    // Uses tmp_qk/tmp_qv instead of self.qk/self.qv (which are empty in GPU mode).
-                    // Use gpu_attn_cap (not max_seq_len) for tmp buffer size since lazy grow
-                    // may not have expanded to full size.
+                    // Q4/Q8: CPU dequant into temporary F32 buffer, convert to F16,
+                    // partial upload at byte offset to avoid overwriting earlier flushes.
                     let gs = self.group_size;
-                    let attn_buf_size = self.gpu_attn_cap * self.kv_heads * self.head_dim;
-                    let mut tmp_attn_k = vec![0.0f32; attn_buf_size];
-                    let mut tmp_attn_v = vec![0.0f32; attn_buf_size];
+                    let flush_buf_size = flush_tokens * self.kv_heads * self.head_dim;
+                    let mut tmp_attn_k = vec![0.0f32; flush_buf_size];
+                    let mut tmp_attn_v = vec![0.0f32; flush_buf_size];
                     let mut deq_buf = [0.0f32; QKKV];
 
-                    // Key: per-channel dequant
+                    // Key: per-channel dequant — relative positions (0-based within flush window)
                     let mut k_idx = 0usize;
                     for h in 0..self.kv_heads {
                         for g in 0..n_groups {
-                            let tok_start_in_attn = tok_base + g * gs;
+                            let tok_start = g * gs;
                             for ch in 0..self.head_dim {
                                 tmp_qk.dequantize_block(k_idx, &mut deq_buf);
                                 k_idx += 1;
                                 for (t, &val) in deq_buf.iter().enumerate().take(gs) {
-                                    let pos = tok_start_in_attn + t;
+                                    let pos = tok_start + t;
                                     let out_idx = pos * self.kv_heads * self.head_dim
                                         + h * self.head_dim
                                         + ch;
@@ -1682,13 +1680,12 @@ impl KiviCache {
                             }
                         }
                     }
-                    // Value: per-token dequant
+                    // Value: per-token dequant — relative positions (0-based within flush window)
                     let blocks_per_token_v = self.head_dim / QKKV;
                     let mut v_idx = 0usize;
                     for h in 0..self.kv_heads {
                         for t in 0..flush_tokens {
-                            let pos = tok_base + t;
-                            let out_base = pos * self.kv_heads * self.head_dim + h * self.head_dim;
+                            let out_base = t * self.kv_heads * self.head_dim + h * self.head_dim;
                             for b in 0..blocks_per_token_v {
                                 tmp_qv.dequantize_block(v_idx, &mut deq_buf);
                                 v_idx += 1;
@@ -1698,15 +1695,19 @@ impl KiviCache {
                         }
                     }
 
-                    // Convert F32 → F16 and upload to GPU attention buffers
+                    // Convert F32 → F16 and partial upload to GPU attention buffers
                     let tmp_attn_k_f16: Vec<half::f16> =
                         tmp_attn_k.iter().map(|&v| half::f16::from_f32(v)).collect();
                     let tmp_attn_v_f16: Vec<half::f16> =
                         tmp_attn_v.iter().map(|&v| half::f16::from_f32(v)).collect();
 
-                    let backend = self.gpu_backend.as_ref().unwrap();
-                    let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
-                    let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
+                    // Byte offset into F16 attention buffer for this flush window
+                    let byte_offset = tok_base * self.kv_heads * self.head_dim * 2;
+
+                    let gpu_attn_k = self.gpu_attn_k.as_ref().unwrap();
+                    let gpu_attn_v = self.gpu_attn_v.as_ref().unwrap();
+                    let cl_mem_k = get_cl_mem(gpu_attn_k.buffer().as_ref())?;
+                    let cl_mem_v = get_cl_mem(gpu_attn_v.buffer().as_ref())?;
                     // SAFETY: half::f16 is repr(transparent) over u16, contiguous in memory
                     let k_f16_bytes = unsafe {
                         std::slice::from_raw_parts(
@@ -1714,14 +1715,33 @@ impl KiviCache {
                             tmp_attn_k_f16.len() * 2,
                         )
                     };
-                    backend.write_buffer(gpu_attn_k, k_f16_bytes)?;
                     let v_f16_bytes = unsafe {
                         std::slice::from_raw_parts(
                             tmp_attn_v_f16.as_ptr() as *const u8,
                             tmp_attn_v_f16.len() * 2,
                         )
                     };
-                    backend.write_buffer(gpu_attn_v, v_f16_bytes)?;
+                    // SAFETY: cl_mem handles are valid; byte_offset + data fits within buffer
+                    unsafe {
+                        ocl::core::enqueue_write_buffer(
+                            &ocl.queue,
+                            cl_mem_k,
+                            true,
+                            byte_offset,
+                            k_f16_bytes,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                        ocl::core::enqueue_write_buffer(
+                            &ocl.queue,
+                            cl_mem_v,
+                            true,
+                            byte_offset,
+                            v_f16_bytes,
+                            None::<&ocl::core::Event>,
+                            None::<&mut ocl::core::Event>,
+                        )?;
+                    }
                 }
             }
         }
