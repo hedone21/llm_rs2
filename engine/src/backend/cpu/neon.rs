@@ -1939,23 +1939,7 @@ impl CpuBackendNeon {
             SendSyncPtr(a_q8.as_ptr())
         });
 
-        // Adaptive chunk size: target ~4 tasks per thread to minimize Rayon overhead.
-        // F16 path uses SpinPool with NR=4 batching; Q4_0 used chunk_size=64 fixed,
-        // which creates excessive tasks for large N (e.g., lm_head N=151936 → 2374 tasks).
-        let num_threads = rayon::current_num_threads();
-        let total_elements = m * n;
-        let chunk_size = if m == 1 {
-            // GEMV: scale chunk size with N to keep task count bounded
-            let target_tasks = num_threads * 4;
-            let cs = (n + target_tasks - 1) / target_tasks;
-            // Round up to even for i8mm 2-row pairing
-            (cs + 1) & !1
-        } else {
-            let cs = total_elements.div_ceil(num_threads);
-            cs.max(256)
-        };
-
-        // Hoist feature detection outside closure (avoids atomic load per chunk)
+        // Hoist feature detection outside closure
         #[cfg(target_arch = "aarch64")]
         let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
         #[cfg(not(target_arch = "aarch64"))]
@@ -1966,75 +1950,115 @@ impl CpuBackendNeon {
         #[cfg(not(target_arch = "aarch64"))]
         let use_dotprod = false;
 
-        out_data.par_chunks_mut(chunk_size).enumerate().for_each(
-            |(chunk_idx, chunk): (usize, &mut [f32])| {
-                let start_idx = chunk_idx * chunk_size;
+        let num_threads = rayon::current_num_threads();
 
-                if use_i8mm {
-                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
-                    let mut local_i = 0;
-                    while local_i < chunk.len() {
-                        let idx = start_idx + local_i;
-                        let i = idx / n;
-                        let j = idx % n;
-                        let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
+        if m == 1 {
+            // === GEMV: adaptive chunk size, flat N-parallel ===
+            let target_tasks = num_threads * 4;
+            let chunk_size = {
+                let cs = (n + target_tasks - 1) / target_tasks;
+                (cs + 1) & !1 // round up to even for i8mm
+            };
 
-                        if local_i + 1 < chunk.len() && j + 1 < n {
-                            let b0 = unsafe { b_row_node.add(j * nb_k) };
-                            let b1 = unsafe { b_row_node.add((j + 1) * nb_k) };
-                            let (left, right) = chunk[local_i..].split_at_mut(1);
-                            unsafe {
-                                self.vec_dot_q4_0_q8_0_i8mm(
-                                    k,
-                                    &mut left[0],
-                                    &mut right[0],
-                                    b0,
-                                    b1,
-                                    a_row_ptr,
-                                );
+            out_data.par_chunks_mut(chunk_size).enumerate().for_each(
+                |(chunk_idx, chunk): (usize, &mut [f32])| {
+                    let start_idx = chunk_idx * chunk_size;
+                    let b_base = b.as_ptr() as *const BlockQ4_0;
+                    let a_ptr = unsafe { a_q8_ptr.ptr() };
+
+                    if use_i8mm {
+                        let mut li = 0;
+                        while li < chunk.len() {
+                            let j = start_idx + li;
+                            if li + 1 < chunk.len() && j + 1 < n {
+                                let (left, right) = chunk[li..].split_at_mut(1);
+                                unsafe {
+                                    self.vec_dot_q4_0_q8_0_i8mm(
+                                        k, &mut left[0], &mut right[0],
+                                        b_base.add(j * nb_k), b_base.add((j + 1) * nb_k), a_ptr,
+                                    );
+                                }
+                                li += 2;
+                            } else {
+                                let mut sum = 0.0;
+                                unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add(j * nb_k), a_ptr) }
+                                chunk[li] = sum;
+                                li += 1;
                             }
-                            local_i += 2;
-                        } else {
-                            let b_ptr = unsafe { b_row_node.add(j * nb_k) };
+                        }
+                    } else if use_dotprod {
+                        for (li, out_val) in chunk.iter_mut().enumerate() {
                             let mut sum = 0.0;
+                            unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add((start_idx + li) * nb_k), a_ptr) }
+                            *out_val = sum;
+                        }
+                    } else {
+                        for (li, out_val) in chunk.iter_mut().enumerate() {
+                            let mut sum = 0.0;
+                            unsafe { self.vec_dot_q4_0_q8_0(k, &mut sum, b_base.add((start_idx + li) * nb_k), a_ptr) }
+                            *out_val = sum;
+                        }
+                    }
+                },
+            );
+        } else {
+            // === GEMM (M>1): N-major tiled ===
+            // Weight rows are shared across M activation rows within each N-chunk,
+            // improving cache reuse. Mirrors the F16 GEMM tiling strategy.
+            const NR: usize = 2; // i8mm natural pair
+            let target_n_chunks = num_threads * 4;
+            let rows_per_chunk = ((n + target_n_chunks - 1) / target_n_chunks + NR - 1) / NR * NR;
+            let rows_per_chunk = rows_per_chunk.max(NR);
+            let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
+
+            let b_base_usize = b.as_ptr() as usize;
+            let a_q8_usize = a_q8_ptr.ptr() as usize;
+            let out_ptr_usize = out_data.as_mut_ptr() as usize;
+
+            (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
+                let j_start = chunk_idx * rows_per_chunk;
+                let j_end = (j_start + rows_per_chunk).min(n);
+                let b_base = b_base_usize as *const BlockQ4_0;
+                let a_q8_base = a_q8_usize as *const BlockQ8_0;
+                let out_base = out_ptr_usize as *mut f32;
+                let backend = CpuBackendNeon::new();
+
+                let mut j = j_start;
+                while j < j_end {
+                    if use_i8mm && j + 1 < j_end {
+                        // i8mm: 2 weight rows × all M activation rows
+                        let b0 = unsafe { b_base.add(j * nb_k) };
+                        let b1 = unsafe { b_base.add((j + 1) * nb_k) };
+                        for i in 0..m {
+                            let a_row = unsafe { a_q8_base.add(i * nb_k_q8) };
+                            let mut s0 = 0.0f32;
+                            let mut s1 = 0.0f32;
                             unsafe {
-                                self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_ptr, a_row_ptr);
+                                backend.vec_dot_q4_0_q8_0_i8mm(k, &mut s0, &mut s1, b0, b1, a_row);
+                                *out_base.add(i * n + j) = s0;
+                                *out_base.add(i * n + j + 1) = s1;
                             }
-                            chunk[local_i] = sum;
-                            local_i += 1;
                         }
-                    }
-                } else if use_dotprod {
-                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
-                    for (local_i, out_val) in chunk.iter_mut().enumerate() {
-                        let idx = start_idx + local_i;
-                        let i = idx / n;
-                        let j = idx % n;
-                        let b_row_ptr = unsafe { b_row_node.add(j * nb_k) };
-                        let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
-                        let mut sum = 0.0;
-                        unsafe {
-                            self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_row_ptr, a_row_ptr);
+                        j += 2;
+                    } else {
+                        let b_ptr = unsafe { b_base.add(j * nb_k) };
+                        for i in 0..m {
+                            let a_row = unsafe { a_q8_base.add(i * nb_k_q8) };
+                            let mut sum = 0.0f32;
+                            unsafe {
+                                if use_dotprod {
+                                    backend.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_ptr, a_row);
+                                } else {
+                                    backend.vec_dot_q4_0_q8_0(k, &mut sum, b_ptr, a_row);
+                                }
+                                *out_base.add(i * n + j) = sum;
+                            }
                         }
-                        *out_val = sum;
-                    }
-                } else {
-                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
-                    for (local_i, out_val) in chunk.iter_mut().enumerate() {
-                        let idx = start_idx + local_i;
-                        let i = idx / n;
-                        let j = idx % n;
-                        let b_row_ptr = unsafe { b_row_node.add(j * nb_k) };
-                        let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
-                        let mut sum = 0.0;
-                        unsafe {
-                            self.vec_dot_q4_0_q8_0(k, &mut sum, b_row_ptr, a_row_ptr);
-                        }
-                        *out_val = sum;
+                        j += 1;
                     }
                 }
-            },
-        );
+            });
+        }
         Ok(())
     }
 
