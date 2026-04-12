@@ -1,66 +1,40 @@
-// gemv_noshuffle_q4_0.cl — Global buffer MVP of llama.cpp's gemv_noshuffle.
+// gemv_noshuffle_q4_0.cl -- image1d_buffer_t GEMV kernel for Q4_0 (Adreno TP path).
 //
-// Ported from llama.cpp (image1d_buffer_t -> global buffer reads).
-// Keeps the core optimizations: SOA layout, 4-wave K-split, sub_group_broadcast,
+// Ported from llama.cpp gemv_noshuffle with simplified signature (no offset params).
+// Uses image1d_buffer_t for weight nibbles (R32UI) and activation (RGBA32F) to
+// leverage Adreno TP (texture pipe) cache for coalesced reads.
+// Scales (src0_d) remain global half2* (same as llama.cpp).
+//
+// Core optimizations: SOA layout, 4-wave K-split, sub_group_broadcast,
 // local memory reduction.
 //
-// Weight layout (SOA, produced by kernel_convert_block_q4_0_noshuffle in cvt.cl):
-//   src0_q: rearranged nibbles, 16 bytes per block (QK4_0/2)
-//   src0_d: half scale per block
+// Weight layout (SOA + transposed, produced by convert_q4_0_to_noshuffle in Rust):
+//   1. kernel_convert_block_q4_0_noshuffle: AOS -> SOA nibble rearrange (row-major)
+//   2. ushort-level 2D transpose: q[row * K/4 + col] -> q_t[col * M + row]
+//   3. half-level 2D transpose: d[row * bpr + k] -> d_t[k * M + row]
+//
+//   src0_q: transposed SOA nibbles (image1d_buffer_t, R32UI -- each texel = 1 uint)
+//   src0_d: transposed SOA scales (half2*, one pair per row-pair per K-block)
+//   src1:   activation vector (image1d_buffer_t, RGBA32F -- each texel = float4)
 //
 // Each work-item computes 2 output rows (float2 totalSum).
 //   global_work_size = [ne01/2, N_SIMDGROUP, 1]  (ne01 = number of rows)
 //   local_work_size  = [SIMDGROUP_WIDTH, N_SIMDGROUP, 1]
 //
 // Compile-time defines required:
-//   -DLINE_STRIDE_A=<ne01/2>  (row-pair count = half the total rows)
-//   -DBLOCK_STRIDE_A=<ne01>   (total rows, for stepping through SOA nibble words)
-//   -DSIMDGROUP_WIDTH=<64>    (subgroup width on Adreno with half-wave)
+//   -DLINE_STRIDE_A=<ne01/2>       stride between consecutive ushort columns in uint units
+//   -DBLOCK_STRIDE_A=<4*ne01>      stride between consecutive K-blocks (8 ushort cols * ne01/2)
+//   -DSIMDGROUP_WIDTH=<64>         subgroup width on Adreno with half-wave
 //
-// Understanding the SOA nibble layout:
+// Indexing: read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * i).x
+//   - gid: row-pair index (0..ne01/2-1), consecutive gids = consecutive rows in memory
+//   - k: K-block index (0..blocks_per_row-1)
+//   - i: ushort column within block (0..7)
 //
-// After kernel_convert_block_q4_0_noshuffle, for a matrix with `num_rows` rows
-// and `K` columns (K/QK4_0 blocks per row), the SOA nibble buffer has:
-//   - Total blocks = num_rows * (K / QK4_0)
-//   - Each block = 16 bytes = 8 ushort = 4 uint
+// Reading uint at index n returns ushort pair (row 2*gid, row 2*gid+1) for the same
+// ushort column, because the transposed layout places consecutive rows contiguously.
 //
-// The image1d_buffer_t in llama.cpp wraps this as R32UI format (1 uint per texel).
-// read_imageui(src0_q, texel_idx).x returns one uint (4 bytes = 4 nibbles = 2 ushort).
-//
-// For the global buffer version, we use uint* indexing with the same texel offsets.
-// The layout is: all blocks are stored contiguously, row after row.
-//   texel_idx = row * (K/QK4_0) * 4 + block * 4 + word_in_block
-// But the kernel uses the pre-computed strides LINE_STRIDE_A and BLOCK_STRIDE_A:
-//   texel_idx = gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * word_idx
-//
-// where gid = get_global_id(0) = row_pair_index.
-//
-// In the llama.cpp image kernel:
-//   LINE_STRIDE_A  = ne00/QK4_0/2  (= blocks_per_row / 2, since 2 rows per pair,
-//                                    but actually = ne01/2 for row interleaving)
-//   BLOCK_STRIDE_A = ne00/QK4_0    (blocks_per_row)
-//
-// Wait — re-reading the llama.cpp dispatch code more carefully:
-//   LINE_STRIDE_A = ne00 / 32 / 2 = blocks_per_row / 2
-//   BLOCK_STRIDE_A = ne00 / 32 = blocks_per_row
-// These operate in "texel" (uint) units within the image1d_buffer_t, where
-// each texel = 1 uint = 4 bytes of the SOA nibble buffer.
-//
-// Since each block = 16 bytes = 4 uint texels, and there are blocks_per_row blocks
-// per row, each row occupies blocks_per_row * 4 texels. Two consecutive rows
-// occupy blocks_per_row * 8 texels.
-//
-// The indexing gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * i:
-//   - gid selects which row-pair (0 .. ne01/2-1)
-//   - k selects which K-block (0 .. blocks_per_row-1)
-//   - LINE_STRIDE_A * i steps through the 8 uint words of a block-pair
-//
-// This means the data is stored interleaved: for each "column" (uint position
-// within a block), all row-pairs are stored together. This is a transposed
-// layout compared to naive row-major. That's what "noshuffle" refers to —
-// the SOA conversion already arranges data for coalesced access.
-//
-// For our global uint* buffer, we use identical indexing.
+// Reference: llama.cpp gemv_noshuffle_general.cl, ggml-opencl.cpp Adreno transpose path.
 
 #pragma OPENCL EXTENSION cl_khr_fp16 : enable
 #pragma OPENCL EXTENSION cl_khr_subgroups : enable
@@ -184,16 +158,9 @@
 // ---------------------------------------------------------------------------
 // kernel_gemv_noshuffle_q4_0
 //
-// Global-buffer MVP: reads weight nibbles and scales from global memory
-// instead of image1d_buffer_t. Activation (src1) is also a plain global
-// float buffer.
-//
-// The data layout is identical to the image1d_buffer_t version. The image
-// format was R32UI — each texel is one uint (4 bytes). We read from
-// global uint* with the same linear offsets.
-//
-// For activation, the image format was RGBA32F — each texel is float4.
-// We read from global float4*.
+// image1d_buffer_t version: reads weight nibbles via read_imageui (R32UI)
+// and activation via read_imagef (RGBA32F) to leverage Adreno TP cache.
+// Scales (src0_d) are read from global half2* directly.
 //
 // Dispatch:
 //   global = [ne01/2, N_SIMDGROUP]
@@ -203,12 +170,12 @@
 REQD_SUBGROUP_SIZE_64
 #endif
 __kernel void kernel_gemv_noshuffle_q4_0(
-        global uint   * src0_q,   // SOA nibbles (uint for R32UI texel compat)
-        global half2  * src0_d,   // SOA scales (half2 = scale for 2 rows)
-        global float4 * src1,     // activation vector (float4 for RGBA32F texel compat)
-        global float  * dst,      // output vector
-        int ne00,                 // K dimension (number of elements per row)
-        int ne01                  // M dimension (number of output rows)
+        __read_only image1d_buffer_t src0_q,  // SOA nibbles (R32UI, 1 uint per texel)
+        global half2  * src0_d,               // SOA scales (half2 = scale for 2 rows)
+        __read_only image1d_buffer_t src1,    // activation vector (RGBA32F, float4 per texel)
+        global float  * dst,                  // output vector
+        int ne00,                             // K dimension (number of elements per row)
+        int ne01                              // M dimension (number of output rows)
 )
 {
     uint groupId = get_local_id(1);    // wave index (0..3)
@@ -228,27 +195,25 @@ __kernel void kernel_gemv_noshuffle_q4_0(
         regS = src0_d[gid + k * LINE_STRIDE_A];
 
         // First 4 fibers in each wave load 8 activation values (= 1 block of QK4_0=32)
-        // llama.cpp: regB.s0123 = read_imagef(src1, (slid * 2 + k * 8))
-        //            regB.s4567 = read_imagef(src1, (1 + slid * 2 + k * 8))
         // read_imagef returns float4 from RGBA32F texels.
-        // src1 is [K/4] float4 texels. k*8 = k * (QK4_0/4) since QK4_0=32 → 8 texels/block.
+        // src1 is [K/4] float4 texels. k*8 = k * (QK4_0/4) since QK4_0=32 -> 8 texels/block.
         if (slid < 4) {
-            regB.s0123 = src1[slid * 2 + k * 8];
-            regB.s4567 = src1[1 + slid * 2 + k * 8];
+            regB.s0123 = read_imagef(src1, slid * 2 + k * 8);
+            regB.s4567 = read_imagef(src1, 1 + slid * 2 + k * 8);
         }
 
-        // Load weight nibbles. read_imageui(src0_q, offset).x → src0_q[offset]
-        regA.s0 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0];
-        regA.s1 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1];
-        regA.s2 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2];
-        regA.s3 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3];
+        // Load weight nibbles via texture pipe (R32UI image)
+        regA.s0 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 0).x;
+        regA.s1 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 1).x;
+        regA.s2 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 2).x;
+        regA.s3 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 3).x;
 
         dequantizeBlockAccum_ns_sgbroadcast_1_hi(totalSum, as_ushort8(regA), regS, regB);
 
-        regA.s0 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4];
-        regA.s1 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5];
-        regA.s2 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6];
-        regA.s3 = src0_q[gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7];
+        regA.s0 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 4).x;
+        regA.s1 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 5).x;
+        regA.s2 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 6).x;
+        regA.s3 = read_imageui(src0_q, gid + k * BLOCK_STRIDE_A + LINE_STRIDE_A * 7).x;
 
         dequantizeBlockAccum_ns_sgbroadcast_1_lo(totalSum, as_ushort8(regA), regS, regB);
     }
