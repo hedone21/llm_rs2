@@ -1618,11 +1618,31 @@ impl OpenCLBackend {
                 "{} -DLINE_STRIDE_A={} -DBLOCK_STRIDE_A={} -DSIMDGROUP_WIDTH={}",
                 self.cl_opts, line_stride_a, block_stride_a, simdgroup_width
             );
-            let program = Program::builder()
+
+            // Try with vector sub_group_broadcast first (Adreno 830+ / driver v47+).
+            // Falls back to scalar path if the compiler rejects float8 broadcast.
+            let defines_vec = format!("{} -DVECTOR_SUB_GROUP_BROADCAT", defines);
+            let program_result = Program::builder()
                 .devices(self.device)
                 .src(gemv_src)
-                .cmplr_opt(&defines)
-                .build(&self.context)?;
+                .cmplr_opt(&defines_vec)
+                .build(&self.context);
+
+            let program = match program_result {
+                Ok(p) => {
+                    log::info!("GEMV noshuffle Q4_0: vector sub_group_broadcast enabled");
+                    p
+                }
+                Err(_) => {
+                    log::info!("GEMV noshuffle Q4_0: falling back to scalar sub_group_broadcast");
+                    Program::builder()
+                        .devices(self.device)
+                        .src(gemv_src)
+                        .cmplr_opt(&defines)
+                        .build(&self.context)?
+                }
+            };
+
             let kernel = ocl::core::create_kernel(&program, "kernel_gemv_noshuffle_q4_0")?;
             log::info!(
                 "GEMV noshuffle Q4_0 kernel compiled: ne01={}, LINE_STRIDE_A={}, BLOCK_STRIDE_A={}",
