@@ -2311,6 +2311,21 @@ impl CpuBackendNeon {
 
     /// 2-row i8mm dot product: weight 2행 × activation 1행 → 결과 2개.
     /// ARM FEAT_I8MM (smmla) 기반. i8mm 미지원 디바이스에서는 호출하지 않을 것.
+    ///
+    /// `smmla` 시맨틱 (2x8x2 matrix multiply-accumulate):
+    ///   acc[0] += dot(a[0:7],  b[0:7])   — weight row 0 × activation low
+    ///   acc[1] += dot(a[0:7],  b[8:15])  — weight row 0 × activation high (duplicate)
+    ///   acc[2] += dot(a[8:15], b[0:7])   — weight row 1 × activation low
+    ///   acc[3] += dot(a[8:15], b[8:15])  — weight row 1 × activation high (duplicate)
+    ///
+    /// GEMV에서 activation row가 1개이므로 b의 양쪽 절반에 동일 데이터를 복제.
+    /// scale = [d_x0*d_y, 0, d_x1*d_y, 0]으로 중복 lane을 제거하여
+    /// sumv[0] = row 0 결과, sumv[2] = row 1 결과를 누적.
+    ///
+    /// # Safety
+    /// - `vx0`, `vx1`은 각각 `n / QK8_0`개의 `BlockQ4_0`을 가리키는 유효 포인터
+    /// - `vy`는 `n / QK8_0`개의 `BlockQ8_0`을 가리키는 유효 포인터
+    /// - 호출자가 FEAT_I8MM 지원을 런타임에 확인해야 함
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
     pub unsafe fn vec_dot_q4_0_q8_0_i8mm(
@@ -2322,7 +2337,103 @@ impl CpuBackendNeon {
         vx1: *const BlockQ4_0,
         vy: *const BlockQ8_0,
     ) {
-        unimplemented!("i8mm dot product — to be implemented in next task");
+        unsafe {
+            let nb = n / QK8_0;
+            let m4b = vdupq_n_u8(0x0F);
+            let s8b = vdupq_n_s8(0x08);
+
+            let mut sumv = vdupq_n_f32(0.0);
+
+            for i in 0..nb {
+                let b_x0 = &*vx0.add(i);
+                let b_x1 = &*vx1.add(i);
+                let b_y = &*vy.add(i);
+
+                // Unpack Q4_0 nibbles → signed int8 (subtract bias 8)
+                let v0_0 = vld1q_u8(b_x0.qs.as_ptr());
+                let v0_1 = vld1q_u8(b_x1.qs.as_ptr());
+
+                let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
+                let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
+                let x1_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_1, m4b)), s8b);
+                let x1_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4)), s8b);
+
+                // Load Q8_0 activation
+                let y_l = vld1q_s8(b_y.qs.as_ptr());
+                let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
+
+                // Scale: [d_x0*d_y, 0, d_x1*d_y, 0] — zero lanes mask out duplicate smmla results
+                let d_x0 = b_x0.d.to_f32();
+                let d_x1 = b_x1.d.to_f32();
+                let d_y = b_y.d.to_f32();
+                let _scale = [d_x0 * d_y, 0.0f32, d_x1 * d_y, 0.0f32];
+                let scale = vld1q_f32(_scale.as_ptr());
+
+                // Interleave weight rows: a[0:7] = x0 half, a[8:15] = x1 half
+                let l0 = vreinterpretq_s8_s64(vzip1q_s64(
+                    vreinterpretq_s64_s8(x0_l),
+                    vreinterpretq_s64_s8(x1_l),
+                ));
+                let l1 = vreinterpretq_s8_s64(vzip2q_s64(
+                    vreinterpretq_s64_s8(x0_l),
+                    vreinterpretq_s64_s8(x1_l),
+                ));
+                let l2 = vreinterpretq_s8_s64(vzip1q_s64(
+                    vreinterpretq_s64_s8(x0_h),
+                    vreinterpretq_s64_s8(x1_h),
+                ));
+                let l3 = vreinterpretq_s8_s64(vzip2q_s64(
+                    vreinterpretq_s64_s8(x0_h),
+                    vreinterpretq_s64_s8(x1_h),
+                ));
+
+                // Duplicate activation for both halves (GEMV: single activation row replicated)
+                let r0 = vreinterpretq_s8_s64(vzip1q_s64(
+                    vreinterpretq_s64_s8(y_l),
+                    vreinterpretq_s64_s8(y_l),
+                ));
+                let r1 = vreinterpretq_s8_s64(vzip2q_s64(
+                    vreinterpretq_s64_s8(y_l),
+                    vreinterpretq_s64_s8(y_l),
+                ));
+                let r2 = vreinterpretq_s8_s64(vzip1q_s64(
+                    vreinterpretq_s64_s8(y_h),
+                    vreinterpretq_s64_s8(y_h),
+                ));
+                let r3 = vreinterpretq_s8_s64(vzip2q_s64(
+                    vreinterpretq_s64_s8(y_h),
+                    vreinterpretq_s64_s8(y_h),
+                ));
+
+                // 4 chained smmla: accumulate 32 int8 dot products per weight row.
+                // .arch_extension i8mm enables smmla even when the default target
+                // does not include +i8mm (runtime detection guards the call site).
+                let mut acc = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension i8mm",
+                    "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                    "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                    "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                    "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                    acc = inout(vreg) acc,
+                    a0 = in(vreg) l0,
+                    b0 = in(vreg) r0,
+                    a1 = in(vreg) l1,
+                    b1 = in(vreg) r1,
+                    a2 = in(vreg) l2,
+                    b2 = in(vreg) r2,
+                    a3 = in(vreg) l3,
+                    b3 = in(vreg) r3,
+                );
+
+                // acc = [dot(x0,y), dot(x0,y), dot(x1,y), dot(x1,y)]
+                // vmlaq with scale zeroes duplicate lanes → sumv[0] += x0, sumv[2] += x1
+                sumv = vmlaq_f32(sumv, vcvtq_f32_s32(acc), scale);
+            }
+
+            *s0 = vgetq_lane_f32(sumv, 0);
+            *s1 = vgetq_lane_f32(sumv, 2);
+        }
     }
 }
 
