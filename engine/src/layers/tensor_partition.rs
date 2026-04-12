@@ -61,6 +61,14 @@ fn bytes_per_row(dtype: DType, in_dim: usize) -> Result<usize> {
             );
             Ok(in_dim / 32 * 20)
         }
+        DType::Q8_0 => {
+            ensure!(
+                in_dim.is_multiple_of(32),
+                "Q8_0 requires in_dim divisible by 32, got {}",
+                in_dim
+            );
+            Ok(in_dim / 32 * 34)
+        }
         DType::F16 | DType::BF16 => Ok(in_dim * 2),
         DType::F32 => Ok(in_dim * 4),
         DType::U8 => Ok(in_dim),

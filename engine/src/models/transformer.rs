@@ -103,6 +103,20 @@ impl TransformerModel {
         crate::models::loader::load_model(&source, backend, _memory)
     }
 
+    /// Load a model from a GGUF file.
+    ///
+    /// The weight dtype is determined from the GGUF file's tensor types.
+    /// No conversion is performed -- tensors are loaded in their native format.
+    pub fn load_gguf(
+        model_path: &str,
+        backend: Arc<dyn Backend>,
+        memory: &dyn Memory,
+    ) -> Result<Self> {
+        use crate::models::loader::gguf::GgufSource;
+        let source = GgufSource::open(std::path::Path::new(model_path))?;
+        crate::models::loader::load_model(&source, backend, memory)
+    }
+
     /// Migrate all model weight tensors from CPU to GPU zero-copy memory.
     ///
     /// Creates `UnifiedBuffer` (CL_MEM_ALLOC_HOST_PTR) for each weight tensor,

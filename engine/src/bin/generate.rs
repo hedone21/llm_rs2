@@ -577,8 +577,15 @@ fn main() -> anyhow::Result<()> {
         ),
     };
     eprintln!("[Config] Weight dtype: {:?}", w_dtype);
-    let mut model =
-        TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?;
+    let is_gguf = model_path.ends_with(".gguf");
+    let mut model = if is_gguf {
+        if args.weight_dtype != "f16" {
+            eprintln!("[Warning] --weight-dtype ignored for GGUF models (dtype from file)");
+        }
+        TransformerModel::load_gguf(model_path, backend.clone(), &*memory)?
+    } else {
+        TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?
+    };
 
     // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
     // Creates UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR) + mapped: single VMA,
@@ -648,8 +655,17 @@ fn main() -> anyhow::Result<()> {
     let weights_on_gpu = false;
 
     // 2. Tokenizer
-    let tokenizer = Tokenizer::from_file(format!("{}/tokenizer.json", model_path))
-        .map_err(|e| anyhow::anyhow!(e))?;
+    let tokenizer_path = if is_gguf {
+        // GGUF is a single file; look for tokenizer.json in the same directory
+        let parent = std::path::Path::new(model_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        parent.join("tokenizer.json").to_string_lossy().into_owned()
+    } else {
+        format!("{}/tokenizer.json", model_path)
+    };
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("Cannot load tokenizer from {}: {}", tokenizer_path, e))?;
 
     // 3. Prompt
     let prompt = if let Some(path) = &args.prompt_file {

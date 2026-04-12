@@ -121,6 +121,110 @@ impl ModelConfig {
         })
     }
 
+    /// Construct a ModelConfig from GGUF metadata.
+    ///
+    /// GGUF metadata keys follow the pattern `{arch}.{param_name}` where
+    /// `{arch}` comes from `general.architecture`.
+    pub fn from_gguf_metadata(gguf: &crate::models::loader::gguf::GgufFile) -> Result<Self> {
+        let arch_str = gguf
+            .get_str("general.architecture")
+            .ok_or_else(|| anyhow!("GGUF: missing 'general.architecture' metadata"))?;
+
+        let arch = match arch_str {
+            "llama" => ModelArch::Llama,
+            "qwen2" => ModelArch::Qwen2,
+            "gemma" | "gemma2" | "gemma3" => ModelArch::Gemma3,
+            _ => anyhow::bail!("GGUF: unsupported architecture '{}'", arch_str),
+        };
+
+        let prefix = arch_str;
+
+        let hidden_size = gguf
+            .get_u32(&format!("{prefix}.embedding_length"))
+            .ok_or_else(|| anyhow!("GGUF: missing {prefix}.embedding_length"))?
+            as usize;
+        let num_hidden_layers =
+            gguf.get_u32(&format!("{prefix}.block_count"))
+                .ok_or_else(|| anyhow!("GGUF: missing {prefix}.block_count"))? as usize;
+        let num_attention_heads = gguf
+            .get_u32(&format!("{prefix}.attention.head_count"))
+            .ok_or_else(|| anyhow!("GGUF: missing {prefix}.attention.head_count"))?
+            as usize;
+        let num_key_value_heads = gguf
+            .get_u32(&format!("{prefix}.attention.head_count_kv"))
+            .unwrap_or(num_attention_heads as u32) as usize;
+        let intermediate_size = gguf
+            .get_u32(&format!("{prefix}.feed_forward_length"))
+            .ok_or_else(|| anyhow!("GGUF: missing {prefix}.feed_forward_length"))?
+            as usize;
+        let vocab_size = gguf
+            .get_u32(&format!("{prefix}.vocab_size"))
+            .unwrap_or(32000) as usize;
+        let rms_norm_eps = gguf
+            .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
+            .unwrap_or(1e-5) as f64;
+        let rope_theta = gguf
+            .get_f32(&format!("{prefix}.rope.freq_base"))
+            .unwrap_or(10000.0) as f64;
+        let head_dim = hidden_size / num_attention_heads;
+
+        let has_qkv_bias = matches!(arch, ModelArch::Qwen2);
+        let tie_word_embeddings = gguf.find_tensor("output.weight").is_none();
+
+        // Gemma3 specific fields
+        let (
+            rope_local_theta,
+            sliding_window,
+            sliding_window_pattern,
+            query_pre_attn_scalar,
+            embed_scale,
+        ) = match arch {
+            ModelArch::Gemma3 => {
+                let local_theta = gguf
+                    .get_f32(&format!("{prefix}.rope.local.freq_base"))
+                    .unwrap_or(10000.0) as f64;
+                let sw = gguf
+                    .get_u32(&format!("{prefix}.attention.sliding_window"))
+                    .map(|v| v as usize);
+                let sw_pattern = gguf
+                    .get_u32(&format!("{prefix}.attention.sliding_window_pattern"))
+                    .map(|v| v as usize);
+                let qpas = gguf
+                    .get_u32(&format!("{prefix}.attention.query_pre_attn_scalar"))
+                    .map(|v| v as usize);
+                let es = Some((hidden_size as f32).sqrt());
+                (Some(local_theta), sw, sw_pattern, qpas, es)
+            }
+            _ => (None, None, None, None, None),
+        };
+
+        // eos_token_id: GGUF may store it as an array or a single value
+        let eos_token_id = gguf
+            .get_u32("tokenizer.ggml.eos_token_id")
+            .unwrap_or(u32::MAX);
+
+        Ok(Self {
+            arch,
+            hidden_size,
+            num_hidden_layers,
+            num_attention_heads,
+            num_key_value_heads,
+            head_dim,
+            intermediate_size,
+            vocab_size,
+            rms_norm_eps,
+            rope_theta,
+            has_qkv_bias,
+            tie_word_embeddings,
+            eos_token_id,
+            rope_local_theta,
+            sliding_window,
+            sliding_window_pattern,
+            query_pre_attn_scalar,
+            embed_scale,
+        })
+    }
+
     fn detect_arch(raw: &RawHfConfig) -> Result<ModelArch> {
         // Try architectures field first
         if let Some(archs) = &raw.architectures {

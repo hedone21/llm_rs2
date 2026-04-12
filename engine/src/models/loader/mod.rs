@@ -8,6 +8,7 @@
 //! - `SafetensorsSource` — HuggingFace safetensors format
 
 pub mod convert;
+pub mod gguf;
 pub mod safetensors;
 
 use anyhow::Result;

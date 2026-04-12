@@ -7,6 +7,7 @@ use ocl::core::Mem;
 pub enum DType {
     Q4_0,
     Q4_1,
+    Q8_0,
     F16,
     BF16,
     F32,
@@ -16,7 +17,7 @@ pub enum DType {
 impl DType {
     pub fn size(&self) -> usize {
         match self {
-            DType::Q4_0 | DType::Q4_1 => 1, // Actually block quantized, handled separately usually
+            DType::Q4_0 | DType::Q4_1 | DType::Q8_0 => 1, // Actually block quantized, handled separately usually
             DType::F16 | DType::BF16 => 2,
             DType::F32 => 4,
             DType::U8 => 1,
@@ -145,12 +146,13 @@ mod tests {
         let variants = [
             DType::Q4_0,
             DType::Q4_1,
+            DType::Q8_0,
             DType::F16,
             DType::BF16,
             DType::F32,
             DType::U8,
         ];
-        let expected = [1, 1, 2, 2, 4, 1];
+        let expected = [1, 1, 1, 2, 2, 4, 1];
         for (dt, exp) in variants.iter().zip(expected.iter()) {
             assert_eq!(dt.size(), *exp, "DType::{:?} size mismatch", dt);
         }
