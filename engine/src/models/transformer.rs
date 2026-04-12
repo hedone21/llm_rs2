@@ -1063,7 +1063,9 @@ impl TransformerModel {
                 })
                 .collect();
             // Also include lm_head ne01 if applicable
-            if !self.lm_head_on_cpu && let Some(ref e) = ns_entry(&self.lm_head) {
+            if !self.lm_head_on_cpu
+                && let Some(ref e) = ns_entry(&self.lm_head)
+            {
                 ne01_set.push(e.ne01);
             }
             ne01_set.sort_unstable();

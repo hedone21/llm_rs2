@@ -10,15 +10,22 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 /// Function type for work items: (context_pointer, chunk_id)
 pub type WorkFn = unsafe fn(*const u8, usize);
 
+/// 64-byte aligned atomic wrapper to prevent false sharing.
+/// Each hot field gets its own cache line (ggml GGML_CACHE_ALIGN pattern).
+#[repr(C, align(64))]
+struct CacheAligned<T>(T);
+
+#[repr(C)]
 struct SharedState {
     /// Incremented each dispatch — workers check this after unpark.
-    generation: AtomicU64,
+    generation: CacheAligned<AtomicU64>,
     /// Workers fetch_add to grab the next chunk (work-stealing).
-    next_chunk: AtomicUsize,
+    next_chunk: CacheAligned<AtomicUsize>,
+    /// Workers increment when done with current dispatch.
+    done_count: CacheAligned<AtomicUsize>,
+    // --- cold fields below (shared cache line OK) ---
     /// Total chunks for current dispatch.
     total_chunks: AtomicUsize,
-    /// Workers increment when done with current dispatch.
-    done_count: AtomicUsize,
     /// Shutdown signal.
     shutdown: AtomicBool,
     /// When true, workers spin instead of park after completing work.
@@ -43,10 +50,10 @@ impl SpinPool {
     /// The main thread also participates during dispatch (total = n_workers + 1).
     pub fn new(n_workers: usize) -> Self {
         let shared = Arc::new(SharedState {
-            generation: AtomicU64::new(0),
-            next_chunk: AtomicUsize::new(0),
+            generation: CacheAligned(AtomicU64::new(0)),
+            next_chunk: CacheAligned(AtomicUsize::new(0)),
+            done_count: CacheAligned(AtomicUsize::new(0)),
             total_chunks: AtomicUsize::new(0),
-            done_count: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
             batch_mode: AtomicBool::new(false),
             n_workers,
@@ -91,7 +98,7 @@ impl SpinPool {
                 if shared.shutdown.load(Ordering::Relaxed) {
                     return;
                 }
-                let g = shared.generation.load(Ordering::Acquire);
+                let g = shared.generation.0.load(Ordering::Acquire);
                 if g != last_gen {
                     last_gen = g;
                     break;
@@ -113,7 +120,7 @@ impl SpinPool {
             // Work-stealing: grab chunks via atomic counter
             Self::steal_work(shared);
 
-            shared.done_count.fetch_add(1, Ordering::Release);
+            shared.done_count.0.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -125,7 +132,7 @@ impl SpinPool {
         let total = shared.total_chunks.load(Ordering::Relaxed);
 
         loop {
-            let chunk = shared.next_chunk.fetch_add(1, Ordering::Relaxed);
+            let chunk = shared.next_chunk.0.fetch_add(1, Ordering::Relaxed);
             if chunk >= total {
                 break;
             }
@@ -161,14 +168,14 @@ impl SpinPool {
         self.shared.work_fn.store(wf as usize, Ordering::Relaxed);
         self.shared.work_ctx.store(ctx as usize, Ordering::Relaxed);
         self.shared.total_chunks.store(nc, Ordering::Relaxed);
-        self.shared.next_chunk.store(0, Ordering::Relaxed);
-        self.shared.done_count.store(0, Ordering::Relaxed);
-        self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.next_chunk.0.store(0, Ordering::Relaxed);
+        self.shared.done_count.0.store(0, Ordering::Relaxed);
+        self.shared.generation.0.fetch_add(1, Ordering::Release);
         for wt in &self.worker_threads {
             wt.unpark();
         }
         Self::steal_work(&self.shared);
-        while self.shared.done_count.load(Ordering::Acquire) < self.shared.n_workers {
+        while self.shared.done_count.0.load(Ordering::Acquire) < self.shared.n_workers {
             std::hint::spin_loop();
         }
 
@@ -178,12 +185,12 @@ impl SpinPool {
             self.shared.work_fn.store(wf as usize, Ordering::Relaxed);
             self.shared.work_ctx.store(ctx as usize, Ordering::Relaxed);
             self.shared.total_chunks.store(nc, Ordering::Relaxed);
-            self.shared.next_chunk.store(0, Ordering::Relaxed);
-            self.shared.done_count.store(0, Ordering::Relaxed);
-            self.shared.generation.fetch_add(1, Ordering::Release);
+            self.shared.next_chunk.0.store(0, Ordering::Relaxed);
+            self.shared.done_count.0.store(0, Ordering::Relaxed);
+            self.shared.generation.0.fetch_add(1, Ordering::Release);
             // Workers are still spinning — they'll catch the generation change
             Self::steal_work(&self.shared);
-            while self.shared.done_count.load(Ordering::Acquire) < self.shared.n_workers {
+            while self.shared.done_count.0.load(Ordering::Acquire) < self.shared.n_workers {
                 std::hint::spin_loop();
             }
         }
@@ -205,11 +212,11 @@ impl SpinPool {
             .store(work_fn as usize, Ordering::Relaxed);
         self.shared.work_ctx.store(ctx as usize, Ordering::Relaxed);
         self.shared.total_chunks.store(n_chunks, Ordering::Relaxed);
-        self.shared.next_chunk.store(0, Ordering::Relaxed);
-        self.shared.done_count.store(0, Ordering::Relaxed);
+        self.shared.next_chunk.0.store(0, Ordering::Relaxed);
+        self.shared.done_count.0.store(0, Ordering::Relaxed);
 
         // Publish work (Release ensures setup is visible to workers)
-        self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.generation.0.fetch_add(1, Ordering::Release);
 
         // Wake all parked workers
         for wt in &self.worker_threads {
@@ -220,7 +227,7 @@ impl SpinPool {
         Self::steal_work(&self.shared);
 
         // Wait for all workers to finish
-        while self.shared.done_count.load(Ordering::Acquire) < self.shared.n_workers {
+        while self.shared.done_count.0.load(Ordering::Acquire) < self.shared.n_workers {
             std::hint::spin_loop();
         }
     }
@@ -229,7 +236,7 @@ impl SpinPool {
 impl Drop for SpinPool {
     fn drop(&mut self) {
         self.shared.shutdown.store(true, Ordering::Release);
-        self.shared.generation.fetch_add(1, Ordering::Release);
+        self.shared.generation.0.fetch_add(1, Ordering::Release);
         for wt in &self.worker_threads {
             wt.unpark();
         }
@@ -296,6 +303,45 @@ mod tests {
                 r.load(Ordering::Relaxed)
             );
         }
+    }
+
+    #[test]
+    fn test_cache_line_alignment() {
+        // Hot atomic fields must sit on separate 64-byte cache lines
+        // to prevent false sharing (ggml Issue #9588: +30% on ARM).
+        let state = SharedState {
+            generation: CacheAligned(AtomicU64::new(0)),
+            next_chunk: CacheAligned(AtomicUsize::new(0)),
+            done_count: CacheAligned(AtomicUsize::new(0)),
+            total_chunks: AtomicUsize::new(0),
+            shutdown: AtomicBool::new(false),
+            batch_mode: AtomicBool::new(false),
+            n_workers: 0,
+            work_fn: AtomicUsize::new(0),
+            work_ctx: AtomicUsize::new(0),
+        };
+
+        let base = &state as *const _ as usize;
+        let gen_off = &state.generation.0 as *const _ as usize - base;
+        let next_off = &state.next_chunk.0 as *const _ as usize - base;
+        let done_off = &state.done_count.0 as *const _ as usize - base;
+
+        // Each hot field on a distinct 64-byte cache line
+        assert_ne!(
+            gen_off / 64,
+            next_off / 64,
+            "generation and next_chunk share a cache line"
+        );
+        assert_ne!(
+            next_off / 64,
+            done_off / 64,
+            "next_chunk and done_count share a cache line"
+        );
+        assert_ne!(
+            gen_off / 64,
+            done_off / 64,
+            "generation and done_count share a cache line"
+        );
     }
 
     #[test]
