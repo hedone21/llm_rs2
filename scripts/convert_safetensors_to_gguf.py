@@ -10,6 +10,7 @@ import sys, json, struct, os
 import numpy as np
 from pathlib import Path
 from safetensors import safe_open
+from safetensors.numpy import load_file as st_load_file
 
 QK4_0 = 32  # Q4_0 block size
 
@@ -80,6 +81,10 @@ for i in range(256):  # enough layers
         f"model.layers.{i}.mlp.down_proj.weight": f"blk.{i}.ffn_down.weight",
         f"model.layers.{i}.input_layernorm.weight": f"blk.{i}.attn_norm.weight",
         f"model.layers.{i}.post_attention_layernorm.weight": f"blk.{i}.ffn_norm.weight",
+        # QKV bias (Qwen2)
+        f"model.layers.{i}.self_attn.q_proj.bias": f"blk.{i}.attn_q.bias",
+        f"model.layers.{i}.self_attn.k_proj.bias": f"blk.{i}.attn_k.bias",
+        f"model.layers.{i}.self_attn.v_proj.bias": f"blk.{i}.attn_v.bias",
     })
 
 # ggml_type constants
@@ -100,7 +105,12 @@ def main():
 
     # Load config.json
     config = json.loads((model_dir / "config.json").read_text())
-    arch = "llama"  # Llama family
+
+    # Detect architecture from model_type
+    model_type = config.get("model_type", "llama").lower()
+    ARCH_MAP = {"llama": "llama", "qwen2": "qwen2", "gemma": "gemma", "gemma2": "gemma2", "gemma3": "gemma3"}
+    arch = ARCH_MAP.get(model_type, "llama")
+    print(f"Architecture: {arch} (model_type={model_type})")
 
     # Find safetensors files
     st_files = sorted(model_dir.glob("*.safetensors"))
@@ -149,7 +159,26 @@ def main():
             continue
 
         h = handles[tensor_names[hf_name]]
-        tensor = h.get_tensor(hf_name)
+        # Handle BF16: numpy doesn't support bf16 natively
+        try:
+            tensor = h.get_tensor(hf_name)
+        except TypeError:
+            # BF16 fallback: read raw uint16 bytes, convert to f32 via bit manipulation
+            sl = h.get_slice(hf_name)
+            shape_orig = sl.get_shape()
+            # Read raw bytes from safetensors file
+            st_path = st_files[tensor_names[hf_name]]
+            with open(str(st_path), 'rb') as raw_f:
+                header_size = struct.unpack('<Q', raw_f.read(8))[0]
+                header = json.loads(raw_f.read(header_size))
+                info = header[hf_name]
+                offsets = info['data_offsets']
+                raw_f.seek(8 + header_size + offsets[0])
+                raw_bytes = raw_f.read(offsets[1] - offsets[0])
+            # BF16 → F32: shift left 16 bits
+            bf16 = np.frombuffer(raw_bytes, dtype=np.uint16)
+            f32_bits = bf16.astype(np.uint32) << 16
+            tensor = np.frombuffer(f32_bits.tobytes(), dtype=np.float32).reshape(shape_orig)
         shape = tensor.shape
 
         # GGUF dims are reversed (innermost first)
