@@ -2185,6 +2185,10 @@ impl CpuBackendNeon {
     }
 
     // Dot Product Q4_0 * Q8_0 (NEON + DotProd)
+    // 2-block unrolling with vector FMA accumulation (matches llama.cpp pattern).
+    // Key optimisation: dot products stay in int32x4_t lanes, converted to float32x4_t
+    // and accumulated via vmlaq_n_f32, avoiding per-block scalar reduction (vaddvq_s32).
+    // Final horizontal reduction happens once after the loop.
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn vec_dot_q4_0_q8_0_sdot(
         &self,
@@ -2194,41 +2198,103 @@ impl CpuBackendNeon {
         vy: *const BlockQ8_0,
     ) {
         let nb = n / QK8_0;
-        let mut sumf = 0.0;
 
         unsafe {
             let m4b = vdupq_n_u8(0x0F);
             let s8b = vdupq_n_s8(8);
 
+            let mut sumv0 = vdupq_n_f32(0.0);
+            let mut sumv1 = vdupq_n_f32(0.0);
+
+            // Main loop: process 2 blocks per iteration
             let mut i = 0;
-            while i < nb {
+            while i + 1 < nb {
+                let x0 = &*vx.add(i);
+                let x1 = &*vx.add(i + 1);
+                let y0 = &*vy.add(i);
+                let y1 = &*vy.add(i + 1);
+
+                let d0 = x0.d.to_f32() * y0.d.to_f32();
+                let d1 = x1.d.to_f32() * y1.d.to_f32();
+
+                // Load and unpack Q4_0 block 0
+                let v0_0 = vld1q_u8(x0.qs.as_ptr());
+                let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
+                let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
+
+                // Load and unpack Q4_0 block 1
+                let v0_1 = vld1q_u8(x1.qs.as_ptr());
+                let x1_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_1, m4b)), s8b);
+                let x1_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4)), s8b);
+
+                // Load Q8_0 block 0
+                let y0_l = vld1q_s8(y0.qs.as_ptr());
+                let y0_h = vld1q_s8(y0.qs.as_ptr().add(16));
+
+                // Load Q8_0 block 1
+                let y1_l = vld1q_s8(y1.qs.as_ptr());
+                let y1_h = vld1q_s8(y1.qs.as_ptr().add(16));
+
+                // Dot product block 0: sdot low then high into p_0
+                let mut p_0 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                    acc = inout(vreg) p_0,
+                    x = in(vreg) x0_l,
+                    y = in(vreg) y0_l,
+                );
+                std::arch::asm!(
+                    "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                    acc = inout(vreg) p_0,
+                    x = in(vreg) x0_h,
+                    y = in(vreg) y0_h,
+                );
+
+                // Dot product block 1: sdot low then high into p_1
+                let mut p_1 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                    acc = inout(vreg) p_1,
+                    x = in(vreg) x1_l,
+                    y = in(vreg) y1_l,
+                );
+                std::arch::asm!(
+                    "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                    acc = inout(vreg) p_1,
+                    x = in(vreg) x1_h,
+                    y = in(vreg) y1_h,
+                );
+
+                // Vector FMA: accumulate int32x4_t → float32x4_t with scalar scale
+                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
+
+                i += 2;
+            }
+
+            // Horizontal reduction (single pass at end)
+            let mut sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+            // Handle odd remainder block (when nb is odd)
+            if i < nb {
                 let x = &*vx.add(i);
                 let y = &*vy.add(i);
                 let d = x.d.to_f32() * y.d.to_f32();
 
-                // Load Q4_0
-                let v0 = vld1q_u8(x.qs.as_ptr()); // 32 values (uint8x16)
-
-                // Unpack to int8
+                let v0 = vld1q_u8(x.qs.as_ptr());
                 let x_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0, m4b)), s8b);
                 let x_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0, 4)), s8b);
 
-                // Load Q8_0
-                let y_l = vld1q_s8(y.qs.as_ptr()); // 16 values
-                let y_h = vld1q_s8(y.qs.as_ptr().add(16)); // 16 values
+                let y_l = vld1q_s8(y.qs.as_ptr());
+                let y_h = vld1q_s8(y.qs.as_ptr().add(16));
 
-                // Dot Product with Accumulation (ARMv8.2 sdot)
-                // sdot (acc, a, b) -> acc + a[0]*b[0] + a[1]*b[1] + a[2]*b[2] + a[3]*b[3]
                 let mut acc = vdupq_n_s32(0);
-
-                // Use asm! to emit sdot instruction since vdotq_s32 is unstable
                 std::arch::asm!(
                     "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
                     acc = inout(vreg) acc,
                     x = in(vreg) x_l,
                     y = in(vreg) y_l,
                 );
-
                 std::arch::asm!(
                     "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
                     acc = inout(vreg) acc,
@@ -2236,13 +2302,11 @@ impl CpuBackendNeon {
                     y = in(vreg) y_h,
                 );
 
-                let sum_i = vaddvq_s32(acc);
-                sumf += d * sum_i as f32;
-
-                i += 1;
+                sumf += d * vaddvq_s32(acc) as f32;
             }
+
+            *s = sumf;
         }
-        *s = sumf;
     }
 }
 
