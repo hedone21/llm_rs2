@@ -398,9 +398,13 @@ impl KiviCache {
         }
 
         let res_elems = kv_heads * residual_size * head_dim;
-        // Lazy grow: start with res_cap tokens for attention buffers instead of max_seq_len.
-        // Grows on demand via ensure_gpu_attn_capacity() during flush.
-        let initial_attn_cap = residual_size;
+        // Allocate attention buffers at max_seq_len upfront.
+        // Lazy grow (Phase 2) is disabled because the OpenCL Plan caches cl_mem
+        // handles at build time — growing attn buffers would stale the Plan's
+        // references, causing garbage output or crashes.
+        // For bits=16 (dynamic quant entry), attn buffers aren't used until
+        // transition_bits() switches to Q2/Q4/Q8.
+        let initial_attn_cap = max_seq_len;
         let attn_elems = initial_attn_cap * kv_heads * head_dim;
 
         // Q2 storage: max blocks needed
