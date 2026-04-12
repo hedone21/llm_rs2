@@ -2308,6 +2308,22 @@ impl CpuBackendNeon {
             *s = sumf;
         }
     }
+
+    /// 2-row i8mm dot product: weight 2행 × activation 1행 → 결과 2개.
+    /// ARM FEAT_I8MM (smmla) 기반. i8mm 미지원 디바이스에서는 호출하지 않을 것.
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn vec_dot_q4_0_q8_0_i8mm(
+        &self,
+        n: usize,
+        s0: &mut f32,
+        s1: &mut f32,
+        vx0: *const BlockQ4_0,
+        vx1: *const BlockQ4_0,
+        vy: *const BlockQ8_0,
+    ) {
+        unimplemented!("i8mm dot product — to be implemented in next task");
+    }
 }
 
 // --- SpinPool work context for F16 GEMV ---
@@ -2763,6 +2779,122 @@ mod tests {
                 1e-2,
                 atol,
                 &format!("k={}", k),
+            );
+        }
+    }
+
+    #[test]
+    fn test_i8mm_dot_q4_0_q8_0() {
+        if !std::arch::is_aarch64_feature_detected!("i8mm") {
+            eprintln!("[SKIPPED] i8mm not supported on this device");
+            return;
+        }
+
+        let backend = CpuBackendNeon;
+
+        // Test various dimensions
+        for nb in [1, 2, 4, 8, 64, 128] {
+            let k = nb * QK4_0; // 32, 64, 128, 256, 2048, 4096
+
+            // Create deterministic test data
+            let mut rng_state = 42u64;
+            let mut pseudo_rand = || -> i8 {
+                rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((rng_state >> 33) % 15) as i8 - 7
+            };
+
+            let mut blocks_row0 = Vec::with_capacity(nb);
+            let mut blocks_row1 = Vec::with_capacity(nb);
+            for blk in 0..nb {
+                let d0 = half::f16::from_f32(0.1 + 0.01 * blk as f32);
+                let d1 = half::f16::from_f32(0.15 + 0.01 * blk as f32);
+                let mut qs0 = [0u8; QK4_0 / 2];
+                let mut qs1 = [0u8; QK4_0 / 2];
+                for z in 0..QK4_0 / 2 {
+                    let v0_lo = (pseudo_rand() + 8) as u8;
+                    let v0_hi = (pseudo_rand() + 8) as u8;
+                    qs0[z] = (v0_lo & 0x0F) | ((v0_hi & 0x0F) << 4);
+                    let v1_lo = (pseudo_rand() + 8) as u8;
+                    let v1_hi = (pseudo_rand() + 8) as u8;
+                    qs1[z] = (v1_lo & 0x0F) | ((v1_hi & 0x0F) << 4);
+                }
+                blocks_row0.push(BlockQ4_0 { d: d0, qs: qs0 });
+                blocks_row1.push(BlockQ4_0 { d: d1, qs: qs1 });
+            }
+
+            // Create activation (Q8_0)
+            let mut act_blocks = Vec::with_capacity(nb);
+            for blk in 0..nb {
+                let d = half::f16::from_f32(0.2 + 0.005 * blk as f32);
+                let mut qs = [0i8; QK8_0];
+                for z in 0..QK8_0 {
+                    qs[z] = pseudo_rand();
+                }
+                act_blocks.push(BlockQ8_0 { d, qs });
+            }
+
+            // Reference: existing sdot function
+            let mut ref0 = 0.0f32;
+            let mut ref1 = 0.0f32;
+            unsafe {
+                if std::arch::is_aarch64_feature_detected!("dotprod") {
+                    backend.vec_dot_q4_0_q8_0_sdot(
+                        k,
+                        &mut ref0,
+                        blocks_row0.as_ptr(),
+                        act_blocks.as_ptr(),
+                    );
+                    backend.vec_dot_q4_0_q8_0_sdot(
+                        k,
+                        &mut ref1,
+                        blocks_row1.as_ptr(),
+                        act_blocks.as_ptr(),
+                    );
+                } else {
+                    backend.vec_dot_q4_0_q8_0(
+                        k,
+                        &mut ref0,
+                        blocks_row0.as_ptr(),
+                        act_blocks.as_ptr(),
+                    );
+                    backend.vec_dot_q4_0_q8_0(
+                        k,
+                        &mut ref1,
+                        blocks_row1.as_ptr(),
+                        act_blocks.as_ptr(),
+                    );
+                }
+            }
+
+            // i8mm
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            unsafe {
+                backend.vec_dot_q4_0_q8_0_i8mm(
+                    k,
+                    &mut s0,
+                    &mut s1,
+                    blocks_row0.as_ptr(),
+                    blocks_row1.as_ptr(),
+                    act_blocks.as_ptr(),
+                );
+            }
+
+            let tol = 1e-4 * (k as f32).sqrt();
+            assert!(
+                (s0 - ref0).abs() < tol,
+                "k={k} row0: i8mm={s0} ref={ref0} diff={}",
+                (s0 - ref0).abs()
+            );
+            assert!(
+                (s1 - ref1).abs() < tol,
+                "k={k} row1: i8mm={s1} ref={ref1} diff={}",
+                (s1 - ref1).abs()
+            );
+            eprintln!(
+                "[PASS] k={k}: row0 diff={:.6}, row1 diff={:.6}",
+                (s0 - ref0).abs(),
+                (s1 - ref1).abs()
             );
         }
     }
