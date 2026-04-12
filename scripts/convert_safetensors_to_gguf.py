@@ -85,6 +85,11 @@ for i in range(256):  # enough layers
         f"model.layers.{i}.self_attn.q_proj.bias": f"blk.{i}.attn_q.bias",
         f"model.layers.{i}.self_attn.k_proj.bias": f"blk.{i}.attn_k.bias",
         f"model.layers.{i}.self_attn.v_proj.bias": f"blk.{i}.attn_v.bias",
+        # Gemma3 extra norms
+        f"model.layers.{i}.self_attn.q_norm.weight": f"blk.{i}.attn_q_norm.weight",
+        f"model.layers.{i}.self_attn.k_norm.weight": f"blk.{i}.attn_k_norm.weight",
+        f"model.layers.{i}.pre_feedforward_layernorm.weight": f"blk.{i}.pre_ffn_norm.weight",
+        f"model.layers.{i}.post_feedforward_layernorm.weight": f"blk.{i}.post_ffn_norm.weight",
     })
 
 # ggml_type constants
@@ -108,7 +113,8 @@ def main():
 
     # Detect architecture from model_type
     model_type = config.get("model_type", "llama").lower()
-    ARCH_MAP = {"llama": "llama", "qwen2": "qwen2", "gemma": "gemma", "gemma2": "gemma2", "gemma3": "gemma3"}
+    ARCH_MAP = {"llama": "llama", "qwen2": "qwen2", "gemma": "gemma", "gemma2": "gemma2",
+                 "gemma3": "gemma3", "gemma3_text": "gemma3"}
     arch = ARCH_MAP.get(model_type, "llama")
     print(f"Architecture: {arch} (model_type={model_type})")
 
@@ -235,6 +241,16 @@ def main():
     add_kv_u32(f"{arch}.context_length", config.get("max_position_embeddings", 2048))
     add_kv_f32(f"{arch}.attention.layer_norm_rms_epsilon", config.get("rms_norm_eps", 1e-5))
     add_kv_f32(f"{arch}.rope.freq_base", config.get("rope_theta", 10000.0))
+
+    # Gemma3 extra metadata
+    if "head_dim" in config:
+        add_kv_u32(f"{arch}.attention.head_dim", config["head_dim"])
+    if "sliding_window" in config:
+        add_kv_u32(f"{arch}.attention.sliding_window", config["sliding_window"])
+    if "sliding_window_pattern" in config:
+        add_kv_u32(f"{arch}.attention.sliding_window_pattern", config["sliding_window_pattern"])
+    if "query_pre_attn_scalar" in config:
+        add_kv_f32(f"{arch}.attention.query_pre_attn_scalar", config["query_pre_attn_scalar"])
 
     # Finalize header with kv_count
     header.extend(struct.pack('<Q', kv_count))
