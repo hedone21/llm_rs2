@@ -647,6 +647,21 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Q4_0 noshuffle SOA conversion: pre-convert all Q4_0 weights to Adreno-optimized
+    // SOA layout. After this, matmul_q4_0 auto-dispatches to noshuffle GEMV for decode.
+    // Check actual weight dtype (GGUF may load Q4_0 even when w_dtype=F16).
+    #[cfg(feature = "opencl")]
+    if is_gpu {
+        let actual_q4 = w_dtype == DType::Q4_0
+            || model.layers.first().map_or(false, |l| l.wq.dtype() == DType::Q4_0);
+        if actual_q4 {
+            match model.prepare_noshuffle_buffers(&backend) {
+                Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
+                Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
+            }
+        }
+    }
+
     // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch.
     #[cfg(feature = "opencl")]
     let weights_on_gpu =

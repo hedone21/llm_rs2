@@ -148,6 +148,19 @@ struct KernelCache {
 unsafe impl Send for KernelCache {}
 unsafe impl Sync for KernelCache {}
 
+/// SOA layout entry for a Q4_0 weight tensor converted to noshuffle format.
+/// Stored in the noshuffle registry, keyed by the original cl_mem pointer.
+pub struct NoshuffleSoaEntry {
+    /// SOA nibbles buffer (transposed, ushort-level column-major)
+    pub q_buf: ocl::core::Mem,
+    /// SOA scales buffer (transposed, half-level column-major)
+    pub d_buf: ocl::core::Mem,
+    /// K dimension (elements per row)
+    pub ne00: usize,
+    /// M dimension (number of rows)
+    pub ne01: usize,
+}
+
 /// OpenCL Backend with cached kernel objects for performance.
 /// Kernels are created once during initialization and reused across all calls.
 pub struct OpenCLBackend {
@@ -218,6 +231,12 @@ pub struct OpenCLBackend {
     // Each unique dimension pair requires a different compile-time define set.
     // UnsafeCell: single-threaded access like other kernel caches.
     gemv_noshuffle_cache: UnsafeCell<HashMap<usize, (Program, CoreKernel)>>,
+
+    // Q4_0 noshuffle SOA registry: maps original weight cl_mem pointer (as usize)
+    // to pre-converted SOA buffers. Populated by prepare_noshuffle_buffers() at load time.
+    // matmul_q4_0() auto-dispatches to noshuffle GEMV when a lookup succeeds.
+    // UnsafeCell: single-threaded access (same pattern as kernels and gemv_noshuffle_cache).
+    noshuffle_soa_registry: UnsafeCell<HashMap<usize, NoshuffleSoaEntry>>,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -888,6 +907,7 @@ impl OpenCLBackend {
             cl_opts: cl_opts.clone(),
             max_mem_alloc_size,
             gemv_noshuffle_cache: UnsafeCell::new(HashMap::new()),
+            noshuffle_soa_registry: UnsafeCell::new(HashMap::new()),
         })
     }
 
@@ -1221,6 +1241,22 @@ impl OpenCLBackend {
         let out_buf =
             get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
 
+        // Auto-dispatch to noshuffle GEMV for decode (m==1) when SOA buffers are available.
+        // The noshuffle kernel is optimized for Adreno's subgroup architecture (SIMD width 64).
+        if m == 1 {
+            let b_key = b_buf.as_ptr() as usize;
+            if let Some(entry) = self.lookup_noshuffle_soa(b_key) {
+                return self.matmul_q4_0_noshuffle(
+                    &entry.q_buf,
+                    &entry.d_buf,
+                    a_buf,
+                    out_buf,
+                    entry.ne00,
+                    entry.ne01,
+                );
+            }
+        }
+
         let kernels = unsafe { &*self.kernels.get() };
         let kernel = &kernels.kernel_mul_mat_q4_0_f32;
 
@@ -1270,11 +1306,35 @@ impl OpenCLBackend {
         Ok(())
     }
 
+    /// Register a pre-converted noshuffle SOA entry for a weight tensor.
+    ///
+    /// `key` should be the original weight buffer's `cl_mem` pointer cast to `usize`.
+    /// Called by `prepare_noshuffle_buffers()` after `convert_q4_0_to_noshuffle()`.
+    pub fn register_noshuffle_soa(&self, key: usize, entry: NoshuffleSoaEntry) {
+        // SAFETY: single-threaded inference access (same pattern as gemv_noshuffle_cache)
+        let registry = unsafe { &mut *self.noshuffle_soa_registry.get() };
+        registry.insert(key, entry);
+    }
+
+    /// Lookup a pre-converted noshuffle SOA entry by the original weight cl_mem pointer.
+    ///
+    /// Returns None if the weight was not pre-converted (fallback to standard Q4_0 GEMV).
+    pub fn lookup_noshuffle_soa(&self, key: usize) -> Option<&NoshuffleSoaEntry> {
+        // SAFETY: single-threaded inference access
+        let registry = unsafe { &*self.noshuffle_soa_registry.get() };
+        registry.get(&key)
+    }
+
     /// Convert Q4_0 AOS weight buffer to SOA layout for the noshuffle GEMV kernel.
     ///
     /// Called once per weight tensor at model load time.
-    /// Returns (q_buf, d_buf) — the SOA nibbles and scales buffers.
-    /// Also compiles the per-dimension GEMV noshuffle kernel if not yet available.
+    /// Returns (q_buf, d_buf) — the SOA nibbles and scales buffers,
+    /// **transposed** so that the GEMV kernel can access them with coalesced reads.
+    ///
+    /// The full pipeline mirrors llama.cpp's Adreno path:
+    ///   1. GPU: kernel_convert_block_q4_0_noshuffle (nibble rearrange, row-major)
+    ///   2. CPU: ushort-level 2D transpose of q buffer (M rows x K/4 cols -> K/4 rows x M cols)
+    ///   3. CPU: half-level 2D transpose of d buffer (M rows x blocks_per_row cols -> transposed)
     ///
     /// # Arguments
     /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format)
@@ -1294,7 +1354,7 @@ impl OpenCLBackend {
             .as_ref()
             .ok_or_else(|| anyhow!("Q4_0 noshuffle conversion kernel not available"))?;
 
-        // Allocate SOA buffers
+        // Allocate SOA buffers (row-major, pre-transpose)
         // dst_q: num_blocks * 16 bytes (QK4_0/2 = 16 nibble-bytes per block)
         let q_bytes = num_blocks * 16;
         let dst_q = unsafe {
@@ -1316,7 +1376,7 @@ impl OpenCLBackend {
             )?
         };
 
-        // Set kernel args and dispatch
+        // Step 1: GPU SOA conversion (nibble rearrange, keeps row-major block order)
         unsafe {
             ocl::core::set_kernel_arg(cvt_kernel, 0, ocl::core::ArgVal::mem(src))?;
             ocl::core::set_kernel_arg(cvt_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
@@ -1334,27 +1394,104 @@ impl OpenCLBackend {
                 None::<&mut ocl::core::Event>,
             )?;
         }
-
-        // Ensure conversion completes before returning
         self.queue.finish()?;
 
-        // Build the GEMV noshuffle kernel if we haven't already (dimension-specific defines).
-        // We build once with the first dimension encountered and cache it. If different
-        // weight dimensions are used (which is the case — QKV vs FFN), we handle it by
-        // passing ne00/ne01 as runtime kernel args rather than compile-time defines.
+        // Step 2: CPU transpose of q buffer (ushort-level 2D transpose)
         //
-        // Actually, LINE_STRIDE_A and BLOCK_STRIDE_A must be compile-time defines for
-        // the kernel to work correctly (they're used in array indexing). So we need
-        // per-dimension kernels. For the MVP, we build them lazily and store the
-        // most recently used one. The caller (matmul_q4_0_noshuffle) will rebuild
-        // if dimensions change.
+        // Row-major layout (after SOA conversion):
+        //   q[row * cols_ushort + col] where cols_ushort = K/4 (ushort per row)
+        // Transposed layout (what GEMV expects):
+        //   q_t[col * M + row] (column-major by ushort)
         //
-        // For the MVP, we skip caching complexity and build the kernel at dispatch time
-        // based on the dimensions of each call. This adds ~1ms compile overhead on first
-        // call per dimension, amortized over thousands of tokens.
+        // When GEMV reads uint* from the transposed buffer, consecutive row-pairs
+        // (row 2*gid, 2*gid+1) share a uint, enabling 2-row-per-fiber processing.
+        let cols_ushort = ne00 / 4; // K/4 ushort per row
+        let q_total_ushort = ne01 * cols_ushort;
+        {
+            let mut q_host = vec![0u16; q_total_ushort];
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &self.queue,
+                    &dst_q,
+                    true,
+                    0,
+                    std::slice::from_raw_parts_mut(
+                        q_host.as_mut_ptr() as *mut u8,
+                        q_total_ushort * 2,
+                    ),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+
+            let mut q_transposed = vec![0u16; q_total_ushort];
+            for row in 0..ne01 {
+                for col in 0..cols_ushort {
+                    q_transposed[col * ne01 + row] = q_host[row * cols_ushort + col];
+                }
+            }
+
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &self.queue,
+                    &dst_q,
+                    true,
+                    0,
+                    std::slice::from_raw_parts(
+                        q_transposed.as_ptr() as *const u8,
+                        q_total_ushort * 2,
+                    ),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }
+
+        // Step 3: CPU transpose of d buffer (half-level 2D transpose)
+        //
+        // Row-major: d[row * blocks_per_row + k] (half per block)
+        // Transposed: d_t[k * M + row] (column-major by half)
+        //
+        // GEMV reads half2* from transposed d: half2[k*(M/2) + gid]
+        //   .x = d_t[k*M + 2*gid]   = scale for even row
+        //   .y = d_t[k*M + 2*gid+1] = scale for odd row
+        let blocks_per_row = ne00 / 32; // QK4_0 = 32
+        {
+            let mut d_host = vec![0u16; num_blocks];
+            unsafe {
+                ocl::core::enqueue_read_buffer(
+                    &self.queue,
+                    &dst_d,
+                    true,
+                    0,
+                    std::slice::from_raw_parts_mut(d_host.as_mut_ptr() as *mut u8, num_blocks * 2),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+
+            let mut d_transposed = vec![0u16; num_blocks];
+            for row in 0..ne01 {
+                for k in 0..blocks_per_row {
+                    d_transposed[k * ne01 + row] = d_host[row * blocks_per_row + k];
+                }
+            }
+
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &self.queue,
+                    &dst_d,
+                    true,
+                    0,
+                    std::slice::from_raw_parts(d_transposed.as_ptr() as *const u8, num_blocks * 2),
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }
 
         log::info!(
-            "Q4_0 noshuffle SOA conversion done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB",
+            "Q4_0 noshuffle SOA conversion + transpose done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB",
             num_blocks,
             ne00,
             ne01,
@@ -1386,12 +1523,21 @@ impl OpenCLBackend {
         ne00: usize,
         ne01: usize,
     ) -> Result<()> {
-        // Compute strides (in uint/half2 units, matching the kernel's indexing)
-        // LINE_STRIDE_A = ne01/2 (row-pair count — each gid covers 2 rows)
-        // BLOCK_STRIDE_A = ne01 (total rows — stride between consecutive uint words)
-        // SIMDGROUP_WIDTH = 64 (Adreno half-wave)
+        // Compute strides (in uint units, matching the kernel's indexing on transposed SOA).
+        //
+        // After ushort-level 2D transpose of the SOA q buffer:
+        //   Original: M rows x (K/4) cols of ushort (row-major)
+        //   Transposed: (K/4) rows x M cols of ushort (column-major by ushort)
+        //
+        // When read as uint* (2 ushort = 1 uint), consecutive row-pairs share a uint.
+        //   LINE_STRIDE_A = ne01/2 — stride between consecutive ushort columns in uint units
+        //   BLOCK_STRIDE_A = 4 * ne01 — stride between consecutive K-blocks (each block = 8 ushort cols)
+        //     = 8 ushort_cols * (ne01/2) uint_per_ushort_col = 4*ne01
+        //   SIMDGROUP_WIDTH = 64 (Adreno half-wave)
+        //
+        // Reference: llama.cpp gemv_noshuffle_general.cl: LINE_STRIDE_A=M/2, BLOCK_STRIDE_A=N_SIMDGROUP*M
         let line_stride_a = ne01 / 2;
-        let block_stride_a = ne01;
+        let block_stride_a = 4 * ne01;
         let simdgroup_width: usize = 64;
 
         // SAFETY: single-threaded inference access (same pattern as kernels UnsafeCell)
@@ -3866,5 +4012,570 @@ mod gpu_buffer_shift_tests {
         assert_eq!(k_data[4 * dim], 8.0);
 
         drop(cpu_mem); // suppress unused warning
+    }
+}
+
+#[cfg(test)]
+mod noshuffle_tests {
+    use super::*;
+
+    fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
+        OpenCLBackend::new().ok().map(Arc::new)
+    }
+
+    /// Q4_0 block: 2 bytes d (f16) + 16 bytes qs (QK4_0/2 = 16 nibble bytes)
+    const BLOCK_Q4_0_SIZE: usize = 18;
+    const QK4_0: usize = 32;
+
+    /// Build a minimal Q4_0 block from known quant values.
+    ///
+    /// `d_f32`: scale (will be converted to f16)
+    /// `quants`: 32 signed 4-bit values (-8..7), stored as unsigned 0..15 in nibbles
+    fn make_q4_0_block(d_f32: f32, quants: &[i8; 32]) -> [u8; BLOCK_Q4_0_SIZE] {
+        let mut block = [0u8; BLOCK_Q4_0_SIZE];
+        let d_f16 = half::f16::from_f32(d_f32);
+        block[0..2].copy_from_slice(&d_f16.to_le_bytes());
+        // Pack 32 quants into 16 bytes: qs[i] = (q[2i] & 0xF) | (q[2i+1] << 4)
+        // In Q4_0, stored nibble = quant + 8 (unsigned 0..15)
+        for i in 0..16 {
+            let lo = (quants[i] + 8) as u8 & 0x0F;
+            let hi = (quants[i + 16] + 8) as u8 & 0x0F;
+            block[2 + i] = lo | (hi << 4);
+        }
+        block
+    }
+
+    /// Reference CPU dequant for a Q4_0 block -> 32 f32 values.
+    fn dequant_q4_0_block(block: &[u8; BLOCK_Q4_0_SIZE]) -> [f32; 32] {
+        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let mut out = [0.0f32; 32];
+        for i in 0..16 {
+            let byte = block[2 + i];
+            let lo = (byte & 0x0F) as i8 - 8;
+            let hi = ((byte >> 4) & 0x0F) as i8 - 8;
+            out[i] = lo as f32 * d;
+            out[i + 16] = hi as f32 * d;
+        }
+        out
+    }
+
+    /// Reference CPU matmul: weight (ne01 x ne00, Q4_0) * activation (ne00,) -> output (ne01,)
+    fn reference_matmul_q4_0(
+        blocks: &[[u8; BLOCK_Q4_0_SIZE]],
+        activation: &[f32],
+        ne00: usize,
+        ne01: usize,
+    ) -> Vec<f32> {
+        let blocks_per_row = ne00 / QK4_0;
+        let mut output = vec![0.0f32; ne01];
+        for row in 0..ne01 {
+            let mut sum = 0.0f32;
+            for k_blk in 0..blocks_per_row {
+                let block = &blocks[row * blocks_per_row + k_blk];
+                let dequants = dequant_q4_0_block(block);
+                for j in 0..QK4_0 {
+                    sum += dequants[j] * activation[k_blk * QK4_0 + j];
+                }
+            }
+            output[row] = sum;
+        }
+        output
+    }
+
+    /// Test that the SOA conversion + transpose produces the correct transposed layout.
+    ///
+    /// This verifies the nibble rearrangement and 2D transpose independently of GEMV.
+    #[test]
+    fn test_soa_conversion_transpose_layout() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // Small matrix: 4 rows, K=64 -> blocks_per_row=2, total 8 blocks
+        let ne01 = 4usize;
+        let ne00 = 64usize;
+        let blocks_per_row = ne00 / QK4_0;
+        let num_blocks = ne01 * blocks_per_row;
+
+        // Create blocks with known patterns
+        let mut all_blocks = Vec::new();
+        for row in 0..ne01 {
+            for k in 0..blocks_per_row {
+                let d = (row + 1) as f32 * 0.1 + k as f32 * 0.01;
+                let mut quants = [0i8; 32];
+                for j in 0..32 {
+                    quants[j] = ((row * 100 + k * 32 + j) % 15) as i8 - 7;
+                }
+                all_blocks.push(make_q4_0_block(d, &quants));
+            }
+        }
+
+        // Upload raw Q4_0 data to GPU
+        let raw_bytes: Vec<u8> = all_blocks.iter().flat_map(|b| b.iter().copied()).collect();
+        let src_buf = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                raw_bytes.len(),
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &src_buf,
+                true,
+                0,
+                &raw_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        // Run SOA conversion + transpose
+        let (q_buf, d_buf) = backend
+            .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
+            .unwrap();
+
+        // Read back transposed q and d
+        let q_total_ushort = ne01 * (ne00 / 4);
+        let mut q_transposed = vec![0u16; q_total_ushort];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                &q_buf,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(
+                    q_transposed.as_mut_ptr() as *mut u8,
+                    q_total_ushort * 2,
+                ),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        let mut d_transposed = vec![0u16; num_blocks];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                &d_buf,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(
+                    d_transposed.as_mut_ptr() as *mut u8,
+                    num_blocks * 2,
+                ),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        // Verify d transpose: d_transposed[k * ne01 + row] == original d[row][k]
+        for row in 0..ne01 {
+            for k in 0..blocks_per_row {
+                let original_d = half::f16::from_le_bytes([
+                    all_blocks[row * blocks_per_row + k][0],
+                    all_blocks[row * blocks_per_row + k][1],
+                ]);
+                let transposed_d = half::f16::from_bits(d_transposed[k * ne01 + row]);
+                assert_eq!(
+                    original_d.to_bits(),
+                    transposed_d.to_bits(),
+                    "d mismatch at row={}, k={}: original={:?}, transposed={:?}",
+                    row,
+                    k,
+                    original_d,
+                    transposed_d
+                );
+            }
+        }
+
+        // Verify q transpose layout: each row's noshuffle block data should be
+        // accessible at the correct transposed position.
+        //
+        // After noshuffle conversion, block[row][k] has 16 bytes = 8 ushort.
+        // After transpose, ushort col c at row r is at q_transposed[c * ne01 + r].
+        //
+        // For row `row`, block `k`, the ushort column range is k*8..k*8+7.
+        // We can verify by computing the expected noshuffle output for each block
+        // and checking the transposed positions.
+        for row in 0..ne01 {
+            for k in 0..blocks_per_row {
+                let block = &all_blocks[row * blocks_per_row + k];
+                // Compute expected noshuffle q bytes (same logic as kernel)
+                let mut expected_q = [0u8; 16];
+                for i in 0..8 {
+                    let x0 = block[2 + 2 * i];
+                    let x1 = block[2 + 2 * i + 1];
+                    expected_q[i] = (x0 & 0x0F) | ((x1 & 0x0F) << 4);
+                    expected_q[i + 8] = ((x0 & 0xF0) >> 4) | (x1 & 0xF0);
+                }
+
+                // expected_q as 8 ushort (LE)
+                let mut expected_ushort = [0u16; 8];
+                for i in 0..8 {
+                    expected_ushort[i] =
+                        expected_q[2 * i] as u16 | ((expected_q[2 * i + 1] as u16) << 8);
+                }
+
+                // Check transposed positions: col = k*8+j, row = row
+                for j in 0..8 {
+                    let col_ushort = k * 8 + j;
+                    let transposed_val = q_transposed[col_ushort * ne01 + row];
+                    assert_eq!(
+                        expected_ushort[j], transposed_val,
+                        "q mismatch at row={}, k={}, ushort_j={}: expected={:#06x}, got={:#06x}",
+                        row, k, j, expected_ushort[j], transposed_val
+                    );
+                }
+            }
+        }
+
+        eprintln!(
+            "[PASS] SOA conversion + transpose layout verified for {}x{}",
+            ne01, ne00
+        );
+    }
+
+    /// Test that the GEMV indexing logic in the transposed layout produces correct
+    /// uint values when accessed with the kernel's stride pattern.
+    ///
+    /// This simulates the kernel's memory access pattern without actually running
+    /// the GPU kernel (no sub_group_broadcast needed).
+    #[test]
+    fn test_noshuffle_gemv_indexing() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // 4 rows, K=128 -> blocks_per_row=4
+        let ne01 = 4usize;
+        let ne00 = 128usize;
+        let blocks_per_row = ne00 / QK4_0;
+        let num_blocks = ne01 * blocks_per_row;
+
+        // Create blocks with known scale and quant patterns
+        let mut all_blocks = Vec::new();
+        for row in 0..ne01 {
+            for k in 0..blocks_per_row {
+                let d = 0.5f32;
+                let mut quants = [0i8; 32];
+                for j in 0..32 {
+                    quants[j] = ((row * 1000 + k * 32 + j) % 15) as i8 - 7;
+                }
+                all_blocks.push(make_q4_0_block(d, &quants));
+            }
+        }
+
+        // Upload and convert
+        let raw_bytes: Vec<u8> = all_blocks.iter().flat_map(|b| b.iter().copied()).collect();
+        let src_buf = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                raw_bytes.len(),
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &src_buf,
+                true,
+                0,
+                &raw_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        let (q_buf, d_buf) = backend
+            .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
+            .unwrap();
+
+        // Read back as uint (for q) and u16 (for d)
+        let q_total_uint = ne01 * ne00 / 8; // ne01 * (K/4) ushort / 2
+        let mut q_uint = vec![0u32; q_total_uint];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                &q_buf,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(q_uint.as_mut_ptr() as *mut u8, q_total_uint * 4),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        let mut d_u16 = vec![0u16; num_blocks];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                &d_buf,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(d_u16.as_mut_ptr() as *mut u8, num_blocks * 2),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        let line_stride_a = ne01 / 2;
+        let block_stride_a = 4 * ne01;
+
+        // Simulate the kernel access pattern for each row-pair and K-block
+        for gid in 0..ne01 / 2 {
+            for k in 0..blocks_per_row {
+                // Read scale (half2 = two consecutive u16 as half pair)
+                let scale_idx = gid + k * line_stride_a;
+                let scale_even = half::f16::from_bits(d_u16[scale_idx * 2]);
+                let scale_odd = half::f16::from_bits(d_u16[scale_idx * 2 + 1]);
+
+                // Expected scales
+                let row_even = 2 * gid;
+                let row_odd = 2 * gid + 1;
+                let expected_d_even = half::f16::from_le_bytes([
+                    all_blocks[row_even * blocks_per_row + k][0],
+                    all_blocks[row_even * blocks_per_row + k][1],
+                ]);
+                let expected_d_odd = half::f16::from_le_bytes([
+                    all_blocks[row_odd * blocks_per_row + k][0],
+                    all_blocks[row_odd * blocks_per_row + k][1],
+                ]);
+
+                assert_eq!(
+                    scale_even.to_bits(),
+                    expected_d_even.to_bits(),
+                    "scale even mismatch: gid={}, k={}",
+                    gid,
+                    k
+                );
+                assert_eq!(
+                    scale_odd.to_bits(),
+                    expected_d_odd.to_bits(),
+                    "scale odd mismatch: gid={}, k={}",
+                    gid,
+                    k
+                );
+
+                // Read 8 uint values (matching kernel's regA pattern)
+                for i in 0..8 {
+                    let q_idx = gid + k * block_stride_a + line_stride_a * i;
+                    assert!(
+                        q_idx < q_total_uint,
+                        "q_idx {} out of range (max {})",
+                        q_idx,
+                        q_total_uint
+                    );
+                    let val = q_uint[q_idx];
+                    let lo_ushort = (val & 0xFFFF) as u16;
+                    let hi_ushort = (val >> 16) as u16;
+
+                    // lo_ushort should be from row_even, hi_ushort from row_odd
+                    // Both at the same ushort column: k*8 + i
+                    // Compute expected from noshuffle conversion
+                    for (check_row, check_ushort, label) in
+                        [(row_even, lo_ushort, "even"), (row_odd, hi_ushort, "odd")]
+                    {
+                        let block = &all_blocks[check_row * blocks_per_row + k];
+                        let mut expected_q = [0u8; 16];
+                        for ii in 0..8 {
+                            let x0 = block[2 + 2 * ii];
+                            let x1 = block[2 + 2 * ii + 1];
+                            expected_q[ii] = (x0 & 0x0F) | ((x1 & 0x0F) << 4);
+                            expected_q[ii + 8] = ((x0 & 0xF0) >> 4) | (x1 & 0xF0);
+                        }
+                        // ushort column i within this block's 8 ushorts
+                        let expected_val =
+                            expected_q[2 * i] as u16 | ((expected_q[2 * i + 1] as u16) << 8);
+                        assert_eq!(
+                            check_ushort, expected_val,
+                            "q {} row mismatch: gid={}, k={}, i={}: got={:#06x}, expected={:#06x}",
+                            label, gid, k, i, check_ushort, expected_val
+                        );
+                    }
+                }
+            }
+        }
+
+        eprintln!("[PASS] GEMV indexing verified for {}x{}", ne01, ne00);
+    }
+
+    /// End-to-end test: compare noshuffle GEMV output against reference CPU dequant.
+    ///
+    /// On macOS (Apple GPU), the noshuffle GEMV kernel may not compile due to missing
+    /// sub_group_broadcast / cl_qcom_reqd_sub_group_size. In that case, this test
+    /// is skipped gracefully.
+    #[test]
+    fn test_noshuffle_q4_0_correctness() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // 8 rows, K=128 (small but exercises multiple blocks and row-pairs)
+        let ne01 = 8usize;
+        let ne00 = 128usize;
+        let blocks_per_row = ne00 / QK4_0;
+        let num_blocks = ne01 * blocks_per_row;
+
+        // Create blocks with non-trivial patterns
+        let mut all_blocks = Vec::new();
+        for row in 0..ne01 {
+            for k in 0..blocks_per_row {
+                let d = 0.1 + 0.05 * row as f32 + 0.01 * k as f32;
+                let mut quants = [0i8; 32];
+                for j in 0..32 {
+                    quants[j] = ((row * 7 + k * 3 + j * 5) % 15) as i8 - 7;
+                }
+                all_blocks.push(make_q4_0_block(d, &quants));
+            }
+        }
+
+        // Create activation vector
+        let mut activation = vec![0.0f32; ne00];
+        for i in 0..ne00 {
+            activation[i] = (i as f32 * 0.01).sin();
+        }
+
+        // Reference CPU result
+        let reference = reference_matmul_q4_0(&all_blocks, &activation, ne00, ne01);
+
+        // Upload Q4_0 data
+        let raw_bytes: Vec<u8> = all_blocks.iter().flat_map(|b| b.iter().copied()).collect();
+        let src_buf = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                raw_bytes.len(),
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &src_buf,
+                true,
+                0,
+                &raw_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        // Convert to noshuffle SOA + transpose
+        let (q_buf, d_buf) = backend
+            .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
+            .unwrap();
+
+        // Upload activation
+        let act_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                ne00,
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &act_buf,
+                true,
+                0,
+                std::slice::from_raw_parts(activation.as_ptr() as *const u8, ne00 * 4),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        // Allocate output
+        let dst_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                ne01,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Try running the noshuffle GEMV kernel
+        match backend.matmul_q4_0_noshuffle(&q_buf, &d_buf, &act_buf, &dst_buf, ne00, ne01) {
+            Ok(()) => {
+                backend.queue.finish().unwrap();
+
+                // Read back output
+                let mut output = vec![0.0f32; ne01];
+                unsafe {
+                    ocl::core::enqueue_read_buffer(
+                        &backend.queue,
+                        &dst_buf,
+                        true,
+                        0,
+                        std::slice::from_raw_parts_mut(output.as_mut_ptr() as *mut u8, ne01 * 4),
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )
+                    .unwrap();
+                }
+
+                // Compare with reference
+                let max_abs_error = reference
+                    .iter()
+                    .zip(output.iter())
+                    .map(|(r, o)| (r - o).abs())
+                    .fold(0.0f32, f32::max);
+
+                eprintln!("Reference: {:?}", &reference);
+                eprintln!("GPU:       {:?}", &output);
+                eprintln!("Max abs error: {}", max_abs_error);
+
+                // Q4_0 dequant introduces rounding, so allow moderate tolerance
+                assert!(
+                    max_abs_error < 0.01,
+                    "GEMV output diverges from reference: max_abs_error={} (threshold=0.01)",
+                    max_abs_error
+                );
+
+                eprintln!(
+                    "[PASS] Noshuffle GEMV correctness verified for {}x{}",
+                    ne01, ne00
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[SKIPPED] Noshuffle GEMV kernel failed to compile/dispatch (expected on \
+                     macOS without Adreno extensions): {}",
+                    e
+                );
+                // SOA conversion + transpose tests above already validate the data layout.
+            }
+        }
     }
 }

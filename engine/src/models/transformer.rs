@@ -359,6 +359,81 @@ impl TransformerModel {
         Ok(count)
     }
 
+    /// Convert all Q4_0 weight tensors to noshuffle SOA layout for Adreno-optimized GEMV.
+    ///
+    /// For each Q4_0 weight tensor on GPU, runs the SOA conversion pipeline
+    /// (GPU nibble rearrange + CPU transpose) and registers the result in the
+    /// backend's noshuffle SOA registry. After this, `matmul_q4_0()` will
+    /// automatically dispatch to the noshuffle GEMV kernel for decode (m==1).
+    ///
+    /// Returns the number of weight tensors converted.
+    #[cfg(feature = "opencl")]
+    pub fn prepare_noshuffle_buffers(&self, backend: &Arc<dyn Backend>) -> Result<usize> {
+        use crate::backend::opencl::{NoshuffleSoaEntry, OpenCLBackend, get_cl_mem};
+
+        let ocl_be = backend
+            .as_any()
+            .downcast_ref::<OpenCLBackend>()
+            .ok_or_else(|| anyhow!("Not OpenCL backend"))?;
+
+        let mut count = 0;
+
+        // Helper closure: convert one weight tensor if it is Q4_0 on GPU.
+        let process_weight = |tensor: &Tensor| -> Result<bool> {
+            if tensor.dtype() != DType::Q4_0 {
+                return Ok(false);
+            }
+            let cl_mem = get_cl_mem(tensor.buffer().as_ref())
+                .map_err(|_| anyhow!("Weight buffer has no cl_mem"))?;
+            let dims = tensor.shape().dims();
+            // Weight shape: [rows, cols] = [ne01, ne00]
+            let (ne01, ne00) = (dims[0], dims[1]);
+            let num_blocks = ne01 * ne00 / 32; // QK4_0 = 32
+
+            let (q_buf, d_buf) =
+                ocl_be.convert_q4_0_to_noshuffle(cl_mem, num_blocks, ne00, ne01)?;
+
+            let key = cl_mem.as_ptr() as usize;
+            ocl_be.register_noshuffle_soa(
+                key,
+                NoshuffleSoaEntry {
+                    q_buf,
+                    d_buf,
+                    ne00,
+                    ne01,
+                },
+            );
+            Ok(true)
+        };
+
+        for layer in &self.layers {
+            for weight in [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ] {
+                if process_weight(weight)? {
+                    count += 1;
+                }
+            }
+        }
+
+        // lm_head (only if on GPU)
+        if !self.lm_head_on_cpu && process_weight(&self.lm_head)? {
+            count += 1;
+        }
+
+        eprintln!(
+            "[Backend] Q4_0 noshuffle SOA prepared: {} weight tensors",
+            count
+        );
+        Ok(count)
+    }
+
     /// Migrate all model weight tensors to CUDA pinned host memory (CudaHostBuffer).
     ///
     /// Uses `Backend::copy_from()` to allocate pinned memory and memcpy weight data.
