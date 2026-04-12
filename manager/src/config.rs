@@ -244,16 +244,36 @@ impl Default for TriggerConfig {
     }
 }
 
-fn default_ewma_alpha() -> f32 { 0.875 }
-fn default_temp_safe() -> f32 { 35.0 }
-fn default_temp_critical() -> f32 { 50.0 }
-fn default_tbt_enter() -> f64 { 0.30 }
-fn default_tbt_exit() -> f64 { 0.10 }
-fn default_tbt_warmup() -> u32 { 20 }
-fn default_mem_enter() -> f64 { 0.80 }
-fn default_mem_exit() -> f64 { 0.60 }
-fn default_temp_enter() -> f64 { 0.70 }
-fn default_temp_exit() -> f64 { 0.50 }
+fn default_ewma_alpha() -> f32 {
+    0.875
+}
+fn default_temp_safe() -> f32 {
+    35.0
+}
+fn default_temp_critical() -> f32 {
+    50.0
+}
+fn default_tbt_enter() -> f64 {
+    0.30
+}
+fn default_tbt_exit() -> f64 {
+    0.10
+}
+fn default_tbt_warmup() -> u32 {
+    20
+}
+fn default_mem_enter() -> f64 {
+    0.80
+}
+fn default_mem_exit() -> f64 {
+    0.60
+}
+fn default_temp_enter() -> f64 {
+    0.70
+}
+fn default_temp_exit() -> f64 {
+    0.50
+}
 
 #[cfg(feature = "hierarchical")]
 mod hierarchical_config {

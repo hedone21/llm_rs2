@@ -1,8 +1,8 @@
 # NDK 경로 설정
-export NDK_HOME=/opt/android-ndk
+export NDK_HOME=/opt/homebrew/share/android-ndk
 # 호스트 OS
-# export HOST_TAG=darwin-x86_64  # macOS
-export HOST_TAG=linux-x86_64     # Linux (Arch)
+export HOST_TAG=darwin-x86_64  # macOS
+# export HOST_TAG=linux-x86_64     # Linux (Arch)
 export TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG
 
 # 컴파일러 경로 지정 (API 레벨 24 예시)

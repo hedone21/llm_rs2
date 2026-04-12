@@ -265,15 +265,14 @@ impl EwmaReliefTable {
     }
 
     fn save(&self, path: &Path) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(&self.entries)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(&self.entries).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
     fn load(path: &Path, alpha: f32, defaults: HashMap<String, Vec<f32>>) -> std::io::Result<Self> {
         let json = std::fs::read_to_string(path)?;
-        let entries: HashMap<String, ReliefEntry> = serde_json::from_str(&json)
-            .map_err(std::io::Error::other)?;
+        let entries: HashMap<String, ReliefEntry> =
+            serde_json::from_str(&json).map_err(std::io::Error::other)?;
         Ok(Self {
             entries,
             alpha,
