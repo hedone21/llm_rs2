@@ -1920,27 +1920,77 @@ impl CpuBackendNeon {
         out_data.par_chunks_mut(chunk_size).enumerate().for_each(
             |(chunk_idx, chunk): (usize, &mut [f32])| {
                 let start_idx = chunk_idx * chunk_size;
-                for (local_i, out_val) in chunk.iter_mut().enumerate() {
-                    let idx = start_idx + local_i;
-                    let i = idx / n;
-                    let j = idx % n;
 
-                    let b_offset = j * nb_k;
-                    let b_row_node = unsafe { b.as_ptr() as *const BlockQ4_0 };
-                    let b_row_ptr = unsafe { b_row_node.add(b_offset) };
+                #[cfg(target_arch = "aarch64")]
+                let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+                #[cfg(not(target_arch = "aarch64"))]
+                let use_i8mm = false;
 
-                    // We need pointer to the start of the row in the vector
-                    let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
+                if use_i8mm {
+                    // i8mm 2-row path: process adjacent weight rows in pairs
+                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
+                    let mut local_i = 0;
+                    while local_i < chunk.len() {
+                        let idx = start_idx + local_i;
+                        let i = idx / n;
+                        let j = idx % n;
+                        let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
 
-                    let mut sum = 0.0;
-                    unsafe {
-                        if std::arch::is_aarch64_feature_detected!("dotprod") {
-                            self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_row_ptr, a_row_ptr);
+                        // Pair adjacent weight rows if within same activation row
+                        if local_i + 1 < chunk.len() && j + 1 < n {
+                            let b0 = unsafe { b_row_node.add(j * nb_k) };
+                            let b1 = unsafe { b_row_node.add((j + 1) * nb_k) };
+                            // Safety: b0/b1 point to valid BlockQ4_0 rows within b tensor,
+                            // a_row_ptr points to valid BlockQ8_0 row within a_q8.
+                            // chunk[local_i..local_i+2] is within bounds (checked above).
+                            // split_at_mut to satisfy borrow checker for two disjoint elements.
+                            let (left, right) = chunk[local_i..].split_at_mut(1);
+                            unsafe {
+                                self.vec_dot_q4_0_q8_0_i8mm(
+                                    k,
+                                    &mut left[0],
+                                    &mut right[0],
+                                    b0,
+                                    b1,
+                                    a_row_ptr,
+                                );
+                            }
+                            local_i += 2;
                         } else {
-                            self.vec_dot_q4_0_q8_0(k, &mut sum, b_row_ptr, a_row_ptr);
+                            // Last weight row in activation row or last element in chunk
+                            let b_ptr = unsafe { b_row_node.add(j * nb_k) };
+                            let mut sum = 0.0;
+                            // Safety: fallback to sdot for unpaired row.
+                            // b_ptr and a_row_ptr are valid (same invariants as above).
+                            unsafe {
+                                self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_ptr, a_row_ptr);
+                            }
+                            chunk[local_i] = sum;
+                            local_i += 1;
                         }
                     }
-                    *out_val = sum;
+                } else {
+                    // Existing sdot / basic NEON path
+                    for (local_i, out_val) in chunk.iter_mut().enumerate() {
+                        let idx = start_idx + local_i;
+                        let i = idx / n;
+                        let j = idx % n;
+
+                        let b_offset = j * nb_k;
+                        let b_row_node = b.as_ptr() as *const BlockQ4_0;
+                        let b_row_ptr = unsafe { b_row_node.add(b_offset) };
+                        let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
+
+                        let mut sum = 0.0;
+                        unsafe {
+                            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                                self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_row_ptr, a_row_ptr);
+                            } else {
+                                self.vec_dot_q4_0_q8_0(k, &mut sum, b_row_ptr, a_row_ptr);
+                            }
+                        }
+                        *out_val = sum;
+                    }
                 }
             },
         );
