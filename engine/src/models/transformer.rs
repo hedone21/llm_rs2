@@ -925,8 +925,11 @@ impl TransformerModel {
         use crate::backend::opencl::plan::*;
         use crate::core::kv_cache::KVLayout;
 
-        // GPU plan only supports F16 weights (kernel_mul_mat_f16_f32)
-        if self.layers[0].wq.dtype() != crate::core::buffer::DType::F16 {
+        let weight_dtype = self.layers[0].wq.dtype();
+        let is_f16 = weight_dtype == crate::core::buffer::DType::F16;
+        let is_q4_0 = weight_dtype == crate::core::buffer::DType::Q4_0;
+        // GPU plan supports F16 weights or Q4_0 with noshuffle SOA conversion
+        if !is_f16 && !is_q4_0 {
             return None;
         }
 
@@ -970,6 +973,36 @@ impl TransformerModel {
             ((n_kv_heads * head_dim) as i32, head_dim as i32)
         };
 
+        let ocl_backend = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
+
+        // For Q4_0 weights, verify noshuffle SOA entries are available.
+        // If any weight lacks a q_img (noshuffle image), fall back to legacy path.
+        if is_q4_0 {
+            let first_wq_key = cl!(self.layers[0].wq).as_ptr() as usize;
+            match ocl_backend.lookup_noshuffle_soa(first_wq_key) {
+                Some(e) if e.q_img.is_some() => {}
+                _ => return None,
+            }
+        }
+
+        // Helper: lookup noshuffle SOA entry and return NoshufflePlanEntry if available.
+        let ns_entry = |tensor: &Tensor| -> Option<NoshufflePlanEntry<'_>> {
+            if !is_q4_0 {
+                return None;
+            }
+            let key = cl!(tensor).as_ptr() as usize;
+            let entry = ocl_backend.lookup_noshuffle_soa(key)?;
+            let q_img = entry.q_img.as_ref()?;
+            Some(NoshufflePlanEntry {
+                q_img,
+                d_buf: &entry.d_buf,
+                ne00: entry.ne00,
+                ne01: entry.ne01,
+            })
+        };
+
         // Collect per-layer buffer handles
         let mut layer_bufs = Vec::new();
         let mut kv_bufs_vec = Vec::new();
@@ -995,6 +1028,13 @@ impl TransformerModel {
                 bq,
                 bk,
                 bv,
+                wq_noshuffle: ns_entry(&layer.wq),
+                wk_noshuffle: ns_entry(&layer.wk),
+                wv_noshuffle: ns_entry(&layer.wv),
+                wo_noshuffle: ns_entry(&layer.wo),
+                w_gate_noshuffle: ns_entry(&layer.w_gate),
+                w_up_noshuffle: ns_entry(&layer.w_up),
+                w_down_noshuffle: ns_entry(&layer.w_down),
             });
             kv_bufs_vec.push(KvBufs {
                 k_cache: cl!(kv_caches[i].k_buffer),
@@ -1002,9 +1042,54 @@ impl TransformerModel {
             });
         }
 
-        let ocl_backend = backend
-            .as_any()
-            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
+        // Build noshuffle GEMV programs if Q4_0 (compile per unique ne01 dimension).
+        let noshuffle_programs = if is_q4_0 {
+            // Collect unique ne01 values from all noshuffle entries
+            let mut ne01_set: Vec<usize> = layer_bufs
+                .iter()
+                .flat_map(|lb| {
+                    [
+                        lb.wq_noshuffle.as_ref(),
+                        lb.wk_noshuffle.as_ref(),
+                        lb.wv_noshuffle.as_ref(),
+                        lb.wo_noshuffle.as_ref(),
+                        lb.w_gate_noshuffle.as_ref(),
+                        lb.w_up_noshuffle.as_ref(),
+                        lb.w_down_noshuffle.as_ref(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .map(|e| e.ne01)
+                })
+                .collect();
+            // Also include lm_head ne01 if applicable
+            if !self.lm_head_on_cpu && let Some(ref e) = ns_entry(&self.lm_head) {
+                ne01_set.push(e.ne01);
+            }
+            ne01_set.sort_unstable();
+            ne01_set.dedup();
+            match build_noshuffle_programs(
+                &ocl_backend.device,
+                &ocl_backend.context,
+                &ocl_backend.cl_opts,
+                &ne01_set,
+            ) {
+                Ok(progs) => Some(progs),
+                Err(e) => {
+                    log::warn!("Failed to build noshuffle programs for plan: {}", e);
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
+
+        // lm_head noshuffle entry (Q4_0 on GPU only)
+        let lm_head_noshuffle = if !self.lm_head_on_cpu {
+            ns_entry(&self.lm_head)
+        } else {
+            None
+        };
 
         // Mirror the runtime gate in `attention_gen` — flash attention has no
         // score output, so an active GPU score accumulator forces the legacy
@@ -1053,14 +1138,17 @@ impl TransformerModel {
             kv_pos_stride,
             kv_head_stride,
             is_nosub: ocl_backend.is_nosub(),
+            noshuffle_programs,
+            lm_head_noshuffle,
         };
 
         match build_full_plan(&full_config) {
             Ok(plan) => {
                 log::info!(
-                    "GPU kernel plan built ({} layers, capacity={})",
+                    "GPU kernel plan built ({} layers, capacity={}, q4_noshuffle={})",
                     self.layers.len(),
-                    capacity
+                    capacity,
+                    is_q4_0,
                 );
                 Some(plan)
             }
@@ -1175,6 +1263,14 @@ impl TransformerModel {
                 bq: None,
                 bk: None,
                 bv: None,
+                // KIVI currently only supports F16 weights — no noshuffle.
+                wq_noshuffle: None,
+                wk_noshuffle: None,
+                wv_noshuffle: None,
+                wo_noshuffle: None,
+                w_gate_noshuffle: None,
+                w_up_noshuffle: None,
+                w_down_noshuffle: None,
             });
 
             let plan_bufs = kv_caches[i].get_plan_gpu_buffers()?;

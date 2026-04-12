@@ -226,7 +226,7 @@ pub struct OpenCLBackend {
     gpu_score_acc: UnsafeCell<Option<gpu_score::GpuScoreAccumulator>>,
 
     // Cached compiler options for building additional programs (e.g., score_reduce.cl).
-    cl_opts: String,
+    pub cl_opts: String,
 
     // CL_DEVICE_MAX_MEM_ALLOC_SIZE: maximum single buffer allocation (bytes).
     max_mem_alloc_size: usize,

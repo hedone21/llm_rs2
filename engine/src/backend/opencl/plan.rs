@@ -616,6 +616,33 @@ pub struct LayerPlanConfig<'a> {
     /// `AttentionVariant::Standard` because the flash kernel has no score
     /// output.
     pub needs_attention_scores: bool,
+    // -- Q4_0 noshuffle matmul support --
+    /// Pre-compiled noshuffle GEMV programs, keyed by ne01 (M dimension).
+    /// When `Some`, matmul steps use Q4_0 noshuffle dispatch instead of F16.
+    pub noshuffle_programs: Option<&'a std::collections::HashMap<usize, ocl::Program>>,
+    /// Per-weight noshuffle SOA entries (q_img + d_buf + dimensions).
+    /// When `noshuffle_programs` is `Some`, these must also be `Some`.
+    pub wq_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub wk_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub wv_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub wo_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub w_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub w_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub w_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
+}
+
+/// Lightweight reference to a noshuffle SOA entry for plan building.
+/// Avoids coupling plan.rs to NoshuffleSoaEntry's full layout.
+#[derive(Clone, Copy)]
+pub struct NoshufflePlanEntry<'a> {
+    /// image1d_buffer_t wrapping SOA nibbles (R32UI)
+    pub q_img: &'a Mem,
+    /// SOA scales buffer (half2*)
+    pub d_buf: &'a Mem,
+    /// K dimension (elements per row)
+    pub ne00: usize,
+    /// M dimension (number of output rows)
+    pub ne01: usize,
 }
 
 /// N threshold for switching from N_DST=2 (128 rows/WG) to N_DST=4 (256 rows/WG) GEMV kernel.
@@ -713,6 +740,147 @@ fn make_f16_matmul_step(
         op_tag,
         retained_bufs: vec![],
     })
+}
+
+/// Helper: create a dedicated kernel and pre-bind Q4_0 noshuffle GEMV arguments.
+///
+/// Must mirror `OpenClBackend::matmul_q4_0_noshuffle` dispatch exactly.
+///
+/// The noshuffle GEMV kernel uses image1d_buffer_t for both weight nibbles (R32UI)
+/// and activation (RGBA32F). The activation image wraps the source F32 buffer and
+/// is retained in `retained_bufs` so its cl_mem stays valid for the plan's lifetime.
+///
+/// Kernel args:
+///   0: weight nibbles image (image1d_buffer_t, R32UI)
+///   1: weight scales (global half2*)
+///   2: activation image (image1d_buffer_t, RGBA32F)
+///   3: output buffer (global float*)
+///   4: ne00 (K dimension, i32)
+///   5: ne01 (M dimension, i32)
+///
+/// Dispatch: global=[ne01/2, N_SIMDGROUP=4, 1], local=[64, 4, 1], ndim=2.
+#[allow(clippy::too_many_arguments)]
+fn make_q4_0_noshuffle_matmul_step(
+    program: &ocl::Program,
+    context: &ocl::core::Context,
+    q_img: &Mem,
+    d_buf: &Mem,
+    src_buf: &Mem,
+    dst_buf: &Mem,
+    ne00: usize,
+    ne01: usize,
+    op_tag: OpTag,
+) -> Result<KernelStep> {
+    let kernel = ocl::core::create_kernel(program, "kernel_gemv_noshuffle_q4_0")
+        .context("create kernel_gemv_noshuffle_q4_0 for plan")?;
+
+    // Create activation image1d_buffer_t (RGBA32F) wrapping the F32 source buffer.
+    // Each texel = float4 (4 floats), so width = ne00 / 4.
+    // SAFETY: src_buf has at least ne00 * sizeof(f32) bytes, and ne00 is always a
+    // multiple of 4 for Q4_0 (QK4_0=32).
+    let act_img = {
+        use ocl::core::{
+            ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat, MemObjectType,
+        };
+        let fmt = ImageFormat::new(ImageChannelOrder::Rgba, ImageChannelDataType::Float);
+        let desc = ImageDescriptor::new(
+            MemObjectType::Image1dBuffer,
+            ne00 / 4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(src_buf.clone()),
+        );
+        unsafe {
+            ocl::core::create_image(
+                context,
+                ocl::core::MEM_READ_ONLY,
+                &fmt,
+                &desc,
+                None::<&[f32]>,
+                None,
+            )?
+        }
+    };
+
+    let ne00_i = ne00 as i32;
+    let ne01_i = ne01 as i32;
+
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(q_img))?;
+        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(d_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(&act_img))?;
+        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::mem(dst_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::scalar(&ne00_i))?;
+        ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&ne01_i))?;
+    }
+
+    let simdgroup_width: usize = 64;
+    let n_simdgroup: usize = 4;
+    let global_work_size = [ne01 / 2, n_simdgroup, 1];
+    let local_work_size = [simdgroup_width, n_simdgroup, 1];
+
+    Ok(KernelStep {
+        kernel,
+        ndim: 2,
+        global_work_size,
+        local_work_size: Some(local_work_size),
+        dynamic_args: vec![],
+        op_tag,
+        retained_bufs: vec![act_img],
+    })
+}
+
+/// Build noshuffle GEMV programs, keyed by ne01 (M dimension).
+///
+/// Each unique ne01 requires different compile-time defines (LINE_STRIDE_A,
+/// BLOCK_STRIDE_A). Returns a HashMap that `make_q4_0_noshuffle_matmul_step`
+/// indexes into for kernel creation.
+///
+/// Tries vector sub_group_broadcast first (Adreno 830+), falls back to scalar.
+pub fn build_noshuffle_programs(
+    device: &ocl::Device,
+    context: &ocl::Context,
+    cl_opts: &str,
+    ne01_set: &[usize],
+) -> Result<std::collections::HashMap<usize, ocl::Program>> {
+    let gemv_src = include_str!("../../../kernels/gemv_noshuffle_q4_0.cl");
+    let mut programs = std::collections::HashMap::new();
+
+    for &ne01 in ne01_set {
+        if programs.contains_key(&ne01) {
+            continue;
+        }
+        let line_stride_a = ne01 / 2;
+        let block_stride_a = 4 * ne01;
+        let simdgroup_width: usize = 64;
+        let defines = format!(
+            "{} -DLINE_STRIDE_A={} -DBLOCK_STRIDE_A={} -DSIMDGROUP_WIDTH={}",
+            cl_opts, line_stride_a, block_stride_a, simdgroup_width
+        );
+
+        // Try vector sub_group_broadcast first (Adreno 830+ / driver v47+)
+        let defines_vec = format!("{} -DVECTOR_SUB_GROUP_BROADCAT", defines);
+        let program = match ocl::Program::builder()
+            .devices(device)
+            .src(gemv_src)
+            .cmplr_opt(&defines_vec)
+            .build(context)
+        {
+            Ok(p) => p,
+            Err(_) => ocl::Program::builder()
+                .devices(device)
+                .src(gemv_src)
+                .cmplr_opt(&defines)
+                .build(context)
+                .with_context(|| format!("build noshuffle program for ne01={}", ne01))?,
+        };
+        programs.insert(ne01, program);
+    }
+
+    Ok(programs)
 }
 
 /// Build a pre-bound `KernelStep` that dispatches `flash_attn_f32_f16_q1`.
@@ -910,17 +1078,34 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     // 2. matmul Q (residual -> q)
     // -----------------------------------------------------------------------
-    steps_pre_kv.push(make_f16_matmul_step(
-        config.f16_program,
-        config.residual_buf,
-        config.wq_buf,
-        config.q_buf,
-        config.n_q,
-        k,
-        OpTag::MatmulQKV,
-        None,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.wq_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for wq ne01")?;
+        steps_pre_kv.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.residual_buf,
+            config.q_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulQKV,
+        )?);
+    } else {
+        steps_pre_kv.push(make_f16_matmul_step(
+            config.f16_program,
+            config.residual_buf,
+            config.wq_buf,
+            config.q_buf,
+            config.n_q,
+            k,
+            OpTag::MatmulQKV,
+            None,
+            config.is_nosub,
+        )?);
+    }
 
     // Optional: add Q bias (Qwen2 etc.) — non-bias models have bq_buf = None.
     if let Some(bq) = config.bq_buf {
@@ -936,17 +1121,34 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     // 3. matmul K (residual -> k)
     // -----------------------------------------------------------------------
-    steps_pre_kv.push(make_f16_matmul_step(
-        config.f16_program,
-        config.residual_buf,
-        config.wk_buf,
-        config.k_buf,
-        config.n_k,
-        k,
-        OpTag::MatmulQKV,
-        None,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.wk_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for wk ne01")?;
+        steps_pre_kv.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.residual_buf,
+            config.k_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulQKV,
+        )?);
+    } else {
+        steps_pre_kv.push(make_f16_matmul_step(
+            config.f16_program,
+            config.residual_buf,
+            config.wk_buf,
+            config.k_buf,
+            config.n_k,
+            k,
+            OpTag::MatmulQKV,
+            None,
+            config.is_nosub,
+        )?);
+    }
 
     // Optional: add K bias (Qwen2 etc.) — non-bias models have bk_buf = None.
     if let Some(bk) = config.bk_buf {
@@ -962,17 +1164,34 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     // 4. matmul V (residual -> v)
     // -----------------------------------------------------------------------
-    steps_pre_kv.push(make_f16_matmul_step(
-        config.f16_program,
-        config.residual_buf,
-        config.wv_buf,
-        config.v_buf,
-        config.n_v,
-        k,
-        OpTag::MatmulQKV,
-        None,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.wv_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for wv ne01")?;
+        steps_pre_kv.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.residual_buf,
+            config.v_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulQKV,
+        )?);
+    } else {
+        steps_pre_kv.push(make_f16_matmul_step(
+            config.f16_program,
+            config.residual_buf,
+            config.wv_buf,
+            config.v_buf,
+            config.n_v,
+            k,
+            OpTag::MatmulQKV,
+            None,
+            config.is_nosub,
+        )?);
+    }
 
     // Optional: add V bias (Qwen2 etc.) — non-bias models have bv_buf = None.
     if let Some(bv) = config.bv_buf {
@@ -1203,17 +1422,34 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     let mut steps_post_attn = Vec::with_capacity(7);
 
     // 9. matmul Wo (out_attn -> attn_out)
-    steps_post_attn.push(make_f16_matmul_step(
-        config.f16_program,
-        config.out_attn_buf,
-        config.wo_buf,
-        config.attn_out_buf,
-        dim,
-        dim,
-        OpTag::MatmulWo,
-        None,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.wo_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for wo ne01")?;
+        steps_post_attn.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.out_attn_buf,
+            config.attn_out_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulWo,
+        )?);
+    } else {
+        steps_post_attn.push(make_f16_matmul_step(
+            config.f16_program,
+            config.out_attn_buf,
+            config.wo_buf,
+            config.attn_out_buf,
+            dim,
+            dim,
+            OpTag::MatmulWo,
+            None,
+            config.is_nosub,
+        )?);
+    }
 
     // 10. add_rms_norm_oop (x += attn_out, then norm -> residual)
     {
@@ -1246,30 +1482,64 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     }
 
     // 11. matmul gate (residual -> gate)
-    steps_post_attn.push(make_f16_matmul_step(
-        config.f16_program,
-        config.residual_buf,
-        config.w_gate_buf,
-        config.gate_buf,
-        config.ffn_hidden,
-        k,
-        OpTag::MatmulGateUp,
-        config.f16_l4_program,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.w_gate_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for w_gate ne01")?;
+        steps_post_attn.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.residual_buf,
+            config.gate_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulGateUp,
+        )?);
+    } else {
+        steps_post_attn.push(make_f16_matmul_step(
+            config.f16_program,
+            config.residual_buf,
+            config.w_gate_buf,
+            config.gate_buf,
+            config.ffn_hidden,
+            k,
+            OpTag::MatmulGateUp,
+            config.f16_l4_program,
+            config.is_nosub,
+        )?);
+    }
 
     // 12. matmul up (residual -> up)
-    steps_post_attn.push(make_f16_matmul_step(
-        config.f16_program,
-        config.residual_buf,
-        config.w_up_buf,
-        config.up_buf,
-        config.ffn_hidden,
-        k,
-        OpTag::MatmulGateUp,
-        config.f16_l4_program,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.w_up_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for w_up ne01")?;
+        steps_post_attn.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.residual_buf,
+            config.up_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulGateUp,
+        )?);
+    } else {
+        steps_post_attn.push(make_f16_matmul_step(
+            config.f16_program,
+            config.residual_buf,
+            config.w_up_buf,
+            config.up_buf,
+            config.ffn_hidden,
+            k,
+            OpTag::MatmulGateUp,
+            config.f16_l4_program,
+            config.is_nosub,
+        )?);
+    }
 
     // 13. silu_mul (gate = silu(gate) * up)
     {
@@ -1293,17 +1563,34 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     }
 
     // 14. matmul down (gate -> down)
-    steps_post_attn.push(make_f16_matmul_step(
-        config.f16_program,
-        config.gate_buf,
-        config.w_down_buf,
-        config.down_buf,
-        dim,
-        config.ffn_hidden,
-        OpTag::MatmulDown,
-        None,
-        config.is_nosub,
-    )?);
+    if let (Some(ns), Some(progs)) = (&config.w_down_noshuffle, config.noshuffle_programs) {
+        let prog = progs
+            .get(&ns.ne01)
+            .context("noshuffle program for w_down ne01")?;
+        steps_post_attn.push(make_q4_0_noshuffle_matmul_step(
+            prog,
+            config.context.as_core(),
+            ns.q_img,
+            ns.d_buf,
+            config.gate_buf,
+            config.down_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulDown,
+        )?);
+    } else {
+        steps_post_attn.push(make_f16_matmul_step(
+            config.f16_program,
+            config.gate_buf,
+            config.w_down_buf,
+            config.down_buf,
+            dim,
+            config.ffn_hidden,
+            OpTag::MatmulDown,
+            None,
+            config.is_nosub,
+        )?);
+    }
 
     // 15. add_assign (x += down)
     {
@@ -1392,6 +1679,12 @@ pub struct FullPlanConfig<'a> {
     pub kv_head_stride: i32,
     /// Whether the device lacks subgroup support (nosub fallback path).
     pub is_nosub: bool,
+    // -- Q4_0 noshuffle matmul support --
+    /// Pre-compiled noshuffle GEMV programs, keyed by ne01 (M dimension).
+    /// When `Some`, layers with noshuffle entries use Q4_0 GEMV kernels.
+    pub noshuffle_programs: Option<std::collections::HashMap<usize, ocl::Program>>,
+    /// Per-layer noshuffle SOA entries for lm_head. `None` for F16 or CPU lm_head.
+    pub lm_head_noshuffle: Option<NoshufflePlanEntry<'a>>,
 }
 
 /// Per-layer weight buffer references.
@@ -1411,6 +1704,14 @@ pub struct LayerBufs<'a> {
     pub bq: Option<&'a Mem>,
     pub bk: Option<&'a Mem>,
     pub bv: Option<&'a Mem>,
+    // -- Q4_0 noshuffle SOA entries (optional, None for F16 weights) --
+    pub wq_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub wk_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub wv_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub wo_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub w_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub w_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub w_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
 }
 
 /// Per-layer KV cache buffer references.
@@ -1478,6 +1779,14 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             flash_attn_f32_f16_program_dk64: config.flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128: config.flash_attn_f32_f16_program_dk128,
             needs_attention_scores: config.needs_attention_scores,
+            noshuffle_programs: config.noshuffle_programs.as_ref(),
+            wq_noshuffle: lb.wq_noshuffle,
+            wk_noshuffle: lb.wk_noshuffle,
+            wv_noshuffle: lb.wv_noshuffle,
+            wo_noshuffle: lb.wo_noshuffle,
+            w_gate_noshuffle: lb.w_gate_noshuffle,
+            w_up_noshuffle: lb.w_up_noshuffle,
+            w_down_noshuffle: lb.w_down_noshuffle,
         };
         layers.push(
             build_layer_plan(&layer_config)
@@ -1523,20 +1832,40 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     // lm_head matmul: x [1, dim] × lm_head [vocab, dim]^T → logits [1, vocab]
     // None when lm_head is on CPU (large tied embedding that exceeds GPU alloc limit).
     let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
-        Some(
-            make_f16_matmul_step(
-                config.f16_program,
-                config.x_buf,
-                lm_head_buf,
-                config.logits_buf,
-                config.vocab_size,
-                config.dim,
-                OpTag::LmHead,
-                config.f16_l4_program,
-                config.is_nosub,
+        if let (Some(ns), Some(progs)) = (&config.lm_head_noshuffle, &config.noshuffle_programs) {
+            let prog = progs
+                .get(&ns.ne01)
+                .context("noshuffle program for lm_head ne01")?;
+            Some(
+                make_q4_0_noshuffle_matmul_step(
+                    prog,
+                    config.context.as_core(),
+                    ns.q_img,
+                    ns.d_buf,
+                    config.x_buf,
+                    config.logits_buf,
+                    ns.ne00,
+                    ns.ne01,
+                    OpTag::LmHead,
+                )
+                .context("build lm_head noshuffle matmul step")?,
             )
-            .context("build lm_head matmul step")?,
-        )
+        } else {
+            Some(
+                make_f16_matmul_step(
+                    config.f16_program,
+                    config.x_buf,
+                    lm_head_buf,
+                    config.logits_buf,
+                    config.vocab_size,
+                    config.dim,
+                    OpTag::LmHead,
+                    config.f16_l4_program,
+                    config.is_nosub,
+                )
+                .context("build lm_head matmul step")?,
+            )
+        }
     } else {
         None
     };
@@ -2011,6 +2340,15 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             flash_attn_f32_f16_program_dk64: None,
             flash_attn_f32_f16_program_dk128: None,
             needs_attention_scores: false,
+            // KIVI currently only supports F16 weights — no noshuffle.
+            noshuffle_programs: None,
+            wq_noshuffle: None,
+            wk_noshuffle: None,
+            wv_noshuffle: None,
+            wo_noshuffle: None,
+            w_gate_noshuffle: None,
+            w_up_noshuffle: None,
+            w_down_noshuffle: None,
         };
         layers.push(
             build_kivi_layer_plan(
