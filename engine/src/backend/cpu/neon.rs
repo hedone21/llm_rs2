@@ -8,7 +8,9 @@ use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::arch::aarch64::*;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Mutex, OnceLock};
 
 /// Runtime toggle: when true, F16 matmul uses Rayon instead of SpinPool.
 /// Set via `--use-rayon` CLI flag for A/B benchmarking.
@@ -1952,21 +1954,56 @@ impl CpuBackendNeon {
 
         let num_threads = rayon::current_num_threads();
 
+        // Try to get interleaved weights for i8mm 4-row kernel
+        let il_ptr = if use_i8mm && n % 4 == 0 {
+            get_interleaved_q4(b, nb_k, n)
+        } else {
+            None
+        };
+
         if m == 1 {
             // === GEMV: adaptive chunk size, flat N-parallel ===
             let target_tasks = num_threads * 4;
-            let chunk_size = {
+            let chunk_size = if il_ptr.is_some() {
+                // 4-row interleaved: round up to multiple of 4
                 let cs = (n + target_tasks - 1) / target_tasks;
-                (cs + 1) & !1 // round up to even for i8mm
+                (cs + 3) & !3
+            } else {
+                let cs = (n + target_tasks - 1) / target_tasks;
+                (cs + 1) & !1
             };
 
             out_data.par_chunks_mut(chunk_size).enumerate().for_each(
                 |(chunk_idx, chunk): (usize, &mut [f32])| {
                     let start_idx = chunk_idx * chunk_size;
-                    let b_base = b.as_ptr() as *const BlockQ4_0;
                     let a_ptr = unsafe { a_q8_ptr.ptr() };
 
-                    if use_i8mm {
+                    if let Some(il) = il_ptr {
+                        // i8mm 4-row interleaved path — no weight vzip overhead
+                        let il_base = il as *const u8;
+                        let mut li = 0;
+                        while li + 3 < chunk.len() && start_idx + li + 3 < n {
+                            let j = start_idx + li;
+                            let group = j / 4; // which 4-row group
+                            let il_group_ptr = unsafe { il_base.add(group * nb_k * IL_BLOCK_SIZE) };
+                            let mut results = [0.0f32; 4];
+                            unsafe {
+                                self.vec_dot_q4_0_q8_0_i8mm_4rows_il(nb_k, il_group_ptr, a_ptr, &mut results);
+                            }
+                            chunk[li..li + 4].copy_from_slice(&results);
+                            li += 4;
+                        }
+                        // Tail: fallback to non-interleaved sdot
+                        let b_base = b.as_ptr() as *const BlockQ4_0;
+                        while li < chunk.len() {
+                            let j = start_idx + li;
+                            let mut sum = 0.0;
+                            unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add(j * nb_k), a_ptr) }
+                            chunk[li] = sum;
+                            li += 1;
+                        }
+                    } else if use_i8mm {
+                        let b_base = b.as_ptr() as *const BlockQ4_0;
                         let mut li = 0;
                         while li < chunk.len() {
                             let j = start_idx + li;
@@ -1987,12 +2024,14 @@ impl CpuBackendNeon {
                             }
                         }
                     } else if use_dotprod {
+                        let b_base = b.as_ptr() as *const BlockQ4_0;
                         for (li, out_val) in chunk.iter_mut().enumerate() {
                             let mut sum = 0.0;
                             unsafe { self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_base.add((start_idx + li) * nb_k), a_ptr) }
                             *out_val = sum;
                         }
                     } else {
+                        let b_base = b.as_ptr() as *const BlockQ4_0;
                         for (li, out_val) in chunk.iter_mut().enumerate() {
                             let mut sum = 0.0;
                             unsafe { self.vec_dot_q4_0_q8_0(k, &mut sum, b_base.add((start_idx + li) * nb_k), a_ptr) }
@@ -2003,17 +2042,17 @@ impl CpuBackendNeon {
             );
         } else {
             // === GEMM (M>1): N-major tiled ===
-            // Weight rows are shared across M activation rows within each N-chunk,
-            // improving cache reuse. Mirrors the F16 GEMM tiling strategy.
-            const NR: usize = 2; // i8mm natural pair
+            // Weight rows are shared across M activation rows within each N-chunk.
+            let nr = if il_ptr.is_some() { 4usize } else { 2 };
             let target_n_chunks = num_threads * 4;
-            let rows_per_chunk = ((n + target_n_chunks - 1) / target_n_chunks + NR - 1) / NR * NR;
-            let rows_per_chunk = rows_per_chunk.max(NR);
+            let rows_per_chunk = ((n + target_n_chunks - 1) / target_n_chunks + nr - 1) / nr * nr;
+            let rows_per_chunk = rows_per_chunk.max(nr);
             let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
 
             let b_base_usize = b.as_ptr() as usize;
             let a_q8_usize = a_q8_ptr.ptr() as usize;
             let out_ptr_usize = out_data.as_mut_ptr() as usize;
+            let il_usize = il_ptr.unwrap_or(0);
 
             (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
                 let j_start = chunk_idx * rows_per_chunk;
@@ -2025,8 +2064,23 @@ impl CpuBackendNeon {
 
                 let mut j = j_start;
                 while j < j_end {
-                    if use_i8mm && j + 1 < j_end {
-                        // i8mm: 2 weight rows × all M activation rows
+                    if il_usize != 0 && j + 3 < j_end {
+                        // i8mm 4-row interleaved: weight data pre-arranged for smmla
+                        let group = j / 4;
+                        let il_group = unsafe { (il_usize as *const u8).add(group * nb_k * IL_BLOCK_SIZE) };
+                        for i in 0..m {
+                            let a_row = unsafe { a_q8_base.add(i * nb_k_q8) };
+                            let mut results = [0.0f32; 4];
+                            unsafe {
+                                backend.vec_dot_q4_0_q8_0_i8mm_4rows_il(nb_k, il_group, a_row, &mut results);
+                                *out_base.add(i * n + j) = results[0];
+                                *out_base.add(i * n + j + 1) = results[1];
+                                *out_base.add(i * n + j + 2) = results[2];
+                                *out_base.add(i * n + j + 3) = results[3];
+                            }
+                        }
+                        j += 4;
+                    } else if use_i8mm && j + 1 < j_end {
                         let b0 = unsafe { b_base.add(j * nb_k) };
                         let b1 = unsafe { b_base.add((j + 1) * nb_k) };
                         for i in 0..m {
@@ -2698,6 +2752,192 @@ impl CpuBackendNeon {
             *s0 = vgetq_lane_f32(sumv, 0);
             *s1 = vgetq_lane_f32(sumv, 2);
         }
+    }
+}
+
+// --- Q4_0 interleaved weight cache ---
+// Lazily interleaves Q4_0 weights into smmla-ready 4-row blocks on first use.
+// Key = tensor data pointer (stable for mmap/alloc'd weights), value = interleaved bytes.
+static Q4_IL_CACHE: OnceLock<Mutex<HashMap<usize, Vec<u8>>>> = OnceLock::new();
+
+/// Interleaved Q4_0 block for 4 rows: scales + smmla-ready byte pairs.
+/// Layout per block (72 bytes, same size as 4 × BlockQ4_0):
+///   [d0, d1, d2, d3]: 4 × f16 = 8 bytes
+///   Pair 0+1: [r0.qs[0..8], r1.qs[0..8], r0.qs[8..16], r1.qs[8..16]] = 32 bytes
+///   Pair 2+3: [r2.qs[0..8], r3.qs[0..8], r2.qs[8..16], r3.qs[8..16]] = 32 bytes
+const IL_BLOCK_SIZE: usize = 72; // 8 + 32 + 32
+
+/// Interleave Q4_0 weight matrix [N, K/32 blocks] into 4-row smmla-ready format.
+/// N must be a multiple of 4.
+fn interleave_q4_0_weights(src: *const BlockQ4_0, nb_k: usize, n: usize) -> Vec<u8> {
+    assert!(n % 4 == 0, "interleave requires N % 4 == 0, got N={n}");
+    let n_groups = n / 4;
+    let mut out = vec![0u8; n_groups * nb_k * IL_BLOCK_SIZE];
+
+    for g in 0..n_groups {
+        let rows = [
+            unsafe { src.add((g * 4) * nb_k) },
+            unsafe { src.add((g * 4 + 1) * nb_k) },
+            unsafe { src.add((g * 4 + 2) * nb_k) },
+            unsafe { src.add((g * 4 + 3) * nb_k) },
+        ];
+
+        for bi in 0..nb_k {
+            let dst_offset = (g * nb_k + bi) * IL_BLOCK_SIZE;
+            let dst = &mut out[dst_offset..dst_offset + IL_BLOCK_SIZE];
+
+            // 4 scales (f16, 2 bytes each)
+            for r in 0..4 {
+                let blk = unsafe { &*rows[r].add(bi) };
+                dst[r * 2] = blk.d.to_bits() as u8;
+                dst[r * 2 + 1] = (blk.d.to_bits() >> 8) as u8;
+            }
+
+            // Pair 0+1: interleave qs for smmla
+            let b0 = unsafe { &*rows[0].add(bi) };
+            let b1 = unsafe { &*rows[1].add(bi) };
+            // First 16 bytes: [r0.qs[0..8], r1.qs[0..8]]
+            dst[8..16].copy_from_slice(&b0.qs[0..8]);
+            dst[16..24].copy_from_slice(&b1.qs[0..8]);
+            // Next 16 bytes: [r0.qs[8..16], r1.qs[8..16]]
+            dst[24..32].copy_from_slice(&b0.qs[8..16]);
+            dst[32..40].copy_from_slice(&b1.qs[8..16]);
+
+            // Pair 2+3
+            let b2 = unsafe { &*rows[2].add(bi) };
+            let b3 = unsafe { &*rows[3].add(bi) };
+            dst[40..48].copy_from_slice(&b2.qs[0..8]);
+            dst[48..56].copy_from_slice(&b3.qs[0..8]);
+            dst[56..64].copy_from_slice(&b2.qs[8..16]);
+            dst[64..72].copy_from_slice(&b3.qs[8..16]);
+        }
+    }
+    out
+}
+
+/// Get interleaved weight data, lazily creating it on first call.
+/// Returns pointer to interleaved data and whether it was used (N % 4 == 0).
+fn get_interleaved_q4(b: &Tensor, nb_k: usize, n: usize) -> Option<usize> {
+    if n % 4 != 0 {
+        return None;
+    }
+    let key = b.as_ptr() as usize;
+    let cache = Q4_IL_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap();
+
+    if let Some(data) = map.get(&key) {
+        return Some(data.as_ptr() as usize);
+    }
+
+    let data = interleave_q4_0_weights(b.as_ptr() as *const BlockQ4_0, nb_k, n);
+    let ptr = data.as_ptr() as usize;
+    map.insert(key, data);
+    Some(ptr)
+}
+
+impl CpuBackendNeon {
+    /// 4-row i8mm dot product on interleaved Q4_0 data.
+    /// Weight data is pre-arranged so that vld1q + vand/vshr directly produces
+    /// smmla-ready operands — no vzip needed for weights.
+    ///
+    /// il_ptr: pointer to interleaved block for rows [4*g, 4*g+1, 4*g+2, 4*g+3]
+    /// nb_k: number of Q4_0 blocks per row (K / 32)
+    /// vy: activation Q8_0 pointer (shared across all 4 rows)
+    /// out: 4 output dot products
+    #[cfg(target_arch = "aarch64")]
+    unsafe fn vec_dot_q4_0_q8_0_i8mm_4rows_il(
+        &self,
+        nb_k: usize,
+        il_ptr: *const u8,
+        vy: *const BlockQ8_0,
+        out: &mut [f32; 4],
+    ) {
+        let m4b = vdupq_n_u8(0x0F);
+        let s8b = vdupq_n_s8(0x08);
+
+        let mut sumv01 = vdupq_n_f32(0.0);
+        let mut sumv23 = vdupq_n_f32(0.0);
+
+        for i in 0..nb_k {
+            let base = il_ptr.add(i * IL_BLOCK_SIZE);
+            let b_y = &*vy.add(i);
+
+            // Load 4 scales
+            let d0 = half::f16::from_bits(*(base as *const u16)).to_f32();
+            let d1 = half::f16::from_bits(*(base.add(2) as *const u16)).to_f32();
+            let d2 = half::f16::from_bits(*(base.add(4) as *const u16)).to_f32();
+            let d3 = half::f16::from_bits(*(base.add(6) as *const u16)).to_f32();
+            let d_y = b_y.d.to_f32();
+
+            // Load activation once, duplicate for smmla
+            let y_l = vld1q_s8(b_y.qs.as_ptr());
+            let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
+            let r0 = vreinterpretq_s8_s64(vzip1q_s64(
+                vreinterpretq_s64_s8(y_l), vreinterpretq_s64_s8(y_l),
+            ));
+            let r1 = vreinterpretq_s8_s64(vzip2q_s64(
+                vreinterpretq_s64_s8(y_l), vreinterpretq_s64_s8(y_l),
+            ));
+            let r2 = vreinterpretq_s8_s64(vzip1q_s64(
+                vreinterpretq_s64_s8(y_h), vreinterpretq_s64_s8(y_h),
+            ));
+            let r3 = vreinterpretq_s8_s64(vzip2q_s64(
+                vreinterpretq_s64_s8(y_h), vreinterpretq_s64_s8(y_h),
+            ));
+
+            // Pair 0+1: load pre-interleaved weights → unpack → smmla directly
+            let w01a = vld1q_u8(base.add(8));   // [r0.qs[0:8], r1.qs[0:8]]
+            let w01b = vld1q_u8(base.add(24));  // [r0.qs[8:16], r1.qs[8:16]]
+            let l0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01a, m4b)), s8b);
+            let l1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01b, m4b)), s8b);
+            let l2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01a, 4)), s8b);
+            let l3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01b, 4)), s8b);
+
+            let scale01 = [d0 * d_y, 0.0f32, d1 * d_y, 0.0f32];
+            let mut acc01 = vdupq_n_s32(0);
+            std::arch::asm!(
+                ".arch_extension i8mm",
+                "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                acc = inout(vreg) acc01,
+                a0 = in(vreg) l0, b0 = in(vreg) r0,
+                a1 = in(vreg) l1, b1 = in(vreg) r1,
+                a2 = in(vreg) l2, b2 = in(vreg) r2,
+                a3 = in(vreg) l3, b3 = in(vreg) r3,
+            );
+            sumv01 = vmlaq_f32(sumv01, vcvtq_f32_s32(acc01), vld1q_f32(scale01.as_ptr()));
+
+            // Pair 2+3: same pattern, reusing activation r0..r3
+            let w23a = vld1q_u8(base.add(40));
+            let w23b = vld1q_u8(base.add(56));
+            let l0b = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w23a, m4b)), s8b);
+            let l1b = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w23b, m4b)), s8b);
+            let l2b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w23a, 4)), s8b);
+            let l3b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w23b, 4)), s8b);
+
+            let scale23 = [d2 * d_y, 0.0f32, d3 * d_y, 0.0f32];
+            let mut acc23 = vdupq_n_s32(0);
+            std::arch::asm!(
+                ".arch_extension i8mm",
+                "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                acc = inout(vreg) acc23,
+                a0 = in(vreg) l0b, b0 = in(vreg) r0,
+                a1 = in(vreg) l1b, b1 = in(vreg) r1,
+                a2 = in(vreg) l2b, b2 = in(vreg) r2,
+                a3 = in(vreg) l3b, b3 = in(vreg) r3,
+            );
+            sumv23 = vmlaq_f32(sumv23, vcvtq_f32_s32(acc23), vld1q_f32(scale23.as_ptr()));
+        }
+
+        out[0] = vgetq_lane_f32(sumv01, 0);
+        out[1] = vgetq_lane_f32(sumv01, 2);
+        out[2] = vgetq_lane_f32(sumv23, 0);
+        out[3] = vgetq_lane_f32(sumv23, 2);
     }
 }
 
