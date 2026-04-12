@@ -1910,27 +1910,18 @@ impl CpuBackendNeon {
             return self.matmul_transposed_q4_0_serial(a, b, out);
         }
 
-        // Optimization: Use NEON Kernel for all M (Unified).
-        // Note: We removed the M=1 scalar fallback in favor of the optimized kernel (fundamental solution).
         let a_data = a.as_slice::<f32>();
         let nb_k = k / QK4_0;
         let out_data = out.as_mut_slice::<f32>();
-
-        // 1. Quantize A to Q8_0
         let nb_k_q8 = k / QK8_0;
         let total_q8_blocks = m * nb_k_q8;
 
         // Reuse thread-local workspace to avoid per-matmul allocation.
-        // Safety: we quantize into the buffer here (main thread), then only read it
-        // via raw pointer in par_chunks_mut. The buffer outlives the parallel region
-        // because thread-local storage persists for the thread's lifetime.
         let a_q8_ptr: SendSyncPtr = Q8_WORKSPACE.with(|ws| {
             let mut a_q8 = ws.borrow_mut();
             if a_q8.len() < total_q8_blocks {
                 let additional = total_q8_blocks - a_q8.len();
                 a_q8.reserve(additional);
-                // Safety: reserve guarantees capacity >= total_q8_blocks.
-                // quantize_row_q8_0 will fully initialize these blocks below.
                 unsafe {
                     a_q8.set_len(total_q8_blocks);
                 }
@@ -1948,13 +1939,10 @@ impl CpuBackendNeon {
             SendSyncPtr(a_q8.as_ptr())
         });
 
-        // Chunking strategy: smaller chunks for GEMV to improve Rayon work-stealing.
-        // GEMV (m=1): chunk_size=64 → 32 tasks for n=2048 with 8 threads.
-        // GEMM (m>1): larger chunks to amortize scheduling overhead.
+        // Chunking strategy: smaller chunks for GEMV to improve work-stealing.
         let num_threads = rayon::current_num_threads();
         let total_elements = m * n;
         let chunk_size = if m == 1 {
-            // GEMV: fine-grained chunking (llama.cpp uses 64)
             64
         } else {
             let cs = total_elements.div_ceil(num_threads);
@@ -1978,18 +1966,11 @@ impl CpuBackendNeon {
                         let idx = start_idx + local_i;
                         let i = idx / n;
                         let j = idx % n;
-                        // Safety: a_q8_ptr.0 points to the thread-local workspace which is
-                        // still alive (thread_local storage persists). We only read from it.
                         let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
 
-                        // Pair adjacent weight rows if within same activation row
                         if local_i + 1 < chunk.len() && j + 1 < n {
                             let b0 = unsafe { b_row_node.add(j * nb_k) };
                             let b1 = unsafe { b_row_node.add((j + 1) * nb_k) };
-                            // Safety: b0/b1 point to valid BlockQ4_0 rows within b tensor,
-                            // a_row_ptr points to valid BlockQ8_0 row within workspace.
-                            // chunk[local_i..local_i+2] is within bounds (checked above).
-                            // split_at_mut to satisfy borrow checker for two disjoint elements.
                             let (left, right) = chunk[local_i..].split_at_mut(1);
                             unsafe {
                                 self.vec_dot_q4_0_q8_0_i8mm(
@@ -2003,11 +1984,8 @@ impl CpuBackendNeon {
                             }
                             local_i += 2;
                         } else {
-                            // Last weight row in activation row or last element in chunk
                             let b_ptr = unsafe { b_row_node.add(j * nb_k) };
                             let mut sum = 0.0;
-                            // Safety: fallback to sdot for unpaired row.
-                            // b_ptr and a_row_ptr are valid (same invariants as above).
                             unsafe {
                                 self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_ptr, a_row_ptr);
                             }
@@ -2016,24 +1994,31 @@ impl CpuBackendNeon {
                         }
                     }
                 } else {
-                    // Existing sdot / basic NEON path
                     for (local_i, out_val) in chunk.iter_mut().enumerate() {
                         let idx = start_idx + local_i;
                         let i = idx / n;
                         let j = idx % n;
 
-                        let b_offset = j * nb_k;
                         let b_row_node = b.as_ptr() as *const BlockQ4_0;
-                        let b_row_ptr = unsafe { b_row_node.add(b_offset) };
-                        // Safety: same as i8mm path — reading from workspace via raw pointer.
+                        let b_row_ptr = unsafe { b_row_node.add(j * nb_k) };
                         let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
 
                         let mut sum = 0.0;
                         unsafe {
                             if std::arch::is_aarch64_feature_detected!("dotprod") {
-                                self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_row_ptr, a_row_ptr);
+                                self.vec_dot_q4_0_q8_0_sdot(
+                                    k,
+                                    &mut sum,
+                                    b_row_ptr,
+                                    a_row_ptr,
+                                );
                             } else {
-                                self.vec_dot_q4_0_q8_0(k, &mut sum, b_row_ptr, a_row_ptr);
+                                self.vec_dot_q4_0_q8_0(
+                                    k,
+                                    &mut sum,
+                                    b_row_ptr,
+                                    a_row_ptr,
+                                );
                             }
                         }
                         *out_val = sum;
@@ -2406,6 +2391,155 @@ impl CpuBackendNeon {
         }
     }
 
+    /// 4-row sdot dot product: weight 4행 × activation 1행 → 결과 4개.
+    /// Activation Q8_0 blocks are loaded once and reused across 4 weight rows,
+    /// reducing memory bandwidth by ~4x in the GEMV (M=1) regime.
+    ///
+    /// Each iteration processes 2 Q4_0/Q8_0 block pairs (64 values) to keep
+    /// the 8 accumulator registers busy and hide sdot latency.
+    ///
+    /// # Safety
+    /// - `vx[0..4]` each point to `n / QK8_0` valid `BlockQ4_0` blocks
+    /// - `vy` points to `n / QK8_0` valid `BlockQ8_0` blocks
+    #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
+    pub unsafe fn vec_dot_q4_0_q8_0_sdot_4rows(
+        &self,
+        n: usize,
+        vx: [*const BlockQ4_0; 4],
+        vy: *const BlockQ8_0,
+        out: &mut [f32; 4],
+    ) {
+        let nb = n / QK8_0;
+
+        unsafe {
+            let m4b = vdupq_n_u8(0x0F);
+            let s8b = vdupq_n_s8(8);
+
+            // 8 accumulators: 2 per row (for 2-block unrolling)
+            let mut sum0a = vdupq_n_f32(0.0);
+            let mut sum0b = vdupq_n_f32(0.0);
+            let mut sum1a = vdupq_n_f32(0.0);
+            let mut sum1b = vdupq_n_f32(0.0);
+            let mut sum2a = vdupq_n_f32(0.0);
+            let mut sum2b = vdupq_n_f32(0.0);
+            let mut sum3a = vdupq_n_f32(0.0);
+            let mut sum3b = vdupq_n_f32(0.0);
+
+            let mut i = 0;
+            while i + 1 < nb {
+                // Load activation Q8_0 — shared across all 4 weight rows
+                let y0 = &*vy.add(i);
+                let y1 = &*vy.add(i + 1);
+                let y0_l = vld1q_s8(y0.qs.as_ptr());
+                let y0_h = vld1q_s8(y0.qs.as_ptr().add(16));
+                let y1_l = vld1q_s8(y1.qs.as_ptr());
+                let y1_h = vld1q_s8(y1.qs.as_ptr().add(16));
+
+                // Process each of the 4 weight rows
+                macro_rules! do_row {
+                    ($row:expr, $suma:ident, $sumb:ident) => {
+                        let x0 = &*vx[$row].add(i);
+                        let x1 = &*vx[$row].add(i + 1);
+
+                        // Block 0: unpack Q4_0 nibbles
+                        let v0_0 = vld1q_u8(x0.qs.as_ptr());
+                        let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
+                        let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
+
+                        let d0 = x0.d.to_f32() * y0.d.to_f32();
+
+                        let mut p_0 = vdupq_n_s32(0);
+                        std::arch::asm!(
+                            "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                            acc = inout(vreg) p_0,
+                            x = in(vreg) x0_l,
+                            y = in(vreg) y0_l,
+                        );
+                        std::arch::asm!(
+                            "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                            acc = inout(vreg) p_0,
+                            x = in(vreg) x0_h,
+                            y = in(vreg) y0_h,
+                        );
+                        $suma = vmlaq_n_f32($suma, vcvtq_f32_s32(p_0), d0);
+
+                        // Block 1: unpack Q4_0 nibbles
+                        let v0_1 = vld1q_u8(x1.qs.as_ptr());
+                        let x1_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_1, m4b)), s8b);
+                        let x1_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4)), s8b);
+
+                        let d1 = x1.d.to_f32() * y1.d.to_f32();
+
+                        let mut p_1 = vdupq_n_s32(0);
+                        std::arch::asm!(
+                            "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                            acc = inout(vreg) p_1,
+                            x = in(vreg) x1_l,
+                            y = in(vreg) y1_l,
+                        );
+                        std::arch::asm!(
+                            "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                            acc = inout(vreg) p_1,
+                            x = in(vreg) x1_h,
+                            y = in(vreg) y1_h,
+                        );
+                        $sumb = vmlaq_n_f32($sumb, vcvtq_f32_s32(p_1), d1);
+                    };
+                }
+
+                do_row!(0, sum0a, sum0b);
+                do_row!(1, sum1a, sum1b);
+                do_row!(2, sum2a, sum2b);
+                do_row!(3, sum3a, sum3b);
+
+                i += 2;
+            }
+
+            // Handle odd remainder block
+            if i < nb {
+                let y0 = &*vy.add(i);
+                let y0_l = vld1q_s8(y0.qs.as_ptr());
+                let y0_h = vld1q_s8(y0.qs.as_ptr().add(16));
+
+                macro_rules! do_row_tail {
+                    ($row:expr, $suma:ident) => {
+                        let x0 = &*vx[$row].add(i);
+                        let v0_0 = vld1q_u8(x0.qs.as_ptr());
+                        let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
+                        let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
+                        let d0 = x0.d.to_f32() * y0.d.to_f32();
+                        let mut p_0 = vdupq_n_s32(0);
+                        std::arch::asm!(
+                            "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                            acc = inout(vreg) p_0,
+                            x = in(vreg) x0_l,
+                            y = in(vreg) y0_l,
+                        );
+                        std::arch::asm!(
+                            "sdot {acc:v}.4s, {x:v}.16b, {y:v}.16b",
+                            acc = inout(vreg) p_0,
+                            x = in(vreg) x0_h,
+                            y = in(vreg) y0_h,
+                        );
+                        $suma = vmlaq_n_f32($suma, vcvtq_f32_s32(p_0), d0);
+                    };
+                }
+
+                do_row_tail!(0, sum0a);
+                do_row_tail!(1, sum1a);
+                do_row_tail!(2, sum2a);
+                do_row_tail!(3, sum3a);
+            }
+
+            // Horizontal reduction
+            out[0] = vaddvq_f32(vaddq_f32(sum0a, sum0b));
+            out[1] = vaddvq_f32(vaddq_f32(sum1a, sum1b));
+            out[2] = vaddvq_f32(vaddq_f32(sum2a, sum2b));
+            out[3] = vaddvq_f32(vaddq_f32(sum3a, sum3b));
+        }
+    }
+
     /// 2-row i8mm dot product: weight 2행 × activation 1행 → 결과 2개.
     /// ARM FEAT_I8MM (smmla) 기반. i8mm 미지원 디바이스에서는 호출하지 않을 것.
     ///
@@ -2546,6 +2680,22 @@ struct F16GemvCtx {
     n: usize,
     rows_per_chunk: usize,
 }
+
+// --- SpinPool work context for Q4_0 GEMV ---
+
+#[repr(C)]
+struct Q4GemvCtx {
+    a_q8_ptr: *const BlockQ8_0, // Pre-quantized activation in Q8_0
+    b_base: *const BlockQ4_0,   // Weight matrix [N, K/32] in Q4_0
+    out_ptr: *mut f32,          // Output [N]
+    k: usize,
+    n: usize,
+    nb_k: usize,               // K / QK4_0 = number of Q4_0 blocks per row
+    rows_per_chunk: usize,
+}
+
+unsafe impl Send for Q4GemvCtx {}
+unsafe impl Sync for Q4GemvCtx {}
 
 // --- N-major GEMM context (prefill, M > 1) ---
 
@@ -2690,6 +2840,205 @@ pub unsafe fn fused_matmul_f16(
         fused_gemv_chunk,
         &ctx as *const FusedGemvCtx as *const u8,
     );
+}
+
+/// Fused multi-matmul for Q4_0 decode (M=1): single Q8_0 quantization + single Rayon dispatch.
+/// Combines gate+up (or QKV) into one parallel region, avoiding redundant quantization
+/// and Rayon dispatch overhead.
+///
+/// `matmuls`: slice of (weight_base, out_ptr, n_rows) — up to 3 matmuls.
+///
+/// # Safety
+/// All weight pointers must be valid BlockQ4_0 arrays. All out_ptrs must have capacity >= n_rows.
+/// `a_data` must point to a valid f32 slice of length `k`.
+pub unsafe fn fused_matmul_q4_0(
+    a_data: *const f32,
+    k: usize,
+    matmuls: &[(*const BlockQ4_0, *mut f32, usize)],
+) {
+    let nb_k = k / QK4_0;
+    let nb_k_q8 = k / QK8_0;
+    let backend = CpuBackendNeon::new();
+
+    // 1. Quantize activation to Q8_0 — once for all matmuls (reuse thread-local workspace)
+    let a_q8_usize: usize = Q8_WORKSPACE.with(|ws| {
+        let mut a_q8 = ws.borrow_mut();
+        if a_q8.len() < nb_k_q8 {
+            let additional = nb_k_q8 - a_q8.len();
+            a_q8.reserve(additional);
+            a_q8.set_len(nb_k_q8);
+        }
+        let a_row = std::slice::from_raw_parts(a_data, k);
+        backend.quantize_row_q8_0(a_row, &mut a_q8[..nb_k_q8], k);
+        a_q8.as_ptr() as usize
+    });
+
+    // 2. Build fused context — cast pointers to usize for Rayon Send
+    let mut b_bases = [0usize; 3];
+    let mut out_ptrs = [0usize; 3];
+    let mut ns = [0usize; 3];
+    let n_matmuls = matmuls.len();
+
+    for (i, &(b, o, n)) in matmuls.iter().enumerate().take(3) {
+        b_bases[i] = b as usize;
+        out_ptrs[i] = o as usize;
+        ns[i] = n;
+    }
+
+    // Build cumulative row offsets for matmul boundaries
+    let mut row_offsets = [0usize; 4];
+    for i in 0..n_matmuls {
+        row_offsets[i + 1] = row_offsets[i] + ns[i];
+    }
+    let total_rows = row_offsets[n_matmuls];
+
+    let chunk_size = 64usize;
+    let n_chunks = (total_rows + chunk_size - 1) / chunk_size;
+
+    #[cfg(target_arch = "aarch64")]
+    let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+    #[cfg(not(target_arch = "aarch64"))]
+    let use_i8mm = false;
+
+    // 3. Rayon dispatch: write directly to output pointers (no intermediate buffer)
+    (0..n_chunks).into_par_iter().for_each(|chunk_idx| {
+        let global_start = chunk_idx * chunk_size;
+        let global_end = (global_start + chunk_size).min(total_rows);
+        let a_q8_ptr = a_q8_usize as *const BlockQ8_0;
+
+        if use_i8mm {
+            let mut gi = global_start;
+            while gi < global_end {
+                let mut mat_idx = 0;
+                while mat_idx + 1 < n_matmuls && gi >= row_offsets[mat_idx + 1] {
+                    mat_idx += 1;
+                }
+                let j = gi - row_offsets[mat_idx];
+                let b_base = b_bases[mat_idx] as *const BlockQ4_0;
+                let out_base = out_ptrs[mat_idx] as *mut f32;
+
+                // i8mm 2-row: pair adjacent rows within same matmul
+                if gi + 1 < global_end && gi + 1 < row_offsets[mat_idx + 1] {
+                    let b0 = unsafe { b_base.add(j * nb_k) };
+                    let b1 = unsafe { b_base.add((j + 1) * nb_k) };
+                    let mut s0 = 0.0f32;
+                    let mut s1 = 0.0f32;
+                    unsafe {
+                        backend.vec_dot_q4_0_q8_0_i8mm(
+                            k, &mut s0, &mut s1, b0, b1, a_q8_ptr,
+                        );
+                        *out_base.add(j) = s0;
+                        *out_base.add(j + 1) = s1;
+                    }
+                    gi += 2;
+                } else {
+                    let b_ptr = unsafe { b_base.add(j * nb_k) };
+                    let mut sum = 0.0f32;
+                    unsafe {
+                        backend.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_ptr, a_q8_ptr);
+                        *out_base.add(j) = sum;
+                    }
+                    gi += 1;
+                }
+            }
+        } else {
+            for gi in global_start..global_end {
+                let mut mat_idx = 0;
+                while mat_idx + 1 < n_matmuls && gi >= row_offsets[mat_idx + 1] {
+                    mat_idx += 1;
+                }
+                let j = gi - row_offsets[mat_idx];
+                let b_base = b_bases[mat_idx] as *const BlockQ4_0;
+                let out_base = out_ptrs[mat_idx] as *mut f32;
+                let b_ptr = unsafe { b_base.add(j * nb_k) };
+
+                let mut sum = 0.0f32;
+                unsafe {
+                    if std::arch::is_aarch64_feature_detected!("dotprod") {
+                        backend.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_ptr, a_q8_ptr);
+                    } else {
+                        backend.vec_dot_q4_0_q8_0(k, &mut sum, b_ptr, a_q8_ptr);
+                    }
+                    *out_base.add(j) = sum;
+                }
+            }
+        }
+    });
+}
+
+/// Work function for SpinPool: Q4_0 GEMV with batched dot product.
+/// Uses i8mm (smmla, 2-row) when available, falls back to sdot (4-row).
+///
+/// # Safety
+/// Called by SpinPool workers with valid Q4GemvCtx pointer.
+unsafe fn q4_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
+    let ctx = &*(ctx_ptr as *const Q4GemvCtx);
+    let j_start = chunk_id * ctx.rows_per_chunk;
+    let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
+
+    let backend = CpuBackendNeon::new();
+
+    #[cfg(target_arch = "aarch64")]
+    let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+    #[cfg(not(target_arch = "aarch64"))]
+    let use_i8mm = false;
+
+    if use_i8mm {
+        // i8mm path: 2-row batches using smmla instruction
+        let mut j = j_start;
+        while j + 1 < j_end {
+            let mut s0 = 0.0f32;
+            let mut s1 = 0.0f32;
+            backend.vec_dot_q4_0_q8_0_i8mm(
+                ctx.k,
+                &mut s0,
+                &mut s1,
+                ctx.b_base.add(j * ctx.nb_k),
+                ctx.b_base.add((j + 1) * ctx.nb_k),
+                ctx.a_q8_ptr,
+            );
+            *ctx.out_ptr.add(j) = s0;
+            *ctx.out_ptr.add(j + 1) = s1;
+            j += 2;
+        }
+        if j < j_end {
+            let mut sum = 0.0f32;
+            backend.vec_dot_q4_0_q8_0_sdot(
+                ctx.k,
+                &mut sum,
+                ctx.b_base.add(j * ctx.nb_k),
+                ctx.a_q8_ptr,
+            );
+            *ctx.out_ptr.add(j) = sum;
+        }
+    } else {
+        // sdot path: 4-row batches
+        const NR: usize = 4;
+        let mut j = j_start;
+        while j + NR <= j_end {
+            let vx = [
+                ctx.b_base.add(j * ctx.nb_k),
+                ctx.b_base.add((j + 1) * ctx.nb_k),
+                ctx.b_base.add((j + 2) * ctx.nb_k),
+                ctx.b_base.add((j + 3) * ctx.nb_k),
+            ];
+            let mut results = [0.0f32; NR];
+            backend.vec_dot_q4_0_q8_0_sdot_4rows(ctx.k, vx, ctx.a_q8_ptr, &mut results);
+            std::ptr::copy_nonoverlapping(results.as_ptr(), ctx.out_ptr.add(j), NR);
+            j += NR;
+        }
+        while j < j_end {
+            let mut sum = 0.0f32;
+            backend.vec_dot_q4_0_q8_0_sdot(
+                ctx.k,
+                &mut sum,
+                ctx.b_base.add(j * ctx.nb_k),
+                ctx.a_q8_ptr,
+            );
+            *ctx.out_ptr.add(j) = sum;
+            j += 1;
+        }
+    }
 }
 
 /// Work function for SpinPool: processes a coarse chunk of output rows.

@@ -68,8 +68,12 @@ impl TransformerLayer {
         let t = prof_start!();
         #[cfg(target_arch = "aarch64")]
         let is_cpu_f16 = backend.name().contains("CPU") && self.wq.dtype() == DType::F16;
+        #[cfg(target_arch = "aarch64")]
+        let is_cpu_q4 = backend.name().contains("CPU") && self.wq.dtype() == DType::Q4_0;
         #[cfg(not(target_arch = "aarch64"))]
         let is_cpu_f16 = false;
+        #[cfg(not(target_arch = "aarch64"))]
+        let is_cpu_q4 = false;
         let is_decode = x
             .shape()
             .dims()
@@ -99,6 +103,36 @@ impl TransformerLayer {
                             ),
                             (
                                 self.wv.as_ptr() as *const u16,
+                                ws.v.as_mut_ptr() as *mut f32,
+                                self.wv.shape().dims()[0],
+                            ),
+                        ],
+                    );
+                }
+            }
+        } else if is_cpu_q4 && is_decode {
+            // Fused QKV for Q4_0: single Q8 quantization + single Rayon dispatch
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::core::quant::BlockQ4_0;
+                let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
+                unsafe {
+                    crate::backend::cpu::neon::fused_matmul_q4_0(
+                        ws.residual.as_ptr() as *const f32,
+                        k,
+                        &[
+                            (
+                                self.wq.as_ptr() as *const BlockQ4_0,
+                                ws.q.as_mut_ptr() as *mut f32,
+                                self.wq.shape().dims()[0],
+                            ),
+                            (
+                                self.wk.as_ptr() as *const BlockQ4_0,
+                                ws.k.as_mut_ptr() as *mut f32,
+                                self.wk.shape().dims()[0],
+                            ),
+                            (
+                                self.wv.as_ptr() as *const BlockQ4_0,
                                 ws.v.as_mut_ptr() as *mut f32,
                                 self.wv.shape().dims()[0],
                             ),
@@ -976,6 +1010,31 @@ impl TransformerLayer {
                             ),
                             (
                                 self.w_up.as_ptr() as *const u16,
+                                ws.up.as_mut_ptr() as *mut f32,
+                                self.w_up.shape().dims()[0],
+                            ),
+                        ],
+                    );
+                }
+            }
+        } else if is_cpu_q4 && is_decode {
+            // ── Fused Q4_0 dispatch: single Q8 quantization + single Rayon dispatch ──
+            #[cfg(target_arch = "aarch64")]
+            {
+                use crate::core::quant::BlockQ4_0;
+                let k = ws.residual.shape().dims()[ws.residual.shape().dims().len() - 1];
+                unsafe {
+                    crate::backend::cpu::neon::fused_matmul_q4_0(
+                        ws.residual.as_ptr() as *const f32,
+                        k,
+                        &[
+                            (
+                                self.w_gate.as_ptr() as *const BlockQ4_0,
+                                ws.gate.as_mut_ptr() as *mut f32,
+                                self.w_gate.shape().dims()[0],
+                            ),
+                            (
+                                self.w_up.as_ptr() as *const BlockQ4_0,
                                 ws.up.as_mut_ptr() as *mut f32,
                                 self.w_up.shape().dims()[0],
                             ),
