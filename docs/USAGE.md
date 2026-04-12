@@ -39,17 +39,49 @@
 
 ## 1. Quick Start
 
-### 호스트 CPU 추론
+### 지원 모델 포맷
+
+| 포맷 | 확장자 | 지원 dtype | 특징 |
+|------|--------|-----------|------|
+| **HuggingFace Safetensors** | `.safetensors` (디렉토리) | F16, BF16, F32 | `--weight-dtype q4`로 로드 시 Q4_0 변환 가능 |
+| **GGUF** | `.gguf` (단일 파일) | Q4_0, Q8_0, F16, F32 | 사전 양자화 모델 직접 로드 (zero-copy, 변환 불필요) |
+
+GGUF의 K-quant 텐서 (Q4_K, Q6_K 등)는 로드 시 F32로 자동 dequant된다.
+
+### Safetensors 모델 (F16)
 
 ```bash
 cargo build --release
+
+# CPU 추론
 ./target/release/generate -m models/qwen2.5-1.5b --prompt "Hello" -n 50
+
+# GPU + Q4 양자화 (F16→Q4 로드 시 변환)
+./target/release/generate -m models/qwen2.5-1.5b -b opencl --weight-dtype q4 --prompt "Hello" -n 50
 ```
 
-### 호스트 GPU (NVIDIA OpenCL) 추론
+### GGUF 모델 (사전 양자화)
 
 ```bash
-./target/release/generate -m models/qwen2.5-1.5b -b opencl --weight-dtype q4 --prompt "Hello" -n 50
+# .gguf 파일을 --model-path에 직접 지정
+./target/release/generate -m models/llama3.2-1b-q4_0.gguf --prompt "Hello" -n 50
+
+# GPU
+./target/release/generate -m models/llama3.2-1b-q4_0.gguf -b opencl --prompt "Hello" -n 50
+```
+
+> GGUF 모드에서 `--weight-dtype`은 무시된다 (파일 내 dtype 사용).
+> `tokenizer.json`이 GGUF 파일과 같은 디렉토리에 있어야 한다.
+
+**GGUF 모델 다운로드 방법:**
+
+```bash
+# HuggingFace에서 Q4_0 GGUF 다운로드
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
+  --include "Llama-3.2-1B-Instruct-Q4_0.gguf" --local-dir models/
+
+# 또는 기존 safetensors에서 순수 Q4_0 GGUF 생성
+python scripts/convert_safetensors_to_gguf.py models/llama3.2-1b models/llama3.2-1b-q4_0.gguf
 ```
 
 ### 온디바이스 (Android, Adreno GPU) 추론
@@ -59,13 +91,20 @@ cargo build --release
 source android.source
 cargo build --release --target aarch64-linux-android
 
-# 배포
+# 배포 (Safetensors)
 adb push target/aarch64-linux-android/release/generate /data/local/tmp/
 adb push -r models/qwen2.5-1.5b /data/local/tmp/models/qwen2.5-1.5b
 
-# 실행
+# 실행 (Safetensors + GPU + Q4)
 adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
   -m /data/local/tmp/models/qwen2.5-1.5b -b opencl --weight-dtype q4 -n 50 \
+  --prompt 'Hello'"
+
+# 실행 (GGUF + GPU)
+adb push models/llama3.2-1b-q4_0.gguf /data/local/tmp/models/
+adb push models/llama3.2-1b/tokenizer.json /data/local/tmp/models/
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
+  -m /data/local/tmp/models/llama3.2-1b-q4_0.gguf -b opencl -n 50 \
   --prompt 'Hello'"
 ```
 
@@ -106,7 +145,7 @@ scp target/aarch64-unknown-linux-musl/release/generate user@jetson:~/
   -n 200
 ```
 
-**Q4 weight로 메모리 절약 (CPU)**
+**Q4 weight로 메모리 절약 — Safetensors (로드 시 F16→Q4 변환)**
 
 ```bash
 ./target/release/generate \
@@ -116,15 +155,32 @@ scp target/aarch64-unknown-linux-musl/release/generate user@jetson:~/
   -n 200
 ```
 
+**Q4 weight — GGUF (사전 양자화, 변환 없이 직접 로드)**
+
+```bash
+# GGUF Q4_0 모델을 직접 로드 — 로딩 시간 단축, peak RSS 감소
+./target/release/generate \
+  -m models/llama3.2-1b-q4_0.gguf \
+  --prompt "Explain quantum computing" \
+  -n 200
+```
+
+> **Safetensors Q4 vs GGUF Q4_0**: 추론 결과와 속도는 동일. GGUF는 로딩 시 F32 중간 버퍼가 없어 peak RSS가 ~6배 낮다.
+
 **OpenCL GPU 추론 (Android/NVIDIA)**
 
 ```bash
+# Safetensors
 ./target/release/generate \
   -m models/qwen2.5-1.5b \
+  -b opencl --weight-dtype q4 \
+  --prompt "Explain quantum computing" -n 200
+
+# GGUF
+./target/release/generate \
+  -m models/llama3.2-1b-q4_0.gguf \
   -b opencl \
-  --weight-dtype q4 \
-  --prompt "Explain quantum computing" \
-  -n 200
+  --prompt "Explain quantum computing" -n 200
 ```
 
 **CPU→GPU 자동 전환 (CPU prefill → GPU decode)**
@@ -1690,7 +1746,9 @@ chmod +x 은 필요 없음 (adb push가 실행 권한 유지)
 
 ### 5.2 모델 배포
 
-**HuggingFace에서 모델 다운로드**
+#### Safetensors 모델 (F16)
+
+**다운로드:**
 
 ```bash
 # Llama 3.2 1B (모델 접근 권한 필요)
@@ -1702,26 +1760,79 @@ huggingface-cli download Qwen/Qwen2.5-1.5B \
   --local-dir models/qwen2.5-1.5b
 ```
 
-**Android로 모델 배포**
-
-```bash
-# 디렉토리 생성
-adb shell mkdir -p /data/local/tmp/models/qwen2.5-1.5b
-
-# 모델 파일 전송 (수 GB, 시간 소요)
-adb push models/qwen2.5-1.5b/. /data/local/tmp/models/qwen2.5-1.5b/
-
-# 전송 확인
-adb shell ls -la /data/local/tmp/models/qwen2.5-1.5b/
-```
-
-**필수 모델 파일**
+**필수 파일:**
 
 | 파일 | 용도 |
 |------|------|
-| `model.safetensors` (또는 여러 개) | 가중치 |
+| `model.safetensors` (또는 여러 개) | 가중치 (F16/BF16) |
 | `tokenizer.json` | 토크나이저 |
 | `config.json` | 모델 설정 |
+
+**Android 배포:**
+
+```bash
+adb shell mkdir -p /data/local/tmp/models/qwen2.5-1.5b
+adb push models/qwen2.5-1.5b/. /data/local/tmp/models/qwen2.5-1.5b/
+```
+
+#### GGUF 모델 (사전 양자화)
+
+**다운로드 (HuggingFace에서 직접):**
+
+```bash
+# Llama 3.2 1B Q4_0 GGUF
+hf download bartowski/Llama-3.2-1B-Instruct-GGUF \
+  --include "Llama-3.2-1B-Instruct-Q4_0.gguf" \
+  --local-dir models/llama3.2-1b-gguf
+```
+
+> HuggingFace의 GGUF 파일은 혼합 양자화를 포함할 수 있다 (예: embed이 Q6_K).
+> llm.rs는 K-quant 텐서를 자동으로 F32 dequant하여 처리하지만,
+> 순수 Q4_0 파일이 최적이다.
+
+**Safetensors에서 순수 Q4_0 GGUF 생성 (권장):**
+
+```bash
+python scripts/convert_safetensors_to_gguf.py \
+  models/llama3.2-1b \
+  models/llama3.2-1b-q4_0.gguf
+```
+
+이 방법은 weight 텐서만 Q4_0, norm/embed은 F32로 저장하여
+혼합 양자화 없는 깨끗한 GGUF를 생성한다.
+
+**필수 파일:**
+
+| 파일 | 용도 |
+|------|------|
+| `*.gguf` | 가중치 + 모델 설정 (단일 파일) |
+| `tokenizer.json` | 토크나이저 (**같은 디렉토리에 배치**) |
+
+> GGUF에는 `config.json`이 불필요 — 모델 설정이 GGUF 메타데이터에 포함되어 있다.
+> 단, `tokenizer.json`은 GGUF 파일과 같은 디렉토리에 있어야 한다.
+
+**Android 배포:**
+
+```bash
+adb push models/llama3.2-1b-q4_0.gguf /data/local/tmp/models/
+adb push models/llama3.2-1b/tokenizer.json /data/local/tmp/models/
+```
+
+#### 지원 GGUF 양자화 타입
+
+| GGUF ggml_type | 지원 | 로드 방식 |
+|----------------|------|----------|
+| `F32` (0) | O | 직접 참조 (zero-copy) |
+| `F16` (1) | O | 직접 참조 (zero-copy) |
+| `Q4_0` (2) | O | 직접 참조 (zero-copy) — 권장 |
+| `Q4_1` (3) | O | 로드 시 F32 dequant |
+| `Q8_0` (8) | O | 직접 참조 (zero-copy) |
+| `Q4_K` (12) | △ | 로드 시 F32 dequant (fallback) |
+| `Q6_K` (14) | △ | 로드 시 F32 dequant (fallback) |
+| `Q2_K`, `Q3_K`, `Q5_K` 등 | X | 에러 반환 |
+
+> Q4_0과 Q8_0이 zero-copy 로드되어 가장 효율적이다.
+> K-quant (Q4_K, Q6_K)는 지원하지만 로드 시 F32 변환 오버헤드가 있다.
 
 ---
 
@@ -1791,11 +1902,11 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `-m, --model-path` | `models/llama3.2-1b` | HuggingFace Safetensors 모델 경로 |
+| `-m, --model-path` | `models/llama3.2-1b` | 모델 경로. 디렉토리=Safetensors, `.gguf` 파일=GGUF |
 | `-p, --prompt` | `"Hello, world! I am a"` | 입력 프롬프트 |
 | `--prompt-file` | — | 프롬프트 파일 (`--prompt` 오버라이드) |
 | `-n, --num-tokens` | 20 | 생성 토큰 수 |
-| `--weight-dtype` | `f16` | `f16` 또는 `q4` |
+| `--weight-dtype` | `f16` | `f16` 또는 `q4` (Safetensors용. GGUF에서는 무시) |
 
 ### 백엔드 & 실행
 

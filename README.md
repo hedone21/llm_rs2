@@ -24,13 +24,14 @@ graph LR
 - **ARM64 Optimized**: Android/Linux ARM64 SoC 전용 NEON intrinsics 및 dotprod 최적화
 - **Zero-copy Memory**: `Galloc` + `SharedBuffer`로 CPU↔GPU 간 memcpy 제거 (ARM UMA 활용)
 - **Backend Extensibility**: `Backend` 트레이트 기반 CPU / OpenCL GPU 백엔드 교체 가능
-- **Quantization Support**: Q4_0 / Q8_0 블록 양자화, F16/BF16 추론 지원
+- **Quantization Support**: Q4_0 / Q8_0 블록 양자화, F16/BF16 추론 지원. GGUF 사전 양자화 모델 직접 로드
 - **KIVI KV Cache 양자화**: KV 캐시 Q4/Q8 동적 양자화로 메모리 사용량 감소
 - **KV Cache Eviction**: Sliding Window / H2O / D2O (merge compensation) / StreamingLLM 정책
 - **Tensor Partition**: FFN gate/up matmul을 GPU+CPU에 동시 분산 실행 (`--tensor-partition`)
 - **Flash Attention**: GPU flash attention (strided, GQA-aware)
 - **Resilience**: Manager 연동 적응형 추론 — 메모리 압박 시 자동 eviction, 온도 시 throttle
 - **Llama 3.2 Ready**: Llama 3.2 (1B/3B) 아키텍처 및 GQA 우선 지원
+- **Multi-format Model Loading**: HuggingFace Safetensors (F16/BF16) 및 GGUF (Q4_0/Q8_0/F16) 포맷 지원
 
 ## 📋 Prerequisites
 
@@ -40,18 +41,30 @@ graph LR
 
 ## ⚡ Quick Start
 
-### 호스트 (CPU)
+### Safetensors (F16) 모델
 
 ```bash
 cargo build --release
-./target/release/generate -m /path/to/model -t /path/to/tokenizer.json -p "Hello"
+
+# CPU
+./target/release/generate -m models/llama3.2-1b --prompt "Hello" -n 50
+
+# GPU (OpenCL) + Q4 양자화 (로드 시 F16→Q4 변환)
+./target/release/generate -m models/llama3.2-1b -b opencl --weight-dtype q4 --prompt "Hello" -n 50
 ```
 
-### 호스트 (GPU)
+### GGUF (사전 양자화) 모델
 
 ```bash
-./target/release/generate -m /path/to/model -t /path/to/tokenizer.json -b opencl -p "Hello"
+# .gguf 파일을 직접 지정 — dtype 자동 감지, 로드 시 변환 불필요
+./target/release/generate -m models/llama3.2-1b-q4_0.gguf --prompt "Hello" -n 50
+
+# GPU
+./target/release/generate -m models/llama3.2-1b-q4_0.gguf -b opencl --prompt "Hello" -n 50
 ```
+
+> **지원 GGUF 양자화 타입**: Q4_0, Q8_0, F16, F32. K-quant (Q4_K 등)는 로드 시 F32로 dequant.
+> `tokenizer.json`이 GGUF 파일과 같은 디렉토리에 있어야 합니다.
 
 ### Android
 
@@ -59,7 +72,12 @@ cargo build --release
 source android.source
 cargo build --release --target aarch64-linux-android
 adb push target/aarch64-linux-android/release/generate /data/local/tmp/
-adb shell /data/local/tmp/generate -m /data/local/tmp/model -t /data/local/tmp/tokenizer.json -p "Hello"
+
+# Safetensors
+adb shell "/data/local/tmp/generate -m /data/local/tmp/models/llama3.2-1b -b opencl --prompt Hello"
+
+# GGUF
+adb shell "/data/local/tmp/generate -m /data/local/tmp/models/llama3.2-1b-q4_0.gguf -b opencl --prompt Hello"
 ```
 
 자세한 사용법: [docs/USAGE.md](docs/USAGE.md)
