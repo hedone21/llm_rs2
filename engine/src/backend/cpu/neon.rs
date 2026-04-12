@@ -1939,27 +1939,38 @@ impl CpuBackendNeon {
             SendSyncPtr(a_q8.as_ptr())
         });
 
-        // Chunking strategy: smaller chunks for GEMV to improve work-stealing.
+        // Adaptive chunk size: target ~4 tasks per thread to minimize Rayon overhead.
+        // F16 path uses SpinPool with NR=4 batching; Q4_0 used chunk_size=64 fixed,
+        // which creates excessive tasks for large N (e.g., lm_head N=151936 → 2374 tasks).
         let num_threads = rayon::current_num_threads();
         let total_elements = m * n;
         let chunk_size = if m == 1 {
-            64
+            // GEMV: scale chunk size with N to keep task count bounded
+            let target_tasks = num_threads * 4;
+            let cs = (n + target_tasks - 1) / target_tasks;
+            // Round up to even for i8mm 2-row pairing
+            (cs + 1) & !1
         } else {
             let cs = total_elements.div_ceil(num_threads);
             cs.max(256)
         };
 
+        // Hoist feature detection outside closure (avoids atomic load per chunk)
+        #[cfg(target_arch = "aarch64")]
+        let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+        #[cfg(not(target_arch = "aarch64"))]
+        let use_i8mm = false;
+
+        #[cfg(target_arch = "aarch64")]
+        let use_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+        #[cfg(not(target_arch = "aarch64"))]
+        let use_dotprod = false;
+
         out_data.par_chunks_mut(chunk_size).enumerate().for_each(
             |(chunk_idx, chunk): (usize, &mut [f32])| {
                 let start_idx = chunk_idx * chunk_size;
 
-                #[cfg(target_arch = "aarch64")]
-                let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
-                #[cfg(not(target_arch = "aarch64"))]
-                let use_i8mm = false;
-
                 if use_i8mm {
-                    // i8mm 2-row path: process adjacent weight rows in pairs
                     let b_row_node = b.as_ptr() as *const BlockQ4_0;
                     let mut local_i = 0;
                     while local_i < chunk.len() {
@@ -1993,33 +2004,31 @@ impl CpuBackendNeon {
                             local_i += 1;
                         }
                     }
-                } else {
+                } else if use_dotprod {
+                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
                     for (local_i, out_val) in chunk.iter_mut().enumerate() {
                         let idx = start_idx + local_i;
                         let i = idx / n;
                         let j = idx % n;
-
-                        let b_row_node = b.as_ptr() as *const BlockQ4_0;
                         let b_row_ptr = unsafe { b_row_node.add(j * nb_k) };
                         let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
-
                         let mut sum = 0.0;
                         unsafe {
-                            if std::arch::is_aarch64_feature_detected!("dotprod") {
-                                self.vec_dot_q4_0_q8_0_sdot(
-                                    k,
-                                    &mut sum,
-                                    b_row_ptr,
-                                    a_row_ptr,
-                                );
-                            } else {
-                                self.vec_dot_q4_0_q8_0(
-                                    k,
-                                    &mut sum,
-                                    b_row_ptr,
-                                    a_row_ptr,
-                                );
-                            }
+                            self.vec_dot_q4_0_q8_0_sdot(k, &mut sum, b_row_ptr, a_row_ptr);
+                        }
+                        *out_val = sum;
+                    }
+                } else {
+                    let b_row_node = b.as_ptr() as *const BlockQ4_0;
+                    for (local_i, out_val) in chunk.iter_mut().enumerate() {
+                        let idx = start_idx + local_i;
+                        let i = idx / n;
+                        let j = idx % n;
+                        let b_row_ptr = unsafe { b_row_node.add(j * nb_k) };
+                        let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
+                        let mut sum = 0.0;
+                        unsafe {
+                            self.vec_dot_q4_0_q8_0(k, &mut sum, b_row_ptr, a_row_ptr);
                         }
                         *out_val = sum;
                     }
@@ -2892,7 +2901,13 @@ pub unsafe fn fused_matmul_q4_0(
     }
     let total_rows = row_offsets[n_matmuls];
 
-    let chunk_size = 64usize;
+    // Adaptive chunk size: target ~4 tasks per thread
+    let num_threads = rayon::current_num_threads();
+    let target_tasks = num_threads * 4;
+    let chunk_size = {
+        let cs = (total_rows + target_tasks - 1) / target_tasks;
+        (cs + 1) & !1 // round up to even for i8mm 2-row pairing
+    };
     let n_chunks = (total_rows + chunk_size - 1) / chunk_size;
 
     #[cfg(target_arch = "aarch64")]
