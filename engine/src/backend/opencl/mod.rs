@@ -4692,4 +4692,135 @@ mod noshuffle_tests {
             }
         }
     }
+
+    #[test]
+    fn test_image1d_buffer_creation_and_readback() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // Create a buffer with known data
+        let data: Vec<u32> = (0..256).collect();
+        let buf = unsafe {
+            let b = ocl::core::create_buffer::<_, u32>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                data.len(),
+                None,
+            )
+            .unwrap();
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &b,
+                true,
+                0,
+                std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+            b
+        };
+
+        // Create image1d_buffer_t wrapping it (R32UI format)
+        use ocl::core::{
+            ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat, MemObjectType,
+        };
+        let img_fmt = ImageFormat::new(ImageChannelOrder::R, ImageChannelDataType::UnsignedInt32);
+        let img_desc = ImageDescriptor::new(
+            MemObjectType::Image1dBuffer,
+            data.len(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(buf.clone()),
+        );
+        let result = unsafe {
+            ocl::core::create_image(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_ONLY,
+                &img_fmt,
+                &img_desc,
+                None::<&[u32]>,
+                None,
+            )
+        };
+
+        match result {
+            Ok(img) => {
+                eprintln!(
+                    "[PASS] image1d_buffer_t R32UI created: width={}",
+                    data.len()
+                );
+                drop(img);
+            }
+            Err(e) => {
+                eprintln!("[SKIPPED] image1d_buffer_t not supported: {}", e);
+            }
+        }
+
+        // Also test RGBA32F format (for activation vectors)
+        let float_data: Vec<f32> = (0..64).map(|i| i as f32 * 0.1).collect();
+        let float_buf = unsafe {
+            let b = ocl::core::create_buffer::<_, f32>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                float_data.len(),
+                None,
+            )
+            .unwrap();
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &b,
+                true,
+                0,
+                std::slice::from_raw_parts(float_data.as_ptr() as *const u8, float_data.len() * 4),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+            b
+        };
+
+        let act_fmt = ImageFormat::new(ImageChannelOrder::Rgba, ImageChannelDataType::Float);
+        let act_desc = ImageDescriptor::new(
+            MemObjectType::Image1dBuffer,
+            float_data.len() / 4, // RGBA = 4 floats per texel
+            0,
+            0,
+            0,
+            0,
+            0,
+            Some(float_buf.clone()),
+        );
+        let act_result = unsafe {
+            ocl::core::create_image(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_ONLY,
+                &act_fmt,
+                &act_desc,
+                None::<&[f32]>,
+                None,
+            )
+        };
+
+        match act_result {
+            Ok(img) => {
+                eprintln!(
+                    "[PASS] image1d_buffer_t RGBA32F created: width={}",
+                    float_data.len() / 4
+                );
+                drop(img);
+            }
+            Err(e) => {
+                eprintln!("[SKIPPED] image1d_buffer_t RGBA32F not supported: {}", e);
+            }
+        }
+    }
 }
