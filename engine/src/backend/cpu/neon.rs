@@ -7,11 +7,34 @@ use crate::core::thread_pool::{self, WorkFn};
 use anyhow::{Result, anyhow};
 use rayon::prelude::*;
 use std::arch::aarch64::*;
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 /// Runtime toggle: when true, F16 matmul uses Rayon instead of SpinPool.
 /// Set via `--use-rayon` CLI flag for A/B benchmarking.
 pub static USE_RAYON: AtomicBool = AtomicBool::new(false);
+
+// Reusable Q8_0 workspace for matmul_transposed_q4_0.
+// Eliminates per-matmul Vec<BlockQ8_0> allocation (~112 allocs/token).
+// Safety: single-threaded inference model — only the main thread quantizes into this buffer
+// before par_chunks_mut reads it via raw pointer.
+thread_local! {
+    static Q8_WORKSPACE: RefCell<Vec<BlockQ8_0>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Wrapper to send `*const BlockQ8_0` into Rayon parallel closures.
+/// Safety: the pointer targets a thread-local buffer that is fully initialized
+/// before the parallel region and only read (never written) during it.
+#[derive(Clone, Copy)]
+struct SendSyncPtr(*const BlockQ8_0);
+unsafe impl Send for SendSyncPtr {}
+unsafe impl Sync for SendSyncPtr {}
+impl SendSyncPtr {
+    #[inline(always)]
+    fn ptr(self) -> *const BlockQ8_0 {
+        self.0
+    }
+}
 
 // sdot_asm and prefetch_asm removed (unused)
 
@@ -1897,25 +1920,46 @@ impl CpuBackendNeon {
         let nb_k_q8 = k / QK8_0;
         let total_q8_blocks = m * nb_k_q8;
 
-        // Temp buffer allocation
-        let mut a_q8 = Vec::with_capacity(total_q8_blocks);
-        unsafe {
-            a_q8.set_len(total_q8_blocks);
-        }
-
-        for i in 0..m {
-            let a_offset = i * k;
-            let a_row = &a_data[a_offset..a_offset + k];
-            let q8_row = &mut a_q8[i * nb_k_q8..(i + 1) * nb_k_q8];
-            unsafe {
-                self.quantize_row_q8_0(a_row, q8_row, k);
+        // Reuse thread-local workspace to avoid per-matmul allocation.
+        // Safety: we quantize into the buffer here (main thread), then only read it
+        // via raw pointer in par_chunks_mut. The buffer outlives the parallel region
+        // because thread-local storage persists for the thread's lifetime.
+        let a_q8_ptr: SendSyncPtr = Q8_WORKSPACE.with(|ws| {
+            let mut a_q8 = ws.borrow_mut();
+            if a_q8.len() < total_q8_blocks {
+                let additional = total_q8_blocks - a_q8.len();
+                a_q8.reserve(additional);
+                // Safety: reserve guarantees capacity >= total_q8_blocks.
+                // quantize_row_q8_0 will fully initialize these blocks below.
+                unsafe {
+                    a_q8.set_len(total_q8_blocks);
+                }
             }
-        }
 
-        // Adaptive chunking strategy
+            for i in 0..m {
+                let a_offset = i * k;
+                let a_row = &a_data[a_offset..a_offset + k];
+                let q8_row = &mut a_q8[i * nb_k_q8..(i + 1) * nb_k_q8];
+                unsafe {
+                    self.quantize_row_q8_0(a_row, q8_row, k);
+                }
+            }
+
+            SendSyncPtr(a_q8.as_ptr())
+        });
+
+        // Chunking strategy: smaller chunks for GEMV to improve Rayon work-stealing.
+        // GEMV (m=1): chunk_size=64 → 32 tasks for n=2048 with 8 threads.
+        // GEMM (m>1): larger chunks to amortize scheduling overhead.
         let num_threads = rayon::current_num_threads();
-        let chunk_size = (n + num_threads - 1) / num_threads;
-        let chunk_size = chunk_size.max(256);
+        let total_elements = m * n;
+        let chunk_size = if m == 1 {
+            // GEMV: fine-grained chunking (llama.cpp uses 64)
+            64
+        } else {
+            let cs = total_elements.div_ceil(num_threads);
+            cs.max(256)
+        };
 
         out_data.par_chunks_mut(chunk_size).enumerate().for_each(
             |(chunk_idx, chunk): (usize, &mut [f32])| {
@@ -1934,14 +1978,16 @@ impl CpuBackendNeon {
                         let idx = start_idx + local_i;
                         let i = idx / n;
                         let j = idx % n;
-                        let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
+                        // Safety: a_q8_ptr.0 points to the thread-local workspace which is
+                        // still alive (thread_local storage persists). We only read from it.
+                        let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
 
                         // Pair adjacent weight rows if within same activation row
                         if local_i + 1 < chunk.len() && j + 1 < n {
                             let b0 = unsafe { b_row_node.add(j * nb_k) };
                             let b1 = unsafe { b_row_node.add((j + 1) * nb_k) };
                             // Safety: b0/b1 point to valid BlockQ4_0 rows within b tensor,
-                            // a_row_ptr points to valid BlockQ8_0 row within a_q8.
+                            // a_row_ptr points to valid BlockQ8_0 row within workspace.
                             // chunk[local_i..local_i+2] is within bounds (checked above).
                             // split_at_mut to satisfy borrow checker for two disjoint elements.
                             let (left, right) = chunk[local_i..].split_at_mut(1);
@@ -1979,7 +2025,8 @@ impl CpuBackendNeon {
                         let b_offset = j * nb_k;
                         let b_row_node = b.as_ptr() as *const BlockQ4_0;
                         let b_row_ptr = unsafe { b_row_node.add(b_offset) };
-                        let a_row_ptr = unsafe { a_q8.as_ptr().add(i * nb_k_q8) };
+                        // Safety: same as i8mm path — reading from workspace via raw pointer.
+                        let a_row_ptr = unsafe { a_q8_ptr.ptr().add(i * nb_k_q8) };
 
                         let mut sum = 0.0;
                         unsafe {
