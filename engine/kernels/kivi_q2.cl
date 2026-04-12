@@ -153,6 +153,113 @@ __kernel void kivi_scatter_residual(
 // Writes new K/V tokens from SeqMajor input to head-first residual buffer.
 // Called during update() to scatter incoming tokens.
 
+// ─── F16-output dequant/scatter kernels ─────────────────────────────────────
+//
+// Identical logic to the F32 variants above, but write half instead of float.
+// Used when gpu_attn_k/gpu_attn_v are allocated as F16 buffers to halve VRAM.
+
+__kernel void kivi_dequantize_value_q2_f16(
+    __global const uchar* q2_data,
+    __global half* attn_v,            // [max_seq, kv_heads, head_dim] F16
+    const int kv_heads,
+    const int head_dim,
+    const int flush_tokens,
+    const int tok_base,
+    const int block_offset
+) {
+    const int bid = get_global_id(0);
+    const int blocks_per_token = head_dim / Q2_GROUP_SIZE;
+    const int total_blocks = kv_heads * flush_tokens * blocks_per_token;
+    if (bid >= total_blocks) return;
+
+    const int b = bid % blocks_per_token;
+    const int temp = bid / blocks_per_token;
+    const int t = temp % flush_tokens;
+    const int h = temp / flush_tokens;
+
+    const int src_off = (block_offset + bid) * Q2_BLOCK_SIZE;
+    const float d = vload_half(0, (__global const half*)(q2_data + src_off));
+    const float m = vload_half(0, (__global const half*)(q2_data + src_off + 2));
+
+    const int dst_base = (tok_base + t) * kv_heads * head_dim + h * head_dim + b * Q2_GROUP_SIZE;
+
+    for (int i = 0; i < 8; i++) {
+        const uchar byte = q2_data[src_off + 4 + i];
+        attn_v[dst_base + i * 4 + 0] = convert_half((float)((byte >> 0) & 0x03) * d + m);
+        attn_v[dst_base + i * 4 + 1] = convert_half((float)((byte >> 2) & 0x03) * d + m);
+        attn_v[dst_base + i * 4 + 2] = convert_half((float)((byte >> 4) & 0x03) * d + m);
+        attn_v[dst_base + i * 4 + 3] = convert_half((float)((byte >> 6) & 0x03) * d + m);
+    }
+}
+
+__kernel void kivi_dequantize_key_q2_f16(
+    __global const uchar* q2_data,
+    __global half* attn_k,            // [max_seq, kv_heads, head_dim] F16
+    const int kv_heads,
+    const int head_dim,
+    const int groups_per_flush,
+    const int tok_base,
+    const int block_offset
+) {
+    const int bid = get_global_id(0);
+    const int total_blocks = kv_heads * groups_per_flush * head_dim;
+    if (bid >= total_blocks) return;
+
+    const int ch = bid % head_dim;
+    const int temp = bid / head_dim;
+    const int g = temp % groups_per_flush;
+    const int h = temp / groups_per_flush;
+
+    const int src_off = (block_offset + bid) * Q2_BLOCK_SIZE;
+    const float d = vload_half(0, (__global const half*)(q2_data + src_off));
+    const float m = vload_half(0, (__global const half*)(q2_data + src_off + 2));
+
+    const int tok_start = tok_base + g * Q2_GROUP_SIZE;
+    const int head_offset = h * head_dim + ch;
+
+    for (int i = 0; i < 8; i++) {
+        const uchar byte = q2_data[src_off + 4 + i];
+        const int base_t = i * 4;
+
+        attn_k[(tok_start + base_t + 0) * kv_heads * head_dim + head_offset] =
+            convert_half((float)((byte >> 0) & 0x03) * d + m);
+        attn_k[(tok_start + base_t + 1) * kv_heads * head_dim + head_offset] =
+            convert_half((float)((byte >> 2) & 0x03) * d + m);
+        attn_k[(tok_start + base_t + 2) * kv_heads * head_dim + head_offset] =
+            convert_half((float)((byte >> 4) & 0x03) * d + m);
+        attn_k[(tok_start + base_t + 3) * kv_heads * head_dim + head_offset] =
+            convert_half((float)((byte >> 6) & 0x03) * d + m);
+    }
+}
+
+__kernel void kivi_scatter_residual_f16(
+    __global const float* residual,   // [kv_heads, res_cap, head_dim] F32
+    __global half* attn,              // [max_seq, kv_heads, head_dim] F16
+    const int kv_heads,
+    const int res_cap,
+    const int head_dim,
+    const int res_pos,
+    const int tok_base
+) {
+    const int tid = get_global_id(0);
+    const int total = kv_heads * res_pos * head_dim;
+    if (tid >= total) return;
+
+    const int d = tid % head_dim;
+    const int tmp = tid / head_dim;
+    const int t = tmp % res_pos;
+    const int h = tmp / res_pos;
+
+    const int src_idx = h * res_cap * head_dim + t * head_dim + d;
+    const int dst_idx = (tok_base + t) * kv_heads * head_dim + h * head_dim + d;
+    attn[dst_idx] = convert_half(residual[src_idx]);
+}
+
+// ─── Update gather: [seq_len, kv_heads, head_dim] → [kv_heads, res_cap, head_dim] ──
+//
+// Writes new K/V tokens from SeqMajor input to head-first residual buffer.
+// Called during update() to scatter incoming tokens.
+
 __kernel void kivi_gather_update(
     __global const float* input,      // [seq_len, kv_heads, head_dim]
     __global float* residual,         // [kv_heads, res_cap, head_dim]

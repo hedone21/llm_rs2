@@ -125,6 +125,10 @@ struct KernelCache {
     kernel_kivi_deq_key_q2: Option<CoreKernel>,
     kernel_kivi_scatter_residual: Option<CoreKernel>,
     kernel_kivi_gather_update: Option<CoreKernel>,
+    // KIVI Q2 F16-output variants (dequant/scatter to half buffers)
+    kernel_kivi_deq_value_q2_f16: Option<CoreKernel>,
+    kernel_kivi_deq_key_q2_f16: Option<CoreKernel>,
+    kernel_kivi_scatter_residual_f16: Option<CoreKernel>,
     // KIVI fused attention kernels (optional — direct Q2/Q4/Q8 attention without F32 dequant)
     kernel_attn_gen_kivi_q2: Option<CoreKernel>,
     kernel_attn_gen_kivi_q4: Option<CoreKernel>,
@@ -762,6 +766,15 @@ impl OpenCLBackend {
             kernel_kivi_gather_update: kivi_q2_kernels
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kivi_gather_update").ok()),
+            kernel_kivi_deq_value_q2_f16: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_value_q2_f16").ok()),
+            kernel_kivi_deq_key_q2_f16: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_dequantize_key_q2_f16").ok()),
+            kernel_kivi_scatter_residual_f16: kivi_q2_kernels
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kivi_scatter_residual_f16").ok()),
             kernel_attn_gen_kivi_q2: kivi_attn_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_attn_gen_kivi_q2").ok()),
@@ -2994,6 +3007,162 @@ impl OpenCLBackend {
             .kernel_kivi_scatter_residual
             .as_ref()
             .ok_or_else(|| anyhow!("KIVI Q2 kernel not available"))?;
+
+        let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
+        let attn_mem = get_cl_mem(attn.buffer().as_ref())?;
+
+        let total = kv_heads * res_pos * head_dim;
+        let kv_heads_i = kv_heads as i32;
+        let res_cap_i = res_cap as i32;
+        let head_dim_i = head_dim as i32;
+        let res_pos_i = res_pos as i32;
+        let tok_base_i = tok_base as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(residual_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&res_cap_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&res_pos_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&tok_base_i))?;
+
+            let global_work_size: [usize; 3] = [total, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize Q2 value blocks on GPU to F16 attention buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_dequantize_value_q2_f16(
+        &self,
+        q2_buf: &Tensor,
+        attn_v: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        flush_tokens: usize,
+        tok_base: usize,
+        block_offset: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_deq_value_q2_f16
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI Q2 F16 value dequant kernel not available"))?;
+
+        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
+        let attn_v_mem = get_cl_mem(attn_v.buffer().as_ref())?;
+
+        let total_blocks = kv_heads * flush_tokens * (head_dim / 32);
+        let kv_heads_i = kv_heads as i32;
+        let head_dim_i = head_dim as i32;
+        let flush_tokens_i = flush_tokens as i32;
+        let tok_base_i = tok_base as i32;
+        let block_offset_i = block_offset as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_v_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&flush_tokens_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
+
+            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Dequantize Q2 key blocks on GPU to F16 attention buffer (per-channel scatter).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_dequantize_key_q2_f16(
+        &self,
+        q2_buf: &Tensor,
+        attn_k: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        groups_per_flush: usize,
+        tok_base: usize,
+        block_offset: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_deq_key_q2_f16
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI Q2 F16 key dequant kernel not available"))?;
+
+        let q2_mem = get_cl_mem(q2_buf.buffer().as_ref())?;
+        let attn_k_mem = get_cl_mem(attn_k.buffer().as_ref())?;
+
+        let total_blocks = kv_heads * groups_per_flush * head_dim;
+        let kv_heads_i = kv_heads as i32;
+        let head_dim_i = head_dim as i32;
+        let groups_per_flush_i = groups_per_flush as i32;
+        let tok_base_i = tok_base as i32;
+        let block_offset_i = block_offset as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q2_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(attn_k_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&kv_heads_i))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&head_dim_i))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&groups_per_flush_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&tok_base_i))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
+
+            let global_work_size: [usize; 3] = [total_blocks, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                None::<[usize; 3]>,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Scatter residual F32 buffer to F16 attention buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kivi_scatter_residual_f16(
+        &self,
+        residual: &Tensor,
+        attn: &mut Tensor,
+        kv_heads: usize,
+        res_cap: usize,
+        head_dim: usize,
+        res_pos: usize,
+        tok_base: usize,
+    ) -> Result<()> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = kernels
+            .kernel_kivi_scatter_residual_f16
+            .as_ref()
+            .ok_or_else(|| anyhow!("KIVI F16 scatter_residual kernel not available"))?;
 
         let residual_mem = get_cl_mem(residual.buffer().as_ref())?;
         let attn_mem = get_cl_mem(attn.buffer().as_ref())?;

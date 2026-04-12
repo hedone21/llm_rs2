@@ -1653,9 +1653,10 @@ fn make_kivi_gather_step(
     })
 }
 
-/// Build a KIVI scatter_residual kernel step for K or V.
+/// Build a KIVI scatter_residual_f16 kernel step for K or V.
+/// Scatters F32 residual data into F16 attention buffer.
 ///
-/// kivi_scatter_residual args:
+/// kivi_scatter_residual_f16 args:
 ///   residual(0), attn(1), kv_heads(2), res_cap(3), head_dim(4), res_pos(5), tok_base(6)
 fn make_kivi_scatter_step(
     kivi_q2_program: &ocl::Program,
@@ -1665,8 +1666,9 @@ fn make_kivi_scatter_step(
     res_cap: usize,
     head_dim: usize,
 ) -> Result<KernelStep> {
-    let kernel = ocl::core::create_kernel(kivi_q2_program, "kivi_scatter_residual")
-        .context("create kivi_scatter_residual")?;
+    // F16 variant: residual is F32 input, attn output is F16 buffer
+    let kernel = ocl::core::create_kernel(kivi_q2_program, "kivi_scatter_residual_f16")
+        .context("create kivi_scatter_residual_f16")?;
     let res_pos_init = 0i32;
     let tok_base_init = 0i32;
     unsafe {
@@ -1904,7 +1906,7 @@ fn build_kivi_layer_plan(
             ));
         }
     } else {
-        // Assembled: scatter residual to attn buffer, then standard attention on the F32 buffer
+        // Assembled: scatter F32 residual to F16 attn buffer, then F16 attention
         let scatter_k = make_kivi_scatter_step(
             kivi_q2_program,
             kivi_kv.res_k,

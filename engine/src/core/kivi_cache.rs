@@ -251,10 +251,10 @@ pub struct KiviCache {
     gpu_res_k: Option<Tensor>,
     /// GPU F32 residual V buffer: [kv_heads, res_cap, head_dim]
     gpu_res_v: Option<Tensor>,
-    /// GPU F32 attention K output: [gpu_attn_cap, kv_heads, head_dim]
+    /// GPU F16 attention K output: [gpu_attn_cap, kv_heads, head_dim]
     /// Capacity grows lazily via `ensure_gpu_attn_capacity()`.
     gpu_attn_k: Option<Tensor>,
-    /// GPU F32 attention V output: [gpu_attn_cap, kv_heads, head_dim]
+    /// GPU F16 attention V output: [gpu_attn_cap, kv_heads, head_dim]
     /// Capacity grows lazily via `ensure_gpu_attn_capacity()`.
     gpu_attn_v: Option<Tensor>,
     /// Current allocated capacity of gpu_attn_k/v in tokens.
@@ -425,13 +425,15 @@ impl KiviCache {
                 backend.clone(),
             );
 
-            let attn_k_buf = memory.alloc(attn_elems * 4, DType::F32)?;
+            // Attention buffers use F16 to halve GPU memory (~112 MB savings).
+            // Dequant kernels (*_f16) and scatter_residual_f16 write half directly.
+            let attn_k_buf = memory.alloc(attn_elems * 2, DType::F16)?;
             let attn_k = Tensor::new(
                 Shape::new(vec![initial_attn_cap, kv_heads, head_dim]),
                 attn_k_buf,
                 backend.clone(),
             );
-            let attn_v_buf = memory.alloc(attn_elems * 4, DType::F32)?;
+            let attn_v_buf = memory.alloc(attn_elems * 2, DType::F16)?;
             let attn_v = Tensor::new(
                 Shape::new(vec![initial_attn_cap, kv_heads, head_dim]),
                 attn_v_buf,
@@ -554,15 +556,15 @@ impl KiviCache {
         let new_elems = new_cap * self.kv_heads * self.head_dim;
         let new_shape = Shape::new(vec![new_cap, self.kv_heads, self.head_dim]);
 
-        // Allocate new K buffer
-        let new_k_buf = memory.alloc(new_elems * 4, DType::F32)?;
+        // Allocate new F16 K buffer
+        let new_k_buf = memory.alloc(new_elems * 2, DType::F16)?;
         let mut new_k = Tensor::new(new_shape.clone(), new_k_buf, backend.clone());
-        // Allocate new V buffer
-        let new_v_buf = memory.alloc(new_elems * 4, DType::F32)?;
+        // Allocate new F16 V buffer
+        let new_v_buf = memory.alloc(new_elems * 2, DType::F16)?;
         let mut new_v = Tensor::new(new_shape, new_v_buf, backend.clone());
 
         // Zero-initialize new buffers to prevent garbage in unwritten regions
-        let zeros = vec![0u8; new_elems * 4];
+        let zeros = vec![0u8; new_elems * 2];
         backend.write_buffer(&mut new_k, &zeros)?;
         backend.write_buffer(&mut new_v, &zeros)?;
 
@@ -897,25 +899,26 @@ impl KiviCache {
             let new_elems = self.kv_heads * new_res_cap * self.head_dim;
 
             if self.is_gpu() {
-                // GPU mode: read GPU attn buffers (which contain all dequanted data)
-                // into temporary Vecs, then populate residual.
+                // GPU mode: read F16 GPU attn buffers, convert to F32, populate residual.
                 // Use gpu_attn_cap (not max_seq_len) since lazy grow may not have
                 // expanded to full size yet.
                 let read_cap = self.gpu_attn_cap;
                 let attn_buf_size = read_cap * self.kv_heads * self.head_dim;
-                let mut tmp_attn_k = vec![0.0f32; attn_buf_size];
-                let mut tmp_attn_v = vec![0.0f32; attn_buf_size];
 
                 // First, ensure GPU attn buffers are up to date (scatter residual)
                 let _ = self.assemble_view_gpu();
 
-                // Read GPU attn buffers to tmp (only gpu_attn_cap worth of data)
+                // Read F16 GPU attn buffers to temporary half vec, then convert to F32
+                let mut tmp_attn_k_f16 = vec![half::f16::ZERO; attn_buf_size];
+                let mut tmp_attn_v_f16 = vec![half::f16::ZERO; attn_buf_size];
+
                 let backend = self.gpu_backend.as_ref().unwrap();
                 if let Some(gpu_attn_k) = self.gpu_attn_k.as_ref() {
+                    // SAFETY: half::f16 is repr(transparent) over u16, 2 bytes each
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(
-                            tmp_attn_k.as_mut_ptr() as *mut u8,
-                            attn_buf_size * 4,
+                            tmp_attn_k_f16.as_mut_ptr() as *mut u8,
+                            attn_buf_size * 2,
                         )
                     };
                     backend.read_buffer(gpu_attn_k, dst)?;
@@ -923,12 +926,16 @@ impl KiviCache {
                 if let Some(gpu_attn_v) = self.gpu_attn_v.as_ref() {
                     let dst = unsafe {
                         std::slice::from_raw_parts_mut(
-                            tmp_attn_v.as_mut_ptr() as *mut u8,
-                            attn_buf_size * 4,
+                            tmp_attn_v_f16.as_mut_ptr() as *mut u8,
+                            attn_buf_size * 2,
                         )
                     };
                     backend.read_buffer(gpu_attn_v, dst)?;
                 }
+
+                // Convert F16 → F32
+                let tmp_attn_k: Vec<f32> = tmp_attn_k_f16.iter().map(|v| v.to_f32()).collect();
+                let tmp_attn_v: Vec<f32> = tmp_attn_v_f16.iter().map(|v| v.to_f32()).collect();
 
                 // Expand residual and copy from tmp attn buffers
                 self.res_k.resize(new_elems, 0.0);
@@ -1616,13 +1623,13 @@ impl KiviCache {
                     }
                 }
 
-                // Dispatch GPU dequant: fill F32 attention buffers for the assembled path.
-                // Q2: use dedicated GPU dequant kernel (fast).
-                // Q4/Q8: no GPU dequant kernel yet — CPU dequant into temp buf + upload F32.
+                // Dispatch GPU dequant: fill F16 attention buffers for the assembled path.
+                // Q2: use dedicated GPU F16 dequant kernel (fast).
+                // Q4/Q8: no GPU dequant kernel yet — CPU dequant → F16 convert → upload.
                 if self.bits == 2 {
                     let gpu_q2k = self.gpu_q2k.as_ref().unwrap();
                     let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
-                    ocl.kivi_dequantize_key_q2(
+                    ocl.kivi_dequantize_key_q2_f16(
                         gpu_q2k,
                         gpu_attn_k,
                         self.kv_heads,
@@ -1633,7 +1640,7 @@ impl KiviCache {
                     )?;
                     let gpu_q2v = self.gpu_q2v.as_ref().unwrap();
                     let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
-                    ocl.kivi_dequantize_value_q2(
+                    ocl.kivi_dequantize_value_q2_f16(
                         gpu_q2v,
                         gpu_attn_v,
                         self.kv_heads,
@@ -1643,7 +1650,7 @@ impl KiviCache {
                         v_block_start,
                     )?;
                 } else {
-                    // Q4/Q8: CPU dequant into temporary buffer, then upload to GPU.
+                    // Q4/Q8: CPU dequant into temporary F32 buffer, convert to F16, upload.
                     // Uses tmp_qk/tmp_qv instead of self.qk/self.qv (which are empty in GPU mode).
                     // Use gpu_attn_cap (not max_seq_len) for tmp buffer size since lazy grow
                     // may not have expanded to full size.
@@ -1687,25 +1694,30 @@ impl KiviCache {
                         }
                     }
 
-                    // Upload dequanted F32 to GPU attention buffers (gpu_attn_cap sized)
+                    // Convert F32 → F16 and upload to GPU attention buffers
+                    let tmp_attn_k_f16: Vec<half::f16> =
+                        tmp_attn_k.iter().map(|&v| half::f16::from_f32(v)).collect();
+                    let tmp_attn_v_f16: Vec<half::f16> =
+                        tmp_attn_v.iter().map(|&v| half::f16::from_f32(v)).collect();
+
                     let backend = self.gpu_backend.as_ref().unwrap();
                     let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
                     let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
-                    // SAFETY: tmp_attn_k/v are contiguous f32 vecs, reinterpret as bytes for upload
-                    let k_f32_bytes = unsafe {
+                    // SAFETY: half::f16 is repr(transparent) over u16, contiguous in memory
+                    let k_f16_bytes = unsafe {
                         std::slice::from_raw_parts(
-                            tmp_attn_k.as_ptr() as *const u8,
-                            tmp_attn_k.len() * 4,
+                            tmp_attn_k_f16.as_ptr() as *const u8,
+                            tmp_attn_k_f16.len() * 2,
                         )
                     };
-                    backend.write_buffer(gpu_attn_k, k_f32_bytes)?;
-                    let v_f32_bytes = unsafe {
+                    backend.write_buffer(gpu_attn_k, k_f16_bytes)?;
+                    let v_f16_bytes = unsafe {
                         std::slice::from_raw_parts(
-                            tmp_attn_v.as_ptr() as *const u8,
-                            tmp_attn_v.len() * 4,
+                            tmp_attn_v_f16.as_ptr() as *const u8,
+                            tmp_attn_v_f16.len() * 2,
                         )
                     };
-                    backend.write_buffer(gpu_attn_v, v_f32_bytes)?;
+                    backend.write_buffer(gpu_attn_v, v_f16_bytes)?;
                 }
             }
         }
@@ -1836,9 +1848,10 @@ impl KiviCache {
             if self.res_pos > 0 {
                 let backend_arc = self.gpu_backend.as_ref().unwrap().clone();
                 if let Some(ocl) = backend_arc.as_any().downcast_ref::<OpenCLBackend>() {
+                    // F32 residual → F16 attention buffer (scatter + convert)
                     let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
                     let gpu_attn_k = self.gpu_attn_k.as_mut().unwrap();
-                    ocl.kivi_scatter_residual(
+                    ocl.kivi_scatter_residual_f16(
                         gpu_res_k,
                         gpu_attn_k,
                         self.kv_heads,
@@ -1849,7 +1862,7 @@ impl KiviCache {
                     )?;
                     let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
                     let gpu_attn_v = self.gpu_attn_v.as_mut().unwrap();
-                    ocl.kivi_scatter_residual(
+                    ocl.kivi_scatter_residual_f16(
                         gpu_res_v,
                         gpu_attn_v,
                         self.kv_heads,
@@ -3634,6 +3647,89 @@ mod tests {
         assert!(
             (expected_first - actual_first).abs() < 0.5,
             "Q2 token 0 element 0: expected ~{expected_first}, got {actual_first}"
+        );
+    }
+
+    /// Verify that F16 round-trip of Q2 dequantized values preserves precision.
+    /// KIVI Q2 dequant outputs are in a narrow range (typically -2..+2),
+    /// so F16 (which covers +/-65504 with ~3.3 decimal digits) should be more
+    /// than sufficient. This test confirms cosine similarity > 0.9999.
+    #[test]
+    fn test_f16_dequant_precision_simulation() {
+        let kv_heads = 2;
+        let head_dim = 64;
+        let max_seq = 256;
+        let res_cap = 32;
+        let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
+
+        // Insert 65 tokens to trigger at least one flush (res_cap=32 → flush at 32)
+        for i in 0..65 {
+            let k = make_input_tensor(1, kv_heads, head_dim, 0.1 + i as f32 * 0.05);
+            let v = make_input_tensor(1, kv_heads, head_dim, -0.1 - i as f32 * 0.03);
+            cache.update(&k, &v).unwrap();
+        }
+
+        let (k_view, v_view) = cache.get_view();
+        let k_f32 =
+            unsafe { std::slice::from_raw_parts(k_view.as_ptr() as *const f32, k_view.size() / 4) };
+        let v_f32 =
+            unsafe { std::slice::from_raw_parts(v_view.as_ptr() as *const f32, v_view.size() / 4) };
+
+        // Simulate F16 round-trip
+        let k_f16_roundtrip: Vec<f32> = k_f32
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+        let v_f16_roundtrip: Vec<f32> = v_f32
+            .iter()
+            .map(|&v| half::f16::from_f32(v).to_f32())
+            .collect();
+
+        // Cosine similarity
+        fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
+            let mut dot = 0.0f64;
+            let mut norm_a = 0.0f64;
+            let mut norm_b = 0.0f64;
+            for (&x, &y) in a.iter().zip(b.iter()) {
+                dot += x as f64 * y as f64;
+                norm_a += (x as f64) * (x as f64);
+                norm_b += (y as f64) * (y as f64);
+            }
+            if norm_a == 0.0 || norm_b == 0.0 {
+                return 1.0; // both zero = identical
+            }
+            (dot / (norm_a.sqrt() * norm_b.sqrt())) as f32
+        }
+
+        let k_cos = cosine_sim(k_f32, &k_f16_roundtrip);
+        let v_cos = cosine_sim(v_f32, &v_f16_roundtrip);
+        assert!(
+            k_cos > 0.9999,
+            "K F16 precision loss too high: cosine_sim = {k_cos}"
+        );
+        assert!(
+            v_cos > 0.9999,
+            "V F16 precision loss too high: cosine_sim = {v_cos}"
+        );
+    }
+
+    /// Verify that GPU-mode attn buffers are allocated as F16 (not F32).
+    /// new_gpu() with non-OpenCL backend falls back to CPU mode, so we just
+    /// verify that the CPU fallback path doesn't create F16 buffers.
+    #[test]
+    fn test_new_gpu_fallback_no_f16_attn_buffers() {
+        use crate::memory::galloc::Galloc;
+        let cpu_backend: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let memory: Arc<dyn crate::core::memory::Memory> = Arc::new(Galloc::new());
+        let cache = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
+        // CPU fallback: gpu_attn_k/v should be None
+        assert!(
+            cache.gpu_attn_k.is_none(),
+            "CPU fallback should not have gpu_attn_k"
+        );
+        assert!(
+            cache.gpu_attn_v.is_none(),
+            "CPU fallback should not have gpu_attn_v"
         );
     }
 }
