@@ -1,18 +1,38 @@
 #!/usr/bin/env python3
-"""Convert safetensors F16 model to pure Q4_0 GGUF for llm.rs testing.
+"""Convert safetensors F16 model to Q4_0 GGUF compatible with both llm.rs and llama.cpp.
 
 Usage:
     python scripts/convert_safetensors_to_gguf.py \
-        models/llama3.2-1b \
-        models/llama3.2-1b-q4_0.gguf
+        models/qwen2.5-1.5b \
+        models/qwen2.5-1.5b-q4_0.gguf
 """
 import sys, json, struct, os
 import numpy as np
 from pathlib import Path
 from safetensors import safe_open
-from safetensors.numpy import load_file as st_load_file
 
 QK4_0 = 32  # Q4_0 block size
+
+# ggml_type constants
+GGML_F32 = 0
+GGML_F16 = 1
+GGML_Q4_0 = 2
+
+# GGUF value type constants
+GGUF_TYPE_UINT8   = 0
+GGUF_TYPE_INT8    = 1
+GGUF_TYPE_UINT16  = 2
+GGUF_TYPE_INT16   = 3
+GGUF_TYPE_UINT32  = 4
+GGUF_TYPE_INT32   = 5
+GGUF_TYPE_FLOAT32 = 6
+GGUF_TYPE_BOOL    = 7
+GGUF_TYPE_STRING  = 8
+GGUF_TYPE_ARRAY   = 9
+GGUF_TYPE_UINT64  = 10
+
+ALIGNMENT = 32
+
 
 def quantize_q4_0(data_f32: np.ndarray) -> bytes:
     """Quantize F32 array to Q4_0 blocks (matches llm.rs/ggml BlockQ4_0)."""
@@ -42,6 +62,8 @@ def quantize_q4_0(data_f32: np.ndarray) -> bytes:
     return bytes(result)
 
 
+# ---------- GGUF writers ----------
+
 def write_gguf_string(buf: bytearray, s: str):
     """Write GGUF string: u64 len + bytes."""
     encoded = s.encode('utf-8')
@@ -54,23 +76,46 @@ def write_gguf_kv(buf: bytearray, key: str, value, vtype: int):
     write_gguf_string(buf, key)
     buf.extend(struct.pack('<I', vtype))
 
-    if vtype == 4:    # u32
+    if vtype == GGUF_TYPE_UINT32:
         buf.extend(struct.pack('<I', value))
-    elif vtype == 6:  # f32
+    elif vtype == GGUF_TYPE_INT32:
+        buf.extend(struct.pack('<i', value))
+    elif vtype == GGUF_TYPE_FLOAT32:
         buf.extend(struct.pack('<f', value))
-    elif vtype == 8:  # string
+    elif vtype == GGUF_TYPE_BOOL:
+        buf.extend(struct.pack('<B', 1 if value else 0))
+    elif vtype == GGUF_TYPE_STRING:
         write_gguf_string(buf, value)
-    elif vtype == 10: # u64
+    elif vtype == GGUF_TYPE_UINT64:
         buf.extend(struct.pack('<Q', value))
 
 
-# GGUF tensor name mapping: HF name → GGUF name
+def write_gguf_kv_array(buf: bytearray, key: str, element_type: int, elements):
+    """Write a KV pair with array value."""
+    write_gguf_string(buf, key)
+    buf.extend(struct.pack('<I', GGUF_TYPE_ARRAY))
+    buf.extend(struct.pack('<I', element_type))
+    buf.extend(struct.pack('<Q', len(elements)))
+
+    for elem in elements:
+        if element_type == GGUF_TYPE_STRING:
+            write_gguf_string(buf, elem)
+        elif element_type == GGUF_TYPE_FLOAT32:
+            buf.extend(struct.pack('<f', elem))
+        elif element_type == GGUF_TYPE_INT32:
+            buf.extend(struct.pack('<i', elem))
+        elif element_type == GGUF_TYPE_UINT32:
+            buf.extend(struct.pack('<I', elem))
+
+
+# ---------- GGUF tensor name mapping ----------
+
 GGUF_NAMES = {
     "model.embed_tokens.weight": "token_embd.weight",
     "model.norm.weight": "output_norm.weight",
     "lm_head.weight": "output.weight",
 }
-for i in range(256):  # enough layers
+for i in range(256):
     GGUF_NAMES.update({
         f"model.layers.{i}.self_attn.q_proj.weight": f"blk.{i}.attn_q.weight",
         f"model.layers.{i}.self_attn.k_proj.weight": f"blk.{i}.attn_k.weight",
@@ -92,13 +137,140 @@ for i in range(256):  # enough layers
         f"model.layers.{i}.post_feedforward_layernorm.weight": f"blk.{i}.post_ffn_norm.weight",
     })
 
-# ggml_type constants
-GGML_F32 = 0
-GGML_F16 = 1
-GGML_Q4_0 = 2
 
-ALIGNMENT = 32
+# ---------- Tokenizer ----------
 
+# Token types matching ggml/llama.cpp
+LLAMA_TOKEN_TYPE_NORMAL       = 1
+LLAMA_TOKEN_TYPE_UNKNOWN      = 2
+LLAMA_TOKEN_TYPE_CONTROL      = 3
+LLAMA_TOKEN_TYPE_USER_DEFINED = 4
+LLAMA_TOKEN_TYPE_UNUSED       = 5
+LLAMA_TOKEN_TYPE_BYTE         = 6
+
+
+def load_tokenizer(model_dir: Path):
+    """Load tokenizer data from tokenizer.json and tokenizer_config.json.
+
+    Returns dict with keys: model_type, tokens, scores, token_types, merges,
+    bos_id, eos_id, pad_id, add_bos, add_eos, chat_template.
+    """
+    tokenizer_path = model_dir / "tokenizer.json"
+    config_path = model_dir / "tokenizer_config.json"
+    model_config_path = model_dir / "config.json"
+
+    if not tokenizer_path.exists():
+        print(f"WARNING: {tokenizer_path} not found — skipping tokenizer metadata")
+        return None
+
+    tok = json.loads(tokenizer_path.read_text())
+    tok_config = json.loads(config_path.read_text()) if config_path.exists() else {}
+    model_config = json.loads(model_config_path.read_text()) if model_config_path.exists() else {}
+
+    # Detect tokenizer model type
+    tok_model_type = tok.get("model", {}).get("type", "BPE")
+    if tok_model_type == "BPE":
+        ggml_model = "gpt2"
+    elif tok_model_type == "Unigram":
+        ggml_model = "llama"
+    elif tok_model_type == "WordPiece":
+        ggml_model = "bert"
+    else:
+        ggml_model = "gpt2"
+    print(f"Tokenizer: {tok_model_type} → ggml model '{ggml_model}'")
+
+    # Build vocab: need token string for each ID 0..vocab_size-1
+    vocab = tok.get("model", {}).get("vocab", {})
+    added_tokens = tok.get("added_tokens", [])
+    vocab_size = model_config.get("vocab_size", len(vocab) + len(added_tokens))
+
+    # Create id→token mapping
+    id_to_token = {}
+    for token_str, token_id in vocab.items():
+        id_to_token[token_id] = token_str
+
+    # Added tokens override
+    special_ids = set()
+    for at in added_tokens:
+        tid = at["id"]
+        id_to_token[tid] = at["content"]
+        if at.get("special", False):
+            special_ids.add(tid)
+
+    # Build ordered arrays
+    tokens = []
+    scores = []
+    token_types = []
+    for i in range(vocab_size):
+        if i in id_to_token:
+            tokens.append(id_to_token[i])
+        else:
+            tokens.append(f"[UNUSED_{i}]")
+
+        # Scores: for BPE, use negative index as score (lower = more frequent)
+        scores.append(float(-i))
+
+        # Token type
+        if i in special_ids:
+            token_types.append(LLAMA_TOKEN_TYPE_CONTROL)
+        elif i not in id_to_token:
+            token_types.append(LLAMA_TOKEN_TYPE_UNUSED)
+        else:
+            token_types.append(LLAMA_TOKEN_TYPE_NORMAL)
+
+    # Merges
+    merges = tok.get("model", {}).get("merges", [])
+
+    # Special token IDs
+    bos_id = model_config.get("bos_token_id")
+    eos_id = model_config.get("eos_token_id")
+
+    # Try to resolve from token strings if IDs not in config
+    if bos_id is None and tok_config.get("bos_token"):
+        bos_str = tok_config["bos_token"]
+        if isinstance(bos_str, dict):
+            bos_str = bos_str.get("content", "")
+        bos_id = vocab.get(bos_str)
+    if eos_id is None and tok_config.get("eos_token"):
+        eos_str = tok_config["eos_token"]
+        if isinstance(eos_str, dict):
+            eos_str = eos_str.get("content", "")
+        eos_id = vocab.get(eos_str)
+
+    # Padding token
+    pad_id = None
+    if tok_config.get("pad_token"):
+        pad_str = tok_config["pad_token"]
+        if isinstance(pad_str, dict):
+            pad_str = pad_str.get("content", "")
+        pad_id = vocab.get(pad_str)
+
+    add_bos = tok_config.get("add_bos_token", False)
+    add_eos = tok_config.get("add_eos_token", False)
+
+    # Chat template
+    chat_template = tok_config.get("chat_template")
+
+    print(f"  Vocab: {len(tokens)} tokens, {len(merges)} merges")
+    print(f"  BOS={bos_id}, EOS={eos_id}, PAD={pad_id}")
+    print(f"  Special tokens: {len(special_ids)}")
+
+    return {
+        "model_type": ggml_model,
+        "tokens": tokens,
+        "scores": scores,
+        "token_types": token_types,
+        "merges": merges,
+        "bos_id": bos_id,
+        "eos_id": eos_id,
+        "pad_id": pad_id,
+        "add_bos": add_bos,
+        "add_eos": add_eos,
+        "chat_template": chat_template,
+    }
+
+
+# ---------- Main ----------
 
 def main():
     if len(sys.argv) < 3:
@@ -118,6 +290,9 @@ def main():
     arch = ARCH_MAP.get(model_type, "llama")
     print(f"Architecture: {arch} (model_type={model_type})")
 
+    # Load tokenizer
+    tokenizer = load_tokenizer(model_dir)
+
     # Find safetensors files
     st_files = sorted(model_dir.glob("*.safetensors"))
     if not st_files:
@@ -135,25 +310,26 @@ def main():
 
     print(f"Found {len(tensor_names)} tensors in {len(st_files)} file(s)")
 
-    # Determine which tensors to quantize vs keep as F32
+    # Classify tensors: which to quantize vs keep as F32
     weight_2d = set()  # 2D weight tensors → Q4_0
-    norm_1d = set()    # 1D norm tensors → F32
-    embed = set()      # embed/lm_head → F32 (too important to quantize)
+    norm_1d = set()    # 1D norm/bias tensors → F32
 
     for name in tensor_names:
         h = handles[tensor_names[name]]
         shape = h.get_slice(name).get_shape()
         if len(shape) == 1:
             norm_1d.add(name)
-        elif "embed_tokens" in name or "lm_head" in name:
-            embed.add(name)
+        elif "embed_tokens" in name:
+            # embed_tokens stays F16: used by gather (embedding lookup) which
+            # needs direct indexing. Also serves as lm_head via weight tying.
+            norm_1d.add(name)
         else:
             if shape[-1] % QK4_0 == 0:
                 weight_2d.add(name)
             else:
-                embed.add(name)  # can't quantize, keep as F32
+                norm_1d.add(name)  # can't quantize, keep as F32
 
-    print(f"  Q4_0: {len(weight_2d)}, F32 norm: {len(norm_1d)}, F32 embed: {len(embed)}")
+    print(f"  Q4_0: {len(weight_2d)}, F32/F16: {len(norm_1d)}")
 
     # Prepare tensor data
     tensors = []  # (gguf_name, dims_gguf, ggml_type, data_bytes)
@@ -172,16 +348,14 @@ def main():
             # BF16 fallback: read raw uint16 bytes, convert to f32 via bit manipulation
             sl = h.get_slice(hf_name)
             shape_orig = sl.get_shape()
-            # Read raw bytes from safetensors file
             st_path = st_files[tensor_names[hf_name]]
             with open(str(st_path), 'rb') as raw_f:
                 header_size = struct.unpack('<Q', raw_f.read(8))[0]
-                header = json.loads(raw_f.read(header_size))
-                info = header[hf_name]
+                header_json = json.loads(raw_f.read(header_size))
+                info = header_json[hf_name]
                 offsets = info['data_offsets']
                 raw_f.seek(8 + header_size + offsets[0])
                 raw_bytes = raw_f.read(offsets[1] - offsets[0])
-            # BF16 → F32: shift left 16 bits
             bf16 = np.frombuffer(raw_bytes, dtype=np.uint16)
             f32_bits = bf16.astype(np.uint32) << 16
             tensor = np.frombuffer(f32_bits.tobytes(), dtype=np.float32).reshape(shape_orig)
@@ -191,66 +365,103 @@ def main():
         dims_gguf = list(reversed(shape))
 
         if hf_name in weight_2d:
-            # Quantize to Q4_0
             f32 = tensor.astype(np.float32).flatten()
             data = quantize_q4_0(f32)
             tensors.append((gguf_name, dims_gguf, GGML_Q4_0, data))
+        elif "embed_tokens" in hf_name:
+            # Embedding: store as F16 (saves 50% vs F32, used by gather lookup)
+            f16 = tensor.astype(np.float32).astype(np.float16)
+            data = f16.tobytes()
+            tensors.append((gguf_name, dims_gguf, GGML_F16, data))
         else:
-            # Keep as F32
             f32 = tensor.astype(np.float32)
             data = f32.tobytes()
             tensors.append((gguf_name, dims_gguf, GGML_F32, data))
 
     print(f"Prepared {len(tensors)} tensors for GGUF")
 
-    # Build GGUF file
+    # ========== Build GGUF file ==========
+
     # 1. Header
     header = bytearray()
     header.extend(struct.pack('<I', 0x46554747))  # magic: GGUF LE
     header.extend(struct.pack('<I', 3))            # version: 3
     header.extend(struct.pack('<Q', len(tensors))) # tensor_count
-    # KV count (will fill after building KV section)
 
     # 2. KV metadata
     kv = bytearray()
     kv_count = 0
 
-    def add_kv_str(key, val):
-        nonlocal kv_count
-        write_gguf_kv(kv, key, val, 8)
-        kv_count += 1
+    def add_str(key, val):
+        nonlocal kv_count; write_gguf_kv(kv, key, val, GGUF_TYPE_STRING); kv_count += 1
 
-    def add_kv_u32(key, val):
-        nonlocal kv_count
-        write_gguf_kv(kv, key, val, 4)
-        kv_count += 1
+    def add_u32(key, val):
+        nonlocal kv_count; write_gguf_kv(kv, key, val, GGUF_TYPE_UINT32); kv_count += 1
 
-    def add_kv_f32(key, val):
-        nonlocal kv_count
-        write_gguf_kv(kv, key, val, 6)
-        kv_count += 1
+    def add_f32(key, val):
+        nonlocal kv_count; write_gguf_kv(kv, key, val, GGUF_TYPE_FLOAT32); kv_count += 1
 
-    add_kv_str("general.architecture", arch)
-    add_kv_str("general.name", config.get("_name_or_path", "llama"))
-    add_kv_u32(f"{arch}.embedding_length", config["hidden_size"])
-    add_kv_u32(f"{arch}.block_count", config["num_hidden_layers"])
-    add_kv_u32(f"{arch}.attention.head_count", config["num_attention_heads"])
-    add_kv_u32(f"{arch}.attention.head_count_kv", config.get("num_key_value_heads", config["num_attention_heads"]))
-    add_kv_u32(f"{arch}.feed_forward_length", config["intermediate_size"])
-    add_kv_u32(f"{arch}.vocab_size", config["vocab_size"])
-    add_kv_u32(f"{arch}.context_length", config.get("max_position_embeddings", 2048))
-    add_kv_f32(f"{arch}.attention.layer_norm_rms_epsilon", config.get("rms_norm_eps", 1e-5))
-    add_kv_f32(f"{arch}.rope.freq_base", config.get("rope_theta", 10000.0))
+    def add_bool(key, val):
+        nonlocal kv_count; write_gguf_kv(kv, key, val, GGUF_TYPE_BOOL); kv_count += 1
+
+    def add_array_str(key, vals):
+        nonlocal kv_count; write_gguf_kv_array(kv, key, GGUF_TYPE_STRING, vals); kv_count += 1
+
+    def add_array_f32(key, vals):
+        nonlocal kv_count; write_gguf_kv_array(kv, key, GGUF_TYPE_FLOAT32, vals); kv_count += 1
+
+    def add_array_i32(key, vals):
+        nonlocal kv_count; write_gguf_kv_array(kv, key, GGUF_TYPE_INT32, vals); kv_count += 1
+
+    # --- Model architecture metadata ---
+    add_str("general.architecture", arch)
+    add_str("general.name", config.get("_name_or_path", model_dir.name))
+    add_u32("general.file_type", 2)  # GGML_FTYPE_MOSTLY_Q4_0
+
+    add_u32(f"{arch}.embedding_length", config["hidden_size"])
+    add_u32(f"{arch}.block_count", config["num_hidden_layers"])
+    add_u32(f"{arch}.attention.head_count", config["num_attention_heads"])
+    add_u32(f"{arch}.attention.head_count_kv",
+            config.get("num_key_value_heads", config["num_attention_heads"]))
+    add_u32(f"{arch}.feed_forward_length", config["intermediate_size"])
+    add_u32(f"{arch}.vocab_size", config["vocab_size"])
+    add_u32(f"{arch}.context_length", config.get("max_position_embeddings", 2048))
+    add_f32(f"{arch}.attention.layer_norm_rms_epsilon", config.get("rms_norm_eps", 1e-5))
+    add_f32(f"{arch}.rope.freq_base", config.get("rope_theta", 10000.0))
 
     # Gemma3 extra metadata
     if "head_dim" in config:
-        add_kv_u32(f"{arch}.attention.head_dim", config["head_dim"])
+        add_u32(f"{arch}.attention.head_dim", config["head_dim"])
     if "sliding_window" in config:
-        add_kv_u32(f"{arch}.attention.sliding_window", config["sliding_window"])
+        add_u32(f"{arch}.attention.sliding_window", config["sliding_window"])
     if "sliding_window_pattern" in config:
-        add_kv_u32(f"{arch}.attention.sliding_window_pattern", config["sliding_window_pattern"])
+        add_u32(f"{arch}.attention.sliding_window_pattern", config["sliding_window_pattern"])
     if "query_pre_attn_scalar" in config:
-        add_kv_f32(f"{arch}.attention.query_pre_attn_scalar", config["query_pre_attn_scalar"])
+        add_f32(f"{arch}.attention.query_pre_attn_scalar", config["query_pre_attn_scalar"])
+
+    # --- Tokenizer metadata (required by llama.cpp) ---
+    if tokenizer:
+        add_str("tokenizer.ggml.model", tokenizer["model_type"])
+        add_str("tokenizer.ggml.pre", "default")
+        add_array_str("tokenizer.ggml.tokens", tokenizer["tokens"])
+        add_array_f32("tokenizer.ggml.scores", tokenizer["scores"])
+        add_array_i32("tokenizer.ggml.token_type", tokenizer["token_types"])
+
+        if tokenizer["merges"]:
+            add_array_str("tokenizer.ggml.merges", tokenizer["merges"])
+
+        if tokenizer["bos_id"] is not None:
+            add_u32("tokenizer.ggml.bos_token_id", tokenizer["bos_id"])
+        if tokenizer["eos_id"] is not None:
+            add_u32("tokenizer.ggml.eos_token_id", tokenizer["eos_id"])
+        if tokenizer["pad_id"] is not None:
+            add_u32("tokenizer.ggml.padding_token_id", tokenizer["pad_id"])
+
+        add_bool("tokenizer.ggml.add_bos_token", tokenizer["add_bos"])
+        add_bool("tokenizer.ggml.add_eos_token", tokenizer["add_eos"])
+
+        if tokenizer.get("chat_template"):
+            add_str("tokenizer.chat_template", tokenizer["chat_template"])
 
     # Finalize header with kv_count
     header.extend(struct.pack('<Q', kv_count))
@@ -258,7 +469,6 @@ def main():
     # 3. Tensor info section
     tensor_info = bytearray()
     current_offset = 0
-    tensor_offsets = []
 
     for gguf_name, dims, ggml_type, data in tensors:
         write_gguf_string(tensor_info, gguf_name)
@@ -267,9 +477,7 @@ def main():
             tensor_info.extend(struct.pack('<Q', d))
         tensor_info.extend(struct.pack('<I', ggml_type))
         tensor_info.extend(struct.pack('<Q', current_offset))
-        tensor_offsets.append(current_offset)
         current_offset += len(data)
-        # Align next tensor
         padding = (ALIGNMENT - (current_offset % ALIGNMENT)) % ALIGNMENT
         current_offset += padding
 
@@ -286,13 +494,12 @@ def main():
 
         for i, (gguf_name, dims, ggml_type, data) in enumerate(tensors):
             f.write(data)
-            # Align
             padding = (ALIGNMENT - (len(data) % ALIGNMENT)) % ALIGNMENT
             if padding and i < len(tensors) - 1:
                 f.write(b'\x00' * padding)
 
     file_size = os.path.getsize(output_path)
-    print(f"Written {output_path}: {file_size / 1024 / 1024:.1f} MB ({len(tensors)} tensors)")
+    print(f"\nWritten {output_path}: {file_size / 1024 / 1024:.1f} MB ({len(tensors)} tensors, {kv_count} metadata)")
 
 
 if __name__ == "__main__":
