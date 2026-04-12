@@ -1948,15 +1948,58 @@ impl CpuBackendNeon {
             SendSyncPtr(a_q8.as_ptr())
         });
 
-        // Chunking strategy: smaller chunks for GEMV to improve Rayon work-stealing.
-        // GEMV (m=1): chunk_size=64 → 32 tasks for n=2048 with 8 threads.
-        // GEMM (m>1): larger chunks to amortize scheduling overhead.
+        // Feature detection: once at function level, passed via context.
+        #[cfg(target_arch = "aarch64")]
+        let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
+        #[cfg(not(target_arch = "aarch64"))]
+        let use_i8mm = false;
+
+        if m == 1 {
+            // GEMV: SpinPool dispatch — persistent threads with work-stealing.
+            // Rayon par_chunks_mut shows zero scaling on Android (1T=4T=8T).
+            // SpinPool uses park/unpark with ~1-3us wake latency, matching
+            // the F16 GEMV path that scales well.
+            let pool = thread_pool::get_pool();
+            let n_threads = rayon::current_num_threads();
+
+            // Chunking: NR=2 for i8mm (pair processing), target n_threads*8
+            // chunks for effective work-stealing across heterogeneous cores.
+            let nr: usize = if use_i8mm { 2 } else { 1 };
+            let target_chunks = n_threads * 8;
+            let rows_per_chunk = ((n + target_chunks - 1) / target_chunks + nr - 1) / nr * nr;
+            let rows_per_chunk = rows_per_chunk.max(nr);
+            let n_chunks = (n + rows_per_chunk - 1) / rows_per_chunk;
+
+            let ctx = Q4GemvCtx {
+                b_ptr: b.as_ptr() as *const BlockQ4_0,
+                a_ptr: a_q8_ptr.ptr(),
+                out_ptr: out_data.as_mut_ptr(),
+                k,
+                n,
+                nb_k,
+                rows_per_chunk,
+                use_i8mm,
+            };
+
+            // Safety: ctx references weight tensor (alive for model lifetime),
+            // Q8 workspace (thread-local, read-only during dispatch), and
+            // output slice (exclusively owned by this function). All outlive
+            // the dispatch call which blocks until completion.
+            unsafe {
+                pool.dispatch(
+                    n_chunks,
+                    q4_gemv_chunk,
+                    &ctx as *const Q4GemvCtx as *const u8,
+                );
+            }
+
+            return Ok(());
+        }
+
+        // GEMM (m>1): Rayon par_chunks_mut — good enough for batched prefill.
         let num_threads = rayon::current_num_threads();
         let total_elements = m * n;
-        let chunk_size = if m == 1 {
-            // GEMV: fine-grained chunking (llama.cpp uses 64)
-            64
-        } else {
+        let chunk_size = {
             let cs = total_elements.div_ceil(num_threads);
             cs.max(256)
         };
@@ -1964,11 +2007,6 @@ impl CpuBackendNeon {
         out_data.par_chunks_mut(chunk_size).enumerate().for_each(
             |(chunk_idx, chunk): (usize, &mut [f32])| {
                 let start_idx = chunk_idx * chunk_size;
-
-                #[cfg(target_arch = "aarch64")]
-                let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
-                #[cfg(not(target_arch = "aarch64"))]
-                let use_i8mm = false;
 
                 if use_i8mm {
                     // i8mm 2-row path: process adjacent weight rows in pairs
@@ -2530,6 +2568,82 @@ impl CpuBackendNeon {
 
             *s0 = vgetq_lane_f32(sumv, 0);
             *s1 = vgetq_lane_f32(sumv, 2);
+        }
+    }
+}
+
+// --- SpinPool work context for Q4_0 GEMV ---
+
+#[repr(C)]
+struct Q4GemvCtx {
+    b_ptr: *const BlockQ4_0, // weight base pointer
+    a_ptr: *const BlockQ8_0, // activation (Q8_0 quantized)
+    out_ptr: *mut f32,       // output
+    k: usize,                // inner dimension
+    n: usize,                // output rows
+    nb_k: usize,             // k / QK4_0 (blocks per row)
+    rows_per_chunk: usize,   // output rows per chunk
+    use_i8mm: bool,          // feature flag
+}
+
+// Safety: Q4GemvCtx contains raw pointers that are only read during dispatch.
+// The pointed-to data (weight tensor, Q8 workspace, output slice) all outlive
+// the dispatch call. Q8 workspace is thread-local but only read (not written)
+// during the parallel region.
+unsafe impl Send for Q4GemvCtx {}
+unsafe impl Sync for Q4GemvCtx {}
+
+/// Work function for Q4_0 GEMV SpinPool dispatch.
+/// Processes a coarse chunk of output rows. i8mm path pairs adjacent rows
+/// for 2x throughput; sdot/basic NEON handles single rows.
+///
+/// # Safety
+/// Called by SpinPool workers with valid Q4GemvCtx pointer.
+unsafe fn q4_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
+    unsafe {
+        let ctx = &*(ctx_ptr as *const Q4GemvCtx);
+        let j_start = chunk_id * ctx.rows_per_chunk;
+        let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
+        let backend = CpuBackendNeon;
+
+        if ctx.use_i8mm {
+            let mut j = j_start;
+            while j + 1 < j_end {
+                let b0 = ctx.b_ptr.add(j * ctx.nb_k);
+                let b1 = ctx.b_ptr.add((j + 1) * ctx.nb_k);
+                backend.vec_dot_q4_0_q8_0_i8mm(
+                    ctx.k,
+                    &mut *ctx.out_ptr.add(j),
+                    &mut *ctx.out_ptr.add(j + 1),
+                    b0,
+                    b1,
+                    ctx.a_ptr,
+                );
+                j += 2;
+            }
+            if j < j_end {
+                // Odd trailing row: fall back to sdot
+                let b_row = ctx.b_ptr.add(j * ctx.nb_k);
+                let mut sum = 0.0f32;
+                backend.vec_dot_q4_0_q8_0_sdot(ctx.k, &mut sum, b_row, ctx.a_ptr);
+                *ctx.out_ptr.add(j) = sum;
+            }
+        } else {
+            #[cfg(target_arch = "aarch64")]
+            let use_dotprod = std::arch::is_aarch64_feature_detected!("dotprod");
+            #[cfg(not(target_arch = "aarch64"))]
+            let use_dotprod = false;
+
+            for j in j_start..j_end {
+                let b_row = ctx.b_ptr.add(j * ctx.nb_k);
+                let mut sum = 0.0f32;
+                if use_dotprod {
+                    backend.vec_dot_q4_0_q8_0_sdot(ctx.k, &mut sum, b_row, ctx.a_ptr);
+                } else {
+                    backend.vec_dot_q4_0_q8_0(ctx.k, &mut sum, b_row, ctx.a_ptr);
+                }
+                *ctx.out_ptr.add(j) = sum;
+            }
         }
     }
 }
