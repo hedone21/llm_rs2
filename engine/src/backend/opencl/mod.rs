@@ -9,6 +9,7 @@ use anyhow::{Result, anyhow};
 use ocl::core::Kernel as CoreKernel;
 use ocl::{Context, Device, Platform, Program, Queue, flags};
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::Arc;
 
@@ -137,6 +138,8 @@ struct KernelCache {
     kernel_mul_mat_f16_f32_l4: Option<CoreKernel>,
     // true when f16 kernel is the nosub fallback (1D work group, N_DST=4 rows/WG)
     f16_is_nosub: bool,
+    // Q4_0 noshuffle: SOA conversion kernel (Adreno-optimized, from cvt.cl)
+    kernel_cvt_q4_0_noshuffle: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -182,6 +185,11 @@ pub struct OpenCLBackend {
     pub kivi_q2_program: Option<Program>,
     pub kivi_attn_program: Option<Program>,
 
+    // Q4_0 noshuffle programs (optional — Adreno-optimized SOA GEMV)
+    pub cvt_noshuffle_program: Option<Program>,
+    // gemv_noshuffle programs are dimension-specific (LINE_STRIDE_A, BLOCK_STRIDE_A).
+    // Built lazily per weight dimension via convert_q4_0_to_noshuffle().
+
     // Cached kernels — inference is single-threaded, no lock needed.
     // UnsafeCell avoids Mutex overhead (~170us/lock on Adreno).
     kernels: UnsafeCell<KernelCache>,
@@ -205,6 +213,11 @@ pub struct OpenCLBackend {
 
     // CL_DEVICE_MAX_MEM_ALLOC_SIZE: maximum single buffer allocation (bytes).
     max_mem_alloc_size: usize,
+
+    // Cached GEMV noshuffle kernels, keyed by (ne01,) dimensions.
+    // Each unique dimension pair requires a different compile-time define set.
+    // UnsafeCell: single-threaded access like other kernel caches.
+    gemv_noshuffle_cache: UnsafeCell<HashMap<usize, (Program, CoreKernel)>>,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -656,6 +669,20 @@ impl OpenCLBackend {
             log::warn!("kivi_attn.cl failed to compile. KIVI fused attention disabled.");
         }
 
+        // Q4_0 noshuffle SOA conversion kernel (cvt.cl already contains the kernel)
+        let cvt_noshuffle_src = include_str!("../../../kernels/cvt.cl");
+        let cvt_noshuffle_program = Program::builder()
+            .devices(device)
+            .src(cvt_noshuffle_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if cvt_noshuffle_program.is_some() {
+            log::info!("cvt.cl compiled (Q4_0 noshuffle SOA conversion kernel)");
+        } else {
+            log::warn!("cvt.cl failed to compile. Q4_0 noshuffle disabled.");
+        }
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -788,6 +815,10 @@ impl OpenCLBackend {
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_l4").ok()),
             f16_is_nosub,
+            kernel_cvt_q4_0_noshuffle: cvt_noshuffle_program.as_ref().and_then(|p| {
+                ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle").ok()
+            }),
+            // GEMV noshuffle kernel is built per-dimension (lazy), so None initially
         };
 
         log::info!("OpenCL kernels cached successfully");
@@ -849,12 +880,14 @@ impl OpenCLBackend {
             gemm_f32_program,
             kivi_q2_program: kivi_q2_kernels,
             kivi_attn_program,
+            cvt_noshuffle_program,
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
             dummy_score_buf,
             gpu_score_acc: UnsafeCell::new(None),
             cl_opts: cl_opts.clone(),
             max_mem_alloc_size,
+            gemv_noshuffle_cache: UnsafeCell::new(HashMap::new()),
         })
     }
 
@@ -1227,6 +1260,184 @@ impl OpenCLBackend {
                 &self.queue,
                 kernel,
                 3,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Convert Q4_0 AOS weight buffer to SOA layout for the noshuffle GEMV kernel.
+    ///
+    /// Called once per weight tensor at model load time.
+    /// Returns (q_buf, d_buf) — the SOA nibbles and scales buffers.
+    /// Also compiles the per-dimension GEMV noshuffle kernel if not yet available.
+    ///
+    /// # Arguments
+    /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format)
+    /// * `num_blocks` - Total number of Q4_0 blocks (= num_rows * K / QK4_0)
+    /// * `ne00` - K dimension (elements per row)
+    /// * `ne01` - M dimension (number of rows)
+    pub fn convert_q4_0_to_noshuffle(
+        &self,
+        src: &ocl::core::Mem,
+        num_blocks: usize,
+        ne00: usize,
+        ne01: usize,
+    ) -> Result<(ocl::core::Mem, ocl::core::Mem)> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let cvt_kernel = kernels
+            .kernel_cvt_q4_0_noshuffle
+            .as_ref()
+            .ok_or_else(|| anyhow!("Q4_0 noshuffle conversion kernel not available"))?;
+
+        // Allocate SOA buffers
+        // dst_q: num_blocks * 16 bytes (QK4_0/2 = 16 nibble-bytes per block)
+        let q_bytes = num_blocks * 16;
+        let dst_q = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                q_bytes,
+                None,
+            )?
+        };
+
+        // dst_d: num_blocks * 2 bytes (one f16 per block)
+        let dst_d = unsafe {
+            ocl::core::create_buffer::<_, u16>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                num_blocks,
+                None,
+            )?
+        };
+
+        // Set kernel args and dispatch
+        unsafe {
+            ocl::core::set_kernel_arg(cvt_kernel, 0, ocl::core::ArgVal::mem(src))?;
+            ocl::core::set_kernel_arg(cvt_kernel, 1, ocl::core::ArgVal::mem(&dst_q))?;
+            ocl::core::set_kernel_arg(cvt_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
+
+            let global_work_size: [usize; 3] = [num_blocks, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                cvt_kernel,
+                1,
+                None,
+                &global_work_size,
+                None,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        // Ensure conversion completes before returning
+        self.queue.finish()?;
+
+        // Build the GEMV noshuffle kernel if we haven't already (dimension-specific defines).
+        // We build once with the first dimension encountered and cache it. If different
+        // weight dimensions are used (which is the case — QKV vs FFN), we handle it by
+        // passing ne00/ne01 as runtime kernel args rather than compile-time defines.
+        //
+        // Actually, LINE_STRIDE_A and BLOCK_STRIDE_A must be compile-time defines for
+        // the kernel to work correctly (they're used in array indexing). So we need
+        // per-dimension kernels. For the MVP, we build them lazily and store the
+        // most recently used one. The caller (matmul_q4_0_noshuffle) will rebuild
+        // if dimensions change.
+        //
+        // For the MVP, we skip caching complexity and build the kernel at dispatch time
+        // based on the dimensions of each call. This adds ~1ms compile overhead on first
+        // call per dimension, amortized over thousands of tokens.
+
+        log::info!(
+            "Q4_0 noshuffle SOA conversion done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB",
+            num_blocks,
+            ne00,
+            ne01,
+            q_bytes / 1024,
+            num_blocks * 2 / 1024,
+        );
+        Ok((dst_q, dst_d))
+    }
+
+    /// Dispatch the noshuffle GEMV kernel for Q4_0 weights in SOA layout.
+    ///
+    /// Compiles the dimension-specific kernel on first call and caches it
+    /// (keyed by `ne01`). Subsequent calls with the same dimensions hit the cache.
+    #[allow(clippy::map_entry)]
+    ///
+    /// # Arguments
+    /// * `q_buf` - SOA nibbles buffer (from convert_q4_0_to_noshuffle)
+    /// * `d_buf` - SOA scales buffer (from convert_q4_0_to_noshuffle)
+    /// * `src1_buf` - Activation vector (F32)
+    /// * `dst_buf` - Output buffer (F32)
+    /// * `ne00` - K dimension
+    /// * `ne01` - M dimension (number of output rows, must be even)
+    pub fn matmul_q4_0_noshuffle(
+        &self,
+        q_buf: &ocl::core::Mem,
+        d_buf: &ocl::core::Mem,
+        src1_buf: &ocl::core::Mem,
+        dst_buf: &ocl::core::Mem,
+        ne00: usize,
+        ne01: usize,
+    ) -> Result<()> {
+        // Compute strides (in uint/half2 units, matching the kernel's indexing)
+        // LINE_STRIDE_A = ne01/2 (row-pair count — each gid covers 2 rows)
+        // BLOCK_STRIDE_A = ne01 (total rows — stride between consecutive uint words)
+        // SIMDGROUP_WIDTH = 64 (Adreno half-wave)
+        let line_stride_a = ne01 / 2;
+        let block_stride_a = ne01;
+        let simdgroup_width: usize = 64;
+
+        // SAFETY: single-threaded inference access (same pattern as kernels UnsafeCell)
+        let cache = unsafe { &mut *self.gemv_noshuffle_cache.get() };
+        if !cache.contains_key(&ne01) {
+            let gemv_src = include_str!("../../../kernels/gemv_noshuffle_q4_0.cl");
+            let defines = format!(
+                "{} -DLINE_STRIDE_A={} -DBLOCK_STRIDE_A={} -DSIMDGROUP_WIDTH={}",
+                self.cl_opts, line_stride_a, block_stride_a, simdgroup_width
+            );
+            let program = Program::builder()
+                .devices(self.device)
+                .src(gemv_src)
+                .cmplr_opt(&defines)
+                .build(&self.context)?;
+            let kernel = ocl::core::create_kernel(&program, "kernel_gemv_noshuffle_q4_0")?;
+            log::info!(
+                "GEMV noshuffle Q4_0 kernel compiled: ne01={}, LINE_STRIDE_A={}, BLOCK_STRIDE_A={}",
+                ne01,
+                line_stride_a,
+                block_stride_a
+            );
+            cache.insert(ne01, (program, kernel));
+        }
+        let (_program, kernel) = cache.get(&ne01).unwrap();
+
+        let ne00_i = ne00 as i32;
+        let ne01_i = ne01 as i32;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(d_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(src1_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(dst_buf))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&ne00_i))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&ne01_i))?;
+
+            // Dispatch: global=[ne01/2, N_SIMDGROUP=4, 1], local=[SIMDGROUP_WIDTH=64, 4, 1]
+            let n_simdgroup: usize = 4;
+            let global_work_size: [usize; 3] = [ne01 / 2, n_simdgroup, 1];
+            let local_work_size: [usize; 3] = [simdgroup_width, n_simdgroup, 1];
+
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                kernel,
+                2,
                 None,
                 &global_work_size,
                 Some(local_work_size),
