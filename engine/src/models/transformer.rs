@@ -390,7 +390,7 @@ impl TransformerModel {
             let (ne01, ne00) = (dims[0], dims[1]);
             let num_blocks = ne01 * ne00 / 32; // QK4_0 = 32
 
-            let (q_buf, d_buf) =
+            let (q_buf, d_buf, q_img) =
                 ocl_be.convert_q4_0_to_noshuffle(cl_mem, num_blocks, ne00, ne01)?;
 
             let key = cl_mem.as_ptr() as usize;
@@ -399,6 +399,7 @@ impl TransformerModel {
                 NoshuffleSoaEntry {
                     q_buf,
                     d_buf,
+                    q_img,
                     ne00,
                     ne01,
                 },

@@ -155,6 +155,10 @@ pub struct NoshuffleSoaEntry {
     pub q_buf: ocl::core::Mem,
     /// SOA scales buffer (transposed, half-level column-major)
     pub d_buf: ocl::core::Mem,
+    /// image1d_buffer_t wrapping q_buf (R32UI format) for Adreno TP cache.
+    /// None when image creation fails (e.g. CL_DEVICE_IMAGE_MAX_BUFFER_SIZE exceeded,
+    /// image1d_buffer_t not supported). Falls back to standard Q4_0 matmul path.
+    pub q_img: Option<ocl::core::Mem>,
     /// K dimension (elements per row)
     pub ne00: usize,
     /// M dimension (number of rows)
@@ -1241,13 +1245,17 @@ impl OpenCLBackend {
         let out_buf =
             get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("Out is not OpenCL buffer"))?;
 
-        // Auto-dispatch to noshuffle GEMV for decode (m==1) when SOA buffers are available.
-        // The noshuffle kernel is optimized for Adreno's subgroup architecture (SIMD width 64).
+        // Auto-dispatch to noshuffle GEMV for decode (m==1) when image1d_buffer_t is available.
+        // The noshuffle kernel uses Adreno TP cache via image reads (R32UI weight, RGBA32F act).
+        // Only dispatches when q_img is Some (image creation succeeded at load time).
+        // When q_img is None (image unsupported), falls through to standard Q4_0 GEMV.
         if m == 1 {
             let b_key = b_buf.as_ptr() as usize;
-            if let Some(entry) = self.lookup_noshuffle_soa(b_key) {
+            if let Some(entry) = self.lookup_noshuffle_soa(b_key)
+                && let Some(ref q_img) = entry.q_img
+            {
                 return self.matmul_q4_0_noshuffle(
-                    &entry.q_buf,
+                    q_img,
                     &entry.d_buf,
                     a_buf,
                     out_buf,
@@ -1255,6 +1263,7 @@ impl OpenCLBackend {
                     entry.ne01,
                 );
             }
+            // q_img == None or no SOA entry → fall through to standard Q4_0 GEMV
         }
 
         let kernels = unsafe { &*self.kernels.get() };
@@ -1328,13 +1337,15 @@ impl OpenCLBackend {
     /// Convert Q4_0 AOS weight buffer to SOA layout for the noshuffle GEMV kernel.
     ///
     /// Called once per weight tensor at model load time.
-    /// Returns (q_buf, d_buf) — the SOA nibbles and scales buffers,
-    /// **transposed** so that the GEMV kernel can access them with coalesced reads.
+    /// Returns (q_buf, d_buf, q_img) — the SOA nibbles buffer, scales buffer,
+    /// and an optional image1d_buffer_t wrapping q_buf (R32UI) for Adreno TP cache.
+    /// **Transposed** so that the GEMV kernel can access them with coalesced reads.
     ///
     /// The full pipeline mirrors llama.cpp's Adreno path:
     ///   1. GPU: kernel_convert_block_q4_0_noshuffle (nibble rearrange, row-major)
     ///   2. CPU: ushort-level 2D transpose of q buffer (M rows x K/4 cols -> K/4 rows x M cols)
     ///   3. CPU: half-level 2D transpose of d buffer (M rows x blocks_per_row cols -> transposed)
+    ///   4. Create image1d_buffer_t wrapping q_buf (R32UI) — gracefully degrades if unsupported.
     ///
     /// # Arguments
     /// * `src` - Raw Q4_0 weight buffer (BlockQ4_0 AOS format)
@@ -1347,7 +1358,7 @@ impl OpenCLBackend {
         num_blocks: usize,
         ne00: usize,
         ne01: usize,
-    ) -> Result<(ocl::core::Mem, ocl::core::Mem)> {
+    ) -> Result<(ocl::core::Mem, ocl::core::Mem, Option<ocl::core::Mem>)> {
         let kernels = unsafe { &*self.kernels.get() };
         let cvt_kernel = kernels
             .kernel_cvt_q4_0_noshuffle
@@ -1490,33 +1501,92 @@ impl OpenCLBackend {
             }
         }
 
+        // Step 4: Create image1d_buffer_t wrapping transposed q_buf (R32UI).
+        // Each texel = 1 uint = 2 ushort (row-pair), total width = q_total_ushort / 2 texels.
+        // Gracefully falls back to None if image creation fails (unsupported device, size limit).
+        let q_total_uint = q_total_ushort / 2;
+        let q_img = {
+            use ocl::core::{
+                ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat,
+                MemObjectType,
+            };
+            let q_img_fmt =
+                ImageFormat::new(ImageChannelOrder::R, ImageChannelDataType::UnsignedInt32);
+            let q_img_desc = ImageDescriptor::new(
+                MemObjectType::Image1dBuffer,
+                q_total_uint, // width in texels (each texel = 1 uint)
+                0,
+                0,
+                0,
+                0,
+                0,
+                // SAFETY: Mem::clone() calls clRetainMemObject, so the underlying buffer
+                // stays alive even if this image is dropped first.
+                Some(dst_q.clone()),
+            );
+            // SAFETY: dst_q is a valid CL buffer with q_total_uint * 4 bytes.
+            // image1d_buffer_t is a read-only view over the same memory.
+            let result = unsafe {
+                ocl::core::create_image(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_ONLY,
+                    &q_img_fmt,
+                    &q_img_desc,
+                    None::<&[u32]>,
+                    None, // device_versions — fallback to context auto-detect (OpenCL 1.2+)
+                )
+            };
+            match result {
+                Ok(img) => {
+                    log::info!(
+                        "image1d_buffer_t created for noshuffle Q4_0: width={} texels, ne01={}",
+                        q_total_uint,
+                        ne01
+                    );
+                    Some(img)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "image1d_buffer_t creation failed (ne01={}), fallback to buffer path: {}",
+                        ne01,
+                        e
+                    );
+                    None
+                }
+            }
+        };
+
         log::info!(
-            "Q4_0 noshuffle SOA conversion + transpose done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB",
+            "Q4_0 noshuffle SOA conversion + transpose done: {} blocks, ne00={}, ne01={}, q={} KB, d={} KB, img={}",
             num_blocks,
             ne00,
             ne01,
             q_bytes / 1024,
             num_blocks * 2 / 1024,
+            if q_img.is_some() { "yes" } else { "no" },
         );
-        Ok((dst_q, dst_d))
+        Ok((dst_q, dst_d, q_img))
     }
 
     /// Dispatch the noshuffle GEMV kernel for Q4_0 weights in SOA layout.
+    ///
+    /// Uses image1d_buffer_t for both weight nibbles (R32UI) and activation (RGBA32F)
+    /// to leverage Adreno TP (texture pipe) cache for coalesced reads.
     ///
     /// Compiles the dimension-specific kernel on first call and caches it
     /// (keyed by `ne01`). Subsequent calls with the same dimensions hit the cache.
     #[allow(clippy::map_entry)]
     ///
     /// # Arguments
-    /// * `q_buf` - SOA nibbles buffer (from convert_q4_0_to_noshuffle)
-    /// * `d_buf` - SOA scales buffer (from convert_q4_0_to_noshuffle)
-    /// * `src1_buf` - Activation vector (F32)
+    /// * `q_img` - image1d_buffer_t wrapping SOA nibbles (R32UI, from convert_q4_0_to_noshuffle)
+    /// * `d_buf` - SOA scales buffer (half2*, from convert_q4_0_to_noshuffle)
+    /// * `src1_buf` - Activation vector buffer (F32), wrapped into RGBA32F image internally
     /// * `dst_buf` - Output buffer (F32)
     /// * `ne00` - K dimension
     /// * `ne01` - M dimension (number of output rows, must be even)
     pub fn matmul_q4_0_noshuffle(
         &self,
-        q_buf: &ocl::core::Mem,
+        q_img: &ocl::core::Mem,
         d_buf: &ocl::core::Mem,
         src1_buf: &ocl::core::Mem,
         dst_buf: &ocl::core::Mem,
@@ -1567,12 +1637,54 @@ impl OpenCLBackend {
         let ne00_i = ne00 as i32;
         let ne01_i = ne01 as i32;
 
+        // Create activation image1d_buffer_t (RGBA32F) wrapping the F32 activation buffer.
+        // Each texel = float4 (4 floats), so width = ne00 / 4.
+        // This image is ephemeral (created per-dispatch, dropped after enqueue).
+        // SAFETY: src1_buf has ne00 * sizeof(f32) bytes, and ne00 is always a multiple of 4
+        // for Q4_0 (QK4_0=32, ne00 is a multiple of 32).
+        let act_img = {
+            use ocl::core::{
+                ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat,
+                MemObjectType,
+            };
+            let act_img_fmt =
+                ImageFormat::new(ImageChannelOrder::Rgba, ImageChannelDataType::Float);
+            let act_img_desc = ImageDescriptor::new(
+                MemObjectType::Image1dBuffer,
+                ne00 / 4, // float4 texels -> K/4 width
+                0,
+                0,
+                0,
+                0,
+                0,
+                // SAFETY: Mem::clone() calls clRetainMemObject; the activation buffer
+                // outlives this ephemeral image (dropped at end of this function).
+                Some(src1_buf.clone()),
+            );
+            unsafe {
+                ocl::core::create_image(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_ONLY,
+                    &act_img_fmt,
+                    &act_img_desc,
+                    None::<&[f32]>,
+                    None, // device_versions — fallback to context auto-detect
+                )?
+            }
+        };
+
         unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            // arg 0: weight nibbles image (image1d_buffer_t, R32UI)
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_img))?;
+            // arg 1: weight scales (global half2*)
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(d_buf))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(src1_buf))?;
+            // arg 2: activation image (image1d_buffer_t, RGBA32F)
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&act_img))?;
+            // arg 3: output buffer (global float*)
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(dst_buf))?;
+            // arg 4: ne00 (K dimension)
             ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&ne00_i))?;
+            // arg 5: ne01 (M dimension)
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&ne01_i))?;
 
             // Dispatch: global=[ne01/2, N_SIMDGROUP=4, 1], local=[SIMDGROUP_WIDTH=64, 4, 1]
@@ -1591,6 +1703,8 @@ impl OpenCLBackend {
                 None::<&mut ocl::core::Event>,
             )?;
         }
+        // act_img is dropped here; clReleaseMemObject is called.
+        // The enqueued kernel retains its own reference to the image/buffer.
         Ok(())
     }
 
@@ -4139,7 +4253,7 @@ mod noshuffle_tests {
         }
 
         // Run SOA conversion + transpose
-        let (q_buf, d_buf) = backend
+        let (q_buf, d_buf, _q_img) = backend
             .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
             .unwrap();
 
@@ -4304,7 +4418,7 @@ mod noshuffle_tests {
             .unwrap();
         }
 
-        let (q_buf, d_buf) = backend
+        let (q_buf, d_buf, _q_img) = backend
             .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
             .unwrap();
 
@@ -4487,7 +4601,7 @@ mod noshuffle_tests {
         }
 
         // Convert to noshuffle SOA + transpose
-        let (q_buf, d_buf) = backend
+        let (q_buf, d_buf, _q_img) = backend
             .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
             .unwrap();
 

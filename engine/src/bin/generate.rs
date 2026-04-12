@@ -653,7 +653,10 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "opencl")]
     if is_gpu {
         let actual_q4 = w_dtype == DType::Q4_0
-            || model.layers.first().map_or(false, |l| l.wq.dtype() == DType::Q4_0);
+            || model
+                .layers
+                .first()
+                .map_or(false, |l| l.wq.dtype() == DType::Q4_0);
         if actual_q4 {
             match model.prepare_noshuffle_buffers(&backend) {
                 Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
