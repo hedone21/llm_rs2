@@ -4,6 +4,24 @@
 
 ---
 
+## [P0] Long context CPU attention 최적화 — 4K에서 llama.cpp 대비 35% 수준
+- **Status**: TODO (설계+측정 완료, 구현 대기)
+- **Sprint**: next
+- **Dependencies**: 없음
+- **Description**: 4K context에서 llm_rs decode가 10.6 tok/s로 llama.cpp 30.5 tok/s의 35% 수준. Short context(~20)는 75%. 원인: standard 3-pass attention + head-parallel이 GQA 6:1에서 KV 중복 읽기(6배) + L2 thrash 유발. DRAM-bound가 되어 context 확장 시 급격 열화.
+- **Acceptance Criteria**:
+  - 4K context decode: 25+ tok/s (llama.cpp 대비 80% 이상)
+  - Short context 회귀 없음 (22 tok/s 이상 유지)
+  - 정확도 유지 (F16 NMSE < 1e-4, top-k match > 99%)
+- **상세 계획**: `.agent/todos/long_context_attention_optimization.md`
+- **구현 단계**: (1) Online Softmax (Step 1, 낮은 난이도) → (2) Flash Decoding KV split (Step 2, 중간 난이도, 메인 효과) → (3) CPU Flash Attention for prefill (Step 3, prefill O(n²) 해결)
+- **주 수정 파일**: `engine/src/backend/cpu/neon.rs:235 attention_gen_f16_neon`
+- **담당 권장**: senior-implementer (NEON + numerical algorithm)
+- **측정 환경**: Galaxy S25 / Snapdragon 8 Elite / Qwen2.5 1.5B Q4_0 (`qwen2.5-1.5b-q4_0-v2.gguf`) / 6 threads
+- **측정일**: 2026-04-13
+
+---
+
 ## [P3] 다중 모델 사이즈 검증 테스트 매트릭스
 - **Status**: TODO
 - **Sprint**: backlog
