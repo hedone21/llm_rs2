@@ -296,6 +296,48 @@ pub fn flash_attention_forward_strided(
     bc: usize,
     window_size: Option<usize>,
 ) {
+    // Step 3: NEON tile + online-softmax prefill path.  Used when the input
+    // is long enough to amortise dispatch overhead, head_dim is 8-aligned,
+    // the GQA ratio is integer, and KV is HeadMajor (kv_head_stride equals
+    // a full KV row × capacity).  `k_stride == head_dim` identifies the
+    // HeadMajor case (SeqMajor would set k_stride = n_heads_kv * head_dim).
+    //
+    // All other combinations fall through to the scalar rayon path below.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::backend::cpu::neon::{PREFILL_FLASH_THRESHOLD, flash_prefill_forward_f32_neon};
+        if q_len >= PREFILL_FLASH_THRESHOLD
+            && head_dim.is_multiple_of(8)
+            && n_heads_q.is_multiple_of(n_heads_kv)
+            && k_stride == head_dim
+            && v_stride == head_dim
+            && q_stride == n_heads_q * head_dim
+            && out_stride == n_heads_q * head_dim
+            && kv_head_stride.is_multiple_of(head_dim)
+        {
+            let _ = (br, bc); // advisory — the NEON path picks its own tile.
+            flash_prefill_forward_f32_neon(
+                q,
+                k,
+                v,
+                out,
+                n_heads_q,
+                n_heads_kv,
+                q_len,
+                kv_len,
+                head_dim,
+                q_stride,
+                k_stride,
+                v_stride,
+                out_stride,
+                kv_head_stride,
+                q_start_pos,
+                window_size,
+            );
+            return;
+        }
+    }
+
     let n_rep = n_heads_q / n_heads_kv;
 
     // We need to extract pointers BEFORE the closure to avoid capturing `&mut [f32]` which cannot be shared.

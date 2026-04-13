@@ -4143,6 +4143,619 @@ unsafe fn f16_gemm_chunk(ctx_ptr: *const u8, chunk_id: usize) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Step 3 — NEON flash-attention **prefill** kernel.
+// ---------------------------------------------------------------------------
+//
+// Tile-based Q·K^T → online softmax → P·V with per-row state. Task grid is
+// `(tile_i, kv_h)`; each worker processes the full GQA Q-head group sharing
+// that kv-head, re-using the K/V tile while iterating over Q-heads.
+//
+// Designed as a drop-in replacement for the scalar rayon path inside
+// `layers::attention::flash_attention_forward_strided` when:
+//   * `q_len >= PREFILL_FLASH_THRESHOLD`
+//   * HeadMajor KV (`kv_head_stride == capacity * head_dim` contiguous KV rows)
+//   * `head_dim % 8 == 0`
+//   * `n_heads_q % n_heads_kv == 0`
+//
+// The caller passes F32 Q/K/V slices with the row stride conventions the
+// scalar path uses.  F16 KV is still dequantized by the caller today (1st-
+// PR scope); a future PR may add a direct-F16 NEON path.
+//
+// Invariants:
+//   * Causal mask: `global_c <= global_r + q_start_pos`.
+//   * Optional sliding window: `global_c + window_size > global_r + q_start_pos`.
+//   * All `(m, l, O)` state is F32.
+//   * `scores_out` diagnostic path is unsupported — caller routes to
+//     scalar when requested.
+
+/// Prefill flash threshold — below this `q_len` we keep the scalar rayon
+/// path for short prompts where tile dispatch overhead dominates.
+pub const PREFILL_FLASH_THRESHOLD: usize = 128;
+
+/// Per-(tile_i, kv_h) task context for the prefill NEON kernel.
+///
+/// Shared across SpinPool workers by reference; each worker derives its
+/// `(tile_i, kv_h)` from `task_id` and writes exclusively to its own
+/// `out[tile_row_slice, gqa_group]` region.
+///
+/// # Safety
+/// All raw pointers must outlive the enclosing dispatch.  Output regions
+/// are partitioned such that no two workers touch the same element.
+struct PrefillFlashCtx {
+    q_ptr: *const f32,
+    k_ptr: *const f32,
+    v_ptr: *const f32,
+    out_ptr: *mut f32,
+    n_heads_kv: usize,
+    gqa_ratio: usize,
+    head_dim: usize,
+    q_len: usize,
+    kv_len: usize,
+    q_row_stride: usize,
+    k_pos_stride: usize,
+    v_pos_stride: usize,
+    out_row_stride: usize,
+    kv_head_stride: usize,
+    q_start_pos: usize,
+    br: usize,
+    bc: usize,
+    scale: f32,
+    window_size_plus1: u32, // 0 means "None" (full causal).
+}
+
+unsafe impl Send for PrefillFlashCtx {}
+unsafe impl Sync for PrefillFlashCtx {}
+
+/// Tile classification for causal-mask aware traversal.
+///
+/// - `Full`: every `(r, c)` in the tile is lower-triangular and within the
+///   optional sliding window — mask-free inner kernel.
+/// - `Skip`: every `(r, c)` is upper-triangular (or outside the window) —
+///   the worker simply continues.
+/// - `Diagonal`: boundary tile — per-row lane predicate needed.
+#[derive(Copy, Clone, Debug, PartialEq)]
+enum TileKind {
+    Full,
+    Diagonal,
+    Skip,
+}
+
+/// Classify `(tile_i, tile_j)` relative to the causal triangle and optional
+/// sliding window.  `r_start/r_end` are local query tile bounds,
+/// `c_start/c_end` are global key tile bounds.  `q_start_pos` biases local
+/// queries into global coordinates: `global_r = r + q_start_pos`.
+#[inline]
+fn classify_tile(
+    r_start: usize,
+    r_end: usize,
+    c_start: usize,
+    c_end: usize,
+    q_start_pos: usize,
+    window_size: Option<usize>,
+) -> TileKind {
+    // Upper-triangular entirely?  min global_r in tile = r_start + q_start_pos.
+    // Every key masked iff c_start > max_global_r = (r_end - 1) + q_start_pos.
+    // AND (for window) c_end + ws <= min_global_r + 1 (all keys too old).
+    let max_global_r = (r_end - 1) + q_start_pos;
+    let min_global_r = r_start + q_start_pos;
+
+    // Skip if every (r, c) in the tile has global_c > global_r (upper triangle).
+    let upper_skip = c_start > max_global_r;
+    // Skip if every key falls outside the sliding window (all too old).
+    let window_skip = match window_size {
+        Some(ws) => c_end + ws <= min_global_r + 1,
+        None => false,
+    };
+    if upper_skip || window_skip {
+        return TileKind::Skip;
+    }
+
+    // Full iff every (r, c) satisfies causal AND window.
+    // max_global_c = c_end - 1.  Causal full: c_end - 1 <= min_global_r,
+    // i.e. c_end <= min_global_r + 1.
+    let causal_full = c_end <= min_global_r + 1;
+    // Window full: for every r, min_global_c in tile = c_start, must satisfy
+    // c_start + ws > max_global_r, i.e. c_start + ws >= max_global_r + 1.
+    let window_full = match window_size {
+        Some(ws) => c_start + ws >= max_global_r + 1,
+        None => true,
+    };
+    if causal_full && window_full {
+        TileKind::Full
+    } else {
+        TileKind::Diagonal
+    }
+}
+
+/// NEON F32 dot-product kernel for a single (Q row, K row) pair of length
+/// `head_dim`, unrolled to process 16 lanes per iteration.
+///
+/// # Safety
+/// * `q`, `k` must point to at least `head_dim` F32 lanes.
+/// * `head_dim % 4 == 0` (prefill caller guarantees `head_dim % 8 == 0`).
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn qk_dot_f32_neon(q: *const f32, k: *const f32, head_dim: usize) -> f32 {
+    unsafe {
+        let mut acc0 = vdupq_n_f32(0.0);
+        let mut acc1 = vdupq_n_f32(0.0);
+        let mut acc2 = vdupq_n_f32(0.0);
+        let mut acc3 = vdupq_n_f32(0.0);
+        let mut i = 0;
+        while i + 16 <= head_dim {
+            let q0 = vld1q_f32(q.add(i));
+            let q1 = vld1q_f32(q.add(i + 4));
+            let q2 = vld1q_f32(q.add(i + 8));
+            let q3 = vld1q_f32(q.add(i + 12));
+            let k0 = vld1q_f32(k.add(i));
+            let k1 = vld1q_f32(k.add(i + 4));
+            let k2 = vld1q_f32(k.add(i + 8));
+            let k3 = vld1q_f32(k.add(i + 12));
+            acc0 = vfmaq_f32(acc0, q0, k0);
+            acc1 = vfmaq_f32(acc1, q1, k1);
+            acc2 = vfmaq_f32(acc2, q2, k2);
+            acc3 = vfmaq_f32(acc3, q3, k3);
+            i += 16;
+        }
+        while i + 8 <= head_dim {
+            let q0 = vld1q_f32(q.add(i));
+            let q1 = vld1q_f32(q.add(i + 4));
+            let k0 = vld1q_f32(k.add(i));
+            let k1 = vld1q_f32(k.add(i + 4));
+            acc0 = vfmaq_f32(acc0, q0, k0);
+            acc1 = vfmaq_f32(acc1, q1, k1);
+            i += 8;
+        }
+        while i + 4 <= head_dim {
+            let q0 = vld1q_f32(q.add(i));
+            let k0 = vld1q_f32(k.add(i));
+            acc0 = vfmaq_f32(acc0, q0, k0);
+            i += 4;
+        }
+        let sum = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+        let mut tail = vaddvq_f32(sum);
+        while i < head_dim {
+            tail += *q.add(i) * *k.add(i);
+            i += 1;
+        }
+        tail
+    }
+}
+
+/// NEON FMA loop: `o[0..head_dim] *= alpha`.
+///
+/// # Safety
+/// `o` must point to `head_dim` writable F32 lanes; `head_dim % 4 == 0`.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn rescale_o_neon(o: *mut f32, alpha: f32, head_dim: usize) {
+    unsafe {
+        let a = vdupq_n_f32(alpha);
+        let mut i = 0;
+        while i + 16 <= head_dim {
+            let o0 = vld1q_f32(o.add(i));
+            let o1 = vld1q_f32(o.add(i + 4));
+            let o2 = vld1q_f32(o.add(i + 8));
+            let o3 = vld1q_f32(o.add(i + 12));
+            vst1q_f32(o.add(i), vmulq_f32(o0, a));
+            vst1q_f32(o.add(i + 4), vmulq_f32(o1, a));
+            vst1q_f32(o.add(i + 8), vmulq_f32(o2, a));
+            vst1q_f32(o.add(i + 12), vmulq_f32(o3, a));
+            i += 16;
+        }
+        while i + 4 <= head_dim {
+            let x = vld1q_f32(o.add(i));
+            vst1q_f32(o.add(i), vmulq_f32(x, a));
+            i += 4;
+        }
+        while i < head_dim {
+            *o.add(i) *= alpha;
+            i += 1;
+        }
+    }
+}
+
+/// NEON FMA loop: `o[0..head_dim] += beta * v[0..head_dim]`.
+///
+/// # Safety
+/// `o`, `v` must point to `head_dim` F32 lanes; `head_dim % 4 == 0`.
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn fma_o_v_neon(o: *mut f32, v: *const f32, beta: f32, head_dim: usize) {
+    unsafe {
+        let b = vdupq_n_f32(beta);
+        let mut i = 0;
+        while i + 16 <= head_dim {
+            let o0 = vld1q_f32(o.add(i));
+            let o1 = vld1q_f32(o.add(i + 4));
+            let o2 = vld1q_f32(o.add(i + 8));
+            let o3 = vld1q_f32(o.add(i + 12));
+            let v0 = vld1q_f32(v.add(i));
+            let v1 = vld1q_f32(v.add(i + 4));
+            let v2 = vld1q_f32(v.add(i + 8));
+            let v3 = vld1q_f32(v.add(i + 12));
+            vst1q_f32(o.add(i), vfmaq_f32(o0, b, v0));
+            vst1q_f32(o.add(i + 4), vfmaq_f32(o1, b, v1));
+            vst1q_f32(o.add(i + 8), vfmaq_f32(o2, b, v2));
+            vst1q_f32(o.add(i + 12), vfmaq_f32(o3, b, v3));
+            i += 16;
+        }
+        while i + 4 <= head_dim {
+            let o0 = vld1q_f32(o.add(i));
+            let v0 = vld1q_f32(v.add(i));
+            vst1q_f32(o.add(i), vfmaq_f32(o0, b, v0));
+            i += 4;
+        }
+        while i < head_dim {
+            *o.add(i) += beta * *v.add(i);
+            i += 1;
+        }
+    }
+}
+
+/// Per-row online softmax state carried across K-tile iterations.
+#[derive(Clone, Copy)]
+struct PrefillRowState {
+    m: f32,
+    l: f32,
+}
+
+impl PrefillRowState {
+    const EMPTY: PrefillRowState = PrefillRowState {
+        m: f32::NEG_INFINITY,
+        l: 0.0,
+    };
+}
+
+/// Prefill SpinPool worker: process one `(tile_i, kv_h)` pair end-to-end.
+///
+/// The worker holds thread-local scratch:
+/// * `o_tile[gqa_ratio * br * head_dim]`: weighted-V accumulator (F32).
+/// * `state[gqa_ratio * br]`: per-row (m, l) state.
+/// * `s_tile[br * bc]`: per-tile raw score buffer.
+/// * `p_tile[br * bc]`: per-tile softmax-weighted probability buffer.
+///
+/// These are stack-allocated small buffers for the state, but `o_tile`
+/// and `s_tile`/`p_tile` grow with tile dim so we Vec them once per worker
+/// invocation (fast paths: Vec::with_capacity then reset to zero in-place).
+///
+/// # Safety
+/// * `ctx` must be a live `*const PrefillFlashCtx`.
+/// * `task_id < n_tile_rows * n_heads_kv`.
+/// * The output region for `(tile_i, kv_h)` is disjoint from all other
+///   workers' regions.
+unsafe fn prefill_tile_worker(ctx: *const u8, task_id: usize) {
+    unsafe {
+        let ctx = &*(ctx as *const PrefillFlashCtx);
+        let n_heads_kv = ctx.n_heads_kv;
+        let gqa = ctx.gqa_ratio;
+        let head_dim = ctx.head_dim;
+        let br = ctx.br;
+        let bc = ctx.bc;
+
+        let tile_i = task_id / n_heads_kv;
+        let kv_h = task_id % n_heads_kv;
+        let r_start = tile_i * br;
+        let r_end = (r_start + br).min(ctx.q_len);
+        if r_start >= r_end {
+            return;
+        }
+        let cur_br = r_end - r_start;
+        let q_h_begin = kv_h * gqa;
+
+        let rows = gqa * cur_br;
+        // Per-row running softmax state for all `gqa × cur_br` queries in
+        // this (tile_i, kv_h) task.
+        let mut state = vec![PrefillRowState::EMPTY; rows];
+        // Weighted-V accumulator, laid out as `[q_h_within_group][r][d]`.
+        let mut o_tile = vec![0.0f32; rows * head_dim];
+        // Per-(tile_j) S and P scratch.
+        let mut s_tile = vec![0.0f32; cur_br * bc];
+        let mut p_tile = vec![0.0f32; cur_br * bc];
+
+        let tc = ctx.kv_len.div_ceil(bc);
+        let ws = if ctx.window_size_plus1 == 0 {
+            None
+        } else {
+            Some((ctx.window_size_plus1 - 1) as usize)
+        };
+
+        for tj in 0..tc {
+            let c_start = tj * bc;
+            let c_end = (c_start + bc).min(ctx.kv_len);
+            let cur_bc = c_end - c_start;
+
+            let kind = classify_tile(r_start, r_end, c_start, c_end, ctx.q_start_pos, ws);
+            if kind == TileKind::Skip {
+                continue;
+            }
+
+            // Process Q-heads in the GQA group.  Inner K-tile data is
+            // shared across heads, maximising L2 reuse.
+            for g in 0..gqa {
+                let q_h = q_h_begin + g;
+                let q_base = ctx.q_ptr.add(r_start * ctx.q_row_stride + q_h * head_dim);
+                let k_base = ctx
+                    .k_ptr
+                    .add(kv_h * ctx.kv_head_stride + c_start * ctx.k_pos_stride);
+                let v_base = ctx
+                    .v_ptr
+                    .add(kv_h * ctx.kv_head_stride + c_start * ctx.v_pos_stride);
+                let o_group_base = o_tile.as_mut_ptr().add(g * cur_br * head_dim);
+                let state_group = &mut state[g * cur_br..g * cur_br + cur_br];
+
+                // ---- Kernel A: compute S = Q · K^T (scaled) ----
+                for r in 0..cur_br {
+                    let q_row = q_base.add(r * ctx.q_row_stride);
+                    let s_row = s_tile.as_mut_ptr().add(r * bc);
+                    for c in 0..cur_bc {
+                        let k_row = k_base.add(c * ctx.k_pos_stride);
+                        let dot = qk_dot_f32_neon(q_row, k_row, head_dim);
+                        *s_row.add(c) = dot * ctx.scale;
+                    }
+                }
+
+                // ---- Kernel B: per-row online softmax + P · V ----
+                for r in 0..cur_br {
+                    let global_r = r_start + r + ctx.q_start_pos;
+                    let s_row = s_tile.as_ptr().add(r * bc);
+                    let p_row = p_tile.as_mut_ptr().add(r * bc);
+
+                    // Mask + row_max.
+                    let mut row_max = f32::NEG_INFINITY;
+                    let mut any_valid = false;
+                    match kind {
+                        TileKind::Full => {
+                            // No mask; all lanes valid.
+                            for c in 0..cur_bc {
+                                let v = *s_row.add(c);
+                                if v.is_finite() {
+                                    if v > row_max {
+                                        row_max = v;
+                                    }
+                                    any_valid = true;
+                                }
+                            }
+                        }
+                        TileKind::Diagonal => {
+                            // Per-lane predicate.
+                            for c in 0..cur_bc {
+                                let global_c = c_start + c;
+                                let causal_ok = global_c <= global_r;
+                                let window_ok = match ws {
+                                    Some(w) => global_c + w > global_r,
+                                    None => true,
+                                };
+                                if causal_ok && window_ok {
+                                    let v = *s_row.add(c);
+                                    if v.is_finite() {
+                                        if v > row_max {
+                                            row_max = v;
+                                        }
+                                        any_valid = true;
+                                    }
+                                }
+                            }
+                        }
+                        TileKind::Skip => unreachable!(),
+                    }
+
+                    if !any_valid {
+                        // No finite valid key this tile — state untouched.
+                        for c in 0..cur_bc {
+                            *p_row.add(c) = 0.0;
+                        }
+                        continue;
+                    }
+
+                    let st = &mut state_group[r];
+                    let m_prev = st.m;
+                    let m_new = m_prev.max(row_max);
+
+                    // Build P row.
+                    let mut l_part = 0.0f32;
+                    match kind {
+                        TileKind::Full => {
+                            for c in 0..cur_bc {
+                                let sv = *s_row.add(c);
+                                let p = if sv.is_finite() {
+                                    (sv - m_new).exp()
+                                } else {
+                                    0.0
+                                };
+                                *p_row.add(c) = p;
+                                l_part += p;
+                            }
+                        }
+                        TileKind::Diagonal => {
+                            for c in 0..cur_bc {
+                                let global_c = c_start + c;
+                                let causal_ok = global_c <= global_r;
+                                let window_ok = match ws {
+                                    Some(w) => global_c + w > global_r,
+                                    None => true,
+                                };
+                                let sv = *s_row.add(c);
+                                let p = if causal_ok && window_ok && sv.is_finite() {
+                                    (sv - m_new).exp()
+                                } else {
+                                    0.0
+                                };
+                                *p_row.add(c) = p;
+                                l_part += p;
+                            }
+                        }
+                        TileKind::Skip => unreachable!(),
+                    }
+
+                    let alpha = if m_prev == f32::NEG_INFINITY {
+                        0.0
+                    } else {
+                        (m_prev - m_new).exp()
+                    };
+
+                    let o_row = o_group_base.add(r * head_dim);
+                    if alpha != 1.0 {
+                        rescale_o_neon(o_row, alpha, head_dim);
+                    }
+
+                    // O += Σ_c p[c] · V[c, :]
+                    for c in 0..cur_bc {
+                        let p = *p_row.add(c);
+                        if p != 0.0 {
+                            let v_row = v_base.add(c * ctx.v_pos_stride);
+                            fma_o_v_neon(o_row, v_row, p, head_dim);
+                        }
+                    }
+
+                    st.m = m_new;
+                    st.l = st.l * alpha + l_part;
+                }
+            }
+        }
+
+        // Normalise and write out[r, q_h, :] for each (g, r) in this task.
+        for g in 0..gqa {
+            let q_h = q_h_begin + g;
+            for r in 0..cur_br {
+                let st = state[g * cur_br + r];
+                let o_row = o_tile.as_ptr().add((g * cur_br + r) * head_dim);
+                let out_row = ctx
+                    .out_ptr
+                    .add((r_start + r) * ctx.out_row_stride + q_h * head_dim);
+                if st.l == 0.0 || !st.l.is_finite() {
+                    // No valid key contributed — emit zero vector (matches
+                    // the reference when the row is fully masked).
+                    std::ptr::write_bytes(out_row, 0, head_dim);
+                    continue;
+                }
+                let inv_l = 1.0 / st.l;
+                let inv_v = vdupq_n_f32(inv_l);
+                let mut i = 0;
+                while i + 16 <= head_dim {
+                    let o0 = vld1q_f32(o_row.add(i));
+                    let o1 = vld1q_f32(o_row.add(i + 4));
+                    let o2 = vld1q_f32(o_row.add(i + 8));
+                    let o3 = vld1q_f32(o_row.add(i + 12));
+                    vst1q_f32(out_row.add(i), vmulq_f32(o0, inv_v));
+                    vst1q_f32(out_row.add(i + 4), vmulq_f32(o1, inv_v));
+                    vst1q_f32(out_row.add(i + 8), vmulq_f32(o2, inv_v));
+                    vst1q_f32(out_row.add(i + 12), vmulq_f32(o3, inv_v));
+                    i += 16;
+                }
+                while i + 4 <= head_dim {
+                    let x = vld1q_f32(o_row.add(i));
+                    vst1q_f32(out_row.add(i), vmulq_f32(x, inv_v));
+                    i += 4;
+                }
+                while i < head_dim {
+                    *out_row.add(i) = *o_row.add(i) * inv_l;
+                    i += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Entry point: tile + online-softmax prefill flash attention on NEON.
+///
+/// Signature mirrors `layers::attention::flash_attention_forward_strided`.
+/// See that function's doc-comment for stride conventions.  The caller
+/// should perform the threshold / layout checks before dispatching here.
+///
+/// `br` / `bc` from the caller are *advisory*: the kernel picks its own
+/// tile size based on `head_dim` to maximise L1/L2 residency.  The caller's
+/// values are used only when they are already tile-friendly and large
+/// enough to saturate NEON throughput (not enforced in this PR).
+///
+/// # Safety
+/// Slices must correspond to the HeadMajor KV layout and the Q / out row
+/// strides documented in `flash_attention_forward_strided`.
+#[allow(clippy::too_many_arguments)]
+pub fn flash_prefill_forward_f32_neon(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    q_len: usize,
+    kv_len: usize,
+    head_dim: usize,
+    q_row_stride: usize,
+    k_pos_stride: usize,
+    v_pos_stride: usize,
+    out_row_stride: usize,
+    kv_head_stride: usize,
+    q_start_pos: usize,
+    window_size: Option<usize>,
+) {
+    debug_assert_eq!(n_heads_q % n_heads_kv, 0);
+    debug_assert_eq!(head_dim % 8, 0);
+    debug_assert!(q_len > 0);
+
+    // Adaptive tile sizes per Architect §4.1.  `br × bc` chosen to fit the
+    // (Q tile, K/V tile, S tile, O tile) working set inside L1/L2 while
+    // giving enough FMA work to amortise dispatch.
+    let (br, bc) = if head_dim >= 96 { (64, 64) } else { (128, 64) };
+
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let gqa_ratio = n_heads_q / n_heads_kv;
+
+    // Encode `window_size` as a small unsigned so the ctx stays Copy/POD
+    // and worker code can branch on `ws == 0` → None.  `ws + 1` avoids
+    // collision with ws = 0 itself.
+    let window_size_plus1 = match window_size {
+        Some(w) => {
+            debug_assert!(w < u32::MAX as usize - 1);
+            (w as u32) + 1
+        }
+        None => 0,
+    };
+
+    let _ = n_heads_q; // field is only used for the debug_assert below.
+    let ctx = PrefillFlashCtx {
+        q_ptr: q.as_ptr(),
+        k_ptr: k.as_ptr(),
+        v_ptr: v.as_ptr(),
+        out_ptr: out.as_mut_ptr(),
+        n_heads_kv,
+        gqa_ratio,
+        head_dim,
+        q_len,
+        kv_len,
+        q_row_stride,
+        k_pos_stride,
+        v_pos_stride,
+        out_row_stride,
+        kv_head_stride,
+        q_start_pos,
+        br,
+        bc,
+        scale,
+        window_size_plus1,
+    };
+
+    let n_tile_rows = q_len.div_ceil(br);
+    let n_tasks = n_tile_rows * n_heads_kv;
+    let pool = thread_pool::get_pool();
+    // Safety:
+    // * `prefill_tile_worker` interprets `*const u8` as
+    //   `*const PrefillFlashCtx` (what we pass).
+    // * `ctx` is a stack value borrowed immutably by `dispatch` which
+    //   blocks until every worker finishes.
+    // * Task output regions are partitioned by `(tile_i, kv_h)` → distinct
+    //   `(r_row, q_h_in_group)` output slices.
+    unsafe {
+        pool.dispatch(
+            n_tasks,
+            prefill_tile_worker as WorkFn,
+            &ctx as *const PrefillFlashCtx as *const u8,
+        );
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
