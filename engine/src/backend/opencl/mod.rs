@@ -26,7 +26,9 @@ pub mod plan;
 fn log_prefill_dk128_once() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        eprintln!("[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32");
+        eprintln!(
+            "[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64"
+        );
     });
 }
 
@@ -2028,18 +2030,20 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
             ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
 
-            // Work size: [ceil(n_q/block_m) * block_m, n_heads_q * batch_size, 1]
-            // block_m matches the BLOCK_M define used to compile each kernel variant:
-            //   head_dim=64  → BLOCK_M=64 (dk64 program, unchanged)
-            //   head_dim=128 → BLOCK_M=32 (dk128 program, reduced to relieve register pressure)
-            let block_m: usize = match head_dim {
-                64 => 64,
-                128 => 32,
+            // Work size: [ceil(n_q/block_m) * lanes_per_wg, n_heads_q * batch_size, 1]
+            // BLOCK_M = Q-rows per WG (matches the -DBLOCK_M compile-time macro).
+            // lanes_per_wg = threads per WG:
+            //   head_dim=64  → BLOCK_M=64, 1 thread / Q-row → lanes_per_wg=64 (dk64 program, unchanged)
+            //   head_dim=128 → BLOCK_M=32, 2 threads / Q-row (A-3 B-1 subgroup split) → lanes_per_wg=64
+            let (block_m, lanes_per_wg): (usize, usize) = match head_dim {
+                64 => (64, 64),
+                128 => (32, 64),
                 _ => unreachable!("head_dim guard above"),
             };
             let n_groups_q = seq_len.div_ceil(block_m);
-            let global_work_size: [usize; 3] = [n_groups_q * block_m, n_heads_q * batch_size, 1];
-            let local_work_size: [usize; 3] = [block_m, 1, 1];
+            let global_work_size: [usize; 3] =
+                [n_groups_q * lanes_per_wg, n_heads_q * batch_size, 1];
+            let local_work_size: [usize; 3] = [lanes_per_wg, 1, 1];
 
             ocl::core::enqueue_kernel(
                 &self.queue,
