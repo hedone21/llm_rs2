@@ -463,7 +463,7 @@ __kernel void flash_attn_f32_f16(
 
 #endif  // FA_SUBGROUP_SPLIT
 
-__kernel void flash_attn_f32_f16_q1(
+__kernel REQD_SUBGROUP_SIZE_64 void flash_attn_f32_f16_q1(
     const global void * q_void, ulong q_offset,
     const global void * k_void, ulong k_offset,
     const global void * v_void, ulong v_offset,
@@ -549,15 +549,10 @@ __kernel void flash_attn_f32_f16_q1(
         m_i = max(m_i, score);
     }
 
-    __local ACC_TYPE local_m[Q1_WG_SIZE];
-    local_m[tid] = m_i;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) local_m[tid] = max(local_m[tid], local_m[tid + s]);
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const ACC_TYPE m_final = local_m[0];
+    // B-4: subgroup reduce — Q1_WG_SIZE=64 == subgroup width on Adreno.
+    // Replaces 6-stage SLM tree-reduce (7 barriers) with single barrier-free
+    // shuffle. Result is broadcast to all lanes, no SLM needed.
+    const ACC_TYPE m_final = sub_group_reduce_max(m_i);
 
     ACC_TYPE4 o_acc[DV_VEC];
     #pragma unroll
@@ -590,19 +585,11 @@ __kernel void flash_attn_f32_f16_q1(
         }
     }
 
-    __local ACC_TYPE local_l[Q1_WG_SIZE];
-    __local ACC_TYPE4 local_o_comp[Q1_WG_SIZE];
-    local_l[tid] = l_i;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    #pragma unroll
-    for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-        if (tid < s) local_l[tid] += local_l[tid + s];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
+    // B-4: subgroup reduce sum across 64 lanes (barrier-free).
+    ACC_TYPE l_final = sub_group_reduce_add(l_i);
 
     const ulong o_row_offset = batch_idx * o_nb3 + head_idx * o_nb1;
     global O_DATA_TYPE4 *o_row = (global O_DATA_TYPE4 *)(o_base + o_row_offset);
-    ACC_TYPE l_final = local_l[0];
 
     if (sinks_ptr != NULL) {
         l_final += exp(sinks_ptr[head_idx] - m_final);
@@ -610,16 +597,18 @@ __kernel void flash_attn_f32_f16_q1(
 
     if (l_final > 0.0f) {
         const ACC_TYPE l_inv = 1.0f / l_final;
+        // B-4: per-DV-element subgroup reduce on each vec4 component.
+        // Replaces DV_VEC × 7-stage SLM tree-reduce (224 barriers for DV=128)
+        // with DV_VEC × 4 barrier-free shuffles. lane 0 writes the result.
         for (int i = 0; i < DV_VEC; i++) {
-            local_o_comp[tid] = o_acc[i];
-            barrier(CLK_LOCAL_MEM_FENCE);
-            #pragma unroll
-            for (int s = Q1_WG_SIZE / 2; s > 0; s >>= 1) {
-                if (tid < s) local_o_comp[tid] += local_o_comp[tid + s];
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
+            const ACC_TYPE4 v = o_acc[i];
+            const ACC_TYPE r0 = sub_group_reduce_add(v.s0);
+            const ACC_TYPE r1 = sub_group_reduce_add(v.s1);
+            const ACC_TYPE r2 = sub_group_reduce_add(v.s2);
+            const ACC_TYPE r3 = sub_group_reduce_add(v.s3);
             if (tid == 0) {
-                o_row[i] = CONVERT_O_DATA4(local_o_comp[0] * l_inv);
+                const ACC_TYPE4 sum = (ACC_TYPE4)(r0, r1, r2, r3);
+                o_row[i] = CONVERT_O_DATA4(sum * l_inv);
             }
         }
     } else if (tid == 0) {
