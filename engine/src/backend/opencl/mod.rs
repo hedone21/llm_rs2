@@ -10,8 +10,10 @@ use ocl::core::Kernel as CoreKernel;
 use ocl::{Context, Device, Platform, Program, Queue, flags};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::collections::HashSet;
 #[cfg(test)]
 use std::sync::Arc;
+use std::sync::{Mutex, OnceLock};
 
 pub mod buffer;
 pub mod gpu_score;
@@ -977,6 +979,49 @@ impl OpenCLBackend {
                 None,
             )?
         };
+
+        // One-time startup diagnostic: report which flash decode split/reduce
+        // kernels compiled successfully on this device. Always emitted once so
+        // the user can confirm whether KV-split is available.
+        eprintln!(
+            "[OpenCL] Flash decode kernels: split_dk64={} split_dk128={} reduce_dk64={} reduce_dk128={}",
+            if flash_attn_f32_f16_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_split").ok())
+                .is_some()
+            {
+                "Y"
+            } else {
+                "N"
+            },
+            if flash_attn_f32_f16_program_dk128
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_split").ok())
+                .is_some()
+            {
+                "Y"
+            } else {
+                "N"
+            },
+            if flash_attn_q1_reduce_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_q1_reduce").ok())
+                .is_some()
+            {
+                "Y"
+            } else {
+                "N"
+            },
+            if flash_attn_q1_reduce_program_dk128
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_q1_reduce").ok())
+                .is_some()
+            {
+                "Y"
+            } else {
+                "N"
+            },
+        );
 
         Ok(Self {
             context,
@@ -2078,6 +2123,40 @@ impl OpenCLBackend {
             );
         }
         // Fall through to legacy path when split/reduce kernels are unavailable or kv_splits == 1.
+        // If kv_splits > 1 but kernels are missing, emit a one-time warning so the user knows
+        // the split path was bypassed (Adreno driver compile failure or unsupported head_dim).
+        if kv_splits > 1 {
+            let reason = match head_dim {
+                64 => {
+                    if split_kernel_opt.is_none() && reduce_kernel_opt.is_none() {
+                        "split+reduce kernels unavailable for dk64"
+                    } else if split_kernel_opt.is_none() {
+                        "split kernel unavailable for dk64"
+                    } else {
+                        "reduce kernel unavailable for dk64"
+                    }
+                }
+                128 => {
+                    if split_kernel_opt.is_none() && reduce_kernel_opt.is_none() {
+                        "split+reduce kernels unavailable for dk128"
+                    } else if split_kernel_opt.is_none() {
+                        "split kernel unavailable for dk128"
+                    } else {
+                        "reduce kernel unavailable for dk128"
+                    }
+                }
+                _ => "unsupported head_dim for split path",
+            };
+            static LEGACY_WARNED: OnceLock<Mutex<HashSet<(usize, usize)>>> = OnceLock::new();
+            let seen = LEGACY_WARNED.get_or_init(|| Mutex::new(HashSet::new()));
+            let key = (kv_splits, head_dim);
+            if seen.lock().unwrap().insert(key) {
+                eprintln!(
+                    "[FlashDecode] kv_splits={} would benefit from split path, but using legacy single-kernel (reason: {})",
+                    kv_splits, reason
+                );
+            }
+        }
 
         let q_buf = get_cl_mem(q.buffer().as_ref())?;
         let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
@@ -2210,6 +2289,20 @@ impl OpenCLBackend {
         split_kernel: &CoreKernel,
         reduce_kernel: &CoreKernel,
     ) -> Result<bool> {
+        // Emit a per-(kv_splits, head_dim) one-time diagnostic so the user can
+        // confirm that the Flash Decoding split path is actually being reached.
+        {
+            static LOGGED: OnceLock<Mutex<HashSet<(usize, usize)>>> = OnceLock::new();
+            let seen = LOGGED.get_or_init(|| Mutex::new(HashSet::new()));
+            let key = (kv_splits, head_dim);
+            if seen.lock().unwrap().insert(key) {
+                eprintln!(
+                    "[FlashDecode] KV-split active: kv_splits={} (n_kv={}, head_dim={}, n_heads_q={})",
+                    kv_splits, cache_seq_len, head_dim, n_heads_q
+                );
+            }
+        }
+
         let q_buf = get_cl_mem(q.buffer().as_ref())?;
         let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
         let v_buf = get_cl_mem(v_cache.buffer().as_ref())?;
