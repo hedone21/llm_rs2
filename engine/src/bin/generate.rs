@@ -803,10 +803,15 @@ fn main() -> anyhow::Result<()> {
 
     // On discrete GPUs without flash attention for this head_dim, F16 KV + GPU attention
     // produces incorrect results. Auto-promote to F32 KV for correctness.
-    // Flash attention is compiled with DK=64; models with head_dim != 64 can't use it.
-    if backend.is_gpu() && kv_type == DType::F16 && head_dim != 64 && backend.is_discrete_gpu() {
+    // flash_attn_f32_f16 is compiled for DK ∈ {64, 128}; other head_dim values
+    // have no GPU F16 kernel and must fall back to F32 KV.
+    if backend.is_gpu()
+        && kv_type == DType::F16
+        && !matches!(head_dim, 64 | 128)
+        && backend.is_discrete_gpu()
+    {
         eprintln!(
-            "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} != flash_attn DK=64)",
+            "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} not in flash_attn DK set {{64, 128}})",
             head_dim
         );
         kv_type = DType::F32;
