@@ -97,7 +97,8 @@ struct Args {
     no_prefill_ws: bool,
 
     /// Chunked prefill: split long prompts into chunks to limit peak memory.
-    /// 0 = disabled (default, process entire prompt as one batch).
+    /// 0 = auto (default): GPU backend derives a safe size from max_single_alloc()
+    ///     to avoid CL_INVALID_BUFFER_SIZE; CPU backend processes entire prompt as one batch.
     #[arg(long, default_value_t = 0)]
     prefill_chunk_size: usize,
 
@@ -1611,14 +1612,48 @@ fn main() -> anyhow::Result<()> {
 
                 // Chunked prefill
                 // When resilience is enabled, auto-chunk at 256 for checkpoint support.
-                let chunk_size =
-                    if args.prefill_chunk_size > 0 && args.prefill_chunk_size < process_len {
-                        args.prefill_chunk_size
-                    } else if args.enable_resilience && process_len > 256 {
-                        256
+                // When GPU backend and prefill_chunk_size == 0, auto-derive a safe chunk
+                // size from max_single_alloc() to avoid CL_INVALID_BUFFER_SIZE (-61).
+                let auto_gpu_chunk: Option<usize> =
+                    if args.prefill_chunk_size == 0 && backend.is_gpu() {
+                        let max_alloc = backend.max_single_alloc();
+                        if max_alloc > 0 {
+                            // Each chunk needs a logits buffer: chunk * vocab_size * 4 bytes.
+                            // Use 50% of max_single_alloc as conservative budget.
+                            let budget = max_alloc / 2;
+                            let by_vocab = (budget / (vocab_size * 4)).max(1);
+                            // Also bound by hidden_size to keep activation buffers feasible.
+                            let by_hidden = (max_alloc / (hidden_size * 4)).max(1);
+                            let derived = by_vocab.min(by_hidden).min(512);
+                            Some(derived)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
+                let chunk_size = if args.prefill_chunk_size > 0
+                    && args.prefill_chunk_size < process_len
+                {
+                    args.prefill_chunk_size
+                } else if let Some(auto) = auto_gpu_chunk {
+                    if auto < process_len {
+                        eprintln!(
+                            "[Prefill] prefill_chunk_size auto-selected: {} (max_alloc={}MB, vocab={}, hidden={})",
+                            auto,
+                            backend.max_single_alloc() / (1024 * 1024),
+                            vocab_size,
+                            hidden_size,
+                        );
+                        auto
                     } else {
                         process_len
-                    };
+                    }
+                } else if args.enable_resilience && process_len > 256 {
+                    256
+                } else {
+                    process_len
+                };
                 let chunked = chunk_size < process_len;
 
                 // Dynamic prefill policy: use persistent values if set by prior
@@ -2272,8 +2307,40 @@ fn main() -> anyhow::Result<()> {
         // 0 or >= process_len → use full prompt as single chunk (original behaviour).
         // When resilience is enabled, auto-chunk at 256 so that chunk boundaries
         // serve as checkpoints for SwitchHw / Throttle / LayerSkip commands.
+        // When GPU backend and prefill_chunk_size == 0, auto-derive a safe chunk
+        // size from max_single_alloc() to avoid CL_INVALID_BUFFER_SIZE (-61).
+        let auto_gpu_chunk: Option<usize> = if args.prefill_chunk_size == 0 && backend.is_gpu() {
+            let max_alloc = backend.max_single_alloc();
+            if max_alloc > 0 {
+                // Each chunk needs a logits buffer: chunk * vocab_size * 4 bytes.
+                // Use 50% of max_single_alloc as conservative budget.
+                let budget = max_alloc / 2;
+                let by_vocab = (budget / (vocab_size * 4)).max(1);
+                // Also bound by hidden_size to keep activation buffers feasible.
+                let by_hidden = (max_alloc / (hidden_size * 4)).max(1);
+                let derived = by_vocab.min(by_hidden).min(512);
+                Some(derived)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         let chunk_size = if args.prefill_chunk_size > 0 && args.prefill_chunk_size < process_len {
             args.prefill_chunk_size
+        } else if let Some(auto) = auto_gpu_chunk {
+            if auto < process_len {
+                eprintln!(
+                    "[Prefill] prefill_chunk_size auto-selected: {} (max_alloc={}MB, vocab={}, hidden={})",
+                    auto,
+                    backend.max_single_alloc() / (1024 * 1024),
+                    vocab_size,
+                    hidden_size,
+                );
+                auto
+            } else {
+                process_len
+            }
         } else if args.enable_resilience && process_len > 256 {
             256
         } else {
