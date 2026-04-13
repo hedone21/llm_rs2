@@ -293,6 +293,7 @@ impl TransformerLayer {
             None, // prefill_ws: passed separately via forward_into dispatch
             0,    // layer_idx: unknown in this path (no variance collector)
             None, // variance_collector: not available here
+            args.profiler.map(|p| &mut p.prefill),
         )
     }
 

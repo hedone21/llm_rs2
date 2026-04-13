@@ -1,5 +1,38 @@
 use super::*;
 
+use std::collections::HashSet;
+use std::sync::Mutex;
+
+/// Per-run deduplication set for GPU→CPU attention fallback warnings.
+/// Same (dtype, head_dim, reason) tuple is logged to stderr only once per process.
+static FALLBACK_WARNED: Mutex<Option<HashSet<(String, usize, &'static str)>>> = Mutex::new(None);
+
+/// Emit a one-time stderr warning for a GPU prefill → CPU attention fallback.
+/// Always emits the OpProfiler event (if profiler is Some) regardless of dedup state.
+fn warn_gpu_fallback_once(
+    kv_dtype: crate::core::buffer::DType,
+    head_dim: usize,
+    reason: &'static str,
+    profiler: Option<&mut crate::profile::ops::PrefillOpProfiler>,
+) {
+    let dtype_str = format!("{:?}", kv_dtype);
+    let key = (dtype_str.clone(), head_dim, reason);
+
+    let mut guard = FALLBACK_WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    let set = guard.get_or_insert_with(HashSet::new);
+    if set.insert(key) {
+        eprintln!(
+            "[GPU-fallback] prefill attn: dtype={} head_dim={} reason=\"{}\"",
+            dtype_str, head_dim, reason
+        );
+    }
+    drop(guard);
+
+    if let Some(p) = profiler {
+        p.cpu_fallback_count += 1;
+    }
+}
+
 impl TransformerLayer {
     /// Standard forward path (Prefill or dynamic generation)
     #[allow(clippy::too_many_arguments)]
@@ -28,12 +61,53 @@ impl TransformerLayer {
         mut variance_collector: Option<
             &mut crate::core::pressure::d2o_layer_alloc::D2OVarianceCollector,
         >,
+        mut profiler: Option<&mut crate::profile::ops::PrefillOpProfiler>,
     ) -> Result<()> {
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
         let v_dim = self.wv.shape().dims()[0];
         let n_heads_q = q_dim / head_dim;
         let n_heads_kv = k_dim / head_dim;
+
+        // Split profiler borrow: we need it in multiple branches below.
+        // Use a raw pointer to avoid borrow-checker conflict across branches.
+        // Safety: `profiler` outlives this function and is never aliased concurrently.
+        let profiler_ptr = profiler
+            .as_mut()
+            .map(|p| *p as *mut crate::profile::ops::PrefillOpProfiler);
+
+        // SAFETY: single-threaded forward pass; pointer is valid for function lifetime.
+        macro_rules! pf {
+            () => {
+                profiler_ptr.map(|p| unsafe { &mut *p })
+            };
+        }
+
+        let is_gpu = backend.is_gpu();
+
+        macro_rules! pf_start {
+            () => {
+                if profiler_ptr.is_some() {
+                    if is_gpu {
+                        backend.synchronize().ok();
+                    }
+                    std::time::Instant::now()
+                } else {
+                    std::time::Instant::now()
+                }
+            };
+        }
+
+        macro_rules! pf_record {
+            ($t:expr, $field:ident) => {
+                if let Some(p) = pf!() {
+                    if is_gpu {
+                        backend.synchronize().ok();
+                    }
+                    p.$field += $t.elapsed().as_micros() as u64;
+                }
+            };
+        }
 
         // PrefillWorkspace path: early return to keep the fallback path's
         // stack frame identical to the original (pre-ae62391) code.
@@ -50,12 +124,20 @@ impl TransformerLayer {
             // Reuse pre-allocated workspace — zero GPU alloc/free per layer
             let n_elem = batch_size * seq_len * dim;
             backend.copy_slice(x, &mut ws.residual, 0, 0, n_elem)?;
-            backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
+            {
+                let t = pf_start!();
+                backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
+                pf_record!(t, rms_norm);
+            }
 
             // QKV: always GPU-only (attention partition removed — merge overhead exceeds benefit)
-            backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
-            backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
-            backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
+            {
+                let t = pf_start!();
+                backend.matmul_transposed(x, &self.wq, &mut ws.q)?;
+                backend.matmul_transposed(x, &self.wk, &mut ws.k)?;
+                backend.matmul_transposed(x, &self.wv, &mut ws.v)?;
+                pf_record!(t, matmul_qkv);
+            }
 
             if let Some(ref bias) = self.qkv_bias {
                 backend.add_row_bias(&mut ws.q, &bias.bq)?;
@@ -90,36 +172,44 @@ impl TransformerLayer {
                 backend.clone(),
             );
 
-            backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
-            backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+            {
+                let t = pf_start!();
+                backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
+                backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+                pf_record!(t, rope);
+            }
 
             // KV cache update
             let kv_dtype = kv_cache.kv_dtype();
-            if kv_dtype != DType::F32 {
-                let n_elem = seq_len * n_heads_kv * head_dim;
-                let buf_size = match kv_dtype {
-                    DType::F16 => n_elem * 2,
-                    DType::Q4_0 => {
-                        (n_elem / crate::core::quant::QK4_0)
-                            * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+            {
+                let t = pf_start!();
+                if kv_dtype != DType::F32 {
+                    let n_elem = seq_len * n_heads_kv * head_dim;
+                    let buf_size = match kv_dtype {
+                        DType::F16 => n_elem * 2,
+                        DType::Q4_0 => {
+                            (n_elem / crate::core::quant::QK4_0)
+                                * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+                        }
+                        _ => n_elem * 4,
+                    };
+                    if ws.k_cast.is_none() {
+                        let buf = memory.alloc(buf_size, kv_dtype)?;
+                        ws.k_cast = Some(Tensor::new(k_rope.shape().clone(), buf, backend.clone()));
                     }
-                    _ => n_elem * 4,
-                };
-                if ws.k_cast.is_none() {
-                    let buf = memory.alloc(buf_size, kv_dtype)?;
-                    ws.k_cast = Some(Tensor::new(k_rope.shape().clone(), buf, backend.clone()));
+                    if ws.v_cast.is_none() {
+                        let buf = memory.alloc(buf_size, kv_dtype)?;
+                        ws.v_cast = Some(Tensor::new(ws.v.shape().clone(), buf, backend.clone()));
+                    }
+                    let k_c = ws.k_cast.as_mut().unwrap();
+                    let v_c = ws.v_cast.as_mut().unwrap();
+                    backend.cast(&k_rope, k_c)?;
+                    backend.cast(&ws.v, v_c)?;
+                    kv_cache.update(k_c, v_c)?;
+                } else {
+                    super::update_kv_cache(kv_cache, &k_rope, &ws.v, backend)?;
                 }
-                if ws.v_cast.is_none() {
-                    let buf = memory.alloc(buf_size, kv_dtype)?;
-                    ws.v_cast = Some(Tensor::new(ws.v.shape().clone(), buf, backend.clone()));
-                }
-                let k_c = ws.k_cast.as_mut().unwrap();
-                let v_c = ws.v_cast.as_mut().unwrap();
-                backend.cast(&k_rope, k_c)?;
-                backend.cast(&ws.v, v_c)?;
-                kv_cache.update(k_c, v_c)?;
-            } else {
-                super::update_kv_cache(kv_cache, &k_rope, &ws.v, backend)?;
+                pf_record!(t, kv_write);
             }
 
             let cache_seq_len = kv_cache.current_pos();
@@ -129,13 +219,13 @@ impl TransformerLayer {
 
             ws.out_attn
                 .reshape(Shape::new(vec![batch_size, seq_len, q_dim]));
-            let is_gpu = backend.is_gpu();
 
             // GPU flash attention — only if KV buffers are actually GPU buffers.
             // CPU-only caches (e.g. KiviCache with SharedBuffer) skip to CPU fallback.
             let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
             let gpu_dispatched = if is_gpu && kv_is_gpu {
-                backend.flash_attention_prefill(
+                let t = pf_start!();
+                let dispatched = backend.flash_attention_prefill(
                     &q_rope,
                     &k_cache,
                     &v_cache,
@@ -148,16 +238,33 @@ impl TransformerLayer {
                     kv_capacity,
                     batch_size,
                     kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
-                )?
+                )?;
+                if dispatched {
+                    pf_record!(t, flash_prefill_gpu);
+                }
+                dispatched
             } else {
                 false
             };
+
+            // Detect and log GPU→CPU attention fallback.
+            if !gpu_dispatched && is_gpu && kv_is_gpu {
+                let reason: &'static str = if head_dim != 64 {
+                    "head_dim != 64 (not compiled into flash_attn kernel)"
+                } else if kv_dtype == DType::Q4_0 {
+                    "kv dtype Q4_0 not supported by flash_attn kernel"
+                } else {
+                    "flash_attn kernel unavailable for this dtype/config"
+                };
+                warn_gpu_fallback_once(kv_dtype, head_dim, reason, pf!());
+            }
 
             // Use read_buffer path only when buffers are not CPU-accessible (device-only).
             // UMA/pinned buffers (CUDA, OpenCL zero-copy) have valid as_ptr().
             let is_device_only = is_gpu && q_rope.as_ptr().is_null();
             if !gpu_dispatched {
                 // CPU attention fallback
+                let pf_attn_t = pf_start!();
                 let mut out_vec = Vec::new();
                 {
                     fn as_u8_mut(v: &mut [f32]) -> &mut [u8] {
@@ -435,26 +542,39 @@ impl TransformerLayer {
                         }
                     }
                 }
+                pf_record!(pf_attn_t, flash_prefill_cpu);
             }
 
             // O-proj: always GPU-only (wo partition removed — merge overhead exceeds benefit)
             ws.attn_out_proj
                 .reshape(Shape::new(vec![batch_size, seq_len, dim]));
-            backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out_proj)?;
+            {
+                let t = pf_start!();
+                backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out_proj)?;
+                pf_record!(t, matmul_wo);
+            }
             if rms_norm_add_unit {
                 backend.rms_norm(&mut ws.attn_out_proj, &self.ffn_norm, rms_norm_eps, true)?;
             }
-            backend.add_assign(&mut ws.attn_out_proj, &ws.residual)?;
+            {
+                let t = pf_start!();
+                backend.add_assign(&mut ws.attn_out_proj, &ws.residual)?;
+                pf_record!(t, add_assign);
+            }
 
             // Copy to x for FFN
             backend.copy_slice(&ws.attn_out_proj, x, 0, 0, n_elem)?;
 
             // FFN
             backend.copy_slice(x, &mut ws.residual_ffn, 0, 0, n_elem)?;
-            if let Some(ref pfn) = self.pre_ffn_norm {
-                backend.rms_norm(x, pfn, rms_norm_eps, true)?;
-            } else {
-                backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
+            {
+                let t = pf_start!();
+                if let Some(ref pfn) = self.pre_ffn_norm {
+                    backend.rms_norm(x, pfn, rms_norm_eps, true)?;
+                } else {
+                    backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
+                }
+                pf_record!(t, rms_norm);
             }
 
             let ffn_hidden = self.w_up.shape().dims()[0];
@@ -551,22 +671,47 @@ impl TransformerLayer {
                     )?;
                 }
             } else {
-                backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
-                backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
+                {
+                    let t = pf_start!();
+                    backend.matmul_transposed(x, &self.w_gate, &mut ws.gate)?;
+                    pf_record!(t, ffn_gate);
+                }
+                {
+                    let t = pf_start!();
+                    backend.matmul_transposed(x, &self.w_up, &mut ws.up)?;
+                    pf_record!(t, ffn_up);
+                }
             }
 
-            if use_gelu_tanh {
-                backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
-            } else {
-                backend.silu_mul(&mut ws.gate, &ws.up)?;
+            {
+                let t = pf_start!();
+                if use_gelu_tanh {
+                    backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
+                } else {
+                    backend.silu_mul(&mut ws.gate, &ws.up)?;
+                }
+                pf_record!(t, silu_mul);
             }
 
             // Down: always GPU-only (down partition removed — merge overhead exceeds benefit)
-            backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+            {
+                let t = pf_start!();
+                backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+                pf_record!(t, ffn_down);
+            }
             if let Some(ref pfn) = self.post_ffn_norm {
                 backend.rms_norm(&mut ws.down, pfn, rms_norm_eps, true)?;
             }
-            backend.add_assign(&mut ws.down, &ws.residual_ffn)?;
+            {
+                let t = pf_start!();
+                backend.add_assign(&mut ws.down, &ws.residual_ffn)?;
+                pf_record!(t, add_assign);
+            }
+
+            // Record layer count.
+            if let Some(p) = pf!() {
+                p.layer_count += 1;
+            }
 
             // Output x = down
             backend.copy_slice(&ws.down, x, 0, 0, n_elem)?;
@@ -575,15 +720,23 @@ impl TransformerLayer {
 
         // Fallback: allocate temp buffers per layer (original path, pre-ae62391)
         let residual = backend.copy_from(x)?;
-        backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
+        {
+            let t = pf_start!();
+            backend.rms_norm(x, &self.attention_norm, rms_norm_eps, rms_norm_add_unit)?;
+            pf_record!(t, rms_norm);
+        }
 
         let mut q = self.alloc_temp(vec![batch_size, seq_len, q_dim], memory, backend)?;
         let mut k = self.alloc_temp(vec![batch_size, seq_len, k_dim], memory, backend)?;
         let mut v = self.alloc_temp(vec![batch_size, seq_len, v_dim], memory, backend)?;
 
-        backend.matmul_transposed(x, &self.wq, &mut q)?;
-        backend.matmul_transposed(x, &self.wk, &mut k)?;
-        backend.matmul_transposed(x, &self.wv, &mut v)?;
+        {
+            let t = pf_start!();
+            backend.matmul_transposed(x, &self.wq, &mut q)?;
+            backend.matmul_transposed(x, &self.wk, &mut k)?;
+            backend.matmul_transposed(x, &self.wv, &mut v)?;
+            pf_record!(t, matmul_qkv);
+        }
 
         if let Some(ref bias) = self.qkv_bias {
             backend.add_row_bias(&mut q, &bias.bq)?;
@@ -617,30 +770,38 @@ impl TransformerLayer {
             backend.clone(),
         );
 
-        backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
-        backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+        {
+            let t = pf_start!();
+            backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
+            backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
+            pf_record!(t, rope);
+        }
 
         // Cast to target dtype if KV cache is not F32
         let kv_dtype = kv_cache.kv_dtype();
-        if kv_dtype != DType::F32 {
-            let n_elem = seq_len * n_heads_kv * head_dim;
-            let buf_size = match kv_dtype {
-                DType::F16 => n_elem * 2,
-                DType::Q4_0 => {
-                    (n_elem / crate::core::quant::QK4_0)
-                        * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
-                }
-                _ => n_elem * 4,
-            };
-            let k_cast_buf = memory.alloc(buf_size, kv_dtype)?;
-            let mut k_cast = Tensor::new(k_rope.shape().clone(), k_cast_buf, backend.clone());
-            backend.cast(&k_rope, &mut k_cast)?;
-            let v_cast_buf = memory.alloc(buf_size, kv_dtype)?;
-            let mut v_cast = Tensor::new(v.shape().clone(), v_cast_buf, backend.clone());
-            backend.cast(&v, &mut v_cast)?;
-            kv_cache.update(&k_cast, &v_cast)?;
-        } else {
-            super::update_kv_cache(kv_cache, &k_rope, &v, backend)?;
+        {
+            let t = pf_start!();
+            if kv_dtype != DType::F32 {
+                let n_elem = seq_len * n_heads_kv * head_dim;
+                let buf_size = match kv_dtype {
+                    DType::F16 => n_elem * 2,
+                    DType::Q4_0 => {
+                        (n_elem / crate::core::quant::QK4_0)
+                            * std::mem::size_of::<crate::core::quant::BlockQ4_0>()
+                    }
+                    _ => n_elem * 4,
+                };
+                let k_cast_buf = memory.alloc(buf_size, kv_dtype)?;
+                let mut k_cast = Tensor::new(k_rope.shape().clone(), k_cast_buf, backend.clone());
+                backend.cast(&k_rope, &mut k_cast)?;
+                let v_cast_buf = memory.alloc(buf_size, kv_dtype)?;
+                let mut v_cast = Tensor::new(v.shape().clone(), v_cast_buf, backend.clone());
+                backend.cast(&v, &mut v_cast)?;
+                kv_cache.update(&k_cast, &v_cast)?;
+            } else {
+                super::update_kv_cache(kv_cache, &k_rope, &v, backend)?;
+            }
+            pf_record!(t, kv_write);
         }
 
         let cache_seq_len = kv_cache.current_pos();
@@ -650,13 +811,12 @@ impl TransformerLayer {
 
         let mut out_attn = self.alloc_temp(vec![batch_size, seq_len, q_dim], memory, backend)?;
 
-        let is_gpu = backend.is_gpu();
-
         // GPU flash attention — only if KV buffers are actually GPU buffers.
         // CPU-only caches (e.g. KiviCache with SharedBuffer) skip to CPU fallback.
         let kv_is_gpu = k_cache.buffer().is_gpu_buffer();
         let gpu_dispatched = if is_gpu && kv_is_gpu {
-            backend.flash_attention_prefill(
+            let t = pf_start!();
+            let dispatched = backend.flash_attention_prefill(
                 &q_rope,
                 &k_cache,
                 &v_cache,
@@ -669,14 +829,31 @@ impl TransformerLayer {
                 kv_capacity,
                 batch_size,
                 kv_layout == crate::core::kv_cache::KVLayout::HeadMajor,
-            )?
+            )?;
+            if dispatched {
+                pf_record!(t, flash_prefill_gpu);
+            }
+            dispatched
         } else {
             false
         };
 
+        // Detect and log GPU→CPU attention fallback.
+        if !gpu_dispatched && is_gpu && kv_is_gpu {
+            let reason: &'static str = if head_dim != 64 {
+                "head_dim != 64 (not compiled into flash_attn kernel)"
+            } else if kv_dtype == DType::Q4_0 {
+                "kv dtype Q4_0 not supported by flash_attn kernel"
+            } else {
+                "flash_attn kernel unavailable for this dtype/config"
+            };
+            warn_gpu_fallback_once(kv_dtype, head_dim, reason, pf!());
+        }
+
         let is_device_only2 = is_gpu && q_rope.as_ptr().is_null();
         if !gpu_dispatched {
             // ---- CPU flash attention path (also used as GPU fallback) ----
+            let pf_attn_t2 = pf_start!();
             let mut out_vec = Vec::new();
 
             {
@@ -922,51 +1099,163 @@ impl TransformerLayer {
                 );
                 out_attn = backend.copy_from(&cpu_out)?;
             }
+            pf_record!(pf_attn_t2, flash_prefill_cpu);
         }
 
         let mut attn_out_projected =
             self.alloc_temp(vec![batch_size, seq_len, dim], memory, backend)?;
-        backend.matmul_transposed(&out_attn, &self.wo, &mut attn_out_projected)?;
+        {
+            let t = pf_start!();
+            backend.matmul_transposed(&out_attn, &self.wo, &mut attn_out_projected)?;
+            pf_record!(t, matmul_wo);
+        }
 
         // Gemma3: apply post-attention norm (ffn_norm) to O-proj output before residual add.
         // Llama/Qwen2: no post-attention norm here.
         if rms_norm_add_unit {
             backend.rms_norm(&mut attn_out_projected, &self.ffn_norm, rms_norm_eps, true)?;
         }
-        backend.add_assign(&mut attn_out_projected, &residual)?;
+        {
+            let t = pf_start!();
+            backend.add_assign(&mut attn_out_projected, &residual)?;
+            pf_record!(t, add_assign);
+        }
         *x = attn_out_projected;
 
         let residual_ffn = backend.copy_from(x)?;
         // Gemma3: use dedicated pre_ffn_norm. Llama/Qwen2: use ffn_norm as pre-FFN norm.
-        if let Some(ref pfn) = self.pre_ffn_norm {
-            backend.rms_norm(x, pfn, rms_norm_eps, true)?;
-        } else {
-            backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
+        {
+            let t = pf_start!();
+            if let Some(ref pfn) = self.pre_ffn_norm {
+                backend.rms_norm(x, pfn, rms_norm_eps, true)?;
+            } else {
+                backend.rms_norm(x, &self.ffn_norm, rms_norm_eps, false)?;
+            }
+            pf_record!(t, rms_norm);
         }
 
         let ffn_hidden = self.w_up.shape().dims()[0];
         let mut gate = self.alloc_temp(vec![batch_size, seq_len, ffn_hidden], memory, backend)?;
         let mut up = self.alloc_temp(vec![batch_size, seq_len, ffn_hidden], memory, backend)?;
 
-        backend.matmul_transposed(x, &self.w_gate, &mut gate)?;
-        backend.matmul_transposed(x, &self.w_up, &mut up)?;
+        {
+            let t = pf_start!();
+            backend.matmul_transposed(x, &self.w_gate, &mut gate)?;
+            pf_record!(t, ffn_gate);
+        }
+        {
+            let t = pf_start!();
+            backend.matmul_transposed(x, &self.w_up, &mut up)?;
+            pf_record!(t, ffn_up);
+        }
 
-        if use_gelu_tanh {
-            backend.gelu_tanh_mul(&mut gate, &up)?;
-        } else {
-            backend.silu_mul(&mut gate, &up)?;
+        {
+            let t = pf_start!();
+            if use_gelu_tanh {
+                backend.gelu_tanh_mul(&mut gate, &up)?;
+            } else {
+                backend.silu_mul(&mut gate, &up)?;
+            }
+            pf_record!(t, silu_mul);
         }
 
         let mut down = self.alloc_temp(vec![batch_size, seq_len, dim], memory, backend)?;
-        backend.matmul_transposed(&gate, &self.w_down, &mut down)?;
+        {
+            let t = pf_start!();
+            backend.matmul_transposed(&gate, &self.w_down, &mut down)?;
+            pf_record!(t, ffn_down);
+        }
 
         // Gemma3: apply post-FFN norm to FFN output before residual add.
         if let Some(ref pfn) = self.post_ffn_norm {
             backend.rms_norm(&mut down, pfn, rms_norm_eps, true)?;
         }
-        backend.add_assign(&mut down, &residual_ffn)?;
+        {
+            let t = pf_start!();
+            backend.add_assign(&mut down, &residual_ffn)?;
+            pf_record!(t, add_assign);
+        }
+
+        // Record layer count.
+        if let Some(p) = pf!() {
+            p.layer_count += 1;
+        }
+
         *x = down;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::buffer::DType;
+    use crate::profile::ops::PrefillOpProfiler;
+
+    /// Verify that warn_gpu_fallback_once increments cpu_fallback_count every call
+    /// (the dedupe is only for stderr, not for the profiler counter).
+    #[test]
+    fn test_fallback_profiler_count_increments_every_call() {
+        let mut p = PrefillOpProfiler::new();
+        assert_eq!(p.cpu_fallback_count, 0);
+
+        warn_gpu_fallback_once(
+            DType::Q4_0,
+            64,
+            "kv dtype Q4_0 not supported by flash_attn kernel",
+            Some(&mut p),
+        );
+        assert_eq!(p.cpu_fallback_count, 1);
+
+        warn_gpu_fallback_once(
+            DType::Q4_0,
+            64,
+            "kv dtype Q4_0 not supported by flash_attn kernel",
+            Some(&mut p),
+        );
+        assert_eq!(p.cpu_fallback_count, 2);
+    }
+
+    /// Verify that warn_gpu_fallback_once works without profiler (None path).
+    #[test]
+    fn test_fallback_no_profiler_does_not_panic() {
+        // Should not panic even with no profiler attached.
+        warn_gpu_fallback_once(
+            DType::F32,
+            128,
+            "flash_attn kernel unavailable for this dtype/config",
+            None,
+        );
+        warn_gpu_fallback_once(
+            DType::F32,
+            128,
+            "flash_attn kernel unavailable for this dtype/config",
+            None,
+        );
+    }
+
+    /// Verify that the FALLBACK_WARNED set distinguishes different keys.
+    #[test]
+    fn test_fallback_different_keys_both_counted() {
+        let mut p1 = PrefillOpProfiler::new();
+        let mut p2 = PrefillOpProfiler::new();
+
+        warn_gpu_fallback_once(
+            DType::Q4_0,
+            64,
+            "kv dtype Q4_0 not supported by flash_attn kernel",
+            Some(&mut p1),
+        );
+        warn_gpu_fallback_once(
+            DType::F32,
+            128,
+            "head_dim != 64 (not compiled into flash_attn kernel)",
+            Some(&mut p2),
+        );
+
+        // Each profiler gets its own count incremented.
+        assert_eq!(p1.cpu_fallback_count, 1);
+        assert_eq!(p2.cpu_fallback_count, 1);
     }
 }

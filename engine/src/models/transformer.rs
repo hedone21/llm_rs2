@@ -770,6 +770,7 @@ impl TransformerModel {
                         Some(pws),
                         i,
                         variance_collector.as_deref_mut(),
+                        profiler.as_deref_mut().map(|p| &mut p.prefill),
                     )?;
                 } else {
                     layer.forward(LayerForwardArgs {
