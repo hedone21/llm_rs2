@@ -225,12 +225,20 @@ impl Backend for CpuBackendNeon {
 }
 
 impl CpuBackendNeon {
-    /// NEON-optimized attention for F16 KV cache.
+    /// NEON-optimized attention for F16 KV cache using single-pass online softmax.
     ///
-    /// Three optimizations over the generic common.rs F16 path:
-    /// 1. Direct F16·F32 dot via `vec_dot_f16_f32` — eliminates intermediate F32 buffer
-    /// 2. Vectorized softmax using NEON `v_expf` — 4-wide exp instead of scalar
-    /// 3. Stack-allocated scores buffer for typical sequence lengths (<=4096)
+    /// Optimizations over the generic common.rs F16 path:
+    /// 1. Direct F16·F32 dot via `vec_dot_f16_f32_4rows` — eliminates intermediate F32 buffer
+    /// 2. Online softmax — K and V are scanned **once** in the same loop, eliminating
+    ///    the 3-pass (QK^T → softmax → weighted V) structure. Running (m, l, o) state
+    ///    is updated per token using the identity:
+    ///        m_new = max(m, s)
+    ///        rescale = exp(m - m_new)
+    ///        l_new = l * rescale + exp(s - m_new)
+    ///        o_new = o * rescale + V[t] * exp(s - m_new)
+    ///    Final output = o / l.
+    /// 3. Per-token NaN gate: NaN scores are treated as -inf (contribute 0) without
+    ///    touching the running (m, l, o) state.
     #[allow(clippy::too_many_arguments)]
     fn attention_gen_f16_neon(
         q: &Tensor,
@@ -263,6 +271,7 @@ impl CpuBackendNeon {
             .as_ref()
             .map(|s| s.len() / num_heads_q)
             .unwrap_or(0);
+        let need_scores = scores_ptr.is_some();
 
         // Detect layout: HeadMajor [batch, kv_heads, capacity, head_dim]
         let k_shape = k_cache.shape().dims();
@@ -270,7 +279,10 @@ impl CpuBackendNeon {
             k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
         let capacity = if is_head_major { k_shape[2] } else { 0 };
 
-        // Stack threshold: avoid heap alloc for typical decode sequences
+        // When diagnostics are requested we retain raw (pre-softmax) scores on the
+        // stack for typical decode lengths, heap for longer sequences. Raw scores
+        // are then converted to post-softmax weights in a short second pass using
+        // the final running (m, l) from the online loop.
         const STACK_SCORES_MAX: usize = 4096;
 
         out_data
@@ -281,199 +293,79 @@ impl CpuBackendNeon {
                 let q_off = h * head_dim;
                 let q_ptr = unsafe { q_data.as_ptr().add(q_off) };
 
-                // Fix 3: stack-allocated scores for typical lengths, heap fallback
+                // Raw scores buffer only when diagnostics are needed.
                 let mut stack_scores = [0.0f32; STACK_SCORES_MAX];
                 let mut heap_scores: Vec<f32>;
-                let scores: &mut [f32] = if cache_seq_len <= STACK_SCORES_MAX {
-                    &mut stack_scores[..cache_seq_len]
+                let raw_scores: Option<&mut [f32]> = if need_scores {
+                    if cache_seq_len <= STACK_SCORES_MAX {
+                        Some(&mut stack_scores[..cache_seq_len])
+                    } else {
+                        heap_scores = vec![0.0f32; cache_seq_len];
+                        Some(&mut heap_scores[..])
+                    }
                 } else {
-                    heap_scores = vec![0.0f32; cache_seq_len];
-                    &mut heap_scores[..]
+                    None
                 };
 
-                // --- Q * K^T: direct F16·F32 dot (Fix 1) ---
-                // Process 4 timesteps at once using vec_dot_f16_f32_4rows
+                // Initialize accumulator `o` (out_h) to zero. Online softmax
+                // will rescale and FMA V[t] into this buffer in-place.
+                for x in out_h.iter_mut() {
+                    *x = 0.0;
+                }
+
+                // Running softmax state.
+                let mut m_run: f32 = f32::NEG_INFINITY;
+                let mut l_run: f32 = 0.0;
+
                 let k_f16_ptr = k_data.as_ptr() as *const u16;
-                let full_4 = cache_seq_len / 4;
-                for chunk in 0..full_4 {
-                    let t_base = chunk * 4;
-                    let mut b_ptrs = [std::ptr::null::<u16>(); 4];
-                    for r in 0..4 {
-                        let t = t_base + r;
-                        let off = if is_head_major {
-                            (kv_h * capacity + t) * head_dim
-                        } else {
-                            (t * num_heads_kv + kv_h) * head_dim
-                        };
-                        b_ptrs[r] = unsafe { k_f16_ptr.add(off) };
-                    }
-                    let mut dots = [0.0f32; 4];
-                    unsafe {
-                        Self::vec_dot_f16_f32_4rows(head_dim, q_ptr, b_ptrs, &mut dots);
-                    }
-                    for r in 0..4 {
-                        scores[t_base + r] = dots[r] * scale;
-                    }
-                }
-                // Remaining timesteps (0-3)
-                for t in (full_4 * 4)..cache_seq_len {
-                    let off = if is_head_major {
-                        (kv_h * capacity + t) * head_dim
-                    } else {
-                        (t * num_heads_kv + kv_h) * head_dim
-                    };
-                    let k_ptr = unsafe { k_f16_ptr.add(off) };
-                    let dot =
-                        unsafe { Self::vec_dot_f16_f32(head_dim, q_ptr, k_ptr) };
-                    scores[t] = dot * scale;
-                }
-
-                // --- Softmax with NEON v_expf (Fix 2) ---
-                // Pass 0: sanitize NaN in Q*K^T scores.
-                // NaN can arise from dot(Q,K) when Q contains NaN (propagated
-                // from a previous layer whose softmax produced NaN).  Replace
-                // NaN with -inf so softmax assigns zero probability to those
-                // positions instead of poisoning the entire distribution.
-                unsafe {
-                    let s_ptr = scores.as_mut_ptr();
-                    let mut i = 0;
-                    while i + 4 <= cache_seq_len {
-                        let v = vld1q_f32(s_ptr.add(i));
-                        // NaN != NaN → comparison yields 0 for NaN lanes
-                        let nan_mask = vmvnq_u32(vceqq_f32(v, v));
-                        // Replace NaN lanes with -inf
-                        let clean = vbslq_f32(nan_mask, vdupq_n_f32(f32::NEG_INFINITY), v);
-                        vst1q_f32(s_ptr.add(i), clean);
-                        i += 4;
-                    }
-                    while i < cache_seq_len {
-                        if (*s_ptr.add(i)).is_nan() {
-                            *s_ptr.add(i) = f32::NEG_INFINITY;
-                        }
-                        i += 1;
-                    }
-                }
-
-                // Pass 1: find max
-                let mut max_val = f32::NEG_INFINITY;
-                unsafe {
-                    let s_ptr = scores.as_ptr();
-                    let mut max_v = vdupq_n_f32(f32::NEG_INFINITY);
-                    let mut i = 0;
-                    while i + 4 <= cache_seq_len {
-                        max_v = vmaxq_f32(max_v, vld1q_f32(s_ptr.add(i)));
-                        i += 4;
-                    }
-                    max_val = vmaxvq_f32(max_v);
-                    while i < cache_seq_len {
-                        max_val = max_val.max(*s_ptr.add(i));
-                        i += 1;
-                    }
-                }
-
-                // Guard: if all logits were NaN (now all -inf), max_val stays
-                // -inf.  exp(-inf - (-inf)) = exp(NaN) would poison everything.
-                // Fall back to uniform distribution in that case.
-                if max_val.is_infinite() && max_val.is_sign_negative() {
-                    let uniform = 1.0 / cache_seq_len as f32;
-                    for s in scores[..cache_seq_len].iter_mut() {
-                        *s = uniform;
-                    }
-                } else {
-                // Pass 2: exp(x - max) and sum
-                // Use scalar exp() per lane — v_expf has bit-manipulation precision
-                // issues on certain ARM cores (Apple Silicon, Cortex-A720) that
-                // corrupt softmax distributions at longer sequence lengths (300+).
-                // Same rationale as v_silu / v_tanh scalar fallbacks.
-                let mut sum_exp = 0.0f32;
-                unsafe {
-                    let s_ptr = scores.as_mut_ptr();
-                    let max_v = vdupq_n_f32(max_val);
-                    let mut sum_v = vdupq_n_f32(0.0);
-                    let mut i = 0;
-                    while i + 4 <= cache_seq_len {
-                        let x = vsubq_f32(vld1q_f32(s_ptr.add(i)), max_v);
-                        // Scalar exp per lane for correctness
-                        let mut vals = [0.0f32; 4];
-                        vst1q_f32(vals.as_mut_ptr(), x);
-                        vals[0] = vals[0].exp();
-                        vals[1] = vals[1].exp();
-                        vals[2] = vals[2].exp();
-                        vals[3] = vals[3].exp();
-                        let e = vld1q_f32(vals.as_ptr());
-                        vst1q_f32(s_ptr.add(i), e);
-                        sum_v = vaddq_f32(sum_v, e);
-                        i += 4;
-                    }
-                    sum_exp = vaddvq_f32(sum_v);
-                    while i < cache_seq_len {
-                        let e = (*s_ptr.add(i) - max_val).exp();
-                        *s_ptr.add(i) = e;
-                        sum_exp += e;
-                        i += 1;
-                    }
-                }
-
-                // Pass 3: normalize
-                // Guard: if sum_exp is 0, NaN, or inf, fall back to uniform.
-                if sum_exp.is_nan() || sum_exp <= 0.0 || sum_exp.is_infinite() {
-                    let uniform = 1.0 / cache_seq_len as f32;
-                    for s in scores[..cache_seq_len].iter_mut() {
-                        *s = uniform;
-                    }
-                } else {
-                let inv_sum = 1.0 / sum_exp;
-                unsafe {
-                    let s_ptr = scores.as_mut_ptr();
-                    let inv_v = vdupq_n_f32(inv_sum);
-                    let mut i = 0;
-                    while i + 4 <= cache_seq_len {
-                        let x = vld1q_f32(s_ptr.add(i));
-                        vst1q_f32(s_ptr.add(i), vmulq_f32(x, inv_v));
-                        i += 4;
-                    }
-                    while i < cache_seq_len {
-                        *s_ptr.add(i) *= inv_sum;
-                        i += 1;
-                    }
-                }
-                } // end sum_exp guard
-                } // end max_val guard
-
-                // Copy scores for diagnostics if requested
-                if let Some(SendPtr(ptr)) = scores_ptr {
-                    unsafe {
-                        let dst = std::slice::from_raw_parts_mut(
-                            ptr.add(h * scores_stride),
-                            cache_seq_len,
-                        );
-                        dst.copy_from_slice(&scores[..cache_seq_len]);
-                    }
-                }
-
-                // --- Weighted V sum: fused F16→F32 convert + FMA ---
-                for d in 0..head_dim {
-                    out_h[d] = 0.0;
-                }
                 let v_f16_ptr = v_data.as_ptr() as *const u16;
-                for t in 0..cache_seq_len {
-                    let w = scores[t];
-                    if w == 0.0 {
-                        continue;
+
+                // Helper: apply a single (t, raw_s) to running state + V[t] FMA.
+                // This closure-like sequence is inlined manually to keep `unsafe`
+                // blocks tight and avoid closure capture.
+                //
+                // Step per token:
+                //   if s is NaN or -inf: skip (no contribution, state untouched)
+                //   m_new = max(m, s)
+                //   alpha = exp(m - m_new)   (0 on first valid token since m=-inf)
+                //   beta  = exp(s - m_new)
+                //   l     = l * alpha + beta
+                //   o     = o * alpha + V[t] * beta
+                //   m     = m_new
+                //
+                // Vectorized o update: `o = o * alpha + V[t] * beta` — for each 4-lane
+                // chunk, load V (F16→F32), multiply by beta, then FMA into alpha*o.
+                let mut apply_token = |t: usize, raw_s: f32| {
+                    // Skip non-finite logits without perturbing running state.
+                    if !raw_s.is_finite() {
+                        return;
                     }
+                    let m_new = m_run.max(raw_s);
+                    // On the very first valid token m_run is -inf so (m - m_new) = -inf,
+                    // which gives alpha = 0.  The accumulator was pre-zeroed so this
+                    // correctly discards the initial garbage (nothing to scale).
+                    let alpha = if m_run.is_infinite() && m_run.is_sign_negative() {
+                        0.0
+                    } else {
+                        (m_run - m_new).exp()
+                    };
+                    let beta = (raw_s - m_new).exp();
+                    l_run = l_run * alpha + beta;
+                    m_run = m_new;
+
+                    // Rescale `o` by alpha and FMA in V[t] * beta.
                     let off = if is_head_major {
                         (kv_h * capacity + t) * head_dim
                     } else {
                         (t * num_heads_kv + kv_h) * head_dim
                     };
-                    // Fused F16→F32 + weighted accumulation with NEON
                     unsafe {
                         let vp = v_f16_ptr.add(off);
                         let o_ptr = out_h.as_mut_ptr();
-                        let w_v = vdupq_n_f32(w);
+                        let alpha_v = vdupq_n_f32(alpha);
+                        let beta_v = vdupq_n_f32(beta);
                         let mut i = 0;
                         while i + 16 <= head_dim {
-                            // Load 16 F16 values → 4 F32x4 vectors
                             let raw0: uint16x8_t = vld1q_u16(vp.add(i));
                             let raw1: uint16x8_t = vld1q_u16(vp.add(i + 8));
                             let f0: float32x4_t;
@@ -485,22 +377,19 @@ impl CpuBackendNeon {
                             std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f2, i = in(vreg) raw1);
                             std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f3, i = in(vreg) raw1);
 
-                            vst1q_f32(
-                                o_ptr.add(i),
-                                vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, f0),
-                            );
-                            vst1q_f32(
-                                o_ptr.add(i + 4),
-                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 4)), w_v, f1),
-                            );
-                            vst1q_f32(
-                                o_ptr.add(i + 8),
-                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 8)), w_v, f2),
-                            );
-                            vst1q_f32(
-                                o_ptr.add(i + 12),
-                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 12)), w_v, f3),
-                            );
+                            // o = o * alpha + V * beta
+                            let o0 = vld1q_f32(o_ptr.add(i));
+                            let o1 = vld1q_f32(o_ptr.add(i + 4));
+                            let o2 = vld1q_f32(o_ptr.add(i + 8));
+                            let o3 = vld1q_f32(o_ptr.add(i + 12));
+                            let o0s = vmulq_f32(o0, alpha_v);
+                            let o1s = vmulq_f32(o1, alpha_v);
+                            let o2s = vmulq_f32(o2, alpha_v);
+                            let o3s = vmulq_f32(o3, alpha_v);
+                            vst1q_f32(o_ptr.add(i), vfmaq_f32(o0s, beta_v, f0));
+                            vst1q_f32(o_ptr.add(i + 4), vfmaq_f32(o1s, beta_v, f1));
+                            vst1q_f32(o_ptr.add(i + 8), vfmaq_f32(o2s, beta_v, f2));
+                            vst1q_f32(o_ptr.add(i + 12), vfmaq_f32(o3s, beta_v, f3));
                             i += 16;
                         }
                         while i + 8 <= head_dim {
@@ -509,19 +398,163 @@ impl CpuBackendNeon {
                             let fh: float32x4_t;
                             std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) fl, i = in(vreg) raw);
                             std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) fh, i = in(vreg) raw);
-                            vst1q_f32(
-                                o_ptr.add(i),
-                                vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, fl),
-                            );
-                            vst1q_f32(
-                                o_ptr.add(i + 4),
-                                vfmaq_f32(vld1q_f32(o_ptr.add(i + 4)), w_v, fh),
-                            );
+                            let o0 = vld1q_f32(o_ptr.add(i));
+                            let o1 = vld1q_f32(o_ptr.add(i + 4));
+                            let o0s = vmulq_f32(o0, alpha_v);
+                            let o1s = vmulq_f32(o1, alpha_v);
+                            vst1q_f32(o_ptr.add(i), vfmaq_f32(o0s, beta_v, fl));
+                            vst1q_f32(o_ptr.add(i + 4), vfmaq_f32(o1s, beta_v, fh));
                             i += 8;
                         }
                         while i < head_dim {
-                            *o_ptr.add(i) += w * half::f16::from_bits(*vp.add(i)).to_f32();
+                            let v_f32 = half::f16::from_bits(*vp.add(i)).to_f32();
+                            *o_ptr.add(i) = *o_ptr.add(i) * alpha + v_f32 * beta;
                             i += 1;
+                        }
+                    }
+                };
+
+                // --- Single-pass: Q·K[t] → online softmax update + V[t] FMA ---
+                // Process 4 timesteps at a time via vec_dot_f16_f32_4rows for K
+                // throughput; per-token online softmax is updated sequentially.
+                let full_4 = cache_seq_len / 4;
+                for chunk in 0..full_4 {
+                    let t_base = chunk * 4;
+                    let mut b_ptrs = [std::ptr::null::<u16>(); 4];
+                    for (r, bp) in b_ptrs.iter_mut().enumerate() {
+                        let t = t_base + r;
+                        let off = if is_head_major {
+                            (kv_h * capacity + t) * head_dim
+                        } else {
+                            (t * num_heads_kv + kv_h) * head_dim
+                        };
+                        *bp = unsafe { k_f16_ptr.add(off) };
+                    }
+                    let mut dots = [0.0f32; 4];
+                    unsafe {
+                        Self::vec_dot_f16_f32_4rows(head_dim, q_ptr, b_ptrs, &mut dots);
+                    }
+                    for (r, &d) in dots.iter().enumerate() {
+                        let s = d * scale;
+                        let t = t_base + r;
+                        if let Some(raw) = raw_scores.as_deref() {
+                            // Safety: raw_scores has len == cache_seq_len.
+                            unsafe {
+                                *(raw.as_ptr() as *mut f32).add(t) = s;
+                            }
+                        }
+                        apply_token(t, s);
+                    }
+                }
+                for t in (full_4 * 4)..cache_seq_len {
+                    let off = if is_head_major {
+                        (kv_h * capacity + t) * head_dim
+                    } else {
+                        (t * num_heads_kv + kv_h) * head_dim
+                    };
+                    let k_ptr = unsafe { k_f16_ptr.add(off) };
+                    let dot = unsafe { Self::vec_dot_f16_f32(head_dim, q_ptr, k_ptr) };
+                    let s = dot * scale;
+                    if let Some(raw) = raw_scores.as_deref() {
+                        unsafe {
+                            *(raw.as_ptr() as *mut f32).add(t) = s;
+                        }
+                    }
+                    apply_token(t, s);
+                }
+
+                // Finalize output = o / l (with fallback on pathological states).
+                // m_run == -inf means every score was non-finite (all NaN) → uniform.
+                // l_run non-finite / zero / negative also falls back to uniform.
+                let fallback_uniform = !l_run.is_finite()
+                    || l_run <= 0.0
+                    || (m_run.is_infinite() && m_run.is_sign_negative());
+
+                if fallback_uniform {
+                    // Uniform average of V[t] over t, ignoring softmax.
+                    // Matches the fallback semantics of the original 3-pass code.
+                    for x in out_h.iter_mut() {
+                        *x = 0.0;
+                    }
+                    let uniform = 1.0 / cache_seq_len as f32;
+                    for t in 0..cache_seq_len {
+                        let off = if is_head_major {
+                            (kv_h * capacity + t) * head_dim
+                        } else {
+                            (t * num_heads_kv + kv_h) * head_dim
+                        };
+                        unsafe {
+                            let vp = v_f16_ptr.add(off);
+                            let o_ptr = out_h.as_mut_ptr();
+                            let w_v = vdupq_n_f32(uniform);
+                            let mut i = 0;
+                            while i + 8 <= head_dim {
+                                let raw: uint16x8_t = vld1q_u16(vp.add(i));
+                                let fl: float32x4_t;
+                                let fh: float32x4_t;
+                                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) fl, i = in(vreg) raw);
+                                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) fh, i = in(vreg) raw);
+                                vst1q_f32(
+                                    o_ptr.add(i),
+                                    vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, fl),
+                                );
+                                vst1q_f32(
+                                    o_ptr.add(i + 4),
+                                    vfmaq_f32(vld1q_f32(o_ptr.add(i + 4)), w_v, fh),
+                                );
+                                i += 8;
+                            }
+                            while i < head_dim {
+                                *o_ptr.add(i) +=
+                                    uniform * half::f16::from_bits(*vp.add(i)).to_f32();
+                                i += 1;
+                            }
+                        }
+                    }
+                } else {
+                    // Divide running o by l: out_h *= 1/l_run.
+                    let inv_l = 1.0 / l_run;
+                    unsafe {
+                        let o_ptr = out_h.as_mut_ptr();
+                        let inv_v = vdupq_n_f32(inv_l);
+                        let mut i = 0;
+                        while i + 4 <= head_dim {
+                            let x = vld1q_f32(o_ptr.add(i));
+                            vst1q_f32(o_ptr.add(i), vmulq_f32(x, inv_v));
+                            i += 4;
+                        }
+                        while i < head_dim {
+                            *o_ptr.add(i) *= inv_l;
+                            i += 1;
+                        }
+                    }
+                }
+
+                // Diagnostic path: convert raw scores → post-softmax weights using
+                // the final (m_run, l_run) state. This matches the contract of the
+                // original 3-pass implementation (normalized probabilities).
+                if let Some(SendPtr(ptr)) = scores_ptr {
+                    let raw = raw_scores.expect("raw_scores set iff need_scores");
+                    unsafe {
+                        let dst = std::slice::from_raw_parts_mut(
+                            ptr.add(h * scores_stride),
+                            cache_seq_len,
+                        );
+                        if fallback_uniform {
+                            let uniform = 1.0 / cache_seq_len as f32;
+                            for w in dst.iter_mut() {
+                                *w = uniform;
+                            }
+                        } else {
+                            let inv_l = 1.0 / l_run;
+                            for (i, w) in dst.iter_mut().enumerate() {
+                                let s = raw[i];
+                                if !s.is_finite() {
+                                    *w = 0.0;
+                                } else {
+                                    *w = (s - m_run).exp() * inv_l;
+                                }
+                            }
                         }
                     }
                 }
