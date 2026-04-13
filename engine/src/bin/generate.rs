@@ -2207,6 +2207,21 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Inference profiler (only when --profile is set)
+    // Declared before prefill so PrefillOpProfiler can be populated.
+    let mut profiler = if args.profile {
+        Some(llm_rs2::profile::InferenceProfiler::new(
+            llm_rs2::profile::ProfileConfig {
+                score_snapshot_interval: args.profile_interval,
+                track_per_head: args.profile_per_head,
+                enabled_probes: args.profile_probes.split(',').map(String::from).collect(),
+                output_dir: std::path::PathBuf::from(&args.profile_dir),
+            },
+        ))
+    } else {
+        None
+    };
+
     // Pre-allocate generation buffers
     let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
     let mut logits = Tensor::new(
@@ -2420,7 +2435,7 @@ fn main() -> anyhow::Result<()> {
                 x_gen: None,
                 workspace: None,
                 score_accumulator: None, // No score tracking during prefill
-                profiler: None,
+                profiler: profiler.as_mut().map(|p| &mut p.ops),
                 skip_config: None,
                 importance_collector: None,
                 // Chunked mode: only the last position's logits needed (saves GPU memory).
@@ -2799,20 +2814,6 @@ fn main() -> anyhow::Result<()> {
             budgets.iter().map(|(h, r)| h + r).collect::<Vec<_>>()
         );
         Some(budgets)
-    } else {
-        None
-    };
-
-    // Inference profiler (only when --profile is set)
-    let mut profiler = if args.profile {
-        Some(llm_rs2::profile::InferenceProfiler::new(
-            llm_rs2::profile::ProfileConfig {
-                score_snapshot_interval: args.profile_interval,
-                track_per_head: args.profile_per_head,
-                enabled_probes: args.profile_probes.split(',').map(String::from).collect(),
-                output_dir: std::path::PathBuf::from(&args.profile_dir),
-            },
-        ))
     } else {
         None
     };
