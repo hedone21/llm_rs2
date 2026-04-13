@@ -1027,18 +1027,22 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 
 ---
 
-## 11. 다음 세션 시작 가이드 (2026-04-13 세션 종료 시점)
+## 11. 다음 세션 시작 가이드 (2026-04-13 21:30 세션 종료 시점 — P2-1 Phase B 1차 완료)
 
 ### 현재 master 상태
-- 최신 커밋: `37aaab2 perf(opencl): tune BLOCK_M=32 for flash prefill DK=128`
-- 빌드: Android aarch64 release OK, 호스트 cargo test 정상 (기존 baseline panic 2개 제외)
-- 작업트리 clean (tracked files 기준)
+- 최신 커밋: `2cb9d4a feat(opencl): Q4_0 tiled GEMM kernel for prefill (P2-1 Phase B)`
+- 빌드: Android aarch64 release OK, 호스트 `cargo check --all-targets` 클린 (rust-analyzer stale 경고만 잔존)
+- 작업트리: tracked files clean (untracked `.agent/research/`, eval_stderr.txt 등만 존재)
 
-### 측정된 현재 성능 (Qwen 2.5 1.5B Q4_0, Adreno 830, F16 KV, 4K, plan ON, 6T)
-- Prefill: 31.0 tok/s (이전 CPU fallback 43, -28% regression)
-- Decode: 7.3 tok/s (baseline 대비 동일)
-- TBT: 6.8 tok/s
-- 격차: Prefill 24× vs llama.cpp(760), Decode 2× vs llama.cpp(14.9)
+### 측정된 현재 성능 (Qwen 2.5 1.5B Q4_0, Adreno 830, F16 KV, 4K, plan ON)
+| 항목 | 이전 baseline (37aaab2) | **Phase B 적용 (2cb9d4a)** | Δ |
+|------|-----|-----|---|
+| Prefill (4472 tok) | 27.8 tok/s | **50.0 tok/s** | +80% |
+| Decode | 7.4 tok/s | 8.8 tok/s | +19% |
+| TBT | 148 ms | 124 ms | −16% |
+
+- 잔여 격차: Prefill **15× vs llama.cpp(760)**, Decode 1.7× vs llama.cpp(14.9)
+- Llama 3.2 1B Q4_0 Prefill: 136.3 tok/s (회귀 없음 — F16 GEMM 경로 무변경)
 
 ### 이번 세션(2026-04-13) 완료 작업 요약
 **커밋 (master)**:
@@ -1048,28 +1052,56 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 - `f0091cc` feat(profiler): prefill per-op + GPU fallback log — P1-2 DONE
 - `7f41d2f` feat(opencl): GPU flash prefill head_dim=128 — P0-3 기능 DONE
 - `37aaab2` perf(opencl): tune BLOCK_M=32 for DK=128 — P0-3 튜닝 (effect=0)
+- `2cb9d4a` feat(opencl): Q4_0 tiled GEMM kernel for prefill (P2-1 Phase B) — **이번 세션 핵심**
 
 **Revert (history 보존)**:
 - `d0d4978` ← `5f3dd1f / 9a5a75e / f14ddb3` — P0-5/P0-5b Flash Decoding KV-split (-11%)
 - `84c82d2` ← `5f59455` — P0-5c GQA-aware KV 공유 (-65%, WG=2 under-utilization)
 
+**핵심 발견 (Phase A 선조사)**:
+- 24× 갭의 주범은 **Q4_0 타일드 GEMM 커널 부재** (flash_attn 아님)
+- F16 GEMM은 이미 llama.cpp와 byte-identical, parity 상태
+- Phase B에서 `mul_mm_q4_0_f32_l4_lm.cl` 포팅 + `matmul_q4_0()` m≥32 분기 → +80% 달성
+- 포팅 시 interleaved `BlockQ4_0` 직접 사용 (rewrap 없이, byte-level dequant load)
+- 보고서: `.agent/research/2026-04-13_p2-1_adreno_f16_matmul_phase_a.md` (untracked)
+
 ### 다음 세션 착수 옵션
 
-**A. 🔥 P2-1 Adreno F16 matmul 최적화 (권장, 최우선)**
-- researcher 선조사 (2일): Adreno subgroup 커널 패턴, image2d_t, Qualcomm extensions (`gemv_noshuffle.cl` 등 llama.cpp 패턴, 우리 `mul_mv_q4_0_*.cl` 이식 가능성)
-- senior-implementer 구현 (3~5일): subgroup + texture cache 기반 F16 GEMM/flash attention DK=128
-- 목표: Prefill 31 → 100+ tok/s
-- 착수 명령: `researcher` 에이전트 호출 + 본 파일 §10.2 P2-1 항목 참조
+**A. 🔥 P2-1b Follow-up: Prefill 추가 최적화 (권장, 최우선)**
+
+목표: Prefill 50 → 150+ tok/s. 잔여 15× 갭 해소.
+
+- **A-0. 프로파일 먼저 (필수, 30분)** — Phase B 적용 후 op breakdown 재측정. Q4_0 GEMM이 병목에서 빠졌으니 현재 hot path는 flash_attn DK=128 prefill / LM head GEMV 가능성. `--profile` per-op ms 분포 확인 후 A-1/A-2/A-3 중 선택.
+
+- **A-1. Q4_0 GEMM Adreno subgroup + image2d_t 버전 (High ROI, 중간 난이도)**
+  - 현재 `mul_mm_q4_0_f32_l4_lm.cl`은 vanilla local memory only (buf 2×8KB)
+  - Adreno 830은 `gemv_noshuffle.cl` 패턴(subgroup 64-wide + image1d_buffer TP cache)이 GEMV에서 2~3× 빠름
+  - GEMM에서도 텍스처 캐시로 weight read 가속화 가능 (llama.cpp 대응 커널 부재 → 우리가 먼저)
+  - 리스크: Adreno 전용 분기 (`#ifdef ADRENO_GPU`), weight rewrap 추가 필요 (SOA AOS-row-major)
+  - 기대: Prefill 50 → 90~120 tok/s
+
+- **A-2. Q4_0 GEMM tile size 튜닝 (Low ROI 예상, 저난이도)**
+  - 현재 BM=64, BN=64, BK=32, TM=4, TN=8, nth=128
+  - BLOCK_M=32 DK=128 flash tuning 효과 0 전례 → 제한적 가능성
+  - Adreno 830 레지스터 압박/WG 한계 기준 BM=32/BK=64 variant 확인 가치 있음
+  - 기대: Prefill 50 → 55~70 tok/s (보조)
+
+- **A-3. Flash Attn DK=128 Prefill 최적화 (Medium ROI, 고난이도)**
+  - matmul 병목 해소된 지금 flash_attn이 새 병목일 수 있음 — 프로파일 필수 (A-0)
+  - 필요 시 subgroup reduction 기반 online softmax 재작성
+  - 기대: Prefill 50 → 80~100 tok/s (단독), A-1과 중첩 시 시너지
+
+**권장 순서**: A-0 → A-1 → A-3 재평가 → 필요 시 A-2.
+
+착수 명령: `.agent/todos/long_context_attention_optimization.md §11 읽고 A-0 프로파일부터 해줘`
 
 **B. P0-2 CPU prefill F16 직접 경로 (차순위)**
-- senior-implementer 구현 (1~2일)
-- CPU fallback 자체 속도 개선 (37→60+ tok/s 기대)
-- 현재 GPU prefill 활성화됐으므로 우선순위 낮음, 단 non-GPU 디바이스 지원에는 중요
+- senior-implementer 구현 (1~2일). CPU fallback 속도 개선 (37→60+ tok/s).
+- GPU prefill 활성화 + Phase B 완료로 우선순위 낮음. non-GPU 디바이스 지원 필요 시 승격.
 
 **C. P0-5d GQA + KV-split 결합 커널 (DEFERRED 유지)**
-- Llama 3.2 3B 등 다른 모델 벤치 인프라 도입 후 재평가
-- 현재 Qwen 단독 벤치 (n_heads_kv=2)에서는 P0-5c revert 이유로 deferred 유지
-- 착수 조건: Llama 3.2 1B/3B 측정 인프라 추가 시
+- Llama 3.2 3B 등 multi-모델 벤치 인프라 도입 후 재평가.
+- Qwen 단독(n_heads_kv=2)에서는 P0-5c revert 근거 유효.
 
 ### 재현용 벤치마크 명령
 ```bash
@@ -1096,9 +1128,8 @@ adb shell "cd /data/local/tmp && ./generate \
 ```
 
 ### 참고 문서 / 보존된 작업물
-- Phase 2 상세: 본 파일 §10
+- Phase 2 상세: 본 파일 §10 (P2-1 §10.2는 Phase B 결과로 갱신됨)
 - §10.1.6: GPU decode 구조적 결함 분석 (KV-split 가설 + 정정 이력 포함)
 - P0-5/P0-5b/P0-5c revert 근거: 각 항목 Notes 블록
-- Researcher 선조사 자료: `.agent/research/2026-04-13_flash_decoding_kv_split.md`
-  - P0-5 revert 커밋에 포함되어 파일은 삭제됨
-  - 복원: `git show d0d4978~1:.agent/research/2026-04-13_flash_decoding_kv_split.md`
+- **P2-1 Phase A 선조사**: `.agent/research/2026-04-13_p2-1_adreno_f16_matmul_phase_a.md` (untracked, 보존 필요)
+- P0-5 선조사 복원: `git show d0d4978~1:.agent/research/2026-04-13_flash_decoding_kv_split.md`
