@@ -26,7 +26,7 @@ pub mod plan;
 fn log_prefill_dk128_once() {
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
     ONCE.get_or_init(|| {
-        eprintln!("[Prefill] flash_attn dispatch: head_dim=128, DType=F16");
+        eprintln!("[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32");
     });
 }
 
@@ -623,7 +623,7 @@ impl OpenCLBackend {
         // DK=128 (Qwen 2.5-1.5B). Same source file, different macros.
         // Supports both prefill (`flash_attn_f32_f16`) and decode
         // (`flash_attn_f32_f16_q1`) kernels.
-        let flash_attn_dk128_defines = "-DDK=128 -DDV=128 -DBLOCK_M=64 -DBLOCK_N=32";
+        let flash_attn_dk128_defines = "-DDK=128 -DDV=128 -DBLOCK_M=32 -DBLOCK_N=32";
         let flash_attn_f32_opts_dk128 = format!("{} {}", cl_opts, flash_attn_dk128_defines);
 
         let flash_attn_f32_f16_program_dk128 = match Program::builder()
@@ -633,7 +633,7 @@ impl OpenCLBackend {
             .build(&context)
         {
             Ok(p) => {
-                log::info!("flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128)");
+                log::info!("flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128, BLOCK_M=32)");
                 Some(p)
             }
             Err(e) => {
@@ -1912,11 +1912,18 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
             ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
 
-            // Work size: [ceil(n_q/BLOCK_M) * BLOCK_M, n_heads_q * batch_size, 1]
-            const BLOCK_M: usize = 64;
-            let n_groups_q = seq_len.div_ceil(BLOCK_M);
-            let global_work_size: [usize; 3] = [n_groups_q * BLOCK_M, n_heads_q * batch_size, 1];
-            let local_work_size: [usize; 3] = [BLOCK_M, 1, 1];
+            // Work size: [ceil(n_q/block_m) * block_m, n_heads_q * batch_size, 1]
+            // block_m matches the BLOCK_M define used to compile each kernel variant:
+            //   head_dim=64  → BLOCK_M=64 (dk64 program, unchanged)
+            //   head_dim=128 → BLOCK_M=32 (dk128 program, reduced to relieve register pressure)
+            let block_m: usize = match head_dim {
+                64 => 64,
+                128 => 32,
+                _ => unreachable!("head_dim guard above"),
+            };
+            let n_groups_q = seq_len.div_ceil(block_m);
+            let global_work_size: [usize; 3] = [n_groups_q * block_m, n_heads_q * batch_size, 1];
+            let local_work_size: [usize; 3] = [block_m, 1, 1];
 
             ocl::core::enqueue_kernel(
                 &self.queue,
