@@ -364,3 +364,413 @@ for tile_i in 0..(n / TILE_I):     // Q tiles
 - Threshold 상향 조정 (예: 2K 이상에서만 chunk split)
 - Rayon overhead 측정 — crossbeam_utils::thread 직접 사용 고려
 - SpinPool 활용 검토 (`engine/src/core/thread_pool.rs`)
+
+---
+
+## 10. 후속 작업 (Phase 2) — Long Context 잔여 성능 갭 해소
+
+Step 1/2/3 (Online Softmax / Flash Decoding / Flash Prefill NEON) 완료 후에도 4K 구간에서 llama.cpp 대비 격차가 큼:
+
+| 시나리오 | llm_rs2 | llama.cpp | 비율 |
+|---|---|---|---|
+| CPU 4K decode | 11.2 tok/s | 30.5 tok/s | 37% |
+| CPU 4K prefill | 37.7 tok/s | ~50+ tok/s | 75% |
+| GPU 4K decode | 7.4 tok/s | 14.9 tok/s | 50% |
+| GPU 4K prefill | 39.2 tok/s | ~760 tok/s | 5.2% (19x gap) |
+
+외부 분석(코드 검증 완료)으로 다음 3개 근본 원인 식별.
+
+### 0. 환경 / 선행 작업 (다른 세션 착수 시 필독)
+
+**선행 커밋 (master 기준)**:
+- Step 1 (Online Softmax): `89a7afd`
+- Step 2 (Flash Decoding): `70a059f`
+- Step 3 (Flash Prefill NEON): `1d2bd2e`
+
+**디바이스**: Galaxy S25 (Snapdragon 8 Elite, Adreno 830, R3CY408S5SB)
+
+**모델 / 프롬프트 (디바이스 경로)**:
+- 모델: `/data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf` (Qwen2.5 1.5B Q4_0)
+- 4K 프롬프트: `/data/local/tmp/prompt_6k.txt` (4472 tokens)
+- 2K 프롬프트: `/data/local/tmp/prompt_2k.txt` (2054 tokens)
+- 바이너리 push 위치: `/data/local/tmp/generate`, `/data/local/tmp/llama-bench` (대조용)
+
+**측정 규칙** (메모리 `feedback_benchmark_thread_count.md` 참조):
+- `--threads 6` 단일 (8T 측정 금지)
+- 각 조건 1회만 측정 (반복 금지)
+- 측정 전 5~10분 쿨다운, `adb shell dumpsys thermalservice | head -20`로 Status 0 확인
+
+**빌드 절차 (Linux 호스트)**:
+```bash
+source android.source
+# 만약 NDK 경로 에러 시 수동 export (이전 세션에서 발견된 함정):
+#   export ANDROID_NDK_HOME=/opt/android-ndk
+#   export PATH=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin:$PATH
+cargo build --release --bin generate --target aarch64-linux-android
+adb push target/aarch64-linux-android/release/generate /data/local/tmp/generate
+adb shell chmod +x /data/local/tmp/generate
+```
+
+**기준선 측정 명령 (재현 가능)**:
+```bash
+# Short decode (회귀 방지 측정)
+adb shell "cd /data/local/tmp && ./generate \
+  -m /data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf \
+  --prompt 'Hello world' \
+  -n 128 -b cpu --threads 6 --ignore-eos"
+
+# 4K (주 지표)
+adb shell "cd /data/local/tmp && ./generate \
+  -m /data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf \
+  --prompt-file /data/local/tmp/prompt_6k.txt \
+  -n 128 -b cpu --max-seq-len 6144 --threads 6 --ignore-eos"
+```
+
+**현재 베이스라인 (Step 3 = `1d2bd2e` 기준, 6T 1회 cold)**:
+- Short decode: 32.6 tok/s
+- 2K decode / prefill: 14.2 / 50.9 tok/s
+- 4K decode / prefill: 11.2 / 37.7 tok/s
+- llama.cpp CPU 6T 4K combined: 30.50 tok/s (대조군)
+
+---
+
+### 10.1 근본 원인 정리
+
+**원인 A — Prefill F16→F32 bulk 변환 (Step 3 1차 PR 미완성 Stage)**
+- 위치: `engine/src/layers/transformer_layer/forward.rs:174-229, 694-752`
+- 매 레이어마다 F16 KV를 `read_to_f32` + `bulk_f16_to_f32`로 거대한 Vec<f32>에 통째로 복사
+- 4K × 28 레이어 → 수십 MB 할당/복사 반복으로 NEON Flash Prefill 이득을 상쇄
+- 해결: `arch/cpu_flash_attention_prefill.md` Stage 9 (F16 직접 경로) 구현
+
+**원인 B — CPU Decode Q4_0 horizontal sum 비효율**
+- 위치: `engine/src/backend/cpu/neon.rs:2957-3050` `vec_dot_q4_0_q8_0`
+- 블록당 `vaddlvq_s16` 4회 호출 — ARM에서 사이클 큰 명령
+- llama.cpp 스타일 `vpaddlq_s16 + vpadal_s16` 체인 미사용
+- 참조: `docs/31_perf_comparison_llama_cpp.md` "Phase 1: CPU Q4 Dot Product 최적화"
+
+**원인 C — GPU Adreno F16 커널 부재**
+- 현재 F16 GEMM은 범용 템플릿 → 로컬 메모리 낭비 + barrier 과다
+- llama.cpp는 Adreno subgroup + texture cache 활용
+- GPU 4K prefill 격차의 압도적 비중 차지
+
+**추가 이슈 — GPU prefill chunk auto-sizing**
+- `--prefill-chunk-size 0` 기본값에서 `CL_INVALID_BUFFER_SIZE` 실패
+- 자동 chunk 결정 로직 필요 (소규모 fix)
+
+---
+
+### 10.1.5 GPU Prefill 실제 동작 분석 (CPU Fallback 삼중 병목) — 2026-04-13 추가
+
+**핵심 발견**: `-b opencl` 지정 시에도 prefill이 내부 조건 실패로 CPU fallback 경로로 재진입. 결과적으로 "GPU Q4 prefill 32.7ms vs CPU Q4 36.0ms"가 유사했던 이유는 **둘 다 실제로는 CPU에서 실행**되고 있었기 때문. 10.1의 원인 A/B/C는 유효하나, GPU 경로 자체가 dispatch 되지 않는 **선행 차단 문제**가 있음을 확인.
+
+**원인 D1 — Q4_0 KV cache: Prefill GPU 커널 미존재**
+- 위치: `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu`
+- 코드 구조:
+  ```rust
+  let kernel = match kv_dtype {
+      DType::F32 => match &kernels.kernel_flash_attn_f32 { ... }
+      DType::F16 => match &kernels.kernel_flash_attn_f32_f16 { ... }
+      _ => return Ok(false), // Q4_0 not supported
+  };
+  ```
+- 영향: Q4_0 KV (현재 기본 실전 구성)일 때 GPU backend 요청이 무조건 `Ok(false)` → 상위 레이어 CPU fallback.
+- 근본 해법: flash_attn prefill 커널의 Q4_0 지원 (on-the-fly dequant 전략).
+
+**원인 D2 — F16 Prefill 커널 head_dim=64 하드코딩 (Qwen 계열 차단)**
+- 위치: `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu` (F16 분기)
+- 빌드 시 `DK=DV=64` 매크로로 컴파일된 `flash_attn_f32_f16` 커널만 존재 → `head_dim != 64`인 경우 fallback:
+  ```rust
+  if head_dim != 64 {
+      return Ok(false);
+  }
+  ```
+- Step 2 (최근 커밋)에서 **decode** 경로에는 `head_dim=128` 커널을 추가했으나, **prefill** 경로는 미적용.
+- 영향: Qwen2.5 1.5B (head_dim=128)는 F16 KV cache 구성에서도 prefill GPU 경로 불가 → CPU fallback.
+
+**원인 D3 — Fallback 경로의 삼중 병목**
+- 위치: `engine/src/layers/transformer_layer/forward.rs` `!gpu_dispatched` 분기 (prefill path around L174-229, variant L694-752)
+- 단계별 비용:
+  1. **VRAM → RAM 전량 카피**: K/V 텐서가 device-only일 때 `is_device_only` 분기로 수십~수백 MB를 CPU 메모리로 다운로드
+  2. **F32 강제 변환**: Q4_0 → `read_to_f32` 또는 F16 → `bulk_f16_to_f32`로 전부 F32 확장 (O(N))
+  3. **스칼라 CPU 연산**: 최적화되지 않은 CPU 경로로 실제 attention 계산 수행
+- 이것이 10.1 원인 A("F16→F32 bulk 변환")를 더 심각하게 만드는 실제 호출 컨텍스트.
+
+**영향 평가**
+- 문서/측정 상 "GPU prefill"로 기록된 수치 일부는 실제 CPU 실행 결과 → **재측정 필요**.
+- P2-1 (Adreno F16 matmul 커널)만으로는 해결 불가 — prefill flash attn 커널 자체가 dispatch 되지 않는 구간이 존재.
+- 본질적 해결은 **GPU 커널 지원 확장 (P0-3, P0-4)** + **fallback 감지 가시성 (P1-2 강화)**.
+
+**코드 경로 요약 (재진입 탐지용)**
+| 파일 | 함수 | 역할 |
+|---|---|---|
+| `engine/src/backend/opencl/mod.rs` | `flash_attention_prefill_gpu` | dtype/head_dim 분기 → `Ok(false)`면 fallback 신호 |
+| `engine/src/layers/transformer_layer/forward.rs` | prefill dispatch (L174-229, L694-752) | `!gpu_dispatched` 시 CPU 경로 진입 (VRAM→RAM 카피, F32 변환) |
+| `engine/src/backend/cpu/neon.rs` | `flash_prefill_forward_*` | 실제 CPU 계산 (F32 가정) |
+
+---
+
+### 10.2 TODO 항목
+
+#### [P0-1] Q4_0 vec_dot horizontal sum 최적화 (vpaddlq + vpadal 체인) + i8mm hot path
+- **Status**: IN_PROGRESS (범위 확장 중 — 2026-04-13 재작업)
+- **Sprint**: current
+- **담당**: senior-implementer
+- **Dependencies**: 없음 (독립 작업)
+- **예상 작업량**: 0.5 ~ 1일 (초기) + i8mm 경로 확장 0.5 ~ 1일
+- **코드 위치**: `engine/src/backend/cpu/neon.rs:2957-3050` `vec_dot_q4_0_q8_0`, 그리고 i8mm 핫 경로 `vec_dot_q4_0_q8_0_i8mm_4rows_il`, `vec_dot_q4_0_q8_0_i8mm`
+- **참조 문서**: `docs/31_perf_comparison_llama_cpp.md` (Phase 1 섹션), llama.cpp `ggml-quants.c` `ggml_vec_dot_q4_0_q8_0`
+- **Description**: 블록당 4회 `vaddlvq_s16`를 `vpaddlq_s16 + vpadal_s16` 체인으로 교체하여 horizontal reduction 사이클 단축. 가능하면 i8mm (`vusdotq_s32`) 경로와 함께 dotprod 경로도 같은 기법으로 통일. **확장**: 초기 수정은 plain NEON 함수에만 적용했으나, Snapdragon 8 Elite에서는 i8mm capable이라 `vec_dot_q4_0_q8_0_i8mm*` 경로가 dispatch되고 plain NEON 경로가 사용되지 않음 — 실측에서 성능 변동이 관측되지 않음. 따라서 **i8mm 핫 경로 (`_i8mm_4rows_il`, `_i8mm`)에도 동일 최적화 확대 적용**이 필요.
+- **Acceptance Criteria**:
+  - [ ] **`vec_dot_q4_0_q8_0_i8mm_4rows_il` 및 `vec_dot_q4_0_q8_0_i8mm`가 dispatch되는 실측 환경 (Snapdragon 8 Elite, Galaxy S25)에서 4K decode 11.4 → 14+ tok/s**
+  - [ ] 4K decode (Qwen2.5 1.5B Q4_0, Snapdragon 8 Elite, CPU 6T): 11.2 → 14+ tok/s (+28% 이상)
+  - [ ] Unit test `tests/neon_q4_dot.rs` 동일 결과 유지 (abs diff ≤ 1e-5)
+  - [ ] `cargo bench` (있다면) 또는 `generate --profile` 기준 `matmul` op latency 감소 확인
+  - [ ] x86 AVX2 경로 미영향 (회귀 테스트)
+- **구현 패턴** (llama.cpp `ggml_vec_dot_q4_0_q8_0` 참조):
+
+  ```c
+  // llama.cpp 패턴 (ggml-cpu/quants.c 또는 ggml-cpu/arch/arm/quants.c)
+  // 핵심: vpaddlq_s16 → 짝수 인접 합산 → vpadal_s16으로 i32 누적기에 즉시 페어 더함
+  int32x4_t sumv0 = vdupq_n_s32(0);
+  int16x8_t p0 = vmull_s8(vget_low_s8(x0), vget_low_s8(y0));
+  p0 = vmlal_s8(p0, vget_high_s8(x0), vget_high_s8(y0));
+  sumv0 = vpadalq_s16(sumv0, p0);  // <-- 핵심: pairwise add long + accumulate
+  // ... 블록 끝에서 한 번만 vaddvq_s32(sumv0)로 horizontal sum
+  ```
+
+  **현재 (neon.rs:2957~)**:
+  - 블록당 4회 `vaddlvq_s16(...)` 호출 → 각 호출이 별도 horizontal reduction
+  - i16 8-element를 i64 하나로 줄이는 비싼 명령
+
+  **변경 후 목표**:
+  - 블록 내부에서 `vpaddlq_s16` (i16x8 → i32x4 pairwise) + `vpadal_s16` (in-place i32x4 누적)
+  - 마지막 블록 종료 후 단 1회만 `vaddvq_s32` (i32x4 → i32 horizontal sum)
+  - 결과: 사이클 절감 + 명령 수 감소
+
+  i8mm 경로(`vusdotq_s32` 사용 영역)도 동일 원리 적용 가능 — `vusdotq` 누적기는 이미 i32x4이므로 horizontal은 마지막 1회만.
+- **Notes**: ROI 최고 (작은 작업, decode 28% 개선 추정). Phase 2의 first delivery로 권장. **2026-04-13 재작업 메모**: plain NEON만 수정하면 Snapdragon 8 Elite에서 측정 불변 (i8mm이 우선 dispatch되기 때문). 반드시 dispatch되는 경로에서 실측 검증해야 함.
+
+---
+
+#### [P0-2] Prefill F16 직접 경로 (Step 3 Stage 9 완성)
+- **Status**: TODO
+- **Sprint**: current
+- **담당**: senior-implementer
+- **Dependencies**: Step 3 (Flash Prefill NEON) 완료됨 — 선행 조건 충족
+- **예상 작업량**: 1 ~ 2일
+- **코드 위치**:
+  - `engine/src/layers/transformer_layer/forward.rs:174-229` (prefill main path)
+  - `engine/src/layers/transformer_layer/forward.rs:694-752` (variant path)
+  - `engine/src/backend/cpu/neon.rs` (Flash Prefill 커널 — F16 변종 추가)
+- **참조 문서**: `arch/cpu_flash_attention_prefill.md` Stage 9 (F16 직접 경로)
+- **Description**: `read_to_f32` + `bulk_f16_to_f32`로 전체 K/V를 F32로 변환하는 대신, Flash Prefill 커널 내부에서 F16 block을 직접 read → decode → softmax tile에 사용. 타일 단위 deq (on-the-fly)로 수십 MB Vec<f32> allocation/copy 제거.
+- **Acceptance Criteria**:
+  - [ ] Prefill 경로에서 `bulk_f16_to_f32` 호출 제거 (F16 KV 케이스)
+  - [ ] 4K prefill (CPU): 37.7 → 60+ tok/s (+60% 이상)
+  - [ ] `prompt_alloc` / `memcpy` 관련 heap 프로파일 대폭 감소 (측정 필요)
+  - [ ] 수치 정확도: `test_backend` CPU vs baseline 비교, logit cos-sim ≥ 0.999
+  - [ ] 기존 F32 경로 회귀 없음
+- **F16 직접 경로 신규 함수 시그니처 후보** (Architect와 협의):
+
+  ```rust
+  // engine/src/backend/cpu/neon.rs (신규)
+  #[cfg(target_arch = "aarch64")]
+  pub fn flash_prefill_forward_f16_neon(
+      q: &[f32],          // [seq_len, n_heads_q, head_dim] (Q는 F32 유지 — RoPE 출력)
+      k_f16: &[u16],      // [kv_heads, capacity, head_dim] F16 raw bits
+      v_f16: &[u16],      // 동일 layout
+      // ... 기존 F32 시그니처와 동일한 메타파라미터 ...
+  ) -> Result<()>;
+  ```
+
+  - F16 K/V는 타일 진입 시 NEON `vld1q_u16` + `vcvt_f32_f16`으로 on-the-fly 변환
+  - Step 1/2의 `flash_apply_token` F16 변환 패턴 재사용
+
+- **forward.rs 분기 변경 위치**:
+  - L174-229: prefill main path — `read_to_f32` 호출 전에 `if F16 KV: flash_prefill_forward_f16_neon(...)` 분기 추가
+  - L694-752: variant path — 동일 패턴
+  - 기존 F32 경로는 fallback으로 유지 (F32 KV 케이스용)
+- **Notes**: forward.rs (dispatch layer)와 neon.rs (kernel layer) 양쪽 수정이 필요. Architect 검토 권장 — 특히 F16 K/V `Tensor` 접근자 trait 안정성. **Scope 재확인 (2026-04-13)**: P0-2는 CPU fallback 경로 자체를 빠르게 만드는 완화책 — GPU backend를 명시적으로 지정한 시나리오의 본질적 해결은 아님. GPU path dispatch 자체는 **P0-3/P0-4**에서 다룸. P0-3/P0-4 완료 후에도 `-b cpu` 실행과 head_dim 미지원 fallback을 위해 P0-2는 여전히 필요.
+
+---
+
+#### [P0-3] OpenCL flash_attn prefill 커널 head_dim=128 지원 (Qwen 계열)
+- **Status**: TODO
+- **Sprint**: current
+- **담당**: senior-implementer
+- **Dependencies**: 없음 (Step 2 decode head_dim=128 패턴 참조)
+- **예상 작업량**: 1 ~ 2일
+- **코드 위치**:
+  - `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu` (F16 분기 — 현재 `if head_dim != 64 { return Ok(false); }`)
+  - `engine/kernels/flash_attn_f32_f16*.cl` (prefill 커널; `DK=DV=64` 빌드 매크로)
+  - 커널 빌드 및 캐시 로딩부 (`kernel_flash_attn_f32_f16_dk128` 신규 추가 필요)
+- **참조**: 최근 커밋에서 decode에 적용된 head_dim=128 커널 (`attention_gen_f16_neon` 계열 Step 2/3 prefill/decode 패턴), llama.cpp Adreno flash attention 커널
+- **Description**: Prefill용 F16 flash attention OpenCL 커널을 `DK=DV=128`로 별도 빌드하고, `head_dim == 128` 분기에서 dispatch. Step 2가 decode 경로에 적용한 head_dim 별 커널 컴파일 + 선택 로직을 prefill에 확장. Qwen2.5 1.5B (head_dim=128)가 F16 KV 구성에서 GPU prefill을 사용할 수 있도록 함.
+- **Acceptance Criteria**:
+  - [ ] `flash_attention_prefill_gpu`가 `head_dim == 128, DType::F16` 조합에서 `Ok(true)`로 dispatch됨 (fallback 경고 로그 없음)
+  - [ ] 4K prefill (Qwen2.5 1.5B, F16 KV, GPU): 현재 CPU fallback 수치 대비 명확한 개선 (측정값은 P1-1/P1-2 완료 후 재정의)
+  - [ ] head_dim=64 (Llama 3.2 계열) 경로 회귀 없음
+  - [ ] `test_backend` 정확도: CPU vs GPU cos-sim ≥ 0.999 (head_dim=128)
+  - [ ] 커널 컴파일 시간 증가는 허용 범위 (프로그램 캐시로 완화 확인)
+- **Notes**: Step 2 decode 패턴 재사용 가능 — 구조적으로 낮은 리스크. P0-4 대비 **선행 권장** (커널 템플릿 매크로화 경험 확보).
+
+---
+
+#### [P0-4] OpenCL flash_attn prefill 커널 Q4_0 KV 지원
+- **Status**: TODO
+- **Sprint**: current (researcher 선조사 → senior-implementer)
+- **담당**: researcher (선조사) → senior-implementer (구현)
+- **Dependencies**: P0-3 완료 권장 (커널 매크로화 경험 선행)
+- **예상 작업량**: researcher 1 ~ 2일 + senior-implementer 3 ~ 5일
+- **코드 위치**:
+  - `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu` (현재 Q4_0 분기에서 `_ => return Ok(false)`)
+  - `engine/kernels/flash_attn_f32_f16*.cl` (신규 `flash_attn_f32_q4_0*.cl` 파생)
+  - 참고: 기존 Q4_0 GEMV 커널 (`mul_mv_q4_0_*.cl`), Q4_0 블록 layout
+- **참조**:
+  - llama.cpp의 Q4 KV cache 지원 상태 조사 (대체로 F16 권장하는 이유 포함)
+  - `docs/31_perf_comparison_llama_cpp.md`
+  - 프로젝트 내 Q4_0 dequant 커널 (`simple_ops.cl`, KIVI 관련)
+- **Description**:
+  - **Phase A (Researcher)**: Q4_0 KV를 GPU flash attention에서 처리하는 현실적 전략 평가:
+    (a) 타일 로드 시 on-the-fly dequant (Q4_0 → F16 in private/local mem) 후 기존 F16 커널 재사용
+    (b) K/V를 F16으로 사전 변환한 shadow buffer 유지 (메모리 2x 비용, 코드 단순)
+    (c) Q4_0 블록 단위로 fused matmul (complex, 큰 개발 비용)
+  - 각 전략별 성능/정확도/VRAM 트레이드오프 문서화, 권고안 제시.
+  - **Phase B (senior-implementer)**: 선택된 전략 구현. 가장 유력한 후보는 (a) — K 타일 로드 지점에서 Q4_0 block을 subgroup 단위로 dequant하여 local/private memory F16 타일 구성, 이후 기존 online softmax + Pv matmul 재사용.
+- **Acceptance Criteria**:
+  - [ ] Researcher 산출물: Q4_0 GPU flash attention 전략 비교 문서 (전략 (a)/(b)/(c) 성능/메모리/복잡도 분석)
+  - [ ] `flash_attention_prefill_gpu`가 `DType::Q4_0` 케이스에서 `Ok(true)` dispatch
+  - [ ] 4K prefill (Qwen2.5 1.5B, Q4_0 KV, GPU): 현재 CPU fallback 수치 대비 대폭 개선
+  - [ ] 수치 정확도: F16 KV baseline 대비 logit cos-sim ≥ 0.995 (Q4_0 quantization loss 고려)
+  - [ ] VRAM 사용량이 F16 KV 대비 +50% 이내 (shadow buffer 전략 시 제약)
+  - [ ] CPU Q4_0 prefill fallback 경로는 유지 (비-OpenCL 빌드/호스트 GPU 호환)
+- **Notes**: Phase 2의 가장 큰 미해결 영역 — Q4_0은 실전 기본 구성인데 GPU prefill 자체가 없음. Researcher 선조사 결과에 따라 작업 범위 / acceptance 수치 재조정. 전략 (b) 선택 시 P1-1 (chunk sizing)의 메모리 계산식도 함께 갱신 필요.
+
+---
+
+#### [P1-1] GPU prefill chunk auto-sizing fix
+- **Status**: TODO
+- **Sprint**: current
+- **담당**: implementer (sonnet)
+- **Dependencies**: 없음
+- **예상 작업량**: 0.5일
+- **코드 위치**: `engine/src/bin/generate.rs` (prefill 루프, chunk size 결정부) + `engine/src/backend/opencl/mod.rs` (buffer size 계산)
+- **Description**: `--prefill-chunk-size 0` (기본값) 시 `CL_INVALID_BUFFER_SIZE`로 실패. GPU 가용 메모리와 모델 hidden dim에서 안전한 기본 chunk size를 자동 산출 (예: 512 또는 사용 가능 메모리 / (hidden_dim * 4) 중 작은 값).
+- **Acceptance Criteria**:
+  - [ ] `--prefill-chunk-size 0` 호출 시 에러 없이 정상 동작
+  - [ ] 4K prompt GPU prefill 성공
+  - [ ] 명시적 `--prefill-chunk-size 128` 결과와 수치 동등 (FP tolerance 내)
+  - [ ] 로그에 자동 선택된 chunk size 출력
+- **검증 명령**:
+  ```bash
+  # 자동 chunk 결정 정상 동작 확인
+  adb shell "cd /data/local/tmp && ./generate \
+    -m /data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf \
+    --prompt-file /data/local/tmp/prompt_6k.txt \
+    -n 8 -b opencl --kv-type f16 --max-seq-len 6144 --ignore-eos"
+
+  # 명시적 chunk size와 결과 동등성 확인
+  adb shell "... --prefill-chunk-size 128 ..."
+  ```
+- **Notes**: 낮은 위험도, 빠른 개선. GPU 4K prefill 측정 재개를 위한 선결 조건.
+
+---
+
+#### [P1-2] Prefill OpProfiler 확장 + GPU fallback 감지 로그 (중요도 상승)
+- **Status**: TODO
+- **Sprint**: current
+- **담당**: implementer (sonnet)
+- **Dependencies**: 없음 (P0-2와 병행 가능)
+- **예상 작업량**: 0.5 ~ 1일 + fallback 로그 0.25일
+- **코드 위치**:
+  - `engine/src/core/profiler.rs` (OpProfiler)
+  - `engine/src/layers/transformer_layer/forward.rs` (prefill path hooks, `!gpu_dispatched` 분기)
+  - `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu` (Ok(false) 반환 지점들)
+- **Description**: 현재 OpProfiler가 decode 중심. Prefill에서도 per-op (qkv_matmul, rope, kv_write, flash_prefill, ffn_*) 타이밍을 남기도록 hook 추가. `--profile` flag 시 prefill 경로에서도 `synchronize()` + timestamp 캡처. **추가 (2026-04-13)**: 10.1.5에서 밝혀진 GPU prefill CPU fallback 문제의 가시성 확보를 위해, GPU 커널이 `Ok(false)` 반환하여 CPU로 fallback할 때 **stderr 경고 로그**를 남긴다 (이유 포함: "Q4_0 not supported", "head_dim=128 not supported" 등).
+- **Acceptance Criteria**:
+  - [ ] `generate --profile` 실행 시 prefill per-op breakdown이 stderr/JSON에 출력
+  - [ ] Decode 결과 포맷과 호환 (dashboard 파싱 가능)
+  - [ ] 4K prefill 전/후 P0-2 효과를 per-op 단위로 측정 가능
+  - [ ] **GPU backend 지정 상태에서 prefill이 CPU로 fallback될 때마다 stderr에 1회 이상 경고 로그 출력 (dtype, head_dim, 이유 포함)**
+  - [ ] **fallback 이벤트가 OpProfiler 출력에도 "cpu_fallback_dispatch" 이벤트로 기록**
+  - [ ] 중복 로그 방지: 같은 (dtype, head_dim) 조합은 per-run 1회만 출력 (또는 dedupe 카운터)
+- **Notes**: 이전 세션 권고 사항. P0-2의 효과 측정과 원인 C 조사의 필수 전제. **중요도 상승**: 10.1.5 발견으로, fallback 감지 없이는 GPU 최적화 작업(P0-3/P0-4/P2-1)이 실제 유효한지 구분할 수 없음. P0-3/P0-4 착수 **전에** 완료 권장.
+
+---
+
+#### [P2-1] GPU Adreno F16 matmul 커널 (Subgroup + Texture)
+- **Status**: TODO
+- **Sprint**: next (P0-3/P0-4 + P1 완료 후)
+- **담당**: researcher 선조사 → senior-implementer 구현
+- **Dependencies**: P0-3 (head_dim=128 prefill 커널), P0-4 (Q4_0 prefill 커널), P1-1 (GPU prefill chunk sizing), P1-2 (per-op 측정 + fallback 로그) — **flash attention dispatch가 실제로 GPU에서 일어나는 상태**에서 matmul 병목이 remaining gap의 지배 요인인지 검증 선행
+- **예상 작업량**: 4 ~ 7일 (연구 2일 + 구현 3 ~ 5일)
+- **코드 위치**:
+  - 기존: `engine/kernels/mul_mv_f16_f32.cl`, `matmul*.cl` 계열
+  - 신규 예정: `engine/kernels/mul_mm_f16_adreno.cl` (Prefill GEMM 특화)
+- **참조 문서**: 
+  - llama.cpp `ggml-opencl.cpp` Adreno subgroup 커널
+  - `arch/gpu_backend.md` (있다면)
+  - `docs/31_perf_comparison_llama_cpp.md` Phase 3 섹션
+- **Description**:
+  - **Phase A (Researcher)**: llama.cpp Adreno F16 matmul 커널 분석 → subgroup size, local mem tiling, texture cache(image2d) 사용 패턴 정리. 우리 현재 커널과 diff, Qualcomm 플랫폼 feature 요구사항 문서화.
+  - **Phase B (senior-implementer)**: Prefill GEMM (M >> 1) 특화 F16 커널 작성. Subgroup reduction + texture(image2d_t)로 K 행 재사용 극대화. 기존 decode GEMV 커널은 건드리지 않음.
+- **Acceptance Criteria**:
+  - [ ] Research 산출물: Adreno subgroup 커널 작동 원리 + 적용 가능성 평가 문서
+  - [ ] 4K prefill GPU: 39.2 → 200+ tok/s (5x 이상 개선, 절대값은 Researcher 보고 이후 재조정)
+  - [ ] Decode 성능 회귀 없음 (GEMV 커널 유지)
+  - [ ] Non-Adreno (NVIDIA/Intel OpenCL) fallback 유지 — 기존 범용 커널 보존
+  - [ ] `test_backend` 정확도: CPU vs GPU cos-sim ≥ 0.999
+- **Notes**: ROI 불확실성과 작업량 때문에 P2. **P0-3/P0-4 완료로 flash attention이 실제 GPU에서 dispatch된 상태**에서 OpProfiler로 GPU prefill 병목이 정말 matmul에 있는지 재검증 후 착수. (10.1.5 발견 이전에는 "GPU prefill 측정치"가 사실상 CPU fallback 결과였을 가능성이 높음.) `.cl` 수정 허용 규칙은 `feedback_cl_modification.md` 참조.
+
+---
+
+### 10.3 권장 실행 순서 (2026-04-13 재정렬)
+
+10.1.5 발견으로 GPU 실행 경로 자체가 Q4_0 / head_dim=128 케이스에서 dispatch되지 않는 문제가 드러남. 따라서 **GPU 커널 확장 트랙(A')**을 CPU 성능 트랙(A)과 병렬로 추가.
+
+**병렬 트랙 A (CPU 성능 / fallback 완화)**:
+1. P0-1 rework — Q4_0 horizontal sum + i8mm 핫 경로 확대 (senior-implementer, ~1일)
+2. P0-2 F16 직접 경로 prefill (senior-implementer, 1~2일) — P0-1 완료 후 착수 권장
+
+**병렬 트랙 A' (GPU 커널 확장 — 본질적 해결)**:
+1. P0-3 head_dim=128 prefill 커널 (senior-implementer, 1~2일) — Step 2 decode 패턴 재사용
+2. P0-4 Q4_0 prefill 커널 (researcher 선조사 1~2일 → senior-implementer 3~5일) — P0-3 완료 후 착수 권장 (커널 매크로화 경험 계승)
+
+**병렬 트랙 B (GPU 재개 + 가시성 — A'의 전제)**:
+1. P1-2 Prefill OpProfiler 확장 + **fallback 감지 로그** (implementer, 0.5~1일) — **A' 착수 전 완료 권장**
+2. P1-1 GPU chunk auto-sizing (implementer, 0.5일)
+
+**직렬 트랙 C (GPU 최종 최적화)** — A' + B 완료 후:
+1. P2-1 Phase A: Researcher 선조사 (2일) — A' 완료 상태에서 remaining gap 분석
+2. P2-1 Phase B: senior-implementer 구현 (3~5일)
+
+**마일스톤 재정의**:
+- **M1 (week 1)**: P0-1 rework + P1-1 + P1-2 완료 → decode 11.4→14+ tok/s (i8mm 경로 실측), GPU prefill fallback 가시화, chunk sizing 정상화
+- **M2 (week 2)**: P0-3 + P0-2 완료 → F16 KV head_dim=128 (Qwen)에서 GPU prefill 실제 dispatch, CPU fallback 최적화 동시 달성 — CPU prefill 37.7→60+ tok/s
+- **M3 (week 2~3)**: P0-4 완료 → Q4_0 KV GPU prefill 가능 (실전 기본 구성 커버)
+- **M4 (week 3~4)**: P2-1 완료 → flash attention이 실제 GPU 실행되는 조건에서 matmul 병목 개선, GPU 4K prefill 목표 달성
+
+---
+
+### 10.4 핵심 acceptance criteria 요약
+
+| ID | 핵심 지표 | 목표 |
+|---|---|---|
+| P0-1 | 4K decode (CPU 6T, **i8mm 경로 dispatch되는 실측 환경**) | 11.4 → 14+ tok/s |
+| P0-2 | 4K prefill (CPU) | 37.7 → 60+ tok/s, bulk F16→F32 제거 |
+| P0-3 | F16 KV, head_dim=128 prefill GPU dispatch | `Ok(false)` fallback 제거, CPU fallback 대비 개선 |
+| P0-4 | Q4_0 KV prefill GPU dispatch | `Ok(false)` fallback 제거, cos-sim ≥ 0.995 |
+| P1-1 | `--prefill-chunk-size 0` | 실패 → 정상 동작 |
+| P1-2 | Prefill per-op 프로파일 + fallback 로그 | 출력 가능, GPU→CPU fallback 경고 stderr |
+| P2-1 | 4K prefill (GPU, 실제 GPU dispatch 상태) | 39.2 → 200+ tok/s |
+| 공통 | 수치 정확도 | logit cos-sim ≥ 0.999 (test_backend, P0-4는 ≥ 0.995) |
+
+---
+
+### 10.5 참고 문서
+
+- 코드 위치 근거: 외부 분석 결과와 현 코드 매칭 완료
+- `docs/31_perf_comparison_llama_cpp.md` — Phase 1~3 비교 분석
+- `arch/cpu_flash_attention_prefill.md` — Stage 9 F16 직접 경로 설계
+- `feedback_cl_modification.md` — `.cl` 커널 수정 허용 정책
+- llama.cpp 참조: `reference_llama_cpp_source.md`, `reference_llama_cpp_testing.md`
