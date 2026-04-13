@@ -925,9 +925,17 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 
 ---
 
-#### [P2-1] GPU Adreno F16 matmul 커널 (Subgroup + Texture) — 🔥 **최우선 (2026-04-13 승격)**
-- **Status**: TODO → **🔥 최우선 (2026-04-13 승격, P0-3 완료 후)**
-- **Sprint**: current
+#### [P2-1] GPU Adreno F16 matmul 커널 (Subgroup + Texture) — 🟡 **Phase B 1차 완료 (2026-04-13)**
+- **Status**: **Phase A 완료 + Phase B 1차 완료 (2026-04-13)** — Q4_0 tiled GEMM 커널 적용. Qwen prefill **27.8 → 50.0 tok/s (+80%)**. 목표(150+) 미달이나 회귀 해소 + 의미있는 진전. 추가 최적화 (subgroup intrinsics, texture cache) 는 후속 작업.
+- **Sprint**: ~~current~~ → 후속 (추가 최적화 시 재오픈)
+- **2026-04-13 Phase B 결과**:
+  - 신규 커널: `engine/kernels/mul_mm_q4_0_f32_l4_lm.cl` (llama.cpp 포팅, interleaved BlockQ4_0 레이아웃 적용)
+  - Dispatch: `matmul_q4_0()` 에서 m≥32일 때 `matmul_gemm_q4_0()` 로 분기 (GEMV는 m<32, m=1 noshuffle 보존)
+  - **Galaxy S25 (Adreno 830) 측정**:
+    - Qwen 2.5-1.5B Q4_0 prefill 4472 tok: **27.8 → 50.0 tok/s (+80%)** (master vs Phase B 동일 thermal status 1)
+    - Qwen Decode 7.4 → 8.8 tok/s (+19%, thermal variance 포함)
+    - Llama 3.2 1B Q4_0 prefill 4449 tok: 136.3 tok/s (회귀 없음 — Llama는 head_dim=64 + FFN 작아 이미 최적)
+  - **목표 미달 분석**: 50 tok/s vs 목표 150+. 잔여 갭 원인 추정 — flash_attn (head_dim=128 prefill) 비중 큼, GEMM tile 사이즈가 Adreno에 비최적, subgroup 미사용. 후속 P2-1b 로 분리 검토.
 - **담당**: researcher 선조사 → senior-implementer 구현
 - **Dependencies**: P0-3 ✅ 완료 (Qwen prefill GPU 경로 활성화로 fallback 아닌 실제 커널 측정 가능). P1-1 / P1-2 ✅ 완료
 - **예상 작업량**: 4 ~ 7일 (연구 2일 + 구현 3 ~ 5일)
@@ -1004,7 +1012,7 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 | ~~P0-4~~ | ~~Q4_0 KV prefill GPU dispatch~~ | ~~cos-sim ≥ 0.995~~ | **DEFERRED (future, P2)** |
 | P1-1 | `--prefill-chunk-size 0` | 실패 → 정상 동작 | **DONE (커밋 15f99e0)** |
 | P1-2 | Prefill per-op 프로파일 + fallback 로그 | 출력 가능, GPU→CPU fallback 경고 stderr | **DONE (커밋 f0091cc)** |
-| **P2-1** 🔥 | **4K prefill (Qwen, Adreno 830, plan ON, 6T) — 최우선 (P0-3 완료 후 승격)** | **31 → 100+ tok/s** (llama.cpp 760의 13%+) | **TODO — 🔥 최우선 (current sprint)** |
+| **P2-1** 🟡 | **4K prefill (Qwen, Adreno 830, plan ON, 6T)** | 27.8 → 50.0 tok/s (+80%) — 목표 150+ 미달 | **Phase B 1차 완료 (Q4_0 GEMM)** |
 | 공통 | 수치 정확도 | logit cos-sim ≥ 0.999 (test_backend) | — |
 
 ---
