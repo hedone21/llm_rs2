@@ -97,6 +97,13 @@ pub enum AttentionVariant {
     /// softmax, no score output. Selected at plan-build time when
     /// head_dim==64, F16 KV, HeadMajor, and no scores are needed.
     StandardFlash(KernelStep),
+    /// GQA-aware decode flash attention (flash_attn_f32_f16_q1_gqa). Same
+    /// preconditions as `StandardFlash` plus `gqa_ratio >= 2` and
+    /// `kv_capacity >= GQA_MIN_CTX` (context-run threshold is enforced at
+    /// plan-build time via `kv_capacity`; runtime fallback to q1 happens if
+    /// the actual `n_kv` falls below threshold on first few tokens — not
+    /// wired here because plan path is decode-only with grown caches).
+    StandardFlashGqa(KernelStep),
     /// KIVI assembled: scatter residual to F32 attn buffer, then standard F32 attention.
     /// Used when native KIVI attention kernel is not available.
     KiviAssembled {
@@ -415,6 +422,32 @@ impl FullKernelPlan {
                         ocl::core::finish(queue).ok();
                         eprintln!(
                             "[Plan] L{} flash attention OK (attn_seq_len={})",
+                            i, attn_seq_len
+                        );
+                    }
+                }
+                AttentionVariant::StandardFlashGqa(step) => {
+                    if debug_sync {
+                        eprintln!(
+                            "[Plan] L{} GQA flash attention dispatch (attn_seq_len={}, gws={:?}, lws={:?})",
+                            i, attn_seq_len, step.global_work_size, step.local_work_size
+                        );
+                    }
+                    Self::dispatch_step(
+                        queue,
+                        step,
+                        start_pos_i32,
+                        attn_seq_len,
+                        write_pos,
+                        kv_cap,
+                        rp,
+                        q2t,
+                        rt,
+                    );
+                    if debug_sync {
+                        ocl::core::finish(queue).ok();
+                        eprintln!(
+                            "[Plan] L{} GQA flash attention OK (attn_seq_len={})",
                             i, attn_seq_len
                         );
                     }
@@ -883,12 +916,19 @@ pub fn build_noshuffle_programs(
     Ok(programs)
 }
 
-/// Build a pre-bound `KernelStep` that dispatches `flash_attn_f32_f16_q1`.
+/// Build a pre-bound `KernelStep` that dispatches `flash_attn_f32_f16_q1`
+/// or its GQA-aware variant `flash_attn_f32_f16_q1_gqa` depending on layer
+/// geometry.
 ///
 /// Arg layout mirrors `OpenCLBackend::flash_attention_decode_gpu` — see that
 /// method in `engine/src/backend/opencl/mod.rs` for the canonical layout.
-/// All 40 args are static except `n_kv` at index 10, which is patched per
-/// decode step via `DynamicArg::CacheSeqLen`.
+/// All 40 (41 for GQA) args are static except `n_kv` at index 10, which is
+/// patched per decode step via `DynamicArg::CacheSeqLen`.
+///
+/// Selection: GQA variant is used when `gqa_ratio >= 2`, the GQA kernel is
+/// available for the layer's head_dim, and `kv_capacity >= GQA_MIN_CTX` (so
+/// the cooperative KV load is amortized). Otherwise the legacy per-head q1
+/// variant is used — this preserves MHA and short-ctx behavior.
 fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVariant> {
     // Pick the program matching this layer's head_dim. The caller
     // (`use_flash` gate) guarantees the matching program is `Some`.
@@ -898,6 +938,27 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
         _ => None,
     }
     .expect("caller must verify flash program is Some for this head_dim");
+
+    // --- GQA selection heuristic (plan-build time) ---
+    // Must match the runtime eligibility in OpenCLBackend::gqa_decode_eligible.
+    const GQA_RATIO_MAX: usize = 8;
+    const GQA_MIN_CTX: usize = 128;
+    let use_gqa = {
+        let n_q = config.n_heads_q;
+        let n_kv = config.n_kv_heads;
+        if n_kv == 0 || n_q == 0 || !n_q.is_multiple_of(n_kv) {
+            false
+        } else {
+            let ratio = n_q / n_kv;
+            (2..=GQA_RATIO_MAX).contains(&ratio)
+                && (config.head_dim == 64 || config.head_dim == 128)
+                && config.kv_capacity >= GQA_MIN_CTX
+        }
+    };
+
+    if use_gqa {
+        return build_flash_attention_step_gqa(config, program);
+    }
 
     let kernel = ocl::core::create_kernel(program, "flash_attn_f32_f16_q1")
         .context("create flash_attn_f32_f16_q1 for plan")?;
@@ -980,6 +1041,206 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
         ocl::core::set_kernel_arg(&kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
     }
 
+    const Q1_WG_SIZE: usize = 64;
+    Ok(AttentionVariant::StandardFlash(KernelStep {
+        kernel,
+        ndim: 2,
+        global_work_size: [Q1_WG_SIZE, n_heads_q, 1],
+        local_work_size: Some([Q1_WG_SIZE, 1, 1]),
+        dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 10 }],
+        op_tag: OpTag::Attention,
+        retained_bufs: vec![],
+    }))
+}
+
+/// Build a pre-bound `KernelStep` that dispatches the GQA-aware decode flash
+/// kernel `flash_attn_f32_f16_q1_gqa`. Arg layout mirrors
+/// `OpenCLBackend::flash_attention_decode_gpu_gqa` with one extra trailing
+/// arg (`gqa_ratio` at index 40).
+///
+/// The caller (`build_flash_attention_step`) guarantees GQA eligibility.
+/// Falls back to the standard variant if the GQA kernel fails to create
+/// (e.g. driver rejected the program).
+fn build_flash_attention_step_gqa(
+    config: &LayerPlanConfig,
+    program: &ocl::Program,
+) -> Result<AttentionVariant> {
+    let kernel = match ocl::core::create_kernel(program, "flash_attn_f32_f16_q1_gqa") {
+        Ok(k) => k,
+        Err(_) => {
+            // GQA kernel not available in this program binary — fall back to q1.
+            // This can happen if the source was rebuilt without the GQA variant.
+            let fallback = ocl::core::create_kernel(program, "flash_attn_f32_f16_q1")
+                .context("fallback flash_attn_f32_f16_q1 create after GQA miss")?;
+            return build_flash_attention_step_std(config, fallback);
+        }
+    };
+
+    let n_heads_q = config.n_heads_q;
+    let n_heads_kv = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_capacity = config.kv_capacity;
+    let gqa_ratio = (n_heads_q / n_heads_kv) as i32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q_nb1 = (n_heads_q * head_dim * 4) as u64;
+    let q_nb2 = (head_dim * 4) as u64;
+    let q_nb3 = q_nb1;
+
+    let kv_elem_size: u64 = 2;
+    let k_nb1 = (head_dim as u64) * kv_elem_size;
+    let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
+    let k_nb3 = (n_heads_kv as u64) * k_nb2;
+
+    let o_nb1 = (head_dim * 4) as u64;
+    let o_nb2 = (n_heads_q * head_dim * 4) as u64;
+    let o_nb3 = o_nb2;
+
+    let n_q = 1i32;
+    let initial_n_kv = 0i32;
+    let is_causal = 0i32;
+    let n_head = n_heads_q as i32;
+    let n_head_kv_arg = n_heads_kv as i32;
+    let max_bias = 0.0f32;
+    let m0 = 0.0f32;
+    let m1 = 0.0f32;
+    let n_head_log2 = 0i32;
+    let logit_softcap = 0.0f32;
+    let zero_u64 = 0u64;
+    let zero_i32 = 0i32;
+
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.k_cache_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(config.v_cache_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::mem(config.out_attn_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+        ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
+        ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&initial_n_kv))?;
+        ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
+        ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
+        ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 19, ocl::core::ArgVal::scalar(&k_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 20, ocl::core::ArgVal::scalar(&k_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 21, ocl::core::ArgVal::scalar(&k_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
+        ocl::core::set_kernel_arg(&kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
+        ocl::core::set_kernel_arg(&kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
+        ocl::core::set_kernel_arg(&kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
+        ocl::core::set_kernel_arg(&kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
+        ocl::core::set_kernel_arg(&kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
+        ocl::core::set_kernel_arg(&kernel, 31, ocl::core::ArgVal::mem_null())?;
+        ocl::core::set_kernel_arg(&kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 38, ocl::core::ArgVal::mem_null())?;
+        ocl::core::set_kernel_arg(&kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 40, ocl::core::ArgVal::scalar(&gqa_ratio))?;
+    }
+
+    const Q1_WG_SIZE: usize = 64;
+    Ok(AttentionVariant::StandardFlashGqa(KernelStep {
+        kernel,
+        ndim: 3,
+        // One WG per KV-head; each WG processes `gqa_ratio` Q-heads.
+        global_work_size: [Q1_WG_SIZE, n_heads_kv, 1],
+        local_work_size: Some([Q1_WG_SIZE, 1, 1]),
+        dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 10 }],
+        op_tag: OpTag::Attention,
+        retained_bufs: vec![],
+    }))
+}
+
+/// Standard q1 builder extracted for the GQA fallback path. Mirrors the
+/// bottom half of `build_flash_attention_step` with a pre-created kernel.
+fn build_flash_attention_step_std(
+    config: &LayerPlanConfig,
+    kernel: ocl::core::Kernel,
+) -> Result<AttentionVariant> {
+    let n_heads_q = config.n_heads_q;
+    let n_heads_kv = config.n_kv_heads;
+    let head_dim = config.head_dim;
+    let kv_capacity = config.kv_capacity;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+    let q_nb1 = (n_heads_q * head_dim * 4) as u64;
+    let q_nb2 = (head_dim * 4) as u64;
+    let q_nb3 = q_nb1;
+    let kv_elem_size: u64 = 2;
+    let k_nb1 = (head_dim as u64) * kv_elem_size;
+    let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
+    let k_nb3 = (n_heads_kv as u64) * k_nb2;
+    let o_nb1 = (head_dim * 4) as u64;
+    let o_nb2 = (n_heads_q * head_dim * 4) as u64;
+    let o_nb3 = o_nb2;
+    let n_q = 1i32;
+    let initial_n_kv = 0i32;
+    let is_causal = 0i32;
+    let n_head = n_heads_q as i32;
+    let n_head_kv_arg = n_heads_kv as i32;
+    let max_bias = 0.0f32;
+    let m0 = 0.0f32;
+    let m1 = 0.0f32;
+    let n_head_log2 = 0i32;
+    let logit_softcap = 0.0f32;
+    let zero_u64 = 0u64;
+    let zero_i32 = 0i32;
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.k_cache_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(config.v_cache_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::mem(config.out_attn_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
+        ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
+        ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&initial_n_kv))?;
+        ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
+        ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
+        ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 19, ocl::core::ArgVal::scalar(&k_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 20, ocl::core::ArgVal::scalar(&k_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 21, ocl::core::ArgVal::scalar(&k_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
+        ocl::core::set_kernel_arg(&kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
+        ocl::core::set_kernel_arg(&kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
+        ocl::core::set_kernel_arg(&kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
+        ocl::core::set_kernel_arg(&kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
+        ocl::core::set_kernel_arg(&kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
+        ocl::core::set_kernel_arg(&kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
+        ocl::core::set_kernel_arg(&kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
+        ocl::core::set_kernel_arg(&kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
+        ocl::core::set_kernel_arg(&kernel, 31, ocl::core::ArgVal::mem_null())?;
+        ocl::core::set_kernel_arg(&kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
+        ocl::core::set_kernel_arg(&kernel, 38, ocl::core::ArgVal::mem_null())?;
+        ocl::core::set_kernel_arg(&kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+    }
     const Q1_WG_SIZE: usize = 64;
     Ok(AttentionVariant::StandardFlash(KernelStep {
         kernel,
