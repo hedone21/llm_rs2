@@ -1109,6 +1109,12 @@ impl TransformerModel {
             simple_ops_program: &ocl_backend.simple_ops_program,
             flash_attn_f32_f16_program_dk64: ocl_backend.flash_attn_f32_f16_program_dk64.as_ref(),
             flash_attn_f32_f16_program_dk128: ocl_backend.flash_attn_f32_f16_program_dk128.as_ref(),
+            flash_attn_q1_reduce_program_dk64: ocl_backend
+                .flash_attn_q1_reduce_program_dk64
+                .as_ref(),
+            flash_attn_q1_reduce_program_dk128: ocl_backend
+                .flash_attn_q1_reduce_program_dk128
+                .as_ref(),
             needs_attention_scores: plan_needs_scores,
             layer_bufs,
             x_buf: cl!(x),
