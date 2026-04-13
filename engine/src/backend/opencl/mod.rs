@@ -118,12 +118,6 @@ struct KernelCache {
     /// Decode-specialized flash attention, head_dim=128 variant
     /// (Q=F32, KV=F16, compiled with -DDK=128 -DDV=128).
     kernel_flash_attn_f32_f16_q1_dk128: Option<CoreKernel>,
-    /// GQA-aware decode flash attention: one WG per KV-head processes
-    /// all `gqa_ratio` Q-heads sharing that KV-head (KV loaded once,
-    /// reused). head_dim=64 variant.
-    kernel_flash_attn_f32_f16_q1_gqa_dk64: Option<CoreKernel>,
-    /// GQA-aware decode flash attention, head_dim=128 variant.
-    kernel_flash_attn_f32_f16_q1_gqa_dk128: Option<CoreKernel>,
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_f32_f32: Option<CoreKernel>,
@@ -804,12 +798,6 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16_q1_dk128: flash_attn_f32_f16_program_dk128
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
-            kernel_flash_attn_f32_f16_q1_gqa_dk64: flash_attn_f32_f16_program_dk64
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_gqa").ok()),
-            kernel_flash_attn_f32_f16_q1_gqa_dk128: flash_attn_f32_f16_program_dk128
-                .as_ref()
-                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_gqa").ok()),
             kernel_mul_mm_f16_f32: gemm_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f16_f32_l4_lm").ok()),
@@ -1911,11 +1899,6 @@ impl OpenCLBackend {
     ///
     /// Supports head_dim ∈ {64, 128} today. Requires F16 KV on GPU,
     /// HeadMajor KV layout, `seq_len=1`, and no score output.
-    ///
-    /// When `gqa_ratio > 1` and `n_kv >= GQA_MIN_CTX`, transparently routes to
-    /// the GQA-aware variant (`flash_attn_f32_f16_q1_gqa`) that shares KV reads
-    /// across Q-heads in the same GQA group — see `flash_attention_decode_gpu_gqa`.
-    ///
     /// Returns Ok(true) if the kernel was dispatched; Ok(false) if preconditions
     /// are not met and the caller should fall back to the legacy attention kernel.
     #[allow(clippy::too_many_arguments)]
@@ -1941,24 +1924,6 @@ impl OpenCLBackend {
             return Ok(false);
         }
         let kv_capacity = k_shape[2];
-
-        // Try GQA-aware path first when eligible.
-        if Self::gqa_decode_eligible(n_heads_q, n_heads_kv, head_dim, cache_seq_len) {
-            match self.flash_attention_decode_gpu_gqa(
-                q,
-                k_cache,
-                v_cache,
-                out,
-                n_heads_q,
-                n_heads_kv,
-                head_dim,
-                cache_seq_len,
-                kv_capacity,
-            )? {
-                true => return Ok(true),
-                false => { /* fall through to standard q1 */ }
-            }
-        }
 
         // Head dim must match the DK/DV compile-time constant of one of the
         // compiled flash attention programs. Add new variants here when
@@ -2085,201 +2050,6 @@ impl OpenCLBackend {
         }
 
         Ok(true)
-    }
-
-    /// Runtime eligibility check for the GQA-aware decode kernel.
-    ///
-    /// Activation conditions (see `.agent/research/2026-04-13_gqa_kv_sharing_kernel.md` §G):
-    ///   1. `gqa_ratio > 1` — MHA (ratio=1) has no KV reuse; use q1.
-    ///   2. `gqa_ratio <= GQA_RATIO_MAX` — private-array upper bound in the kernel.
-    ///   3. `head_dim ∈ {64, 128}` — only these DK variants are compiled.
-    ///   4. `cache_seq_len >= GQA_MIN_CTX` — short ctx amortizes cooperative load poorly.
-    #[inline]
-    fn gqa_decode_eligible(
-        n_heads_q: usize,
-        n_heads_kv: usize,
-        head_dim: usize,
-        cache_seq_len: usize,
-    ) -> bool {
-        // Must match GQA_RATIO_MAX in flash_attn_f32_f16.cl.
-        const GQA_RATIO_MAX: usize = 8;
-        // Below this threshold the GQA kernel's cooperative KV load isn't amortized
-        // enough to beat the simpler q1 kernel. Tuned heuristic — revisit with device
-        // measurements.
-        const GQA_MIN_CTX: usize = 128;
-
-        if n_heads_kv == 0 || n_heads_q == 0 {
-            return false;
-        }
-        if !n_heads_q.is_multiple_of(n_heads_kv) {
-            return false;
-        }
-        let gqa_ratio = n_heads_q / n_heads_kv;
-        if !(2..=GQA_RATIO_MAX).contains(&gqa_ratio) {
-            return false;
-        }
-        if head_dim != 64 && head_dim != 128 {
-            return false;
-        }
-        if cache_seq_len < GQA_MIN_CTX {
-            return false;
-        }
-        true
-    }
-
-    /// Dispatch the GQA-aware flash decode kernel
-    /// (`flash_attn_f32_f16_q1_gqa`). Returns Ok(false) if the kernel handle
-    /// for the requested head_dim is not available (falls back to q1).
-    ///
-    /// Emits a one-shot stderr diagnostic per unique `(gqa_ratio, head_dim)`
-    /// pair when the kernel dispatches successfully for the first time.
-    #[allow(clippy::too_many_arguments)]
-    fn flash_attention_decode_gpu_gqa(
-        &self,
-        q: &Tensor,
-        k_cache: &Tensor,
-        v_cache: &Tensor,
-        out: &mut Tensor,
-        n_heads_q: usize,
-        n_heads_kv: usize,
-        head_dim: usize,
-        cache_seq_len: usize,
-        kv_capacity: usize,
-    ) -> Result<bool> {
-        let kernels = unsafe { &*self.kernels.get() };
-        let kernel = match head_dim {
-            64 => match &kernels.kernel_flash_attn_f32_f16_q1_gqa_dk64 {
-                Some(k) => k,
-                None => return Ok(false),
-            },
-            128 => match &kernels.kernel_flash_attn_f32_f16_q1_gqa_dk128 {
-                Some(k) => k,
-                None => return Ok(false),
-            },
-            _ => return Ok(false),
-        };
-
-        let gqa_ratio = (n_heads_q / n_heads_kv) as i32;
-
-        let q_buf = get_cl_mem(q.buffer().as_ref())?;
-        let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
-        let v_buf = get_cl_mem(v_cache.buffer().as_ref())?;
-        let o_buf = get_cl_mem(out.buffer().as_ref())?;
-
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-        // Strides mirror flash_attention_decode_gpu. Q/O: F32; KV: F16 HeadMajor.
-        let q_nb1 = (n_heads_q * head_dim * 4) as u64;
-        let q_nb2 = (head_dim * 4) as u64;
-        let q_nb3 = q_nb1;
-        let kv_elem_size: u64 = 2;
-        let k_nb1 = (head_dim as u64) * kv_elem_size;
-        let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
-        let k_nb3 = (n_heads_kv as u64) * k_nb2;
-        let (v_nb1, v_nb2, v_nb3) = (k_nb1, k_nb2, k_nb3);
-        let o_nb1 = (head_dim * 4) as u64;
-        let o_nb2 = (n_heads_q * head_dim * 4) as u64;
-        let o_nb3 = o_nb2;
-
-        let n_q = 1i32;
-        let n_kv = cache_seq_len as i32;
-        let is_causal = 0i32;
-        let n_head = n_heads_q as i32;
-        let n_head_kv_arg = n_heads_kv as i32;
-        let max_bias = 0.0f32;
-        let m0 = 0.0f32;
-        let m1 = 0.0f32;
-        let n_head_log2 = 0i32;
-        let logit_softcap = 0.0f32;
-        let zero_u64 = 0u64;
-        let zero_i32 = 0i32;
-
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(k_buf))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(v_buf))?;
-            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::mem(o_buf))?;
-            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&scale))?;
-            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&n_q))?;
-            ocl::core::set_kernel_arg(kernel, 10, ocl::core::ArgVal::scalar(&n_kv))?;
-            ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&is_causal))?;
-            ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&n_head))?;
-            ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&q_nb1))?;
-            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&q_nb2))?;
-            ocl::core::set_kernel_arg(kernel, 15, ocl::core::ArgVal::scalar(&q_nb3))?;
-            ocl::core::set_kernel_arg(kernel, 16, ocl::core::ArgVal::scalar(&k_nb1))?;
-            ocl::core::set_kernel_arg(kernel, 17, ocl::core::ArgVal::scalar(&k_nb2))?;
-            ocl::core::set_kernel_arg(kernel, 18, ocl::core::ArgVal::scalar(&k_nb3))?;
-            ocl::core::set_kernel_arg(kernel, 19, ocl::core::ArgVal::scalar(&v_nb1))?;
-            ocl::core::set_kernel_arg(kernel, 20, ocl::core::ArgVal::scalar(&v_nb2))?;
-            ocl::core::set_kernel_arg(kernel, 21, ocl::core::ArgVal::scalar(&v_nb3))?;
-            ocl::core::set_kernel_arg(kernel, 22, ocl::core::ArgVal::scalar(&o_nb1))?;
-            ocl::core::set_kernel_arg(kernel, 23, ocl::core::ArgVal::scalar(&o_nb2))?;
-            ocl::core::set_kernel_arg(kernel, 24, ocl::core::ArgVal::scalar(&o_nb3))?;
-            ocl::core::set_kernel_arg(kernel, 25, ocl::core::ArgVal::scalar(&max_bias))?;
-            ocl::core::set_kernel_arg(kernel, 26, ocl::core::ArgVal::scalar(&m0))?;
-            ocl::core::set_kernel_arg(kernel, 27, ocl::core::ArgVal::scalar(&m1))?;
-            ocl::core::set_kernel_arg(kernel, 28, ocl::core::ArgVal::scalar(&n_head_log2))?;
-            ocl::core::set_kernel_arg(kernel, 29, ocl::core::ArgVal::scalar(&logit_softcap))?;
-            ocl::core::set_kernel_arg(kernel, 30, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
-            ocl::core::set_kernel_arg(kernel, 31, ocl::core::ArgVal::mem_null())?;
-            ocl::core::set_kernel_arg(kernel, 32, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 33, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 34, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 35, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 36, ocl::core::ArgVal::scalar(&zero_i32))?;
-            ocl::core::set_kernel_arg(kernel, 37, ocl::core::ArgVal::scalar(&zero_i32))?;
-            ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
-            ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
-            ocl::core::set_kernel_arg(kernel, 40, ocl::core::ArgVal::scalar(&gqa_ratio))?;
-
-            const Q1_WG_SIZE: usize = 64;
-            // Global = [WG_SIZE, n_heads_kv, batch]. One WG per KV-head.
-            let global_work_size: [usize; 3] = [Q1_WG_SIZE, n_heads_kv, 1];
-            let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-        }
-
-        // One-shot stderr diagnostic per unique (gqa_ratio, head_dim).
-        log_gqa_active_once(gqa_ratio, head_dim, n_heads_kv, cache_seq_len);
-
-        Ok(true)
-    }
-}
-
-/// Emit a one-shot stderr line the first time the GQA kernel dispatches for
-/// a given (gqa_ratio, head_dim) combo. Mirrors the `[FlashDecode]` pattern
-/// established in P0-5 for production observability.
-fn log_gqa_active_once(gqa_ratio: i32, head_dim: usize, n_heads_kv: usize, n_kv: usize) {
-    use std::collections::HashSet;
-    use std::sync::{Mutex, OnceLock};
-    static SEEN: OnceLock<Mutex<HashSet<(i32, usize)>>> = OnceLock::new();
-    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut guard = match seen.lock() {
-        Ok(g) => g,
-        Err(_) => return,
-    };
-    let key = (gqa_ratio, head_dim);
-    if guard.insert(key) {
-        // KV tile must match the kernel's GQA_KV_TILE macro.
-        let kv_tile = if head_dim == 128 { 32 } else { 64 };
-        eprintln!(
-            "[GQA-Attn] active: gqa_ratio={} kv_tile={} head_dim={} n_heads_kv={} n_kv={}",
-            gqa_ratio, kv_tile, head_dim, n_heads_kv, n_kv
-        );
     }
 }
 
@@ -4125,29 +3895,6 @@ impl OpenCLBackend {
             128 => kernels.kernel_flash_attn_f32_f16_q1_dk128.is_some(),
             _ => false,
         }
-    }
-
-    /// Returns true if the GQA-aware decode kernel is available for the
-    /// given head_dim. Mirrors `has_flash_decode_kernel` for the GQA variant
-    /// compiled from the same DK program.
-    pub fn has_flash_decode_gqa_kernel(&self, head_dim: usize) -> bool {
-        let kernels = unsafe { &*self.kernels.get() };
-        match head_dim {
-            64 => kernels.kernel_flash_attn_f32_f16_q1_gqa_dk64.is_some(),
-            128 => kernels.kernel_flash_attn_f32_f16_q1_gqa_dk128.is_some(),
-            _ => false,
-        }
-    }
-
-    /// Public accessor for the GQA eligibility heuristic (used by plan.rs to
-    /// select `AttentionVariant::StandardFlashGqa` at plan build time).
-    pub fn gqa_decode_eligible_pub(
-        n_heads_q: usize,
-        n_heads_kv: usize,
-        head_dim: usize,
-        cache_seq_len: usize,
-    ) -> bool {
-        Self::gqa_decode_eligible(n_heads_q, n_heads_kv, head_dim, cache_seq_len)
     }
 
     /// Check if KIVI fused attention kernel is available for the given bit-width.
