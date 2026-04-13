@@ -118,6 +118,18 @@ struct KernelCache {
     /// Decode-specialized flash attention, head_dim=128 variant
     /// (Q=F32, KV=F16, compiled with -DDK=128 -DDV=128).
     kernel_flash_attn_f32_f16_q1_dk128: Option<CoreKernel>,
+    /// Flash Decoding (P0-5) split kernel for head_dim=64. Partitions the KV
+    /// axis across `get_global_id(2)` and writes unnormalized partials +
+    /// (m, l) meta to external F32 buffers. Invoked only when
+    /// `kv_splits > 1`.
+    kernel_flash_attn_f32_f16_q1_split_dk64: Option<CoreKernel>,
+    /// Flash Decoding split kernel for head_dim=128.
+    kernel_flash_attn_f32_f16_q1_split_dk128: Option<CoreKernel>,
+    /// Flash Decoding reducer for head_dim=64 — merges per-split partials
+    /// into the final output via log-sum-exp.
+    kernel_flash_attn_q1_reduce_dk64: Option<CoreKernel>,
+    /// Flash Decoding reducer for head_dim=128.
+    kernel_flash_attn_q1_reduce_dk128: Option<CoreKernel>,
     // GEMM kernels for prefill (tiled matrix multiply, M > 1)
     kernel_mul_mm_f16_f32: Option<CoreKernel>,
     kernel_mul_mm_f32_f32: Option<CoreKernel>,
@@ -190,6 +202,11 @@ pub struct OpenCLBackend {
     /// by `flash_attention_decode_gpu` for models with head_dim=128
     /// (e.g. Qwen 2.5-1.5B).
     pub flash_attn_f32_f16_program_dk128: Option<Program>,
+    /// Flash Decoding (P0-5) reducer program for head_dim=64.
+    /// Compiled from `flash_attn_q1_reduce.cl` with `-DDV=64`.
+    pub flash_attn_q1_reduce_program_dk64: Option<Program>,
+    /// Flash Decoding reducer program for head_dim=128. `-DDV=128`.
+    pub flash_attn_q1_reduce_program_dk128: Option<Program>,
 
     // F16 GEMV N_DST=4 for large-N decode (lm_head, FFN)
     pub f16_l4_program: Option<Program>,
@@ -241,6 +258,27 @@ pub struct OpenCLBackend {
     // matmul_q4_0() auto-dispatches to noshuffle GEMV when a lookup succeeds.
     // UnsafeCell: single-threaded access (same pattern as kernels and gemv_noshuffle_cache).
     noshuffle_soa_registry: UnsafeCell<HashMap<usize, NoshuffleSoaEntry>>,
+
+    // Flash Decoding (P0-5) scratch buffers. Lazily allocated the first time
+    // `flash_attention_decode_gpu` picks kv_splits > 1, and grown on demand.
+    // partials: n_head_q * head_dim_v * kv_splits floats (F32, unnormalized).
+    // meta:     n_head_q * kv_splits * 2 floats (F32, m and l pairs).
+    // UnsafeCell: single-threaded access like other caches.
+    flash_decode_scratch: UnsafeCell<Option<FlashDecodeScratch>>,
+}
+
+/// Persistent scratch for `flash_attention_decode_gpu` split/reduce path.
+///
+/// Both buffers are sized to the largest (n_head * DV * kv_splits) /
+/// (n_head * kv_splits) seen so far. Reallocated when the running inference
+/// needs more capacity. The capacity is tracked in element counts (F32).
+pub struct FlashDecodeScratch {
+    partials: ocl::core::Mem,
+    meta: ocl::core::Mem,
+    /// Capacity of partials, in float elements.
+    partials_cap_f32: usize,
+    /// Capacity of meta, in float elements.
+    meta_cap_f32: usize,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -623,6 +661,49 @@ impl OpenCLBackend {
             }
         };
 
+        // Flash Decoding reducer (P0-5). Separate tiny program per DV so the
+        // kernel can const-unroll the inner loop. Same compile-time ceiling
+        // on kv_splits (MAX_KV_SPLITS=32, matches Metal nwg=32).
+        let flash_reduce_src = include_str!("../../../kernels/flash_attn_q1_reduce.cl");
+        let flash_reduce_opts_dk64 = format!("{} -DDV=64 -DMAX_KV_SPLITS=32", cl_opts);
+        let flash_attn_q1_reduce_program_dk64 = match Program::builder()
+            .devices(device)
+            .src(flash_reduce_src)
+            .cmplr_opt(&flash_reduce_opts_dk64)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("flash_attn_q1_reduce.cl compiled (DV=64)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "flash_attn_q1_reduce.cl DV=64 failed: {}. Flash Decoding KV-split disabled for DK=64.",
+                    e
+                );
+                None
+            }
+        };
+        let flash_reduce_opts_dk128 = format!("{} -DDV=128 -DMAX_KV_SPLITS=32", cl_opts);
+        let flash_attn_q1_reduce_program_dk128 = match Program::builder()
+            .devices(device)
+            .src(flash_reduce_src)
+            .cmplr_opt(&flash_reduce_opts_dk128)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("flash_attn_q1_reduce.cl compiled (DV=128)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "flash_attn_q1_reduce.cl DV=128 failed: {}. Flash Decoding KV-split disabled for DK=128.",
+                    e
+                );
+                None
+            }
+        };
+
         // GEMM kernels for prefill — tiled matmul (BM=64, BN=64, BK=16)
         let gemm_f16_src = include_str!("../../../kernels/mul_mm_f16_f32_l4_lm.cl");
         let gemm_f16_program = match Program::builder()
@@ -798,6 +879,18 @@ impl OpenCLBackend {
             kernel_flash_attn_f32_f16_q1_dk128: flash_attn_f32_f16_program_dk128
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1").ok()),
+            kernel_flash_attn_f32_f16_q1_split_dk64: flash_attn_f32_f16_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_split").ok()),
+            kernel_flash_attn_f32_f16_q1_split_dk128: flash_attn_f32_f16_program_dk128
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16_q1_split").ok()),
+            kernel_flash_attn_q1_reduce_dk64: flash_attn_q1_reduce_program_dk64
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_q1_reduce").ok()),
+            kernel_flash_attn_q1_reduce_dk128: flash_attn_q1_reduce_program_dk128
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_q1_reduce").ok()),
             kernel_mul_mm_f16_f32: gemm_f16_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mm_f16_f32_l4_lm").ok()),
@@ -898,6 +991,8 @@ impl OpenCLBackend {
             flash_attn_f32_program,
             flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128,
+            flash_attn_q1_reduce_program_dk64,
+            flash_attn_q1_reduce_program_dk128,
             f16_l4_program,
             gemm_f16_program,
             gemm_f32_program,
@@ -912,6 +1007,7 @@ impl OpenCLBackend {
             max_mem_alloc_size,
             gemv_noshuffle_cache: UnsafeCell::new(HashMap::new()),
             noshuffle_soa_registry: UnsafeCell::new(HashMap::new()),
+            flash_decode_scratch: UnsafeCell::new(None),
         })
     }
 
@@ -1901,6 +1997,11 @@ impl OpenCLBackend {
     /// HeadMajor KV layout, `seq_len=1`, and no score output.
     /// Returns Ok(true) if the kernel was dispatched; Ok(false) if preconditions
     /// are not met and the caller should fall back to the legacy attention kernel.
+    ///
+    /// Long-context (P0-5): when `cache_seq_len` is large the KV axis is split
+    /// across `get_global_id(2)` via `flash_attn_*_q1_split` + reducer; short
+    /// contexts keep the legacy single-kernel path (no partial/meta overhead).
+    /// See `compute_kv_splits`.
     #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_decode_gpu(
         &self,
@@ -1941,6 +2042,42 @@ impl OpenCLBackend {
             },
             _ => return Ok(false),
         };
+
+        // Decide whether to take the Flash Decoding split/reduce path. If the
+        // required split or reduce kernel is missing (e.g. driver failed to
+        // compile), silently fall back to the legacy single-kernel path so
+        // short/long ctx behavior degrades gracefully.
+        let kv_splits = flash_decode_kv_splits(cache_seq_len);
+        let (split_kernel_opt, reduce_kernel_opt) = match head_dim {
+            64 => (
+                kernels.kernel_flash_attn_f32_f16_q1_split_dk64.as_ref(),
+                kernels.kernel_flash_attn_q1_reduce_dk64.as_ref(),
+            ),
+            128 => (
+                kernels.kernel_flash_attn_f32_f16_q1_split_dk128.as_ref(),
+                kernels.kernel_flash_attn_q1_reduce_dk128.as_ref(),
+            ),
+            _ => (None, None),
+        };
+        if kv_splits > 1
+            && let (Some(split_k), Some(reduce_k)) = (split_kernel_opt, reduce_kernel_opt)
+        {
+            return self.flash_attention_decode_split_gpu(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                cache_seq_len,
+                kv_capacity,
+                kv_splits,
+                split_k,
+                reduce_k,
+            );
+        }
+        // Fall through to legacy path when split/reduce kernels are unavailable or kv_splits == 1.
 
         let q_buf = get_cl_mem(q.buffer().as_ref())?;
         let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
@@ -2051,6 +2188,253 @@ impl OpenCLBackend {
 
         Ok(true)
     }
+
+    /// Flash Decoding (P0-5) split/reduce dispatch. See `flash_attention_decode_gpu`.
+    ///
+    /// The split kernel emits unnormalized partials + (m, l) meta into F32
+    /// scratch buffers; the reducer merges them via log-sum-exp and writes
+    /// the final F32 output. Called only when `kv_splits > 1`.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention_decode_split_gpu(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        kv_capacity: usize,
+        kv_splits: usize,
+        split_kernel: &CoreKernel,
+        reduce_kernel: &CoreKernel,
+    ) -> Result<bool> {
+        let q_buf = get_cl_mem(q.buffer().as_ref())?;
+        let k_buf = get_cl_mem(k_cache.buffer().as_ref())?;
+        let v_buf = get_cl_mem(v_cache.buffer().as_ref())?;
+        let o_buf = get_cl_mem(out.buffer().as_ref())?;
+
+        // Ensure scratch buffers have enough capacity for this dispatch.
+        // partials: n_heads_q * head_dim * kv_splits floats.
+        // meta:     n_heads_q * kv_splits * 2 floats.
+        let partials_floats = n_heads_q
+            .checked_mul(head_dim)
+            .and_then(|v| v.checked_mul(kv_splits))
+            .ok_or_else(|| anyhow::anyhow!("flash decode partials size overflow"))?;
+        let meta_floats = n_heads_q
+            .checked_mul(kv_splits)
+            .and_then(|v| v.checked_mul(2))
+            .ok_or_else(|| anyhow::anyhow!("flash decode meta size overflow"))?;
+        self.ensure_flash_decode_scratch(partials_floats, meta_floats)?;
+        let (partials_mem, meta_mem) = {
+            // SAFETY: single-threaded access matches other UnsafeCell uses.
+            let scratch = unsafe { &*self.flash_decode_scratch.get() };
+            let s = scratch
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("flash decode scratch not initialized"))?;
+            (s.partials.clone(), s.meta.clone())
+        };
+
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        // Q strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
+        let q_nb1 = (n_heads_q * head_dim * 4) as u64;
+        let q_nb2 = (head_dim * 4) as u64;
+        let q_nb3 = q_nb1;
+
+        // KV strides — HeadMajor [1, n_heads_kv, capacity, head_dim], bytes
+        let kv_elem_size: u64 = 2; // F16
+        let k_nb1 = (head_dim as u64) * kv_elem_size;
+        let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
+        let k_nb3 = (n_heads_kv as u64) * k_nb2;
+        let (v_nb1, v_nb2, v_nb3) = (k_nb1, k_nb2, k_nb3);
+
+        // Output strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
+        let o_nb1 = (head_dim * 4) as u64; // head stride
+        let _o_nb2 = (n_heads_q * head_dim * 4) as u64;
+
+        let n_q = 1i32;
+        let n_kv_i32 = cache_seq_len as i32;
+        let is_causal = 0i32;
+        let n_head_i32 = n_heads_q as i32;
+        let n_head_kv_i32 = n_heads_kv as i32;
+        let max_bias = 0.0f32;
+        let m0 = 0.0f32;
+        let m1 = 0.0f32;
+        let n_head_log2 = 0i32;
+        let logit_softcap = 0.0f32;
+        let zero_u64 = 0u64;
+        let zero_i32 = 0i32;
+        let kv_splits_i32 = kv_splits as i32;
+
+        unsafe {
+            // --- Split kernel args (35 total) ---
+            // Q, K, V buffers + offsets (args 0-5)
+            ocl::core::set_kernel_arg(split_kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(split_kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(split_kernel, 2, ocl::core::ArgVal::mem(k_buf))?;
+            ocl::core::set_kernel_arg(split_kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(split_kernel, 4, ocl::core::ArgVal::mem(v_buf))?;
+            ocl::core::set_kernel_arg(split_kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+            // Scalars (args 6-10)
+            ocl::core::set_kernel_arg(split_kernel, 6, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(split_kernel, 7, ocl::core::ArgVal::scalar(&n_q))?;
+            ocl::core::set_kernel_arg(split_kernel, 8, ocl::core::ArgVal::scalar(&n_kv_i32))?;
+            ocl::core::set_kernel_arg(split_kernel, 9, ocl::core::ArgVal::scalar(&is_causal))?;
+            ocl::core::set_kernel_arg(split_kernel, 10, ocl::core::ArgVal::scalar(&n_head_i32))?;
+            // Q strides (args 11-13)
+            ocl::core::set_kernel_arg(split_kernel, 11, ocl::core::ArgVal::scalar(&q_nb1))?;
+            ocl::core::set_kernel_arg(split_kernel, 12, ocl::core::ArgVal::scalar(&q_nb2))?;
+            ocl::core::set_kernel_arg(split_kernel, 13, ocl::core::ArgVal::scalar(&q_nb3))?;
+            // K strides (args 14-16)
+            ocl::core::set_kernel_arg(split_kernel, 14, ocl::core::ArgVal::scalar(&k_nb1))?;
+            ocl::core::set_kernel_arg(split_kernel, 15, ocl::core::ArgVal::scalar(&k_nb2))?;
+            ocl::core::set_kernel_arg(split_kernel, 16, ocl::core::ArgVal::scalar(&k_nb3))?;
+            // V strides (args 17-19)
+            ocl::core::set_kernel_arg(split_kernel, 17, ocl::core::ArgVal::scalar(&v_nb1))?;
+            ocl::core::set_kernel_arg(split_kernel, 18, ocl::core::ArgVal::scalar(&v_nb2))?;
+            ocl::core::set_kernel_arg(split_kernel, 19, ocl::core::ArgVal::scalar(&v_nb3))?;
+            // ALiBi params — unused (args 20-24)
+            ocl::core::set_kernel_arg(split_kernel, 20, ocl::core::ArgVal::scalar(&max_bias))?;
+            ocl::core::set_kernel_arg(split_kernel, 21, ocl::core::ArgVal::scalar(&m0))?;
+            ocl::core::set_kernel_arg(split_kernel, 22, ocl::core::ArgVal::scalar(&m1))?;
+            ocl::core::set_kernel_arg(split_kernel, 23, ocl::core::ArgVal::scalar(&n_head_log2))?;
+            ocl::core::set_kernel_arg(split_kernel, 24, ocl::core::ArgVal::scalar(&logit_softcap))?;
+            // n_head_kv (arg 25)
+            ocl::core::set_kernel_arg(split_kernel, 25, ocl::core::ArgVal::scalar(&n_head_kv_i32))?;
+            // mask = NULL (args 26-32)
+            ocl::core::set_kernel_arg(split_kernel, 26, ocl::core::ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(split_kernel, 27, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(split_kernel, 28, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(split_kernel, 29, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(split_kernel, 30, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(split_kernel, 31, ocl::core::ArgVal::scalar(&zero_i32))?;
+            ocl::core::set_kernel_arg(split_kernel, 32, ocl::core::ArgVal::scalar(&zero_i32))?;
+            // kv_splits + partials + meta (args 33-35)
+            ocl::core::set_kernel_arg(split_kernel, 33, ocl::core::ArgVal::scalar(&kv_splits_i32))?;
+            ocl::core::set_kernel_arg(split_kernel, 34, ocl::core::ArgVal::mem(&partials_mem))?;
+            ocl::core::set_kernel_arg(split_kernel, 35, ocl::core::ArgVal::mem(&meta_mem))?;
+
+            // Launch split: global = [Q1_WG_SIZE, n_heads_q, kv_splits],
+            // local = [Q1_WG_SIZE, 1, 1].
+            const Q1_WG_SIZE: usize = 64;
+            let gws_split: [usize; 3] = [Q1_WG_SIZE, n_heads_q, kv_splits];
+            let lws_split: [usize; 3] = [Q1_WG_SIZE, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                split_kernel,
+                3,
+                None,
+                &gws_split,
+                Some(lws_split),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+
+            // --- Reduce kernel args (8 total) ---
+            // partials, meta, sinks=NULL, dst
+            let dst_head_stride = o_nb1;
+            ocl::core::set_kernel_arg(reduce_kernel, 0, ocl::core::ArgVal::mem(&partials_mem))?;
+            ocl::core::set_kernel_arg(reduce_kernel, 1, ocl::core::ArgVal::mem(&meta_mem))?;
+            ocl::core::set_kernel_arg(reduce_kernel, 2, ocl::core::ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(reduce_kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(reduce_kernel, 4, ocl::core::ArgVal::mem(o_buf))?;
+            ocl::core::set_kernel_arg(reduce_kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(reduce_kernel, 6, ocl::core::ArgVal::scalar(&kv_splits_i32))?;
+            ocl::core::set_kernel_arg(reduce_kernel, 7, ocl::core::ArgVal::scalar(&n_head_i32))?;
+            ocl::core::set_kernel_arg(
+                reduce_kernel,
+                8,
+                ocl::core::ArgVal::scalar(&dst_head_stride),
+            )?;
+
+            // Launch reduce: one work group per head, DV lanes per work group.
+            let gws_reduce: [usize; 3] = [head_dim, n_heads_q, 1];
+            let lws_reduce: [usize; 3] = [head_dim, 1, 1];
+            ocl::core::enqueue_kernel(
+                &self.queue,
+                reduce_kernel,
+                2,
+                None,
+                &gws_reduce,
+                Some(lws_reduce),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        Ok(true)
+    }
+
+    /// Grow `flash_decode_scratch` in-place to satisfy the requested element
+    /// counts. Allocates new device buffers only on first call or when the
+    /// current capacity is insufficient.
+    fn ensure_flash_decode_scratch(
+        &self,
+        partials_floats: usize,
+        meta_floats: usize,
+    ) -> Result<()> {
+        // SAFETY: single-threaded UnsafeCell access, matches kernels cache.
+        let slot = unsafe { &mut *self.flash_decode_scratch.get() };
+
+        if let Some(s) = slot.as_ref()
+            && s.partials_cap_f32 >= partials_floats
+            && s.meta_cap_f32 >= meta_floats
+        {
+            return Ok(());
+        }
+
+        let partials_bytes = partials_floats * std::mem::size_of::<f32>();
+        let meta_bytes = meta_floats * std::mem::size_of::<f32>();
+
+        let partials = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                partials_floats.max(1),
+                None,
+            )?
+        };
+        let meta = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                meta_floats.max(1),
+                None,
+            )?
+        };
+
+        log::debug!(
+            "flash_decode_scratch allocated: partials={} bytes, meta={} bytes",
+            partials_bytes,
+            meta_bytes,
+        );
+
+        *slot = Some(FlashDecodeScratch {
+            partials,
+            meta,
+            partials_cap_f32: partials_floats,
+            meta_cap_f32: meta_floats,
+        });
+        Ok(())
+    }
+}
+
+/// Compute the number of KV-axis splits for Flash Decoding.
+///
+/// Heuristic (research doc §G.1, Metal-style):
+///   n_kv < 512              → 1 (no split, use legacy single-kernel path)
+///   else                    → next_pow2(min(32, max(1, n_kv / 1024)))
+///
+/// Output is always a power of two in [1, 32]. 1 means "no split".
+#[inline]
+pub fn flash_decode_kv_splits(n_kv: usize) -> usize {
+    if n_kv < 512 {
+        return 1;
+    }
+    let s = (n_kv / 1024).clamp(1, 32);
+    s.next_power_of_two().min(32)
 }
 
 impl Backend for OpenCLBackend {
