@@ -461,9 +461,11 @@ adb shell "cd /data/local/tmp && ./generate \
 
 ### 10.1.5 GPU Prefill 실제 동작 분석 (CPU Fallback 삼중 병목) — 2026-04-13 추가
 
-**핵심 발견**: `-b opencl` 지정 시에도 prefill이 내부 조건 실패로 CPU fallback 경로로 재진입. 결과적으로 "GPU Q4 prefill 32.7ms vs CPU Q4 36.0ms"가 유사했던 이유는 **둘 다 실제로는 CPU에서 실행**되고 있었기 때문. 10.1의 원인 A/B/C는 유효하나, GPU 경로 자체가 dispatch 되지 않는 **선행 차단 문제**가 있음을 확인.
+> **⚠️ 2026-04-13 17:00 정정 (부분 철회)**: 아래 원인 **D1 (Q4_0 prefill 커널 미지원)** 분석은 실제 벤치마크 설정(**Weights=Q4_0, KV=F16**)과 맞지 않음. `flash_attention_prefill_gpu`의 `DType::Q4_0 ⇒ Ok(false)` 분기는 **KV dtype 기준**이므로 KV=F16 구성에서는 발동하지 않음. Attention은 GPU F16 커널(`flash_attn_f32_f16_q1` 등)로 정상 실행 중. 따라서 **원인 D1/D3 (풀 카피 fallback)은 현재 벤치마크에서는 발생하지 않음**. 원인 **D2 (F16 prefill 커널 head_dim=64 하드코딩)**만 유효하며 Qwen2.5 1.5B (head_dim=128)에서 여전히 CPU fallback 유발. **현재 주요 진단은 하단 [10.1.6](#101-6-gpu-decode-attention의-구조적-결함--kv-split-부재) 으로 이동**했음. P0-4 (Q4_0 KV prefill 커널)는 현재 기본 벤치 구성과 무관하므로 priority 강등 (아래 P0-4 항목 주석 참조).
 
-**원인 D1 — Q4_0 KV cache: Prefill GPU 커널 미존재**
+**핵심 발견** (정정 후): `-b opencl` 지정 시 prefill attention은 GPU F16 커널로 실행되나, **head_dim=128 (Qwen 계열) 조건에서는 여전히 CPU fallback**. 10.1의 원인 A/B/C는 유효하나, 기존 세션에서 해석했던 "GPU = CPU fallback" 프레임은 과도하게 일반화된 것임. 실제로는 head_dim=64 모델에서는 GPU 경로가 작동. 본질적 long-context 성능 갭의 주원인은 10.1.6의 decode attention KV-split 부재.
+
+**원인 D1 — Q4_0 KV cache: Prefill GPU 커널 미존재** ⚠️ **10.1.6 참조로 대체 — 현재 기본 벤치 구성(Weights=Q4_0, KV=F16)과 무관**
 - 위치: `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu`
 - 코드 구조:
   ```rust
@@ -473,8 +475,9 @@ adb shell "cd /data/local/tmp && ./generate \
       _ => return Ok(false), // Q4_0 not supported
   };
   ```
-- 영향: Q4_0 KV (현재 기본 실전 구성)일 때 GPU backend 요청이 무조건 `Ok(false)` → 상위 레이어 CPU fallback.
-- 근본 해법: flash_attn prefill 커널의 Q4_0 지원 (on-the-fly dequant 전략).
+- **정정 (2026-04-13 17:00)**: 이 분기는 **KV dtype 기준**이며, 현재 기본 벤치 설정 (`--kv-type f16`)에서는 발동하지 않음. Weights가 Q4_0이더라도 KV가 F16이면 F16 커널 경로로 진입. 이 원인은 `--kv-type q4_0` 등 KV=Q4_0 구성을 쓰는 다른 사용 사례에만 해당.
+- ~~영향: Q4_0 KV (현재 기본 실전 구성)일 때 GPU backend 요청이 무조건 `Ok(false)` → 상위 레이어 CPU fallback.~~ (잘못된 전제 — 기본 구성은 KV=F16)
+- 근본 해법 (KV=Q4_0 구성 한정): flash_attn prefill 커널의 Q4_0 지원 (on-the-fly dequant 전략) — **P0-4 참조, 우선순위 강등됨**.
 
 **원인 D2 — F16 Prefill 커널 head_dim=64 하드코딩 (Qwen 계열 차단)**
 - 위치: `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu` (F16 분기)
@@ -487,13 +490,14 @@ adb shell "cd /data/local/tmp && ./generate \
 - Step 2 (최근 커밋)에서 **decode** 경로에는 `head_dim=128` 커널을 추가했으나, **prefill** 경로는 미적용.
 - 영향: Qwen2.5 1.5B (head_dim=128)는 F16 KV cache 구성에서도 prefill GPU 경로 불가 → CPU fallback.
 
-**원인 D3 — Fallback 경로의 삼중 병목**
+**원인 D3 — Fallback 경로의 삼중 병목** ⚠️ **현재 벤치 구성(KV=F16, Qwen head_dim=128)에서는 원인 D2로 인한 fallback 시에만 발생 — 10.1.6 참조**
 - 위치: `engine/src/layers/transformer_layer/forward.rs` `!gpu_dispatched` 분기 (prefill path around L174-229, variant L694-752)
 - 단계별 비용:
   1. **VRAM → RAM 전량 카피**: K/V 텐서가 device-only일 때 `is_device_only` 분기로 수십~수백 MB를 CPU 메모리로 다운로드
   2. **F32 강제 변환**: Q4_0 → `read_to_f32` 또는 F16 → `bulk_f16_to_f32`로 전부 F32 확장 (O(N))
   3. **스칼라 CPU 연산**: 최적화되지 않은 CPU 경로로 실제 attention 계산 수행
-- 이것이 10.1 원인 A("F16→F32 bulk 변환")를 더 심각하게 만드는 실제 호출 컨텍스트.
+- **정정**: 이 경로는 원인 D2 (head_dim=128) 때문에 Qwen prefill에서만 발동. Llama 3.2 1B (head_dim=64) 기본 벤치에서는 GPU F16 커널로 dispatch 성공 → D3 발생 안 함.
+- 이것이 10.1 원인 A("F16→F32 bulk 변환")를 더 심각하게 만드는 실제 호출 컨텍스트 (D2 fallback 시).
 
 **영향 평가**
 - 문서/측정 상 "GPU prefill"로 기록된 수치 일부는 실제 CPU 실행 결과 → **재측정 필요**.
@@ -509,10 +513,54 @@ adb shell "cd /data/local/tmp && ./generate \
 
 ---
 
+### 10.1.6 GPU Decode Attention의 구조적 결함: KV-Split 부재 — 2026-04-13 추가 (현재 최우선 진단)
+
+#### 핵심 발견
+- **짧은 컨텍스트(128 토큰)**: llm_rs GPU가 llama.cpp 대비 **빠름** — Adreno-특화 Q4_0 weight matmul 커널(`mul_mv_q4_0_f32.cl`)의 서브그룹/텍스처 최적화 덕분. 이때 시간 99%는 weight matmul, attention 비중 무시 가능.
+- **긴 컨텍스트(4K+)**: llm_rs GPU가 llama.cpp 대비 **반토막** (Qwen2.5 1.5B 기준 7.4 vs 14.9 tok/s) — weight matmul 시간은 고정이지만 attention 시간이 폭증.
+- Attention 시간 폭증의 원인은 **VRAM 대역폭 포화**이며, 그 원인은 **decode attention 커널의 head-parallel only 디스패치** (KV-split 부재).
+
+#### 코드 증거
+`engine/src/backend/opencl/mod.rs` 약 2038 줄 부근 `flash_attention_decode_gpu` 디스패치:
+```rust
+// Q1_WG_SIZE = 64 (compile-time constant in the kernel)
+const Q1_WG_SIZE: usize = 64;
+
+// Global = [Q1_WG_SIZE, n_heads_q * batch (= n_heads_q for decode batch=1), 1]
+// Each WG handles one (batch, head) pair.
+let global_work_size: [usize; 3] = [Q1_WG_SIZE, n_heads_q, 1];
+let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
+```
+
+- 병렬화 축이 **Q-head 단일 축**이며 **KV 시퀀스 축 분할 없음** (Flash Decoding / KV-split 미구현).
+- 워크그룹 간에는 local memory 공유 불가 → GQA 공유가 "논리적"으로만 존재하고 VRAM 레벨에서는 보장되지 않음.
+
+#### 구조적 결함 — GQA 중복 VRAM 읽기
+- Qwen2.5 1.5B: n_heads_q=12, n_heads_kv=2 → **6개 Q-head가 1개 KV-head 공유**.
+- Llama 3.2 1B: n_heads_q=32, n_heads_kv=8 → **4개 Q-head가 1개 KV-head 공유**.
+- 현재 구조에서 각 Q-head가 별도 워크그룹 → **같은 KV를 각자 따로 VRAM에서 로드**.
+
+#### 트래픽 계산 (Qwen 4K 예시)
+- KV-head 1개 (F16): 4096 tok × 128 dim × 2B = **1MB** (K만. V까지 2MB)
+- Q-head 12개가 각자 로드: 12 × 2MB = **24MB/layer/token**
+- 28 레이어: **672MB/token**  ↔ 이상적 공유 시: 2 KV-head × 2MB × 28 = **112MB/token** (6배 감소)
+- LPDDR5X ~77GB/s 환경에서 이는 대역폭 포화의 직접 원인
+
+#### 짧은 문맥에선 티 안 나는 이유
+- 128 토큰 구성: KV-head 1개 당 K+V ≈ 32KB (F16). 4~6배 중복 읽기해도 ~192KB 수준 → GPU L1/L2 캐시 hit → 문제 없음.
+- 4K 문맥: KV-head 당 2MB → L2 초과 → 매번 VRAM 페치 → 중복 요청이 실제 대역폭 비용으로 전환.
+
+#### 결론
+- 4K decode 성능 갭(**llm_rs GPU 7.4 tok/s vs llama.cpp 14.9 tok/s**)의 **주원인은 GPU attention 커널의 KV-split 부재**.
+- 이는 하드웨어 한계가 아닌 **커널 디스패치 설계 결함**. llama.cpp는 Flash Decoding (KV-split) 으로 해결.
+- Prefill 경로에서 발견된 P0-3 (head_dim=128) 문제와는 **다른 이슈**이며 병렬로 존재. 해법은 신규 **P0-5** (아래 10.2 참조).
+
+---
+
 ### 10.2 TODO 항목
 
 #### [P0-1] Q4_0 vec_dot horizontal sum 최적화 (vpaddlq + vpadal 체인) + i8mm hot path
-- **Status**: IN_PROGRESS (범위 확장 중 — 2026-04-13 재작업)
+- **Status**: PARTIAL DONE (2026-04-13, 커밋 c794292 + 9abd8e0; decode 11.2 → 12.0 tok/s, +7.1%; 목표 14+ tok/s 미달; 잔여 갭은 **P0-5 (GPU KV-split 부재)** 기인 가능성 높음 — CPU-only 구성이 아닌 하이브리드 측정 시 재검증 필요)
 - **Sprint**: current
 - **담당**: senior-implementer
 - **Dependencies**: 없음 (독립 작업)
@@ -616,9 +664,35 @@ adb shell "cd /data/local/tmp && ./generate \
 
 ---
 
-#### [P0-4] OpenCL flash_attn prefill 커널 Q4_0 KV 지원
+#### [P0-5] GPU flash_attention_decode KV-split (Flash Decoding) 구현 — 🔥 **NEW 최우선 GPU 트랙** (2026-04-13)
 - **Status**: TODO
-- **Sprint**: current (researcher 선조사 → senior-implementer)
+- **Sprint**: current
+- **담당**: researcher 선조사 (짧음, 1일) → senior-implementer 구현 (2~4일)
+- **Dependencies**: 없음 (P0-3/P0-4와 독립, GPU kernel 계열 중 **가장 ROI 높음**)
+- **예상 작업량**: 3~5일
+- **코드 위치**:
+  - `engine/src/backend/opencl/mod.rs::flash_attention_decode_gpu` 디스패치 (약 2038줄 부근 `global_work_size` 정의)
+  - `engine/kernels/flash_attn_f32_f16_q1*.cl` (head-parallel 전용, KV-split 브랜치 추가 또는 별도 커널)
+  - (선택) llama.cpp Adreno용 flash decoding 커널 참조
+- **Description**:
+  - Global work size 를 `[Q1_WG_SIZE, n_heads_q, kv_splits]` 로 확장.
+  - 각 (head, kv_split) 워크그룹이 자기 chunk의 partial `(m_i, l_i, o_i)` 계산.
+  - 2nd pass (또는 동일 커널 2단계)에서 global max/log-sum-exp 로 merge.
+  - KV-split 수는 컨텍스트 길이에 따라 동적 결정 (예: `ceil(cache_seq_len / 1024)` 또는 GPU CU 수 기반). Short ctx에서는 `kv_splits=1` 로 회귀 방지.
+  - GQA-aware: 같은 KV-head 를 공유하는 Q-head 는 같은 KV-split 스케줄 내에서 local memory 로 공유 (가능한 경우).
+- **Acceptance Criteria**:
+  - [ ] Short context (128 tok) decode 회귀 없음 (`kv_splits=1` fallback 경로)
+  - [ ] 4K decode (Qwen2.5 1.5B, Adreno 830): 7.4 → **12+ tok/s** (llama.cpp 14.9의 80% 이상)
+  - [ ] Head-parallel vs KV-split 자동 전환 임계값 튜닝 결과 TODO 노트에 기록
+  - [ ] 정확도: logits cos-sim ≥ 0.999 vs 기존 커널
+  - [ ] `.cl` 커널 수정 허용 (`feedback_cl_modification.md` 근거)
+- **Notes**: 이번 세션에서 발견된 **최우선 GPU 성능 이슈**. 10.1.6 의 VRAM thrashing 분석이 직접 근거. Flash Decoding(Tri Dao 2023) 패턴. `.cl` 커널 수정 허용. P0-1 rework 잔여 갭(decode 12.0 → 목표 14+ tok/s)도 이 항목 완료로 회복 가능성 있음 (CPU 구성에서도 GPU KV-split이 weight matmul 대역폭 경쟁을 줄임). researcher 선조사: llama.cpp Adreno flash decoding 커널 구조 + Tri Dao 2023 Flash Decoding 알고리즘 검토.
+
+---
+
+#### [P0-4] ~~OpenCL flash_attn prefill 커널 Q4_0 KV 지원~~ → **P2 강등 (future)** — 현재 기본 벤치 구성(KV=F16)과 무관
+- **Status**: DEFERRED (2026-04-13 priority 강등; 기본 벤치는 `--kv-type f16`, 이 항목은 `--kv-type q4_0` 등 KV=Q4_0 구성을 쓰는 다른 사용 사례에만 필요)
+- **Sprint**: backlog (future — KV=Q4_0 구성이 실전에서 요구될 때 재활성화)
 - **담당**: researcher (선조사) → senior-implementer (구현)
 - **Dependencies**: P0-3 완료 권장 (커널 매크로화 경험 선행)
 - **예상 작업량**: researcher 1 ~ 2일 + senior-implementer 3 ~ 5일
@@ -644,12 +718,12 @@ adb shell "cd /data/local/tmp && ./generate \
   - [ ] 수치 정확도: F16 KV baseline 대비 logit cos-sim ≥ 0.995 (Q4_0 quantization loss 고려)
   - [ ] VRAM 사용량이 F16 KV 대비 +50% 이내 (shadow buffer 전략 시 제약)
   - [ ] CPU Q4_0 prefill fallback 경로는 유지 (비-OpenCL 빌드/호스트 GPU 호환)
-- **Notes**: Phase 2의 가장 큰 미해결 영역 — Q4_0은 실전 기본 구성인데 GPU prefill 자체가 없음. Researcher 선조사 결과에 따라 작업 범위 / acceptance 수치 재조정. 전략 (b) 선택 시 P1-1 (chunk sizing)의 메모리 계산식도 함께 갱신 필요.
+- **Notes**: **2026-04-13 17:00 priority 강등** — 10.1.5 정정으로 "Q4_0은 실전 기본 구성" 주장이 **오판**임이 확인됨. 기본 벤치 구성은 Weights=Q4_0 + **KV=F16**이며, `flash_attention_prefill_gpu` Q4_0 분기는 **KV dtype 기준**이므로 현재 벤치에서는 발동하지 않음. 이 항목은 미래에 `--kv-type q4_0` (KV 자체를 Q4_0으로 저장) 구성을 쓰는 사용 사례가 생길 때 재활성화. Researcher 선조사 결과에 따라 작업 범위 / acceptance 수치 재조정. 전략 (b) 선택 시 P1-1 (chunk sizing)의 메모리 계산식도 함께 갱신 필요.
 
 ---
 
 #### [P1-1] GPU prefill chunk auto-sizing fix
-- **Status**: TODO
+- **Status**: DONE (2026-04-13, 커밋 15f99e0)
 - **Sprint**: current
 - **담당**: implementer (sonnet)
 - **Dependencies**: 없음
@@ -677,7 +751,7 @@ adb shell "cd /data/local/tmp && ./generate \
 ---
 
 #### [P1-2] Prefill OpProfiler 확장 + GPU fallback 감지 로그 (중요도 상승)
-- **Status**: TODO
+- **Status**: DONE (2026-04-13, 커밋 f0091cc)
 - **Sprint**: current
 - **담당**: implementer (sonnet)
 - **Dependencies**: 없음 (P0-2와 병행 가능)
@@ -724,46 +798,48 @@ adb shell "cd /data/local/tmp && ./generate \
 
 ---
 
-### 10.3 권장 실행 순서 (2026-04-13 재정렬)
+### 10.3 권장 실행 순서 (2026-04-13 17:00 재재정렬 — 10.1.6 발견 반영)
 
-10.1.5 발견으로 GPU 실행 경로 자체가 Q4_0 / head_dim=128 케이스에서 dispatch되지 않는 문제가 드러남. 따라서 **GPU 커널 확장 트랙(A')**을 CPU 성능 트랙(A)과 병렬로 추가.
+**핵심 업데이트**: 10.1.6 발견으로 **GPU decode attention의 KV-split 부재 (P0-5)**가 long-context 성능 갭의 최대 원인으로 확인됨. 또한 10.1.5 원인 D1 (Q4_0 prefill 커널) 분석은 오진으로 정정되어 P0-4는 강등. 따라서 GPU 트랙의 중심이 prefill(P0-3/P0-4)에서 **decode(P0-5)로 이동**.
 
 **병렬 트랙 A (CPU 성능 / fallback 완화)**:
-1. P0-1 rework — Q4_0 horizontal sum + i8mm 핫 경로 확대 (senior-implementer, ~1일)
-2. P0-2 F16 직접 경로 prefill (senior-implementer, 1~2일) — P0-1 완료 후 착수 권장
+1. ~~P0-1 rework~~ **PARTIAL DONE (커밋 c794292+9abd8e0; 11.2 → 12.0 tok/s, +7.1%)** — 목표 14+ 미달분은 P0-5 기인 가능성
+2. P0-2 F16 직접 경로 prefill (senior-implementer, 1~2일)
 
-**병렬 트랙 A' (GPU 커널 확장 — 본질적 해결)**:
-1. P0-3 head_dim=128 prefill 커널 (senior-implementer, 1~2일) — Step 2 decode 패턴 재사용
-2. P0-4 Q4_0 prefill 커널 (researcher 선조사 1~2일 → senior-implementer 3~5일) — P0-3 완료 후 착수 권장 (커널 매크로화 경험 계승)
+**병렬 트랙 A' (GPU 커널 확장 — 본질적 해결, 최우선)**:
+1. 🔥 **P0-5 decode KV-split (Flash Decoding)** (researcher 1일 → senior-implementer 2~4일) — **최우선, GPU 계열 ROI 최고**
+2. P0-3 head_dim=128 prefill 커널 (senior-implementer, 1~2일) — Step 2 decode 패턴 재사용
+3. ~~P0-4 Q4_0 prefill 커널~~ **DEFERRED (P2/future)** — 현재 벤치 구성(KV=F16)과 무관
 
-**병렬 트랙 B (GPU 재개 + 가시성 — A'의 전제)**:
-1. P1-2 Prefill OpProfiler 확장 + **fallback 감지 로그** (implementer, 0.5~1일) — **A' 착수 전 완료 권장**
-2. P1-1 GPU chunk auto-sizing (implementer, 0.5일)
+**병렬 트랙 B (GPU 재개 + 가시성)** — **완료**:
+1. ~~P1-1 GPU chunk auto-sizing~~ **DONE (커밋 15f99e0)**
+2. ~~P1-2 Prefill OpProfiler 확장 + fallback 감지 로그~~ **DONE (커밋 f0091cc)**
 
-**직렬 트랙 C (GPU 최종 최적화)** — A' + B 완료 후:
-1. P2-1 Phase A: Researcher 선조사 (2일) — A' 완료 상태에서 remaining gap 분석
+**직렬 트랙 C (GPU 최종 최적화)** — A' 완료 후:
+1. P2-1 Phase A: Researcher 선조사 (2일) — P0-3/P0-5 완료 상태에서 remaining gap 분석
 2. P2-1 Phase B: senior-implementer 구현 (3~5일)
 
-**마일스톤 재정의**:
-- **M1 (week 1)**: P0-1 rework + P1-1 + P1-2 완료 → decode 11.4→14+ tok/s (i8mm 경로 실측), GPU prefill fallback 가시화, chunk sizing 정상화
-- **M2 (week 2)**: P0-3 + P0-2 완료 → F16 KV head_dim=128 (Qwen)에서 GPU prefill 실제 dispatch, CPU fallback 최적화 동시 달성 — CPU prefill 37.7→60+ tok/s
-- **M3 (week 2~3)**: P0-4 완료 → Q4_0 KV GPU prefill 가능 (실전 기본 구성 커버)
-- **M4 (week 3~4)**: P2-1 완료 → flash attention이 실제 GPU 실행되는 조건에서 matmul 병목 개선, GPU 4K prefill 목표 달성
+**마일스톤 재정의 (2026-04-13 17:00)**:
+- **M1 (완료)**: P0-1 rework + P1-1 + P1-2 완료 → decode 11.2 → **12.0 tok/s** (Qwen CPU 4K, +7.1%, 목표 14+ 일부 달성), GPU prefill fallback 가시화, chunk auto-sizing 정상화.
+- **M2 (현재)**: **P0-5 완료 → GPU 4K decode 7.4 → 12+ tok/s (Qwen), Llama 3.2 1B GPU 4K도 대응 비율 향상 예상**. 이번 마일스톤의 최우선 목표.
+- **M3**: P0-3 + P0-2 완료 → GPU prefill head_dim=128 실제 dispatch (Qwen), CPU prefill 37.7 → 60+ tok/s.
+- **M4**: P2-1 (Adreno F16 matmul 커널) — P0-3/P0-5 완료로 dispatch 확보된 상태에서 remaining gap 분석 후 필요 시 착수.
 
 ---
 
 ### 10.4 핵심 acceptance criteria 요약
 
-| ID | 핵심 지표 | 목표 |
-|---|---|---|
-| P0-1 | 4K decode (CPU 6T, **i8mm 경로 dispatch되는 실측 환경**) | 11.4 → 14+ tok/s |
-| P0-2 | 4K prefill (CPU) | 37.7 → 60+ tok/s, bulk F16→F32 제거 |
-| P0-3 | F16 KV, head_dim=128 prefill GPU dispatch | `Ok(false)` fallback 제거, CPU fallback 대비 개선 |
-| P0-4 | Q4_0 KV prefill GPU dispatch | `Ok(false)` fallback 제거, cos-sim ≥ 0.995 |
-| P1-1 | `--prefill-chunk-size 0` | 실패 → 정상 동작 |
-| P1-2 | Prefill per-op 프로파일 + fallback 로그 | 출력 가능, GPU→CPU fallback 경고 stderr |
-| P2-1 | 4K prefill (GPU, 실제 GPU dispatch 상태) | 39.2 → 200+ tok/s |
-| 공통 | 수치 정확도 | logit cos-sim ≥ 0.999 (test_backend, P0-4는 ≥ 0.995) |
+| ID | 핵심 지표 | 목표 | 현재 상태 |
+|---|---|---|---|
+| P0-1 | 4K decode (CPU 6T, **i8mm 경로 dispatch되는 실측 환경**) | 11.2 → 14+ tok/s | **PARTIAL DONE** (12.0 tok/s, +7.1%) |
+| P0-2 | 4K prefill (CPU) | 37.7 → 60+ tok/s, bulk F16→F32 제거 | TODO |
+| P0-3 | F16 KV, head_dim=128 prefill GPU dispatch | `Ok(false)` fallback 제거, CPU fallback 대비 개선 | TODO |
+| **P0-5** 🔥 | **4K decode (GPU, Qwen2.5 1.5B, Adreno 830)** | **7.4 → 12+ tok/s (llama.cpp 14.9의 80%+)** | **TODO — 최우선** |
+| ~~P0-4~~ | ~~Q4_0 KV prefill GPU dispatch~~ | ~~cos-sim ≥ 0.995~~ | **DEFERRED (future, P2)** |
+| P1-1 | `--prefill-chunk-size 0` | 실패 → 정상 동작 | **DONE (커밋 15f99e0)** |
+| P1-2 | Prefill per-op 프로파일 + fallback 로그 | 출력 가능, GPU→CPU fallback 경고 stderr | **DONE (커밋 f0091cc)** |
+| P2-1 | 4K prefill (GPU, 실제 GPU dispatch 상태) | 39.2 → 200+ tok/s | TODO (next) |
+| 공통 | 수치 정확도 | logit cos-sim ≥ 0.999 (test_backend) | — |
 
 ---
 
