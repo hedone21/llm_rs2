@@ -523,6 +523,11 @@ adb shell "cd /data/local/tmp && ./generate \
 > **2026-04-13 실측 검증 (revert 완료, 커밋 d0d4978)**: P0-5/P0-5b 디바이스 실측 결과, KV-split는 4K Adreno 830 구성에서 net regression (7.3 → 6.5 tok/s, -11%).
 > 원인: (1) 추가 kernel launch 오버헤드 (12 Q-head × 4 splits = 48 WG), (2) partials/meta buffer 추가 VRAM 트래픽, (3) 12 Q-head만으로 점유율 충분해 병렬성 이득 미미.
 > 결론: KV-split 단독으로는 4K decode 병목 해결 불가. 본질적 해결은 P0-5c (GQA-aware KV 공유 커널).
+>
+> **2026-04-13 추가 실측 검증 (P0-5c revert, 커밋 84c82d2)**: GQA-aware KV 공유 커널을 구현해 같은 KV-head를 공유하는 Q-head들을 단일 WG로 묶었으나, Qwen 2.5 1.5B (n_heads_kv=2) 에서 **WG=2 under-utilization**으로 오히려 net regression (7.3 → 2.6 tok/s, -65%).
+> 6× VRAM KV read 감소 효과 < Adreno 830의 다수 SP가 놀게 되는 idle 손실.
+> 본질적 해결은 **GQA + KV-split 결합** (`gws=[WG_SIZE, n_heads_kv, n_kv_splits]` 으로 Qwen 2×8=16, Llama 8×8=64 WG 확보). P0-5 (KV-split) + P0-5c (GQA reuse) 둘 다 부활 + 결합하는 별도 작업 필요 → **신규 P0-5d 참조**.
+> llama.cpp는 모든 백엔드에서 decode GQA reuse 미구현 — 우리도 동일 stance 유지.
 
 #### 핵심 발견
 - **짧은 컨텍스트(128 토큰)**: llm_rs GPU가 llama.cpp 대비 **빠름** — Adreno-특화 Q4_0 weight matmul 커널(`mul_mv_q4_0_f32.cl`)의 서브그룹/텍스처 최적화 덕분. 이때 시간 99%는 weight matmul, attention 비중 무시 가능.
@@ -561,7 +566,7 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 | 이상 (완전 공유) | ~4 MB | 1× |
 | Legacy 단일 커널 | 24 MB | 6× |
 | KV-split (P0-5) **(측정상 net negative, REVERTED)** | ~12 MB (이론치) | 3× (시퀀스 축 분할 + 페치 재사용 일부) |
-| GQA 공유 (P0-5c) | ~4 MB (이상치 근접) | 1× |
+| GQA 공유 (P0-5c) **(측정상 net negative on Qwen, REVERTED — WG=2 under-utilization)** | ~4 MB (이상치 근접) | 1× |
 
 → P0-5는 절반 수준의 개선에 불과. 본질 해결은 P0-5c 의 WG 그룹핑 + local memory KV 공유.
 - LPDDR5X ~77GB/s 환경에서 이는 대역폭 포화의 직접 원인
@@ -754,8 +759,8 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 
 ---
 
-#### [P0-5c] GQA-aware KV 공유 커널 (WG 그룹핑 + local memory 공유) — 🔥 **최우선 GPU 트랙** (2026-04-13 P0-5/P0-5b revert 후 승격)
-- **Status**: **TODO — 🔥 최우선 GPU 트랙** (P0-5/P0-5b revert로 단독 직진)
+#### [P0-5c] GQA-aware KV 공유 커널 (WG 그룹핑 + local memory 공유) — ⚠️ **REVERTED** (2026-04-13)
+- **Status**: **REVERTED (2026-04-13, 커밋 84c82d2)** — Qwen 4K 디바이스 실측에서 net regression (-65%) 확정. PLAN_DEBUG로 GQA kernel 정상 활성화 확인했으나, n_heads_kv=2 → WG=2 under-utilization 으로 6× VRAM 절감 < Adreno 830 SP idle 손실. 코드 보존 (커밋 5f59455). 결합 작업은 신규 P0-5d 로 이관.
 - **Sprint**: current
 - **담당**: researcher 선조사 (1일) → senior-implementer 구현 (3~5일)
 - **Dependencies**: 없음 (P0-5/P0-5b revert로 의존성 해소, 단독 직진)
@@ -782,6 +787,54 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
   - [ ] 정확도: logits cos-sim ≥ 0.999 vs 기존 커널
   - [ ] (선택) VRAM 트래픽 실측 (perfetto/snapdragon profiler 가능 시): 24MB → 4~6MB / layer / token 확인
 - **Notes**: P0-5/P0-5b 완료 후 잔여 4K GPU 격차 해소의 **본질 작업**. GQA local memory 공유로 VRAM 대역폭 6배 절감 기대. llama.cpp 의 `Q_PER_THREAD` 매크로 패턴이 가장 직접적 참조. 이 항목이 10.1.6 "GQA 중복 VRAM 읽기" 본질 결함의 최종 해법.
+- **2026-04-13 REVERT 결정 (커밋 84c82d2)**:
+  - **실측 (Adreno 830, Qwen 2.5 1.5B Q4_0, F16 KV, 4K n_kv=4472, plan ON, cooldown 240s, AP 31.4°C, Status 0)**:
+    - baseline (legacy q1, plan ON): 7.4 → 7.3 tok/s 재현
+    - **GQA kernel (P0-5c): 2.6 tok/s (-65%)**
+  - **PLAN_DEBUG 검증**: `[Plan] L0..L27 GQA flash attention dispatch (attn_seq_len=4473, gws=[64, 2, 1], lws=Some([64, 1, 1]))` — Plan path에서 StandardFlashGqa variant 정상 활성화. 단 `gws=[64, 2, 1]` = **WG 2개만** dispatch (Qwen n_heads_kv=2).
+  - **원인**:
+    1. Qwen n_heads_kv=2 → WG=2 → Adreno 830 (다수 SP) 심각한 under-utilization (Researcher 조사 §G.4 사전 경고 일치)
+    2. 6× VRAM KV read 절감 효과 < GPU SP idle 손실
+    3. `o_acc[8][32]` private register 압력 (spill 가능성) 추가 악화
+    4. llama.cpp도 decode GQA reuse 미구현 — 동일 stance 유지
+  - **Llama 3.2 1B (n_heads_kv=8, WG=8) 미측정**: 상대적으로 유리할 가능성, 그러나 현 시점 주력 벤치 모델이 Qwen이라 검증 불가.
+  - **코드 보존**: 커밋 5f59455 (P0-5c GQA 커널 + plan 통합 + 테스트 + research doc 일체).
+  - **재개 조건**:
+    - Qwen 전용 **GQA + KV-split 결합 커널** 도입 시 (`gws=[WG_SIZE, n_heads_kv, n_kv_splits]` 으로 16+ WG 확보) → **신규 P0-5d 참조**
+    - 또는 Llama 3.2 (n_heads_kv=8) 주력 벤치 도입 후 재측정 (WG=8로 실용성 있을 가능성)
+
+---
+
+#### [P0-5d] GQA + KV-split 결합 커널 — 🔶 **DEFERRED (후보, P0-3 완료 후 재평가)** (2026-04-13 신설)
+- **Status**: **DEFERRED** (P0-5/P0-5b/P0-5c 결합 재시도 필요 확인 후 활성화)
+- **Sprint**: backlog
+- **담당**: senior-implementer (P0-5/P0-5b/P0-5c 커밋 resurrect + 확장)
+- **Dependencies**: P0-3 완료 권장 (head_dim=128 매크로화 경험 + Qwen prefill GPU dispatch 확보 후 decode 트랙 재진입)
+- **예상 작업량**: 3~5일
+- **코드 위치** (resurrect 대상):
+  - 커밋 5f3dd1f — P0-5 KV-split 커널 (`flash_attn_f32_f16_q1_split.cl` 추정)
+  - 커밋 9a5a75e — KV-split dispatch 로그
+  - 커밋 f14ddb3 — Plan-path KV-split 통합 (P0-5b)
+  - 커밋 5f59455 — P0-5c GQA reuse 커널 + plan 통합 + 테스트 + research doc
+- **Description**:
+  - P0-5c revert 후 남은 방향. **GQA reuse + KV-split 두 축을 직교 결합**.
+  - Dispatch: `gws=[WG_SIZE, n_heads_kv, n_kv_splits]`
+    - Qwen 2.5 1.5B (n_heads_kv=2): 2×8 = **16 WG** (ctx 4K, kv_splits=8)
+    - Llama 3.2 1B/3B (n_heads_kv=8): 8×8 = **64 WG**
+  - Adreno 830 SP 점유율 충분 확보 → P0-5c의 WG=2 under-utilization 문제 + P0-5의 launch overhead 문제 동시 해소.
+  - 같은 KV-head를 공유하는 Q-head 그룹은 local memory KV 한 번 로드 (P0-5c 패턴) + 시퀀스 축은 split 으로 추가 병렬화 (P0-5 패턴) + 2nd pass reduce.
+  - **권장 검증 순서**: Llama 3.2 3B (n_heads_kv=8, head_dim=128) 벤치에서 먼저 검증 → Qwen 적용. WG 수가 큰 구성에서 먼저 안전 마진 확보.
+- **참조**:
+  - llama.cpp `ggml-cuda/fattn-vec-f16.cu` — `parallel_blocks` (KV-split) + `ncols` (Q-group) 동시 활용 패턴
+  - 우리 보존 커밋 5f3dd1f/f14ddb3/5f59455 의 코드 베이스
+  - 10.1.6 "2026-04-13 추가 실측 검증" 의 net negative 분석
+- **Acceptance Criteria**:
+  - [ ] 4K decode (Qwen 2.5 1.5B, Adreno 830, plan ON): 7.4 → **12+ tok/s** (llama.cpp 14.9의 80%+)
+  - [ ] VRAM 트래픽: 24 MB/layer/token → **6~8 MB** (3~4× 감소, GQA 부분 reuse + split 페치 재사용)
+  - [ ] Short ctx (128 tok) 회귀 없음
+  - [ ] 정확도: cos-sim ≥ 0.999 vs baseline
+  - [ ] (선택) Llama 3.2 3B 측정에서 동일 또는 더 큰 개선 확인 (WG=64 풀 점유)
+- **Notes**: P0-5c revert 보고에서 명시된 "재개 조건" 의 구체화. 단독 P0-5/P0-5c 모두 net negative 였으므로 결합만이 유의미. 현 sprint는 deferred — P0-3 완료로 Qwen prefill GPU 경로 확보 후, remaining gap 분석에서 decode attention 비중이 여전히 크면 활성화. **현재 우선순위는 P0-3 (prefill head_dim=128)**.
 
 ---
 
@@ -901,11 +954,12 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 1. ~~P0-1 rework~~ **PARTIAL DONE (커밋 c794292+9abd8e0; 11.2 → 12.0 tok/s, +7.1%)** — 목표 14+ 미달분은 P0-5 기인 가능성
 2. P0-2 F16 직접 경로 prefill (senior-implementer, 1~2일)
 
-**병렬 트랙 A' (GPU 커널 확장 — 본질적 해결, 최우선)** — 2026-04-13 19:20 재재정렬 (P0-5/P0-5b revert 후):
-1. 🔥 **P0-5c GQA-aware KV 공유 커널 (본질 해결)** — researcher 선조사 (1일) → senior-implementer (3~5일). **최상단, 단독 직진** (P0-5/P0-5b revert로 의존성 해소).
-2. **P0-3 head_dim=128 prefill 커널** (senior-implementer, 1~2일) — Step 2 decode 패턴 재사용, P0-5c와 병렬 가능
-3. ~~**P0-5 decode KV-split 커널/dispatch**~~ **REVERTED (커밋 d0d4978)** — 4K Adreno 830 net regression (-11%) 확정. 코드는 5f3dd1f/9a5a75e/f14ddb3 에 보존. 재개 조건: 8K+ 컨텍스트 벤치 도입 또는 소형 GPU 타겟 추가.
-4. ~~**P0-5b Plan-path KV-split 통합**~~ **REVERTED (커밋 d0d4978)** — Plan 통합 동작 확인했으나 P0-5 본체가 net negative라 함께 revert.
+**병렬 트랙 A' (GPU 커널 확장 — 본질적 해결, 최우선)** — 2026-04-13 20:00 재재재정렬 (P0-5c revert 후):
+1. 🔥 **P0-3 head_dim=128 prefill 커널** (senior-implementer, 1~2일) — **최우선 승격**. Qwen prefill GPU 활성화 → CPU fallback 탈출. Step 2 decode 패턴 재사용.
+2. ~~**P0-5c GQA-aware KV 공유 커널**~~ **REVERTED (커밋 84c82d2)** — Qwen 4K 측정에서 net regression (7.3 → 2.6 tok/s, -65%). PLAN_DEBUG로 GQA kernel 정상 활성화 확인했으나 n_heads_kv=2 → WG=2 under-utilization. 코드는 커밋 5f59455 에 보존. 결합 작업은 **P0-5d** 로 이관.
+3. ~~**P0-5 decode KV-split 커널/dispatch**~~ **REVERTED (커밋 d0d4978)** — 4K Adreno 830 net regression (-11%) 확정. 코드는 5f3dd1f/9a5a75e/f14ddb3 에 보존. **결합 작업은 P0-5d 로 이관**.
+4. ~~**P0-5b Plan-path KV-split 통합**~~ **REVERTED (커밋 d0d4978)** — Plan 통합 동작 확인했으나 P0-5 본체가 net negative라 함께 revert. **결합 작업은 P0-5d 로 이관**.
+5. 🔶 **P0-5d GQA + KV-split 결합 커널** — **DEFERRED (backlog)**. P0-3 완료 후 재평가. P0-5/P0-5b/P0-5c 커밋 resurrect + 결합 (`gws=[WG_SIZE, n_heads_kv, n_kv_splits]`). Qwen 2×8=16 WG, Llama 8×8=64 WG → SP 점유율 확보. 권장 검증 순서: Llama 3.2 3B 먼저 → Qwen.
 5. ~~P0-4 Q4_0 prefill 커널~~ **DEFERRED (P2/future)** — 현재 벤치 구성(KV=F16)과 무관
 
 **병렬 트랙 B (GPU 재개 + 가시성)** — **완료**:
@@ -916,13 +970,14 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 1. P2-1 Phase A: Researcher 선조사 (2일) — P0-3/P0-5 완료 상태에서 remaining gap 분석
 2. P2-1 Phase B: senior-implementer 구현 (3~5일)
 
-**마일스톤 재정의 (2026-04-13 19:20 — P0-5/P0-5b revert 반영)**:
+**마일스톤 재정의 (2026-04-13 20:00 — P0-5c revert 반영)**:
 - **M1 (완료)**: P0-1 rework + P1-1 + P1-2 완료 → decode 11.2 → **12.0 tok/s** (Qwen CPU 4K, +7.1%, 목표 14+ 일부 달성), GPU prefill fallback 가시화, chunk auto-sizing 정상화.
-- **M2 (현재, 재정의)**: **P0-5c 완료 → 4K decode 7.4 → 12+ tok/s (GQA 본질 해결, VRAM 트래픽 24→~4 MB/layer)**. 이번 마일스톤의 최우선 목표. P0-5/P0-5b revert로 단독 직진.
-- **M3 (재정의)**: **P0-3 + P0-2 완료 → Qwen prefill GPU 활성화 + CPU prefill F16 직접 경로**. Prefill 성능 격차 해소.
-- **M4 (기존 M4 유지)**: P0-2 완료 상태 M3 에 병합됨. (삭제 — M3 에 포함)
-- **M5**: P2-1 (Adreno F16 matmul 커널) — P0-3/P0-5c 완료로 dispatch 확보된 상태에서 remaining gap 분석 후 필요 시 착수.
+- **M2 (현재, 재정의)**: **P0-3 완료 → Qwen prefill GPU 활성화 (head_dim=128 dispatch, CPU fallback 탈출)**. 최우선 목표. P0-5c revert로 GPU 트랙의 본질 작업이 prefill 로 이동.
+- **M3 (재정의)**: **P0-2 완료 → CPU prefill F16 직접 경로 (Step 3 Stage 9)**. Prefill 성능 격차 해소.
+- **M4 (조건부, 재정의)**: **P0-5d (GQA + KV-split 결합) 활성화 후 완료** — 현재 Adreno 830 + Qwen 벤치 구성에서 유의미한 효과 확인되면. P0-3 완료 상태에서 remaining gap이 여전히 decode attention 이면 진입.
+- **M5**: P2-1 (Adreno F16 matmul 커널) — P0-3 완료로 prefill GPU dispatch 확보된 상태에서 remaining gap 분석 후 필요 시 착수.
 - ~~**이전 M2 (P0-5b)**~~ **제거** (revert로 전제 소멸)
+- ~~**이전 M2 (P0-5c 단독)**~~ **제거** (2026-04-13 revert로 전제 소멸 → P0-5d 결합 작업으로 이관)
 
 ---
 
@@ -932,10 +987,11 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 |---|---|---|---|
 | P0-1 | 4K decode (CPU 6T, **i8mm 경로 dispatch되는 실측 환경**) | 11.2 → 14+ tok/s | **PARTIAL DONE** (12.0 tok/s, +7.1%) |
 | P0-2 | 4K prefill (CPU) | 37.7 → 60+ tok/s, bulk F16→F32 제거 | TODO |
-| P0-3 | F16 KV, head_dim=128 prefill GPU dispatch | `Ok(false)` fallback 제거, CPU fallback 대비 개선 | TODO |
-| **P0-5c** 🔥 | **GQA-aware KV 공유 커널 (local memory 공유) — 본질 해결, 단독 직진** | **baseline 7.3 tok/s (measured 2026-04-13) → 12+ tok/s**, VRAM 트래픽 24→~4 MB/layer/token (6배 감소) | **TODO — 🔥 최우선 GPU 트랙** |
+| **P0-3** 🔥 | **F16 KV, head_dim=128 prefill GPU dispatch — 최우선 GPU 트랙 (P0-5c revert 후 승격)** | `Ok(false)` fallback 제거, Qwen prefill GPU 활성화, CPU fallback 대비 개선 | **TODO — 🔥 최우선** |
+| ~~P0-5c~~ | ~~GQA-aware KV 공유 커널 (local memory 공유)~~ | ~~baseline 7.3 → 12+ tok/s, VRAM 24→~4 MB/layer~~ | **REVERTED (커밋 84c82d2, 2026-04-13) — Qwen 4K: 7.3 → 2.6 (-65%); n_heads_kv=2 → WG=2 under-utilization on Adreno 830** |
 | ~~P0-5~~ | ~~4K decode KV-split 커널/dispatch~~ | ~~커널 컴파일 + dispatch + split active~~ | **REVERTED (커밋 d0d4978, 2026-04-13) — net regression -10~11% @ 4K Adreno 830** |
 | ~~P0-5b~~ | ~~Plan-path KV-split 통합~~ | ~~baseline 7.3 대비 회귀 없음~~ | **REVERTED (커밋 d0d4978, 2026-04-13) — plan+KV-split 6.5 tok/s (-11% vs 7.3 baseline)** |
+| 🔶 P0-5d | GQA + KV-split 결합 커널 (`gws=[WG_SIZE, n_heads_kv, n_kv_splits]`) | 4K decode 7.4 → 12+ tok/s, VRAM 24→6~8 MB/layer, Qwen 16WG / Llama 64WG | **DEFERRED (backlog, P0-3 완료 후 재평가)** |
 | ~~P0-4~~ | ~~Q4_0 KV prefill GPU dispatch~~ | ~~cos-sim ≥ 0.995~~ | **DEFERRED (future, P2)** |
 | P1-1 | `--prefill-chunk-size 0` | 실패 → 정상 동작 | **DONE (커밋 15f99e0)** |
 | P1-2 | Prefill per-op 프로파일 + fallback 로그 | 출력 가능, GPU→CPU fallback 경고 stderr | **DONE (커밋 f0091cc)** |
