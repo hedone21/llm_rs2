@@ -224,8 +224,202 @@ impl Backend for CpuBackendNeon {
     }
 }
 
+/// Size of one KV chunk (in tokens) used by the flash-decoding path.
+///
+/// Chosen so that one chunk of K+V in F16 occupies ~512 KB on Qwen2.5 1.5B
+/// (head_dim=128): `1024 * 128 * 2 bytes/elem * 2 (K+V) = 512 KiB`, which is
+/// ~25% of the Snapdragon 8 Elite Oryon L2 (2 MiB) and leaves room for other
+/// threads.  Must be a multiple of 4 to keep the inner 4-way unrolled loop
+/// aligned.  See `arch/cpu_flash_decoding.md` §4.1.
+const FLASH_DECODE_CHUNK_SIZE: usize = 1024;
+
+/// Minimum `cache_seq_len` at which the flash-decoding path activates.
+///
+/// Below this threshold the head-parallel Step 1 path is retained to avoid
+/// its amortization overhead (partial-state buffer alloc + LSE merge) on
+/// short contexts where GQA redundant reads are not the bottleneck.  Set
+/// equal to `CHUNK_SIZE` so the single-chunk case (`n_chunks = 1`) is still
+/// routed to flash decoding (merge is a trivial no-op).
+const FLASH_DECODE_THRESHOLD: usize = 1024;
+
+/// Per-(chunk, q-head) partial online-softmax state.
+///
+/// Aligned to a 64-byte cache line so neighbouring workers writing to
+/// adjacent `PartialState` entries never share a cache line (false-sharing
+/// prevention).  The flat `o_tilde` buffer (F32 `head_dim` lanes) is carried
+/// out-of-band in `FlashDecodeCtx::partial_o` because `head_dim` is only
+/// known at runtime; this struct tracks just the scalar `(m, l)` pair.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct PartialState {
+    /// Chunk-local max logit.
+    m: f32,
+    /// Chunk-local softmax denominator `Σ exp(s_t − m)`.
+    l: f32,
+}
+
+impl PartialState {
+    const EMPTY: PartialState = PartialState {
+        m: f32::NEG_INFINITY,
+        l: 0.0,
+    };
+}
+
+/// Flash-decoding dispatch context.  A single `FlashDecodeCtx` is shared
+/// across SpinPool workers; each worker derives its `(chunk_idx, kv_h)` from
+/// its task id and reads Q/K/V / writes its own slice of `partial_ml` and
+/// `partial_o`.
+///
+/// # Safety
+/// The raw pointers are required because `SpinPool::dispatch` takes a
+/// `*const u8` context; `Send + Sync` is sound because:
+/// * `q_ptr`, `k_ptr`, `v_ptr` point to read-only tensor slices that outlive
+///   `dispatch`.
+/// * `partial_ml_ptr` / `partial_o_ptr` point to mutable buffers whose
+///   entries are partitioned across workers by `(chunk_idx, q_h)` — no two
+///   workers touch the same element.
+struct FlashDecodeCtx {
+    q_ptr: *const f32,
+    k_ptr: *const u16,
+    v_ptr: *const u16,
+    partial_ml_ptr: *mut PartialState,
+    partial_o_ptr: *mut f32,
+    num_heads_q: usize,
+    num_heads_kv: usize,
+    gqa_ratio: usize,
+    head_dim: usize,
+    capacity: usize,
+    cache_seq_len: usize,
+    chunk_size: usize,
+    scale: f32,
+}
+
+// Safety: see struct docstring.  The raw pointer fields point to buffers
+// whose lifetime is bounded by the `dispatch` call, and ownership regions
+// are partitioned such that concurrent access is non-overlapping.
+unsafe impl Send for FlashDecodeCtx {}
+unsafe impl Sync for FlashDecodeCtx {}
+
+/// Compute `[t_start, t_end)` for `chunk_idx`-th chunk of a sequence of
+/// `cache_seq_len` tokens split at `chunk_size`-token granularity.
+#[inline]
+fn flash_chunk_range(chunk_idx: usize, cache_seq_len: usize, chunk_size: usize) -> (usize, usize) {
+    let start = chunk_idx * chunk_size;
+    let end = (start + chunk_size).min(cache_seq_len);
+    (start, end)
+}
+
+/// Uniform-V fallback: `out_h = (1/seq_len) · Σ_t V[kv_h, t]`.
+///
+/// Used by the flash-decoding merge when every chunk partial is
+/// `m_c = −∞` (all tokens for this Q-head were NaN) or the merged
+/// denominator is non-finite / non-positive.  Semantics mirror the
+/// head-parallel path's `fallback_uniform` branch.
+///
+/// # Safety
+/// `v_ptr` must reference an F16 KV tensor of shape
+/// `[_, _, capacity, head_dim]` with at least `cache_seq_len` valid
+/// positions for `kv_h`; `out_h` must hold `head_dim` writable F32 lanes.
+fn flash_uniform_fallback(
+    out_h: &mut [f32],
+    kv_h: usize,
+    head_dim: usize,
+    capacity: usize,
+    cache_seq_len: usize,
+    v_ptr: *const u16,
+) {
+    for x in out_h.iter_mut() {
+        *x = 0.0;
+    }
+    if cache_seq_len == 0 {
+        return;
+    }
+    let uniform = 1.0 / cache_seq_len as f32;
+    unsafe {
+        let o_ptr = out_h.as_mut_ptr();
+        let w_v = vdupq_n_f32(uniform);
+        for t in 0..cache_seq_len {
+            let vp = v_ptr.add((kv_h * capacity + t) * head_dim);
+            let mut i = 0;
+            while i + 8 <= head_dim {
+                let raw: uint16x8_t = vld1q_u16(vp.add(i));
+                let fl: float32x4_t;
+                let fh: float32x4_t;
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) fl, i = in(vreg) raw);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) fh, i = in(vreg) raw);
+                vst1q_f32(o_ptr.add(i), vfmaq_f32(vld1q_f32(o_ptr.add(i)), w_v, fl));
+                vst1q_f32(
+                    o_ptr.add(i + 4),
+                    vfmaq_f32(vld1q_f32(o_ptr.add(i + 4)), w_v, fh),
+                );
+                i += 8;
+            }
+            while i < head_dim {
+                *o_ptr.add(i) += uniform * half::f16::from_bits(*vp.add(i)).to_f32();
+                i += 1;
+            }
+        }
+    }
+}
+
 impl CpuBackendNeon {
-    /// NEON-optimized attention for F16 KV cache using single-pass online softmax.
+    /// NEON-optimized attention for F16 KV cache.
+    ///
+    /// Dispatches between two internal paths based on `cache_seq_len` and on
+    /// whether post-softmax scores are requested:
+    ///
+    /// * **Head-parallel path** (`attention_gen_f16_neon_head_parallel`): Step 1
+    ///   single-pass online softmax, one Q-head per rayon worker.  Optimal for
+    ///   short contexts where GQA redundant KV reads are not the bottleneck.
+    /// * **Flash-decoding path** (`attention_gen_f16_neon_flash`): Step 2
+    ///   KV-chunk + kv_h parallelism via SpinPool.  All Q-heads in a GQA group
+    ///   share the same K/V chunk load, reducing DRAM traffic by `gqa_ratio×`
+    ///   at long contexts.
+    ///
+    /// Routing (see `arch/cpu_flash_decoding.md` §4.2, §7.2):
+    /// * `cache_seq_len < FLASH_DECODE_THRESHOLD` → head-parallel.
+    /// * `scores_out.is_some()` → head-parallel (post-softmax weights are
+    ///   well-defined only with a global softmax, which the flash path does
+    ///   not materialize per-token).
+    /// * Otherwise → flash-decoding.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_f16_neon(
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+        scores_out: Option<&mut [f32]>,
+    ) -> Result<()> {
+        if cache_seq_len < FLASH_DECODE_THRESHOLD || scores_out.is_some() {
+            return Self::attention_gen_f16_neon_head_parallel(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+                scores_out,
+            );
+        }
+        Self::attention_gen_f16_neon_flash(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            num_heads_q,
+            num_heads_kv,
+            head_dim,
+            cache_seq_len,
+        )
+    }
+
+    /// Step 1 head-parallel online-softmax path.
     ///
     /// Optimizations over the generic common.rs F16 path:
     /// 1. Direct F16·F32 dot via `vec_dot_f16_f32_4rows` — eliminates intermediate F32 buffer
@@ -240,7 +434,7 @@ impl CpuBackendNeon {
     /// 3. Per-token NaN gate: NaN scores are treated as -inf (contribute 0) without
     ///    touching the running (m, l, o) state.
     #[allow(clippy::too_many_arguments)]
-    fn attention_gen_f16_neon(
+    fn attention_gen_f16_neon_head_parallel(
         q: &Tensor,
         k_cache: &Tensor,
         v_cache: &Tensor,
@@ -561,6 +755,428 @@ impl CpuBackendNeon {
             });
 
         Ok(())
+    }
+
+    /// Step 2 flash-decoding path: KV-chunk + kv_h parallelism via SpinPool.
+    ///
+    /// Two-phase algorithm (see `arch/cpu_flash_decoding.md` §2):
+    /// 1. **Per-chunk partial online softmax** (parallel): `n_chunks × num_heads_kv`
+    ///    tasks dispatched to the SpinPool.  Each task iterates over every
+    ///    Q-head in its GQA group (`gqa_ratio` heads) and for each Q-head
+    ///    records a chunk-local triple `(m_c, l_c, Õ_c)` in shared scratch
+    ///    buffers.  Because the inner loop reuses the same K/V chunk across
+    ///    all Q-heads in the group, DRAM traffic shrinks by `gqa_ratio×`.
+    /// 2. **LSE merge** (serial on main thread): for each Q-head combine the
+    ///    partials back into a global softmax output:
+    ///        M = max_c m_c,  L = Σ α_c · l_c,  O = Σ α_c · Õ_c,  out = O / L,
+    ///    where `α_c = exp(m_c − M)` and `Õ_c = l_c · o_c` is the un-normalised
+    ///    weighted-V accumulator the workers write out.  All-NaN chunks
+    ///    (`m_c = −∞`, `l_c = 0`) contribute zero to both sums; if every
+    ///    chunk is in that state the path falls back to a uniform-V average
+    ///    matching the head-parallel semantics.
+    ///
+    /// The flash path never writes post-softmax diagnostic scores (caller must
+    /// route `scores_out.is_some()` to `attention_gen_f16_neon_head_parallel`
+    /// — this is enforced in the dispatcher).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gen_f16_neon_flash(
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+    ) -> Result<()> {
+        debug_assert!(cache_seq_len >= FLASH_DECODE_THRESHOLD);
+        debug_assert!(num_heads_q.is_multiple_of(num_heads_kv));
+
+        let q_data = q.as_slice::<f32>();
+        let out_data = out.as_mut_slice::<f32>();
+        let k_data = k_cache.as_slice::<half::f16>();
+        let v_data = v_cache.as_slice::<half::f16>();
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = num_heads_q / num_heads_kv;
+
+        // KV layout: HeadMajor [batch=1, kv_heads, capacity, head_dim].  The
+        // flash path requires HeadMajor because chunk contiguity depends on
+        // `(kv_h, t, d)` → offset being row-major in `t`.  (SeqMajor would
+        // stride every chunk read by `num_heads_kv`, wiping out the DRAM
+        // savings.)  Fall back to the head-parallel path when HeadMajor is
+        // not detected.
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        if !is_head_major {
+            return Self::attention_gen_f16_neon_head_parallel(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                num_heads_q,
+                num_heads_kv,
+                head_dim,
+                cache_seq_len,
+                None,
+            );
+        }
+        let capacity = k_shape[2];
+
+        let chunk_size = FLASH_DECODE_CHUNK_SIZE;
+        let n_chunks = cache_seq_len.div_ceil(chunk_size);
+
+        // Scratch buffers.
+        //
+        // `partial_ml[chunk_idx * num_heads_q + q_h]` — scalar (m, l) pair
+        //   (cache-line aligned; see `PartialState`).
+        // `partial_o[chunk_idx * num_heads_q * head_dim + q_h * head_dim + d]`
+        //   — un-normalised weighted-V accumulator Õ_c.
+        let mut partial_ml: Vec<PartialState> = vec![PartialState::EMPTY; n_chunks * num_heads_q];
+        let mut partial_o: Vec<f32> = vec![0.0f32; n_chunks * num_heads_q * head_dim];
+
+        let ctx = FlashDecodeCtx {
+            q_ptr: q_data.as_ptr(),
+            k_ptr: k_data.as_ptr() as *const u16,
+            v_ptr: v_data.as_ptr() as *const u16,
+            partial_ml_ptr: partial_ml.as_mut_ptr(),
+            partial_o_ptr: partial_o.as_mut_ptr(),
+            num_heads_q,
+            num_heads_kv,
+            gqa_ratio,
+            head_dim,
+            capacity,
+            cache_seq_len,
+            chunk_size,
+            scale,
+        };
+
+        let n_tasks = n_chunks * num_heads_kv;
+        let pool = thread_pool::get_pool();
+        // Safety:
+        // * `flash_chunk_worker` interprets the `*const u8` ctx as
+        //   `*const FlashDecodeCtx` (which is what we pass).
+        // * `ctx` lives on the stack here and is borrowed immutably by
+        //   `dispatch` (blocks until all tasks complete).
+        // * Per-task writes are partitioned by `(chunk_idx, kv_h)` →
+        //   `(chunk_idx, q_h ∈ gqa group of kv_h)`, so no two workers touch
+        //   the same `partial_ml` or `partial_o` element.
+        unsafe {
+            pool.dispatch(
+                n_tasks,
+                Self::flash_chunk_worker as WorkFn,
+                &ctx as *const FlashDecodeCtx as *const u8,
+            );
+        }
+
+        // Phase 2: LSE merge (serial, main thread).
+        Self::flash_merge_partials(
+            &partial_ml,
+            &partial_o,
+            out_data,
+            num_heads_q,
+            gqa_ratio,
+            head_dim,
+            capacity,
+            n_chunks,
+            cache_seq_len,
+            v_data.as_ptr() as *const u16,
+        );
+
+        Ok(())
+    }
+
+    /// SpinPool worker for Phase 1 of the flash-decoding path.
+    ///
+    /// `task_id` decodes as `(chunk_idx, kv_h) = (task_id / num_heads_kv,
+    /// task_id % num_heads_kv)`.  The worker processes one `(chunk, kv_h)`
+    /// tile across all `gqa_ratio` Q-heads in that kv-group, using per-token
+    /// online softmax to produce `(m_c, l_c, Õ_c)` partials in the shared
+    /// scratch buffers.
+    ///
+    /// # Safety
+    /// `ctx` must point to a live `FlashDecodeCtx`.  `task_id` must lie in
+    /// `0..n_chunks * num_heads_kv`.  The referenced tensor buffers must
+    /// remain valid for the duration of the dispatch.  The partial output
+    /// regions are written to exclusively by this task.
+    unsafe fn flash_chunk_worker(ctx: *const u8, task_id: usize) {
+        unsafe {
+            let ctx = &*(ctx as *const FlashDecodeCtx);
+            let chunk_idx = task_id / ctx.num_heads_kv;
+            let kv_h = task_id % ctx.num_heads_kv;
+            let (t_start, t_end) = flash_chunk_range(chunk_idx, ctx.cache_seq_len, ctx.chunk_size);
+            debug_assert!(t_end > t_start);
+
+            let q_h_begin = kv_h * ctx.gqa_ratio;
+            let q_h_end = q_h_begin + ctx.gqa_ratio;
+            let head_dim = ctx.head_dim;
+
+            // Pre-zero the `o_tilde` scratch for each Q-head in this tile so
+            // the online-softmax loop can FMA directly into it.
+            for q_h in q_h_begin..q_h_end {
+                let o_base = ctx
+                    .partial_o_ptr
+                    .add((chunk_idx * ctx.num_heads_q + q_h) * head_dim);
+                std::ptr::write_bytes(o_base, 0, head_dim);
+            }
+
+            // Each Q-head scans the entire `[t_start, t_end)` range once.
+            // This preserves the GQA-group inner loop so the chunk's K/V
+            // stays resident in L1/L2 across all `gqa_ratio` Q-heads.
+            for q_h in q_h_begin..q_h_end {
+                let q_off = q_h * head_dim;
+                let q_ptr = ctx.q_ptr.add(q_off);
+                let o_base = ctx
+                    .partial_o_ptr
+                    .add((chunk_idx * ctx.num_heads_q + q_h) * head_dim);
+
+                let mut m_run: f32 = f32::NEG_INFINITY;
+                let mut l_run: f32 = 0.0;
+
+                // Process 4 timesteps at a time via vec_dot_f16_f32_4rows.
+                let chunk_len = t_end - t_start;
+                let full_4 = chunk_len / 4;
+                for block in 0..full_4 {
+                    let t_base = t_start + block * 4;
+                    let mut b_ptrs = [std::ptr::null::<u16>(); 4];
+                    for (r, bp) in b_ptrs.iter_mut().enumerate() {
+                        let t = t_base + r;
+                        let off = (kv_h * ctx.capacity + t) * head_dim;
+                        *bp = ctx.k_ptr.add(off);
+                    }
+                    let mut dots = [0.0f32; 4];
+                    Self::vec_dot_f16_f32_4rows(head_dim, q_ptr, b_ptrs, &mut dots);
+                    for (r, &d) in dots.iter().enumerate() {
+                        let t = t_base + r;
+                        let s = d * ctx.scale;
+                        Self::flash_apply_token(
+                            s,
+                            t,
+                            kv_h,
+                            ctx.capacity,
+                            head_dim,
+                            ctx.v_ptr,
+                            o_base,
+                            &mut m_run,
+                            &mut l_run,
+                        );
+                    }
+                }
+                for t in (t_start + full_4 * 4)..t_end {
+                    let off = (kv_h * ctx.capacity + t) * head_dim;
+                    let k_ptr = ctx.k_ptr.add(off);
+                    let dot = Self::vec_dot_f16_f32(head_dim, q_ptr, k_ptr);
+                    let s = dot * ctx.scale;
+                    Self::flash_apply_token(
+                        s,
+                        t,
+                        kv_h,
+                        ctx.capacity,
+                        head_dim,
+                        ctx.v_ptr,
+                        o_base,
+                        &mut m_run,
+                        &mut l_run,
+                    );
+                }
+
+                // Record chunk-local partial.  `o_base` already holds Õ_c.
+                let slot = ctx.partial_ml_ptr.add(chunk_idx * ctx.num_heads_q + q_h);
+                (*slot).m = m_run;
+                (*slot).l = l_run;
+            }
+        }
+    }
+
+    /// Apply a single `(t, raw_s)` token to the running online-softmax state
+    /// `(m_run, l_run)` and FMA `V[t] * beta` into the accumulator `o_base`.
+    ///
+    /// NaN/−inf scores are treated as weight-0: the running state is left
+    /// untouched and the accumulator is not modified.  This mirrors the
+    /// per-token NaN gate of the head-parallel path.
+    ///
+    /// # Safety
+    /// `v_ptr` must point to an F16 KV tensor of shape
+    /// `[_, num_heads_kv, capacity, head_dim]` with at least `t+1` valid
+    /// positions for `kv_h`.  `o_base` must point to `head_dim` writable
+    /// F32 lanes.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn flash_apply_token(
+        raw_s: f32,
+        t: usize,
+        kv_h: usize,
+        capacity: usize,
+        head_dim: usize,
+        v_ptr: *const u16,
+        o_base: *mut f32,
+        m_run: &mut f32,
+        l_run: &mut f32,
+    ) {
+        unsafe {
+            if !raw_s.is_finite() {
+                return;
+            }
+            let m_new = m_run.max(raw_s);
+            let alpha = if m_run.is_infinite() && m_run.is_sign_negative() {
+                0.0
+            } else {
+                (*m_run - m_new).exp()
+            };
+            let beta = (raw_s - m_new).exp();
+            *l_run = *l_run * alpha + beta;
+            *m_run = m_new;
+
+            let vp = v_ptr.add((kv_h * capacity + t) * head_dim);
+            let alpha_v = vdupq_n_f32(alpha);
+            let beta_v = vdupq_n_f32(beta);
+            let mut i = 0;
+            while i + 16 <= head_dim {
+                let raw0: uint16x8_t = vld1q_u16(vp.add(i));
+                let raw1: uint16x8_t = vld1q_u16(vp.add(i + 8));
+                let f0: float32x4_t;
+                let f1: float32x4_t;
+                let f2: float32x4_t;
+                let f3: float32x4_t;
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f0, i = in(vreg) raw0);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f1, i = in(vreg) raw0);
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) f2, i = in(vreg) raw1);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) f3, i = in(vreg) raw1);
+
+                let o0 = vld1q_f32(o_base.add(i));
+                let o1 = vld1q_f32(o_base.add(i + 4));
+                let o2 = vld1q_f32(o_base.add(i + 8));
+                let o3 = vld1q_f32(o_base.add(i + 12));
+                let o0s = vmulq_f32(o0, alpha_v);
+                let o1s = vmulq_f32(o1, alpha_v);
+                let o2s = vmulq_f32(o2, alpha_v);
+                let o3s = vmulq_f32(o3, alpha_v);
+                vst1q_f32(o_base.add(i), vfmaq_f32(o0s, beta_v, f0));
+                vst1q_f32(o_base.add(i + 4), vfmaq_f32(o1s, beta_v, f1));
+                vst1q_f32(o_base.add(i + 8), vfmaq_f32(o2s, beta_v, f2));
+                vst1q_f32(o_base.add(i + 12), vfmaq_f32(o3s, beta_v, f3));
+                i += 16;
+            }
+            while i + 8 <= head_dim {
+                let raw: uint16x8_t = vld1q_u16(vp.add(i));
+                let fl: float32x4_t;
+                let fh: float32x4_t;
+                std::arch::asm!("fcvtl {o:v}.4s, {i:v}.4h", o = lateout(vreg) fl, i = in(vreg) raw);
+                std::arch::asm!("fcvtl2 {o:v}.4s, {i:v}.8h", o = lateout(vreg) fh, i = in(vreg) raw);
+                let o0 = vld1q_f32(o_base.add(i));
+                let o1 = vld1q_f32(o_base.add(i + 4));
+                let o0s = vmulq_f32(o0, alpha_v);
+                let o1s = vmulq_f32(o1, alpha_v);
+                vst1q_f32(o_base.add(i), vfmaq_f32(o0s, beta_v, fl));
+                vst1q_f32(o_base.add(i + 4), vfmaq_f32(o1s, beta_v, fh));
+                i += 8;
+            }
+            while i < head_dim {
+                let v_f32 = half::f16::from_bits(*vp.add(i)).to_f32();
+                *o_base.add(i) = *o_base.add(i) * alpha + v_f32 * beta;
+                i += 1;
+            }
+        }
+    }
+
+    /// Phase 2 of flash-decoding: combine chunk partials back into a global
+    /// softmax output per Q-head.
+    ///
+    /// For each Q-head `q_h`, reads the `n_chunks` partials
+    /// `(m_c, l_c, Õ_c)` and writes:
+    /// ```text
+    ///   M = max_c m_c
+    ///   L = Σ_c exp(m_c − M) · l_c
+    ///   O = Σ_c exp(m_c − M) · Õ_c          (un-normalised weighted V)
+    ///   out[q_h] = O / L
+    /// ```
+    ///
+    /// Fallback: if every partial has `m_c = −∞` (i.e. every token in every
+    /// chunk was NaN) we emit the uniform-V average, mirroring the head-
+    /// parallel path's `fallback_uniform` branch.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_merge_partials(
+        partial_ml: &[PartialState],
+        partial_o: &[f32],
+        out_data: &mut [f32],
+        num_heads_q: usize,
+        gqa_ratio: usize,
+        head_dim: usize,
+        capacity: usize,
+        n_chunks: usize,
+        cache_seq_len: usize,
+        v_ptr: *const u16,
+    ) {
+        for q_h in 0..num_heads_q {
+            let kv_h = q_h / gqa_ratio;
+            let out_h = &mut out_data[q_h * head_dim..(q_h + 1) * head_dim];
+
+            // Global max across finite chunk partials.
+            let mut m_max = f32::NEG_INFINITY;
+            for c in 0..n_chunks {
+                let m_c = partial_ml[c * num_heads_q + q_h].m;
+                if m_c.is_finite() && m_c > m_max {
+                    m_max = m_c;
+                }
+            }
+
+            if m_max == f32::NEG_INFINITY {
+                // All chunks dead → uniform-V fallback matching Step 1
+                // semantics: out_h = (1/seq_len) · Σ_t V[kv_h, t].
+                flash_uniform_fallback(out_h, kv_h, head_dim, capacity, cache_seq_len, v_ptr);
+                continue;
+            }
+
+            // Accumulate O and L via LSE.
+            unsafe {
+                let o_ptr = out_h.as_mut_ptr();
+                // Zero O before summation.
+                std::ptr::write_bytes(o_ptr, 0, head_dim);
+
+                let mut l_total: f32 = 0.0;
+                for c in 0..n_chunks {
+                    let ml = partial_ml[c * num_heads_q + q_h];
+                    if !ml.m.is_finite() {
+                        continue;
+                    }
+                    let alpha = (ml.m - m_max).exp();
+                    l_total += alpha * ml.l;
+
+                    let o_c_ptr = partial_o.as_ptr().add((c * num_heads_q + q_h) * head_dim);
+                    let alpha_v = vdupq_n_f32(alpha);
+                    let mut i = 0;
+                    while i + 4 <= head_dim {
+                        let o_cur = vld1q_f32(o_ptr.add(i));
+                        let o_add = vld1q_f32(o_c_ptr.add(i));
+                        vst1q_f32(o_ptr.add(i), vfmaq_f32(o_cur, alpha_v, o_add));
+                        i += 4;
+                    }
+                    while i < head_dim {
+                        *o_ptr.add(i) += alpha * *o_c_ptr.add(i);
+                        i += 1;
+                    }
+                }
+
+                // Final normalisation or fallback on pathological L.
+                if !l_total.is_finite() || l_total <= 0.0 {
+                    flash_uniform_fallback(out_h, kv_h, head_dim, capacity, cache_seq_len, v_ptr);
+                } else {
+                    let inv_l = 1.0 / l_total;
+                    let inv_v = vdupq_n_f32(inv_l);
+                    let mut i = 0;
+                    while i + 4 <= head_dim {
+                        let x = vld1q_f32(o_ptr.add(i));
+                        vst1q_f32(o_ptr.add(i), vmulq_f32(x, inv_v));
+                        i += 4;
+                    }
+                    while i < head_dim {
+                        *o_ptr.add(i) *= inv_l;
+                        i += 1;
+                    }
+                }
+            }
+        }
     }
 
     fn matmul_transposed_f32(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {

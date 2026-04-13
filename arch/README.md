@@ -37,6 +37,7 @@ spec/ 대응이 아닌 독립적인 feature 설계 문서:
 | 파일 | 내용 |
 |------|------|
 | `tensor_partition.md` | CPU-GPU Cooperative Inference (Option B) — Tensor Partition 설계 |
+| `cpu_flash_decoding.md` | CPU Attention KV-Split 병렬화 (Step 2 — `attention_gen_f16_neon`) 설계 |
 
 ## 규칙
 
