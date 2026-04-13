@@ -11,8 +11,6 @@ use anyhow::{Context, Result};
 use ocl::core::Kernel as CoreKernel;
 use ocl::core::Mem;
 
-use super::flash_decode_kv_splits;
-
 /// Operation tag for profiling — maps to OpProfiler fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpTag {
@@ -51,10 +49,6 @@ pub enum DynamicArg {
     ResTokens { arg_idx: u32 },
     /// Tok base offset for scatter (i32) — q2_tokens passed to scatter
     TokBase { arg_idx: u32 },
-    /// Flash Decoding KV-split count (i32). Computed at dispatch time from
-    /// the current `cache_seq_len` via `flash_decode_kv_splits`. Used by the
-    /// split kernel (arg index varies) and the reducer (separate arg index).
-    FlashKvSplits { arg_idx: u32 },
 }
 
 /// A single GPU kernel dispatch with pre-bound arguments.
@@ -103,20 +97,6 @@ pub enum AttentionVariant {
     /// softmax, no score output. Selected at plan-build time when
     /// head_dim==64, F16 KV, HeadMajor, and no scores are needed.
     StandardFlash(KernelStep),
-    /// P0-5b: Adaptive flash decode. Holds the legacy single-kernel path
-    /// AND the KV-split (Flash Decoding) split + reduce kernels. Each token
-    /// dispatch decides between the two paths based on the current
-    /// `cache_seq_len` via `flash_decode_kv_splits`. Short ctx
-    /// (`kv_splits == 1`) → `legacy`; long ctx → `split` + `reduce`.
-    StandardFlashAdaptive {
-        legacy: KernelStep,
-        split: KernelStep,
-        reduce: KernelStep,
-        /// `flash_decode_kv_splits(kv_capacity)` — the upper bound on
-        /// `kv_splits`. Used to cap dispatch-time `kv_splits` so it never
-        /// exceeds the scratch buffer that was sized at plan-build time.
-        max_kv_splits: usize,
-    },
     /// KIVI assembled: scatter residual to F32 attn buffer, then standard F32 attention.
     /// Used when native KIVI attention kernel is not available.
     KiviAssembled {
@@ -182,38 +162,6 @@ impl FullKernelPlan {
         res_pos: i32,
         q2_tokens: i32,
         res_tokens: i32,
-    ) {
-        Self::dispatch_step_ex(
-            queue,
-            step,
-            start_pos,
-            cache_seq_len,
-            write_pos,
-            kv_capacity,
-            res_pos,
-            q2_tokens,
-            res_tokens,
-            1,
-            None,
-        );
-    }
-
-    /// Extended dispatch with optional dynamic `flash_kv_splits` and global
-    /// work size override. Used by the Flash Decoding adaptive variant.
-    #[inline]
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_step_ex(
-        queue: &ocl::core::CommandQueue,
-        step: &KernelStep,
-        start_pos: i32,
-        cache_seq_len: i32,
-        write_pos: i32,
-        kv_capacity: i32,
-        res_pos: i32,
-        q2_tokens: i32,
-        res_tokens: i32,
-        flash_kv_splits: i32,
-        global_work_size_override: Option<[usize; 3]>,
     ) {
         for dyn_arg in &step.dynamic_args {
             let (arg_idx, result) = unsafe {
@@ -282,14 +230,6 @@ impl FullKernelPlan {
                             ocl::core::ArgVal::scalar(&q2_tokens),
                         ),
                     ),
-                    DynamicArg::FlashKvSplits { arg_idx } => (
-                        *arg_idx,
-                        ocl::core::set_kernel_arg(
-                            &step.kernel,
-                            *arg_idx,
-                            ocl::core::ArgVal::scalar(&flash_kv_splits),
-                        ),
-                    ),
                 }
             };
             if let Err(e) = result {
@@ -301,14 +241,13 @@ impl FullKernelPlan {
                 );
             }
         }
-        let gws = global_work_size_override.unwrap_or(step.global_work_size);
         unsafe {
             if let Err(e) = ocl::core::enqueue_kernel(
                 queue,
                 &step.kernel,
                 step.ndim,
                 None,
-                &gws,
+                &step.global_work_size,
                 step.local_work_size,
                 None::<&ocl::core::Event>,
                 None::<&mut ocl::core::Event>,
@@ -316,7 +255,7 @@ impl FullKernelPlan {
                 log::error!(
                     "Plan enqueue_kernel failed: op={:?} gws={:?}: {}",
                     step.op_tag,
-                    gws,
+                    step.global_work_size,
                     e
                 );
             }
@@ -476,83 +415,6 @@ impl FullKernelPlan {
                         ocl::core::finish(queue).ok();
                         eprintln!(
                             "[Plan] L{} flash attention OK (attn_seq_len={})",
-                            i, attn_seq_len
-                        );
-                    }
-                }
-                AttentionVariant::StandardFlashAdaptive {
-                    legacy,
-                    split,
-                    reduce,
-                    max_kv_splits,
-                } => {
-                    // Decide path each token. Cap by `max_kv_splits` so the
-                    // pre-bound scratch buffer (sized at plan-build time for
-                    // `flash_decode_kv_splits(kv_capacity)`) is never
-                    // exceeded.
-                    let desired = flash_decode_kv_splits(attn_seq_len as usize);
-                    let kv_splits = desired.min(*max_kv_splits);
-                    if kv_splits <= 1 {
-                        if debug_sync {
-                            eprintln!(
-                                "[Plan] L{} flash adaptive: legacy path (attn_seq_len={})",
-                                i, attn_seq_len
-                            );
-                        }
-                        Self::dispatch_step(
-                            queue,
-                            legacy,
-                            start_pos_i32,
-                            attn_seq_len,
-                            write_pos,
-                            kv_cap,
-                            rp,
-                            q2t,
-                            rt,
-                        );
-                    } else {
-                        if debug_sync {
-                            eprintln!(
-                                "[Plan] L{} flash adaptive: split+reduce (attn_seq_len={}, kv_splits={})",
-                                i, attn_seq_len, kv_splits
-                            );
-                        }
-                        // Split kernel: gws_z must equal kv_splits.
-                        let mut gws_split = split.global_work_size;
-                        gws_split[2] = kv_splits;
-                        Self::dispatch_step_ex(
-                            queue,
-                            split,
-                            start_pos_i32,
-                            attn_seq_len,
-                            write_pos,
-                            kv_cap,
-                            rp,
-                            q2t,
-                            rt,
-                            kv_splits as i32,
-                            Some(gws_split),
-                        );
-                        // Reduce kernel: gws static (head_dim, n_heads_q, 1);
-                        // only kv_splits scalar is dynamic.
-                        Self::dispatch_step_ex(
-                            queue,
-                            reduce,
-                            start_pos_i32,
-                            attn_seq_len,
-                            write_pos,
-                            kv_cap,
-                            rp,
-                            q2t,
-                            rt,
-                            kv_splits as i32,
-                            None,
-                        );
-                    }
-                    if debug_sync {
-                        ocl::core::finish(queue).ok();
-                        eprintln!(
-                            "[Plan] L{} flash adaptive OK (attn_seq_len={})",
                             i, attn_seq_len
                         );
                     }
@@ -749,13 +611,6 @@ pub struct LayerPlanConfig<'a> {
     /// Used for Qwen 2.5-1.5B and other head_dim=128 models.
     /// `None` forces the legacy path for head_dim=128 models.
     pub flash_attn_f32_f16_program_dk128: Option<&'a ocl::Program>,
-    /// Flash Decoding (P0-5b) reducer program for head_dim=64.
-    /// When `Some` AND the matching split kernel is also available
-    /// (compiled into the dk64 program), the layer builder may register
-    /// the KV-split adaptive variant.
-    pub flash_attn_q1_reduce_program_dk64: Option<&'a ocl::Program>,
-    /// Flash Decoding reducer program for head_dim=128.
-    pub flash_attn_q1_reduce_program_dk128: Option<&'a ocl::Program>,
     /// True if this decode plan must capture attention scores (H2O/H2O+ or
     /// an active GPU score accumulator). When true, the builder must use
     /// `AttentionVariant::Standard` because the flash kernel has no score
@@ -1028,72 +883,13 @@ pub fn build_noshuffle_programs(
     Ok(programs)
 }
 
-/// Build the `AttentionVariant` for the flash decode path.
-///
-/// When the `flash_attn_f32_f16_q1_split` + `flash_attn_q1_reduce` kernels
-/// (P0-5b Flash Decoding) are available AND `kv_capacity` is large enough to
-/// ever trigger a KV-split, returns `AttentionVariant::StandardFlashAdaptive`
-/// holding both the legacy single-kernel path and the split + reduce pair.
-/// Otherwise falls back to the legacy `AttentionVariant::StandardFlash`
-/// (preserves short-ctx behavior without the partials/meta scratch
-/// allocation overhead).
-fn build_flash_attention_variant(config: &LayerPlanConfig) -> Result<AttentionVariant> {
-    let legacy = build_flash_attention_step(config)?;
-
-    // Decide whether to upgrade to the adaptive (KV-split) variant.
-    let max_kv_splits = flash_decode_kv_splits(config.kv_capacity);
-    if max_kv_splits <= 1 {
-        // kv_capacity too small to ever benefit. Stay on legacy.
-        return Ok(AttentionVariant::StandardFlash(legacy));
-    }
-    let reduce_program = match config.head_dim {
-        64 => config.flash_attn_q1_reduce_program_dk64,
-        128 => config.flash_attn_q1_reduce_program_dk128,
-        _ => None,
-    };
-    let split_program = match config.head_dim {
-        64 => config.flash_attn_f32_f16_program_dk64,
-        128 => config.flash_attn_f32_f16_program_dk128,
-        _ => None,
-    };
-    let (Some(reduce_program), Some(split_program)) = (reduce_program, split_program) else {
-        return Ok(AttentionVariant::StandardFlash(legacy));
-    };
-
-    match build_flash_attention_split_reduce_steps(
-        config,
-        split_program,
-        reduce_program,
-        max_kv_splits,
-    ) {
-        Ok((split, reduce)) => Ok(AttentionVariant::StandardFlashAdaptive {
-            legacy,
-            split,
-            reduce,
-            max_kv_splits,
-        }),
-        Err(e) => {
-            // Building split/reduce should be rare — if it fails (kernel
-            // missing in program, scratch allocation failure, etc.), log and
-            // fall back to legacy so decode still works.
-            log::warn!(
-                "Flash decode adaptive variant build failed (head_dim={}): {}. Falling back to legacy single-kernel path.",
-                config.head_dim,
-                e
-            );
-            Ok(AttentionVariant::StandardFlash(legacy))
-        }
-    }
-}
-
-/// Build the legacy single-kernel flash decode step
-/// (`flash_attn_f32_f16_q1`).
+/// Build a pre-bound `KernelStep` that dispatches `flash_attn_f32_f16_q1`.
 ///
 /// Arg layout mirrors `OpenCLBackend::flash_attention_decode_gpu` — see that
 /// method in `engine/src/backend/opencl/mod.rs` for the canonical layout.
 /// All 40 args are static except `n_kv` at index 10, which is patched per
 /// decode step via `DynamicArg::CacheSeqLen`.
-fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<KernelStep> {
+fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVariant> {
     // Pick the program matching this layer's head_dim. The caller
     // (`use_flash` gate) guarantees the matching program is `Some`.
     let program = match config.head_dim {
@@ -1185,7 +981,7 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<KernelStep> {
     }
 
     const Q1_WG_SIZE: usize = 64;
-    Ok(KernelStep {
+    Ok(AttentionVariant::StandardFlash(KernelStep {
         kernel,
         ndim: 2,
         global_work_size: [Q1_WG_SIZE, n_heads_q, 1],
@@ -1193,191 +989,7 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<KernelStep> {
         dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 10 }],
         op_tag: OpTag::Attention,
         retained_bufs: vec![],
-    })
-}
-
-/// Build the split + reduce kernel steps for the Flash Decoding (P0-5b)
-/// adaptive path. Pre-allocates partials/meta scratch sized for
-/// `max_kv_splits`, and pre-binds all static args (Q/K/V/scratch, scales,
-/// strides). The dispatch-time dynamics are:
-///
-///   - `n_kv` (split arg 8, reduce arg N/A)         → `CacheSeqLen`
-///   - `kv_splits` (split arg 33, reduce arg 6)      → `FlashKvSplits`
-///   - split global_work_size[2]                     → kv_splits override
-///
-/// The retained scratch buffers live inside `split.retained_bufs` so the
-/// scratch cl_mem stays valid for the lifetime of the plan.
-///
-/// Arg layout mirrors `OpenCLBackend::flash_attention_decode_split_gpu`;
-/// keep this in sync with that method when args change.
-fn build_flash_attention_split_reduce_steps(
-    config: &LayerPlanConfig,
-    split_program: &ocl::Program,
-    reduce_program: &ocl::Program,
-    max_kv_splits: usize,
-) -> Result<(KernelStep, KernelStep)> {
-    let split_kernel = ocl::core::create_kernel(split_program, "flash_attn_f32_f16_q1_split")
-        .context("create flash_attn_f32_f16_q1_split for plan")?;
-    let reduce_kernel = ocl::core::create_kernel(reduce_program, "flash_attn_q1_reduce")
-        .context("create flash_attn_q1_reduce for plan")?;
-
-    let n_heads_q = config.n_heads_q;
-    let n_heads_kv = config.n_kv_heads;
-    let head_dim = config.head_dim;
-    let kv_capacity = config.kv_capacity;
-    let scale = 1.0f32 / (head_dim as f32).sqrt();
-
-    // Pre-allocate scratch sized for the worst case (max_kv_splits at this
-    // layer's kv_capacity). The scratch lives on `split.retained_bufs` so
-    // its cl_mem stays valid for the plan's lifetime.
-    let partials_floats = n_heads_q
-        .checked_mul(head_dim)
-        .and_then(|v| v.checked_mul(max_kv_splits))
-        .context("flash decode partials size overflow")?;
-    let meta_floats = n_heads_q
-        .checked_mul(max_kv_splits)
-        .and_then(|v| v.checked_mul(2))
-        .context("flash decode meta size overflow")?;
-
-    let partials_buf = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            config.context.as_core(),
-            ocl::core::MEM_READ_WRITE,
-            partials_floats.max(1),
-            None,
-        )
-    }
-    .context("create flash decode partials scratch for plan")?;
-    let meta_buf = unsafe {
-        ocl::core::create_buffer::<_, f32>(
-            config.context.as_core(),
-            ocl::core::MEM_READ_WRITE,
-            meta_floats.max(1),
-            None,
-        )
-    }
-    .context("create flash decode meta scratch for plan")?;
-
-    // Q strides (F32 [batch=1, seq=1, n_heads_q, head_dim]), bytes
-    let q_nb1 = (n_heads_q * head_dim * 4) as u64;
-    let q_nb2 = (head_dim * 4) as u64;
-    let q_nb3 = q_nb1;
-    // KV strides (F16 HeadMajor [1, n_heads_kv, capacity, head_dim]), bytes
-    let kv_elem_size: u64 = 2;
-    let k_nb1 = (head_dim as u64) * kv_elem_size;
-    let k_nb2 = (kv_capacity * head_dim) as u64 * kv_elem_size;
-    let k_nb3 = (n_heads_kv as u64) * k_nb2;
-    let (v_nb1, v_nb2, v_nb3) = (k_nb1, k_nb2, k_nb3);
-
-    let n_q = 1i32;
-    let initial_n_kv = 0i32;
-    let initial_kv_splits = 1i32;
-    let is_causal = 0i32;
-    let n_head = n_heads_q as i32;
-    let n_head_kv_arg = n_heads_kv as i32;
-    let max_bias = 0.0f32;
-    let m0 = 0.0f32;
-    let m1 = 0.0f32;
-    let n_head_log2 = 0i32;
-    let logit_softcap = 0.0f32;
-    let zero_u64 = 0u64;
-    let zero_i32 = 0i32;
-
-    unsafe {
-        // --- Split kernel (35 args) ---
-        ocl::core::set_kernel_arg(&split_kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
-        ocl::core::set_kernel_arg(&split_kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 2, ocl::core::ArgVal::mem(config.k_cache_buf))?;
-        ocl::core::set_kernel_arg(&split_kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 4, ocl::core::ArgVal::mem(config.v_cache_buf))?;
-        ocl::core::set_kernel_arg(&split_kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 6, ocl::core::ArgVal::scalar(&scale))?;
-        ocl::core::set_kernel_arg(&split_kernel, 7, ocl::core::ArgVal::scalar(&n_q))?;
-        ocl::core::set_kernel_arg(&split_kernel, 8, ocl::core::ArgVal::scalar(&initial_n_kv))?;
-        ocl::core::set_kernel_arg(&split_kernel, 9, ocl::core::ArgVal::scalar(&is_causal))?;
-        ocl::core::set_kernel_arg(&split_kernel, 10, ocl::core::ArgVal::scalar(&n_head))?;
-        ocl::core::set_kernel_arg(&split_kernel, 11, ocl::core::ArgVal::scalar(&q_nb1))?;
-        ocl::core::set_kernel_arg(&split_kernel, 12, ocl::core::ArgVal::scalar(&q_nb2))?;
-        ocl::core::set_kernel_arg(&split_kernel, 13, ocl::core::ArgVal::scalar(&q_nb3))?;
-        ocl::core::set_kernel_arg(&split_kernel, 14, ocl::core::ArgVal::scalar(&k_nb1))?;
-        ocl::core::set_kernel_arg(&split_kernel, 15, ocl::core::ArgVal::scalar(&k_nb2))?;
-        ocl::core::set_kernel_arg(&split_kernel, 16, ocl::core::ArgVal::scalar(&k_nb3))?;
-        ocl::core::set_kernel_arg(&split_kernel, 17, ocl::core::ArgVal::scalar(&v_nb1))?;
-        ocl::core::set_kernel_arg(&split_kernel, 18, ocl::core::ArgVal::scalar(&v_nb2))?;
-        ocl::core::set_kernel_arg(&split_kernel, 19, ocl::core::ArgVal::scalar(&v_nb3))?;
-        ocl::core::set_kernel_arg(&split_kernel, 20, ocl::core::ArgVal::scalar(&max_bias))?;
-        ocl::core::set_kernel_arg(&split_kernel, 21, ocl::core::ArgVal::scalar(&m0))?;
-        ocl::core::set_kernel_arg(&split_kernel, 22, ocl::core::ArgVal::scalar(&m1))?;
-        ocl::core::set_kernel_arg(&split_kernel, 23, ocl::core::ArgVal::scalar(&n_head_log2))?;
-        ocl::core::set_kernel_arg(&split_kernel, 24, ocl::core::ArgVal::scalar(&logit_softcap))?;
-        ocl::core::set_kernel_arg(&split_kernel, 25, ocl::core::ArgVal::scalar(&n_head_kv_arg))?;
-        // mask = NULL (args 26-32)
-        ocl::core::set_kernel_arg(&split_kernel, 26, ocl::core::ArgVal::mem_null())?;
-        ocl::core::set_kernel_arg(&split_kernel, 27, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 28, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 29, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 30, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&split_kernel, 31, ocl::core::ArgVal::scalar(&zero_i32))?;
-        ocl::core::set_kernel_arg(&split_kernel, 32, ocl::core::ArgVal::scalar(&zero_i32))?;
-        ocl::core::set_kernel_arg(
-            &split_kernel,
-            33,
-            ocl::core::ArgVal::scalar(&initial_kv_splits),
-        )?;
-        ocl::core::set_kernel_arg(&split_kernel, 34, ocl::core::ArgVal::mem(&partials_buf))?;
-        ocl::core::set_kernel_arg(&split_kernel, 35, ocl::core::ArgVal::mem(&meta_buf))?;
-
-        // --- Reduce kernel (9 args) ---
-        let dst_head_stride = (head_dim * 4) as u64;
-        ocl::core::set_kernel_arg(&reduce_kernel, 0, ocl::core::ArgVal::mem(&partials_buf))?;
-        ocl::core::set_kernel_arg(&reduce_kernel, 1, ocl::core::ArgVal::mem(&meta_buf))?;
-        ocl::core::set_kernel_arg(&reduce_kernel, 2, ocl::core::ArgVal::mem_null())?;
-        ocl::core::set_kernel_arg(&reduce_kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(
-            &reduce_kernel,
-            4,
-            ocl::core::ArgVal::mem(config.out_attn_buf),
-        )?;
-        ocl::core::set_kernel_arg(&reduce_kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(
-            &reduce_kernel,
-            6,
-            ocl::core::ArgVal::scalar(&initial_kv_splits),
-        )?;
-        ocl::core::set_kernel_arg(&reduce_kernel, 7, ocl::core::ArgVal::scalar(&n_head))?;
-        ocl::core::set_kernel_arg(
-            &reduce_kernel,
-            8,
-            ocl::core::ArgVal::scalar(&dst_head_stride),
-        )?;
-    }
-
-    const Q1_WG_SIZE: usize = 64;
-    let split_step = KernelStep {
-        kernel: split_kernel,
-        ndim: 3,
-        // gws_z (kv_splits) is patched per-dispatch in execute().
-        global_work_size: [Q1_WG_SIZE, n_heads_q, max_kv_splits],
-        local_work_size: Some([Q1_WG_SIZE, 1, 1]),
-        dynamic_args: vec![
-            DynamicArg::CacheSeqLen { arg_idx: 8 },
-            DynamicArg::FlashKvSplits { arg_idx: 33 },
-        ],
-        op_tag: OpTag::Attention,
-        retained_bufs: vec![partials_buf.clone(), meta_buf.clone()],
-    };
-    let reduce_step = KernelStep {
-        kernel: reduce_kernel,
-        ndim: 2,
-        global_work_size: [head_dim, n_heads_q, 1],
-        local_work_size: Some([head_dim, 1, 1]),
-        dynamic_args: vec![DynamicArg::FlashKvSplits { arg_idx: 6 }],
-        op_tag: OpTag::Attention,
-        // partials/meta retained on split_step is sufficient (same handles
-        // are also used here, but we need only one owner). Keep empty.
-        retained_bufs: vec![],
-    };
-    Ok((split_step, reduce_step))
+    }))
 }
 
 /// Build a pre-bound `kernel_add_row_bias` step that adds the given bias
@@ -1735,7 +1347,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     let use_flash = is_head_major && flash_program_available && !config.needs_attention_scores;
 
     let attention = if use_flash {
-        build_flash_attention_variant(config)?
+        build_flash_attention_step(config)?
     } else {
         let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_attn_gen_half")
             .context("create kernel_attn_gen_half")?;
@@ -2029,13 +1641,6 @@ pub struct FullPlanConfig<'a> {
     /// builder may select `AttentionVariant::StandardFlash` for layers
     /// with head_dim=128 (e.g. Qwen 2.5-1.5B).
     pub flash_attn_f32_f16_program_dk128: Option<&'a ocl::Program>,
-    /// Flash Decoding (P0-5b) reducer program for head_dim=64. Used together
-    /// with the `flash_attn_f32_f16_q1_split` kernel compiled into the dk64
-    /// program. When both are `Some` and `kv_capacity` is large enough, the
-    /// layer builder upgrades flash steps to the KV-split adaptive variant.
-    pub flash_attn_q1_reduce_program_dk64: Option<&'a ocl::Program>,
-    /// Flash Decoding reducer program for head_dim=128.
-    pub flash_attn_q1_reduce_program_dk128: Option<&'a ocl::Program>,
     /// True if this decode plan must capture attention scores (H2O / GPU
     /// score accumulator). Forces the legacy attention path because flash
     /// attention has no score output.
@@ -2173,8 +1778,6 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             is_nosub: config.is_nosub,
             flash_attn_f32_f16_program_dk64: config.flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128: config.flash_attn_f32_f16_program_dk128,
-            flash_attn_q1_reduce_program_dk64: config.flash_attn_q1_reduce_program_dk64,
-            flash_attn_q1_reduce_program_dk128: config.flash_attn_q1_reduce_program_dk128,
             needs_attention_scores: config.needs_attention_scores,
             noshuffle_programs: config.noshuffle_programs.as_ref(),
             wq_noshuffle: lb.wq_noshuffle,
@@ -2736,8 +2339,6 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             // (which build_kivi_layer_plan immediately overrides anyway).
             flash_attn_f32_f16_program_dk64: None,
             flash_attn_f32_f16_program_dk128: None,
-            flash_attn_q1_reduce_program_dk64: None,
-            flash_attn_q1_reduce_program_dk128: None,
             needs_attention_scores: false,
             // KIVI currently only supports F16 weights — no noshuffle.
             noshuffle_programs: None,
@@ -2822,56 +2423,4 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
         lm_head,
         kv_capacity: config.max_seq_len,
     })
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// P0-5b sanity: adaptive flash decode is gated on
-    /// `flash_decode_kv_splits(kv_capacity) > 1`. For Llama 3.2 1B (2048 ctx)
-    /// and Qwen 2.5 (longer ctx) the heuristic must return > 1, otherwise the
-    /// adaptive variant would never trigger in production.
-    #[test]
-    fn flash_decode_kv_splits_long_ctx_triggers_split() {
-        // Production min ctx (Llama 3.2 1B/3B): 2048
-        assert!(
-            flash_decode_kv_splits(2048) > 1,
-            "kv_capacity=2048 must trigger KV-split (got {})",
-            flash_decode_kv_splits(2048)
-        );
-        // Larger contexts should also split
-        assert!(flash_decode_kv_splits(4096) >= 4);
-        assert!(flash_decode_kv_splits(8192) >= 8);
-    }
-
-    /// P0-5b regression guard: short contexts must NOT trigger the split path
-    /// (avoids partials/meta scratch overhead for tiny prompts).
-    #[test]
-    fn flash_decode_kv_splits_short_ctx_uses_legacy() {
-        for n_kv in [0usize, 1, 64, 128, 256, 511] {
-            assert_eq!(
-                flash_decode_kv_splits(n_kv),
-                1,
-                "short ctx (n_kv={}) must use legacy single-kernel path",
-                n_kv
-            );
-        }
-    }
-
-    /// P0-5b: `DynamicArg::FlashKvSplits` is the new variant we added so the
-    /// dispatcher can patch `kv_splits` per token. This test guards against
-    /// accidental removal during refactors.
-    #[test]
-    fn dynamic_arg_flash_kv_splits_exists() {
-        let arg = DynamicArg::FlashKvSplits { arg_idx: 33 };
-        match arg {
-            DynamicArg::FlashKvSplits { arg_idx } => assert_eq!(arg_idx, 33),
-            _ => panic!("unexpected variant"),
-        }
-    }
 }
