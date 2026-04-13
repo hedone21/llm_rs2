@@ -2952,7 +2952,15 @@ impl CpuBackendNeon {
         }
     }
 
-    // Dot Product Q4_0 * Q8_0 (NEON)
+    // Dot Product Q4_0 * Q8_0 (NEON, dotprod 미지원 fallback)
+    //
+    // 최적화 (2026-04-13, P0-1):
+    //   - 블록당 4회 `vaddlvq_s16` (각 호출이 i16x8→i64 horizontal reduction) 제거
+    //   - 대신 `vmull_s8` → `vpaddlq_s16` → `vaddq_s32` 체인으로 int32x4_t 누적기에 유지
+    //   - 블록 스케일은 `vmlaq_n_f32`로 float32x4_t sumv에 누적 (llama.cpp 패턴)
+    //   - 최종 `vaddvq_f32` 1회만 수행하여 horizontal reduction 비용 최소화
+    //
+    // llama.cpp `ggml_vec_dot_q4_0_q8_0` (arch/arm/quants.c) 기본 NEON 경로와 동일 패턴.
     #[target_feature(enable = "neon")]
     pub unsafe fn vec_dot_q4_0_q8_0(
         &self,
@@ -2963,10 +2971,13 @@ impl CpuBackendNeon {
     ) {
         let nb = n / QK8_0;
 
-        let mut sumf = 0.0;
         unsafe {
             let m4b = vdupq_n_u8(0x0F);
             let s8b = vdupq_n_s8(8);
+
+            // Float 누적기 2개 (2-block unroll → 독립 dependency chain으로 FMA 파이프 활용)
+            let mut sumv0 = vdupq_n_f32(0.0);
+            let mut sumv1 = vdupq_n_f32(0.0);
 
             let mut i = 0;
             while i + 1 < nb {
@@ -2978,47 +2989,52 @@ impl CpuBackendNeon {
                 let d0 = x0.d.to_f32() * y0.d.to_f32();
                 let d1 = x1.d.to_f32() * y1.d.to_f32();
 
-                // Block 0
+                // Block 0: unpack Q4_0 nibbles + sub 8
                 let v0_0 = vld1q_u8(x0.qs.as_ptr());
-                // Unpack and sub 8
                 let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
                 let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
                 let y0_l = vld1q_s8(y0.qs.as_ptr());
                 let y0_h = vld1q_s8(y0.qs.as_ptr().add(16));
 
-                let mul_l0 = vmull_s8(vget_low_s8(x0_l), vget_low_s8(y0_l));
-                let mul_l1 = vmull_high_s8(x0_l, y0_l);
-                let mul_h0 = vmull_s8(vget_low_s8(x0_h), vget_low_s8(y0_h));
-                let mul_h1 = vmull_high_s8(x0_h, y0_h);
-                let acc0 = vaddlvq_s16(mul_l0)
-                    + vaddlvq_s16(mul_l1)
-                    + vaddlvq_s16(mul_h0)
-                    + vaddlvq_s16(mul_h1);
-
-                // Block 1
+                // Block 1: unpack Q4_0 nibbles + sub 8
                 let v1_0 = vld1q_u8(x1.qs.as_ptr());
                 let x1_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v1_0, m4b)), s8b);
                 let x1_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v1_0, 4)), s8b);
                 let y1_l = vld1q_s8(y1.qs.as_ptr());
                 let y1_h = vld1q_s8(y1.qs.as_ptr().add(16));
 
+                // Block 0 dot → int32x4_t: vmull_s8 × 4 → vpaddlq_s16 × 2 → vaddq_s32
+                //   vdotq_s32(acc, a, b)와 등가 (dotprod 없는 fallback)
+                let mul_l0_0 = vmull_s8(vget_low_s8(x0_l), vget_low_s8(y0_l));
+                let mul_l1_0 = vmull_high_s8(x0_l, y0_l);
+                let mul_h0_0 = vmull_s8(vget_low_s8(x0_h), vget_low_s8(y0_h));
+                let mul_h1_0 = vmull_high_s8(x0_h, y0_h);
+                // 각 i16x8 쌍을 i32x4 pairwise로 접고 누적. 블록당 horizontal reduction 없음.
+                let p_low_0 = vaddq_s32(vpaddlq_s16(mul_l0_0), vpaddlq_s16(mul_l1_0));
+                let p_high_0 = vaddq_s32(vpaddlq_s16(mul_h0_0), vpaddlq_s16(mul_h1_0));
+                let p_0 = vaddq_s32(p_low_0, p_high_0);
+
+                // Block 1 dot → int32x4_t
                 let mul_l0_1 = vmull_s8(vget_low_s8(x1_l), vget_low_s8(y1_l));
                 let mul_l1_1 = vmull_high_s8(x1_l, y1_l);
                 let mul_h0_1 = vmull_s8(vget_low_s8(x1_h), vget_low_s8(y1_h));
                 let mul_h1_1 = vmull_high_s8(x1_h, y1_h);
-                let acc1 = vaddlvq_s16(mul_l0_1)
-                    + vaddlvq_s16(mul_l1_1)
-                    + vaddlvq_s16(mul_h0_1)
-                    + vaddlvq_s16(mul_h1_1);
+                let p_low_1 = vaddq_s32(vpaddlq_s16(mul_l0_1), vpaddlq_s16(mul_l1_1));
+                let p_high_1 = vaddq_s32(vpaddlq_s16(mul_h0_1), vpaddlq_s16(mul_h1_1));
+                let p_1 = vaddq_s32(p_low_1, p_high_1);
 
-                sumf += d0 * acc0 as f32;
-                sumf += d1 * acc1 as f32;
+                // Float 누적: sumv += vcvtq_f32_s32(p) * d (scalar broadcast FMA)
+                sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), d0);
+                sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_1), d1);
 
                 i += 2;
             }
 
-            // Tail
-            while i < nb {
+            // 루프 종료 후 horizontal reduction 1회 (float lane 4개 → scalar)
+            let mut sumf = vaddvq_f32(sumv0) + vaddvq_f32(sumv1);
+
+            // Tail (nb가 홀수일 때 마지막 1블록)
+            if i < nb {
                 let x = &*vx.add(i);
                 let y = &*vy.add(i);
                 let d = x.d.to_f32() * y.d.to_f32();
@@ -3033,16 +3049,16 @@ impl CpuBackendNeon {
                 let mul_l1 = vmull_high_s8(x0_l, y0_l);
                 let mul_h0 = vmull_s8(vget_low_s8(x0_h), vget_low_s8(y0_h));
                 let mul_h1 = vmull_high_s8(x0_h, y0_h);
-                let acc = vaddlvq_s16(mul_l0)
-                    + vaddlvq_s16(mul_l1)
-                    + vaddlvq_s16(mul_h0)
-                    + vaddlvq_s16(mul_h1);
+                let p_low = vaddq_s32(vpaddlq_s16(mul_l0), vpaddlq_s16(mul_l1));
+                let p_high = vaddq_s32(vpaddlq_s16(mul_h0), vpaddlq_s16(mul_h1));
+                let p = vaddq_s32(p_low, p_high);
 
-                sumf += d * acc as f32;
-                i += 1;
+                // Tail은 lane-sum을 스칼라 가중 (단일 블록이므로 vmlaq_n_f32 대비 경미한 비용)
+                sumf += d * vaddvq_s32(p) as f32;
             }
+
+            *s = sumf;
         }
-        *s = sumf;
     }
 
     // Dot Product Q4_0 * Q8_0 (NEON + DotProd)
