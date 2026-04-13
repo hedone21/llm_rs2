@@ -3368,95 +3368,118 @@ impl CpuBackendNeon {
             let m4b = vdupq_n_u8(0x0F);
             let s8b = vdupq_n_s8(0x08);
 
-            let mut sumv = vdupq_n_f32(0.0);
+            // 2-block unroll with two independent float accumulators to hide
+            // smmla → vcvt → vmla dependency chain (matches llama.cpp i8mm pattern).
+            // Each sumv lane layout: [r0, r0, r1, r1] — scale vector zeroes duplicate
+            // lanes so lane 0 holds row-0 sum and lane 2 holds row-1 sum.
+            let mut sumv_a = vdupq_n_f32(0.0);
+            let mut sumv_b = vdupq_n_f32(0.0);
 
-            for i in 0..nb {
-                let b_x0 = &*vx0.add(i);
-                let b_x1 = &*vx1.add(i);
-                let b_y = &*vy.add(i);
+            // Helper: build interleaved smmla operands for one block pair.
+            // Returns (acc int32x4) via the closure-free macro-style inline asm.
+            macro_rules! block_i8mm {
+                ($i:expr, $sumv:ident) => {{
+                    let b_x0 = &*vx0.add($i);
+                    let b_x1 = &*vx1.add($i);
+                    let b_y = &*vy.add($i);
 
-                // Unpack Q4_0 nibbles → signed int8 (subtract bias 8)
-                let v0_0 = vld1q_u8(b_x0.qs.as_ptr());
-                let v0_1 = vld1q_u8(b_x1.qs.as_ptr());
+                    // Unpack Q4_0 nibbles → signed int8 (subtract bias 8)
+                    let v0_0 = vld1q_u8(b_x0.qs.as_ptr());
+                    let v0_1 = vld1q_u8(b_x1.qs.as_ptr());
 
-                let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
-                let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
-                let x1_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_1, m4b)), s8b);
-                let x1_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4)), s8b);
+                    let x0_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_0, m4b)), s8b);
+                    let x0_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_0, 4)), s8b);
+                    let x1_l = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(v0_1, m4b)), s8b);
+                    let x1_h = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(v0_1, 4)), s8b);
 
-                // Load Q8_0 activation
-                let y_l = vld1q_s8(b_y.qs.as_ptr());
-                let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
+                    // Load Q8_0 activation
+                    let y_l = vld1q_s8(b_y.qs.as_ptr());
+                    let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
 
-                // Scale: [d_x0*d_y, 0, d_x1*d_y, 0] — zero lanes mask out duplicate smmla results
-                let d_x0 = b_x0.d.to_f32();
-                let d_x1 = b_x1.d.to_f32();
-                let d_y = b_y.d.to_f32();
-                let _scale = [d_x0 * d_y, 0.0f32, d_x1 * d_y, 0.0f32];
-                let scale = vld1q_f32(_scale.as_ptr());
+                    let d_x0 = b_x0.d.to_f32();
+                    let d_x1 = b_x1.d.to_f32();
+                    let d_y = b_y.d.to_f32();
 
-                // Interleave weight rows: a[0:7] = x0 half, a[8:15] = x1 half
-                let l0 = vreinterpretq_s8_s64(vzip1q_s64(
-                    vreinterpretq_s64_s8(x0_l),
-                    vreinterpretq_s64_s8(x1_l),
-                ));
-                let l1 = vreinterpretq_s8_s64(vzip2q_s64(
-                    vreinterpretq_s64_s8(x0_l),
-                    vreinterpretq_s64_s8(x1_l),
-                ));
-                let l2 = vreinterpretq_s8_s64(vzip1q_s64(
-                    vreinterpretq_s64_s8(x0_h),
-                    vreinterpretq_s64_s8(x1_h),
-                ));
-                let l3 = vreinterpretq_s8_s64(vzip2q_s64(
-                    vreinterpretq_s64_s8(x0_h),
-                    vreinterpretq_s64_s8(x1_h),
-                ));
+                    // Scale vector constructed in-register (avoids stack-to-load stall).
+                    // Layout [d_x0*d_y, 0, d_x1*d_y, 0] masks out duplicate smmla lanes.
+                    let s0x = d_x0 * d_y;
+                    let s1x = d_x1 * d_y;
+                    let scale = vsetq_lane_f32(
+                        s1x,
+                        vsetq_lane_f32(s0x, vdupq_n_f32(0.0), 0),
+                        2,
+                    );
 
-                // Duplicate activation for both halves (GEMV: single activation row replicated)
-                let r0 = vreinterpretq_s8_s64(vzip1q_s64(
-                    vreinterpretq_s64_s8(y_l),
-                    vreinterpretq_s64_s8(y_l),
-                ));
-                let r1 = vreinterpretq_s8_s64(vzip2q_s64(
-                    vreinterpretq_s64_s8(y_l),
-                    vreinterpretq_s64_s8(y_l),
-                ));
-                let r2 = vreinterpretq_s8_s64(vzip1q_s64(
-                    vreinterpretq_s64_s8(y_h),
-                    vreinterpretq_s64_s8(y_h),
-                ));
-                let r3 = vreinterpretq_s8_s64(vzip2q_s64(
-                    vreinterpretq_s64_s8(y_h),
-                    vreinterpretq_s64_s8(y_h),
-                ));
+                    // Interleave weight rows: a[0:7] = x0 half, a[8:15] = x1 half
+                    let l0 = vreinterpretq_s8_s64(vzip1q_s64(
+                        vreinterpretq_s64_s8(x0_l),
+                        vreinterpretq_s64_s8(x1_l),
+                    ));
+                    let l1 = vreinterpretq_s8_s64(vzip2q_s64(
+                        vreinterpretq_s64_s8(x0_l),
+                        vreinterpretq_s64_s8(x1_l),
+                    ));
+                    let l2 = vreinterpretq_s8_s64(vzip1q_s64(
+                        vreinterpretq_s64_s8(x0_h),
+                        vreinterpretq_s64_s8(x1_h),
+                    ));
+                    let l3 = vreinterpretq_s8_s64(vzip2q_s64(
+                        vreinterpretq_s64_s8(x0_h),
+                        vreinterpretq_s64_s8(x1_h),
+                    ));
 
-                // 4 chained smmla: accumulate 32 int8 dot products per weight row.
-                // .arch_extension i8mm enables smmla even when the default target
-                // does not include +i8mm (runtime detection guards the call site).
-                let mut acc = vdupq_n_s32(0);
-                std::arch::asm!(
-                    ".arch_extension i8mm",
-                    "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
-                    "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
-                    "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
-                    "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
-                    acc = inout(vreg) acc,
-                    a0 = in(vreg) l0,
-                    b0 = in(vreg) r0,
-                    a1 = in(vreg) l1,
-                    b1 = in(vreg) r1,
-                    a2 = in(vreg) l2,
-                    b2 = in(vreg) r2,
-                    a3 = in(vreg) l3,
-                    b3 = in(vreg) r3,
-                );
+                    // Duplicate activation for both halves (GEMV: single activation row)
+                    let r0 = vreinterpretq_s8_s64(vzip1q_s64(
+                        vreinterpretq_s64_s8(y_l),
+                        vreinterpretq_s64_s8(y_l),
+                    ));
+                    let r1 = vreinterpretq_s8_s64(vzip2q_s64(
+                        vreinterpretq_s64_s8(y_l),
+                        vreinterpretq_s64_s8(y_l),
+                    ));
+                    let r2 = vreinterpretq_s8_s64(vzip1q_s64(
+                        vreinterpretq_s64_s8(y_h),
+                        vreinterpretq_s64_s8(y_h),
+                    ));
+                    let r3 = vreinterpretq_s8_s64(vzip2q_s64(
+                        vreinterpretq_s64_s8(y_h),
+                        vreinterpretq_s64_s8(y_h),
+                    ));
 
-                // acc = [dot(x0,y), dot(x0,y), dot(x1,y), dot(x1,y)]
-                // vmlaq with scale zeroes duplicate lanes → sumv[0] += x0, sumv[2] += x1
-                sumv = vmlaq_f32(sumv, vcvtq_f32_s32(acc), scale);
+                    let mut acc = vdupq_n_s32(0);
+                    std::arch::asm!(
+                        ".arch_extension i8mm",
+                        "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                        "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                        "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                        "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                        acc = inout(vreg) acc,
+                        a0 = in(vreg) l0,
+                        b0 = in(vreg) r0,
+                        a1 = in(vreg) l1,
+                        b1 = in(vreg) r1,
+                        a2 = in(vreg) l2,
+                        b2 = in(vreg) r2,
+                        a3 = in(vreg) l3,
+                        b3 = in(vreg) r3,
+                    );
+
+                    // acc = [dot(x0,y), dot(x0,y), dot(x1,y), dot(x1,y)]
+                    $sumv = vmlaq_f32($sumv, vcvtq_f32_s32(acc), scale);
+                }};
             }
 
+            let mut i = 0;
+            while i + 1 < nb {
+                block_i8mm!(i, sumv_a);
+                block_i8mm!(i + 1, sumv_b);
+                i += 2;
+            }
+            if i < nb {
+                block_i8mm!(i, sumv_a);
+            }
+
+            let sumv = vaddq_f32(sumv_a, sumv_b);
             *s0 = vgetq_lane_f32(sumv, 0);
             *s1 = vgetq_lane_f32(sumv, 2);
         }
@@ -3563,89 +3586,122 @@ impl CpuBackendNeon {
         let m4b = vdupq_n_u8(0x0F);
         let s8b = vdupq_n_s8(0x08);
 
-        let mut sumv01 = vdupq_n_f32(0.0);
-        let mut sumv23 = vdupq_n_f32(0.0);
+        // 4 float accumulators: 2 per row-pair × 2-block unroll.
+        // Two independent chains per row-pair break the smmla → vcvt → vmla
+        // dependency, matching llama.cpp's i8mm 2-block unroll strategy.
+        // Each sumv lane layout: [r_a, r_a, r_b, r_b] — scale zeroes duplicate lanes
+        // so lane 0 holds the first row, lane 2 holds the second.
+        let mut sumv01_a = vdupq_n_f32(0.0);
+        let mut sumv01_b = vdupq_n_f32(0.0);
+        let mut sumv23_a = vdupq_n_f32(0.0);
+        let mut sumv23_b = vdupq_n_f32(0.0);
 
-        for i in 0..nb_k {
-            let base = il_ptr.add(i * IL_BLOCK_SIZE);
-            let b_y = &*vy.add(i);
+        // Single-block processing of an interleaved block, feeding two float
+        // accumulators (one for row-pair 0+1, one for row-pair 2+3).
+        macro_rules! il_block {
+            ($i:expr, $s01:ident, $s23:ident) => {{
+                let base = il_ptr.add($i * IL_BLOCK_SIZE);
+                let b_y = &*vy.add($i);
 
-            // Load 4 scales
-            let d0 = half::f16::from_bits(*(base as *const u16)).to_f32();
-            let d1 = half::f16::from_bits(*(base.add(2) as *const u16)).to_f32();
-            let d2 = half::f16::from_bits(*(base.add(4) as *const u16)).to_f32();
-            let d3 = half::f16::from_bits(*(base.add(6) as *const u16)).to_f32();
-            let d_y = b_y.d.to_f32();
+                // 4 scales + activation scale
+                let d0 = half::f16::from_bits(*(base as *const u16)).to_f32();
+                let d1 = half::f16::from_bits(*(base.add(2) as *const u16)).to_f32();
+                let d2 = half::f16::from_bits(*(base.add(4) as *const u16)).to_f32();
+                let d3 = half::f16::from_bits(*(base.add(6) as *const u16)).to_f32();
+                let d_y = b_y.d.to_f32();
 
-            // Load activation once, duplicate for smmla
-            let y_l = vld1q_s8(b_y.qs.as_ptr());
-            let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
-            let r0 = vreinterpretq_s8_s64(vzip1q_s64(
-                vreinterpretq_s64_s8(y_l),
-                vreinterpretq_s64_s8(y_l),
-            ));
-            let r1 = vreinterpretq_s8_s64(vzip2q_s64(
-                vreinterpretq_s64_s8(y_l),
-                vreinterpretq_s64_s8(y_l),
-            ));
-            let r2 = vreinterpretq_s8_s64(vzip1q_s64(
-                vreinterpretq_s64_s8(y_h),
-                vreinterpretq_s64_s8(y_h),
-            ));
-            let r3 = vreinterpretq_s8_s64(vzip2q_s64(
-                vreinterpretq_s64_s8(y_h),
-                vreinterpretq_s64_s8(y_h),
-            ));
+                // Activation: load once, duplicate halves for smmla GEMV
+                let y_l = vld1q_s8(b_y.qs.as_ptr());
+                let y_h = vld1q_s8(b_y.qs.as_ptr().add(16));
+                let r0 = vreinterpretq_s8_s64(vzip1q_s64(
+                    vreinterpretq_s64_s8(y_l),
+                    vreinterpretq_s64_s8(y_l),
+                ));
+                let r1 = vreinterpretq_s8_s64(vzip2q_s64(
+                    vreinterpretq_s64_s8(y_l),
+                    vreinterpretq_s64_s8(y_l),
+                ));
+                let r2 = vreinterpretq_s8_s64(vzip1q_s64(
+                    vreinterpretq_s64_s8(y_h),
+                    vreinterpretq_s64_s8(y_h),
+                ));
+                let r3 = vreinterpretq_s8_s64(vzip2q_s64(
+                    vreinterpretq_s64_s8(y_h),
+                    vreinterpretq_s64_s8(y_h),
+                ));
 
-            // Pair 0+1: load pre-interleaved weights → unpack → smmla directly
-            let w01a = vld1q_u8(base.add(8)); // [r0.qs[0:8], r1.qs[0:8]]
-            let w01b = vld1q_u8(base.add(24)); // [r0.qs[8:16], r1.qs[8:16]]
-            let l0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01a, m4b)), s8b);
-            let l1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01b, m4b)), s8b);
-            let l2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01a, 4)), s8b);
-            let l3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01b, 4)), s8b);
+                // Scale vectors built in-register (avoid stack store-to-load stall)
+                let scale01 = vsetq_lane_f32(
+                    d1 * d_y,
+                    vsetq_lane_f32(d0 * d_y, vdupq_n_f32(0.0), 0),
+                    2,
+                );
+                let scale23 = vsetq_lane_f32(
+                    d3 * d_y,
+                    vsetq_lane_f32(d2 * d_y, vdupq_n_f32(0.0), 0),
+                    2,
+                );
 
-            let scale01 = [d0 * d_y, 0.0f32, d1 * d_y, 0.0f32];
-            let mut acc01 = vdupq_n_s32(0);
-            std::arch::asm!(
-                ".arch_extension i8mm",
-                "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
-                "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
-                "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
-                "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
-                acc = inout(vreg) acc01,
-                a0 = in(vreg) l0, b0 = in(vreg) r0,
-                a1 = in(vreg) l1, b1 = in(vreg) r1,
-                a2 = in(vreg) l2, b2 = in(vreg) r2,
-                a3 = in(vreg) l3, b3 = in(vreg) r3,
-            );
-            sumv01 = vmlaq_f32(sumv01, vcvtq_f32_s32(acc01), vld1q_f32(scale01.as_ptr()));
+                // Pair 0+1
+                let w01a = vld1q_u8(base.add(8));
+                let w01b = vld1q_u8(base.add(24));
+                let l0 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01a, m4b)), s8b);
+                let l1 = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w01b, m4b)), s8b);
+                let l2 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01a, 4)), s8b);
+                let l3 = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w01b, 4)), s8b);
 
-            // Pair 2+3: same pattern, reusing activation r0..r3
-            let w23a = vld1q_u8(base.add(40));
-            let w23b = vld1q_u8(base.add(56));
-            let l0b = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w23a, m4b)), s8b);
-            let l1b = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w23b, m4b)), s8b);
-            let l2b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w23a, 4)), s8b);
-            let l3b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w23b, 4)), s8b);
+                let mut acc01 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension i8mm",
+                    "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                    "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                    "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                    "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                    acc = inout(vreg) acc01,
+                    a0 = in(vreg) l0, b0 = in(vreg) r0,
+                    a1 = in(vreg) l1, b1 = in(vreg) r1,
+                    a2 = in(vreg) l2, b2 = in(vreg) r2,
+                    a3 = in(vreg) l3, b3 = in(vreg) r3,
+                );
+                $s01 = vmlaq_f32($s01, vcvtq_f32_s32(acc01), scale01);
 
-            let scale23 = [d2 * d_y, 0.0f32, d3 * d_y, 0.0f32];
-            let mut acc23 = vdupq_n_s32(0);
-            std::arch::asm!(
-                ".arch_extension i8mm",
-                "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
-                "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
-                "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
-                "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
-                acc = inout(vreg) acc23,
-                a0 = in(vreg) l0b, b0 = in(vreg) r0,
-                a1 = in(vreg) l1b, b1 = in(vreg) r1,
-                a2 = in(vreg) l2b, b2 = in(vreg) r2,
-                a3 = in(vreg) l3b, b3 = in(vreg) r3,
-            );
-            sumv23 = vmlaq_f32(sumv23, vcvtq_f32_s32(acc23), vld1q_f32(scale23.as_ptr()));
+                // Pair 2+3: reuses r0..r3 activation halves
+                let w23a = vld1q_u8(base.add(40));
+                let w23b = vld1q_u8(base.add(56));
+                let l0b = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w23a, m4b)), s8b);
+                let l1b = vsubq_s8(vreinterpretq_s8_u8(vandq_u8(w23b, m4b)), s8b);
+                let l2b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w23a, 4)), s8b);
+                let l3b = vsubq_s8(vreinterpretq_s8_u8(vshrq_n_u8(w23b, 4)), s8b);
+
+                let mut acc23 = vdupq_n_s32(0);
+                std::arch::asm!(
+                    ".arch_extension i8mm",
+                    "smmla {acc:v}.4s, {a0:v}.16b, {b0:v}.16b",
+                    "smmla {acc:v}.4s, {a1:v}.16b, {b1:v}.16b",
+                    "smmla {acc:v}.4s, {a2:v}.16b, {b2:v}.16b",
+                    "smmla {acc:v}.4s, {a3:v}.16b, {b3:v}.16b",
+                    acc = inout(vreg) acc23,
+                    a0 = in(vreg) l0b, b0 = in(vreg) r0,
+                    a1 = in(vreg) l1b, b1 = in(vreg) r1,
+                    a2 = in(vreg) l2b, b2 = in(vreg) r2,
+                    a3 = in(vreg) l3b, b3 = in(vreg) r3,
+                );
+                $s23 = vmlaq_f32($s23, vcvtq_f32_s32(acc23), scale23);
+            }};
         }
 
+        let mut i = 0;
+        while i + 1 < nb_k {
+            il_block!(i, sumv01_a, sumv23_a);
+            il_block!(i + 1, sumv01_b, sumv23_b);
+            i += 2;
+        }
+        if i < nb_k {
+            il_block!(i, sumv01_a, sumv23_a);
+        }
+
+        let sumv01 = vaddq_f32(sumv01_a, sumv01_b);
+        let sumv23 = vaddq_f32(sumv23_a, sumv23_b);
         out[0] = vgetq_lane_f32(sumv01, 0);
         out[1] = vgetq_lane_f32(sumv01, 2);
         out[2] = vgetq_lane_f32(sumv23, 0);
