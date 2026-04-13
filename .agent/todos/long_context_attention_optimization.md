@@ -668,11 +668,11 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 ---
 
 #### [P0-3] OpenCL flash_attn prefill 커널 head_dim=128 지원 (Qwen 계열)
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: **DONE (기능) / 성능 회귀 (2026-04-13, 커밋 7f41d2f + 37aaab2)** — Qwen prefill GPU dispatch 활성화 확인, 단 prefill 속도 31 tok/s < CPU fallback 43 tok/s (-28%). 남은 격차는 Adreno 특화 matmul 부재 → **P2-1 영역**으로 이관.
+- **Sprint**: done (perf 잔여는 P2-1)
 - **담당**: senior-implementer
 - **Dependencies**: 없음 (Step 2 decode head_dim=128 패턴 참조)
-- **예상 작업량**: 1 ~ 2일
+- **예상 작업량**: 1 ~ 2일 (실제 소요 동일)
 - **코드 위치**:
   - `engine/src/backend/opencl/mod.rs::flash_attention_prefill_gpu` (F16 분기 — 현재 `if head_dim != 64 { return Ok(false); }`)
   - `engine/kernels/flash_attn_f32_f16*.cl` (prefill 커널; `DK=DV=64` 빌드 매크로)
@@ -680,12 +680,17 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 - **참조**: 최근 커밋에서 decode에 적용된 head_dim=128 커널 (`attention_gen_f16_neon` 계열 Step 2/3 prefill/decode 패턴), llama.cpp Adreno flash attention 커널
 - **Description**: Prefill용 F16 flash attention OpenCL 커널을 `DK=DV=128`로 별도 빌드하고, `head_dim == 128` 분기에서 dispatch. Step 2가 decode 경로에 적용한 head_dim 별 커널 컴파일 + 선택 로직을 prefill에 확장. Qwen2.5 1.5B (head_dim=128)가 F16 KV 구성에서 GPU prefill을 사용할 수 있도록 함.
 - **Acceptance Criteria**:
-  - [ ] `flash_attention_prefill_gpu`가 `head_dim == 128, DType::F16` 조합에서 `Ok(true)`로 dispatch됨 (fallback 경고 로그 없음)
-  - [ ] 4K prefill (Qwen2.5 1.5B, F16 KV, GPU): 현재 CPU fallback 수치 대비 명확한 개선 (측정값은 P1-1/P1-2 완료 후 재정의)
-  - [ ] head_dim=64 (Llama 3.2 계열) 경로 회귀 없음
-  - [ ] `test_backend` 정확도: CPU vs GPU cos-sim ≥ 0.999 (head_dim=128)
-  - [ ] 커널 컴파일 시간 증가는 허용 범위 (프로그램 캐시로 완화 확인)
-- **Notes**: Step 2 decode 패턴 재사용 가능 — 구조적으로 낮은 리스크. P0-4 대비 **선행 권장** (커널 템플릿 매크로화 경험 확보).
+  - [x] `flash_attention_prefill_gpu`가 `head_dim == 128, DType::F16` 조합에서 `Ok(true)`로 dispatch됨 (fallback 경고 로그 없음) ✅
+  - [ ] 4K prefill (Qwen2.5 1.5B, F16 KV, GPU): 현재 CPU fallback 수치 대비 명확한 개선 — ❌ **미달** (CPU 43 → GPU 31, -28%)
+  - [x] head_dim=64 (Llama 3.2 계열) 경로 회귀 없음 ✅
+  - [x] `test_backend` 정확도: CPU vs GPU cos-sim ≥ 0.999 (head_dim=128) ✅
+  - [x] 커널 컴파일 시간 증가는 허용 범위 (프로그램 캐시로 완화 확인) ✅
+- **Notes**:
+  - Step 2 decode 패턴 재사용 가능 — 구조적으로 낮은 리스크. P0-4 대비 **선행 권장** (커널 템플릿 매크로화 경험 확보).
+  - **2026-04-13 실측**: Qwen prefill GPU 활성화 확인, `[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32` 로그 발화, CPU fallback 로그(`[GPU-fallback]`) 제거. 단 prefill 속도 31 tok/s < CPU fallback 43 tok/s.
+  - **BLOCK_M=64 vs 32 모두 30.8 ~ 31.0 tok/s** 로 register spill 원인 아님 확정 (튜닝 무효).
+  - 남은 격차 (GPU 31 vs llama.cpp 760, **24×**) 는 Adreno subgroup + texture cache 최적화 필요 → **P2-1 영역**으로 이관.
+  - Decode 경로 영향 없음 (7.4 → 7.5 tok/s).
 
 ---
 
@@ -920,64 +925,68 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 
 ---
 
-#### [P2-1] GPU Adreno F16 matmul 커널 (Subgroup + Texture)
-- **Status**: TODO
-- **Sprint**: next (P0-3/P0-4 + P1 완료 후)
+#### [P2-1] GPU Adreno F16 matmul 커널 (Subgroup + Texture) — 🔥 **최우선 (2026-04-13 승격)**
+- **Status**: TODO → **🔥 최우선 (2026-04-13 승격, P0-3 완료 후)**
+- **Sprint**: current
 - **담당**: researcher 선조사 → senior-implementer 구현
-- **Dependencies**: P0-3 (head_dim=128 prefill 커널), P0-4 (Q4_0 prefill 커널), P1-1 (GPU prefill chunk sizing), P1-2 (per-op 측정 + fallback 로그) — **flash attention dispatch가 실제로 GPU에서 일어나는 상태**에서 matmul 병목이 remaining gap의 지배 요인인지 검증 선행
+- **Dependencies**: P0-3 ✅ 완료 (Qwen prefill GPU 경로 활성화로 fallback 아닌 실제 커널 측정 가능). P1-1 / P1-2 ✅ 완료
 - **예상 작업량**: 4 ~ 7일 (연구 2일 + 구현 3 ~ 5일)
 - **코드 위치**:
-  - 기존: `engine/kernels/mul_mv_f16_f32.cl`, `matmul*.cl` 계열
-  - 신규 예정: `engine/kernels/mul_mm_f16_adreno.cl` (Prefill GEMM 특화)
+  - 기존: `engine/kernels/mul_mv_f16_f32.cl`, `matmul*.cl` 계열, `engine/kernels/flash_attn_f32_f16*.cl` (prefill DK=128)
+  - 신규 예정: `engine/kernels/mul_mm_f16_adreno.cl` (Prefill GEMM 특화), 또는 기존 flash attention 커널의 Adreno-특화 버전
 - **참조 문서**: 
-  - llama.cpp `ggml-opencl.cpp` Adreno subgroup 커널
+  - llama.cpp `ggml-opencl.cpp` Adreno subgroup 커널 (`gemv_noshuffle.cl` 등)
+  - `mul_mv_q4_0_*.cl` (이미 Adreno 최적화된 Q4_0 GEMV 커널 — F16 계열에 이식 가능성)
   - `arch/gpu_backend.md` (있다면)
   - `docs/31_perf_comparison_llama_cpp.md` Phase 3 섹션
 - **Description**:
-  - **Phase A (Researcher)**: llama.cpp Adreno F16 matmul 커널 분석 → subgroup size, local mem tiling, texture cache(image2d) 사용 패턴 정리. 우리 현재 커널과 diff, Qualcomm 플랫폼 feature 요구사항 문서화.
-  - **Phase B (senior-implementer)**: Prefill GEMM (M >> 1) 특화 F16 커널 작성. Subgroup reduction + texture(image2d_t)로 K 행 재사용 극대화. 기존 decode GEMV 커널은 건드리지 않음.
+  - P0-3 완료로 Qwen prefill GPU 활성화됐으나 속도 미달(CPU 43 > GPU 31). Register spill 아님 확정, **Adreno 특화 최적화 부재가 원인**.
+  - **Phase A (Researcher)**: llama.cpp Adreno 계열 커널 패턴 분석 — subgroup size, local mem tiling, texture cache(image2d_t) 사용 패턴 정리. `cl_qcom_extended_register_size`, subgroup intrinsics (Qualcomm extensions). 우리 현재 커널과 diff. 우리 프로젝트 내 이미 Adreno-친화로 작성된 `mul_mv_q4_0_*.cl` 패턴을 F16 계열 (특히 `flash_attn_f32_f16` prefill DK=128) 에 이식 가능성 평가.
+  - **Phase B (senior-implementer)**: Prefill 핵심 커널 (`flash_attn_f32_f16` prefill DK=128) 의 Adreno 특화 변형. Subgroup reduction + texture(image2d_t)로 K 행 재사용 극대화. 필요 시 decode `_q1` 도 포함. 기존 일반 커널은 fallback으로 보존.
 - **Acceptance Criteria**:
   - [ ] Research 산출물: Adreno subgroup 커널 작동 원리 + 적용 가능성 평가 문서
-  - [ ] 4K prefill GPU: 39.2 → 200+ tok/s (5x 이상 개선, 절대값은 Researcher 보고 이후 재조정)
-  - [ ] Decode 성능 회귀 없음 (GEMV 커널 유지)
+  - [ ] 4K prefill (Qwen 2.5 1.5B, Adreno 830, plan ON, 6T): **31 → 100+ tok/s** (llama.cpp 760의 13%+ 회복; 절대값은 researcher 보고 후 재조정)
+  - [ ] 4K decode 회귀 없음 (현재 7.3 tok/s 유지)
   - [ ] Non-Adreno (NVIDIA/Intel OpenCL) fallback 유지 — 기존 범용 커널 보존
   - [ ] `test_backend` 정확도: CPU vs GPU cos-sim ≥ 0.999
-- **Notes**: ROI 불확실성과 작업량 때문에 P2. **P0-3/P0-4 완료로 flash attention이 실제 GPU에서 dispatch된 상태**에서 OpProfiler로 GPU prefill 병목이 정말 matmul에 있는지 재검증 후 착수. (10.1.5 발견 이전에는 "GPU prefill 측정치"가 사실상 CPU fallback 결과였을 가능성이 높음.) `.cl` 수정 허용 규칙은 `feedback_cl_modification.md` 참조.
+- **Notes**:
+  - ROI 불확실성과 작업량 때문에 원래 P2였으나, P0-3 완료로 GPU dispatch가 실제 일어나는 상태가 되었고 prefill GPU(31) < CPU fallback(43) 회귀가 확인됨에 따라 **최우선 트랙으로 승격**.
+  - 대상 커널: `flash_attn_f32_f16` prefill (DK=128). Adreno subgroup + texture cache 미사용이 회귀의 근본 원인.
+  - `.cl` 수정 허용 규칙은 `feedback_cl_modification.md` 참조.
 
 ---
 
-### 10.3 권장 실행 순서 (2026-04-13 17:00 재재정렬 — 10.1.6 발견 반영)
+### 10.3 권장 실행 순서 (2026-04-13 20:30 최종 정리 — P0-3 완료, P2-1 최우선 승격)
 
-**핵심 업데이트**: 10.1.6 발견으로 **GPU decode attention의 KV-split 부재 (P0-5)**가 long-context 성능 갭의 최대 원인으로 확인됨. 또한 10.1.5 원인 D1 (Q4_0 prefill 커널) 분석은 오진으로 정정되어 P0-4는 강등. 따라서 GPU 트랙의 중심이 prefill(P0-3/P0-4)에서 **decode(P0-5)로 이동**.
+**핵심 업데이트 (2026-04-13 세션 종료 시점)**: P0-3 기능 완료 (Qwen prefill GPU dispatch 활성화)로 CPU fallback 탈출. 그러나 GPU prefill (31 tok/s) < CPU fallback (43 tok/s, -28%)로 회귀가 확인되어 **P2-1 (Adreno F16 matmul 커널)**이 최우선으로 승격됨. P0-5/P0-5b/P0-5c는 모두 revert, P0-5d는 Llama 3.2 3B 도입 후 재평가로 deferred.
 
 **병렬 트랙 A (CPU 성능 / fallback 완화)**:
 1. ~~P0-1 rework~~ **PARTIAL DONE (커밋 c794292+9abd8e0; 11.2 → 12.0 tok/s, +7.1%)** — 목표 14+ 미달분은 P0-5 기인 가능성
 2. P0-2 F16 직접 경로 prefill (senior-implementer, 1~2일)
 
 **병렬 트랙 A' (GPU 커널 확장 — 본질적 해결, 최우선)** — 2026-04-13 20:00 재재재정렬 (P0-5c revert 후):
-1. 🔥 **P0-3 head_dim=128 prefill 커널** (senior-implementer, 1~2일) — **최우선 승격**. Qwen prefill GPU 활성화 → CPU fallback 탈출. Step 2 decode 패턴 재사용.
-2. ~~**P0-5c GQA-aware KV 공유 커널**~~ **REVERTED (커밋 84c82d2)** — Qwen 4K 측정에서 net regression (7.3 → 2.6 tok/s, -65%). PLAN_DEBUG로 GQA kernel 정상 활성화 확인했으나 n_heads_kv=2 → WG=2 under-utilization. 코드는 커밋 5f59455 에 보존. 결합 작업은 **P0-5d** 로 이관.
+**트랙 A' (GPU 커널 확장) — 최종 정리**:
+1. 🔥 **P2-1 Adreno F16 matmul 커널** — **최우선** (researcher 2일 → senior-implementer 3~5일). Prefill 31 → 100+ tok/s 목표.
+2. ~~**P0-3 head_dim=128 prefill 커널**~~ **DONE 기능 / 성능 회귀 (커밋 7f41d2f + 37aaab2, 2026-04-13)** — Qwen prefill GPU dispatch 활성화 ✅, CPU fallback 로그 제거 ✅. 단 GPU 31 tok/s < CPU 43 tok/s. 잔여 갭은 P2-1로 이관.
 3. ~~**P0-5 decode KV-split 커널/dispatch**~~ **REVERTED (커밋 d0d4978)** — 4K Adreno 830 net regression (-11%) 확정. 코드는 5f3dd1f/9a5a75e/f14ddb3 에 보존. **결합 작업은 P0-5d 로 이관**.
 4. ~~**P0-5b Plan-path KV-split 통합**~~ **REVERTED (커밋 d0d4978)** — Plan 통합 동작 확인했으나 P0-5 본체가 net negative라 함께 revert. **결합 작업은 P0-5d 로 이관**.
-5. 🔶 **P0-5d GQA + KV-split 결합 커널** — **DEFERRED (backlog)**. P0-3 완료 후 재평가. P0-5/P0-5b/P0-5c 커밋 resurrect + 결합 (`gws=[WG_SIZE, n_heads_kv, n_kv_splits]`). Qwen 2×8=16 WG, Llama 8×8=64 WG → SP 점유율 확보. 권장 검증 순서: Llama 3.2 3B 먼저 → Qwen.
-5. ~~P0-4 Q4_0 prefill 커널~~ **DEFERRED (P2/future)** — 현재 벤치 구성(KV=F16)과 무관
+5. ~~**P0-5c GQA-aware KV 공유 커널**~~ **REVERTED (커밋 84c82d2)** — Qwen 4K 측정에서 net regression (7.3 → 2.6 tok/s, -65%). 코드는 커밋 5f59455 에 보존. 결합 작업은 **P0-5d** 로 이관.
+6. 🔶 **P0-5d GQA + KV-split 결합 커널** — **DEFERRED (backlog)**. Llama 3.2 3B 등 다른 모델 벤치 인프라 도입 후 재평가. WG 수가 큰 구성에서 먼저 검증 후 Qwen 적용.
+7. ~~P0-4 Q4_0 prefill 커널~~ **DEFERRED (P2/future)** — 현재 벤치 구성(KV=F16)과 무관
 
 **병렬 트랙 B (GPU 재개 + 가시성)** — **완료**:
 1. ~~P1-1 GPU chunk auto-sizing~~ **DONE (커밋 15f99e0)**
 2. ~~P1-2 Prefill OpProfiler 확장 + fallback 감지 로그~~ **DONE (커밋 f0091cc)**
 
-**직렬 트랙 C (GPU 최종 최적화)** — A' 완료 후:
-1. P2-1 Phase A: Researcher 선조사 (2일) — P0-3/P0-5 완료 상태에서 remaining gap 분석
-2. P2-1 Phase B: senior-implementer 구현 (3~5일)
+**트랙 C (CPU prefill F16 경로)** — 차순위:
+1. **P0-2** CPU prefill F16 직접 경로 (Step 3 Stage 9). GPU prefill 활성화로 우선순위 낮아졌으나 non-GPU 디바이스/fallback 품질 위해 차순위 유지.
 
-**마일스톤 재정의 (2026-04-13 20:00 — P0-5c revert 반영)**:
-- **M1 (완료)**: P0-1 rework + P1-1 + P1-2 완료 → decode 11.2 → **12.0 tok/s** (Qwen CPU 4K, +7.1%, 목표 14+ 일부 달성), GPU prefill fallback 가시화, chunk auto-sizing 정상화.
-- **M2 (현재, 재정의)**: **P0-3 완료 → Qwen prefill GPU 활성화 (head_dim=128 dispatch, CPU fallback 탈출)**. 최우선 목표. P0-5c revert로 GPU 트랙의 본질 작업이 prefill 로 이동.
-- **M3 (재정의)**: **P0-2 완료 → CPU prefill F16 직접 경로 (Step 3 Stage 9)**. Prefill 성능 격차 해소.
-- **M4 (조건부, 재정의)**: **P0-5d (GQA + KV-split 결합) 활성화 후 완료** — 현재 Adreno 830 + Qwen 벤치 구성에서 유의미한 효과 확인되면. P0-3 완료 상태에서 remaining gap이 여전히 decode attention 이면 진입.
-- **M5**: P2-1 (Adreno F16 matmul 커널) — P0-3 완료로 prefill GPU dispatch 확보된 상태에서 remaining gap 분석 후 필요 시 착수.
-- ~~**이전 M2 (P0-5b)**~~ **제거** (revert로 전제 소멸)
-- ~~**이전 M2 (P0-5c 단독)**~~ **제거** (2026-04-13 revert로 전제 소멸 → P0-5d 결합 작업으로 이관)
+**마일스톤 재정의 (2026-04-13 세션 종료)**:
+- **M1 (완료)**: P0-1 rework (partial) + P1-1 + P1-2 완료 → decode 11.2 → **12.0 tok/s** (Qwen CPU 4K, +7.1%), GPU prefill fallback 가시화, chunk auto-sizing 정상화.
+- **M2 (완료)**: **P0-3 기능 완료 → Qwen prefill GPU 활성화 (head_dim=128 dispatch, CPU fallback 탈출)**. 단 perf 회귀로 P2-1 후속 작업 필수.
+- **M3 (현재, 🔥 진행 중 타겟)**: **P2-1 완료 → Adreno F16 matmul 커널 적용으로 prefill 31 → 100+ tok/s**. Subgroup + texture cache 기반.
+- **M4 (차후)**: **P0-2 완료 → CPU prefill F16 직접 경로**. Non-GPU fallback 품질 + CPU-only 디바이스 지원.
+- **M5 (조건부)**: **P0-5d (GQA + KV-split 결합) 활성화** — Llama 3.2 3B 벤치 도입 후 WG 충분 구성에서 재평가.
 
 ---
 
@@ -987,7 +996,7 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 |---|---|---|---|
 | P0-1 | 4K decode (CPU 6T, **i8mm 경로 dispatch되는 실측 환경**) | 11.2 → 14+ tok/s | **PARTIAL DONE** (12.0 tok/s, +7.1%) |
 | P0-2 | 4K prefill (CPU) | 37.7 → 60+ tok/s, bulk F16→F32 제거 | TODO |
-| **P0-3** 🔥 | **F16 KV, head_dim=128 prefill GPU dispatch — 최우선 GPU 트랙 (P0-5c revert 후 승격)** | `Ok(false)` fallback 제거, Qwen prefill GPU 활성화, CPU fallback 대비 개선 | **TODO — 🔥 최우선** |
+| P0-3 | F16 KV, head_dim=128 prefill GPU dispatch | `Ok(false)` fallback 제거, Qwen prefill GPU 활성화, CPU fallback 대비 개선 | **DONE 기능 / 성능 회귀 (커밋 7f41d2f + 37aaab2, 2026-04-13) — dispatch ✅, 31 tok/s < CPU 43 (-28%)** |
 | ~~P0-5c~~ | ~~GQA-aware KV 공유 커널 (local memory 공유)~~ | ~~baseline 7.3 → 12+ tok/s, VRAM 24→~4 MB/layer~~ | **REVERTED (커밋 84c82d2, 2026-04-13) — Qwen 4K: 7.3 → 2.6 (-65%); n_heads_kv=2 → WG=2 under-utilization on Adreno 830** |
 | ~~P0-5~~ | ~~4K decode KV-split 커널/dispatch~~ | ~~커널 컴파일 + dispatch + split active~~ | **REVERTED (커밋 d0d4978, 2026-04-13) — net regression -10~11% @ 4K Adreno 830** |
 | ~~P0-5b~~ | ~~Plan-path KV-split 통합~~ | ~~baseline 7.3 대비 회귀 없음~~ | **REVERTED (커밋 d0d4978, 2026-04-13) — plan+KV-split 6.5 tok/s (-11% vs 7.3 baseline)** |
@@ -995,7 +1004,7 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 | ~~P0-4~~ | ~~Q4_0 KV prefill GPU dispatch~~ | ~~cos-sim ≥ 0.995~~ | **DEFERRED (future, P2)** |
 | P1-1 | `--prefill-chunk-size 0` | 실패 → 정상 동작 | **DONE (커밋 15f99e0)** |
 | P1-2 | Prefill per-op 프로파일 + fallback 로그 | 출력 가능, GPU→CPU fallback 경고 stderr | **DONE (커밋 f0091cc)** |
-| P2-1 | 4K prefill (GPU, 실제 GPU dispatch 상태) | 39.2 → 200+ tok/s | TODO (next) |
+| **P2-1** 🔥 | **4K prefill (Qwen, Adreno 830, plan ON, 6T) — 최우선 (P0-3 완료 후 승격)** | **31 → 100+ tok/s** (llama.cpp 760의 13%+) | **TODO — 🔥 최우선 (current sprint)** |
 | 공통 | 수치 정확도 | logit cos-sim ≥ 0.999 (test_backend) | — |
 
 ---
@@ -1007,3 +1016,81 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 - `arch/cpu_flash_attention_prefill.md` — Stage 9 F16 직접 경로 설계
 - `feedback_cl_modification.md` — `.cl` 커널 수정 허용 정책
 - llama.cpp 참조: `reference_llama_cpp_source.md`, `reference_llama_cpp_testing.md`
+
+---
+
+## 11. 다음 세션 시작 가이드 (2026-04-13 세션 종료 시점)
+
+### 현재 master 상태
+- 최신 커밋: `37aaab2 perf(opencl): tune BLOCK_M=32 for flash prefill DK=128`
+- 빌드: Android aarch64 release OK, 호스트 cargo test 정상 (기존 baseline panic 2개 제외)
+- 작업트리 clean (tracked files 기준)
+
+### 측정된 현재 성능 (Qwen 2.5 1.5B Q4_0, Adreno 830, F16 KV, 4K, plan ON, 6T)
+- Prefill: 31.0 tok/s (이전 CPU fallback 43, -28% regression)
+- Decode: 7.3 tok/s (baseline 대비 동일)
+- TBT: 6.8 tok/s
+- 격차: Prefill 24× vs llama.cpp(760), Decode 2× vs llama.cpp(14.9)
+
+### 이번 세션(2026-04-13) 완료 작업 요약
+**커밋 (master)**:
+- `c794292` perf(neon): Q4_0 vec_dot fallback (vpaddlq chain) — P0-1 partial
+- `9abd8e0` perf(neon): Q4_0 i8mm hot paths, 2-block unroll — P0-1 partial
+- `15f99e0` fix(gpu): prefill chunk auto-sizing — P1-1 DONE
+- `f0091cc` feat(profiler): prefill per-op + GPU fallback log — P1-2 DONE
+- `7f41d2f` feat(opencl): GPU flash prefill head_dim=128 — P0-3 기능 DONE
+- `37aaab2` perf(opencl): tune BLOCK_M=32 for DK=128 — P0-3 튜닝 (effect=0)
+
+**Revert (history 보존)**:
+- `d0d4978` ← `5f3dd1f / 9a5a75e / f14ddb3` — P0-5/P0-5b Flash Decoding KV-split (-11%)
+- `84c82d2` ← `5f59455` — P0-5c GQA-aware KV 공유 (-65%, WG=2 under-utilization)
+
+### 다음 세션 착수 옵션
+
+**A. 🔥 P2-1 Adreno F16 matmul 최적화 (권장, 최우선)**
+- researcher 선조사 (2일): Adreno subgroup 커널 패턴, image2d_t, Qualcomm extensions (`gemv_noshuffle.cl` 등 llama.cpp 패턴, 우리 `mul_mv_q4_0_*.cl` 이식 가능성)
+- senior-implementer 구현 (3~5일): subgroup + texture cache 기반 F16 GEMM/flash attention DK=128
+- 목표: Prefill 31 → 100+ tok/s
+- 착수 명령: `researcher` 에이전트 호출 + 본 파일 §10.2 P2-1 항목 참조
+
+**B. P0-2 CPU prefill F16 직접 경로 (차순위)**
+- senior-implementer 구현 (1~2일)
+- CPU fallback 자체 속도 개선 (37→60+ tok/s 기대)
+- 현재 GPU prefill 활성화됐으므로 우선순위 낮음, 단 non-GPU 디바이스 지원에는 중요
+
+**C. P0-5d GQA + KV-split 결합 커널 (DEFERRED 유지)**
+- Llama 3.2 3B 등 다른 모델 벤치 인프라 도입 후 재평가
+- 현재 Qwen 단독 벤치 (n_heads_kv=2)에서는 P0-5c revert 이유로 deferred 유지
+- 착수 조건: Llama 3.2 1B/3B 측정 인프라 추가 시
+
+### 재현용 벤치마크 명령
+```bash
+# Android 빌드 (Linux 호스트)
+export NDK_HOME=/opt/android-ndk
+export HOST_TAG=linux-x86_64
+export TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG
+export CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang
+export CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang++
+export AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android21-clang
+cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
+
+adb push target/aarch64-linux-android/release/generate /data/local/tmp/generate
+adb shell chmod +x /data/local/tmp/generate
+
+# 쿨다운 + 4K bench (1회 규칙)
+sleep 240
+adb shell "dumpsys thermalservice | grep -E 'Thermal Status|AP,'"  # Status 0 확인
+adb shell "cd /data/local/tmp && ./generate \
+  -m /data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf \
+  --prompt-file /data/local/tmp/prompt_6k.txt \
+  -n 128 -b opencl --kv-type f16 --max-seq-len 6144 --ignore-eos"
+```
+
+### 참고 문서 / 보존된 작업물
+- Phase 2 상세: 본 파일 §10
+- §10.1.6: GPU decode 구조적 결함 분석 (KV-split 가설 + 정정 이력 포함)
+- P0-5/P0-5b/P0-5c revert 근거: 각 항목 Notes 블록
+- Researcher 선조사 자료: `.agent/research/2026-04-13_flash_decoding_kv_split.md`
+  - P0-5 revert 커밋에 포함되어 파일은 삭제됨
+  - 복원: `git show d0d4978~1:.agent/research/2026-04-13_flash_decoding_kv_split.md`
