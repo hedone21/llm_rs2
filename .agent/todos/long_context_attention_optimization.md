@@ -22,6 +22,42 @@
 
 **산출물**: `.agent/research/microbench_flash_attn/run1_2120.txt`
 
+### 🆕 2026-04-14 21:30: Option C — Per-op slope vs TOTAL 모순 검증 → **모순 아님**
+
+**원본**: `.agent/research/option_2b_raw/llm_rs2_ctx*.log` (decode per-op breakdown), `llama_ctx*.csv` (per-kernel)
+
+**같은 profile-events 세션 내 슬롭 합 계산**:
+
+| op | slope μs/n_kv | % of profile sum |
+|---|---:|---:|
+| attention      | 13.23 | 93.6% |
+| matmul_ffn     | 0.393 | 2.8% |
+| lm_head        | 0.316 | 2.2% |
+| matmul_qkv     | 0.095 | 0.7% |
+| rms_norm       | 0.049 | 0.3% |
+| matmul_wo      | 0.035 | 0.2% |
+| 기타           | 0.014 | 0.1% |
+| **per-op 합**  | **14.13** | 100% |
+| **wall (Decode ms/tok) 같은 세션** | **14.74** | sync gap 0.6 |
+
+**모순 해소**:
+- §12의 "13.23 > 12.45" 비교는 profile 세션 attention vs non-profile 세션 wall — 다른 측정 모드의 apples-to-oranges
+- 같은 profile 세션 내: per-op 합 14.13 ≈ wall 14.74 (sync 0.6 차이) — **내부 일관성 OK**
+- profile-events 자체가 +2.29 μs/n_kv 시스템 overhead 추가 (12.45 → 14.74)
+
+**비-profile 세션 attention contribution 추정**: 13.23 × (12.45/14.74) = **11.18 μs/n_kv** = wall 12.45의 **90%**.
+
+**llama.cpp profile 세션 Q1 alone slope**: **17.22 μs/n_kv** > 우리 13.23 (!). 그러나 비-profile wall은 5.70. 즉 llama.cpp는 profile 모드에서 더 크게 inflate (드라이버 차이) → **engine 간 profile-events 직접 비교 신뢰 불가**.
+
+**산출물**: `.agent/research/microbench_flash_attn/option_c_op_slope_audit.md` (전체 분석 표)
+
+**갭 분해 최종판** (비-profile 기준):
+- Total 갭: 6.75 μs/n_kv
+- Attention contribution: ~5.5 μs/n_kv (81%) ← 줄여야 할 것
+- Non-attention contribution: ~1.25 μs/n_kv (19%) ← matmul_ffn/lm_head/matmul_qkv 등에서 분산
+
+**다음 작업 권장 순서 갱신**: A (production 조건 microbench로 0.36 → 0.47 차이 isolate) → D (eviction-based 우회) → B (Snapdragon Profiler).
+
 ### 🚀 다음 세션 엔트리 포인트 (재정비)
 
 KV stride 가설까지 기각된 시점, 남은 후보를 ROI 순으로:
