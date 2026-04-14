@@ -46,27 +46,28 @@ pub trait WeightMapper: Send + Sync {
     }
 
     /// Embedding tensor name.
-    fn embed_name(&self) -> &str {
-        "model.embed_tokens.weight"
-    }
+    fn embed_name(&self) -> String;
 
     /// Final RMSNorm tensor name.
-    fn norm_name(&self) -> &str {
-        "model.norm.weight"
-    }
+    fn norm_name(&self) -> String;
 
     /// LM head tensor name.
-    fn lm_head_name(&self) -> &str {
-        "lm_head.weight"
-    }
+    fn lm_head_name(&self) -> String;
 }
 
-/// Factory: create the appropriate WeightMapper for a given architecture.
+/// Factory: create the appropriate WeightMapper for a given architecture (no prefix).
 pub fn create_mapper(arch: ModelArch) -> Box<dyn WeightMapper> {
+    create_mapper_with_prefix(arch, "")
+}
+
+/// Factory: create a WeightMapper with an optional name prefix (for multimodal wrappers).
+/// E.g. `prefix = "language_model."` for Gemma 3 multimodal safetensors.
+pub fn create_mapper_with_prefix(arch: ModelArch, prefix: &str) -> Box<dyn WeightMapper> {
+    let p = prefix.to_string();
     match arch {
-        ModelArch::Llama => Box::new(llama::LlamaMapper),
-        ModelArch::Qwen2 => Box::new(qwen2::Qwen2Mapper),
-        ModelArch::Gemma3 => Box::new(gemma3::Gemma3Mapper),
+        ModelArch::Llama => Box::new(llama::LlamaMapper { prefix: p }),
+        ModelArch::Qwen2 => Box::new(qwen2::Qwen2Mapper { prefix: p }),
+        ModelArch::Gemma3 => Box::new(gemma3::Gemma3Mapper { prefix: p }),
     }
 }
 
@@ -151,5 +152,34 @@ mod tests {
             names12.q_norm.as_deref(),
             Some("model.layers.12.self_attn.q_norm.weight")
         );
+    }
+
+    #[test]
+    fn test_gemma3_mapper_with_multimodal_prefix() {
+        let m = create_mapper_with_prefix(ModelArch::Gemma3, "language_model.");
+        let names = m.weight_names(0);
+        assert_eq!(
+            names.wq,
+            "language_model.model.layers.0.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            names.attention_norm,
+            "language_model.model.layers.0.input_layernorm.weight"
+        );
+        assert_eq!(
+            names.pre_ffn_norm.as_deref(),
+            Some("language_model.model.layers.0.pre_feedforward_layernorm.weight")
+        );
+        assert_eq!(m.embed_name(), "language_model.model.embed_tokens.weight");
+        assert_eq!(m.norm_name(), "language_model.model.norm.weight");
+        assert_eq!(m.lm_head_name(), "language_model.lm_head.weight");
+    }
+
+    #[test]
+    fn test_mapper_empty_prefix_matches_default_factory() {
+        let with = create_mapper_with_prefix(ModelArch::Llama, "");
+        let default = create_mapper(ModelArch::Llama);
+        assert_eq!(with.weight_names(3).wq, default.weight_names(3).wq);
+        assert_eq!(with.embed_name(), default.embed_name());
     }
 }
