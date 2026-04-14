@@ -183,6 +183,17 @@ git worktree list
 BRANCH="$NAME"
 SLUG=$(echo "$BRANCH" | tr '/' '-')
 
+# 0. 에이전트 cwd가 삭제 대상 워크트리 내부라면 거부
+#    (삭제 후 harness의 shell이 없어진 디렉토리에 묶여 모든 bash 명령이
+#    "Path does not exist"로 실패하는 edge case 방지. 세션 재시작 전까지 복구 불가.)
+CUR_ABS=$(pwd -P)
+case "$CUR_ABS" in
+  */llm_rs2-${SLUG}|*/llm_rs2-${SLUG}/*)
+    echo "Error: current cwd ($CUR_ABS) is inside the worktree to be deleted." >&2
+    echo "Run 'cd <main-repo-path>' (or start a new session in the main repo) before 'worktree clean'." >&2
+    exit 1 ;;
+esac
+
 # 메인 레포로 이동 (cwd를 워크트리로 두면 아래 remove가 실패한다)
 MAIN_PATH=$(git worktree list --porcelain | awk '/^worktree / {print $2; exit}')
 cd "$MAIN_PATH"
@@ -268,6 +279,8 @@ worktree clean refactor/qcf-refactor
 | sanity-check 실패 | 에러. master 체크아웃 안 함. 사용자가 수정 후 재시도. |
 | 머지 충돌 | git이 멈춘다. 사용자에게 알리고 자동 resolve 시도 금지. |
 | `clean` 시 미병합 브랜치 | 거부. 실수로 작업 유실 방지. |
+| `clean` 시 현재 cwd가 삭제 대상 워크트리 | 거부. harness shell이 사라진 디렉토리에 묶여 세션 전체가 잠김. 메인 레포로 이동 후 재시도. |
+| 외부에서 이미 디렉토리 삭제 → `git worktree list`에 stale entry | `git worktree prune`으로 정리. 브랜치는 `git branch -d <name>` 별도 처리. |
 
 ## 참고
 
