@@ -24,13 +24,14 @@ da9981a feat(config): add weight_prefix and text_config flatten for multimodal w
 - Mapper: 5/5 models::mappers::tests including 2 new tests
 - Lib (skip convert, unified_buffer): 875/0
 - Integration: gemma3_4b_loading 2/2 PASS on original 2-shard + wrapper config
-- CPU eval-ll on original path: 40/40 PASS (447s)
-- OpenCL eval-ll on original path: 40/40 PASS (129s) — Task 10 (NVIDIA host; Outcome B per memory)
+- CPU eval-ll on original path: 40/40 numeric PASS (447s)
+- OpenCL eval-ll (PoCL, CPU-emulated): 40/40 numeric PASS (655s). 단일 프롬프트 정상 생성. 엔진 inter-question 상태 관리 정확성 확인.
+- OpenCL eval-ll (NVIDIA CUDA, RTX 3090 Ti): exit 0, 40 항목 처리, Q1–Q4 NLL은 CPU와 일치, **Q5 이후 NaN**. 단일 프롬프트 blank (EOS 즉시). 원인: NVIDIA OpenCL 1.2 JIT가 Adreno 특화 커널 9개 컴파일 실패 후 fallback 실행 시 상태 오염. **4B 전용이 아닌 pre-existing 호스트 드라이버 상호작용 이슈** (1B도 Q5+ `CL_OUT_OF_RESOURCES`). 별도 이슈 `issues/host_opencl_nvidia_fallback_20260414.md` / 브랜치 `fix/host-opencl-nvidia-fallback` 예정. — Task 10 raw data: `notes/gemma3_4b_task10_status.md`
 - 1B regression: Llama/Gemma3/Qwen2 all generate sensible text
 - cargo fmt clean; no new clippy errors; 4 minor pre-existing style warnings unchanged
 
 ## Known non-blocking
-- NVIDIA host OpenCL single-prompt produces blank output (documented; Adreno path is the real target)
+- NVIDIA host OpenCL: Q5+ NaN on eval-ll, blank single-prompt (pre-existing host-driver JIT fallback issue, not 4B-specific; tracked in `issues/host_opencl_nvidia_fallback_20260414.md`)
 - head_dim=256 flash_attn kernel variant missing → prefill attention falls back to CPU on OpenCL (future optimization)
 - test_f32_to_f16_roundtrip SIGABRT (pre-existing unrelated)
 - unified_buffer tests fail on non-OpenCL host (pre-existing unrelated)
