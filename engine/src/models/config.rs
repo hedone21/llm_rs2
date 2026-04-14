@@ -85,7 +85,7 @@ impl ModelConfig {
                 .any(|a| a.ends_with("ForConditionalGeneration"))
         }) || raw.text_config.is_some();
 
-        let (raw, weight_prefix): (RawHfConfig, String) = if is_multimodal {
+        let (mut raw, weight_prefix): (RawHfConfig, String) = if is_multimodal {
             let arch_hint = raw
                 .architectures
                 .as_ref()
@@ -112,19 +112,19 @@ impl ModelConfig {
             (raw, String::new())
         };
 
+        let arch = Self::detect_arch(&raw)?;
+
         // Gemma3TextConfig defaults applied when a multimodal wrapper omits attention shape
         // fields. Mirrors HuggingFace transformers Gemma3TextConfig __init__ defaults — these
         // values match gemma-3-4b. Other Gemma3 sizes include these fields explicitly in
         // their text_config, so defaults are only consulted for 4B-style wrappers.
-        let mut raw = raw;
-        if !weight_prefix.is_empty() {
+        // Scoped to Gemma3 so future Llava/Qwen2-VL wrappers don't accidentally inherit them.
+        if !weight_prefix.is_empty() && matches!(arch, ModelArch::Gemma3) {
             raw.num_attention_heads.get_or_insert(8);
             raw.num_key_value_heads.get_or_insert(4);
             raw.head_dim.get_or_insert(256);
             raw.vocab_size.get_or_insert(262208);
         }
-
-        let arch = Self::detect_arch(&raw)?;
 
         let hidden_size = raw
             .hidden_size
