@@ -86,11 +86,20 @@ impl ModelConfig {
         }) || raw.text_config.is_some();
 
         let (raw, weight_prefix): (RawHfConfig, String) = if is_multimodal {
-            let tc = *raw
-                .text_config
-                .clone()
-                .ok_or_else(|| anyhow!("multimodal wrapper detected but text_config missing"))?;
+            let arch_hint = raw.architectures.as_ref()
+                .and_then(|a| a.first()).cloned()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let tc = *raw.text_config.clone().ok_or_else(|| {
+                anyhow!("config.json has architecture '{arch_hint}' (multimodal wrapper) but 'text_config' field is missing")
+            })?;
             let mut flat = tc;
+            if flat.text_config.is_some() {
+                return Err(anyhow!(
+                    "nested text_config in multimodal wrapper is not supported (single-wrapper only)"
+                ));
+            }
+            // 현재 지원 범위는 Gemma3 multimodal wrapper 한정. 향후 Llava 등 다른 wrapper를 지원하려면
+            // architectures 주입을 감지된 wrapper 패밀리별로 분기해야 함.
             if flat.architectures.is_none() {
                 flat.architectures = Some(vec!["Gemma3ForCausalLM".to_string()]);
             }
@@ -470,6 +479,49 @@ mod tests {
         }
         let config = ModelConfig::from_json(&dir).unwrap();
         assert_eq!(config.weight_prefix, "");
+    }
+
+    #[test]
+    fn test_parse_multimodal_nested_text_config_errors() {
+        let json = r#"{
+            "architectures": ["Gemma3ForConditionalGeneration"],
+            "text_config": {
+                "architectures": ["Gemma3ForCausalLM"],
+                "hidden_size": 2560,
+                "num_hidden_layers": 34,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 4,
+                "intermediate_size": 10240,
+                "vocab_size": 262144,
+                "text_config": {"hidden_size": 1}
+            }
+        }"#;
+        let tmp_dir = std::path::PathBuf::from("/tmp/llm_rs2_test_nested_text_config");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        let err = ModelConfig::from_json(&tmp_dir).unwrap_err();
+        assert!(err.to_string().contains("nested text_config"),
+            "expected nested text_config error, got: {err}");
+    }
+
+    #[test]
+    fn test_parse_multimodal_missing_text_config_errors_with_arch_name() {
+        let json = r#"{
+            "architectures": ["Gemma3ForConditionalGeneration"]
+        }"#;
+        let tmp_dir = std::path::PathBuf::from("/tmp/llm_rs2_test_missing_text_config");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let config_path = tmp_dir.join("config.json");
+        let mut f = std::fs::File::create(&config_path).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+        let err = ModelConfig::from_json(&tmp_dir).unwrap_err();
+        let s = err.to_string();
+        assert!(s.contains("Gemma3ForConditionalGeneration"),
+            "expected arch name in error, got: {err}");
+        assert!(s.contains("text_config"),
+            "expected text_config mention, got: {err}");
     }
 
     #[test]
