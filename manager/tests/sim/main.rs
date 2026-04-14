@@ -8,4 +8,5 @@ mod common;
 mod test_config;
 mod test_harness;
 mod test_physics;
+mod test_scenarios;
 mod test_signal;

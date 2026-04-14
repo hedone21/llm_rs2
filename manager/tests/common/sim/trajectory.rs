@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -316,8 +317,7 @@ impl Trajectory {
 
     /// JSON 형식으로 파일에 저장한다.
     pub fn dump_json<P: AsRef<Path>>(&self, path: P) -> std::io::Result<()> {
-        let json = serde_json::to_string_pretty(self)
-            .map_err(std::io::Error::other)?;
+        let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
@@ -446,9 +446,9 @@ impl Trajectory {
     pub fn observation_due_count_for(&self, action: &str) -> usize {
         self.entries
             .iter()
-            .filter(|e| {
-                matches!(e, TrajectoryEntry::ObservationDue { action: a, .. } if a == action)
-            })
+            .filter(
+                |e| matches!(e, TrajectoryEntry::ObservationDue { action: a, .. } if a == action),
+            )
             .count()
     }
 
@@ -481,5 +481,150 @@ impl Trajectory {
             }
         };
         self.entries.iter().rev().map(entry_at_s).next()
+    }
+}
+
+// ─────────────────────────────────────────────────────────
+// TrajectorySummary — 스냅샷용 요약 타입
+// ─────────────────────────────────────────────────────────
+
+/// 마지막 PhysicalState의 주요 숫자 (반올림 정제).
+#[derive(Debug, Clone, Serialize)]
+pub struct PhysicalStateSummary {
+    /// KV 캐시 크기 (MiB, 소수 2자리).
+    pub kv_cache_bytes_mib: f64,
+    /// 디바이스 메모리 사용량 (MB, 소수 1자리).
+    pub device_memory_used_mb: f64,
+    /// 엔진 CPU 사용률 (%, 소수 1자리).
+    pub engine_cpu_pct: f64,
+    /// 엔진 GPU 사용률 (%, 소수 1자리).
+    pub engine_gpu_pct: f64,
+    /// CPU 주파수 비율 freq/max (소수 3자리).
+    pub cpu_freq_ratio: f64,
+    /// GPU 주파수 비율 freq/max (소수 3자리).
+    pub gpu_freq_ratio: f64,
+    /// 집계 온도 °C (소수 1자리).
+    pub thermal_c: f64,
+    /// 처리량 tokens/s (소수 2자리).
+    pub throughput_tps: f64,
+}
+
+impl PhysicalStateSummary {
+    fn from_snapshot(s: &PhysicalStateSnapshot, cfg_cpu_max: f64, cfg_gpu_max: f64) -> Self {
+        fn r1(v: f64) -> f64 {
+            (v * 10.0).round() / 10.0
+        }
+        fn r2(v: f64) -> f64 {
+            (v * 100.0).round() / 100.0
+        }
+        fn r3(v: f64) -> f64 {
+            (v * 1000.0).round() / 1000.0
+        }
+        let cpu_max = if cfg_cpu_max > 0.0 {
+            cfg_cpu_max
+        } else {
+            s.cpu_freq_mhz.max(1.0)
+        };
+        let gpu_max = if cfg_gpu_max > 0.0 {
+            cfg_gpu_max
+        } else {
+            s.gpu_freq_mhz.max(1.0)
+        };
+        Self {
+            kv_cache_bytes_mib: r2(s.kv_cache_bytes / (1024.0 * 1024.0)),
+            device_memory_used_mb: r1(s.device_memory_used_mb),
+            engine_cpu_pct: r1(s.engine_cpu_pct),
+            engine_gpu_pct: r1(s.engine_gpu_pct),
+            cpu_freq_ratio: r3(s.cpu_freq_mhz / cpu_max),
+            gpu_freq_ratio: r3(s.gpu_freq_mhz / gpu_max),
+            thermal_c: r1(s.thermal_c),
+            throughput_tps: r2(s.throughput_tps),
+        }
+    }
+}
+
+/// 시뮬레이션 실행 결과 요약 (insta 스냅샷 대상).
+#[derive(Debug, Clone, Serialize)]
+pub struct TrajectorySummary {
+    /// 시뮬레이션 총 시간 (초, 소수 2자리).
+    pub duration_s: f64,
+    /// 기록된 heartbeat 수.
+    pub heartbeat_count: usize,
+    /// 신호 종류별 개수.
+    pub signal_count_by_kind: BTreeMap<String, usize>,
+    /// directive 총 개수.
+    pub directive_count: usize,
+    /// directive command 종류별 개수.
+    pub directive_kinds: BTreeMap<String, usize>,
+    /// 첫 directive 발생 시각 (초, 소수 2자리).
+    pub first_directive_at_s: Option<f64>,
+    /// 마지막 물리 상태 요약.
+    pub state_final: Option<PhysicalStateSummary>,
+}
+
+impl TrajectorySummary {
+    /// Trajectory에서 요약을 생성한다.
+    ///
+    /// `cpu_max_mhz` / `gpu_max_mhz`: DVFS 비율 계산용 (baseline cfg에서 전달).
+    pub fn from_trajectory(traj: &Trajectory, cpu_max_mhz: f64, gpu_max_mhz: f64) -> Self {
+        // 신호 종류별 집계
+        let mut signal_count_by_kind: BTreeMap<String, usize> = BTreeMap::new();
+        for entry in &traj.entries {
+            if let TrajectoryEntry::Signal { signal, .. } = entry {
+                *signal_count_by_kind.entry(signal.kind.clone()).or_insert(0) += 1;
+            }
+        }
+
+        // directive 집계
+        let mut directive_kinds: BTreeMap<String, usize> = BTreeMap::new();
+        let mut first_directive_at_s: Option<f64> = None;
+        let mut directive_count = 0usize;
+        for entry in &traj.entries {
+            if let TrajectoryEntry::Directive {
+                at_s, directive, ..
+            } = entry
+            {
+                directive_count += 1;
+                if first_directive_at_s.is_none() {
+                    first_directive_at_s = Some((at_s * 100.0).round() / 100.0);
+                }
+                for cmd in &directive.commands {
+                    // "KvEvictSliding { keep_ratio: 0.8 }" → "KvEvictSliding"
+                    let kind = cmd
+                        .split_once('{')
+                        .map(|(k, _)| k.trim())
+                        .unwrap_or(cmd.as_str());
+                    *directive_kinds.entry(kind.to_string()).or_insert(0) += 1;
+                }
+            }
+        }
+
+        // 마지막 StateSnapshot
+        let state_final = traj.entries.iter().rev().find_map(|e| {
+            if let TrajectoryEntry::StateSnapshot { state, .. } = e {
+                Some(PhysicalStateSummary::from_snapshot(
+                    state,
+                    cpu_max_mhz,
+                    gpu_max_mhz,
+                ))
+            } else {
+                None
+            }
+        });
+
+        let duration_s = traj
+            .last_at_s()
+            .map(|v| (v * 100.0).round() / 100.0)
+            .unwrap_or(0.0);
+
+        Self {
+            duration_s,
+            heartbeat_count: traj.heartbeat_count(),
+            signal_count_by_kind,
+            directive_count,
+            directive_kinds,
+            first_directive_at_s,
+            state_final,
+        }
     }
 }

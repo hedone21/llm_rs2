@@ -24,6 +24,7 @@ default = ["dbus", "lua"]
 
 [dev-dependencies]
 evalexpr = "11"
+insta = { version = "1", features = ["yaml", "json"] }
 rand = "0.8"
 rand_chacha = "0.3"
 serde_yaml = "0.9"

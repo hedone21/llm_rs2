@@ -264,6 +264,14 @@ impl EwmaReliefTable {
         self.entries.get(action).map_or(0, |e| e.observation_count)
     }
 
+    /// 현재 테이블 상태를 스냅샷으로 반환한다 (테스트/시뮬레이터 관측용).
+    pub(crate) fn snapshot(&self) -> HashMap<String, [f32; RELIEF_DIMS]> {
+        self.entries
+            .iter()
+            .map(|(k, v)| (k.clone(), v.relief))
+            .collect()
+    }
+
     fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(&self.entries).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
@@ -699,6 +707,10 @@ impl PolicyStrategy for LuaPolicy {
                 );
             }
         }
+    }
+
+    fn relief_snapshot(&self) -> Option<std::collections::HashMap<String, [f32; 6]>> {
+        Some(self.relief_table.snapshot())
     }
 }
 

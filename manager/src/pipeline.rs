@@ -8,6 +8,8 @@
 //!
 //! `docs/36_policy_design.md` §9 (Manager Main Loop)를 참조한다.
 
+use std::collections::HashMap;
+
 use llm_shared::{EngineDirective, EngineMessage, QcfEstimate, SystemSignal};
 
 use crate::types::OperatingMode;
@@ -39,6 +41,14 @@ pub trait PolicyStrategy: Send {
     /// 보류 중인 QCF 요청의 타임아웃을 체크한다 (SEQ-098, 1초).
     /// 기본 구현은 no-op.
     fn check_qcf_timeout(&mut self) -> Option<EngineDirective> {
+        None
+    }
+
+    /// EwmaReliefTable 상태 스냅샷을 반환한다 (테스트/시뮬레이터 관측용).
+    ///
+    /// `action_name → [f32; 6]` 형태. 기본 구현은 None (구현하지 않은 정책).
+    /// LuaPolicy는 Some을 반환하도록 오버라이드한다.
+    fn relief_snapshot(&self) -> Option<HashMap<String, [f32; 6]>> {
         None
     }
 }
