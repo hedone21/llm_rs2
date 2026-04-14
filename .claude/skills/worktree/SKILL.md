@@ -64,16 +64,23 @@ fi
 # 워크트리 + 새 브랜치 생성 (master에서 분기)
 git worktree add -b "$BRANCH" "$WT_PATH" "$BASE_BRANCH"
 
-echo "✓ Created worktree: $WT_PATH (branch: $BRANCH)"
-echo "  → cd $WT_PATH"
+# 생성 직후 자동으로 워크트리로 이동 (절대경로로 resolve해서 pwd 안정화)
+cd "$WT_PATH"
+WT_ABS=$(pwd)
+
+echo "✓ Created worktree: $WT_ABS (branch: $BRANCH)"
+echo "✓ cwd switched to: $WT_ABS"
 ```
 
 **사용 예시**:
 - "qcf 리팩토링 작업을 worktree에서 해줘" → `NAME=qcf-refactor TYPE=refactor`
 - "새 실험용 worktree 만들어줘 이름은 adreno-test" → `NAME=adreno-test TYPE=work`
 
+**자동 cwd 전환 (중요)**:
+- `create` 성공 후 **에이전트의 Bash cwd를 워크트리로 자동 전환**한다. Claude Code의 Bash 도구는 호출 간 cwd가 유지되므로, `cd`를 별도 호출로 분리하지 말고 반드시 `git worktree add`와 **동일한 Bash 호출** 안에서 `cd "$WT_PATH"`를 이어 실행한다. 그래야 이후 에이전트가 실행하는 모든 명령(편집/빌드/테스트/커밋)이 워크트리 안에서 수행된다.
+- 사용자의 대화형 셸 cwd는 바뀌지 않는다. 사용자가 터미널에서 직접 작업하려면 `cd $WT_PATH`를 안내한다. 하지만 Claude가 대신 작업을 이어서 수행하는 경우라면 이 안내는 선택적이다 — 에이전트 cwd는 이미 이동한 상태다.
+
 **주의**:
-- 생성 후 사용자에게 `cd <WT_PATH>` 하라고 안내한다. 이후 작업은 그 디렉토리에서 수행.
 - 메인 레포의 미커밋 변경은 새 워크트리에 복제되지 않는다 (git 기본 동작). 이게 의도한 격리다.
 - Android 크로스 컴파일 시 워크트리 내부에서도 `source android.source`는 매번 필요하다 (CLAUDE.md 참조).
 
@@ -133,8 +140,11 @@ fi
 
 # 5. 삭제 여부는 사용자에게 물어본다 (스크립트로 자동 삭제 금지)
 echo ""
-echo "Merge complete. Run 'worktree clean $BRANCH' after confirming with user."
+echo "Merge complete. cwd: $(pwd) (main repo on master)"
+echo "Ask user before running 'worktree clean $BRANCH'."
 ```
+
+**병합 후 cwd**: 병합은 메인 레포에서 수행되므로 에이전트 cwd는 자연스럽게 메인 레포(master)로 이동한다. 삭제하지 않기로 결정한 경우, 사용자가 해당 워크트리에서 추가 작업을 이어가려면 다시 `cd $WT_PATH` 하거나, 스킬이 다시 호출되면 `create` 대신 해당 워크트리로 명시적으로 이동한다.
 
 **병합 방식 선택**:
 - 기본 `--no-ff`: 일반적인 feature/refactor 작업. 머지 커밋 남김.
@@ -160,26 +170,53 @@ git worktree list
 # name은 브랜치명 (예: feat/qcf-audit) 또는 slug
 BRANCH="$NAME"
 SLUG=$(echo "$BRANCH" | tr '/' '-')
-WT_PATH="../llm_rs2-${SLUG}"
 
-# 메인 레포에서 실행
-cd "$(git worktree list --porcelain | awk '/^worktree / {print $2; exit}')"
+# 메인 레포로 이동 (cwd를 워크트리로 두면 아래 remove가 실패한다)
+MAIN_PATH=$(git worktree list --porcelain | awk '/^worktree / {print $2; exit}')
+cd "$MAIN_PATH"
 
-# 병합 여부 확인 (safety)
+# 워크트리 실제 경로를 git이 추적하는 목록에서 조회 (추정 경로에 의존하지 않음)
+WT_PATH=$(git worktree list --porcelain \
+  | awk -v br="refs/heads/$BRANCH" '
+      /^worktree / {p=$2}
+      $0=="branch "br {print p; exit}')
+if [ -z "$WT_PATH" ]; then
+  # fallback: 규약 경로
+  WT_PATH="$MAIN_PATH/../llm_rs2-${SLUG}"
+fi
+WT_ABS=$(cd "$WT_PATH" 2>/dev/null && pwd || echo "$WT_PATH")
+
+# 병합 여부 확인 (safety) — 병합되지 않은 브랜치는 거부
 if ! git branch --merged master | grep -q "^[* ]*$BRANCH$"; then
-  echo "Warning: branch $BRANCH is NOT merged into master"
-  echo "Refusing to delete. Merge first, or use 'git branch -D' manually if intentional."
+  echo "Error: branch $BRANCH is NOT merged into master" >&2
+  echo "Refusing to delete. Merge first, or use 'git branch -D' manually if intentional." >&2
   exit 1
 fi
 
-# worktree 제거 (내부 미커밋은 이미 merge 단계에서 차단됨)
-git worktree remove "$WT_PATH"
+# 1. 워크트리 제거 — target/, .idea/ 등 gitignored 파일 때문에 거부되지 않도록 --force
+#    (git worktree remove는 워크트리 디렉토리 자체도 함께 삭제한다)
+git worktree remove --force "$WT_PATH" || {
+  echo "Warning: git worktree remove failed; falling back to manual cleanup"
+  git worktree prune
+}
 
-# 브랜치 제거 (merged check는 -d가 자동으로 수행)
+# 2. 디렉토리 잔재 제거 (git이 무언가 남겨둔 경우 대비)
+#    절대경로가 메인 레포 내부가 아닌지 sanity-check 후 rm
+if [ -d "$WT_ABS" ] \
+   && [ "$WT_ABS" != "$MAIN_PATH" ] \
+   && [ "$WT_ABS" != "/" ] \
+   && [ "$WT_ABS" != "$HOME" ]; then
+  rm -rf "$WT_ABS"
+  echo "✓ Removed leftover directory: $WT_ABS"
+fi
+
+# 3. 브랜치 제거 (merged check는 위에서 통과했으므로 -d 가능)
 git branch -d "$BRANCH"
 
-echo "✓ Removed worktree $WT_PATH and branch $BRANCH"
+echo "✓ Removed worktree $WT_ABS and branch $BRANCH"
 ```
+
+**삭제 범위**: `git worktree remove --force`는 워크트리 디렉토리 **전체를 폴더째 삭제**한다 (gitignored 빌드 산출물 `target/` 포함). 뒤이은 `rm -rf`는 git이 남긴 잔재가 있을 경우의 안전망이다 — 루트/홈/메인 레포 경로로 착각해 실행되지 않도록 가드를 둔다.
 
 **사용자 확인 절차 (스킬 사용자가 따를 것)**:
 1. `merge` 성공 후 스크립트가 자동으로 `clean`을 호출하지 **않는다**.
