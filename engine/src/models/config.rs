@@ -86,8 +86,11 @@ impl ModelConfig {
         }) || raw.text_config.is_some();
 
         let (raw, weight_prefix): (RawHfConfig, String) = if is_multimodal {
-            let arch_hint = raw.architectures.as_ref()
-                .and_then(|a| a.first()).cloned()
+            let arch_hint = raw
+                .architectures
+                .as_ref()
+                .and_then(|a| a.first())
+                .cloned()
                 .unwrap_or_else(|| "<unknown>".to_string());
             let tc = *raw.text_config.clone().ok_or_else(|| {
                 anyhow!("config.json has architecture '{arch_hint}' (multimodal wrapper) but 'text_config' field is missing")
@@ -108,6 +111,18 @@ impl ModelConfig {
         } else {
             (raw, String::new())
         };
+
+        // Gemma3TextConfig defaults applied when a multimodal wrapper omits attention shape
+        // fields. Mirrors HuggingFace transformers Gemma3TextConfig __init__ defaults — these
+        // values match gemma-3-4b. Other Gemma3 sizes include these fields explicitly in
+        // their text_config, so defaults are only consulted for 4B-style wrappers.
+        let mut raw = raw;
+        if !weight_prefix.is_empty() {
+            raw.num_attention_heads.get_or_insert(8);
+            raw.num_key_value_heads.get_or_insert(4);
+            raw.head_dim.get_or_insert(256);
+            raw.vocab_size.get_or_insert(262208);
+        }
 
         let arch = Self::detect_arch(&raw)?;
 
@@ -502,8 +517,10 @@ mod tests {
         let mut f = std::fs::File::create(&config_path).unwrap();
         f.write_all(json.as_bytes()).unwrap();
         let err = ModelConfig::from_json(&tmp_dir).unwrap_err();
-        assert!(err.to_string().contains("nested text_config"),
-            "expected nested text_config error, got: {err}");
+        assert!(
+            err.to_string().contains("nested text_config"),
+            "expected nested text_config error, got: {err}"
+        );
     }
 
     #[test]
@@ -518,10 +535,14 @@ mod tests {
         f.write_all(json.as_bytes()).unwrap();
         let err = ModelConfig::from_json(&tmp_dir).unwrap_err();
         let s = err.to_string();
-        assert!(s.contains("Gemma3ForConditionalGeneration"),
-            "expected arch name in error, got: {err}");
-        assert!(s.contains("text_config"),
-            "expected text_config mention, got: {err}");
+        assert!(
+            s.contains("Gemma3ForConditionalGeneration"),
+            "expected arch name in error, got: {err}"
+        );
+        assert!(
+            s.contains("text_config"),
+            "expected text_config mention, got: {err}"
+        );
     }
 
     #[test]
