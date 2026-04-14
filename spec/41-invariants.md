@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) = 총 68개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) = 총 75개.
 
 ## 1. Purpose and Scope
 
@@ -149,6 +149,27 @@
 | INV-083 | MGR-C06 | PI Controller output은 [0, 1] 범위 내. | Correctness | runtime | clamp |
 | INV-084 | MGR-C07, MGR-C08 | ActionSelector = stateless. ReliefEstimator.predict = 읽기 전용. | Correctness | static | 코드 구조 |
 | INV-085 | MGR-C10 | Normal 모드에서 액션 미발행. | Correctness | runtime, test | 조건 검사 |
+
+### 3.7 LuaPolicy Relief Adaptation Invariants [INV-086 ~ INV-090]
+
+2026-04 기본 정책이 LuaPolicy로 이관되며 도입된 불변식. HierarchicalPolicy의 RLS 기반 INV-046~051과 독립적으로 존재한다. `#[cfg(feature = "hierarchical")]` 여부와 무관하게 LuaPolicy 경로에서 항상 MUST.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-086 | 20-manager MGR-091, 23-manager-data MGR-DAT-070/071 | `EwmaReliefTable.save()`는 `entries`(EWMA 누적값 + observation_count)만 직렬화한다. raw observation 이력, alpha, defaults는 저장 대상이 아니다. | Correctness | static, test | JSON 스키마 검증 |
+| INV-087 | 22-manager-algorithms MGR-ALG-080 | `observation_count == 0`인 액션에 대한 첫 `observe()`는 α 평활을 우회하고 관측값을 직접 대입한다 (cold-start 가속). | Correctness | runtime, test | |
+| INV-088 | 22-manager-algorithms MGR-ALG-082, 12-protocol SEQ-055 | `decide()`가 다중 커맨드를 반환하면 `ObservationContext`는 **첫 번째** 커맨드의 action만 기록하고, 나머지 액션에 대한 관측은 수행되지 않는다. 관찰 대기 중 새 커맨드가 발행되면 기존 관찰은 학습 없이 폐기된다. | Correctness | test | 학습 누락을 의도적으로 허용 |
+| INV-089 | 22-manager-algorithms MGR-ALG-083, 23-manager-data MGR-DAT-073 | 6D relief 관측에서 차원 0~4(gpu, cpu, memory, thermal, latency)는 `before - after`로, 차원 5(main_app_qos)는 `after - before`로 계산한다. 부호 반전은 차원 5에만 적용된다. | Correctness | runtime, test | |
+| INV-090 | 22-manager-algorithms MGR-ALG-081 | `EwmaReliefTable.predict(action)`은 **읽기 전용**이다. `entries`에 새 항목을 생성하거나 기존 값을 수정하지 않는다 (INV-084의 LuaPolicy 구체화). | Correctness | static, test | 코드 구조 |
+
+### 3.8 Engine Self-Utilization Invariants [INV-091 ~ INV-092]
+
+2026-04 Phase 1에서 Engine이 Heartbeat에 자신의 프로세스 단위 CPU/GPU 사용률을 실어 보낼 때 적용된다. 대응 필드는 `EngineStatus.self_cpu_pct`, `self_gpu_pct` (MSG-060, MGR-DAT-075, MGR-DAT-076).
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-091 | 11-protocol-messages MSG-067, 23-manager-data MGR-DAT-075/076 | `self_cpu_pct`, `self_gpu_pct` ∈ [0.0, 1.0]. 범위 밖 값은 송출 전에 clamp 한다. | Correctness | runtime, test | Engine 측 clamp |
+| INV-092 | 11-protocol-messages MSG-067/068, 23-manager-data MGR-DAT-075/076 | 측정 실패 시 `self_cpu_pct`/`self_gpu_pct`는 0.0 fallback. Heartbeat 송출은 차단되지 않는다. | Robustness/Correctness | runtime, test | MSG-061 하위호환 규약과 동일한 원칙 |
 
 ## 4. Alternative Behavior
 

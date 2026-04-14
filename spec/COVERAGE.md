@@ -105,6 +105,13 @@
 | INV-084 | ActionSelector = stateless. ReliefEstimator.predict = 읽기 전용. | Correctness | 🔶 | (static: 코드 구조) |
 | INV-085 | Normal 모드에서 액션 미발행. | Correctness | ✅ | `manager/tests/spec/test_inv_083_085.rs` |
 
+## Engine Self-Utilization (INV-091 ~ INV-092, 2026-04)
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-091 | `self_cpu_pct`, `self_gpu_pct` ∈ [0.0, 1.0] (Engine 측 clamp). | Correctness | 🆕 미구현 | `engine/tests/spec/test_msg_060_self_util.rs`, `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
+| INV-092 | 측정 실패 시 self_cpu_pct/self_gpu_pct = 0.0 fallback, Heartbeat 송출 차단 금지. | Correctness | 🆕 미구현 | `engine/tests/spec/test_msg_060_self_util.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -142,6 +149,10 @@
 | MSG-030 | (D) | EngineCommand 13종 serde | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
 | MSG-034b | (D) | KvMergeD2o serde round-trip | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
 | MSG-035 | (D) | KvStreaming serde round-trip | ✅ | `shared/tests/spec/test_msg_010_100.rs` |
+| MSG-060 | (D) | EngineStatus 18필드 serde + self_cpu_pct/self_gpu_pct 하위호환 (default=0.0) | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
+| MSG-067 | (A) | self_cpu_pct 계산식(/proc/self/stat + CLK_TCK + num_cpus) + clamp | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
+| MSG-068 | (D) | self_gpu_pct Phase 1 placeholder (항상 0.0) | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
+| MSG-069 | (D) | ctx.engine.cpu_pct/gpu_pct LuaPolicy 노출 계약 | 🆕 | `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
 
 ## Sequence
 
@@ -186,6 +197,8 @@
 | MGR-DAT-022 | (D) | MemoryMonitorConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_022_024.rs` |
 | MGR-DAT-023 | (D) | ThermalMonitorConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_022_024.rs` |
 | MGR-DAT-024 | (D) | ComputeMonitorConfig 기본값 | ✅ | `manager/tests/spec/test_mgr_dat_022_024.rs` |
+| MGR-DAT-075 | (D) | EngineStatus.self_cpu_pct 의미/범위/측정/실패 fallback | 🆕 | `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
+| MGR-DAT-076 | (D) | EngineStatus.self_gpu_pct Phase 1 placeholder (ctx.engine.gpu_pct 노출, 값=0.0) | 🆕 | `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
 
 ## Engine State
 

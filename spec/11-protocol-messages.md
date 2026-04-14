@@ -338,7 +338,13 @@ JSON 예시:
 
 **[MSG-066]** actual_throughput — EMA (α=0.1)로 계산된다. 토큰 미생성 시 0.0. *(non-normative)*
 
-JSON 예시 (전체 16필드):
+**[MSG-067]** self_cpu_pct 계산 — Engine은 `/proc/self/stat`의 `(utime + stime)` 틱 증가량을 직전 Heartbeat 송출 시각과의 wall-clock 경과 및 `sysconf(_SC_CLK_TCK)`, 코어 수(`num_cpus`)로 정규화하여 [0.0, 1.0] 범위로 산출한다. 범위 밖 값은 clamp한다 (INV-091). 측정 실패 시 0.0 fallback이며, Heartbeat 송출은 차단하지 않는다 (INV-092). *(MUST)*
+
+**[MSG-068]** self_gpu_pct — Phase 1에서는 항상 0.0을 기록한다. Phase 2에서 GPU profiling 기반으로 확장될 때 본 조항은 MGR-DAT-076과 함께 재정의된다. *(non-normative, placeholder)*
+
+**[MSG-069]** Manager 연결 — `ctx.engine.cpu_pct`, `ctx.engine.gpu_pct`는 LuaPolicy 평가 컨텍스트에 노출된다 (MGR-DAT-075, MGR-DAT-076). 시스템 전체 CPU 사용률(`ComputeGuidance.cpu_pct` 기반 `ctx.signal.compute.cpu_pct`)과 별도 값으로 유지되며, 두 값의 산출/비교(예: 외부 경합량)는 Lua 스크립트 책임이다. Pressure6D 계산식은 변경되지 않는다. *(MUST)*
+
+JSON 예시 (전체 18필드):
 ```json
 {
   "type": "heartbeat",
@@ -357,11 +363,13 @@ JSON 예시 (전체 16필드):
   "active_actions": ["kv_evict_h2o"],
   "eviction_policy": "h2o",
   "kv_dtype": "f16",
-  "skip_ratio": 0.0
+  "skip_ratio": 0.0,
+  "self_cpu_pct": 0.42,
+  "self_gpu_pct": 0.0
 }
 ```
 
-JSON 예시 (5필드 생략 — 구 버전 호환):
+JSON 예시 (7필드 생략 — 구 버전 호환):
 ```json
 {
   "type": "heartbeat",

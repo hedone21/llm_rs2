@@ -82,3 +82,15 @@ mod test_seq_040_064_mgr;
 #[cfg(feature = "hierarchical")]
 #[path = "spec/test_seq_095_098.rs"]
 mod test_seq_095_098;
+
+// ── LuaPolicy (2026-04 기본 정책) EWMA Relief Adaptation ──
+// MGR-ALG-080~083, MGR-090~093, MGR-DAT-070~074, SEQ-055~057, INV-086~090
+// feature gate 없음 — LuaPolicy가 기본 경로.
+#[path = "spec/test_mgr_alg_080_083_ewma_relief.rs"]
+mod test_mgr_alg_080_083_ewma_relief;
+
+// ── Engine Self-Utilization Heartbeat 노출 (2026-04 Phase 1) ──
+// MGR-DAT-075, MGR-DAT-076, MSG-069, INV-091~092
+// feature gate 없음 — LuaPolicy ctx.engine 노출 경로.
+#[path = "spec/test_mgr_dat_075_076_engine_util.rs"]
+mod test_mgr_dat_075_076_engine_util;

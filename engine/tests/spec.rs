@@ -51,6 +51,11 @@ mod test_eng_dat_c05_streaming;
 #[path = "spec/test_eng_dat_c06_d2o.rs"]
 mod test_eng_dat_c06_d2o;
 
+// ── MSG-060 Engine Self-Utilization (2026-04 Phase 1) ──
+// MSG-060 필드 17~18, MSG-067~069, INV-091~092
+#[path = "spec/test_msg_060_self_util.rs"]
+mod test_msg_060_self_util;
+
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;

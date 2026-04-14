@@ -628,7 +628,10 @@ flowchart TD
 -- 입력: ctx 테이블
 ctx = {
     engine = {device, throughput, kv_util, cache_tokens, cache_bytes,
-              tokens_generated, state, kv_dtype, skip_ratio},
+              tokens_generated, state, kv_dtype, skip_ratio,
+              -- 신규 (2026-04 Phase 1, §10.7): Engine 자가 측정 사용률
+              cpu_pct,     -- f64 [0,1]  EngineStatus.self_cpu_pct
+              gpu_pct},    -- f64 [0,1]  Phase 1 = 0.0 (placeholder)
     active = {"throttle", ...},
 
     -- 신규 (2026-04): 원시 센서 메트릭
@@ -933,3 +936,83 @@ sequenceDiagram
 |------|----------|------|
 | gpu, cpu, memory, thermal, latency | pressure 감소 (좋음) | `before[i] - after[i]` |
 | main_app | QoS 향상 (좋음) | `after[5] - before[5]` (반전) |
+
+### 10.7 Engine Self-Util Exposure -- `ctx.engine.cpu_pct` / `ctx.engine.gpu_pct`
+
+> 요구사항: MSG-060(필드 17~18), MSG-067, MSG-068, MSG-069, MGR-DAT-075, MGR-DAT-076, INV-091, INV-092
+>
+> **신규 (2026-04 Phase 1)**: Engine이 Heartbeat에 자신의 프로세스 단위 CPU 사용률을 실어 보내면, LuaPolicy는 이를 Monitor가 생성하는 system-wide `ctx.signal.compute.cpu_pct`와 병존하는 raw 값으로 `ctx.engine` 테이블에 노출한다. Phase 1은 CPU만 실제 측정하고, GPU는 필드만 선제 배선한다.
+
+#### 설계 결정
+
+- Pressure6D 계산은 변경하지 않는다. `SignalState.pressure_with_thermal()`은 기존대로 `ComputeGuidance.cpu_pct`(시스템 전체)만 사용한다. Engine self CPU 값은 `Pressure6D`에 섞이지 않는다.
+- 두 값(engine-self, system-wide)을 섞어 "경합(contention)" 단일 스칼라로 계산하지 않는다. 계산 주체는 Lua 측이며, 정책 다양성을 위해 의도적으로 raw 로 노출한다.
+- `cpu_pct`/`gpu_pct`는 `ctx.engine` 테이블 하위에 둔다 (`ctx.signal`이 아닌 이유: `ctx.signal`은 OS sensor 기반 공간, `ctx.engine`은 engine 프로세스 자기 보고 공간으로 의미 분리).
+- GPU(Phase 1): Engine이 항상 0.0을 송출하므로 `ctx.engine.gpu_pct`도 항상 0.0이다. Lua 스크립트는 Phase 1에서 참조하지 말 것이 권고된다. 필드를 지금 배선하여 Phase 2에서 shape 변경 없이 값만 채우도록 한다 (하위호환 리스크 최소화).
+- 측정 실패 시 Engine 측에서 0.0 fallback (INV-092) 하여 송출하므로, Manager/Lua 측에서는 별도 방어 코드가 필요 없다. 단, 정책 스크립트가 `nil` 분기를 두면 미래 확장성을 해칠 수 있으므로 항상 0.0 숫자 값으로 간주한다.
+
+#### ctx.engine 신규 필드 매핑
+
+| Lua 경로 | 원천 | 타입 | Phase 1 값 |
+|----------|------|------|------------|
+| `ctx.engine.cpu_pct` | `EngineStatus.self_cpu_pct` (MGR-DAT-075, MSG-060 #17) | number [0,1] | Engine `/proc/self/stat` 기반 실측 |
+| `ctx.engine.gpu_pct` | `EngineStatus.self_gpu_pct` (MGR-DAT-076, MSG-060 #18) | number [0,1] | 항상 0.0 (placeholder, MSG-068) |
+
+#### 데이터 흐름
+
+```mermaid
+flowchart LR
+    subgraph Engine
+        PS["/proc/self/stat<br/>utime+stime delta"]
+        EST["EngineStatus<br/>self_cpu_pct<br/>self_gpu_pct=0.0"]
+        PS --> EST
+    end
+    subgraph Manager
+        UES["update_engine_state()"]
+        EC["engine_cache<br/>(Option<EngineStatus>)"]
+        BC["build_ctx()"]
+        LUA["Lua ctx.engine.cpu_pct<br/>Lua ctx.engine.gpu_pct"]
+        UES --> EC --> BC --> LUA
+    end
+    subgraph Monitor
+        CG["ComputeMonitor → ComputeGuidance"]
+        SS["SignalState"]
+        SC["ctx.signal.compute.cpu_pct<br/>(system-wide)"]
+        CG --> SS --> SC
+    end
+    EST -- "Heartbeat JSON" --> UES
+```
+
+#### Lua 사용 예 (정보 제공, non-normative)
+
+```lua
+-- 외부 앱이 CPU를 점유하고 있는지 추정
+local system_cpu = ctx.signal.compute.cpu_pct / 100.0   -- 0..1
+local engine_cpu = ctx.engine.cpu_pct                    -- 0..1
+local external_cpu = math.max(0.0, system_cpu - engine_cpu)
+
+if external_cpu > 0.4 and ctx.coef.trigger.tbt_degraded then
+    -- 시스템은 바쁘지만 engine 자체는 여유 → throttle보다
+    -- layer_skip 같은 self-limit이 적절할 수 있다
+    return { {type = "layer_skip", ratio = 0.1} }
+end
+```
+
+Phase 1 `ctx.engine.gpu_pct`는 항상 0.0이므로 동일한 패턴을 GPU에 적용하면 의도치 않게 트리거된다. Phase 2가 도입될 때까지 GPU 경합 추정은 `sys.gpu_busy()` 헬퍼를 권장한다.
+
+#### 처리 흐름 변경 요약
+
+- `LuaPolicy::update_engine_state()`가 `EngineMessage::Heartbeat(status)`를 수신하면 기존 필드와 함께 `self_cpu_pct`, `self_gpu_pct`를 `engine_cache`에 보관.
+- `build_ctx()`가 `ctx.engine` 테이블을 구성할 때 두 필드를 `cpu_pct`, `gpu_pct` 키로 노출.
+- `SignalState`, `TriggerEngine`, `EwmaReliefTable`는 Phase 1에서 영향을 받지 않는다.
+
+#### 예외/엣지
+
+- Engine이 구버전(MSG-061 하위호환)이라 두 필드를 송출하지 않으면 serde default로 0.0 복원. `ctx.engine.cpu_pct == 0.0`은 "idle"과 구별할 수 없으므로 Lua 측에서 0.0을 의미 있는 구분자로 사용하지 말 것.
+- Heartbeat 손실 구간 동안 `engine_cache`는 이전 값을 유지하지 않고 Option으로 설계되어 있으므로, 연결 재개 전에는 Lua 측 `ctx.engine.cpu_pct`가 이전 값으로 고정될 수 있다(기존 `EngineStatus` 캐시 동작과 동일).
+
+#### Phase 2 follow-up (non-normative)
+
+- OpenCL: 커널 enqueue 시 `cl_event`를 수집, `CL_PROFILING_COMMAND_START/END`로 커널 wall-clock을 누적한 뒤 heartbeat 구간의 벽시계 시간으로 나누어 `self_gpu_pct` 산출.
+- CUDA: `cudaEventRecord` + `cudaEventElapsedTime`로 동일한 누적 후 정규화.
+- 측정 오버헤드가 무시할 수 없다면 샘플링(예: N 커널마다 1회) 전략을 `AdaptationConfig`에 노출할 수 있다 (Phase 2 스펙 개정 시 MGR-DAT-076 확장).

@@ -435,7 +435,33 @@ pub struct FeatureVector { pub values: [f32; FEATURE_DIM] }
 
 ### 4a. LuaPolicy 전용 데이터 타입 (신규 2026-04)
 
+> 요구사항: MGR-DAT-070~076, MGR-090~093, INV-086~092
+
 **파일**: `manager/src/lua_policy.rs` (비공개 타입)
+
+#### EngineStatus 신규 필드 (Phase 1, 2026-04)
+
+> 요구사항: MSG-060 #17~18, MSG-067~069, MGR-DAT-075, MGR-DAT-076, INV-091, INV-092
+
+`shared::EngineStatus`에 2개 필드가 추가되어 LuaPolicy `ctx.engine`으로 노출된다. 상세 흐름은 `arch/20-manager.md` §10.7 참조.
+
+```rust
+// shared/src/lib.rs (수정 위치 — 본 문서는 참조만)
+pub struct EngineStatus {
+    // ... 기존 16 필드 ...
+    #[serde(default)]
+    pub self_cpu_pct: f64,   // MGR-DAT-075, [0,1] clamp
+    #[serde(default)]
+    pub self_gpu_pct: f64,   // MGR-DAT-076, Phase 1 = 0.0
+}
+```
+
+| 필드 | serde | 구버전 역직렬화 | 소비 위치 |
+|------|-------|----------------|----------|
+| `self_cpu_pct` | `#[serde(default)]` → 0.0 | OK | `LuaPolicy::build_ctx()` → `ctx.engine.cpu_pct` |
+| `self_gpu_pct` | `#[serde(default)]` → 0.0 | OK | `LuaPolicy::build_ctx()` → `ctx.engine.gpu_pct` (항상 0.0) |
+
+Pressure6D / EwmaReliefTable / TriggerEngine 계산에는 두 필드를 사용하지 않는다 (설계 결정: `arch/20-manager.md` §10.7).
 
 #### Pressure6D
 
