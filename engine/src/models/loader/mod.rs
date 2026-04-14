@@ -308,6 +308,7 @@ pub fn load_model(
         sliding_window_pattern: config.sliding_window_pattern,
         query_pre_attn_scalar: config.query_pre_attn_scalar,
         embed_scale: config.embed_scale,
+        weight_prefix: config.weight_prefix.clone(),
     };
 
     Ok(TransformerModel {
