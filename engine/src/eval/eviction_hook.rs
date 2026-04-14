@@ -178,7 +178,15 @@ impl StepHook<KVCache> for EvictionHook {
         _step: usize,
         _qcf_metrics: &mut Vec<serde_json::Value>,
     ) -> PostStepResult {
-        if caches.is_empty() || max_cache_pos(caches) <= self.effective_budget {
+        // effective_budget == 0 means "no budget" (full-prefill mode).
+        // Guard against the budget=0 degenerate case: without this check,
+        // ratio = 0/before_len = 0 would request full eviction every step,
+        // which on some OpenCL drivers (NVIDIA) destabilises subsequent reads
+        // via the shrink_to_fit reallocation path.
+        if caches.is_empty()
+            || self.effective_budget == 0
+            || max_cache_pos(caches) <= self.effective_budget
+        {
             return PostStepResult::default();
         }
 
@@ -229,7 +237,15 @@ impl StepHook<KVCache> for EvictionHook {
         // After full batch prefill, evict if cache exceeds budget.
         // This replaces the old chunked-prefill approach that decoded overflow
         // tokens one-by-one (causing 2-3.3x slowdown).
-        if caches.is_empty() || max_cache_pos(caches) <= self.effective_budget {
+        //
+        // Skip when effective_budget == 0 (full-prefill / no-budget mode):
+        // ratio = 0/before_len would ask the pipeline for full eviction, and
+        // the resulting release_unused_pages → shrink_to_fit reallocation
+        // breaks the next question's GPU reads on NVIDIA OpenCL.
+        if caches.is_empty()
+            || self.effective_budget == 0
+            || max_cache_pos(caches) <= self.effective_budget
+        {
             return;
         }
 
