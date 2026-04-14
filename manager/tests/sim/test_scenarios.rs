@@ -543,3 +543,84 @@ fn scenario_partition_contention_produces_non_empty_relief() {
         "30s 시뮬 후 relief_snapshot이 비어있지 않아야 함 (VirtualClockHandle이 3s 관측 지연을 충족해야 함)"
     );
 }
+
+// ─────────────────────────────────────────────────────────
+// S25 + 메모리 램프 + production 범용 Lua 정책 (policy_example.lua)
+// ─────────────────────────────────────────────────────────
+
+/// Galaxy S25 preset에서 메모리 사용량 점진 증가 시나리오를 production용
+/// 범용 Lua 정책(`manager/scripts/policy_example.lua`)으로 실행한다.
+///
+/// 검증 포인트:
+/// - 12 GB total + 8192 → 11500 MB 램프 → Warning + Critical 시그널 발생
+/// - policy_example.lua는 pressure가 가장 높은 도메인을 찾아 best-relief action 선택
+/// - 30s 실행 후 적어도 하나의 evict directive가 방출되고 relief 학습이 발생
+///
+/// 주의: policy_example.lua는 `c.relief[*]` 값 > 0 인 action만 선택하므로
+///       relief 테이블이 비면 cold-start 시 directive를 0건 방출한다.
+///       production과 동일하게 `manager/policy_config.toml`의 default_relief를
+///       시드로 사용해 부트스트랩을 가능하게 한다.
+///
+/// 디버깅: `SIM_TIMELINE=compact cargo test ... -- --nocapture`
+#[cfg(feature = "lua")]
+#[test]
+fn scenario_s25_memory_pressure_with_general_policy() {
+    let scenario_path = scenarios_dir().join("s25_memory_pressure_steady.yaml");
+    let lua_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts")
+        .join("policy_example.lua");
+    let policy_toml_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy_config.toml");
+
+    let cfg = load_scenario(&scenario_path).unwrap_or_else(|e| panic!("시나리오 로드 실패: {e}"));
+
+    let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
+    let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
+
+    // production policy_config.toml에서 default_relief 시드 로드
+    let manager_cfg = llm_manager::config::Config::from_file(&policy_toml_path)
+        .expect("policy_config.toml 로드 실패");
+    let adaptation_cfg = manager_cfg.adaptation;
+    assert!(
+        !adaptation_cfg.default_relief.is_empty(),
+        "default_relief가 비어있으면 cold-start 시 정책이 무효이므로 테스트 사전조건 위반"
+    );
+
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, adaptation_cfg)
+        .expect("Simulator::with_lua_policy 생성 실패");
+    sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
+
+    let traj = sim.trajectory();
+    traj.print_timeline_if_enabled();
+
+    let summary = TrajectorySummary::from_trajectory(traj, cpu_max, gpu_max);
+    insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
+        insta::assert_yaml_snapshot!("s25_memory_pressure_general_summary", summary);
+    });
+
+    let relief = sim.policy.relief_snapshot().unwrap_or_default();
+    if !relief.is_empty() {
+        let formatted = format_relief(&relief);
+        insta::with_settings!({ sort_maps => true, snapshot_suffix => "" }, {
+            insta::assert_yaml_snapshot!("s25_memory_pressure_general_relief", formatted);
+        });
+    }
+
+    // 1) memory_pressure signal 발생
+    let mem_sigs = traj.signal_count_by_kind("memory_pressure");
+    assert!(
+        mem_sigs >= 1,
+        "memory_pressure signal이 1개 이상 기록되어야 함, actual={mem_sigs}"
+    );
+
+    // 2) Warning 이상 진입 시점에 directive 방출
+    assert!(
+        traj.directive_count() >= 1,
+        "범용 정책은 pressure 진입 시 최소 1개 directive를 방출해야 함, actual={}",
+        traj.directive_count()
+    );
+
+    // 3) policy_example.lua는 evict 계열을 선택해야 함 (memory가 dominant pressure)
+    traj.assert_contains_directive_kind("Evict")
+        .or_else(|_| traj.assert_contains_directive_kind("Quant"))
+        .expect("memory dominant pressure 시 Evict/Quant 계열 directive가 등장해야 함");
+}

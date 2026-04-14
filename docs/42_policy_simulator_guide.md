@@ -399,6 +399,51 @@ let mut sim = Simulator::new(cfg, Box::new(mock))
     .with_tick_dt(Duration::from_millis(10));
 ```
 
+### 7.5 production 범용 정책 + 디바이스 preset 조합
+
+`manager/scripts/policy_example.lua`는 production용 범용 정책으로,
+`ctx.coef.relief` 테이블에서 `pressure가 가장 높은 도메인`에 대해
+relief 값이 가장 큰 action을 선택한다. 이 정책을 시뮬레이터에 붙이려면
+**`manager/policy_config.toml`의 `default_relief`를 시드로 같이 로드해야**
+한다 — 그렇지 않으면 cold-start에서 학습된 relief가 없어 directive를
+하나도 방출하지 않는다 (relief 값 ≤ 0이면 정책이 의도적으로 no-op).
+
+S25 디바이스 + 메모리 압박 시나리오 + 범용 정책을 묶은 예시 테스트:
+
+- 시나리오: `manager/tests/fixtures/sim/scenarios/s25_memory_pressure_steady.yaml`
+  (`extends: ../s25_galaxy.yaml`, 8192→11500 MB 램프)
+- 정책: `manager/scripts/policy_example.lua`
+- relief seed: `manager/policy_config.toml`
+
+```bash
+# 일반 실행 (snapshot 검증 포함)
+cargo test -p llm_manager --test sim --features lua \
+  scenario_s25_memory_pressure_with_general_policy
+
+# 타임라인을 stderr로 보면서 실행 (디버깅)
+SIM_TIMELINE=compact cargo test -p llm_manager --test sim --features lua \
+  scenario_s25_memory_pressure_with_general_policy -- --nocapture
+
+# 시나리오 변경 후 snapshot 갱신
+INSTA_UPDATE=always cargo test -p llm_manager --test sim --features lua \
+  scenario_s25_memory_pressure_with_general_policy
+```
+
+테스트 코드는 `manager/tests/sim/test_scenarios.rs`의
+`scenario_s25_memory_pressure_with_general_policy` 함수를 참조.
+
+```rust
+let manager_cfg = llm_manager::config::Config::from_file(
+    &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("policy_config.toml"),
+)?;
+let mut sim = Simulator::with_lua_policy(
+    cfg,
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("scripts/policy_example.lua"),
+    manager_cfg.adaptation,  // ← default_relief 시드 포함
+)?;
+```
+
 ---
 
 ## 8. Trajectory + Assertion
