@@ -1800,6 +1800,7 @@ mod tests {
             sliding_window_pattern: None,
             query_pre_attn_scalar: None,
             embed_scale: None,
+            weight_prefix: String::new(),
         };
 
         let model = TransformerModel {
@@ -1944,6 +1945,7 @@ mod tests {
             sliding_window_pattern: Some(6),
             query_pre_attn_scalar: None,
             embed_scale: Some(scale),
+            weight_prefix: String::new(),
         };
 
         let lm_head = norm.clone();
@@ -2054,6 +2056,7 @@ mod tests {
             sliding_window_pattern: None,
             query_pre_attn_scalar: None,
             embed_scale: None,
+            weight_prefix: String::new(),
         };
 
         let model = TransformerModel {
@@ -2151,6 +2154,7 @@ mod tests {
             sliding_window_pattern: None,
             query_pre_attn_scalar: None,
             embed_scale: None,
+            weight_prefix: String::new(),
         };
 
         let model = TransformerModel {
