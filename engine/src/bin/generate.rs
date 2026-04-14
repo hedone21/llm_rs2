@@ -136,6 +136,22 @@ struct Args {
     #[arg(long, default_value_t = false)]
     profile_events: bool,
 
+    /// Enable GPU self-utilization measurement in Heartbeat (MSG-068 Phase 2).
+    ///
+    /// Turns on OpenCL queue profiling (same mechanism as `--profile-events`)
+    /// and feeds the accumulated GPU busy ns into `EngineStatus.self_gpu_pct`
+    /// so the Manager / LuaPolicy `ctx.engine.gpu_pct` reflects real usage
+    /// instead of the Phase 1 hardcoded 0.0.
+    ///
+    /// **Overhead**: on Adreno, queue profiling adds ~54 ms/token. Keep OFF
+    /// for production TBT measurements. OFF is the default — heartbeat
+    /// `self_gpu_pct` stays at 0.0 (INV-092 fallback).
+    ///
+    /// If `--profile-events` is already set this flag is redundant; both
+    /// share the same backend profiling infrastructure.
+    #[arg(long, default_value_t = false)]
+    heartbeat_gpu_profile: bool,
+
     /// Output directory for profiling data.
     #[arg(long, default_value = "results/profile")]
     profile_dir: String,
@@ -523,7 +539,9 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "opencl")]
             let (gpu_be, gpu_mem_arc) =
                 match llm_rs2::backend::opencl::OpenCLBackend::new_with_profile_events(
-                    args.profile_events,
+                    // MSG-068 Phase 2: heartbeat-gpu-profile도 같은 queue
+                    // profiling 인프라를 사용하므로 어느 한쪽이 켜지면 활성화.
+                    args.profile_events || args.heartbeat_gpu_profile,
                 ) {
                     Ok(gpu_concrete) => {
                         let gpu_concrete = Arc::new(gpu_concrete);
@@ -555,7 +573,9 @@ fn main() -> anyhow::Result<()> {
         "opencl" | "gpu" => {
             let gpu_concrete = Arc::new(
                 llm_rs2::backend::opencl::OpenCLBackend::new_with_profile_events(
-                    args.profile_events,
+                    // MSG-068 Phase 2: heartbeat-gpu-profile도 같은 queue
+                    // profiling 인프라를 사용하므로 어느 한쪽이 켜지면 활성화.
+                    args.profile_events || args.heartbeat_gpu_profile,
                 )?,
             );
             // When resilience is enabled, force zero-copy memory so KV cache uses
@@ -927,17 +947,47 @@ fn main() -> anyhow::Result<()> {
 
     let mut experiment_tx: Option<std::sync::mpsc::Sender<ManagerMessage>> = None;
     let heartbeat_interval = std::time::Duration::from_millis(1000);
+
+    // MSG-068 Phase 2: GPU self-util meter 추출. 백엔드가 queue profiling과
+    // 함께 빌드되었을 때만(opt-in) Some이 된다. CPU 백엔드/비활성 시 None이며
+    // executor는 self_gpu_pct=0.0을 송출한다 (INV-092 fallback).
+    #[allow(unused_mut)]
+    let mut gpu_meter: Option<std::sync::Arc<dyn llm_rs2::resilience::GpuSelfMeter>> = None;
+    #[cfg(feature = "opencl")]
+    if args.heartbeat_gpu_profile {
+        // 우선 primary backend에서 찾고, 없으면 secondary(GPU)에서 찾는다.
+        // CPU primary + GPU secondary 구성에서도 GPU self-util을 보고하기 위함.
+        let try_extract = |b: &std::sync::Arc<dyn Backend>| -> Option<
+            std::sync::Arc<dyn llm_rs2::resilience::GpuSelfMeter>,
+        > {
+            b.as_any()
+                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                .and_then(|ocl| ocl.gpu_self_meter())
+                .map(|m| m as std::sync::Arc<dyn llm_rs2::resilience::GpuSelfMeter>)
+        };
+        gpu_meter =
+            try_extract(&backend).or_else(|| gpu_backend_arc.as_ref().and_then(try_extract));
+        if gpu_meter.is_some() {
+            eprintln!("[Resilience] Heartbeat GPU profiling enabled (MSG-068 Phase 2)");
+        } else {
+            eprintln!(
+                "[Resilience] --heartbeat-gpu-profile set but no OpenCL backend with profiling available; self_gpu_pct stays 0.0"
+            );
+        }
+    }
+
     let mut command_executor = if let Some(ref schedule) = experiment_schedule {
         // Experiment mode: internal mpsc channel (no external transport needed)
         let (tx, rx) = std::sync::mpsc::channel();
         let (resp_tx, _resp_rx) = std::sync::mpsc::channel();
         experiment_tx = Some(tx);
         eprintln!("[Experiment] Mode enabled — schedule: {}", schedule.name);
-        Some(CommandExecutor::new(
+        Some(CommandExecutor::with_gpu_meter(
             rx,
             resp_tx,
             args.backend.clone(),
             heartbeat_interval,
+            gpu_meter.clone(),
         ))
     } else if args.enable_resilience {
         let (cmd_rx, resp_tx, _handle) = match args.resilience_transport.as_str() {
@@ -961,8 +1011,13 @@ fn main() -> anyhow::Result<()> {
             "[Resilience] Executor enabled — transport: {}",
             args.resilience_transport
         );
-        let executor =
-            CommandExecutor::new(cmd_rx, resp_tx, args.backend.clone(), heartbeat_interval);
+        let executor = CommandExecutor::with_gpu_meter(
+            cmd_rx,
+            resp_tx,
+            args.backend.clone(),
+            heartbeat_interval,
+            gpu_meter.clone(),
+        );
 
         // Send Capability as first message (SEQ-022).
         executor.send_capability(llm_shared::EngineCapability {
@@ -2887,12 +2942,14 @@ fn main() -> anyhow::Result<()> {
     {
         println!("[Profile] Event: DecodingStart");
 
-        // --profile-events: drop any events captured during prefill/warmup so
-        // the decode-only aggregate is not polluted. Prefill uses the generic
-        // `forward` path (no label hints), so without this step all matmul
-        // dispatches from prefill would spill into the decode "matmul" bucket.
+        // --profile-events / --heartbeat-gpu-profile: drop any events captured
+        // during prefill/warmup so the decode-only aggregate is not polluted.
+        // Prefill uses the generic `forward` path (no label hints), so without
+        // this step all matmul dispatches from prefill would spill into the
+        // decode "matmul" bucket and inflate the GPU self-util meter's first
+        // heartbeat sample.
         #[cfg(feature = "opencl")]
-        if args.profile_events
+        if (args.profile_events || args.heartbeat_gpu_profile)
             && let Some(ocl_be) = backend
                 .as_any()
                 .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
@@ -2901,6 +2958,13 @@ fn main() -> anyhow::Result<()> {
             backend.synchronize()?;
             ocl_be.flush_and_aggregate_profile()?;
             let _ = ocl_be.take_profile_accum();
+            // Prefill-phase GPU busy ns were also fed into the self-util
+            // meter via flush_and_aggregate_profile(); drain them so the
+            // first heartbeat only reflects decode-phase usage.
+            if let Some(m) = ocl_be.gpu_self_meter() {
+                use llm_rs2::resilience::GpuSelfMeter;
+                let _ = m.sample(std::time::Duration::from_secs(1));
+            }
             eprintln!("[Profile] prefill/warmup events dropped (decode-only accumulator)");
         }
         // Pre-allocate workspace for generation
@@ -3218,20 +3282,28 @@ fn main() -> anyhow::Result<()> {
             backend.synchronize()?;
 
             // --profile-events: drain and aggregate GPU events into OpProfiler.
-            // Runs only when the OpenCL backend was created with event profiling
-            // enabled; CPU backend or non-profile runs skip this entirely.
+            // --heartbeat-gpu-profile (MSG-068 Phase 2): same flush, but feeds
+            // the GPU self-util meter instead of (or in addition to) the
+            // op-level profiler. Flush runs whenever queue profiling is on.
             #[cfg(feature = "opencl")]
-            if args.profile_events
+            if (args.profile_events || args.heartbeat_gpu_profile)
                 && let Some(ocl_be) = backend
                     .as_any()
                     .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
                 && ocl_be.profile_events_enabled
             {
                 ocl_be.flush_and_aggregate_profile()?;
-                let accum = ocl_be.take_profile_accum();
-                if let Some(ref mut p) = profiler {
-                    p.ops.merge_from_events(&accum);
-                    p.ops.count += 1;
+                // Op-profiler aggregation only when the caller asked for
+                // per-op timing (--profile-events). The heartbeat-only path
+                // still flushes so the GPU self-util meter sees the delta,
+                // but intentionally skips take_profile_accum() to avoid
+                // clearing labels that might still be of interest elsewhere.
+                if args.profile_events {
+                    let accum = ocl_be.take_profile_accum();
+                    if let Some(ref mut p) = profiler {
+                        p.ops.merge_from_events(&accum);
+                        p.ops.count += 1;
+                    }
                 }
             }
 

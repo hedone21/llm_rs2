@@ -1,10 +1,13 @@
 //! MGR-DAT-075, MGR-DAT-076, MSG-069: LuaPolicy `ctx.engine` 하위의
 //! Engine self-utilization 필드 노출 계약을 검증한다.
 //!
-//! 2026-04 Phase 1 — Engine이 Heartbeat로 전달한 `self_cpu_pct`/`self_gpu_pct`가
+//! 2026-04 Phase 1~2 — Engine이 Heartbeat로 전달한 `self_cpu_pct`/`self_gpu_pct`가
 //! Manager 측에서 소실·재해석 없이 `ctx.engine.cpu_pct`/`ctx.engine.gpu_pct`로
 //! Lua 평가 컨텍스트에 그대로 전달되는지 확인한다. 또한 Pressure6D나
 //! EwmaReliefTable 계산에 섞여 들어가지 않음(영향 없음)을 확인한다.
+//!
+//! Phase 2에서는 self_gpu_pct가 실측값(0.0~1.0)일 수 있으며, Manager는 여전히
+//! 해석/변형하지 않고 그대로 전달해야 한다.
 //!
 //! 실행 조건: LuaPolicy가 기본 경로이므로 feature gate 없음. 기존
 //! `#[cfg(feature = "hierarchical")]` 테스트와 독립적으로 실행된다.
@@ -140,16 +143,17 @@ fn mgr_dat_075_ctx_engine_cpu_pct_is_zero_before_first_heartbeat() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn mgr_dat_076_ctx_engine_gpu_pct_phase1_is_zero() {
-    // SPEC: MGR-DAT-076, MSG-068
+fn mgr_dat_076_ctx_engine_gpu_pct_default_is_zero_without_meter() {
+    // SPEC: MGR-DAT-076, MSG-068, INV-092
+    // Phase 2에서도 meter 미주입(기본) 시 engine은 self_gpu_pct=0.0을 송출하며
+    // Manager는 그대로 ctx.engine.gpu_pct=0.0으로 Lua에 노출한다.
     let (mut p, _f) = new_policy(SCRIPT_ECHO_GPU_PCT_AS_TBT);
-    // Executor는 Phase 1에서 self_gpu_pct=0.0 하드코딩. heartbeat 그대로 전달.
     p.update_engine_state(&heartbeat(0.5, 0.0));
     let dir = p.process_signal(&compute_signal(0.0));
     assert_eq!(
         extract_target_ms(dir),
         Some(0),
-        "Phase 1에서 ctx.engine.gpu_pct는 항상 0"
+        "meter 미주입 시 ctx.engine.gpu_pct는 0.0 (Phase 1 호환)"
     );
 }
 

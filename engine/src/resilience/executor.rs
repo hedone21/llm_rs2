@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -6,6 +7,7 @@ use llm_shared::{
     EngineStatus, ManagerMessage, QcfEstimate, ResourceLevel,
 };
 
+use crate::resilience::gpu_self_meter::GpuSelfMeter;
 use crate::resilience::proc_self_meter::ProcSelfMeter;
 
 // ── Public types ────────────────────────────────────────────
@@ -131,6 +133,13 @@ pub struct CommandExecutor {
 
     // Engine self-util (MSG-067): /proc/self/stat 기반 자가 CPU 사용률 measurer.
     proc_meter: ProcSelfMeter,
+
+    // Engine self-util (MSG-068, Phase 2): OpenCL profiling 기반 자가 GPU
+    // 사용률 measurer. None이면 Phase 1 호환 동작 (self_gpu_pct=0.0).
+    gpu_meter: Option<Arc<dyn GpuSelfMeter>>,
+    // 직전 heartbeat 송출 시각. gpu_meter의 wall_elapsed 계산에 사용한다.
+    // 첫 샘플은 new() 시각을 기준으로 하여 warm-up 구간을 자연스럽게 흡수.
+    last_heartbeat_at: Instant,
 }
 
 impl CommandExecutor {
@@ -140,6 +149,21 @@ impl CommandExecutor {
         active_device: String,
         heartbeat_interval: Duration,
     ) -> Self {
+        Self::with_gpu_meter(cmd_rx, resp_tx, active_device, heartbeat_interval, None)
+    }
+
+    /// MSG-068 / MGR-DAT-076 Phase 2: GPU self-utilization meter를 주입할 수
+    /// 있는 확장 생성자. `gpu_meter`가 `Some`이면 heartbeat 송출 시 meter를
+    /// 샘플링하여 `self_gpu_pct`에 실어 보낸다. `None`이면 Phase 1 호환
+    /// (항상 0.0).
+    pub fn with_gpu_meter(
+        cmd_rx: mpsc::Receiver<ManagerMessage>,
+        resp_tx: mpsc::Sender<EngineMessage>,
+        active_device: String,
+        heartbeat_interval: Duration,
+        gpu_meter: Option<Arc<dyn GpuSelfMeter>>,
+    ) -> Self {
+        let now = Instant::now();
         Self {
             cmd_rx,
             resp_tx,
@@ -159,9 +183,11 @@ impl CommandExecutor {
             throughput_ema: 0.0,
             last_token_time: None,
             tokens_generated: 0,
-            last_heartbeat: Instant::now(),
+            last_heartbeat: now,
             heartbeat_interval,
             proc_meter: ProcSelfMeter::new(),
+            gpu_meter,
+            last_heartbeat_at: now,
         }
     }
 
@@ -492,9 +518,22 @@ impl CommandExecutor {
             partition_ratio: self.partition_ratio,
             // MSG-067: /proc/self/stat 기반 자가 CPU 사용률. 측정 실패 시 0.0 (INV-092).
             self_cpu_pct: self.proc_meter.sample(),
-            // MSG-068: Phase 1 placeholder. Phase 2에서 OpenCL profiling 기반 실측.
-            self_gpu_pct: 0.0,
+            // MSG-068 / MGR-DAT-076 Phase 2: OpenCL profiling 기반 자가 GPU
+            // 사용률. meter 미주입 시(기본값) 0.0을 유지하여 Phase 1 호환
+            // (INV-092). INV-091 clamp는 meter 구현 내에서 보장된다.
+            self_gpu_pct: self
+                .gpu_meter
+                .as_ref()
+                .map(|m| {
+                    let elapsed = self.last_heartbeat_at.elapsed();
+                    m.sample(elapsed).clamp(0.0, 1.0)
+                })
+                .unwrap_or(0.0),
         };
+
+        // heartbeat 송출 직후 기준점 갱신. GPU meter의 다음 wall_elapsed 창을
+        // 여기서 시작하여 heartbeat 간격과 정확히 정렬한다.
+        self.last_heartbeat_at = Instant::now();
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));
     }

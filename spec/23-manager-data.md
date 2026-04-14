@@ -665,25 +665,27 @@ pub struct TriggerConfig {
 
 관련 요구사항: MSG-060 필드 17, MSG-067, INV-091, INV-092. 저장 대상 아님 (`EwmaReliefTable`에 포함되지 않음).
 
-**[MGR-DAT-076]** EngineStatus.self_gpu_pct — Engine 프로세스 단위 GPU 사용률. **Phase 1 미구현 placeholder.** *(MUST)*
+**[MGR-DAT-076]** EngineStatus.self_gpu_pct — Engine 프로세스 단위 GPU 사용률. *(MUST)*
 
 | 항목 | 정의 |
 |------|------|
 | 타입 | `f64` |
 | 범위 | `[0.0, 1.0]` (clamp, INV-091) |
-| Phase 1 값 | **항상 0.0.** Engine은 의미 있는 값을 계산하지 않는다 (MSG-068). |
-| Phase 2 계획 (non-normative) | OpenCL profiling (`CL_QUEUE_PROFILING_ENABLE`로 측정한 커널 start/end wall-clock) 기반 활용률. CUDA 백엔드는 `cudaEventElapsedTime` 대응. 세부 규격은 Phase 2 스펙 개정 시 본 항목을 확장한다. |
-| 소비자 (Phase 1) | LuaPolicy: `ctx.engine.gpu_pct`로 노출되지만 항상 0.0이므로 Lua 스크립트는 참조하지 말 것이 권고된다. 필드는 프로토콜 shape 고정을 위해 선제 배선한다. |
-| Pressure6D 영향 | 없음 (Phase 1에서는 의미 부여 없음). |
+| 측정 방법 | OpenCL queue profiling (`CL_QUEUE_PROFILING_ENABLE`) 이벤트로부터 각 kernel dispatch의 `(end - start)` ns를 누적하고 Heartbeat 간격의 wall-clock elapsed로 나눈다. CUDA 백엔드는 `cudaEventElapsedTime` 기반 동등 구현을 허용한다. |
+| 집계 창 | 직전 Heartbeat 송출 ~ 현재 송출 사이. 첫 송출은 0.0(warm-up). |
+| Opt-in 정책 | **기본값 비활성화 (meter 미주입 → 0.0).** Adreno에서 queue profiling은 ~54 ms/token 오버헤드를 유발하므로 production TBT 측정에서는 OFF가 원칙. Engine은 CLI 플래그(`--heartbeat-gpu-profile` 또는 `--profile-events`)로 활성화된 경우에만 meter를 주입한다. Phase 1 호환 동작은 곧 meter 미주입 상태와 같다. |
+| 실패 시 | 0.0 (INV-092, Heartbeat 송출을 차단하지 않음). |
+| 소비자 | LuaPolicy: `ctx.engine.gpu_pct`로 노출. Manager Rust 측은 값을 해석하지 않고 그대로 전달한다. |
+| Pressure6D 영향 | **없음.** Pressure6D 계산식은 변경되지 않으며 engine-self GPU 값은 pressure 벡터/relief 학습에 반영되지 않는다. |
 
-관련 요구사항: MSG-060 필드 18, MSG-068, INV-091, INV-092. Phase 2 확장 시 본 섹션과 MSG-068을 동시에 갱신한다.
+관련 요구사항: MSG-060 필드 18, MSG-068, INV-091, INV-092. 저장 대상 아님(`EwmaReliefTable`에 포함되지 않음).
 
 #### LuaPolicy 컨텍스트 노출 규약
 
 | ctx 경로 | 소스 | 의미 |
 |----------|------|------|
 | `ctx.engine.cpu_pct` | EngineStatus.self_cpu_pct (MGR-DAT-075) | Engine 프로세스 자신의 CPU 점유율 |
-| `ctx.engine.gpu_pct` | EngineStatus.self_gpu_pct (MGR-DAT-076) | Phase 1 = 0.0 |
+| `ctx.engine.gpu_pct` | EngineStatus.self_gpu_pct (MGR-DAT-076) | Engine 프로세스 자신의 GPU 점유율 (meter 미주입 시 0.0) |
 | `ctx.signal.compute.cpu_pct` | ComputeGuidance.cpu_pct (MGR-DAT-013) | 시스템 전체 CPU 사용률 |
 
 Lua 측은 `ctx.signal.compute.cpu_pct - ctx.engine.cpu_pct`로 외부 경합(main app 등)을 추정할 수 있다. Rust 측은 해당 차이를 계산하거나 Pressure6D로 전달하지 않는다.

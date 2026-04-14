@@ -340,7 +340,17 @@ JSON 예시:
 
 **[MSG-067]** self_cpu_pct 계산 — Engine은 `/proc/self/stat`의 `(utime + stime)` 틱 증가량을 직전 Heartbeat 송출 시각과의 wall-clock 경과 및 `sysconf(_SC_CLK_TCK)`, 코어 수(`num_cpus`)로 정규화하여 [0.0, 1.0] 범위로 산출한다. 범위 밖 값은 clamp한다 (INV-091). 측정 실패 시 0.0 fallback이며, Heartbeat 송출은 차단하지 않는다 (INV-092). *(MUST)*
 
-**[MSG-068]** self_gpu_pct — Phase 1에서는 항상 0.0을 기록한다. Phase 2에서 GPU profiling 기반으로 확장될 때 본 조항은 MGR-DAT-076과 함께 재정의된다. *(non-normative, placeholder)*
+**[MSG-068]** self_gpu_pct 계산 — Engine은 OpenCL queue profiling
+(`CL_QUEUE_PROFILING_ENABLE`)로 캡처한 커널 start/end 이벤트에서
+`(end - start)` nanoseconds를 누적하고, 직전 Heartbeat 송출 시각과의
+wall-clock 경과로 정규화하여 [0.0, 1.0] 범위로 산출한다. 범위 밖 값은 clamp한다
+(INV-091). **Opt-in only**: profiling 활성화 시 Adreno 기준 ~54 ms/token
+오버헤드가 있으므로 기본은 비활성화(meter 미주입)이며 이 경우 0.0을 그대로
+송출한다 (INV-092 fallback, 하위호환). 측정 실패/meter 미주입 시 0.0이며
+Heartbeat 송출은 차단하지 않는다 (INV-092). 첫 샘플은 기준점 부재로 0.0
+반환(warm-up). CUDA 등 다른 백엔드는 동등한 device-side event timing을
+사용할 수 있으며(예: `cudaEventElapsedTime`), 의미는 동일하게 정의된다.
+*(MUST when meter is injected; MAY skip otherwise)*
 
 **[MSG-069]** Manager 연결 — `ctx.engine.cpu_pct`, `ctx.engine.gpu_pct`는 LuaPolicy 평가 컨텍스트에 노출된다 (MGR-DAT-075, MGR-DAT-076). 시스템 전체 CPU 사용률(`ComputeGuidance.cpu_pct` 기반 `ctx.signal.compute.cpu_pct`)과 별도 값으로 유지되며, 두 값의 산출/비교(예: 외부 경합량)는 Lua 스크립트 책임이다. Pressure6D 계산식은 변경되지 않는다. *(MUST)*
 

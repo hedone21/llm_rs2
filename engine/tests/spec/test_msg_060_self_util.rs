@@ -2,13 +2,20 @@
 //! INV-091, INV-092: Engine Self-Utilization Heartbeat 필드 Spec 테스트.
 //!
 //! 2026-04 Phase 1 — Engine이 `/proc/self/stat` 기반 자신의 CPU 사용률을
-//! Heartbeat(MSG-060)에 실어 보내는 경로를 검증한다. GPU는 Phase 1에서
-//! placeholder(항상 0.0)이며 서지/의미는 Phase 2에서 재정의된다.
+//! Heartbeat(MSG-060)에 실어 보낸다.
+//!
+//! 2026-04 Phase 2 — Engine이 OpenCL queue profiling 기반 자신의 GPU
+//! 사용률을 Heartbeat(MSG-060)에 실어 보낸다. meter 미주입(기본) 시 0.0
+//! 유지 (Phase 1 호환, INV-092 fallback).
 //!
 //! 실행 조건: feature gate 없음 (기본 경로).
 
 #![allow(clippy::needless_doctest_main)]
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use llm_rs2::resilience::gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter, OpenClEventGpuMeter};
 use llm_rs2::resilience::proc_self_meter::ProcSelfMeter;
 use llm_shared::{EngineState, EngineStatus, ResourceLevel};
 
@@ -125,12 +132,86 @@ fn inv_091_self_cpu_pct_is_clamped_on_send_side() {
 }
 
 #[test]
-fn inv_091_self_gpu_pct_phase1_is_always_zero() {
-    // SPEC: INV-091, MSG-068
-    // Phase 1 — Engine 측에서 GPU self-util은 항상 0.0. Executor에서
-    // 하드코딩되므로, base_status() (executor와 같은 기본값)이 곧 송출 값.
+fn inv_091_self_gpu_pct_default_without_meter_is_zero() {
+    // SPEC: INV-091, MSG-068, INV-092
+    // Phase 2 — meter 미주입(기본 CommandExecutor::new) 시 executor는 Phase 1과
+    // 동일하게 self_gpu_pct=0.0을 송출한다. 하위호환 및 INV-092 fallback.
     let s = base_status();
     assert_eq!(s.self_gpu_pct, 0.0);
+}
+
+#[test]
+fn msg_068_noop_gpu_meter_always_returns_zero() {
+    // SPEC: MSG-068, INV-092
+    // NoOpGpuMeter는 모든 wall_elapsed 입력에 대해 0.0을 반환해야 한다.
+    let m = NoOpGpuMeter;
+    assert_eq!(m.sample(Duration::from_millis(0)), 0.0);
+    assert_eq!(m.sample(Duration::from_millis(1000)), 0.0);
+    assert_eq!(m.sample(Duration::from_secs(3600)), 0.0);
+}
+
+#[test]
+fn msg_068_gpu_meter_sample_is_in_unit_range() {
+    // SPEC: MSG-068, INV-091
+    // OpenClEventGpuMeter는 어떤 입력에도 [0.0, 1.0] 범위 값을 반환한다.
+    let m = OpenClEventGpuMeter::new();
+    // 극단값: busy > wall은 1.0으로 clamp
+    m.record_busy_ns(10_000_000_000);
+    let v = m.sample(Duration::from_millis(1000));
+    assert!((0.0..=1.0).contains(&v), "expected 0..=1, got {v}");
+    assert_eq!(v, 1.0);
+
+    // 일반 케이스
+    m.record_busy_ns(250_000_000);
+    let v = m.sample(Duration::from_millis(1000));
+    assert!((0.0..=1.0).contains(&v));
+    assert!((v - 0.25).abs() < 1e-9);
+}
+
+#[test]
+fn msg_068_gpu_meter_first_sample_is_zero() {
+    // SPEC: MSG-068 warm-up
+    // 첫 sample()은 이전 기준값이 없으므로 0.0 반환(누적도 0).
+    let m = OpenClEventGpuMeter::new();
+    assert_eq!(m.sample(Duration::from_millis(1000)), 0.0);
+}
+
+#[test]
+fn inv_092_gpu_meter_zero_wall_falls_back_to_zero() {
+    // SPEC: INV-092
+    // 측정 실패/퇴화 입력(wall_elapsed=0) 시 meter는 0.0을 반환.
+    let m = OpenClEventGpuMeter::new();
+    m.record_busy_ns(500_000_000);
+    assert_eq!(m.sample(Duration::ZERO), 0.0);
+}
+
+#[test]
+fn inv_092_gpu_meter_failure_does_not_block_heartbeat() {
+    // SPEC: INV-092
+    // meter가 0.0 반환하더라도 status serialize/deserialize가 정상 동작하고
+    // 다른 필드가 영향을 받지 않음을 확인.
+    let m: Arc<dyn GpuSelfMeter> = Arc::new(NoOpGpuMeter);
+    let mut s = base_status();
+    s.self_gpu_pct = m.sample(Duration::from_millis(1000)); // 0.0
+    let json = serde_json::to_string(&s).unwrap();
+    let back: EngineStatus = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.self_gpu_pct, 0.0);
+    assert_eq!(back.tokens_generated, 50);
+    assert_eq!(back.active_device, "cpu");
+}
+
+#[test]
+fn msg_068_gpu_meter_trait_object_dispatch_works() {
+    // SPEC: MSG-068
+    // CommandExecutor가 저장하는 형태 Arc<dyn GpuSelfMeter> 경유 호출이
+    // 구현체에 정상 dispatch되는지 확인 (executor 경로 간접 검증).
+    let meter = Arc::new(OpenClEventGpuMeter::new());
+    meter.record_busy_ns(400_000_000);
+    let dyn_meter: Arc<dyn GpuSelfMeter> = meter.clone();
+    let v = dyn_meter.sample(Duration::from_millis(1000));
+    assert!((v - 0.4).abs() < 1e-9);
+    // drain semantics: 두 번째 호출은 0.0
+    assert_eq!(dyn_meter.sample(Duration::from_millis(1000)), 0.0);
 }
 
 // ---------------------------------------------------------------------------

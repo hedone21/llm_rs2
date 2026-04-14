@@ -1,4 +1,5 @@
 pub mod executor;
+pub mod gpu_self_meter;
 pub mod manager;
 pub mod proc_self_meter;
 pub mod signal;
@@ -12,6 +13,7 @@ pub mod dbus_transport;
 pub use executor::{
     CommandExecutor, EvictMethod, EvictPlan, ExecutionPlan, KVSnapshot, StreamingParams,
 };
+pub use gpu_self_meter::{GpuSelfMeter, NoOpGpuMeter, OpenClEventGpuMeter};
 pub use manager::{InferenceContext, ResilienceManager, execute_action};
 pub use signal::{
     CommandResponse, CommandResult, EngineCapability, EngineCommand, EngineDirective,

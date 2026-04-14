@@ -10,8 +10,9 @@ use ocl::core::Kernel as CoreKernel;
 use ocl::{Context, Device, Platform, Program, Queue, flags};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-#[cfg(test)]
 use std::sync::Arc;
+
+use crate::resilience::gpu_self_meter::OpenClEventGpuMeter;
 
 pub mod buffer;
 pub mod gpu_score;
@@ -294,6 +295,14 @@ pub struct OpenCLBackend {
     // and plan.rs to distinguish matmul_qkv / matmul_wo / matmul_ffn / lm_head
     // which all dispatch the same underlying GEMV/GEMM kernel.
     op_label_hint: UnsafeCell<Option<&'static str>>,
+
+    // MSG-068 / MGR-DAT-076 (Phase 2): Engine process GPU self-utilization
+    // meter. `flush_and_aggregate_profile()` pushes per-event (end - start) ns
+    // into this accumulator when present. `CommandExecutor::send_heartbeat`
+    // then drains it to compute `self_gpu_pct`. Populated only when the caller
+    // opts in via `new_with_profile_events(true)`. Arc so both backend and
+    // executor can hold a reference without lifetime gymnastics.
+    gpu_self_meter: Option<Arc<OpenClEventGpuMeter>>,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -1056,6 +1065,14 @@ impl OpenCLBackend {
             profile_events: UnsafeCell::new(Vec::new()),
             profile_accum: UnsafeCell::new(HashMap::new()),
             op_label_hint: UnsafeCell::new(None),
+            // MSG-068 Phase 2: meter는 profile-events 모드에서만 생성된다.
+            // 호스트가 --profile-events 또는 --heartbeat-gpu-profile로 queue
+            // profiling을 켰을 때만 의미가 있다.
+            gpu_self_meter: if profile_events_enabled {
+                Some(Arc::new(OpenClEventGpuMeter::new()))
+            } else {
+                None
+            },
         })
     }
 
@@ -1179,9 +1196,26 @@ impl OpenCLBackend {
                 };
             let delta = end_ns.saturating_sub(start_ns);
             *accum.entry(label).or_insert(0) += delta;
+            // MSG-068 Phase 2: GPU self-util accumulator (opt-in). Sums raw
+            // (end - start) ns regardless of label. CommandExecutor drains
+            // this via GpuSelfMeter::sample() on each heartbeat.
+            if let Some(meter) = self.gpu_self_meter.as_ref() {
+                meter.record_busy_ns(delta);
+            }
             // ev is dropped here -> clReleaseEvent
         }
         Ok(())
+    }
+
+    /// Clone the shared GPU self-utilization meter, if profile-events is enabled.
+    ///
+    /// Used by `CommandExecutor` to periodically drain accumulated GPU busy
+    /// ns and compute `EngineStatus.self_gpu_pct` (MSG-068, MGR-DAT-076
+    /// Phase 2). Returns `None` when the backend was constructed without
+    /// profiling (`new_with_profile_events(false)`), in which case the
+    /// executor falls back to `self_gpu_pct = 0.0` (INV-092).
+    pub fn gpu_self_meter(&self) -> Option<Arc<OpenClEventGpuMeter>> {
+        self.gpu_self_meter.clone()
     }
 
     /// Consume the accumulated per-label ns map, returning it as `HashMap<String, u64>`.
