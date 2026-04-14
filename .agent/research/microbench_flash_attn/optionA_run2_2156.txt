@@ -1,0 +1,57 @@
+# microbench_flash_attn — Option C (stride) + Option A (production conditions)
+# Platform: QUALCOMM Snapdragon(TM)
+# Device:   QUALCOMM Adreno(TM) 830
+# Model: n_h_q=12 n_h_kv=2 dk=128 dv=128 cap=8192 Q1_WG_SIZE=64 layers=28
+# Build opts: -DDK=128 -DDV=128 -DBLOCK_M=32 -DBLOCK_N=32 -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+
+layout,variant,n_kv,median_us,mean_us,min_us,max_us,iters
+HeadMajor,Single,258,196.86,197.07,195.07,200.96,30
+HeadMajor,Single,1025,470.78,470.99,468.99,475.14,30
+HeadMajor,Single,2047,827.14,828.61,823.04,837.12,30
+HeadMajor,Single,4472,1724.16,1724.31,1711.10,1737.98,30
+HeadMajor,Repeat28,258,5574.14,5568.68,5529.09,5583.10,30
+HeadMajor,Repeat28,1025,13356.54,13357.10,13332.99,13385.47,30
+HeadMajor,Repeat28,2047,23332.35,23397.96,23185.41,24901.38,30
+HeadMajor,Repeat28,4472,47960.83,47769.78,47279.10,49793.28,30
+HeadMajor,Repeat28Mask,258,5580.29,5580.31,5570.56,5590.78,30
+HeadMajor,Repeat28Mask,1025,13464.06,13517.43,13368.06,15337.98,30
+HeadMajor,Repeat28Mask,2047,23905.54,23893.57,23712.77,23966.72,30
+HeadMajor,Repeat28Mask,4472,48960.51,49000.90,48811.78,50225.41,30
+HeadMajor,Repeat28MaskQ,258,5579.01,5579.00,5568.77,5592.83,30
+HeadMajor,Repeat28MaskQ,1025,13457.92,13443.59,13363.97,13491.97,30
+HeadMajor,Repeat28MaskQ,2047,23857.15,23830.81,23604.48,23878.91,30
+HeadMajor,Repeat28MaskQ,4472,49003.26,49123.66,48770.56,50849.79,30
+PosMajor,Single,258,199.94,199.97,197.89,203.01,30
+PosMajor,Single,1025,482.82,483.04,477.95,489.98,30
+PosMajor,Single,2047,857.86,854.87,844.03,864.00,30
+PosMajor,Single,4472,1746.18,1748.44,1720.06,1766.91,30
+PosMajor,Repeat28,258,5681.92,5680.12,5663.23,5691.90,30
+PosMajor,Repeat28,1025,13579.78,13579.32,13544.96,13600.51,30
+PosMajor,Repeat28,2047,23719.17,23759.05,23611.14,25470.98,30
+PosMajor,Repeat28,4472,48486.91,48607.51,48337.92,50729.98,30
+PosMajor,Repeat28Mask,258,5678.85,5686.59,5649.66,5740.29,30
+PosMajor,Repeat28Mask,1025,13712.64,13710.21,13677.82,13735.17,30
+PosMajor,Repeat28Mask,2047,24068.10,24071.12,23891.46,25619.97,30
+PosMajor,Repeat28Mask,4472,49040.90,49015.41,48718.59,50511.36,30
+PosMajor,Repeat28MaskQ,258,5692.93,5691.59,5673.98,5701.89,30
+PosMajor,Repeat28MaskQ,1025,13655.04,13728.06,13574.14,15628.29,30
+PosMajor,Repeat28MaskQ,2047,24011.78,24001.72,23901.95,24026.88,30
+PosMajor,Repeat28MaskQ,4472,48764.67,48912.76,48671.23,50584.06,30
+
+# Slope (μs / n_kv) per (layout, variant) — least squares
+# layout,variant,slope_us_per_n_kv,intercept_us
+# HeadMajor,Single,0.3626,97.42
+# HeadMajor,Repeat28,10.0501,2953.28
+# HeadMajor,Repeat28Mask,10.2945,2898.11
+# HeadMajor,Repeat28MaskQ,10.3055,2873.39
+# PosMajor,Single,0.3668,106.23
+# PosMajor,Repeat28,10.1467,3075.78
+# PosMajor,Repeat28Mask,10.2768,3080.14
+# PosMajor,Repeat28MaskQ,10.2102,3116.14
+
+# Production gap decomposition (HeadMajor only, per-token slope)
+# Reference: production attention slope = 13.23 μs/n_kv per token
+# Single            per-token slope = 10.1537 μs/n_kv  Δ = +0.0000
+# Repeat28          per-token slope = 10.0501 μs/n_kv  Δ = -0.1037
+# Repeat28Mask      per-token slope = 10.2945 μs/n_kv  Δ = +0.2444
+# Repeat28MaskQ     per-token slope = 10.3055 μs/n_kv  Δ = +0.0110

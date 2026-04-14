@@ -58,6 +58,51 @@
 
 **다음 작업 권장 순서 갱신**: A (production 조건 microbench로 0.36 → 0.47 차이 isolate) → D (eviction-based 우회) → B (Snapdragon Profiler).
 
+### 🆕 2026-04-14 21:50: Option A — production 조건 microbench 분해 → **결정적 발견**
+
+**확장 매트릭스**: 4 variants × 2 layouts × 4 n_kv × 30 iters × 2 runs.
+
+**HeadMajor per-token slope (μs/n_kv) 분해**:
+
+| variant | mean slope | Δ from prev |
+|---|---:|---:|
+| Single × 28 (환산) | 10.48 | — |
+| Repeat28 (back-to-back) | 9.98 | −0.50 (pipeline overlap) |
+| +Mask (causal F16) | 10.30 | +0.32 (mask read) |
+| +QVar (28-slot rotation) | 10.30 | 0.00 (no effect) |
+
+**결과 1**: production attention slope 13.23 vs microbench-best 10.30 = **2.93 μs/n_kv 차이**가 production 환경의 17개 intervening ops (FFN matmul L2 thrashing 등)에서 옴. **수정 어려움 — 구조적**.
+
+**결과 2 (더 중요)**: microbench-best 10.30 자체가 llama.cpp 추정 attention slope (~4.5) 대비 **2.3× 느림**. 즉 production 환경 노이즈를 0으로 제거해도 우리 커널이 본질적으로 더 느림. **Phase A의 "byte-identical 결론"이 실측과 모순 — 재검토 필요**.
+
+**Phase A 누락 가능성**:
+1. 실제 dispatch 되는 kernel 파일이 다름 (build variant)
+2. global/local work size, subgroup 구성 차이
+3. specialization constants 차이
+4. vendor-specific 컴파일 옵션 차이
+5. 드라이버 컴파일 결정 차이 (source identical even if asm differs)
+
+**산출물**: `.agent/research/microbench_flash_attn/option_a_production_decomp.md`
+
+### 🚀 다음 세션 엔트리 포인트 (재정비 v3)
+
+A 결과로 "production 환경 overhead 2.93은 줄이기 어렵고, 진짜 갭은 커널 자체 (10.30 vs 4.5)"가 확정됨. Phase A 재검토 + B (Snapdragon Profiler)로 kernel-level isolation이 정공법.
+
+**A1 (저비용, Phase A 재검토)**: researcher에게 다음을 위임
+- Galaxy S25 디바이스에서 실제 llama.cpp 빌드가 사용하는 kernel binary 추출 (clGetProgramInfo + decompile)
+- 우리와 같은 입력 (Qwen 2.5-1.5B, n_kv=2047, decode)에서 llama.cpp가 enqueue 하는 정확한 dispatch parameters (gws/lws/args) 캡처
+- 두 kernel의 컴파일된 ISA 직접 비교
+
+**A2 (고비용, B로 진행)**: Snapdragon Profiler trace
+- 두 엔진의 attention dispatch만 격리하여 SP에서 비교
+- L1/L2 hit rate, register usage, occupancy, stall reason 직접 측정
+- 명확한 bottleneck class 식별 (memory-bound vs compute-bound vs occupancy)
+
+**D (저비용, 갭 우회)**: 정확도 trade-off 수용 가능 시
+- 이미 구현된 Sliding/H2O/D2O eviction을 long-context decode에 적극 적용
+- effective n_kv 감소 → context 비례 갭 자동 감소
+- 측정: `--eviction-policy sliding --eviction-window 1024` 에서 long context TBT 비교
+
 ### 🚀 다음 세션 엔트리 포인트 (재정비)
 
 KV stride 가설까지 기각된 시점, 남은 후보를 ROI 순으로:
