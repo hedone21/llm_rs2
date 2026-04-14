@@ -170,7 +170,7 @@ impl Simulator {
 
         let hb_interval = Duration::from_secs_f64(self.cfg.observation.heartbeat.interval_s);
         schedule_periodic_from(
-            &mut *self.clock.lock().unwrap(),
+            &mut self.clock.lock().unwrap(),
             || EventKind::Heartbeat,
             now,
             hb_interval,
@@ -180,7 +180,7 @@ impl Simulator {
         let mem_period =
             Duration::from_secs_f64(self.cfg.observation.signals.memory.poll_interval_s);
         schedule_periodic_from(
-            &mut *self.clock.lock().unwrap(),
+            &mut self.clock.lock().unwrap(),
             || EventKind::SignalMemory,
             now,
             mem_period,
@@ -190,7 +190,7 @@ impl Simulator {
         let cpu_period =
             Duration::from_secs_f64(self.cfg.observation.signals.compute.poll_interval_s);
         schedule_periodic_from(
-            &mut *self.clock.lock().unwrap(),
+            &mut self.clock.lock().unwrap(),
             || EventKind::SignalCompute,
             now,
             cpu_period,
@@ -200,7 +200,7 @@ impl Simulator {
         let therm_period =
             Duration::from_secs_f64(self.cfg.observation.signals.thermal.poll_interval_s);
         schedule_periodic_from(
-            &mut *self.clock.lock().unwrap(),
+            &mut self.clock.lock().unwrap(),
             || EventKind::SignalThermal,
             now,
             therm_period,
@@ -210,7 +210,7 @@ impl Simulator {
         let energy_period =
             Duration::from_secs_f64(self.cfg.observation.signals.energy.poll_interval_s);
         schedule_periodic_from(
-            &mut *self.clock.lock().unwrap(),
+            &mut self.clock.lock().unwrap(),
             || EventKind::SignalEnergy,
             now,
             energy_period,
@@ -313,7 +313,7 @@ impl Simulator {
                 &mut self.state,
                 &self.engine,
                 &self.cfg,
-                &*vc,
+                &vc,
                 self.tick_dt,
                 &mut self.ctx,
             )?;

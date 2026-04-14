@@ -24,7 +24,9 @@ use crate::config::{AdaptationConfig, TriggerConfig};
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
 
-const RELIEF_DIMS: usize = 6; // gpu, cpu, memory, thermal, latency, main_app_qos
+/// 6D relief 벡터 차원 수 (gpu, cpu, memory, thermal, latency, main_app_qos).
+#[doc(hidden)]
+pub const RELIEF_DIMS: usize = 6;
 
 #[derive(Debug, Clone, Default)]
 struct Pressure6D {
@@ -203,22 +205,32 @@ impl TriggerEngine {
     }
 }
 
+/// 단일 액션의 학습된 EWMA relief 벡터 + 관측 횟수.
+///
+/// JSON으로 직렬화되어 `relief_table_path`에 저장된다 (MGR-DAT-071).
+/// `relief[i]` 부호 규약 (MGR-DAT-073, INV-089):
+///   - dims 0~4: before – after (양수 = 압박 감소)
+///   - dim 5 (main_app_qos): after – before (양수 = QoS 향상)
+#[doc(hidden)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReliefEntry {
-    relief: [f32; RELIEF_DIMS],
-    observation_count: u32,
+pub struct ReliefEntry {
+    pub relief: [f32; RELIEF_DIMS],
+    pub observation_count: u32,
 }
 
-#[derive(Debug)]
-struct EwmaReliefTable {
-    entries: HashMap<String, ReliefEntry>,
-    alpha: f32,
-    #[allow(dead_code)]
-    defaults: HashMap<String, Vec<f32>>,
+/// EWMA-기반 relief 학습 테이블 (MGR-ALG-080 ~ MGR-ALG-083).
+///
+/// Integration test에서 직접 생성·조작하기 위해 공개된다.
+/// Production 코드는 `LuaPolicy` 내부에서만 사용한다.
+#[doc(hidden)]
+pub struct EwmaReliefTable {
+    pub entries: HashMap<String, ReliefEntry>,
+    pub alpha: f32,
+    pub defaults: HashMap<String, Vec<f32>>,
 }
 
 impl EwmaReliefTable {
-    fn new(alpha: f32, defaults: HashMap<String, Vec<f32>>) -> Self {
+    pub fn new(alpha: f32, defaults: HashMap<String, Vec<f32>>) -> Self {
         Self {
             entries: HashMap::new(),
             alpha,
@@ -226,7 +238,7 @@ impl EwmaReliefTable {
         }
     }
 
-    fn predict(&self, action: &str) -> [f32; RELIEF_DIMS] {
+    pub fn predict(&self, action: &str) -> [f32; RELIEF_DIMS] {
         if let Some(entry) = self.entries.get(action) {
             return entry.relief;
         }
@@ -240,7 +252,7 @@ impl EwmaReliefTable {
         [0.0; RELIEF_DIMS]
     }
 
-    fn observe(&mut self, action: &str, observed: &[f32; RELIEF_DIMS]) {
+    pub fn observe(&mut self, action: &str, observed: &[f32; RELIEF_DIMS]) {
         let entry = self
             .entries
             .entry(action.to_string())
@@ -260,25 +272,28 @@ impl EwmaReliefTable {
         entry.observation_count += 1;
     }
 
-    #[allow(dead_code)]
-    fn observation_count(&self, action: &str) -> u32 {
+    pub fn observation_count(&self, action: &str) -> u32 {
         self.entries.get(action).map_or(0, |e| e.observation_count)
     }
 
     /// 현재 테이블 상태를 스냅샷으로 반환한다 (테스트/시뮬레이터 관측용).
-    pub(crate) fn snapshot(&self) -> HashMap<String, [f32; RELIEF_DIMS]> {
+    pub fn snapshot(&self) -> HashMap<String, [f32; RELIEF_DIMS]> {
         self.entries
             .iter()
             .map(|(k, v)| (k.clone(), v.relief))
             .collect()
     }
 
-    fn save(&self, path: &Path) -> std::io::Result<()> {
+    pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(&self.entries).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
     }
 
-    fn load(path: &Path, alpha: f32, defaults: HashMap<String, Vec<f32>>) -> std::io::Result<Self> {
+    pub fn load(
+        path: &Path,
+        alpha: f32,
+        defaults: HashMap<String, Vec<f32>>,
+    ) -> std::io::Result<Self> {
         let json = std::fs::read_to_string(path)?;
         let entries: HashMap<String, ReliefEntry> =
             serde_json::from_str(&json).map_err(std::io::Error::other)?;

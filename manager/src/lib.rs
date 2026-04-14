@@ -12,6 +12,10 @@ pub mod evaluator;
 pub mod lua_policy;
 #[cfg(feature = "lua")]
 pub use lua_policy::OBSERVATION_DELAY_SECS;
+// 테스트 전용 re-export (integration test에서 직접 EwmaReliefTable 조작)
+#[cfg(feature = "lua")]
+#[doc(hidden)]
+pub use lua_policy::{EwmaReliefTable, RELIEF_DIMS, ReliefEntry};
 pub mod monitor;
 #[cfg(feature = "hierarchical")]
 pub mod pi_controller;
