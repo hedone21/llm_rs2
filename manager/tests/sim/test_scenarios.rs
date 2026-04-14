@@ -416,6 +416,104 @@ fn scenario_memory_and_thermal_combined() {
 }
 
 // ─────────────────────────────────────────────────────────
+// s25_galaxy.yaml 디바이스 preset smoke 테스트 (Phase 6)
+// ─────────────────────────────────────────────────────────
+
+/// smoke 1: s25_galaxy.yaml이 올바르게 파싱되고 initial_state 값이 기대와 일치하는지 검증.
+/// extends: baseline.yaml 상속 + S25 override가 올바르게 적용되어야 한다.
+#[test]
+fn test_s25_galaxy_preset_loads_and_initial_state_correct() {
+    let preset_path = fixtures_dir().join("s25_galaxy.yaml");
+    let cfg =
+        load_scenario(&preset_path).unwrap_or_else(|e| panic!("s25_galaxy.yaml 로드 실패: {e}"));
+
+    // override된 필드 검증
+    assert_eq!(
+        cfg.initial_state.device_memory_total_mb, 12288,
+        "S25 RAM = 12 GB → 12288 MB"
+    );
+    assert_eq!(
+        cfg.initial_state.gpu_max_freq_mhz, 1100,
+        "Adreno 750 max freq = 1100 MHz"
+    );
+    assert_eq!(
+        cfg.initial_state.cpu_max_freq_mhz, 4200,
+        "Snapdragon 8 Elite big cluster max = 4200 MHz"
+    );
+    // throttle threshold override 확인
+    assert_eq!(
+        cfg.initial_state.throttle_threshold_c as u32, 82,
+        "S25 throttle threshold = 82 °C"
+    );
+    // baseline에서 상속된 필드 (override 없음) — kv_dtype 확인
+    assert_eq!(
+        cfg.initial_state.kv_dtype, "f16",
+        "kv_dtype baseline 상속 확인"
+    );
+}
+
+/// smoke 2: s25_galaxy.yaml + memory_evict_graduated Lua로 5초 시뮬 실행.
+/// 정상 종료 + heartbeat 기록 확인. extends + physical simulation 통합 검증.
+#[cfg(feature = "lua")]
+#[test]
+fn test_s25_galaxy_preset_runs_with_lua_policy() {
+    use llm_manager::config::AdaptationConfig;
+
+    let preset_path = fixtures_dir().join("s25_galaxy.yaml");
+    let lua_path = lua_dir().join("memory_evict_graduated.lua");
+
+    let cfg =
+        load_scenario(&preset_path).unwrap_or_else(|e| panic!("s25_galaxy.yaml 로드 실패: {e}"));
+
+    let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
+    let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
+
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, AdaptationConfig::default())
+        .expect("Simulator::with_lua_policy 생성 실패");
+
+    sim.run_for(Duration::from_secs(5)).expect("5초 실행 실패");
+
+    let summary = TrajectorySummary::from_trajectory(sim.trajectory(), cpu_max, gpu_max);
+
+    // 5초 실행 후 heartbeat >= 1 (interval_s=1.0)
+    assert!(
+        summary.heartbeat_count >= 1,
+        "5s 실행 후 heartbeat >= 1, actual={}",
+        summary.heartbeat_count
+    );
+    // signal이 기록되어야 함
+    assert!(
+        !summary.signal_count_by_kind.is_empty(),
+        "signal이 1종 이상 기록되어야 함"
+    );
+}
+
+/// smoke 2 (lua feature 없을 때): MockPolicy로 s25_galaxy.yaml 기본 동작 확인.
+#[cfg(not(feature = "lua"))]
+#[test]
+fn test_s25_galaxy_preset_runs_with_lua_policy() {
+    use crate::common::sim::mock_policy::MockPolicy;
+
+    let preset_path = fixtures_dir().join("s25_galaxy.yaml");
+    let cfg =
+        load_scenario(&preset_path).unwrap_or_else(|e| panic!("s25_galaxy.yaml 로드 실패: {e}"));
+
+    let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
+    let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
+
+    let mut sim = Simulator::new(cfg, Box::new(MockPolicy::new()));
+    sim.run_for(Duration::from_secs(5)).expect("5초 실행 실패");
+
+    let summary = TrajectorySummary::from_trajectory(sim.trajectory(), cpu_max, gpu_max);
+
+    assert!(
+        summary.heartbeat_count >= 1,
+        "5s 실행 후 heartbeat >= 1, actual={}",
+        summary.heartbeat_count
+    );
+}
+
+// ─────────────────────────────────────────────────────────
 // relief_snapshot 비공허 검증 (PR 2+3 핵심 회귀 테스트)
 // ─────────────────────────────────────────────────────────
 

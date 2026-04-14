@@ -59,9 +59,10 @@
   - `test_inv_004_thermal_alert_throttle.rs` — thermal_ramp 시나리오로 커버
 - `test_mgr_dat_075_076_engine_util.rs` — 유지 (단순 Lua ctx 통과 검증, 시뮬레이터 불필요)
 
-### Phase 6 — 디바이스 preset 및 문서 ⏳
-- [ ] `s25_galaxy.yaml` (baseline extends, manual estimates)
-- [ ] `docs/` 사용 가이드
+### Phase 6 — 디바이스 preset 및 문서 ✅ (2026-04-14)
+- [x] `s25_galaxy.yaml` (baseline extends, manual estimates, TODO(K) 14개 표시)
+- [x] `docs/42_policy_simulator_guide.md` — 14개 섹션 사용 가이드
+- [x] smoke 테스트 2개 (`test_s25_galaxy_preset_loads_and_initial_state_correct`, `test_s25_galaxy_preset_runs_with_lua_policy`)
 
 ## 재사용 대상
 
