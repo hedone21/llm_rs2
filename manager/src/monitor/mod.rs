@@ -4,6 +4,12 @@ pub mod external;
 pub mod memory;
 pub mod thermal;
 
+// Re-export the pure level-decision helpers so the integration test simulator
+// can import them via `llm_manager::monitor::*` without duplicating thresholds.
+pub use compute::{compute_level_from_pcts, compute_recommendation};
+pub use memory::memory_level_from_available_pct;
+pub use thermal::{thermal_level_from_temp_c, throttle_ratio_from_level};
+
 use llm_shared::SystemSignal;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

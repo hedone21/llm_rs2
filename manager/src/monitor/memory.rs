@@ -7,6 +7,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Available memory percentage → [`Level`] (descending: lower is worse).
+///
+/// Pure, stateless threshold check using the default `MemoryMonitorConfig` thresholds
+/// (warning=40%, critical=20%, emergency=10%). Hysteresis is not applied; for stateful
+/// evaluation with hysteresis the production monitor uses [`ThresholdEvaluator`] internally.
+///
+/// Exposed so the simulator can delegate level decisions here instead of
+/// duplicating the threshold constants.
+pub fn memory_level_from_available_pct(available_pct: f64) -> Level {
+    let cfg = MemoryMonitorConfig::default();
+    if available_pct <= cfg.emergency_pct {
+        Level::Emergency
+    } else if available_pct <= cfg.critical_pct {
+        Level::Critical
+    } else if available_pct <= cfg.warning_pct {
+        Level::Warning
+    } else {
+        Level::Normal
+    }
+}
+
 pub struct MemoryMonitor {
     poll_interval: Duration,
     evaluator: ThresholdEvaluator,
@@ -174,7 +195,7 @@ mod tests {
         .unwrap();
 
         let mut f_psi = tempfile::NamedTempFile::new().unwrap();
-        write!(f_psi, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n").unwrap();
+        writeln!(f_psi, "some avg10=0.00 avg60=0.00 avg300=0.00 total=0").unwrap();
 
         let config = default_config();
         let mut monitor = MemoryMonitor::with_paths(

@@ -1,13 +1,30 @@
 use super::Monitor;
 use crate::config::ComputeMonitorConfig;
 use crate::evaluator::{Direction, ThresholdEvaluator, Thresholds};
-#[cfg(test)]
-use llm_shared::Level;
-use llm_shared::{ComputeReason, RecommendedBackend, SystemSignal};
+use llm_shared::{ComputeReason, Level, RecommendedBackend, SystemSignal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+
+/// max(cpu%, gpu%) → compute [`Level`] (ascending, Emergency not used — max is Critical).
+///
+/// Pure, stateless threshold check using the default `ComputeMonitorConfig` thresholds
+/// (warning=70%, critical=90%). Hysteresis is not applied.
+///
+/// Exposed so the simulator can delegate level decisions here instead of
+/// duplicating the threshold constants.
+pub fn compute_level_from_pcts(cpu_pct: f64, gpu_pct: f64) -> Level {
+    let cfg = ComputeMonitorConfig::default();
+    let worst = cpu_pct.max(gpu_pct);
+    if worst >= cfg.critical_pct {
+        Level::Critical
+    } else if worst >= cfg.warning_pct {
+        Level::Warning
+    } else {
+        Level::Normal
+    }
+}
 
 pub struct ComputeMonitor {
     poll_interval: Duration,
@@ -146,7 +163,11 @@ impl Monitor for ComputeMonitor {
     }
 }
 
-fn compute_recommendation(
+/// Recommend a backend based on CPU/GPU usage percentages.
+///
+/// Exposed so the simulator can share this logic without duplication.
+/// `warning_pct` should match `ComputeMonitorConfig::warning_pct` (default: 70.0).
+pub fn compute_recommendation(
     cpu: f64,
     gpu: f64,
     warning_pct: f64,

@@ -7,6 +7,43 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+/// Temperature in degrees Celsius → [`Level`] (ascending: higher is worse).
+///
+/// Pure, stateless threshold check using the default `ThermalMonitorConfig` thresholds
+/// (warning=60°C, critical=75°C, emergency=85°C). Hysteresis is not applied; for stateful
+/// evaluation with hysteresis the production monitor uses [`ThresholdEvaluator`] internally.
+///
+/// Exposed so the simulator can delegate level decisions here instead of
+/// duplicating the threshold constants.
+pub fn thermal_level_from_temp_c(temp_c: f64) -> Level {
+    let cfg = ThermalMonitorConfig::default();
+    // Config stores millidegrees; convert to °C for comparison.
+    let warning_c = cfg.warning_mc as f64 / 1000.0;
+    let critical_c = cfg.critical_mc as f64 / 1000.0;
+    let emergency_c = cfg.emergency_mc as f64 / 1000.0;
+
+    if temp_c >= emergency_c {
+        Level::Emergency
+    } else if temp_c >= critical_c {
+        Level::Critical
+    } else if temp_c >= warning_c {
+        Level::Warning
+    } else {
+        Level::Normal
+    }
+}
+
+/// [`Level`] → throttle ratio applied by the thermal monitor in `build_signal()`.
+///
+/// Exposed so the simulator can produce consistent throttle_ratio values.
+pub fn throttle_ratio_from_level(level: Level) -> f64 {
+    match level {
+        Level::Normal | Level::Warning => 1.0,
+        Level::Critical => 0.7,
+        Level::Emergency => 0.3,
+    }
+}
+
 pub struct ThermalMonitor {
     poll_interval: Duration,
     evaluator: ThresholdEvaluator,
@@ -111,11 +148,7 @@ impl ThermalMonitor {
     }
 
     fn build_signal(&self) -> SystemSignal {
-        let throttle_ratio = match self.evaluator.level() {
-            Level::Normal | Level::Warning => 1.0,
-            Level::Critical => 0.7,
-            Level::Emergency => 0.3,
-        };
+        let throttle_ratio = throttle_ratio_from_level(self.evaluator.level());
         SystemSignal::ThermalAlert {
             level: self.evaluator.level(),
             temperature_mc: self.last_temp_mc,

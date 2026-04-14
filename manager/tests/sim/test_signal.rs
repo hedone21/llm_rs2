@@ -41,7 +41,7 @@ fn fixtures_dir() -> PathBuf {
 }
 
 fn load_baseline() -> ScenarioConfig {
-    load_scenario(&fixtures_dir().join("baseline.yaml")).expect("baseline.yaml should load")
+    load_scenario(fixtures_dir().join("baseline.yaml")).expect("baseline.yaml should load")
 }
 
 fn make_state_and_engine(cfg: &ScenarioConfig) -> (PhysicalState, EngineStateModel) {

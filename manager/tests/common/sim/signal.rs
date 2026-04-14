@@ -1,13 +1,18 @@
 //! PhysicalState → SystemSignal / EngineMessage 투영.
 //!
-//! production monitor의 레벨 결정 공식과 동일한 임계값을 사용한다:
-//! - Memory: available% 기준 descending (warning=40, critical=20, emergency=10, hysteresis=5)
-//! - Thermal: °C 기준 ascending (warning=60, critical=75, emergency=85, hysteresis=5)
-//! - Compute: max(cpu%, gpu%) 기준 ascending (warning=70, critical=90, no_emergency)
+//! Level 결정은 production monitor helper를 위임한다:
+//! - Memory: `llm_manager::monitor::memory_level_from_available_pct`
+//! - Thermal: `llm_manager::monitor::thermal_level_from_temp_c`
+//! - Compute: `llm_manager::monitor::compute_level_from_pcts`
 //! - Energy: 배터리 없는 경우 Normal / power_budget 기본값 사용
 
 #![allow(dead_code)]
 
+use llm_manager::config::ComputeMonitorConfig;
+use llm_manager::monitor::{
+    compute_level_from_pcts, compute_recommendation, memory_level_from_available_pct,
+    thermal_level_from_temp_c,
+};
 use llm_shared::{
     ComputeReason, EnergyReason, EngineMessage, EngineState, EngineStatus, Level,
     RecommendedBackend, ResourceLevel, SystemSignal,
@@ -19,33 +24,9 @@ use super::noise::NoiseRng;
 use super::state::{EngineStateModel, PhysicalState};
 
 // ─────────────────────────────────────────────────────────
-// Production 임계값 상수 (monitor 모듈과 동일)
+// 에너지 기본 power_budget (mW).
+// 배터리를 가정하지 않는 시뮬레이터 전용 상수.
 // ─────────────────────────────────────────────────────────
-
-/// 메모리 available % 기준 (descending: 낮을수록 나쁨).
-mod mem_thresholds {
-    pub const WARNING_PCT: f64 = 40.0;
-    pub const CRITICAL_PCT: f64 = 20.0;
-    pub const EMERGENCY_PCT: f64 = 10.0;
-    pub const HYSTERESIS_PCT: f64 = 5.0;
-}
-
-/// 온도 °C 기준 (ascending: 높을수록 나쁨).
-mod thermal_thresholds {
-    pub const WARNING_C: f64 = 60.0;
-    pub const CRITICAL_C: f64 = 75.0;
-    pub const EMERGENCY_C: f64 = 85.0;
-    pub const HYSTERESIS_C: f64 = 5.0;
-}
-
-/// Compute usage % 기준 (ascending, no Emergency level).
-mod compute_thresholds {
-    pub const WARNING_PCT: f64 = 70.0;
-    pub const CRITICAL_PCT: f64 = 90.0;
-    pub const HYSTERESIS_PCT: f64 = 5.0;
-}
-
-/// 에너지 기본 power_budget (mW).
 mod energy_budgets {
     pub const BASELINE_MW: u32 = 5000;
     pub const WARNING_MW: u32 = 3000;
@@ -54,46 +35,12 @@ mod energy_budgets {
 }
 
 // ─────────────────────────────────────────────────────────
-// Level 결정 함수 (stateless — production ThresholdEvaluator 공식 재현)
+// Level 결정 함수 — production helper로 위임
 // ─────────────────────────────────────────────────────────
 
-/// 메모리 available % → Level (descending: 낮을수록 나쁨).
-/// 이력(hysteresis)이 없는 단순 단계 결정 (시뮬레이터는 상태를 유지하지 않음).
-pub fn memory_level_from_available_pct(available_pct: f64) -> Level {
-    if available_pct <= mem_thresholds::EMERGENCY_PCT {
-        Level::Emergency
-    } else if available_pct <= mem_thresholds::CRITICAL_PCT {
-        Level::Critical
-    } else if available_pct <= mem_thresholds::WARNING_PCT {
-        Level::Warning
-    } else {
-        Level::Normal
-    }
-}
-
-/// 온도 °C → Level (ascending: 높을수록 나쁨).
-pub fn thermal_level_from_temp_c(temp_c: f64) -> Level {
-    if temp_c >= thermal_thresholds::EMERGENCY_C {
-        Level::Emergency
-    } else if temp_c >= thermal_thresholds::CRITICAL_C {
-        Level::Critical
-    } else if temp_c >= thermal_thresholds::WARNING_C {
-        Level::Warning
-    } else {
-        Level::Normal
-    }
-}
-
-/// max(cpu%, gpu%) → compute Level (ascending, Emergency 없음 → Critical까지).
+/// max(cpu%, gpu%) → compute Level (production helper 위임).
 pub fn compute_level_from_usage(cpu_pct: f64, gpu_pct: f64) -> Level {
-    let worst = cpu_pct.max(gpu_pct);
-    if worst >= compute_thresholds::CRITICAL_PCT {
-        Level::Critical
-    } else if worst >= compute_thresholds::WARNING_PCT {
-        Level::Warning
-    } else {
-        Level::Normal
-    }
+    compute_level_from_pcts(cpu_pct, gpu_pct)
 }
 
 /// Level → ResourceLevel 변환 (Emergency → Critical 클램핑).
@@ -312,12 +259,9 @@ fn derive_compute_signal(
 
     // backend 추천 (gpu_cluster_thermal이 높으면 CPU 권장)
     let gpu_thermal = state.gpu_cluster_thermal_c;
-    let (recommended_backend, reason) = compute_recommendation(
-        cpu_with_noise,
-        gpu_usage_pct,
-        gpu_thermal,
-        compute_thresholds::WARNING_PCT,
-    );
+    let warning_pct = ComputeMonitorConfig::default().warning_pct;
+    let (recommended_backend, reason) =
+        sim_compute_recommendation(cpu_with_noise, gpu_usage_pct, gpu_thermal, warning_pct);
 
     SystemSignal::ComputeGuidance {
         level,
@@ -400,9 +344,10 @@ fn derive_energy_signal(
     let power_budget_mw = ((energy_budgets::BASELINE_MW as i32 + noise_mw).max(0)) as u32;
 
     // thermal 기반으로 에너지 레벨 조정: 온도가 높으면 ThermalPower
-    let (level, reason) = if state.thermal_c >= thermal_thresholds::EMERGENCY_C {
+    let thermal_lv = thermal_level_from_temp_c(state.thermal_c);
+    let (level, reason) = if thermal_lv == Level::Emergency {
         (Level::Emergency, EnergyReason::ThermalPower)
-    } else if state.thermal_c >= thermal_thresholds::CRITICAL_C {
+    } else if thermal_lv >= Level::Critical {
         (Level::Critical, EnergyReason::ThermalPower)
     } else {
         (level, reason)
@@ -419,34 +364,22 @@ fn derive_energy_signal(
 // Compute 추천 룰
 // ─────────────────────────────────────────────────────────
 
-fn compute_recommendation(
+/// GPU thermal 상태를 추가로 고려하는 시뮬레이터 전용 wrapper.
+///
+/// GPU thermal이 Critical 이상이면 즉시 CPU 권장.
+/// 그 외에는 production `compute_recommendation` helper에 위임한다.
+fn sim_compute_recommendation(
     cpu_pct: f64,
     gpu_pct: f64,
     gpu_thermal_c: f64,
     warning_pct: f64,
 ) -> (RecommendedBackend, ComputeReason) {
-    let cpu_hot = cpu_pct >= warning_pct;
-    let gpu_hot = gpu_pct >= warning_pct;
-
-    // GPU 온도가 높으면 CPU 권장
-    if gpu_thermal_c >= thermal_thresholds::CRITICAL_C {
+    // GPU 온도가 Critical 이상이면 CPU 권장 (시뮬레이터 전용 규칙)
+    if thermal_level_from_temp_c(gpu_thermal_c) >= Level::Critical {
         return (RecommendedBackend::Cpu, ComputeReason::GpuBottleneck);
     }
 
-    match (cpu_hot, gpu_hot) {
-        (true, true) => (RecommendedBackend::Any, ComputeReason::BothLoaded),
-        (true, false) => (RecommendedBackend::Gpu, ComputeReason::CpuBottleneck),
-        (false, true) => (RecommendedBackend::Cpu, ComputeReason::GpuBottleneck),
-        (false, false) => {
-            if (cpu_pct - gpu_pct).abs() < 10.0 {
-                (RecommendedBackend::Any, ComputeReason::Balanced)
-            } else if cpu_pct < gpu_pct {
-                (RecommendedBackend::Cpu, ComputeReason::CpuAvailable)
-            } else {
-                (RecommendedBackend::Gpu, ComputeReason::GpuAvailable)
-            }
-        }
-    }
+    compute_recommendation(cpu_pct, gpu_pct, warning_pct)
 }
 
 // ─────────────────────────────────────────────────────────
@@ -471,7 +404,7 @@ mod tests {
     }
 
     fn load_baseline() -> crate::common::sim::config::ScenarioConfig {
-        load_scenario(&fixtures_dir().join("baseline.yaml")).expect("baseline.yaml should load")
+        load_scenario(fixtures_dir().join("baseline.yaml")).expect("baseline.yaml should load")
     }
 
     fn make_state_and_engine(
