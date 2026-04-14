@@ -439,6 +439,69 @@ fn test_memory_ramp_scenario_triggers_evict() {
     );
 }
 
+/// 13. format_timeline / format_timeline_compact 출력 형식 검증.
+#[test]
+fn test_format_timeline_renders_expected_event_tags() {
+    use llm_shared::SystemSignal;
+
+    let mut cfg = load_baseline();
+    cfg.initial_state.device_memory_used_mb = 7500;
+
+    let mut mock = MockPolicy::new();
+    mock.directive_on_signal = Some(Box::new(|sig| {
+        if let SystemSignal::MemoryPressure { level, .. } = sig
+            && *level >= llm_shared::Level::Warning
+        {
+            return Some(EngineDirective {
+                seq_id: 7,
+                commands: vec![EngineCommand::KvEvictSliding { keep_ratio: 0.5 }],
+            });
+        }
+        None
+    }));
+
+    let policy = Box::new(mock);
+    let mut sim = Simulator::new(cfg, policy);
+    sim.run_for(Duration::from_secs(2)).expect("run_for 2s");
+
+    let traj = sim.trajectory();
+    let full = traj.format_timeline();
+    let compact = traj.format_timeline_compact();
+
+    // 헤더 + 핵심 이벤트 태그가 모두 등장
+    assert!(
+        full.contains("Simulation Timeline"),
+        "header 누락:\n{}",
+        full
+    );
+    assert!(full.contains("[STATE]"), "STATE 라인 누락:\n{}", full);
+    assert!(full.contains("[HB]"), "HB 라인 누락:\n{}", full);
+    assert!(full.contains("[SIG]"), "SIG 라인 누락:\n{}", full);
+    assert!(full.contains("[DIR]"), "DIR 라인 누락:\n{}", full);
+
+    // compact는 HB를 생략하고 STATE는 1초 간격으로 샘플링
+    assert!(
+        !compact.contains("[HB]"),
+        "compact는 HB 라인을 포함하면 안됨:\n{}",
+        compact
+    );
+    let full_state_lines = full.lines().filter(|l| l.contains("[STATE]")).count();
+    let compact_state_lines = compact.lines().filter(|l| l.contains("[STATE]")).count();
+    assert!(
+        compact_state_lines < full_state_lines,
+        "compact STATE({}) < full STATE({}) 이어야 함",
+        compact_state_lines,
+        full_state_lines
+    );
+    // 2초 시나리오 → 초당 1개 ≈ 2~3개 (시작 + 매 초)
+    assert!(
+        compact_state_lines <= 4,
+        "compact STATE 라인은 4개 이하여야 함, actual={}\n{}",
+        compact_state_lines,
+        compact
+    );
+}
+
 /// 12. 동일 seed 두 번 실행 → trajectory JSON이 동일.
 #[test]
 fn test_noise_reproducibility_via_simulator() {

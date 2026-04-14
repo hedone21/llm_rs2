@@ -482,6 +482,165 @@ impl Trajectory {
         };
         self.entries.iter().rev().map(entry_at_s).next()
     }
+
+    // ─────────────────────────────────────────────────────
+    // ASCII 타임라인 포매터
+    // ─────────────────────────────────────────────────────
+
+    /// 모든 이벤트를 포함한 ASCII 타임라인을 문자열로 렌더.
+    ///
+    /// 실패한 테스트의 원인 추적이나 `SIM_TIMELINE=1 cargo test -- --nocapture`에서
+    /// 시뮬레이터 동작을 한눈에 보기 위한 용도. State snapshot까지 전부 포함하므로
+    /// 30s 시나리오(tick 50ms)에서 ~600줄이 나온다. 짧게 보려면
+    /// [`format_timeline_compact`](Self::format_timeline_compact)를 사용한다.
+    pub fn format_timeline(&self) -> String {
+        self.format_timeline_inner(TimelineMode::Full)
+    }
+
+    /// State snapshot을 1초 간격으로 샘플링하고 heartbeat를 생략한 간결 타임라인.
+    ///
+    /// 시그널/지시/주입/관측 같은 구조적 이벤트는 모두 유지. 상태 변화의 대략적인
+    /// 흐름만 확인하면 충분할 때 사용.
+    pub fn format_timeline_compact(&self) -> String {
+        self.format_timeline_inner(TimelineMode::Compact)
+    }
+
+    /// `SIM_TIMELINE` 환경변수가 설정된 경우 타임라인을 stderr로 출력.
+    ///
+    /// - `SIM_TIMELINE=1` 또는 `full`: [`format_timeline`](Self::format_timeline)
+    /// - `SIM_TIMELINE=compact`: [`format_timeline_compact`](Self::format_timeline_compact)
+    /// - 미설정: no-op
+    ///
+    /// 테스트 본문 끝에서 호출하면 `cargo test -- --nocapture`로 필요할 때만
+    /// 타임라인을 확인할 수 있다.
+    pub fn print_timeline_if_enabled(&self) {
+        match std::env::var("SIM_TIMELINE").ok().as_deref() {
+            Some("1") | Some("full") => eprintln!("{}", self.format_timeline()),
+            Some("compact") => eprintln!("{}", self.format_timeline_compact()),
+            _ => {}
+        }
+    }
+
+    fn format_timeline_inner(&self, mode: TimelineMode) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let duration = self.last_at_s().unwrap_or(0.0);
+        writeln!(out, "━━━ Simulation Timeline ━━━").ok();
+        writeln!(
+            out,
+            "duration={:.2}s  heartbeats={}  signals={}  directives={}  obs={}",
+            duration,
+            self.heartbeat_count(),
+            self.signal_count(),
+            self.directive_count(),
+            self.observation_due_count(),
+        )
+        .ok();
+        writeln!(out).ok();
+
+        let mut last_state_sec: Option<i64> = None;
+        for entry in &self.entries {
+            match entry {
+                TrajectoryEntry::StateSnapshot {
+                    at_s,
+                    state,
+                    engine,
+                } => {
+                    if matches!(mode, TimelineMode::Compact) {
+                        let sec = at_s.floor() as i64;
+                        if last_state_sec == Some(sec) {
+                            continue;
+                        }
+                        last_state_sec = Some(sec);
+                    }
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [STATE]  kv={:6.2}MiB  mem={:6.1}MB  cpu={:5.1}%  gpu={:5.1}%  therm={:5.1}°C  tps={:6.2}  dev={}  phase={}  actions={:?}",
+                        at_s,
+                        state.kv_cache_bytes / (1024.0 * 1024.0),
+                        state.device_memory_used_mb,
+                        state.engine_cpu_pct,
+                        state.engine_gpu_pct,
+                        state.thermal_c,
+                        state.throughput_tps,
+                        engine.active_device,
+                        engine.phase,
+                        engine.active_actions,
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::Heartbeat { at_s, message } => {
+                    if matches!(mode, TimelineMode::Compact) {
+                        continue;
+                    }
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [HB]     tps={:6.2}  mem={}  compute={}  kv_tok={}",
+                        at_s,
+                        message.actual_throughput.unwrap_or(0.0),
+                        message.memory_level.as_deref().unwrap_or("?"),
+                        message.compute_level.as_deref().unwrap_or("?"),
+                        message.kv_cache_tokens.unwrap_or(0),
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::Signal { at_s, signal } => {
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [SIG]    {}@{}  {}",
+                        at_s, signal.kind, signal.level, signal.detail,
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::Directive {
+                    at_s,
+                    trigger,
+                    directive,
+                } => {
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [DIR] ← {}@{}  seq={}  cmds={:?}",
+                        at_s, trigger.kind, trigger.level, directive.seq_id, directive.commands,
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::ObservationDue {
+                    at_s,
+                    action,
+                    recorded_at_s,
+                } => {
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [OBS]    {} (recorded t={:.2}s)",
+                        at_s, action, recorded_at_s,
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::InjectionEvent { at_s, idx, started } => {
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [INJ]    idx={} {}",
+                        at_s,
+                        idx,
+                        if *started { "started" } else { "ended" },
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::Custom { at_s, name } => {
+                    writeln!(out, "t={:7.2}s  [CUSTOM] {}", at_s, name).ok();
+                }
+            }
+        }
+
+        out
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TimelineMode {
+    Full,
+    Compact,
 }
 
 // ─────────────────────────────────────────────────────────

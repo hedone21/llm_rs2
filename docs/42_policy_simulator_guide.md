@@ -450,7 +450,41 @@ traj.dump_json(path)?;      // JSON 덤프
 traj.dump_csv_states(path)? // StateSnapshot만 CSV
 ```
 
-### 8.3 relief_snapshot
+### 8.3 ASCII 타임라인 (디버깅용)
+
+테스트가 왜 실패했는지(또는 왜 성공했는지)를 한눈에 보고 싶을 때 사용한다.
+
+```rust
+// 1) 코드에서 직접 호출
+eprintln!("{}", sim.trajectory().format_timeline());          // 모든 이벤트
+eprintln!("{}", sim.trajectory().format_timeline_compact()); // STATE 1초 간격 + HB 생략
+
+// 2) 환경변수로 opt-in (테스트 본문 끝에 호출만 두면 됨)
+sim.trajectory().print_timeline_if_enabled();
+```
+
+```bash
+SIM_TIMELINE=1       cargo test -p llm_manager --test sim -- --nocapture  # 전체
+SIM_TIMELINE=compact cargo test -p llm_manager --test sim -- --nocapture  # 간결
+```
+
+출력 예시:
+
+```
+━━━ Simulation Timeline ━━━
+duration=3.00s  heartbeats=3  signals=18  directives=2  obs=2
+
+t=   0.05s  [STATE]  kv=  4.00MiB  mem=7500.0MB  cpu= 35.0%  gpu= 70.0%  therm= 48.0°C  tps= 18.52  dev=opencl  phase=decode  actions=[]
+t=   0.25s  [SIG]    compute_guidance@Normal  {"cpu_usage_pct":35.0,"gpu_usage_pct":70.0}
+t=   0.50s  [SIG]    memory_pressure@Critical  {"available_bytes":580911104,"reclaim_target_bytes":...}
+t=   0.50s  [DIR] ← memory_pressure@Critical  seq=7  cmds=["KvEvictSliding { keep_ratio: 0.5 }"]
+t=   1.00s  [HB]     tps= 18.52  mem=Critical  compute=Normal  kv_tok=1024
+t=   3.50s  [OBS]    kv_evict_sliding (recorded t=0.50s)
+```
+
+태그 의미: `[STATE]` 물리/엔진 스냅샷, `[HB]` heartbeat, `[SIG]` SystemSignal 송출, `[DIR]` PolicyStrategy 응답, `[OBS]` ObservationDue (3초 관측 지연 도래), `[INJ]` external_injection 시작/종료, `[CUSTOM]` 테스트가 직접 기록한 마커.
+
+### 8.4 relief_snapshot
 
 `LuaPolicy`에만 유효. EwmaReliefTable의 현재 상태를 반환한다:
 
