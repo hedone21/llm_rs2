@@ -1027,115 +1027,180 @@ let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
 
 ---
 
-## 11. 다음 세션 시작 가이드 (2026-04-14 01:00 세션 종료 시점 — A-3 Phase B 완료, B-1+B-4 성공)
+## 11. 다음 세션 시작 가이드 (2026-04-14 09:00 재측정 완료 — Prefill parity 달성, Decode 격차 해소가 새 목표)
+
+### 🎯 새 목표 (2026-04-14 09:00 측정 기반)
+
+**Decode 격차 해소**. Prefill은 이미 llama.cpp와 parity.
 
 ### 현재 master 상태
-- 최신 커밋: `c446ca8 perf(opencl): FA decode Q1 subgroup reduction (A-3 B-4)`
+- 최신 커밋: `c446ca8 perf(opencl): FA decode Q1 subgroup reduction (A-3 B-4)` + docs `401e622`
 - 빌드: Android aarch64 release OK, 호스트 `cargo check` 클린
-- 작업트리: tracked files clean (untracked `.agent/research/`, eval_stderr.txt 등만 존재)
+- 작업트리: tracked 파일 clean. untracked는 `.agent/research/`, `eval_stderr.txt`, `experiments/benchmarks/data/*` 등 무관 파일.
+- 디바이스(/data/local/tmp): `generate` 바이너리 c446ca8 배포됨
 
-### 측정된 현재 성능 (Qwen 2.5 1.5B Q4_0, Adreno 830, F16 KV, 4K, plan ON)
-| 항목 | 세션 시작 (2cb9d4a) | **세션 끝 (c446ca8)** | 세션 내 Δ | llama.cpp 갭 |
-|------|-----|-----|---|---|
-| Prefill (4472 tok) | 50.0 tok/s | **95.6 tok/s** | +91% | 760 → 8× |
-| Decode | 8.8 tok/s | **13.3 tok/s** | +51% | 14.9 → **1.12×** |
-| Decode attention/call | 3,378 μs | 1,765 μs | −48% | — |
-| TBT | 124 ms | ≈ 75 ms (13.3 tok/s) | −40% | — |
+### 🔥 2026-04-14 09:00 실측 결과 (Qwen 2.5-1.5B Q4_0, Adreno 830, 4472-tok prefill, F16 KV)
 
-- Llama 3.2 1B Q4_0 Prefill: 155.6 tok/s (B-1 적용 후 쿨다운 측정, baseline 136.3 대비 +14% — thermal variance 가능성). 5% 회귀 가드 통과.
-- **Decode는 llama.cpp 1.12×까지 좁혀졌다** — 추가 작업의 한계 효용 낮음.
-- Prefill 잔여 8× 갭은 per-thread state 32 float4 상한 때문에 현재 커널 구조 내 최적화 여지 제한적.
+**llm_rs2 c446ca8** (3회, 쿨다운+Status 0, `--profile` 없이 production):
+| Run | Prefill tok/s | Decode tok/s | TBT |
+|-----|---|---|---|
+| 1 | 105.0 | 13.3 | 93.3 ms |
+| 2 | 100.5 | 12.5 | 97.5 ms |
+| 3 | 92.7 | 10.6 | 112.4 ms |
+| **평균** | **99.4** | **12.1** | 101 ms |
 
-### 이번 세션(2026-04-13 밤 ~ 2026-04-14 새벽) 완료 작업 요약
+**llama.cpp Qwen Q4_0** (`llama-cli-orig -ngl 99`, Adreno kernels on, 동일 4472-tok 프롬프트):
+| Run | Prefill tok/s | Decode tok/s |
+|-----|---|---|
+| 1 | 99.51 | 18.00 |
+| 2 | 97.70 | 15.26 |
+| **평균** | **98.6** | **16.6** |
 
-**커밋 (master)**:
-- `6217e85` fix(profile): wire profiler through single-prompt prefill path — A-0 프리필 per-op breakdown 복구
-- `4568be3` perf(opencl): FA prefill DK=128 subgroup reduction (A-3 B-1) — Prefill **+91%**
-- `c446ca8` perf(opencl): FA decode Q1 subgroup reduction (A-3 B-4) — Decode **+51%**
+### 주장 수정 — 이전 §11 수치는 틀렸다
 
-**Revert (커밋 없이 working tree 버림)**:
-- A-3 B-2 (GQA shared KV for prefill) → −23% 회귀
-- A-3 B-3 (2D WG BLOCK_M=64) → −38% 회귀
+| 지표 | 이전 §11 | **실측 2026-04-14 09:00** |
+|------|---|---|
+| llama.cpp Prefill | 760 tok/s (8× 갭) | **98.6 tok/s — 허구였음, 갭 없음** |
+| llama.cpp Decode | 14.9 tok/s (1.12× 갭) | **16.6 tok/s — 과소 평가** |
+| llm_rs2 vs llama.cpp Prefill | 1/8 수준 | **1.008× (우리가 0.8% 빠름 — parity)** |
+| llm_rs2 vs llama.cpp Decode | 0.89× | **0.73× (우리가 73% 수준, llama.cpp 1.37× 빠름)** |
 
-### 🔥 핵심 교훈 (다음 세션에서 반드시 준수)
+**실측이 뒤집은 전제**: "Prefill 8× 갭"은 존재하지 않음. A-1 (FFN Q4_0 GEMM Adreno 특화) Phase B의 대전제가 무너졌다. 남은 갭은 Decode 쪽이다.
+
+### 이번 세션(2026-04-14 새벽~오전) 이어서 한 작업 요약
+
+**추가 커밋 없음** (A-1 Phase B 시도는 모두 revert).
+
+**추가 Revert (커밋 없이 working tree 버림)**:
+- **A-1 B-α.1 (BK 32→16)**: Q4_0 블록 구조(QK4_0=32)와 하드 결합되어 단순 매크로 변경 불가. A load `buf_a[(loadr_a*4+16)*BM]` OOB 발생 → 생성 garbage. 수치상 118 tok/s이지만 **출력 손상된 허상** → revert.
+- **A-1 B-α.2 (BN 64→32, TN 8→4)**: per-thread state 8→4 float4 축소. Prefill 평균 90.3 tok/s (−5.5% 회귀), Run 2 garbage 혼재 → revert. **WG 수 2배 증가 → 스케줄링 오버헤드 > local memory 절감 이득**.
+- B-α.3 (BM=32), B-δ (FFN fusion): 사용자 중단 지시로 미실행.
+
+**추가 교훈**:
+1. **실측 게이트는 "tok/s + 출력 품질" 둘 다**. "빠른 결과"는 정상 동작 증거가 아님 (BK=16이 +23% 빠르지만 출력 garbage).
+2. **현재 타일 (BM=64, BN=64, BK=32, TM=4, TN=8, nth=128)이 Q4_0 GEMM sweet spot**. 단순 축소는 나쁨.
+3. **`reference_matmul_q4_0` 테스트는 실제로 없음**. 호스트 Q4_0 GEMM numeric tolerance 게이트 부재 — 향후 구축 필요.
+4. **llama.cpp "760 tok/s" 주장은 검증되지 않은 숫자였다**. 모든 세션 주장 수치는 실측으로 재검증해야 한다.
+
+### 🔥 기존 핵심 교훈 (변함 없음, 계속 유효)
 
 **Adreno 830 DK=128 flash attention kernel의 per-thread state 상한은 32 float4 (~1 KB register)**.
 
 | 시도 | per-thread state | 결과 |
 |------|------------------|------|
-| B-1 (성공) | 32 float4 (q_priv[16] + o_acc[16], lane-split 구조) | +91% |
-| B-2 (revert) | 96 float4 (GQA 6 × o_acc[16]) | −23% |
-| B-3 (revert) | 64 float4 (2 Q-rows × o_acc[16]) | −38% |
-| B-4 (성공) | 32 float4 유지 (reduction 비용만 제거) | Decode +51% |
+| A-3 B-1 (성공) | 32 float4 (q_priv[16] + o_acc[16], lane-split 구조) | Prefill +91% |
+| A-3 B-2 (revert) | 96 float4 (GQA 6 × o_acc[16]) | −23% |
+| A-3 B-3 (revert) | 64 float4 (2 Q-rows × o_acc[16]) | −38% |
+| A-3 B-4 (성공) | 32 float4 유지 (reduction 비용만 제거) | Decode +51% |
 
-**원인**: Adreno compiler가 레지스터 부족 시 private array를 SLM/global로 spill. Spill이 일어나면 메모리 대역 절감·재사용 이득을 압도함. Qualcomm은 레지스터 budget을 공식 문서화하지 않아 실측이 유일한 판단 기준.
+**원인**: Adreno compiler가 레지스터 부족 시 private array를 SLM/global로 spill. Spill이 일어나면 메모리 대역 절감·재사용 이득을 압도함.
 
 **방법론 원칙**:
-1. GPU 커널 최적화에서 per-thread 배열을 키우는 변경은 **실측 전까지 부정적 가설로 간주**.
-2. 대역폭 절감(K/V 재사용, tile reuse) vs register 증가의 트레이드오프는 Adreno에서 **거의 항상 register 쪽이 진다**.
-3. **State 불변 + reduction/barrier 비용만 줄이는** 최적화가 ROI 가장 높음 (B-1, B-4).
-4. llama.cpp가 구현하지 않은 기법은 자동으로 의심하라 — Adreno 구조적 한계일 가능성.
-5. Llama 3.2 1B 측정치 ±5~10% 변동은 **thermal variance**. 재측정은 쿨다운 ≥ 2분 + Status=0 확인 후 1회.
+1. per-thread 배열 키우는 변경은 실측 전까지 **부정적 가설**.
+2. 대역폭 절감 vs register 증가 트레이드오프는 Adreno에서 **거의 항상 register 쪽이 진다**.
+3. **State 불변 + reduction/barrier 비용만 줄이는** 최적화가 ROI 가장 높음.
+4. llama.cpp가 구현하지 않은 기법은 **Adreno 구조적 한계 가능성** 우선 의심.
+5. 측정 ±5~10% 변동은 thermal variance. 재측정은 쿨다운 ≥ 2분 + Status=0 확인 후.
+6. **실측 게이트 = tok/s + 출력 품질** (신규).
 
-**구체적 함의 — 다음 세션에서 건드리면 안 되는 방향**:
-- Prefill flash_attn DK=128 커널에서 per-Q-row/per-gqa-head 상태 확장 (B-2, B-3 패턴)
-- Q tile/O tile을 SLM 경유로 돌리는 "대용량 버퍼 이동" (SLM access latency × n_iter이 bandwidth 이득을 상쇄)
-- WG 수 반감을 수반하는 tiling 확장 (occupancy 감소)
+### 다음 세션 착수 옵션 (Decode 격차 해소 중심 재설계)
 
-### 다음 세션 착수 옵션 (재설계)
+Decode 병목 분석이 먼저. c446ca8에서 오늘 아침 측정한 `--profile` Decode breakdown (단, `--profile`은 54ms sync 오버헤드로 절대값 부풀림, **상대 비교만 유효**):
 
-**A. 🔥 Prefill 잔여 8× 갭 해소 — 새 병목 재탐사 (권장, 최우선)**
+| Op | % |
+|----|---|
+| attention | 41.3% |
+| matmul_ffn | 20.0% |
+| matmul_wo | 8.7% |
+| rms_norm | 7.7% |
+| matmul_qkv | 7.1% |
+| rope | 4.4% |
+| silu_mul | 4.0% |
+| add_assign | 3.5% |
+| kv_update | 3.4% |
 
-- Decode는 llama.cpp 1.12×까지 근접, Prefill만 8× 갭. A-3 후 flash_attn 비중이 65% → (이번 세션 프로파일 미측정) 으로 재분포됨. FFN matmul, Q4_0 GEMM, kv_write, qkv/wo matmul 등 재식별 필요.
-- **A-0. Prefill 재프로파일 (필수, 30분)**: c446ca8 기준 `--profile`로 flash_prefill_gpu / ffn_gate/up/down / matmul_qkv/wo / kv_write / rms_norm / rope 비중 재측정.
-- **A-1. Q4_0 GEMM Adreno 특화 (High ROI 유력)**: 현재 vanilla local memory only. Adreno subgroup + `image1d_buffer_t` TP cache는 GEMV에서 2-3× 효과 확인됨. GEMM 포팅 시 weight rewrap(SOA/AOS row-major)이 추가로 필요하지만 **P2-1 Phase A 보고서(.agent/research/2026-04-13_p2-1_adreno_f16_matmul_phase_a.md)**가 경로 상세 기술. FFN 3개(ffn_gate/up/down, 각 8% baseline)가 최대 수혜자.
-- **A-2. kv_write / matmul_qkv 검토**: kv_write 6.2%는 현재 동기식. 배치 write + async가능성.
-- **A-3. LM head GEMV 확인**: `embed_tokens`(Q4_0 dequant)가 vocab=151,936 × hidden=1,536 — prefill 마지막 logits 계산 비용 확인.
+Decode attention 41.3% (이미 A-3 B-4로 subgroup reduction 적용됨) 이 여전히 지배적이지만 추가 개선 여지는 per-thread state 상한 때문에 제한적.
 
-**권장 순서**: A-0 재프로파일 → 최대 병목부터 A-1~A-3 중 선택. **per-thread state 상한 교훈(위 참조) 준수**.
+**A. 🔥 Decode attention 41.3% 잔여 갭 분석 (권장, 최우선)**
 
-착수 명령: `.agent/todos/long_context_attention_optimization.md §11 읽고 A-0 재프로파일부터`
+- **A-0. Decode 전용 프로파일 재분석**: llama.cpp Decode 16.6 tok/s → ms/tok 60.2ms vs 우리 82.6ms → 22ms/tok 차이. 레이어별 breakdown, KV access 패턴, subgroup utilization 확인.
+- **A-1. llama.cpp Decode 경로 구조 분석 (researcher 위임)**: `ggml-opencl.cpp` flash attention decode 경로 소스에서 우리가 놓친 최적화 기법 식별. Q1 커널 구조, KV head access pattern, subgroup 활용. llama.cpp가 `mul_mat_Ab_Bi_8x4.cl` 같은 Adreno 특화 attention 커널을 가지고 있는지 확인.
+- **A-2. Decode attention `flash_attn_f32_f16_q1` 세부 튜닝**: per-thread state 32 float4 상한 내에서 가능한 개선 — instruction-level prefetch, barrier 제거, KV load 패턴. **state 불변 규칙 준수**.
+- **A-3. matmul_ffn 20% 보조 공략**: Decode에서 FFN GEMV(Q4_0 single-row) 경로 확인. 현재 `mul_mv_q4_0_noshuffle` 계열. Adreno GEMV 추가 튜닝.
 
-**B. Decode 마무리 + 전체 e2e end-to-end 벤치 정비 (차순위)**
+**권장 순서**: A-0 재프로파일 → A-1 researcher → A-2/A-3 중 ROI 높은 쪽.
 
-- Decode 13.3 vs llama.cpp 14.9 (12% 갭) — 이 갭의 원인 재확인 (아마 FFN matmul 15.3%, RMSNorm 7.4% 등 산발적).
-- `generate_master` 같은 대조군 정비, 쿨다운 프로토콜 문서화로 측정 재현성 확보.
-- 우선순위: A가 더 큰 효용.
+**B. Decode KV access 패턴 최적화**
 
-**C. 모델 범용성 확장 — Llama 3.2 3B / Gemma 3 / Qwen 2.5-3B (DEFERRED 유지)**
+- HeadMajor 레이아웃에서 KV cache 접근이 Q1 커널에서 얼마나 coalesced 되는지 검토
+- `kv_head_stride` 활용도, subgroup broadcast 활용도
+- per-thread state 불변 규칙 하에서 cache hit rate 개선만
 
-- 지금까지 Qwen 2.5-1.5B 단독 벤치로만 최적화 결정. P0-5c 실패의 교훈처럼 multi-model 재확인 필요.
-- Llama 3.2 3B(head_dim=128, 다른 GQA ratio) 파일 확보 후 최적화된 커널(B-1/B-4) 회귀 검증.
-- 구현 작업 없이도 먼저 모델 파일 배포 + 단발 벤치 가치 있음.
+**C. 측정 인프라 정비 (보완)**
 
-### 재현용 벤치마크 명령
+1. `reference_matmul_q4_0` 같은 Q4_0 GEMM numeric tolerance 테스트 구축 (B-α.1 교훈).
+2. `generate --quality-check` 같이 출력 첫 토큰 N개가 정상 코드 포인트 범위인지 자동 검증 옵션.
+3. llama.cpp vs llm_rs2 자동 벤치 스크립트 (쿨다운 + Status 확인 + 3회 평균 + 차이 리포트).
+
+**D. 모델 범용성 확장 (DEFERRED, 기존과 동일)**
+
+Llama 3.2 3B / Gemma 3 / Qwen 2.5-3B 등 — per-thread state 상한과 GQA ratio 다를 수 있어 회귀 검증 가치.
+
+### 다음 세션 진입 명령
+
+```
+.agent/todos/long_context_attention_optimization.md §11 읽고 Decode A-0 프로파일부터
+```
+
+### 재현용 명령
+
+**llm_rs2 벤치** (쿨다운 + Status 0 후 1회 = production, 3회 평균이 더 정확):
 ```bash
-# Android 빌드 (Linux 호스트)
+adb shell "cd /data/local/tmp && ./generate \
+  -m /data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf \
+  --prompt-file /data/local/tmp/prompt_6k.txt \
+  -n 32 -b opencl --kv-type f16 --max-seq-len 6144 --ignore-eos"
+```
+
+**llama.cpp 벤치 (apples-to-apples)**:
+```bash
+# 사전: /data/local/tmp/Qwen2.5-1.5B-Instruct-q4_0.gguf 가 준비되어 있음
+# (host에서 llama-quantize로 F16→Q4_0 변환하여 푸시)
+adb shell "cd /data/local/tmp && LD_LIBRARY_PATH=/data/local/tmp ./llama-cli-orig \
+  -m /data/local/tmp/Qwen2.5-1.5B-Instruct-q4_0.gguf \
+  -f /data/local/tmp/prompt_6k.txt \
+  -n 32 -ngl 99 -c 6144 --no-display-prompt --temp 0.8 --top-p 0.9 --top-k 40 -no-cnv"
+```
+
+**Android 빌드**:
+```bash
 export NDK_HOME=/opt/android-ndk
 export HOST_TAG=linux-x86_64
 export TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG
+export PATH=$TOOLCHAIN/bin:$PATH
 export CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang
 export CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang++
 export AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar
 export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android21-clang
 cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
-
 adb push target/aarch64-linux-android/release/generate /data/local/tmp/generate
 adb shell chmod +x /data/local/tmp/generate
-
-# 쿨다운 + 4K bench (1회 규칙)
-sleep 120
-adb shell "dumpsys thermalservice | grep 'Thermal Status'"  # Status 0 확인
-adb shell "cd /data/local/tmp && ./generate \
-  -m /data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf \
-  --prompt-file /data/local/tmp/prompt_6k.txt \
-  -n 64 -b opencl --kv-type f16 --max-seq-len 6144 --ignore-eos --profile"
 ```
 
 ### 참고 문서 / 보존된 작업물
+
 - Phase 2 상세: 본 파일 §10 (P2-1 §10.2는 P2-1 Phase B 결과로 갱신됨)
 - §10.1.6: GPU decode 구조적 결함 분석 (KV-split 가설 + 정정 이력 포함)
 - P0-5/P0-5b/P0-5c revert 근거: 각 항목 Notes 블록
-- **P2-1 Phase A 선조사**: `.agent/research/2026-04-13_p2-1_adreno_f16_matmul_phase_a.md` (untracked, 보존 필요)
+- **P2-1 Phase A 선조사**: `.agent/research/2026-04-13_p2-1_adreno_f16_matmul_phase_a.md` (untracked, 보존 필요 — **단, "Prefill 8× 갭" 전제는 2026-04-14 09:00 실측으로 무효화됨**. Phase A의 기술 분석(llama.cpp Q4_0 커널 구조)은 여전히 유효)
 - **A-3 Phase A 선조사**: `.agent/research/2026-04-13_a3_flash_attn_dk128_prefill_phase_a.md` (untracked, 보존 필요 — per-thread state 상한 교훈의 근거)
 - P0-5 선조사 복원: `git show d0d4978~1:.agent/research/2026-04-13_flash_decoding_kv_split.md`
+
+### 실측 장비 상태 기록 (재현성)
+
+- Device: Galaxy S25 (Adreno 830, Snapdragon 8 Elite for Galaxy)
+- 측정 시점 thermal: Thermal Status 0~1, AP1 60.2°C, AP2 30~40°C
+- 쿨다운: 벤치 간 60~120초. 연속 벤치 시 Status 2로 올라가면 추가 2분 쿨다운.
+- Qwen Q4_0 gguf on device: `/data/local/tmp/Qwen2.5-1.5B-Instruct-q4_0.gguf` (1011 MiB, llama-quantize 생성)
+- llm_rs2 모델: `/data/local/tmp/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0-v2.gguf`
+- 프롬프트: `/data/local/tmp/prompt_6k.txt` (4472 tokens)
