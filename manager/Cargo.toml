@@ -23,7 +23,12 @@ hierarchical = []
 default = ["dbus", "lua"]
 
 [dev-dependencies]
+evalexpr = "11"
+rand_chacha = "0.3"
+serde_yaml = "0.9"
 tempfile = "3"
+thiserror = "1"
+validator = { version = "0.20", features = ["derive"] }
 
 [[bin]]
 name = "mock_manager"
@@ -32,3 +37,7 @@ path = "src/bin/mock_manager.rs"
 [[bin]]
 name = "mock_engine"
 path = "src/bin/mock_engine.rs"
+
+[[test]]
+name = "sim"
+path = "tests/sim/main.rs"
