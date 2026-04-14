@@ -394,4 +394,4 @@ Fail-Safety 원칙은 00-overview(SYS-050~055), 01-architecture(INV-005~006), 10
 
 ### 실측 relief와 설계 의도의 괴리
 
-01-architecture SYS-095의 도메인 매핑은 설계 의도이다. 실측 profile(JOURNAL 세션 8)에서는 SwitchHw만 cross-domain(Compute+Thermal) 효과가 유의미하게 확인되었으며, Eviction/Offload의 Memory relief는 물리 메모리 수준에서 null/negligible이었다. ReliefEstimator의 온라인 학습(SYS-019)이 이 괴리를 runtime에 보정하는 메커니즘이다.
+01-architecture SYS-095의 도메인 매핑은 설계 의도이다. 실측 profile(JOURNAL 세션 8)에서는 SwitchHw만 cross-domain(Compute+Thermal) 효과가 유의미하게 확인되었으며, Eviction/Offload의 Memory relief는 물리 메모리 수준에서 null/negligible이었다. SYS-019가 규정하는 온라인 학습(LuaPolicy 기본 경로의 `EwmaReliefTable` 또는 `#[cfg(feature = "hierarchical")]` 확장 경로의 `ReliefEstimator`)이 이 괴리를 runtime에 보정하는 메커니즘이다.

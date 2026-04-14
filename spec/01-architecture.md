@@ -273,7 +273,9 @@ SystemSignal → PI Controller → PressureVector → Supervisory → OperatingM
 | 컴포넌트 | 역할 |
 |---------|------|
 | ActionRegistry | 액션 메타데이터 저장소. ID, 종류(Lossless/Lossy), 가역 여부, 파라미터 범위, 배타 그룹, 기본 비용. |
-| ReliefEstimator | 액션별 릴리프 예측. 온라인 선형 회귀(RLS, λ=0.995) 기반 학습. 13차원 특성 벡터 → 4차원 ReliefVector. 액션 실행 후 3초 관찰 딜레이를 두고 실측 relief로 모델을 업데이트한다 ([SYS-019] 참조). |
+| ReliefLearner (개념) | SYS-019 MUST. 액션별 릴리프의 runtime 예측 + 실측 관찰 보정. 구현은 활성화된 정책에 따라 아래 둘 중 하나이며, SYS-019는 둘 중 하나가 존재할 것을 요구한다. |
+| `EwmaReliefTable` (LuaPolicy 기본 경로) | α=0.875 EWMA, 6차원 릴리프 벡터, 3초 관찰 딜레이. 액션 이름(String)별 per-action EWMA. MGR-DAT-071, MGR-ALG-080~083 참조. |
+| `ReliefEstimator` (`#[cfg(feature = "hierarchical")]` 확장 경로) | 온라인 선형 회귀(RLS, λ=0.995) 기반 학습. 13차원 특성 벡터 → 4차원 ReliefVector. 3초 관찰 딜레이. MGR-027, MGR-ALG-040~047 참조. |
 
 **[SYS-089]** Emitter Layer는 Policy가 결정한 디렉티브를 Engine에 전송한다. Emitter trait을 구현한다: *(MUST)*
 

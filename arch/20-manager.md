@@ -842,6 +842,8 @@ impl TbtTracker {
 
 ### 10.5 EwmaReliefTable -- Per-Action 6D EWMA 학습
 
+> **→ [SYS-019](../spec/00-overview.md#sys-019) 구현 경로 중 기본 경로 (LuaPolicy).** 확장 경로(`#[cfg(feature = "hierarchical")]` `ReliefEstimator`, RLS/13D→4D)는 §1 HierarchicalPolicy 참조.
+
 **파일**: `manager/src/lua_policy.rs` (비공개 struct)
 
 #### 설계 결정
