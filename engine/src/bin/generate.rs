@@ -1379,6 +1379,7 @@ fn main() -> anyhow::Result<()> {
             importance_collector: Some(&mut collector),
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
 
         let table = collector.build();
@@ -1771,6 +1772,7 @@ fn main() -> anyhow::Result<()> {
                         importance_collector: None,
                         logits_last_only: chunked,
                         variance_collector: None,
+                        prefill_workspace: None,
                     })?;
                     backend.synchronize()?;
                     drop(input_tensor);
@@ -1843,6 +1845,7 @@ fn main() -> anyhow::Result<()> {
                                     importance_collector: None,
                                     logits_last_only: true,
                                     variance_collector: None,
+                                    prefill_workspace: None,
                                 })?;
                                 drop(cpu_in_tensor);
                                 drop(cpu_logits);
@@ -2157,6 +2160,7 @@ fn main() -> anyhow::Result<()> {
                         importance_collector: None,
                         logits_last_only: false,
                         variance_collector: None,
+                        prefill_workspace: None,
                     })?;
                     backend.synchronize()?;
 
@@ -2315,6 +2319,7 @@ fn main() -> anyhow::Result<()> {
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
         backend.synchronize()?;
 
@@ -2485,6 +2490,7 @@ fn main() -> anyhow::Result<()> {
                 // Non-chunked: write all positions (original behaviour).
                 logits_last_only: chunked,
                 variance_collector: variance_collector.as_mut(),
+                prefill_workspace: None,
             })?;
             backend.synchronize()?;
 
@@ -2557,6 +2563,7 @@ fn main() -> anyhow::Result<()> {
                             importance_collector: None,
                             logits_last_only: true,
                             variance_collector: None,
+                            prefill_workspace: None,
                         })?;
                         // No backend.synchronize() needed — CPU forward is synchronous.
                         drop(cpu_in_tensor);
@@ -3193,6 +3200,7 @@ fn main() -> anyhow::Result<()> {
                     importance_collector: None,
                     logits_last_only: false,
                     variance_collector: None,
+                    prefill_workspace: None,
                 })?;
 
                 // Rebuild plan if it was invalidated (e.g. KV cache resize)
@@ -4751,6 +4759,7 @@ fn run_kivi_ppl(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
 
         // Collect flush QCF metrics from prefill
@@ -4829,6 +4838,7 @@ fn run_kivi_ppl(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
         start_pos += 1;
 
@@ -5099,6 +5109,7 @@ fn run_kivi(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
 
         // Sample last token from prefill logits
@@ -5250,6 +5261,7 @@ fn run_kivi(
                 importance_collector: None,
                 logits_last_only: false,
                 variance_collector: None,
+                prefill_workspace: None,
             })?;
 
             // Rebuild plan after fallback
@@ -5692,6 +5704,7 @@ fn run_offload(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
 
         // Sample last token from prefill logits
@@ -5792,6 +5805,7 @@ fn run_offload(
                 importance_collector: None,
                 logits_last_only: false,
                 variance_collector: None,
+                prefill_workspace: None,
             },
             &mut prefetch,
         )?;
@@ -6103,6 +6117,7 @@ fn run_ppl(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
 
         // Read all prefill logits to CPU
@@ -6169,6 +6184,7 @@ fn run_ppl(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
         start_pos += 1;
 

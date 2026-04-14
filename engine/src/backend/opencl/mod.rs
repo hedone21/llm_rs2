@@ -125,6 +125,12 @@ struct KernelCache {
     kernel_rms_norm_oop: CoreKernel,
     kernel_add_rms_norm_oop: CoreKernel,
     kernel_flash_attn_f32: Option<CoreKernel>,
+    /// Prefill flash attention, F32 Q/KV, head_dim=256 variant
+    /// (compiled from `flash_attn_f32.cl` with -DDK=256 -DDV=256 -DBLOCK_M=16).
+    /// Added to eliminate the CPU fallback for Gemma3 models (head_dim=256)
+    /// whose repeated per-layer `clEnqueueReadBuffer` churn exhausts NVIDIA
+    /// OpenCL driver staging resources during multi-question eval-ll.
+    kernel_flash_attn_f32_dk256: Option<CoreKernel>,
     /// Prefill flash attention, head_dim=64 variant
     /// (Q=F32, KV=F16, compiled with -DDK=64 -DDV=64).
     /// Formerly `kernel_flash_attn_f32_f16` (implicit dk64); renamed to
@@ -205,6 +211,11 @@ pub struct OpenCLBackend {
 
     // Flash attention programs (optional — compiled with head_dim-specific defines)
     pub flash_attn_f32_program: Option<Program>,
+    /// Flash attention F32-Q / F32-KV program, head_dim=256 variant.
+    /// Used by prefill (`flash_attn_f32` kernel) for Gemma3 1B / 4B.
+    /// On NVIDIA OpenCL this replaces the CPU fallback whose per-layer
+    /// `clEnqueueReadBuffer` calls exhaust driver staging resources.
+    pub flash_attn_f32_program_dk256: Option<Program>,
     /// Flash attention F32-Q / F16-KV program, head_dim=64 variant.
     /// Used by prefill (`flash_attn_f32_f16` kernel) and decode
     /// (`flash_attn_f32_f16_q1` kernel) at head_dim=64.
@@ -689,6 +700,37 @@ impl OpenCLBackend {
             }
         };
 
+        // DK=256 (Gemma3 1B / 4B). Built from the same F32 kernel source; only
+        // the compile-time DK/DV/BLOCK_M/BLOCK_N constants differ.
+        // * BLOCK_M=32: WG_SIZE = BLOCK_M = 32 matches NVIDIA warp size and
+        //   keeps per-thread register pressure manageable for the
+        //   q_priv[DK_VEC=64] + o_acc[DV_VEC=64] private arrays.
+        // * BLOCK_N=16: 2 × 16 × 64 × sizeof(float4) = 32 KB of shared memory,
+        //   under the 48 KB CUDA limit. BLOCK_N=32 overflows to 64 KB (ptxas
+        //   "too much shared data"), BLOCK_N=8 reduces local tile reuse and
+        //   showed numerical drift in long-prefill production runs.
+        let flash_attn_dk256_defines = "-DDK=256 -DDV=256 -DBLOCK_M=32 -DBLOCK_N=16";
+        let flash_attn_f32_opts_dk256 = format!("{} {}", cl_opts, flash_attn_dk256_defines);
+
+        let flash_attn_f32_program_dk256 = match Program::builder()
+            .devices(device)
+            .src(flash_attn_f32_src)
+            .cmplr_opt(&flash_attn_f32_opts_dk256)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("flash_attn_f32.cl compiled (BLOCK_M=16, BLOCK_N=32, DK=256)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!(
+                    "flash_attn_f32.cl DK=256 failed: {}. GPU prefill F32 head_dim=256 disabled (Gemma3 falls back to CPU attention).",
+                    e
+                );
+                None
+            }
+        };
+
         // GEMM kernels for prefill — tiled matmul (BM=64, BN=64, BK=16)
         let gemm_f16_src = include_str!("../../../kernels/mul_mm_f16_f32_l4_lm.cl");
         let gemm_f16_program = match Program::builder()
@@ -876,6 +918,9 @@ impl OpenCLBackend {
             kernel_flash_attn_f32: flash_attn_f32_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32").ok()),
+            kernel_flash_attn_f32_dk256: flash_attn_f32_program_dk256
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32").ok()),
             kernel_flash_attn_f32_f16_dk64: flash_attn_f32_f16_program_dk64
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32_f16").ok()),
@@ -989,6 +1034,7 @@ impl OpenCLBackend {
             quant_q4_0_program,
             get_rows_program,
             flash_attn_f32_program,
+            flash_attn_f32_program_dk256,
             flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128,
             f16_l4_program,
@@ -2058,16 +2104,17 @@ impl OpenCLBackend {
         let kv_dtype = k_cache.dtype();
         let kernels = unsafe { &*self.kernels.get() };
         let kernel = match kv_dtype {
-            DType::F32 => {
-                // F32 program is compiled with DK=DV=64 only.
-                if head_dim != 64 {
-                    return Ok(false);
-                }
-                match &kernels.kernel_flash_attn_f32 {
+            DType::F32 => match head_dim {
+                64 => match &kernels.kernel_flash_attn_f32 {
                     Some(k) => k,
                     None => return Ok(false),
-                }
-            }
+                },
+                256 => match &kernels.kernel_flash_attn_f32_dk256 {
+                    Some(k) => k,
+                    None => return Ok(false),
+                },
+                _ => return Ok(false),
+            },
             DType::F16 => match head_dim {
                 64 => match &kernels.kernel_flash_attn_f32_f16_dk64 {
                     Some(k) => k,
@@ -2195,6 +2242,8 @@ impl OpenCLBackend {
             let (block_m, lanes_per_wg): (usize, usize) = match head_dim {
                 64 => (64, 64),
                 128 => (32, 64),
+                // DK=256: WG_SIZE = BLOCK_M = 32 to match NVIDIA warp size.
+                256 => (32, 32),
                 _ => unreachable!("head_dim guard above"),
             };
             let n_groups_q = seq_len.div_ceil(block_m);
@@ -2209,6 +2258,18 @@ impl OpenCLBackend {
                 &global_work_size,
                 Some(local_work_size),
             )?;
+
+            // DK=256 stability guard: the kernel's large per-thread register
+            // footprint (q_priv[64] + o_acc[64] float4 tiles) pressures the
+            // NVIDIA driver when 34 back-to-back layers' dispatches share the
+            // command queue without intermediate drains. An explicit finish
+            // breaks the chain and keeps multi-question eval-ll stable.
+            // No-op on head_dim ∈ {64, 128} where the existing kernels are
+            // register-light, and on Adreno (isolated by the head_dim == 256
+            // guard itself — no production Gemma3 path on Adreno today).
+            if head_dim == 256 {
+                ocl::core::finish(&self.queue)?;
+            }
         }
 
         Ok(true)

@@ -145,6 +145,22 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
     let qcf_layer_skip = layer_skip_opr.map(|v| v as f64);
     let qcf_layer_skip_layers = layer_skip_opr.map(|_| layer_skip_set_len);
 
+    let trace_alloc = std::env::var("LLM_OCL_ALLOC_TRACE").is_ok();
+    if trace_alloc {
+        #[cfg(feature = "opencl")]
+        {
+            let (live, bytes, allocs, releases) =
+                crate::backend::opencl::buffer::snapshot_alloc_counters();
+            eprintln!(
+                "[OCL-Trace] pre-loop live={} bytes={:.1}MB total_allocs={} total_releases={}",
+                live,
+                bytes as f64 / (1024.0 * 1024.0),
+                allocs,
+                releases,
+            );
+        }
+    }
+
     for (q_idx, question) in questions.iter().enumerate() {
         let q_start = std::time::Instant::now();
 
@@ -153,6 +169,23 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         // Flush GPU queue to release deferred OpenCL buffers from previous question.
         // Without this, NVIDIA's runtime accumulates pending buffer releases → OOM.
         backend.synchronize()?;
+
+        if trace_alloc {
+            #[cfg(feature = "opencl")]
+            {
+                let (live, bytes, allocs, releases) =
+                    crate::backend::opencl::buffer::snapshot_alloc_counters();
+                eprintln!(
+                    "[OCL-Trace] Q{} begin id={} live={} bytes={:.1}MB total_allocs={} total_releases={}",
+                    q_idx + 1,
+                    question.id,
+                    live,
+                    bytes as f64 / (1024.0 * 1024.0),
+                    allocs,
+                    releases,
+                );
+            }
+        }
 
         // Tokenize prompt
         let prompt_enc = tokenizer
@@ -246,6 +279,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                 importance_collector: None,
                 logits_last_only: false,
                 variance_collector: None,
+                prefill_workspace: None,
             })?;
 
             // Restore current_pos: undo the probe's kv_cache.update() increment.
@@ -335,6 +369,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
                         importance_collector: None,
                         logits_last_only: false,
                         variance_collector: None,
+                        prefill_workspace: None,
                     })?;
                     sp += 1;
 
@@ -553,6 +588,7 @@ fn run_importance_pass<C: KVCacheOps>(
         importance_collector: Some(&mut collector),
         logits_last_only: false,
         variance_collector: None,
+        prefill_workspace: None,
     })?;
 
     let table = collector.build();
@@ -692,6 +728,7 @@ fn run_token_by_token_prefill<C: KVCacheOps>(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
     }
 
@@ -758,6 +795,7 @@ fn run_full_prefill<C: KVCacheOps>(
         importance_collector: None,
         logits_last_only: true,
         variance_collector: None,
+        prefill_workspace: None,
     })?;
 
     // Read logits (only last position — much smaller than full prompt × vocab)
@@ -846,6 +884,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
         importance_collector: None,
         logits_last_only: true,
         variance_collector: None,
+        prefill_workspace: None,
     })?;
 
     // Explicitly drop GPU buffers and flush queue to free VRAM before the
@@ -899,6 +938,7 @@ fn run_chunked_prefill<C: KVCacheOps>(
             importance_collector: None,
             logits_last_only: false,
             variance_collector: None,
+            prefill_workspace: None,
         })?;
         start_pos += 1;
     }
