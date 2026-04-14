@@ -27,6 +27,30 @@ fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
     }
 }
 
+/// Run `f` with the OpenCL `op_label_hint` temporarily set to `label`, if the
+/// backend is an event-profiling OpenCL backend. No-op on CPU or when
+/// event profiling is off. Used by the non-plan path to tag lm_head.
+#[inline]
+fn with_op_label<F, T>(backend: &Arc<dyn Backend>, label: &'static str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    #[cfg(feature = "opencl")]
+    if let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+        && ocl_be.profile_events_enabled
+    {
+        ocl_be.set_op_label(label);
+        let r = f();
+        ocl_be.clear_op_label();
+        return r;
+    }
+    #[cfg(not(feature = "opencl"))]
+    let _ = (backend, label);
+    f()
+}
+
 pub struct TransformerModel {
     pub config: ModelConfig,
     pub layers: Vec<TransformerLayer>,
@@ -893,12 +917,16 @@ impl TransformerModel {
             if self.lm_head_on_cpu {
                 self.lm_head_matmul_cpu(&x_last, logits_out, backend)?;
             } else {
-                backend.matmul_transposed(&x_last, &self.lm_head, logits_out)?;
+                with_op_label(backend, "lm_head", || {
+                    backend.matmul_transposed(&x_last, &self.lm_head, logits_out)
+                })?;
             }
         } else if self.lm_head_on_cpu {
             self.lm_head_matmul_cpu(&x, logits_out, backend)?;
         } else {
-            backend.matmul_transposed(&x, &self.lm_head, logits_out)?;
+            with_op_label(backend, "lm_head", || {
+                backend.matmul_transposed(&x, &self.lm_head, logits_out)
+            })?;
         }
 
         // Synchronize before owned PrefillWorkspace drop — ensures all GPU kernels
@@ -1185,7 +1213,7 @@ impl TransformerModel {
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
-        match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
+        match plan.execute(ocl_backend, start_pos, kv_caches) {
             Ok(()) => {
                 // If lm_head was skipped in the plan (on CPU), run CPU fallback.
                 if plan.lm_head.is_none() {
@@ -1366,7 +1394,7 @@ impl TransformerModel {
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
-        match plan.execute(ocl_backend.queue.as_core(), start_pos, kv_caches) {
+        match plan.execute(ocl_backend, start_pos, kv_caches) {
             Ok(()) => {
                 if plan.lm_head.is_none() {
                     self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;

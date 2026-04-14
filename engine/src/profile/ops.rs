@@ -13,6 +13,19 @@ pub struct OpProfiler {
     pub add_assign: u64,
     pub copy_residual: u64,
     pub cast: u64,
+    /// Final LM head matmul (only populated by `--profile-events`).
+    /// The legacy `--profile` path does not time lm_head separately.
+    pub lm_head: u64,
+    /// Generic matmul bucket used by `--profile-events` when the caller did
+    /// not set a more specific hint (matmul_qkv/matmul_wo/matmul_ffn/lm_head).
+    /// Only populated by event-based profiling.
+    pub matmul: u64,
+    /// Residual/elementwise operations that did not match a specific label.
+    /// Only populated by event-based profiling.
+    pub gather: u64,
+    /// Fallback bucket: any kernel dispatch whose event label did not match
+    /// a known OpProfiler field. Only populated by event-based profiling.
+    pub other: u64,
     pub count: u64,
     /// Prefill-specific per-op breakdown (populated during prefill pass).
     pub prefill: PrefillOpProfiler,
@@ -170,11 +183,13 @@ impl OpProfiler {
     }
 
     /// Returns all decode operations as (name, value) pairs sorted by typical impact.
-    fn ops(&self) -> [(&'static str, u64); 11] {
+    fn ops(&self) -> [(&'static str, u64); 15] {
         [
             ("matmul_qkv", self.matmul_qkv),
             ("matmul_wo", self.matmul_wo),
             ("matmul_ffn", self.matmul_ffn),
+            ("lm_head", self.lm_head),
+            ("matmul", self.matmul),
             ("attention", self.attention),
             ("rms_norm", self.rms_norm),
             ("rope", self.rope),
@@ -183,7 +198,43 @@ impl OpProfiler {
             ("copy_residual", self.copy_residual),
             ("kv_update", self.kv_update),
             ("cast", self.cast),
+            ("gather", self.gather),
+            ("other", self.other),
         ]
+    }
+
+    /// Merge event-based per-label GPU ns into the microsecond accumulators.
+    ///
+    /// Called once per decode step by the `--profile-events` code path.
+    /// Input map uses the labels defined in
+    /// `.agent/research/2026-04-14_decode_microbench_plan.md` (C-2 table).
+    /// Unknown labels fall into the `other` bucket so no dispatch is dropped.
+    pub fn merge_from_events(&mut self, events: &std::collections::HashMap<String, u64>) {
+        for (label, ns) in events {
+            let us = ns / 1_000;
+            match label.as_str() {
+                "rms_norm" => self.rms_norm += us,
+                "matmul_qkv" => self.matmul_qkv += us,
+                "matmul_wo" => self.matmul_wo += us,
+                "matmul_ffn" => self.matmul_ffn += us,
+                "lm_head" => self.lm_head += us,
+                "matmul" => self.matmul += us,
+                "rope" => self.rope += us,
+                "kv_update" => self.kv_update += us,
+                "attention" => self.attention += us,
+                "silu_mul" => self.silu_mul += us,
+                "add_assign" => self.add_assign += us,
+                "cast" => self.cast += us,
+                "gather" => self.gather += us,
+                // flash_prefill counted towards prefill bucket? For decode
+                // path it will not fire. Accept into "other" if it leaks.
+                "flash_prefill" => self.prefill.flash_prefill_gpu += us,
+                // load_time events fire only during model initialization and
+                // should not contaminate decode numbers — silently drop.
+                "load_time" => {}
+                _ => self.other += us,
+            }
+        }
     }
 
     fn total(&self) -> u64 {
@@ -294,7 +345,7 @@ mod tests {
         assert_eq!(json["total_us"], 6500);
 
         let breakdown = json["breakdown"].as_object().unwrap();
-        assert_eq!(breakdown.len(), 11); // all 11 ops present
+        assert_eq!(breakdown.len(), 15); // all 15 ops present
 
         // Verify specific op values
         assert_eq!(breakdown["matmul_qkv"]["total_us"], 1000);

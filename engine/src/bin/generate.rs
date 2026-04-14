@@ -115,8 +115,26 @@ struct Args {
     prefill_cpu_chunk_size: usize,
 
     /// Enable profiling (per-op timing, latency, score snapshots).
+    ///
+    /// Legacy mode: inserts two `clFinish()` calls per op on GPU, which
+    /// inflates decode ms/tok by ~54 ms on Adreno. Useful for **relative**
+    /// per-op ranking only. For apples-to-apples comparison with llama.cpp
+    /// per-op GPU timing, use `--profile-events` instead.
     #[arg(long, default_value_t = false)]
     profile: bool,
+
+    /// Enable OpenCL event-based per-op profiling.
+    ///
+    /// Creates the command queue with `CL_QUEUE_PROFILING_ENABLE` and
+    /// captures a profiling event per kernel dispatch. At decode-step
+    /// boundaries the `End-Start` nanoseconds are aggregated per logical
+    /// op label. Unlike `--profile`, this adds no `clFinish()` calls and
+    /// closely matches absolute GPU time (same mechanism as
+    /// `GGML_OPENCL_PROFILING` in llama.cpp).
+    ///
+    /// Mutually exclusive with `--profile`.
+    #[arg(long, default_value_t = false)]
+    profile_events: bool,
 
     /// Output directory for profiling data.
     #[arg(long, default_value = "results/profile")]
@@ -462,6 +480,18 @@ fn main() -> anyhow::Result<()> {
         args.temperature = 0.0;
     }
 
+    // --profile and --profile-events are mutually exclusive.
+    // Both probe the decode path but use incompatible mechanisms:
+    //   --profile          : CPU wall clock + per-op clFinish (adds ~54 ms/tok)
+    //   --profile-events   : GPU profiling events (near-zero overhead)
+    if args.profile && args.profile_events {
+        anyhow::bail!(
+            "--profile and --profile-events are mutually exclusive. \
+             Use --profile-events for absolute GPU per-op timing (Adreno/llama.cpp comparison), \
+             or --profile for legacy CPU-wall-clock relative ranking."
+        );
+    }
+
     let sampling_config = SamplingConfig {
         temperature: args.temperature,
         top_p: args.top_p,
@@ -491,24 +521,29 @@ fn main() -> anyhow::Result<()> {
             let cpu_mem: Arc<dyn Memory> = Arc::new(Galloc::new());
             // Try to init GPU as secondary for SwitchHw resilience
             #[cfg(feature = "opencl")]
-            let (gpu_be, gpu_mem_arc) = match llm_rs2::backend::opencl::OpenCLBackend::new() {
-                Ok(gpu_concrete) => {
-                    let gpu_concrete = Arc::new(gpu_concrete);
-                    let gm: Arc<dyn Memory> =
-                        Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
-                            gpu_concrete.context.clone(),
-                            gpu_concrete.queue.clone(),
-                            args.zero_copy,
-                        ));
-                    let g = gpu_concrete as Arc<dyn Backend>;
-                    eprintln!("[Backend] CPU primary, GPU secondary available (SwitchHw ready)");
-                    (Some(g), Some(gm))
-                }
-                Err(e) => {
-                    eprintln!("[Backend] CPU only (GPU init failed: {})", e);
-                    (None, None)
-                }
-            };
+            let (gpu_be, gpu_mem_arc) =
+                match llm_rs2::backend::opencl::OpenCLBackend::new_with_profile_events(
+                    args.profile_events,
+                ) {
+                    Ok(gpu_concrete) => {
+                        let gpu_concrete = Arc::new(gpu_concrete);
+                        let gm: Arc<dyn Memory> =
+                            Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
+                                gpu_concrete.context.clone(),
+                                gpu_concrete.queue.clone(),
+                                args.zero_copy,
+                            ));
+                        let g = gpu_concrete as Arc<dyn Backend>;
+                        eprintln!(
+                            "[Backend] CPU primary, GPU secondary available (SwitchHw ready)"
+                        );
+                        (Some(g), Some(gm))
+                    }
+                    Err(e) => {
+                        eprintln!("[Backend] CPU only (GPU init failed: {})", e);
+                        (None, None)
+                    }
+                };
             #[cfg(not(feature = "opencl"))]
             let (gpu_be, gpu_mem_arc): (
                 Option<Arc<dyn Backend>>,
@@ -518,7 +553,11 @@ fn main() -> anyhow::Result<()> {
         }
         #[cfg(feature = "opencl")]
         "opencl" | "gpu" => {
-            let gpu_concrete = Arc::new(llm_rs2::backend::opencl::OpenCLBackend::new()?);
+            let gpu_concrete = Arc::new(
+                llm_rs2::backend::opencl::OpenCLBackend::new_with_profile_events(
+                    args.profile_events,
+                )?,
+            );
             // When resilience is enabled, force zero-copy memory so KV cache uses
             // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, host-accessible). This enables
             // zero-alloc UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
@@ -2207,9 +2246,13 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Inference profiler (only when --profile is set)
+    // Inference profiler (activated by either --profile or --profile-events).
     // Declared before prefill so PrefillOpProfiler can be populated.
-    let mut profiler = if args.profile {
+    //
+    // --profile-events uses the same InferenceProfiler container (ops/json
+    // export) but feeds it via OpProfiler::merge_from_events() instead of
+    // the legacy per-op synchronize+wall-clock path.
+    let mut profiler = if args.profile || args.profile_events {
         Some(llm_rs2::profile::InferenceProfiler::new(
             llm_rs2::profile::ProfileConfig {
                 score_snapshot_interval: args.profile_interval,
@@ -2836,6 +2879,23 @@ fn main() -> anyhow::Result<()> {
     // === GENERATION PHASE ===
     {
         println!("[Profile] Event: DecodingStart");
+
+        // --profile-events: drop any events captured during prefill/warmup so
+        // the decode-only aggregate is not polluted. Prefill uses the generic
+        // `forward` path (no label hints), so without this step all matmul
+        // dispatches from prefill would spill into the decode "matmul" bucket.
+        #[cfg(feature = "opencl")]
+        if args.profile_events
+            && let Some(ocl_be) = backend
+                .as_any()
+                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+            && ocl_be.profile_events_enabled
+        {
+            backend.synchronize()?;
+            ocl_be.flush_and_aggregate_profile()?;
+            let _ = ocl_be.take_profile_accum();
+            eprintln!("[Profile] prefill/warmup events dropped (decode-only accumulator)");
+        }
         // Pre-allocate workspace for generation
         let q_dim = model.config.num_attention_heads * model.config.head_dim;
         let k_dim = model.config.num_key_value_heads * model.config.head_dim;
@@ -3148,6 +3208,25 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             backend.synchronize()?;
+
+            // --profile-events: drain and aggregate GPU events into OpProfiler.
+            // Runs only when the OpenCL backend was created with event profiling
+            // enabled; CPU backend or non-profile runs skip this entirely.
+            #[cfg(feature = "opencl")]
+            if args.profile_events
+                && let Some(ocl_be) = backend
+                    .as_any()
+                    .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                && ocl_be.profile_events_enabled
+            {
+                ocl_be.flush_and_aggregate_profile()?;
+                let accum = ocl_be.take_profile_accum();
+                if let Some(ref mut p) = profiler {
+                    p.ops.merge_from_events(&accum);
+                    p.ops.count += 1;
+                }
+            }
+
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
             // ── H2O Debug: per-step diagnostics ──

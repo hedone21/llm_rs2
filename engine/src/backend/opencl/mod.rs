@@ -266,6 +266,23 @@ pub struct OpenCLBackend {
     // matmul_q4_0() auto-dispatches to noshuffle GEMV when a lookup succeeds.
     // UnsafeCell: single-threaded access (same pattern as kernels and gemv_noshuffle_cache).
     noshuffle_soa_registry: UnsafeCell<HashMap<usize, NoshuffleSoaEntry>>,
+
+    // ── Event-based per-op profiling (--profile-events) ──────────────────
+    // When true, the queue was created with CL_QUEUE_PROFILING_ENABLE and all
+    // enqueue_kernel_labeled() calls capture an event + label. Decode-step
+    // flush aggregates (End-Start) ns per label. Unlike the legacy --profile
+    // mode, no per-op clFinish is required.
+    pub profile_events_enabled: bool,
+    // Captured (label, event) pairs, cleared on each flush_and_aggregate_profile().
+    // UnsafeCell: single-threaded inference access.
+    profile_events: UnsafeCell<Vec<(&'static str, ocl::core::Event)>>,
+    // Accumulated GPU ns per label (total over the whole run).
+    profile_accum: UnsafeCell<HashMap<&'static str, u64>>,
+    // Optional caller-provided label hint. When Some, it overrides the
+    // static label passed to enqueue_kernel_labeled(). Used by forward_gen
+    // and plan.rs to distinguish matmul_qkv / matmul_wo / matmul_ffn / lm_head
+    // which all dispatch the same underlying GEMV/GEMM kernel.
+    op_label_hint: UnsafeCell<Option<&'static str>>,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -285,6 +302,23 @@ impl std::fmt::Debug for OpenCLBackend {
 
 impl OpenCLBackend {
     pub fn new() -> Result<Self> {
+        Self::new_with_profile_events(false)
+    }
+
+    /// Build an OpenCLBackend with optional per-op event profiling.
+    ///
+    /// When `profile_events_enabled` is true, the command queue is created
+    /// with `CL_QUEUE_PROFILING_ENABLE`, and every kernel dispatch that
+    /// goes through `enqueue_kernel_labeled()` records an `ocl::core::Event`
+    /// plus label. The decode loop periodically calls
+    /// `flush_and_aggregate_profile()` which reads `End - Start` nanoseconds
+    /// from each event and accumulates them into `profile_accum`.
+    ///
+    /// This is the replacement for the legacy `--profile` mode, which
+    /// inserted two `clFinish()` calls per op and inflated decode ms/tok
+    /// by ~54 ms on Adreno. Event-based measurement has near-zero CPU
+    /// overhead because profiling info is collected by the GPU itself.
+    pub fn new_with_profile_events(profile_events_enabled: bool) -> Result<Self> {
         // --- Platform selection via OCL_PLATFORM env var ---
         let platform = if let Ok(name) = std::env::var("OCL_PLATFORM") {
             let name_lower = name.to_lowercase();
@@ -369,7 +403,13 @@ impl OpenCLBackend {
             .devices(device)
             .build()?;
 
-        let queue = Queue::new(&context, device, None)?;
+        let queue_props = if profile_events_enabled {
+            log::info!("OpenCL queue: CL_QUEUE_PROFILING_ENABLE (event-based per-op profiling)");
+            Some(flags::QUEUE_PROFILING_ENABLE)
+        } else {
+            None
+        };
+        let queue = Queue::new(&context, device, queue_props)?;
 
         // --- Build compiler options based on device CL version ---
         let cl_opts = build_cl_opts(&device);
@@ -966,7 +1006,151 @@ impl OpenCLBackend {
             max_mem_alloc_size,
             gemv_noshuffle_cache: UnsafeCell::new(HashMap::new()),
             noshuffle_soa_registry: UnsafeCell::new(HashMap::new()),
+            profile_events_enabled,
+            profile_events: UnsafeCell::new(Vec::new()),
+            profile_accum: UnsafeCell::new(HashMap::new()),
+            op_label_hint: UnsafeCell::new(None),
         })
+    }
+
+    // ── Event-based per-op profiling helpers (--profile-events) ─────────
+    //
+    // See `OpenCLBackend::new_with_profile_events()` for the design rationale.
+    // All three helpers are no-ops when `profile_events_enabled` is false.
+
+    /// Set a caller-provided label hint. Overrides the static label passed to
+    /// `enqueue_kernel_labeled()` for the next dispatches, until cleared.
+    /// Used by the forward pass to distinguish matmul_qkv / matmul_wo /
+    /// matmul_ffn / lm_head which all dispatch the same GEMV/GEMM kernels.
+    #[inline]
+    pub fn set_op_label(&self, label: &'static str) {
+        if !self.profile_events_enabled {
+            return;
+        }
+        // SAFETY: single-threaded inference access (same pattern as `kernels`).
+        unsafe {
+            *self.op_label_hint.get() = Some(label);
+        }
+    }
+
+    /// Clear a previously-set label hint.
+    #[inline]
+    pub fn clear_op_label(&self) {
+        if !self.profile_events_enabled {
+            return;
+        }
+        unsafe {
+            *self.op_label_hint.get() = None;
+        }
+    }
+
+    /// Enqueue an OpenCL kernel, capturing an event tagged with `default_label`
+    /// (or the caller-provided hint, when set) when profile-events mode is on.
+    ///
+    /// Fallback path (profile off) = plain `ocl::core::enqueue_kernel` with no
+    /// event — identical to the old sites being replaced.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_kernel_labeled(
+        &self,
+        kernel: &CoreKernel,
+        default_label: &'static str,
+        work_dim: u32,
+        gws: &[usize; 3],
+        lws: Option<[usize; 3]>,
+    ) -> Result<()> {
+        if self.profile_events_enabled {
+            let label = unsafe { (*self.op_label_hint.get()).unwrap_or(default_label) };
+            let mut ev: ocl::core::Event = ocl::core::Event::null();
+            unsafe {
+                ocl::core::enqueue_kernel(
+                    &self.queue,
+                    kernel,
+                    work_dim,
+                    None,
+                    gws,
+                    lws,
+                    None::<&ocl::core::Event>,
+                    Some(&mut ev),
+                )?;
+                let events = &mut *self.profile_events.get();
+                events.push((label, ev));
+            }
+        } else {
+            unsafe {
+                ocl::core::enqueue_kernel(
+                    &self.queue,
+                    kernel,
+                    work_dim,
+                    None,
+                    gws,
+                    lws,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Flush captured events into the per-label accumulator, reading
+    /// `CL_PROFILING_COMMAND_{START,END}` from each event and summing
+    /// `(end - start)` ns into `profile_accum[label]`.
+    ///
+    /// Caller must ensure the queue has been drained (e.g. via
+    /// `synchronize()`) before calling — profiling info is only valid once
+    /// the command has reached `CL_COMPLETE`. Events are released
+    /// automatically when dropped from the Vec.
+    ///
+    /// No-op when profile-events mode is off.
+    pub fn flush_and_aggregate_profile(&self) -> Result<()> {
+        if !self.profile_events_enabled {
+            return Ok(());
+        }
+        // SAFETY: single-threaded inference access.
+        let (events_vec, accum) = unsafe {
+            (
+                &mut *self.profile_events.get(),
+                &mut *self.profile_accum.get(),
+            )
+        };
+        for (label, ev) in events_vec.drain(..) {
+            let start_ns =
+                match ocl::core::get_event_profiling_info(&ev, ocl::core::ProfilingInfo::Start) {
+                    Ok(info) => info.time()?,
+                    Err(e) => {
+                        log::warn!("profile: get_event_profiling_info(start) failed: {}", e);
+                        continue;
+                    }
+                };
+            let end_ns =
+                match ocl::core::get_event_profiling_info(&ev, ocl::core::ProfilingInfo::End) {
+                    Ok(info) => info.time()?,
+                    Err(e) => {
+                        log::warn!("profile: get_event_profiling_info(end) failed: {}", e);
+                        continue;
+                    }
+                };
+            let delta = end_ns.saturating_sub(start_ns);
+            *accum.entry(label).or_insert(0) += delta;
+            // ev is dropped here -> clReleaseEvent
+        }
+        Ok(())
+    }
+
+    /// Consume the accumulated per-label ns map, returning it as `HashMap<String, u64>`.
+    /// Clears the internal accumulator (so callers can snapshot mid-run).
+    ///
+    /// Returns an empty map when profile-events is off.
+    pub fn take_profile_accum(&self) -> HashMap<String, u64> {
+        if !self.profile_events_enabled {
+            return HashMap::new();
+        }
+        let accum = unsafe { &mut *self.profile_accum.get() };
+        accum
+            .drain()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect::<HashMap<_, _>>()
     }
 
     /// Initialize the GPU-side attention score accumulator.
@@ -1086,15 +1270,12 @@ impl OpenCLBackend {
             let local_work_size: [usize; 3] = [128, 1, 1];
             let global_work_size: [usize; 3] = [n.div_ceil(64) * 128, m.div_ceil(64), 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 3,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -1159,15 +1340,12 @@ impl OpenCLBackend {
             let local_work_size: [usize; 3] = [128, 1, 1];
             let global_work_size: [usize; 3] = [n.div_ceil(64) * 128, m.div_ceil(64), 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 3,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -1239,15 +1417,12 @@ impl OpenCLBackend {
             let local_work_size: [usize; 3] = [128, 1, 1];
             let global_work_size: [usize; 3] = [n.div_ceil(64) * 128, m.div_ceil(64), 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 3,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -1347,15 +1522,12 @@ impl OpenCLBackend {
                 let n_groups = n.div_ceil(WAVE4_N_DST);
                 ([n_groups * 64, m * 4, 1], [64usize, 4, 1])
             };
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 3,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -1444,15 +1616,12 @@ impl OpenCLBackend {
             let group_size_0 = n.div_ceil(4);
             let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], m, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 3,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -1537,16 +1706,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(cvt_kernel, 2, ocl::core::ArgVal::mem(&dst_d))?;
 
             let global_work_size: [usize; 3] = [num_blocks, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                cvt_kernel,
-                1,
-                None,
-                &global_work_size,
-                None,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(cvt_kernel, "load_time", 1, &global_work_size, None)?;
         }
         self.queue.finish()?;
 
@@ -1855,15 +2015,12 @@ impl OpenCLBackend {
             let global_work_size: [usize; 3] = [ne01 / 2, n_simdgroup, 1];
             let local_work_size: [usize; 3] = [simdgroup_width, n_simdgroup, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 2,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         // act_img is dropped here; clReleaseMemObject is called.
@@ -2045,15 +2202,12 @@ impl OpenCLBackend {
                 [n_groups_q * lanes_per_wg, n_heads_q * batch_size, 1];
             let local_work_size: [usize; 3] = [lanes_per_wg, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "flash_prefill",
                 2,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
 
@@ -2204,15 +2358,12 @@ impl OpenCLBackend {
             // Each WG handles one (batch, head) pair.
             let global_work_size: [usize; 3] = [Q1_WG_SIZE, n_heads_q, 1];
             let local_work_size: [usize; 3] = [Q1_WG_SIZE, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "attention",
                 2,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
 
@@ -2523,15 +2674,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [n * local_size, m.div_ceil(4), 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "matmul",
                 3,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -2578,15 +2726,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "rms_norm",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -2629,15 +2774,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "rms_norm",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -2684,15 +2826,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "rms_norm",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -2722,16 +2861,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&theta))?;
 
             let work_size = seq_len * num_heads * (head_dim / 2);
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &[work_size, 1, 1],
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "rope", 1, &[work_size, 1, 1], None)?;
         }
         Ok(())
     }
@@ -2754,16 +2884,7 @@ impl Backend for OpenCLBackend {
                     )?;
                     let gws: [usize; 3] = [num_elements.div_ceil(64) * 64, 1, 1];
                     let lws: [usize; 3] = [64, 1, 1];
-                    ocl::core::enqueue_kernel(
-                        &self.queue,
-                        kernel,
-                        1,
-                        None,
-                        &gws,
-                        Some(lws),
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )?;
+                    self.enqueue_kernel_labeled(kernel, "cast", 1, &gws, Some(lws))?;
                 }
                 Ok(())
             }
@@ -2792,15 +2913,12 @@ impl Backend for OpenCLBackend {
                     let local_size = 64;
                     let global_size = num_blocks.div_ceil(local_size) * local_size;
 
-                    ocl::core::enqueue_kernel(
-                        &self.queue,
+                    self.enqueue_kernel_labeled(
                         kernel,
+                        "cast",
                         1,
-                        None,
                         &[global_size, 1, 1],
                         Some([local_size, 1, 1]),
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
                     )?;
                 }
                 Ok(())
@@ -2844,16 +2962,7 @@ impl Backend for OpenCLBackend {
 
             let gws: [usize; 3] = [n_elems.div_ceil(64) * 64, 1, 1];
             let lws: [usize; 3] = [64, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &gws,
-                Some(lws),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 1, &gws, Some(lws))?;
         }
         Ok(())
     }
@@ -3001,15 +3110,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "attention",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
 
@@ -3055,16 +3161,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size4 as i32)))?;
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &[size4, 1, 1],
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "silu_mul", 1, &[size4, 1, 1], None)?;
         }
         Ok(())
     }
@@ -3085,16 +3182,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size4 as i32)))?;
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &[size4, 1, 1],
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "silu_mul", 1, &[size4, 1, 1], None)?;
         }
         Ok(())
     }
@@ -3115,16 +3203,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(y_buf))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size4 as i32)))?;
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &[size4, 1, 1],
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "add_assign", 1, &[size4, 1, 1], None)?;
         }
         Ok(())
     }
@@ -3148,16 +3227,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(total as i32)))?;
 
             let gws = total.div_ceil(64) * 64;
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &[gws, 1, 1],
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "add_assign", 1, &[gws, 1, 1], None)?;
         }
         Ok(())
     }
@@ -3186,16 +3256,7 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&val))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::scalar(&(size as i32)))?;
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                1,
-                None,
-                &[size, 1, 1],
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "other", 1, &[size, 1, 1], None)?;
         }
         Ok(())
     }
@@ -3221,15 +3282,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "other",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -3300,15 +3358,12 @@ impl Backend for OpenCLBackend {
             let global_work_size: [usize; 3] = [num_indices * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "gather",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
         Ok(())
@@ -3579,16 +3634,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
 
             let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -3633,16 +3679,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
 
             let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -3686,16 +3723,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&tok_base_i))?;
 
             let global_work_size: [usize; 3] = [total, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -3738,16 +3766,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
 
             let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -3790,16 +3809,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&block_offset_i))?;
 
             let global_work_size: [usize; 3] = [total_blocks, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -3842,16 +3852,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&tok_base_i))?;
 
             let global_work_size: [usize; 3] = [total, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -3895,16 +3896,7 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&res_pos_i))?;
 
             let global_work_size: [usize; 3] = [total, 1, 1];
-            ocl::core::enqueue_kernel(
-                &self.queue,
-                kernel,
-                3,
-                None,
-                &global_work_size,
-                None::<[usize; 3]>,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
+            self.enqueue_kernel_labeled(kernel, "kv_update", 3, &global_work_size, None)?;
         }
         Ok(())
     }
@@ -4013,15 +4005,12 @@ impl OpenCLBackend {
             let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
             let local_work_size: [usize; 3] = [local_size, 1, 1];
 
-            ocl::core::enqueue_kernel(
-                &self.queue,
+            self.enqueue_kernel_labeled(
                 kernel,
+                "attention",
                 1,
-                None,
                 &global_work_size,
                 Some(local_work_size),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             )?;
         }
 

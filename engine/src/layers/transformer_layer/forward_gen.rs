@@ -24,9 +24,49 @@ impl TransformerLayer {
         let mut profiler = args.profiler.as_deref_mut();
         let is_gpu = backend.is_gpu();
 
+        // Detect whether the backend was created with `--profile-events`.
+        // In that mode the OpenCL backend is already capturing per-op GPU
+        // events, so the legacy wall-clock + `clFinish()` path must stay
+        // silent to avoid double-counting and to preserve the zero-overhead
+        // property of event-based profiling.
+        #[cfg(feature = "opencl")]
+        let event_profiling = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            .map(|b| b.profile_events_enabled)
+            .unwrap_or(false);
+        #[cfg(not(feature = "opencl"))]
+        let event_profiling = false;
+
+        // `set_label` / `clear_label`: caller-side label hints used only by
+        // `--profile-events` to distinguish matmul_qkv / matmul_wo /
+        // matmul_ffn / lm_head (all dispatch the same GEMV/GEMM kernels).
+        // No-op on CPU or when event profiling is off.
+        #[allow(unused_variables)]
+        let set_label = |label: &'static str| {
+            #[cfg(feature = "opencl")]
+            if event_profiling
+                && let Some(ocl_be) = backend
+                    .as_any()
+                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            {
+                ocl_be.set_op_label(label);
+            }
+        };
+        let clear_label = || {
+            #[cfg(feature = "opencl")]
+            if event_profiling
+                && let Some(ocl_be) = backend
+                    .as_any()
+                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+            {
+                ocl_be.clear_op_label();
+            }
+        };
+
         macro_rules! prof_start {
             () => {
-                if profiler.is_some() {
+                if profiler.is_some() && !event_profiling {
                     // Drain GPU queue before timing to get accurate per-op measurement
                     if is_gpu {
                         backend.synchronize().ok();
@@ -40,7 +80,9 @@ impl TransformerLayer {
         }
         macro_rules! prof_record {
             ($t:expr, $field:ident) => {
-                if let Some(ref mut p) = profiler {
+                if let Some(ref mut p) = profiler
+                    && !event_profiling
+                {
                     // Wait for GPU kernel to actually complete before recording time
                     if is_gpu {
                         backend.synchronize().ok();
@@ -143,9 +185,11 @@ impl TransformerLayer {
         } else {
             // Decode QKV: GPU-only (partition not applied to attention in decode).
             crate::core::thread_pool::get_pool().begin_batch();
+            set_label("matmul_qkv");
             backend.matmul_transposed(&ws.residual, &self.wq, &mut ws.q)?;
             backend.matmul_transposed(&ws.residual, &self.wk, &mut ws.k)?;
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
+            clear_label();
             crate::core::thread_pool::get_pool().end_batch();
             if is_gpu {
                 backend.flush()?;
@@ -912,7 +956,9 @@ impl TransformerLayer {
 
         let t = prof_start!();
         // Decode wo: GPU-only (partition not applied to attention output in decode).
+        set_label("matmul_wo");
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
+        clear_label();
         prof_record!(t, matmul_wo);
 
         // 7+8. Post-attention residual + pre-FFN norm
@@ -1045,8 +1091,10 @@ impl TransformerLayer {
         } else {
             // ── Generic path: sequential matmuls on active backend ──
             crate::core::thread_pool::get_pool().begin_batch();
+            set_label("matmul_ffn");
             backend.matmul_transposed(&ws.residual, &self.w_gate, &mut ws.gate)?;
             backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
+            clear_label();
             crate::core::thread_pool::get_pool().end_batch();
             if is_gpu {
                 backend.flush()?;
@@ -1064,7 +1112,9 @@ impl TransformerLayer {
 
         // Decode down: GPU-only (partition not applied to down in decode).
         let t = prof_start!();
+        set_label("matmul_ffn");
         backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+        clear_label();
         prof_record!(t, matmul_ffn);
 
         // 10. Residual 2 — accumulate FFN result into x (skip connection)

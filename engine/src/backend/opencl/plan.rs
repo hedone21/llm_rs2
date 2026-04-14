@@ -29,6 +29,33 @@ pub enum OpTag {
     LmHead,
 }
 
+impl OpTag {
+    /// Static label used by the event-based profiler (`--profile-events`).
+    ///
+    /// These names match the keys produced by the non-plan path (forward_gen
+    /// via `OpenCLBackend::set_op_label`), so the resulting aggregate is
+    /// self-consistent whether plan execution or the generic dispatch path
+    /// was used. Must stay in sync with the label matrix in the
+    /// `.agent/research/2026-04-14_decode_microbench_plan.md` report.
+    pub fn profile_label(&self) -> &'static str {
+        match self {
+            OpTag::RmsNorm => "rms_norm",
+            OpTag::AddRmsNorm => "rms_norm",
+            OpTag::FinalNorm => "rms_norm",
+            OpTag::MatmulQKV => "matmul_qkv",
+            OpTag::MatmulWo => "matmul_wo",
+            OpTag::MatmulGateUp => "matmul_ffn",
+            OpTag::MatmulDown => "matmul_ffn",
+            OpTag::Rope => "rope",
+            OpTag::KvScatter => "kv_update",
+            OpTag::Attention => "attention",
+            OpTag::AddAssign => "add_assign",
+            OpTag::SiluMul => "silu_mul",
+            OpTag::LmHead => "lm_head",
+        }
+    }
+}
+
 /// Dynamic argument that changes per token.
 #[derive(Debug, Clone)]
 pub enum DynamicArg {
@@ -150,10 +177,16 @@ impl std::error::Error for PlanInvalidated {}
 
 impl FullKernelPlan {
     /// Dispatch a single kernel step, updating its dynamic args.
+    ///
+    /// When `backend.profile_events_enabled` is true, the dispatch goes
+    /// through `backend.enqueue_kernel_labeled()` so a profiling event is
+    /// captured for each kernel. Otherwise, falls back to the legacy raw
+    /// `ocl::core::enqueue_kernel` path (zero overhead in the non-profiled
+    /// build).
     #[inline]
     #[allow(clippy::too_many_arguments)]
     fn dispatch_step(
-        queue: &ocl::core::CommandQueue,
+        backend: &crate::backend::opencl::OpenCLBackend,
         step: &KernelStep,
         start_pos: i32,
         cache_seq_len: i32,
@@ -163,6 +196,7 @@ impl FullKernelPlan {
         q2_tokens: i32,
         res_tokens: i32,
     ) {
+        let queue = backend.queue.as_core();
         for dyn_arg in &step.dynamic_args {
             let (arg_idx, result) = unsafe {
                 match dyn_arg {
@@ -241,23 +275,40 @@ impl FullKernelPlan {
                 );
             }
         }
-        unsafe {
-            if let Err(e) = ocl::core::enqueue_kernel(
-                queue,
+        if backend.profile_events_enabled {
+            if let Err(e) = backend.enqueue_kernel_labeled(
                 &step.kernel,
+                step.op_tag.profile_label(),
                 step.ndim,
-                None,
                 &step.global_work_size,
                 step.local_work_size,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             ) {
                 log::error!(
-                    "Plan enqueue_kernel failed: op={:?} gws={:?}: {}",
+                    "Plan enqueue_kernel_labeled failed: op={:?} gws={:?}: {}",
                     step.op_tag,
                     step.global_work_size,
                     e
                 );
+            }
+        } else {
+            unsafe {
+                if let Err(e) = ocl::core::enqueue_kernel(
+                    queue,
+                    &step.kernel,
+                    step.ndim,
+                    None,
+                    &step.global_work_size,
+                    step.local_work_size,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                ) {
+                    log::error!(
+                        "Plan enqueue_kernel failed: op={:?} gws={:?}: {}",
+                        step.op_tag,
+                        step.global_work_size,
+                        e
+                    );
+                }
             }
         }
     }
@@ -270,11 +321,12 @@ impl FullKernelPlan {
     /// Returns `Err(PlanInvalidated)` if KV cache capacity changed.
     pub fn execute<C: crate::core::kv_cache::KVCacheOps>(
         &self,
-        queue: &ocl::core::CommandQueue,
+        backend: &crate::backend::opencl::OpenCLBackend,
         start_pos: usize,
         kv_caches: &mut [C],
     ) -> std::result::Result<(), PlanInvalidated> {
         let debug_sync = std::env::var("PLAN_DEBUG").is_ok();
+        let queue = backend.queue.as_core();
 
         for (i, layer_plan) in self.layers.iter().enumerate() {
             let cache = &mut kv_caches[i];
@@ -298,7 +350,7 @@ impl FullKernelPlan {
             // Steps 1-6: pre-KV steps
             for (si, step) in layer_plan.steps_pre_kv.iter().enumerate() {
                 Self::dispatch_step(
-                    queue,
+                    backend,
                     step,
                     start_pos_i32,
                     cache_seq_len,
@@ -320,7 +372,7 @@ impl FullKernelPlan {
             match &layer_plan.kv_update {
                 KvUpdateVariant::Standard(step) => {
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         step,
                         start_pos_i32,
                         cache_seq_len,
@@ -340,7 +392,7 @@ impl FullKernelPlan {
                 }
                 KvUpdateVariant::Kivi { gather_k, gather_v } => {
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         gather_k,
                         start_pos_i32,
                         cache_seq_len,
@@ -351,7 +403,7 @@ impl FullKernelPlan {
                         rt,
                     );
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         gather_v,
                         start_pos_i32,
                         cache_seq_len,
@@ -377,7 +429,7 @@ impl FullKernelPlan {
                         );
                     }
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         step,
                         start_pos_i32,
                         attn_seq_len,
@@ -401,7 +453,7 @@ impl FullKernelPlan {
                         );
                     }
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         step,
                         start_pos_i32,
                         attn_seq_len,
@@ -426,7 +478,7 @@ impl FullKernelPlan {
                 } => {
                     // Scatter residual to F32 attn buffer (with updated res_tokens)
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         scatter_k,
                         start_pos_i32,
                         cache_seq_len,
@@ -437,7 +489,7 @@ impl FullKernelPlan {
                         rt_after,
                     );
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         scatter_v,
                         start_pos_i32,
                         cache_seq_len,
@@ -450,7 +502,7 @@ impl FullKernelPlan {
                     // Attention over total = q2_tokens + res_tokens_after
                     let total = q2t + rt_after;
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         attn,
                         start_pos_i32,
                         total,
@@ -464,7 +516,7 @@ impl FullKernelPlan {
                 AttentionVariant::KiviNative(step) => {
                     // Native KIVI attention: q2_tokens and res_tokens are dynamic
                     Self::dispatch_step(
-                        queue,
+                        backend,
                         step,
                         start_pos_i32,
                         cache_seq_len,
@@ -480,7 +532,7 @@ impl FullKernelPlan {
             // Steps 9-15: post-attention steps
             for (si, step) in layer_plan.steps_post_attn.iter().enumerate() {
                 Self::dispatch_step(
-                    queue,
+                    backend,
                     step,
                     start_pos_i32,
                     cache_seq_len,
@@ -505,35 +557,59 @@ impl FullKernelPlan {
         }
 
         // Final norm
-        unsafe {
-            if let Err(e) = ocl::core::enqueue_kernel(
-                queue,
+        if backend.profile_events_enabled {
+            if let Err(e) = backend.enqueue_kernel_labeled(
                 &self.final_norm.kernel,
+                self.final_norm.op_tag.profile_label(),
                 self.final_norm.ndim,
-                None,
                 &self.final_norm.global_work_size,
                 self.final_norm.local_work_size,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
             ) {
-                log::error!("Plan enqueue final_norm failed: {}", e);
+                log::error!("Plan enqueue_kernel_labeled final_norm failed: {}", e);
+            }
+        } else {
+            unsafe {
+                if let Err(e) = ocl::core::enqueue_kernel(
+                    queue,
+                    &self.final_norm.kernel,
+                    self.final_norm.ndim,
+                    None,
+                    &self.final_norm.global_work_size,
+                    self.final_norm.local_work_size,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                ) {
+                    log::error!("Plan enqueue final_norm failed: {}", e);
+                }
             }
         }
 
         // lm_head matmul (skipped when lm_head is on CPU)
         if let Some(ref lm_head) = self.lm_head {
-            unsafe {
-                if let Err(e) = ocl::core::enqueue_kernel(
-                    queue,
+            if backend.profile_events_enabled {
+                if let Err(e) = backend.enqueue_kernel_labeled(
                     &lm_head.kernel,
+                    lm_head.op_tag.profile_label(),
                     lm_head.ndim,
-                    None,
                     &lm_head.global_work_size,
                     lm_head.local_work_size,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
                 ) {
-                    log::error!("Plan enqueue lm_head failed: {}", e);
+                    log::error!("Plan enqueue_kernel_labeled lm_head failed: {}", e);
+                }
+            } else {
+                unsafe {
+                    if let Err(e) = ocl::core::enqueue_kernel(
+                        queue,
+                        &lm_head.kernel,
+                        lm_head.ndim,
+                        None,
+                        &lm_head.global_work_size,
+                        lm_head.local_work_size,
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    ) {
+                        log::error!("Plan enqueue lm_head failed: {}", e);
+                    }
                 }
             }
         }
