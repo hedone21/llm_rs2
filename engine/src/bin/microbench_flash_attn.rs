@@ -84,7 +84,9 @@ mod bench {
     pub struct State {
         pub context: Context,
         pub queue: Queue,
-        pub kernel: ocl::core::Kernel,
+        /// (engine_name, kernel) — Cross-run에서 두 엔진(우리 vs llama.cpp)
+        /// Q1 kernel을 같은 buffer 상에서 dispatch.
+        pub kernels: Vec<(String, ocl::core::Kernel)>,
         pub q_pool_buf: Mem,
         pub k_buf: Mem,
         pub v_buf: Mem,
@@ -140,13 +142,26 @@ mod bench {
         let full_opts = format!("{} {}", dk128_defines, cl_opts);
         println!("# Build opts: {}", full_opts);
 
-        let flash_attn_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
-        let program = Program::builder()
+        // 우리(llm_rs2) Q1: production source 그대로
+        let our_src = include_str!("../../kernels/flash_attn_f32_f16.cl");
+        let our_program = Program::builder()
             .devices(device)
-            .src(flash_attn_src)
+            .src(our_src)
             .cmplr_opt(&full_opts)
             .build(&context)?;
-        let kernel = ocl::core::create_kernel(&program, "flash_attn_f32_f16_q1")?;
+        let our_kernel = ocl::core::create_kernel(&our_program, "flash_attn_f32_f16_q1")?;
+
+        // llama.cpp Q1: vendored source (Phase A 재감사 후 cross-run 검증용).
+        // SLM tree-reduce + barrier 패턴 (B-4 sub_group_reduce 미적용).
+        let llama_src = include_str!(
+            "../../../.agent/research/microbench_flash_attn/llamacpp_q1_flash_attn.cl"
+        );
+        let llama_program = Program::builder()
+            .devices(device)
+            .src(llama_src)
+            .cmplr_opt(&full_opts)
+            .build(&context)?;
+        let llama_kernel = ocl::core::create_kernel(&llama_program, "flash_attn_f32_f16_q1")?;
 
         // KV: HeadMajor 기본 layout으로 alloc. 0.125 (F16 0x3000) 채움.
         let kv_elems = N_H_KV * CAP * DK;
@@ -265,47 +280,55 @@ mod bench {
         let mask_nb3 = mask_nb2;
         let mask_ne = 1i32;
 
-        // q_offset (arg 1) is set per-iter; 초기는 0
-        ocl::core::set_kernel_arg(&kernel, 0, ArgVal::mem(&q_pool_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 1, ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 2, ArgVal::mem(&k_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 3, ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 4, ArgVal::mem(&v_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 5, ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 6, ArgVal::mem(&o_buf))?;
-        ocl::core::set_kernel_arg(&kernel, 7, ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 8, ArgVal::scalar(&scale))?;
-        ocl::core::set_kernel_arg(&kernel, 9, ArgVal::scalar(&n_q))?;
-        // arg 10 = n_kv (per-iter)
-        ocl::core::set_kernel_arg(&kernel, 11, ArgVal::scalar(&is_causal))?;
-        ocl::core::set_kernel_arg(&kernel, 12, ArgVal::scalar(&n_head))?;
-        ocl::core::set_kernel_arg(&kernel, 13, ArgVal::scalar(&q_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 14, ArgVal::scalar(&q_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 15, ArgVal::scalar(&q_nb3))?;
-        // args 16-21 = K/V strides (per-layout)
-        ocl::core::set_kernel_arg(&kernel, 22, ArgVal::scalar(&o_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 23, ArgVal::scalar(&o_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 24, ArgVal::scalar(&o_nb3))?;
-        ocl::core::set_kernel_arg(&kernel, 25, ArgVal::scalar(&max_bias))?;
-        ocl::core::set_kernel_arg(&kernel, 26, ArgVal::scalar(&m0))?;
-        ocl::core::set_kernel_arg(&kernel, 27, ArgVal::scalar(&m1))?;
-        ocl::core::set_kernel_arg(&kernel, 28, ArgVal::scalar(&n_head_log2))?;
-        ocl::core::set_kernel_arg(&kernel, 29, ArgVal::scalar(&logit_softcap))?;
-        ocl::core::set_kernel_arg(&kernel, 30, ArgVal::scalar(&n_head_kv))?;
-        // arg 31 = mask_void (per-variant)
-        ocl::core::set_kernel_arg(&kernel, 32, ArgVal::scalar(&zero_u64))?;
-        ocl::core::set_kernel_arg(&kernel, 33, ArgVal::scalar(&mask_nb1))?;
-        ocl::core::set_kernel_arg(&kernel, 34, ArgVal::scalar(&mask_nb2))?;
-        ocl::core::set_kernel_arg(&kernel, 35, ArgVal::scalar(&mask_nb3))?;
-        ocl::core::set_kernel_arg(&kernel, 36, ArgVal::scalar(&mask_ne))?;
-        ocl::core::set_kernel_arg(&kernel, 37, ArgVal::scalar(&mask_ne))?;
-        ocl::core::set_kernel_arg(&kernel, 38, ArgVal::mem_null())?;
-        ocl::core::set_kernel_arg(&kernel, 39, ArgVal::scalar(&zero_u64))?;
+        // 두 kernel에 동일 정적 args 설정 — q_offset/n_kv/K-V strides/mask는 동적
+        let setup_static = |k: &ocl::core::Kernel| -> anyhow::Result<()> {
+            ocl::core::set_kernel_arg(k, 0, ArgVal::mem(&q_pool_buf))?;
+            ocl::core::set_kernel_arg(k, 1, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(k, 2, ArgVal::mem(&k_buf))?;
+            ocl::core::set_kernel_arg(k, 3, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(k, 4, ArgVal::mem(&v_buf))?;
+            ocl::core::set_kernel_arg(k, 5, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(k, 6, ArgVal::mem(&o_buf))?;
+            ocl::core::set_kernel_arg(k, 7, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(k, 8, ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(k, 9, ArgVal::scalar(&n_q))?;
+            // arg 10 = n_kv (per-iter)
+            ocl::core::set_kernel_arg(k, 11, ArgVal::scalar(&is_causal))?;
+            ocl::core::set_kernel_arg(k, 12, ArgVal::scalar(&n_head))?;
+            ocl::core::set_kernel_arg(k, 13, ArgVal::scalar(&q_nb1))?;
+            ocl::core::set_kernel_arg(k, 14, ArgVal::scalar(&q_nb2))?;
+            ocl::core::set_kernel_arg(k, 15, ArgVal::scalar(&q_nb3))?;
+            // args 16-21 = K/V strides (per-layout)
+            ocl::core::set_kernel_arg(k, 22, ArgVal::scalar(&o_nb1))?;
+            ocl::core::set_kernel_arg(k, 23, ArgVal::scalar(&o_nb2))?;
+            ocl::core::set_kernel_arg(k, 24, ArgVal::scalar(&o_nb3))?;
+            ocl::core::set_kernel_arg(k, 25, ArgVal::scalar(&max_bias))?;
+            ocl::core::set_kernel_arg(k, 26, ArgVal::scalar(&m0))?;
+            ocl::core::set_kernel_arg(k, 27, ArgVal::scalar(&m1))?;
+            ocl::core::set_kernel_arg(k, 28, ArgVal::scalar(&n_head_log2))?;
+            ocl::core::set_kernel_arg(k, 29, ArgVal::scalar(&logit_softcap))?;
+            ocl::core::set_kernel_arg(k, 30, ArgVal::scalar(&n_head_kv))?;
+            // arg 31 = mask_void (per-variant)
+            ocl::core::set_kernel_arg(k, 32, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(k, 33, ArgVal::scalar(&mask_nb1))?;
+            ocl::core::set_kernel_arg(k, 34, ArgVal::scalar(&mask_nb2))?;
+            ocl::core::set_kernel_arg(k, 35, ArgVal::scalar(&mask_nb3))?;
+            ocl::core::set_kernel_arg(k, 36, ArgVal::scalar(&mask_ne))?;
+            ocl::core::set_kernel_arg(k, 37, ArgVal::scalar(&mask_ne))?;
+            ocl::core::set_kernel_arg(k, 38, ArgVal::mem_null())?;
+            ocl::core::set_kernel_arg(k, 39, ArgVal::scalar(&zero_u64))?;
+            Ok(())
+        };
+        setup_static(&our_kernel)?;
+        setup_static(&llama_kernel)?;
 
         Ok(State {
             context,
             queue,
-            kernel,
+            kernels: vec![
+                ("llm_rs2".to_string(), our_kernel),
+                ("llama.cpp".to_string(), llama_kernel),
+            ],
             q_pool_buf,
             k_buf,
             v_buf,
@@ -319,19 +342,21 @@ mod bench {
 
     /// 한 measurement: variant.num_dispatches 만큼 dispatch, event 합산.
     /// 반환값은 measurement 1 회의 sum-of-events μs (= per-token attention 비용).
-    fn measure_one(state: &State, variant: Variant) -> anyhow::Result<f64> {
-        let mut events: Vec<Event> = (0..variant.num_dispatches)
-            .map(|_| Event::null())
-            .collect();
+    fn measure_one(
+        state: &State,
+        kernel: &ocl::core::Kernel,
+        variant: Variant,
+    ) -> anyhow::Result<f64> {
+        let mut events: Vec<Event> = (0..variant.num_dispatches).map(|_| Event::null()).collect();
         for (i, ev) in events.iter_mut().enumerate() {
             if variant.vary_q {
                 let q_off = (i as u64) * state.q_slot_bytes;
-                ocl::core::set_kernel_arg(&state.kernel, 1, ArgVal::scalar(&q_off))?;
+                ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&q_off))?;
             }
             unsafe {
                 ocl::core::enqueue_kernel(
                     &state.queue,
-                    &state.kernel,
+                    kernel,
                     2,
                     None,
                     &state.gws,
@@ -354,127 +379,147 @@ mod bench {
     pub fn measure_matrix(
         state: &State,
         layouts: &[(&'static str, (u64, u64, u64))],
-    ) -> anyhow::Result<Vec<(String, String, Vec<(i32, f64)>)>> {
+    ) -> anyhow::Result<Vec<(String, String, String, Vec<(i32, f64)>)>> {
         // header
         println!();
-        println!("layout,variant,n_kv,median_us,mean_us,min_us,max_us,iters");
+        println!("engine,layout,variant,n_kv,median_us,mean_us,min_us,max_us,iters");
 
-        let mut all_results: Vec<(String, String, Vec<(i32, f64)>)> = Vec::new();
+        let mut all_results: Vec<(String, String, String, Vec<(i32, f64)>)> = Vec::new();
 
-        for (layout_name, (k_nb1, k_nb2, k_nb3)) in layouts {
-            ocl::core::set_kernel_arg(&state.kernel, 16, ArgVal::scalar(k_nb1))?;
-            ocl::core::set_kernel_arg(&state.kernel, 17, ArgVal::scalar(k_nb2))?;
-            ocl::core::set_kernel_arg(&state.kernel, 18, ArgVal::scalar(k_nb3))?;
-            ocl::core::set_kernel_arg(&state.kernel, 19, ArgVal::scalar(k_nb1))?;
-            ocl::core::set_kernel_arg(&state.kernel, 20, ArgVal::scalar(k_nb2))?;
-            ocl::core::set_kernel_arg(&state.kernel, 21, ArgVal::scalar(k_nb3))?;
+        // engine 외부 루프: 같은 KV 데이터/같은 dispatch params로 두 kernel 직접 비교
+        for (engine_name, kernel) in &state.kernels {
+            for (layout_name, (k_nb1, k_nb2, k_nb3)) in layouts {
+                ocl::core::set_kernel_arg(kernel, 16, ArgVal::scalar(k_nb1))?;
+                ocl::core::set_kernel_arg(kernel, 17, ArgVal::scalar(k_nb2))?;
+                ocl::core::set_kernel_arg(kernel, 18, ArgVal::scalar(k_nb3))?;
+                ocl::core::set_kernel_arg(kernel, 19, ArgVal::scalar(k_nb1))?;
+                ocl::core::set_kernel_arg(kernel, 20, ArgVal::scalar(k_nb2))?;
+                ocl::core::set_kernel_arg(kernel, 21, ArgVal::scalar(k_nb3))?;
 
-            for variant in VARIANTS {
-                // mask arg per variant
-                if variant.use_mask {
-                    ocl::core::set_kernel_arg(&state.kernel, 31, ArgVal::mem(&state.mask_buf))?;
-                } else {
-                    ocl::core::set_kernel_arg(&state.kernel, 31, ArgVal::mem_null())?;
-                }
-                // q_offset 초기화 (vary_q=false 인 경우 0 고정)
-                let zero_u64 = 0u64;
-                if !variant.vary_q {
-                    ocl::core::set_kernel_arg(&state.kernel, 1, ArgVal::scalar(&zero_u64))?;
-                }
-
-                let mut points: Vec<(i32, f64)> = Vec::new();
-
-                for &n_kv in N_KV_VALUES {
-                    ocl::core::set_kernel_arg(&state.kernel, 10, ArgVal::scalar(&n_kv))?;
-
-                    for _ in 0..WARMUP_ITERS {
-                        let _ = measure_one(state, *variant)?;
+                for variant in VARIANTS {
+                    if variant.use_mask {
+                        ocl::core::set_kernel_arg(kernel, 31, ArgVal::mem(&state.mask_buf))?;
+                    } else {
+                        ocl::core::set_kernel_arg(kernel, 31, ArgVal::mem_null())?;
+                    }
+                    let zero_u64 = 0u64;
+                    if !variant.vary_q {
+                        ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&zero_u64))?;
                     }
 
-                    let mut samples: Vec<f64> = Vec::with_capacity(MEASURE_ITERS);
-                    for _ in 0..MEASURE_ITERS {
-                        samples.push(measure_one(state, *variant)?);
+                    let mut points: Vec<(i32, f64)> = Vec::new();
+
+                    for &n_kv in N_KV_VALUES {
+                        ocl::core::set_kernel_arg(kernel, 10, ArgVal::scalar(&n_kv))?;
+
+                        for _ in 0..WARMUP_ITERS {
+                            let _ = measure_one(state, kernel, *variant)?;
+                        }
+
+                        let mut samples: Vec<f64> = Vec::with_capacity(MEASURE_ITERS);
+                        for _ in 0..MEASURE_ITERS {
+                            samples.push(measure_one(state, kernel, *variant)?);
+                        }
+
+                        let mut sorted = samples.clone();
+                        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        let median = sorted[sorted.len() / 2];
+                        let mean: f64 = samples.iter().sum::<f64>() / samples.len() as f64;
+                        let min = sorted[0];
+                        let max = *sorted.last().unwrap();
+
+                        println!(
+                            "{},{},{},{},{:.2},{:.2},{:.2},{:.2},{}",
+                            engine_name,
+                            layout_name,
+                            variant.name,
+                            n_kv,
+                            median,
+                            mean,
+                            min,
+                            max,
+                            samples.len()
+                        );
+                        points.push((n_kv, median));
                     }
 
-                    let mut sorted = samples.clone();
-                    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-                    let median = sorted[sorted.len() / 2];
-                    let mean: f64 = samples.iter().sum::<f64>() / samples.len() as f64;
-                    let min = sorted[0];
-                    let max = *sorted.last().unwrap();
-
-                    println!(
-                        "{},{},{},{:.2},{:.2},{:.2},{:.2},{}",
-                        layout_name,
-                        variant.name,
-                        n_kv,
-                        median,
-                        mean,
-                        min,
-                        max,
-                        samples.len()
-                    );
-                    points.push((n_kv, median));
+                    all_results.push((
+                        engine_name.clone(),
+                        layout_name.to_string(),
+                        variant.name.to_string(),
+                        points,
+                    ));
                 }
-
-                all_results.push((layout_name.to_string(), variant.name.to_string(), points));
             }
         }
 
         Ok(all_results)
     }
 
-    pub fn print_slope_table(results: &[(String, String, Vec<(i32, f64)>)]) {
+    pub fn print_slope_table(results: &[(String, String, String, Vec<(i32, f64)>)]) {
         println!();
-        println!("# Slope (μs / n_kv) per (layout, variant) — least squares");
-        println!("# layout,variant,slope_us_per_n_kv,intercept_us");
-        for (layout, variant, pts) in results {
-            let n = pts.len() as f64;
-            let sx: f64 = pts.iter().map(|(x, _)| *x as f64).sum();
-            let sy: f64 = pts.iter().map(|(_, y)| *y).sum();
-            let sxx: f64 = pts.iter().map(|(x, _)| (*x as f64).powi(2)).sum();
-            let sxy: f64 = pts.iter().map(|(x, y)| (*x as f64) * *y).sum();
-            let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
-            let intercept = (sy - slope * sx) / n;
+        println!("# Slope (μs / n_kv) per (engine, layout, variant) — least squares");
+        println!("# engine,layout,variant,slope_us_per_n_kv,intercept_us");
+        for (engine, layout, variant, pts) in results {
+            let (slope, intercept) = lsq(pts);
             println!(
-                "# {},{},{:.4},{:.2}",
-                layout, variant, slope, intercept
+                "# {},{},{},{:.4},{:.2}",
+                engine, layout, variant, slope, intercept
             );
         }
     }
 
-    pub fn print_decomposition(results: &[(String, String, Vec<(i32, f64)>)]) {
-        // HeadMajor variant 별 slope만 추출
-        let head_slopes: Vec<(String, f64)> = results
-            .iter()
-            .filter(|(l, _, _)| l == "HeadMajor")
-            .map(|(_, v, pts)| {
-                let n = pts.len() as f64;
-                let sx: f64 = pts.iter().map(|(x, _)| *x as f64).sum();
-                let sy: f64 = pts.iter().map(|(_, y)| *y).sum();
-                let sxx: f64 = pts.iter().map(|(x, _)| (*x as f64).powi(2)).sum();
-                let sxy: f64 = pts.iter().map(|(x, y)| (*x as f64) * *y).sum();
-                (v.clone(), (n * sxy - sx * sy) / (n * sxx - sx * sx))
-            })
-            .collect();
+    fn lsq(pts: &[(i32, f64)]) -> (f64, f64) {
+        let n = pts.len() as f64;
+        let sx: f64 = pts.iter().map(|(x, _)| *x as f64).sum();
+        let sy: f64 = pts.iter().map(|(_, y)| *y).sum();
+        let sxx: f64 = pts.iter().map(|(x, _)| (*x as f64).powi(2)).sum();
+        let sxy: f64 = pts.iter().map(|(x, y)| (*x as f64) * *y).sum();
+        let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
+        let intercept = (sy - slope * sx) / n;
+        (slope, intercept)
+    }
+
+    pub fn print_cross_run_summary(results: &[(String, String, String, Vec<(i32, f64)>)]) {
+        // (engine, variant) → slope (HeadMajor 만)
+        let mut by_var: std::collections::BTreeMap<String, Vec<(String, f64)>> =
+            std::collections::BTreeMap::new();
+        for (engine, layout, variant, pts) in results {
+            if layout != "HeadMajor" {
+                continue;
+            }
+            let (slope, _) = lsq(pts);
+            by_var
+                .entry(variant.clone())
+                .or_default()
+                .push((engine.clone(), slope));
+        }
 
         println!();
-        println!("# Production gap decomposition (HeadMajor only, per-token slope)");
-        println!("# Reference: production attention slope = 13.23 μs/n_kv per token");
-        let mut prev_slope = 0.0;
-        for (i, (variant, slope)) in head_slopes.iter().enumerate() {
-            // Single은 1 dispatch 기준이라 ×28 환산
-            let per_token = if variant == "Single" {
-                slope * (N_LAYERS as f64)
+        println!("# Cross-run verdict — HeadMajor only, per variant");
+        println!("# variant,engine_a,slope_a,engine_b,slope_b,ratio_a/b");
+        for (variant, engines) in &by_var {
+            if engines.len() != 2 {
+                continue;
+            }
+            let (ea, sa) = &engines[0];
+            let (eb, sb) = &engines[1];
+            let ratio = sa / sb;
+            let verdict = if ratio < 0.95 {
+                format!(
+                    "{} faster ({:.1}% advantage)",
+                    ea,
+                    (1.0 / ratio - 1.0) * 100.0
+                )
+            } else if ratio > 1.05 {
+                format!("{} faster ({:.1}% advantage)", eb, (ratio - 1.0) * 100.0)
             } else {
-                *slope
+                "within ±5% (TIE)".to_string()
             };
-            let delta = if i == 0 { 0.0 } else { per_token - prev_slope };
             println!(
-                "# {:16}  per-token slope = {:7.4} μs/n_kv  Δ = {:+7.4}",
-                variant, per_token, delta
+                "# {:16},{},{:.4},{},{:.4},{:.3}x  →  {}",
+                variant, ea, sa, eb, sb, ratio, verdict
             );
-            prev_slope = per_token;
         }
     }
 }
@@ -499,6 +544,6 @@ fn main() -> anyhow::Result<()> {
 
     let results = bench::measure_matrix(&state, layouts)?;
     bench::print_slope_table(&results);
-    bench::print_decomposition(&results);
+    bench::print_cross_run_summary(&results);
     Ok(())
 }

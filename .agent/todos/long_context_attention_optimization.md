@@ -153,6 +153,72 @@ A1 결과로 **갭의 실재 자체가 의심스러움** 상태. 더 진행 전 
 **계속 유효 (D)**:
 - Eviction은 갭 실재 무관 독립 전략.
 
+### 🆕 2026-04-14 22:30: Cross-run — llm_rs2 Q1 vs llama.cpp Q1 → **결정적 verdict**
+
+**산출물**: `.agent/research/microbench_flash_attn/cross_run_verdict.md`
+
+같은 microbench harness가 production Q1과 vendored llama.cpp Q1을 모두 컴파일하고 동일 buffer/dispatch로 호출. 4 variants × 2 layouts × 4 n_kv × 30 iters × 2 runs.
+
+**결과 (HeadMajor, Repeat28+Mask, mean of 2 runs)**:
+
+| engine | per-token slope μs/n_kv | ratio |
+|---|---:|---:|
+| llm_rs2 (B-4 sub_group_reduce) | **10.30** | 1.34× |
+| llama.cpp (SLM tree-reduce + 236 barriers) | **7.69** | 1.0 |
+
+**llama.cpp가 33-55% 빠름** — 4 variants 모두에서 일관됨.
+
+**§12 갭 6.75 μs/n_kv 분해 (개정)**:
+| 기여 | μs/n_kv | % |
+|---|---:|---:|
+| **B-4 sub_group_reduce LOSS** | **~2.5** | **37%** |
+| Production 환경 (FFN cache thrashing) | ~1.5 | 22% |
+| 미해명 잔존 | ~2.75 | 41% |
+
+**즉시 회수 가능: 2.5 μs/n_kv (37% of gap) — B-4 revert만 하면**
+
+**가능한 원인** (가설):
+1. Adreno OpenCL `sub_group_reduce_*` 구현이 SLM tree-reduce보다 비효율
+2. `cl_qcom_reqd_sub_group_size("half"=64)` 어트리뷰트가 occupancy 제한
+3. Register pressure: sub_group broadcast로 모든 lane이 결과 보유 → SLM tree (lane 0만 결과)보다 register 압박
+4. Compile path 차이: REQD_SUBGROUP_SIZE_64 어트리뷰트의 ISA 영향
+
+### 🚀 다음 세션 엔트리 포인트 (재정비 v5 — 결정적)
+
+**즉시 (저비용, 큰 효과)**: B-4 revert 검증
+- `engine/kernels/flash_attn_f32_f16.cl`의 Q1 kernel만 SLM tree-reduce 패턴으로 교체 (llama.cpp 버전 그대로 차용)
+- production decode 벤치 재측정 (Galaxy S25, Qwen 2.5-1.5B Q4_0, 4 ctx)
+- 예상 효과: attention slope 13.23 → ~10 μs/n_kv (25% 감소), wall 12.45 → ~10.3 μs/n_kv (17% 감소)
+- prefill kernel은 별도 작업 (B-4은 Q1만 적용)
+
+**후속 (조사)**: 왜 Adreno에서 sub_group_reduce가 느린가
+- `clGetKernelSubGroupInfo`로 두 kernel의 실제 subgroup 사이즈 확인
+- `CL_KERNEL_PRIVATE_MEM_SIZE`, `CL_KERNEL_LOCAL_MEM_SIZE` 비교
+- Snapdragon Profiler trace로 wavefront occupancy + register spill
+
+**미해명 4.6 μs/n_kv 잔존**:
+- B-4 revert 후에도 wall 10.3 vs llama 5.7 = 4.6 μs/n_kv 갭 남음
+- attention 외부 또는 production 환경 효과
+- D path (eviction)이 합리적
+
+### ✗ 최종 기각 가설 (누적, 9개) — A1 결론 정정
+
+1. Zero-copy KV
+2. llm_rs2 내부 HeadMajor/SeqMajor
+3. Flash attn kernel 바이트 정적 분석 (prefill만, Q1 미검증 → cross-run에서 직접 비교)
+4. Launch count / per-launch host work context 비례
+5. "우리 attention이 실제로 더 빠름" (Phase B 결론, A1 일시 부활했다 cross-run에서 다시 확정 기각)
+6. KV stride layout 차이 (HeadMajor 256B vs llama-view 512B)
+7. Production 환경 effects가 진짜 갭 (microbench-best도 느림)
+8. ~~"우리 Q1 kernel이 더 고도화됨" (A1 추정)~~ — **cross-run에서 정반대 확정**
+9. 갭 자체의 phantom 성 → **REJECT, 갭 실재함 + 직접 측정으로 검증**
+
+### ✓ 신규 확정 가설
+
+- **B-4 sub_group_reduce 최적화는 Adreno 830에서 손해** (cross-run direct measurement)
+- 갭의 37% (2.5 μs/n_kv per token)가 우리 Q1 kernel 선택의 직접 손실
+- 즉시 revert로 회수 가능
+
 ### 🚀 다음 세션 엔트리 포인트 (이전 v3, 보존용)
 
 KV stride 가설까지 기각된 시점, 남은 후보를 ROI 순으로:
