@@ -156,6 +156,27 @@ impl SafetensorsSource {
         }
     }
 
+    /// Build a descriptive error for a missing tensor, including a sample of
+    /// names that *are* present in the shard to aid debugging.
+    fn missing_tensor_err(
+        &self,
+        name: &str,
+        shard_idx: usize,
+        inner: impl std::fmt::Display,
+    ) -> anyhow::Error {
+        let sample: Vec<&str> = self.shard_tensors[shard_idx]
+            .names()
+            .iter()
+            .take(5)
+            .copied()
+            .collect();
+        anyhow!(
+            "safetensors missing tensor '{name}' in shard {shard_idx} \
+             (config weight_prefix={:?}); first few names in shard: {sample:?}; inner: {inner}",
+            self.config.weight_prefix
+        )
+    }
+
     /// Load a raw tensor by safetensors name into a GPU-backed tensor.
     ///
     /// `is_weight`: true uses `weight_dtype`, false uses F32.
@@ -177,19 +198,7 @@ impl SafetensorsSource {
         let shard_idx = self.weight_map.get(name).copied().unwrap_or(0);
         let tensor_view = match self.shard_tensors[shard_idx].tensor(name) {
             Ok(v) => v,
-            Err(e) => {
-                let sample: Vec<String> = self.shard_tensors[shard_idx]
-                    .names()
-                    .iter()
-                    .take(5)
-                    .map(|s| (*s).to_string())
-                    .collect();
-                return Err(anyhow!(
-                    "safetensors missing tensor '{name}' in shard {shard_idx} \
-                     (config weight_prefix={:?}); first few names in shard: {sample:?}; inner: {e}",
-                    self.config.weight_prefix
-                ));
-            }
+            Err(e) => return Err(self.missing_tensor_err(name, shard_idx, e)),
         };
         let shape = Shape::new(tensor_view.shape().to_vec());
         let num_elements: usize = tensor_view.shape().iter().product();
@@ -342,19 +351,7 @@ impl SafetensorsSource {
         let shard_idx = self.weight_map.get(name).copied().unwrap_or(0);
         let tensor_view = match self.shard_tensors[shard_idx].tensor(name) {
             Ok(v) => v,
-            Err(e) => {
-                let sample: Vec<String> = self.shard_tensors[shard_idx]
-                    .names()
-                    .iter()
-                    .take(5)
-                    .map(|s| (*s).to_string())
-                    .collect();
-                return Err(anyhow!(
-                    "safetensors missing tensor '{name}' in shard {shard_idx} \
-                     (config weight_prefix={:?}); first few names in shard: {sample:?}; inner: {e}",
-                    self.config.weight_prefix
-                ));
-            }
+            Err(e) => return Err(self.missing_tensor_err(name, shard_idx, e)),
         };
         let shape = Shape::new(tensor_view.shape().to_vec());
         let num_elements: usize = tensor_view.shape().iter().product();
