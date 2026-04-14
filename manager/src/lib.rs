@@ -6,6 +6,8 @@ pub mod emitter;
 pub mod evaluator;
 #[cfg(feature = "lua")]
 pub mod lua_policy;
+#[cfg(feature = "lua")]
+pub use lua_policy::OBSERVATION_DELAY_SECS;
 pub mod monitor;
 #[cfg(feature = "hierarchical")]
 pub mod pi_controller;

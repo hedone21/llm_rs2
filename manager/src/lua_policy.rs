@@ -281,7 +281,7 @@ impl EwmaReliefTable {
     }
 }
 
-const OBSERVATION_DELAY_SECS: f64 = 3.0;
+pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 
 struct ObservationContext {
     action: String,
