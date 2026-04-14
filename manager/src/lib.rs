@@ -1,6 +1,10 @@
 #[cfg(feature = "hierarchical")]
 pub mod action_registry;
 pub mod channel;
+pub mod clock;
+
+// Clock 추상화 공개 타입 re-export
+pub use clock::{Clock, LogicalInstant, SystemClock};
 pub mod config;
 pub mod emitter;
 pub mod evaluator;
