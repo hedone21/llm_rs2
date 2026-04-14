@@ -96,6 +96,8 @@ numeric, ~650s).
 
 **CPU backend**: `--backend cpu`도 안정적 (40/40 numeric, ~450s).
 
+**NVIDIA GPU + 배치 분할**: `scripts/eval_ll_batched.py`로 chunk당 프로세스를 재시작하여 드라이버 누적 회피. 40/40 numeric, ~260s (CPU 대비 43% 단축). 상세 가이드: `docs/gemma3_4b_nvidia_batched_eval_guide.md`.
+
 ## Impact
 
 - 호스트 개발 환경에서 4B 대규모 eval-ll이 NVIDIA GPU로 안 돌아간다는 제약.

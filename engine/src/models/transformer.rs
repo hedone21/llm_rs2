@@ -91,6 +91,11 @@ pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub logits_out: &'a mut Tensor,
     pub x_gen: Option<&'a mut Tensor>,
     pub workspace: Option<&'a mut LayerWorkspace>,
+    /// Pre-allocated prefill workspace (caller-owned, max_seq_len-sized).
+    /// When `Some`, `forward_into` reuses it instead of allocating a fresh one
+    /// for each prefill call. Essential on NVIDIA OpenCL where repeated
+    /// alloc/free cycles accumulate deferred-release pressure (→ CL_OUT_OF_RESOURCES).
+    pub prefill_workspace: Option<&'a mut crate::layers::workspace::PrefillWorkspace>,
     /// Optional attention score accumulator for H2O-style eviction.
     /// When active, post-softmax scores are captured from tracked layers.
     pub score_accumulator: Option<&'a mut AttentionScoreAccumulator>,
@@ -699,11 +704,17 @@ impl TransformerModel {
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
-        // Use caller-provided prefill workspace or create one for this call.
-        let mut prefill_ws: Option<crate::layers::workspace::PrefillWorkspace> = None;
+        // Prefill workspace: prefer caller-provided (pre-allocated at max_seq_len,
+        // reused across calls), fall back to allocating one for this call.
+        //
+        // Caller reuse eliminates ~10 GPU buffer alloc/release cycles per prefill,
+        // which is critical on NVIDIA OpenCL where deferred release pressure
+        // accumulates and eventually triggers CL_OUT_OF_RESOURCES.
+        let caller_prefill_ws = args.prefill_workspace;
+        let mut owned_prefill_ws: Option<crate::layers::workspace::PrefillWorkspace> = None;
         let no_prefill_ws = std::env::var("LLM_NO_PREFILL_WS").is_ok();
         let mut needs_ws_sync = false; // synchronize before owned_prefill_ws drop
-        if seq_len > 1 && backend.is_gpu() && !no_prefill_ws {
+        if caller_prefill_ws.is_none() && seq_len > 1 && backend.is_gpu() && !no_prefill_ws {
             use crate::layers::workspace::{PrefillWorkspace, WorkspaceConfig as WsCfg};
             let ws_cfg = WsCfg {
                 batch_size,
@@ -715,9 +726,13 @@ impl TransformerModel {
                 n_heads: self.config.num_attention_heads,
                 max_seq_len: 0,
             };
-            prefill_ws = PrefillWorkspace::new(&ws_cfg, seq_len, memory, backend.clone()).ok();
-            needs_ws_sync = prefill_ws.is_some();
+            owned_prefill_ws =
+                PrefillWorkspace::new(&ws_cfg, seq_len, memory, backend.clone()).ok();
+            needs_ws_sync = owned_prefill_ws.is_some();
         }
+        // Unified handle: caller-provided wins, otherwise owned (if created).
+        let mut prefill_ws: Option<&mut crate::layers::workspace::PrefillWorkspace> =
+            caller_prefill_ws.or(owned_prefill_ws.as_mut());
 
         // Check if GPU-side score accumulator is active.
         // When active, attention_gen writes scores to a persistent GPU buffer and
@@ -770,7 +785,7 @@ impl TransformerModel {
             // carrying prefill_ws through LayerForwardArgs (which changes the
             // struct layout and triggers ARM64 codegen regression — see ae62391).
             if seq_len > 1 {
-                if let Some(ref mut pws) = prefill_ws {
+                if let Some(pws) = prefill_ws.as_deref_mut() {
                     let dim = hidden_size;
                     layer.forward_prefill(
                         &mut x,
