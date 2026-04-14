@@ -315,6 +315,8 @@ impl EngineState_ {
             prefill_pos: 0,
             prefill_total: 0,
             partition_ratio: 0.0,
+            self_cpu_pct: 0.0,
+            self_gpu_pct: 0.0,
         }
     }
 }

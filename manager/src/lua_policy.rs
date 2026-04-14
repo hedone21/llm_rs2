@@ -414,6 +414,9 @@ impl LuaPolicy {
             engine_tbl.set("prefill_pos", status.prefill_pos)?;
             engine_tbl.set("prefill_total", status.prefill_total)?;
             engine_tbl.set("partition_ratio", status.partition_ratio)?;
+            // MGR-DAT-075/076, MSG-069: Engine process 자가 사용률 (Phase 1: CPU만 실측, GPU는 0.0 placeholder).
+            engine_tbl.set("cpu_pct", status.self_cpu_pct)?;
+            engine_tbl.set("gpu_pct", status.self_gpu_pct)?;
         } else {
             // No heartbeat yet -- provide defaults
             engine_tbl.set("device", "unknown")?;
@@ -429,6 +432,9 @@ impl LuaPolicy {
             engine_tbl.set("prefill_pos", 0)?;
             engine_tbl.set("prefill_total", 0)?;
             engine_tbl.set("partition_ratio", 0.0)?;
+            // MGR-DAT-075/076, MSG-069: heartbeat 없을 때 0.0 default (INV-092).
+            engine_tbl.set("cpu_pct", 0.0)?;
+            engine_tbl.set("gpu_pct", 0.0)?;
         }
         ctx.set("engine", engine_tbl)?;
 
@@ -1347,6 +1353,8 @@ mod tests {
             prefill_pos: 0,
             prefill_total: 0,
             partition_ratio: 0.0,
+            self_cpu_pct: 0.0,
+            self_gpu_pct: 0.0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
@@ -1394,6 +1402,8 @@ mod tests {
             prefill_pos: 0,
             prefill_total: 0,
             partition_ratio: 0.0,
+            self_cpu_pct: 0.0,
+            self_gpu_pct: 0.0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
@@ -1716,6 +1726,8 @@ mod tests {
             prefill_pos: 200,
             prefill_total: 1000,
             partition_ratio: 0.0,
+            self_cpu_pct: 0.0,
+            self_gpu_pct: 0.0,
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 

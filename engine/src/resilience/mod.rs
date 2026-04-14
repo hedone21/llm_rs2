@@ -1,5 +1,6 @@
 pub mod executor;
 pub mod manager;
+pub mod proc_self_meter;
 pub mod signal;
 pub mod state;
 pub mod strategy;

@@ -306,6 +306,15 @@ pub struct EngineStatus {
     /// Current tensor partition GPU ratio (0.0 = disabled).
     #[serde(default)]
     pub partition_ratio: f32,
+    /// Engine process 자신의 CPU 사용률 (MSG-060 #17, MSG-067). `/proc/self/stat`의
+    /// (utime+stime) delta / (CLK_TCK × num_cpus × elapsed). 측정 실패 시 0.0.
+    /// 값 범위는 송출 직전 [0.0, 1.0]로 clamp 된다 (INV-091, INV-092).
+    #[serde(default)]
+    pub self_cpu_pct: f64,
+    /// Engine process 자신의 GPU 사용률 (MSG-060 #18, MSG-068). Phase 1에서는 항상 0.0
+    /// placeholder이며 Phase 2에서 OpenCL profiling 기반 실측으로 재정의된다.
+    #[serde(default)]
+    pub self_gpu_pct: f64,
 }
 
 /// Result of executing a single command.
@@ -728,6 +737,8 @@ mod tests {
             prefill_pos: 0,
             prefill_total: 0,
             partition_ratio: 0.0,
+            self_cpu_pct: 0.0,
+            self_gpu_pct: 0.0,
         }
     }
 

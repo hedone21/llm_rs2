@@ -116,6 +116,8 @@ fn test_inv_081_engine_message_all_variants_json() {
         prefill_pos: 0,
         prefill_total: 0,
         partition_ratio: 0.0,
+        self_cpu_pct: 0.0,
+        self_gpu_pct: 0.0,
     });
     let json = serde_json::to_string(&hb).unwrap();
     let back: EngineMessage = serde_json::from_str(&json).unwrap();

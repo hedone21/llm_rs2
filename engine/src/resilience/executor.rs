@@ -6,6 +6,8 @@ use llm_shared::{
     EngineStatus, ManagerMessage, QcfEstimate, ResourceLevel,
 };
 
+use crate::resilience::proc_self_meter::ProcSelfMeter;
+
 // ── Public types ────────────────────────────────────────────
 
 /// Plan produced by CommandExecutor::poll() for the inference loop to execute.
@@ -126,6 +128,9 @@ pub struct CommandExecutor {
     // Heartbeat
     last_heartbeat: Instant,
     heartbeat_interval: Duration,
+
+    // Engine self-util (MSG-067): /proc/self/stat 기반 자가 CPU 사용률 measurer.
+    proc_meter: ProcSelfMeter,
 }
 
 impl CommandExecutor {
@@ -156,6 +161,7 @@ impl CommandExecutor {
             tokens_generated: 0,
             last_heartbeat: Instant::now(),
             heartbeat_interval,
+            proc_meter: ProcSelfMeter::new(),
         }
     }
 
@@ -438,7 +444,7 @@ impl CommandExecutor {
         }
     }
 
-    fn send_heartbeat(&self, kv_snap: &KVSnapshot) {
+    fn send_heartbeat(&mut self, kv_snap: &KVSnapshot) {
         let utilization = if kv_snap.capacity > 0 {
             kv_snap.total_tokens as f32 / kv_snap.capacity as f32
         } else {
@@ -484,6 +490,10 @@ impl CommandExecutor {
             prefill_pos: self.prefill_pos,
             prefill_total: self.prefill_total,
             partition_ratio: self.partition_ratio,
+            // MSG-067: /proc/self/stat 기반 자가 CPU 사용률. 측정 실패 시 0.0 (INV-092).
+            self_cpu_pct: self.proc_meter.sample(),
+            // MSG-068: Phase 1 placeholder. Phase 2에서 OpenCL profiling 기반 실측.
+            self_gpu_pct: 0.0,
         };
 
         let _ = self.resp_tx.send(EngineMessage::Heartbeat(status));
