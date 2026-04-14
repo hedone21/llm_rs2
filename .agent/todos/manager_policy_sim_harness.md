@@ -64,6 +64,16 @@
 - [x] `docs/42_policy_simulator_guide.md` — 14개 섹션 사용 가이드
 - [x] smoke 테스트 2개 (`test_s25_galaxy_preset_loads_and_initial_state_correct`, `test_s25_galaxy_preset_runs_with_lua_policy`)
 
+## 남은 후속 작업 우선순위
+
+1. **높음 — Calibration 자동화**: `s25_galaxy.yaml`의 14개 TODO(K) 추정치를 실기 측정값으로 교체하는 도구. 시뮬레이터 신뢰도를 실기와 연결하는 유일한 경로.
+2. **중간 — 60s 초과 lazy re-inject**: 장기 thermal drift 시나리오 작성 가능.
+3. **낮음 — FPS helper 잔여 `Instant` 정리 (Clock PR 5)**: 테스트 정확도 영향 없음, 아키텍처 일관성 용도.
+
+### 스코프 제외
+
+- **HierarchicalPolicy Clock 주입 (Clock PR 4)**: HierarchicalPolicy 실사용 계획 없음으로 확정 (2026-04-14). 교차 검증 필요 시 재검토.
+
 ## 재사용 대상
 
 - `manager/src/pipeline.rs:20-44` — PolicyStrategy trait

@@ -232,9 +232,7 @@ pub fn apply_actions(
                 // Set 효과의 max: target 후보 중 최대값
                 values.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
             }
-            CompositionOp::Min => {
-                values.iter().cloned().fold(f64::INFINITY, f64::min)
-            }
+            CompositionOp::Min => values.iter().cloned().fold(f64::INFINITY, f64::min),
         };
 
         let new_val = lag_step(current, target, tau_s, dt_s);

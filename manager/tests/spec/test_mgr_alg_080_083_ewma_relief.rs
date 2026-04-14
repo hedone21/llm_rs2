@@ -861,12 +861,7 @@ mod ewma_tests {
             entry2.observation_count, expected_count,
             "observation_count 보존 실패"
         );
-        for (i, (&r2, &exp)) in entry2
-            .relief
-            .iter()
-            .zip(expected_relief.iter())
-            .enumerate()
-        {
+        for (i, (&r2, &exp)) in entry2.relief.iter().zip(expected_relief.iter()).enumerate() {
             assert!(
                 (r2 - exp).abs() < TOL,
                 "dim[{}] round-trip 실패: {} vs {}",
