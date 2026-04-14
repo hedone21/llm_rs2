@@ -6,6 +6,7 @@
 //! Phase 4: harness, trajectory, mock_policy 추가.
 
 pub mod clock;
+pub mod clock_adapter;
 pub mod compose;
 pub mod config;
 pub mod derived;

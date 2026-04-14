@@ -10,11 +10,14 @@
 
 #![allow(dead_code)]
 
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use llm_shared::{EngineCommand, EngineDirective};
 
 use super::clock::{EventKind, VirtualClock};
+use super::clock_adapter::VirtualClockHandle;
 use super::config::ScenarioConfig;
 use super::expr::ExprContext;
 use super::noise::NoiseRng;
@@ -65,7 +68,7 @@ impl From<physics::SimError> for SimError {
 ///
 /// 생성 후 `run_for` 또는 `run_until`로 실행하고, `trajectory()`로 결과를 검사한다.
 pub struct Simulator {
-    pub clock: VirtualClock,
+    pub clock: Arc<Mutex<VirtualClock>>,
     pub state: PhysicalState,
     pub engine: EngineStateModel,
     pub cfg: ScenarioConfig,
@@ -84,7 +87,7 @@ impl Simulator {
         let rng = cfg.rng_seed.map(NoiseRng::new);
         let ctx = ExprContext::new();
         Self {
-            clock: VirtualClock::new(),
+            clock: Arc::new(Mutex::new(VirtualClock::new())),
             state,
             engine,
             cfg,
@@ -94,6 +97,52 @@ impl Simulator {
             tick_dt: Duration::from_millis(50),
             ctx,
         }
+    }
+
+    /// LuaPolicy + VirtualClockHandle 자동 배선 헬퍼.
+    ///
+    /// `LuaPolicy`가 시뮬레이터의 가상 시계와 동일한 Arc를 공유하므로,
+    /// `advance()`가 반영된 논리 시각으로 관측 지연 계산이 이루어진다.
+    #[cfg(feature = "lua")]
+    pub fn with_lua_policy(
+        cfg: ScenarioConfig,
+        script_path: impl AsRef<Path>,
+        adaptation_config: llm_manager::config::AdaptationConfig,
+    ) -> Result<Self, SimError> {
+        let clock = Arc::new(Mutex::new(VirtualClock::new()));
+        let handle = VirtualClockHandle::new(Arc::clone(&clock));
+        let policy = llm_manager::lua_policy::LuaPolicy::new(
+            script_path
+                .as_ref()
+                .to_str()
+                .ok_or_else(|| SimError::Policy {
+                    phase: "init".into(),
+                    err: "invalid script path".into(),
+                })?,
+            adaptation_config,
+            Arc::new(handle),
+        )
+        .map_err(|e| SimError::Policy {
+            phase: "init".into(),
+            err: e.to_string(),
+        })?;
+
+        let state = PhysicalState::from_config(&cfg.initial_state);
+        let engine = EngineStateModel::from_config(&cfg.initial_state);
+        let rng = cfg.rng_seed.map(NoiseRng::new);
+        let ctx = ExprContext::new();
+
+        Ok(Self {
+            clock,
+            state,
+            engine,
+            cfg,
+            policy: Box::new(policy),
+            trajectory: Trajectory::new(),
+            rng,
+            tick_dt: Duration::from_millis(50),
+            ctx,
+        })
     }
 
     /// tick 크기 변경 (기본 50ms).
@@ -113,7 +162,7 @@ impl Simulator {
 
     /// `until` 시각까지 주기 이벤트를 프리로드한다.
     fn preload_events(&mut self, until: Duration) {
-        let now = self.clock.now();
+        let now = self.clock.lock().unwrap().now();
 
         // 이미 스케줄된 이벤트의 최대 시각 계산 (중복 스케줄 방지)
         // 현재는 단순히 now ~ until 구간을 채운다.
@@ -121,7 +170,7 @@ impl Simulator {
 
         let hb_interval = Duration::from_secs_f64(self.cfg.observation.heartbeat.interval_s);
         schedule_periodic_from(
-            &mut self.clock,
+            &mut *self.clock.lock().unwrap(),
             || EventKind::Heartbeat,
             now,
             hb_interval,
@@ -131,7 +180,7 @@ impl Simulator {
         let mem_period =
             Duration::from_secs_f64(self.cfg.observation.signals.memory.poll_interval_s);
         schedule_periodic_from(
-            &mut self.clock,
+            &mut *self.clock.lock().unwrap(),
             || EventKind::SignalMemory,
             now,
             mem_period,
@@ -141,7 +190,7 @@ impl Simulator {
         let cpu_period =
             Duration::from_secs_f64(self.cfg.observation.signals.compute.poll_interval_s);
         schedule_periodic_from(
-            &mut self.clock,
+            &mut *self.clock.lock().unwrap(),
             || EventKind::SignalCompute,
             now,
             cpu_period,
@@ -151,7 +200,7 @@ impl Simulator {
         let therm_period =
             Duration::from_secs_f64(self.cfg.observation.signals.thermal.poll_interval_s);
         schedule_periodic_from(
-            &mut self.clock,
+            &mut *self.clock.lock().unwrap(),
             || EventKind::SignalThermal,
             now,
             therm_period,
@@ -161,7 +210,7 @@ impl Simulator {
         let energy_period =
             Duration::from_secs_f64(self.cfg.observation.signals.energy.poll_interval_s);
         schedule_periodic_from(
-            &mut self.clock,
+            &mut *self.clock.lock().unwrap(),
             || EventKind::SignalEnergy,
             now,
             energy_period,
@@ -175,10 +224,14 @@ impl Simulator {
 
             if t_start > now && t_start <= until {
                 self.clock
+                    .lock()
+                    .unwrap()
                     .schedule(EventKind::ExternalInjectionStart(idx), t_start);
             }
             if t_end > now && t_end <= until {
                 self.clock
+                    .lock()
+                    .unwrap()
                     .schedule(EventKind::ExternalInjectionEnd(idx), t_end);
             }
         }
@@ -190,8 +243,8 @@ impl Simulator {
 
     /// 1회 tick 실행.
     pub fn tick(&mut self) -> Result<(), SimError> {
-        let tick_end = self.clock.now() + self.tick_dt;
-        let events = self.clock.drain_until(tick_end);
+        let tick_end = self.clock.lock().unwrap().now() + self.tick_dt;
+        let events = self.clock.lock().unwrap().drain_until(tick_end);
 
         for event in &events {
             let at = event.at;
@@ -254,21 +307,24 @@ impl Simulator {
         }
 
         // physics step (clock.advance 이전에 호출)
-        physics::step(
-            &mut self.state,
-            &self.engine,
-            &self.cfg,
-            &self.clock,
-            self.tick_dt,
-            &mut self.ctx,
-        )?;
+        {
+            let vc = self.clock.lock().unwrap();
+            physics::step(
+                &mut self.state,
+                &self.engine,
+                &self.cfg,
+                &*vc,
+                self.tick_dt,
+                &mut self.ctx,
+            )?;
+        }
 
         // state snapshot 기록
         self.trajectory
             .record_state_snapshot(tick_end, &self.state, &self.engine);
 
         // clock advance
-        self.clock.advance(self.tick_dt);
+        self.clock.lock().unwrap().advance(self.tick_dt);
 
         Ok(())
     }
@@ -279,10 +335,10 @@ impl Simulator {
 
     /// 지정 기간 실행한다.
     pub fn run_for(&mut self, duration: Duration) -> Result<(), SimError> {
-        let end = self.clock.now() + duration;
+        let end = self.clock.lock().unwrap().now() + duration;
         self.preload_events(end);
 
-        while self.clock.now() < end {
+        while self.clock.lock().unwrap().now() < end {
             self.tick()?;
         }
         Ok(())
@@ -296,15 +352,15 @@ impl Simulator {
     ) -> Result<(), SimError> {
         // run_until은 종료 시각을 모르므로 horizon을 60s로 설정한다.
         const HORIZON: Duration = Duration::from_secs(60);
-        let until = self.clock.now() + max.min(HORIZON);
+        let until = self.clock.lock().unwrap().now() + max.min(HORIZON);
         self.preload_events(until);
 
-        let end = self.clock.now() + max;
+        let end = self.clock.lock().unwrap().now() + max;
         loop {
             if predicate(self) {
                 return Ok(());
             }
-            if self.clock.now() >= end {
+            if self.clock.lock().unwrap().now() >= end {
                 return Err(SimError::MaxDurationExceeded);
             }
             self.tick()?;
@@ -322,9 +378,9 @@ impl Simulator {
         // observable action이면 ObservationDue 이벤트 스케줄
         for cmd in &dir.commands {
             if let Some(action_name) = observable_action_name(cmd) {
-                let recorded_at = self.clock.now();
+                let recorded_at = self.clock.lock().unwrap().now();
                 let due_at = recorded_at + OBSERVATION_DELAY;
-                self.clock.schedule(
+                self.clock.lock().unwrap().schedule(
                     EventKind::ObservationDue {
                         action: action_name,
                         recorded_at,

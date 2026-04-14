@@ -294,7 +294,8 @@ fn create_lua_policy(
     let path_str = script_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in policy script path"))?;
-    let policy = llm_manager::lua_policy::LuaPolicy::new(path_str, config.adaptation.clone())?;
+    let policy =
+        llm_manager::lua_policy::LuaPolicy::with_system_clock(path_str, config.adaptation.clone())?;
     log::info!("LuaPolicy initialized from {}", path_str);
     Ok(Box::new(policy))
 }

@@ -34,7 +34,8 @@ fn write_script(body: &str) -> tempfile::NamedTempFile {
 
 fn new_policy(script: &str) -> (LuaPolicy, tempfile::NamedTempFile) {
     let f = write_script(script);
-    let p = LuaPolicy::new(f.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+    let p = LuaPolicy::with_system_clock(f.path().to_str().unwrap(), AdaptationConfig::default())
+        .unwrap();
     (p, f)
 }
 

@@ -56,7 +56,7 @@ fn format_relief(
 #[cfg(feature = "lua")]
 #[test]
 fn scenario_memory_pressure_steady() {
-    use llm_manager::{config::AdaptationConfig, lua_policy::LuaPolicy};
+    use llm_manager::config::AdaptationConfig;
 
     let scenario_path = scenarios_dir().join("memory_pressure_steady.yaml");
     let lua_path = lua_dir().join("memory_evict_graduated.lua");
@@ -66,13 +66,8 @@ fn scenario_memory_pressure_steady() {
     let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
     let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
 
-    let policy = LuaPolicy::new(
-        lua_path.to_str().expect("lua path to str"),
-        AdaptationConfig::default(),
-    )
-    .expect("LuaPolicy 생성 실패");
-
-    let mut sim = Simulator::new(cfg, Box::new(policy));
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, AdaptationConfig::default())
+        .expect("Simulator::with_lua_policy 생성 실패");
     sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
 
     let summary = TrajectorySummary::from_trajectory(sim.trajectory(), cpu_max, gpu_max);
@@ -146,7 +141,7 @@ fn scenario_memory_pressure_steady() {
 #[cfg(feature = "lua")]
 #[test]
 fn scenario_thermal_ramp_with_decode() {
-    use llm_manager::{config::AdaptationConfig, lua_policy::LuaPolicy};
+    use llm_manager::config::AdaptationConfig;
 
     let scenario_path = scenarios_dir().join("thermal_ramp_with_decode.yaml");
     let lua_path = lua_dir().join("thermal_switch_backend.lua");
@@ -156,13 +151,8 @@ fn scenario_thermal_ramp_with_decode() {
     let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
     let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
 
-    let policy = LuaPolicy::new(
-        lua_path.to_str().expect("lua path to str"),
-        AdaptationConfig::default(),
-    )
-    .expect("LuaPolicy 생성 실패");
-
-    let mut sim = Simulator::new(cfg, Box::new(policy));
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, AdaptationConfig::default())
+        .expect("Simulator::with_lua_policy 생성 실패");
     sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
 
     let summary = TrajectorySummary::from_trajectory(sim.trajectory(), cpu_max, gpu_max);
@@ -236,7 +226,7 @@ fn scenario_thermal_ramp_with_decode() {
 #[cfg(feature = "lua")]
 #[test]
 fn scenario_partition_contention() {
-    use llm_manager::{config::AdaptationConfig, lua_policy::LuaPolicy};
+    use llm_manager::config::AdaptationConfig;
 
     let scenario_path = scenarios_dir().join("partition_contention.yaml");
     let lua_path = lua_dir().join("partition_adaptive.lua");
@@ -246,13 +236,8 @@ fn scenario_partition_contention() {
     let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
     let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
 
-    let policy = LuaPolicy::new(
-        lua_path.to_str().expect("lua path to str"),
-        AdaptationConfig::default(),
-    )
-    .expect("LuaPolicy 생성 실패");
-
-    let mut sim = Simulator::new(cfg, Box::new(policy));
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, AdaptationConfig::default())
+        .expect("Simulator::with_lua_policy 생성 실패");
     sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
 
     let summary = TrajectorySummary::from_trajectory(sim.trajectory(), cpu_max, gpu_max);
@@ -327,7 +312,7 @@ fn scenario_partition_contention() {
 #[cfg(feature = "lua")]
 #[test]
 fn scenario_memory_and_thermal_combined() {
-    use llm_manager::{config::AdaptationConfig, lua_policy::LuaPolicy};
+    use llm_manager::config::AdaptationConfig;
 
     let baseline_path = fixtures_dir().join("baseline.yaml");
     let lua_path = lua_dir().join("memory_and_thermal_combined.lua");
@@ -344,13 +329,8 @@ fn scenario_memory_and_thermal_combined() {
     let cpu_max = cfg.initial_state.cpu_max_freq_mhz as f64;
     let gpu_max = cfg.initial_state.gpu_max_freq_mhz as f64;
 
-    let policy = LuaPolicy::new(
-        lua_path.to_str().expect("lua path to str"),
-        AdaptationConfig::default(),
-    )
-    .expect("LuaPolicy 생성 실패");
-
-    let mut sim = Simulator::new(cfg, Box::new(policy));
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, AdaptationConfig::default())
+        .expect("Simulator::with_lua_policy 생성 실패");
     sim.run_for(Duration::from_secs(20)).expect("20s 실행 실패");
 
     let summary = TrajectorySummary::from_trajectory(sim.trajectory(), cpu_max, gpu_max);
@@ -432,5 +412,36 @@ fn scenario_memory_and_thermal_combined() {
     assert!(
         sim.trajectory().signal_count_by_kind("thermal_alert") >= 1,
         "thermal_alert signal이 기록되어야 함"
+    );
+}
+
+// ─────────────────────────────────────────────────────────
+// relief_snapshot 비공허 검증 (PR 2+3 핵심 회귀 테스트)
+// ─────────────────────────────────────────────────────────
+
+/// VirtualClockHandle이 LuaPolicy에 주입되어 30s 시뮬에서 relief가 실제로 학습되는지 검증.
+/// 이전에는 wall-clock 기반 observation이 ~100ms 안에 끝나는 harness에서 3s delay를
+/// 충족하지 못해 relief_snapshot이 항상 공허했다.
+#[cfg(feature = "lua")]
+#[test]
+fn scenario_partition_contention_produces_non_empty_relief() {
+    use llm_manager::config::AdaptationConfig;
+
+    let scenario_path = scenarios_dir().join("partition_contention.yaml");
+    let lua_path = lua_dir().join("partition_adaptive.lua");
+
+    let cfg = load_scenario(&scenario_path).unwrap_or_else(|e| panic!("시나리오 로드 실패: {e}"));
+
+    let mut sim = Simulator::with_lua_policy(cfg, &lua_path, AdaptationConfig::default())
+        .expect("Simulator::with_lua_policy 생성 실패");
+    sim.run_for(Duration::from_secs(30)).expect("30s 실행 실패");
+
+    let relief = sim
+        .policy
+        .relief_snapshot()
+        .expect("LuaPolicy는 Some을 반환해야 함");
+    assert!(
+        !relief.is_empty(),
+        "30s 시뮬 후 relief_snapshot이 비어있지 않아야 함 (VirtualClockHandle이 3s 관측 지연을 충족해야 함)"
     );
 }

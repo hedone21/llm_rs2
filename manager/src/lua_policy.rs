@@ -19,6 +19,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use crate::clock::{Clock, LogicalInstant, SystemClock};
 use crate::config::{AdaptationConfig, TriggerConfig};
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
@@ -294,7 +295,7 @@ pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 struct ObservationContext {
     action: String,
     before: Pressure6D,
-    timestamp: Instant,
+    timestamp: LogicalInstant,
 }
 
 /// Lua-based policy strategy.
@@ -311,6 +312,7 @@ pub struct LuaPolicy {
     relief_table: EwmaReliefTable,
     observation: Option<ObservationContext>,
     adaptation_config: AdaptationConfig,
+    clock: Arc<dyn Clock>,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -328,7 +330,14 @@ impl LuaPolicy {
     ///
     /// The script must define a global `decide(ctx)` function.
     /// `sys.*` helper functions are registered before the script is evaluated.
-    pub fn new(script_path: &str, config: AdaptationConfig) -> anyhow::Result<Self> {
+    ///
+    /// `clock`은 관측 지연 계산에 사용된다. Production은 `SystemClock`, 테스트/시뮬레이터는
+    /// `VirtualClockHandle`을 주입한다.
+    pub fn new(
+        script_path: &str,
+        config: AdaptationConfig,
+        clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
         // Sandbox: only table + string + math (no io, os, debug, etc.)
         // Safety: we intentionally restrict stdlib to TABLE | STRING | MATH.
         // unsafe_new_with is required because mlua considers any stdlib subset
@@ -393,7 +402,13 @@ impl LuaPolicy {
             relief_table,
             observation: None,
             adaptation_config: config,
+            clock,
         })
+    }
+
+    /// Production 기본 생성자 — SystemClock을 자동 주입한다.
+    pub fn with_system_clock(script_path: &str, config: AdaptationConfig) -> anyhow::Result<Self> {
+        Self::new(script_path, config, Arc::new(SystemClock::new()))
     }
 
     /// Build the `ctx` Lua table from current engine state.
@@ -560,7 +575,8 @@ impl LuaPolicy {
             None => return,
         };
 
-        if obs.timestamp.elapsed().as_secs_f64() < OBSERVATION_DELAY_SECS {
+        let elapsed = self.clock.now().saturating_duration_since(obs.timestamp);
+        if elapsed.as_secs_f64() < OBSERVATION_DELAY_SECS {
             self.observation = Some(obs);
             return;
         }
@@ -671,7 +687,7 @@ impl PolicyStrategy for LuaPolicy {
                 self.observation = Some(ObservationContext {
                     action: action_name,
                     before: pressure,
-                    timestamp: Instant::now(),
+                    timestamp: self.clock.now(),
                 });
             } else {
                 self.observation = None;
@@ -1093,8 +1109,11 @@ mod tests {
     #[test]
     fn test_empty_decide() {
         let script = create_temp_script("function decide(ctx) return {} end");
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert!(cmds.is_empty());
     }
@@ -1102,8 +1121,11 @@ mod tests {
     #[test]
     fn test_nil_decide() {
         let script = create_temp_script("function decide(ctx) return nil end");
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert!(cmds.is_empty());
     }
@@ -1115,8 +1137,11 @@ mod tests {
                 return {{type = "throttle", delay_ms = 50}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1132,8 +1157,11 @@ mod tests {
                 return {{type = "set_target_tbt", target_ms = 150}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1149,8 +1177,11 @@ mod tests {
                 return {{type = "layer_skip", skip_ratio = 0.25}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1168,8 +1199,11 @@ mod tests {
                 return {{type = "kv_evict_h2o", keep_ratio = 0.5}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1187,8 +1221,11 @@ mod tests {
                 return {{type = "kv_evict_sliding", keep_ratio = 0.6}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1206,8 +1243,11 @@ mod tests {
                 return {{type = "kv_streaming", sink_size = 4, window_size = 512}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1229,8 +1269,11 @@ mod tests {
                 return {{type = "kv_merge_d2o", keep_ratio = 0.75}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1248,8 +1291,11 @@ mod tests {
                 return {{type = "kv_quant_dynamic", target_bits = 4}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1265,8 +1311,11 @@ mod tests {
                 return {{type = "switch_hw", device = "cpu"}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1282,8 +1331,11 @@ mod tests {
                 return {{type = "restore_defaults"}}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::RestoreDefaults));
@@ -1299,8 +1351,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], EngineCommand::Suspend));
@@ -1317,8 +1372,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], EngineCommand::KvEvictH2o { .. }));
@@ -1336,8 +1394,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let mut policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
 
         // No heartbeat yet -- kv_util defaults to 0.0
         let cmds = policy.call_decide();
@@ -1385,8 +1446,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let mut policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
 
         // No heartbeat -> empty active
         let cmds = policy.call_decide();
@@ -1431,8 +1495,11 @@ mod tests {
                 error("intentional error")
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert!(cmds.is_empty());
     }
@@ -1447,8 +1514,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         // Unknown action is skipped, throttle is kept
         assert_eq!(cmds.len(), 1);
@@ -1458,7 +1528,10 @@ mod tests {
     #[test]
     fn test_missing_decide_function() {
         let script = create_temp_script("-- no decide function");
-        let result = LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default());
+        let result = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        );
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("decide"));
@@ -1471,8 +1544,11 @@ mod tests {
                 return {{type = "throttle", delay_ms = 100}}
             end"#,
         );
-        let mut policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let signal = SystemSignal::MemoryPressure {
             level: llm_shared::Level::Warning,
             available_bytes: 1_000_000,
@@ -1489,8 +1565,11 @@ mod tests {
     #[test]
     fn test_process_signal_returns_none_for_empty() {
         let script = create_temp_script("function decide(ctx) return {} end");
-        let mut policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let signal = SystemSignal::MemoryPressure {
             level: llm_shared::Level::Normal,
             available_bytes: 7_000_000,
@@ -1514,8 +1593,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
 
         // First two calls return empty
         assert!(policy.call_decide().is_empty());
@@ -1533,8 +1615,11 @@ mod tests {
     #[test]
     fn test_mode_returns_normal() {
         let script = create_temp_script("function decide(ctx) return {} end");
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         assert_eq!(policy.mode(), OperatingMode::Normal);
     }
 
@@ -1550,8 +1635,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         // On any Linux host, total should be > 0
         assert_eq!(cmds.len(), 1);
@@ -1568,8 +1656,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
     }
@@ -1585,8 +1676,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
     }
@@ -1600,8 +1694,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1621,8 +1718,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1649,8 +1749,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1677,8 +1780,11 @@ mod tests {
                 }
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
@@ -1709,8 +1815,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let mut policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
 
         // No heartbeat yet — phase defaults to ""
         let cmds = policy.call_decide();
@@ -1767,8 +1876,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 1 }));
@@ -1788,8 +1900,11 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy =
-            LuaPolicy::new(script.path().to_str().unwrap(), AdaptationConfig::default()).unwrap();
+        let policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
         let cmds = policy.call_decide();
         assert_eq!(cmds.len(), 1);
     }
@@ -2013,7 +2128,8 @@ mod tests {
             ..AdaptationConfig::default()
         };
 
-        let mut policy = LuaPolicy::new(script_path.to_str().unwrap(), config).unwrap();
+        let mut policy =
+            LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
 
         let signal = SystemSignal::ComputeGuidance {
             level: llm_shared::Level::Warning,
@@ -2047,7 +2163,8 @@ mod tests {
         std::fs::write(&script_path, script).unwrap();
 
         let config = AdaptationConfig::default();
-        let mut policy = LuaPolicy::new(script_path.to_str().unwrap(), config).unwrap();
+        let mut policy =
+            LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
 
         // Memory pressure: available=1MB / total=8MB = 87.5% used > 80% enter
         let signal = SystemSignal::MemoryPressure {

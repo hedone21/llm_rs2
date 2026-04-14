@@ -373,8 +373,8 @@ end
     std::fs::write(script_file.path(), lua_script).expect("write lua");
 
     let script_path = script_file.path().to_str().expect("path to str");
-    let lua_policy = LuaPolicy::new(script_path, AdaptationConfig::default())
-        .expect("LuaPolicy::new should succeed");
+    let lua_policy = LuaPolicy::with_system_clock(script_path, AdaptationConfig::default())
+        .expect("LuaPolicy::with_system_clock should succeed");
 
     let mut cfg = load_baseline();
     // memory_used를 경고 수준으로 높임 (total=8192, used=7500 → available≈8.5% → Critical)
