@@ -908,3 +908,45 @@ flowchart LR
 - `engine/src/core/kv_cache.rs` — KV cache 로직 변경 없음
 - `engine/src/core/pressure/` — eviction pipeline 변경 없음
 - `engine/src/bin/generate.rs` — CLI 인터페이스 변경 불필요 (동일 바이너리로 지원)
+
+---
+
+## 9. Gemma 3 4B 지원 추가 (2026-04-14)
+
+Gemma 3 4B (`google/gemma-3-4b-it`) 지원 확장. 1B 설계(섹션 1~8)를 재사용하며 다음 차이점만 반영한다.
+
+### 9.1 모델 스펙 차이
+
+| 항목 | Gemma 3 1B | Gemma 3 4B |
+|------|-----------|-----------|
+| hidden_size | 1152 | 2560 |
+| num_hidden_layers | 26 | 34 |
+| num_attention_heads (Q) | 4 | 8 |
+| num_key_value_heads (KV) | 1 | 4 |
+| head_dim | 256 | 256 |
+| intermediate_size | 6912 | 10240 |
+| vocab_size | 262144 | 262144 |
+| max_position_embeddings | 32768 | 131072 |
+| weight 파일 | 단일 safetensors | 2-shard safetensors |
+| config 래퍼 | 없음 (flat) | 있음 (`Gemma3ForConditionalGeneration` + `text_config` 중첩 + vision) |
+
+### 9.2 구현 변경점
+
+- **config 로더**: `Gemma3ForConditionalGeneration` 래퍼에서 `text_config`만 추출하도록 `config.rs::detect_arch()` 확장. `architectures` / `model_type` 우선순위로 text-only 분기 결정.
+- **weight mapper**: multimodal 래퍼의 `language_model.` 접두사 처리. 텐서 이름 조회 시 접두사 자동 prepend. vision tower 가중치는 스킵.
+- **텐서 분할 shard**: 기존 `SafeTensors` 멀티-파일 로더 재사용 (1B의 flattened 단일 파일도 계속 동작).
+- **flash_attn 커널**: head_dim=256은 기존 OpenCL 커널 variant에 없음 → prefill attention이 OpenCL 백엔드에서 CPU fallback 사용 (향후 최적화 여지).
+
+### 9.3 검증 결과
+
+- Unit tests: `models::config::tests` 8/8 (신규 5건), `models::mappers::tests` 5/5 (신규 2건)
+- Lib 전체: 875/0 (convert/unified_buffer 제외, 기존 unrelated failure)
+- Integration: `gemma3_4b_loading` 2/2 PASS (원본 2-shard + 래퍼 config)
+- eval-ll smoke 40/40 PASS — CPU 447s, OpenCL 129s (NVIDIA host, `--qcf-mode both`)
+- 1B 회귀: Llama 3.2 1B / Gemma 3 1B / Qwen2 1.5B 모두 정상 생성
+
+### 9.4 알려진 비차단 이슈
+
+- NVIDIA host OpenCL에서 단일 프롬프트 generate가 blank 출력 (별도 문서화, 실제 타겟은 Adreno)
+- head_dim=256 flash_attn GPU 커널 부재 → prefill attention은 CPU fallback (Adreno에서도 동일, 디코드는 정상)
+
