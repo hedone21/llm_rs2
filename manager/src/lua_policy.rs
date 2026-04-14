@@ -307,6 +307,27 @@ impl EwmaReliefTable {
 
 pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 
+/// Relief 테이블 업데이트 이벤트 (관측성 훅).
+///
+/// 시뮬레이터가 [`LuaPolicy::drain_relief_updates`]로 드레인해 trajectory에
+/// 기록한다. production에서는 로그용으로만 소비된다.
+#[doc(hidden)]
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReliefUpdateEvent {
+    /// observe() 대상 action 이름.
+    pub action: String,
+    /// observe() 호출 전 relief 벡터.
+    pub before: [f32; RELIEF_DIMS],
+    /// observe() 호출 후 relief 벡터 (EWMA 적용 결과).
+    pub after: [f32; RELIEF_DIMS],
+    /// 이번에 관측된 델타 (before_pressure - after_pressure).
+    pub observed: [f32; RELIEF_DIMS],
+    /// 업데이트 후 total observation count.
+    pub observation_count: u32,
+    /// ObservationContext가 기록된 이후 경과 시간 (초).
+    pub age_s: f64,
+}
+
 struct ObservationContext {
     action: String,
     before: Pressure6D,
@@ -328,6 +349,11 @@ pub struct LuaPolicy {
     observation: Option<ObservationContext>,
     adaptation_config: AdaptationConfig,
     clock: Arc<dyn Clock>,
+    /// 최근 발생한 relief 업데이트 이벤트 (시뮬레이터가 drain한다).
+    pending_relief_updates: Vec<ReliefUpdateEvent>,
+    /// 3s 관측 지연을 채우기 전에 새 directive로 덮어써진 observation 수.
+    /// Single-slot observation 구조상 빠른 directive 방출 시 학습 누락 발생 감지용.
+    observation_overrun_count: u64,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -418,6 +444,8 @@ impl LuaPolicy {
             observation: None,
             adaptation_config: config,
             clock,
+            pending_relief_updates: Vec::new(),
+            observation_overrun_count: 0,
         })
     }
 
@@ -611,6 +639,9 @@ impl LuaPolicy {
             after.main_app - obs.before.main_app,
         ];
 
+        let before_relief = self.relief_table.predict(&obs.action);
+        let age_s = elapsed.as_secs_f64();
+
         log::info!(
             "Relief observation: action={}, observed=[{:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}]",
             obs.action,
@@ -623,6 +654,36 @@ impl LuaPolicy {
         );
 
         self.relief_table.observe(&obs.action, &observed);
+
+        // 업데이트 후 스냅샷 기록 (관측성 훅)
+        let after_entry = self.relief_table.entries.get(&obs.action);
+        let after_relief = after_entry.map(|e| e.relief).unwrap_or(before_relief);
+        let count = after_entry.map(|e| e.observation_count).unwrap_or(0);
+        self.pending_relief_updates.push(ReliefUpdateEvent {
+            action: obs.action,
+            before: before_relief,
+            after: after_relief,
+            observed,
+            observation_count: count,
+            age_s,
+        });
+    }
+
+    /// 관측성 훅: 지난 drain 이후 축적된 relief 업데이트 이벤트를 반환하고 버퍼를 비운다.
+    ///
+    /// 시뮬레이터가 매 tick 호출해 Trajectory에 기록한다.
+    #[doc(hidden)]
+    pub fn drain_relief_updates(&mut self) -> Vec<ReliefUpdateEvent> {
+        std::mem::take(&mut self.pending_relief_updates)
+    }
+
+    /// 관측성 훅: OBSERVATION_DELAY_SECS를 채우기 전에 덮어써진 observation 수.
+    ///
+    /// Single-slot observation 구조로 인한 학습 누락 감지용. 이 값이 증가하는
+    /// 만큼 정책이 빠르게 직전 action 결과를 측정하지 못했다는 뜻.
+    #[doc(hidden)]
+    pub fn observation_overrun_count(&self) -> u64 {
+        self.observation_overrun_count
     }
 }
 
@@ -691,7 +752,11 @@ impl PolicyStrategy for LuaPolicy {
         if commands.is_empty() {
             None
         } else {
-            // Observation 시작 (단일 액션만)
+            // Observation 시작 (단일 액션만). 기존 observation이 3s 지연을 못 채우고
+            // 덮어써지는 경우 overrun으로 집계 — 학습 누락 감지용.
+            if self.observation.is_some() {
+                self.observation_overrun_count += 1;
+            }
             if commands.len() == 1 {
                 let action_name = engine_command_to_action_name(&commands[0]);
                 let pressure = self.signal_state.pressure_with_thermal(
@@ -742,6 +807,14 @@ impl PolicyStrategy for LuaPolicy {
 
     fn relief_snapshot(&self) -> Option<std::collections::HashMap<String, [f32; 6]>> {
         Some(self.relief_table.snapshot())
+    }
+
+    fn drain_relief_updates(&mut self) -> Vec<ReliefUpdateEvent> {
+        LuaPolicy::drain_relief_updates(self)
+    }
+
+    fn observation_overrun_count(&self) -> u64 {
+        LuaPolicy::observation_overrun_count(self)
     }
 }
 

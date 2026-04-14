@@ -542,6 +542,23 @@ fn scenario_partition_contention_produces_non_empty_relief() {
         !relief.is_empty(),
         "30s 시뮬 후 relief_snapshot이 비어있지 않아야 함 (VirtualClockHandle이 3s 관측 지연을 충족해야 함)"
     );
+
+    // Phase A: trajectory에 ReliefUpdate 이벤트가 기록되어야 함.
+    let update_count = sim
+        .trajectory()
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                crate::common::sim::trajectory::TrajectoryEntry::ReliefUpdate { .. }
+            )
+        })
+        .count();
+    assert!(
+        update_count >= 1,
+        "trajectory에 ReliefUpdate 이벤트가 >=1건 기록되어야 함 (학습 경로 trace 가능 확인)"
+    );
 }
 
 // ─────────────────────────────────────────────────────────
@@ -623,4 +640,17 @@ fn scenario_s25_memory_pressure_with_general_policy() {
     traj.assert_contains_directive_kind("Evict")
         .or_else(|_| traj.assert_contains_directive_kind("Quant"))
         .expect("memory dominant pressure 시 Evict/Quant 계열 directive가 등장해야 함");
+
+    // 4) Session summary에 observation overrun이 감지되어야 함.
+    //    policy_example.lua는 signal 빈도가 높으면 매 signal마다 directive를 방출해
+    //    3s 관측 지연을 못 채우고 덮어써진다 — single-slot observation 구조의 한계.
+    let summary = traj.format_session_summary();
+    assert!(
+        summary.contains("observation overruns"),
+        "summary에 overrun 경고가 표시되어야 함:\n{summary}"
+    );
+    assert!(
+        sim.policy.observation_overrun_count() > 0,
+        "빠른 directive 방출로 overrun이 1회 이상 발생해야 함"
+    );
 }

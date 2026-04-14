@@ -236,6 +236,23 @@ pub enum TrajectoryEntry {
         at_s: f64,
         name: String,
     },
+    /// Relief 테이블 업데이트 (EWMA observe 호출 결과).
+    ReliefUpdate {
+        at_s: f64,
+        action: String,
+        before: [f32; 6],
+        after: [f32; 6],
+        observed: [f32; 6],
+        observation_count: u32,
+        /// ObservationContext 기록 시점 이후 경과(초).
+        age_s: f64,
+    },
+    /// 3s 관측 지연 충족 전에 새 directive로 덮어써진 observation — 학습 누락 감지.
+    ObservationOverrun {
+        at_s: f64,
+        /// 시뮬레이션 시작 이후 누적 overrun 카운트.
+        total_count: u64,
+    },
 }
 
 // ─────────────────────────────────────────────────────────
@@ -308,6 +325,29 @@ impl Trajectory {
         self.entries.push(TrajectoryEntry::Custom {
             at_s: at.as_secs_f64(),
             name: name.to_string(),
+        });
+    }
+
+    pub fn record_relief_update(
+        &mut self,
+        at: Duration,
+        ev: &llm_manager::lua_policy::ReliefUpdateEvent,
+    ) {
+        self.entries.push(TrajectoryEntry::ReliefUpdate {
+            at_s: at.as_secs_f64(),
+            action: ev.action.clone(),
+            before: ev.before,
+            after: ev.after,
+            observed: ev.observed,
+            observation_count: ev.observation_count,
+            age_s: ev.age_s,
+        });
+    }
+
+    pub fn record_observation_overrun(&mut self, at: Duration, total_count: u64) {
+        self.entries.push(TrajectoryEntry::ObservationOverrun {
+            at_s: at.as_secs_f64(),
+            total_count,
         });
     }
 
@@ -478,6 +518,8 @@ impl Trajectory {
                 TrajectoryEntry::ObservationDue { at_s, .. } => *at_s,
                 TrajectoryEntry::InjectionEvent { at_s, .. } => *at_s,
                 TrajectoryEntry::Custom { at_s, .. } => *at_s,
+                TrajectoryEntry::ReliefUpdate { at_s, .. } => *at_s,
+                TrajectoryEntry::ObservationOverrun { at_s, .. } => *at_s,
             }
         };
         self.entries.iter().rev().map(entry_at_s).next()
@@ -505,6 +547,165 @@ impl Trajectory {
         self.format_timeline_inner(TimelineMode::Compact)
     }
 
+    /// 세션 요약 리포트 — 학습 누락, action 포화, pressure 진행 같은 insight 중심.
+    ///
+    /// [`format_timeline`](Self::format_timeline)가 이벤트 덤프라면, 이 출력은
+    /// 집계·이상탐지를 담당한다. 예:
+    ///
+    /// ```text
+    /// ━━━ Session Summary ━━━
+    /// duration=30.00s
+    /// signals: memory_pressure×60, compute_guidance×120, ...
+    /// directives: 172 (KvQuantDynamic×172 — saturated)
+    /// relief updates: 4  (kv_quant_dynamic[mem]: 0.500→0.478 in 4 obs)
+    /// ⚠ observation overruns: 168 / 172 (97%) — 3s 지연 미충족
+    /// ```
+    pub fn format_session_summary(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+
+        let duration = self.last_at_s().unwrap_or(0.0);
+        writeln!(out, "━━━ Session Summary ━━━").ok();
+        writeln!(out, "duration={:.2}s", duration).ok();
+
+        // Signal 집계
+        let mut sig_counts: BTreeMap<String, usize> = BTreeMap::new();
+        for e in &self.entries {
+            if let TrajectoryEntry::Signal { signal, .. } = e {
+                *sig_counts.entry(signal.kind.clone()).or_insert(0) += 1;
+            }
+        }
+        let sig_line: Vec<String> = sig_counts.iter().map(|(k, v)| format!("{k}×{v}")).collect();
+        writeln!(out, "signals: {}", sig_line.join(", ")).ok();
+
+        // Directive 집계 + saturation 감지
+        let mut dir_kinds: BTreeMap<String, usize> = BTreeMap::new();
+        let total_dirs = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                if let TrajectoryEntry::Directive { directive, .. } = e {
+                    for cmd in &directive.commands {
+                        let kind = cmd.split_once('{').map(|(k, _)| k.trim()).unwrap_or(cmd);
+                        *dir_kinds.entry(kind.to_string()).or_insert(0) += 1;
+                    }
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .count();
+        if total_dirs == 0 {
+            writeln!(
+                out,
+                "directives: 0  ⚠ 정책이 어떤 directive도 방출하지 않음"
+            )
+            .ok();
+        } else {
+            let kinds_line: Vec<String> =
+                dir_kinds.iter().map(|(k, v)| format!("{k}×{v}")).collect();
+            let saturated =
+                dir_kinds.len() == 1 && dir_kinds.values().next().copied().unwrap_or(0) >= 10;
+            let saturation_note = if saturated {
+                "  ⚠ 단일 action으로 포화 — action 다양성 없음"
+            } else {
+                ""
+            };
+            writeln!(
+                out,
+                "directives: {}  ({}){}",
+                total_dirs,
+                kinds_line.join(", "),
+                saturation_note,
+            )
+            .ok();
+        }
+
+        // Relief 학습 요약 — action별 차원별 (before → after) 델타
+        struct ReliefAgg {
+            count: u32,
+            first_before: [f32; 6],
+            last_after: [f32; 6],
+        }
+        let mut relief_agg: BTreeMap<String, ReliefAgg> = BTreeMap::new();
+        for e in &self.entries {
+            if let TrajectoryEntry::ReliefUpdate {
+                action,
+                before,
+                after,
+                ..
+            } = e
+            {
+                relief_agg
+                    .entry(action.clone())
+                    .and_modify(|a| {
+                        a.count += 1;
+                        a.last_after = *after;
+                    })
+                    .or_insert(ReliefAgg {
+                        count: 1,
+                        first_before: *before,
+                        last_after: *after,
+                    });
+            }
+        }
+        if relief_agg.is_empty() {
+            writeln!(out, "relief updates: 0").ok();
+        } else {
+            let total: u32 = relief_agg.values().map(|a| a.count).sum();
+            writeln!(out, "relief updates: {total}").ok();
+            const DIM_NAMES: [&str; 6] = ["gpu", "cpu", "mem", "therm", "lat", "app"];
+            for (action, agg) in &relief_agg {
+                let deltas: Vec<String> = (0..6)
+                    .filter_map(|i| {
+                        let delta = agg.last_after[i] - agg.first_before[i];
+                        (delta.abs() >= 0.005).then(|| {
+                            format!(
+                                "{}: {:.3}→{:.3}",
+                                DIM_NAMES[i], agg.first_before[i], agg.last_after[i]
+                            )
+                        })
+                    })
+                    .collect();
+                let delta_str = if deltas.is_empty() {
+                    "no significant change".to_string()
+                } else {
+                    deltas.join(", ")
+                };
+                writeln!(out, "  {} obs#{}: {}", action, agg.count, delta_str,).ok();
+            }
+        }
+
+        // Observation overrun — 학습 누락 경고
+        let overrun_total = self
+            .entries
+            .iter()
+            .rev()
+            .find_map(|e| {
+                if let TrajectoryEntry::ObservationOverrun { total_count, .. } = e {
+                    Some(*total_count)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        if overrun_total > 0 {
+            let pct = if total_dirs > 0 {
+                100.0 * overrun_total as f64 / total_dirs as f64
+            } else {
+                0.0
+            };
+            writeln!(
+                out,
+                "⚠ observation overruns: {} / {} directives ({:.0}%) — 3s 지연 미충족으로 학습 누락",
+                overrun_total, total_dirs, pct,
+            )
+            .ok();
+        }
+
+        out
+    }
+
     /// `SIM_TIMELINE` 환경변수가 설정된 경우 타임라인을 stderr로 출력.
     ///
     /// - `SIM_TIMELINE=1` 또는 `full`: [`format_timeline`](Self::format_timeline)
@@ -517,6 +718,7 @@ impl Trajectory {
         match std::env::var("SIM_TIMELINE").ok().as_deref() {
             Some("1") | Some("full") => eprintln!("{}", self.format_timeline()),
             Some("compact") => eprintln!("{}", self.format_timeline_compact()),
+            Some("summary") => eprintln!("{}", self.format_session_summary()),
             _ => {}
         }
     }
@@ -629,6 +831,30 @@ impl Trajectory {
                 }
                 TrajectoryEntry::Custom { at_s, name } => {
                     writeln!(out, "t={:7.2}s  [CUSTOM] {}", at_s, name).ok();
+                }
+                TrajectoryEntry::ReliefUpdate {
+                    at_s,
+                    action,
+                    before,
+                    after,
+                    observation_count,
+                    age_s,
+                    ..
+                } => {
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [RELIEF] {} age={:.2}s obs#{}  relief[mem]: {:.3}→{:.3}",
+                        at_s, action, age_s, observation_count, before[2], after[2],
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::ObservationOverrun { at_s, total_count } => {
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [OVERRUN] pending observation 덮어써짐 (누적 {})",
+                        at_s, total_count,
+                    )
+                    .ok();
                 }
             }
         }

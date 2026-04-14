@@ -495,22 +495,26 @@ traj.dump_json(path)?;      // JSON 덤프
 traj.dump_csv_states(path)? // StateSnapshot만 CSV
 ```
 
-### 8.3 ASCII 타임라인 (디버깅용)
+### 8.3 ASCII 타임라인 + 세션 요약 (디버깅용)
 
 테스트가 왜 실패했는지(또는 왜 성공했는지)를 한눈에 보고 싶을 때 사용한다.
+`format_timeline`이 raw 이벤트 덤프라면 `format_session_summary`는 집계 +
+이상탐지(saturation, observation overrun 등) 담당.
 
 ```rust
 // 1) 코드에서 직접 호출
 eprintln!("{}", sim.trajectory().format_timeline());          // 모든 이벤트
 eprintln!("{}", sim.trajectory().format_timeline_compact()); // STATE 1초 간격 + HB 생략
+eprintln!("{}", sim.trajectory().format_session_summary()); // 집계/경고 리포트
 
 // 2) 환경변수로 opt-in (테스트 본문 끝에 호출만 두면 됨)
 sim.trajectory().print_timeline_if_enabled();
 ```
 
 ```bash
-SIM_TIMELINE=1       cargo test -p llm_manager --test sim -- --nocapture  # 전체
-SIM_TIMELINE=compact cargo test -p llm_manager --test sim -- --nocapture  # 간결
+SIM_TIMELINE=1       cargo test ... -- --nocapture  # 전체 이벤트 로그
+SIM_TIMELINE=compact cargo test ... -- --nocapture  # 간결 이벤트 로그
+SIM_TIMELINE=summary cargo test ... -- --nocapture  # 요약 리포트
 ```
 
 출력 예시:
@@ -527,9 +531,42 @@ t=   1.00s  [HB]     tps= 18.52  mem=Critical  compute=Normal  kv_tok=1024
 t=   3.50s  [OBS]    kv_evict_sliding (recorded t=0.50s)
 ```
 
-태그 의미: `[STATE]` 물리/엔진 스냅샷, `[HB]` heartbeat, `[SIG]` SystemSignal 송출, `[DIR]` PolicyStrategy 응답, `[OBS]` ObservationDue (3초 관측 지연 도래), `[INJ]` external_injection 시작/종료, `[CUSTOM]` 테스트가 직접 기록한 마커.
+태그 의미: `[STATE]` 물리/엔진 스냅샷, `[HB]` heartbeat, `[SIG]` SystemSignal 송출, `[DIR]` PolicyStrategy 응답, `[OBS]` ObservationDue (3초 관측 지연 도래), `[INJ]` external_injection 시작/종료, `[CUSTOM]` 테스트가 직접 기록한 마커, `[RELIEF]` EWMA observe() 호출 (학습 업데이트), `[OVERRUN]` 3s 지연 전에 observation이 덮어써진 횟수.
 
-### 8.4 relief_snapshot
+세션 요약 출력 예시 (`SIM_TIMELINE=summary`):
+
+```
+━━━ Session Summary ━━━
+duration=30.00s
+signals: compute_guidance×120, energy_constraint×15, memory_pressure×60, thermal_alert×30
+directives: 172  (KvQuantDynamic×172)  ⚠ 단일 action으로 포화 — action 다양성 없음
+relief updates: 0
+⚠ observation overruns: 171 / 172 directives (99%) — 3s 지연 미충족으로 학습 누락
+```
+
+요약 리포트가 감지하는 항목:
+- **saturation**: 하나의 action만 반복 선택되는 경우 (대개 default_relief 시드가 치우침)
+- **observation overrun**: 3s 관측 지연 전에 새 directive로 덮어써진 observation 수. 높으면 relief 학습이 거의 발생하지 않음
+- **relief deltas**: action별 차원별 (before → after) 학습 경로
+
+### 8.4 Relief 학습 경로 관찰
+
+`LuaPolicy::check_observation()`이 EWMA update를 수행할 때마다
+`Trajectory`에 `ReliefUpdate` 이벤트가 추가된다. JSON/CSV 덤프에도
+포함되므로 외부 도구로 시계열 분석이 가능하다.
+
+단일 슬롯 구조(`LuaPolicy.observation: Option<ObservationContext>`)의
+한계로, directive 방출 간격이 3s보다 짧으면 이전 observation이 덮어써진다.
+이 경우:
+- `[OVERRUN]` 이벤트가 trajectory에 기록
+- `sim.policy.observation_overrun_count()`로 누적 값 조회
+- 세션 요약에 경고 표시
+
+고빈도 signal 환경(compute_guidance 4Hz 등)에서 범용 정책을 검증할 때
+반드시 확인해야 할 지표. production 배포에서도 발생하는 실제 문제이므로
+시뮬레이터로 먼저 드러내는 것이 목적.
+
+### 8.5 relief_snapshot
 
 `LuaPolicy`에만 유효. EwmaReliefTable의 현재 상태를 반환한다:
 

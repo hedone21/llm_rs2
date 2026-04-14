@@ -51,6 +51,20 @@ pub trait PolicyStrategy: Send {
     fn relief_snapshot(&self) -> Option<HashMap<String, [f32; 6]>> {
         None
     }
+
+    /// 관측성 훅: 지난 호출 이후 발생한 relief 업데이트 이벤트를 드레인한다.
+    ///
+    /// 시뮬레이터가 매 tick 호출해 Trajectory에 기록한다. 기본은 빈 Vec.
+    fn drain_relief_updates(&mut self) -> Vec<crate::lua_policy::ReliefUpdateEvent> {
+        Vec::new()
+    }
+
+    /// 관측성 훅: 3s 관측 지연 충족 전에 덮어써진 observation 누적 개수.
+    ///
+    /// 빠른 directive 방출로 인한 학습 누락 감지용. 기본은 0.
+    fn observation_overrun_count(&self) -> u64 {
+        0
+    }
 }
 
 /// Seq ID 생성을 위한 단조 증가 카운터.

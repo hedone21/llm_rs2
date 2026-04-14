@@ -77,6 +77,9 @@ pub struct Simulator {
     pub rng: Option<NoiseRng>,
     tick_dt: Duration,
     ctx: ExprContext,
+    /// 직전 tick에 관측한 cumulative observation overrun count.
+    /// 증가량만 trajectory에 새 이벤트로 기록하기 위한 값.
+    last_overrun_count: u64,
 }
 
 impl Simulator {
@@ -96,6 +99,7 @@ impl Simulator {
             rng,
             tick_dt: Duration::from_millis(50),
             ctx,
+            last_overrun_count: 0,
         }
     }
 
@@ -142,6 +146,7 @@ impl Simulator {
             rng,
             tick_dt: Duration::from_millis(50),
             ctx,
+            last_overrun_count: 0,
         })
     }
 
@@ -304,6 +309,17 @@ impl Simulator {
             self.apply_directive(&dir)?;
             self.trajectory
                 .record_custom(tick_end, "qcf_timeout_directive");
+        }
+
+        // Relief 업데이트 + observation overrun 드레인 — 관측성 훅.
+        for ev in self.policy.drain_relief_updates() {
+            self.trajectory.record_relief_update(tick_end, &ev);
+        }
+        let overrun_total = self.policy.observation_overrun_count();
+        if overrun_total > self.last_overrun_count {
+            self.last_overrun_count = overrun_total;
+            self.trajectory
+                .record_observation_overrun(tick_end, overrun_total);
         }
 
         // physics step (clock.advance 이전에 호출)
