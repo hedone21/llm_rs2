@@ -1,0 +1,97 @@
+# microbench_flash_attn — Option C (stride) + Option A (production conditions)
+# Platform: QUALCOMM Snapdragon(TM)
+# Device:   QUALCOMM Adreno(TM) 830
+# Model: n_h_q=12 n_h_kv=2 dk=128 dv=128 cap=8192 Q1_WG_SIZE=64 layers=28
+# Build opts: -DDK=128 -DDV=128 -DBLOCK_M=32 -DBLOCK_N=32 -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+
+engine,layout,variant,n_kv,median_us,mean_us,min_us,max_us,iters
+llm_rs2,HeadMajor,Single,258,111.87,111.57,109.82,113.15,30
+llm_rs2,HeadMajor,Single,1025,323.84,321.53,313.09,330.24,30
+llm_rs2,HeadMajor,Single,2047,596.99,601.08,579.07,683.01,30
+llm_rs2,HeadMajor,Single,4472,1304.06,1334.55,1267.20,1516.03,30
+llm_rs2,HeadMajor,Repeat28,258,2815.49,2814.75,2801.15,2826.24,30
+llm_rs2,HeadMajor,Repeat28,1025,8809.98,8889.63,8771.58,10984.70,30
+llm_rs2,HeadMajor,Repeat28,2047,16226.56,16305.13,16018.94,16695.81,30
+llm_rs2,HeadMajor,Repeat28,4472,32980.22,33206.33,32542.72,35081.22,30
+llm_rs2,HeadMajor,Repeat28Mask,258,2845.95,2844.55,2829.82,2856.96,30
+llm_rs2,HeadMajor,Repeat28Mask,1025,8798.72,8795.21,8753.92,8843.52,30
+llm_rs2,HeadMajor,Repeat28Mask,2047,16645.63,16711.02,16547.07,18817.28,30
+llm_rs2,HeadMajor,Repeat28Mask,4472,34622.72,34809.66,34455.81,36710.66,30
+llm_rs2,HeadMajor,Repeat28MaskQ,258,2817.02,2819.62,2800.13,2855.17,30
+llm_rs2,HeadMajor,Repeat28MaskQ,1025,8798.72,8798.56,8727.81,8871.94,30
+llm_rs2,HeadMajor,Repeat28MaskQ,2047,16593.66,16657.89,16553.73,18533.38,30
+llm_rs2,HeadMajor,Repeat28MaskQ,4472,34596.86,34812.65,34490.37,36757.76,30
+llm_rs2,PosMajor,Single,258,107.78,107.40,104.96,109.06,30
+llm_rs2,PosMajor,Single,1025,302.85,302.72,299.78,305.92,30
+llm_rs2,PosMajor,Single,2047,558.85,558.79,552.96,566.02,30
+llm_rs2,PosMajor,Single,4472,1199.87,1208.70,1188.10,1498.11,30
+llm_rs2,PosMajor,Repeat28,258,2763.78,2765.56,2752.77,2798.08,30
+llm_rs2,PosMajor,Repeat28,1025,8545.28,8547.73,8514.82,8601.09,30
+llm_rs2,PosMajor,Repeat28,2047,15623.94,15691.55,15540.48,17663.23,30
+llm_rs2,PosMajor,Repeat28,4472,32658.43,32857.69,32608.77,33924.10,30
+llm_rs2,PosMajor,Repeat28Mask,258,2836.74,2831.16,2784.77,2844.16,30
+llm_rs2,PosMajor,Repeat28Mask,1025,8663.04,8643.57,8484.61,8726.78,30
+llm_rs2,PosMajor,Repeat28Mask,2047,15828.48,15826.44,15784.70,15891.71,30
+llm_rs2,PosMajor,Repeat28Mask,4472,33565.44,33602.81,33029.38,35644.42,30
+llm_rs2,PosMajor,Repeat28MaskQ,258,2851.84,2851.93,2842.11,2861.06,30
+llm_rs2,PosMajor,Repeat28MaskQ,1025,8533.76,8603.75,8449.54,10393.60,30
+llm_rs2,PosMajor,Repeat28MaskQ,2047,15852.03,15873.89,15799.55,16077.57,30
+llm_rs2,PosMajor,Repeat28MaskQ,4472,33475.58,33578.57,33085.44,35333.38,30
+llama.cpp,HeadMajor,Single,258,108.03,108.36,105.98,113.92,30
+llama.cpp,HeadMajor,Single,1025,304.13,305.98,295.94,347.14,30
+llama.cpp,HeadMajor,Single,2047,568.83,581.44,550.91,677.89,30
+llama.cpp,HeadMajor,Single,4472,1142.02,1182.87,1131.01,1422.08,30
+llama.cpp,HeadMajor,Repeat28,258,2808.83,2808.10,2795.01,2821.12,30
+llama.cpp,HeadMajor,Repeat28,1025,8587.26,8657.66,8564.22,10718.98,30
+llama.cpp,HeadMajor,Repeat28,2047,15881.98,15901.11,15750.66,16092.93,30
+llama.cpp,HeadMajor,Repeat28,4472,33104.13,33266.75,32484.35,35889.66,30
+llama.cpp,HeadMajor,Repeat28Mask,258,2846.21,2846.63,2835.97,2860.03,30
+llama.cpp,HeadMajor,Repeat28Mask,1025,8786.69,8788.76,8733.18,8841.22,30
+llama.cpp,HeadMajor,Repeat28Mask,2047,16642.30,16711.24,16476.93,18620.93,30
+llama.cpp,HeadMajor,Repeat28Mask,4472,34652.42,34933.17,34497.79,37799.94,30
+llama.cpp,HeadMajor,Repeat28MaskQ,258,2845.44,2844.98,2834.18,2856.19,30
+llama.cpp,HeadMajor,Repeat28MaskQ,1025,8768.51,8770.35,8736.00,8820.48,30
+llama.cpp,HeadMajor,Repeat28MaskQ,2047,16635.39,16711.26,16481.28,18764.80,30
+llama.cpp,HeadMajor,Repeat28MaskQ,4472,34565.63,34915.30,34478.34,38043.14,30
+llama.cpp,PosMajor,Single,258,107.01,107.60,105.98,115.97,30
+llama.cpp,PosMajor,Single,1025,303.10,308.89,300.80,361.98,30
+llama.cpp,PosMajor,Single,2047,552.96,570.04,548.86,689.92,30
+llama.cpp,PosMajor,Single,4472,1158.91,1198.85,1153.02,1467.14,30
+llama.cpp,PosMajor,Repeat28,258,2803.97,2803.37,2794.24,2811.65,30
+llama.cpp,PosMajor,Repeat28,1025,8471.30,8473.92,8459.26,8489.98,30
+llama.cpp,PosMajor,Repeat28,2047,15556.61,15702.62,15512.83,17859.84,30
+llama.cpp,PosMajor,Repeat28,4472,33030.91,33262.47,32940.29,36111.10,30
+llama.cpp,PosMajor,Repeat28Mask,258,2840.06,2836.49,2792.19,2849.02,30
+llama.cpp,PosMajor,Repeat28Mask,1025,8536.06,8535.92,8511.74,8569.34,30
+llama.cpp,PosMajor,Repeat28Mask,2047,15736.32,15740.46,15709.70,15835.65,30
+llama.cpp,PosMajor,Repeat28Mask,4472,33046.02,33181.41,33003.01,36213.25,30
+llama.cpp,PosMajor,Repeat28MaskQ,258,2812.16,2814.26,2794.75,2856.96,30
+llama.cpp,PosMajor,Repeat28MaskQ,1025,8599.04,8687.85,8559.87,10773.25,30
+llama.cpp,PosMajor,Repeat28MaskQ,2047,15815.17,15821.28,15776.77,15892.48,30
+llama.cpp,PosMajor,Repeat28MaskQ,4472,33102.08,33464.10,33037.57,36127.23,30
+
+# Slope (μs / n_kv) per (engine, layout, variant) — least squares
+# engine,layout,variant,slope_us_per_n_kv,intercept_us
+# llm_rs2,HeadMajor,Single,0.2832,31.86
+# llm_rs2,HeadMajor,Repeat28,7.1178,1324.88
+# llm_rs2,HeadMajor,Repeat28Mask,7.5282,1044.47
+# llm_rs2,HeadMajor,Repeat28MaskQ,7.5261,1021.89
+# llm_rs2,PosMajor,Single,0.2594,36.42
+# llm_rs2,PosMajor,Repeat28,7.0645,1118.50
+# llm_rs2,PosMajor,Repeat28Mask,7.2701,1043.03
+# llm_rs2,PosMajor,Repeat28MaskQ,7.2572,1023.08
+# llama.cpp,HeadMajor,Single,0.2449,53.17
+# llama.cpp,HeadMajor,Repeat28,7.1670,1116.36
+# llama.cpp,HeadMajor,Repeat28Mask,7.5367,1031.64
+# llama.cpp,HeadMajor,Repeat28MaskQ,7.5167,1042.41
+# llama.cpp,PosMajor,Single,0.2492,44.45
+# llama.cpp,PosMajor,Repeat28,7.1570,1005.93
+# llama.cpp,PosMajor,Repeat28Mask,7.1505,1092.53
+# llama.cpp,PosMajor,Repeat28MaskQ,7.1642,1108.36
+
+# Cross-run verdict — HeadMajor only, per variant
+# variant,engine_a,slope_a,engine_b,slope_b,ratio_a/b
+# Repeat28        ,llm_rs2,7.1178,llama.cpp,7.1670,0.993x  →  within ±5% (TIE)
+# Repeat28Mask    ,llm_rs2,7.5282,llama.cpp,7.5367,0.999x  →  within ±5% (TIE)
+# Repeat28MaskQ   ,llm_rs2,7.5261,llama.cpp,7.5167,1.001x  →  within ±5% (TIE)
+# Single          ,llm_rs2,0.2832,llama.cpp,0.2449,1.156x  →  llama.cpp faster (15.6% advantage)

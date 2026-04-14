@@ -219,6 +219,58 @@ A1 결과로 **갭의 실재 자체가 의심스러움** 상태. 더 진행 전 
 - 갭의 37% (2.5 μs/n_kv per token)가 우리 Q1 kernel 선택의 직접 손실
 - 즉시 revert로 회수 가능
 
+### 🆕 2026-04-14 23:00: B-4 revert 적용 + production 검증 → **갭 76% 회수**
+
+**산출물**: `.agent/research/microbench_flash_attn/post_revert_verdict.md`
+
+**변경**: `engine/kernels/flash_attn_f32_f16.cl` Q1 kernel만 SLM tree-reduce 패턴으로 교체 (REQD_SUBGROUP_SIZE_64 + sub_group_reduce_* 모두 제거). prefill kernel은 그대로.
+
+**Microbench 재측정 (post-revert vs llama.cpp)**:
+
+| variant | llm_rs2 (revert) | llama.cpp | ratio |
+|---|---:|---:|---:|
+| Repeat28 | 7.12 | 7.17 | 0.993× **TIE** |
+| Repeat28+Mask | 7.53 | 7.54 | 0.999× **TIE** |
+| Repeat28+Mask+QVar | 7.53 | 7.52 | 1.001× **TIE** |
+
+**Production decode 벤치 (Galaxy S25, Qwen 2.5-1.5B Q4_0, AP mStatus=0)**:
+
+| n_kv | baseline (B-4 ON) | post-revert | Δ ms/tok |
+|---:|---:|---:|---:|
+| ~1024 | 38.80 | 33.22 (n_kv=941) | **−5.58** |
+| ~2048 | 58.88 | 40.08 (n_kv=1852) | **−18.80** |
+| ~4500 | 83.30 | 53.28 (n_kv=3674) | **−30.02** |
+
+**Decode wall slope**:
+- 이전: **12.45 μs/n_kv**
+- **현재: 7.32 μs/n_kv** (long-ctx 3 점)
+- 회수: **5.13 μs/n_kv (갭 66~76% 해소)**
+
+**갭 분석**:
+- llama 4.72 baseline: 7.73 → **2.60** μs/n_kv (66% 회수)
+- llama 5.70 baseline: 6.75 → **1.62** μs/n_kv (76% 회수)
+
+**정확도 검증**: `--prompt "The quick brown fox" --temperature 0.0` → "jumps over the lazy dog. This is a sentence in English. ..." — **자연스러운 출력, garbage 없음, no regression**.
+
+### 🚀 다음 세션 엔트리 포인트 (재정비 v6 — 갭 대부분 해소)
+
+**잔존 1.6-2.6 μs/n_kv 갭**:
+- D path (eviction): n_kv 자체 감소로 우회 가능
+- B path (Snapdragon Profiler): op-level isolation으로 잔존 원인 식별
+- prefill kernel B-4 검토: prefill도 같은 패턴 적용 중. 별도 §1~10 prefill 갭 추적과 합칠 필요
+
+**즉시 검토 권장**:
+- **재현성 추가 측정** (현재 1회) — Δ 30 ms 등 큰 수치의 thermal 노이즈 가능성 검증
+- **eval 회귀 테스트**: PPL 또는 LongBench로 정확도 quantitative 회귀 확인
+- **prefill 동등 revert 검토**: prefill kernel도 REQD_SUBGROUP_SIZE_64 + A-3 B-1 분할 적용 중. Decode와 같은 손실 가능성
+
+### ✓ 추가 확정 (revert 검증)
+
+- B-4 revert가 production에서 **5.13 μs/n_kv 회수**, decode wall 12.45 → 7.32 (41% 감소)
+- microbench cross-run에서 3 production-relevant variants 모두 llama.cpp와 ±0.5% TIE
+- Decode 출력 정상성 OK (qualitative)
+- prefill에는 영향 없음 (Q1만 변경)
+
 ### 🚀 다음 세션 엔트리 포인트 (이전 v3, 보존용)
 
 KV stride 가설까지 기각된 시점, 남은 후보를 ROI 순으로:

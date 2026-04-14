@@ -1,0 +1,32 @@
+=== ctx=p_short ===
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 8192)
+Prefill: 835.99 ms (114 tokens, 136.4 tok/s)
+Decode: 36.88 ms/tok (27.1 tok/s) [30 tokens, forward only]
+Avg TBT: 48.28 ms (20.7 tokens/sec)
+[cool 240s]
+=== ctx=p1k ===
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+KV cache type: F16, layout: HeadMajor (initial capacity: 1024 tokens, 524288B per layer, max: 8192)
+[Prefill] Chunked mode: 911 tokens in chunks of 512
+Prefill: 6468.32 ms (911 tokens, 140.8 tok/s)
+Decode: 33.22 ms/tok (30.1 tok/s) [30 tokens, forward only]
+Avg TBT: 48.54 ms (20.6 tokens/sec)
+[cool 240s]
+=== ctx=p2k ===
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+KV cache type: F16, layout: HeadMajor (initial capacity: 2048 tokens, 1048576B per layer, max: 8192)
+[Prefill] Chunked mode: 1822 tokens in chunks of 512
+Prefill: 13930.23 ms (1822 tokens, 130.8 tok/s)
+Decode: 40.08 ms/tok (25.0 tok/s) [30 tokens, forward only]
+Avg TBT: 56.38 ms (17.7 tokens/sec)
+[cool 240s]
+=== ctx=p4k ===
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+KV cache type: F16, layout: HeadMajor (initial capacity: 4096 tokens, 2097152B per layer, max: 8192)
+[Prefill] Chunked mode: 3644 tokens in chunks of 512
+Prefill: 32766.55 ms (3644 tokens, 111.2 tok/s)
+Decode: 53.28 ms/tok (18.8 tok/s) [30 tokens, forward only]
+Avg TBT: 70.97 ms (14.1 tokens/sec)
+[cool 240s]
