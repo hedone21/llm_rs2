@@ -39,10 +39,25 @@
 - [ ] `trajectory.rs`: CSV/JSON dump, assertion 헬퍼
 - [ ] 통합 테스트: LuaPolicy + baseline.yaml memory 램프 시나리오
 
-### Phase 5 — 시나리오 YAML / spec 테스트 마이그레이션 ⏳
-- [ ] `fixtures/sim/scenarios/` 3개 (memory_pressure_steady, thermal_ramp_with_decode, partition_contention)
-- [ ] `manager/tests/sim/` 스펙 테스트 배치
-- [ ] 기존 실기 의존 테스트 중 시뮬레이터로 대체 가능한 것 마이그레이션 (별도 커밋)
+### Phase 5 — 시나리오 YAML / spec 테스트 마이그레이션 ✅ (2026-04-14, 144755d)
+- [x] `fixtures/sim/scenarios/` 3종 (memory_pressure_steady, thermal_ramp_with_decode, partition_contention)
+- [x] `fixtures/sim/lua/` 4종 fixture Lua 스크립트
+- [x] `insta` crate dev-dependency 추가 (v1, yaml+json)
+- [x] `PolicyStrategy::relief_snapshot()` default method + LuaPolicy 구현
+- [x] `TrajectorySummary` / `PhysicalStateSummary` 타입 추가
+- [x] `test_scenarios.rs` 4개 시나리오 + insta 스냅샷 (.snap 4개 포함)
+- [x] 98 tests pass (94 기존 + 4 신규)
+- [x] `test_mgr_alg_080_083_ewma_relief.rs` — 24개 todo!() → 24/24 pass (2026-04-14, 0656040)
+  - EwmaReliefTable/ReliefEntry pub 노출 + ManualClock 주입으로 MGR-ALG-080~083, INV-086~090, MGR-DAT-070~074 검증
+  - spec 테스트: 8→32 pass, sim 테스트: 104 pass 비회귀
+- [ ] 기존 실기 의존 테스트 마이그레이션 (Phase 6 범위로 이동)
+
+#### 마이그레이션 후보 (향후 작업)
+- `test_mgr_alg_080_083_ewma_relief.rs` — 완료 (2026-04-14)
+- `test_inv_*.rs` 중 signal→directive 경로 검증 항목: 시나리오 YAML + MockPolicy로 대체 가능
+  - `test_inv_002_memory_warning_evict.rs` — memory_pressure_steady 시나리오로 커버
+  - `test_inv_004_thermal_alert_throttle.rs` — thermal_ramp 시나리오로 커버
+- `test_mgr_dat_075_076_engine_util.rs` — 유지 (단순 Lua ctx 통과 검증, 시뮬레이터 불필요)
 
 ### Phase 6 — 디바이스 preset 및 문서 ⏳
 - [ ] `s25_galaxy.yaml` (baseline extends, manual estimates)
