@@ -1,0 +1,20 @@
+# microbench_flash_attn — KV layout slope isolation
+# Platform: QUALCOMM Snapdragon(TM)
+# Device:   QUALCOMM Adreno(TM) 830
+# Model: n_h_q=12 n_h_kv=2 dk=128 dv=128 cap=8192 Q1_WG_SIZE=64
+# Build opts: -DDK=128 -DDV=128 -DBLOCK_M=32 -DBLOCK_N=32 -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+
+layout,n_kv,median_us,mean_us,min_us,max_us,iters
+HeadMajor,258,201.98,201.33,197.89,204.80,30
+HeadMajor,1025,503.81,502.95,484.86,512.00,30
+HeadMajor,2047,900.10,899.54,891.14,902.14,30
+HeadMajor,4472,1847.81,1844.92,1794.05,1854.21,30
+PosMajor,258,206.85,206.32,198.91,212.99,30
+PosMajor,1025,503.04,502.65,494.08,506.11,30
+PosMajor,2047,890.88,889.87,879.87,895.23,30
+PosMajor,4472,1824.00,1822.05,1807.87,1831.17,30
+
+# Slope (μs / n_kv) via least squares on median samples
+# HeadMajor   slope = 0.3903 μs/n_kv   intercept = 102.05 μs
+# PosMajor    slope = 0.3836 μs/n_kv   intercept = 108.05 μs
+# HeadMajor / PosMajor slope ratio = 1.018x (차이 < 10% → KV stride 가설 REJECT (다른 곳 찾아야))
