@@ -21,7 +21,7 @@ use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::memory::galloc::Galloc;
 use crate::models::config::ModelConfig;
-use crate::models::mappers::{WeightMapper, create_mapper};
+use crate::models::mappers::{WeightMapper, create_mapper_with_prefix};
 
 use super::TensorId;
 use super::convert;
@@ -55,7 +55,7 @@ impl SafetensorsSource {
     pub fn open(model_path: &str, weight_dtype: DType) -> Result<Self> {
         let path = Path::new(model_path);
         let config = ModelConfig::from_json(path)?;
-        let mapper = create_mapper(config.arch);
+        let mapper = create_mapper_with_prefix(config.arch, &config.weight_prefix);
 
         let single_path = path.join("model.safetensors");
         let index_path = path.join("model.safetensors.index.json");
@@ -121,9 +121,9 @@ impl SafetensorsSource {
     /// Resolve a `TensorId` to the safetensors weight name string.
     pub fn resolve_name(&self, id: &TensorId) -> String {
         match id {
-            TensorId::Embed => self.mapper.embed_name().to_string(),
-            TensorId::FinalNorm => self.mapper.norm_name().to_string(),
-            TensorId::LmHead => self.mapper.lm_head_name().to_string(),
+            TensorId::Embed => self.mapper.embed_name(),
+            TensorId::FinalNorm => self.mapper.norm_name(),
+            TensorId::LmHead => self.mapper.lm_head_name(),
             TensorId::LayerWeight { layer, kind } => {
                 use super::LayerWeightKind;
                 let names = self.mapper.weight_names(*layer);
@@ -178,8 +178,17 @@ impl SafetensorsSource {
         let tensor_view = match self.shard_tensors[shard_idx].tensor(name) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Error finding tensor '{}' in shard {}", name, shard_idx);
-                return Err(anyhow!("{}", e));
+                let sample: Vec<String> = self.shard_tensors[shard_idx]
+                    .names()
+                    .iter()
+                    .take(5)
+                    .map(|s| (*s).to_string())
+                    .collect();
+                return Err(anyhow!(
+                    "safetensors missing tensor '{name}' in shard {shard_idx} \
+                     (config weight_prefix={:?}); first few names in shard: {sample:?}; inner: {e}",
+                    self.config.weight_prefix
+                ));
             }
         };
         let shape = Shape::new(tensor_view.shape().to_vec());
@@ -334,8 +343,17 @@ impl SafetensorsSource {
         let tensor_view = match self.shard_tensors[shard_idx].tensor(name) {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("Error finding tensor '{}' in shard {}", name, shard_idx);
-                return Err(anyhow!("{}", e));
+                let sample: Vec<String> = self.shard_tensors[shard_idx]
+                    .names()
+                    .iter()
+                    .take(5)
+                    .map(|s| (*s).to_string())
+                    .collect();
+                return Err(anyhow!(
+                    "safetensors missing tensor '{name}' in shard {shard_idx} \
+                     (config weight_prefix={:?}); first few names in shard: {sample:?}; inner: {e}",
+                    self.config.weight_prefix
+                ));
             }
         };
         let shape = Shape::new(tensor_view.shape().to_vec());
