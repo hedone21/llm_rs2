@@ -76,9 +76,21 @@ echo "✓ cwd switched to: $WT_ABS"
 - "qcf 리팩토링 작업을 worktree에서 해줘" → `NAME=qcf-refactor TYPE=refactor`
 - "새 실험용 worktree 만들어줘 이름은 adreno-test" → `NAME=adreno-test TYPE=work`
 
-**자동 cwd 전환 (중요)**:
-- `create` 성공 후 **에이전트의 Bash cwd를 워크트리로 자동 전환**한다. Claude Code의 Bash 도구는 호출 간 cwd가 유지되므로, `cd`를 별도 호출로 분리하지 말고 반드시 `git worktree add`와 **동일한 Bash 호출** 안에서 `cd "$WT_PATH"`를 이어 실행한다. 그래야 이후 에이전트가 실행하는 모든 명령(편집/빌드/테스트/커밋)이 워크트리 안에서 수행된다.
-- 사용자의 대화형 셸 cwd는 바뀌지 않는다. 사용자가 터미널에서 직접 작업하려면 `cd $WT_PATH`를 안내한다. 하지만 Claude가 대신 작업을 이어서 수행하는 경우라면 이 안내는 선택적이다 — 에이전트 cwd는 이미 이동한 상태다.
+**cwd 처리 (중요 — 하네스 동작)**:
+
+Claude Code 하네스는 Bash 도구 호출이 끝날 때마다 **cwd를 프로젝트 루트로 리셋**한다 ("Shell cwd was reset to …" 메시지 참고). 즉, 단일 Bash 호출 안에서의 `cd`만 유효하고, 다음 호출은 다시 메인 레포에서 시작한다. 이 현실에 맞춰 다음 두 가지를 함께 지킨다:
+
+1. **생성 직후 기록**: `create`가 성공하면 `WT_ABS` 절대경로를 대화 메모리에 기록한다 (예: "worktree: /home/.../llm_rs2-<slug>"). Read/Edit/Write는 절대경로로 워크트리 파일을 직접 다룬다.
+2. **Bash 호출은 cd 프리픽스**: 이후 워크트리 안에서 수행해야 하는 Bash 명령은 한 줄 복합 커맨드로 `cd "$WT_ABS" && <실제 명령>` 형태로 감싼다. 예:
+   ```bash
+   cd /home/go/Workspace/llm_rs2-fix-foo && cargo check
+   cd /home/go/Workspace/llm_rs2-fix-foo && git add -A && git commit -m "..."
+   ```
+   이 패턴은 상태(cwd)에 의존하지 않으므로 실패 모드가 단순하고, 하네스 리셋에 영향받지 않는다.
+
+Read/Edit/Write 도구는 절대경로를 받으므로 cwd와 무관하다 — 워크트리 내부 파일 편집 시 `/home/.../llm_rs2-<slug>/engine/...` 형태 절대경로를 사용한다.
+
+사용자의 대화형 셸 cwd는 바뀌지 않는다. 사용자가 터미널에서 직접 작업하려면 `cd $WT_ABS`를 안내한다.
 
 **주의**:
 - 메인 레포의 미커밋 변경은 새 워크트리에 복제되지 않는다 (git 기본 동작). 이게 의도한 격리다.
@@ -86,7 +98,7 @@ echo "✓ cwd switched to: $WT_ABS"
 
 ### `merge [--squash]`
 
-현재 위치한 워크트리의 브랜치를 master에 병합한다. **반드시 워크트리 내부에서 실행**.
+워크트리의 브랜치를 master에 병합한다. **반드시 워크트리 내부에서 실행**하며, 하네스 cwd 리셋 때문에 단일 Bash 호출 전체를 `cd "$WT_ABS" && { ... }` 로 감싼다 (아래 스크립트를 통째로).
 
 ```bash
 # 0. 현재가 워크트리인지 확인 (메인 레포에서 merge 호출 차단)
