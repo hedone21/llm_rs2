@@ -1,0 +1,19 @@
+=== Reproducibility run #2 (post-revert) ===
+
+--- ctx=p1k ---
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+Prefill: 6464.62 ms (911 tokens, 140.9 tok/s)
+Decode: 38.90 ms/tok (25.7 tok/s) [1 tokens, forward only]
+[cool 240s]
+
+--- ctx=p2k ---
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+Prefill: 13881.78 ms (1822 tokens, 131.3 tok/s)
+Decode: 39.98 ms/tok (25.0 tok/s) [30 tokens, forward only]
+[cool 240s]
+
+--- ctx=p4k ---
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+Prefill: 32645.69 ms (3644 tokens, 111.6 tok/s)
+Decode: 53.25 ms/tok (18.8 tok/s) [30 tokens, forward only]
+[cool 240s]

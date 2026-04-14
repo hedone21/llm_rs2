@@ -271,6 +271,59 @@ A1 결과로 **갭의 실재 자체가 의심스러움** 상태. 더 진행 전 
 - Decode 출력 정상성 OK (qualitative)
 - prefill에는 영향 없음 (Q1만 변경)
 
+### 🆕 2026-04-14 23:20: 잔존 작업 4개 완료
+
+#### 1. 재현성 (run2 추가 측정)
+
+같은 디바이스 24시간 내, 동일 cooldown:
+
+| ctx | run1 | run2 | Δ |
+|---|---:|---:|---:|
+| p2k (n_kv=1852) | 40.08 | 39.98 | 0.1 ms |
+| p4k (n_kv=3674) | 53.28 | 53.25 | 0.03 ms |
+
+Slope 7.32 vs 7.28 (±0.5%). **노이즈 아님 확정**.
+
+#### 2. 정확도 회귀 (CPU vs OpenCL 비트 비교)
+
+같은 prompt, T=0, --num-tokens 20:
+- "The capital of France is Paris. It has a population of about 2 million people and covers an area of 10" — CPU와 OpenCL **완전 동일**
+- Long ctx (n_kv ~956): "The quick brown fox jumps over the lazy dog. ... THe quik brown foxtjumps ove thlazy dgo" — typos까지 동일 (모델 행동, 커널 버그 아님)
+
+**Q1 kernel 정확성 비트-동일 검증**.
+
+#### 3. Prefill kernel B-4 검토
+
+Prefill에는 `REQD_SUBGROUP_SIZE_64` attribute는 있지만 `sub_group_reduce_*` 호출은 **없음**. SLM tree-reduce 사용 중 (l_dot exchange).
+
+격리 테스트 (attribute만 임시 제거 → 측정 → 원복):
+
+| ctx | with-attr | no-attr | Δ |
+|---|---:|---:|---:|
+| p1k | 6468 ms | 6499 | +0.5% |
+| p2k | 13930 | 13891 | -0.3% |
+| p4k | 32766 | 32618 | -0.5% |
+
+**REQD_SUBGROUP_SIZE_64 자체는 prefill에서 영향 0** (< 1% 노이즈 범위). Q1의 33% 손실은 **`sub_group_reduce_*` 호출 자체** 때문이었음 확정.
+
+**Prefill 추가 변경 불필요**. 원복 완료. prefill의 별도 갭 (~2× 느림 vs llama)은 A-3 B-1 split layout 자체 또는 다른 요인으로 별도 추적 필요.
+
+### 🎯 최종 상태 (2026-04-14 23:30)
+
+- **B-4 Q1 revert 적용**: decode wall slope 12.45 → 7.32 μs/n_kv (5.13 회수)
+- **갭 76% 해소**: 6.75 → 1.62 μs/n_kv (vs llama 5.70)
+- **정확도 회귀 0** (CPU vs OpenCL bit-identical)
+- **재현성 OK** (run1/run2 ±0.5%)
+- **prefill 변경 불필요** (attribute 무해)
+
+### 🚀 미래 작업 (다음 세션, 우선순위 정렬)
+
+**잔존 1.6-2.6 μs/n_kv 갭 해소 옵션** (선택):
+1. **D path (eviction)** — 정확도 trade-off로 즉시 win, 가장 ROI 명확
+2. **op-level isolation** — 비-attention ops (matmul_qkv/wo/ffn) 격리 측정. 합 ~1.0 μs/n_kv 추정
+3. **B path (Snapdragon Profiler)** — kernel-level L1/L2/occupancy trace
+4. **prefill 별도 추적**: §1~10 prefill 갭 (~2× vs llama). A-3 B-1 split 효과 격리, llama prefill kernel cross-run 등
+
 ### 🚀 다음 세션 엔트리 포인트 (이전 v3, 보존용)
 
 KV stride 가설까지 기각된 시점, 남은 후보를 ROI 순으로:

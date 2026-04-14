@@ -1,0 +1,19 @@
+=== prefill no-attr test ===
+
+--- ctx=p1k ---
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+Prefill: 6499.42 ms (911 tokens, 140.2 tok/s)
+Decode: 34.45 ms/tok (29.0 tok/s) [4 tokens, forward only]
+[cool 60s]
+
+--- ctx=p2k ---
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+Prefill: 13890.75 ms (1822 tokens, 131.2 tok/s)
+Decode: 42.13 ms/tok (23.7 tok/s) [4 tokens, forward only]
+[cool 60s]
+
+--- ctx=p4k ---
+	Temperature{mValue=60.2, mType=0, mName=AP, mStatus=0}
+Prefill: 32617.56 ms (3644 tokens, 111.7 tok/s)
+Decode: 54.84 ms/tok (18.2 tok/s) [4 tokens, forward only]
+[cool 60s]
