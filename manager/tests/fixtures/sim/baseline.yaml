@@ -177,8 +177,22 @@ dvfs:
     tau_s: 0.3
 
 derived:
+  # Phase 2: phase_throughput 내장 함수 사용.
+  # 인자: (phase, active_device, partition_ratio,
+  #         cpu_freq_mhz/cpu_max_freq_mhz, gpu_freq_mhz/gpu_max_freq_mhz,
+  #         memory_bw_utilization_pct,
+  #         base_tps_decode_gpu, base_tps_decode_cpu,
+  #         base_tps_decode_partition, base_tps_prefill_gpu)
   throughput_tps:
-    expr: "base_tps_decode_gpu * (gpu_freq_mhz / gpu_max_freq_mhz) * (1.0 - memory_bw_utilization_pct / 200.0)"
+    expr: >-
+      phase_throughput(phase, active_device, partition_ratio,
+                       cpu_freq_mhz / cpu_max_freq_mhz,
+                       gpu_freq_mhz / gpu_max_freq_mhz,
+                       memory_bw_utilization_pct,
+                       base_tps_decode_gpu, base_tps_decode_cpu,
+                       base_tps_decode_partition, base_tps_prefill_gpu) *
+      throttle_factor(throttle_delay_ms) *
+      skip_boost(skip_ratio)
     tau_s: 0.0
   tbt_ms:
     expr: "1000.0 / max(throughput_tps, 0.1)"
