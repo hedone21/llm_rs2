@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use crate::common::sim::{
     config::{ScenarioConfig, load_scenario},
     expr::ExprContext,
-    physics::{lag_step, step},
+    physics::{lag_step, step_raw as step},
     state::{EngineStateModel, PhysicalState},
 };
 

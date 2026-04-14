@@ -9,6 +9,9 @@
 
 #![allow(dead_code)]
 
+use std::time::Duration;
+
+use super::clock::VirtualClock;
 use super::compose;
 use super::config::ScenarioConfig;
 use super::derived;
@@ -48,16 +51,22 @@ pub fn lag_step(current: f64, target: f64, tau_s: f64, dt_s: f64) -> f64 {
 // 메인 step 함수
 // ─────────────────────────────────────────────────────────
 
-/// 1 tick(dt_s 초)을 진행한다.
-/// now_s: 현재 시각 (s), Phase 3에서 VirtualClock으로 교체 예정.
+/// 1 tick(dt 기간)을 진행한다.
+///
+/// `clock`의 현재 시각(`clock.now_secs()`)과 dt를 사용하므로
+/// 호출 전에 clock.advance(dt)를 해서는 안 된다.
+/// (advance는 harness에서 drain_until 이후에 별도로 수행한다.)
 pub fn step(
     state: &mut PhysicalState,
     engine: &EngineStateModel,
     cfg: &ScenarioConfig,
-    now_s: f64,
-    dt_s: f64,
+    clock: &VirtualClock,
+    dt: Duration,
     ctx: &mut ExprContext,
 ) -> Result<(), SimError> {
+    let now_s = clock.now_secs();
+    let dt_s = dt.as_secs_f64();
+
     // 1. DVFS 업데이트
     dvfs_update(state, cfg, dt_s);
 
@@ -74,6 +83,29 @@ pub fn step(
     derived::evaluate(state, engine, cfg, ctx)?;
 
     Ok(())
+}
+
+/// 하위 호환성 래퍼: now_s, dt_s를 직접 받아 step을 호출한다.
+/// Phase 2 테스트 코드에서 사용.
+pub fn step_raw(
+    state: &mut PhysicalState,
+    engine: &EngineStateModel,
+    cfg: &ScenarioConfig,
+    now_s: f64,
+    dt_s: f64,
+    ctx: &mut ExprContext,
+) -> Result<(), SimError> {
+    let mut clock = VirtualClock::new();
+    // now_s 만큼 시계를 미리 전진시킨다.
+    clock.advance(Duration::from_secs_f64(now_s));
+    step(
+        state,
+        engine,
+        cfg,
+        &clock,
+        Duration::from_secs_f64(dt_s),
+        ctx,
+    )
 }
 
 // ─────────────────────────────────────────────────────────
@@ -228,8 +260,7 @@ fn passive_dynamics(
             1.0
         };
         let growth = bytes_per_token as f64 * tokens_per_dt;
-        state.kv_cache_bytes =
-            (state.kv_cache_bytes + growth).min(state.kv_cache_capacity_bytes);
+        state.kv_cache_bytes = (state.kv_cache_bytes + growth).min(state.kv_cache_capacity_bytes);
     }
 }
 

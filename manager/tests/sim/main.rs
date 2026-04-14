@@ -7,3 +7,4 @@ mod common;
 
 mod test_config;
 mod test_physics;
+mod test_signal;
