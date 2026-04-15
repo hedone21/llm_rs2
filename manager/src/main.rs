@@ -62,8 +62,17 @@ impl TransportHandle {
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// SIGHUP 수신 시 true로 설정 — 메인 루프에서 검사하여 hot-reload를 실행한다.
+#[cfg(unix)]
+static SIGHUP_RELOAD: AtomicBool = AtomicBool::new(false);
+
 extern "C" fn handle_signal(_: libc::c_int) {
     SHUTDOWN.store(true, Ordering::Relaxed);
+}
+
+#[cfg(unix)]
+extern "C" fn handle_sighup(_: libc::c_int) {
+    SIGHUP_RELOAD.store(true, Ordering::Relaxed);
 }
 
 #[derive(Parser)]
@@ -107,6 +116,11 @@ fn main() -> anyhow::Result<()> {
         libc::signal(
             libc::SIGTERM,
             handle_signal as *const () as libc::sighandler_t,
+        );
+        #[cfg(unix)]
+        libc::signal(
+            libc::SIGHUP,
+            handle_sighup as *const () as libc::sighandler_t,
         );
     }
 
@@ -164,6 +178,25 @@ fn main() -> anyhow::Result<()> {
         if SHUTDOWN.load(Ordering::Relaxed) {
             shutdown.store(true, Ordering::Relaxed);
             break;
+        }
+
+        // ── SIGHUP: Lua 스크립트 hot-reload ─────────────────────────────────
+        #[cfg(unix)]
+        if SIGHUP_RELOAD.swap(false, Ordering::Relaxed) {
+            if let Some(path) = policy.script_path() {
+                let path = path.to_path_buf();
+                log::info!(
+                    "SIGHUP received — reloading policy script: {}",
+                    path.display()
+                );
+                if let Err(e) = policy.reload_script(&path) {
+                    log::error!("Policy hot-reload failed: {}", e);
+                } else {
+                    log::info!("Policy hot-reload succeeded");
+                }
+            } else {
+                log::warn!("SIGHUP received but policy does not support hot-reload");
+            }
         }
 
         // ── Engine message 수신 (unix transport일 때만 유효) ──────────────

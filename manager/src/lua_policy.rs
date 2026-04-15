@@ -332,6 +332,9 @@ impl EwmaReliefTable {
 
 pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 
+/// Lua 오류가 이 횟수 이상 연속 발생하면 영구 fallback으로 전환한다.
+const FALLBACK_ERROR_THRESHOLD: u32 = 3;
+
 /// 동시에 대기 가능한 in-flight observation 최대 개수.
 ///
 /// 정책이 3s 관측 지연을 채우기 전에 새 directive를 방출하면 이전 observation이
@@ -390,6 +393,12 @@ pub struct LuaPolicy {
     /// 큐 용량이 충분하면 0이어야 한다 — 값이 계속 증가하면 directive 방출률이
     /// 용량을 초과했다는 뜻이므로 `MAX_PENDING_OBSERVATIONS` 조정을 검토.
     observation_overrun_count: u64,
+    /// 연속 Lua 오류 횟수. FALLBACK_ERROR_THRESHOLD 도달 시 permanent_fallback으로 전환.
+    consecutive_errors: u32,
+    /// true이면 Lua VM을 호출하지 않고 내장 fallback 로직을 사용한다.
+    permanent_fallback: bool,
+    /// 로드된 Lua 스크립트 경로 (hot-reload에 사용).
+    script_path: std::path::PathBuf,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -482,6 +491,9 @@ impl LuaPolicy {
             clock,
             pending_relief_updates: Vec::new(),
             observation_overrun_count: 0,
+            consecutive_errors: 0,
+            permanent_fallback: false,
+            script_path: script_path.into(),
         })
     }
 
@@ -627,8 +639,46 @@ impl LuaPolicy {
         Ok(ctx)
     }
 
+    /// 내장 fallback 정책 — Lua VM 없이 신호 레벨만으로 커맨드를 생성한다.
+    ///
+    /// `permanent_fallback`이 true일 때 또는 Lua 오류 발생 시 대체 경로로 사용된다.
+    fn fallback_decide(&self, signal: &SystemSignal) -> Vec<EngineCommand> {
+        use llm_shared::Level;
+        match signal {
+            SystemSignal::MemoryPressure { level, .. } => match level {
+                Level::Normal => vec![EngineCommand::RestoreDefaults],
+                Level::Warning => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.85 }],
+                Level::Critical => vec![EngineCommand::KvEvictSliding { keep_ratio: 0.50 }],
+                Level::Emergency => vec![
+                    EngineCommand::KvEvictSliding { keep_ratio: 0.25 },
+                    EngineCommand::SetTargetTbt { target_ms: 500 },
+                ],
+            },
+            SystemSignal::ThermalAlert { level, .. } => match level {
+                Level::Normal | Level::Warning => vec![],
+                Level::Critical => vec![EngineCommand::Throttle { delay_ms: 100 }],
+                Level::Emergency => vec![EngineCommand::Throttle { delay_ms: 200 }],
+            },
+            SystemSignal::ComputeGuidance { level, .. } => match level {
+                Level::Normal | Level::Warning => vec![],
+                Level::Critical => vec![EngineCommand::Throttle { delay_ms: 50 }],
+                Level::Emergency => vec![EngineCommand::Throttle { delay_ms: 150 }],
+            },
+            SystemSignal::EnergyConstraint { .. } => vec![],
+        }
+    }
+
     /// Call `decide(ctx)` and parse the returned table into `Vec<EngineCommand>`.
-    fn call_decide(&self) -> Vec<EngineCommand> {
+    ///
+    /// 반환값: `(commands, was_fallback)`.
+    /// Lua 오류가 `FALLBACK_ERROR_THRESHOLD`회 연속 발생하면 `permanent_fallback = true`로
+    /// 전환하고 이후 호출에서는 Lua VM을 완전히 우회한다.
+    fn call_decide(&mut self, signal: &SystemSignal) -> (Vec<EngineCommand>, bool) {
+        // 영구 fallback 모드이면 즉시 반환
+        if self.permanent_fallback {
+            return (self.fallback_decide(signal), true);
+        }
+
         let result: LuaResult<Vec<EngineCommand>> = (|| {
             let globals = self.lua.globals();
             let decide: mlua::Function = globals.get("decide")?;
@@ -638,10 +688,27 @@ impl LuaPolicy {
         })();
 
         match result {
-            Ok(commands) => commands,
+            Ok(commands) => {
+                self.consecutive_errors = 0;
+                (commands, false)
+            }
             Err(e) => {
-                log::error!("Lua decide() error: {}", e);
-                Vec::new()
+                self.consecutive_errors += 1;
+                log::error!(
+                    "Lua decide() error (consecutive={}): {}",
+                    self.consecutive_errors,
+                    e
+                );
+                if self.consecutive_errors >= FALLBACK_ERROR_THRESHOLD {
+                    self.permanent_fallback = true;
+                    log::error!(
+                        "LuaPolicy: {} consecutive errors — switching to permanent fallback \
+                         (script: {})",
+                        self.consecutive_errors,
+                        self.script_path.display()
+                    );
+                }
+                (self.fallback_decide(signal), true)
             }
         }
     }
@@ -787,36 +854,39 @@ impl PolicyStrategy for LuaPolicy {
         // 3. Observation 체크
         self.check_observation();
 
-        // 4. Lua decide(ctx) 호출
-        let commands = self.call_decide();
+        // 4. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
+        let (commands, was_fallback) = self.call_decide(signal);
         if commands.is_empty() {
             None
         } else {
-            // Observation 큐잉 (단일 액션만). Multi-command directive는 어느
-            // command가 이후 pressure 변화를 일으켰는지 귀속 불가하므로 큐를
-            // 비운다. 큐 용량 초과 시 가장 오래된 observation을 드롭하고
-            // overrun을 기록한다.
-            if commands.len() == 1 {
-                let action_name = engine_command_to_action_name(&commands[0]);
-                let pressure = self.signal_state.pressure_with_thermal(
-                    self.adaptation_config.temp_safe_c,
-                    self.adaptation_config.temp_critical_c,
-                    self.trigger_engine.tbt_degradation_ratio(),
-                );
-                if self.observations.len() >= MAX_PENDING_OBSERVATIONS {
-                    let _ = self.observations.pop_front();
-                    self.observation_overrun_count += 1;
-                }
-                self.observations.push_back(ObservationContext {
-                    action: action_name,
-                    before: pressure,
-                    timestamp: self.clock.now(),
-                });
-            } else {
-                // Multi-command: 귀속 불가. 쌓여있던 관측들을 overrun으로 처리.
-                if !self.observations.is_empty() {
-                    self.observation_overrun_count += self.observations.len() as u64;
-                    self.observations.clear();
+            // fallback 경로의 커맨드는 relief 학습 대상이 아니므로 observation을 큐잉하지 않는다.
+            if !was_fallback {
+                // Observation 큐잉 (단일 액션만). Multi-command directive는 어느
+                // command가 이후 pressure 변화를 일으켰는지 귀속 불가하므로 큐를
+                // 비운다. 큐 용량 초과 시 가장 오래된 observation을 드롭하고
+                // overrun을 기록한다.
+                if commands.len() == 1 {
+                    let action_name = engine_command_to_action_name(&commands[0]);
+                    let pressure = self.signal_state.pressure_with_thermal(
+                        self.adaptation_config.temp_safe_c,
+                        self.adaptation_config.temp_critical_c,
+                        self.trigger_engine.tbt_degradation_ratio(),
+                    );
+                    if self.observations.len() >= MAX_PENDING_OBSERVATIONS {
+                        let _ = self.observations.pop_front();
+                        self.observation_overrun_count += 1;
+                    }
+                    self.observations.push_back(ObservationContext {
+                        action: action_name,
+                        before: pressure,
+                        timestamp: self.clock.now(),
+                    });
+                } else {
+                    // Multi-command: 귀속 불가. 쌓여있던 관측들을 overrun으로 처리.
+                    if !self.observations.is_empty() {
+                        self.observation_overrun_count += self.observations.len() as u64;
+                        self.observations.clear();
+                    }
                 }
             }
 
@@ -870,6 +940,74 @@ impl PolicyStrategy for LuaPolicy {
 
     fn observation_overrun_count(&self) -> u64 {
         LuaPolicy::observation_overrun_count(self)
+    }
+
+    /// Lua 스크립트 핫-리로드.
+    ///
+    /// 새 VM에서 스크립트 로드 + `decide` 함수 존재 검증에 성공한 경우에만
+    /// `self.lua`와 `self.script_path`를 교체한다. 실패 시 `self` 변경 없이 Err.
+    fn reload_script(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        // 1. 새 Lua VM 생성 (new()의 초기화 로직 복제)
+        // Safety: TABLE | STRING | MATH만 로드, I/O 없음.
+        let new_lua = unsafe {
+            Lua::unsafe_new_with(
+                StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+                mlua::LuaOptions::default(),
+            )
+        };
+        let _ = new_lua.set_memory_limit(4 * 1024 * 1024);
+
+        // 2. sys.* 헬퍼 등록
+        register_sys_helpers(&new_lua)
+            .map_err(|e| anyhow::anyhow!("reload: register_sys_helpers failed: {}", e))?;
+
+        // 3. 스크립트 파일 읽기 + 실행
+        let script = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("reload: read '{}' failed: {}", path.display(), e))?;
+        new_lua
+            .load(&script)
+            .set_name(path.to_string_lossy().as_ref())
+            .exec()
+            .map_err(|e| anyhow::anyhow!("reload: exec '{}' failed: {}", path.display(), e))?;
+
+        // 4. decide 함수 존재 확인
+        let globals = new_lua.globals();
+        let decide: Value = globals
+            .get("decide")
+            .map_err(|e| anyhow::anyhow!("reload: get 'decide' failed: {}", e))?;
+        if !decide.is_function() {
+            anyhow::bail!(
+                "reload: '{}' must define a global `decide(ctx)` function",
+                path.display()
+            );
+        }
+
+        // 5. (선택) POLICY_META 로깅
+        if let Ok(Value::Table(meta)) = globals.get::<Value>("POLICY_META") {
+            if let Ok(name) = meta.get::<String>("name") {
+                let version: String = meta.get::<String>("version").unwrap_or_default();
+                log::info!(
+                    "LuaPolicy reloaded: name={} version={} path={}",
+                    name,
+                    version,
+                    path.display()
+                );
+            }
+        } else {
+            log::info!("LuaPolicy reloaded: path={}", path.display());
+        }
+
+        // 6. 모두 성공한 경우에만 self 교체
+        self.lua = new_lua;
+        self.script_path = path.to_path_buf();
+        self.consecutive_errors = 0;
+        self.permanent_fallback = false;
+
+        Ok(())
+    }
+
+    fn script_path(&self) -> Option<&std::path::Path> {
+        Some(&self.script_path)
     }
 }
 
@@ -1249,27 +1387,37 @@ mod tests {
         f
     }
 
+    /// 테스트용 더미 SystemSignal (Lua parse 테스트에서 signal 내용은 무관).
+    fn dummy_signal() -> SystemSignal {
+        SystemSignal::MemoryPressure {
+            level: llm_shared::Level::Normal,
+            available_bytes: 4 * 1024 * 1024 * 1024,
+            total_bytes: 8 * 1024 * 1024 * 1024,
+            reclaim_target_bytes: 0,
+        }
+    }
+
     #[test]
     fn test_empty_decide() {
         let script = create_temp_script("function decide(ctx) return {} end");
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert!(cmds.is_empty());
     }
 
     #[test]
     fn test_nil_decide() {
         let script = create_temp_script("function decide(ctx) return nil end");
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert!(cmds.is_empty());
     }
 
@@ -1280,12 +1428,12 @@ mod tests {
                 return {{type = "throttle", delay_ms = 50}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::Throttle { delay_ms } => assert_eq!(*delay_ms, 50),
@@ -1300,12 +1448,12 @@ mod tests {
                 return {{type = "set_target_tbt", target_ms = 150}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SetTargetTbt { target_ms } => assert_eq!(*target_ms, 150),
@@ -1320,12 +1468,12 @@ mod tests {
                 return {{type = "layer_skip", skip_ratio = 0.25}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::LayerSkip { skip_ratio } => {
@@ -1342,12 +1490,12 @@ mod tests {
                 return {{type = "kv_evict_h2o", keep_ratio = 0.5}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::KvEvictH2o { keep_ratio } => {
@@ -1364,12 +1512,12 @@ mod tests {
                 return {{type = "kv_evict_sliding", keep_ratio = 0.6}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::KvEvictSliding { keep_ratio } => {
@@ -1386,12 +1534,12 @@ mod tests {
                 return {{type = "kv_streaming", sink_size = 4, window_size = 512}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::KvStreaming {
@@ -1412,12 +1560,12 @@ mod tests {
                 return {{type = "kv_merge_d2o", keep_ratio = 0.75}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::KvMergeD2o { keep_ratio } => {
@@ -1434,12 +1582,12 @@ mod tests {
                 return {{type = "kv_quant_dynamic", target_bits = 4}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::KvQuantDynamic { target_bits } => assert_eq!(*target_bits, 4),
@@ -1454,12 +1602,12 @@ mod tests {
                 return {{type = "switch_hw", device = "cpu"}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SwitchHw { device } => assert_eq!(device, "cpu"),
@@ -1474,12 +1622,12 @@ mod tests {
                 return {{type = "restore_defaults"}}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::RestoreDefaults));
     }
@@ -1494,12 +1642,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], EngineCommand::Suspend));
         assert!(matches!(cmds[1], EngineCommand::Resume));
@@ -1515,12 +1663,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 2);
         assert!(matches!(cmds[0], EngineCommand::KvEvictH2o { .. }));
         assert!(matches!(cmds[1], EngineCommand::SetTargetTbt { .. }));
@@ -1544,7 +1692,7 @@ mod tests {
         .unwrap();
 
         // No heartbeat yet -- kv_util defaults to 0.0
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert!(cmds.is_empty());
 
         // Send heartbeat with high kv_util
@@ -1574,7 +1722,7 @@ mod tests {
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::KvEvictSliding { .. }));
     }
@@ -1596,7 +1744,7 @@ mod tests {
         .unwrap();
 
         // No heartbeat -> empty active
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert!(cmds.is_empty());
 
         // Send heartbeat with active actions
@@ -1626,25 +1774,32 @@ mod tests {
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::RestoreDefaults));
     }
 
     #[test]
-    fn test_lua_error_returns_empty() {
+    fn test_lua_error_returns_fallback() {
+        // Lua 오류 시 fallback_decide()가 호출되어 was_fallback=true + non-empty commands 반환.
         let script = create_temp_script(
             r#"function decide(ctx)
                 error("intentional error")
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
-        assert!(cmds.is_empty());
+        let (cmds, was_fallback) = policy.call_decide(&dummy_signal());
+        // dummy_signal()은 Level::Normal MemoryPressure → RestoreDefaults
+        assert!(was_fallback, "should be fallback on Lua error");
+        assert_eq!(cmds.len(), 1);
+        assert!(
+            matches!(cmds[0], EngineCommand::RestoreDefaults),
+            "Level::Normal fallback should yield RestoreDefaults"
+        );
     }
 
     #[test]
@@ -1657,12 +1812,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         // Unknown action is skipped, throttle is kept
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 10 }));
@@ -1736,18 +1891,18 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
 
         // First two calls return empty
-        assert!(policy.call_decide().is_empty());
-        assert!(policy.call_decide().is_empty());
+        assert!(policy.call_decide(&dummy_signal()).0.is_empty());
+        assert!(policy.call_decide(&dummy_signal()).0.is_empty());
 
         // Third call triggers throttle
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::Throttle { delay_ms } => assert_eq!(*delay_ms, 3),
@@ -1758,7 +1913,7 @@ mod tests {
     #[test]
     fn test_mode_returns_normal() {
         let script = create_temp_script("function decide(ctx) return {} end");
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
@@ -1778,12 +1933,12 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         // On any Linux host, total should be > 0
         assert_eq!(cmds.len(), 1);
     }
@@ -1799,12 +1954,12 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
     }
 
@@ -1819,12 +1974,12 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
     }
 
@@ -1837,12 +1992,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SetPartitionRatio { ratio } => {
@@ -1861,12 +2016,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SetPrefillPolicy {
@@ -1892,12 +2047,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SetPrefillPolicy {
@@ -1923,12 +2078,12 @@ mod tests {
                 }
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SetPrefillPolicy {
@@ -1965,7 +2120,7 @@ mod tests {
         .unwrap();
 
         // No heartbeat yet — phase defaults to ""
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert!(cmds.is_empty());
 
         // Send heartbeat in prefill phase at 20%
@@ -1995,7 +2150,7 @@ mod tests {
         };
         policy.update_engine_state(&EngineMessage::Heartbeat(status));
 
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         match &cmds[0] {
             EngineCommand::SetPrefillPolicy { chunk_size, .. } => {
@@ -2019,12 +2174,12 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
         assert!(matches!(cmds[0], EngineCommand::Throttle { delay_ms: 1 }));
     }
@@ -2043,12 +2198,12 @@ mod tests {
                 return {}
             end"#,
         );
-        let policy = LuaPolicy::with_system_clock(
+        let mut policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
         .unwrap();
-        let cmds = policy.call_decide();
+        let cmds = policy.call_decide(&dummy_signal()).0;
         assert_eq!(cmds.len(), 1);
     }
 

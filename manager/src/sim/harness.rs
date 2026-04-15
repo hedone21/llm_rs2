@@ -479,6 +479,7 @@ fn observable_action_name(cmd: &EngineCommand) -> Option<String> {
         EngineCommand::SwitchHw { .. } => Some("switch_hw".to_string()),
         EngineCommand::SetPartitionRatio { .. } => Some("set_partition_ratio".to_string()),
         EngineCommand::LayerSkip { .. } => Some("layer_skip".to_string()),
+        EngineCommand::KvQuantDynamic { .. } => Some("kv_quant_dynamic".to_string()),
         // RestoreDefaults, RequestQcf, SetTargetTbt 등은 관측 불필요
         _ => None,
     }

@@ -78,6 +78,23 @@ pub trait PolicyStrategy: Send {
     fn observation_overrun_count(&self) -> u64 {
         0
     }
+
+    /// Lua 스크립트를 핫-리로드한다.
+    ///
+    /// 새 VM을 생성하고 스크립트를 검증한 뒤 성공 시에만 `self`를 교체한다.
+    /// 실패 시 `self` 변경 없이 `Err`를 반환한다.
+    ///
+    /// 기본 구현은 지원하지 않음을 알리는 에러를 반환한다.
+    fn reload_script(&mut self, _path: &std::path::Path) -> anyhow::Result<()> {
+        anyhow::bail!("reload_script not supported by this policy")
+    }
+
+    /// 현재 로드된 Lua 스크립트 경로를 반환한다.
+    ///
+    /// 기본 구현은 None (Lua 정책이 아닌 경우).
+    fn script_path(&self) -> Option<&std::path::Path> {
+        None
+    }
 }
 
 /// Seq ID 생성을 위한 단조 증가 카운터.
