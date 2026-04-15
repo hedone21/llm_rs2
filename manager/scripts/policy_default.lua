@@ -47,9 +47,10 @@ local THETA = {
 local PRESSURE_KEY = { mem = "memory", cpu = "cpu", gpu = "gpu", therm = "thermal" }
 
 -- Joint action registry (§4.6) — arity ≤ 2, 수동 등록만
+-- NOTE: kv_evict_sliding + kv_quant_dynamic은 같은 kv_quality 배타 그룹에 속하므로
+--       동시 발행 금지 (정확도 이중 훼손). 해당 조합은 등록하지 않는다.
 local JOINT_ACTIONS = {
-    kv_evict_plus_quant      = { components = { "kv_evict_sliding", "kv_quant_dynamic" } },
-    throttle_plus_layer_skip = { components = { "throttle",         "layer_skip"        } },
+    throttle_plus_layer_skip = { components = { "throttle", "layer_skip" } },
 }
 
 -- pressure.memory 값에 따른 파라미터 테이블
@@ -144,6 +145,15 @@ local function is_active_any(name, active)
 end
 
 function decide(ctx)
+    -- Joint action 검증 (ctx.is_joint_valid가 있을 때만 실행)
+    if ctx.is_joint_valid then
+        for jkey, jspec in pairs(JOINT_ACTIONS) do
+            if not ctx.is_joint_valid(jspec.components) then
+                error("Invalid joint action '" .. jkey .. "': conflicting components")
+            end
+        end
+    end
+
     local c = ctx.coef
     local t = c.trigger
     local p = c.pressure

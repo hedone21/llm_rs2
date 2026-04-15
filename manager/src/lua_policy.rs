@@ -424,6 +424,8 @@ pub struct LuaPolicy {
     history: VecDeque<HistoryEntry>,
     /// relief table 마지막 자동 저장 시각.
     last_persist_at: Option<std::time::Instant>,
+    /// 배타 그룹 맵 — ctx.is_joint_valid()에서 참조한다.
+    exclusion_groups: HashMap<String, Vec<String>>,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -468,6 +470,19 @@ impl LuaPolicy {
         script_path: &str,
         config: AdaptationConfig,
         clock: Arc<dyn Clock>,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_exclusions(script_path, config, clock, HashMap::new())
+    }
+
+    /// 배타 그룹 맵을 주입하여 LuaPolicy를 생성한다.
+    ///
+    /// `exclusion_groups`는 PolicyConfig에서 파싱한 문자열 맵이며,
+    /// `ctx.is_joint_valid(actions)` Lua 함수에서 참조된다.
+    pub fn new_with_exclusions(
+        script_path: &str,
+        config: AdaptationConfig,
+        clock: Arc<dyn Clock>,
+        exclusion_groups: HashMap<String, Vec<String>>,
     ) -> anyhow::Result<Self> {
         // Sandbox: only table + string + math (no io, os, debug, etc.)
         // Safety: we intentionally restrict stdlib to TABLE | STRING | MATH.
@@ -545,6 +560,7 @@ impl LuaPolicy {
             // 시작 시각을 기준점으로 초기화하여 첫 auto-persist는 인터벌 경과 후에 발생한다.
             // None이면 첫 process_signal 호출 즉시 저장되므로 MGR-093 위반.
             last_persist_at: Some(std::time::Instant::now()),
+            exclusion_groups,
         })
     }
 
@@ -711,6 +727,35 @@ impl LuaPolicy {
             history_table.set(i + 1, h)?;
         }
         ctx.set("history", history_table)?;
+
+        // ctx.is_joint_valid(action_list) — Lua에서 joint action 검증에 사용
+        // 인자: string 배열 (Lua table). 반환: boolean.
+        // 배타 그룹에 속한 두 액션이 동시에 포함되면 false를 반환한다.
+        {
+            let groups = self.exclusion_groups.clone();
+            let is_joint_valid = self.lua.create_function(move |_, tbl: Table| {
+                let mut names: Vec<String> = Vec::new();
+                for pair in tbl.pairs::<mlua::Value, String>() {
+                    match pair {
+                        Ok((_, v)) => names.push(v),
+                        Err(_) => continue,
+                    }
+                }
+                for members in groups.values() {
+                    let mut count = 0usize;
+                    for name in &names {
+                        if members.contains(name) {
+                            count += 1;
+                        }
+                        if count >= 2 {
+                            return Ok(false);
+                        }
+                    }
+                }
+                Ok(true)
+            })?;
+            ctx.set("is_joint_valid", is_joint_valid)?;
+        }
 
         Ok(ctx)
     }
@@ -2645,5 +2690,116 @@ mod tests {
             matches!(directive.commands[0], EngineCommand::KvEvictH2o { keep_ratio } if (keep_ratio - 0.5).abs() < f32::EPSILON),
             "Expected KvEvictH2o with keep_ratio=0.5"
         );
+    }
+
+    #[test]
+    fn ctx_is_joint_valid_returns_true_for_non_excluded_pair() {
+        let script = r#"
+            function decide(ctx)
+                -- throttle + layer_skip는 배타 그룹에 없으므로 valid
+                assert(ctx.is_joint_valid({"throttle", "layer_skip"}) == true,
+                    "throttle+layer_skip should be valid")
+                return {}
+            end
+        "#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("test.lua");
+        std::fs::write(&script_path, script).unwrap();
+
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        groups.insert(
+            "kv_quality".to_string(),
+            vec![
+                "kv_evict_sliding".to_string(),
+                "kv_evict_h2o".to_string(),
+                "kv_merge_d2o".to_string(),
+                "kv_quant_dynamic".to_string(),
+            ],
+        );
+
+        let policy = LuaPolicy::new_with_exclusions(
+            script_path.to_str().unwrap(),
+            AdaptationConfig::default(),
+            Arc::new(SystemClock::new()),
+            groups,
+        );
+        let mut policy = policy.unwrap();
+        let result = policy.process_signal(&dummy_signal());
+        // decide()에서 assert 통과 후 {} 반환 → None
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ctx_is_joint_valid_returns_false_for_excluded_pair() {
+        let script = r#"
+            function decide(ctx)
+                -- kv_evict_sliding + kv_quant_dynamic은 kv_quality 배타 그룹
+                assert(ctx.is_joint_valid({"kv_evict_sliding", "kv_quant_dynamic"}) == false,
+                    "kv_evict_sliding+kv_quant_dynamic should be invalid")
+                return {}
+            end
+        "#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("test2.lua");
+        std::fs::write(&script_path, script).unwrap();
+
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        groups.insert(
+            "kv_quality".to_string(),
+            vec![
+                "kv_evict_sliding".to_string(),
+                "kv_evict_h2o".to_string(),
+                "kv_merge_d2o".to_string(),
+                "kv_quant_dynamic".to_string(),
+            ],
+        );
+
+        let policy = LuaPolicy::new_with_exclusions(
+            script_path.to_str().unwrap(),
+            AdaptationConfig::default(),
+            Arc::new(SystemClock::new()),
+            groups,
+        );
+        let mut policy = policy.unwrap();
+        let result = policy.process_signal(&dummy_signal());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn ctx_is_joint_valid_single_action_always_valid() {
+        let script = r#"
+            function decide(ctx)
+                assert(ctx.is_joint_valid({"kv_evict_sliding"}) == true,
+                    "single action should always be valid")
+                assert(ctx.is_joint_valid({}) == true,
+                    "empty list should be valid")
+                return {}
+            end
+        "#;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script_path = dir.path().join("test3.lua");
+        std::fs::write(&script_path, script).unwrap();
+
+        let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+        groups.insert(
+            "kv_quality".to_string(),
+            vec![
+                "kv_evict_sliding".to_string(),
+                "kv_quant_dynamic".to_string(),
+            ],
+        );
+
+        let mut policy = LuaPolicy::new_with_exclusions(
+            script_path.to_str().unwrap(),
+            AdaptationConfig::default(),
+            Arc::new(SystemClock::new()),
+            groups,
+        )
+        .unwrap();
+        let result = policy.process_signal(&dummy_signal());
+        assert!(result.is_none());
     }
 }

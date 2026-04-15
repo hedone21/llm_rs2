@@ -128,6 +128,23 @@ mod hierarchical {
 
     use super::{PolicyStrategy, next_seq_id};
 
+    /// 선택된 커맨드 목록에 joint constraint 위반이 있는지 확인한다.
+    ///
+    /// 동일 배타 그룹에 두 개 이상의 액션이 포함되면 true를 반환한다.
+    fn has_joint_constraint_violation(
+        commands: &[ActionCommand],
+        registry: &ActionRegistry,
+    ) -> bool {
+        for i in 0..commands.len() {
+            for j in (i + 1)..commands.len() {
+                if registry.is_excluded(&commands[i].action, &commands[j].action) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// 이전 액션 효과 관측을 위한 컨텍스트.
     struct ObservationContext {
         /// 액션 적용 직전의 pressure 상태.
@@ -408,6 +425,16 @@ mod hierarchical {
             );
 
             if commands.is_empty() {
+                return None;
+            }
+
+            // Joint constraint 검증: 동일 배타 그룹의 두 액션이 같은 directive에 포함되면 드롭한다.
+            if has_joint_constraint_violation(&commands, &self.registry) {
+                let ids: Vec<ActionId> = commands.iter().map(|c| c.action).collect();
+                log::warn!(
+                    "[Pipeline] Joint constraint violation — dropping directive: {:?}",
+                    ids
+                );
                 return None;
             }
 
@@ -1779,6 +1806,106 @@ mod hierarchical {
                     id
                 );
             }
+        }
+
+        /// has_joint_constraint_violation: 배타 그룹 내 두 액션 포함 시 true 반환
+        #[test]
+        fn test_has_joint_constraint_violation_detected() {
+            use crate::action_registry::ActionRegistry;
+            use crate::config::{ActionConfig, PolicyConfig};
+            use crate::types::{ActionCommand, ActionParams, Operation};
+            use std::collections::HashMap;
+
+            let mut actions = HashMap::new();
+            for name in &["kv_evict_sliding", "kv_evict_h2o", "kv_quant_dynamic"] {
+                actions.insert(
+                    name.to_string(),
+                    ActionConfig {
+                        lossy: true,
+                        reversible: false,
+                        default_cost: 1.0,
+                    },
+                );
+            }
+            let mut exclusion_groups = HashMap::new();
+            exclusion_groups.insert(
+                "kv_quality".to_string(),
+                vec![
+                    "kv_evict_sliding".to_string(),
+                    "kv_evict_h2o".to_string(),
+                    "kv_quant_dynamic".to_string(),
+                ],
+            );
+            let config = PolicyConfig {
+                actions,
+                exclusion_groups,
+                ..Default::default()
+            };
+            let registry = ActionRegistry::from_config(&config);
+
+            // 같은 그룹의 두 액션 → violation
+            let cmds = vec![
+                ActionCommand {
+                    action: ActionId::KvEvictSliding,
+                    operation: Operation::Apply(ActionParams::default()),
+                },
+                ActionCommand {
+                    action: ActionId::KvQuantDynamic,
+                    operation: Operation::Apply(ActionParams::default()),
+                },
+            ];
+            assert!(
+                has_joint_constraint_violation(&cmds, &registry),
+                "kv_evict_sliding + kv_quant_dynamic should be a joint constraint violation"
+            );
+        }
+
+        /// has_joint_constraint_violation: 다른 그룹의 두 액션은 false 반환
+        #[test]
+        fn test_has_joint_constraint_violation_not_triggered() {
+            use crate::action_registry::ActionRegistry;
+            use crate::config::{ActionConfig, PolicyConfig};
+            use crate::types::{ActionCommand, ActionParams, Operation};
+            use std::collections::HashMap;
+
+            let mut actions = HashMap::new();
+            for name in &["throttle", "layer_skip", "kv_evict_sliding"] {
+                actions.insert(
+                    name.to_string(),
+                    ActionConfig {
+                        lossy: true,
+                        reversible: false,
+                        default_cost: 1.0,
+                    },
+                );
+            }
+            let mut exclusion_groups = HashMap::new();
+            exclusion_groups.insert(
+                "kv_quality".to_string(),
+                vec!["kv_evict_sliding".to_string()],
+            );
+            let config = PolicyConfig {
+                actions,
+                exclusion_groups,
+                ..Default::default()
+            };
+            let registry = ActionRegistry::from_config(&config);
+
+            // throttle + layer_skip는 같은 그룹 아님 → no violation
+            let cmds = vec![
+                ActionCommand {
+                    action: ActionId::Throttle,
+                    operation: Operation::Apply(ActionParams::default()),
+                },
+                ActionCommand {
+                    action: ActionId::LayerSkip,
+                    operation: Operation::Apply(ActionParams::default()),
+                },
+            ];
+            assert!(
+                !has_joint_constraint_violation(&cmds, &registry),
+                "throttle + layer_skip should NOT be a joint constraint violation"
+            );
         }
     }
 }

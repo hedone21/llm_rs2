@@ -1,3 +1,6 @@
+[policy.exclusion_groups]
+kv_quality = ["kv_evict_sliding", "kv_evict_h2o", "kv_merge_d2o", "kv_quant_dynamic"]
+
 [adaptation]
 ewma_alpha = 0.875
 relief_table_path = ""
