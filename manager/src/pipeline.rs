@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use llm_shared::{EngineDirective, EngineMessage, QcfEstimate, SystemSignal};
+use llm_shared::{EngineCommand, EngineDirective, EngineMessage, QcfEstimate, SystemSignal};
 
 use crate::types::OperatingMode;
 
@@ -1750,6 +1750,123 @@ mod hierarchical {
                 );
             }
         }
+    }
+}
+
+/// 연속으로 동일한 directive가 방출되는 것을 억제한다.
+///
+/// `process(directive)`는 `commands`가 마지막으로 방출된 배치와 다를 때만
+/// `Some(directive)`를 반환하고, 동일하면 `None`을 반환한다.
+pub struct DirectiveDeduplicator {
+    last_commands: Option<Vec<EngineCommand>>,
+}
+
+impl DirectiveDeduplicator {
+    pub fn new() -> Self {
+        Self {
+            last_commands: None,
+        }
+    }
+
+    /// 방출해야 하면 `Some(directive)`, 억제해야 하면 `None`을 반환한다.
+    pub fn process(&mut self, directive: EngineDirective) -> Option<EngineDirective> {
+        let is_dup = self.last_commands.as_ref() == Some(&directive.commands);
+        if is_dup {
+            None
+        } else {
+            self.last_commands = Some(directive.commands.clone());
+            Some(directive)
+        }
+    }
+}
+
+impl Default for DirectiveDeduplicator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::*;
+    use llm_shared::{EngineCommand, EngineDirective};
+
+    fn directive(commands: Vec<EngineCommand>) -> EngineDirective {
+        EngineDirective {
+            seq_id: 0,
+            commands,
+        }
+    }
+
+    fn sliding(keep_ratio: f32) -> EngineCommand {
+        EngineCommand::KvEvictSliding { keep_ratio }
+    }
+
+    fn h2o(keep_ratio: f32) -> EngineCommand {
+        EngineCommand::KvEvictH2o { keep_ratio }
+    }
+
+    // 케이스 1: 첫 번째 directive는 항상 통과
+    #[test]
+    fn first_directive_always_passes() {
+        let mut dedup = DirectiveDeduplicator::new();
+        let d = directive(vec![sliding(0.8)]);
+        assert!(dedup.process(d).is_some());
+    }
+
+    // 케이스 2: 동일 commands 연속 → 두 번째부터 억제
+    #[test]
+    fn identical_commands_suppressed() {
+        let mut dedup = DirectiveDeduplicator::new();
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none());
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none());
+    }
+
+    // 케이스 3: 같은 타입, 다른 파라미터 → 방출
+    #[test]
+    fn same_type_different_param_passes() {
+        let mut dedup = DirectiveDeduplicator::new();
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.5)])).is_some());
+    }
+
+    // 케이스 4: A → B → A 전환: 두 번째 A는 방출 (last=B이므로)
+    #[test]
+    fn cycle_a_b_a_emits_second_a() {
+        let mut dedup = DirectiveDeduplicator::new();
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some()); // A 방출
+        assert!(dedup.process(directive(vec![h2o(0.5)])).is_some()); // B 방출
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some()); // A 재방출
+    }
+
+    // 케이스 5: multi-command directive 동일하면 억제
+    #[test]
+    fn multi_command_identical_suppressed() {
+        let mut dedup = DirectiveDeduplicator::new();
+        let cmds = vec![sliding(0.8), h2o(0.5)];
+        assert!(dedup.process(directive(cmds.clone())).is_some());
+        assert!(dedup.process(directive(cmds)).is_none());
+    }
+
+    // 케이스 6: None(억제) 이후 다른 directive 방출 가능 확인
+    #[test]
+    fn after_suppression_different_command_passes() {
+        let mut dedup = DirectiveDeduplicator::new();
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none()); // 억제
+        assert!(dedup.process(directive(vec![h2o(0.5)])).is_some()); // 다른 커맨드 → 방출
+    }
+
+    // 케이스 7: 억제된 directive는 last_commands를 갱신하지 않음
+    // A → A(억제) → B 시퀀스에서 B는 A와 다르므로 방출되어야 한다.
+    #[test]
+    fn suppressed_does_not_update_last() {
+        let mut dedup = DirectiveDeduplicator::new();
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some()); // A
+        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none()); // A 억제 → last=A 유지
+        // B는 A와 다르므로 방출되어야 함
+        assert!(dedup.process(directive(vec![h2o(0.5)])).is_some()); // B
     }
 }
 

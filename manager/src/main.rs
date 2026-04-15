@@ -10,8 +10,8 @@ use llm_manager::monitor::energy::EnergyMonitor;
 use llm_manager::monitor::external::ExternalMonitor;
 use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
-use llm_manager::pipeline::PolicyStrategy;
-use llm_shared::{EngineCommand, EngineMessage, SystemSignal};
+use llm_manager::pipeline::{DirectiveDeduplicator, PolicyStrategy};
+use llm_shared::{EngineMessage, SystemSignal};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -158,7 +158,7 @@ fn main() -> anyhow::Result<()> {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     log::info!("Entering main loop");
-    let mut last_commands: Option<Vec<EngineCommand>> = None;
+    let mut dedup = DirectiveDeduplicator::new();
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             shutdown.store(true, Ordering::Relaxed);
@@ -219,12 +219,7 @@ fn main() -> anyhow::Result<()> {
                 log::info!("Signal: {:?}", signal);
 
                 if let Some(directive) = policy.process_signal(&signal) {
-                    let is_dup = last_commands
-                        .as_ref()
-                        .map_or(false, |lc| lc == &directive.commands);
-                    if is_dup {
-                        log::debug!("Directive suppressed (duplicate): {:?}", directive.commands);
-                    } else {
+                    if let Some(directive) = dedup.process(directive) {
                         log::info!(
                             "Directive seq={}: {} commands [mode={:?}]",
                             directive.seq_id,
@@ -234,7 +229,8 @@ fn main() -> anyhow::Result<()> {
                         if let Err(e) = transport.emitter().emit_directive(&directive) {
                             log::error!("Emit directive failed: {}", e);
                         }
-                        last_commands = Some(directive.commands.clone());
+                    } else {
+                        log::debug!("Directive suppressed (duplicate)");
                     }
                 }
             }
