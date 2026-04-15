@@ -13,10 +13,19 @@
 //!   - Repeat28MaskQ : 28 dispatches + mask + Q를 28-slot pool에서 rotate
 //!     → Q cold-cache 효과 측정 (production은 매 layer 다른 Q)
 //!
+//! 목적 3 (H2 GPU 캐시 thrashing 검증, 본 확장): Q1 dispatch 사이에 대용량
+//! 버퍼 read/write 커널을 삽입해 L2/SLC를 오염시킨 뒤 Q1 slope 변화 측정.
+//! production에서 Q1 직전에 QKV/RoPE/scatter, 직후에 FFN(~20MB Q4_0 streaming)이
+//! 실행되어 K/V가 cold-cache 상태로 밀려나는 효과를 흉내냄.
+//!   - Repeat28Pollute8  : 각 Q1 전 8MB streaming (LLC 일부 eviction)
+//!   - Repeat28Pollute32 : 각 Q1 전 32MB streaming (LLC 완전 eviction)
+//! production과 microbench 사이 Q1 slope 갭(microbench TIE, production 5.70 vs 7.32 μs/n_kv)이
+//! 주변 op의 캐시 thrashing으로 설명되는지 검증.
+//!
 //! 가설: incremental overhead 합이 production gap 0.11 μs/n_kv per layer
 //! (= 3.1 μs/n_kv per token) 를 설명한다.
 //!
-//! 모든 variant × 2 layout × 4 n_kv → 16 조합 × MEASURE_ITERS = 30 measurements.
+//! 모든 variant × 2 layout × 4 n_kv → 12 조합 × MEASURE_ITERS = 30 measurements.
 
 #[cfg(not(feature = "opencl"))]
 fn main() {
@@ -50,7 +59,16 @@ mod bench {
         pub num_dispatches: usize,
         pub use_mask: bool,
         pub vary_q: bool,
+        /// Q1 dispatch마다 앞에 삽입할 "cache pollute" 커널의 읽기 buffer 크기(MB).
+        /// 0 = 삽입 안 함. production에서 Q1 주변 FFN/QKV가 L2/SLC를 밀어내는 효과 흉내.
+        pub pollute_mb: usize,
+        /// true = dispatch마다 다른 cl_mem(K, V) 사용 (28×K + 28×V = 56 separate cl_mem).
+        /// production과 동일한 cl_mem 개수. false = 공유 K/V (llama.cpp처럼 1 cl_mem).
+        pub fragmented_kv: bool,
     }
+
+    /// Cache-pollute 커널용 최대 버퍼 크기. 변수 정의가 아닌 alloc 상한.
+    pub const POLLUTE_MAX_MB: usize = 64;
 
     pub const VARIANTS: &[Variant] = &[
         Variant {
@@ -58,24 +76,58 @@ mod bench {
             num_dispatches: 1,
             use_mask: false,
             vary_q: false,
+            pollute_mb: 0,
+            fragmented_kv: false,
         },
         Variant {
             name: "Repeat28",
             num_dispatches: N_LAYERS,
             use_mask: false,
             vary_q: false,
+            pollute_mb: 0,
+            fragmented_kv: false,
         },
         Variant {
             name: "Repeat28Mask",
             num_dispatches: N_LAYERS,
             use_mask: true,
             vary_q: false,
+            pollute_mb: 0,
+            fragmented_kv: false,
         },
         Variant {
             name: "Repeat28MaskQ",
             num_dispatches: N_LAYERS,
             use_mask: true,
             vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: false,
+        },
+        Variant {
+            name: "Repeat28Pollute8",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 8,
+            fragmented_kv: false,
+        },
+        Variant {
+            name: "Repeat28Pollute32",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 32,
+            fragmented_kv: false,
+        },
+        // 28 layer KV를 28 separate cl_mem으로 분리 — production 실제 구조.
+        // Contiguous(Repeat28MaskQ) 대비 slope 차이 → cl_mem 분리 오버헤드 격리 측정.
+        Variant {
+            name: "Repeat28Frag",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: true,
         },
     ];
 
@@ -90,12 +142,28 @@ mod bench {
         pub q_pool_buf: Mem,
         pub k_buf: Mem,
         pub v_buf: Mem,
+        /// 28 separate K cl_mem (production 구조 시뮬레이션, Repeat28Frag 전용)
+        pub k_bufs_frag: Vec<Mem>,
+        pub v_bufs_frag: Vec<Mem>,
         pub o_buf: Mem,
         pub mask_buf: Mem,
+        pub pollute_buf: Mem,
+        pub pollute_kernel: ocl::core::Kernel,
         pub q_slot_bytes: u64,
         pub gws: [usize; 3],
         pub lws: Option<[usize; 3]>,
     }
+
+    /// Cache-pollute 커널: streaming RW로 L2/SLC를 강제 eviction.
+    const POLLUTE_SRC: &str = r#"
+__kernel void pollute(__global float4* buf, const int elems4) {
+    const int gid = get_global_id(0);
+    if (gid < elems4) {
+        float4 v = buf[gid];
+        buf[gid] = v + (float4)(1e-30f);
+    }
+}
+"#;
 
     pub fn init() -> anyhow::Result<State> {
         let platform = Platform::default();
@@ -114,7 +182,21 @@ mod bench {
             .platform(platform)
             .devices(device)
             .build()?;
-        let queue = Queue::new(&context, device, Some(flags::QUEUE_PROFILING_ENABLE))?;
+        // LLMRS_MB_WALLCLOCK=1 → profile-events 플래그 없이 queue 생성.
+        // Wall-clock 측정 (Instant::now() + queue.finish()) 을 대신 사용하여
+        // production dispatch와 동일한 queue 설정으로 Q1 slope 격리 측정.
+        let wallclock_mode = std::env::var_os("LLMRS_MB_WALLCLOCK").is_some();
+        let queue_props = if wallclock_mode {
+            None
+        } else {
+            Some(flags::QUEUE_PROFILING_ENABLE)
+        };
+        let queue = Queue::new(&context, device, queue_props)?;
+        if wallclock_mode {
+            println!("# Mode: wallclock (no CL_QUEUE_PROFILING_ENABLE, Instant-based)");
+        } else {
+            println!("# Mode: profile-events (CL_QUEUE_PROFILING_ENABLE)");
+        }
 
         // 컴파일 옵션 — production과 동일
         let cl_c_version_str = device
@@ -191,6 +273,16 @@ mod bench {
         };
         let k_buf = alloc_kv()?;
         let v_buf = alloc_kv()?;
+
+        // Fragmented variant용 28 separate K/V buffers. 각 buffer는 1 layer KV size
+        // (N_H_KV * CAP * DK half = 4 MB) = production의 alloc_kv 단위와 동일.
+        // 56 separate cl_mem object를 만들어 driver bookkeeping 오버헤드를 격리.
+        let mut k_bufs_frag: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        let mut v_bufs_frag: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        for _ in 0..N_LAYERS {
+            k_bufs_frag.push(alloc_kv()?);
+            v_bufs_frag.push(alloc_kv()?);
+        }
 
         // Q pool: 28-slot, 각 slot = N_H_Q * DK F32. 슬롯별로 다른 값 채워서
         // Q variance variant에서 cold-cache 흉내.
@@ -322,6 +414,38 @@ mod bench {
         setup_static(&our_kernel)?;
         setup_static(&llama_kernel)?;
 
+        // Pollute buffer: POLLUTE_MAX_MB만큼 float4로 alloc. 초기값 non-zero.
+        let pollute_elems4: usize = (POLLUTE_MAX_MB * 1024 * 1024) / 16;
+        let pollute_host: Vec<f32> = vec![0.001; pollute_elems4 * 4];
+        let pollute_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                pollute_elems4 * 4,
+                None,
+            )?
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &queue,
+                &pollute_buf,
+                true,
+                0,
+                std::slice::from_raw_parts(
+                    pollute_host.as_ptr() as *const u8,
+                    pollute_elems4 * 4 * 4,
+                ),
+                None::<&Event>,
+                None::<&mut Event>,
+            )?;
+        }
+        let pollute_program = Program::builder()
+            .devices(device)
+            .src(POLLUTE_SRC)
+            .cmplr_opt(&cl_opts)
+            .build(&context)?;
+        let pollute_kernel = ocl::core::create_kernel(&pollute_program, "pollute")?;
+
         Ok(State {
             context,
             queue,
@@ -332,41 +456,102 @@ mod bench {
             q_pool_buf,
             k_buf,
             v_buf,
+            k_bufs_frag,
+            v_bufs_frag,
             o_buf,
             mask_buf,
+            pollute_buf,
+            pollute_kernel,
             q_slot_bytes,
             gws: [Q1_WG_SIZE, N_H_Q, 1],
             lws: Some([Q1_WG_SIZE, 1, 1]),
         })
     }
 
-    /// 한 measurement: variant.num_dispatches 만큼 dispatch, event 합산.
-    /// 반환값은 measurement 1 회의 sum-of-events μs (= per-token attention 비용).
+    /// 한 measurement: variant.num_dispatches 만큼 dispatch.
+    /// 기본은 event profiling 합산, LLMRS_MB_WALLCLOCK=1이면 Instant + queue.finish()로
+    /// wall-clock 측정. 반환값은 measurement 1회의 μs (= per-token attention 비용).
     fn measure_one(
         state: &State,
         kernel: &ocl::core::Kernel,
         variant: Variant,
     ) -> anyhow::Result<f64> {
-        let mut events: Vec<Event> = (0..variant.num_dispatches).map(|_| Event::null()).collect();
-        for (i, ev) in events.iter_mut().enumerate() {
+        let wallclock_mode = std::env::var_os("LLMRS_MB_WALLCLOCK").is_some();
+        let mut events: Vec<Event> = if wallclock_mode {
+            Vec::new()
+        } else {
+            (0..variant.num_dispatches).map(|_| Event::null()).collect()
+        };
+        let pollute_elems4: i32 = ((variant.pollute_mb * 1024 * 1024) / 16) as i32;
+        let pollute_gws: [usize; 3] = [pollute_elems4.max(1) as usize, 1, 1];
+        let pollute_lws: Option<[usize; 3]> = Some([64, 1, 1]);
+        if variant.pollute_mb > 0 {
+            ocl::core::set_kernel_arg(&state.pollute_kernel, 0, ArgVal::mem(&state.pollute_buf))?;
+            ocl::core::set_kernel_arg(&state.pollute_kernel, 1, ArgVal::scalar(&pollute_elems4))?;
+        }
+        let wc_start = if wallclock_mode {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+        for i in 0..variant.num_dispatches {
+            if variant.pollute_mb > 0 {
+                unsafe {
+                    ocl::core::enqueue_kernel(
+                        &state.queue,
+                        &state.pollute_kernel,
+                        1,
+                        None,
+                        &pollute_gws,
+                        pollute_lws,
+                        None::<&Event>,
+                        None::<&mut Event>,
+                    )?;
+                }
+            }
             if variant.vary_q {
                 let q_off = (i as u64) * state.q_slot_bytes;
                 ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&q_off))?;
             }
+            if variant.fragmented_kv {
+                ocl::core::set_kernel_arg(kernel, 2, ArgVal::mem(&state.k_bufs_frag[i]))?;
+                ocl::core::set_kernel_arg(kernel, 4, ArgVal::mem(&state.v_bufs_frag[i]))?;
+            }
             unsafe {
-                ocl::core::enqueue_kernel(
-                    &state.queue,
-                    kernel,
-                    2,
-                    None,
-                    &state.gws,
-                    state.lws,
-                    None::<&Event>,
-                    Some(ev),
-                )?;
+                if wallclock_mode {
+                    ocl::core::enqueue_kernel(
+                        &state.queue,
+                        kernel,
+                        2,
+                        None,
+                        &state.gws,
+                        state.lws,
+                        None::<&Event>,
+                        None::<&mut Event>,
+                    )?;
+                } else {
+                    ocl::core::enqueue_kernel(
+                        &state.queue,
+                        kernel,
+                        2,
+                        None,
+                        &state.gws,
+                        state.lws,
+                        None::<&Event>,
+                        Some(&mut events[i]),
+                    )?;
+                }
             }
         }
+        // Fragmented 종료 후 공유 K/V로 복원 (다음 variant 영향 방지)
+        if variant.fragmented_kv {
+            ocl::core::set_kernel_arg(kernel, 2, ArgVal::mem(&state.k_buf))?;
+            ocl::core::set_kernel_arg(kernel, 4, ArgVal::mem(&state.v_buf))?;
+        }
         ocl::core::finish(&state.queue)?;
+        if let Some(t0) = wc_start {
+            return Ok(t0.elapsed().as_nanos() as f64 / 1000.0);
+        }
         let mut sum_us = 0.0;
         for ev in &events {
             let s = ocl::core::get_event_profiling_info(ev, ProfilingInfo::Start)?.time()?;

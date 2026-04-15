@@ -5,7 +5,10 @@ use crate::core::memory::Memory;
 use anyhow::Result;
 use ocl::flags::MemFlags;
 use ocl::{Context, Queue};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+
+static KV_ALLOC_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 pub struct OpenCLMemory {
     #[allow(dead_code)]
@@ -63,6 +66,23 @@ impl Memory for OpenCLMemory {
             // Map for CPU access only during SwitchHw (via kv_migrate).
             // Note: OpenCL spec says writing to a mapped buffer via cl_mem is UB.
             let buffer = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
+
+            if std::env::var_os("LLMRS_LOG_KV_VMA").is_some() {
+                let idx = KV_ALLOC_COUNTER.fetch_add(1, Ordering::Relaxed);
+                match buffer.map() {
+                    Ok(host_ptr) => {
+                        eprintln!(
+                            "[KV_VMA] idx={:3} host_ptr={:p} size={}",
+                            idx, host_ptr, size
+                        );
+                        let _ = buffer.unmap();
+                    }
+                    Err(e) => {
+                        eprintln!("[KV_VMA] idx={} map failed: {}", idx, e);
+                    }
+                }
+            }
+
             let buf: Arc<dyn Buffer> = Arc::new(buffer);
             {
                 let mut mem = self.used_memory.lock().unwrap();

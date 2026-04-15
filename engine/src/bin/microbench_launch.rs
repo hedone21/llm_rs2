@@ -55,12 +55,7 @@ fn main() -> anyhow::Result<()> {
 
     // === 3. Dummy buffer (cl_int[1]) ===
     let dummy_buf: Mem = unsafe {
-        ocl::core::create_buffer::<_, i32>(
-            context.as_core(),
-            ocl::core::MEM_READ_WRITE,
-            1,
-            None,
-        )?
+        ocl::core::create_buffer::<_, i32>(context.as_core(), ocl::core::MEM_READ_WRITE, 1, None)?
     };
 
     // === 4. Warmup: 1000 launches + finish ===

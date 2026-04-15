@@ -191,7 +191,7 @@ impl TransformerLayer {
             backend.matmul_transposed(&ws.residual, &self.wv, &mut ws.v)?;
             clear_label();
             crate::core::thread_pool::get_pool().end_batch();
-            if is_gpu {
+            if is_gpu && std::env::var_os("LLMRS_DISABLE_FLUSH_QKV").is_none() {
                 backend.flush()?;
             }
         }
@@ -394,6 +394,11 @@ impl TransformerLayer {
                 // GPU attention or F16 KV cache - use backend's dtype-aware implementation.
                 // When need_scores is true, attention_gen() writes post-softmax scores
                 // directly into ws.scores, eliminating the separate CPU score recomputation.
+                let trace_q1 = is_gpu && std::env::var_os("LLMRS_TRACE_Q1").is_some();
+                if trace_q1 {
+                    backend.synchronize()?;
+                }
+                let q1_start = std::time::Instant::now();
                 backend.attention_gen(
                     &q_rope,
                     &k_cache,
@@ -409,6 +414,11 @@ impl TransformerLayer {
                         None
                     },
                 )?;
+                if trace_q1 {
+                    backend.synchronize()?;
+                    let us = q1_start.elapsed().as_nanos() as u64 / 1000;
+                    eprintln!("[Q1_TRACE] n_kv={} us={}", effective_cache_len, us);
+                }
             } else if is_q4_gpu {
                 // Q4_0 + GPU: read raw Q4_0 bytes from GPU, dequantize on CPU,
                 // compute attention, then write result back to GPU.
@@ -1096,7 +1106,7 @@ impl TransformerLayer {
             backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
             clear_label();
             crate::core::thread_pool::get_pool().end_batch();
-            if is_gpu {
+            if is_gpu && std::env::var_os("LLMRS_DISABLE_FLUSH_FFN").is_none() {
                 backend.flush()?;
             }
         }

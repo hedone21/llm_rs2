@@ -452,6 +452,11 @@ impl FullKernelPlan {
                             i, attn_seq_len, step.global_work_size, step.local_work_size
                         );
                     }
+                    let trace_q1 = std::env::var_os("LLMRS_TRACE_Q1").is_some();
+                    if trace_q1 {
+                        ocl::core::finish(queue).ok();
+                    }
+                    let q1_start = std::time::Instant::now();
                     Self::dispatch_step(
                         backend,
                         step,
@@ -463,6 +468,11 @@ impl FullKernelPlan {
                         q2t,
                         rt,
                     );
+                    if trace_q1 {
+                        ocl::core::finish(queue).ok();
+                        let us = q1_start.elapsed().as_nanos() as u64 / 1000;
+                        eprintln!("[Q1_TRACE] layer={} n_kv={} us={}", i, attn_seq_len, us);
+                    }
                     if debug_sync {
                         ocl::core::finish(queue).ok();
                         eprintln!(
