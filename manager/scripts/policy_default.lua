@@ -93,9 +93,10 @@ local function build_cmd(action, level, cpu_pressure)
     elseif action == "kv_quant_dynamic" then
         cmd.target_bits = p.target_bits
     elseif action == "throttle" then
-        -- cpu_pressure에 비례, 최소 20ms
+        -- cpu_pressure에 비례, 최소 20ms, 20ms 단위 양자화
+        -- (미세한 pressure 변동이 매 tick 다른 directive를 생성하지 않도록)
         local raw = math.floor(cpu_pressure * 200)
-        cmd.delay_ms = math.max(raw, 20)
+        cmd.delay_ms = math.max(math.floor(raw / 20) * 20, 20)
     elseif action == "set_target_tbt" then
         cmd.target_ms = 150
     elseif action == "layer_skip" then
@@ -158,12 +159,19 @@ function decide(ctx)
 
     -- 2. Z_k 계산 (multi-threshold excess virtual queue, docs/46 §4.2)
     local Z = {}
-    local has_emergency = false
+    -- has_compute_emergency: Safety Override predicate (cpu/gpu/therm만, §4.7.2)
+    --   throttle은 compute 부하를 낮추는 액션이므로 메모리 emergency에는 사용 안 함
+    -- any_emergency: latency hard floor 완화 predicate (모든 도메인)
+    --   어느 도메인이든 emergency면 latency를 더 양보하여 강한 조치를 허용
+    local has_compute_emergency = false
+    local any_emergency = false
     for dkey, pkey in pairs(PRESSURE_KEY) do
         local pv = p[pkey] or 0
         Z[dkey] = compute_Zk(pv, THETA[dkey])
-        -- Safety Override predicate: raw pressure 기준 (§4.7.2)
-        if pv >= THETA[dkey].emerg then has_emergency = true end
+        if pv >= THETA[dkey].emerg then
+            any_emergency = true
+            if dkey ~= "mem" then has_compute_emergency = true end
+        end
     end
 
     -- 모든 Z_k = 0 → 개입 불필요
@@ -180,7 +188,7 @@ function decide(ctx)
     local cpu_p = p.cpu or 0
 
     -- 4. Safe set: latency hard floor (Emergency 시 완화, §4.4)
-    local lat_floor = has_emergency and -DPP.C_EMERGENCY or -DPP.C
+    local lat_floor = any_emergency and -DPP.C_EMERGENCY or -DPP.C
 
     -- 5. Candidate 목록 (single action + joint action, §4.6)
     local candidates = {}
@@ -237,9 +245,11 @@ function decide(ctx)
     end
 
     -- 8. Safety Override (DPP 외부 레이어, §4.7)
-    -- Emergency 도메인이 있으면 DPP 결과와 무관하게 throttle 강제 추가.
+    -- Compute/thermal emergency 시 DPP 결과와 무관하게 throttle 강제 추가.
+    -- 메모리 emergency는 제외 — throttle은 compute 부하를 낮추는 액션이며
+    -- 메모리는 kv_evict 계열로 처리해야 함.
     -- NOTE: commands > 1 → lua_policy.rs가 observation을 clear함 (observation skip 자동 처리)
-    if has_emergency and not is_active("throttle", ctx.active) then
+    if has_compute_emergency and not is_active("throttle", ctx.active) then
         local has_thr = false
         for _, cmd in ipairs(primary_cmds) do
             if cmd.type == "throttle" then has_thr = true; break end
