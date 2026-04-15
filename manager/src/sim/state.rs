@@ -261,40 +261,38 @@ impl EngineStateModel {
 
     fn apply_command(&mut self, cmd: &EngineCommand, state: &mut PhysicalState) {
         match cmd {
+            // ── One-shot 액션 (KV cache eviction/quantization) ──
+            // 즉시 적용 후 종료되는 액션이므로 active_actions에 등록하지 않는다.
+            // 등록하면 is_active_any() 체크가 재발행을 영구 차단하여
+            // 메모리가 계속 높아도 추가 eviction이 일어나지 않는 문제가 발생한다.
             EngineCommand::KvEvictH2o { keep_ratio } => {
-                let ratio = *keep_ratio as f64;
-                self.last_evict_ratio = Some(ratio);
-                add_action(&mut self.active_actions, "kv_evict_h2o");
+                self.last_evict_ratio = Some(*keep_ratio as f64);
             }
             EngineCommand::KvEvictSliding { keep_ratio } => {
-                let ratio = *keep_ratio as f64;
-                self.last_evict_ratio = Some(ratio);
-                add_action(&mut self.active_actions, "kv_evict_sliding");
+                self.last_evict_ratio = Some(*keep_ratio as f64);
             }
             EngineCommand::KvMergeD2o { keep_ratio } => {
-                let ratio = *keep_ratio as f64;
-                self.last_evict_ratio = Some(ratio);
-                add_action(&mut self.active_actions, "kv_evict_d2o");
+                self.last_evict_ratio = Some(*keep_ratio as f64);
             }
+            EngineCommand::KvQuantDynamic { target_bits } => {
+                self.kv_quant_bits = Some(*target_bits);
+                state.kv_dtype = bits_to_dtype(*target_bits);
+            }
+            // ── Persistent 모드 액션 ──
+            // RestoreDefaults가 올 때까지 유지되는 액션. active_actions에 등록.
+            // 이름은 Lua 정책과 일치하도록 snake_case 사용.
             EngineCommand::Throttle { delay_ms } => {
                 self.throttle_delay_ms = *delay_ms as f64;
-                add_action(&mut self.active_actions, "Throttle");
+                add_action(&mut self.active_actions, "throttle");
             }
             EngineCommand::SwitchHw { device } => {
                 self.last_switch_device = Some(device.clone());
                 self.active_device = device.clone();
-                add_action(&mut self.active_actions, "SwitchHw");
+                add_action(&mut self.active_actions, "switch_hw");
             }
             EngineCommand::SetPartitionRatio { ratio } => {
                 self.partition_ratio = *ratio as f64;
-                add_action(&mut self.active_actions, "SetPartitionRatio");
-            }
-            EngineCommand::KvQuantDynamic { target_bits } => {
-                self.kv_quant_bits = Some(*target_bits);
-                // kv_dtype 갱신
-                let dtype = bits_to_dtype(*target_bits);
-                state.kv_dtype = dtype;
-                add_action(&mut self.active_actions, "KvQuantDynamic");
+                add_action(&mut self.active_actions, "set_partition_ratio");
             }
             EngineCommand::RestoreDefaults => {
                 self.active_actions.clear();
@@ -305,7 +303,7 @@ impl EngineStateModel {
             }
             EngineCommand::LayerSkip { skip_ratio } => {
                 self.skip_ratio = *skip_ratio as f64;
-                add_action(&mut self.active_actions, "LayerSkip");
+                add_action(&mut self.active_actions, "layer_skip");
             }
             EngineCommand::SetTargetTbt { target_ms } => {
                 self.tbt_target_ms = *target_ms as f64;

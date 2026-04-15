@@ -1,5 +1,6 @@
 ---
 source: manager/tests/sim/test_scenarios.rs
+assertion_line: 161
 expression: summary
 ---
 duration_s: 30
@@ -17,8 +18,8 @@ first_directive_at_s: 1
 state_final:
   kv_cache_bytes_mib: 2.8
   device_memory_used_mb: 3500
-  engine_cpu_pct: 85
-  engine_gpu_pct: 5.3
+  engine_cpu_pct: 30
+  engine_gpu_pct: 96
   cpu_freq_ratio: 1
   gpu_freq_ratio: 1
   thermal_c: 68

@@ -236,7 +236,9 @@ fn test_directive_triggers_observation_due_schedule() {
     );
 }
 
-/// 8. Evict directive 수신 시 engine.active_actions에 "kv_evict_*" 추가.
+/// 8. Evict directive 수신 시 engine state가 갱신된다.
+/// KvEvict*는 one-shot 액션이므로 active_actions에 등록되지 않는다.
+/// 대신 last_evict_ratio가 갱신되고 directive 기록이 남는다.
 #[test]
 fn test_apply_directive_changes_engine_state() {
     use llm_shared::SystemSignal;
@@ -264,13 +266,13 @@ fn test_apply_directive_changes_engine_state() {
     sim.run_for(Duration::from_millis(1500))
         .expect("run_for 1.5s");
 
-    // engine.active_actions에 kv_evict_h2o가 있어야 함
+    // KvEvict*는 one-shot 액션: active_actions에 등록되지 않음
     assert!(
-        sim.engine
+        !sim.engine
             .active_actions
             .iter()
             .any(|a| a.contains("kv_evict")),
-        "Evict directive 수신 후 engine.active_actions에 kv_evict_* 포함 필요, actual={:?}",
+        "KvEvict는 one-shot 액션이므로 active_actions에 포함되지 않아야 함, actual={:?}",
         sim.engine.active_actions
     );
 
