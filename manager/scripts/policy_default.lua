@@ -11,6 +11,10 @@
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
+--   1.0.1 (2026-04-15): pressure_level 임계값을 Rust MemoryMonitorConfig defaults에 정렬
+--     - emergency: 0.93 → 0.90 (available <= 10%)
+--     - critical:  0.85 → 0.80 (available <= 20%)
+--     - warning:   0.70 → 0.60 (available <= 40%)
 --   1.0.0 (2026-04-15): initial production policy
 --     - 3단계 pressure level (Warning/Critical/Emergency)
 --     - keep_ratio / target_bits / throttle delay_ms 동적화
@@ -18,14 +22,18 @@
 --     - restore_defaults 조건 단순화 (0.3 임계값 제거)
 --     - Emergency에서 보조 throttle 추가 (relief observation 포기 허용)
 
-POLICY_META = { name = "llm_default", version = "1.0.0" }
+POLICY_META = { name = "llm_default", version = "1.0.1" }
 
 -- pressure.memory 값에 따른 파라미터 테이블
--- level: "warning"(0.70~), "critical"(0.85~), "emergency"(0.93~)
+-- p.memory = 1.0 - (available / total) 즉 used 비율 (0.0~1.0)
+-- Rust MemoryMonitorConfig::default() 임계값과 정렬:
+--   Emergency : available <= 10%  → used >= 90%  → p.memory >= 0.90
+--   Critical  : available <= 20%  → used >= 80%  → p.memory >= 0.80
+--   Warning   : available <= 40%  → used >= 60%  → p.memory >= 0.60
 local function pressure_level(mem_pressure)
-    if mem_pressure >= 0.93 then return "emergency"
-    elseif mem_pressure >= 0.85 then return "critical"
-    elseif mem_pressure >= 0.70 then return "warning"
+    if mem_pressure >= 0.90 then return "emergency"
+    elseif mem_pressure >= 0.80 then return "critical"
+    elseif mem_pressure >= 0.60 then return "warning"
     else return "normal"
     end
 end

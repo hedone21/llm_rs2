@@ -112,6 +112,39 @@
 
 ---
 
+## [P2] policy_default.lua — action 계열 반복(연속 관측 실패 후 교체) 방지 논의 필요
+- **Status**: TODO (논의 필요, 구현 방향 미결)
+- **Sprint**: backlog
+- **Dependencies**: 없음
+- **Description**: |
+  external injection처럼 외부 압박이 지속되는 상황에서 kv_quant_dynamic을 반복 발동해도
+  memory가 실제로 줄지 않으면 EWMA relief가 감소한다.
+  relief argmax가 kv_evict_h2o로 교체되고, 그것도 관측 실패하면 다시 교체 → action 순환 발생.
+
+  관측된 사례 (2026-04-15 시뮬레이션):
+    t=1s  KvQuantDynamic(8) → obs#1 actual≈0 → EWMA 0.500→0.437
+    t=4s  KvQuantDynamic(4) → obs#2 actual≈0 → EWMA 0.437→0.383
+    t=7s  KvEvictH2o(0.5)   ← h2o prior(0.400) > quant learned(0.383)
+    t=10s KvQuantDynamic(4) ← h2o obs#1 후 quant가 다시 승리
+
+  논의 필요 사항:
+    A. active guard 확장: observation window(3s) 외에 "최근 N번 관측이 모두 낮으면
+       동일 계열 재선택 쿨다운" 추가 (ctx.history 활용 가능)
+    B. 계열(category) 개념 도입: kv_evict_*, kv_quant_* 묶어 동일 계열 내 교체 억제
+    C. 외부 압박 감지: memory가 지속 상승 중이면 relief 관측을 신뢰하지 않음 (p.memory
+       slope from ctx.history 로 판단)
+    D. 현행 유지: 실제 relief가 낮은 action을 자연스럽게 교체하는 것이 올바른 동작.
+       production에서 injection은 없으므로 real relief signal이 정확할 것.
+
+  주의: D 옵션이 맞을 수도 있음. 실기(Galaxy S25) 테스트 전에 변경 여부 결정 권장.
+- **Acceptance Criteria**: 논의 후 방향 결정, policy_default.lua 또는 lua_policy.rs 수정
+- **Notes**: |
+  - 관련 파일: manager/scripts/policy_default.lua (is_active 가드, observation window)
+  - ctx.history (ring buffer, 최근 10 tick) 이미 Lua에 노출됨 → slope 계산 가능
+  - EwmaReliefTable α=0.875: 관측 2회 후 prior 대비 ~23% 감소 (external pressure 상황)
+
+---
+
 # Spec-Implementation Divergence (2026-03-31 조사)
 
 > spec/에 정의되어 있지만 코드에 구현되지 않은 항목. 우선순위 순.
