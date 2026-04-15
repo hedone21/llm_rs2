@@ -29,7 +29,7 @@ function decide(ctx)
     local domains = {gpu = p.gpu, cpu = p.cpu, memory = p.memory, thermal = p.thermal}
     local max_domain, max_val = nil, 0
     for k, v in pairs(domains) do
-        if v > max_val then
+        if v > max_val or (v == max_val and max_domain ~= nil and k < max_domain) then
             max_domain = k
             max_val = v
         end
@@ -51,7 +51,9 @@ function decide(ctx)
 
     for action, r in pairs(c.relief) do
         local relief_val = r[domain_key] or 0
-        if relief_val > best_relief and (r.lat or 0) >= -0.15 then
+        local better = relief_val > best_relief
+        local tied   = relief_val == best_relief and best_action ~= nil and action < best_action
+        if (better or tied) and (r.lat or 0) >= -0.15 then
             best_action = action
             best_relief = relief_val
         end
