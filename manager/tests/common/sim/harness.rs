@@ -25,7 +25,7 @@ use super::physics;
 use super::signal;
 use super::state::{EngineStateModel, PhysicalState};
 use super::trajectory::Trajectory;
-use llm_manager::pipeline::PolicyStrategy;
+use llm_manager::pipeline::{DirectiveDeduplicator, PolicyStrategy};
 
 /// action 발동 후 관측 지연 (lua_policy.rs OBSERVATION_DELAY_SECS 복제).
 /// lua_policy는 cfg(feature="lua") 조건부이므로, 여기서 상수를 독립 보유한다.
@@ -80,6 +80,8 @@ pub struct Simulator {
     /// 직전 tick에 관측한 cumulative observation overrun count.
     /// 증가량만 trajectory에 새 이벤트로 기록하기 위한 값.
     last_overrun_count: u64,
+    /// 직전 방출 directive와 동일한 commands면 suppressed — main.rs와 동일 동작.
+    dedup: DirectiveDeduplicator,
 }
 
 impl Simulator {
@@ -100,6 +102,7 @@ impl Simulator {
             tick_dt: Duration::from_millis(50),
             ctx,
             last_overrun_count: 0,
+            dedup: DirectiveDeduplicator::new(),
         }
     }
 
@@ -147,6 +150,7 @@ impl Simulator {
             tick_dt: Duration::from_millis(50),
             ctx,
             last_overrun_count: 0,
+            dedup: DirectiveDeduplicator::new(),
         })
     }
 
@@ -273,8 +277,10 @@ impl Simulator {
                         signal::derive_signal(&event.kind, &self.state, &self.cfg, &mut self.rng)
                     {
                         if let Some(dir) = self.policy.process_signal(&sig) {
-                            self.apply_directive(&dir)?;
-                            self.trajectory.record_directive(at, &sig, &dir);
+                            if let Some(dir) = self.dedup.process(dir) {
+                                self.apply_directive(&dir)?;
+                                self.trajectory.record_directive(at, &sig, &dir);
+                            }
                         }
                         self.trajectory.record_signal(at, &sig);
                     }

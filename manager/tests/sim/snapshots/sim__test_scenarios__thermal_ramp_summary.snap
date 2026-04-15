@@ -9,10 +9,10 @@ signal_count_by_kind:
   energy_constraint: 15
   memory_pressure: 60
   thermal_alert: 30
-directive_count: 219
+directive_count: 2
 directive_kinds:
   SwitchHw: 1
-  Throttle: 219
+  Throttle: 2
 first_directive_at_s: 1
 state_final:
   kv_cache_bytes_mib: 2.8

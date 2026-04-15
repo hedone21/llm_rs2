@@ -9,15 +9,15 @@ signal_count_by_kind:
   energy_constraint: 15
   memory_pressure: 60
   thermal_alert: 30
-directive_count: 90
+directive_count: 4
 directive_kinds:
-  KvEvictH2o: 22
-  KvEvictSliding: 22
-  KvMergeD2o: 23
-  KvQuantDynamic: 23
+  KvEvictH2o: 1
+  KvEvictSliding: 1
+  KvMergeD2o: 1
+  KvQuantDynamic: 1
 first_directive_at_s: 7.5
 state_final:
-  kv_cache_bytes_mib: 829.37
+  kv_cache_bytes_mib: 830.23
   device_memory_used_mb: 11326.9
   engine_cpu_pct: 30
   engine_gpu_pct: 65

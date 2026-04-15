@@ -9,9 +9,9 @@ signal_count_by_kind:
   energy_constraint: 10
   memory_pressure: 40
   thermal_alert: 20
-directive_count: 149
+directive_count: 1
 directive_kinds:
-  KvEvictSliding: 149
+  KvEvictSliding: 1
 first_directive_at_s: 0.5
 state_final:
   kv_cache_bytes_mib: 41.49
