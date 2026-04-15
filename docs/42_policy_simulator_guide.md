@@ -555,16 +555,22 @@ relief updates: 0
 `Trajectory`에 `ReliefUpdate` 이벤트가 추가된다. JSON/CSV 덤프에도
 포함되므로 외부 도구로 시계열 분석이 가능하다.
 
-단일 슬롯 구조(`LuaPolicy.observation: Option<ObservationContext>`)의
-한계로, directive 방출 간격이 3s보다 짧으면 이전 observation이 덮어써진다.
-이 경우:
-- `[OVERRUN]` 이벤트가 trajectory에 기록
-- `sim.policy.observation_overrun_count()`로 누적 값 조회
-- 세션 요약에 경고 표시
+**Multi-slot observation queue (2026-04-15)**: `LuaPolicy`는 in-flight
+observation을 FIFO 큐(`VecDeque`, 용량 `MAX_PENDING_OBSERVATIONS=32`)로
+관리한다. 3s 관측 지연 동안 새 directive가 누적되어도 각 observation이
+독립적으로 성숙·업데이트된다. 큐 용량을 초과하면 가장 오래된 항목을
+드롭하고 `observation_overrun_count`를 증가시킨다 — 정상 상황에서는 0이며,
+값이 계속 증가하면 용량 조정 신호.
 
-고빈도 signal 환경(compute_guidance 4Hz 등)에서 범용 정책을 검증할 때
-반드시 확인해야 할 지표. production 배포에서도 발생하는 실제 문제이므로
-시뮬레이터로 먼저 드러내는 것이 목적.
+관측 지표:
+- `[RELIEF]` 이벤트가 trajectory에 기록 (action별 before/after relief, age_s)
+- `[OVERRUN]` 이벤트는 용량 초과시에만 기록 (정상 운영에서는 비어있음)
+- `sim.policy.observation_overrun_count()`로 누적 값 조회
+- `sim.policy.relief_snapshot()`으로 학습 상태 조회
+
+고빈도 signal 환경(compute_guidance 4Hz 등)에서도 multi-slot 큐가
+관측 소실 없이 학습을 누적하므로, 시간이 지나면 relief 테이블이 실제
+관측으로 수렴한다.
 
 ### 8.5 relief_snapshot
 

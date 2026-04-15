@@ -641,16 +641,37 @@ fn scenario_s25_memory_pressure_with_general_policy() {
         .or_else(|_| traj.assert_contains_directive_kind("Quant"))
         .expect("memory dominant pressure 시 Evict/Quant 계열 directive가 등장해야 함");
 
-    // 4) Session summary에 observation overrun이 감지되어야 함.
-    //    policy_example.lua는 signal 빈도가 높으면 매 signal마다 directive를 방출해
-    //    3s 관측 지연을 못 채우고 덮어써진다 — single-slot observation 구조의 한계.
+    // 4) Multi-slot observation queue는 관측 소실 없이 학습을 누적해야 한다.
+    //    30s 시뮬 동안 5~6 Hz directive rate × 3 s 지연 = 동시 in-flight ≤ 20,
+    //    MAX_PENDING_OBSERVATIONS=32 용량 안에서 전부 수용되어 overrun=0이어야 함.
+    let overrun = sim.policy.observation_overrun_count();
+    assert_eq!(
+        overrun, 0,
+        "multi-slot 큐는 현재 rate를 수용해야 함 — overrun 발생은 용량 조정 신호: {overrun}"
+    );
+
+    // 5) relief 테이블 업데이트가 실제로 발생해야 함 (학습 경로 동작 확인).
+    let update_count = sim
+        .trajectory()
+        .entries
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                crate::common::sim::trajectory::TrajectoryEntry::ReliefUpdate { .. }
+            )
+        })
+        .count();
+    assert!(
+        update_count >= 10,
+        "directive 방출 후 성숙한 observation이 relief 테이블에 누적되어야 함: \
+         ReliefUpdate 이벤트 {update_count}건"
+    );
+
+    // 6) summary에 overrun 경고가 **없어야** 함 (multi-slot 수용 증거).
     let summary = traj.format_session_summary();
     assert!(
-        summary.contains("observation overruns"),
-        "summary에 overrun 경고가 표시되어야 함:\n{summary}"
-    );
-    assert!(
-        sim.policy.observation_overrun_count() > 0,
-        "빠른 directive 방출로 overrun이 1회 이상 발생해야 함"
+        !summary.contains("observation overruns"),
+        "multi-slot 큐는 overrun이 없어야 하므로 summary에 경고가 표시되면 안 됨:\n{summary}"
     );
 }

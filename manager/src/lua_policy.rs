@@ -14,7 +14,7 @@
 use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineStatus, SystemSignal};
 use mlua::{Lua, Result as LuaResult, StdLib, Table, Value};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -307,6 +307,16 @@ impl EwmaReliefTable {
 
 pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 
+/// 동시에 대기 가능한 in-flight observation 최대 개수.
+///
+/// 정책이 3s 관측 지연을 채우기 전에 새 directive를 방출하면 이전 observation이
+/// 소실되던 single-slot 구조의 한계를 해소하기 위해 FIFO 큐로 전환했다
+/// (2026-04-15). 기본 용량 32는 ~10 Hz directive rate × 3 s = 30 동시 in-flight를
+/// 수용하도록 설정한다. 용량을 넘으면 가장 오래된 observation을 드롭하고
+/// `observation_overrun_count`를 증가시킨다.
+#[doc(hidden)]
+pub const MAX_PENDING_OBSERVATIONS: usize = 32;
+
 /// Relief 테이블 업데이트 이벤트 (관측성 훅).
 ///
 /// 시뮬레이터가 [`LuaPolicy::drain_relief_updates`]로 드레인해 trajectory에
@@ -346,13 +356,14 @@ pub struct LuaPolicy {
     signal_state: SignalState,
     trigger_engine: TriggerEngine,
     relief_table: EwmaReliefTable,
-    observation: Option<ObservationContext>,
+    observations: VecDeque<ObservationContext>,
     adaptation_config: AdaptationConfig,
     clock: Arc<dyn Clock>,
     /// 최근 발생한 relief 업데이트 이벤트 (시뮬레이터가 drain한다).
     pending_relief_updates: Vec<ReliefUpdateEvent>,
-    /// 3s 관측 지연을 채우기 전에 새 directive로 덮어써진 observation 수.
-    /// Single-slot observation 구조상 빠른 directive 방출 시 학습 누락 발생 감지용.
+    /// `MAX_PENDING_OBSERVATIONS` 용량 초과로 드롭된 observation 수.
+    /// 큐 용량이 충분하면 0이어야 한다 — 값이 계속 증가하면 directive 방출률이
+    /// 용량을 초과했다는 뜻이므로 `MAX_PENDING_OBSERVATIONS` 조정을 검토.
     observation_overrun_count: u64,
 }
 
@@ -441,7 +452,7 @@ impl LuaPolicy {
             signal_state: SignalState::default(),
             trigger_engine,
             relief_table,
-            observation: None,
+            observations: VecDeque::new(),
             adaptation_config: config,
             clock,
             pending_relief_updates: Vec::new(),
@@ -613,17 +624,22 @@ impl LuaPolicy {
 
 impl LuaPolicy {
     fn check_observation(&mut self) {
-        let obs = match self.observation.take() {
-            Some(obs) => obs,
-            None => return,
-        };
-
-        let elapsed = self.clock.now().saturating_duration_since(obs.timestamp);
-        if elapsed.as_secs_f64() < OBSERVATION_DELAY_SECS {
-            self.observation = Some(obs);
-            return;
+        // FIFO 큐: 오래된 observation부터 순서대로 확인한다. 큐가 삽입 시각 기준
+        // 단조 증가이므로 front가 아직 성숙하지 않았다면 뒤쪽도 성숙하지 않았다.
+        let now = self.clock.now();
+        while let Some(front) = self.observations.front() {
+            let elapsed = now.saturating_duration_since(front.timestamp);
+            if elapsed.as_secs_f64() < OBSERVATION_DELAY_SECS {
+                break;
+            }
+            // 성숙한 observation은 pop해서 처리.
+            let obs = self.observations.pop_front().expect("front checked above");
+            self.mature_observation(obs, elapsed.as_secs_f64());
         }
+    }
 
+    /// 성숙한 observation 하나를 처리하고 relief 테이블을 업데이트한다.
+    fn mature_observation(&mut self, obs: ObservationContext, age_s: f64) {
         let after = self.signal_state.pressure_with_thermal(
             self.adaptation_config.temp_safe_c,
             self.adaptation_config.temp_critical_c,
@@ -640,7 +656,6 @@ impl LuaPolicy {
         ];
 
         let before_relief = self.relief_table.predict(&obs.action);
-        let age_s = elapsed.as_secs_f64();
 
         log::info!(
             "Relief observation: action={}, observed=[{:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}]",
@@ -752,11 +767,10 @@ impl PolicyStrategy for LuaPolicy {
         if commands.is_empty() {
             None
         } else {
-            // Observation 시작 (단일 액션만). 기존 observation이 3s 지연을 못 채우고
-            // 덮어써지는 경우 overrun으로 집계 — 학습 누락 감지용.
-            if self.observation.is_some() {
-                self.observation_overrun_count += 1;
-            }
+            // Observation 큐잉 (단일 액션만). Multi-command directive는 어느
+            // command가 이후 pressure 변화를 일으켰는지 귀속 불가하므로 큐를
+            // 비운다. 큐 용량 초과 시 가장 오래된 observation을 드롭하고
+            // overrun을 기록한다.
             if commands.len() == 1 {
                 let action_name = engine_command_to_action_name(&commands[0]);
                 let pressure = self.signal_state.pressure_with_thermal(
@@ -764,13 +778,21 @@ impl PolicyStrategy for LuaPolicy {
                     self.adaptation_config.temp_critical_c,
                     self.trigger_engine.tbt_degradation_ratio(),
                 );
-                self.observation = Some(ObservationContext {
+                if self.observations.len() >= MAX_PENDING_OBSERVATIONS {
+                    let _ = self.observations.pop_front();
+                    self.observation_overrun_count += 1;
+                }
+                self.observations.push_back(ObservationContext {
                     action: action_name,
                     before: pressure,
                     timestamp: self.clock.now(),
                 });
             } else {
-                self.observation = None;
+                // Multi-command: 귀속 불가. 쌓여있던 관측들을 overrun으로 처리.
+                if !self.observations.is_empty() {
+                    self.observation_overrun_count += self.observations.len() as u64;
+                    self.observations.clear();
+                }
             }
 
             Some(EngineDirective {

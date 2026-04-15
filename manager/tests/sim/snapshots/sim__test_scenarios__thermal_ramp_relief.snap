@@ -2,10 +2,10 @@
 source: manager/tests/sim/test_scenarios.rs
 expression: formatted
 ---
-set_partition_ratio:
+throttle:
+  - -0
+  - 0.001
+  - 0.001
   - 0
-  - 0.005
-  - -0.001
-  - -0.002
-  - -0.131
+  - 1.37
   - 0
