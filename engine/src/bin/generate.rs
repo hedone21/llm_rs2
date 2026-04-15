@@ -3494,6 +3494,14 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             forward_ms_values.push(forward_ms);
+            if std::env::var("LLMRS_PER_TOKEN_MS").is_ok() {
+                eprintln!(
+                    "[PER_TOKEN] idx={} kv_pos={} forward_ms={:.3}",
+                    decode_token_index,
+                    kv_caches[0].current_pos,
+                    forward_ms
+                );
+            }
 
             // ── Experiment: inject directives at this token position ──
             let mut injected_signals: Vec<String> = Vec::new();
@@ -4272,6 +4280,18 @@ fn main() -> anyhow::Result<()> {
             1000.0 / avg_forward,
             forward_ms_values.len(),
         );
+        if forward_ms_values.len() >= 2 {
+            let tail = &forward_ms_values[1..];
+            let avg_tail: f64 = tail.iter().sum::<f64>() / tail.len() as f64;
+            let tok0 = forward_ms_values[0];
+            println!(
+                "Decode(excl tok[0]): {:.2} ms/tok ({:.1} tok/s) [{} tokens] | tok[0]={:.2} ms",
+                avg_tail,
+                1000.0 / avg_tail,
+                tail.len(),
+                tok0,
+            );
+        }
     }
     if !tbt_values.is_empty() {
         let avg_tbt: f64 = tbt_values.iter().sum::<f64>() / tbt_values.len() as f64;
