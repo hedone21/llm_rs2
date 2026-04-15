@@ -1,10 +1,8 @@
 # Manager Algorithms
 
-> **TL;DR**: Manager Policy Layer 내부 4개 핵심 알고리즘의 상세 명세.
-> (1) 도메인별 압력 계산: Compute/Thermal은 PI Controller (gain scheduling, anti-windup), Memory는 임계값 기반 직접 매핑 (OOM 즉각 대응). 전략 패턴으로 교체 가능.
-> (2) Supervisory: peak pressure 기반 3-state 운영 모드 판정.
-> (3) ActionSelector: 2^N 전수 탐색 cross-domain 조합 최적화.
-> (4) ReliefEstimator: RLS 온라인 선형 회귀로 액션 효과 예측.
+> **TL;DR**: Manager Policy Layer 내부 알고리즘의 상세 명세.
+> **HierarchicalPolicy (3.1~3.7)**: (1) 도메인별 압력 계산: Compute/Thermal은 PI Controller (gain scheduling, anti-windup), Memory는 임계값 기반 직접 매핑 (OOM 즉각 대응). 전략 패턴으로 교체 가능. (2) Supervisory: peak pressure 기반 3-state 운영 모드 판정. (3) ActionSelector: 2^N 전수 탐색 cross-domain 조합 최적화. (4) ReliefEstimator: RLS 온라인 선형 회귀로 액션 효과 예측.
+> **LuaPolicy DPP (3.8)**: Lyapunov Drift-Plus-Penalty 기반 온라인 자원 관리. Multi-threshold virtual queue + latency penalty로 다중 도메인 압력 해소를 선형 스칼라화. EwmaReliefTable로 relief 학습. Production 기본 정책.
 > 각 알고리즘은 의사코드, Contract (PRE/POST/INV), example trace를 포함한다.
 
 ## 1. Purpose and Scope
@@ -21,6 +19,7 @@
 - Observation relief 계산
 - EnergyConstraint max-floor 처리
 - process_signal 전체 파이프라인
+- LuaPolicy DPP (Drift-Plus-Penalty) 결정 알고리즘 — multi-threshold virtual queue, safe set, joint action, safety override, trigger engine
 
 **이 파일이 명세하지 않는 것:**
 
@@ -1107,6 +1106,659 @@ t=3.2s: signal=MemoryPressure (여전히 높음)
           estimator.observe(action, feature_vec, actual_relief)
           pending_observation = None
 ```
+
+### 3.8 LuaPolicy DPP Algorithm [MGR-DPP-010 ~ MGR-DPP-070]
+
+Production 정책 엔진인 `policy_default.lua` v2.1.0의 핵심 결정 알고리즘이다. Lyapunov Drift-Plus-Penalty (DPP) 프레임워크를 사용하여 다중 도메인 압력 해소와 latency 비용 간 최적 트레이드오프를 선형 스칼라화로 해결한다.
+
+> **HierarchicalPolicy와의 관계**: 3.1~3.7의 HierarchicalPolicy (PI + Supervisory + ActionSelector + RLS)는 `#[cfg(feature = "hierarchical")]` 경로에서만 활성화된다. LuaPolicy DPP는 기본 정책 경로이며, relief 학습에 EwmaReliefTable (MGR-ALG-080~083, INV-086~090)을 사용한다. 두 정책은 `Policy` 트레이트를 통해 교체 가능하다.
+
+#### MGR-DPP-010: DPP Objective Function
+
+DPP는 모든 candidate action에 대해 아래 목적 함수를 평가하고, 최대값을 달성하는 action을 선택한다. *(MUST)*
+
+```
+PRE:  Z_k >= 0 for all k, V >= 0, r_k(a) is predicted relief for domain k
+POST: a* is the action maximizing the objective among A_safe
+
+a* = argmax_{a ∈ A_safe} [ Σ_k Z_k · r_k(a)
+                            - V · max(-lat(a), 0)
+                            + UCB · ucb_bonus(a) ]
+```
+
+- `Z_k`: 도메인 k의 virtual queue 값 (압력의 가중 초과량). 높을수록 해당 도메인 해소에 높은 가치 부여.
+- `r_k(a)`: action a의 도메인 k에 대한 예측 relief. EwmaReliefTable.predict(a)에서 획득.
+- `lat(a)`: action a의 예측 latency 영향. 음수이면 latency 악화.
+- `V`: latency penalty weight. latency 보호와 압력 해소 간 트레이드오프 조절.
+- `UCB`: UCB bonus weight (기본 1.0). LinUCB confidence width를 score에 additive 반영.
+- `ucb_bonus(a)`: LinUCB가 산출하는 exploration bonus. `σ(a) · linucb_alpha`. LinUCB 비활성 시 0. 상세는 §3.9 참조.
+- `A_safe`: safe set. latency floor 제약을 만족하는 action 집합 (§3.8 MGR-DPP-020).
+
+**INV-093**: DPP objective는 Z_k=0인 도메인의 relief를 무시한다. 압력이 warn 이하인 도메인은 결정에 영향을 미치지 않는다.
+
+#### MGR-DPP-011: Multi-Threshold Excess Virtual Queue
+
+도메인 k의 virtual queue Z_k는 3단계 임계값 초과량의 가중합이다. *(MUST)*
+
+```
+PRE:  p_k in [0, 1], θ_warn < θ_crit < θ_emerg, all θ in (0, 1)
+POST: Z_k >= 0
+
+function compute_virtual_queue(p_k, thresholds) -> Z_k:
+    Z_k = W_WARN  * max(0, p_k - θ_warn)
+        + W_CRIT  * max(0, p_k - θ_crit)
+        + W_EMERG * max(0, p_k - θ_emerg)
+    return Z_k
+```
+
+상수:
+
+| 가중치 | 값 | 의미 |
+|--------|-----|------|
+| W_WARN | 1.0 | warning 초과분 기본 가중 |
+| W_CRIT | 2.0 | critical 초과분 2배 가중 |
+| W_EMERG | 4.0 | emergency 초과분 4배 가중 |
+
+**INV-094**: Z_k는 항상 비음수이다. p_k <= θ_warn이면 Z_k = 0이다.
+
+**INV-095**: 가중치 관계는 W_WARN < W_CRIT < W_EMERG를 유지한다. emergency 도메인은 항상 warning/critical보다 큰 Z_k를 가진다.
+
+#### MGR-DPP-012: Domain Thresholds
+
+도메인별 3단계 임계값 정의이다. *(MUST)*
+
+| 도메인 (k) | θ_warn | θ_crit | θ_emerg | 비고 |
+|------------|--------|--------|---------|------|
+| mem | 0.60 | 0.80 | 0.90 | 메모리: 낮은 warn으로 조기 대응 |
+| cpu | 0.70 | 0.85 | 0.95 | Compute |
+| gpu | 0.70 | 0.85 | 0.95 | Compute |
+| therm | 0.70 | 0.85 | 0.95 | Thermal |
+
+**INV-096**: 모든 도메인에서 θ_warn < θ_crit < θ_emerg가 성립한다.
+
+#### MGR-DPP-013: DPP Constants
+
+DPP 프레임워크의 전역 상수이다. *(MUST)*
+
+| 상수 | 값 | 의미 |
+|------|-----|------|
+| V | 1.0 | latency penalty weight. 클수록 latency 보호 우선. |
+| C | 0.30 | normal latency floor. lat(a) >= -C 를 만족해야 A_safe에 포함. |
+| C_EMERGENCY | 0.50 | emergency latency floor. emergency 도메인 존재 시 완화된 floor. |
+| UCB | 1.0 | LinUCB exploration bonus weight. ucb_bonus(a) 항의 가중치. |
+
+#### MGR-DPP-020: Safe Set Construction
+
+Candidate action의 safe set A_safe를 구성한다. latency floor 제약을 만족하는 action만 포함한다. *(MUST)*
+
+```
+PRE:  candidates is set of all candidate actions
+      has_emergency = any domain k where p_k >= θ_emerg
+POST: A_safe ⊆ candidates, all a in A_safe satisfy latency floor
+
+function build_safe_set(candidates, has_emergency) -> A_safe:
+    floor = if has_emergency then -C_EMERGENCY else -C
+    A_safe = { a ∈ candidates | lat(a) >= floor }
+    return A_safe
+```
+
+- `lat(a)`: EwmaReliefTable.predict(a)의 latency 차원 (index 4). 음수 = latency 악화.
+- Emergency 시 floor을 완화하여 더 공격적인 action 허용 (-0.50 vs -0.30).
+
+**INV-097**: A_safe가 비어있으면 no-op을 반환한다. latency floor을 위반하는 action은 절대 선택되지 않는다.
+
+#### MGR-DPP-030: Joint Action Registry
+
+2개 이하의 single action을 조합한 joint action을 정의한다. *(MUST)*
+
+```
+joint_actions = {
+    "throttle_plus_layer_skip":  ["throttle", "layer_skip"]
+}
+```
+
+> **v2.1.0 변경**: `kv_evict_plus_quant` (`kv_evict_sliding` + `kv_quant_dynamic`) 제거. 두 action은 `kv_quality` exclusion group에 속하므로 동시 발행이 금지된다 (INV-041). Joint action으로 등록하면 exclusion 위반이 되어 제거하였다.
+
+**ctx.is_joint_valid 검증**: `decide()` 진입 시, 모든 joint action의 component를 exclusion_groups로 검증한다. *(MUST)*
+
+```
+PRE:  joint_actions registry, exclusion_groups registry
+POST: all joint actions are valid, or error raised
+
+function validate_joint_actions(joint_actions, exclusion_groups):
+    for name, components in joint_actions:
+        if not ctx.is_joint_valid(components):
+            error("joint action '" .. name .. "' violates exclusion groups")
+```
+
+Joint action의 relief 추정:
+
+```
+PRE:  joint action J = {a1, a2}
+POST: predicted relief vector for J
+
+function predict_joint_relief(J) -> relief:
+    if ewma_table.has_entry(J.name):
+        return ewma_table.predict(J.name)    // 학습된 joint relief
+    else:
+        // fallback: component 선형 합
+        return ewma_table.predict(a1) + ewma_table.predict(a2)
+```
+
+**INV-098**: Joint action은 최대 2개의 component action으로 구성된다.
+
+**INV-099**: Joint relief fallback은 component relief의 선형 합이다. 학습된 joint relief가 존재하면 이를 우선 사용한다.
+
+#### MGR-DPP-040: Safety Override
+
+DPP 결정 외부에서 적용되는 강제 규칙이다. DPP가 선택한 action과 무관하게 적용된다. *(MUST)*
+
+```
+PRE:  dpp_result is the action selected by DPP objective
+      domain_levels is map of domain -> pressure_level
+POST: final_action with safety overrides applied
+
+function apply_safety_override(dpp_result, domain_levels) -> final_action:
+    final_action = dpp_result
+
+    // Compute 또는 Thermal이 emergency인 경우에만 throttle 강제 추가
+    if domain_levels["cpu"] == EMERGENCY
+       or domain_levels["gpu"] == EMERGENCY
+       or domain_levels["therm"] == EMERGENCY:
+        if "throttle" not in final_action:
+            final_action = final_action + "throttle"
+
+    // 주의: Memory emergency는 throttle을 강제하지 않음
+    // (throttle은 compute 액션이므로 memory 해소에 무효)
+
+    return final_action
+```
+
+**INV-100**: Safety Override는 compute/thermal emergency에서만 throttle을 추가한다. Memory emergency는 Safety Override 대상이 아니다.
+
+**INV-101**: Safety Override는 DPP 결과에 throttle을 **추가**만 한다. DPP가 선택한 action을 제거하지 않는다.
+
+#### MGR-DPP-050: Pressure Level to Parameter Mapping
+
+Pressure level에 따라 action의 세부 파라미터를 결정한다. *(MUST)*
+
+| Pressure Level | keep_ratio | target_bits | 적용 시나리오 |
+|---------------|------------|-------------|-------------|
+| emergency | 0.25 | 2 | 최대 공격: KV 75% evict, 2-bit quant |
+| critical | 0.50 | 4 | 강한 해소: KV 50% evict, 4-bit quant |
+| warning | 0.70 | 8 | 완만한 해소: KV 30% evict, 8-bit quant |
+| normal | 0.85 | 16 | 최소 개입 (거의 무손실) |
+
+Pressure level 판정:
+
+```
+function pressure_level(p_k, thresholds) -> level:
+    if p_k >= θ_emerg: return EMERGENCY
+    if p_k >= θ_crit:  return CRITICAL
+    if p_k >= θ_warn:  return WARNING
+    return NORMAL
+```
+
+#### MGR-DPP-060: Decision Pipeline (Full 6-Step)
+
+LuaPolicy의 `decide()` 호출 시 실행되는 전체 결정 파이프라인이다. *(MUST)*
+
+```
+PRE:  pressures is map of domain -> pressure value [0,1]
+      triggers is set of active TriggerEngine triggers
+      ewma_table is EwmaReliefTable instance
+      active_actions is set of currently active actions
+POST: list of EngineCommand (possibly empty)
+
+function decide(pressures, triggers, ewma_table, active_actions) -> commands:
+
+    // ── Step 1: Trigger 검사 ──
+    if triggers is empty:
+        if active_actions is not empty:
+            return restore_commands(active_actions)
+        return []
+
+    // ── Step 2: Virtual Queue 계산 + Emergency 판별 ──
+    has_emergency = false
+    Z = {}
+    for k in {mem, cpu, gpu, therm}:
+        Z[k] = compute_virtual_queue(pressures[k], thresholds[k])
+        if pressures[k] >= thresholds[k].emerg:
+            has_emergency = true
+
+    // ── Step 3: 전체 Z_k = 0 검사 ──
+    if all Z[k] == 0:
+        if active_actions is not empty:
+            return restore_commands(active_actions)
+        return []
+
+    // ── Step 4: Candidate 열거 (single + joint) ──
+    candidates = enumerate_single_actions()
+                 ∪ enumerate_joint_actions()
+
+    // ── Step 5: DPP Score 계산 + argmax ──
+    A_safe = build_safe_set(candidates, has_emergency)
+    if A_safe is empty:
+        return []
+
+    best = None, best_score = -∞
+    for a in A_safe:
+        relief = predict_relief(a)    // single or joint
+        resource_term = Σ_k Z[k] * relief[k]
+        latency_penalty = V * max(-relief.latency, 0)
+        ucb = UCB * (relief.ucb_bonus or 0)   // LinUCB bonus (§3.9)
+        score = resource_term - latency_penalty + ucb
+        if score > best_score:
+            best = a, best_score = score
+
+    // ── Step 6: Safety Override ──
+    domain_levels = { k: pressure_level(pressures[k], thresholds[k])
+                      for k in {mem, cpu, gpu, therm} }
+    final = apply_safety_override(best, domain_levels)
+
+    // 파라미터 결정: 최고 압력 도메인의 level 사용
+    peak_level = max(domain_levels.values())
+    params = parameter_mapping(peak_level)
+
+    return build_commands(final, params)
+```
+
+**INV-102**: Step 1에서 trigger가 없으면 Step 2~6을 실행하지 않는다. Trigger가 없는 상태에서 새 action을 발행하지 않는다.
+
+**INV-103**: Step 5에서 score 비교는 strict greater-than이다. 동점 시 먼저 열거된 candidate가 선택된다.
+
+#### MGR-DPP-061: TriggerEngine Hysteresis
+
+TriggerEngine은 hysteresis 기반 3개 trigger를 관리한다. *(MUST)*
+
+```
+triggers = {
+    tbt_degraded: { enter: 0.30, exit: 0.10 },   // TBT 열화율
+    mem_low:      { enter: 0.80, exit: 0.60 },   // 메모리 사용률
+    temp_high:    { enter: 0.70, exit: 0.50 }    // 온도 사용률
+}
+```
+
+```
+PRE:  value in [0, 1], trigger has state {active: bool, enter: float, exit: float}
+POST: trigger.active updated
+
+function update_trigger(trigger, value):
+    if trigger.active:
+        if value < trigger.exit:
+            trigger.active = false
+    else:
+        if value >= trigger.enter:
+            trigger.active = true
+```
+
+- `tbt_degraded`의 value: `(current_tbt - baseline_tbt) / baseline_tbt`. TBT baseline은 EWMA (alpha=0.875, warmup=20 tokens).
+
+**INV-104**: Hysteresis 간격(enter - exit)은 양수이다. enter > exit가 항상 성립한다.
+
+**INV-105**: TBT baseline EWMA warmup 기간(20 tokens) 동안 `tbt_degraded` trigger는 활성화되지 않는다.
+
+#### MGR-DPP-062: EwmaReliefTable Integration
+
+DPP는 EwmaReliefTable을 통해 relief를 예측하고 학습한다. 상세 수식은 MGR-ALG-080~083 및 INV-086~090을 참조한다. *(MUST)*
+
+```
+Relief 벡터: 6D = [gpu, cpu, memory, thermal, latency, main_app_qos]
+EWMA alpha: 0.875
+Observation delay: 3초
+Cold start: default prior 사용 (observation_count == 0 → 직접 대입, INV-087)
+```
+
+DPP objective에서 사용하는 도메인 매핑:
+
+| DPP 도메인 k | Relief 벡터 index | 용도 |
+|-------------|------------------|------|
+| gpu | 0 | Z_gpu · r_gpu(a) |
+| cpu | 1 | Z_cpu · r_cpu(a) |
+| mem | 2 | Z_mem · r_mem(a) |
+| therm | 3 | Z_therm · r_therm(a) |
+| (latency) | 4 | V · max(-lat(a), 0) penalty |
+| (main_app_qos) | 5 | (현재 DPP objective에 미사용) |
+
+#### MGR-DPP-070: Example Trace — Memory Critical + Thermal Warning
+
+```
+상태: mem=0.82, cpu=0.40, gpu=0.50, therm=0.72
+      triggers = {mem_low: active, temp_high: active}
+      active_actions = {}
+
+Step 1: triggers not empty → 진행
+
+Step 2: Virtual Queue 계산
+  Z_mem   = 1.0 * max(0, 0.82 - 0.60)   // 0.22
+          + 2.0 * max(0, 0.82 - 0.80)   // 0.04
+          + 4.0 * max(0, 0.82 - 0.90)   // 0.00
+          = 0.26
+  Z_cpu   = 1.0 * max(0, 0.40 - 0.70)   = 0.00
+  Z_gpu   = 1.0 * max(0, 0.50 - 0.70)   = 0.00
+  Z_therm = 1.0 * max(0, 0.72 - 0.70)   // 0.02
+          + 2.0 * max(0, 0.72 - 0.85)   // 0.00
+          + 4.0 * max(0, 0.72 - 0.95)   // 0.00
+          = 0.02
+  has_emergency = false (모든 도메인 < θ_emerg)
+
+Step 3: Z_mem=0.26, Z_therm=0.02 → 진행 (not all zero)
+
+Step 4: Candidates (예시 relief from EwmaReliefTable, ucb_bonus from LinUCB §3.9)
+  kv_evict_sliding:  relief = [0.0, 0.0, 0.35, 0.0, -0.15, 0.0], ucb_bonus = 0.05
+  kv_quant_dynamic:  relief = [0.0, 0.0, 0.20, 0.0, -0.10, 0.0], ucb_bonus = 0.02
+  throttle:          relief = [0.15, 0.10, 0.0, 0.25, -0.20, 0.0], ucb_bonus = 0.08
+
+  > v2.1.0: kv_evict_plus_quant 제거 (kv_quality exclusion group 위반)
+
+Step 5: DPP Score (V=1.0, UCB=1.0)
+  kv_evict_sliding:
+    resource_term = 0.26*0.35 + 0.02*0.0 = 0.091
+    latency_penalty = 1.0 * max(0.15, 0) = 0.15
+    ucb = 1.0 * 0.05 = 0.05
+    score = 0.091 - 0.15 + 0.05 = -0.009
+
+  kv_quant_dynamic:
+    resource_term = 0.26*0.20 = 0.052
+    latency_penalty = 1.0 * max(0.10, 0) = 0.10
+    ucb = 1.0 * 0.02 = 0.02
+    score = 0.052 - 0.10 + 0.02 = -0.028
+
+  throttle:
+    resource_term = 0.00*0.15 + 0.00*0.10 + 0.26*0.0 + 0.02*0.25 = 0.005
+    latency_penalty = 1.0 * max(0.20, 0) = 0.20
+    ucb = 1.0 * 0.08 = 0.08
+    score = 0.005 - 0.20 + 0.08 = -0.115
+
+  Safe set (floor = -C = -0.30):
+    모든 candidate의 lat(a) >= -0.30 → 전원 포함
+
+  Best: kv_evict_sliding (score = -0.009)
+
+Step 6: Safety Override
+  domain_levels = {mem: CRITICAL, cpu: NORMAL, gpu: NORMAL, therm: WARNING}
+  compute/thermal emergency 없음 → override 없음
+
+Result: [KvEvictSliding { keep_ratio: 0.50 }]
+  (peak_level = CRITICAL → keep_ratio=0.50)
+```
+
+> **해석**: v2.1.0에서 UCB bonus가 추가되어, LinUCB exploration이 score에 반영된다. kv_evict_sliding은 관측이 적어 ucb_bonus가 높고 (0.05), 이것이 latency penalty를 상쇄하여 kv_quant_dynamic보다 높은 score를 달성했다. LinUCB 비활성 시 (ucb_bonus=0) kv_quant_dynamic이 선택되어 기존 동작과 동일하다.
+
+### 3.9 LinUCB Exploration Bonus [MGR-LUCB-010 ~ MGR-LUCB-070]
+
+DPP (§3.8)의 score에 LinUCB (Linear Upper Confidence Bound) exploration bonus를 additive로 통합한다. LinUCB는 DPP를 대체하지 않으며, EwmaReliefTable의 점추정(mean)을 유지하면서 uncertainty(σ)를 추가하여 exploration을 개선한다. Safe set은 기존 DPP (§3.8 MGR-DPP-020)를 그대로 사용한다.
+
+> **EwmaReliefTable과의 관계**: Mean 추정은 EWMA가 담당하고 (빠른 수렴, 단순), uncertainty 추정은 LinUCB P matrix가 담당한다 (정확한 confidence width). `ucb_bonus = σ · linucb_alpha`가 DPP score에 additive로 더해진다.
+
+#### MGR-LUCB-010: LinUCB + DPP Additive Bonus
+
+DPP objective에 LinUCB exploration bonus를 additive 항으로 추가한다. *(MUST)*
+
+```
+PRE:  Z_k >= 0 for all k, V >= 0
+      r̂_k(a): EwmaReliefTable 점추정 (mean)
+      ucb_bonus(a): LinUCB confidence width σ(a) · linucb_alpha
+POST: a* is the action maximizing the objective among A_safe
+
+score(a) = Σ_k Z_k · r̂_k(a)
+           - V · max(-lât(a), 0)
+           + UCB · ucb_bonus(a)
+
+a* = argmax_{a ∈ A_safe} score(a)
+```
+
+- `ucb_bonus(a)`: `σ(a, φ) · linucb_alpha`. σ가 크면 (관측 적음) bonus가 크다 → exploration 유도.
+- `UCB`: DPP 상수 (기본 1.0). §3.8 MGR-DPP-013 참조.
+- `A_safe`: 기존 DPP safe set (§3.8 MGR-DPP-020). Pessimistic safe set은 사용하지 않는다.
+- DPP 상수 (V, C, C_EMERGENCY, W_*, THETA)는 §3.8과 동일하게 적용한다.
+
+**INV-106**: `linucb_alpha=0`이면 `ucb_bonus(a)=0`이 되어, objective는 §3.8 MGR-DPP-010의 기존 DPP objective와 수학적으로 동일하다.
+
+#### MGR-LUCB-011: LinUcbTable 인터페이스
+
+Per-action P matrix (= V^{-1}) 관리 구조체이다. *(MUST)*
+
+```
+PRE:  action name, feature vector φ ∈ R^D (D = LINUCB_FEATURE_DIM = 13)
+POST: scalar ucb_bonus
+
+struct LinUcbTable:
+    // Per-action D×D P matrix (= V⁻¹). action 미등록 시 None.
+    tables: HashMap<String, [[f32; D]; D]>
+
+    ucb_bonus(action: str, φ: R^D) -> f32
+    update(action: str, φ: R^D)
+```
+
+- `ucb_bonus`: σ = sqrt(max(0, φᵀ · P · φ)). P가 없으면 (cold start) 1.0을 반환하여 최대 탐색을 유도한다.
+- `update`: Sherman-Morrison으로 P matrix를 갱신한다 (§3.9 MGR-LUCB-013 참조).
+- b, theta 벡터는 관리하지 않는다. Mean 추정은 EWMA가 전담한다.
+
+**INV-107**: `ucb_bonus`는 읽기 전용이다. P matrix를 변경하지 않는다. (MGR-C08 정신 계승)
+
+**INV-108**: σ >= 0. `max(0, φᵀ·P·φ)` + `sqrt`로 비음수가 보장된다.
+
+#### MGR-LUCB-012: Feature Vector 정의 (13D)
+
+LinUCB에 입력되는 context feature vector이다. HierarchicalPolicy FeatureVector와 동일한 레이아웃이다. *(MUST)*
+
+```
+PRE:  SignalState, Heartbeat, active_actions available
+POST: φ ∈ R^D, D = 13, all elements in [0, 1]
+
+LINUCB_FEATURE_DIM = 13
+
+φ = [
+    0:  KV_OCCUPANCY,       // Heartbeat.kv_cache_utilization      [0,1]
+    1:  IS_GPU,             // 1.0 if GPU backend, 0.0 otherwise   {0,1}
+    2:  TOKEN_PROGRESS,     // min(tokens_generated / max_tokens, 1.0) [0,1]
+    3:  IS_PREFILL,         // 1.0 if prefill phase, 0.0 otherwise {0,1}
+    4:  KV_DTYPE_NORM,      // kv_dtype encoding normalized        [0,1]
+    5:  TBT_RATIO,          // current_tbt / baseline_tbt          [0,1] (clamped)
+    6:  TOKENS_GEN_NORM,    // min(tokens_generated / 1000, 1.0)   [0,1]
+    7:  ACTIVE_SWITCH_HW,   // 1.0 if switch_hw active             {0,1}
+    8:  ACTIVE_THROTTLE,    // 1.0 if throttle active               {0,1}
+    9:  ACTIVE_KV_OFFLOAD,  // 1.0 if kv_offload active             {0,1}
+    10: ACTIVE_EVICTION,    // 1.0 if kv_evict_* active             {0,1}
+    11: ACTIVE_LAYER_SKIP,  // 1.0 if layer_skip active             {0,1}
+    12: ACTIVE_KV_QUANT,    // 1.0 if kv_quant_dynamic active       {0,1}
+]
+```
+
+- Feature dimension D = 13. Context 7D (indices 0~6) + active action indicators 6D (indices 7~12).
+- 모든 feature는 [0, 1] 범위로 정규화된다.
+- Active action indicator는 현재 실행 중인 action의 존재 여부를 이진 인코딩한다.
+
+**INV-109**: Feature vector의 모든 원소는 [0, 1] 범위이다.
+
+#### MGR-LUCB-013: P Matrix 관리 (Sherman-Morrison)
+
+Per-action P matrix (= V^{-1})의 갱신 규칙이다. b, theta는 관리하지 않는다. *(MUST)*
+
+```
+초기화 (action 첫 등록 시):
+    P = (1/λ) · I_D       // D × D, λ = 1.0 → P = I_D
+                           // V = λI → P = V⁻¹ = (1/λ)I
+
+갱신 (update 호출 시):
+    PRE:  φ ∈ R^D, P is current inverse
+    POST: P updated via Sherman-Morrison
+
+    // Sherman-Morrison: (V + φφᵀ)⁻¹ = V⁻¹ - (V⁻¹φ)(φᵀV⁻¹) / (1 + φᵀV⁻¹φ)
+    Pφ = P · φ
+    denom = 1.0 + φᵀ · Pφ
+    P ← P - (Pφ · Pφᵀ) / denom
+```
+
+- λ (ridge regularization): 1.0 고정. forgetting factor 없음.
+- V를 직접 저장하지 않고, P = V^{-1}만 유지하여 O(D^2) 갱신 (D=13이므로 169 flops).
+- P는 항상 positive semi-definite이다 (Sherman-Morrison은 positive definiteness를 보존한다).
+
+**INV-110**: P는 항상 positive semi-definite이다. Sherman-Morrison update는 positive definiteness를 보존한다.
+
+#### MGR-LUCB-014: Confidence Width σ 계산
+
+Action의 uncertainty를 나타내는 스칼라 σ이다. *(MUST)*
+
+```
+PRE:  φ ∈ R^D, P = V⁻¹ (positive semi-definite)
+POST: σ >= 0
+
+σ(a, φ) = sqrt(max(0, φᵀ · P_a · φ))
+```
+
+- P가 존재하지 않으면 (action 미등록, cold start): σ = 1.0 (최대 탐색).
+- 관측이 증가하면 P가 shrink하여 σ가 감소한다 (uncertainty 감소).
+- `max(0, ...)`: 부동소수점 오차로 인한 미세 음수를 방지한다.
+
+#### MGR-LUCB-015: linucb_alpha 가중치
+
+UCB bonus의 고정 가중치이다. β_t 스케줄은 사용하지 않는다. *(MUST)*
+
+```
+ucb_bonus(a) = σ(a, φ) · linucb_alpha
+```
+
+| 설정 | 기본값 | 위치 | 의미 |
+|------|--------|------|------|
+| linucb_alpha | 0.5 | AdaptationConfig | exploration 강도. σ에 곱해지는 고정 가중치. |
+
+- β_t 시간 감쇠 스케줄은 없다. P matrix의 자연 shrink로 σ가 감소하여, 동일 φ에 대해 ucb_bonus가 단조 감소한다.
+- `linucb_alpha=0`이면 ucb_bonus=0이 되어 기존 DPP와 동일하게 동작한다 (§3.9 MGR-LUCB-070).
+
+**INV-111**: `linucb_alpha >= 0`. AdaptationConfig에서 검증한다.
+
+**INV-112**: 동일 φ에 대해, P matrix update 후 σ는 단조 감소한다. Sherman-Morrison은 P를 monotonically shrink하므로 `φᵀPφ`는 비증가이다.
+
+#### MGR-LUCB-020: Safe Set — 기존 DPP 유지 [REMOVED]
+
+~~Pessimistic safe set은 구현하지 않는다.~~ 코드는 기존 DPP safe set (§3.8 MGR-DPP-020)을 그대로 사용한다. LinUCB는 safe set을 변경하지 않고 score의 additive bonus로만 영향을 미친다.
+
+> **v2.1.0 설계 결정**: Pessimistic safe set (A_safe_ucb ⊆ A_safe)은 초기 설계에 있었으나, cold start 시 σ가 과도하게 커서 대부분의 action이 safe set에서 배제되는 문제가 발생하였다. 대신 기존 DPP safe set을 유지하고, exploration은 additive bonus로 유도한다.
+
+#### MGR-LUCB-021: [REMOVED]
+
+~~Optimistic reward selection은 별도 단계로 존재하지 않는다.~~ DPP score에 `+ UCB · ucb_bonus(a)` 항으로 통합되었다 (§3.9 MGR-LUCB-010).
+
+#### MGR-LUCB-030: EwmaReliefTable과의 하이브리드 관계
+
+EWMA와 LinUCB의 역할 분담이다. *(MUST)*
+
+```
+DPP score 계산 시:
+    mean[k] = EwmaReliefTable.predict(a)[k]      // EWMA 점추정
+    ucb     = UCB * σ(a, φ) * linucb_alpha        // LinUCB exploration bonus
+
+관측 시:
+    EwmaReliefTable.observe(a, actual_relief)     // EWMA 갱신
+    LinUcbTable.update(a, φ)                      // LinUCB P matrix 갱신 (동시)
+```
+
+- Mean은 EWMA가 제공한다. LinUcbTable은 mean을 계산하지 않는다 (P matrix만 관리).
+- σ는 LinUCB P matrix가 제공한다. EWMA는 uncertainty를 제공할 수 없다.
+- 두 테이블은 독립적으로 갱신되며, 동일 시점에 호출된다.
+
+**INV-115**: EWMA observe와 LinUCB update는 동일 시점에 호출된다. 두 테이블 간 학습 데이터 불일치는 없다.
+
+#### MGR-LUCB-040: Lua 인터페이스
+
+LinUCB 추정 결과를 Lua 정책에 노출하는 인터페이스이다. *(MUST)*
+
+```
+build_ctx() 시:
+    ctx.coef.relief[action_name].ucb_bonus = σ(a, φ) · linucb_alpha
+```
+
+- `ucb_bonus` 필드는 per-action relief 테이블에 직접 포함된다. 별도 `relief_ub` 테이블은 없다.
+- Lua DPP score 계산에서 `+ DPP.UCB * (r.ucb_bonus or 0)`으로 참조한다.
+- `ucb_bonus`가 nil이면 0으로 처리 (LinUCB 미활성 시 자연 fallback).
+
+#### MGR-LUCB-050: Phase 로드맵
+
+단계적 도입 계획이다. *(SHOULD)*
+
+| Phase | 내용 | 상태 | 검증 방법 |
+|-------|------|------|----------|
+| Phase 1 | Rust LinUcbTable 구현 + Lua ctx.coef.relief[a].ucb_bonus 노출 + policy_default.lua v2.1.0 통합 | **완료** | 유닛 테스트: ucb_bonus 수렴, Sherman-Morrison 정합성 |
+| Phase 2 | 시뮬레이터 AB 비교 | 미착수 | EWMA-only vs UCB 강화: cumulative relief, exploration rate |
+| Phase 3 | 온디바이스 AB 테스트 | 미착수 | TBT 회귀 없음 확인 |
+
+#### MGR-LUCB-060: Example Trace — LinUCB Additive Bonus
+
+```
+상태: mem=0.82, cpu=0.40, gpu=0.50, therm=0.72
+      triggers = {mem_low: active, temp_high: active}
+      active_actions = {}
+      linucb_alpha = 0.5
+
+Feature vector φ (13D):
+  [0.65, 1.0, 0.30, 0.0, 0.5, 1.2, 0.15, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  (kv_occ=0.65, is_gpu=1.0, token_prog=0.30, is_prefill=0, kv_dtype=0.5,
+   tbt_ratio=1.2→clamped 1.0, tokens_gen=0.15, all active_actions=0)
+
+Step 1~4: §3.8 MGR-DPP-060과 동일 (Z 계산, candidate 열거)
+  Z_mem=0.26, Z_therm=0.02, Z_cpu=0.00, Z_gpu=0.00
+
+Step 5: DPP Score + LinUCB Bonus (V=1.0, UCB=1.0)
+
+  kv_evict_sliding (P matrix 5회 update 후):
+    EWMA mean = [0.0, 0.0, 0.35, 0.0, -0.15, 0.0]
+    σ = sqrt(φᵀ·P·φ) = 0.42
+    ucb_bonus = 0.42 * 0.5 = 0.21
+    resource_term = 0.26*0.35 + 0.02*0.0 = 0.091
+    latency_penalty = 1.0 * max(0.15, 0) = 0.15
+    ucb = 1.0 * 0.21 = 0.21
+    score = 0.091 - 0.15 + 0.21 = 0.151
+
+  kv_quant_dynamic (P matrix 20회 update 후):
+    EWMA mean = [0.0, 0.0, 0.20, 0.0, -0.10, 0.0]
+    σ = 0.18
+    ucb_bonus = 0.18 * 0.5 = 0.09
+    resource_term = 0.26*0.20 = 0.052
+    latency_penalty = 1.0 * max(0.10, 0) = 0.10
+    ucb = 1.0 * 0.09 = 0.09
+    score = 0.052 - 0.10 + 0.09 = 0.042
+
+  throttle (P matrix 미등록, cold start):
+    EWMA mean = [0.15, 0.10, 0.0, 0.25, -0.20, 0.0]
+    σ = 1.0 (cold start default)
+    ucb_bonus = 1.0 * 0.5 = 0.50
+    resource_term = 0.02*0.25 = 0.005
+    latency_penalty = 1.0 * max(0.20, 0) = 0.20
+    ucb = 1.0 * 0.50 = 0.50
+    score = 0.005 - 0.20 + 0.50 = 0.305
+
+  Safe set (§3.8 MGR-DPP-020, floor = -C = -0.30):
+    모든 candidate의 lat(a) >= -0.30 → 전원 포함
+
+  Best: throttle (score = 0.305)
+
+Step 6: Safety Override
+  domain_levels = {mem: CRITICAL, cpu: NORMAL, gpu: NORMAL, therm: WARNING}
+  compute/thermal emergency 없음 → override 없음
+
+Result: [Throttle]
+```
+
+> **해석**: throttle은 cold start (P 미등록)로 σ=1.0이 되어 ucb_bonus=0.50이 부여되었다. 이 exploration bonus가 latency penalty를 크게 상쇄하여 최고 score를 달성했다. 기존 DPP (ucb_bonus=0)에서는 throttle의 score가 -0.195로 최하위였으나, LinUCB bonus로 탐색이 유도되었다. throttle을 실행하고 relief를 관측하면 P matrix가 update되어 σ가 감소하고, 이후에는 EWMA mean 기반 결정에 수렴한다.
+
+#### MGR-LUCB-070: LinUCB 비활성화 (Fallback)
+
+`linucb_alpha=0`으로 설정하면 기존 §3.8 DPP로 완전 복귀한다. *(MUST)*
+
+```
+비활성화 조건:
+    - linucb_alpha = 0 (AdaptationConfig)
+
+동작:
+    ucb_bonus(a) = σ(a, φ) · 0 = 0 for all a
+    score(a) = Σ_k Z_k · r̂_k(a) - V · max(-lât(a), 0) + UCB · 0
+             = Σ_k Z_k · r̂_k(a) - V · max(-lât(a), 0)   // §3.8 동일
+    A_safe: §3.8 MGR-DPP-020 그대로                       // 변경 없음
+```
+
+**INV-116**: `linucb_alpha=0`이면, DPP 결정은 §3.8과 비트 단위 동일한 결과를 산출한다. 하위 호환을 보장한다.
 
 ## 4. Alternative Behavior
 

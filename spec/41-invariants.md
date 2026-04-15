@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) = 총 75개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) = 총 88개.
 
 ## 1. Purpose and Scope
 
@@ -171,6 +171,44 @@
 | INV-091 | 11-protocol-messages MSG-067, 23-manager-data MGR-DAT-075/076 | `self_cpu_pct`, `self_gpu_pct` ∈ [0.0, 1.0]. 범위 밖 값은 송출 전에 clamp 한다. | Correctness | runtime, test | Engine 측 clamp |
 | INV-092 | 11-protocol-messages MSG-067/068, 23-manager-data MGR-DAT-075/076 | 측정 실패 시 `self_cpu_pct`/`self_gpu_pct`는 0.0 fallback. Heartbeat 송출은 차단되지 않는다. | Robustness/Correctness | runtime, test | MSG-061 하위호환 규약과 동일한 원칙 |
 
+### 3.9 LuaPolicy DPP Algorithm Invariants [INV-093 ~ INV-105]
+
+2026-04 LuaPolicy DPP (Drift-Plus-Penalty) 결정 알고리즘의 불변식. `policy_default.lua` v2.1.0 기준. 대응 명세: `22-manager-algorithms.md` 3.8절 (MGR-DPP-010~070).
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-093 | 22-manager-algorithms MGR-DPP-010 | DPP objective에서 Z_k=0인 도메인의 relief는 score에 기여하지 않는다. θ_warn 이하 도메인은 결정에 무영향. | Correctness | test | Z_k 가중으로 자연 보장 |
+| INV-094 | 22-manager-algorithms MGR-DPP-011 | Z_k >= 0. p_k <= θ_warn이면 Z_k = 0. | Correctness | runtime, test | max(0, ...) 구조 |
+| INV-095 | 22-manager-algorithms MGR-DPP-011 | W_WARN < W_CRIT < W_EMERG. emergency 도메인은 항상 더 큰 Z_k를 가진다. | Correctness | static | 상수 관계 |
+| INV-096 | 22-manager-algorithms MGR-DPP-012 | 모든 도메인에서 θ_warn < θ_crit < θ_emerg. | Correctness | static, test | 설정 검증 |
+| INV-097 | 22-manager-algorithms MGR-DPP-020 | A_safe가 비어있으면 no-op. latency floor 위반 action은 선택 불가. | Safety | test | hard constraint |
+| INV-098 | 22-manager-algorithms MGR-DPP-030 | Joint action은 최대 2개의 component action으로 구성. | Correctness | static | 레지스트리 구조 |
+| INV-099 | 22-manager-algorithms MGR-DPP-030 | Joint relief fallback은 component relief의 선형 합. 학습 joint relief가 우선. | Correctness | test | cold start 경로 |
+| INV-100 | 22-manager-algorithms MGR-DPP-040 | Safety Override는 compute/thermal emergency에서만 throttle을 추가. Memory emergency는 대상 아님. | Safety | test | throttle은 compute 액션 |
+| INV-101 | 22-manager-algorithms MGR-DPP-040 | Safety Override는 DPP 결과에 throttle을 **추가**만 한다. 기존 action을 제거하지 않는다. | Safety | test | additive only |
+| INV-102 | 22-manager-algorithms MGR-DPP-060 | Trigger가 없으면 새 action을 발행하지 않는다. Step 2~6 미실행. | Correctness | test | restore만 허용 |
+| INV-103 | 22-manager-algorithms MGR-DPP-060 | Score 동점 시 먼저 열거된 candidate가 선택된다. (strict greater-than 비교) | Correctness | test | 결정론적 tie-break |
+| INV-104 | 22-manager-algorithms MGR-DPP-061 | TriggerEngine hysteresis에서 enter > exit. 양의 간격 보장. | Correctness | static, test | 설정 검증 |
+| INV-105 | 22-manager-algorithms MGR-DPP-061 | TBT baseline EWMA warmup 기간(20 tokens) 동안 `tbt_degraded` trigger는 활성화되지 않는다. | Safety | runtime, test | premature trigger 방지 |
+
+### 3.10 LinUCB Exploration Bonus Invariants [INV-106 ~ INV-116]
+
+2026-04 LinUCB additive exploration bonus의 불변식. 대응 명세: `22-manager-algorithms.md` 3.9절 (MGR-LUCB-010~070). v2.1.0 기준.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-106 | 22-manager-algorithms MGR-LUCB-010 | `linucb_alpha=0`이면 `ucb_bonus=0`이 되어 기존 DPP (MGR-DPP-010)와 수학적으로 동일하다. | Correctness | test | 하위 호환 보장 |
+| INV-107 | 22-manager-algorithms MGR-LUCB-011 | `ucb_bonus()`는 읽기 전용이다. P matrix를 변경하지 않는다. | Correctness | test | MGR-C08 정신 계승 |
+| INV-108 | 22-manager-algorithms MGR-LUCB-014 | σ >= 0. `sqrt(max(0, φᵀ·P·φ))`로 비음수가 보장된다. | Correctness | test | sqrt 입력 비음수 |
+| INV-109 | 22-manager-algorithms MGR-LUCB-012 | Feature vector (13D)의 모든 원소는 [0, 1] 범위이다. | Correctness | runtime, test | 입력 정규화 |
+| INV-110 | 22-manager-algorithms MGR-LUCB-013 | P (= V⁻¹)는 항상 positive semi-definite이다. Sherman-Morrison update가 보존한다. | Correctness | static | Sherman-Morrison 보존 |
+| INV-111 | 22-manager-algorithms MGR-LUCB-015 | `linucb_alpha >= 0`. AdaptationConfig에서 검증한다. | Correctness | runtime, test | config 검증 |
+| INV-112 | 22-manager-algorithms MGR-LUCB-015 | 동일 φ에 대해, P matrix update 후 σ는 단조 감소한다 (P shrink). β_t 스케줄 없음. | Correctness | test | 수렴 보장 |
+| INV-113 | 22-manager-algorithms MGR-LUCB-020 | `[REMOVED]` Pessimistic safe set은 구현하지 않는다. 기존 DPP safe set (MGR-DPP-020) 유지. | — | — | v2.1.0에서 제거 |
+| INV-114 | 22-manager-algorithms MGR-LUCB-020 | `[REMOVED]` Pessimistic safe set 관련. INV-113과 함께 제거. | — | — | v2.1.0에서 제거 |
+| INV-115 | 22-manager-algorithms MGR-LUCB-030 | EWMA observe와 LinUCB update는 동일 시점에 호출된다. 학습 데이터 불일치 없음. | Correctness | test | 학습 데이터 일관성 |
+| INV-116 | 22-manager-algorithms MGR-LUCB-070 | `linucb_alpha=0`이면 DPP 결정은 §3.8과 비트 단위 동일 결과를 산출한다. | Correctness | test | INV-106 재확인, 런타임 fallback |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -191,6 +229,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 | INV-025 | INV-024 | 11-protocol-messages에서 10-protocol 재확인 |
 | INV-041 | INV-016 | 22-manager-algorithms에서 01-architecture 재확인 |
 | INV-062 | INV-074 | 30-engine과 31-engine-state에서 동일 내용 |
+| INV-116 | INV-106 | MGR-LUCB-070에서 MGR-LUCB-010 재확인 (linucb_alpha=0 시 동일 결과) |
 
 ## 5. Constraints
 
@@ -198,19 +237,21 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 16 | 25% |
-| Correctness | 44 | 68% |
+| Safety | 16 | 22% |
+| Correctness | 53 | 72% |
 | Performance | 2 | 3% |
-| Compatibility | 3 | 5% |
-| **합계** | **65** | **100%** |
+| Compatibility | 3 | 4% |
+| **합계** | **74** | **100%** |
+
+> **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 
 ### 5.2 검증 방법별 통계
 
 | 검증 방법 | 주 검증 | 보조 검증 포함 | 설명 |
 |----------|---------|-------------|------|
-| static | 20 | 24 | Cargo 의존 구조, feature gate, trait bound, 코드 구조 |
-| runtime | 32 | 38 | assert, clamp, 조건 검사, AtomicU64 |
-| test | 12 | 26 | 단위/통합/프로퍼티/장애 주입 테스트 |
+| static | 21 | 25 | Cargo 의존 구조, feature gate, trait bound, 코드 구조 |
+| runtime | 33 | 40 | assert, clamp, 조건 검사, AtomicU64 |
+| test | 21 | 37 | 단위/통합/프로퍼티/장애 주입 테스트 |
 
 다수의 불변식이 2개 이상의 검증 방법을 병용한다.
 
