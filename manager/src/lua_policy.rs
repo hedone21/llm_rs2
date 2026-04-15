@@ -802,6 +802,10 @@ impl PolicyStrategy for LuaPolicy {
         }
     }
 
+    fn cancel_last_observation(&mut self) {
+        self.observations.pop_back();
+    }
+
     fn update_engine_state(&mut self, msg: &EngineMessage) {
         if let EngineMessage::Heartbeat(status) = msg {
             self.engine_state = Some(status.clone());

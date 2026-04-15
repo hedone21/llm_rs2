@@ -280,6 +280,8 @@ impl Simulator {
                             if let Some(dir) = self.dedup.process(dir) {
                                 self.apply_directive(&dir)?;
                                 self.trajectory.record_directive(at, &sig, &dir);
+                            } else {
+                                self.policy.cancel_last_observation();
                             }
                         }
                         self.trajectory.record_signal(at, &sig);

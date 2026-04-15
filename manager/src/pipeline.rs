@@ -52,6 +52,12 @@ pub trait PolicyStrategy: Send {
         None
     }
 
+    /// 직전 process_signal() 호출에서 큐잉된 observation을 취소한다.
+    ///
+    /// dedup이 directive를 suppress했을 때 호출된다.
+    /// 기본 구현은 no-op (관측 기능 없는 policy에서 그냥 무시).
+    fn cancel_last_observation(&mut self) {}
+
     /// 관측성 훅: 지난 호출 이후 발생한 relief 업데이트 이벤트를 드레인한다.
     ///
     /// 시뮬레이터가 매 tick 호출해 Trajectory에 기록한다. 기본은 빈 Vec.

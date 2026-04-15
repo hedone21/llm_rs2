@@ -230,7 +230,8 @@ fn main() -> anyhow::Result<()> {
                             log::error!("Emit directive failed: {}", e);
                         }
                     } else {
-                        log::debug!("Directive suppressed (duplicate)");
+                        policy.cancel_last_observation();
+                        log::debug!("Directive suppressed (duplicate), observation cancelled");
                     }
                 }
             }
