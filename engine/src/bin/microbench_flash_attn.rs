@@ -65,6 +65,9 @@ mod bench {
         /// true = dispatch마다 다른 cl_mem(K, V) 사용 (28×K + 28×V = 56 separate cl_mem).
         /// production과 동일한 cl_mem 개수. false = 공유 K/V (llama.cpp처럼 1 cl_mem).
         pub fragmented_kv: bool,
+        /// true = 18B stride struct-pattern pollute (Q4_0 matmul 유사)
+        /// false = float4 streaming (기존)
+        pub pollute_stride: bool,
     }
 
     /// Cache-pollute 커널용 최대 버퍼 크기. 변수 정의가 아닌 alloc 상한.
@@ -78,6 +81,7 @@ mod bench {
             vary_q: false,
             pollute_mb: 0,
             fragmented_kv: false,
+            pollute_stride: false,
         },
         Variant {
             name: "Repeat28",
@@ -86,6 +90,7 @@ mod bench {
             vary_q: false,
             pollute_mb: 0,
             fragmented_kv: false,
+            pollute_stride: false,
         },
         Variant {
             name: "Repeat28Mask",
@@ -94,6 +99,7 @@ mod bench {
             vary_q: false,
             pollute_mb: 0,
             fragmented_kv: false,
+            pollute_stride: false,
         },
         Variant {
             name: "Repeat28MaskQ",
@@ -102,6 +108,7 @@ mod bench {
             vary_q: true,
             pollute_mb: 0,
             fragmented_kv: false,
+            pollute_stride: false,
         },
         Variant {
             name: "Repeat28Pollute8",
@@ -110,6 +117,7 @@ mod bench {
             vary_q: true,
             pollute_mb: 8,
             fragmented_kv: false,
+            pollute_stride: false,
         },
         Variant {
             name: "Repeat28Pollute32",
@@ -118,6 +126,7 @@ mod bench {
             vary_q: true,
             pollute_mb: 32,
             fragmented_kv: false,
+            pollute_stride: false,
         },
         // 28 layer KV를 28 separate cl_mem으로 분리 — production 실제 구조.
         // Contiguous(Repeat28MaskQ) 대비 slope 차이 → cl_mem 분리 오버헤드 격리 측정.
@@ -128,6 +137,27 @@ mod bench {
             vary_q: true,
             pollute_mb: 0,
             fragmented_kv: true,
+            pollute_stride: false,
+        },
+        // Q4_0 matmul 18B stride access pattern — streaming(float4) 대비 slope 차이 검증.
+        // Q4_0 block_q4_0 구조: half(2B) + 16 nibble bytes = 18B per block.
+        Variant {
+            name: "Repeat28PolluteStride8",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 8,
+            fragmented_kv: false,
+            pollute_stride: true,
+        },
+        Variant {
+            name: "Repeat28PolluteStride32",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 32,
+            fragmented_kv: false,
+            pollute_stride: true,
         },
     ];
 
@@ -149,6 +179,8 @@ mod bench {
         pub mask_buf: Mem,
         pub pollute_buf: Mem,
         pub pollute_kernel: ocl::core::Kernel,
+        pub pollute_stride_kernel: ocl::core::Kernel,
+        pub pollute_sink_buf: Mem,
         pub q_slot_bytes: u64,
         pub gws: [usize; 3],
         pub lws: Option<[usize; 3]>,
@@ -162,6 +194,28 @@ __kernel void pollute(__global float4* buf, const int elems4) {
         float4 v = buf[gid];
         buf[gid] = v + (float4)(1e-30f);
     }
+}
+"#;
+
+    /// Cache-pollute 커널 (stride variant): 18B stride struct read — Q4_0 block_q4_0 access 흉내.
+    /// block_q4_0 = { half d; uint8_t qs[16]; } = 2 + 16 = 18 bytes per block.
+    /// 각 thread가 struct 1개씩 읽어 volatile sum에 기여 (DCE 방지용 sink write 1 lane).
+    const POLLUTE_STRIDE_SRC: &str = r#"
+__kernel void pollute_stride(
+    __global const uchar* buf,
+    const int n_blocks,
+    __global float* sink
+) {
+    const int gid = get_global_id(0);
+    if (gid >= n_blocks) return;
+    const int base = gid * 18;
+    /* half scale — 2 bytes */
+    float d = vload_half(0, (const __global half*)(buf + base));
+    /* 16 nibble bytes — 모두 읽기 (prefetch 친화적 contiguous) */
+    uchar acc = 0;
+    #pragma unroll
+    for (int i = 0; i < 16; ++i) acc ^= buf[base + 2 + i];
+    if (gid == 0) sink[0] = d * (float)acc;  /* DCE 방지 (write 1 lane) */
 }
 "#;
 
@@ -446,6 +500,26 @@ __kernel void pollute(__global float4* buf, const int elems4) {
             .build(&context)?;
         let pollute_kernel = ocl::core::create_kernel(&pollute_program, "pollute")?;
 
+        // Stride-pattern pollute: 18B struct (Q4_0 block_q4_0) per thread.
+        // pollute_buf(uchar*)를 재사용하여 추가 alloc 없이 stride access 흉내.
+        let pollute_stride_program = Program::builder()
+            .devices(device)
+            .src(POLLUTE_STRIDE_SRC)
+            .cmplr_opt(&cl_opts)
+            .build(&context)?;
+        let pollute_stride_kernel =
+            ocl::core::create_kernel(&pollute_stride_program, "pollute_stride")?;
+
+        // Sink buffer: float 1개 (DCE 방지용 lane-0 write).
+        let pollute_sink_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                1,
+                None,
+            )?
+        };
+
         Ok(State {
             context,
             queue,
@@ -462,6 +536,8 @@ __kernel void pollute(__global float4* buf, const int elems4) {
             mask_buf,
             pollute_buf,
             pollute_kernel,
+            pollute_stride_kernel,
+            pollute_sink_buf,
             q_slot_bytes,
             gws: [Q1_WG_SIZE, N_H_Q, 1],
             lws: Some([Q1_WG_SIZE, 1, 1]),
@@ -485,9 +561,43 @@ __kernel void pollute(__global float4* buf, const int elems4) {
         let pollute_elems4: i32 = ((variant.pollute_mb * 1024 * 1024) / 16) as i32;
         let pollute_gws: [usize; 3] = [pollute_elems4.max(1) as usize, 1, 1];
         let pollute_lws: Option<[usize; 3]> = Some([64, 1, 1]);
+        // stride variant: n_blocks = (MB * 1024 * 1024) / 18
+        let pollute_stride_n_blocks: i32 = if variant.pollute_mb > 0 {
+            ((variant.pollute_mb * 1024 * 1024) / 18) as i32
+        } else {
+            1
+        };
+        let pollute_stride_gws: [usize; 3] = [pollute_stride_n_blocks.max(1) as usize, 1, 1];
+        let pollute_stride_lws: Option<[usize; 3]> = Some([64, 1, 1]);
         if variant.pollute_mb > 0 {
-            ocl::core::set_kernel_arg(&state.pollute_kernel, 0, ArgVal::mem(&state.pollute_buf))?;
-            ocl::core::set_kernel_arg(&state.pollute_kernel, 1, ArgVal::scalar(&pollute_elems4))?;
+            if variant.pollute_stride {
+                ocl::core::set_kernel_arg(
+                    &state.pollute_stride_kernel,
+                    0,
+                    ArgVal::mem(&state.pollute_buf),
+                )?;
+                ocl::core::set_kernel_arg(
+                    &state.pollute_stride_kernel,
+                    1,
+                    ArgVal::scalar(&pollute_stride_n_blocks),
+                )?;
+                ocl::core::set_kernel_arg(
+                    &state.pollute_stride_kernel,
+                    2,
+                    ArgVal::mem(&state.pollute_sink_buf),
+                )?;
+            } else {
+                ocl::core::set_kernel_arg(
+                    &state.pollute_kernel,
+                    0,
+                    ArgVal::mem(&state.pollute_buf),
+                )?;
+                ocl::core::set_kernel_arg(
+                    &state.pollute_kernel,
+                    1,
+                    ArgVal::scalar(&pollute_elems4),
+                )?;
+            }
         }
         let wc_start = if wallclock_mode {
             Some(std::time::Instant::now())
@@ -496,17 +606,32 @@ __kernel void pollute(__global float4* buf, const int elems4) {
         };
         for i in 0..variant.num_dispatches {
             if variant.pollute_mb > 0 {
-                unsafe {
-                    ocl::core::enqueue_kernel(
-                        &state.queue,
-                        &state.pollute_kernel,
-                        1,
-                        None,
-                        &pollute_gws,
-                        pollute_lws,
-                        None::<&Event>,
-                        None::<&mut Event>,
-                    )?;
+                if variant.pollute_stride {
+                    unsafe {
+                        ocl::core::enqueue_kernel(
+                            &state.queue,
+                            &state.pollute_stride_kernel,
+                            1,
+                            None,
+                            &pollute_stride_gws,
+                            pollute_stride_lws,
+                            None::<&Event>,
+                            None::<&mut Event>,
+                        )?;
+                    }
+                } else {
+                    unsafe {
+                        ocl::core::enqueue_kernel(
+                            &state.queue,
+                            &state.pollute_kernel,
+                            1,
+                            None,
+                            &pollute_gws,
+                            pollute_lws,
+                            None::<&Event>,
+                            None::<&mut Event>,
+                        )?;
+                    }
                 }
             }
             if variant.vary_q {
