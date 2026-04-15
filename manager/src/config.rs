@@ -197,6 +197,11 @@ pub struct AdaptationConfig {
     /// Per-action default relief values [gpu, cpu, memory, thermal, latency, main_app_qos].
     #[serde(default)]
     pub default_relief: std::collections::HashMap<String, Vec<f32>>,
+
+    /// DirectiveDeduplicator cooldown (seconds).
+    /// cooldown이 경과하면 동일한 directive도 재방출하여 relief observation이 쌓이도록 한다.
+    #[serde(default = "default_dedup_cooldown_secs")]
+    pub dedup_cooldown_secs: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,6 +231,7 @@ impl Default for AdaptationConfig {
             temp_critical_c: 50.0,
             trigger: TriggerConfig::default(),
             default_relief: std::collections::HashMap::new(),
+            dedup_cooldown_secs: 60.0,
         }
     }
 }
@@ -273,6 +279,9 @@ fn default_temp_enter() -> f64 {
 }
 fn default_temp_exit() -> f64 {
     0.50
+}
+fn default_dedup_cooldown_secs() -> f64 {
+    60.0
 }
 
 #[cfg(feature = "hierarchical")]

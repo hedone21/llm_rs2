@@ -27,13 +27,16 @@ mod ewma_tests {
     const TOL: f32 = 1e-4;
 
     // ─────────────────────────────────────────────────────────────────────────
-    // MGR-ALG-080 / INV-087: EWMA observe 수식 + 첫 관측 cold-start 대입
+    // MGR-ALG-080 / INV-087: EWMA observe 수식 + 첫 관측 EWMA 적용
     // ─────────────────────────────────────────────────────────────────────────
 
-    /// MGR-ALG-080, INV-087: 첫 번째 observe는 relief에 observed 값을 그대로 대입한다.
+    /// MGR-ALG-080, INV-087: 첫 번째 observe도 EWMA를 적용한다.
+    /// defaults가 없을 때 entry 초기값은 [0.0; 6]이므로:
+    /// 첫 관측 후 relief[i] = alpha * 0.0 + (1-alpha) * observed[i] = (1-alpha) * observed[i]
     #[test]
     fn mgr_alg_080_first_observation_direct_assignment() {
-        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        let alpha = 0.875f32;
+        let mut table = EwmaReliefTable::new(alpha, HashMap::new());
         let observed: [f32; 6] = [0.1, 0.2, 0.3, -0.1, 0.05, 0.4];
 
         table.observe("test_action", &observed);
@@ -41,17 +44,20 @@ mod ewma_tests {
         let entry = table.entries.get("test_action").expect("entry 없음");
         assert_eq!(entry.observation_count, 1, "첫 관측 후 count==1");
         for (i, &v) in observed.iter().enumerate() {
+            let expected = (1.0 - alpha) * v;
             assert!(
-                (entry.relief[i] - v).abs() < TOL,
-                "dim[{}]: expected {}, got {}",
+                (entry.relief[i] - expected).abs() < TOL,
+                "dim[{}]: expected {} (= (1-alpha)*obs), got {}",
                 i,
-                v,
+                expected,
                 entry.relief[i]
             );
         }
     }
 
-    /// MGR-ALG-080: 두 번째 이후 observe에 α 평활이 적용된다.
+    /// MGR-ALG-080: 두 번째 이후 observe에도 동일하게 α 평활이 적용된다.
+    /// 첫 관측: relief = (1-alpha)*first (initial=0)
+    /// 두 번째: relief = alpha * ((1-alpha)*first) + (1-alpha)*second
     #[test]
     fn mgr_alg_080_subsequent_observation_applies_alpha() {
         let alpha = 0.875f32;
@@ -67,7 +73,10 @@ mod ewma_tests {
         assert_eq!(entry.observation_count, 2, "두 번째 관측 후 count==2");
 
         for i in 0..RELIEF_DIMS {
-            let expected = alpha * first[i] + (1.0 - alpha) * second[i];
+            // after first: (1-alpha)*first[i]
+            let after_first = (1.0 - alpha) * first[i];
+            // after second: alpha * after_first + (1-alpha) * second[i]
+            let expected = alpha * after_first + (1.0 - alpha) * second[i];
             assert!(
                 (entry.relief[i] - expected).abs() < TOL,
                 "dim[{}]: expected EWMA {:.6}, got {:.6}",
@@ -83,20 +92,26 @@ mod ewma_tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     /// MGR-ALG-081: entries에 있으면 defaults보다 우선순위가 높다.
+    /// 첫 관측 후 entries 값은 EWMA 적용 결과이므로 defaults(9.0)와 다르다.
     #[test]
     fn mgr_alg_081_predict_entries_priority() {
+        let alpha = 0.875f32;
+        let default_val = 9.0f32;
         let mut defaults = HashMap::new();
-        defaults.insert("A".to_string(), vec![9.0f32, 9.0, 9.0, 9.0, 9.0, 9.0]);
-        let mut table = EwmaReliefTable::new(0.875, defaults);
+        defaults.insert("A".to_string(), vec![default_val; 6]);
+        let mut table = EwmaReliefTable::new(alpha, defaults);
 
-        // entries에 "A" 등록
+        // entries에 "A" 등록: initial = default = 9.0
+        // 첫 관측 후: alpha * 9.0 + (1-alpha) * obs
         let obs: [f32; 6] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         table.observe("A", &obs);
 
         let result = table.predict("A");
         for i in 0..RELIEF_DIMS {
+            let expected = alpha * default_val + (1.0 - alpha) * obs[i];
+            // entries가 존재하므로 defaults(9.0)가 아닌 EWMA 결과를 반환해야 함
             assert!(
-                (result[i] - obs[i]).abs() < TOL,
+                (result[i] - expected).abs() < TOL,
                 "dim[{}]: entries({}) 우선, defaults(9.0) 무시되어야 함",
                 i,
                 result[i]
@@ -456,15 +471,18 @@ mod ewma_tests {
             );
         }
 
-        // EwmaReliefTable에 observe 후 relief도 동일해야 함 (첫 관측 = 직접 대입)
-        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        // EwmaReliefTable에 observe 후 relief = (1-alpha) * observed (defaults 없음, initial=0)
+        let alpha = 0.875f32;
+        let mut table = EwmaReliefTable::new(alpha, HashMap::new());
         table.observe("test", &observed);
         let entry = table.entries.get("test").unwrap();
         for (i, &r) in entry.relief.iter().enumerate().take(5) {
+            let expected = (1.0 - alpha) * 0.3;
             assert!(
-                (r - 0.3).abs() < TOL,
-                "dim[{}] relief: expected 0.3, got {}",
+                (r - expected).abs() < TOL,
+                "dim[{}] relief: expected {}, got {}",
                 i,
+                expected,
                 r
             );
         }
@@ -489,14 +507,17 @@ mod ewma_tests {
             observed_dim5
         );
 
-        // EwmaReliefTable에 관측
+        // EwmaReliefTable에 관측: relief[5] = (1-alpha) * observed_dim5 (defaults 없음, initial=0)
+        let alpha = 0.875f32;
         let observed: [f32; 6] = [0.0, 0.0, 0.0, 0.0, 0.0, observed_dim5];
-        let mut table = EwmaReliefTable::new(0.875, HashMap::new());
+        let mut table = EwmaReliefTable::new(alpha, HashMap::new());
         table.observe("action", &observed);
         let entry = table.entries.get("action").unwrap();
+        let expected_dim5 = (1.0 - alpha) * 0.2;
         assert!(
-            (entry.relief[5] - 0.2).abs() < TOL,
-            "dim[5] relief: expected 0.2, got {}",
+            (entry.relief[5] - expected_dim5).abs() < TOL,
+            "dim[5] relief: expected {}, got {}",
+            expected_dim5,
             entry.relief[5]
         );
     }

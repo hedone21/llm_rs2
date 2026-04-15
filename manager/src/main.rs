@@ -158,7 +158,8 @@ fn main() -> anyhow::Result<()> {
 
     // ── Main loop ─────────────────────────────────────────────────────────────
     log::info!("Entering main loop");
-    let mut dedup = DirectiveDeduplicator::new();
+    let start = std::time::Instant::now();
+    let mut dedup = DirectiveDeduplicator::with_cooldown(config.adaptation.dedup_cooldown_secs);
     loop {
         if SHUTDOWN.load(Ordering::Relaxed) {
             shutdown.store(true, Ordering::Relaxed);
@@ -219,7 +220,8 @@ fn main() -> anyhow::Result<()> {
                 log::info!("Signal: {:?}", signal);
 
                 if let Some(directive) = policy.process_signal(&signal) {
-                    if let Some(directive) = dedup.process(directive) {
+                    if let Some(directive) = dedup.process(directive, start.elapsed().as_secs_f64())
+                    {
                         log::info!(
                             "Directive seq={}: {} commands [mode={:?}]",
                             directive.seq_id,

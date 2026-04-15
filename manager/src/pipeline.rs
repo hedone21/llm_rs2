@@ -1761,26 +1761,54 @@ mod hierarchical {
 
 /// 연속으로 동일한 directive가 방출되는 것을 억제한다.
 ///
-/// `process(directive)`는 `commands`가 마지막으로 방출된 배치와 다를 때만
-/// `Some(directive)`를 반환하고, 동일하면 `None`을 반환한다.
+/// `process(directive, now_secs)`는 `commands`가 마지막으로 방출된 배치와 다르거나
+/// cooldown이 경과했을 때만 `Some(directive)`를 반환하고, 그 외에는 `None`을 반환한다.
+///
+/// cooldown이 경과하면 동일한 directive도 재방출하여 relief observation이
+/// 쌓일 수 있도록 한다.
 pub struct DirectiveDeduplicator {
     last_commands: Option<Vec<EngineCommand>>,
+    /// 마지막으로 directive를 방출한 시각 (seconds).
+    last_sent_at: Option<f64>,
+    /// 동일한 directive를 재방출하기 위한 cooldown (seconds).
+    cooldown_secs: f64,
 }
 
 impl DirectiveDeduplicator {
+    /// 기본 cooldown(60s)으로 생성한다.
     pub fn new() -> Self {
+        Self::with_cooldown(60.0)
+    }
+
+    /// 지정한 cooldown(seconds)으로 생성한다.
+    pub fn with_cooldown(cooldown_secs: f64) -> Self {
         Self {
             last_commands: None,
+            last_sent_at: None,
+            cooldown_secs,
         }
     }
 
     /// 방출해야 하면 `Some(directive)`, 억제해야 하면 `None`을 반환한다.
-    pub fn process(&mut self, directive: EngineDirective) -> Option<EngineDirective> {
+    ///
+    /// `now_secs`는 프로세스 시작 시각 기준 경과 초(seconds)이다.
+    pub fn process(
+        &mut self,
+        directive: EngineDirective,
+        now_secs: f64,
+    ) -> Option<EngineDirective> {
         let is_dup = self.last_commands.as_ref() == Some(&directive.commands);
-        if is_dup {
+        let cooldown_elapsed = self
+            .last_sent_at
+            .map(|t| now_secs - t >= self.cooldown_secs)
+            .unwrap_or(false);
+        let suppress = is_dup && !cooldown_elapsed;
+
+        if suppress {
             None
         } else {
             self.last_commands = Some(directive.commands.clone());
+            self.last_sent_at = Some(now_secs);
             Some(directive)
         }
     }
@@ -1817,33 +1845,33 @@ mod dedup_tests {
     fn first_directive_always_passes() {
         let mut dedup = DirectiveDeduplicator::new();
         let d = directive(vec![sliding(0.8)]);
-        assert!(dedup.process(d).is_some());
+        assert!(dedup.process(d, 0.0).is_some());
     }
 
     // 케이스 2: 동일 commands 연속 → 두 번째부터 억제
     #[test]
     fn identical_commands_suppressed() {
         let mut dedup = DirectiveDeduplicator::new();
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some());
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none());
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none());
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 1.0).is_none());
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 2.0).is_none());
     }
 
     // 케이스 3: 같은 타입, 다른 파라미터 → 방출
     #[test]
     fn same_type_different_param_passes() {
         let mut dedup = DirectiveDeduplicator::new();
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some());
-        assert!(dedup.process(directive(vec![sliding(0.5)])).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.5)]), 1.0).is_some());
     }
 
     // 케이스 4: A → B → A 전환: 두 번째 A는 방출 (last=B이므로)
     #[test]
     fn cycle_a_b_a_emits_second_a() {
         let mut dedup = DirectiveDeduplicator::new();
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some()); // A 방출
-        assert!(dedup.process(directive(vec![h2o(0.5)])).is_some()); // B 방출
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some()); // A 재방출
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some()); // A 방출
+        assert!(dedup.process(directive(vec![h2o(0.5)]), 1.0).is_some()); // B 방출
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 2.0).is_some()); // A 재방출
     }
 
     // 케이스 5: multi-command directive 동일하면 억제
@@ -1851,17 +1879,17 @@ mod dedup_tests {
     fn multi_command_identical_suppressed() {
         let mut dedup = DirectiveDeduplicator::new();
         let cmds = vec![sliding(0.8), h2o(0.5)];
-        assert!(dedup.process(directive(cmds.clone())).is_some());
-        assert!(dedup.process(directive(cmds)).is_none());
+        assert!(dedup.process(directive(cmds.clone()), 0.0).is_some());
+        assert!(dedup.process(directive(cmds), 1.0).is_none());
     }
 
     // 케이스 6: None(억제) 이후 다른 directive 방출 가능 확인
     #[test]
     fn after_suppression_different_command_passes() {
         let mut dedup = DirectiveDeduplicator::new();
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some());
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none()); // 억제
-        assert!(dedup.process(directive(vec![h2o(0.5)])).is_some()); // 다른 커맨드 → 방출
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some());
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 1.0).is_none()); // 억제
+        assert!(dedup.process(directive(vec![h2o(0.5)]), 2.0).is_some()); // 다른 커맨드 → 방출
     }
 
     // 케이스 7: 억제된 directive는 last_commands를 갱신하지 않음
@@ -1869,10 +1897,50 @@ mod dedup_tests {
     #[test]
     fn suppressed_does_not_update_last() {
         let mut dedup = DirectiveDeduplicator::new();
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_some()); // A
-        assert!(dedup.process(directive(vec![sliding(0.8)])).is_none()); // A 억제 → last=A 유지
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some()); // A
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 1.0).is_none()); // A 억제 → last=A 유지
         // B는 A와 다르므로 방출되어야 함
-        assert!(dedup.process(directive(vec![h2o(0.5)])).is_some()); // B
+        assert!(dedup.process(directive(vec![h2o(0.5)]), 2.0).is_some()); // B
+    }
+
+    // 케이스 8: cooldown 후 동일한 directive 통과
+    #[test]
+    fn cooldown_allows_same_after_timeout() {
+        let mut dedup = DirectiveDeduplicator::with_cooldown(60.0);
+        // t=0: 첫 방출
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some());
+        // t=30: cooldown 미경과 → 억제
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 30.0).is_none());
+        // t=59: cooldown 미경과 → 억제
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 59.0).is_none());
+        // t=60: cooldown 경과 → 재방출
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 60.0).is_some());
+        // t=100: cooldown 미경과(마지막 방출=60) → 억제
+        assert!(
+            dedup
+                .process(directive(vec![sliding(0.8)]), 100.0)
+                .is_none()
+        );
+        // t=120: cooldown 경과(마지막 방출=60) → 재방출
+        assert!(
+            dedup
+                .process(directive(vec![sliding(0.8)]), 120.0)
+                .is_some()
+        );
+    }
+
+    // 케이스 9: directive가 바뀌면 cooldown 타이머 리셋
+    #[test]
+    fn cooldown_reset_on_change() {
+        let mut dedup = DirectiveDeduplicator::with_cooldown(60.0);
+        // t=0: A 방출
+        assert!(dedup.process(directive(vec![sliding(0.8)]), 0.0).is_some());
+        // t=50: B 방출 (다른 directive → 타이머 리셋)
+        assert!(dedup.process(directive(vec![h2o(0.5)]), 50.0).is_some());
+        // t=90: B 동일 → cooldown 미경과(50+60=110) → 억제
+        assert!(dedup.process(directive(vec![h2o(0.5)]), 90.0).is_none());
+        // t=110: cooldown 경과 → 재방출
+        assert!(dedup.process(directive(vec![h2o(0.5)]), 110.0).is_some());
     }
 }
 

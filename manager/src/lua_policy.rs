@@ -253,21 +253,32 @@ impl EwmaReliefTable {
     }
 
     pub fn observe(&mut self, action: &str, observed: &[f32; RELIEF_DIMS]) {
+        // 첫 관측도 EWMA로 처리한다. entry 초기값은 default_relief prior로 설정하여
+        // outlier 단일 관측이 prior를 완전히 소실시키는 문제를 방지한다.
+        let default = self
+            .defaults
+            .get(action)
+            .map(|v| {
+                let mut r = [0.0f32; RELIEF_DIMS];
+                for (i, &val) in v.iter().enumerate().take(RELIEF_DIMS) {
+                    r[i] = val;
+                }
+                r
+            })
+            .unwrap_or([0.0f32; RELIEF_DIMS]);
+
         let entry = self
             .entries
             .entry(action.to_string())
             .or_insert_with(|| ReliefEntry {
-                relief: [0.0; RELIEF_DIMS],
+                relief: default,
                 observation_count: 0,
             });
 
-        if entry.observation_count == 0 {
-            entry.relief = *observed;
-        } else {
-            let a = self.alpha;
-            for (i, &obs_val) in observed.iter().enumerate() {
-                entry.relief[i] = a * entry.relief[i] + (1.0 - a) * obs_val;
-            }
+        // 항상 EWMA 적용 (첫 관측도 동일하게)
+        let a = self.alpha;
+        for (i, &obs_val) in observed.iter().enumerate() {
+            entry.relief[i] = a * entry.relief[i] + (1.0 - a) * obs_val;
         }
         entry.observation_count += 1;
     }
@@ -2025,11 +2036,43 @@ mod tests {
 
     #[test]
     fn ewma_first_observation_replaces_default() {
+        // defaults가 없는 경우: entry 초기값 = [0.0; 6].
+        // 첫 관측 후 값 = alpha * 0.0 + (1-alpha) * observed = 0.125 * observed
         let mut table = EwmaReliefTable::new(0.875, HashMap::new());
         let observed = [0.6, -0.2, 0.0, 0.4, -0.1, 0.0];
         table.observe("switch_hw", &observed);
         let predicted = table.predict("switch_hw");
-        assert_eq!(predicted, observed);
+        let expected: [f32; 6] = observed.map(|v| 0.125 * v);
+        for (i, (&p, &e)) in predicted.iter().zip(expected.iter()).enumerate() {
+            assert!((p - e).abs() < 1e-6, "dim {}: expected {}, got {}", i, e, p);
+        }
+        assert_eq!(table.observation_count("switch_hw"), 1);
+    }
+
+    #[test]
+    fn ewma_first_observation_blends_with_prior() {
+        // defaults가 있는 경우: entry 초기값 = default.
+        // 첫 관측 후 값 = alpha * default + (1-alpha) * observed
+        let mut defaults = HashMap::new();
+        defaults.insert(
+            "switch_hw".to_string(),
+            vec![0.5f32, -0.3, 0.0, 0.3, -0.1, 0.0],
+        );
+        let mut table = EwmaReliefTable::new(0.875, defaults);
+        let observed = [0.6f32, -0.2, 0.0, 0.4, -0.1, 0.0];
+        let default = [0.5f32, -0.3, 0.0, 0.3, -0.1, 0.0];
+        table.observe("switch_hw", &observed);
+        let predicted = table.predict("switch_hw");
+        for i in 0..6 {
+            let expected = 0.875 * default[i] + 0.125 * observed[i];
+            assert!(
+                (predicted[i] - expected).abs() < 1e-5,
+                "dim {}: expected {}, got {}",
+                i,
+                expected,
+                predicted[i]
+            );
+        }
         assert_eq!(table.observation_count("switch_hw"), 1);
     }
 

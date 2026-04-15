@@ -102,7 +102,7 @@ impl Simulator {
             tick_dt: Duration::from_millis(50),
             ctx,
             last_overrun_count: 0,
-            dedup: DirectiveDeduplicator::new(),
+            dedup: DirectiveDeduplicator::with_cooldown(60.0),
         }
     }
 
@@ -150,8 +150,14 @@ impl Simulator {
             tick_dt: Duration::from_millis(50),
             ctx,
             last_overrun_count: 0,
-            dedup: DirectiveDeduplicator::new(),
+            dedup: DirectiveDeduplicator::with_cooldown(60.0),
         })
+    }
+
+    /// dedup cooldown 설정 빌더 (시뮬레이터용).
+    pub fn with_dedup_cooldown(mut self, secs: f64) -> Self {
+        self.dedup = DirectiveDeduplicator::with_cooldown(secs);
+        self
     }
 
     /// tick 크기 변경 (기본 50ms).
@@ -277,7 +283,7 @@ impl Simulator {
                         signal::derive_signal(&event.kind, &self.state, &self.cfg, &mut self.rng)
                     {
                         if let Some(dir) = self.policy.process_signal(&sig) {
-                            if let Some(dir) = self.dedup.process(dir) {
+                            if let Some(dir) = self.dedup.process(dir, at.as_secs_f64()) {
                                 self.apply_directive(&dir)?;
                                 self.trajectory.record_directive(at, &sig, &dir);
                             } else {

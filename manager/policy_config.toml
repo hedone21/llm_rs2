@@ -3,6 +3,7 @@ ewma_alpha = 0.875
 relief_table_path = ""
 temp_safe_c = 35.0
 temp_critical_c = 50.0
+dedup_cooldown_secs = 60.0
 
 [adaptation.trigger]
 tbt_enter = 0.30
