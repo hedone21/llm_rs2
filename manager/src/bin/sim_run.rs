@@ -34,6 +34,11 @@ struct Args {
     /// trajectory를 JSON으로 저장할 경로
     #[arg(long)]
     output_json: Option<std::path::PathBuf>,
+
+    /// policy_config.toml 경로 (AdaptationConfig 로드용)
+    /// 미지정 시 AdaptationConfig::default() 사용
+    #[arg(long)]
+    config: Option<std::path::PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -43,7 +48,13 @@ fn main() -> anyhow::Result<()> {
     let cfg = llm_manager::sim::config::load_scenario(&args.scenario)
         .map_err(|e| anyhow::anyhow!("시나리오 로드 실패: {e}"))?;
 
-    let adaptation = llm_manager::config::AdaptationConfig::default();
+    let adaptation = if let Some(cfg_path) = &args.config {
+        llm_manager::config::Config::from_file(cfg_path)
+            .map_err(|e| anyhow::anyhow!("설정 로드 실패: {e}"))?
+            .adaptation
+    } else {
+        llm_manager::config::AdaptationConfig::default()
+    };
 
     let mut sim = llm_manager::sim::harness::Simulator::with_lua_policy(cfg, &args.lua, adaptation)
         .map_err(|e| anyhow::anyhow!("Simulator 초기화 실패: {e}"))?;
