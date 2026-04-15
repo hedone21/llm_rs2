@@ -11,6 +11,10 @@
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
+--   2.1.0 (2026-04-15): LinUCB exploration bonus 추가
+--     - DPP score에 UCB bonus 항 추가: score += DPP.UCB * r.ucb_bonus
+--     - Rust LinUcbTable이 feature vector 기반 P matrix 관리 (13D)
+--     - cold-start: ucb_bonus = 1.0 (최대 탐색), 관측 후 단조 감소
 --   2.0.0 (2026-04-15): DPP 기반 재설계 (docs/46_dpp_policy_design.md)
 --     - max-domain argmax → Σ_k Z_k·r_k − V·ℓ linear scalarization
 --     - Z_k = multi-threshold excess virtual queue (raw pressure 제거)
@@ -20,7 +24,7 @@
 --   1.0.1 (2026-04-15): pressure_level 임계값 정렬
 --   1.0.0 (2026-04-15): initial production policy
 
-POLICY_META = { name = "llm_default", version = "2.0.0" }
+POLICY_META = { name = "llm_default", version = "2.1.0" }
 
 -- ── DPP 상수 (docs/46 §4) ──────────────────────────────────────────────────
 local DPP = {
@@ -30,6 +34,7 @@ local DPP = {
     W_WARN      = 1.0,   -- threshold excess weights (§4.2.3)
     W_CRIT      = 2.0,
     W_EMERG     = 4.0,
+    UCB         = 1.0,   -- LinUCB exploration bonus weight
 }
 
 -- Per-domain threshold (Rust Monitor defaults에 정렬, §4.2.4)
@@ -231,7 +236,7 @@ function decide(ctx)
             end
             -- latency soft penalty: V · max(-lat, 0)
             local latency_penalty = (lat < 0) and (DPP.V * (-lat)) or 0
-            local score = resource_term - latency_penalty
+            local score = resource_term - latency_penalty + DPP.UCB * (r.ucb_bonus or 0)
 
             if score > best_score then
                 best_action = cand.name

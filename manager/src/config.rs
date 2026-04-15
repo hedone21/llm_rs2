@@ -206,6 +206,10 @@ pub struct AdaptationConfig {
     /// Relief table 자동 저장 인터벌 (초). 0이면 비활성화. 기본 300.0s.
     #[serde(default = "default_persist_interval_secs")]
     pub persist_interval_secs: f64,
+
+    /// LinUCB UCB 탐색 가중치 (0 = 비활성, 기본 0.5).
+    #[serde(default = "default_linucb_alpha")]
+    pub linucb_alpha: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -237,6 +241,7 @@ impl Default for AdaptationConfig {
             default_relief: std::collections::HashMap::new(),
             dedup_cooldown_secs: 60.0,
             persist_interval_secs: 300.0,
+            linucb_alpha: 0.5,
         }
     }
 }
@@ -290,6 +295,9 @@ fn default_dedup_cooldown_secs() -> f64 {
 }
 fn default_persist_interval_secs() -> f64 {
     300.0
+}
+fn default_linucb_alpha() -> f32 {
+    0.5
 }
 
 #[cfg(feature = "hierarchical")]

@@ -330,6 +330,108 @@ impl EwmaReliefTable {
     }
 }
 
+/// LinUCB feature vector 차원 (13).
+///
+/// indices:
+///   0 = KV_OCCUPANCY (kv_cache_utilization)
+///   1 = IS_GPU (active_device contains "opencl")
+///   2 = TOKEN_PROGRESS (tokens_generated / 2048, clamped to 1.0)
+///   3 = IS_PREFILL (phase == "prefill")
+///   4 = KV_DTYPE_NORM (f32=0.0, f16=0.5, q4=1.0)
+///   5 = TBT_RATIO (tbt_degradation_ratio)
+///   6 = TOKENS_GEN_NORM (same as TOKEN_PROGRESS – kept for symmetry)
+///   7 = ACTIVE_SWITCH_HW
+///   8 = ACTIVE_THROTTLE
+///   9 = ACTIVE_KV_OFFLOAD
+///  10 = ACTIVE_EVICTION (kv_evict_*)
+///  11 = ACTIVE_LAYER_SKIP
+///  12 = ACTIVE_KV_QUANT
+pub const LINUCB_FEATURE_DIM: usize = 13;
+
+/// LinUCB exploration bonus 계산기.
+///
+/// 각 액션마다 D×D P matrix (= A_a^{-1})를 관리한다.
+/// UCB bonus = sqrt(phi^T · P_a · phi).
+///
+/// 평균 relief는 EwmaReliefTable이 담당하고,
+/// 이 구조체는 exploration bonus 전용이다.
+struct LinUcbTable {
+    /// action_name → D×D P matrix (flat row-major, length = feature_dim²)
+    matrices: HashMap<String, Vec<f32>>,
+    feature_dim: usize,
+}
+
+impl LinUcbTable {
+    fn new() -> Self {
+        Self {
+            matrices: HashMap::new(),
+            feature_dim: LINUCB_FEATURE_DIM,
+        }
+    }
+
+    /// P matrix가 없으면 identity로 초기화 (최대 불확실성 = 최대 탐색).
+    fn ensure_matrix(&mut self, action: &str) {
+        if self.matrices.contains_key(action) {
+            return;
+        }
+        let d = self.feature_dim;
+        let mut p = vec![0.0f32; d * d];
+        for i in 0..d {
+            p[i * d + i] = 1.0;
+        }
+        self.matrices.insert(action.to_string(), p);
+    }
+
+    /// UCB bonus = sqrt(max(0, phi^T · P · phi)).
+    /// P matrix가 없으면 1.0 반환 (identity 기대값 ≈ ||phi||, cold-start 탐색 최대).
+    fn ucb_bonus(&self, action: &str, phi: &[f32]) -> f32 {
+        let p = match self.matrices.get(action) {
+            Some(m) => m,
+            None => return 1.0,
+        };
+        let d = self.feature_dim;
+        // v = P · phi  (D벡터)
+        let mut v = vec![0.0f32; d];
+        for i in 0..d {
+            v[i] = phi.iter().enumerate().map(|(j, &x)| p[i * d + j] * x).sum();
+        }
+        // phi^T · v (스칼라)
+        let val: f32 = phi.iter().zip(v.iter()).map(|(&x, &vi)| x * vi).sum();
+        val.max(0.0).sqrt()
+    }
+
+    /// Sherman-Morrison P matrix 업데이트:
+    /// P ← P − (P·φ·φᵀ·P) / (1 + φᵀ·P·φ)
+    ///
+    /// λ=1.0 (망각 없음). 탐색 목적이므로 P는 단조 감소가 맞다.
+    fn update(&mut self, action: &str, phi: &[f32]) {
+        self.ensure_matrix(action);
+        let p = self.matrices.get_mut(action).unwrap();
+        let d = self.feature_dim;
+
+        // p_phi = P · phi
+        let mut p_phi = vec![0.0f32; d];
+        for i in 0..d {
+            p_phi[i] = phi.iter().enumerate().map(|(j, &x)| p[i * d + j] * x).sum();
+        }
+
+        // denom = 1 + phi^T · p_phi
+        let denom: f32 = 1.0
+            + phi
+                .iter()
+                .zip(p_phi.iter())
+                .map(|(&x, &v)| x * v)
+                .sum::<f32>();
+
+        // P ← P − (p_phi · p_phi^T) / denom
+        for i in 0..d {
+            for j in 0..d {
+                p[i * d + j] -= p_phi[i] * p_phi[j] / denom;
+            }
+        }
+    }
+}
+
 pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 
 /// Lua 스크립트의 POLICY_META 테이블에서 읽어온 이름과 버전.
@@ -389,6 +491,7 @@ struct ObservationContext {
     action: String,
     before: Pressure6D,
     timestamp: LogicalInstant,
+    feature_vec: [f32; LINUCB_FEATURE_DIM], // 큐잉 시점의 phi 스냅샷
 }
 
 /// Lua-based policy strategy.
@@ -403,6 +506,11 @@ pub struct LuaPolicy {
     signal_state: SignalState,
     trigger_engine: TriggerEngine,
     relief_table: EwmaReliefTable,
+    linucb: LinUcbTable,
+    /// 현재 tick의 feature vector. 관측 큐잉 시 스냅샷.
+    feature_state: [f32; LINUCB_FEATURE_DIM],
+    /// LinUCB UCB 탐색 가중치 (config.linucb_alpha).
+    linucb_alpha: f32,
     observations: VecDeque<ObservationContext>,
     adaptation_config: AdaptationConfig,
     clock: Arc<dyn Clock>,
@@ -547,6 +655,9 @@ impl LuaPolicy {
             signal_state: SignalState::default(),
             trigger_engine,
             relief_table,
+            linucb: LinUcbTable::new(),
+            feature_state: [0.0f32; LINUCB_FEATURE_DIM],
+            linucb_alpha: config.linucb_alpha,
             observations: VecDeque::new(),
             adaptation_config: config,
             clock,
@@ -567,6 +678,51 @@ impl LuaPolicy {
     /// Production 기본 생성자 — SystemClock을 자동 주입한다.
     pub fn with_system_clock(script_path: &str, config: AdaptationConfig) -> anyhow::Result<Self> {
         Self::new(script_path, config, Arc::new(SystemClock::new()))
+    }
+
+    /// 현재 엔진 상태 + signal_state에서 13차원 feature vector를 빌드.
+    fn build_feature_vec(&self) -> [f32; LINUCB_FEATURE_DIM] {
+        let mut phi = [0.0f32; LINUCB_FEATURE_DIM];
+
+        if let Some(ref status) = self.engine_state {
+            // 0: KV_OCCUPANCY
+            phi[0] = status.kv_cache_utilization.clamp(0.0, 1.0);
+            // 1: IS_GPU
+            phi[1] = if status.active_device.to_lowercase().contains("opencl") {
+                1.0
+            } else {
+                0.0
+            };
+            // 2 & 6: TOKEN_PROGRESS / TOKENS_GEN_NORM (같은 값)
+            let tok_norm = (status.tokens_generated as f32 / 2048.0).min(1.0);
+            phi[2] = tok_norm;
+            phi[6] = tok_norm;
+            // 3: IS_PREFILL
+            phi[3] = if status.phase == "prefill" { 1.0 } else { 0.0 };
+            // 4: KV_DTYPE_NORM
+            phi[4] = match status.kv_dtype.as_str() {
+                "f32" => 0.0,
+                "f16" => 0.5,
+                _ => 1.0, // q4_0 등 양자화 포맷
+            };
+            // 7-12: ACTIVE_* flags
+            for action in &status.active_actions {
+                match action.as_str() {
+                    "switch_hw" => phi[7] = 1.0,
+                    "throttle" | "set_target_tbt" => phi[8] = 1.0,
+                    "kv_offload_disk" => phi[9] = 1.0,
+                    "kv_evict_h2o" | "kv_evict_sliding" | "kv_merge_d2o" => phi[10] = 1.0,
+                    "layer_skip" => phi[11] = 1.0,
+                    "kv_quant_dynamic" => phi[12] = 1.0,
+                    _ => {}
+                }
+            }
+        }
+
+        // 5: TBT_RATIO
+        phi[5] = self.trigger_engine.tbt_degradation_ratio().unwrap_or(0.0) as f32;
+
+        phi
     }
 
     /// Build the `ctx` Lua table from current engine state.
@@ -690,6 +846,7 @@ impl LuaPolicy {
             ];
             for name in &action_names {
                 let relief = self.relief_table.predict(name);
+                let ucb = self.linucb.ucb_bonus(name, &self.feature_state) * self.linucb_alpha;
                 let entry = lua.create_table()?;
                 entry.set("gpu", relief[0])?;
                 entry.set("cpu", relief[1])?;
@@ -697,6 +854,7 @@ impl LuaPolicy {
                 entry.set("thermal", relief[3])?;
                 entry.set("lat", relief[4])?;
                 entry.set("qos", relief[5])?;
+                entry.set("ucb_bonus", ucb)?;
                 r_tbl.set(*name, entry)?;
             }
             coef.set("relief", r_tbl)?;
@@ -883,6 +1041,9 @@ impl LuaPolicy {
 
         self.relief_table.observe(&obs.action, &observed);
 
+        // LinUCB P matrix 업데이트 — 해당 방향 탐색 완료 처리
+        self.linucb.update(&obs.action, &obs.feature_vec);
+
         // 업데이트 후 스냅샷 기록 (관측성 훅)
         let after_entry = self.relief_table.entries.get(&obs.action);
         let after_relief = after_entry.map(|e| e.relief).unwrap_or(before_relief);
@@ -1040,6 +1201,8 @@ impl PolicyStrategy for LuaPolicy {
         self.check_observation();
 
         // 5. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
+        // feature_state를 현재 시점으로 갱신 (LinUCB용)
+        self.feature_state = self.build_feature_vec();
         let (commands, was_fallback) = self.call_decide(signal);
         let directive = if commands.is_empty() {
             None
@@ -1065,6 +1228,7 @@ impl PolicyStrategy for LuaPolicy {
                         action: action_name,
                         before: pressure,
                         timestamp: self.clock.now(),
+                        feature_vec: self.feature_state,
                     });
                 } else {
                     // Multi-command: 귀속 불가. 쌓여있던 관측들을 overrun으로 처리.
@@ -2801,5 +2965,53 @@ mod tests {
         .unwrap();
         let result = policy.process_signal(&dummy_signal());
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn linucb_cold_start_returns_positive_bonus() {
+        let table = LinUcbTable::new();
+        let phi = [1.0f32; LINUCB_FEATURE_DIM];
+        // P matrix 없으면 1.0 반환
+        assert_eq!(table.ucb_bonus("kv_evict_sliding", &phi), 1.0);
+    }
+
+    #[test]
+    fn linucb_bonus_decreases_after_update() {
+        let mut table = LinUcbTable::new();
+        let phi = [0.5f32; LINUCB_FEATURE_DIM];
+        // 첫 번째: P 없으므로 1.0
+        assert_eq!(table.ucb_bonus("throttle", &phi), 1.0);
+        // update 후: P가 초기화되고 해당 방향 불확실성 감소
+        table.update("throttle", &phi);
+        let bonus_after = table.ucb_bonus("throttle", &phi);
+        // identity P의 초기 bonus < 1.0이 되어야 함
+        assert!(
+            bonus_after < 1.0,
+            "bonus after update should decrease: {}",
+            bonus_after
+        );
+        // 동일한 phi로 반복 업데이트하면 계속 감소
+        for _ in 0..5 {
+            table.update("throttle", &phi);
+        }
+        let bonus_later = table.ucb_bonus("throttle", &phi);
+        assert!(
+            bonus_later <= bonus_after,
+            "bonus should keep decreasing: {} vs {}",
+            bonus_later,
+            bonus_after
+        );
+    }
+
+    #[test]
+    fn linucb_actions_are_independent() {
+        let mut table = LinUcbTable::new();
+        let phi = [0.3f32; LINUCB_FEATURE_DIM];
+        // action A 10회 업데이트
+        for _ in 0..10 {
+            table.update("kv_evict_sliding", &phi);
+        }
+        // action B는 cold-start → 1.0
+        assert_eq!(table.ucb_bonus("throttle", &phi), 1.0);
     }
 }
