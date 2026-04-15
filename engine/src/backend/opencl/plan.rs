@@ -11,6 +11,16 @@ use anyhow::{Context, Result};
 use ocl::core::Kernel as CoreKernel;
 use ocl::core::Mem;
 
+thread_local! {
+    /// LLMRS_OP_TRACE: per-token wall-clock accumulator (label -> microseconds).
+    /// Activated by Plan::execute; dispatch_step reads/writes when Some(_).
+    /// Labels are split into `{op}@enqueue` (CPU submission) and `{op}@gpu`
+    /// (clFinish wait, approximates pure GPU execution) to isolate where slope
+    /// against n_kv originates.
+    static OP_TRACE_ACC: std::cell::RefCell<Option<std::collections::HashMap<String, u64>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Operation tag for profiling — maps to OpProfiler fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpTag {
@@ -275,6 +285,11 @@ impl FullKernelPlan {
                 );
             }
         }
+        let traced = OP_TRACE_ACC.with(|c| c.borrow().is_some());
+        if traced {
+            ocl::core::finish(queue).ok();
+        }
+        let t_op_start = std::time::Instant::now();
         if backend.profile_events_enabled {
             if let Err(e) = backend.enqueue_kernel_labeled(
                 &step.kernel,
@@ -311,6 +326,22 @@ impl FullKernelPlan {
                 }
             }
         }
+        if traced {
+            let t_enqueue_end = std::time::Instant::now();
+            ocl::core::finish(queue).ok();
+            let t_gpu_end = std::time::Instant::now();
+            let enqueue_us =
+                t_enqueue_end.duration_since(t_op_start).as_nanos() as u64 / 1000;
+            let gpu_us =
+                t_gpu_end.duration_since(t_enqueue_end).as_nanos() as u64 / 1000;
+            let label = step.op_tag.profile_label();
+            OP_TRACE_ACC.with(|c| {
+                if let Some(m) = c.borrow_mut().as_mut() {
+                    *m.entry(format!("{}@enqueue", label)).or_insert(0) += enqueue_us;
+                    *m.entry(format!("{}@gpu", label)).or_insert(0) += gpu_us;
+                }
+            });
+        }
     }
 
     /// Execute the full decode plan for one token.
@@ -326,7 +357,15 @@ impl FullKernelPlan {
         kv_caches: &mut [C],
     ) -> std::result::Result<(), PlanInvalidated> {
         let debug_sync = std::env::var("PLAN_DEBUG").is_ok();
+        let op_trace = std::env::var_os("LLMRS_OP_TRACE").is_some();
         let queue = backend.queue.as_core();
+
+        if op_trace {
+            OP_TRACE_ACC.with(|c| {
+                *c.borrow_mut() = Some(std::collections::HashMap::new());
+            });
+        }
+        let mut trace_n_kv: i32 = 0;
 
         for (i, layer_plan) in self.layers.iter().enumerate() {
             let cache = &mut kv_caches[i];
@@ -346,6 +385,9 @@ impl FullKernelPlan {
 
             // Attention sees the token we just scattered
             let attn_seq_len = cache_seq_len + 1;
+            if op_trace {
+                trace_n_kv = attn_seq_len;
+            }
 
             // Steps 1-6: pre-KV steps
             for (si, step) in layer_plan.steps_pre_kv.iter().enumerate() {
@@ -622,6 +664,18 @@ impl FullKernelPlan {
                     }
                 }
             }
+        }
+
+        if op_trace {
+            OP_TRACE_ACC.with(|c| {
+                if let Some(m) = c.borrow_mut().take() {
+                    let mut entries: Vec<(String, u64)> = m.into_iter().collect();
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                    let parts: Vec<String> =
+                        entries.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    eprintln!("[OP_TRACE] n_kv={} {}", trace_n_kv, parts.join(" "));
+                }
+            });
         }
 
         Ok(())
@@ -1291,7 +1345,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // isolated microbench 10μs vs noshuffle 21μs, but production pp4096 showed
     // +24ms/tok regression (cause unclear, possibly cache/pipe interaction with
     // surrounding ops). Reverted to noshuffle pending investigation.
-    if false && let Some(ns) = &config.wk_noshuffle
+    if false
+        && let Some(ns) = &config.wk_noshuffle
         && ns.ne01 <= SMALL_N_AOS_THRESHOLD
     {
         steps_pre_kv.push(make_q4_0_aos_matmul_step(
@@ -1346,7 +1401,8 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     // 4. matmul V (residual -> v)
     // -----------------------------------------------------------------------
-    if false && let Some(ns) = &config.wv_noshuffle
+    if false
+        && let Some(ns) = &config.wv_noshuffle
         && ns.ne01 <= SMALL_N_AOS_THRESHOLD
     {
         steps_pre_kv.push(make_q4_0_aos_matmul_step(
