@@ -630,6 +630,9 @@ pub struct LayerPlanConfig<'a> {
     pub f16_program: &'a ocl::Program,
     pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
+    /// AOS Q4_0 matmul program (`kernel_mul_mat_q4_0_f32`). Used for small-N
+    /// matmuls where noshuffle GEMV under-utilizes the GPU (e.g. K/V projection).
+    pub q4_0_program: &'a ocl::Program,
     // Buffer handles (cl_mem) — model weights
     pub x_buf: &'a Mem,
     pub wq_buf: &'a Mem,
@@ -908,6 +911,77 @@ fn make_q4_0_noshuffle_matmul_step(
         retained_bufs: vec![act_img],
     })
 }
+
+/// Build an AOS Q4_0 matmul step using `kernel_mul_mat_q4_0_f32`.
+/// Better for small-N projections (e.g. K/V where N=n_kv_heads*head_dim is small)
+/// because it dispatches `ceil(N/4)*64` threads along N, giving better GPU utilization
+/// than noshuffle GEMV (which creates only N/2 threads along rows).
+///
+/// Weight is in AOS BlockQ4_0 layout (18 bytes per block: 2 bytes half scale + 16 bytes nibbles).
+#[allow(clippy::too_many_arguments)]
+fn make_q4_0_aos_matmul_step(
+    program: &ocl::Program,
+    weight_buf: &Mem,
+    src_buf: &Mem,
+    dst_buf: &Mem,
+    k: usize,
+    n: usize,
+    op_tag: OpTag,
+) -> Result<KernelStep> {
+    let kernel = ocl::core::create_kernel(program, "kernel_mul_mat_q4_0_f32")
+        .context("create kernel_mul_mat_q4_0_f32 for plan")?;
+
+    let m = 1i32;
+    let ne00 = k as i32;
+    let ne01 = n as i32;
+    let ne02 = 1i32;
+    let ne10 = k as i32;
+    let ne12 = k as i32;
+    let ne0 = n as i32;
+    let ne1 = n as i32;
+    let r2 = 1i32;
+    let r3 = 1i32;
+    let zero_u64 = 0u64;
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(weight_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(src_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(dst_buf))?;
+        ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&zero_u64))?;
+        ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&ne00))?;
+        ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::scalar(&ne01))?;
+        ocl::core::set_kernel_arg(&kernel, 8, ocl::core::ArgVal::scalar(&ne02))?;
+        ocl::core::set_kernel_arg(&kernel, 9, ocl::core::ArgVal::scalar(&ne10))?;
+        ocl::core::set_kernel_arg(&kernel, 10, ocl::core::ArgVal::scalar(&ne12))?;
+        ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&ne0))?;
+        ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&ne1))?;
+        ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
+        ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
+    }
+
+    let global_work_size = [n.div_ceil(4) * 64, m as usize, 1];
+    let local_work_size = [64, 1, 1];
+
+    Ok(KernelStep {
+        kernel,
+        ndim: 3,
+        global_work_size,
+        local_work_size: Some(local_work_size),
+        dynamic_args: vec![],
+        op_tag,
+        retained_bufs: vec![],
+    })
+}
+
+/// N threshold below which AOS Q4_0 matmul is preferred over noshuffle GEMV.
+/// At small N, noshuffle's gws=[N/2, 4, 1] creates too few workgroups to saturate
+/// Adreno 830's 16+ compute units. AOS's gws=[ceil(N/4)*64, 1, 1] scales better.
+/// Empirical crossover (microbench_ops on Qwen 2.5-1.5B Q4_0):
+///   N=256 (K/V proj):  aos 10μs  vs noshuffle 21μs → aos wins
+///   N=1536 (Q/O proj): aos 35μs  vs noshuffle 24μs → noshuffle wins
+///   N=8960 (FFN):      aos 164μs vs noshuffle 128μs → noshuffle wins
+const SMALL_N_AOS_THRESHOLD: usize = 512;
 
 /// Build noshuffle GEMV programs, keyed by ne01 (M dimension).
 ///
@@ -1203,7 +1277,23 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     // 3. matmul K (residual -> k)
     // -----------------------------------------------------------------------
-    if let (Some(ns), Some(progs)) = (&config.wk_noshuffle, config.noshuffle_programs) {
+    // NOTE: Tried AOS path for small-N K proj (N <= SMALL_N_AOS_THRESHOLD) — in
+    // isolated microbench 10μs vs noshuffle 21μs, but production pp4096 showed
+    // +24ms/tok regression (cause unclear, possibly cache/pipe interaction with
+    // surrounding ops). Reverted to noshuffle pending investigation.
+    if false && let Some(ns) = &config.wk_noshuffle
+        && ns.ne01 <= SMALL_N_AOS_THRESHOLD
+    {
+        steps_pre_kv.push(make_q4_0_aos_matmul_step(
+            config.q4_0_program,
+            config.wk_buf,
+            config.residual_buf,
+            config.k_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulQKV,
+        )?);
+    } else if let (Some(ns), Some(progs)) = (&config.wk_noshuffle, config.noshuffle_programs) {
         let prog = progs
             .get(&ns.ne01)
             .context("noshuffle program for wk ne01")?;
@@ -1246,7 +1336,19 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     // 4. matmul V (residual -> v)
     // -----------------------------------------------------------------------
-    if let (Some(ns), Some(progs)) = (&config.wv_noshuffle, config.noshuffle_programs) {
+    if false && let Some(ns) = &config.wv_noshuffle
+        && ns.ne01 <= SMALL_N_AOS_THRESHOLD
+    {
+        steps_pre_kv.push(make_q4_0_aos_matmul_step(
+            config.q4_0_program,
+            config.wv_buf,
+            config.residual_buf,
+            config.v_buf,
+            ns.ne00,
+            ns.ne01,
+            OpTag::MatmulQKV,
+        )?);
+    } else if let (Some(ns), Some(progs)) = (&config.wv_noshuffle, config.noshuffle_programs) {
         let prog = progs
             .get(&ns.ne01)
             .context("noshuffle program for wv ne01")?;
@@ -1720,6 +1822,9 @@ pub struct FullPlanConfig<'a> {
     pub f16_program: &'a ocl::Program,
     pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
+    /// AOS Q4_0 matmul program (`kernel_mul_mat_q4_0_f32`). Used for small-N
+    /// matmuls where noshuffle GEMV under-utilizes the GPU (e.g. K/V projection).
+    pub q4_0_program: &'a ocl::Program,
     /// Flash attention program for head_dim=64. When `Some`, the layer
     /// builder may select `AttentionVariant::StandardFlash` for layers
     /// with head_dim=64.
@@ -1825,6 +1930,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             f16_program: config.f16_program,
             f16_l4_program: config.f16_l4_program,
             simple_ops_program: config.simple_ops_program,
+            q4_0_program: config.q4_0_program,
             x_buf: config.x_buf,
             wq_buf: lb.wq,
             wk_buf: lb.wk,
@@ -1998,6 +2104,9 @@ pub struct KiviFullPlanConfig<'a> {
     pub f16_program: &'a ocl::Program,
     pub f16_l4_program: Option<&'a ocl::Program>,
     pub simple_ops_program: &'a ocl::Program,
+    /// AOS Q4_0 matmul program (`kernel_mul_mat_q4_0_f32`). Used for small-N
+    /// matmuls where noshuffle GEMV under-utilizes the GPU (e.g. K/V projection).
+    pub q4_0_program: &'a ocl::Program,
     pub kivi_q2_program: &'a ocl::Program,
     pub kivi_attn_program: Option<&'a ocl::Program>,
     pub layer_bufs: Vec<LayerBufs<'a>>,
@@ -2388,6 +2497,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             f16_program: config.f16_program,
             f16_l4_program: config.f16_l4_program,
             simple_ops_program: config.simple_ops_program,
+            q4_0_program: config.q4_0_program,
             x_buf: config.x_buf,
             wq_buf: lb.wq,
             wk_buf: lb.wk,
