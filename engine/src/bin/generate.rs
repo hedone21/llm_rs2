@@ -877,6 +877,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Determine initial KV cache capacity (dynamic grow-on-demand)
+    // Default: reserve space for prompt + all tokens to generate, so decode never
+    // triggers grow() mid-generation (grow is ~370 ms spike on Adreno).
     let initial_kv_capacity = if args.eval_ll || args.ppl.is_some() {
         // Eval modes: pre-allocate full capacity to avoid re-allocation
         max_seq_len
@@ -885,6 +887,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         input_ids
             .len()
+            .saturating_add(args.num_tokens)
             .next_power_of_two()
             .max(128)
             .min(max_seq_len)
