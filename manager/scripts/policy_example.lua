@@ -39,18 +39,13 @@ function decide(ctx)
         return {}
     end
 
-    -- Map relief table keys to domain keys
-    local domain_key = max_domain
-    if domain_key == "memory" then domain_key = "mem" end
-    if domain_key == "thermal" then domain_key = "therm" end
-
     -- Select the action with highest relief for the bottleneck domain,
     -- while respecting latency budget (lat >= -0.15)
     local best_action = nil
     local best_relief = -999
 
     for action, r in pairs(c.relief) do
-        local relief_val = r[domain_key] or 0
+        local relief_val = r[max_domain] or 0
         local better = relief_val > best_relief
         local tied   = relief_val == best_relief and best_action ~= nil and action < best_action
         if (better or tied) and (r.lat or 0) >= -0.15 then

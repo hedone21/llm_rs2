@@ -677,8 +677,8 @@ impl LuaPolicy {
                 let entry = lua.create_table()?;
                 entry.set("gpu", relief[0])?;
                 entry.set("cpu", relief[1])?;
-                entry.set("mem", relief[2])?;
-                entry.set("therm", relief[3])?;
+                entry.set("memory", relief[2])?;
+                entry.set("thermal", relief[3])?;
                 entry.set("lat", relief[4])?;
                 entry.set("qos", relief[5])?;
                 r_tbl.set(*name, entry)?;
