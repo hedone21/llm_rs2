@@ -3,26 +3,54 @@
 --
 -- Decision flow:
 --   1. trigger 없으면 restore or no-op
---   2. max-pressure 도메인 선정
---   3. relief argmax (lat constraint >= -0.20)
---   4. 파라미터는 pressure level에 따라 동적화
---   5. Emergency(>=0.93)에서만 보조 throttle 추가 (observation 포기)
+--   2. Z_k 계산 (multi-threshold excess virtual queue)
+--   3. Candidate 목록 구성 (single + joint)
+--   4. DPP score argmax: Σ_k Z_k·r_k(a) − V·ℓ(a), hard floor 적용
+--   5. Safety Override: Emergency 도메인 시 throttle 강제 추가
 --
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
---   1.0.1 (2026-04-15): pressure_level 임계값을 Rust MemoryMonitorConfig defaults에 정렬
---     - emergency: 0.93 → 0.90 (available <= 10%)
---     - critical:  0.85 → 0.80 (available <= 20%)
---     - warning:   0.70 → 0.60 (available <= 40%)
+--   2.0.0 (2026-04-15): DPP 기반 재설계 (docs/46_dpp_policy_design.md)
+--     - max-domain argmax → Σ_k Z_k·r_k − V·ℓ linear scalarization
+--     - Z_k = multi-threshold excess virtual queue (raw pressure 제거)
+--     - Latency: binary gate → hard floor + V·ℓ soft penalty 하이브리드
+--     - Joint action registry (kv_evict_plus_quant, throttle_plus_layer_skip)
+--     - Emergency throttle → DPP-external Safety Override layer 분리
+--   1.0.1 (2026-04-15): pressure_level 임계값 정렬
 --   1.0.0 (2026-04-15): initial production policy
---     - 3단계 pressure level (Warning/Critical/Emergency)
---     - keep_ratio / target_bits / throttle delay_ms 동적화
---     - active 중복 가드로 action 순환 해소
---     - restore_defaults 조건 단순화 (0.3 임계값 제거)
---     - Emergency에서 보조 throttle 추가 (relief observation 포기 허용)
 
-POLICY_META = { name = "llm_default", version = "1.0.1" }
+POLICY_META = { name = "llm_default", version = "2.0.0" }
+
+-- ── DPP 상수 (docs/46 §4) ──────────────────────────────────────────────────
+local DPP = {
+    V           = 1.0,   -- latency penalty weight
+    C           = 0.30,  -- latency hard floor (normal)
+    C_EMERGENCY = 0.50,  -- latency hard floor (emergency)
+    W_WARN      = 1.0,   -- threshold excess weights (§4.2.3)
+    W_CRIT      = 2.0,
+    W_EMERG     = 4.0,
+}
+
+-- Per-domain threshold (Rust Monitor defaults에 정렬, §4.2.4)
+-- mem: MemoryMonitorConfig — available 40/20/10% → used 60/80/90%
+-- cpu/gpu: ComputeMonitorConfig warn=70%, crit=90%; Emergency는 정책 레이어 자체 정의
+-- therm: ThermalMonitorConfig 60/75/85°C 정규화 (85°C = 1.0 기준)
+local THETA = {
+    mem   = { warn = 0.60, crit = 0.80, emerg = 0.90 },
+    cpu   = { warn = 0.70, crit = 0.85, emerg = 0.95 },
+    gpu   = { warn = 0.70, crit = 0.85, emerg = 0.95 },
+    therm = { warn = 0.70, crit = 0.85, emerg = 0.95 },
+}
+
+-- DPP 도메인 키 → ctx.coef.pressure 키 매핑
+local PRESSURE_KEY = { mem = "memory", cpu = "cpu", gpu = "gpu", therm = "thermal" }
+
+-- Joint action registry (§4.6) — arity ≤ 2, 수동 등록만
+local JOINT_ACTIONS = {
+    kv_evict_plus_quant      = { components = { "kv_evict_sliding", "kv_quant_dynamic" } },
+    throttle_plus_layer_skip = { components = { "throttle",         "layer_skip"        } },
+}
 
 -- pressure.memory 값에 따른 파라미터 테이블
 -- p.memory = 1.0 - (available / total) 즉 used 비율 (0.0~1.0)
@@ -81,6 +109,39 @@ local function build_cmd(action, level, cpu_pressure)
     return cmd
 end
 
+-- Z_k: multi-threshold excess virtual queue (§4.2)
+local function compute_Zk(pv, th)
+    local ew = math.max(0, pv - th.warn)
+    local ec = math.max(0, pv - th.crit)
+    local ee = math.max(0, pv - th.emerg)
+    return DPP.W_WARN * ew + DPP.W_CRIT * ec + DPP.W_EMERG * ee
+end
+
+-- Joint action relief 계산 (cold-start: component 선형 합 fallback, §4.6.6)
+local function joint_relief(c, jkey)
+    if c.relief[jkey] ~= nil then return c.relief[jkey] end
+    local spec = JOINT_ACTIONS[jkey]
+    if not spec then return nil end
+    local sum = { memory = 0, cpu = 0, gpu = 0, thermal = 0, lat = 0 }
+    for _, comp in ipairs(spec.components) do
+        local r = c.relief[comp] or {}
+        for k in pairs(sum) do sum[k] = sum[k] + (r[k] or 0) end
+    end
+    return sum
+end
+
+-- Joint action active 검사: component 중 하나라도 active면 true
+local function is_active_any(name, active)
+    local spec = JOINT_ACTIONS[name]
+    if spec then
+        for _, comp in ipairs(spec.components) do
+            if is_active(comp, active) then return true end
+        end
+        return false
+    end
+    return is_active(name, active)
+end
+
 function decide(ctx)
     local c = ctx.coef
     local t = c.trigger
@@ -95,77 +156,98 @@ function decide(ctx)
         return {}
     end
 
-    -- 2. max-pressure 도메인 선정 (cpu 포함, tie-break 알파벳순)
-    local domains = {
-        cpu     = p.cpu     or 0,
-        gpu     = p.gpu     or 0,
-        memory  = p.memory  or 0,
-        thermal = p.thermal or 0,
-    }
-    local max_domain, max_val = nil, -1
-    for k, v in pairs(domains) do
-        if v > max_val or (v == max_val and max_domain ~= nil and k < max_domain) then
-            max_domain = k
-            max_val    = v
-        end
+    -- 2. Z_k 계산 (multi-threshold excess virtual queue, docs/46 §4.2)
+    local Z = {}
+    local has_emergency = false
+    for dkey, pkey in pairs(PRESSURE_KEY) do
+        local pv = p[pkey] or 0
+        Z[dkey] = compute_Zk(pv, THETA[dkey])
+        -- Safety Override predicate: raw pressure 기준 (§4.7.2)
+        if pv >= THETA[dkey].emerg then has_emergency = true end
     end
 
-    if max_domain == nil then
+    -- 모든 Z_k = 0 → 개입 불필요
+    local any_z = false
+    for _, zv in pairs(Z) do if zv > 0 then any_z = true; break end end
+    if not any_z then
+        if #ctx.active > 0 then return {{ type = "restore_defaults" }} end
         return {}
     end
 
-    -- relief 테이블 lookup 키 변환 (memory→mem, thermal→therm)
-    local domain_key = max_domain
-    if domain_key == "memory"  then domain_key = "mem"   end
-    if domain_key == "thermal" then domain_key = "therm" end
+    -- 3. pressure level 결정 (build_cmd 파라미터용; 기존 함수 재사용)
+    local mem_p = p.memory or 0
+    local lvl   = pressure_level(mem_p)
+    local cpu_p = p.cpu or 0
 
-    -- 3. pressure level 결정 (memory 기준)
-    local mem_p  = p.memory or 0
-    local lvl    = pressure_level(mem_p)
-    local cpu_p  = p.cpu    or 0
+    -- 4. Safe set: latency hard floor (Emergency 시 완화, §4.4)
+    local lat_floor = has_emergency and -DPP.C_EMERGENCY or -DPP.C
 
-    -- Normal 수준이면 개입 없음 (trigger false 분기와 별개로 정밀 차단)
-    if lvl == "normal" then
-        return {}
-    end
-
-    -- 4. relief argmax: lat constraint >= -0.20
-    local best_action = nil
-    local best_relief = -999
-
+    -- 5. Candidate 목록 (single action + joint action, §4.6)
+    local candidates = {}
     for action, r in pairs(c.relief) do
-        local relief_val = r[domain_key] or 0
-        local better = relief_val > best_relief
-        local tied   = (relief_val == best_relief) and (best_action ~= nil) and (action < best_action)
-        if (better or tied) and (r.lat or 0) >= -0.20 then
-            best_action = action
-            best_relief = relief_val
+        -- joint registry에 속한 single key는 제외 (joint이 이미 포함)
+        if JOINT_ACTIONS[action] == nil then
+            table.insert(candidates, { name = action, relief = r })
+        end
+    end
+    for jkey in pairs(JOINT_ACTIONS) do
+        local jr = joint_relief(c, jkey)
+        if jr ~= nil then
+            table.insert(candidates, { name = jkey, relief = jr, is_joint = true })
         end
     end
 
-    if not best_action or best_relief <= 0 then
-        return {}
-    end
+    -- 6. DPP score argmax: score = Σ_k Z_k·r_k(a) − V·max(-lat,0) (§4.1)
+    local best_action, best_score = nil, -math.huge
+    for _, cand in ipairs(candidates) do
+        local r   = cand.relief
+        local lat = r.lat or 0
+        -- hard floor 검사 (safe set, 원칙 3)
+        if lat >= lat_floor then
+            -- resource term: Σ_k Z_k · r[domain_k]
+            local resource_term = 0
+            for dkey, zv in pairs(Z) do
+                if zv > 0 then
+                    resource_term = resource_term + zv * (r[PRESSURE_KEY[dkey]] or 0)
+                end
+            end
+            -- latency soft penalty: V · max(-lat, 0)
+            local latency_penalty = (lat < 0) and (DPP.V * (-lat)) or 0
+            local score = resource_term - latency_penalty
 
-    -- active 중복 가드: 이미 동일 action이 active면 스킵
-    -- (KvQuantDynamic→KvEvictH2o→KvEvictSliding→KvMergeD2o 순환 방지)
-    if is_active(best_action, ctx.active) then
-        return {}
-    end
-
-    local primary_cmd = build_cmd(best_action, lvl, cpu_p)
-
-    -- 5. Emergency에서만 보조 throttle 추가
-    --    NOTE: commands가 2개이면 relief observation이 큐잉되지 않음.
-    --    Emergency에서는 즉각적 압박 완화가 우선이므로 이를 허용한다.
-    if lvl == "emergency" then
-        -- throttle이 primary로 이미 선정된 경우엔 중복 추가하지 않음
-        if best_action ~= "throttle" and not is_active("throttle", ctx.active) then
-            local throttle_delay = math.max(math.floor(cpu_p * 200), 20)
-            local aux_throttle = { type = "throttle", delay_ms = throttle_delay }
-            return { primary_cmd, aux_throttle }
+            if score > best_score then
+                best_action = cand.name
+                best_score  = score
+            end
         end
     end
 
-    return { primary_cmd }
+    -- 7. Primary commands (DPP output)
+    local primary_cmds = {}
+    if best_action ~= nil and best_score > 0
+       and not is_active_any(best_action, ctx.active) then
+        if JOINT_ACTIONS[best_action] ~= nil then
+            -- Joint action: 각 component를 별도 cmd로 빌드
+            for _, comp in ipairs(JOINT_ACTIONS[best_action].components) do
+                table.insert(primary_cmds, build_cmd(comp, lvl, cpu_p))
+            end
+        else
+            table.insert(primary_cmds, build_cmd(best_action, lvl, cpu_p))
+        end
+    end
+
+    -- 8. Safety Override (DPP 외부 레이어, §4.7)
+    -- Emergency 도메인이 있으면 DPP 결과와 무관하게 throttle 강제 추가.
+    -- NOTE: commands > 1 → lua_policy.rs가 observation을 clear함 (observation skip 자동 처리)
+    if has_emergency and not is_active("throttle", ctx.active) then
+        local has_thr = false
+        for _, cmd in ipairs(primary_cmds) do
+            if cmd.type == "throttle" then has_thr = true; break end
+        end
+        if not has_thr then
+            table.insert(primary_cmds, build_cmd("throttle", lvl, cpu_p))
+        end
+    end
+
+    return primary_cmds
 end
