@@ -39,6 +39,7 @@ spec/ 대응이 아닌 독립적인 feature 설계 문서:
 | `tensor_partition.md` | CPU-GPU Cooperative Inference (Option B) — Tensor Partition 설계 |
 | `cpu_flash_decoding.md` | CPU Attention KV-Split 병렬화 (Step 2 — `attention_gen_f16_neon`) 설계 |
 | `clock_abstraction.md` | Manager `Clock` trait 추상화 (테스트 용이성, 시뮬레이터 시간 주입) |
+| `action_constraints.md` | Manager `ConstraintRegistry` 설계 — EngineCommand 조합 제약의 다층 방어 (Lua + Rust pipeline) |
 
 ## 규칙
 
