@@ -25,6 +25,19 @@
 //! 가설: incremental overhead 합이 production gap 0.11 μs/n_kv per layer
 //! (= 3.1 μs/n_kv per token) 를 설명한다.
 //!
+//! 목적 4 (production-like op chain, 2026-04-15 확장):
+//!   pollute 기반 가설이 기각된 뒤(streaming 32MB, stride 18B 모두 slope 변화 < 0.1 μs/n_kv)
+//!   남은 가설은 "production decode layer의 실제 op sequence + weight 점유 + scheduler 상태"이다.
+//!   Q1 앞/뒤에 실제 production kernel (mul_mv_q4_0_f32, rope_simple, kv_scatter_f32_to_f16,
+//!   rms_norm_opt_f4, silu_mul_simple) 을 단계적으로 삽입하여 Q1 slope 변화 측정.
+//!   - Repeat28WithQKV         : Q1 앞 matmul_qkv (Q4_0 GEMV)
+//!   - Repeat28WithQKVRope     : + rope(Q) + rope(K)
+//!   - Repeat28WithQKVRopeKv   : + kv_scatter
+//!   - Repeat28WithAttnFFN     : Q1 뒤 WO + rms_norm + gate/up + silu_mul + down
+//!   - Repeat28FullLayer       : 전체 layer chain (production 가장 유사)
+//!   140 Q4_0 weight buffers (28 layer × 5 matmul) 가 점유된 상태에서 측정하여
+//!   weight working-set 영향까지 재현.
+//!
 //! 모든 variant × 2 layout × 4 n_kv → 12 조합 × MEASURE_ITERS = 30 measurements.
 
 #[cfg(not(feature = "opencl"))]
@@ -47,6 +60,16 @@ mod bench {
     pub const CAP: usize = 8192; // 최대 n_kv 4472 + 마진
     pub const Q1_WG_SIZE: usize = 64;
     pub const N_LAYERS: usize = 28; // Repeat28 — Qwen 2.5-1.5B 레이어 수
+    /// Hidden dimension (Qwen 2.5-1.5B)
+    pub const HIDDEN: usize = N_H_Q * DK; // 12 * 128 = 1536
+    /// FFN 내부 hidden (Qwen 2.5-1.5B)
+    pub const FFN_HIDDEN: usize = 8960;
+    /// QKV 출력 = Q + K + V = n_h_q*dk + n_h_kv*dk + n_h_kv*dv
+    pub const QKV_OUT: usize = (N_H_Q + 2 * N_H_KV) * DK; // 2048
+    /// Q4_0 block size (elements per block)
+    pub const Q4_0_QK: usize = 32;
+    /// Q4_0 block bytes (half scale + 16 nibble bytes)
+    pub const Q4_0_BLOCK_BYTES: usize = 18;
 
     pub const N_KV_VALUES: &[i32] = &[258, 1025, 2047, 4472];
     pub const WARMUP_ITERS: usize = 5;
@@ -68,6 +91,16 @@ mod bench {
         /// true = 18B stride struct-pattern pollute (Q4_0 matmul 유사)
         /// false = float4 streaming (기존)
         pub pollute_stride: bool,
+        /// Production decode layer chain 흉내용 추가 dispatch.
+        /// Q1 앞에 matmul_qkv (Q4_0 GEMV, HIDDEN → QKV_OUT) 1회.
+        pub insert_qkv: bool,
+        /// Q1 앞에 rope(Q) + rope(K) 2회.
+        pub insert_rope: bool,
+        /// Q1 앞에 kv_scatter_f32_to_f16 1회.
+        pub insert_kv_scatter: bool,
+        /// Q1 뒤에 matmul_wo + add_rms_norm_oop + gate/up/down matmul + silu_mul 삽입.
+        /// Layer chain 중 Q1 앞/뒤 전체 op 집합을 재현.
+        pub insert_post_attn: bool,
     }
 
     /// Cache-pollute 커널용 최대 버퍼 크기. 변수 정의가 아닌 alloc 상한.
@@ -82,6 +115,10 @@ mod bench {
             pollute_mb: 0,
             fragmented_kv: false,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         Variant {
             name: "Repeat28",
@@ -91,6 +128,10 @@ mod bench {
             pollute_mb: 0,
             fragmented_kv: false,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         Variant {
             name: "Repeat28Mask",
@@ -100,6 +141,10 @@ mod bench {
             pollute_mb: 0,
             fragmented_kv: false,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         Variant {
             name: "Repeat28MaskQ",
@@ -109,6 +154,10 @@ mod bench {
             pollute_mb: 0,
             fragmented_kv: false,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         Variant {
             name: "Repeat28Pollute8",
@@ -118,6 +167,10 @@ mod bench {
             pollute_mb: 8,
             fragmented_kv: false,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         Variant {
             name: "Repeat28Pollute32",
@@ -127,6 +180,10 @@ mod bench {
             pollute_mb: 32,
             fragmented_kv: false,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         // 28 layer KV를 28 separate cl_mem으로 분리 — production 실제 구조.
         // Contiguous(Repeat28MaskQ) 대비 slope 차이 → cl_mem 분리 오버헤드 격리 측정.
@@ -138,6 +195,10 @@ mod bench {
             pollute_mb: 0,
             fragmented_kv: true,
             pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         // Q4_0 matmul 18B stride access pattern — streaming(float4) 대비 slope 차이 검증.
         // Q4_0 block_q4_0 구조: half(2B) + 16 nibble bytes = 18B per block.
@@ -149,6 +210,10 @@ mod bench {
             pollute_mb: 8,
             fragmented_kv: false,
             pollute_stride: true,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
         },
         Variant {
             name: "Repeat28PolluteStride32",
@@ -158,6 +223,85 @@ mod bench {
             pollute_mb: 32,
             fragmented_kv: false,
             pollute_stride: true,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
+        },
+        // === Production-like op chain variants (단계별 누적) ===
+        // Base: Repeat28MaskQ. Q1 주변에 실제 production decode layer에서
+        // 실행되는 op들을 단계적으로 추가. 각 variant가 Q1 slope에 주는 영향
+        // 격리 측정 → production gap +1.6 μs/n_kv 구성 요소 식별.
+        //
+        // Q1 앞: matmul_qkv (Q4_0 GEMV, HIDDEN → QKV_OUT)
+        Variant {
+            name: "Repeat28WithQKV",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: false,
+            pollute_stride: false,
+            insert_qkv: true,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
+        },
+        // + rope(Q) + rope(K)
+        Variant {
+            name: "Repeat28WithQKVRope",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: false,
+            pollute_stride: false,
+            insert_qkv: true,
+            insert_rope: true,
+            insert_kv_scatter: false,
+            insert_post_attn: false,
+        },
+        // + kv_scatter_f32_to_f16
+        Variant {
+            name: "Repeat28WithQKVRopeKv",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: false,
+            pollute_stride: false,
+            insert_qkv: true,
+            insert_rope: true,
+            insert_kv_scatter: true,
+            insert_post_attn: false,
+        },
+        // Q1 뒤: matmul_wo + add_rms_norm + matmul_gate + matmul_up + silu_mul + matmul_down
+        Variant {
+            name: "Repeat28WithAttnFFN",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: false,
+            pollute_stride: false,
+            insert_qkv: false,
+            insert_rope: false,
+            insert_kv_scatter: false,
+            insert_post_attn: true,
+        },
+        // 전체 layer chain: QKV + rope + kv_scatter + Q1 + WO + add_rms_norm + FFN
+        Variant {
+            name: "Repeat28FullLayer",
+            num_dispatches: N_LAYERS,
+            use_mask: true,
+            vary_q: true,
+            pollute_mb: 0,
+            fragmented_kv: false,
+            pollute_stride: false,
+            insert_qkv: true,
+            insert_rope: true,
+            insert_kv_scatter: true,
+            insert_post_attn: true,
         },
     ];
 
@@ -184,6 +328,42 @@ mod bench {
         pub q_slot_bytes: u64,
         pub gws: [usize; 3],
         pub lws: Option<[usize; 3]>,
+        // === Production-like op chain state (insert_* variants에서만 사용) ===
+        /// Hidden state F32 [HIDDEN] (rms_norm/matmul 입력)
+        pub hidden_buf: Mem,
+        /// Residual buffer F32 [HIDDEN] (add_rms_norm_oop)
+        pub residual_buf: Mem,
+        /// RMSNorm weight F32 [HIDDEN]
+        pub rms_weight_buf: Mem,
+        /// QKV output F32 [QKV_OUT] (matmul_qkv 출력, rope/kv_scatter 입력)
+        pub qkv_out_buf: Mem,
+        /// K tmp F32 [N_H_KV * DK] (rope/kv_scatter K 입력)
+        pub k_tmp_buf: Mem,
+        /// V tmp F32 [N_H_KV * DK] (kv_scatter V 입력)
+        pub v_tmp_buf: Mem,
+        /// WO output F32 [HIDDEN]
+        pub wo_out_buf: Mem,
+        /// FFN gate/up output F32 [FFN_HIDDEN]
+        pub ffn_gate_buf: Mem,
+        pub ffn_up_buf: Mem,
+        /// FFN down output F32 [HIDDEN]
+        pub ffn_down_buf: Mem,
+        /// Per-layer Q4_0 weight buffers (28 layers × 5 matmul = 140 buffers)
+        pub w_qkv_bufs: Vec<Mem>, // [HIDDEN → QKV_OUT]
+        pub w_wo_bufs: Vec<Mem>,   // [HIDDEN → HIDDEN]
+        pub w_gate_bufs: Vec<Mem>, // [HIDDEN → FFN_HIDDEN]
+        pub w_up_bufs: Vec<Mem>,   // [HIDDEN → FFN_HIDDEN]
+        pub w_down_bufs: Vec<Mem>, // [FFN_HIDDEN → HIDDEN]
+        /// Q4_0 matmul kernel (kernel_mul_mat_q4_0_f32, reused for all matmul)
+        pub q4_0_matmul_kernel: ocl::core::Kernel,
+        /// RoPE kernel (kernel_rope_simple, inplace)
+        pub rope_kernel: ocl::core::Kernel,
+        /// KV scatter kernel (kernel_kv_scatter_f32_to_f16)
+        pub kv_scatter_kernel: ocl::core::Kernel,
+        /// RMSNorm kernel (kernel_rms_norm_opt_f4)
+        pub rms_norm_kernel: ocl::core::Kernel,
+        /// SiLU mul kernel (kernel_silu_mul_simple)
+        pub silu_mul_kernel: ocl::core::Kernel,
     }
 
     /// Cache-pollute 커널: streaming RW로 L2/SLC를 강제 eviction.
@@ -520,6 +700,135 @@ __kernel void pollute_stride(
             )?
         };
 
+        // === Production-like op chain 리소스 alloc ===
+        //
+        // F32 activation buffers (hidden/residual/qkv_out/k_tmp/v_tmp/wo/ffn_gate/up/down).
+        // rms_weight: RMSNorm weight (F32 [HIDDEN]).
+        let alloc_f32 = |elems: usize| -> anyhow::Result<Mem> {
+            let buf = unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    elems,
+                    None,
+                )?
+            };
+            // zero-init (write 1 byte 0 패턴으로 충분 — 실제 값은 무의미, cache 상태만 중요)
+            let zero: Vec<f32> = vec![0.0; elems];
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &queue,
+                    &buf,
+                    true,
+                    0,
+                    std::slice::from_raw_parts(zero.as_ptr() as *const u8, elems * 4),
+                    None::<&Event>,
+                    None::<&mut Event>,
+                )?;
+            }
+            Ok(buf)
+        };
+        let hidden_buf = alloc_f32(HIDDEN)?;
+        let residual_buf = alloc_f32(HIDDEN)?;
+        let rms_weight_buf = alloc_f32(HIDDEN)?;
+        let qkv_out_buf = alloc_f32(QKV_OUT)?;
+        let k_tmp_buf = alloc_f32(N_H_KV * DK)?;
+        let v_tmp_buf = alloc_f32(N_H_KV * DK)?;
+        let wo_out_buf = alloc_f32(HIDDEN)?;
+        let ffn_gate_buf = alloc_f32(FFN_HIDDEN)?;
+        let ffn_up_buf = alloc_f32(FFN_HIDDEN)?;
+        let ffn_down_buf = alloc_f32(HIDDEN)?;
+
+        // Q4_0 weight buffers: per-layer, per-matmul-type.
+        // Production과 동일 구조(140개 buffer)로 driver bookkeeping/L2 working-set 재현.
+        // Q4_0 layout: K*N/QK 블록, 블록당 18B (half scale + 16 nibble bytes).
+        let alloc_q4_0 = |k_dim: usize, n_dim: usize| -> anyhow::Result<Mem> {
+            let n_blocks = (k_dim * n_dim) / Q4_0_QK;
+            let bytes = n_blocks * Q4_0_BLOCK_BYTES;
+            let buf = unsafe {
+                ocl::core::create_buffer::<_, u8>(
+                    context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    bytes,
+                    None,
+                )?
+            };
+            // 초기값: zero. 정확한 결과값 불필요 (L2 state + dispatch pattern만 중요).
+            let zero: Vec<u8> = vec![0u8; bytes];
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &queue,
+                    &buf,
+                    true,
+                    0,
+                    &zero,
+                    None::<&Event>,
+                    None::<&mut Event>,
+                )?;
+            }
+            Ok(buf)
+        };
+        let mut w_qkv_bufs: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        let mut w_wo_bufs: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        let mut w_gate_bufs: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        let mut w_up_bufs: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        let mut w_down_bufs: Vec<Mem> = Vec::with_capacity(N_LAYERS);
+        for _ in 0..N_LAYERS {
+            w_qkv_bufs.push(alloc_q4_0(HIDDEN, QKV_OUT)?);
+            w_wo_bufs.push(alloc_q4_0(HIDDEN, HIDDEN)?);
+            w_gate_bufs.push(alloc_q4_0(HIDDEN, FFN_HIDDEN)?);
+            w_up_bufs.push(alloc_q4_0(HIDDEN, FFN_HIDDEN)?);
+            w_down_bufs.push(alloc_q4_0(FFN_HIDDEN, HIDDEN)?);
+        }
+
+        // Production kernel 재사용 — include_str!로 원본 그대로 컴파일.
+        // cl_opts는 flash_attn과 같은 fast-math 플래그만 전달 (DK/DV define 불필요).
+        //
+        // Note: simple_ops.cl은 subgroup 의존 — Adreno에서는 OK, 호스트 OpenCL 일부는
+        // 실패할 수 있음. 실패 시 nosub fallback 사용.
+        let simple_ops_src = include_str!("../../kernels/simple_ops.cl");
+        let simple_ops_fallback_src = include_str!("../../kernels/fallback/simple_ops_nosub.cl");
+        let simple_ops_program = match Program::builder()
+            .devices(device)
+            .src(simple_ops_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => p,
+            Err(_) => Program::builder()
+                .devices(device)
+                .src(simple_ops_fallback_src)
+                .cmplr_opt(&cl_opts)
+                .build(&context)?,
+        };
+        let rope_kernel = ocl::core::create_kernel(&simple_ops_program, "kernel_rope_simple")?;
+        let kv_scatter_kernel =
+            ocl::core::create_kernel(&simple_ops_program, "kernel_kv_scatter_f32_to_f16")?;
+        // rms_norm: opt_f4 (production 경로)는 HIDDEN % 4 == 0 조건 OK (1536)
+        let rms_norm_kernel =
+            ocl::core::create_kernel(&simple_ops_program, "kernel_rms_norm_opt_f4")?;
+        let silu_mul_kernel =
+            ocl::core::create_kernel(&simple_ops_program, "kernel_silu_mul_simple")?;
+
+        // Q4_0 matmul kernel — production `kernel_mul_mat_q4_0_f32`. GEMV (m==1) 경로.
+        let q4_0_src = include_str!("../../kernels/mul_mv_q4_0_f32.cl");
+        let q4_0_fallback_src = include_str!("../../kernels/fallback/mul_mv_q4_0_f32_nosub.cl");
+        let q4_0_program = match Program::builder()
+            .devices(device)
+            .src(q4_0_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => p,
+            Err(_) => Program::builder()
+                .devices(device)
+                .src(q4_0_fallback_src)
+                .cmplr_opt(&cl_opts)
+                .build(&context)?,
+        };
+        let q4_0_matmul_kernel =
+            ocl::core::create_kernel(&q4_0_program, "kernel_mul_mat_q4_0_f32")?;
+
         Ok(State {
             context,
             queue,
@@ -541,7 +850,205 @@ __kernel void pollute_stride(
             q_slot_bytes,
             gws: [Q1_WG_SIZE, N_H_Q, 1],
             lws: Some([Q1_WG_SIZE, 1, 1]),
+            hidden_buf,
+            residual_buf,
+            rms_weight_buf,
+            qkv_out_buf,
+            k_tmp_buf,
+            v_tmp_buf,
+            wo_out_buf,
+            ffn_gate_buf,
+            ffn_up_buf,
+            ffn_down_buf,
+            w_qkv_bufs,
+            w_wo_bufs,
+            w_gate_bufs,
+            w_up_bufs,
+            w_down_bufs,
+            q4_0_matmul_kernel,
+            rope_kernel,
+            kv_scatter_kernel,
+            rms_norm_kernel,
+            silu_mul_kernel,
         })
+    }
+
+    /// Production fake QKV matmul dispatch (Q4_0 GEMV, HIDDEN → QKV_OUT).
+    /// Production `matmul_q4_0` (mul_mv_q4_0_f32.cl) 그대로 사용.
+    /// layer_idx별로 다른 weight buffer를 바인딩하여 140-weight working-set 재현.
+    fn dispatch_fake_matmul_q4_0(
+        state: &State,
+        weight_buf: &Mem,
+        src_buf: &Mem,
+        dst_buf: &Mem,
+        k_dim: usize, // input dim
+        n_dim: usize, // output dim
+    ) -> anyhow::Result<()> {
+        let kernel = &state.q4_0_matmul_kernel;
+        let ne00 = k_dim as i32;
+        let ne01 = n_dim as i32;
+        let ne02 = 1i32;
+        let ne10 = k_dim as i32;
+        let ne12 = k_dim as i32; // m=1
+        let ne0 = n_dim as i32;
+        let ne1 = n_dim as i32; // m=1
+        let r2 = 1i32;
+        let r3 = 1i32;
+        let zero_u64 = 0u64;
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ArgVal::mem(weight_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 2, ArgVal::mem(src_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 4, ArgVal::mem(dst_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ArgVal::scalar(&zero_u64))?;
+            ocl::core::set_kernel_arg(kernel, 6, ArgVal::scalar(&ne00))?;
+            ocl::core::set_kernel_arg(kernel, 7, ArgVal::scalar(&ne01))?;
+            ocl::core::set_kernel_arg(kernel, 8, ArgVal::scalar(&ne02))?;
+            ocl::core::set_kernel_arg(kernel, 9, ArgVal::scalar(&ne10))?;
+            ocl::core::set_kernel_arg(kernel, 10, ArgVal::scalar(&ne12))?;
+            ocl::core::set_kernel_arg(kernel, 11, ArgVal::scalar(&ne0))?;
+            ocl::core::set_kernel_arg(kernel, 12, ArgVal::scalar(&ne1))?;
+            ocl::core::set_kernel_arg(kernel, 13, ArgVal::scalar(&r2))?;
+            ocl::core::set_kernel_arg(kernel, 14, ArgVal::scalar(&r3))?;
+
+            let local_work_size: [usize; 3] = [64, 1, 1];
+            let group_size_0 = n_dim.div_ceil(4);
+            let global_work_size: [usize; 3] = [group_size_0 * local_work_size[0], 1, 1];
+            ocl::core::enqueue_kernel(
+                &state.queue,
+                kernel,
+                3,
+                None,
+                &global_work_size,
+                Some(local_work_size),
+                None::<&Event>,
+                None::<&mut Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// RoPE (in-place on `x_buf`) — production `kernel_rope_simple` 그대로.
+    fn dispatch_fake_rope(state: &State, x_buf: &Mem, num_heads: usize) -> anyhow::Result<()> {
+        let kernel = &state.rope_kernel;
+        let head_dim_i32 = DK as i32;
+        let num_heads_i32 = num_heads as i32;
+        let seq_len_i32 = 1i32;
+        let start_pos_i32 = 0i32;
+        let theta: f32 = 1_000_000.0; // Qwen rope_theta (정확한 값 불필요)
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&head_dim_i32))?;
+            ocl::core::set_kernel_arg(kernel, 2, ArgVal::scalar(&num_heads_i32))?;
+            ocl::core::set_kernel_arg(kernel, 3, ArgVal::scalar(&seq_len_i32))?;
+            ocl::core::set_kernel_arg(kernel, 4, ArgVal::scalar(&start_pos_i32))?;
+            ocl::core::set_kernel_arg(kernel, 5, ArgVal::scalar(&theta))?;
+
+            let work_size = num_heads * (DK / 2);
+            let gws: [usize; 3] = [work_size, 1, 1];
+            ocl::core::enqueue_kernel(
+                &state.queue,
+                kernel,
+                1,
+                None,
+                &gws,
+                None,
+                None::<&Event>,
+                None::<&mut Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// KV scatter F32 → F16 (production `kernel_kv_scatter_f32_to_f16`).
+    fn dispatch_fake_kv_scatter(state: &State) -> anyhow::Result<()> {
+        let kernel = &state.kv_scatter_kernel;
+        let head_dim_i32 = DK as i32;
+        let capacity_i32 = CAP as i32;
+        let write_pos_i32 = 0i32; // 항상 0 OK — cache state는 동일 slot 덮어쓰기
+        let n_elems = N_H_KV * DK;
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ArgVal::mem(&state.k_tmp_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ArgVal::mem(&state.v_tmp_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ArgVal::mem(&state.k_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ArgVal::mem(&state.v_buf))?;
+            ocl::core::set_kernel_arg(kernel, 4, ArgVal::scalar(&head_dim_i32))?;
+            ocl::core::set_kernel_arg(kernel, 5, ArgVal::scalar(&capacity_i32))?;
+            ocl::core::set_kernel_arg(kernel, 6, ArgVal::scalar(&write_pos_i32))?;
+
+            let gws: [usize; 3] = [n_elems.div_ceil(64) * 64, 1, 1];
+            let lws: [usize; 3] = [64, 1, 1];
+            ocl::core::enqueue_kernel(
+                &state.queue,
+                kernel,
+                1,
+                None,
+                &gws,
+                Some(lws),
+                None::<&Event>,
+                None::<&mut Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// RMSNorm (in-place on `x_buf`, weight `rms_weight_buf`).
+    /// Production `kernel_rms_norm_opt_f4` 그대로. HIDDEN=1536 → %4==0 OK.
+    fn dispatch_fake_rms_norm(state: &State, x_buf: &Mem) -> anyhow::Result<()> {
+        let kernel = &state.rms_norm_kernel;
+        let dim_i32 = HIDDEN as i32;
+        let eps: f32 = 1e-6;
+        let add_unit: i32 = 0;
+        let local_size: usize = 64;
+        let local_mem_bytes = local_size * std::mem::size_of::<f32>();
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ArgVal::mem(x_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ArgVal::mem(&state.rms_weight_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ArgVal::scalar(&dim_i32))?;
+            ocl::core::set_kernel_arg(kernel, 3, ArgVal::scalar(&eps))?;
+            ocl::core::set_kernel_arg(kernel, 4, ArgVal::scalar(&add_unit))?;
+            ocl::core::set_kernel_arg(kernel, 5, ArgVal::local::<f32>(&local_mem_bytes))?;
+
+            let gws: [usize; 3] = [local_size, 1, 1]; // 1 row (decode)
+            let lws: [usize; 3] = [local_size, 1, 1];
+            ocl::core::enqueue_kernel(
+                &state.queue,
+                kernel,
+                1,
+                None,
+                &gws,
+                Some(lws),
+                None::<&Event>,
+                None::<&mut Event>,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// SiLU mul (gate = silu(gate) * up, in-place on `gate_buf`).
+    /// Production `kernel_silu_mul_simple` — float4 elementwise.
+    fn dispatch_fake_silu_mul(state: &State) -> anyhow::Result<()> {
+        let kernel = &state.silu_mul_kernel;
+        let size4 = (FFN_HIDDEN / 4) as i32;
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ArgVal::mem(&state.ffn_gate_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ArgVal::mem(&state.ffn_up_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ArgVal::scalar(&size4))?;
+
+            let gws: [usize; 3] = [size4.max(1) as usize, 1, 1];
+            ocl::core::enqueue_kernel(
+                &state.queue,
+                kernel,
+                1,
+                None,
+                &gws,
+                None,
+                None::<&Event>,
+                None::<&mut Event>,
+            )?;
+        }
+        Ok(())
     }
 
     /// 한 measurement: variant.num_dispatches 만큼 dispatch.
@@ -634,6 +1141,29 @@ __kernel void pollute_stride(
                     }
                 }
             }
+            // === Production-like op chain: Q1 앞 dispatches ===
+            if variant.insert_qkv {
+                // matmul_qkv: hidden [HIDDEN] × W_qkv [HIDDEN → QKV_OUT] → qkv_out
+                dispatch_fake_matmul_q4_0(
+                    state,
+                    &state.w_qkv_bufs[i],
+                    &state.hidden_buf,
+                    &state.qkv_out_buf,
+                    HIDDEN,
+                    QKV_OUT,
+                )?;
+            }
+            if variant.insert_rope {
+                // rope(Q) on qkv_out (첫 N_H_Q heads 영역).
+                // kernel_rope_simple은 x_buf 시작부터 num_heads heads 처리.
+                dispatch_fake_rope(state, &state.qkv_out_buf, N_H_Q)?;
+                // rope(K) on k_tmp (K는 production에서 QKV output 중 K 슬라이스지만,
+                // 측정 목적상 별도 buffer OK — access pattern은 동일 scale).
+                dispatch_fake_rope(state, &state.k_tmp_buf, N_H_KV)?;
+            }
+            if variant.insert_kv_scatter {
+                dispatch_fake_kv_scatter(state)?;
+            }
             if variant.vary_q {
                 let q_off = (i as u64) * state.q_slot_bytes;
                 ocl::core::set_kernel_arg(kernel, 1, ArgVal::scalar(&q_off))?;
@@ -666,6 +1196,52 @@ __kernel void pollute_stride(
                         Some(&mut events[i]),
                     )?;
                 }
+            }
+            // === Production-like op chain: Q1 뒤 dispatches ===
+            if variant.insert_post_attn {
+                // matmul_wo: o_buf (reshape to hidden) × W_wo → wo_out.
+                // Note: o_buf는 [N_H_Q * DV] = HIDDEN elements (F32). matmul 입력으로
+                // 그대로 사용. Q1 출력을 WO input으로 연결하여 production dependency 재현.
+                dispatch_fake_matmul_q4_0(
+                    state,
+                    &state.w_wo_bufs[i],
+                    &state.o_buf,
+                    &state.wo_out_buf,
+                    HIDDEN,
+                    HIDDEN,
+                )?;
+                // add_rms_norm 대체: rms_norm (hidden += residual 단계는 생략,
+                // L2 working-set + dispatch count만 재현).
+                dispatch_fake_rms_norm(state, &state.hidden_buf)?;
+                // FFN gate
+                dispatch_fake_matmul_q4_0(
+                    state,
+                    &state.w_gate_bufs[i],
+                    &state.hidden_buf,
+                    &state.ffn_gate_buf,
+                    HIDDEN,
+                    FFN_HIDDEN,
+                )?;
+                // FFN up
+                dispatch_fake_matmul_q4_0(
+                    state,
+                    &state.w_up_bufs[i],
+                    &state.hidden_buf,
+                    &state.ffn_up_buf,
+                    HIDDEN,
+                    FFN_HIDDEN,
+                )?;
+                // silu_mul (gate = silu(gate) * up)
+                dispatch_fake_silu_mul(state)?;
+                // FFN down
+                dispatch_fake_matmul_q4_0(
+                    state,
+                    &state.w_down_bufs[i],
+                    &state.ffn_gate_buf,
+                    &state.ffn_down_buf,
+                    FFN_HIDDEN,
+                    HIDDEN,
+                )?;
             }
         }
         // Fragmented 종료 후 공유 K/V로 복원 (다음 variant 영향 방지)
