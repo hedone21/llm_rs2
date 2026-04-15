@@ -202,6 +202,10 @@ pub struct AdaptationConfig {
     /// cooldown이 경과하면 동일한 directive도 재방출하여 relief observation이 쌓이도록 한다.
     #[serde(default = "default_dedup_cooldown_secs")]
     pub dedup_cooldown_secs: f64,
+
+    /// Relief table 자동 저장 인터벌 (초). 0이면 비활성화. 기본 300.0s.
+    #[serde(default = "default_persist_interval_secs")]
+    pub persist_interval_secs: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -232,6 +236,7 @@ impl Default for AdaptationConfig {
             trigger: TriggerConfig::default(),
             default_relief: std::collections::HashMap::new(),
             dedup_cooldown_secs: 60.0,
+            persist_interval_secs: 300.0,
         }
     }
 }
@@ -282,6 +287,9 @@ fn default_temp_exit() -> f64 {
 }
 fn default_dedup_cooldown_secs() -> f64 {
     60.0
+}
+fn default_persist_interval_secs() -> f64 {
+    300.0
 }
 
 #[cfg(feature = "hierarchical")]

@@ -332,6 +332,25 @@ impl EwmaReliefTable {
 
 pub const OBSERVATION_DELAY_SECS: f64 = 3.0;
 
+/// Lua 스크립트의 POLICY_META 테이블에서 읽어온 이름과 버전.
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+struct PolicyMeta {
+    name: String,
+    version: String,
+}
+
+/// 히스토리 링 버퍼에 저장되는 단일 tick 상태 스냅샷.
+#[derive(Debug, Clone)]
+struct HistoryEntry {
+    /// 기록 시각 (단조 시계 기준 초).
+    at_s: f64,
+    /// 6D 압박 벡터 [gpu, cpu, memory, thermal, latency, main_app].
+    pressure: [f32; 6],
+    /// 해당 tick에 엔진에 활성화된 action 이름 목록.
+    active_actions: Vec<String>,
+}
+
 /// Lua 오류가 이 횟수 이상 연속 발생하면 영구 fallback으로 전환한다.
 const FALLBACK_ERROR_THRESHOLD: u32 = 3;
 
@@ -399,6 +418,12 @@ pub struct LuaPolicy {
     permanent_fallback: bool,
     /// 로드된 Lua 스크립트 경로 (hot-reload에 사용).
     script_path: std::path::PathBuf,
+    /// 로드된 Lua 스크립트의 POLICY_META (없으면 None).
+    policy_meta: Option<PolicyMeta>,
+    /// 최근 10 tick의 상태 스냅샷 (오래된 것이 front).
+    history: VecDeque<HistoryEntry>,
+    /// relief table 마지막 자동 저장 시각.
+    last_persist_at: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -408,6 +433,26 @@ impl std::fmt::Debug for LuaPolicy {
             .field("signal_state", &self.signal_state)
             .field("trigger_engine", &self.trigger_engine)
             .finish()
+    }
+}
+
+/// Lua globals에서 POLICY_META 테이블을 읽어 로그에 기록하고 반환한다.
+///
+/// 스크립트가 POLICY_META를 정의하지 않으면 None을 반환한다.
+fn log_policy_meta(lua: &Lua) -> Option<PolicyMeta> {
+    let globals = lua.globals();
+    let meta_table: mlua::Result<mlua::Table> = globals.get("POLICY_META");
+    match meta_table {
+        Ok(t) => {
+            let name: String = t.get("name").unwrap_or_default();
+            let version: String = t.get("version").unwrap_or_default();
+            log::info!("Policy loaded: name={:?} version={:?}", name, version);
+            Some(PolicyMeta { name, version })
+        }
+        Err(_) => {
+            log::debug!("POLICY_META not defined in Lua script");
+            None
+        }
     }
 }
 
@@ -479,6 +524,7 @@ impl LuaPolicy {
         };
 
         let trigger_engine = TriggerEngine::new(config.trigger.clone());
+        let policy_meta = log_policy_meta(&lua);
 
         Ok(Self {
             lua,
@@ -494,6 +540,11 @@ impl LuaPolicy {
             consecutive_errors: 0,
             permanent_fallback: false,
             script_path: script_path.into(),
+            policy_meta,
+            history: VecDeque::with_capacity(10),
+            // 시작 시각을 기준점으로 초기화하여 첫 auto-persist는 인터벌 경과 후에 발생한다.
+            // None이면 첫 process_signal 호출 즉시 저장되므로 MGR-093 위반.
+            last_persist_at: Some(std::time::Instant::now()),
         })
     }
 
@@ -635,6 +686,31 @@ impl LuaPolicy {
             coef.set("relief", r_tbl)?;
         }
         ctx.set("coef", coef)?;
+
+        // ctx.history — 최근 N tick의 상태 스냅샷 (오래된 것이 index 1)
+        let history_table = self.lua.create_table()?;
+        for (i, entry) in self.history.iter().enumerate() {
+            let h = self.lua.create_table()?;
+            h.set("at_s", entry.at_s)?;
+
+            let p = self.lua.create_table()?;
+            p.set("gpu", entry.pressure[0])?;
+            p.set("cpu", entry.pressure[1])?;
+            p.set("memory", entry.pressure[2])?;
+            p.set("thermal", entry.pressure[3])?;
+            p.set("latency", entry.pressure[4])?;
+            p.set("main_app", entry.pressure[5])?;
+            h.set("pressure", p)?;
+
+            let acts = self.lua.create_table()?;
+            for (j, a) in entry.active_actions.iter().enumerate() {
+                acts.set(j + 1, a.as_str())?;
+            }
+            h.set("active", acts)?;
+
+            history_table.set(i + 1, h)?;
+        }
+        ctx.set("history", history_table)?;
 
         Ok(ctx)
     }
@@ -792,6 +868,39 @@ impl LuaPolicy {
     pub fn observation_overrun_count(&self) -> u64 {
         self.observation_overrun_count
     }
+
+    /// Relief table을 인터벌 조건 충족 시 자동 저장한다 (INV-103: 실패 시 로그만).
+    fn maybe_persist(&mut self) {
+        let interval = self.adaptation_config.persist_interval_secs;
+        if interval <= 0.0 {
+            return;
+        }
+        let path = &self.adaptation_config.relief_table_path;
+        if path.is_empty() {
+            return;
+        }
+
+        let should_persist = match &self.last_persist_at {
+            None => true,
+            Some(t) => t.elapsed().as_secs_f64() >= interval,
+        };
+        if !should_persist {
+            return;
+        }
+
+        let path_buf = self.adaptation_config.relief_table_path.clone();
+        let path = std::path::Path::new(&path_buf);
+        match self.relief_table.save(path) {
+            Ok(()) => {
+                log::debug!("Relief table auto-persisted to {}", path.display());
+                self.last_persist_at = Some(std::time::Instant::now());
+            }
+            Err(e) => {
+                log::warn!("Relief table auto-persist failed: {}", e);
+                // INV-103: 저장 실패는 로그만, 동작 중단하지 않음
+            }
+        }
+    }
 }
 
 impl PolicyStrategy for LuaPolicy {
@@ -851,12 +960,43 @@ impl PolicyStrategy for LuaPolicy {
                 .update_tbt_from_throughput(status.actual_throughput);
         }
 
-        // 3. Observation 체크
+        // 3. History 갱신 (check_observation 전에 현재 상태를 스냅샷)
+        {
+            let at_s = self.clock.now().as_duration_since_start().as_secs_f64();
+            let pressure = self.signal_state.pressure_with_thermal(
+                self.adaptation_config.temp_safe_c,
+                self.adaptation_config.temp_critical_c,
+                self.trigger_engine.tbt_degradation_ratio(),
+            );
+            let active_actions = self
+                .engine_state
+                .as_ref()
+                .map(|s| s.active_actions.clone())
+                .unwrap_or_default();
+            let entry = HistoryEntry {
+                at_s,
+                pressure: [
+                    pressure.gpu,
+                    pressure.cpu,
+                    pressure.memory,
+                    pressure.thermal,
+                    pressure.latency,
+                    pressure.main_app,
+                ],
+                active_actions,
+            };
+            if self.history.len() >= 10 {
+                self.history.pop_front();
+            }
+            self.history.push_back(entry);
+        }
+
+        // 4. Observation 체크
         self.check_observation();
 
-        // 4. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
+        // 5. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
         let (commands, was_fallback) = self.call_decide(signal);
-        if commands.is_empty() {
+        let directive = if commands.is_empty() {
             None
         } else {
             // fallback 경로의 커맨드는 relief 학습 대상이 아니므로 observation을 큐잉하지 않는다.
@@ -894,7 +1034,12 @@ impl PolicyStrategy for LuaPolicy {
                 seq_id: next_seq_id(),
                 commands,
             })
-        }
+        };
+
+        // 6. Relief table 자동 저장 (인터벌 초과 시)
+        self.maybe_persist();
+
+        directive
     }
 
     fn cancel_last_observation(&mut self) {
@@ -982,26 +1127,14 @@ impl PolicyStrategy for LuaPolicy {
             );
         }
 
-        // 5. (선택) POLICY_META 로깅
-        if let Ok(Value::Table(meta)) = globals.get::<Value>("POLICY_META") {
-            if let Ok(name) = meta.get::<String>("name") {
-                let version: String = meta.get::<String>("version").unwrap_or_default();
-                log::info!(
-                    "LuaPolicy reloaded: name={} version={} path={}",
-                    name,
-                    version,
-                    path.display()
-                );
-            }
-        } else {
-            log::info!("LuaPolicy reloaded: path={}", path.display());
-        }
-
-        // 6. 모두 성공한 경우에만 self 교체
+        // 5. 모두 성공한 경우에만 self 교체
+        log::info!("LuaPolicy reloaded: path={}", path.display());
         self.lua = new_lua;
         self.script_path = path.to_path_buf();
         self.consecutive_errors = 0;
         self.permanent_fallback = false;
+        // POLICY_META 로깅 + 필드 갱신 (log_policy_meta가 name/version을 함께 출력)
+        self.policy_meta = log_policy_meta(&self.lua);
 
         Ok(())
     }
