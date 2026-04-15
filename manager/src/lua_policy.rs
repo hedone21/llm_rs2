@@ -295,6 +295,20 @@ impl EwmaReliefTable {
             .collect()
     }
 
+    /// defaults에 설정된 초기값 스냅샷을 반환한다 (sim_run 진단용).
+    pub fn initial_snapshot(&self) -> HashMap<String, [f32; RELIEF_DIMS]> {
+        self.defaults
+            .iter()
+            .map(|(k, v)| {
+                let mut arr = [0.0f32; RELIEF_DIMS];
+                for (i, &val) in v.iter().enumerate().take(RELIEF_DIMS) {
+                    arr[i] = val;
+                }
+                (k.clone(), arr)
+            })
+            .collect()
+    }
+
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         let json = serde_json::to_string_pretty(&self.entries).map_err(std::io::Error::other)?;
         std::fs::write(path, json)
@@ -844,6 +858,10 @@ impl PolicyStrategy for LuaPolicy {
 
     fn relief_snapshot(&self) -> Option<std::collections::HashMap<String, [f32; 6]>> {
         Some(self.relief_table.snapshot())
+    }
+
+    fn initial_relief_snapshot(&self) -> Option<std::collections::HashMap<String, [f32; 6]>> {
+        Some(self.relief_table.initial_snapshot())
     }
 
     fn drain_relief_updates(&mut self) -> Vec<ReliefUpdateEvent> {

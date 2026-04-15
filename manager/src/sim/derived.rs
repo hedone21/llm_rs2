@@ -61,7 +61,7 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::sim::{config::load_scenario, state::PhysicalState};
+    use super::super::config::load_scenario;
     use std::path::PathBuf;
 
     fn fixtures_dir() -> PathBuf {
@@ -76,7 +76,7 @@ mod tests {
         let path = fixtures_dir().join("baseline.yaml");
         let cfg = load_scenario(&path).expect("baseline should load");
         let mut state = PhysicalState::from_config(&cfg.initial_state);
-        let engine = crate::common::sim::state::EngineStateModel::from_config(&cfg.initial_state);
+        let engine = super::super::state::EngineStateModel::from_config(&cfg.initial_state);
         let mut ctx = ExprContext::new();
 
         // throughput_tps를 수동으로 설정

@@ -328,10 +328,11 @@ impl Trajectory {
         });
     }
 
+    #[cfg(feature = "lua")]
     pub fn record_relief_update(
         &mut self,
         at: Duration,
-        ev: &llm_manager::lua_policy::ReliefUpdateEvent,
+        ev: &crate::lua_policy::ReliefUpdateEvent,
     ) {
         self.entries.push(TrajectoryEntry::ReliefUpdate {
             at_s: at.as_secs_f64(),
@@ -550,78 +551,113 @@ impl Trajectory {
     /// 세션 요약 리포트 — 학습 누락, action 포화, pressure 진행 같은 insight 중심.
     ///
     /// [`format_timeline`](Self::format_timeline)가 이벤트 덤프라면, 이 출력은
-    /// 집계·이상탐지를 담당한다. 예:
-    ///
-    /// ```text
-    /// ━━━ Session Summary ━━━
-    /// duration=30.00s
-    /// signals: memory_pressure×60, compute_guidance×120, ...
-    /// directives: 172 (KvQuantDynamic×172 — saturated)
-    /// relief updates: 4  (kv_quant_dynamic[mem]: 0.500→0.478 in 4 obs)
-    /// ⚠ observation overruns: 168 / 172 (97%) — 3s 지연 미충족
-    /// ```
+    /// 집계·이상탐지를 담당한다.
     pub fn format_session_summary(&self) -> String {
         use std::fmt::Write;
         let mut out = String::new();
 
         let duration = self.last_at_s().unwrap_or(0.0);
         writeln!(out, "━━━ Session Summary ━━━").ok();
-        writeln!(out, "duration={:.2}s", duration).ok();
+        writeln!(out, "duration: {:.2}s", duration).ok();
+        writeln!(out).ok();
 
-        // Signal 집계
-        let mut sig_counts: BTreeMap<String, usize> = BTreeMap::new();
+        // ── Signal 블록: kind별 + level별 집계 ──
+        // kind → level → count
+        let mut sig_by_kind_level: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
         for e in &self.entries {
             if let TrajectoryEntry::Signal { signal, .. } = e {
-                *sig_counts.entry(signal.kind.clone()).or_insert(0) += 1;
+                *sig_by_kind_level
+                    .entry(signal.kind.clone())
+                    .or_default()
+                    .entry(signal.level.clone())
+                    .or_insert(0) += 1;
             }
         }
-        let sig_line: Vec<String> = sig_counts.iter().map(|(k, v)| format!("{k}×{v}")).collect();
-        writeln!(out, "signals: {}", sig_line.join(", ")).ok();
+        let total_signals: usize = sig_by_kind_level
+            .values()
+            .flat_map(|lvl| lvl.values())
+            .sum();
 
-        // Directive 집계 + saturation 감지
-        let mut dir_kinds: BTreeMap<String, usize> = BTreeMap::new();
-        let total_dirs = self
+        if total_signals == 0 {
+            writeln!(out, "Signals (0 total): none").ok();
+        } else {
+            writeln!(out, "Signals ({total_signals} total):").ok();
+            // 각 kind의 최대 길이로 정렬
+            let max_kind_len = sig_by_kind_level.keys().map(|k| k.len()).max().unwrap_or(0);
+            for (kind, lvl_map) in &sig_by_kind_level {
+                let kind_total: usize = lvl_map.values().sum();
+                // level별 detail: Normal×45  Warning×10  Critical×5
+                let lvl_detail: Vec<String> = lvl_map
+                    .iter()
+                    .map(|(lv, cnt)| format!("{lv}×{cnt}"))
+                    .collect();
+                writeln!(
+                    out,
+                    "  {:<width$}  {:>4}  [{}]",
+                    kind,
+                    kind_total,
+                    lvl_detail.join("  "),
+                    width = max_kind_len,
+                )
+                .ok();
+            }
+        }
+        writeln!(out).ok();
+
+        // ── Directive 블록: 타이밍 + trigger 표시 ──
+        let directive_entries: Vec<(&f64, &SignalDump, &DirectiveDump)> = self
             .entries
             .iter()
             .filter_map(|e| {
-                if let TrajectoryEntry::Directive { directive, .. } = e {
-                    for cmd in &directive.commands {
-                        let kind = cmd.split_once('{').map(|(k, _)| k.trim()).unwrap_or(cmd);
-                        *dir_kinds.entry(kind.to_string()).or_insert(0) += 1;
-                    }
-                    Some(())
+                if let TrajectoryEntry::Directive {
+                    at_s,
+                    trigger,
+                    directive,
+                } = e
+                {
+                    Some((at_s, trigger, directive))
                 } else {
                     None
                 }
             })
-            .count();
+            .collect();
+        let total_dirs = directive_entries.len();
+
         if total_dirs == 0 {
             writeln!(
                 out,
-                "directives: 0  ⚠ 정책이 어떤 directive도 방출하지 않음"
+                "Directives (0 sent): ⚠ 정책이 어떤 directive도 방출하지 않음"
             )
             .ok();
         } else {
-            let kinds_line: Vec<String> =
-                dir_kinds.iter().map(|(k, v)| format!("{k}×{v}")).collect();
+            writeln!(out, "Directives ({total_dirs} sent):").ok();
+            for (at_s, trigger, directive) in &directive_entries {
+                let cmds_str = directive.commands.join(", ");
+                writeln!(out, "  t=+{:6.2}s  {}", at_s, cmds_str,).ok();
+                writeln!(
+                    out,
+                    "  {:10}  trigger: {}({})",
+                    "", trigger.kind, trigger.level,
+                )
+                .ok();
+            }
+            // saturation 감지
+            let mut dir_kinds: BTreeMap<String, usize> = BTreeMap::new();
+            for (_, _, directive) in &directive_entries {
+                for cmd in &directive.commands {
+                    let kind = cmd.split_once('{').map(|(k, _)| k.trim()).unwrap_or(cmd);
+                    *dir_kinds.entry(kind.to_string()).or_insert(0) += 1;
+                }
+            }
             let saturated =
                 dir_kinds.len() == 1 && dir_kinds.values().next().copied().unwrap_or(0) >= 10;
-            let saturation_note = if saturated {
-                "  ⚠ 단일 action으로 포화 — action 다양성 없음"
-            } else {
-                ""
-            };
-            writeln!(
-                out,
-                "directives: {}  ({}){}",
-                total_dirs,
-                kinds_line.join(", "),
-                saturation_note,
-            )
-            .ok();
+            if saturated {
+                writeln!(out, "  ⚠ 단일 action으로 포화 — action 다양성 없음").ok();
+            }
         }
+        writeln!(out).ok();
 
-        // Relief 학습 요약 — action별 차원별 (before → after) 델타
+        // ── Relief Table 블록 ──
         struct ReliefAgg {
             count: u32,
             first_before: [f32; 6],
@@ -649,30 +685,34 @@ impl Trajectory {
                     });
             }
         }
+
         if relief_agg.is_empty() {
-            writeln!(out, "relief updates: 0").ok();
+            writeln!(out, "Relief Table (0 actions learned)").ok();
         } else {
-            let total: u32 = relief_agg.values().map(|a| a.count).sum();
-            writeln!(out, "relief updates: {total}").ok();
+            let total_relief: u32 = relief_agg.values().map(|a| a.count).sum();
+            writeln!(out, "Relief Table ({total_relief} action(s) learned):").ok();
             const DIM_NAMES: [&str; 6] = ["gpu", "cpu", "mem", "therm", "lat", "app"];
+            // 헤더
+            let max_action_len = relief_agg.keys().map(|k| k.len()).max().unwrap_or(6).max(6);
+            write!(out, "  {:<width$}", "action", width = max_action_len).ok();
+            for dim in &DIM_NAMES {
+                write!(out, "  {:>6}", dim).ok();
+            }
+            writeln!(out, "  obs").ok();
+
             for (action, agg) in &relief_agg {
-                let deltas: Vec<String> = (0..6)
-                    .filter_map(|i| {
-                        let delta = agg.last_after[i] - agg.first_before[i];
-                        (delta.abs() >= 0.005).then(|| {
-                            format!(
-                                "{}: {:.3}→{:.3}",
-                                DIM_NAMES[i], agg.first_before[i], agg.last_after[i]
-                            )
-                        })
-                    })
-                    .collect();
-                let delta_str = if deltas.is_empty() {
-                    "no significant change".to_string()
-                } else {
-                    deltas.join(", ")
-                };
-                writeln!(out, "  {} obs#{}: {}", action, agg.count, delta_str,).ok();
+                // prior 행 (first_before)
+                write!(out, "  {:<width$}", action, width = max_action_len).ok();
+                for &v in &agg.first_before {
+                    write!(out, "  {:>6.3}", v).ok();
+                }
+                writeln!(out, "  (prior)").ok();
+                // 마지막 관측 행 (last_after)
+                write!(out, "  {:<width$}", "", width = max_action_len).ok();
+                for &v in &agg.last_after {
+                    write!(out, "  {:>6.3}", v).ok();
+                }
+                writeln!(out, "  obs#{}", agg.count).ok();
             }
         }
 
@@ -695,6 +735,7 @@ impl Trajectory {
             } else {
                 0.0
             };
+            writeln!(out).ok();
             writeln!(
                 out,
                 "⚠ observation overruns: {} / {} directives ({:.0}%) — 3s 지연 미충족으로 학습 누락",

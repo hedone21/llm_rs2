@@ -25,7 +25,7 @@ use super::physics;
 use super::signal;
 use super::state::{EngineStateModel, PhysicalState};
 use super::trajectory::Trajectory;
-use llm_manager::pipeline::{DirectiveDeduplicator, PolicyStrategy};
+use crate::pipeline::{DirectiveDeduplicator, PolicyStrategy};
 
 /// action 발동 후 관측 지연 (lua_policy.rs OBSERVATION_DELAY_SECS 복제).
 /// lua_policy는 cfg(feature="lua") 조건부이므로, 여기서 상수를 독립 보유한다.
@@ -114,11 +114,11 @@ impl Simulator {
     pub fn with_lua_policy(
         cfg: ScenarioConfig,
         script_path: impl AsRef<Path>,
-        adaptation_config: llm_manager::config::AdaptationConfig,
+        adaptation_config: crate::config::AdaptationConfig,
     ) -> Result<Self, SimError> {
         let clock = Arc::new(Mutex::new(VirtualClock::new()));
         let handle = VirtualClockHandle::new(Arc::clone(&clock));
-        let policy = llm_manager::lua_policy::LuaPolicy::new(
+        let policy = crate::lua_policy::LuaPolicy::new(
             script_path
                 .as_ref()
                 .to_str()
@@ -326,6 +326,7 @@ impl Simulator {
         }
 
         // Relief 업데이트 + observation overrun 드레인 — 관측성 훅.
+        #[cfg(feature = "lua")]
         for ev in self.policy.drain_relief_updates() {
             self.trajectory.record_relief_update(tick_end, &ev);
         }

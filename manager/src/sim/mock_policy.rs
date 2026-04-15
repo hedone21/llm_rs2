@@ -7,8 +7,8 @@
 
 #![allow(dead_code)]
 
-use llm_manager::pipeline::PolicyStrategy;
-use llm_manager::types::OperatingMode;
+use crate::pipeline::PolicyStrategy;
+use crate::types::OperatingMode;
 use llm_shared::{EngineDirective, EngineMessage, SystemSignal};
 
 /// 신호 핸들러 콜백 타입.

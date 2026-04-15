@@ -15,6 +15,12 @@ env_logger = "0.11"
 libc = "0.2"
 zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"], optional = true }
 mlua = { version = "0.11", features = ["lua54", "vendored", "send"], optional = true }
+evalexpr = "11"
+rand = "0.8"
+rand_chacha = "0.3"
+serde_yaml = "0.9"
+thiserror = "1"
+validator = { version = "0.20", features = ["derive"] }
 
 [features]
 dbus = ["zbus"]
@@ -23,14 +29,8 @@ hierarchical = []
 default = ["dbus", "lua"]
 
 [dev-dependencies]
-evalexpr = "11"
 insta = { version = "1", features = ["yaml", "json"] }
-rand = "0.8"
-rand_chacha = "0.3"
-serde_yaml = "0.9"
 tempfile = "3"
-thiserror = "1"
-validator = { version = "0.20", features = ["derive"] }
 
 [[bin]]
 name = "mock_manager"
@@ -39,6 +39,11 @@ path = "src/bin/mock_manager.rs"
 [[bin]]
 name = "mock_engine"
 path = "src/bin/mock_engine.rs"
+
+[[bin]]
+name = "sim_run"
+path = "src/bin/sim_run.rs"
+required-features = ["lua"]
 
 [[test]]
 name = "sim"

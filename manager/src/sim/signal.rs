@@ -8,8 +8,8 @@
 
 #![allow(dead_code)]
 
-use llm_manager::config::ComputeMonitorConfig;
-use llm_manager::monitor::{
+use crate::config::ComputeMonitorConfig;
+use crate::monitor::{
     compute_level_from_pcts, compute_recommendation, memory_level_from_available_pct,
     thermal_level_from_temp_c,
 };
@@ -388,12 +388,10 @@ fn sim_compute_recommendation(
 
 #[cfg(test)]
 mod tests {
+    use super::super::config::load_scenario;
+    use super::super::noise::NoiseRng;
+    use super::super::state::{EngineStateModel, PhysicalState};
     use super::*;
-    use crate::common::sim::{
-        config::load_scenario,
-        noise::NoiseRng,
-        state::{EngineStateModel, PhysicalState},
-    };
     use std::path::PathBuf;
 
     fn fixtures_dir() -> PathBuf {
@@ -403,12 +401,12 @@ mod tests {
             .join("sim")
     }
 
-    fn load_baseline() -> crate::common::sim::config::ScenarioConfig {
+    fn load_baseline() -> super::super::config::ScenarioConfig {
         load_scenario(fixtures_dir().join("baseline.yaml")).expect("baseline.yaml should load")
     }
 
     fn make_state_and_engine(
-        cfg: &crate::common::sim::config::ScenarioConfig,
+        cfg: &super::super::config::ScenarioConfig,
     ) -> (PhysicalState, EngineStateModel) {
         (
             PhysicalState::from_config(&cfg.initial_state),
@@ -529,7 +527,7 @@ mod tests {
 
     #[test]
     fn test_signal_polling_cadence_respects_config() {
-        use crate::common::sim::clock::{EventKind, VirtualClock};
+        use super::super::clock::{EventKind, VirtualClock};
         use std::time::Duration;
 
         let cfg = load_baseline();
@@ -570,7 +568,7 @@ mod tests {
             .heartbeat
             .noise
             .entry("throughput_tps".to_string())
-            .or_insert(crate::common::sim::config::NoiseSpec {
+            .or_insert(super::super::config::NoiseSpec {
                 sigma: Some(1.0),
                 sigma_mb: None,
                 sigma_mc: None,

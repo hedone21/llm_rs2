@@ -24,6 +24,7 @@ pub mod pipeline;
 pub mod relief;
 #[cfg(feature = "hierarchical")]
 pub mod selector;
+pub mod sim;
 #[cfg(feature = "hierarchical")]
 pub mod supervisory;
 pub mod types;

@@ -11,7 +11,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use llm_manager::clock::{Clock, LogicalInstant};
+use crate::clock::{Clock, LogicalInstant};
 
 use super::clock::VirtualClock;
 

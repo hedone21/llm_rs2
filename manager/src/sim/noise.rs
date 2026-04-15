@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_maybe_create_with_seed() {
-        use crate::common::sim::config::load_scenario;
+        use super::super::config::load_scenario;
         use std::path::PathBuf;
 
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

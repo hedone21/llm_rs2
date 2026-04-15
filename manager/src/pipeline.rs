@@ -52,6 +52,13 @@ pub trait PolicyStrategy: Send {
         None
     }
 
+    /// EwmaReliefTable defaults에 설정된 초기값 스냅샷을 반환한다 (sim_run 진단용).
+    ///
+    /// 기본 구현은 None. LuaPolicy는 Some을 반환하도록 오버라이드한다.
+    fn initial_relief_snapshot(&self) -> Option<HashMap<String, [f32; 6]>> {
+        None
+    }
+
     /// 직전 process_signal() 호출에서 큐잉된 observation을 취소한다.
     ///
     /// dedup이 directive를 suppress했을 때 호출된다.
