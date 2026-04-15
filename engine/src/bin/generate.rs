@@ -2343,24 +2343,39 @@ fn main() -> anyhow::Result<()> {
     // Without this, idle CPU starts at ~2.2GHz and ramp-up time
     // pollutes the prefill measurement (llama.cpp's model loading + warmup
     // achieves the same effect).
-    {
-        let warmup_buf = Galloc::new().alloc(4, DType::U8)?;
+    //
+    // Env overrides (for gap investigation):
+    //   LLMRS_SKIP_WARMUP=1     : disable warmup entirely (baseline cold-start)
+    //   LLMRS_WARMUP_TOKENS=N   : warmup with N tokens (default 1). Use >1 to JIT-compile
+    //                             prefill-path kernels (batched QKV / flash_attn prefill).
+    if std::env::var("LLMRS_SKIP_WARMUP").is_err() {
+        let warmup_tokens: usize = std::env::var("LLMRS_WARMUP_TOKENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1)
+            .max(1)
+            .min(tokens.len());
+
+        let warmup_start = std::time::Instant::now();
+        let warmup_buf = Galloc::new().alloc(warmup_tokens * 4, DType::U8)?;
         unsafe {
-            *(warmup_buf.as_mut_ptr() as *mut u32) = tokens[0];
+            let ptr = warmup_buf.as_mut_ptr() as *mut u32;
+            std::ptr::copy_nonoverlapping(tokens.as_ptr(), ptr, warmup_tokens);
         }
         let warmup_input = Tensor::new(
-            Shape::new(vec![1, 1]),
+            Shape::new(vec![1, warmup_tokens]),
             warmup_buf,
             Arc::new(CpuBackend::new()),
         );
         let warmup_input = backend.copy_from(&warmup_input)?;
 
-        let warmup_logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
-        let mut warmup_logits = Tensor::new(
-            Shape::new(vec![1, 1, vocab_size]),
-            warmup_logits_buf,
-            backend.clone(),
-        );
+        let warmup_logits_shape = if warmup_tokens == 1 {
+            Shape::new(vec![1, 1, vocab_size])
+        } else {
+            Shape::new(vec![1, warmup_tokens, vocab_size])
+        };
+        let warmup_logits_buf = memory.alloc(warmup_tokens * vocab_size * 4, DType::F32)?;
+        let mut warmup_logits = Tensor::new(warmup_logits_shape, warmup_logits_buf, backend.clone());
 
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &warmup_input,
@@ -2380,6 +2395,11 @@ fn main() -> anyhow::Result<()> {
             prefill_workspace: None,
         })?;
         backend.synchronize()?;
+        let warmup_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;
+        eprintln!(
+            "[WARMUP] tokens={} ms={:.2}",
+            warmup_tokens, warmup_ms
+        );
 
         // Brief all-core spin to push DVFS governor to max frequency.
         // 50ms is enough for walt governor to ramp up.
@@ -2398,6 +2418,8 @@ fn main() -> anyhow::Result<()> {
             cache.current_pos = 0;
             cache.high_water_pos = 0;
         }
+    } else {
+        eprintln!("[WARMUP] skipped (LLMRS_SKIP_WARMUP)");
     }
 
     // D2O layer-level allocation: create variance collector before prefill.
@@ -2515,6 +2537,9 @@ fn main() -> anyhow::Result<()> {
             let chunk_tokens = &tokens[chunk_start..chunk_end];
             let chunk_len = chunk_tokens.len();
 
+            let chunk_trace = std::env::var("LLMRS_PREFILL_CHUNK_MS").is_ok();
+            let t_chunk_start = std::time::Instant::now();
+
             // Build CPU input tensor for this chunk.
             let cpu_chunk_buf = Galloc::new().alloc(chunk_len * 4, DType::U8)?;
             unsafe {
@@ -2527,6 +2552,7 @@ fn main() -> anyhow::Result<()> {
                 Arc::new(CpuBackend::new()),
             );
             let input_tensor = backend.copy_from(&cpu_chunk_tensor)?;
+            let t_setup_end = std::time::Instant::now();
 
             // RoPE position for this chunk: start_pos (0 during prefill) + offset within prompt.
             let chunk_start_pos = start_pos + chunk_start;
@@ -2551,6 +2577,16 @@ fn main() -> anyhow::Result<()> {
                 prefill_workspace: None,
             })?;
             backend.synchronize()?;
+            if chunk_trace {
+                let now = std::time::Instant::now();
+                let setup_ms = (t_setup_end - t_chunk_start).as_secs_f64() * 1000.0;
+                let fwd_ms = (now - t_setup_end).as_secs_f64() * 1000.0;
+                let total_ms = (now - t_chunk_start).as_secs_f64() * 1000.0;
+                eprintln!(
+                    "[PREFILL_CHUNK] idx={} start_pos={} len={} setup_ms={:.2} fwd_ms={:.2} total_ms={:.2}",
+                    chunk_idx, chunk_start_pos, chunk_len, setup_ms, fwd_ms, total_ms
+                );
+            }
 
             // Immediately release the GPU input buffer for this chunk.
             drop(input_tensor);
