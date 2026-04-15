@@ -60,8 +60,8 @@ pub fn evaluate(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::config::load_scenario;
+    use super::*;
     use std::path::PathBuf;
 
     fn fixtures_dir() -> PathBuf {

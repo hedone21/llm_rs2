@@ -3,8 +3,66 @@
 > **작성일**: 2026-04-15
 > **대상**: `manager/scripts/policy_default.lua`의 도메인 선정 및 액션 argmax 로직을 multi-objective 관점으로 재설계
 > **상태**: **설계안 (미구현)** — 본 문서는 `policy_default.lua` v1.0.1의 단일 max-domain argmax를 MOMAB 기반 indicator-weighted scalarization으로 교체하는 방안을 기술한다. 구현은 별도 작업으로 수행한다.
-> **관련**: `docs/43_production_lua_policy_design.md`, `docs/42_policy_simulator_guide.md`, `manager/src/lua_policy.rs`, `manager/scripts/policy_default.lua`
+> **관련**: `docs/43_production_lua_policy_design.md`, `docs/42_policy_simulator_guide.md`, `docs/46_dpp_policy_design.md` (DPP 프레임워크 통합), `manager/src/lua_policy.rs`, `manager/scripts/policy_default.lua`
 > **Spec ID 후보**: MGR-POL-2xx 대역 (미할당, 본 문서 채택 시 `/spec-manage`로 할당)
+
+---
+
+## 0. DPP 프레임워크 재정렬 (2026-04-15 추가)
+
+> **요지**: 본 문서의 indicator-weighted scalarization은 독립적인 MOMAB 방법이 아니라 **Lyapunov Drift-Plus-Penalty (DPP)** 프레임워크의 한 특수 케이스이다. Researcher 조사(`.agent/research/2026-04-15_unified_framework_search.md`)로 확인됨.
+>
+> 상세 DPP 설계는 `docs/46_dpp_policy_design.md` 참조. 본 섹션은 docs/44의 수식을 DPP 표기법으로 재진술하고 용어를 통일한다.
+
+### 0.1 DPP 핵심 수식과 docs/44의 매핑
+
+DPP per-slot action selection:
+
+$$
+a^* \;=\; \arg\max_{a \in \mathcal{A}_{\text{safe}}} \Bigl[\, \sum_k Z_k(t) \cdot \hat{r}_k(a) \;-\; V \cdot \hat{\ell}(a) \,\Bigr]
+$$
+
+| DPP 기호 | docs/44 매핑 | Lua/Rust 구현 |
+|----------|--------------|----------------|
+| $Z_k(t)$ (virtual queue) | $w_d$ (domain weight) | `p.memory/cpu/gpu/thermal` 기반 파생 |
+| $\hat{r}_k(a)$ (relief estimate) | $r_{a,d}$ | `ctx.coef.relief[action][d]` |
+| $\hat{\ell}(a)$ (penalty estimate) | $-\min(r_{a,\text{lat}}, 0)$ | `ctx.coef.relief[action].lat` (부호 반전) |
+| $V$ (tradeoff param) | $\lambda$ | `LATENCY_LAMBDA = 2.0` |
+| $\mathcal{A}_{\text{safe}}$ | `r.lat >= LATENCY_FLOOR` | hard floor filter |
+
+### 0.2 docs/44 scalarization은 DPP의 Z_k 할당 전략
+
+docs/44 §2.3의 weight 3:1 혼합은 DPP의 $Z_k$를 **pressure level에 따라 구간화한 step function**이다:
+
+$$
+Z_k(t) \;=\; \begin{cases}
+3.0 & p_k \ge \theta_k^{\text{emergency}} \\
+1.0 & \theta_k^{\text{warning}} \le p_k < \theta_k^{\text{emergency}} \\
+0.0 & p_k < \theta_k^{\text{warning}}
+\end{cases}
+$$
+
+연속 DPP의 $Z_k(t+1) = \max(Z_k(t) + g_k(a) - \text{thr}_k, 0)$ 대신 **runtime instantaneous pressure의 계단 변환**을 사용한 것이 변형 사항(V3). 의미론은 동일 — pressure가 높을수록 해당 도메인의 weight가 커짐.
+
+### 0.3 용어 통일
+
+본 문서 이후의 용어를 DPP 관례와 일치시킨다:
+
+- "scalarization weight $w_d$" → DPP "virtual queue $Z_d$"로 읽어도 무방 (본 문서는 scalarization 관점 유지)
+- "latency penalty coefficient $\lambda$" → DPP "tradeoff parameter $V$"
+- "active domain set $D_{\text{active}}$" → DPP "non-empty queue domains $\{d : Z_d > 0\}$"
+- "hard floor filter" → DPP "safe set $\mathcal{A}_{\text{safe}}$"
+
+### 0.4 DPP 불변 원칙과 docs/44의 관계
+
+`docs/46_dpp_policy_design.md`에서 정의하는 4가지 DPP 불변 원칙:
+
+1. **Score linearity**: $\text{score}(a) = \sum_k Z_k \cdot \hat{r}_k - V \cdot \hat{\ell}$
+2. **$Z_k$가 pressure weight 역할**: pressure↑ → weight↑
+3. **Feasibility 먼저**: safe set 필터를 score 계산 전에 적용
+4. **Seed safe action**: no-op은 항상 feasible
+
+docs/44의 §2 (indicator-weighted) 및 §2.3 (Emergency gate) 설계는 4가지 원칙 모두를 **만족한다**. 단, docs/44 §2.4의 latency 처리는 "hard floor + soft penalty 하이브리드"로 원칙 1, 3을 동시 만족해야 하며, soft penalty를 score에 포함시키는 것이 필수다 (docs/46 §4.4 참조).
 
 ---
 
@@ -344,6 +402,72 @@ end
 - Reference point $z^* = [\max_a r_{a,d}]$ (tick마다 재계산)
 - 시뮬레이터에서 동일 trace 재생하여 본 설계와 경로 비교
 - 판단 기준: Pareto concave 영역에서 본 설계가 놓치는 action이 유의미한 빈도로 존재하는가
+
+---
+
+## 4.5 Safe-LUCB 확장 (Amani 2019) — 로드맵 요약
+
+> **상세 설계**: `docs/45_safe_lucb_design.md` 참조. 본 섹션은 Phase 0(본 문서)이 Phase 1~3의 foundation이 됨을 명시하기 위한 요약이다.
+
+### 배경
+
+본 문서(docs/44)의 indicator-weighted scalarization은 **mean-only argmax**이다. 즉, `ctx.coef.relief[action]`의 점 추정값만으로 action을 선택하며 다음 두 가지를 보장하지 않는다:
+
+1. **Exploration**: 관측이 적은 action이 선택되기 어려움 (cold-start bias)
+2. **Safety**: latency 악화가 `-0.30` hard floor로 binary gate될 뿐, mean estimate의 uncertainty를 반영하지 않음
+
+Amani et al. (2019) NeurIPS "Linear Stochastic Bandits Under Safety Constraints"는 이 두 문제를 동시에 해결하는 Safe-LUCB 알고리즘을 제시한다.
+
+### 핵심 아이디어
+
+- Ridge regression의 confidence ellipsoid로 **pessimistic cost UB**를 계산하여 safe set $S_t$를 정의:
+
+  $$
+  S_t = \{\, a : \hat{c}(a, \phi) + \beta_t \cdot \|\phi\|_{V_a^{-1}} \le C \,\}
+  $$
+
+- Safe set 내에서 **optimistic reward UCB**로 action을 선택:
+
+  $$
+  a_t = \arg\max_{a \in S_t}\,[\,\hat{r}(a, \phi) + \beta_t \cdot \|\phi\|_{V_a^{-1}}\,]
+  $$
+
+### 매핑 결정 (옵션 A)
+
+- 6개 domain pressure → **본 문서(§2)의 indicator-weighted scalarization에 흡수** (Phase 0)
+- Latency만 분리된 **safety constraint**: $c(a, \phi) = -r[a][\text{lat}]$, $C = 0.30$
+- Reward: 본 문서의 scalarized relief score
+
+즉, docs/44와 Amani는 **독립적이 아니라 중첩 관계**이다:
+
+- docs/44 = Safe-LUCB의 reward function 정의
+- docs/45 = docs/44에 UCB bonus + pessimistic safe set을 추가
+
+### 로드맵 (Phase 0~3)
+
+| Phase | 내용 | 기간 | 관련 문서 |
+|-------|------|------|----------|
+| **Phase 0** | docs/44 indicator-weighted scalarization 구현 | 1주 | **본 문서** |
+| **Phase 1** | `OnlineLinearEstimator`에 `predict_with_ub()` 추가 + Lua `ctx.coef.relief_ub` 노출 | 1주 | docs/45 §6.1 |
+| **Phase 2** | `policy_safe_lucb.lua` 신규 + 시뮬레이터 AB 비교 + $\beta_t$ 튜닝 | 2주 | docs/45 §6.2 |
+| **Phase 3** | Production 승격 여부 결정 (조건부) | — | docs/45 §6.3 |
+
+**Phase 0의 독립적 가치**: Phase 2~3이 empirical 검증에서 실패하더라도 Phase 0은 그대로 production에 남는다 (현재의 max-domain argmax 대비 분명한 개선).
+
+### Phase 0과 Phase 1+의 경계
+
+본 문서에서 정의하는 구조:
+
+- `ctx.coef.relief[a][d]` — **point estimate** (`\hat{r}(a, \phi)_d`)
+- `D_{\text{active}}`, `weights[d]`, `LATENCY_FLOOR` — scalarization hyperparameter
+
+Phase 1에서 추가하는 구조 (docs/45에서 상세 기술):
+
+- `ctx.coef.relief_ub[a][d]` — **confidence bonus** ($\beta_t \cdot \|\phi\|_{V^{-1}}$, reward head)
+- `ctx.coef.cost_ub[a]` — **pessimistic cost UB** (latency cost head, safe set check용)
+- `ctx.coef.beta_t` — **scalar confidence radius** (노출은 diagnostic 용도)
+
+Lua 정책은 Phase 0/1/2+를 단일 스크립트에서 토글하거나 별도 스크립트로 분리할 수 있다 (결정 보류, docs/45 §6.2 참조).
 
 ---
 

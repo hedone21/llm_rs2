@@ -241,6 +241,17 @@ pub enum EngineCommand {
     },
 }
 
+impl EngineCommand {
+    /// 두 command가 같은 variant(종류)인지 확인한다.
+    ///
+    /// 파라미터 값은 무시하고 discriminant만 비교한다.
+    /// `DirectiveDeduplicator`에서 parameterized command의 미세한 변동을
+    /// 중복으로 처리하기 위해 사용한다.
+    pub fn same_kind(&self, other: &Self) -> bool {
+        std::mem::discriminant(self) == std::mem::discriminant(other)
+    }
+}
+
 /// Batch of commands from Manager to Engine.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EngineDirective {

@@ -2046,7 +2046,7 @@ mod tests {
     #[test]
     fn test_mode_returns_normal() {
         let script = create_temp_script("function decide(ctx) return {} end");
-        let mut policy = LuaPolicy::with_system_clock(
+        let policy = LuaPolicy::with_system_clock(
             script.path().to_str().unwrap(),
             AdaptationConfig::default(),
         )
