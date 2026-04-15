@@ -82,6 +82,8 @@ pub struct Simulator {
     last_overrun_count: u64,
     /// 직전 방출 directive와 동일한 commands면 suppressed — main.rs와 동일 동작.
     dedup: DirectiveDeduplicator,
+    /// 각 signal 종류의 직전 level — LevelTransition 감지용.
+    last_signal_levels: std::collections::HashMap<String, String>,
 }
 
 impl Simulator {
@@ -103,6 +105,7 @@ impl Simulator {
             ctx,
             last_overrun_count: 0,
             dedup: DirectiveDeduplicator::with_cooldown(60.0),
+            last_signal_levels: std::collections::HashMap::new(),
         }
     }
 
@@ -151,6 +154,7 @@ impl Simulator {
             ctx,
             last_overrun_count: 0,
             dedup: DirectiveDeduplicator::with_cooldown(60.0),
+            last_signal_levels: std::collections::HashMap::new(),
         })
     }
 
@@ -282,6 +286,21 @@ impl Simulator {
                     if let Some(sig) =
                         signal::derive_signal(&event.kind, &self.state, &self.cfg, &mut self.rng)
                     {
+                        // ── Level transition 감지 ──
+                        let dump = super::trajectory::SignalDump::from_signal(&sig);
+                        let prev = self.last_signal_levels.get(&dump.kind).cloned();
+                        if prev.as_deref() != Some(dump.level.as_str()) {
+                            self.trajectory.record_level_transition(
+                                at,
+                                &dump.kind,
+                                prev.as_deref(),
+                                &dump.level,
+                                &self.state,
+                            );
+                            self.last_signal_levels
+                                .insert(dump.kind.clone(), dump.level.clone());
+                        }
+                        // ── 기존 policy 처리 ──
                         if let Some(dir) = self.policy.process_signal(&sig) {
                             if let Some(dir) = self.dedup.process(dir, at.as_secs_f64()) {
                                 self.apply_directive(&dir)?;

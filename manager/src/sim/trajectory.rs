@@ -253,6 +253,18 @@ pub enum TrajectoryEntry {
         /// 시뮬레이션 시작 이후 누적 overrun 카운트.
         total_count: u64,
     },
+    /// Signal level 변화 (예: Normal→Warning). 발생 시점의 물리 상태도 함께 기록.
+    LevelTransition {
+        at_s: f64,
+        /// 변화한 signal 종류 (e.g. "memory_pressure")
+        signal_kind: String,
+        /// 이전 level. None이면 해당 signal 종류의 첫 번째 발생.
+        from_level: Option<String>,
+        /// 새 level
+        to_level: String,
+        /// 전환 시점의 물리 상태 스냅샷
+        state: PhysicalStateSnapshot,
+    },
 }
 
 // ─────────────────────────────────────────────────────────
@@ -349,6 +361,23 @@ impl Trajectory {
         self.entries.push(TrajectoryEntry::ObservationOverrun {
             at_s: at.as_secs_f64(),
             total_count,
+        });
+    }
+
+    pub fn record_level_transition(
+        &mut self,
+        at: Duration,
+        signal_kind: &str,
+        from_level: Option<&str>,
+        to_level: &str,
+        state: &PhysicalState,
+    ) {
+        self.entries.push(TrajectoryEntry::LevelTransition {
+            at_s: at.as_secs_f64(),
+            signal_kind: signal_kind.to_string(),
+            from_level: from_level.map(str::to_string),
+            to_level: to_level.to_string(),
+            state: PhysicalStateSnapshot::from_state(state),
         });
     }
 
@@ -521,6 +550,7 @@ impl Trajectory {
                 TrajectoryEntry::Custom { at_s, .. } => *at_s,
                 TrajectoryEntry::ReliefUpdate { at_s, .. } => *at_s,
                 TrajectoryEntry::ObservationOverrun { at_s, .. } => *at_s,
+                TrajectoryEntry::LevelTransition { at_s, .. } => *at_s,
             }
         };
         self.entries.iter().rev().map(entry_at_s).next()
@@ -653,6 +683,79 @@ impl Trajectory {
                 dir_kinds.len() == 1 && dir_kinds.values().next().copied().unwrap_or(0) >= 10;
             if saturated {
                 writeln!(out, "  ⚠ 단일 action으로 포화 — action 다양성 없음").ok();
+            }
+        }
+        writeln!(out).ok();
+
+        // ── Signal Transitions 블록 ──
+        let transition_entries: Vec<(
+            &f64,
+            &String,
+            &Option<String>,
+            &String,
+            &PhysicalStateSnapshot,
+        )> = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                if let TrajectoryEntry::LevelTransition {
+                    at_s,
+                    signal_kind,
+                    from_level,
+                    to_level,
+                    state,
+                } = e
+                {
+                    Some((at_s, signal_kind, from_level, to_level, state))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let total_transitions = transition_entries.len();
+
+        if total_transitions == 0 {
+            writeln!(out, "Signal Transitions (0): none").ok();
+        } else {
+            writeln!(out, "Signal Transitions ({total_transitions}):").ok();
+            let max_kind_len = transition_entries
+                .iter()
+                .map(|(_, k, _, _, _)| k.len())
+                .max()
+                .unwrap_or(0);
+            let max_from_len = transition_entries
+                .iter()
+                .map(|(_, _, f, _, _)| f.as_deref().unwrap_or("-").len())
+                .max()
+                .unwrap_or(1);
+            let max_to_len = transition_entries
+                .iter()
+                .map(|(_, _, _, t, _)| t.len())
+                .max()
+                .unwrap_or(0);
+            for (at_s, signal_kind, from_level, to_level, state) in &transition_entries {
+                let from = from_level.as_deref().unwrap_or("-");
+                let mem_pct = if state.device_memory_total_mb > 0.0 {
+                    100.0 * state.device_memory_used_mb / state.device_memory_total_mb
+                } else {
+                    0.0
+                };
+                writeln!(
+                    out,
+                    "  t={:+8.2}s  {:<kind_w$}  {:<from_w$}  → {:<to_w$}  mem={:5.1}%  cpu={:5.1}%  gpu={:5.1}%  therm={:5.1}°C",
+                    at_s,
+                    signal_kind,
+                    from,
+                    to_level,
+                    mem_pct,
+                    state.engine_cpu_pct,
+                    state.engine_gpu_pct,
+                    state.thermal_c,
+                    kind_w = max_kind_len,
+                    from_w = max_from_len,
+                    to_w = max_to_len,
+                )
+                .ok();
             }
         }
         writeln!(out).ok();
@@ -894,6 +997,27 @@ impl Trajectory {
                         out,
                         "t={:7.2}s  [OVERRUN] pending observation 덮어써짐 (누적 {})",
                         at_s, total_count,
+                    )
+                    .ok();
+                }
+                TrajectoryEntry::LevelTransition {
+                    at_s,
+                    signal_kind,
+                    from_level,
+                    to_level,
+                    state,
+                } => {
+                    let from = from_level.as_deref().unwrap_or("-");
+                    let mem_pct = if state.device_memory_total_mb > 0.0 {
+                        100.0 * state.device_memory_used_mb / state.device_memory_total_mb
+                    } else {
+                        0.0
+                    };
+                    writeln!(
+                        out,
+                        "t={:7.2}s  [TRANS]  {}: {} → {}   mem={:.0}%  cpu={:.0}%  gpu={:.0}%  therm={:.1}°C",
+                        at_s, signal_kind, from, to_level,
+                        mem_pct, state.engine_cpu_pct, state.engine_gpu_pct, state.thermal_c,
                     )
                     .ok();
                 }
