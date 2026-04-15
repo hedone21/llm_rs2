@@ -1124,7 +1124,13 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // 1. rms_norm_oop (x -> residual)
     // -----------------------------------------------------------------------
     {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_oop")
+        // float4 path for dim divisible by 4 (all decoder arches).
+        let kernel_name = if dim % 4 == 0 {
+            "kernel_rms_norm_oop_f4"
+        } else {
+            "kernel_rms_norm_oop"
+        };
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, kernel_name)
             .context("create kernel_rms_norm_oop")?;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
@@ -1529,7 +1535,12 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
 
     // 10. add_rms_norm_oop (x += attn_out, then norm -> residual)
     {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_add_rms_norm_oop")
+        let kernel_name = if dim % 4 == 0 {
+            "kernel_add_rms_norm_oop_f4"
+        } else {
+            "kernel_add_rms_norm_oop"
+        };
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, kernel_name)
             .context("create kernel_add_rms_norm_oop")?;
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.x_buf))?;
@@ -1877,7 +1888,12 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
 
     // Final RMSNorm (in-place on x)
     let final_norm = {
-        let kernel = ocl::core::create_kernel(config.simple_ops_program, "kernel_rms_norm_opt")
+        let kernel_name = if config.dim % 4 == 0 {
+            "kernel_rms_norm_opt_f4"
+        } else {
+            "kernel_rms_norm_opt"
+        };
+        let kernel = ocl::core::create_kernel(config.simple_ops_program, kernel_name)
             .context("create final kernel_rms_norm_opt")?;
         let local_size = 64usize;
         let local_mem_bytes = local_size * std::mem::size_of::<f32>();

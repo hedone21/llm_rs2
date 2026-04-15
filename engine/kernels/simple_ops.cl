@@ -83,6 +83,64 @@ kernel void kernel_rms_norm_opt(
     }
 }
 
+// Vectorized RMSNorm (float4) — in-place. Requires dim % 4 == 0.
+// Uses dot() + float4 loads for ~4x less loop iterations. Pattern mirrors
+// llama.cpp kernel_rms_norm_mul. Each workgroup handles one row.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_rms_norm_opt_f4(
+    global float * x,
+    global float * weight,
+    int dim,                // must be multiple of 4
+    float eps,
+    int add_unit,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float4 * x_v = (global float4 *)(x + row * dim);
+    global float4 * w_v = (global float4 *)weight;
+    int dim_v = dim >> 2;
+
+    // Phase 1: parallel sum of squares via dot()
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 v = x_v[i];
+        sum_sq += dot(v, v);
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    // Phase 2: apply normalization vectorized
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+    float4 ones = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 w = w_v[i];
+        if (add_unit) w = w + ones;
+        x_v[i] = x_v[i] * scale * w;
+    }
+}
+
 // Fused add + out-of-place RMSNorm: x += residual; out = norm(x) * weight
 // Eliminates separate add_assign kernel before rms_norm_oop.
 #ifdef ADRENO_GPU
@@ -142,6 +200,66 @@ kernel void kernel_add_rms_norm_oop(
     }
 }
 
+// Vectorized fused add + RMSNorm (float4). dim must be multiple of 4.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_add_rms_norm_oop_f4(
+    global float * x,
+    global float * residual,
+    global float * out,
+    global float * weight,
+    int dim,
+    float eps,
+    int add_unit,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float4 * x_v = (global float4 *)(x + row * dim);
+    global float4 * res_v = (global float4 *)(residual + row * dim);
+    global float4 * out_v = (global float4 *)(out + row * dim);
+    global float4 * w_v = (global float4 *)weight;
+    int dim_v = dim >> 2;
+
+    // Phase 1: x += residual, sum of squares via dot()
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 v = x_v[i] + res_v[i];
+        x_v[i] = v;
+        sum_sq += dot(v, v);
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+    float4 ones = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 w = w_v[i];
+        if (add_unit) w = w + ones;
+        out_v[i] = x_v[i] * scale * w;
+    }
+}
+
 // Out-of-place variant: reads from x, writes to out (x is preserved).
 // Used to eliminate copy_residual in the forward pass.
 #ifdef ADRENO_GPU
@@ -193,6 +311,62 @@ kernel void kernel_rms_norm_oop(
     for (int i = lid; i < dim; i += local_size) {
         float w = add_unit ? (1.0f + weight[i]) : weight[i];
         out_row[i] = x_row[i] * scale * w;
+    }
+}
+
+// Vectorized out-of-place RMSNorm (float4). dim must be multiple of 4.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_rms_norm_oop_f4(
+    global float * x,
+    global float * out,
+    global float * weight,
+    int dim,
+    float eps,
+    int add_unit,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float4 * x_v = (global float4 *)(x + row * dim);
+    global float4 * out_v = (global float4 *)(out + row * dim);
+    global float4 * w_v = (global float4 *)weight;
+    int dim_v = dim >> 2;
+
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 v = x_v[i];
+        sum_sq += dot(v, v);
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+    float4 ones = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 w = w_v[i];
+        if (add_unit) w = w + ones;
+        out_v[i] = x_v[i] * scale * w;
     }
 }
 
