@@ -1,0 +1,27 @@
+# Cross-model GPU bench — Thu Apr 16 08:52:25 AM KST 2026
+=== THERMAL pre-llama_3b_256 08:52:25 === max=42300mC
+=== THERMAL llama_3b_256 START 08:53:55 === max=40300mC
+=== THERMAL llama_3b_256 END 08:53:59 === max=60300mC
+=== THERMAL pre-llmrs_3b_256 08:53:59 === max=55700mC
+=== THERMAL llmrs_3b_256 START 08:55:30 === max=38400mC
+=== THERMAL llmrs_3b_256 END 08:55:45 === max=54600mC
+=== THERMAL pre-llama_3b_1024 08:55:45 === max=53300mC
+=== THERMAL llama_3b_1024 START 08:57:15 === max=39200mC
+=== THERMAL llama_3b_1024 END 08:57:25 === max=67700mC
+=== THERMAL pre-llmrs_3b_1024 08:57:25 === max=65800mC
+=== THERMAL llmrs_3b_1024 START 08:58:55 === max=41100mC
+=== THERMAL llmrs_3b_1024 END 08:59:25 === max=64200mC
+=== THERMAL pre-llama_3b_2048 08:59:25 === max=60300mC
+=== THERMAL llama_3b_2048 START 09:00:55 === max=40300mC
+=== THERMAL llama_3b_2048 END 09:01:20 === max=68900mC
+=== THERMAL pre-llmrs_3b_2048 09:01:20 === max=67700mC
+=== THERMAL llmrs_3b_2048 START 09:02:50 === max=41900mC
+=== THERMAL llmrs_3b_2048 END 09:03:43 === max=61500mC
+=== THERMAL pre-llama_3b_6k 09:03:43 === max=61100mC
+=== THERMAL llama_3b_6k START 09:05:14 === max=42600mC
+=== THERMAL llama_3b_6k END 09:07:05 === max=61500mC
+=== THERMAL pre-llmrs_3b_6k 09:07:05 === max=63400mC
+=== THERMAL llmrs_3b_6k START 09:08:35 === max=42600mC
+=== THERMAL llmrs_3b_6k END 09:10:42 === max=58400mC
+=== THERMAL pre-llama_4b_256 09:10:42 === max=61500mC
+=== THERMAL llama_4b_256 START 09:12:12 === max=44200mC

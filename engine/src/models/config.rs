@@ -238,9 +238,11 @@ impl ModelConfig {
         let rope_theta = gguf
             .get_f32(&format!("{prefix}.rope.freq_base"))
             .unwrap_or(10000.0) as f64;
-        // head_dim: use explicit GGUF metadata if available (Gemma3 has head_dim != hidden/heads)
+        // head_dim: use explicit GGUF metadata if available (Gemma3 has head_dim != hidden/heads).
+        // Gemma3 GGUF stores head_dim as `attention.key_length`, not `attention.head_dim`.
         let head_dim = gguf
             .get_u32(&format!("{prefix}.attention.head_dim"))
+            .or_else(|| gguf.get_u32(&format!("{prefix}.attention.key_length")))
             .map(|v| v as usize)
             .unwrap_or(hidden_size / num_attention_heads);
 

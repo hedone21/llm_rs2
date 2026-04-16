@@ -1,0 +1,26 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from llama3.2-3b-gguf/model.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 255 tensors, arch=Llama, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 197 weight tensors
+[Backend] Noshuffle SOA prepared: 197 weight tensors
+Prompt: The development of artificial intelligence has been one of the most transformative technological advances of the 21st century. From its humble beginnings in academic research labs during the 1950s, AI has evolved into a powerful force that shapes nearly every aspect of modern life. Machine learning algorithms now power recommendation systems that determine what we watch, read, and buy. Natural language processing enables virtual assistants to understand and respond to human speech with remarkable accuracy. Computer vision systems can identify objects, faces, and even emotions with precision that rivals or exceeds human capability. The healthcare industry has embraced AI for drug discovery, medical imaging analysis, and personalized treatment planning. Financial institutions rely on AI for fraud detection, algorithmic trading, and risk assessment. Autonomous vehicles use sophisticated AI systems to navigate complex traffic environments. The manufacturing sector employs AI-driven robotics for quality control and predictive maintenance. Education is being revolutionized by adaptive learning platforms that tailor content to individual student needs. Creative industries are exploring AI-generated art, music, and literature, raising profound questions about the nature of creativity itself. Despite these remarkable advances, significant challenges remain. Issues of bias in AI systems, privacy concerns related to data collection, the environmental impact of training large models, and the potential displacement of human workers all demand careful consideration. Rese
+Token Length: 256
+Model config: layers=28, kv_heads=8, head_dim=128, max_seq_len=320
+KV cache type: F16, layout: HeadMajor (initial capacity: 320 tokens, 655360B per layer, max: 320)
+Generating (Max: 320, Temp: 0, TopP: 0.9, TopK: 40)...
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=229.87
+[Profile] Event: PrefillStart
+Prefill: 4196.16 ms (256 tokens, 61.0 tok/s)
+[Profile] Event: DecodingStart
+The development of artificial intelligence has been one of the most transformative technological advances of the 21st century. From its humble beginnings in academic research labs during the 1950s, AI has evolved into a powerful force that shapes nearly every aspect of modern life. Machine learning algorithms now power recommendation systems that determine what we watch, read, and buy. Natural language processing enables virtual assistants to understand and respond to human speech with remarkable accuracy. Computer vision systems can identify objects, faces, and even emotions with precision that rivals or exceeds human capability. The healthcare industry has embraced AI for drug discovery, medical imaging analysis, and personalized treatment planning. Financial institutions rely on AI for fraud detection, algorithmic trading, and risk assessment. Autonomous vehicles use sophisticated AI systems to navigate complex traffic environments. The manufacturing sector employs AI-driven robotics for quality control and predictive maintenance. Education is being revolutionized by adaptive learning platforms that tailor content to individual student needs. Creative industries are exploring AI-generated art, music, and literature, raising profound questions about the nature of creativity itself. Despite these remarkable advances, significant challenges remain. Issues of bias in AI systems, privacy concerns related to data collection, the environmental impact of training large models, and the potential displacement of human workers all demand careful consideration. Rese... • as ( ... The • , is now • 4... from a ... ( | The,... is also , has been used by (...
+The …
+Done.
+[Profile] Event: End
+TTFT: 4550.22 ms
+Decode: 46.19 ms/tok (21.6 tok/s) [31 tokens, forward only]
+Decode(excl tok[0]): 46.01 ms/tok (21.7 tok/s) [30 tokens] | tok[0]=51.61 ms
+Avg TBT: 58.65 ms (17.1 tokens/sec)
