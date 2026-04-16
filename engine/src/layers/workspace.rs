@@ -20,6 +20,9 @@ pub struct LayerWorkspace {
     pub attn_out: Tensor, // [batch, 1, dim]
     /// Pre-allocated scores buffer for attention (max_seq_len size)
     pub scores: Vec<f32>,
+    /// Score buffer offset: kv_start_pos for local attention layers, 0 for global.
+    /// Used to correctly map ws.scores[t] to cache position (score_offset + t).
+    pub score_offset: usize,
     /// Pre-allocated KV cache cast buffers (F32→F16 conversion).
     /// Avoids GPU memory allocation per token per layer.
     pub k_cast: Option<Tensor>,
@@ -76,6 +79,7 @@ impl LayerWorkspace {
             residual: retag(self.residual),
             attn_out: retag(self.attn_out),
             scores: self.scores,
+            score_offset: self.score_offset,
             k_cast: self.k_cast.map(&retag),
             v_cast: self.v_cast.map(&retag),
             partition_ws: self.partition_ws.map(|pw| PartitionWorkspace {
@@ -110,6 +114,7 @@ impl LayerWorkspace {
             residual: alloc(vec![config.batch_size, 1, config.dim])?,
             attn_out: alloc(vec![config.batch_size, 1, config.dim])?,
             scores: vec![0.0; config.n_heads * config.max_seq_len],
+            score_offset: 0,
             k_cast: None, // Lazily initialized on first use with correct dtype
             v_cast: None,
             partition_ws: None, // Set externally when tensor partition is enabled

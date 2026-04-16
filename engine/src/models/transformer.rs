@@ -873,6 +873,8 @@ impl TransformerModel {
                 && acc.should_track_layer(i)
             {
                 let cache_seq_len = kv_caches[i].current_pos();
+                let score_offset = ws.score_offset;
+                let effective_len = cache_seq_len - score_offset;
                 let n_heads_q = self.config.num_attention_heads;
                 let stride = ws.scores.len() / n_heads_q;
 
@@ -881,12 +883,19 @@ impl TransformerModel {
                     acc.accumulate_layer_gqa(
                         &ws.scores,
                         stride,
-                        cache_seq_len,
+                        effective_len,
                         n_heads_q,
                         n_kv_heads,
+                        score_offset,
                     );
                 } else {
-                    acc.accumulate_layer(&ws.scores, stride, cache_seq_len, n_heads_q);
+                    acc.accumulate_layer(
+                        &ws.scores,
+                        stride,
+                        effective_len,
+                        n_heads_q,
+                        score_offset,
+                    );
                 }
             }
         }

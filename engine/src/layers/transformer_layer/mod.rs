@@ -579,7 +579,7 @@ mod tests {
         let mut acc = AttentionScoreAccumulator::new(16, n_heads_q, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq_len, n_heads_q);
+        acc.accumulate_layer(&scores, stride, cache_seq_len, n_heads_q, 0);
         acc.end_step();
 
         // Per-token importance = sum across heads of softmax probs

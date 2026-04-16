@@ -169,23 +169,31 @@ impl AttentionScoreAccumulator {
     ///
     /// `scores`: flat buffer `[n_heads_q * stride]`, where stride >= cache_seq_len.
     /// `stride`: distance between head score arrays.
-    /// `cache_seq_len`: number of valid token positions in cache.
+    /// `cache_seq_len`: number of valid token positions covered by this scores buffer.
     /// `n_heads_q`: number of query heads.
+    /// `score_offset`: cache position of scores[t=0]. 0 for global attention; kv_start_pos
+    ///   for local (sliding-window) attention layers so that scores are mapped to the correct
+    ///   absolute cache positions.
     pub fn accumulate_layer(
         &mut self,
         scores: &[f32],
         stride: usize,
         cache_seq_len: usize,
         n_heads_q: usize,
+        score_offset: usize,
     ) {
         let len = cache_seq_len.min(self.max_seq_len);
 
         for t in 0..len {
+            let pos = score_offset + t;
+            if pos >= self.max_seq_len {
+                break;
+            }
             let mut layer_score = 0.0f32;
             for h in 0..n_heads_q {
                 layer_score += scores[h * stride + t];
             }
-            self.step_importance[t] = self.step_importance[t].max(layer_score);
+            self.step_importance[pos] = self.step_importance[pos].max(layer_score);
         }
     }
 
@@ -195,6 +203,8 @@ impl AttentionScoreAccumulator {
     ///
     /// `scores`: flat buffer `[n_heads_q * stride]`.
     /// `n_heads_q`: total query heads (must be divisible by `n_kv_heads`).
+    /// `score_offset`: cache position of scores[t=0]. 0 for global attention; kv_start_pos
+    ///   for local (sliding-window) attention layers.
     pub fn accumulate_layer_gqa(
         &mut self,
         scores: &[f32],
@@ -202,6 +212,7 @@ impl AttentionScoreAccumulator {
         cache_seq_len: usize,
         n_heads_q: usize,
         n_kv_heads: usize,
+        score_offset: usize,
     ) {
         let len = cache_seq_len.min(self.max_seq_len);
 
@@ -209,12 +220,16 @@ impl AttentionScoreAccumulator {
         let inv_rep = 1.0 / n_rep as f32;
 
         for t in 0..len {
+            let pos = score_offset + t;
+            if pos >= self.max_seq_len {
+                break;
+            }
             // Flat accumulation (backward compatible with H2O)
             let mut layer_score = 0.0f32;
             for h in 0..n_heads_q {
                 layer_score += scores[h * stride + t];
             }
-            self.step_importance[t] = self.step_importance[t].max(layer_score);
+            self.step_importance[pos] = self.step_importance[pos].max(layer_score);
 
             // Per-KV-head: average Q-heads within each GQA group
             for kv_h in 0..n_kv_heads {
@@ -223,7 +238,7 @@ impl AttentionScoreAccumulator {
                     group_score += scores[(kv_h * n_rep + r) * stride + t];
                 }
                 group_score *= inv_rep;
-                let idx = kv_h * self.max_seq_len + t;
+                let idx = kv_h * self.max_seq_len + pos;
                 self.head_step_importance[idx] = self.head_step_importance[idx].max(group_score);
                 // CAOTE: overwrite (not MAX) to keep the last tracked layer's raw attention.
                 // NaN guard: softmax can produce NaN when all logits are -inf (e.g.
@@ -383,7 +398,7 @@ mod tests {
         let scores = vec![
             0.1, 0.2, 0.3, 0.4, 0.0, 0.0, 0.0, 0.0, 0.4, 0.3, 0.2, 0.1, 0.0, 0.0, 0.0, 0.0,
         ];
-        acc.accumulate_layer(&scores, 8, 4, 2);
+        acc.accumulate_layer(&scores, 8, 4, 2, 0);
         acc.end_step();
 
         // Per-token: sum across heads → layer_score, then MAX with step_importance
@@ -405,8 +420,8 @@ mod tests {
         let scores1 = vec![0.1, 0.2, 0.3, 0.4]; // layer 0 scores
         let scores2 = vec![0.4, 0.1, 0.1, 0.4]; // layer 1 scores
 
-        acc.accumulate_layer(&scores1, 4, 4, 1);
-        acc.accumulate_layer(&scores2, 4, 4, 1);
+        acc.accumulate_layer(&scores1, 4, 4, 1, 0);
+        acc.accumulate_layer(&scores2, 4, 4, 1, 0);
         acc.end_step();
 
         // Per-layer MAX: max(0.1,0.4)=0.4, max(0.2,0.1)=0.2, max(0.3,0.1)=0.3, max(0.4,0.4)=0.4
@@ -425,12 +440,12 @@ mod tests {
 
         // Step 1
         acc.begin_step();
-        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1);
+        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1, 0);
         acc.end_step();
 
         // Step 2
         acc.begin_step();
-        acc.accumulate_layer(&[4.0, 3.0, 2.0, 1.0], 4, 4, 1);
+        acc.accumulate_layer(&[4.0, 3.0, 2.0, 1.0], 4, 4, 1, 0);
         acc.end_step();
 
         // importance = step1 + step2 = [5.0, 5.0, 5.0, 5.0]
@@ -448,7 +463,7 @@ mod tests {
 
         // Step 1: accumulate
         acc.begin_step();
-        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1);
+        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1, 0);
         acc.end_step();
         // importance = [1, 2, 3, 4]
 
@@ -480,7 +495,7 @@ mod tests {
         acc.set_active(true);
 
         acc.begin_step();
-        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1);
+        acc.accumulate_layer(&[1.0, 2.0, 3.0, 4.0], 4, 4, 1, 0);
         acc.end_step();
         acc.reset();
 
@@ -517,9 +532,9 @@ mod tests {
         acc.begin_step();
 
         // Layer 0: token 0 is critical (score=9.0), token 1 low (0.1)
-        acc.accumulate_layer(&[9.0, 0.1, 0.1, 0.1], 4, 4, 1);
+        acc.accumulate_layer(&[9.0, 0.1, 0.1, 0.1], 4, 4, 1, 0);
         // Layer 1: token 1 is critical (score=9.0), token 0 low (0.1)
-        acc.accumulate_layer(&[0.1, 9.0, 0.1, 0.1], 4, 4, 1);
+        acc.accumulate_layer(&[0.1, 9.0, 0.1, 0.1], 4, 4, 1, 0);
         acc.end_step();
 
         // MAX: both token 0 and token 1 should have high importance (9.0)
@@ -549,7 +564,7 @@ mod tests {
             0.0, 0.0, 1.0, 0.0, // Q-head 2
             0.0, 0.0, 0.0, 1.0, // Q-head 3
         ];
-        acc.accumulate_layer_gqa(&scores, 4, 4, 4, 2);
+        acc.accumulate_layer_gqa(&scores, 4, 4, 4, 2, 0);
         acc.end_step();
 
         // KV head 0: avg(Q0, Q1) per token
@@ -584,7 +599,7 @@ mod tests {
             0.0, 0.0, 1.0, 0.0, // Q2
             0.0, 0.0, 0.0, 1.0, // Q3
         ];
-        acc.accumulate_layer_gqa(&scores, 4, 4, 4, 2);
+        acc.accumulate_layer_gqa(&scores, 4, 4, 4, 2, 0);
         acc.end_step();
 
         // Flat importance = sum across all Q-heads per token
@@ -607,7 +622,7 @@ mod tests {
             2.0, 4.0, 0.0, 0.0, // Q0 → KV0
             0.0, 0.0, 6.0, 8.0, // Q1 → KV1
         ];
-        acc.accumulate_layer_gqa(&scores, 4, 4, 2, 2);
+        acc.accumulate_layer_gqa(&scores, 4, 4, 2, 2, 0);
         acc.end_step();
 
         // head_importance: KV0=[2,4,0,0], KV1=[0,0,6,8]
@@ -628,7 +643,7 @@ mod tests {
         acc.set_active(true);
         acc.begin_step();
         let scores = vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
-        acc.accumulate_layer_gqa(&scores, 4, 4, 2, 2);
+        acc.accumulate_layer_gqa(&scores, 4, 4, 2, 2, 0);
         acc.end_step();
         acc.reset();
 
@@ -667,14 +682,14 @@ mod tests {
             9.0, 0.1, 0.1, 0.1, // Q0 → KV0
             0.1, 0.1, 0.1, 0.1, // Q1 → KV1
         ];
-        acc.accumulate_layer_gqa(&scores_l0, 4, 4, 2, 2);
+        acc.accumulate_layer_gqa(&scores_l0, 4, 4, 2, 2, 0);
 
         // Layer 1: KV0 low, KV1 high on tok2
         let scores_l1 = vec![
             0.1, 0.1, 0.1, 0.1, // Q0 → KV0
             0.1, 0.1, 9.0, 0.1, // Q1 → KV1
         ];
-        acc.accumulate_layer_gqa(&scores_l1, 4, 4, 2, 2);
+        acc.accumulate_layer_gqa(&scores_l1, 4, 4, 2, 2, 0);
         acc.end_step();
 
         let head_imp = acc.head_importance_scores().unwrap();
@@ -761,8 +776,8 @@ mod tests {
             s
         };
 
-        acc.accumulate_layer(&layer0, stride, cache_seq, n_heads);
-        acc.accumulate_layer(&layer1, stride, cache_seq, n_heads);
+        acc.accumulate_layer(&layer0, stride, cache_seq, n_heads, 0);
+        acc.accumulate_layer(&layer1, stride, cache_seq, n_heads, 0);
         acc.end_step();
 
         let max_imp = acc.importance_scores();
@@ -817,7 +832,7 @@ mod tests {
                 s[0] = 0.01;
                 s[1] = 5.0; // moderately important in other layers
             }
-            acc.accumulate_layer(&s, max_seq, cache_seq, 1);
+            acc.accumulate_layer(&s, max_seq, cache_seq, 1, 0);
         }
         acc.end_step();
 
@@ -843,8 +858,8 @@ mod tests {
 
         // Step 1: layer0=[3.0, 1.0], layer1=[1.0, 5.0]
         acc.begin_step();
-        acc.accumulate_layer(&[3.0, 1.0, 0.0, 0.0], max_seq, 2, 1);
-        acc.accumulate_layer(&[1.0, 5.0, 0.0, 0.0], max_seq, 2, 1);
+        acc.accumulate_layer(&[3.0, 1.0, 0.0, 0.0], max_seq, 2, 1, 0);
+        acc.accumulate_layer(&[1.0, 5.0, 0.0, 0.0], max_seq, 2, 1, 0);
         acc.end_step();
 
         // step_max: token0=max(3,1)=3, token1=max(1,5)=5
@@ -854,8 +869,8 @@ mod tests {
 
         // Step 2: layer0=[4.0, 2.0], layer1=[2.0, 1.0]
         acc.begin_step();
-        acc.accumulate_layer(&[4.0, 2.0, 0.0, 0.0], max_seq, 2, 1);
-        acc.accumulate_layer(&[2.0, 1.0, 0.0, 0.0], max_seq, 2, 1);
+        acc.accumulate_layer(&[4.0, 2.0, 0.0, 0.0], max_seq, 2, 1, 0);
+        acc.accumulate_layer(&[2.0, 1.0, 0.0, 0.0], max_seq, 2, 1, 0);
         acc.end_step();
 
         // step_max: token0=max(4,2)=4, token1=max(2,1)=2
@@ -886,7 +901,7 @@ mod tests {
         let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads);
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads, 0);
         acc.end_step();
 
         let imp = acc.importance_scores();
@@ -968,7 +983,7 @@ mod tests {
                     }
                 }
 
-                acc.accumulate_layer(&scores, max_seq, cache_len, n_heads_q);
+                acc.accumulate_layer(&scores, max_seq, cache_len, n_heads_q, 0);
             }
 
             acc.end_step();
@@ -1287,8 +1302,8 @@ mod tests {
                     }
                 }
 
-                acc_raw.accumulate_layer(&scores, max_seq, cache_len, n_heads_q);
-                acc_norm.accumulate_layer(&scores, max_seq, cache_len, n_heads_q);
+                acc_raw.accumulate_layer(&scores, max_seq, cache_len, n_heads_q, 0);
+                acc_norm.accumulate_layer(&scores, max_seq, cache_len, n_heads_q, 0);
             }
 
             acc_raw.end_step();
@@ -1497,7 +1512,7 @@ mod tests {
 
         // First accumulate via CPU path
         acc.begin_step();
-        acc.accumulate_layer(&[100.0, 200.0, 300.0, 400.0], 4, 4, 1);
+        acc.accumulate_layer(&[100.0, 200.0, 300.0, 400.0], 4, 4, 1, 0);
         acc.end_step();
 
         assert!((acc.importance_scores()[0] - 100.0).abs() < 1e-6);
@@ -1518,10 +1533,10 @@ mod tests {
 
         // Simulate some steps to build step_count
         acc.begin_step();
-        acc.accumulate_layer(&[1.0, 1.0, 1.0, 1.0], 4, 4, 1);
+        acc.accumulate_layer(&[1.0, 1.0, 1.0, 1.0], 4, 4, 1, 0);
         acc.end_step(); // step_count[0..4] = 1
         acc.begin_step();
-        acc.accumulate_layer(&[1.0, 1.0, 0.0, 0.0], 4, 4, 1);
+        acc.accumulate_layer(&[1.0, 1.0, 0.0, 0.0], 4, 4, 1, 0);
         acc.end_step(); // step_count = [2, 2, 1, 1]
 
         // GPU import with known values
@@ -1548,13 +1563,18 @@ mod tests {
         stride: usize,
         len: usize,
         n_heads_q: usize,
+        score_offset: usize,
     ) {
         for t in 0..len {
+            let pos = score_offset + t;
+            if pos >= step_importance.len() {
+                break;
+            }
             let mut layer_score = 0.0f32;
             for h in 0..n_heads_q {
                 layer_score += scores[h * stride + t];
             }
-            step_importance[t] = step_importance[t].max(layer_score);
+            step_importance[pos] = step_importance[pos].max(layer_score);
         }
     }
 
@@ -1569,15 +1589,20 @@ mod tests {
         n_heads_q: usize,
         n_kv_heads: usize,
         max_seq_len: usize,
+        score_offset: usize,
     ) {
         let n_rep = n_heads_q / n_kv_heads;
         let inv_rep = 1.0 / n_rep as f32;
         for t in 0..len {
+            let pos = score_offset + t;
+            if pos >= max_seq_len {
+                break;
+            }
             let mut layer_score = 0.0f32;
             for h in 0..n_heads_q {
                 layer_score += scores[h * stride + t];
             }
-            step_importance[t] = step_importance[t].max(layer_score);
+            step_importance[pos] = step_importance[pos].max(layer_score);
 
             for kv_h in 0..n_kv_heads {
                 let mut group_score = 0.0f32;
@@ -1585,7 +1610,7 @@ mod tests {
                     group_score += scores[(kv_h * n_rep + r) * stride + t];
                 }
                 group_score *= inv_rep;
-                let idx = kv_h * max_seq_len + t;
+                let idx = kv_h * max_seq_len + pos;
                 head_step_importance[idx] = head_step_importance[idx].max(group_score);
                 last_layer_head_attn[idx] = group_score;
             }
@@ -1610,13 +1635,13 @@ mod tests {
 
         // Scalar reference
         let mut step_ref = vec![0.0f32; max_seq];
-        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q);
+        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q, 0);
 
         // Through the struct (uses NEON on aarch64, scalar on x86)
         let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q);
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q, 0);
 
         for t in 0..cache_seq {
             assert!(
@@ -1659,13 +1684,14 @@ mod tests {
             n_heads_q,
             n_kv_heads,
             max_seq,
+            0,
         );
 
         // Through the struct
         let mut acc = AttentionScoreAccumulator::new_gqa(max_seq, n_heads_q, n_kv_heads, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        acc.accumulate_layer_gqa(&scores, stride, cache_seq, n_heads_q, n_kv_heads);
+        acc.accumulate_layer_gqa(&scores, stride, cache_seq, n_heads_q, n_kv_heads, 0);
 
         for t in 0..cache_seq {
             assert!(
@@ -1718,7 +1744,7 @@ mod tests {
                 scores1[h * max_seq + t] = (t + 1) as f32 * 0.1 + h as f32 * 0.01;
             }
         }
-        acc.accumulate_layer_gqa(&scores1, max_seq, 5, n_heads_q, n_kv_heads);
+        acc.accumulate_layer_gqa(&scores1, max_seq, 5, n_heads_q, n_kv_heads, 0);
         acc.end_step();
 
         // Step 2
@@ -1729,7 +1755,7 @@ mod tests {
                 scores2[h * max_seq + t] = (7 - t) as f32 * 0.15 + h as f32 * 0.02;
             }
         }
-        acc.accumulate_layer_gqa(&scores2, max_seq, 7, n_heads_q, n_kv_heads);
+        acc.accumulate_layer_gqa(&scores2, max_seq, 7, n_heads_q, n_kv_heads, 0);
         acc.end_step();
 
         // Verify: positions 0..5 have step_count=2, positions 5..7 have step_count=1
@@ -1776,12 +1802,12 @@ mod tests {
         }
 
         let mut step_ref = vec![0.0f32; max_seq];
-        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q);
+        accumulate_layer_scalar(&mut step_ref, &scores, stride, cache_seq, n_heads_q, 0);
 
         let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q);
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q, 0);
 
         for t in 0..cache_seq {
             assert!(
@@ -1810,7 +1836,7 @@ mod tests {
         let mut acc = AttentionScoreAccumulator::new(max_seq, n_heads_q, 1, 0, 0.0);
         acc.set_active(true);
         acc.begin_step();
-        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q);
+        acc.accumulate_layer(&scores, stride, cache_seq, n_heads_q, 0);
 
         // sum: [5.0, 7.0, 9.0]
         assert!((acc.step_importance[0] - 5.0).abs() < 1e-6);
@@ -1842,7 +1868,7 @@ mod tests {
             scores_l0[h * stride + 2] = 0.2;
             scores_l0[h * stride + 3] = 0.1;
         }
-        acc.accumulate_layer_gqa(&scores_l0, stride, cache_seq_len, n_heads_q, n_kv_heads);
+        acc.accumulate_layer_gqa(&scores_l0, stride, cache_seq_len, n_heads_q, n_kv_heads, 0);
 
         // Verify layer 0 accumulated correctly
         assert!(
@@ -1861,7 +1887,7 @@ mod tests {
 
         // Layer 1: all NaN scores (simulates NaN cascade from Q*K^T)
         let scores_l1 = vec![f32::NAN; n_heads_q * stride];
-        acc.accumulate_layer_gqa(&scores_l1, stride, cache_seq_len, n_heads_q, n_kv_heads);
+        acc.accumulate_layer_gqa(&scores_l1, stride, cache_seq_len, n_heads_q, n_kv_heads, 0);
 
         // After NaN layer: flat step_importance should retain L0 values (max(0.4*4, NaN) = 0.4*4)
         // f32::max(valid, NaN) = valid (IEEE 754)

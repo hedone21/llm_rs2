@@ -303,6 +303,8 @@ impl TransformerLayer {
         };
         // Physical start offset in the KV cache for the window.
         let kv_start_pos = cache_seq_len - effective_cache_len;
+        // Record offset so the score accumulator can map ws.scores[t] → cache pos (kv_start_pos + t).
+        ws.score_offset = kv_start_pos;
 
         // AWQE: cache가 attention scores를 요구하면 score 계산 강제
         let need_scores = args.need_scores || kv_cache.needs_attn_scores();
