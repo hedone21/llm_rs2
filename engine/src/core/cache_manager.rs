@@ -181,7 +181,15 @@ impl CacheManager {
         }
 
         let (pressure, mem_available) = if force {
-            (PressureLevel::Emergency, 0)
+            // Budget-driven forced eviction: use Emergency to ensure all pipeline
+            // handlers run regardless of their min_level. Read actual mem_available
+            // for accurate logging (previously hardcoded to 0, which was misleading).
+            let mem = self
+                .monitor
+                .mem_stats()
+                .map(|s| s.available)
+                .unwrap_or(usize::MAX);
+            (PressureLevel::Emergency, mem)
         } else {
             let mem_available = match self.monitor.mem_stats() {
                 Ok(stats) => stats.available,
@@ -354,7 +362,11 @@ impl CacheManager {
         }
 
         let pressure = PressureLevel::Emergency;
-        let mem_available = 0;
+        let mem_available = self
+            .monitor
+            .mem_stats()
+            .map(|s| s.available)
+            .unwrap_or(usize::MAX);
 
         self.event_sink.emit(CacheEvent::PressureDetected {
             level: pressure,
