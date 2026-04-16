@@ -127,7 +127,7 @@ cargo build --release --target aarch64-unknown-linux-musl --no-default-features
 scp target/aarch64-unknown-linux-musl/release/generate user@jetson:~/
 ```
 
-> **주의**: Jetson에는 OpenCL 런타임이 없으므로 `--no-default-features`로 빌드. CUDA 백엔드는 향후 지원 예정.
+> **주의**: Jetson에는 OpenCL 런타임이 없으므로 `--no-default-features --features cuda`로 빌드하여 CUDA 백엔드를 사용한다.
 > Xavier(Carmel ARMv8.2)는 dotprod/fhm 미지원 — 크로스 컴파일 시 musl 타겟 사용 또는 네이티브 빌드.
 
 ---
@@ -1720,7 +1720,7 @@ RUSTFLAGS='-C target-feature=+neon,+fp16' cargo build --release --no-default-fea
 # 결과물: target/release/generate
 ```
 
-> Jetson에는 OpenCL이 없으므로 `--no-default-features`(OpenCL 제외)로 빌드한다. CUDA 백엔드는 향후 `--features cuda`로 지원 예정.
+> Jetson에는 OpenCL이 없으므로 `--no-default-features --features cuda`로 빌드하여 CUDA 백엔드를 사용한다.
 
 **통합 러너 사용 (권장, Android)**
 
@@ -1912,7 +1912,7 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 
 | 플래그 | 기본값 | 설명 |
 |--------|--------|------|
-| `-b, --backend` | `cpu` | `cpu` 또는 `opencl` (GPU 보조 자동 초기화) |
+| `-b, --backend` | `cpu` | `cpu`, `opencl`, 또는 `cuda` (`--features cuda` 빌드 필요) |
 | `--switch-threshold` | 0 | CPU→GPU 자동 전환 토큰 수 (0=비활성) |
 | `--threads` | 자동 | CPU 스레드 수 (0=auto) |
 | `--tensor-partition` | 0.0 | FFN gate/up matmul GPU 비율 (0.0=비활성, >0 시 zero-copy 자동 활성) |

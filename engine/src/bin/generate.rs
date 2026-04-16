@@ -53,7 +53,7 @@ struct Args {
     #[arg(short, long, default_value_t = 20)]
     num_tokens: usize,
 
-    /// Backend to use: "cpu" or "opencl" (GPU secondary auto-initialized when available)
+    /// Backend to use: "cpu", "opencl", or "cuda" (build with --features cuda)
     #[arg(short, long, default_value = "cpu")]
     backend: String,
 

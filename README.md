@@ -23,7 +23,7 @@ graph LR
 
 - **ARM64 Optimized**: Android/Linux ARM64 SoC 전용 NEON intrinsics 및 dotprod 최적화
 - **Zero-copy Memory**: `Galloc` + `SharedBuffer`로 CPU↔GPU 간 memcpy 제거 (ARM UMA 활용)
-- **Backend Extensibility**: `Backend` 트레이트 기반 CPU / OpenCL GPU 백엔드 교체 가능
+- **Backend Extensibility**: `Backend` 트레이트 기반 CPU / OpenCL / CUDA GPU 백엔드 교체 가능
 - **Quantization Support**: Q4_0 / Q8_0 블록 양자화, F16/BF16 추론 지원. GGUF 사전 양자화 모델 직접 로드
 - **KIVI KV Cache 양자화**: KV 캐시 Q4/Q8 동적 양자화로 메모리 사용량 감소
 - **KV Cache Eviction**: Sliding Window / H2O / D2O (merge compensation) / StreamingLLM 정책
@@ -51,6 +51,10 @@ cargo build --release
 
 # GPU (OpenCL) + Q4 양자화 (로드 시 F16→Q4 변환)
 ./target/release/generate -m models/llama3.2-1b -b opencl --weight-dtype q4 --prompt "Hello" -n 50
+
+# GPU (CUDA) — NVIDIA discrete GPU / Jetson
+cargo build --release --no-default-features --features cuda
+./target/release/generate -m models/llama3.2-1b -b cuda --prompt "Hello" -n 50
 ```
 
 ### GGUF (사전 양자화) 모델
