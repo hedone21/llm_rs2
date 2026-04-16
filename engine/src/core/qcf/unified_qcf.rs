@@ -9,7 +9,7 @@
 
 use super::{AggregationMode, aggregate_heads};
 use crate::core::kv_cache::KVLayout;
-use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, QKKV};
+use crate::core::quant::{BlockKVQ4, BlockKVQ8, BlockQ2_0, BlockQ4_0, QK4_0, QKKV};
 
 // ── Action types ────────────────────────────────────────────────
 
@@ -48,6 +48,8 @@ pub enum VDataSource<'a> {
     F32(&'a [f32]),
     /// F16 KV cache data stored as raw u16 (half::f16 bit representation).
     F16(&'a [u16]),
+    /// Q4_0 KV cache data stored as BlockQ4_0 blocks.
+    Q4_0(&'a [BlockQ4_0]),
 }
 
 // ── Parameters ──────────────────────────────────────────────────
@@ -310,6 +312,30 @@ fn read_v_f32(
                 .iter()
                 .map(|&bits| half::f16::from_bits(bits).to_f32())
                 .collect()
+        }
+        VDataSource::Q4_0(data) => {
+            // Q4_0: blocks_per_pos = head_dim / QK4_0 (e.g. 64/32=2, 256/32=8)
+            let blocks_per_pos = head_dim / QK4_0;
+            let block_idx = match layout {
+                KVLayout::HeadMajor => (head * capacity + pos) * blocks_per_pos,
+                KVLayout::SeqMajor => (pos * n_kv_heads + head) * blocks_per_pos,
+            };
+            if block_idx >= data.len() {
+                return vec![0.0; head_dim];
+            }
+            let mut out = vec![0.0f32; head_dim];
+            let mut buf = [0.0f32; QK4_0];
+            for b in 0..blocks_per_pos {
+                let bi = block_idx + b;
+                if bi >= data.len() {
+                    break;
+                }
+                data[bi].dequantize(&mut buf);
+                let dst_start = b * QK4_0;
+                let dst_end = (dst_start + QK4_0).min(head_dim);
+                out[dst_start..dst_end].copy_from_slice(&buf[..dst_end - dst_start]);
+            }
+            out
         }
     }
 }

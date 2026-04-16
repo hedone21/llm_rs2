@@ -2375,7 +2375,8 @@ fn main() -> anyhow::Result<()> {
             Shape::new(vec![1, warmup_tokens, vocab_size])
         };
         let warmup_logits_buf = memory.alloc(warmup_tokens * vocab_size * 4, DType::F32)?;
-        let mut warmup_logits = Tensor::new(warmup_logits_shape, warmup_logits_buf, backend.clone());
+        let mut warmup_logits =
+            Tensor::new(warmup_logits_shape, warmup_logits_buf, backend.clone());
 
         model.forward_into(TransformerModelForwardArgs {
             input_tokens: &warmup_input,
@@ -2396,10 +2397,7 @@ fn main() -> anyhow::Result<()> {
         })?;
         backend.synchronize()?;
         let warmup_ms = warmup_start.elapsed().as_secs_f64() * 1000.0;
-        eprintln!(
-            "[WARMUP] tokens={} ms={:.2}",
-            warmup_tokens, warmup_ms
-        );
+        eprintln!("[WARMUP] tokens={} ms={:.2}", warmup_tokens, warmup_ms);
 
         // Brief all-core spin to push DVFS governor to max frequency.
         // 50ms is enough for walt governor to ramp up.
@@ -3536,9 +3534,7 @@ fn main() -> anyhow::Result<()> {
             if std::env::var("LLMRS_PER_TOKEN_MS").is_ok() {
                 eprintln!(
                     "[PER_TOKEN] idx={} kv_pos={} forward_ms={:.3}",
-                    decode_token_index,
-                    kv_caches[0].current_pos,
-                    forward_ms
+                    decode_token_index, kv_caches[0].current_pos, forward_ms
                 );
             }
 
@@ -4441,7 +4437,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                     action: QcfActionType::EvictSliding { target_len },
                     v_source: VDataSource::F32(match &v_source {
                         VDataSource::F32(d) => d,
-                        VDataSource::F16(_) => &[],
+                        VDataSource::F16(_) | VDataSource::Q4_0(_) => &[],
                     }),
                     attention_scores,
                     head_attn: head_attn_opt,

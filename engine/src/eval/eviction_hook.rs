@@ -253,24 +253,19 @@ impl StepHook<KVCache> for EvictionHook {
         let ratio = self.effective_budget as f32 / before_len as f32;
         let eviction_ratio = 1.0 - ratio;
 
-        // V buffer readback for QCF-CAOTE (GPU backends)
-        let can_compute_qcf = self.kv_type == "f32";
-        let v_cpu_data: Option<Vec<f32>> = if can_compute_qcf
-            && !caches.is_empty()
-            && caches[0].v_buffer.buffer().as_ptr().is_null()
-        {
-            let v_elems = caches[0].v_buffer.buffer().size() / 4;
-            let mut v_buf = vec![0.0f32; v_elems];
-            let byte_slice = unsafe {
-                std::slice::from_raw_parts_mut(v_buf.as_mut_ptr() as *mut u8, v_elems * 4)
+        // V buffer readback for QCF computation (GPU backends only — CPU buffers are
+        // always accessible via as_ptr() and do not need a readback).
+        let v_cpu_bytes: Option<Vec<u8>> =
+            if !caches.is_empty() && caches[0].v_buffer.buffer().as_ptr().is_null() {
+                let size = caches[0].v_buffer.buffer().size();
+                let mut buf = vec![0u8; size];
+                match self.backend.read_buffer(&caches[0].v_buffer, &mut buf) {
+                    Ok(()) => Some(buf),
+                    Err(_) => None,
+                }
+            } else {
+                None
             };
-            match self.backend.read_buffer(&caches[0].v_buffer, byte_slice) {
-                Ok(()) => Some(v_buf),
-                Err(_) => None,
-            }
-        } else {
-            None
-        };
         // GPU score sync before QCF computation (eval-ll path).
         // On GPU backends, forward_into() accumulates scores entirely on the device.
         // The CPU accumulator's importance and last_layer_head_attn are empty.
@@ -292,9 +287,10 @@ impl StepHook<KVCache> for EvictionHook {
             acc.import_gpu_scores(&flat, &head);
         }
 
-        let can_compute_qcf = can_compute_qcf
-            && !caches.is_empty()
-            && (v_cpu_data.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
+        // can_compute_qcf: true when V data is CPU-accessible (CPU backend) or
+        // successfully read back (GPU backend). Supports F32, F16, and Q4_0 dtypes.
+        let can_compute_qcf = !caches.is_empty()
+            && (v_cpu_bytes.is_some() || !caches[0].v_buffer.buffer().as_ptr().is_null());
 
         // Collect QCF metrics before eviction
         let (_evicted_positions_for_qcf, qcf_attn_raw, qcf_attn_norm, qcf_caote) = if self
@@ -355,21 +351,49 @@ impl StepHook<KVCache> for EvictionHook {
                         compute_unified_qcf,
                     };
                     let cache = &caches[0];
-                    let v_slice_f32: &[f32];
-                    let v_slice_u16: &[u16];
-                    let v_source = if let Some(ref cpu_data) = v_cpu_data {
-                        v_slice_f32 = cpu_data;
-                        VDataSource::F32(v_slice_f32)
+                    use crate::core::quant::BlockQ4_0 as _BlockQ4_0D2O;
+                    let v_source_d2o_opt: Option<VDataSource> = if let Some(ref bytes) = v_cpu_bytes
+                    {
+                        match cache.v_buffer.dtype() {
+                            DType::F32 => {
+                                let elems = bytes.len() / 4;
+                                let ptr = bytes.as_ptr() as *const f32;
+                                Some(VDataSource::F32(unsafe {
+                                    std::slice::from_raw_parts(ptr, elems)
+                                }))
+                            }
+                            DType::F16 => {
+                                let elems = bytes.len() / 2;
+                                let ptr = bytes.as_ptr() as *const u16;
+                                Some(VDataSource::F16(unsafe {
+                                    std::slice::from_raw_parts(ptr, elems)
+                                }))
+                            }
+                            DType::Q4_0 => {
+                                let block_size = std::mem::size_of::<_BlockQ4_0D2O>();
+                                let n_blocks = bytes.len() / block_size;
+                                let ptr = bytes.as_ptr() as *const _BlockQ4_0D2O;
+                                Some(VDataSource::Q4_0(unsafe {
+                                    std::slice::from_raw_parts(ptr, n_blocks)
+                                }))
+                            }
+                            _ => None,
+                        }
                     } else {
                         match cache.v_buffer.dtype() {
-                            DType::F16 => {
-                                v_slice_u16 = cache.v_buffer.as_slice::<u16>();
-                                VDataSource::F16(v_slice_u16)
-                            }
-                            _ => {
-                                v_slice_f32 = cache.v_buffer.as_slice::<f32>();
-                                VDataSource::F32(v_slice_f32)
-                            }
+                            DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
+                            DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
+                            DType::Q4_0 => Some(VDataSource::Q4_0(
+                                cache.v_buffer.as_slice::<_BlockQ4_0D2O>(),
+                            )),
+                            _ => None,
+                        }
+                    };
+                    let v_source = match v_source_d2o_opt {
+                        Some(s) => s,
+                        None => {
+                            // fallback: treat as F32 (may be incorrect for unknown dtypes)
+                            VDataSource::F32(cache.v_buffer.as_slice::<f32>())
                         }
                     };
                     let head_attn_opt = self
@@ -395,20 +419,73 @@ impl StepHook<KVCache> for EvictionHook {
                     let (qcf, _) = compute_unified_qcf(&params);
                     qcf
                 } else if can_compute_qcf && !positions.is_empty() {
-                    // H2O path: legacy eviction-only CAOTE
-                    if let Some(head_attn) = self
-                        .score_accumulator
-                        .as_ref()
-                        .and_then(|acc| acc.last_step_head_attn())
-                    {
-                        let metric = crate::core::qcf::compute_eviction_qcf_caote(
-                            &positions,
-                            head_attn,
-                            &caches[0],
-                            &self.qcf_config,
-                            v_cpu_data.as_deref(),
-                        );
-                        metric.raw_value
+                    // H2O path: unified QCF (supports F32/F16/Q4_0)
+                    use crate::core::buffer::DType;
+                    use crate::core::qcf::{
+                        AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
+                        compute_unified_qcf,
+                    };
+                    use crate::core::quant::BlockQ4_0;
+                    let cache = &caches[0];
+                    let v_source_opt: Option<VDataSource> = if let Some(ref bytes) = v_cpu_bytes {
+                        match cache.v_buffer.dtype() {
+                            DType::F32 => {
+                                let elems = bytes.len() / 4;
+                                let ptr = bytes.as_ptr() as *const f32;
+                                Some(VDataSource::F32(unsafe {
+                                    std::slice::from_raw_parts(ptr, elems)
+                                }))
+                            }
+                            DType::F16 => {
+                                let elems = bytes.len() / 2;
+                                let ptr = bytes.as_ptr() as *const u16;
+                                Some(VDataSource::F16(unsafe {
+                                    std::slice::from_raw_parts(ptr, elems)
+                                }))
+                            }
+                            DType::Q4_0 => {
+                                let block_size = std::mem::size_of::<BlockQ4_0>();
+                                let n_blocks = bytes.len() / block_size;
+                                let ptr = bytes.as_ptr() as *const BlockQ4_0;
+                                Some(VDataSource::Q4_0(unsafe {
+                                    std::slice::from_raw_parts(ptr, n_blocks)
+                                }))
+                            }
+                            _ => None,
+                        }
+                    } else {
+                        match cache.v_buffer.dtype() {
+                            DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
+                            DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
+                            DType::Q4_0 => {
+                                Some(VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>()))
+                            }
+                            _ => None,
+                        }
+                    };
+                    if let Some(v_source) = v_source_opt {
+                        let head_attn_opt = self
+                            .score_accumulator
+                            .as_ref()
+                            .and_then(|acc| acc.last_step_head_attn());
+                        let params = UnifiedQcfParams {
+                            action: QcfActionType::EvictH2o {
+                                target_len,
+                                keep_ratio: self.h2o_keep_ratio,
+                                protected_prefix: self.protected_prefix,
+                            },
+                            v_source,
+                            attention_scores: &scores,
+                            head_attn: head_attn_opt,
+                            n_kv_heads: cache.kv_heads(),
+                            head_dim: cache.head_dim(),
+                            current_pos: before_len,
+                            capacity: cache.capacity(),
+                            layout: cache.layout(),
+                            aggregation: AggregationMode::Mean,
+                        };
+                        let (qcf, _) = compute_unified_qcf(&params);
+                        qcf
                     } else {
                         0.0
                     }
@@ -453,21 +530,75 @@ impl StepHook<KVCache> for EvictionHook {
                 })
                 .unwrap_or((0.0, 0.0));
 
-            // QCF-CAOTE
+            // QCF: unified formula (supports F32/F16/Q4_0)
             let caote = if can_compute_qcf && !positions.is_empty() {
-                if let Some(head_attn) = self
-                    .score_accumulator
-                    .as_ref()
-                    .and_then(|acc| acc.last_step_head_attn())
-                {
-                    let metric = crate::core::qcf::compute_sliding_qcf_caote(
-                        &positions,
-                        head_attn,
-                        &caches[0],
-                        &self.qcf_config,
-                        v_cpu_data.as_deref(),
-                    );
-                    metric.raw_value
+                use crate::core::buffer::DType;
+                use crate::core::qcf::{
+                    AggregationMode, QcfActionType, UnifiedQcfParams, VDataSource,
+                    compute_unified_qcf,
+                };
+                use crate::core::quant::BlockQ4_0;
+                let cache = &caches[0];
+                let v_source_opt: Option<VDataSource> = if let Some(ref bytes) = v_cpu_bytes {
+                    match cache.v_buffer.dtype() {
+                        DType::F32 => {
+                            let elems = bytes.len() / 4;
+                            let ptr = bytes.as_ptr() as *const f32;
+                            Some(VDataSource::F32(unsafe {
+                                std::slice::from_raw_parts(ptr, elems)
+                            }))
+                        }
+                        DType::F16 => {
+                            let elems = bytes.len() / 2;
+                            let ptr = bytes.as_ptr() as *const u16;
+                            Some(VDataSource::F16(unsafe {
+                                std::slice::from_raw_parts(ptr, elems)
+                            }))
+                        }
+                        DType::Q4_0 => {
+                            let block_size = std::mem::size_of::<BlockQ4_0>();
+                            let n_blocks = bytes.len() / block_size;
+                            let ptr = bytes.as_ptr() as *const BlockQ4_0;
+                            Some(VDataSource::Q4_0(unsafe {
+                                std::slice::from_raw_parts(ptr, n_blocks)
+                            }))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    match cache.v_buffer.dtype() {
+                        DType::F32 => Some(VDataSource::F32(cache.v_buffer.as_slice::<f32>())),
+                        DType::F16 => Some(VDataSource::F16(cache.v_buffer.as_slice::<u16>())),
+                        DType::Q4_0 => {
+                            Some(VDataSource::Q4_0(cache.v_buffer.as_slice::<BlockQ4_0>()))
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(v_source) = v_source_opt {
+                    let head_attn_opt = self
+                        .score_accumulator
+                        .as_ref()
+                        .and_then(|acc| acc.last_step_head_attn());
+                    let flat_scores: &[f32] = self
+                        .score_accumulator
+                        .as_ref()
+                        .map(|acc| acc.importance_scores())
+                        .unwrap_or(&[]);
+                    let params = UnifiedQcfParams {
+                        action: QcfActionType::EvictSliding { target_len },
+                        v_source,
+                        attention_scores: flat_scores,
+                        head_attn: head_attn_opt,
+                        n_kv_heads: cache.kv_heads(),
+                        head_dim: cache.head_dim(),
+                        current_pos: before_len,
+                        capacity: cache.capacity(),
+                        layout: cache.layout(),
+                        aggregation: AggregationMode::Mean,
+                    };
+                    let (qcf, _) = compute_unified_qcf(&params);
+                    qcf
                 } else {
                     0.0
                 }
