@@ -183,7 +183,19 @@ impl TransformerLayer {
             let kv_dtype = kv_cache.kv_dtype();
             {
                 let t = pf_start!();
-                if kv_dtype != DType::F32 {
+                use crate::core::kv_cache::KVLayout;
+                if kv_dtype == DType::F16 && is_gpu && kv_cache.layout() == KVLayout::HeadMajor {
+                    // GPU F16 HeadMajor: batch cast+scatter kernel (1 dispatch)
+                    kv_cache.ensure_capacity(kv_cache.current_pos() + seq_len)?;
+                    let pos = kv_cache.current_pos();
+                    let cap = kv_cache.capacity();
+                    if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
+                        backend.kv_scatter_f32_to_f16_batch(
+                            &k_rope, &ws.v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, seq_len,
+                        )?;
+                    }
+                    kv_cache.advance_pos(seq_len);
+                } else if kv_dtype != DType::F32 {
                     let n_elem = seq_len * n_heads_kv * head_dim;
                     let buf_size = match kv_dtype {
                         DType::F16 => n_elem * 2,
@@ -781,7 +793,19 @@ impl TransformerLayer {
         let kv_dtype = kv_cache.kv_dtype();
         {
             let t = pf_start!();
-            if kv_dtype != DType::F32 {
+            use crate::core::kv_cache::KVLayout;
+            if kv_dtype == DType::F16 && is_gpu && kv_cache.layout() == KVLayout::HeadMajor {
+                // GPU F16 HeadMajor: batch cast+scatter kernel (1 dispatch)
+                kv_cache.ensure_capacity(kv_cache.current_pos() + seq_len)?;
+                let pos = kv_cache.current_pos();
+                let cap = kv_cache.capacity();
+                if let Some((k_buf, v_buf)) = kv_cache.get_buffers_mut() {
+                    backend.kv_scatter_f32_to_f16_batch(
+                        &k_rope, &v, k_buf, v_buf, n_heads_kv, head_dim, cap, pos, seq_len,
+                    )?;
+                }
+                kv_cache.advance_pos(seq_len);
+            } else if kv_dtype != DType::F32 {
                 let n_elem = seq_len * n_heads_kv * head_dim;
                 let buf_size = match kv_dtype {
                     DType::F16 => n_elem * 2,

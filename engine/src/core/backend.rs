@@ -268,6 +268,48 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Batch F32->F16 KV scatter for prefill: writes seq_len positions in one kernel launch.
+    /// k_src/v_src: contiguous [seq_len, kv_heads * head_dim] F32
+    /// k_dst/v_dst: [kv_heads, capacity, head_dim] F16 HeadMajor
+    /// Default: loops over single-position scatter.
+    #[allow(clippy::too_many_arguments)]
+    fn kv_scatter_f32_to_f16_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        // Default: iterate per position using single-position scatter
+        use half::f16;
+        let src_f32 =
+            unsafe { std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4) };
+        let dst_f16 = unsafe {
+            std::slice::from_raw_parts_mut(k_dst.as_mut_ptr() as *mut f16, k_dst.size() / 2)
+        };
+        let v_src_f32 =
+            unsafe { std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4) };
+        let v_dst_f16 = unsafe {
+            std::slice::from_raw_parts_mut(v_dst.as_mut_ptr() as *mut f16, v_dst.size() / 2)
+        };
+        for s in 0..seq_len {
+            for h in 0..n_kv_heads {
+                let src_off = (s * n_kv_heads + h) * head_dim;
+                let dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim;
+                for d in 0..head_dim {
+                    dst_f16[dst_off + d] = f16::from_f32(src_f32[src_off + d]);
+                    v_dst_f16[dst_off + d] = f16::from_f32(v_src_f32[src_off + d]);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Copy data from src into dst buffer (same shape/size required).
     /// On GPU: just enqueue_copy_buffer, no new backend/kernel allocation.
     /// On CPU: memcpy.

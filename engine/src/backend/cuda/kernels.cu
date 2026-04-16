@@ -81,16 +81,16 @@ extern "C" __global__ void rms_norm_f32(
     const float * row_x = x + (long long)row * ncols;
     float * row_dst = dst + (long long)row * ncols;
 
-    // Thread 0 computes the full RMS (simple, no reduction needed for correctness)
-    __shared__ float rms_inv_shared;
-    if (tid == 0) {
-        float sum_sq = 0.0f;
-        for (int i = 0; i < ncols; i++) {
-            float v = row_x[i];
-            sum_sq += v * v;
-        }
-        rms_inv_shared = rsqrtf(sum_sq / (float)ncols + eps);
+    // Parallel reduction for sum of squares across all threads in block
+    float partial_sq = 0.0f;
+    for (int i = tid; i < ncols; i += blockDim.x) {
+        float v = row_x[i];
+        partial_sq += v * v;
     }
+    float sum_sq = block_reduce_sum(partial_sq);
+    __shared__ float rms_inv_shared;
+    if (tid == 0)
+        rms_inv_shared = rsqrtf(sum_sq / (float)ncols + eps);
     __syncthreads();
 
     float rms_inv = rms_inv_shared;
@@ -259,6 +259,29 @@ extern "C" __global__ void kv_scatter_f32_to_f16(
     if (d >= head_dim) return;
     int src_off = h * head_dim + d;
     int dst_off = h * capacity * head_dim + write_pos * head_dim + d;
+    k_dst[dst_off] = __float2half(k_src[src_off]);
+    v_dst[dst_off] = __float2half(v_src[src_off]);
+}
+
+// =================================================================
+// 11b. KV scatter F32->F16 BATCH (HeadMajor layout, prefill)
+// =================================================================
+// grid=(kv_heads, seq_len, 1), block=(head_dim, 1, 1)
+// k_src layout: [seq_len, kv_heads, head_dim] (contiguous F32, last-dim = kv_heads*head_dim)
+// k_dst layout: HeadMajor [kv_heads, capacity, head_dim] (F16)
+extern "C" __global__ void kv_scatter_f32_to_f16_batch(
+    const float * k_src, const float * v_src,
+    half * k_dst, half * v_dst,
+    int kv_heads, int head_dim, int capacity, int write_pos_start, int seq_len)
+{
+    int h = blockIdx.x;   // kv head index
+    int s = blockIdx.y;   // sequence position within batch
+    int d = threadIdx.x;  // dimension index
+    if (h >= kv_heads || s >= seq_len || d >= head_dim) return;
+    // src: contiguous [seq_len, kv_heads * head_dim] -> offset = s * kv_heads * head_dim + h * head_dim + d
+    int src_off = (s * kv_heads + h) * head_dim + d;
+    // dst: HeadMajor [kv_heads, capacity, head_dim] -> offset = h * capacity * head_dim + (write_pos_start + s) * head_dim + d
+    int dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim + d;
     k_dst[dst_off] = __float2half(k_src[src_off]);
     v_dst[dst_off] = __float2half(v_src[src_off]);
 }

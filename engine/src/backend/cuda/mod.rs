@@ -435,10 +435,8 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("flash_attn_prefill launch failed: {e}"))?;
             }
-            self.synchronize()?;
             Ok(true)
         } else {
-            self.synchronize()?;
             Ok(false)
         }
     }
@@ -450,14 +448,12 @@ impl Backend for CudaBackend {
     }
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-        // Sync before cuBLAS: other ops may have written to input buffers
-        // on a different stream than cuBLAS uses.
-        self.synchronize()?;
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
         // Q4_0 weights always go through CPU fallback
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
+            self.synchronize()?; // sync before CPU reads GPU data
             return cpu_fallback().matmul_transposed(a, b, out);
         }
 
@@ -502,7 +498,6 @@ impl Backend for CudaBackend {
                     )
                     .map_err(|e| anyhow!("cublasSgemm failed: {e}"))?;
                 }
-                self.synchronize()?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
                 // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS.
@@ -564,7 +559,6 @@ impl Backend for CudaBackend {
                     )
                     .map_err(|e| anyhow!("cublasGemmEx (F32->F16 x F16) failed: {e}"))?;
                 }
-                self.synchronize()?;
                 *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
             } else if a_dtype == DType::F16 && b_dtype == DType::F16 {
@@ -596,7 +590,6 @@ impl Backend for CudaBackend {
                     )
                     .map_err(|e| anyhow!("cublasGemmEx (F16xF16) failed: {e}"))?;
                 }
-                self.synchronize()?;
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
@@ -635,7 +628,6 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("add_assign kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -654,7 +646,6 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("scale kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -674,7 +665,6 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("silu_mul kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -694,7 +684,6 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("gelu_tanh_mul kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -727,7 +716,6 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("rms_norm kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -767,7 +755,6 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("rms_norm_oop kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -807,7 +794,6 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("softmax kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -852,7 +838,6 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("rope_inplace kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -876,7 +861,6 @@ impl Backend for CudaBackend {
                         .launch(Self::launch_config_1d(n))
                         .map_err(|e| anyhow!("cast_f32_f16 kernel launch failed: {e}"))?;
                 }
-                self.synchronize()?; // CPU may read dst immediately
                 Ok(())
             }
             (DType::F16, DType::F32, Some(sp), Some(dp)) => {
@@ -891,7 +875,6 @@ impl Backend for CudaBackend {
                         .launch(Self::launch_config_1d(n))
                         .map_err(|e| anyhow!("cast_f16_f32 kernel launch failed: {e}"))?;
                 }
-                self.synchronize()?;
                 Ok(())
             }
             _ => {
@@ -922,7 +905,6 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(total))
                 .map_err(|e| anyhow!("add_row_bias kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
         Ok(())
     }
 
@@ -973,13 +955,90 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("kv_scatter kernel launch failed: {e}"))?;
             }
-            self.synchronize()?;
             Ok(())
         } else {
             // Missing device ptr: sync then CPU fallback
             self.synchronize()?;
             cpu_fallback()
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
+        }
+    }
+
+    fn kv_scatter_f32_to_f16_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let ks_ptr = Self::get_device_ptr(k_src.buffer().as_ref());
+        let vs_ptr = Self::get_device_ptr(v_src.buffer().as_ref());
+        let kd_ptr = Self::get_device_ptr(k_dst.buffer().as_ref());
+        let vd_ptr = Self::get_device_ptr(v_dst.buffer().as_ref());
+
+        if let (Some(ks), Some(vs), Some(kd), Some(vd)) = (ks_ptr, vs_ptr, kd_ptr, vd_ptr) {
+            let kvh = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let cap = capacity as i32;
+            let wps = write_pos_start as i32;
+            let sl = seq_len as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (n_kv_heads as u32, seq_len as u32, 1),
+                block_dim: (head_dim as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stream = self.ctx.default_stream();
+            // SAFETY: ks/vs are valid F32 device ptrs of [seq_len * kv_heads * head_dim].
+            // kd/vd are valid F16 device ptrs of [kv_heads * capacity * head_dim].
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.kv_scatter_batch)
+                    .arg(&ks)
+                    .arg(&vs)
+                    .arg(&kd)
+                    .arg(&vd)
+                    .arg(&kvh)
+                    .arg(&hd)
+                    .arg(&cap)
+                    .arg(&wps)
+                    .arg(&sl)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("kv_scatter_batch launch failed: {e}"))?;
+            }
+            Ok(())
+        } else {
+            // CPU fallback: use default trait impl
+            self.synchronize()?;
+            // Re-dispatch to default trait implementation
+            use half::f16;
+            let src_f32 = unsafe {
+                std::slice::from_raw_parts(k_src.as_ptr() as *const f32, k_src.size() / 4)
+            };
+            let dst_f16 = unsafe {
+                std::slice::from_raw_parts_mut(k_dst.as_mut_ptr() as *mut f16, k_dst.size() / 2)
+            };
+            let v_src_f32 = unsafe {
+                std::slice::from_raw_parts(v_src.as_ptr() as *const f32, v_src.size() / 4)
+            };
+            let v_dst_f16 = unsafe {
+                std::slice::from_raw_parts_mut(v_dst.as_mut_ptr() as *mut f16, v_dst.size() / 2)
+            };
+            for s in 0..seq_len {
+                for h in 0..n_kv_heads {
+                    let src_off = (s * n_kv_heads + h) * head_dim;
+                    let dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim;
+                    for d in 0..head_dim {
+                        dst_f16[dst_off + d] = f16::from_f32(src_f32[src_off + d]);
+                        v_dst_f16[dst_off + d] = f16::from_f32(v_src_f32[src_off + d]);
+                    }
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1019,7 +1078,6 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("gather_f16 kernel launch failed: {e}"))?;
             }
-            self.synchronize()?;
             Ok(())
         } else {
             self.synchronize()?;
@@ -1101,7 +1159,6 @@ impl Backend for CudaBackend {
                             .launch(cfg)
                             .map_err(|e| anyhow!("attention_gen_f32 kernel launch failed: {e}"))?;
                     }
-                    self.synchronize()?;
                     Ok(())
                 }
                 DType::F16 => {
@@ -1123,7 +1180,6 @@ impl Backend for CudaBackend {
                                 anyhow!("attention_gen_f16kv kernel launch failed: {e}")
                             })?;
                     }
-                    self.synchronize()?;
                     Ok(())
                 }
                 _ => {
