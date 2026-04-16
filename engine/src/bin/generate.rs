@@ -4411,22 +4411,33 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             .filter(|a| a.is_active())
             .and_then(|a| a.last_step_head_attn());
 
-        // Access V buffer as F32 (standard KVCache is always F32 or F16)
+        // Build V data source — supports F32, F16, and Q4_0 KV caches.
         let v_dtype = cache.v_buffer.dtype();
-        let v_source = match v_dtype {
-            DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-            _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-        };
-
         // Fallback flat scores if no accumulator
         let fallback_scores: Vec<f32>;
         let attention_scores: &[f32] = if let Some(scores) = scores_opt {
             scores
         } else {
-            // Uniform fallback
             fallback_scores = vec![1.0 / current_pos.max(1) as f32; current_pos];
             &fallback_scores
         };
+
+        // Helper macro: build VDataSource from the cache V buffer based on dtype.
+        macro_rules! v_src {
+            () => {
+                match v_dtype {
+                    DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
+                    DType::Q4_0 => {
+                        VDataSource::Q4_0(
+                            cache
+                                .v_buffer
+                                .as_slice::<llm_rs2::core::quant::BlockQ4_0>(),
+                        )
+                    }
+                    _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
+                }
+            };
+        }
 
         let aggregation = AggregationMode::Mean;
 
@@ -4435,10 +4446,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             {
                 let params = UnifiedQcfParams {
                     action: QcfActionType::EvictSliding { target_len },
-                    v_source: VDataSource::F32(match &v_source {
-                        VDataSource::F32(d) => d,
-                        VDataSource::F16(_) | VDataSource::Q4_0(_) => &[],
-                    }),
+                    v_source: v_src!(),
                     attention_scores,
                     head_attn: head_attn_opt,
                     n_kv_heads,
@@ -4447,14 +4455,6 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                     capacity,
                     layout,
                     aggregation: aggregation.clone(),
-                };
-                // Re-wrap v_source properly
-                let params = UnifiedQcfParams {
-                    v_source: match v_dtype {
-                        DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                        _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                    },
-                    ..params
                 };
                 let (qcf, _) = compute_unified_qcf(&params);
                 estimates.insert("kv_evict_sliding".to_string(), qcf);
@@ -4468,10 +4468,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                         keep_ratio: 0.5,
                         protected_prefix,
                     },
-                    v_source: match v_dtype {
-                        DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                        _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                    },
+                    v_source: v_src!(),
                     attention_scores,
                     head_attn: head_attn_opt,
                     n_kv_heads,
@@ -4492,10 +4489,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                         sink_size,
                         window_size,
                     },
-                    v_source: match v_dtype {
-                        DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                        _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                    },
+                    v_source: v_src!(),
                     attention_scores,
                     head_attn: head_attn_opt,
                     n_kv_heads,
@@ -4517,10 +4511,7 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
                         keep_ratio: 0.5,
                         protected_prefix,
                     },
-                    v_source: match v_dtype {
-                        DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                        _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
-                    },
+                    v_source: v_src!(),
                     attention_scores,
                     head_attn: head_attn_opt,
                     n_kv_heads,

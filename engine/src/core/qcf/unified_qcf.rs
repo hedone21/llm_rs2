@@ -1001,7 +1001,7 @@ mod tests {
             aggregation: AggregationMode::Mean,
         };
 
-        let (qcf_flat, ph_flat) = compute_unified_qcf(&params_flat);
+        let (qcf_flat, _ph_flat) = compute_unified_qcf(&params_flat);
         let (qcf_head, ph_head) = compute_unified_qcf(&params_head);
 
         // Per-head should yield different per-head values
