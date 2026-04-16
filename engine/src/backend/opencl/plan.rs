@@ -330,10 +330,8 @@ impl FullKernelPlan {
             let t_enqueue_end = std::time::Instant::now();
             ocl::core::finish(queue).ok();
             let t_gpu_end = std::time::Instant::now();
-            let enqueue_us =
-                t_enqueue_end.duration_since(t_op_start).as_nanos() as u64 / 1000;
-            let gpu_us =
-                t_gpu_end.duration_since(t_enqueue_end).as_nanos() as u64 / 1000;
+            let enqueue_us = t_enqueue_end.duration_since(t_op_start).as_nanos() as u64 / 1000;
+            let gpu_us = t_gpu_end.duration_since(t_enqueue_end).as_nanos() as u64 / 1000;
             let label = step.op_tag.profile_label();
             OP_TRACE_ACC.with(|c| {
                 if let Some(m) = c.borrow_mut().as_mut() {
@@ -703,8 +701,10 @@ impl FullKernelPlan {
                 if let Some(m) = c.borrow_mut().take() {
                     let mut entries: Vec<(String, u64)> = m.into_iter().collect();
                     entries.sort_by(|a, b| a.0.cmp(&b.0));
-                    let parts: Vec<String> =
-                        entries.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+                    let parts: Vec<String> = entries
+                        .iter()
+                        .map(|(k, v)| format!("{}={}", k, v))
+                        .collect();
                     eprintln!("[OP_TRACE] n_kv={} {}", trace_n_kv, parts.join(" "));
                 }
             });

@@ -249,8 +249,8 @@ impl TransformerLayer {
 
             // Detect and log GPU→CPU attention fallback.
             if !gpu_dispatched && is_gpu && kv_is_gpu {
-                let reason: &'static str = if !matches!(head_dim, 64 | 128) {
-                    "head_dim not in {64, 128} (no flash_attn DK variant compiled)"
+                let reason: &'static str = if !matches!(head_dim, 64 | 128 | 256) {
+                    "head_dim not in {64, 128, 256} (no flash_attn DK variant compiled)"
                 } else if kv_dtype == DType::Q4_0 {
                     "kv dtype Q4_0 not supported by flash_attn kernel"
                 } else {
@@ -840,8 +840,8 @@ impl TransformerLayer {
 
         // Detect and log GPU→CPU attention fallback.
         if !gpu_dispatched && is_gpu && kv_is_gpu {
-            let reason: &'static str = if !matches!(head_dim, 64 | 128) {
-                "head_dim not in {64, 128} (no flash_attn DK variant compiled)"
+            let reason: &'static str = if !matches!(head_dim, 64 | 128 | 256) {
+                "head_dim not in {64, 128, 256} (no flash_attn DK variant compiled)"
             } else if kv_dtype == DType::Q4_0 {
                 "kv dtype Q4_0 not supported by flash_attn kernel"
             } else {
@@ -1250,7 +1250,7 @@ mod tests {
         warn_gpu_fallback_once(
             DType::F32,
             256,
-            "head_dim not in {64, 128} (no flash_attn DK variant compiled)",
+            "head_dim not in {64, 128, 256} (no flash_attn DK variant compiled)",
             Some(&mut p2),
         );
 

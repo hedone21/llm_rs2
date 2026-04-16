@@ -22,9 +22,7 @@ pub struct CudaMemory {
 
 impl Default for CudaMemory {
     fn default() -> Self {
-        Self {
-            use_managed: false,
-        }
+        Self { use_managed: false }
     }
 }
 

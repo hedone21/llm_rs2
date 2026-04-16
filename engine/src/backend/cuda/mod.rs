@@ -356,22 +356,91 @@ impl Backend for CudaBackend {
 
     fn flash_attention_prefill(
         &self,
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _out: &mut Tensor,
-        _nq: usize,
-        _nkv: usize,
-        _sl: usize,
-        _csl: usize,
-        _hd: usize,
-        _cap: usize,
-        _bs: usize,
-        _hm: bool,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        head_dim: usize,
+        kv_capacity: usize,
+        batch_size: usize,
+        _is_head_major: bool,
     ) -> Result<bool> {
-        // Sync before CPU fallback reads KV cache written by GPU kernels.
-        self.synchronize()?;
-        Ok(false)
+        let kv_dtype = k_cache.dtype();
+
+        // Only support F32/F16 KV and head_dim in {64, 128, 256}
+        if !matches!(head_dim, 64 | 128 | 256) || kv_dtype == DType::Q4_0 {
+            self.synchronize()?;
+            return Ok(false);
+        }
+
+        let q_ptr = Self::get_device_ptr(q.buffer().as_ref());
+        let k_ptr = Self::get_device_ptr(k_cache.buffer().as_ref());
+        let v_ptr = Self::get_device_ptr(v_cache.buffer().as_ref());
+        let out_ptr = Self::get_device_ptr(out.buffer().as_ref());
+
+        if let (Some(qp), Some(kp), Some(vp), Some(op)) = (q_ptr, k_ptr, v_ptr, out_ptr) {
+            let block_m: u32 = 32;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    seq_len.div_ceil(block_m as usize) as u32,
+                    (n_heads_q * batch_size) as u32,
+                    1,
+                ),
+                block_dim: (block_m, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            let nhq = n_heads_q as i32;
+            let nkv = n_heads_kv as i32;
+            let sl = seq_len as i32;
+            let csl = cache_seq_len as i32;
+            let cap = kv_capacity as i32;
+            let bs = batch_size as i32;
+
+            let kernel = match (kv_dtype, head_dim) {
+                (DType::F32, 64) => &self.kernels.flash_prefill_f32_dk64,
+                (DType::F32, 128) => &self.kernels.flash_prefill_f32_dk128,
+                (DType::F32, 256) => &self.kernels.flash_prefill_f32_dk256,
+                (DType::F16, 64) => &self.kernels.flash_prefill_f16kv_dk64,
+                (DType::F16, 128) => &self.kernels.flash_prefill_f16kv_dk128,
+                (DType::F16, 256) => &self.kernels.flash_prefill_f16kv_dk256,
+                _ => {
+                    self.synchronize()?;
+                    return Ok(false);
+                }
+            };
+
+            let stream = self.ctx.default_stream();
+            // SAFETY: qp is valid F32 device ptr for Q [batch, seq_len, n_heads_q, head_dim].
+            // kp/vp are valid F32 or F16 device ptrs for KV [batch, n_heads_kv, capacity, head_dim].
+            // op is valid F32 device ptr for output, same layout as Q.
+            // All dimensions are checked by callers (transformer layer).
+            unsafe {
+                stream
+                    .launch_builder(kernel)
+                    .arg(&qp)
+                    .arg(&kp)
+                    .arg(&vp)
+                    .arg(&op)
+                    .arg(&nhq)
+                    .arg(&nkv)
+                    .arg(&sl)
+                    .arg(&csl)
+                    .arg(&cap)
+                    .arg(&bs)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("flash_attn_prefill launch failed: {e}"))?;
+            }
+            self.synchronize()?;
+            Ok(true)
+        } else {
+            self.synchronize()?;
+            Ok(false)
+        }
     }
 
     // --- Math ops ---
