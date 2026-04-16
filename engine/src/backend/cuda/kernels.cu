@@ -449,14 +449,12 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
     int h_kv = h_q / gqa_ratio; \
     \
     int my_query_row = tile_row * BM + tid; \
-    if (my_query_row >= seq_len) return; \
+    int valid = (my_query_row < seq_len); \
     \
     float scale = rsqrtf((float)(HD)); \
-    int causal_limit = cache_seq_len - seq_len + my_query_row; \
+    int causal_limit = valid ? (cache_seq_len - seq_len + my_query_row) : -1; \
     \
-    /* Pointers */ \
-    long long q_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
-    const float* my_q = q + q_offset; \
+    /* KV base pointer (same for all threads in block — needed for cooperative load) */ \
     long long kv_base = ((long long)b * n_heads_kv + h_kv) * kv_capacity * (HD); \
     const float* k_base = k_cache + kv_base; \
     const float* v_base = v_cache + kv_base; \
@@ -467,9 +465,13 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
     float m_i = -INFINITY; \
     float l_i = 0.0f; \
     \
-    /* Load Q into registers */ \
+    /* Load Q into registers (valid threads only — invalid threads have OOB q_offset) */ \
     float q_reg[HD]; \
-    for (int d = 0; d < (HD); d++) q_reg[d] = my_q[d]; \
+    if (valid) { \
+        long long q_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        const float* my_q = q + q_offset; \
+        for (int d = 0; d < (HD); d++) q_reg[d] = my_q[d]; \
+    } \
     \
     /* Shared memory for K and V tiles: BN * HD each */ \
     __shared__ float k_tile[BN * HD]; \
@@ -491,6 +493,8 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
         } \
         __syncthreads(); \
         \
+        if (!valid) continue; \
+        \
         /* Process pairs of KV positions to reduce rescaling */ \
         int p = 0; \
         for (; p + 1 < tile_len; p += 2) { \
@@ -509,16 +513,18 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
                 s1 = dot * scale; \
             } \
             float m_new = fmaxf(m_i, fmaxf(s0, s1)); \
-            float exp0 = expf(s0 - m_new); \
-            float exp1 = expf(s1 - m_new); \
-            float rescale = expf(m_i - m_new); \
-            l_i = l_i * rescale + exp0 + exp1; \
-            for (int d = 0; d < (HD); d++) { \
-                o_acc[d] = o_acc[d] * rescale \
-                         + exp0 * v_tile[p * (HD) + d] \
-                         + exp1 * v_tile[(p+1) * (HD) + d]; \
+            if (m_new > -INFINITY) { \
+                float exp0 = expf(s0 - m_new); \
+                float exp1 = expf(s1 - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp0 + exp1; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale \
+                             + exp0 * v_tile[p * (HD) + d] \
+                             + exp1 * v_tile[(p+1) * (HD) + d]; \
+                } \
+                m_i = m_new; \
             } \
-            m_i = m_new; \
         } \
         /* Handle odd remainder */ \
         if (p < tile_len) { \
@@ -530,21 +536,29 @@ extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
                 s = dot * scale; \
             } \
             float m_new = fmaxf(m_i, s); \
-            float exp_s = expf(s - m_new); \
-            float rescale = expf(m_i - m_new); \
-            l_i = l_i * rescale + exp_s; \
-            for (int d = 0; d < (HD); d++) { \
-                o_acc[d] = o_acc[d] * rescale + exp_s * v_tile[p * (HD) + d]; \
+            if (m_new > -INFINITY) { \
+                float exp_s = expf(s - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp_s; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale + exp_s * v_tile[p * (HD) + d]; \
+                } \
+                m_i = m_new; \
             } \
-            m_i = m_new; \
         } \
     } \
     \
     /* Final normalization and write output */ \
-    float inv_l = 1.0f / l_i; \
-    long long out_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
-    float* my_out = out + out_offset; \
-    for (int d = 0; d < (HD); d++) my_out[d] = o_acc[d] * inv_l; \
+    if (valid) { \
+        long long out_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        float* my_out = out + out_offset; \
+        if (l_i > 0.0f) { \
+            float inv_l = 1.0f / l_i; \
+            for (int d = 0; d < (HD); d++) my_out[d] = o_acc[d] * inv_l; \
+        } else { \
+            for (int d = 0; d < (HD); d++) my_out[d] = 0.0f; \
+        } \
+    } \
 }
 
 #define FLASH_PREFILL_KERNEL_F16KV(SUFFIX, HD, BM, BN) \
@@ -567,13 +581,12 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
     int h_kv = h_q / gqa_ratio; \
     \
     int my_query_row = tile_row * BM + tid; \
-    if (my_query_row >= seq_len) return; \
+    int valid = (my_query_row < seq_len); \
     \
     float scale = rsqrtf((float)(HD)); \
-    int causal_limit = cache_seq_len - seq_len + my_query_row; \
+    int causal_limit = valid ? (cache_seq_len - seq_len + my_query_row) : -1; \
     \
-    long long q_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
-    const float* my_q = q + q_offset; \
+    /* KV base pointer (same for all threads in block — needed for cooperative load) */ \
     long long kv_base = ((long long)b * n_heads_kv + h_kv) * kv_capacity * (HD); \
     const half* k_base = k_cache + kv_base; \
     const half* v_base = v_cache + kv_base; \
@@ -583,8 +596,13 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
     float m_i = -INFINITY; \
     float l_i = 0.0f; \
     \
+    /* Load Q into registers (valid threads only — invalid threads have OOB q_offset) */ \
     float q_reg[HD]; \
-    for (int d = 0; d < (HD); d++) q_reg[d] = my_q[d]; \
+    if (valid) { \
+        long long q_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        const float* my_q = q + q_offset; \
+        for (int d = 0; d < (HD); d++) q_reg[d] = my_q[d]; \
+    } \
     \
     /* Shared memory for K and V tiles (stored as F32 after dequant) */ \
     __shared__ float k_tile[BN * HD]; \
@@ -604,6 +622,8 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
         } \
         __syncthreads(); \
         \
+        if (!valid) continue; \
+        \
         int p = 0; \
         for (; p + 1 < tile_len; p += 2) { \
             int kp0 = kv_start + p; \
@@ -621,16 +641,18 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
                 s1 = dot * scale; \
             } \
             float m_new = fmaxf(m_i, fmaxf(s0, s1)); \
-            float exp0 = expf(s0 - m_new); \
-            float exp1 = expf(s1 - m_new); \
-            float rescale = expf(m_i - m_new); \
-            l_i = l_i * rescale + exp0 + exp1; \
-            for (int d = 0; d < (HD); d++) { \
-                o_acc[d] = o_acc[d] * rescale \
-                         + exp0 * v_tile[p * (HD) + d] \
-                         + exp1 * v_tile[(p+1) * (HD) + d]; \
+            if (m_new > -INFINITY) { \
+                float exp0 = expf(s0 - m_new); \
+                float exp1 = expf(s1 - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp0 + exp1; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale \
+                             + exp0 * v_tile[p * (HD) + d] \
+                             + exp1 * v_tile[(p+1) * (HD) + d]; \
+                } \
+                m_i = m_new; \
             } \
-            m_i = m_new; \
         } \
         if (p < tile_len) { \
             int kp = kv_start + p; \
@@ -641,20 +663,29 @@ extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
                 s = dot * scale; \
             } \
             float m_new = fmaxf(m_i, s); \
-            float exp_s = expf(s - m_new); \
-            float rescale = expf(m_i - m_new); \
-            l_i = l_i * rescale + exp_s; \
-            for (int d = 0; d < (HD); d++) { \
-                o_acc[d] = o_acc[d] * rescale + exp_s * v_tile[p * (HD) + d]; \
+            if (m_new > -INFINITY) { \
+                float exp_s = expf(s - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp_s; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale + exp_s * v_tile[p * (HD) + d]; \
+                } \
+                m_i = m_new; \
             } \
-            m_i = m_new; \
         } \
     } \
     \
-    float inv_l = 1.0f / l_i; \
-    long long out_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
-    float* my_out = out + out_offset; \
-    for (int d = 0; d < (HD); d++) my_out[d] = o_acc[d] * inv_l; \
+    /* Final normalization and write output */ \
+    if (valid) { \
+        long long out_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        float* my_out = out + out_offset; \
+        if (l_i > 0.0f) { \
+            float inv_l = 1.0f / l_i; \
+            for (int d = 0; d < (HD); d++) my_out[d] = o_acc[d] * inv_l; \
+        } else { \
+            for (int d = 0; d < (HD); d++) my_out[d] = 0.0f; \
+        } \
+    } \
 }
 
 // Generate F32 KV variants
