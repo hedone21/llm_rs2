@@ -16,7 +16,7 @@ use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
 use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
-use llm_rs2::core::sys_monitor::LinuxSystemMonitor;
+use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::workspace::{LayerWorkspace, PartitionWorkspace, WorkspaceConfig};
 use llm_rs2::memory::galloc::Galloc;
@@ -863,21 +863,9 @@ fn main() -> anyhow::Result<()> {
         ),
     };
 
-    // On discrete GPUs without flash attention for this head_dim, F16 KV + GPU attention
-    // produces incorrect results. Auto-promote to F32 KV for correctness.
-    // flash_attn_f32_f16 is compiled for DK ∈ {64, 128}; other head_dim values
-    // have no GPU F16 kernel and must fall back to F32 KV.
-    if backend.is_gpu()
-        && kv_type == DType::F16
-        && !matches!(head_dim, 64 | 128)
-        && backend.is_discrete_gpu()
-    {
-        eprintln!(
-            "[Config] Auto-promoting KV cache F16 → F32 (discrete GPU, head_dim={} not in flash_attn DK set {{64, 128}})",
-            head_dim
-        );
-        kv_type = DType::F32;
-    }
+    // Note: flash_attn_f32_f16 is compiled for DK ∈ {64, 128} only, but both
+    // CUDA naive attention (attention_gen_f16kv_naive) and CPU fallback attention
+    // support F16 KV for any head_dim. No auto-promotion needed.
 
     // Determine initial KV cache capacity (dynamic grow-on-demand)
     // Default: reserve space for prompt + all tokens to generate, so decode never
@@ -1170,7 +1158,15 @@ fn main() -> anyhow::Result<()> {
             });
 
     let mut cache_manager = {
-        let monitor = Box::new(LinuxSystemMonitor);
+        // CUDA discrete GPU: managed memory (cuMemAllocManaged) reserves system RAM
+        // for virtual address space even though data resides in VRAM. MemAvailable
+        // from /proc/meminfo is unreliable — use NoOpMonitor to prevent false pressure.
+        let monitor: Box<dyn llm_rs2::core::sys_monitor::SystemMonitor> =
+            if backend.is_discrete_gpu() {
+                Box::new(NoOpMonitor)
+            } else {
+                Box::new(LinuxSystemMonitor)
+            };
         let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
 
         if args.eviction_policy == "d2o" {

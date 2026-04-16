@@ -77,6 +77,27 @@ impl SystemMonitor for LinuxSystemMonitor {
     }
 }
 
+/// No-op monitor that always reports abundant memory.
+///
+/// Used when system RAM metrics are unreliable — e.g., CUDA discrete GPU where
+/// managed memory (cuMemAllocManaged) reserves system RAM for virtual address
+/// space even though data resides in VRAM. Reading /proc/meminfo MemAvailable
+/// would show artificially low values, triggering false memory pressure alerts.
+///
+/// With this monitor, KV cache eviction is driven purely by policy budgets
+/// (e.g., H2O keep_ratio, sliding window size) rather than system RAM pressure.
+pub struct NoOpMonitor;
+
+impl SystemMonitor for NoOpMonitor {
+    fn mem_stats(&self) -> Result<MemoryStats> {
+        Ok(MemoryStats {
+            total: usize::MAX,
+            available: usize::MAX,
+            free: usize::MAX,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
