@@ -106,6 +106,9 @@ pub struct ComputeMonitorConfig {
     pub warning_pct: f64,
     pub critical_pct: f64,
     pub hysteresis_pct: f64,
+    /// 커스텀 GPU sysfs 경로. None이면 벤더별 후보 목록을 순서대로 시도한다.
+    /// 예: "/sys/kernel/gpu/gpu_busy_percentage" (Adreno)
+    pub gpu_sysfs_path: Option<String>,
 }
 
 impl Default for ComputeMonitorConfig {
@@ -116,6 +119,7 @@ impl Default for ComputeMonitorConfig {
             warning_pct: 70.0,
             critical_pct: 90.0,
             hysteresis_pct: 5.0,
+            gpu_sysfs_path: None,
         }
     }
 }

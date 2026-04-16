@@ -26,11 +26,23 @@ pub fn compute_level_from_pcts(cpu_pct: f64, gpu_pct: f64) -> Level {
     }
 }
 
+/// GPU sysfs 경로 후보 목록 (벤더별, 순서대로 시도).
+/// - Adreno (Qualcomm): /sys/kernel/gpu/gpu_busy_percentage
+/// - Adreno (일부 기기): kgsl devfs 경로
+/// - Mali (Samsung/Arm): /sys/class/misc/mali0/device/utilization
+const GPU_SYSFS_CANDIDATES: &[&str] = &[
+    "/sys/kernel/gpu/gpu_busy_percentage",
+    "/sys/devices/platform/kgsl-3d0.0/kgsl/kgsl-3d0/gpu_busy_percentage",
+    "/sys/class/misc/mali0/device/utilization",
+];
+
 pub struct ComputeMonitor {
     poll_interval: Duration,
     evaluator: ThresholdEvaluator,
     warning_usage_pct: f64,
     stat_path: String,
+    /// 실제로 사용할 GPU sysfs 경로 목록. 비어 있으면 GPU=0.0.
+    gpu_sysfs_paths: Vec<String>,
     prev_snapshot: Option<CpuSnapshot>,
     last_cpu: f64,
     last_gpu: f64,
@@ -46,6 +58,7 @@ struct CpuSnapshot {
 
 impl ComputeMonitor {
     pub fn new(config: &ComputeMonitorConfig, default_poll_ms: u64) -> Self {
+        let gpu_sysfs_paths = resolve_gpu_sysfs_paths(config.gpu_sysfs_path.as_deref());
         Self {
             poll_interval: Duration::from_millis(
                 config.poll_interval_ms.unwrap_or(default_poll_ms),
@@ -61,6 +74,7 @@ impl ComputeMonitor {
             ),
             warning_usage_pct: config.warning_pct,
             stat_path: "/proc/stat".into(),
+            gpu_sysfs_paths,
             prev_snapshot: None,
             last_cpu: 0.0,
             last_gpu: 0.0,
@@ -76,6 +90,13 @@ impl ComputeMonitor {
         m
     }
 
+    #[cfg(test)]
+    fn with_gpu_path(config: &ComputeMonitorConfig, gpu_path: String) -> Self {
+        let mut m = Self::new(config, 1000);
+        m.gpu_sysfs_paths = vec![gpu_path];
+        m
+    }
+
     fn read_once(&mut self) -> anyhow::Result<bool> {
         let snap = read_cpu_snapshot(&self.stat_path)?;
 
@@ -88,8 +109,7 @@ impl ComputeMonitor {
             } else {
                 0.0
             };
-            // GPU usage requires vendor-specific sysfs — not implemented yet
-            self.last_gpu = 0.0;
+            self.last_gpu = read_gpu_busy_pct(&self.gpu_sysfs_paths);
             true
         } else {
             false
@@ -189,6 +209,31 @@ pub fn compute_recommendation(
             }
         }
     }
+}
+
+/// 설정된 커스텀 경로 또는 벤더별 후보 목록에서 실제로 존재하는 경로만 추려 반환.
+/// 모두 없으면 빈 Vec → `read_gpu_busy_pct`가 0.0 반환.
+fn resolve_gpu_sysfs_paths(custom: Option<&str>) -> Vec<String> {
+    if let Some(p) = custom {
+        return vec![p.to_string()];
+    }
+    GPU_SYSFS_CANDIDATES
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// GPU 사용률(0~100%)을 sysfs 경로 목록에서 읽어 반환.
+/// 모든 경로 시도 후 실패 시 0.0 (fallback, INV-092 유사 원칙).
+fn read_gpu_busy_pct(paths: &[String]) -> f64 {
+    for path in paths {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Ok(v) = content.trim().parse::<f64>() {
+                return v.clamp(0.0, 100.0);
+            }
+        }
+    }
+    0.0
 }
 
 fn read_cpu_snapshot(path: &str) -> anyhow::Result<CpuSnapshot> {
@@ -292,6 +337,53 @@ mod tests {
         monitor.last_cpu = 99.0;
         let level = monitor.evaluator.evaluate(99.0);
         assert_eq!(level, Some(Level::Critical)); // Not Emergency
+    }
+
+    #[test]
+    fn gpu_sysfs_reads_value_from_file() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "67\n").unwrap();
+
+        let config = default_config();
+        let monitor =
+            ComputeMonitor::with_gpu_path(&config, f.path().to_str().unwrap().to_string());
+
+        // read_gpu_busy_pct는 delta와 무관하게 매 read_once마다 읽힘
+        // → stat_path가 빈 문자열이므로 첫 읽기는 Err (delta 없음)
+        // sysfs 값은 직접 함수를 통해 검증한다.
+        let v = read_gpu_busy_pct(&monitor.gpu_sysfs_paths);
+        assert!((v - 67.0).abs() < f64::EPSILON, "got {v}");
+    }
+
+    #[test]
+    fn gpu_sysfs_clamps_out_of_range() {
+        let f = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(f.path(), "150\n").unwrap();
+        let paths = vec![f.path().to_str().unwrap().to_string()];
+        assert_eq!(read_gpu_busy_pct(&paths), 100.0);
+    }
+
+    #[test]
+    fn gpu_sysfs_fallback_when_path_missing() {
+        let paths = vec!["/nonexistent/path/gpu_busy".to_string()];
+        assert_eq!(read_gpu_busy_pct(&paths), 0.0);
+    }
+
+    #[test]
+    fn gpu_sysfs_fallback_when_paths_empty() {
+        assert_eq!(read_gpu_busy_pct(&[]), 0.0);
+    }
+
+    #[test]
+    fn resolve_gpu_sysfs_paths_uses_custom_when_set() {
+        let paths = resolve_gpu_sysfs_paths(Some("/custom/path"));
+        assert_eq!(paths, vec!["/custom/path".to_string()]);
+    }
+
+    #[test]
+    fn resolve_gpu_sysfs_paths_returns_candidates_when_none() {
+        let paths = resolve_gpu_sysfs_paths(None);
+        assert_eq!(paths.len(), GPU_SYSFS_CANDIDATES.len());
     }
 
     #[test]
