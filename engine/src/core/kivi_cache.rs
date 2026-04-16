@@ -398,13 +398,17 @@ impl KiviCache {
         }
 
         let res_elems = kv_heads * residual_size * head_dim;
-        // Allocate attention buffers at max_seq_len upfront.
+
+        // bits=16 (dynamic quant entry): F16 attn and Q-block buffers are NOT
+        // used until transition_bits() switches to Q2/Q4/Q8.  Skip their
+        // allocation to avoid OOM — only the F32 residual is needed.
+        let skip_attn_and_q = bits == 16;
+
+        // Allocate attention buffers at max_seq_len upfront (unless bits=16).
         // Lazy grow (Phase 2) is disabled because the OpenCL Plan caches cl_mem
         // handles at build time — growing attn buffers would stale the Plan's
         // references, causing garbage output or crashes.
-        // For bits=16 (dynamic quant entry), attn buffers aren't used until
-        // transition_bits() switches to Q2/Q4/Q8.
-        let initial_attn_cap = max_seq_len;
+        let initial_attn_cap = if skip_attn_and_q { 0 } else { max_seq_len };
         let attn_elems = initial_attn_cap * kv_heads * head_dim;
 
         // Q2 storage: max blocks needed
@@ -415,7 +419,8 @@ impl KiviCache {
         let max_k_blocks = max_flushes * groups_per_flush * kv_heads * head_dim;
         let max_v_blocks = max_flushes * kv_heads * residual_size * blocks_per_token_v;
 
-        let result = (|| -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)> {
+        #[allow(clippy::type_complexity)]
+        let result = (|| -> Result<(Tensor, Tensor, Option<Tensor>, Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
             let res_k_buf = memory.alloc(res_elems * 4, DType::F32)?;
             let res_k = Tensor::new(
                 Shape::new(vec![kv_heads, residual_size, head_dim]),
@@ -429,44 +434,55 @@ impl KiviCache {
                 backend.clone(),
             );
 
-            // Attention buffers use F16 to halve GPU memory (~112 MB savings).
-            // Dequant kernels (*_f16) and scatter_residual_f16 write half directly.
-            let attn_k_buf = memory.alloc(attn_elems * 2, DType::F16)?;
-            let attn_k = Tensor::new(
-                Shape::new(vec![initial_attn_cap, kv_heads, head_dim]),
-                attn_k_buf,
-                backend.clone(),
-            );
-            let attn_v_buf = memory.alloc(attn_elems * 2, DType::F16)?;
-            let attn_v = Tensor::new(
-                Shape::new(vec![initial_attn_cap, kv_heads, head_dim]),
-                attn_v_buf,
-                backend.clone(),
-            );
-
-            // Quantized block storage: size depends on bits
-            // bits=16 (dynamic quant): allocate for worst-case Q8 (36B/block)
-            // since runtime transition to any bit width is possible.
-            let block_bytes = match bits {
-                2 => 12,      // BlockQ2_0
-                4 => 20,      // BlockKVQ4
-                8 | 16 => 36, // BlockKVQ8 (16: dynamic, worst-case)
-                _ => 36,
+            // bits=16: skip F16 attn + Q-block allocation entirely.
+            // These will be allocated on-demand in transition_bits() or
+            // ensure_gpu_attn_capacity() when the cache transitions to Q2/Q4/Q8.
+            let (attn_k, attn_v) = if skip_attn_and_q {
+                (None, None)
+            } else {
+                // Attention buffers use F16 to halve GPU memory (~112 MB savings).
+                // Dequant kernels (*_f16) and scatter_residual_f16 write half directly.
+                let attn_k_buf = memory.alloc(attn_elems * 2, DType::F16)?;
+                let ak = Tensor::new(
+                    Shape::new(vec![initial_attn_cap, kv_heads, head_dim]),
+                    attn_k_buf,
+                    backend.clone(),
+                );
+                let attn_v_buf = memory.alloc(attn_elems * 2, DType::F16)?;
+                let av = Tensor::new(
+                    Shape::new(vec![initial_attn_cap, kv_heads, head_dim]),
+                    attn_v_buf,
+                    backend.clone(),
+                );
+                (Some(ak), Some(av))
             };
-            let q2k_bytes = max_k_blocks * block_bytes;
-            let q2k_buf = memory.alloc(q2k_bytes.max(block_bytes), DType::U8)?;
-            let q2k = Tensor::new(
-                Shape::new(vec![q2k_bytes.max(block_bytes)]),
-                q2k_buf,
-                backend.clone(),
-            );
-            let q2v_bytes = max_v_blocks * block_bytes;
-            let q2v_buf = memory.alloc(q2v_bytes.max(block_bytes), DType::U8)?;
-            let q2v = Tensor::new(
-                Shape::new(vec![q2v_bytes.max(block_bytes)]),
-                q2v_buf,
-                backend.clone(),
-            );
+
+            let (q2k, q2v) = if skip_attn_and_q {
+                (None, None)
+            } else {
+                // Quantized block storage: size depends on bits
+                let block_bytes = match bits {
+                    2 => 12,      // BlockQ2_0
+                    4 => 20,      // BlockKVQ4
+                    8 | 16 => 36, // BlockKVQ8 (16: dynamic, worst-case)
+                    _ => 36,
+                };
+                let q2k_bytes = max_k_blocks * block_bytes;
+                let q2k_buf = memory.alloc(q2k_bytes.max(block_bytes), DType::U8)?;
+                let qk = Tensor::new(
+                    Shape::new(vec![q2k_bytes.max(block_bytes)]),
+                    q2k_buf,
+                    backend.clone(),
+                );
+                let q2v_bytes = max_v_blocks * block_bytes;
+                let q2v_buf = memory.alloc(q2v_bytes.max(block_bytes), DType::U8)?;
+                let qv = Tensor::new(
+                    Shape::new(vec![q2v_bytes.max(block_bytes)]),
+                    q2v_buf,
+                    backend.clone(),
+                );
+                (Some(qk), Some(qv))
+            };
 
             Ok((res_k, res_v, attn_k, attn_v, q2k, q2v))
         })();
@@ -479,13 +495,24 @@ impl KiviCache {
                     let zeros = vec![0u8; t.size()];
                     backend.write_buffer(t, &zeros)
                 };
-                if let Err(e) = zero_init(&mut res_k)
+                let init_result = zero_init(&mut res_k)
                     .and_then(|_| zero_init(&mut res_v))
-                    .and_then(|_| zero_init(&mut attn_k))
-                    .and_then(|_| zero_init(&mut attn_v))
-                    .and_then(|_| zero_init(&mut q2k))
-                    .and_then(|_| zero_init(&mut q2v))
-                {
+                    .and_then(|_| {
+                        if let Some(ref mut ak) = attn_k {
+                            zero_init(ak)?;
+                        }
+                        if let Some(ref mut av) = attn_v {
+                            zero_init(av)?;
+                        }
+                        if let Some(ref mut qk) = q2k {
+                            zero_init(qk)?;
+                        }
+                        if let Some(ref mut qv) = q2v {
+                            zero_init(qv)?;
+                        }
+                        Ok(())
+                    });
+                if let Err(e) = init_result {
                     log::warn!(
                         "KiviCache: GPU buffer zero-init failed ({}), falling back to CPU mode",
                         e
@@ -497,11 +524,11 @@ impl KiviCache {
                 cache.gpu_memory = Some(memory);
                 cache.gpu_res_k = Some(res_k);
                 cache.gpu_res_v = Some(res_v);
-                cache.gpu_attn_k = Some(attn_k);
-                cache.gpu_attn_v = Some(attn_v);
+                cache.gpu_attn_k = attn_k;
+                cache.gpu_attn_v = attn_v;
                 cache.gpu_attn_cap = initial_attn_cap;
-                cache.gpu_q2k = Some(q2k);
-                cache.gpu_q2v = Some(q2v);
+                cache.gpu_q2k = q2k;
+                cache.gpu_q2v = q2v;
 
                 // GPU mode: eliminate redundant CPU allocations.
                 // GPU buffers hold the canonical data; CPU Vecs are not needed.
@@ -513,9 +540,15 @@ impl KiviCache {
                 cache.qk = QuantizedBlocks::empty(bits);
                 cache.qv = QuantizedBlocks::empty(bits);
 
-                log::info!(
-                    "KiviCache: GPU mode enabled (lazy attn cap={initial_attn_cap}, CPU attn/q freed)"
-                );
+                if skip_attn_and_q {
+                    log::info!(
+                        "KiviCache: GPU mode enabled (bits=16, attn/Q deferred, res_cap={residual_size})"
+                    );
+                } else {
+                    log::info!(
+                        "KiviCache: GPU mode enabled (attn cap={initial_attn_cap}, CPU attn/q freed)"
+                    );
+                }
             }
             Err(e) => {
                 log::warn!("KiviCache: GPU alloc failed ({}), using CPU mode", e);
@@ -592,6 +625,73 @@ impl KiviCache {
         self.gpu_attn_k = Some(new_k);
         self.gpu_attn_v = Some(new_v);
         self.gpu_attn_cap = new_cap;
+        Ok(())
+    }
+
+    /// Allocate GPU Q-block buffers (gpu_q2k/gpu_q2v) for the given bit-width.
+    ///
+    /// Called during `transition_bits(16 -> Q)` when Q-block allocation was
+    /// deferred at `new_gpu()` (bits=16 skips Q-block allocation to save memory).
+    /// No-op if Q-block buffers already exist.
+    fn allocate_gpu_q_blocks(&mut self, bits: u8) -> Result<()> {
+        if self.gpu_q2k.is_some() {
+            return Ok(());
+        }
+        let backend = self
+            .gpu_backend
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("allocate_gpu_q_blocks: no GPU backend"))?
+            .clone();
+        let memory = self
+            .gpu_memory
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("allocate_gpu_q_blocks: no GPU memory"))?
+            .clone();
+
+        let gs = QKKV;
+        let groups_per_flush = self.res_cap.max(gs) / gs; // use current res_cap (may be max_seq_len)
+        let max_flushes = self.max_seq_len.div_ceil(self.res_cap.max(gs));
+        let blocks_per_token_v = self.head_dim / gs;
+        let max_k_blocks = max_flushes * groups_per_flush * self.kv_heads * self.head_dim;
+        let max_v_blocks = max_flushes * self.kv_heads * self.res_cap.max(gs) * blocks_per_token_v;
+
+        let block_bytes: usize = match bits {
+            2 => 12,
+            4 => 20,
+            8 => 36,
+            _ => 36,
+        };
+
+        let q2k_bytes = max_k_blocks * block_bytes;
+        let q2k_buf = memory.alloc(q2k_bytes.max(block_bytes), DType::U8)?;
+        let mut q2k = Tensor::new(
+            Shape::new(vec![q2k_bytes.max(block_bytes)]),
+            q2k_buf,
+            backend.clone(),
+        );
+        let q2v_bytes = max_v_blocks * block_bytes;
+        let q2v_buf = memory.alloc(q2v_bytes.max(block_bytes), DType::U8)?;
+        let mut q2v = Tensor::new(
+            Shape::new(vec![q2v_bytes.max(block_bytes)]),
+            q2v_buf,
+            backend.clone(),
+        );
+
+        // Zero-init
+        let zeros_k = vec![0u8; q2k.size()];
+        backend.write_buffer(&mut q2k, &zeros_k)?;
+        let zeros_v = vec![0u8; q2v.size()];
+        backend.write_buffer(&mut q2v, &zeros_v)?;
+
+        log::info!(
+            "KiviCache: deferred GPU Q-block alloc (bits={}, q2k={} B, q2v={} B)",
+            bits,
+            q2k_bytes.max(block_bytes),
+            q2v_bytes.max(block_bytes)
+        );
+
+        self.gpu_q2k = Some(q2k);
+        self.gpu_q2v = Some(q2v);
         Ok(())
     }
 
@@ -982,6 +1082,20 @@ impl KiviCache {
             self.bits = 16;
             self.qk = QuantizedBlocks::Unquantized;
             self.qv = QuantizedBlocks::Unquantized;
+
+            // GPU mode: release attn and Q-block buffers to reclaim memory.
+            // bits=16 uses only F32 residual; these buffers are unused.
+            if self.is_gpu() {
+                self.gpu_attn_k = None;
+                self.gpu_attn_v = None;
+                self.gpu_attn_cap = 0;
+                self.gpu_q2k = None;
+                self.gpu_q2v = None;
+                self.gpu_q2k_blocks = 0;
+                self.gpu_q2v_blocks = 0;
+                log::info!("KiviCache: GPU attn/Q buffers released (transition to bits=16)");
+            }
+
             return Ok(());
         }
 
@@ -991,6 +1105,14 @@ impl KiviCache {
             self.bits = new_bits;
             self.qk = QuantizedBlocks::new(new_bits);
             self.qv = QuantizedBlocks::new(new_bits);
+
+            // GPU mode: allocate Q-block buffers that were deferred at new_gpu()
+            // (bits=16 skips attn+Q allocation to avoid OOM).
+            // These must exist before flush_residual_gpu() which uploads Q data.
+            // ensure_gpu_attn_capacity() inside flush will handle attn buffers.
+            if self.gpu_backend.is_some() && self.gpu_q2k.is_none() {
+                self.allocate_gpu_q_blocks(new_bits)?;
+            }
 
             // Flush as many full groups as possible from residual.
             // GPU mode: use flush_residual_gpu() to keep GPU buffers in sync

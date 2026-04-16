@@ -217,10 +217,7 @@ fn resolve_gpu_sysfs_paths(custom: Option<&str>) -> Vec<String> {
     if let Some(p) = custom {
         return vec![p.to_string()];
     }
-    GPU_SYSFS_CANDIDATES
-        .iter()
-        .map(|s| s.to_string())
-        .collect()
+    GPU_SYSFS_CANDIDATES.iter().map(|s| s.to_string()).collect()
 }
 
 /// GPU 사용률(0~100%)을 sysfs 경로 목록에서 읽어 반환.
