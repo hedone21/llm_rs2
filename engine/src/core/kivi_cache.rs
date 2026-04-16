@@ -397,8 +397,6 @@ impl KiviCache {
             return cache;
         }
 
-        let res_elems = kv_heads * residual_size * head_dim;
-
         // bits=16 (dynamic quant entry): F16 attn and Q-block buffers are NOT
         // used until transition_bits() switches to Q2/Q4/Q8.  Skip their
         // allocation to avoid OOM — only the F32 residual is needed.
@@ -419,22 +417,29 @@ impl KiviCache {
         let max_k_blocks = max_flushes * groups_per_flush * kv_heads * head_dim;
         let max_v_blocks = max_flushes * kv_heads * residual_size * blocks_per_token_v;
 
+        // GPU residual capacity: full residual_size for all bit-widths.
+        // For bits=16 with large max_seq_len, alloc may fail — the Err path
+        // below falls back to CPU mode gracefully.
+        // F16 attn and Q-block buffers are still skipped for bits=16.
+        let gpu_res_cap = residual_size;
+        let gpu_res_elems = kv_heads * gpu_res_cap * head_dim;
+
         #[allow(clippy::type_complexity)]
         let result = (|| -> Result<(Tensor, Tensor, Option<Tensor>, Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
-            let res_k_buf = memory.alloc(res_elems * 4, DType::F32)?;
+            let res_k_buf = memory.alloc(gpu_res_elems * 4, DType::F32)?;
             let res_k = Tensor::new(
-                Shape::new(vec![kv_heads, residual_size, head_dim]),
+                Shape::new(vec![kv_heads, gpu_res_cap, head_dim]),
                 res_k_buf,
                 backend.clone(),
             );
-            let res_v_buf = memory.alloc(res_elems * 4, DType::F32)?;
+            let res_v_buf = memory.alloc(gpu_res_elems * 4, DType::F32)?;
             let res_v = Tensor::new(
-                Shape::new(vec![kv_heads, residual_size, head_dim]),
+                Shape::new(vec![kv_heads, gpu_res_cap, head_dim]),
                 res_v_buf,
                 backend.clone(),
             );
 
-            // bits=16: skip F16 attn + Q-block allocation entirely.
+            // bits=2/4/8: F16 attn + Q-block allocation.
             // These will be allocated on-demand in transition_bits() or
             // ensure_gpu_attn_capacity() when the cache transitions to Q2/Q4/Q8.
             let (attn_k, attn_v) = if skip_attn_and_q {
@@ -2119,18 +2124,6 @@ impl KiviCache {
     /// If `assemble_view_gpu()` fails (e.g. kernel dispatch error), falls back
     /// to CPU dequant + assemble path to avoid returning stale/garbage data.
     fn get_view_gpu(&mut self) -> (Tensor, Tensor) {
-        if let Err(e) = self.assemble_view_gpu() {
-            log::warn!(
-                "KiviCache assemble_view_gpu error: {}, returning stale GPU attention buffers \
-                 (CPU qk/qv not available in GPU mode)",
-                e
-            );
-            // GPU mode: CPU qk/qv and attn bufs are empty, so we cannot fall back to
-            // CPU assemble_view(). Return the GPU attention buffers as-is — quantized
-            // data was already dequanted during flush, only the latest residual scatter
-            // failed. This is a rare error path; data may be slightly stale.
-        }
-
         let total = self.total_tokens();
         let backend = self.gpu_backend.as_ref().unwrap().clone();
 
@@ -2139,6 +2132,29 @@ impl KiviCache {
             let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
             let t = Tensor::new(shape.clone(), buf.clone(), backend);
             return (t.clone(), t);
+        }
+
+        // bits=16: no attn buffers — return GPU residual directly as F32 view.
+        // HeadMajor [kv_heads, res_cap, head_dim] → reinterpret as
+        // [1, kv_heads, res_cap, head_dim] with only `total` valid tokens.
+        if self.bits == 16 {
+            let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
+            let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+            // HeadMajor layout: shape encodes [batch=1, kv_heads, capacity, head_dim]
+            // The attention kernel reads kv_head_stride and kv_pos_stride from shape.
+            let shape = Shape::new(vec![1, self.kv_heads, self.res_cap, self.head_dim]);
+            let k = Tensor::new(shape.clone(), gpu_res_k.buffer().clone(), backend.clone());
+            let v = Tensor::new(shape, gpu_res_v.buffer().clone(), backend);
+            return (k, v);
+        }
+
+        // bits=2/4/8: assemble quantized + residual into F16 attn buffers
+        if let Err(e) = self.assemble_view_gpu() {
+            log::warn!(
+                "KiviCache assemble_view_gpu error: {}, returning stale GPU attention buffers \
+                 (CPU qk/qv not available in GPU mode)",
+                e
+            );
         }
 
         let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
@@ -2166,7 +2182,13 @@ impl KVCacheOps for KiviCache {
     }
 
     fn capacity(&self) -> usize {
-        self.max_seq_len
+        // bits=16 GPU: return GPU residual capacity (may be smaller than max_seq_len
+        // due to grow-on-demand). Used for HeadMajor stride calculations.
+        if self.bits == 16 && self.gpu_res_k.is_some() {
+            self.res_cap
+        } else {
+            self.max_seq_len
+        }
     }
 
     fn kv_heads(&self) -> usize {
@@ -2178,7 +2200,14 @@ impl KVCacheOps for KiviCache {
     }
 
     fn layout(&self) -> KVLayout {
-        KVLayout::SeqMajor
+        // bits=16 GPU mode: residual is HeadMajor [kv_heads, res_cap, head_dim].
+        // bits=2/4/8 GPU mode: assembled attn view is SeqMajor [total, kv_heads, head_dim].
+        // CPU mode: always SeqMajor.
+        if self.bits == 16 && self.gpu_res_k.is_some() {
+            KVLayout::HeadMajor
+        } else {
+            KVLayout::SeqMajor
+        }
     }
 
     fn kv_dtype(&self) -> DType {
