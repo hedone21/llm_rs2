@@ -1106,17 +1106,54 @@ impl KiviCache {
             self.qk = QuantizedBlocks::new(new_bits);
             self.qv = QuantizedBlocks::new(new_bits);
 
-            // GPU mode: allocate Q-block buffers that were deferred at new_gpu()
-            // (bits=16 skips attn+Q allocation to avoid OOM).
-            // These must exist before flush_residual_gpu() which uploads Q data.
-            // ensure_gpu_attn_capacity() inside flush will handle attn buffers.
-            if self.gpu_backend.is_some() && self.gpu_q2k.is_none() {
-                self.allocate_gpu_q_blocks(new_bits)?;
+            if self.gpu_backend.is_some() {
+                // GPU mode: avoid OOM by releasing large F32 residual buffers before
+                // allocating F16 attn + Q-block buffers.
+                //
+                // Step A: Read GPU F32 residual → CPU (so quantization can proceed).
+                let res_bytes = self.kv_heads * self.res_cap * self.head_dim * 4;
+                {
+                    let backend = self.gpu_backend.as_ref().unwrap();
+                    if let Some(gpu_rk) = self.gpu_res_k.as_ref() {
+                        // SAFETY: res_k Vec is pre-allocated with res_cap * kv_heads * head_dim
+                        // f32 elements. res_bytes = that count * 4 bytes.
+                        let k_dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                self.res_k.as_mut_ptr() as *mut u8,
+                                res_bytes,
+                            )
+                        };
+                        backend.read_buffer(gpu_rk, k_dst)?;
+                    }
+                    if let Some(gpu_rv) = self.gpu_res_v.as_ref() {
+                        let v_dst = unsafe {
+                            std::slice::from_raw_parts_mut(
+                                self.res_v.as_mut_ptr() as *mut u8,
+                                res_bytes,
+                            )
+                        };
+                        backend.read_buffer(gpu_rv, v_dst)?;
+                    }
+                }
+
+                // Step B: Release GPU F32 residual buffers to free memory before
+                // Q-block + F16 attn allocation.
+                self.gpu_res_k = None;
+                self.gpu_res_v = None;
+                log::info!(
+                    "KiviCache: GPU F32 residual released before 16→{} transition",
+                    new_bits
+                );
+
+                // Step C: Allocate Q-block buffers (deferred from new_gpu).
+                if self.gpu_q2k.is_none() {
+                    self.allocate_gpu_q_blocks(new_bits)?;
+                }
             }
 
             // Flush as many full groups as possible from residual.
-            // GPU mode: use flush_residual_gpu() to keep GPU buffers in sync
-            // (upload quantized blocks + update GPU attention buffers).
+            // GPU mode: flush_residual_gpu() will skip GPU readback (already done above)
+            // and use CPU data for quantization. F16 attn allocation happens inside flush.
             if self.res_pos >= self.group_size {
                 if self.gpu_backend.is_some() {
                     self.flush_residual_gpu()?;
@@ -1159,31 +1196,69 @@ impl KiviCache {
                 self.res_cap = new_res_cap;
 
                 // Sync compacted CPU residual to GPU.
-                // GPU buffer is larger (old allocation) but only the first
-                // kv_heads × new_res_cap × head_dim elements are used.
                 if needs_gpu_sync {
-                    let backend = self.gpu_backend.as_ref().unwrap();
+                    let backend = self.gpu_backend.as_ref().unwrap().clone();
+                    let memory = self.gpu_memory.as_ref().unwrap().clone();
+                    // SAFETY: res_k/res_v contain new_elems f32 values after compaction.
                     let k_bytes = unsafe {
                         std::slice::from_raw_parts(self.res_k.as_ptr() as *const u8, new_elems * 4)
                     };
                     let v_bytes = unsafe {
                         std::slice::from_raw_parts(self.res_v.as_ptr() as *const u8, new_elems * 4)
                     };
-                    // Write compacted data to the start of GPU buffer.
-                    // Remaining space is unused (gpu_res_k/v are oversized but
-                    // res_cap now tracks the correct stride).
-                    if let Some(gpu_rk) = self.gpu_res_k.as_mut() {
-                        let gpu_size = gpu_rk.buffer().size();
-                        let mut padded = vec![0u8; gpu_size];
-                        padded[..k_bytes.len()].copy_from_slice(k_bytes);
-                        backend.write_buffer(gpu_rk, &padded)?;
+
+                    if self.gpu_res_k.is_some() {
+                        // GPU buffer exists (oversized from old allocation).
+                        // Write compacted data to the start; remaining space is unused.
+                        if let Some(gpu_rk) = self.gpu_res_k.as_mut() {
+                            let gpu_size = gpu_rk.buffer().size();
+                            let mut padded = vec![0u8; gpu_size];
+                            padded[..k_bytes.len()].copy_from_slice(k_bytes);
+                            backend.write_buffer(gpu_rk, &padded)?;
+                        }
+                        if let Some(gpu_rv) = self.gpu_res_v.as_mut() {
+                            let gpu_size = gpu_rv.buffer().size();
+                            let mut padded = vec![0u8; gpu_size];
+                            padded[..v_bytes.len()].copy_from_slice(v_bytes);
+                            backend.write_buffer(gpu_rv, &padded)?;
+                        }
+                    } else {
+                        // GPU residual was released (transition_bits 16→Q path).
+                        // Allocate small GPU residual buffers (res_cap=32 now).
+                        let shape = Shape::new(vec![self.kv_heads, new_res_cap, self.head_dim]);
+                        let k_buf = memory.alloc(new_elems * 4, DType::F32)?;
+                        let mut gpu_rk = Tensor::new(shape.clone(), k_buf, backend.clone());
+                        backend.write_buffer(&mut gpu_rk, k_bytes)?;
+                        self.gpu_res_k = Some(gpu_rk);
+
+                        let v_buf = memory.alloc(new_elems * 4, DType::F32)?;
+                        let mut gpu_rv = Tensor::new(shape, v_buf, backend.clone());
+                        backend.write_buffer(&mut gpu_rv, v_bytes)?;
+                        self.gpu_res_v = Some(gpu_rv);
+
+                        log::info!(
+                            "KiviCache: GPU F32 residual re-allocated (res_cap={})",
+                            new_res_cap
+                        );
                     }
-                    if let Some(gpu_rv) = self.gpu_res_v.as_mut() {
-                        let gpu_size = gpu_rv.buffer().size();
-                        let mut padded = vec![0u8; gpu_size];
-                        padded[..v_bytes.len()].copy_from_slice(v_bytes);
-                        backend.write_buffer(gpu_rv, &padded)?;
-                    }
+                } else if self.gpu_backend.is_some() && self.gpu_res_k.is_none() {
+                    // No remaining tokens but GPU residual was released.
+                    // Allocate empty small GPU residual buffers for future updates.
+                    let backend = self.gpu_backend.as_ref().unwrap().clone();
+                    let memory = self.gpu_memory.as_ref().unwrap().clone();
+                    let shape = Shape::new(vec![self.kv_heads, new_res_cap, self.head_dim]);
+                    let k_buf = memory.alloc(new_elems * 4, DType::F32)?;
+                    let gpu_rk = Tensor::new(shape.clone(), k_buf, backend.clone());
+                    self.gpu_res_k = Some(gpu_rk);
+
+                    let v_buf = memory.alloc(new_elems * 4, DType::F32)?;
+                    let gpu_rv = Tensor::new(shape, v_buf, backend.clone());
+                    self.gpu_res_v = Some(gpu_rv);
+
+                    log::info!(
+                        "KiviCache: GPU F32 residual re-allocated empty (res_cap={})",
+                        new_res_cap
+                    );
                 }
             }
 
@@ -1516,12 +1591,15 @@ impl KiviCache {
         // 0. Ensure GPU attn buffers can hold all quantized + flushing tokens
         self.ensure_gpu_attn_capacity(self.q2_tokens + flush_tokens)?;
 
-        // 1. Read GPU residual to CPU (needed for quantization)
-        let res_bytes = self.kv_heads * self.res_cap * self.head_dim * 4;
+        // 1. Read GPU residual to CPU (needed for quantization).
+        //    Skip if GPU residual buffers were already read back and released
+        //    (e.g. during transition_bits 16→Q to avoid OOM).
+        if let (Some(gpu_res_k), Some(gpu_res_v)) =
+            (self.gpu_res_k.as_ref(), self.gpu_res_v.as_ref())
         {
+            let res_bytes = self.kv_heads * self.res_cap * self.head_dim * 4;
             let backend = self.gpu_backend.as_ref().unwrap();
-            let gpu_res_k = self.gpu_res_k.as_ref().unwrap();
-            let gpu_res_v = self.gpu_res_v.as_ref().unwrap();
+            // SAFETY: res_k/res_v Vecs hold at least res_bytes / 4 f32 elements.
             let k_dst = unsafe {
                 std::slice::from_raw_parts_mut(self.res_k.as_mut_ptr() as *mut u8, res_bytes)
             };
@@ -1642,23 +1720,34 @@ impl KiviCache {
         self.q2_tokens += flush_tokens;
         self.q2_deq_tokens = self.q2_tokens; // GPU dequant already done above
 
-        // 5. Shift remaining residual tokens on GPU
+        // 5. Shift remaining residual tokens on GPU (or CPU if GPU residual was released)
         let remaining = self.res_pos - flush_tokens;
         if remaining > 0 {
-            let backend = self.gpu_backend.as_ref().unwrap().clone();
-            let gpu_res_k = self.gpu_res_k.as_mut().unwrap();
-            for h in 0..self.kv_heads {
-                let base = h * self.res_cap * self.head_dim;
-                let src = base + flush_tokens * self.head_dim;
-                let count = remaining * self.head_dim;
-                backend.buffer_shift(gpu_res_k, src, base, count)?;
-            }
-            let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
-            for h in 0..self.kv_heads {
-                let base = h * self.res_cap * self.head_dim;
-                let src = base + flush_tokens * self.head_dim;
-                let count = remaining * self.head_dim;
-                backend.buffer_shift(gpu_res_v, src, base, count)?;
+            if let Some(gpu_res_k) = self.gpu_res_k.as_mut() {
+                let backend = self.gpu_backend.as_ref().unwrap().clone();
+                for h in 0..self.kv_heads {
+                    let base = h * self.res_cap * self.head_dim;
+                    let src = base + flush_tokens * self.head_dim;
+                    let count = remaining * self.head_dim;
+                    backend.buffer_shift(gpu_res_k, src, base, count)?;
+                }
+                let gpu_res_v = self.gpu_res_v.as_mut().unwrap();
+                for h in 0..self.kv_heads {
+                    let base = h * self.res_cap * self.head_dim;
+                    let src = base + flush_tokens * self.head_dim;
+                    let count = remaining * self.head_dim;
+                    backend.buffer_shift(gpu_res_v, src, base, count)?;
+                }
+            } else {
+                // GPU residual released (transition_bits 16→Q path).
+                // Shift on CPU side — data was already read back before release.
+                for h in 0..self.kv_heads {
+                    let base = h * self.res_cap * self.head_dim;
+                    let src = base + flush_tokens * self.head_dim;
+                    let count = remaining * self.head_dim;
+                    self.res_k.copy_within(src..src + count, base);
+                    self.res_v.copy_within(src..src + count, base);
+                }
             }
         }
         self.res_pos = remaining;
