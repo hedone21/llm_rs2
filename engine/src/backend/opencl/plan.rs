@@ -515,6 +515,38 @@ impl FullKernelPlan {
                         let us = q1_start.elapsed().as_nanos() as u64 / 1000;
                         eprintln!("[Q1_TRACE] layer={} n_kv={} us={}", i, attn_seq_len, us);
                     }
+                    // LLMRS_Q1_REPEAT=N: re-dispatch the Q1 kernel (N-1) additional
+                    // times against the same KV state, measuring each repetition in
+                    // isolation. The first (production) iteration follows matmul_qkv
+                    // /rope/kv_update and reads KV "cold" from the just-written slot;
+                    // subsequent reps read it "warm". Comparing rep=0 vs rep>=1
+                    // slope against n_kv separates kernel-intrinsic cost from
+                    // context-dependent cache/coherency effects.
+                    let q1_repeat: u32 = std::env::var("LLMRS_Q1_REPEAT")
+                        .ok()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(1);
+                    for rep in 1..q1_repeat {
+                        ocl::core::finish(queue).ok();
+                        let rep_start = std::time::Instant::now();
+                        Self::dispatch_step(
+                            backend,
+                            step,
+                            start_pos_i32,
+                            attn_seq_len,
+                            write_pos,
+                            kv_cap,
+                            rp,
+                            q2t,
+                            rt,
+                        );
+                        ocl::core::finish(queue).ok();
+                        let rep_us = rep_start.elapsed().as_nanos() as u64 / 1000;
+                        eprintln!(
+                            "[Q1_REPEAT] layer={} n_kv={} rep={} us={}",
+                            i, attn_seq_len, rep, rep_us
+                        );
+                    }
                     if debug_sync {
                         ocl::core::finish(queue).ok();
                         eprintln!(
