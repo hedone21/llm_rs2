@@ -219,12 +219,18 @@ impl CacheManager {
             forced: force,
         });
 
-        log::info!(
-            "[CacheManager] pressure={:?}{}, executing '{}'",
-            pressure,
-            if force { " (forced)" } else { "" },
-            self.pipeline.name(),
-        );
+        if force {
+            log::info!(
+                "[CacheManager] budget eviction (forced), executing '{}'",
+                self.pipeline.name(),
+            );
+        } else {
+            log::info!(
+                "[CacheManager] pressure={:?}, executing '{}'",
+                pressure,
+                self.pipeline.name(),
+            );
+        }
 
         let (importance, head_importance, n_kv_heads) = match scores {
             ScoreContext::None => (None, None, 0),
@@ -375,8 +381,7 @@ impl CacheManager {
         });
 
         log::info!(
-            "[CacheManager] pressure={:?} (forced+layer_ratios), executing '{}'",
-            pressure,
+            "[CacheManager] budget eviction (forced+layer_ratios), executing '{}'",
             self.pipeline.name(),
         );
 

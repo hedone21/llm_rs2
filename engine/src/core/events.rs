@@ -141,12 +141,19 @@ impl EventSink for StderrDiagnosticSink {
                 mem_available,
                 forced,
             } => {
-                eprintln!(
-                    "[CacheEvent] Pressure {:?}, mem_available={} MB{}",
-                    level,
-                    mem_available / (1024 * 1024),
-                    if forced { " (forced)" } else { "" }
-                );
+                if forced {
+                    // Budget-driven forced eviction (eval-ll, resilience signal).
+                    // Don't display pressure level — it's always Emergency by design
+                    // to ensure all pipeline handlers run, not because of actual
+                    // memory pressure.
+                    eprintln!("[CacheEvent] Budget eviction (forced)");
+                } else {
+                    eprintln!(
+                        "[CacheEvent] Pressure {:?}, mem_available={} MB",
+                        level,
+                        mem_available / (1024 * 1024),
+                    );
+                }
             }
             CacheEvent::EvictionCompleted {
                 ref policy,
