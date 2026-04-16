@@ -607,8 +607,11 @@ fn main() -> anyhow::Result<()> {
         #[cfg(feature = "cuda")]
         "cuda" => {
             let gpu_concrete = Arc::new(llm_rs2::backend::cuda::CudaBackend::new()?);
-            let gpu_mem: Arc<dyn Memory> =
-                Arc::new(llm_rs2::backend::cuda::memory::CudaMemory::new());
+            let gpu_mem: Arc<dyn Memory> = if gpu_concrete.is_discrete_gpu() {
+                Arc::new(llm_rs2::backend::cuda::memory::CudaMemory::managed())
+            } else {
+                Arc::new(llm_rs2::backend::cuda::memory::CudaMemory::new())
+            };
             let gpu: Arc<dyn Backend> = gpu_concrete;
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
         }
@@ -4427,13 +4430,9 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
             () => {
                 match v_dtype {
                     DType::F16 => VDataSource::F16(cache.v_buffer.as_slice::<u16>()),
-                    DType::Q4_0 => {
-                        VDataSource::Q4_0(
-                            cache
-                                .v_buffer
-                                .as_slice::<llm_rs2::core::quant::BlockQ4_0>(),
-                        )
-                    }
+                    DType::Q4_0 => VDataSource::Q4_0(
+                        cache.v_buffer.as_slice::<llm_rs2::core::quant::BlockQ4_0>(),
+                    ),
                     _ => VDataSource::F32(cache.v_buffer.as_slice::<f32>()),
                 }
             };

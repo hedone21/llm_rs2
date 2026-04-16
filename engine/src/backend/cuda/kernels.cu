@@ -103,12 +103,12 @@ extern "C" __global__ void rms_norm_f32(
 }
 
 // =================================================================
-// 2. RoPE inplace (neox style, Llama/Qwen)
+// 2. RoPE inplace (neox split-half, Llama/Qwen/Gemma3)
 // =================================================================
 // Supports both decode (seq_len=1) and prefill (seq_len>1).
 // grid=(seq_len * n_heads, 1, 1), block=(head_dim/2, 1, 1)
 // x layout: [seq_len, n_heads, head_dim] (flattened)
-// Each position t gets rotation angle: (start_pos + t) * freq_i
+// Pair layout: (x[i], x[i + head_dim/2]) — matches CPU/OpenCL neox style.
 extern "C" __global__ void rope_inplace_f32(
     float * x, int head_dim, int n_heads, int seq_len,
     int start_pos, float theta_base)
@@ -117,7 +117,8 @@ extern "C" __global__ void rope_inplace_f32(
     int t = block_id / n_heads;         // sequence position within batch
     int h = block_id % n_heads;         // head index
     int i = threadIdx.x;                // dim pair index: 0..head_dim/2
-    if (i >= head_dim / 2) return;
+    int half_dim = head_dim / 2;
+    if (i >= half_dim) return;
 
     // freq = theta_base^(-2i/head_dim) = exp(-2i/head_dim * log(theta_base))
     // Using exp+log matches CPU's floating point behavior better than powf.
@@ -127,10 +128,10 @@ extern "C" __global__ void rope_inplace_f32(
     float sin_t = sinf(theta);
 
     int base = (t * n_heads + h) * head_dim;
-    float x0 = x[base + 2 * i];
-    float x1 = x[base + 2 * i + 1];
-    x[base + 2 * i]     = x0 * cos_t - x1 * sin_t;
-    x[base + 2 * i + 1] = x0 * sin_t + x1 * cos_t;
+    float x0 = x[base + i];
+    float x1 = x[base + i + half_dim];
+    x[base + i]            = x0 * cos_t - x1 * sin_t;
+    x[base + i + half_dim] = x0 * sin_t + x1 * cos_t;
 }
 
 // =================================================================

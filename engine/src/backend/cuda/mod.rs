@@ -12,7 +12,7 @@
 pub mod kernels;
 pub mod memory;
 
-use crate::buffer::cuda_buffer::{CudaBuffer, CudaHostBuffer};
+use crate::buffer::cuda_buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::tensor::Tensor;
@@ -59,6 +59,8 @@ pub struct CudaBackend {
     is_uma: bool,
     cublas: Arc<CublasHandle>,
     kernels: Arc<CudaKernels>,
+    /// Cached F16 cast buffer for matmul_transposed F32×F16 path.
+    cast_cache: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
 }
 
 impl CudaBackend {
@@ -98,11 +100,12 @@ impl CudaBackend {
             return Err(anyhow!("Device does not support managed (unified) memory"));
         }
 
-        // Check UMA (unified addressing)
-        let unified_addr = ctx
-            .attribute(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING)
+        // Check UMA: integrated GPU (e.g., Jetson) shares physical memory with CPU.
+        // CU_DEVICE_ATTRIBUTE_INTEGRATED = 1 means integrated (UMA), 0 means discrete.
+        let integrated = ctx
+            .attribute(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
             .unwrap_or(0);
-        let is_uma = unified_addr != 0;
+        let is_uma = integrated != 0;
 
         // Get device name
         let cu_device = cuda_result::device::get(ordinal as i32)
@@ -138,6 +141,7 @@ impl CudaBackend {
                 handle: cublas_handle,
             }),
             kernels: Arc::new(kernels),
+            cast_cache: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -168,6 +172,11 @@ impl CudaBackend {
                 buf.as_any()
                     .downcast_ref::<CudaBuffer>()
                     .map(|cb| cb.device_ptr())
+            })
+            .or_else(|| {
+                buf.as_any()
+                    .downcast_ref::<CudaDeviceBuffer>()
+                    .map(|db| db.device_ptr())
             })
     }
 
@@ -427,9 +436,17 @@ impl Backend for CudaBackend {
                 self.synchronize()?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
-                // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS
+                // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS.
+                // Reuse cached buffer to avoid per-call allocation.
                 let k_elements = (m * k) as usize;
-                let a_f16_buf = CudaHostBuffer::new(k_elements * 2, DType::F16)?;
+                let needed = k_elements * 2;
+                let a_f16_buf = {
+                    let mut cache = self.cast_cache.lock().unwrap();
+                    match cache.take() {
+                        Some(buf) if buf.size() >= needed => buf,
+                        _ => CudaHostBuffer::new(needed, DType::F16)?,
+                    }
+                };
                 let a_f16_ptr = a_f16_buf.device_ptr();
 
                 // Launch F32->F16 cast kernel
@@ -479,6 +496,7 @@ impl Backend for CudaBackend {
                     .map_err(|e| anyhow!("cublasGemmEx (F32->F16 x F16) failed: {e}"))?;
                 }
                 self.synchronize()?;
+                *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
             } else if a_dtype == DType::F16 && b_dtype == DType::F16 {
                 // Both F16: use GemmEx with F32 compute for accuracy
@@ -1082,8 +1100,11 @@ impl Backend for CudaBackend {
     }
 
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
-        // Sync before CPU reads: GPU kernels may have written to this buffer.
         self.synchronize()?;
+        if let Some(db) = t.buffer().as_any().downcast_ref::<CudaDeviceBuffer>() {
+            db.copy_to_host(dst.as_mut_ptr(), dst.len())?;
+            return Ok(());
+        }
         let src_ptr = t.buffer().as_ptr();
         if src_ptr.is_null() {
             anyhow::bail!("Cannot read null buffer");
@@ -1095,26 +1116,38 @@ impl Backend for CudaBackend {
     }
 
     fn copy_from(&self, src: &Tensor) -> Result<Tensor> {
-        self.synchronize()?; // GPU가 src에 쓴 데이터 완료 대기
+        self.synchronize()?;
         let size = src.size();
-        let cuda_buf = CudaHostBuffer::new(size, src.dtype())?;
-
-        // Copy data from source to pinned host memory.
-        // SAFETY: Both pointers are valid. src from any Buffer (CPU or GPU),
-        // dst from cuMemHostAlloc (valid host pointer, page-locked).
         let src_ptr = src.as_ptr();
-        let dst_ptr = cuda_buf.as_mut_ptr();
-        if !src_ptr.is_null() && !dst_ptr.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
-            }
-        }
 
-        // Return tensor with this backend. Clone is cheap (Arc refcounts).
-        Ok(Tensor::new(
-            src.shape().clone(),
-            Arc::new(cuda_buf),
-            Arc::new(self.clone()),
-        ))
+        if self.is_discrete_gpu() {
+            // Discrete GPU: use managed memory (cuMemAllocManaged).
+            // CUDA driver auto-migrates pages to VRAM on first GPU access.
+            let managed_buf = CudaBuffer::new(size, src.dtype())?;
+            if !src_ptr.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, managed_buf.as_mut_ptr(), size);
+                }
+            }
+            Ok(Tensor::new(
+                src.shape().clone(),
+                Arc::new(managed_buf),
+                Arc::new(self.clone()),
+            ))
+        } else {
+            // UMA (Jetson): pinned host memory is zero-copy.
+            let cuda_buf = CudaHostBuffer::new(size, src.dtype())?;
+            let dst_ptr = cuda_buf.as_mut_ptr();
+            if !src_ptr.is_null() && !dst_ptr.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+                }
+            }
+            Ok(Tensor::new(
+                src.shape().clone(),
+                Arc::new(cuda_buf),
+                Arc::new(self.clone()),
+            ))
+        }
     }
 }

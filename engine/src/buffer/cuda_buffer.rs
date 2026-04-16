@@ -281,6 +281,136 @@ impl Buffer for CudaHostBuffer {
     }
 }
 
+/// Pure device memory buffer (VRAM on discrete GPU).
+///
+/// Uses `cuMemAlloc` to allocate memory in GPU VRAM. Not host-accessible —
+/// `as_ptr()` returns null. Use `device_ptr()` for GPU kernel / cuBLAS calls.
+///
+/// This is optimal for read-only weight tensors on discrete GPUs where
+/// pinned host memory (CudaHostBuffer) would force every read over PCIe.
+pub struct CudaDeviceBuffer {
+    dev_ptr: cuda_sys::CUdeviceptr,
+    size: usize,
+    dtype: DType,
+}
+
+unsafe impl Send for CudaDeviceBuffer {}
+unsafe impl Sync for CudaDeviceBuffer {}
+
+impl CudaDeviceBuffer {
+    /// Allocate `size` bytes of device memory (VRAM).
+    pub fn new(size: usize, dtype: DType) -> Result<Self> {
+        if size == 0 {
+            return Err(anyhow!("CudaDeviceBuffer: cannot allocate 0 bytes"));
+        }
+        let dev_ptr = unsafe {
+            let mut ptr: cuda_sys::CUdeviceptr = 0;
+            let res = cuda_sys::cuMemAlloc_v2(&mut ptr, size);
+            if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuMemAlloc({size} bytes) failed: {:?}", res));
+            }
+            ptr
+        };
+        Ok(Self {
+            dev_ptr,
+            size,
+            dtype,
+        })
+    }
+
+    /// Copy data from host to this device buffer.
+    pub fn copy_from_host(&self, src: *const u8, len: usize) -> Result<()> {
+        if len > self.size {
+            return Err(anyhow!(
+                "CudaDeviceBuffer::copy_from_host: len {len} > size {}",
+                self.size
+            ));
+        }
+        unsafe {
+            let res = cuda_sys::cuMemcpyHtoD_v2(self.dev_ptr, src as *const std::ffi::c_void, len);
+            if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuMemcpyHtoD failed: {:?}", res));
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy data from this device buffer to host.
+    pub fn copy_to_host(&self, dst: *mut u8, len: usize) -> Result<()> {
+        if len > self.size {
+            return Err(anyhow!(
+                "CudaDeviceBuffer::copy_to_host: len {len} > size {}",
+                self.size
+            ));
+        }
+        unsafe {
+            let res = cuda_sys::cuMemcpyDtoH_v2(dst as *mut std::ffi::c_void, self.dev_ptr, len);
+            if res != cuda_sys::CUresult::CUDA_SUCCESS {
+                return Err(anyhow!("cuMemcpyDtoH failed: {:?}", res));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn device_ptr(&self) -> cuda_sys::CUdeviceptr {
+        self.dev_ptr
+    }
+}
+
+impl Drop for CudaDeviceBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = cuda_sys::cuMemFree_v2(self.dev_ptr);
+        }
+    }
+}
+
+impl Buffer for CudaDeviceBuffer {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Not host-accessible. Returns null.
+    fn as_ptr(&self) -> *const u8 {
+        std::ptr::null()
+    }
+
+    /// Not host-accessible. Returns null.
+    fn as_mut_ptr(&self) -> *mut u8 {
+        std::ptr::null_mut()
+    }
+
+    #[cfg(feature = "opencl")]
+    fn cl_mem(&self) -> Option<&ocl::core::Mem> {
+        None
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    fn cl_mem(&self) -> Option<()> {
+        None
+    }
+
+    fn sync_device(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn is_host_managed(&self) -> bool {
+        false
+    }
+
+    fn is_gpu_buffer(&self) -> bool {
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

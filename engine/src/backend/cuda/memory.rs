@@ -1,41 +1,56 @@
 //! CUDA memory allocator implementing the `Memory` trait.
 //!
-//! Phase 3: uses CudaHostBuffer (cuMemHostAlloc with DEVICEMAP) for pinned
-//! zero-copy buffers accessible from both CPU and GPU via cuBLAS.
+//! Two modes based on GPU type:
+//! - **UMA (Jetson)**: CudaHostBuffer (cuMemHostAlloc+DEVICEMAP) — zero-copy,
+//!   CPU and GPU share physical DRAM.
+//! - **Discrete GPU**: CudaBuffer (cuMemAllocManaged) — CUDA driver auto-migrates
+//!   pages to VRAM on GPU access, giving device-local bandwidth for activations.
+//!   CPU access (logit reads, sampling) triggers migration back, but these are
+//!   infrequent compared to the per-token GPU compute.
 
-use crate::buffer::cuda_buffer::CudaHostBuffer;
+use crate::buffer::cuda_buffer::{CudaBuffer, CudaHostBuffer};
 use crate::core::buffer::{Buffer, DType};
 use crate::core::memory::Memory;
 use anyhow::Result;
 use std::sync::Arc;
 
 /// Memory allocator for the CUDA backend.
-///
-/// Allocates pinned host memory (cuMemHostAlloc) with GPU device mapping.
-/// On Jetson (UMA), this provides zero-copy access from both CPU and GPU.
-/// The device pointer can be passed directly to cuBLAS for GPU-accelerated compute.
-pub struct CudaMemory;
+pub struct CudaMemory {
+    /// If true, use managed memory (discrete GPU). Otherwise pinned host (UMA).
+    use_managed: bool,
+}
 
 impl Default for CudaMemory {
     fn default() -> Self {
-        Self
+        Self {
+            use_managed: false,
+        }
     }
 }
 
 impl CudaMemory {
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Create allocator for discrete GPU — uses managed memory for activations.
+    pub fn managed() -> Self {
+        Self { use_managed: true }
     }
 }
 
 impl Memory for CudaMemory {
     fn alloc(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
-        let buf = CudaHostBuffer::new(size, dtype)?;
-        Ok(Arc::new(buf))
+        if self.use_managed {
+            let buf = CudaBuffer::new(size, dtype)?;
+            Ok(Arc::new(buf))
+        } else {
+            let buf = CudaHostBuffer::new(size, dtype)?;
+            Ok(Arc::new(buf))
+        }
     }
 
     fn used_memory(&self) -> usize {
-        // TODO: track cumulative allocations if needed for pressure monitoring.
         0
     }
 }
