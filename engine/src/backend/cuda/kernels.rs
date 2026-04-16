@@ -94,6 +94,8 @@ impl CudaKernels {
             "/usr/local/cuda-11.4/bin/nvcc".to_string()
         } else if std::path::Path::new("/usr/local/cuda/bin/nvcc").exists() {
             "/usr/local/cuda/bin/nvcc".to_string()
+        } else if std::path::Path::new("/opt/cuda/bin/nvcc").exists() {
+            "/opt/cuda/bin/nvcc".to_string() // Arch Linux default
         } else {
             "nvcc".to_string() // hope it's in PATH
         };
