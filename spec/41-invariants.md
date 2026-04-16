@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) = 총 88개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) = 총 100개.
 
 ## 1. Purpose and Scope
 
@@ -209,6 +209,16 @@
 | INV-115 | 22-manager-algorithms MGR-LUCB-030 | EWMA observe와 LinUCB update는 동일 시점에 호출된다. 학습 데이터 불일치 없음. | Correctness | test | 학습 데이터 일관성 |
 | INV-116 | 22-manager-algorithms MGR-LUCB-070 | `linucb_alpha=0`이면 DPP 결정은 §3.8과 비트 단위 동일 결과를 산출한다. | Correctness | test | INV-106 재확인, 런타임 fallback |
 
+### 3.11 QCF × DPP Quality Penalty Invariants [INV-117 ~ INV-119]
+
+2026-04 QCF × DPP 통합 (v2.2.0)의 불변식. 대응 명세: `22-manager-algorithms.md` 3.8절 (MGR-DPP-010, MGR-DPP-013, MGR-DPP-020). `policy_default.lua` v2.2.0 기준.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-117 | 22-manager-algorithms MGR-DPP-010 | QCF cache miss인 action의 qcf_cost는 0으로 처리한다 (score에서 penalty 없음). should_request_qcf()가 자동 선발행을 수행한다. | Correctness | test | cache miss fallback |
+| INV-118 | 22-manager-algorithms MGR-DPP-020 | Emergency level에서 quality floor은 비활성(∞)이다. lossy action이 항상 safe set에 포함될 수 있어야 한다. | Safety | test | Emergency escape hatch |
+| INV-119 | 22-manager-algorithms MGR-DPP-020 | pressure level이 높아질수록 quality floor이 완화된다 (0.30 → 0.60 → 0.90 → ∞). 압박이 심할수록 더 많은 품질 훼손을 허용한다. | Correctness | test | monotonic floor relaxation |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -237,13 +247,14 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 16 | 22% |
-| Correctness | 53 | 72% |
+| Safety | 17 | 22% |
+| Correctness | 55 | 71% |
 | Performance | 2 | 3% |
 | Compatibility | 3 | 4% |
-| **합계** | **74** | **100%** |
+| **합계** | **77** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
+> INV-117~119는 v2.2.0 (QCF × DPP)에서 추가.
 
 ### 5.2 검증 방법별 통계
 

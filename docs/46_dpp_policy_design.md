@@ -1072,4 +1072,89 @@ DPP 이론은 queue stability를 보장하지만, 실제 구현에서 **특정 d
 
 ---
 
+## 9. v2.2.0: QCF Quality Penalty 통합
+
+> **버전 이력**: v2.0.0 (§1~§8 본문) → v2.1.0 (LinUCB, `spec/22-manager-algorithms.md` §3.9) → **v2.2.0 (QCF × DPP, 이 절)**.
+
+### 9.1 동기
+
+v2.1.0(LinUCB) 이후 남은 문제: DPP는 latency penalty만 고려하며, action의 **품질 훼손 비용**을 무시한다.
+예: `kv_evict_sliding`과 `kv_quant_dynamic`은 latency 영향이 비슷해도 품질 훼손 정도가 매우 다를 수 있다.
+
+QCF(Quality Cost Function) — `engine/src/core/qcf/` — 가 각 action의 추정 품질 비용을 산출하는데,
+DPP가 이를 전혀 활용하지 않는 문제가 있었다.
+
+### 9.2 설계 결정: Lyapunov 다중 페널티 확장
+
+DPP score에 V_Q penalty 항을 추가하는 방식이 이론적으로 자연스럽다:
+
+```
+score(a) = Σ Z_k·r̂_k − V·ℓ + UCB·b − V_Q·qcf_cost(a)
+```
+
+- `V·ℓ`: latency 페널티 (기존)
+- `V_Q·qcf_cost`: quality 페널티 (신규)
+- 두 항은 동일한 Lyapunov 페널티 구조 → 이론 정합성 유지 (§1.1, §2 원칙 1 score linearity 위반 없음)
+
+#### 대안 검토
+
+| 옵션 | 설명 | 채택 여부 |
+|------|------|----------|
+| **A. V_Q penalty** | DPP score에 soft penalty 추가 + quality floor | **채택** |
+| B. Hard exclusion | qcf_cost > threshold이면 safe set에서 완전 제외 | 부분 채택 (level-dependent floor로 구현) |
+| C. qcf_cost를 relief로 취급 | 음의 relief domain으로 처리 | 기각 — Z_k=0이면 무시되어 Emergency 시 안전 보장 불가 |
+
+### 9.3 Level-Dependent Quality Floor
+
+단순 threshold 배제만으로는 Emergency 시 모든 lossy action이 배제될 위험이 있다.
+→ pressure level에 따라 floor를 완화:
+
+| Pressure Level | QCF_FLOOR |
+|----------------|-----------|
+| normal | 0.30 |
+| warning | 0.60 |
+| critical | 0.90 |
+| emergency | ∞ (비활성) |
+
+Emergency에서 floor = ∞는 "어떤 action도 quality 이유로 배제하지 않음"을 보장한다 (§2 원칙 4 seed safe action 존재성 유지, INV-118).
+
+단조 완화(INV-119): 압박이 심해질수록 허용 quality cost가 커진다.
+
+### 9.4 QCF 비동기성 처리
+
+`EngineStatus` heartbeat에 QCF 필드가 없으므로, HierarchicalPolicy의 "Critical 전환 엣지" 트리거를 직접 사용할 수 없다.
+
+**해법: pressure-delta TTL 캐싱**
+- 압박 존재 + cache stale(> `qcf_stale_secs=5초`) → `RequestQcf` 선발행
+- 응답 수신: cache 갱신, None 반환 → 다음 tick DPP에서 활용
+- 타임아웃(1초): pending 소거, 이전 cache 유지 (오래된 값이 없는 것보다 낫다)
+
+이 방식은 매 tick `decide()`가 호출되는 구조에서 "요청 tick → 응답 수신 tick → DPP 활용 tick"의 3-tick 지연을 허용한다.
+
+LuaPolicy 상태:
+- `qcf_cache: HashMap<String, (f32, LogicalInstant)>` — per-action TTL cache
+- `qcf_pending_at: Option<LogicalInstant>` — 중복 요청 방지
+
+cache miss는 qcf_cost=0으로 처리되어 penalty 없음 (INV-117). 이는 "정보 부재 = 탐색 선행 필요"라는 원칙을 `should_request_qcf()`의 자동 선발행으로 우회한다.
+
+### 9.5 Dead Action 문제
+
+V_Q penalty가 크면 특정 action이 항상 낮은 score를 받아 LinUCB P matrix가 업데이트되지 않는다.
+이는 cold-start 후 해당 action에 대한 신뢰구간이 수렴하지 않는 "dead action" 문제이다.
+
+**완화 전략**:
+- `V_Q = 0`으로 설정 시 QCF penalty 완전 비활성 + RequestQcf 중단 (`should_request_qcf()` false 반환)
+- quality floor이 Emergency에서 비활성화되므로 극한 상황에서 모든 action이 탐색 가능
+- 향후: QCF penalty 독립 exploration (LinUCB를 quality axis에서도 적용) — 현재 미구현
+
+### 9.6 구현 참조
+
+- Rust: `manager/src/lua_policy.rs` — `qcf_cache`, `qcf_pending_at`, `should_request_qcf()`, `complete_qcf_selection()`, `check_qcf_timeout()`, `build_ctx()`의 `qcf_cost`/`qcf_age_s` 노출
+- Config: `manager/src/config.rs` — `V_Q` (기본 0.5), `qcf_stale_secs` (기본 5.0)
+- Lua: `manager/scripts/policy_default.lua` v2.2.0 — `QCF_FLOOR` 테이블, safe set filter, score 식
+- Spec: `spec/22-manager-algorithms.md` §3.8 MGR-DPP-010/013/020 (v2.2.0 업데이트)
+- Invariants: INV-117 (cache miss = 0), INV-118 (Emergency 비활성), INV-119 (단조 완화)
+
+---
+
 **문서 끝. 피드백은 `.agent/todos/architect.md`로.**
