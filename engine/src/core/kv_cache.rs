@@ -425,8 +425,11 @@ impl KVCache {
             None => return Ok(0),
         };
 
-        // Only shrink if using less than half capacity (avoid thrashing)
-        let new_cap = self.current_pos.next_power_of_two().max(64);
+        // Compute target capacity: 1.5x current_pos, 64-aligned, minimum 64.
+        // Using 1.5x headroom (instead of next_power_of_two) avoids edge cases where
+        // e.g. current_pos=2049 rounds up to 4096 and prevents any shrink.
+        let new_cap = ((self.current_pos * 3 / 2) + 63) & !63;
+        let new_cap = new_cap.max(64);
         if new_cap >= self.capacity {
             return Ok(0);
         }
@@ -903,7 +906,8 @@ impl KVCache {
     pub fn release_unused_pages(&mut self) -> usize {
         // Shrink buffers when significantly underutilized (works for any buffer type).
         // Reallocates smaller buffers, guaranteeing physical memory release.
-        if self.memory.is_some() && self.current_pos < self.capacity / 2 {
+        // Threshold: 75% — e.g. H2O keep_ratio=0.5 evicts to capacity/2, which now triggers shrink.
+        if self.memory.is_some() && self.current_pos * 4 < self.capacity * 3 {
             return self.shrink_to_fit().unwrap_or_else(|e| {
                 eprintln!("[KVCache] shrink_to_fit failed: {}", e);
                 0

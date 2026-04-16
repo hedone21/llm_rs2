@@ -17,7 +17,7 @@
 //! CPU-only mode is fully preserved for backward compatibility.
 
 use crate::backend::cpu::CpuBackend;
-use crate::buffer::shared_buffer::SharedBuffer;
+use crate::buffer::shared_buffer::{SharedBuffer, SharedBufferView};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout, KiviRawBuffers};
@@ -215,9 +215,10 @@ pub struct KiviCache {
     /// Residual buffer capacity (R). Must be a multiple of QKKV (32).
     res_cap: usize,
 
-    // Pre-allocated output buffers for assemble_view() dequantization
-    attn_k_buf: Vec<f32>,
-    attn_v_buf: Vec<f32>,
+    // Pre-allocated output buffers for assemble_view() dequantization.
+    // Arc<SharedBuffer> enables zero-copy get_view(): Arc::clone instead of memcpy.
+    attn_k_buf: Arc<SharedBuffer>,
+    attn_v_buf: Arc<SharedBuffer>,
 
     /// Number of quantized tokens already dequantized into attn_k_buf/attn_v_buf.
     /// Enables incremental dequantization — only new flushes are processed.
@@ -271,6 +272,54 @@ pub struct KiviCache {
 }
 
 impl KiviCache {
+    // ── SharedBuffer ↔ f32 slice helpers ─────────────────────────────────────
+
+    /// Return the attn_k_buf contents as a `&[f32]` slice (len = byte_size / 4).
+    #[allow(dead_code)]
+    fn attn_k_as_slice(&self) -> &[f32] {
+        let len = self.attn_k_buf.size() / 4;
+        if len == 0 {
+            return &[];
+        }
+        // SAFETY: SharedBuffer is allocated as DType::F32 with size = len*4 bytes.
+        // The pointer is valid for `len` f32 elements.
+        unsafe { std::slice::from_raw_parts(self.attn_k_buf.as_ptr() as *const f32, len) }
+    }
+
+    /// Return the attn_v_buf contents as a `&[f32]` slice.
+    #[allow(dead_code)]
+    fn attn_v_as_slice(&self) -> &[f32] {
+        let len = self.attn_v_buf.size() / 4;
+        if len == 0 {
+            return &[];
+        }
+        unsafe { std::slice::from_raw_parts(self.attn_v_buf.as_ptr() as *const f32, len) }
+    }
+
+    /// Return the attn_k_buf contents as a `&mut [f32]` slice.
+    ///
+    /// SAFETY: Caller must ensure no aliasing references exist. In practice,
+    /// this is only called from `&mut self` methods (assemble_view, reset, etc.)
+    /// where the borrow checker guarantees exclusive access to `self`.
+    fn attn_k_as_slice_mut(&mut self) -> &mut [f32] {
+        let len = self.attn_k_buf.size() / 4;
+        if len == 0 {
+            return &mut [];
+        }
+        // SAFETY: SharedBuffer::as_mut_ptr() returns a valid writable pointer.
+        // We have &mut self, so no other references to this buffer exist.
+        unsafe { std::slice::from_raw_parts_mut(self.attn_k_buf.as_mut_ptr() as *mut f32, len) }
+    }
+
+    /// Return the attn_v_buf contents as a `&mut [f32]` slice.
+    fn attn_v_as_slice_mut(&mut self) -> &mut [f32] {
+        let len = self.attn_v_buf.size() / 4;
+        if len == 0 {
+            return &mut [];
+        }
+        unsafe { std::slice::from_raw_parts_mut(self.attn_v_buf.as_mut_ptr() as *mut f32, len) }
+    }
+
     /// Create a new KiviCache with specified bit-width.
     ///
     /// - `kv_heads`: number of KV heads
@@ -325,8 +374,8 @@ impl KiviCache {
             res_v: vec![0.0; res_elems],
             res_pos: 0,
             res_cap: actual_res_cap,
-            attn_k_buf: vec![0.0; attn_buf_size],
-            attn_v_buf: vec![0.0; attn_buf_size],
+            attn_k_buf: Arc::new(SharedBuffer::new(attn_buf_size * 4, DType::F32)),
+            attn_v_buf: Arc::new(SharedBuffer::new(attn_buf_size * 4, DType::F32)),
             q2_deq_tokens: 0,
             out_backend: Arc::new(CpuBackend::new()),
             kv_heads,
@@ -540,8 +589,8 @@ impl KiviCache {
                 // attn_k_buf/attn_v_buf are replaced by gpu_attn_k/gpu_attn_v.
                 // qk/qv are replaced by gpu_q2k/gpu_q2v.
                 // res_k/res_v are KEPT -- needed for CPU quantization during flush.
-                cache.attn_k_buf = Vec::new();
-                cache.attn_v_buf = Vec::new();
+                cache.attn_k_buf = Arc::new(SharedBuffer::new(0, DType::F32));
+                cache.attn_v_buf = Arc::new(SharedBuffer::new(0, DType::F32));
                 cache.qk = QuantizedBlocks::empty(bits);
                 cache.qv = QuantizedBlocks::empty(bits);
 
@@ -704,8 +753,7 @@ impl KiviCache {
     ///
     /// Counts capacity of attn_k_buf/attn_v_buf, res_k/res_v, and qk/qv.
     pub fn cpu_memory_bytes(&self) -> usize {
-        let attn_bytes =
-            (self.attn_k_buf.capacity() + self.attn_v_buf.capacity()) * std::mem::size_of::<f32>();
+        let attn_bytes = self.attn_k_buf.size() + self.attn_v_buf.size();
         let res_bytes =
             (self.res_k.capacity() + self.res_v.capacity()) * std::mem::size_of::<f32>();
         let q_bytes = self.qk.capacity_bytes() + self.qv.capacity_bytes();
@@ -816,15 +864,15 @@ impl KiviCache {
             // Only clear CPU residual (still used for flush quantization).
             self.qk = QuantizedBlocks::empty(self.bits);
             self.qv = QuantizedBlocks::empty(self.bits);
-            // attn_k_buf/attn_v_buf stay as empty Vecs (no allocation)
-            debug_assert_eq!(self.attn_k_buf.capacity(), 0);
-            debug_assert_eq!(self.attn_v_buf.capacity(), 0);
+            // attn_k_buf/attn_v_buf stay as empty SharedBuffers (no allocation)
+            debug_assert_eq!(self.attn_k_buf.size(), 0);
+            debug_assert_eq!(self.attn_v_buf.size(), 0);
         } else {
             // CPU mode: zero-fill to reuse allocations
             self.qk.clear();
             self.qv.clear();
-            self.attn_k_buf.fill(0.0);
-            self.attn_v_buf.fill(0.0);
+            self.attn_k_as_slice_mut().fill(0.0);
+            self.attn_v_as_slice_mut().fill(0.0);
         }
         self.q2_tokens = 0;
         self.res_k.fill(0.0);
@@ -1064,6 +1112,17 @@ impl KiviCache {
                 // CPU mode: use self.attn_k_buf/attn_v_buf as before
                 self.assemble_view();
 
+                // Obtain raw slices to break the borrow: attn buffers are read-only here,
+                // res_k/res_v are written. They are disjoint allocations.
+                let attn_k_len = self.attn_k_buf.size() / 4;
+                let attn_v_len = self.attn_v_buf.size() / 4;
+                let attn_k = unsafe {
+                    std::slice::from_raw_parts(self.attn_k_buf.as_ptr() as *const f32, attn_k_len)
+                };
+                let attn_v = unsafe {
+                    std::slice::from_raw_parts(self.attn_v_buf.as_ptr() as *const f32, attn_v_len)
+                };
+
                 self.res_k.resize(new_elems, 0.0);
                 self.res_v.resize(new_elems, 0.0);
 
@@ -1073,9 +1132,9 @@ impl KiviCache {
                         let attn_idx = t * self.kv_heads * self.head_dim + h * self.head_dim;
                         let res_idx = res_base + t * self.head_dim;
                         self.res_k[res_idx..res_idx + self.head_dim]
-                            .copy_from_slice(&self.attn_k_buf[attn_idx..attn_idx + self.head_dim]);
+                            .copy_from_slice(&attn_k[attn_idx..attn_idx + self.head_dim]);
                         self.res_v[res_idx..res_idx + self.head_dim]
-                            .copy_from_slice(&self.attn_v_buf[attn_idx..attn_idx + self.head_dim]);
+                            .copy_from_slice(&attn_v[attn_idx..attn_idx + self.head_dim]);
                     }
                 }
             }
@@ -1428,6 +1487,18 @@ impl KiviCache {
         let gs = self.group_size;
         let groups_per_flush = self.res_cap / gs;
 
+        // Obtain raw f32 pointers to the SharedBuffer-backed attn buffers.
+        // SAFETY: We have &mut self, so exclusive access is guaranteed.
+        // The buffers are allocated as DType::F32 with size = max_seq * kv_heads * head_dim * 4.
+        let attn_k_len = self.attn_k_buf.size() / 4;
+        let attn_v_len = self.attn_v_buf.size() / 4;
+        let attn_k = unsafe {
+            std::slice::from_raw_parts_mut(self.attn_k_buf.as_mut_ptr() as *mut f32, attn_k_len)
+        };
+        let attn_v = unsafe {
+            std::slice::from_raw_parts_mut(self.attn_v_buf.as_mut_ptr() as *mut f32, attn_v_len)
+        };
+
         // === Incremental quantized dequantization (only new flushes) ===
         if self.q2_tokens > self.q2_deq_tokens {
             debug_assert!(
@@ -1462,7 +1533,7 @@ impl KiviCache {
                                 let pos = tok_start + t;
                                 let out_idx =
                                     pos * self.kv_heads * self.head_dim + h * self.head_dim + ch;
-                                self.attn_k_buf[out_idx] = val;
+                                attn_k[out_idx] = val;
                             }
                         }
                     }
@@ -1477,7 +1548,7 @@ impl KiviCache {
                             self.qv.dequantize_block(v_block_idx, &mut deq_buf);
                             v_block_idx += 1;
                             let start = out_base + b * QKKV;
-                            self.attn_v_buf[start..start + QKKV].copy_from_slice(&deq_buf);
+                            attn_v[start..start + QKKV].copy_from_slice(&deq_buf);
                         }
                     }
                 }
@@ -1495,9 +1566,9 @@ impl KiviCache {
                     let pos = token_offset + t;
                     let out_base = pos * self.kv_heads * self.head_dim + h * self.head_dim;
                     let res_start = res_base + t * self.head_dim;
-                    self.attn_k_buf[out_base..out_base + self.head_dim]
+                    attn_k[out_base..out_base + self.head_dim]
                         .copy_from_slice(&self.res_k[res_start..res_start + self.head_dim]);
-                    self.attn_v_buf[out_base..out_base + self.head_dim]
+                    attn_v[out_base..out_base + self.head_dim]
                         .copy_from_slice(&self.res_v[res_start..res_start + self.head_dim]);
                 }
             }
@@ -2296,27 +2367,25 @@ impl KVCacheOps for KiviCache {
         // Incremental assemble (only dequantize new Q2 flushes + copy residual)
         self.assemble_view();
 
-        let buf_size = total * self.kv_heads * self.head_dim;
-        let byte_size = buf_size * 4;
         let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
 
-        let k_buf = Arc::new(SharedBuffer::new(byte_size, DType::F32));
-        let v_buf = Arc::new(SharedBuffer::new(byte_size, DType::F32));
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                self.attn_k_buf.as_ptr(),
-                k_buf.as_mut_ptr() as *mut f32,
-                buf_size,
-            );
-            std::ptr::copy_nonoverlapping(
-                self.attn_v_buf.as_ptr(),
-                v_buf.as_mut_ptr() as *mut f32,
-                buf_size,
-            );
-        }
-
-        let k_tensor = Tensor::new(shape.clone(), k_buf, backend.clone());
-        let v_tensor = Tensor::new(shape, v_buf, backend);
+        // Zero-copy: create a view into the pre-allocated attn buffers.
+        // SharedBufferView holds an Arc to keep the backing buffer alive, and
+        // exposes only the valid region (total * kv_heads * head_dim * 4 bytes).
+        // This eliminates the per-token memcpy + malloc that was the bottleneck.
+        let valid_bytes = total * self.kv_heads * self.head_dim * 4;
+        let k_view = Arc::new(SharedBufferView::new(
+            self.attn_k_buf.clone(),
+            valid_bytes,
+            DType::F32,
+        ));
+        let v_view = Arc::new(SharedBufferView::new(
+            self.attn_v_buf.clone(),
+            valid_bytes,
+            DType::F32,
+        ));
+        let k_tensor = Tensor::new(shape.clone(), k_view, backend.clone());
+        let v_tensor = Tensor::new(shape, v_view, backend);
 
         (k_tensor, v_tensor)
     }
@@ -3066,7 +3135,10 @@ mod tests {
         assert_eq!(cache.q2_tokens, 64);
 
         let (k4, _) = cache.get_view();
-        let k4_data = k4.as_slice::<f32>();
+        // Clone the data: zero-copy get_view shares the internal buffer, so
+        // subsequent assemble_view() calls (e.g. from transition_bits) would
+        // overwrite the data visible through this tensor.
+        let k4_data: Vec<f32> = k4.as_slice::<f32>()[..n_q].to_vec();
 
         // Q4 should be close to Q8 (some error from requant)
         let mse_8_to_4: f32 = k8_data
@@ -3081,7 +3153,7 @@ mod tests {
         assert_eq!(cache.bits(), 2);
 
         let (k2, _) = cache.get_view();
-        let k2_data = k2.as_slice::<f32>();
+        let k2_data: Vec<f32> = k2.as_slice::<f32>()[..n_q].to_vec();
 
         let mse_4_to_2: f32 = k4_data
             .iter()
@@ -3698,10 +3770,10 @@ mod tests {
         let cache_cpu = KiviCache::new_gpu(2, 64, 256, 32, 2, cpu_backend, memory);
         assert!(!cache_cpu.is_gpu());
         // CPU mode: attn_k_buf/attn_v_buf should be fully allocated
-        let attn_cap = cache_cpu.attn_k_buf.capacity() + cache_cpu.attn_v_buf.capacity();
+        let attn_cap = cache_cpu.attn_k_buf.size() + cache_cpu.attn_v_buf.size();
         assert!(
             attn_cap > 0,
-            "CPU mode must have allocated attn buffers, got capacity=0"
+            "CPU mode must have allocated attn buffers, got size=0"
         );
 
         // For a true GPU cache we can only test with OpenCL backend on device.
@@ -3784,13 +3856,13 @@ mod tests {
         let res_cap = 32;
 
         let mut cache = KiviCache::new(kv_heads, head_dim, max_seq, res_cap);
-        let cap_before = cache.attn_k_buf.capacity();
+        let size_before = cache.attn_k_buf.size();
         cache.reset();
-        let cap_after = cache.attn_k_buf.capacity();
-        // CPU mode: capacity must not change (fill, not reallocate)
+        let size_after = cache.attn_k_buf.size();
+        // CPU mode: size must not change (fill, not reallocate)
         assert_eq!(
-            cap_before, cap_after,
-            "CPU mode reset() must not change attn_k_buf capacity"
+            size_before, size_after,
+            "CPU mode reset() must not change attn_k_buf size"
         );
     }
 

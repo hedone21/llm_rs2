@@ -3,6 +3,7 @@ use anyhow::Result;
 #[cfg(feature = "opencl")]
 use ocl::core::Mem;
 use std::any::Any;
+use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct SharedBuffer {
@@ -48,6 +49,85 @@ impl Buffer for SharedBuffer {
         // But Buffer trait demands &self -> *mut u8 which implies internal mutability or unsafety
         // Typically Buffer is Arc-ed and used carefully.
         self.data.as_ptr() as *mut u8
+    }
+
+    #[cfg(feature = "opencl")]
+    fn cl_mem(&self) -> Option<&Mem> {
+        None
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    fn cl_mem(&self) -> Option<()> {
+        None
+    }
+
+    fn sync_device(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// A zero-copy view into a region of a `SharedBuffer`.
+///
+/// Holds an `Arc<SharedBuffer>` to keep the backing memory alive.
+/// `size()` returns only the view length (not the full buffer).
+/// Used by KiviCache `get_view()` to return Tensors that share the
+/// pre-allocated attn buffer without memcpy.
+#[derive(Debug)]
+pub struct SharedBufferView {
+    /// Backing buffer (kept alive via Arc).
+    _backing: Arc<SharedBuffer>,
+    /// Pointer to the start of the viewed region.
+    ptr: *const u8,
+    /// Size of the viewed region in bytes.
+    len: usize,
+    dtype: DType,
+}
+
+// SAFETY: SharedBufferView holds a raw pointer derived from SharedBuffer's Vec<u8>,
+// which is Send+Sync. The Arc keeps the allocation alive.
+unsafe impl Send for SharedBufferView {}
+unsafe impl Sync for SharedBufferView {}
+
+impl SharedBufferView {
+    /// Create a view of `byte_len` bytes starting at byte offset 0 of `backing`.
+    ///
+    /// # Panics
+    /// Panics if `byte_len > backing.size()`.
+    pub fn new(backing: Arc<SharedBuffer>, byte_len: usize, dtype: DType) -> Self {
+        assert!(
+            byte_len <= backing.size(),
+            "SharedBufferView len ({byte_len}) exceeds backing size ({})",
+            backing.size()
+        );
+        let ptr = backing.as_ptr();
+        Self {
+            _backing: backing,
+            ptr,
+            len: byte_len,
+            dtype,
+        }
+    }
+}
+
+impl Buffer for SharedBufferView {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn size(&self) -> usize {
+        self.len
+    }
+
+    fn as_ptr(&self) -> *const u8 {
+        self.ptr
+    }
+
+    fn as_mut_ptr(&self) -> *mut u8 {
+        self.ptr as *mut u8
     }
 
     #[cfg(feature = "opencl")]
