@@ -1069,6 +1069,40 @@ function get_qcf_values(registry) -> map of ActionId to float:
 
 > **참고 (non-normative)**: QCF 실시간 보고가 Engine에 구현되면, 이 proxy는 Engine이 보고한 QCF 값으로 대체될 예정이다.
 
+> **LuaPolicy 경로 (2026-04-16)**: LuaPolicy에서는 실시간 QCF 통합(MGR-ALG-073)으로 대체됨. HierarchicalPolicy에서만 proxy 동작 유지.
+
+#### MGR-ALG-073: LuaPolicy QCF 통합
+
+트리거 조건: *(SHOULD)*
+
+```
+qcf_pending_at is None
+AND (memory_pressure >= 0.6 OR cpu_pct >= 70.0 OR thermal_normalized >= 0.7)
+AND (qcf_cache is empty OR any entry older than qcf_stale_secs)
+
+→ RequestQcf 발행, qcf_pending_at = now()
+```
+
+cache 관리:
+
+```
+complete_qcf_selection(qcf):
+    qcf_pending_at = None
+    qcf_cache[name] = (cost, now()) for each entry in qcf.estimates
+
+check_qcf_timeout():
+    elapsed >= 1.0s → qcf_pending_at = None (cache 유지)
+```
+
+DPP score 반영 (`policy_default.lua` v2.2.0):
+
+```
+r[action].qcf_cost = qcf_cache[action].cost  (없으면 0)
+score(a) = Σ Z_k·r̂_k − V·ℓ + UCB·bonus − V_Q·qcf_cost
+safe set 추가 조건: qcf_cost(a) ≤ QCF_FLOOR[lvl]
+QCF_FLOOR: normal=0.30 / warning=0.60 / critical=0.90 / emergency=∞
+```
+
 #### MGR-ALG-072: Full Pipeline Example Trace
 
 ```

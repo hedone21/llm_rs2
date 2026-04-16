@@ -34,8 +34,13 @@ fn write_script(body: &str) -> tempfile::NamedTempFile {
 
 fn new_policy(script: &str) -> (LuaPolicy, tempfile::NamedTempFile) {
     let f = write_script(script);
-    let p = LuaPolicy::with_system_clock(f.path().to_str().unwrap(), AdaptationConfig::default())
-        .unwrap();
+    // qcf_penalty_weight=0.0 으로 QCF 선발행 로직을 비활성화한다.
+    // 이 파일의 테스트는 ctx.engine / ctx.signal 매핑만 검증하므로 QCF 경로가 개입하면 안 된다.
+    let config = AdaptationConfig {
+        qcf_penalty_weight: 0.0,
+        ..AdaptationConfig::default()
+    };
+    let p = LuaPolicy::with_system_clock(f.path().to_str().unwrap(), config).unwrap();
     (p, f)
 }
 

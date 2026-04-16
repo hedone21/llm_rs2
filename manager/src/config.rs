@@ -210,6 +210,14 @@ pub struct AdaptationConfig {
     /// LinUCB UCB 탐색 가중치 (0 = 비활성, 기본 0.5).
     #[serde(default = "default_linucb_alpha")]
     pub linucb_alpha: f32,
+
+    /// QCF quality penalty weight in DPP score (V_Q). 0 = 비활성. 기본 0.5.
+    #[serde(default = "default_qcf_penalty_weight")]
+    pub qcf_penalty_weight: f32,
+
+    /// QCF cache TTL (초). 초과 시 stale로 판단해 재요청. 기본 5.0.
+    #[serde(default = "default_qcf_stale_secs")]
+    pub qcf_stale_secs: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -242,6 +250,8 @@ impl Default for AdaptationConfig {
             dedup_cooldown_secs: 60.0,
             persist_interval_secs: 300.0,
             linucb_alpha: 0.5,
+            qcf_penalty_weight: default_qcf_penalty_weight(),
+            qcf_stale_secs: default_qcf_stale_secs(),
         }
     }
 }
@@ -298,6 +308,12 @@ fn default_persist_interval_secs() -> f64 {
 }
 fn default_linucb_alpha() -> f32 {
     0.5
+}
+fn default_qcf_penalty_weight() -> f32 {
+    0.5
+}
+fn default_qcf_stale_secs() -> f64 {
+    5.0
 }
 
 #[cfg(feature = "hierarchical")]

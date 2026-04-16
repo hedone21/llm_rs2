@@ -11,6 +11,11 @@
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
+--   2.2.0 (2026-04-16): QCF quality penalty 통합
+--     - DPP score에 quality penalty 항 추가: score -= DPP.V_Q * r.qcf_cost
+--     - level-dependent quality floor: QCF_FLOOR[lvl] 초과 시 safe set 제외
+--     - Emergency에서는 QCF floor 비활성 (lossy action 반드시 허용)
+--     - Rust LuaPolicy가 RequestQcf 자동 트리거 + cache 관리
 --   2.1.0 (2026-04-15): LinUCB exploration bonus 추가
 --     - DPP score에 UCB bonus 항 추가: score += DPP.UCB * r.ucb_bonus
 --     - Rust LinUcbTable이 feature vector 기반 P matrix 관리 (13D)
@@ -24,7 +29,7 @@
 --   1.0.1 (2026-04-15): pressure_level 임계값 정렬
 --   1.0.0 (2026-04-15): initial production policy
 
-POLICY_META = { name = "llm_default", version = "2.1.0" }
+POLICY_META = { name = "llm_default", version = "2.2.0" }
 
 -- ── DPP 상수 (docs/46 §4) ──────────────────────────────────────────────────
 local DPP = {
@@ -35,6 +40,7 @@ local DPP = {
     W_CRIT      = 2.0,
     W_EMERG     = 4.0,
     UCB         = 1.0,   -- LinUCB exploration bonus weight
+    V_Q         = 0.5,   -- QCF quality penalty weight (Lyapunov multi-penalty extension)
 }
 
 -- Per-domain threshold (Rust Monitor defaults에 정렬, §4.2.4)
@@ -46,6 +52,15 @@ local THETA = {
     cpu   = { warn = 0.70, crit = 0.85, emerg = 0.95 },
     gpu   = { warn = 0.70, crit = 0.85, emerg = 0.95 },
     therm = { warn = 0.70, crit = 0.85, emerg = 0.95 },
+}
+
+-- QCF quality floor: level별 최대 허용 qcf_cost (초과 시 safe set 제외)
+-- Emergency = math.huge → QCF floor 비활성 (lossy action 반드시 허용)
+local QCF_FLOOR = {
+    normal    = 0.30,
+    warning   = 0.60,
+    critical  = 0.90,
+    emergency = math.huge,
 }
 
 -- DPP 도메인 키 → ctx.coef.pressure 키 매핑
@@ -220,27 +235,34 @@ function decide(ctx)
         end
     end
 
-    -- 6. DPP score argmax: score = Σ_k Z_k·r_k(a) − V·max(-lat,0) (§4.1)
+    -- 6. DPP score argmax: score = Σ_k Z_k·r_k(a) − V·max(-lat,0) − V_Q·qcf_cost (§4.1)
     local best_action, best_score = nil, -math.huge
+    local q_floor = QCF_FLOOR[lvl] or math.huge
     for _, cand in ipairs(candidates) do
         local r   = cand.relief
         local lat = r.lat or 0
         -- hard floor 검사 (safe set, 원칙 3)
         if lat >= lat_floor then
-            -- resource term: Σ_k Z_k · r[domain_k]
-            local resource_term = 0
-            for dkey, zv in pairs(Z) do
-                if zv > 0 then
-                    resource_term = resource_term + zv * (r[PRESSURE_KEY[dkey]] or 0)
+            -- QCF quality floor 검사 (level-dependent, Emergency에서는 비활성)
+            local qcf = r.qcf_cost or 0
+            if qcf <= q_floor then
+                -- resource term: Σ_k Z_k · r[domain_k]
+                local resource_term = 0
+                for dkey, zv in pairs(Z) do
+                    if zv > 0 then
+                        resource_term = resource_term + zv * (r[PRESSURE_KEY[dkey]] or 0)
+                    end
                 end
-            end
-            -- latency soft penalty: V · max(-lat, 0)
-            local latency_penalty = (lat < 0) and (DPP.V * (-lat)) or 0
-            local score = resource_term - latency_penalty + DPP.UCB * (r.ucb_bonus or 0)
+                -- latency soft penalty: V · max(-lat, 0)
+                local latency_penalty = (lat < 0) and (DPP.V * (-lat)) or 0
+                local score = resource_term - latency_penalty
+                           + DPP.UCB * (r.ucb_bonus or 0)
+                           - DPP.V_Q * qcf
 
-            if score > best_score then
-                best_action = cand.name
-                best_score  = score
+                if score > best_score then
+                    best_action = cand.name
+                    best_score  = score
+                end
             end
         end
     end

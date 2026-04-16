@@ -2,6 +2,8 @@
 kv_quality = ["kv_evict_sliding", "kv_evict_h2o", "kv_merge_d2o", "kv_quant_dynamic"]
 
 [adaptation]
+qcf_penalty_weight = 0.5   # QCF quality penalty weight (V_Q in DPP)
+qcf_stale_secs = 5.0       # QCF cache TTL seconds
 ewma_alpha = 0.875
 relief_table_path = ""
 temp_safe_c = 35.0

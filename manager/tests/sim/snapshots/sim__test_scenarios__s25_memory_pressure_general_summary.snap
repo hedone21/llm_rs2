@@ -1,6 +1,5 @@
 ---
 source: manager/tests/sim/test_scenarios.rs
-assertion_line: 614
 expression: summary
 ---
 duration_s: 30
@@ -10,10 +9,14 @@ signal_count_by_kind:
   energy_constraint: 15
   memory_pressure: 60
   thermal_alert: 30
-directive_count: 1
+directive_count: 42
 directive_kinds:
-  KvQuantDynamic: 1
-first_directive_at_s: 7.5
+  KvEvictH2o: 5
+  KvEvictSliding: 3
+  KvMergeD2o: 6
+  KvQuantDynamic: 9
+  RequestQcf: 19
+first_directive_at_s: 0.5
 state_final:
   kv_cache_bytes_mib: 795.11
   device_memory_used_mb: 11326.9

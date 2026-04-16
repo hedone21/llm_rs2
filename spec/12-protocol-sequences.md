@@ -409,7 +409,9 @@ Manager                                    Engine
   │                                          │
 ```
 
-**[SEQ-095]** Manager는 Supervisory가 Critical 모드로 전환할 때 `RequestQcf`를 포함한 Directive를 전송한다. *(MUST)*
+**[SEQ-095]** Manager는 정책 판정에 따라 `RequestQcf`를 포함한 Directive를 전송한다.
+- HierarchicalPolicy: Supervisory가 Critical 모드로 전환할 때 *(MUST)*
+- LuaPolicy: 자원 압박 감지 시 QCF cache stale 여부에 따라 *(SHOULD)*
 
 **[SEQ-096]** Engine은 RequestQcf Directive에 대해 먼저 CommandResponse(Ok)를 전송하고, 그 다음 QcfEstimate를 별도 EngineMessage로 전송한다. 순서: Response → QcfEstimate. *(MUST)*
 

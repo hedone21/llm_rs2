@@ -195,11 +195,15 @@ mod ewma_tests {
         let script_path = dir.path().join("multi_cmd.lua");
         std::fs::write(&script_path, script).unwrap();
 
-        let mut policy = LuaPolicy::with_system_clock(
-            script_path.to_str().unwrap(),
-            AdaptationConfig::default(),
-        )
-        .unwrap();
+        // qcf_penalty_weight=0.0 으로 QCF 선발행 로직을 비활성화한다.
+        // 이 테스트는 multi-command observation 생성 안 됨을 검증하므로
+        // QCF RequestQcf가 먼저 개입하면 안 된다.
+        let config = AdaptationConfig {
+            qcf_penalty_weight: 0.0,
+            ..AdaptationConfig::default()
+        };
+        let mut policy =
+            LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
 
         let signal = SystemSignal::MemoryPressure {
             level: llm_shared::Level::Warning,

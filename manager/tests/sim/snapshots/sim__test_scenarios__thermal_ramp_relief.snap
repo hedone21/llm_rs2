@@ -3,9 +3,9 @@ source: manager/tests/sim/test_scenarios.rs
 expression: formatted
 ---
 throttle:
+  - -0.003
+  - 0.002
   - 0
-  - -0
   - 0
-  - 0
-  - 0
+  - 0.352
   - 0

@@ -11,7 +11,9 @@
 //! restricted to the `sys.*` helpers registered by Rust (read-only sysfs/procfs
 //! access).  Memory is capped at 4 MB.
 
-use llm_shared::{EngineCommand, EngineDirective, EngineMessage, EngineStatus, SystemSignal};
+use llm_shared::{
+    EngineCommand, EngineDirective, EngineMessage, EngineStatus, QcfEstimate, SystemSignal,
+};
 use mlua::{Lua, Result as LuaResult, StdLib, Table, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -511,6 +513,14 @@ pub struct LuaPolicy {
     feature_state: [f32; LINUCB_FEATURE_DIM],
     /// LinUCB UCB 탐색 가중치 (config.linucb_alpha).
     linucb_alpha: f32,
+    /// QCF cost cache: action_name → (cost, observed_at)
+    qcf_cache: HashMap<String, (f32, LogicalInstant)>,
+    /// RequestQcf 발행 시각. None이면 pending 없음.
+    qcf_pending_at: Option<LogicalInstant>,
+    /// QCF quality penalty weight (V_Q). config에서 주입.
+    qcf_penalty_weight: f32,
+    /// QCF cache TTL (초). 초과 시 stale로 판단해 재요청.
+    qcf_stale_secs: f64,
     observations: VecDeque<ObservationContext>,
     adaptation_config: AdaptationConfig,
     clock: Arc<dyn Clock>,
@@ -658,6 +668,10 @@ impl LuaPolicy {
             linucb: LinUcbTable::new(),
             feature_state: [0.0f32; LINUCB_FEATURE_DIM],
             linucb_alpha: config.linucb_alpha,
+            qcf_cache: HashMap::new(),
+            qcf_pending_at: None,
+            qcf_penalty_weight: config.qcf_penalty_weight,
+            qcf_stale_secs: config.qcf_stale_secs,
             observations: VecDeque::new(),
             adaptation_config: config,
             clock,
@@ -678,6 +692,49 @@ impl LuaPolicy {
     /// Production 기본 생성자 — SystemClock을 자동 주입한다.
     pub fn with_system_clock(script_path: &str, config: AdaptationConfig) -> anyhow::Result<Self> {
         Self::new(script_path, config, Arc::new(SystemClock::new()))
+    }
+
+    /// QCF cache가 stale한지 확인 (비어있거나 TTL 초과 시 true).
+    fn qcf_cache_is_stale(&self) -> bool {
+        if self.qcf_cache.is_empty() {
+            return true;
+        }
+        self.qcf_cache.values().any(|(_, observed_at)| {
+            self.clock.elapsed_since(*observed_at).as_secs_f64() > self.qcf_stale_secs
+        })
+    }
+
+    /// 현재 신호 상태에서 QCF 요청이 필요한지 판단.
+    fn should_request_qcf(&self) -> bool {
+        // V_Q = 0이면 QCF penalty를 사용하지 않으므로 요청 불필요
+        if self.qcf_penalty_weight == 0.0 {
+            return false;
+        }
+        if self.qcf_pending_at.is_some() {
+            return false;
+        }
+        let mem_pressure = if self.signal_state.mem_total > 0 {
+            1.0 - (self.signal_state.mem_available as f64 / self.signal_state.mem_total as f64)
+        } else {
+            0.0
+        };
+        let mem_high = mem_pressure >= 0.6;
+        let cpu_high = self.signal_state.cpu_pct >= 70.0;
+        let thermal_high = {
+            let temp_c = self.signal_state.temp_mc as f32 / 1000.0;
+            let safe = self.adaptation_config.temp_safe_c;
+            let critical = self.adaptation_config.temp_critical_c;
+            let range = critical - safe;
+            if range > 0.0 {
+                ((temp_c - safe) / range) >= 0.7
+            } else {
+                false
+            }
+        };
+        if !mem_high && !cpu_high && !thermal_high {
+            return false;
+        }
+        self.qcf_cache_is_stale()
     }
 
     /// 현재 엔진 상태 + signal_state에서 13차원 feature vector를 빌드.
@@ -855,9 +912,22 @@ impl LuaPolicy {
                 entry.set("lat", relief[4])?;
                 entry.set("qos", relief[5])?;
                 entry.set("ucb_bonus", ucb)?;
+                // QCF cost: cache에서 조회. 미수신 시 0 (penalty 없음), age=MAX
+                let (qcf_cost, qcf_age_s) = match self.qcf_cache.get(*name) {
+                    Some(&(cost, observed_at)) => {
+                        let age = self.clock.elapsed_since(observed_at).as_secs_f64() as f32;
+                        (cost, age)
+                    }
+                    None => (0.0_f32, f32::MAX),
+                };
+                entry.set("qcf_cost", qcf_cost)?;
+                entry.set("qcf_age_s", qcf_age_s)?;
                 r_tbl.set(*name, entry)?;
             }
             coef.set("relief", r_tbl)?;
+
+            // coef.qcf_penalty_weight — Lua script가 V_Q를 config 값으로 override할 때 사용
+            coef.set("qcf_penalty_weight", self.qcf_penalty_weight)?;
         }
         ctx.set("coef", coef)?;
 
@@ -1200,7 +1270,16 @@ impl PolicyStrategy for LuaPolicy {
         // 4. Observation 체크
         self.check_observation();
 
-        // 5. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
+        // 5. QCF 요청: 압박 있고 cache stale이면 RequestQcf 선발행
+        if self.should_request_qcf() {
+            self.qcf_pending_at = Some(self.clock.now());
+            return Some(EngineDirective {
+                seq_id: next_seq_id(),
+                commands: vec![EngineCommand::RequestQcf],
+            });
+        }
+
+        // 6. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
         // feature_state를 현재 시점으로 갱신 (LinUCB용)
         self.feature_state = self.build_feature_vec();
         let (commands, was_fallback) = self.call_decide(signal);
@@ -1245,7 +1324,7 @@ impl PolicyStrategy for LuaPolicy {
             })
         };
 
-        // 6. Relief table 자동 저장 (인터벌 초과 시)
+        // 7. Relief table 자동 저장 (인터벌 초과 시)
         self.maybe_persist();
 
         directive
@@ -1294,6 +1373,36 @@ impl PolicyStrategy for LuaPolicy {
 
     fn observation_overrun_count(&self) -> u64 {
         LuaPolicy::observation_overrun_count(self)
+    }
+
+    fn complete_qcf_selection(&mut self, qcf: &QcfEstimate) -> Option<EngineDirective> {
+        // pending이 없으면 무시 (중복 응답 방어)
+        self.qcf_pending_at.take()?;
+        // cache 갱신
+        let now = self.clock.now();
+        for (name, &cost) in &qcf.estimates {
+            self.qcf_cache.insert(name.clone(), (cost, now));
+        }
+        log::debug!(
+            "LuaPolicy QCF cache updated: {} actions",
+            self.qcf_cache.len()
+        );
+        None // 다음 process_signal() 호출에서 DPP score에 반영
+    }
+
+    fn check_qcf_timeout(&mut self) -> Option<EngineDirective> {
+        const QCF_TIMEOUT_SECS: f64 = 1.0;
+        let pending_at = self.qcf_pending_at?;
+        let elapsed = self.clock.elapsed_since(pending_at).as_secs_f64();
+        if elapsed >= QCF_TIMEOUT_SECS {
+            log::warn!(
+                "LuaPolicy QCF estimate timeout ({:.1}s) — clearing pending",
+                elapsed
+            );
+            self.qcf_pending_at = None;
+            // cache는 비우지 않음: 이전 값 유지 (stale이라도 없는 것보다 낫다)
+        }
+        None
     }
 
     /// Lua 스크립트 핫-리로드.
@@ -2834,7 +2943,11 @@ mod tests {
         let script_path = dir.path().join("test_trigger.lua");
         std::fs::write(&script_path, script).unwrap();
 
-        let config = AdaptationConfig::default();
+        // qcf_penalty_weight=0.0 으로 QCF 요청 로직 비활성화 (이 테스트는 Lua 결정 경로만 검증)
+        let config = AdaptationConfig {
+            qcf_penalty_weight: 0.0,
+            ..AdaptationConfig::default()
+        };
         let mut policy =
             LuaPolicy::with_system_clock(script_path.to_str().unwrap(), config).unwrap();
 
@@ -3013,5 +3126,134 @@ mod tests {
         }
         // action B는 cold-start → 1.0
         assert_eq!(table.ucb_bonus("throttle", &phi), 1.0);
+    }
+
+    // ── QCF cache 관련 테스트 ───────────────────────────────────────────
+
+    fn make_policy_with_system_clock() -> LuaPolicy {
+        let script = create_temp_script("function decide(ctx) return {} end");
+        LuaPolicy::with_system_clock(script.path().to_str().unwrap(), AdaptationConfig::default())
+            .unwrap()
+    }
+
+    #[test]
+    fn qcf_cache_is_stale_when_empty() {
+        let policy = make_policy_with_system_clock();
+        // 빈 cache는 stale
+        assert!(policy.qcf_cache_is_stale());
+    }
+
+    #[test]
+    fn complete_qcf_selection_populates_cache() {
+        let mut policy = make_policy_with_system_clock();
+        // pending 없으면 None 즉시 반환
+        let qcf = QcfEstimate {
+            estimates: [("kv_evict_sliding".to_string(), 0.3f32)]
+                .into_iter()
+                .collect(),
+        };
+        let result = policy.complete_qcf_selection(&qcf);
+        assert!(result.is_none(), "pending 없으면 None을 반환해야 한다");
+        assert!(
+            policy.qcf_cache.is_empty(),
+            "pending 없으면 cache 갱신하지 않아야 한다"
+        );
+
+        // pending 설정 후 complete_qcf_selection 호출
+        policy.qcf_pending_at = Some(policy.clock.now());
+        let result2 = policy.complete_qcf_selection(&qcf);
+        assert!(result2.is_none(), "complete 후에는 None을 반환해야 한다");
+        assert!(
+            policy.qcf_pending_at.is_none(),
+            "pending_at이 소비되어야 한다"
+        );
+        assert_eq!(policy.qcf_cache.len(), 1);
+        let (cost, _) = policy.qcf_cache["kv_evict_sliding"];
+        assert!((cost - 0.3).abs() < f32::EPSILON);
+    }
+
+    /// 결정론적 시간 제어를 위한 테스트 전용 Clock.
+    struct FixedClock {
+        current: std::sync::atomic::AtomicU64,
+    }
+
+    impl FixedClock {
+        fn new(millis: u64) -> Arc<Self> {
+            Arc::new(Self {
+                current: std::sync::atomic::AtomicU64::new(millis),
+            })
+        }
+
+        fn advance(&self, millis: u64) {
+            self.current
+                .fetch_add(millis, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    impl Clock for FixedClock {
+        fn now(&self) -> LogicalInstant {
+            let ms = self.current.load(std::sync::atomic::Ordering::Relaxed);
+            LogicalInstant::from_duration_since_start(std::time::Duration::from_millis(ms))
+        }
+    }
+
+    #[test]
+    fn check_qcf_timeout_clears_pending_after_1s() {
+        let clock = FixedClock::new(0);
+        let script = create_temp_script("function decide(ctx) return {} end");
+        let mut policy = LuaPolicy::new(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+            clock.clone() as Arc<dyn Clock>,
+        )
+        .unwrap();
+
+        // pending 없으면 no-op
+        assert!(policy.check_qcf_timeout().is_none());
+
+        // t=0에서 pending 설정
+        policy.qcf_pending_at = Some(policy.clock.now());
+
+        // t=500ms: 아직 timeout 아님
+        clock.advance(500);
+        let result = policy.check_qcf_timeout();
+        assert!(result.is_none());
+        assert!(
+            policy.qcf_pending_at.is_some(),
+            "500ms 경과: 아직 pending 유지되어야 한다"
+        );
+
+        // t=1100ms: 1초 초과 → pending 소거
+        clock.advance(600);
+        let result2 = policy.check_qcf_timeout();
+        assert!(result2.is_none());
+        assert!(
+            policy.qcf_pending_at.is_none(),
+            "1초 경과 후 pending_at이 소거되어야 한다"
+        );
+    }
+
+    #[test]
+    fn should_request_qcf_false_when_no_pressure() {
+        let policy = make_policy_with_system_clock();
+        // signal_state 기본값: mem_total=0, cpu_pct=0, temp_mc=0 → 압박 없음
+        assert!(!policy.should_request_qcf());
+    }
+
+    #[test]
+    fn should_request_qcf_true_when_mem_high_and_cache_empty() {
+        let mut policy = make_policy_with_system_clock();
+        // 메모리 압박 >= 0.6 설정: total=100, available=30 → used=0.7
+        policy.signal_state.update_memory(30, 100);
+        assert!(policy.should_request_qcf());
+    }
+
+    #[test]
+    fn should_request_qcf_false_when_pending_exists() {
+        let mut policy = make_policy_with_system_clock();
+        policy.signal_state.update_memory(30, 100);
+        // pending 설정 → false
+        policy.qcf_pending_at = Some(policy.clock.now());
+        assert!(!policy.should_request_qcf());
     }
 }

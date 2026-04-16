@@ -4,8 +4,8 @@ expression: formatted
 ---
 kv_evict_sliding:
   - 0
-  - 0.001
+  - 0.003
   - -0.006
-  - -0.059
-  - 0
+  - -0.003
+  - -0.001
   - 0
