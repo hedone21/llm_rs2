@@ -167,6 +167,9 @@ struct KernelCache {
     kernel_attn_gen_kivi_q8: Option<CoreKernel>,
     // F16 GEMV N_DST=4 variant for large-N matmuls (lm_head, FFN)
     kernel_mul_mat_f16_f32_l4: Option<CoreKernel>,
+    // Score-only attention kernel (decode, F16 KV): Q*K^T + softmax, no V multiply.
+    // Used alongside flash_attention_decode_gpu to avoid falling back to slow kernel_attn_gen_half.
+    kernel_score_only_half: Option<CoreKernel>,
     // true when f16 kernel is the nosub fallback (1D work group, N_DST=4 rows/WG)
     f16_is_nosub: bool,
     // Q4_0 noshuffle: SOA conversion kernel (Adreno-optimized, from cvt.cl)
@@ -238,6 +241,9 @@ pub struct OpenCLBackend {
     // KIVI kernel programs (optional — needed for plan-based KIVI decode)
     pub kivi_q2_program: Option<Program>,
     pub kivi_attn_program: Option<Program>,
+
+    // Score-only attention program (Q*K^T + softmax, no V multiply)
+    pub attention_scores_program: Option<Program>,
 
     // Q4_0 noshuffle programs (optional — Adreno-optimized SOA GEMV)
     pub cvt_noshuffle_program: Option<Program>,
@@ -830,6 +836,20 @@ impl OpenCLBackend {
             log::warn!("kivi_attn.cl failed to compile. KIVI fused attention disabled.");
         }
 
+        // Score-only attention kernel (Q*K^T + softmax, no V multiply)
+        let attn_scores_src = include_str!("../../../kernels/attention_scores.cl");
+        let attention_scores_program = Program::builder()
+            .devices(device)
+            .src(attn_scores_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if attention_scores_program.is_some() {
+            log::info!("attention_scores.cl compiled (score-only decode kernel)");
+        } else {
+            log::warn!("attention_scores.cl failed to compile. Score-only kernel disabled.");
+        }
+
         // Q4_0 noshuffle SOA conversion kernel (cvt.cl already contains the kernel)
         let cvt_noshuffle_src = include_str!("../../../kernels/cvt.cl");
         let cvt_noshuffle_program = Program::builder()
@@ -984,6 +1004,9 @@ impl OpenCLBackend {
             kernel_mul_mat_f16_f32_l4: f16_l4_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_l4").ok()),
+            kernel_score_only_half: attention_scores_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_score_only_half").ok()),
             f16_is_nosub,
             kernel_cvt_q4_0_noshuffle: cvt_noshuffle_program.as_ref().and_then(|p| {
                 ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle").ok()
@@ -1052,6 +1075,7 @@ impl OpenCLBackend {
             gemm_q4_0_program,
             kivi_q2_program: kivi_q2_kernels,
             kivi_attn_program,
+            attention_scores_program,
             cvt_noshuffle_program,
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
@@ -2464,6 +2488,118 @@ impl OpenCLBackend {
 
         Ok(true)
     }
+
+    /// Compute post-softmax attention scores on GPU without V*score weighted sum.
+    /// Used alongside `flash_attention_decode_gpu()` to avoid falling back to the
+    /// slow `kernel_attn_gen_half` when `scores_out` is requested.
+    ///
+    /// Only supports F16 HeadMajor KV cache (same prerequisite as flash decode).
+    /// Returns `Ok(true)` on success, `Ok(false)` if the kernel is unavailable.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_scores_gpu(
+        &self,
+        q: &Tensor,
+        k_cache: &Tensor,
+        scores_out: &mut [f32],
+        num_heads_q: usize,
+        num_heads_kv: usize,
+        head_dim: usize,
+        cache_seq_len: usize,
+    ) -> Result<bool> {
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = match &kernels.kernel_score_only_half {
+            Some(k) => k,
+            None => return Ok(false),
+        };
+
+        let q_buf =
+            get_cl_mem(q.buffer().as_ref()).map_err(|_| anyhow!("Q is not OpenCL buffer"))?;
+        let k_buf =
+            get_cl_mem(k_cache.buffer().as_ref()).map_err(|_| anyhow!("K is not OpenCL buffer"))?;
+
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let local_size = 64usize;
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
+
+        let score_stride = scores_out.len() / num_heads_q;
+
+        // Detect HeadMajor layout and compute strides
+        let k_shape = k_cache.shape().dims();
+        let is_head_major =
+            k_shape.len() >= 3 && k_shape[1] == num_heads_kv && k_shape[1] != k_shape[2];
+        let capacity = if is_head_major { k_shape[2] } else { 0 };
+
+        let (kv_pos_stride, kv_head_stride) = if is_head_major {
+            (head_dim as i32, (capacity * head_dim) as i32)
+        } else {
+            ((num_heads_kv * head_dim) as i32, head_dim as i32)
+        };
+
+        // Allocate GPU score buffer
+        let score_buf_size = num_heads_q * score_stride;
+        let score_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE | ocl::core::MEM_ALLOC_HOST_PTR,
+                score_buf_size,
+                None,
+            )?
+        };
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(q_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(k_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&score_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(num_heads_q as i32)))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                5,
+                ocl::core::ArgVal::scalar(&(num_heads_kv as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                6,
+                ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
+            )?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&scale))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&kv_pos_stride))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::scalar(&kv_head_stride))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                10,
+                ocl::core::ArgVal::scalar(&(score_stride as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                11,
+                ocl::core::ArgVal::local::<f32>(&local_mem_size),
+            )?;
+
+            let global_work_size: [usize; 3] = [num_heads_q * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+            self.enqueue_kernel_labeled(
+                kernel,
+                "score_only",
+                1,
+                &global_work_size,
+                Some(local_work_size),
+            )?;
+
+            // Blocking readback of scores to CPU
+            ocl::core::enqueue_read_buffer(
+                &self.queue,
+                &score_buf,
+                true, // blocking read
+                0,
+                scores_out,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        Ok(true)
+    }
 }
 
 impl Backend for OpenCLBackend {
@@ -3072,18 +3208,22 @@ impl Backend for OpenCLBackend {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
-        scores_out: Option<&mut [f32]>,
+        mut scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         // Flash-attention decode fast path: single-pass online softmax, vectorized
         // float4 K/V reads, no local-memory output reduction. Used when none of the
         // score-accumulator paths are active and the kernel's compile-time DK/DV
         // matches the current head_dim.
+        //
+        // When scores_out is requested, we still use flash attention for the output
+        // vector and dispatch a separate lightweight score-only kernel (Q*K^T + softmax)
+        // instead of falling back to the slow kernel_attn_gen_half.
         let gpu_acc_active = {
             let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
             gpu_acc.as_ref().is_some_and(|acc| acc.is_active())
         };
-        if !gpu_acc_active && scores_out.is_none() {
-            if self.flash_attention_decode_gpu(
+        if !gpu_acc_active
+            && self.flash_attention_decode_gpu(
                 q,
                 k_cache,
                 v_cache,
@@ -3092,7 +3232,26 @@ impl Backend for OpenCLBackend {
                 num_heads_kv,
                 head_dim,
                 cache_seq_len,
-            )? {
+            )?
+        {
+            // Flash attention succeeded for output. Now handle scores if needed.
+            if let Some(ref mut scores) = scores_out {
+                if self.compute_scores_gpu(
+                    q,
+                    k_cache,
+                    scores,
+                    num_heads_q,
+                    num_heads_kv,
+                    head_dim,
+                    cache_seq_len,
+                )? {
+                    return Ok(());
+                }
+                // Score-only kernel unavailable — fall through to legacy path
+                // for scores only (output already computed by flash attn, but
+                // we need to recompute everything with the slow kernel to get
+                // scores). This should be rare (kernel compilation failure).
+            } else {
                 return Ok(());
             }
         }
