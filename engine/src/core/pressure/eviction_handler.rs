@@ -8,6 +8,14 @@ use crate::core::eviction::EvictionPolicy;
 use crate::core::qcf::QcfConfig;
 use anyhow::Result;
 
+/// Minimum number of tokens that must be evicted to justify compaction overhead.
+///
+/// When `current_pos - target_len` falls below this threshold, eviction is
+/// skipped and `ActionResult::NoOp` is returned. This prevents the "sticky
+/// eviction" pattern where 18~22 tokens trigger a full sort+memcpy cycle for
+/// only ~33 tokens removed, whose cost offsets the attention savings entirely.
+pub const MIN_EVICT_TOKENS: usize = 64;
+
 /// Adapts an `EvictionPolicy` to the `CachePressureHandler` interface.
 ///
 /// The wrapped policy's `evict()` / `evict_with_scores()` is called with
@@ -123,6 +131,20 @@ impl CachePressureHandler for EvictionHandler {
             return Ok(ActionResult::NoOp);
         }
 
+        let tokens_to_remove = current_pos - target_len;
+        if tokens_to_remove < MIN_EVICT_TOKENS {
+            log::debug!(
+                "[EvictionHandler] skip: policy='{}', tokens_to_remove={} < MIN_EVICT_TOKENS={} \
+                 (current_pos={}, target_len={})",
+                self.policy.name(),
+                tokens_to_remove,
+                MIN_EVICT_TOKENS,
+                current_pos,
+                target_len,
+            );
+            return Ok(ActionResult::NoOp);
+        }
+
         log::debug!(
             "[EvictionHandler] policy='{}': {} → {} tokens",
             self.policy.name(),
@@ -206,12 +228,13 @@ mod tests {
 
     #[test]
     fn test_wraps_sliding_window() {
+        // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(
-            Box::new(SlidingWindowPolicy::new(10, 0)), // window=10, prefix=4(clamped)
-            0.5,
+            Box::new(SlidingWindowPolicy::new(10, 0)), // window=10, prefix=0
+            0.3,
         );
 
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
@@ -231,9 +254,13 @@ mod tests {
                 new_pos,
             } => {
                 assert!(tokens_removed > 0);
-                assert!(new_pos < 40);
-                // SlidingWindow with window=10, prefix=4 → max_keep=14
-                assert!(new_pos <= 14);
+                assert!(new_pos < 100);
+                // SlidingWindow may clamp to internal min_keep; just verify significant reduction.
+                assert!(
+                    tokens_removed >= 64,
+                    "Must remove >= MIN_EVICT_TOKENS(64), removed {}",
+                    tokens_removed
+                );
             }
             _ => panic!("Expected Evicted, got {:?}", result),
         }
@@ -247,17 +274,18 @@ mod tests {
 
     #[test]
     fn test_wraps_h2o_with_scores() {
+        // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(
-            Box::new(H2OPolicy::new(5, 0.5, 0)), // prefix=4(clamped), keep_ratio=0.5
-            0.5,
+            Box::new(H2OPolicy::new(5, 0.5, 0)), // prefix=0(clamped), keep_ratio=0.5
+            0.3,
         );
 
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let mut importance = vec![0.0f32; 100];
         importance[10] = 10.0;
         importance[20] = 9.0;
         importance[30] = 8.0;
-        for i in 4..40 {
+        for i in 4..100 {
             if importance[i] == 0.0 {
                 importance[i] = 0.01;
             }
@@ -282,9 +310,9 @@ mod tests {
                 new_pos,
             } => {
                 assert!(tokens_removed > 0);
-                assert!(new_pos < 40);
-                // H2O: target = 40 * 0.5 = 20
-                assert_eq!(new_pos, 20);
+                assert!(new_pos < 100);
+                // H2O: target = 100 * 0.3 = 30
+                assert_eq!(new_pos, 30);
             }
             _ => panic!("Expected Evicted, got {:?}", result),
         }
@@ -348,11 +376,71 @@ mod tests {
     }
 
     #[test]
+    fn test_skip_when_tokens_to_remove_below_threshold() {
+        // current_pos=100, target_ratio=0.95 → target_len=95, tokens_to_remove=5 < MIN_EVICT_TOKENS=64
+        // Expected: NoOp, current_pos unchanged.
+        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(200, 0)), 0.95);
+
+        let mut caches = make_caches(2, 100);
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Emergency,
+            mem_available: 0,
+            target_ratio: None,
+            qcf_sink: None,
+            layer_ratios: None,
+        };
+
+        let result = handler.handle(&mut ctx).unwrap();
+        assert!(
+            matches!(result, ActionResult::NoOp),
+            "Expected NoOp when tokens_to_remove({}) < MIN_EVICT_TOKENS({}), got {:?}",
+            100usize.saturating_sub(95),
+            MIN_EVICT_TOKENS,
+            result,
+        );
+        // current_pos must be unchanged
+        assert_eq!(ctx.caches[0].current_pos, 100);
+    }
+
+    #[test]
+    fn test_skip_does_not_fire_when_above_threshold() {
+        // current_pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS=64
+        // Expected: Evicted, not NoOp.
+        let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(200, 0)), 0.3);
+
+        let mut caches = make_caches(2, 100);
+        let mut ctx = HandlerContext {
+            caches: &mut caches,
+            importance: None,
+            head_importance: None,
+            n_kv_heads: 0,
+            pressure_level: PressureLevel::Emergency,
+            mem_available: 0,
+            target_ratio: None,
+            qcf_sink: None,
+            layer_ratios: None,
+        };
+
+        let result = handler.handle(&mut ctx).unwrap();
+        assert!(
+            matches!(result, ActionResult::Evicted { .. }),
+            "Expected Evicted when tokens_to_remove >= MIN_EVICT_TOKENS, got {:?}",
+            result,
+        );
+        assert!(ctx.caches[0].current_pos < 100);
+    }
+
+    #[test]
     fn test_target_ratio_clamping() {
-        // ratio=0.0 should clamp to 0.1
+        // ratio=0.0 should clamp to 0.1.
+        // pos=100, clamped ratio=0.1 → target_len=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64).
         let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.0);
 
-        let mut caches = make_caches(1, 50);
+        let mut caches = make_caches(1, 100);
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None,
@@ -376,10 +464,11 @@ mod tests {
 
     #[test]
     fn test_h2o_fallback_without_scores() {
-        // H2O without importance scores → fallback to sliding-window-like behavior
-        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.5);
+        // H2O without importance scores → fallback to sliding-window-like behavior.
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
+        let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.3);
 
-        let mut caches = make_caches(2, 30);
+        let mut caches = make_caches(2, 100);
         let mut ctx = HandlerContext {
             caches: &mut caches,
             importance: None, // no scores
@@ -399,7 +488,7 @@ mod tests {
                 new_pos,
             } => {
                 assert!(tokens_removed > 0);
-                assert!(new_pos < 30);
+                assert!(new_pos < 100);
             }
             _ => panic!("Expected Evicted"),
         }

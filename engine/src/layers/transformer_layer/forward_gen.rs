@@ -1033,8 +1033,7 @@ impl TransformerLayer {
             let cpu_slice_dtype = part.gate.cpu_slice.dtype();
             #[cfg(target_arch = "aarch64")]
             let used_fused = if cpu.name().contains("CPU") && cpu_slice_dtype == DType::F16 {
-                let k = pw.residual_cpu.shape().dims()
-                    [pw.residual_cpu.shape().dims().len() - 1];
+                let k = pw.residual_cpu.shape().dims()[pw.residual_cpu.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_f16(
                         pw.residual_cpu.as_ptr() as *const f32,
@@ -1056,8 +1055,7 @@ impl TransformerLayer {
                 true
             } else if cpu.name().contains("CPU") && cpu_slice_dtype == DType::Q4_0 {
                 use crate::core::quant::BlockQ4_0;
-                let k = pw.residual_cpu.shape().dims()
-                    [pw.residual_cpu.shape().dims().len() - 1];
+                let k = pw.residual_cpu.shape().dims()[pw.residual_cpu.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_q4_0(
                         pw.residual_cpu.as_ptr() as *const f32,

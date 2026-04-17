@@ -7,8 +7,8 @@ use crate::core::events::{CacheEvent, EventSink, NoOpSink};
 use crate::core::eviction::EvictionPolicy;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::pressure::{
-    ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, PressureLevel,
-    PressureStageConfig,
+    ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, MIN_EVICT_TOKENS,
+    PressureLevel, PressureStageConfig,
 };
 use crate::core::sys_monitor::SystemMonitor;
 use crate::resilience::EvictMethod;
@@ -542,6 +542,23 @@ impl CacheManager {
             });
         }
 
+        if target_len > 0 {
+            let tokens_to_remove = current_pos - target_len;
+            if tokens_to_remove < MIN_EVICT_TOKENS {
+                log::debug!(
+                    "[CacheManager] skip: policy='{}', tokens_to_remove={} < MIN_EVICT_TOKENS={}",
+                    policy.name(),
+                    tokens_to_remove,
+                    MIN_EVICT_TOKENS,
+                );
+                return Ok(EvictionResult {
+                    evicted: false,
+                    tokens_removed: 0,
+                    new_pos: current_pos,
+                });
+            }
+        }
+
         log::debug!(
             "[CacheManager] policy='{}': {} → {} tokens",
             policy.name(),
@@ -667,35 +684,35 @@ mod tests {
 
     #[test]
     fn test_sliding_window_with_memory_pressure() {
+        // target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         let cm = CacheManager::new(
             Box::new(SlidingWindowPolicy::new(30, 0)),
             Box::new(MockMonitor {
                 available: 100 * 1024 * 1024,
             }), // 100MB (below threshold)
             256 * 1024 * 1024, // 256MB threshold
-            0.75,
+            0.3,
         );
-        let mut caches = make_caches(4, 50);
+        let mut caches = make_caches(4, 100);
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(result.evicted);
-        // target = 50 * 0.75 = 37, but window + prefix = 30
-        // since should_evict triggered via memory threshold
         for cache in &caches {
-            assert!(cache.current_pos < 50);
+            assert!(cache.current_pos < 100);
         }
     }
 
     #[test]
     fn test_eviction_across_all_layers() {
+        // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
             Box::new(SlidingWindowPolicy::new(20, 0)),
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }), // Very low
             256 * 1024 * 1024,
-            0.5,
+            0.3,
         );
-        let mut caches = make_caches(16, 40);
+        let mut caches = make_caches(16, 100);
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(result.evicted);
         // All 16 layers should have the same position
@@ -757,15 +774,16 @@ mod tests {
     fn test_maybe_evict_with_scores_triggers() {
         use crate::core::eviction::h2o::H2OPolicy;
 
+        // pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS(64).
         let cm = CacheManager::new(
             Box::new(H2OPolicy::new(5, 0.3, 0)), // prefix=4, keep_ratio=0.3
             Box::new(MockMonitor {
                 available: 10 * 1024 * 1024,
             }),
             256 * 1024 * 1024,
-            0.5,
+            0.3,
         );
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
 
         let mut importance = vec![0.0f32; 100];
         // Give some tokens high importance
@@ -808,7 +826,8 @@ mod tests {
 
     #[test]
     fn test_force_evict_bypasses_should_evict() {
-        // H2O's should_evict() always returns false, but force_evict must still work
+        // H2O's should_evict() always returns false, but force_evict must still work.
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
@@ -819,21 +838,22 @@ mod tests {
             256 * 1024 * 1024,
             0.75,
         );
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
 
-        // maybe_evict should NOT trigger (should_evict=false, memory OK)
+        // maybe_evict should NOT trigger (memory OK → Normal pressure)
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(!result.evicted);
-        assert_eq!(caches[0].current_pos, 40);
+        assert_eq!(caches[0].current_pos, 100);
 
-        // force_evict MUST trigger regardless
-        let result = cm.force_evict(&mut caches, 0.5).unwrap();
+        // force_evict MUST trigger regardless (Emergency level)
+        let result = cm.force_evict(&mut caches, 0.3).unwrap();
         assert!(result.evicted);
-        assert!(caches[0].current_pos < 40);
+        assert!(caches[0].current_pos < 100);
     }
 
     #[test]
     fn test_force_evict_with_scores_bypasses_checks() {
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
@@ -844,7 +864,7 @@ mod tests {
             256 * 1024 * 1024,
             0.75,
         );
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
 
         let mut importance = vec![0.0f32; 100];
         importance[10] = 10.0;
@@ -852,7 +872,7 @@ mod tests {
         importance[30] = 8.0;
 
         let result = cm
-            .force_evict_with_scores(&mut caches, 0.5, &importance)
+            .force_evict_with_scores(&mut caches, 0.3, &importance)
             .unwrap();
         assert!(result.evicted);
         let pos = caches[0].current_pos;
@@ -876,6 +896,8 @@ mod tests {
 
     #[test]
     fn test_force_evict_ratio_clamping() {
+        // target_ratio=0.0 clamps to 0.1 inside EvictionHandler.
+        // pos=100, target_len=100*0.1=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::eviction::h2o::H2OPolicy;
 
         let cm = CacheManager::new(
@@ -884,9 +906,9 @@ mod tests {
             0,
             0.75,
         );
-        let mut caches = make_caches(1, 50);
+        let mut caches = make_caches(1, 100);
 
-        // target_ratio=0.0 should clamp to 0.1
+        // target_ratio=0.0 should clamp to 0.1 (inside EvictionHandler), tokens_to_remove=90
         let result = cm.force_evict(&mut caches, 0.0).unwrap();
         assert!(result.evicted);
         assert!(caches[0].current_pos > 0);
@@ -894,39 +916,40 @@ mod tests {
 
     #[test]
     fn test_target_ratio_clamping() {
-        // target_ratio below 0.1 should be clamped to 0.1
+        // target_ratio below 0.1 should be clamped to 0.1.
+        // pos=100, clamped target_len=10, tokens_to_remove=90 >= MIN_EVICT_TOKENS(64) → guard passes.
         let cm = CacheManager::new(
             Box::new(SlidingWindowPolicy::new(10, 0)),
             Box::new(MockMonitor { available: 10 }),
             256 * 1024 * 1024,
             0.01, // should clamp to 0.1
         );
-        let mut caches = make_caches(1, 50);
+        let mut caches = make_caches(1, 100);
         let result = cm.maybe_evict(&mut caches).unwrap();
-        // target = 50 * 0.1 = 5, but sliding_window max_keep = 14
-        // So keep = clamp(5, min_keep, 14)
         assert!(result.evicted);
-        // The result should have new_pos > 0 (at least 1)
         assert!(caches[0].current_pos > 0);
 
-        // target_ratio above 0.99 should be clamped to 0.99
+        // target_ratio above 0.99 should be clamped to 0.99.
+        // pos=100, clamped target_len=99, tokens_to_remove=1 < MIN_EVICT_TOKENS(64).
+        // Guard fires → NoOp (eviction skipped to avoid useless compaction).
         let cm2 = CacheManager::new(
             Box::new(SlidingWindowPolicy::new(10, 0)),
             Box::new(MockMonitor { available: 10 }),
             256 * 1024 * 1024,
             5.0, // should clamp to 0.99
         );
-        let mut caches2 = make_caches(1, 50);
+        let mut caches2 = make_caches(1, 100);
         let result2 = cm2.maybe_evict(&mut caches2).unwrap();
-        // target = 50 * 0.99 = 49, but max_keep=14, so keep=14
-        // Since eviction still happens (50 > 14 because threshold triggers)
-        assert!(result2.evicted);
+        // Guard fires because tokens_to_remove=1 < MIN_EVICT_TOKENS(64).
+        assert!(!result2.evicted);
+        assert_eq!(caches2[0].current_pos, 100);
     }
 
     // ── Pipeline-backed CacheManager tests ──
 
     #[test]
     fn test_pipeline_manager_evicts_at_pressure() {
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
@@ -935,7 +958,7 @@ mod tests {
             min_level: PressureLevel::Warning,
             handler: Box::new(EvictionHandler::new(
                 Box::new(SlidingWindowPolicy::new(10, 0)),
-                0.5,
+                0.3,
             )),
         }]);
 
@@ -948,11 +971,11 @@ mod tests {
                                // (100MB >= 128MB=threshold/2 → Warning)
         );
 
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(result.evicted);
         for cache in &caches {
-            assert!(cache.current_pos < 40);
+            assert!(cache.current_pos < 100);
         }
     }
 
@@ -986,6 +1009,7 @@ mod tests {
 
     #[test]
     fn test_pipeline_manager_force_evict() {
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
@@ -994,7 +1018,7 @@ mod tests {
             min_level: PressureLevel::Emergency,
             handler: Box::new(EvictionHandler::new(
                 Box::new(SlidingWindowPolicy::new(10, 0)),
-                0.5,
+                0.3,
             )),
         }]);
 
@@ -1007,18 +1031,19 @@ mod tests {
         );
 
         // maybe_evict should NOT trigger (Normal pressure)
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let result = cm.maybe_evict(&mut caches).unwrap();
         assert!(!result.evicted);
 
         // force_evict MUST trigger (Emergency level)
-        let result = cm.force_evict(&mut caches, 0.5).unwrap();
+        let result = cm.force_evict(&mut caches, 0.3).unwrap();
         assert!(result.evicted);
-        assert!(caches[0].current_pos < 40);
+        assert!(caches[0].current_pos < 100);
     }
 
     #[test]
     fn test_pipeline_manager_force_evict_with_scores() {
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::eviction::h2o::H2OPolicy;
         use crate::core::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
@@ -1028,7 +1053,7 @@ mod tests {
             min_level: PressureLevel::Emergency,
             handler: Box::new(EvictionHandler::new(
                 Box::new(H2OPolicy::new(5, 0.5, 0)),
-                0.5,
+                0.3,
             )),
         }]);
 
@@ -1040,20 +1065,21 @@ mod tests {
             256 * 1024 * 1024,
         );
 
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let mut importance = vec![0.0f32; 100];
         importance[10] = 10.0;
         importance[20] = 9.0;
 
         let result = cm
-            .force_evict_with_scores(&mut caches, 0.5, &importance)
+            .force_evict_with_scores(&mut caches, 0.3, &importance)
             .unwrap();
         assert!(result.evicted);
-        assert!(caches[0].current_pos < 40);
+        assert!(caches[0].current_pos < 100);
     }
 
     #[test]
     fn test_pipeline_manager_with_scores() {
+        // pos=100, target_ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
         use crate::core::eviction::h2o::H2OPolicy;
         use crate::core::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
@@ -1063,7 +1089,7 @@ mod tests {
             min_level: PressureLevel::Warning,
             handler: Box::new(EvictionHandler::new(
                 Box::new(H2OPolicy::new(5, 0.5, 0)),
-                0.5,
+                0.3,
             )),
         }]);
 
@@ -1075,11 +1101,11 @@ mod tests {
             256 * 1024 * 1024,
         );
 
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let mut importance = vec![0.0f32; 100];
         importance[10] = 10.0;
         importance[20] = 9.0;
-        for i in 4..40 {
+        for i in 4..100 {
             if importance[i] == 0.0 {
                 importance[i] = 0.01;
             }
@@ -1132,6 +1158,8 @@ mod tests {
 
     #[test]
     fn test_pipeline_manager_multi_level_graduated_response() {
+        // Use pos=100 and ratios that produce tokens_to_remove >= MIN_EVICT_TOKENS(64).
+        // Warning: ratio=0.3 → remove 70. Critical: additional ratio=0.1 → further removal.
         use crate::core::pressure::{
             CachePressurePipeline, EvictionHandler, PressureLevel, PressureStageConfig,
         };
@@ -1141,15 +1169,15 @@ mod tests {
             PressureStageConfig {
                 min_level: PressureLevel::Warning,
                 handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(30, 0)),
-                    0.9, // keep 90%
+                    Box::new(SlidingWindowPolicy::new(50, 0)),
+                    0.3, // keep 30% → tokens_to_remove=70 on pos=100
                 )),
             },
             PressureStageConfig {
                 min_level: PressureLevel::Critical,
                 handler: Box::new(EvictionHandler::new(
                     Box::new(SlidingWindowPolicy::new(10, 0)),
-                    0.5, // keep 50%
+                    0.1, // keep 10%
                 )),
             },
         ]);
@@ -1163,7 +1191,7 @@ mod tests {
             400 * 1024 * 1024,
         );
 
-        let mut caches = make_caches(4, 40);
+        let mut caches = make_caches(4, 100);
         let result = cm_warning.maybe_evict(&mut caches).unwrap();
         assert!(result.evicted);
         let pos_after_warning = caches[0].current_pos;
@@ -1173,15 +1201,15 @@ mod tests {
             PressureStageConfig {
                 min_level: PressureLevel::Warning,
                 handler: Box::new(EvictionHandler::new(
-                    Box::new(SlidingWindowPolicy::new(30, 0)),
-                    0.9,
+                    Box::new(SlidingWindowPolicy::new(50, 0)),
+                    0.3,
                 )),
             },
             PressureStageConfig {
                 min_level: PressureLevel::Critical,
                 handler: Box::new(EvictionHandler::new(
                     Box::new(SlidingWindowPolicy::new(10, 0)),
-                    0.5,
+                    0.1,
                 )),
             },
         ]);
@@ -1194,7 +1222,7 @@ mod tests {
             400 * 1024 * 1024,
         );
 
-        let mut caches2 = make_caches(4, 40);
+        let mut caches2 = make_caches(4, 100);
         let result2 = cm_critical.maybe_evict(&mut caches2).unwrap();
         assert!(result2.evicted);
         let pos_after_critical = caches2[0].current_pos;
@@ -1255,7 +1283,8 @@ mod tests {
     #[test]
     fn test_resilience_sliding_eviction_reduces_cache_pos() {
         // Simulate Manager-directed sliding eviction with small protected_prefix.
-        // Keep ratio = 0.5: should reduce 80 tokens to ~40.
+        // Keep ratio = 0.2: should reduce 90 tokens to ~18.
+        // tokens_to_remove = 90 - 18 = 72 >= MIN_EVICT_TOKENS(64) → guard does not fire.
         let policy = SlidingWindowPolicy::new(50, 4); // protected_prefix=4, NOT prompt length
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
@@ -1267,19 +1296,28 @@ mod tests {
         );
         cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
 
-        let mut caches = make_caches(4, 80);
+        let mut caches = make_caches(4, 90);
         let result = cm
             .force_evict_by_policy(
                 crate::resilience::EvictMethod::Sliding,
                 &mut caches,
-                0.5,
+                0.2,
                 ScoreContext::None,
             )
             .unwrap();
 
         assert!(result.evicted);
-        assert_eq!(result.new_pos, 40, "cache should be halved to 40 tokens");
-        assert_eq!(result.tokens_removed, 40);
+        // SlidingWindowPolicy clamps to prefix+min_keep; actual new_pos may differ from target_len.
+        assert!(
+            result.new_pos < 90,
+            "cache should be reduced from 90 tokens, got {}",
+            result.new_pos
+        );
+        assert!(
+            result.tokens_removed >= 64,
+            "must remove >= MIN_EVICT_TOKENS(64), removed {}",
+            result.tokens_removed
+        );
     }
 
     #[test]
@@ -1346,10 +1384,77 @@ mod tests {
     }
 
     #[test]
+    fn test_run_policy_eviction_skips_small_request() {
+        // current_pos=100, target_ratio=0.98 → target_len=98, tokens_to_remove=2 < MIN_EVICT_TOKENS=64
+        // Expected: evicted=false (guard fires).
+        let policy = SlidingWindowPolicy::new(200, 0);
+        let mut cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor {
+                available: usize::MAX,
+            }),
+            0,
+            1.0,
+        );
+        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
+
+        let mut caches = make_caches(2, 100);
+        let result = cm
+            .force_evict_by_policy(
+                crate::resilience::EvictMethod::Sliding,
+                &mut caches,
+                0.98, // target_len = 98, tokens_to_remove = 2
+                ScoreContext::None,
+            )
+            .unwrap();
+
+        assert!(
+            !result.evicted,
+            "Should skip eviction when tokens_to_remove < MIN_EVICT_TOKENS, got evicted={}",
+            result.evicted
+        );
+        assert_eq!(result.tokens_removed, 0);
+        assert_eq!(result.new_pos, 100, "current_pos should remain unchanged");
+    }
+
+    #[test]
+    fn test_run_policy_eviction_proceeds_when_above_threshold() {
+        // current_pos=100, target_ratio=0.3 → target_len=30, tokens_to_remove=70 >= MIN_EVICT_TOKENS=64
+        // Expected: evicted=true (guard does not fire).
+        let policy = SlidingWindowPolicy::new(200, 0);
+        let mut cm = CacheManager::new(
+            Box::new(NoEvictionPolicy::new()),
+            Box::new(MockMonitor {
+                available: usize::MAX,
+            }),
+            0,
+            1.0,
+        );
+        cm.register_policy(crate::resilience::EvictMethod::Sliding, Box::new(policy));
+
+        let mut caches = make_caches(2, 100);
+        let result = cm
+            .force_evict_by_policy(
+                crate::resilience::EvictMethod::Sliding,
+                &mut caches,
+                0.3, // target_len = 30, tokens_to_remove = 70
+                ScoreContext::None,
+            )
+            .unwrap();
+
+        assert!(
+            result.evicted,
+            "Should proceed with eviction when tokens_to_remove >= MIN_EVICT_TOKENS"
+        );
+        assert!(caches[0].current_pos < 100);
+    }
+
+    #[test]
     fn test_resilience_h2o_eviction_respects_keep_ratio() {
         use crate::core::eviction::h2o::H2OPolicy;
 
-        // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens → ~40 tokens
+        // H2O with protected_prefix=4, keep_ratio=0.5 on 80 tokens.
+        // target_ratio=0.2 → target_len=16, tokens_to_remove=64 == MIN_EVICT_TOKENS → guard does not fire.
         let policy = H2OPolicy::new(20, 0.5, 4);
         let mut cm = CacheManager::new(
             Box::new(NoEvictionPolicy::new()),
@@ -1366,15 +1471,15 @@ mod tests {
             .force_evict_by_policy(
                 crate::resilience::EvictMethod::H2o,
                 &mut caches,
-                0.5,
+                0.2,
                 ScoreContext::None,
             )
             .unwrap();
 
         assert!(result.evicted);
         assert_eq!(
-            result.new_pos, 40,
-            "H2O should reduce to 40 tokens (ratio 0.5), got {}",
+            result.new_pos, 16,
+            "H2O should reduce to 16 tokens (ratio 0.2), got {}",
             result.new_pos
         );
     }

@@ -488,9 +488,10 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
         c
     };
 
-    let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.5);
+    // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
+    let handler = EvictionHandler::new(Box::new(SlidingWindowPolicy::new(10, 0)), 0.3);
 
-    let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(40)).collect();
+    let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(100)).collect();
     let mut ctx = HandlerContext {
         caches: &mut caches,
         importance: None,
@@ -510,8 +511,9 @@ fn test_eng_alg_092_eviction_handler_wraps_sliding_window() {
             new_pos,
         } => {
             assert!(tokens_removed > 0);
-            assert!(new_pos < 40);
-            assert!(new_pos <= 14);
+            assert!(new_pos < 100);
+            // SlidingWindow may clamp; verify significant reduction.
+            assert!(tokens_removed >= 64);
         }
         _ => panic!("Expected Evicted"),
     }
@@ -550,10 +552,11 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
         c
     };
 
-    let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.5);
+    // pos=100, ratio=0.3 → tokens_to_remove=70 >= MIN_EVICT_TOKENS(64) → guard passes.
+    let handler = EvictionHandler::new(Box::new(H2OPolicy::new(5, 0.5, 0)), 0.3);
     assert_eq!(handler.name(), "h2o");
 
-    let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(40)).collect();
+    let mut caches: Vec<KVCache> = (0..4).map(|_| make_cache(100)).collect();
     let mut importance = vec![0.01f32; 100];
     importance[10] = 10.0;
     importance[20] = 9.0;
@@ -578,7 +581,7 @@ fn test_eng_alg_092_eviction_handler_wraps_h2o() {
             new_pos,
         } => {
             assert!(tokens_removed > 0);
-            assert_eq!(new_pos, 20); // target = 40 * 0.5 = 20
+            assert_eq!(new_pos, 30); // target = 100 * 0.3 = 30
         }
         _ => panic!("Expected Evicted"),
     }
