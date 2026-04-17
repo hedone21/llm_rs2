@@ -983,6 +983,10 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn supports_kv_scatter_batch(&self) -> bool {
+        true
+    }
+
     fn kv_scatter_f32_to_f16_batch(
         &self,
         k_src: &Tensor,

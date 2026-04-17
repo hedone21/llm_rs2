@@ -184,8 +184,14 @@ impl TransformerLayer {
             {
                 let t = pf_start!();
                 use crate::core::kv_cache::KVLayout;
-                if kv_dtype == DType::F16 && is_gpu && kv_cache.layout() == KVLayout::HeadMajor {
-                    // GPU F16 HeadMajor: batch cast+scatter kernel (1 dispatch)
+                if kv_dtype == DType::F16
+                    && is_gpu
+                    && kv_cache.layout() == KVLayout::HeadMajor
+                    && backend.supports_kv_scatter_batch()
+                {
+                    // GPU F16 HeadMajor: batch cast+scatter kernel (1 dispatch).
+                    // Only for backends with a real device kernel — the trait's
+                    // default host-pointer fallback segfaults on device-only buffers.
                     kv_cache.ensure_capacity(kv_cache.current_pos() + seq_len)?;
                     let pos = kv_cache.current_pos();
                     let cap = kv_cache.capacity();
@@ -794,8 +800,14 @@ impl TransformerLayer {
         {
             let t = pf_start!();
             use crate::core::kv_cache::KVLayout;
-            if kv_dtype == DType::F16 && is_gpu && kv_cache.layout() == KVLayout::HeadMajor {
-                // GPU F16 HeadMajor: batch cast+scatter kernel (1 dispatch)
+            if kv_dtype == DType::F16
+                && is_gpu
+                && kv_cache.layout() == KVLayout::HeadMajor
+                && backend.supports_kv_scatter_batch()
+            {
+                // GPU F16 HeadMajor: batch cast+scatter kernel (1 dispatch).
+                // Only for backends with a real device kernel — the trait's
+                // default host-pointer fallback segfaults on device-only buffers.
                 kv_cache.ensure_capacity(kv_cache.current_pos() + seq_len)?;
                 let pos = kv_cache.current_pos();
                 let cap = kv_cache.capacity();

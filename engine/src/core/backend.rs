@@ -268,10 +268,24 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Whether this backend has a native batch F32→F16 KV scatter implementation.
+    ///
+    /// Returns `false` by default. Backends implementing a real kernel for
+    /// `kv_scatter_f32_to_f16_batch` must override this to return `true`.
+    ///
+    /// The default implementation of `kv_scatter_f32_to_f16_batch` uses host
+    /// pointer slices via `as_ptr()`/`as_mut_ptr()`, which segfaults on
+    /// device-only buffers (e.g. OpenCL without zero-copy mapping). Callers
+    /// must check this flag before dispatching the batch path and fall back to
+    /// the per-position `cast + update` path otherwise.
+    fn supports_kv_scatter_batch(&self) -> bool {
+        false
+    }
+
     /// Batch F32->F16 KV scatter for prefill: writes seq_len positions in one kernel launch.
     /// k_src/v_src: contiguous [seq_len, kv_heads * head_dim] F32
     /// k_dst/v_dst: [kv_heads, capacity, head_dim] F16 HeadMajor
-    /// Default: loops over single-position scatter.
+    /// Default: host-pointer fallback — ONLY safe when callers guard on `supports_kv_scatter_batch()`.
     #[allow(clippy::too_many_arguments)]
     fn kv_scatter_f32_to_f16_batch(
         &self,
