@@ -369,7 +369,19 @@ impl TransformerModel {
         gpu_ratio: f32,
         cpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
-        use crate::layers::tensor_partition::{PartitionContext, split_weight};
+        use crate::layers::tensor_partition::{PartitionContext, is_gpu_only_ratio, split_weight};
+
+        // GPU-only fast path: leave partition_ctx cleared so forward() takes
+        // the dense full-weight GPU matmul path. Avoids per-token host
+        // staging (read_buffer + CPU matmul on a clamped 128-row slice +
+        // GPU↔host merge) that is independent of ratio once partition_ctx
+        // is installed. See `is_gpu_only_ratio` / `GPU_ONLY_THRESHOLD`.
+        if is_gpu_only_ratio(gpu_ratio) {
+            for layer in &mut self.layers {
+                layer.partition_ctx = None;
+            }
+            return Ok(0);
+        }
 
         let mut count = 0;
         for layer in &mut self.layers {

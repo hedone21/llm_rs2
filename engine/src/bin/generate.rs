@@ -671,12 +671,28 @@ fn main() -> anyhow::Result<()> {
     // When GPU primary + resilience/partition enabled: ensure weights are CPU-accessible.
     // Maps UnifiedBuffer weights or reads device-only OpenCLBuffer into new UnifiedBuffer.
     // Single VMA (ALLOC_HOST_PTR) — no PSS double-counting on Adreno.
+    //
+    // Preload conditions (in order of cost/necessity):
+    //   1. `--resilience-prealloc-switch`  → SwitchHw needs CPU-accessible weights
+    //   2. `--tensor-partition <r>` where r is NOT the GPU-only fast-path ratio
+    //      (r < GPU_ONLY_THRESHOLD and r > 0) → CPU matmul needs host pointers
+    //   3. `--prefill-cpu-chunk-size > 0`  → CPU-side prefill chunk uses weights
+    //
+    // Notably `--enable-resilience` alone does NOT trigger preload. The
+    // IPC directives that require CPU-accessible weights (`SetPartitionRatio`
+    // with a non-GPU-only ratio, `SwitchHw` to CPU) now lazily invoke
+    // `map_weights_for_cpu()` at the first activation point (see the
+    // directive handler below). This avoids the ~200 ms startup cost and
+    // the 400+ MB RSS uplift that hit every run which only enabled the
+    // manager channel but never actually used CPU-side weight access.
+    #[cfg(feature = "opencl")]
+    let cli_partition_needs_cpu_weights = args.tensor_partition > 0.0
+        && !llm_rs2::layers::tensor_partition::is_gpu_only_ratio(args.tensor_partition);
     #[cfg(feature = "opencl")]
     if is_gpu
         && (args.resilience_prealloc_switch
-            || args.tensor_partition > 0.0
-            || args.prefill_cpu_chunk_size > 0
-            || args.enable_resilience)
+            || cli_partition_needs_cpu_weights
+            || args.prefill_cpu_chunk_size > 0)
     {
         match model.map_weights_for_cpu(&backend) {
             Ok(n) if n > 0 => eprintln!(
@@ -704,8 +720,19 @@ fn main() -> anyhow::Result<()> {
 
     // Tensor partition: split FFN gate/up weights for CPU-GPU cooperative inference.
     // Requires weights to be CPU-accessible (after map_weights_for_cpu).
+    //
+    // When `args.tensor_partition` is inside the GPU-only fast-path band
+    // (>= GPU_ONLY_THRESHOLD), `prepare_tensor_partition` is a no-op and
+    // leaves `partition_ctx = None`; forward() then takes the dense GPU
+    // path. We still call it so the semantics (and the "Prepared 0" log)
+    // are explicit.
     if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
         match model.prepare_tensor_partition(args.tensor_partition, &cpu_backend_arc) {
+            Ok(0) => eprintln!(
+                "[Partition] ratio={:.3} treated as GPU-only (>= {:.3}); partition path disabled",
+                args.tensor_partition,
+                llm_rs2::layers::tensor_partition::GPU_ONLY_THRESHOLD,
+            ),
             Ok(n) => eprintln!(
                 "[Partition] Prepared {} weights with ratio {:.2}",
                 n, args.tensor_partition
@@ -3866,34 +3893,76 @@ fn main() -> anyhow::Result<()> {
                         gen_ws.partition_ws = None;
                         eprintln!("[Partition] Disabled (ratio={})", ratio);
                         executor.set_partition_ratio(0.0);
-                    } else if model.layers[0].wq.as_ptr().is_null() {
+                    } else if llm_rs2::layers::tensor_partition::is_gpu_only_ratio(ratio) {
+                        // GPU-only fast path: clear any existing partition context
+                        // so forward() skips the host staging / CPU matmul / merge
+                        // path entirely. No lazy `map_weights_for_cpu` needed here
+                        // because the CPU side is unused at this ratio.
+                        for layer in &mut model.layers {
+                            layer.partition_ctx = None;
+                        }
+                        gen_ws.partition_ws = None;
                         eprintln!(
-                            "[Partition] ratio={} rejected — weights not CPU-accessible.",
-                            ratio
+                            "[Partition] ratio={:.3} treated as GPU-only (>= {:.3}); partition path disabled",
+                            ratio,
+                            llm_rs2::layers::tensor_partition::GPU_ONLY_THRESHOLD,
                         );
+                        executor.set_partition_ratio(ratio);
                     } else {
-                        // Re-split weights with new ratio
-                        match model.prepare_tensor_partition(ratio, &cpu_backend_arc) {
-                            Ok(n) => {
-                                eprintln!(
-                                    "[Partition] Re-split {} weights with ratio {:.2}",
-                                    n, ratio
-                                );
-                                // Reallocate workspace
-                                if let Some(ref ctx) = model.layers[0].partition_ctx {
-                                    let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
-                                    gen_ws.partition_ws = Some(PartitionWorkspace::new(
-                                        ctx,
-                                        ffn_hidden,
-                                        hidden_size,
-                                        &gpu_alloc,
-                                        backend.clone(),
-                                        cpu_backend_arc.clone(),
-                                    )?);
+                        // Lazy activation: if weights are still GPU-only (null host
+                        // ptr — the normal state when `--enable-resilience` alone
+                        // was used without `--tensor-partition`), map them now. This
+                        // moves the ~200 ms / +400 MB RSS cost from startup to the
+                        // first `SetPartitionRatio` directive that actually needs
+                        // CPU-accessible weights. The one-shot first-activation
+                        // stall is logged for downstream TBT accounting.
+                        let mut lazy_map_ok = true;
+                        #[cfg(feature = "opencl")]
+                        if is_gpu && model.layers[0].wq.as_ptr().is_null() {
+                            let t0 = std::time::Instant::now();
+                            match model.map_weights_for_cpu(&backend) {
+                                Ok(n) if n > 0 => eprintln!(
+                                    "[Partition] Lazy-mapped {} weight tensors for CPU access in {:.1} ms (first-activation stall)",
+                                    n,
+                                    t0.elapsed().as_secs_f64() * 1000.0,
+                                ),
+                                Ok(_) => {}
+                                Err(e) => {
+                                    eprintln!(
+                                        "[Partition] Lazy weight map failed: {} — ratio={} rejected.",
+                                        e, ratio
+                                    );
+                                    lazy_map_ok = false;
                                 }
-                                executor.set_partition_ratio(ratio);
                             }
-                            Err(e) => eprintln!("[Partition] Re-split failed: {}", e),
+                        }
+                        // Re-split weights with new ratio (only if lazy map succeeded)
+                        if lazy_map_ok {
+                            match model.prepare_tensor_partition(ratio, &cpu_backend_arc) {
+                                Ok(n) => {
+                                    eprintln!(
+                                        "[Partition] Re-split {} weights with ratio {:.2}",
+                                        n, ratio
+                                    );
+                                    // Reallocate workspace
+                                    if let Some(ref ctx) = model.layers[0].partition_ctx {
+                                        let gpu_alloc =
+                                            make_partition_gpu_alloc(&*backend, decode_mem);
+                                        gen_ws.partition_ws = Some(PartitionWorkspace::new(
+                                            ctx,
+                                            ffn_hidden,
+                                            hidden_size,
+                                            &gpu_alloc,
+                                            backend.clone(),
+                                            cpu_backend_arc.clone(),
+                                        )?);
+                                    } else {
+                                        gen_ws.partition_ws = None;
+                                    }
+                                    executor.set_partition_ratio(ratio);
+                                }
+                                Err(e) => eprintln!("[Partition] Re-split failed: {}", e),
+                            }
                         }
                     }
                 }
@@ -4068,6 +4137,10 @@ fn main() -> anyhow::Result<()> {
                                 "[Partition] RestoreDefaults: re-split {} weights with CLI ratio {:.2}",
                                 n, cli_ratio
                             );
+                            // prepare_tensor_partition returns 0 when cli_ratio is
+                            // in the GPU-only fast-path band; partition_ctx is then
+                            // None and we must clear any stale workspace so forward()
+                            // stays on the dense GPU path.
                             if let Some(ref ctx) = model.layers[0].partition_ctx {
                                 let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
                                 if let Ok(ws) = PartitionWorkspace::new(
@@ -4080,6 +4153,8 @@ fn main() -> anyhow::Result<()> {
                                 ) {
                                     gen_ws.partition_ws = Some(ws);
                                 }
+                            } else {
+                                gen_ws.partition_ws = None;
                             }
                             executor.set_partition_ratio(cli_ratio);
                         }

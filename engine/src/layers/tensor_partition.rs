@@ -11,6 +11,35 @@ use std::sync::Arc;
 /// 128 rows ensures alignment with GPU workgroup sizes and Q4_0 block boundaries.
 const ROW_ALIGNMENT: usize = 128;
 
+/// GPU-only fast-path threshold for `gpu_ratio`.
+///
+/// When `gpu_ratio >= GPU_ONLY_THRESHOLD`, the partition activation path is
+/// skipped entirely: `partition_ctx` stays `None`, and the forward pass uses
+/// the dense full-weight matmul on GPU. This avoids the ratio-independent
+/// constant overhead of the partition path (host staging `read_buffer`,
+/// CPU matmul kick-off for a clamped 128-row slice, and GPU<->host merge).
+///
+/// The rationale: `split_weight` clamps `split_row` to `[128, out_dim - 128]`
+/// (Q4_0 alignment requirement). A caller passing `ratio=0.999` still ends up
+/// with 128 CPU rows per weight, forcing the partition dispatch path every
+/// token even though the split is effectively GPU-only. This threshold makes
+/// that corner case behave as the user intends.
+///
+/// 0.995 is chosen empirically:
+///   - For Llama 3.2 1B `ffn_hidden=8192`, 0.995 → CPU gets at most 128 rows
+///     (1.6% of output), which is already the clamp minimum. Anything above
+///     0.995 is structurally equivalent to "clamp min CPU rows" for any sane
+///     FFN size, so skipping the partition path is information-preserving.
+///   - 1.0 is considered GPU-only by design (`generate.rs` CLI gate is
+///     `tensor_partition > 0.0 && tensor_partition < 1.0`).
+pub const GPU_ONLY_THRESHOLD: f32 = 0.995;
+
+/// Returns true when the given ratio should take the GPU-only fast path
+/// (no partition context installed, no per-token host staging).
+pub fn is_gpu_only_ratio(gpu_ratio: f32) -> bool {
+    gpu_ratio >= GPU_ONLY_THRESHOLD
+}
+
 /// A weight tensor split row-wise into GPU and CPU partitions.
 ///
 /// For a weight `W [out_dim, in_dim]`, the split produces:
@@ -306,6 +335,24 @@ mod tests {
             *block = BlockQ4_0::quantize(&src);
         }
         tensor
+    }
+
+    // PA-T1-FASTPATH: GPU-only fast-path threshold classifier is correct.
+    // Ratios at or above `GPU_ONLY_THRESHOLD` must take the fast path
+    // (partition_ctx = None). Ratios strictly below must NOT (real split).
+    #[test]
+    fn test_gpu_only_fast_path_classifier() {
+        // At threshold: fast path.
+        assert!(is_gpu_only_ratio(GPU_ONLY_THRESHOLD));
+        // Above: fast path.
+        assert!(is_gpu_only_ratio(0.999));
+        assert!(is_gpu_only_ratio(1.0));
+        // Below: partition path.
+        assert!(!is_gpu_only_ratio(0.99));
+        assert!(!is_gpu_only_ratio(0.75));
+        assert!(!is_gpu_only_ratio(0.5));
+        assert!(!is_gpu_only_ratio(0.001));
+        assert!(!is_gpu_only_ratio(0.0));
     }
 
     // PA-T1-06: Q4_0 alignment — split_row is a multiple of 128.
