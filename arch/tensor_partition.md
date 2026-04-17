@@ -615,6 +615,14 @@ W_gpu = W[0..out_dim_gpu, :]         → Tensor(shape=[out_dim_gpu, in_dim])
 W_cpu = W[out_dim_gpu..out_dim, :]   → Tensor(shape=[out_dim_cpu, in_dim])
 ```
 
+**gpu_ratio 의미**: **GPU에 할당되는 행의 비율**. 0.0 = 전부 CPU (실제로는 disabled), 1.0 = 전부 GPU (실제로는 disabled). 0.1 = 10% GPU / 90% CPU, 0.9 = 90% GPU / 10% CPU.
+
+**Clamping 주의**: `split_row`은 `[ROW_ALIGNMENT, out_dim - ROW_ALIGNMENT]` = `[128, out_dim-128]`로 강제 clamping된다 (`engine/src/layers/tensor_partition.rs:120-124`). 즉:
+- `gpu_ratio=0.001` → split_row=128 (clamp up) → GPU **128행만**, CPU가 `out_dim-128` 행 처리. "거의 전부 GPU"가 아니라 "거의 전부 CPU".
+- `gpu_ratio=0.999` → split_row=`out_dim-128` → GPU가 `out_dim-128` 행, CPU는 **128행만**.
+
+Partition 활성화 조건은 `args.tensor_partition > 0.0 && args.tensor_partition < 1.0` (`generate.rs:703`). GPU-only 실행을 원하면 플래그를 **생략**하거나 `1.0`으로 지정.
+
 #### Q4_0 Alignment 보장
 
 Q4_0 블록은 32개 값을 하나의 `BlockQ4_0`(18 bytes)로 묶는다.

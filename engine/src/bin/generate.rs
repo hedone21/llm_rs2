@@ -87,8 +87,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     no_gpu_plan: bool,
 
-    /// GPU ratio for tensor partition (0.0~1.0). 0 = disabled.
-    /// Splits FFN gate/up matmul between GPU and CPU for cooperative execution.
+    /// GPU ratio for tensor partition — fraction of FFN gate/up rows assigned to GPU.
+    /// Range (0.0, 1.0): 0.0 = disabled (no split), 1.0 = disabled (no split).
+    /// 0.1 = 10% GPU + 90% CPU, 0.9 = 90% GPU + 10% CPU.
+    /// NOTE: split_row is clamped to [128, out_dim-128], so extreme values like 0.001
+    /// still leave 128 rows on GPU and the rest (CPU-heavy) on CPU — not "almost all GPU".
+    /// Use 1.0 or omit the flag for GPU-only execution.
     #[arg(long, default_value_t = 0.0)]
     tensor_partition: f32,
 

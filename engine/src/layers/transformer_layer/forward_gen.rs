@@ -1010,10 +1010,9 @@ impl TransformerLayer {
         if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
             // ── Partitioned FFN gate/up: cooperative GPU + CPU ──
 
-            // 0. Sync prior GPU ops (rms_norm → residual) then copy to CPU.
-            // Blocking read_buffer on in-order queue also syncs, but explicit
-            // synchronize() gives the driver a cleaner pipeline drain signal.
-            backend.synchronize()?;
+            // 0. Copy residual to CPU. Blocking read_buffer on in-order queue
+            // implicitly syncs prior rms_norm → residual write; explicit synchronize()
+            // is redundant and adds per-layer pipeline drain cost.
             unsafe {
                 let dst = std::slice::from_raw_parts_mut(
                     pw.residual_cpu.as_mut_ptr(),
@@ -1027,10 +1026,66 @@ impl TransformerLayer {
             backend.matmul_transposed(&ws.residual, &part.up.gpu_slice, &mut pw.up_gpu)?;
             backend.flush()?;
 
-            // 2. CPU: blocking partial matmuls (GPU runs in parallel after flush)
+            // 2. CPU: fused matmul for gate + up (shares x quantization + SpinPool dispatch).
+            // GPU runs in parallel after flush().
             let cpu = &part.cpu_backend;
-            cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
-            cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
+            #[cfg(target_arch = "aarch64")]
+            let cpu_slice_dtype = part.gate.cpu_slice.dtype();
+            #[cfg(target_arch = "aarch64")]
+            let used_fused = if cpu.name().contains("CPU") && cpu_slice_dtype == DType::F16 {
+                let k = pw.residual_cpu.shape().dims()
+                    [pw.residual_cpu.shape().dims().len() - 1];
+                unsafe {
+                    crate::backend::cpu::neon::fused_matmul_f16(
+                        pw.residual_cpu.as_ptr() as *const f32,
+                        k,
+                        &[
+                            (
+                                part.gate.cpu_slice.as_ptr() as *const u16,
+                                pw.gate_cpu.as_mut_ptr() as *mut f32,
+                                part.gate.cpu_slice.shape().dims()[0],
+                            ),
+                            (
+                                part.up.cpu_slice.as_ptr() as *const u16,
+                                pw.up_cpu.as_mut_ptr() as *mut f32,
+                                part.up.cpu_slice.shape().dims()[0],
+                            ),
+                        ],
+                    );
+                }
+                true
+            } else if cpu.name().contains("CPU") && cpu_slice_dtype == DType::Q4_0 {
+                use crate::core::quant::BlockQ4_0;
+                let k = pw.residual_cpu.shape().dims()
+                    [pw.residual_cpu.shape().dims().len() - 1];
+                unsafe {
+                    crate::backend::cpu::neon::fused_matmul_q4_0(
+                        pw.residual_cpu.as_ptr() as *const f32,
+                        k,
+                        &[
+                            (
+                                part.gate.cpu_slice.as_ptr() as *const BlockQ4_0,
+                                pw.gate_cpu.as_mut_ptr() as *mut f32,
+                                part.gate.cpu_slice.shape().dims()[0],
+                            ),
+                            (
+                                part.up.cpu_slice.as_ptr() as *const BlockQ4_0,
+                                pw.up_cpu.as_mut_ptr() as *mut f32,
+                                part.up.cpu_slice.shape().dims()[0],
+                            ),
+                        ],
+                    );
+                }
+                true
+            } else {
+                false
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let used_fused = false;
+            if !used_fused {
+                cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
+                cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
+            }
 
             // 3+4. Merge via copy_slice: GPU→GPU copy + CPU→GPU write, no host staging.
             // On OpenCL in-order queue the copy_slice after GPU matmuls is serialized,

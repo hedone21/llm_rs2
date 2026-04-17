@@ -606,9 +606,10 @@ impl TransformerLayer {
                 // ── Partitioned FFN gate/up (prefill): cooperative GPU + CPU ──
                 let total_rows = batch_size * seq_len;
 
-                // Copy normalized x to CPU
+                // Copy normalized x to CPU. Blocking read_buffer below implicitly
+                // syncs prior GPU ops on the in-order queue; explicit synchronize()
+                // is redundant.
                 let x_cpu_bytes = batch_size * seq_len * dim * 4;
-                backend.synchronize()?;
                 let x_cpu_buf = Galloc::new().alloc(x_cpu_bytes, DType::F32)?;
                 let x_cpu = Tensor::new(x.shape().clone(), x_cpu_buf, part.cpu_backend.clone());
                 unsafe {
