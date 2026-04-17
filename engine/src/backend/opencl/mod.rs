@@ -2762,6 +2762,44 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn write_buffer_range(&self, t: &mut Tensor, src: &[u8], dst_offset: usize) -> Result<()> {
+        let end = dst_offset
+            .checked_add(src.len())
+            .ok_or_else(|| anyhow::anyhow!("write_buffer_range: offset+len overflow"))?;
+        if end > t.size() {
+            anyhow::bail!(
+                "write_buffer_range: out of bounds ({} + {} > {})",
+                dst_offset,
+                src.len(),
+                t.size()
+            );
+        }
+        if let Ok(dst_mem) = get_cl_mem(t.buffer().as_ref()) {
+            // Partial blocking write starting at `dst_offset` bytes into the buffer.
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &self.queue,
+                    dst_mem,
+                    true,
+                    dst_offset,
+                    src,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )?;
+            }
+        } else {
+            // Mapped / host-ptr buffer: direct offset memcpy
+            let dst_ptr = t.as_mut_ptr();
+            if dst_ptr.is_null() {
+                anyhow::bail!("write_buffer_range: null pointer in destination tensor");
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr.add(dst_offset), src.len());
+            }
+        }
+        Ok(())
+    }
+
     fn synchronize(&self) -> Result<()> {
         ocl::core::finish(&self.queue)?;
         Ok(())

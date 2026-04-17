@@ -371,6 +371,36 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// Write host bytes into a sub-range of a backend buffer starting at
+    /// `dst_offset`. Used by callers that keep a max-capacity buffer but only
+    /// need to upload the currently-valid prefix (e.g. `OffloadKVCache` staging
+    /// a GPU KV view of length `current_pos` into a `max_seq_len`-sized buffer).
+    ///
+    /// Default: memcpy into the tensor's mapped pointer at `dst_offset`.
+    /// GPU backends should override with a bounded `enqueue_write_buffer` to
+    /// avoid requiring a full-capacity write.
+    fn write_buffer_range(&self, t: &mut Tensor, src: &[u8], dst_offset: usize) -> Result<()> {
+        let dst_ptr = t.as_mut_ptr();
+        if dst_ptr.is_null() {
+            anyhow::bail!("Cannot write to null buffer (not mapped)");
+        }
+        let end = dst_offset
+            .checked_add(src.len())
+            .ok_or_else(|| anyhow::anyhow!("write_buffer_range: offset+len overflow"))?;
+        if end > t.size() {
+            anyhow::bail!(
+                "write_buffer_range: out of bounds ({} + {} > {})",
+                dst_offset,
+                src.len(),
+                t.size()
+            );
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), dst_ptr.add(dst_offset), src.len());
+        }
+        Ok(())
+    }
+
     // Type casting (e.g. F32 → F16)
     fn cast(&self, src: &Tensor, dst: &mut Tensor) -> Result<()>;
 

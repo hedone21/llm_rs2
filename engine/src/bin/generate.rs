@@ -5792,7 +5792,12 @@ fn run_offload(
         );
     }
 
-    // Create OffloadKVCache per layer
+    // Create OffloadKVCache per layer. When the main backend is a GPU, wire it
+    // (plus the matching memory allocator) so `get_view()` uploads the KV bytes
+    // to device buffers that `attention_gen` can read via `cl_mem`. Without
+    // this, OpenCL backends would see a null `cl_mem` from the default CPU
+    // `SharedBuffer` and fail at kernel arg binding.
+    let is_gpu_backend = backend.as_ref().is_gpu();
     let mut kv_caches: Vec<OffloadKVCache> = (0..num_layers)
         .map(|layer_id| {
             let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> = match offload_mode {
@@ -5807,7 +5812,12 @@ fn run_offload(
                 ),
                 _ => panic!("Unknown offload mode: {}", offload_mode),
             };
-            OffloadKVCache::new(layer_id, kv_heads, head_dim, kv_dtype, max_seq_len, store)
+            let mut c =
+                OffloadKVCache::new(layer_id, kv_heads, head_dim, kv_dtype, max_seq_len, store);
+            if is_gpu_backend {
+                c.set_gpu_backend(backend.clone(), memory.clone());
+            }
+            c
         })
         .collect();
 

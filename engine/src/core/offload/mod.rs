@@ -15,8 +15,10 @@ pub mod store;
 
 use crate::backend::cpu::CpuBackend;
 use crate::buffer::shared_buffer::SharedBuffer;
+use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::kv_cache::{KVCacheOps, KVLayout};
+use crate::core::memory::Memory;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use anyhow::Result;
@@ -61,8 +63,20 @@ pub struct OffloadKVCache {
     out_k_buf: Option<Arc<SharedBuffer>>,
     /// Reusable output SharedBuffer for V (R-P2: avoid per-call allocation).
     out_v_buf: Option<Arc<SharedBuffer>>,
-    /// Shared CPU backend for creating output tensors.
+    /// Shared CPU backend for creating output tensors (default path).
     out_backend: Arc<CpuBackend>,
+    /// Optional GPU backend for attention. When set via `set_gpu_backend`, `get_view()`
+    /// uploads the CPU-resident KV data to GPU buffers so `attention_gen` can consume
+    /// them directly. Without this, OpenCL backends would see null `cl_mem` and fail.
+    gpu_backend: Option<Arc<dyn Backend>>,
+    /// Memory allocator matched to `gpu_backend` — used to allocate the GPU-side
+    /// upload buffers in `get_view()`. `None` when running on CPU backend.
+    gpu_memory: Option<Arc<dyn Memory>>,
+    /// Reusable GPU output buffer for K (allocated lazily in `get_view()` when
+    /// `gpu_backend` is set). Grows to `max_seq_len * token_bytes`.
+    gpu_k_buf: Option<Arc<dyn Buffer>>,
+    /// Reusable GPU output buffer for V (see `gpu_k_buf`).
+    gpu_v_buf: Option<Arc<dyn Buffer>>,
     /// Number of tokens written to attn_buf but not yet flushed to store.
     /// When preloaded, decode updates go to attn_buf only; store catches up on release.
     store_behind: usize,
@@ -96,8 +110,23 @@ impl OffloadKVCache {
             out_k_buf: None,
             out_v_buf: None,
             out_backend: Arc::new(CpuBackend::new()),
+            gpu_backend: None,
+            gpu_memory: None,
+            gpu_k_buf: None,
+            gpu_v_buf: None,
             store_behind: 0,
         }
+    }
+
+    /// Wire up a GPU backend + matching `Memory` allocator so `get_view()` can
+    /// upload KV data to device-side buffers that the attention kernel can read.
+    ///
+    /// Must be called once after construction when running on an OpenCL/CUDA
+    /// backend. CPU-only runs may skip this — `get_view()` will then fall back
+    /// to returning host-backed `SharedBuffer` tensors.
+    pub fn set_gpu_backend(&mut self, backend: Arc<dyn Backend>, memory: Arc<dyn Memory>) {
+        self.gpu_backend = Some(backend);
+        self.gpu_memory = Some(memory);
     }
 
     /// Migrate data from an existing KVCache (raw buffer copy).
@@ -265,13 +294,38 @@ impl KVCacheOps for OffloadKVCache {
             ));
         }
 
-        // Read raw data from tensors
-        let k_ptr = new_k.buffer().as_ptr();
-        let v_ptr = new_v.buffer().as_ptr();
         let expected_bytes = seq_len * self.token_bytes;
 
-        let k_data = unsafe { std::slice::from_raw_parts(k_ptr, expected_bytes) };
-        let v_data = unsafe { std::slice::from_raw_parts(v_ptr, expected_bytes) };
+        // Resolve host-accessible byte slices for K and V.
+        //
+        // For CPU-backed tensors `buffer().as_ptr()` is valid, so we can borrow
+        // directly. For GPU-only buffers (e.g. OpenCL `OpenCLBuffer`, unmapped
+        // `UnifiedBuffer`) `as_ptr()` returns null — blindly feeding that to
+        // `memmove` via `std::slice::from_raw_parts` would fault inside libc
+        // (seen as `SIGSEGV __memmove_aarch64_nt` / `EFAULT` from write(2)).
+        // In that case, read the tensor back into a staging buffer via the
+        // tensor's own backend (`backend.read_buffer`).
+        let k_ptr = new_k.buffer().as_ptr();
+        let v_ptr = new_v.buffer().as_ptr();
+
+        let mut k_staging: Vec<u8>;
+        let mut v_staging: Vec<u8>;
+        let (k_data, v_data): (&[u8], &[u8]) = if !k_ptr.is_null() && !v_ptr.is_null() {
+            // Fast path: borrow tensor bytes directly.
+            unsafe {
+                (
+                    std::slice::from_raw_parts(k_ptr, expected_bytes),
+                    std::slice::from_raw_parts(v_ptr, expected_bytes),
+                )
+            }
+        } else {
+            // GPU-only tensors: stage through host memory via backend readback.
+            k_staging = vec![0u8; expected_bytes];
+            v_staging = vec![0u8; expected_bytes];
+            new_k.backend().read_buffer(new_k, &mut k_staging)?;
+            new_v.backend().read_buffer(new_v, &mut v_staging)?;
+            (&k_staging[..], &v_staging[..])
+        };
 
         if seq_len == 1 {
             if self.preloaded
@@ -309,12 +363,12 @@ impl KVCacheOps for OffloadKVCache {
 
     fn get_view(&mut self) -> (Tensor, Tensor) {
         let total = self.current_pos;
-        let backend: Arc<dyn crate::core::backend::Backend> = self.out_backend.clone();
+        let cpu_backend: Arc<dyn crate::core::backend::Backend> = self.out_backend.clone();
 
         if total == 0 {
             let buf = Arc::new(SharedBuffer::new(0, self.dtype));
             let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
-            let t = Tensor::new(shape.clone(), buf.clone(), backend.clone());
+            let t = Tensor::new(shape.clone(), buf.clone(), cpu_backend.clone());
             return (t.clone(), t);
         }
 
@@ -348,7 +402,7 @@ impl KVCacheOps for OffloadKVCache {
                 log::error!("OffloadKVCache[{}] load failed: {}", self.layer_id, e);
                 let buf = Arc::new(SharedBuffer::new(0, self.dtype));
                 let shape = Shape::new(vec![1, 0, self.kv_heads, self.head_dim]);
-                let t = Tensor::new(shape.clone(), buf.clone(), backend.clone());
+                let t = Tensor::new(shape.clone(), buf.clone(), cpu_backend.clone());
                 return (t.clone(), t);
             }
         }
@@ -357,6 +411,67 @@ impl KVCacheOps for OffloadKVCache {
 
         let shape = Shape::new(vec![1, total, self.kv_heads, self.head_dim]);
 
+        // GPU path: when a GPU backend has been wired via `set_gpu_backend`,
+        // upload the staged KV bytes into device buffers. This is required on
+        // OpenCL / CUDA backends because `attention_gen` calls `get_cl_mem` on
+        // the tensors — a CPU `SharedBuffer` has no `cl_mem` and would error.
+        //
+        // The GPU buffers are allocated once at `max_bytes` (max_seq_len
+        // capacity) and reused across tokens. Each `get_view()` only writes
+        // the currently-valid prefix (`total_bytes`) via `write_buffer_range`,
+        // so decode sees ~1 token-worth of upload per layer. On ARM UMA those
+        // GPU buffers are `CL_MEM_ALLOC_HOST_PTR`, making the enqueue a near-
+        // zero memcpy into shared SoC memory.
+        if let (Some(gpu_be), Some(gpu_mem)) = (&self.gpu_backend, &self.gpu_memory) {
+            let need_alloc = self
+                .gpu_k_buf
+                .as_ref()
+                .map(|b| b.size() < max_bytes)
+                .unwrap_or(true);
+            if need_alloc {
+                self.gpu_k_buf = Some(
+                    gpu_mem
+                        .alloc(max_bytes, self.dtype)
+                        .expect("OffloadKVCache get_view: failed to allocate GPU K buffer"),
+                );
+                self.gpu_v_buf = Some(
+                    gpu_mem
+                        .alloc(max_bytes, self.dtype)
+                        .expect("OffloadKVCache get_view: failed to allocate GPU V buffer"),
+                );
+            }
+            let gpu_k = self.gpu_k_buf.as_ref().unwrap().clone();
+            let gpu_v = self.gpu_v_buf.as_ref().unwrap().clone();
+
+            // Wrap the (full-capacity) device buffers as tensors whose `shape`
+            // covers only the valid [0..total] prefix — downstream kernels
+            // index via shape, not buffer size. The underlying buffer's
+            // `size()` remains `max_bytes`, so we must use `write_buffer_range`
+            // (partial upload) rather than `write_buffer` (which asserts
+            // `src.len() == t.size()`).
+            let mut k_tensor = Tensor::new(shape.clone(), gpu_k, gpu_be.clone());
+            let mut v_tensor = Tensor::new(shape, gpu_v, gpu_be.clone());
+
+            if let Err(e) = gpu_be.write_buffer_range(&mut k_tensor, &k_attn[..total_bytes], 0) {
+                log::error!(
+                    "OffloadKVCache[{}] GPU K upload failed: {}",
+                    self.layer_id,
+                    e
+                );
+            }
+            if let Err(e) = gpu_be.write_buffer_range(&mut v_tensor, &v_attn[..total_bytes], 0) {
+                log::error!(
+                    "OffloadKVCache[{}] GPU V upload failed: {}",
+                    self.layer_id,
+                    e
+                );
+            }
+
+            return (k_tensor, v_tensor);
+        }
+
+        // CPU fallback: return SharedBuffer-backed tensors with a copy of the
+        // active region (preserves the prior behavior for test paths).
         // R-P2: Reuse output SharedBuffers when possible
         let k_buf = Self::reuse_or_alloc_out_buf(&mut self.out_k_buf, total_bytes, self.dtype);
         let v_buf = Self::reuse_or_alloc_out_buf(&mut self.out_v_buf, total_bytes, self.dtype);
@@ -365,8 +480,8 @@ impl KVCacheOps for OffloadKVCache {
             std::ptr::copy_nonoverlapping(v_attn.as_ptr(), v_buf.as_mut_ptr(), total_bytes);
         }
 
-        let k_tensor = Tensor::new(shape.clone(), k_buf, backend.clone());
-        let v_tensor = Tensor::new(shape, v_buf, backend);
+        let k_tensor = Tensor::new(shape.clone(), k_buf, cpu_backend.clone());
+        let v_tensor = Tensor::new(shape, v_buf, cpu_backend);
 
         (k_tensor, v_tensor)
     }
