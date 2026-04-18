@@ -43,29 +43,26 @@ error: linker `/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch6
 
 **원인**
 
-`.cargo/config.toml`에 NDK 경로가 `/opt/android-ndk/`로 하드코딩되어 있습니다:
-
-```toml
-# .cargo/config.toml
-[target.aarch64-linux-android]
-linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
-ar = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
-```
-
-반면 `android.source`는 다른 경로(`/home/go/.opt/android-ndk-r27d`)를 설정하며, API 레벨도 다릅니다 (config.toml은 `android35`, android.source는 `android21`).
+과거 `.cargo/config.toml`이 NDK 경로를 절대경로로 하드코딩해 mac/linux 호스트 간 충돌이 있었습니다. 현재는 `hosts.toml` 기반으로 `run_device.py`/`builder.py`가 호스트별 NDK 경로를 자동 주입합니다.
 
 **해결**
 
-1. `source android.source`를 **반드시** 먼저 실행하여 환경 변수를 설정합니다:
+1. 최초 1회 `hosts.toml`을 생성합니다 (NDK 자동 감지):
 
 ```bash
-source android.source
-cargo build --target aarch64-linux-android --release --bin generate
+python scripts/device_registry.py bootstrap-host
+# 또는: cp hosts.toml.example hosts.toml && 수동 편집
 ```
 
-2. `android.source`가 설정하는 `CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER` 환경 변수가 `.cargo/config.toml`의 `linker` 설정을 **오버라이드**합니다. 환경 변수가 cargo config보다 우선순위가 높으므로 `source android.source` 후에는 config.toml의 하드코딩 경로가 무시됩니다.
+2. `run_device.py`로 빌드합니다 — `hosts.toml`에서 현재 호스트의 toolchain 경로를 읽어 `CC_*`, `CARGO_TARGET_*_LINKER` 등을 자동 설정합니다:
 
-3. NDK가 시스템에 설치되어 있지 않다면, `android.source`의 `NDK_HOME` 경로를 자신의 NDK 설치 경로로 수정하세요.
+```bash
+python scripts/run_device.py -d pixel --skip-exec generate
+```
+
+3. NDK가 다른 위치에 설치되어 있다면 `hosts.toml`의 `[hosts.<id>.toolchains.android-ndk]` 블록에서 `ndk_home` 경로를 수정합니다. `bootstrap-host`는 `/opt/homebrew/share/android-ndk`, `/opt/android-ndk`, `$ANDROID_NDK_HOME`, `$NDK_HOME`을 순차 프로빙합니다.
+
+4. (Legacy) `source android.source`도 여전히 동작하지만 deprecated입니다 — `builder.py`가 `DeprecationWarning`을 emit합니다.
 
 ---
 
@@ -170,33 +167,32 @@ ld: error: unable to find library -lgcc
 
 **원인**
 
-`android.source`에서 설정하는 환경 변수들이 누락되었습니다:
-
-```bash
-export CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang
-export CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang++
-export AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar
-export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android21-clang
-```
-
-`source android.source` 없이 빌드하면 cargo가 시스템 기본 `cc`를 linker로 사용하려 하므로 크로스 컴파일이 실패합니다.
+cargo가 NDK toolchain 경로(`CC_*`, `CARGO_TARGET_*_LINKER` 등)를 알지 못합니다. 정상 흐름에서는 `run_device.py` → `builder.py:_compose_toolchain_env()`가 `hosts.toml`을 읽어 이 변수들을 빌드 subprocess env에 주입합니다.
 
 **해결**
 
-1. **반드시** 빌드 전에 `source android.source`를 실행합니다:
+1. `hosts.toml`이 존재하는지 확인합니다 (없으면 생성):
 
 ```bash
-source android.source
-cargo build --target aarch64-linux-android --release --bin generate
+ls hosts.toml || python scripts/device_registry.py bootstrap-host
 ```
 
-2. `$NDK_HOME` 경로가 실제 NDK 설치 위치를 가리키는지 확인합니다:
+2. `run_device.py` 경유로 빌드합니다 (cargo 직접 호출 X):
 
 ```bash
-ls $NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/
+python scripts/run_device.py -d pixel --skip-exec generate
 ```
 
-3. 새 터미널을 열 때마다 `source android.source`를 재실행해야 합니다. 환경 변수는 현재 셸 세션에만 적용됩니다.
+3. 그래도 실패하면 `hosts.toml`의 `ndk_home` 경로 + `host_tag`로 조합한 toolchain bin이 실제 존재하는지 확인합니다:
+
+```bash
+# hosts.toml에 ndk_home="/opt/homebrew/share/android-ndk", host_tag="darwin-x86_64"라면:
+ls /opt/homebrew/share/android-ndk/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android21-clang
+```
+
+부재 시 `builder.py`가 `ToolchainNotFoundError(expected: <경로>)`로 정확한 누락 경로를 알려줍니다.
+
+4. CI/Docker 등 호스트 자동 감지가 모호한 환경에서는 `LLM_RS2_HOST=<id>` env로 강제 지정합니다.
 
 ---
 

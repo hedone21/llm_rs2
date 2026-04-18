@@ -87,12 +87,13 @@ python scripts/convert_safetensors_to_gguf.py models/llama3.2-1b models/llama3.2
 ### 온디바이스 (Android, Adreno GPU) 추론
 
 ```bash
-# 빌드
-source android.source
-cargo build --release --target aarch64-linux-android
+# 최초 1회: 호스트 toolchain 등록 (NDK 자동 감지)
+python scripts/device_registry.py bootstrap-host
 
-# 배포 (Safetensors)
-adb push target/aarch64-linux-android/release/generate /data/local/tmp/
+# 빌드 + 배포 (run_device.py가 hosts.toml로 NDK env 자동 주입)
+python scripts/run_device.py -d pixel --skip-exec generate
+
+# 모델 가중치는 한 번만
 adb push -r models/qwen2.5-1.5b /data/local/tmp/models/qwen2.5-1.5b
 
 # 실행 (Safetensors + GPU + Q4)
@@ -1684,23 +1685,22 @@ python scripts/stress_test_device.py --device pixel --phases 4,5
 
 ### 5.1 빌드 & 배포
 
-**Android 크로스 컴파일**
+**Android 크로스 컴파일** (run_device.py 경유 권장 — 아래 "통합 러너" 섹션 참조)
 
 ```bash
-# NDK 환경 설정 (프로젝트 루트의 android.source 사용)
-source android.source
+# 최초 1회: 호스트 toolchain 등록 (NDK 자동 감지 → hosts.toml 생성)
+python scripts/device_registry.py bootstrap-host
 
-# generate 빌드
-cargo build --release --target aarch64-linux-android --bin generate
-
-# manager 관련 빌드
-cargo build --release --target aarch64-linux-android \
-  --bin mock_manager -p llm_manager --no-default-features
+# generate + manager 동시 빌드 + 푸시 (실행은 안 함)
+python scripts/run_device.py -d pixel --skip-exec generate --extra-bin llm_manager
 
 # 결과물 위치
 # target/aarch64-linux-android/release/generate
-# target/aarch64-linux-android/release/mock_manager
+# target/aarch64-linux-android/release/llm_manager
 ```
+
+> cargo 직접 호출이 필요하면 `source android.source && cargo build --target aarch64-linux-android ...`도 가능하나
+> `android.source`는 mac/linux 호스트 토글이 수동이라 **deprecated**. `hosts.toml` 흐름을 권장.
 
 **Jetson 크로스 컴파일**
 
@@ -1739,7 +1739,7 @@ python scripts/run_device.py -d pixel --skip-build generate --prompt "Hello" -n 
 python scripts/run_device.py -d pixel --dry-run generate --prompt "Hello" -n 50
 ```
 
-**수동 배포**
+**수동 배포** (run_device.py 미사용 시)
 
 ```bash
 adb push target/aarch64-linux-android/release/generate /data/local/tmp/llm_rs2/
@@ -1877,7 +1877,7 @@ serial = ""   # 빈 문자열 = 첫 연결 디바이스
 
 [devices.pixel.build]
 target = "aarch64-linux-android"
-env_file = "android.source"
+toolchain = "android-ndk"   # hosts.toml에 정의된 toolchain id
 binary_dir = "target/aarch64-linux-android/release"
 
 [devices.pixel.paths]

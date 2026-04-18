@@ -38,9 +38,15 @@ cargo build --release -p llm_rs2 --bin generate
 ### Android (aarch64)
 
 ```bash
-source android.source
-cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
+# 최초 1회: hosts.toml 생성 (NDK 자동 감지)
+python scripts/device_registry.py bootstrap-host
+
+# run_device.py가 hosts.toml로 NDK env를 자동 주입
+python scripts/run_device.py -d pixel --skip-exec generate
 # 결과: target/aarch64-linux-android/release/generate
+
+# cargo 직접 호출 (비권장):
+# source android.source && cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
 ```
 
 ### 전체 바이너리 한번에
@@ -80,7 +86,7 @@ type = "adb"
 serial = ""                             # 빈 문자열 = 첫 연결 디바이스
 [devices.pixel.build]
 target = "aarch64-linux-android"
-env_file = "android.source"
+toolchain = "android-ndk"               # hosts.toml에 정의된 toolchain id
 binary_dir = "target/aarch64-linux-android/release"
 [devices.pixel.paths]
 work_dir = "/data/local/tmp"
@@ -94,7 +100,7 @@ lib_dir = "/data/local/tmp"             # LD_LIBRARY_PATH (OpenCL 라이브러�
 | | 호스트 | Android 디바이스 |
 |---|--------|-----------------|
 | 빌드 타겟 | 네이티브 | `aarch64-linux-android` |
-| 환경 소싱 | 없음 | `source android.source` |
+| 환경 소싱 | 없음 | `hosts.toml` (run_device.py가 자동 주입) |
 | 모델 경로 | `models/llama3.2-1b/` | `/data/local/tmp/models/llama3.2-1b` |
 | 실행 | 직접 `./target/release/generate` | `adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate"` |
 | GPU | 없음 | Adreno (OpenCL) |
@@ -609,7 +615,8 @@ python experiments/qcf_validation/scripts/run_mmlu.py --download
 │   ├── analysis/                        # 분석 스크립트
 │   ├── qcf_validation/                  # QCF 검증 실험
 │   └── reports/                         # 리포트
-├── devices.toml                         # 디바이스 레지스트리
-├── android.source                       # NDK 크로스 컴파일 환경
+├── devices.toml                         # 디바이스 레지스트리 (배포 타겟)
+├── hosts.toml.example                   # 빌드 호스트별 toolchain 템플릿
+├── android.source                       # [DEPRECATED] hosts.toml로 대체
 └── results/data/                        # 실험 결과 JSON (커밋됨)
 ```

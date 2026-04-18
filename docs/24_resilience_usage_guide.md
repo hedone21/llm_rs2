@@ -26,10 +26,11 @@ Resilience 기능은 `resilience` feature로 게이팅되어 있습니다.
 # resilience feature 포함 빌드
 cargo build --release --bin generate --features resilience
 
-# Android 크로스 컴파일
-source android.source
-cargo build --target aarch64-linux-android --release \
-  --bin generate --features resilience
+# Android 크로스 컴파일 (run_device.py가 hosts.toml로 NDK env 자동 주입)
+python scripts/run_device.py -d pixel --skip-exec generate
+# 또는 cargo 직접 호출 (비권장):
+# source android.source && cargo build --target aarch64-linux-android --release \
+#   --bin generate --features resilience
 ```
 
 feature 없이 빌드하면 `--enable-resilience` 플래그가 존재하지만 아무 동작도 하지 않습니다 (dead code 제거됨).

@@ -186,7 +186,7 @@ Architect에게 spec-manage 스킬 사용을 명시하여 다음을 요청한다
 - `.cl` 커널 파일: 명시적 지시 없이 수정 금지
 - KV cache 변경 시: HeadMajor 레이아웃 가정 유지
 - Backend 트레이트 변경 시: CPU/OpenCL 양쪽 구현 필수
-- Android 크로스 컴파일: `source android.source` 선행
+- Android 크로스 컴파일: `run_device.py`가 `hosts.toml`로 NDK env 자동 주입 (최초 1회 `bootstrap-host` 필요)
 - 성능 코드: ARM64 NEON/dotprod, Adreno GPU 특성 고려
 - 커밋: Conventional Commits 형식 (`type(scope): subject`)
 

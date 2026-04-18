@@ -486,8 +486,9 @@ KiviCache 데이터 흐름:
 llm_rs2/
 ├── ARCHITECTURE.md          # 본 문서
 ├── Cargo.toml               # Workspace 루트 (engine, shared, manager)
-├── devices.toml             # 디바이스 레지스트리 설정
-├── android.source           # Android 크로스컴파일 환경 변수
+├── devices.toml             # 디바이스 레지스트리 (배포 타겟)
+├── hosts.toml.example       # 빌드 호스트별 toolchain 템플릿 (실 hosts.toml은 gitignored)
+├── android.source           # [DEPRECATED] hosts.toml로 대체됨 (PR cleanup 예정)
 │
 ├── engine/                  # ★ LLM 추론 엔진 (llm_rs2 crate)
 │   ├── Cargo.toml
@@ -1044,10 +1045,11 @@ cargo test --features resilience --test test_resilience_integration
 
 ### 8.5. Android 디바이스 테스트
 ```bash
-source android.source
-cargo build --target aarch64-linux-android --release --bin generate --features opencl
-adb push target/aarch64-linux-android/release/generate /data/local/tmp/
-adb shell /data/local/tmp/generate --model-path /data/local/tmp/model --backend opencl
+# 최초 1회: hosts.toml 생성 (NDK 자동 감지)
+python scripts/device_registry.py bootstrap-host
+
+# 빌드 + 배포 + 실행 (run_device.py가 NDK env 자동 주입)
+python scripts/run_device.py -d pixel generate --backend opencl
 ```
 
 ---

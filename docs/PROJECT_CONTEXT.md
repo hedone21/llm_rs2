@@ -61,13 +61,16 @@
 ## 5. Development Cheat Sheet (Commands)
 
 ### Build
-**Note**: Source `android.source` for NDK environment variables first.
+**Preferred**: use `run_device.py` which auto-injects NDK env from `hosts.toml`. Run `python scripts/device_registry.py bootstrap-host` once to generate `hosts.toml` (NDK auto-detected).
 ```bash
-# Release Build for Android
-cargo build --target aarch64-linux-android --release
+# Build + deploy + run
+python scripts/run_device.py -d pixel generate
 
-# Build specific binary
-cargo build --target aarch64-linux-android --release --bin generate
+# Build + deploy only (no execute)
+python scripts/run_device.py -d pixel --skip-exec generate --extra-bin llm_manager
+
+# Direct cargo (legacy, not recommended): source android.source first
+# cargo build --target aarch64-linux-android --release --bin generate
 ```
 
 ### Usage Guidelines

@@ -17,9 +17,9 @@ cargo check --workspace              # 전체 크레이트 문법 검사
 cargo build -p llm_rs2               # 엔진 빌드
 cargo build -p llm_manager           # 매니저 빌드
 
-# Android 크로스 컴파일 (반드시 source 먼저)
-source android.source
-cargo build --target aarch64-linux-android --release -p llm_rs2 --bin generate
+# Android 크로스 컴파일 (run_device.py가 hosts.toml로 NDK env 자동 주입)
+python scripts/run_device.py -d pixel --skip-exec --skip-deploy generate
+# (cargo 직접 호출은 비권장: source android.source && cargo build --target aarch64-linux-android ...)
 ```
 
 ## 전체 검사 (fmt + clippy + test)
