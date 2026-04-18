@@ -111,25 +111,35 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
 
 > **권장 조합**: Android + OpenCL + Q4 weight. Adreno GPU에서 llama.cpp CPU 대비 약 +23% 속도.
 
-### 온디바이스 (Jetson, CPU) 추론
+### 온디바이스 (Jetson) 추론 — cargo-zigbuild 경로 (권장)
+
+`devices.toml`에 `[devices.jetson]`이 등록되어 있고 `run_device.py`가 빌드→배포→실행을 자동화한다.
+`cargo-zigbuild`가 호스트의 최신 glibc(예: Arch 2.41)와 보드의 구버전 glibc(JetPack 5.1.x = 2.31) 간 호환을 처리한다.
 
 ```bash
-# 방법 1: Jetson에서 네이티브 빌드 (권장)
-# Jetson에 Rust 설치 후:
-RUSTFLAGS='-C target-feature=+neon,+fp16' cargo build --release --no-default-features
-./target/release/generate -m models/qwen2.5-1.5b --prompt "Hello" -n 50
+# CPU
+python scripts/run_device.py -d jetson generate -b cpu --prompt "'Hello'" -n 50
 
-# 방법 2: 호스트에서 크로스 컴파일 (Orin — dotprod/fhm 지원)
-cargo build --release --target aarch64-unknown-linux-gnu --no-default-features
-scp target/aarch64-unknown-linux-gnu/release/generate user@jetson:~/
-
-# 방법 3: 호스트에서 크로스 컴파일 정적 링킹 (Xavier — dotprod/fhm 미지원, glibc 2.31)
-cargo build --release --target aarch64-unknown-linux-musl --no-default-features
-scp target/aarch64-unknown-linux-musl/release/generate user@jetson:~/
+# CUDA (GPU)
+python scripts/run_device.py -d jetson generate -b cuda --prompt "'Hello'" -n 50
 ```
 
-> **주의**: Jetson에는 OpenCL 런타임이 없으므로 `--no-default-features --features cuda`로 빌드하여 CUDA 백엔드를 사용한다.
-> Xavier(Carmel ARMv8.2)는 dotprod/fhm 미지원 — 크로스 컴파일 시 musl 타겟 사용 또는 네이티브 빌드.
+> **prompt에 공백이 있으면 외곽 쌍따옴표 + 내부 홑따옴표** (`"'…'"`)로 감싼다 — SSH 전송 시 셸 토큰화 보호.
+
+#### 호스트 일회성 셋업 (cargo-zigbuild)
+
+`docs/jetson_setup.md` 참조. 요약:
+1. `sudo pacman -S zig` (또는 OS별 zig 설치)
+2. `cargo install cargo-zigbuild`
+3. `~/.cargo/bin`을 PATH에 포함
+4. `ssh-copy-id -p <port> user@jetson` (passwordless ssh 키 등록)
+5. `python scripts/device_registry.py bootstrap-host`로 hosts.toml 생성
+
+#### 백엔드 비고
+
+- Jetson에는 OpenCL 런타임이 없으므로 `cuda` feature를 쓴다 (`devices.jetson.build.features = ["cuda"]`).
+- cudarc는 `fallback-dynamic-loading`이라 호스트에 CUDA SDK 불필요. 보드의 `LD_LIBRARY_PATH=/usr/local/cuda/lib64`만 필요(자동 주입).
+- Xavier(Carmel ARMv8.2)는 dotprod/fhm 미지원이지만 zigbuild 타겟 `aarch64-unknown-linux-gnu.2.31`로 통일 (`+neon,+fp16`만 활성).
 
 ---
 

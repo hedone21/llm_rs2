@@ -68,3 +68,31 @@ os = "android"
 [devices.pixel.manager]
 transport = "unix"
 thermal_zone_types = ["cpu-0-0-usr"]
+
+[devices.jetson]
+name = "Jetson Orin"
+
+[devices.jetson.connection]
+type = "ssh"
+host = "165.132.107.73"
+user = "nvidia"
+port = 4121
+
+[devices.jetson.build]
+target = "aarch64-unknown-linux-gnu"
+# zig_target: glibc 2.31 호환 (Jetson Xavier JetPack 5.1.x = Ubuntu 20.04)
+zig_target = "aarch64-unknown-linux-gnu.2.31"
+binary_dir = "target/aarch64-unknown-linux-gnu/release"
+features = ["cuda"]
+default_features = false
+
+[devices.jetson.paths]
+work_dir = "/home/nvidia/llm_rs2"
+model_dir = "/home/nvidia/llm_rs2/models/llama3.2-1b"
+eval_dir = "/home/nvidia/llm_rs2/eval"
+lib_dir = "/usr/local/cuda/lib64"
+
+[devices.jetson.capabilities]
+arch = "aarch64"
+gpu = "cuda"
+os = "linux"

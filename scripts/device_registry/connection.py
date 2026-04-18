@@ -158,28 +158,92 @@ class AdbConnection(Connection):
 
 
 class SshConnection(Connection):
-    """SSH connection — interface reserved for future implementation."""
+    """SSH connection via openssh client (key-based auth only)."""
 
-    def __init__(self, host: str = "", user: str = "", port: int = 22):
-        raise NotImplementedError("SshConnection is not yet implemented")
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        port: int = 22,
+        identity_file: str = "",
+        extra_options: list[str] | None = None,
+    ) -> None:
+        if not host:
+            raise ValueError("SshConnection: 'host' is required")
+        if not user:
+            raise ValueError("SshConnection: 'user' is required")
+        self._host = host
+        self._user = user
+        self._port = port
+        self._identity_file = identity_file
+        self._extra_options: list[str] = list(extra_options or [])
 
-    def execute(self, command, timeout=None, env_vars=None):
-        raise NotImplementedError
+    def _ssh_base(self) -> list[str]:
+        """Build the base ssh argument list (without remote command)."""
+        args = ["ssh", "-p", str(self._port)]
+        if self._identity_file:
+            args.extend(["-i", self._identity_file])
+        args.extend(self._extra_options)
+        args.append(f"{self._user}@{self._host}")
+        return args
 
-    def push(self, local_path, remote_path):
-        raise NotImplementedError
+    def _scp_base(self) -> list[str]:
+        """Build the base scp argument list (without source/dest)."""
+        args = ["scp", "-P", str(self._port)]
+        if self._identity_file:
+            args.extend(["-i", self._identity_file])
+        args.extend(self._extra_options)
+        return args
 
-    def pull(self, remote_path, local_path):
-        raise NotImplementedError
+    def execute(
+        self,
+        command: str,
+        timeout: int | None = None,
+        env_vars: dict[str, str] | None = None,
+    ) -> CommandResult:
+        env_prefix = ""
+        if env_vars:
+            env_prefix = " ".join(f"{k}={v}" for k, v in env_vars.items()) + " "
+        full_cmd = self._ssh_base() + [f"{env_prefix}{command}"]
+        try:
+            r = subprocess.run(
+                full_cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return CommandResult(r.returncode, r.stdout, r.stderr)
+        except subprocess.TimeoutExpired:
+            return CommandResult(-1, "", f"Command timed out after {timeout}s")
 
-    def file_exists(self, remote_path):
-        raise NotImplementedError
+    def push(self, local_path: str | Path, remote_path: str) -> None:
+        local = Path(local_path)
+        cmd = self._scp_base()
+        if local.is_dir():
+            cmd.append("-r")
+        cmd.append(str(local))
+        cmd.append(f"{self._user}@{self._host}:{remote_path}")
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"scp push failed: {r.stderr}")
 
-    def mkdir(self, remote_path):
-        raise NotImplementedError
+    def pull(self, remote_path: str, local_path: str | Path) -> None:
+        cmd = self._scp_base()
+        cmd.append(f"{self._user}@{self._host}:{remote_path}")
+        cmd.append(str(local_path))
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"scp pull failed: {r.stderr}")
 
-    def chmod(self, remote_path, mode="+x"):
-        raise NotImplementedError
+    def file_exists(self, remote_path: str) -> bool:
+        result = self.execute(f"test -e {remote_path}")
+        return result.returncode == 0
+
+    def mkdir(self, remote_path: str) -> None:
+        self.execute(f"mkdir -p {remote_path}")
+
+    def chmod(self, remote_path: str, mode: str = "+x") -> None:
+        self.execute(f"chmod {mode} {remote_path}")
 
 
 def create_connection(config: ConnectionConfig) -> Connection:
@@ -189,6 +253,12 @@ def create_connection(config: ConnectionConfig) -> Connection:
     elif config.type == "adb":
         return AdbConnection(serial=config.serial)
     elif config.type == "ssh":
-        return SshConnection()
+        return SshConnection(
+            host=config.host,
+            user=config.user,
+            port=config.port,
+            identity_file=config.identity_file,
+            extra_options=config.ssh_options,
+        )
     else:
         raise ValueError(f"Unknown connection type: {config.type}")

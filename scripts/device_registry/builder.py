@@ -110,7 +110,12 @@ def build_binary(
     # Start from a copy of the current environment
     env = dict(os.environ)
 
-    if device_config.build.toolchain:
+    use_zigbuild = bool(device_config.build.zig_target)
+
+    if use_zigbuild:
+        # zigbuild handles linker/CC itself via zig — skip toolchain env composition.
+        pass
+    elif device_config.build.toolchain:
         # New path: compose env from hosts.toml
         try:
             hosts_cfg = load_hosts_config()
@@ -155,9 +160,20 @@ def build_binary(
             print(f"Warning: env_file '{env_file}' not found, skipping")
 
     # Build cargo command
-    cmd_parts = ["cargo", "build", "--release"]
+    if use_zigbuild:
+        cmd_parts = ["cargo", "zigbuild", "--release"]
+    else:
+        cmd_parts = ["cargo", "build", "--release"]
 
-    if device_config.build.target:
+    if device_config.build.features:
+        cmd_parts.extend(["--features", ",".join(device_config.build.features)])
+
+    if not device_config.build.default_features:
+        cmd_parts.append("--no-default-features")
+
+    if use_zigbuild:
+        cmd_parts.extend(["--target", device_config.build.zig_target])
+    elif device_config.build.target:
         cmd_parts.extend(["--target", device_config.build.target])
 
     cmd_parts.extend(["--bin", binary_name])

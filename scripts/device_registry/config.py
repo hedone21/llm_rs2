@@ -203,10 +203,24 @@ def detect_current_host(
 class ConnectionConfig:
     type: str  # "local", "adb", "ssh"
     serial: str = ""
+    # SSH-specific fields
+    host: str = ""
+    user: str = ""
+    port: int = 22
+    identity_file: str = ""
+    ssh_options: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> ConnectionConfig:
-        return cls(type=d["type"], serial=d.get("serial", ""))
+        return cls(
+            type=d["type"],
+            serial=d.get("serial", ""),
+            host=d.get("host", ""),
+            user=d.get("user", ""),
+            port=int(d.get("port", 22)),
+            identity_file=d.get("identity_file", ""),
+            ssh_options=list(d.get("ssh_options", [])),
+        )
 
 
 @dataclass
@@ -215,6 +229,11 @@ class BuildConfig:
     env_file: str = ""  # deprecated: use toolchain instead
     binary_dir: str = ""
     toolchain: str = ""  # toolchain name key in hosts.toml
+    features: list[str] = field(default_factory=list)
+    default_features: bool = True
+    # zigbuild target (e.g. "aarch64-unknown-linux-gnu.2.31") — when set,
+    # builder uses `cargo zigbuild` with this target and skips toolchain env composition.
+    zig_target: str = ""
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> BuildConfig:
@@ -223,6 +242,9 @@ class BuildConfig:
             env_file=d.get("env_file", ""),
             binary_dir=d.get("binary_dir", ""),
             toolchain=d.get("toolchain", ""),
+            features=list(d.get("features", [])),
+            default_features=bool(d.get("default_features", True)),
+            zig_target=d.get("zig_target", ""),
         )
 
 

@@ -43,6 +43,12 @@ uname_match = { sysname = "Linux", machine = "x86_64" }
   # cargo_target = "aarch64-unknown-linux-gnu"
   # env          = { PKG_CONFIG_SYSROOT_DIR = "${HOME}/cross/rpi-sysroot" }
 
+  # Jetson Orin cross-compile (host → aarch64-linux-gnu)
+  # Requires: sudo pacman -S aarch64-linux-gnu-gcc  (or equivalent)
+  [hosts.arch-linux.toolchains.jetson-cross]
+  bin_prefix   = "/usr/bin/aarch64-linux-gnu-"
+  cargo_target = "aarch64-unknown-linux-gnu"
+
 # ── Ubuntu CI (GitHub Actions / self-hosted runner) ─────────────────────────
 [hosts.ubuntu-ci]
 uname_match = { sysname = "Linux", machine = "x86_64" }
