@@ -51,5 +51,6 @@ zbus = { version = "5", optional = true, default-features = false, features = ["
 [features]
 default = ["opencl"]
 opencl = ["ocl"]
-cuda = ["cudarc"]
+cuda = ["cudarc"]               # PC / discrete GPU version (cuda_pc/)
+cuda-embedded = ["cudarc"]      # Embedded UMA version, e.g. Jetson Xavier (cuda_embedded/)
 resilience = ["zbus"]

@@ -483,7 +483,7 @@ impl TransformerModel {
     /// enabling cuBLAS to access the weight data via device pointers.
     ///
     /// Returns the number of tensors migrated.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
     pub fn migrate_weights_to_cuda(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
         let mut count = 0;
 

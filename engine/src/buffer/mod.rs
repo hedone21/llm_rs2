@@ -2,7 +2,7 @@
 pub mod cl_sub_buffer;
 #[cfg(feature = "opencl")]
 pub mod cl_wrapped_buffer;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
 pub mod cuda_buffer;
 #[cfg(feature = "opencl")]
 pub mod madviseable_gpu_buffer;

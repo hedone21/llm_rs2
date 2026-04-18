@@ -608,7 +608,7 @@ fn main() -> anyhow::Result<()> {
             // GPU is primary; keep a ref as secondary for SwitchHw round-trip
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
         }
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
         "cuda" => {
             let gpu_concrete = Arc::new(llm_rs2::backend::cuda::CudaBackend::new()?);
             let gpu_mem: Arc<dyn Memory> = if gpu_concrete.is_discrete_gpu() {
@@ -707,7 +707,7 @@ fn main() -> anyhow::Result<()> {
     // CUDA: migrate weights to pinned host memory for cuBLAS access.
     // Unlike OpenCL (CL_MEM_USE_HOST_PTR zero-copy wrap), CUDA requires a memcpy into
     // cuMemHostAlloc'd buffers to get device pointers for cuBLAS.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
     if args.backend == "cuda" {
         match model.migrate_weights_to_cuda(&backend) {
             Ok(n) => eprintln!(
