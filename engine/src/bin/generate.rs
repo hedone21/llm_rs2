@@ -185,6 +185,19 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cuda_profile: bool,
 
+    /// Experimental: defer the per-op `synchronize()` calls in the
+    /// cuda-embedded backend and sync only once per decode token
+    /// (immediately before sampling reads logits).
+    ///
+    /// Phase C hypothesis H1: the 4.6 ms/tok (12%) wall-clock overhead
+    /// beyond GPU kernel time is driven by ~30 per-op syncs per token.
+    /// Enabling this flag measures the residual cost. Not a production
+    /// optimization — correctness relies on sampling being the only
+    /// CPU-visible read in the decode loop. Use with
+    /// `--backend cuda-embedded` only; a no-op on other backends.
+    #[arg(long, default_value_t = false)]
+    cuda_defer_sync: bool,
+
     /// Model weight data type (f16 or q4). f16 = no quantization, q4 = Q4_0 quantization at load time.
     #[arg(long, default_value = "f16")]
     weight_dtype: String,
@@ -635,6 +648,17 @@ fn main() -> anyhow::Result<()> {
             #[cfg(feature = "cuda-embedded")]
             if args.cuda_profile {
                 gpu_concrete.enable_profiler(4096)?;
+            }
+            // --cuda-defer-sync: skip implicit per-op synchronize() in
+            // launch helpers. The decode loop must then sync once per
+            // token before sampling reads the logits — see the decode
+            // loop's pre-sampling barrier.
+            #[cfg(feature = "cuda-embedded")]
+            if args.cuda_defer_sync {
+                gpu_concrete.set_defer_sync(true);
+                eprintln!(
+                    "[CUDA] --cuda-defer-sync enabled: per-op syncs suppressed; token-boundary sync only"
+                );
             }
             let gpu: Arc<dyn Backend> = gpu_concrete;
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
@@ -4217,7 +4241,14 @@ fn main() -> anyhow::Result<()> {
             }
             // ── End Resilience checkpoint ─────────────────────
 
-            // Read logits to CPU (reuses pre-allocated buffer)
+            // Read logits to CPU (reuses pre-allocated buffer).
+            //
+            // Token-boundary sync point: `Backend::read_buffer` always
+            // calls `synchronize()` internally (see CpuBackend/OpenCL/
+            // cuda_embedded impls). This is the barrier that guarantees
+            // all in-flight kernels complete before sampling runs —
+            // critical for `--cuda-defer-sync` where per-op syncs are
+            // suppressed.
             unsafe {
                 let ptr = logits_cpu.as_mut_ptr() as *mut u8;
                 let slice = std::slice::from_raw_parts_mut(ptr, logits_cpu.len() * 4);

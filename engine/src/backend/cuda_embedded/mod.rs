@@ -27,6 +27,7 @@ use std::any::Any;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Wrapper around a raw cuBLAS handle for safe sharing via Arc.
 ///
@@ -78,6 +79,22 @@ pub struct CudaBackend {
     /// pattern as OpenCL. Wrapped in `Arc` so `Clone` on the backend is
     /// cheap and shares the same hint slot.
     op_label_hint: Arc<OpLabelHint>,
+    /// Experimental toggle: when `true`, launch helpers skip their
+    /// implicit `self.synchronize()` call (see `maybe_sync`). Explicit
+    /// `Backend::synchronize()` calls and sync points guarding immediate
+    /// CPU reads (e.g. `cast` fallback, `read_buffer`, `copy_from`) are
+    /// *not* affected. Toggled via `set_defer_sync` / CLI flag
+    /// `--cuda-defer-sync` to measure the decode-loop overhead of the
+    /// current per-op sync policy (Phase C hypothesis H1).
+    ///
+    /// Wrapped behind `Arc` implicitly via `AtomicBool` on a cloned
+    /// struct — each `Clone` captures the same atomic via the enclosing
+    /// `Arc`-less field only because `AtomicBool: !Clone` would force a
+    /// copy of the current value, which is the desired semantics for
+    /// short-lived clones in the inference path. For the inference
+    /// loop the backend is held by a single `Arc`, so clones observe
+    /// the same flag.
+    defer_sync: Arc<AtomicBool>,
 }
 
 /// Wrapper around `UnsafeCell<Option<&'static str>>` so we can
@@ -194,6 +211,7 @@ impl CudaBackend {
             cast_cache: Arc::new(std::sync::Mutex::new(None)),
             profiler: Arc::new(std::sync::Mutex::new(None)),
             op_label_hint: Arc::new(OpLabelHint::new()),
+            defer_sync: Arc::new(AtomicBool::new(false)),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -279,6 +297,56 @@ impl CudaBackend {
     #[inline]
     pub fn clear_op_label(&self) {
         self.op_label_hint.set(None);
+    }
+
+    // ── Experimental sync deferral (--cuda-defer-sync) ──────────────
+    //
+    // Decode-path launch helpers currently call `self.synchronize()`
+    // after every kernel / cuBLAS dispatch. Phase B analysis showed a
+    // 4.6 ms/tok (12%) wall-clock overhead beyond GPU kernel time,
+    // largely attributable to this per-op sync. These toggles let the
+    // generate binary measure the uncovered cost without restructuring
+    // the dispatch layer.
+    //
+    // Semantics:
+    // - `set_defer_sync(true)`: every `maybe_sync()` call site becomes
+    //   a no-op. Sync is the caller's responsibility (generate.rs syncs
+    //   once per token before sampling).
+    // - `set_defer_sync(false)` (default): identical to previous
+    //   behavior — `maybe_sync()` delegates to `synchronize()`.
+    //
+    // The flag does NOT affect:
+    // - `Backend::synchronize()` itself (explicit).
+    // - `read_buffer` / `copy_from` (which sync as part of the API).
+    // - `cast` 's immediate-read fallback path (CPU reads dst right
+    //   after).
+    // - `self_test` (runs once at init, kept deterministic).
+    /// Enable or disable the experimental deferred-sync mode.
+    ///
+    /// When enabled, launch helpers skip their implicit
+    /// `synchronize()`; the caller must invoke
+    /// `Backend::synchronize()` at a meaningful boundary (e.g. before
+    /// reading logits back for sampling).
+    #[inline]
+    pub fn set_defer_sync(&self, v: bool) {
+        self.defer_sync.store(v, Ordering::Relaxed);
+    }
+
+    /// Query the current deferred-sync setting.
+    #[inline]
+    pub fn defer_sync_enabled(&self) -> bool {
+        self.defer_sync.load(Ordering::Relaxed)
+    }
+
+    /// Launch-site sync wrapper. No-op when `defer_sync` is enabled;
+    /// otherwise delegates to `self.synchronize()`.
+    #[inline]
+    fn maybe_sync(&self) -> Result<()> {
+        if self.defer_sync.load(Ordering::Relaxed) {
+            Ok(())
+        } else {
+            self.synchronize()
+        }
     }
 
     /// Begin timing `tag` (resolving against the current label hint)
@@ -549,7 +617,7 @@ impl Backend for CudaBackend {
 
         // Only support F32/F16 KV and head_dim in {64, 128, 256}
         if !matches!(head_dim, 64 | 128 | 256) || kv_dtype == DType::Q4_0 {
-            self.synchronize()?;
+            self.maybe_sync()?;
             return Ok(false);
         }
 
@@ -585,7 +653,7 @@ impl Backend for CudaBackend {
                 (DType::F16, 128) => &self.kernels.flash_prefill_f16kv_dk128,
                 (DType::F16, 256) => &self.kernels.flash_prefill_f16kv_dk256,
                 _ => {
-                    self.synchronize()?;
+                    self.maybe_sync()?;
                     return Ok(false);
                 }
             };
@@ -614,10 +682,10 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.synchronize()?;
+            self.maybe_sync()?;
             Ok(true)
         } else {
-            self.synchronize()?;
+            self.maybe_sync()?;
             Ok(false)
         }
     }
@@ -630,8 +698,11 @@ impl Backend for CudaBackend {
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         // Sync before cuBLAS: other ops may have written to input buffers
-        // on a different stream than cuBLAS uses.
-        self.synchronize()?;
+        // on a different stream than cuBLAS uses. (Currently cuBLAS is
+        // bound to the default stream in `new()`, so this is ordering
+        // insurance rather than a correctness requirement — safe to
+        // defer under --cuda-defer-sync.)
+        self.maybe_sync()?;
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
@@ -685,7 +756,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.synchronize()?;
+                self.maybe_sync()?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
                 // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS.
@@ -753,7 +824,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.synchronize()?;
+                self.maybe_sync()?;
                 *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
             } else if a_dtype == DType::F16 && b_dtype == DType::F16 {
@@ -789,7 +860,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.synchronize()?;
+                self.maybe_sync()?;
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
@@ -831,7 +902,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -853,7 +924,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -876,7 +947,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -899,7 +970,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -935,7 +1006,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -978,7 +1049,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -1021,7 +1092,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -1069,7 +1140,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -1114,12 +1185,16 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.synchronize()?;
+                self.maybe_sync()?;
                 Ok(())
             }
             _ => {
-                // Unsupported dtype or missing device ptr: sync then CPU fallback
-                self.synchronize()?;
+                // Unsupported dtype or missing device ptr: sync then CPU fallback.
+                // NOTE: under `--cuda-defer-sync` this becomes a no-op,
+                // but the only dtypes that take this path (Q4_0, etc.)
+                // never touch a live GPU write in the decode hot path
+                // — this branch is exercised at load/init, not per token.
+                self.maybe_sync()?;
                 cpu_fallback().cast(src, dst)
             }
         }
@@ -1148,7 +1223,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.synchronize()?;
+        self.maybe_sync()?;
         Ok(())
     }
 
@@ -1202,11 +1277,11 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.synchronize()?;
+            self.maybe_sync()?;
             Ok(())
         } else {
             // Missing device ptr: sync then CPU fallback
-            self.synchronize()?;
+            self.maybe_sync()?;
             cpu_fallback()
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
         }
@@ -1263,10 +1338,10 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.synchronize()?;
+            self.maybe_sync()?;
             Ok(())
         } else {
-            self.synchronize()?;
+            self.maybe_sync()?;
             cpu_fallback().kv_scatter_f32_to_f16_batch(
                 k_src,
                 v_src,
@@ -1285,7 +1360,7 @@ impl Backend for CudaBackend {
         // GPU kernel only supports F16 embedding -> F32 output.
         // For other dtypes, sync and fall back to CPU.
         if src.dtype() != DType::F16 {
-            self.synchronize()?;
+            self.maybe_sync()?;
             return cpu_fallback().gather(src, indices, dst);
         }
 
@@ -1320,10 +1395,10 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.synchronize()?;
+            self.maybe_sync()?;
             Ok(())
         } else {
-            self.synchronize()?;
+            self.maybe_sync()?;
             cpu_fallback().gather(src, indices, dst)
         }
     }
@@ -1348,7 +1423,7 @@ impl Backend for CudaBackend {
 
         // If scores_out is requested or device pointers are unavailable, use CPU fallback.
         if scores_out.is_some() {
-            self.synchronize()?;
+            self.maybe_sync()?;
             return cpu_fallback().attention_gen(
                 q,
                 k_cache,
@@ -1407,7 +1482,7 @@ impl Backend for CudaBackend {
                         }
                         Ok(())
                     });
-                    self.synchronize()?;
+                    self.maybe_sync()?;
                     Ok(())
                 }
                 DType::F16 => {
@@ -1432,12 +1507,12 @@ impl Backend for CudaBackend {
                         }
                         Ok(())
                     });
-                    self.synchronize()?;
+                    self.maybe_sync()?;
                     Ok(())
                 }
                 _ => {
                     // Q4_0 or unsupported: sync then CPU fallback
-                    self.synchronize()?;
+                    self.maybe_sync()?;
                     cpu_fallback().attention_gen(
                         q,
                         k_cache,
@@ -1453,7 +1528,7 @@ impl Backend for CudaBackend {
             }
         } else {
             // Missing device pointers: sync then CPU fallback
-            self.synchronize()?;
+            self.maybe_sync()?;
             cpu_fallback().attention_gen(
                 q,
                 k_cache,
