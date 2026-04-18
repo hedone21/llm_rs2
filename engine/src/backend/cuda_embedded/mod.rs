@@ -727,6 +727,64 @@ impl Backend for CudaBackend {
             let m: i32 = a_dims[..a_rank - 1].iter().product::<usize>() as i32;
             let n = b_dims[b_rank - 2] as i32;
 
+            // --- seq_len=1 decode fast path: dedicated F16 GEMV kernel ---
+            // Bypasses cuBLAS gemm_ex's warp-granularity overhead for
+            // memory-bound decode-shape matmuls (Llama 3.2 1B: K=2048/8192,
+            // N=2048/3072/8192/128256). Routed only when M=1 and the weight
+            // is F16; K must be even for the half2 vector path.
+            if m == 1 && b_dtype == DType::F16 && (k & 1) == 0 {
+                const GEMV_N_DST: u32 = 4;
+                const GEMV_WARP: u32 = 32;
+                let stream = self.ctx.default_stream();
+                let cfg = LaunchConfig {
+                    grid_dim: ((n as u32).div_ceil(GEMV_N_DST), 1, 1),
+                    block_dim: (GEMV_WARP * GEMV_N_DST, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+                if a_dtype == DType::F16 {
+                    // SAFETY: a_ptr/b_ptr/out_ptr are valid device pointers of
+                    // matching dtype (F16/F16/F32). K is even → half2 vector
+                    // path is safe. Buffers are at least 4-byte aligned (host
+                    // pinned / device alloc), so half2 reads are aligned.
+                    cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                        unsafe {
+                            stream
+                                .launch_builder(&self.kernels.gemv_f16_f16_f32)
+                                .arg(&b_ptr) // weight [N,K] F16
+                                .arg(&a_ptr) // input  [K]   F16
+                                .arg(&out_ptr) // output [N]   F32
+                                .arg(&k)
+                                .arg(&n)
+                                .launch(cfg)
+                                .map_err(|e| anyhow!("gemv_f16_f16_f32 launch failed: {e}"))?;
+                        }
+                        Ok(())
+                    });
+                    self.maybe_sync()?;
+                    return Ok(());
+                } else if a_dtype == DType::F32 {
+                    // SAFETY: a_ptr=F32 input, b_ptr=F16 weight, out_ptr=F32.
+                    // K even guarantees half2/float2 vector loads are in-bounds.
+                    cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                        unsafe {
+                            stream
+                                .launch_builder(&self.kernels.gemv_f16_f32_f32)
+                                .arg(&b_ptr) // weight [N,K] F16
+                                .arg(&a_ptr) // input  [K]   F32
+                                .arg(&out_ptr) // output [N]   F32
+                                .arg(&k)
+                                .arg(&n)
+                                .launch(cfg)
+                                .map_err(|e| anyhow!("gemv_f16_f32_f32 launch failed: {e}"))?;
+                        }
+                        Ok(())
+                    });
+                    self.maybe_sync()?;
+                    return Ok(());
+                }
+                // Other a_dtype falls through to cuBLAS / CPU fallback.
+            }
+
             if a_dtype == DType::F32 && b_dtype == DType::F32 {
                 // Pure F32: use sgemm
                 let alpha: f32 = 1.0;
@@ -2101,6 +2159,95 @@ mod tests {
                 "mismatch at {i}: flash={} naive={}",
                 out_flash[i],
                 out_naive[i]
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // GEMV (seq_len=1) reference: mirrors gemv_f16_*_f32 kernel arithmetic.
+    // ------------------------------------------------------------------
+    // Performs the same logical op as the CUDA kernels (out[n] = sum_k w[n,k]*x[k])
+    // with explicit F16→F32 casts on read, matching the kernel's __half22float2 path.
+    // This reference is used by the main session's Jetson verification to
+    // compute the expected output for a given random seed.
+    fn ref_gemv_f16_f32(
+        weight_f16: &[u16], // [N, K] row-major F16 bits
+        input_f32: &[f32],  // [K]
+        out: &mut [f32],    // [N]
+        k: usize,
+        n: usize,
+    ) {
+        assert_eq!(weight_f16.len(), n * k);
+        assert_eq!(input_f32.len(), k);
+        assert_eq!(out.len(), n);
+        for row in 0..n {
+            let mut acc = 0.0f32;
+            for col in 0..k {
+                let w = half::f16::from_bits(weight_f16[row * k + col]).to_f32();
+                acc += w * input_f32[col];
+            }
+            out[row] = acc;
+        }
+    }
+
+    #[test]
+    fn test_ref_gemv_f16_f32_basic() {
+        // Sanity: identity weight (one-hot rows) must pass input through.
+        let k = 8;
+        let n = 4;
+        let mut w = vec![0u16; n * k];
+        for row in 0..n {
+            w[row * k + row] = half::f16::from_f32(1.0).to_bits();
+        }
+        let x: Vec<f32> = (0..k).map(|i| i as f32 + 0.5).collect();
+        let mut out = vec![0.0f32; n];
+        ref_gemv_f16_f32(&w, &x, &mut out, k, n);
+        for row in 0..n {
+            assert!(
+                (out[row] - x[row]).abs() < 1e-4,
+                "row {row}: {} != {}",
+                out[row],
+                x[row]
+            );
+        }
+    }
+
+    #[test]
+    fn test_ref_gemv_f16_f32_random_small() {
+        // Deterministic pseudo-random weights; verify against direct
+        // F16→F32 dot-product reference. Same seed is used by Jetson test.
+        let k = 128;
+        let n = 256;
+        let mut w = vec![0u16; n * k];
+        let mut x = vec![0.0f32; k];
+        // LCG — deterministic, cross-platform.
+        let mut s: u32 = 0x1234_5678;
+        let mut next = || {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12345);
+            ((s >> 16) as f32 / 32768.0) - 1.0 // roughly [-1, 1)
+        };
+        for i in 0..(n * k) {
+            w[i] = half::f16::from_f32(next() * 0.1).to_bits();
+        }
+        for i in 0..k {
+            x[i] = next() * 0.1;
+        }
+
+        let mut out = vec![0.0f32; n];
+        ref_gemv_f16_f32(&w, &x, &mut out, k, n);
+
+        // Independent naive double-precision check (no F16 pre-rounding).
+        for row in 0..n {
+            let mut expected = 0.0f64;
+            for col in 0..k {
+                let wv = half::f16::from_bits(w[row * k + col]).to_f32() as f64;
+                expected += wv * x[col] as f64;
+            }
+            assert!(
+                (out[row] as f64 - expected).abs() < 1e-3,
+                "row {row}: got {} expected {}",
+                out[row],
+                expected
             );
         }
     }

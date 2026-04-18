@@ -137,8 +137,51 @@ Raw: `raw/c1_defer_run{1,2,3}.log`, `raw/c1_correctness_{baseline,defer}.log`
 2. UMA 캐시 flush 명시적 호출(`cudaMemPrefetchAsync` 또는 `__builtin___clear_cache`) 실험
 3. 최소 sync 세트 결정 후 "correct defer-sync" 재측정 — 이게 실질 H1 기여도
 
+## Phase C2 실험 결과 — H2(F16 GEMV 커널) 검증
+
+seq_len=1 F16 matmul을 전용 GEMV 커널로 라우팅. kernels.cu에 `gemv_f16_f16_f32`, `gemv_f16_f32_f32` 2개 추가. matmul_transposed 진입부 M=1 fast path.
+
+설계: 1 warp/row, N_DST=4 rows/block, block=(128,1,1), shared mem 미사용, `half2` + `__half22float2` vectorized load, `__shfl_down_sync` cascading reduction (결정론적).
+
+### 측정 (3회 반복)
+
+| 모드 | Decode tok/s | ms/tok | vs baseline |
+|---|---:|---:|---:|
+| baseline | 26.3 ± 0.2 | 38.1 | — |
+| **C2 GEMV** | **27.93 ± 0.05** | 35.80 | **+6.2%** |
+| llama.cpp 참조 | 35.19 ± 0.2 | 28.4 | +33.8% |
+
+### Correctness (`--temperature 0.0`)
+
+```
+baseline : The capital of France is Paris. It's the most visited city in Europe...
+C2 GEMV  : The capital of France is Paris. It's the most visited city in Europe...   ✓ 완전 일치
+```
+
+### Per-op 변화 (ms/tok 기준)
+
+| op | B baseline | C2 GEMV | 개선 |
+|---|---:|---:|---:|
+| matmul_qkv | 3.97 | 2.66 | **-33%** |
+| matmul_wo  | 2.09 | 1.57 | **-25%** |
+| matmul_ffn | 18.34 | 16.90 | -7.8% |
+| lm_head    | 5.34 | 5.13 | -4% |
+| matmul (cuBLAS 잔류) | 1.66 | 1.66 | 0% |
+| **TOTAL GPU** | 33.43 | 30.40 | -9.1% |
+
+- qkv/wo에서 큰 개선 (K=2048 작은 matmul에 GEMV 효과 극대화)
+- **ffn down (K=8192)**과 **lm_head (N=128256)** 개선 미미 — 현재 N_DST=4, block=128 구성이 이런 비대칭 치수에서는 cuBLAS 대비 우위 작음
+- 추가 튜닝 여지: N_DST=8~16 또는 K>4096 구간에 split-K variant
+
+### 기여도
+
+- **H2 실 기여**: +1.6 tok/s (+6.2%), 예상 +4.5 tok/s 중 36% 달성
+- 남은 여지: lm_head + ffn_down 전용 kernel tuning으로 추가 +2~3 tok/s 가능할 것으로 추정 (후속 과제 #24 후보)
+- Correctness 완전 보존 → production 반영 가능
+
 ## 관련 커밋
 
 - `42134a3` refactor(cuda_embedded): resync baseline with cuda_pc
 - `8705ac3` feat(cuda_embedded): add CUDA event-based per-op profiler
-- Phase C1 작업 (이 커밋): `feat(cuda_embedded): add --cuda-defer-sync for H1 experiment`
+- `9c34c88` feat(cuda_embedded): add --cuda-defer-sync for H1 experiment (C1)
+- Phase C2 작업 (이 커밋): `perf(cuda_embedded): add F16 GEMV kernel for decode matmul`

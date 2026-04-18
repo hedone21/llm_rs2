@@ -720,3 +720,109 @@ FLASH_PREFILL_KERNEL_F32(dk256, 256, 32,  8)
 FLASH_PREFILL_KERNEL_F16KV(dk64,  64,  32, 32)
 FLASH_PREFILL_KERNEL_F16KV(dk128, 128, 32, 16)
 FLASH_PREFILL_KERNEL_F16KV(dk256, 256, 32,  8)
+
+// =================================================================
+// 16. F16 GEMV (seq_len=1 decode fast path)
+// =================================================================
+// Decode-specific GEMV for transposed weight: out[n] = sum_k w[n,k] * x[k].
+// Targets Llama 3.2 1B matmul dispatch at M=1 to bypass cuBLAS gemm_ex's
+// warp-granularity overhead. Memory-bound by F16 weight streaming.
+//
+// Structure:
+//   - 1 warp (32 threads) per output row (intra-warp __shfl reduce).
+//   - N_DST rows per block → block = WARP_SIZE * N_DST threads.
+//   - Weight is [N, K] row-major (transposed). Each warp streams its row;
+//     the N_DST rows in a block share the same input vector (automatic L1
+//     reuse — input is read per warp but hits the same 2K/8K cache lines).
+//   - Vectorized load via half2 (2 F16 per transaction) with float2 FMA
+//     to amortize global load latency. Scalar tail handles odd K.
+//
+// Launch:
+//   grid = (ceil(N / N_DST), 1, 1), block = (WARP_SIZE * N_DST, 1, 1)
+//
+// Determinism:
+//   Each row reduction is a fixed cascading __shfl_down_sync pattern on a
+//   fixed lane ordering. Same input → same bit-exact output across runs.
+//
+// Alignment requirement:
+//   half2 fast path assumes `weight` and `input` are 4-byte aligned and
+//   K is even. All Llama 3.2 1B matmul dims (K ∈ {2048, 8192}) satisfy
+//   this. For unusual K (odd), the host routes to the scalar kernel.
+
+#define GEMV_N_DST 4
+#define GEMV_WARP 32
+
+// --- F16 weight × F16 input → F32 output, K even ---
+extern "C" __global__ void gemv_f16_f16_f32(
+    const half* __restrict__ weight,   // [N, K] row-major
+    const half* __restrict__ input,    // [K]
+    float*     __restrict__ output,    // [N]
+    int K, int N)
+{
+    int warp_id = threadIdx.x / GEMV_WARP;     // 0..N_DST-1
+    int lane    = threadIdx.x % GEMV_WARP;     // 0..31
+    int row     = blockIdx.x * GEMV_N_DST + warp_id;
+    if (row >= N) return;
+
+    int k2 = K >> 1;                           // number of half2 elements
+    const half2* w2 = reinterpret_cast<const half2*>(weight + (long long)row * K);
+    const half2* x2 = reinterpret_cast<const half2*>(input);
+
+    float acc = 0.0f;
+
+    // Main loop: stride GEMV_WARP (32) over half2 pairs.
+    for (int i = lane; i < k2; i += GEMV_WARP) {
+        float2 wv = __half22float2(w2[i]);
+        float2 xv = __half22float2(x2[i]);
+        acc += wv.x * xv.x + wv.y * xv.y;
+    }
+
+    // Scalar tail (K odd — unlikely for Llama 3.2 1B but kept for safety).
+    if ((K & 1) && lane == 0) {
+        acc += __half2float(weight[(long long)row * K + (K - 1)])
+             * __half2float(input[K - 1]);
+    }
+
+    // Deterministic warp reduce: cascading __shfl_down_sync.
+    #pragma unroll
+    for (int offset = GEMV_WARP / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset, GEMV_WARP);
+    }
+    if (lane == 0) output[row] = acc;
+}
+
+// --- F16 weight × F32 input → F32 output, K even ---
+// Skips the F32→F16 cast of the activation vector entirely.
+extern "C" __global__ void gemv_f16_f32_f32(
+    const half*  __restrict__ weight,  // [N, K] row-major F16
+    const float* __restrict__ input,   // [K] F32
+    float*       __restrict__ output,  // [N]
+    int K, int N)
+{
+    int warp_id = threadIdx.x / GEMV_WARP;
+    int lane    = threadIdx.x % GEMV_WARP;
+    int row     = blockIdx.x * GEMV_N_DST + warp_id;
+    if (row >= N) return;
+
+    int k2 = K >> 1;
+    const half2*  w2 = reinterpret_cast<const half2*>(weight + (long long)row * K);
+    const float2* x2 = reinterpret_cast<const float2*>(input);
+
+    float acc = 0.0f;
+
+    for (int i = lane; i < k2; i += GEMV_WARP) {
+        float2 wv = __half22float2(w2[i]);
+        float2 xv = x2[i];
+        acc += wv.x * xv.x + wv.y * xv.y;
+    }
+
+    if ((K & 1) && lane == 0) {
+        acc += __half2float(weight[(long long)row * K + (K - 1)]) * input[K - 1];
+    }
+
+    #pragma unroll
+    for (int offset = GEMV_WARP / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset, GEMV_WARP);
+    }
+    if (lane == 0) output[row] = acc;
+}
