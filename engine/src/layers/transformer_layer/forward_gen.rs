@@ -39,9 +39,10 @@ impl TransformerLayer {
         let event_profiling = false;
 
         // `set_label` / `clear_label`: caller-side label hints used only by
-        // `--profile-events` to distinguish matmul_qkv / matmul_wo /
-        // matmul_ffn / lm_head (all dispatch the same GEMV/GEMM kernels).
-        // No-op on CPU or when event profiling is off.
+        // `--profile-events` / `--cuda-profile` to distinguish matmul_qkv /
+        // matmul_wo / matmul_ffn / lm_head (all dispatch the same
+        // GEMV/GEMM kernels). No-op on CPU or when neither profiler is
+        // active.
         #[allow(unused_variables)]
         let set_label = |label: &'static str| {
             #[cfg(feature = "opencl")]
@@ -52,6 +53,13 @@ impl TransformerLayer {
             {
                 ocl_be.set_op_label(label);
             }
+            #[cfg(feature = "cuda-embedded")]
+            if let Some(cu_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
+            {
+                cu_be.set_op_label(label);
+            }
         };
         let clear_label = || {
             #[cfg(feature = "opencl")]
@@ -61,6 +69,13 @@ impl TransformerLayer {
                     .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             {
                 ocl_be.clear_op_label();
+            }
+            #[cfg(feature = "cuda-embedded")]
+            if let Some(cu_be) = backend
+                .as_any()
+                .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
+            {
+                cu_be.clear_op_label();
             }
         };
 

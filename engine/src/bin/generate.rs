@@ -172,6 +172,19 @@ struct Args {
     #[arg(long, default_value_t = false)]
     profile_per_head: bool,
 
+    /// Enable per-op CUDA event profiler (cuda-embedded backend only).
+    ///
+    /// Wraps each GPU kernel launch in a `cuEventRecord` pair and
+    /// aggregates elapsed ms per op label at end-of-run. Label matrix
+    /// matches OpenCL's `--profile-events` (matmul_qkv, matmul_wo,
+    /// matmul_ffn, rms_norm, rope, attention, kv_update, silu_mul,
+    /// lm_head) for apples-to-apples Adreno vs Jetson comparison.
+    ///
+    /// Independent of `--profile` and `--profile-events`. Writes
+    /// `results/profile/cuda_embedded_decode_<timestamp>.json`.
+    #[arg(long, default_value_t = false)]
+    cuda_profile: bool,
+
     /// Model weight data type (f16 or q4). f16 = no quantization, q4 = Q4_0 quantization at load time.
     #[arg(long, default_value = "f16")]
     weight_dtype: String,
@@ -616,6 +629,13 @@ fn main() -> anyhow::Result<()> {
             } else {
                 Arc::new(llm_rs2::backend::cuda::memory::CudaMemory::new())
             };
+            // --cuda-profile: event-based per-op profiler. Only wired on
+            // the cuda-embedded backend (PC cuda path has its own
+            // profiling story and doesn't expose enable_profiler).
+            #[cfg(feature = "cuda-embedded")]
+            if args.cuda_profile {
+                gpu_concrete.enable_profiler(4096)?;
+            }
             let gpu: Arc<dyn Backend> = gpu_concrete;
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
         }
@@ -3374,6 +3394,21 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // --cuda-profile: drain pending CUevent pairs per-token so
+            // the pool (default 4096 pairs) does not overflow. Each
+            // decode token launches roughly n_layers * ~10 kernels.
+            #[cfg(feature = "cuda-embedded")]
+            if args.cuda_profile
+                && let Some(cu_be) = backend
+                    .as_any()
+                    .downcast_ref::<llm_rs2::backend::cuda_embedded::CudaBackend>()
+                && cu_be.profiler_enabled()
+            {
+                if let Err(e) = cu_be.flush_profiler() {
+                    eprintln!("[CUDA-Profile] per-token flush failed: {}", e);
+                }
+            }
+
             let forward_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
 
             // ── H2O Debug: per-step diagnostics ──
@@ -4380,6 +4415,26 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 6.6. Export --cuda-profile aggregate if enabled.
+    // Independent of the generic `profiler` above (which lives in
+    // `llm_rs2::profile::ops::OpProfiler` and targets OpenCL events).
+    #[cfg(feature = "cuda-embedded")]
+    if args.cuda_profile
+        && let Some(cuda_be) = backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::cuda_embedded::CudaBackend>()
+        && cuda_be.profiler_enabled()
+    {
+        match cuda_be.flush_profiler() {
+            Ok(Some(map)) => {
+                let dropped = cuda_be.profiler_dropped();
+                dump_cuda_profile_report(&map, dropped, &args, tbt_values.len(), cuda_be.device());
+            }
+            Ok(None) => {}
+            Err(e) => eprintln!("[CUDA-Profile] flush failed: {}", e),
+        }
+    }
+
     // 7. Output results
     println!("\nDone.");
     println!("[Profile] Event: End");
@@ -4416,6 +4471,109 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// ── CUDA profile report ───────────────────────────────────────
+
+#[cfg(feature = "cuda-embedded")]
+fn dump_cuda_profile_report(
+    map: &std::collections::HashMap<&'static str, (u64, f64)>,
+    dropped: u64,
+    args: &Args,
+    n_tokens: usize,
+    device: &str,
+) {
+    // 1) Sort by total_ms descending — same ordering as the OpenCL
+    //    `--profile-events` summary so the two reports read the same.
+    let mut rows: Vec<(&&str, &(u64, f64))> = map.iter().collect();
+    rows.sort_by(|a, b| {
+        b.1.1
+            .partial_cmp(&a.1.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let total_ms: f64 = rows.iter().map(|(_, v)| v.1).sum();
+
+    eprintln!(
+        "\n=== CUDA per-op profile ({} ops over {} tokens) ===",
+        rows.len(),
+        n_tokens
+    );
+    eprintln!(
+        "{:<28}  {:>8}  {:>12}  {:>10}  {:>7}",
+        "label", "count", "total_ms", "mean_ms", "pct"
+    );
+    for (label, (count, t_ms)) in &rows {
+        let pct = if total_ms > 0.0 {
+            t_ms / total_ms * 100.0
+        } else {
+            0.0
+        };
+        let mean = if *count > 0 {
+            t_ms / (*count as f64)
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{:<28}  {:>8}  {:>12.3}  {:>10.4}  {:>6.2}%",
+            label, count, t_ms, mean, pct
+        );
+    }
+    eprintln!(
+        "{:<28}  {:>8}  {:>12.3}",
+        "TOTAL",
+        rows.iter().map(|(_, v)| v.0).sum::<u64>(),
+        total_ms
+    );
+    if dropped > 0 {
+        eprintln!(
+            "[CUDA-Profile] WARNING: {dropped} records dropped (pool exhausted between flushes)"
+        );
+    }
+
+    // 2) Write JSON to results/profile/cuda_embedded_decode_<ts>.json.
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Plain unix seconds — `chrono` is not a workspace dep. Downstream
+    // tooling can parse either form.
+    let ts_iso = format!("unix:{ts}");
+
+    let mut ops_json = Vec::with_capacity(rows.len());
+    for (label, (count, t_ms)) in &rows {
+        let mean = if *count > 0 {
+            t_ms / (*count as f64)
+        } else {
+            0.0
+        };
+        ops_json.push(serde_json::json!({
+            "label": label,
+            "count": count,
+            "total_ms": t_ms,
+            "mean_ms": mean,
+        }));
+    }
+    let doc = serde_json::json!({
+        "timestamp": ts_iso,
+        "device": device,
+        "backend": "cuda-embedded",
+        "n_tokens": n_tokens,
+        "model": args.model_path,
+        "dropped_records": dropped,
+        "ops": ops_json,
+    });
+
+    let dir = std::path::PathBuf::from(&args.profile_dir);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        eprintln!("[CUDA-Profile] mkdir {} failed: {}", dir.display(), e);
+        return;
+    }
+    let path = dir.join(format!("cuda_embedded_decode_{}.json", ts));
+    match std::fs::write(&path, serde_json::to_vec_pretty(&doc).unwrap_or_default()) {
+        Ok(()) => eprintln!("[CUDA-Profile] Exported to {}", path.display()),
+        Err(e) => eprintln!("[CUDA-Profile] write {} failed: {}", path.display(), e),
+    }
 }
 
 // ── Experiment helpers ────────────────────────────────────────

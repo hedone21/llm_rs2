@@ -11,17 +11,21 @@
 
 pub mod kernels;
 pub mod memory;
+pub mod profiler;
 
 use crate::buffer::cuda_buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::tensor::Tensor;
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
 use cudarc::driver::sys as cuda_sys;
 use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg, result as cuda_result};
 use kernels::CudaKernels;
+use profiler::{CudaOpProfiler, CudaOpTag};
 use std::any::Any;
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Wrapper around a raw cuBLAS handle for safe sharing via Arc.
@@ -61,7 +65,53 @@ pub struct CudaBackend {
     kernels: Arc<CudaKernels>,
     /// Cached F16 cast buffer for matmul_transposed F32×F16 path.
     cast_cache: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
+    /// Per-op CUDA event profiler. `None` = profiling off (zero
+    /// overhead on the launch path: one `Mutex::lock` + `Option::is_none`
+    /// check). Enabled via `enable_profiler`.
+    profiler: Arc<std::sync::Mutex<Option<CudaOpProfiler>>>,
+    /// Caller-side label hint for the next `matmul_transposed` dispatch.
+    /// Mirrors `OpenCLBackend::op_label_hint`; set by `set_op_label`
+    /// (forward_gen / transformer.rs) to distinguish matmul_qkv /
+    /// matmul_wo / matmul_ffn / lm_head.
+    ///
+    /// SAFETY: only accessed from the single inference thread, same
+    /// pattern as OpenCL. Wrapped in `Arc` so `Clone` on the backend is
+    /// cheap and shares the same hint slot.
+    op_label_hint: Arc<OpLabelHint>,
 }
+
+/// Wrapper around `UnsafeCell<Option<&'static str>>` so we can
+/// `unsafe impl Send + Sync` without exposing the cell on the backend
+/// struct.
+pub(crate) struct OpLabelHint(UnsafeCell<Option<&'static str>>);
+
+impl OpLabelHint {
+    fn new() -> Self {
+        Self(UnsafeCell::new(None))
+    }
+
+    #[inline]
+    fn get(&self) -> Option<&'static str> {
+        // SAFETY: single-threaded inference access.
+        unsafe { *self.0.get() }
+    }
+
+    #[inline]
+    fn set(&self, label: Option<&'static str>) {
+        // SAFETY: single-threaded inference access.
+        unsafe {
+            *self.0.get() = label;
+        }
+    }
+}
+
+// SAFETY: same rationale as `OpenCLBackend::op_label_hint` — the
+// inference loop is single-threaded and the hint is only read/written
+// on that thread. Any cross-thread access would be via `clone()` +
+// `set_op_label` from a fresh thread, which is not a supported
+// pattern.
+unsafe impl Send for OpLabelHint {}
+unsafe impl Sync for OpLabelHint {}
 
 impl CudaBackend {
     /// Initialize CUDA backend on device 0.
@@ -142,6 +192,8 @@ impl CudaBackend {
             }),
             kernels: Arc::new(kernels),
             cast_cache: Arc::new(std::sync::Mutex::new(None)),
+            profiler: Arc::new(std::sync::Mutex::new(None)),
+            op_label_hint: Arc::new(OpLabelHint::new()),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -158,6 +210,107 @@ impl CudaBackend {
     /// Compute capability as (major, minor).
     pub fn compute_capability(&self) -> (i32, i32) {
         self.compute_capability
+    }
+
+    // ── Per-op CUDA event profiler (--cuda-profile) ─────────────────
+    //
+    // The fast path when profiling is disabled is a single
+    // `Mutex::lock()` + `Option::is_none()` check per launch site;
+    // when disabled the helper returns early before touching the CUDA
+    // event API. See `profiler.rs` for the timing model.
+
+    /// Enable the per-op CUDA event profiler with a fixed-size event
+    /// pool. Idempotent — a second call replaces the existing state.
+    pub fn enable_profiler(&self, pool_size: usize) -> Result<()> {
+        let p = CudaOpProfiler::new(pool_size).context("allocating CudaOpProfiler event pool")?;
+        *self.profiler.lock().unwrap() = Some(p);
+        eprintln!("[CUDA-Profile] event-based profiler enabled (pool_size={pool_size})");
+        Ok(())
+    }
+
+    /// Whether profiling is currently active.
+    pub fn profiler_enabled(&self) -> bool {
+        self.profiler.lock().unwrap().is_some()
+    }
+
+    /// Drain pending events, synchronising the last one, and return a
+    /// snapshot of the current aggregate map. Returns `None` when the
+    /// profiler is disabled.
+    ///
+    /// The internal aggregate keeps accumulating across calls — to
+    /// reset between runs use `reset_profiler()`.
+    pub fn flush_profiler(&self) -> Result<Option<HashMap<&'static str, (u64, f64)>>> {
+        let mut guard = self.profiler.lock().unwrap();
+        let Some(p) = guard.as_mut() else {
+            return Ok(None);
+        };
+        p.flush()?;
+        Ok(Some(p.report().clone()))
+    }
+
+    /// Number of start attempts dropped because the event pool was
+    /// exhausted between flushes. Returns 0 when disabled.
+    pub fn profiler_dropped(&self) -> u64 {
+        self.profiler
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|p| p.dropped())
+            .unwrap_or(0)
+    }
+
+    /// Clear aggregate + in-flight state. Pool stays allocated.
+    pub fn reset_profiler(&self) {
+        if let Some(p) = self.profiler.lock().unwrap().as_mut() {
+            p.reset();
+        }
+    }
+
+    /// Caller-side label hint for the next `matmul_transposed`
+    /// dispatch. See `OpenCLBackend::set_op_label` for the design.
+    /// No-op when the profiler is disabled — the hint is cheap to
+    /// set even so to keep the call sites uniform.
+    #[inline]
+    pub fn set_op_label(&self, label: &'static str) {
+        self.op_label_hint.set(Some(label));
+    }
+
+    /// Clear a previously-set label hint.
+    #[inline]
+    pub fn clear_op_label(&self) {
+        self.op_label_hint.set(None);
+    }
+
+    /// Begin timing `tag` (resolving against the current label hint)
+    /// on `stream`. Returns the raw CUstream for use by the caller
+    /// and a `bool` indicating whether a matching `end_op` is needed
+    /// (true when the start event actually recorded).
+    ///
+    /// Disabled-profiler fast path: returns `(stream_raw, false)`
+    /// without acquiring the mutex's inner state — one lock +
+    /// `is_none()` check.
+    #[inline]
+    fn begin_op(&self, tag: CudaOpTag, stream: cuda_sys::CUstream) -> Result<bool> {
+        let mut guard = self.profiler.lock().unwrap();
+        let Some(p) = guard.as_mut() else {
+            return Ok(false);
+        };
+        let label = self
+            .op_label_hint
+            .get()
+            .unwrap_or_else(|| tag.profile_label());
+        p.record_start(label, stream)
+    }
+
+    /// Pair with a successful `begin_op`. Called only when
+    /// `begin_op` returned `Ok(true)`.
+    #[inline]
+    fn end_op(&self, stream: cuda_sys::CUstream) -> Result<()> {
+        let mut guard = self.profiler.lock().unwrap();
+        if let Some(p) = guard.as_mut() {
+            p.record_end(stream)?;
+        }
+        Ok(())
     }
 
     /// Attempt to get a CUdeviceptr from a Buffer.
@@ -333,6 +486,29 @@ fn cpu_fallback() -> crate::backend::cpu::CpuBackend {
     crate::backend::cpu::CpuBackend::new()
 }
 
+/// Wrap a single kernel-launch block with optional per-op profiling.
+///
+/// `self_:expr` is typically `self`; `tag:expr` is a `CudaOpTag`; the
+/// block `$body` performs the `launch_builder(...).launch(cfg)` call
+/// on the default stream. When the profiler is disabled the pair of
+/// `begin_op` / `end_op` collapses into two quick mutex lock +
+/// `is_none()` checks — no CUDA API calls.
+///
+/// NOTE: the block must launch on the **default stream** so that
+/// start/end event ordering is sequential. Custom streams would need
+/// a dedicated record path.
+macro_rules! cuda_profile {
+    ($self_:expr, $tag:expr, $stream:expr, $body:block) => {{
+        let __stream_raw: cuda_sys::CUstream = $stream.cu_stream();
+        let __timed = $self_.begin_op($tag, __stream_raw)?;
+        let __res: Result<()> = (|| $body)();
+        if __timed {
+            $self_.end_op(__stream_raw)?;
+        }
+        __res?;
+    }};
+}
+
 impl Backend for CudaBackend {
     fn as_any(&self) -> &dyn Any {
         self
@@ -419,22 +595,25 @@ impl Backend for CudaBackend {
             // kp/vp are valid F32 or F16 device ptrs for KV [batch, n_heads_kv, capacity, head_dim].
             // op is valid F32 device ptr for output, same layout as Q.
             // All dimensions are checked by callers (transformer layer).
-            unsafe {
-                stream
-                    .launch_builder(kernel)
-                    .arg(&qp)
-                    .arg(&kp)
-                    .arg(&vp)
-                    .arg(&op)
-                    .arg(&nhq)
-                    .arg(&nkv)
-                    .arg(&sl)
-                    .arg(&csl)
-                    .arg(&cap)
-                    .arg(&bs)
-                    .launch(cfg)
-                    .map_err(|e| anyhow!("flash_attn_prefill launch failed: {e}"))?;
-            }
+            cuda_profile!(self, CudaOpTag::FlashAttentionPrefill, stream, {
+                unsafe {
+                    stream
+                        .launch_builder(kernel)
+                        .arg(&qp)
+                        .arg(&kp)
+                        .arg(&vp)
+                        .arg(&op)
+                        .arg(&nhq)
+                        .arg(&nkv)
+                        .arg(&sl)
+                        .arg(&csl)
+                        .arg(&cap)
+                        .arg(&bs)
+                        .launch(cfg)
+                        .map_err(|e| anyhow!("flash_attn_prefill launch failed: {e}"))?;
+                }
+                Ok(())
+            });
             self.synchronize()?;
             Ok(true)
         } else {
@@ -481,27 +660,31 @@ impl Backend for CudaBackend {
                 // Pure F32: use sgemm
                 let alpha: f32 = 1.0;
                 let beta: f32 = 0.0;
+                let stream = self.ctx.default_stream();
                 // SAFETY: All device pointers are valid CudaHostBuffer/CudaBuffer allocations.
                 // Dimensions are checked by shape accessors. cuBLAS handle is valid.
-                unsafe {
-                    cublas_result::sgemm(
-                        self.cublas.handle,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                        n,
-                        m,
-                        k,
-                        &alpha,
-                        b_ptr as *const f32,
-                        k,
-                        a_ptr as *const f32,
-                        k,
-                        &beta,
-                        out_ptr as *mut f32,
-                        n,
-                    )
-                    .map_err(|e| anyhow!("cublasSgemm failed: {e}"))?;
-                }
+                cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                    unsafe {
+                        cublas_result::sgemm(
+                            self.cublas.handle,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                            n,
+                            m,
+                            k,
+                            &alpha,
+                            b_ptr as *const f32,
+                            k,
+                            a_ptr as *const f32,
+                            k,
+                            &beta,
+                            out_ptr as *mut f32,
+                            n,
+                        )
+                        .map_err(|e| anyhow!("cublasSgemm failed: {e}"))?;
+                    }
+                    Ok(())
+                });
                 self.synchronize()?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
@@ -525,45 +708,51 @@ impl Backend for CudaBackend {
                 // SAFETY: a_ptr is valid F32 device memory of size k_elements*4.
                 // a_f16_ptr is valid F16 device memory of size k_elements*2.
                 // Cast kernel reads k_elements floats and writes k_elements halfs.
-                unsafe {
-                    stream
-                        .launch_builder(&self.kernels.cast_f32_f16)
-                        .arg(&a_ptr)
-                        .arg(&a_f16_ptr)
-                        .arg(&k_i32)
-                        .launch(cfg)
-                        .map_err(|e| anyhow!("cast_f32_to_f16 kernel launch failed: {e}"))?;
-                }
+                cuda_profile!(self, CudaOpTag::Cast, stream, {
+                    unsafe {
+                        stream
+                            .launch_builder(&self.kernels.cast_f32_f16)
+                            .arg(&a_ptr)
+                            .arg(&a_f16_ptr)
+                            .arg(&k_i32)
+                            .launch(cfg)
+                            .map_err(|e| anyhow!("cast_f32_to_f16 kernel launch failed: {e}"))?;
+                    }
+                    Ok(())
+                });
 
                 // F16xF16 cuBLAS GemmEx
                 let alpha: f32 = 1.0;
                 let beta: f32 = 0.0;
                 // SAFETY: a_f16_ptr and b_ptr are valid F16 device memory.
                 // out_ptr is valid F32 device memory. Dimensions match.
-                unsafe {
-                    cublas_result::gemm_ex(
-                        self.cublas.handle,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                        n,
-                        m,
-                        k,
-                        &alpha as *const f32 as *const std::ffi::c_void,
-                        b_ptr as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType_t::CUDA_R_16F,
-                        k,
-                        a_f16_ptr as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType_t::CUDA_R_16F,
-                        k,
-                        &beta as *const f32 as *const std::ffi::c_void,
-                        out_ptr as *mut std::ffi::c_void,
-                        cublas_sys::cudaDataType_t::CUDA_R_32F,
-                        n,
-                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    )
-                    .map_err(|e| anyhow!("cublasGemmEx (F32->F16 x F16) failed: {e}"))?;
-                }
+                cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                    unsafe {
+                        cublas_result::gemm_ex(
+                            self.cublas.handle,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                            n,
+                            m,
+                            k,
+                            &alpha as *const f32 as *const std::ffi::c_void,
+                            b_ptr as *const std::ffi::c_void,
+                            cublas_sys::cudaDataType_t::CUDA_R_16F,
+                            k,
+                            a_f16_ptr as *const std::ffi::c_void,
+                            cublas_sys::cudaDataType_t::CUDA_R_16F,
+                            k,
+                            &beta as *const f32 as *const std::ffi::c_void,
+                            out_ptr as *mut std::ffi::c_void,
+                            cublas_sys::cudaDataType_t::CUDA_R_32F,
+                            n,
+                            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        )
+                        .map_err(|e| anyhow!("cublasGemmEx (F32->F16 x F16) failed: {e}"))?;
+                    }
+                    Ok(())
+                });
                 self.synchronize()?;
                 *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
@@ -571,31 +760,35 @@ impl Backend for CudaBackend {
                 // Both F16: use GemmEx with F32 compute for accuracy
                 let alpha: f32 = 1.0;
                 let beta: f32 = 0.0;
+                let stream = self.ctx.default_stream();
                 // SAFETY: Both pointers are valid F16 device memory. out_ptr is valid F32.
-                unsafe {
-                    cublas_result::gemm_ex(
-                        self.cublas.handle,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_T,
-                        cublas_sys::cublasOperation_t::CUBLAS_OP_N,
-                        n,
-                        m,
-                        k,
-                        &alpha as *const f32 as *const std::ffi::c_void,
-                        b_ptr as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType_t::CUDA_R_16F,
-                        k,
-                        a_ptr as *const std::ffi::c_void,
-                        cublas_sys::cudaDataType_t::CUDA_R_16F,
-                        k,
-                        &beta as *const f32 as *const std::ffi::c_void,
-                        out_ptr as *mut std::ffi::c_void,
-                        cublas_sys::cudaDataType_t::CUDA_R_32F,
-                        n,
-                        cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                        cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-                    )
-                    .map_err(|e| anyhow!("cublasGemmEx (F16xF16) failed: {e}"))?;
-                }
+                cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                    unsafe {
+                        cublas_result::gemm_ex(
+                            self.cublas.handle,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_T,
+                            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+                            n,
+                            m,
+                            k,
+                            &alpha as *const f32 as *const std::ffi::c_void,
+                            b_ptr as *const std::ffi::c_void,
+                            cublas_sys::cudaDataType_t::CUDA_R_16F,
+                            k,
+                            a_ptr as *const std::ffi::c_void,
+                            cublas_sys::cudaDataType_t::CUDA_R_16F,
+                            k,
+                            &beta as *const f32 as *const std::ffi::c_void,
+                            out_ptr as *mut std::ffi::c_void,
+                            cublas_sys::cudaDataType_t::CUDA_R_32F,
+                            n,
+                            cublas_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                            cublas_sys::cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+                        )
+                        .map_err(|e| anyhow!("cublasGemmEx (F16xF16) failed: {e}"))?;
+                    }
+                    Ok(())
+                });
                 self.synchronize()?;
                 Ok(())
             } else {
@@ -626,15 +819,18 @@ impl Backend for CudaBackend {
         let k = n as i32;
         let stream = self.ctx.default_stream();
         // SAFETY: a_ptr and b_ptr are valid F32 device memory of n elements each.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.add_assign)
-                .arg(&a_ptr)
-                .arg(&b_ptr)
-                .arg(&k)
-                .launch(Self::launch_config_1d(n))
-                .map_err(|e| anyhow!("add_assign kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::AddAssign, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.add_assign)
+                    .arg(&a_ptr)
+                    .arg(&b_ptr)
+                    .arg(&k)
+                    .launch(Self::launch_config_1d(n))
+                    .map_err(|e| anyhow!("add_assign kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -645,15 +841,18 @@ impl Backend for CudaBackend {
         let k = n as i32;
         let stream = self.ctx.default_stream();
         // SAFETY: x_ptr is valid F32 device memory of n elements.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.scale)
-                .arg(&x_ptr)
-                .arg(&v)
-                .arg(&k)
-                .launch(Self::launch_config_1d(n))
-                .map_err(|e| anyhow!("scale kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::Scale, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.scale)
+                    .arg(&x_ptr)
+                    .arg(&v)
+                    .arg(&k)
+                    .launch(Self::launch_config_1d(n))
+                    .map_err(|e| anyhow!("scale kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -665,15 +864,18 @@ impl Backend for CudaBackend {
         let k = n as i32;
         let stream = self.ctx.default_stream();
         // SAFETY: a_ptr (gate) and b_ptr (up) are valid F32 device memory of n elements.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.silu_mul)
-                .arg(&a_ptr)
-                .arg(&b_ptr)
-                .arg(&k)
-                .launch(Self::launch_config_1d(n))
-                .map_err(|e| anyhow!("silu_mul kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::SiluMul, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.silu_mul)
+                    .arg(&a_ptr)
+                    .arg(&b_ptr)
+                    .arg(&k)
+                    .launch(Self::launch_config_1d(n))
+                    .map_err(|e| anyhow!("silu_mul kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -685,15 +887,18 @@ impl Backend for CudaBackend {
         let k = n as i32;
         let stream = self.ctx.default_stream();
         // SAFETY: gate_ptr and up_ptr are valid F32 device memory of n elements.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.gelu_tanh_mul)
-                .arg(&gate_ptr)
-                .arg(&up_ptr)
-                .arg(&k)
-                .launch(Self::launch_config_1d(n))
-                .map_err(|e| anyhow!("gelu_tanh_mul kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::GeluTanhMul, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.gelu_tanh_mul)
+                    .arg(&gate_ptr)
+                    .arg(&up_ptr)
+                    .arg(&k)
+                    .launch(Self::launch_config_1d(n))
+                    .map_err(|e| anyhow!("gelu_tanh_mul kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -715,18 +920,21 @@ impl Backend for CudaBackend {
         let stream = self.ctx.default_stream();
         // SAFETY: x_ptr (in-place dst+src) and w_ptr are valid F32 device memory.
         // nrows * ncols == total elements.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.rms_norm)
-                .arg(&x_ptr) // dst
-                .arg(&x_ptr) // x (in-place)
-                .arg(&w_ptr) // weight
-                .arg(&ncols)
-                .arg(&eps)
-                .arg(&add_unit_i32)
-                .launch(cfg)
-                .map_err(|e| anyhow!("rms_norm kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::RmsNorm, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.rms_norm)
+                    .arg(&x_ptr) // dst
+                    .arg(&x_ptr) // x (in-place)
+                    .arg(&w_ptr) // weight
+                    .arg(&ncols)
+                    .arg(&eps)
+                    .arg(&add_unit_i32)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("rms_norm kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -755,18 +963,21 @@ impl Backend for CudaBackend {
         };
         let stream = self.ctx.default_stream();
         // SAFETY: out_ptr (dst), x_ptr (src), w_ptr are valid F32 device memory.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.rms_norm)
-                .arg(&out_ptr) // dst
-                .arg(&x_ptr) // x (read-only)
-                .arg(&w_ptr) // weight
-                .arg(&ncols)
-                .arg(&eps)
-                .arg(&add_unit_i32)
-                .launch(cfg)
-                .map_err(|e| anyhow!("rms_norm_oop kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::RmsNorm, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.rms_norm)
+                    .arg(&out_ptr) // dst
+                    .arg(&x_ptr) // x (read-only)
+                    .arg(&w_ptr) // weight
+                    .arg(&ncols)
+                    .arg(&eps)
+                    .arg(&add_unit_i32)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("rms_norm_oop kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -799,14 +1010,17 @@ impl Backend for CudaBackend {
         };
         let stream = self.ctx.default_stream();
         // SAFETY: x_ptr is valid F32 device memory of nrows*ncols elements.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.softmax)
-                .arg(&x_ptr)
-                .arg(&ncols)
-                .launch(cfg)
-                .map_err(|e| anyhow!("softmax kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::Softmax, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.softmax)
+                    .arg(&x_ptr)
+                    .arg(&ncols)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("softmax kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -840,18 +1054,21 @@ impl Backend for CudaBackend {
             shared_mem_bytes: 0,
         };
         let stream = self.ctx.default_stream();
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.rope_inplace)
-                .arg(&x_ptr)
-                .arg(&hd)
-                .arg(&nh)
-                .arg(&sl)
-                .arg(&sp)
-                .arg(&theta)
-                .launch(cfg)
-                .map_err(|e| anyhow!("rope_inplace kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::Rope, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.rope_inplace)
+                    .arg(&x_ptr)
+                    .arg(&hd)
+                    .arg(&nh)
+                    .arg(&sl)
+                    .arg(&sp)
+                    .arg(&theta)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("rope_inplace kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -867,30 +1084,36 @@ impl Backend for CudaBackend {
             (DType::F32, DType::F16, Some(sp), Some(dp)) => {
                 let k = n as i32;
                 let stream = self.ctx.default_stream();
-                unsafe {
-                    stream
-                        .launch_builder(&self.kernels.cast_f32_f16)
-                        .arg(&sp)
-                        .arg(&dp)
-                        .arg(&k)
-                        .launch(Self::launch_config_1d(n))
-                        .map_err(|e| anyhow!("cast_f32_f16 kernel launch failed: {e}"))?;
-                }
+                cuda_profile!(self, CudaOpTag::Cast, stream, {
+                    unsafe {
+                        stream
+                            .launch_builder(&self.kernels.cast_f32_f16)
+                            .arg(&sp)
+                            .arg(&dp)
+                            .arg(&k)
+                            .launch(Self::launch_config_1d(n))
+                            .map_err(|e| anyhow!("cast_f32_f16 kernel launch failed: {e}"))?;
+                    }
+                    Ok(())
+                });
                 self.synchronize()?; // CPU may read dst immediately
                 Ok(())
             }
             (DType::F16, DType::F32, Some(sp), Some(dp)) => {
                 let k = n as i32;
                 let stream = self.ctx.default_stream();
-                unsafe {
-                    stream
-                        .launch_builder(&self.kernels.cast_f16_f32)
-                        .arg(&sp)
-                        .arg(&dp)
-                        .arg(&k)
-                        .launch(Self::launch_config_1d(n))
-                        .map_err(|e| anyhow!("cast_f16_f32 kernel launch failed: {e}"))?;
-                }
+                cuda_profile!(self, CudaOpTag::Cast, stream, {
+                    unsafe {
+                        stream
+                            .launch_builder(&self.kernels.cast_f16_f32)
+                            .arg(&sp)
+                            .arg(&dp)
+                            .arg(&k)
+                            .launch(Self::launch_config_1d(n))
+                            .map_err(|e| anyhow!("cast_f16_f32 kernel launch failed: {e}"))?;
+                    }
+                    Ok(())
+                });
                 self.synchronize()?;
                 Ok(())
             }
@@ -912,16 +1135,19 @@ impl Backend for CudaBackend {
         let total_i32 = total as i32;
         let stream = self.ctx.default_stream();
         // SAFETY: x_ptr is valid F32 device ptr of total elements; bias_ptr is valid F32 of ncols.
-        unsafe {
-            stream
-                .launch_builder(&self.kernels.add_row_bias)
-                .arg(&x_ptr)
-                .arg(&bias_ptr)
-                .arg(&ncols)
-                .arg(&total_i32)
-                .launch(Self::launch_config_1d(total))
-                .map_err(|e| anyhow!("add_row_bias kernel launch failed: {e}"))?;
-        }
+        cuda_profile!(self, CudaOpTag::AddRowBias, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.add_row_bias)
+                    .arg(&x_ptr)
+                    .arg(&bias_ptr)
+                    .arg(&ncols)
+                    .arg(&total_i32)
+                    .launch(Self::launch_config_1d(total))
+                    .map_err(|e| anyhow!("add_row_bias kernel launch failed: {e}"))?;
+            }
+            Ok(())
+        });
         self.synchronize()?;
         Ok(())
     }
@@ -960,19 +1186,22 @@ impl Backend for CudaBackend {
             let stream = self.ctx.default_stream();
             // SAFETY: ks/vs are valid F32 device ptrs; kd/vd are valid F16 device ptrs.
             // Dimensions match kv_heads * head_dim for src, kv_heads * capacity * head_dim for dst.
-            unsafe {
-                stream
-                    .launch_builder(&self.kernels.kv_scatter)
-                    .arg(&ks)
-                    .arg(&vs)
-                    .arg(&kd)
-                    .arg(&vd)
-                    .arg(&hd)
-                    .arg(&cap)
-                    .arg(&wp)
-                    .launch(cfg)
-                    .map_err(|e| anyhow!("kv_scatter kernel launch failed: {e}"))?;
-            }
+            cuda_profile!(self, CudaOpTag::KvScatter, stream, {
+                unsafe {
+                    stream
+                        .launch_builder(&self.kernels.kv_scatter)
+                        .arg(&ks)
+                        .arg(&vs)
+                        .arg(&kd)
+                        .arg(&vd)
+                        .arg(&hd)
+                        .arg(&cap)
+                        .arg(&wp)
+                        .launch(cfg)
+                        .map_err(|e| anyhow!("kv_scatter kernel launch failed: {e}"))?;
+                }
+                Ok(())
+            });
             self.synchronize()?;
             Ok(())
         } else {
@@ -1016,21 +1245,24 @@ impl Backend for CudaBackend {
                 shared_mem_bytes: 0,
             };
             let stream = self.ctx.default_stream();
-            unsafe {
-                stream
-                    .launch_builder(&self.kernels.kv_scatter_batch)
-                    .arg(&ks)
-                    .arg(&vs)
-                    .arg(&kd)
-                    .arg(&vd)
-                    .arg(&kvh)
-                    .arg(&hd)
-                    .arg(&cap)
-                    .arg(&wps)
-                    .arg(&sl)
-                    .launch(cfg)
-                    .map_err(|e| anyhow!("kv_scatter_batch launch failed: {e}"))?;
-            }
+            cuda_profile!(self, CudaOpTag::KvScatter, stream, {
+                unsafe {
+                    stream
+                        .launch_builder(&self.kernels.kv_scatter_batch)
+                        .arg(&ks)
+                        .arg(&vs)
+                        .arg(&kd)
+                        .arg(&vd)
+                        .arg(&kvh)
+                        .arg(&hd)
+                        .arg(&cap)
+                        .arg(&wps)
+                        .arg(&sl)
+                        .launch(cfg)
+                        .map_err(|e| anyhow!("kv_scatter_batch launch failed: {e}"))?;
+                }
+                Ok(())
+            });
             self.synchronize()?;
             Ok(())
         } else {
@@ -1075,16 +1307,19 @@ impl Backend for CudaBackend {
             };
             let stream = self.ctx.default_stream();
             // SAFETY: sp is valid F16 embed device ptr; ip is valid i32 indices; dp is valid F32 output.
-            unsafe {
-                stream
-                    .launch_builder(&self.kernels.gather_f16)
-                    .arg(&sp)
-                    .arg(&ip)
-                    .arg(&dp)
-                    .arg(&dim_i32)
-                    .launch(cfg)
-                    .map_err(|e| anyhow!("gather_f16 kernel launch failed: {e}"))?;
-            }
+            cuda_profile!(self, CudaOpTag::Gather, stream, {
+                unsafe {
+                    stream
+                        .launch_builder(&self.kernels.gather_f16)
+                        .arg(&sp)
+                        .arg(&ip)
+                        .arg(&dp)
+                        .arg(&dim_i32)
+                        .launch(cfg)
+                        .map_err(|e| anyhow!("gather_f16 kernel launch failed: {e}"))?;
+                }
+                Ok(())
+            });
             self.synchronize()?;
             Ok(())
         } else {
@@ -1152,43 +1387,51 @@ impl Backend for CudaBackend {
             match kv_dtype {
                 DType::F32 => {
                     // SAFETY: qp, kp, vp, op are valid F32 device ptrs with correct dimensions.
-                    unsafe {
-                        stream
-                            .launch_builder(&self.kernels.flash_attn_f32)
-                            .arg(&qp)
-                            .arg(&kp)
-                            .arg(&vp)
-                            .arg(&op)
-                            .arg(&nhq)
-                            .arg(&nkv)
-                            .arg(&hd)
-                            .arg(&cap)
-                            .arg(&csl)
-                            .launch(cfg)
-                            .map_err(|e| anyhow!("attention_gen_f32 kernel launch failed: {e}"))?;
-                    }
+                    cuda_profile!(self, CudaOpTag::Attention, stream, {
+                        unsafe {
+                            stream
+                                .launch_builder(&self.kernels.flash_attn_f32)
+                                .arg(&qp)
+                                .arg(&kp)
+                                .arg(&vp)
+                                .arg(&op)
+                                .arg(&nhq)
+                                .arg(&nkv)
+                                .arg(&hd)
+                                .arg(&cap)
+                                .arg(&csl)
+                                .launch(cfg)
+                                .map_err(|e| {
+                                    anyhow!("attention_gen_f32 kernel launch failed: {e}")
+                                })?;
+                        }
+                        Ok(())
+                    });
                     self.synchronize()?;
                     Ok(())
                 }
                 DType::F16 => {
                     // SAFETY: kp and vp are valid F16 device ptrs; qp and op are F32.
-                    unsafe {
-                        stream
-                            .launch_builder(&self.kernels.flash_attn_f16kv)
-                            .arg(&qp)
-                            .arg(&kp)
-                            .arg(&vp)
-                            .arg(&op)
-                            .arg(&nhq)
-                            .arg(&nkv)
-                            .arg(&hd)
-                            .arg(&cap)
-                            .arg(&csl)
-                            .launch(cfg)
-                            .map_err(|e| {
-                                anyhow!("attention_gen_f16kv kernel launch failed: {e}")
-                            })?;
-                    }
+                    cuda_profile!(self, CudaOpTag::Attention, stream, {
+                        unsafe {
+                            stream
+                                .launch_builder(&self.kernels.flash_attn_f16kv)
+                                .arg(&qp)
+                                .arg(&kp)
+                                .arg(&vp)
+                                .arg(&op)
+                                .arg(&nhq)
+                                .arg(&nkv)
+                                .arg(&hd)
+                                .arg(&cap)
+                                .arg(&csl)
+                                .launch(cfg)
+                                .map_err(|e| {
+                                    anyhow!("attention_gen_f16kv kernel launch failed: {e}")
+                                })?;
+                        }
+                        Ok(())
+                    });
                     self.synchronize()?;
                     Ok(())
                 }

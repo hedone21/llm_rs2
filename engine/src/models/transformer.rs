@@ -27,10 +27,12 @@ fn is_local_layer(layer_idx: usize, pattern: Option<usize>) -> bool {
     }
 }
 
-/// Run `f` with the OpenCL `op_label_hint` temporarily set to `label`, if the
-/// backend is an event-profiling OpenCL backend. No-op on CPU or when
-/// event profiling is off. Used by the non-plan path to tag lm_head.
+/// Run `f` with the backend's `op_label_hint` temporarily set to
+/// `label`, when a compatible profiling backend is active. No-op on
+/// CPU or when profiling is off. Used by the non-plan path to tag
+/// lm_head (and any other op the caller knows about).
 #[inline]
+#[allow(unused_variables)]
 fn with_op_label<F, T>(backend: &Arc<dyn Backend>, label: &'static str, f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T>,
@@ -46,8 +48,16 @@ where
         ocl_be.clear_op_label();
         return r;
     }
-    #[cfg(not(feature = "opencl"))]
-    let _ = (backend, label);
+    #[cfg(feature = "cuda-embedded")]
+    if let Some(cu_be) = backend
+        .as_any()
+        .downcast_ref::<crate::backend::cuda_embedded::CudaBackend>()
+    {
+        cu_be.set_op_label(label);
+        let r = f();
+        cu_be.clear_op_label();
+        return r;
+    }
     f()
 }
 
