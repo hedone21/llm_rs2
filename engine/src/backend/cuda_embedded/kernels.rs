@@ -28,9 +28,16 @@ pub struct CudaKernels {
     pub cast_f16_f32: CudaFunction,
     pub add_row_bias: CudaFunction,
     pub kv_scatter: CudaFunction,
+    pub kv_scatter_batch: CudaFunction,
     pub gather_f16: CudaFunction,
     pub flash_attn_f32: CudaFunction,
     pub flash_attn_f16kv: CudaFunction,
+    pub flash_prefill_f32_dk64: CudaFunction,
+    pub flash_prefill_f32_dk128: CudaFunction,
+    pub flash_prefill_f32_dk256: CudaFunction,
+    pub flash_prefill_f16kv_dk64: CudaFunction,
+    pub flash_prefill_f16kv_dk128: CudaFunction,
+    pub flash_prefill_f16kv_dk256: CudaFunction,
 }
 
 impl CudaKernels {
@@ -64,9 +71,16 @@ impl CudaKernels {
             cast_f16_f32: load("cast_f16_to_f32")?,
             add_row_bias: load("add_row_bias_f32")?,
             kv_scatter: load("kv_scatter_f32_to_f16")?,
+            kv_scatter_batch: load("kv_scatter_f32_to_f16_batch")?,
             gather_f16: load("gather_f16")?,
             flash_attn_f32: load("attention_gen_f32_naive")?,
             flash_attn_f16kv: load("attention_gen_f16kv_naive")?,
+            flash_prefill_f32_dk64: load("flash_attn_prefill_f32_dk64")?,
+            flash_prefill_f32_dk128: load("flash_attn_prefill_f32_dk128")?,
+            flash_prefill_f32_dk256: load("flash_attn_prefill_f32_dk256")?,
+            flash_prefill_f16kv_dk64: load("flash_attn_prefill_f16kv_dk64")?,
+            flash_prefill_f16kv_dk128: load("flash_attn_prefill_f16kv_dk128")?,
+            flash_prefill_f16kv_dk256: load("flash_attn_prefill_f16kv_dk256")?,
         })
     }
 

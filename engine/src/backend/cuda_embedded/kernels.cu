@@ -81,16 +81,16 @@ extern "C" __global__ void rms_norm_f32(
     const float * row_x = x + (long long)row * ncols;
     float * row_dst = dst + (long long)row * ncols;
 
-    // Thread 0 computes the full RMS (simple, no reduction needed for correctness)
-    __shared__ float rms_inv_shared;
-    if (tid == 0) {
-        float sum_sq = 0.0f;
-        for (int i = 0; i < ncols; i++) {
-            float v = row_x[i];
-            sum_sq += v * v;
-        }
-        rms_inv_shared = rsqrtf(sum_sq / (float)ncols + eps);
+    // Parallel reduction for sum of squares across all threads in block
+    float partial_sq = 0.0f;
+    for (int i = tid; i < ncols; i += blockDim.x) {
+        float v = row_x[i];
+        partial_sq += v * v;
     }
+    float sum_sq = block_reduce_sum(partial_sq);
+    __shared__ float rms_inv_shared;
+    if (tid == 0)
+        rms_inv_shared = rsqrtf(sum_sq / (float)ncols + eps);
     __syncthreads();
 
     float rms_inv = rms_inv_shared;
@@ -103,12 +103,12 @@ extern "C" __global__ void rms_norm_f32(
 }
 
 // =================================================================
-// 2. RoPE inplace (neox style, Llama/Qwen)
+// 2. RoPE inplace (neox split-half, Llama/Qwen/Gemma3)
 // =================================================================
 // Supports both decode (seq_len=1) and prefill (seq_len>1).
 // grid=(seq_len * n_heads, 1, 1), block=(head_dim/2, 1, 1)
 // x layout: [seq_len, n_heads, head_dim] (flattened)
-// Each position t gets rotation angle: (start_pos + t) * freq_i
+// Pair layout: (x[i], x[i + head_dim/2]) — matches CPU/OpenCL neox style.
 extern "C" __global__ void rope_inplace_f32(
     float * x, int head_dim, int n_heads, int seq_len,
     int start_pos, float theta_base)
@@ -117,7 +117,8 @@ extern "C" __global__ void rope_inplace_f32(
     int t = block_id / n_heads;         // sequence position within batch
     int h = block_id % n_heads;         // head index
     int i = threadIdx.x;                // dim pair index: 0..head_dim/2
-    if (i >= head_dim / 2) return;
+    int half_dim = head_dim / 2;
+    if (i >= half_dim) return;
 
     // freq = theta_base^(-2i/head_dim) = exp(-2i/head_dim * log(theta_base))
     // Using exp+log matches CPU's floating point behavior better than powf.
@@ -127,10 +128,10 @@ extern "C" __global__ void rope_inplace_f32(
     float sin_t = sinf(theta);
 
     int base = (t * n_heads + h) * head_dim;
-    float x0 = x[base + 2 * i];
-    float x1 = x[base + 2 * i + 1];
-    x[base + 2 * i]     = x0 * cos_t - x1 * sin_t;
-    x[base + 2 * i + 1] = x0 * sin_t + x1 * cos_t;
+    float x0 = x[base + i];
+    float x1 = x[base + i + half_dim];
+    x[base + i]            = x0 * cos_t - x1 * sin_t;
+    x[base + i + half_dim] = x0 * sin_t + x1 * cos_t;
 }
 
 // =================================================================
@@ -258,6 +259,29 @@ extern "C" __global__ void kv_scatter_f32_to_f16(
     if (d >= head_dim) return;
     int src_off = h * head_dim + d;
     int dst_off = h * capacity * head_dim + write_pos * head_dim + d;
+    k_dst[dst_off] = __float2half(k_src[src_off]);
+    v_dst[dst_off] = __float2half(v_src[src_off]);
+}
+
+// =================================================================
+// 11b. KV scatter F32->F16 BATCH (HeadMajor layout, prefill)
+// =================================================================
+// grid=(kv_heads, seq_len, 1), block=(head_dim, 1, 1)
+// k_src layout: [seq_len, kv_heads, head_dim] (contiguous F32, last-dim = kv_heads*head_dim)
+// k_dst layout: HeadMajor [kv_heads, capacity, head_dim] (F16)
+extern "C" __global__ void kv_scatter_f32_to_f16_batch(
+    const float * k_src, const float * v_src,
+    half * k_dst, half * v_dst,
+    int kv_heads, int head_dim, int capacity, int write_pos_start, int seq_len)
+{
+    int h = blockIdx.x;   // kv head index
+    int s = blockIdx.y;   // sequence position within batch
+    int d = threadIdx.x;  // dimension index
+    if (h >= kv_heads || s >= seq_len || d >= head_dim) return;
+    // src: contiguous [seq_len, kv_heads * head_dim] -> offset = s * kv_heads * head_dim + h * head_dim + d
+    int src_off = (s * kv_heads + h) * head_dim + d;
+    // dst: HeadMajor [kv_heads, capacity, head_dim] -> offset = h * capacity * head_dim + (write_pos_start + s) * head_dim + d
+    int dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim + d;
     k_dst[dst_off] = __float2half(k_src[src_off]);
     v_dst[dst_off] = __float2half(v_src[src_off]);
 }
@@ -410,3 +434,289 @@ extern "C" __global__ void attention_gen_f16kv_naive(
         out_vec[d] = acc;
     }
 }
+
+// =================================================================
+// 15. Flash Attention Prefill (FlashAttention-2 style online softmax)
+// =================================================================
+// Macro-generated kernels for head_dim = 64, 128, 256.
+// Each thread processes one query row. K/V are loaded in tiles of BLOCK_N
+// into shared memory cooperatively. Two KV positions are processed per
+// inner iteration to halve rescaling overhead.
+//
+// Grid:  (ceil(seq_len / BLOCK_M), n_heads_q * batch_size, 1)
+// Block: (BLOCK_M, 1, 1)
+//
+// Memory layout:
+//   Q/O: [batch, seq_len, n_heads_q, head_dim]  (contiguous)
+//   KV:  HeadMajor [batch, n_heads_kv, capacity, head_dim]
+//
+// Causal mask: k_pos > (cache_seq_len - seq_len + query_row) => -inf
+
+#define FLASH_PREFILL_KERNEL_F32(SUFFIX, HD, BM, BN) \
+extern "C" __global__ void flash_attn_prefill_f32_##SUFFIX( \
+    const float* __restrict__ q, \
+    const float* __restrict__ k_cache, \
+    const float* __restrict__ v_cache, \
+    float* __restrict__ out, \
+    int n_heads_q, int n_heads_kv, \
+    int seq_len, int cache_seq_len, int kv_capacity, \
+    int batch_size) \
+{ \
+    int tile_row = blockIdx.x;  /* which BLOCK_M tile of queries */ \
+    int head_batch = blockIdx.y; /* h_q + batch * n_heads_q */ \
+    int tid = threadIdx.x;       /* thread within block = query row within tile */ \
+    \
+    int b = head_batch / n_heads_q; \
+    int h_q = head_batch % n_heads_q; \
+    int gqa_ratio = n_heads_q / n_heads_kv; \
+    int h_kv = h_q / gqa_ratio; \
+    \
+    int my_query_row = tile_row * BM + tid; \
+    int valid = (my_query_row < seq_len); \
+    \
+    float scale = rsqrtf((float)(HD)); \
+    int causal_limit = valid ? (cache_seq_len - seq_len + my_query_row) : -1; \
+    \
+    /* KV base pointer (same for all threads in block — needed for cooperative load) */ \
+    long long kv_base = ((long long)b * n_heads_kv + h_kv) * kv_capacity * (HD); \
+    const float* k_base = k_cache + kv_base; \
+    const float* v_base = v_cache + kv_base; \
+    \
+    /* Accumulator in registers */ \
+    float o_acc[HD]; \
+    for (int d = 0; d < (HD); d++) o_acc[d] = 0.0f; \
+    float m_i = -INFINITY; \
+    float l_i = 0.0f; \
+    \
+    /* Load Q into registers (valid threads only — invalid threads have OOB q_offset) */ \
+    float q_reg[HD]; \
+    if (valid) { \
+        long long q_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        const float* my_q = q + q_offset; \
+        for (int d = 0; d < (HD); d++) q_reg[d] = my_q[d]; \
+    } \
+    \
+    /* Shared memory for K and V tiles: BN * HD each */ \
+    __shared__ float k_tile[BN * HD]; \
+    __shared__ float v_tile[BN * HD]; \
+    \
+    /* Iterate over KV in tiles of BN */ \
+    for (int kv_start = 0; kv_start < cache_seq_len; kv_start += BN) { \
+        int kv_end = min(kv_start + BN, cache_seq_len); \
+        int tile_len = kv_end - kv_start; \
+        \
+        /* Cooperative load of K and V tiles into shared memory */ \
+        __syncthreads(); \
+        for (int i = tid; i < tile_len * (HD); i += BM) { \
+            int pos_local = i / (HD); \
+            int dim = i % (HD); \
+            int pos_global = kv_start + pos_local; \
+            k_tile[pos_local * (HD) + dim] = k_base[pos_global * (HD) + dim]; \
+            v_tile[pos_local * (HD) + dim] = v_base[pos_global * (HD) + dim]; \
+        } \
+        __syncthreads(); \
+        \
+        if (!valid) continue; \
+        \
+        /* Process pairs of KV positions to reduce rescaling */ \
+        int p = 0; \
+        for (; p + 1 < tile_len; p += 2) { \
+            int kp0 = kv_start + p; \
+            int kp1 = kv_start + p + 1; \
+            float s0 = (kp0 <= causal_limit) ? 0.0f : -INFINITY; \
+            float s1 = (kp1 <= causal_limit) ? 0.0f : -INFINITY; \
+            if (kp0 <= causal_limit) { \
+                float dot = 0.0f; \
+                for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
+                s0 = dot * scale; \
+            } \
+            if (kp1 <= causal_limit) { \
+                float dot = 0.0f; \
+                for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[(p+1) * (HD) + d]; \
+                s1 = dot * scale; \
+            } \
+            float m_new = fmaxf(m_i, fmaxf(s0, s1)); \
+            if (m_new > -INFINITY) { \
+                float exp0 = expf(s0 - m_new); \
+                float exp1 = expf(s1 - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp0 + exp1; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale \
+                             + exp0 * v_tile[p * (HD) + d] \
+                             + exp1 * v_tile[(p+1) * (HD) + d]; \
+                } \
+                m_i = m_new; \
+            } \
+        } \
+        /* Handle odd remainder */ \
+        if (p < tile_len) { \
+            int kp = kv_start + p; \
+            float s = -INFINITY; \
+            if (kp <= causal_limit) { \
+                float dot = 0.0f; \
+                for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
+                s = dot * scale; \
+            } \
+            float m_new = fmaxf(m_i, s); \
+            if (m_new > -INFINITY) { \
+                float exp_s = expf(s - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp_s; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale + exp_s * v_tile[p * (HD) + d]; \
+                } \
+                m_i = m_new; \
+            } \
+        } \
+    } \
+    \
+    /* Final normalization and write output */ \
+    if (valid) { \
+        long long out_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        float* my_out = out + out_offset; \
+        if (l_i > 0.0f) { \
+            float inv_l = 1.0f / l_i; \
+            for (int d = 0; d < (HD); d++) my_out[d] = o_acc[d] * inv_l; \
+        } else { \
+            for (int d = 0; d < (HD); d++) my_out[d] = 0.0f; \
+        } \
+    } \
+}
+
+#define FLASH_PREFILL_KERNEL_F16KV(SUFFIX, HD, BM, BN) \
+extern "C" __global__ void flash_attn_prefill_f16kv_##SUFFIX( \
+    const float* __restrict__ q, \
+    const half* __restrict__ k_cache, \
+    const half* __restrict__ v_cache, \
+    float* __restrict__ out, \
+    int n_heads_q, int n_heads_kv, \
+    int seq_len, int cache_seq_len, int kv_capacity, \
+    int batch_size) \
+{ \
+    int tile_row = blockIdx.x; \
+    int head_batch = blockIdx.y; \
+    int tid = threadIdx.x; \
+    \
+    int b = head_batch / n_heads_q; \
+    int h_q = head_batch % n_heads_q; \
+    int gqa_ratio = n_heads_q / n_heads_kv; \
+    int h_kv = h_q / gqa_ratio; \
+    \
+    int my_query_row = tile_row * BM + tid; \
+    int valid = (my_query_row < seq_len); \
+    \
+    float scale = rsqrtf((float)(HD)); \
+    int causal_limit = valid ? (cache_seq_len - seq_len + my_query_row) : -1; \
+    \
+    /* KV base pointer (same for all threads in block — needed for cooperative load) */ \
+    long long kv_base = ((long long)b * n_heads_kv + h_kv) * kv_capacity * (HD); \
+    const half* k_base = k_cache + kv_base; \
+    const half* v_base = v_cache + kv_base; \
+    \
+    float o_acc[HD]; \
+    for (int d = 0; d < (HD); d++) o_acc[d] = 0.0f; \
+    float m_i = -INFINITY; \
+    float l_i = 0.0f; \
+    \
+    /* Load Q into registers (valid threads only — invalid threads have OOB q_offset) */ \
+    float q_reg[HD]; \
+    if (valid) { \
+        long long q_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        const float* my_q = q + q_offset; \
+        for (int d = 0; d < (HD); d++) q_reg[d] = my_q[d]; \
+    } \
+    \
+    /* Shared memory for K and V tiles (stored as F32 after dequant) */ \
+    __shared__ float k_tile[BN * HD]; \
+    __shared__ float v_tile[BN * HD]; \
+    \
+    for (int kv_start = 0; kv_start < cache_seq_len; kv_start += BN) { \
+        int kv_end = min(kv_start + BN, cache_seq_len); \
+        int tile_len = kv_end - kv_start; \
+        \
+        __syncthreads(); \
+        for (int i = tid; i < tile_len * (HD); i += BM) { \
+            int pos_local = i / (HD); \
+            int dim = i % (HD); \
+            int pos_global = kv_start + pos_local; \
+            k_tile[pos_local * (HD) + dim] = __half2float(k_base[pos_global * (HD) + dim]); \
+            v_tile[pos_local * (HD) + dim] = __half2float(v_base[pos_global * (HD) + dim]); \
+        } \
+        __syncthreads(); \
+        \
+        if (!valid) continue; \
+        \
+        int p = 0; \
+        for (; p + 1 < tile_len; p += 2) { \
+            int kp0 = kv_start + p; \
+            int kp1 = kv_start + p + 1; \
+            float s0 = (kp0 <= causal_limit) ? 0.0f : -INFINITY; \
+            float s1 = (kp1 <= causal_limit) ? 0.0f : -INFINITY; \
+            if (kp0 <= causal_limit) { \
+                float dot = 0.0f; \
+                for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
+                s0 = dot * scale; \
+            } \
+            if (kp1 <= causal_limit) { \
+                float dot = 0.0f; \
+                for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[(p+1) * (HD) + d]; \
+                s1 = dot * scale; \
+            } \
+            float m_new = fmaxf(m_i, fmaxf(s0, s1)); \
+            if (m_new > -INFINITY) { \
+                float exp0 = expf(s0 - m_new); \
+                float exp1 = expf(s1 - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp0 + exp1; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale \
+                             + exp0 * v_tile[p * (HD) + d] \
+                             + exp1 * v_tile[(p+1) * (HD) + d]; \
+                } \
+                m_i = m_new; \
+            } \
+        } \
+        if (p < tile_len) { \
+            int kp = kv_start + p; \
+            float s = -INFINITY; \
+            if (kp <= causal_limit) { \
+                float dot = 0.0f; \
+                for (int d = 0; d < (HD); d++) dot += q_reg[d] * k_tile[p * (HD) + d]; \
+                s = dot * scale; \
+            } \
+            float m_new = fmaxf(m_i, s); \
+            if (m_new > -INFINITY) { \
+                float exp_s = expf(s - m_new); \
+                float rescale = (m_i > -INFINITY) ? expf(m_i - m_new) : 0.0f; \
+                l_i = l_i * rescale + exp_s; \
+                for (int d = 0; d < (HD); d++) { \
+                    o_acc[d] = o_acc[d] * rescale + exp_s * v_tile[p * (HD) + d]; \
+                } \
+                m_i = m_new; \
+            } \
+        } \
+    } \
+    \
+    /* Final normalization and write output */ \
+    if (valid) { \
+        long long out_offset = ((long long)b * seq_len * n_heads_q + (long long)my_query_row * n_heads_q + h_q) * (HD); \
+        float* my_out = out + out_offset; \
+        if (l_i > 0.0f) { \
+            float inv_l = 1.0f / l_i; \
+            for (int d = 0; d < (HD); d++) my_out[d] = o_acc[d] * inv_l; \
+        } else { \
+            for (int d = 0; d < (HD); d++) my_out[d] = 0.0f; \
+        } \
+    } \
+}
+
+// Generate F32 KV variants
+FLASH_PREFILL_KERNEL_F32(dk64,  64,  32, 32)
+FLASH_PREFILL_KERNEL_F32(dk128, 128, 32, 16)
+FLASH_PREFILL_KERNEL_F32(dk256, 256, 32,  8)
+
+// Generate F16 KV variants
+FLASH_PREFILL_KERNEL_F16KV(dk64,  64,  32, 32)
+FLASH_PREFILL_KERNEL_F16KV(dk128, 128, 32, 16)
+FLASH_PREFILL_KERNEL_F16KV(dk256, 256, 32,  8)

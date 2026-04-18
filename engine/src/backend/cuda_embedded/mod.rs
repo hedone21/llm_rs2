@@ -12,7 +12,7 @@
 pub mod kernels;
 pub mod memory;
 
-use crate::buffer::cuda_buffer::{CudaBuffer, CudaHostBuffer};
+use crate::buffer::cuda_buffer::{CudaBuffer, CudaDeviceBuffer, CudaHostBuffer};
 use crate::core::backend::Backend;
 use crate::core::buffer::{Buffer, DType};
 use crate::core::tensor::Tensor;
@@ -59,6 +59,8 @@ pub struct CudaBackend {
     is_uma: bool,
     cublas: Arc<CublasHandle>,
     kernels: Arc<CudaKernels>,
+    /// Cached F16 cast buffer for matmul_transposed F32×F16 path.
+    cast_cache: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
 }
 
 impl CudaBackend {
@@ -98,11 +100,12 @@ impl CudaBackend {
             return Err(anyhow!("Device does not support managed (unified) memory"));
         }
 
-        // Check UMA (unified addressing)
-        let unified_addr = ctx
-            .attribute(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_UNIFIED_ADDRESSING)
+        // Check UMA: integrated GPU (e.g., Jetson) shares physical memory with CPU.
+        // CU_DEVICE_ATTRIBUTE_INTEGRATED = 1 means integrated (UMA), 0 means discrete.
+        let integrated = ctx
+            .attribute(cuda_sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
             .unwrap_or(0);
-        let is_uma = unified_addr != 0;
+        let is_uma = integrated != 0;
 
         // Get device name
         let cu_device = cuda_result::device::get(ordinal as i32)
@@ -138,6 +141,7 @@ impl CudaBackend {
                 handle: cublas_handle,
             }),
             kernels: Arc::new(kernels),
+            cast_cache: Arc::new(std::sync::Mutex::new(None)),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -168,6 +172,11 @@ impl CudaBackend {
                 buf.as_any()
                     .downcast_ref::<CudaBuffer>()
                     .map(|cb| cb.device_ptr())
+            })
+            .or_else(|| {
+                buf.as_any()
+                    .downcast_ref::<CudaDeviceBuffer>()
+                    .map(|db| db.device_ptr())
             })
     }
 
@@ -347,22 +356,91 @@ impl Backend for CudaBackend {
 
     fn flash_attention_prefill(
         &self,
-        _q: &Tensor,
-        _k: &Tensor,
-        _v: &Tensor,
-        _out: &mut Tensor,
-        _nq: usize,
-        _nkv: usize,
-        _sl: usize,
-        _csl: usize,
-        _hd: usize,
-        _cap: usize,
-        _bs: usize,
-        _hm: bool,
+        q: &Tensor,
+        k_cache: &Tensor,
+        v_cache: &Tensor,
+        out: &mut Tensor,
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        head_dim: usize,
+        kv_capacity: usize,
+        batch_size: usize,
+        _is_head_major: bool,
     ) -> Result<bool> {
-        // Sync before CPU fallback reads KV cache written by GPU kernels.
-        self.synchronize()?;
-        Ok(false)
+        let kv_dtype = k_cache.dtype();
+
+        // Only support F32/F16 KV and head_dim in {64, 128, 256}
+        if !matches!(head_dim, 64 | 128 | 256) || kv_dtype == DType::Q4_0 {
+            self.synchronize()?;
+            return Ok(false);
+        }
+
+        let q_ptr = Self::get_device_ptr(q.buffer().as_ref());
+        let k_ptr = Self::get_device_ptr(k_cache.buffer().as_ref());
+        let v_ptr = Self::get_device_ptr(v_cache.buffer().as_ref());
+        let out_ptr = Self::get_device_ptr(out.buffer().as_ref());
+
+        if let (Some(qp), Some(kp), Some(vp), Some(op)) = (q_ptr, k_ptr, v_ptr, out_ptr) {
+            let block_m: u32 = 32;
+            let cfg = LaunchConfig {
+                grid_dim: (
+                    seq_len.div_ceil(block_m as usize) as u32,
+                    (n_heads_q * batch_size) as u32,
+                    1,
+                ),
+                block_dim: (block_m, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            let nhq = n_heads_q as i32;
+            let nkv = n_heads_kv as i32;
+            let sl = seq_len as i32;
+            let csl = cache_seq_len as i32;
+            let cap = kv_capacity as i32;
+            let bs = batch_size as i32;
+
+            let kernel = match (kv_dtype, head_dim) {
+                (DType::F32, 64) => &self.kernels.flash_prefill_f32_dk64,
+                (DType::F32, 128) => &self.kernels.flash_prefill_f32_dk128,
+                (DType::F32, 256) => &self.kernels.flash_prefill_f32_dk256,
+                (DType::F16, 64) => &self.kernels.flash_prefill_f16kv_dk64,
+                (DType::F16, 128) => &self.kernels.flash_prefill_f16kv_dk128,
+                (DType::F16, 256) => &self.kernels.flash_prefill_f16kv_dk256,
+                _ => {
+                    self.synchronize()?;
+                    return Ok(false);
+                }
+            };
+
+            let stream = self.ctx.default_stream();
+            // SAFETY: qp is valid F32 device ptr for Q [batch, seq_len, n_heads_q, head_dim].
+            // kp/vp are valid F32 or F16 device ptrs for KV [batch, n_heads_kv, capacity, head_dim].
+            // op is valid F32 device ptr for output, same layout as Q.
+            // All dimensions are checked by callers (transformer layer).
+            unsafe {
+                stream
+                    .launch_builder(kernel)
+                    .arg(&qp)
+                    .arg(&kp)
+                    .arg(&vp)
+                    .arg(&op)
+                    .arg(&nhq)
+                    .arg(&nkv)
+                    .arg(&sl)
+                    .arg(&csl)
+                    .arg(&cap)
+                    .arg(&bs)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("flash_attn_prefill launch failed: {e}"))?;
+            }
+            self.synchronize()?;
+            Ok(true)
+        } else {
+            self.synchronize()?;
+            Ok(false)
+        }
     }
 
     // --- Math ops ---
@@ -427,9 +505,17 @@ impl Backend for CudaBackend {
                 self.synchronize()?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
-                // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS
+                // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS.
+                // Reuse cached buffer to avoid per-call allocation.
                 let k_elements = (m * k) as usize;
-                let a_f16_buf = CudaHostBuffer::new(k_elements * 2, DType::F16)?;
+                let needed = k_elements * 2;
+                let a_f16_buf = {
+                    let mut cache = self.cast_cache.lock().unwrap();
+                    match cache.take() {
+                        Some(buf) if buf.size() >= needed => buf,
+                        _ => CudaHostBuffer::new(needed, DType::F16)?,
+                    }
+                };
                 let a_f16_ptr = a_f16_buf.device_ptr();
 
                 // Launch F32->F16 cast kernel
@@ -479,6 +565,7 @@ impl Backend for CudaBackend {
                     .map_err(|e| anyhow!("cublasGemmEx (F32->F16 x F16) failed: {e}"))?;
                 }
                 self.synchronize()?;
+                *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
             } else if a_dtype == DType::F16 && b_dtype == DType::F16 {
                 // Both F16: use GemmEx with F32 compute for accuracy
@@ -896,6 +983,72 @@ impl Backend for CudaBackend {
         }
     }
 
+    fn supports_kv_scatter_batch(&self) -> bool {
+        true
+    }
+
+    fn kv_scatter_f32_to_f16_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        let ks = Self::get_device_ptr(k_src.buffer().as_ref());
+        let vs = Self::get_device_ptr(v_src.buffer().as_ref());
+        let kd = Self::get_device_ptr(k_dst.buffer().as_ref());
+        let vd = Self::get_device_ptr(v_dst.buffer().as_ref());
+
+        if let (Some(ks), Some(vs), Some(kd), Some(vd)) = (ks, vs, kd, vd) {
+            let hd = head_dim as i32;
+            let cap = capacity as i32;
+            let wps = write_pos_start as i32;
+            let sl = seq_len as i32;
+            let kvh = kv_heads as i32;
+            let cfg = LaunchConfig {
+                grid_dim: (kv_heads as u32, seq_len as u32, 1),
+                block_dim: (head_dim as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stream = self.ctx.default_stream();
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.kv_scatter_batch)
+                    .arg(&ks)
+                    .arg(&vs)
+                    .arg(&kd)
+                    .arg(&vd)
+                    .arg(&kvh)
+                    .arg(&hd)
+                    .arg(&cap)
+                    .arg(&wps)
+                    .arg(&sl)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("kv_scatter_batch launch failed: {e}"))?;
+            }
+            self.synchronize()?;
+            Ok(())
+        } else {
+            self.synchronize()?;
+            cpu_fallback().kv_scatter_f32_to_f16_batch(
+                k_src,
+                v_src,
+                k_dst,
+                v_dst,
+                kv_heads,
+                head_dim,
+                capacity,
+                write_pos_start,
+                seq_len,
+            )
+        }
+    }
+
     fn gather(&self, src: &Tensor, indices: &Tensor, dst: &mut Tensor) -> Result<()> {
         // GPU kernel only supports F16 embedding -> F32 output.
         // For other dtypes, sync and fall back to CPU.
@@ -1082,8 +1235,11 @@ impl Backend for CudaBackend {
     }
 
     fn read_buffer(&self, t: &Tensor, dst: &mut [u8]) -> Result<()> {
-        // Sync before CPU reads: GPU kernels may have written to this buffer.
         self.synchronize()?;
+        if let Some(db) = t.buffer().as_any().downcast_ref::<CudaDeviceBuffer>() {
+            db.copy_to_host(dst.as_mut_ptr(), dst.len())?;
+            return Ok(());
+        }
         let src_ptr = t.buffer().as_ptr();
         if src_ptr.is_null() {
             anyhow::bail!("Cannot read null buffer");
@@ -1095,26 +1251,539 @@ impl Backend for CudaBackend {
     }
 
     fn copy_from(&self, src: &Tensor) -> Result<Tensor> {
-        self.synchronize()?; // GPU가 src에 쓴 데이터 완료 대기
+        self.synchronize()?;
         let size = src.size();
-        let cuda_buf = CudaHostBuffer::new(size, src.dtype())?;
-
-        // Copy data from source to pinned host memory.
-        // SAFETY: Both pointers are valid. src from any Buffer (CPU or GPU),
-        // dst from cuMemHostAlloc (valid host pointer, page-locked).
         let src_ptr = src.as_ptr();
-        let dst_ptr = cuda_buf.as_mut_ptr();
-        if !src_ptr.is_null() && !dst_ptr.is_null() {
-            unsafe {
-                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+
+        if self.is_discrete_gpu() {
+            // Discrete GPU: use managed memory (cuMemAllocManaged).
+            // CUDA driver auto-migrates pages to VRAM on first GPU access.
+            let managed_buf = CudaBuffer::new(size, src.dtype())?;
+            if !src_ptr.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, managed_buf.as_mut_ptr(), size);
+                }
+            }
+            Ok(Tensor::new(
+                src.shape().clone(),
+                Arc::new(managed_buf),
+                Arc::new(self.clone()),
+            ))
+        } else {
+            // UMA (Jetson): pinned host memory is zero-copy.
+            let cuda_buf = CudaHostBuffer::new(size, src.dtype())?;
+            let dst_ptr = cuda_buf.as_mut_ptr();
+            if !src_ptr.is_null() && !dst_ptr.is_null() {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, size);
+                }
+            }
+            Ok(Tensor::new(
+                src.shape().clone(),
+                Arc::new(cuda_buf),
+                Arc::new(self.clone()),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Reference implementation of tiled online-softmax flash attention (matches CUDA kernel logic).
+    /// Used to verify numerical stability invariants without requiring a GPU.
+    fn ref_flash_attn_prefill(
+        q: &[f32],       // [seq_len, n_heads_q, head_dim]
+        k: &[f32],       // [n_heads_kv, capacity, head_dim]
+        v: &[f32],       // [n_heads_kv, capacity, head_dim]
+        out: &mut [f32], // [seq_len, n_heads_q, head_dim]
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        kv_capacity: usize,
+        head_dim: usize,
+        block_n: usize, // KV tile size
+    ) {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = n_heads_q / n_heads_kv;
+
+        for s in 0..seq_len {
+            let causal_limit = (cache_seq_len as i64) - (seq_len as i64) + (s as i64);
+
+            for h_q in 0..n_heads_q {
+                let h_kv = h_q / gqa_ratio;
+                let q_off = (s * n_heads_q + h_q) * head_dim;
+
+                let mut o_acc = vec![0.0f32; head_dim];
+                let mut m_i: f32 = f32::NEG_INFINITY;
+                let mut l_i: f32 = 0.0;
+
+                // Process KV in tiles of block_n, pairs of 2
+                for kv_start in (0..cache_seq_len).step_by(block_n) {
+                    let kv_end = (kv_start + block_n).min(cache_seq_len);
+                    let tile_len = kv_end - kv_start;
+
+                    let mut p = 0;
+                    while p + 1 < tile_len {
+                        let kp0 = kv_start + p;
+                        let kp1 = kv_start + p + 1;
+
+                        let s0 = if (kp0 as i64) <= causal_limit {
+                            let k_off = h_kv * kv_capacity * head_dim + kp0 * head_dim;
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q[q_off + d] * k[k_off + d];
+                            }
+                            dot * scale
+                        } else {
+                            f32::NEG_INFINITY
+                        };
+
+                        let s1 = if (kp1 as i64) <= causal_limit {
+                            let k_off = h_kv * kv_capacity * head_dim + kp1 * head_dim;
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q[q_off + d] * k[k_off + d];
+                            }
+                            dot * scale
+                        } else {
+                            f32::NEG_INFINITY
+                        };
+
+                        let m_new = m_i.max(s0.max(s1));
+                        if m_new > f32::NEG_INFINITY {
+                            let exp0 = (s0 - m_new).exp();
+                            let exp1 = (s1 - m_new).exp();
+                            let rescale = if m_i > f32::NEG_INFINITY {
+                                (m_i - m_new).exp()
+                            } else {
+                                0.0
+                            };
+                            l_i = l_i * rescale + exp0 + exp1;
+                            for d in 0..head_dim {
+                                let v0 = v[h_kv * kv_capacity * head_dim + kp0 * head_dim + d];
+                                let v1 = v[h_kv * kv_capacity * head_dim + kp1 * head_dim + d];
+                                o_acc[d] = o_acc[d] * rescale + exp0 * v0 + exp1 * v1;
+                            }
+                            m_i = m_new;
+                        }
+                        p += 2;
+                    }
+
+                    // Odd remainder
+                    if p < tile_len {
+                        let kp = kv_start + p;
+                        let s = if (kp as i64) <= causal_limit {
+                            let k_off = h_kv * kv_capacity * head_dim + kp * head_dim;
+                            let mut dot = 0.0f32;
+                            for d in 0..head_dim {
+                                dot += q[q_off + d] * k[k_off + d];
+                            }
+                            dot * scale
+                        } else {
+                            f32::NEG_INFINITY
+                        };
+
+                        let m_new = m_i.max(s);
+                        if m_new > f32::NEG_INFINITY {
+                            let exp_s = (s - m_new).exp();
+                            let rescale = if m_i > f32::NEG_INFINITY {
+                                (m_i - m_new).exp()
+                            } else {
+                                0.0
+                            };
+                            l_i = l_i * rescale + exp_s;
+                            for d in 0..head_dim {
+                                o_acc[d] = o_acc[d] * rescale
+                                    + exp_s * v[h_kv * kv_capacity * head_dim + kp * head_dim + d];
+                            }
+                            m_i = m_new;
+                        }
+                    }
+                }
+
+                let o_off = (s * n_heads_q + h_q) * head_dim;
+                if l_i > 0.0 {
+                    let inv_l = 1.0 / l_i;
+                    for d in 0..head_dim {
+                        out[o_off + d] = o_acc[d] * inv_l;
+                    }
+                } else {
+                    for d in 0..head_dim {
+                        out[o_off + d] = 0.0;
+                    }
+                }
             }
         }
+    }
 
-        // Return tensor with this backend. Clone is cheap (Arc refcounts).
-        Ok(Tensor::new(
-            src.shape().clone(),
-            Arc::new(cuda_buf),
-            Arc::new(self.clone()),
-        ))
+    /// Naive attention (no tiling) for reference comparison.
+    fn ref_naive_attention(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        out: &mut [f32],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        seq_len: usize,
+        cache_seq_len: usize,
+        kv_capacity: usize,
+        head_dim: usize,
+    ) {
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let gqa_ratio = n_heads_q / n_heads_kv;
+        for s in 0..seq_len {
+            let causal_limit = (cache_seq_len as i64) - (seq_len as i64) + (s as i64);
+            for h_q in 0..n_heads_q {
+                let h_kv = h_q / gqa_ratio;
+                let q_off = (s * n_heads_q + h_q) * head_dim;
+                // Compute all scores
+                let mut scores = vec![f32::NEG_INFINITY; cache_seq_len];
+                for t in 0..cache_seq_len {
+                    if (t as i64) <= causal_limit {
+                        let k_off = h_kv * kv_capacity * head_dim + t * head_dim;
+                        let mut dot = 0.0f32;
+                        for d in 0..head_dim {
+                            dot += q[q_off + d] * k[k_off + d];
+                        }
+                        scores[t] = dot * scale;
+                    }
+                }
+                // Softmax
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum_exp = 0.0f32;
+                let mut exps = vec![0.0f32; cache_seq_len];
+                if max_s > f32::NEG_INFINITY {
+                    for t in 0..cache_seq_len {
+                        exps[t] = (scores[t] - max_s).exp();
+                        sum_exp += exps[t];
+                    }
+                }
+                // Weighted sum
+                let o_off = (s * n_heads_q + h_q) * head_dim;
+                if sum_exp > 0.0 {
+                    for d in 0..head_dim {
+                        let mut acc = 0.0f32;
+                        for t in 0..cache_seq_len {
+                            acc += exps[t] * v[h_kv * kv_capacity * head_dim + t * head_dim + d];
+                        }
+                        out[o_off + d] = acc / sum_exp;
+                    }
+                } else {
+                    for d in 0..head_dim {
+                        out[o_off + d] = 0.0;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Test cases ---
+
+    #[test]
+    fn test_flash_prefill_no_nan_basic() {
+        // Basic case: seq_len=4, head_dim=64, 2 heads, tile_size=8
+        let head_dim = 64;
+        let seq_len = 4;
+        let n_heads_q = 2;
+        let n_heads_kv = 2;
+        let capacity = 16;
+        let cache_seq_len = seq_len; // fresh prefill
+
+        let q = vec![0.1f32; seq_len * n_heads_q * head_dim];
+        let k = vec![0.2f32; n_heads_kv * capacity * head_dim];
+        let v = vec![0.3f32; n_heads_kv * capacity * head_dim];
+        let mut out_flash = vec![0.0f32; seq_len * n_heads_q * head_dim];
+        let mut out_naive = vec![0.0f32; seq_len * n_heads_q * head_dim];
+
+        ref_flash_attn_prefill(
+            &q,
+            &k,
+            &v,
+            &mut out_flash,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+            8,
+        );
+        ref_naive_attention(
+            &q,
+            &k,
+            &v,
+            &mut out_naive,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+        );
+
+        for i in 0..out_flash.len() {
+            assert!(!out_flash[i].is_nan(), "NaN at index {i}");
+            assert!(
+                (out_flash[i] - out_naive[i]).abs() < 1e-5,
+                "mismatch at {i}: flash={} naive={}",
+                out_flash[i],
+                out_naive[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_flash_prefill_no_nan_head_dim_256() {
+        // Gemma3 4B config: head_dim=256, GQA
+        let head_dim = 256;
+        let seq_len = 7; // NOT multiple of BLOCK_M=32 -> tests padding
+        let n_heads_q = 8;
+        let n_heads_kv = 4; // GQA ratio 2
+        let capacity = 32;
+        let cache_seq_len = seq_len;
+
+        let q: Vec<f32> = (0..seq_len * n_heads_q * head_dim)
+            .map(|i| ((i % 97) as f32 - 48.0) * 0.01)
+            .collect();
+        let k: Vec<f32> = (0..n_heads_kv * capacity * head_dim)
+            .map(|i| ((i % 83) as f32 - 41.0) * 0.01)
+            .collect();
+        let v: Vec<f32> = (0..n_heads_kv * capacity * head_dim)
+            .map(|i| ((i % 71) as f32 - 35.0) * 0.01)
+            .collect();
+        let mut out_flash = vec![0.0f32; seq_len * n_heads_q * head_dim];
+        let mut out_naive = vec![0.0f32; seq_len * n_heads_q * head_dim];
+
+        ref_flash_attn_prefill(
+            &q,
+            &k,
+            &v,
+            &mut out_flash,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+            8,
+        );
+        ref_naive_attention(
+            &q,
+            &k,
+            &v,
+            &mut out_naive,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+        );
+
+        for i in 0..out_flash.len() {
+            assert!(!out_flash[i].is_nan(), "NaN at index {i}");
+            assert!(
+                (out_flash[i] - out_naive[i]).abs() < 1e-4,
+                "mismatch at {i}: flash={} naive={}",
+                out_flash[i],
+                out_naive[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_flash_prefill_no_nan_single_token() {
+        // Edge case: seq_len=1 (single token prefill)
+        let head_dim = 64;
+        let seq_len = 1;
+        let n_heads_q = 4;
+        let n_heads_kv = 4;
+        let capacity = 8;
+        let cache_seq_len = 1;
+
+        let q = vec![1.0f32; seq_len * n_heads_q * head_dim];
+        let k = vec![1.0f32; n_heads_kv * capacity * head_dim];
+        let v = vec![0.5f32; n_heads_kv * capacity * head_dim];
+        let mut out = vec![0.0f32; seq_len * n_heads_q * head_dim];
+
+        ref_flash_attn_prefill(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+            8,
+        );
+
+        for i in 0..out.len() {
+            assert!(!out[i].is_nan(), "NaN at index {i}");
+            // With single token, output should equal v (softmax of single element = 1.0)
+            assert!(
+                (out[i] - 0.5).abs() < 1e-5,
+                "expected 0.5, got {} at {i}",
+                out[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_flash_prefill_no_nan_odd_tile_boundary() {
+        // cache_seq_len that creates odd tile remainder for all block_n values
+        for &block_n in &[8, 16, 32] {
+            let head_dim = 64;
+            let seq_len = 5;
+            let n_heads_q = 2;
+            let n_heads_kv = 2;
+            let cache_seq_len = block_n + 3; // ensures odd remainder
+            let capacity = cache_seq_len + 4;
+
+            let q: Vec<f32> = (0..seq_len * n_heads_q * head_dim)
+                .map(|i| (i as f32 * 0.01).sin())
+                .collect();
+            let k: Vec<f32> = (0..n_heads_kv * capacity * head_dim)
+                .map(|i| (i as f32 * 0.02).cos())
+                .collect();
+            let v: Vec<f32> = (0..n_heads_kv * capacity * head_dim)
+                .map(|i| (i as f32 * 0.03).sin())
+                .collect();
+            let mut out_flash = vec![0.0f32; seq_len * n_heads_q * head_dim];
+            let mut out_naive = vec![0.0f32; seq_len * n_heads_q * head_dim];
+
+            ref_flash_attn_prefill(
+                &q,
+                &k,
+                &v,
+                &mut out_flash,
+                n_heads_q,
+                n_heads_kv,
+                seq_len,
+                cache_seq_len,
+                capacity,
+                head_dim,
+                block_n,
+            );
+            ref_naive_attention(
+                &q,
+                &k,
+                &v,
+                &mut out_naive,
+                n_heads_q,
+                n_heads_kv,
+                seq_len,
+                cache_seq_len,
+                capacity,
+                head_dim,
+            );
+
+            for i in 0..out_flash.len() {
+                assert!(!out_flash[i].is_nan(), "NaN at block_n={block_n} index {i}");
+                assert!(
+                    (out_flash[i] - out_naive[i]).abs() < 1e-4,
+                    "mismatch at block_n={block_n} index {i}: flash={} naive={}",
+                    out_flash[i],
+                    out_naive[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_flash_prefill_no_nan_all_masked() {
+        // Edge case: cache_seq_len=0 -- no KV to attend, should produce zeros not NaN
+        let head_dim = 64;
+        let seq_len = 4;
+        let n_heads_q = 2;
+        let n_heads_kv = 2;
+        let capacity = 8;
+        let cache_seq_len = 0;
+
+        let q = vec![1.0f32; seq_len * n_heads_q * head_dim];
+        let k = vec![0.0f32; n_heads_kv * capacity * head_dim];
+        let v = vec![0.0f32; n_heads_kv * capacity * head_dim];
+        let mut out = vec![f32::NAN; seq_len * n_heads_q * head_dim]; // init with NaN to detect untouched
+
+        ref_flash_attn_prefill(
+            &q,
+            &k,
+            &v,
+            &mut out,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+            8,
+        );
+
+        for i in 0..out.len() {
+            assert!(!out[i].is_nan(), "NaN at index {i} (all-masked case)");
+            assert_eq!(out[i], 0.0, "expected 0.0 for all-masked at index {i}");
+        }
+    }
+
+    #[test]
+    fn test_flash_prefill_continuation_context() {
+        // Continuation: existing KV cache + new tokens
+        let head_dim = 128;
+        let seq_len = 3; // new tokens
+        let n_heads_q = 4;
+        let n_heads_kv = 2; // GQA
+        let capacity = 32;
+        let cache_seq_len = 10; // already 7 cached + 3 new = 10
+
+        let q: Vec<f32> = (0..seq_len * n_heads_q * head_dim)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let k: Vec<f32> = (0..n_heads_kv * capacity * head_dim)
+            .map(|i| (i as f32 * 0.05).cos())
+            .collect();
+        let v: Vec<f32> = (0..n_heads_kv * capacity * head_dim)
+            .map(|i| (i as f32 * 0.07).sin())
+            .collect();
+        let mut out_flash = vec![0.0f32; seq_len * n_heads_q * head_dim];
+        let mut out_naive = vec![0.0f32; seq_len * n_heads_q * head_dim];
+
+        ref_flash_attn_prefill(
+            &q,
+            &k,
+            &v,
+            &mut out_flash,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+            16,
+        );
+        ref_naive_attention(
+            &q,
+            &k,
+            &v,
+            &mut out_naive,
+            n_heads_q,
+            n_heads_kv,
+            seq_len,
+            cache_seq_len,
+            capacity,
+            head_dim,
+        );
+
+        for i in 0..out_flash.len() {
+            assert!(!out_flash[i].is_nan(), "NaN at index {i}");
+            assert!(
+                (out_flash[i] - out_naive[i]).abs() < 1e-4,
+                "mismatch at {i}: flash={} naive={}",
+                out_flash[i],
+                out_naive[i]
+            );
+        }
     }
 }
