@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,189 @@ except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[no-redef]
 
 _TOML_FILENAME = "devices.toml"
+_HOSTS_TOML_FILENAME = "hosts.toml"
+
+
+# ---------------------------------------------------------------------------
+# Hosts / Toolchain config
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ToolchainConfig:
+    """Per-toolchain build settings (NDK, cross-SDK, etc.)."""
+
+    ndk_home: str = ""
+    host_tag: str = ""
+    api_level: int = 0
+    sysroot: str = ""
+    bin_prefix: str = ""
+    cargo_target: str = ""
+    env: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # Expand env vars and ~ in all string fields
+        self.ndk_home = _expand(self.ndk_home)
+        self.host_tag = _expand(self.host_tag)
+        self.sysroot = _expand(self.sysroot)
+        self.bin_prefix = _expand(self.bin_prefix)
+        self.cargo_target = _expand(self.cargo_target)
+        self.env = {k: _expand(v) for k, v in self.env.items()}
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ToolchainConfig:
+        return cls(
+            ndk_home=d.get("ndk_home", ""),
+            host_tag=d.get("host_tag", ""),
+            api_level=int(d.get("api_level", 0)),
+            sysroot=d.get("sysroot", ""),
+            bin_prefix=d.get("bin_prefix", ""),
+            cargo_target=d.get("cargo_target", ""),
+            env=dict(d.get("env", {})),
+        )
+
+
+@dataclass
+class HostConfig:
+    """Configuration for a single build host."""
+
+    id: str
+    uname_match: dict[str, str] = field(default_factory=dict)
+    env_marker: str = ""
+    toolchains: dict[str, ToolchainConfig] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, host_id: str, d: dict[str, Any]) -> HostConfig:
+        toolchains = {
+            name: ToolchainConfig.from_dict(tc_dict)
+            for name, tc_dict in d.get("toolchains", {}).items()
+        }
+        return cls(
+            id=host_id,
+            uname_match=dict(d.get("uname_match", {})),
+            env_marker=d.get("env_marker", ""),
+            toolchains=toolchains,
+        )
+
+
+@dataclass
+class HostsConfig:
+    """Root configuration loaded from hosts.toml."""
+
+    schema_version: int
+    default_host: str
+    hosts: dict[str, HostConfig]
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> HostsConfig:
+        hosts = {
+            host_id: HostConfig.from_dict(host_id, host_data)
+            for host_id, host_data in d.get("hosts", {}).items()
+        }
+        return cls(
+            schema_version=int(d.get("schema_version", 1)),
+            default_host=d.get("default_host", ""),
+            hosts=hosts,
+        )
+
+
+def _expand(s: str) -> str:
+    """Expand environment variables and ~ in a string."""
+    return os.path.expanduser(os.path.expandvars(s))
+
+
+def find_hosts_toml(start_dir: str | Path | None = None) -> Path:
+    """Walk up from start_dir to find hosts.toml."""
+    d = Path(start_dir) if start_dir else Path.cwd()
+    while True:
+        candidate = d / _HOSTS_TOML_FILENAME
+        if candidate.is_file():
+            return candidate
+        parent = d.parent
+        if parent == d:
+            break
+        d = parent
+    raise FileNotFoundError(
+        f"{_HOSTS_TOML_FILENAME} not found in {start_dir or Path.cwd()} or any parent directory"
+    )
+
+
+def load_hosts_config(path: str | Path | None = None) -> HostsConfig:
+    """Load and parse hosts.toml."""
+    if path:
+        p = Path(path)
+    else:
+        p = find_hosts_toml()
+    with open(p, "rb") as f:
+        data = tomllib.load(f)
+    return HostsConfig.from_dict(data)
+
+
+def detect_current_host(
+    hosts: HostsConfig,
+    env: dict[str, str] | None = None,
+) -> HostConfig:
+    """Detect the current build host from hosts.toml.
+
+    Priority:
+    1. LLM_RS2_HOST env var override.
+    2. env_marker match (truthy env var) + uname_match (all keys must match).
+    3. Plain uname_match (all keys must match).
+    4. hosts.default_host fallback.
+    5. RuntimeError if all fail.
+    """
+    if env is None:
+        env = dict(os.environ)
+
+    # 1. Explicit override
+    override = env.get("LLM_RS2_HOST", "")
+    if override:
+        if override in hosts.hosts:
+            return hosts.hosts[override]
+        available = list(hosts.hosts.keys())
+        raise RuntimeError(
+            f"LLM_RS2_HOST={override!r} not found in hosts.toml; "
+            f"available hosts={available}"
+        )
+
+    uname = platform.uname()
+    uname_fields = {
+        "sysname": uname.system,
+        "machine": uname.machine,
+        "nodename": uname.node,
+        "release": uname.release,
+        "version": uname.version,
+        "processor": uname.processor,
+    }
+
+    def _matches_uname(host: HostConfig) -> bool:
+        for key, expected in host.uname_match.items():
+            if uname_fields.get(key, "") != expected:
+                return False
+        return True
+
+    # 2. env_marker-gated hosts (higher priority than plain match)
+    for host in hosts.hosts.values():
+        if host.env_marker and env.get(host.env_marker, ""):
+            if _matches_uname(host):
+                return host
+
+    # 3. Plain uname match
+    for host in hosts.hosts.values():
+        if not host.env_marker and _matches_uname(host):
+            return host
+
+    # 4. default_host fallback
+    if hosts.default_host and hosts.default_host in hosts.hosts:
+        return hosts.hosts[hosts.default_host]
+
+    available = list(hosts.hosts.keys())
+    raise RuntimeError(
+        f"No host matched. "
+        f"detected uname={dict(uname_fields)!r} ; "
+        f"available hosts={available} ; "
+        f"set LLM_RS2_HOST=<id>"
+    )
 
 
 @dataclass
@@ -28,8 +212,9 @@ class ConnectionConfig:
 @dataclass
 class BuildConfig:
     target: str = ""  # empty = native build
-    env_file: str = ""
+    env_file: str = ""  # deprecated: use toolchain instead
     binary_dir: str = ""
+    toolchain: str = ""  # toolchain name key in hosts.toml
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> BuildConfig:
@@ -37,6 +222,7 @@ class BuildConfig:
             target=d.get("target", ""),
             env_file=d.get("env_file", ""),
             binary_dir=d.get("binary_dir", ""),
+            toolchain=d.get("toolchain", ""),
         )
 
 

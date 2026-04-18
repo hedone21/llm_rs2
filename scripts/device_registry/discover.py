@@ -32,7 +32,7 @@ class DiscoveredDevice:
         build: dict = {}
         if self.connection_type == "adb":
             build["target"] = "aarch64-linux-android"
-            build["env_file"] = "android.source"
+            build["toolchain"] = "android-ndk"
             build["binary_dir"] = "target/aarch64-linux-android/release"
         else:
             build["target"] = ""

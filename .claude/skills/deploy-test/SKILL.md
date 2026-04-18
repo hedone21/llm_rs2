@@ -88,10 +88,24 @@ python scripts/run_comparison_benchmark.py --device pixel --dry-run
 
 패키지: `scripts/device_registry/` — config.py, connection.py, builder.py, deployer.py, discover.py.
 
+## Deploy-only 모드 (실행 없이 빌드+푸시)
+
+generate + manager 두 바이너리를 디바이스에 올리되 실행하지 않는다:
+```bash
+python scripts/run_device.py -d pixel --skip-exec generate --extra-bin llm_manager
+```
+
 ## 사전 조건
 
 - `adb devices`로 디바이스 연결 확인
-- Android 빌드 시 `source android.source` 필수 (run_device.py는 자동 처리)
+- Android 빌드 환경 설정 (최초 1회):
+  ```bash
+  # 자동 프로빙 (권장)
+  python scripts/device_registry.py bootstrap-host
+
+  # 또는 수동으로 템플릿 복사 후 편집
+  cp hosts.toml.example hosts.toml
+  ```
 - 모델 가중치가 디바이스에 존재해야 함
 
 ## 결과 보고

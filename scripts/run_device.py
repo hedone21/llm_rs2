@@ -6,6 +6,9 @@ Usage:
     python scripts/run_device.py -d host test_backend
     python scripts/run_device.py -d pixel --skip-build generate -b opencl
     python scripts/run_device.py --list-devices
+
+    # Build + deploy multiple binaries without executing (deploy-only):
+    python scripts/run_device.py -d pixel --skip-exec generate --extra-bin llm_manager
 """
 
 from __future__ import annotations
@@ -47,6 +50,7 @@ def main() -> int:
     parser.add_argument("-d", "--device", default="host", help="Device ID (default: host)")
     parser.add_argument("--skip-build", action="store_true", help="Skip build step")
     parser.add_argument("--skip-deploy", action="store_true", help="Skip deploy step")
+    parser.add_argument("--skip-exec", action="store_true", help="Build + deploy only, no execute")
     parser.add_argument("--dry-run", action="store_true", help="Print commands without executing")
     parser.add_argument("--list-devices", action="store_true", help="List registered devices")
     parser.add_argument("--deploy-eval", action="store_true", help="Deploy experiments/prompts/ files too")
@@ -109,6 +113,11 @@ def main() -> int:
     else:
         print("\n[2/3] Deploy skipped")
         conn = create_connection(device.connection)
+
+    # 2.5 skip-exec shortcut
+    if args.skip_exec:
+        print("\n[3/3] Skipped (--skip-exec)")
+        return 0
 
     # 3. Execute
     print("\n[3/3] Executing...")

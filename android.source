@@ -1,3 +1,4 @@
+echo "[deprecated] android.source — migrate to hosts.toml. See README." >&2
 # NDK 경로 설정
 export NDK_HOME=/opt/homebrew/share/android-ndk
 # 호스트 OS

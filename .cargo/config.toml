@@ -1,7 +1,6 @@
 # Android (Galaxy S25 등): Cortex-A/X — dotprod, fhm, fp16 지원
+# linker/ar are injected via hosts.toml + builder.py (no hard-coded paths here)
 [target.aarch64-linux-android]
-linker = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
-ar = "/opt/android-ndk/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-ar"
 rustflags = ["-C", "target-feature=+neon,+dotprod,+fhm,+fp16", "-C", "link-arg=-Wl,--allow-shlib-undefined", "-L", "libs/aarch64"]
 
 # Jetson cross-compile (Orin sm_87: Cortex-A78AE — dotprod, fhm 지원)

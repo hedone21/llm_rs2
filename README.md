@@ -37,7 +37,7 @@ graph LR
 
 - **Rust** (stable): `rustup install stable`
 - **OpenCL SDK** (GPU 사용 시): 플랫폼별 OpenCL 헤더 및 ICD 설치 필요
-- **Android NDK** (크로스컴파일 시): `source android.source`로 환경 변수 설정 후 빌드
+- **Android NDK** (크로스컴파일 시): `hosts.toml` 설정 후 `run_device.py`로 빌드 (env 자동 주입). 직접 cargo 호출 시에는 `source android.source` 필요 (비권장)
 
 ## ⚡ Quick Start
 
@@ -73,15 +73,20 @@ cargo build --release --no-default-features --features cuda
 ### Android
 
 ```bash
-source android.source
-cargo build --release --target aarch64-linux-android
-adb push target/aarch64-linux-android/release/generate /data/local/tmp/
+# 최초 1회: 호스트 toolchain 등록
+python scripts/device_registry.py bootstrap-host  # NDK 자동 감지
+# 또는: cp hosts.toml.example hosts.toml && 편집
 
-# Safetensors
-adb shell "/data/local/tmp/generate -m /data/local/tmp/models/llama3.2-1b -b opencl --prompt Hello"
+# 빌드 + 배포 + 실행 (run_device.py가 NDK env 자동 주입)
+python scripts/run_device.py -d pixel generate \
+    --model-path /data/local/tmp/models/llama3.2-1b -b opencl --prompt Hello
 
-# GGUF
-adb shell "/data/local/tmp/generate -m /data/local/tmp/models/llama3.2-1b-q4_0.gguf -b opencl --prompt Hello"
+# 배포만 (실행 없이)
+python scripts/run_device.py -d pixel --skip-exec generate --extra-bin llm_manager
+
+# 직접 cargo 빌드 시 (비권장): source android.source 필요
+# source android.source
+# cargo build --release --target aarch64-linux-android
 ```
 
 자세한 사용법: [docs/USAGE.md](docs/USAGE.md)

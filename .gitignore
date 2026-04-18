@@ -1,5 +1,6 @@
 /models
 /target
+/hosts.toml
 __pycache__/
 *.pyc
 .venv/

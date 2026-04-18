@@ -9,7 +9,8 @@
 #   serial             = ""                          (adb only; empty = default device)
 #   [devices.<id>.build]
 #   target             = ""                          (cargo target triple; empty = native)
-#   env_file           = ""                          (source before build, e.g. "android.source")
+#   toolchain          = ""                          (toolchain key in hosts.toml; preferred over env_file)
+#   env_file           = ""                          (DEPRECATED: use toolchain instead)
 #   binary_dir         = ""                          (relative path to built binaries)
 #   [devices.<id>.paths]
 #   work_dir           = ""                          (remote working directory; required)
@@ -50,7 +51,7 @@ serial = ""
 
 [devices.pixel.build]
 target = "aarch64-linux-android"
-env_file = "android.source"
+toolchain = "android-ndk"
 binary_dir = "target/aarch64-linux-android/release"
 
 [devices.pixel.paths]
