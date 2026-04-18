@@ -83,7 +83,7 @@ target = "aarch64-unknown-linux-gnu"
 # zig_target: glibc 2.31 호환 (Jetson Xavier JetPack 5.1.x = Ubuntu 20.04)
 zig_target = "aarch64-unknown-linux-gnu.2.31"
 binary_dir = "target/aarch64-unknown-linux-gnu/release"
-features = ["cuda"]
+features = ["cuda", "resilience"]
 default_features = false
 
 [devices.jetson.paths]

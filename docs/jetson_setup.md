@@ -91,6 +91,58 @@ python scripts/run_device.py -d jetson --skip-build --skip-exec generate
 
 > SSH로 전달되는 `--prompt` 인자는 셸 토큰화를 거치므로 공백이 있으면 `"'…'"`로 감싼다.
 
+## Manager 연동 (`--enable-resilience`)
+
+`devices.toml`의 jetson features에 `resilience`가 포함되어 있어 `generate` 바이너리가 manager IPC를 지원한다. Manager는 별도 크레이트라 직접 빌드/배포한다.
+
+### 1) Manager 빌드 + 배포 (1회)
+
+```bash
+# 호스트에서 manager 크로스 빌드 (default features = dbus + lua)
+PATH="$HOME/.cargo/bin:$PATH" cargo zigbuild --release \
+    --target aarch64-unknown-linux-gnu.2.31 --bin llm_manager
+
+# 바이너리 + lua policy 보드로 전송
+scp -P 4121 target/aarch64-unknown-linux-gnu/release/llm_manager \
+    nvidia@<host>:/home/nvidia/llm_rs2/llm_manager
+scp -P 4121 manager/scripts/policy_default.lua \
+    nvidia@<host>:/home/nvidia/llm_rs2/policy_default.lua
+```
+
+> Manager Cargo features: `default = ["dbus", "lua"]`. `hierarchical` feature는 default 아님 → `--policy-script <lua>` **필수**. 없으면 `--policy-script is required (built without 'hierarchical' feature)` 에러.
+
+### 2) Manager 백그라운드 실행
+
+```bash
+ssh -p 4121 nvidia@<host> 'pkill -f llm_manager; rm -f /tmp/llm_resilience.sock /tmp/manager.log; \
+    nohup env LD_LIBRARY_PATH=/usr/local/cuda/lib64 RUST_LOG=info \
+    /home/nvidia/llm_rs2/llm_manager \
+    -t unix:/tmp/llm_resilience.sock --client-timeout 120 \
+    --policy-script /home/nvidia/llm_rs2/policy_default.lua \
+    >/tmp/manager.log 2>&1 </dev/null & disown'
+```
+
+### 3) Resilience 활성화 추론
+
+```bash
+python scripts/run_device.py -d jetson --skip-build --skip-deploy generate \
+    -b cuda --prompt "'Hello'" -n 50 \
+    --enable-resilience --resilience-transport unix:/tmp/llm_resilience.sock
+```
+
+기대 로그:
+```
+[Resilience] Executor enabled — transport: unix:/tmp/llm_resilience.sock
+[Resilience] Capability sent to Manager
+[Resilience] Directive seq=2: Throttle { delay_ms: 20 }
+```
+
+### 4) Manager 정리
+
+```bash
+ssh -p 4121 nvidia@<host> 'pkill -f llm_manager; rm -f /tmp/llm_resilience.sock'
+```
+
 ## 트러블슈팅
 
 | 증상 | 원인 / 해결 |
@@ -100,12 +152,19 @@ python scripts/run_device.py -d jetson --skip-build --skip-exec generate
 | `Permission denied (publickey)` | ssh key 미등록 → 위의 `ssh-copy-id` 단계 |
 | `/usr/local/cuda/lib64/libcudart.so: not found` | 보드에 CUDA가 없음 → `dpkg -l | grep cuda`로 JetPack 확인 |
 | `cuda kernel compile error sm_XX` | cudarc cuda-11040 vs 보드 CUDA 버전 mismatch — `engine/Cargo.toml`의 `cudarc` features 조정 |
+| `connection failed: /tmp/llm_resilience.sock: No such file` | manager가 죽었거나 안 떠 있음 → `cat /tmp/manager.log` 확인 |
+| `--policy-script is required (built without 'hierarchical' feature)` | manager에 `--policy-script <lua>` 누락 → 위의 manager 실행 명령 참조 |
 
 ## 검증된 환경 (2026-04-18)
 
 - 호스트: Arch Linux (glibc 2.41), zig 0.15.2, cargo-zigbuild 0.22.2
 - 보드: Jetson AGX Xavier (sm_72, JetPack 5.1.2 = R35.5, Ubuntu 20.04, glibc 2.31, CUDA 11.8)
 - 모델: Llama 3.2 1B (F16 safetensors)
-- 결과:
+- 결과 (Llama 3.2 1B, F16, 30 토큰):
   - CPU: Decode 16.7 tok/s, Prefill 39.5 tok/s
   - CUDA: Decode 26.0 tok/s, Prefill 140.6 tok/s
+- 추가 검증된 기능 (CUDA):
+  - Eviction (`--eviction-policy h2o` / `streaming`): 23.5–23.7 tok/s
+  - KIVI Q2 (`--kivi`): 23.5 tok/s, **6.8× KV 압축**
+  - Tensor Partition (`--tensor-partition 0.5 --zero-copy`): 21.7 tok/s, 32 weights split
+  - Resilience (`--enable-resilience` + manager unix socket): 24.0 tok/s, Throttle directive 양방향 통신 확인
