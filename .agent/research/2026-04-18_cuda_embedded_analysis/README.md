@@ -137,6 +137,31 @@ Raw: `raw/c1_defer_run{1,2,3}.log`, `raw/c1_correctness_{baseline,defer}.log`
 2. UMA 캐시 flush 명시적 호출(`cudaMemPrefetchAsync` 또는 `__builtin___clear_cache`) 실험
 3. 최소 sync 세트 결정 후 "correct defer-sync" 재측정 — 이게 실질 H1 기여도
 
+### C1 bisection 시도 기록 (2026-04-19, inconclusive)
+
+다음 개별 수정을 각각 시도했으나 correctness 복원 실패:
+
+1. **write_buffer 후 `backend.synchronize()` 추가** (`generate.rs:3313`) — CPU→UMA 쓰기 후 ARM memory barrier 가설 검증. Decode 37.1 tok/s, **여전히 garbage** (`raw/c1_bisect_writebuf_sync.log`).
+2. **gather 함수의 `maybe_sync()` → hard `synchronize()`** (`cuda_embedded/mod.rs:1456`) — forward 첫 op 이후 pre-forward state 가시화. Decode 37.4 tok/s, **여전히 garbage** (`raw/c1_bisect_gather_sync_v2.log`).
+
+두 지점 모두 단독으로는 부족. 원인은 다음 중 하나 이상으로 추정:
+- **여러 op에서 누적되는 UMA 캐시 비일관성**: 특정 op만 barrier로는 불충분하며 매 launch마다 flush 필요 (= 사실상 원래 sync와 동일 효과)
+- **GPU L1/L2 cache의 kernel 간 persistence**: same-stream serialization은 memory ordering을 보장하지만, 일부 Tegra/Xavier 하드웨어 특성에서 L1이 stale read를 유발할 가능성
+- **CUDA 11.8 Tegra 드라이버 특성**: discrete GPU와 달리 pinned UMA에서 cuStreamSynchronize 없이는 CPU↔GPU 일관성이 약함
+
+**해결 방향 (후속)**:
+- 전체 forward pass를 `cuGraph`로 감싸기 — 그래프 단위 실행은 stream 내부 ordering이 더 엄격
+- `CudaHostBuffer` alloc 시 `CU_MEMHOSTALLOC_WRITECOMBINED` 검토 (CPU 캐시 우회)
+- Implementer에게 per-site hard-sync 플래그(`--cuda-defer-sync-skip <op_name>`)를 구현시켜 자동화 bisection
+- CUDA Nsight Compute로 attention/matmul 출력의 실제 값을 스냅샷해 발산 시점 식별
+
+## Phase C1 후속 결론
+
+- **H1 upper bound** = +36.3% (35.85 tok/s) 는 여전히 유효한 이론적 가능성
+- 현재 production-safe 해답은 Phase C2 (GEMV) +6.2% 만 확정
+- Phase C3 (cuGraph)는 stream-ordering을 강화하여 C1 문제를 **간접 해결**할 가능성 있음 — C1 해결이 C3 구현 내에서 자연스레 이뤄질 수도
+- **권고**: 단독 H1 해결에 시간 투자 전에 C3 진행 → 그 과정에서 C1 원인이 드러나거나 해결되는지 관찰
+
 ## Phase C2 실험 결과 — H2(F16 GEMV 커널) 검증
 
 seq_len=1 F16 matmul을 전용 GEMV 커널로 라우팅. kernels.cu에 `gemv_f16_f16_f32`, `gemv_f16_f32_f32` 2개 추가. matmul_transposed 진입부 M=1 fast path.
