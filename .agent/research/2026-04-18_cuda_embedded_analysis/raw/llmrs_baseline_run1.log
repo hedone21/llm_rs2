@@ -1,0 +1,40 @@
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /home/nvidia/llm_rs2/models/llama3.2-1b
+[CUDA] Compiling kernels with /usr/local/cuda-11.4/bin/nvcc --ptx -arch=sm_72 ...
+[CUDA] Kernel compilation done (725638 bytes PTX)
+[CUDA] Device: Xavier (sm_72, UMA=true, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to CUDA pinned memory
+Prompt: The capital of France is
+Token Length: 6
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[WARMUP] tokens=1 ms=46.76
+Prefill: 42.38 ms (6 tokens, 141.6 tok/s)
+Device: Jetson Orin (jetson, ssh)
+
+[1/3] Build skipped
+
+[2/3] Deploy skipped
+
+[3/3] Executing...
+  Command: /home/nvidia/llm_rs2/generate --model-path /home/nvidia/llm_rs2/models/llama3.2-1b -b cuda --prompt 'The capital of France is' -n 30
+  Env: {'LD_LIBRARY_PATH': '/usr/local/cuda/lib64'}
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The capital of France is home to the Louvre, a museum that's so famous it has its own movie. Check out our list of the most beautiful churches in Paris for
+Done.
+[Profile] Event: End
+TTFT: 149.02 ms
+Decode: 38.44 ms/tok (26.0 tok/s) [29 tokens, forward only]
+Decode(excl tok[0]): 38.34 ms/tok (26.1 tok/s) [28 tokens] | tok[0]=41.14 ms
+Avg TBT: 41.79 ms (23.9 tokens/sec)

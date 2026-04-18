@@ -1,0 +1,10 @@
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 30990 MiB):
+  Device 0: Xavier, compute capability 7.2, VMM: yes, VRAM: 30990 MiB
+| model                          |       size |     params | backend    | ngl |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | --: | --------------: | -------------------: |
+| llama 1B F16                   |   2.30 GiB |     1.24 B | CUDA       |  99 |            tg30 |         35.24 ± 0.10 |
+
+build: 23b8cc4 (1)

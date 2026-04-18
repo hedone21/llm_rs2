@@ -1,0 +1,60 @@
+** WARNING: connection is not using a post-quantum key exchange algorithm.
+** This session may be vulnerable to "store now, decrypt later" attacks.
+** The server may need to be upgraded. See https://openssh.com/pq.html
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /home/nvidia/llm_rs2/models/llama3.2-1b
+[CUDA] Compiling kernels with /usr/local/cuda-11.4/bin/nvcc --ptx -arch=sm_72 ...
+[CUDA] Kernel compilation done (725638 bytes PTX)
+[CUDA] Device: Xavier (sm_72, UMA=true, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[CUDA-Profile] event-based profiler enabled (pool_size=4096)
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to CUDA pinned memory
+Prompt: The capital of France is
+Token Length: 6
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[WARMUP] tokens=1 ms=46.28
+Prefill: 43.24 ms (6 tokens, 138.8 tok/s)
+
+=== CUDA per-op profile (14 ops over 29 tokens) ===
+label                            count      total_ms     mean_ms      pct
+matmul_ffn                        2784       530.540      0.1906   54.99%
+lm_head                             62       155.328      2.5053   16.10%
+matmul_qkv                        2784       113.486      0.0408   11.76%
+matmul_wo                          928        59.469      0.0641    6.16%
+matmul                             224        48.421      0.2162    5.02%
+rms_norm                          1023        12.225      0.0119    1.27%
+rope                               992        10.872      0.0110    1.13%
+add_assign                         992        10.281      0.0104    1.07%
+attention                          464        10.072      0.0217    1.04%
+silu_mul                           496         5.419      0.0109    0.56%
+kv_update                          496         5.230      0.0105    0.54%
+cast                               224         2.594      0.0116    0.27%
+flash_attn_prefill                  32         0.637      0.0199    0.07%
+gather                              31         0.269      0.0087    0.03%
+TOTAL                            11532       964.844
+[CUDA-Profile] Exported to results/profile/cuda_embedded_decode_1776524230.json
+Device: Jetson Orin (jetson, ssh)
+
+[1/3] Build skipped
+
+[2/3] Deploy skipped
+
+[3/3] Executing...
+  Command: /home/nvidia/llm_rs2/generate --model-path /home/nvidia/llm_rs2/models/llama3.2-1b -b cuda --prompt 'The capital of France is' -n 30 --cuda-profile
+  Env: {'LD_LIBRARY_PATH': '/usr/local/cuda/lib64'}
+[Profile] Event: PrefillStart
+[Profile] Event: DecodingStart
+The capital of France is Paris and it’s one of the world’s most visited cities. This city has a lot to offer from its famous architecture, museums, and world-class
+Done.
+[Profile] Event: End
+TTFT: 149.51 ms
+Decode: 40.59 ms/tok (24.6 tok/s) [29 tokens, forward only]
+Decode(excl tok[0]): 40.52 ms/tok (24.7 tok/s) [28 tokens] | tok[0]=42.55 ms
+Avg TBT: 44.10 ms (22.7 tokens/sec)
