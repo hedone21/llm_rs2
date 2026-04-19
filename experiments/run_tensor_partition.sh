@@ -20,15 +20,25 @@ LOCAL_OUT=experiments/results/tensor_partition
 LOG_FILE=${LOCAL_OUT}/run.log
 
 RATIOS=(1.0 0.875 0.75)   # GPU-only first → warm baseline
-PREFILL=(128 1024 4096)
+PREFILL=(1024)             # focus on p=1024 (cold-kernel check revealed 28% run1→run2 gap at p>128)
 REPS=2
 
 # ── Thermal cooldown policy ──────────────────────────────────────────────────
-THERMAL_ZONE=/sys/class/thermal/thermal_zone0/temp
-THERMAL_TARGET_MC=42000   # 42°C — idle ~40°C + 2°C margin (docs/31_perf_comparison_llama_cpp.md)
-THERMAL_MAX_WAIT=300      # abort if not cool after 5 min
-COOLDOWN_MIN_SHORT=30     # prefill ≤ 1024: min 30s cooldown
-COOLDOWN_MIN_LONG=90      # prefill = 4096: min 90s (bench_cross_model_gpu.sh convention)
+# Gate on MAX of CPU cores + CPU subsystem (aoss-0 lags 4~5°C behind real CPU temp on S25).
+# Probed zones: cpu-0-*, cpu-1-*, cpuss-0-*, cpuss-1-* → returns max mC.
+THERMAL_TARGET_MC=42000   # 42°C on hottest CPU zone (CPU cores at 45°C caused throttle)
+THERMAL_MAX_WAIT=600      # abort if not cool after 10 min (allow deep cooldown)
+COOLDOWN_MIN_SHORT=60     # prefill ≤ 1024: min 60s cooldown
+COOLDOWN_MIN_LONG=90      # prefill = 4096: min 90s
+RATIO_BREAK=300           # 5 min rest between ratio blocks to reset thermal debt
+
+# Read max temp across CPU cluster thermal zones (CPU is hottest under partition).
+read_cpu_max_temp() {
+  adb shell "for z in /sys/class/thermal/thermal_zone*; do \
+    t=\$(cat \$z/type); \
+    case \$t in cpu-*|cpuss-*) cat \$z/temp ;; esac; \
+  done | sort -nr | head -1" | tr -d '\r'
+}
 
 wait_for_cool() {
   local min_wait=$1
@@ -37,8 +47,8 @@ wait_for_cool() {
   local waited=${min_wait}
   while (( waited < THERMAL_MAX_WAIT )); do
     local t
-    t=$(adb shell cat "${THERMAL_ZONE}" | tr -d '\r')
-    echo "[cooldown] t=${t} mC (target<${THERMAL_TARGET_MC}), waited=${waited}s" | tee -a "${LOG_FILE}"
+    t=$(read_cpu_max_temp)
+    echo "[cooldown] cpu_max=${t} mC (target<${THERMAL_TARGET_MC}), waited=${waited}s" | tee -a "${LOG_FILE}"
     if (( t < THERMAL_TARGET_MC )); then
       echo "[cooldown] OK" | tee -a "${LOG_FILE}"
       return 0
@@ -60,9 +70,9 @@ adb_run() {
   echo "[run] start $(date '+%Y-%m-%dT%H:%M:%S')" | tee -a "${LOG_FILE}"
 
   adb shell "cd /data/local/tmp && ./generate \
-    --model ${MODEL} -b opencl --threads 6 \
+    --model-path ${MODEL} -b opencl --threads 6 \
     --prompt-file prompts/prefill_${p}.txt \
-    --tensor-partition ${r} -n 128 \
+    --tensor-partition ${r} -n 128 --ignore-eos \
     --experiment-output ${device_out} \
     --experiment-sample-interval 10 \
     --experiment-logits-topk 0" 2>&1 | tee -a "${LOG_FILE}"
@@ -76,10 +86,27 @@ adb_run_warmup() {
   echo "" | tee -a "${LOG_FILE}"
   echo "[warmup] ratio=1.0, prefill=128 — filling OpenCL JIT cache" | tee -a "${LOG_FILE}"
   adb shell "cd /data/local/tmp && ./generate \
-    --model ${MODEL} -b opencl --threads 6 \
+    --model-path ${MODEL} -b opencl --threads 6 \
     --prompt-file prompts/prefill_128.txt \
-    --tensor-partition 1.0 -n 128 \
+    --tensor-partition 1.0 -n 128 --ignore-eos \
     --experiment-output ${OUT}/warmup.jsonl \
+    --experiment-sample-interval 10 \
+    --experiment-logits-topk 0" 2>&1 | tee -a "${LOG_FILE}" || true
+}
+
+# ── Per-ratio warmup (primes OpenCL kernel cache for new dispatch shape) ─────
+# Call with: adb_run_warmup_ratio <ratio> <prefill>
+# Output is discarded. Prevents cold-kernel bias on first timed run per ratio.
+adb_run_warmup_ratio() {
+  local r=$1
+  local p=$2
+  echo "" | tee -a "${LOG_FILE}"
+  echo "[warmup] ratio=${r}, prefill=${p} — priming kernel cache" | tee -a "${LOG_FILE}"
+  adb shell "cd /data/local/tmp && ./generate \
+    --model-path ${MODEL} -b opencl --threads 6 \
+    --prompt-file prompts/prefill_${p}.txt \
+    --tensor-partition ${r} -n 128 --ignore-eos \
+    --experiment-output ${OUT}/warmup_r${r}_p${p}.jsonl \
     --experiment-sample-interval 10 \
     --experiment-logits-topk 0" 2>&1 | tee -a "${LOG_FILE}" || true
 }
@@ -118,8 +145,25 @@ adb_run_warmup
 wait_for_cool ${COOLDOWN_MIN_SHORT}
 
 # ── 5. Main sweep: ratio × prefill × rep ─────────────────────────────────────
+ratio_idx=0
 for r in "${RATIOS[@]}"; do
+  # Inter-ratio thermal debt reset (skip before first ratio)
+  if (( ratio_idx > 0 )); then
+    echo "" | tee -a "${LOG_FILE}"
+    echo "[ratio-break] ${RATIO_BREAK}s rest before ratio=${r}" | tee -a "${LOG_FILE}"
+    wait_for_cool ${RATIO_BREAK}
+  fi
+  ratio_idx=$((ratio_idx + 1))
+
   for p in "${PREFILL[@]}"; do
+    # Per-(ratio,prefill) warmup — discards cold kernel-compile time
+    adb_run_warmup_ratio "${r}" "${p}"
+    if (( p >= 4096 )); then
+      wait_for_cool ${COOLDOWN_MIN_LONG}
+    else
+      wait_for_cool ${COOLDOWN_MIN_SHORT}
+    fi
+
     for rep in $(seq 1 "${REPS}"); do
       adb_run
 

@@ -63,25 +63,34 @@ def extract_summary(records: list[dict]) -> Optional[dict]:
     return None
 
 
+def _max_valid_thermal(thermal) -> Optional[float]:
+    """thermal_mc may be a scalar or a per-zone array. Return max of valid (>0) values."""
+    if thermal is None:
+        return None
+    if isinstance(thermal, (int, float)):
+        return float(thermal) if thermal > 0 else None
+    valid = [v for v in thermal if isinstance(v, (int, float)) and v > 0]
+    return max(valid) if valid else None
+
+
 def extract_thermal_peak(records: list[dict]) -> Optional[float]:
-    """Return max sys.thermal_mc across all per-token records."""
+    """Return max sys.thermal_mc across all per-token records (handles array format)."""
     peak = None
     for rec in records:
         sys_data = rec.get("sys", {})
-        thermal = sys_data.get("thermal_mc")
-        if thermal is not None:
-            if peak is None or thermal > peak:
-                peak = thermal
+        t = _max_valid_thermal(sys_data.get("thermal_mc"))
+        if t is not None and (peak is None or t > peak):
+            peak = t
     return peak
 
 
 def extract_thermal_start(records: list[dict]) -> Optional[float]:
-    """Return thermal_mc from the first record that has sys.thermal_mc."""
+    """Return max(thermal_mc) from the first record that has sys.thermal_mc."""
     for rec in records:
         sys_data = rec.get("sys", {})
-        thermal = sys_data.get("thermal_mc")
-        if thermal is not None:
-            return thermal
+        t = _max_valid_thermal(sys_data.get("thermal_mc"))
+        if t is not None:
+            return t
     return None
 
 
