@@ -69,6 +69,33 @@ os = "android"
 transport = "unix"
 thermal_zone_types = ["cpu-0-0-usr"]
 
+[devices.galaxy_s25]
+name = "Galaxy S25"
+
+[devices.galaxy_s25.connection]
+type = "adb"
+serial = ""
+
+[devices.galaxy_s25.build]
+target = "aarch64-linux-android"
+toolchain = "android-ndk"
+binary_dir = "target/aarch64-linux-android/release"
+
+[devices.galaxy_s25.paths]
+work_dir = "/data/local/tmp"
+model_dir = "/data/local/tmp/models/qwen2.5-1.5b"
+eval_dir = "/data/local/tmp/llm_rs2/eval"
+lib_dir = "/data/local/tmp"
+
+[devices.galaxy_s25.capabilities]
+arch = "aarch64"
+gpu = "adreno"
+os = "android"
+
+[devices.galaxy_s25.manager]
+transport = "unix"
+thermal_zone_types = ["cpu-0-0-usr"]
+
 [devices.jetson]
 name = "Jetson Orin"
 
