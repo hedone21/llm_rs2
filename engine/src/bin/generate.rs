@@ -5722,14 +5722,12 @@ fn run_kivi(
     // Skip when tensor partition is active — plan bypasses forward_gen's
     // partition co-execution path.
     #[cfg(feature = "opencl")]
-    let mut gpu_plan = if backend.name() == "OpenCL"
-        && !no_gpu_plan
-        && model.layers[0].partition_ctx.is_none()
-    {
-        model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend)
-    } else {
-        None
-    };
+    let mut gpu_plan =
+        if backend.name() == "OpenCL" && !no_gpu_plan && model.layers[0].partition_ctx.is_none() {
+            model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend)
+        } else {
+            None
+        };
     #[cfg(not(feature = "opencl"))]
     let gpu_plan: Option<()> = None;
 

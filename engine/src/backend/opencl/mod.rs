@@ -2624,6 +2624,38 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn enqueue_read_buffer_async(
+        &self,
+        t: &Tensor,
+        dst: &mut [u8],
+    ) -> Result<crate::core::backend::GpuEvent> {
+        let buf =
+            get_cl_mem(t.buffer().as_ref()).map_err(|_| anyhow::anyhow!("Not OpenCL buffer"))?;
+        let mut event: ocl::core::Event = ocl::core::Event::null();
+        // SAFETY: non-blocking read with an explicit event output. The caller
+        // is contracted (per trait docs) to keep `dst` alive until `wait_event`
+        // returns for this event — matching OpenCL's device-timeline write.
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &self.queue,
+                buf,
+                false,
+                0,
+                dst,
+                None::<&ocl::core::Event>,
+                Some(&mut event),
+            )?;
+        }
+        Ok(crate::core::backend::GpuEvent { inner: Some(event) })
+    }
+
+    fn wait_event(&self, evt: &crate::core::backend::GpuEvent) -> Result<()> {
+        if let Some(e) = evt.inner.as_ref() {
+            ocl::core::wait_for_event(e)?;
+        }
+        Ok(())
+    }
+
     fn name(&self) -> &str {
         "OpenCL"
     }

@@ -442,6 +442,7 @@ pub fn merge_partials_2d(
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+static PART_SYNC_NS: AtomicU64 = AtomicU64::new(0);
 static PART_READ_NS: AtomicU64 = AtomicU64::new(0);
 static PART_CPU_NS: AtomicU64 = AtomicU64::new(0);
 static PART_GPU_WAIT_NS: AtomicU64 = AtomicU64::new(0);
@@ -458,7 +459,14 @@ pub fn partition_trace_enabled() -> bool {
     enabled
 }
 
-pub fn record_partition_timing(read_ns: u64, cpu_ns: u64, gpu_wait_ns: u64, merge_ns: u64) {
+pub fn record_partition_timing(
+    sync_ns: u64,
+    read_ns: u64,
+    cpu_ns: u64,
+    gpu_wait_ns: u64,
+    merge_ns: u64,
+) {
+    PART_SYNC_NS.fetch_add(sync_ns, Ordering::Relaxed);
     PART_READ_NS.fetch_add(read_ns, Ordering::Relaxed);
     PART_CPU_NS.fetch_add(cpu_ns, Ordering::Relaxed);
     PART_GPU_WAIT_NS.fetch_add(gpu_wait_ns, Ordering::Relaxed);
@@ -473,6 +481,7 @@ pub fn print_partition_trace_summary(count: u64) {
     if count == 0 {
         return;
     }
+    let sync = PART_SYNC_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
     let read = PART_READ_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
     let cpu = PART_CPU_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
     let gpu_wait = PART_GPU_WAIT_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
@@ -487,8 +496,8 @@ pub fn print_partition_trace_summary(count: u64) {
         "GPU (CPU finished well before GPU)"
     };
     println!(
-        "[partition-trace] layers={} avg/layer: read_buf={:.2}ms cpu_matmul={:.2}ms gpu_wait={:.2}ms merge={:.2}ms — bottleneck: {}",
-        count, read, cpu, gpu_wait, merge, bottleneck
+        "[partition-trace] layers={} avg/layer: sync_drain={:.2}ms dma_read={:.2}ms cpu_matmul={:.2}ms gpu_wait={:.2}ms merge={:.2}ms — bottleneck: {}",
+        count, sync, read, cpu, gpu_wait, merge, bottleneck
     );
     use std::io::Write;
     let _ = std::io::stdout().flush();

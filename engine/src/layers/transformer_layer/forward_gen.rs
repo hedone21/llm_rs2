@@ -1,5 +1,19 @@
 use super::*;
 
+std::thread_local! {
+    static TLS_T_SYNC_DONE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Cached check for `LLMRS_PARTITION_ASYNC_READ`. When set (any value),
+/// the tensor-partition path uses `enqueue_read_buffer_async` + `wait_event`
+/// around the GPU chain enqueue instead of the blocking `synchronize()` +
+/// `read_buffer` pair. This overlaps host wait with GPU enqueue so the
+/// sync-drain can be at least partially hidden. Default: off.
+fn partition_async_read_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var_os("LLMRS_PARTITION_ASYNC_READ").is_some())
+}
+
 impl TransformerLayer {
     /// Fast path for single token generation using pre-allocated workspace.
     pub(super) fn forward_gen<C: KVCacheOps>(&self, mut args: ForwardGenArgs<C>) -> Result<()> {
@@ -1066,12 +1080,48 @@ impl TransformerLayer {
             let skip_sync = sync_n > 1 && (layer_count % sync_n) != 0;
 
             let zcopy_residual = !ws.residual.as_ptr().is_null();
+            // A1 async-read path: non-blocking enqueue of the residual DMA
+            // read + deferred `wait_event` immediately before the CPU slice
+            // consumes the bytes. Enables overlap of the host-side sync-drain
+            // with the GPU FFN chain enqueue issued right after.
+            let async_read =
+                partition_async_read_enabled() && !zcopy_residual && !skip_sync && is_gpu;
+            let mut pending_read_evt: Option<crate::core::backend::GpuEvent> = None;
             let residual_cpu_ptr: *const u8 = if zcopy_residual {
                 if !skip_sync {
                     backend.synchronize()?;
                 }
                 ws.residual.as_ptr()
+            } else if async_read {
+                // Non-blocking DMA read — no prior `synchronize()`, enqueue_read
+                // itself orders against the in-order queue.
+                let t_async_start = std::time::Instant::now();
+                unsafe {
+                    let dst = std::slice::from_raw_parts_mut(
+                        pw.residual_cpu.as_mut_ptr(),
+                        pw.residual_cpu.size(),
+                    );
+                    pending_read_evt = Some(backend.enqueue_read_buffer_async(&ws.residual, dst)?);
+                }
+                if part_trace {
+                    // Under async_read, the "sync_drain" window collapses to
+                    // the enqueue call itself; the real wait is deferred and
+                    // will be accounted for in the dma_read segment below.
+                    TLS_T_SYNC_DONE.with(|c| c.set(Some(t_async_start)));
+                }
+                pw.residual_cpu.as_ptr()
             } else {
+                // Explicit sync first so we can time the drain independently
+                // from the DMA-read phase below.
+                if !skip_sync {
+                    backend.synchronize()?;
+                }
+                // Mark end of the sync-drain phase.
+                let _t_sync_done_marker = std::time::Instant::now();
+                if part_trace {
+                    // Stash the marker in a thread-local for the record call.
+                    TLS_T_SYNC_DONE.with(|c| c.set(Some(_t_sync_done_marker)));
+                }
                 if !skip_sync {
                     unsafe {
                         let dst = std::slice::from_raw_parts_mut(
@@ -1110,6 +1160,15 @@ impl TransformerLayer {
                 &mut pw.down_partial_gpu,
             )?;
             backend.flush()?;
+
+            // A1 async-read: wait for the non-blocking residual DMA to land
+            // before CPU consumes it. This is the host wait window that
+            // previously sat before the GPU enqueue as `synchronize()`; by
+            // deferring it here it can overlap with the GPU enqueue/flush
+            // above.
+            if let Some(evt) = pending_read_evt.take() {
+                backend.wait_event(&evt)?;
+            }
 
             // 2. CPU: full FFN chain on its own slice, independent of GPU.
             let cpu = &part.cpu_backend;
@@ -1227,12 +1286,17 @@ impl TransformerLayer {
                 (t0, t_read, t_cpu_done, t_gpu_done)
             {
                 let t_merge = std::time::Instant::now();
-                let read_ns = t_read.duration_since(t0).as_nanos() as u64;
+                // Split read window into sync-drain (before DMA) and DMA (after)
+                // using the thread-local marker captured above.
+                let t_sync_done = TLS_T_SYNC_DONE.with(|c| c.take()).unwrap_or(t0);
+                let sync_ns = t_sync_done.duration_since(t0).as_nanos() as u64;
+                let dma_ns = t_read.duration_since(t_sync_done).as_nanos() as u64;
                 let cpu_ns = t_cpu.duration_since(t_read).as_nanos() as u64;
                 let gpu_wait_ns = t_gpu.duration_since(t_cpu).as_nanos() as u64;
                 let merge_ns = t_merge.duration_since(t_gpu).as_nanos() as u64;
                 crate::layers::tensor_partition::record_partition_timing(
-                    read_ns,
+                    sync_ns,
+                    dma_ns,
                     cpu_ns,
                     gpu_wait_ns,
                     merge_ns,

@@ -2,6 +2,28 @@ use crate::core::buffer::DType;
 use crate::core::tensor::Tensor;
 use anyhow::Result;
 
+/// Opaque async GPU event handle returned by `enqueue_read_buffer_async`.
+///
+/// Used by tensor-partition's `LLMRS_PARTITION_ASYNC_READ` path to overlap
+/// the residual DMA read with a subsequent GPU enqueue chain. Default for
+/// non-OpenCL backends is a dummy (no-op wait) since the default async
+/// fallback in `Backend` simply performs a synchronous blocking read.
+#[derive(Default)]
+pub struct GpuEvent {
+    #[cfg(feature = "opencl")]
+    pub(crate) inner: Option<ocl::core::Event>,
+}
+
+impl GpuEvent {
+    /// Dummy event — `wait_event` on this is a no-op.
+    pub fn dummy() -> Self {
+        Self {
+            #[cfg(feature = "opencl")]
+            inner: None,
+        }
+    }
+}
+
 pub trait Backend: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
     fn name(&self) -> &str;
@@ -358,6 +380,28 @@ pub trait Backend: Send + Sync {
         unsafe {
             std::ptr::copy_nonoverlapping(src_ptr, dst.as_mut_ptr(), dst.len());
         }
+        Ok(())
+    }
+
+    /// Non-blocking variant of `read_buffer`. Enqueues a DMA read and returns
+    /// an opaque event handle that can be awaited via `wait_event`. Backends
+    /// that support true async reads (OpenCL) override this. The default
+    /// falls back to a synchronous blocking read and returns a dummy event.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure `dst` remains valid until `wait_event` has
+    /// returned for the returned event — OpenCL writes into `dst` on the
+    /// device's timeline, not the host's.
+    fn enqueue_read_buffer_async(&self, t: &Tensor, dst: &mut [u8]) -> Result<GpuEvent> {
+        self.read_buffer(t, dst)?;
+        Ok(GpuEvent::dummy())
+    }
+
+    /// Block until the event returned by `enqueue_read_buffer_async` has
+    /// completed. Default: no-op (for backends that return a dummy event
+    /// because the enqueue was already blocking).
+    fn wait_event(&self, _evt: &GpuEvent) -> Result<()> {
         Ok(())
     }
 
