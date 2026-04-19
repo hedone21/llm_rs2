@@ -1,0 +1,30 @@
+[Config] Using 20 threads
+[Profile] Event: ModelLoadStart
+Loading model from models/llama3.2-1b
+[CUDA] Compiling kernels with /opt/cuda/bin/nvcc --ptx -arch=sm_86 ...
+[CUDA] Kernel compilation done (716247 bytes PTX)
+[CUDA] Device: NVIDIA GeForce RTX 3090 Ti (sm_86, UMA=false, managed_mem=1, cuBLAS=ready, kernels=ready)
+[CUDA self-test] add_assign: [5.0, 7.0, 9.0] OK
+[CUDA self-test] scale:      [1.0, 2.0, 3.0] OK
+[CUDA self-test] rms_norm:   [0.8485, 1.1314] OK
+[CUDA] --cuda-sync-policy=custom:elem_add,kv_scatter,fallback (mask=0x91)
+[Config] Weight dtype: F16
+lm_head not found, deriving from embed_tokens (F16) for lm_head...
+[Backend] Migrated 147 weight tensors to CUDA pinned memory
+Prompt: The capital of France is
+Token Length: 6
+Model config: layers=16, kv_heads=8, head_dim=64, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[WARMUP] tokens=1 ms=249.81
+[Profile] Event: PrefillStart
+Prefill: 59.42 ms (6 tokens, 101.0 tok/s)
+[Profile] Event: DecodingStart
+The capital of France is Paris. The capital city of France has a population of 2,140,000 people and an area that covers 105 square miles.
+The French
+Done.
+[Profile] Event: End
+TTFT: 361.97 ms
+Decode: 6.87 ms/tok (145.5 tok/s) [29 tokens, forward only]
+Decode(excl tok[0]): 6.82 ms/tok (146.7 tok/s) [28 tokens] | tok[0]=8.47 ms
+Avg TBT: 8.83 ms (113.3 tokens/sec)

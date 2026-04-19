@@ -23,6 +23,145 @@ use cudarc::driver::{CudaContext, LaunchConfig, PushKernelArg, result as cuda_re
 use kernels::CudaKernels;
 use std::any::Any;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Per-category sync tag for `maybe_sync_cat`.
+///
+/// Ported from cuda_embedded (2026-04-19). Used to bisect which per-op
+/// syncs are load-bearing on host-class CUDA versus pure overhead. The
+/// category definitions are intentionally identical to cuda_embedded's
+/// so CLI/policy strings stay portable between backends.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SyncCat {
+    /// `add_assign` (residual accumulate — runs 2x per layer).
+    ElemAdd = 0,
+    /// `rms_norm` and `rms_norm_oop` launches.
+    RmsNorm = 1,
+    /// `rope_inplace`.
+    Rope = 2,
+    /// cuBLAS / custom GEMV matmul variants in `matmul_transposed`,
+    /// plus the pre-launch input-ordering guard at the top of that
+    /// function. The cast F32->F16 that precedes `gemm_ex` is also
+    /// folded in here (same-stream, not a CPU-visible read).
+    Matmul = 3,
+    /// `kv_scatter_f32_to_f16` (+ batch variant).
+    KvScatter = 4,
+    /// `attention_gen` (flash_attn_f32/f16kv) and
+    /// `flash_attention_prefill`.
+    Attention = 5,
+    /// `gather` (embedding lookup).
+    Gather = 6,
+    /// Sync before dropping to a CPU fallback (unsupported dtype,
+    /// missing device pointer). Keeping these syncs is load-bearing
+    /// whenever a preceding GPU op's output feeds the fallback.
+    FallbackPre = 7,
+    /// FFN activation kernels: `silu_mul`, `gelu_tanh_mul`.
+    ElemAct = 8,
+    /// Miscellaneous elementwise: `scale`, `softmax`, `add_row_bias`,
+    /// `cast_f16_f32`. Rarely exercised on the Llama decode path
+    /// (softmax/add_row_bias never fire; scale/cast run at edges).
+    ElemMisc = 9,
+}
+
+impl SyncCat {
+    #[inline]
+    fn bit(self) -> u32 {
+        1u32 << (self as u32)
+    }
+}
+
+/// Bitmask controlling which `SyncCat` launch sites still issue a
+/// `synchronize()`. Stored as the raw `u32` inside an `AtomicU32`.
+#[derive(Copy, Clone, Debug)]
+pub struct SyncPolicy(u32);
+
+impl SyncPolicy {
+    pub const EMPTY: SyncPolicy = SyncPolicy(0);
+    /// All categories active — identical to the pre-port behaviour.
+    pub const ALL: SyncPolicy = SyncPolicy(0x3FF);
+    /// llama.cpp-style minimal set: only the `FallbackPre` guard
+    /// stays on so CPU fallback paths still observe in-flight GPU
+    /// writes. On host discrete GPUs this is closer to llama.cpp's
+    /// behaviour than on Jetson UMA.
+    pub const LLAMACPP: SyncPolicy = SyncPolicy(1u32 << (SyncCat::FallbackPre as u32));
+    /// Bisection result from cuda_embedded (Jetson UMA): `ElemAdd` +
+    /// `FallbackPre`. Kept as a portable default starting point for
+    /// host bisection.
+    pub const MINIMAL: SyncPolicy =
+        SyncPolicy((1u32 << (SyncCat::ElemAdd as u32)) | (1u32 << (SyncCat::FallbackPre as u32)));
+
+    #[inline]
+    pub fn contains(self, cat: SyncCat) -> bool {
+        (self.0 & cat.bit()) != 0
+    }
+
+    #[inline]
+    pub fn with(mut self, cat: SyncCat) -> Self {
+        self.0 |= cat.bit();
+        self
+    }
+
+    #[inline]
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub fn from_raw(v: u32) -> Self {
+        SyncPolicy(v & 0x3FF)
+    }
+
+    /// Parse a policy string (see cuda_embedded::SyncPolicy::parse for the
+    /// full grammar). Kept in sync so CLI strings are portable.
+    pub fn parse(spec: &str) -> std::result::Result<Self, String> {
+        let s = spec.trim();
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(Self::ALL);
+        }
+        if s.eq_ignore_ascii_case("none") {
+            return Ok(Self::EMPTY);
+        }
+        if s.eq_ignore_ascii_case("llamacpp") {
+            return Ok(Self::LLAMACPP);
+        }
+        if s.eq_ignore_ascii_case("minimal") {
+            return Ok(Self::MINIMAL);
+        }
+        let rest = s
+            .strip_prefix("custom:")
+            .ok_or_else(|| format!("unknown sync policy: '{s}'"))?;
+        let mut mask = SyncPolicy::EMPTY;
+        for tok in rest.split(',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let lc = t.to_ascii_lowercase();
+            if lc == "elementwise" || lc == "elem" {
+                mask = mask
+                    .with(SyncCat::ElemAdd)
+                    .with(SyncCat::ElemAct)
+                    .with(SyncCat::ElemMisc);
+                continue;
+            }
+            let cat = match lc.as_str() {
+                "elem_add" | "add_assign" | "elemadd" => SyncCat::ElemAdd,
+                "elem_act" | "elemact" | "silu_mul" | "silu" => SyncCat::ElemAct,
+                "elem_misc" | "elemmisc" | "misc" => SyncCat::ElemMisc,
+                "rmsnorm" | "rms" => SyncCat::RmsNorm,
+                "rope" => SyncCat::Rope,
+                "matmul" | "mm" | "cublas" => SyncCat::Matmul,
+                "kv_scatter" | "kv" | "kvscatter" => SyncCat::KvScatter,
+                "attention" | "attn" => SyncCat::Attention,
+                "gather" | "embed" => SyncCat::Gather,
+                "fallback" | "fallback_pre" | "cpu_fallback" => SyncCat::FallbackPre,
+                other => return Err(format!("unknown sync category: '{other}'")),
+            };
+            mask = mask.with(cat);
+        }
+        Ok(mask)
+    }
+}
 
 /// Wrapper around a raw cuBLAS handle for safe sharing via Arc.
 ///
@@ -61,6 +200,18 @@ pub struct CudaBackend {
     kernels: Arc<CudaKernels>,
     /// Cached F16 cast buffer for matmul_transposed F32×F16 path.
     cast_cache: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
+    /// When `true`, launch-helper `maybe_sync_cat` calls are no-ops
+    /// (suppresses every per-op sync). Explicit `Backend::synchronize()`
+    /// and API-boundary syncs (read_buffer/copy_from/cast's CPU-read
+    /// fallback) are unaffected. Toggled via `set_defer_sync` / CLI
+    /// `--cuda-defer-sync`.
+    defer_sync: Arc<AtomicBool>,
+    /// Per-category sync bitmask (see `SyncPolicy`). When a
+    /// `maybe_sync_cat(SyncCat::X)` call fires, it invokes
+    /// `synchronize()` iff the `X` bit is set. Defaults to
+    /// `SyncPolicy::ALL` for backward compatibility with the
+    /// pre-port behaviour. `defer_sync=true` overrides this.
+    sync_policy: Arc<AtomicU32>,
 }
 
 impl CudaBackend {
@@ -142,6 +293,8 @@ impl CudaBackend {
             }),
             kernels: Arc::new(kernels),
             cast_cache: Arc::new(std::sync::Mutex::new(None)),
+            defer_sync: Arc::new(AtomicBool::new(false)),
+            sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -158,6 +311,53 @@ impl CudaBackend {
     /// Compute capability as (major, minor).
     pub fn compute_capability(&self) -> (i32, i32) {
         self.compute_capability
+    }
+
+    /// Enable or disable the experimental deferred-sync mode.
+    ///
+    /// When enabled, every `maybe_sync_cat` call becomes a no-op; the
+    /// caller is responsible for syncing before any CPU-visible read
+    /// (e.g. before sampling reads the logits). Does NOT affect
+    /// `Backend::synchronize()`, `read_buffer`/`copy_from`, or the
+    /// CPU-read fallback path inside `cast`.
+    #[inline]
+    pub fn set_defer_sync(&self, v: bool) {
+        self.defer_sync.store(v, Ordering::Relaxed);
+    }
+
+    /// Query the current deferred-sync setting.
+    #[inline]
+    pub fn defer_sync_enabled(&self) -> bool {
+        self.defer_sync.load(Ordering::Relaxed)
+    }
+
+    /// Set the per-category sync policy. `defer_sync=true` still
+    /// takes precedence and suppresses sync for every category.
+    #[inline]
+    pub fn set_sync_policy(&self, policy: SyncPolicy) {
+        self.sync_policy.store(policy.raw(), Ordering::Relaxed);
+    }
+
+    /// Current per-category sync policy.
+    #[inline]
+    pub fn sync_policy(&self) -> SyncPolicy {
+        SyncPolicy::from_raw(self.sync_policy.load(Ordering::Relaxed))
+    }
+
+    /// Category-aware sync helper. Invokes `synchronize()` iff:
+    /// - `defer_sync` is **off**, AND
+    /// - the current `SyncPolicy` has `cat` set.
+    #[inline]
+    fn maybe_sync_cat(&self, cat: SyncCat) -> Result<()> {
+        if self.defer_sync.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let mask = self.sync_policy.load(Ordering::Relaxed);
+        if (mask & cat.bit()) != 0 {
+            self.synchronize()
+        } else {
+            Ok(())
+        }
     }
 
     /// Attempt to get a CUdeviceptr from a Buffer.
@@ -373,7 +573,7 @@ impl Backend for CudaBackend {
 
         // Only support F32/F16 KV and head_dim in {64, 128, 256}
         if !matches!(head_dim, 64 | 128 | 256) || kv_dtype == DType::Q4_0 {
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return Ok(false);
         }
 
@@ -409,7 +609,7 @@ impl Backend for CudaBackend {
                 (DType::F16, 128) => &self.kernels.flash_prefill_f16kv_dk128,
                 (DType::F16, 256) => &self.kernels.flash_prefill_f16kv_dk256,
                 _ => {
-                    self.synchronize()?;
+                    self.maybe_sync_cat(SyncCat::FallbackPre)?;
                     return Ok(false);
                 }
             };
@@ -435,10 +635,10 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("flash_attn_prefill launch failed: {e}"))?;
             }
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::Attention)?;
             Ok(true)
         } else {
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             Ok(false)
         }
     }
@@ -452,7 +652,7 @@ impl Backend for CudaBackend {
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
         // Sync before cuBLAS: other ops may have written to input buffers
         // on a different stream than cuBLAS uses.
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::Matmul)?;
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
@@ -502,7 +702,7 @@ impl Backend for CudaBackend {
                     )
                     .map_err(|e| anyhow!("cublasSgemm failed: {e}"))?;
                 }
-                self.synchronize()?;
+                self.maybe_sync_cat(SyncCat::Matmul)?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
                 // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS.
@@ -564,7 +764,7 @@ impl Backend for CudaBackend {
                     )
                     .map_err(|e| anyhow!("cublasGemmEx (F32->F16 x F16) failed: {e}"))?;
                 }
-                self.synchronize()?;
+                self.maybe_sync_cat(SyncCat::Matmul)?;
                 *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
             } else if a_dtype == DType::F16 && b_dtype == DType::F16 {
@@ -596,7 +796,7 @@ impl Backend for CudaBackend {
                     )
                     .map_err(|e| anyhow!("cublasGemmEx (F16xF16) failed: {e}"))?;
                 }
-                self.synchronize()?;
+                self.maybe_sync_cat(SyncCat::Matmul)?;
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
@@ -635,7 +835,7 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("add_assign kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::ElemAdd)?;
         Ok(())
     }
 
@@ -654,7 +854,7 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("scale kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::ElemMisc)?;
         Ok(())
     }
 
@@ -674,7 +874,7 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("silu_mul kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::ElemAct)?;
         Ok(())
     }
 
@@ -694,7 +894,7 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(n))
                 .map_err(|e| anyhow!("gelu_tanh_mul kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::ElemAct)?;
         Ok(())
     }
 
@@ -727,7 +927,7 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("rms_norm kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::RmsNorm)?;
         Ok(())
     }
 
@@ -767,7 +967,7 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("rms_norm_oop kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::RmsNorm)?;
         Ok(())
     }
 
@@ -807,7 +1007,7 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("softmax kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::ElemMisc)?;
         Ok(())
     }
 
@@ -852,7 +1052,7 @@ impl Backend for CudaBackend {
                 .launch(cfg)
                 .map_err(|e| anyhow!("rope_inplace kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::Rope)?;
         Ok(())
     }
 
@@ -876,7 +1076,7 @@ impl Backend for CudaBackend {
                         .launch(Self::launch_config_1d(n))
                         .map_err(|e| anyhow!("cast_f32_f16 kernel launch failed: {e}"))?;
                 }
-                self.synchronize()?; // CPU may read dst immediately
+                self.maybe_sync_cat(SyncCat::ElemMisc)?; // CPU may read dst immediately
                 Ok(())
             }
             (DType::F16, DType::F32, Some(sp), Some(dp)) => {
@@ -891,12 +1091,12 @@ impl Backend for CudaBackend {
                         .launch(Self::launch_config_1d(n))
                         .map_err(|e| anyhow!("cast_f16_f32 kernel launch failed: {e}"))?;
                 }
-                self.synchronize()?;
+                self.maybe_sync_cat(SyncCat::ElemMisc)?;
                 Ok(())
             }
             _ => {
                 // Unsupported dtype or missing device ptr: sync then CPU fallback
-                self.synchronize()?;
+                self.maybe_sync_cat(SyncCat::FallbackPre)?;
                 cpu_fallback().cast(src, dst)
             }
         }
@@ -922,7 +1122,7 @@ impl Backend for CudaBackend {
                 .launch(Self::launch_config_1d(total))
                 .map_err(|e| anyhow!("add_row_bias kernel launch failed: {e}"))?;
         }
-        self.synchronize()?;
+        self.maybe_sync_cat(SyncCat::ElemMisc)?;
         Ok(())
     }
 
@@ -973,11 +1173,11 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("kv_scatter kernel launch failed: {e}"))?;
             }
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
             Ok(())
         } else {
             // Missing device ptr: sync then CPU fallback
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback()
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
         }
@@ -1031,10 +1231,10 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("kv_scatter_batch launch failed: {e}"))?;
             }
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
             Ok(())
         } else {
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback().kv_scatter_f32_to_f16_batch(
                 k_src,
                 v_src,
@@ -1053,7 +1253,7 @@ impl Backend for CudaBackend {
         // GPU kernel only supports F16 embedding -> F32 output.
         // For other dtypes, sync and fall back to CPU.
         if src.dtype() != DType::F16 {
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return cpu_fallback().gather(src, indices, dst);
         }
 
@@ -1085,10 +1285,10 @@ impl Backend for CudaBackend {
                     .launch(cfg)
                     .map_err(|e| anyhow!("gather_f16 kernel launch failed: {e}"))?;
             }
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::Gather)?;
             Ok(())
         } else {
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback().gather(src, indices, dst)
         }
     }
@@ -1113,7 +1313,7 @@ impl Backend for CudaBackend {
 
         // If scores_out is requested or device pointers are unavailable, use CPU fallback.
         if scores_out.is_some() {
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return cpu_fallback().attention_gen(
                 q,
                 k_cache,
@@ -1167,7 +1367,7 @@ impl Backend for CudaBackend {
                             .launch(cfg)
                             .map_err(|e| anyhow!("attention_gen_f32 kernel launch failed: {e}"))?;
                     }
-                    self.synchronize()?;
+                    self.maybe_sync_cat(SyncCat::Attention)?;
                     Ok(())
                 }
                 DType::F16 => {
@@ -1189,12 +1389,12 @@ impl Backend for CudaBackend {
                                 anyhow!("attention_gen_f16kv kernel launch failed: {e}")
                             })?;
                     }
-                    self.synchronize()?;
+                    self.maybe_sync_cat(SyncCat::Attention)?;
                     Ok(())
                 }
                 _ => {
                     // Q4_0 or unsupported: sync then CPU fallback
-                    self.synchronize()?;
+                    self.maybe_sync_cat(SyncCat::FallbackPre)?;
                     cpu_fallback().attention_gen(
                         q,
                         k_cache,
@@ -1210,7 +1410,7 @@ impl Backend for CudaBackend {
             }
         } else {
             // Missing device pointers: sync then CPU fallback
-            self.synchronize()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback().attention_gen(
                 q,
                 k_cache,

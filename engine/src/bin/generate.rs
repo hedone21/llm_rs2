@@ -693,8 +693,9 @@ fn main() -> anyhow::Result<()> {
             // --cuda-defer-sync: skip implicit per-op synchronize() in
             // launch helpers. The decode loop must then sync once per
             // token before sampling reads the logits — see the decode
-            // loop's pre-sampling barrier.
-            #[cfg(feature = "cuda-embedded")]
+            // loop's pre-sampling barrier. Available on both cuda_pc
+            // (host discrete GPU) and cuda_embedded (Jetson UMA).
+            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
             if args.cuda_defer_sync {
                 gpu_concrete.set_defer_sync(true);
                 eprintln!(
@@ -708,12 +709,17 @@ fn main() -> anyhow::Result<()> {
             // values override the policy bitmask. Legacy
             // `--cuda-defer-sync` takes precedence and zeros the policy
             // entirely at the `maybe_sync_cat` layer.
-            #[cfg(feature = "cuda-embedded")]
+            //
+            // Resolves through `llm_rs2::backend::cuda` which aliases to
+            // cuda_pc (feature = "cuda") or cuda_embedded (feature =
+            // "cuda-embedded"); the two modules share the same
+            // SyncPolicy API shape.
+            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
             {
-                use llm_rs2::backend::cuda_embedded::SyncPolicy;
+                use llm_rs2::backend::cuda::SyncPolicy;
                 let policy = SyncPolicy::parse(&args.cuda_sync_policy).map_err(|e| {
                     anyhow::anyhow!(
-                        "--cuda-sync-policy: {e}. Valid: all | none | llamacpp | custom:<cats>"
+                        "--cuda-sync-policy: {e}. Valid: all | none | llamacpp | minimal | custom:<cats>"
                     )
                 })?;
                 gpu_concrete.set_sync_policy(policy);
