@@ -1804,6 +1804,28 @@ fn main() -> anyhow::Result<()> {
         // buffers so merge can use direct pointer access instead of read_buffer/write_buffer.
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
+
+            // Zero-copy residual: permanent-map ws.residual's UnifiedBuffer so the
+            // partition decode path can read residual directly via as_ptr() and
+            // skip the per-layer read_buffer DMA (currently ~1.15 ms/layer).
+            // Gate behind LLMRS_PARTITION_ZCOPY_RESIDUAL=1 for A/B benchmarking.
+            #[cfg(feature = "opencl")]
+            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some() {
+                if let Some(ub) = gen_ws
+                    .residual
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<llm_rs2::buffer::unified_buffer::UnifiedBuffer>()
+                {
+                    ub.map()?;
+                    eprintln!("[Partition] Residual UnifiedBuffer permanent-mapped for zero-copy");
+                } else {
+                    eprintln!(
+                        "[Partition] WARN: residual buffer is not UnifiedBuffer (zero-copy skipped)"
+                    );
+                }
+            }
+
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx,
                 ffn_hidden,
@@ -3219,6 +3241,25 @@ fn main() -> anyhow::Result<()> {
         // Use UnifiedBuffer (ALLOC_HOST_PTR) for zero-copy merge (see batch path above).
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
+
+            // Zero-copy residual (see line 1807 block for rationale).
+            #[cfg(feature = "opencl")]
+            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some() {
+                if let Some(ub) = gen_ws
+                    .residual
+                    .buffer()
+                    .as_any()
+                    .downcast_ref::<llm_rs2::buffer::unified_buffer::UnifiedBuffer>()
+                {
+                    ub.map()?;
+                    eprintln!("[Partition] Residual UnifiedBuffer permanent-mapped for zero-copy");
+                } else {
+                    eprintln!(
+                        "[Partition] WARN: residual buffer is not UnifiedBuffer (zero-copy skipped)"
+                    );
+                }
+            }
+
             gen_ws.partition_ws = Some(PartitionWorkspace::new(
                 ctx,
                 ffn_hidden,
@@ -3301,12 +3342,15 @@ fn main() -> anyhow::Result<()> {
         // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
         // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
         // Disable when score_accumulator is active: plan doesn't collect attention scores
+        // Disable when tensor partition is active: plan bypasses forward_gen's
+        // partition path entirely (plan = pure GPU chain, no CPU co-execution).
         #[cfg(feature = "opencl")]
         let mut gpu_plan = if backend.name() == "OpenCL"
             && !args.profile
             && !args.no_gpu_plan
             && score_accumulator.is_none()
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+            && model.layers[0].partition_ctx.is_none()
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
         } else {
@@ -3466,7 +3510,9 @@ fn main() -> anyhow::Result<()> {
                     prefill_workspace: None,
                 })?;
 
-                // Rebuild plan if it was invalidated (e.g. KV cache resize)
+                // Rebuild plan if it was invalidated (e.g. KV cache resize).
+                // Skip rebuild when tensor partition is active — plan bypasses
+                // the partition co-execution path.
                 #[cfg(feature = "opencl")]
                 if gpu_plan.is_none()
                     && backend.name() == "OpenCL"
@@ -3474,6 +3520,7 @@ fn main() -> anyhow::Result<()> {
                     && !args.no_gpu_plan
                     && score_accumulator.is_none()
                     && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
+                    && model.layers[0].partition_ctx.is_none()
                 {
                     gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                 }
@@ -4040,6 +4087,12 @@ fn main() -> anyhow::Result<()> {
                         gen_ws.partition_ws = None;
                         eprintln!("[Partition] Disabled (ratio={})", ratio);
                         executor.set_partition_ratio(0.0);
+                        // Partition off: invalidate plan to trigger rebuild next
+                        // iter so GPU-only fast path is restored.
+                        #[cfg(feature = "opencl")]
+                        {
+                            gpu_plan = None;
+                        }
                     } else if llm_rs2::layers::tensor_partition::is_gpu_only_ratio(ratio) {
                         // GPU-only fast path: clear any existing partition context
                         // so forward() skips the host staging / CPU matmul / merge
@@ -4055,6 +4108,10 @@ fn main() -> anyhow::Result<()> {
                             llm_rs2::layers::tensor_partition::GPU_ONLY_THRESHOLD,
                         );
                         executor.set_partition_ratio(ratio);
+                        #[cfg(feature = "opencl")]
+                        {
+                            gpu_plan = None;
+                        }
                     } else {
                         // Lazy activation: if weights are still GPU-only (null host
                         // ptr — the normal state when `--enable-resilience` alone
@@ -4107,6 +4164,12 @@ fn main() -> anyhow::Result<()> {
                                         gen_ws.partition_ws = None;
                                     }
                                     executor.set_partition_ratio(ratio);
+                                    // Partition active: invalidate plan so the
+                                    // partition co-execution path takes over.
+                                    #[cfg(feature = "opencl")]
+                                    {
+                                        gpu_plan = None;
+                                    }
                                 }
                                 Err(e) => eprintln!("[Partition] Re-split failed: {}", e),
                             }
@@ -5655,9 +5718,14 @@ fn run_kivi(
     // Track last applied quant bits to avoid redundant transition_bits calls (sticky guard)
     let mut kivi_last_quant_bits: Option<u8> = None;
 
-    // Build GPU kernel plan for KIVI decode (OpenCL only)
+    // Build GPU kernel plan for KIVI decode (OpenCL only).
+    // Skip when tensor partition is active — plan bypasses forward_gen's
+    // partition co-execution path.
     #[cfg(feature = "opencl")]
-    let mut gpu_plan = if backend.name() == "OpenCL" && !no_gpu_plan {
+    let mut gpu_plan = if backend.name() == "OpenCL"
+        && !no_gpu_plan
+        && model.layers[0].partition_ctx.is_none()
+    {
         model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend)
     } else {
         None
@@ -5733,9 +5801,13 @@ fn run_kivi(
                 prefill_workspace: None,
             })?;
 
-            // Rebuild plan after fallback
+            // Rebuild plan after fallback. Skip when partition is active.
             #[cfg(feature = "opencl")]
-            if gpu_plan.is_none() && backend.name() == "OpenCL" && !no_gpu_plan {
+            if gpu_plan.is_none()
+                && backend.name() == "OpenCL"
+                && !no_gpu_plan
+                && model.layers[0].partition_ctx.is_none()
+            {
                 gpu_plan = model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend);
             }
         }

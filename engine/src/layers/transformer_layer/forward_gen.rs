@@ -7,6 +7,19 @@ impl TransformerLayer {
         if args.skip_attn && args.skip_mlp {
             return Ok(());
         }
+        {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static DBG_ENTER: AtomicBool = AtomicBool::new(false);
+            if !DBG_ENTER.swap(true, Ordering::Relaxed) {
+                let has_part = args.ws.partition_ws.is_some();
+                println!(
+                    "[part-dbg] forward_gen entered, ws.partition_ws.is_some()={}",
+                    has_part
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            }
+        }
 
         let _skip_attn = args.skip_attn;
         let _skip_mlp = args.skip_mlp;
@@ -1021,37 +1034,93 @@ impl TransformerLayer {
         prof_record!(t, rms_norm);
 
         // 9. FFN — gate + up projections (3 paths: partition, fused NEON, generic)
+        //
+        // Strategy B whole-FFN slice: when partition is active the GPU runs the
+        // entire FFN chain (gate, up, silu_mul, down) on its own split_col-wide
+        // slice with NO intermediate sync, while the CPU runs the whole chain
+        // on its own (ffn_hidden - split_col)-wide slice. The layer ends with a
+        // single elementwise sum of two [1, 1, hidden] partials.
         let t = prof_start!();
+        let partition_active = self.partition_ctx.is_some() && ws.partition_ws.is_some();
         if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
-            // ── Partitioned FFN gate/up: cooperative GPU + CPU ──
+            // ── Partitioned whole-FFN: cooperative GPU + CPU ──
+            let part_trace = crate::layers::tensor_partition::partition_trace_enabled();
+            let t0 = if part_trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
 
-            // 0. Copy residual to CPU. Blocking read_buffer on in-order queue
-            // implicitly syncs prior rms_norm → residual write; explicit synchronize()
-            // is redundant and adds per-layer pipeline drain cost.
-            unsafe {
-                let dst = std::slice::from_raw_parts_mut(
-                    pw.residual_cpu.as_mut_ptr(),
-                    pw.residual_cpu.size(),
-                );
-                backend.read_buffer(&ws.residual, dst)?;
-            }
+            // 0. Make residual visible to CPU (same sync-amortization knobs as before).
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SYNC_LAYER_COUNT: AtomicU64 = AtomicU64::new(0);
+            static SYNC_EVERY_N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let sync_n = *SYNC_EVERY_N.get_or_init(|| {
+                std::env::var("LLMRS_PARTITION_SYNC_EVERY_N")
+                    .ok()
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .filter(|&n| n >= 1)
+                    .unwrap_or(1)
+            });
+            let layer_count = SYNC_LAYER_COUNT.fetch_add(1, Ordering::Relaxed);
+            let skip_sync = sync_n > 1 && (layer_count % sync_n) != 0;
 
-            // 1. GPU: enqueue partial matmuls (non-blocking)
+            let zcopy_residual = !ws.residual.as_ptr().is_null();
+            let residual_cpu_ptr: *const u8 = if zcopy_residual {
+                if !skip_sync {
+                    backend.synchronize()?;
+                }
+                ws.residual.as_ptr()
+            } else {
+                if !skip_sync {
+                    unsafe {
+                        let dst = std::slice::from_raw_parts_mut(
+                            pw.residual_cpu.as_mut_ptr(),
+                            pw.residual_cpu.size(),
+                        );
+                        backend.read_buffer(&ws.residual, dst)?;
+                    }
+                }
+                pw.residual_cpu.as_ptr()
+            };
+            let residual_cpu_dims = if zcopy_residual {
+                ws.residual.shape().dims().to_vec()
+            } else {
+                pw.residual_cpu.shape().dims().to_vec()
+            };
+            let t_read = if part_trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            // 1. GPU: enqueue the entire FFN chain on the split_col-wide slice.
+            //    No flush/sync in between — in-order queue preserves ordering
+            //    and the GPU can pipeline the chain end-to-end.
             backend.matmul_transposed(&ws.residual, &part.gate.gpu_slice, &mut pw.gate_gpu)?;
             backend.matmul_transposed(&ws.residual, &part.up.gpu_slice, &mut pw.up_gpu)?;
+            if use_gelu_tanh {
+                backend.gelu_tanh_mul(&mut pw.gate_gpu, &pw.up_gpu)?;
+            } else {
+                backend.silu_mul(&mut pw.gate_gpu, &pw.up_gpu)?;
+            }
+            backend.matmul_transposed(
+                &pw.gate_gpu,
+                &part.down.gpu_slice,
+                &mut pw.down_partial_gpu,
+            )?;
             backend.flush()?;
 
-            // 2. CPU: fused matmul for gate + up (shares x quantization + SpinPool dispatch).
-            // GPU runs in parallel after flush().
+            // 2. CPU: full FFN chain on its own slice, independent of GPU.
             let cpu = &part.cpu_backend;
             #[cfg(target_arch = "aarch64")]
             let cpu_slice_dtype = part.gate.cpu_slice.dtype();
+            let k = residual_cpu_dims[residual_cpu_dims.len() - 1];
             #[cfg(target_arch = "aarch64")]
             let used_fused = if cpu.name().contains("CPU") && cpu_slice_dtype == DType::F16 {
-                let k = pw.residual_cpu.shape().dims()[pw.residual_cpu.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_f16(
-                        pw.residual_cpu.as_ptr() as *const f32,
+                        residual_cpu_ptr as *const f32,
                         k,
                         &[
                             (
@@ -1070,10 +1139,9 @@ impl TransformerLayer {
                 true
             } else if cpu.name().contains("CPU") && cpu_slice_dtype == DType::Q4_0 {
                 use crate::core::quant::BlockQ4_0;
-                let k = pw.residual_cpu.shape().dims()[pw.residual_cpu.shape().dims().len() - 1];
                 unsafe {
                     crate::backend::cpu::neon::fused_matmul_q4_0(
-                        pw.residual_cpu.as_ptr() as *const f32,
+                        residual_cpu_ptr as *const f32,
                         k,
                         &[
                             (
@@ -1096,26 +1164,79 @@ impl TransformerLayer {
             #[cfg(not(target_arch = "aarch64"))]
             let used_fused = false;
             if !used_fused {
+                let _ = residual_cpu_ptr;
+                if zcopy_residual {
+                    unsafe {
+                        let dst = std::slice::from_raw_parts_mut(
+                            pw.residual_cpu.as_mut_ptr(),
+                            pw.residual_cpu.size(),
+                        );
+                        let src =
+                            std::slice::from_raw_parts(ws.residual.as_ptr(), ws.residual.size());
+                        dst.copy_from_slice(src);
+                    }
+                }
                 cpu.matmul_transposed(&pw.residual_cpu, &part.gate.cpu_slice, &mut pw.gate_cpu)?;
                 cpu.matmul_transposed(&pw.residual_cpu, &part.up.cpu_slice, &mut pw.up_cpu)?;
             }
 
-            // 3+4. Merge via copy_slice: GPU→GPU copy + CPU→GPU write, no host staging.
-            // On OpenCL in-order queue the copy_slice after GPU matmuls is serialized,
-            // so no explicit synchronize() is needed.
-            {
-                let gpu_elems = pw.gate_gpu.size() / 4; // F32 elements
-                let cpu_elems = pw.gate_cpu.size() / 4;
-                // GPU partial → ws.gate[0..gpu_elems]
-                backend.copy_slice(&pw.gate_gpu, &mut ws.gate, 0, 0, gpu_elems)?;
-                // CPU partial → ws.gate[gpu_elems..] (CPU→GPU write with offset)
-                backend.copy_slice(&pw.gate_cpu, &mut ws.gate, 0, gpu_elems, cpu_elems)?;
+            // CPU silu/gelu * up on its slice.
+            if use_gelu_tanh {
+                cpu.gelu_tanh_mul(&mut pw.gate_cpu, &pw.up_cpu)?;
+            } else {
+                cpu.silu_mul(&mut pw.gate_cpu, &pw.up_cpu)?;
             }
+
+            // CPU down matmul on its slice: down.cpu_slice = [hidden, ffn_hidden-split_col],
+            // input = pw.gate_cpu = [1, 1, ffn_hidden-split_col], output = [1, 1, hidden].
+            cpu.matmul_transposed(&pw.gate_cpu, &part.down.cpu_slice, &mut pw.down_partial_cpu)?;
+
+            let t_cpu_done = if part_trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            if part_trace {
+                backend.synchronize()?;
+            }
+            let t_gpu_done = if part_trace {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
+            // 3. Merge: ws.down = down_partial_gpu + down_partial_cpu (both [1,1,hidden]).
+            //    Upload CPU partial to a GPU staging buffer, then elementwise add.
+            let hidden_elems = pw.down_partial_gpu.size() / 4;
+            // Start by moving the GPU partial into ws.down (single GPU→GPU copy).
+            backend.copy_slice(&pw.down_partial_gpu, &mut ws.down, 0, 0, hidden_elems)?;
+            // Upload CPU partial. copy_slice handles CPU→GPU when src is a CPU
+            // tensor and dst is a GPU tensor (write_buffer-style transfer).
+            backend.copy_slice(
+                &pw.down_partial_cpu,
+                &mut pw.cpu_merge_staging,
+                0,
+                0,
+                hidden_elems,
+            )?;
+            // ws.down += cpu_merge_staging
+            backend.add_assign(&mut ws.down, &pw.cpu_merge_staging)?;
+
+            if let (Some(t0), Some(t_read), Some(t_cpu), Some(t_gpu)) =
+                (t0, t_read, t_cpu_done, t_gpu_done)
             {
-                let gpu_elems = pw.up_gpu.size() / 4;
-                let cpu_elems = pw.up_cpu.size() / 4;
-                backend.copy_slice(&pw.up_gpu, &mut ws.up, 0, 0, gpu_elems)?;
-                backend.copy_slice(&pw.up_cpu, &mut ws.up, 0, gpu_elems, cpu_elems)?;
+                let t_merge = std::time::Instant::now();
+                let read_ns = t_read.duration_since(t0).as_nanos() as u64;
+                let cpu_ns = t_cpu.duration_since(t_read).as_nanos() as u64;
+                let gpu_wait_ns = t_gpu.duration_since(t_cpu).as_nanos() as u64;
+                let merge_ns = t_merge.duration_since(t_gpu).as_nanos() as u64;
+                crate::layers::tensor_partition::record_partition_timing(
+                    read_ns,
+                    cpu_ns,
+                    gpu_wait_ns,
+                    merge_ns,
+                );
             }
         } else if is_cpu_f16 && is_decode {
             // ── Fused NEON F16 dispatch (aarch64 only) ──
@@ -1180,20 +1301,23 @@ impl TransformerLayer {
         }
         prof_record!(t, matmul_ffn);
 
-        let t = prof_start!();
-        if use_gelu_tanh {
-            backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
-        } else {
-            backend.silu_mul(&mut ws.gate, &ws.up)?;
-        }
-        prof_record!(t, silu_mul);
+        // silu_mul + down matmul: skipped when partition is active (done per-slice
+        // inside the partition block above, merged into ws.down at layer end).
+        if !partition_active {
+            let t = prof_start!();
+            if use_gelu_tanh {
+                backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
+            } else {
+                backend.silu_mul(&mut ws.gate, &ws.up)?;
+            }
+            prof_record!(t, silu_mul);
 
-        // Decode down: GPU-only (partition not applied to down in decode).
-        let t = prof_start!();
-        set_label("matmul_ffn");
-        backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
-        clear_label();
-        prof_record!(t, matmul_ffn);
+            let t = prof_start!();
+            set_label("matmul_ffn");
+            backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
+            clear_label();
+            prof_record!(t, matmul_ffn);
+        }
 
         // 10. Residual 2 — accumulate FFN result into x (skip connection)
         let t = prof_start!();

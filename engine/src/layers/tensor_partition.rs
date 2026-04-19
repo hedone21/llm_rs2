@@ -56,14 +56,22 @@ pub struct PartitionedWeight {
 
 /// Per-layer partition context holding CPU backend and partitioned weights.
 ///
-/// Only FFN gate/up projections are partitioned; attention (wq/wk/wv/wo) and
-/// FFN down are always executed on the GPU to avoid merge overhead.
+/// Strategy B (whole-FFN slice): gate/up are split row-wise on `out_dim`, and
+/// `down` is split column-wise on `in_dim` at the **same split point**
+/// (`gate.split_row == down.split_col`). That way the CPU can compute the full
+/// FFN chain — gate → up → silu_mul → down — on its slice independently, and
+/// only the final `[hidden]` partial result needs to be summed with the GPU's
+/// partial at the very end of the layer (instead of merging after gate/up).
 pub struct PartitionContext {
     pub gpu_ratio: f32,
     pub cpu_backend: Arc<dyn Backend>,
-    // FFN gate/up projections (always large enough for partitioning)
+    // FFN gate/up projections, row-split on out_dim (ffn_hidden).
     pub gate: PartitionedWeight,
     pub up: PartitionedWeight,
+    // FFN down projection, col-split on in_dim (ffn_hidden).
+    // `down.split_row` is reused to mean `split_col` — i.e. the number of
+    // columns handled on GPU. Its value matches `gate.split_row`.
+    pub down: PartitionedWeight,
 }
 
 /// Compute the number of bytes per row for a given dtype and inner dimension.
@@ -230,6 +238,146 @@ pub fn split_weight(
     })
 }
 
+/// Split a weight tensor **column-wise** (along the `in_dim` axis) for the
+/// Strategy-B whole-FFN slice path.
+///
+/// Given a weight `W [out_dim, in_dim]` and a `split_col` (number of inner
+/// columns handled on GPU, must match the caller's gate/up `split_row`):
+///   - `gpu_slice`: `W[:, 0..split_col]`       (processed by GPU)
+///   - `cpu_slice`: `W[:, split_col..in_dim]`  (processed by CPU)
+///
+/// Unlike `split_weight` (row-split), this requires **per-row copying**
+/// because each row's bytes are interleaved in memory. We issue one
+/// backend-level `memcpy` per row into a fresh contiguous buffer.
+///
+/// `split_col` must be a multiple of 128 (enforces `ROW_ALIGNMENT` and, for
+/// Q4_0, block-boundary alignment at 32-elem granularity).
+///
+/// Returns a `PartitionedWeight` whose `split_row` field holds the
+/// **column split** (repurposed) so downstream consumers can read it with
+/// the same accessor.
+pub fn split_weight_col(
+    weight: &Tensor,
+    split_col: usize,
+    cpu_backend: &Arc<dyn Backend>,
+) -> Result<PartitionedWeight> {
+    let shape = weight.shape();
+    let dims = shape.dims();
+    ensure!(
+        dims.len() == 2,
+        "split_weight_col expects 2D weight [out_dim, in_dim], got {:?}",
+        dims
+    );
+
+    let out_dim = dims[0];
+    let in_dim = dims[1];
+    let dtype = weight.dtype();
+
+    ensure!(
+        split_col > 0 && split_col < in_dim,
+        "split_col ({}) must be in (0, in_dim={})",
+        split_col,
+        in_dim
+    );
+    ensure!(
+        split_col.is_multiple_of(ROW_ALIGNMENT),
+        "split_col ({}) must be a multiple of {} (Q4_0 block + workgroup alignment)",
+        split_col,
+        ROW_ALIGNMENT
+    );
+
+    let full_row_bytes = bytes_per_row(dtype, in_dim)?;
+    let gpu_row_bytes = bytes_per_row(dtype, split_col)?;
+    let cpu_row_bytes = bytes_per_row(dtype, in_dim - split_col)?;
+    ensure!(
+        gpu_row_bytes + cpu_row_bytes == full_row_bytes,
+        "Row byte split mismatch: gpu({}) + cpu({}) = {} != full({})",
+        gpu_row_bytes,
+        cpu_row_bytes,
+        gpu_row_bytes + cpu_row_bytes,
+        full_row_bytes,
+    );
+
+    let total_bytes = weight.size();
+    ensure!(
+        total_bytes == out_dim * full_row_bytes,
+        "Weight buffer size ({}) != out_dim*row_bytes ({})",
+        total_bytes,
+        out_dim * full_row_bytes,
+    );
+
+    // Build the GPU slice and CPU slice as fresh host buffers, one row at a
+    // time. This is O(out_dim * row_bytes) memcpy on the host side, executed
+    // once at model setup — decode path amortizes it over every token.
+    let gpu_bytes = out_dim * gpu_row_bytes;
+    let cpu_bytes = out_dim * cpu_row_bytes;
+
+    // Allocate fresh CPU-owned host buffers via cpu_backend's memory arena.
+    // We go through `Galloc` (host RAM) so `as_ptr()` works for the CPU path
+    // and the GPU backend can later adopt these bytes via `backend.copy_from`.
+    use crate::core::memory::Memory;
+    use crate::memory::galloc::Galloc;
+
+    let galloc = Galloc::new();
+    let gpu_host_buf = galloc.alloc(gpu_bytes, dtype)?;
+    let cpu_host_buf = galloc.alloc(cpu_bytes, dtype)?;
+
+    // Safety: weight has a valid host pointer (callers pass CPU-accessible
+    // tensors); gpu_host_buf / cpu_host_buf were just allocated as host RAM.
+    unsafe {
+        let src = weight.as_ptr();
+        let gpu_dst = gpu_host_buf.as_mut_ptr();
+        let cpu_dst = cpu_host_buf.as_mut_ptr();
+        ensure!(
+            !src.is_null() && !gpu_dst.is_null() && !cpu_dst.is_null(),
+            "split_weight_col: null pointer (weight must be CPU-mapped)",
+        );
+        for r in 0..out_dim {
+            let src_row = src.add(r * full_row_bytes);
+            let gpu_row_dst = gpu_dst.add(r * gpu_row_bytes);
+            let cpu_row_dst = cpu_dst.add(r * cpu_row_bytes);
+            std::ptr::copy_nonoverlapping(src_row, gpu_row_dst, gpu_row_bytes);
+            std::ptr::copy_nonoverlapping(src_row.add(gpu_row_bytes), cpu_row_dst, cpu_row_bytes);
+        }
+    }
+
+    // CPU slice tensor: host buffer directly tagged with the CPU backend.
+    let cpu_tensor = Tensor::new(
+        Shape::new(vec![out_dim, in_dim - split_col]),
+        cpu_host_buf,
+        cpu_backend.clone(),
+    );
+
+    // GPU slice tensor: adopt the host buffer via backend.copy_from so GPU
+    // backends upload it to a device-resident buffer. CPU backends will see
+    // this as a no-op clone.
+    // `copy_from` may tag the returned tensor with the source backend (see
+    // OpenCLBackend::copy_from: uses src.backend().clone()), so we explicitly
+    // retag with the weight's backend to restore the GPU ownership invariant.
+    let gpu_host_tensor = Tensor::new(
+        Shape::new(vec![out_dim, split_col]),
+        gpu_host_buf,
+        cpu_backend.clone(),
+    );
+    let copied = weight.backend().copy_from(&gpu_host_tensor)?;
+    let gpu_tensor = Tensor::new(
+        Shape::new(vec![out_dim, split_col]),
+        copied.buffer().clone(),
+        weight.backend().clone(),
+    );
+
+    debug!(
+        "split_weight_col: [{}x{}] split_col={}, gpu_bytes={}, cpu_bytes={} (per-row copy)",
+        out_dim, in_dim, split_col, gpu_bytes, cpu_bytes,
+    );
+
+    Ok(PartitionedWeight {
+        gpu_slice: gpu_tensor,
+        cpu_slice: cpu_tensor,
+        split_row: split_col, // field repurposed to carry the col-split
+    })
+}
+
 /// Merge 2D partial results from GPU and CPU partitions (prefill path).
 ///
 /// GPU partial: `[batch, seq_len, split_row]` (F32, on GPU)
@@ -280,6 +428,70 @@ pub fn merge_partials_2d(
     backend.write_buffer(output, &merged)?;
 
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Partition trace (env-gated)
+//
+// Set `LLMRS_PARTITION_TRACE=1` to enable per-layer timing of the partition
+// decode path. Adds one extra `synchronize()` per layer (measurement cost
+// ~variable), so use for diagnosis only, not production benchmarks.
+//
+// Prints a summary to stderr every 280 layer calls (≈ 10 tokens at 28 layers).
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PART_READ_NS: AtomicU64 = AtomicU64::new(0);
+static PART_CPU_NS: AtomicU64 = AtomicU64::new(0);
+static PART_GPU_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+static PART_MERGE_NS: AtomicU64 = AtomicU64::new(0);
+static PART_LAYER_COUNT: AtomicU64 = AtomicU64::new(0);
+const TRACE_SUMMARY_PERIOD: u64 = 28; // every decode token (28 layers)
+
+pub fn partition_trace_enabled() -> bool {
+    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let enabled = std::env::var_os("LLMRS_PARTITION_TRACE").is_some();
+    if !CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        println!("[partition-trace-init] enabled={}", enabled);
+    }
+    enabled
+}
+
+pub fn record_partition_timing(read_ns: u64, cpu_ns: u64, gpu_wait_ns: u64, merge_ns: u64) {
+    PART_READ_NS.fetch_add(read_ns, Ordering::Relaxed);
+    PART_CPU_NS.fetch_add(cpu_ns, Ordering::Relaxed);
+    PART_GPU_WAIT_NS.fetch_add(gpu_wait_ns, Ordering::Relaxed);
+    PART_MERGE_NS.fetch_add(merge_ns, Ordering::Relaxed);
+    let count = PART_LAYER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if count % TRACE_SUMMARY_PERIOD == 0 {
+        print_partition_trace_summary(count);
+    }
+}
+
+pub fn print_partition_trace_summary(count: u64) {
+    if count == 0 {
+        return;
+    }
+    let read = PART_READ_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
+    let cpu = PART_CPU_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
+    let gpu_wait = PART_GPU_WAIT_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
+    let merge = PART_MERGE_NS.load(Ordering::Relaxed) as f64 / count as f64 / 1e6;
+    // parallel efficiency: if gpu_wait ≈ 0, CPU was the longer phase (GPU done waiting = idle)
+    // if gpu_wait >> 0, GPU was still running when CPU done (GPU-bottleneck)
+    let bottleneck = if gpu_wait < 0.05 {
+        "CPU (GPU already idle when CPU finished)"
+    } else if gpu_wait < cpu * 0.2 {
+        "balanced"
+    } else {
+        "GPU (CPU finished well before GPU)"
+    };
+    println!(
+        "[partition-trace] layers={} avg/layer: read_buf={:.2}ms cpu_matmul={:.2}ms gpu_wait={:.2}ms merge={:.2}ms — bottleneck: {}",
+        count, read, cpu, gpu_wait, merge, bottleneck
+    );
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
 }
 
 #[cfg(test)]
@@ -666,6 +878,174 @@ mod tests {
         let cpu = cpu_backend();
         let result = split_weight(&w, 0.5, &cpu);
         assert!(result.is_err());
+    }
+
+    // ── split_weight_col tests (Strategy B: whole-FFN slice) ──
+
+    // Byte layout: each row is contiguous in memory. col-split must preserve
+    // each row's first `split_col` elements in the GPU slice and the rest in
+    // the CPU slice, for every row.
+    #[test]
+    fn test_split_weight_col_f32_roundtrip() {
+        let out_dim = 512;
+        let in_dim = 256;
+        let split_col = 128;
+        let w = make_f32_weight(out_dim, in_dim);
+        let cpu = cpu_backend();
+
+        let pw = split_weight_col(&w, split_col, &cpu).unwrap();
+        assert_eq!(pw.split_row, split_col); // repurposed field
+        assert_eq!(pw.gpu_slice.shape().dims(), &[out_dim, split_col]);
+        assert_eq!(pw.cpu_slice.shape().dims(), &[out_dim, in_dim - split_col]);
+
+        // Verify byte-exact data for every row.
+        let orig = w.as_slice::<f32>();
+        let gpu_data = pw.gpu_slice.as_slice::<f32>();
+        let cpu_data = pw.cpu_slice.as_slice::<f32>();
+        let cpu_cols = in_dim - split_col;
+        for r in 0..out_dim {
+            for c in 0..split_col {
+                let expected = orig[r * in_dim + c];
+                let actual = gpu_data[r * split_col + c];
+                assert_eq!(actual, expected, "GPU row {} col {}", r, c);
+            }
+            for c in 0..cpu_cols {
+                let expected = orig[r * in_dim + split_col + c];
+                let actual = cpu_data[r * cpu_cols + c];
+                assert_eq!(actual, expected, "CPU row {} col {}", r, c);
+            }
+        }
+    }
+
+    // Q4_0 col-split: split_col must be a multiple of 32 (block size) to keep
+    // whole blocks intact per row. 128 satisfies both the 32-block and 128
+    // workgroup alignment.
+    #[test]
+    fn test_split_weight_col_q4_0_roundtrip() {
+        let out_dim = 256;
+        let in_dim = 512; // 16 Q4_0 blocks per row
+        let split_col = 128; // 4 blocks GPU-side, 12 blocks CPU-side
+        let w = make_q4_weight(out_dim, in_dim);
+        let cpu = cpu_backend();
+
+        let pw = split_weight_col(&w, split_col, &cpu).unwrap();
+        let gpu_data =
+            unsafe { std::slice::from_raw_parts(pw.gpu_slice.as_ptr(), pw.gpu_slice.size()) };
+        let cpu_data =
+            unsafe { std::slice::from_raw_parts(pw.cpu_slice.as_ptr(), pw.cpu_slice.size()) };
+        let orig = unsafe { std::slice::from_raw_parts(w.as_ptr(), w.size()) };
+
+        let row_bytes = in_dim / 32 * 18;
+        let gpu_row_bytes = split_col / 32 * 18;
+        let cpu_row_bytes = (in_dim - split_col) / 32 * 18;
+        assert_eq!(pw.gpu_slice.size(), out_dim * gpu_row_bytes);
+        assert_eq!(pw.cpu_slice.size(), out_dim * cpu_row_bytes);
+
+        for r in 0..out_dim {
+            let orig_row = &orig[r * row_bytes..(r + 1) * row_bytes];
+            let gpu_row = &gpu_data[r * gpu_row_bytes..(r + 1) * gpu_row_bytes];
+            let cpu_row = &cpu_data[r * cpu_row_bytes..(r + 1) * cpu_row_bytes];
+            assert_eq!(gpu_row, &orig_row[..gpu_row_bytes], "GPU row {}", r);
+            assert_eq!(cpu_row, &orig_row[gpu_row_bytes..], "CPU row {}", r);
+        }
+    }
+
+    // End-to-end: col-split partitioned matmul must match the full matmul.
+    // Input must be col-split alongside the weight so CPU and GPU dot products
+    // both sum over their own slice of the inner dimension.
+    #[test]
+    fn test_split_weight_col_matmul_f32() {
+        let backend = cpu_backend();
+        let memory = Galloc::new();
+        let out_dim = 512;
+        let in_dim = 256;
+        let split_col = 128;
+
+        let w = make_f32_weight(out_dim, in_dim);
+        let x_buf = memory.alloc(in_dim * 4, DType::F32).unwrap();
+        let mut x = Tensor::new(Shape::new(vec![1, 1, in_dim]), x_buf, backend.clone());
+        for (i, v) in x.as_mut_slice::<f32>().iter_mut().enumerate() {
+            *v = (i as f32 + 1.0) * 0.01;
+        }
+
+        // Reference: full matmul.
+        let out_buf = memory.alloc(out_dim * 4, DType::F32).unwrap();
+        let mut out_full = Tensor::new(Shape::new(vec![1, 1, out_dim]), out_buf, backend.clone());
+        backend.matmul_transposed(&x, &w, &mut out_full).unwrap();
+
+        // Partition: gpu handles input[:split_col] * w[:, :split_col],
+        // cpu handles input[split_col:] * w[:, split_col:], then sum.
+        let cpu2 = cpu_backend();
+        let pw = split_weight_col(&w, split_col, &cpu2).unwrap();
+
+        // x_gpu: fresh [1, 1, split_col] copy of x[0..split_col].
+        let xg_buf = memory.alloc(split_col * 4, DType::F32).unwrap();
+        let mut x_gpu = Tensor::new(Shape::new(vec![1, 1, split_col]), xg_buf, backend.clone());
+        x_gpu
+            .as_mut_slice::<f32>()
+            .copy_from_slice(&x.as_slice::<f32>()[..split_col]);
+
+        // x_cpu: fresh [1, 1, in_dim-split_col] copy of x[split_col..].
+        let cpu_cols = in_dim - split_col;
+        let xc_buf = memory.alloc(cpu_cols * 4, DType::F32).unwrap();
+        let mut x_cpu = Tensor::new(Shape::new(vec![1, 1, cpu_cols]), xc_buf, cpu2.clone());
+        x_cpu
+            .as_mut_slice::<f32>()
+            .copy_from_slice(&x.as_slice::<f32>()[split_col..]);
+
+        let gpu_out_buf = memory.alloc(out_dim * 4, DType::F32).unwrap();
+        let mut out_gpu = Tensor::new(
+            Shape::new(vec![1, 1, out_dim]),
+            gpu_out_buf,
+            backend.clone(),
+        );
+        backend
+            .matmul_transposed(&x_gpu, &pw.gpu_slice, &mut out_gpu)
+            .unwrap();
+
+        let cpu_out_buf = memory.alloc(out_dim * 4, DType::F32).unwrap();
+        let mut out_cpu = Tensor::new(Shape::new(vec![1, 1, out_dim]), cpu_out_buf, cpu2.clone());
+        cpu2.matmul_transposed(&x_cpu, &pw.cpu_slice, &mut out_cpu)
+            .unwrap();
+
+        // Sum: full ≈ gpu_partial + cpu_partial (elementwise on out_dim).
+        let full = out_full.as_slice::<f32>();
+        let g = out_gpu.as_slice::<f32>();
+        let c = out_cpu.as_slice::<f32>();
+        for i in 0..out_dim {
+            let combined = g[i] + c[i];
+            let diff = (full[i] - combined).abs();
+            let rel = if full[i].abs() > 1e-6 {
+                diff / full[i].abs()
+            } else {
+                diff
+            };
+            assert!(
+                rel < 1e-4 || diff < 0.01,
+                "mismatch at [{}]: full={}, combined={}, diff={}, rel={}",
+                i,
+                full[i],
+                combined,
+                diff,
+                rel,
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_weight_col_invalid_alignment() {
+        let w = make_f32_weight(256, 256);
+        let cpu = cpu_backend();
+        // 64 is not a multiple of ROW_ALIGNMENT (128).
+        assert!(split_weight_col(&w, 64, &cpu).is_err());
+    }
+
+    #[test]
+    fn test_split_weight_col_bounds() {
+        let w = make_f32_weight(256, 256);
+        let cpu = cpu_backend();
+        assert!(split_weight_col(&w, 0, &cpu).is_err());
+        assert!(split_weight_col(&w, 256, &cpu).is_err());
     }
 
     // ── merge_partials_2d tests ──

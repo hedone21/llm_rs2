@@ -58,6 +58,9 @@ impl LayerWorkspace {
             bufs.push(pw.up_gpu.buffer().clone());
             bufs.push(pw.up_cpu.buffer().clone());
             bufs.push(pw.residual_cpu.buffer().clone());
+            bufs.push(pw.down_partial_gpu.buffer().clone());
+            bufs.push(pw.down_partial_cpu.buffer().clone());
+            bufs.push(pw.cpu_merge_staging.buffer().clone());
         }
         bufs
     }
@@ -88,6 +91,9 @@ impl LayerWorkspace {
                 up_gpu: retag(pw.up_gpu),
                 up_cpu: retag(pw.up_cpu),
                 residual_cpu: retag(pw.residual_cpu),
+                down_partial_gpu: retag(pw.down_partial_gpu),
+                down_partial_cpu: retag(pw.down_partial_cpu),
+                cpu_merge_staging: retag(pw.cpu_merge_staging),
             }),
         }
     }
@@ -195,7 +201,7 @@ impl PrefillWorkspace {
 ///
 /// Only FFN gate/up are partitioned; attention and FFN down run GPU-only.
 pub struct PartitionWorkspace {
-    // --- FFN gate/up ---
+    // --- FFN gate/up (Strategy B: CPU keeps its partial; GPU keeps its partial) ---
     /// GPU partial output for gate projection: [1, 1, gate_split_row]
     pub gate_gpu: Tensor,
     /// CPU partial output for gate projection: [1, 1, ffn_hidden - gate_split_row]
@@ -208,6 +214,17 @@ pub struct PartitionWorkspace {
     /// UnifiedBuffer::as_ptr() returns null when unmapped, so we copy residual
     /// to this CPU buffer via read_buffer() before CPU matmul.
     pub residual_cpu: Tensor,
+
+    // --- FFN down (Strategy B) ---
+    /// GPU partial output for down projection: [1, 1, hidden_size]
+    /// Contains `W_down[:, :split_col] @ silu(gate_gpu)*up_gpu`.
+    pub down_partial_gpu: Tensor,
+    /// CPU partial output for down projection: [1, 1, hidden_size]
+    /// Contains `W_down[:, split_col:] @ silu(gate_cpu)*up_cpu`.
+    pub down_partial_cpu: Tensor,
+    /// GPU-side staging buffer to upload the CPU partial for the final
+    /// elementwise add: [1, 1, hidden_size].
+    pub cpu_merge_staging: Tensor,
 }
 
 impl PartitionWorkspace {
@@ -249,6 +266,26 @@ impl PartitionWorkspace {
         let (gate_gpu, gate_cpu) = alloc_pair(&ctx.gate, ffn_hidden)?;
         let (up_gpu, up_cpu) = alloc_pair(&ctx.up, ffn_hidden)?;
 
+        // FFN down (Strategy B whole-slice):
+        //   down_partial_gpu  [1, 1, hidden]  GPU F32
+        //   down_partial_cpu  [1, 1, hidden]  CPU F32
+        //   cpu_merge_staging [1, 1, hidden]  GPU F32  (upload target for CPU partial)
+        let down_partial_gpu = Tensor::new(
+            Shape::new(vec![1, 1, hidden_size]),
+            gpu_alloc(hidden_size * 4, DType::F32)?,
+            gpu_backend.clone(),
+        );
+        let cpu_merge_staging = Tensor::new(
+            Shape::new(vec![1, 1, hidden_size]),
+            gpu_alloc(hidden_size * 4, DType::F32)?,
+            gpu_backend.clone(),
+        );
+        let down_partial_cpu = Tensor::new(
+            Shape::new(vec![1, 1, hidden_size]),
+            cpu_mem.alloc(hidden_size * 4, DType::F32)?,
+            cpu_backend.clone(),
+        );
+
         Ok(Self {
             gate_gpu,
             gate_cpu,
@@ -258,6 +295,9 @@ impl PartitionWorkspace {
                 let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
                 Tensor::new(Shape::new(vec![1, 1, hidden_size]), buf, cpu_backend)
             },
+            down_partial_gpu,
+            down_partial_cpu,
+            cpu_merge_staging,
         })
     }
 }

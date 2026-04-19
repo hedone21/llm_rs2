@@ -379,7 +379,9 @@ impl TransformerModel {
         gpu_ratio: f32,
         cpu_backend: &Arc<dyn Backend>,
     ) -> Result<usize> {
-        use crate::layers::tensor_partition::{PartitionContext, is_gpu_only_ratio, split_weight};
+        use crate::layers::tensor_partition::{
+            PartitionContext, is_gpu_only_ratio, split_weight, split_weight_col,
+        };
 
         // GPU-only fast path: leave partition_ctx cleared so forward() takes
         // the dense full-weight GPU matmul path. Avoids per-token host
@@ -395,16 +397,25 @@ impl TransformerModel {
 
         let mut count = 0;
         for layer in &mut self.layers {
-            // Only partition FFN gate/up (large enough, no merge overhead concern)
+            // Strategy B: whole-FFN slice.
+            // gate/up split_row is on the ffn_hidden (out_dim) axis.
+            // down split_col is on the ffn_hidden (in_dim) axis — same
+            // logical dimension, so we reuse gate's split_row.
             let gate = split_weight(&layer.w_gate, gpu_ratio, cpu_backend)?;
             let up = split_weight(&layer.w_up, gpu_ratio, cpu_backend)?;
-            count += 2;
+            debug_assert_eq!(
+                gate.split_row, up.split_row,
+                "gate/up split_row must match (same ffn_hidden, same gpu_ratio)",
+            );
+            let down = split_weight_col(&layer.w_down, gate.split_row, cpu_backend)?;
+            count += 3;
 
             layer.partition_ctx = Some(PartitionContext {
                 gpu_ratio,
                 cpu_backend: cpu_backend.clone(),
                 gate,
                 up,
+                down,
             });
         }
         Ok(count)
