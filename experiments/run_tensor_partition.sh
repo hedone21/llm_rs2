@@ -19,7 +19,7 @@ OUT=/data/local/tmp/tp_results
 LOCAL_OUT=experiments/results/tensor_partition
 LOG_FILE=${LOCAL_OUT}/run.log
 
-RATIOS=(1.0 0.875 0.75)   # GPU-only first → warm baseline
+RATIOS=(1.0 0.994 0.875 0.75)  # 0.994 = partition path, ~1.4% CPU → isolates sync/merge overhead vs r=1.0 fast path
 PREFILL=(1024)             # focus on p=1024 (cold-kernel check revealed 28% run1→run2 gap at p>128)
 REPS=2
 

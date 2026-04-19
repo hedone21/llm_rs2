@@ -32,3 +32,6 @@ benchmarks/plots/
 kernels/kernels
 llama.cpp-kernels/
 tools/memfill_android
+
+# Third-party clones for comparison
+experiments/external/
