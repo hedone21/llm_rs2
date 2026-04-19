@@ -198,6 +198,32 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cuda_defer_sync: bool,
 
+    /// Per-category sync policy for the cuda-embedded backend. Lets us
+    /// bisect which per-op `cuStreamSynchronize()` calls are load-bearing
+    /// for correctness on Jetson UMA versus which are pure overhead.
+    ///
+    /// Values:
+    /// - `all` (default): every launch-site sync stays on (pre-bisect
+    ///   behaviour, ~28 tok/s on Xavier).
+    /// - `none`: every per-op sync suppressed (equivalent to
+    ///   `--cuda-defer-sync`; garbage output).
+    /// - `llamacpp`: only the CPU-fallback guard stays on (garbage
+    ///   output on Jetson UMA — residual `add_assign` loses cache
+    ///   coherency without an intra-layer sync).
+    /// - `minimal`: bisection-validated minimal correct set
+    ///   (`elem_add` + `fallback`; ~34.8 tok/s on Xavier, +6.4 tok/s
+    ///   vs `all`).
+    /// - `custom:A,B`: comma-separated category names. Recognised
+    ///   categories: `elementwise` (expands to `elem_add` +
+    ///   `elem_act` + `elem_misc`), `elem_add`, `elem_act`,
+    ///   `elem_misc`, `rmsnorm`, `rope`, `matmul`, `kv_scatter`,
+    ///   `attention`, `gather`, `fallback`. Only the listed ones
+    ///   keep syncing; everything else is deferred.
+    ///
+    /// `--cuda-defer-sync` still takes precedence when enabled.
+    #[arg(long, default_value = "all")]
+    cuda_sync_policy: String,
+
     /// Allocate weight tensors in device-only memory (`cuMemAlloc`) instead
     /// of UMA pinned host memory (`cuMemHostAlloc`) on Jetson.
     ///
@@ -675,6 +701,30 @@ fn main() -> anyhow::Result<()> {
                     "[CUDA] --cuda-defer-sync enabled: per-op syncs suppressed; token-boundary sync only"
                 );
             }
+            // --cuda-sync-policy: fine-grained per-category bisection.
+            // Parsed before weights-device so a misconfigured string
+            // errors out before the long model-load path. `all` is a
+            // no-op (matches the AtomicU32 default from `new()`); other
+            // values override the policy bitmask. Legacy
+            // `--cuda-defer-sync` takes precedence and zeros the policy
+            // entirely at the `maybe_sync_cat` layer.
+            #[cfg(feature = "cuda-embedded")]
+            {
+                use llm_rs2::backend::cuda_embedded::SyncPolicy;
+                let policy = SyncPolicy::parse(&args.cuda_sync_policy).map_err(|e| {
+                    anyhow::anyhow!(
+                        "--cuda-sync-policy: {e}. Valid: all | none | llamacpp | custom:<cats>"
+                    )
+                })?;
+                gpu_concrete.set_sync_policy(policy);
+                if !args.cuda_sync_policy.eq_ignore_ascii_case("all") {
+                    eprintln!(
+                        "[CUDA] --cuda-sync-policy={} (mask=0x{:02x})",
+                        args.cuda_sync_policy,
+                        policy.raw()
+                    );
+                }
+            }
             // --cuda-weights-device: route weight uploads through a pure
             // device allocation (cuMemAlloc + explicit H2D). Must be set
             // before the model loader runs so every `copy_weight_from`
@@ -960,7 +1010,7 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    let mut kv_type = match args.kv_type.as_str() {
+    let kv_type = match args.kv_type.as_str() {
         "f32" => DType::F32,
         "f16" => DType::F16,
         "q4" => DType::Q4_0,

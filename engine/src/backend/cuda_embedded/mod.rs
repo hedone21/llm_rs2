@@ -27,7 +27,160 @@ use std::any::Any;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Per-category sync tag for `maybe_sync_cat`.
+///
+/// Used to bisect which per-op syncs are actually required for
+/// correctness on Jetson UMA. Each tag corresponds to a group of
+/// launch sites inside `CudaBackend`; a `SyncPolicy` bitmask picks
+/// which groups still invoke `synchronize()`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SyncCat {
+    /// `add_assign` (residual accumulate — runs 2x per layer).
+    ElemAdd = 0,
+    /// `rms_norm` and `rms_norm_oop` launches.
+    RmsNorm = 1,
+    /// `rope_inplace`.
+    Rope = 2,
+    /// cuBLAS / custom GEMV matmul variants in `matmul_transposed`,
+    /// plus the pre-launch input-ordering guard at the top of that
+    /// function. The cast F32->F16 that precedes `gemm_ex` is also
+    /// folded in here (same-stream, not a CPU-visible read).
+    Matmul = 3,
+    /// `kv_scatter_f32_to_f16` (+ batch variant).
+    KvScatter = 4,
+    /// `attention_gen` (flash_attn_f32/f16kv) and
+    /// `flash_attention_prefill`.
+    Attention = 5,
+    /// `gather` (embedding lookup).
+    Gather = 6,
+    /// Sync before dropping to a CPU fallback (unsupported dtype,
+    /// missing device pointer). Keeping these syncs is load-bearing
+    /// whenever a preceding GPU op's output feeds the fallback.
+    FallbackPre = 7,
+    /// FFN activation kernels: `silu_mul`, `gelu_tanh_mul`.
+    ElemAct = 8,
+    /// Miscellaneous elementwise: `scale`, `softmax`, `add_row_bias`,
+    /// `cast_f16_f32`. Rarely exercised on the Llama decode path
+    /// (softmax/add_row_bias never fire; scale/cast run at edges).
+    ElemMisc = 9,
+}
+
+impl SyncCat {
+    #[inline]
+    fn bit(self) -> u32 {
+        1u32 << (self as u32)
+    }
+}
+
+/// Bitmask controlling which `SyncCat` launch sites still issue a
+/// `synchronize()`. Stored as the raw `u32` inside an `AtomicU32`.
+#[derive(Copy, Clone, Debug)]
+pub struct SyncPolicy(u32);
+
+impl SyncPolicy {
+    pub const EMPTY: SyncPolicy = SyncPolicy(0);
+    /// All categories active — identical to the pre-bisect behaviour.
+    pub const ALL: SyncPolicy = SyncPolicy(0x3FF);
+    /// llama.cpp-style minimal set: only the `FallbackPre` guard
+    /// stays on so CPU fallback paths still observe in-flight GPU
+    /// writes. All per-op GPU syncs are suppressed. NOTE: this
+    /// produces garbage output on Jetson UMA because the decode-loop
+    /// residual (`add_assign`) needs an implicit sync to publish the
+    /// previous layer's writes before the next layer reads them.
+    /// Use `MINIMAL` for the actually-correct minimal set.
+    pub const LLAMACPP: SyncPolicy = SyncPolicy(1u32 << (SyncCat::FallbackPre as u32));
+    /// Bisection result (2026-04-19): smallest category set that
+    /// preserves correctness on Jetson UMA is `ElemAdd` (residual
+    /// `add_assign`, fires 32x per token at 16 layers) plus
+    /// `FallbackPre` for safety on CPU-fallback paths. Raw logs at
+    /// `.agent/research/2026-04-19_sync_bisect/`.
+    pub const MINIMAL: SyncPolicy =
+        SyncPolicy((1u32 << (SyncCat::ElemAdd as u32)) | (1u32 << (SyncCat::FallbackPre as u32)));
+
+    #[inline]
+    pub fn contains(self, cat: SyncCat) -> bool {
+        (self.0 & cat.bit()) != 0
+    }
+
+    #[inline]
+    pub fn with(mut self, cat: SyncCat) -> Self {
+        self.0 |= cat.bit();
+        self
+    }
+
+    #[inline]
+    pub fn raw(self) -> u32 {
+        self.0
+    }
+
+    #[inline]
+    pub fn from_raw(v: u32) -> Self {
+        SyncPolicy(v & 0x3FF)
+    }
+
+    /// Parse a policy string:
+    /// - `all` -> `ALL`
+    /// - `none` -> `EMPTY` (same as legacy `--cuda-defer-sync`)
+    /// - `llamacpp` -> `LLAMACPP` (produces garbage on Jetson UMA)
+    /// - `minimal` -> `MINIMAL` (bisection-validated: elem_add +
+    ///   fallback; +6.4 tok/s on Xavier vs `all`).
+    /// - `custom:A,B,...` where `A`/`B` are category names
+    ///   (case-insensitive): `elementwise`, `elem_add`, `elem_act`,
+    ///   `elem_misc`, `rmsnorm`, `rope`, `matmul`, `kv_scatter`,
+    ///   `attention`, `gather`, `fallback`. The legacy name
+    ///   `elementwise` expands to the three `elem_*` sub-cats.
+    pub fn parse(spec: &str) -> std::result::Result<Self, String> {
+        let s = spec.trim();
+        if s.eq_ignore_ascii_case("all") {
+            return Ok(Self::ALL);
+        }
+        if s.eq_ignore_ascii_case("none") {
+            return Ok(Self::EMPTY);
+        }
+        if s.eq_ignore_ascii_case("llamacpp") {
+            return Ok(Self::LLAMACPP);
+        }
+        if s.eq_ignore_ascii_case("minimal") {
+            return Ok(Self::MINIMAL);
+        }
+        let rest = s
+            .strip_prefix("custom:")
+            .ok_or_else(|| format!("unknown sync policy: '{s}'"))?;
+        let mut mask = SyncPolicy::EMPTY;
+        for tok in rest.split(',') {
+            let t = tok.trim();
+            if t.is_empty() {
+                continue;
+            }
+            let lc = t.to_ascii_lowercase();
+            // `elementwise` (legacy) expands to the three elem sub-cats.
+            if lc == "elementwise" || lc == "elem" {
+                mask = mask
+                    .with(SyncCat::ElemAdd)
+                    .with(SyncCat::ElemAct)
+                    .with(SyncCat::ElemMisc);
+                continue;
+            }
+            let cat = match lc.as_str() {
+                "elem_add" | "add_assign" | "elemadd" => SyncCat::ElemAdd,
+                "elem_act" | "elemact" | "silu_mul" | "silu" => SyncCat::ElemAct,
+                "elem_misc" | "elemmisc" | "misc" => SyncCat::ElemMisc,
+                "rmsnorm" | "rms" => SyncCat::RmsNorm,
+                "rope" => SyncCat::Rope,
+                "matmul" | "mm" | "cublas" => SyncCat::Matmul,
+                "kv_scatter" | "kv" | "kvscatter" => SyncCat::KvScatter,
+                "attention" | "attn" => SyncCat::Attention,
+                "gather" | "embed" => SyncCat::Gather,
+                "fallback" | "fallback_pre" | "cpu_fallback" => SyncCat::FallbackPre,
+                other => return Err(format!("unknown sync category: '{other}'")),
+            };
+            mask = mask.with(cat);
+        }
+        Ok(mask)
+    }
+}
 
 /// Wrapper around a raw cuBLAS handle for safe sharing via Arc.
 ///
@@ -95,6 +248,14 @@ pub struct CudaBackend {
     /// loop the backend is held by a single `Arc`, so clones observe
     /// the same flag.
     defer_sync: Arc<AtomicBool>,
+    /// Per-category sync bitmask (see `SyncPolicy`). When a
+    /// `maybe_sync_cat(SyncCat::X)` call fires, it invokes
+    /// `synchronize()` iff the `X` bit is set. Defaults to
+    /// `SyncPolicy::ALL` for backward compatibility with the
+    /// pre-bisect behaviour. `defer_sync=true` overrides this
+    /// (suppresses sync regardless of the policy bits) so the
+    /// legacy `--cuda-defer-sync` shorthand keeps working.
+    sync_policy: Arc<AtomicU32>,
     /// When `true`, `copy_weight_from` allocates a `CudaDeviceBuffer`
     /// (`cuMemAlloc`, device-only VRAM / carveout) and performs an
     /// explicit H2D `cuMemcpyHtoD` instead of the default `CudaHostBuffer`
@@ -228,6 +389,7 @@ impl CudaBackend {
             profiler: Arc::new(std::sync::Mutex::new(None)),
             op_label_hint: Arc::new(OpLabelHint::new()),
             defer_sync: Arc::new(AtomicBool::new(false)),
+            sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
             weights_device: Arc::new(AtomicBool::new(false)),
         };
 
@@ -374,14 +536,37 @@ impl CudaBackend {
         self.weights_device.load(Ordering::Relaxed)
     }
 
-    /// Launch-site sync wrapper. No-op when `defer_sync` is enabled;
-    /// otherwise delegates to `self.synchronize()`.
+    /// Set the per-category sync policy. `defer_sync=true` still
+    /// takes precedence and suppresses sync for every category.
     #[inline]
-    fn maybe_sync(&self) -> Result<()> {
+    pub fn set_sync_policy(&self, policy: SyncPolicy) {
+        self.sync_policy.store(policy.raw(), Ordering::Relaxed);
+    }
+
+    /// Current per-category sync policy.
+    #[inline]
+    pub fn sync_policy(&self) -> SyncPolicy {
+        SyncPolicy::from_raw(self.sync_policy.load(Ordering::Relaxed))
+    }
+
+    /// Category-aware variant of `maybe_sync`. Invokes
+    /// `synchronize()` iff:
+    /// - `defer_sync` is **off**, AND
+    /// - the current `SyncPolicy` has `cat` set.
+    ///
+    /// The legacy `--cuda-defer-sync` flag (full suppression) still
+    /// wins so policy experiments layer on top of the existing
+    /// shorthand without code duplication.
+    #[inline]
+    fn maybe_sync_cat(&self, cat: SyncCat) -> Result<()> {
         if self.defer_sync.load(Ordering::Relaxed) {
-            Ok(())
-        } else {
+            return Ok(());
+        }
+        let mask = self.sync_policy.load(Ordering::Relaxed);
+        if (mask & cat.bit()) != 0 {
             self.synchronize()
+        } else {
+            Ok(())
         }
     }
 
@@ -653,7 +838,7 @@ impl Backend for CudaBackend {
 
         // Only support F32/F16 KV and head_dim in {64, 128, 256}
         if !matches!(head_dim, 64 | 128 | 256) || kv_dtype == DType::Q4_0 {
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return Ok(false);
         }
 
@@ -689,7 +874,7 @@ impl Backend for CudaBackend {
                 (DType::F16, 128) => &self.kernels.flash_prefill_f16kv_dk128,
                 (DType::F16, 256) => &self.kernels.flash_prefill_f16kv_dk256,
                 _ => {
-                    self.maybe_sync()?;
+                    self.maybe_sync_cat(SyncCat::FallbackPre)?;
                     return Ok(false);
                 }
             };
@@ -718,10 +903,10 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::Attention)?;
             Ok(true)
         } else {
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             Ok(false)
         }
     }
@@ -738,7 +923,7 @@ impl Backend for CudaBackend {
         // bound to the default stream in `new()`, so this is ordering
         // insurance rather than a correctness requirement — safe to
         // defer under --cuda-defer-sync.)
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::Matmul)?;
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
@@ -796,7 +981,7 @@ impl Backend for CudaBackend {
                         }
                         Ok(())
                     });
-                    self.maybe_sync()?;
+                    self.maybe_sync_cat(SyncCat::Matmul)?;
                     return Ok(());
                 } else if a_dtype == DType::F32 {
                     // SAFETY: a_ptr=F32 input, b_ptr=F16 weight, out_ptr=F32.
@@ -815,7 +1000,7 @@ impl Backend for CudaBackend {
                         }
                         Ok(())
                     });
-                    self.maybe_sync()?;
+                    self.maybe_sync_cat(SyncCat::Matmul)?;
                     return Ok(());
                 }
                 // Other a_dtype falls through to cuBLAS / CPU fallback.
@@ -850,7 +1035,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.maybe_sync()?;
+                self.maybe_sync_cat(SyncCat::Matmul)?;
                 Ok(())
             } else if a_dtype == DType::F32 && b_dtype == DType::F16 {
                 // F32 activation x F16 weight: cast A to F16, then F16xF16 cuBLAS.
@@ -918,7 +1103,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.maybe_sync()?;
+                self.maybe_sync_cat(SyncCat::Matmul)?;
                 *self.cast_cache.lock().unwrap() = Some(a_f16_buf);
                 Ok(())
             } else if a_dtype == DType::F16 && b_dtype == DType::F16 {
@@ -954,7 +1139,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.maybe_sync()?;
+                self.maybe_sync_cat(SyncCat::Matmul)?;
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
@@ -996,7 +1181,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::ElemAdd)?;
         Ok(())
     }
 
@@ -1018,7 +1203,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::ElemMisc)?;
         Ok(())
     }
 
@@ -1041,7 +1226,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::ElemAct)?;
         Ok(())
     }
 
@@ -1064,7 +1249,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::ElemAct)?;
         Ok(())
     }
 
@@ -1100,7 +1285,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::RmsNorm)?;
         Ok(())
     }
 
@@ -1143,7 +1328,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::RmsNorm)?;
         Ok(())
     }
 
@@ -1186,7 +1371,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::ElemMisc)?;
         Ok(())
     }
 
@@ -1234,7 +1419,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::Rope)?;
         Ok(())
     }
 
@@ -1279,7 +1464,7 @@ impl Backend for CudaBackend {
                     }
                     Ok(())
                 });
-                self.maybe_sync()?;
+                self.maybe_sync_cat(SyncCat::ElemMisc)?;
                 Ok(())
             }
             _ => {
@@ -1288,7 +1473,7 @@ impl Backend for CudaBackend {
                 // but the only dtypes that take this path (Q4_0, etc.)
                 // never touch a live GPU write in the decode hot path
                 // — this branch is exercised at load/init, not per token.
-                self.maybe_sync()?;
+                self.maybe_sync_cat(SyncCat::FallbackPre)?;
                 cpu_fallback().cast(src, dst)
             }
         }
@@ -1317,7 +1502,7 @@ impl Backend for CudaBackend {
             }
             Ok(())
         });
-        self.maybe_sync()?;
+        self.maybe_sync_cat(SyncCat::ElemMisc)?;
         Ok(())
     }
 
@@ -1371,11 +1556,11 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
             Ok(())
         } else {
             // Missing device ptr: sync then CPU fallback
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback()
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
         }
@@ -1432,10 +1617,10 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::KvScatter)?;
             Ok(())
         } else {
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback().kv_scatter_f32_to_f16_batch(
                 k_src,
                 v_src,
@@ -1454,7 +1639,7 @@ impl Backend for CudaBackend {
         // GPU kernel only supports F16 embedding -> F32 output.
         // For other dtypes, sync and fall back to CPU.
         if src.dtype() != DType::F16 {
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return cpu_fallback().gather(src, indices, dst);
         }
 
@@ -1489,10 +1674,10 @@ impl Backend for CudaBackend {
                 }
                 Ok(())
             });
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::Gather)?;
             Ok(())
         } else {
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback().gather(src, indices, dst)
         }
     }
@@ -1517,7 +1702,7 @@ impl Backend for CudaBackend {
 
         // If scores_out is requested or device pointers are unavailable, use CPU fallback.
         if scores_out.is_some() {
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return cpu_fallback().attention_gen(
                 q,
                 k_cache,
@@ -1576,7 +1761,7 @@ impl Backend for CudaBackend {
                         }
                         Ok(())
                     });
-                    self.maybe_sync()?;
+                    self.maybe_sync_cat(SyncCat::Attention)?;
                     Ok(())
                 }
                 DType::F16 => {
@@ -1601,12 +1786,12 @@ impl Backend for CudaBackend {
                         }
                         Ok(())
                     });
-                    self.maybe_sync()?;
+                    self.maybe_sync_cat(SyncCat::Attention)?;
                     Ok(())
                 }
                 _ => {
                     // Q4_0 or unsupported: sync then CPU fallback
-                    self.maybe_sync()?;
+                    self.maybe_sync_cat(SyncCat::FallbackPre)?;
                     cpu_fallback().attention_gen(
                         q,
                         k_cache,
@@ -1622,7 +1807,7 @@ impl Backend for CudaBackend {
             }
         } else {
             // Missing device pointers: sync then CPU fallback
-            self.maybe_sync()?;
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             cpu_fallback().attention_gen(
                 q,
                 k_cache,
