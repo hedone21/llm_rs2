@@ -222,6 +222,17 @@ pub trait Backend: Send + Sync {
     // Memory Ops
     fn copy_from(&self, t: &Tensor) -> Result<Tensor>;
 
+    /// Copy a weight tensor from CPU to this backend.
+    ///
+    /// Distinguishes static, read-only weights (uploaded once at model load
+    /// time) from runtime activations. Backends that can benefit from
+    /// device-local storage for weights (e.g. `cuda_embedded` with
+    /// `--cuda-weights-device` to bypass Jetson UMA cache coherency issues)
+    /// override this method. The default delegates to `copy_from`.
+    fn copy_weight_from(&self, t: &Tensor) -> Result<Tensor> {
+        self.copy_from(t)
+    }
+
     /// Fused F32→F16 cast + HeadMajor scatter for KV cache update.
     /// Replaces 2× cast + 16× copy_slice with a single GPU kernel.
     /// Default: falls back to separate cast + copy.

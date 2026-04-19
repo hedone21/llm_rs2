@@ -95,6 +95,22 @@ pub struct CudaBackend {
     /// loop the backend is held by a single `Arc`, so clones observe
     /// the same flag.
     defer_sync: Arc<AtomicBool>,
+    /// When `true`, `copy_weight_from` allocates a `CudaDeviceBuffer`
+    /// (`cuMemAlloc`, device-only VRAM / carveout) and performs an
+    /// explicit H2D `cuMemcpyHtoD` instead of the default `CudaHostBuffer`
+    /// zero-copy path. Activations/KV/workspace remain host-pinned.
+    ///
+    /// Rationale: Jetson UMA pinned host memory has weak L2 cache
+    /// coherency with CUDA kernels, which surfaces as garbage output when
+    /// combined with aggressive decode-loop pipelining (see
+    /// `--cuda-defer-sync`). llama.cpp works around this by forcing
+    /// `integrated = false` (ggml-cuda.cu:241) so all tensors live in
+    /// device memory. Weights dominate the cacheable dataset and are
+    /// written once, so moving only them off UMA recovers coherency for
+    /// the hot read path while keeping zero-copy on the per-token
+    /// activations. Wired via the `--cuda-weights-device` CLI flag;
+    /// defaults to `false` (no change from the pre-P3 behaviour).
+    weights_device: Arc<AtomicBool>,
 }
 
 /// Wrapper around `UnsafeCell<Option<&'static str>>` so we can
@@ -212,6 +228,7 @@ impl CudaBackend {
             profiler: Arc::new(std::sync::Mutex::new(None)),
             op_label_hint: Arc::new(OpLabelHint::new()),
             defer_sync: Arc::new(AtomicBool::new(false)),
+            weights_device: Arc::new(AtomicBool::new(false)),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -336,6 +353,25 @@ impl CudaBackend {
     #[inline]
     pub fn defer_sync_enabled(&self) -> bool {
         self.defer_sync.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable device-only weight allocation.
+    ///
+    /// When enabled, `copy_weight_from` routes weight uploads through a
+    /// `CudaDeviceBuffer` (pure VRAM/carveout, `cuMemAlloc`) with an
+    /// explicit H2D copy. Disabled (default) keeps the original UMA
+    /// `CudaHostBuffer` fast path. Must be set before any weights are
+    /// uploaded via `copy_weight_from` for the flag to take effect on
+    /// model load.
+    #[inline]
+    pub fn set_weights_device(&self, v: bool) {
+        self.weights_device.store(v, Ordering::Relaxed);
+    }
+
+    /// Query whether device-only weight allocation is enabled.
+    #[inline]
+    pub fn weights_device_enabled(&self) -> bool {
+        self.weights_device.load(Ordering::Relaxed)
     }
 
     /// Launch-site sync wrapper. No-op when `defer_sync` is enabled;
@@ -1660,6 +1696,58 @@ impl Backend for CudaBackend {
                 Arc::new(self.clone()),
             ))
         }
+    }
+
+    /// Weight upload path.
+    ///
+    /// Falls back to `copy_from` unless `--cuda-weights-device` is enabled
+    /// (`weights_device_enabled() == true`) *and* we are running on a UMA
+    /// device. The discrete-GPU branch of `copy_from` already uses managed
+    /// memory which the CUDA driver migrates to VRAM on first access, so
+    /// there is no additional benefit from `cuMemAlloc` there.
+    fn copy_weight_from(&self, src: &Tensor) -> Result<Tensor> {
+        if !self.weights_device_enabled() || self.is_discrete_gpu() {
+            return self.copy_from(src);
+        }
+
+        // If the source is already a `CudaDeviceBuffer` owned by this
+        // backend, re-uploading would (a) issue a no-op H2D (source
+        // `as_ptr()` is null, so `copy_from_host` is skipped and the
+        // fresh destination stays zero-initialised) and (b) waste
+        // bandwidth even if we routed the copy through a D2D memcpy.
+        // Simply reuse the existing buffer — it is already on the
+        // correct backend in the correct place.
+        if src.buffer().as_any().is::<CudaDeviceBuffer>() {
+            return Ok(Tensor::new(
+                src.shape().clone(),
+                src.buffer().clone(),
+                Arc::new(self.clone()),
+            ));
+        }
+
+        self.synchronize()?;
+        let size = src.size();
+        let src_ptr = src.as_ptr();
+        if src_ptr.is_null() {
+            return Err(anyhow!(
+                "copy_weight_from: source has a null host pointer (size={size}, dtype={:?})",
+                src.dtype()
+            ));
+        }
+
+        // Pure device buffer (cuMemAlloc). No host-mapped alias — weights
+        // are read by kernels only. Sampling reads logits; logits are a
+        // separate activation tensor allocated through the normal
+        // workspace path, so staying on device here is safe.
+        let dev_buf = CudaDeviceBuffer::new(size, src.dtype())?;
+        dev_buf
+            .copy_from_host(src_ptr, size)
+            .with_context(|| format!("weight H2D copy ({size} bytes)"))?;
+        Ok(Tensor::new(
+            src.shape().clone(),
+            Arc::new(dev_buf),
+            Arc::new(self.clone()),
+        ))
     }
 }
 

@@ -191,7 +191,16 @@ impl SafetensorsSource {
                 } else {
                     let cpu_tensor =
                         Tensor::new(shape, buffer, self.cpu_backend.clone() as Arc<dyn Backend>);
-                    backend.copy_from(&cpu_tensor)
+                    // Weight tensors (`is_weight == true`) may take the
+                    // backend's device-only weight path when enabled
+                    // (e.g. `--cuda-weights-device`). Norms/biases are
+                    // loaded via `load_raw(..., false, ...)` and stay on
+                    // the zero-copy activation path.
+                    if is_weight {
+                        backend.copy_weight_from(&cpu_tensor)
+                    } else {
+                        backend.copy_from(&cpu_tensor)
+                    }
                 }
             };
 

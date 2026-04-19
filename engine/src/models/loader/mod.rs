@@ -257,7 +257,9 @@ pub fn load_model(
                 );
                 (embed_tokens.clone(), true)
             } else {
-                (backend.copy_from(&embed_tokens)?, false)
+                // Tied lm_head: a real weight — route through the weight
+                // path so `--cuda-weights-device` can take effect.
+                (backend.copy_weight_from(&embed_tokens)?, false)
             }
         }
     };
@@ -276,7 +278,8 @@ pub fn load_model(
         // Tied weights with GPU lm_head: reuse (zero extra memory)
         Some(lm_head.clone())
     } else {
-        match backend.copy_from(&embed_tokens) {
+        // embed_tokens is a static weight — use the weight upload path.
+        match backend.copy_weight_from(&embed_tokens) {
             Ok(gpu_t) => Some(gpu_t),
             Err(e) => {
                 eprintln!(

@@ -488,71 +488,88 @@ impl TransformerModel {
 
     /// Migrate all model weight tensors to CUDA pinned host memory (CudaHostBuffer).
     ///
-    /// Uses `Backend::copy_from()` to allocate pinned memory and memcpy weight data.
-    /// On Jetson (UMA), pinned memory is zero-copy accessible from both CPU and GPU,
-    /// enabling cuBLAS to access the weight data via device pointers.
+    /// Uses `Backend::copy_weight_from()` so the backend's weight-specific
+    /// allocation policy applies (e.g. `--cuda-weights-device` routes
+    /// through a pure `cuMemAlloc` buffer; the default keeps the
+    /// `CudaHostBuffer` zero-copy path). Norms and biases still use
+    /// `copy_from` since they are loaded as activations.
+    ///
+    /// On Jetson (UMA) the default (pinned) path gives zero-copy CPU+GPU
+    /// access; cuBLAS reads via the device pointer companion to the same
+    /// physical allocation.
     ///
     /// Returns the number of tensors migrated.
     #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
     pub fn migrate_weights_to_cuda(&mut self, gpu_backend: &Arc<dyn Backend>) -> Result<usize> {
         let mut count = 0;
 
-        let migrate_one = |t: &Tensor| -> Result<Tensor> { gpu_backend.copy_from(t) };
+        // Weight tensors (matmul operands): follow backend weight policy.
+        let migrate_weight = |t: &Tensor| -> Result<Tensor> { gpu_backend.copy_weight_from(t) };
+        // Norms / biases / the dangling activations still use the zero-copy
+        // pinned host path. They are touched by CPU from time to time
+        // (diagnostics, CPU fallback) and are tiny compared to matmul
+        // weights, so keeping them on UMA is strictly better.
+        let migrate_norm = |t: &Tensor| -> Result<Tensor> { gpu_backend.copy_from(t) };
 
-        macro_rules! migrate {
+        macro_rules! migrate_w {
             ($t:expr) => {
-                $t = migrate_one(&$t)?;
+                $t = migrate_weight(&$t)?;
+                count += 1;
+            };
+        }
+        macro_rules! migrate_n {
+            ($t:expr) => {
+                $t = migrate_norm(&$t)?;
                 count += 1;
             };
         }
 
         for layer in &mut self.layers {
-            migrate!(layer.wq);
-            migrate!(layer.wk);
-            migrate!(layer.wv);
-            migrate!(layer.wo);
-            migrate!(layer.w_gate);
-            migrate!(layer.w_up);
-            migrate!(layer.w_down);
-            migrate!(layer.attention_norm);
-            migrate!(layer.ffn_norm);
+            migrate_w!(layer.wq);
+            migrate_w!(layer.wk);
+            migrate_w!(layer.wv);
+            migrate_w!(layer.wo);
+            migrate_w!(layer.w_gate);
+            migrate_w!(layer.w_up);
+            migrate_w!(layer.w_down);
+            migrate_n!(layer.attention_norm);
+            migrate_n!(layer.ffn_norm);
             if let Some(ref mut bias) = layer.qkv_bias {
-                migrate!(bias.bq);
-                migrate!(bias.bk);
-                migrate!(bias.bv);
+                migrate_n!(bias.bq);
+                migrate_n!(bias.bk);
+                migrate_n!(bias.bv);
             }
             if let Some(ref t) = layer.q_norm {
-                layer.q_norm = Some(migrate_one(t)?);
+                layer.q_norm = Some(migrate_norm(t)?);
                 count += 1;
             }
             if let Some(ref t) = layer.k_norm {
-                layer.k_norm = Some(migrate_one(t)?);
+                layer.k_norm = Some(migrate_norm(t)?);
                 count += 1;
             }
             if let Some(ref t) = layer.pre_ffn_norm {
-                layer.pre_ffn_norm = Some(migrate_one(t)?);
+                layer.pre_ffn_norm = Some(migrate_norm(t)?);
                 count += 1;
             }
             if let Some(ref t) = layer.post_ffn_norm {
-                layer.post_ffn_norm = Some(migrate_one(t)?);
+                layer.post_ffn_norm = Some(migrate_norm(t)?);
                 count += 1;
             }
         }
 
-        migrate!(self.norm);
+        migrate_n!(self.norm);
 
-        // lm_head + embed_tokens: may be large, but Jetson has plenty of unified memory.
-        // Still apply the same size guard for safety.
+        // lm_head + embed_tokens: weights — follow the weight policy.
         let max_alloc = gpu_backend.max_single_alloc();
         if !self.lm_head_on_cpu {
             if self.lm_head.size() <= max_alloc {
-                migrate!(self.lm_head);
+                migrate_w!(self.lm_head);
             } else {
                 self.lm_head_on_cpu = true;
             }
         }
         if self.embed_tokens.size() <= max_alloc {
-            self.gpu_embed_tokens = Some(migrate_one(&self.embed_tokens)?);
+            self.gpu_embed_tokens = Some(migrate_weight(&self.embed_tokens)?);
             count += 1;
         }
 

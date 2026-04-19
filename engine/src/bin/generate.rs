@@ -198,6 +198,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cuda_defer_sync: bool,
 
+    /// Allocate weight tensors in device-only memory (`cuMemAlloc`) instead
+    /// of UMA pinned host memory (`cuMemHostAlloc`) on Jetson.
+    ///
+    /// Jetson integrated GPUs expose the CPU DRAM to CUDA kernels through
+    /// a pinned host-mapped alias, which gives zero-copy but weak L2 cache
+    /// coherency when kernels read and the CPU writes (see llama.cpp
+    /// `ggml-cuda.cu:241`, issue #15034). Weights are written once at load
+    /// time and then read from every kernel for the rest of the run, so
+    /// moving them off the UMA alias is the strongest lever for cache
+    /// ordering without losing zero-copy on per-token activations /
+    /// KV cache. No-op on discrete GPUs (managed memory already migrates
+    /// weights to VRAM on first touch) and on non-CUDA backends.
+    #[arg(long, default_value_t = false)]
+    cuda_weights_device: bool,
+
     /// Model weight data type (f16 or q4). f16 = no quantization, q4 = Q4_0 quantization at load time.
     #[arg(long, default_value = "f16")]
     weight_dtype: String,
@@ -659,6 +674,23 @@ fn main() -> anyhow::Result<()> {
                 eprintln!(
                     "[CUDA] --cuda-defer-sync enabled: per-op syncs suppressed; token-boundary sync only"
                 );
+            }
+            // --cuda-weights-device: route weight uploads through a pure
+            // device allocation (cuMemAlloc + explicit H2D). Must be set
+            // before the model loader runs so every `copy_weight_from`
+            // call sees the flag.
+            #[cfg(feature = "cuda-embedded")]
+            if args.cuda_weights_device {
+                if gpu_concrete.is_discrete_gpu() {
+                    eprintln!(
+                        "[CUDA] --cuda-weights-device ignored on discrete GPU (managed memory already migrates weights to VRAM)"
+                    );
+                } else {
+                    gpu_concrete.set_weights_device(true);
+                    eprintln!(
+                        "[CUDA] --cuda-weights-device enabled: weight tensors allocated via cuMemAlloc (device-only); activations/KV remain host-pinned"
+                    );
+                }
             }
             let gpu: Arc<dyn Backend> = gpu_concrete;
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)

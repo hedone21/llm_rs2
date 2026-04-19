@@ -574,7 +574,7 @@ impl GgufSource {
     }
 
     /// Load a tensor from the GGUF file onto the given backend.
-    fn load_raw(&self, name: &str, _is_weight: bool, backend: &Arc<dyn Backend>) -> Result<Tensor> {
+    fn load_raw(&self, name: &str, is_weight: bool, backend: &Arc<dyn Backend>) -> Result<Tensor> {
         let info = self
             .gguf
             .find_tensor(name)
@@ -591,7 +591,14 @@ impl GgufSource {
 
         // Check if this is a type that needs dequantization to F32 at load time
         if needs_dequant_fallback(info.ggml_type) {
-            return self.load_with_dequant(info.ggml_type, data, num_elements, shape, backend);
+            return self.load_with_dequant(
+                info.ggml_type,
+                data,
+                num_elements,
+                shape,
+                is_weight,
+                backend,
+            );
         }
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
@@ -610,13 +617,15 @@ impl GgufSource {
 
         if is_cpu {
             Ok(cpu_tensor)
+        } else if is_weight {
+            backend.copy_weight_from(&cpu_tensor)
         } else {
             backend.copy_from(&cpu_tensor)
         }
     }
 
     /// Load a tensor as CPU-only.
-    fn load_raw_cpu(&self, name: &str, _is_weight: bool) -> Result<Tensor> {
+    fn load_raw_cpu(&self, name: &str, is_weight: bool) -> Result<Tensor> {
         let info = self
             .gguf
             .find_tensor(name)
@@ -634,6 +643,7 @@ impl GgufSource {
                 data,
                 num_elements,
                 shape,
+                is_weight,
                 &cpu_backend_arc,
             );
         }
@@ -663,6 +673,7 @@ impl GgufSource {
         data: &[u8],
         num_elements: usize,
         shape: Shape,
+        is_weight: bool,
         backend: &Arc<dyn Backend>,
     ) -> Result<Tensor> {
         let type_name = ggml_type_name(ggml_type);
@@ -693,6 +704,8 @@ impl GgufSource {
         let is_cpu = backend.name().contains("CPU");
         if is_cpu {
             Ok(cpu_tensor)
+        } else if is_weight {
+            backend.copy_weight_from(&cpu_tensor)
         } else {
             backend.copy_from(&cpu_tensor)
         }
