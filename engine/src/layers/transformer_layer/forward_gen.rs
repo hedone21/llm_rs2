@@ -1220,6 +1220,7 @@ impl TransformerLayer {
                 partition_path = crate::layers::tensor_partition::PartitionPath::SyncRead;
                 pw.residual_cpu.as_ptr()
             };
+            #[cfg(target_arch = "aarch64")]
             let residual_cpu_dims = if zcopy_residual && !replicate_norm {
                 ws.residual.shape().dims().to_vec()
             } else {
@@ -1279,6 +1280,7 @@ impl TransformerLayer {
             let cpu = &part.cpu_backend;
             #[cfg(target_arch = "aarch64")]
             let cpu_slice_dtype = part.gate.cpu_slice.dtype();
+            #[cfg(target_arch = "aarch64")]
             let k = residual_cpu_dims[residual_cpu_dims.len() - 1];
             #[cfg(target_arch = "aarch64")]
             let used_fused = if cpu.name().contains("CPU") && cpu_slice_dtype == DType::F16 {
