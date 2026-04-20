@@ -30,6 +30,15 @@ pub struct LayerWorkspace {
     /// Pre-allocated scratch buffers for CPU-GPU tensor partition (decode only).
     /// None when tensor partition is disabled.
     pub partition_ws: Option<PartitionWorkspace>,
+    /// Fused-merge carry slots: when `LLMRS_PARTITION_FUSED_MERGE=1`, the
+    /// previous layer's partition FFN end leaves its `down_partial_gpu` and
+    /// `cpu_merge_staging` (CPU partial uploaded) tensors here so the next
+    /// layer's entry can fuse them with the residual + attn_norm into a
+    /// single kernel. Cleared at the start of each forward_into call and
+    /// whenever the path is disabled. The tensors are shallow clones (Arc
+    /// buffers) of `partition_ws.down_partial_gpu` / `cpu_merge_staging`.
+    pub partition_prev_gpu_partial: Option<Tensor>,
+    pub partition_prev_cpu_staging: Option<Tensor>,
 }
 
 impl LayerWorkspace {
@@ -95,6 +104,8 @@ impl LayerWorkspace {
                 down_partial_cpu: retag(pw.down_partial_cpu),
                 cpu_merge_staging: retag(pw.cpu_merge_staging),
             }),
+            partition_prev_gpu_partial: self.partition_prev_gpu_partial.map(&retag),
+            partition_prev_cpu_staging: self.partition_prev_cpu_staging.map(&retag),
         }
     }
 
@@ -124,7 +135,17 @@ impl LayerWorkspace {
             k_cast: None, // Lazily initialized on first use with correct dtype
             v_cast: None,
             partition_ws: None, // Set externally when tensor partition is enabled
+            partition_prev_gpu_partial: None,
+            partition_prev_cpu_staging: None,
         })
+    }
+
+    /// Clear fused-merge carry slots. Called at the start of every
+    /// `forward_into` to ensure layer 0 does not consume stale state from a
+    /// previous token's final layer.
+    pub fn reset_partition_prev(&mut self) {
+        self.partition_prev_gpu_partial = None;
+        self.partition_prev_cpu_staging = None;
     }
 }
 

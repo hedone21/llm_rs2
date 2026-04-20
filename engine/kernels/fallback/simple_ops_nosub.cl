@@ -443,6 +443,60 @@ kernel void kernel_add_rms_norm_oop(
 }
 
 //------------------------------------------------------------------------------
+// Fused 3-input merge + out-of-place RMSNorm — nosub (tree reduction) variant.
+// See simple_ops.cl for full semantics and aliasing rules.
+//------------------------------------------------------------------------------
+kernel void kernel_fused_norm_merge(
+    global float * prior_residual,
+    global float * gpu_partial,
+    global float * cpu_staging,
+    global float * norm_weight,
+    global float * out,
+    global float * residual_out,
+    int dim,
+    float eps,
+    int add_unit,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float * prior_row = prior_residual + row * dim;
+    global float * gpu_row = gpu_partial + row * dim;
+    global float * cpu_row = cpu_staging + row * dim;
+    global float * out_row = out + row * dim;
+    global float * res_out_row = residual_out + row * dim;
+
+    // Reduction order: sum = prior + (gpu + cpu), matching baseline 3-step
+    // path (ws.down = gpu + cpu; x += ws.down). See simple_ops.cl for detail.
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim; i += local_size) {
+        float partial = gpu_row[i] + cpu_row[i];
+        float val = prior_row[i] + partial;
+        res_out_row[i] = val;
+        sum_sq += val * val;
+    }
+
+    scratch[lid] = sum_sq;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = local_size / 2; s > 0; s >>= 1) {
+        if (lid < s) scratch[lid] += scratch[lid + s];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    sum_sq = scratch[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+
+    for (int i = lid; i < dim; i += local_size) {
+        float w = add_unit ? (1.0f + norm_weight[i]) : norm_weight[i];
+        out_row[i] = res_out_row[i] * scale * w;
+    }
+}
+
+//------------------------------------------------------------------------------
 // F16 KV Cache Support Kernels
 //------------------------------------------------------------------------------
 

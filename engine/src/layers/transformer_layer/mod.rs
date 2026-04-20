@@ -268,6 +268,8 @@ impl TransformerLayer {
                 use_gelu_tanh: args.use_gelu_tanh,
                 is_local_attn: args.is_local_attn,
                 local_attn_window: args.local_attn_window,
+                layer_idx: args.layer_id,
+                is_last_layer: args.is_last_layer,
             });
         }
 
@@ -336,6 +338,14 @@ pub struct ForwardGenArgs<'a, C: KVCacheOps = KVCache> {
     pub is_local_attn: Option<bool>,
     /// Gemma3: local attention window size (sliding_window value).
     pub local_attn_window: Option<usize>,
+    /// 0-based layer index. Used by `LLMRS_PARTITION_FUSED_MERGE` to decide
+    /// whether the layer should consume the previous layer's partition
+    /// partial buffers via `fused_norm_merge` (layer_idx > 0).
+    pub layer_idx: usize,
+    /// True when this is the final transformer layer. Used by
+    /// `LLMRS_PARTITION_FUSED_MERGE` to keep the legacy merge + residual
+    /// add path so the final norm + lm_head see the fully accumulated `x`.
+    pub is_last_layer: bool,
 }
 
 pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -365,6 +375,11 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
     pub is_local_attn: Option<bool>,
     /// Gemma3: local attention window size (sliding_window value).
     pub local_attn_window: Option<usize>,
+    /// True when this is the final transformer layer. Consumed by
+    /// `forward_gen` under `LLMRS_PARTITION_FUSED_MERGE` to keep the legacy
+    /// post-FFN residual add on the last layer so the final norm + lm_head
+    /// see the fully accumulated `x`.
+    pub is_last_layer: bool,
 }
 
 // OpProfiler has been moved to crate::profile::ops.

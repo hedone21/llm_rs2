@@ -459,6 +459,16 @@ pub fn partition_trace_enabled() -> bool {
     enabled
 }
 
+/// When `LLMRS_PARTITION_FUSED_MERGE=1`, the tensor-partition decode path
+/// folds the per-layer merge 3-step + residual add + next layer's
+/// attention-norm into a single `fused_norm_merge` kernel call at the next
+/// layer's entry. Reduces 5 inter-kernel barriers to 1 on the OpenCL
+/// in-order queue. Default: off.
+pub fn partition_fused_merge_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| std::env::var("LLMRS_PARTITION_FUSED_MERGE").is_ok_and(|v| v == "1"))
+}
+
 pub fn record_partition_timing(
     sync_ns: u64,
     read_ns: u64,

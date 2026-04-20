@@ -125,6 +125,11 @@ struct KernelCache {
     kernel_kv_scatter_f32_to_f16: CoreKernel,
     kernel_rms_norm_oop: CoreKernel,
     kernel_add_rms_norm_oop: CoreKernel,
+    /// Fused 3-input merge + RMSNorm for tensor-partition layer boundary.
+    /// See `kernel_fused_norm_merge` in `engine/kernels/simple_ops.cl`.
+    kernel_fused_norm_merge: CoreKernel,
+    /// float4 variant (dim % 4 == 0). Selected dynamically in dispatch.
+    kernel_fused_norm_merge_f4: Option<CoreKernel>,
     kernel_flash_attn_f32: Option<CoreKernel>,
     /// Prefill flash attention, F32 Q/KV, head_dim=256 variant
     /// (compiled from `flash_attn_f32.cl` with -DDK=256 -DDV=256 -DBLOCK_M=16).
@@ -944,6 +949,17 @@ impl OpenCLBackend {
                 &simple_ops_program,
                 "kernel_add_rms_norm_oop",
             )?,
+            kernel_fused_norm_merge: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_fused_norm_merge",
+            )?,
+            // f4 variant exists only in the subgroup simple_ops.cl path, not in the
+            // nosub fallback. Fall back to the scalar kernel on nosub platforms.
+            kernel_fused_norm_merge_f4: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_fused_norm_merge_f4",
+            )
+            .ok(),
             kernel_flash_attn_f32: flash_attn_f32_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "flash_attn_f32").ok()),
@@ -3130,6 +3146,81 @@ impl Backend for OpenCLBackend {
             self.enqueue_kernel_labeled(
                 kernel,
                 "rms_norm",
+                1,
+                &global_work_size,
+                Some(local_work_size),
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_norm_merge(
+        &self,
+        prior_residual: &Tensor,
+        gpu_partial: &Tensor,
+        cpu_staging: &Tensor,
+        norm_weight: &Tensor,
+        out: &mut Tensor,
+        residual_out: &mut Tensor,
+        eps: f32,
+        add_unit: bool,
+    ) -> Result<()> {
+        // Determine [rows, dim] from prior_residual shape — residual_out / out / weight
+        // must have matching layout. In the decode path rows=1 (single-token boundary).
+        let dims = prior_residual.shape().dims();
+        if dims.is_empty() {
+            anyhow::bail!("fused_norm_merge: prior_residual has 0 dims");
+        }
+        let dim = dims[dims.len() - 1];
+        let rows: usize = dims[..dims.len() - 1].iter().product::<usize>().max(1);
+
+        let prior_buf = get_cl_mem(prior_residual.buffer().as_ref())
+            .map_err(|_| anyhow!("prior_residual is not OpenCL buffer"))?;
+        let gpu_buf = get_cl_mem(gpu_partial.buffer().as_ref())
+            .map_err(|_| anyhow!("gpu_partial is not OpenCL buffer"))?;
+        let cpu_buf = get_cl_mem(cpu_staging.buffer().as_ref())
+            .map_err(|_| anyhow!("cpu_staging is not OpenCL buffer"))?;
+        let w_buf = get_cl_mem(norm_weight.buffer().as_ref())
+            .map_err(|_| anyhow!("norm_weight is not OpenCL buffer"))?;
+        let out_buf =
+            get_cl_mem(out.buffer().as_ref()).map_err(|_| anyhow!("out is not OpenCL buffer"))?;
+        let res_out_buf = get_cl_mem(residual_out.buffer().as_ref())
+            .map_err(|_| anyhow!("residual_out is not OpenCL buffer"))?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        // Prefer float4 kernel when dim aligns and the subgroup path is available.
+        let kernel = if dim.is_multiple_of(4) {
+            kernels
+                .kernel_fused_norm_merge_f4
+                .as_ref()
+                .unwrap_or(&kernels.kernel_fused_norm_merge)
+        } else {
+            &kernels.kernel_fused_norm_merge
+        };
+
+        let local_size = 64usize;
+        let local_mem_size = local_size * std::mem::size_of::<f32>();
+        let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(prior_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(gpu_buf))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(cpu_buf))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(w_buf))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::mem(res_out_buf))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&(dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 7, ocl::core::ArgVal::scalar(&eps))?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&add_unit_i32))?;
+            ocl::core::set_kernel_arg(kernel, 9, ocl::core::ArgVal::local::<f32>(&local_mem_size))?;
+
+            let global_work_size: [usize; 3] = [rows * local_size, 1, 1];
+            let local_work_size: [usize; 3] = [local_size, 1, 1];
+
+            self.enqueue_kernel_labeled(
+                kernel,
+                "fused_norm_merge",
                 1,
                 &global_work_size,
                 Some(local_work_size),

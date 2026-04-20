@@ -668,6 +668,7 @@ impl TransformerModel {
                 layer_id: i,
                 skip_attn: false,
                 skip_mlp: false,
+                is_last_layer: i + 1 == self.layers.len(),
             })?;
         }
 
@@ -717,6 +718,14 @@ impl TransformerModel {
         let skip_config = args.skip_config;
         let mut importance_collector = args.importance_collector;
         let mut variance_collector = args.variance_collector;
+
+        // Fused-merge carry slots are scoped to a single forward pass; reset
+        // them here so the first layer cannot accidentally consume stale
+        // state from the previous token's final layer (should be None anyway
+        // since the last layer never stashes, but defensive).
+        if let Some(ws) = workspace.as_deref_mut() {
+            ws.reset_partition_prev();
+        }
 
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
@@ -881,6 +890,7 @@ impl TransformerModel {
                         use_gelu_tanh: is_gemma3,
                         is_local_attn: is_local,
                         local_attn_window: self.config.sliding_window,
+                        is_last_layer: i + 1 == self.layers.len(),
                     })?;
                 }
             } else {
@@ -903,6 +913,7 @@ impl TransformerModel {
                     use_gelu_tanh: is_gemma3,
                     is_local_attn: is_local,
                     local_attn_window: self.config.sliding_window,
+                    is_last_layer: i + 1 == self.layers.len(),
                 })?;
             }
 
@@ -1511,6 +1522,10 @@ impl TransformerModel {
         let mut workspace = args.workspace;
         let _importance_collector = args.importance_collector; // unused in offload path
 
+        if let Some(ws) = workspace.as_deref_mut() {
+            ws.reset_partition_prev();
+        }
+
         let batch_size = input_tokens.shape().dims()[0];
         let seq_len = input_tokens.shape().dims()[1];
         let hidden_size = self.config.hidden_size;
@@ -1648,6 +1663,7 @@ impl TransformerModel {
                 use_gelu_tanh: is_gemma3,
                 is_local_attn: is_local_i,
                 local_attn_window: self.config.sliding_window,
+                is_last_layer: i + 1 == num_layers,
             })?;
             let fwd_dur = fwd_t0.elapsed();
             prefetch.record_forward(fwd_dur);

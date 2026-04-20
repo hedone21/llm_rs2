@@ -136,16 +136,56 @@ impl TransformerLayer {
 
         let rms_norm_add_unit = args.rms_norm_add_unit;
         let use_gelu_tanh = args.use_gelu_tanh;
+        let layer_idx = args.layer_idx;
+        let is_last_layer = args.is_last_layer;
+        let partition_fused = crate::layers::tensor_partition::partition_fused_merge_enabled();
 
         // 1. Attention Norm — out-of-place: ws.residual = norm(x), x preserved for skip connection
+        //
+        // Under `LLMRS_PARTITION_FUSED_MERGE=1`, when the previous layer left a
+        // carry via partition_prev_* slots (i.e. layer_idx > 0 and partition
+        // was active), we collapse
+        //     L_{N-1}: copy(gpu→ws.down) + add_assign(ws.down, staging) + add_assign(x, ws.down)
+        //     L_{N}:   rms_norm_oop(x, ws.residual, attn_norm)
+        // into a single `fused_norm_merge(x, prev_gpu, prev_staging, attn_norm, ws.residual, x)`
+        // call. Residual `x` is updated in-place via the `residual_out` slot.
         let t = prof_start!();
-        backend.rms_norm_oop(
-            x,
-            &mut ws.residual,
-            &self.attention_norm,
-            rms_norm_eps,
-            rms_norm_add_unit,
-        )?;
+        let consumed_fused = if partition_fused
+            && layer_idx > 0
+            && ws.partition_prev_gpu_partial.is_some()
+            && ws.partition_prev_cpu_staging.is_some()
+        {
+            let prev_gpu = ws.partition_prev_gpu_partial.take().unwrap();
+            let prev_staging = ws.partition_prev_cpu_staging.take().unwrap();
+            // SAFETY of aliasing: backend contract allows residual_out to alias
+            // prior_residual; here both are `x`. `ws.residual` is a distinct
+            // buffer so the `out` slot is disjoint.
+            // We split the borrow of x manually by using a local clone of the
+            // Tensor handle (Arc'd buffer) as prior_residual input.
+            let x_alias = x.clone();
+            backend.fused_norm_merge(
+                &x_alias,
+                &prev_gpu,
+                &prev_staging,
+                &self.attention_norm,
+                &mut ws.residual,
+                x,
+                rms_norm_eps,
+                rms_norm_add_unit,
+            )?;
+            true
+        } else {
+            false
+        };
+        if !consumed_fused {
+            backend.rms_norm_oop(
+                x,
+                &mut ws.residual,
+                &self.attention_norm,
+                rms_norm_eps,
+                rms_norm_add_unit,
+            )?;
+        }
         prof_record!(t, rms_norm);
 
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
@@ -1268,8 +1308,18 @@ impl TransformerLayer {
             // 3. Merge: ws.down = down_partial_gpu + down_partial_cpu (both [1,1,hidden]).
             //    Upload CPU partial to a GPU staging buffer, then elementwise add.
             let hidden_elems = pw.down_partial_gpu.size() / 4;
-            // Start by moving the GPU partial into ws.down (single GPU→GPU copy).
-            backend.copy_slice(&pw.down_partial_gpu, &mut ws.down, 0, 0, hidden_elems)?;
+            // Fused path: defer the final merge (GPU copy + add_assign) and
+            // the post-FFN residual add to the next layer's attention-norm so
+            // they collapse into a single `fused_norm_merge` kernel. We still
+            // need to upload the CPU partial here because `cpu_merge_staging`
+            // is what `fused_norm_merge` will read on the next layer, and the
+            // blocking write_buffer issued by `copy_slice` is what orders the
+            // CPU partial into the in-order queue ahead of the fused kernel.
+            let defer_merge = partition_fused && !is_last_layer;
+            if !defer_merge {
+                // Legacy path: move the GPU partial into ws.down first.
+                backend.copy_slice(&pw.down_partial_gpu, &mut ws.down, 0, 0, hidden_elems)?;
+            }
             // Upload CPU partial. copy_slice handles CPU→GPU when src is a CPU
             // tensor and dst is a GPU tensor (write_buffer-style transfer).
             backend.copy_slice(
@@ -1279,8 +1329,16 @@ impl TransformerLayer {
                 0,
                 hidden_elems,
             )?;
-            // ws.down += cpu_merge_staging
-            backend.add_assign(&mut ws.down, &pw.cpu_merge_staging)?;
+            if !defer_merge {
+                // ws.down += cpu_merge_staging
+                backend.add_assign(&mut ws.down, &pw.cpu_merge_staging)?;
+            } else {
+                // Stash alias handles for the next layer's fused entry. These
+                // are shallow Tensor clones (Arc<dyn Buffer>) that keep the
+                // GPU backing live without any additional allocation or copy.
+                ws.partition_prev_gpu_partial = Some(pw.down_partial_gpu.clone());
+                ws.partition_prev_cpu_staging = Some(pw.cpu_merge_staging.clone());
+            }
 
             if let (Some(t0), Some(t_read), Some(t_cpu), Some(t_gpu)) =
                 (t0, t_read, t_cpu_done, t_gpu_done)
@@ -1389,7 +1447,17 @@ impl TransformerLayer {
         if let Some(ref pfn) = self.post_ffn_norm {
             backend.rms_norm(&mut ws.down, pfn, rms_norm_eps, true)?;
         }
-        backend.add_assign(x, &ws.down)?;
+        // Fused path: under LLMRS_PARTITION_FUSED_MERGE, on non-last partition
+        // layers we deferred the merge itself (ws.down is not the full sum)
+        // *and* this `x += ws.down` residual add. Both are absorbed into the
+        // next layer's `fused_norm_merge(x, prev_gpu, prev_staging, ...)`
+        // call, which performs `residual_out = x + prev_gpu + prev_staging`
+        // in a single kernel. Skip the scalar add here to avoid double-counting.
+        let skip_final_add =
+            partition_fused && partition_active && !is_last_layer && self.post_ffn_norm.is_none();
+        if !skip_final_add {
+            backend.add_assign(x, &ws.down)?;
+        }
         prof_record!(t, add_assign);
 
         if let Some(ref mut p) = profiler {

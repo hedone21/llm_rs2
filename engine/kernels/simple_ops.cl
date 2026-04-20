@@ -260,6 +260,154 @@ kernel void kernel_add_rms_norm_oop_f4(
     }
 }
 
+// Fused 3-input merge + out-of-place RMSNorm for tensor-partition layer boundary.
+//
+// Replaces the decode-path layer merge (copy_slice gpu->down, copy_slice cpu->staging,
+// add_assign(down,staging), residual+=down) + next-layer RMSNorm with a single kernel.
+// Computes:
+//     sum[i]          = prior_residual[i] + gpu_partial[i] + cpu_staging[i]
+//     residual_out[i] = sum[i]                          (updated residual for next layer)
+//     out[i]          = (sum[i] / rms(sum)) * w_eff[i]  (pre-attention norm output)
+// where w_eff = (1 + norm_weight) when add_unit != 0 (Gemma3 convention) else norm_weight.
+//
+// Buffer aliasing: `residual_out` MAY alias `prior_residual` (same cl_mem) for an in-place
+// residual update — the kernel reads every input once before writing `residual_out`, so the
+// overlap is safe. `out` MUST NOT alias any input. The other three inputs MUST be distinct.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_fused_norm_merge(
+    global float * prior_residual,
+    global float * gpu_partial,
+    global float * cpu_staging,
+    global float * norm_weight,
+    global float * out,
+    global float * residual_out,
+    int dim,
+    float eps,
+    int add_unit,           // Gemma3 style: weight = 1 + weight when nonzero
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float * prior_row = prior_residual + row * dim;
+    global float * gpu_row = gpu_partial + row * dim;
+    global float * cpu_row = cpu_staging + row * dim;
+    global float * out_row = out + row * dim;
+    global float * res_out_row = residual_out + row * dim;
+
+    // Phase 1: sum = prior + (gpu + cpu); residual_out = sum; accumulate sum_sq
+    //
+    // Reduction order MUST match the baseline 3-step path so generated
+    // tokens stay bit-exact with fused off:
+    //   baseline:  ws.down = gpu + cpu;  x = prior + ws.down
+    // Evaluating as `prior + gpu + cpu` (left-to-right) would reduce as
+    // `(prior + gpu) + cpu` and drift one-ULP per element.
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim; i += local_size) {
+        float partial = gpu_row[i] + cpu_row[i];
+        float val = prior_row[i] + partial;
+        res_out_row[i] = val;
+        sum_sq += val * val;
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    // Phase 2: normalize & apply weight (reads residual_out to support in-place prior_residual aliasing)
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+
+    for (int i = lid; i < dim; i += local_size) {
+        float w = add_unit ? (1.0f + norm_weight[i]) : norm_weight[i];
+        out_row[i] = res_out_row[i] * scale * w;
+    }
+}
+
+// Vectorized fused norm-merge (float4). dim must be multiple of 4.
+// Same semantics as kernel_fused_norm_merge; see notes above for aliasing rules.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_fused_norm_merge_f4(
+    global float * prior_residual,
+    global float * gpu_partial,
+    global float * cpu_staging,
+    global float * norm_weight,
+    global float * out,
+    global float * residual_out,
+    int dim,
+    float eps,
+    int add_unit,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float4 * prior_v = (global float4 *)(prior_residual + row * dim);
+    global float4 * gpu_v = (global float4 *)(gpu_partial + row * dim);
+    global float4 * cpu_v = (global float4 *)(cpu_staging + row * dim);
+    global float4 * w_v = (global float4 *)norm_weight;
+    global float4 * out_v = (global float4 *)(out + row * dim);
+    global float4 * res_out_v = (global float4 *)(residual_out + row * dim);
+    int dim_v = dim >> 2;
+
+    // Phase 1 — see scalar variant for reduction-order rationale.
+    // Order: v = prior + (gpu + cpu), matching baseline `x += (ws.down = gpu + cpu)`.
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 partial = gpu_v[i] + cpu_v[i];
+        float4 v = prior_v[i] + partial;
+        res_out_v[i] = v;
+        sum_sq += dot(v, v);
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+    float4 ones = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 w = w_v[i];
+        if (add_unit) w = w + ones;
+        out_v[i] = res_out_v[i] * scale * w;
+    }
+}
+
 // Out-of-place variant: reads from x, writes to out (x is preserved).
 // Used to eliminate copy_residual in the forward pass.
 #ifdef ADRENO_GPU

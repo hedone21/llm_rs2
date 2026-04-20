@@ -106,6 +106,45 @@ pub trait Backend: Send + Sync {
         self.add_assign(x, residual)?;
         self.rms_norm_oop(x, out, w, eps, add_unit)
     }
+
+    /// Fused 3-input merge + out-of-place RMS norm for tensor-partition layer boundary.
+    ///
+    /// Replaces the decode-path per-layer merge sequence
+    ///     (copy_slice gpu → buf, copy_slice cpu → staging, add_assign, residual += buf)
+    /// plus the next layer's pre-attention RMSNorm with a single kernel dispatch,
+    /// eliminating three inter-kernel barriers on the OpenCL in-order queue.
+    ///
+    /// Semantics:
+    ///   residual_out[i] = prior_residual[i] + gpu_partial[i] + cpu_staging[i]
+    ///   out[i]          = (residual_out[i] / rms(residual_out)) * w_eff[i]
+    /// where `w_eff = (1 + norm_weight)` when `add_unit` is true (Gemma3) else `norm_weight`.
+    ///
+    /// Buffer aliasing: `residual_out` MAY alias `prior_residual` for an in-place residual
+    /// update. `out` MUST NOT alias any input. The three partial inputs MUST be distinct
+    /// buffers.
+    ///
+    /// Default implementation: composes the existing 3-step path for correctness and for
+    /// backends that do not override (CPU, CUDA, and OpenCL fallback during bring-up).
+    /// The OpenCL backend overrides with the fused kernel.
+    #[allow(clippy::too_many_arguments)]
+    fn fused_norm_merge(
+        &self,
+        prior_residual: &Tensor,
+        gpu_partial: &Tensor,
+        cpu_staging: &Tensor,
+        norm_weight: &Tensor,
+        out: &mut Tensor,
+        residual_out: &mut Tensor,
+        eps: f32,
+        add_unit: bool,
+    ) -> Result<()> {
+        // Default path: residual_out = prior + gpu + cpu; out = norm(residual_out) * w.
+        // Copy prior into residual_out, then add gpu and cpu contributions.
+        self.copy_into(prior_residual, residual_out)?;
+        self.add_assign(residual_out, gpu_partial)?;
+        self.add_assign(residual_out, cpu_staging)?;
+        self.rms_norm_oop(residual_out, out, norm_weight, eps, add_unit)
+    }
     fn softmax(&self, x: &mut Tensor) -> Result<()>;
 
     // Rotate
