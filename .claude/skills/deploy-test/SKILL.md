@@ -69,12 +69,31 @@ python3 ./.agent/skills/testing/scripts/stress_test_adb.py \
 | `models/llama3.2-1b/` (safetensors) | Safetensors 비교/폴백 전용 |
 
 ```bash
-# 호스트에 다운로드
+# 호스트에 Safetensors 다운로드
 huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
 
 # 디바이스에 푸시 (최초 1회)
 adb push models/llama3.2-1b /data/local/tmp/models/llama3.2-1b
 ```
+
+### Safetensors → GGUF 변환
+
+프로젝트 내장 변환 스크립트 사용 (llm.rs + llama.cpp 양쪽 호환):
+
+```bash
+# F16 (모든 2D weight + embed F16, norm F32)
+python scripts/convert_safetensors_to_gguf.py --outtype f16 \
+    models/qwen2.5-1.5b \
+    models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
+
+# Q4_0 (2D weight quantized, embed F16, norm F32 — 기본값)
+python scripts/convert_safetensors_to_gguf.py --outtype q4_0 \
+    models/qwen2.5-1.5b \
+    models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+```
+
+지원 아키텍처: llama, qwen2, gemma/gemma2/gemma3. 기본 `--outtype`은 `q4_0`.
+
 
 ## Device Registry
 

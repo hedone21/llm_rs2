@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Convert safetensors F16 model to Q4_0 GGUF compatible with both llm.rs and llama.cpp.
+"""Convert safetensors model to GGUF (Q4_0 hybrid or F16) compatible with llm.rs and llama.cpp.
 
 Usage:
+    # Q4_0 (default, 2D weights quantized, embed F16, norm F32)
     python scripts/convert_safetensors_to_gguf.py \
         models/qwen2.5-1.5b \
-        models/qwen2.5-1.5b-q4_0.gguf
+        models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+
+    # F16 (all 2D weights + embed F16, norm F32)
+    python scripts/convert_safetensors_to_gguf.py \
+        --outtype f16 \
+        models/qwen2.5-1.5b \
+        models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf
 """
-import sys, json, struct, os
+import sys, json, struct, os, argparse
 import numpy as np
 from pathlib import Path
 from safetensors import safe_open
@@ -273,12 +280,17 @@ def load_tokenizer(model_dir: Path):
 # ---------- Main ----------
 
 def main():
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <safetensors_dir> <output.gguf>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Convert safetensors to GGUF (Q4_0 hybrid or F16).")
+    parser.add_argument("model_dir", type=Path, help="Directory containing *.safetensors + config.json")
+    parser.add_argument("output_path", type=str, help="Output .gguf path")
+    parser.add_argument("--outtype", choices=["q4_0", "f16"], default="q4_0",
+                        help="Output weight type (default: q4_0)")
+    args = parser.parse_args()
 
-    model_dir = Path(sys.argv[1])
-    output_path = sys.argv[2]
+    model_dir = args.model_dir
+    output_path = args.output_path
+    outtype = args.outtype
+    print(f"Output type: {outtype}")
 
     # Load config.json
     config = json.loads((model_dir / "config.json").read_text())
@@ -310,9 +322,9 @@ def main():
 
     print(f"Found {len(tensor_names)} tensors in {len(st_files)} file(s)")
 
-    # Classify tensors: which to quantize vs keep as F32
-    weight_2d = set()  # 2D weight tensors → Q4_0
-    norm_1d = set()    # 1D norm/bias tensors → F32
+    # Classify tensors: 2D weights (outtype-dependent) vs norm/embed (F32/F16)
+    weight_2d = set()  # 2D weight tensors → Q4_0 or F16 depending on outtype
+    norm_1d = set()    # 1D norm/bias → F32, embed → F16
 
     for name in tensor_names:
         h = handles[tensor_names[name]]
@@ -324,12 +336,12 @@ def main():
             # needs direct indexing. Also serves as lm_head via weight tying.
             norm_1d.add(name)
         else:
-            if shape[-1] % QK4_0 == 0:
-                weight_2d.add(name)
-            else:
+            if outtype == "q4_0" and shape[-1] % QK4_0 != 0:
                 norm_1d.add(name)  # can't quantize, keep as F32
+            else:
+                weight_2d.add(name)
 
-    print(f"  Q4_0: {len(weight_2d)}, F32/F16: {len(norm_1d)}")
+    print(f"  2D-weight ({outtype}): {len(weight_2d)}, norm/embed: {len(norm_1d)}")
 
     # Prepare tensor data
     tensors = []  # (gguf_name, dims_gguf, ggml_type, data_bytes)
@@ -365,9 +377,14 @@ def main():
         dims_gguf = list(reversed(shape))
 
         if hf_name in weight_2d:
-            f32 = tensor.astype(np.float32).flatten()
-            data = quantize_q4_0(f32)
-            tensors.append((gguf_name, dims_gguf, GGML_Q4_0, data))
+            if outtype == "q4_0":
+                f32 = tensor.astype(np.float32).flatten()
+                data = quantize_q4_0(f32)
+                tensors.append((gguf_name, dims_gguf, GGML_Q4_0, data))
+            else:  # f16
+                f16 = tensor.astype(np.float32).astype(np.float16)
+                data = f16.tobytes()
+                tensors.append((gguf_name, dims_gguf, GGML_F16, data))
         elif "embed_tokens" in hf_name:
             # Embedding: store as F16 (saves 50% vs F32, used by gather lookup)
             f16 = tensor.astype(np.float32).astype(np.float16)
@@ -416,7 +433,8 @@ def main():
     # --- Model architecture metadata ---
     add_str("general.architecture", arch)
     add_str("general.name", config.get("_name_or_path", model_dir.name))
-    add_u32("general.file_type", 2)  # GGML_FTYPE_MOSTLY_Q4_0
+    # GGML_FTYPE: MOSTLY_F16=1, MOSTLY_Q4_0=2
+    add_u32("general.file_type", 2 if outtype == "q4_0" else 1)
 
     add_u32(f"{arch}.embedding_length", config["hidden_size"])
     add_u32(f"{arch}.block_count", config["num_hidden_layers"])
