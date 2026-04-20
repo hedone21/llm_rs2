@@ -200,6 +200,16 @@ pub struct CudaBackend {
     kernels: Arc<CudaKernels>,
     /// Cached F16 cast buffer for matmul_transposed F32×F16 path.
     cast_cache: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
+    /// Reusable device buffer for per-call attention score readback
+    /// (Phase B: resilience/eviction GPU path). Holds normalized softmax weights
+    /// in layout `[num_heads_q, score_stride]` F32. Allocated lazily on first
+    /// score-enabled `attention_gen` call and grown on demand. `None` when
+    /// score readback has not yet been requested.
+    ///
+    /// For UMA (Jetson) this uses `CudaHostBuffer` so kernel writes are
+    /// automatically visible to the CPU without an explicit `memcpy_dtoh`.
+    /// For discrete GPUs the same path works via managed-memory migration.
+    score_tmp_buf: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
     /// When `true`, launch-helper `maybe_sync_cat` calls are no-ops
     /// (suppresses every per-op sync). Explicit `Backend::synchronize()`
     /// and API-boundary syncs (read_buffer/copy_from/cast's CPU-read
@@ -293,6 +303,7 @@ impl CudaBackend {
             }),
             kernels: Arc::new(kernels),
             cast_cache: Arc::new(std::sync::Mutex::new(None)),
+            score_tmp_buf: Arc::new(std::sync::Mutex::new(None)),
             defer_sync: Arc::new(AtomicBool::new(false)),
             sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
         };
@@ -1311,8 +1322,12 @@ impl Backend for CudaBackend {
         let v_ptr = Self::get_device_ptr(v_cache.buffer().as_ref());
         let out_ptr = Self::get_device_ptr(out.buffer().as_ref());
 
-        // If scores_out is requested or device pointers are unavailable, use CPU fallback.
-        if scores_out.is_some() {
+        // Q4_0 KV cache is not supported by the GPU attention_gen kernels; always
+        // take the CPU path for that dtype. Also, if any of the input tensors
+        // lack a CUDA device pointer (non-CUDA buffer), we must fall back.
+        let kv_dtype_ok = matches!(kv_dtype, DType::F32 | DType::F16);
+        let all_ptrs = q_ptr.is_some() && k_ptr.is_some() && v_ptr.is_some() && out_ptr.is_some();
+        if !kv_dtype_ok || !all_ptrs {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return cpu_fallback().attention_gen(
                 q,
@@ -1327,102 +1342,140 @@ impl Backend for CudaBackend {
             );
         }
 
-        if let (Some(qp), Some(kp), Some(vp), Some(op)) = (q_ptr, k_ptr, v_ptr, out_ptr) {
-            // Shared memory: cache_seq_len floats for scores
-            let shmem = (cache_seq_len * std::mem::size_of::<f32>()) as u32;
-            let block_size = 256u32;
-            let cfg = LaunchConfig {
-                grid_dim: (num_heads_q as u32, 1, 1),
-                block_dim: (block_size, 1, 1),
-                shared_mem_bytes: shmem,
-            };
-            let nhq = num_heads_q as i32;
-            let nkv = num_heads_kv as i32;
-            let hd = head_dim as i32;
-            // KV cache is HeadMajor: capacity is derived from the k_cache tensor shape.
-            let k_dims = k_cache.shape().dims().to_vec();
-            let cap = if k_dims.len() >= 3 {
-                k_dims[k_dims.len() - 2] as i32
-            } else {
-                cache_seq_len as i32
-            };
-            let csl = cache_seq_len as i32;
-            let stream = self.ctx.default_stream();
+        // GPU path (F32 / F16 KV). Phase B: if `scores_out` is requested, bind
+        // a reusable device-visible score buffer to the kernel, then copy it
+        // back to the caller-provided CPU slice after the launch syncs. When
+        // `scores_out` is None the kernel receives a NULL score pointer and
+        // avoids any extra global writes (zero overhead on the hot path).
+        let qp = q_ptr.unwrap();
+        let kp = k_ptr.unwrap();
+        let vp = v_ptr.unwrap();
+        let op = out_ptr.unwrap();
 
-            match kv_dtype {
-                DType::F32 => {
-                    // SAFETY: qp, kp, vp, op are valid F32 device ptrs with correct dimensions.
-                    unsafe {
-                        stream
-                            .launch_builder(&self.kernels.flash_attn_f32)
-                            .arg(&qp)
-                            .arg(&kp)
-                            .arg(&vp)
-                            .arg(&op)
-                            .arg(&nhq)
-                            .arg(&nkv)
-                            .arg(&hd)
-                            .arg(&cap)
-                            .arg(&csl)
-                            .launch(cfg)
-                            .map_err(|e| anyhow!("attention_gen_f32 kernel launch failed: {e}"))?;
-                    }
-                    self.maybe_sync_cat(SyncCat::Attention)?;
-                    Ok(())
+        // Prepare scores buffer + stride (row length per head) before kernel launch.
+        // We pin the MutexGuard for the duration of the launch so the
+        // underlying CudaHostBuffer lives at least until the device sync below.
+        let (score_dptr, score_stride_i32, scratch_guard) = if let Some(ref slice) = scores_out {
+            let stride = if num_heads_q == 0 {
+                0
+            } else {
+                slice.len() / num_heads_q
+            };
+            if stride == 0 || stride < cache_seq_len {
+                // Malformed caller buffer: disable GPU score export to avoid OOB.
+                (0u64, 0i32, None)
+            } else {
+                let need_bytes = num_heads_q
+                    .checked_mul(stride)
+                    .and_then(|n| n.checked_mul(std::mem::size_of::<f32>()))
+                    .ok_or_else(|| anyhow!("score buffer size overflow"))?;
+                let mut guard = self.score_tmp_buf.lock().unwrap();
+                let need_realloc = guard
+                    .as_ref()
+                    .map(|b| b.size() < need_bytes)
+                    .unwrap_or(true);
+                if need_realloc {
+                    *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
                 }
-                DType::F16 => {
-                    // SAFETY: kp and vp are valid F16 device ptrs; qp and op are F32.
-                    unsafe {
-                        stream
-                            .launch_builder(&self.kernels.flash_attn_f16kv)
-                            .arg(&qp)
-                            .arg(&kp)
-                            .arg(&vp)
-                            .arg(&op)
-                            .arg(&nhq)
-                            .arg(&nkv)
-                            .arg(&hd)
-                            .arg(&cap)
-                            .arg(&csl)
-                            .launch(cfg)
-                            .map_err(|e| {
-                                anyhow!("attention_gen_f16kv kernel launch failed: {e}")
-                            })?;
-                    }
-                    self.maybe_sync_cat(SyncCat::Attention)?;
-                    Ok(())
-                }
-                _ => {
-                    // Q4_0 or unsupported: sync then CPU fallback
-                    self.maybe_sync_cat(SyncCat::FallbackPre)?;
-                    cpu_fallback().attention_gen(
-                        q,
-                        k_cache,
-                        v_cache,
-                        out,
-                        num_heads_q,
-                        num_heads_kv,
-                        head_dim,
-                        cache_seq_len,
-                        None,
-                    )
-                }
+                let dptr = guard.as_ref().unwrap().device_ptr();
+                (dptr, stride as i32, Some(guard))
             }
         } else {
-            // Missing device pointers: sync then CPU fallback
-            self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback().attention_gen(
-                q,
-                k_cache,
-                v_cache,
-                out,
-                num_heads_q,
-                num_heads_kv,
-                head_dim,
-                cache_seq_len,
-                None,
-            )
+            (0u64, 0i32, None)
+        };
+
+        // Shared memory: cache_seq_len floats for scores
+        let shmem = (cache_seq_len * std::mem::size_of::<f32>()) as u32;
+        let block_size = 256u32;
+        let cfg = LaunchConfig {
+            grid_dim: (num_heads_q as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: shmem,
+        };
+        let nhq = num_heads_q as i32;
+        let nkv = num_heads_kv as i32;
+        let hd = head_dim as i32;
+        // KV cache is HeadMajor: capacity is derived from the k_cache tensor shape.
+        let k_dims = k_cache.shape().dims().to_vec();
+        let cap = if k_dims.len() >= 3 {
+            k_dims[k_dims.len() - 2] as i32
+        } else {
+            cache_seq_len as i32
+        };
+        let csl = cache_seq_len as i32;
+        let stream = self.ctx.default_stream();
+
+        match kv_dtype {
+            DType::F32 => {
+                // SAFETY: qp, kp, vp, op are valid F32 device ptrs with correct dimensions.
+                // score_dptr is either a valid device ptr (when scores_out is Some and
+                // the scratch buffer is large enough) or 0 (NULL), which the kernel
+                // treats as "skip score export".
+                unsafe {
+                    stream
+                        .launch_builder(&self.kernels.flash_attn_f32)
+                        .arg(&qp)
+                        .arg(&kp)
+                        .arg(&vp)
+                        .arg(&op)
+                        .arg(&nhq)
+                        .arg(&nkv)
+                        .arg(&hd)
+                        .arg(&cap)
+                        .arg(&csl)
+                        .arg(&score_dptr)
+                        .arg(&score_stride_i32)
+                        .launch(cfg)
+                        .map_err(|e| anyhow!("attention_gen_f32 kernel launch failed: {e}"))?;
+                }
+            }
+            DType::F16 => {
+                // SAFETY: kp and vp are valid F16 device ptrs; qp and op are F32.
+                unsafe {
+                    stream
+                        .launch_builder(&self.kernels.flash_attn_f16kv)
+                        .arg(&qp)
+                        .arg(&kp)
+                        .arg(&vp)
+                        .arg(&op)
+                        .arg(&nhq)
+                        .arg(&nkv)
+                        .arg(&hd)
+                        .arg(&cap)
+                        .arg(&csl)
+                        .arg(&score_dptr)
+                        .arg(&score_stride_i32)
+                        .launch(cfg)
+                        .map_err(|e| anyhow!("attention_gen_f16kv kernel launch failed: {e}"))?;
+                }
+            }
+            _ => unreachable!("kv_dtype_ok gate already restricted to F32/F16"),
         }
+
+        // If a CPU-side `scores_out` was requested and the kernel wrote into
+        // the scratch device buffer, sync and copy back. UMA (Jetson) makes
+        // this a zero-copy view; discrete GPUs trigger managed-memory
+        // migration into pinned host memory on CPU read. We sync explicitly
+        // here regardless of `defer_sync` because the caller expects the
+        // slice to be valid immediately after return.
+        if let (Some(scratch), Some(dst)) = (scratch_guard, scores_out) {
+            let stride = score_stride_i32 as usize;
+            let total = num_heads_q * stride;
+            self.synchronize()?;
+            // SAFETY: scratch is a CudaHostBuffer with at least
+            // total*sizeof(f32) bytes (we sized it above). The kernel has
+            // just written `num_heads_q` rows of `cache_seq_len` floats each
+            // at stride `stride`. We read the full flat region.
+            let host_ptr = scratch.as_ref().unwrap().as_ptr() as *const f32;
+            unsafe {
+                let src = std::slice::from_raw_parts(host_ptr, total);
+                let copy_len = dst.len().min(total);
+                dst[..copy_len].copy_from_slice(&src[..copy_len]);
+            }
+        } else {
+            self.maybe_sync_cat(SyncCat::Attention)?;
+        }
+        Ok(())
     }
 
     // --- Memory ops ---

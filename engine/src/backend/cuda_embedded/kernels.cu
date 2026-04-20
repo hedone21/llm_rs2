@@ -307,13 +307,22 @@ extern "C" __global__ void gather_f16(
 // grid=(n_heads_q, 1, 1), block=(BLOCK_SIZE, 1, 1)
 // HeadMajor layout: k_cache[kv_h, pos, d] = k_cache[kv_h * capacity * head_dim + pos * head_dim + d]
 // shared memory: cache_seq_len floats for scores + 33 floats for reduction scratch
+//
+// Optional post-softmax score export (Phase B: resilience/eviction):
+//   scores_out: if non-NULL, layout [n_heads_q, score_stride] float32. Each head h
+//               writes `cache_seq_len` normalized weights to scores_out[h*stride..].
+//   score_stride: row stride in floats (>= cache_seq_len).
+//   When scores_out == NULL (score_stride ignored), the kernel behaves identically
+//   to the pre-Phase-B version (no additional writes, no branching in hot loop).
 extern "C" __global__ void attention_gen_f32_naive(
     const float * q,
     const float * k_cache,
     const float * v_cache,
     float * out,
     int n_heads_q, int kv_heads, int head_dim,
-    int capacity, int cache_seq_len)
+    int capacity, int cache_seq_len,
+    float * __restrict__ scores_out,
+    int score_stride)
 {
     int h = blockIdx.x;
     int kv_h = h / (n_heads_q / kv_heads);
@@ -360,6 +369,16 @@ extern "C" __global__ void attention_gen_f32_naive(
         scores[t] *= inv_sum;
     __syncthreads();
 
+    // Optional: export post-softmax scores for eviction policies (H2O/D2O/QCF).
+    // Branch on NULL is uniform across all threads in the block, so predication
+    // has no divergence cost. When disabled, the loop body is never entered.
+    if (scores_out != nullptr) {
+        float * scores_row = scores_out + (size_t)h * (size_t)score_stride;
+        for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+            scores_row[t] = scores[t];
+        }
+    }
+
     // Phase 3: Weighted sum of V -- each thread handles a subset of head_dim
     float * out_vec = out + h * head_dim;
     for (int d = tid; d < head_dim; d += blockDim.x) {
@@ -375,13 +394,16 @@ extern "C" __global__ void attention_gen_f32_naive(
 // 14. Attention gen NAIVE (single query decode, F16 KV cache)
 // =================================================================
 // Retained as fallback. Prefer flash_attn_decode_f16kv.
+// See attention_gen_f32_naive for scores_out / score_stride semantics.
 extern "C" __global__ void attention_gen_f16kv_naive(
     const float * q,
     const half * k_cache,
     const half * v_cache,
     float * out,
     int n_heads_q, int kv_heads, int head_dim,
-    int capacity, int cache_seq_len)
+    int capacity, int cache_seq_len,
+    float * __restrict__ scores_out,
+    int score_stride)
 {
     int h = blockIdx.x;
     int kv_h = h / (n_heads_q / kv_heads);
@@ -423,6 +445,15 @@ extern "C" __global__ void attention_gen_f16kv_naive(
     for (int t = tid; t < cache_seq_len; t += blockDim.x)
         scores[t] *= inv_sum;
     __syncthreads();
+
+    // Optional: export post-softmax scores (Phase B resilience path). Uniform
+    // NULL check across the block; disabled path has no hot-loop overhead.
+    if (scores_out != nullptr) {
+        float * scores_row = scores_out + (size_t)h * (size_t)score_stride;
+        for (int t = tid; t < cache_seq_len; t += blockDim.x) {
+            scores_row[t] = scores[t];
+        }
+    }
 
     // Phase 3: V weighted sum (F16 V dequantized on-the-fly)
     float * out_vec = out + h * head_dim;
