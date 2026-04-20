@@ -1432,8 +1432,13 @@ fn main() -> anyhow::Result<()> {
     // Always build accumulator for eval-ll when any eviction policy is active:
     // sliding mode needs it to populate last_step_head_attn for QCF-ATTN v2.
     let has_eviction_policy = args.eviction_policy != "none";
-    let needs_accumulator =
-        needs_score_based || needs_caote || args.enable_resilience || has_eviction_policy;
+    // Note: --enable-resilience does NOT force accumulator. Resilience actions
+    // (KvEvict, SwitchHw, Throttle, etc.) don't need attention scores. QCF dry-run
+    // estimates gracefully fall back to uniform weights when accumulator is absent
+    // (compute_qcf_estimates at line ~4882). Coupling removed 2026-04-20 — forcing
+    // accumulator disabled the GPU decode plan (~25% slowdown) for no correctness
+    // benefit in sliding/streaming/none eviction scenarios.
+    let needs_accumulator = needs_score_based || needs_caote || has_eviction_policy;
     // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
     let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote || has_eviction_policy;
 
