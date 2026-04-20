@@ -94,21 +94,41 @@ python scripts/convert_safetensors_to_gguf.py --outtype q4_0 \
 
 지원 아키텍처: llama, qwen2, gemma/gemma2/gemma3. 기본 `--outtype`은 `q4_0`.
 
-### GGUF 호스트 CPU 검증 (llm.rs vs llama.cpp 비교)
+### GGUF 호스트 CPU 비교 테스트 (llm.rs vs llama.cpp)
 
-동일 GGUF로 양쪽 엔진 출력 비교:
+용도별 도구 매트릭스:
+
+| 비교 항목 | 도구 | 비고 |
+|----------|------|------|
+| **성능** (prefill/decode t/s) | `llama-bench` | 표준. 커스텀 prompt 불가, 길이·KV dtype·depth 자유 |
+| **텍스트 출력 sanity** | `llama-simple` | greedy만. seed/temp 제어 불가 |
+| **품질 (PPL)** | `llama-perplexity` | 표준 dataset 필요 |
+
+**성능 비교 (기본 워크플로우)**:
 
 ```bash
-# llm.rs CPU (seed/temp 제어 가능)
-./target/release/generate -b cpu -m <gguf> -p "The capital of France is" \
-    -n 24 --temperature 0
+# llama.cpp 기준값
+/home/go/Workspace/llama.cpp/build-host/bin/llama-bench \
+    -m models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf \
+    -p 128,512,2048 -n 32,128 -t 8 -ctk f16 -ctv f16 -r 3 -o md
 
-# llama.cpp (llama-simple, 최소 옵션 바이너리)
-/home/go/Workspace/llama.cpp/build-host/bin/llama-simple -m <gguf> -n 24 \
-    "The capital of France is"
+# llm.rs 동일 조건
+./target/release/generate -b cpu \
+    -m models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf \
+    -p "$(printf 'x %.0s' {1..512})" -n 128 --temperature 0
+# → stderr의 "Prefill: ... tok/s"와 "Decode: ... tok/s" 라인 수집
 ```
 
-**주의**: `llama-cli` (983df14+)는 `--no-conversation` 미지원, `llama-completion`은 Qwen2 base model에서 토큰 반복 버그. 비교 테스트는 반드시 `llama-simple` 사용. 미빌드 시: `cd /home/go/Workspace/llama.cpp/build-host && cmake --build . --target llama-simple -j$(nproc)`.
+**텍스트 sanity check**:
+
+```bash
+/home/go/Workspace/llama.cpp/build-host/bin/llama-simple -m <gguf> -n 24 \
+    "The capital of France is"
+./target/release/generate -b cpu -m <gguf> -p "The capital of France is" \
+    -n 24 --temperature 0
+```
+
+**주의**: `llama-cli` (983df14+)는 `--no-conversation` 미지원, `llama-completion`은 Qwen2 base에서 토큰 반복 버그. `llama-bench`/`llama-simple`은 영향 없음. 미빌드 시: `cd /home/go/Workspace/llama.cpp/build-host && cmake --build . --target llama-bench llama-simple -j$(nproc)`.
 
 
 ## Device Registry
