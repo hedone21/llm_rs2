@@ -1127,10 +1127,19 @@ impl TransformerLayer {
             let async_read =
                 partition_async_read_enabled() && !zcopy_residual && !skip_sync && is_gpu;
             let mut pending_read_evt: Option<crate::core::backend::GpuEvent> = None;
+            // Track which path was taken for trace accounting.
+            let partition_path;
             let residual_cpu_ptr: *const u8 = if zcopy_residual {
                 if !skip_sync {
                     backend.synchronize()?;
                 }
+                // Zcopy has no DMA read; record sync completion immediately so
+                // the dma_ns window is 0 for this path.
+                if part_trace {
+                    let t_zcopy_sync_done = std::time::Instant::now();
+                    TLS_T_SYNC_DONE.with(|c| c.set(Some(t_zcopy_sync_done)));
+                }
+                partition_path = crate::layers::tensor_partition::PartitionPath::Zcopy;
                 ws.residual.as_ptr()
             } else if async_read {
                 // Non-blocking DMA read — no prior `synchronize()`, enqueue_read
@@ -1149,6 +1158,7 @@ impl TransformerLayer {
                     // will be accounted for in the dma_read segment below.
                     TLS_T_SYNC_DONE.with(|c| c.set(Some(t_async_start)));
                 }
+                partition_path = crate::layers::tensor_partition::PartitionPath::AsyncRead;
                 pw.residual_cpu.as_ptr()
             } else {
                 // Explicit sync first so we can time the drain independently
@@ -1171,6 +1181,7 @@ impl TransformerLayer {
                         backend.read_buffer(&ws.residual, dst)?;
                     }
                 }
+                partition_path = crate::layers::tensor_partition::PartitionPath::SyncRead;
                 pw.residual_cpu.as_ptr()
             };
             let residual_cpu_dims = if zcopy_residual {
@@ -1358,6 +1369,7 @@ impl TransformerLayer {
                     cpu_ns,
                     gpu_wait_ns,
                     merge_ns,
+                    partition_path,
                 );
             }
         } else if is_cpu_f16 && is_decode {

@@ -450,6 +450,28 @@ static PART_MERGE_NS: AtomicU64 = AtomicU64::new(0);
 static PART_LAYER_COUNT: AtomicU64 = AtomicU64::new(0);
 const TRACE_SUMMARY_PERIOD: u64 = 28; // every decode token (28 layers)
 
+// Path distribution counters.
+static PART_ZCOPY_COUNT: AtomicU64 = AtomicU64::new(0);
+static PART_ASYNC_COUNT: AtomicU64 = AtomicU64::new(0);
+static PART_SYNC_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
+
+// Per-path sync_ns aggregates:
+//   zcopy     — synchronize() with zero-copy residual (no DMA read).
+//   non_zcopy — async_read or sync+read_buffer paths (both use DMA after sync).
+static PART_SYNC_NS_ZCOPY: AtomicU64 = AtomicU64::new(0);
+static PART_SYNC_NS_NONZCOPY: AtomicU64 = AtomicU64::new(0);
+
+/// Which residual-transfer path was taken for a given partition layer call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PartitionPath {
+    /// Zero-copy path: residual already CPU-visible via mapped host pointer.
+    Zcopy,
+    /// Async DMA read path: non-blocking `enqueue_read_buffer_async` + deferred `wait_event`.
+    AsyncRead,
+    /// Synchronous path: blocking `synchronize()` followed by `read_buffer`.
+    SyncRead,
+}
+
 pub fn partition_trace_enabled() -> bool {
     static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let enabled = std::env::var_os("LLMRS_PARTITION_TRACE").is_some();
@@ -475,14 +497,32 @@ pub fn record_partition_timing(
     cpu_ns: u64,
     gpu_wait_ns: u64,
     merge_ns: u64,
+    path: PartitionPath,
 ) {
     PART_SYNC_NS.fetch_add(sync_ns, Ordering::Relaxed);
     PART_READ_NS.fetch_add(read_ns, Ordering::Relaxed);
     PART_CPU_NS.fetch_add(cpu_ns, Ordering::Relaxed);
     PART_GPU_WAIT_NS.fetch_add(gpu_wait_ns, Ordering::Relaxed);
     PART_MERGE_NS.fetch_add(merge_ns, Ordering::Relaxed);
+
+    // Update path distribution counters + per-path sync_ns aggregates.
+    match path {
+        PartitionPath::Zcopy => {
+            PART_ZCOPY_COUNT.fetch_add(1, Ordering::Relaxed);
+            PART_SYNC_NS_ZCOPY.fetch_add(sync_ns, Ordering::Relaxed);
+        }
+        PartitionPath::AsyncRead => {
+            PART_ASYNC_COUNT.fetch_add(1, Ordering::Relaxed);
+            PART_SYNC_NS_NONZCOPY.fetch_add(sync_ns, Ordering::Relaxed);
+        }
+        PartitionPath::SyncRead => {
+            PART_SYNC_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
+            PART_SYNC_NS_NONZCOPY.fetch_add(sync_ns, Ordering::Relaxed);
+        }
+    }
+
     let count = PART_LAYER_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if count % TRACE_SUMMARY_PERIOD == 0 {
+    if count.is_multiple_of(TRACE_SUMMARY_PERIOD) {
         print_partition_trace_summary(count);
     }
 }
@@ -509,6 +549,33 @@ pub fn print_partition_trace_summary(count: u64) {
         "[partition-trace] layers={} avg/layer: sync_drain={:.2}ms dma_read={:.2}ms cpu_matmul={:.2}ms gpu_wait={:.2}ms merge={:.2}ms — bottleneck: {}",
         count, sync, read, cpu, gpu_wait, merge, bottleneck
     );
+
+    // Path distribution + per-path sync_ns averages.
+    let zcopy_n = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
+    let async_n = PART_ASYNC_COUNT.load(Ordering::Relaxed);
+    let sync_read_n = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
+    let zcopy_avg = if zcopy_n > 0 {
+        format!(
+            "{:.2}ms",
+            PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed) as f64 / zcopy_n as f64 / 1e6
+        )
+    } else {
+        "n/a".to_string()
+    };
+    let nonzcopy_n = async_n + sync_read_n;
+    let nonzcopy_avg = if nonzcopy_n > 0 {
+        format!(
+            "{:.2}ms",
+            PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed) as f64 / nonzcopy_n as f64 / 1e6
+        )
+    } else {
+        "n/a".to_string()
+    };
+    println!(
+        "[partition-trace] path dist: zcopy={} async={} sync_read={} — sync_ns zcopy={} non_zcopy={}",
+        zcopy_n, async_n, sync_read_n, zcopy_avg, nonzcopy_avg
+    );
+
     use std::io::Write;
     let _ = std::io::stdout().flush();
 }
@@ -1188,5 +1255,99 @@ mod tests {
 
         let result = output.as_slice::<f32>();
         assert_eq!(result, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    // PA-T1-PATHCNT: record_partition_timing increments the correct path counter
+    // and accumulates sync_ns into the correct per-path aggregate.
+    #[test]
+    fn test_record_partition_timing_path_counters() {
+        // Snapshot counters before the test calls.
+        let zcopy_before = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
+        let async_before = PART_ASYNC_COUNT.load(Ordering::Relaxed);
+        let sync_before = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
+        let zcopy_ns_before = PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed);
+        let nonzcopy_ns_before = PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed);
+        let layer_before = PART_LAYER_COUNT.load(Ordering::Relaxed);
+
+        // Call with Zcopy path: sync_ns=1000, rest 0.
+        record_partition_timing(1_000, 0, 0, 0, 0, PartitionPath::Zcopy);
+        assert_eq!(
+            PART_ZCOPY_COUNT.load(Ordering::Relaxed),
+            zcopy_before + 1,
+            "Zcopy counter should increment by 1"
+        );
+        assert_eq!(
+            PART_ASYNC_COUNT.load(Ordering::Relaxed),
+            async_before,
+            "AsyncRead counter must not change for Zcopy call"
+        );
+        assert_eq!(
+            PART_SYNC_PATH_COUNT.load(Ordering::Relaxed),
+            sync_before,
+            "SyncRead counter must not change for Zcopy call"
+        );
+        assert_eq!(
+            PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed),
+            zcopy_ns_before + 1_000,
+            "zcopy sync_ns aggregate should increase by 1000"
+        );
+        assert_eq!(
+            PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed),
+            nonzcopy_ns_before,
+            "non_zcopy sync_ns aggregate must not change for Zcopy call"
+        );
+
+        // Snapshot again before AsyncRead call.
+        let zcopy_before2 = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
+        let async_before2 = PART_ASYNC_COUNT.load(Ordering::Relaxed);
+        let nonzcopy_ns_before2 = PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed);
+
+        // Call with AsyncRead path: sync_ns=500.
+        record_partition_timing(500, 200, 0, 0, 0, PartitionPath::AsyncRead);
+        assert_eq!(
+            PART_ASYNC_COUNT.load(Ordering::Relaxed),
+            async_before2 + 1,
+            "AsyncRead counter should increment by 1"
+        );
+        assert_eq!(
+            PART_ZCOPY_COUNT.load(Ordering::Relaxed),
+            zcopy_before2,
+            "Zcopy counter must not change for AsyncRead call"
+        );
+        assert_eq!(
+            PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed),
+            nonzcopy_ns_before2 + 500,
+            "non_zcopy sync_ns aggregate should increase by 500 for AsyncRead"
+        );
+
+        // Snapshot again before SyncRead call.
+        let sync_before3 = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
+        let nonzcopy_ns_before3 = PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed);
+        let layer_before3 = PART_LAYER_COUNT.load(Ordering::Relaxed);
+
+        // Call with SyncRead path: sync_ns=2000.
+        record_partition_timing(2_000, 300, 100, 50, 10, PartitionPath::SyncRead);
+        assert_eq!(
+            PART_SYNC_PATH_COUNT.load(Ordering::Relaxed),
+            sync_before3 + 1,
+            "SyncRead counter should increment by 1"
+        );
+        assert_eq!(
+            PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed),
+            nonzcopy_ns_before3 + 2_000,
+            "non_zcopy sync_ns aggregate should increase by 2000 for SyncRead"
+        );
+        assert_eq!(
+            PART_LAYER_COUNT.load(Ordering::Relaxed),
+            layer_before3 + 1,
+            "layer count should increment by 1"
+        );
+
+        // Verify the overall layer count increased by 3 across all three calls.
+        assert_eq!(
+            PART_LAYER_COUNT.load(Ordering::Relaxed),
+            layer_before + 3,
+            "total layer count should have increased by 3"
+        );
     }
 }
