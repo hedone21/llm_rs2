@@ -1,0 +1,11 @@
+engine,model,run,prefill_tok_s,decode_tok_s,prefill_ms,decode_ms_per_tok,prompt_tokens,temp_before_max_mC,temp_after_max_mC
+llm.rs-gpu,f16,r1,127.8,14.8,1025.10,67.52,131,38000,56100
+llm.rs-gpu,f16,r2,127.5,14.8,1027.34,67.50,131,36900,54200
+llm.rs-gpu,f16,r3,127.9,14.8,1023.89,67.55,131,36500,53000
+llm.rs-gpu,f16,r3_mean_stdev,127.73±0.21,14.80±0.00,1025.4,67.52,131,,
+llm.rs-gpu,q4_0,r1,115.4,27.9,1135.46,35.86,131,36100,52300
+llm.rs-gpu,q4_0,r2,115.0,27.8,1139.48,35.92,131,35300,48000
+llm.rs-gpu,q4_0,r3,114.7,27.8,1142.59,35.92,131,35700,48000
+llm.rs-gpu,q4_0,r3_mean_stdev,115.03±0.35,27.83±0.06,1139.2,35.90,131,,
+llama.cpp-gpu,f16,r3_mean_stdev,202.80±0.82,18.67±0.04,,,128,33800,57600
+llama.cpp-gpu,q4_0,r3_mean_stdev,615.22±3.97,32.43±1.96,,,128,34200,55700

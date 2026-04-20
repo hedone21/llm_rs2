@@ -1,0 +1,25 @@
+[Config] Using 8 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Migrated 339 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 
+Token Length: 201
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[WARMUP] tokens=1 ms=302.92
+[Profile] Event: PrefillStart
+Prefill: 2474.52 ms (201 tokens, 81.2 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 1[part-dbg] forward_gen entered, ws.partition_ws.is_some()=false
+00 times
+Done.
+[Profile] Event: End
+TTFT: 2866.23 ms
+Decode: 28.72 ms/tok (34.8 tok/s) [3 tokens, forward only]
+Decode(excl tok[0]): 28.87 ms/tok (34.6 tok/s) [2 tokens] | tok[0]=28.43 ms
+Avg TBT: 32.08 ms (31.2 tokens/sec)

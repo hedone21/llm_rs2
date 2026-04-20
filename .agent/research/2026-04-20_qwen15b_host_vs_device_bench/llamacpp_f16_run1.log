@@ -1,0 +1,11 @@
+=== temp snapshot before run ===
+2026-04-20T15:12:45 cpuss-0-0=36100 cpuss-0-1=36100 cpuss-1-0=34900 cpuss-1-1=35300 gpuss-0=35000 gpuss-1=35000 gpuss-2=35000 gpuss-3=35000 gpuss-4=35000 gpuss-5=35400 gpuss-6=35400 gpuss-7=34600
+=== llama-bench F16 r=3 ===
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen2 1.5B F16                 |   2.88 GiB |     1.54 B | CPU        |       6 |           pp128 |        108.49 ± 3.63 |
+| qwen2 1.5B F16                 |   2.88 GiB |     1.54 B | CPU        |       6 |           tg128 |         19.76 ± 0.03 |
+
+build: 983df14 (1)
+=== temp snapshot after run ===
+2026-04-20T15:13:11 cpuss-0-0=72200 cpuss-0-1=70700 cpuss-1-0=66900 cpuss-1-1=67600 gpuss-0=60300 gpuss-1=60300 gpuss-2=60000 gpuss-3=60000 gpuss-4=63500 gpuss-5=63500 gpuss-6=62300 gpuss-7=61500

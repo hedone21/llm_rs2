@@ -1,0 +1,96 @@
+=== manager pgrep ===
+30760 /data/local/tmp/llm_manager --policy-script /data/local/tmp/noop_policy.lua --transport tcp:127.0.0.1:38701
+=== manager log (pre-connect) ===
+[2026-04-20T06:31:00Z INFO  llm_manager] Config not found, using defaults
+[2026-04-20T06:31:00Z INFO  llm_manager] LLM Manager starting (poll_interval=1000ms)
+[2026-04-20T06:31:00Z INFO  llm_manager::channel::tcp] [TcpChannel] Listening on 127.0.0.1:38701
+[2026-04-20T06:31:00Z INFO  llm_manager] TCP transport: waiting for client on 127.0.0.1:38701 (timeout=60s)...
+=== temp snapshot before run ===
+2026-04-20T15:31:02 cpuss-0-0=36900 cpuss-0-1=36500 cpuss-1-0=35300 cpuss-1-1=35700 gpuss-0=35400 gpuss-1=35000 gpuss-2=35000 gpuss-3=35400 gpuss-4=35400 gpuss-5=35400 gpuss-6=35800 gpuss-7=35000
+=== llm.rs generate ===
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Backend] CPU primary, GPU secondary available (SwitchHw ready)
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Migrated 339 weight tensors to GPU zero-copy (ALLOC_HOST_PTR)
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 
+Token Length: 131
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+[Resilience] Executor enabled — transport: tcp:127.0.0.1:38701
+[Resilience] Capability sent to Manager
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[WARMUP] tokens=1 ms=459.94
+[Profile] Event: PrefillStart
+Prefill: 2060.37 ms (131 tokens, 63.6 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 1[part-dbg] forward_gen entered, ws.partition_ws.is_some()=false
+00% of these sentences are true, false or nonsense? To determine whether all 12 sentences are true, false, or nonsense based on "The Quick Brown Fox Jumps Over The Lazy Dog," we need to analyze each sentence and compare it with the original statement.
+
+Sentence #1: "The quick brown fox jumps over the lazy dog."
+This is a paraphrase of the original statement. It means that if you were to jump over a lazy dog, you would be jumping over one that's not as fast or agile as others. So this sentence is true.
+
+Sentence #2: "The quick brown fox jumps over
+Done.
+[Profile] Event: End
+TTFT: 2593.29 ms
+Decode: 32.44 ms/tok (30.8 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 32.32 ms/tok (30.9 tok/s) [126 tokens] | tok[0]=47.00 ms
+Avg TBT: 32.92 ms (30.4 tokens/sec)
+=== temp snapshot after run ===
+2026-04-20T15:31:13 cpuss-0-0=66500 cpuss-0-1=64900 cpuss-1-0=58400 cpuss-1-1=59600 gpuss-0=51000 gpuss-1=51400 gpuss-2=51800 gpuss-3=51800 gpuss-4=56100 gpuss-5=55700 gpuss-6=53700 gpuss-7=52900
+=== manager log (post-run) ===
+[2026-04-20T06:31:00Z INFO  llm_manager] Config not found, using defaults
+[2026-04-20T06:31:00Z INFO  llm_manager] LLM Manager starting (poll_interval=1000ms)
+[2026-04-20T06:31:00Z INFO  llm_manager::channel::tcp] [TcpChannel] Listening on 127.0.0.1:38701
+[2026-04-20T06:31:00Z INFO  llm_manager] TCP transport: waiting for client on 127.0.0.1:38701 (timeout=60s)...
+[2026-04-20T06:31:06Z INFO  llm_manager::channel::tcp] [TcpChannel] Client connected from 127.0.0.1:42224
+[2026-04-20T06:31:06Z INFO  llm_manager] Transport: TcpChannel
+[2026-04-20T06:31:06Z INFO  llm_manager::monitor::energy] [EnergyMonitor] No battery found, will report defaults
+[2026-04-20T06:31:06Z INFO  llm_manager] Monitors: 4
+[2026-04-20T06:31:06Z INFO  llm_manager::monitor::memory] [MemoryMonitor] Starting (interval=1000ms)
+[2026-04-20T06:31:06Z INFO  llm_manager] Started 4 monitor threads
+[2026-04-20T06:31:06Z INFO  llm_manager::monitor::thermal] [ThermalMonitor] Starting (interval=1000ms)
+[2026-04-20T06:31:06Z INFO  llm_manager::lua_policy] LuaPolicy loaded from /data/local/tmp/noop_policy.lua
+[2026-04-20T06:31:06Z INFO  llm_manager] LuaPolicy initialized from /data/local/tmp/noop_policy.lua
+[2026-04-20T06:31:06Z INFO  llm_manager] Entering main loop
+[2026-04-20T06:31:06Z INFO  llm_manager] Engine capability: devices=["cpu", "opencl"]
+[2026-04-20T06:31:06Z INFO  llm_manager::monitor::compute] [ComputeMonitor] Starting (interval=1000ms)
+[2026-04-20T06:31:06Z INFO  llm_manager::monitor::energy] [EnergyMonitor] Starting (interval=1000ms, battery=none)
+[2026-04-20T06:31:06Z INFO  llm_manager::monitor::thermal] [ThermalMonitor] Monitoring all 32 zones
+[2026-04-20T06:31:06Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5713072128, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:06Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:06Z INFO  llm_manager] Signal: ThermalAlert { level: Normal, temperature_mc: 56900, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T06:31:07Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5047570432, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:07Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:07Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 45.90163934426229, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:07Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 94200, throttling_active: false, throttle_ratio: 0.3 }
+[2026-04-20T06:31:08Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5029376000, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:08Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:08Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 62.96758104738155, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:08Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 91500, throttling_active: false, throttle_ratio: 0.3 }
+[2026-04-20T06:31:09Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5050585088, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:09Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:09Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 65.43837357052097, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:09Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 96900, throttling_active: false, throttle_ratio: 0.3 }
+[2026-04-20T06:31:10Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5050339328, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:10Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:10Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 66.49746192893402, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:10Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 83400, throttling_active: false, throttle_ratio: 0.3 }
+[2026-04-20T06:31:11Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5049585664, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:11Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:11Z INFO  llm_manager] Signal: ComputeGuidance { level: Warning, recommended_backend: Gpu, reason: CpuBottleneck, cpu_usage_pct: 72.56857855361596, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:11Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 99200, throttling_active: false, throttle_ratio: 0.3 }
+[2026-04-20T06:31:12Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5049540608, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:12Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:12Z INFO  llm_manager] Signal: ComputeGuidance { level: Warning, recommended_backend: Gpu, reason: CpuBottleneck, cpu_usage_pct: 71.17572692793932, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:12Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 96900, throttling_active: false, throttle_ratio: 0.3 }
+[2026-04-20T06:31:13Z INFO  llm_manager::channel::tcp] [TcpChannel] Reader thread exited — connection lost
+[2026-04-20T06:31:13Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 7286779904, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T06:31:13Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T06:31:13Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 51.76767676767676, gpu_usage_pct: 0.0 }
+[2026-04-20T06:31:13Z INFO  llm_manager] Signal: ThermalAlert { level: Emergency, temperature_mc: 87200, throttling_active: false, throttle_ratio: 0.3 }
+=== done ===
