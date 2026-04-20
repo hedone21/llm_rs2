@@ -616,14 +616,12 @@ fn main() -> anyhow::Result<()> {
                 ) {
                     Ok(gpu_concrete) => {
                         let gpu_concrete = Arc::new(gpu_concrete);
-                        let gm: Arc<dyn Memory> = Arc::new(
-                            llm_rs2::backend::opencl::memory::OpenCLMemory::new_with_caps(
+                        let gm: Arc<dyn Memory> =
+                            Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
                                 gpu_concrete.context.clone(),
                                 gpu_concrete.queue.clone(),
                                 args.zero_copy,
-                                gpu_concrete.qcom_capabilities,
-                            ),
-                        );
+                            ));
                         let g = gpu_concrete as Arc<dyn Backend>;
                         eprintln!(
                             "[Backend] CPU primary, GPU secondary available (SwitchHw ready)"
@@ -667,14 +665,12 @@ fn main() -> anyhow::Result<()> {
             {
                 eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
             }
-            let gpu_mem: Arc<dyn Memory> = Arc::new(
-                llm_rs2::backend::opencl::memory::OpenCLMemory::new_with_caps(
+            let gpu_mem: Arc<dyn Memory> =
+                Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
                     gpu_concrete.context.clone(),
                     gpu_concrete.queue.clone(),
                     effective_zero_copy,
-                    gpu_concrete.qcom_capabilities,
-                ),
-            );
+                ));
             let gpu: Arc<dyn Backend> = gpu_concrete;
             // GPU is primary; keep a ref as secondary for SwitchHw round-trip
             (gpu.clone(), gpu_mem.clone(), Some(gpu), Some(gpu_mem), true)
