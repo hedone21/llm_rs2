@@ -2713,6 +2713,7 @@ fn main() -> anyhow::Result<()> {
         let mut prefill_logits = Tensor::new(logits_shape, prefill_logits_buf, backend.clone());
 
         let prefill_timer = std::time::Instant::now();
+        let mut prefill_pure_fwd_ms: f64 = 0.0;
         let total_chunks = process_len.div_ceil(chunk_size);
 
         // Report prefill start to resilience manager.
@@ -2769,11 +2770,12 @@ fn main() -> anyhow::Result<()> {
                 prefill_workspace: None,
             })?;
             backend.synchronize()?;
+            let t_fwd_end = std::time::Instant::now();
+            let fwd_ms = (t_fwd_end - t_setup_end).as_secs_f64() * 1000.0;
+            prefill_pure_fwd_ms += fwd_ms;
             if chunk_trace {
-                let now = std::time::Instant::now();
                 let setup_ms = (t_setup_end - t_chunk_start).as_secs_f64() * 1000.0;
-                let fwd_ms = (now - t_setup_end).as_secs_f64() * 1000.0;
-                let total_ms = (now - t_chunk_start).as_secs_f64() * 1000.0;
+                let total_ms = (t_fwd_end - t_chunk_start).as_secs_f64() * 1000.0;
                 eprintln!(
                     "[PREFILL_CHUNK] idx={} start_pos={} len={} setup_ms={:.2} fwd_ms={:.2} total_ms={:.2}",
                     chunk_idx, chunk_start_pos, chunk_len, setup_ms, fwd_ms, total_ms
@@ -3081,6 +3083,12 @@ fn main() -> anyhow::Result<()> {
             prefill_forward_ms,
             process_len,
             process_len as f64 / (prefill_forward_ms / 1000.0),
+        );
+        eprintln!(
+            "Prefill(pure fwd): {:.2} ms ({} tokens, {:.1} tok/s) [sync'd forward only, comparable to llama-bench pp]",
+            prefill_pure_fwd_ms,
+            process_len,
+            process_len as f64 / (prefill_pure_fwd_ms / 1000.0),
         );
         _last_token_time = std::time::Instant::now();
 
