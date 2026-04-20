@@ -1837,7 +1837,7 @@ fn main() -> anyhow::Result<()> {
 
             if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                 eprintln!(
-                    "[Partition] Direction A compute-replication ENABLED (CPU runs add_rms_norm_oop in parallel with GPU; LLMRS_PARTITION_REPLICATE_NORM=0 to disable)"
+                    "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
                 );
             } else {
                 eprintln!(
@@ -3281,7 +3281,7 @@ fn main() -> anyhow::Result<()> {
 
             if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                 eprintln!(
-                    "[Partition] Direction A compute-replication ENABLED (CPU runs add_rms_norm_oop in parallel with GPU; LLMRS_PARTITION_REPLICATE_NORM=0 to disable)"
+                    "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
                 );
             } else {
                 eprintln!(
@@ -4182,7 +4182,7 @@ fn main() -> anyhow::Result<()> {
                                         )?);
                                         if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                                             eprintln!(
-                                                "[Partition] Direction A compute-replication ENABLED (CPU runs add_rms_norm_oop in parallel with GPU; LLMRS_PARTITION_REPLICATE_NORM=0 to disable)"
+                                                "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
                                             );
                                         } else {
                                             eprintln!(
@@ -4393,7 +4393,7 @@ fn main() -> anyhow::Result<()> {
                                     gen_ws.partition_ws = Some(ws);
                                     if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                                         eprintln!(
-                                            "[Partition] Direction A compute-replication ENABLED (CPU runs add_rms_norm_oop in parallel with GPU; LLMRS_PARTITION_REPLICATE_NORM=0 to disable)"
+                                            "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
                                         );
                                     } else {
                                         eprintln!(

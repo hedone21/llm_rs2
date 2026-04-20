@@ -507,8 +507,17 @@ pub fn partition_fused_merge_enabled() -> bool {
 /// `attn_out` is ready, so the host wait window overlaps with the GPU
 /// FFN chain enqueue.
 ///
-/// Set `LLMRS_PARTITION_REPLICATE_NORM=0` to disable and fall back to the
-/// legacy 3-way (zcopy / async_read / sync_read) residual DMA path.
+/// Default: **disabled**. Galaxy S25 measurements (2026-04-20) found this
+/// path regresses Q4_0 by +12 ms/tok and F16 by +32 ms/tok, and produces
+/// divergent token IDs because `add_rms_norm_oop` mutates `x` in place on
+/// the GPU before the async x-read lands, causing the CPU replica to
+/// double-add `attn_out`. The structural premise (CPU bears the extra
+/// norm cost for free) also fails — CPU `add_rms_norm_oop` costs
+/// 0.8–1.5 ms/layer, which exceeds the 0.4 ms/layer `sync_drain` it
+/// replaces. Kept as dead path for future investigation under
+/// GPU-bottleneck regimes (e.g. larger models, prefill workloads).
+///
+/// Set `LLMRS_PARTITION_REPLICATE_NORM=1` to re-enable for experimentation.
 ///
 /// NOTE: `OnceLock` caches the decision process-wide on first read, so
 /// changing the env var after the first partition layer runs has no effect.
@@ -516,8 +525,8 @@ pub fn partition_replicate_norm_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("LLMRS_PARTITION_REPLICATE_NORM")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 
