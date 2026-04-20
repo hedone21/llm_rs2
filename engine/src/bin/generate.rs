@@ -1432,13 +1432,19 @@ fn main() -> anyhow::Result<()> {
     // Always build accumulator for eval-ll when any eviction policy is active:
     // sliding mode needs it to populate last_step_head_attn for QCF-ATTN v2.
     let has_eviction_policy = args.eviction_policy != "none";
-    // Note: --enable-resilience does NOT force accumulator. Resilience actions
-    // (KvEvict, SwitchHw, Throttle, etc.) don't need attention scores. QCF dry-run
-    // estimates gracefully fall back to uniform weights when accumulator is absent
-    // (compute_qcf_estimates at line ~4882). Coupling removed 2026-04-20 — forcing
-    // accumulator disabled the GPU decode plan (~25% slowdown) for no correctness
-    // benefit in sliding/streaming/none eviction scenarios.
-    let needs_accumulator = needs_score_based || needs_caote || has_eviction_policy;
+    // --enable-resilience forces accumulator on: the manager can request Evict
+    // at any runtime moment, and `compute_qcf_estimates` (~line 4882) falls back
+    // to uniform weights without scores, which corrupts action-cost ranks
+    // (measured: h2o/d2o collapse to 0, sliding inflates +312%).
+    // Originally decoupled 2026-04-20 because forcing the CPU accumulator
+    // disabled the GPU decode plan (~25% slowdown). Now re-coupled after
+    // Phase A/B (flash_attn score output, commits 3096de4 + 28d8fe4): the
+    // accumulator coexists with the GPU plan and overhead is <1%
+    // (Adreno 37.4 t/s, Jetson overhead 1.8–4.3%).
+    let needs_accumulator = needs_score_based
+        || needs_caote
+        || args.enable_resilience
+        || has_eviction_policy;
     // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
     let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote || has_eviction_policy;
 
