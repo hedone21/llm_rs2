@@ -1142,7 +1142,7 @@ mod tests {
         for (rank, &(idx, _)) in gen_rank_pairs.iter().enumerate() {
             score_ranks[idx] = rank as f64;
         }
-        let mut pos_ranks: Vec<f64> = (0..gen_positions.len()).map(|i| i as f64).collect();
+        let pos_ranks: Vec<f64> = (0..gen_positions.len()).map(|i| i as f64).collect();
         let rank_n = pos_ranks.len() as f64;
         let pos_rank_mean = pos_ranks.iter().sum::<f64>() / rank_n;
         let score_rank_mean = score_ranks.iter().sum::<f64>() / rank_n;

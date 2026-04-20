@@ -2760,6 +2760,7 @@ impl OpenCLBackend {
     /// Returns Ok(true) if the kernel was dispatched; Ok(false) if preconditions
     /// are not met and the caller should fall back to the legacy attention kernel.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn flash_attention_decode_gpu(
         &self,
         q: &Tensor,
@@ -2770,6 +2771,12 @@ impl OpenCLBackend {
         n_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
+        // Optional post-softmax score output. When `Some((buf, layer_offset, stride))`,
+        // the kernel writes per-token weights into
+        // `buf[layer_offset + head_idx * stride + t]` (matches the
+        // `GpuScoreAccumulator` layout in `gpu_score.rs`). `None` forces the
+        // dummy buffer + `write_scores=0` fast path.
+        score_buf: Option<(&ocl::core::Mem, i32, i32)>,
     ) -> Result<bool> {
         // Only F16 KV on HeadMajor GPU buffer is supported.
         if k_cache.dtype() != DType::F16 {
@@ -2888,6 +2895,17 @@ impl OpenCLBackend {
             // sinks = NULL (args 38-39)
             ocl::core::set_kernel_arg(kernel, 38, ocl::core::ArgVal::mem_null())?;
             ocl::core::set_kernel_arg(kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
+            // Post-softmax score output (args 40-43). The kernel requires a
+            // valid buffer even when `write_scores=0`; bind the backend-wide
+            // 1-element dummy in that case.
+            let (s_buf, s_layer_offset, s_stride, write_scores) = match score_buf {
+                Some((buf, off, stride)) => (buf, off, stride, 1i32),
+                None => (&self.dummy_score_buf, 0i32, 0i32, 0i32),
+            };
+            ocl::core::set_kernel_arg(kernel, 40, ocl::core::ArgVal::mem(s_buf))?;
+            ocl::core::set_kernel_arg(kernel, 41, ocl::core::ArgVal::scalar(&s_layer_offset))?;
+            ocl::core::set_kernel_arg(kernel, 42, ocl::core::ArgVal::scalar(&s_stride))?;
+            ocl::core::set_kernel_arg(kernel, 43, ocl::core::ArgVal::scalar(&write_scores))?;
 
             // Q1_WG_SIZE = 64 (compile-time constant in the kernel)
             const Q1_WG_SIZE: usize = 64;
@@ -2913,7 +2931,12 @@ impl OpenCLBackend {
     ///
     /// Only supports F16 HeadMajor KV cache (same prerequisite as flash decode).
     /// Returns `Ok(true)` on success, `Ok(false)` if the kernel is unavailable.
+    ///
+    /// Deprecated: the flash attention Q1 kernel now writes post-softmax
+    /// scores directly via the `score_buf` parameter. This helper is retained
+    /// for out-of-band diagnostics/tests only.
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     fn compute_scores_gpu(
         &self,
         q: &Tensor,
@@ -3771,7 +3794,7 @@ impl Backend for OpenCLBackend {
         num_heads_kv: usize,
         head_dim: usize,
         cache_seq_len: usize,
-        mut scores_out: Option<&mut [f32]>,
+        scores_out: Option<&mut [f32]>,
     ) -> Result<()> {
         // Flash-attention decode fast path: single-pass online softmax, vectorized
         // float4 K/V reads, no local-memory output reduction. Used when none of the
@@ -3781,11 +3804,36 @@ impl Backend for OpenCLBackend {
         // When scores_out is requested, we still use flash attention for the output
         // vector and dispatch a separate lightweight score-only kernel (Q*K^T + softmax)
         // instead of falling back to the slow kernel_attn_gen_half.
-        let gpu_acc_active = {
+        // Flash attention path — now also supports GPU score accumulator
+        // writes directly from the Q1 kernel, so the legacy
+        // `kernel_attn_gen_half` fallback is only needed for non-GPU-acc
+        // score readback (plan.rs handles this via the Standard variant).
+        let gpu_acc_score_triple: Option<(ocl::core::Mem, i32, i32)> = {
             let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
-            gpu_acc.as_ref().is_some_and(|acc| acc.is_active())
+            gpu_acc.as_ref().and_then(|acc| {
+                if acc.is_active() {
+                    let offset = acc.layer_offset_elems(acc.current_layer_idx()) as i32;
+                    let stride = acc.score_stride() as i32;
+                    // SAFETY: clone the cl_mem handle — OpenCL reference
+                    // counting keeps the underlying allocation alive while
+                    // the accumulator owns it.
+                    Some((acc.score_buf_mem().clone(), offset, stride))
+                } else {
+                    None
+                }
+            })
         };
-        if !gpu_acc_active
+
+        let flash_score_arg = gpu_acc_score_triple
+            .as_ref()
+            .map(|(buf, off, stride)| (buf, *off, *stride));
+
+        // When the CPU wants readback via `scores_out` (no GPU acc), we fall
+        // back to the legacy path below since `scores_out` expects the result
+        // in CPU memory. The GPU score accumulator path fully replaces the
+        // slow kernel_attn_gen_half dispatch.
+        let can_use_flash = gpu_acc_score_triple.is_some() || scores_out.is_none();
+        if can_use_flash
             && self.flash_attention_decode_gpu(
                 q,
                 k_cache,
@@ -3795,29 +3843,16 @@ impl Backend for OpenCLBackend {
                 num_heads_kv,
                 head_dim,
                 cache_seq_len,
+                flash_score_arg,
             )?
         {
-            // Flash attention succeeded for output. Now handle scores if needed.
-            if let Some(ref mut scores) = scores_out {
-                if self.compute_scores_gpu(
-                    q,
-                    k_cache,
-                    scores,
-                    num_heads_q,
-                    num_heads_kv,
-                    head_dim,
-                    cache_seq_len,
-                )? {
-                    return Ok(());
-                }
-                // Score-only kernel unavailable — fall through to legacy path
-                // for scores only (output already computed by flash attn, but
-                // we need to recompute everything with the slow kernel to get
-                // scores). This should be rare (kernel compilation failure).
-            } else {
-                return Ok(());
-            }
+            // Flash attention succeeded. For GPU acc path, scores are written
+            // into the per-layer slice of the persistent score buffer; the
+            // fused reduce runs at end_step(). For no-score path, we're done.
+            return Ok(());
         }
+        // Legacy path (scores_out readback requested and GPU acc inactive)
+        // continues below with kernel_attn_gen_half + CPU readback.
 
         let q_buf =
             get_cl_mem(q.buffer().as_ref()).map_err(|_| anyhow!("Q is not OpenCL buffer"))?;

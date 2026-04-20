@@ -1273,6 +1273,50 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
         ocl::core::set_kernel_arg(&kernel, 39, ocl::core::ArgVal::scalar(&zero_u64))?;
     }
 
+    // Post-softmax score output (args 40-43). When a GPU score buffer is
+    // supplied via LayerPlanConfig, bind it here so the Q1 kernel can write
+    // per-token weights directly — avoiding the legacy kernel_attn_gen_half
+    // fallback that used to dominate decode wall-clock. Otherwise bind a
+    // 1-element dummy buffer and disable writes.
+    let (score_mem, score_stride_val, score_layer_offset_val, write_scores, retained_bufs): (
+        Mem,
+        i32,
+        i32,
+        i32,
+        Vec<Mem>,
+    ) = match config.gpu_score_buf {
+        Some(buf) => (
+            buf.clone(),
+            config.gpu_score_stride,
+            config.gpu_score_layer_offset,
+            1i32,
+            vec![],
+        ),
+        None => {
+            let dummy = unsafe {
+                ocl::core::create_buffer::<_, f32>(
+                    config.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    1,
+                    None,
+                )
+            }
+            .context("create dummy score buffer for flash plan")?;
+            let d_clone = dummy.clone();
+            (dummy, 0i32, 0i32, 0i32, vec![d_clone])
+        }
+    };
+    unsafe {
+        ocl::core::set_kernel_arg(&kernel, 40, ocl::core::ArgVal::mem(&score_mem))?;
+        ocl::core::set_kernel_arg(
+            &kernel,
+            41,
+            ocl::core::ArgVal::scalar(&score_layer_offset_val),
+        )?;
+        ocl::core::set_kernel_arg(&kernel, 42, ocl::core::ArgVal::scalar(&score_stride_val))?;
+        ocl::core::set_kernel_arg(&kernel, 43, ocl::core::ArgVal::scalar(&write_scores))?;
+    }
+
     const Q1_WG_SIZE: usize = 64;
     Ok(AttentionVariant::StandardFlash(KernelStep {
         kernel,
@@ -1281,7 +1325,7 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
         local_work_size: Some([Q1_WG_SIZE, 1, 1]),
         dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 10 }],
         op_tag: OpTag::Attention,
-        retained_bufs: vec![],
+        retained_bufs,
     }))
 }
 
@@ -1666,14 +1710,18 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
         && config.kv_head_stride == (config.kv_capacity * config.head_dim) as i32;
     // Flash attention is gated per head_dim because each DK variant is a
     // separate compiled program. Add a new arm here when adding DK=256
-    // (Gemma3) etc. `needs_attention_scores` forces legacy because no
-    // flash variant emits scores (see C2 follow-up plan).
+    // (Gemma3) etc. The Q1 kernel now emits post-softmax scores directly
+    // when a GPU score buffer is supplied, so `needs_attention_scores`
+    // alone no longer forces the legacy path — it does only when scores
+    // must land in a CPU-readback buffer (`gpu_score_buf == None`).
     let flash_program_available = match config.head_dim {
         64 => config.flash_attn_f32_f16_program_dk64.is_some(),
         128 => config.flash_attn_f32_f16_program_dk128.is_some(),
         _ => false,
     };
-    let use_flash = is_head_major && flash_program_available && !config.needs_attention_scores;
+    let scores_need_legacy_readback =
+        config.needs_attention_scores && config.gpu_score_buf.is_none();
+    let use_flash = is_head_major && flash_program_available && !scores_need_legacy_readback;
 
     let attention = if use_flash {
         build_flash_attention_step(config)?

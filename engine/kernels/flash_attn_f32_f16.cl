@@ -495,7 +495,15 @@ __kernel void flash_attn_f32_f16_q1(
     const int mask_ne2,
     const int mask_ne3,
     const global void* sinks_void,
-    const ulong sinks_offset
+    const ulong sinks_offset,
+    // Post-softmax score output (arg 40-43). When `write_scores != 0`, the
+    // kernel writes per-token attention weights into
+    // `S[score_layer_offset + head_idx * score_stride + k_idx]`. `S` must be
+    // a valid buffer (use a dummy 1-element buffer when `write_scores == 0`).
+    global float * S,
+    const int score_layer_offset,
+    const int score_stride,
+    const int write_scores
 ) {
     const int tid = get_local_id(0);
     const int head_batch_idx = get_global_id(1);
@@ -510,6 +518,8 @@ __kernel void flash_attn_f32_f16_q1(
     const global char* k_base = (const global char*)k_void + k_offset;
     const global char* v_base = (const global char*)v_void + v_offset;
     global char* o_base = (global char*)o_void + o_offset;
+
+    const int score_row_base = score_layer_offset + head_idx * score_stride;
 
     const global char* mask_base = NULL;
     if (mask_void != NULL) {
@@ -588,6 +598,12 @@ __kernel void flash_attn_f32_f16_q1(
             score = logit_softcap * tanh(score / logit_softcap);
         }
         const ACC_TYPE p = exp(score - m_final);
+        // Pre-normalize p snapshot — finalized via `/ l_final` below once the
+        // SLM tree-reduce produces l_final. Adreno: uniform write_scores
+        // across the WG keeps this branch divergence-free.
+        if (write_scores) {
+            S[score_row_base + k_idx] = (float)p;
+        }
         l_i += p;
         #pragma unroll
         for (int i = 0; i < DV_VEC; i++) {
@@ -612,6 +628,16 @@ __kernel void flash_attn_f32_f16_q1(
 
     if (sinks_ptr != NULL) {
         l_final += exp(sinks_ptr[head_idx] - m_final);
+    }
+
+    // Post-normalize scores to `exp(score - m_final) / l_final`, matching the
+    // softmax weight written by `kernel_attn_gen_half`. Strided across the WG
+    // for coalesced global writes.
+    if (write_scores && l_final > 0.0f) {
+        const float inv_l = 1.0f / (float)l_final;
+        for (int t = tid; t < n_kv; t += Q1_WG_SIZE) {
+            S[score_row_base + t] *= inv_l;
+        }
     }
 
     if (l_final > 0.0f) {

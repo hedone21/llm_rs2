@@ -94,6 +94,7 @@ fn flash_attn_decode_dk128_self_consistent() {
             n_heads_kv,
             head_dim,
             cache_seq_len,
+            None,
         )
         .expect("flash call a");
     if !ok_a {
@@ -115,6 +116,7 @@ fn flash_attn_decode_dk128_self_consistent() {
             n_heads_kv,
             head_dim,
             cache_seq_len,
+            None,
         )
         .expect("flash call b");
     assert!(
