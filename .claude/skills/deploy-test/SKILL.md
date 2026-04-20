@@ -94,6 +94,22 @@ python scripts/convert_safetensors_to_gguf.py --outtype q4_0 \
 
 지원 아키텍처: llama, qwen2, gemma/gemma2/gemma3. 기본 `--outtype`은 `q4_0`.
 
+### GGUF 호스트 CPU 검증 (llm.rs vs llama.cpp 비교)
+
+동일 GGUF로 양쪽 엔진 출력 비교:
+
+```bash
+# llm.rs CPU (seed/temp 제어 가능)
+./target/release/generate -b cpu -m <gguf> -p "The capital of France is" \
+    -n 24 --temperature 0
+
+# llama.cpp (llama-simple, 최소 옵션 바이너리)
+/home/go/Workspace/llama.cpp/build-host/bin/llama-simple -m <gguf> -n 24 \
+    "The capital of France is"
+```
+
+**주의**: `llama-cli` (983df14+)는 `--no-conversation` 미지원, `llama-completion`은 Qwen2 base model에서 토큰 반복 버그. 비교 테스트는 반드시 `llama-simple` 사용. 미빌드 시: `cd /home/go/Workspace/llama.cpp/build-host && cmake --build . --target llama-simple -j$(nproc)`.
+
 
 ## Device Registry
 
