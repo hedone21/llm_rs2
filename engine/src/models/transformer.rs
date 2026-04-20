@@ -1209,11 +1209,19 @@ impl TransformerModel {
 
         // Mirror the runtime gate in `attention_gen` — flash attention has no
         // score output, so an active GPU score accumulator forces the legacy
-        // attention path. The CPU-side `score_accumulator` is already checked
-        // by callers of `build_plan` (see `generate.rs`).
+        // attention path and pre-binds the persistent score buffer into the
+        // attention kernel args (arg 4, `write_scores=1`, `score_stride`).
         let plan_needs_scores = ocl_backend
             .gpu_score_acc()
             .is_some_and(|acc| acc.is_active());
+        let (gpu_score_buf, gpu_score_stride) = if plan_needs_scores {
+            match ocl_backend.gpu_score_acc() {
+                Some(acc) => (Some(acc.score_buf_mem()), acc.score_stride() as i32),
+                None => (None, 0),
+            }
+        } else {
+            (None, 0)
+        };
 
         let full_config = FullPlanConfig {
             context: &ocl_backend.context,
@@ -1224,6 +1232,8 @@ impl TransformerModel {
             flash_attn_f32_f16_program_dk64: ocl_backend.flash_attn_f32_f16_program_dk64.as_ref(),
             flash_attn_f32_f16_program_dk128: ocl_backend.flash_attn_f32_f16_program_dk128.as_ref(),
             needs_attention_scores: plan_needs_scores,
+            gpu_score_buf,
+            gpu_score_stride,
             layer_bufs,
             x_buf: cl!(x),
             q_buf: cl!(ws.q),

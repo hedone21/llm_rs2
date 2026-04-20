@@ -171,6 +171,11 @@ pub struct FullKernelPlan {
     pub lm_head: Option<KernelStep>,
     /// KV cache capacity at plan creation time (for invalidation check)
     pub kv_capacity: usize,
+    /// True when the legacy attention step was bound to the backend's GPU
+    /// score accumulator at build time. `execute()` uses this flag to drive
+    /// `GpuScoreAccumulator::reduce_layer` per layer and `end_step` after
+    /// the final layer, mirroring the non-plan path in `transformer.rs`.
+    pub writes_gpu_scores: bool,
 }
 
 /// Error indicating the plan's pre-bound arguments are stale.
@@ -479,6 +484,22 @@ impl FullKernelPlan {
                         q2t,
                         rt,
                     );
+                    // GPU score accumulator: reduce per-layer scores into the
+                    // step buffers immediately after the attention kernel, so
+                    // the next layer can safely reuse `score_buf`. Mirrors the
+                    // runtime flow in `OpenCLBackend::attention_gen` (mod.rs:3939).
+                    if self.writes_gpu_scores
+                        && let Some(gpu_acc) = backend.gpu_score_acc()
+                        && gpu_acc.is_active()
+                        && let Err(e) = gpu_acc.reduce_layer(queue, attn_seq_len as usize)
+                    {
+                        log::error!(
+                            "Plan reduce_layer failed: layer={} n_kv={}: {}",
+                            i,
+                            attn_seq_len,
+                            e
+                        );
+                    }
                     if debug_sync {
                         eprintln!("[Plan] L{} attention enqueued, calling finish...", i);
                         ocl::core::finish(queue).ok();
@@ -638,6 +659,26 @@ impl FullKernelPlan {
             }
         }
 
+        // GPU score accumulator: flush step-local scores into cumulative
+        // importance and clear step buffers. Mirrors transformer.rs:979 for
+        // the non-plan path. Uses the post-advance cache position (one past
+        // the token just scattered) so `end_step` sees the same length the
+        // runtime sees.
+        if self.writes_gpu_scores
+            && !kv_caches.is_empty()
+            && let Some(gpu_acc) = backend.gpu_score_acc_mut()
+            && gpu_acc.is_active()
+        {
+            let cache_seq_len = kv_caches[0].current_pos();
+            if let Err(e) = gpu_acc.end_step(queue, cache_seq_len) {
+                log::error!(
+                    "Plan gpu_score end_step failed: n_kv={}: {}",
+                    cache_seq_len,
+                    e
+                );
+            }
+        }
+
         // Final norm
         if backend.profile_events_enabled {
             if let Err(e) = backend.enqueue_kernel_labeled(
@@ -791,6 +832,15 @@ pub struct LayerPlanConfig<'a> {
     /// `AttentionVariant::Standard` because the flash kernel has no score
     /// output.
     pub needs_attention_scores: bool,
+    /// Persistent GPU score buffer from the backend's `GpuScoreAccumulator`.
+    /// When `Some` and `needs_attention_scores` is true, the legacy attention
+    /// step is pre-bound to write softmax scores directly into this buffer
+    /// (arg 4, `write_scores=1`, `score_stride` below). Per-layer reduction
+    /// (`GpuScoreAccumulator::reduce_layer`) is then driven by `FullKernelPlan::execute`.
+    pub gpu_score_buf: Option<&'a Mem>,
+    /// Score stride (= `max_seq_len`) matching `gpu_score_buf` layout. Unused
+    /// when `gpu_score_buf` is `None`.
+    pub gpu_score_stride: i32,
     // -- Q4_0 noshuffle matmul support --
     /// Pre-compiled noshuffle GEMV programs, keyed by ne01 (M dimension).
     /// When `Some`, matmul steps use Q4_0 noshuffle dispatch instead of F16.
@@ -1635,8 +1685,19 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             .context("create kernel_attn_gen_half")?;
         let scale = 1.0f32 / (config.head_dim as f32).sqrt();
         let cache_seq_len_init = 0i32;
-        let write_scores = 0i32;
-        let score_stride = 0i32;
+        // When a GPU score accumulator buffer is supplied and scores are
+        // required, bind it as arg 4 (`scores`) with `write_scores=1` and
+        // the accumulator's stride. This mirrors the runtime path in
+        // `OpenCLBackend::attention_gen` (mod.rs:~3858), allowing the plan
+        // to accumulate per-step importance without round-tripping through
+        // forward_gen. When no GPU buffer is supplied we retain the legacy
+        // dummy binding.
+        let (write_scores, score_stride) =
+            if config.needs_attention_scores && config.gpu_score_buf.is_some() {
+                (1i32, config.gpu_score_stride)
+            } else {
+                (0i32, 0i32)
+            };
         let dummy_score_buf = unsafe {
             ocl::core::create_buffer::<_, f32>(
                 config.context.as_core(),
@@ -1646,12 +1707,17 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             )
         }
         .context("create dummy score buffer for plan")?;
+        let score_arg_buf: &Mem = if write_scores == 1 {
+            config.gpu_score_buf.unwrap()
+        } else {
+            &dummy_score_buf
+        };
         unsafe {
             ocl::core::set_kernel_arg(&kernel, 0, ocl::core::ArgVal::mem(config.q_buf))?;
             ocl::core::set_kernel_arg(&kernel, 1, ocl::core::ArgVal::mem(config.k_cache_buf))?;
             ocl::core::set_kernel_arg(&kernel, 2, ocl::core::ArgVal::mem(config.v_cache_buf))?;
             ocl::core::set_kernel_arg(&kernel, 3, ocl::core::ArgVal::mem(config.out_attn_buf))?;
-            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(&dummy_score_buf))?;
+            ocl::core::set_kernel_arg(&kernel, 4, ocl::core::ArgVal::mem(score_arg_buf))?;
             ocl::core::set_kernel_arg(
                 &kernel,
                 5,
@@ -1935,6 +2001,11 @@ pub struct FullPlanConfig<'a> {
     /// score accumulator). Forces the legacy attention path because flash
     /// attention has no score output.
     pub needs_attention_scores: bool,
+    /// Persistent GPU score buffer from `OpenCLBackend::gpu_score_acc()`.
+    /// Propagated into each layer's `LayerPlanConfig::gpu_score_buf`.
+    pub gpu_score_buf: Option<&'a Mem>,
+    /// Score stride for the buffer above.
+    pub gpu_score_stride: i32,
     // Per-layer weight buffers: Vec<(wq, wk, wv, wo, w_gate, w_up, w_down, attn_norm, ffn_norm)>
     pub layer_bufs: Vec<LayerBufs<'a>>,
     // Workspace buffers (shared across layers)
@@ -2070,6 +2141,8 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             flash_attn_f32_f16_program_dk64: config.flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128: config.flash_attn_f32_f16_program_dk128,
             needs_attention_scores: config.needs_attention_scores,
+            gpu_score_buf: config.gpu_score_buf,
+            gpu_score_stride: config.gpu_score_stride,
             noshuffle_programs: config.noshuffle_programs.as_ref(),
             wq_noshuffle: lb.wq_noshuffle,
             wk_noshuffle: lb.wk_noshuffle,
@@ -2171,6 +2244,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         final_norm,
         lm_head,
         kv_capacity: config.kv_capacity,
+        writes_gpu_scores: config.needs_attention_scores && config.gpu_score_buf.is_some(),
     })
 }
 
@@ -2640,6 +2714,8 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             flash_attn_f32_f16_program_dk64: None,
             flash_attn_f32_f16_program_dk128: None,
             needs_attention_scores: false,
+            gpu_score_buf: None,
+            gpu_score_stride: 0,
             // KIVI currently only supports F16 weights — no noshuffle.
             noshuffle_programs: None,
             wq_noshuffle: None,
@@ -2722,5 +2798,8 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
         final_norm,
         lm_head,
         kv_capacity: config.max_seq_len,
+        // KIVI plans never bind a GPU score accumulator; scores are collected
+        // on the CPU path when KIVI is active.
+        writes_gpu_scores: false,
     })
 }

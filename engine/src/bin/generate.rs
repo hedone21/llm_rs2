@@ -3374,14 +3374,32 @@ fn main() -> anyhow::Result<()> {
 
         // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
         // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
-        // Disable when score_accumulator is active: plan doesn't collect attention scores
         // Disable when tensor partition is active: plan bypasses forward_gen's
         // partition path entirely (plan = pure GPU chain, no CPU co-execution).
+        //
+        // Score accumulator coexistence: when a CPU `score_accumulator` is
+        // active (H2O/D2O/Sliding/CAOTE eviction), the plan may still be used
+        // as long as the paired GPU `gpu_score_acc` is active.  `build_plan`
+        // then selects the legacy attention kernel (flash attn has no score
+        // output) and pre-binds the GPU score buffer into arg 4. Per-layer
+        // `reduce_layer` + post-pass `end_step` are driven by
+        // `FullKernelPlan::execute` so CPU readback happens only at eviction
+        // time (see `sync_to_cpu` further down).
+        #[cfg(feature = "opencl")]
+        let accumulator_compatible_with_plan = {
+            let has_cpu_acc = score_accumulator.is_some();
+            let gpu_acc_active = backend
+                .as_any()
+                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                .and_then(|ob| ob.gpu_score_acc())
+                .is_some_and(|acc| acc.is_active());
+            !has_cpu_acc || gpu_acc_active
+        };
         #[cfg(feature = "opencl")]
         let mut gpu_plan = if backend.name() == "OpenCL"
             && !args.profile
             && !args.no_gpu_plan
-            && score_accumulator.is_none()
+            && accumulator_compatible_with_plan
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
             && model.layers[0].partition_ctx.is_none()
         {
@@ -3545,13 +3563,24 @@ fn main() -> anyhow::Result<()> {
 
                 // Rebuild plan if it was invalidated (e.g. KV cache resize).
                 // Skip rebuild when tensor partition is active — plan bypasses
-                // the partition co-execution path.
+                // the partition co-execution path. Same accumulator-pairing
+                // requirement as the initial build above.
+                #[cfg(feature = "opencl")]
+                let accumulator_compatible_with_plan = {
+                    let has_cpu_acc = score_accumulator.is_some();
+                    let gpu_acc_active = backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                        .and_then(|ob| ob.gpu_score_acc())
+                        .is_some_and(|acc| acc.is_active());
+                    !has_cpu_acc || gpu_acc_active
+                };
                 #[cfg(feature = "opencl")]
                 if gpu_plan.is_none()
                     && backend.name() == "OpenCL"
                     && !args.profile
                     && !args.no_gpu_plan
-                    && score_accumulator.is_none()
+                    && accumulator_compatible_with_plan
                     && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
                     && model.layers[0].partition_ctx.is_none()
                 {
