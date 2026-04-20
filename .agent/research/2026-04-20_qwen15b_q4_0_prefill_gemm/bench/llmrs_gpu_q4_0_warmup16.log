@@ -1,0 +1,42 @@
+=== manager pgrep ===
+16545 /data/local/tmp/llm_manager --policy-script /data/local/tmp/noop_policy.lua --transport tcp:127.0.0.1:38701
+=== temp before ===
+2026-04-20T17:41:08 cpuss-0-0=33400 cpuss-0-1=31900 cpuss-1-0=31500 cpuss-1-1=31900 gpuss-0=31500 gpuss-1=31500 gpuss-2=31500 gpuss-3=31500 gpuss-4=31900 gpuss-5=32300 gpuss-6=32300 gpuss-7=31900
+=== llm.rs generate (-b opencl, WARMUP_TOKENS=16) ===
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Forcing zero-copy memory for CPU-accessible buffers
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 
+Token Length: 131
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+[Resilience] Executor enabled — transport: tcp:127.0.0.1:38701
+[Resilience] Capability sent to Manager
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[GPU Score] Accumulator initialized — per-token readback eliminated
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=16 ms=151.98
+[Profile] Event: PrefillStart
+Prefill: 434.90 ms (131 tokens, 301.2 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 1[part-dbg] forward_gen entered, ws.partition_ws.is_some()=false
+00 times, each time with a different font and color.
+
+This is an example of what happens when you use fonts in your text editor or word processor to make it look more interesting and visually appealing for people who read on screen (like computers). Each time you type something new into your document, the program changes how that text looks by using different colors, sizes, shapes etc. This helps us understand better what we're reading even if our eyes can't see all of those details at once.
+
+So when someone types out a sentence like "The quick brown fox jumps over the lazy dog." they might choose to use one font for
+Done.
+[Profile] Event: End
+TTFT: 730.32 ms
+Decode: 37.40 ms/tok (26.7 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 35.88 ms/tok (27.9 tok/s) [126 tokens] | tok[0]=228.57 ms
+Avg TBT: 39.03 ms (25.6 tokens/sec)
+=== temp after ===
+2026-04-20T17:41:19 cpuss-0-0=44900 cpuss-0-1=45300 cpuss-1-0=43400 cpuss-1-1=43400 gpuss-0=43200 gpuss-1=43600 gpuss-2=43600 gpuss-3=43600 gpuss-4=43600 gpuss-5=44000 gpuss-6=44000 gpuss-7=43200
+=== done ===

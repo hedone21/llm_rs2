@@ -179,6 +179,14 @@ struct KernelCache {
     f16_is_nosub: bool,
     // Q4_0 noshuffle: SOA conversion kernel (Adreno-optimized, from cvt.cl)
     kernel_cvt_q4_0_noshuffle: Option<CoreKernel>,
+    /// Adreno-optimized Q4_0 GEMM for prefill (llama.cpp mul_mat_Ab_Bi_8x4).
+    /// Consumes the same SOA q_buf / d_buf produced by `convert_q4_0_to_noshuffle`.
+    /// Activations must be transposed to F16 (K × N_padded) via
+    /// `kernel_transpose_32_16` before dispatch.
+    kernel_mul_mat_ab_bi_8x4: Option<CoreKernel>,
+    /// F32 → F16 activation transpose with N-padding to multiple of 8,
+    /// used exclusively by the Adreno Q4_0 GEMM fast path.
+    kernel_transpose_32_16: Option<CoreKernel>,
 }
 
 // SAFETY: OpenCL kernel objects are thread-safe for clSetKernelArg + clEnqueueNDRangeKernel
@@ -255,6 +263,12 @@ pub struct OpenCLBackend {
     // gemv_noshuffle programs are dimension-specific (LINE_STRIDE_A, BLOCK_STRIDE_A).
     // Built lazily per weight dimension via convert_q4_0_to_noshuffle().
 
+    // Adreno Q4_0 GEMM path (llama.cpp-style): `mul_mat_Ab_Bi_8x4` + F32→F16
+    // activation transpose from `transpose.cl`. Optional — falls back to
+    // `mul_mm_q4_0_f32_l4_lm` when either program fails to compile.
+    pub gemm_ab_bi_program: Option<Program>,
+    pub transpose_program: Option<Program>,
+
     // Cached kernels — inference is single-threaded, no lock needed.
     // UnsafeCell avoids Mutex overhead (~170us/lock on Adreno).
     kernels: UnsafeCell<KernelCache>,
@@ -289,6 +303,25 @@ pub struct OpenCLBackend {
     // matmul_q4_0() auto-dispatches to noshuffle GEMV when a lookup succeeds.
     // UnsafeCell: single-threaded access (same pattern as kernels and gemv_noshuffle_cache).
     noshuffle_soa_registry: UnsafeCell<HashMap<usize, NoshuffleSoaEntry>>,
+
+    // Persistent scratch for `matmul_q4_0_gemm_adreno`: F16 activation with N
+    // padded to a multiple of 8. Grown on demand to max(K * N_padded / 2) bytes
+    // across prefill. Single-threaded inference access, same pattern as other
+    // UnsafeCell caches. Stored as (buffer, rgba16f_write_image,
+    // rgba16f_read_image, capacity_bytes, image_texel_count). Reusing the same
+    // `cl_mem` images across 196 Q4_0 matmul calls saves ~400 µs/call of
+    // driver bookkeeping (Adreno clCreateImage on CL_MEM_IMAGE1D_BUFFER is
+    // non-trivial).
+    #[allow(clippy::type_complexity)]
+    gemm_act_trans_buf:
+        UnsafeCell<Option<(ocl::core::Mem, ocl::core::Mem, ocl::core::Mem, usize, usize)>>,
+
+    // Per-layer cache key for the transposed activation above: `(a_buf_ptr,
+    // m, k)`. When a matmul reuses the same activation pointer and shape
+    // (e.g. Q/K/V all consume the post-RMSNorm residual within one layer),
+    // the transpose pass is skipped and only the GEMM dispatch runs.
+    // Invalidated whenever `gemm_act_trans_buf` is (re)allocated.
+    gemm_act_trans_key: UnsafeCell<Option<(usize, usize, usize)>>,
 
     // ── Event-based per-op profiling (--profile-events) ──────────────────
     // When true, the queue was created with CL_QUEUE_PROFILING_ENABLE and all
@@ -869,6 +902,39 @@ impl OpenCLBackend {
             log::warn!("cvt.cl failed to compile. Q4_0 noshuffle disabled.");
         }
 
+        // Adreno Q4_0 GEMM fast path: `mul_mat_Ab_Bi_8x4.cl` consumes SOA
+        // weights (from cvt.cl) and F16-transposed activations to compute
+        // prefill matmul at ~4-5x the throughput of generic `mul_mm_q4_0`.
+        let gemm_ab_bi_src = include_str!("../../../kernels/mul_mat_Ab_Bi_8x4.cl");
+        let gemm_ab_bi_program = Program::builder()
+            .devices(device)
+            .src(gemm_ab_bi_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if gemm_ab_bi_program.is_some() {
+            log::info!("mul_mat_Ab_Bi_8x4.cl compiled (Adreno Q4_0 GEMM fast path for prefill)");
+        } else {
+            log::warn!(
+                "mul_mat_Ab_Bi_8x4.cl failed to compile. Q4_0 prefill falls back to generic GEMM."
+            );
+        }
+
+        // Activation transpose kernel (F32 → F16, pads N to multiple of 8).
+        // Required pre-processing for `mul_mat_Ab_Bi_8x4`.
+        let transpose_src = include_str!("../../../kernels/transpose.cl");
+        let transpose_program = Program::builder()
+            .devices(device)
+            .src(transpose_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+            .ok();
+        if transpose_program.is_some() {
+            log::info!("transpose.cl compiled (activation F32→F16 transpose)");
+        } else {
+            log::warn!("transpose.cl failed to compile. Adreno Q4_0 GEMM disabled.");
+        }
+
         // Create and cache all kernel objects once
         let kernel_cache = KernelCache {
             kernel_mul_mat_f32_f32: ocl::core::create_kernel(&program, "kernel_mul_mat_f32_f32")?,
@@ -1027,6 +1093,12 @@ impl OpenCLBackend {
             kernel_cvt_q4_0_noshuffle: cvt_noshuffle_program.as_ref().and_then(|p| {
                 ocl::core::create_kernel(p, "kernel_convert_block_q4_0_noshuffle").ok()
             }),
+            kernel_mul_mat_ab_bi_8x4: gemm_ab_bi_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_Ab_Bi_8x4").ok()),
+            kernel_transpose_32_16: transpose_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_transpose_32_16").ok()),
             // GEMV noshuffle kernel is built per-dimension (lazy), so None initially
         };
 
@@ -1093,6 +1165,8 @@ impl OpenCLBackend {
             kivi_attn_program,
             attention_scores_program,
             cvt_noshuffle_program,
+            gemm_ab_bi_program,
+            transpose_program,
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
             dummy_score_buf,
@@ -1101,6 +1175,8 @@ impl OpenCLBackend {
             max_mem_alloc_size,
             gemv_noshuffle_cache: UnsafeCell::new(HashMap::new()),
             noshuffle_soa_registry: UnsafeCell::new(HashMap::new()),
+            gemm_act_trans_buf: UnsafeCell::new(None),
+            gemm_act_trans_key: UnsafeCell::new(None),
             profile_events_enabled,
             profile_events: UnsafeCell::new(Vec::new()),
             profile_accum: UnsafeCell::new(HashMap::new()),
@@ -1692,6 +1768,44 @@ impl OpenCLBackend {
             // q_img == None or no SOA entry → fall through to standard Q4_0 GEMV
         }
 
+        // Adreno Q4_0 GEMM fast path (llama.cpp mul_mat_Ab_Bi_8x4).
+        // Requires a noshuffle SOA entry (q_buf/d_buf transposed) and both
+        // gemm_ab_bi + transpose programs. Triggers for every prefill-style
+        // token count (m > 1) when available. SOA lookup miss, shape misfit,
+        // or kernel unavailability all fall through to the generic tiled
+        // GEMM / GEMV paths below.
+        //
+        // Shape requirements:
+        //   * n % 4 == 0 — GEMM iterates 4 output rows per wg lane
+        //   * k % 4 == 0 — weight nibble unpacking uses `vload4`
+        //
+        // `m` (token count) need not be a multiple of 4. The transpose kernel
+        // tiles 4 rows per thread; when the last tile's tail row is OOB the
+        // corresponding half lands in an `n >= n_no_padding` column of the
+        // transposed activation. Downstream `mul_mat_Ab_Bi_8x4` guards writes
+        // with `idx+3 < m*n_no_padding`, so garbage from OOB reads never
+        // reaches the final output buffer.
+        //
+        // `n/4` does not have to divide the LWS(=128). Adreno OpenCL 2.0+
+        // accepts non-uniform workgroup sizes for the trailing shape (tested
+        // on Qwen 2.5-1.5B, n=8960 → n/4=2240 runs cleanly with [1,128,1]).
+        // We keep a generic-GEMM fallback in this file so a stricter driver
+        // can opt out via env if regressions appear.
+        if m > 1 && n.is_multiple_of(4) && k.is_multiple_of(4) {
+            let b_key = b_buf.as_ptr() as usize;
+            if let Some(entry) = self.lookup_noshuffle_soa(b_key)
+                && entry.ne00 == k
+                && entry.ne01 == n
+            {
+                let kernels = unsafe { &*self.kernels.get() };
+                if kernels.kernel_mul_mat_ab_bi_8x4.is_some()
+                    && kernels.kernel_transpose_32_16.is_some()
+                {
+                    return self.matmul_q4_0_gemm_adreno(a_buf, out_buf, entry, m, n, k);
+                }
+            }
+        }
+
         // Tiled GEMM for prefill (M >= 32). Reuses weights across BM=64 rows of output,
         // eliminating the 64x weight-reload overhead of GEMV for large batches.
         if m >= 32 {
@@ -2145,6 +2259,291 @@ impl OpenCLBackend {
         }
         // act_img is dropped here; clReleaseMemObject is called.
         // The enqueued kernel retains its own reference to the image/buffer.
+        Ok(())
+    }
+
+    /// Adreno Q4_0 GEMM fast path (llama.cpp `mul_mat_Ab_Bi_8x4`).
+    ///
+    /// Two-stage dispatch:
+    ///   1. `kernel_transpose_32_16`: F32 activation `[M_tok, K]` →
+    ///      F16 scratch `[K, N_padded]` where `N_padded = (M_tok + 7) & ~7`.
+    ///   2. `kernel_mul_mat_Ab_Bi_8x4`: consumes transposed activation +
+    ///      SOA weight (`q_buf`/`d_buf`) and writes `[M_tok, N_out]` F32.
+    ///
+    /// Kernel shape-lookup notes (llama.cpp `ggml-opencl.cpp:9749`):
+    ///   * per-shape tuned `local_work_size` is available but the generic
+    ///     `[1, 128, 1]` from the default path is what actually ships in
+    ///     llama.cpp's release builds for non-llama2 dims. Qwen2.5-1.5B
+    ///     prefill shapes do not match any hard-coded entry, so we use
+    ///     the default as well.
+    ///
+    /// # Arguments
+    /// * `a_buf` — activation cl_mem (F32, `[m, k]`)
+    /// * `out_buf` — output cl_mem (F32, `[m, n]`)
+    /// * `entry` — SOA Q4_0 weight (must have `ne00 == k`, `ne01 == n`)
+    /// * `m` — token count (rows of activation / output)
+    /// * `n` — output dim (rows of weight)
+    /// * `k` — input dim (cols of weight / activation)
+    ///
+    /// Register footprint (per Adreno reqd_sub_group_size("full") thread):
+    ///   `c0..c3 half8` (16 halves = 8 float4) + `B half8` + `dequant half4` ≈
+    ///   **~10 float4** — well below the 32 float4 spill threshold.
+    #[allow(clippy::too_many_arguments)]
+    fn matmul_q4_0_gemm_adreno(
+        &self,
+        a_buf: &ocl::core::Mem,
+        out_buf: &ocl::core::Mem,
+        entry: &NoshuffleSoaEntry,
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        use ocl::core::{
+            ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat, MemObjectType,
+        };
+
+        // Kernel preconditions:
+        //   * m (token count) becomes padded to multiple of 8 for activation tiling.
+        //   * n (out_dim) must be divisible by 4 (kernel processes 4 rows per wg lane
+        //     via gws[1] = n/4). All Q4_0 weight rows from real models (dim / ffn)
+        //     satisfy this — bail to generic path otherwise.
+        //   * k (in_dim) must be divisible by 4 for vload4 / per-4 weight unpacking.
+        if !n.is_multiple_of(4) || !k.is_multiple_of(4) {
+            return Err(anyhow!(
+                "Adreno Q4_0 GEMM requires n%4==0 && k%4==0, got n={}, k={}",
+                n,
+                k
+            ));
+        }
+
+        let pad_extra = (8 - (m % 8)) % 8;
+        let padded_m = m + pad_extra;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let transpose_kernel = kernels
+            .kernel_transpose_32_16
+            .as_ref()
+            .ok_or_else(|| anyhow!("kernel_transpose_32_16 unavailable"))?;
+        let gemm_kernel = kernels
+            .kernel_mul_mat_ab_bi_8x4
+            .as_ref()
+            .ok_or_else(|| anyhow!("kernel_mul_mat_Ab_Bi_8x4 unavailable"))?;
+
+        // ── Scratch buffer for the transposed F16 activation ─────────────
+        // Size: k * padded_m * 2 bytes. The slot also holds two persistent
+        // image views (write-only for transpose, read-only for GEMM). Both
+        // images are only valid while the underlying buffer has at least
+        // `texel_count * 8` bytes (RGBA16F = 4 halves = 8 bytes per texel);
+        // on buffer realloc we rebuild both images too.
+        let trans_bytes = k * padded_m * 2;
+        let texel_count = k * padded_m / 4;
+        // SAFETY: single-threaded inference access, same pattern as
+        // `gemv_noshuffle_cache` / `noshuffle_soa_registry`.
+        let trans_slot = unsafe { &mut *self.gemm_act_trans_buf.get() };
+        let trans_key_slot = unsafe { &mut *self.gemm_act_trans_key.get() };
+        let need_realloc = match trans_slot {
+            Some((_, _, _, cap, cached_texels)) => {
+                *cap < trans_bytes || *cached_texels < texel_count
+            }
+            None => true,
+        };
+        if need_realloc {
+            let mem = unsafe {
+                ocl::core::create_buffer::<_, u8>(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    trans_bytes,
+                    None,
+                )?
+            };
+            let fmt = ImageFormat::new(ImageChannelOrder::Rgba, ImageChannelDataType::HalfFloat);
+            let desc = ImageDescriptor::new(
+                MemObjectType::Image1dBuffer,
+                texel_count,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(mem.clone()),
+            );
+            let write_img = unsafe {
+                ocl::core::create_image(
+                    self.context.as_core(),
+                    ocl::core::MEM_WRITE_ONLY,
+                    &fmt,
+                    &desc,
+                    None::<&[u16]>,
+                    None,
+                )?
+            };
+            let read_img = unsafe {
+                ocl::core::create_image(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_ONLY,
+                    &fmt,
+                    &desc,
+                    None::<&[u16]>,
+                    None,
+                )?
+            };
+            *trans_slot = Some((mem, write_img, read_img, trans_bytes, texel_count));
+            *trans_key_slot = None; // any re-alloc invalidates the cache
+        }
+        let (act_trans_mem, act_out_img, b_in_img, _cap, _tex) = trans_slot.as_ref().unwrap();
+
+        // Skip the transpose pass when the same activation (same ptr, same
+        // shape) was transposed on the previous call. Q/K/V within one layer
+        // share the post-RMSNorm residual, so ~3 of every 7 matmuls per
+        // layer can reuse the existing F16 tile.
+        let activation_key = (a_buf.as_ptr() as usize, m, k);
+        let skip_transpose = matches!(*trans_key_slot, Some(prev) if prev == activation_key);
+
+        // ── Stage 1: activation transpose F32 → F16 with N-padding ───────
+        //
+        // Kernel signature:
+        //   kernel_transpose_32_16(
+        //     __read_only image1d_buffer_t  input  (RGBA32F, width = m * k / 4),
+        //     __write_only image1d_buffer_t output (RGBA16F, width = k * padded_m / 4),
+        //     const uint rows       = m / 4,           // input row-tiles
+        //     const uint cols       = k / 4,           // input col-tiles (K per texel/4)
+        //     const uint padded_rows = padded_m / 4);  // output col-tiles
+        //
+        // gws = [k / 4, padded_m / 4]
+        //
+        // kernel_transpose_32_16 tiles 4×4 halves per thread. When `m` is
+        // not a multiple of 4 the final tile reads past the valid region;
+        // Adreno's `read_imageh` clamps to zero on OOB which is exactly
+        // what `mul_mat_Ab_Bi_8x4` wants (N>m rows must contribute 0).
+        // We still need the scratch padding zeros for n ∈ [m, padded_m).
+        // Zero the scratch up-front (once per call, same ACE queue) so the
+        // last F16 tile in the padded-N direction is clean irrespective of
+        // image sampling semantics. Q4_0 prefill issues 7 matmul/layer and
+        // `kernel_transpose_32_16` dominates less than 2% of the wall clock
+        // so the zero-fill overhead is negligible.
+        //
+        // When the cache hit lets us skip the transpose, also skip the
+        // zero-fill (the scratch already holds a valid tile).
+        if !skip_transpose {
+            let zero: u8 = 0;
+            // Event arg types: `En` = new event (&mut Event), `Ewl` = wait-list
+            // (&[Event]). Passing `None` with fully-specified turbofish lets
+            // ocl-core monomorphize without an ambiguous trait resolution.
+            type NullEvent<'a> = &'a mut ocl::core::Event;
+            type WaitList<'a> = &'a [ocl::core::Event];
+            unsafe {
+                ocl::core::enqueue_fill_buffer::<u8, _, NullEvent<'_>, WaitList<'_>>(
+                    &self.queue,
+                    act_trans_mem,
+                    zero,
+                    0,
+                    trans_bytes,
+                    None,
+                    None,
+                    None,
+                )?;
+            }
+        }
+
+        if !skip_transpose {
+            // Activation input image (RGBA32F view of a_buf). Ephemeral — the
+            // caller owns the F32 buffer and may rebind `a_buf` across calls,
+            // so we can't cache this image.
+            let act_in_img = {
+                let fmt = ImageFormat::new(ImageChannelOrder::Rgba, ImageChannelDataType::Float);
+                let desc = ImageDescriptor::new(
+                    MemObjectType::Image1dBuffer,
+                    m * k / 4,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(a_buf.clone()),
+                );
+                unsafe {
+                    ocl::core::create_image(
+                        self.context.as_core(),
+                        ocl::core::MEM_READ_ONLY,
+                        &fmt,
+                        &desc,
+                        None::<&[f32]>,
+                        None,
+                    )?
+                }
+            };
+
+            let rows_i = (m / 4) as i32;
+            let cols_i = (k / 4) as i32;
+            let padded_rows_i = (padded_m / 4) as i32;
+
+            unsafe {
+                ocl::core::set_kernel_arg(
+                    transpose_kernel,
+                    0,
+                    ocl::core::ArgVal::mem(&act_in_img),
+                )?;
+                ocl::core::set_kernel_arg(
+                    transpose_kernel,
+                    1,
+                    ocl::core::ArgVal::mem(act_out_img),
+                )?;
+                ocl::core::set_kernel_arg(transpose_kernel, 2, ocl::core::ArgVal::scalar(&rows_i))?;
+                ocl::core::set_kernel_arg(transpose_kernel, 3, ocl::core::ArgVal::scalar(&cols_i))?;
+                ocl::core::set_kernel_arg(
+                    transpose_kernel,
+                    4,
+                    ocl::core::ArgVal::scalar(&padded_rows_i),
+                )?;
+
+                let gws_t: [usize; 3] = [k / 4, padded_m / 4, 1];
+                // Leave LWS to the driver. llama.cpp uses `[1, 16]` but that
+                // constrains `padded_m/4 % 16 == 0`; Qwen 2.5-1.5B with M=131
+                // pads to 136 → padded_m/4 = 34, which violates `gws % lws == 0`.
+                self.enqueue_kernel_labeled(transpose_kernel, "matmul_transpose", 2, &gws_t, None)?;
+            }
+            *trans_key_slot = Some(activation_key);
+        }
+
+        // ── Stage 2: Q4_0 × F16 GEMM ─────────────────────────────────────
+        //
+        // `b_in_img` is the persistent RGBA16F read-only view of
+        // `act_trans_mem` held in the cache slot.
+
+        let m_i = n as i32; // kernel's m = output dim (rows of weight)
+        let n_padded_i = padded_m as i32; // kernel's n = padded token count
+        let k_i = k as i32;
+        let n_no_padding_i = m as i32; // real token count
+
+        unsafe {
+            ocl::core::set_kernel_arg(gemm_kernel, 0, ocl::core::ArgVal::mem(&entry.q_buf))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 1, ocl::core::ArgVal::mem(&entry.d_buf))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 2, ocl::core::ArgVal::mem(b_in_img))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 3, ocl::core::ArgVal::mem(out_buf))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 4, ocl::core::ArgVal::scalar(&m_i))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 5, ocl::core::ArgVal::scalar(&n_padded_i))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 6, ocl::core::ArgVal::scalar(&k_i))?;
+            ocl::core::set_kernel_arg(gemm_kernel, 7, ocl::core::ArgVal::scalar(&n_no_padding_i))?;
+
+            // gws = [ceil(N/8), M/4, 1] = [padded_m/8, n/4, 1]. llama.cpp
+            // dispatches this same kernel with a *fixed* LWS of [1, 128, 1]
+            // even for shapes where `n/4 % 128 != 0` (e.g. Qwen's FFN
+            // n=8960 → n/4=2240, remainder 64). The dispatch works on
+            // Adreno OpenCL 3.0 + CL2.0-compiled kernels because
+            // non-uniform workgroups are supported; the `qcom_reqd_sub_group_size("full")`
+            // attribute pins the lane count without constraining the WG shape.
+            //
+            // We match llama.cpp's behaviour by always using [1, 128, 1].
+            // If Adreno's driver rejects the non-uniform remainder for
+            // `n/4 % 128 != 0` we'll see `CL_INVALID_WORK_GROUP_SIZE` at
+            // dispatch time; callers then re-run with the generic GEMM.
+            let gws_g: [usize; 3] = [padded_m / 8, n / 4, 1];
+            let lws_g: [usize; 3] = [1, 128, 1];
+            self.enqueue_kernel_labeled(gemm_kernel, "matmul", 3, &gws_g, Some(lws_g))?;
+        }
+
+        // act_in_img / act_out_img / b_in_img drop here; the enqueued kernels
+        // hold their own references via clRetainMemObject.
         Ok(())
     }
 

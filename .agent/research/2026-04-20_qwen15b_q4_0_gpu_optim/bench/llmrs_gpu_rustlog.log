@@ -1,0 +1,843 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[2026-04-20T07:54:50Z INFO  llm_rs2::backend::opencl] OpenCL Platform: QUALCOMM Snapdragon(TM)
+[2026-04-20T07:54:50Z INFO  llm_rs2::backend::opencl] OpenCL Device: QUALCOMM Adreno(TM) 830 (API 3.0, CL C: OpenCL C 3.0 Adreno(TM) 830)
+[2026-04-20T07:54:50Z INFO  llm_rs2::backend::opencl] Subgroup support: cl_khr_subgroups=true, cl_intel_subgroups=false
+[2026-04-20T07:54:50Z INFO  llm_rs2::backend::opencl] GPU Global Memory: 5557 MB
+[2026-04-20T07:54:50Z INFO  llm_rs2::backend::opencl] GPU Max Alloc Size: 1024 MB
+[2026-04-20T07:54:50Z INFO  llm_rs2::backend::opencl] OpenCL compiler options: -cl-std=CL2.0 -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math
+[2026-04-20T07:54:51Z INFO  llm_rs2::backend::opencl] simple_ops.cl compiled (subgroup path)
+[2026-04-20T07:54:51Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32.cl compiled (4-wave K-split, N_DST=2, 128 rows/WG)
+[2026-04-20T07:54:51Z INFO  llm_rs2::backend::opencl] mul_mv_f16_f32_l4.cl compiled (GEMV N_DST=4 for large N)
+[2026-04-20T07:54:51Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=64, BLOCK_N=32, DK=64)
+[2026-04-20T07:54:51Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=64)
+[2026-04-20T07:54:51Z INFO  llm_rs2::backend::opencl] flash_attn_f32_f16.cl compiled (Q=F32, KV=F16, DK=128, BLOCK_M=32)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] flash_attn_f32.cl compiled (BLOCK_M=16, BLOCK_N=32, DK=256)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] mul_mm_f16_f32_l4_lm.cl compiled (GEMM prefill F16)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] mul_mm_f32_f32_l4_lm.cl compiled (GEMM prefill F32)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] mul_mm_q4_0_f32_l4_lm.cl compiled (Q4_0 GEMM for prefill)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] kivi_q2.cl compiled (KIVI Q2 dequant/scatter kernels)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] kivi_attn.cl compiled (KIVI fused attention kernels)
+[2026-04-20T07:54:52Z WARN  llm_rs2::backend::opencl] attention_scores.cl failed to compile. Score-only kernel disabled.
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] cvt.cl compiled (Q4_0 noshuffle SOA conversion kernel)
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] OpenCL kernels cached successfully
+[2026-04-20T07:54:52Z INFO  llm_rs2::backend::opencl] Memory mode: UMA/integrated (zero_copy=true)
+[Config] Forcing zero-copy memory for CPU-accessible buffers
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:53Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:54Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=49152 texels, ne01=256
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 12288 blocks, ne00=1536, ne01=256, q=192 KB, d=24 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 12288 blocks, q=192 KB, d=24 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=294912 texels, ne01=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 73728 blocks, ne00=1536, ne01=1536, q=1152 KB, d=144 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 73728 blocks, q=1152 KB, d=144 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=1536, ne01=8960, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] image1d_buffer_t created for noshuffle Q4_0: width=1720320 texels, ne01=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 noshuffle SOA conversion + transpose done: 430080 blocks, ne00=8960, ne01=1536, q=6720 KB, d=840 KB, img=yes
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 plain SOA split done: 430080 blocks, q=6720 KB, d=840 KB
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 
+Token Length: 131
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 256 tokens, 131072B per layer, max: 2048)
+[Resilience] Executor enabled — transport: tcp:127.0.0.1:38701
+[Resilience] Capability sent to Manager
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GPU score accumulator initialized (n_heads_q=12, n_kv_heads=2, max_seq=2048)
+[GPU Score] Accumulator initialized — per-token readback eliminated
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GEMV noshuffle Q4_0: vector sub_group_broadcast enabled
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GEMV noshuffle Q4_0 kernel compiled: ne01=1536, LINE_STRIDE_A=768, BLOCK_STRIDE_A=6144
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GEMV noshuffle Q4_0: vector sub_group_broadcast enabled
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GEMV noshuffle Q4_0 kernel compiled: ne01=256, LINE_STRIDE_A=128, BLOCK_STRIDE_A=1024
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GEMV noshuffle Q4_0: vector sub_group_broadcast enabled
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] GEMV noshuffle Q4_0 kernel compiled: ne01=8960, LINE_STRIDE_A=4480, BLOCK_STRIDE_A=35840
+[WARMUP] tokens=1 ms=246.72
+[Profile] Event: PrefillStart
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:55Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=256, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=8960, k=1536
+[2026-04-20T07:54:56Z INFO  llm_rs2::backend::opencl] Q4_0 GEMM dispatch (SOA uchar4): m=131, n=1536, k=8960
+Prefill: 1121.86 ms (131 tokens, 116.8 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 1[part-dbg] forward_gen entered, ws.partition_ws.is_some()=false
+00 times, that's a lot of jumping! But what about this
+Done.
+[Profile] Event: End
+TTFT: 1506.31 ms
+Decode: 34.36 ms/tok (29.1 tok/s) [15 tokens, forward only]
+Decode(excl tok[0]): 34.33 ms/tok (29.1 tok/s) [14 tokens] | tok[0]=34.71 ms
+Avg TBT: 36.79 ms (27.2 tokens/sec)

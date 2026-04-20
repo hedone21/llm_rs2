@@ -1,0 +1,2 @@
+[2026-04-20T16:55:36] attempt=1 max=34200mC (zone=cpuss-0-0) threshold=38000mC
+[2026-04-20T16:55:36] PASS max=34200mC <= 38000mC

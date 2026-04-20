@@ -1,0 +1,94 @@
+=== manager pgrep ===
+17685 /data/local/tmp/llm_manager --policy-script /data/local/tmp/noop_policy.lua --transport tcp:127.0.0.1:38701
+=== manager log (pre-connect) ===
+[2026-04-20T08:49:33Z INFO  llm_manager] Config not found, using defaults
+[2026-04-20T08:49:33Z INFO  llm_manager] LLM Manager starting (poll_interval=1000ms)
+[2026-04-20T08:49:33Z INFO  llm_manager::channel::tcp] [TcpChannel] Listening on 127.0.0.1:38701
+[2026-04-20T08:49:33Z INFO  llm_manager] TCP transport: waiting for client on 127.0.0.1:38701 (timeout=60s)...
+=== temp snapshot before run ===
+2026-04-20T17:49:35 cpuss-0-0=34900 cpuss-0-1=34200 cpuss-1-0=33800 cpuss-1-1=34200 gpuss-0=33800 gpuss-1=34200 gpuss-2=33500 gpuss-3=33800 gpuss-4=34200 gpuss-5=34200 gpuss-6=34200 gpuss-7=34200
+=== llm.rs generate (-b opencl) ===
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Forcing zero-copy memory for CPU-accessible buffers
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 
+Token Length: 131
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+[Resilience] Executor enabled — transport: tcp:127.0.0.1:38701
+[Resilience] Capability sent to Manager
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[GPU Score] Accumulator initialized — per-token readback eliminated
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=244.81
+[Profile] Event: PrefillStart
+Prefill: 401.19 ms (131 tokens, 326.5 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 1[part-dbg] forward_gen entered, ws.partition_ws.is_some()=false
+00 times, each time with a different font and color.
+
+This is an example of what happens when you use fonts in your text editor or word processor to make it look more interesting and visually appealing for people who read on screen (like computers). Each time you type something new into your document, the program changes how that text looks by using different colors, sizes, shapes etc. This helps us understand better what we're reading even if our eyes can't see all of those details at once.
+
+So when someone types out a sentence like "The quick brown fox jumps over the lazy dog." they might choose to use one font for
+Done.
+[Profile] Event: End
+TTFT: 791.51 ms
+Decode: 35.96 ms/tok (27.8 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 35.97 ms/tok (27.8 tok/s) [126 tokens] | tok[0]=34.83 ms
+Avg TBT: 37.60 ms (26.6 tokens/sec)
+=== temp snapshot after run ===
+2026-04-20T17:49:46 cpuss-0-0=48400 cpuss-0-1=48800 cpuss-1-0=44900 cpuss-1-1=44900 gpuss-0=44800 gpuss-1=44800 gpuss-2=45100 gpuss-3=45100 gpuss-4=45100 gpuss-5=45500 gpuss-6=45500 gpuss-7=44400
+=== manager log (post-run) ===
+[2026-04-20T08:49:33Z INFO  llm_manager] Config not found, using defaults
+[2026-04-20T08:49:33Z INFO  llm_manager] LLM Manager starting (poll_interval=1000ms)
+[2026-04-20T08:49:33Z INFO  llm_manager::channel::tcp] [TcpChannel] Listening on 127.0.0.1:38701
+[2026-04-20T08:49:33Z INFO  llm_manager] TCP transport: waiting for client on 127.0.0.1:38701 (timeout=60s)...
+[2026-04-20T08:49:40Z INFO  llm_manager::channel::tcp] [TcpChannel] Client connected from 127.0.0.1:51390
+[2026-04-20T08:49:40Z INFO  llm_manager] Transport: TcpChannel
+[2026-04-20T08:49:40Z INFO  llm_manager::monitor::energy] [EnergyMonitor] No battery found, will report defaults
+[2026-04-20T08:49:40Z INFO  llm_manager] Monitors: 4
+[2026-04-20T08:49:40Z INFO  llm_manager::monitor::memory] [MemoryMonitor] Starting (interval=1000ms)
+[2026-04-20T08:49:40Z INFO  llm_manager::monitor::thermal] [ThermalMonitor] Starting (interval=1000ms)
+[2026-04-20T08:49:40Z INFO  llm_manager] Started 4 monitor threads
+[2026-04-20T08:49:40Z INFO  llm_manager::monitor::compute] [ComputeMonitor] Starting (interval=1000ms)
+[2026-04-20T08:49:40Z INFO  llm_manager::lua_policy] LuaPolicy loaded from /data/local/tmp/noop_policy.lua
+[2026-04-20T08:49:40Z INFO  llm_manager] LuaPolicy initialized from /data/local/tmp/noop_policy.lua
+[2026-04-20T08:49:40Z INFO  llm_manager::monitor::energy] [EnergyMonitor] Starting (interval=1000ms, battery=none)
+[2026-04-20T08:49:40Z INFO  llm_manager] Entering main loop
+[2026-04-20T08:49:40Z INFO  llm_manager] Engine capability: devices=["cpu", "opencl"]
+[2026-04-20T08:49:40Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5550866432, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:40Z INFO  llm_manager::monitor::thermal] [ThermalMonitor] Monitoring all 32 zones
+[2026-04-20T08:49:40Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:40Z INFO  llm_manager] Signal: ThermalAlert { level: Warning, temperature_mc: 61500, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T08:49:41Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:41Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5575528448, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:41Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 12.658227848101266, gpu_usage_pct: 0.0 }
+[2026-04-20T08:49:41Z INFO  llm_manager] Signal: ThermalAlert { level: Warning, temperature_mc: 55300, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T08:49:42Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:42Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5575241728, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:42Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 10.844892812105927, gpu_usage_pct: 0.0 }
+[2026-04-20T08:49:42Z INFO  llm_manager] Signal: ThermalAlert { level: Warning, temperature_mc: 58800, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T08:49:43Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:43Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5575176192, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:43Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 10.732323232323232, gpu_usage_pct: 0.0 }
+[2026-04-20T08:49:43Z INFO  llm_manager] Signal: ThermalAlert { level: Warning, temperature_mc: 60000, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T08:49:44Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:44Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5575192576, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:44Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Any, reason: Balanced, cpu_usage_pct: 9.898477157360407, gpu_usage_pct: 0.0 }
+[2026-04-20T08:49:44Z INFO  llm_manager] Signal: ThermalAlert { level: Warning, temperature_mc: 61100, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T08:49:45Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:45Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 5574717440, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:45Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 10.831234256926953, gpu_usage_pct: 0.0 }
+[2026-04-20T08:49:45Z INFO  llm_manager] Signal: ThermalAlert { level: Warning, temperature_mc: 61900, throttling_active: false, throttle_ratio: 1.0 }
+[2026-04-20T08:49:46Z INFO  llm_manager::channel::tcp] [TcpChannel] Reader thread exited — connection lost
+[2026-04-20T08:49:46Z INFO  llm_manager] Signal: EnergyConstraint { level: Normal, reason: None, power_budget_mw: 0 }
+[2026-04-20T08:49:46Z INFO  llm_manager] Signal: MemoryPressure { level: Normal, available_bytes: 7764144128, total_bytes: 11654733824, reclaim_target_bytes: 0 }
+[2026-04-20T08:49:46Z INFO  llm_manager] Signal: ComputeGuidance { level: Normal, recommended_backend: Gpu, reason: GpuAvailable, cpu_usage_pct: 11.964735516372796, gpu_usage_pct: 0.0 }
+[2026-04-20T08:49:46Z INFO  llm_manager] Signal: ThermalAlert { level: Normal, temperature_mc: 48400, throttling_active: false, throttle_ratio: 1.0 }
+=== done ===

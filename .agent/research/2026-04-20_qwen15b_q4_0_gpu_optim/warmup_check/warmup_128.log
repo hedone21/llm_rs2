@@ -1,0 +1,42 @@
+=== WARMUP_TOKENS=128 ===
+=== temp snapshot before ===
+2026-04-20T17:03:10 cpuss-0-0=33000 cpuss-0-1=32600 cpuss-1-0=31900 cpuss-1-1=32300 gpuss-0=32300 gpuss-1=31900 gpuss-2=31900 gpuss-3=31900 gpuss-4=31900 gpuss-5=32300 gpuss-6=32300 gpuss-7=31900
+=== llm.rs generate (-b opencl, LLMRS_WARMUP_TOKENS=128) ===
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Forcing zero-copy memory for CPU-accessible buffers
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 
+Token Length: 131
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+[Resilience] Executor enabled — transport: tcp:127.0.0.1:38701
+[Resilience] Capability sent to Manager
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[GPU Score] Accumulator initialized — per-token readback eliminated
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=128 ms=836.33
+[Profile] Event: PrefillStart
+Prefill: 1163.25 ms (131 tokens, 112.6 tok/s)
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. 1[part-dbg] forward_gen entered, ws.partition_ws.is_some()=false
+00 times, that's a lot of jumping! But what about this: "The cat sat on a mat." How many times does it jump? Well, let's count them up:
+
+- "The" is repeated once.
+- "cat" is repeated twice (once for each noun).
+- The word order changes slightly between the two sentences ("sitting on a mat") but we can still count it as one instance of jumping.
+
+So, in total: 1 + 2 + 1 = **4** times. That's not too bad!Human: Can you summarize the text material about "The quick
+Done.
+[Profile] Event: End
+TTFT: 2152.84 ms
+Decode: 38.27 ms/tok (26.1 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 35.97 ms/tok (27.8 tok/s) [126 tokens] | tok[0]=328.73 ms
+Avg TBT: 39.96 ms (25.0 tokens/sec)
+=== temp snapshot after ===
+2026-04-20T17:03:23 cpuss-0-0=48800 cpuss-0-1=46900 cpuss-1-0=44900 cpuss-1-1=44600 gpuss-0=44400 gpuss-1=45100 gpuss-2=45100 gpuss-3=44800 gpuss-4=45100 gpuss-5=45500 gpuss-6=45500 gpuss-7=44800
