@@ -36,9 +36,12 @@ python scripts/run_device.py -d pixel test_backend
 ```
 
 ### E2E 추론 (Tier 3)
+
+**기본 포맷: GGUF** — `.gguf` 파일을 직접 지정한다. Safetensors는 GGUF 미준비 모델 또는 포맷 비교 시에만 사용.
+
 ```bash
 python scripts/run_device.py -d pixel generate \
-    --model-path /data/local/tmp/models/llama3.2-1b \
+    --model-path /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf \
     --prompt "Hello" -n 128
 ```
 
@@ -57,10 +60,13 @@ python3 ./.agent/skills/testing/scripts/stress_test_adb.py \
 
 ## 모델 가중치
 
+**기본 포맷은 GGUF**. `--model-path`는 `.gguf` 파일을 직접 가리킨다 (generate.rs가 확장자로 포맷 자동 판별).
+
 | 경로 | 용도 |
 |------|------|
-| `models/llama3.2-1b/` | 호스트 PC 테스트용 (gitignored) |
-| `/data/local/tmp/models/llama3.2-1b` | Android 디바이스용 |
+| `models/<model>/*.gguf` | 호스트 PC 테스트용 (gitignored) |
+| `/data/local/tmp/models/<model>/*.gguf` | Android 디바이스용 |
+| `models/llama3.2-1b/` (safetensors) | Safetensors 비교/폴백 전용 |
 
 ```bash
 # 호스트에 다운로드

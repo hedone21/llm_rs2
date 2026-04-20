@@ -38,15 +38,16 @@ cargo test -p llm_manager                   # 매니저 유닛 테스트
 
 ## 호스트 추론 테스트
 
-```bash
-# 모델 다운로드 (최초 1회)
-huggingface-cli download meta-llama/Llama-3.2-1B --local-dir models/llama3.2-1b
+**기본 포맷: GGUF**. `--model-path`는 `.gguf` 파일을 직접 지정한다 (generate.rs가 확장자로 포맷 자동 판별). Safetensors는 GGUF 미준비 모델 또는 포맷 비교 시에만 사용.
 
-# 추론 실행
-cargo run --release --bin generate -- --model-path models/llama3.2-1b --prompt "Hello" -n 128
+```bash
+# 추론 실행 (GGUF 기본)
+cargo run --release --bin generate -- \
+    --model-path models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf \
+    --prompt "Hello" -n 128
 ```
 
-모델 경로: `models/llama3.2-1b/` (gitignored)
+모델 경로: `models/<model>/*.gguf` (gitignored)
 
 ## 실패 시 대응
 
