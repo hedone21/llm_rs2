@@ -1134,14 +1134,28 @@ impl TransformerLayer {
             //
             // Gates:
             //   - Gemma3 (rms_norm_add_unit) is out of scope (different fused norm).
-            //   - `x` must be CPU-visible (UMA) to feed the CPU add_rms_norm_oop.
             //   - skip_sync (LLMRS_PARTITION_SYNC_EVERY_N>1) falls back to legacy.
+            //
+            // `x` host-visibility is NOT a gate. When `x.as_ptr()` is null
+            // (UMA `UnifiedBuffer` without a current `map()`, common on
+            // Adreno for the previous layer's output), the CPU reads `x`
+            // into `pw.x_cpu` via an additional `enqueue_read_buffer_async`
+            // call enqueued alongside the `attn_out` read. Both DMAs are
+            // awaited together right before the CPU norm runs.
             let replicate_norm = is_gpu
                 && !rms_norm_add_unit
                 && !skip_sync
-                && crate::layers::tensor_partition::partition_replicate_norm_enabled()
-                && !x.as_ptr().is_null();
+                && crate::layers::tensor_partition::partition_replicate_norm_enabled();
             let mut pending_read_evt: Option<crate::core::backend::GpuEvent> = None;
+            // Deferred event for the x→x_cpu DMA when `x` is not host-visible.
+            // `None` when `x` is directly CPU-accessible and no fallback read
+            // was needed.
+            let mut pending_x_evt: Option<crate::core::backend::GpuEvent> = None;
+            // Tracks whether the CPU norm should read from `x` directly (UMA
+            // host-visible path) or from `pw.x_cpu` (async-read fallback).
+            // Decided at enqueue time so later code can borrow `pw.x_cpu`
+            // without re-checking `x.as_ptr()`.
+            let mut replicate_use_x_cpu = false;
             // Track which path was taken for trace accounting.
             let partition_path;
             let residual_cpu_ptr: *const u8 = if replicate_norm {
@@ -1155,6 +1169,17 @@ impl TransformerLayer {
                         pw.attn_out_cpu.size(),
                     );
                     pending_read_evt = Some(backend.enqueue_read_buffer_async(&ws.attn_out, dst)?);
+                }
+                // Fallback: if `x` is not host-visible, enqueue a parallel
+                // async read of `x` into `pw.x_cpu`. Both DMAs pipeline
+                // against the GPU FFN chain enqueued below.
+                if x.as_ptr().is_null() {
+                    unsafe {
+                        let dst =
+                            std::slice::from_raw_parts_mut(pw.x_cpu.as_mut_ptr(), pw.x_cpu.size());
+                        pending_x_evt = Some(backend.enqueue_read_buffer_async(x, dst)?);
+                    }
+                    replicate_use_x_cpu = true;
                 }
                 if part_trace {
                     // Under replicate_norm, the "sync_drain" window collapses to
@@ -1253,8 +1278,14 @@ impl TransformerLayer {
             // to land before CPU consumes it. This is the host wait window
             // that previously sat before the GPU enqueue as `synchronize()`;
             // by deferring it here it can overlap with the GPU enqueue/flush
-            // above.
+            // above. When Direction A fell back to the async x-read path,
+            // wait for the x DMA too — both events were enqueued on the same
+            // in-order queue but waiting explicitly keeps the ordering
+            // guarantee independent of queue semantics.
             if let Some(evt) = pending_read_evt.take() {
+                backend.wait_event(&evt)?;
+            }
+            if let Some(evt) = pending_x_evt.take() {
                 backend.wait_event(&evt)?;
             }
 
@@ -1264,16 +1295,33 @@ impl TransformerLayer {
             // (unchanged); this CPU copy is a numerically-equivalent replica
             // (L∞ < 1e-4 by the norm's fp32 stability) used only as input to
             // the CPU FFN chain below.
+            //
+            // When `x` was not host-visible at enqueue time, its async-read
+            // landed in `pw.x_cpu`; the CPU norm consumes that buffer
+            // instead. `add_rms_norm_oop` mutates its `x` input (x += res),
+            // so routing this through `pw.x_cpu` also keeps GPU-side `x`
+            // untouched by the replica computation.
             if partition_path == crate::layers::tensor_partition::PartitionPath::ReplicateNorm {
                 let cpu = &part.cpu_backend;
-                cpu.add_rms_norm_oop(
-                    x,
-                    &pw.attn_out_cpu,
-                    &mut pw.residual_cpu,
-                    &self.ffn_norm,
-                    rms_norm_eps,
-                    false,
-                )?;
+                if replicate_use_x_cpu {
+                    cpu.add_rms_norm_oop(
+                        &mut pw.x_cpu,
+                        &pw.attn_out_cpu,
+                        &mut pw.residual_cpu,
+                        &self.ffn_norm,
+                        rms_norm_eps,
+                        false,
+                    )?;
+                } else {
+                    cpu.add_rms_norm_oop(
+                        x,
+                        &pw.attn_out_cpu,
+                        &mut pw.residual_cpu,
+                        &self.ffn_norm,
+                        rms_norm_eps,
+                        false,
+                    )?;
+                }
             }
 
             // 2. CPU: full FFN chain on its own slice, independent of GPU.

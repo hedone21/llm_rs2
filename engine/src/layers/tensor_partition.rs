@@ -1476,4 +1476,106 @@ mod tests {
         let b = partition_replicate_norm_enabled();
         assert_eq!(a, b, "OnceLock must return a stable decision");
     }
+
+    // PA-T1-REPLICATE-XCPU: PartitionWorkspace now allocates an `x_cpu`
+    // fallback buffer mirroring `attn_out_cpu`, so the Direction A gate can
+    // activate even when the previous layer's output (`x`) is not host-
+    // visible. The buffer must have matching shape/size and be writable;
+    // these properties are what the forward_gen async-read fallback relies
+    // on (`pw.x_cpu.as_mut_ptr()` + `pw.x_cpu.size()` into
+    // `enqueue_read_buffer_async`).
+    #[test]
+    fn test_partition_workspace_has_x_cpu_fallback_buffer() {
+        use crate::backend::cpu::CpuBackend;
+        use crate::core::buffer::DType;
+        use crate::core::shape::Shape;
+        use crate::core::tensor::Tensor;
+        use crate::layers::workspace::PartitionWorkspace;
+        use crate::memory::galloc::Galloc;
+        use std::sync::Arc;
+
+        // Minimal PartitionContext scaffolding. The test only needs the
+        // geometry fields that PartitionWorkspace::new consumes.
+        let cpu_backend: Arc<dyn crate::core::backend::Backend> = Arc::new(CpuBackend::new());
+        let cpu_mem = Galloc::new();
+
+        // Fake partitioned weights: split_row = hidden/2 for gate/up, whole
+        // slice for down. Actual weight tensors are unused by this test; we
+        // build minimal shells so PartitionWorkspace::new can inspect
+        // `split_row`.
+        let ffn_hidden = 64usize;
+        let hidden_size = 32usize;
+        let split = ffn_hidden / 2;
+
+        // Build dummy gate/up cpu_slice tensors so PartitionedWeight is
+        // fully formed; the workspace never touches their buffers during
+        // allocation (only `split_row` is read by `alloc_pair`).
+        let dummy_slice = |rows: usize, cols: usize| -> Tensor {
+            let buf = cpu_mem.alloc(rows * cols * 4, DType::F32).unwrap();
+            Tensor::new(Shape::new(vec![rows, cols]), buf, cpu_backend.clone())
+        };
+        let gate_cpu_slice = dummy_slice(ffn_hidden - split, hidden_size);
+        let up_cpu_slice = dummy_slice(ffn_hidden - split, hidden_size);
+        let down_cpu_slice = dummy_slice(hidden_size, ffn_hidden - split);
+        let gate_gpu_slice = dummy_slice(split, hidden_size);
+        let up_gpu_slice = dummy_slice(split, hidden_size);
+        let down_gpu_slice = dummy_slice(hidden_size, split);
+
+        let ctx = PartitionContext {
+            gpu_ratio: 0.5,
+            cpu_backend: cpu_backend.clone(),
+            gate: PartitionedWeight {
+                gpu_slice: gate_gpu_slice,
+                cpu_slice: gate_cpu_slice,
+                split_row: split,
+            },
+            up: PartitionedWeight {
+                gpu_slice: up_gpu_slice,
+                cpu_slice: up_cpu_slice,
+                split_row: split,
+            },
+            down: PartitionedWeight {
+                gpu_slice: down_gpu_slice,
+                cpu_slice: down_cpu_slice,
+                split_row: hidden_size,
+            },
+        };
+
+        // gpu_alloc stub (CPU memory works for the structural checks).
+        let gpu_alloc =
+            |bytes: usize, dtype: DType| -> anyhow::Result<Arc<dyn crate::core::buffer::Buffer>> {
+                Ok(cpu_mem.alloc(bytes, dtype)?)
+            };
+
+        let pw = PartitionWorkspace::new(
+            &ctx,
+            ffn_hidden,
+            hidden_size,
+            &gpu_alloc,
+            cpu_backend.clone(),
+            cpu_backend.clone(),
+        )
+        .expect("PartitionWorkspace::new must succeed");
+
+        // x_cpu must mirror attn_out_cpu: same shape, same byte size, writable.
+        assert_eq!(
+            pw.x_cpu.shape().dims(),
+            pw.attn_out_cpu.shape().dims(),
+            "x_cpu shape must match attn_out_cpu"
+        );
+        assert_eq!(
+            pw.x_cpu.size(),
+            pw.attn_out_cpu.size(),
+            "x_cpu byte size must match attn_out_cpu"
+        );
+        assert_eq!(
+            pw.x_cpu.size(),
+            hidden_size * 4,
+            "x_cpu must be hidden_size * 4 bytes (F32)"
+        );
+        assert!(
+            !pw.x_cpu.as_ptr().is_null(),
+            "x_cpu must be CPU-allocated (non-null ptr) so the async-read fallback can target it"
+        );
+    }
 }

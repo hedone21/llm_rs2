@@ -68,6 +68,7 @@ impl LayerWorkspace {
             bufs.push(pw.up_cpu.buffer().clone());
             bufs.push(pw.residual_cpu.buffer().clone());
             bufs.push(pw.attn_out_cpu.buffer().clone());
+            bufs.push(pw.x_cpu.buffer().clone());
             bufs.push(pw.down_partial_gpu.buffer().clone());
             bufs.push(pw.down_partial_cpu.buffer().clone());
             bufs.push(pw.cpu_merge_staging.buffer().clone());
@@ -102,6 +103,7 @@ impl LayerWorkspace {
                 up_cpu: retag(pw.up_cpu),
                 residual_cpu: retag(pw.residual_cpu),
                 attn_out_cpu: retag(pw.attn_out_cpu),
+                x_cpu: retag(pw.x_cpu),
                 down_partial_gpu: retag(pw.down_partial_gpu),
                 down_partial_cpu: retag(pw.down_partial_cpu),
                 cpu_merge_staging: retag(pw.cpu_merge_staging),
@@ -247,6 +249,13 @@ pub struct PartitionWorkspace {
     /// after `attn_out` is ready, allowing the host wait window to overlap
     /// with the GPU FFN chain enqueue.
     pub attn_out_cpu: Tensor,
+    /// CPU-side copy of the layer input `x` for Direction A fallback.
+    /// [1, 1, dim]. When `x` is not host-accessible (UMA `UnifiedBuffer`
+    /// without a current `map()`, which is the common case on Adreno), the
+    /// partition block asynchronously DMA-reads `x` into this buffer alongside
+    /// the `attn_out` read, then the CPU's `add_rms_norm_oop` consumes it.
+    /// Mirrors `attn_out_cpu`'s allocation pattern.
+    pub x_cpu: Tensor,
 
     // --- FFN down (Strategy B) ---
     /// GPU partial output for down projection: [1, 1, hidden_size]
@@ -329,6 +338,14 @@ impl PartitionWorkspace {
         };
         let attn_out_cpu = {
             let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
+            Tensor::new(
+                Shape::new(vec![1, 1, hidden_size]),
+                buf,
+                cpu_backend.clone(),
+            )
+        };
+        let x_cpu = {
+            let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
             Tensor::new(Shape::new(vec![1, 1, hidden_size]), buf, cpu_backend)
         };
         Ok(Self {
@@ -338,6 +355,7 @@ impl PartitionWorkspace {
             up_cpu,
             residual_cpu,
             attn_out_cpu,
+            x_cpu,
             down_partial_gpu,
             down_partial_cpu,
             cpu_merge_staging,
