@@ -1834,6 +1834,16 @@ fn main() -> anyhow::Result<()> {
                 backend.clone(),
                 cpu_backend_arc.clone(),
             )?);
+
+            if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
+                eprintln!(
+                    "[Partition] Direction A compute-replication ENABLED (CPU runs add_rms_norm_oop in parallel with GPU; LLMRS_PARTITION_REPLICATE_NORM=0 to disable)"
+                );
+            } else {
+                eprintln!(
+                    "[Partition] Direction A compute-replication DISABLED (legacy residual DMA path)"
+                );
+            }
         }
 
         // Pre-allocate CPU/GPU single-token tensors

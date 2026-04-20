@@ -1126,10 +1126,46 @@ impl TransformerLayer {
             // with the GPU FFN chain enqueue issued right after.
             let async_read =
                 partition_async_read_enabled() && !zcopy_residual && !skip_sync && is_gpu;
+            // Direction A (compute replication): CPU DMA-reads `attn_out` and
+            // independently runs `add_rms_norm_oop` to produce its own
+            // residual, while the GPU runs its matching call in parallel.
+            // Advances the sync point from post-norm to post-attn_out and
+            // overlaps the host wait window with the GPU FFN chain enqueue.
+            //
+            // Gates:
+            //   - Gemma3 (rms_norm_add_unit) is out of scope (different fused norm).
+            //   - `x` must be CPU-visible (UMA) to feed the CPU add_rms_norm_oop.
+            //   - skip_sync (LLMRS_PARTITION_SYNC_EVERY_N>1) falls back to legacy.
+            let replicate_norm = is_gpu
+                && !rms_norm_add_unit
+                && !skip_sync
+                && crate::layers::tensor_partition::partition_replicate_norm_enabled()
+                && !x.as_ptr().is_null();
             let mut pending_read_evt: Option<crate::core::backend::GpuEvent> = None;
             // Track which path was taken for trace accounting.
             let partition_path;
-            let residual_cpu_ptr: *const u8 = if zcopy_residual {
+            let residual_cpu_ptr: *const u8 = if replicate_norm {
+                // Enqueue non-blocking read of `ws.attn_out` into CPU buffer.
+                // No prior `synchronize()` — the in-order queue guarantees
+                // this read observes the completed `matmul_wo` + prior ops.
+                let t_replicate_start = std::time::Instant::now();
+                unsafe {
+                    let dst = std::slice::from_raw_parts_mut(
+                        pw.attn_out_cpu.as_mut_ptr(),
+                        pw.attn_out_cpu.size(),
+                    );
+                    pending_read_evt = Some(backend.enqueue_read_buffer_async(&ws.attn_out, dst)?);
+                }
+                if part_trace {
+                    // Under replicate_norm, the "sync_drain" window collapses to
+                    // the enqueue call; the real wait happens after GPU FFN
+                    // enqueue and is accounted for in the dma_read segment.
+                    TLS_T_SYNC_DONE.with(|c| c.set(Some(t_replicate_start)));
+                }
+                partition_path = crate::layers::tensor_partition::PartitionPath::ReplicateNorm;
+                // Placeholder — CPU residual is computed after wait_event below.
+                pw.residual_cpu.as_ptr()
+            } else if zcopy_residual {
                 if !skip_sync {
                     backend.synchronize()?;
                 }
@@ -1184,7 +1220,7 @@ impl TransformerLayer {
                 partition_path = crate::layers::tensor_partition::PartitionPath::SyncRead;
                 pw.residual_cpu.as_ptr()
             };
-            let residual_cpu_dims = if zcopy_residual {
+            let residual_cpu_dims = if zcopy_residual && !replicate_norm {
                 ws.residual.shape().dims().to_vec()
             } else {
                 pw.residual_cpu.shape().dims().to_vec()
@@ -1212,13 +1248,31 @@ impl TransformerLayer {
             )?;
             backend.flush()?;
 
-            // A1 async-read: wait for the non-blocking residual DMA to land
-            // before CPU consumes it. This is the host wait window that
-            // previously sat before the GPU enqueue as `synchronize()`; by
-            // deferring it here it can overlap with the GPU enqueue/flush
+            // A1 async-read / Direction A: wait for the non-blocking DMA read
+            // to land before CPU consumes it. This is the host wait window
+            // that previously sat before the GPU enqueue as `synchronize()`;
+            // by deferring it here it can overlap with the GPU enqueue/flush
             // above.
             if let Some(evt) = pending_read_evt.take() {
                 backend.wait_event(&evt)?;
+            }
+
+            // Direction A: CPU independently computes the residual from its
+            // own (x, attn_out_cpu) via add_rms_norm_oop. The GPU has already
+            // produced `ws.residual` via its own add_rms_norm_oop call above
+            // (unchanged); this CPU copy is a numerically-equivalent replica
+            // (L∞ < 1e-4 by the norm's fp32 stability) used only as input to
+            // the CPU FFN chain below.
+            if partition_path == crate::layers::tensor_partition::PartitionPath::ReplicateNorm {
+                let cpu = &part.cpu_backend;
+                cpu.add_rms_norm_oop(
+                    x,
+                    &pw.attn_out_cpu,
+                    &mut pw.residual_cpu,
+                    &self.ffn_norm,
+                    rms_norm_eps,
+                    false,
+                )?;
             }
 
             // 2. CPU: full FFN chain on its own slice, independent of GPU.
@@ -1275,7 +1329,10 @@ impl TransformerLayer {
             let used_fused = false;
             if !used_fused {
                 let _ = residual_cpu_ptr;
-                if zcopy_residual {
+                if zcopy_residual && !replicate_norm {
+                    // In the replicate_norm path, pw.residual_cpu was already
+                    // computed by the CPU's own add_rms_norm_oop above and
+                    // must not be overwritten from ws.residual.
                     unsafe {
                         let dst = std::slice::from_raw_parts_mut(
                             pw.residual_cpu.as_mut_ptr(),

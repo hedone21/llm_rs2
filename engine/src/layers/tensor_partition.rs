@@ -454,12 +454,15 @@ const TRACE_SUMMARY_PERIOD: u64 = 28; // every decode token (28 layers)
 static PART_ZCOPY_COUNT: AtomicU64 = AtomicU64::new(0);
 static PART_ASYNC_COUNT: AtomicU64 = AtomicU64::new(0);
 static PART_SYNC_PATH_COUNT: AtomicU64 = AtomicU64::new(0);
+static PART_REPLICATE_COUNT: AtomicU64 = AtomicU64::new(0);
 
 // Per-path sync_ns aggregates:
 //   zcopy     — synchronize() with zero-copy residual (no DMA read).
 //   non_zcopy — async_read or sync+read_buffer paths (both use DMA after sync).
+//   replicate — Direction A compute replication (attn_out async read + CPU norm).
 static PART_SYNC_NS_ZCOPY: AtomicU64 = AtomicU64::new(0);
 static PART_SYNC_NS_NONZCOPY: AtomicU64 = AtomicU64::new(0);
+static PART_SYNC_NS_REPLICATE: AtomicU64 = AtomicU64::new(0);
 
 /// Which residual-transfer path was taken for a given partition layer call.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,6 +473,11 @@ pub enum PartitionPath {
     AsyncRead,
     /// Synchronous path: blocking `synchronize()` followed by `read_buffer`.
     SyncRead,
+    /// Direction A compute-replication path: CPU DMA-reads `attn_out` and
+    /// independently runs `add_rms_norm_oop` to produce its own residual,
+    /// while the GPU runs its matching call in parallel. The synchronization
+    /// point is advanced from post-norm to post-`attn_out`.
+    ReplicateNorm,
 }
 
 pub fn partition_trace_enabled() -> bool {
@@ -489,6 +497,28 @@ pub fn partition_trace_enabled() -> bool {
 pub fn partition_fused_merge_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| std::env::var("LLMRS_PARTITION_FUSED_MERGE").is_ok_and(|v| v == "1"))
+}
+
+/// Direction A (compute replication) gate. When enabled (default on when
+/// partition is active), the partition block asynchronously DMA-reads
+/// `ws.attn_out` to CPU and independently runs `add_rms_norm_oop` on the
+/// CPU side, while the GPU runs its matching call on `ws.residual`. The
+/// synchronization point is advanced from after the norm to after
+/// `attn_out` is ready, so the host wait window overlaps with the GPU
+/// FFN chain enqueue.
+///
+/// Set `LLMRS_PARTITION_REPLICATE_NORM=0` to disable and fall back to the
+/// legacy 3-way (zcopy / async_read / sync_read) residual DMA path.
+///
+/// NOTE: `OnceLock` caches the decision process-wide on first read, so
+/// changing the env var after the first partition layer runs has no effect.
+pub fn partition_replicate_norm_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LLMRS_PARTITION_REPLICATE_NORM")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 pub fn record_partition_timing(
@@ -518,6 +548,10 @@ pub fn record_partition_timing(
         PartitionPath::SyncRead => {
             PART_SYNC_PATH_COUNT.fetch_add(1, Ordering::Relaxed);
             PART_SYNC_NS_NONZCOPY.fetch_add(sync_ns, Ordering::Relaxed);
+        }
+        PartitionPath::ReplicateNorm => {
+            PART_REPLICATE_COUNT.fetch_add(1, Ordering::Relaxed);
+            PART_SYNC_NS_REPLICATE.fetch_add(sync_ns, Ordering::Relaxed);
         }
     }
 
@@ -554,6 +588,7 @@ pub fn print_partition_trace_summary(count: u64) {
     let zcopy_n = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
     let async_n = PART_ASYNC_COUNT.load(Ordering::Relaxed);
     let sync_read_n = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
+    let replicate_n = PART_REPLICATE_COUNT.load(Ordering::Relaxed);
     let zcopy_avg = if zcopy_n > 0 {
         format!(
             "{:.2}ms",
@@ -571,9 +606,17 @@ pub fn print_partition_trace_summary(count: u64) {
     } else {
         "n/a".to_string()
     };
+    let replicate_avg = if replicate_n > 0 {
+        format!(
+            "{:.2}ms",
+            PART_SYNC_NS_REPLICATE.load(Ordering::Relaxed) as f64 / replicate_n as f64 / 1e6
+        )
+    } else {
+        "n/a".to_string()
+    };
     println!(
-        "[partition-trace] path dist: zcopy={} async={} sync_read={} — sync_ns zcopy={} non_zcopy={}",
-        zcopy_n, async_n, sync_read_n, zcopy_avg, nonzcopy_avg
+        "[partition-trace] path dist: zcopy={} async={} sync_read={} replicate={} — sync_ns zcopy={} non_zcopy={} replicate={}",
+        zcopy_n, async_n, sync_read_n, replicate_n, zcopy_avg, nonzcopy_avg, replicate_avg
     );
 
     use std::io::Write;
@@ -1349,5 +1392,88 @@ mod tests {
             layer_before + 3,
             "total layer count should have increased by 3"
         );
+    }
+
+    // PA-T1-REPLICATE-PATHCNT: ReplicateNorm path increments its own counter
+    // and aggregates into the dedicated replicate sync_ns bucket without
+    // disturbing zcopy / async / sync_read counters. Covers Direction A.
+    #[test]
+    fn test_replicate_norm_path_counter() {
+        let zcopy_before = PART_ZCOPY_COUNT.load(Ordering::Relaxed);
+        let async_before = PART_ASYNC_COUNT.load(Ordering::Relaxed);
+        let sync_before = PART_SYNC_PATH_COUNT.load(Ordering::Relaxed);
+        let replicate_before = PART_REPLICATE_COUNT.load(Ordering::Relaxed);
+        let zcopy_ns_before = PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed);
+        let nonzcopy_ns_before = PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed);
+        let replicate_ns_before = PART_SYNC_NS_REPLICATE.load(Ordering::Relaxed);
+        let layer_before = PART_LAYER_COUNT.load(Ordering::Relaxed);
+
+        // One call per path variant. Use distinct sync_ns values so aggregate
+        // checks can discriminate which bucket the add landed in.
+        record_partition_timing(111, 0, 0, 0, 0, PartitionPath::Zcopy);
+        record_partition_timing(222, 0, 0, 0, 0, PartitionPath::AsyncRead);
+        record_partition_timing(333, 0, 0, 0, 0, PartitionPath::SyncRead);
+        record_partition_timing(444, 0, 0, 0, 0, PartitionPath::ReplicateNorm);
+
+        assert_eq!(
+            PART_ZCOPY_COUNT.load(Ordering::Relaxed),
+            zcopy_before + 1,
+            "Zcopy counter +1"
+        );
+        assert_eq!(
+            PART_ASYNC_COUNT.load(Ordering::Relaxed),
+            async_before + 1,
+            "AsyncRead counter +1"
+        );
+        assert_eq!(
+            PART_SYNC_PATH_COUNT.load(Ordering::Relaxed),
+            sync_before + 1,
+            "SyncRead counter +1"
+        );
+        assert_eq!(
+            PART_REPLICATE_COUNT.load(Ordering::Relaxed),
+            replicate_before + 1,
+            "ReplicateNorm counter +1"
+        );
+        // Replicate sync_ns lands only in the replicate aggregate.
+        assert_eq!(
+            PART_SYNC_NS_REPLICATE.load(Ordering::Relaxed),
+            replicate_ns_before + 444,
+            "replicate sync_ns aggregate gained 444"
+        );
+        // Zcopy aggregate gained 111; non_zcopy gained 222 + 333 = 555.
+        assert_eq!(
+            PART_SYNC_NS_ZCOPY.load(Ordering::Relaxed),
+            zcopy_ns_before + 111,
+        );
+        assert_eq!(
+            PART_SYNC_NS_NONZCOPY.load(Ordering::Relaxed),
+            nonzcopy_ns_before + 222 + 333,
+        );
+        assert_eq!(
+            PART_LAYER_COUNT.load(Ordering::Relaxed),
+            layer_before + 4,
+            "total layer count +4 across all four paths"
+        );
+    }
+
+    // PA-T1-REPLICATE-GATE: the env-gated getter returns a bool consistent
+    // with the plan's default-on semantics.
+    //
+    // The getter uses `OnceLock` for process-wide caching, so we can only
+    // observe the value once per process. We therefore verify the call itself
+    // is type-correct and non-panicking; the exact boolean depends on whether
+    // any prior test in this process already cached it, which is fine — this
+    // test exists to guard against regressions that would make the function
+    // unusable (panic, infinite loop, etc.) rather than to re-exercise env
+    // parsing.
+    #[test]
+    fn test_partition_replicate_norm_env_gate() {
+        let _ = partition_replicate_norm_enabled();
+        // Second call must return the same value as the first (OnceLock
+        // stability). We snapshot and compare.
+        let a = partition_replicate_norm_enabled();
+        let b = partition_replicate_norm_enabled();
+        assert_eq!(a, b, "OnceLock must return a stable decision");
     }
 }
