@@ -18,6 +18,7 @@ pub mod buffer;
 pub mod gpu_score;
 pub mod memory;
 pub mod plan;
+pub mod qcom_ext;
 
 /// Emit a one-time diagnostic to stderr when the prefill flash attention
 /// dispatcher routes a head_dim=128 / F16 KV workload through the new
@@ -38,7 +39,13 @@ fn log_prefill_dk128_once() {
 pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     // First try UnifiedBuffer
     if let Some(unified) = buf.as_any().downcast_ref::<UnifiedBuffer>() {
-        return Ok(unified.cl_buffer().as_core());
+        // UnifiedBuffer has two backing storage variants (Standard
+        // CL_MEM_ALLOC_HOST_PTR vs Qualcomm CL_MEM_EXT_HOST_PTR_QCOM);
+        // use the trait-level cl_mem() so we get the right cl_mem
+        // for either variant.
+        return unified
+            .cl_mem()
+            .ok_or_else(|| anyhow!("UnifiedBuffer has no cl_mem"));
     }
     // Then try legacy OpenCLBuffer
     if let Some(ocl_buf) = buf
@@ -262,6 +269,14 @@ pub struct OpenCLBackend {
     // true on UMA devices (Adreno, Mali): CL_MEM_ALLOC_HOST_PTR for zero-copy.
     // false on discrete GPUs (NVIDIA): device-only buffers for correct behavior.
     pub use_zero_copy: bool,
+
+    /// Qualcomm-specific OpenCL extension capabilities, probed once at
+    /// backend init. All fields are `false` / `0` on non-Adreno
+    /// platforms. Consumers (e.g. `OpenCLMemory::alloc_with_policy`)
+    /// check these before requesting the `cl_qcom_ext_host_ptr` path
+    /// and silently fall back to `CL_MEM_ALLOC_HOST_PTR` when the
+    /// extensions are absent.
+    pub qcom_capabilities: qcom_ext::QcomCapabilities,
 
     // Pre-allocated 1-element dummy buffer for attention_gen when scores_out is None.
     // Avoids per-call GPU buffer allocation (16 layers x every token).
@@ -1071,6 +1086,21 @@ impl OpenCLBackend {
             )?
         };
 
+        // Probe Qualcomm Adreno-specific extensions (iocoherent, ext_host_ptr).
+        // Non-Adreno devices yield an all-zero capability struct; consumers
+        // fall back to the standard CL_MEM_ALLOC_HOST_PTR path.
+        let qcom_capabilities = qcom_ext::probe(&device);
+        if qcom_capabilities.any_host_ptr_ext() {
+            log::info!(
+                "Qualcomm ext: ext_host_ptr={}, iocoherent={}, ion_host_ptr={}, padding={}B, page_size={}B",
+                qcom_capabilities.ext_host_ptr,
+                qcom_capabilities.iocoherent,
+                qcom_capabilities.ion_host_ptr,
+                qcom_capabilities.ext_mem_padding_bytes,
+                qcom_capabilities.page_size_bytes,
+            );
+        }
+
         Ok(Self {
             context,
             queue,
@@ -1095,6 +1125,7 @@ impl OpenCLBackend {
             cvt_noshuffle_program,
             kernels: UnsafeCell::new(kernel_cache),
             use_zero_copy,
+            qcom_capabilities,
             dummy_score_buf,
             gpu_score_acc: UnsafeCell::new(None),
             cl_opts: cl_opts.clone(),
@@ -2683,10 +2714,11 @@ impl Backend for OpenCLBackend {
         let size = src.size();
         // On UMA devices (Adreno): CL_MEM_ALLOC_HOST_PTR for zero-copy shared memory.
         // On discrete GPUs (NVIDIA): device-only buffers for correct behavior.
-        let memory = crate::backend::opencl::memory::OpenCLMemory::new(
+        let memory = crate::backend::opencl::memory::OpenCLMemory::new_with_caps(
             self.context.clone(),
             self.queue.clone(),
             self.use_zero_copy,
+            self.qcom_capabilities,
         );
         let buffer = memory.alloc(size, src.dtype())?;
 
