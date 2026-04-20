@@ -191,8 +191,9 @@ impl UnifiedBuffer {
         //    host_ptr argument is the address of the ext descriptor.
         let ctx = queue.context();
         let ctx_ptr = ctx.as_ptr();
-        let flags_bits: u64 =
-            flags::MEM_READ_WRITE.bits() | flags::MEM_USE_HOST_PTR.bits() | CL_MEM_EXT_HOST_PTR_QCOM;
+        let flags_bits: u64 = flags::MEM_READ_WRITE.bits()
+            | flags::MEM_USE_HOST_PTR.bits()
+            | CL_MEM_EXT_HOST_PTR_QCOM;
 
         let mut errcode: i32 = 0;
         // SAFETY: clCreateBuffer follows the standard OpenCL ABI.

@@ -508,31 +508,199 @@ struct Args {
 /// Single VMA: `as_ptr()`/`as_mut_ptr()` return valid host pointers while
 /// `cl_mem()` remains valid for GPU kernels. No PSS double-counting on Adreno.
 ///
+/// When `LLMRS_QCOM_IOCOHERENT=1` AND the device supports
+/// `cl_qcom_ext_host_ptr_iocoherent` (Adreno 8xx+), the buffer is instead
+/// allocated via `UnifiedBuffer::new_with_cache_policy(IoCoherent)` so that
+/// the Adreno driver can skip the implicit CPU cache flush/invalidate
+/// operations on buffer boundaries — see Milestone 2-2 of the Doppeladler
+/// adoption plan and `.agent/research/2026-04-20_coherence_flag_matrix.md`.
+/// On any failure or capability mismatch we transparently fall back to the
+/// standard `CL_MEM_ALLOC_HOST_PTR` path, matching the Milestone 1 semantics
+/// in `OpenCLMemory::alloc_with_policy`.
+///
 /// On other backends (CPU, CUDA): falls back to `memory.alloc()` which already
 /// returns host-accessible buffers (SharedBuffer, CudaHostBuffer).
 fn make_partition_gpu_alloc<'a>(
     backend: &'a dyn Backend,
     memory: &'a dyn Memory,
 ) -> impl Fn(usize, DType) -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> + 'a {
-    // Try to extract OpenCL queue for UnifiedBuffer allocation.
+    // Try to extract OpenCL queue + Qcom capabilities for UnifiedBuffer allocation.
     #[cfg(feature = "opencl")]
-    let ocl_queue: Option<ocl::Queue> = backend
+    let ocl_state: Option<(
+        ocl::Queue,
+        llm_rs2::backend::opencl::qcom_ext::QcomCapabilities,
+    )> = backend
         .as_any()
         .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
-        .map(|b| b.queue.clone());
+        .map(|b| (b.queue.clone(), b.qcom_capabilities));
+
+    #[cfg(feature = "opencl")]
+    let iocoherent_requested = std::env::var_os("LLMRS_QCOM_IOCOHERENT")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+
+    // Emit the Milestone 2-2 banner once when iocoherent is engaged.
+    #[cfg(feature = "opencl")]
+    if iocoherent_requested
+        && let Some((_, caps)) = ocl_state.as_ref()
+    {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            if caps.supports_iocoherent() {
+                eprintln!(
+                    "[QCOM] partition workspace: LLMRS_QCOM_IOCOHERENT=1 active \
+                     (ext_host_ptr={}, iocoherent={}, page_size={}B) — \
+                     CPU-shared buffers will be allocated via \
+                     CL_MEM_HOST_IOCOHERENT_QCOM",
+                    caps.ext_host_ptr, caps.iocoherent, caps.page_size_bytes,
+                );
+            } else {
+                eprintln!(
+                    "[QCOM] partition workspace: LLMRS_QCOM_IOCOHERENT=1 requested \
+                     but device lacks cl_qcom_ext_host_ptr_iocoherent \
+                     (ext_host_ptr={}, iocoherent={}) — falling back to default \
+                     CL_MEM_ALLOC_HOST_PTR path",
+                    caps.ext_host_ptr, caps.iocoherent,
+                );
+            }
+        });
+    }
 
     #[cfg(not(feature = "opencl"))]
     let _ = backend; // suppress unused warning
 
     move |size: usize, dtype: DType| -> anyhow::Result<Arc<dyn llm_rs2::core::buffer::Buffer>> {
         #[cfg(feature = "opencl")]
-        if let Some(ref q) = ocl_queue {
+        if let Some((ref q, ref caps)) = ocl_state {
+            // Opt-in iocoherent path (Milestone 2-2).
+            if iocoherent_requested && caps.supports_iocoherent() {
+                use llm_rs2::backend::opencl::qcom_ext::QcomCachePolicy;
+                match llm_rs2::buffer::unified_buffer::UnifiedBuffer::new_with_cache_policy(
+                    q.clone(),
+                    size,
+                    dtype,
+                    QcomCachePolicy::IoCoherent,
+                    caps.page_size_bytes,
+                ) {
+                    Ok(buf) => {
+                        // iocoherent path is always-mapped; no extra map() needed.
+                        return Ok(Arc::new(buf));
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "partition iocoherent alloc failed (size={}): {} — falling back to ALLOC_HOST_PTR",
+                            size,
+                            e
+                        );
+                    }
+                }
+            }
             let buf = llm_rs2::buffer::unified_buffer::UnifiedBuffer::new(q.clone(), size, dtype)?;
             buf.map()?; // Permanent map for dual CPU/GPU access
             return Ok(Arc::new(buf));
         }
         memory.alloc(size, dtype)
     }
+}
+
+/// Milestone 2-2: when `LLMRS_QCOM_IOCOHERENT=1` and the device exposes
+/// `cl_qcom_ext_host_ptr_iocoherent`, re-allocate `ws.residual` and
+/// `ws.attn_out` on the iocoherent host-cache policy path so that the
+/// partition decode block (which reads them via `as_ptr()`) avoids the
+/// driver's implicit CPU cache flush on every GPU→CPU boundary.
+///
+/// Falls back silently to a no-op on:
+///   - non-OpenCL backends,
+///   - OpenCL backends that don't expose the extension,
+///   - individual allocation failures (preserves the original buffers).
+///
+/// Called after `LayerWorkspace::new()` but before the PartitionWorkspace
+/// is attached, so it must operate on the existing `ws.residual` /
+/// `ws.attn_out` tensors (shape + backend are preserved, only the
+/// underlying buffer is swapped).
+#[cfg(feature = "opencl")]
+fn rewrap_partition_shared_buffers_iocoherent(
+    backend: &dyn Backend,
+    ws: &mut LayerWorkspace,
+    hidden_size: usize,
+) {
+    // Honour the same gate as make_partition_gpu_alloc.
+    let requested = std::env::var_os("LLMRS_QCOM_IOCOHERENT")
+        .map(|v| v != "0")
+        .unwrap_or(false);
+    if !requested {
+        return;
+    }
+    let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+    else {
+        return;
+    };
+    let caps = ocl_be.qcom_capabilities;
+    if !caps.supports_iocoherent() {
+        return;
+    }
+    let q = ocl_be.queue.clone();
+    let bytes = hidden_size * 4; // F32
+    let page_hint = caps.page_size_bytes;
+
+    use llm_rs2::backend::opencl::qcom_ext::QcomCachePolicy;
+    let mk = |label: &str| -> Option<Arc<dyn llm_rs2::core::buffer::Buffer>> {
+        match llm_rs2::buffer::unified_buffer::UnifiedBuffer::new_with_cache_policy(
+            q.clone(),
+            bytes,
+            DType::F32,
+            QcomCachePolicy::IoCoherent,
+            page_hint,
+        ) {
+            Ok(b) => Some(Arc::new(b)),
+            Err(e) => {
+                log::warn!(
+                    "partition iocoherent rewrap '{}' failed: {} — keeping ALLOC_HOST_PTR buffer",
+                    label,
+                    e
+                );
+                None
+            }
+        }
+    };
+
+    let mut swapped = 0usize;
+    if let Some(buf) = mk("ws.residual") {
+        ws.residual = Tensor::new(
+            ws.residual.shape().clone(),
+            buf,
+            ws.residual.backend().clone(),
+        );
+        swapped += 1;
+    }
+    if let Some(buf) = mk("ws.attn_out") {
+        ws.attn_out = Tensor::new(
+            ws.attn_out.shape().clone(),
+            buf,
+            ws.attn_out.backend().clone(),
+        );
+        swapped += 1;
+    }
+    if swapped > 0 {
+        static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        ONCE.get_or_init(|| {
+            eprintln!(
+                "[QCOM] partition shared buffers rewrapped as iocoherent \
+                 ({} buffers: ws.residual, ws.attn_out — hidden_size={})",
+                swapped, hidden_size,
+            );
+        });
+    }
+}
+
+#[cfg(not(feature = "opencl"))]
+fn rewrap_partition_shared_buffers_iocoherent(
+    _backend: &dyn Backend,
+    _ws: &mut LayerWorkspace,
+    _hidden_size: usize,
+) {
 }
 
 fn main() -> anyhow::Result<()> {
@@ -1808,6 +1976,11 @@ fn main() -> anyhow::Result<()> {
         // buffers so merge can use direct pointer access instead of read_buffer/write_buffer.
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
+
+            // Milestone 2-2: swap ws.residual/ws.attn_out to iocoherent buffers
+            // before the zero-copy residual map() call below — they are the
+            // primary CPU↔GPU shared buffers on the partition decode path.
+            rewrap_partition_shared_buffers_iocoherent(&*backend, &mut gen_ws, hidden_size);
 
             // Zero-copy residual: permanent-map ws.residual's UnifiedBuffer so the
             // partition decode path can read residual directly via as_ptr() and
@@ -3256,6 +3429,10 @@ fn main() -> anyhow::Result<()> {
         if let Some(ref ctx) = model.layers[0].partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
 
+            // Milestone 2-2: route CPU-shared buffers through the iocoherent
+            // cache policy when LLMRS_QCOM_IOCOHERENT=1 (no-op otherwise).
+            rewrap_partition_shared_buffers_iocoherent(&*backend, &mut gen_ws, hidden_size);
+
             // Zero-copy residual (see line 1807 block for rationale).
             #[cfg(feature = "opencl")]
             if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some() {
@@ -4176,6 +4353,14 @@ fn main() -> anyhow::Result<()> {
                                     if let Some(ref ctx) = model.layers[0].partition_ctx {
                                         let gpu_alloc =
                                             make_partition_gpu_alloc(&*backend, decode_mem);
+                                        // Milestone 2-2: iocoherent rewrap
+                                        // (no-op unless LLMRS_QCOM_IOCOHERENT=1
+                                        // + Adreno extension present).
+                                        rewrap_partition_shared_buffers_iocoherent(
+                                            &*backend,
+                                            &mut gen_ws,
+                                            hidden_size,
+                                        );
                                         gen_ws.partition_ws = Some(PartitionWorkspace::new(
                                             ctx,
                                             ffn_hidden,
@@ -4386,6 +4571,13 @@ fn main() -> anyhow::Result<()> {
                             // stays on the dense GPU path.
                             if let Some(ref ctx) = model.layers[0].partition_ctx {
                                 let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
+                                // Milestone 2-2: iocoherent rewrap (no-op unless
+                                // LLMRS_QCOM_IOCOHERENT=1 + Adreno extension).
+                                rewrap_partition_shared_buffers_iocoherent(
+                                    &*backend,
+                                    &mut gen_ws,
+                                    hidden_size,
+                                );
                                 if let Ok(ws) = PartitionWorkspace::new(
                                     ctx,
                                     ffn_hidden,
