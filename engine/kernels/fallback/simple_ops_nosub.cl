@@ -252,7 +252,7 @@ kernel void kernel_attn_gen(
     global float * K,
     global float * V,
     global float * O,
-    global float * S,            // score output [num_heads_q, score_stride]
+    global float * S,            // score output [n_layers, num_heads_q, score_stride]
     int head_dim,
     int num_heads_q,
     int num_heads_kv,
@@ -262,6 +262,7 @@ kernel void kernel_attn_gen(
     int kv_head_stride,
     int write_scores,            // 0=skip, 1=write
     int score_stride,            // stride between heads in S
+    int score_layer_offset,      // base offset in S for this layer (= layer_idx * num_heads_q * score_stride)
     local float * scratch
 ) {
     int head_idx = get_group_id(0);
@@ -330,7 +331,7 @@ kernel void kernel_attn_gen(
         float weight = exp(score * scale - max_score) / total_sum;
 
         if (write_scores) {
-            S[head_idx * score_stride + t] = weight;
+            S[score_layer_offset + head_idx * score_stride + t] = weight;
         }
 
         global float * v_ptr = V + kv_base + t * kv_pos_stride;
@@ -516,7 +517,7 @@ kernel void kernel_attn_gen_half(
     global half * K,
     global half * V,
     global float * O,
-    global float * S,            // score output [num_heads_q, score_stride]
+    global float * S,            // score output [n_layers, num_heads_q, score_stride]
     int head_dim,
     int num_heads_q,
     int num_heads_kv,
@@ -526,6 +527,7 @@ kernel void kernel_attn_gen_half(
     int kv_head_stride,
     int write_scores,            // 0=skip, 1=write
     int score_stride,            // stride between heads in S
+    int score_layer_offset,      // base offset in S for this layer (= layer_idx * num_heads_q * score_stride)
     local float * scratch
 ) {
     int head_idx = get_group_id(0);
@@ -591,7 +593,7 @@ kernel void kernel_attn_gen_half(
         float weight = exp(score * scale - max_score) / total_sum;
 
         if (write_scores) {
-            S[head_idx * score_stride + t] = weight;
+            S[score_layer_offset + head_idx * score_stride + t] = weight;
         }
 
         global half * v_ptr = V + kv_base + t * kv_pos_stride;

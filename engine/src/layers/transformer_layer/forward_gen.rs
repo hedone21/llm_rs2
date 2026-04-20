@@ -476,6 +476,21 @@ impl TransformerLayer {
                 // GPU attention or F16 KV cache - use backend's dtype-aware implementation.
                 // When need_scores is true, attention_gen() writes post-softmax scores
                 // directly into ws.scores, eliminating the separate CPU score recomputation.
+                //
+                // GPU score accumulator path: mod.rs::attention_gen reads the current
+                // layer index from the accumulator to route writes into the correct
+                // [n_layers, n_heads_q, score_stride] slice of `score_buf`. The plan
+                // path pre-bakes this offset at build time; the non-plan (forward_gen)
+                // path must set it dynamically per layer.
+                #[cfg(feature = "opencl")]
+                if let Some(ocl_be) = backend
+                    .as_any()
+                    .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+                    && let Some(gpu_acc) = ocl_be.gpu_score_acc_mut()
+                    && gpu_acc.is_active()
+                {
+                    gpu_acc.set_current_layer_idx(layer_idx);
+                }
                 let trace_q1 = is_gpu && std::env::var_os("LLMRS_TRACE_Q1").is_some();
                 if trace_q1 {
                     backend.synchronize()?;

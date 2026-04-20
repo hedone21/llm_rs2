@@ -484,22 +484,12 @@ impl FullKernelPlan {
                         q2t,
                         rt,
                     );
-                    // GPU score accumulator: reduce per-layer scores into the
-                    // step buffers immediately after the attention kernel, so
-                    // the next layer can safely reuse `score_buf`. Mirrors the
-                    // runtime flow in `OpenCLBackend::attention_gen` (mod.rs:3939).
-                    if self.writes_gpu_scores
-                        && let Some(gpu_acc) = backend.gpu_score_acc()
-                        && gpu_acc.is_active()
-                        && let Err(e) = gpu_acc.reduce_layer(queue, attn_seq_len as usize)
-                    {
-                        log::error!(
-                            "Plan reduce_layer failed: layer={} n_kv={}: {}",
-                            i,
-                            attn_seq_len,
-                            e
-                        );
-                    }
+                    // GPU score accumulator: per-layer scores now live in the
+                    // layer's own slice of `score_buf` (offset pre-baked at
+                    // plan-build time, see `LayerPlanConfig::gpu_score_layer_offset`).
+                    // A single fused reduce kernel folds all layers into
+                    // cumulative importance at `end_step()` after the final
+                    // layer — no per-layer dispatch needed here.
                     if debug_sync {
                         eprintln!("[Plan] L{} attention enqueued, calling finish...", i);
                         ocl::core::finish(queue).ok();
@@ -841,6 +831,13 @@ pub struct LayerPlanConfig<'a> {
     /// Score stride (= `max_seq_len`) matching `gpu_score_buf` layout. Unused
     /// when `gpu_score_buf` is `None`.
     pub gpu_score_stride: i32,
+    /// Base offset (in f32 elements) for this layer's slice of `gpu_score_buf`.
+    /// The score buffer has layout `[n_layers, n_heads_q, score_stride]`, so
+    /// layer `l`'s base offset is `l * n_heads_q * score_stride`. This is
+    /// pre-baked into the attention kernel's `score_layer_offset` arg by the
+    /// layer builder, avoiding per-token arg updates. Unused when
+    /// `gpu_score_buf` is `None`.
+    pub gpu_score_layer_offset: i32,
     // -- Q4_0 noshuffle matmul support --
     /// Pre-compiled noshuffle GEMV programs, keyed by ne01 (M dimension).
     /// When `Some`, matmul steps use Q4_0 noshuffle dispatch instead of F16.
@@ -1750,6 +1747,11 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(
                 &kernel,
                 14,
+                ocl::core::ArgVal::scalar(&config.gpu_score_layer_offset),
+            )?;
+            ocl::core::set_kernel_arg(
+                &kernel,
+                15,
                 ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
             )?;
         }
@@ -2143,6 +2145,13 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             needs_attention_scores: config.needs_attention_scores,
             gpu_score_buf: config.gpu_score_buf,
             gpu_score_stride: config.gpu_score_stride,
+            // Per-layer offset into the [n_layers, n_heads_q, score_stride]
+            // score buffer (in f32 elements). Pre-baked into the attention
+            // kernel's `score_layer_offset` arg so each layer writes into its
+            // own slice without per-token arg updates.
+            gpu_score_layer_offset: (i as i32)
+                * (config.n_heads_q as i32)
+                * config.gpu_score_stride,
             noshuffle_programs: config.noshuffle_programs.as_ref(),
             wq_noshuffle: lb.wq_noshuffle,
             wk_noshuffle: lb.wk_noshuffle,
@@ -2533,9 +2542,12 @@ fn make_kivi_assembled_attn_step(
         ocl::core::set_kernel_arg(&kernel, 11, ocl::core::ArgVal::scalar(&kv_head_stride))?;
         ocl::core::set_kernel_arg(&kernel, 12, ocl::core::ArgVal::scalar(&write_scores))?;
         ocl::core::set_kernel_arg(&kernel, 13, ocl::core::ArgVal::scalar(&score_stride))?;
+        // KIVI assembled path does not collect scores, so score_layer_offset
+        // is a no-op; pass 0.
+        ocl::core::set_kernel_arg(&kernel, 14, ocl::core::ArgVal::scalar(&0i32))?;
         ocl::core::set_kernel_arg(
             &kernel,
-            14,
+            15,
             ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
         )?;
     }
@@ -2716,6 +2728,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             needs_attention_scores: false,
             gpu_score_buf: None,
             gpu_score_stride: 0,
+            gpu_score_layer_offset: 0,
             // KIVI currently only supports F16 weights — no noshuffle.
             noshuffle_programs: None,
             wq_noshuffle: None,

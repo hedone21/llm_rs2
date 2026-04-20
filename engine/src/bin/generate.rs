@@ -1482,6 +1482,7 @@ fn main() -> anyhow::Result<()> {
             .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
     {
         match ocl_be.init_gpu_score_acc(
+            model.config.num_hidden_layers,
             model.config.num_attention_heads,
             model.config.num_key_value_heads,
             max_seq_len,

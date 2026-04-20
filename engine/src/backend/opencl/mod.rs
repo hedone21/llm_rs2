@@ -1358,6 +1358,7 @@ impl OpenCLBackend {
     /// Must be called before the decode loop starts.
     pub fn init_gpu_score_acc(
         &self,
+        n_layers: usize,
         n_heads_q: usize,
         n_kv_heads: usize,
         max_seq_len: usize,
@@ -1368,6 +1369,7 @@ impl OpenCLBackend {
             self.context.as_core(),
             self.device.as_core(),
             &self.cl_opts,
+            n_layers,
             n_heads_q,
             n_kv_heads,
             max_seq_len,
@@ -1378,7 +1380,8 @@ impl OpenCLBackend {
             *self.gpu_score_acc.get() = Some(acc);
         }
         log::info!(
-            "GPU score accumulator initialized (n_heads_q={}, n_kv_heads={}, max_seq={})",
+            "GPU score accumulator initialized (n_layers={}, n_heads_q={}, n_kv_heads={}, max_seq={})",
+            n_layers,
             n_heads_q,
             n_kv_heads,
             max_seq_len
@@ -3855,9 +3858,10 @@ impl Backend for OpenCLBackend {
         let gpu_acc = unsafe { &*self.gpu_score_acc.get() };
         let use_gpu_acc = gpu_acc.as_ref().is_some_and(|acc| acc.is_active());
 
-        let (write_scores, score_stride_val) = if use_gpu_acc {
+        let (write_scores, score_stride_val, score_layer_offset) = if use_gpu_acc {
             let acc = gpu_acc.as_ref().unwrap();
-            (1i32, acc.score_stride() as i32)
+            let offset = acc.layer_offset_elems(acc.current_layer_idx()) as i32;
+            (1i32, acc.score_stride() as i32, offset)
         } else {
             (
                 scores_out.is_some() as i32,
@@ -3865,6 +3869,7 @@ impl Backend for OpenCLBackend {
                     .as_ref()
                     .map(|s| (s.len() / num_heads_q) as i32)
                     .unwrap_or(0),
+                0i32,
             )
         };
 
@@ -3915,9 +3920,10 @@ impl Backend for OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 11, ocl::core::ArgVal::scalar(&kv_head_stride))?;
             ocl::core::set_kernel_arg(kernel, 12, ocl::core::ArgVal::scalar(&write_scores))?;
             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&score_stride_val))?;
+            ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&score_layer_offset))?;
             ocl::core::set_kernel_arg(
                 kernel,
-                14,
+                15,
                 ocl::core::ArgVal::local::<f32>(&local_mem_size),
             )?;
 
@@ -3934,14 +3940,11 @@ impl Backend for OpenCLBackend {
         }
 
         // Post-kernel score handling:
-        // GPU acc path: run reduce_layer kernel (no CPU readback)
-        // Legacy path: blocking GPU->CPU readback of scores
+        // GPU acc path: scores stay in the per-layer slice of score_buf; a
+        // single fused reduce kernel runs at end_step() (see gpu_score.rs).
+        // Legacy path: blocking GPU->CPU readback of scores.
         if use_gpu_acc {
-            // SAFETY: single-threaded access
-            let acc = unsafe { &*self.gpu_score_acc.get() };
-            if let Some(acc) = acc.as_ref() {
-                acc.reduce_layer(self.queue.as_core(), cache_seq_len)?;
-            }
+            // Nothing to do per layer — fused reduce runs at end_step().
         } else if let (Some(scores), Some(buf)) = (scores_out, &score_buf) {
             unsafe {
                 ocl::core::enqueue_read_buffer(

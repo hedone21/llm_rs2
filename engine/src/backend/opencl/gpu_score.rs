@@ -4,33 +4,35 @@
 //! kernels entirely on the device, eliminating per-token GPU->CPU blocking
 //! reads (~129ms/token). CPU readback occurs only at eviction time.
 //!
-//! # Workflow
+//! # Workflow (fused variant, 2026-04-20)
 //!
 //! Per decode token:
-//! 1. `attention_gen` writes post-softmax scores to `score_buf` (persistent GPU buffer)
-//! 2. `reduce_layer()` runs `kernel_score_reduce` after each layer
-//! 3. `end_step()` runs `kernel_score_end_step` + clears step buffers
+//! 1. For each layer l, `attention_gen` writes post-softmax scores into the
+//!    `[l, :, :]` slice of the per-token `score_buf`
+//!    (`layer_offset(l) = l * n_heads_q * score_stride`).
+//! 2. At end of token, `end_step()` dispatches a single fused reduce kernel
+//!    that iterates all layers, computes MAX-across-layers of both flat and
+//!    per-KV-head aggregates, applies exponential decay, and adds into the
+//!    cumulative `importance` / `head_importance` buffers directly.
+//!
+//! This replaces the older per-layer reduce (28 dispatches/token on
+//! Qwen2.5-1.5B) + `end_step` + 2×clear (= 31 dispatches) with a single
+//! per-token dispatch, eliminating ~500-700 us of Adreno launch overhead.
 //!
 //! At eviction time:
-//! 4. `sync_to_cpu()` does a single blocking readback of cumulative importance
-//! 5. `reset()` clears cumulative buffers after eviction
+//! 3. `sync_to_cpu()` does a single blocking readback of cumulative importance.
+//! 4. `reset()` clears cumulative buffers after eviction.
 
 use anyhow::Result;
 use ocl::core::Kernel as CoreKernel;
 
 /// GPU-resident score accumulator that avoids per-token GPU->CPU readback.
 pub struct GpuScoreAccumulator {
-    /// Persistent GPU buffer for attention scores output.
-    /// Layout: `[n_heads_q * score_stride]` where score_stride >= max_seq_len.
-    /// Reused by `attention_gen` kernel across all layers/tokens.
+    /// Persistent GPU buffer for per-layer attention scores output.
+    /// Layout: `[n_layers, n_heads_q, score_stride]` where score_stride == max_seq_len.
+    /// The attention kernel for layer `l` writes into slice
+    /// `score_buf[l * n_heads_q * score_stride .. (l+1) * n_heads_q * score_stride]`.
     score_buf: ocl::core::Mem,
-
-    /// Step-local flat importance buffer: `[max_seq_len]`.
-    /// Aggregates per-layer scores via MAX within a single decode step.
-    step_flat: ocl::core::Mem,
-
-    /// Step-local per-KV-head importance: `[n_kv_heads * max_seq_len]`.
-    step_head: ocl::core::Mem,
 
     /// Cumulative flat importance: `[max_seq_len]`.
     /// Grows over decode steps with exponential decay.
@@ -40,11 +42,10 @@ pub struct GpuScoreAccumulator {
     head_importance: ocl::core::Mem,
 
     // --- Cached kernels ---
-    kernel_reduce: CoreKernel,
-    kernel_end_step: CoreKernel,
-    kernel_clear: CoreKernel,
+    kernel_fused_reduce: CoreKernel,
 
     // --- Config ---
+    n_layers: usize,
     n_heads_q: usize,
     n_kv_heads: usize,
     max_seq_len: usize,
@@ -54,6 +55,11 @@ pub struct GpuScoreAccumulator {
     decay_factor: f32,
     active: bool,
     steps_accumulated: usize,
+    /// Current layer index (0..n_layers). Non-plan callers (`forward_gen`)
+    /// set this before `attention_gen` so the mod.rs arg binding can write
+    /// to the correct layer slice of `score_buf`. The plan path pre-bakes
+    /// the layer offset into each layer's kernel args and does not use this.
+    current_layer_idx: usize,
 }
 
 // SAFETY: GpuScoreAccumulator is only accessed from the inference thread,
@@ -64,19 +70,32 @@ unsafe impl Sync for GpuScoreAccumulator {}
 impl GpuScoreAccumulator {
     /// Create a new GPU score accumulator.
     ///
-    /// Compiles the score_reduce.cl kernels and allocates persistent GPU buffers.
+    /// Compiles the score_reduce.cl kernel and allocates persistent GPU buffers.
     /// Returns an error if kernel compilation or buffer allocation fails.
+    ///
+    /// `n_layers` controls the per-layer partitioning of `score_buf`. Memory
+    /// footprint for Qwen2.5-1.5B (n_layers=28, n_heads_q=12, max_seq=2048):
+    /// 28 * 12 * 2048 * 4B = 2.625 MiB — acceptable on Adreno.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         queue: &ocl::core::CommandQueue,
         context: &ocl::core::Context,
         device: &ocl::core::DeviceId,
         cl_opts: &str,
+        n_layers: usize,
         n_heads_q: usize,
         n_kv_heads: usize,
         max_seq_len: usize,
         decay: f32,
     ) -> Result<Self> {
+        if n_kv_heads > 16 {
+            anyhow::bail!(
+                "GpuScoreAccumulator: n_kv_heads={} exceeds fused kernel limit of 16; \
+                 increase step_head_local[] size in score_reduce.cl if needed",
+                n_kv_heads
+            );
+        }
+
         let src = include_str!("../../../kernels/score_reduce.cl");
         let program = ocl::core::create_build_program(
             context,
@@ -86,12 +105,10 @@ impl GpuScoreAccumulator {
         )
         .map_err(|e| anyhow::anyhow!("score_reduce.cl compilation failed: {}", e))?;
 
-        let kernel_reduce = ocl::core::create_kernel(&program, "kernel_score_reduce")?;
-        let kernel_end_step = ocl::core::create_kernel(&program, "kernel_score_end_step")?;
-        let kernel_clear = ocl::core::create_kernel(&program, "kernel_score_clear")?;
+        let kernel_fused_reduce = ocl::core::create_kernel(&program, "kernel_score_fused_reduce")?;
 
         let score_stride = max_seq_len;
-        let score_buf_size = n_heads_q * score_stride;
+        let score_buf_size = n_layers * n_heads_q * score_stride;
         let flat_size = max_seq_len;
         let head_size = n_kv_heads * max_seq_len;
 
@@ -105,14 +122,6 @@ impl GpuScoreAccumulator {
             )?
         };
 
-        let step_flat = unsafe {
-            ocl::core::create_buffer::<_, f32>(context, ocl::core::MEM_READ_WRITE, flat_size, None)?
-        };
-
-        let step_head = unsafe {
-            ocl::core::create_buffer::<_, f32>(context, ocl::core::MEM_READ_WRITE, head_size, None)?
-        };
-
         let importance = unsafe {
             ocl::core::create_buffer::<_, f32>(context, ocl::core::MEM_READ_WRITE, flat_size, None)?
         };
@@ -121,29 +130,14 @@ impl GpuScoreAccumulator {
             ocl::core::create_buffer::<_, f32>(context, ocl::core::MEM_READ_WRITE, head_size, None)?
         };
 
-        // Zero-initialize all buffers
+        // Zero-initialize cumulative buffers and score buffer (score_buf zero is
+        // important because the fused reduce reads every layer; any layer that
+        // didn't write for some reason would otherwise contribute stale data
+        // from a prior allocation).
         let zeros_flat = vec![0.0f32; flat_size];
         let zeros_head = vec![0.0f32; head_size];
         let zeros_score = vec![0.0f32; score_buf_size];
         unsafe {
-            ocl::core::enqueue_write_buffer(
-                queue,
-                &step_flat,
-                true,
-                0,
-                &zeros_flat,
-                None::<ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-            ocl::core::enqueue_write_buffer(
-                queue,
-                &step_head,
-                true,
-                0,
-                &zeros_head,
-                None::<ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
             ocl::core::enqueue_write_buffer(
                 queue,
                 &importance,
@@ -175,13 +169,10 @@ impl GpuScoreAccumulator {
 
         Ok(Self {
             score_buf,
-            step_flat,
-            step_head,
             importance,
             head_importance,
-            kernel_reduce,
-            kernel_end_step,
-            kernel_clear,
+            kernel_fused_reduce,
+            n_layers,
             n_heads_q,
             n_kv_heads,
             max_seq_len,
@@ -189,11 +180,13 @@ impl GpuScoreAccumulator {
             decay_factor: (1.0 - decay).clamp(0.0, 1.0),
             active: false,
             steps_accumulated: 0,
+            current_layer_idx: 0,
         })
     }
 
     /// Get the persistent GPU score buffer for use by `attention_gen`.
-    /// The attention kernel writes post-softmax scores here.
+    /// The attention kernel writes post-softmax scores here, at the offset
+    /// `current_layer_idx * n_heads_q * score_stride`.
     #[inline]
     pub fn score_buf_mem(&self) -> &ocl::core::Mem {
         &self.score_buf
@@ -211,71 +204,48 @@ impl GpuScoreAccumulator {
         self.n_heads_q
     }
 
-    /// Run the per-layer score reduction kernel.
-    ///
-    /// Called after each `attention_gen` call to aggregate scores from the
-    /// persistent `score_buf` into step-local `step_flat` and `step_head`.
-    pub fn reduce_layer(
-        &self,
-        queue: &ocl::core::CommandQueue,
-        cache_seq_len: usize,
-    ) -> Result<()> {
-        if !self.active || cache_seq_len == 0 {
-            return Ok(());
-        }
+    /// Number of layers (partition count of `score_buf`).
+    #[inline]
+    pub fn n_layers(&self) -> usize {
+        self.n_layers
+    }
 
-        let kernel = &self.kernel_reduce;
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&self.score_buf))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&self.step_flat))?;
-            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&self.step_head))?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                3,
-                ocl::core::ArgVal::scalar(&(self.n_heads_q as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                4,
-                ocl::core::ArgVal::scalar(&(self.n_kv_heads as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                5,
-                ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                6,
-                ocl::core::ArgVal::scalar(&(self.score_stride as i32)),
-            )?;
-            ocl::core::set_kernel_arg(
-                kernel,
-                7,
-                ocl::core::ArgVal::scalar(&(self.max_seq_len as i32)),
-            )?;
+    /// Compute the base offset (in f32 elements) for a given layer's slice of
+    /// `score_buf`. Callers that pre-bake the offset at plan-build time (plan.rs)
+    /// use this; the runtime non-plan path reads `current_layer_idx()` instead.
+    #[inline]
+    pub fn layer_offset_elems(&self, layer_idx: usize) -> usize {
+        layer_idx * self.n_heads_q * self.score_stride
+    }
 
-            let gws = [Self::round_up(cache_seq_len, 64), 1, 1];
-            let lws = [64, 1, 1];
+    /// Set the current layer index for the next `attention_gen` call (non-plan
+    /// path only; the plan path pre-bakes per-layer offsets into kernel args).
+    #[inline]
+    pub fn set_current_layer_idx(&mut self, layer_idx: usize) {
+        debug_assert!(
+            layer_idx < self.n_layers,
+            "layer_idx={} exceeds n_layers={}",
+            layer_idx,
+            self.n_layers
+        );
+        self.current_layer_idx = layer_idx;
+    }
 
-            ocl::core::enqueue_kernel(
-                queue,
-                kernel,
-                1,
-                None,
-                &gws,
-                Some(lws),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-        }
-        Ok(())
+    /// Get the current layer index.
+    #[inline]
+    pub fn current_layer_idx(&self) -> usize {
+        self.current_layer_idx
     }
 
     /// End the current decode step.
     ///
-    /// Flushes step-local importance into cumulative importance with decay,
-    /// then clears step buffers for the next token.
+    /// Dispatches the fused reduce kernel that iterates all layers,
+    /// aggregates per-layer scores (flat sum, per-head GQA avg), applies
+    /// MAX across layers, and updates cumulative importance + head_importance
+    /// with exponential decay — all in a single kernel.
+    ///
+    /// This replaces the former per-layer `reduce_layer` (28 dispatches) +
+    /// `end_step` + 2 × clear (31 total) sequence with one dispatch.
     pub fn end_step(
         &mut self,
         queue: &ocl::core::CommandQueue,
@@ -285,27 +255,40 @@ impl GpuScoreAccumulator {
             return Ok(());
         }
 
-        // 1. Flush step -> cumulative with decay
-        let kernel = &self.kernel_end_step;
+        let kernel = &self.kernel_fused_reduce;
         unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&self.importance))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&self.step_flat))?;
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(&self.score_buf))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(&self.importance))?;
             ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(&self.head_importance))?;
-            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(&self.step_head))?;
-            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&self.decay_factor))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::scalar(&self.decay_factor))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                4,
+                ocl::core::ArgVal::scalar(&(self.n_layers as i32)),
+            )?;
             ocl::core::set_kernel_arg(
                 kernel,
                 5,
-                ocl::core::ArgVal::scalar(&(self.n_kv_heads as i32)),
+                ocl::core::ArgVal::scalar(&(self.n_heads_q as i32)),
             )?;
             ocl::core::set_kernel_arg(
                 kernel,
                 6,
-                ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
+                ocl::core::ArgVal::scalar(&(self.n_kv_heads as i32)),
             )?;
             ocl::core::set_kernel_arg(
                 kernel,
                 7,
+                ocl::core::ArgVal::scalar(&(cache_seq_len as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                8,
+                ocl::core::ArgVal::scalar(&(self.score_stride as i32)),
+            )?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                9,
                 ocl::core::ArgVal::scalar(&(self.max_seq_len as i32)),
             )?;
 
@@ -324,10 +307,14 @@ impl GpuScoreAccumulator {
             )?;
         }
 
-        // 2. Clear step buffers for next token
-        self.clear_step_buffers(queue)?;
-
         self.steps_accumulated += 1;
+        // Advance the layer index counter back to 0 for the next token so the
+        // non-plan path (which calls set_current_layer_idx per layer) starts
+        // clean. The score_buf contents from this token are now folded into
+        // `importance` / `head_importance`; the next token's per-layer writes
+        // will simply overwrite the slices (fused reduce reads before any
+        // subsequent writes of the same slot).
+        self.current_layer_idx = 0;
         Ok(())
     }
 
@@ -367,11 +354,30 @@ impl GpuScoreAccumulator {
     pub fn reset(&mut self, queue: &ocl::core::CommandQueue) -> Result<()> {
         let flat_size = self.max_seq_len;
         let head_size = self.n_kv_heads * self.max_seq_len;
-
-        self.clear_buffer(queue, &self.importance, flat_size)?;
-        self.clear_buffer(queue, &self.head_importance, head_size)?;
-        self.clear_step_buffers(queue)?;
+        let zeros_flat = vec![0.0f32; flat_size];
+        let zeros_head = vec![0.0f32; head_size];
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.importance,
+                true,
+                0,
+                &zeros_flat,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+            ocl::core::enqueue_write_buffer(
+                queue,
+                &self.head_importance,
+                true,
+                0,
+                &zeros_head,
+                None::<ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
         self.steps_accumulated = 0;
+        self.current_layer_idx = 0;
         Ok(())
     }
 
@@ -391,45 +397,6 @@ impl GpuScoreAccumulator {
     }
 
     // --- Internal helpers ---
-
-    fn clear_step_buffers(&self, queue: &ocl::core::CommandQueue) -> Result<()> {
-        let flat_size = self.max_seq_len;
-        let head_size = self.n_kv_heads * self.max_seq_len;
-        self.clear_buffer(queue, &self.step_flat, flat_size)?;
-        self.clear_buffer(queue, &self.step_head, head_size)?;
-        Ok(())
-    }
-
-    fn clear_buffer(
-        &self,
-        queue: &ocl::core::CommandQueue,
-        buf: &ocl::core::Mem,
-        n: usize,
-    ) -> Result<()> {
-        if n == 0 {
-            return Ok(());
-        }
-        let kernel = &self.kernel_clear;
-        unsafe {
-            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(buf))?;
-            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::scalar(&(n as i32)))?;
-
-            let gws = [Self::round_up(n, 256), 1, 1];
-            let lws = [256, 1, 1];
-
-            ocl::core::enqueue_kernel(
-                queue,
-                kernel,
-                1,
-                None,
-                &gws,
-                Some(lws),
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-        }
-        Ok(())
-    }
 
     #[inline]
     fn round_up(n: usize, multiple: usize) -> usize {

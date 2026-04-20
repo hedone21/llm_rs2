@@ -1,29 +1,43 @@
-// GPU-side attention score reduction kernels.
-// Accumulates post-softmax attention scores entirely on GPU,
-// eliminating per-token GPU->CPU blocking readback (~129ms/token).
+// GPU-side attention score reduction — fused single-dispatch variant.
 //
-// Flow per decode token:
-//   1. kernel_attn_gen writes scores to persistent GPU buffer
-//   2. kernel_score_reduce: per-layer reduction (MAX across layers within step)
-//   3. kernel_score_end_step: flush step scores into cumulative importance (with decay)
-//   4. kernel_score_clear: zero step buffers for next token
+// Older design (pre-fused):
+//   - kernel_score_reduce    per layer (28x/token on Qwen2.5-1.5B)
+//   - kernel_score_end_step  1x/token
+//   - kernel_score_clear     2x/token
+//   => 31 dispatches/token, ~500-700 us of launch overhead on Adreno.
 //
-// Readback happens only at eviction time (1 blocking read per eviction event).
+// New design:
+//   1. kernel_attn_gen writes scores to a per-layer slice of a
+//      [n_layers, n_heads_q, score_stride] score buffer.
+//   2. kernel_score_fused_reduce runs ONCE per token, iterating all
+//      layers to compute MAX-across-layers of per-token aggregated
+//      scores, and directly applies exponential decay + add into
+//      cumulative importance buffers.
+//
+// Readback still happens only at eviction time (1 blocking read per
+// eviction event).
 
-// Reduce attention scores from one layer into step-local buffers.
-// Called once per layer (16x per token for Llama 3.2 1B).
+// Fused reduction:
+//   * Loops across layers for MAX aggregation (commutative, idempotent).
+//   * Applies decay to the previous cumulative value once and adds the
+//     aggregated step score.
+//   * Handles both flat (sum over Q-heads) and per-KV-head (avg Q-heads
+//     within GQA group) importance in a single pass so we only read the
+//     score buffer once per (layer, t).
 //
-// scores: [n_heads_q * score_stride] - post-softmax attention weights from kernel_attn_gen
-// step_flat: [max_seq_len] - step-local flat importance (MAX across layers)
-// step_head: [n_kv_heads * max_seq_len] - step-local per-KV-head importance (MAX across layers)
+// scores: [n_layers, n_heads_q, score_stride] - post-softmax attn weights
+//   slot(layer, h, t) = layer * (n_heads_q * score_stride) + h * score_stride + t
+// importance: [max_seq_len] - cumulative flat importance (in-place update)
+// head_importance: [n_kv_heads * max_seq_len] - cumulative per-head importance (in-place)
+// decay_factor: (1.0 - decay), applied to cumulative before adding step contribution.
 //
 // Each work-item processes one token position t.
-// Flat: sum all Q-head scores for token t, then MAX with step_flat[t].
-// Per-head: average Q-heads within each GQA group, then MAX with step_head[kv*max_seq+t].
-__kernel void kernel_score_reduce(
+__kernel void kernel_score_fused_reduce(
     __global const float * scores,
-    __global float * step_flat,
-    __global float * step_head,
+    __global float * importance,
+    __global float * head_importance,
+    float decay_factor,
+    int n_layers,
     int n_heads_q,
     int n_kv_heads,
     int cache_seq_len,
@@ -34,66 +48,49 @@ __kernel void kernel_score_reduce(
     if (t >= cache_seq_len) return;
 
     int n_rep = n_heads_q / n_kv_heads;
-
-    // Sum all Q-head scores for flat importance
-    float total = 0.0f;
-    for (int h = 0; h < n_heads_q; h++) {
-        total += scores[h * score_stride + t];
-    }
-
-    // Accumulate flat (MAX across layers within step)
-    step_flat[t] = max(step_flat[t], total);
-
-    // GQA per-KV-head average
     float inv_rep = 1.0f / (float)n_rep;
+    int layer_stride = n_heads_q * score_stride;
+
+    // MAX across layers of (sum over Q-heads of weights[l, h, t]).
+    float step_flat = 0.0f;
+    // MAX across layers of (avg over Q-heads within GQA group of weights[l, kv*n_rep+r, t]).
+    // Materialised into per-kv local array so the (l, h) loop can update both
+    // flat and per-head state in a single read of each score element.
+    // n_kv_heads <= 16 in every supported model (Qwen2.5-1.5B = 2, Llama 3.2 1B = 8,
+    // Gemma 3 = 4). Using a fixed-size stack array avoids dynamic allocation.
+    float step_head_local[16];
     for (int kv = 0; kv < n_kv_heads; kv++) {
-        float group_sum = 0.0f;
-        for (int r = 0; r < n_rep; r++) {
-            group_sum += scores[(kv * n_rep + r) * score_stride + t];
+        step_head_local[kv] = 0.0f;
+    }
+
+    for (int l = 0; l < n_layers; l++) {
+        int layer_base = l * layer_stride;
+
+        // Pass 1: flat sum + per-head accumulation for this layer.
+        float layer_flat = 0.0f;
+        // Per-layer per-kv group sum.
+        float layer_head[16];
+        for (int kv = 0; kv < n_kv_heads; kv++) {
+            layer_head[kv] = 0.0f;
         }
-        float avg = group_sum * inv_rep;
-        int idx = kv * max_seq_len + t;
-        step_head[idx] = max(step_head[idx], avg);
+
+        for (int h = 0; h < n_heads_q; h++) {
+            float w = scores[layer_base + h * score_stride + t];
+            layer_flat += w;
+            int kv = h / n_rep;
+            layer_head[kv] += w;
+        }
+
+        step_flat = fmax(step_flat, layer_flat);
+        for (int kv = 0; kv < n_kv_heads; kv++) {
+            float avg = layer_head[kv] * inv_rep;
+            step_head_local[kv] = fmax(step_head_local[kv], avg);
+        }
     }
-}
 
-// Flush step-local importance into cumulative importance with exponential decay.
-// Called once per token after all layers are processed.
-//
-// importance: [max_seq_len] - cumulative flat importance
-// step_flat: [max_seq_len] - step-local flat importance (consumed then cleared)
-// head_importance: [n_kv_heads * max_seq_len] - cumulative per-head importance
-// step_head: [n_kv_heads * max_seq_len] - step-local per-head (consumed then cleared)
-// decay_factor: (1.0 - decay), applied to cumulative before adding step scores
-//
-// Each work-item processes one token position t.
-__kernel void kernel_score_end_step(
-    __global float * importance,
-    __global const float * step_flat,
-    __global float * head_importance,
-    __global const float * step_head,
-    float decay_factor,
-    int n_kv_heads,
-    int cache_seq_len,
-    int max_seq_len
-) {
-    int t = get_global_id(0);
-    if (t >= cache_seq_len) return;
-
-    importance[t] = importance[t] * decay_factor + step_flat[t];
-
+    importance[t] = importance[t] * decay_factor + step_flat;
     for (int kv = 0; kv < n_kv_heads; kv++) {
         int idx = kv * max_seq_len + t;
-        head_importance[idx] = head_importance[idx] * decay_factor + step_head[idx];
+        head_importance[idx] = head_importance[idx] * decay_factor + step_head_local[kv];
     }
-}
-
-// Clear a float buffer (set to zero).
-// Used to zero step_flat and step_head after end_step.
-__kernel void kernel_score_clear(
-    __global float * buf,
-    int n
-) {
-    int i = get_global_id(0);
-    if (i < n) buf[i] = 0.0f;
 }
