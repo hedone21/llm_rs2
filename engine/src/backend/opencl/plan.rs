@@ -561,9 +561,7 @@ impl PartitionStep {
         //    `LLMRS_PARTITION_SKIP_GPU_WAIT=1` to opt out for A/B on
         //    hardware where bit-exactness is re-validated.
         let skip_gpu_wait = std::env::var_os("LLMRS_PARTITION_SKIP_GPU_WAIT").is_some();
-        if !skip_gpu_wait
-            && let Err(e) = ocl::core::finish(queue)
-        {
+        if !skip_gpu_wait && let Err(e) = ocl::core::finish(queue) {
             log::error!(
                 "PartitionStep GPU wait failed: layer={} err={}",
                 layer_idx,
@@ -607,47 +605,48 @@ impl PartitionStep {
         // kernel-read. Fallback to the legacy upload path when mapping is
         // unavailable (e.g. discrete OpenCL device, env opt-out).
         let staging_host_ptr = pw.cpu_merge_staging.buffer().as_mut_ptr();
-        let upload_cpu_partial = |fallback_label: &str| -> std::result::Result<(), PlanInvalidated> {
-            if !staging_host_ptr.is_null() {
-                // SAFETY: `staging_host_ptr` is from ALLOC_HOST_PTR-backed
-                // buffer, mapped for the workspace lifetime. Non-overlapping
-                // with `down_partial_cpu` (separate allocations).
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        cpu_partial_slice.as_ptr(),
-                        staging_host_ptr,
-                        cpu_partial_slice.len(),
-                    );
+        let upload_cpu_partial =
+            |fallback_label: &str| -> std::result::Result<(), PlanInvalidated> {
+                if !staging_host_ptr.is_null() {
+                    // SAFETY: `staging_host_ptr` is from ALLOC_HOST_PTR-backed
+                    // buffer, mapped for the workspace lifetime. Non-overlapping
+                    // with `down_partial_cpu` (separate allocations).
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            cpu_partial_slice.as_ptr(),
+                            staging_host_ptr,
+                            cpu_partial_slice.len(),
+                        );
+                    }
+                    // Release fence: ensure CPU stores to the zero-copy staging
+                    // buffer commit before the in-order queue starts executing
+                    // `add_assign` (which reads the same ALLOC_HOST_PTR region
+                    // via GPU). On ARM Adreno UMA this is the minimum barrier
+                    // required when the gpu_wait drain is skipped.
+                    std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                    return Ok(());
                 }
-                // Release fence: ensure CPU stores to the zero-copy staging
-                // buffer commit before the in-order queue starts executing
-                // `add_assign` (which reads the same ALLOC_HOST_PTR region
-                // via GPU). On ARM Adreno UMA this is the minimum barrier
-                // required when the gpu_wait drain is skipped.
-                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
-                return Ok(());
-            }
-            if let Err(e) = unsafe {
-                ocl::core::enqueue_write_buffer(
-                    queue,
-                    staging_mem,
-                    true,
-                    0,
-                    cpu_partial_slice,
-                    None::<&ocl::core::Event>,
-                    None::<&mut ocl::core::Event>,
-                )
-            } {
-                log::error!(
-                    "PartitionStep CPU partial upload failed ({}): layer={} err={}",
-                    fallback_label,
-                    layer_idx,
-                    e
-                );
-                return Err(PlanInvalidated);
-            }
-            Ok(())
-        };
+                if let Err(e) = unsafe {
+                    ocl::core::enqueue_write_buffer(
+                        queue,
+                        staging_mem,
+                        true,
+                        0,
+                        cpu_partial_slice,
+                        None::<&ocl::core::Event>,
+                        None::<&mut ocl::core::Event>,
+                    )
+                } {
+                    log::error!(
+                        "PartitionStep CPU partial upload failed ({}): layer={} err={}",
+                        fallback_label,
+                        layer_idx,
+                        e
+                    );
+                    return Err(PlanInvalidated);
+                }
+                Ok(())
+            };
 
         match &self.merge {
             PartitionMerge::Inline {
@@ -1518,6 +1517,13 @@ pub struct LayerPlanConfig<'a> {
     pub w_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    /// Partition slice SOA entries. Populated when `partition_ctx` is active
+    /// and the slice cl_mems have been registered via
+    /// `prepare_noshuffle_buffers`. `build_partitioned_layer_plan` consults
+    /// these before falling back to the AOS GEMV kernel.
+    pub partition_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub partition_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub partition_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
 }
 
 /// Lightweight reference to a noshuffle SOA entry for plan building.
@@ -2816,8 +2822,12 @@ pub fn build_partitioned_layer_plan(
         crate::backend::opencl::get_cl_mem(partition_ctx.down.gpu_slice.buffer().as_ref())
             .context("partition down slice cl_mem")?;
 
-    // Dtype dispatch: partition weights inherit the base model dtype. Q4_0
-    // partition slices use the AOS path (no noshuffle SOA registered).
+    // Dtype dispatch: partition weights inherit the base model dtype. When
+    // Q4_0 partition slices have been registered in the backend's noshuffle
+    // SOA registry (via `prepare_noshuffle_buffers`), prefer the
+    // Adreno-optimized `kernel_gemv_noshuffle_q4_0` path; otherwise fall back
+    // to the AOS `kernel_mul_mat_q4_0_f32`. The F16 path forwards the L4
+    // program so large slices select the N_DST=4 kernel.
     let gate_dtype = partition_ctx.gate.gpu_slice.dtype();
     let use_q4_0 = gate_dtype == crate::core::buffer::DType::Q4_0;
 
@@ -2826,19 +2836,27 @@ pub fn build_partitioned_layer_plan(
                         dst: &Mem,
                         n: usize,
                         k: usize,
-                        tag: OpTag|
+                        tag: OpTag,
+                        ns: Option<&NoshufflePlanEntry>|
      -> Result<KernelStep> {
         if use_q4_0 {
+            if let (Some(entry), Some(progs)) = (ns, config.noshuffle_programs)
+                && let Some(prog) = progs.get(&entry.ne01)
+            {
+                return make_q4_0_noshuffle_matmul_step(
+                    prog,
+                    config.context.as_core(),
+                    entry.q_img,
+                    entry.d_buf,
+                    src,
+                    dst,
+                    entry.ne00,
+                    entry.ne01,
+                    tag,
+                );
+            }
             make_q4_0_aos_matmul_step(config.q4_0_program, weight, src, dst, k, n, tag)
         } else {
-            // F16 path (default for F16/BF16). Forward the L4 program handle
-            // so the N_DST=4 kernel (half WG count, activation reuse across
-            // 4 rows) is selected when the slice output dim exceeds
-            // LARGE_N_THRESHOLD — matching the non-partition `build_layer_plan`
-            // behaviour. Previously this was pinned to `None`, forcing
-            // partition F16 slices onto the slower N_DST=2 kernel even for
-            // large FFN hidden (measured ~1.6 ms/layer overhead on Qwen
-            // 2.5-1.5B at r=0.95, 2026-04-22).
             make_f16_matmul_step(
                 config.f16_program,
                 src,
@@ -2861,6 +2879,7 @@ pub fn build_partitioned_layer_plan(
         split_row,
         dim,
         OpTag::MatmulGateUp,
+        config.partition_gate_noshuffle.as_ref(),
     )?;
     let gpu_up = build_matmul(
         config.residual_buf,
@@ -2869,6 +2888,7 @@ pub fn build_partitioned_layer_plan(
         split_row,
         dim,
         OpTag::MatmulGateUp,
+        config.partition_up_noshuffle.as_ref(),
     )?;
 
     // SiLU/GELU × up into gate_gpu (in place). split_row must be multiple of 4.
@@ -2907,6 +2927,7 @@ pub fn build_partitioned_layer_plan(
         dim,
         split_row,
         OpTag::MatmulDown,
+        config.partition_down_noshuffle.as_ref(),
     )?;
 
     // ── Merge sub-steps ──
@@ -3144,6 +3165,14 @@ pub struct LayerBufs<'a> {
     pub w_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub w_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    /// Q4_0 noshuffle SOA entries for partition-path slice weights. Populated
+    /// by `transformer::build_plan` when the layer has a `PartitionContext`
+    /// and `prepare_noshuffle_buffers` has registered the slices. Used by
+    /// `build_partitioned_layer_plan` to route the GPU FFN slice through
+    /// `kernel_gemv_noshuffle_q4_0` instead of the slower AOS GEMV.
+    pub partition_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub partition_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    pub partition_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
 }
 
 /// Per-layer KV cache buffer references.
@@ -3229,6 +3258,9 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             w_gate_noshuffle: lb.w_gate_noshuffle,
             w_up_noshuffle: lb.w_up_noshuffle,
             w_down_noshuffle: lb.w_down_noshuffle,
+            partition_gate_noshuffle: lb.partition_gate_noshuffle,
+            partition_up_noshuffle: lb.partition_up_noshuffle,
+            partition_down_noshuffle: lb.partition_down_noshuffle,
         };
         // Route through the partition builder when this layer has a
         // `PartitionContext` attached AND the plan-path feature is enabled.
@@ -3855,6 +3887,9 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             w_gate_noshuffle: None,
             w_up_noshuffle: None,
             w_down_noshuffle: None,
+            partition_gate_noshuffle: None,
+            partition_up_noshuffle: None,
+            partition_down_noshuffle: None,
         };
         layers.push(
             build_kivi_layer_plan(

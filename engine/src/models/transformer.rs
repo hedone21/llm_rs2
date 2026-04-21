@@ -514,6 +514,20 @@ impl TransformerModel {
                     count += 1;
                 }
             }
+            // Partition slices: when `--tensor-partition <r>` is active the
+            // plan-path FFN dispatches onto `partition_ctx.{gate,up,down}.
+            // gpu_slice`. Without SOA these fall back to the AOS GEMV kernel
+            // which is measurably slower than noshuffle on Adreno 830 (see
+            // build_partitioned_layer_plan). Register the sub-buffer cl_mems
+            // here so the plan builder can look them up via the same key
+            // scheme used for full weights.
+            if let Some(ref ctx) = layer.partition_ctx {
+                for weight in [&ctx.gate.gpu_slice, &ctx.up.gpu_slice, &ctx.down.gpu_slice] {
+                    if process_weight(weight)? {
+                        count += 1;
+                    }
+                }
+            }
         }
 
         // lm_head (only if on GPU)
@@ -1160,6 +1174,15 @@ impl TransformerModel {
                 Some(bias) => (Some(cl!(bias.bq)), Some(cl!(bias.bk)), Some(cl!(bias.bv))),
                 None => (None, None, None),
             };
+            let (partition_gate_ns, partition_up_ns, partition_down_ns) =
+                match layer.partition_ctx.as_ref() {
+                    Some(ctx) => (
+                        ns_entry(&ctx.gate.gpu_slice),
+                        ns_entry(&ctx.up.gpu_slice),
+                        ns_entry(&ctx.down.gpu_slice),
+                    ),
+                    None => (None, None, None),
+                };
             layer_bufs.push(LayerBufs {
                 wq: cl!(layer.wq),
                 wk: cl!(layer.wk),
@@ -1180,6 +1203,9 @@ impl TransformerModel {
                 w_gate_noshuffle: ns_entry(&layer.w_gate),
                 w_up_noshuffle: ns_entry(&layer.w_up),
                 w_down_noshuffle: ns_entry(&layer.w_down),
+                partition_gate_noshuffle: partition_gate_ns,
+                partition_up_noshuffle: partition_up_ns,
+                partition_down_noshuffle: partition_down_ns,
             });
             kv_bufs_vec.push(KvBufs {
                 k_cache: cl!(kv_caches[i].k_buffer),
@@ -1189,7 +1215,9 @@ impl TransformerModel {
 
         // Build noshuffle GEMV programs if Q4_0 (compile per unique ne01 dimension).
         let noshuffle_programs = if is_q4_0 {
-            // Collect unique ne01 values from all noshuffle entries
+            // Collect unique ne01 values from all noshuffle entries — including
+            // partition slice entries whose `ne01` (split_row or hidden_size)
+            // typically differs from the full weight's ne01.
             let mut ne01_set: Vec<usize> = layer_bufs
                 .iter()
                 .flat_map(|lb| {
@@ -1201,6 +1229,9 @@ impl TransformerModel {
                         lb.w_gate_noshuffle.as_ref(),
                         lb.w_up_noshuffle.as_ref(),
                         lb.w_down_noshuffle.as_ref(),
+                        lb.partition_gate_noshuffle.as_ref(),
+                        lb.partition_up_noshuffle.as_ref(),
+                        lb.partition_down_noshuffle.as_ref(),
                     ]
                     .into_iter()
                     .flatten()
@@ -1387,7 +1418,7 @@ impl TransformerModel {
             match &result {
                 Ok(()) => {
                     let n = OK_CNT.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n == 1 || n.is_power_of_two() || n % 32 == 0 {
+                    if n == 1 || n.is_power_of_two() || n.is_multiple_of(32) {
                         eprintln!(
                             "[plan-trace] execute_plan ok={} err={}",
                             n,
@@ -1509,6 +1540,9 @@ impl TransformerModel {
                 w_gate_noshuffle: None,
                 w_up_noshuffle: None,
                 w_down_noshuffle: None,
+                partition_gate_noshuffle: None,
+                partition_up_noshuffle: None,
+                partition_down_noshuffle: None,
             });
 
             let plan_bufs = kv_caches[i].get_plan_gpu_buffers()?;
