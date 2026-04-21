@@ -1307,6 +1307,11 @@ impl TransformerModel {
             up_buf: cl!(ws.up),
             down_buf: cl!(ws.down),
             residual_buf: cl!(ws.residual),
+            // Permanent-mapped host ptr when residual UnifiedBuffer has
+            // been mapped (LLMRS_PARTITION_ZCOPY_RESIDUAL or the
+            // partition poll-flag auto-enable). `as_ptr()` returns null
+            // when unmapped.
+            residual_host_ptr: ws.residual.buffer().as_ptr(),
             kv_bufs: kv_bufs_vec,
             final_norm_buf: cl!(self.norm),
             lm_head_buf: if self.lm_head_on_cpu {

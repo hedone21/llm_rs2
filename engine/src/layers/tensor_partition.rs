@@ -570,6 +570,22 @@ pub fn partition_plan_enabled() -> bool {
     })
 }
 
+/// When enabled, `PartitionStep::run` skips the explicit `clFinish(queue)`
+/// wait for `add_rms_norm_oop` and instead spin-polls an ALLOC_HOST_PTR
+/// flag written by the `kernel_add_rms_norm_oop_f4_sigflag` variant. This
+/// elides Adreno driver submission/completion latency (~0.29 ms/layer on
+/// S25) at the cost of a busy-wait CPU loop scoped to that window.
+///
+/// Default: **disabled** (opt-in). Enable with `LLMRS_PARTITION_POLL_FLAG=1`.
+pub fn partition_poll_flag_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LLMRS_PARTITION_POLL_FLAG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// Diagnostic gate for the plan-path partition executor. When enabled, each
 /// sub-step inside `PartitionStep::run` is followed by a blocking `clFinish`
 /// and a stderr line with the sub-step label. Intended for debugging sync

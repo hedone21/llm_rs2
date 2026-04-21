@@ -260,6 +260,85 @@ kernel void kernel_add_rms_norm_oop_f4(
     }
 }
 
+// Variant of kernel_add_rms_norm_oop_f4 that signals completion by writing
+// 1 to a host-visible flag (CL_MEM_ALLOC_HOST_PTR). Used by tensor-partition
+// plan path to let the CPU spin-poll instead of blocking on
+// `clFinish(queue)` — shaves Adreno driver submission/completion latency
+// (~0.3 ms/layer) off the partition critical path.
+//
+// Correctness requirements:
+//   - Single work-group (row count == 1, i.e. decode m=1).
+//   - `ready_flag` points to a 4-byte ALLOC_HOST_PTR buffer initialized to 0
+//     by the CPU before the kernel is enqueued.
+//   - `barrier(CLK_GLOBAL_MEM_FENCE)` + `atomic_xchg` establishes a release
+//     edge: the CPU, after observing flag==1 via an acquire fence, is
+//     guaranteed to see the preceding stores to `out`.
+#ifdef ADRENO_GPU
+REQD_SUBGROUP_SIZE_64
+#endif
+kernel void kernel_add_rms_norm_oop_f4_sigflag(
+    global float * x,
+    global float * residual,
+    global float * out,
+    global float * weight,
+    int dim,
+    float eps,
+    int add_unit,
+    global volatile int * ready_flag,
+    local float * scratch
+) {
+    int row = get_group_id(0);
+    int lid = get_local_id(0);
+    int local_size = get_local_size(0);
+
+    global float4 * x_v = (global float4 *)(x + row * dim);
+    global float4 * res_v = (global float4 *)(residual + row * dim);
+    global float4 * out_v = (global float4 *)(out + row * dim);
+    global float4 * w_v = (global float4 *)weight;
+    int dim_v = dim >> 2;
+
+    float sum_sq = 0.0f;
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 v = x_v[i] + res_v[i];
+        x_v[i] = v;
+        sum_sq += dot(v, v);
+    }
+
+    sum_sq = sub_group_reduce_add(sum_sq);
+    if (get_sub_group_local_id() == 0) {
+        scratch[get_sub_group_id()] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int num_subgroups = local_size / get_max_sub_group_size();
+    if (get_sub_group_id() == 0) {
+        float val = (get_sub_group_local_id() < num_subgroups) ? scratch[get_sub_group_local_id()] : 0.0f;
+        sum_sq = sub_group_reduce_add(val);
+    }
+    if (lid == 0) {
+        scratch[0] = sum_sq;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    sum_sq = scratch[0];
+
+    float rms = sqrt(sum_sq / (float)dim + eps);
+    float scale = 1.0f / rms;
+    float4 ones = (float4)(1.0f, 1.0f, 1.0f, 1.0f);
+
+    for (int i = lid; i < dim_v; i += local_size) {
+        float4 w = w_v[i];
+        if (add_unit) w = w + ones;
+        out_v[i] = x_v[i] * scale * w;
+    }
+
+    // Release edge: wait for all work-items in the WG to finish writing
+    // `out`, then publish the ready flag.
+    barrier(CLK_GLOBAL_MEM_FENCE);
+    if (lid == 0) {
+        atomic_xchg(ready_flag, 1);
+    }
+}
+
 // Fused 3-input merge + out-of-place RMSNorm for tensor-partition layer boundary.
 //
 // Replaces the decode-path layer merge (copy_slice gpu->down, copy_slice cpu->staging,

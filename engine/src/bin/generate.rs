@@ -1820,9 +1820,13 @@ fn main() -> anyhow::Result<()> {
             // Zero-copy residual: permanent-map ws.residual's UnifiedBuffer so the
             // partition decode path can read residual directly via as_ptr() and
             // skip the per-layer read_buffer DMA (currently ~1.15 ms/layer).
-            // Gate behind LLMRS_PARTITION_ZCOPY_RESIDUAL=1 for A/B benchmarking.
+            // Gate behind LLMRS_PARTITION_ZCOPY_RESIDUAL=1, or auto-enable when
+            // poll-flag mode is active (skipping the read_buffer is the whole
+            // point of the spin-poll path).
             #[cfg(feature = "opencl")]
-            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some() {
+            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some()
+                || llm_rs2::layers::tensor_partition::partition_poll_flag_enabled()
+            {
                 if let Some(ub) = gen_ws
                     .residual
                     .buffer()
@@ -3274,7 +3278,9 @@ fn main() -> anyhow::Result<()> {
 
             // Zero-copy residual (see line 1807 block for rationale).
             #[cfg(feature = "opencl")]
-            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some() {
+            if std::env::var_os("LLMRS_PARTITION_ZCOPY_RESIDUAL").is_some()
+                || llm_rs2::layers::tensor_partition::partition_poll_flag_enabled()
+            {
                 if let Some(ub) = gen_ws
                     .residual
                     .buffer()

@@ -311,6 +311,13 @@ pub struct PartitionPlanContext {
     /// (plan invalidation on UMA remapping). Currently informational only.
     #[allow(dead_code)]
     pub residual_buf_handle: Mem,
+    /// Permanent-mapped host pointer for `residual_buf_handle`. Non-null
+    /// only when the residual cl_mem is an ALLOC_HOST_PTR UnifiedBuffer
+    /// with `.map()` held for the plan's lifetime — which the poll-flag
+    /// path auto-enables. When available, `PartitionStep::run` reads
+    /// residual directly via this pointer instead of issuing a blocking
+    /// `enqueue_read_buffer`.
+    pub residual_host_ptr: *const u8,
     #[allow(dead_code)]
     pub x_buf_handle: Mem,
     #[allow(dead_code)]
@@ -434,12 +441,71 @@ impl PartitionStep {
         };
 
         // 2. Sync + read residual into CPU workspace.
-        //    The plan path only supports SyncRead today — zcopy/async/replicate
-        //    are rejected at build time. `ocl::core::finish` drains the
-        //    in-order queue (add_rms_norm_oop + prior ops) and issues the
-        //    ARM UMA cache flush needed before the host read.
+        //    Default path: `ocl::core::finish` drains the in-order queue
+        //    (add_rms_norm_oop + prior ops) and issues the ARM UMA cache
+        //    flush needed before the host read.
+        //    Poll-flag path (LLMRS_PARTITION_POLL_FLAG=1): the sigflag
+        //    kernel variant wrote `ready_flag=1` after the residual store
+        //    with an atomic_xchg release edge. CPU spin-polls the host
+        //    pointer instead of blocking on `clFinish` — skipping the
+        //    ~0.29 ms Adreno driver round-trip. The blocking
+        //    `enqueue_read_buffer` that follows still serves as an
+        //    in-order sync point (fast because add_rms_norm_oop is already
+        //    done) and performs the residual DMA read.
         let queue = backend.queue.as_core();
-        if let Err(e) = ocl::core::finish(queue) {
+        let poll_flag = crate::layers::tensor_partition::partition_poll_flag_enabled();
+        // SAFETY: `workspace` is owned by this plan and only accessed here.
+        let pw: &mut PartitionPlanWorkspace = unsafe { &mut *self.cpu_ctx.workspace.get() };
+        if poll_flag {
+            let flag_ptr = pw.ready_flag.buffer().as_mut_ptr() as *mut i32;
+            if flag_ptr.is_null() {
+                log::error!(
+                    "PartitionStep poll flag host ptr is null: layer={} (ALLOC_HOST_PTR map failed?)",
+                    layer_idx,
+                );
+                return Err(PlanInvalidated);
+            }
+            // Flush host's pending enqueues so the sigflag kernel is
+            // submitted to the GPU. Without this, the CPU would spin on a
+            // flag that the driver hasn't even handed to hardware yet.
+            if let Err(e) = ocl::core::flush(queue) {
+                log::error!(
+                    "PartitionStep flush pre-poll failed: layer={} err={}",
+                    layer_idx,
+                    e
+                );
+                return Err(PlanInvalidated);
+            }
+            // Spin until the GPU signals completion. Cap iterations to
+            // bail out if the kernel crashed or the flag path is broken,
+            // so the engine degrades to `PlanInvalidated` rather than
+            // hanging forever.
+            const MAX_SPINS: u64 = 50_000_000; // ~seconds on a 3 GHz core
+            let mut spins = 0u64;
+            loop {
+                let v = unsafe { std::ptr::read_volatile(flag_ptr) };
+                if v != 0 {
+                    break;
+                }
+                std::hint::spin_loop();
+                spins += 1;
+                if spins == MAX_SPINS {
+                    log::error!(
+                        "PartitionStep poll-flag timeout: layer={}",
+                        layer_idx,
+                    );
+                    return Err(PlanInvalidated);
+                }
+            }
+            // Acquire fence: pair with the GPU's atomic_xchg release so
+            // subsequent residual reads observe the sigflag kernel's
+            // stores.
+            std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+            // Reset the flag for the next layer's sigflag kernel.
+            unsafe {
+                std::ptr::write_volatile(flag_ptr, 0);
+            }
+        } else if let Err(e) = ocl::core::finish(queue) {
             log::error!(
                 "PartitionStep synchronize failed: layer={} err={}",
                 layer_idx,
@@ -453,16 +519,32 @@ impl PartitionStep {
             None
         };
 
-        // SAFETY: `workspace` is owned by this plan and only accessed here.
-        let pw: &mut PartitionPlanWorkspace = unsafe { &mut *self.cpu_ctx.workspace.get() };
-
         // Read residual into CPU-visible buffer. The pre-bound cl_mem is the
         // canonical source; a blocking `enqueue_read_buffer` guarantees the
         // bytes land in `pw.residual_cpu` before the CPU FFN chain starts.
+        //
+        // Poll-flag fast path: when the residual buffer is a permanent-mapped
+        // ALLOC_HOST_PTR UnifiedBuffer and the sigflag release has already
+        // been observed, `residual_host_ptr` points into the same physical
+        // memory. memcpy straight from there — no DMA, no driver
+        // round-trip. The CPU matmul still runs against `pw.residual_cpu`
+        // for cache locality.
         let residual_bytes = pw.residual_cpu.size();
         let residual_slice =
             unsafe { std::slice::from_raw_parts_mut(pw.residual_cpu.as_mut_ptr(), residual_bytes) };
-        if let Err(e) = unsafe {
+        if poll_flag && !self.cpu_ctx.residual_host_ptr.is_null() {
+            // SAFETY: `residual_host_ptr` wraps a permanent-mapped
+            // ALLOC_HOST_PTR region backing the same cl_mem the GPU wrote
+            // to. The acquire fence above pairs with the sigflag kernel's
+            // atomic_xchg release, making the residual stores visible.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.cpu_ctx.residual_host_ptr,
+                    residual_slice.as_mut_ptr(),
+                    residual_bytes,
+                );
+            }
+        } else if let Err(e) = unsafe {
             ocl::core::enqueue_read_buffer(
                 queue,
                 &self.cpu_ctx.residual_buf_handle,
@@ -1524,6 +1606,18 @@ pub struct LayerPlanConfig<'a> {
     pub partition_gate_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub partition_up_noshuffle: Option<NoshufflePlanEntry<'a>>,
     pub partition_down_noshuffle: Option<NoshufflePlanEntry<'a>>,
+    /// Partition ready-flag buffer. When `Some`, `build_layer_plan` selects
+    /// the `_sigflag` variant for step 10 (`add_rms_norm_oop`) and binds
+    /// this cl_mem as the flag output. `PartitionStep::run` then
+    /// spin-polls the host-mapped side instead of calling `clFinish` —
+    /// only valid with `partition_poll_flag_enabled()`.
+    pub partition_ready_flag_buf: Option<&'a Mem>,
+    /// Permanent-mapped host pointer for `residual_buf`. When non-null,
+    /// the partition plan path can read residual directly via this
+    /// pointer (skipping the blocking `enqueue_read_buffer`). Only used
+    /// by `build_partitioned_layer_plan` to stash into
+    /// `PartitionPlanContext.residual_host_ptr`.
+    pub residual_host_ptr: *const u8,
 }
 
 /// Lightweight reference to a noshuffle SOA entry for plan building.
@@ -2541,8 +2635,15 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     }
 
     // 10. add_rms_norm_oop (x += attn_out, then norm -> residual)
+    //     Optional: when `partition_ready_flag_buf` is set, use the
+    //     `_sigflag` variant that writes a host-visible flag after the
+    //     residual store (release semantics). `PartitionStep::run` then
+    //     spin-polls the flag instead of blocking on `clFinish(queue)`.
     {
-        let kernel_name = if dim % 4 == 0 {
+        let use_sigflag = config.partition_ready_flag_buf.is_some() && dim.is_multiple_of(4);
+        let kernel_name = if use_sigflag {
+            "kernel_add_rms_norm_oop_f4_sigflag"
+        } else if dim.is_multiple_of(4) {
             "kernel_add_rms_norm_oop_f4"
         } else {
             "kernel_add_rms_norm_oop"
@@ -2558,11 +2659,22 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ocl::core::set_kernel_arg(&kernel, 5, ocl::core::ArgVal::scalar(&config.rms_norm_eps))?;
             // add_unit = 0 (non-Gemma3)
             ocl::core::set_kernel_arg(&kernel, 6, ocl::core::ArgVal::scalar(&0i32))?;
-            ocl::core::set_kernel_arg(
-                &kernel,
-                7,
-                ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
-            )?;
+            if use_sigflag {
+                // SAFETY: existence checked above.
+                let flag_buf = config.partition_ready_flag_buf.unwrap();
+                ocl::core::set_kernel_arg(&kernel, 7, ocl::core::ArgVal::mem(flag_buf))?;
+                ocl::core::set_kernel_arg(
+                    &kernel,
+                    8,
+                    ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
+                )?;
+            } else {
+                ocl::core::set_kernel_arg(
+                    &kernel,
+                    7,
+                    ocl::core::ArgVal::local::<f32>(&local_mem_bytes),
+                )?;
+            }
         }
         steps_post_attn_pre_ffn.push(KernelStep {
             kernel,
@@ -3012,6 +3124,7 @@ pub fn build_partitioned_layer_plan(
         down_cpu: partition_ctx.down.cpu_slice.clone(),
         workspace: workspace.clone(),
         residual_buf_handle: config.residual_buf.clone(),
+        residual_host_ptr: config.residual_host_ptr,
         x_buf_handle: config.x_buf.clone(),
         attn_out_buf_handle: config.attn_out_buf.clone(),
         use_gelu_tanh,
@@ -3084,6 +3197,11 @@ pub struct FullPlanConfig<'a> {
     pub up_buf: &'a Mem,
     pub down_buf: &'a Mem,
     pub residual_buf: &'a Mem,
+    /// Permanent-mapped host pointer backing `residual_buf`, if the
+    /// residual tensor is an ALLOC_HOST_PTR UnifiedBuffer with `.map()`
+    /// held for the plan's lifetime. `null` otherwise. Propagated into
+    /// `LayerPlanConfig.residual_host_ptr` for partition plan builds.
+    pub residual_host_ptr: *const u8,
     // Per-layer KV cache buffers
     pub kv_bufs: Vec<KvBufs<'a>>,
     // Final norm + lm_head
@@ -3187,6 +3305,31 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     let n_k = config.n_kv_heads * config.head_dim;
     let n_v = n_k;
 
+    // Extract the partition ready-flag cl_mem once per plan build so every
+    // layer with a `PartitionContext` can point its `add_rms_norm_oop`
+    // step at the shared flag buffer. Only active when the opt-in poll
+    // mode is enabled (otherwise the sigflag kernel variant is skipped
+    // and the classic `clFinish` drain in `PartitionStep::run` is used).
+    let partition_ready_flag_mem: Option<&Mem> = if crate::layers::tensor_partition::partition_poll_flag_enabled()
+        && config
+            .partition_layers
+            .as_ref()
+            .is_some_and(|v| v.iter().any(|p| p.is_some()))
+    {
+        config
+            .partition_workspace
+            .as_ref()
+            .and_then(|ws| {
+                // SAFETY: `workspace` is only mutated from the dispatch
+                // thread; here we only read the tensor's buffer handle to
+                // extract its cl_mem for pre-binding.
+                let pw = unsafe { &*ws.get() };
+                crate::backend::opencl::get_cl_mem(pw.ready_flag.buffer().as_ref()).ok()
+            })
+    } else {
+        None
+    };
+
     let mut layers = Vec::with_capacity(config.layer_bufs.len());
     for (i, (lb, kb)) in config
         .layer_bufs
@@ -3261,6 +3404,19 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             partition_gate_noshuffle: lb.partition_gate_noshuffle,
             partition_up_noshuffle: lb.partition_up_noshuffle,
             partition_down_noshuffle: lb.partition_down_noshuffle,
+            partition_ready_flag_buf: if config
+                .partition_layers
+                .as_ref()
+                .and_then(|v| v.get(i))
+                .copied()
+                .flatten()
+                .is_some()
+            {
+                partition_ready_flag_mem
+            } else {
+                None
+            },
+            residual_host_ptr: config.residual_host_ptr,
         };
         // Route through the partition builder when this layer has a
         // `PartitionContext` attached AND the plan-path feature is enabled.
@@ -3890,6 +4046,8 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             partition_gate_noshuffle: None,
             partition_up_noshuffle: None,
             partition_down_noshuffle: None,
+            partition_ready_flag_buf: None,
+            residual_host_ptr: std::ptr::null(),
         };
         layers.push(
             build_kivi_layer_plan(

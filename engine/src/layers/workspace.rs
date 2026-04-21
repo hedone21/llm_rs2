@@ -152,6 +152,7 @@ impl LayerWorkspace {
                         down_partial_gpu: pw.down_partial_gpu.clone(),
                         down_partial_cpu: pw.down_partial_cpu.clone(),
                         cpu_merge_staging: pw.cpu_merge_staging.clone(),
+                        ready_flag: pw.ready_flag.clone(),
                     })
                 });
                 let pw = cell.0.into_inner();
@@ -166,6 +167,7 @@ impl LayerWorkspace {
                     down_partial_gpu: retag(pw.down_partial_gpu),
                     down_partial_cpu: retag(pw.down_partial_cpu),
                     cpu_merge_staging: retag(pw.cpu_merge_staging),
+                    ready_flag: retag(pw.ready_flag),
                 }))
             }),
             partition_prev_gpu_partial: self.partition_prev_gpu_partial.map(&retag),
@@ -327,6 +329,13 @@ pub struct PartitionWorkspace {
     /// GPU-side staging buffer to upload the CPU partial for the final
     /// elementwise add: [1, 1, hidden_size].
     pub cpu_merge_staging: Tensor,
+    /// Host-visible 4-byte flag (CL_MEM_ALLOC_HOST_PTR, permanent-mapped).
+    /// Written by the `kernel_add_rms_norm_oop_f4_sigflag` kernel variant
+    /// via `atomic_xchg` once the `residual` output is globally visible;
+    /// `PartitionStep::run` spin-polls this flag instead of calling
+    /// `clFinish(queue)` when `LLMRS_PARTITION_POLL_FLAG=1`. Eliminates
+    /// per-layer driver round-trip latency (~0.29 ms on Adreno 830).
+    pub ready_flag: Tensor,
 }
 
 impl PartitionWorkspace {
@@ -424,6 +433,23 @@ impl PartitionWorkspace {
             let buf = cpu_mem.alloc(hidden_size * 4, DType::F32)?;
             Tensor::new(Shape::new(vec![1, 1, hidden_size]), buf, cpu_backend)
         };
+        // Ready-flag: 4 bytes, GPU-visible + CPU-visible via ALLOC_HOST_PTR.
+        // Permanent-mapped so `as_mut_ptr()` yields the host pointer the
+        // CPU polls while the sigflag kernel signals completion.
+        let ready_flag = Tensor::new(
+            Shape::new(vec![1]),
+            gpu_alloc(4, DType::F32)?,
+            gpu_backend.clone(),
+        );
+        #[cfg(feature = "opencl")]
+        if let Some(ub) = ready_flag
+            .buffer()
+            .as_any()
+            .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+        {
+            let _ = ub.map();
+        }
+
         Ok(Self {
             gate_gpu,
             gate_cpu,
@@ -435,6 +461,7 @@ impl PartitionWorkspace {
             down_partial_gpu,
             down_partial_cpu,
             cpu_merge_staging,
+            ready_flag,
         })
     }
 }
