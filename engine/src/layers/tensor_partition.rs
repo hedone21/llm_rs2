@@ -549,15 +549,14 @@ pub fn partition_replicate_norm_enabled() -> bool {
 /// caller falls back to `forward_gen` — kept as a bit-exact comparison
 /// backstop for the new plan path.
 ///
-/// Default: **disabled** (2026-04-21). Galaxy S25 device validation revealed
-/// that the engine-wide OpenCL plan path produces garbage tokens on Adreno
-/// 830 even without partition (commit 3096de4..master all reproduce
-/// "EQtranslatedまでocab..." on `llama3.2-1b-q4_0.gguf` + `--tensor-partition
-/// 0.0`). The partition integration added in `af11688` only becomes
-/// meaningful once the upstream plan executor parity bug is fixed, so we
-/// default the partition-plan shortcut off to avoid forwarding the breakage
-/// into every partition decode. Set `LLMRS_PARTITION_PLAN=1` to opt in once
-/// the underlying regression is triaged.
+/// Default: **enabled** (2026-04-21 re-enable after lm_head dtype fix). The
+/// plan parity regression that prompted a default-off flip in `49c0d91` was
+/// rooted in the plan building an F16 GEMV step for an F32 `lm_head` (tied
+/// tokens inherited from `token_embd.weight`, which GGUF Llama 3.2 1B stores
+/// as F32). Fixed by gating the plan's lm_head matmul on the weight dtype and
+/// falling back to `backend.matmul_transposed` when no GPU GEMV variant is
+/// available. Set `LLMRS_PARTITION_PLAN=0` to force the legacy `forward_gen`
+/// partition path (bit-exact comparison backstop).
 ///
 /// The decision is cached at first read via `OnceLock` because plan builds
 /// and hot dispatch must observe a single stable value across a generation
@@ -566,8 +565,8 @@ pub fn partition_plan_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("LLMRS_PARTITION_PLAN")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 

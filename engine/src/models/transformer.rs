@@ -1321,6 +1321,7 @@ impl TransformerModel {
                 .iter()
                 .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
             partition_use_gelu_tanh: self.config.arch == crate::models::config::ModelArch::Gemma3,
+            lm_head_dtype: self.lm_head.dtype(),
         };
 
         match build_full_plan(&full_config) {
@@ -1380,9 +1381,23 @@ impl TransformerModel {
 
         match plan.execute(ocl_backend, start_pos, kv_caches) {
             Ok(()) => {
-                // If lm_head was skipped in the plan (on CPU), run CPU fallback.
+                // `plan.lm_head` is None in two scenarios:
+                //   1. `self.lm_head_on_cpu == true` (large tied embedding
+                //      kept on CPU to fit alloc limits).
+                //   2. `self.lm_head` is on GPU but its dtype has no
+                //      matching GPU GEMV variant in the plan builder (e.g.
+                //      F32 `token_embd.weight` from GGUF Llama 3.2 1B,
+                //      inherited by the tied lm_head via `copy_weight_from`).
+                //      Non-plan paths handle this via `matmul_transposed`
+                //      dispatch on dtype; the plan has no F32 step, so we
+                //      dispatch here instead of CPU-fallback (which would
+                //      require `self.lm_head` to be a CPU tensor).
                 if plan.lm_head.is_none() {
-                    self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                    if self.lm_head_on_cpu {
+                        self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                    } else {
+                        backend.matmul_transposed(x_gen, &self.lm_head, logits_out)?;
+                    }
                 }
                 Ok(true)
             }
@@ -1526,6 +1541,7 @@ impl TransformerModel {
             bits,
             use_native_attn: use_native,
             is_nosub: ocl_backend.is_nosub(),
+            lm_head_dtype: self.lm_head.dtype(),
         };
 
         match build_kivi_full_plan(&kivi_config) {
@@ -1569,7 +1585,11 @@ impl TransformerModel {
         match plan.execute(ocl_backend, start_pos, kv_caches) {
             Ok(()) => {
                 if plan.lm_head.is_none() {
-                    self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                    if self.lm_head_on_cpu {
+                        self.lm_head_matmul_cpu(x_gen, logits_out, backend)?;
+                    } else {
+                        backend.matmul_transposed(x_gen, &self.lm_head, logits_out)?;
+                    }
                 }
                 Ok(true)
             }

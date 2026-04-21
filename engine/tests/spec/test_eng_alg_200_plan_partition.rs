@@ -64,24 +64,24 @@ mod eng_alg_200_host {
 
     /// partition_plan_enabled()의 기본값 검증.
     ///
-    /// 환경 변수 LLMRS_PARTITION_PLAN이 설정되지 않은 경우 false가 기본값
-    /// (2026-04-21 device regression: Adreno 830에서 plan 경로가 partition
-    /// 유무와 무관하게 garbage token을 출력하는 기존 버그가 드러나 opt-in
-    /// 방식으로 복귀). OnceLock으로 캐시되므로 이 테스트는 first-reader가
-    /// 되어야 신뢰성 있음. CI 환경에서는 env var를 설정하지 않고 실행하는
-    /// 것이 전제.
+    /// 환경 변수 LLMRS_PARTITION_PLAN이 설정되지 않은 경우 true가 기본값
+    /// (2026-04-21 late: lm_head dtype 불일치로 인한 plan garbage 버그가
+    /// F32 tied-embedding lm_head에 대한 matmul_transposed fallback으로
+    /// 수정되어 partition plan 경로를 기본으로 복원). OnceLock으로
+    /// 캐시되므로 이 테스트는 first-reader가 되어야 신뢰성 있음. CI
+    /// 환경에서는 env var를 설정하지 않고 실행하는 것이 전제.
     #[test]
-    fn eng_alg_200_partition_plan_default_disabled() {
+    fn eng_alg_200_partition_plan_default_enabled() {
         // env var가 설정된 경우 캐시는 해당 값에 따라 결정됨 — 기본값
         // 단언을 건너뛴다.
         if std::env::var("LLMRS_PARTITION_PLAN").is_ok() {
             return;
         }
-        // OnceLock이 아직 초기화되지 않았다면 기본값은 false.
+        // OnceLock이 아직 초기화되지 않았다면 기본값은 true.
         assert!(
-            !partition_plan_enabled(),
-            "LLMRS_PARTITION_PLAN 미설정 시 partition_plan_enabled() = false (Adreno \
-             regression opt-in 기본값, 2026-04-21 이후)"
+            partition_plan_enabled(),
+            "LLMRS_PARTITION_PLAN 미설정 시 partition_plan_enabled() = true (기본값, \
+             2026-04-21 lm_head dtype fix 이후)"
         );
     }
 

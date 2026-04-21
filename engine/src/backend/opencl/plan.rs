@@ -117,6 +117,31 @@ pub struct KernelStep {
     /// the kernel, leading to SIGSEGV on dispatch.
     #[allow(dead_code)]
     pub retained_bufs: Vec<Mem>,
+    /// Activation image1d_buffer_t recreation hint for the Q4_0 noshuffle GEMV.
+    ///
+    /// The noshuffle GEMV kernel reads its activation through an
+    /// `image1d_buffer_t` (RGBA32F) wrapping a regular `cl_mem` buffer. On
+    /// Adreno 830 (driver v47, OpenCL 3.0), an image created once at plan
+    /// build time and reused across dispatches reads **stale** texels when
+    /// the backing buffer is written by a kernel in the same queue between
+    /// dispatches (the buffer path is coherent; the image-backed-by-buffer
+    /// path is not). The non-plan `matmul_q4_0_noshuffle` path (mod.rs)
+    /// dodges this by recreating the image every call.
+    ///
+    /// When `Some((src_buf, ne00, arg_idx))`, `FullKernelPlan::dispatch_step`
+    /// allocates a fresh image wrapping `src_buf` of width `ne00/4`, sets it
+    /// on argument `arg_idx`, and releases the ephemeral image after the
+    /// enqueue returns (OpenCL refcounting keeps it alive until the driver
+    /// consumes it). Static binding is still used for the nibble image and
+    /// scale buffer (they never change between dispatches).
+    ///
+    /// Currently never set to `Some` — the per-layer noshuffle GEMV images
+    /// do observe preceding buffer writes correctly on Adreno 830, and the
+    /// `lm_head` F32 tied-embedding case (which originally motivated this
+    /// hook) is now handled by the dtype-gated plan builder. Kept as a
+    /// documented escape hatch for future coherency regressions.
+    #[allow(dead_code)]
+    pub noshuffle_act_rebuild: Option<(Mem, usize, u32)>,
 }
 
 // SAFETY: CoreKernel is a raw cl_kernel pointer. We guarantee single-threaded access
@@ -714,6 +739,74 @@ impl FullKernelPlan {
         res_tokens: i32,
     ) {
         let queue = backend.queue.as_core();
+
+        // Q4_0 noshuffle GEMV: recreate the activation `image1d_buffer_t` per
+        // dispatch. Adreno's image cache is NOT coherent with kernel writes to
+        // the underlying buffer across dispatches (see doc on `KernelStep
+        // ::noshuffle_act_rebuild`). Holding the image alive until after
+        // enqueue is sufficient because OpenCL's internal refcount keeps the
+        // cl_mem valid until the driver consumes it.
+        //
+        // Kept outside the `dynamic_args` loop so the lifetime spans the
+        // enqueue below.
+        let _ephemeral_act_img: Option<Mem> =
+            if let Some((ref src_buf, ne00, arg_idx)) = step.noshuffle_act_rebuild {
+                use ocl::core::{
+                    ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat,
+                    MemObjectType,
+                };
+                let fmt = ImageFormat::new(ImageChannelOrder::Rgba, ImageChannelDataType::Float);
+                let desc = ImageDescriptor::new(
+                    MemObjectType::Image1dBuffer,
+                    ne00 / 4,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(src_buf.clone()),
+                );
+                let img_res = unsafe {
+                    ocl::core::create_image(
+                        &backend.context,
+                        ocl::core::MEM_READ_ONLY,
+                        &fmt,
+                        &desc,
+                        None::<&[f32]>,
+                        None,
+                    )
+                };
+                match img_res {
+                    Ok(img) => {
+                        let arg_res = unsafe {
+                            ocl::core::set_kernel_arg(
+                                &step.kernel,
+                                arg_idx,
+                                ocl::core::ArgVal::mem(&img),
+                            )
+                        };
+                        if let Err(e) = arg_res {
+                            log::error!(
+                                "Plan set noshuffle act image arg failed: op={:?} arg_idx={}: {}",
+                                step.op_tag,
+                                arg_idx,
+                                e
+                            );
+                        }
+                        Some(img)
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Plan create noshuffle act image failed: op={:?}: {}",
+                            step.op_tag,
+                            e
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
         for dyn_arg in &step.dynamic_args {
             let (arg_idx, result) = unsafe {
                 match dyn_arg {
@@ -1266,34 +1359,14 @@ impl FullKernelPlan {
             }
         }
 
-        // lm_head matmul (skipped when lm_head is on CPU)
+        // lm_head matmul (skipped when lm_head is on CPU or has an unsupported
+        // dtype — see `build_full_plan` for the dtype gating).
+        //
+        // Route through `dispatch_step` so any future `noshuffle_act_rebuild`
+        // hooks can participate. `dynamic_args` is empty here so there is no
+        // per-token overhead from the dispatcher wrapping.
         if let Some(ref lm_head) = self.lm_head {
-            if backend.profile_events_enabled {
-                if let Err(e) = backend.enqueue_kernel_labeled(
-                    &lm_head.kernel,
-                    lm_head.op_tag.profile_label(),
-                    lm_head.ndim,
-                    &lm_head.global_work_size,
-                    lm_head.local_work_size,
-                ) {
-                    log::error!("Plan enqueue_kernel_labeled lm_head failed: {}", e);
-                }
-            } else {
-                unsafe {
-                    if let Err(e) = ocl::core::enqueue_kernel(
-                        queue,
-                        &lm_head.kernel,
-                        lm_head.ndim,
-                        None,
-                        &lm_head.global_work_size,
-                        lm_head.local_work_size,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    ) {
-                        log::error!("Plan enqueue lm_head failed: {}", e);
-                    }
-                }
-            }
+            Self::dispatch_step(backend, lm_head, 0, 0, 0, 0, 0, 0, 0);
         }
 
         if op_trace {
@@ -1530,6 +1603,7 @@ fn make_f16_matmul_step(
         dynamic_args: vec![],
         op_tag,
         retained_bufs: vec![],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -1621,6 +1695,15 @@ fn make_q4_0_noshuffle_matmul_step(
         dynamic_args: vec![],
         op_tag,
         retained_bufs: vec![act_img],
+        // Per-dispatch image rebuild is unnecessary for the per-layer
+        // matmuls that share `residual_buf`/`gate_buf`/`x_buf` across
+        // sequential kernel dispatches in the same queue — image reads
+        // observe preceding buffer writes correctly on Adreno 830 for
+        // those cases. Left as `None` here to avoid per-token image
+        // allocation overhead (~4 μs × 112 calls). If a future case
+        // surfaces a coherency issue with a specific activation buffer,
+        // flip to `Some((src_buf.clone(), ne00, 2))` for just that step.
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -1683,6 +1766,7 @@ fn make_q4_0_aos_matmul_step(
         dynamic_args: vec![],
         op_tag,
         retained_bufs: vec![],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -1895,6 +1979,7 @@ fn build_flash_attention_step(config: &LayerPlanConfig) -> Result<AttentionVaria
         dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 10 }],
         op_tag: OpTag::Attention,
         retained_bufs,
+        noshuffle_act_rebuild: None,
     }))
 }
 
@@ -1933,6 +2018,7 @@ fn build_add_row_bias_step(
         dynamic_args: vec![],
         op_tag,
         retained_bufs: vec![],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -1984,6 +2070,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![],
             op_tag: OpTag::RmsNorm,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         });
     }
 
@@ -2179,6 +2266,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![DynamicArg::StartPos { arg_idx: 4 }],
             op_tag: OpTag::Rope,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         });
     }
 
@@ -2215,6 +2303,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![DynamicArg::StartPos { arg_idx: 4 }],
             op_tag: OpTag::Rope,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         });
     }
 
@@ -2252,6 +2341,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             ],
             op_tag: OpTag::KvScatter,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         })
     };
 
@@ -2380,6 +2470,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 8 }],
             op_tag: OpTag::Attention,
             retained_bufs: vec![dummy_score_buf],
+            noshuffle_act_rebuild: None,
         })
     };
 
@@ -2450,6 +2541,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![],
             op_tag: OpTag::AddRmsNorm,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         });
     }
 
@@ -2537,6 +2629,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![],
             op_tag: OpTag::SiluMul,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         }
     };
 
@@ -2602,6 +2695,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
             dynamic_args: vec![],
             op_tag: OpTag::AddAssign,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         });
     }
 
@@ -2768,6 +2862,7 @@ pub fn build_partitioned_layer_plan(
             dynamic_args: vec![],
             op_tag: OpTag::SiluMul,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         }
     };
 
@@ -2808,6 +2903,7 @@ pub fn build_partitioned_layer_plan(
             dynamic_args: vec![],
             op_tag: OpTag::AddAssign, // reuse the post-FFN tag for tracing
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         }
     };
 
@@ -2835,6 +2931,7 @@ pub fn build_partitioned_layer_plan(
             dynamic_args: vec![],
             op_tag: OpTag::AddAssign,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         }
     };
 
@@ -2977,6 +3074,17 @@ pub struct FullPlanConfig<'a> {
     /// of the layer config seen by `forward_gen`. Default `false` when
     /// `partition_layers` is not set.
     pub partition_use_gelu_tanh: bool,
+    /// dtype of the lm_head weight tensor. Determines which GPU matmul
+    /// variant the plan binds (noshuffle GEMV for Q4_0, F16 GEMV for F16).
+    /// When the lm_head is stored as F32 (e.g. Llama 3.2 GGUF where
+    /// `token_embd.weight` is F32 and the tied lm_head inherits that dtype),
+    /// the plan **cannot** dispatch it on GPU — the F16 GEMV kernel reads
+    /// 2 bytes per element and would read F32-interpreted-as-F16 halves,
+    /// producing wildly scaled garbage logits. The caller should set this
+    /// to the actual dtype of `lm_head_buf` so `build_full_plan` can skip
+    /// emitting a broken GPU step and let `execute_plan` fall through to
+    /// `lm_head_matmul_cpu`.
+    pub lm_head_dtype: crate::core::buffer::DType,
 }
 
 /// Per-layer weight buffer references.
@@ -3161,11 +3269,16 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
             dynamic_args: vec![],
             op_tag: OpTag::FinalNorm,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         }
     };
 
     // lm_head matmul: x [1, dim] × lm_head [vocab, dim]^T → logits [1, vocab]
-    // None when lm_head is on CPU (large tied embedding that exceeds GPU alloc limit).
+    // None when lm_head is on CPU (large tied embedding that exceeds GPU alloc
+    // limit) OR when the weight dtype has no matching GPU GEMV variant — see
+    // `lm_head_dtype` on FullPlanConfig for why an F32 lm_head must fall
+    // through to CPU even though the buffer is uploaded to GPU.
+    use crate::core::buffer::DType;
     let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
         if let (Some(ns), Some(progs)) = (&config.lm_head_noshuffle, &config.noshuffle_programs) {
             let prog = progs
@@ -3185,7 +3298,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
                 )
                 .context("build lm_head noshuffle matmul step")?,
             )
-        } else {
+        } else if config.lm_head_dtype == DType::F16 {
             Some(
                 make_f16_matmul_step(
                     config.f16_program,
@@ -3200,6 +3313,15 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
                 )
                 .context("build lm_head matmul step")?,
             )
+        } else {
+            // Unsupported dtype for the plan's GPU lm_head dispatch
+            // (F32, tied-embedding case). Return None and let
+            // `execute_plan` fall through to the CPU matmul path.
+            log::info!(
+                "plan: lm_head dtype {:?} has no GPU GEMV variant, falling back to CPU",
+                config.lm_head_dtype
+            );
+            None
         }
     } else {
         None
@@ -3282,6 +3404,8 @@ pub struct KiviFullPlanConfig<'a> {
     pub use_native_attn: bool,
     /// Whether the device lacks subgroup support (nosub fallback path).
     pub is_nosub: bool,
+    /// dtype of the lm_head weight — see doc on `FullPlanConfig::lm_head_dtype`.
+    pub lm_head_dtype: crate::core::buffer::DType,
 }
 
 /// Build a KIVI gather_update kernel step for K or V.
@@ -3318,6 +3442,7 @@ fn make_kivi_gather_step(
         dynamic_args: vec![DynamicArg::ResPos { arg_idx: 6 }],
         op_tag: OpTag::KvScatter, // reuse tag for profiling
         retained_bufs: vec![],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -3362,6 +3487,7 @@ fn make_kivi_scatter_step(
         ],
         op_tag: OpTag::KvScatter,
         retained_bufs: vec![],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -3445,6 +3571,7 @@ fn make_kivi_native_attn_step(
         ],
         op_tag: OpTag::Attention,
         retained_bufs: vec![dummy_score_buf],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -3518,6 +3645,7 @@ fn make_kivi_assembled_attn_step(
         dynamic_args: vec![DynamicArg::CacheSeqLen { arg_idx: 8 }],
         op_tag: OpTag::Attention,
         retained_bufs: vec![dummy_score_buf],
+        noshuffle_act_rebuild: None,
     })
 }
 
@@ -3740,25 +3868,35 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
             dynamic_args: vec![],
             op_tag: OpTag::FinalNorm,
             retained_bufs: vec![],
+            noshuffle_act_rebuild: None,
         }
     };
 
-    // lm_head (None when kept on CPU)
+    // lm_head (None when kept on CPU or dtype has no GPU GEMV — see
+    // FullPlanConfig::lm_head_dtype for the F32 tied-embedding rationale).
     let lm_head = if let Some(lm_head_buf) = config.lm_head_buf {
-        Some(
-            make_f16_matmul_step(
-                config.f16_program,
-                config.x_buf,
-                lm_head_buf,
-                config.logits_buf,
-                config.vocab_size,
-                config.dim,
-                OpTag::LmHead,
-                config.f16_l4_program,
-                config.is_nosub,
+        if config.lm_head_dtype == crate::core::buffer::DType::F16 {
+            Some(
+                make_f16_matmul_step(
+                    config.f16_program,
+                    config.x_buf,
+                    lm_head_buf,
+                    config.logits_buf,
+                    config.vocab_size,
+                    config.dim,
+                    OpTag::LmHead,
+                    config.f16_l4_program,
+                    config.is_nosub,
+                )
+                .context("build lm_head matmul step for KIVI plan")?,
             )
-            .context("build lm_head matmul step for KIVI plan")?,
-        )
+        } else {
+            log::info!(
+                "kivi plan: lm_head dtype {:?} has no GPU GEMV, falling back",
+                config.lm_head_dtype
+            );
+            None
+        }
     } else {
         None
     };
