@@ -2831,7 +2831,14 @@ pub fn build_partitioned_layer_plan(
         if use_q4_0 {
             make_q4_0_aos_matmul_step(config.q4_0_program, weight, src, dst, k, n, tag)
         } else {
-            // F16 path (default for F16/BF16).
+            // F16 path (default for F16/BF16). Forward the L4 program handle
+            // so the N_DST=4 kernel (half WG count, activation reuse across
+            // 4 rows) is selected when the slice output dim exceeds
+            // LARGE_N_THRESHOLD — matching the non-partition `build_layer_plan`
+            // behaviour. Previously this was pinned to `None`, forcing
+            // partition F16 slices onto the slower N_DST=2 kernel even for
+            // large FFN hidden (measured ~1.6 ms/layer overhead on Qwen
+            // 2.5-1.5B at r=0.95, 2026-04-22).
             make_f16_matmul_step(
                 config.f16_program,
                 src,
@@ -2840,7 +2847,7 @@ pub fn build_partitioned_layer_plan(
                 n,
                 k,
                 tag,
-                None,
+                config.f16_l4_program,
                 config.is_nosub,
             )
         }
