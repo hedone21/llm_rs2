@@ -72,6 +72,19 @@ pub struct PartitionContext {
     // `down.split_row` is reused to mean `split_col` — i.e. the number of
     // columns handled on GPU. Its value matches `gate.split_row`.
     pub down: PartitionedWeight,
+    /// INV-120: monotonic counter bumped every time the partition ratio /
+    /// slice geometry changes. Plan builds (see `build_partitioned_layer_plan`
+    /// in `backend/opencl/plan.rs`) capture this value at build time; the
+    /// matching `PartitionStep::run` path checks it on entry and returns
+    /// `PlanInvalidated` when the captured value no longer matches. This keeps
+    /// stale plans from dispatching against freshly re-sliced `cl_mem`
+    /// handles (the cause of R-PP2 in `arch/plan_partition_integration.md`).
+    ///
+    /// The counter is shared via `Arc` so all layers observe the same
+    /// monotonic ordering — bumping any single layer's counter (e.g. from a
+    /// dynamic `prepare_tensor_partition` call that rebuilds every layer)
+    /// would still be observed as a miss by every layer's captured generation.
+    pub ratio_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Compute the number of bytes per row for a given dtype and inner dimension.
@@ -528,6 +541,37 @@ pub fn partition_replicate_norm_enabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+/// Gate for routing tensor partition through the OpenCL plan path
+/// (`backend/opencl/plan.rs::build_partitioned_layer_plan`). When disabled,
+/// `build_plan` returns an error for layers with a `PartitionContext` and the
+/// caller falls back to `forward_gen` — kept as a bit-exact comparison
+/// backstop for the new plan path.
+///
+/// Default: **enabled**. `LLMRS_PARTITION_PLAN=0` forces the legacy path.
+/// The decision is cached at first read via `OnceLock` because plan builds
+/// and hot dispatch must observe a single stable value across a generation
+/// (otherwise a mid-loop flip would desynchronize builder and executor).
+pub fn partition_plan_enabled() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::var("LLMRS_PARTITION_PLAN")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Diagnostic gate for the plan-path partition executor. When enabled, each
+/// sub-step inside `PartitionStep::run` is followed by a blocking `clFinish`
+/// and a stderr line with the sub-step label. Intended for debugging sync
+/// ordering or residual propagation bugs when bit-exactness tests fail —
+/// pairs with `PLAN_DEBUG` on the non-partition path.
+///
+/// Default: **disabled**. `LLMRS_PLAN_PARTITION_DEBUG=1` turns it on. Not
+/// cached because the expectation is one-shot investigation.
+pub fn partition_plan_debug_enabled() -> bool {
+    std::env::var_os("LLMRS_PLAN_PARTITION_DEBUG").is_some()
 }
 
 pub fn record_partition_timing(
@@ -1548,6 +1592,7 @@ mod tests {
                 cpu_slice: down_cpu_slice,
                 split_row: hidden_size,
             },
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // gpu_alloc stub (CPU memory works for the structural checks).

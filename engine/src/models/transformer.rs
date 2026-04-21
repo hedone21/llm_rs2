@@ -9,6 +9,7 @@ use crate::core::memory::Memory;
 use crate::core::offload::preload_pool::{self, PreloadPool};
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
+use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::models::config::{ModelArch, ModelConfig};
@@ -382,6 +383,7 @@ impl TransformerModel {
         use crate::layers::tensor_partition::{
             PartitionContext, is_gpu_only_ratio, split_weight, split_weight_col,
         };
+        use std::sync::atomic::{AtomicU64, Ordering};
 
         // GPU-only fast path: leave partition_ctx cleared so forward() takes
         // the dense full-weight GPU matmul path. Avoids per-token host
@@ -389,7 +391,15 @@ impl TransformerModel {
         // GPU↔host merge) that is independent of ratio once partition_ctx
         // is installed. See `is_gpu_only_ratio` / `GPU_ONLY_THRESHOLD`.
         if is_gpu_only_ratio(gpu_ratio) {
+            // Still bump any surviving generation counters before we drop the
+            // contexts — a plan that was built against the previous ratio
+            // must observe `Err(PlanInvalidated)` on its next execute() rather
+            // than dispatch against cl_mem handles that no longer back the
+            // active forward path. (INV-120)
             for layer in &mut self.layers {
+                if let Some(ref ctx) = layer.partition_ctx {
+                    ctx.ratio_generation.fetch_add(1, Ordering::Release);
+                }
                 layer.partition_ctx = None;
             }
             return Ok(0);
@@ -397,6 +407,15 @@ impl TransformerModel {
 
         let mut count = 0;
         for layer in &mut self.layers {
+            // Reuse the existing Arc<AtomicU64> if a partition_ctx is already
+            // installed so that plans built against the prior generation see
+            // the bump. A fresh install starts at 0 — the first plan build
+            // captures 0 and only misses when a subsequent re-split bumps it.
+            let prev_gen = layer
+                .partition_ctx
+                .as_ref()
+                .map(|c| c.ratio_generation.clone());
+
             // Strategy B: whole-FFN slice.
             // gate/up split_row is on the ffn_hidden (out_dim) axis.
             // down split_col is on the ffn_hidden (in_dim) axis — same
@@ -410,12 +429,24 @@ impl TransformerModel {
             let down = split_weight_col(&layer.w_down, gate.split_row, cpu_backend)?;
             count += 3;
 
+            // Bump the shared counter if this is a re-split; allocate a fresh
+            // counter at 0 otherwise. Release ordering pairs with the Acquire
+            // load in `PartitionStep::run` / `build_partitioned_layer_plan`.
+            let gen_arc = match prev_gen {
+                Some(g) => {
+                    g.fetch_add(1, Ordering::Release);
+                    g
+                }
+                None => Arc::new(AtomicU64::new(0)),
+            };
+
             layer.partition_ctx = Some(PartitionContext {
                 gpu_ratio,
                 cpu_backend: cpu_backend.clone(),
                 gate,
                 up,
                 down,
+                ratio_generation: gen_arc,
             });
         }
         Ok(count)
@@ -1267,6 +1298,29 @@ impl TransformerModel {
             is_nosub: ocl_backend.is_nosub(),
             noshuffle_programs,
             lm_head_noshuffle,
+            partition_layers: {
+                // Route each layer's optional PartitionContext into the plan
+                // builder. When any layer has a partition_ctx, the FFN
+                // segment uses `build_partitioned_layer_plan`; otherwise the
+                // legacy GPU-only FFN is used per layer. See arch A.6.1.
+                let mut any = false;
+                let v: Vec<Option<&PartitionContext>> = self
+                    .layers
+                    .iter()
+                    .map(|l| {
+                        let opt = l.partition_ctx.as_ref();
+                        any |= opt.is_some();
+                        opt
+                    })
+                    .collect();
+                if any { Some(v) } else { None }
+            },
+            partition_workspace: ws.partition_ws.clone(),
+            partition_cpu_backend: self
+                .layers
+                .iter()
+                .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
+            partition_use_gelu_tanh: self.config.arch == crate::models::config::ModelArch::Gemma3,
         };
 
         match build_full_plan(&full_config) {
@@ -1346,6 +1400,12 @@ impl TransformerModel {
             return None;
         }
         if !kv_caches[0].is_gpu() {
+            return None;
+        }
+        // KIVI plan does not yet support the cooperative tensor-partition FFN.
+        // If any layer has a partition_ctx, decline the plan and let the
+        // caller route to forward_gen.
+        if self.layers.iter().any(|l| l.partition_ctx.is_some()) {
             return None;
         }
 

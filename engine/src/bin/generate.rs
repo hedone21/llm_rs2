@@ -18,7 +18,9 @@ use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
 use llm_rs2::core::tensor::Tensor;
-use llm_rs2::layers::workspace::{LayerWorkspace, PartitionWorkspace, WorkspaceConfig};
+use llm_rs2::layers::workspace::{
+    LayerWorkspace, PartitionWorkspace, PartitionWsCell, WorkspaceConfig,
+};
 use llm_rs2::memory::galloc::Galloc;
 use llm_rs2::models::transformer::{TransformerModel, TransformerModelForwardArgs};
 use std::sync::Arc;
@@ -1441,10 +1443,8 @@ fn main() -> anyhow::Result<()> {
     // Phase A/B (flash_attn score output, commits 3096de4 + 28d8fe4): the
     // accumulator coexists with the GPU plan and overhead is <1%
     // (Adreno 37.4 t/s, Jetson overhead 1.8–4.3%).
-    let needs_accumulator = needs_score_based
-        || needs_caote
-        || args.enable_resilience
-        || has_eviction_policy;
+    let needs_accumulator =
+        needs_score_based || needs_caote || args.enable_resilience || has_eviction_policy;
     // GQA mode required for last_step_head_attn() (QCF-ATTN v2 + CAOTE).
     let use_gqa = args.eviction_policy == "h2o_plus" || needs_caote || has_eviction_policy;
 
@@ -1838,14 +1838,14 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            gen_ws.partition_ws = Some(PartitionWorkspace::new(
+            gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(PartitionWorkspace::new(
                 ctx,
                 ffn_hidden,
                 hidden_size,
                 &gpu_alloc,
                 backend.clone(),
                 cpu_backend_arc.clone(),
-            )?);
+            )?)));
 
             if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                 eprintln!(
@@ -3290,14 +3290,14 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
-            gen_ws.partition_ws = Some(PartitionWorkspace::new(
+            gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(PartitionWorkspace::new(
                 ctx,
                 ffn_hidden,
                 hidden_size,
                 &gpu_alloc,
                 backend.clone(),
                 cpu_backend_arc.clone(),
-            )?);
+            )?)));
 
             if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                 eprintln!(
@@ -3402,13 +3402,17 @@ fn main() -> anyhow::Result<()> {
                 .is_some_and(|acc| acc.is_active());
             !has_cpu_acc || gpu_acc_active
         };
+        // Partition is now routed through `build_partitioned_layer_plan` inside
+        // `build_plan`, so the old `partition_ctx.is_none()` gate has been
+        // removed (see ENG-ALG-200 / arch A.6.1). When partition + plan are
+        // both unavailable for a layer (e.g. `LLMRS_PARTITION_PLAN=0`), the
+        // builder returns `Err` and the caller falls back to forward_gen.
         #[cfg(feature = "opencl")]
         let mut gpu_plan = if backend.name() == "OpenCL"
             && !args.profile
             && !args.no_gpu_plan
             && accumulator_compatible_with_plan
             && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
-            && model.layers[0].partition_ctx.is_none()
         {
             model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend)
         } else {
@@ -3582,6 +3586,10 @@ fn main() -> anyhow::Result<()> {
                         .is_some_and(|acc| acc.is_active());
                     !has_cpu_acc || gpu_acc_active
                 };
+                // Plan rebuild after fallback. Partition is now routed inside
+                // build_plan (ENG-ALG-200) so the old `partition_ctx.is_none()`
+                // gate is dropped — build_plan itself picks partition-aware or
+                // legacy FFN per layer.
                 #[cfg(feature = "opencl")]
                 if gpu_plan.is_none()
                     && backend.name() == "OpenCL"
@@ -3589,7 +3597,6 @@ fn main() -> anyhow::Result<()> {
                     && !args.no_gpu_plan
                     && accumulator_compatible_with_plan
                     && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
-                    && model.layers[0].partition_ctx.is_none()
                 {
                     gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
                 }
@@ -4221,14 +4228,16 @@ fn main() -> anyhow::Result<()> {
                                     if let Some(ref ctx) = model.layers[0].partition_ctx {
                                         let gpu_alloc =
                                             make_partition_gpu_alloc(&*backend, decode_mem);
-                                        gen_ws.partition_ws = Some(PartitionWorkspace::new(
-                                            ctx,
-                                            ffn_hidden,
-                                            hidden_size,
-                                            &gpu_alloc,
-                                            backend.clone(),
-                                            cpu_backend_arc.clone(),
-                                        )?);
+                                        gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(
+                                            PartitionWorkspace::new(
+                                                ctx,
+                                                ffn_hidden,
+                                                hidden_size,
+                                                &gpu_alloc,
+                                                backend.clone(),
+                                                cpu_backend_arc.clone(),
+                                            )?,
+                                        )));
                                         if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                                             eprintln!(
                                                 "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
@@ -4439,7 +4448,7 @@ fn main() -> anyhow::Result<()> {
                                     backend.clone(),
                                     cpu_backend_arc.clone(),
                                 ) {
-                                    gen_ws.partition_ws = Some(ws);
+                                    gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(ws)));
                                     if llm_rs2::layers::tensor_partition::partition_replicate_norm_enabled() {
                                         eprintln!(
                                             "[Partition] Direction A compute-replication ENABLED (experimental; measured +12ms Q4 / +32ms F16 regression on Galaxy S25 and token-ID divergence — unset LLMRS_PARTITION_REPLICATE_NORM to restore default)"
@@ -5810,7 +5819,10 @@ fn run_kivi(
     // partition co-execution path.
     #[cfg(feature = "opencl")]
     let mut gpu_plan =
-        if backend.name() == "OpenCL" && !no_gpu_plan && model.layers[0].partition_ctx.is_none() {
+        // KIVI plan does not yet integrate tensor-partition — the rejection
+        // lives inside `build_plan_for_kivi` (returns None when any layer has
+        // a partition_ctx). See ENG-ALG-200 scope note.
+        if backend.name() == "OpenCL" && !no_gpu_plan {
             model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend)
         } else {
             None
@@ -5886,13 +5898,10 @@ fn run_kivi(
                 prefill_workspace: None,
             })?;
 
-            // Rebuild plan after fallback. Skip when partition is active.
+            // Rebuild plan after fallback. Rejection for partition-active
+            // KIVI runs happens inside `build_plan_for_kivi` (see ENG-ALG-200).
             #[cfg(feature = "opencl")]
-            if gpu_plan.is_none()
-                && backend.name() == "OpenCL"
-                && !no_gpu_plan
-                && model.layers[0].partition_ctx.is_none()
-            {
+            if gpu_plan.is_none() && backend.name() == "OpenCL" && !no_gpu_plan {
                 gpu_plan = model.build_plan_for_kivi(&x_gen, &logits, &gen_ws, &kv_caches, backend);
             }
         }

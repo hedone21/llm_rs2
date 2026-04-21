@@ -1111,7 +1111,14 @@ impl TransformerLayer {
         // single elementwise sum of two [1, 1, hidden] partials.
         let t = prof_start!();
         let partition_active = self.partition_ctx.is_some() && ws.partition_ws.is_some();
-        if let (Some(part), Some(pw)) = (&self.partition_ctx, ws.partition_ws.as_mut()) {
+        // SAFETY: `partition_ws` is an `Arc<UnsafeCell<PartitionWorkspace>>`
+        // shared with the OpenCL plan path. Both forward_gen and the plan's
+        // `PartitionStep::run` execute on the same dispatch thread, so there
+        // is no aliased mutable access (see LayerWorkspace::partition_ws doc).
+        let partition_ws_ptr: Option<*mut crate::layers::workspace::PartitionWorkspace> =
+            ws.partition_ws.as_ref().map(|arc| arc.get());
+        if let (Some(part), Some(pw_ptr)) = (&self.partition_ctx, partition_ws_ptr) {
+            let pw: &mut crate::layers::workspace::PartitionWorkspace = unsafe { &mut *pw_ptr };
             // ── Partitioned whole-FFN: cooperative GPU + CPU ──
             let part_trace = crate::layers::tensor_partition::partition_trace_enabled();
             let t0 = if part_trace {
@@ -1288,6 +1295,15 @@ impl TransformerLayer {
                 &mut pw.down_partial_gpu,
             )?;
             backend.flush()?;
+
+            // Diagnostic: serialize GPU FFN slice before CPU starts to isolate
+            // CPU compute from DRAM bandwidth contention. With this flag on,
+            // `cpu_ns` reflects pure NEON throughput; without it, `cpu_ns`
+            // includes any slowdown from concurrent GPU weight reads on the
+            // shared LPDDR. Compare the two to attribute the cpu_matmul gap.
+            if std::env::var_os("LLMRS_PARTITION_GPU_DELAY").is_some() {
+                backend.synchronize()?;
+            }
 
             // A1 async-read / Direction A: wait for the non-blocking DMA read
             // to land before CPU consumes it. This is the host wait window
