@@ -550,18 +550,18 @@ impl PartitionStep {
             None
         };
 
-        // 5. GPU wait — only required for the legacy `enqueue_write_buffer`
-        //    merge path (no longer the default after Phase 1a). With UMA
-        //    memcpy into a permanent-mapped staging buffer, the subsequent
-        //    `copy_gpu_to_down` and `add_assign` enqueues sit on the same
-        //    in-order queue as the GPU FFN steps, so GPU-side ordering is
-        //    preserved automatically. The only remaining risk is CPU-store
-        //    → GPU-read coherency on the staging buffer; an ARM release
-        //    fence + Adreno ALLOC_HOST_PTR coherency are sufficient on S25
-        //    (validated by bit-exact vs `--no-gpu-plan`). Opt-in the
-        //    blocking drain via LLMRS_PARTITION_EXPLICIT_GPU_WAIT=1 for
-        //    A/B bisection or non-UMA hardware.
-        if std::env::var_os("LLMRS_PARTITION_EXPLICIT_GPU_WAIT").is_some()
+        // 5. GPU wait — drain the in-flight GPU FFN dispatches before the
+        //    CPU partial is delivered to `cpu_merge_staging`. Required for
+        //    correctness on Adreno / ARM UMA: skipping this drain and
+        //    relying only on an ARM release fence + ALLOC_HOST_PTR
+        //    coherency produced garbage tokens on Qwen 2.5 1.5B F16
+        //    (partition r=0.7, 2026-04-21). The write-before-read hazard
+        //    appears to be dtype / kernel-layout dependent — Q4_0 noshuffle
+        //    SOA kernels happened to be coherent, F16 GEMV was not. Use
+        //    `LLMRS_PARTITION_SKIP_GPU_WAIT=1` to opt out for A/B on
+        //    hardware where bit-exactness is re-validated.
+        let skip_gpu_wait = std::env::var_os("LLMRS_PARTITION_SKIP_GPU_WAIT").is_some();
+        if !skip_gpu_wait
             && let Err(e) = ocl::core::finish(queue)
         {
             log::error!(

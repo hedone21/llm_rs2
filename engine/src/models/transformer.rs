@@ -1379,7 +1379,28 @@ impl TransformerModel {
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
             .ok_or_else(|| anyhow!("Backend is not OpenCL"))?;
 
-        match plan.execute(ocl_backend, start_pos, kv_caches) {
+        let result = plan.execute(ocl_backend, start_pos, kv_caches);
+        if std::env::var_os("LLMRS_PLAN_TRACE").is_some() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static OK_CNT: AtomicU64 = AtomicU64::new(0);
+            static ERR_CNT: AtomicU64 = AtomicU64::new(0);
+            match &result {
+                Ok(()) => {
+                    let n = OK_CNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_power_of_two() || n % 32 == 0 {
+                        eprintln!(
+                            "[plan-trace] execute_plan ok={} err={}",
+                            n,
+                            ERR_CNT.load(Ordering::Relaxed)
+                        );
+                    }
+                }
+                Err(_) => {
+                    ERR_CNT.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        match result {
             Ok(()) => {
                 // `plan.lm_head` is None in two scenarios:
                 //   1. `self.lm_head_on_cpu == true` (large tied embedding
