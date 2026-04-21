@@ -3418,6 +3418,17 @@ fn main() -> anyhow::Result<()> {
         } else {
             None
         };
+        // Sticky disable: when the initial `build_plan` returns `None` and
+        // partition is active, the cause is almost always the opt-in gate
+        // (`LLMRS_PARTITION_PLAN=0` default on Adreno, 2026-04-21). Retrying
+        // every token spams `build_plan` (~100 ms/token overhead) for no
+        // benefit. Lock the disable on the first miss and keep forward_gen.
+        // `execute_plan` resetting `gpu_plan = None` for KV-resize
+        // invalidation still takes the rebuild path on the next token.
+        #[cfg(feature = "opencl")]
+        let partition_active_any = model.layers.iter().any(|l| l.partition_ctx.is_some());
+        #[cfg(feature = "opencl")]
+        let mut gpu_plan_sticky_disabled = partition_active_any && gpu_plan.is_none();
 
         // Pre-allocate decode buffers (reused across tokens)
         let mut logits_cpu = vec![0.0f32; vocab_size];
@@ -3592,6 +3603,7 @@ fn main() -> anyhow::Result<()> {
                 // legacy FFN per layer.
                 #[cfg(feature = "opencl")]
                 if gpu_plan.is_none()
+                    && !gpu_plan_sticky_disabled
                     && backend.name() == "OpenCL"
                     && !args.profile
                     && !args.no_gpu_plan
@@ -3599,6 +3611,10 @@ fn main() -> anyhow::Result<()> {
                     && model.config.arch != llm_rs2::models::config::ModelArch::Gemma3
                 {
                     gpu_plan = model.build_plan(&x_gen, &logits, &gen_ws, &mut kv_caches, &backend);
+                    if partition_active_any && gpu_plan.is_none() {
+                        // Second build also failed — lock out further retries.
+                        gpu_plan_sticky_disabled = true;
+                    }
                 }
             }
             backend.synchronize()?;

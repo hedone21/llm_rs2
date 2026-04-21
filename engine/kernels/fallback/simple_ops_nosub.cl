@@ -166,6 +166,21 @@ kernel void kernel_add_assign_simple(
     }
 }
 
+// Scalar-stride copy of `size` floats from src[src_offset ..] to dst[dst_offset ..].
+// See simple_ops.cl for rationale; fallback mirror kept in lock-step.
+kernel void kernel_copy_slice_simple(
+    global const float * src,
+    global float * dst,
+    int src_offset,
+    int dst_offset,
+    int size
+) {
+    int i = get_global_id(0);
+    if (i < size) {
+        dst[dst_offset + i] = src[src_offset + i];
+    }
+}
+
 kernel void kernel_silu_mul_simple(
     global float4 * x,
     global float4 * y,

@@ -804,6 +804,24 @@ kernel void kernel_add_assign_simple(
     }
 }
 
+// Scalar-stride copy of `size` floats from src[src_offset ..] to dst[dst_offset ..].
+// Used by the tensor-partition plan merge step (arch A.7.1) — the runtime `copy_slice`
+// backend method bypasses the kernel plan (it uses clEnqueueCopyBuffer), so the plan
+// path needs a GPU kernel with equivalent semantics to stay fully enqueue-driven.
+// gws: [size, 1, 1]; lws: None (any power-of-two subgroup works).
+kernel void kernel_copy_slice_simple(
+    global const float * src,
+    global float * dst,
+    int src_offset,
+    int dst_offset,
+    int size
+) {
+    int i = get_global_id(0);
+    if (i < size) {
+        dst[dst_offset + i] = src[src_offset + i];
+    }
+}
+
 // Broadcast-add a 1D bias to each row of x.
 // x: [rows * dim], bias: [dim]. bias is added to each row.
 kernel void kernel_add_row_bias(

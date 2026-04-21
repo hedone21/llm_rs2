@@ -549,7 +549,16 @@ pub fn partition_replicate_norm_enabled() -> bool {
 /// caller falls back to `forward_gen` — kept as a bit-exact comparison
 /// backstop for the new plan path.
 ///
-/// Default: **enabled**. `LLMRS_PARTITION_PLAN=0` forces the legacy path.
+/// Default: **disabled** (2026-04-21). Galaxy S25 device validation revealed
+/// that the engine-wide OpenCL plan path produces garbage tokens on Adreno
+/// 830 even without partition (commit 3096de4..master all reproduce
+/// "EQtranslatedまでocab..." on `llama3.2-1b-q4_0.gguf` + `--tensor-partition
+/// 0.0`). The partition integration added in `af11688` only becomes
+/// meaningful once the upstream plan executor parity bug is fixed, so we
+/// default the partition-plan shortcut off to avoid forwarding the breakage
+/// into every partition decode. Set `LLMRS_PARTITION_PLAN=1` to opt in once
+/// the underlying regression is triaged.
+///
 /// The decision is cached at first read via `OnceLock` because plan builds
 /// and hot dispatch must observe a single stable value across a generation
 /// (otherwise a mid-loop flip would desynchronize builder and executor).
@@ -557,8 +566,8 @@ pub fn partition_plan_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("LLMRS_PARTITION_PLAN")
-            .map(|v| v != "0")
-            .unwrap_or(true)
+            .map(|v| v == "1")
+            .unwrap_or(false)
     })
 }
 

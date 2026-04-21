@@ -1334,7 +1334,22 @@ impl TransformerModel {
                 Some(plan)
             }
             Err(e) => {
-                log::warn!("Failed to build GPU kernel plan: {}", e);
+                // The plan builder bails with a short message whenever an
+                // opt-in flag is off (e.g. `LLMRS_PARTITION_PLAN=0`, currently
+                // the default on Adreno until the upstream plan-path parity
+                // bug is triaged). Demote that expected signal to `info!` so
+                // partition runs — which rebuild the plan every token after a
+                // fallback — do not spam warnings. Any real kernel-build /
+                // cl_mem failure still surfaces via the full context chain.
+                let chain = format!("{:#}", e);
+                if chain.contains("LLMRS_PARTITION_PLAN=0")
+                    || chain.contains("LLMRS_PARTITION_REPLICATE_NORM=1")
+                    || chain.contains("LLMRS_PARTITION_SYNC_EVERY_N")
+                {
+                    log::info!("GPU kernel plan skipped: {}", chain);
+                } else {
+                    log::warn!("Failed to build GPU kernel plan: {}", chain);
+                }
                 None
             }
         }
