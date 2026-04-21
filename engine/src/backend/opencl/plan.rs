@@ -336,6 +336,24 @@ unsafe impl Sync for PartitionPlanContext {}
 pub type PartitionPlanWorkspace = crate::layers::workspace::PartitionWorkspace;
 
 impl PartitionStep {
+    /// INV-120 generation check — separated so tests can exercise staleness
+    /// detection without a live OpenCL backend.
+    ///
+    /// Compares `cpu_ctx.ratio_generation_at_build` against the current value
+    /// of `cpu_ctx.ratio_generation_counter`. Returns `Err(PlanInvalidated)`
+    /// when the counter has advanced past the captured generation.
+    pub fn check_generation(&self) -> std::result::Result<(), PlanInvalidated> {
+        use std::sync::atomic::Ordering;
+        let live_gen = self
+            .cpu_ctx
+            .ratio_generation_counter
+            .load(Ordering::Acquire);
+        if live_gen != self.cpu_ctx.ratio_generation_at_build {
+            return Err(PlanInvalidated);
+        }
+        Ok(())
+    }
+
     /// Execute this partition layer step.
     ///
     /// Sequence (mirrors `forward_gen` partition SyncRead path, see
@@ -368,18 +386,18 @@ impl PartitionStep {
         );
 
         // 1. INV-120 generation check.
-        let live_gen = self
-            .cpu_ctx
-            .ratio_generation_counter
-            .load(Ordering::Acquire);
-        if live_gen != self.cpu_ctx.ratio_generation_at_build {
+        if let Err(e) = self.check_generation() {
+            let live_gen = self
+                .cpu_ctx
+                .ratio_generation_counter
+                .load(Ordering::Acquire);
             log::warn!(
                 "PartitionStep stale: layer={} build_gen={} live_gen={} → PlanInvalidated",
                 layer_idx,
                 self.cpu_ctx.ratio_generation_at_build,
                 live_gen,
             );
-            return Err(PlanInvalidated);
+            return Err(e);
         }
 
         let debug = partition_plan_debug_enabled();
@@ -646,7 +664,7 @@ pub struct FullKernelPlan {
 }
 
 /// Error indicating the plan's pre-bound arguments are stale.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PlanInvalidated;
 
 impl std::fmt::Display for PlanInvalidated {
@@ -656,6 +674,23 @@ impl std::fmt::Display for PlanInvalidated {
 }
 
 impl std::error::Error for PlanInvalidated {}
+
+/// INV-120 generation check as a free function — usable from tests without
+/// constructing a full `PartitionStep`.
+///
+/// Returns `Err(PlanInvalidated)` when `counter.load(Acquire) != at_build`.
+pub fn check_partition_generation(
+    at_build: u64,
+    counter: &Arc<std::sync::atomic::AtomicU64>,
+) -> std::result::Result<(), PlanInvalidated> {
+    use std::sync::atomic::Ordering;
+    let live = counter.load(Ordering::Acquire);
+    if live != at_build {
+        Err(PlanInvalidated)
+    } else {
+        Ok(())
+    }
+}
 
 impl FullKernelPlan {
     /// Dispatch a single kernel step, updating its dynamic args.

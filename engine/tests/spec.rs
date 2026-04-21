@@ -56,6 +56,12 @@ mod test_eng_dat_c06_d2o;
 #[path = "spec/test_msg_060_self_util.rs"]
 mod test_msg_060_self_util;
 
+// ── Tensor Partition × Plan 통합 테스트 ──
+#[path = "spec/test_eng_alg_200_plan_partition.rs"]
+mod test_eng_alg_200_plan_partition;
+#[path = "spec/test_inv_120_plan_partition_stale.rs"]
+mod test_inv_120_plan_partition_stale;
+
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;
