@@ -486,6 +486,73 @@ fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
     }
 }
 
+/// Row-level inverse permutation that undoes llama.cpp's
+/// `convert_hf_to_gguf.py` Q/K weight reordering.
+///
+/// Background — Llama-family models use the NeoX (half-half) RoPE layout in
+/// HuggingFace: for a head of size `D`, the first `D/2` elements rotate with
+/// the last `D/2`. llama.cpp's ggml originally targeted the "NORM"
+/// (interleaved `(x0,x1), (x2,x3), ...`) RoPE. To bridge the two, the GGUF
+/// converter permutes each head's rows as:
+///
+/// ```text
+///   weights.reshape(n_head, head_dim/2, 2, *rest).swapaxes(1, 2).reshape(*)
+/// ```
+///
+/// So row `j` (within a head) in the GGUF file holds what HF stored at row
+/// `2*j`     if `j <  head_dim/2`
+/// `2*j - head_dim + 1` otherwise.
+///
+/// We use the HF (NeoX) RoPE layout in `kernel_rope_simple`, so we must
+/// undo the permute at load time. Every row is `row_size_bytes` wide and
+/// rows are contiguous, so this works uniformly for F16/Q4_0/Q8_0 — any
+/// dtype whose quantization blocks live fully inside one row (true for all
+/// currently-supported ggml_types, whose block_size ∈ {1, 32}).
+///
+/// Qwen2/Gemma3 GGUF converters do **not** apply this permute (they use the
+/// NEOX rope path directly), so this is gated to `ModelArch::Llama`.
+fn unpermute_qk_rows(src: &[u8], n_head: usize, head_dim: usize, row_size_bytes: usize) -> Vec<u8> {
+    debug_assert!(head_dim.is_multiple_of(2));
+    let half = head_dim / 2;
+    let total_rows = n_head * head_dim;
+    debug_assert_eq!(src.len(), total_rows * row_size_bytes);
+
+    let mut dst = vec![0u8; src.len()];
+    for h in 0..n_head {
+        let head_base = h * head_dim;
+        for j in 0..head_dim {
+            // HF row (h*head_dim + j) <- GGUF row (h*head_dim + src_offset)
+            let src_in_head = if j < half { 2 * j } else { 2 * (j - half) + 1 };
+            let src_row = head_base + src_in_head;
+            let dst_row = head_base + j;
+            let src_off = src_row * row_size_bytes;
+            let dst_off = dst_row * row_size_bytes;
+            dst[dst_off..dst_off + row_size_bytes]
+                .copy_from_slice(&src[src_off..src_off + row_size_bytes]);
+        }
+    }
+    dst
+}
+
+/// Return `Some((n_head, head_dim))` if the tensor named `name` must be
+/// inverse-permuted on load for the given model config — i.e. a Llama-arch
+/// `blk.N.attn_q.weight` or `blk.N.attn_k.weight`. Otherwise `None`.
+fn qk_permute_shape(name: &str, config: &ModelConfig) -> Option<(usize, usize)> {
+    use crate::models::config::ModelArch;
+    if config.arch != ModelArch::Llama {
+        return None;
+    }
+    // Match "blk.<N>.attn_q.weight" or "blk.<N>.attn_k.weight".
+    let stem = name.strip_prefix("blk.")?;
+    let (_idx, rest) = stem.split_once('.')?;
+    let head_dim = config.head_dim;
+    match rest {
+        "attn_q.weight" => Some((config.num_attention_heads, head_dim)),
+        "attn_k.weight" => Some((config.num_key_value_heads, head_dim)),
+        _ => None,
+    }
+}
+
 /// Determine the "weight dtype" of a GGUF file by looking at the dominant
 /// ggml_type across weight tensors (excluding norms and biases).
 fn detect_weight_dtype(gguf: &GgufFile) -> DType {
@@ -603,6 +670,32 @@ impl GgufSource {
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
 
+        // Llama Q/K weights must be inverse-permuted to undo llama.cpp's
+        // convert_hf_to_gguf reshape — see `unpermute_qk_rows`. This path
+        // allocates a fresh owned buffer; the zero-copy mmap fast path below
+        // is only used for non-permuted tensors.
+        if let Some((n_head, head_dim)) = qk_permute_shape(name, &self.config) {
+            let total_rows: usize = shape.dims()[0];
+            debug_assert_eq!(total_rows, n_head * head_dim);
+            debug_assert!(data.len().is_multiple_of(total_rows));
+            let row_size_bytes = data.len() / total_rows;
+            let permuted = unpermute_qk_rows(data, n_head, head_dim, row_size_bytes);
+            let owned_buf: Arc<dyn crate::core::buffer::Buffer> =
+                Arc::new(SharedBuffer::from_vec(permuted, dtype));
+            let cpu_tensor = Tensor::new(
+                shape,
+                owned_buf,
+                self.cpu_backend.clone() as Arc<dyn Backend>,
+            );
+            return if is_cpu {
+                Ok(cpu_tensor)
+            } else if is_weight {
+                backend.copy_weight_from(&cpu_tensor)
+            } else {
+                backend.copy_from(&cpu_tensor)
+            };
+        }
+
         // For norm/bias tensors (is_weight=false) that are in F32, use MmapBuffer directly.
         // For weight tensors that are already in their native quantized format, also use MmapBuffer.
         // This gives zero-copy access to the GGUF data.
@@ -649,6 +742,23 @@ impl GgufSource {
         }
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
+
+        // Llama Q/K weights must be inverse-permuted — see load_raw above.
+        if let Some((n_head, head_dim)) = qk_permute_shape(name, &self.config) {
+            let total_rows: usize = shape.dims()[0];
+            debug_assert_eq!(total_rows, n_head * head_dim);
+            debug_assert!(data.len().is_multiple_of(total_rows));
+            let row_size_bytes = data.len() / total_rows;
+            let permuted = unpermute_qk_rows(data, n_head, head_dim, row_size_bytes);
+            let owned_buf: Arc<dyn crate::core::buffer::Buffer> =
+                Arc::new(SharedBuffer::from_vec(permuted, dtype));
+            return Ok(Tensor::new(
+                shape,
+                owned_buf,
+                self.cpu_backend.clone() as Arc<dyn Backend>,
+            ));
+        }
+
         let abs_offset = self.gguf.tensor_data_offset + info.offset as usize;
 
         // Safety: abs_offset + data.len() <= mmap.len()
@@ -768,6 +878,140 @@ impl TensorSource for GgufSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------------
+    // Q/K unpermute helper
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_unpermute_qk_rows_matches_numpy_reshape_swapaxes() {
+        // Build an n_head=2, head_dim=4, k=1 (row_size=4 bytes) tensor whose
+        // rows are byte-tagged so we can confirm the destination layout.
+        //
+        // "GGUF-stored" representation (input to unpermute):
+        //   HF would store row `(h * head_dim + 2*p + s)` with value tagged
+        //   (h, 2*p + s). llama.cpp's convert permute reshuffles so that the
+        //   saved row at position `(h * head_dim + s * half + p)` holds the
+        //   data that HF had at `(h * head_dim + 2*p + s)`.
+        //
+        // So if we fill the input with that saved-order tag, `unpermute_qk_rows`
+        // should put the HF-order tag back: row `(h*head_dim + j)` maps to
+        // `(h, j)` where j = HF within-head index.
+        let n_head = 2;
+        let head_dim = 4;
+        let half = head_dim / 2;
+        let row_size_bytes = 1;
+        let mut input = vec![0u8; n_head * head_dim * row_size_bytes];
+        for h in 0..n_head {
+            for s in 0..2 {
+                for p in 0..half {
+                    // GGUF saved order: within-head index = s*half + p.
+                    let saved_idx = s * half + p;
+                    // HF original within-head index = 2*p + s.
+                    let hf_idx = 2 * p + s;
+                    // Tag byte = head * 16 + HF within-head index (0..15).
+                    input[h * head_dim + saved_idx] = ((h * head_dim + hf_idx) & 0xff) as u8;
+                }
+            }
+        }
+
+        let out = unpermute_qk_rows(&input, n_head, head_dim, row_size_bytes);
+        // After unpermute, row `h*head_dim + j` should hold tag `h*head_dim + j`.
+        for h in 0..n_head {
+            for j in 0..head_dim {
+                assert_eq!(
+                    out[h * head_dim + j],
+                    ((h * head_dim + j) & 0xff) as u8,
+                    "h={h}, j={j}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unpermute_qk_rows_wide_rows() {
+        // Same n_head/head_dim but a 5-byte row (exercises per-row memcpy).
+        let n_head = 3;
+        let head_dim = 4;
+        let half = head_dim / 2;
+        let row_size = 5;
+        let mut input = vec![0u8; n_head * head_dim * row_size];
+        for h in 0..n_head {
+            for s in 0..2 {
+                for p in 0..half {
+                    let saved_idx = s * half + p;
+                    let hf_idx = 2 * p + s;
+                    let tag = (h * head_dim + hf_idx) as u8;
+                    let off = (h * head_dim + saved_idx) * row_size;
+                    for b in 0..row_size {
+                        input[off + b] = tag.wrapping_add(b as u8);
+                    }
+                }
+            }
+        }
+        let out = unpermute_qk_rows(&input, n_head, head_dim, row_size);
+        for h in 0..n_head {
+            for j in 0..head_dim {
+                let tag = (h * head_dim + j) as u8;
+                let off = (h * head_dim + j) * row_size;
+                for b in 0..row_size {
+                    assert_eq!(
+                        out[off + b],
+                        tag.wrapping_add(b as u8),
+                        "h={h}, j={j}, b={b}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_qk_permute_shape_gating() {
+        use crate::models::config::ModelArch;
+        fn make_cfg(arch: ModelArch) -> ModelConfig {
+            ModelConfig {
+                arch,
+                hidden_size: 2048,
+                num_hidden_layers: 16,
+                num_attention_heads: 32,
+                num_key_value_heads: 8,
+                head_dim: 64,
+                intermediate_size: 8192,
+                vocab_size: 128256,
+                rms_norm_eps: 1e-5,
+                rope_theta: 500000.0,
+                has_qkv_bias: false,
+                tie_word_embeddings: true,
+                eos_token_id: 128009,
+                rope_local_theta: None,
+                sliding_window: None,
+                sliding_window_pattern: None,
+                query_pre_attn_scalar: None,
+                embed_scale: None,
+                weight_prefix: String::new(),
+            }
+        }
+        let base = make_cfg(ModelArch::Llama);
+        // Llama Q/K: return shape.
+        assert_eq!(
+            qk_permute_shape("blk.0.attn_q.weight", &base),
+            Some((32, 64))
+        );
+        assert_eq!(
+            qk_permute_shape("blk.7.attn_k.weight", &base),
+            Some((8, 64))
+        );
+        // Llama V / output / norms: skip.
+        assert_eq!(qk_permute_shape("blk.0.attn_v.weight", &base), None);
+        assert_eq!(qk_permute_shape("blk.0.attn_output.weight", &base), None);
+        assert_eq!(qk_permute_shape("blk.0.attn_norm.weight", &base), None);
+        assert_eq!(qk_permute_shape("token_embd.weight", &base), None);
+
+        // Qwen2: skip (converter does not permute).
+        let qwen = make_cfg(ModelArch::Qwen2);
+        assert_eq!(qk_permute_shape("blk.0.attn_q.weight", &qwen), None);
+        assert_eq!(qk_permute_shape("blk.0.attn_k.weight", &qwen), None);
+    }
 
     // -----------------------------------------------------------------------
     // GgufTestBuilder: synthesize valid GGUF v3 binaries in memory
