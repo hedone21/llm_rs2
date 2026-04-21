@@ -466,7 +466,7 @@ impl PartitionStep {
             ocl::core::enqueue_read_buffer(
                 queue,
                 &self.cpu_ctx.residual_buf_handle,
-                true, // blocking
+                true, // blocking — implicit in-order barrier + cache flush
                 0,
                 residual_slice,
                 None::<&ocl::core::Event>,
@@ -550,10 +550,20 @@ impl PartitionStep {
             None
         };
 
-        // 5. GPU wait — drain before the CPU `write_buffer` enqueues to
-        //    avoid interleaving with outstanding GPU reads from the same
-        //    staging buffer.
-        if let Err(e) = ocl::core::finish(queue) {
+        // 5. GPU wait — only required for the legacy `enqueue_write_buffer`
+        //    merge path (no longer the default after Phase 1a). With UMA
+        //    memcpy into a permanent-mapped staging buffer, the subsequent
+        //    `copy_gpu_to_down` and `add_assign` enqueues sit on the same
+        //    in-order queue as the GPU FFN steps, so GPU-side ordering is
+        //    preserved automatically. The only remaining risk is CPU-store
+        //    → GPU-read coherency on the staging buffer; an ARM release
+        //    fence + Adreno ALLOC_HOST_PTR coherency are sufficient on S25
+        //    (validated by bit-exact vs `--no-gpu-plan`). Opt-in the
+        //    blocking drain via LLMRS_PARTITION_EXPLICIT_GPU_WAIT=1 for
+        //    A/B bisection or non-UMA hardware.
+        if std::env::var_os("LLMRS_PARTITION_EXPLICIT_GPU_WAIT").is_some()
+            && let Err(e) = ocl::core::finish(queue)
+        {
             log::error!(
                 "PartitionStep GPU wait failed: layer={} err={}",
                 layer_idx,
@@ -589,6 +599,56 @@ impl PartitionStep {
             "cpu_merge_staging must be >= down_partial_cpu size",
         );
 
+        // Phase 1a: when `cpu_merge_staging` is permanent-mapped (via
+        // LLMRS_PARTITION_ZCOPY_MERGE, default on), memcpy from the CPU
+        // partial into its host pointer instead of enqueueing a blocking
+        // `enqueue_write_buffer`. Same cl_mem is visible to the GPU kernel
+        // via ALLOC_HOST_PTR; Adreno UMA allows concurrent CPU-write +
+        // kernel-read. Fallback to the legacy upload path when mapping is
+        // unavailable (e.g. discrete OpenCL device, env opt-out).
+        let staging_host_ptr = pw.cpu_merge_staging.buffer().as_mut_ptr();
+        let upload_cpu_partial = |fallback_label: &str| -> std::result::Result<(), PlanInvalidated> {
+            if !staging_host_ptr.is_null() {
+                // SAFETY: `staging_host_ptr` is from ALLOC_HOST_PTR-backed
+                // buffer, mapped for the workspace lifetime. Non-overlapping
+                // with `down_partial_cpu` (separate allocations).
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        cpu_partial_slice.as_ptr(),
+                        staging_host_ptr,
+                        cpu_partial_slice.len(),
+                    );
+                }
+                // Release fence: ensure CPU stores to the zero-copy staging
+                // buffer commit before the in-order queue starts executing
+                // `add_assign` (which reads the same ALLOC_HOST_PTR region
+                // via GPU). On ARM Adreno UMA this is the minimum barrier
+                // required when the gpu_wait drain is skipped.
+                std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+                return Ok(());
+            }
+            if let Err(e) = unsafe {
+                ocl::core::enqueue_write_buffer(
+                    queue,
+                    staging_mem,
+                    true,
+                    0,
+                    cpu_partial_slice,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )
+            } {
+                log::error!(
+                    "PartitionStep CPU partial upload failed ({}): layer={} err={}",
+                    fallback_label,
+                    layer_idx,
+                    e
+                );
+                return Err(PlanInvalidated);
+            }
+            Ok(())
+        };
+
         match &self.merge {
             PartitionMerge::Inline {
                 copy_gpu_to_down,
@@ -596,51 +656,16 @@ impl PartitionStep {
             } => {
                 // (a) copy_slice(down_partial_gpu → ws.down). Pre-bound.
                 FullKernelPlan::dispatch_step(backend, copy_gpu_to_down, 0, 0, 0, 0, 0, 0, 0);
-                // (b) upload CPU partial into `cpu_merge_staging` (GPU buffer).
-                //     write_buffer is blocking on in-order queue; after this
-                //     the staging buffer is bound to the add_assign step.
-                if let Err(e) = unsafe {
-                    ocl::core::enqueue_write_buffer(
-                        queue,
-                        staging_mem,
-                        true, // blocking
-                        0,
-                        cpu_partial_slice,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )
-                } {
-                    log::error!(
-                        "PartitionStep CPU partial upload failed: layer={} err={}",
-                        layer_idx,
-                        e
-                    );
-                    return Err(PlanInvalidated);
-                }
+                // (b) deliver CPU partial to `cpu_merge_staging` (memcpy on
+                //     UMA with permanent-mapped staging, else blocking DMA).
+                upload_cpu_partial("inline")?;
                 // (c) add_assign(ws.down, cpu_merge_staging).
                 FullKernelPlan::dispatch_step(backend, add_assign, 0, 0, 0, 0, 0, 0, 0);
             }
             PartitionMerge::Deferred => {
-                // Upload CPU partial only; the next layer's fused kernel
+                // Deliver CPU partial only; the next layer's fused kernel
                 // will perform copy+add. (Phase 2-B placeholder.)
-                if let Err(e) = unsafe {
-                    ocl::core::enqueue_write_buffer(
-                        queue,
-                        staging_mem,
-                        true,
-                        0,
-                        cpu_partial_slice,
-                        None::<&ocl::core::Event>,
-                        None::<&mut ocl::core::Event>,
-                    )
-                } {
-                    log::error!(
-                        "PartitionStep CPU partial upload failed (deferred): layer={} err={}",
-                        layer_idx,
-                        e
-                    );
-                    return Err(PlanInvalidated);
-                }
+                upload_cpu_partial("deferred")?;
             }
         }
 

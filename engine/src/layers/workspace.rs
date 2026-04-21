@@ -382,6 +382,22 @@ impl PartitionWorkspace {
             gpu_alloc(hidden_size * 4, DType::F32)?,
             gpu_backend.clone(),
         );
+        // Phase 1a: permanent-map `cpu_merge_staging` UnifiedBuffer so the
+        // plan-path merge can memcpy directly from `down_partial_cpu` into the
+        // GPU-visible host pointer, eliminating the per-layer
+        // `enqueue_write_buffer` (~0.13 ms/layer × 16 = 2.1 ms/tok on S25).
+        // Opt-out via LLMRS_PARTITION_ZCOPY_MERGE=0 for A/B benchmarking.
+        #[cfg(feature = "opencl")]
+        if std::env::var("LLMRS_PARTITION_ZCOPY_MERGE")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+            && let Some(ub) = cpu_merge_staging
+                .buffer()
+                .as_any()
+                .downcast_ref::<crate::buffer::unified_buffer::UnifiedBuffer>()
+        {
+            let _ = ub.map();
+        }
         let down_partial_cpu = Tensor::new(
             Shape::new(vec![1, 1, hidden_size]),
             cpu_mem.alloc(hidden_size * 4, DType::F32)?,
