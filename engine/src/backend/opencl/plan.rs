@@ -604,13 +604,73 @@ impl PartitionStep {
         // `residual_cpu_ptr` routing logic here. Treat that as a future
         // optimization gated on benchmark evidence.
         let cpu_ok = (|| -> Result<()> {
-            cpu.matmul_transposed(&pw.residual_cpu, &self.cpu_ctx.gate_cpu, &mut pw.gate_cpu)?;
-            cpu.matmul_transposed(&pw.residual_cpu, &self.cpu_ctx.up_cpu, &mut pw.up_cpu)?;
+            // Fused gate+up matmul: single F32→F16 A conversion, single
+            // SpinPool dispatch — saves ~100-300 us/layer vs two separate
+            // `matmul_transposed` calls. Mirrors the forward_gen partition
+            // path (transformer_layer/forward_gen.rs:1367).
+            #[cfg(target_arch = "aarch64")]
+            let used_fused_gate_up = {
+                let gate_dtype = self.cpu_ctx.gate_cpu.dtype();
+                let k = self.cpu_ctx.gate_cpu.shape().dims()[1];
+                if gate_dtype == crate::core::buffer::DType::F16 {
+                    unsafe {
+                        crate::backend::cpu::neon::fused_matmul_f16(
+                            pw.residual_cpu.as_ptr() as *const f32,
+                            k,
+                            &[
+                                (
+                                    self.cpu_ctx.gate_cpu.as_ptr() as *const u16,
+                                    pw.gate_cpu.as_mut_ptr() as *mut f32,
+                                    self.cpu_ctx.gate_cpu.shape().dims()[0],
+                                ),
+                                (
+                                    self.cpu_ctx.up_cpu.as_ptr() as *const u16,
+                                    pw.up_cpu.as_mut_ptr() as *mut f32,
+                                    self.cpu_ctx.up_cpu.shape().dims()[0],
+                                ),
+                            ],
+                        );
+                    }
+                    true
+                } else if gate_dtype == crate::core::buffer::DType::Q4_0 {
+                    use crate::core::quant::BlockQ4_0;
+                    unsafe {
+                        crate::backend::cpu::neon::fused_matmul_q4_0(
+                            pw.residual_cpu.as_ptr() as *const f32,
+                            k,
+                            &[
+                                (
+                                    self.cpu_ctx.gate_cpu.as_ptr() as *const BlockQ4_0,
+                                    pw.gate_cpu.as_mut_ptr() as *mut f32,
+                                    self.cpu_ctx.gate_cpu.shape().dims()[0],
+                                ),
+                                (
+                                    self.cpu_ctx.up_cpu.as_ptr() as *const BlockQ4_0,
+                                    pw.up_cpu.as_mut_ptr() as *mut f32,
+                                    self.cpu_ctx.up_cpu.shape().dims()[0],
+                                ),
+                            ],
+                        );
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            #[cfg(not(target_arch = "aarch64"))]
+            let used_fused_gate_up = false;
+
+            if !used_fused_gate_up {
+                cpu.matmul_transposed(&pw.residual_cpu, &self.cpu_ctx.gate_cpu, &mut pw.gate_cpu)?;
+                cpu.matmul_transposed(&pw.residual_cpu, &self.cpu_ctx.up_cpu, &mut pw.up_cpu)?;
+            }
+
             if self.cpu_ctx.use_gelu_tanh {
                 cpu.gelu_tanh_mul(&mut pw.gate_cpu, &pw.up_cpu)?;
             } else {
                 cpu.silu_mul(&mut pw.gate_cpu, &pw.up_cpu)?;
             }
+
             cpu.matmul_transposed(
                 &pw.gate_cpu,
                 &self.cpu_ctx.down_cpu,
