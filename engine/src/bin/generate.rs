@@ -241,6 +241,21 @@ struct Args {
     #[arg(long, default_value_t = false)]
     cuda_weights_device: bool,
 
+    /// Experimental: bundle each decode step's kernel launches into a
+    /// single CUDA Graph (captured and replayed once per token).
+    ///
+    /// Removes per-kernel driver launch overhead (~5 µs × ~400 launches
+    /// = ~2 ms/tok on Jetson Xavier). Pays a per-step graph
+    /// instantiate cost (~0.3-1 ms on Xavier) — net win is sensitive
+    /// to the instantiate overhead actually measured.
+    ///
+    /// Currently a per-step re-capture baseline. Incompatible with
+    /// `--cuda-profile`, `--profile`, and tensor partition; the
+    /// inner decode path must not call `synchronize()`, `read_buffer`,
+    /// or any CPU fallback while capture is active.
+    #[arg(long, default_value_t = false)]
+    cuda_graph: bool,
+
     /// Model weight data type (f16 or q4). f16 = no quantization, q4 = Q4_0 quantization at load time.
     #[arg(long, default_value = "f16")]
     weight_dtype: String,
@@ -3571,6 +3586,25 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     cpu_memory_arc.as_ref()
                 };
+
+                // --cuda-graph: bundle this token's launches into a single
+                // CUDA Graph, replayed once. Drains pending work first; the
+                // end_capture_and_launch() call replaces the per-kernel
+                // driver dispatches with one graph launch.
+                #[cfg(feature = "cuda-embedded")]
+                let cu_graph_be: Option<&llm_rs2::backend::cuda_embedded::CudaBackend> =
+                    if args.cuda_graph {
+                        backend
+                            .as_any()
+                            .downcast_ref::<llm_rs2::backend::cuda_embedded::CudaBackend>()
+                    } else {
+                        None
+                    };
+                #[cfg(feature = "cuda-embedded")]
+                if let Some(cu_be) = cu_graph_be {
+                    cu_be.begin_graph_capture()?;
+                }
+
                 model.forward_into(TransformerModelForwardArgs {
                     input_tokens: &gen_input_tensor,
                     start_pos,
@@ -3588,6 +3622,11 @@ fn main() -> anyhow::Result<()> {
                     variance_collector: None,
                     prefill_workspace: None,
                 })?;
+
+                #[cfg(feature = "cuda-embedded")]
+                if let Some(cu_be) = cu_graph_be {
+                    cu_be.end_graph_capture_and_launch()?;
+                }
 
                 // Rebuild plan if it was invalidated (e.g. KV cache resize).
                 // Skip rebuild when tensor partition is active — plan bypasses

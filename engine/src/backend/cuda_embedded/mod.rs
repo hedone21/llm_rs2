@@ -212,6 +212,14 @@ impl Drop for CublasHandle {
 #[derive(Clone)]
 pub struct CudaBackend {
     ctx: Arc<CudaContext>,
+    /// Dedicated non-blocking CUDA stream for all backend launches.
+    ///
+    /// Using a custom stream (instead of `ctx.default_stream()` which is
+    /// the legacy default stream, `cu_stream = NULL`) unblocks
+    /// `cuStreamBeginCapture` — the legacy default stream cannot be
+    /// captured. Also prevents cross-thread false synchronization that
+    /// the legacy default stream imposes.
+    stream: Arc<cudarc::driver::CudaStream>,
     device_name: String,
     compute_capability: (i32, i32),
     is_uma: bool,
@@ -287,6 +295,19 @@ pub struct CudaBackend {
     /// activations. Wired via the `--cuda-weights-device` CLI flag;
     /// defaults to `false` (no change from the pre-P3 behaviour).
     weights_device: Arc<AtomicBool>,
+    /// True while `begin_graph_capture` is active and
+    /// `end_graph_capture_and_launch` has not yet been called.
+    ///
+    /// During capture, every `maybe_sync_cat` call site becomes a
+    /// no-op (synchronising mid-capture is illegal and would abort the
+    /// capture). The flag is set/cleared by the public
+    /// `begin_graph_capture` / `end_graph_capture_and_launch` helpers;
+    /// when unset the backend behaves exactly as before.
+    ///
+    /// CUDA Graph path bundles the ~400+ kernel launches of a decode
+    /// step into a single graph launch, removing per-kernel driver
+    /// launch overhead (~5 µs × 400 = ~2 ms/tok on Jetson Xavier).
+    graph_capturing: Arc<AtomicBool>,
 }
 
 /// Wrapper around `UnsafeCell<Option<&'static str>>` so we can
@@ -372,13 +393,22 @@ impl CudaBackend {
         let device_name = cuda_result::device::get_name(cu_device)
             .unwrap_or_else(|_| format!("CUDA Device {ordinal}"));
 
+        // Dedicated non-blocking stream for all backend launches. The
+        // legacy default stream (`ctx.default_stream()`, cu_stream=NULL)
+        // cannot be captured by CUDA Graphs, so every launch goes through
+        // this stream instead. Must be created before the cuBLAS handle
+        // so we bind cuBLAS to the same stream.
+        let stream = ctx
+            .new_stream()
+            .map_err(|e| anyhow!("cuStreamCreate failed: {e}"))?;
+
         // Create cuBLAS handle and bind to the same stream as custom kernels.
         // Without this, cuBLAS uses stream 0 while custom kernels use
-        // ctx.default_stream(), causing cross-stream ordering issues.
+        // our non-blocking stream, causing cross-stream ordering issues.
         let cublas_handle =
             cublas_result::create_handle().map_err(|e| anyhow!("cublasCreate_v2 failed: {e}"))?;
         unsafe {
-            cublas_result::set_stream(cublas_handle, ctx.default_stream().cu_stream() as _)
+            cublas_result::set_stream(cublas_handle, stream.cu_stream() as _)
                 .map_err(|e| anyhow!("cublasSetStream failed: {e}"))?;
         }
 
@@ -393,6 +423,7 @@ impl CudaBackend {
 
         let backend = Self {
             ctx,
+            stream,
             device_name,
             compute_capability: (cc_major, cc_minor),
             is_uma,
@@ -408,6 +439,7 @@ impl CudaBackend {
             defer_sync: Arc::new(AtomicBool::new(false)),
             sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
             weights_device: Arc::new(AtomicBool::new(false)),
+            graph_capturing: Arc::new(AtomicBool::new(false)),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -553,6 +585,108 @@ impl CudaBackend {
         self.weights_device.load(Ordering::Relaxed)
     }
 
+    // ── CUDA Graph capture (decode-loop launch bundling) ────────────
+    //
+    // One decode step issues ~400 kernel launches (QKV + rope + kv_scatter
+    // + attention + wo + silu + gate + up + down + two rms_norms + two
+    // residual adds, × 32 layers, + lm_head). At 5 µs/launch the driver
+    // launch overhead alone is ~2 ms/tok on Jetson Xavier — a large
+    // fraction of the 17 ms/tok gap vs llama.cpp.
+    //
+    // Capture the whole decode step into a CUDA Graph, then launch the
+    // graph once. `cudaStreamBeginCapture_v2` batches all subsequent
+    // launches on the stream into a graph DAG without executing them.
+    // `cudaStreamEndCapture` closes the capture and returns the graph;
+    // `cudaGraphInstantiate` compiles it into an executable; a single
+    // `cudaGraphLaunch` then runs the whole DAG back-to-back with just
+    // one driver round-trip.
+    //
+    // Naive per-step capture pays the instantiate cost every step
+    // (~0.3-1 ms on Xavier) — a useful baseline to measure against.
+    // Future work can cache the CudaGraphExec and use cuGraphExecUpdate
+    // to refresh kernel node parameters (pos, token ptrs) in-place.
+    //
+    // Contract for callers:
+    // - `begin_graph_capture` synchronizes first (drain pending work),
+    //   then enters capture mode on the default stream.
+    // - Between `begin` and `end`, any `backend.synchronize()` /
+    //   `read_buffer` / `copy_from` / `cpu_fallback` path is illegal
+    //   (would abort capture). The normal decode path does not touch
+    //   these, but `--profile` / `--cuda-profile` / `--partition`
+    //   features may — keep them off when graph mode is active.
+    // - `end_graph_capture_and_launch` closes capture, instantiates,
+    //   launches once, and schedules the graph for auto-free on
+    //   completion.
+
+    /// Begin a CUDA Graph capture on the default stream.
+    ///
+    /// Pending work on the stream is synchronized first so the captured
+    /// graph depends only on operations enqueued after this call.
+    pub fn begin_graph_capture(&self) -> Result<()> {
+        if self.graph_capturing.load(Ordering::Relaxed) {
+            return Err(anyhow!(
+                "begin_graph_capture called while capture is already active"
+            ));
+        }
+        self.synchronize()?;
+        let stream = self.stream.clone();
+        // Sanity: stream must not be in capturing state when we enter.
+        // If a prior capture was invalidated without its end_capture being
+        // observed, fail fast with context rather than getting an opaque
+        // STREAM_CAPTURE_UNSUPPORTED further down.
+        let status = stream
+            .capture_status()
+            .map_err(|e| anyhow!("cuStreamIsCapturing failed: {e}"))?;
+        if status != cuda_sys::CUstreamCaptureStatus_enum::CU_STREAM_CAPTURE_STATUS_NONE {
+            return Err(anyhow!(
+                "begin_graph_capture: stream is in capture status {:?} before BeginCapture",
+                status
+            ));
+        }
+        // RELAXED: matches llama.cpp's `cudaStreamCaptureModeRelaxed`.
+        // Allows cuMemcpyAsync / event queries that would otherwise
+        // invalidate a THREAD_LOCAL / GLOBAL capture.
+        stream
+            .begin_capture(cuda_sys::CUstreamCaptureMode_enum::CU_STREAM_CAPTURE_MODE_RELAXED)
+            .map_err(|e| anyhow!("cuStreamBeginCapture failed: {e}"))?;
+        self.graph_capturing.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Close an active capture and launch the resulting graph exactly once.
+    ///
+    /// After return, the backend is no longer in capture mode and the
+    /// launched graph's completion is pending on the default stream
+    /// (caller may call `synchronize()` when they need the output).
+    pub fn end_graph_capture_and_launch(&self) -> Result<()> {
+        if !self.graph_capturing.load(Ordering::Relaxed) {
+            return Err(anyhow!("end_graph_capture called without active capture"));
+        }
+        self.graph_capturing.store(false, Ordering::Relaxed);
+        let stream = self.stream.clone();
+        // AUTO_FREE_ON_LAUNCH: the graph's backing allocations (if any)
+        // are freed when the launch completes, matching the per-step
+        // lifetime of the capture.
+        let flag =
+            cuda_sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+        let graph = stream
+            .end_capture(flag)
+            .map_err(|e| anyhow!("cuStreamEndCapture failed: {e}"))?;
+        if let Some(g) = graph {
+            g.launch()
+                .map_err(|e| anyhow!("cuGraphLaunch failed: {e}"))?;
+        }
+        // `g` drops here → exec_destroy + graph_destroy on the Arc'd
+        // CudaContext's scratch error slot.
+        Ok(())
+    }
+
+    /// Whether a CUDA Graph capture is currently active on this backend.
+    #[inline]
+    pub fn is_graph_capturing(&self) -> bool {
+        self.graph_capturing.load(Ordering::Relaxed)
+    }
+
     /// Set the per-category sync policy. `defer_sync=true` still
     /// takes precedence and suppresses sync for every category.
     #[inline]
@@ -576,6 +710,10 @@ impl CudaBackend {
     /// shorthand without code duplication.
     #[inline]
     fn maybe_sync_cat(&self, cat: SyncCat) -> Result<()> {
+        // Mid-capture sync is illegal — would abort the stream capture.
+        if self.graph_capturing.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         if self.defer_sync.load(Ordering::Relaxed) {
             return Ok(());
         }
@@ -664,7 +802,7 @@ impl CudaBackend {
         let a_ptr = a_buf.device_ptr();
         let b_ptr = b_buf.device_ptr();
         let k: i32 = 3;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         unsafe {
             stream
                 .launch_builder(&self.kernels.add_assign)
@@ -948,7 +1086,7 @@ impl Backend for CudaBackend {
                 }
             };
 
-            let stream = self.ctx.default_stream();
+            let stream = self.stream.clone();
             // SAFETY: qp is valid F32 device ptr for Q [batch, seq_len, n_heads_q, head_dim].
             // kp/vp are valid F32 or F16 device ptrs for KV [batch, n_heads_kv, capacity, head_dim].
             // op is valid F32 device ptr for output, same layout as Q.
@@ -1020,7 +1158,7 @@ impl Backend for CudaBackend {
                     const MMVQ_NWARPS: u32 = 4;
                     let k_i32 = k_u as i32;
                     let n_i32 = n_u as i32;
-                    let stream = self.ctx.default_stream();
+                    let stream = self.stream.clone();
                     // Row stride in bytes for activation / output F32 tensors.
                     let a_row_stride_bytes = (k_u * 4) as u64;
                     let out_row_stride_bytes = (n_u * 4) as u64;
@@ -1153,7 +1291,7 @@ impl Backend for CudaBackend {
             if m == 1 && b_dtype == DType::F16 && (k & 1) == 0 {
                 const GEMV_N_DST: u32 = 4;
                 const GEMV_WARP: u32 = 32;
-                let stream = self.ctx.default_stream();
+                let stream = self.stream.clone();
                 let cfg = LaunchConfig {
                     grid_dim: ((n as u32).div_ceil(GEMV_N_DST), 1, 1),
                     block_dim: (GEMV_WARP * GEMV_N_DST, 1, 1),
@@ -1207,7 +1345,7 @@ impl Backend for CudaBackend {
                 // Pure F32: use sgemm
                 let alpha: f32 = 1.0;
                 let beta: f32 = 0.0;
-                let stream = self.ctx.default_stream();
+                let stream = self.stream.clone();
                 // SAFETY: All device pointers are valid CudaHostBuffer/CudaBuffer allocations.
                 // Dimensions are checked by shape accessors. cuBLAS handle is valid.
                 cuda_profile!(self, CudaOpTag::Matmul, stream, {
@@ -1250,7 +1388,7 @@ impl Backend for CudaBackend {
 
                 // Launch F32->F16 cast kernel
                 let cfg = Self::launch_config_1d(k_elements);
-                let stream = self.ctx.default_stream();
+                let stream = self.stream.clone();
                 let k_i32 = k_elements as i32;
                 // SAFETY: a_ptr is valid F32 device memory of size k_elements*4.
                 // a_f16_ptr is valid F16 device memory of size k_elements*2.
@@ -1307,7 +1445,7 @@ impl Backend for CudaBackend {
                 // Both F16: use GemmEx with F32 compute for accuracy
                 let alpha: f32 = 1.0;
                 let beta: f32 = 0.0;
-                let stream = self.ctx.default_stream();
+                let stream = self.stream.clone();
                 // SAFETY: Both pointers are valid F16 device memory. out_ptr is valid F32.
                 cuda_profile!(self, CudaOpTag::Matmul, stream, {
                     unsafe {
@@ -1364,7 +1502,7 @@ impl Backend for CudaBackend {
         let a_ptr = Self::require_device_ptr(a.buffer().as_ref(), "add_assign a")?;
         let b_ptr = Self::require_device_ptr(b.buffer().as_ref(), "add_assign b")?;
         let k = n as i32;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: a_ptr and b_ptr are valid F32 device memory of n elements each.
         cuda_profile!(self, CudaOpTag::AddAssign, stream, {
             unsafe {
@@ -1386,7 +1524,7 @@ impl Backend for CudaBackend {
         let n = x.numel();
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "scale x")?;
         let k = n as i32;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: x_ptr is valid F32 device memory of n elements.
         cuda_profile!(self, CudaOpTag::Scale, stream, {
             unsafe {
@@ -1409,7 +1547,7 @@ impl Backend for CudaBackend {
         let a_ptr = Self::require_device_ptr(a.buffer().as_ref(), "silu_mul gate")?;
         let b_ptr = Self::require_device_ptr(b.buffer().as_ref(), "silu_mul up")?;
         let k = n as i32;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: a_ptr (gate) and b_ptr (up) are valid F32 device memory of n elements.
         cuda_profile!(self, CudaOpTag::SiluMul, stream, {
             unsafe {
@@ -1432,7 +1570,7 @@ impl Backend for CudaBackend {
         let gate_ptr = Self::require_device_ptr(gate.buffer().as_ref(), "gelu_tanh_mul gate")?;
         let up_ptr = Self::require_device_ptr(up.buffer().as_ref(), "gelu_tanh_mul up")?;
         let k = n as i32;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: gate_ptr and up_ptr are valid F32 device memory of n elements.
         cuda_profile!(self, CudaOpTag::GeluTanhMul, stream, {
             unsafe {
@@ -1464,7 +1602,7 @@ impl Backend for CudaBackend {
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: x_ptr (in-place dst+src) and w_ptr are valid F32 device memory.
         // nrows * ncols == total elements.
         cuda_profile!(self, CudaOpTag::RmsNorm, stream, {
@@ -1508,7 +1646,7 @@ impl Backend for CudaBackend {
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: out_ptr (dst), x_ptr (src), w_ptr are valid F32 device memory.
         cuda_profile!(self, CudaOpTag::RmsNorm, stream, {
             unsafe {
@@ -1555,7 +1693,7 @@ impl Backend for CudaBackend {
             block_dim: (block_size, 1, 1),
             shared_mem_bytes: 0,
         };
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: x_ptr is valid F32 device memory of nrows*ncols elements.
         cuda_profile!(self, CudaOpTag::Softmax, stream, {
             unsafe {
@@ -1600,7 +1738,7 @@ impl Backend for CudaBackend {
             block_dim: ((head_dim / 2) as u32, 1, 1),
             shared_mem_bytes: 0,
         };
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         cuda_profile!(self, CudaOpTag::Rope, stream, {
             unsafe {
                 stream
@@ -1630,7 +1768,7 @@ impl Backend for CudaBackend {
         match (src_dtype, dst_dtype, src_ptr, dst_ptr) {
             (DType::F32, DType::F16, Some(sp), Some(dp)) => {
                 let k = n as i32;
-                let stream = self.ctx.default_stream();
+                let stream = self.stream.clone();
                 cuda_profile!(self, CudaOpTag::Cast, stream, {
                     unsafe {
                         stream
@@ -1648,7 +1786,7 @@ impl Backend for CudaBackend {
             }
             (DType::F16, DType::F32, Some(sp), Some(dp)) => {
                 let k = n as i32;
-                let stream = self.ctx.default_stream();
+                let stream = self.stream.clone();
                 cuda_profile!(self, CudaOpTag::Cast, stream, {
                     unsafe {
                         stream
@@ -1684,7 +1822,7 @@ impl Backend for CudaBackend {
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "add_row_bias x")?;
         let bias_ptr = Self::require_device_ptr(bias.buffer().as_ref(), "add_row_bias bias")?;
         let total_i32 = total as i32;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
         // SAFETY: x_ptr is valid F32 device ptr of total elements; bias_ptr is valid F32 of ncols.
         cuda_profile!(self, CudaOpTag::AddRowBias, stream, {
             unsafe {
@@ -1734,7 +1872,7 @@ impl Backend for CudaBackend {
                 block_dim: (head_dim as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let stream = self.ctx.default_stream();
+            let stream = self.stream.clone();
             // SAFETY: ks/vs are valid F32 device ptrs; kd/vd are valid F16 device ptrs.
             // Dimensions match kv_heads * head_dim for src, kv_heads * capacity * head_dim for dst.
             cuda_profile!(self, CudaOpTag::KvScatter, stream, {
@@ -1795,7 +1933,7 @@ impl Backend for CudaBackend {
                 block_dim: (head_dim as u32, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let stream = self.ctx.default_stream();
+            let stream = self.stream.clone();
             cuda_profile!(self, CudaOpTag::KvScatter, stream, {
                 unsafe {
                     stream
@@ -1856,7 +1994,7 @@ impl Backend for CudaBackend {
                 block_dim: (256, 1, 1),
                 shared_mem_bytes: 0,
             };
-            let stream = self.ctx.default_stream();
+            let stream = self.stream.clone();
             // SAFETY: sp is valid F16 embed device ptr; ip is valid i32 indices; dp is valid F32 output.
             cuda_profile!(self, CudaOpTag::Gather, stream, {
                 unsafe {
@@ -1978,7 +2116,7 @@ impl Backend for CudaBackend {
             cache_seq_len as i32
         };
         let csl = cache_seq_len as i32;
-        let stream = self.ctx.default_stream();
+        let stream = self.stream.clone();
 
         match kv_dtype {
             DType::F32 => {
@@ -2063,8 +2201,7 @@ impl Backend for CudaBackend {
     // --- Memory ops ---
 
     fn synchronize(&self) -> Result<()> {
-        self.ctx
-            .default_stream()
+        self.stream
             .synchronize()
             .map_err(|e| anyhow!("CUDA synchronize failed: {e}"))
     }
