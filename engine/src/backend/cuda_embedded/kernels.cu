@@ -932,3 +932,175 @@ extern "C" __global__ void gemv_q4_0_f32_f32(
         output[row] = sum;
     }
 }
+
+// =================================================================
+// Q8_1 activation quantization + Q4_0 × Q8_1 mmvq (dp4a integer dot).
+// Ported from llama.cpp's mmvq.cu + quantize.cu (MIT license).
+//
+// Decode (M=1) fast path:
+//   1. Launch `quantize_q8_1_f32` to compress the F32 activation vector
+//      into (K/32) block_q8_1 records (36 B each = half2 ds + int8 qs[32]).
+//   2. Launch `mul_mat_vec_q4_0_q8_1` which, for every output row, uses
+//      dp4a to compute sum((w_q-8) * x_q) on 4-way packed int8 pairs,
+//      then applies the per-block scales.
+//
+// Replaces dequant-in-kernel float GEMV (~5.9 tok/s on Xavier) with the
+// llama.cpp-style integer path (~17 tok/s reference).
+// =================================================================
+
+#define QK8_1 32
+#define QI8_1 8    // = QK8_1/4 (int32s of qs per Q8_1 block)
+#define QK4_0 32
+#define QI4_0 4    // = QK4_0/8 (int32s of qs per Q4_0 block)
+#define VDR_Q4_0_Q8_1_MMVQ 2
+
+// Quantize the activation vector `x[K]` into Q8_1 blocks.
+// Each block_q8_1 record is 36 bytes: half2 ds (d=amax/127, sum=sum_x) + int8 qs[32].
+// Grid: (ceil(K / blockDim.x), 1, 1), block: (Q8_1_QUANT_BSIZE, 1, 1) with
+// blockDim.x a multiple of QK8_1 so the warp reduction below is well-defined.
+extern "C" __global__ void quantize_q8_1_f32(
+    const float* __restrict__ x,
+    unsigned char* __restrict__ vy,
+    int K)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= K) return;
+
+    const int ib  = i >> 5;   // block index (QK8_1 = 32)
+    const int iqs = i & 31;   // quant index within block
+
+    const float xi = x[i];
+    float amax = fabsf(xi);
+    float sum  = xi;
+
+    // Reduce amax/sum within the 32 lanes that share a Q8_1 block.
+    #pragma unroll
+    for (int mask = 16; mask > 0; mask >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, mask, 32));
+        sum  +=            __shfl_xor_sync(0xffffffff, sum,  mask, 32);
+    }
+
+    const float d = amax / 127.0f;
+    const int   q = (amax == 0.0f) ? 0 : __float2int_rn(xi / d);
+
+    // Layout: [half2 ds | int8 qs[32]] — 36 B, naturally 4-byte aligned.
+    unsigned char* blk = vy + ib * 36;
+    signed char* qs = (signed char*)(blk + 4);
+    qs[iqs] = (signed char)q;
+
+    if (iqs == 0) {
+        __half2* ds = (__half2*)blk;
+        *ds = __floats2half2_rn(d, sum);
+    }
+}
+
+// Q4_0 × Q8_1 mul_mat_vec (ncols_dst = 1, rows_per_cuda_block = 1).
+// Grid: (N, 1, 1), block: (32, MMVQ_NWARPS, 1) with 4 warps per output row.
+//
+//   weight       : [N * (K/QK4_0) * 18] bytes (block_q4_0 = half d + uint8 qs[16])
+//   activation_q : [ (K/QK8_1) * 36 ] bytes (block_q8_1 produced by the kernel above)
+//   output       : [N] F32
+//
+// Per-thread: pick one Q4_0 block (kbx) and one of the 2 dot-product slots
+// (kqs ∈ {0,2}), producing half of the block's contribution via two dp4a
+// calls. 4 warps * 32 lanes = 128 threads process 64 blocks per iteration
+// (blocks_per_iter = vdr * nwarps * warp_size / qi = 2*4*32/4 = 64).
+#ifndef MMVQ_NWARPS
+#define MMVQ_NWARPS 4
+#endif
+
+extern "C" __global__ void mul_mat_vec_q4_0_q8_1(
+    const unsigned char* __restrict__ weight,        // Q4_0 blocks
+    const unsigned char* __restrict__ activation_q,  // Q8_1 blocks
+    float*               __restrict__ output,
+    int K, int N)
+{
+    const int row = blockIdx.x;
+    if (row >= N) return;
+
+    const int tid = 32 * threadIdx.y + threadIdx.x;   // 0..127
+    const int blocks_per_row = K >> 5;                 // K / QK4_0
+    const int blocks_per_iter = (VDR_Q4_0_Q8_1_MMVQ * MMVQ_NWARPS * 32) / QI4_0; // 64
+
+    // Q4_0 block stride (bytes) and Q8_1 block stride (bytes).
+    const int q4_block_bytes = 18;
+    const int q8_block_bytes = 36;
+
+    const unsigned char* w_row = weight + (long long)row * blocks_per_row * q4_block_bytes;
+
+    float tmp = 0.0f;
+
+    // Each thread owns one (kbx, kqs) pair per iteration.
+    //   kbx = tid / (qi/vdr) = tid / 2
+    //   kqs = vdr * (tid % (qi/vdr)) = 2 * (tid % 2)  ∈ {0, 2}
+    const int kqs = VDR_Q4_0_Q8_1_MMVQ * (tid & 1);
+
+    for (int kbx = tid >> 1; kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const unsigned char* bq4 = w_row + kbx * q4_block_bytes;
+        const unsigned char* bq8 = activation_q + kbx * q8_block_bytes;
+
+        // Load Q4_0 scale (half) and the 2 int32 quants this thread owns.
+        // bq4 layout: [half d | uint8 qs[16]] — d is 2-byte aligned.
+        unsigned short d_bits = (unsigned short)bq4[0] | ((unsigned short)bq4[1] << 8);
+        float d4 = __half2float(__ushort_as_half(d_bits));
+
+        // v[0], v[1]: 2 int32s starting at qs[kqs*4].
+        // Use byte loads to be robust to the 2-byte alignment of qs.
+        int v0, v1;
+        {
+            const unsigned char* p = bq4 + 2 + kqs * 4;  // kqs * 4 ∈ {0, 8}
+            v0 = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
+            v1 = (int)p[4] | ((int)p[5] << 8) | ((int)p[6] << 16) | ((int)p[7] << 24);
+        }
+
+        // u[4]: 4 int32s from bq8->qs at offsets kqs, kqs+1, kqs+QI4_0, kqs+QI4_0+1.
+        // bq8 layout: [half2 ds (4 B) | int8 qs[32] (32 B)] — qs is 4-byte aligned.
+        const int* qs8 = (const int*)(bq8 + 4);
+        int u00 = qs8[kqs + 0];            // lower 4 values batch
+        int u01 = qs8[kqs + 1];
+        int u10 = qs8[kqs + QI4_0 + 0];    // upper 4 values batch (offset +4 int32 = +16 bytes)
+        int u11 = qs8[kqs + QI4_0 + 1];
+
+        // dp4a over low/high nibbles.
+        int sumi = 0;
+        {
+            int vi_lo = (v0 >> 0) & 0x0F0F0F0F;
+            int vi_hi = (v0 >> 4) & 0x0F0F0F0F;
+            sumi = __dp4a(vi_lo, u00, sumi);
+            sumi = __dp4a(vi_hi, u10, sumi);
+        }
+        {
+            int vi_lo = (v1 >> 0) & 0x0F0F0F0F;
+            int vi_hi = (v1 >> 4) & 0x0F0F0F0F;
+            sumi = __dp4a(vi_lo, u01, sumi);
+            sumi = __dp4a(vi_hi, u11, sumi);
+        }
+
+        // Q8_1 scale + sum: half2 at bq8[0..4].
+        const __half2 ds8 = *(const __half2*)bq8;
+        float2 ds8f = __half22float2(ds8);
+        // 8 * vdr / QI4_0 = 8*2/4 = 4 (adjusts the -8 bias for half-block coverage).
+        tmp += d4 * (sumi * ds8f.x - 4.0f * ds8f.y);
+    }
+
+    // Cross-warp reduce: each of the 32 lanes carries partial sums across
+    // MMVQ_NWARPS warps; lane 0 of warp 0 writes the final scalar.
+    __shared__ float tmp_shared[MMVQ_NWARPS - 1][32];
+    if (threadIdx.y > 0) {
+        tmp_shared[threadIdx.y - 1][threadIdx.x] = tmp;
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+
+    #pragma unroll
+    for (int l = 0; l < MMVQ_NWARPS - 1; ++l) {
+        tmp += tmp_shared[l][threadIdx.x];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        tmp += __shfl_down_sync(0xffffffff, tmp, offset, 32);
+    }
+    if (threadIdx.x == 0) {
+        output[row] = tmp;
+    }
+}

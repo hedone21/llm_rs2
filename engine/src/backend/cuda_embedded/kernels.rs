@@ -41,6 +41,8 @@ pub struct CudaKernels {
     pub gemv_f16_f16_f32: CudaFunction,
     pub gemv_f16_f32_f32: CudaFunction,
     pub gemv_q4_0_f32_f32: CudaFunction,
+    pub quantize_q8_1_f32: CudaFunction,
+    pub mul_mat_vec_q4_0_q8_1: CudaFunction,
 }
 
 impl CudaKernels {
@@ -87,6 +89,8 @@ impl CudaKernels {
             gemv_f16_f16_f32: load("gemv_f16_f16_f32")?,
             gemv_f16_f32_f32: load("gemv_f16_f32_f32")?,
             gemv_q4_0_f32_f32: load("gemv_q4_0_f32_f32")?,
+            quantize_q8_1_f32: load("quantize_q8_1_f32")?,
+            mul_mat_vec_q4_0_q8_1: load("mul_mat_vec_q4_0_q8_1")?,
         })
     }
 

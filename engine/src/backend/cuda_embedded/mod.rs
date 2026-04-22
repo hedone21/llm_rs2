@@ -219,6 +219,12 @@ pub struct CudaBackend {
     kernels: Arc<CudaKernels>,
     /// Cached F16 cast buffer for matmul_transposed F32×F16 path.
     cast_cache: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
+    /// Scratch buffer for Q8_1 quantized activations used by the Q4_0 ×
+    /// Q8_1 mmvq path (decode M=1). 36 bytes per Q8_1 block
+    /// (half2 ds + int8 qs[32]); sized to (max K / 32) * 36 and grown
+    /// on demand. Populated by `quantize_q8_1_f32`, consumed by
+    /// `mul_mat_vec_q4_0_q8_1`.
+    q8_1_scratch: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
     /// Reusable device buffer for per-call attention score readback
     /// (Phase B: resilience/eviction GPU path). Holds normalized softmax weights
     /// in layout `[num_heads_q, score_stride]` F32. Allocated lazily on first
@@ -395,6 +401,7 @@ impl CudaBackend {
             }),
             kernels: Arc::new(kernels),
             cast_cache: Arc::new(std::sync::Mutex::new(None)),
+            q8_1_scratch: Arc::new(std::sync::Mutex::new(None)),
             score_tmp_buf: Arc::new(std::sync::Mutex::new(None)),
             profiler: Arc::new(std::sync::Mutex::new(None)),
             op_label_hint: Arc::new(OpLabelHint::new()),
@@ -1008,32 +1015,94 @@ impl Backend for CudaBackend {
                 let b_dev = Self::get_device_ptr(b.buffer().as_ref());
                 let out_dev = Self::get_device_ptr(out.buffer().as_ref());
                 if let (Some(a_ptr), Some(b_ptr), Some(out_ptr)) = (a_dev, b_dev, out_dev) {
-                    // One CUDA block per output row; Q4_0_NWARPS warps per block
-                    // (matches `Q4_0_NWARPS` in kernels.cu). Warps stride across
-                    // a row's Q4_0 blocks, keeping all lanes busy and using SLM
-                    // for the cross-warp reduce. Keeps Q4_0 fully on-GPU,
-                    // including prefill (M>1 via back-to-back launches) — the
-                    // CPU-fallback path suffers from Jetson UMA cache-incoherency
-                    // after a CPU write.
                     const GEMV_WARP: u32 = 32;
                     const Q4_0_NWARPS: u32 = 4;
+                    const MMVQ_NWARPS: u32 = 4;
                     let k_i32 = k_u as i32;
                     let n_i32 = n_u as i32;
                     let stream = self.ctx.default_stream();
+                    // Row stride in bytes for activation / output F32 tensors.
+                    let a_row_stride_bytes = (k_u * 4) as u64;
+                    let out_row_stride_bytes = (n_u * 4) as u64;
+
+                    // Decode (M=1): Q8_1 quantize + dp4a mmvq. Ported from
+                    // llama.cpp (mmvq.cu + quantize.cu). Integer dot product is
+                    // ~3x faster than the dequant-in-kernel float GEMV below
+                    // on Jetson Xavier (and matches llama.cpp throughput).
+                    if m_u == 1 {
+                        let n_q8_blocks = k_u >> 5; // K / 32
+                        let need_bytes = n_q8_blocks * 36;
+                        let mut guard = self.q8_1_scratch.lock().unwrap();
+                        let need_realloc = guard
+                            .as_ref()
+                            .map(|b| b.size() < need_bytes)
+                            .unwrap_or(true);
+                        if need_realloc {
+                            *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
+                        }
+                        let q8_ptr = guard.as_ref().unwrap().device_ptr();
+
+                        // quantize_q8_1_f32: one thread per F32 element.
+                        // Use block size 256 (multiple of 32 == QK8_1).
+                        const QUANT_BS: u32 = 256;
+                        let q_cfg = LaunchConfig {
+                            grid_dim: ((k_u as u32).div_ceil(QUANT_BS), 1, 1),
+                            block_dim: (QUANT_BS, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                            unsafe {
+                                stream
+                                    .launch_builder(&self.kernels.quantize_q8_1_f32)
+                                    .arg(&a_ptr)
+                                    .arg(&q8_ptr)
+                                    .arg(&k_i32)
+                                    .launch(q_cfg)
+                                    .map_err(|e| anyhow!("quantize_q8_1_f32 launch failed: {e}"))?;
+                            }
+                            Ok(())
+                        });
+
+                        // mul_mat_vec_q4_0_q8_1: one CUDA block per output row,
+                        // 4 warps × 32 lanes = 128 threads. 128 * SLM scratch
+                        // ((MMVQ_NWARPS-1) * 32 * 4 bytes = 384 B).
+                        let mmvq_cfg = LaunchConfig {
+                            grid_dim: (n_i32 as u32, 1, 1),
+                            block_dim: (GEMV_WARP, MMVQ_NWARPS, 1),
+                            shared_mem_bytes: 0, // declared __shared__ in kernel
+                        };
+                        cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                            unsafe {
+                                stream
+                                    .launch_builder(&self.kernels.mul_mat_vec_q4_0_q8_1)
+                                    .arg(&b_ptr)
+                                    .arg(&q8_ptr)
+                                    .arg(&out_ptr)
+                                    .arg(&k_i32)
+                                    .arg(&n_i32)
+                                    .launch(mmvq_cfg)
+                                    .map_err(|e| {
+                                        anyhow!("mul_mat_vec_q4_0_q8_1 launch failed: {e}")
+                                    })?;
+                            }
+                            Ok(())
+                        });
+
+                        self.maybe_sync_cat(SyncCat::Matmul)?;
+                        return Ok(());
+                    }
+
+                    // Prefill (M>1): fall through to the dequant-in-kernel
+                    // GEMV (one launch per token). Good enough — prefill
+                    // runs once per prompt, not per decode step.
                     let cfg = LaunchConfig {
                         grid_dim: (n_i32 as u32, 1, 1),
                         block_dim: (GEMV_WARP, Q4_0_NWARPS, 1),
                         shared_mem_bytes: Q4_0_NWARPS * 4,
                     };
-                    // Row stride in bytes for activation / output F32 tensors.
-                    let a_row_stride_bytes = (k_u * 4) as u64;
-                    let out_row_stride_bytes = (n_u * 4) as u64;
                     for m_i in 0..m_u {
                         let a_ptr_row = a_ptr + a_row_stride_bytes * (m_i as u64);
                         let out_ptr_row = out_ptr + out_row_stride_bytes * (m_i as u64);
-                        // SAFETY: b_ptr points at a byte buffer containing
-                        // N*(K/32)*18 bytes of BlockQ4_0 data. a_ptr_row is
-                        // F32 of length K; out_ptr_row is F32 of length N.
                         cuda_profile!(self, CudaOpTag::Matmul, stream, {
                             unsafe {
                                 stream
