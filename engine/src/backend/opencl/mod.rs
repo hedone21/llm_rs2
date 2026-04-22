@@ -172,6 +172,9 @@ struct KernelCache {
     kernel_attn_gen_kivi_q8: Option<CoreKernel>,
     // F16 GEMV N_DST=4 variant for large-N matmuls (lm_head, FFN)
     kernel_mul_mat_f16_f32_l4: Option<CoreKernel>,
+    // F16 GEMV single-token decode variant (N_DST=1, 64 threads/WG).
+    // Matches llama.cpp's ne11*ne12<4 path. Dispatched when m=1.
+    kernel_mul_mat_f16_f32_1row: Option<CoreKernel>,
     // Score-only attention kernel (decode, F16 KV): Q*K^T + softmax, no V multiply.
     // Used alongside flash_attention_decode_gpu to avoid falling back to slow kernel_attn_gen_half.
     kernel_score_only_half: Option<CoreKernel>,
@@ -245,6 +248,9 @@ pub struct OpenCLBackend {
 
     // F16 GEMV N_DST=4 for large-N decode (lm_head, FFN)
     pub f16_l4_program: Option<Program>,
+
+    // F16 GEMV single-token decode (N_DST=1). llama.cpp parity.
+    pub f16_1row_program: Option<Program>,
 
     // GEMM programs for prefill (tiled matmul, optional — fallback to GEMV)
     pub gemm_f16_program: Option<Program>,
@@ -698,6 +704,27 @@ impl OpenCLBackend {
             }
         };
 
+        // F16 GEMV 1row variant — matches llama.cpp's single-token decode path.
+        // Activation ne11=1 case: 1 output row per WG, 64-lane subgroup reduce,
+        // no local memory. llama.cpp selects this when ne11*ne12 < 4.
+        // Tested 2026-04-22 to close the remaining n=2000 gap vs llama.cpp.
+        let f16_1row_src = include_str!("../../../kernels/mul_mv_f16_f32_1row_simple.cl");
+        let f16_1row_program = match Program::builder()
+            .devices(device)
+            .src(f16_1row_src)
+            .cmplr_opt(&cl_opts)
+            .build(&context)
+        {
+            Ok(p) => {
+                log::info!("mul_mv_f16_f32_1row.cl compiled (single-token decode)");
+                Some(p)
+            }
+            Err(e) => {
+                log::warn!("mul_mv_f16_f32_1row.cl failed: {}. Fallback to N_DST=4.", e);
+                None
+            }
+        };
+
         // Flash attention kernels — compiled with head_dim-specific defines.
         // Each DK variant is a separate program because DK is a compile-time
         // constant (q_priv[DK_VEC] / o_acc[DV_VEC] are private arrays).
@@ -1101,6 +1128,9 @@ impl OpenCLBackend {
             kernel_mul_mat_f16_f32_l4: f16_l4_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_l4").ok()),
+            kernel_mul_mat_f16_f32_1row: f16_1row_program
+                .as_ref()
+                .and_then(|p| ocl::core::create_kernel(p, "kernel_mul_mat_f16_f32_1row").ok()),
             kernel_score_only_half: attention_scores_program
                 .as_ref()
                 .and_then(|p| ocl::core::create_kernel(p, "kernel_score_only_half").ok()),
@@ -1173,6 +1203,7 @@ impl OpenCLBackend {
             flash_attn_f32_f16_program_dk64,
             flash_attn_f32_f16_program_dk128,
             f16_l4_program,
+            f16_1row_program,
             gemm_f16_program,
             gemm_f32_program,
             gemm_q4_0_program,
@@ -1676,13 +1707,27 @@ impl OpenCLBackend {
         let kernels = unsafe { &*self.kernels.get() };
         let f16_nosub = kernels.f16_is_nosub;
 
+        // 1row variant (mul_mv_f16_f32_1row.cl, N_DST=1 → 1 row/WG, single
+        // 64-lane subgroup). Matches llama.cpp's decode path; dispatched when
+        // activation batch m=1 (single-token decode). Disable with
+        // LLMRS_F16_GEMV_DISABLE_1ROW=1 for A/B testing.
+        let disable_1row = std::env::var("LLMRS_F16_GEMV_DISABLE_1ROW")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let use_1row =
+            !disable_1row && m == 1 && kernels.kernel_mul_mat_f16_f32_1row.is_some();
+
         // L4 variant (mul_mv_f16_f32_l4.cl, N_DST=4 → 4 rows/WG) is also 4-wave
         // K-split, so it only works when the main 4-wave kernel is loaded.
         // Use it for large-N matmuls (lm_head, FFN) where halving WG count pays off.
         const LARGE_N_THRESHOLD: usize = 4096;
-        let use_l4 =
-            !f16_nosub && n > LARGE_N_THRESHOLD && kernels.kernel_mul_mat_f16_f32_l4.is_some();
-        let kernel = if use_l4 {
+        let use_l4 = !use_1row
+            && !f16_nosub
+            && n > LARGE_N_THRESHOLD
+            && kernels.kernel_mul_mat_f16_f32_l4.is_some();
+        let kernel = if use_1row {
+            kernels.kernel_mul_mat_f16_f32_1row.as_ref().unwrap()
+        } else if use_l4 {
             kernels.kernel_mul_mat_f16_f32_l4.as_ref().unwrap()
         } else {
             &kernels.kernel_mul_mat_f16_f32
@@ -1715,7 +1760,11 @@ impl OpenCLBackend {
             ocl::core::set_kernel_arg(kernel, 13, ocl::core::ArgVal::scalar(&r2))?;
             ocl::core::set_kernel_arg(kernel, 14, ocl::core::ArgVal::scalar(&r3))?;
 
-            let (global_work_size, local_work_size) = if f16_nosub {
+            let (global_work_size, local_work_size) = if use_1row {
+                // 1row kernel: local=[64,1,1], N_DST=1 → 1 row/WG (single SG).
+                // Global: dim0 = n*64, dim1 = m=1, dim2 = 1.
+                ([n * 64, m, 1], [64usize, 1, 1])
+            } else if f16_nosub {
                 // Nosub kernel: local=[64,1,1], N_DST=4 → 4 rows/WG.
                 // Global: dim0 = ceil(n/4)*64, dim1 = m (batch), dim2 = 1.
                 const NOSUB_N_DST: usize = 4;
