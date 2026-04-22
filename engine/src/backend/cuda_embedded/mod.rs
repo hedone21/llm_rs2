@@ -826,12 +826,7 @@ impl CudaBackend {
             // on the same context. new_graph is the fresh capture. Both
             // handles remain valid for this call (we hold the mutex).
             let status = unsafe {
-                cuda_sys::cuGraphExecUpdate(
-                    cache.exec,
-                    new_graph,
-                    &mut err_node,
-                    &mut result,
-                )
+                cuda_sys::cuGraphExecUpdate(cache.exec, new_graph, &mut err_node, &mut result)
             };
             status == cuda_sys::CUresult::CUDA_SUCCESS
                 && matches!(
@@ -1488,32 +1483,73 @@ impl Backend for CudaBackend {
                         return Ok(());
                     }
 
-                    // Prefill (M>1): fall through to the dequant-in-kernel
-                    // GEMV (one launch per token). Good enough — prefill
-                    // runs once per prompt, not per decode step.
-                    let cfg = LaunchConfig {
-                        grid_dim: (n_i32 as u32, 1, 1),
-                        block_dim: (GEMV_WARP, Q4_0_NWARPS, 1),
-                        shared_mem_bytes: Q4_0_NWARPS * 4,
-                    };
-                    for m_i in 0..m_u {
-                        let a_ptr_row = a_ptr + a_row_stride_bytes * (m_i as u64);
-                        let out_ptr_row = out_ptr + out_row_stride_bytes * (m_i as u64);
-                        cuda_profile!(self, CudaOpTag::Matmul, stream, {
-                            unsafe {
-                                stream
-                                    .launch_builder(&self.kernels.gemv_q4_0_f32_f32)
-                                    .arg(&b_ptr)
-                                    .arg(&a_ptr_row)
-                                    .arg(&out_ptr_row)
-                                    .arg(&k_i32)
-                                    .arg(&n_i32)
-                                    .launch(cfg)
-                                    .map_err(|e| anyhow!("gemv_q4_0_f32_f32 launch failed: {e}"))?;
-                            }
-                            Ok(())
-                        });
+                    // Prefill (M>1): Q8_1 quantise + dp4a mmvq, batched across
+                    // tokens via grid.y = M. Matches the decode fast path but
+                    // runs over a packed [M*(K/32)*36] Q8_1 scratch and writes
+                    // [M*N] F32 output. 3× faster than the dequant-in-kernel
+                    // float GEMV it replaced.
+                    let _ = (a_row_stride_bytes, out_row_stride_bytes);
+                    let n_q8_blocks_per_tok = k_u >> 5;
+                    let need_bytes = m_u * n_q8_blocks_per_tok * 36;
+                    let mut guard = self.q8_1_scratch.lock().unwrap();
+                    let need_realloc = guard
+                        .as_ref()
+                        .map(|b| b.size() < need_bytes)
+                        .unwrap_or(true);
+                    if need_realloc {
+                        *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
+                        // Re-alloc invalidates any previously cached Q8_1
+                        // quantisation — pointer changed.
+                        *self.q8_1_cache.lock().unwrap() = None;
                     }
+                    let q8_ptr = guard.as_ref().unwrap().device_ptr();
+                    drop(guard);
+                    // Prefill path does not reuse the decode cache entry; the
+                    // buffer now holds M tokens' worth of Q8_1 data.
+                    *self.q8_1_cache.lock().unwrap() = None;
+
+                    const QUANT_BS: u32 = 256;
+                    let q_cfg = LaunchConfig {
+                        grid_dim: ((k_u as u32).div_ceil(QUANT_BS), m_u as u32, 1),
+                        block_dim: (QUANT_BS, 1, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                        unsafe {
+                            stream
+                                .launch_builder(&self.kernels.quantize_q8_1_f32)
+                                .arg(&a_ptr)
+                                .arg(&q8_ptr)
+                                .arg(&k_i32)
+                                .launch(q_cfg)
+                                .map_err(|e| {
+                                    anyhow!("quantize_q8_1_f32 (batched) launch failed: {e}")
+                                })?;
+                        }
+                        Ok(())
+                    });
+
+                    let mmvq_cfg = LaunchConfig {
+                        grid_dim: (n_i32 as u32, m_u as u32, 1),
+                        block_dim: (GEMV_WARP, MMVQ_NWARPS, 1),
+                        shared_mem_bytes: 0,
+                    };
+                    cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                        unsafe {
+                            stream
+                                .launch_builder(&self.kernels.mul_mat_vec_q4_0_q8_1)
+                                .arg(&b_ptr)
+                                .arg(&q8_ptr)
+                                .arg(&out_ptr)
+                                .arg(&k_i32)
+                                .arg(&n_i32)
+                                .launch(mmvq_cfg)
+                                .map_err(|e| {
+                                    anyhow!("mul_mat_vec_q4_0_q8_1 (batched) launch failed: {e}")
+                                })?;
+                        }
+                        Ok(())
+                    });
                     self.maybe_sync_cat(SyncCat::Matmul)?;
                     return Ok(());
                 }
@@ -1866,8 +1902,7 @@ impl Backend for CudaBackend {
         let out_dims = out.shape().dims().to_vec();
         let n_u = *out_dims.last().unwrap_or(&0);
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "ffn_gate_up_silu x")?;
-        let wg_ptr =
-            Self::require_device_ptr(w_gate.buffer().as_ref(), "ffn_gate_up_silu w_gate")?;
+        let wg_ptr = Self::require_device_ptr(w_gate.buffer().as_ref(), "ffn_gate_up_silu w_gate")?;
         let wu_ptr = Self::require_device_ptr(w_up.buffer().as_ref(), "ffn_gate_up_silu w_up")?;
         let out_ptr = Self::require_device_ptr(out.buffer().as_ref(), "ffn_gate_up_silu out")?;
         // out is written — drop any Q8 cache of that ptr.

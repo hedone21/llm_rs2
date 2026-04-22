@@ -917,27 +917,32 @@ extern "C" __global__ void gemv_f16_f32_f32(
 // K must be a multiple of 32. Weight pointer is byte-addressed; each row is
 // (K/32) * 18 bytes. Block offset 18*b is always 2-aligned (we avoid a wider
 // reinterpret_cast on a 2-aligned address).
-// Launched with block_dim = (32, Q4_0_NWARPS, 1). Each CUDA block handles
-// one output row; the Q4_0_NWARPS warps each process a strided subset of the
-// row's Q4_0 blocks, then tree-reduce via SLM.
+// Launched with block_dim = (32, Q4_0_NWARPS, 1) and grid_dim = (N, M, 1).
+// Each CUDA block handles one (output_row, token) pair; the Q4_0_NWARPS warps
+// each process a strided subset of the row's Q4_0 blocks, then tree-reduce via
+// SLM. Batching M tokens into the grid Y dimension amortises launch latency
+// and removes the per-token host-side loop that dominated prefill on Jetson
+// Xavier (~18K launches / prefill for Llama 3.1 8B at seq_len=81).
 #ifndef Q4_0_NWARPS
 #define Q4_0_NWARPS 4
 #endif
 
 extern "C" __global__ void gemv_q4_0_f32_f32(
     const unsigned char* __restrict__ weight,  // [N * (K/32) * 18] bytes
-    const float*         __restrict__ input,   // [K] F32
-    float*               __restrict__ output,  // [N] F32
+    const float*         __restrict__ input,   // [M * K] F32 (row-major, stride K)
+    float*               __restrict__ output,  // [M * N] F32 (row-major, stride N)
     int K, int N)
 {
     const int row  = blockIdx.x;
     if (row >= N) return;
+    const int tok  = blockIdx.y;               // 0..M-1
     const int lane    = threadIdx.x;           // 0..31
     const int warp_id = threadIdx.y;           // 0..(Q4_0_NWARPS-1)
 
     const int n_blocks = K >> 5;               // K / 32
     const unsigned char* row_ptr =
         weight + (long long)row * n_blocks * 18;
+    const float* input_tok = input + (long long)tok * K;
 
     float acc = 0.0f;
 
@@ -955,7 +960,7 @@ extern "C" __global__ void gemv_q4_0_f32_f32(
         int nib = (lane < 16) ? (int)(q_byte & 0xFu) : (int)(q_byte >> 4);
         int v   = nib - 8;
 
-        float act = input[b * 32 + lane];
+        float act = input_tok[b * 32 + lane];
         acc += (float)v * d * act;
     }
 
@@ -973,7 +978,7 @@ extern "C" __global__ void gemv_q4_0_f32_f32(
         float sum = 0.0f;
         #pragma unroll
         for (int w = 0; w < Q4_0_NWARPS; ++w) sum += partial[w];
-        output[row] = sum;
+        output[(long long)tok * N + row] = sum;
     }
 }
 
@@ -998,10 +1003,11 @@ extern "C" __global__ void gemv_q4_0_f32_f32(
 #define QI4_0 4    // = QK4_0/8 (int32s of qs per Q4_0 block)
 #define VDR_Q4_0_Q8_1_MMVQ 2
 
-// Quantize the activation vector `x[K]` into Q8_1 blocks.
+// Quantize the activation vector(s) `x[M*K]` into Q8_1 blocks `vy[M*(K/32)*36]`.
 // Each block_q8_1 record is 36 bytes: half2 ds (d=amax/127, sum=sum_x) + int8 qs[32].
-// Grid: (ceil(K / blockDim.x), 1, 1), block: (Q8_1_QUANT_BSIZE, 1, 1) with
+// Grid: (ceil(K / blockDim.x), M, 1), block: (Q8_1_QUANT_BSIZE, 1, 1) with
 // blockDim.x a multiple of QK8_1 so the warp reduction below is well-defined.
+// For decode (M=1) this degenerates to the single-vector launch.
 extern "C" __global__ void quantize_q8_1_f32(
     const float* __restrict__ x,
     unsigned char* __restrict__ vy,
@@ -1009,11 +1015,13 @@ extern "C" __global__ void quantize_q8_1_f32(
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= K) return;
+    const int tok = blockIdx.y;
 
-    const int ib  = i >> 5;   // block index (QK8_1 = 32)
+    const int ib  = i >> 5;   // block index within a token (QK8_1 = 32)
     const int iqs = i & 31;   // quant index within block
 
-    const float xi = x[i];
+    const int n_blocks = K >> 5;
+    const float xi = x[(long long)tok * K + i];
     float amax = fabsf(xi);
     float sum  = xi;
 
@@ -1028,7 +1036,7 @@ extern "C" __global__ void quantize_q8_1_f32(
     const int   q = (amax == 0.0f) ? 0 : __float2int_rn(xi / d);
 
     // Layout: [half2 ds | int8 qs[32]] — 36 B, naturally 4-byte aligned.
-    unsigned char* blk = vy + ib * 36;
+    unsigned char* blk = vy + ((long long)tok * n_blocks + ib) * 36;
     signed char* qs = (signed char*)(blk + 4);
     qs[iqs] = (signed char)q;
 
@@ -1059,12 +1067,13 @@ extern "C" __global__ void quantize_q8_1_f32(
 // 1024-thread blocks.
 extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4_0_q8_1(
     const unsigned char* __restrict__ weight,        // Q4_0 blocks
-    const unsigned char* __restrict__ activation_q,  // Q8_1 blocks
-    float*               __restrict__ output,
+    const unsigned char* __restrict__ activation_q,  // Q8_1 blocks [M*(K/32)*36]
+    float*               __restrict__ output,        // [M*N] F32
     int K, int N)
 {
     const int row = blockIdx.x;
     if (row >= N) return;
+    const int tok = blockIdx.y;
 
     const int tid = 32 * threadIdx.y + threadIdx.x;   // 0..127
     const int blocks_per_row = K >> 5;                 // K / QK4_0
@@ -1075,6 +1084,8 @@ extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4
     const int q8_block_bytes = 36;
 
     const unsigned char* w_row = weight + (long long)row * blocks_per_row * q4_block_bytes;
+    const unsigned char* act_tok = activation_q
+        + (long long)tok * blocks_per_row * q8_block_bytes;
 
     float tmp = 0.0f;
 
@@ -1085,7 +1096,7 @@ extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4
 
     for (int kbx = tid >> 1; kbx < blocks_per_row; kbx += blocks_per_iter) {
         const unsigned char* bq4 = w_row + kbx * q4_block_bytes;
-        const unsigned char* bq8 = activation_q + kbx * q8_block_bytes;
+        const unsigned char* bq8 = act_tok + kbx * q8_block_bytes;
 
         // Load Q4_0 scale (half) and the 2 int32 quants this thread owns.
         // bq4 layout: [half d | uint8 qs[16]] — d is 2-byte aligned.
@@ -1149,7 +1160,7 @@ extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4
         tmp += __shfl_down_sync(0xffffffff, tmp, offset, 32);
     }
     if (threadIdx.x == 0) {
-        output[row] = tmp;
+        output[(long long)tok * N + row] = tmp;
     }
 }
 
