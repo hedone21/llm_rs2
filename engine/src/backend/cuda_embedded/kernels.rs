@@ -18,6 +18,7 @@ const KERNEL_SOURCE: &str = include_str!("kernels.cu");
 /// Holds compiled CudaFunction handles for all custom kernels.
 pub struct CudaKernels {
     pub rms_norm: CudaFunction,
+    pub add_rms_norm_mul: CudaFunction,
     pub rope_inplace: CudaFunction,
     pub softmax: CudaFunction,
     pub silu_mul: CudaFunction,
@@ -66,6 +67,7 @@ impl CudaKernels {
 
         Ok(Self {
             rms_norm: load("rms_norm_f32")?,
+            add_rms_norm_mul: load("add_rms_norm_mul_f32")?,
             rope_inplace: load("rope_inplace_f32")?,
             softmax: load("softmax_f32")?,
             silu_mul: load("silu_mul_f32")?,

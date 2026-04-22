@@ -1676,9 +1676,46 @@ impl Backend for CudaBackend {
         eps: f32,
         add_unit: bool,
     ) -> Result<()> {
-        // Fused: x += residual; out = rms_norm(x) * w
-        self.add_assign(x, residual)?;
-        self.rms_norm_oop(x, out, w, eps, add_unit)
+        // Single-kernel: x += residual; out = rms_norm(x_new) * w.
+        // Saves one launch + one DRAM round-trip on `x` vs the default
+        // add_assign → rms_norm_oop pairing.
+        let dims = x.shape().dims().to_vec();
+        let rank = dims.len();
+        let ncols = dims[rank - 1] as i32;
+        let nrows: usize = dims[..rank - 1].iter().product::<usize>().max(1);
+        let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "add_rms_norm_oop x")?;
+        let res_ptr =
+            Self::require_device_ptr(residual.buffer().as_ref(), "add_rms_norm_oop residual")?;
+        let out_ptr = Self::require_device_ptr(out.buffer().as_ref(), "add_rms_norm_oop out")?;
+        let w_ptr = Self::require_device_ptr(w.buffer().as_ref(), "add_rms_norm_oop w")?;
+        let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
+        let block_size = (ncols as usize).min(1024) as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (nrows as u32, 1, 1),
+            block_dim: (block_size, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stream = self.stream.clone();
+        // SAFETY: all four pointers are valid F32 device memory with
+        // matching nrows*ncols element counts.
+        cuda_profile!(self, CudaOpTag::RmsNorm, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.add_rms_norm_mul)
+                    .arg(&x_ptr) // in/out: x += residual
+                    .arg(&res_ptr) // residual
+                    .arg(&out_ptr) // dst = rms_norm(x_new) * w
+                    .arg(&w_ptr)
+                    .arg(&ncols)
+                    .arg(&eps)
+                    .arg(&add_unit_i32)
+                    .launch(cfg)
+                    .map_err(|e| anyhow!("add_rms_norm_mul_f32 launch failed: {e}"))?;
+            }
+            Ok(())
+        });
+        self.maybe_sync_cat(SyncCat::RmsNorm)?;
+        Ok(())
     }
 
     fn softmax(&self, x: &mut Tensor) -> Result<()> {

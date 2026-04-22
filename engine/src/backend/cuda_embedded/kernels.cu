@@ -103,6 +103,50 @@ extern "C" __global__ void rms_norm_f32(
 }
 
 // =================================================================
+// Fused residual add + out-of-place RMS norm.
+//     x[i] += residual[i]      (in-place residual accumulate)
+//     dst[i] = x[i] * rms_inv(x) * weight[i]   (optionally (1 + w) for add_unit)
+// Replaces the add_assign → rms_norm_oop pair on the decode hot path.
+// One pass through memory for the residual add + sum-sq reduce, one more
+// pass for the scaled write. Eliminates the intermediate add_assign launch
+// + the add_assign's own DRAM round-trip on x.
+// =================================================================
+extern "C" __global__ void add_rms_norm_mul_f32(
+    float * __restrict__ x,             // in/out: x += residual
+    const float * __restrict__ residual,
+    float * __restrict__ dst,           // out: rms_norm(x_new) * w
+    const float * __restrict__ weight,
+    int ncols, float eps, int add_unit)
+{
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    float * row_x = x + (long long)row * ncols;
+    float * row_dst = dst + (long long)row * ncols;
+    const float * row_res = residual + (long long)row * ncols;
+
+    // Accumulate residual in-place AND reduce sum of squares over the
+    // updated x values.
+    float partial_sq = 0.0f;
+    for (int i = tid; i < ncols; i += blockDim.x) {
+        float v = row_x[i] + row_res[i];
+        row_x[i] = v;
+        partial_sq += v * v;
+    }
+    float sum_sq = block_reduce_sum(partial_sq);
+    __shared__ float rms_inv_shared;
+    if (tid == 0) {
+        rms_inv_shared = rsqrtf(sum_sq / (float)ncols + eps);
+    }
+    __syncthreads();
+
+    float rms_inv = rms_inv_shared;
+    for (int i = tid; i < ncols; i += blockDim.x) {
+        float w = add_unit ? (1.0f + weight[i]) : weight[i];
+        row_dst[i] = row_x[i] * rms_inv * w;
+    }
+}
+
+// =================================================================
 // 2. RoPE inplace (neox split-half, Llama/Qwen/Gemma3)
 // =================================================================
 // Supports both decode (seq_len=1) and prefill (seq_len>1).
@@ -1009,7 +1053,11 @@ extern "C" __global__ void quantize_q8_1_f32(
 #define MMVQ_NWARPS 4
 #endif
 
-extern "C" __global__ void mul_mat_vec_q4_0_q8_1(
+// Pin the block size so the CUDA compiler can size its register allocation
+// against a known upper bound — matches llama.cpp's mmvq.cu launch_bounds
+// and avoids the occupancy regression that happens when nvcc assumes
+// 1024-thread blocks.
+extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4_0_q8_1(
     const unsigned char* __restrict__ weight,        // Q4_0 blocks
     const unsigned char* __restrict__ activation_q,  // Q8_1 blocks
     float*               __restrict__ output,
