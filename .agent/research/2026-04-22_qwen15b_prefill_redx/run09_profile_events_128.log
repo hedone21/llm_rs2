@@ -1,0 +1,40 @@
+  Operation             Total(us)    Avg(us)        %
+  -------------------- ---------- ---------- --------
+  matmul_qkv                    0          0     0.0%
+  matmul_wo                     0          0     0.0%
+  matmul_ffn                    0          0     0.0%
+  lm_head                       0          0     0.0%
+  matmul                        0          0     0.0%
+  attention                     0          0     0.0%
+  rms_norm                      0          0     0.0%
+  rope                          0          0     0.0%
+  silu_mul                      0          0     0.0%
+  add_assign                    0          0     0.0%
+  copy_residual                 0          0     0.0%
+  kv_update                     0          0     0.0%
+  cast                          0          0     0.0%
+  gather                        0          0     0.0%
+  other                         0          0     0.0%
+  TOTAL                         0          0
+
+[Profile/Prefill] Per-op breakdown (28 layers, 0 CPU attn fallbacks):
+  Operation                 Total(us)    Avg(us)        %
+  ------------------------ ---------- ---------- --------
+  matmul_qkv                    31351       1119     5.3%
+  matmul_wo                     16557        591     2.8%
+  ffn_gate                      41926       1497     7.1%
+  ffn_up                        41408       1478     7.0%
+  ffn_down                      62709       2239    10.7%
+  flash_prefill_gpu             34407       1228     5.8%
+  flash_prefill_cpu                 0          0     0.0%
+  rms_norm                      14106        503     2.4%
+  rope                           9237        329     1.6%
+  kv_write                     310501      11089    52.8%
+  silu_mul                      10598        378     1.8%
+  add_assign                    15800        564     2.7%
+  TOTAL                        588600      21021
+[Profile] Exported to /data/local/tmp/llm_rs2/results/profile/profile_opencl_none_0_1776866149.json
+
+Done.
+[Profile] Event: End
+TTFT: 990.15 ms

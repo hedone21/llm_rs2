@@ -499,10 +499,7 @@ impl PartitionStep {
                 std::hint::spin_loop();
                 spins += 1;
                 if spins == MAX_SPINS {
-                    log::error!(
-                        "PartitionStep poll-flag timeout: layer={}",
-                        layer_idx,
-                    );
+                    log::error!("PartitionStep poll-flag timeout: layer={}", layer_idx,);
                     return Err(PlanInvalidated);
                 }
             }
@@ -3429,25 +3426,23 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
     // step at the shared flag buffer. Only active when the opt-in poll
     // mode is enabled (otherwise the sigflag kernel variant is skipped
     // and the classic `clFinish` drain in `PartitionStep::run` is used).
-    let partition_ready_flag_mem: Option<&Mem> = if crate::layers::tensor_partition::partition_poll_flag_enabled()
-        && config
-            .partition_layers
-            .as_ref()
-            .is_some_and(|v| v.iter().any(|p| p.is_some()))
-    {
-        config
-            .partition_workspace
-            .as_ref()
-            .and_then(|ws| {
+    let partition_ready_flag_mem: Option<&Mem> =
+        if crate::layers::tensor_partition::partition_poll_flag_enabled()
+            && config
+                .partition_layers
+                .as_ref()
+                .is_some_and(|v| v.iter().any(|p| p.is_some()))
+        {
+            config.partition_workspace.as_ref().and_then(|ws| {
                 // SAFETY: `workspace` is only mutated from the dispatch
                 // thread; here we only read the tensor's buffer handle to
                 // extract its cl_mem for pre-binding.
                 let pw = unsafe { &*ws.get() };
                 crate::backend::opencl::get_cl_mem(pw.ready_flag.buffer().as_ref()).ok()
             })
-    } else {
-        None
-    };
+        } else {
+            None
+        };
 
     let mut layers = Vec::with_capacity(config.layer_bufs.len());
     for (i, (lb, kb)) in config

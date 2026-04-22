@@ -123,6 +123,11 @@ struct KernelCache {
     kernel_attn_gen_half: CoreKernel,
     kernel_quantize_f32_to_q4_0: CoreKernel,
     kernel_kv_scatter_f32_to_f16: CoreKernel,
+    /// BATCH variant: writes `seq_len` positions in one kernel launch.
+    /// Used by prefill path in `transformer_layer::forward.rs` when
+    /// `supports_kv_scatter_batch()` returns true. See
+    /// `kernel_kv_scatter_f32_to_f16_batch` in `engine/kernels/simple_ops.cl`.
+    kernel_kv_scatter_f32_to_f16_batch: CoreKernel,
     kernel_rms_norm_oop: CoreKernel,
     kernel_add_rms_norm_oop: CoreKernel,
     /// Fused 3-input merge + RMSNorm for tensor-partition layer boundary.
@@ -657,7 +662,11 @@ impl OpenCLBackend {
                 p
             }
             Err(e) => {
-                log::warn!("primary F16 kernel ({}) failed: {}. Trying the other variant.", primary_tag, e);
+                log::warn!(
+                    "primary F16 kernel ({}) failed: {}. Trying the other variant.",
+                    primary_tag,
+                    e
+                );
                 let alt_src = if use_4wave { f16_fallback_src } else { f16_src };
                 let alt_is_nosub = use_4wave;
                 match Program::builder()
@@ -1048,6 +1057,10 @@ impl OpenCLBackend {
             kernel_kv_scatter_f32_to_f16: ocl::core::create_kernel(
                 &simple_ops_program,
                 "kernel_kv_scatter_f32_to_f16",
+            )?,
+            kernel_kv_scatter_f32_to_f16_batch: ocl::core::create_kernel(
+                &simple_ops_program,
+                "kernel_kv_scatter_f32_to_f16_batch",
             )?,
             kernel_rms_norm_oop: ocl::core::create_kernel(
                 &simple_ops_program,
@@ -1714,8 +1727,7 @@ impl OpenCLBackend {
         let disable_1row = std::env::var("LLMRS_F16_GEMV_DISABLE_1ROW")
             .map(|v| v == "1" || v == "true")
             .unwrap_or(false);
-        let use_1row =
-            !disable_1row && m == 1 && kernels.kernel_mul_mat_f16_f32_1row.is_some();
+        let use_1row = !disable_1row && m == 1 && kernels.kernel_mul_mat_f16_f32_1row.is_some();
 
         // L4 variant (mul_mv_f16_f32_l4.cl, N_DST=4 → 4 rows/WG) is also 4-wave
         // K-split, so it only works when the main 4-wave kernel is loaded.
@@ -3848,6 +3860,72 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    fn supports_kv_scatter_batch(&self) -> bool {
+        true
+    }
+
+    /// Batch F32->F16 KV scatter for prefill: single kernel launch writes
+    /// `seq_len` positions for both K and V. Replaces the CPU per-token
+    /// `copy_nonoverlapping` loop in `KVCache::update()` F16 HeadMajor path.
+    ///
+    /// NDRange: 3D `[head_dim, seq_len, kv_heads]`. Local size is
+    /// `[min(head_dim, 64), 1, 1]` so typical (head_dim=64 or 128) fills one
+    /// Adreno wavefront per workgroup without cross-SM reduction.
+    fn kv_scatter_f32_to_f16_batch(
+        &self,
+        k_src: &Tensor,
+        v_src: &Tensor,
+        k_dst: &mut Tensor,
+        v_dst: &mut Tensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        write_pos_start: usize,
+        seq_len: usize,
+    ) -> Result<()> {
+        if seq_len == 0 {
+            return Ok(());
+        }
+        let k_src_mem = get_cl_mem(k_src.buffer().as_ref())?;
+        let v_src_mem = get_cl_mem(v_src.buffer().as_ref())?;
+        let k_dst_mem = get_cl_mem(k_dst.buffer().as_ref())?;
+        let v_dst_mem = get_cl_mem(v_dst.buffer().as_ref())?;
+
+        let kernels = unsafe { &*self.kernels.get() };
+        let kernel = &kernels.kernel_kv_scatter_f32_to_f16_batch;
+
+        unsafe {
+            ocl::core::set_kernel_arg(kernel, 0, ocl::core::ArgVal::mem(k_src_mem))?;
+            ocl::core::set_kernel_arg(kernel, 1, ocl::core::ArgVal::mem(v_src_mem))?;
+            ocl::core::set_kernel_arg(kernel, 2, ocl::core::ArgVal::mem(k_dst_mem))?;
+            ocl::core::set_kernel_arg(kernel, 3, ocl::core::ArgVal::mem(v_dst_mem))?;
+            ocl::core::set_kernel_arg(kernel, 4, ocl::core::ArgVal::scalar(&(n_kv_heads as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 5, ocl::core::ArgVal::scalar(&(head_dim as i32)))?;
+            ocl::core::set_kernel_arg(kernel, 6, ocl::core::ArgVal::scalar(&(capacity as i32)))?;
+            ocl::core::set_kernel_arg(
+                kernel,
+                7,
+                ocl::core::ArgVal::scalar(&(write_pos_start as i32)),
+            )?;
+            ocl::core::set_kernel_arg(kernel, 8, ocl::core::ArgVal::scalar(&(seq_len as i32)))?;
+
+            // Round head_dim up to the nearest multiple of the local-size (64 or head_dim).
+            // For head_dim ∈ {64, 128, 256} this is exact; for smaller head_dim pick 32.
+            let lx = if head_dim.is_multiple_of(64) {
+                64
+            } else if head_dim.is_multiple_of(32) {
+                32
+            } else {
+                1
+            };
+            let gx = head_dim.div_ceil(lx) * lx;
+            let gws: [usize; 3] = [gx, seq_len, n_kv_heads];
+            let lws: [usize; 3] = [lx, 1, 1];
+            self.enqueue_kernel_labeled(kernel, "kv_write", 3, &gws, Some(lws))?;
+        }
+        Ok(())
+    }
+
     fn attention_gen(
         &self,
         q: &Tensor,
@@ -5224,6 +5302,7 @@ mod gpu_buffer_shift_tests {
 #[cfg(test)]
 mod noshuffle_tests {
     use super::*;
+    use crate::core::shape::Shape;
 
     fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
         OpenCLBackend::new().ok().map(Arc::new)
@@ -5914,5 +5993,708 @@ mod noshuffle_tests {
                 eprintln!("[SKIPPED] image1d_buffer_t RGBA32F not supported: {}", e);
             }
         }
+    }
+
+    // --- Q4_0 tiled GEMM (mul_mm_q4_0_f32_l4_lm) correctness ---
+
+    /// Build a Q4_0 weight Tensor [N, K] populated with random-ish deterministic quants.
+    fn make_q4_0_weight_tensor(
+        backend: &Arc<OpenCLBackend>,
+        n: usize,
+        k: usize,
+        seed: u32,
+    ) -> (Tensor, Vec<[u8; BLOCK_Q4_0_SIZE]>) {
+        assert!(k.is_multiple_of(QK4_0), "K must be multiple of QK4_0=32");
+        let blocks_per_row = k / QK4_0;
+        let num_blocks = n * blocks_per_row;
+
+        // Deterministic pseudo-random block generation (LCG for reproducibility).
+        let mut rng_state: u32 = seed.wrapping_mul(2654435761).wrapping_add(1);
+        let mut rng = || {
+            rng_state = rng_state.wrapping_mul(1664525).wrapping_add(1013904223);
+            rng_state
+        };
+
+        let mut all_blocks = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            let d = 0.01 + ((rng() % 256) as f32) * 0.001;
+            let mut quants = [0i8; 32];
+            for q in quants.iter_mut() {
+                *q = ((rng() % 15) as i8) - 7;
+            }
+            all_blocks.push(make_q4_0_block(d, &quants));
+        }
+
+        // Upload to a Q4_0 DType Tensor.
+        let raw_bytes: Vec<u8> = all_blocks.iter().flat_map(|b| b.iter().copied()).collect();
+        let mem = memory::OpenCLMemory::new(
+            backend.context.clone(),
+            backend.queue.clone(),
+            false, // device-only
+        );
+        let buf = mem.alloc(raw_bytes.len(), DType::Q4_0).unwrap();
+        let tensor = Tensor::new(Shape::new(vec![n, k]), buf, backend.clone());
+
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                &raw_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        (tensor, all_blocks)
+    }
+
+    /// Build an F32 activation Tensor [M, K] with deterministic values.
+    fn make_f32_activation_tensor(
+        backend: &Arc<OpenCLBackend>,
+        m: usize,
+        k: usize,
+    ) -> (Tensor, Vec<f32>) {
+        let total = m * k;
+        let mut data = vec![0.0f32; total];
+        for (i, v) in data.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.0137 + ((i % 19) as f32) * 0.05).sin() * 0.5;
+        }
+        let byte_len = total * 4;
+        let mem = memory::OpenCLMemory::new(backend.context.clone(), backend.queue.clone(), false);
+        let buf = mem.alloc(byte_len, DType::F32).unwrap();
+        let tensor = Tensor::new(Shape::new(vec![m, k]), buf, backend.clone());
+
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        (tensor, data)
+    }
+
+    /// Allocate a zero-initialised F32 output Tensor [M, N].
+    fn make_f32_output_tensor(backend: &Arc<OpenCLBackend>, m: usize, n: usize) -> Tensor {
+        let total = m * n;
+        let byte_len = total * 4;
+        let mem = memory::OpenCLMemory::new(backend.context.clone(), backend.queue.clone(), false);
+        let buf = mem.alloc(byte_len, DType::F32).unwrap();
+        let tensor = Tensor::new(Shape::new(vec![m, n]), buf, backend.clone());
+
+        // Zero init.
+        let zeros = vec![0.0f32; total];
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(zeros.as_ptr() as *const u8, byte_len) };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        tensor
+    }
+
+    /// Read [M, N] F32 output back.
+    fn read_f32_output(backend: &Arc<OpenCLBackend>, out: &Tensor) -> Vec<f32> {
+        let n_elem = out.buffer().size() / 4;
+        let mut result = vec![0.0f32; n_elem];
+        let cl_mem = get_cl_mem(out.buffer().as_ref()).unwrap();
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, n_elem * 4),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        result
+    }
+
+    /// CPU reference GEMM for Q4_0 weight [N, K] x F32 activation [M, K] -> [M, N].
+    /// Output layout: out[m * N + n] = sum_k weight[n, k] * act[m, k].
+    fn reference_gemm_q4_0(
+        blocks: &[[u8; BLOCK_Q4_0_SIZE]],
+        activation: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f32> {
+        let blocks_per_row = k / QK4_0;
+        let mut out = vec![0.0f32; m * n];
+        // Pre-dequant weights into a flat [N, K] f32 matrix for clarity.
+        let mut w = vec![0.0f32; n * k];
+        for row in 0..n {
+            for kb in 0..blocks_per_row {
+                let dq = dequant_q4_0_block(&blocks[row * blocks_per_row + kb]);
+                for j in 0..QK4_0 {
+                    w[row * k + kb * QK4_0 + j] = dq[j];
+                }
+            }
+        }
+        for mi in 0..m {
+            for ni in 0..n {
+                let mut acc = 0.0f32;
+                for ki in 0..k {
+                    acc += w[ni * k + ki] * activation[mi * k + ki];
+                }
+                out[mi * n + ni] = acc;
+            }
+        }
+        out
+    }
+
+    /// Verify tiled Q4_0 GEMM (`matmul_gemm_q4_0`) matches the CPU reference
+    /// for a shape that activates the GEMM path (m >= 32).
+    ///
+    /// Shape chosen:
+    ///   * m = 64 — exactly one BM tile
+    ///   * n = 128 — two BN tiles
+    ///   * k = 256 — 8 BK tiles
+    ///
+    /// All dimensions are multiples of 4 (the aligned fast path), but the
+    /// kernel itself handles arbitrary `m` via the boundary check in the
+    /// store loop.
+    #[test]
+    fn test_matmul_gemm_q4_0_basic() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        {
+            let kernels = unsafe { &*backend.kernels.get() };
+            if kernels.kernel_mul_mm_q4_0_f32.is_none() {
+                eprintln!("[SKIPPED] mul_mm_q4_0_f32_l4_lm kernel not available");
+                return;
+            }
+        }
+
+        let m = 64usize;
+        let n = 128usize;
+        let k = 256usize;
+
+        let (w_tensor, blocks) = make_q4_0_weight_tensor(&backend, n, k, 42);
+        let (a_tensor, a_data) = make_f32_activation_tensor(&backend, m, k);
+        let mut out_tensor = make_f32_output_tensor(&backend, m, n);
+
+        // Force GEMM path by calling matmul_q4_0 (m >= 32 dispatches to matmul_gemm_q4_0
+        // when no noshuffle SOA entry exists for the raw Q4_0 weight).
+        backend
+            .matmul_q4_0(&a_tensor, &w_tensor, &mut out_tensor)
+            .expect("matmul_q4_0 GEMM path");
+        backend.queue.finish().unwrap();
+
+        let got = read_f32_output(&backend, &out_tensor);
+        let expected = reference_gemm_q4_0(&blocks, &a_data, m, n, k);
+
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            let diff = (g - e).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+            let denom = e.abs().max(1e-6);
+            let rel = diff / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        eprintln!(
+            "[gemm-q4_0] shape=[{},{},{}] max_abs={:.4e} max_rel={:.4e}",
+            m, n, k, max_abs, max_rel
+        );
+        assert!(
+            max_abs < 5e-2,
+            "Q4_0 GEMM max_abs {:.4e} exceeds tolerance (f16 scale)",
+            max_abs
+        );
+    }
+
+    /// Boundary test: `m` not a multiple of BM=64. Exercises the store-loop
+    /// row boundary guard and the tile-load zero-padding for OOB rows.
+    #[test]
+    fn test_matmul_gemm_q4_0_unaligned_m() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        {
+            let kernels = unsafe { &*backend.kernels.get() };
+            if kernels.kernel_mul_mm_q4_0_f32.is_none() {
+                eprintln!("[SKIPPED] mul_mm_q4_0_f32_l4_lm kernel not available");
+                return;
+            }
+        }
+
+        let m = 33usize; // >= 32 gate, not aligned to BM=64 or BN=64
+        let n = 96usize; // not aligned to 64
+        let k = 128usize;
+
+        let (w_tensor, blocks) = make_q4_0_weight_tensor(&backend, n, k, 7);
+        let (a_tensor, a_data) = make_f32_activation_tensor(&backend, m, k);
+        let mut out_tensor = make_f32_output_tensor(&backend, m, n);
+
+        backend
+            .matmul_q4_0(&a_tensor, &w_tensor, &mut out_tensor)
+            .expect("matmul_q4_0 GEMM path (unaligned m)");
+        backend.queue.finish().unwrap();
+
+        let got = read_f32_output(&backend, &out_tensor);
+        let expected = reference_gemm_q4_0(&blocks, &a_data, m, n, k);
+
+        let mut max_abs = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            let diff = (g - e).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+        }
+        eprintln!(
+            "[gemm-q4_0] unaligned shape=[{},{},{}] max_abs={:.4e}",
+            m, n, k, max_abs
+        );
+        assert!(
+            max_abs < 5e-2,
+            "Q4_0 GEMM (unaligned m) max_abs {:.4e} exceeds tolerance",
+            max_abs
+        );
+    }
+
+    /// Realistic prefill shape (Qwen 2.5 1.5B FFN gate: n=8960, k=1536, m=256).
+    /// Scaled down to keep host test fast but still tile-heavy.
+    #[test]
+    fn test_matmul_gemm_q4_0_prefill_shape() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        {
+            let kernels = unsafe { &*backend.kernels.get() };
+            if kernels.kernel_mul_mm_q4_0_f32.is_none() {
+                eprintln!("[SKIPPED] mul_mm_q4_0_f32_l4_lm kernel not available");
+                return;
+            }
+        }
+
+        // Downscaled Qwen-like FFN projection: m (seq) = 128, n (out) = 768,
+        // k (in) = 1024. k % QK4_0 = 0, n/k multiples of BM/BN.
+        let m = 128usize;
+        let n = 768usize;
+        let k = 1024usize;
+
+        let (w_tensor, blocks) = make_q4_0_weight_tensor(&backend, n, k, 99);
+        let (a_tensor, a_data) = make_f32_activation_tensor(&backend, m, k);
+        let mut out_tensor = make_f32_output_tensor(&backend, m, n);
+
+        backend
+            .matmul_q4_0(&a_tensor, &w_tensor, &mut out_tensor)
+            .expect("matmul_q4_0 GEMM path (prefill-shape)");
+        backend.queue.finish().unwrap();
+
+        let got = read_f32_output(&backend, &out_tensor);
+        let expected = reference_gemm_q4_0(&blocks, &a_data, m, n, k);
+
+        // Larger k inflates absolute accumulated FP error but relative error
+        // remains tight (F16 scales → ~1e-3 relative per term).
+        let mut max_abs = 0.0f32;
+        let mut max_rel = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            let diff = (g - e).abs();
+            if diff > max_abs {
+                max_abs = diff;
+            }
+            let denom = e.abs().max(1e-4);
+            let rel = diff / denom;
+            if rel > max_rel {
+                max_rel = rel;
+            }
+        }
+        eprintln!(
+            "[gemm-q4_0] prefill shape=[{},{},{}] max_abs={:.4e} max_rel={:.4e}",
+            m, n, k, max_abs, max_rel
+        );
+        // Accumulated error over k=1024 mac's with F16 scales.
+        assert!(
+            max_abs < 2e-1,
+            "Q4_0 GEMM (prefill) max_abs {:.4e} exceeds tolerance",
+            max_abs
+        );
+    }
+}
+
+// ============================================================
+// Tests: kv_scatter_f32_to_f16_batch
+// ============================================================
+#[cfg(test)]
+mod kv_scatter_batch_tests {
+    use super::*;
+    use crate::core::shape::Shape;
+    use half::f16;
+
+    fn try_create_backend() -> Option<Arc<OpenCLBackend>> {
+        OpenCLBackend::new().ok().map(Arc::new)
+    }
+
+    fn make_f32_src(backend: &Arc<OpenCLBackend>, data: &[f32], shape: Vec<usize>) -> Tensor {
+        let byte_len = data.len() * 4;
+        let mem = memory::OpenCLMemory::new(backend.context.clone(), backend.queue.clone(), false);
+        let buf = mem.alloc(byte_len, DType::F32).unwrap();
+        let tensor = Tensor::new(Shape::new(shape), buf, backend.clone());
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, byte_len) };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        tensor
+    }
+
+    fn make_f16_zero_dst(
+        backend: &Arc<OpenCLBackend>,
+        n_elems: usize,
+        shape: Vec<usize>,
+    ) -> Tensor {
+        let byte_len = n_elems * 2;
+        let zeros: Vec<f16> = vec![f16::from_f32(0.0); n_elems];
+        let mem = memory::OpenCLMemory::new(backend.context.clone(), backend.queue.clone(), false);
+        let buf = mem.alloc(byte_len, DType::F16).unwrap();
+        let tensor = Tensor::new(Shape::new(shape), buf, backend.clone());
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(zeros.as_ptr() as *const u8, byte_len) };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        tensor
+    }
+
+    fn read_f16_tensor(backend: &Arc<OpenCLBackend>, tensor: &Tensor) -> Vec<f16> {
+        let n = tensor.buffer().size() / 2;
+        let mut result = vec![f16::from_f32(0.0); n];
+        let cl_mem = get_cl_mem(tensor.buffer().as_ref()).unwrap();
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                cl_mem,
+                true,
+                0,
+                std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, n * 2),
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        result
+    }
+
+    /// Build src F32 tensor layout `[seq_len, kv_heads, head_dim]` with a
+    /// deterministic but per-position-distinct pattern so that offset bugs
+    /// (swapped axes, wrong stride) fail loudly.
+    fn make_pattern(seq_len: usize, kv_heads: usize, head_dim: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; seq_len * kv_heads * head_dim];
+        for s in 0..seq_len {
+            for h in 0..kv_heads {
+                for d in 0..head_dim {
+                    let idx = (s * kv_heads + h) * head_dim + d;
+                    // Unique per (s, h, d) — fits in F16 range (±2^15) for reasonable sizes.
+                    out[idx] = (s * 1000 + h * 100 + d) as f32 * 0.001;
+                }
+            }
+        }
+        out
+    }
+
+    /// Run batch scatter and verify against CPU reference.
+    fn run_case(
+        backend: &Arc<OpenCLBackend>,
+        kv_heads: usize,
+        head_dim: usize,
+        capacity: usize,
+        seq_len: usize,
+        dst_pos: usize,
+    ) {
+        assert!(dst_pos + seq_len <= capacity, "case over-runs capacity");
+        let n_dst = kv_heads * capacity * head_dim;
+
+        let k_pattern = make_pattern(seq_len, kv_heads, head_dim);
+        let mut v_pattern = make_pattern(seq_len, kv_heads, head_dim);
+        // Offset V so K/V paths aren't trivially identical.
+        for v in v_pattern.iter_mut() {
+            *v += 0.5;
+        }
+
+        let k_src = make_f32_src(backend, &k_pattern, vec![1, seq_len, kv_heads * head_dim]);
+        let v_src = make_f32_src(backend, &v_pattern, vec![1, seq_len, kv_heads * head_dim]);
+        let mut k_dst = make_f16_zero_dst(backend, n_dst, vec![1, kv_heads, capacity, head_dim]);
+        let mut v_dst = make_f16_zero_dst(backend, n_dst, vec![1, kv_heads, capacity, head_dim]);
+
+        backend
+            .kv_scatter_f32_to_f16_batch(
+                &k_src, &v_src, &mut k_dst, &mut v_dst, kv_heads, head_dim, capacity, dst_pos,
+                seq_len,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+
+        let k_out = read_f16_tensor(backend, &k_dst);
+        let v_out = read_f16_tensor(backend, &v_dst);
+
+        assert_eq!(k_out.len(), n_dst);
+        assert_eq!(v_out.len(), n_dst);
+
+        // Verify: each (s, h, d) in src lands at HeadMajor offset
+        //   h * capacity * head_dim + (dst_pos + s) * head_dim + d
+        // Unwritten positions must remain zero.
+        let mut max_abs_k: f32 = 0.0;
+        let mut max_abs_v: f32 = 0.0;
+        for h in 0..kv_heads {
+            for p in 0..capacity {
+                for d in 0..head_dim {
+                    let off = h * capacity * head_dim + p * head_dim + d;
+                    let k_val = k_out[off].to_f32();
+                    let v_val = v_out[off].to_f32();
+                    if p < dst_pos || p >= dst_pos + seq_len {
+                        // Unwritten region must remain zero.
+                        assert_eq!(
+                            k_val, 0.0,
+                            "k_dst untouched region non-zero at h={h} p={p} d={d}"
+                        );
+                        assert_eq!(
+                            v_val, 0.0,
+                            "v_dst untouched region non-zero at h={h} p={p} d={d}"
+                        );
+                    } else {
+                        let s = p - dst_pos;
+                        let src_idx = (s * kv_heads + h) * head_dim + d;
+                        let k_exp = k_pattern[src_idx];
+                        let v_exp = v_pattern[src_idx];
+                        max_abs_k = max_abs_k.max((k_val - k_exp).abs());
+                        max_abs_v = max_abs_v.max((v_val - v_exp).abs());
+                    }
+                }
+            }
+        }
+        // F16 has ~11-bit mantissa → relative precision ~2^-10 ≈ 1e-3.
+        // Scale tolerance by magnitude of the pattern (values up to seq*1.0 + heads*0.1 + dim*0.001).
+        let max_mag = (seq_len as f32) + (kv_heads as f32) * 0.1 + (head_dim as f32) * 0.001;
+        let tol = (max_mag * 1e-3).max(1e-3);
+        assert!(
+            max_abs_k < tol,
+            "K max_abs {max_abs_k:.4e} exceeds F16 tol {tol:.4e} (max_mag={max_mag:.2})"
+        );
+        assert!(
+            max_abs_v < tol,
+            "V max_abs {max_abs_v:.4e} exceeds F16 tol {tol:.4e} (max_mag={max_mag:.2})"
+        );
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_seq1_qwen() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        run_case(&backend, 2, 128, 512, 1, 0);
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_seq4_qwen() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        run_case(&backend, 2, 128, 512, 4, 0);
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_seq16_llama() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        run_case(&backend, 8, 64, 512, 16, 0);
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_seq256_qwen_prefill() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        run_case(&backend, 2, 128, 512, 256, 0);
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_append_offset() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        // Decode-after-prefill style: write positions 256..260.
+        run_case(&backend, 2, 128, 512, 4, 256);
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_boundary() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        // Last-seq_len positions: dst_pos = capacity - seq_len.
+        run_case(&backend, 8, 64, 512, 16, 512 - 16);
+    }
+
+    #[test]
+    fn test_kv_scatter_batch_matches_single_scatter() {
+        // Parity check: running seq_len=1 batch call vs seq_len iterations of
+        // the single-position kernel must produce identical F16 output.
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+        let kv_heads = 2usize;
+        let head_dim = 128usize;
+        let capacity = 256usize;
+        let seq_len = 8usize;
+
+        let k_pat = make_pattern(seq_len, kv_heads, head_dim);
+        let v_pat: Vec<f32> = k_pat.iter().map(|x| x + 0.25).collect();
+
+        // Batch path.
+        let k_src_b = make_f32_src(&backend, &k_pat, vec![1, seq_len, kv_heads * head_dim]);
+        let v_src_b = make_f32_src(&backend, &v_pat, vec![1, seq_len, kv_heads * head_dim]);
+        let mut k_dst_b = make_f16_zero_dst(
+            &backend,
+            kv_heads * capacity * head_dim,
+            vec![1, kv_heads, capacity, head_dim],
+        );
+        let mut v_dst_b = make_f16_zero_dst(
+            &backend,
+            kv_heads * capacity * head_dim,
+            vec![1, kv_heads, capacity, head_dim],
+        );
+        backend
+            .kv_scatter_f32_to_f16_batch(
+                &k_src_b,
+                &v_src_b,
+                &mut k_dst_b,
+                &mut v_dst_b,
+                kv_heads,
+                head_dim,
+                capacity,
+                0,
+                seq_len,
+            )
+            .unwrap();
+        backend.synchronize().unwrap();
+
+        // Reference: seq_len calls to single-position scatter.
+        let mut k_dst_r = make_f16_zero_dst(
+            &backend,
+            kv_heads * capacity * head_dim,
+            vec![1, kv_heads, capacity, head_dim],
+        );
+        let mut v_dst_r = make_f16_zero_dst(
+            &backend,
+            kv_heads * capacity * head_dim,
+            vec![1, kv_heads, capacity, head_dim],
+        );
+        for s in 0..seq_len {
+            let off = s * kv_heads * head_dim;
+            let k_slice = &k_pat[off..off + kv_heads * head_dim];
+            let v_slice = &v_pat[off..off + kv_heads * head_dim];
+            let k_s_s = make_f32_src(&backend, k_slice, vec![1, 1, kv_heads * head_dim]);
+            let v_s_s = make_f32_src(&backend, v_slice, vec![1, 1, kv_heads * head_dim]);
+            backend
+                .kv_scatter_f32_to_f16(
+                    &k_s_s,
+                    &v_s_s,
+                    &mut k_dst_r,
+                    &mut v_dst_r,
+                    head_dim,
+                    capacity,
+                    s,
+                )
+                .unwrap();
+        }
+        backend.synchronize().unwrap();
+
+        let kb = read_f16_tensor(&backend, &k_dst_b);
+        let vb = read_f16_tensor(&backend, &v_dst_b);
+        let kr = read_f16_tensor(&backend, &k_dst_r);
+        let vr = read_f16_tensor(&backend, &v_dst_r);
+        assert_eq!(kb, kr, "batch vs single-scatter K mismatch");
+        assert_eq!(vb, vr, "batch vs single-scatter V mismatch");
     }
 }

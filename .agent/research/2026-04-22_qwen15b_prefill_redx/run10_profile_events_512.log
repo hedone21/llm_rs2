@@ -1,0 +1,30 @@
+  silu_mul                      0          0     0.0%
+  add_assign                    0          0     0.0%
+  copy_residual                 0          0     0.0%
+  kv_update                     0          0     0.0%
+  cast                          0          0     0.0%
+  gather                        0          0     0.0%
+  other                         0          0     0.0%
+  TOTAL                         0          0
+
+[Profile/Prefill] Per-op breakdown (28 layers, 0 CPU attn fallbacks):
+  Operation                 Total(us)    Avg(us)        %
+  ------------------------ ---------- ---------- --------
+  matmul_qkv                    58322       2082     3.4%
+  matmul_wo                     41639       1487     2.4%
+  ffn_gate                     140268       5009     8.2%
+  ffn_up                       144593       5164     8.4%
+  ffn_down                     212544       7590    12.4%
+  flash_prefill_gpu            348131      12433    20.3%
+  flash_prefill_cpu                 0          0     0.0%
+  rms_norm                      17515        625     1.0%
+  rope                          10375        370     0.6%
+  kv_write                     682358      24369    39.8%
+  silu_mul                      34248       1223     2.0%
+  add_assign                    25620        915     1.5%
+  TOTAL                       1715613      61271
+[Profile] Exported to /data/local/tmp/llm_rs2/results/profile/profile_opencl_none_0_1776866164.json
+
+Done.
+[Profile] Event: End
+TTFT: 2507.65 ms

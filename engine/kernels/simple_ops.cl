@@ -1255,3 +1255,42 @@ kernel void kernel_kv_scatter_f32_to_f16(
     k_dst[dst_idx] = (half)k_src[src_idx];
     v_dst[dst_idx] = (half)v_src[src_idx];
 }
+
+// ============================================================
+// Fused F32->F16 Cast + HeadMajor Scatter (BATCH variant for prefill)
+// ============================================================
+// Writes `seq_len` positions in one kernel launch, replacing the per-token
+// CPU scatter loop used by the F16 HeadMajor `can_direct_copy` path in
+// `KVCache::update()`. Target is Qwen/Llama prefill where kv_write dominates
+// (~40-53% of per-op time on Adreno 830, measured 2026-04-22).
+//
+// Input layout  (k_src / v_src): contiguous [seq_len, kv_heads, head_dim] F32
+//   src_off = (s * kv_heads + h) * head_dim + d
+// Output layout (k_dst / v_dst): HeadMajor [kv_heads, capacity, head_dim] F16
+//   dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim + d
+//
+// NDRange: 3D [head_dim, seq_len, kv_heads]. No reduction, no SLM, no
+// sub_group ops — pure embarrassingly parallel cast+copy. Adreno-friendly:
+// no register pressure (scatter only).
+kernel void kernel_kv_scatter_f32_to_f16_batch(
+    global const float * k_src,
+    global const float * v_src,
+    global half * k_dst,
+    global half * v_dst,
+    int kv_heads,
+    int head_dim,
+    int capacity,
+    int write_pos_start,
+    int seq_len
+) {
+    int d = get_global_id(0);
+    int s = get_global_id(1);
+    int h = get_global_id(2);
+    if (d >= head_dim || s >= seq_len || h >= kv_heads) return;
+
+    int src_off = (s * kv_heads + h) * head_dim + d;
+    int dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim + d;
+
+    k_dst[dst_off] = (half)k_src[src_off];
+    v_dst[dst_off] = (half)v_src[src_off];
+}

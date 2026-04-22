@@ -1,0 +1,64 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jum
+Token Length: 456
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=174.98
+[Profile] Event: PrefillStart
+Prefill: 1506.71 ms (456 tokens, 302.6 tok/s)
+Prefill(pure fwd): 1506.65 ms (456 tokens, 302.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+[Profile] prefill/warmup events dropped (decode-only accumulator)
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jum
+
+
+[Profile] Decode per-op breakdown (accumulated over 1 layer-calls):
+  Operation             Total(us)    Avg(us)        %
+  -------------------- ---------- ---------- --------
+  matmul_qkv                    0          0     0.0%
+  matmul_wo                     0          0     0.0%
+  matmul_ffn                    0          0     0.0%
+  lm_head                       0          0     0.0%
+  matmul                        0          0     0.0%
+  attention                     0          0     0.0%
+  rms_norm                      0          0     0.0%
+  rope                          0          0     0.0%
+  silu_mul                      0          0     0.0%
+  add_assign                    0          0     0.0%
+  copy_residual                 0          0     0.0%
+  kv_update                     0          0     0.0%
+  cast                          0          0     0.0%
+  gather                        0          0     0.0%
+  other                         0          0     0.0%
+  TOTAL                         0          0
+
+[Profile/Prefill] Per-op breakdown (28 layers, 0 CPU attn fallbacks):
+  Operation                 Total(us)    Avg(us)        %
+  ------------------------ ---------- ---------- --------
+  matmul_qkv                    59832       2136     5.7%
+  matmul_wo                     45958       1641     4.4%
+  ffn_gate                     142393       5085    13.6%
+  ffn_up                       143813       5136    13.7%
+  ffn_down                     206661       7380    19.7%
+  flash_prefill_gpu            337168      12041    32.1%
+  flash_prefill_cpu           
+Done.
+[Profile] Event: End
+TTFT: 1849.54 ms
+      0          0     0.0%
+  rms_norm                      27324        975     2.6%
+  rope                          10727        383     1.0%
+  kv_write                      10445        373     1.0%
+  silu_mul                      31723       1132     3.0%
+  add_assign                    34440       1230     3.3%
+  TOTAL                       1050484      37517
+[Profile] Exported to results/profile/profile_opencl_none_0_1776867799.json

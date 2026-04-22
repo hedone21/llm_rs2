@@ -1,0 +1,9 @@
+[WARMUP] tokens=1 ms=184.42
+Prefill: 1557.72 ms (456 tokens, 292.7 tok/s)
+Prefill(pure fwd): 1557.66 ms (456 tokens, 292.7 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[WARMUP] tokens=1 ms=187.38
+Prefill: 1671.56 ms (456 tokens, 272.8 tok/s)
+Prefill(pure fwd): 1671.50 ms (456 tokens, 272.8 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[WARMUP] tokens=1 ms=262.20
+Prefill: 1650.15 ms (456 tokens, 276.3 tok/s)
+Prefill(pure fwd): 1650.09 ms (456 tokens, 276.3 tok/s) [sync'd forward only, comparable to llama-bench pp]

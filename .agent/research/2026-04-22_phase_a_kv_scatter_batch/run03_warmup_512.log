@@ -1,0 +1,4 @@
+Token Length: 456
+KV cache type: F16, layout: HeadMajor (initial capacity: 512 tokens, 262144B per layer, max: 2048)
+[WARMUP] tokens=1 ms=169.32
+Prefill(pure fwd): 1278.32 ms (456 tokens, 356.7 tok/s) [sync'd forward only, comparable to llama-bench pp]

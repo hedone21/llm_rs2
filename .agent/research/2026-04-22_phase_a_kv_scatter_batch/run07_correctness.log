@@ -1,0 +1,26 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The capital of France is
+Token Length: 5
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0, TopP: 0.9, TopK: 40)...
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=169.49
+[Profile] Event: PrefillStart
+Prefill: 122.35 ms (5 tokens, 40.9 tok/s)
+Prefill(pure fwd): 122.28 ms (5 tokens, 40.9 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The capital of France is Paris. It has a population of about 2 million people and covers an area of 104 square kilometers (
+Done.
+[Profile] Event: End
+TTFT: 349.59 ms
+Decode: 25.00 ms/tok (40.0 tok/s) [23 tokens, forward only]
+Decode(excl tok[0]): 24.82 ms/tok (40.3 tok/s) [22 tokens] | tok[0]=28.97 ms
+Avg TBT: 31.31 ms (31.9 tokens/sec)

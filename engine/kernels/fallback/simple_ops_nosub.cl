@@ -667,6 +667,33 @@ kernel void kernel_kv_scatter_f32_to_f16(
     v_dst[dst_idx] = (half)v_src[src_idx];
 }
 
+//------------------------------------------------------------------------------
+// BATCH variant for prefill: writes seq_len positions in one dispatch.
+// See detailed docs in engine/kernels/simple_ops.cl.
+//------------------------------------------------------------------------------
+kernel void kernel_kv_scatter_f32_to_f16_batch(
+    global const float * k_src,
+    global const float * v_src,
+    global half * k_dst,
+    global half * v_dst,
+    int kv_heads,
+    int head_dim,
+    int capacity,
+    int write_pos_start,
+    int seq_len
+) {
+    int d = get_global_id(0);
+    int s = get_global_id(1);
+    int h = get_global_id(2);
+    if (d >= head_dim || s >= seq_len || h >= kv_heads) return;
+
+    int src_off = (s * kv_heads + h) * head_dim + d;
+    int dst_off = h * capacity * head_dim + (write_pos_start + s) * head_dim + d;
+
+    k_dst[dst_off] = (half)k_src[src_off];
+    v_dst[dst_off] = (half)v_src[src_off];
+}
+
 // Broadcast-add a 1D bias to each row of x.
 // x: [rows * dim], bias: [dim]. bias is added to each row.
 kernel void kernel_add_row_bias(

@@ -1,0 +1,63 @@
+[Config] Using 6 threads
+[Profile] Event: ModelLoadStart
+Loading model from /data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf
+[Config] Weight dtype: F16
+[GGUF] Loaded: 338 tensors, arch=Qwen2, weight_dtype=Q4_0
+lm_head not found, deriving from embed_tokens (Q4_0) for lm_head...
+[Backend] Q4_0 noshuffle SOA prepared: 196 weight tensors
+[Backend] Noshuffle SOA prepared: 196 weight tensors
+Prompt: The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown f
+Token Length: 114
+Model config: layers=28, kv_heads=2, head_dim=128, max_seq_len=2048
+KV cache type: F16, layout: HeadMajor (initial capacity: 128 tokens, 65536B per layer, max: 2048)
+Generating (Max: 2048, Temp: 0.8, TopP: 0.9, TopK: 40)...
+[Prefill] flash_attn dispatch: head_dim=128, DType=F16, BLOCK_M=32, subgroup=64
+[WARMUP] tokens=1 ms=172.40
+[Profile] Event: PrefillStart
+Prefill: 419.81 ms (114 tokens, 271.5 tok/s)
+Prefill(pure fwd): 419.74 ms (114 tokens, 271.6 tok/s) [sync'd forward only, comparable to llama-bench pp]
+[Profile] Event: DecodingStart
+The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown f
+[Profile] prefill/warmup events dropped (decode-only accumulator)
+
+[Profile] Decode per-op breakdown (accumulated over 1 layer-calls):
+  Operation             Total(us)    Avg(us)        %
+  -------------------- ---------- ---------- --------
+  matmul_qkv                    0          0     0.0%
+  matmul_wo                     0          0     0.0%
+  matmul_ffn                    0          0     0.0%
+  lm_head                       0          0     0.0%
+  matmul                        0          0     0.0%
+  attention                     0          0     0.0%
+  rms_norm                      0          0     0.0%
+  rope                          0          0     0.0%
+  silu_mul                      0          0     0.0%
+  add_assign                    0          0     0.0%
+  copy_residual                 0          0     0.0%
+  kv_update                     0          0     0.0%
+  cast                          0          0     0.0%
+  gather                        0          0     0.0%
+  other                         0          0     0.0%
+  TOTAL                         0          0
+
+[Profile/Prefill] Per-op breakdown (28 layers, 0 CPU attn fallbacks):
+  Operation                 Total(us)    Avg(us)        %
+  ------------------------ ---------- ---------- --------
+  matmul_qkv                    32400       1157    11.2%
+  matmul_wo                     17493        624     6.0%
+  ffn_gate                      43747       1562    15.1%
+  ffn_up                        43351       1548    15.0%
+  ffn_down                      67351       2405    23.2%
+  flash_prefill_gpu             29651       1058    10.2%
+  flash_prefill_cpu                 0          0     0.0%
+  rms_norm                      13812        493     4.8%
+  rope                           7630        272     2.6%
+  kv_write                       5914        211     2.0%
+  silu_mul                      11801        421     4.1%
+  add_assign                    16741        597     5.8%
+  TOTAL                        289891    
+Done.
+[Profile] Event: End
+TTFT: 700.39 ms
+  10353
+[Profile] Exported to results/profile/profile_opencl_none_0_1776867817.json
