@@ -4780,6 +4780,12 @@ fn main() -> anyhow::Result<()> {
     #[cfg(feature = "cuda-embedded")]
     {
         llm_rs2::backend::cuda_embedded::dump_fallback_counters();
+        if let Some(cu_be) = backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::cuda_embedded::CudaBackend>()
+        {
+            cu_be.dump_graph_counters();
+        }
     }
     println!("TTFT: {:.2} ms", _ttft_ms);
     if !forward_ms_values.is_empty() {

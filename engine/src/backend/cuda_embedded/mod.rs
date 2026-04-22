@@ -318,7 +318,61 @@ pub struct CudaBackend {
     /// step into a single graph launch, removing per-kernel driver
     /// launch overhead (~5 µs × 400 = ~2 ms/tok on Jetson Xavier).
     graph_capturing: Arc<AtomicBool>,
+    /// Cached CUDA Graph executable reused across decode steps via
+    /// `cuGraphExecUpdate`. Lives behind `Arc<Mutex<>>` so clones of
+    /// the backend share the cache (ownership matches the rest of the
+    /// backend state).
+    ///
+    /// `None` means "no graph yet" — the next `end_graph_capture_and_launch`
+    /// instantiates and stores. A subsequent call tries to update the
+    /// stored exec with the freshly captured graph; on failure
+    /// (topology changed, etc.) the stored exec is destroyed and a
+    /// fresh instantiate runs.
+    ///
+    /// Callers mutate this indirectly:
+    /// - `invalidate_graph_cache()` — external reset (capacity grow,
+    ///   eviction fire, skip config change, …).
+    /// - `end_graph_capture_and_launch` — internal reuse / refresh.
+    cached_graph: Arc<std::sync::Mutex<Option<CudaGraphCache>>>,
+    /// Diagnostic counters for the graph fast path
+    /// (updates, instantiates, total-steps). Dumped by
+    /// `dump_graph_counters()` on demand.
+    graph_update_ok: Arc<std::sync::atomic::AtomicU64>,
+    graph_instantiate_count: Arc<std::sync::atomic::AtomicU64>,
+    graph_step_count: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// Owns a `CUgraphExec` for the decode-loop graph.
+///
+/// The exec is a snapshot of the topology at instantiate time; the
+/// parent CUgraph is not needed after instantiate (and is freed
+/// immediately by `end_graph_capture_and_launch`). Drop destroys the
+/// exec so a stale cache can be cleared with `*guard = None`.
+struct CudaGraphCache {
+    exec: cuda_sys::CUgraphExec,
+}
+
+impl Drop for CudaGraphCache {
+    fn drop(&mut self) {
+        // SAFETY: exec was produced by cuGraphInstantiate in
+        // `end_graph_capture_and_launch` on the same context. Drop
+        // happens when the Mutex slot is replaced or the backend is
+        // dropped. No aliasing — each Cache owns its exec.
+        unsafe {
+            if !self.exec.is_null() {
+                let _ = cuda_result::graph::exec_destroy(self.exec);
+                self.exec = std::ptr::null_mut();
+            }
+        }
+    }
+}
+
+// SAFETY: CUgraph / CUgraphExec are raw driver handles. They are
+// accessed only via the outer Mutex<Option<CudaGraphCache>>, which
+// serialises access from the backend's single inference thread. No
+// concurrent driver call on the same handle.
+unsafe impl Send for CudaGraphCache {}
+unsafe impl Sync for CudaGraphCache {}
 
 /// Wrapper around `UnsafeCell<Option<&'static str>>` so we can
 /// `unsafe impl Send + Sync` without exposing the cell on the backend
@@ -451,6 +505,10 @@ impl CudaBackend {
             sync_policy: Arc::new(AtomicU32::new(SyncPolicy::ALL.raw())),
             weights_device: Arc::new(AtomicBool::new(false)),
             graph_capturing: Arc::new(AtomicBool::new(false)),
+            cached_graph: Arc::new(std::sync::Mutex::new(None)),
+            graph_update_ok: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            graph_instantiate_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            graph_step_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Run self-test to verify kernel launch + arg passing
@@ -714,38 +772,157 @@ impl CudaBackend {
         Ok(())
     }
 
-    /// Close an active capture and launch the resulting graph exactly once.
+    /// Close an active capture, refresh or instantiate the cached exec,
+    /// and launch the graph exactly once.
     ///
-    /// After return, the backend is no longer in capture mode and the
-    /// launched graph's completion is pending on the default stream
-    /// (caller may call `synchronize()` when they need the output).
+    /// Reuse flow (llama.cpp-style):
+    ///  1. `cuStreamEndCapture` yields a fresh `CUgraph` for this step.
+    ///  2. If a cached `CUgraphExec` from a previous step exists, call
+    ///     `cuGraphExecUpdate(prev_exec, new_graph)`. On success, only
+    ///     kernel-node parameters were refreshed (no instantiate cost)
+    ///     and the prev_exec is ready to launch.
+    ///  3. On update failure (topology / node-type / function / params
+    ///     changed, NOT_SUPPORTED), destroy prev_exec and
+    ///     `cuGraphInstantiate` a new exec from the fresh graph.
+    ///  4. Launch the (updated or fresh) exec on the backend's stream.
+    ///
+    /// The update path is ~10× cheaper than instantiate on Jetson
+    /// Xavier (~50 µs vs ~500 µs). With ~400 launches/tok the
+    /// launch-overhead saving (~2 ms/tok) now dominates, making the
+    /// graph path a net win.
     pub fn end_graph_capture_and_launch(&self) -> Result<()> {
         if !self.graph_capturing.load(Ordering::Relaxed) {
             return Err(anyhow!("end_graph_capture called without active capture"));
         }
         self.graph_capturing.store(false, Ordering::Relaxed);
-        let stream = self.stream.clone();
-        // AUTO_FREE_ON_LAUNCH: the graph's backing allocations (if any)
-        // are freed when the launch completes, matching the per-step
-        // lifetime of the capture.
-        let flag =
-            cuda_sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
-        let graph = stream
-            .end_capture(flag)
-            .map_err(|e| anyhow!("cuStreamEndCapture failed: {e}"))?;
-        if let Some(g) = graph {
-            g.launch()
+
+        // End capture → raw CUgraph. Use result::stream::end_capture
+        // (sys-level wrapper) so we keep the graph lifetime under our
+        // control rather than cudarc's CudaGraph wrapper which also
+        // instantiates an exec inline.
+        // SAFETY: stream was in capturing state (we set the flag at
+        // begin_graph_capture). end_capture transfers ownership of
+        // the CUgraph to us.
+        let new_graph = unsafe {
+            cuda_result::stream::end_capture(self.stream.cu_stream())
+                .map_err(|e| anyhow!("cuStreamEndCapture failed: {e}"))?
+        };
+        if new_graph.is_null() {
+            // Capture was invalidated — nothing to launch. Keep any
+            // cached exec intact (it may still be valid for the next
+            // step) but warn so regressions surface.
+            eprintln!("[CUDA-Graph] WARN: end_capture returned null graph (invalidated)");
+            return Ok(());
+        }
+
+        let mut cache_guard = self.cached_graph.lock().unwrap();
+
+        // Try update path if we already have a cached exec.
+        let reused = if let Some(cache) = cache_guard.as_ref() {
+            let mut result: cuda_sys::CUgraphExecUpdateResult =
+                cuda_sys::CUgraphExecUpdateResult_enum::CU_GRAPH_EXEC_UPDATE_SUCCESS;
+            let mut err_node: cuda_sys::CUgraphNode = std::ptr::null_mut();
+            // SAFETY: cache.exec was instantiated from a prior capture
+            // on the same context. new_graph is the fresh capture. Both
+            // handles remain valid for this call (we hold the mutex).
+            let status = unsafe {
+                cuda_sys::cuGraphExecUpdate(
+                    cache.exec,
+                    new_graph,
+                    &mut err_node,
+                    &mut result,
+                )
+            };
+            status == cuda_sys::CUresult::CUDA_SUCCESS
+                && matches!(
+                    result,
+                    cuda_sys::CUgraphExecUpdateResult_enum::CU_GRAPH_EXEC_UPDATE_SUCCESS
+                )
+        } else {
+            false
+        };
+
+        self.graph_step_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let exec_to_launch = if reused {
+            self.graph_update_ok
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Update succeeded — exec already refreshed in place. The
+            // new graph is no longer needed (exec snapshots the
+            // topology); free it so we don't leak.
+            unsafe {
+                let _ = cuda_result::graph::destroy(new_graph);
+            }
+            cache_guard.as_ref().unwrap().exec
+        } else {
+            self.graph_instantiate_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // First step or update failed: drop any stale exec and
+            // instantiate fresh from new_graph. The instantiate call
+            // snapshots topology internally, so we also destroy the
+            // parent graph right after.
+            *cache_guard = None;
+            let flag = cuda_sys::CUgraphInstantiate_flags_enum::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH;
+            // SAFETY: new_graph is a valid CUgraph from end_capture.
+            // AUTO_FREE_ON_LAUNCH is safe for this decode graph
+            // (no CUDA allocation nodes).
+            let exec = unsafe {
+                cuda_result::graph::instantiate(new_graph, flag)
+                    .map_err(|e| anyhow!("cuGraphInstantiate failed: {e}"))?
+            };
+            unsafe {
+                let _ = cuda_result::graph::destroy(new_graph);
+            }
+            *cache_guard = Some(CudaGraphCache { exec });
+            exec
+        };
+
+        // Launch. Release the mutex first so re-entrant backend calls
+        // (unlikely but cheap to enable) don't deadlock.
+        drop(cache_guard);
+
+        // SAFETY: exec_to_launch is either the prev-reused handle
+        // (still cached) or the freshly instantiated one (also
+        // cached). Both are valid; stream is bound to the backend.
+        unsafe {
+            cuda_result::graph::launch(exec_to_launch, self.stream.cu_stream())
                 .map_err(|e| anyhow!("cuGraphLaunch failed: {e}"))?;
         }
-        // `g` drops here → exec_destroy + graph_destroy on the Arc'd
-        // CudaContext's scratch error slot.
         Ok(())
+    }
+
+    /// Drop any cached graph exec so the next `end_graph_capture_and_launch`
+    /// starts from scratch. Call when the decode topology is about to
+    /// change (KV capacity grow, skip-config flip, eviction-fire step,
+    /// score-accumulator toggling, etc.).
+    pub fn invalidate_graph_cache(&self) {
+        let mut g = self.cached_graph.lock().unwrap();
+        if g.is_some() {
+            eprintln!("[CUDA-Graph] cache invalidated (topology change)");
+            *g = None;
+        }
     }
 
     /// Whether a CUDA Graph capture is currently active on this backend.
     #[inline]
     pub fn is_graph_capturing(&self) -> bool {
         self.graph_capturing.load(Ordering::Relaxed)
+    }
+
+    /// Print graph reuse stats to stderr: total steps vs update-hits
+    /// vs instantiate-fallbacks. A healthy run should show
+    /// `instantiate == 1` (first step) and `update == steps - 1`.
+    pub fn dump_graph_counters(&self) {
+        let steps = self.graph_step_count.load(Ordering::Relaxed);
+        let ok = self.graph_update_ok.load(Ordering::Relaxed);
+        let inst = self.graph_instantiate_count.load(Ordering::Relaxed);
+        if steps > 0 {
+            eprintln!(
+                "[CUDA-Graph] steps={steps} update_ok={ok} instantiate={inst} \
+                 (update_hit_rate={:.1}%)",
+                100.0 * ok as f64 / steps as f64
+            );
+        }
     }
 
     /// Set the per-category sync policy. `defer_sync=true` still
