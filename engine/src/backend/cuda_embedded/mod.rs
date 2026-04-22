@@ -1826,6 +1826,125 @@ impl Backend for CudaBackend {
         Ok(())
     }
 
+    fn matmul_ffn_gate_up_silu(
+        &self,
+        x: &Tensor,
+        w_gate: &Tensor,
+        w_up: &Tensor,
+        out: &mut Tensor,
+        up_scratch: &mut Tensor,
+    ) -> Result<()> {
+        // Fused Q4_0 × Q8_1 mmvq + silu-gating fast path:
+        //   out[row] = silu(w_gate[row] · x) * (w_up[row] · x)
+        //
+        // Conditions — all must hold for the fast path:
+        //   • decode (M = 1)
+        //   • both weights Q4_0, activation F32
+        //   • K multiple of 32 (QK4_0)
+        //
+        // Otherwise fall back to the 3-op sequence identical to the
+        // trait default.
+        let m_u: usize = x.shape().dims()[..x.shape().dims().len() - 1]
+            .iter()
+            .product::<usize>()
+            .max(1);
+        let k_u = *x.shape().dims().last().unwrap_or(&0);
+        let fast = m_u == 1
+            && (k_u & 31) == 0
+            && w_gate.dtype() == DType::Q4_0
+            && w_up.dtype() == DType::Q4_0
+            && x.dtype() == DType::F32;
+
+        if !fast {
+            // Fallback: keep the default trait sequence.
+            self.matmul_transposed(x, w_gate, out)?;
+            self.matmul_transposed(x, w_up, up_scratch)?;
+            return self.silu_mul(out, up_scratch);
+        }
+
+        self.maybe_sync_cat(SyncCat::Matmul)?;
+        let out_dims = out.shape().dims().to_vec();
+        let n_u = *out_dims.last().unwrap_or(&0);
+        let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "ffn_gate_up_silu x")?;
+        let wg_ptr =
+            Self::require_device_ptr(w_gate.buffer().as_ref(), "ffn_gate_up_silu w_gate")?;
+        let wu_ptr = Self::require_device_ptr(w_up.buffer().as_ref(), "ffn_gate_up_silu w_up")?;
+        let out_ptr = Self::require_device_ptr(out.buffer().as_ref(), "ffn_gate_up_silu out")?;
+        // out is written — drop any Q8 cache of that ptr.
+        self.invalidate_q8_cache_if_matches(out_ptr);
+
+        // Quantise activation if the cache is cold.
+        let n_q8_blocks = k_u >> 5;
+        let need_bytes = n_q8_blocks * 36;
+        let mut guard = self.q8_1_scratch.lock().unwrap();
+        let need_realloc = guard
+            .as_ref()
+            .map(|b| b.size() < need_bytes)
+            .unwrap_or(true);
+        if need_realloc {
+            *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
+            *self.q8_1_cache.lock().unwrap() = None;
+        }
+        let q8_ptr = guard.as_ref().unwrap().device_ptr();
+        drop(guard);
+
+        let stream = self.stream.clone();
+        if !self.q8_cache_hit(x_ptr, k_u) {
+            const QUANT_BS: u32 = 256;
+            let k_i32 = k_u as i32;
+            let q_cfg = LaunchConfig {
+                grid_dim: ((k_u as u32).div_ceil(QUANT_BS), 1, 1),
+                block_dim: (QUANT_BS, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                unsafe {
+                    stream
+                        .launch_builder(&self.kernels.quantize_q8_1_f32)
+                        .arg(&x_ptr)
+                        .arg(&q8_ptr)
+                        .arg(&k_i32)
+                        .launch(q_cfg)
+                        .map_err(|e| anyhow!("quantize_q8_1_f32 launch failed: {e}"))?;
+                }
+                Ok(())
+            });
+            self.record_q8_cache(x_ptr, k_u);
+        }
+
+        // Launch fused mmvq + silu-gate. Same block/grid as the
+        // non-fused mmvq; the kernel carries a second accumulator.
+        const GEMV_WARP: u32 = 32;
+        const MMVQ_NWARPS: u32 = 4;
+        let k_i32 = k_u as i32;
+        let n_i32 = n_u as i32;
+        let mmvq_cfg = LaunchConfig {
+            grid_dim: (n_i32 as u32, 1, 1),
+            block_dim: (GEMV_WARP, MMVQ_NWARPS, 1),
+            shared_mem_bytes: 0,
+        };
+        cuda_profile!(self, CudaOpTag::Matmul, stream, {
+            unsafe {
+                stream
+                    .launch_builder(&self.kernels.mul_mat_vec_q4_0_q8_1_gate_up_silu)
+                    .arg(&wg_ptr)
+                    .arg(&wu_ptr)
+                    .arg(&q8_ptr)
+                    .arg(&out_ptr)
+                    .arg(&k_i32)
+                    .arg(&n_i32)
+                    .launch(mmvq_cfg)
+                    .map_err(|e| {
+                        anyhow!("mul_mat_vec_q4_0_q8_1_gate_up_silu launch failed: {e}")
+                    })?;
+            }
+            Ok(())
+        });
+        self.maybe_sync_cat(SyncCat::Matmul)?;
+        let _ = up_scratch; // fused path writes `out` directly
+        Ok(())
+    }
+
     fn gelu_tanh_mul(&self, gate: &mut Tensor, up: &Tensor) -> Result<()> {
         let n = gate.numel();
         let gate_ptr = Self::require_device_ptr(gate.buffer().as_ref(), "gelu_tanh_mul gate")?;

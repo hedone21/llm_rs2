@@ -61,6 +61,30 @@ pub trait Backend: Send + Sync {
 
     // Activation & Norm
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()>;
+
+    /// Fused FFN gate + up matmul followed by SiLU gating:
+    ///     out[i] = silu(gate·x)[i] * (up·x)[i]
+    ///
+    /// Both matmuls share the same activation `x`, so a GPU backend
+    /// can bundle them into one kernel and reuse the quantised
+    /// activation cache. The `gate_scratch`/`up_scratch` tensors are
+    /// temporaries used by the default (non-fused) fallback; GPU
+    /// overrides may ignore them and write `out` directly.
+    ///
+    /// Default: 3 op fallback (gate matmul → up matmul → silu_mul).
+    fn matmul_ffn_gate_up_silu(
+        &self,
+        x: &Tensor,
+        w_gate: &Tensor,
+        w_up: &Tensor,
+        out: &mut Tensor,
+        up_scratch: &mut Tensor,
+    ) -> Result<()> {
+        self.matmul_transposed(x, w_gate, out)?;
+        self.matmul_transposed(x, w_up, up_scratch)?;
+        self.silu_mul(out, up_scratch)
+    }
+
     /// GELU tanh approximation fused with elementwise multiply.
     /// gate[i] = gelu_tanh(gate[i]) * up[i]
     /// Used by Gemma 3 FFN (hidden_activation = "gelu_pytorch_tanh").

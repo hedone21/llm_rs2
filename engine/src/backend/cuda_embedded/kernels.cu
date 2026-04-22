@@ -1152,3 +1152,148 @@ extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4
         output[row] = tmp;
     }
 }
+
+// =================================================================
+// Fused FFN gate + up mmvq + SiLU gating (decode, M=1).
+//
+// Replaces the sequence
+//     gate = w_gate · x    (mmvq)
+//     up   = w_up   · x    (mmvq)
+//     out  = silu(gate) * up
+// with a single kernel. Both gate and up matmul scan the same
+// Q8_1-quantised activation, so the read of `activation_q` is shared
+// between the two dp4a accumulators (L2 reuse). The silu-multiply
+// runs in registers inside the reduction write-back.
+//
+// Register budget: the non-fused kernel carries one float accumulator
+// + a handful of int loads per dp4a; doubling for gate+up keeps us
+// well under Xavier's 64-regs-per-thread sweet spot (checked via
+// `--ptxas-options=-v` — N regs, no spill).
+//
+// Grid: (N, 1, 1) where N = FFN hidden dim (14336 for Llama 3.1 8B).
+// Block: (32, MMVQ_NWARPS, 1) = 128 threads.
+// =================================================================
+extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1)
+void mul_mat_vec_q4_0_q8_1_gate_up_silu(
+    const unsigned char* __restrict__ weight_gate,   // Q4_0 blocks
+    const unsigned char* __restrict__ weight_up,     // Q4_0 blocks
+    const unsigned char* __restrict__ activation_q,  // Q8_1 blocks (shared)
+    float*               __restrict__ output,        // [N] — silu(gate)·up
+    int K, int N)
+{
+    const int row = blockIdx.x;
+    if (row >= N) return;
+
+    const int tid = 32 * threadIdx.y + threadIdx.x;
+    const int blocks_per_row = K >> 5;
+    const int blocks_per_iter = (VDR_Q4_0_Q8_1_MMVQ * MMVQ_NWARPS * 32) / QI4_0; // 64
+
+    const int q4_block_bytes = 18;
+    const int q8_block_bytes = 36;
+
+    const unsigned char* w_gate_row =
+        weight_gate + (long long)row * blocks_per_row * q4_block_bytes;
+    const unsigned char* w_up_row =
+        weight_up + (long long)row * blocks_per_row * q4_block_bytes;
+
+    float tmp_gate = 0.0f;
+    float tmp_up   = 0.0f;
+
+    const int kqs = VDR_Q4_0_Q8_1_MMVQ * (tid & 1);
+
+    for (int kbx = tid >> 1; kbx < blocks_per_row; kbx += blocks_per_iter) {
+        const unsigned char* bq4_gate = w_gate_row + kbx * q4_block_bytes;
+        const unsigned char* bq4_up   = w_up_row   + kbx * q4_block_bytes;
+        const unsigned char* bq8      = activation_q + kbx * q8_block_bytes;
+
+        // Q8_1 reads shared between gate and up.
+        const int* qs8 = (const int*)(bq8 + 4);
+        const int u00 = qs8[kqs + 0];
+        const int u01 = qs8[kqs + 1];
+        const int u10 = qs8[kqs + QI4_0 + 0];
+        const int u11 = qs8[kqs + QI4_0 + 1];
+        const __half2 ds8 = *(const __half2*)bq8;
+        const float2 ds8f = __half22float2(ds8);
+
+        // Gate block.
+        {
+            unsigned short d_bits =
+                (unsigned short)bq4_gate[0] | ((unsigned short)bq4_gate[1] << 8);
+            float d4 = __half2float(__ushort_as_half(d_bits));
+            int v0, v1;
+            {
+                const unsigned char* p = bq4_gate + 2 + kqs * 4;
+                v0 = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
+                v1 = (int)p[4] | ((int)p[5] << 8) | ((int)p[6] << 16) | ((int)p[7] << 24);
+            }
+            int sumi = 0;
+            {
+                int vi_lo = (v0 >> 0) & 0x0F0F0F0F;
+                int vi_hi = (v0 >> 4) & 0x0F0F0F0F;
+                sumi = __dp4a(vi_lo, u00, sumi);
+                sumi = __dp4a(vi_hi, u10, sumi);
+            }
+            {
+                int vi_lo = (v1 >> 0) & 0x0F0F0F0F;
+                int vi_hi = (v1 >> 4) & 0x0F0F0F0F;
+                sumi = __dp4a(vi_lo, u01, sumi);
+                sumi = __dp4a(vi_hi, u11, sumi);
+            }
+            tmp_gate += d4 * (sumi * ds8f.x - 4.0f * ds8f.y);
+        }
+
+        // Up block.
+        {
+            unsigned short d_bits =
+                (unsigned short)bq4_up[0] | ((unsigned short)bq4_up[1] << 8);
+            float d4 = __half2float(__ushort_as_half(d_bits));
+            int v0, v1;
+            {
+                const unsigned char* p = bq4_up + 2 + kqs * 4;
+                v0 = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
+                v1 = (int)p[4] | ((int)p[5] << 8) | ((int)p[6] << 16) | ((int)p[7] << 24);
+            }
+            int sumi = 0;
+            {
+                int vi_lo = (v0 >> 0) & 0x0F0F0F0F;
+                int vi_hi = (v0 >> 4) & 0x0F0F0F0F;
+                sumi = __dp4a(vi_lo, u00, sumi);
+                sumi = __dp4a(vi_hi, u10, sumi);
+            }
+            {
+                int vi_lo = (v1 >> 0) & 0x0F0F0F0F;
+                int vi_hi = (v1 >> 4) & 0x0F0F0F0F;
+                sumi = __dp4a(vi_lo, u01, sumi);
+                sumi = __dp4a(vi_hi, u11, sumi);
+            }
+            tmp_up += d4 * (sumi * ds8f.x - 4.0f * ds8f.y);
+        }
+    }
+
+    // Cross-warp reduce for both accumulators.
+    __shared__ float tmp_shared_gate[MMVQ_NWARPS - 1][32];
+    __shared__ float tmp_shared_up  [MMVQ_NWARPS - 1][32];
+    if (threadIdx.y > 0) {
+        tmp_shared_gate[threadIdx.y - 1][threadIdx.x] = tmp_gate;
+        tmp_shared_up  [threadIdx.y - 1][threadIdx.x] = tmp_up;
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+
+    #pragma unroll
+    for (int l = 0; l < MMVQ_NWARPS - 1; ++l) {
+        tmp_gate += tmp_shared_gate[l][threadIdx.x];
+        tmp_up   += tmp_shared_up  [l][threadIdx.x];
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        tmp_gate += __shfl_down_sync(0xffffffff, tmp_gate, offset, 32);
+        tmp_up   += __shfl_down_sync(0xffffffff, tmp_up,   offset, 32);
+    }
+    if (threadIdx.x == 0) {
+        // SiLU(gate) = gate / (1 + exp(-gate)).
+        float g = tmp_gate;
+        float silu = g / (1.0f + __expf(-g));
+        output[row] = silu * tmp_up;
+    }
+}

@@ -1563,8 +1563,25 @@ impl TransformerLayer {
             // ── Generic path: sequential matmuls on active backend ──
             crate::core::thread_pool::get_pool().begin_batch();
             set_label("matmul_ffn");
-            backend.matmul_transposed(&ws.residual, &self.w_gate, &mut ws.gate)?;
-            backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
+            // Backends with a Q4_0 × Q8_1 mmvq fast path (CUDA
+            // embedded) fuse gate+up matmul and SiLU gating into one
+            // kernel via `matmul_ffn_gate_up_silu`. The default trait
+            // implementation falls back to gate matmul + up matmul +
+            // silu_mul, matching the prior behaviour. Skip the fused
+            // path for Gemma-style GELU activation since the fused
+            // kernel only implements SiLU.
+            if !use_gelu_tanh {
+                backend.matmul_ffn_gate_up_silu(
+                    &ws.residual,
+                    &self.w_gate,
+                    &self.w_up,
+                    &mut ws.gate,
+                    &mut ws.up,
+                )?;
+            } else {
+                backend.matmul_transposed(&ws.residual, &self.w_gate, &mut ws.gate)?;
+                backend.matmul_transposed(&ws.residual, &self.w_up, &mut ws.up)?;
+            }
             clear_label();
             crate::core::thread_pool::get_pool().end_batch();
             if is_gpu && std::env::var_os("LLMRS_DISABLE_FLUSH_FFN").is_none() {
@@ -1573,16 +1590,17 @@ impl TransformerLayer {
         }
         prof_record!(t, matmul_ffn);
 
-        // silu_mul + down matmul: skipped when partition is active (done per-slice
-        // inside the partition block above, merged into ws.down at layer end).
+        // silu_mul (GELU path) + down matmul: skipped when partition is active
+        // (done per-slice inside the partition block above, merged into
+        // ws.down at layer end). For the SiLU path, `matmul_ffn_gate_up_silu`
+        // above already wrote `silu(gate) * up` into `ws.gate`, so only
+        // the GELU branch needs a separate activation step.
         if !partition_active {
-            let t = prof_start!();
             if use_gelu_tanh {
+                let t = prof_start!();
                 backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
-            } else {
-                backend.silu_mul(&mut ws.gate, &ws.up)?;
+                prof_record!(t, silu_mul);
             }
-            prof_record!(t, silu_mul);
 
             let t = prof_start!();
             set_label("matmul_ffn");
