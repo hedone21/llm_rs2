@@ -73,6 +73,12 @@ kernel void kernel_mul_mat_f16_f32_1row(
 
     if (ne00 >= 128) {
         // Vectorized half4 × float4
+        // NOTE: on Adreno 830, `vload_half4 + dot()` outperformed
+        // `(half4*)` cast + 4 scalar MADs (ablation 2026-04-22, +12 ms
+        // regression with scalar MAD). The `dot()` reduction compiles to
+        // Adreno's FDP4 single-cycle instruction while scalar MAD chain
+        // does not pipeline as efficiently. Do NOT "optimize" to llama.cpp
+        // style without re-verifying on hardware.
         int ne00_4 = ne00 / 4;
         for (int i = lid; i < ne00_4; i += stride) {
             float4 a = vload4(0, yr + i * 4);
