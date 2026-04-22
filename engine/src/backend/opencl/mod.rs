@@ -626,28 +626,43 @@ impl OpenCLBackend {
         let f16_src = include_str!("../../../kernels/mul_mv_f16_f32.cl");
         let f16_fallback_src = include_str!("../../../kernels/fallback/mul_mv_f16_f32_nosub.cl");
         let f16_is_nosub: bool;
+        // 2026-04-22: nosub (single-SG, N_DST=4) is DEFAULT on Adreno 830 —
+        // matches llama.cpp's design and measured −33% TBT at n=1024 (Qwen F16)
+        // vs the 4-wave K-split variant. Opt back into 4-wave with
+        // LLMRS_F16_GEMV_USE_4WAVE=1 (for A/B testing or other devices).
+        let use_4wave = std::env::var("LLMRS_F16_GEMV_USE_4WAVE")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        let primary_src = if use_4wave { f16_src } else { f16_fallback_src };
+        let primary_tag = if use_4wave {
+            "4-wave K-split, N_DST=2 (opt-in)"
+        } else {
+            "nosub single-SG, N_DST=4 (default)"
+        };
         let f16_program = match Program::builder()
             .devices(device)
-            .src(f16_src)
+            .src(primary_src)
             .cmplr_opt(&cl_opts)
             .build(&context)
         {
             Ok(p) => {
-                log::info!("mul_mv_f16_f32.cl compiled (4-wave K-split, N_DST=2, 128 rows/WG)");
-                f16_is_nosub = false;
+                log::info!("mul_mv_f16_f32 compiled ({})", primary_tag);
+                f16_is_nosub = !use_4wave;
                 p
             }
             Err(e) => {
-                log::warn!("4-wave F16 compile failed: {}. Falling back to nosub.", e);
+                log::warn!("primary F16 kernel ({}) failed: {}. Trying the other variant.", primary_tag, e);
+                let alt_src = if use_4wave { f16_fallback_src } else { f16_src };
+                let alt_is_nosub = use_4wave;
                 match Program::builder()
                     .devices(device)
-                    .src(f16_fallback_src)
+                    .src(alt_src)
                     .cmplr_opt(&cl_opts)
                     .build(&context)
                 {
                     Ok(p) => {
-                        log::info!("F16 GEMV compiled (subgroup-reduce fallback, N_DST=4)");
-                        f16_is_nosub = true;
+                        log::info!("F16 GEMV compiled (alt path)");
+                        f16_is_nosub = alt_is_nosub;
                         p
                     }
                     Err(e2) => {
