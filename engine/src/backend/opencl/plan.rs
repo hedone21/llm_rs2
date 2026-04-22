@@ -692,18 +692,20 @@ impl PartitionStep {
             None
         };
 
-        // 5. GPU wait — drain the in-flight GPU FFN dispatches before the
-        //    CPU partial is delivered to `cpu_merge_staging`. Required for
-        //    correctness on Adreno / ARM UMA: skipping this drain and
-        //    relying only on an ARM release fence + ALLOC_HOST_PTR
-        //    coherency produced garbage tokens on Qwen 2.5 1.5B F16
-        //    (partition r=0.7, 2026-04-21). The write-before-read hazard
-        //    appears to be dtype / kernel-layout dependent — Q4_0 noshuffle
-        //    SOA kernels happened to be coherent, F16 GEMV was not. Use
-        //    `LLMRS_PARTITION_SKIP_GPU_WAIT=1` to opt out for A/B on
-        //    hardware where bit-exactness is re-validated.
-        let skip_gpu_wait = std::env::var_os("LLMRS_PARTITION_SKIP_GPU_WAIT").is_some();
-        if !skip_gpu_wait && let Err(e) = ocl::core::finish(queue) {
+        // 5. GPU wait — historically a `finish()` drain before delivering the
+        //    CPU partial to `cpu_merge_staging`. Default is now SKIP: the
+        //    in-order queue serializes `gpu_down → copy_slice → add_assign`
+        //    for us, and the CPU→staging path is covered by a Release fence
+        //    below (ALLOC_HOST_PTR on Adreno UMA). Re-validated bit-exact on
+        //    2026-04-22: Qwen 2.5 1.5B F16 (200 tokens, r∈{0.5..0.9}),
+        //    Llama 3.2 3B Q4_0 (r=0.97). The prior Qwen F16 garbage regression
+        //    (2026-04-21 opt-in downgrade) no longer reproduces — the
+        //    intervening landings (POLL_FLAG sigflag release edge, permanent-
+        //    mapped cpu_merge_staging, fused_matmul) appear to have closed
+        //    the hazard window. Set `LLMRS_PARTITION_WAIT_GPU=1` to re-enable
+        //    the drain if correctness regresses on new hardware.
+        let wait_gpu = std::env::var_os("LLMRS_PARTITION_WAIT_GPU").is_some();
+        if wait_gpu && let Err(e) = ocl::core::finish(queue) {
             log::error!(
                 "PartitionStep GPU wait failed: layer={} err={}",
                 layer_idx,

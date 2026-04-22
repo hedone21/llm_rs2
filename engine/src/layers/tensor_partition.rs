@@ -576,13 +576,15 @@ pub fn partition_plan_enabled() -> bool {
 /// elides Adreno driver submission/completion latency (~0.29 ms/layer on
 /// S25) at the cost of a busy-wait CPU loop scoped to that window.
 ///
-/// Default: **disabled** (opt-in). Enable with `LLMRS_PARTITION_POLL_FLAG=1`.
+/// Default: **enabled**. Disable with `LLMRS_PARTITION_POLL_FLAG=0` to fall
+/// back to the `clFinish` drain on hardware where the sigflag path is slower
+/// or ALLOC_HOST_PTR coherency is unreliable.
 pub fn partition_poll_flag_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHED.get_or_init(|| {
         std::env::var("LLMRS_PARTITION_POLL_FLAG")
-            .map(|v| v == "1")
-            .unwrap_or(false)
+            .map(|v| v != "0")
+            .unwrap_or(true)
     })
 }
 
