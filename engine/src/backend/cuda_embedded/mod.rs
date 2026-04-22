@@ -233,6 +233,16 @@ pub struct CudaBackend {
     /// on demand. Populated by `quantize_q8_1_f32`, consumed by
     /// `mul_mat_vec_q4_0_q8_1`.
     q8_1_scratch: Arc<std::sync::Mutex<Option<CudaHostBuffer>>>,
+    /// Cache marker for `q8_1_scratch`: records which (activation
+    /// device pointer, K) the scratch currently holds a valid Q8_1
+    /// quantisation for. Every mutating op in the backend invalidates
+    /// this marker if the written pointer matches (see
+    /// `invalidate_q8_cache_if_matches`), so the Q4_0 mmvq fast path
+    /// can safely skip the re-quantize when a series of matmuls share
+    /// the same read-only activation (e.g. Q, K, V projections from
+    /// the pre-attn RMSNorm output; gate and up projections from the
+    /// pre-FFN RMSNorm output).
+    q8_1_cache: Arc<std::sync::Mutex<Option<(u64, usize)>>>,
     /// Reusable device buffer for per-call attention score readback
     /// (Phase B: resilience/eviction GPU path). Holds normalized softmax weights
     /// in layout `[num_heads_q, score_stride]` F32. Allocated lazily on first
@@ -433,6 +443,7 @@ impl CudaBackend {
             kernels: Arc::new(kernels),
             cast_cache: Arc::new(std::sync::Mutex::new(None)),
             q8_1_scratch: Arc::new(std::sync::Mutex::new(None)),
+            q8_1_cache: Arc::new(std::sync::Mutex::new(None)),
             score_tmp_buf: Arc::new(std::sync::Mutex::new(None)),
             profiler: Arc::new(std::sync::Mutex::new(None)),
             op_label_hint: Arc::new(OpLabelHint::new()),
@@ -583,6 +594,56 @@ impl CudaBackend {
     #[inline]
     pub fn weights_device_enabled(&self) -> bool {
         self.weights_device.load(Ordering::Relaxed)
+    }
+
+    // ── Q8_1 activation cache ───────────────────────────────────────
+    //
+    // The Q4_0 mmvq path quantises the F32 activation vector into Q8_1
+    // blocks (36 B/block, 4096-float input = 4.5 KB) before the integer
+    // dot. Every decode token invokes this for QKV × 3, gate, up, wo
+    // and down — 7 matmuls per layer, 32 layers = 224 mmvq calls, and
+    // 224 quantize launches if cached naively.
+    //
+    // Most of those share an activation: Q, K and V all read the
+    // pre-attn RMSNorm output; gate and up both read the pre-FFN
+    // RMSNorm output. Only the first in each burst needs a fresh Q8_1
+    // quantisation; the rest can reuse the cached scratch. That
+    // collapses 224 → 32 + 3 × 32 = 128 quantize launches (–43 %) when
+    // the cache hit rate is perfect.
+    //
+    // Invalidation is conservative — any mutating op whose output
+    // pointer matches the cached pointer clears the marker. This
+    // catches the common case where `ws.residual` is recomputed by
+    // a subsequent RMSNorm and its old Q8_1 image would be stale.
+
+    /// Record a freshly-computed Q8_1 quantisation so the next
+    /// `matmul_transposed` over the same `(ptr, k)` can skip the
+    /// quantize kernel.
+    #[inline]
+    fn record_q8_cache(&self, act_ptr: u64, k: usize) {
+        *self.q8_1_cache.lock().unwrap() = Some((act_ptr, k));
+    }
+
+    /// Invalidate the Q8_1 cache if the most recently recorded
+    /// activation pointer matches the given written-to pointer.
+    /// Called from every mutating op (add_assign, rms_norm, matmul
+    /// output, etc.) to keep the cache honest without per-op bookkeeping
+    /// at call sites.
+    #[inline]
+    fn invalidate_q8_cache_if_matches(&self, written_ptr: u64) {
+        let mut c = self.q8_1_cache.lock().unwrap();
+        if let Some((cached_ptr, _)) = *c {
+            if cached_ptr == written_ptr {
+                *c = None;
+            }
+        }
+    }
+
+    /// Query whether the Q8_1 cache currently holds a valid
+    /// quantisation for `(act_ptr, k)`.
+    #[inline]
+    fn q8_cache_hit(&self, act_ptr: u64, k: usize) -> bool {
+        matches!(*self.q8_1_cache.lock().unwrap(), Some((p, kk)) if p == act_ptr && kk == k)
     }
 
     // ── CUDA Graph capture (decode-loop launch bundling) ────────────
@@ -1131,6 +1192,12 @@ impl Backend for CudaBackend {
         // insurance rather than a correctness requirement — safe to
         // defer under --cuda-defer-sync.)
         self.maybe_sync_cat(SyncCat::Matmul)?;
+        // The output buffer is about to be overwritten — if it happens
+        // to match the currently-cached Q8_1 activation, drop the cache
+        // so a later matmul that reads from here re-quantizes.
+        if let Some(out_ptr_preview) = Self::get_device_ptr(out.buffer().as_ref()) {
+            self.invalidate_q8_cache_if_matches(out_ptr_preview);
+        }
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
@@ -1177,29 +1244,43 @@ impl Backend for CudaBackend {
                             .unwrap_or(true);
                         if need_realloc {
                             *guard = Some(CudaHostBuffer::new(need_bytes, DType::F32)?);
+                            // Forced re-alloc invalidates any previously
+                            // cached Q8_1 quantisation — pointer is new.
+                            *self.q8_1_cache.lock().unwrap() = None;
                         }
                         let q8_ptr = guard.as_ref().unwrap().device_ptr();
+                        drop(guard);
 
-                        // quantize_q8_1_f32: one thread per F32 element.
-                        // Use block size 256 (multiple of 32 == QK8_1).
-                        const QUANT_BS: u32 = 256;
-                        let q_cfg = LaunchConfig {
-                            grid_dim: ((k_u as u32).div_ceil(QUANT_BS), 1, 1),
-                            block_dim: (QUANT_BS, 1, 1),
-                            shared_mem_bytes: 0,
-                        };
-                        cuda_profile!(self, CudaOpTag::Matmul, stream, {
-                            unsafe {
-                                stream
-                                    .launch_builder(&self.kernels.quantize_q8_1_f32)
-                                    .arg(&a_ptr)
-                                    .arg(&q8_ptr)
-                                    .arg(&k_i32)
-                                    .launch(q_cfg)
-                                    .map_err(|e| anyhow!("quantize_q8_1_f32 launch failed: {e}"))?;
-                            }
-                            Ok(())
-                        });
+                        // Skip the quantize launch if this backend's
+                        // Q8_1 scratch already holds the result for
+                        // (a_ptr, k_u). Invalidated by every mutating op
+                        // whose output pointer matches `a_ptr`, so the
+                        // skipped case is provably safe.
+                        if !self.q8_cache_hit(a_ptr, k_u) {
+                            // quantize_q8_1_f32: one thread per F32 element.
+                            // Block size 256 (multiple of 32 == QK8_1).
+                            const QUANT_BS: u32 = 256;
+                            let q_cfg = LaunchConfig {
+                                grid_dim: ((k_u as u32).div_ceil(QUANT_BS), 1, 1),
+                                block_dim: (QUANT_BS, 1, 1),
+                                shared_mem_bytes: 0,
+                            };
+                            cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                                unsafe {
+                                    stream
+                                        .launch_builder(&self.kernels.quantize_q8_1_f32)
+                                        .arg(&a_ptr)
+                                        .arg(&q8_ptr)
+                                        .arg(&k_i32)
+                                        .launch(q_cfg)
+                                        .map_err(|e| {
+                                            anyhow!("quantize_q8_1_f32 launch failed: {e}")
+                                        })?;
+                                }
+                                Ok(())
+                            });
+                            self.record_q8_cache(a_ptr, k_u);
+                        }
 
                         // mul_mat_vec_q4_0_q8_1: one CUDA block per output row,
                         // 4 warps × 32 lanes = 128 threads. 128 * SLM scratch
@@ -1500,6 +1581,7 @@ impl Backend for CudaBackend {
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
         let n = a.numel();
         let a_ptr = Self::require_device_ptr(a.buffer().as_ref(), "add_assign a")?;
+        self.invalidate_q8_cache_if_matches(a_ptr);
         let b_ptr = Self::require_device_ptr(b.buffer().as_ref(), "add_assign b")?;
         let k = n as i32;
         let stream = self.stream.clone();
@@ -1523,6 +1605,7 @@ impl Backend for CudaBackend {
     fn scale(&self, x: &mut Tensor, v: f32) -> Result<()> {
         let n = x.numel();
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "scale x")?;
+        self.invalidate_q8_cache_if_matches(x_ptr);
         let k = n as i32;
         let stream = self.stream.clone();
         // SAFETY: x_ptr is valid F32 device memory of n elements.
@@ -1545,6 +1628,7 @@ impl Backend for CudaBackend {
     fn silu_mul(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
         let n = a.numel();
         let a_ptr = Self::require_device_ptr(a.buffer().as_ref(), "silu_mul gate")?;
+        self.invalidate_q8_cache_if_matches(a_ptr);
         let b_ptr = Self::require_device_ptr(b.buffer().as_ref(), "silu_mul up")?;
         let k = n as i32;
         let stream = self.stream.clone();
@@ -1568,6 +1652,7 @@ impl Backend for CudaBackend {
     fn gelu_tanh_mul(&self, gate: &mut Tensor, up: &Tensor) -> Result<()> {
         let n = gate.numel();
         let gate_ptr = Self::require_device_ptr(gate.buffer().as_ref(), "gelu_tanh_mul gate")?;
+        self.invalidate_q8_cache_if_matches(gate_ptr);
         let up_ptr = Self::require_device_ptr(up.buffer().as_ref(), "gelu_tanh_mul up")?;
         let k = n as i32;
         let stream = self.stream.clone();
@@ -1594,6 +1679,7 @@ impl Backend for CudaBackend {
         let ncols = dims[rank - 1] as i32;
         let nrows: usize = dims[..rank - 1].iter().product::<usize>().max(1);
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "rms_norm x")?;
+        self.invalidate_q8_cache_if_matches(x_ptr);
         let w_ptr = Self::require_device_ptr(w.buffer().as_ref(), "rms_norm w")?;
         let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
         let block_size = (ncols as usize).min(1024) as u32;
@@ -1638,6 +1724,7 @@ impl Backend for CudaBackend {
         let nrows: usize = dims[..rank - 1].iter().product::<usize>().max(1);
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "rms_norm_oop x")?;
         let out_ptr = Self::require_device_ptr(out.buffer().as_ref(), "rms_norm_oop out")?;
+        self.invalidate_q8_cache_if_matches(out_ptr);
         let w_ptr = Self::require_device_ptr(w.buffer().as_ref(), "rms_norm_oop w")?;
         let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
         let block_size = (ncols as usize).min(1024) as u32;
@@ -1687,6 +1774,11 @@ impl Backend for CudaBackend {
         let res_ptr =
             Self::require_device_ptr(residual.buffer().as_ref(), "add_rms_norm_oop residual")?;
         let out_ptr = Self::require_device_ptr(out.buffer().as_ref(), "add_rms_norm_oop out")?;
+        // Both x (in-place residual accumulate) and out (fresh RMSNorm
+        // output) get written — invalidate any cached Q8_1 snapshot of
+        // either.
+        self.invalidate_q8_cache_if_matches(x_ptr);
+        self.invalidate_q8_cache_if_matches(out_ptr);
         let w_ptr = Self::require_device_ptr(w.buffer().as_ref(), "add_rms_norm_oop w")?;
         let add_unit_i32: i32 = if add_unit { 1 } else { 0 };
         let block_size = (ncols as usize).min(1024) as u32;
@@ -1724,6 +1816,7 @@ impl Backend for CudaBackend {
         let ncols = dims[rank - 1] as i32;
         let nrows: usize = dims[..rank - 1].iter().product::<usize>().max(1);
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "softmax x")?;
+        self.invalidate_q8_cache_if_matches(x_ptr);
         let block_size = (ncols as usize).min(1024) as u32;
         let cfg = LaunchConfig {
             grid_dim: (nrows as u32, 1, 1),
@@ -1766,6 +1859,7 @@ impl Backend for CudaBackend {
             .unwrap_or(1);
 
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "rope_inplace x")?;
+        self.invalidate_q8_cache_if_matches(x_ptr);
         let hd = head_dim as i32;
         let nh = n_heads as i32;
         let sl = seq_len as i32;
@@ -1801,6 +1895,9 @@ impl Backend for CudaBackend {
         let n = src.numel();
         let src_ptr = Self::get_device_ptr(src.buffer().as_ref());
         let dst_ptr = Self::get_device_ptr(dst.buffer().as_ref());
+        if let Some(dp) = dst_ptr {
+            self.invalidate_q8_cache_if_matches(dp);
+        }
 
         match (src_dtype, dst_dtype, src_ptr, dst_ptr) {
             (DType::F32, DType::F16, Some(sp), Some(dp)) => {
@@ -1857,6 +1954,7 @@ impl Backend for CudaBackend {
         let ncols = dims[rank - 1] as i32;
         let total = x.numel();
         let x_ptr = Self::require_device_ptr(x.buffer().as_ref(), "add_row_bias x")?;
+        self.invalidate_q8_cache_if_matches(x_ptr);
         let bias_ptr = Self::require_device_ptr(bias.buffer().as_ref(), "add_row_bias bias")?;
         let total_i32 = total as i32;
         let stream = self.stream.clone();
@@ -2018,6 +2116,9 @@ impl Backend for CudaBackend {
         let src_ptr = Self::get_device_ptr(src.buffer().as_ref());
         let idx_ptr = Self::get_device_ptr(indices.buffer().as_ref());
         let dst_ptr = Self::get_device_ptr(dst.buffer().as_ref());
+        if let Some(dp) = dst_ptr {
+            self.invalidate_q8_cache_if_matches(dp);
+        }
 
         if let (Some(sp), Some(ip), Some(dp)) = (src_ptr, idx_ptr, dst_ptr) {
             let dims = dst.shape().dims().to_vec();
