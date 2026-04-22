@@ -40,6 +40,7 @@ pub struct CudaKernels {
     pub flash_prefill_f16kv_dk256: CudaFunction,
     pub gemv_f16_f16_f32: CudaFunction,
     pub gemv_f16_f32_f32: CudaFunction,
+    pub gemv_q4_0_f32_f32: CudaFunction,
 }
 
 impl CudaKernels {
@@ -85,6 +86,7 @@ impl CudaKernels {
             flash_prefill_f16kv_dk256: load("flash_attn_prefill_f16kv_dk256")?,
             gemv_f16_f16_f32: load("gemv_f16_f16_f32")?,
             gemv_f16_f32_f32: load("gemv_f16_f32_f32")?,
+            gemv_q4_0_f32_f32: load("gemv_q4_0_f32_f32")?,
         })
     }
 

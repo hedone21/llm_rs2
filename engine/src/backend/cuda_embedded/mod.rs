@@ -989,7 +989,73 @@ impl Backend for CudaBackend {
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
-        // Q4_0 weights always go through CPU fallback
+        // Q4_0 decode fast path: M=1, F32 activation × Q4_0 weight → F32 output,
+        // K multiple of 32 (BlockQ4_0 block size). Dequant-in-kernel GEMV, one
+        // warp per output row with N_DST rows per block. Bypasses the legacy
+        // CPU fallback (which re-dequantized every block on the Neon/AVX side
+        // — correct but CPU-bound even on Jetson Xavier UMA).
+        if b_dtype == DType::Q4_0 && a_dtype == DType::F32 {
+            let a_dims = a.shape().dims();
+            let b_dims = b.shape().dims();
+            let a_rank = a_dims.len();
+            let b_rank = b_dims.len();
+            let k_u = a_dims[a_rank - 1];
+            let m_u: usize = a_dims[..a_rank - 1].iter().product();
+            let n_u = b_dims[b_rank - 2];
+
+            if (k_u & 31) == 0 {
+                let a_dev = Self::get_device_ptr(a.buffer().as_ref());
+                let b_dev = Self::get_device_ptr(b.buffer().as_ref());
+                let out_dev = Self::get_device_ptr(out.buffer().as_ref());
+                if let (Some(a_ptr), Some(b_ptr), Some(out_ptr)) = (a_dev, b_dev, out_dev) {
+                    // One CUDA block per output row; Q4_0_NWARPS warps per block
+                    // (matches `Q4_0_NWARPS` in kernels.cu). Warps stride across
+                    // a row's Q4_0 blocks, keeping all lanes busy and using SLM
+                    // for the cross-warp reduce. Keeps Q4_0 fully on-GPU,
+                    // including prefill (M>1 via back-to-back launches) — the
+                    // CPU-fallback path suffers from Jetson UMA cache-incoherency
+                    // after a CPU write.
+                    const GEMV_WARP: u32 = 32;
+                    const Q4_0_NWARPS: u32 = 4;
+                    let k_i32 = k_u as i32;
+                    let n_i32 = n_u as i32;
+                    let stream = self.ctx.default_stream();
+                    let cfg = LaunchConfig {
+                        grid_dim: (n_i32 as u32, 1, 1),
+                        block_dim: (GEMV_WARP, Q4_0_NWARPS, 1),
+                        shared_mem_bytes: Q4_0_NWARPS * 4,
+                    };
+                    // Row stride in bytes for activation / output F32 tensors.
+                    let a_row_stride_bytes = (k_u * 4) as u64;
+                    let out_row_stride_bytes = (n_u * 4) as u64;
+                    for m_i in 0..m_u {
+                        let a_ptr_row = a_ptr + a_row_stride_bytes * (m_i as u64);
+                        let out_ptr_row = out_ptr + out_row_stride_bytes * (m_i as u64);
+                        // SAFETY: b_ptr points at a byte buffer containing
+                        // N*(K/32)*18 bytes of BlockQ4_0 data. a_ptr_row is
+                        // F32 of length K; out_ptr_row is F32 of length N.
+                        cuda_profile!(self, CudaOpTag::Matmul, stream, {
+                            unsafe {
+                                stream
+                                    .launch_builder(&self.kernels.gemv_q4_0_f32_f32)
+                                    .arg(&b_ptr)
+                                    .arg(&a_ptr_row)
+                                    .arg(&out_ptr_row)
+                                    .arg(&k_i32)
+                                    .arg(&n_i32)
+                                    .launch(cfg)
+                                    .map_err(|e| anyhow!("gemv_q4_0_f32_f32 launch failed: {e}"))?;
+                            }
+                            Ok(())
+                        });
+                    }
+                    self.maybe_sync_cat(SyncCat::Matmul)?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Q4_0 non-decode (prefill M>1) or missing device ptr: CPU fallback.
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
             return cpu_fallback_tagged("matmul_transposed_q4_0").matmul_transposed(a, b, out);
         }

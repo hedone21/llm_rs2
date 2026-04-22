@@ -857,3 +857,78 @@ extern "C" __global__ void gemv_f16_f32_f32(
     }
     if (lane == 0) output[row] = acc;
 }
+
+// --- Q4_0 weight × F32 input → F32 output ---
+// Dequant-in-kernel GEMV for BlockQ4_0 layout: { half d; uint8_t qs[16] } = 18
+// bytes per 32 elements. Low-nibble → positions 0..15, high → 16..31, with
+// dequant value = ((nibble as i8) - 8) * d.
+//
+// Threading: 1 warp per output row, 32 lanes cooperate on one block at a time
+// so lane-strided loads are fully coalesced:
+//   - activation reads: 32 contiguous f32 per block (128 B, one coalesced txn).
+//   - qs reads:         lanes 0..15 each fetch one byte (16 B coalesced); lanes
+//                       16..31 reuse via __shfl_sync.
+//   - d bits read:      lane 0 loads 2 bytes, broadcasts via __shfl_sync.
+//
+// K must be a multiple of 32. Weight pointer is byte-addressed; each row is
+// (K/32) * 18 bytes. Block offset 18*b is always 2-aligned (we avoid a wider
+// reinterpret_cast on a 2-aligned address).
+// Launched with block_dim = (32, Q4_0_NWARPS, 1). Each CUDA block handles
+// one output row; the Q4_0_NWARPS warps each process a strided subset of the
+// row's Q4_0 blocks, then tree-reduce via SLM.
+#ifndef Q4_0_NWARPS
+#define Q4_0_NWARPS 4
+#endif
+
+extern "C" __global__ void gemv_q4_0_f32_f32(
+    const unsigned char* __restrict__ weight,  // [N * (K/32) * 18] bytes
+    const float*         __restrict__ input,   // [K] F32
+    float*               __restrict__ output,  // [N] F32
+    int K, int N)
+{
+    const int row  = blockIdx.x;
+    if (row >= N) return;
+    const int lane    = threadIdx.x;           // 0..31
+    const int warp_id = threadIdx.y;           // 0..(Q4_0_NWARPS-1)
+
+    const int n_blocks = K >> 5;               // K / 32
+    const unsigned char* row_ptr =
+        weight + (long long)row * n_blocks * 18;
+
+    float acc = 0.0f;
+
+    // Warp `warp_id` strides over blocks with stride Q4_0_NWARPS so the
+    // per-warp accumulators carry disjoint partial sums.
+    for (int b = warp_id; b < n_blocks; b += Q4_0_NWARPS) {
+        const unsigned char* bp = row_ptr + b * 18;
+
+        unsigned short d_bits =
+            (unsigned short)bp[0] | ((unsigned short)bp[1] << 8);
+        float d = __half2float(__ushort_as_half(d_bits));
+
+        int qs_idx = (lane < 16) ? lane : (lane - 16);
+        unsigned char q_byte = bp[2 + qs_idx];
+        int nib = (lane < 16) ? (int)(q_byte & 0xFu) : (int)(q_byte >> 4);
+        int v   = nib - 8;
+
+        float act = input[b * 32 + lane];
+        acc += (float)v * d * act;
+    }
+
+    // Intra-warp reduce.
+    #pragma unroll
+    for (int offset = GEMV_WARP / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffff, acc, offset, GEMV_WARP);
+    }
+
+    // Cross-warp reduce via SLM (Q4_0_NWARPS values; warp 0 finalizes).
+    __shared__ float partial[Q4_0_NWARPS];
+    if (lane == 0) partial[warp_id] = acc;
+    __syncthreads();
+    if (warp_id == 0 && lane == 0) {
+        float sum = 0.0f;
+        #pragma unroll
+        for (int w = 0; w < Q4_0_NWARPS; ++w) sum += partial[w];
+        output[row] = sum;
+    }
+}
