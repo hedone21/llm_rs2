@@ -54,6 +54,7 @@ mod eng_alg_200_host {
 
         fn _assert_merge_variant_exhaustive(merge: &PartitionMerge) {
             match merge {
+                PartitionMerge::Fused { .. } => {}
                 PartitionMerge::Inline { .. } => {}
                 PartitionMerge::Deferred => {}
             }

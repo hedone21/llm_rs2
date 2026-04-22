@@ -166,6 +166,19 @@ kernel void kernel_add_assign_simple(
     }
 }
 
+// See simple_ops.cl for rationale; fallback mirror kept in lock-step.
+kernel void kernel_partition_fused_merge_residual_f4(
+    global float4 * x,
+    global const float4 * gpu_partial,
+    global const float4 * cpu_partial,
+    int size4
+) {
+    int i = get_global_id(0);
+    if (i < size4) {
+        x[i] += gpu_partial[i] + cpu_partial[i];
+    }
+}
+
 // Scalar-stride copy of `size` floats from src[src_offset ..] to dst[dst_offset ..].
 // See simple_ops.cl for rationale; fallback mirror kept in lock-step.
 kernel void kernel_copy_slice_simple(

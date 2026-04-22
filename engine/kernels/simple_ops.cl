@@ -883,6 +883,24 @@ kernel void kernel_add_assign_simple(
     }
 }
 
+// Tensor-partition fused merge + residual: x += gpu_partial + cpu_partial.
+// Replaces 3 sequential kernels (copy_slice + add_assign_staging + post_ffn add_assign)
+// with a single dispatch on partition layers. `gpu_partial` = down_partial_gpu
+// output, `cpu_partial` = cpu_merge_staging ALLOC_HOST_PTR buffer written by CPU.
+// Both are full `dim`-sized vectors (their respective share of rows reproject
+// through down_proj back into dim dimensions). gws: [dim/4, 1, 1].
+kernel void kernel_partition_fused_merge_residual_f4(
+    global float4 * x,
+    global const float4 * gpu_partial,
+    global const float4 * cpu_partial,
+    int size4
+) {
+    int i = get_global_id(0);
+    if (i < size4) {
+        x[i] += gpu_partial[i] + cpu_partial[i];
+    }
+}
+
 // Scalar-stride copy of `size` floats from src[src_offset ..] to dst[dst_offset ..].
 // Used by the tensor-partition plan merge step (arch A.7.1) — the runtime `copy_slice`
 // backend method bypasses the kernel plan (it uses clEnqueueCopyBuffer), so the plan
