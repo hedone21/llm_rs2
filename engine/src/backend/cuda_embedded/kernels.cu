@@ -1165,6 +1165,146 @@ extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1) void mul_mat_vec_q4
 }
 
 // =================================================================
+// Row×Token MMQ-style tiled Q4_0 × Q8_1 kernel.
+//
+// Each block processes a tile of (ROW_TILE output rows) × (M_TILE tokens),
+// so both the weight-row load (shared across M_TILE tokens) and the
+// Q8_1 activation load (shared across ROW_TILE rows) are amortised
+// over register-held accumulators. The previous "1 row × M_TILE tokens"
+// shape topped out at ~32 tok/s for Llama 3.1 8B prefill on Xavier;
+// adding row tiling cuts activation BW ~ROW_TILE× and is the main
+// lever that closes the gap toward llama.cpp's MMQ throughput.
+//
+// Grid: (ceil(N / ROW_TILE), ceil(M_total / M_TILE), 1)
+// Block: (32, MMVQ_NWARPS, 1) = 128 threads
+// Per thread: ROW_TILE * M_TILE f32 accumulators + 4-way dp4a scratch
+// =================================================================
+// Empirically swept on Jetson AGX Xavier (sm_72, Llama 3.1 8B Q4_0, pp81):
+//   (R=1,M=8)=32.4   (R=2,M=2)=25.6   (R=2,M=4)=37.2*   (R=2,M=8)=27.7
+//   (R=4,M=2)=spill  (R=4,M=8)=spill  (R=1,M=16)=spill
+// R=2,M=4 keeps 8 accumulators/thread (within Xavier's 64-reg/thread budget
+// for 128-thread blocks) while amortising weight BW ~4× and activation BW
+// ~2×. Going further (R=4 or M=8) spills registers → local memory traffic.
+#define ROW_TILE 2
+#define M_TILE   4
+
+extern "C" __global__ __launch_bounds__(MMVQ_NWARPS * 32, 1)
+void mul_mat_q4_0_q8_1_mtile(
+    const unsigned char* __restrict__ weight,        // Q4_0 weight [N * (K/32)*18]
+    const unsigned char* __restrict__ activation_q,  // Q8_1 [M_total * (K/32)*36]
+    float*               __restrict__ output,        // F32 [M_total * N]
+    int K, int N, int M_total)
+{
+    const int row_base = blockIdx.x * ROW_TILE;
+    const int tok_base = blockIdx.y * M_TILE;
+
+    const int tid = 32 * threadIdx.y + threadIdx.x;
+    const int blocks_per_row = K >> 5;
+    const int blocks_per_iter = (VDR_Q4_0_Q8_1_MMVQ * MMVQ_NWARPS * 32) / QI4_0;
+
+    const int q4_block_bytes = 18;
+    const int q8_block_bytes = 36;
+
+    const int kqs = VDR_Q4_0_Q8_1_MMVQ * (tid & 1);
+
+    // ROW_TILE * M_TILE accumulators per thread (register-held).
+    float tmp[ROW_TILE][M_TILE];
+    #pragma unroll
+    for (int r = 0; r < ROW_TILE; ++r) {
+        #pragma unroll
+        for (int m = 0; m < M_TILE; ++m) tmp[r][m] = 0.0f;
+    }
+
+    for (int kbx = tid >> 1; kbx < blocks_per_row; kbx += blocks_per_iter) {
+        // Load ROW_TILE Q4_0 blocks (one per row) once, split into dp4a ops.
+        float d4[ROW_TILE];
+        int   vlo0[ROW_TILE], vhi0[ROW_TILE], vlo1[ROW_TILE], vhi1[ROW_TILE];
+        #pragma unroll
+        for (int r = 0; r < ROW_TILE; ++r) {
+            const int row = row_base + r;
+            if (row >= N) { d4[r] = 0.0f; vlo0[r] = vhi0[r] = vlo1[r] = vhi1[r] = 0; continue; }
+            const unsigned char* w_row = weight
+                + (long long)row * blocks_per_row * q4_block_bytes;
+            const unsigned char* bq4 = w_row + kbx * q4_block_bytes;
+            unsigned short d_bits =
+                (unsigned short)bq4[0] | ((unsigned short)bq4[1] << 8);
+            d4[r] = __half2float(__ushort_as_half(d_bits));
+            const unsigned char* p = bq4 + 2 + kqs * 4;
+            int v0 = (int)p[0] | ((int)p[1] << 8) | ((int)p[2] << 16) | ((int)p[3] << 24);
+            int v1 = (int)p[4] | ((int)p[5] << 8) | ((int)p[6] << 16) | ((int)p[7] << 24);
+            vlo0[r] = (v0 >> 0) & 0x0F0F0F0F;
+            vhi0[r] = (v0 >> 4) & 0x0F0F0F0F;
+            vlo1[r] = (v1 >> 0) & 0x0F0F0F0F;
+            vhi1[r] = (v1 >> 4) & 0x0F0F0F0F;
+        }
+
+        // Per M token: load Q8_1 once, issue dp4a against every row.
+        #pragma unroll
+        for (int m = 0; m < M_TILE; ++m) {
+            const int tok = tok_base + m;
+            if (tok >= M_total) continue;
+            const unsigned char* bq8 = activation_q
+                + (long long)tok * blocks_per_row * q8_block_bytes
+                + kbx * q8_block_bytes;
+            const int* qs8 = (const int*)(bq8 + 4);
+            int u00 = qs8[kqs + 0];
+            int u01 = qs8[kqs + 1];
+            int u10 = qs8[kqs + QI4_0 + 0];
+            int u11 = qs8[kqs + QI4_0 + 1];
+            const __half2 ds8 = *(const __half2*)bq8;
+            float2 ds8f = __half22float2(ds8);
+
+            #pragma unroll
+            for (int r = 0; r < ROW_TILE; ++r) {
+                int sumi = 0;
+                sumi = __dp4a(vlo0[r], u00, sumi);
+                sumi = __dp4a(vhi0[r], u10, sumi);
+                sumi = __dp4a(vlo1[r], u01, sumi);
+                sumi = __dp4a(vhi1[r], u11, sumi);
+                tmp[r][m] += d4[r] * (sumi * ds8f.x - 4.0f * ds8f.y);
+            }
+        }
+    }
+
+    // Cross-warp reduction per (row, tok).
+    __shared__ float tmp_shared[ROW_TILE][M_TILE][MMVQ_NWARPS - 1][32];
+    #pragma unroll
+    for (int r = 0; r < ROW_TILE; ++r) {
+        #pragma unroll
+        for (int m = 0; m < M_TILE; ++m) {
+            if (threadIdx.y > 0) {
+                tmp_shared[r][m][threadIdx.y - 1][threadIdx.x] = tmp[r][m];
+            }
+        }
+    }
+    __syncthreads();
+
+    if (threadIdx.y != 0) return;
+    #pragma unroll
+    for (int r = 0; r < ROW_TILE; ++r) {
+        const int row = row_base + r;
+        if (row >= N) continue;
+        #pragma unroll
+        for (int m = 0; m < M_TILE; ++m) {
+            const int tok = tok_base + m;
+            if (tok >= M_total) continue;
+            float accum = tmp[r][m];
+            #pragma unroll
+            for (int l = 0; l < MMVQ_NWARPS - 1; ++l) {
+                accum += tmp_shared[r][m][l][threadIdx.x];
+            }
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                accum += __shfl_down_sync(0xffffffff, accum, offset, 32);
+            }
+            if (threadIdx.x == 0) {
+                output[(long long)tok * N + row] = accum;
+            }
+        }
+    }
+}
+
+// =================================================================
 // Fused FFN gate + up mmvq + SiLU gating (decode, M=1).
 //
 // Replaces the sequence

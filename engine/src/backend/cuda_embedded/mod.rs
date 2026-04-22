@@ -1529,23 +1529,36 @@ impl Backend for CudaBackend {
                         Ok(())
                     });
 
-                    let mmvq_cfg = LaunchConfig {
-                        grid_dim: (n_i32 as u32, m_u as u32, 1),
+                    // Row×Token MMQ tile: each block holds ROW_TILE weight
+                    // rows and streams M_TILE activation tokens against
+                    // them, amortising both weight BW (M_TILE×) and
+                    // activation BW (ROW_TILE×) over register-held
+                    // accumulators. Kernel tile constants must match
+                    // kernels.cu's ROW_TILE / M_TILE.
+                    const ROW_TILE: u32 = 2;
+                    const M_TILE: u32 = 4;
+                    let m_u32 = m_u as u32;
+                    let m_i32_total = m_u32 as i32;
+                    let grid_x = (n_i32 as u32).div_ceil(ROW_TILE);
+                    let grid_y = m_u32.div_ceil(M_TILE);
+                    let mmq_cfg = LaunchConfig {
+                        grid_dim: (grid_x, grid_y, 1),
                         block_dim: (GEMV_WARP, MMVQ_NWARPS, 1),
                         shared_mem_bytes: 0,
                     };
                     cuda_profile!(self, CudaOpTag::Matmul, stream, {
                         unsafe {
                             stream
-                                .launch_builder(&self.kernels.mul_mat_vec_q4_0_q8_1)
+                                .launch_builder(&self.kernels.mul_mat_q4_0_q8_1_mtile)
                                 .arg(&b_ptr)
                                 .arg(&q8_ptr)
                                 .arg(&out_ptr)
                                 .arg(&k_i32)
                                 .arg(&n_i32)
-                                .launch(mmvq_cfg)
+                                .arg(&m_i32_total)
+                                .launch(mmq_cfg)
                                 .map_err(|e| {
-                                    anyhow!("mul_mat_vec_q4_0_q8_1 (batched) launch failed: {e}")
+                                    anyhow!("mul_mat_q4_0_q8_1_mtile launch failed: {e}")
                                 })?;
                         }
                         Ok(())
