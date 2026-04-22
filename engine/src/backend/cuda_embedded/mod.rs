@@ -779,10 +779,62 @@ impl CudaBackend {
     }
 }
 
+use std::sync::atomic::AtomicU64;
+
+static FALLBACK_MATMUL: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_MATMUL_T_Q4_0: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_MATMUL_T_OTHER: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_MATMUL_SLICE: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_CAST: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_KV_SCATTER: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_GATHER: AtomicU64 = AtomicU64::new(0);
+static FALLBACK_ATTENTION_GEN: AtomicU64 = AtomicU64::new(0);
+
+fn fallback_counter(tag: &str) -> &'static AtomicU64 {
+    match tag {
+        "matmul" => &FALLBACK_MATMUL,
+        "matmul_transposed_q4_0" => &FALLBACK_MATMUL_T_Q4_0,
+        "matmul_transposed_other" => &FALLBACK_MATMUL_T_OTHER,
+        "matmul_slice" => &FALLBACK_MATMUL_SLICE,
+        "cast" => &FALLBACK_CAST,
+        "kv_scatter" => &FALLBACK_KV_SCATTER,
+        "gather" => &FALLBACK_GATHER,
+        "attention_gen" => &FALLBACK_ATTENTION_GEN,
+        _ => &FALLBACK_MATMUL, // default sink
+    }
+}
+
 /// Internal helper: get a CPU backend for fallback compute.
 /// Uses the platform-native backend (Neon on aarch64, AVX2 on x86_64).
 fn cpu_fallback() -> crate::backend::cpu::CpuBackend {
+    cpu_fallback_tagged("unknown")
+}
+
+fn cpu_fallback_tagged(tag: &'static str) -> crate::backend::cpu::CpuBackend {
+    let c = fallback_counter(tag);
+    let n = c.fetch_add(1, Ordering::Relaxed) + 1;
+    if std::env::var("LLM_RS_TRACE_FALLBACK").is_ok() && (n <= 3 || n % 500 == 0) {
+        eprintln!("[cpu_fallback] {}: count={}", tag, n);
+    }
     crate::backend::cpu::CpuBackend::new()
+}
+
+/// Dump fallback counter totals.
+pub fn dump_fallback_counters() {
+    eprintln!("[cpu_fallback] === totals ===");
+    for tag in [
+        "matmul",
+        "matmul_transposed_q4_0",
+        "matmul_transposed_other",
+        "matmul_slice",
+        "cast",
+        "kv_scatter",
+        "gather",
+        "attention_gen",
+    ] {
+        let n = fallback_counter(tag).load(Ordering::Relaxed);
+        eprintln!("[cpu_fallback] {:>28}: {}", tag, n);
+    }
 }
 
 /// Wrap a single kernel-launch block with optional per-op profiling.
@@ -924,7 +976,7 @@ impl Backend for CudaBackend {
     // --- Math ops ---
 
     fn matmul(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
-        cpu_fallback().matmul(a, b, out)
+        cpu_fallback_tagged("matmul").matmul(a, b, out)
     }
 
     fn matmul_transposed(&self, a: &Tensor, b: &Tensor, out: &mut Tensor) -> Result<()> {
@@ -939,7 +991,7 @@ impl Backend for CudaBackend {
 
         // Q4_0 weights always go through CPU fallback
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
-            return cpu_fallback().matmul_transposed(a, b, out);
+            return cpu_fallback_tagged("matmul_transposed_q4_0").matmul_transposed(a, b, out);
         }
 
         // Try to get device pointers for cuBLAS
@@ -1153,11 +1205,11 @@ impl Backend for CudaBackend {
                 Ok(())
             } else {
                 // Unsupported dtype combination -> CPU fallback
-                cpu_fallback().matmul_transposed(a, b, out)
+                cpu_fallback_tagged("matmul_transposed_other").matmul_transposed(a, b, out)
             }
         } else {
             // No device pointers available -> CPU fallback
-            cpu_fallback().matmul_transposed(a, b, out)
+            cpu_fallback_tagged("matmul_transposed_other").matmul_transposed(a, b, out)
         }
     }
 
@@ -1169,7 +1221,7 @@ impl Backend for CudaBackend {
         cols: usize,
         out: &mut Tensor,
     ) -> Result<()> {
-        cpu_fallback().matmul_slice(a, b, rows, cols, out)
+        cpu_fallback_tagged("matmul_slice").matmul_slice(a, b, rows, cols, out)
     }
 
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) -> Result<()> {
@@ -1484,7 +1536,7 @@ impl Backend for CudaBackend {
                 // never touch a live GPU write in the decode hot path
                 // — this branch is exercised at load/init, not per token.
                 self.maybe_sync_cat(SyncCat::FallbackPre)?;
-                cpu_fallback().cast(src, dst)
+                cpu_fallback_tagged("cast").cast(src, dst)
             }
         }
     }
@@ -1571,7 +1623,7 @@ impl Backend for CudaBackend {
         } else {
             // Missing device ptr: sync then CPU fallback
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback()
+            cpu_fallback_tagged("kv_scatter")
                 .kv_scatter_f32_to_f16(k_src, v_src, k_dst, v_dst, head_dim, capacity, write_pos)
         }
     }
@@ -1631,7 +1683,7 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback().kv_scatter_f32_to_f16_batch(
+            cpu_fallback_tagged("kv_scatter").kv_scatter_f32_to_f16_batch(
                 k_src,
                 v_src,
                 k_dst,
@@ -1650,7 +1702,7 @@ impl Backend for CudaBackend {
         // For other dtypes, sync and fall back to CPU.
         if src.dtype() != DType::F16 {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback().gather(src, indices, dst);
+            return cpu_fallback_tagged("gather").gather(src, indices, dst);
         }
 
         let src_ptr = Self::get_device_ptr(src.buffer().as_ref());
@@ -1688,7 +1740,7 @@ impl Backend for CudaBackend {
             Ok(())
         } else {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            cpu_fallback().gather(src, indices, dst)
+            cpu_fallback_tagged("gather").gather(src, indices, dst)
         }
     }
 
@@ -1717,7 +1769,7 @@ impl Backend for CudaBackend {
         let all_ptrs = q_ptr.is_some() && k_ptr.is_some() && v_ptr.is_some() && out_ptr.is_some();
         if !kv_dtype_ok || !all_ptrs {
             self.maybe_sync_cat(SyncCat::FallbackPre)?;
-            return cpu_fallback().attention_gen(
+            return cpu_fallback_tagged("attention_gen").attention_gen(
                 q,
                 k_cache,
                 v_cache,

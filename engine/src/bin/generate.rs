@@ -223,7 +223,7 @@ struct Args {
     ///   keep syncing; everything else is deferred.
     ///
     /// `--cuda-defer-sync` still takes precedence when enabled.
-    #[arg(long, default_value = "all")]
+    #[arg(long, default_value = "minimal")]
     cuda_sync_policy: String,
 
     /// Allocate weight tensors in device-only memory (`cuMemAlloc`) instead
@@ -4738,6 +4738,10 @@ fn main() -> anyhow::Result<()> {
     // 7. Output results
     println!("\nDone.");
     println!("[Profile] Event: End");
+    #[cfg(feature = "cuda-embedded")]
+    {
+        llm_rs2::backend::cuda_embedded::dump_fallback_counters();
+    }
     println!("TTFT: {:.2} ms", _ttft_ms);
     if !forward_ms_values.is_empty() {
         let avg_forward: f64 =
