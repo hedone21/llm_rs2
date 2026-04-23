@@ -136,7 +136,7 @@ position,score,token_type
 134,66.472885,generated
 135,65.498138,generated
 136,64.666428,generated
-137,63.882702,generated
+137,63.882698,generated
 138,63.142490,generated
 139,62.345005,generated
 140,61.595070,generated
@@ -146,7 +146,7 @@ position,score,token_type
 144,59.156601,generated
 145,58.552391,generated
 146,58.055828,generated
-147,57.580105,generated
+147,57.580097,generated
 148,57.123833,generated
 149,56.592731,generated
 150,56.089733,generated
@@ -220,7 +220,7 @@ position,score,token_type
 218,41.949471,generated
 219,41.795921,generated
 220,41.653278,generated
-221,41.580696,generated
+221,41.580704,generated
 222,41.509289,generated
 223,41.438892,generated
 224,41.292240,generated
@@ -257,7 +257,7 @@ position,score,token_type
 255,38.692661,generated
 256,38.649914,generated
 257,38.607590,generated
-258,38.565689,generated
+258,38.565693,generated
 259,38.452011,generated
 260,38.347687,generated
 261,38.307606,generated
@@ -274,7 +274,7 @@ position,score,token_type
 272,37.629002,generated
 273,37.594215,generated
 274,37.489395,generated
-275,37.393742,generated
+275,37.393749,generated
 276,37.360401,generated
 277,37.327393,generated
 278,37.294651,generated
@@ -288,7 +288,7 @@ position,score,token_type
 286,36.784775,generated
 287,36.755219,generated
 288,36.725773,generated
-289,36.628185,generated
+289,36.628189,generated
 290,36.539276,generated
 291,36.511047,generated
 292,36.483013,generated
@@ -327,7 +327,7 @@ position,score,token_type
 325,34.819817,generated
 326,34.799244,generated
 327,34.778709,generated
-328,34.758266,generated
+328,34.758270,generated
 329,34.674099,generated
 330,34.597824,generated
 331,34.577961,generated
@@ -556,7 +556,7 @@ position,score,token_type
 554,27.092533,generated
 555,27.041599,generated
 556,27.028761,generated
-557,27.015818,generated
+557,27.015820,generated
 558,27.002794,generated
 559,26.949286,generated
 560,26.898603,generated
@@ -571,7 +571,7 @@ position,score,token_type
 569,26.664093,generated
 570,26.613981,generated
 571,26.600920,generated
-572,26.587755,generated
+572,26.587757,generated
 573,26.574490,generated
 574,26.522146,generated
 575,26.472294,generated
@@ -659,7 +659,7 @@ position,score,token_type
 657,24.207861,generated
 658,24.192369,generated
 659,24.145424,generated
-660,24.099331,generated
+660,24.099335,generated
 661,24.083876,generated
 662,24.068321,generated
 663,24.052620,generated
@@ -795,7 +795,7 @@ position,score,token_type
 793,20.135160,generated
 794,20.088831,generated
 795,20.042402,generated
-796,20.015217,generated
+796,20.015219,generated
 797,19.987789,generated
 798,19.960114,generated
 799,19.913408,generated
@@ -860,7 +860,7 @@ position,score,token_type
 858,17.519569,generated
 859,17.463570,generated
 860,17.407324,generated
-861,17.364437,generated
+861,17.364439,generated
 862,17.321140,generated
 863,17.277428,generated
 864,17.220133,generated
@@ -880,7 +880,7 @@ position,score,token_type
 878,16.500937,generated
 879,16.439087,generated
 880,16.376902,generated
-881,16.326269,generated
+881,16.326271,generated
 882,16.275139,generated
 883,16.223505,generated
 884,16.159893,generated
@@ -910,7 +910,7 @@ position,score,token_type
 908,14.666539,generated
 909,14.591900,generated
 910,14.516745,generated
-911,14.450410,generated
+911,14.450411,generated
 912,14.383385,generated
 913,14.315688,generated
 914,14.238327,generated
@@ -951,7 +951,7 @@ position,score,token_type
 949,11.269592,generated
 950,11.166061,generated
 951,11.067603,generated
-952,10.968082,generated
+952,10.968083,generated
 953,10.867481,generated
 954,10.760139,generated
 955,10.651855,generated
@@ -969,7 +969,7 @@ position,score,token_type
 967,9.312183,generated
 968,9.194462,generated
 969,9.071019,generated
-970,8.946420,generated
+970,8.946421,generated
 971,8.824964,generated
 972,8.702160,generated
 973,8.577996,generated
