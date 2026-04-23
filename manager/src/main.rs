@@ -233,7 +233,15 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 EngineMessage::Capability(cap) => {
-                    log::info!("Engine capability: devices={:?}", cap.available_devices);
+                    log::info!(
+                        "Engine capability: devices={:?} available_actions={:?}",
+                        cap.available_devices,
+                        cap.available_actions
+                    );
+                    // Capability 를 policy 에 전파하여 `available_actions` 필터가
+                    // 엔진이 지원하지 않는 액션(예: F16 KV 에서 kv_quant_dynamic) 을
+                    // 선택하지 않도록 한다.
+                    policy.update_engine_state(&msg);
                 }
                 EngineMessage::QcfEstimate(qcf) => {
                     log::info!("Engine QCF estimate: {} actions", qcf.estimates.len());

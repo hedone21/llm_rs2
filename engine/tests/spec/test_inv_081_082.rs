@@ -89,6 +89,7 @@ fn test_inv_081_engine_message_all_variants_json() {
         max_kv_tokens: 2048,
         bytes_per_kv_token: 256,
         num_layers: 16,
+        ..Default::default()
     });
     let json = serde_json::to_string(&cap).unwrap();
     let back: EngineMessage = serde_json::from_str(&json).unwrap();

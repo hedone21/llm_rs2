@@ -322,6 +322,7 @@ fn test_mgr_alg_051_non_heartbeat_ignored() {
         max_kv_tokens: 2048,
         bytes_per_kv_token: 256,
         num_layers: 16,
+        ..Default::default()
     }));
     assert_eq!(p.mode(), OperatingMode::Normal);
 

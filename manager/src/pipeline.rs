@@ -1142,6 +1142,7 @@ mod hierarchical {
                 max_kv_tokens: 2048,
                 bytes_per_kv_token: 256,
                 num_layers: 16,
+                ..Default::default()
             }));
             assert!((p.engine_state.values[feature::KV_OCCUPANCY] - before).abs() < 1e-5);
 

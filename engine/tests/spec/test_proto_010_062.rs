@@ -24,6 +24,7 @@ fn sample_capability() -> EngineMessage {
         max_kv_tokens: 2048,
         bytes_per_kv_token: 256,
         num_layers: 16,
+        ..Default::default()
     })
 }
 

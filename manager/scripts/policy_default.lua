@@ -11,6 +11,10 @@
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
+--   2.3.0 (2026-04-23): available_actions 필터 추가
+--     - ctx.available (엔진 capability) 에 없는 액션은 candidate 에서 제외
+--     - F16 KV cache 에서 kv_quant_dynamic 이 선택되어 엔진이 무시하는 false-pass 회귀 방지
+--     - joint action 은 모든 component 가 available 일 때만 후보로 포함
 --   2.2.0 (2026-04-16): QCF quality penalty 통합
 --     - DPP score에 quality penalty 항 추가: score -= DPP.V_Q * r.qcf_cost
 --     - level-dependent quality floor: QCF_FLOOR[lvl] 초과 시 safe set 제외
@@ -29,7 +33,7 @@
 --   1.0.1 (2026-04-15): pressure_level 임계값 정렬
 --   1.0.0 (2026-04-15): initial production policy
 
-POLICY_META = { name = "llm_default", version = "2.2.0" }
+POLICY_META = { name = "llm_default", version = "2.3.0" }
 
 -- ── DPP 상수 (docs/46 §4) ──────────────────────────────────────────────────
 local DPP = {
@@ -98,6 +102,18 @@ local LEVEL_PARAMS = {
 -- ctx.active에 name이 포함되어 있는지 확인
 local function is_active(name, active)
     for _, a in ipairs(active) do
+        if a == name then return true end
+    end
+    return false
+end
+
+-- ctx.available 에 action 이 있는지 확인. available 리스트가 비어 있으면
+-- 엔진이 아직 capability 를 보고하지 않은 것으로 간주하고 필터링하지 않는다
+-- (backward compat). 예: F16 KV 는 kv_quant_dynamic 을 보고하지 않으므로
+-- 정책이 해당 액션을 선택하면 엔진이 "Ignoring" 로 무시한다 — 이를 방지한다.
+local function is_available(name, available)
+    if available == nil or #available == 0 then return true end
+    for _, a in ipairs(available) do
         if a == name then return true end
     end
     return false
@@ -221,17 +237,26 @@ function decide(ctx)
     local lat_floor = any_emergency and -DPP.C_EMERGENCY or -DPP.C
 
     -- 5. Candidate 목록 (single action + joint action, §4.6)
+    --    ctx.available 에 없는 액션은 엔진이 실행할 수 없으므로 제외한다.
+    local avail = ctx.available
     local candidates = {}
     for action, r in pairs(c.relief) do
         -- joint registry에 속한 single key는 제외 (joint이 이미 포함)
-        if JOINT_ACTIONS[action] == nil then
+        if JOINT_ACTIONS[action] == nil and is_available(action, avail) then
             table.insert(candidates, { name = action, relief = r })
         end
     end
-    for jkey in pairs(JOINT_ACTIONS) do
-        local jr = joint_relief(c, jkey)
-        if jr ~= nil then
-            table.insert(candidates, { name = jkey, relief = jr, is_joint = true })
+    for jkey, jspec in pairs(JOINT_ACTIONS) do
+        -- joint 은 모든 component 가 available 할 때만 후보로 포함
+        local all_avail = true
+        for _, comp in ipairs(jspec.components) do
+            if not is_available(comp, avail) then all_avail = false; break end
+        end
+        if all_avail then
+            local jr = joint_relief(c, jkey)
+            if jr ~= nil then
+                table.insert(candidates, { name = jkey, relief = jr, is_joint = true })
+            end
         end
     end
 

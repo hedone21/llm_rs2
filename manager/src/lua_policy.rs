@@ -505,6 +505,10 @@ pub struct LuaPolicy {
     lua: Lua,
     /// Latest engine heartbeat (None until first heartbeat received).
     engine_state: Option<EngineStatus>,
+    /// 엔진이 Capability 로 보고한 `available_actions` 목록.
+    /// Heartbeat 보다 먼저 도착하므로 (그리고 이후 heartbeat 에는 포함되지 않음)
+    /// 별도 필드로 보관하여 decide() 의 available 필터에 사용한다.
+    engine_available_actions: Vec<String>,
     // ── 신규 필드 ──
     signal_state: SignalState,
     trigger_engine: TriggerEngine,
@@ -518,6 +522,11 @@ pub struct LuaPolicy {
     qcf_cache: HashMap<String, (f32, LogicalInstant)>,
     /// RequestQcf 발행 시각. None이면 pending 없음.
     qcf_pending_at: Option<LogicalInstant>,
+    /// RequestQcf 를 유발한 signal. `complete_qcf_selection` 에서 재사용하여
+    /// 2-step handshake (QCF 응답 수신 직후 decide() 실행) 를 성사시킨다.
+    /// 이 필드가 없으면 QcfEstimate 수신 후 cache만 갱신되고 후속 directive 가
+    /// 발행되지 않아 signal 경로가 seq=1 에서 멈춘다.
+    qcf_pending_signal: Option<SystemSignal>,
     /// QCF quality penalty weight (V_Q). config에서 주입.
     qcf_penalty_weight: f32,
     /// QCF cache TTL (초). 초과 시 stale로 판단해 재요청.
@@ -684,6 +693,7 @@ impl LuaPolicy {
         Ok(Self {
             lua,
             engine_state: None,
+            engine_available_actions: Vec::new(),
             signal_state: SignalState::default(),
             trigger_engine,
             relief_table,
@@ -692,6 +702,7 @@ impl LuaPolicy {
             linucb_alpha: config.linucb_alpha,
             qcf_cache: HashMap::new(),
             qcf_pending_at: None,
+            qcf_pending_signal: None,
             qcf_penalty_weight: config.qcf_penalty_weight,
             qcf_stale_secs: config.qcf_stale_secs,
             observations: VecDeque::new(),
@@ -879,6 +890,27 @@ impl LuaPolicy {
             }
         }
         ctx.set("active", active_tbl)?;
+
+        // ctx.available -- 엔진이 실행 가능하다고 보고한 action 이름 목록.
+        // 비어있으면 "엔진이 아직 capability 를 보고하지 않음" 으로 해석 —
+        // 이 경우 Lua 측은 필터링하지 않는다 (backward compat).
+        // Capability 메시지가 heartbeat 보다 먼저 도착하므로 engine_state 가 None
+        // 이어도 engine_available_actions 에서 가져온다.
+        // 엔진이 F16 KV 를 사용하면 kv_quant_dynamic 이 제외되는 등, cache dtype /
+        // eviction_policy 에 따라 동적으로 결정된다
+        // (engine/src/resilience/executor.rs `compute_available_actions`).
+        let avail_tbl = lua.create_table()?;
+        let avail_source: &[String] = if let Some(ref status) = self.engine_state
+            && !status.available_actions.is_empty()
+        {
+            &status.available_actions
+        } else {
+            &self.engine_available_actions
+        };
+        for (i, action) in avail_source.iter().enumerate() {
+            avail_tbl.set(i + 1, action.as_str())?;
+        }
+        ctx.set("available", avail_tbl)?;
 
         // ctx.signal (신규)
         let signal_tbl = lua.create_table()?;
@@ -1216,6 +1248,48 @@ impl LuaPolicy {
             }
         }
     }
+
+    /// `signal` 에 대해 Lua `decide(ctx)` 를 실행하고, 반환된 커맨드로
+    /// `EngineDirective` 를 조립한다. Observation 큐잉과 fallback 처리도 동일하게
+    /// 수행한다. `process_signal` 본문과 `complete_qcf_selection` 이 공유한다.
+    fn decide_and_build_directive(&mut self, signal: &SystemSignal) -> Option<EngineDirective> {
+        // feature_state를 현재 시점으로 갱신 (LinUCB용)
+        self.feature_state = self.build_feature_vec();
+        let (commands, was_fallback) = self.call_decide(signal);
+        if commands.is_empty() {
+            return None;
+        }
+        // fallback 경로의 커맨드는 relief 학습 대상이 아니므로 observation 큐잉 생략.
+        if !was_fallback {
+            if commands.len() == 1 {
+                let action_name = engine_command_to_action_name(&commands[0]);
+                let pressure = self.signal_state.pressure_with_thermal(
+                    self.adaptation_config.temp_safe_c,
+                    self.adaptation_config.temp_critical_c,
+                    self.trigger_engine.tbt_degradation_ratio(),
+                );
+                if self.observations.len() >= MAX_PENDING_OBSERVATIONS {
+                    let _ = self.observations.pop_front();
+                    self.observation_overrun_count += 1;
+                }
+                self.observations.push_back(ObservationContext {
+                    action: action_name,
+                    before: pressure,
+                    timestamp: self.clock.now(),
+                    feature_vec: self.feature_state,
+                });
+            } else if !self.observations.is_empty() {
+                // Multi-command directive: 어느 command가 relief를 유발했는지
+                // 귀속 불가 → 이전 observation 을 모두 overrun 으로 비운다.
+                self.observation_overrun_count += self.observations.len() as u64;
+                self.observations.clear();
+            }
+        }
+        Some(EngineDirective {
+            seq_id: next_seq_id(),
+            commands,
+        })
+    }
 }
 
 impl PolicyStrategy for LuaPolicy {
@@ -1312,56 +1386,17 @@ impl PolicyStrategy for LuaPolicy {
         // 5. QCF 요청: 압박 있고 cache stale이면 RequestQcf 선발행
         if self.should_request_qcf() {
             self.qcf_pending_at = Some(self.clock.now());
+            // 현재 signal 을 저장해 두어야 QcfEstimate 도착 시점에
+            // decide() 를 동일한 signal 로 재실행할 수 있다 (2-step handshake).
+            self.qcf_pending_signal = Some(signal.clone());
             return Some(EngineDirective {
                 seq_id: next_seq_id(),
                 commands: vec![EngineCommand::RequestQcf],
             });
         }
 
-        // 6. Lua decide(ctx) 호출 (fallback 시 was_fallback=true)
-        // feature_state를 현재 시점으로 갱신 (LinUCB용)
-        self.feature_state = self.build_feature_vec();
-        let (commands, was_fallback) = self.call_decide(signal);
-        let directive = if commands.is_empty() {
-            None
-        } else {
-            // fallback 경로의 커맨드는 relief 학습 대상이 아니므로 observation을 큐잉하지 않는다.
-            if !was_fallback {
-                // Observation 큐잉 (단일 액션만). Multi-command directive는 어느
-                // command가 이후 pressure 변화를 일으켰는지 귀속 불가하므로 큐를
-                // 비운다. 큐 용량 초과 시 가장 오래된 observation을 드롭하고
-                // overrun을 기록한다.
-                if commands.len() == 1 {
-                    let action_name = engine_command_to_action_name(&commands[0]);
-                    let pressure = self.signal_state.pressure_with_thermal(
-                        self.adaptation_config.temp_safe_c,
-                        self.adaptation_config.temp_critical_c,
-                        self.trigger_engine.tbt_degradation_ratio(),
-                    );
-                    if self.observations.len() >= MAX_PENDING_OBSERVATIONS {
-                        let _ = self.observations.pop_front();
-                        self.observation_overrun_count += 1;
-                    }
-                    self.observations.push_back(ObservationContext {
-                        action: action_name,
-                        before: pressure,
-                        timestamp: self.clock.now(),
-                        feature_vec: self.feature_state,
-                    });
-                } else {
-                    // Multi-command: 귀속 불가. 쌓여있던 관측들을 overrun으로 처리.
-                    if !self.observations.is_empty() {
-                        self.observation_overrun_count += self.observations.len() as u64;
-                        self.observations.clear();
-                    }
-                }
-            }
-
-            Some(EngineDirective {
-                seq_id: next_seq_id(),
-                commands,
-            })
-        };
+        // 6. Lua decide(ctx) 호출 및 directive 조립
+        let directive = self.decide_and_build_directive(signal);
 
         // 7. Relief table 자동 저장 (인터벌 초과 시)
         self.maybe_persist();
@@ -1374,8 +1409,28 @@ impl PolicyStrategy for LuaPolicy {
     }
 
     fn update_engine_state(&mut self, msg: &EngineMessage) {
-        if let EngineMessage::Heartbeat(status) = msg {
-            self.engine_state = Some(status.clone());
+        match msg {
+            EngineMessage::Heartbeat(status) => {
+                // 엔진 heartbeat 의 available_actions 는 빈 리스트 — Capability 로 보고된
+                // 값이 `engine_available_actions` 에 이미 저장되어 있으므로 그걸 보존한다.
+                let mut merged = status.clone();
+                if merged.available_actions.is_empty()
+                    && !self.engine_available_actions.is_empty()
+                {
+                    merged.available_actions = self.engine_available_actions.clone();
+                }
+                self.engine_state = Some(merged);
+            }
+            EngineMessage::Capability(cap) => {
+                // 엔진이 capability 보고 — 이후 모든 decide() 에서 available 필터로 사용.
+                // Capability 는 heartbeat 이전에 한 번 오므로, engine_state 가 None 인
+                // 시점에도 ctx.available 을 채우기 위해 별도 필드에 저장한다.
+                self.engine_available_actions = cap.available_actions.clone();
+                if let Some(ref mut status) = self.engine_state {
+                    status.available_actions = cap.available_actions.clone();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1417,6 +1472,9 @@ impl PolicyStrategy for LuaPolicy {
     fn complete_qcf_selection(&mut self, qcf: &QcfEstimate) -> Option<EngineDirective> {
         // pending이 없으면 무시 (중복 응답 방어)
         self.qcf_pending_at.take()?;
+        // RequestQcf 를 유발한 signal 도 함께 해제한다. 다음 signal 이 오면
+        // 새로 세팅되므로 중복 사용 위험은 없다.
+        let pending_signal = self.qcf_pending_signal.take();
         // cache 갱신
         let now = self.clock.now();
         for (name, &cost) in &qcf.estimates {
@@ -1426,7 +1484,11 @@ impl PolicyStrategy for LuaPolicy {
             "LuaPolicy QCF cache updated: {} actions",
             self.qcf_cache.len()
         );
-        None // 다음 process_signal() 호출에서 DPP score에 반영
+        // 2-step handshake 완료: 갱신된 QCF 값을 반영해 즉시 decide() 를 실행하여
+        // seq=2 directive 를 발행한다. signal 이 기록되지 않은 경우(예: 외부에서
+        // QcfEstimate 가 선행 도착) 는 None 반환 — 다음 process_signal() 이 스코어링.
+        let signal = pending_signal?;
+        self.decide_and_build_directive(&signal)
     }
 
     fn check_qcf_timeout(&mut self) -> Option<EngineDirective> {
@@ -3188,7 +3250,7 @@ mod tests {
     #[test]
     fn complete_qcf_selection_populates_cache() {
         let mut policy = make_policy_with_system_clock();
-        // pending 없으면 None 즉시 반환
+        // pending 없으면 cache 갱신도 없이 None 즉시 반환
         let qcf = QcfEstimate {
             estimates: [("kv_evict_sliding".to_string(), 0.3f32)]
                 .into_iter()
@@ -3201,10 +3263,14 @@ mod tests {
             "pending 없으면 cache 갱신하지 않아야 한다"
         );
 
-        // pending 설정 후 complete_qcf_selection 호출
+        // pending_at 만 설정하고 pending_signal 없는 legacy 경로 — cache 는 갱신되지만
+        // decide() 는 실행되지 않아 None 반환.
         policy.qcf_pending_at = Some(policy.clock.now());
         let result2 = policy.complete_qcf_selection(&qcf);
-        assert!(result2.is_none(), "complete 후에는 None을 반환해야 한다");
+        assert!(
+            result2.is_none(),
+            "pending_signal 없으면 cache만 갱신되고 None을 반환해야 한다"
+        );
         assert!(
             policy.qcf_pending_at.is_none(),
             "pending_at이 소비되어야 한다"
@@ -3212,6 +3278,77 @@ mod tests {
         assert_eq!(policy.qcf_cache.len(), 1);
         let (cost, _) = policy.qcf_cache["kv_evict_sliding"];
         assert!((cost - 0.3).abs() < f32::EPSILON);
+    }
+
+    /// 2-step handshake 회귀 테스트: `process_signal` 이 Critical 에서 RequestQcf 를
+    /// 내고 `pending_signal` 을 기록한다. 이어서 `complete_qcf_selection` 이 도착하면
+    /// 저장된 signal 로 decide() 를 재실행하여 seq=2 EngineDirective (비어있지 않은
+    /// commands) 를 반환해야 한다. 이 경로가 깨져 있으면 signal 경로가 seq=1 에서 멈춘다.
+    #[test]
+    fn complete_qcf_selection_emits_directive_after_2step_handshake() {
+        use crate::pipeline::PolicyStrategy;
+
+        let script = r#"
+            POLICY_META = { name = "test_2step", version = "1.0" }
+            function decide(ctx)
+                if ctx.coef.trigger.mem_low then
+                    return {{ type = "kv_evict_sliding", keep_ratio = 0.5 }}
+                end
+                return {}
+            end
+        "#;
+        let script_file = create_temp_script(script);
+        let mut policy = LuaPolicy::new(
+            script_file.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+            Arc::new(crate::clock::SystemClock::new()),
+        )
+        .expect("policy load");
+
+        // (1) Critical MemoryPressure 주입 → RequestQcf directive 발행 + pending_signal 기록
+        let signal = SystemSignal::MemoryPressure {
+            level: llm_shared::Level::Critical,
+            available_bytes: 30_000_000,
+            total_bytes: 8_000_000_000,
+            reclaim_target_bytes: 100_000_000,
+        };
+        let d1 = policy.process_signal(&signal).expect("seq=1 directive");
+        assert_eq!(
+            d1.commands.len(),
+            1,
+            "첫 directive 는 RequestQcf 1건이어야 한다"
+        );
+        assert!(
+            matches!(d1.commands[0], EngineCommand::RequestQcf),
+            "첫 command 는 RequestQcf 여야 한다, got {:?}",
+            d1.commands[0]
+        );
+        assert!(
+            policy.qcf_pending_signal.is_some(),
+            "pending_signal 이 기록되어야 한다"
+        );
+
+        // (2) 엔진이 QcfEstimate 를 반환 → complete_qcf_selection 이 seq=2 directive 발행
+        let qcf = QcfEstimate {
+            estimates: [("kv_evict_sliding".to_string(), 0.25f32)]
+                .into_iter()
+                .collect(),
+        };
+        let d2 = policy
+            .complete_qcf_selection(&qcf)
+            .expect("2-step handshake 에서 seq=2 directive 발행 필요");
+        assert!(
+            !d2.commands.is_empty(),
+            "decide() 가 비지 않은 commands 를 반환해야 한다"
+        );
+        assert!(
+            matches!(d2.commands[0], EngineCommand::KvEvictSliding { .. }),
+            "Lua policy 가 kv_evict_sliding 을 선택해야 한다, got {:?}",
+            d2.commands[0]
+        );
+        // pending 상태가 완전 해제되어야 한다.
+        assert!(policy.qcf_pending_at.is_none());
+        assert!(policy.qcf_pending_signal.is_none());
     }
 
     /// 결정론적 시간 제어를 위한 테스트 전용 Clock.

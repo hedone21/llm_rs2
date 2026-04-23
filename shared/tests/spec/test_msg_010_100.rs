@@ -68,6 +68,7 @@ fn test_msg_011_engine_message_serde_variants() {
         max_kv_tokens: 1024,
         bytes_per_kv_token: 128,
         num_layers: 8,
+        ..Default::default()
     });
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"type\":\"capability\""));
@@ -259,6 +260,7 @@ fn test_msg_050_engine_capability_serde() {
         max_kv_tokens: 2048,
         bytes_per_kv_token: 256,
         num_layers: 16,
+        ..Default::default()
     };
     let json = serde_json::to_string(&cap).unwrap();
     let back: EngineCapability = serde_json::from_str(&json).unwrap();

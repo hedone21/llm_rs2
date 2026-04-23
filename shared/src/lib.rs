@@ -271,13 +271,20 @@ pub enum ManagerMessage {
 }
 
 /// Engine capability report (sent once after connection).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EngineCapability {
     pub available_devices: Vec<String>,
     pub active_device: String,
     pub max_kv_tokens: usize,
     pub bytes_per_kv_token: usize,
     pub num_layers: usize,
+    /// Actions the Engine can currently execute given its configuration
+    /// (eviction policy, KV dtype, etc.). Older engines may omit this field —
+    /// in that case `default = Vec::new()` signals "capability report does not
+    /// include action list" and the policy should avoid filtering by it.
+    /// Heartbeat 에도 동일한 필드가 있으며, 둘 중 먼저 도달하는 쪽이 기준이 된다.
+    #[serde(default)]
+    pub available_actions: Vec<String>,
 }
 
 /// Engine status heartbeat.
@@ -737,6 +744,7 @@ mod tests {
             max_kv_tokens: 2048,
             bytes_per_kv_token: 256,
             num_layers: 16,
+            ..Default::default()
         };
         let json = serde_json::to_string(&cap).unwrap();
         let back: EngineCapability = serde_json::from_str(&json).unwrap();
@@ -875,6 +883,7 @@ mod tests {
             max_kv_tokens: 1024,
             bytes_per_kv_token: 128,
             num_layers: 8,
+            ..Default::default()
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"capability\""));

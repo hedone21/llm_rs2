@@ -29,6 +29,7 @@ fn test_seq_022_send_capability() {
         max_kv_tokens: 2048,
         bytes_per_kv_token: 256,
         num_layers: 16,
+        ..Default::default()
     });
 
     // resp_rx에서 EngineMessage::Capability 수신 확인
