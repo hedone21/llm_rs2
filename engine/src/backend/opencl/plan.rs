@@ -15,9 +15,8 @@ use std::sync::Arc;
 use crate::core::backend::Backend;
 use crate::core::tensor::Tensor;
 use crate::layers::tensor_partition::{
-    PartitionContext, PartitionPath, partition_fused_merge_enabled, partition_plan_debug_enabled,
-    partition_plan_enabled, partition_replicate_norm_enabled, partition_trace_enabled,
-    record_partition_timing,
+    PartitionContext, PartitionPath, partition_plan_debug_enabled, partition_plan_enabled,
+    partition_replicate_norm_enabled, partition_trace_enabled, record_partition_timing,
 };
 use crate::layers::workspace::PartitionWsCell;
 
@@ -3124,7 +3123,14 @@ pub fn build_partitioned_layer_plan(
     )?;
 
     // ── Merge sub-steps ──
-    let merge_mode_deferred = partition_fused_merge_enabled() && !is_last_layer;
+    // Plan path has no `fused_norm_merge` kernel wiring yet (see
+    // `PartitionMerge::Deferred` comment above). Honouring
+    // `LLMRS_PARTITION_FUSED_MERGE=1` here silently drops the merge altogether
+    // — fast but produces garbage logits. Hard-force deferred off for the plan
+    // path; `forward_gen` still consumes the env flag and uses the real fused
+    // kernel. Flip this back to `partition_fused_merge_enabled() && !is_last_layer`
+    // only after wiring `fused_norm_merge` into the plan executor (Phase 2-B).
+    let merge_mode_deferred = false;
 
     // (a) copy_slice(down_partial_gpu → ws.down), first `dim` floats.
     let copy_gpu_to_down = {
