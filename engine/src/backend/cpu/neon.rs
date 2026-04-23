@@ -3722,22 +3722,6 @@ struct F16GemvCtx {
     rows_per_chunk: usize,
 }
 
-// --- SpinPool work context for Q4_0 GEMV ---
-
-#[repr(C)]
-struct Q4GemvCtx {
-    a_q8_ptr: *const BlockQ8_0, // Pre-quantized activation in Q8_0
-    b_base: *const BlockQ4_0,   // Weight matrix [N, K/32] in Q4_0
-    out_ptr: *mut f32,          // Output [N]
-    k: usize,
-    n: usize,
-    nb_k: usize, // K / QK4_0 = number of Q4_0 blocks per row
-    rows_per_chunk: usize,
-}
-
-unsafe impl Send for Q4GemvCtx {}
-unsafe impl Sync for Q4GemvCtx {}
-
 // --- N-major GEMM context (prefill, M > 1) ---
 
 /// Context for N-major GEMM dispatch.
@@ -4009,81 +3993,6 @@ pub unsafe fn fused_matmul_q4_0(
             }
         }
     });
-}
-
-/// Work function for SpinPool: Q4_0 GEMV with batched dot product.
-/// Uses i8mm (smmla, 2-row) when available, falls back to sdot (4-row).
-///
-/// # Safety
-/// Called by SpinPool workers with valid Q4GemvCtx pointer.
-unsafe fn q4_gemv_chunk(ctx_ptr: *const u8, chunk_id: usize) {
-    let ctx = &*(ctx_ptr as *const Q4GemvCtx);
-    let j_start = chunk_id * ctx.rows_per_chunk;
-    let j_end = (j_start + ctx.rows_per_chunk).min(ctx.n);
-
-    let backend = CpuBackendNeon::new();
-
-    #[cfg(target_arch = "aarch64")]
-    let use_i8mm = std::arch::is_aarch64_feature_detected!("i8mm");
-    #[cfg(not(target_arch = "aarch64"))]
-    let use_i8mm = false;
-
-    if use_i8mm {
-        // i8mm path: 2-row batches using smmla instruction
-        let mut j = j_start;
-        while j + 1 < j_end {
-            let mut s0 = 0.0f32;
-            let mut s1 = 0.0f32;
-            backend.vec_dot_q4_0_q8_0_i8mm(
-                ctx.k,
-                &mut s0,
-                &mut s1,
-                ctx.b_base.add(j * ctx.nb_k),
-                ctx.b_base.add((j + 1) * ctx.nb_k),
-                ctx.a_q8_ptr,
-            );
-            *ctx.out_ptr.add(j) = s0;
-            *ctx.out_ptr.add(j + 1) = s1;
-            j += 2;
-        }
-        if j < j_end {
-            let mut sum = 0.0f32;
-            backend.vec_dot_q4_0_q8_0_sdot(
-                ctx.k,
-                &mut sum,
-                ctx.b_base.add(j * ctx.nb_k),
-                ctx.a_q8_ptr,
-            );
-            *ctx.out_ptr.add(j) = sum;
-        }
-    } else {
-        // sdot path: 4-row batches
-        const NR: usize = 4;
-        let mut j = j_start;
-        while j + NR <= j_end {
-            let vx = [
-                ctx.b_base.add(j * ctx.nb_k),
-                ctx.b_base.add((j + 1) * ctx.nb_k),
-                ctx.b_base.add((j + 2) * ctx.nb_k),
-                ctx.b_base.add((j + 3) * ctx.nb_k),
-            ];
-            let mut results = [0.0f32; NR];
-            backend.vec_dot_q4_0_q8_0_sdot_4rows(ctx.k, vx, ctx.a_q8_ptr, &mut results);
-            std::ptr::copy_nonoverlapping(results.as_ptr(), ctx.out_ptr.add(j), NR);
-            j += NR;
-        }
-        while j < j_end {
-            let mut sum = 0.0f32;
-            backend.vec_dot_q4_0_q8_0_sdot(
-                ctx.k,
-                &mut sum,
-                ctx.b_base.add(j * ctx.nb_k),
-                ctx.a_q8_ptr,
-            );
-            *ctx.out_ptr.add(j) = sum;
-            j += 1;
-        }
-    }
 }
 
 /// Work function for SpinPool: processes a coarse chunk of output rows.
