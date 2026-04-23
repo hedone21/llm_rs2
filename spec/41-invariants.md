@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) = 총 100개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) = 총 101개.
 
 ## 1. Purpose and Scope
 
@@ -218,6 +218,14 @@
 | INV-117 | 22-manager-algorithms MGR-DPP-010 | QCF cache miss인 action의 qcf_cost는 0으로 처리한다 (score에서 penalty 없음). should_request_qcf()가 자동 선발행을 수행한다. | Correctness | test | cache miss fallback |
 | INV-118 | 22-manager-algorithms MGR-DPP-020 | Emergency level에서 quality floor은 비활성(∞)이다. lossy action이 항상 safe set에 포함될 수 있어야 한다. | Safety | test | Emergency escape hatch |
 | INV-119 | 22-manager-algorithms MGR-DPP-020 | pressure level이 높아질수록 quality floor이 완화된다 (0.30 → 0.60 → 0.90 → ∞). 압박이 심할수록 더 많은 품질 훼손을 허용한다. | Correctness | test | monotonic floor relaxation |
+
+### 3.12 Plan × Tensor Partition Invariants [INV-120]
+
+2026-04 Plan × Tensor Partition 통합 (ENG-ALG-200)의 불변식. 대응 명세: `arch/plan_partition_integration.md` A.6.2, A.11 R-PP2.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-120 | arch/plan_partition_integration.md A.6.2 | FullKernelPlan이 PartitionStep을 포함할 때, 각 PartitionStep::run 진입 시 PartitionPlanContext.ratio_generation_at_build와 PartitionContext.ratio_generation을 비교한다. mismatch면 PlanInvalidated를 반환하며 caller는 plan을 재빌드하거나 forward_gen으로 fallback해야 한다. | Safety/Correctness | runtime | AtomicU64 generation 비교 |
 
 ## 4. Alternative Behavior
 

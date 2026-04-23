@@ -112,6 +112,12 @@
 | INV-091 | `self_cpu_pct`, `self_gpu_pct` ∈ [0.0, 1.0] (Engine 측 clamp). | Correctness | 🆕 미구현 | `engine/tests/spec/test_msg_060_self_util.rs`, `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
 | INV-092 | 측정 실패 시 self_cpu_pct/self_gpu_pct = 0.0 fallback, Heartbeat 송출 차단 금지. | Correctness | 🆕 미구현 | `engine/tests/spec/test_msg_060_self_util.rs` |
 
+## Plan × Tensor Partition (INV-120, 2026-04)
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-120 | PartitionStep::run 진입 시 ratio_generation mismatch 시 PlanInvalidated 반환. caller는 재빌드 또는 forward_gen fallback. | Safety/Correctness | 🆕 미구현 | `tests/spec/inv_120_plan_partition_stale.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -221,6 +227,7 @@
 | ENG-ALG-012 | (A) | D2O Compensation | ✅ | `engine/tests/spec/test_eng_alg_010_012.rs` |
 | ENG-ALG-020 | (A) | KIVI 양자화 | ✅ | `engine/tests/spec/test_eng_alg_020_022.rs` |
 | ENG-ALG-051 | (B) | Unified QCF (attention output perturbation 통합 메트릭) | ⬜ | 미구현 |
+| ENG-ALG-200 | (A) | GPU Plan × Tensor Partition 협업 (PartitionStep, FfnVariant::Partitioned) | 🆕 미구현 | `tests/spec/eng_alg_200_plan_partition.rs` |
 
 ## Engine Data
 

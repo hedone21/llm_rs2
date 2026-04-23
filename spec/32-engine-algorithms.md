@@ -1006,6 +1006,33 @@ function per_token_checkpoint(executor, caches, model_state):
 - 같은 `poll()`에서 여러 Directive가 도착하면 마지막 evict가 승리 (superseding, ENG-ST-040 참조)
 - Heartbeat는 `poll()` 내부에서 interval 기반 자동 전송
 
+### 3.11 GPU Plan × Tensor Partition 협업
+
+#### 3.11.1 LayerKernelPlan에 PartitionStep 통합 [ENG-ALG-200]
+
+**[ENG-ALG-200]** Tensor partition이 활성일 때 GPU 단계는 plan으로 dispatch overhead를 회피하고, CPU FFN slice는 기존 PartitionWorkspace 위에서 동기 직렬 실행한다. *(MUST)*
+
+**목적**: tensor partition이 활성일 때 GPU 단계는 plan으로 dispatch overhead를 회피하고, CPU FFN slice는 기존 PartitionWorkspace 위에서 동기 직렬 실행한다.
+
+**알고리즘 (per layer)**:
+1. (선행) 이전 layer의 GPU 단계 완료 보장 (in-order queue).
+2. residual을 CPU에 가시화 (synchronize + read_buffer 또는 zcopy).
+3. GPU FFN slice 4 KernelStep 연속 enqueue + flush.
+4. CPU FFN slice (matmul gate, matmul up, silu/gelu_mul, matmul down).
+5. PartitionMerge::Inline이면 copy_slice/add_assign 3 step 실행.
+   PartitionMerge::Deferred이면 cpu_merge_staging에 upload만, merge는 다음 layer의
+   fused_norm_merge에 위임.
+
+**불변식**:
+- INV-120 — PartitionStep::run 진입 시 ratio_generation 검사. mismatch 시 PlanInvalidated 반환.
+- INV-082 (Buffer alive guarantee) — KernelStep.retained_bufs로 lifetime 유지.
+
+**연관 ENG-ALG**:
+- ENG-ALG-095 (resilience checkpoint) — SetPartitionRatio 처리 시 plan 재빌드 트리거.
+
+**연관 arch**: `arch/plan_partition_integration.md` (전체).
+**구현 우선순위**: P1 (decode TBT 회수 -10~-15 ms/tok 목표).
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.

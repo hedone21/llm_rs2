@@ -218,6 +218,14 @@ D-Bus system bus --> DbusTransport --> signal_to_manager_message() --> ManagerMe
 | StepHook trait | KVCacheOps 구현체별 평가 로직 추상화 (EvictionHook, KiviHook) |
 | CLI | `--eval-ll`, `--eval-batch`, `--eval-continuation` |
 
+#### Cross-subsystem Engine Components
+
+서브시스템 경계를 횡단하는 핵심 컴포넌트 (ENG-ALG/INV 추적용):
+
+| 컴포넌트 | 핵심 타입/함수 | ENG-ALG | INV |
+|----------|---------------|---------|-----|
+| GPU Plan Partition (`backend/opencl/plan.rs`) | PartitionStep, FfnVariant, build_partitioned_ffn | ENG-ALG-200 | INV-082, INV-120 |
+
 ### 3.3 Transport Trait and Implementations [ENG-020 ~ ENG-024]
 
 **[ENG-020]** Transport trait은 Manager-Engine 간 양방향 바이트 스트림을 추상화한다. *(MUST)*
