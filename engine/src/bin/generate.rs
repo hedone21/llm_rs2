@@ -517,6 +517,21 @@ struct Args {
     /// Maximum iterations for prompt-batch loop (0 = unlimited).
     #[arg(long, default_value_t = 0)]
     max_iterations: usize,
+
+    /// Start an interactive multi-turn chat REPL (Llama 3.2 Instruct / Qwen2).
+    /// Uses standard (non-KIVI, non-offload) forward path.
+    #[arg(long, default_value_t = false)]
+    chat: bool,
+
+    /// Optional system prompt injected as the first turn when --chat is set.
+    #[arg(long)]
+    system_prompt: Option<String>,
+
+    /// Optional Unix domain socket path. When set, chat mode also accepts
+    /// newline-delimited user messages from this socket in addition to stdin,
+    /// and streams assistant replies back (terminated by 0x04).
+    #[arg(long)]
+    chat_socket: Option<String>,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -582,6 +597,31 @@ fn main() -> anyhow::Result<()> {
     // --greedy overrides temperature to 0
     if args.greedy {
         args.temperature = 0.0;
+    }
+
+    // --chat conflict validation (v1 supports only the standard forward path).
+    if args.chat {
+        let conflicts: &[(&str, bool)] = &[
+            ("--kivi", args.kivi),
+            (
+                "--kv-offload",
+                !args.kv_offload.is_empty() && args.kv_offload != "none",
+            ),
+            ("--eval-ll", args.eval_ll),
+            ("--ppl", args.ppl.is_some()),
+            ("--prompt-batch", args.prompt_batch.is_some()),
+            ("--eval-batch", args.eval_batch.is_some()),
+            ("--tensor-partition", args.tensor_partition > 0.0),
+            ("--cuda-graph", args.cuda_graph),
+            ("--dump-importance", args.dump_importance),
+            ("--experiment-schedule", args.experiment_schedule.is_some()),
+        ];
+        if let Some((flag, _)) = conflicts.iter().find(|(_, enabled)| *enabled) {
+            anyhow::bail!(
+                "--chat is incompatible with {} (v1 supports only the standard forward path)",
+                flag
+            );
+        }
     }
 
     // --profile and --profile-events are mutually exclusive.
@@ -1109,6 +1149,26 @@ fn main() -> anyhow::Result<()> {
                 memory.clone(),
             )
             .with_layout(kv_layout),
+        );
+    }
+
+    // ── Chat REPL mode (standard forward path only) ──
+    if args.chat {
+        let sampling_config = SamplingConfig {
+            temperature: args.temperature,
+            top_p: args.top_p,
+            top_k: args.top_k,
+            repetition_penalty: args.repetition_penalty,
+            repetition_window: args.repetition_window,
+        };
+        return run_chat(
+            &args,
+            &model,
+            &tokenizer,
+            &backend,
+            &mut kv_caches,
+            &sampling_config,
+            max_seq_len,
         );
     }
 
@@ -3592,14 +3652,15 @@ fn main() -> anyhow::Result<()> {
                 // end_capture_and_launch() call replaces the per-kernel
                 // driver dispatches with one graph launch.
                 #[cfg(feature = "cuda-embedded")]
-                let cu_graph_be: Option<&llm_rs2::backend::cuda_embedded::CudaBackend> =
-                    if args.cuda_graph {
-                        backend
-                            .as_any()
-                            .downcast_ref::<llm_rs2::backend::cuda_embedded::CudaBackend>()
-                    } else {
-                        None
-                    };
+                let cu_graph_be: Option<
+                    &llm_rs2::backend::cuda_embedded::CudaBackend,
+                > = if args.cuda_graph {
+                    backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::cuda_embedded::CudaBackend>()
+                } else {
+                    None
+                };
                 #[cfg(feature = "cuda-embedded")]
                 if let Some(cu_be) = cu_graph_be {
                     cu_be.begin_graph_capture()?;
@@ -7124,6 +7185,508 @@ fn run_ppl(
         "\n[PPL] Final: PPL={:.4}, NLL={:.4}, tokens={}, {:.1} tok/s, {:.1}s",
         ppl, total_nll, nll_count, tok_per_sec, wall_time
     );
+
+    Ok(())
+}
+
+// ─────────────────────── Chat REPL mode ───────────────────────
+
+#[cfg(unix)]
+type ChatReplyWriter = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
+#[cfg(not(unix))]
+type ChatReplyWriter = std::sync::Arc<std::sync::Mutex<()>>;
+
+enum ChatInput {
+    Line(String, Option<ChatReplyWriter>),
+    Eof,
+}
+
+fn resolve_token_ids(
+    tokenizer: &Tokenizer,
+    literals: &[&'static str],
+    required: bool,
+) -> anyhow::Result<Vec<u32>> {
+    let mut out = Vec::with_capacity(literals.len());
+    for lit in literals {
+        match tokenizer.token_to_id(lit) {
+            Some(id) => out.push(id),
+            None if required => {
+                anyhow::bail!(
+                    "tokenizer is missing required special token `{}`. \
+                     Make sure tokenizer.json has it registered as an added_token.",
+                    lit
+                );
+            }
+            None => {}
+        }
+    }
+    Ok(out)
+}
+
+fn write_reply_bytes(reply: Option<&ChatReplyWriter>, bytes: &[u8]) {
+    #[cfg(unix)]
+    if let Some(arc) = reply {
+        use std::io::Write;
+        if let Ok(mut s) = arc.lock() {
+            let _ = s.write_all(bytes);
+            let _ = s.flush();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (reply, bytes);
+    }
+}
+
+fn finish_reply_stream(reply: Option<&ChatReplyWriter>) {
+    // Delimit end-of-turn with 0x04 (EOT) and shutdown the stream.
+    #[cfg(unix)]
+    if let Some(arc) = reply {
+        use std::io::Write;
+        if let Ok(mut s) = arc.lock() {
+            let _ = s.write_all(&[0x04]);
+            let _ = s.flush();
+            let _ = s.shutdown(std::net::Shutdown::Write);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = reply;
+    }
+}
+
+fn spawn_chat_input_sources(
+    socket_path: Option<&str>,
+) -> anyhow::Result<std::sync::mpsc::Receiver<ChatInput>> {
+    let (tx, rx) = std::sync::mpsc::channel::<ChatInput>();
+
+    // stdin reader thread
+    let stdin_tx = tx.clone();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let stdin = std::io::stdin();
+        let mut reader = stdin.lock();
+        loop {
+            let mut buf = String::new();
+            match reader.read_line(&mut buf) {
+                Ok(0) => {
+                    let _ = stdin_tx.send(ChatInput::Eof);
+                    break;
+                }
+                Ok(_) => {
+                    if stdin_tx.send(ChatInput::Line(buf, None)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = stdin_tx.send(ChatInput::Eof);
+                    break;
+                }
+            }
+        }
+    });
+
+    // Optional Unix socket listener thread
+    #[cfg(unix)]
+    if let Some(path) = socket_path {
+        use std::os::unix::net::UnixListener;
+        let path = path.to_string();
+        // Remove any stale socket file before binding
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)
+            .map_err(|e| anyhow::anyhow!("failed to bind Unix socket at {}: {}", path, e))?;
+        eprintln!("[Chat] Listening for socket input at {}", path);
+        let sock_tx = tx.clone();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let stream = match conn {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let stream_arc =
+                    std::sync::Arc::new(std::sync::Mutex::new(match stream.try_clone() {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    }));
+                let conn_tx = sock_tx.clone();
+                let reader_stream = stream;
+                std::thread::spawn(move || {
+                    use std::io::BufRead;
+                    let reader = std::io::BufReader::new(reader_stream);
+                    for line in reader.lines().map_while(Result::ok) {
+                        if conn_tx
+                            .send(ChatInput::Line(line, Some(stream_arc.clone())))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+    }
+    #[cfg(not(unix))]
+    if socket_path.is_some() {
+        anyhow::bail!("--chat-socket is only supported on unix targets");
+    }
+
+    Ok(rx)
+}
+
+fn chat_prefill_and_update_kv(
+    model: &TransformerModel,
+    backend: &Arc<dyn Backend>,
+    memory: &dyn Memory,
+    kv_caches: &mut [KVCache],
+    tokens: &[u32],
+    start_pos: usize,
+) -> anyhow::Result<Option<Vec<f32>>> {
+    // Build token tensor on backend (host tensor copied via backend.copy_from).
+    let cpu_backend = Arc::new(CpuBackend::new());
+    let input_buf = Galloc::new().alloc(tokens.len() * 4, DType::U8)?;
+    unsafe {
+        let ptr = input_buf.as_mut_ptr() as *mut u32;
+        for (i, &id) in tokens.iter().enumerate() {
+            *ptr.add(i) = id;
+        }
+    }
+    let cpu_input = Tensor::new(Shape::new(vec![1, tokens.len()]), input_buf, cpu_backend);
+    let input_tensor = backend.copy_from(&cpu_input)?;
+
+    let vocab_size = model.config.vocab_size;
+    let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut logits_out = Tensor::new(
+        Shape::new(vec![1, 1, vocab_size]),
+        logits_buf,
+        backend.clone(),
+    );
+
+    model.forward_into(TransformerModelForwardArgs {
+        input_tokens: &input_tensor,
+        start_pos,
+        kv_caches,
+        backend,
+        memory,
+        logits_out: &mut logits_out,
+        x_gen: None,
+        workspace: None,
+        score_accumulator: None,
+        profiler: None,
+        skip_config: None,
+        importance_collector: None,
+        logits_last_only: true,
+        variance_collector: None,
+        prefill_workspace: None,
+    })?;
+
+    let mut host_logits = vec![0.0f32; vocab_size];
+    unsafe {
+        let ptr = host_logits.as_mut_ptr() as *mut u8;
+        let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+        backend.read_buffer(&logits_out, slice)?;
+    }
+    Ok(Some(host_logits))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chat(
+    args: &Args,
+    model: &TransformerModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    kv_caches: &mut [KVCache],
+    sampling_config: &SamplingConfig,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    use llm_rs2::core::chat_template::ChatTemplate;
+    use std::collections::VecDeque;
+    use std::io::Write;
+
+    let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
+
+    let arch = model.config.arch;
+    let template = ChatTemplate::new(arch)?;
+    let vocab_size = model.config.vocab_size;
+    let hidden_size = model.config.hidden_size;
+    let q_dim = model.config.num_attention_heads * model.config.head_dim;
+    let k_dim = model.config.num_key_value_heads * model.config.head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = model.config.intermediate_size;
+
+    // Stop tokens: required literals must resolve; others are best-effort.
+    let stop_ids = {
+        let lits = template.stop_token_literals();
+        if lits.is_empty() {
+            anyhow::bail!("chat template has no stop token literals");
+        }
+        // First literal is required (authoritative turn terminator), rest optional.
+        let mut ids = resolve_token_ids(tokenizer, &[lits[0]], true)?;
+        ids.extend(resolve_token_ids(tokenizer, &lits[1..], false)?);
+        // Also accept the model's configured EOS id as a stop token.
+        ids.push(model.config.eos_token_id);
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let assistant_eot_ids: Vec<u32> = tokenizer
+        .encode(template.assistant_eot(), false)
+        .map_err(|e| anyhow::anyhow!("encode EOT: {}", e))?
+        .get_ids()
+        .to_vec();
+    let bos_id = if template.bos_needed_on_first_prefill() {
+        template
+            .bos_literal()
+            .and_then(|lit| tokenizer.token_to_id(lit))
+    } else {
+        None
+    };
+
+    // Pre-allocate decode workspace.
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let mut decode_logits =
+        Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let mut gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let mut gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
+
+    let mut pos: usize = 0;
+
+    // Optional system prompt prefill
+    if let Some(sys) = &args.system_prompt {
+        let rendered = template.render_system(sys);
+        let mut ids = tokenizer
+            .encode(rendered.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode system: {}", e))?
+            .get_ids()
+            .to_vec();
+        if let Some(b) = bos_id {
+            ids.insert(0, b);
+        }
+        if ids.len() > max_seq_len {
+            anyhow::bail!(
+                "system prompt produces {} tokens, exceeds max_seq_len={}",
+                ids.len(),
+                max_seq_len
+            );
+        }
+        chat_prefill_and_update_kv(model, backend, memory.as_ref(), kv_caches, &ids, pos)?;
+        pos += ids.len();
+    }
+
+    // Set up input sources
+    let input_rx = spawn_chat_input_sources(args.chat_socket.as_deref())?;
+
+    // --prompt becomes the first user message when non-empty.
+    let mut first_user: Option<String> =
+        (!args.prompt.trim().is_empty()).then(|| args.prompt.clone());
+    let mut recent: VecDeque<u32> = VecDeque::new();
+
+    eprintln!(
+        "[Chat] Ready. Arch={:?}, max_seq_len={}. Commands: /exit /reset /stats /help",
+        arch, max_seq_len
+    );
+    let mut stdout_lock = std::io::stdout();
+
+    'outer: loop {
+        print!("> ");
+        stdout_lock.flush().ok();
+
+        let (user_line_raw, reply_writer) = if let Some(line) = first_user.take() {
+            (line, None)
+        } else {
+            match input_rx.recv() {
+                Ok(ChatInput::Line(s, w)) => (s, w),
+                Ok(ChatInput::Eof) | Err(_) => {
+                    eprintln!();
+                    break 'outer;
+                }
+            }
+        };
+        let user_line = user_line_raw
+            .trim_end_matches(&['\n', '\r'][..])
+            .to_string();
+        let trimmed = user_line.trim();
+
+        match trimmed {
+            "" => continue,
+            "/exit" | "/quit" => break 'outer,
+            "/help" => {
+                println!("(commands: /exit /quit /reset /stats /help; empty line ignored)");
+                continue;
+            }
+            "/stats" => {
+                println!("kv_pos={}/{}", pos, max_seq_len);
+                continue;
+            }
+            "/reset" => {
+                for c in kv_caches.iter_mut() {
+                    c.current_pos = 0;
+                }
+                pos = 0;
+                recent.clear();
+                println!("(session reset)");
+                continue;
+            }
+            _ => {}
+        }
+
+        let rendered = template.render_user_and_assistant_header(trimmed);
+        let mut turn_ids: Vec<u32> = tokenizer
+            .encode(rendered.as_str(), false)
+            .map_err(|e| anyhow::anyhow!("encode user turn: {}", e))?
+            .get_ids()
+            .to_vec();
+        if pos == 0
+            && let Some(b) = bos_id
+        {
+            turn_ids.insert(0, b);
+        }
+
+        // Hard context-overflow check (no auto eviction in v1).
+        if pos + turn_ids.len() + args.num_tokens > max_seq_len {
+            let msg = format!(
+                "error: context would exceed max_seq_len={} (pos={}, incoming={}, reserve={}). \
+                 Start a new session with /reset or increase --max-seq-len.",
+                max_seq_len,
+                pos,
+                turn_ids.len(),
+                args.num_tokens
+            );
+            eprintln!("{}", msg);
+            write_reply_bytes(reply_writer.as_ref(), msg.as_bytes());
+            finish_reply_stream(reply_writer.as_ref());
+            anyhow::bail!("context overflow");
+        }
+
+        // Prefill user turn + assistant header (logits_last_only → sample first token).
+        let prefill_logits =
+            chat_prefill_and_update_kv(model, backend, memory.as_ref(), kv_caches, &turn_ids, pos)?;
+        pos += turn_ids.len();
+
+        // Sample the first assistant token from prefill logits.
+        let mut accum: Vec<u32> = Vec::new();
+        let mut printed_bytes: usize = 0;
+        let mut indices_buf: Vec<usize> = Vec::with_capacity(vocab_size);
+        let first_tok = if let Some(mut logits) = prefill_logits {
+            let recent_slice: Vec<u32> = recent.iter().copied().collect();
+            sampling::sample(
+                &mut logits,
+                &recent_slice,
+                vocab_size,
+                sampling_config,
+                Some(&mut indices_buf),
+            )
+        } else {
+            anyhow::bail!("prefill did not produce logits");
+        };
+
+        let mut cur_tok = first_tok;
+        for _step in 0..args.num_tokens {
+            if stop_ids.contains(&cur_tok) {
+                break;
+            }
+            accum.push(cur_tok);
+            recent.push_back(cur_tok);
+            if recent.len() > sampling_config.repetition_window.max(1) {
+                recent.pop_front();
+            }
+
+            // Streaming decode of accumulated tokens (byte-prefix diff).
+            let decoded = tokenizer.decode(&accum, true).unwrap_or_default();
+            if decoded.len() > printed_bytes {
+                let piece = &decoded[printed_bytes..];
+                print!("{}", piece);
+                stdout_lock.flush().ok();
+                write_reply_bytes(reply_writer.as_ref(), piece.as_bytes());
+                printed_bytes = decoded.len();
+            }
+
+            // Advance KV with the just-sampled token to compute the next logits.
+            unsafe {
+                *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = cur_tok;
+            }
+            backend.write_buffer(&mut gen_input_gpu, unsafe {
+                std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
+            })?;
+
+            model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &gen_input_gpu,
+                start_pos: pos,
+                kv_caches,
+                backend,
+                memory: memory.as_ref(),
+                logits_out: &mut decode_logits,
+                x_gen: Some(&mut x_gen),
+                workspace: Some(&mut gen_ws),
+                score_accumulator: None,
+                profiler: None,
+                skip_config: None,
+                importance_collector: None,
+                logits_last_only: true,
+                variance_collector: None,
+                prefill_workspace: None,
+            })?;
+            pos += 1;
+
+            // Hard stop if we've hit cache capacity ceiling.
+            if pos + 1 >= max_seq_len {
+                break;
+            }
+
+            let mut logits_host = vec![0.0f32; vocab_size];
+            unsafe {
+                let ptr = logits_host.as_mut_ptr() as *mut u8;
+                let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
+                backend.read_buffer(&decode_logits, slice)?;
+            }
+            let recent_slice: Vec<u32> = recent.iter().copied().collect();
+            cur_tok = sampling::sample(
+                &mut logits_host,
+                &recent_slice,
+                vocab_size,
+                sampling_config,
+                Some(&mut indices_buf),
+            );
+        }
+
+        // Append assistant EOT to KV so the next turn sees it in context.
+        if !assistant_eot_ids.is_empty() && pos + assistant_eot_ids.len() <= max_seq_len {
+            chat_prefill_and_update_kv(
+                model,
+                backend,
+                memory.as_ref(),
+                kv_caches,
+                &assistant_eot_ids,
+                pos,
+            )?;
+            pos += assistant_eot_ids.len();
+        }
+
+        println!();
+        stdout_lock.flush().ok();
+        finish_reply_stream(reply_writer.as_ref());
+    }
 
     Ok(())
 }
