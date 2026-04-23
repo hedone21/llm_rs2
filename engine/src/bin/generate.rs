@@ -532,6 +532,13 @@ struct Args {
     /// and streams assistant replies back (terminated by 0x04).
     #[arg(long)]
     chat_socket: Option<String>,
+
+    /// Optional TCP listen address (e.g. "127.0.0.1:7878"). Same protocol
+    /// as --chat-socket: newline-delimited input, assistant reply bytes
+    /// streamed back, 0x04 EOT delimiter per turn. Can be combined with
+    /// --chat-socket; both listeners feed the same chat loop.
+    #[arg(long)]
+    chat_tcp: Option<String>,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -7379,7 +7386,7 @@ fn run_chat(
     }
 
     // Set up input sources
-    let input_rx = spawn_chat_input_sources(args.chat_socket.as_deref())?;
+    let input_rx = spawn_chat_input_sources(args.chat_socket.as_deref(), args.chat_tcp.as_deref())?;
 
     // --prompt becomes the first user message when non-empty.
     let mut first_user: Option<String> =
