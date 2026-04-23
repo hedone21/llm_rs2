@@ -15,6 +15,11 @@ baseline:
     - "h2o"
     - "--protected-prefix"
     - "4"
+    # min_kv_cache 기본값 256 은 short_smoke 프롬프트(≈28 토큰) 에서 eviction 이
+    # target_pos < 256 으로 clamp 되어 "0 evictions" 로 귀결되게 한다. 정책 경로의
+    # 정합성만 검증하므로 하한을 내려 directive 가 실제 eviction 을 수행하도록 한다.
+    - "--min-kv-cache"
+    - "8"
 action:
   enable_resilience: true
   injection_schedule:

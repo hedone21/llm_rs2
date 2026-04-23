@@ -27,7 +27,7 @@ expected:
     stderr_sequence:
       - { pattern: "\\[KIVI-Resilience\\] Transitioned KV cache to 4bit", name: to_q4 }
       - { pattern: "RestoreDefaults|Restored", name: restored, after: to_q4, min_occurrences: 1 }
-      - { pattern: "\\[Experiment\\] Done", after: restored, min_occurrences: 1 }
+      - { pattern: "\\[(KIVI-)?Experiment\\] Done", after: restored, min_occurrences: 1 }
     heartbeat_checks: []
   crash_and_progress:
     decode_tokens_min_ratio: 0.5

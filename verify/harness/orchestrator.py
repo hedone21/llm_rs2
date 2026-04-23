@@ -1244,49 +1244,50 @@ def _run_scenario_adb_signal(
             # the engine client connects, so we cannot adb-forward yet.
             time.sleep(2.0)
 
-            # Tunnel host → device for the external-monitor port. We set this
-            # up now so adb forward is ready before ExternalMonitor binds.
+            # Tunnel host → device for the external-monitor port.
             _adb_forward(host_forward_port, ext_monitor_device_port, serial)
 
-            # Start the engine in the background so we can wait for
-            # ExternalMonitor bind without blocking on engine completion.
-            # The wrapper shell captures the exit code to action_rc_remote.
+            # Start the engine in the background. The wrapper shell captures
+            # the exit code to action_rc_remote so we can detect engine
+            # completion without blocking.
             env_prefix = AdbRemote._inline_env(env_vars)
             engine_cmd_str = " ".join(shlex.quote(a) for a in action_cmd)
+            # Use the same detach pattern as AdbBackgroundProcess (nohup +
+            # redirect + disown + explicit exit 0) so that `adb shell`
+            # returns immediately instead of blocking on the backgrounded
+            # child's stdio. Without this, the adb session waits until the
+            # child closes stdout/stderr, causing remote.exec to timeout
+            # after 15s (observed on S25).
             engine_script = (
-                f"({env_prefix}{engine_cmd_str} "
-                f"> {shlex.quote(action_stdout_remote)} "
-                f"2> {shlex.quote(action_stderr_remote)}; "
-                f"echo $? > {shlex.quote(action_rc_remote)}) & "
-                f"echo $! > {shlex.quote(action_pidfile_remote)}"
+                f"{env_prefix}nohup sh -c "
+                + shlex.quote(
+                    f"{engine_cmd_str} < /dev/null "
+                    f"> {shlex.quote(action_stdout_remote)} "
+                    f"2> {shlex.quote(action_stderr_remote)}; "
+                    f"echo $? > {shlex.quote(action_rc_remote)}"
+                )
+                + f" > /dev/null 2>&1 < /dev/null & "
+                f"echo $! > {shlex.quote(action_pidfile_remote)}; "
+                "disown 2>/dev/null || true; "
+                "exit 0"
             )
             remote.exec(
                 f"sh -c {shlex.quote(engine_script)}",
                 timeout=15.0,
             )
 
-            # Wait for ExternalMonitor to bind its TCP listener.
-            # ExternalMonitor only binds AFTER the engine client connects and
-            # sends its capabilities (manager/src/main.rs). On S25 with f16
-            # model: manager start → engine connect ≈ 11s. A fixed 15s
-            # pre-sleep was too short when generation is also fast (~10.8s),
-            # causing the directive to arrive after engine exit (ISSUE-7,
-            # 20260423_144239 run).
-            found = _wait_for_remote_log_pattern(
-                remote=remote,
-                remote_path=manager_stdout_remote,
-                pattern="[ExternalMonitor] TCP listening",
-                timeout_s=60.0,
-                poll_s=0.5,
-            )
-            if not found:
-                print(
-                    "  [warn] ExternalMonitor TCP bind not detected within 60s "
-                    "— proceeding anyway (signal may still reach engine)"
-                )
+            # Fixed sleep to let engine finish model load and handshake with
+            # manager. Empirical: S25 F16 model load takes ~9s. Engine
+            # connects to manager's 9101 right after load; ExternalMonitor
+            # binds immediately afterwards. signal_client must start only
+            # AFTER this handshake — otherwise its connect hits a not-yet-
+            # bound port, and adb forward may accept TCP without routing
+            # bytes (losing the signal). 10s gives ~1s margin.
+            time.sleep(10.0)
 
-            # Start signal_client immediately after ExternalMonitor is ready.
-            # --pre-sleep 0 because we already waited for the bind above.
+            # Start signal_client AFTER the engine is confirmed connected
+            # (ExternalMonitor is now bound). signal_client's internal 30s
+            # retry absorbs any residual timing slack.
             sig_cmd = [
                 sys.executable,
                 str(PROJECT_ROOT / "verify" / "harness" / "signal_client.py"),

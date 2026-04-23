@@ -30,3 +30,30 @@ enabled = false
 [external]
 enabled = true
 transport = "tcp:127.0.0.1:9102"
+
+# Adaptation priors — 생산 config (manager/policy_config.toml) 와 동일한 default_relief
+# 를 주입하여 DPP score 의 resource_term 이 0 으로 퇴화하지 않도록 한다.
+# 이 섹션이 비면 EwmaReliefTable.predict 가 [0;6] 을 반환해 모든 액션의
+# resource_term=0 이 되고, UCB bonus 로만 스코어가 정해져 signal_memory_critical
+# 이 d2o 같은 잘못된 후보를 집는 회귀가 발생한다.
+[adaptation]
+qcf_penalty_weight = 0.5
+qcf_stale_secs = 5.0
+ewma_alpha = 0.875
+relief_table_path = ""
+temp_safe_c = 35.0
+temp_critical_c = 50.0
+dedup_cooldown_secs = 60.0
+persist_interval_secs = 300.0
+linucb_alpha = 0.5
+
+[adaptation.default_relief]
+switch_hw = [0.5, -0.3, 0.0, 0.3, -0.1, 0.0]
+kv_evict_h2o = [0.1, 0.0, 0.4, 0.1, 0.0, 0.0]
+kv_evict_sliding = [0.1, 0.0, 0.3, 0.1, 0.0, 0.0]
+throttle = [0.0, 0.3, 0.0, 0.2, -0.2, 0.0]
+set_target_tbt = [0.0, 0.2, 0.0, 0.1, -0.1, 0.0]
+layer_skip = [0.2, 0.1, 0.0, 0.1, -0.1, 0.0]
+kv_quant_dynamic = [0.0, 0.0, 0.5, 0.0, 0.0, 0.0]
+kv_merge_d2o = [0.1, 0.0, 0.3, 0.1, 0.0, 0.0]
+set_partition_ratio = [0.3, -0.2, 0.0, 0.1, 0.0, 0.0]

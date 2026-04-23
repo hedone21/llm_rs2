@@ -74,7 +74,7 @@ name = "Galaxy S25"
 
 [devices.galaxy_s25.connection]
 type = "adb"
-serial = ""
+serial = "R3CY408S5SB"
 
 [devices.galaxy_s25.build]
 target = "aarch64-linux-android"

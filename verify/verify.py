@@ -23,6 +23,10 @@ from pathlib import Path
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
+# Make scripts/device_registry importable for build/deploy helpers.
+_SCRIPTS = _HERE.parent / "scripts"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
 
 from harness.fixtures import (  # noqa: E402
     PROJECT_ROOT,
