@@ -119,6 +119,10 @@ pub struct CommandExecutor {
     evict_plan: Option<EvictPlan>,
     // Sticky KV quantization bits: retained until RestoreDefaults
     kv_quant_bits: Option<u8>,
+    // Sticky tensor partition ratio: retained until RestoreDefaults.
+    // Ensures SetPartitionRatio directives received during prefill are
+    // visible in subsequent decode-loop polls (ISSUE-5 fix).
+    partition_ratio_sticky: Option<f32>,
 
     // Tensor partition ratio for heartbeat reporting
     partition_ratio: f32,
@@ -183,6 +187,7 @@ impl CommandExecutor {
             active_actions: Vec::new(),
             evict_plan: None,
             kv_quant_bits: None,
+            partition_ratio_sticky: None,
             partition_ratio: 0.0,
             phase: String::new(),
             prefill_pos: 0,
@@ -259,6 +264,9 @@ impl CommandExecutor {
             plan.target_tbt_set = self.target_tbt_set;
             plan.evict = self.evict_plan.clone();
             plan.kv_quant_bits = self.kv_quant_bits;
+            // Carry forward sticky partition ratio so prefill-time directives
+            // remain visible in subsequent decode-loop polls (ISSUE-5).
+            plan.partition_ratio = self.partition_ratio_sticky;
             return plan;
         }
 
@@ -428,6 +436,7 @@ impl CommandExecutor {
                 self.target_tbt_set = false;
                 self.evict_plan = None;
                 self.kv_quant_bits = None;
+                self.partition_ratio_sticky = None;
                 self.compute_level = ResourceLevel::Normal;
                 self.memory_level = ResourceLevel::Normal;
                 self.active_actions.clear();
@@ -462,6 +471,7 @@ impl CommandExecutor {
                 CommandResult::Ok
             }
             EngineCommand::SetPartitionRatio { ratio } => {
+                self.partition_ratio_sticky = Some(*ratio);
                 plan.partition_ratio = Some(*ratio);
                 CommandResult::Ok
             }
@@ -1389,5 +1399,58 @@ mod tests {
             }
             _ => panic!("Expected QcfEstimate"),
         }
+    }
+
+    // ISSUE-5: SetPartitionRatio는 sticky 상태로 유지되어 prefill 중 수신된
+    // directive가 이후 decode-loop poll에서도 반영돼야 한다.
+    #[test]
+    fn test_set_partition_ratio_sticky_across_polls() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // 1. SetPartitionRatio directive 송신
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SetPartitionRatio { ratio: 0.3 }],
+        }))
+        .unwrap();
+
+        // 2. 첫 poll → plan.partition_ratio == Some(0.3)
+        let plan1 = executor.poll(&empty_snap());
+        assert_eq!(
+            plan1.partition_ratio,
+            Some(0.3),
+            "첫 poll에서 SetPartitionRatio가 반영돼야 함"
+        );
+
+        // 3. 두 번째 poll (directive 없음) → plan.partition_ratio == Some(0.3) (sticky)
+        let plan2 = executor.poll(&empty_snap());
+        assert_eq!(
+            plan2.partition_ratio,
+            Some(0.3),
+            "directive 없는 poll에서도 partition_ratio_sticky가 유지돼야 함 (ISSUE-5)"
+        );
+
+        // 4. 세 번째 poll (여전히 directive 없음) → 여전히 sticky
+        let plan3 = executor.poll(&empty_snap());
+        assert_eq!(
+            plan3.partition_ratio,
+            Some(0.3),
+            "복수의 directive 없는 poll에서도 sticky 유지"
+        );
+
+        // 5. RestoreDefaults directive 송신
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::RestoreDefaults],
+        }))
+        .unwrap();
+        executor.poll(&empty_snap());
+
+        // 6. RestoreDefaults 이후 poll → partition_ratio가 None으로 초기화
+        let plan_after = executor.poll(&empty_snap());
+        assert_eq!(
+            plan_after.partition_ratio, None,
+            "RestoreDefaults 이후 partition_ratio_sticky가 초기화돼야 함"
+        );
     }
 }
