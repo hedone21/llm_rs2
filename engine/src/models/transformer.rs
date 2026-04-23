@@ -960,6 +960,8 @@ impl TransformerModel {
                     local_attn_window: self.config.sliding_window,
                     is_last_layer: i + 1 == self.layers.len(),
                 })?;
+                // Intra-token GPU yield hook (decode only, seq_len == 1).
+                crate::core::gpu_yield::maybe_yield_after_layer(&**backend, i, true);
             }
 
             // Record importance after layer forward

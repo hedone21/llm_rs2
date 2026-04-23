@@ -1495,6 +1495,10 @@ impl FullKernelPlan {
             {
                 log::error!("Plan flush failed: {}", e);
             }
+
+            // Intra-token GPU yield hook. Plan path is decode-only, so
+            // `is_decode = true` unconditionally.
+            crate::core::gpu_yield::maybe_yield_after_layer(backend, i, true);
         }
 
         // GPU score accumulator: flush step-local scores into cumulative

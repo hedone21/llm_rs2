@@ -6,6 +6,7 @@ pub mod chat_ipc;
 pub mod chat_template;
 pub mod events;
 pub mod eviction;
+pub mod gpu_yield;
 pub mod kivi_cache;
 pub mod kv_cache;
 pub mod kv_migrate;

@@ -396,6 +396,20 @@ struct Args {
     #[arg(long, value_parser = ["low", "medium", "normal", "high"], default_value = "normal")]
     gpu_priority: String,
 
+    /// Intra-token GPU yield: after every N decoded layers, flush the GPU
+    /// queue and sleep `--gpu-yield-us` microseconds. Gives the driver a
+    /// scheduling window mid-token so concurrent high-priority contexts
+    /// (e.g. foreground games) don't wait out the full layer chain. 0
+    /// disables. Also settable via env `LLMRS_DECODE_YIELD_EVERY`.
+    #[arg(long, default_value_t = 0)]
+    gpu_yield_every_layer: usize,
+
+    /// Microsecond sleep per intra-token yield point. Effective only when
+    /// `--gpu-yield-every-layer` > 0. 0 issues `sched_yield()` instead of
+    /// sleeping. Also settable via env `LLMRS_DECODE_YIELD_US`.
+    #[arg(long, default_value_t = 500)]
+    gpu_yield_us: u64,
+
     /// Path to write per-token TBT JSONL log.
     /// Each line: {"token_idx":N,"tbt_ms":X,"forward_ms":Y,"cache_pos":Z,"pacing_ms":W}
     #[arg(long)]
@@ -695,6 +709,19 @@ fn main() -> anyhow::Result<()> {
     if args.gpu_priority != "normal" {
         unsafe {
             std::env::set_var("OCL_QUEUE_PRIORITY", &args.gpu_priority);
+        }
+    }
+
+    // Propagate intra-token GPU yield knobs. Both flags route through env
+    // vars so `core::gpu_yield`'s OnceLock cache stays valid across sub-crate
+    // boundaries. CLI wins over a pre-set env var.
+    if args.gpu_yield_every_layer > 0 {
+        unsafe {
+            std::env::set_var(
+                "LLMRS_DECODE_YIELD_EVERY",
+                args.gpu_yield_every_layer.to_string(),
+            );
+            std::env::set_var("LLMRS_DECODE_YIELD_US", args.gpu_yield_us.to_string());
         }
     }
 
