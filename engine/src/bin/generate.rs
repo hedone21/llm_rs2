@@ -381,6 +381,13 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     target_tbt: f64,
 
+    /// Fixed per-token throttle delay in milliseconds (0=disabled).
+    /// Unconditional sleep after each decode step — useful for co-execution
+    /// simulations without running a Manager. Manager `Throttle` directives
+    /// override this value when resilience is enabled.
+    #[arg(long, default_value_t = 0)]
+    throttle_delay_ms: u64,
+
     /// Path to write per-token TBT JSONL log.
     /// Each line: {"token_idx":N,"tbt_ms":X,"forward_ms":Y,"cache_pos":Z,"pacing_ms":W}
     #[arg(long)]
@@ -1337,7 +1344,14 @@ fn main() -> anyhow::Result<()> {
     {
         exec.set_partition_ratio(args.tensor_partition);
     }
-    let mut throttle_delay_ms: u64 = 0;
+    // Seed sticky throttle from CLI so no-directive polls preserve the CLI
+    // value; Manager `Throttle` directives still override at runtime.
+    if args.throttle_delay_ms > 0
+        && let Some(ref mut exec) = command_executor
+    {
+        exec.set_throttle_delay_ms(args.throttle_delay_ms);
+    }
+    let mut throttle_delay_ms: u64 = args.throttle_delay_ms;
     let mut tbt_log_writer: Option<std::io::BufWriter<std::fs::File>> =
         args.tbt_log.as_ref().map(|path| {
             let file = std::fs::File::create(path).expect("failed to create tbt-log file");

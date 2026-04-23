@@ -624,6 +624,12 @@ impl CommandExecutor {
         self.partition_ratio = ratio;
     }
 
+    /// Seed the sticky throttle delay (e.g. from CLI `--throttle-delay-ms`).
+    /// Future Manager `Throttle` directives still override this value.
+    pub fn set_throttle_delay_ms(&mut self, delay_ms: u64) {
+        self.throttle_delay_ms = delay_ms;
+    }
+
     /// Update prefill progress for heartbeat reporting.
     pub fn set_prefill_state(&mut self, phase: &str, pos: usize, total: usize) {
         self.phase = phase.to_string();
