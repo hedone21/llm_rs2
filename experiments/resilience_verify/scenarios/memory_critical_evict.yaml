@@ -1,0 +1,49 @@
+id: memory_critical_evict
+description: "mock_manager scenario mode: KvEvictH2o with keep_ratio=0.5 applied mid-decode on a medium prompt."
+layer: engine_cmd
+devices: [host, pixel, galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:medium_qa
+  decode_tokens: 128
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args:
+    - "--eviction-policy"
+    - "h2o"
+    - "--protected-prefix"
+    - "4"
+action:
+  enable_resilience: true
+  mock_manager_commands:
+    - delay_sec: 1.5
+      command: KvEvictH2o
+      params:
+        keep_ratio: 0.5
+expected:
+  functional:
+    engine_commands_any_of: [KvEvictH2o]
+    stderr_patterns:
+      - "\\[CacheEvent\\] Eviction completed: policy='?h2o'?"
+      - "\\[Resilience\\] Directive.*KvEvictH2o"
+    heartbeat_checks:
+      - field: active_actions
+        contains: evict
+        required: false
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 40.0
+      tolerance_pct: 30.0
+  accuracy:
+    min_rouge_l: 0.15
+    min_bleu_4: 0.00
+    min_char_similarity: 0.10
+# functional_only: KvEvictH2o drops 50% of KV cache context mid-decode; output
+# divergence from baseline is expected. Floor thresholds above catch total
+# gibberish; tighter bounds would be false-positive-prone across prompts.
+pass_criteria: functional_only

@@ -1,0 +1,48 @@
+id: prefill_midway_injection
+description: "Long prompt with prefill_chunk_size=64: inject KvStreaming at 500ms to land during prefill."
+layer: engine_cmd
+devices: [host, pixel, galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:medium_qa
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args:
+    - "--eviction-policy"
+    - "streaming"
+    - "--sink-size"
+    - "4"
+    - "--streaming-window"
+    - "512"
+action:
+  enable_resilience: true
+  mock_manager_commands:
+    - delay_sec: 0.5
+      command: KvStreaming
+      params:
+        sink_size: 4
+        window_size: 64
+expected:
+  functional:
+    engine_commands_any_of: [KvStreaming]
+    stderr_patterns:
+      - "\\[CacheEvent\\] Eviction completed: policy='?(streaming_llm|streaming|stream)'?"
+      - "\\[Resilience\\] Directive.*KvStreaming"
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 9999.0
+      tolerance_pct: 0.0
+  accuracy:
+    min_rouge_l: 0.20
+    min_bleu_4: 0.05
+    min_char_similarity: 0.30
+# functional_only: KvStreaming mid-prefill rewrites the attention window and
+# intentionally truncates long-range context; token divergence is expected.
+pass_criteria: functional_only

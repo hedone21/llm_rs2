@@ -1,0 +1,40 @@
+id: prefill_midway_partition_enable
+description: "Aggressive enable variant: long prompt + prefill_chunk_size=32 + SetPartitionRatio{ratio=0.3} injected at 200ms (during prefill). This exercises the lazy-map + partition code path mid-prefill, which is a likely candidate for the user-reported crash. Baseline is GPU-only (no --tensor-partition)."
+layer: engine_cmd
+devices: [galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:medium_qa
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 32
+  extra_args: []
+action:
+  enable_resilience: true
+  mock_manager_commands:
+    - delay_sec: 0.2
+      command: SetPartitionRatio
+      params:
+        ratio: 0.3
+expected:
+  functional:
+    engine_commands_any_of: [SetPartitionRatio]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] Directive.*SetPartitionRatio", name: dir_received }
+      - { pattern: "\\[Partition\\] (Lazy-mapped|ratio=0\\.3)", name: activated, after: dir_received, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: activated, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 400.0
+      tolerance_pct: 50.0
+  accuracy:
+    min_rouge_l: 0.50
+    min_bleu_4: 0.15
+    min_char_similarity: 0.40
+pass_criteria: all

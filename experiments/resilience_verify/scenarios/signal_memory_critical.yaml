@@ -1,0 +1,47 @@
+id: signal_memory_critical
+description: "SystemSignal path: MemoryPressure{level=critical} injected via ExternalMonitor. Validates the full chain signal → policy → EngineCommand (KvEvict* variant) through the real llm_manager binary. Exercises strategy mapping, not mock_manager's direct command."
+layer: signal
+devices: [galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args:
+    - "--eviction-policy"
+    - "h2o"
+    - "--protected-prefix"
+    - "4"
+action:
+  enable_resilience: true
+  injection_schedule:
+    - delay_sec: 0.8
+      signal:
+        memory_pressure:
+          level: critical
+          available_bytes: 30000000
+          total_bytes: 8000000000
+          reclaim_target_bytes: 100000000
+expected:
+  functional:
+    engine_commands_any_of: [KvEvictH2o, KvEvictSliding, KvEvictStreaming]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] Directive.*KvEvict", name: dir_received }
+      - { pattern: "\\[CacheEvent\\] Eviction completed", name: evicted, after: dir_received, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: evicted, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 80.0
+      tolerance_pct: 30.0
+  accuracy:
+    min_rouge_l: 0.40
+    min_bleu_4: 0.10
+    min_char_similarity: 0.35
+pass_criteria: all

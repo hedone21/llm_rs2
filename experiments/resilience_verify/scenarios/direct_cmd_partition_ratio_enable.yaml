@@ -1,0 +1,39 @@
+id: direct_cmd_partition_ratio_enable
+description: "Dynamic ENABLE of FFN tensor partition at runtime. Baseline runs with --enable-resilience and no --tensor-partition flag (partition OFF, GPU-only). Action injects SetPartitionRatio{ratio=0.3} which should trigger the lazy weight-map path in generate.rs:4253-4286 and then run decode through the partition code path. This is the dual of direct_cmd_partition_ratio (which only covers disable 0.3→0.0). Host excluded — CPU-only backend has no partition path."
+layer: engine_cmd
+devices: [galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args: []
+action:
+  enable_resilience: true
+  mock_manager_command: SetPartitionRatio
+  mock_manager_params:
+    ratio: 0.3
+    wait_secs: 2
+expected:
+  functional:
+    engine_commands_any_of: [SetPartitionRatio]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] Directive.*SetPartitionRatio", name: dir_received }
+      - { pattern: "\\[Partition\\] (Lazy-mapped|ratio=0\\.3)", name: activated, after: dir_received, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: activated, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 300.0
+      tolerance_pct: 50.0
+  accuracy:
+    min_rouge_l: 0.55
+    min_bleu_4: 0.20
+    min_char_similarity: 0.50
+pass_criteria: all

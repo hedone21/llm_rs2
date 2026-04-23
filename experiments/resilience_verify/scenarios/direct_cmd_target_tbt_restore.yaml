@@ -1,0 +1,41 @@
+id: direct_cmd_target_tbt_restore
+description: "Restore path: start with SetTargetTbt{target_ms=250} (slow pacing), then inject SetTargetTbt{target_ms=0} to release pacing. Verifies the reverse transition log and TBT returning to near-baseline."
+layer: engine_cmd
+devices: [host, galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 96
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+action:
+  enable_resilience: true
+  mock_manager_commands:
+    - delay_sec: 0.1
+      command: SetTargetTbt
+      params: { target_ms: 250 }
+    - delay_sec: 3.0
+      command: SetTargetTbt
+      params: { target_ms: 0 }
+expected:
+  functional:
+    engine_commands_any_of: [SetTargetTbt]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] SetTargetTbt:.*250ms", name: slow }
+      - { pattern: "\\[Resilience\\] SetTargetTbt:.*(0ms|->\\s*0)", name: released, after: slow, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: released, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 300.0
+      tolerance_pct: 30.0
+  accuracy:
+    min_rouge_l: 0.90
+    min_bleu_4: 0.50
+    min_char_similarity: 0.85
+pass_criteria: all

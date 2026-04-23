@@ -1,0 +1,38 @@
+id: direct_cmd_throttle_smoke
+description: "mock_manager sends Throttle{delay_ms=20} directly; verify active_actions contains 'throttle' and baseline vs action text match"
+layer: engine_cmd
+devices: [host, pixel, galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  prefill_tokens_min: 0
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+action:
+  enable_resilience: true
+  mock_manager_command: Throttle
+  mock_manager_params:
+    delay_ms: 20
+    wait_secs: 2
+expected:
+  functional:
+    engine_commands_any_of: [Throttle]
+    stderr_patterns:
+      - "\\[Resilience\\] Directive.*Throttle"
+    heartbeat_checks:
+      - field: active_actions
+        contains: throttle
+        required: false
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 500.0
+      tolerance_pct: 50.0
+  accuracy:
+    min_rouge_l: 0.90
+    min_bleu_4: 0.50
+    min_char_similarity: 0.85
+pass_criteria: all

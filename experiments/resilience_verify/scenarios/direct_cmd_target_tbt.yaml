@@ -1,0 +1,35 @@
+id: direct_cmd_target_tbt
+description: "SetTargetTbt{target_ms=250} applies a wall-clock pacing target well above realistic baselines on all supported devices (Jetson Q4 ~20ms, S25 F16 ~85ms). Verifies both the '[Resilience] SetTargetTbt:' transition log and a min_pct=150 TBT uplift (i.e. pacing actually engaged)."
+layer: engine_cmd
+devices: [host, galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 128
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+action:
+  enable_resilience: true
+  mock_manager_command: SetTargetTbt
+  mock_manager_params:
+    target_ms: 250
+    wait_secs: 1
+expected:
+  functional:
+    engine_commands_any_of: [SetTargetTbt]
+    stderr_patterns:
+      - "\\[Resilience\\] Directive.*SetTargetTbt"
+      - "\\[Resilience\\] SetTargetTbt:.*250ms"
+    heartbeat_checks: []
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      min_pct: 150.0
+      tolerance_pct: 20.0
+  accuracy:
+    min_rouge_l: 0.90
+    min_bleu_4: 0.50
+    min_char_similarity: 0.85
+pass_criteria: all

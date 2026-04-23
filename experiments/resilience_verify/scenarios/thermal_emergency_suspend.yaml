@@ -1,0 +1,39 @@
+id: thermal_emergency_suspend
+description: "Suspend directive mid-decode: engine transitions to suspended state and exits the decode loop. Host-only validates Suspend; full Suspend→Resume cycle requires a looping engine (Phase 4+)."
+layer: engine_cmd
+devices: [host, pixel, galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+action:
+  enable_resilience: true
+  mock_manager_commands:
+    - delay_sec: 1.0
+      command: Suspend
+expected:
+  functional:
+    engine_commands_any_of: [Suspend]
+    stderr_patterns:
+      - "\\[Resilience\\] Directive.*Suspend"
+      - "\\[Resilience\\] Inference suspended"
+    heartbeat_checks: []
+  crash_and_progress:
+    # Suspend breaks the decode loop mid-stream; partial decode is expected.
+    decode_tokens_min_ratio: 0.0
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 9999.0
+      tolerance_pct: 0.0
+  accuracy:
+    min_rouge_l: 0.00
+    min_bleu_4: 0.00
+    min_char_similarity: 0.00
+# functional_only: Suspend intentionally truncates the decode loop — baseline
+# decodes to the end while action stops early. Output divergence is by design.
+pass_criteria: functional_only

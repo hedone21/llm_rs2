@@ -1,0 +1,44 @@
+id: direct_cmd_partition_ratio
+description: "SetPartitionRatio{ratio=0.0} disables an *active* FFN partition. Baseline starts with --tensor-partition 0.3 (partition ON on GPU devices) so the action produces an observable '[Partition] Disabled' transition. Host is excluded — no GPU partition path applies."
+layer: engine_cmd
+devices: [galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args:
+    - "--tensor-partition"
+    - "0.3"
+action:
+  enable_resilience: true
+  mock_manager_command: SetPartitionRatio
+  mock_manager_params:
+    ratio: 0.0
+    wait_secs: 2
+expected:
+  functional:
+    engine_commands_any_of: [SetPartitionRatio]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] Directive.*SetPartitionRatio", name: dir_received }
+      - { pattern: "\\[Partition\\] Disabled \\(ratio=0\\)", name: disabled, after: dir_received, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: disabled, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 80.0
+      tolerance_pct: 30.0
+  accuracy:
+    # Disable path preserves mathematically identical compute (GPU vs CPU split).
+    # Greedy output should be near-identical with small numerical drift. If rouge
+    # drops hard, that's a silent correctness bug, not a benign transition.
+    min_rouge_l: 0.80
+    min_bleu_4: 0.40
+    min_char_similarity: 0.70
+pass_criteria: all

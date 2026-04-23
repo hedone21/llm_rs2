@@ -1,0 +1,47 @@
+id: direct_cmd_kvquant_f16_to_q4
+description: "KvQuantDynamic{target_bits=4} switches KV cache dtype mid-decode (F16 → Q4). Baseline enters the KIVI runtime via --kv-dynamic-quant; action asserts the actual '[KIVI-Resilience] Transitioned KV cache to 4bit' line, not just directive receipt."
+layer: engine_cmd
+devices: [galaxy_s25, jetson]
+models: [f16]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+  extra_args:
+    - "--kv-dynamic-quant"
+action:
+  enable_resilience: true
+  mock_manager_command: KvQuantDynamic
+  mock_manager_params:
+    target_bits: 4
+    wait_secs: 2
+expected:
+  functional:
+    engine_commands_any_of: [KvQuantDynamic]
+    stderr_patterns:
+      - "\\[Resilience\\] Directive.*KvQuantDynamic"
+      - "\\[KIVI-Resilience\\] Transitioned KV cache to 4bit"
+    heartbeat_checks:
+      - field: kv_dtype
+        transitions_to: q4
+        required: true
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 200.0
+      tolerance_pct: 50.0
+  accuracy:
+    # Dynamic quantization F16→Q4 is an INTENTIONAL precision drop. Token
+    # divergence vs F16 baseline is expected; we record but do not gate on it.
+    # Still hold a non-zero floor so total gibberish fails here.
+    min_rouge_l: 0.25
+    min_bleu_4: 0.05
+    min_char_similarity: 0.30
+# functional_only: K/V dtype change is a controlled precision loss; output
+# divergence is by design. Crash+progress gate still catches segfaults.
+pass_criteria: functional_only

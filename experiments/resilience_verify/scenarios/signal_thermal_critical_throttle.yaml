@@ -1,0 +1,41 @@
+id: signal_thermal_critical_throttle
+description: "SystemSignal path: ThermalAlert{level=critical, throttling_active=true} injected via ExternalMonitor → policy should emit Throttle / SetTargetTbt. Validates thermal → throttle strategy mapping."
+layer: signal
+devices: [galaxy_s25, jetson]
+models: [f16, q4]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 64
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+action:
+  enable_resilience: true
+  injection_schedule:
+    - delay_sec: 0.5
+      signal:
+        thermal_alert:
+          level: critical
+          temperature_mc: 90000
+          throttling_active: true
+          throttle_ratio: 0.5
+expected:
+  functional:
+    engine_commands_any_of: [Throttle, SetTargetTbt]
+    stderr_sequence:
+      - { pattern: "\\[Resilience\\] Directive.*(Throttle|SetTargetTbt)", name: dir_received }
+      - { pattern: "\\[Experiment\\] Done", after: dir_received, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      min_pct: 20.0
+      tolerance_pct: 30.0
+  accuracy:
+    min_rouge_l: 0.80
+    min_bleu_4: 0.40
+    min_char_similarity: 0.70
+pass_criteria: all

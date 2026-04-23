@@ -1,0 +1,41 @@
+id: direct_cmd_kvquant_restore
+description: "Restore path for KV dtype dynamic quantization: F16 baseline, then KvQuantDynamic{bits=4} to degrade, then RestoreDefaults to return to baseline dtype. Verifies restore-side transition log and partial output recovery."
+layer: engine_cmd
+devices: [galaxy_s25, jetson]
+models: [f16]
+baseline:
+  prompt: fixtures:short_smoke
+  decode_tokens: 96
+  seed: 42
+  greedy: true
+  backend: auto
+  prefill_chunk_size: 64
+action:
+  enable_resilience: true
+  mock_manager_commands:
+    - delay_sec: 0.5
+      command: KvQuantDynamic
+      params: { bits: 4 }
+    - delay_sec: 2.5
+      command: RestoreDefaults
+      params: {}
+expected:
+  functional:
+    engine_commands_any_of: [KvQuantDynamic, RestoreDefaults]
+    stderr_sequence:
+      - { pattern: "\\[KIVI-Resilience\\] Transitioned KV cache to 4bit", name: to_q4 }
+      - { pattern: "RestoreDefaults|Restored", name: restored, after: to_q4, min_occurrences: 1 }
+      - { pattern: "\\[Experiment\\] Done", after: restored, min_occurrences: 1 }
+    heartbeat_checks: []
+  crash_and_progress:
+    decode_tokens_min_ratio: 0.5
+  performance:
+    metric: avg_tbt_ms
+    delta_vs_baseline:
+      max_pct: 200.0
+      tolerance_pct: 50.0
+  accuracy:
+    min_rouge_l: 0.30
+    min_bleu_4: 0.05
+    min_char_similarity: 0.30
+pass_criteria: all

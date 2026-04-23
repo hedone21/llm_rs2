@@ -1,0 +1,34 @@
+# Device × model fixture table for the resilience verify harness.
+#
+# Paths may be absolute or relative to project root.
+# Required keys per (device, model): model_path, tokenizer_path
+#
+# For remote devices (ssh/adb), `model_path` is the REMOTE path used by the
+# on-device `generate` binary; `tokenizer_path` is always a LOCAL path because
+# detokenisation runs on the host where results are analysed.
+
+[devices.host.f16]
+model_path     = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf"
+tokenizer_path = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/tokenizer.json"
+
+[devices.host.q4]
+model_path     = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf"
+tokenizer_path = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/tokenizer.json"
+
+# Jetson AGX Xavier / Orin (ssh). `model_path` is remote.
+[devices.jetson.f16]
+model_path     = "/home/nvidia/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf"
+tokenizer_path = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/tokenizer.json"
+
+[devices.jetson.q4]
+model_path     = "/home/nvidia/llm_rs2/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf"
+tokenizer_path = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/tokenizer.json"
+
+# Galaxy S25 (adb). `model_path` is remote (/data/local/tmp).
+[devices.galaxy_s25.f16]
+model_path     = "/data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-f16.gguf"
+tokenizer_path = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/tokenizer.json"
+
+[devices.galaxy_s25.q4]
+model_path     = "/data/local/tmp/models/qwen2.5-1.5b/qwen2.5-1.5b-q4_0.gguf"
+tokenizer_path = "/home/go/Workspace/llm_rs2/models/qwen2.5-1.5b/tokenizer.json"

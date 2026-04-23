@@ -1,0 +1,3 @@
+Question: Briefly describe what a distributed system is, why it is hard to build, and give two concrete real-world examples.
+
+Answer:

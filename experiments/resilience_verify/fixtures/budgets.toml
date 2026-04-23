@@ -1,0 +1,6 @@
+# Device-specific timeout / threshold overrides for the resilience verify harness.
+# Phase 1: placeholder. Scenarios currently use hard-coded defaults.
+
+[host]
+# generate_timeout_s = 120
+# mock_manager_wait_secs = 2

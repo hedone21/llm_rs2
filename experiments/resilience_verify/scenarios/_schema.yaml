@@ -1,0 +1,82 @@
+# Resilience verify — scenario YAML schema (read-only reference).
+#
+# Loader: scripts/resilience_verify/spec_loader.py::load_scenario
+#
+# id: <unique string, used as output directory name>
+# description: <free-form>
+# layer: engine_cmd      # Only layer supported; signal_injector path removed.
+# devices: [host, pixel, galaxy_s25, jetson]   # allowed devices for this scenario
+# models:  [f16, q4]                           # allowed model keys for this scenario
+#
+# baseline:
+#   prompt: fixtures:<name>       # or absolute path
+#   prefill_tokens_min: <int>
+#   decode_tokens: <int>
+#   seed: <int>
+#   greedy: <bool>
+#   temperature: <float>
+#   backend: auto | cpu | opencl | cuda
+#   prefill_chunk_size: <int>
+#   extra_args: [ ... ]           # forwarded verbatim to `generate`
+#
+# action:
+#   enable_resilience: <bool>
+#
+#   # ── Single-command mode (mock_manager --command) ──
+#   mock_manager_command: Throttle | KvEvictH2o | KvStreaming | KvEvictSliding |
+#                         KvQuantDynamic | SetTargetTbt | SetPartitionRatio |
+#                         SwitchHw | Suspend | Resume | RestoreDefaults |
+#                         RequestQcf | KvMergeD2o | LayerSkip | SetPrefillPolicy
+#   mock_manager_params:
+#     delay_ms: <int>             # Throttle
+#     keep_ratio: <float>         # KvEvict*
+#     target_ms: <int>            # SetTargetTbt
+#     ratio: <float>              # SetPartitionRatio
+#     device: <string>            # SwitchHw
+#     target_bits: <int>          # KvQuantDynamic
+#     sink_size: <int>            # KvStreaming
+#     window_size: <int>          # KvStreaming
+#     wait_secs: <int>            # seconds mock_manager waits before first directive
+#
+#   # ── Scenario mode (mock_manager --scenario <json>) ──
+#   # A list of steps executed sequentially with delays.
+#   # YAML `delay_sec` → JSON `delay_ms` (×1000).
+#   mock_manager_commands:
+#     - delay_sec: 1.5
+#       command: KvEvictH2o
+#       params: { keep_ratio: 0.5 }
+#     - delay_sec: 2.0
+#       command: Resume
+#
+# expected:
+#   functional:
+#     engine_commands_any_of: [ ... ]
+#     stderr_patterns: [ "<regex>", ... ]
+#     min_occurrences: 1
+#     heartbeat_checks:
+#       - field: active_actions
+#         contains: <substring>           # at least one heartbeat contains
+#         required: true|false            # default true
+#       - field: active_actions
+#         does_not_contain: <substring>
+#       - field: state
+#         transitions: ["Running", "Suspended", "Running"]   # subsequence match
+#       - field: state
+#         transitions_to: Suspended
+#       - field: active_device
+#         transitions_to: cuda
+#       - field: kv_dtype
+#         transitions_to: q4              # falls back to [KIVI-Resilience] stderr
+#       - field: kv_cache_tokens
+#         decrease_from_peak: true        # uses kv_util proxy (no direct field)
+#   performance:
+#     metric: avg_tbt_ms | tokens_per_sec
+#     delta_vs_baseline: { max_pct: <float>, tolerance_pct: <float> }
+#   accuracy:
+#     min_rouge_l: <float>
+#     min_bleu_4: <float>
+#     min_char_similarity: <float>
+#
+# pass_criteria:
+#   - all              functional AND performance AND accuracy must pass
+#   - functional_only  only functional matters; perf/accuracy reported only
