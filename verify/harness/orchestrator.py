@@ -1010,6 +1010,32 @@ def _adb_forward_remove(local_port: int, serial: str) -> None:
     subprocess.run(cmd, capture_output=True, timeout=10.0)
 
 
+def _wait_for_remote_log_pattern(
+    remote: "AdbRemote",
+    remote_path: str,
+    pattern: str,
+    timeout_s: float,
+    poll_s: float = 0.5,
+) -> bool:
+    """Poll a device-side file until `pattern` appears in its content.
+
+    Returns True when the pattern is found, False when `timeout_s` elapses.
+    Uses `adb shell cat <remote_path>` on each poll cycle so it works even
+    for files written by nohup/background processes that may not flush
+    immediately (line-buffered output eventually lands here).
+    """
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        rc, stdout, _stderr = remote.exec(
+            f"cat {shlex.quote(remote_path)} 2>/dev/null || true",
+            timeout=10.0,
+        )
+        if rc == 0 and pattern in (stdout or ""):
+            return True
+        time.sleep(poll_s)
+    return False
+
+
 def _run_scenario_adb_signal(
     spec: ScenarioSpec,
     device_cfg: Dict[str, Any],
@@ -1177,9 +1203,6 @@ def _run_scenario_adb_signal(
     mgr_env = dict(env_vars)
     mgr_env["RUST_LOG"] = "info"
 
-    # adb forward must be set up AFTER llm_manager binds, so we do it inside
-    # the background context below. For simplicity we set it up right after
-    # background start + a short wait.
     rc_a: Optional[int] = None
     timed_a = False
     total_delay = sum(float(e.get("delay_sec", 0.0)) for e in schedule)
@@ -1198,6 +1221,12 @@ def _run_scenario_adb_signal(
         extra_args=scenario_extra + forced_thread_args,
     )
 
+    # action_rc_remote: device-side file where engine exit code is written.
+    # Engine runs in background via AdbBackgroundProcess-like wrapper so that
+    # we can interleave the ExternalMonitor bind wait and signal_client start.
+    action_pidfile_remote = f"{remote_run_dir}/engine.pid"
+    action_rc_remote = f"{remote_run_dir}/engine.rc"
+
     t1 = time.monotonic()
     signal_proc = None
     try:
@@ -1210,13 +1239,54 @@ def _run_scenario_adb_signal(
             env_vars=mgr_env,
             startup_wait_s=0.5,
         ) as _mgr_proc:
-            # Give llm_manager time to bind both listeners.
+            # Give llm_manager time to bind the engine-facing TCP listener
+            # (port 9101). The ExternalMonitor port (9102) is bound only AFTER
+            # the engine client connects, so we cannot adb-forward yet.
             time.sleep(2.0)
 
-            # Tunnel host → device for the external-monitor port.
+            # Tunnel host → device for the external-monitor port. We set this
+            # up now so adb forward is ready before ExternalMonitor binds.
             _adb_forward(host_forward_port, ext_monitor_device_port, serial)
 
-            # Start signal_client in the background on the host.
+            # Start the engine in the background so we can wait for
+            # ExternalMonitor bind without blocking on engine completion.
+            # The wrapper shell captures the exit code to action_rc_remote.
+            env_prefix = AdbRemote._inline_env(env_vars)
+            engine_cmd_str = " ".join(shlex.quote(a) for a in action_cmd)
+            engine_script = (
+                f"({env_prefix}{engine_cmd_str} "
+                f"> {shlex.quote(action_stdout_remote)} "
+                f"2> {shlex.quote(action_stderr_remote)}; "
+                f"echo $? > {shlex.quote(action_rc_remote)}) & "
+                f"echo $! > {shlex.quote(action_pidfile_remote)}"
+            )
+            remote.exec(
+                f"sh -c {shlex.quote(engine_script)}",
+                timeout=15.0,
+            )
+
+            # Wait for ExternalMonitor to bind its TCP listener.
+            # ExternalMonitor only binds AFTER the engine client connects and
+            # sends its capabilities (manager/src/main.rs). On S25 with f16
+            # model: manager start → engine connect ≈ 11s. A fixed 15s
+            # pre-sleep was too short when generation is also fast (~10.8s),
+            # causing the directive to arrive after engine exit (ISSUE-7,
+            # 20260423_144239 run).
+            found = _wait_for_remote_log_pattern(
+                remote=remote,
+                remote_path=manager_stdout_remote,
+                pattern="[ExternalMonitor] TCP listening",
+                timeout_s=60.0,
+                poll_s=0.5,
+            )
+            if not found:
+                print(
+                    "  [warn] ExternalMonitor TCP bind not detected within 60s "
+                    "— proceeding anyway (signal may still reach engine)"
+                )
+
+            # Start signal_client immediately after ExternalMonitor is ready.
+            # --pre-sleep 0 because we already waited for the bind above.
             sig_cmd = [
                 sys.executable,
                 str(PROJECT_ROOT / "verify" / "harness" / "signal_client.py"),
@@ -1224,15 +1294,7 @@ def _run_scenario_adb_signal(
                 "--schedule", str(schedule_local),
                 "--log-file", str(signal_log_local),
                 "--connect-timeout", "30",
-                # Wait until the engine has loaded the model, connected to
-                # the manager, and the manager has built its monitor threads
-                # (ExternalMonitor only binds its TCP listener AFTER
-                # `create_transport` receives the engine client connection —
-                # see manager/src/main.rs:142/160). Measured on S25: manager
-                # start → engine connect ≈ 11s; previous 8s pre-sleep raced
-                # the ExternalMonitor bind and silently dropped the signal
-                # (verify v2 ISSUE-7, 20260423_135553 run).
-                "--pre-sleep", "15",
+                "--pre-sleep", "0",
             ]
             signal_proc = subprocess.Popen(
                 sig_cmd,
@@ -1241,15 +1303,48 @@ def _run_scenario_adb_signal(
                 cwd=str(PROJECT_ROOT),
             )
 
-            rc_a, timed_a = run_foreground_adb(
-                remote=remote, cmd=action_cmd,
-                local_stdout_path=action_stdout_local,
-                local_stderr_path=action_stderr_local,
-                adb_stderr_path=action_adb_stderr,
-                remote_log_stdout=action_stdout_remote,
-                remote_log_stderr=action_stderr_remote,
-                env_vars=env_vars, timeout_s=action_timeout,
-            )
+            # Wait for the engine background process to finish.
+            # Poll the rc file; fall back to action_timeout.
+            deadline_engine = time.monotonic() + action_timeout
+            while time.monotonic() < deadline_engine:
+                rc_chk, rc_out, _ = remote.exec(
+                    f"cat {shlex.quote(action_rc_remote)} 2>/dev/null || true",
+                    timeout=10.0,
+                )
+                if rc_chk == 0 and (rc_out or "").strip().isdigit():
+                    rc_a = int(rc_out.strip())
+                    break
+                time.sleep(1.0)
+            else:
+                timed_a = True
+                rc_a = -1
+                # Kill the engine process if it's still alive.
+                rc_pid, pid_out, _ = remote.exec(
+                    f"cat {shlex.quote(action_pidfile_remote)} 2>/dev/null || true",
+                    timeout=10.0,
+                )
+                if rc_pid == 0 and (pid_out or "").strip().isdigit():
+                    engine_pid = int(pid_out.strip())
+                    remote.exec(
+                        f"kill -TERM {engine_pid} 2>/dev/null; "
+                        f"sleep 1; kill -KILL {engine_pid} 2>/dev/null; true",
+                        timeout=15.0,
+                    )
+
+            # Pull engine stdout/stderr now that the process has exited.
+            try:
+                remote.pull(action_stdout_remote, action_stdout_local, retries=2, timeout=120.0)
+            except Exception as e:
+                print(f"  [warn] action.stdout pull failed: {e}")
+                if not action_stdout_local.exists():
+                    action_stdout_local.write_bytes(b"")
+            try:
+                remote.pull(action_stderr_remote, action_stderr_local, retries=2, timeout=120.0)
+            except Exception as e:
+                print(f"  [warn] action.stderr pull failed: {e}")
+                if not action_stderr_local.exists():
+                    action_stderr_local.write_bytes(b"")
+
             time.sleep(1.0)
     finally:
         if signal_proc is not None:
@@ -1272,6 +1367,14 @@ def _run_scenario_adb_signal(
         print(f"  [warn] action.jsonl pull failed: {e}")
         if not action_jsonl_local.exists():
             action_jsonl_local.write_bytes(b"")
+
+    # action.stdout / action.stderr were pulled inside the manager context
+    # block above (right after engine exit). Ensure fallback files exist in
+    # case the inner pull was skipped due to an early exception.
+    if not action_stdout_local.exists():
+        action_stdout_local.write_bytes(b"")
+    if not action_stderr_local.exists():
+        action_stderr_local.write_bytes(b"")
 
     if not manager_stderr_local.exists():
         manager_stderr_local.write_bytes(b"")
