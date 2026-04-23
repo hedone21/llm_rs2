@@ -478,7 +478,11 @@ struct Args {
 
     /// Maximum adaptive prefetch depth for offload KV cache pipeline.
     /// Higher values use more memory but can hide preload latency.
-    #[arg(long, default_value_t = 4)]
+    /// Combined with the controller's default initial depth (16), the
+    /// adaptive loop can spend essentially the entire decode trajectory
+    /// on increasing/decreasing depth without hitting the ceiling on
+    /// typical on-device workloads.
+    #[arg(long, default_value_t = 128)]
     max_prefetch_depth: usize,
 
     /// Use Rayon par_chunks_mut instead of SpinPool for F16 matmul (A/B benchmarking).

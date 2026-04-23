@@ -32,15 +32,33 @@ pub struct PrefetchController {
     decrease_patience: usize,
 }
 
+/// Default starting prefetch depth used by [`PrefetchController::new`].
+///
+/// Chosen to match typical on-device transformer layer counts (Llama 3.2 1B
+/// = 16 layers), so the pipeline starts fully primed and the adaptive loop
+/// only has to shrink if memory pressure or slack is observed.
+pub const DEFAULT_INITIAL_DEPTH: usize = 16;
+
 impl PrefetchController {
-    /// Create a new controller.
+    /// Create a new controller with [`DEFAULT_INITIAL_DEPTH`] as the starting
+    /// depth (clamped to `max_depth`).
     ///
     /// - `max_depth`: upper bound on prefetch depth (memory limit)
     /// - `num_layers`: total transformer layers (used as warmup period)
     pub fn new(max_depth: usize, num_layers: usize) -> Self {
+        Self::with_initial_depth(max_depth, DEFAULT_INITIAL_DEPTH, num_layers)
+    }
+
+    /// Create a new controller with an explicit starting depth.
+    ///
+    /// `initial_depth` is clamped to the range `[1, max_depth]`. Useful for
+    /// tests that want deterministic starting conditions or for callers that
+    /// want to start conservatively regardless of the global default.
+    pub fn with_initial_depth(max_depth: usize, initial_depth: usize, num_layers: usize) -> Self {
+        let max_depth = max_depth.max(1);
         Self {
-            depth: 1,
-            max_depth: max_depth.max(1),
+            depth: initial_depth.clamp(1, max_depth),
+            max_depth,
             preload_ema_us: 0.0,
             forward_ema_us: 0.0,
             alpha: 0.3,
@@ -152,7 +170,7 @@ mod tests {
     #[test]
     fn test_warmup_no_adjust() {
         let num_layers = 4;
-        let mut ctrl = PrefetchController::new(4, num_layers);
+        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
 
         // Record fewer samples than warmup → depth stays at 1
         for _ in 0..3 {
@@ -165,7 +183,7 @@ mod tests {
     #[test]
     fn test_increase_on_stall() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::new(4, num_layers);
+        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
         assert_eq!(ctrl.depth(), 1);
 
         // Record enough samples to exit warmup (preload > forward = stall)
@@ -186,7 +204,7 @@ mod tests {
     #[test]
     fn test_decrease_with_patience() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::new(4, num_layers);
+        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
 
         // Drive depth up first
         for _ in 0..3 {
@@ -231,7 +249,7 @@ mod tests {
     #[test]
     fn test_max_depth_cap() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::new(3, num_layers);
+        let mut ctrl = PrefetchController::with_initial_depth(3, 1, num_layers);
 
         // Stall many times
         for _ in 0..20 {
@@ -246,7 +264,7 @@ mod tests {
     #[test]
     fn test_no_oscillation() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::new(4, num_layers);
+        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
 
         // Warmup with stall → depth=2
         for _ in 0..3 {
@@ -275,5 +293,31 @@ mod tests {
             ctrl.depth() >= 2,
             "alternating should not cause depth to drop below 2"
         );
+    }
+
+    #[test]
+    fn test_default_initial_depth_is_clamped() {
+        // `new` starts at DEFAULT_INITIAL_DEPTH but is clamped down to
+        // `max_depth` when the latter is smaller.
+        let small = PrefetchController::new(4, 2);
+        assert_eq!(small.depth(), 4, "small max_depth clamps initial depth");
+
+        let large = PrefetchController::new(128, 2);
+        assert_eq!(
+            large.depth(),
+            DEFAULT_INITIAL_DEPTH,
+            "initial depth equals DEFAULT_INITIAL_DEPTH when max_depth allows it"
+        );
+    }
+
+    #[test]
+    fn test_with_initial_depth_clamps_to_range() {
+        // `initial_depth=0` is promoted to 1, and an oversized initial_depth
+        // is clamped to max_depth.
+        let floor = PrefetchController::with_initial_depth(8, 0, 2);
+        assert_eq!(floor.depth(), 1);
+
+        let ceil = PrefetchController::with_initial_depth(8, 999, 2);
+        assert_eq!(ceil.depth(), 8);
     }
 }
