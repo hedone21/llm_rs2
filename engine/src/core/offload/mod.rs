@@ -222,6 +222,17 @@ impl OffloadKVCache {
         self.preloaded = false;
     }
 
+    /// Clear the cache: truncate store, reset counters, release attn buffers.
+    /// Intended for session reset in multi-turn chat (`/reset` command).
+    pub fn reset_session(&mut self) {
+        self.store.clear();
+        self.current_pos = 0;
+        self.store_behind = 0;
+        self.preloaded = false;
+        self.attn_k_buf = None;
+        self.attn_v_buf = None;
+    }
+
     /// Re-arm preloaded flag for cross-token buffer retention.
     /// Safe to call after `get_view()`: attn buffers still hold valid data
     /// because `get_view()` copies out (does not consume the source).

@@ -606,14 +606,24 @@ fn main() -> anyhow::Result<()> {
         args.temperature = 0.0;
     }
 
-    // --chat conflict validation (v1 supports only the standard forward path).
+    // --chat conflict validation.
+    // Standard / kivi / offload paths are each supported; experiment/eval
+    // modes and advanced GPU features remain incompatible.
     if args.chat {
+        let kv_offload_active = !args.kv_offload.is_empty() && args.kv_offload != "none";
+        let has_eviction = args.eviction_policy != "none";
+        if args.kivi && kv_offload_active {
+            anyhow::bail!("--chat: --kivi and --kv-offload are mutually exclusive");
+        }
+        if args.kivi && has_eviction {
+            anyhow::bail!("--chat: --kivi cannot combine with --eviction-policy in v1 (pick one)");
+        }
+        if kv_offload_active && has_eviction {
+            anyhow::bail!(
+                "--chat: --kv-offload cannot combine with --eviction-policy in v1 (pick one)"
+            );
+        }
         let conflicts: &[(&str, bool)] = &[
-            ("--kivi", args.kivi),
-            (
-                "--kv-offload",
-                !args.kv_offload.is_empty() && args.kv_offload != "none",
-            ),
             ("--eval-ll", args.eval_ll),
             ("--ppl", args.ppl.is_some()),
             ("--prompt-batch", args.prompt_batch.is_some()),
@@ -625,7 +635,7 @@ fn main() -> anyhow::Result<()> {
         ];
         if let Some((flag, _)) = conflicts.iter().find(|(_, enabled)| *enabled) {
             anyhow::bail!(
-                "--chat is incompatible with {} (v1 supports only the standard forward path)",
+                "--chat is incompatible with {} (v1 supports standard / --kivi / --kv-offload / --eviction-policy paths)",
                 flag
             );
         }
@@ -1159,7 +1169,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
-    // ── Chat REPL mode (standard forward path only) ──
+    // ── Chat REPL mode ──
+    // Three dispatch paths: standard (KVCache, with optional eviction),
+    // KIVI (quantized KV), and KV-offload (disk/raw store).
     if args.chat {
         let sampling_config = SamplingConfig {
             temperature: args.temperature,
@@ -1168,11 +1180,41 @@ fn main() -> anyhow::Result<()> {
             repetition_penalty: args.repetition_penalty,
             repetition_window: args.repetition_window,
         };
-        return run_chat(
+        let kv_offload_active = !args.kv_offload.is_empty() && args.kv_offload != "none";
+        if args.kivi {
+            return run_chat_kivi(
+                &args,
+                &model,
+                &tokenizer,
+                &backend,
+                &memory,
+                &sampling_config,
+                kv_heads,
+                head_dim,
+                num_layers,
+                max_seq_len,
+            );
+        }
+        if kv_offload_active {
+            return run_chat_offload(
+                &args,
+                &model,
+                &tokenizer,
+                &backend,
+                &memory,
+                &sampling_config,
+                kv_heads,
+                head_dim,
+                num_layers,
+                max_seq_len,
+            );
+        }
+        return run_chat_standard(
             &args,
             &model,
             &tokenizer,
             &backend,
+            &memory,
             &mut kv_caches,
             &sampling_config,
             max_seq_len,
@@ -7224,97 +7266,57 @@ fn resolve_token_ids(
     Ok(out)
 }
 
-fn chat_prefill_and_update_kv(
-    model: &TransformerModel,
-    backend: &Arc<dyn Backend>,
-    memory: &dyn Memory,
-    kv_caches: &mut [KVCache],
-    tokens: &[u32],
-    start_pos: usize,
-) -> anyhow::Result<Option<Vec<f32>>> {
-    // Build token tensor on backend (host tensor copied via backend.copy_from).
-    let cpu_backend = Arc::new(CpuBackend::new());
-    let input_buf = Galloc::new().alloc(tokens.len() * 4, DType::U8)?;
-    unsafe {
-        let ptr = input_buf.as_mut_ptr() as *mut u32;
-        for (i, &id) in tokens.iter().enumerate() {
-            *ptr.add(i) = id;
-        }
+// Chat turn executor: per-variant state machine for prefill/decode/eviction/reset.
+// Keeps the REPL loop KV-type-agnostic. See `run_chat_repl`.
+trait ChatTurnExec {
+    /// Current KV position.
+    fn pos(&self) -> usize;
+    /// Reset session state (KV position, accumulator, offload store).
+    fn reset(&mut self);
+    /// Prefill a batch of tokens, advancing `pos` by `tokens.len()` and
+    /// returning the last-position logits (host f32).
+    fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>>;
+    /// Decode a single token, advancing `pos` by 1 and returning logits.
+    fn decode_step(&mut self, token: u32) -> anyhow::Result<Vec<f32>>;
+    /// Ensure there is room for `additional` new tokens before `max_seq_len`.
+    /// Eviction-capable execs may run force_evict here. Non-evicting execs
+    /// return Err on overflow.
+    fn ensure_capacity(&mut self, additional: usize, max_seq_len: usize) -> anyhow::Result<()>;
+    /// End-of-turn maintenance hook (e.g. opportunistic auto-eviction).
+    fn on_turn_end(&mut self) -> anyhow::Result<()> {
+        Ok(())
     }
-    let cpu_input = Tensor::new(Shape::new(vec![1, tokens.len()]), input_buf, cpu_backend);
-    let input_tensor = backend.copy_from(&cpu_input)?;
-
-    let vocab_size = model.config.vocab_size;
-    let logits_buf = memory.alloc(vocab_size * 4, DType::F32)?;
-    let mut logits_out = Tensor::new(
-        Shape::new(vec![1, 1, vocab_size]),
-        logits_buf,
-        backend.clone(),
-    );
-
-    model.forward_into(TransformerModelForwardArgs {
-        input_tokens: &input_tensor,
-        start_pos,
-        kv_caches,
-        backend,
-        memory,
-        logits_out: &mut logits_out,
-        x_gen: None,
-        workspace: None,
-        score_accumulator: None,
-        profiler: None,
-        skip_config: None,
-        importance_collector: None,
-        logits_last_only: true,
-        variance_collector: None,
-        prefill_workspace: None,
-    })?;
-
-    let mut host_logits = vec![0.0f32; vocab_size];
-    unsafe {
-        let ptr = host_logits.as_mut_ptr() as *mut u8;
-        let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
-        backend.read_buffer(&logits_out, slice)?;
-    }
-    Ok(Some(host_logits))
+    /// Content of the `/stats` line.
+    fn stats_line(&self, max_seq_len: usize) -> String;
 }
 
+/// Shared REPL loop driving a `ChatTurnExec`. Handles template rendering,
+/// stdin + socket input, slash commands, streaming decode, and turn-end
+/// hooks. All KV-type-specific work is delegated to the exec.
 #[allow(clippy::too_many_arguments)]
-fn run_chat(
+fn run_chat_repl<E: ChatTurnExec>(
     args: &Args,
-    model: &TransformerModel,
+    model_arch: llm_rs2::models::config::ModelArch,
     tokenizer: &Tokenizer,
-    backend: &Arc<dyn Backend>,
-    kv_caches: &mut [KVCache],
+    eos_token_id: u32,
+    vocab_size: usize,
     sampling_config: &SamplingConfig,
     max_seq_len: usize,
+    exec: &mut E,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::chat_template::ChatTemplate;
     use std::collections::VecDeque;
     use std::io::Write;
 
-    let memory: Arc<dyn Memory> = Arc::new(Galloc::new());
-
-    let arch = model.config.arch;
-    let template = ChatTemplate::new(arch)?;
-    let vocab_size = model.config.vocab_size;
-    let hidden_size = model.config.hidden_size;
-    let q_dim = model.config.num_attention_heads * model.config.head_dim;
-    let k_dim = model.config.num_key_value_heads * model.config.head_dim;
-    let v_dim = k_dim;
-    let ffn_hidden = model.config.intermediate_size;
-
-    // Stop tokens: required literals must resolve; others are best-effort.
+    let template = ChatTemplate::new(model_arch)?;
     let stop_ids = {
         let lits = template.stop_token_literals();
         if lits.is_empty() {
             anyhow::bail!("chat template has no stop token literals");
         }
-        // First literal is required (authoritative turn terminator), rest optional.
         let mut ids = resolve_token_ids(tokenizer, &[lits[0]], true)?;
         ids.extend(resolve_token_ids(tokenizer, &lits[1..], false)?);
-        // Also accept the model's configured EOS id as a stop token.
-        ids.push(model.config.eos_token_id);
+        ids.push(eos_token_id);
         ids.sort_unstable();
         ids.dedup();
         ids
@@ -7332,38 +7334,7 @@ fn run_chat(
         None
     };
 
-    // Pre-allocate decode workspace.
-    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
-    let mut decode_logits =
-        Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
-    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
-    let mut x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
-    let mut gen_ws = LayerWorkspace::new(
-        WorkspaceConfig {
-            batch_size: 1,
-            dim: hidden_size,
-            q_dim,
-            k_dim,
-            v_dim,
-            ffn_hidden,
-            n_heads: model.config.num_attention_heads,
-            max_seq_len,
-        },
-        memory.as_ref(),
-        backend.clone(),
-    )?;
-    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
-    let cpu_gen_input = Tensor::new(
-        Shape::new(vec![1, 1]),
-        cpu_gen_buf,
-        Arc::new(CpuBackend::new()),
-    );
-    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
-    let mut gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
-
-    let mut pos: usize = 0;
-
-    // Optional system prompt prefill
+    // Optional system prompt prefill (stays in KV across turns).
     if let Some(sys) = &args.system_prompt {
         let rendered = template.render_system(sys);
         let mut ids = tokenizer
@@ -7381,21 +7352,17 @@ fn run_chat(
                 max_seq_len
             );
         }
-        chat_prefill_and_update_kv(model, backend, memory.as_ref(), kv_caches, &ids, pos)?;
-        pos += ids.len();
+        let _ = exec.prefill(&ids)?;
     }
 
-    // Set up input sources
     let input_rx = spawn_chat_input_sources(args.chat_socket.as_deref(), args.chat_tcp.as_deref())?;
-
-    // --prompt becomes the first user message when non-empty.
     let mut first_user: Option<String> =
         (!args.prompt.trim().is_empty()).then(|| args.prompt.clone());
     let mut recent: VecDeque<u32> = VecDeque::new();
 
     eprintln!(
         "[Chat] Ready. Arch={:?}, max_seq_len={}. Commands: /exit /reset /stats /help",
-        arch, max_seq_len
+        model_arch, max_seq_len
     );
     let mut stdout_lock = std::io::stdout();
 
@@ -7427,14 +7394,11 @@ fn run_chat(
                 continue;
             }
             "/stats" => {
-                println!("kv_pos={}/{}", pos, max_seq_len);
+                println!("{}", exec.stats_line(max_seq_len));
                 continue;
             }
             "/reset" => {
-                for c in kv_caches.iter_mut() {
-                    c.current_pos = 0;
-                }
-                pos = 0;
+                exec.reset();
                 recent.clear();
                 println!("(session reset)");
                 continue;
@@ -7448,48 +7412,35 @@ fn run_chat(
             .map_err(|e| anyhow::anyhow!("encode user turn: {}", e))?
             .get_ids()
             .to_vec();
-        if pos == 0
+        if exec.pos() == 0
             && let Some(b) = bos_id
         {
             turn_ids.insert(0, b);
         }
 
-        // Hard context-overflow check (no auto eviction in v1).
-        if pos + turn_ids.len() + args.num_tokens > max_seq_len {
-            let msg = format!(
-                "error: context would exceed max_seq_len={} (pos={}, incoming={}, reserve={}). \
-                 Start a new session with /reset or increase --max-seq-len.",
-                max_seq_len,
-                pos,
-                turn_ids.len(),
-                args.num_tokens
-            );
+        // Capacity check: eviction-capable execs may reclaim space here.
+        if let Err(e) = exec.ensure_capacity(turn_ids.len() + args.num_tokens, max_seq_len) {
+            let msg = format!("error: {}", e);
             eprintln!("{}", msg);
             write_reply_bytes(reply_writer.as_ref(), msg.as_bytes());
             finish_reply_stream(reply_writer.as_ref());
-            anyhow::bail!("context overflow");
+            anyhow::bail!("context overflow: {}", e);
         }
 
-        // Prefill user turn + assistant header (logits_last_only → sample first token).
-        let prefill_logits =
-            chat_prefill_and_update_kv(model, backend, memory.as_ref(), kv_caches, &turn_ids, pos)?;
-        pos += turn_ids.len();
+        let mut prefill_logits = exec.prefill(&turn_ids)?;
 
-        // Sample the first assistant token from prefill logits.
         let mut accum: Vec<u32> = Vec::new();
         let mut printed_bytes: usize = 0;
         let mut indices_buf: Vec<usize> = Vec::with_capacity(vocab_size);
-        let first_tok = if let Some(mut logits) = prefill_logits {
+        let first_tok = {
             let recent_slice: Vec<u32> = recent.iter().copied().collect();
             sampling::sample(
-                &mut logits,
+                &mut prefill_logits,
                 &recent_slice,
                 vocab_size,
                 sampling_config,
                 Some(&mut indices_buf),
             )
-        } else {
-            anyhow::bail!("prefill did not produce logits");
         };
 
         let mut cur_tok = first_tok;
@@ -7503,7 +7454,6 @@ fn run_chat(
                 recent.pop_front();
             }
 
-            // Streaming decode of accumulated tokens (byte-prefix diff).
             let decoded = tokenizer.decode(&accum, true).unwrap_or_default();
             if decoded.len() > printed_bytes {
                 let piece = &decoded[printed_bytes..];
@@ -7513,44 +7463,12 @@ fn run_chat(
                 printed_bytes = decoded.len();
             }
 
-            // Advance KV with the just-sampled token to compute the next logits.
-            unsafe {
-                *(cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = cur_tok;
-            }
-            backend.write_buffer(&mut gen_input_gpu, unsafe {
-                std::slice::from_raw_parts(cpu_gen_input.buffer().as_ptr(), 4)
-            })?;
+            let mut logits_host = exec.decode_step(cur_tok)?;
 
-            model.forward_into(TransformerModelForwardArgs {
-                input_tokens: &gen_input_gpu,
-                start_pos: pos,
-                kv_caches,
-                backend,
-                memory: memory.as_ref(),
-                logits_out: &mut decode_logits,
-                x_gen: Some(&mut x_gen),
-                workspace: Some(&mut gen_ws),
-                score_accumulator: None,
-                profiler: None,
-                skip_config: None,
-                importance_collector: None,
-                logits_last_only: true,
-                variance_collector: None,
-                prefill_workspace: None,
-            })?;
-            pos += 1;
-
-            // Hard stop if we've hit cache capacity ceiling.
-            if pos + 1 >= max_seq_len {
+            if exec.pos() + 1 >= max_seq_len {
                 break;
             }
 
-            let mut logits_host = vec![0.0f32; vocab_size];
-            unsafe {
-                let ptr = logits_host.as_mut_ptr() as *mut u8;
-                let slice = std::slice::from_raw_parts_mut(ptr, vocab_size * 4);
-                backend.read_buffer(&decode_logits, slice)?;
-            }
             let recent_slice: Vec<u32> = recent.iter().copied().collect();
             cur_tok = sampling::sample(
                 &mut logits_host,
@@ -7561,18 +7479,12 @@ fn run_chat(
             );
         }
 
-        // Append assistant EOT to KV so the next turn sees it in context.
-        if !assistant_eot_ids.is_empty() && pos + assistant_eot_ids.len() <= max_seq_len {
-            chat_prefill_and_update_kv(
-                model,
-                backend,
-                memory.as_ref(),
-                kv_caches,
-                &assistant_eot_ids,
-                pos,
-            )?;
-            pos += assistant_eot_ids.len();
+        // Record assistant EOT into KV so the next turn sees a well-formed boundary.
+        if !assistant_eot_ids.is_empty() && exec.pos() + assistant_eot_ids.len() <= max_seq_len {
+            let _ = exec.prefill(&assistant_eot_ids)?;
         }
+
+        exec.on_turn_end()?;
 
         println!();
         stdout_lock.flush().ok();
@@ -7580,4 +7492,973 @@ fn run_chat(
     }
 
     Ok(())
+}
+
+// ─── Standard chat executor (KVCache; supports eviction policies) ─────────────
+
+struct StandardTurnExec<'a> {
+    model: &'a TransformerModel,
+    backend: &'a Arc<dyn Backend>,
+    memory: Arc<dyn Memory>,
+    kv_caches: &'a mut [KVCache],
+    // Decode workspace (reused across tokens).
+    decode_logits: Tensor,
+    x_gen: Tensor,
+    gen_ws: LayerWorkspace,
+    cpu_gen_input: Tensor,
+    gen_input_gpu: Tensor,
+    vocab_size: usize,
+    pos: usize,
+    // Eviction wiring (None when --eviction-policy == "none").
+    cache_manager: Option<CacheManager>,
+    score_accumulator: Option<AttentionScoreAccumulator>,
+    eviction_policy_name: String,
+    score_based: bool,
+    target_ratio: f32,
+    evicted_total: usize,
+}
+
+impl<'a> StandardTurnExec<'a> {
+    /// Build a f32 token tensor on backend.
+    fn tokens_to_backend_tensor(&self, tokens: &[u32]) -> anyhow::Result<Tensor> {
+        let cpu_backend = Arc::new(CpuBackend::new());
+        let input_buf = Galloc::new().alloc(tokens.len() * 4, DType::U8)?;
+        unsafe {
+            let ptr = input_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in tokens.iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_input = Tensor::new(Shape::new(vec![1, tokens.len()]), input_buf, cpu_backend);
+        self.backend.copy_from(&cpu_input)
+    }
+
+    /// Run one forward_into pass with the standard KVCache and optional
+    /// score accumulator. Returns last-position logits read to host f32.
+    fn forward_prefill_standard(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let input_tensor = self.tokens_to_backend_tensor(tokens)?;
+        let logits_buf = self.memory.alloc(self.vocab_size * 4, DType::F32)?;
+        let mut logits_out = Tensor::new(
+            Shape::new(vec![1, 1, self.vocab_size]),
+            logits_buf,
+            self.backend.clone(),
+        );
+
+        if let Some(acc) = self.score_accumulator.as_mut() {
+            acc.begin_step();
+        }
+
+        self.model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos: self.pos,
+            kv_caches: self.kv_caches,
+            backend: self.backend,
+            memory: self.memory.as_ref(),
+            logits_out: &mut logits_out,
+            x_gen: None,
+            workspace: None,
+            score_accumulator: self.score_accumulator.as_mut(),
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+            logits_last_only: true,
+            variance_collector: None,
+            prefill_workspace: None,
+        })?;
+        self.pos += tokens.len();
+
+        let mut host = vec![0.0f32; self.vocab_size];
+        unsafe {
+            let ptr = host.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, self.vocab_size * 4);
+            self.backend.read_buffer(&logits_out, slice)?;
+        }
+        Ok(host)
+    }
+
+    #[cfg(feature = "opencl")]
+    fn gpu_sync_scores(&mut self) -> anyhow::Result<()> {
+        if let Some(ocl_be) = self
+            .backend
+            .as_any()
+            .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+            && let Some(gpu_acc) = ocl_be.gpu_score_acc()
+            && gpu_acc.is_active()
+        {
+            let (flat, head) = gpu_acc.sync_to_cpu(ocl_be.queue.as_core())?;
+            if let Some(ref mut acc) = self.score_accumulator {
+                acc.import_gpu_scores(&flat, &head);
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "opencl"))]
+    fn gpu_sync_scores(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Run eviction. Returns the number of tokens removed (0 if no-op).
+    fn run_eviction(&mut self, force: bool) -> anyhow::Result<usize> {
+        if self.cache_manager.is_none() {
+            return Ok(0);
+        }
+        self.gpu_sync_scores()?;
+
+        let before_len = self.kv_caches[0].current_pos;
+        let scores_opt = self
+            .score_accumulator
+            .as_ref()
+            .filter(|acc| acc.is_active())
+            .map(|acc| acc.importance_scores().to_vec());
+
+        let cache_manager = self.cache_manager.as_ref().unwrap();
+        let result = if force {
+            match (&scores_opt, self.score_based) {
+                (Some(scores), true) => cache_manager.force_evict_with_scores(
+                    self.kv_caches,
+                    self.target_ratio,
+                    scores,
+                )?,
+                _ => cache_manager.force_evict(self.kv_caches, self.target_ratio)?,
+            }
+        } else {
+            match (&scores_opt, self.score_based) {
+                (Some(scores), true) => {
+                    cache_manager.maybe_evict_with_scores(self.kv_caches, scores)?
+                }
+                _ => cache_manager.maybe_evict(self.kv_caches)?,
+            }
+        };
+
+        let removed = before_len.saturating_sub(self.kv_caches[0].current_pos);
+        if result.evicted {
+            self.pos = self.kv_caches[0].current_pos;
+            self.evicted_total += removed;
+            eprintln!(
+                "[Chat/Evict] policy={} before={} after={} removed={}",
+                self.eviction_policy_name, before_len, self.pos, removed
+            );
+        }
+        Ok(removed)
+    }
+}
+
+impl<'a> ChatTurnExec for StandardTurnExec<'a> {
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn reset(&mut self) {
+        for c in self.kv_caches.iter_mut() {
+            c.current_pos = 0;
+        }
+        if let Some(acc) = self.score_accumulator.as_mut() {
+            acc.reset();
+        }
+        self.pos = 0;
+        self.evicted_total = 0;
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        self.forward_prefill_standard(tokens)
+    }
+
+    fn decode_step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+        if let Some(acc) = self.score_accumulator.as_mut() {
+            acc.begin_step();
+        }
+        unsafe {
+            *(self.cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token;
+        }
+        self.backend.write_buffer(&mut self.gen_input_gpu, unsafe {
+            std::slice::from_raw_parts(self.cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
+
+        self.model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &self.gen_input_gpu,
+            start_pos: self.pos,
+            kv_caches: self.kv_caches,
+            backend: self.backend,
+            memory: self.memory.as_ref(),
+            logits_out: &mut self.decode_logits,
+            x_gen: Some(&mut self.x_gen),
+            workspace: Some(&mut self.gen_ws),
+            score_accumulator: self.score_accumulator.as_mut(),
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+            logits_last_only: true,
+            variance_collector: None,
+            prefill_workspace: None,
+        })?;
+        self.pos += 1;
+
+        let mut host = vec![0.0f32; self.vocab_size];
+        unsafe {
+            let ptr = host.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, self.vocab_size * 4);
+            self.backend.read_buffer(&self.decode_logits, slice)?;
+        }
+        Ok(host)
+    }
+
+    fn ensure_capacity(&mut self, additional: usize, max_seq_len: usize) -> anyhow::Result<()> {
+        if self.pos + additional <= max_seq_len {
+            return Ok(());
+        }
+        if self.cache_manager.is_some() {
+            // Force eviction; then re-check.
+            self.run_eviction(true)?;
+            if self.pos + additional <= max_seq_len {
+                return Ok(());
+            }
+        }
+        anyhow::bail!(
+            "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
+             Use /reset or increase --max-seq-len.",
+            max_seq_len,
+            self.pos,
+            additional
+        );
+    }
+
+    fn on_turn_end(&mut self) -> anyhow::Result<()> {
+        if self.cache_manager.is_none() {
+            return Ok(());
+        }
+        let capacity = self.kv_caches[0].capacity();
+        let at_pressure = self.pos >= capacity.saturating_mul(9) / 10;
+        if at_pressure && self.score_based {
+            self.run_eviction(true)?;
+        } else {
+            self.run_eviction(false)?;
+        }
+        Ok(())
+    }
+
+    fn stats_line(&self, max_seq_len: usize) -> String {
+        format!(
+            "kv_pos={}/{} policy={} evicted_total={}",
+            self.pos, max_seq_len, self.eviction_policy_name, self.evicted_total
+        )
+    }
+}
+
+/// Build a CacheManager + AttentionScoreAccumulator for chat's eviction mode.
+/// Returns (manager, accumulator, score_based, policy_name, target_ratio).
+/// When `args.eviction_policy == "none"`, the manager is `None`.
+#[allow(clippy::type_complexity)]
+fn build_chat_eviction(
+    args: &Args,
+    model: &TransformerModel,
+    backend: &Arc<dyn Backend>,
+    max_seq_len: usize,
+) -> anyhow::Result<(
+    Option<CacheManager>,
+    Option<AttentionScoreAccumulator>,
+    bool,
+    String,
+    f32,
+)> {
+    if args.eviction_policy == "none" {
+        return Ok((None, None, false, "none".to_string(), 1.0));
+    }
+
+    let _ = backend;
+    let actual_protected_prefix =
+        args.protected_prefix
+            .unwrap_or(match args.eviction_policy.as_str() {
+                "h2o" | "h2o_plus" | "d2o" => 4,
+                "streaming" => args.sink_size,
+                _ => 4,
+            });
+
+    let monitor: Box<dyn llm_rs2::core::sys_monitor::SystemMonitor> = if backend.is_discrete_gpu() {
+        Box::new(NoOpMonitor)
+    } else {
+        Box::new(LinuxSystemMonitor)
+    };
+    let threshold_bytes = args.memory_threshold_mb * 1024 * 1024;
+
+    let mut cache_manager = if args.eviction_policy == "d2o" {
+        let d2o_handler = D2OHandler::new(D2OConfig {
+            keep_ratio: args.d2o_keep_ratio,
+            protected_prefix: actual_protected_prefix,
+            target_ratio: args.eviction_target_ratio,
+            ema_alpha: args.d2o_ema_alpha,
+            ema_beta: args.d2o_ema_beta,
+            use_layer_allocation: args.d2o_layer_alloc,
+            protected_layers: args.d2o_protected_layers.clone().unwrap_or_default(),
+        });
+        let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
+            min_level: PressureLevel::Warning,
+            handler: Box::new(d2o_handler),
+        }]);
+        CacheManager::with_pipeline(pipeline, monitor, threshold_bytes)
+    } else {
+        let policy: Box<dyn llm_rs2::core::eviction::EvictionPolicy> = match args
+            .eviction_policy
+            .as_str()
+        {
+            "sliding" => Box::new(SlidingWindowPolicy::new(
+                args.eviction_window,
+                actual_protected_prefix,
+            )),
+            "streaming" => {
+                use llm_rs2::core::eviction::StreamingLLMPolicy;
+                let window = if args.streaming_window > 0 {
+                    args.streaming_window
+                } else if args.kv_budget > 0 {
+                    args.kv_budget.saturating_sub(args.sink_size)
+                } else {
+                    args.eviction_window
+                };
+                Box::new(StreamingLLMPolicy::new(args.sink_size, window))
+            }
+            "h2o" => Box::new(H2OPolicy::new(
+                args.h2o_recent_window,
+                args.h2o_keep_ratio,
+                actual_protected_prefix,
+            )),
+            "h2o_plus" => Box::new(H2OPlusPolicy::new(
+                args.h2o_recent_window,
+                args.h2o_keep_ratio,
+                actual_protected_prefix,
+            )),
+            other => anyhow::bail!(
+                "Unknown eviction policy for --chat: '{}'. Use: none, sliding, streaming, h2o, h2o_plus, d2o",
+                other
+            ),
+        };
+        CacheManager::new(policy, monitor, threshold_bytes, args.eviction_target_ratio)
+    };
+    cache_manager.set_event_sink(Arc::new(StderrDiagnosticSink));
+
+    // Accumulator setup: build for any active policy so sliding/streaming
+    // still populate importance for observability; score-based policies need it.
+    let score_based = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
+    // GQA accumulator: always active in chat. h2o_plus strictly requires it;
+    // other policies benefit from per-head scores for future CAOTE / head budgets.
+    let mut acc = AttentionScoreAccumulator::new_gqa(
+        max_seq_len,
+        model.config.num_attention_heads,
+        model.config.num_key_value_heads,
+        model.config.num_hidden_layers,
+        args.h2o_tracked_layers,
+        args.h2o_decay,
+    );
+    acc.set_active(true);
+    acc.set_time_normalize(!args.h2o_raw_scores);
+
+    // Init GPU-side accumulator when available.
+    #[cfg(feature = "opencl")]
+    if let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+    {
+        let _ = ocl_be.init_gpu_score_acc(
+            model.config.num_hidden_layers,
+            model.config.num_attention_heads,
+            model.config.num_key_value_heads,
+            max_seq_len,
+            args.h2o_decay,
+        );
+        if let Some(gpu_acc) = ocl_be.gpu_score_acc_mut() {
+            gpu_acc.set_active(true);
+        }
+    }
+
+    Ok((
+        Some(cache_manager),
+        Some(acc),
+        score_based,
+        args.eviction_policy.clone(),
+        args.eviction_target_ratio,
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chat_standard(
+    args: &Args,
+    model: &TransformerModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &Arc<dyn Memory>,
+    kv_caches: &mut [KVCache],
+    sampling_config: &SamplingConfig,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    let vocab_size = model.config.vocab_size;
+    let hidden_size = model.config.hidden_size;
+    let q_dim = model.config.num_attention_heads * model.config.head_dim;
+    let k_dim = model.config.num_key_value_heads * model.config.head_dim;
+    let v_dim = k_dim;
+    let ffn_hidden = model.config.intermediate_size;
+
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let decode_logits = Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
+
+    let (cache_manager, score_accumulator, score_based, policy_name, target_ratio) =
+        build_chat_eviction(args, model, backend, max_seq_len)?;
+
+    let mut exec = StandardTurnExec {
+        model,
+        backend,
+        memory: memory.clone(),
+        kv_caches,
+        decode_logits,
+        x_gen,
+        gen_ws,
+        cpu_gen_input,
+        gen_input_gpu,
+        vocab_size,
+        pos: 0,
+        cache_manager,
+        score_accumulator,
+        eviction_policy_name: policy_name,
+        score_based,
+        target_ratio,
+        evicted_total: 0,
+    };
+
+    run_chat_repl(
+        args,
+        model.config.arch,
+        tokenizer,
+        model.config.eos_token_id,
+        vocab_size,
+        sampling_config,
+        max_seq_len,
+        &mut exec,
+    )
+}
+
+// ─── KIVI chat executor (quantized KV cache) ──────────────────────────────────
+
+struct KiviTurnExec<'a> {
+    model: &'a TransformerModel,
+    backend: &'a Arc<dyn Backend>,
+    memory: Arc<dyn Memory>,
+    kv_caches: Vec<KiviCache>,
+    decode_logits: Tensor,
+    x_gen: Tensor,
+    gen_ws: LayerWorkspace,
+    cpu_gen_input: Tensor,
+    gen_input_gpu: Tensor,
+    vocab_size: usize,
+    pos: usize,
+    bits: u8,
+    residual_size: usize,
+}
+
+impl<'a> KiviTurnExec<'a> {
+    fn tokens_to_backend_tensor(&self, tokens: &[u32]) -> anyhow::Result<Tensor> {
+        let cpu_backend = Arc::new(CpuBackend::new());
+        let input_buf = Galloc::new().alloc(tokens.len() * 4, DType::U8)?;
+        unsafe {
+            let ptr = input_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in tokens.iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_input = Tensor::new(Shape::new(vec![1, tokens.len()]), input_buf, cpu_backend);
+        self.backend.copy_from(&cpu_input)
+    }
+}
+
+impl<'a> ChatTurnExec for KiviTurnExec<'a> {
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn reset(&mut self) {
+        for c in self.kv_caches.iter_mut() {
+            c.reset();
+        }
+        self.pos = 0;
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let input_tensor = self.tokens_to_backend_tensor(tokens)?;
+        let logits_buf = self.memory.alloc(self.vocab_size * 4, DType::F32)?;
+        let mut logits_out = Tensor::new(
+            Shape::new(vec![1, 1, self.vocab_size]),
+            logits_buf,
+            self.backend.clone(),
+        );
+        self.model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &input_tensor,
+            start_pos: self.pos,
+            kv_caches: &mut self.kv_caches,
+            backend: self.backend,
+            memory: self.memory.as_ref(),
+            logits_out: &mut logits_out,
+            x_gen: None,
+            workspace: None,
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+            logits_last_only: true,
+            variance_collector: None,
+            prefill_workspace: None,
+        })?;
+        self.pos += tokens.len();
+
+        let mut host = vec![0.0f32; self.vocab_size];
+        unsafe {
+            let ptr = host.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, self.vocab_size * 4);
+            self.backend.read_buffer(&logits_out, slice)?;
+        }
+        Ok(host)
+    }
+
+    fn decode_step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+        unsafe {
+            *(self.cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token;
+        }
+        self.backend.write_buffer(&mut self.gen_input_gpu, unsafe {
+            std::slice::from_raw_parts(self.cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
+        self.model.forward_into(TransformerModelForwardArgs {
+            input_tokens: &self.gen_input_gpu,
+            start_pos: self.pos,
+            kv_caches: &mut self.kv_caches,
+            backend: self.backend,
+            memory: self.memory.as_ref(),
+            logits_out: &mut self.decode_logits,
+            x_gen: Some(&mut self.x_gen),
+            workspace: Some(&mut self.gen_ws),
+            score_accumulator: None,
+            profiler: None,
+            skip_config: None,
+            importance_collector: None,
+            logits_last_only: true,
+            variance_collector: None,
+            prefill_workspace: None,
+        })?;
+        self.pos += 1;
+
+        let mut host = vec![0.0f32; self.vocab_size];
+        unsafe {
+            let ptr = host.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, self.vocab_size * 4);
+            self.backend.read_buffer(&self.decode_logits, slice)?;
+        }
+        Ok(host)
+    }
+
+    fn ensure_capacity(&mut self, additional: usize, max_seq_len: usize) -> anyhow::Result<()> {
+        if self.pos + additional > max_seq_len {
+            anyhow::bail!(
+                "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
+                 Use /reset or increase --max-seq-len.",
+                max_seq_len,
+                self.pos,
+                additional
+            );
+        }
+        Ok(())
+    }
+
+    fn stats_line(&self, max_seq_len: usize) -> String {
+        format!(
+            "kv_pos={}/{} mode=kivi bits={} residual={}",
+            self.pos, max_seq_len, self.bits, self.residual_size
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chat_kivi(
+    args: &Args,
+    model: &TransformerModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &Arc<dyn Memory>,
+    sampling_config: &SamplingConfig,
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    let vocab_size = model.config.vocab_size;
+    let hidden_size = model.config.hidden_size;
+    let q_dim = model.config.num_attention_heads * head_dim;
+    let k_dim = kv_heads * head_dim;
+    let v_dim = kv_heads * head_dim;
+    let ffn_hidden = model.config.intermediate_size;
+    let residual_size = args.kivi_residual_size;
+    let bits = args.kivi_bits;
+
+    eprintln!(
+        "[Chat/KIVI] bits={}, residual_size={}, max_seq_len={}",
+        bits, residual_size, max_seq_len
+    );
+
+    let kv_caches: Vec<KiviCache> = (0..num_layers)
+        .map(|_| {
+            KiviCache::new_gpu(
+                kv_heads,
+                head_dim,
+                max_seq_len,
+                residual_size,
+                bits,
+                backend.clone(),
+                memory.clone(),
+            )
+        })
+        .collect();
+
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let decode_logits = Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
+
+    let mut exec = KiviTurnExec {
+        model,
+        backend,
+        memory: memory.clone(),
+        kv_caches,
+        decode_logits,
+        x_gen,
+        gen_ws,
+        cpu_gen_input,
+        gen_input_gpu,
+        vocab_size,
+        pos: 0,
+        bits,
+        residual_size,
+    };
+
+    run_chat_repl(
+        args,
+        model.config.arch,
+        tokenizer,
+        model.config.eos_token_id,
+        vocab_size,
+        sampling_config,
+        max_seq_len,
+        &mut exec,
+    )
+}
+
+// ─── KV-Offload chat executor ─────────────────────────────────────────────────
+
+struct OffloadTurnExec<'a> {
+    model: &'a TransformerModel,
+    backend: &'a Arc<dyn Backend>,
+    memory: Arc<dyn Memory>,
+    kv_caches: Vec<llm_rs2::core::offload::OffloadKVCache>,
+    decode_logits: Tensor,
+    x_gen: Tensor,
+    gen_ws: LayerWorkspace,
+    cpu_gen_input: Tensor,
+    gen_input_gpu: Tensor,
+    vocab_size: usize,
+    pos: usize,
+    offload_mode: String,
+    max_prefetch_depth: usize,
+    prefetch: llm_rs2::core::offload::prefetch::PrefetchController,
+}
+
+impl<'a> OffloadTurnExec<'a> {
+    fn tokens_to_backend_tensor(&self, tokens: &[u32]) -> anyhow::Result<Tensor> {
+        let cpu_backend = Arc::new(CpuBackend::new());
+        let input_buf = Galloc::new().alloc(tokens.len() * 4, DType::U8)?;
+        unsafe {
+            let ptr = input_buf.as_mut_ptr() as *mut u32;
+            for (i, &id) in tokens.iter().enumerate() {
+                *ptr.add(i) = id;
+            }
+        }
+        let cpu_input = Tensor::new(Shape::new(vec![1, tokens.len()]), input_buf, cpu_backend);
+        self.backend.copy_from(&cpu_input)
+    }
+}
+
+impl<'a> ChatTurnExec for OffloadTurnExec<'a> {
+    fn pos(&self) -> usize {
+        self.pos
+    }
+
+    fn reset(&mut self) {
+        for c in self.kv_caches.iter_mut() {
+            c.reset_session();
+        }
+        self.pos = 0;
+    }
+
+    fn prefill(&mut self, tokens: &[u32]) -> anyhow::Result<Vec<f32>> {
+        let input_tensor = self.tokens_to_backend_tensor(tokens)?;
+        let logits_buf = self.memory.alloc(self.vocab_size * 4, DType::F32)?;
+        let mut logits_out = Tensor::new(
+            Shape::new(vec![1, 1, self.vocab_size]),
+            logits_buf,
+            self.backend.clone(),
+        );
+        self.model.forward_into_offload(
+            TransformerModelForwardArgs {
+                input_tokens: &input_tensor,
+                start_pos: self.pos,
+                kv_caches: &mut self.kv_caches,
+                backend: self.backend,
+                memory: self.memory.as_ref(),
+                logits_out: &mut logits_out,
+                x_gen: None,
+                workspace: None,
+                score_accumulator: None,
+                profiler: None,
+                skip_config: None,
+                importance_collector: None,
+                logits_last_only: true,
+                variance_collector: None,
+                prefill_workspace: None,
+            },
+            &mut self.prefetch,
+        )?;
+        self.pos += tokens.len();
+
+        let mut host = vec![0.0f32; self.vocab_size];
+        unsafe {
+            let ptr = host.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, self.vocab_size * 4);
+            self.backend.read_buffer(&logits_out, slice)?;
+        }
+        Ok(host)
+    }
+
+    fn decode_step(&mut self, token: u32) -> anyhow::Result<Vec<f32>> {
+        unsafe {
+            *(self.cpu_gen_input.buffer().as_mut_ptr() as *mut u32) = token;
+        }
+        self.backend.write_buffer(&mut self.gen_input_gpu, unsafe {
+            std::slice::from_raw_parts(self.cpu_gen_input.buffer().as_ptr(), 4)
+        })?;
+        self.model.forward_into_offload(
+            TransformerModelForwardArgs {
+                input_tokens: &self.gen_input_gpu,
+                start_pos: self.pos,
+                kv_caches: &mut self.kv_caches,
+                backend: self.backend,
+                memory: self.memory.as_ref(),
+                logits_out: &mut self.decode_logits,
+                x_gen: Some(&mut self.x_gen),
+                workspace: Some(&mut self.gen_ws),
+                score_accumulator: None,
+                profiler: None,
+                skip_config: None,
+                importance_collector: None,
+                logits_last_only: true,
+                variance_collector: None,
+                prefill_workspace: None,
+            },
+            &mut self.prefetch,
+        )?;
+        self.pos += 1;
+
+        let mut host = vec![0.0f32; self.vocab_size];
+        unsafe {
+            let ptr = host.as_mut_ptr() as *mut u8;
+            let slice = std::slice::from_raw_parts_mut(ptr, self.vocab_size * 4);
+            self.backend.read_buffer(&self.decode_logits, slice)?;
+        }
+        Ok(host)
+    }
+
+    fn ensure_capacity(&mut self, additional: usize, max_seq_len: usize) -> anyhow::Result<()> {
+        if self.pos + additional > max_seq_len {
+            anyhow::bail!(
+                "context would exceed max_seq_len={} (pos={}, incoming_reserve={}). \
+                 Use /reset or increase --max-seq-len.",
+                max_seq_len,
+                self.pos,
+                additional
+            );
+        }
+        Ok(())
+    }
+
+    fn stats_line(&self, max_seq_len: usize) -> String {
+        format!(
+            "kv_pos={}/{} mode=offload store={} prefetch_depth={}",
+            self.pos, max_seq_len, self.offload_mode, self.max_prefetch_depth
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_chat_offload(
+    args: &Args,
+    model: &TransformerModel,
+    tokenizer: &Tokenizer,
+    backend: &Arc<dyn Backend>,
+    memory: &Arc<dyn Memory>,
+    sampling_config: &SamplingConfig,
+    kv_heads: usize,
+    head_dim: usize,
+    num_layers: usize,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    use llm_rs2::core::offload::OffloadKVCache;
+    use llm_rs2::core::offload::raw_store::RawStore;
+
+    let vocab_size = model.config.vocab_size;
+    let hidden_size = model.config.hidden_size;
+    let q_dim = model.config.num_attention_heads * head_dim;
+    let k_dim = kv_heads * head_dim;
+    let v_dim = kv_heads * head_dim;
+    let ffn_hidden = model.config.intermediate_size;
+
+    let kv_dtype = match args.kv_type.as_str() {
+        "f32" => DType::F32,
+        "f16" => DType::F16,
+        other => anyhow::bail!(
+            "--chat --kv-offload requires --kv-type f16 or f32 (got '{}')",
+            other
+        ),
+    };
+    let token_bytes = kv_heads * head_dim * kv_dtype.size();
+    let disk_dir = if args.offload_path.is_empty() {
+        std::env::temp_dir().join("llm_rs2_kv_offload")
+    } else {
+        std::path::PathBuf::from(&args.offload_path)
+    };
+    let offload_mode = args.kv_offload.clone();
+    eprintln!(
+        "[Chat/Offload] mode={}, dtype={:?}, layers={}, token_bytes={}, max_seq={}",
+        offload_mode, kv_dtype, num_layers, token_bytes, max_seq_len
+    );
+
+    let is_gpu_backend = backend.as_ref().is_gpu();
+    let kv_caches: Vec<OffloadKVCache> = (0..num_layers)
+        .map(|layer_id| {
+            let store: Box<dyn llm_rs2::core::offload::store::OffloadStore> =
+                match offload_mode.as_str() {
+                    "raw" => Box::new(RawStore::new(token_bytes)),
+                    "disk" => Box::new(
+                        llm_rs2::core::offload::disk_store::DiskStore::new(
+                            disk_dir.clone(),
+                            layer_id,
+                            token_bytes,
+                        )
+                        .expect("DiskStore::new failed"),
+                    ),
+                    other => panic!("Unknown offload mode: {}", other),
+                };
+            let mut c =
+                OffloadKVCache::new(layer_id, kv_heads, head_dim, kv_dtype, max_seq_len, store);
+            if is_gpu_backend {
+                c.set_gpu_backend(backend.clone(), memory.clone());
+            }
+            c
+        })
+        .collect();
+
+    let dl_buf = memory.alloc(vocab_size * 4, DType::F32)?;
+    let decode_logits = Tensor::new(Shape::new(vec![1, 1, vocab_size]), dl_buf, backend.clone());
+    let xg_buf = memory.alloc(hidden_size * 4, DType::F32)?;
+    let x_gen = Tensor::new(Shape::new(vec![1, 1, hidden_size]), xg_buf, backend.clone());
+    let gen_ws = LayerWorkspace::new(
+        WorkspaceConfig {
+            batch_size: 1,
+            dim: hidden_size,
+            q_dim,
+            k_dim,
+            v_dim,
+            ffn_hidden,
+            n_heads: model.config.num_attention_heads,
+            max_seq_len,
+        },
+        memory.as_ref(),
+        backend.clone(),
+    )?;
+    let cpu_gen_buf = Galloc::new().alloc(4, DType::U8)?;
+    let cpu_gen_input = Tensor::new(
+        Shape::new(vec![1, 1]),
+        cpu_gen_buf,
+        Arc::new(CpuBackend::new()),
+    );
+    let gpu_gen_buf = memory.alloc(4, DType::U8)?;
+    let gen_input_gpu = Tensor::new(Shape::new(vec![1, 1]), gpu_gen_buf, backend.clone());
+
+    let prefetch = llm_rs2::core::offload::prefetch::PrefetchController::new(
+        args.max_prefetch_depth,
+        num_layers,
+    );
+    let mut exec = OffloadTurnExec {
+        model,
+        backend,
+        memory: memory.clone(),
+        kv_caches,
+        decode_logits,
+        x_gen,
+        gen_ws,
+        cpu_gen_input,
+        gen_input_gpu,
+        vocab_size,
+        pos: 0,
+        offload_mode,
+        max_prefetch_depth: args.max_prefetch_depth,
+        prefetch,
+    };
+
+    run_chat_repl(
+        args,
+        model.config.arch,
+        tokenizer,
+        model.config.eos_token_id,
+        vocab_size,
+        sampling_config,
+        max_seq_len,
+        &mut exec,
+    )
 }
