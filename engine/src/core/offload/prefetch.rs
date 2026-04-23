@@ -3,6 +3,11 @@
 //! Dynamically adjusts prefetch depth based on observed preload vs forward timing.
 //! When preload takes longer than forward (pipeline stall), depth increases.
 //! When there is consistent slack, depth decreases (saves memory).
+//!
+//! Both increases and decreases move by `adjust_step` (default 16, so one
+//! full layer-group per tick). The step also acts as the decrease floor —
+//! depth never drops below `adjust_step`, guaranteeing at least one primed
+//! prefetch window at all times.
 
 use std::time::Duration;
 
@@ -30,6 +35,8 @@ pub struct PrefetchController {
     slack_streak: usize,
     /// Number of consecutive slack observations required before decreasing depth.
     decrease_patience: usize,
+    /// Step size for each increase / decrease tick (≥ 1).
+    adjust_step: usize,
 }
 
 /// Default starting prefetch depth used by [`PrefetchController::new`].
@@ -39,22 +46,49 @@ pub struct PrefetchController {
 /// only has to shrink if memory pressure or slack is observed.
 pub const DEFAULT_INITIAL_DEPTH: usize = 16;
 
+/// Default step size for each adaptive increase / decrease tick.
+///
+/// One "layer group" (matches `DEFAULT_INITIAL_DEPTH`) so the controller
+/// reacts in chunks that are meaningful for memory accounting, and so the
+/// step also serves as the decrease floor (depth never drops below one
+/// full window).
+pub const DEFAULT_ADJUST_STEP: usize = 16;
+
 impl PrefetchController {
     /// Create a new controller with [`DEFAULT_INITIAL_DEPTH`] as the starting
-    /// depth (clamped to `max_depth`).
+    /// depth and [`DEFAULT_ADJUST_STEP`] as the per-tick change.
     ///
     /// - `max_depth`: upper bound on prefetch depth (memory limit)
     /// - `num_layers`: total transformer layers (used as warmup period)
     pub fn new(max_depth: usize, num_layers: usize) -> Self {
-        Self::with_initial_depth(max_depth, DEFAULT_INITIAL_DEPTH, num_layers)
+        Self::with_tuning(
+            max_depth,
+            DEFAULT_INITIAL_DEPTH,
+            DEFAULT_ADJUST_STEP,
+            num_layers,
+        )
     }
 
     /// Create a new controller with an explicit starting depth.
     ///
-    /// `initial_depth` is clamped to the range `[1, max_depth]`. Useful for
-    /// tests that want deterministic starting conditions or for callers that
-    /// want to start conservatively regardless of the global default.
+    /// Uses [`DEFAULT_ADJUST_STEP`] for the per-tick change. `initial_depth`
+    /// is clamped to `[1, max_depth]`.
     pub fn with_initial_depth(max_depth: usize, initial_depth: usize, num_layers: usize) -> Self {
+        Self::with_tuning(max_depth, initial_depth, DEFAULT_ADJUST_STEP, num_layers)
+    }
+
+    /// Create a new controller with an explicit starting depth and step size.
+    ///
+    /// `adjust_step` doubles as the decrease floor: `depth` never drops
+    /// below `adjust_step` once `adjust()` starts running, so a step of
+    /// 16 keeps at least one full 16-layer window prefetched. Tests that
+    /// want ±1 behavior pass `adjust_step = 1`.
+    pub fn with_tuning(
+        max_depth: usize,
+        initial_depth: usize,
+        adjust_step: usize,
+        num_layers: usize,
+    ) -> Self {
         let max_depth = max_depth.max(1);
         Self {
             depth: initial_depth.clamp(1, max_depth),
@@ -66,6 +100,7 @@ impl PrefetchController {
             warmup_samples: num_layers,
             slack_streak: 0,
             decrease_patience: 3,
+            adjust_step: adjust_step.max(1),
         }
     }
 
@@ -143,13 +178,18 @@ impl PrefetchController {
 
         if slack_ratio < 0.0 {
             // Stall: preload takes longer than forward → increase immediately
-            self.depth = (self.depth + 1).min(self.max_depth);
+            self.depth = (self.depth + self.adjust_step).min(self.max_depth);
             self.slack_streak = 0;
         } else if slack_ratio > 0.3 {
-            // Ample slack → count toward decrease
+            // Ample slack → count toward decrease. `adjust_step` is also the
+            // floor: never drop below one full window (e.g. 16), so a slack
+            // streak that would push depth under `adjust_step` is clamped.
             self.slack_streak += 1;
-            if self.slack_streak >= self.decrease_patience && self.depth > 1 {
-                self.depth -= 1;
+            if self.slack_streak >= self.decrease_patience && self.depth > self.adjust_step {
+                self.depth = self
+                    .depth
+                    .saturating_sub(self.adjust_step)
+                    .max(self.adjust_step);
                 self.slack_streak = 0;
             }
         } else {
@@ -170,7 +210,7 @@ mod tests {
     #[test]
     fn test_warmup_no_adjust() {
         let num_layers = 4;
-        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
+        let mut ctrl = PrefetchController::with_tuning(4, 1, 1, num_layers);
 
         // Record fewer samples than warmup → depth stays at 1
         for _ in 0..3 {
@@ -183,7 +223,7 @@ mod tests {
     #[test]
     fn test_increase_on_stall() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
+        let mut ctrl = PrefetchController::with_tuning(4, 1, 1, num_layers);
         assert_eq!(ctrl.depth(), 1);
 
         // Record enough samples to exit warmup (preload > forward = stall)
@@ -204,7 +244,7 @@ mod tests {
     #[test]
     fn test_decrease_with_patience() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
+        let mut ctrl = PrefetchController::with_tuning(4, 1, 1, num_layers);
 
         // Drive depth up first
         for _ in 0..3 {
@@ -249,7 +289,7 @@ mod tests {
     #[test]
     fn test_max_depth_cap() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::with_initial_depth(3, 1, num_layers);
+        let mut ctrl = PrefetchController::with_tuning(3, 1, 1, num_layers);
 
         // Stall many times
         for _ in 0..20 {
@@ -264,7 +304,7 @@ mod tests {
     #[test]
     fn test_no_oscillation() {
         let num_layers = 2;
-        let mut ctrl = PrefetchController::with_initial_depth(4, 1, num_layers);
+        let mut ctrl = PrefetchController::with_tuning(4, 1, 1, num_layers);
 
         // Warmup with stall → depth=2
         for _ in 0..3 {
@@ -307,6 +347,52 @@ mod tests {
             large.depth(),
             DEFAULT_INITIAL_DEPTH,
             "initial depth equals DEFAULT_INITIAL_DEPTH when max_depth allows it"
+        );
+    }
+
+    #[test]
+    fn test_default_step_moves_by_16_and_respects_floor() {
+        // max=128 gives the step room to grow; num_layers=2 keeps warmup short.
+        let num_layers = 2;
+        let mut ctrl = PrefetchController::new(128, num_layers);
+        assert_eq!(ctrl.depth(), DEFAULT_INITIAL_DEPTH);
+
+        // Stall → +16 to 32.
+        for _ in 0..3 {
+            ctrl.record(dur_us(5000), dur_us(2000));
+        }
+        ctrl.adjust();
+        assert_eq!(ctrl.depth(), 32, "stall bumps depth by one adjust_step");
+
+        // 3 consecutive slack ticks → -16 back to 16 (the floor).
+        for _ in 0..30 {
+            ctrl.record(dur_us(500), dur_us(3000));
+        }
+        ctrl.adjust();
+        ctrl.adjust();
+        let before_decrease = ctrl.depth();
+        ctrl.adjust();
+        assert!(
+            ctrl.depth() < before_decrease,
+            "three slack adjusts should decrease depth"
+        );
+        assert_eq!(
+            ctrl.depth(),
+            DEFAULT_ADJUST_STEP,
+            "decrease clamps to adjust_step floor"
+        );
+
+        // Further slack must not push below the floor.
+        for _ in 0..30 {
+            ctrl.record(dur_us(500), dur_us(3000));
+        }
+        for _ in 0..10 {
+            ctrl.adjust();
+        }
+        assert_eq!(
+            ctrl.depth(),
+            DEFAULT_ADJUST_STEP,
+            "depth is pinned at the adjust_step floor"
         );
     }
 
