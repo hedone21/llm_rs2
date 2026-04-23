@@ -290,13 +290,24 @@ impl SwapHandler {
 
         let count = rec.token_count;
         let existing = cache.current_pos;
-        let capacity = cache.capacity();
+        let mut capacity = cache.capacity();
         if existing + count > capacity {
-            eprintln!(
-                "[SwapHandler] recall for layer {}: capacity {} < existing {} + recall {}; skipping",
-                rec.layer_idx, capacity, existing, count
-            );
-            return Ok(0);
+            // Grow the dynamic cache to hold the recalled prefix + current
+            // tokens. Without this, recall silently dropped data when the
+            // cache had grown just enough to fit decode after offload but
+            // not enough to hold offloaded + current (e.g. offload 20, then
+            // decode 49 tokens → capacity=64 < 49 + 20 = 69).
+            use crate::core::kv_cache::KVCacheOps;
+            if let Err(e) = cache.ensure_capacity(existing + count) {
+                eprintln!(
+                    "[SwapHandler] recall for layer {}: grow to {} failed: {}; skipping",
+                    rec.layer_idx,
+                    existing + count,
+                    e
+                );
+                return Ok(0);
+            }
+            capacity = cache.capacity();
         }
 
         // Shift existing tokens forward by `count` to make room for the prefix.
