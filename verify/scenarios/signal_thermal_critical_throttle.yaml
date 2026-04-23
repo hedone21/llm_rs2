@@ -5,7 +5,7 @@ devices: [galaxy_s25, jetson]
 models: [f16, q4]
 baseline:
   prompt: fixtures:short_smoke
-  decode_tokens: 64
+  decode_tokens: 128
   seed: 42
   greedy: true
   backend: auto
