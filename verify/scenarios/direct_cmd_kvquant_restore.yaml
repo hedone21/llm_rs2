@@ -10,6 +10,8 @@ baseline:
   greedy: true
   backend: auto
   prefill_chunk_size: 64
+  extra_args:
+    - "--kv-dynamic-quant"
 action:
   enable_resilience: true
   mock_manager_commands:
