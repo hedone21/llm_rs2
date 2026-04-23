@@ -360,6 +360,10 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
                 .context("--ratio required for SetPartitionRatio")?;
             Ok(EngineCommand::SetPartitionRatio { ratio })
         }
+        "KvOffload" => {
+            let ratio = params.ratio.context("--ratio required for KvOffload")?;
+            Ok(EngineCommand::KvOffload { ratio })
+        }
         "SetPrefillPolicy" => Ok(EngineCommand::SetPrefillPolicy {
             chunk_size: params.chunk_size,
             yield_ms: params.yield_ms,
