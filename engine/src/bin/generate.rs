@@ -3588,6 +3588,19 @@ fn main() -> anyhow::Result<()> {
         let mut evict_ceiling: Option<usize> = None;
         let mut evict_floor_logged: Option<bool> = None;
 
+        // Sticky cache for last-applied partition ratio. The executor re-delivers
+        // `plan.partition_ratio = Some(sticky)` on every poll (ISSUE-5 fix), so
+        // without this guard the consumer below would re-split 84 weights and
+        // rebuild the GPU plan on every decode tick (verify v2 REGRESSION-A:
+        // q4 enable +102% → +3859% TBT). Seeded from CLI-time partition so the
+        // first sticky re-delivery is a no-op when nothing changed.
+        let mut last_applied_partition_ratio: Option<f32> =
+            if args.tensor_partition > 0.0 && args.tensor_partition < 1.0 {
+                Some(args.tensor_partition)
+            } else {
+                None
+            };
+
         // Generation loop
         for (decode_token_index, _) in (0..(args.num_tokens - 1)).enumerate() {
             // Check physical cache capacity (not start_pos, which is logical RoPE position)
@@ -4343,7 +4356,15 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 // Dynamic tensor partition ratio
-                if let Some(ratio) = plan.partition_ratio {
+                //
+                // The executor re-delivers the sticky partition_ratio on every
+                // poll (ISSUE-5 prefill→decode carry-over), so we guard with
+                // `last_applied_partition_ratio` to prevent re-splitting weights
+                // on every decode tick (REGRESSION-A). Only the first delivery
+                // of a new ratio triggers the expensive re-split / re-register.
+                if let Some(ratio) = plan.partition_ratio
+                    && last_applied_partition_ratio != Some(ratio)
+                {
                     if ratio <= 0.0 || ratio >= 1.0 {
                         // Disable partition: clear partition_ctx from all layers
                         for layer in &mut model.layers {
@@ -4352,6 +4373,7 @@ fn main() -> anyhow::Result<()> {
                         gen_ws.partition_ws = None;
                         eprintln!("[Partition] Disabled (ratio={})", ratio);
                         executor.set_partition_ratio(0.0);
+                        last_applied_partition_ratio = Some(ratio);
                         // Partition off: invalidate plan to trigger rebuild next
                         // iter so GPU-only fast path is restored.
                         #[cfg(feature = "opencl")]
@@ -4373,6 +4395,7 @@ fn main() -> anyhow::Result<()> {
                             llm_rs2::layers::tensor_partition::GPU_ONLY_THRESHOLD,
                         );
                         executor.set_partition_ratio(ratio);
+                        last_applied_partition_ratio = Some(ratio);
                         #[cfg(feature = "opencl")]
                         {
                             gpu_plan = None;
@@ -4440,6 +4463,7 @@ fn main() -> anyhow::Result<()> {
                                         gen_ws.partition_ws = None;
                                     }
                                     executor.set_partition_ratio(ratio);
+                                    last_applied_partition_ratio = Some(ratio);
                                     // Partition active: invalidate plan so the
                                     // partition co-execution path takes over.
                                     #[cfg(feature = "opencl")]
@@ -4720,6 +4744,7 @@ fn main() -> anyhow::Result<()> {
                                 gen_ws.partition_ws = None;
                             }
                             executor.set_partition_ratio(cli_ratio);
+                            last_applied_partition_ratio = Some(cli_ratio);
                         }
                     } else {
                         // CLI had no partition — disable
@@ -4728,6 +4753,7 @@ fn main() -> anyhow::Result<()> {
                         }
                         gen_ws.partition_ws = None;
                         executor.set_partition_ratio(0.0);
+                        last_applied_partition_ratio = None;
                     }
                 }
 
