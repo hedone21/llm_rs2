@@ -5,9 +5,10 @@ use llm_manager::channel::unix_socket::UnixSocketChannel;
 use llm_manager::config::Config;
 use llm_manager::emitter::Emitter;
 use llm_manager::monitor::Monitor;
-use llm_manager::monitor::compute::ComputeMonitor;
+use llm_manager::monitor::compute::{ComputeMonitor, SharedGpuProvider, resolve_backend};
 use llm_manager::monitor::energy::EnergyMonitor;
 use llm_manager::monitor::external::ExternalMonitor;
+use llm_manager::monitor::gpu_provider::build_provider;
 use llm_manager::monitor::memory::MemoryMonitor;
 use llm_manager::monitor::thermal::ThermalMonitor;
 use llm_manager::pipeline::{DirectiveDeduplicator, PolicyStrategy};
@@ -141,8 +142,21 @@ fn main() -> anyhow::Result<()> {
     let mut transport = create_transport(&args, &shutdown)?;
     log::info!("Transport: {}", transport.name());
 
+    // GPU telemetry provider — ComputeMonitor와 LuaPolicy가 공유한다.
+    let gpu_provider: SharedGpuProvider = {
+        let compute_cfg = config.compute.clone().unwrap_or_default();
+        let backend = resolve_backend(&compute_cfg);
+        let provider = build_provider(&backend);
+        log::info!(
+            "GPU telemetry backend: {} ({:?})",
+            provider.describe(),
+            backend
+        );
+        Arc::new(std::sync::Mutex::new(provider))
+    };
+
     // Build monitors
-    let monitors = build_monitors(&config);
+    let monitors = build_monitors(&config, Arc::clone(&gpu_provider));
     log::info!("Monitors: {}", monitors.len());
 
     // Collect initial state from monitors
@@ -156,7 +170,8 @@ fn main() -> anyhow::Result<()> {
 
     // ── Policy 초기화 ─────────────────────────────────────────────────────────
 
-    let mut policy: Box<dyn PolicyStrategy> = create_policy(&args, &config)?;
+    let mut policy: Box<dyn PolicyStrategy> =
+        create_policy(&args, &config, Arc::clone(&gpu_provider))?;
 
     // Emit initial state
     for signal in &initial_signals {
@@ -293,11 +308,16 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// `--policy-script`가 지정되면 LuaPolicy를, 아니면 HierarchicalPolicy를 생성한다.
-fn create_policy(args: &Args, config: &Config) -> anyhow::Result<Box<dyn PolicyStrategy>> {
+fn create_policy(
+    args: &Args,
+    config: &Config,
+    gpu_provider: SharedGpuProvider,
+) -> anyhow::Result<Box<dyn PolicyStrategy>> {
     // Lua policy script 지정 시
     if let Some(ref script_path) = args.policy_script {
-        return create_lua_policy(script_path, config);
+        return create_lua_policy(script_path, config, gpu_provider);
     }
+    let _ = gpu_provider; // hierarchical policy는 현재 provider 미사용
 
     // hierarchical feature 없이 script도 없으면 에러
     #[cfg(not(feature = "hierarchical"))]
@@ -331,12 +351,16 @@ fn create_policy(args: &Args, config: &Config) -> anyhow::Result<Box<dyn PolicyS
 fn create_lua_policy(
     script_path: &std::path::Path,
     config: &Config,
+    gpu_provider: SharedGpuProvider,
 ) -> anyhow::Result<Box<dyn PolicyStrategy>> {
     let path_str = script_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid UTF-8 in policy script path"))?;
-    let policy =
-        llm_manager::lua_policy::LuaPolicy::with_system_clock(path_str, config.adaptation.clone())?;
+    let policy = llm_manager::lua_policy::LuaPolicy::with_system_clock_and_gpu(
+        path_str,
+        config.adaptation.clone(),
+        gpu_provider,
+    )?;
     log::info!("LuaPolicy initialized from {}", path_str);
     Ok(Box::new(policy))
 }
@@ -345,6 +369,7 @@ fn create_lua_policy(
 fn create_lua_policy(
     _script_path: &std::path::Path,
     _config: &Config,
+    _gpu_provider: SharedGpuProvider,
 ) -> anyhow::Result<Box<dyn PolicyStrategy>> {
     anyhow::bail!(
         "--policy-script requires the 'lua' feature (compile with: cargo build --features lua)"
@@ -441,7 +466,7 @@ fn create_dbus_emitter() -> anyhow::Result<Box<dyn Emitter>> {
     anyhow::bail!("Transport 'dbus' requires the 'dbus' feature (compiled without it)")
 }
 
-fn build_monitors(config: &Config) -> Vec<Box<dyn Monitor>> {
+fn build_monitors(config: &Config, gpu_provider: SharedGpuProvider) -> Vec<Box<dyn Monitor>> {
     let default_poll = config.manager.poll_interval_ms;
     let mut monitors: Vec<Box<dyn Monitor>> = Vec::new();
 
@@ -457,7 +482,11 @@ fn build_monitors(config: &Config) -> Vec<Box<dyn Monitor>> {
 
     if config.compute.as_ref().is_none_or(|c| c.enabled) {
         let c = config.compute.clone().unwrap_or_default();
-        monitors.push(Box::new(ComputeMonitor::new(&c, default_poll)));
+        monitors.push(Box::new(ComputeMonitor::new(
+            &c,
+            default_poll,
+            gpu_provider.clone(),
+        )));
     }
 
     if config.energy.as_ref().is_none_or(|c| c.enabled) {

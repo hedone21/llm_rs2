@@ -23,6 +23,7 @@ use std::time::Instant;
 
 use crate::clock::{Clock, LogicalInstant, SystemClock};
 use crate::config::{AdaptationConfig, TriggerConfig};
+use crate::monitor::compute::SharedGpuProvider;
 use crate::pipeline::{PolicyStrategy, next_seq_id};
 use crate::types::OperatingMode;
 
@@ -544,6 +545,9 @@ pub struct LuaPolicy {
     last_persist_at: Option<std::time::Instant>,
     /// 배타 그룹 맵 — ctx.is_joint_valid()에서 참조한다.
     exclusion_groups: HashMap<String, Vec<String>>,
+    /// GPU telemetry provider — `sys.gpu_freq()`, `sys.gpu_busy()` Lua 헬퍼에서 참조한다.
+    /// `ComputeMonitor`와 동일 인스턴스를 공유하여 tegrastats child 중복 spawn을 방지한다.
+    gpu_provider: SharedGpuProvider,
 }
 
 impl std::fmt::Debug for LuaPolicy {
@@ -602,6 +606,24 @@ impl LuaPolicy {
         clock: Arc<dyn Clock>,
         exclusion_groups: HashMap<String, Vec<String>>,
     ) -> anyhow::Result<Self> {
+        Self::new_with_gpu(
+            script_path,
+            config,
+            clock,
+            exclusion_groups,
+            crate::monitor::gpu_provider::shared_null(),
+        )
+    }
+
+    /// Production 경로 — 공유 GPU provider를 주입받는다.
+    /// `ComputeMonitor`와 동일 인스턴스를 공유하면 tegrastats child가 중복 spawn되지 않는다.
+    pub fn new_with_gpu(
+        script_path: &str,
+        config: AdaptationConfig,
+        clock: Arc<dyn Clock>,
+        exclusion_groups: HashMap<String, Vec<String>>,
+        gpu_provider: SharedGpuProvider,
+    ) -> anyhow::Result<Self> {
         // Sandbox: only table + string + math (no io, os, debug, etc.)
         // Safety: we intentionally restrict stdlib to TABLE | STRING | MATH.
         // unsafe_new_with is required because mlua considers any stdlib subset
@@ -617,7 +639,7 @@ impl LuaPolicy {
         let _ = lua.set_memory_limit(4 * 1024 * 1024);
 
         // Register sys.* helpers
-        register_sys_helpers(&lua)
+        register_sys_helpers(&lua, Arc::clone(&gpu_provider))
             .map_err(|e| anyhow::anyhow!("Failed to register sys helpers: {}", e))?;
 
         // Load and execute the user script (defines `decide` globally)
@@ -686,12 +708,29 @@ impl LuaPolicy {
             // None이면 첫 process_signal 호출 즉시 저장되므로 MGR-093 위반.
             last_persist_at: Some(std::time::Instant::now()),
             exclusion_groups,
+            gpu_provider,
         })
     }
 
-    /// Production 기본 생성자 — SystemClock을 자동 주입한다.
+    /// 편의 생성자 — SystemClock + null GPU provider.
+    /// 테스트/시뮬레이터 또는 GPU telemetry가 필요 없는 환경에서 사용.
     pub fn with_system_clock(script_path: &str, config: AdaptationConfig) -> anyhow::Result<Self> {
         Self::new(script_path, config, Arc::new(SystemClock::new()))
+    }
+
+    /// Production 경로 — SystemClock + 공유 GPU provider.
+    pub fn with_system_clock_and_gpu(
+        script_path: &str,
+        config: AdaptationConfig,
+        gpu_provider: SharedGpuProvider,
+    ) -> anyhow::Result<Self> {
+        Self::new_with_gpu(
+            script_path,
+            config,
+            Arc::new(SystemClock::new()),
+            HashMap::new(),
+            gpu_provider,
+        )
     }
 
     /// QCF cache가 stale한지 확인 (비어있거나 TTL 초과 시 true).
@@ -1421,7 +1460,7 @@ impl PolicyStrategy for LuaPolicy {
         let _ = new_lua.set_memory_limit(4 * 1024 * 1024);
 
         // 2. sys.* 헬퍼 등록
-        register_sys_helpers(&new_lua)
+        register_sys_helpers(&new_lua, Arc::clone(&self.gpu_provider))
             .map_err(|e| anyhow::anyhow!("reload: register_sys_helpers failed: {}", e))?;
 
         // 3. 스크립트 파일 읽기 + 실행
@@ -1472,6 +1511,7 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
         EngineCommand::KvStreaming { .. } => "kv_streaming",
         EngineCommand::KvMergeD2o { .. } => "kv_merge_d2o",
         EngineCommand::KvQuantDynamic { .. } => "kv_quant_dynamic",
+        EngineCommand::KvOffload { .. } => "kv_offload",
         EngineCommand::SwitchHw { .. } => "switch_hw",
         EngineCommand::RestoreDefaults => "restore_defaults",
         EngineCommand::Suspend => "suspend",
@@ -1614,7 +1654,10 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
 // ---- sys.* helper registration ----------------------------------------------
 
 /// Register `sys.*` helper functions in the Lua global scope.
-fn register_sys_helpers(lua: &Lua) -> LuaResult<()> {
+///
+/// `gpu_provider`는 `sys.gpu_busy()` / `sys.gpu_freq()`의 백엔드로 사용된다.
+/// Tegra/Adreno/Mali 플랫폼 차이는 provider 내부에서 흡수된다.
+fn register_sys_helpers(lua: &Lua, gpu_provider: SharedGpuProvider) -> LuaResult<()> {
     let sys = lua.create_table()?;
 
     // sys.read(path) -> string
@@ -1654,32 +1697,31 @@ fn register_sys_helpers(lua: &Lua) -> LuaResult<()> {
         })?,
     )?;
 
-    // sys.gpu_busy() -> int (0-100)
+    // sys.gpu_busy() -> int (0-100, -1 if unavailable)
+    let provider_busy = Arc::clone(&gpu_provider);
     sys.set(
         "gpu_busy",
-        lua.create_function(|_, ()| -> LuaResult<i64> {
-            let path = "/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage";
-            let pct = std::fs::read_to_string(path)
+        lua.create_function(move |_, ()| -> LuaResult<i64> {
+            let pct = provider_busy
+                .lock()
                 .ok()
-                .and_then(|s| {
-                    // Format may be "N %" or just "N"
-                    s.split_whitespace()
-                        .next()
-                        .and_then(|v| v.parse::<i64>().ok())
-                })
+                .and_then(|mut g| g.util_pct())
+                .map(|v| v.round() as i64)
                 .unwrap_or(-1);
             Ok(pct)
         })?,
     )?;
 
-    // sys.gpu_freq() -> int (Hz)
+    // sys.gpu_freq() -> int (Hz, -1 if unavailable)
+    let provider_freq = Arc::clone(&gpu_provider);
     sys.set(
         "gpu_freq",
-        lua.create_function(|_, ()| -> LuaResult<i64> {
-            let path = "/sys/class/kgsl/kgsl-3d0/gpuclk";
-            let freq = std::fs::read_to_string(path)
+        lua.create_function(move |_, ()| -> LuaResult<i64> {
+            let freq = provider_freq
+                .lock()
                 .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
+                .and_then(|mut g| g.freq_hz())
+                .map(|v| v as i64)
                 .unwrap_or(-1);
             Ok(freq)
         })?,

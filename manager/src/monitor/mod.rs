@@ -1,6 +1,7 @@
 pub mod compute;
 pub mod energy;
 pub mod external;
+pub mod gpu_provider;
 pub mod memory;
 pub mod thermal;
 

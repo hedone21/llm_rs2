@@ -286,6 +286,10 @@ impl EngineState_ {
                 );
                 CommandResult::Ok
             }
+            EngineCommand::KvOffload { ratio } => {
+                println!("  → KvOffload(ratio={})", ratio);
+                CommandResult::Ok
+            }
         }
     }
 

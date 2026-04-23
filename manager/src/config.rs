@@ -106,9 +106,11 @@ pub struct ComputeMonitorConfig {
     pub warning_pct: f64,
     pub critical_pct: f64,
     pub hysteresis_pct: f64,
-    /// 커스텀 GPU sysfs 경로. None이면 벤더별 후보 목록을 순서대로 시도한다.
-    /// 예: "/sys/kernel/gpu/gpu_busy_percentage" (Adreno)
+    /// DEPRECATED: Use `gpu_backend = { kind = "custom_sysfs", path = "..." }` instead.
+    /// 값이 있고 `gpu_backend`가 `Auto`면 내부적으로 `CustomSysfs`로 매핑된다.
     pub gpu_sysfs_path: Option<String>,
+    /// GPU telemetry 백엔드 선택. `Auto`가 기본이며 실행 환경에서 자동 감지한다.
+    pub gpu_backend: GpuBackend,
 }
 
 impl Default for ComputeMonitorConfig {
@@ -120,8 +122,35 @@ impl Default for ComputeMonitorConfig {
             critical_pct: 90.0,
             hysteresis_pct: 5.0,
             gpu_sysfs_path: None,
+            gpu_backend: GpuBackend::Auto,
         }
     }
+}
+
+/// GPU telemetry provider 선택지.
+///
+/// `Auto` — 런타임에 `/sys`를 스캔하여 Jetson → Adreno/Mali → Null 순 탐지.
+/// `Null` — GPU 없음/미지원 (항상 None).
+/// `Sysfs` — Adreno/Mali sysfs 후보 경로 폴백.
+/// `CustomSysfs` — 명시된 sysfs 파일 하나만 util 소스로 사용.
+/// `Jetson` — devfreq `cur_freq` 자동 탐지 + `tegrastats` 서브프로세스.
+/// `JetsonExplicit` — 명시된 freq 파일 + tegrastats 바이너리.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GpuBackend {
+    #[default]
+    Auto,
+    Null,
+    Sysfs,
+    CustomSysfs {
+        path: String,
+    },
+    Jetson,
+    JetsonExplicit {
+        freq_path: String,
+        #[serde(default)]
+        tegrastats_bin: Option<String>,
+    },
 }
 
 /// Energy monitor configuration.
