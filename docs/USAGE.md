@@ -20,6 +20,7 @@
    - [2.9 KV Offload (캐시 오프로드)](#29-kv-offload-캐시-오프로드)
    - [2.10 Prompt Batch (배치 추론)](#210-prompt-batch-배치-추론)
    - [2.11 Layer Skip (레이어 건너뛰기)](#211-layer-skip-레이어-건너뛰기)
+   - [2.12 Chat (멀티턴 REPL / 소켓 IPC)](#212-chat-멀티턴-repl--소켓-ipc)
 3. [Manager 가이드](#3-manager-가이드)
    - [3.1 기본 실행](#31-기본-실행)
    - [3.2 Lua 정책 스크립팅](#32-lua-정책-스크립팅)
@@ -1019,6 +1020,192 @@ Manager가 런타임에 skip ratio를 조정할 수 있다:
 ```
 
 `skip_ratio=0.0`으로 보내면 skip을 비활성화한다.
+
+---
+
+### 2.12 Chat (멀티턴 REPL / 소켓 IPC)
+
+`--chat` 플래그로 멀티턴 대화 REPL을 연다. 이전 턴의 KV 캐시가 그대로 유지되어
+다음 턴의 prefill이 새 사용자 메시지만 추가로 처리한다. stdin 외에 Unix domain
+socket / TCP listener를 병행해 외부 프로세스에서 프롬프트를 주입할 수 있다.
+
+**지원 아키텍처**: Llama 3.2 Instruct (`<|begin_of_text|>`, `<|eot_id|>`),
+Qwen2 (`<|im_start|>...<|im_end|>`). Gemma3는 현재 미지원 — 템플릿 준비되지 않음.
+
+**호환 경로**: standard (기본 KVCache) / `--kivi` / `--kv-offload` / `--eviction-policy`
+중 하나. 상호 배타이며, 아래와는 같이 쓸 수 없다:
+`--eval-ll`, `--ppl`, `--prompt-batch`, `--eval-batch`, `--tensor-partition`,
+`--cuda-graph`, `--dump-importance`, `--experiment-schedule`.
+
+#### 기본 사용법 (stdin REPL)
+
+```bash
+generate \
+  --model-path models/llama3.2-1b/llama3.2-1b-instruct-q4_0.gguf \
+  --backend opencl \
+  --chat \
+  --system-prompt "You are a concise assistant." \
+  -n 256 \
+  --temperature 0.7 --top-p 0.9
+```
+
+- `-n` (= `--num-tokens`)은 **턴당** 최대 생성 토큰 수.
+- `--system-prompt`는 선택. 지정 시 첫 턴 전에 prefill되어 세션 내내 KV에 유지된다.
+- 시작 직후 `[Chat] Ready. Arch=..., max_seq_len=..., Commands: /exit /reset /stats /help`이 출력되고
+  `>` 프롬프트가 뜬다.
+
+**슬래시 커맨드**:
+
+| 커맨드 | 동작 |
+|--------|------|
+| `/exit`, `/quit` | REPL 종료 |
+| `/reset` | KV 위치·recent window·offload store 리셋 (새 세션) |
+| `/stats` | 현재 KV 사용량/evicted 토큰 수 등 exec 상태 출력 |
+| `/help` | 커맨드 목록 |
+| (빈 줄) | 무시 (프롬프트 재출력) |
+
+`--prompt`를 같이 주면 그 값이 **첫 번째 사용자 턴**으로 자동 투입된다
+(대화 시작 자동화용).
+
+첫 턴에서 `--max-seq-len`을 초과하는 입력+출력이 예상되면 `ensure_capacity()`가
+동작해 eviction-capable exec(`--eviction-policy` 활성 시)은 공간을 회수하고,
+비-eviction exec는 `context overflow` 에러로 턴을 중단한다(REPL은 종료).
+
+#### 소켓 IPC로 테스트하기
+
+stdin과 독립적으로 동작하는 **두 번째 입력 채널**을 띄운다. 두 채널은 동일한
+REPL 루프로 머지되며, 동시에 활성화 가능하다.
+
+**프로토콜**:
+- 입력: newline(`\n`) 종료 사용자 메시지. 한 줄 = 한 턴.
+- 출력: 생성된 어시스턴트 텍스트가 **바이트 스트리밍**된다 (stdout에 찍히는 것과 동일).
+- 턴 경계: 턴 종료 시 `0x04` (EOT, `^D`) 1바이트가 회신 스트림 끝에 붙는다.
+- 끊어진 클라이언트는 조용히 무시되며, 모델 루프는 계속 돈다.
+- 각 연결은 독립 세션이 아니라 **동일 REPL에 멀티플렉싱**된다. 동시 접속은 가능하지만
+  턴은 직렬 처리되고, 모든 클라이언트가 같은 KV 문맥을 공유한다.
+
+##### (A) Unix domain socket — `--chat-socket`
+
+```bash
+generate \
+  --model-path models/llama3.2-1b/llama3.2-1b-instruct-q4_0.gguf \
+  --backend opencl \
+  --chat \
+  --chat-socket /tmp/llm_chat.sock \
+  -n 256
+```
+
+엔진 시작 시 `[Chat] Listening for Unix socket input at /tmp/llm_chat.sock`가 뜬다.
+기존 소켓 파일은 바인드 전에 자동 제거된다.
+
+다른 터미널에서 `socat`이나 `ncat`으로 테스트:
+
+```bash
+# 한 줄 프롬프트 보내고 응답 스트리밍 + EOT까지 수신
+printf 'What is 2+2?\n' | socat - UNIX-CONNECT:/tmp/llm_chat.sock
+
+# 대화형: 라인을 입력할 때마다 한 턴 실행
+socat - UNIX-CONNECT:/tmp/llm_chat.sock
+```
+
+`ncat` 버전:
+
+```bash
+ncat -U /tmp/llm_chat.sock
+```
+
+##### (B) TCP — `--chat-tcp`
+
+```bash
+# 로컬 루프백 (권장)
+generate ... --chat --chat-tcp 127.0.0.1:7878 -n 256
+
+# 포트 자동 할당 (커널이 고른 포트를 stderr에 로그)
+generate ... --chat --chat-tcp 127.0.0.1:0 -n 256
+```
+
+엔진 시작 시 `[Chat] Listening for TCP input at 127.0.0.1:7878`가 뜬다.
+**비-루프백 주소에 바인드하면** `[Chat] WARNING: ... non-loopback address ...`가
+출력된다 — 네트워크 노출 시 프롬프트 주입 공격면이 생기므로 가능하면 루프백 유지.
+
+테스트:
+
+```bash
+# 한 턴
+printf 'Give me a haiku about tensors.\n' | ncat 127.0.0.1 7878
+
+# 대화형
+ncat 127.0.0.1 7878
+```
+
+##### (C) 병행 사용
+
+`--chat-socket`과 `--chat-tcp`는 동시에 켤 수 있다. stdin도 항상 함께 활성화되어
+총 3개 채널이 같은 루프에 merge된다.
+
+```bash
+generate ... --chat \
+  --chat-socket /tmp/llm_chat.sock \
+  --chat-tcp 127.0.0.1:7878 \
+  -n 256
+```
+
+#### 스크립트로 소비하기
+
+EOT 바이트(`\x04`)까지 읽으면 한 턴이 끝난 것으로 판정한다. Python 예:
+
+```python
+import socket
+
+s = socket.create_connection(("127.0.0.1", 7878))
+s.sendall(b"List three Rust crates for LLM inference.\n")
+
+buf = bytearray()
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+    if 0x04 in chunk:
+        break
+
+reply, _, _ = buf.partition(b"\x04")
+print(reply.decode("utf-8", errors="replace"))
+```
+
+여러 턴을 이어서 돌리려면 같은 소켓에 새 라인을 보내고 다시 EOT까지 읽으면 된다.
+세션 재시작이 필요하면 `/reset`을 평문 라인으로 전송한다.
+
+#### 자주 쓰는 조합
+
+```bash
+# KIVI 양자화 KV + 소켓
+generate ... --chat --kivi --kv-quant-bits 4 --chat-socket /tmp/llm_chat.sock -n 256
+
+# Sliding window eviction + TCP
+generate ... --chat \
+  --eviction-policy sliding --eviction-window 1024 --protected-prefix 4 \
+  --chat-tcp 127.0.0.1:7878 -n 256
+
+# D2O + 시스템 프롬프트 + stdin
+generate ... --chat \
+  --eviction-policy d2o --d2o-keep-ratio 0.75 \
+  --system-prompt "Respond in Korean." -n 256
+```
+
+#### 트러블슈팅
+
+- **`--chat is incompatible with --X`**: v1 호환 경로만 허용. `--tensor-partition`,
+  `--cuda-graph`, `--dump-importance`, 실험/배치 모드는 모두 제외된다.
+- **`--chat: --kivi and --kv-offload are mutually exclusive`**: 둘 중 하나만.
+- **소켓이 안 열림**: `/tmp/llm_chat.sock`이 다른 프로세스에 의해 잡혀 있거나
+  권한 문제. 엔진은 바인드 전에 `remove_file`을 시도한다.
+- **TCP 바인드 실패**: 포트 점유. `127.0.0.1:0`으로 자동 할당을 쓰고 stderr 로그로
+  실제 포트 확인.
+- **컨텍스트 오버플로**: 턴 중 `context overflow: ...` 출력 후 REPL 종료.
+  `--eviction-policy sliding --eviction-window <N>`을 같이 붙이면 자동 회수.
+- **Gemma3에서 실패**: 챗 템플릿 미구현. Llama/Qwen2만 사용.
+- **Windows**: `--chat-socket`은 Unix 전용. 윈도우에서는 `--chat-tcp`만 동작.
 
 ---
 
@@ -2072,3 +2259,12 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 | `--dump-importance` | false | 레이어 중요도 테이블 출력 후 종료 (추론 없음) |
 | `--skip-layers` | — | 건너뛸 레이어 인덱스 (콤마 구분, 예: `1,3,5,7`) |
 | `--skip-ratio` | — | 건너뛸 레이어 비율 (0.0~1.0, `SkipConfig::uniform_init()` 사용) |
+
+### Chat (멀티턴 REPL)
+
+| 플래그 | 기본값 | 설명 |
+|--------|--------|------|
+| `--chat` | false | 멀티턴 REPL 진입. Llama Instruct / Qwen2 전용. standard / `--kivi` / `--kv-offload` / `--eviction-policy` 중 하나와만 호환 |
+| `--system-prompt` | — | 세션 시작 시 프리필되는 system 턴 문자열 |
+| `--chat-socket` | — | Unix domain socket 경로. newline-delimited 입력, 응답 바이트 스트리밍 + `0x04` EOT 종결 (Unix 전용) |
+| `--chat-tcp` | — | TCP listen 주소(예: `127.0.0.1:7878`, `127.0.0.1:0`). `--chat-socket`과 동시 사용 가능 |
