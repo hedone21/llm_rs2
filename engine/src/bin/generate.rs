@@ -5129,7 +5129,25 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     let mut estimates = HashMap::new();
 
     // ── 1-4. KVCache-based eviction/merge QCF via unified formula ──
-    if !ctx.kv_caches.is_empty() && ctx.kv_caches[0].current_pos > 0 {
+    //
+    // ISSUE-6 guard: OpenCL device-only 버퍼는 `as_ptr()`이 명시적으로
+    // `ptr::null()`을 반환한다 (engine/src/backend/opencl/buffer.rs). 이 경우
+    // `Tensor::as_slice::<T>()`이 `(ptr=null, len=size/sizeof T)` 슬라이스를
+    //만들고, 아래 `v_src!` 매크로가 그 슬라이스를 `VDataSource`에 담아
+    // `read_v_f32()`에서 `data[offset..end]`로 인덱싱하는 순간 null deref →
+    // SIGSEGV 로 이어진다. signal 경로(RequestQcf)에서 host-mapped KV 없이
+    // QCF 추정이 요청될 수 있으므로, dtype 무관하게 v_buffer 호스트 포인터가
+    // 유효한 경우에만 KV 기반 4종(sliding / h2o / streaming / d2o)을 계산한다.
+    // KIVI / LayerSkip 추정은 v_buffer 호스트 슬라이스에 의존하지 않으므로
+    // 이 guard 밖에 둔다.
+    let v_host_readable =
+        !ctx.kv_caches.is_empty() && ctx.kv_caches.iter().all(|c| !c.v_buffer.as_ptr().is_null());
+    if !ctx.kv_caches.is_empty() && ctx.kv_caches[0].current_pos > 0 && !v_host_readable {
+        eprintln!(
+            "[QCF] KV-based estimates skipped: v_buffer is device-only (signal path without host-mapped KV)."
+        );
+    }
+    if v_host_readable && ctx.kv_caches[0].current_pos > 0 {
         let cache = &ctx.kv_caches[0];
         let current_pos = cache.current_pos;
         let capacity = cache.capacity();

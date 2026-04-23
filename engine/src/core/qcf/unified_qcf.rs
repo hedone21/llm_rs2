@@ -1241,4 +1241,108 @@ mod tests {
         assert!(err(&rt_2) > err(&rt_4), "Q2 error > Q4 error");
         assert!(err(&rt_4) > err(&rt_8), "Q4 error > Q8 error");
     }
+
+    // ── Regression tests for ISSUE-6 ────────────────────────────
+    //
+    // These tests verify that `read_v_f32()` tolerates a V-source slice
+    // whose length is smaller than `offset + head_dim` (including the
+    // degenerate zero-length case). Previously an OpenCL device-only
+    // buffer produced a `(ptr=null, len=0)` slice that would SEGV the
+    // moment `data[offset..end]` indexed it. The host-side guard in
+    // `compute_qcf_estimates` now short-circuits before we get here,
+    // but the read path itself must remain panic-free if it is ever
+    // invoked with a too-small slice (e.g. from tests or future call
+    // sites).
+
+    #[test]
+    fn test_read_v_f32_empty_f16_returns_zeros() {
+        // Empty F16 slice: offset >= data.len() → zero-fill, no panic.
+        let empty: Vec<u16> = Vec::new();
+        let out = read_v_f32(
+            &VDataSource::F16(&empty),
+            /* head = */ 0,
+            /* pos = */ 0,
+            /* head_dim = */ 64,
+            /* capacity = */ 128,
+            /* n_kv_heads = */ 8,
+            KVLayout::HeadMajor,
+        );
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|&x| x == 0.0));
+
+        // Non-zero offset that overruns the (empty) buffer.
+        let out2 = read_v_f32(
+            &VDataSource::F16(&empty),
+            3,
+            17,
+            64,
+            128,
+            8,
+            KVLayout::HeadMajor,
+        );
+        assert_eq!(out2.len(), 64);
+        assert!(out2.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_read_v_f32_empty_f32_returns_zeros() {
+        // Empty F32 slice: same contract as F16.
+        let empty: Vec<f32> = Vec::new();
+        let out = read_v_f32(
+            &VDataSource::F32(&empty),
+            0,
+            0,
+            64,
+            128,
+            8,
+            KVLayout::HeadMajor,
+        );
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|&x| x == 0.0));
+
+        // Partially-filled slice that still cannot cover offset+head_dim.
+        // (offset=64, head_dim=64 → requested [64..128] but len=10.)
+        let short = vec![1.0f32; 10];
+        let out2 = read_v_f32(
+            &VDataSource::F32(&short),
+            1,
+            0,
+            64,
+            128,
+            8,
+            KVLayout::HeadMajor,
+        );
+        assert_eq!(out2.len(), 64);
+        assert!(out2.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn test_read_v_f32_empty_q4_returns_zeros() {
+        // Empty Q4_0 slice: block_idx >= data.len() → zero-fill, no panic.
+        let empty: Vec<BlockQ4_0> = Vec::new();
+        let out = read_v_f32(
+            &VDataSource::Q4_0(&empty),
+            0,
+            0,
+            64,
+            128,
+            8,
+            KVLayout::HeadMajor,
+        );
+        assert_eq!(out.len(), 64);
+        assert!(out.iter().all(|&x| x == 0.0));
+
+        // Non-zero head/pos that overruns the empty block slice.
+        let out2 = read_v_f32(
+            &VDataSource::Q4_0(&empty),
+            2,
+            5,
+            64,
+            128,
+            8,
+            KVLayout::HeadMajor,
+        );
+        assert_eq!(out2.len(), 64);
+        assert!(out2.iter().all(|&x| x == 0.0));
+    }
 }
