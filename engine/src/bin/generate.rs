@@ -388,6 +388,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     throttle_delay_ms: u64,
 
+    /// OpenCL command-queue priority hint (`cl_khr_priority_hints`).
+    /// "low" yields GPU scheduling to foreground apps (e.g. games) during
+    /// co-execution. Falls back to normal priority with a warning if the
+    /// driver does not advertise the extension. Also settable via env var
+    /// `OCL_QUEUE_PRIORITY`.
+    #[arg(long, value_parser = ["low", "medium", "normal", "high"], default_value = "normal")]
+    gpu_priority: String,
+
     /// Path to write per-token TBT JSONL log.
     /// Each line: {"token_idx":N,"tbt_ms":X,"forward_ms":Y,"cache_pos":Z,"pacing_ms":W}
     #[arg(long)]
@@ -680,6 +688,15 @@ fn main() -> anyhow::Result<()> {
     };
 
     let model_path = &args.model_path;
+
+    // Propagate GPU queue priority to OpenCLBackend via env var (same
+    // convention as OCL_PLATFORM / OCL_DEVICE_TYPE). CLI wins over an
+    // already-set env var so a flag in a script overrides the shell env.
+    if args.gpu_priority != "normal" {
+        unsafe {
+            std::env::set_var("OCL_QUEUE_PRIORITY", &args.gpu_priority);
+        }
+    }
 
     // 1. Setup
     eprintln!("[Profile] Event: ModelLoadStart");
@@ -1321,6 +1338,26 @@ fn main() -> anyhow::Result<()> {
         );
 
         // Send Capability as first message (SEQ-022).
+        // available_actions 는 Heartbeat 와 동일하게 eviction_policy / kv_type 에서 파생.
+        // Heartbeat 보다 먼저 manager 에 도달하므로, 첫 signal 처리 시점에 이미 이 값이
+        // 반영돼 있어야 정책이 엔진이 지원하지 않는 액션을 선택하는 회귀를 막을 수 있다.
+        let cap_available_actions = {
+            let mut a = vec![
+                "throttle".to_string(),
+                "switch_hw".to_string(),
+                "layer_skip".to_string(),
+            ];
+            if args.eviction_policy != "none" {
+                a.push("kv_evict_h2o".to_string());
+                a.push("kv_evict_sliding".to_string());
+                a.push("kv_evict_streaming".to_string());
+                a.push("kv_merge_d2o".to_string());
+            }
+            if args.kv_type.starts_with('q') {
+                a.push("kv_quant_dynamic".to_string());
+            }
+            a
+        };
         executor.send_capability(llm_shared::EngineCapability {
             available_devices: vec!["cpu".to_string(), "opencl".to_string()],
             active_device: args.backend.clone(),
@@ -1330,6 +1367,7 @@ fn main() -> anyhow::Result<()> {
                 * 2  // K + V
                 * 2, // F16 = 2 bytes
             num_layers: model.config.num_hidden_layers,
+            available_actions: cap_available_actions,
         });
         eprintln!("[Resilience] Capability sent to Manager");
 

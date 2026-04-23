@@ -7,6 +7,7 @@ use crate::core::memory::Memory;
 use crate::core::tensor::Tensor;
 use anyhow::{Result, anyhow};
 use ocl::core::Kernel as CoreKernel;
+use ocl::core::{ClContextPtr, ClDeviceIdPtr};
 use ocl::{Context, Device, Platform, Program, Queue, flags};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -18,6 +19,88 @@ pub mod buffer;
 pub mod gpu_score;
 pub mod memory;
 pub mod plan;
+
+/// `cl_khr_priority_hints` property name (`CL_QUEUE_PRIORITY_KHR`).
+const CL_QUEUE_PRIORITY_KHR: u64 = 0x1096;
+/// `cl_khr_priority_hints` priority values — bitmask, not ordinal.
+const CL_QUEUE_PRIORITY_HIGH_KHR: u64 = 1 << 0;
+const CL_QUEUE_PRIORITY_MED_KHR: u64 = 1 << 1;
+const CL_QUEUE_PRIORITY_LOW_KHR: u64 = 1 << 2;
+/// `CL_QUEUE_PROPERTIES` (legacy bitfield slot in the property list).
+const CL_QUEUE_PROPERTIES: u64 = 0x1093;
+
+unsafe extern "C" {
+    fn clCreateCommandQueueWithProperties(
+        context: *mut std::ffi::c_void,
+        device: *mut std::ffi::c_void,
+        properties: *const u64,
+        errcode_ret: *mut i32,
+    ) -> *mut std::ffi::c_void;
+}
+
+/// Replace `queue`'s underlying `cl_command_queue` with one that carries a
+/// `CL_QUEUE_PRIORITY_KHR` hint, if the device advertises
+/// `cl_khr_priority_hints`. The original queue is released by `DerefMut`
+/// assignment (ocl-core's `CommandQueue` has a `Drop` impl).
+fn try_apply_queue_priority(
+    queue: &mut Queue,
+    context: &Context,
+    device: Device,
+    queue_flags: Option<flags::CommandQueueProperties>,
+    extensions: &str,
+    priority: &str,
+) -> Result<()> {
+    if !extensions.contains("cl_khr_priority_hints") {
+        return Err(anyhow!(
+            "device lacks cl_khr_priority_hints extension"
+        ));
+    }
+    let priority_val = match priority {
+        "low" => CL_QUEUE_PRIORITY_LOW_KHR,
+        "med" | "medium" => CL_QUEUE_PRIORITY_MED_KHR,
+        "high" => CL_QUEUE_PRIORITY_HIGH_KHR,
+        other => {
+            return Err(anyhow!(
+                "unknown priority '{}': expected low|medium|high|normal",
+                other
+            ));
+        }
+    };
+    let flags_bits: u64 = queue_flags.map(|f| f.bits() as u64).unwrap_or(0);
+    // Property list is zero-terminated: [name, value, name, value, …, 0].
+    let mut props: Vec<u64> = Vec::with_capacity(5);
+    if flags_bits != 0 {
+        props.push(CL_QUEUE_PROPERTIES);
+        props.push(flags_bits);
+    }
+    props.push(CL_QUEUE_PRIORITY_KHR);
+    props.push(priority_val);
+    props.push(0);
+
+    let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&context) as *mut std::ffi::c_void;
+    let dev_ptr = <Device as ClDeviceIdPtr>::as_ptr(&device) as *mut std::ffi::c_void;
+    let mut err: i32 = 0;
+    let raw = unsafe {
+        clCreateCommandQueueWithProperties(ctx_ptr, dev_ptr, props.as_ptr(), &mut err)
+    };
+    if err != 0 || raw.is_null() {
+        return Err(anyhow!(
+            "clCreateCommandQueueWithProperties failed (err={})",
+            err
+        ));
+    }
+    // Wrap the raw handle into ocl-core's CommandQueue (takes ownership of
+    // the refcount, Drop releases it). Then swap via Queue's DerefMut, which
+    // releases the original default-priority queue.
+    let new_core =
+        unsafe { ocl::core::CommandQueue::from_raw_create_ptr(raw as ocl::ffi::cl_command_queue) };
+    **queue = new_core;
+    log::info!(
+        "OpenCL queue: CL_QUEUE_PRIORITY_KHR = {} (cl_khr_priority_hints)",
+        priority
+    );
+    Ok(())
+}
 
 /// Emit a one-time diagnostic to stderr when the prefill flash attention
 /// dispatcher routes a head_dim=128 / F16 KV workload through the new
@@ -484,7 +567,26 @@ impl OpenCLBackend {
         } else {
             None
         };
-        let queue = Queue::new(&context, device, queue_props)?;
+        let mut queue = Queue::new(&context, device, queue_props)?;
+        // Optional: replace queue with a priority-hinted one via
+        // `clCreateCommandQueueWithProperties` + `cl_khr_priority_hints`.
+        // `OCL_QUEUE_PRIORITY` env var: "low" | "normal" | "high".
+        // Unsupported priority or missing extension → warn + keep default queue.
+        if let Ok(pri) = std::env::var("OCL_QUEUE_PRIORITY") {
+            let pri_low = pri.to_lowercase();
+            if pri_low != "normal"
+                && let Err(e) = try_apply_queue_priority(
+                    &mut queue,
+                    &context,
+                    device,
+                    queue_props,
+                    &extensions,
+                    &pri_low,
+                )
+            {
+                log::warn!("OCL_QUEUE_PRIORITY={}: {} — using default priority", pri, e);
+            }
+        }
 
         // --- Build compiler options based on device CL version ---
         let cl_opts = build_cl_opts(&device);
