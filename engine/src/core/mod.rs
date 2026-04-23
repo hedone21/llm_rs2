@@ -2,6 +2,7 @@ pub mod attention_scores;
 pub mod backend;
 pub mod buffer;
 pub mod cache_manager;
+pub mod chat_ipc;
 pub mod chat_template;
 pub mod events;
 pub mod eviction;

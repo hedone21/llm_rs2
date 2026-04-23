@@ -7191,15 +7191,9 @@ fn run_ppl(
 
 // ─────────────────────── Chat REPL mode ───────────────────────
 
-#[cfg(unix)]
-type ChatReplyWriter = std::sync::Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>;
-#[cfg(not(unix))]
-type ChatReplyWriter = std::sync::Arc<std::sync::Mutex<()>>;
-
-enum ChatInput {
-    Line(String, Option<ChatReplyWriter>),
-    Eof,
-}
+use llm_rs2::core::chat_ipc::{
+    ChatInput, finish_reply_stream, spawn_chat_input_sources, write_reply_bytes,
+};
 
 fn resolve_token_ids(
     tokenizer: &Tokenizer,
@@ -7221,116 +7215,6 @@ fn resolve_token_ids(
         }
     }
     Ok(out)
-}
-
-fn write_reply_bytes(reply: Option<&ChatReplyWriter>, bytes: &[u8]) {
-    #[cfg(unix)]
-    if let Some(arc) = reply {
-        use std::io::Write;
-        if let Ok(mut s) = arc.lock() {
-            let _ = s.write_all(bytes);
-            let _ = s.flush();
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (reply, bytes);
-    }
-}
-
-fn finish_reply_stream(reply: Option<&ChatReplyWriter>) {
-    // Delimit end-of-turn with 0x04 (EOT) and shutdown the stream.
-    #[cfg(unix)]
-    if let Some(arc) = reply {
-        use std::io::Write;
-        if let Ok(mut s) = arc.lock() {
-            let _ = s.write_all(&[0x04]);
-            let _ = s.flush();
-            let _ = s.shutdown(std::net::Shutdown::Write);
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = reply;
-    }
-}
-
-fn spawn_chat_input_sources(
-    socket_path: Option<&str>,
-) -> anyhow::Result<std::sync::mpsc::Receiver<ChatInput>> {
-    let (tx, rx) = std::sync::mpsc::channel::<ChatInput>();
-
-    // stdin reader thread
-    let stdin_tx = tx.clone();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        let stdin = std::io::stdin();
-        let mut reader = stdin.lock();
-        loop {
-            let mut buf = String::new();
-            match reader.read_line(&mut buf) {
-                Ok(0) => {
-                    let _ = stdin_tx.send(ChatInput::Eof);
-                    break;
-                }
-                Ok(_) => {
-                    if stdin_tx.send(ChatInput::Line(buf, None)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    let _ = stdin_tx.send(ChatInput::Eof);
-                    break;
-                }
-            }
-        }
-    });
-
-    // Optional Unix socket listener thread
-    #[cfg(unix)]
-    if let Some(path) = socket_path {
-        use std::os::unix::net::UnixListener;
-        let path = path.to_string();
-        // Remove any stale socket file before binding
-        let _ = std::fs::remove_file(&path);
-        let listener = UnixListener::bind(&path)
-            .map_err(|e| anyhow::anyhow!("failed to bind Unix socket at {}: {}", path, e))?;
-        eprintln!("[Chat] Listening for socket input at {}", path);
-        let sock_tx = tx.clone();
-        std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let stream = match conn {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let stream_arc =
-                    std::sync::Arc::new(std::sync::Mutex::new(match stream.try_clone() {
-                        Ok(c) => c,
-                        Err(_) => continue,
-                    }));
-                let conn_tx = sock_tx.clone();
-                let reader_stream = stream;
-                std::thread::spawn(move || {
-                    use std::io::BufRead;
-                    let reader = std::io::BufReader::new(reader_stream);
-                    for line in reader.lines().map_while(Result::ok) {
-                        if conn_tx
-                            .send(ChatInput::Line(line, Some(stream_arc.clone())))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-    }
-    #[cfg(not(unix))]
-    if socket_path.is_some() {
-        anyhow::bail!("--chat-socket is only supported on unix targets");
-    }
-
-    Ok(rx)
 }
 
 fn chat_prefill_and_update_kv(
