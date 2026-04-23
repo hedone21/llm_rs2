@@ -8,10 +8,11 @@ use crate::core::eviction::EvictionPolicy;
 use crate::core::kv_cache::{KVCache, max_cache_pos};
 use crate::core::pressure::{
     ActionResult, CachePressurePipeline, EvictionHandler, HandlerContext, MIN_EVICT_TOKENS,
-    PressureLevel, PressureStageConfig,
+    PressureLevel, PressureStageConfig, SwapHandler,
 };
 use crate::core::sys_monitor::SystemMonitor;
 use crate::resilience::EvictMethod;
+use std::path::PathBuf;
 
 /// Result of an eviction attempt.
 #[derive(Debug, Clone)]
@@ -57,6 +58,10 @@ pub struct CacheManager {
     event_sink: Arc<dyn EventSink>,
     /// Named eviction policies for Manager-directed dispatch (resilience).
     policies: HashMap<EvictMethod, Box<dyn EvictionPolicy>>,
+    /// Optional disk-backed swap handler for `KvOffload` directives.
+    /// Not part of the pressure pipeline — invoked directly by `offload()` /
+    /// `recall()` so it only runs when the Manager explicitly asks for it.
+    swap_handler: Option<Arc<SwapHandler>>,
 }
 
 impl CacheManager {
@@ -80,6 +85,7 @@ impl CacheManager {
             threshold_bytes,
             event_sink: Arc::new(NoOpSink),
             policies: HashMap::new(),
+            swap_handler: None,
         }
     }
 
@@ -98,6 +104,7 @@ impl CacheManager {
             threshold_bytes,
             event_sink: Arc::new(NoOpSink),
             policies: HashMap::new(),
+            swap_handler: None,
         }
     }
 
@@ -109,6 +116,46 @@ impl CacheManager {
     /// Get a reference to the event sink.
     pub fn event_sink(&self) -> &Arc<dyn EventSink> {
         &self.event_sink
+    }
+
+    /// Enable disk-backed KV swap. The resulting `SwapHandler` is stored on the
+    /// manager but *not* registered in the pressure pipeline — it fires only
+    /// when the engine explicitly calls `offload()` / `recall()` in response
+    /// to a `KvOffload` / `RestoreDefaults` directive.
+    pub fn enable_swap(&mut self, swap_dir: PathBuf) {
+        self.swap_handler = Some(Arc::new(SwapHandler::with_disk(0.5, swap_dir)));
+    }
+
+    /// Offload `ratio` fraction (LRU prefix) of each layer's KV cache to disk.
+    /// No-op + warning when swap is not enabled. Returns the number of tokens
+    /// offloaded (summed across layers).
+    pub fn offload(&mut self, caches: &mut [KVCache], ratio: f32) -> Result<usize> {
+        let Some(handler_arc) = self.swap_handler.as_mut() else {
+            eprintln!("[CacheManager] KvOffload ignored: swap not enabled (missing --swap-dir)");
+            return Ok(0);
+        };
+        // Update ratio on the shared handler.
+        if let Some(h) = Arc::get_mut(handler_arc) {
+            h.set_ratio(ratio);
+        } else {
+            // Shared reference outlives us; build a new handler preserving the dir + state.
+            let new_handler = SwapHandler {
+                offload_ratio: ratio.clamp(0.0, 1.0),
+                swap_dir: handler_arc.swap_dir.clone(),
+                state: handler_arc.state.clone(),
+            };
+            *handler_arc = Arc::new(new_handler);
+        }
+        handler_arc.offload_caches(caches)
+    }
+
+    /// Recall any previously offloaded tokens for each cache layer.
+    /// Returns the number of tokens restored. No-op when swap is not enabled.
+    pub fn recall(&mut self, caches: &mut [KVCache]) -> Result<usize> {
+        let Some(handler) = self.swap_handler.as_ref() else {
+            return Ok(0);
+        };
+        handler.recall_caches(caches)
     }
 
     /// Determine pressure level from available memory.

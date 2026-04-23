@@ -193,6 +193,10 @@ pub enum EngineCommand {
     KvMergeD2o { keep_ratio: f32 },
     /// Dynamically transition KV cache quantization bits.
     KvQuantDynamic { target_bits: u8 },
+    /// Offload a fraction of KV cache to disk (LRU prefix).
+    /// `ratio`: 0.0~1.0, fraction of oldest tokens to swap out.
+    /// Paired with `RestoreDefaults` for recall.
+    KvOffload { ratio: f32 },
 
     // ── Query ──
     /// Request QCF cost estimates for lossy actions (MSG-036b).
@@ -538,6 +542,21 @@ mod tests {
         match back {
             EngineCommand::KvQuantDynamic { target_bits } => assert_eq!(target_bits, 4),
             _ => panic!("Expected KvQuantDynamic"),
+        }
+    }
+
+    #[test]
+    fn test_engine_command_serde_kv_offload() {
+        let cmd = EngineCommand::KvOffload { ratio: 0.5 };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"kv_offload\""));
+        assert!(json.contains("\"ratio\":0.5"));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::KvOffload { ratio } => {
+                assert!((ratio - 0.5).abs() < f32::EPSILON);
+            }
+            _ => panic!("Expected KvOffload"),
         }
     }
 

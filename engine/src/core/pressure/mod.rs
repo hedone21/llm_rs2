@@ -72,6 +72,8 @@ pub enum ActionResult {
     Quantized,
     /// KV data was swapped to secondary storage (disk offload).
     Swapped { tokens_swapped: usize },
+    /// KV data was recalled (restored) from secondary storage back into cache.
+    Recalled { tokens_recalled: usize },
 }
 
 impl ActionResult {
@@ -480,6 +482,7 @@ mod tests {
         );
         assert!(ActionResult::Quantized.is_action());
         assert!(ActionResult::Swapped { tokens_swapped: 0 }.is_action());
+        assert!(ActionResult::Recalled { tokens_recalled: 0 }.is_action());
     }
 
     #[test]

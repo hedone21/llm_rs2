@@ -39,6 +39,13 @@ pub struct ExecutionPlan {
     pub layer_skip: Option<f32>,
     /// KV quantization bits, from KvQuantDynamic command.
     pub kv_quant_bits: Option<u8>,
+    /// KV cache offload ratio, from KvOffload command (0.0~1.0).
+    /// Consumed by the decode loop: when `Some(r)`, the engine calls
+    /// `CacheManager::offload(r)` and clears this field.
+    pub offload_ratio: Option<f32>,
+    /// True when a RestoreDefaults directive arrives and offloaded KV data
+    /// should be recalled from swap back into the cache.
+    pub recall_offload: bool,
     /// Whether to restore all action-induced state to defaults.
     pub restore_defaults: bool,
     /// Whether Engine should compute and send QCF estimates.
@@ -424,8 +431,17 @@ impl CommandExecutor {
                 }
                 CommandResult::Ok
             }
+            EngineCommand::KvOffload { ratio } => {
+                let r = ratio.clamp(0.0, 1.0);
+                plan.offload_ratio = Some(r);
+                if !self.active_actions.contains(&"kv_offload".to_string()) {
+                    self.active_actions.push("kv_offload".to_string());
+                }
+                CommandResult::Ok
+            }
             EngineCommand::RestoreDefaults => {
                 plan.restore_defaults = true;
+                plan.recall_offload = true;
                 plan.throttle_delay_ms = 0;
                 plan.target_tbt_ms = 0;
                 // Intentionally leave plan.target_tbt_set = false so the engine
@@ -808,6 +824,37 @@ mod tests {
                 .active_actions()
                 .contains(&"kv_quant_dynamic".to_string())
         );
+    }
+
+    #[test]
+    fn test_kv_offload_sets_plan_field() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::KvOffload { ratio: 0.5 }],
+        }))
+        .unwrap();
+
+        let plan = executor.poll(&empty_snap());
+        assert_eq!(plan.offload_ratio, Some(0.5));
+        assert!(!plan.recall_offload);
+        assert!(
+            executor
+                .active_actions()
+                .contains(&"kv_offload".to_string())
+        );
+
+        // RestoreDefaults should set recall_offload and clear the sticky action
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::RestoreDefaults],
+        }))
+        .unwrap();
+        let plan2 = executor.poll(&empty_snap());
+        assert!(plan2.restore_defaults);
+        assert!(plan2.recall_offload);
+        assert!(executor.active_actions().is_empty());
     }
 
     #[test]
