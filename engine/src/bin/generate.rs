@@ -1397,6 +1397,7 @@ fn main() -> anyhow::Result<()> {
             args.target_tbt,
             args.tbt_log.as_deref(),
             args.ignore_eos,
+            args.throttle_delay_ms,
         );
     }
 
@@ -1422,6 +1423,7 @@ fn main() -> anyhow::Result<()> {
             args.max_prefetch_depth,
             &args.offload_path,
             &mut command_executor,
+            args.throttle_delay_ms,
         );
     }
 
@@ -4113,6 +4115,31 @@ fn main() -> anyhow::Result<()> {
                     } else {
                         args.eviction_window
                     };
+
+                    // ISSUE-9 fix: On OpenCL with zero-copy memory, KV V
+                    // buffers are UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR) that
+                    // start unmapped — `as_ptr()` returns null, which trips
+                    // the host-readable guard in compute_qcf_estimates and
+                    // skips KV-based 4종 estimates. Sync GPU queue and map
+                    // V buffers for CPU before running QCF, then unmap so
+                    // the next forward pass can reuse the GPU path.
+                    if let Err(e) = backend.synchronize() {
+                        eprintln!("[QCF] backend.synchronize() failed: {}", e);
+                    }
+                    let mut mapped_bufs: Vec<std::sync::Arc<dyn llm_rs2::core::buffer::Buffer>> =
+                        Vec::new();
+                    for cache in &kv_caches {
+                        let v_buf = cache.v_buffer.buffer();
+                        if v_buf.as_ptr().is_null() {
+                            match v_buf.map_for_cpu() {
+                                Ok(_) => mapped_bufs.push(v_buf.clone()),
+                                Err(e) => {
+                                    eprintln!("[QCF] map_for_cpu failed: {}", e);
+                                }
+                            }
+                        }
+                    }
+
                     let ctx = QcfEstimateContext {
                         kv_caches: &kv_caches,
                         score_accumulator: score_accumulator.as_ref(),
@@ -4122,6 +4149,16 @@ fn main() -> anyhow::Result<()> {
                         kivi_caches: None,
                     };
                     let estimates = compute_qcf_estimates(&ctx);
+
+                    // Release mappings so subsequent forward passes can use
+                    // the GPU path without the "writes to mapped buffer
+                    // are UB" hazard.
+                    for buf in &mapped_bufs {
+                        if let Err(e) = buf.unmap_for_gpu() {
+                            eprintln!("[QCF] unmap_for_gpu failed: {}", e);
+                        }
+                    }
+
                     executor.send_qcf_estimate(llm_shared::QcfEstimate { estimates });
                 }
 
@@ -4782,6 +4819,10 @@ fn main() -> anyhow::Result<()> {
                 }
 
                 executor.on_token_generated();
+            } else if throttle_delay_ms > 0 {
+                // No CommandExecutor: honour CLI --throttle-delay-ms directly
+                // so decode pacing works without --enable-resilience.
+                std::thread::sleep(std::time::Duration::from_millis(throttle_delay_ms));
             }
             // ── End Resilience checkpoint ─────────────────────
 
@@ -5943,6 +5984,7 @@ fn run_kivi(
     mut target_tbt_ms: f64,
     tbt_log_path: Option<&str>,
     ignore_eos: bool,
+    cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
 
@@ -6348,6 +6390,9 @@ fn run_kivi(
             }
 
             executor.on_token_generated();
+        } else if cli_throttle_delay_ms > 0 {
+            // No CommandExecutor: honour CLI --throttle-delay-ms directly.
+            std::thread::sleep(std::time::Duration::from_millis(cli_throttle_delay_ms));
         }
 
         // Read logits to CPU
@@ -6532,6 +6577,7 @@ fn run_offload(
     max_prefetch_depth: usize,
     offload_path: &str,
     command_executor: &mut Option<CommandExecutor>,
+    cli_throttle_delay_ms: u64,
 ) -> anyhow::Result<()> {
     use llm_rs2::core::kv_cache::KVCacheOps;
     use llm_rs2::core::offload::OffloadKVCache;
@@ -6825,6 +6871,9 @@ fn run_offload(
             }
 
             executor.on_token_generated();
+        } else if cli_throttle_delay_ms > 0 {
+            // No CommandExecutor: honour CLI --throttle-delay-ms directly.
+            std::thread::sleep(std::time::Duration::from_millis(cli_throttle_delay_ms));
         }
         // ── End checkpoint ──
 
