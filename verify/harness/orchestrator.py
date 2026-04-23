@@ -496,9 +496,11 @@ def _run_scenario_ssh(
     # Pre-clean any stale processes / sockets on the remote host.
     # kill errors are ignored (best effort).
     remote.exec(
+        "pkill -TERM -f 'llm_manager' 2>/dev/null; "
         "pkill -TERM -f 'mock_manager' 2>/dev/null; "
         "pkill -TERM -f '/home/nvidia/llm_rs2/generate' 2>/dev/null; "
         "sleep 0.3; "
+        "pkill -KILL -f 'llm_manager' 2>/dev/null; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
         "pkill -KILL -f '/home/nvidia/llm_rs2/generate' 2>/dev/null; "
         "rm -f /tmp/verify_*.sock 2>/dev/null; "
@@ -759,9 +761,11 @@ def _run_scenario_adb(
     # Pre-clean stale processes / sockets on device.
     work_dir = device_cfg.get("paths", {}).get("work_dir", "/data/local/tmp")
     remote.exec(
+        "pkill -TERM -f 'llm_manager' 2>/dev/null; "
         "pkill -TERM -f 'mock_manager' 2>/dev/null; "
         f"pkill -TERM -f '{work_dir}/generate' 2>/dev/null; "
         "sleep 0.3; "
+        "pkill -KILL -f 'llm_manager' 2>/dev/null; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
         f"pkill -KILL -f '{work_dir}/generate' 2>/dev/null; "
         f"rm -f {work_dir}/verify_*.sock 2>/dev/null; "
@@ -1220,10 +1224,15 @@ def _run_scenario_adb_signal(
                 "--schedule", str(schedule_local),
                 "--log-file", str(signal_log_local),
                 "--connect-timeout", "30",
-                # Wait until the engine has loaded the model and connected to
-                # the manager, at which point ExternalMonitor binds its TCP
-                # listener. 8s covers qwen2.5-1.5b model load on S25.
-                "--pre-sleep", "8",
+                # Wait until the engine has loaded the model, connected to
+                # the manager, and the manager has built its monitor threads
+                # (ExternalMonitor only binds its TCP listener AFTER
+                # `create_transport` receives the engine client connection —
+                # see manager/src/main.rs:142/160). Measured on S25: manager
+                # start → engine connect ≈ 11s; previous 8s pre-sleep raced
+                # the ExternalMonitor bind and silently dropped the signal
+                # (verify v2 ISSUE-7, 20260423_135553 run).
+                "--pre-sleep", "15",
             ]
             signal_proc = subprocess.Popen(
                 sig_cmd,
