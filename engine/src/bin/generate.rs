@@ -3608,6 +3608,122 @@ fn main() -> anyhow::Result<()> {
         _printed_len = initial_text.len();
         stdout.flush().ok();
 
+        // ─── UMA Hybrid Attention setup (Stage C) ─────────────────────
+        // LLMRS_ATTN_HYBRID_KV_FRAC=X 가 설정되고 gating 조건이 모두 충족되면
+        // 공용 GPU 스크래치 버퍼를 할당하고 HybridScope를 install한다. 스코프
+        // 객체는 decode 루프 종료까지 살아있어야 하므로 `_hybrid_scope`로 바인드.
+        // Gating 실패 시 reason을 stderr로 한 번 찍고 스킵.
+        #[cfg(feature = "opencl")]
+        let _hybrid_scope = {
+            use llm_rs2::layers::hybrid_attention::{self, HybridAttnSetup};
+            match HybridAttnSetup::from_env() {
+                Some(kv_frac) => {
+                    let backend_is_opencl = backend.name() == "OpenCL";
+                    let kv_is_f16 = args.kv_type == "f16";
+                    let head_dim_val = model.config.head_dim;
+                    let head_dim_ok = head_dim_val == 64 || head_dim_val == 128;
+                    let n_heads_q = model.config.num_attention_heads;
+                    let n_kv_heads = model.config.num_key_value_heads;
+                    let is_gqa = n_kv_heads < n_heads_q;
+                    let partition_off =
+                        args.tensor_partition <= 0.0 || args.tensor_partition >= 1.0;
+                    let eviction_compatible =
+                        args.eviction_policy != "kivi" && args.eviction_policy != "qcf";
+                    let layout_ok = kv_caches
+                        .first()
+                        .map(|c| c.layout() == KVLayout::HeadMajor)
+                        .unwrap_or(false);
+
+                    let gate_ok = backend_is_opencl
+                        && kv_is_f16
+                        && head_dim_ok
+                        && is_gqa
+                        && partition_off
+                        && eviction_compatible
+                        && layout_ok;
+
+                    if !gate_ok {
+                        let reason = if !backend_is_opencl {
+                            "backend is not OpenCL"
+                        } else if !kv_is_f16 {
+                            "kv dtype must be f16"
+                        } else if !head_dim_ok {
+                            "head_dim must be 64 or 128"
+                        } else if !is_gqa {
+                            "requires GQA (n_kv_heads < n_heads_q)"
+                        } else if !partition_off {
+                            "FFN tensor partition is active"
+                        } else if !eviction_compatible {
+                            "incompatible eviction policy (kivi/qcf)"
+                        } else {
+                            "KV layout must be HeadMajor"
+                        };
+                        eprintln!(
+                            "[hybrid-attn] LLMRS_ATTN_HYBRID_KV_FRAC={} ignored: {}",
+                            kv_frac, reason
+                        );
+                        None
+                    } else {
+                        // Map KV/Q/out_attn/residual UnifiedBuffer들을 CPU가 접근
+                        // 가능하도록 전부 매핑한다. UMA 특성상 map은 주소만
+                        // 고정하고 추가 복사는 하지 않는다. Plan execution에
+                        // 들어가기 전에 한 번만 호출되면 충분.
+                        let mut map_err: Option<anyhow::Error> = None;
+                        for c in kv_caches.iter() {
+                            if let Err(e) = c.k_buffer.buffer().map_for_cpu() {
+                                map_err = Some(e);
+                                break;
+                            }
+                            if let Err(e) = c.v_buffer.buffer().map_for_cpu() {
+                                map_err = Some(e);
+                                break;
+                            }
+                        }
+                        if map_err.is_none() {
+                            if let Err(e) = gen_ws.q.buffer().map_for_cpu() {
+                                map_err = Some(e);
+                            } else if let Err(e) = gen_ws.out_attn.buffer().map_for_cpu() {
+                                map_err = Some(e);
+                            }
+                        }
+                        if let Some(e) = map_err {
+                            eprintln!("[hybrid-attn] failed to map UMA buffers: {} — skipping", e);
+                            None
+                        } else {
+                            let ocl_be = backend
+                                .as_any()
+                                .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>();
+                            match ocl_be {
+                                Some(ob) => match HybridAttnSetup::new_for_decode(
+                                    &ob.queue,
+                                    kv_frac,
+                                    n_heads_q,
+                                    head_dim_val,
+                                ) {
+                                    Ok(setup) => {
+                                        eprintln!(
+                                            "[hybrid-attn] enabled: kv_frac={} n_heads_q={} head_dim={}",
+                                            kv_frac, n_heads_q, head_dim_val
+                                        );
+                                        Some(hybrid_attention::install(Arc::new(setup)))
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[hybrid-attn] setup allocation failed: {} — skipping",
+                                            e
+                                        );
+                                        None
+                                    }
+                                },
+                                None => None,
+                            }
+                        }
+                    }
+                }
+                None => None,
+            }
+        };
+
         // Build GPU kernel plan for decode (OpenCL only, lazy rebuild on invalidation)
         // Disable for Gemma3: plan doesn't include QK-norm, post-norm, gelu_tanh_mul
         // Disable when tensor partition is active: plan bypasses forward_gen's
