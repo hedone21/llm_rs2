@@ -15,7 +15,7 @@ action:
   mock_manager_commands:
     - delay_sec: 0.5
       command: KvQuantDynamic
-      params: { bits: 4 }
+      params: { target_bits: 4 }
     - delay_sec: 2.5
       command: RestoreDefaults
       params: {}
