@@ -26,6 +26,11 @@ pub struct ExecutionPlan {
     /// Target TBT in ms. Engine sleeps max(0, target - actual_tbt) per token.
     /// 0 = disabled. Set via SetTargetTbt command.
     pub target_tbt_ms: u64,
+    /// True iff `target_tbt_ms` was explicitly set by a SetTargetTbt directive
+    /// received at least once. Lets the engine distinguish "manager explicitly
+    /// said 0 (disable pacing)" from "manager never sent a directive, use CLI
+    /// default". Cleared by RestoreDefaults.
+    pub target_tbt_set: bool,
     /// Whether inference should be suspended.
     pub suspended: bool,
     /// Whether inference should resume from suspension.
@@ -105,6 +110,7 @@ pub struct CommandExecutor {
     active_device: String,
     throttle_delay_ms: u64,
     target_tbt_ms: u64,
+    target_tbt_set: bool,
 
     // Currently active action names (e.g. "kv_evict_h2o", "throttle")
     active_actions: Vec<String>,
@@ -173,6 +179,7 @@ impl CommandExecutor {
             active_device,
             throttle_delay_ms: 0,
             target_tbt_ms: 0,
+            target_tbt_set: false,
             active_actions: Vec::new(),
             evict_plan: None,
             kv_quant_bits: None,
@@ -249,6 +256,7 @@ impl CommandExecutor {
             // Maintain existing throttle, target TBT, and sticky evict/quant state
             plan.throttle_delay_ms = self.throttle_delay_ms;
             plan.target_tbt_ms = self.target_tbt_ms;
+            plan.target_tbt_set = self.target_tbt_set;
             plan.evict = self.evict_plan.clone();
             plan.kv_quant_bits = self.kv_quant_bits;
             return plan;
@@ -310,7 +318,9 @@ impl CommandExecutor {
             }
             EngineCommand::SetTargetTbt { target_ms } => {
                 plan.target_tbt_ms = *target_ms;
+                plan.target_tbt_set = true;
                 self.target_tbt_ms = *target_ms;
+                self.target_tbt_set = true;
                 if *target_ms > 0 {
                     if !self.active_actions.contains(&"target_tbt".to_string()) {
                         self.active_actions.push("target_tbt".to_string());
@@ -410,8 +420,12 @@ impl CommandExecutor {
                 plan.restore_defaults = true;
                 plan.throttle_delay_ms = 0;
                 plan.target_tbt_ms = 0;
+                // Intentionally leave plan.target_tbt_set = false so the engine
+                // takes the `restore_defaults` branch (CLI fallback) rather
+                // than treating this as an explicit "set to 0".
                 self.throttle_delay_ms = 0;
                 self.target_tbt_ms = 0;
+                self.target_tbt_set = false;
                 self.evict_plan = None;
                 self.kv_quant_bits = None;
                 self.compute_level = ResourceLevel::Normal;
@@ -1109,6 +1123,53 @@ mod tests {
             }
             _ => panic!("Expected Capability"),
         }
+    }
+
+    #[test]
+    fn test_set_target_tbt_dirty_flag_lifecycle() {
+        let (mut executor, tx, _rx) = make_executor();
+
+        // No directive → plan.target_tbt_set must stay false (CLI default path).
+        let plan0 = executor.poll(&empty_snap());
+        assert!(!plan0.target_tbt_set);
+        assert_eq!(plan0.target_tbt_ms, 0);
+
+        // SetTargetTbt { 250 } → set=true, ms=250.
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 1,
+            commands: vec![EngineCommand::SetTargetTbt { target_ms: 250 }],
+        }))
+        .unwrap();
+        let plan1 = executor.poll(&empty_snap());
+        assert!(plan1.target_tbt_set);
+        assert_eq!(plan1.target_tbt_ms, 250);
+
+        // No directive → sticky (set=true, ms=250).
+        let plan2 = executor.poll(&empty_snap());
+        assert!(plan2.target_tbt_set);
+        assert_eq!(plan2.target_tbt_ms, 250);
+
+        // SetTargetTbt { 0 } (explicit pacing disable) → set=true, ms=0.
+        // This is the ISSUE-3 fix: the engine must see set=true to honor 0.
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 2,
+            commands: vec![EngineCommand::SetTargetTbt { target_ms: 0 }],
+        }))
+        .unwrap();
+        let plan3 = executor.poll(&empty_snap());
+        assert!(plan3.target_tbt_set);
+        assert_eq!(plan3.target_tbt_ms, 0);
+
+        // RestoreDefaults → set=false (CLI fallback branch), restore flag on.
+        tx.send(ManagerMessage::Directive(EngineDirective {
+            seq_id: 3,
+            commands: vec![EngineCommand::RestoreDefaults],
+        }))
+        .unwrap();
+        let plan4 = executor.poll(&empty_snap());
+        assert!(!plan4.target_tbt_set);
+        assert_eq!(plan4.target_tbt_ms, 0);
+        assert!(plan4.restore_defaults);
     }
 
     #[test]

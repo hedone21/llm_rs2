@@ -4579,14 +4579,16 @@ fn main() -> anyhow::Result<()> {
                 }
                 throttle_delay_ms = plan.throttle_delay_ms;
 
-                // Update target TBT from Manager directive (overrides CLI --target-tbt)
-                if plan.target_tbt_ms > 0 && plan.target_tbt_ms as f64 != target_tbt_ms {
+                // Update target TBT from Manager directive (overrides CLI --target-tbt).
+                // `target_tbt_set` distinguishes "manager explicitly said 0 (disable
+                // pacing)" from "manager never sent a directive" — otherwise a
+                // `SetTargetTbt { target_ms: 0 }` restore cannot clear a prior
+                // non-zero target (see verify/ISSUE-3).
+                if plan.target_tbt_set && plan.target_tbt_ms as f64 != target_tbt_ms {
                     eprintln!(
                         "[Resilience] SetTargetTbt: {:.1}ms → {}ms",
                         target_tbt_ms, plan.target_tbt_ms
                     );
-                    target_tbt_ms = plan.target_tbt_ms as f64;
-                } else if plan.target_tbt_ms > 0 {
                     target_tbt_ms = plan.target_tbt_ms as f64;
                 } else if plan.restore_defaults {
                     target_tbt_ms = args.target_tbt; // restore CLI default
@@ -6173,14 +6175,14 @@ fn run_kivi(
                 std::thread::sleep(std::time::Duration::from_millis(plan.throttle_delay_ms));
             }
 
-            // Update target TBT from Manager directive
-            if plan.target_tbt_ms > 0 && plan.target_tbt_ms as f64 != target_tbt_ms {
+            // Update target TBT from Manager directive. `target_tbt_set` lets
+            // the engine honor an explicit `SetTargetTbt { target_ms: 0 }` to
+            // disable pacing (see verify/ISSUE-3).
+            if plan.target_tbt_set && plan.target_tbt_ms as f64 != target_tbt_ms {
                 eprintln!(
                     "[KIVI-Resilience] SetTargetTbt: {:.1}ms → {}ms",
                     target_tbt_ms, plan.target_tbt_ms
                 );
-                target_tbt_ms = plan.target_tbt_ms as f64;
-            } else if plan.target_tbt_ms > 0 {
                 target_tbt_ms = plan.target_tbt_ms as f64;
             } else if plan.restore_defaults {
                 target_tbt_ms = 0.0;
