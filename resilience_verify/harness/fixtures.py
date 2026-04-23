@@ -13,7 +13,7 @@ else:  # pragma: no cover
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RESILIENCE_DIR = PROJECT_ROOT / "experiments" / "resilience_verify"
+RESILIENCE_DIR = PROJECT_ROOT / "resilience_verify"
 FIXTURES_DIR = RESILIENCE_DIR / "fixtures"
 SCENARIOS_DIR = RESILIENCE_DIR / "scenarios"
 RESULTS_DIR = RESILIENCE_DIR / "results"

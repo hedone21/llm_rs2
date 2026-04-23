@@ -1078,7 +1078,7 @@ def _run_scenario_adb_signal(
     remote.push(local_prompt, remote_prompt, retries=2, timeout=60.0)
 
     # Manager config (all monitors off except external tcp:127.0.0.1:9102).
-    cfg_src = PROJECT_ROOT / "experiments/resilience_verify/fixtures/manager_config_external_only.toml"
+    cfg_src = PROJECT_ROOT / "resilience_verify" / "fixtures" / "manager_config_external_only.toml"
     local_cfg = out_dir / "manager_config.toml"
     local_cfg.write_text(cfg_src.read_text(), encoding="utf-8")
     remote_cfg = f"{remote_run_dir}/manager_config.toml"
@@ -1215,7 +1215,7 @@ def _run_scenario_adb_signal(
             # Start signal_client in the background on the host.
             sig_cmd = [
                 sys.executable,
-                str(PROJECT_ROOT / "scripts" / "resilience_verify" / "signal_client.py"),
+                str(PROJECT_ROOT / "resilience_verify" / "harness" / "signal_client.py"),
                 "--transport", f"tcp:127.0.0.1:{host_forward_port}",
                 "--schedule", str(schedule_local),
                 "--log-file", str(signal_log_local),

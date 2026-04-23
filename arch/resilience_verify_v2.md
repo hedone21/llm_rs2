@@ -113,10 +113,10 @@ sequenceDiagram
 
 ## 주요 파일
 
-- `scripts/verify_resilience.py` — CLI entrypoint (build/deploy + dispatch)
-- `scripts/resilience_verify/orchestrator.py` — `_run_scenario_{local,ssh,adb,adb_signal}`
-- `scripts/resilience_verify/signal_client.py` — SystemSignal JSONL TCP/Unix injector
-- `scripts/resilience_verify/assertions.py` — `verify_{functional,crash_and_progress,performance,accuracy}` + `aggregate_verdict`
-- `scripts/resilience_verify/log_parser.py` — `find_sequence`, `find_crash_signatures`, `count_decoded_tokens`
-- `experiments/resilience_verify/fixtures/manager_config_external_only.toml` — 결정론 보장을 위해 실측 monitor 전부 off, ExternalMonitor만 on
-- `experiments/resilience_verify/scenarios/*.yaml` — YAML scenario spec (v2 schema)
+- `resilience_verify/verify.py` — CLI entrypoint (build/deploy + dispatch)
+- `resilience_verify/harness/orchestrator.py` — `_run_scenario_{local,ssh,adb,adb_signal}`
+- `resilience_verify/harness/signal_client.py` — SystemSignal JSONL TCP/Unix injector
+- `resilience_verify/harness/assertions.py` — `verify_{functional,crash_and_progress,performance,accuracy}` + `aggregate_verdict`
+- `resilience_verify/harness/log_parser.py` — `find_sequence`, `find_crash_signatures`, `count_decoded_tokens`
+- `resilience_verify/fixtures/manager_config_external_only.toml` — 결정론 보장을 위해 실측 monitor 전부 off, ExternalMonitor만 on
+- `resilience_verify/scenarios/*.yaml` — YAML scenario spec (v2 schema)

@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 """Resilience verify harness — CLI entry point.
 
-Phase 4: Jetson (SSH) remote orchestration added. Local host path unchanged.
+Typical usage (run from project root):
 
-Typical usage:
+    python resilience_verify/verify.py --device host --model f16 \\
+        --scenario-filter throttle_smoke --runs 1 --skip-deploy
 
-    # Host smoke test (Phase 1-3)
-    python scripts/verify_resilience.py --device host --model f16 \\
-        --scenario-filter throttle_smoke --layer engine_cmd --runs 1 --skip-deploy
+    python resilience_verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
 
-    # Jetson smoke test (Phase 4) — builds + deploys by default
-    python scripts/verify_resilience.py --device jetson --model q4 \\
-        --scenario-filter direct_cmd_throttle_smoke --layer engine_cmd --runs 1
-
-    # Jetson full matrix (Phase 4 completion criterion)
-    python scripts/verify_resilience.py --device jetson --model q4,f16 \\
-        --scenario-filter all --layer engine_cmd --runs 1
+See resilience_verify/USAGE.md for the full CLI reference and YAML scenario
+authoring guide; resilience_verify/README.md for architecture overview.
 """
 
 from __future__ import annotations
@@ -25,24 +19,24 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-# Make the package importable when invoked as a script.
-_SCRIPTS_DIR = Path(__file__).resolve().parent
-if str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
+# Make harness/ importable when invoked as a plain script.
+_HERE = Path(__file__).resolve().parent
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
-from resilience_verify.fixtures import (  # noqa: E402
+from harness.fixtures import (  # noqa: E402
     PROJECT_ROOT,
     RESULTS_DIR,
     SCENARIOS_DIR,
     load_device_config,
 )
-from resilience_verify.orchestrator import run_scenario  # noqa: E402
-from resilience_verify.report import (  # noqa: E402
+from harness.orchestrator import run_scenario  # noqa: E402
+from harness.report import (  # noqa: E402
     render_console_table,
     write_summary_jsonl,
     write_summary_md,
 )
-from resilience_verify.spec_loader import (  # noqa: E402
+from harness.spec_loader import (  # noqa: E402
     discover_scenarios,
     filter_scenarios,
 )

@@ -1,7 +1,7 @@
 # Deterministic llm_manager config for resilience verify harness.
 # All system monitors (memory/thermal/compute/energy) are disabled so that only
 # the external signal injection path drives the policy. Signals arrive via TCP
-# JSONL on 127.0.0.1:9102 written by scripts/resilience_verify/signal_client.py.
+# JSONL on 127.0.0.1:9102 written by resilience_verify/harness/signal_client.py.
 
 [manager]
 poll_interval_ms = 500

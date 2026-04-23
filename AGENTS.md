@@ -126,5 +126,10 @@ python scripts/run_device.py -d pixel generate
 | 대시보드 | `/dashboard` |
 | Spec 관리 | `/spec-manage` |
 | 실험 벤치마크 | `experiments/PLAN.md`, `docs/35_experiment_runner_guide.md` |
+| Resilience 검증 하네스 | `resilience_verify/README.md`, `resilience_verify/USAGE.md`, `arch/resilience_verify_v2.md` |
 | TODO 관리 | `.agent/todos/` — 형식: `.agent/todos/README.md` |
 | 설계 문서 | `ARCHITECTURE.md`, `spec/`, `docs/` |
+
+## Resilience 검증 하네스 요약
+
+`resilience_verify/` — SystemSignal → Policy → EngineCommand → Engine 전 경로를 실제 바이너리로 돌려 4층(functional / crash+progress / performance / accuracy) 판정하는 자동화 매트릭스. 엔트리는 `python resilience_verify/verify.py --device <key> --model <f16,q4> [--scenario-filter ...]`. 시나리오 YAML은 `resilience_verify/scenarios/`. 사용법 상세: `resilience_verify/USAGE.md`.

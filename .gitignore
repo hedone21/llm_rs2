@@ -35,3 +35,6 @@ tools/memfill_android
 
 # Third-party clones for comparison
 experiments/external/
+
+# Resilience verify harness runtime outputs
+resilience_verify/results/
