@@ -1414,8 +1414,7 @@ impl PolicyStrategy for LuaPolicy {
                 // 엔진 heartbeat 의 available_actions 는 빈 리스트 — Capability 로 보고된
                 // 값이 `engine_available_actions` 에 이미 저장되어 있으므로 그걸 보존한다.
                 let mut merged = status.clone();
-                if merged.available_actions.is_empty()
-                    && !self.engine_available_actions.is_empty()
+                if merged.available_actions.is_empty() && !self.engine_available_actions.is_empty()
                 {
                     merged.available_actions = self.engine_available_actions.clone();
                 }

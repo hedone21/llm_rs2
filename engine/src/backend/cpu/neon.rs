@@ -4737,6 +4737,594 @@ pub fn flash_prefill_forward_f32_neon(
     }
 }
 
+// ---------------------------------------------------------------------------
+// UMA Hybrid CPU-GPU attention — KV-range partial flash + 2-partial LSE merge
+// (Stage A, host-only). These functions provide the CPU half of a KV-split
+// flash decoding scheme. They reuse the single-chunk online-softmax kernel
+// (`CpuBackendNeon::flash_apply_token`) but expose an arbitrary `[kv_start,
+// kv_end)` range and leave normalisation for a subsequent 2-partial merge.
+// ---------------------------------------------------------------------------
+
+/// Compute a partial flash-attention result over the KV range
+/// `[kv_start, kv_end)` for a single-token decode.
+///
+/// The output is **un-normalised** on purpose: the caller merges the CPU
+/// partial with a complementary GPU partial via [`merge_two_partials_f32`].
+/// Per Q-head the function writes:
+///   * `partial_ml_out[h*2 + 0] = m_final`  (running max logit)
+///   * `partial_ml_out[h*2 + 1] = l_final`  (running softmax denom)
+///   * `partial_o_out[h*head_dim ..]      = Õ = Σ exp(s_t − m_final) · V[t]`
+///
+/// Empty ranges (`kv_start >= kv_end`) produce `m = −∞`, `l = 0`, `o = 0`,
+/// which makes them a no-op contributor in the downstream merge.
+///
+/// GQA: `kv_h = q_h / (n_heads_q / n_heads_kv)`. Q-heads are parallelised
+/// with Rayon across the head axis; each head is independent in this
+/// formulation, so there is no cross-thread synchronisation.
+///
+/// # Preconditions
+/// * HeadMajor KV layout: `K/V[kv_h, t, d]` with stride
+///   `(capacity * head_dim, head_dim, 1)`.
+/// * F16 K/V (passed as `*const u16` = f16 bits).
+/// * `kv_end <= capacity`.
+/// * `n_heads_q` is divisible by `n_heads_kv` (standard GQA).
+///
+/// # Safety
+/// All input/output pointers must reference buffers with at least the shapes
+/// documented above and remain valid for the duration of the call. The
+/// output regions (`partial_ml_out`, `partial_o_out`) must not alias any
+/// input. Aliasing between `partial_ml_out` and `partial_o_out` would be UB
+/// but neither this function nor any realistic caller does so.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn flash_partial_kv_range_f16(
+    q_f32: *const f32,
+    k_f16: *const u16,
+    v_f16: *const u16,
+    partial_ml_out: *mut f32,
+    partial_o_out: *mut f32,
+    n_heads_q: usize,
+    n_heads_kv: usize,
+    head_dim: usize,
+    capacity: usize,
+    kv_start: usize,
+    kv_end: usize,
+    inv_sqrt_dk: f32,
+) {
+    debug_assert!(n_heads_q.is_multiple_of(n_heads_kv));
+    debug_assert!(kv_end <= capacity);
+    debug_assert!(head_dim == 64 || head_dim == 128);
+
+    let gqa_ratio = n_heads_q / n_heads_kv;
+
+    // 빈 범위 처리: 모든 head를 (m=-inf, l=0, o=0)로 초기화 후 조기 반환.
+    if kv_start >= kv_end {
+        unsafe {
+            for h in 0..n_heads_q {
+                *partial_ml_out.add(h * 2) = f32::NEG_INFINITY;
+                *partial_ml_out.add(h * 2 + 1) = 0.0;
+                std::ptr::write_bytes(partial_o_out.add(h * head_dim), 0, head_dim);
+            }
+        }
+        return;
+    }
+
+    // Rayon par_iter용 포인터 번들. rustc 2021의 disjoint closure capture가
+    // 필드 단위로 raw pointer를 `&*const _` 형태로 캡처하는 것을 피하기 위해
+    // `usize`로 감싸둔다. head 축 partition이므로 동시 쓰기 충돌 없음.
+    #[derive(Clone, Copy)]
+    struct HeadPtrs {
+        q: usize,
+        k: usize,
+        v: usize,
+        ml: usize,
+        o: usize,
+    }
+
+    let ptrs = HeadPtrs {
+        q: q_f32 as usize,
+        k: k_f16 as usize,
+        v: v_f16 as usize,
+        ml: partial_ml_out as usize,
+        o: partial_o_out as usize,
+    };
+
+    (0..n_heads_q).into_par_iter().for_each(move |q_h| {
+        let kv_h = q_h / gqa_ratio;
+        let q_off = q_h * head_dim;
+        // SAFETY: q_h < n_heads_q 범위. head 별로 독립된 slice에만 쓴다.
+        unsafe {
+            let q_base = ptrs.q as *const f32;
+            let k_base = ptrs.k as *const u16;
+            let v_base = ptrs.v as *const u16;
+            let ml_base = ptrs.ml as *mut f32;
+            let o_all = ptrs.o as *mut f32;
+            let q_ptr = q_base.add(q_off);
+            let o_base = o_all.add(q_h * head_dim);
+            // 누산 전 0으로 초기화 (online softmax는 FMA into-self 패턴).
+            std::ptr::write_bytes(o_base, 0, head_dim);
+
+            let mut m_run: f32 = f32::NEG_INFINITY;
+            let mut l_run: f32 = 0.0;
+
+            // `flash_chunk_worker`와 동일한 4-way unroll 구조.
+            let range_len = kv_end - kv_start;
+            let full_4 = range_len / 4;
+            for block in 0..full_4 {
+                let t_base = kv_start + block * 4;
+                let mut b_ptrs = [std::ptr::null::<u16>(); 4];
+                for (r, bp) in b_ptrs.iter_mut().enumerate() {
+                    let t = t_base + r;
+                    let off = (kv_h * capacity + t) * head_dim;
+                    *bp = k_base.add(off);
+                }
+                let mut dots = [0.0f32; 4];
+                CpuBackendNeon::vec_dot_f16_f32_4rows(head_dim, q_ptr, b_ptrs, &mut dots);
+                for (r, &d) in dots.iter().enumerate() {
+                    let t = t_base + r;
+                    let s = d * inv_sqrt_dk;
+                    CpuBackendNeon::flash_apply_token(
+                        s, t, kv_h, capacity, head_dim, v_base, o_base, &mut m_run, &mut l_run,
+                    );
+                }
+            }
+            for t in (kv_start + full_4 * 4)..kv_end {
+                let off = (kv_h * capacity + t) * head_dim;
+                let k_ptr = k_base.add(off);
+                let dot = CpuBackendNeon::vec_dot_f16_f32(head_dim, q_ptr, k_ptr);
+                let s = dot * inv_sqrt_dk;
+                CpuBackendNeon::flash_apply_token(
+                    s, t, kv_h, capacity, head_dim, v_base, o_base, &mut m_run, &mut l_run,
+                );
+            }
+
+            *ml_base.add(q_h * 2) = m_run;
+            *ml_base.add(q_h * 2 + 1) = l_run;
+        }
+    });
+}
+
+/// Merge two partial `(m, l, Õ)` flash-attention results into a single
+/// normalised output.
+///
+/// For each Q-head `h`, given partials `(m0, l0, o0_unnorm)` and
+/// `(m1, l1, o1_unnorm)`:
+///   * `M = max(m0, m1)`
+///   * `α0 = exp(m0 − M)`, `α1 = exp(m1 − M)`
+///   * `L = α0 · l0 + α1 · l1`
+///   * `O = α0 · o0 + α1 · o1`
+///   * `out[h] = O / L`
+///
+/// Edge cases (matching [`flash_partial_kv_range_f16`]):
+///   * `m0 = −∞` AND `m1 = −∞` → the merge writes zeros for that head.
+///     This matches "no valid tokens anywhere" semantics; callers that want
+///     a uniform-V fallback must handle that at a higher level (analogous
+///     to the existing `flash_uniform_fallback` in `flash_merge_partials`).
+///   * Exactly one partial is `m = −∞` → the other partial is used as-is
+///     (after normalisation by its own `l`).
+///   * Non-finite or non-positive `L` → output is zero (same pathological
+///     guard as `flash_merge_partials`).
+///
+/// # Safety
+/// All pointers must reference buffers of the documented shape and must not
+/// alias `out`. `out` must be writable for `n_heads_q * head_dim` f32 lanes.
+pub unsafe fn merge_two_partials_f32(
+    partial0_ml: *const f32,
+    partial0_o: *const f32,
+    partial1_ml: *const f32,
+    partial1_o: *const f32,
+    out: *mut f32,
+    n_heads_q: usize,
+    head_dim: usize,
+) {
+    unsafe {
+        for h in 0..n_heads_q {
+            let m0 = *partial0_ml.add(h * 2);
+            let l0 = *partial0_ml.add(h * 2 + 1);
+            let m1 = *partial1_ml.add(h * 2);
+            let l1 = *partial1_ml.add(h * 2 + 1);
+
+            let out_h = out.add(h * head_dim);
+
+            // 두 partial 모두 dead → 제로 폴백.
+            if !m0.is_finite() && !m1.is_finite() {
+                std::ptr::write_bytes(out_h, 0, head_dim);
+                continue;
+            }
+
+            // Global max. -inf는 자연스럽게 작은 쪽으로 처리됨.
+            let m_max = if m0.is_finite() && m1.is_finite() {
+                m0.max(m1)
+            } else if m0.is_finite() {
+                m0
+            } else {
+                m1
+            };
+
+            let alpha0 = if m0.is_finite() {
+                (m0 - m_max).exp()
+            } else {
+                0.0
+            };
+            let alpha1 = if m1.is_finite() {
+                (m1 - m_max).exp()
+            } else {
+                0.0
+            };
+
+            let l_total = alpha0 * l0 + alpha1 * l1;
+
+            // 분모 불량 → 제로 폴백 (flash_merge_partials와 동일 semantics).
+            if !l_total.is_finite() || l_total <= 0.0 {
+                std::ptr::write_bytes(out_h, 0, head_dim);
+                continue;
+            }
+
+            let inv_l = 1.0 / l_total;
+            let scale0 = alpha0 * inv_l;
+            let scale1 = alpha1 * inv_l;
+
+            let o0_ptr = partial0_o.add(h * head_dim);
+            let o1_ptr = partial1_o.add(h * head_dim);
+
+            // NEON FMA 루프: out = scale0*o0 + scale1*o1.
+            let s0_v = vdupq_n_f32(scale0);
+            let s1_v = vdupq_n_f32(scale1);
+            let mut i = 0;
+            while i + 4 <= head_dim {
+                let a = vld1q_f32(o0_ptr.add(i));
+                let b = vld1q_f32(o1_ptr.add(i));
+                let t0 = vmulq_f32(a, s0_v);
+                let t1 = vfmaq_f32(t0, b, s1_v);
+                vst1q_f32(out_h.add(i), t1);
+                i += 4;
+            }
+            while i < head_dim {
+                *out_h.add(i) = scale0 * *o0_ptr.add(i) + scale1 * *o1_ptr.add(i);
+                i += 1;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod hybrid_partial_tests {
+    use super::*;
+
+    /// Deterministic pseudo-random F16 vector (splitmix64-style hash).
+    fn gen_f16(len: usize, seed: u64, lo: f32, hi: f32) -> Vec<half::f16> {
+        let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15);
+        let mut out = Vec::with_capacity(len);
+        let span = hi - lo;
+        for _ in 0..len {
+            state ^= state >> 30;
+            state = state.wrapping_mul(0xBF58476D1CE4E5B9);
+            state ^= state >> 27;
+            state = state.wrapping_mul(0x94D049BB133111EB);
+            state ^= state >> 31;
+            let u = (state >> 40) as u32; // 24-bit
+            let f = (u as f32) / ((1u32 << 24) as f32); // [0, 1)
+            out.push(half::f16::from_f32(lo + f * span));
+        }
+        out
+    }
+
+    fn gen_f32(len: usize, seed: u64, lo: f32, hi: f32) -> Vec<f32> {
+        gen_f16(len, seed, lo, hi)
+            .into_iter()
+            .map(|x| x.to_f32())
+            .collect()
+    }
+
+    /// Naive f32 softmax attention — ground truth reference.
+    /// K/V는 `[kv_heads, capacity, head_dim]` HeadMajor, F16 bits.
+    fn naive_attention_f32(
+        q: &[f32],
+        k: &[half::f16],
+        v: &[half::f16],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        capacity: usize,
+        kv_len: usize,
+    ) -> Vec<f32> {
+        let gqa = n_heads_q / n_heads_kv;
+        let inv_sqrt_dk = 1.0 / (head_dim as f32).sqrt();
+        let mut out = vec![0.0f32; n_heads_q * head_dim];
+        for h in 0..n_heads_q {
+            let kv_h = h / gqa;
+            let q_h = &q[h * head_dim..(h + 1) * head_dim];
+
+            // score[t] = <q, K[kv_h, t]> * inv_sqrt_dk
+            let mut scores = vec![0.0f32; kv_len];
+            for t in 0..kv_len {
+                let k_off = (kv_h * capacity + t) * head_dim;
+                let mut s = 0.0f32;
+                for d in 0..head_dim {
+                    s += q_h[d] * k[k_off + d].to_f32();
+                }
+                scores[t] = s * inv_sqrt_dk;
+            }
+
+            // softmax
+            let mut m = f32::NEG_INFINITY;
+            for &s in &scores {
+                if s > m {
+                    m = s;
+                }
+            }
+            let mut l = 0.0f32;
+            for s in &mut scores {
+                *s = (*s - m).exp();
+                l += *s;
+            }
+            let inv_l = 1.0 / l;
+            for s in &mut scores {
+                *s *= inv_l;
+            }
+
+            // weighted sum of V
+            let out_h = &mut out[h * head_dim..(h + 1) * head_dim];
+            for t in 0..kv_len {
+                let v_off = (kv_h * capacity + t) * head_dim;
+                let w = scores[t];
+                for d in 0..head_dim {
+                    out_h[d] += w * v[v_off + d].to_f32();
+                }
+            }
+        }
+        out
+    }
+
+    /// Partial + merge를 돌려 최종 출력을 만든다.
+    unsafe fn run_split_merge(
+        q: &[f32],
+        k: &[half::f16],
+        v: &[half::f16],
+        n_heads_q: usize,
+        n_heads_kv: usize,
+        head_dim: usize,
+        capacity: usize,
+        kv_len: usize,
+        split: usize,
+    ) -> Vec<f32> {
+        let inv = 1.0 / (head_dim as f32).sqrt();
+        let mut ml0 = vec![0.0f32; n_heads_q * 2];
+        let mut o0 = vec![0.0f32; n_heads_q * head_dim];
+        let mut ml1 = vec![0.0f32; n_heads_q * 2];
+        let mut o1 = vec![0.0f32; n_heads_q * head_dim];
+        let mut out = vec![0.0f32; n_heads_q * head_dim];
+        unsafe {
+            flash_partial_kv_range_f16(
+                q.as_ptr(),
+                k.as_ptr() as *const u16,
+                v.as_ptr() as *const u16,
+                ml0.as_mut_ptr(),
+                o0.as_mut_ptr(),
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                capacity,
+                0,
+                split,
+                inv,
+            );
+            flash_partial_kv_range_f16(
+                q.as_ptr(),
+                k.as_ptr() as *const u16,
+                v.as_ptr() as *const u16,
+                ml1.as_mut_ptr(),
+                o1.as_mut_ptr(),
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                capacity,
+                split,
+                kv_len,
+                inv,
+            );
+            merge_two_partials_f32(
+                ml0.as_ptr(),
+                o0.as_ptr(),
+                ml1.as_ptr(),
+                o1.as_ptr(),
+                out.as_mut_ptr(),
+                n_heads_q,
+                head_dim,
+            );
+        }
+        out
+    }
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// Test A: split(partial+merge) == naive full attention (bit-near).
+    #[test]
+    fn test_a_split_matches_naive() {
+        // (kv_len, split) × (head_dim, n_heads_q, n_heads_kv).
+        let cases = [
+            (128usize, 64usize, 64usize, 16usize, 4usize),
+            (256, 100, 64, 16, 4),
+            (1000, 250, 128, 32, 8),
+            (1000, 750, 128, 32, 8),
+        ];
+        for &(kv_len, split, head_dim, n_heads_q, n_heads_kv) in &cases {
+            let capacity = kv_len + 8; // capacity > kv_len로 stride 정상 확인.
+            let q = gen_f32(n_heads_q * head_dim, 0x1234, -1.0, 1.0);
+            let k = gen_f16(n_heads_kv * capacity * head_dim, 0x5678, -1.0, 1.0);
+            let v = gen_f16(n_heads_kv * capacity * head_dim, 0x9abc, -1.0, 1.0);
+
+            let reference = naive_attention_f32(
+                &q, &k, &v, n_heads_q, n_heads_kv, head_dim, capacity, kv_len,
+            );
+
+            let got = unsafe {
+                run_split_merge(
+                    &q, &k, &v, n_heads_q, n_heads_kv, head_dim, capacity, kv_len, split,
+                )
+            };
+
+            let diff = max_abs_diff(&reference, &got);
+            // f16 deq 경로가 포함되므로 1e-3 허용 (지시문 §Step4 tolerance).
+            assert!(
+                diff < 1e-3,
+                "case kv_len={kv_len} split={split} head_dim={head_dim} \
+                 n_heads_q={n_heads_q} n_heads_kv={n_heads_kv}: max abs diff={diff}"
+            );
+        }
+    }
+
+    /// Test B: empty range produces (m=-inf, l=0, o=0).
+    #[test]
+    fn test_b_empty_range() {
+        let n_heads_q = 16;
+        let n_heads_kv = 4;
+        let head_dim = 64;
+        let capacity = 128;
+        let inv = 1.0 / (head_dim as f32).sqrt();
+        let q = gen_f32(n_heads_q * head_dim, 0xAA, -1.0, 1.0);
+        let k = gen_f16(n_heads_kv * capacity * head_dim, 0xBB, -1.0, 1.0);
+        let v = gen_f16(n_heads_kv * capacity * head_dim, 0xCC, -1.0, 1.0);
+
+        let mut ml = vec![1.23f32; n_heads_q * 2]; // 비-제로로 초기화해 실제 덮어쓰기 확인.
+        let mut o = vec![7.77f32; n_heads_q * head_dim];
+
+        unsafe {
+            flash_partial_kv_range_f16(
+                q.as_ptr(),
+                k.as_ptr() as *const u16,
+                v.as_ptr() as *const u16,
+                ml.as_mut_ptr(),
+                o.as_mut_ptr(),
+                n_heads_q,
+                n_heads_kv,
+                head_dim,
+                capacity,
+                10,
+                10, // empty!
+                inv,
+            );
+        }
+
+        for h in 0..n_heads_q {
+            assert_eq!(ml[h * 2], f32::NEG_INFINITY, "head {h} m should be -inf");
+            assert_eq!(ml[h * 2 + 1], 0.0, "head {h} l should be 0");
+            for d in 0..head_dim {
+                assert_eq!(o[h * head_dim + d], 0.0, "head {h} o[{d}] should be 0");
+            }
+        }
+    }
+
+    /// Test C: merge edge cases — one side -inf, both -inf.
+    #[test]
+    fn test_c_merge_edge_cases() {
+        let n_heads_q = 4;
+        let head_dim = 64;
+
+        // Case C1: partial0 dead, partial1 valid → out = o1 / l1.
+        let mut ml0 = vec![0.0f32; n_heads_q * 2];
+        let mut o0 = vec![0.0f32; n_heads_q * head_dim];
+        for h in 0..n_heads_q {
+            ml0[h * 2] = f32::NEG_INFINITY;
+            ml0[h * 2 + 1] = 0.0;
+        }
+        // partial1: m=1.0, l=3.0, o unnormalised = [2.0, 4.0, ...] (즉 정규화 후 [2/3, 4/3, ...])
+        let mut ml1 = vec![0.0f32; n_heads_q * 2];
+        let mut o1 = vec![0.0f32; n_heads_q * head_dim];
+        for h in 0..n_heads_q {
+            ml1[h * 2] = 1.0;
+            ml1[h * 2 + 1] = 3.0;
+            for d in 0..head_dim {
+                o1[h * head_dim + d] = (d as f32) + 1.0;
+            }
+        }
+
+        let mut out = vec![-1.0f32; n_heads_q * head_dim];
+        unsafe {
+            merge_two_partials_f32(
+                ml0.as_ptr(),
+                o0.as_ptr(),
+                ml1.as_ptr(),
+                o1.as_ptr(),
+                out.as_mut_ptr(),
+                n_heads_q,
+                head_dim,
+            );
+        }
+        for h in 0..n_heads_q {
+            for d in 0..head_dim {
+                let expected = ((d as f32) + 1.0) / 3.0;
+                let got = out[h * head_dim + d];
+                assert!(
+                    (got - expected).abs() < 1e-6,
+                    "C1 head {h} d {d}: got {got}, expected {expected}"
+                );
+            }
+        }
+
+        // Case C2: both -inf → zero fallback.
+        let mut ml0b = vec![0.0f32; n_heads_q * 2];
+        let mut ml1b = vec![0.0f32; n_heads_q * 2];
+        for h in 0..n_heads_q {
+            ml0b[h * 2] = f32::NEG_INFINITY;
+            ml1b[h * 2] = f32::NEG_INFINITY;
+        }
+        let o0b = vec![42.0f32; n_heads_q * head_dim];
+        let o1b = vec![99.0f32; n_heads_q * head_dim];
+        let mut out2 = vec![-1.0f32; n_heads_q * head_dim];
+        unsafe {
+            merge_two_partials_f32(
+                ml0b.as_ptr(),
+                o0b.as_ptr(),
+                ml1b.as_ptr(),
+                o1b.as_ptr(),
+                out2.as_mut_ptr(),
+                n_heads_q,
+                head_dim,
+            );
+        }
+        for x in &out2 {
+            assert_eq!(*x, 0.0, "C2 expected zero fallback");
+        }
+    }
+
+    /// Test D: GQA correctness — verified via Test A with n_heads_q=32, n_heads_kv=8.
+    /// 여기서는 명시적 GQA 비율 다양성을 추가 확인한다.
+    #[test]
+    fn test_d_gqa_variants() {
+        let cases = [
+            (200usize, 77usize, 64usize, 8usize, 8usize), // MHA (gqa=1)
+            (200, 77, 64, 16, 8),                         // gqa=2
+            (200, 77, 128, 32, 4),                        // gqa=8
+        ];
+        for &(kv_len, split, head_dim, n_heads_q, n_heads_kv) in &cases {
+            let capacity = kv_len + 4;
+            let q = gen_f32(n_heads_q * head_dim, 0xDEAD_BEEF, -0.5, 0.5);
+            let k = gen_f16(n_heads_kv * capacity * head_dim, 0xF00D, -0.5, 0.5);
+            let v = gen_f16(n_heads_kv * capacity * head_dim, 0xBAAD, -0.5, 0.5);
+
+            let reference = naive_attention_f32(
+                &q, &k, &v, n_heads_q, n_heads_kv, head_dim, capacity, kv_len,
+            );
+            let got = unsafe {
+                run_split_merge(
+                    &q, &k, &v, n_heads_q, n_heads_kv, head_dim, capacity, kv_len, split,
+                )
+            };
+            let diff = max_abs_diff(&reference, &got);
+            assert!(
+                diff < 1e-3,
+                "GQA case n_heads_q={n_heads_q} n_heads_kv={n_heads_kv}: diff={diff}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;

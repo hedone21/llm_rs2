@@ -51,9 +51,7 @@ fn try_apply_queue_priority(
     priority: &str,
 ) -> Result<()> {
     if !extensions.contains("cl_khr_priority_hints") {
-        return Err(anyhow!(
-            "device lacks cl_khr_priority_hints extension"
-        ));
+        return Err(anyhow!("device lacks cl_khr_priority_hints extension"));
     }
     let priority_val = match priority {
         "low" => CL_QUEUE_PRIORITY_LOW_KHR,
@@ -80,9 +78,8 @@ fn try_apply_queue_priority(
     let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&context) as *mut std::ffi::c_void;
     let dev_ptr = <Device as ClDeviceIdPtr>::as_ptr(&device) as *mut std::ffi::c_void;
     let mut err: i32 = 0;
-    let raw = unsafe {
-        clCreateCommandQueueWithProperties(ctx_ptr, dev_ptr, props.as_ptr(), &mut err)
-    };
+    let raw =
+        unsafe { clCreateCommandQueueWithProperties(ctx_ptr, dev_ptr, props.as_ptr(), &mut err) };
     if err != 0 || raw.is_null() {
         return Err(anyhow!(
             "clCreateCommandQueueWithProperties failed (err={})",
