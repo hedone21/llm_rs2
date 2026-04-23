@@ -7727,9 +7727,12 @@ impl<'a> ChatTurnExec for StandardTurnExec<'a> {
         if self.cache_manager.is_none() {
             return Ok(());
         }
+        // Force-evict once KV usage reaches 90% of capacity so long sessions
+        // keep running without hitting the next-turn ensure_capacity hard stop.
+        // Opportunistic maybe_evict (memory-pressure driven) runs at lower fill.
         let capacity = self.kv_caches[0].capacity();
         let at_pressure = self.pos >= capacity.saturating_mul(9) / 10;
-        if at_pressure && self.score_based {
+        if at_pressure {
             self.run_eviction(true)?;
         } else {
             self.run_eviction(false)?;
