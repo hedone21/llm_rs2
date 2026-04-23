@@ -6,14 +6,14 @@
 
 1. 프로젝트 루트에서 실행 (`pwd`가 `llm_rs2`).
 2. `devices.toml`에 해당 device 엔트리 존재.
-3. `resilience_verify/fixtures/models.toml`에 `[devices.<device_id>.<model_key>]` 엔트리 존재 (model_path + tokenizer_path).
+3. `verify/fixtures/models.toml`에 `[devices.<device_id>.<model_key>]` 엔트리 존재 (model_path + tokenizer_path).
 4. adb 연결 또는 SSH 접근 가능 (로컬 host 제외).
 5. tokenizers Python 패키지 설치: `pip install tokenizers pyyaml`.
 
 ## 2. CLI 옵션 전체
 
 ```text
-python resilience_verify/verify.py [OPTIONS]
+python verify/verify.py [OPTIONS]
 ```
 
 | 옵션 | 기본값 | 설명 |
@@ -25,44 +25,44 @@ python resilience_verify/verify.py [OPTIONS]
 | `--runs N` | `1` | run 반복 수 |
 | `--skip-build` | off | cross-compile 스킵 (기존 바이너리 재사용) |
 | `--skip-deploy` | off | adb push / scp 스킵 |
-| `--output-root DIR` | `resilience_verify/results` | 결과 트리 루트 |
-| `--scenarios-dir DIR` | `resilience_verify/scenarios` | YAML 탐색 루트 |
+| `--output-root DIR` | `verify/results` | 결과 트리 루트 |
+| `--scenarios-dir DIR` | `verify/scenarios` | YAML 탐색 루트 |
 | `--dry-run` | off | 실행 없이 매트릭스만 출력 |
 
 ## 3. 대표 사용 예
 
 ### Smoke test — 호스트 1개 시나리오
 ```bash
-python resilience_verify/verify.py --device host --model f16 \
+python verify/verify.py --device host --model f16 \
   --scenario-filter throttle_smoke --runs 1 --skip-deploy
 ```
 
 ### S25 전체 매트릭스 (F16+Q4, 빌드·배포 자동)
 ```bash
-python resilience_verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
+python verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
 ```
 
 ### 특정 계층만 (signal 경로 회귀 확인)
 ```bash
-python resilience_verify/verify.py --device galaxy_s25 --model f16 \
+python verify/verify.py --device galaxy_s25 --model f16 \
   --layer signal --scenario-filter signal_ --runs 3
 ```
 
 ### 빠른 재실행 (이미 배포돼 있을 때)
 ```bash
-python resilience_verify/verify.py --device galaxy_s25 --model q4 \
+python verify/verify.py --device galaxy_s25 --model q4 \
   --scenario-filter partition --skip-build --skip-deploy --runs 1
 ```
 
 ### Dry-run으로 매트릭스 계획만 보기
 ```bash
-python resilience_verify/verify.py --device jetson --model f16,q4 --dry-run
+python verify/verify.py --device jetson --model f16,q4 --dry-run
 ```
 
 ## 4. 결과 트리
 
 ```
-resilience_verify/results/<ts>_<device>_<models>/
+verify/results/<ts>_<device>_<models>/
   summary.md                                ← 매트릭스 표 (Crash/Tokens/ROUGE/BLEU/TBT)
   summary.jsonl                             ← 동일 데이터 한 줄 per 결과
   <scenario>/<model>/r<idx>/
@@ -219,7 +219,7 @@ expected:
 ## 6. 새 시나리오 추가 3-Step
 
 1. `scenarios/my_new.yaml` 작성 (위 스키마 참조)
-2. `python resilience_verify/verify.py --scenario-filter my_new --device host --dry-run`로 시나리오가 로드되는지 확인
+2. `python verify/verify.py --scenario-filter my_new --device host --dry-run`로 시나리오가 로드되는지 확인
 3. 실제 device에서 1회 돌려 stderr_sequence 패턴 맞추기 → 결과의 `verdict.json.functional.details.stderr_sequence.steps` 확인 후 `matched_line_nos`에 실제 로그가 잡히도록 패턴 보정
 
 ## 7. signal 경로 디버깅

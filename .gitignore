@@ -37,4 +37,4 @@ tools/memfill_android
 experiments/external/
 
 # Resilience verify harness runtime outputs
-resilience_verify/results/
+verify/results/

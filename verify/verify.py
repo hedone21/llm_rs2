@@ -3,13 +3,13 @@
 
 Typical usage (run from project root):
 
-    python resilience_verify/verify.py --device host --model f16 \\
+    python verify/verify.py --device host --model f16 \\
         --scenario-filter throttle_smoke --runs 1 --skip-deploy
 
-    python resilience_verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
+    python verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
 
-See resilience_verify/USAGE.md for the full CLI reference and YAML scenario
-authoring guide; resilience_verify/README.md for architecture overview.
+See verify/USAGE.md for the full CLI reference and YAML scenario
+authoring guide; verify/README.md for architecture overview.
 """
 
 from __future__ import annotations
@@ -206,15 +206,15 @@ def _deploy_prompts(device_key: str) -> bool:
 
     Not strictly required because the orchestrator writes a scenario-specific
     prompt.txt to its run-dir via scp, but we keep a master copy at
-    <work_dir>/resilience_verify_prompts/ for debugging.
+    <work_dir>/verify_prompts/ for debugging.
     """
     from device_registry.config import load_device_config as _load_dc  # type: ignore
     from device_registry.connection import create_connection  # type: ignore
 
     device_cfg = _load_dc(device_key)
     conn = create_connection(device_cfg.connection)
-    prompts_src = PROJECT_ROOT / "experiments" / "resilience_verify" / "fixtures" / "prompts"
-    remote_dir = f"{device_cfg.paths.work_dir}/resilience_verify_prompts"
+    prompts_src = PROJECT_ROOT / "experiments" / "verify" / "fixtures" / "prompts"
+    remote_dir = f"{device_cfg.paths.work_dir}/verify_prompts"
     conn.mkdir(remote_dir)
     for p in sorted(prompts_src.glob("*.txt")):
         conn.push(p, f"{remote_dir}/{p.name}")

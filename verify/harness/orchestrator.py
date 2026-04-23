@@ -10,7 +10,7 @@ Phase 4 additions:
 - SSH remote orchestration (Jetson) via `connection.type == "ssh"`.
 - TCP transport (127.0.0.1:9100) enforced for SSH path — Unix sockets would
   collide with shared user accounts and bind-permission issues.
-- Remote work-dir scheme: `<work_dir>/resilience_verify_runs/<scenario>_r<idx>/`.
+- Remote work-dir scheme: `<work_dir>/verify_runs/<scenario>_r<idx>/`.
 - Prompt + scenario JSON pushed to remote via scp.
 - Baseline & action stderr files pulled back to local for the existing
   assertion code to parse.
@@ -323,8 +323,8 @@ def _run_scenario_local(
     prompt_file = out_dir / "prompt.txt"
     prompt_file.write_text(prompt_text, encoding="utf-8")
 
-    pkill_pattern("mock_manager --socket /tmp/resilience_verify_")
-    remove_socket_files(["/tmp/resilience_verify_*.sock"])
+    pkill_pattern("mock_manager --socket /tmp/verify_")
+    remove_socket_files(["/tmp/verify_*.sock"])
 
     baseline_jsonl = out_dir / "baseline.jsonl"
     baseline_stderr = out_dir / "baseline.stderr"
@@ -359,7 +359,7 @@ def _run_scenario_local(
     timings["baseline_wall_s"] = baseline_wall
 
     # ── Step 2: action ──────────────────────────────────
-    socket_path = Path(f"/tmp/resilience_verify_{os.getpid()}_{spec.id}.sock")
+    socket_path = Path(f"/tmp/verify_{os.getpid()}_{spec.id}.sock")
     try:
         socket_path.unlink()
     except FileNotFoundError:
@@ -489,7 +489,7 @@ def _run_scenario_ssh(
 
     # Remote workdir per-run
     remote_work_root = device_cfg.get("paths", {}).get("work_dir", "/tmp") \
-        + "/resilience_verify_runs"
+        + "/verify_runs"
     remote_run_dir = f"{remote_work_root}/{spec.id}_r{run_idx}_{os.getpid()}"
     remote.exec(f"mkdir -p {shlex.quote(remote_run_dir)}", timeout=15.0)
 
@@ -501,7 +501,7 @@ def _run_scenario_ssh(
         "sleep 0.3; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
         "pkill -KILL -f '/home/nvidia/llm_rs2/generate' 2>/dev/null; "
-        "rm -f /tmp/resilience_verify_*.sock 2>/dev/null; "
+        "rm -f /tmp/verify_*.sock 2>/dev/null; "
         "true",
         timeout=20.0,
     )
@@ -752,7 +752,7 @@ def _run_scenario_adb(
 
     # Remote workdir per-run
     remote_work_root = device_cfg.get("paths", {}).get("work_dir", "/data/local/tmp") \
-        + "/resilience_verify_runs"
+        + "/verify_runs"
     remote_run_dir = f"{remote_work_root}/{spec.id}_r{run_idx}_{os.getpid()}"
     remote.exec(f"mkdir -p {shlex.quote(remote_run_dir)}", timeout=15.0)
 
@@ -764,7 +764,7 @@ def _run_scenario_adb(
         "sleep 0.3; "
         "pkill -KILL -f 'mock_manager' 2>/dev/null; "
         f"pkill -KILL -f '{work_dir}/generate' 2>/dev/null; "
-        f"rm -f {work_dir}/resilience_verify_*.sock 2>/dev/null; "
+        f"rm -f {work_dir}/verify_*.sock 2>/dev/null; "
         "true",
         timeout=20.0,
     )
@@ -1042,7 +1042,7 @@ def _run_scenario_adb_signal(
     manager_bin = _remote_binary_path(device_cfg, "llm_manager")
 
     remote_work_root = device_cfg.get("paths", {}).get("work_dir", "/data/local/tmp") \
-        + "/resilience_verify_runs"
+        + "/verify_runs"
     remote_run_dir = f"{remote_work_root}/{spec.id}_r{run_idx}_{os.getpid()}"
     remote.exec(f"mkdir -p {shlex.quote(remote_run_dir)}", timeout=15.0)
 
@@ -1078,7 +1078,7 @@ def _run_scenario_adb_signal(
     remote.push(local_prompt, remote_prompt, retries=2, timeout=60.0)
 
     # Manager config (all monitors off except external tcp:127.0.0.1:9102).
-    cfg_src = PROJECT_ROOT / "resilience_verify" / "fixtures" / "manager_config_external_only.toml"
+    cfg_src = PROJECT_ROOT / "verify" / "fixtures" / "manager_config_external_only.toml"
     local_cfg = out_dir / "manager_config.toml"
     local_cfg.write_text(cfg_src.read_text(), encoding="utf-8")
     remote_cfg = f"{remote_run_dir}/manager_config.toml"
@@ -1215,7 +1215,7 @@ def _run_scenario_adb_signal(
             # Start signal_client in the background on the host.
             sig_cmd = [
                 sys.executable,
-                str(PROJECT_ROOT / "resilience_verify" / "harness" / "signal_client.py"),
+                str(PROJECT_ROOT / "verify" / "harness" / "signal_client.py"),
                 "--transport", f"tcp:127.0.0.1:{host_forward_port}",
                 "--schedule", str(schedule_local),
                 "--log-file", str(signal_log_local),

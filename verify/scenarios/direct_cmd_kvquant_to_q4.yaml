@@ -1,8 +1,8 @@
-id: direct_cmd_kvquant_f16_to_q4
-description: "KvQuantDynamic{target_bits=4} switches KV cache dtype mid-decode (F16 → Q4). Baseline enters the KIVI runtime via --kv-dynamic-quant; action asserts the actual '[KIVI-Resilience] Transitioned KV cache to 4bit' line, not just directive receipt."
+id: direct_cmd_kvquant_to_q4
+description: "KvQuantDynamic{target_bits=4} switches KV cache dtype mid-decode (F16 → Q4). Weight dtype and KV-cache dtype are independent, so this covers both f16 weights + f16 KV → q4 KV, and q4 weights + f16 KV → q4 KV (the deployment-target combo). Baseline enters the KIVI runtime via --kv-dynamic-quant; action asserts the actual '[KIVI-Resilience] Transitioned KV cache to 4bit' line, not just directive receipt."
 layer: engine_cmd
 devices: [galaxy_s25, jetson]
-models: [f16]
+models: [f16, q4]
 baseline:
   prompt: fixtures:short_smoke
   decode_tokens: 64

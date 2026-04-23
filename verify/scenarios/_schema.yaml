@@ -1,6 +1,6 @@
 # Resilience verify — scenario YAML schema (read-only reference).
 #
-# Loader: resilience_verify/harness/spec_loader.py::load_scenario
+# Loader: verify/harness/spec_loader.py::load_scenario
 #
 # id: <unique string, used as output directory name>
 # description: <free-form>

@@ -2,24 +2,24 @@
 
 llm.rs의 Resilience 기능(SystemSignal → Policy → EngineCommand → Engine 전 경로)을 **실제 바이너리 조합**으로 end-to-end 검증하는 자동화 하네스. On-device(Android/Jetson) + 호스트(x86 CPU) 매트릭스 지원.
 
-자세한 설계 배경은 `arch/resilience_verify_v2.md` 참조.
+자세한 설계 배경은 `arch/verify_v2.md` 참조.
 
 ## 지금 바로 한 번 돌려보기
 
 ```bash
 # 호스트(CPU) 스모크 테스트 — Throttle 1개만
-python resilience_verify/verify.py --device host --model f16 \
+python verify/verify.py --device host --model f16 \
     --scenario-filter throttle_smoke --runs 1 --skip-deploy
 
 # S25 전 시나리오 × F16+Q4 (빌드·배포 자동)
-python resilience_verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
+python verify/verify.py --device galaxy_s25 --model f16,q4 --runs 1
 
 # Jetson 단일 시나리오
-python resilience_verify/verify.py --device jetson --model q4 \
+python verify/verify.py --device jetson --model q4 \
     --scenario-filter memory_critical_evict --runs 1
 ```
 
-결과: `resilience_verify/results/<ts>_<device>_<models>/` 아래에 per-scenario verdict.json + baseline/action 원 로그 + 매트릭스 summary.md.
+결과: `verify/results/<ts>_<device>_<models>/` 아래에 per-scenario verdict.json + baseline/action 원 로그 + 매트릭스 summary.md.
 
 ## 무엇을 검증하는가 (4-Layer Gate)
 
@@ -46,7 +46,7 @@ python resilience_verify/verify.py --device jetson --model q4 \
 ## 디렉터리 구조
 
 ```
-resilience_verify/
+verify/
   README.md          ← 이 파일
   USAGE.md           ← CLI 레퍼런스 + YAML 시나리오 작성법
   verify.py          ← CLI entry (argparse + matrix planner + report emit)
@@ -81,7 +81,7 @@ resilience_verify/
 - `direct_cmd_target_tbt_restore` — 250ms pacing → 0ms 복귀
 - `direct_cmd_partition_ratio` — partition disable 0.3 → 0.0
 - `direct_cmd_partition_ratio_enable` — partition enable 0 → 0.3 *(신규, BS1)*
-- `direct_cmd_kvquant_f16_to_q4` — KV dtype F16 → Q4
+- `direct_cmd_kvquant_to_q4` — KV dtype F16 → Q4
 - `direct_cmd_kvquant_restore` — KvQuantDynamic → RestoreDefaults *(신규)*
 - `memory_critical_evict` — KvEvictH2o keep_ratio=0.5
 - `thermal_emergency_suspend` — Suspend 미드 디코드
@@ -125,4 +125,4 @@ resilience_verify/
 
 ## 다음 단계
 
-자세한 CLI/스키마/디버깅은 [USAGE.md](USAGE.md). 아키텍처 심화는 [`arch/resilience_verify_v2.md`](../arch/resilience_verify_v2.md).
+자세한 CLI/스키마/디버깅은 [USAGE.md](USAGE.md). 아키텍처 심화는 [`arch/verify_v2.md`](../arch/verify_v2.md).

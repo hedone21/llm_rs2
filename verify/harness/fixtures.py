@@ -13,10 +13,10 @@ else:  # pragma: no cover
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RESILIENCE_DIR = PROJECT_ROOT / "resilience_verify"
-FIXTURES_DIR = RESILIENCE_DIR / "fixtures"
-SCENARIOS_DIR = RESILIENCE_DIR / "scenarios"
-RESULTS_DIR = RESILIENCE_DIR / "results"
+VERIFY_DIR = PROJECT_ROOT / "verify"
+FIXTURES_DIR = VERIFY_DIR / "fixtures"
+SCENARIOS_DIR = VERIFY_DIR / "scenarios"
+RESULTS_DIR = VERIFY_DIR / "results"
 
 
 def load_toml(path: Path) -> Dict[str, Any]:

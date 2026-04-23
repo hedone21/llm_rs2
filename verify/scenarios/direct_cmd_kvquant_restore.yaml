@@ -1,8 +1,8 @@
 id: direct_cmd_kvquant_restore
-description: "Restore path for KV dtype dynamic quantization: F16 baseline, then KvQuantDynamic{bits=4} to degrade, then RestoreDefaults to return to baseline dtype. Verifies restore-side transition log and partial output recovery."
+description: "Restore path for KV dtype dynamic quantization: F16 KV baseline, then KvQuantDynamic{bits=4} to degrade KV cache, then RestoreDefaults to return to F16 KV. Runs on both f16 and q4 weight models because KV dtype is independent of weight dtype."
 layer: engine_cmd
 devices: [galaxy_s25, jetson]
-models: [f16]
+models: [f16, q4]
 baseline:
   prompt: fixtures:short_smoke
   decode_tokens: 96
