@@ -4428,6 +4428,50 @@ fn main() -> anyhow::Result<()> {
                                     {
                                         gpu_plan = None;
                                     }
+                                    // Re-register Q4_0 noshuffle SOA entries:
+                                    // `map_weights_for_cpu()` above replaced
+                                    // GPU-only weights' `UnifiedBuffer`, minting
+                                    // new `cl_mem` pointers. The SOA registry's
+                                    // old entries are now keyed by stale
+                                    // `cl_mem`s, so `build_plan()` would miss
+                                    // the lookup and silently fall back to the
+                                    // AOS Q4_0 GEMV (measured +102% TBT on
+                                    // Galaxy S25, verify v2 ISSUE-2).
+                                    //
+                                    // Clear + rebuild mirrors the CLI init path
+                                    // (prepare_tensor_partition → prepare_
+                                    // noshuffle_buffers) so partition sub-buffer
+                                    // slices are also registered. Idempotent
+                                    // for non-Q4_0 weight dtypes: the
+                                    // prepare_noshuffle_buffers() helper
+                                    // short-circuits on DType::Q4_0 mismatch.
+                                    #[cfg(feature = "opencl")]
+                                    if is_gpu {
+                                        let actual_q4 = w_dtype == DType::Q4_0
+                                            || model
+                                                .layers
+                                                .first()
+                                                .is_some_and(|l| l.wq.dtype() == DType::Q4_0);
+                                        if actual_q4
+                                            && let Some(ocl_be) = backend
+                                                .as_any()
+                                                .downcast_ref::<
+                                                    llm_rs2::backend::opencl::OpenCLBackend,
+                                                >()
+                                        {
+                                            ocl_be.clear_noshuffle_soa_registry();
+                                            match model.prepare_noshuffle_buffers(&backend) {
+                                                Ok(n) => eprintln!(
+                                                    "[Partition] Re-registered Q4_0 noshuffle SOA: {} weight tensors",
+                                                    n
+                                                ),
+                                                Err(e) => eprintln!(
+                                                    "[Partition] Noshuffle re-registration failed: {} (AOS fallback will hurt TBT)",
+                                                    e
+                                                ),
+                                            }
+                                        }
+                                    }
                                 }
                                 Err(e) => eprintln!("[Partition] Re-split failed: {}", e),
                             }

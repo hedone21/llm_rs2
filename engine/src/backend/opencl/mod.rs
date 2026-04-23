@@ -1959,6 +1959,26 @@ impl OpenCLBackend {
         registry.get(&key)
     }
 
+    /// Clear the entire noshuffle SOA registry.
+    ///
+    /// Paired with `register_noshuffle_soa()`. Required on the runtime
+    /// `SetPartitionRatio` directive path where `map_weights_for_cpu()` may
+    /// replace a weight tensor's backing `UnifiedBuffer` with a new `cl_mem`.
+    /// The old `cl_mem` key becomes stale, so `lookup_noshuffle_soa()` fails
+    /// and `build_plan()` silently falls back to the AOS Q4_0 GEMV path
+    /// (measured +102% TBT on Galaxy S25, verify v2 ISSUE-2).
+    ///
+    /// Dropping each `NoshuffleSoaEntry` releases its `q_buf` / `d_buf` /
+    /// `q_img` (all `ocl::core::Mem`), allowing the driver to reclaim the
+    /// SOA-transposed GPU allocations before the caller re-runs
+    /// `prepare_noshuffle_buffers()` against the new keys.
+    pub fn clear_noshuffle_soa_registry(&self) {
+        // SAFETY: single-threaded inference access, matching the other
+        // UnsafeCell-backed caches on this struct.
+        let registry = unsafe { &mut *self.noshuffle_soa_registry.get() };
+        registry.clear();
+    }
+
     /// Convert Q4_0 AOS weight buffer to SOA layout for the noshuffle GEMV kernel.
     ///
     /// Called once per weight tensor at model load time.
@@ -6350,6 +6370,123 @@ mod noshuffle_tests {
             max_abs < 2e-1,
             "Q4_0 GEMM (prefill) max_abs {:.4e} exceeds tolerance",
             max_abs
+        );
+    }
+
+    /// Regression for verify v2 ISSUE-2 (SetPartitionRatio directive path).
+    ///
+    /// `map_weights_for_cpu()` replaces a weight's backing `UnifiedBuffer`,
+    /// producing a new `cl_mem` pointer. The old SOA registry entry keyed by
+    /// the pre-map pointer is then stale, so `lookup_noshuffle_soa()` misses
+    /// and `build_plan()` silently falls back to the AOS GEMV path.
+    ///
+    /// The fix is `clear_noshuffle_soa_registry()` + a re-run of
+    /// `prepare_noshuffle_buffers()` on the directive path. This test
+    /// exercises the clear half: register under one key, clear, then confirm
+    /// the old key misses and a brand-new key (simulating a post-map
+    /// `cl_mem`) can be registered and looked up cleanly.
+    #[test]
+    fn test_clear_noshuffle_soa_registry() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // Build two independent SOA entries by running the same conversion
+        // against two distinct source buffers. Each resulting (q_buf, d_buf,
+        // q_img) triple owns real `ocl::core::Mem` handles, so the registry
+        // entries are fully materialised and indistinguishable from the
+        // production `prepare_noshuffle_buffers()` path.
+        let ne01 = 4usize;
+        let ne00 = 64usize;
+        let blocks_per_row = ne00 / QK4_0;
+        let num_blocks = ne01 * blocks_per_row;
+
+        let build_entry = |seed: u8| -> (usize, NoshuffleSoaEntry) {
+            let mut all_blocks = Vec::new();
+            for row in 0..ne01 {
+                for k in 0..blocks_per_row {
+                    let d = (row + 1) as f32 * 0.1 + k as f32 * 0.01 + seed as f32 * 0.001;
+                    let mut quants = [0i8; 32];
+                    for (j, q) in quants.iter_mut().enumerate() {
+                        *q = ((row * 100 + k * 32 + j + seed as usize) % 15) as i8 - 7;
+                    }
+                    all_blocks.push(make_q4_0_block(d, &quants));
+                }
+            }
+            let raw_bytes: Vec<u8> = all_blocks.iter().flat_map(|b| b.iter().copied()).collect();
+            let src_buf = unsafe {
+                ocl::core::create_buffer::<_, u8>(
+                    backend.context.as_core(),
+                    ocl::core::MEM_READ_WRITE,
+                    raw_bytes.len(),
+                    None,
+                )
+                .unwrap()
+            };
+            unsafe {
+                ocl::core::enqueue_write_buffer(
+                    &backend.queue,
+                    &src_buf,
+                    true,
+                    0,
+                    &raw_bytes,
+                    None::<&ocl::core::Event>,
+                    None::<&mut ocl::core::Event>,
+                )
+                .unwrap();
+            }
+            let (q_buf, d_buf, q_img) = backend
+                .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
+                .unwrap();
+            let key = src_buf.as_ptr() as usize;
+            (
+                key,
+                NoshuffleSoaEntry {
+                    q_buf,
+                    d_buf,
+                    q_img,
+                    ne00,
+                    ne01,
+                },
+            )
+        };
+
+        let (key_a, entry_a) = build_entry(0);
+        backend.register_noshuffle_soa(key_a, entry_a);
+        assert!(
+            backend.lookup_noshuffle_soa(key_a).is_some(),
+            "entry must be visible immediately after register"
+        );
+
+        // Simulate the directive-path stall: `map_weights_for_cpu()` hands
+        // the model a brand-new cl_mem, stranding `key_a`.
+        backend.clear_noshuffle_soa_registry();
+        assert!(
+            backend.lookup_noshuffle_soa(key_a).is_none(),
+            "clear_noshuffle_soa_registry() must evict all entries (old key must miss)"
+        );
+
+        // Re-registration with the *new* cl_mem key (different from `key_a`)
+        // must succeed and be looked up by the plan builder.
+        let (key_b, entry_b) = build_entry(1);
+        assert_ne!(
+            key_a, key_b,
+            "test precondition: distinct source buffers produce distinct cl_mem keys"
+        );
+        backend.register_noshuffle_soa(key_b, entry_b);
+        assert!(
+            backend.lookup_noshuffle_soa(key_b).is_some(),
+            "new entry must be looked up after clear + re-register"
+        );
+        // And the old key must still miss, i.e. the clear was not silently
+        // re-populated during the second register call.
+        assert!(
+            backend.lookup_noshuffle_soa(key_a).is_none(),
+            "old key must remain evicted after re-registration"
         );
     }
 }
