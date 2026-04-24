@@ -1465,6 +1465,17 @@ impl FullKernelPlan {
                 } => {
                     #[cfg(target_arch = "aarch64")]
                     {
+                        use std::sync::atomic::{AtomicI32, Ordering, fence};
+
+                        // Stage D: blocking clFinish를 제거하고 sigflag(atomic_xchg)
+                        // + 호스트 spin-poll 로 CPU/GPU partial을 병렬 실행한다.
+                        // fallback 경로로 spin count 초과 시에만 blocking finish.
+                        //
+                        // 최대 spin iteration. Adreno 830 기준 Q1 partial 커널이
+                        // 수백 μs 내에 끝나므로 10M iteration은 넉넉한 상한
+                        // (ARM A72 @ 2GHz 기준 약 5ms).
+                        const MAX_SPIN: u64 = 10_000_000;
+
                         // 1) kv_end(GPU) = attn_seq_len - round(attn_seq_len * kv_frac)
                         //    kv_start = 0 (고정). CPU는 [kv_end_gpu, attn_seq_len)를 담당.
                         let kv_len = attn_seq_len as usize;
@@ -1474,7 +1485,29 @@ impl FullKernelPlan {
                                 hybrid.kv_frac,
                             );
 
-                        // 2) GPU partial enqueue — HybridKvEnd(arg 41) 는 직접 패치.
+                        // 현재 설치된 setup 획득 — ready_flags host_ptr 직접 접근용.
+                        let setup = crate::layers::hybrid_attention::current().expect(
+                            "HybridKvSplit variant selected but no HybridAttnSetup installed",
+                        );
+
+                        // 2) ready_flags 를 0으로 리셋 (UMA 직접 쓰기).
+                        //    반드시 partial kernel enqueue **전**에 수행해야 한다.
+                        //    enqueue 후에 리셋하면 커널이 1로 set 한 값을 덮어쓰는 race 발생.
+                        let ready_ptr = setup.ready_flags_gpu.host_ptr() as *mut AtomicI32;
+                        let n_heads_q = hybrid.n_heads_q;
+                        unsafe {
+                            for h in 0..n_heads_q {
+                                // Relaxed store는 순서 보장이 약하지만, 뒤에 release
+                                // fence 를 삽입하므로 GPU kernel dispatch 이전에
+                                // 모든 0 쓰기가 가시화된다.
+                                (*ready_ptr.add(h)).store(0, Ordering::Relaxed);
+                            }
+                        }
+                        // ARM DMB ISH: 0 초기화 쓰기가 GPU(같은 UMA 메모리)에
+                        // 가시화된 뒤에 커널이 시작되도록 release fence.
+                        fence(Ordering::Release);
+
+                        // 3) GPU partial enqueue — HybridKvEnd(arg 41) 는 직접 패치.
                         unsafe {
                             let kv_end_i32 = kv_end_gpu as i32;
                             // partial_step.dynamic_args에 HybridKvEnd가 들어있지만,
@@ -1491,17 +1524,9 @@ impl FullKernelPlan {
                             }
                         }
 
-                        // ready_flags를 0으로 초기화 (Stage C: blocking sync라
-                        // 플래그 실제 사용은 없지만, 커널이 flag를 1로 쓰므로
-                        // 다음 step 이전에 0으로 돌려놓는다).
-                        // 현재는 커널 dispatch가 헤드별로 flag를 덮어쓰지만,
-                        // Stage D 전환 시 이 초기화가 필수가 된다.
-                        // host_ptr이 ready_flags_mem에 대응되지 않아 이 시점에서
-                        // 간편 초기화는 생략; Stage D에서 본격화.
-
                         // Enqueue GPU partial (dynamic_args의 HybridKvEnd 는 위에서 패치함).
-                        unsafe {
-                            if let Err(e) = ocl::core::enqueue_kernel(
+                        let enqueue_ok = unsafe {
+                            match ocl::core::enqueue_kernel(
                                 queue,
                                 &partial_step.kernel,
                                 partial_step.ndim,
@@ -1511,23 +1536,28 @@ impl FullKernelPlan {
                                 None::<&ocl::core::Event>,
                                 None::<&mut ocl::core::Event>,
                             ) {
-                                log::error!(
-                                    "Plan hybrid partial enqueue failed: L{} n_kv={}: {}",
-                                    i,
-                                    kv_len,
-                                    e
-                                );
+                                Ok(_) => true,
+                                Err(e) => {
+                                    log::error!(
+                                        "Plan hybrid partial enqueue failed: L{} n_kv={}: {}",
+                                        i,
+                                        kv_len,
+                                        e
+                                    );
+                                    false
+                                }
                             }
+                        };
+
+                        // 4) Flush — 드라이버 큐에서 디바이스로 실제 제출 개시.
+                        //    Adreno는 대체로 즉시 시작하나, 명시적 flush로 드라이버
+                        //    지연 가능성을 차단한다.
+                        if enqueue_ok {
+                            let _ = ocl::core::flush(queue);
                         }
 
-                        // 3) Stage C: blocking sync. CPU/GPU 병렬화는 Stage D.
-                        ocl::core::finish(queue).ok();
-
-                        // 4) CPU partial over [kv_end_gpu, kv_len).
+                        // 5) CPU partial over [kv_end_gpu, kv_len) — GPU와 병렬 실행.
                         let inv_sqrt_dk = 1.0f32 / (hybrid.head_dim as f32).sqrt();
-                        let setup = crate::layers::hybrid_attention::current().expect(
-                            "HybridKvSplit variant selected but no HybridAttnSetup installed",
-                        );
                         let mut ml_guard = setup
                             .partial_ml_cpu
                             .lock()
@@ -1537,11 +1567,10 @@ impl FullKernelPlan {
                             .lock()
                             .expect("hybrid partial_o_cpu mutex poisoned");
                         // SAFETY: host pointers are permanent-mapped for the
-                        // lifetime of the HybridScope installed by generate.rs;
-                        // blocking finish() above guarantees GPU writes to the
-                        // GPU-side partial buffers are visible before we read
-                        // them during merge. CPU partial writes only to the
-                        // setup's CPU Vec (guarded by Mutex, single-writer).
+                        // lifetime of the HybridScope installed by generate.rs.
+                        // CPU partial은 GPU-side partial 버퍼는 건드리지 않고
+                        // setup의 CPU Vec (Mutex guarded single-writer)에만 쓴다.
+                        // GPU partial 읽기는 6)의 spin-poll + acquire fence 이후.
                         unsafe {
                             crate::backend::cpu::neon::flash_partial_kv_range_f16(
                                 hybrid.q_host_ptr,
@@ -1557,8 +1586,59 @@ impl FullKernelPlan {
                                 kv_len,
                                 inv_sqrt_dk,
                             );
+                        }
 
-                            // 5) Merge (GPU partial + CPU partial → out_attn).
+                        // 6) Spin-poll: head 별 sigflag 가 1이 될 때까지 대기.
+                        //    enqueue 자체가 실패한 경우 폴링 생략 (flag는 영원히 0).
+                        let mut fallback_used = false;
+                        if enqueue_ok {
+                            for h in 0..n_heads_q {
+                                // SAFETY: ready_flags_gpu는 n_heads_q 크기로
+                                // 할당되었고 UMA로 permanent-map 되어 있다.
+                                let flag = unsafe { &*ready_ptr.add(h) };
+                                let mut spins: u64 = 0;
+                                while flag.load(Ordering::Acquire) == 0 {
+                                    std::hint::spin_loop();
+                                    spins += 1;
+                                    if spins >= MAX_SPIN {
+                                        // Fallback: blocking finish로 전환.
+                                        fallback_used = true;
+                                        break;
+                                    }
+                                }
+                                if fallback_used {
+                                    break;
+                                }
+                            }
+                        }
+                        if fallback_used {
+                            // 안전망: 드라이버가 커널 실행을 지연시키거나
+                            // 기타 이유로 sigflag가 늦는 경우 blocking finish.
+                            let _ = ocl::core::finish(queue);
+                            thread_local! {
+                                static WARNED: std::cell::Cell<bool> =
+                                    const { std::cell::Cell::new(false) };
+                            }
+                            WARNED.with(|w| {
+                                if !w.get() {
+                                    log::warn!(
+                                        "Plan hybrid spin-poll exceeded MAX_SPIN={} iterations; \
+                                         falling back to blocking finish (future occurrences suppressed)",
+                                        MAX_SPIN
+                                    );
+                                    w.set(true);
+                                }
+                            });
+                        }
+                        // 명시적 acquire fence — ARM memory model상 Acquire load 가
+                        // 뒤따르는 비-atomic 읽기 (partial_ml/partial_o) 의 가시성을
+                        // 보장하지만, head별 loop 완료 후 partial_ml_gpu /
+                        // partial_o_gpu 전체에 대한 acquire 를 한 번 더 잠그는
+                        // 차원에서 배리어 삽입.
+                        fence(Ordering::Acquire);
+
+                        // 7) Merge (GPU partial + CPU partial → out_attn).
+                        unsafe {
                             crate::backend::cpu::neon::merge_two_partials_f32(
                                 setup.partial_ml_gpu.host_ptr() as *const f32,
                                 setup.partial_o_gpu.host_ptr() as *const f32,
@@ -1569,6 +1649,9 @@ impl FullKernelPlan {
                                 hybrid.head_dim,
                             );
                         }
+                        // 8) Release fence — out_attn 쓰기가 후속 OpenCL 커널
+                        //    (Wo matmul 등) 에 가시화되도록.
+                        fence(Ordering::Release);
                         drop(ml_guard);
                         drop(o_guard);
                     }

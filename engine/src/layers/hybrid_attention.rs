@@ -266,6 +266,16 @@ impl HybridAttnSetup {
         let partial_o_gpu = HybridGpuBuffer::new_host_visible(queue, o_elems * 4, o_elems)?;
         let ready_flags_gpu = HybridGpuBuffer::new_host_visible(queue, flag_elems * 4, flag_elems)?;
 
+        // Stage D: ready_flags 를 0으로 초기 설정. Plan dispatch 진입 시에도
+        // 매 layer 리셋하지만, 첫 layer가 폴링을 곧바로 시작하기 때문에 할당
+        // 직후 한 번 0으로 클리어해 둔다. UMA 직접 쓰기 + Release fence로
+        // GPU 커널이 관측하기 전에 가시화.
+        unsafe {
+            let ptr = ready_flags_gpu.host_ptr() as *mut i32;
+            std::ptr::write_bytes(ptr, 0, flag_elems);
+        }
+        std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+
         Ok(Self {
             kv_frac,
             n_heads_q,
