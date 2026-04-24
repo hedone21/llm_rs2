@@ -73,6 +73,10 @@ mod test_eng_dat_092_layer_slot;
 mod test_eng_dat_093_transformer_weights;
 #[path = "spec/test_eng_dat_094_secondary_mmap.rs"]
 mod test_eng_dat_094_secondary_mmap;
+#[path = "spec/test_inv_121_dynamic.rs"]
+mod test_inv_121_dynamic;
+#[path = "spec/test_inv_123_dynamic.rs"]
+mod test_inv_123_dynamic;
 #[path = "spec/test_inv_124_slot_dtype_consistency.rs"]
 mod test_inv_124_slot_dtype_consistency;
 #[path = "spec/test_inv_125_secondary_mmap_lifetime.rs"]
