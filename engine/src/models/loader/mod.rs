@@ -272,7 +272,24 @@ pub fn load_model(
     };
 
     // 6. GPU-side embed_tokens
-    let gpu_embed_tokens = if is_cpu {
+    //
+    // LLMRS_SKIP_GPU_EMBED: RSS diagnostic flag.
+    // When set, skip uploading embed_tokens to GPU (saves one ~30 MB GPU alloc
+    // for Llama 3.2 1B Q4_0). gather_embed() falls back to:
+    //   cpu_be.gather(embed_tokens) → backend.write_buffer()  (CPU→GPU per call)
+    // This is slower at runtime but lets Tester measure the RSS contribution of
+    // the GPU embed copy without changing any other logic.
+    // Fallback path exists in TransformerModel::gather_embed (lines 2018-2050):
+    // if gpu_embed_tokens is None but cpu_backend is Some, it reads indices to CPU,
+    // gathers on CPU, and uploads the result — correct but ~3-5x slower per token.
+    let skip_gpu_embed = std::env::var("LLMRS_SKIP_GPU_EMBED").is_ok();
+    if skip_gpu_embed && !is_cpu {
+        eprintln!(
+            "[RSS-diag] LLMRS_SKIP_GPU_EMBED set: skipping GPU embed_tokens upload \
+             (gather will use CPU→GPU fallback path)"
+        );
+    }
+    let gpu_embed_tokens = if is_cpu || skip_gpu_embed {
         None
     } else if !has_lm_head && !lm_head_on_cpu {
         // Tied weights with GPU lm_head: reuse (zero extra memory)

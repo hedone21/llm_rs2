@@ -339,6 +339,36 @@ impl GgufFile {
         self.tensor_index.get(name).map(|&i| &self.tensors[i])
     }
 
+    /// Hint the OS that the mmap pages are no longer needed (MADV_DONTNEED).
+    ///
+    /// Called after all weight tensors have been uploaded to the GPU so that
+    /// the kernel can reclaim the file page cache and reduce RssFile.
+    /// Only meaningful on Linux; a no-op on other platforms.
+    /// Enabled by `LLMRS_MADV_DONTNEED` environment variable.
+    #[cfg(target_os = "linux")]
+    pub fn madvise_dontneed(&self) {
+        let ptr = self.mmap.as_ptr() as *mut libc::c_void;
+        let len = self.mmap.len();
+        if len == 0 {
+            return;
+        }
+        unsafe {
+            let ret = libc::madvise(ptr, len, libc::MADV_DONTNEED);
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                eprintln!("[RSS] madvise(MADV_DONTNEED) failed: {err}");
+            } else {
+                eprintln!(
+                    "[RSS] madvise(MADV_DONTNEED) applied to GGUF mmap ({} MB)",
+                    len / (1024 * 1024)
+                );
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn madvise_dontneed(&self) {}
+
     /// Get the raw byte data for a tensor (zero-copy slice into the mmap).
     pub fn tensor_data(&self, info: &GgufTensorInfo) -> &[u8] {
         let start = self.tensor_data_offset + info.offset as usize;
@@ -603,6 +633,12 @@ impl GgufSource {
             weight_dtype,
             cpu_backend: Arc::new(CpuBackend::new()),
         })
+    }
+
+    /// Hint the OS that the GGUF mmap pages are no longer needed.
+    /// Forwards to `GgufFile::madvise_dontneed`. See that method for details.
+    pub fn madvise_dontneed(&self) {
+        self.gguf.madvise_dontneed();
     }
 
     /// Resolve a TensorId to the GGUF tensor name.

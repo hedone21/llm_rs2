@@ -154,7 +154,15 @@ impl TransformerModel {
     ) -> Result<Self> {
         use crate::models::loader::gguf::GgufSource;
         let source = GgufSource::open(std::path::Path::new(model_path))?;
-        crate::models::loader::load_model(&source, backend, memory)
+        let model = crate::models::loader::load_model(&source, backend, memory)?;
+        // LLMRS_MADV_DONTNEED: after all weights are loaded (and GPU-uploaded by
+        // load_model), advise the kernel that the file page cache is expendable.
+        // MmapBuffer tensors still hold Arc<Mmap> refs — the mapping stays valid —
+        // but the OS can reclaim physical pages, reducing RssFile.
+        if std::env::var("LLMRS_MADV_DONTNEED").is_ok() {
+            source.madvise_dontneed();
+        }
+        Ok(model)
     }
 
     /// Migrate all model weight tensors from CPU to GPU zero-copy memory.

@@ -14,6 +14,7 @@ use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
+use llm_rs2::core::rss_trace::rss_trace;
 use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -616,6 +617,8 @@ fn make_partition_gpu_alloc<'a>(
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    // T0: process start, before CLI parsing or any allocation.
+    rss_trace("start");
 
     #[allow(unused_mut)]
     let mut args = Args::parse();
@@ -921,6 +924,8 @@ fn main() -> anyhow::Result<()> {
     } else {
         TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?
     };
+    // T1: model weights loaded into memory (MmapBuffer + GPU copy if applicable).
+    rss_trace("model_loaded");
 
     // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
     // Creates UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR) + mapped: single VMA,
@@ -1012,6 +1017,13 @@ fn main() -> anyhow::Result<()> {
     // Q4_0 noshuffle SOA conversion: pre-convert all Q4_0 weights to Adreno-optimized
     // SOA layout. After this, matmul_q4_0 auto-dispatches to noshuffle GEMV for decode.
     // Check actual weight dtype (GGUF may load Q4_0 even when w_dtype=F16).
+    //
+    // LLMRS_SKIP_NOSHUFFLE_SOA: RSS diagnostic flag.
+    // When set, skip SOA conversion entirely (registry stays empty).
+    // matmul_q4_0() fallback path (engine/src/backend/opencl/mod.rs:1961):
+    //   lookup_noshuffle_soa() returns None → standard Q4_0 GEMV kernel runs.
+    // So decode still works, just slightly slower. RSS measurement is valid
+    // for all tokens when this flag is set.
     #[cfg(feature = "opencl")]
     if is_gpu {
         let actual_q4 = w_dtype == DType::Q4_0
@@ -1020,9 +1032,16 @@ fn main() -> anyhow::Result<()> {
                 .first()
                 .map_or(false, |l| l.wq.dtype() == DType::Q4_0);
         if actual_q4 {
-            match model.prepare_noshuffle_buffers(&backend) {
-                Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
-                Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
+            if std::env::var("LLMRS_SKIP_NOSHUFFLE_SOA").is_ok() {
+                eprintln!(
+                    "[RSS-diag] LLMRS_SKIP_NOSHUFFLE_SOA set: skipping noshuffle SOA conversion \
+                     (decode uses standard Q4_0 GEMV fallback — correct but slower)"
+                );
+            } else {
+                match model.prepare_noshuffle_buffers(&backend) {
+                    Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
+                    Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
+                }
             }
         }
     }
@@ -3333,6 +3352,8 @@ fn main() -> anyhow::Result<()> {
 
         tokens.push(next_token_id);
         start_pos += process_len;
+        // T2: first forward pass (prefill) complete, KV cache filled.
+        rss_trace("prefill_done");
     }
 
     // Execute deferred SwitchHw (from prefill checkpoint).
@@ -5145,6 +5166,13 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // T3 / T4: RSS snapshot after first and 16th decode tokens.
+            if decode_token_index == 0 {
+                rss_trace("decode_1");
+            } else if decode_token_index == 15 {
+                rss_trace("decode_16");
+            }
+
             if next_token_id == eos_id && !args.ignore_eos && std::env::var("IGNORE_EOS").is_err() {
                 break;
             }
@@ -5277,6 +5305,8 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // T5: normal exit — all allocations still live (model, KV caches, workspaces).
+    rss_trace("exit");
     Ok(())
 }
 
