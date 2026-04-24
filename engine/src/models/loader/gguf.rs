@@ -346,6 +346,17 @@ impl GgufFile {
         &self.mmap[start..start + size]
     }
 
+    /// Full mmap byte slice. Used by `SecondaryMmap` to serve tensor slices
+    /// from pre-computed offsets without re-invoking `tensor_data`.
+    pub fn mmap_data(&self) -> &[u8] {
+        &self.mmap
+    }
+
+    /// Absolute offset of the tensor data section within the mmap.
+    pub fn tensor_data_offset(&self) -> usize {
+        self.tensor_data_offset
+    }
+
     // ---- Metadata accessors ----
 
     pub fn get_str(&self, key: &str) -> Option<&str> {
@@ -386,7 +397,7 @@ impl GgufFile {
 // ---------------------------------------------------------------------------
 
 /// Compute byte size of a tensor's data based on ggml_type and dims.
-fn tensor_byte_size(info: &GgufTensorInfo) -> usize {
+pub(crate) fn tensor_byte_size(info: &GgufTensorInfo) -> usize {
     let num_elements: u64 = info.dims.iter().product();
     match info.ggml_type {
         GGML_TYPE_F32 => num_elements as usize * 4,
@@ -448,7 +459,7 @@ fn f32_vec_to_u8(v: Vec<f32>) -> Vec<u8> {
 }
 
 /// Convert ggml_type to our DType.
-fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
+pub(crate) fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
     match ggml_type {
         GGML_TYPE_F32 => Ok(DType::F32),
         GGML_TYPE_F16 => Ok(DType::F16),
@@ -603,6 +614,13 @@ impl GgufSource {
             weight_dtype,
             cpu_backend: Arc::new(CpuBackend::new()),
         })
+    }
+
+    /// Access the underlying parsed GGUF file (metadata, tensor index, mmap).
+    /// Used by weight-swap infrastructure to validate a secondary GGUF against
+    /// the primary layout without re-parsing.
+    pub fn gguf_file(&self) -> &GgufFile {
+        &self.gguf
     }
 
     /// Resolve a TensorId to the GGUF tensor name.
