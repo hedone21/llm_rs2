@@ -580,6 +580,23 @@ struct Args {
     /// a warn-only no-op. `RestoreDefaults` triggers recall of offloaded data.
     #[arg(long)]
     swap_dir: Option<std::path::PathBuf>,
+
+    /// Optional secondary GGUF path for runtime weight swap (Phase 2).
+    /// When specified together with `--force-swap-ratio`, the engine swaps
+    /// decoder layer weights from the primary dtype to the secondary dtype
+    /// immediately before generation starts.
+    /// When omitted, the weight swap path is disabled (ENG-DAT-C09).
+    #[arg(long)]
+    secondary_gguf: Option<std::path::PathBuf>,
+
+    /// Manually trigger a weight swap before generation starts.
+    /// Value: fraction of decoder layers to swap (0.0–1.0).
+    /// Example: `--force-swap-ratio 0.5` swaps 50% of layers.
+    /// Requires `--secondary-gguf` to be set; exits early with an error
+    /// if the secondary path is absent.
+    /// Intended for offline testing and debug; not for production use.
+    #[arg(long)]
+    force_swap_ratio: Option<f32>,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -933,12 +950,26 @@ fn main() -> anyhow::Result<()> {
         ),
     };
     eprintln!("[Config] Weight dtype: {:?}", w_dtype);
+    // Validate --force-swap-ratio requires --secondary-gguf.
+    if args.force_swap_ratio.is_some() && args.secondary_gguf.is_none() {
+        anyhow::bail!(
+            "--force-swap-ratio requires --secondary-gguf to be set (no secondary weight file)"
+        );
+    }
+
     let is_gguf = model_path.ends_with(".gguf");
     let mut model = if is_gguf {
         if args.weight_dtype != "f16" {
             eprintln!("[Warning] --weight-dtype ignored for GGUF models (dtype from file)");
         }
-        TransformerModel::load_gguf(model_path, backend.clone(), &*memory)?
+        // Use LoadConfig single-entry path (ENG-DAT-090) so --secondary-gguf
+        // is wired in automatically.
+        let load_cfg = llm_rs2::models::loader::LoadConfig {
+            primary_source: std::path::PathBuf::from(model_path),
+            default_dtype: w_dtype,
+            secondary_source: args.secondary_gguf.clone(),
+        };
+        TransformerModel::load_from_config(&load_cfg, backend.clone(), &*memory)?
     } else {
         TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?
     };
@@ -1839,6 +1870,51 @@ fn main() -> anyhow::Result<()> {
     //   using force_evict_with_scores to bypass memory pressure checks.
     let auto_eviction = args.eviction_policy != "none" && experiment_schedule.is_none();
     let score_based_eviction = matches!(args.eviction_policy.as_str(), "h2o" | "h2o_plus" | "d2o");
+
+    // ── Weight swap: --force-swap-ratio manual trigger ──────────────────────
+    // Applied once before generation starts (prefill + decode).
+    // Requires --secondary-gguf (validated above at model load time).
+    if let Some(ratio) = args.force_swap_ratio {
+        use llm_rs2::core::buffer::DType as LDType;
+        use llm_rs2::memory::galloc::Galloc;
+        use llm_rs2::models::weights::swap_executor::SwapExecutor;
+
+        let ratio = ratio.clamp(0.0, 1.0);
+        let num_layers = model.layers.len();
+        let target_layers = SwapExecutor::uniform_target_layers(ratio, num_layers);
+
+        if !target_layers.is_empty() {
+            let swap_memory = Galloc::new();
+            let executor = SwapExecutor::new(
+                LDType::Q4_0,
+                &model.config,
+                // Use CPU backend for the swap: weight tensors are materialised
+                // on CPU first, then the existing backend.copy_weight_from path
+                // routes them to GPU if needed (same as initial load).
+                cpu_backend_arc.clone(),
+                &swap_memory,
+            );
+            match executor.execute(&model, &target_layers) {
+                Ok(report) => {
+                    eprintln!(
+                        "weight_swap: force ratio={:.2}, swapped {}/{} layers in {:.1}ms",
+                        ratio,
+                        report.swapped.len(),
+                        num_layers,
+                        report.latency_ms,
+                    );
+                }
+                Err(e) => {
+                    anyhow::bail!("--force-swap-ratio: swap failed: {}", e);
+                }
+            }
+        } else {
+            eprintln!(
+                "weight_swap: force ratio={:.2} → 0 target layers (no-op)",
+                ratio
+            );
+        }
+    }
 
     // ════════════════════════════════════════════════════════════
     //  DUMP-IMPORTANCE MODE: Measure per-layer importance and exit
