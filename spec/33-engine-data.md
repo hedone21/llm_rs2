@@ -589,6 +589,16 @@
 
 ---
 
+### 3.15.16 Weight Loading / Dynamic Weight Swap
+
+| 플래그 | 타입 | 기본값 | 설명 |
+|--------|------|--------|------|
+| `--model-path` | String | (기존) | Primary 가중치 파일. 초기 로딩 시 모든 decoder layer가 이 파일의 dtype으로 로드된다. |
+| `--model-path-secondary` | String? | None | Secondary 가중치 파일 (낮은 정밀도, e.g. Q4_0). 제공 시 디스크에 mmap만 되고, 런타임 swap 대상으로 예약된다. (ENG-DAT-090) |
+| `--force-swap-ratio` | `Option<f32>` | None | 디버그 전용. Manager 없이 prefill 종료 시 `ResilienceAction::SwapWeights { ratio }`를 직접 트리거한다. 값은 `[0.0, 1.0]`. (ENG-ALG-211 debug hook) |
+
+---
+
 ### 3.16 PressureLevel / ActionResult [ENG-DAT-080]
 
 **[ENG-DAT-080]** CachePressurePipeline의 pressure level과 handler 결과 타입을 정의한다. *(MUST)*
@@ -602,7 +612,8 @@
 | `NoOp` | - | 액션 미수행 |
 | `Evicted` | `tokens_removed: usize`, `new_pos: usize` | 토큰 제거됨 |
 | `Quantized` | - | KV 정밀도 감소 (stub) |
-| `Swapped` | `tokens_swapped: usize` | 토큰 offload됨 |
+| `Swapped` | `tokens_swapped: usize` | KV 토큰 offload됨 |
+| `WeightSwapped` | `layers: Vec<(usize, DType, DType)>`, `freed_bytes: u64`, `latency_ms: u64` | Weight layer dtype 교체됨. `(layer_idx, from_dtype, to_dtype)` 튜플 목록. `freed_bytes`는 `madvise(DONTNEED)` 후 회수된 상주 바이트. `latency_ms`는 swap 전체 실행 시간. (WSWAP-2, INV-123 검증 기반) |
 
 **HandlerContext**: 각 CachePressureHandler에 전달되는 컨텍스트.
 
@@ -617,6 +628,93 @@
 | `target_ratio` | Option\<f32\> | 외부 override (resilience) |
 | `qcf_sink` | Option\<&mut Vec\<QcfMetric\>\> | QCF 메트릭 수집 대상 |
 | `layer_ratios` | Option\<&[(f32, f32)]\> | D2O layer allocation |
+
+---
+
+### 3.17 LoadConfig — Weight Loading with Dynamic Swap [ENG-DAT-090]
+
+**[ENG-DAT-090]** `LoadConfig`는 가중치 로딩의 런타임 설정이다. 초기 로딩은 단일 `default_dtype`을 사용하고, `secondary_source`가 제공되면 런타임 swap 대상 파일로 예약한다. *(MUST)*
+
+**필수 필드**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `primary_source` | PathBuf | Primary 가중치 파일 경로. 기존 `--model-path`가 연결되는 지점. 초기 모든 decoder layer 로딩 소스. |
+| `default_dtype` | DType | Primary 파일이 공급하는 기본 dtype. Loader가 파일 헤더에서 추론하며 초기 로딩 시점의 `LayerSlot::current_dtype` 초깃값. |
+
+**신규 필드** (Dynamic Swap 지원):
+
+| 필드 | 타입 | 기본값 | 설명 |
+|------|------|--------|------|
+| `secondary_source` | `Option<PathBuf>` | None | Secondary 가중치 파일 경로. Primary보다 낮은 정밀도 dtype(e.g. Q4_0)이어야 의미가 있다. **초기 로딩에 사용되지 않는다** — mmap 핸들만 `TransformerWeights`에 보관되어 나중에 `SwapExecutor`가 layer 단위로 참조한다. |
+
+**의미론**:
+
+- `secondary_source == None`이면 swap 경로 비활성. `ResilienceAction::SwapWeights`는 즉시 NoOp 반환.
+- `secondary_source == Some(path)`이면 로더가 primary에 더해 secondary 파일의 metadata(n_layer, n_head, n_kv_head, hidden_size, intermediate_size, head_dim)를 검증하고 mmap을 열어둔다. mmap handle은 `LayerSlot::secondary_mmap_handle`로 공유된다 (ENG-DAT-092).
+- 초기 로딩 후 모든 decoder layer의 `current_dtype`은 `default_dtype`과 같고, `Primary` 전용 상태이다.
+- Cross-layer tensor(embedding, final_norm, lm_head)는 항상 primary에서 로드된다. **Swap 대상이 아니다.**
+- Backend 무관. OpenCL 백엔드의 `rewrap_weights_for_dual_access()`는 swap 직후의 새 Buffer에 대해서도 동일 규칙으로 호출된다.
+
+**ENG-DAT-091 [DEPRECATED 2026-04-24]**: 구 TOML `LayerDtypeProfile` 스키마는 정적 per-layer profile 노선과 함께 폐기되었다. 동적 swap은 Manager 신호 기반이며 TOML 입력이 없다. `quantize_profile` 바이너리도 동시 폐기. ID는 재사용하지 않는다.
+
+---
+
+### 3.18 LayerSlot — Swappable Weight Slot [ENG-DAT-092]
+
+**[ENG-DAT-092]** `LayerSlot`은 decoder block 한 layer의 가중치 묶음을 런타임에 교체 가능한 단위로 캡슐화한다. Forward pass는 이 slot을 통해서만 layer weight에 접근한다. *(MUST)*
+
+**필드**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `current_dtype` | `DType` | 현재 slot이 보유한 weight dtype. 초기값은 `LoadConfig::default_dtype`. swap 후 secondary dtype으로 전환. `INV-124` 대상. |
+| `weights` | `Arc<LayerWeights>` 또는 동치 snapshot 타입 | Layer의 QKV/O/gate/up/down + attn_norm/ffn_norm tensor 묶음. **Lock-free snapshot 교체**가 핵심 요건. 기본 권장 구현은 `arc_swap::ArcSwap<LayerWeights>`. 대안은 `RwLock<Arc<LayerWeights>>` 또는 custom epoch 기반 swap. 최종 선택은 Senior Implementer PoC의 decode latency 측정 후 확정한다. |
+| `secondary_mmap_handle` | `Option<Arc<SecondaryMmap>>` | Secondary 파일의 mmap view. Layer 범위의 tensor slice 정보(offset+len+dtype)를 포함. `None`이면 이 layer는 swap 불가. |
+| `generation` | `AtomicU64` | swap 발생 시마다 1씩 증가. Forward 진입 시점의 값을 캡처하여 swap 도중 재진입을 감지한다. INV-120과 동일 패턴. |
+
+**후조건**:
+- Forward 읽기 경로는 `weights` snapshot을 `Arc::clone`으로 획득 후 사용. 진행 중 swap이 발생해도 해당 forward는 이전 snapshot을 계속 사용하고, **다음 layer 진입 시 최신 snapshot을 본다**.
+- `current_dtype`은 snapshot 교체와 **동일 원자 단계**에 갱신되어야 한다(INV-124).
+
+---
+
+### 3.19 TransformerWeights — Slot Collection [ENG-DAT-093]
+
+**[ENG-DAT-093]** `TransformerWeights`는 모델 전체의 per-layer slot과 cross-layer tensor, 공유 secondary mmap handle을 보관한다. *(MUST)*
+
+**필드**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `layers` | `Vec<LayerSlot>` | Decoder block layer 목록. 길이 = `num_layers`. 순서는 layer index와 동일. |
+| `embedding` | `Arc<Tensor>` | 임베딩 테이블. **Swap 대상 아님**. `LoadConfig::default_dtype`으로 로드된 상태 유지. |
+| `final_norm` | `Arc<Tensor>` | 최종 RMSNorm weight. **Swap 대상 아님**. |
+| `lm_head` | `Option<Arc<Tensor>>` | 출력 projection. tie_word_embeddings 모델(Qwen 등)은 `None`이며 forward는 `embedding`을 재사용. **Swap 대상 아님**. |
+| `secondary_mmap` | `Option<Arc<SecondaryMmap>>` | Secondary 파일 mmap 소유권 핸들. 모든 `LayerSlot::secondary_mmap_handle`은 여기서 clone된 Arc를 공유. 생성자에서 1회 설정 후 모델 lifetime 동안 **drop 금지**(INV-125). |
+| `ratio_generation` | `AtomicU64` | 전체 swap 세대 카운터. `SwapExecutor`가 ratio 기반 다중 layer를 한 배치로 교체할 때 한 번 증가. Forward plan 재빌드 트리거 키 (ENG-ALG-200의 `ratio_generation`과 의미 통합). |
+
+**불변식**:
+- `secondary_mmap.is_some()` ⇒ `secondary_mmap` handle은 `TransformerWeights::drop()` 시점까지 살아있다 (INV-125).
+- 각 `LayerSlot::secondary_mmap_handle.is_some()` ⇒ 해당 Arc는 `TransformerWeights::secondary_mmap`과 동일 pointee.
+
+---
+
+### 3.20 SecondaryMmap — Layer Tensor View [ENG-DAT-094]
+
+**[ENG-DAT-094]** `SecondaryMmap`은 secondary GGUF 파일의 메모리 매핑과, layer별 tensor slice 인덱스를 보관하는 read-only 핸들이다. *(MUST)*
+
+**필드**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `mmap` | `memmap2::Mmap` 또는 동치 | Secondary 파일 전체 read-only mmap. |
+| `layer_index` | `Vec<LayerTensorSlice>` | 각 decoder layer에 속한 tensor들의 `(name, offset, len, dtype, shape)` 목록. GGUF header 파싱 1회로 구축. |
+| `cross_layer_offsets` | `HashMap<String, (u64, u64, DType)>` | 참고용. Swap 대상이 아니지만 metadata 검증에 사용. |
+
+**의미론**:
+- `SwapExecutor`는 `layer_index[i]`를 조회해 해당 layer에 필요한 tensor의 raw byte slice를 얻고, Q/K permutation 등 primary loader와 동일한 후처리를 적용하여 새 `LayerWeights`를 생성한다.
+- `mmap` 자체는 swap 후에도 drop되지 않는다. `madvise(DONTNEED)`는 swap된 **primary** 페이지 영역에만 적용된다 (INV-125의 보호 대상이 아닌 쪽).
 
 ## 4. Alternative Behavior
 
@@ -637,6 +735,16 @@
 **[ENG-DAT-C06]** QcfMetric의 `action` 필드 값은 이 스펙에 명시된 9종 문자열 중 하나여야 한다. *(MUST)*
 
 **[ENG-DAT-C07]** Tensor의 `reshape()`은 numel이 동일한 경우에만 허용된다. *(MUST)*
+
+**[ENG-DAT-C08]** Swap 대상 layer index는 `[0, num_layers)` 범위 내여야 하며, 이 범위 밖 인덱스를 담은 swap 요청은 NoOp으로 처리된다. *(MUST)*
+
+**[ENG-DAT-C09]** `LoadConfig::secondary_source == None`이면 `ResilienceAction::SwapWeights`는 무조건 NoOp을 반환한다. 로딩 경로는 단일 primary 파일만 열고, `LayerSlot::secondary_mmap_handle`은 모두 `None`이다. *(MUST)*
+
+**[ENG-DAT-C10]** Primary와 secondary 가중치 파일의 모델 메타데이터(GGUF metadata의 `n_layer`, `n_head`, `n_kv_head`, `hidden_size`, `intermediate_size`, `head_dim`) 및 각 layer tensor의 shape은 모두 일치해야 한다. 불일치 시 loader는 에러 반환하고 swap 경로도 비활성화된다. *(MUST)*
+
+**[ENG-DAT-C11]** Cross-layer tensor(embedding, final_norm, lm_head)는 `TransformerWeights`의 swap 대상에서 제외된다. 이들의 dtype은 모델 lifetime 동안 `LoadConfig::default_dtype`으로 고정이다. *(MUST)*
+
+**[ENG-DAT-C12]** `TransformerWeights::secondary_mmap`이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop될 수 없다. `LayerSlot::secondary_mmap_handle`의 모든 clone이 drop되어도 `TransformerWeights`가 최후 소유권을 보존한다. *(MUST)*
 
 ## 6. Examples
 

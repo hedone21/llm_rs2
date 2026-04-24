@@ -1033,6 +1033,271 @@ function per_token_checkpoint(executor, caches, model_state):
 **연관 arch**: `arch/plan_partition_integration.md` (전체).
 **구현 우선순위**: P1 (decode TBT 회수 -10~-15 ms/tok 목표).
 
+### 3.12 Dynamic Weight Swap
+
+> **설계 변경 2026-04-24**: 이전 Phase A (정적 TOML `LayerDtypeProfile` + `quantize_profile` 바이너리)는 **전면 폐기**되었다. 현 설계는 **Manager 신호 기반 런타임 동적 swap**으로, secondary 파일은 디스크에 상주하고 평시 로딩 오버헤드가 없다. 폐기된 ID: `ENG-DAT-091` (TOML schema, DEPRECATED — 재사용 금지). 재정의된 ID: `ENG-DAT-090` (LoadConfig), `ENG-ALG-210` (Loader), `INV-121` (forward reentrancy), `INV-122` (mixed precision accuracy).
+
+#### 3.12.1 초기 로딩 (Uniform Primary) [ENG-ALG-210]
+
+**[ENG-ALG-210]** Loader는 모델을 `LoadConfig::primary_source`의 `default_dtype` 하나로 일관되게 로딩하고, `secondary_source`가 있으면 metadata 검증 후 mmap handle을 `TransformerWeights::secondary_mmap`에 보관한다. 초기 로딩 중 swap은 발생하지 않는다. *(MUST)*
+
+**전제**:
+- `LoadConfig` 필드 정의는 ENG-DAT-090 참조.
+- LayerSlot/TransformerWeights/SecondaryMmap은 ENG-DAT-092~094 참조.
+- 제약: ENG-DAT-C08 ~ ENG-DAT-C12.
+
+**알고리즘 (의사코드)**:
+
+```
+function load_model(config: LoadConfig) -> TransformerWeights:
+    primary = open_weight_file(config.primary_source)
+    assert primary.metadata consistent with model config    // ENG-DAT-C10
+
+    secondary_mmap = None
+    if config.secondary_source is Some(path):
+        secondary = open_weight_file(path)
+        assert secondary.metadata matches primary.metadata  // ENG-DAT-C10
+        assert secondary.layer_tensor_shapes == primary.layer_tensor_shapes
+        secondary_mmap = Some(Arc::new(SecondaryMmap::from(secondary)))
+
+    // Cross-layer tensors: primary only, never swapped (ENG-DAT-C11)
+    embedding  = Arc::new(primary.load_tensor("token_embd.weight"))
+    final_norm = Arc::new(primary.load_tensor("output_norm.weight"))
+    lm_head    = if tie_word_embeddings { None } else {
+                    Some(Arc::new(primary.load_tensor("output.weight"))) }
+
+    // Decoder layer slots: all start as primary dtype
+    layers = Vec::with_capacity(num_layers)
+    for layer_idx in 0 .. num_layers:
+        weights = load_layer_weights(&primary, layer_idx, config.default_dtype)
+        layers.push(LayerSlot {
+            current_dtype: config.default_dtype,
+            weights: Arc::new(weights),  // wrapped in ArcSwap or equivalent
+            secondary_mmap_handle: secondary_mmap.clone(),
+            generation: AtomicU64::new(0),
+        })
+
+    return TransformerWeights {
+        layers, embedding, final_norm, lm_head,
+        secondary_mmap,
+        ratio_generation: AtomicU64::new(0),
+    }
+```
+
+**Llama/Qwen 공통**:
+- Tensor name 매칭: 양 모델 모두 GGUF `blk.<layer_idx>.<subname>`. Loader 내부 정규화는 동일.
+- Q/K permutation: 양 모델 모두 GGUF convention을 따르므로 동일 permutation 경로 적용 (참고: `engine/src/models/loader/gguf.rs:514-534, 677-697`).
+- `tie_word_embeddings` 판독은 GGUF metadata에서 모델-agnostic하게 처리. Qwen 2.5 1.5B는 tie를 사용할 수 있으나 decoder block 내부에는 영향 없음.
+
+**에러 케이스**:
+
+| 조건 | 에러 |
+|------|------|
+| primary/secondary 메타데이터 불일치 | `LoadError::MetadataMismatch` (ENG-DAT-C10) |
+| 두 파일의 동일 layer tensor shape 불일치 | `LoadError::ShapeMismatch` (ENG-DAT-C10) |
+| secondary 파일 open 실패 | `LoadError::SecondaryOpen` — primary-only로 계속 진행 여부는 CLI 설정으로 결정 (기본: 에러 반환) |
+
+#### 3.12.2 SwapExecutor 알고리즘 [ENG-ALG-211]
+
+**[ENG-ALG-211]** `SwapExecutor`는 `WeightSwapHandler`가 선택한 layer 집합을 primary→secondary dtype으로 교체한다. 각 layer 교체는 (1) secondary mmap에서 tensor byte slice 복사/역참조, (2) Q/K permutation 적용, (3) 새 `Arc<LayerWeights>` 구성, (4) `LayerSlot` snapshot atomic swap, (5) `current_dtype` 갱신, (6) `generation` 증가, (7) primary 페이지 `madvise(DONTNEED)` 힌트 순서로 수행한다. *(MUST)*
+
+**입력**:
+- `layers_to_swap: &[usize]` — 대상 layer index 목록 (ImportanceCollector + SwapDecider가 선정).
+- `target_dtype: DType` — secondary dtype (현재는 primary 대비 더 낮은 정밀도로 제한, 복귀 경로 없음).
+- `&TransformerWeights` — swap 대상 모델.
+
+**알고리즘**:
+
+```
+function execute_swap(weights: &TransformerWeights,
+                      layers_to_swap: &[usize],
+                      target_dtype: DType) -> SwapResult:
+    if weights.secondary_mmap is None: return NoOp    // ENG-DAT-C09
+
+    // (a) Global generation bump — forward plan 재빌드 트리거
+    let new_gen = weights.ratio_generation.fetch_add(1, SeqCst) + 1
+
+    let mut swapped = Vec::new()
+    let mut freed_total: u64 = 0
+    let start_time = now()
+
+    for layer_idx in layers_to_swap:
+        slot = &weights.layers[layer_idx]
+        if slot.current_dtype == target_dtype: continue   // 이미 swap 완료 (ENG-DAT-C08)
+        let mmap = slot.secondary_mmap_handle.as_ref().expect("C09 보증")
+
+        // (b) Secondary bytes → new LayerWeights with Q/K permutation
+        new_weights = build_layer_from_mmap(mmap, layer_idx, target_dtype)
+        assert new_weights.dtype == target_dtype
+
+        // (c) Atomic snapshot swap — forward는 old Arc 계속 사용 가능
+        let old = slot.weights.swap(Arc::new(new_weights))  // ArcSwap
+        slot.current_dtype.store_atomic(target_dtype)        // INV-124 페어
+        slot.generation.fetch_add(1, SeqCst)
+
+        // (d) Primary 페이지 madvise — old가 drop되면 추가 회수
+        freed_total += madvise_primary_pages(&old, layer_idx)
+
+        swapped.push((layer_idx, DType::from(old_dtype_captured), target_dtype))
+
+    return WeightSwapped {
+        layers: swapped,
+        freed_bytes: freed_total,
+        latency_ms: elapsed_ms(start_time),
+    }
+```
+
+**핵심 보증**:
+- **Forward 비차단**: step (c)의 `ArcSwap::swap`은 lock-free. 진행 중 forward pass는 swap 이전의 Arc를 계속 참조하여 완료. 다음 토큰부터 새 snapshot을 본다.
+- **Plan 재빌드**: `ratio_generation` 증가로 `PartitionStep::run`이 `PlanInvalidated`를 반환 (INV-120 재사용). Caller는 plan을 재빌드하거나 forward_gen으로 fallback.
+- **Q/K permutation dtype 무관**: GGUF convention의 permutation은 byte-level reorder이므로 primary loader의 동일 로직을 재사용 가능. Llama/Qwen 양 모델에서 동일 경로.
+
+**madvise 정책**:
+- 기존 ENG-ALG-C05/C06 (page alignment, is_host_managed) 규칙 재사용.
+- Primary 파일 mmap에서 해당 layer tensor가 점유한 페이지 영역을 `MADV_DONTNEED`로 힌트. 커널이 물리 페이지를 회수하면 PSS 감소.
+- Old Arc가 drop된 후에만 유효. Forward가 여전히 old를 보유 중이면 회수는 drop 시점으로 지연.
+
+**단방향 제약**: Secondary→primary 복귀 경로는 **구현하지 않는다**. 필요 시 Phase 5에서 별도 ENG-ALG로 추가. 현재는 `ResilienceAction::SwapWeights { ratio }`가 단조 증가만 허용하며, 기존 swap된 layer는 중복 선택에서 제외된다 (SwapDecider 로직).
+
+#### 3.12.3 On-Demand ImportanceCollector 활성화 정책 [ENG-ALG-212]
+
+**[ENG-ALG-212]** `ImportanceCollector`는 평시 비활성이며, Manager로부터 `ResilienceAction::SwapWeights`가 도착한 **직후의 prefill-tail**에서만 1회 활성화된다. Decode 중 신호가 도착하면 K=512 토큰 이내 다음 prefill을 대기하고, 초과 시 uniform index fallback으로 전환한다. *(MUST)*
+
+**전제**:
+- `ImportanceCollector`는 `engine/src/core/qcf/layer_importance.rs` 기존 구현 재사용. **on-demand active 플래그**를 추가하여 hot path 오버헤드를 제로화.
+- `SubLayer::Full` 사용 (attention+MLP 통합 점수).
+
+**활성화 흐름**:
+
+```
+state: ImportanceCollector { active: bool, tail_target_token: Option<TokenIdx> }
+
+on_receive ResilienceAction::SwapWeights { ratio }:
+    if in_prefill:
+        // 현재 prefill의 마지막 N=1 토큰에서 측정
+        collector.active = true
+        collector.tail_target_token = Some(prefill_last_token_idx)
+        pending_swap = Some(SwapRequest { ratio, arrived_at_token: current_token })
+    else:   // decode 중
+        // 다음 prefill까지 대기
+        pending_swap = Some(SwapRequest { ratio, arrived_at_token: current_token })
+
+per_token_post_forward(current_token):
+    if collector.active and current_token == collector.tail_target_token:
+        importance_scores = collector.finalize()
+        collector.active = false
+        execute_decider_and_executor(importance_scores, pending_swap.ratio)
+        pending_swap = None
+
+    if pending_swap.is_some() and in_decode:
+        elapsed = current_token - pending_swap.arrived_at_token
+        if elapsed >= K=512:
+            // Fallback: uniform index 선택 (재현성)
+            layers_to_swap = uniform_select_by_index(ratio, num_layers, already_swapped)
+            execute_executor(layers_to_swap)
+            pending_swap = None
+        // else: 다음 prefill이 오면 해당 tail에서 측정
+```
+
+**Fallback 정책 (K=512)**:
+- K 값: 512 tokens. 근거: Llama 3.2 1B ~100 tok/s 기준 ≈ 5초 대기. 사용자 응답성과 측정 정확도의 trade-off. 실측 후 조정 가능.
+- Uniform 선택: `layers_to_swap = [num_layers × i / ⌊ratio × num_layers⌋ for i in 0..⌊ratio × num_layers⌋]`와 유사하게 균등 간격 index 선택. 이미 swap된 layer는 제외하고 다음 인덱스로 skip. **랜덤 금지** (재현성 보장).
+
+**Prefill-tail 정의**:
+- Prefill의 **마지막 1 토큰**에서 per-layer activation divergence 수집 (N=1). 이유: QCF-PPL 상관관계 증명된 메트릭이며 측정 오버헤드 최소.
+- Measurement 방법: ImportanceTable의 per-layer score. SubLayer::Full 사용.
+
+#### 3.12.4 SwapDecider 로직 [ENG-ALG-213]
+
+**[ENG-ALG-213]** `SwapDecider`는 `importance_scores` (또는 uniform fallback), `ratio`, `already_swapped` 집합을 입력받아 swap 대상 layer 목록을 결정한다. *(MUST)*
+
+**알고리즘**:
+
+```
+function decide_layers(importance_scores: Option<&[f32]>,
+                       ratio: f32,
+                       num_layers: usize,
+                       already_swapped: &HashSet<usize>) -> Vec<usize>:
+    target_count = (ratio * num_layers as f32).round() as usize
+    needed = target_count.saturating_sub(already_swapped.len())
+    if needed == 0: return Vec::new()
+
+    candidate_indices = (0..num_layers).filter(|i| !already_swapped.contains(i)).collect()
+
+    let selected = match importance_scores {
+        Some(scores) => {
+            // 중요도 하위 N개 선택
+            candidate_indices.sort_by(|a, b| scores[a].partial_cmp(&scores[b]).unwrap())
+            candidate_indices.truncate(needed)
+            candidate_indices
+        }
+        None => {
+            // Uniform fallback (ENG-ALG-212 경로)
+            uniform_select_by_index(needed, &candidate_indices)
+        }
+    }
+    selected
+```
+
+**모델별 차이 없음**: ratio 기반이므로 Llama (16 layers, ratio=0.25 → 4 layers) 또는 Qwen (28 layers, ratio=0.25 → 7 layers) 자동 적응. Embedding/lm_head/final_norm 제외는 `num_layers` 정의 자체에서 자연 보장 (decoder block만 카운트).
+
+#### 3.12.5 WeightSwapHandler — CachePressureHandler 구현 [ENG-ALG-214]
+
+**[ENG-ALG-214]** `WeightSwapHandler`는 `CachePressureHandler` trait을 구현하며, `ResilienceAction::SwapWeights`가 트리거된 `HandlerContext`에서 ImportanceCollector finalize → SwapDecider → SwapExecutor를 순차 호출한다. KV `SwapHandler`(ENG-ALG-092)와 독립적으로 등록된다. *(MUST)*
+
+**트리거 경로**:
+- Resilience pipeline에서 `HandlerContext::swap_weights_ratio: Option<f32>` 필드를 조회 (HandlerContext 확장, ENG-DAT-080 신규 필드).
+- `Some(ratio)`이면 활성. `None`이면 NoOp.
+
+**반환**:
+- `ActionResult::WeightSwapped { layers, freed_bytes, latency_ms }` (ENG-DAT-080 신규 variant).
+
+**배타성**: 기존 KV SwapHandler와 상호 배타 아님. 둘 다 동일 `HandlerContext`에서 순차 실행 가능 (pipeline 순서에 의존).
+
+#### 3.12.6 Mixed Precision Forward 정확성 [INV-122]
+
+**[INV-122]** 동적 swap으로 일부 decoder layer가 secondary dtype으로 교체된 이후의 forward 결과는 primary single-precision baseline 대비 다음 허용 오차 안에 있어야 한다. *(MUST)*
+
+**수치 기준** (권장 초기값, 실측 후 조정 여지):
+
+| 메트릭 | 허용 임계 | 측정 방법 |
+|--------|----------|----------|
+| **Logit NMSE** (last token) | ≤ 0.01 | `||logits_swapped − logits_primary||² / ||logits_primary||²`. Calibration prompt 평균. |
+| **Top-5 Overlap** | ≥ 0.9 | 마지막 토큰 top-5 ID overlap. |
+| **Top-1 Match Ratio** | ≥ 0.95 | Greedy 기준 32토큰 중 top-1 일치 비율. |
+
+**검증 대상 구성**:
+
+| 모델 | ratio | 기대 swap 수 |
+|------|-------|--------------|
+| Llama 3.2 1B (16 layers) | 0.25 | 4 |
+| Llama 3.2 1B | 0.50 | 8 |
+| Llama 3.2 1B | 1.00 | 16 |
+| Qwen 2.5 1.5B (28 layers) | 0.25 | 7 |
+| Qwen 2.5 1.5B | 0.50 | 14 |
+| Qwen 2.5 1.5B | 1.00 | 28 |
+
+**Calibration Prompt Set**: 최소 8 prompt, 각 ≥ 128 tokens prefill. `experiments/prompts/` 기존 자산 재활용.
+
+**실패 시 대응**:
+- ratio 0.25에서 임계 초과 → ImportanceCollector 기준을 재검토 (다른 metric 시도).
+- ratio 1.00 전체 swap에서도 임계 유지 실패 → secondary dtype 정밀도 상향 (e.g. Q8_0).
+
+**검증 방법**: test. `tests/spec/test_inv_122_mixed_precision.rs` (이전 ID 유지, 내용 재작성).
+
+#### 3.12.7 Forward 재진입 보호 [INV-121]
+
+**[INV-121]** `SwapExecutor`가 `LayerSlot`을 교체하는 구간에서 forward가 해당 layer에 진입해도 **stale dtype 또는 half-swapped 상태를 절대 관찰하지 않는다**. 구현은 `ArcSwap` + `AtomicU64 generation` 조합으로 보장한다. *(MUST)*
+
+**보장 메커니즘**:
+1. Forward 진입 시 `slot.weights.load()`로 Arc snapshot을 획득 (lock-free).
+2. Swap은 `slot.weights.swap(new)`로 snapshot을 원자적으로 교체. `current_dtype`은 같은 단계에서 갱신 (INV-124).
+3. `generation` counter는 Plan 레벨의 stale 감지 키. `PartitionPlanContext`가 generation mismatch를 보면 `PlanInvalidated` 반환 (INV-120 재사용).
+
+**검증 방법**: test. `tests/spec/test_inv_121_swap_reentrancy.rs`에서 swap×forward 동시 부하 (≥10K iterations)로 panic/stale/deadlock 0건 검증.
+
+---
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.
@@ -1060,6 +1325,8 @@ function per_token_checkpoint(executor, caches, model_state):
 **[ENG-ALG-C07]** Chunked prefill에서 모든 청크는 `logits_last_only=true`로 처리한다. *(MUST)*
 
 **[ENG-ALG-C08]** CachePressurePipeline의 stage 실행 순서는 `min_level` 오름차순이다. *(MUST)*
+
+**[ENG-ALG-C09]** Per-layer weight loading(ENG-ALG-210)에서 Phase A는 로딩 완료 후 layer dtype의 런타임 변경을 허용하지 않는다. 동적 교체는 Phase B에서 도입되며 별도 불변식(INV-WSWAP-001, Phase B 예정)으로 규율된다. *(MUST)*
 
 ## 6. Examples
 

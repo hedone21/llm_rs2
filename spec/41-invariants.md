@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) = 총 101개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap 5개, 2026-04-24) = 총 106개.
 
 ## 1. Purpose and Scope
 
@@ -227,6 +227,18 @@
 |----|------|----------|---------|------|------|
 | INV-120 | arch/plan_partition_integration.md A.6.2 | FullKernelPlan이 PartitionStep을 포함할 때, 각 PartitionStep::run 진입 시 PartitionPlanContext.ratio_generation_at_build와 PartitionContext.ratio_generation을 비교한다. mismatch면 PlanInvalidated를 반환하며 caller는 plan을 재빌드하거나 forward_gen으로 fallback해야 한다. | Safety/Correctness | runtime | AtomicU64 generation 비교 |
 
+### 3.13 Weight Swap Invariants [INV-121 ~ INV-125]
+
+2026-04-24 Dynamic Weight Swap (Manager 신호 기반 런타임 교체)의 불변식. 이전 Phase A 정적 노선은 **폐기**되었으며 `ENG-DAT-091` ID는 재사용 금지. 대응 명세: `32-engine-algorithms.md` 3.12 (ENG-ALG-210~214), `33-engine-data.md` 3.17~3.20 (ENG-DAT-090/092/093/094), `arch/weight_swap.md`.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-121 | 32-engine-algorithms 3.12.7 | `SwapExecutor`가 `LayerSlot`을 교체하는 구간에서 forward는 stale dtype 또는 half-swapped 상태를 관찰하지 않는다. `ArcSwap` + `generation` counter로 보장. | Correctness | test | INV-120과 동일 메커니즘 (ratio_generation) |
+| INV-122 | 32-engine-algorithms 3.12.6 | Dynamic swap 후 forward 결과는 primary baseline 대비 logit NMSE ≤ 0.01, top-5 overlap ≥ 0.9, top-1 match ratio ≥ 0.95를 충족한다. | Correctness | test | Llama/Qwen 양쪽, ratio 0.25/0.5/1.0 |
+| INV-123 | 32-engine-algorithms 3.12.2 | `SwapExecutor::execute_swap` 실행 중 forward 진입 시 lock-free로 기존 snapshot에 접근 가능. Swap은 `ArcSwap::swap` 한 단계로 완결되어 partial state를 외부에 노출하지 않는다. | Safety/Correctness | test | lock-free atomicity |
+| INV-124 | 33-engine-data 3.18 | `LayerSlot::current_dtype`의 값은 해당 slot이 현재 노출하는 `weights` snapshot의 실제 tensor dtype과 항상 일치한다. Swap 과정에서 `current_dtype` 갱신과 `weights` snapshot 교체는 동일 논리 단계에서 수행된다. | Correctness | test | dtype consistency |
+| INV-125 | 33-engine-data 3.19, 3.20 | `TransformerWeights::secondary_mmap`이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop되지 않는다. Swap 도중 mmap unmap 금지. 모델 lifetime 동안 생존 보장. | Safety | test | mmap lifetime |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -256,13 +268,13 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
 | Safety | 17 | 22% |
-| Correctness | 55 | 71% |
+| Correctness | 57 | 72% |
 | Performance | 2 | 3% |
-| Compatibility | 3 | 4% |
-| **합계** | **77** | **100%** |
+| Compatibility | 3 | 3% |
+| **합계** | **79** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
-> INV-117~119는 v2.2.0 (QCF × DPP)에서 추가.
+> INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
 
 ### 5.2 검증 방법별 통계
 
