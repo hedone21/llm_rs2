@@ -178,12 +178,14 @@ pub(super) unsafe fn weighted_accum_f32_avx2(
     }
 }
 
+#[derive(Clone)]
 pub struct QkvBias {
     pub bq: Tensor,
     pub bk: Tensor,
     pub bv: Tensor,
 }
 
+#[derive(Clone)]
 pub struct TransformerLayer {
     // Attention
     pub wq: Tensor,

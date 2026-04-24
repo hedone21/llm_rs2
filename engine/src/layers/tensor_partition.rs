@@ -48,6 +48,7 @@ pub fn is_gpu_only_ratio(gpu_ratio: f32) -> bool {
 ///
 /// Each slice owns an independent buffer (pre-copied from the original weight).
 /// GPU slices have a valid `cl_mem` handle; CPU slices have valid host pointers.
+#[derive(Clone)]
 pub struct PartitionedWeight {
     pub gpu_slice: Tensor,
     pub cpu_slice: Tensor,
@@ -62,6 +63,7 @@ pub struct PartitionedWeight {
 /// FFN chain — gate → up → silu_mul → down — on its slice independently, and
 /// only the final `[hidden]` partial result needs to be summed with the GPU's
 /// partial at the very end of the layer (instead of merging after gate/up).
+#[derive(Clone)]
 pub struct PartitionContext {
     pub gpu_ratio: f32,
     pub cpu_backend: Arc<dyn Backend>,
