@@ -878,13 +878,18 @@ impl TransformerModel {
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
-        // Iterate layers. One `ArcSwap` snapshot load per layer (INV-123):
-        // the `layer_arc` local binding owns the full Arc for the duration of
-        // the forward call, so no further atomics touch the slot.
+        // Per-token weight snapshot (ENG-ALG-214-SNAP, INV-121).
+        // We acquire every decoder layer's `Arc<LayerWeights>` and dtype
+        // exactly once on token entry. Any `SwapExecutor::execute` that
+        // lands mid-forward is observed only on the next token, so this
+        // pass can never see a half-swapped state across layers. The
+        // snapshot vector owns the Arcs for the duration of the forward,
+        // keeping each layer's buffers alive until we drop at the end.
         let num_layers = self.layers.len();
-        for (i, slot) in self.layers.iter().enumerate() {
-            let layer_arc = slot.load_weights();
-            let layer = &*layer_arc;
+        let layer_snapshots: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+        for (i, layer_arc) in layer_snapshots.iter().enumerate() {
+            let layer = &**layer_arc;
             let rope_theta = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
                 self.config
                     .rope_local_theta
@@ -1055,15 +1060,23 @@ impl TransformerModel {
         #[cfg(not(feature = "opencl"))]
         let gpu_score_active = false;
 
-        // 2. Iterate layers. Each slot provides an `ArcSwap` snapshot which is
-        // cloned into a local `Arc<TransformerLayer>` once per layer (INV-123);
-        // all subsequent tensor accesses within this layer's forward are on the
-        // snapshot, so a concurrent `SwapExecutor::swap_weights` (Phase 2)
-        // never observes a half-swapped layer.
+        // 2. Per-token weight snapshot (ENG-ALG-214-SNAP, INV-121).
+        // The snapshot vector is materialised once at token entry so the
+        // whole layer loop sees a single consistent generation. A
+        // concurrent `SwapExecutor::execute` is observed only from the
+        // next token; mid-token swaps cannot introduce a layer-level dtype
+        // mix into the current pass (which is a distinct concept from the
+        // steady-state inter-token dtype mix allowed by INV-122). The
+        // snapshot also records `ratio_generation` so the plan path can
+        // detect stale plans without a second atomic load later.
         let num_layers = self.layers.len();
-        for (i, slot) in self.layers.iter().enumerate() {
-            let layer_arc = slot.load_weights();
-            let layer = &*layer_arc;
+        let layer_snapshots: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+        let _entry_ratio_generation: u64 = self
+            .ratio_generation
+            .load(std::sync::atomic::Ordering::Acquire);
+        for (i, layer_arc) in layer_snapshots.iter().enumerate() {
+            let layer = &**layer_arc;
             // GPU acc active -> GPU handles score collection internally in attention_gen.
             // CPU accumulator still needs need_scores=false to avoid redundant CPU path.
             let need_scores = if gpu_score_active {
@@ -2002,6 +2015,13 @@ impl TransformerModel {
         let depth = prefetch.depth();
         let caches_ptr = kv_caches.as_mut_ptr();
 
+        // Per-token weight snapshot (ENG-ALG-214-SNAP, INV-121). Offload
+        // path has its own layer loop, so it needs its own consistent
+        // snapshot set; the preload thread pool only touches KV caches
+        // (not weights) so this snapshot does not interact with it.
+        let layer_snapshots: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+
         // Lazy-init persistent thread pool (sized to max_depth for full concurrency).
         // Mutex is locked once per token — zero contention.
         let mut pool_guard = self.preload_pool.lock().unwrap();
@@ -2083,7 +2103,7 @@ impl TransformerModel {
             } else {
                 None
             };
-            let layer_arc = self.layers[i].load_weights();
+            let layer_arc = layer_snapshots[i].clone();
             layer_arc.forward(LayerForwardArgs {
                 x: &mut x,
                 kv_cache: current,
