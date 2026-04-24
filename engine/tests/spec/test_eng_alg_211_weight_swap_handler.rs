@@ -14,7 +14,7 @@
 //! Spec: ENG-ALG-211, ENG-ALG-212, INV-121/123, WSWAP-2-HANDLER.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use llm_rs2::backend::cpu::CpuBackend;
 use llm_rs2::buffer::shared_buffer::SharedBuffer;
