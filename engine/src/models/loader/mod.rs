@@ -12,6 +12,7 @@ pub mod gguf;
 pub mod safetensors;
 
 use anyhow::Result;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::core::backend::Backend;
@@ -21,6 +22,31 @@ use crate::core::tensor::Tensor;
 use crate::layers::transformer_layer::{QkvBias, TransformerLayer};
 use crate::models::config::ModelConfig;
 use crate::models::transformer::TransformerModel;
+
+/// Runtime weight-load configuration.
+///
+/// Phase 1 shape: primary file path + a discovered default dtype, plus an
+/// optional secondary GGUF path reserved for runtime dynamic swap
+/// (`SwapExecutor`, Phase 2). The secondary file is not consulted during
+/// initial forward — `TransformerWeights::secondary_mmap` merely keeps the
+/// mmap handle alive so Phase 2 can index into it in O(1) per tensor.
+///
+/// Spec: ENG-DAT-090.
+#[derive(Debug, Clone)]
+pub struct LoadConfig {
+    /// Path to the primary weight file (typically the higher-precision one,
+    /// e.g. F16 GGUF). The existing `--model-path` CLI flag binds here.
+    pub primary_source: PathBuf,
+    /// Dtype supplied by the primary file. Loader infers it from the GGUF
+    /// header; this becomes the initial `LayerSlot::current_dtype` for every
+    /// decoder layer.
+    pub default_dtype: DType,
+    /// Optional secondary weight file (typically a lower-precision dtype,
+    /// e.g. Q4_0 GGUF). `None` disables the swap path: initial loading is
+    /// identical to the legacy behaviour and `SwapWeights` actions are
+    /// no-ops. See ENG-DAT-C09.
+    pub secondary_source: Option<PathBuf>,
+}
 
 /// Internal standard tensor identifier (format-agnostic).
 #[derive(Debug, Clone, Copy)]
@@ -98,18 +124,28 @@ pub trait TensorSource {
 ///
 /// This function contains the layer-building loop and lm_head/embed logic
 /// previously in `TransformerModel::load_with_dtype()`.
+///
+/// `secondary_mmap` is the pre-validated handle to an optional secondary
+/// GGUF file (e.g. a Q4_0 companion for a primary F16 model). It is stored
+/// on the model for Phase 2 `SwapExecutor` consumption; initial loading
+/// always uses `source` (ENG-ALG-210).
 pub fn load_model(
     source: &dyn TensorSource,
     backend: Arc<dyn Backend>,
     memory: &dyn Memory,
+    secondary_mmap: Option<Arc<crate::models::weights::SecondaryMmap>>,
 ) -> Result<TransformerModel> {
+    use crate::models::weights::LayerSlot;
+
     let config = source.config();
     let weight_dtype = source.weight_dtype();
     let is_cpu = backend.name().contains("CPU");
     let num_layers = config.num_hidden_layers;
 
-    // 1. Load layers
-    let mut layers = Vec::with_capacity(num_layers);
+    // 1. Load layers as `LayerSlot`s. Each slot wraps the initial
+    //    `TransformerLayer` snapshot behind an `ArcSwap` so Phase 2 can swap
+    //    it atomically (ENG-DAT-092, INV-123).
+    let mut layers: Vec<LayerSlot> = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
         let load_weight = |kind: LayerWeightKind| -> Result<Tensor> {
             source.load_tensor(
@@ -221,7 +257,11 @@ pub fn load_model(
             post_ffn_norm,
             partition_ctx: None,
         };
-        layers.push(layer);
+        // ENG-ALG-210: every slot starts at `default_dtype` (== primary
+        // weight dtype). Secondary handle is cloned into the slot so the
+        // Phase 2 `SwapExecutor` can locate per-layer tensor bytes without
+        // touching the root container.
+        layers.push(LayerSlot::new(layer, weight_dtype, secondary_mmap.clone()));
     }
 
     // 2. Embed tokens (always CPU)
@@ -317,6 +357,8 @@ pub fn load_model(
     Ok(TransformerModel {
         config: model_config,
         layers,
+        secondary_mmap,
+        ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         embed_tokens,
         norm,
         lm_head,
