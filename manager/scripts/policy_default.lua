@@ -11,6 +11,12 @@
 -- POLICY_META.version을 변경할 때마다 changelog 주석도 갱신
 --
 -- Changelog:
+--   2.4.0 (2026-04-24): SwapWeights branch on memory pressure (WSWAP-3-LUA)
+--     - Emergency: KV eviction 이후 추가로 swap_weights 발동 (ratio=0.50, dtype=q4_0)
+--     - Critical + secondary 사용 가능: swap_weights (ratio=0.25)
+--     - Warning/Normal: swap_weights 생략 (KV eviction으로 충분)
+--     - Simple path (Phase 3 placeholder ratio): QCF 사전 질의 없이 고정 ratio
+--       고급 경로 (layer_swap.qcf_swap_at_ratio 기반 ratio 선택)은 Phase 4 TODO
 --   2.3.0 (2026-04-23): available_actions 필터 추가
 --     - ctx.available (엔진 capability) 에 없는 액션은 candidate 에서 제외
 --     - F16 KV cache 에서 kv_quant_dynamic 이 선택되어 엔진이 무시하는 false-pass 회귀 방지
@@ -33,7 +39,7 @@
 --   1.0.1 (2026-04-15): pressure_level 임계값 정렬
 --   1.0.0 (2026-04-15): initial production policy
 
-POLICY_META = { name = "llm_default", version = "2.3.0" }
+POLICY_META = { name = "llm_default", version = "2.4.0" }
 
 -- ── DPP 상수 (docs/46 §4) ──────────────────────────────────────────────────
 local DPP = {
@@ -142,9 +148,19 @@ local function build_cmd(action, level, cpu_pressure)
         cmd.device = "cpu"
     elseif action == "set_partition_ratio" then
         cmd.ratio = 0.5
+    elseif action == "swap_weights" then
+        -- ratio와 dtype은 호출부에서 직접 지정 (level-based 파라미터 없음)
+        -- placeholder: Phase 4에서 QCF 커브 기반으로 조정
+        cmd.ratio = 0.50
+        cmd.dtype = "q4_0"
     end
 
     return cmd
+end
+
+-- SwapWeights 명령 빌드 (ratio와 dtype을 명시적으로 전달)
+local function build_swap_cmd(ratio, dtype)
+    return { type = "swap_weights", ratio = ratio, dtype = dtype }
 end
 
 -- Z_k: multi-threshold excess virtual queue (§4.2)
@@ -318,6 +334,36 @@ function decide(ctx)
         end
         if not has_thr then
             table.insert(primary_cmds, build_cmd("throttle", lvl, cpu_p))
+        end
+    end
+
+    -- 9. SwapWeights Override (WSWAP-3-LUA, §3 weight swap integration)
+    -- Memory emergency/critical 시 KV eviction과 병행하여 weight swap 발동.
+    -- swap_weights가 available한 경우에만 (secondary mmap 존재 시 엔진이 보고).
+    -- Simple path (Phase 3 placeholder): QCF 사전 질의 없이 고정 ratio.
+    -- TODO(Phase 4): layer_swap.qcf_swap_at_ratio 커브 기반으로 ratio 동적 선택.
+    if is_available("swap_weights", avail) and not is_active("swap_weights", ctx.active) then
+        local mem_pv = p.memory or 0
+        local swap_cmd = nil
+
+        if mem_pv >= THETA.mem.emerg then
+            -- Emergency: ratio=0.50 — 절반의 레이어를 Q4_0으로 스왑
+            swap_cmd = build_swap_cmd(0.50, "q4_0")
+        elseif mem_pv >= THETA.mem.crit then
+            -- Critical: ratio=0.25 — 경량 스왑
+            swap_cmd = build_swap_cmd(0.25, "q4_0")
+        end
+        -- Warning/Normal: swap 생략 (KV eviction만으로 충분)
+
+        if swap_cmd ~= nil then
+            -- 중복 체크: primary_cmds에 이미 swap_weights가 없을 때만 추가
+            local has_swap = false
+            for _, cmd in ipairs(primary_cmds) do
+                if cmd.type == "swap_weights" then has_swap = true; break end
+            end
+            if not has_swap then
+                table.insert(primary_cmds, swap_cmd)
+            end
         end
     end
 
