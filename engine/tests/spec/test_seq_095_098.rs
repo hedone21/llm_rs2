@@ -62,6 +62,7 @@ fn test_seq_096_send_qcf_estimate_after_response() {
     estimates.insert("kv_evict_h2o".to_string(), 0.22);
     executor.send_qcf_estimate(QcfEstimate {
         estimates: estimates.clone(),
+        layer_swap: None,
     });
 
     // Message 2: QcfEstimate
@@ -87,6 +88,7 @@ fn test_seq_096_empty_qcf_estimate_when_cache_empty() {
 
     executor.send_qcf_estimate(QcfEstimate {
         estimates: HashMap::new(),
+        layer_swap: None,
     });
 
     let msg = rx.recv_timeout(Duration::from_millis(100)).unwrap();
@@ -145,7 +147,10 @@ fn test_seq_096_message_ordering_response_before_estimate() {
     // Send QcfEstimate (simulating generate.rs behavior after poll)
     let mut estimates = HashMap::new();
     estimates.insert("kv_evict_sliding".to_string(), 0.1);
-    executor.send_qcf_estimate(QcfEstimate { estimates });
+    executor.send_qcf_estimate(QcfEstimate {
+        estimates,
+        layer_swap: None,
+    });
 
     // Verify order: Response first, then QcfEstimate
     let msg1 = rx.recv_timeout(Duration::from_millis(100)).unwrap();

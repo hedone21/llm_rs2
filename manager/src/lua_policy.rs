@@ -1581,6 +1581,7 @@ fn engine_command_to_action_name(cmd: &EngineCommand) -> String {
         EngineCommand::SetPrefillPolicy { .. } => "set_prefill_policy",
         EngineCommand::RequestQcf => "request_qcf",
         EngineCommand::PrepareComputeUnit { .. } => "prepare_compute_unit",
+        EngineCommand::SwapWeights { .. } => "swap_weights",
     }
     .to_string()
 }
@@ -3254,6 +3255,7 @@ mod tests {
             estimates: [("kv_evict_sliding".to_string(), 0.3f32)]
                 .into_iter()
                 .collect(),
+            layer_swap: None,
         };
         let result = policy.complete_qcf_selection(&qcf);
         assert!(result.is_none(), "pending 없으면 None을 반환해야 한다");
@@ -3332,6 +3334,7 @@ mod tests {
             estimates: [("kv_evict_sliding".to_string(), 0.25f32)]
                 .into_iter()
                 .collect(),
+            layer_swap: None,
         };
         let d2 = policy
             .complete_qcf_selection(&qcf)

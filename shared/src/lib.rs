@@ -381,6 +381,35 @@ pub struct CommandResponse {
     pub results: Vec<CommandResult>,
 }
 
+/// Per-layer swap cost information shipped inside `LayerSwapEstimate`.
+///
+/// `layer_idx` is the decoder layer index.  `from_dtype` and `to_dtype` use
+/// `DtypeTag` so the wire format is stable independent of engine-internal
+/// `DType` changes (MSG-089).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LayerSwapEntry {
+    pub layer_idx: u32,
+    pub from_dtype: DtypeTag,
+    pub to_dtype: DtypeTag,
+}
+
+/// Weight-swap QCF estimate included in `QcfEstimate` (MSG-088 extension).
+///
+/// Present when Engine has a secondary mmap open.  `None` when secondary is
+/// absent or the on-demand measurement failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LayerSwapEstimate {
+    /// Length = num_decoder_layers.  Missing entries default to 0.0.
+    pub per_layer_importance: Vec<f32>,
+    /// Length = num_decoder_layers.  Computation-failed layers are `None`
+    /// (JSON null per MSG-088 spec).  Use `Option<f32>` so serde can
+    /// round-trip through JSON null without loss.
+    pub per_layer_noise: Vec<Option<f32>>,
+    /// Pre-computed QCF_swap(ENG-ALG-217) at representative swap ratios.
+    /// Engine provides at minimum keys `"0.25"`, `"0.5"`, `"1.0"`.
+    pub qcf_swap_at_ratio: HashMap<String, f32>,
+}
+
 /// QCF cost estimates from Engine (MSG-085).
 /// Sent as a separate EngineMessage after CommandResponse for RequestQcf.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,6 +418,29 @@ pub struct QcfEstimate {
     /// Keys: action identifier (e.g., "kv_evict_h2o"). Values: QCF cost >= 0.0 (MSG-087).
     /// Only actions the Engine can currently compute are included (MSG-086).
     pub estimates: HashMap<String, f32>,
+    /// Weight-swap layer estimate (MSG-088 Phase 3 extension).
+    ///
+    /// `None` when secondary mmap is absent or measurement failed.
+    /// Old Managers that pre-date Phase 3 will ignore this field (INV-028).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layer_swap: Option<LayerSwapEstimate>,
+}
+
+/// Payload of `EngineMessage::WeightSwapReport` (MSG-089).
+///
+/// Sent after `CommandResponse` for a successful `SwapWeights` command.
+/// Rejected swaps do not produce a report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WeightSwapReport {
+    /// Decoder layers that were atomically replaced.  Empty when no swap was
+    /// needed (idempotent — already at target dtype).
+    pub layers_swapped: Vec<LayerSwapEntry>,
+    /// Bytes reclaimed via `madvise(DONTNEED)` on replaced primary pages.
+    pub freed_bytes: u64,
+    /// Wall-clock latency of the full swap batch in milliseconds.
+    pub latency_ms: u64,
+    /// QCF_swap value for the executed swap set (ENG-ALG-217), in `[0, 1]`.
+    pub qcf_swap_actual: f32,
 }
 
 /// Top-level message from Engine to Manager.
@@ -399,6 +451,8 @@ pub enum EngineMessage {
     Heartbeat(EngineStatus),
     Response(CommandResponse),
     QcfEstimate(QcfEstimate),
+    /// Weight swap completion report (MSG-089, Weight Swap Phase 3).
+    WeightSwapReport(WeightSwapReport),
 }
 
 #[cfg(test)]
@@ -936,11 +990,96 @@ mod tests {
                 m.insert("kv_evict_h2o".to_string(), 0.1);
                 m
             },
+            layer_swap: None,
         });
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"type\":\"qcf_estimate\""));
+        // layer_swap=None must not be serialized (skip_serializing_if)
+        assert!(!json.contains("layer_swap"));
         let back: EngineMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, EngineMessage::QcfEstimate(_)));
+    }
+
+    #[test]
+    fn test_qcf_estimate_layer_swap_optional_backward_compat() {
+        // Old JSON without layer_swap must still deserialize (forward compat).
+        let old_json = r#"{"estimates":{"kv_evict_h2o":0.12}}"#;
+        let back: QcfEstimate = serde_json::from_str(old_json).unwrap();
+        assert!(back.layer_swap.is_none());
+        assert!((back.estimates["kv_evict_h2o"] - 0.12).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn test_qcf_estimate_layer_swap_roundtrip() {
+        let est = QcfEstimate {
+            estimates: {
+                let mut m = HashMap::new();
+                m.insert("kv_evict_h2o".to_string(), 0.12);
+                m
+            },
+            layer_swap: Some(LayerSwapEstimate {
+                per_layer_importance: vec![0.8, 0.5],
+                // None = computation failed for that layer (maps to JSON null)
+                per_layer_noise: vec![Some(0.01), None],
+                qcf_swap_at_ratio: {
+                    let mut m = HashMap::new();
+                    m.insert("0.25".to_string(), 0.08);
+                    m.insert("0.5".to_string(), 0.21);
+                    m.insert("1.0".to_string(), 1.0);
+                    m
+                },
+            }),
+        };
+        let json = serde_json::to_string(&est).unwrap();
+        assert!(json.contains("layer_swap"));
+        assert!(json.contains("per_layer_importance"));
+        // Failed layer serializes as JSON null, must round-trip cleanly
+        assert!(json.contains("null"));
+        let back: QcfEstimate = serde_json::from_str(&json).unwrap();
+        let ls = back.layer_swap.unwrap();
+        assert_eq!(ls.per_layer_importance.len(), 2);
+        assert!((ls.per_layer_importance[0] - 0.8).abs() < f32::EPSILON);
+        assert_eq!(ls.per_layer_noise[0], Some(0.01));
+        assert_eq!(ls.per_layer_noise[1], None);
+    }
+
+    #[test]
+    fn test_engine_message_weight_swap_report_serde() {
+        let report = WeightSwapReport {
+            layers_swapped: vec![
+                LayerSwapEntry {
+                    layer_idx: 2,
+                    from_dtype: DtypeTag::F16,
+                    to_dtype: DtypeTag::Q4_0,
+                },
+                LayerSwapEntry {
+                    layer_idx: 5,
+                    from_dtype: DtypeTag::F16,
+                    to_dtype: DtypeTag::Q4_0,
+                },
+            ],
+            freed_bytes: 31_457_280,
+            latency_ms: 48,
+            qcf_swap_actual: 0.17,
+        };
+        let msg = EngineMessage::WeightSwapReport(report);
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains("\"type\":\"weight_swap_report\""));
+        assert!(json.contains("\"freed_bytes\":31457280"));
+        assert!(json.contains("\"latency_ms\":48"));
+        assert!(json.contains("\"from_dtype\":\"f16\""));
+        assert!(json.contains("\"to_dtype\":\"q4_0\""));
+        let back: EngineMessage = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineMessage::WeightSwapReport(r) => {
+                assert_eq!(r.layers_swapped.len(), 2);
+                assert_eq!(r.layers_swapped[0].layer_idx, 2);
+                assert_eq!(r.freed_bytes, 31_457_280);
+                assert_eq!(r.latency_ms, 48);
+                assert!((r.qcf_swap_actual - 0.17).abs() < 1e-5);
+            }
+            _ => panic!("Expected WeightSwapReport"),
+        }
     }
 
     #[test]

@@ -237,6 +237,7 @@ fn test_directive_triggers_observation_due_schedule() {
 }
 
 /// 8. Evict directive 수신 시 engine state가 갱신된다.
+///
 /// KvEvict*는 one-shot 액션이므로 active_actions에 등록되지 않는다.
 /// 대신 last_evict_ratio가 갱신되고 directive 기록이 남는다.
 #[test]

@@ -588,6 +588,14 @@ fn recv_response_skip_heartbeats(
             Some(EngineMessage::Capability(_)) => {
                 println!("[MockManager] (unexpected Capability after handshake, skipping)");
             }
+            Some(EngineMessage::WeightSwapReport(r)) => {
+                println!(
+                    "[MockManager] (skipping WeightSwapReport while waiting for Response: \
+                     {} layers, freed={}B)",
+                    r.layers_swapped.len(),
+                    r.freed_bytes,
+                );
+            }
             None => {
                 // read timeout / would-block, retry
                 std::thread::sleep(Duration::from_millis(10));
@@ -621,6 +629,14 @@ fn recv_qcf_skip_heartbeats(
             }
             Some(EngineMessage::Capability(_)) => {
                 println!("[MockManager] (unexpected Capability after handshake, skipping)");
+            }
+            Some(EngineMessage::WeightSwapReport(r)) => {
+                println!(
+                    "[MockManager] (skipping WeightSwapReport while waiting for QcfEstimate: \
+                     {} layers, freed={}B)",
+                    r.layers_swapped.len(),
+                    r.freed_bytes,
+                );
             }
             None => {
                 std::thread::sleep(Duration::from_millis(10));
@@ -1656,7 +1672,10 @@ mod tests {
         estimates.insert("kv_evict_h2o".to_string(), 0.15f32);
         engine_send(
             &mut client,
-            &EngineMessage::QcfEstimate(llm_shared::QcfEstimate { estimates }),
+            &EngineMessage::QcfEstimate(llm_shared::QcfEstimate {
+                estimates,
+                layer_swap: None,
+            }),
         );
 
         let qcf = recv_qcf_skip_heartbeats(&mut server, Duration::from_secs(2))

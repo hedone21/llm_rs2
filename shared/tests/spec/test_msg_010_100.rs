@@ -95,6 +95,7 @@ fn test_msg_011_engine_message_serde_variants() {
             m.insert("kv_evict_h2o".to_string(), 0.1);
             m
         },
+        layer_swap: None,
     });
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"type\":\"qcf_estimate\""));
@@ -458,7 +459,10 @@ fn test_msg_085_qcf_estimate_serde_roundtrip() {
     estimates.insert("kv_evict_sliding".to_string(), 0.18f32);
     estimates.insert("layer_skip".to_string(), 0.35f32);
 
-    let qcf = QcfEstimate { estimates };
+    let qcf = QcfEstimate {
+        estimates,
+        layer_swap: None,
+    };
     let msg = EngineMessage::QcfEstimate(qcf);
     let json = serde_json::to_string(&msg).unwrap();
     assert!(json.contains("\"type\":\"qcf_estimate\""));
@@ -482,6 +486,7 @@ fn test_msg_086_qcf_estimate_empty_estimates() {
     use std::collections::HashMap;
     let qcf = QcfEstimate {
         estimates: HashMap::new(),
+        layer_swap: None,
     };
     let msg = EngineMessage::QcfEstimate(qcf);
     let json = serde_json::to_string(&msg).unwrap();
@@ -502,9 +507,12 @@ fn test_msg_087_qcf_values_non_negative() {
     estimates.insert("kv_evict_h2o".to_string(), 0.0f32);
     estimates.insert("layer_skip".to_string(), 1.5f32);
 
-    let qcf = QcfEstimate { estimates };
+    let qcf = QcfEstimate {
+        estimates,
+        layer_swap: None,
+    };
     // 모든 값 검증
-    for (_, &v) in &qcf.estimates {
-        assert!(v >= 0.0, "QCF value must be >= 0.0, got {}", v);
+    for v in qcf.estimates.values() {
+        assert!(*v >= 0.0, "QCF value must be >= 0.0, got {}", v);
     }
 }

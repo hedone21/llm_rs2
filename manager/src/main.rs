@@ -256,6 +256,15 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                 }
+                EngineMessage::WeightSwapReport(report) => {
+                    // Phase 3 Stage B will route this to the policy / LinUCB.
+                    log::info!(
+                        "Engine WeightSwapReport: {} layers swapped, freed={}B, qcf={:.3}",
+                        report.layers_swapped.len(),
+                        report.freed_bytes,
+                        report.qcf_swap_actual,
+                    );
+                }
             }
         }
 

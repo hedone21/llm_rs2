@@ -56,6 +56,10 @@ pub struct ExecutionPlan {
     pub prefill_chunk_size: Option<usize>,
     pub prefill_yield_ms: Option<u32>,
     pub prefill_cpu_chunk_size: Option<usize>,
+    /// Weight swap request from a SwapWeights command (ENG-ALG-214-ROUTE).
+    /// `Some((ratio, target_dtype))` means generate.rs should call
+    /// `WeightSwapDecider` + `SwapExecutor`.  `None` = no pending swap.
+    pub swap_weights: Option<(f32, llm_shared::DtypeTag)>,
 }
 
 /// Eviction method identifier (engine-internal, not in shared protocol).
@@ -505,6 +509,15 @@ impl CommandExecutor {
                 if let Some(v) = cpu_chunk_size {
                     plan.prefill_cpu_chunk_size = Some(*v);
                 }
+                CommandResult::Ok
+            }
+            // SwapWeights is dispatched directly in generate.rs (ENG-ALG-214-ROUTE).
+            // The executor records the pending request so generate.rs can pick it up.
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                plan.swap_weights = Some((*ratio, *target_dtype));
                 CommandResult::Ok
             }
         }
@@ -1442,7 +1455,10 @@ mod tests {
         let mut estimates = std::collections::HashMap::new();
         estimates.insert("kv_evict_sliding".to_string(), 0.5);
         estimates.insert("kv_evict_h2o".to_string(), 0.1);
-        executor.send_qcf_estimate(QcfEstimate { estimates });
+        executor.send_qcf_estimate(QcfEstimate {
+            estimates,
+            layer_swap: None,
+        });
 
         let msg = rx.try_recv().unwrap();
         match msg {

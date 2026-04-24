@@ -4480,7 +4480,10 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
-                    executor.send_qcf_estimate(llm_shared::QcfEstimate { estimates });
+                    executor.send_qcf_estimate(llm_shared::QcfEstimate {
+                        estimates,
+                        layer_swap: None,
+                    });
                 }
 
                 if let Some(evict) = &plan.evict {
@@ -5826,6 +5829,12 @@ fn command_summary(cmd: &EngineCommand) -> String {
             "SetPrefillPolicy(chunk={:?}, yield={:?}, cpu_chunk={:?})",
             chunk_size, yield_ms, cpu_chunk_size
         ),
+        EngineCommand::SwapWeights {
+            ratio,
+            target_dtype,
+        } => {
+            format!("SwapWeights(ratio={:.2}, dtype={:?})", ratio, target_dtype)
+        }
     }
 }
 
@@ -6670,7 +6679,10 @@ fn run_kivi(
                     kivi_caches: Some(&kv_caches),
                 };
                 let estimates = compute_qcf_estimates(&ctx);
-                executor.send_qcf_estimate(llm_shared::QcfEstimate { estimates });
+                executor.send_qcf_estimate(llm_shared::QcfEstimate {
+                    estimates,
+                    layer_swap: None,
+                });
             }
 
             // kv_quant_bits: transition KiviCache bit-width

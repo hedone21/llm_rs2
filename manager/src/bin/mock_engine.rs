@@ -290,6 +290,17 @@ impl EngineState_ {
                 println!("  → KvOffload(ratio={})", ratio);
                 CommandResult::Ok
             }
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                // Mock engine: acknowledge but do not actually swap weights.
+                println!(
+                    "  → SwapWeights(ratio={:.2}, dtype={:?})",
+                    ratio, target_dtype
+                );
+                CommandResult::Ok
+            }
         }
     }
 
@@ -491,7 +502,10 @@ fn handle_directive(
         estimates.insert("kv_merge_d2o".to_string(), 0.08);
         estimates.insert("kv_quant_dynamic".to_string(), 0.15);
         estimates.insert("layer_skip".to_string(), 0.20);
-        let qcf = QcfEstimate { estimates };
+        let qcf = QcfEstimate {
+            estimates,
+            layer_swap: None,
+        };
         if let Err(e) = send_message(stream, &EngineMessage::QcfEstimate(qcf)) {
             eprintln!(
                 "[MockEngine] Failed to send QcfEstimate for seq={}: {}",
