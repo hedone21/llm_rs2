@@ -84,6 +84,17 @@ mod test_inv_124_slot_dtype_consistency;
 #[path = "spec/test_inv_125_secondary_mmap_lifetime.rs"]
 mod test_inv_125_secondary_mmap_lifetime;
 
+// ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
+// Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
+#[path = "spec/test_inv_126_dtype_reserved.rs"]
+mod test_inv_126_dtype_reserved;
+#[path = "spec/test_inv_127_nan_epsilon.rs"]
+mod test_inv_127_nan_epsilon;
+#[path = "spec/test_inv_128_collector_leak_guard.rs"]
+mod test_inv_128_collector_leak_guard;
+#[path = "spec/test_wswap_e2e_phase3.rs"]
+mod test_wswap_e2e_phase3;
+
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;
