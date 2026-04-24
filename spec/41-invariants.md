@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap 5개, 2026-04-24) = 총 106개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) = 총 109개.
 
 ## 1. Purpose and Scope
 
@@ -227,9 +227,13 @@
 |----|------|----------|---------|------|------|
 | INV-120 | arch/plan_partition_integration.md A.6.2 | FullKernelPlan이 PartitionStep을 포함할 때, 각 PartitionStep::run 진입 시 PartitionPlanContext.ratio_generation_at_build와 PartitionContext.ratio_generation을 비교한다. mismatch면 PlanInvalidated를 반환하며 caller는 plan을 재빌드하거나 forward_gen으로 fallback해야 한다. | Safety/Correctness | runtime | AtomicU64 generation 비교 |
 
-### 3.13 Weight Swap Invariants [INV-121 ~ INV-125]
+### 3.13 Weight Swap Invariants [INV-121 ~ INV-128]
 
-2026-04-24 Dynamic Weight Swap (Manager 신호 기반 런타임 교체)의 불변식. 이전 Phase A 정적 노선은 **폐기**되었으며 `ENG-DAT-091` ID는 재사용 금지. 대응 명세: `32-engine-algorithms.md` 3.12 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `33-engine-data.md` 3.17~3.20 (ENG-DAT-090/092/093/094), `arch/weight_swap.md`.
+2026-04-24 Dynamic Weight Swap (Manager 신호 기반 런타임 교체)의 불변식. 이전 Phase A 정적 노선은 **폐기**되었으며 `ENG-DAT-091` ID는 재사용 금지.
+
+- **Phase 1/2 (Engine 내부 인프라)**: INV-121~125. 대응 명세: `32-engine-algorithms.md` 3.12.1~3.12.7 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `33-engine-data.md` 3.17~3.20 (ENG-DAT-090/092/093/094).
+- **Phase 3 (Manager 통합)**: INV-126~128. 대응 명세: `32-engine-algorithms.md` 3.12.8~3.12.12 (ENG-ALG-214-ROUTE, ENG-ALG-215~218), `33-engine-data.md` 3.21 (ENG-DAT-095).
+- **Arch**: `arch/weight_swap.md` v4 (Phase 3 Manager 통합 반영).
 
 **교차 참조**:
 - **INV-120** (Plan × Partition stale): `TransformerModel::ratio_generation`은 INV-120의 감지 키와 동일 소스이다. `SwapExecutor`가 batch 완료 후 정확히 1회 bump하여 plan invalidation을 일으킨다 (ENG-ALG-211 step (e)).
@@ -243,6 +247,9 @@
 | INV-123 | 32-engine-algorithms 3.12.2 | Swap 단위는 `LayerSlot.weights.store()` 호출 1회이며 단일 원자 단계로 완결된다. 토큰 경계 밖(= forward가 snapshot을 재획득하지 않는 구간)에 발생한 swap은 **다음 토큰부터** 관측된다. Partial state(반만 교체된 snapshot 등)는 외부에 절대 노출되지 않는다. | Safety/Correctness | test | lock-free atomicity + per-token snapshot 경계 |
 | INV-124 | 33-engine-data 3.18 | `LayerSlot::current_dtype`의 값은 해당 slot이 현재 노출하는 `weights` snapshot의 실제 tensor dtype과 항상 일치한다. Swap 과정에서 `current_dtype` 갱신과 `weights` snapshot 교체는 동일 논리 단계에서 수행된다. | Correctness | test | dtype consistency |
 | INV-125 | 33-engine-data 3.19, 3.20 | `TransformerModel.secondary_mmap`(구 `TransformerWeights::secondary_mmap`)이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop되지 않는다. Swap 도중 mmap unmap 금지. 모델 lifetime 동안 생존 보장. | Safety | test | mmap lifetime. 보관 위치는 flat 배치(ENG-DAT-093)의 `TransformerModel` 필드. |
+| INV-126 | 32-engine-algorithms 3.12.8 (ENG-ALG-214-ROUTE), MSG-082 | `EngineCommand::SwapWeights.target_dtype`에 `DtypeTag::Q4_0` 이외의 variant가 들어오면 `SwapExecutor`까지 도달하지 않고 `CommandResult::Rejected { reason: "UnsupportedDtype" }`로 처리된다. Phase 3 범위 밖 dtype은 payload 호환성 확보용 reserved variant이며, 실행 경로는 panic 없이 명시적 reject만 수행한다. | Safety/Correctness | test | reserved dtype rejection. `F16`/`F32`/`Q8_0` variant 주입 시 Rejected 응답 확인. |
+| INV-127 | 32-engine-algorithms 3.12.9, 3.12.10, 33-engine-data 3.21 | `QuantNoiseTable::epsilon(i).is_none()`인 layer(=계산 실패로 NaN이 저장된 layer)는 `WeightSwapDecider`에서 swap 후보로 선택되지 않는다. `QuantNoiseTable` 자체가 없으면 `SwapWeights` 경로는 INV-126과 상호 배타적으로 더 앞단(NoSecondary reject)에서 막힌다. | Correctness | test | NaN layer exclusion. per_layer[i] = NaN 주입 → decider 출력에 i 미포함 확인. |
+| INV-128 | 32-engine-algorithms 3.12.12 (ENG-ALG-218) | `ImportanceCollector`가 `Armed` 또는 `Collecting` 상태로 prefill이 진행되었다면, 해당 prefill 종료 시 반드시 `EngineMessage::QcfEstimate`(MSG-084 확장)가 1회 송출되고 collector 상태는 `Idle`로 복귀한다. armed 상태 누수 금지. | Correctness | test | collector leak 검출. RequestQcf → prefill → QcfEstimate 송출 시퀀스의 완결성. |
 
 ## 4. Alternative Behavior
 

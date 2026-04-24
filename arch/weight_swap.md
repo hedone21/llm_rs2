@@ -1,9 +1,11 @@
 # Weight Swap — Dynamic Runtime Swap Architecture
 
-> **상태**: Draft v3 (2026-04-24, Phase 1 구현 반영)
+> **상태**: Draft v4 (2026-04-24, Phase 3 Manager 통합 반영)
 > **작성**: 2026-04-24
-> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, prefill-tail 측정, Arc snapshot 기반 lock-free 교체.
-> **대상 스펙**: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `spec/41-invariants.md` §3.13 (INV-121~125).
+> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택.
+> **대상 스펙**:
+>   - Phase 1/2: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12.1~3.12.7 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `spec/41-invariants.md` §3.13 (INV-121~125).
+>   - Phase 3: `spec/33-engine-data.md` §3.21 (ENG-DAT-095), `spec/32-engine-algorithms.md` §3.12.8~3.12.12 (ENG-ALG-214-ROUTE, ENG-ALG-215~218), `spec/41-invariants.md` §3.13 (INV-126~128), `spec/11-protocol-messages.md` (MSG-042, 082, 088, 089).
 > **대상 모델**: Llama 3.2 1B (16 decoder layers, no tying), Qwen 2.5 1.5B (28 decoder layers, tying 가능).
 > **전제**: GGUF primary + GGUF secondary (dtype 다름). Safetensors는 부차 지원.
 
@@ -470,21 +472,55 @@ flowchart TD
 
 ---
 
-### 2.8 컴포넌트: `ResilienceAction::SwapWeights` (shared crate)
+### 2.8 컴포넌트: `ResilienceAction::SwapWeights` (engine 내부) vs `EngineCommand::SwapWeights` (shared)
+
+**중요 정정 (2026-04-24 v4)**: 이전 arch 초안은 `ResilienceAction`을 shared crate의 enum으로 서술했으나, 실구조는 **engine 내부 enum**이다 (`engine/src/resilience/strategy/mod.rs`). Phase 3에서 Manager 통합은 **shared의 `EngineCommand` enum에 variant를 추가**하는 별개 경로로 수행된다.
+
+**두 경로의 구분**:
+
+| 타입 | 위치 | 역할 | Phase 3 처리 |
+|------|------|------|-------------|
+| `ResilienceAction::SwapWeights { target_ratio }` | `engine/src/resilience/strategy/mod.rs` (내부 enum) | Engine 내부 `MemoryStrategy::react()`가 Manager 없이 생성하는 fallback action | **Phase 3 신규 variant로 추가 권장** (Phase 2 범위에선 미추가). dispatch는 최종적으로 Phase 3의 공통 helper로 귀결. shared 프로토콜과 무관. |
+| `EngineCommand::SwapWeights { ratio, target_dtype }` | `shared/src/lib.rs` (프로토콜 enum) | Manager → Engine IPC payload | **MSG-042로 정의**. shared crate에 필수 추가. |
 
 **설계 결정**:
-- **shared crate의 `ResilienceAction` enum에 variant 추가**: `SwapWeights { ratio: f32 }`. ratio는 `[0.0, 1.0]` clamp.
-- **MemoryStrategy 기본 매핑**: `MemoryPressure::Critical → SwapWeights { ratio: 0.5 }`, `Emergency → SwapWeights { ratio: 1.0 }`를 정책 기본값으로 제안. 실제 값은 Manager의 LuaPolicy에서 조정 가능.
-- **프로토콜 호환성**: `#[serde(default)]` 필드 추가 원칙(INV-028) 준수. 기존 verify 하네스는 variant 미인지 시 무시.
 
-**인터페이스**:
+- **ENG-ALG-214-ROUTE**: `generate.rs` dispatch 루프에 단일 `handle_swap_weights(ratio, target_dtype)` 함수를 추가한다. 두 진입점(shared `EngineCommand` / engine internal `ResilienceAction`)이 이 함수를 공유한다.
+- **MemoryStrategy 기본 매핑 (engine-internal fallback)**:
+  - `MemoryPressure::Critical → ResilienceAction::SwapWeights { target_ratio: 0.5, target_dtype: Q4_0 }`
+  - `MemoryPressure::Emergency → ResilienceAction::SwapWeights { target_ratio: 1.0, target_dtype: Q4_0 }`
+  - 이는 **Manager가 응답 지연 시**의 engine-independent fallback용이다. Manager가 활성화되면 Manager의 LuaPolicy 결정이 우선한다 (더 최신 signal).
+- **프로토콜 호환성**: shared 쪽 신규 필드는 `#[serde(default, skip_serializing_if = "Option::is_none")]` 원칙(INV-028) 준수. 구 Manager는 `layer_swap`/`weight_swap_report`를 모르는 상태로도 동작 가능.
+
+**인터페이스 (shared, MSG-042/082/089)**:
 ```rust
-// shared/src/resilience.rs (또는 기존 파일)
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
+// shared/src/lib.rs
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DtypeTag {
+    Q4_0,
+    F16,
+    F32,
+    Q8_0,
+}
+
+pub enum EngineCommand {
+    // ... 기존 14 variant ...
+    SwapWeights { ratio: f32, target_dtype: DtypeTag },
+}
+
+pub enum EngineMessage {
+    // ... 기존 4 variant ...
+    WeightSwapReport(WeightSwapReport),
+}
+```
+
+**인터페이스 (engine 내부, Phase 3 권장 신규)**:
+```rust
+// engine/src/resilience/strategy/mod.rs
 pub enum ResilienceAction {
     // ... 기존 variant ...
-    SwapWeights { ratio: f32 },   // [0.0, 1.0]
+    SwapWeights { target_ratio: f32, target_dtype: DtypeTag },  // DtypeTag는 shared에서 re-export
 }
 ```
 
@@ -548,8 +584,293 @@ pub enum ResilienceAction {
 
 ---
 
+## 3. Phase 3 Manager 통합 (2026-04-24)
+
+Phase 3은 Phase 1/2에서 구축한 Engine 내부 인프라에 Manager 경로를 연결한다. 핵심 결정:
+
+1. **라우팅 (ENG-ALG-214-ROUTE)**: `EngineCommand::SwapWeights`는 `generate.rs`의 command dispatch 루프에서 **직접** 수신. Pipeline 자동 dispatch는 사용하지 않는다.
+2. **Manager = 상한, Engine = 선택**: Manager가 `ratio` 상한만 지정하고 Engine의 `WeightSwapDecider`(ENG-ALG-215)가 실제 layer 집합을 결정.
+3. **Payload**: `{ ratio, target_dtype: DtypeTag }`. Q4_0만 Phase 3 유효, 나머지는 reserved.
+4. **QCF on-demand (ENG-ALG-218)**: `RequestQcf` → 다음 prefill에 `ImportanceCollector` 주입 → finalize → `QcfEstimate.layer_swap` 응답.
+5. **ε eager 측정 (ENG-ALG-216, ENG-DAT-095)**: engine init에서 `QuantNoiseTable` 1회 계산, 이후 Decider의 독립 입력.
+
+### 3.1 End-to-End 시퀀스
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MLUA as Manager LuaPolicy
+    participant MIPC as Manager IPC
+    participant EIPC as Engine Dispatch<br/>(generate.rs)
+    participant IC as ImportanceCollector
+    participant Fwd as Forward Loop
+    participant DEC as WeightSwapDecider<br/>(ENG-ALG-215)
+    participant EXE as SwapExecutor<br/>(ENG-ALG-211)
+    participant QNT as QuantNoiseTable<br/>(ENG-DAT-095)
+    participant Model as TransformerModel
+
+    Note over MLUA,Model: 단계 A — 측정 요청
+    MLUA->>MIPC: Directive{RequestQcf}
+    MIPC->>EIPC: EngineCommand::RequestQcf
+    EIPC->>IC: collector_flag = Armed
+    EIPC-->>MIPC: CommandResponse{Ok}
+
+    Note over Fwd,IC: 단계 B — 다음 prefill에 수집
+    Fwd->>IC: prefill_start: active = true
+    loop per layer during prefill
+        Fwd->>IC: snapshot_before + record_after
+    end
+    Fwd->>IC: prefill_end: finalize → ImportanceTable
+
+    Note over EIPC,MIPC: 단계 C — QcfEstimate 송출
+    EIPC->>QNT: read ε_i
+    EIPC->>EIPC: compute_qcf_swap at 0.25/0.5/1.0 (ENG-ALG-217)
+    EIPC->>MIPC: EngineMessage::QcfEstimate<br/>{estimates, layer_swap: Some(...)}
+    MIPC-->>MLUA: ctx.qcf.layer_swap
+
+    Note over MLUA: 단계 D — Manager 정책 결정
+    MLUA->>MLUA: decide ratio_max<br/>(e.g. 0.5 for Critical)
+    MLUA->>MIPC: Directive{SwapWeights{ratio=0.5, target_dtype=q4_0}}
+    MIPC->>EIPC: EngineCommand::SwapWeights
+
+    Note over EIPC,Model: 단계 E — Engine 자율 layer 선택 + 실행
+    EIPC->>DEC: decide(ratio_max, ImportanceTable, QuantNoiseTable, already_swapped)
+    DEC->>DEC: key = importance × ε, ascending bottom-k,<br/>protect [0, last], exclude NaN
+    DEC-->>EIPC: layer_set = [2, 5, 9, 11, ...]
+    EIPC->>EXE: execute_swap(layer_set, Q4_0)
+    EXE->>Model: per-layer ArcSwap::store + madvise
+    EXE->>Model: ratio_generation.fetch_add(1)  ★ batch 1회
+    EXE-->>EIPC: SwapReport{layers, freed_bytes, latency_ms}
+
+    Note over EIPC,MIPC: 단계 F — 응답 2개
+    EIPC-->>MIPC: CommandResponse{Ok}
+    EIPC->>EIPC: compute_qcf_swap(layer_set) (ENG-ALG-217)
+    EIPC->>MIPC: EngineMessage::WeightSwapReport<br/>{..., qcf_swap_actual}
+    MIPC-->>MLUA: ctx.engine.last_swap
+```
+
+### 3.2 Command Dispatch 구조
+
+```mermaid
+flowchart TB
+    CMD[EngineCommand arrives in generate.rs] --> MATCH{match variant}
+
+    MATCH -->|KvEvictH2o / Sliding / Streaming / D2o| KVEVICT[EvictPlan → evict]
+    MATCH -->|KvQuantDynamic| KVQ[quantize path]
+    MATCH -->|KvOffload| KVOFF[prune_prefix]
+    MATCH -->|SetPartitionRatio| PART[prepare_tensor_partition]
+    MATCH -->|RequestQcf| QCF[arm ImportanceCollector<br/>next prefill]
+    MATCH -->|SwapWeights| SWAP
+
+    SWAP[SwapWeights dispatch] --> CHK1{secondary_mmap<br/>= Some?}
+    CHK1 -- No --> REJ1[Rejected NoSecondary]
+    CHK1 -- Yes --> CHK2{target_dtype<br/>= Q4_0?}
+    CHK2 -- No --> REJ2[Rejected UnsupportedDtype]
+    CHK2 -- Yes --> CHK3{ratio ∈ 0.0, 1.0?}
+    CHK3 -- No --> REJ3[Rejected InvalidRatio]
+    CHK3 -- Yes --> DECIDE[WeightSwapDecider::decide]
+
+    DECIDE --> EMPTY{layer_set<br/>empty?}
+    EMPTY -- Yes --> OKEMPTY[Ok + empty report]
+    EMPTY -- No --> EXEC[SwapExecutor::execute_swap]
+    EXEC --> REPORT[CommandResponse Ok<br/>+ WeightSwapReport]
+
+    style SWAP fill:#fff3e0
+    style REJ1 fill:#ffcdd2
+    style REJ2 fill:#ffcdd2
+    style REJ3 fill:#ffcdd2
+```
+
+### 3.3 Routing 결정 — Pipeline vs Direct dispatch
+
+| 관점 | Pipeline 경로 (기각) | Direct dispatch (채택) |
+|------|---------------------|------------------------|
+| Trigger | PressureLevel 자동 (Warning 이상) | Manager 명시적 EngineCommand |
+| 기존 유사 패턴 | `EvictionHandler`, `D2OHandler` (KV) | `KvEvictH2o`, `SetPartitionRatio` 등 모든 Manager command |
+| Ratio 결정 | Engine 내부 (PressureLevel → ratio 매핑) | Manager LuaPolicy |
+| Test 표면적 | Pipeline + handler + context | Dispatch test + decider unit test + executor integration |
+| Stage 2 `weight_swap_handler.rs` | 등록 대상 | 내부 오케스트레이터로 유지 (재사용 모듈) |
+
+Stage 2 `weight_swap_handler.rs`는 `CachePressurePipeline`에 **등록하지 않는다**. 대신 "Decider → Executor" 호출을 캡슐화하는 내부 모듈로 격하한다. 이 경우 Stage 2 테스트(WSWAP-2-HANDLER)는 그대로 유효하며, 단지 Pipeline dispatch test만 제거된다.
+
+**engine 내부 fallback 경로**: `ResilienceAction::SwapWeights`(engine 내부 enum)은 별도 경로이다. `MemoryStrategy`(`engine/src/resilience/strategy/memory.rs`)가 Manager 없이 engine 독립으로 swap을 트리거할 때 발행하는 engine-internal action이다. 이는 `generate.rs`의 resilience action loop에서 **동일한** dispatch 함수(SwapWeights 처리 코드)로 귀결된다. 즉 두 진입점이 있으나 공통 Decider + Executor를 공유한다. `ResilienceAction::SwapWeights`는 shared crate에 노출되지 않으며 테스트 대상도 아니다.
+
+### 3.4 LuaPolicy API shape 예시
+
+Manager LuaPolicy는 `ctx.qcf.layer_swap`과 `ctx.engine.last_swap`을 읽어 결정한다. 본 arch는 Python/Lua 코드를 규정하지 않으나 기본 shape 예시:
+
+```lua
+-- 1. QCF 기반 결정
+if ctx.memory.level == "critical" and ctx.qcf.layer_swap then
+    local qcf_at_half = ctx.qcf.layer_swap.qcf_swap_at_ratio["0.5"]
+    if qcf_at_half < 0.3 then
+        return { action = "swap_weights", ratio = 0.5, target_dtype = "q4_0" }
+    else
+        return { action = "swap_weights", ratio = 0.25, target_dtype = "q4_0" }
+    end
+end
+```
+
+구체 Lua 바인딩 계약은 Manager 쪽 arch에서 다룬다 (Phase 3 구현 단계에서 확정).
+
+---
+
+## 4. ε 측정 (QuantNoiseTable Eager 빌드)
+
+### 4.1 흐름
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Loader as load_model()
+    participant Primary as primary mmap
+    participant Secondary as secondary mmap
+    participant Deq as Dequantize (CPU)
+    participant Frob as Frobenius calc
+    participant QNT as QuantNoiseTable
+
+    Loader->>Primary: open + metadata verify
+    Loader->>Secondary: open + metadata verify<br/>(fail → LoadError::SecondaryUnavailable)
+
+    Note over Loader,QNT: ε 계산 시작 (engine init, 1회)
+    loop for each decoder layer i
+        loop for each tensor t in {Q, K, V, O, gate, up, down}
+            Loader->>Primary: load W_primary_t as f32
+            Loader->>Secondary: load W_secondary_t raw bytes
+            Secondary->>Deq: dequantize Q4_0 → f32
+            Deq->>Frob: compute ||Δ||_F² / ||W_p||_F²
+            Frob-->>Loader: ε_t
+        end
+        Loader->>QNT: per_layer[i] = Σ_t ε_t
+    end
+
+    alt 개별 layer 실패
+        Loader->>QNT: per_layer[i] = NaN
+    else 전체 실패
+        Loader->>QNT: uniform_ones(num_layers)<br/>computed_at_init = false
+    end
+
+    Loader-->>Loader: engine init continues
+```
+
+### 4.2 계산 비용과 progress log
+
+| 모델 | 총 deq + Frob 바이트 | 호스트 CPU 예상 latency | progress log |
+|------|---------------------|------------------------|--------------|
+| Llama 3.2 1B | 16 layer × ~110 MiB | 200~500ms (호스트 x86) | 불요 |
+| Qwen 2.5 1.5B | 28 layer × ~55 MiB | 300~700ms | 불요 |
+| (hypothetical) Llama 3B | 32 layer × ~220 MiB | 2~5s (저성능 Android) | 권장 (레이어 단위 stderr) |
+
+**실패 fallback 시 degradation**: `computed_at_init = false, per_layer == [1.0; N]`. Decider의 key `importance × ε`에서 ε가 상수이므로 **importance만으로** 정렬된다. 이는 ENG-ALG-213 (Phase 2 단순 decider)와 동치 경로로, 정상 동작의 손실 하한선이다.
+
+### 4.3 Implementer-facing 구현 힌트 (non-normative)
+
+- `engine/src/models/weights/` 디렉토리에 신규 파일 `quant_noise.rs` 추가를 권장.
+- Dequantize는 `engine/src/backend/cpu_neon.rs`의 `dequantize_q4_0_block` 유사 함수를 재사용. GPU path 아님 (init 시점엔 GPU buffer 미생성).
+- Frobenius는 단순 `(a - b).powi(2).sum()` 루프로 충분. SIMD 최적화는 불필요(1회 비용).
+- 실패 감지: try-catch 대신 `Result<f32, NoiseError>`와 layer 단위 graceful degradation. panic 금지.
+
+---
+
+## 5. WeightSwapDecider — Layer 선택 알고리즘
+
+### 5.1 컴포넌트 구성
+
+```mermaid
+classDiagram
+    class WeightSwapDecider {
+        +decide(ratio_max, num_layers, importance, noise, already_swapped, protected) Vec~usize~
+    }
+    class ImportanceTable {
+        +score(layer_idx) Option~f32~
+    }
+    class QuantNoiseTable {
+        +epsilon(layer_idx) Option~f32~
+        +per_layer: Vec~f32~
+    }
+    class SwapExecutor {
+        +execute_swap(layers, target_dtype) WeightSwapReport
+    }
+
+    WeightSwapDecider ..> ImportanceTable : reads
+    WeightSwapDecider ..> QuantNoiseTable : reads
+    WeightSwapDecider --> SwapExecutor : hands off layer_set
+```
+
+**배치**: `engine/src/models/weights/decider.rs` (권장). `engine/src/core/pressure/weight_swap_handler.rs`(Stage 2)와 다른 파일에 독립 배치하여 "Decider" 책임(선택)과 "Handler/Orchestrator" 책임(오케스트레이션)을 물리적으로 분리.
+
+### 5.2 Key 계산과 tie-breaking
+
+```mermaid
+flowchart LR
+    subgraph Candidates
+        C0[layer 0 — protected]
+        C1[layer 1]
+        C2[layer 2]
+        CN[layer N-1 — protected]
+    end
+
+    C1 --> F1{noise.epsilon}
+    C2 --> F2{noise.epsilon}
+    F1 -- NaN --> X1[exclude]
+    F1 -- Some eps --> K1[key = imp × eps]
+    F2 -- Some eps --> K2[key = imp × eps]
+
+    K1 --> SORT[ascending sort<br/>tie → idx asc]
+    K2 --> SORT
+    SORT --> TRUNC[truncate to needed]
+    TRUNC --> OUT[selected layer_set]
+```
+
+### 5.3 Uniform fallback 트리거
+
+| 상황 | 경로 |
+|------|------|
+| `ImportanceTable == None` (RequestQcf 없이 SwapWeights만 도착) | Uniform fallback (균등 간격 index 선택) |
+| `QuantNoiseTable == None` (secondary 부재) | 도달 불가 (dispatch 단계에서 Rejected) |
+| `QuantNoiseTable::computed_at_init == false` (계산 실패 전체 fallback) | importance×1.0 정렬 (degrade, but not uniform) |
+| `QuantNoiseTable::epsilon(i) == None` (layer i만 실패) | layer i 후보 제외, 나머지는 정상 정렬 |
+
+### 5.4 이미 swap된 layer의 처리
+
+Decider는 `already_swapped: &HashSet<usize>`를 입력받아 후보에서 **제외**한다. "상한" 의미(ENG-ALG-215)에서 `needed = target_count - already_swapped.len()`이다. 즉 Manager가 ratio=0.5를 거듭 지시해도 이미 8개가 swap되어 있다면 추가 선택은 0이다. 단방향 유지.
+
+---
+
+## 6. Phase 3.5 Out-of-scope — `_entry_ratio_generation` Plan Invalidation
+
+Phase 3에서 `SwapExecutor`가 batch 완료 후 `TransformerModel::ratio_generation`을 bump한다 (ENG-ALG-211 step e). 이 bump는 `PartitionPlanContext::ratio_generation` snapshot과 비교되어 `PlanInvalidated`를 트리거한다 (INV-120). 문제는 **`_entry_ratio_generation`**(현재 이름은 구체 코드에서 확인 필요) 경로이다.
+
+### 6.1 현재 상태
+
+- `SetPartitionRatio` 경로는 `prepare_tensor_partition()` 내에서 `ratio_generation`을 bump하고, plan.rs의 `PartitionStep::run`에서 snapshot 비교로 stale을 감지한다.
+- Weight swap 경로도 동일 counter를 bump하지만, plan.rs의 `_entry_ratio_generation` 시작값 설정 로직(plan build 초기 시점의 캡처)이 swap 경로로 들어오는 이벤트에 대해 재빌드를 유발하는지는 **plan.rs 구조 조사가 필요**하다.
+
+### 6.2 Phase 3.5 작업 범위
+
+1. `engine/src/core/plan.rs` 구조 조사 (`_entry_ratio_generation`의 capture 시점, 비교 시점).
+2. Weight swap 경로의 `ratio_generation` bump가 plan 재빌드로 이어지는지 검증 (단위 테스트).
+3. 미동작 시 배선 설계 (plan builder에 swap counter 전파 또는 통합 bump API).
+4. 구현 + 테스트.
+
+**Phase 3에서 하지 않는 것**:
+- plan.rs 구조 변경.
+- `_entry_ratio_generation` 이름 변경 또는 재설계.
+- `ratio_generation`을 multi-source bump하도록 API 수정.
+
+이 작업은 **독립 PR 단위**로 처리한다 (tensor_partition plan.rs 구조 변경 가능성이 있어 리스크 분리).
+
+---
+
 ## 7. 변경 이력
 
+- **2026-04-24 (v4, Phase 3 Manager 통합)**:
+  1. §3 Manager 통합 신규 (E2E sequence, dispatch flowchart, routing 결정 근거, LuaPolicy shape).
+  2. §4 ε 측정 (QuantNoiseTable eager 빌드, fallback 규약, 비용 표) 신규.
+  3. §5 WeightSwapDecider 컴포넌트 (importance × ε bottom-k, tie-breaking, fallback trigger) 신규.
+  4. §6 Phase 3.5 Out-of-scope (`_entry_ratio_generation` plan invalidation) 신규.
+  5. 스펙 ID 추가: ENG-ALG-214-ROUTE, ENG-ALG-215~218, ENG-DAT-095, INV-126~128, MSG-042, MSG-082, MSG-088, MSG-089.
+  6. Stage 2 `weight_swap_handler.rs`의 포지션 재정의 (Pipeline 비등록, 내부 orchestrator 유지).
 - **2026-04-24 (v3, Phase 1 구현 반영 + Spec 명확화 5건)**:
   1. `TransformerWeights` struct 폐기, `TransformerModel` flat 배치로 재정의 (ENG-DAT-093 의미 승계, Phase 2에서 죽은 파일 제거).
   2. Layer 간 dtype 혼합 = 정상 상태 명시. Per-token atomic snapshot 규약(ENG-ALG-214-SNAP, INV-121 재작성) 도입. Mermaid sequence diagram §1.4 추가.

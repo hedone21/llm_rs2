@@ -1,6 +1,6 @@
 # INV Coverage Tracker
 
-> 전체: 65개 | ✅ 48 | ⬜ 0 | 🔶 17
+> 전체: 68개 | ✅ 48 | ⬜ 3 | 🔶 17 (INV-126/127/128 추가, 2026-04-24 Weight Swap Phase 3)
 
 ## 범례
 
@@ -118,9 +118,11 @@
 |-----|------|---------|------|-----------|
 | INV-120 | PartitionStep::run 진입 시 ratio_generation mismatch 시 PlanInvalidated 반환. caller는 재빌드 또는 forward_gen fallback. | Safety/Correctness | 🆕 미구현 | `tests/spec/inv_120_plan_partition_stale.rs` |
 
-## Dynamic Weight Swap (INV-121 ~ INV-125, 2026-04-24)
+## Dynamic Weight Swap (INV-121 ~ INV-128, 2026-04-24)
 
 > 이전 Phase A 정적 노선(TOML `LayerDtypeProfile` + `quantize_profile`)은 2026-04-24에 폐기되었다. ENG-DAT-091 ID는 재사용 금지.
+
+> **Phase 3 Manager 통합 (2026-04-24 추가)**: INV-126~128, ENG-ALG-214-ROUTE, ENG-ALG-215~218, ENG-DAT-095.
 
 | INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
 |-----|------|---------|------|-----------|
@@ -129,6 +131,9 @@
 | INV-123 | Swap 단위 = `LayerSlot.weights.store()` 1회 (단일 원자 단계). 토큰 경계 밖 swap은 다음 토큰부터 관측. Partial state 외부 노출 금지. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_123_swap_atomicity.rs` |
 | INV-124 | LayerSlot::current_dtype == weights snapshot의 실제 tensor dtype (swap 전후 항상 일치). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_124_slot_dtype_consistency.rs` |
 | INV-125 | TransformerModel.secondary_mmap(구 TransformerWeights::secondary_mmap)이 Some인 동안 Arc<SecondaryMmap>은 drop되지 않는다. flat 배치 기준. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_125_secondary_mmap_lifetime.rs` |
+| INV-126 | `EngineCommand::SwapWeights.target_dtype`에서 `DtypeTag::Q4_0` 이외 variant는 panic 없이 Rejected 응답. reserved variant payload 호환성 보장. | Safety/Correctness | 🆕 미구현 | `shared/tests/spec/test_inv_126_swap_dtype_reject.rs` |
+| INV-127 | `QuantNoiseTable::epsilon(i).is_none()`(NaN 저장) layer는 `WeightSwapDecider`에서 제외. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_127_noise_nan_exclusion.rs` |
+| INV-128 | `ImportanceCollector`가 Armed/Collecting 상태로 prefill 완료 시 반드시 `QcfEstimate` 송출 + Idle 복귀. 누수 금지. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_128_qcf_collector_leak.rs` |
 
 ---
 
@@ -171,8 +176,12 @@
 | MSG-067 | (A) | self_cpu_pct 계산식(/proc/self/stat + CLK_TCK + num_cpus) + clamp | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
 | MSG-068 | (D) | self_gpu_pct Phase 1 placeholder (항상 0.0) | 🆕 | `engine/tests/spec/test_msg_060_self_util.rs` |
 | MSG-069 | (D) | ctx.engine.cpu_pct/gpu_pct LuaPolicy 노출 계약 | 🆕 | `manager/tests/spec/test_mgr_dat_075_076_engine_util.rs` |
-| MSG-080 | (D) | `ResilienceAction::SwapWeights { ratio: f32 }` serde (shared crate) + MemoryPressure 기본 매핑 | 🆕 | `shared/tests/spec/test_msg_080_swap_weights.rs` |
-| MSG-081 | (D) | `EngineCommand::SwapWeights { ratio }` command 처리 + `CommandResponse::WeightSwapped` 결과 라운드트립 | 🆕 | `shared/tests/spec/test_msg_081_swap_cmd.rs` |
+| MSG-042 | (D) | `EngineCommand::SwapWeights { ratio, target_dtype: DtypeTag }` serde + dispatch contract (ENG-ALG-214-ROUTE) | 🆕 | `shared/tests/spec/test_msg_042_swap_weights_cmd.rs` |
+| MSG-080 | (D) | [DEPRECATED 재정의됨, 2026-04-24 Phase 3]: Phase 2 초안의 `ResilienceAction::SwapWeights` serde 항목. shared crate에서는 `EngineCommand::SwapWeights`(MSG-042)로 흡수되고, engine 내부 `ResilienceAction::SwapWeights`는 Rust-only 타입으로 테스트 대상 아님. MSG-080 ID는 새 용도 할당 없음. | — | — |
+| MSG-081 | (D) | [DEPRECATED, 2026-04-24 Phase 3]: 구 `CommandResponse::WeightSwapped` variant 제안. Phase 3에서는 별도 `WeightSwapReport` EngineMessage로 대체(MSG-089). MSG-081 ID 폐기. | — | — |
+| MSG-082 | (D) | `DtypeTag` enum (Q4_0 유효, F16/F32/Q8_0 reserved) serde round-trip | 🆕 | `shared/tests/spec/test_msg_082_dtype_tag.rs` |
+| MSG-088 | (D) | QcfEstimate `layer_swap` 필드 확장 (LayerSwapEstimate: per_layer_importance + per_layer_noise + qcf_swap_at_ratio). `#[serde(default)]` 전방 호환. | 🆕 | `shared/tests/spec/test_msg_088_qcf_estimate_layer_swap.rs` |
+| MSG-089 | (D) | `EngineMessage::WeightSwapReport` + `LayerSwapEntry` serde + 순서 보증 (CommandResponse → WeightSwapReport) | 🆕 | `shared/tests/spec/test_msg_089_weight_swap_report.rs` |
 
 ## Sequence
 
@@ -247,6 +256,11 @@
 | ENG-ALG-212 | (A) | On-demand ImportanceCollector 활성화 (prefill-tail + K=512 fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_212_importance_activation.rs` |
 | ENG-ALG-213 | (A) | SwapDecider 로직 (ratio × layer 수, uniform fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_213_swap_decider.rs` |
 | ENG-ALG-214 | (A) | WeightSwapHandler (CachePressureHandler 구현) + per-token forward snapshot 규약 (214-SNAP) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_214_weight_swap_handler.rs` |
+| ENG-ALG-214-ROUTE | (A) | EngineCommand::SwapWeights → generate.rs 직접 dispatch (Pipeline 비경유) + Rejected 조건 | 🆕 미구현 | `engine/tests/spec/test_eng_alg_214_route_dispatch.rs` |
+| ENG-ALG-215 | (A) | WeightSwapDecider: importance × ε ascending bottom-k + 보호 layer (0, last) + uniform fallback | 🆕 미구현 | `engine/tests/spec/test_eng_alg_215_weight_swap_decider.rs` |
+| ENG-ALG-216 | (A) | ε 계산: per-tensor Frobenius 상대 오차² 합산 → per-layer ε_i. Engine init eager. 실패 fallback 규약 | 🆕 미구현 | `engine/tests/spec/test_eng_alg_216_quant_noise_calc.rs` |
+| ENG-ALG-217 | (B) | QCF_swap 공식 = Σ_{i∈S} importance × ε / Σ_all importance × ε. `[0, 1]` 범위. 단조성. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_217_qcf_swap_formula.rs` |
+| ENG-ALG-218 | (E) | On-demand ImportanceCollector: RequestQcf → next prefill arm → finalize → QcfEstimate + K=512 fallback | 🆕 미구현 | `engine/tests/spec/test_eng_alg_218_importance_on_demand.rs` |
 
 ## Engine Data
 
@@ -261,6 +275,7 @@
 | ENG-DAT-092 | (D) | LayerSlot 구조 (current_dtype, weights Arc, secondary_mmap_handle, generation) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_092_layer_slot.rs` |
 | ENG-DAT-093 | (D) | TransformerModel flat 배치: layers(Vec<LayerSlot>) + secondary_mmap + ratio_generation + 기존 embedding/final_norm/lm_head. 별도 wrapper struct 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_093_transformer_weights.rs` |
 | ENG-DAT-094 | (D) | SecondaryMmap (mmap + decoder layer tensor index only). cross_layer_offsets 필드 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_094_secondary_mmap.rs` |
+| ENG-DAT-095 | (D) | QuantNoiseTable (per-layer ε, eager 계산, NaN 결측 표기, uniform_ones fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_095_quant_noise_table.rs` |
 
 ## Cross-cutting
 

@@ -56,7 +56,8 @@ JSON 예시:
 | `"capability"` | Capability | EngineCapability | 능력 보고 (세션당 1회) |
 | `"heartbeat"` | Heartbeat | EngineStatus | 주기적 상태 보고 |
 | `"response"` | Response | CommandResponse | Directive 실행 응답 |
-| `"qcf_estimate"` | QcfEstimate | QcfEstimate | RequestQcf에 대한 QCF 비용 응답 |
+| `"qcf_estimate"` | QcfEstimate | QcfEstimate | RequestQcf에 대한 QCF 비용 응답 (MSG-088에서 `layer_swap` 확장) |
+| `"weight_swap_report"` | WeightSwapReport | WeightSwapReport | MSG-089. SwapWeights 실행 완료 후 전송 |
 
 JSON 예시 (Capability):
 ```json
@@ -131,7 +132,7 @@ JSON 예시:
 
 ### 3.3 EngineCommand [MSG-030 ~ MSG-041, MSG-031b]
 
-**[MSG-030]** EngineCommand — Manager → Engine 개별 명령. `tag = "type"`, `rename_all = "snake_case"`. **14종 변형.** *(MUST)*
+**[MSG-030]** EngineCommand — Manager → Engine 개별 명령. `tag = "type"`, `rename_all = "snake_case"`. **15종 변형** (MSG-042 SwapWeights 추가, 2026-04-24 Weight Swap Phase 3). *(MUST)*
 
 | Tag Value | Variant | 도메인 | 필드 | 필드 타입 | 범위 | 설명 |
 |-----------|---------|--------|------|----------|------|------|
@@ -150,6 +151,8 @@ JSON 예시:
 | `"prepare_compute_unit"` | PrepareComputeUnit | Lifecycle | device | String | 디바이스 식별자 | 전환 사전 워밍업. |
 | `"suspend"` | Suspend | Lifecycle | (없음) | — | — | 추론 즉시 중지. |
 | `"resume"` | Resume | Lifecycle | (없음) | — | — | 추론 재개. |
+| `"swap_weights"` | SwapWeights | Memory | ratio | f32 | (0.0, 1.0] | **상한 비율**. Engine이 ratio 이하에서 자율 결정. |
+| | | | target_dtype | DtypeTag | `"q4_0"` (Phase 3 유효) / `"f16"`, `"f32"`, `"q8_0"` (reserved) | 교체 대상 dtype. Phase 3 범위에서 `q4_0`만 실행. |
 
 > **참고 (non-normative)**: 위 '도메인' 칼럼은 각 액션의 **주 대상(primary target) 도메인** 분류이다. 실제 cross-domain relief effect(하나의 액션이 여러 도메인에 동시 영향을 미침)는 Action Pool(`01-architecture.md` SYS-095)과 `22-manager-algorithms.md`에서 모델링된다.
 
@@ -270,6 +273,46 @@ Suspended 상태에서 추론을 재개한다. compute_level, memory_level을 No
 ```json
 {"type": "resume"}
 ```
+
+#### MSG-042: SwapWeights (Weight Swap Phase 3, 2026-04-24)
+
+**[MSG-042]** Manager → Engine. Decoder layer 집합의 weight dtype을 secondary 파일에서 교체하도록 지시한다. `ratio`는 **상한 비율**(Manager 결정의 의미), Engine은 이 이하에서 `WeightSwapDecider`(ENG-ALG-215)로 layer 수와 집합을 **자율 결정**한다. *(MUST)*
+
+**Payload**:
+
+| 필드 | 타입 | 범위 | 설명 |
+|------|------|------|------|
+| `ratio` | f32 | (0.0, 1.0] | Swap 대상 decoder layer 비율의 **상한**. Engine은 보호 layer(0, last)와 already_swapped를 제외하고 `floor(ratio × num_layers)` 이하의 layer를 선택한다. |
+| `target_dtype` | `DtypeTag` | enum (MSG-082) | 교체 대상 dtype. `"q4_0"`만 Phase 3에서 실행 가능하며, 다른 variant는 payload 호환성 확보용 reserved (INV-126). |
+
+**JSON 예시**:
+```json
+{"type": "swap_weights", "ratio": 0.5, "target_dtype": "q4_0"}
+```
+
+**의미론 (dispatch)**:
+- Engine은 이 명령을 `generate.rs`의 command dispatch 루프에서 **직접** 수신한다 (ENG-ALG-214-ROUTE). `CachePressurePipeline`은 거치지 않는다.
+- `LoadConfig::secondary_source == None`이면 `CommandResult::Rejected { reason: "NoSecondary" }`.
+- `ratio`가 범위 밖이거나 `target_dtype`이 `Q4_0`이 아니면 `CommandResult::Rejected`.
+- 성공 시 `CommandResult::Ok` + 별도 `EngineMessage::WeightSwapReport`(MSG-083) 후속 전송.
+- 이미 모든 후보 layer가 swap 완료(`needed == 0`)인 경우 `Ok` + 빈 report를 보낸다 (reject 아님).
+
+**단방향 제약**: Secondary→primary 복귀 경로는 **제공하지 않는다**. `target_dtype`의 reserved variant는 향후 Phase 5+에서 복귀 혹은 상향 dtype(F16→F32 등) 전환을 열어두기 위한 예약일 뿐, Phase 3에서 발행하지 않는다.
+
+**[MSG-082]** `DtypeTag` enum — SwapWeights의 target_dtype 전용 타입. shared crate에 신규 정의. *(MUST)*
+
+| Tag Value | Variant | Phase 3 상태 |
+|-----------|---------|-------------|
+| `"q4_0"` | Q4_0 | **유효** — SwapExecutor 실행 가능 |
+| `"f16"` | F16 | Reserved — Rejected 반환 |
+| `"f32"` | F32 | Reserved — Rejected 반환 |
+| `"q8_0"` | Q8_0 | Reserved — Rejected 반환 |
+
+**JSON 직렬화**: `rename_all = "snake_case"`, `#[serde(tag = ...)]` 형태는 사용하지 않고 단순 string variant (`"q4_0"`).
+
+**Hosting 위치**: shared/src/lib.rs 또는 별도 shared module. 기존 `DType` enum(engine 내부)과 **다른 타입**이다. shared enum은 프로토콜 안정성을 위해 별도로 정의된다.
+
+---
 
 ### 3.4 EngineCapability [MSG-050 ~ MSG-052]
 
@@ -492,6 +535,86 @@ JSON 예시:
 ```
 
 > **참고 (non-normative)**: Manager의 ActionSelector는 이 값을 lossy 액션의 비용으로 사용한다. Lossless 액션의 비용은 0이다. QcfEstimate가 없으면(Engine 미연결 등) ActionRegistry의 default_cost를 fallback으로 사용한다.
+
+**[MSG-088]** QcfEstimate `layer_swap` 확장 — 2026-04-24 Weight Swap Phase 3. Engine이 `RequestQcf` 수신 후 수행한 on-demand ImportanceCollector 측정 결과를 전달한다. *(MUST when secondary_mmap present; MUST NOT otherwise)*
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `layer_swap` | `Option<LayerSwapEstimate>` | secondary_mmap 부재 or 측정 실패 시 `None`. |
+
+`LayerSwapEstimate`:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `per_layer_importance` | `Vec<f32>` | 길이 = num_decoder_layers. 결측은 0.0. |
+| `per_layer_noise` | `Vec<f32>` | 길이 = num_decoder_layers. 계산 실패 layer는 `NaN` (JSON에선 `null`로 직렬화 권장). |
+| `qcf_swap_at_ratio` | `Map<String, f32>` | 사전 계산된 QCF_swap(ENG-ALG-217). Engine이 최소 `"0.25"`, `"0.5"`, `"1.0"` 3개를 기본 제공. |
+
+**serde 전방 호환**: `layer_swap` 필드는 `#[serde(default, skip_serializing_if = "Option::is_none")]`이다. 구 Manager는 이 필드를 무시하고 `estimates`만 읽는다 (INV-028).
+
+JSON 예시 (확장):
+```json
+{
+  "type": "qcf_estimate",
+  "estimates": {
+    "kv_evict_h2o": 0.12
+  },
+  "layer_swap": {
+    "per_layer_importance": [0.8, 0.5, 0.3, 0.9, 0.2, 0.1, 0.4, 0.7, 0.6, 0.5, 0.3, 0.8, 0.9, 0.4, 0.2, 0.1],
+    "per_layer_noise":      [0.01, 0.02, 0.015, 0.03, 0.025, 0.018, 0.022, 0.019, 0.017, 0.024, 0.021, 0.016, 0.023, 0.028, 0.014, 0.013],
+    "qcf_swap_at_ratio": {
+      "0.25": 0.08,
+      "0.5":  0.21,
+      "1.0":  1.00
+    }
+  }
+}
+```
+
+---
+
+**[MSG-089]** WeightSwapReport — Engine → Manager. `EngineCommand::SwapWeights` 실행 완료 후 `CommandResponse` 다음에 별도 EngineMessage로 송출된다. *(MUST on successful swap execution)*
+
+EngineMessage envelope에 신규 variant 추가 (MSG-011 확장):
+
+| Tag Value | Variant | Payload |
+|-----------|---------|---------|
+| `"weight_swap_report"` | WeightSwapReport | `WeightSwapReport` struct |
+
+**Payload**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `layers_swapped` | `Vec<LayerSwapEntry>` | 실제 교체된 layer들. 비어있으면 swap 미발생(needed=0 등). |
+| `freed_bytes` | `u64` | `madvise(DONTNEED)` 등으로 회수된 상주 바이트 합. |
+| `latency_ms` | `u64` | Swap batch 전체 latency (wall clock). |
+| `qcf_swap_actual` | `f32` | 실행된 swap_set에 대해 계산한 QCF_swap 값 (ENG-ALG-217). `[0, 1]`. |
+
+`LayerSwapEntry`:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `layer_idx` | `u32` | decoder layer index. |
+| `from_dtype` | `DtypeTag` | 교체 전 dtype. |
+| `to_dtype` | `DtypeTag` | 교체 후 dtype (Phase 3에서는 `q4_0` 고정). |
+
+JSON 예시:
+```json
+{
+  "type": "weight_swap_report",
+  "layers_swapped": [
+    {"layer_idx": 2, "from_dtype": "f16", "to_dtype": "q4_0"},
+    {"layer_idx": 5, "from_dtype": "f16", "to_dtype": "q4_0"}
+  ],
+  "freed_bytes": 31457280,
+  "latency_ms": 48,
+  "qcf_swap_actual": 0.17
+}
+```
+
+> **순서 보증**: SwapWeights를 포함한 Directive에 대해 Engine은 (1) `CommandResponse`를 먼저 전송, (2) 성공 시 `WeightSwapReport`를 뒤이어 전송한다. Rejected 시 `WeightSwapReport`는 송출되지 않는다.
+
+---
 
 ### 3.9 Supporting Enums [MSG-090 ~ MSG-095]
 

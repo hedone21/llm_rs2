@@ -650,11 +650,20 @@
 
 **의미론**:
 
-- `secondary_source == None`이면 swap 경로 비활성. `ResilienceAction::SwapWeights`는 즉시 NoOp 반환.
+- `secondary_source == None`이면 swap 경로 비활성. `EngineCommand::SwapWeights`는 `WeightSwapError::NoSecondary` 응답(ENG-DAT-C09).
 - `secondary_source == Some(path)`이면 로더가 primary에 더해 secondary 파일의 metadata(n_layer, n_head, n_kv_head, hidden_size, intermediate_size, head_dim)를 검증하고 mmap을 열어둔다. mmap handle은 `LayerSlot::secondary_mmap_handle`로 공유된다 (ENG-DAT-092).
+- **초기 로딩 후 ε(양자화 noise factor) 계산도 eager하게 수행된다** (ENG-DAT-095, ENG-ALG-216). 계산 결과는 `QuantNoiseTable`로 engine에 보관되어 이후 모든 swap 결정의 독립 입력이 된다.
 - 초기 로딩 후 모든 decoder layer의 `current_dtype`은 `default_dtype`과 같고, `Primary` 전용 상태이다.
 - Cross-layer tensor(embedding, final_norm, lm_head)는 항상 primary에서 로드된다. **Swap 대상이 아니다.**
 - Backend 무관. OpenCL 백엔드의 `rewrap_weights_for_dual_access()`는 swap 직후의 새 Buffer에 대해서도 동일 규칙으로 호출된다.
+
+**Phase 3 사이드 이펙트 명시**:
+
+- `secondary_source.is_some()` ⇒ engine init에서 다음 두 객체가 반드시 생성된다:
+  1. `Arc<SecondaryMmap>` (ENG-DAT-094) — `TransformerModel::secondary_mmap` 필드에 보관.
+  2. `QuantNoiseTable` (ENG-DAT-095) — engine에 보관, `WeightSwapDecider`가 read-only 소비.
+- ε 계산은 **실패해도 엔진 기동을 막지 않는다**: 개별 layer 실패 시 `ε_i = 1.0` fallback, 전체 실패 시 `QuantNoiseTable::uniform_ones(num_layers)`로 degrade. 실패 layer는 decider에서 **swap 후보에서 제외**된다 (INV-127, ENG-ALG-216).
+- ε 계산 시간은 Llama 1B(16 layer × ~7 tensor × 수백 MiB Frobenius)에서 호스트 CPU 대략 200ms~1s 예상. 5초 이상 예상 디바이스에서는 loader가 **progress log**를 stderr로 출력한다 (권장사항, *(SHOULD)*).
 
 **구현 전환 계획 (Loader 시그니처)**:
 
@@ -783,6 +792,54 @@ classDiagram
 **의미론**:
 - `SwapExecutor`는 `layer_index[i]`를 조회해 해당 layer에 필요한 tensor의 raw byte slice를 얻고, Q/K permutation 등 primary loader와 동일한 후처리를 적용하여 새 `LayerWeights`를 생성한다.
 - `mmap` 자체는 swap 후에도 drop되지 않는다. `madvise(DONTNEED)`는 swap된 **primary** 페이지 영역에만 적용된다 (INV-125의 보호 대상이 아닌 쪽).
+
+---
+
+### 3.21 QuantNoiseTable — Per-Layer Quantization Noise Factor [ENG-DAT-095]
+
+**[ENG-DAT-095]** `QuantNoiseTable`은 primary 대 secondary 가중치의 layer별 quantization noise factor `ε_i`를 보관하는 read-only 테이블이다. 생성은 **engine init**에서 secondary mmap open 직후 eager하게 1회 수행되며, 이후 모든 `WeightSwapDecider` 호출의 독립 입력이 된다. *(MUST)*
+
+**설계 결정 (2026-04-24 확정)**:
+
+- **Eager 계산**: engine 기동 시 단 1회. 근거:
+  1. 실험 재현성. 동일 swap 결정을 모든 세션에서 재현해야 QCF-PPL 상관 검증이 성립한다.
+  2. ε는 QCF_swap 수식(ENG-ALG-217)의 **고정 상수**로 쓰이며, 실행 중 변하지 않아야 Manager의 LinUCB 학습이 수렴한다.
+  3. Lazy 계산은 첫 swap 시점의 latency spike를 유발한다 (Manager 신호 응답성 저하).
+- **Read-only 테이블**: 생성 후 불변. `Arc<QuantNoiseTable>`로 공유 가능.
+- **Per-layer 스칼라**: per-tensor 분해는 저장하지 않는다 (`Q/K/V/O/gate/up/down`별 Frobenius는 layer 단위로 합산). 근거: decider는 layer 단위로 결정하며, per-tensor 세분화는 현 스코프 외.
+
+**필드**:
+
+| 필드 | 타입 | 설명 |
+|------|------|------|
+| `per_layer` | `Vec<f32>` | 길이 = `num_decoder_layers`. `per_layer[i] = ε_i ∈ [0.0, +∞)`. 값이 클수록 양자화 오차가 크다. 해당 layer의 **계산 실패**(shape mismatch, dequant 실패 등) 시 `f32::NAN`으로 표기된다. |
+| `computed_at_init` | `bool` | 테이블이 eager 경로로 생성되었는지 여부. 진단/로그용. `false`인 경우는 fallback 경로(uniform ones). |
+
+**접근 API (개념)**:
+
+| 메서드 | 시그니처 | 후조건 |
+|--------|----------|--------|
+| `new_from_frobenius` | `(primary, secondary) -> Self` | ENG-ALG-216 절차 수행. 실패 layer는 NaN. |
+| `uniform_ones` | `(num_layers) -> Self` | fallback. 모든 `ε_i = 1.0`, `computed_at_init = false`. |
+| `epsilon` | `(layer_idx) -> Option<f32>` | NaN이면 `None`, 유효값이면 `Some(ε_i)`. |
+| `len` | `() -> usize` | 레이어 수. |
+
+**의미론**:
+
+- `epsilon(i).is_none()` ⇒ layer i는 **swap 후보에서 제외**된다 (INV-127, ENG-ALG-215). 이 규칙은 `WeightSwapDecider`의 책임.
+- 테이블 없음 (`secondary_source == None`) ⇒ `SwapWeights` 명령 자체가 `WeightSwapError::NoSecondary`로 거부되므로 decider에 도달하지 않는다.
+- 값 범위: `ε_i` 자체는 비정규화 값이다 (Frobenius 상대 오차 제곱, `[0, +∞)`). QCF_swap 공식에서 `importance × ε` 합으로 쓰이며, 합으로 정규화된 뒤에 `[0, 1]` 보장 (ENG-ALG-217).
+
+**보관 위치**:
+
+- `TransformerModel`의 flat 필드로 보관하거나, 별도 service state(engine init에서 생성 후 `WeightSwapDecider`에 주입). 정확한 위치는 arch/weight_swap.md §5 참조.
+- `QcfEstimate` 응답 생성 시 `per_layer` 복사본이 shared 프로토콜로 전송될 수 있다 (MSG-084).
+
+**교차 참조**:
+
+- 계산 절차: ENG-ALG-216.
+- 소비처: ENG-ALG-215 (layer 선택), ENG-ALG-217 (QCF_swap 공식), ENG-ALG-218 (QcfEstimate 응답).
+- 불변식: INV-127 (NaN layer 제외), INV-128 (QcfEstimate payload 누수 금지).
 
 ## 4. Alternative Behavior
 

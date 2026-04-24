@@ -31,10 +31,11 @@
 |-------|------|-----|----------|----------|
 | **1 — 인프라** | `LayerSlot` 구조, secondary 파일 mmap handle 보관, 기존 단일 dtype 초기 로드 경로 보존 (회귀 방지) | 5 | 5–7일 | P1 |
 | **2 — Swap 실행** | `WeightSwapHandler` + `SwapExecutor` + `ratio_generation` 재진입 차단. 수동 CLI/테스트 트리거 | 5 | 6–8일 | P1 |
-| **3 — Manager 연동** | `ResilienceAction::SwapWeights { ratio }` + on-demand `ImportanceCollector` + `SwapDecider` + MemoryStrategy | 5 | 5–7일 | P2 |
+| **3 — Manager 연동** | `EngineCommand::SwapWeights{ratio, DtypeTag}` direct dispatch + `WeightSwapDecider` (importance×ε bottom-k) + `QuantNoiseTable` eager ε + on-demand `ImportanceCollector` 주입 + `QcfEstimate.layer_swap` 확장 + LuaPolicy | 7 | 7–9일 | P2 |
+| **3.5 — plan invalidation** | `_entry_ratio_generation` 배선 (weight swap → plan rebuild) — 독립 PR | 3 | 3–4일 | P3 |
 | **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | P2 |
 
-**진행 순서 강제**: Phase 1 → 2 → 3 → 4. Phase 1의 `LayerSlot` 도입이 forward 경로 전체에 영향을 주므로 가장 먼저, 그리고 성능 회귀 없음을 확인한 후 Phase 2 진입.
+**진행 순서 강제**: Phase 1 → 2 → 3 → 4. Phase 3.5는 Phase 3 완료 후 독립 처리.
 
 ---
 
@@ -261,100 +262,248 @@
 
 ---
 
-# Phase 3 — Manager 연동 (Signal + On-demand QCF + Decider)
+# Phase 3 — Manager 연동 (Direct dispatch + On-demand QCF + Decider)
 
-> **목표**: `ResilienceAction::SwapWeights { ratio }` signal이 실제 manager → engine 경로를 타고 `WeightSwapHandler`를 발동. On-demand `ImportanceCollector`로 prefill tail에서 1회 QCF 측정 → `SwapDecider`가 ratio를 layer 집합으로 변환.
-> **예상 기간**: 5–7일 (5개 작업)
+> **목표**: `EngineCommand::SwapWeights { ratio, target_dtype }`가 실제 manager → engine IPC 경로를 타고 `WeightSwapDecider` + `SwapExecutor`를 발동. RequestQcf → 다음 prefill에서 `ImportanceCollector` 주입 → `QcfEstimate.layer_swap` 응답으로 manager 결정 피드백. ε(quantization noise)는 engine init에서 eager 계산.
+> **예상 기간**: 7–9일 (7개 작업)
 > **기대 효과**: 신호 기반 end-to-end 동작. Phase 4 실측의 전제.
+> **근거 스펙**: ENG-ALG-214-ROUTE, ENG-ALG-215~218, ENG-DAT-095, INV-126~128, MSG-042/082/088/089.
+> **라우팅 결정 (ENG-ALG-214-ROUTE)**: Pipeline 비경유. `generate.rs`의 command dispatch에서 직접 수신 → Decider → Executor.
 
-## [P2] WSWAP-3-SIGNAL. `ResilienceAction::SwapWeights { ratio }` + Shared 프로토콜
+## [P2] WSWAP-3-CMD. `EngineCommand::SwapWeights` + `DtypeTag` shared 프로토콜
 - **Status**: TODO
 - **Sprint**: next
 - **Dependencies**: Phase 2 완료
 - **담당 권장**: Implementer
 - **Description**:
-  - `shared/` 크레이트에 `ResilienceAction::SwapWeights { ratio: f32 }` variant 추가 (serde)
-  - `SystemSignal` → `ResilienceAction` 매핑 로직에 신규 variant 반영
-  - manager → engine 프로토콜 문서 업데이트
-  - verify 하네스 (`verify/scenarios/`) 호환성 확인: 기존 시나리오가 신규 variant로 인해 깨지지 않는지 점검
-  - Spec: `MSG-NNN` 신규 ID 할당 (Architect WSWAP-1-SPEC에서 예약)
+  - **shared/src/lib.rs**:
+    - `EngineCommand::SwapWeights { ratio: f32, target_dtype: DtypeTag }` variant 추가 (MSG-042)
+    - `DtypeTag` enum 신규 (`Q4_0` / `F16` / `F32` / `Q8_0`, snake_case 직렬화) (MSG-082)
+    - `EngineMessage::WeightSwapReport(WeightSwapReport)` variant 추가 (MSG-089)
+    - `WeightSwapReport { layers_swapped, freed_bytes, latency_ms, qcf_swap_actual }` struct (MSG-089)
+    - `LayerSwapEntry { layer_idx, from_dtype, to_dtype }` struct
+    - `QcfEstimate`에 `layer_swap: Option<LayerSwapEstimate>` 필드 추가 (MSG-088)
+    - `LayerSwapEstimate { per_layer_importance, per_layer_noise, qcf_swap_at_ratio }` struct
+  - 모든 필드에 `#[serde(default, skip_serializing_if = "Option::is_none")]` 원칙 적용 (INV-028)
+  - verify 하네스 (`verify/scenarios/`) 기존 시나리오 호환성 확인
 - **Acceptance Criteria**:
-  - shared 크레이트 unit test (serialize/deserialize roundtrip)
-  - verify 하네스 기본 시나리오 pass
-  - `mock_manager` / `mock_engine`이 신규 variant를 받아 no-op (handler 미설치 시) 또는 정상 dispatch
-- **Notes**: R-new-4 완화. verify 스키마 변경 최소화.
+  - shared 크레이트 serde round-trip test (`shared/tests/spec/test_msg_042_swap_weights_cmd.rs`, `test_msg_082_dtype_tag.rs`, `test_msg_088_qcf_estimate_layer_swap.rs`, `test_msg_089_weight_swap_report.rs`)
+  - 구 Manager(`layer_swap` 필드 미인지)가 신규 Engine payload 역직렬화 성공 (INV-028)
+  - mock_manager/mock_engine이 신규 variant 수신 시 최소 no-op
+- **Notes**: MSG-080/081 ID는 사용하지 않음 (초안 단계 vacant, 실제 ID는 MSG-042/082/088/089).
 
-## [P2] WSWAP-3-QCF. On-demand `ImportanceCollector` 활성화 플래그 모드
+## [P2] WSWAP-3-NOISE. `QuantNoiseTable` + ε eager 계산 (ENG-ALG-216)
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: WSWAP-1-SPEC (Architect가 측정 정책 결정)
-- **담당 권장**: Implementer (QCF 확장) + Senior Implementer (hot path 영향 검토)
+- **Dependencies**: WSWAP-1-MMAP (Phase 1 완료, secondary mmap)
+- **담당 권장**: Senior Implementer (dequantize + Frobenius 경로, CPU SIMD 활용 가능)
 - **Description**:
-  - `ImportanceCollector`에 `active: AtomicBool` 플래그 추가
-  - 평시 `active = false` → forward 경로에서 hot-path 분기 early-return (zero overhead 원칙)
-  - Prefill 종료 직후 조건: (a) secondary handle 존재, (b) swap 신호 pending, (c) 이번 prefill이 첫 측정 또는 stale → `active = true` set
-  - 마지막 N 토큰 (spec 결정값)에서 layer importance 수집
-  - 수집 완료 후 `active = false` → `ImportanceTable` freeze 후 `SwapDecider`에 전달
-  - Decode 중 신호 수신 시: 다음 prefill까지 대기. fallback policy는 Architect spec 결정 (예: K 토큰 초과 시 uniform distribution)
+  - `engine/src/models/weights/quant_noise.rs` 신규 파일
+  - `QuantNoiseTable { per_layer: Vec<f32>, computed_at_init: bool }` 구조체
+  - `QuantNoiseTable::new_from_frobenius(primary, secondary) -> Self` — loader에서 engine init 시 호출
+    - 각 decoder layer의 Q/K/V/O/gate/up/down tensor별 dequantize(secondary) → Frobenius 상대 오차² 합산
+    - 개별 layer 실패 시 `ε_i = NaN`; 전체 실패 시 `uniform_ones`
+  - `QuantNoiseTable::uniform_ones(num_layers)` fallback
+  - `epsilon(layer_idx) -> Option<f32>` (NaN은 None)
+  - `TransformerModel` 또는 engine service state에 보관 (arch §5.1)
+  - Progress log는 optional — 2s+ 예상 시 stderr에 layer 단위 출력
 - **Acceptance Criteria**:
-  - active=false일 때 forward 측정 오버헤드 ≤ 0.5% (microbench, 6T)
-  - active=true일 때 prefill tail N 토큰에서 per-layer score 수집 확인
-  - 호스트 unit test: 모의 prefill → score 수집 → freeze → retrieve
-  - fallback policy 테스트 (spec 결정값 기준)
-- **Notes**: R-new-2. "첫 prefill에만 측정"의 한계 — fallback 없으면 반복 쿼리 시 측정 기회 제한. Architect가 spec에 명시한 정책을 정확히 반영.
+  - unit test (`engine/tests/spec/test_eng_dat_095_quant_noise_table.rs`): ones fallback / NaN layer / 정상 Frobenius 계산
+  - unit test (`test_eng_alg_216_quant_noise_calc.rs`): 알려진 Q4_0 예시에 대해 ε 값 손검증
+  - engine 기동 latency 추가 측정 (Llama 1B 호스트: <1s 기대)
+- **Notes**: dequantize는 `engine/src/backend/cpu_neon.rs` 기존 Q4_0 경로 재사용. Init 1회 비용이므로 SIMD 최적화는 2차 고려. INV-127 근거.
 
-## [P2] WSWAP-3-DECIDER. `SwapDecider` 구현 (ratio → layer set)
+## [P2] WSWAP-3-DECIDER. `WeightSwapDecider` 구현 (ENG-ALG-215)
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: WSWAP-3-QCF, WSWAP-2-HANDLER
+- **Dependencies**: WSWAP-3-NOISE, WSWAP-2-HANDLER
 - **담당 권장**: Implementer
 - **Description**:
-  - `SwapDecider::select(ratio: f32, table: &ImportanceTable) -> Vec<usize>`
-  - 알고리즘: layer importance 오름차순 정렬 → 하위 `floor(ratio × n_layers)` 선택
-  - 이미 Q4_0인 layer 제외 (누적 swap 대응)
-  - tie-breaking 규칙 (idx 오름차순) 명시
-  - importance table 부재 시 fallback: uniform (layer idx 순) 또는 spec 결정
+  - `engine/src/models/weights/decider.rs` 신규 파일 (Stage 2 `weight_swap_handler.rs`와 분리)
+  - `WeightSwapDecider::decide(ratio_max, num_layers, importance, noise, already_swapped, protected) -> Vec<usize>`
+  - 알고리즘 (ENG-ALG-215):
+    1. Protected set = {0, num_layers-1} ∪ caller-supplied protected
+    2. `target_count = floor(ratio_max × num_layers)`
+    3. `needed = target_count - already_swapped.len()` (saturating)
+    4. Candidates = non-protected ∧ non-swapped ∧ `epsilon(i).is_some()` (INV-127)
+    5. Importance 있으면: key = `importance × ε`, ascending sort, tie → idx asc
+    6. Importance 없으면: uniform index fallback (재현성, 랜덤 금지)
+    7. truncate to needed
+  - 관련 함수 `compute_qcf_swap(swap_set, noise, importance) -> f32` 구현 (ENG-ALG-217)
+    - 파일 위치: `engine/src/core/qcf/quant_qcf.rs` (신규) 또는 `ImportanceTable` impl block
+    - 분자/분모 모두 `importance × ε`로 정규화 → `[0, 1]` 보장
 - **Acceptance Criteria**:
-  - unit test: 16-layer + ratio=0.25 → 4개 layer 선택, 하위 4개 importance 일치
-  - edge case: ratio=0.0 (빈 vec), ratio=1.0 (전체), ratio=0.75 + 이미 일부 swap됨
-  - fallback 경로 테스트
-- **Notes**: 간단하지만 swap 정책의 핵심. 향후 per-head / per-tensor 세분화 여지는 별도 feature.
+  - unit test (`test_eng_alg_215_weight_swap_decider.rs`): 
+    - Llama 16-layer (protect 0 & 15) + ratio=0.5 → 8 layer 선택, 하위 8개 key
+    - 보호 layer 제외 확인
+    - NaN ε layer 제외 확인 (INV-127)
+    - tie-breaking idx asc 확인
+    - Uniform fallback (importance None) 확인
+    - already_swapped 반영 (ratio 상한 의미)
+  - unit test (`test_eng_alg_217_qcf_swap_formula.rs`):
+    - 빈 set → 0.0, 전체 set → 1.0
+    - 단조성 (S1 ⊆ S2 ⇒ QCF(S1) ≤ QCF(S2))
+    - ε = 상수 1일 때 uniform importance-only 경로와 동치
+- **Notes**: ENG-ALG-213은 이 Decider의 uniform fallback 경로로 흡수됨.
 
-## [P2] WSWAP-3-STRATEGY. `MemoryStrategy` 매핑 확장
+## [P2] WSWAP-3-DISPATCH. `generate.rs` command dispatch (ENG-ALG-214-ROUTE + INV-126)
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: WSWAP-3-SIGNAL, WSWAP-3-DECIDER
+- **Dependencies**: WSWAP-3-CMD, WSWAP-3-DECIDER
 - **담당 권장**: Implementer
 - **Description**:
-  - `engine/src/resilience/strategy/memory.rs` — `MemoryStrategy::react()`에 `SwapWeights { ratio }` 반환 경로 추가
-  - 매핑 (Architect spec 참조, 예시 값):
-    - Warning → ratio=0.0 (no swap) 또는 ratio=0.25
-    - Critical → ratio=0.5
-    - Emergency → ratio=1.0
-  - 기존 Evict와 중첩 여부: spec에서 결정 (Architect)
-  - `policy_default.lua` 연동은 후행 작업 (수동 주입 우선)
+  - `generate.rs`의 EngineCommand dispatch match에 `SwapWeights` arm 추가
+  - Dispatch 순서 (arch §3.2):
+    1. secondary_mmap None ⇒ `Rejected { reason: "NoSecondary" }`
+    2. ratio 범위 밖 (≤0 또는 >1) ⇒ `Rejected { reason: "InvalidRatio" }`
+    3. target_dtype ≠ Q4_0 ⇒ `Rejected { reason: "UnsupportedDtype" }` (INV-126)
+    4. Decider 호출 → layer_set
+    5. layer_set 비었으면 `Ok` + 빈 `WeightSwapReport`
+    6. `SwapExecutor::execute_swap(layer_set, Q4_0)` → `WeightSwapReport` 구성
+    7. `CommandResult::Ok` 즉시 반환
+    8. 이후 `EngineMessage::WeightSwapReport` 별도 송출
+  - `DtypeTag::Q4_0` → `DType::Q4_0` 변환 helper
+  - Stage 2 `weight_swap_handler.rs`를 내부 orchestrator로 유지 (Pipeline 등록은 제거, CachePressureHandler impl도 제거)
+  - `ResilienceAction::SwapWeights` (engine 내부) fallback 경로도 같은 dispatch 함수로 귀결되도록 공통 helper 추출
 - **Acceptance Criteria**:
-  - MemoryLevel → ratio 매핑 단위 테스트
-  - 기존 Evict 경로 회귀 없음
-  - verify 하네스 시나리오 추가 (MemoryCritical → swap 발동)
-- **Notes**: 기존 `project_dpp_policy.md` 참조. Lua policy 통합은 Phase 4 이후.
+  - unit test (`engine/tests/spec/test_eng_alg_214_route_dispatch.rs`):
+    - Rejected 4종(NoSecondary, InvalidRatio, UnsupportedDtype, 각 정상 + 비정상 케이스)
+    - 정상 Q4_0 swap이 Ok + WeightSwapReport 2-message 순서로 송출됨
+    - 이미 전체 swap 완료된 상태에서 ratio=0.5 재수신 ⇒ Ok + 빈 report
+  - unit test (`test_inv_126_swap_dtype_reject.rs`): F16/F32/Q8_0 payload 각각 Rejected
+  - Pipeline에 WeightSwapHandler 등록되지 않음 확인
+- **Notes**: engine-internal `ResilienceAction::SwapWeights`와 shared `EngineCommand::SwapWeights`는 서로 다른 타입. `MemoryStrategy`에서 내리는 fallback action도 이 dispatch helper로 귀결되어야 함.
 
-## [P2] WSWAP-3-E2E. End-to-End 통합 테스트 (mock manager → engine)
+## [P2] WSWAP-3-QCF. `RequestQcf` → On-demand `ImportanceCollector` 주입 (ENG-ALG-218)
 - **Status**: TODO
 - **Sprint**: next
-- **Dependencies**: WSWAP-3-SIGNAL, WSWAP-3-QCF, WSWAP-3-DECIDER, WSWAP-3-STRATEGY
-- **담당 권장**: Tester
+- **Dependencies**: WSWAP-3-NOISE, WSWAP-3-DECIDER
+- **담당 권장**: Implementer (QCF 경로) + Senior Implementer (hot path 영향 검토)
 - **Description**:
-  - `mock_manager` → `mock_engine` 경유로 `SwapWeights { ratio }` 주입
-  - 시나리오: (1) prefill → importance 측정 → 신호 수신 → swap 발동 → decode 진행
-  - 시나리오: (2) 평시 → 신호 없음 → 측정/swap 미발동 (zero overhead 확인)
-  - 시나리오: (3) decode 중 신호 → 다음 prefill까지 대기 → 측정 → swap
-  - verify 하네스에 신규 시나리오 YAML 추가
+  - `ImportanceCollector`에 `active: AtomicBool` 플래그 추가 (기존 `engine/src/core/qcf/layer_importance.rs`)
+  - Engine service state에 `collector_flag: enum { Idle, Armed, Collecting, Finalizing }` 추가
+  - `EngineCommand::RequestQcf` dispatch 시:
+    - `collector_flag = Armed` (다음 prefill에 주입 예약)
+    - `CommandResponse::Ok` 즉시 응답 (기존 동일)
+  - Prefill 경로:
+    - Prefill 시작 시 `collector_flag == Armed` ⇒ `active = true, state = Collecting, tail_target_token = last`
+    - Layer loop 내부: `active`가 true일 때만 snapshot_before / record_after
+    - Prefill 종료 시 `Collecting` ⇒ finalize → `ImportanceTable`을 engine service state에 보관
+  - `QcfEstimate` 응답 빌드:
+    - 기존 KV action estimates (ENG-ALG-050) + `layer_swap: Some(LayerSwapEstimate)` 
+    - `qcf_swap_at_ratio`에 0.25, 0.5, 1.0 기본 계산
+  - `EngineMessage::QcfEstimate` 송출 → `collector_flag = Idle`
+  - K=512 fallback: decode 중 pending + K 초과 ⇒ `layer_swap: None`으로 송출 (차선 방식, 측정 실패 통지)
 - **Acceptance Criteria**:
-  - 3개 시나리오 모두 pass
-  - 로그에서 각 단계 이벤트 확인 (`CacheEvent::WeightSwapped`, `ImportanceCollector activated`)
-  - 호스트 CI 경로에서 통합 테스트 실행 가능 (Android 디바이스 없이)
-- **Notes**: verify 하네스 확장. 기존 시나리오 호환성 유지 필수.
+  - unit test (`test_eng_alg_218_importance_on_demand.rs`):
+    - active=false 평시: forward 경로에 측정 코드 미실행 (micro-bench ≤ 0.5% 회귀)
+    - RequestQcf → next prefill → QcfEstimate 송출 시퀀스
+    - K=512 초과 시 layer_swap None 포함한 QcfEstimate 송출
+  - unit test (`test_inv_128_qcf_collector_leak.rs`):
+    - Armed 상태로 prefill 진행 후 QcfEstimate 1회 송출 + Idle 복귀 확인
+    - 누수 탐지: 두 번째 prefill에서 active=false 유지
+- **Notes**: R-new-2 완화. prefill 경로 hot path에 분기 추가 → cold branch(early return) 유지.
+
+## [P2] WSWAP-3-LUA. Manager LuaPolicy 정책 확장
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: WSWAP-3-CMD, WSWAP-3-DISPATCH
+- **담당 권장**: Implementer (Lua 바인딩)
+- **Description**:
+  - `manager/src/.../policy/`의 Lua 바인딩 확장:
+    - `ctx.qcf.layer_swap` (from `QcfEstimate.layer_swap`) — per_layer_importance/noise, qcf_swap_at_ratio
+    - `ctx.engine.last_swap` (from `WeightSwapReport`) — layers_swapped, freed_bytes, latency_ms, qcf_swap_actual
+  - `policy_default.lua`에 swap 결정 예시 추가 (arch §3.4 참조):
+    - Critical + qcf_at_half < 0.3 → swap_weights ratio=0.5 q4_0
+    - Emergency → swap_weights ratio=1.0 q4_0
+  - 기존 `MemoryStrategy` engine-internal fallback 매핑도 함께 문서화
+  - Shared `EngineCommand::SwapWeights` 발행 API helper
+- **Acceptance Criteria**:
+  - Lua 바인딩 unit test (ctx 구조 노출 확인)
+  - policy_default.lua e2e test: Critical signal → SwapWeights command 발행
+  - verify 하네스 시나리오 추가 (`verify/scenarios/weight_swap_critical.yaml` 등)
+- **Notes**: Manager DPP/LinUCB와의 상호작용은 향후 작업 (Phase 5). 현재는 단순 기반 결정만.
+
+## [P2] WSWAP-3-TEST. Phase 3 spec 테스트 + E2E 통합
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: WSWAP-3-DISPATCH, WSWAP-3-QCF, WSWAP-3-LUA
+- **담당 권장**: Tester (설계) + Implementer (구현)
+- **Description**:
+  - Spec 테스트 (`tests/spec/`):
+    - `test_inv_126_swap_dtype_reject.rs` — reserved dtype 처리
+    - `test_inv_127_noise_nan_exclusion.rs` — NaN layer 제외 (decider 직접 호출)
+    - `test_inv_128_qcf_collector_leak.rs` — collector 누수 금지
+    - `test_eng_alg_214_route_dispatch.rs` — dispatch 결정 매트릭스
+    - `test_eng_alg_215_weight_swap_decider.rs` — decider 알고리즘
+    - `test_eng_alg_216_quant_noise_calc.rs` — ε 계산
+    - `test_eng_alg_217_qcf_swap_formula.rs` — QCF_swap 수식
+    - `test_eng_alg_218_importance_on_demand.rs` — on-demand 주입
+    - `test_eng_dat_095_quant_noise_table.rs` — QuantNoiseTable 구조
+    - `shared/tests/spec/test_msg_042/082/088/089.rs` — 프로토콜
+  - E2E (verify 하네스):
+    - Scenario A: 평시 (신호 없음) → zero overhead 검증
+    - Scenario B: RequestQcf → prefill → QcfEstimate layer_swap 수신 → SwapWeights 발행 → WeightSwapReport 수신
+    - Scenario C: decode 중 RequestQcf + K=512 초과 → layer_swap None
+  - ImportanceCollector armed 누수 fuzz (1000회 RequestQcf/prefill 반복, QcfEstimate 1:1 확인)
+- **Acceptance Criteria**:
+  - 모든 spec 테스트 통과
+  - 3개 E2E 시나리오 모두 통과 (호스트 CI)
+  - fuzz 테스트 누수 0건
+- **Notes**: feedback_spec_tests_required.md 준수 (inline `#[cfg(test)]` 불충분, `tests/spec/` 배치 필수).
+
+---
+
+# Phase 3.5 — `_entry_ratio_generation` Plan Invalidation 배선 (Out-of-scope from Phase 3)
+
+> **독립 PR 단위로 분리**. 이유: tensor_partition plan.rs 구조 변경 가능성이 있어 Phase 3과 리스크 분리.
+> **arch 근거**: `arch/weight_swap.md` §6.
+> **전제**: Phase 3 완료.
+
+## [P3] WSWAP-3.5-INVESTIGATE. plan.rs 구조 조사
+- **Status**: TODO
+- **Sprint**: future
+- **Dependencies**: Phase 3 완료
+- **담당 권장**: Senior Implementer
+- **Description**:
+  - `engine/src/core/plan.rs` 또는 동등 경로의 `_entry_ratio_generation` 이름/정확한 위치 파악
+  - Capture 시점 (plan build 초기), 비교 시점 (`PartitionStep::run`), bump source(현재: tensor partition 경로) 조사
+  - Weight swap의 `ratio_generation` bump가 plan 재빌드를 트리거하는지 검증 테스트 작성
+  - 미동작 시 원인 분석 (counter 공유 여부, comparison 시점 등)
+- **Acceptance Criteria**:
+  - 조사 리포트 (`results/data/weight_swap/phase_3_5_investigation.md`)
+  - 재현 가능한 테스트 케이스 (weight swap → plan stale 감지 여부)
+- **Notes**: 구현 없이 조사 및 테스트만. 설계 문제 발견 시 WSWAP-3.5-DESIGN으로 진입.
+
+## [P3] WSWAP-3.5-DESIGN. Architect: 배선 설계
+- **Status**: TODO
+- **Sprint**: future
+- **Dependencies**: WSWAP-3.5-INVESTIGATE
+- **담당 권장**: Architect
+- **Description**:
+  - INVESTIGATE 결과를 근거로 plan invalidation 배선 설계
+  - 옵션:
+    1. Weight swap 경로도 같은 `ratio_generation` counter 사용 (현재 arch 전제) — bump 호출 위치만 추가
+    2. 별도 `weight_generation` counter 도입 + plan build에서 합산
+    3. Unified `PlanInvalidation` event 시스템 도입
+  - SOLID 원칙 리뷰 + spec ENG-ALG-200(기존 plan partition) 업데이트
+- **Acceptance Criteria**:
+  - 설계 문서 (`arch/plan_partition_integration.md` 업데이트 또는 신규 `arch/plan_invalidation.md`)
+  - 새 spec ID (필요 시) 할당
+  - 테스트 요구사항 작성
+
+## [P3] WSWAP-3.5-IMPL. 구현 + 테스트
+- **Status**: TODO
+- **Sprint**: future
+- **Dependencies**: WSWAP-3.5-DESIGN
+- **담당 권장**: Senior Implementer (plan.rs 수정 위험 민감)
+- **Description**:
+  - DESIGN 결과에 따라 배선 구현
+  - 신규 spec 테스트 추가
+- **Acceptance Criteria**:
+  - Weight swap 후 첫 forward에서 plan 재빌드 or forward_gen fallback 정확히 1회 트리거
+  - 기존 tensor partition 경로 회귀 없음
+  - 모든 기존 spec 테스트 통과
 
 ---
 

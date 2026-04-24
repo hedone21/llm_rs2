@@ -1346,6 +1346,362 @@ function forward_token(model: &TransformerModel, token):
 
 ---
 
+#### 3.12.8 Phase 3 라우팅 결정 — Manager Command 직접 Dispatch [ENG-ALG-214-ROUTE]
+
+**[ENG-ALG-214-ROUTE]** Phase 3 Manager 통합에서 `EngineCommand::SwapWeights`는 **`generate.rs`의 command dispatch 루프에서 직접 수신**되어 `WeightSwapDecider` → `SwapExecutor`로 전달된다. `CachePressurePipeline`의 handler 등록 경로는 **사용하지 않는다**. *(MUST)*
+
+**근거 (기존 패턴과의 일관성)**:
+
+| EngineCommand 유형 | 기존 dispatch 경로 | 비고 |
+|-------------------|------------------|------|
+| `KvEvictH2o` / `KvEvictSliding` / `KvStreaming` / `KvMergeD2o` | `generate.rs` command dispatch → `EvictPlan` 생성 → `evict()` 직접 호출 | Pipeline은 `CachePressurePipeline`의 일반 pressure 경로에서만 사용 |
+| `KvQuantDynamic` | 직접 dispatch | |
+| `KvOffload` | 직접 dispatch → `prune_prefix` | |
+| `SetPartitionRatio` | 직접 dispatch → `prepare_tensor_partition` + `ratio_generation` bump | |
+| **`SwapWeights`** (신규) | **직접 dispatch → `WeightSwapDecider::decide` → `SwapExecutor::execute_swap`** | 본 결정 |
+
+Manager가 보내는 모든 lossy/lossless command는 명시적인 EngineCommand로 전달되며 pipeline pressure level 자동 dispatch와 구분된다. `SwapWeights`도 Manager가 **명시적으로** 발행한 결정이므로 동일 경로를 따른다.
+
+**Pipeline 경로 포기 근거**:
+
+- Pipeline은 `PressureLevel`(`Normal`~`Emergency`)이 `Warning` 이상이 될 때 자동 dispatch하는 구조이다. Weight swap은 (1) 명시적 Manager 결정, (2) ratio 값이 Manager의 LuaPolicy에서 도출됨, (3) Engine 자율이 아닌 Manager 주도이므로 자동 pressure dispatch 모델과 부적합.
+- Stage 2에서 구현된 `engine/src/core/pressure/weight_swap_handler.rs`는 **Pipeline에 등록하지 않는다**. 다음 중 한 가지 처리를 Phase 3 구현 단계에서 결정:
+  1. 내부 오케스트레이터(Decider + Executor 호출 래퍼)로 유지하되 Pipeline trait impl 제거.
+  2. `#[cfg(test)]` 유틸로 격하.
+  3. 완전 삭제 후 로직은 `generate.rs`의 dispatch handler에 통합.
+
+  본 스펙은 1번(오케스트레이터 유지)을 **권장**한다. 단위 테스트 표면적이 확보되고, 재사용 가능하기 때문이다.
+
+**Dispatch 의사코드** (`generate.rs`):
+
+```
+match command:
+    EngineCommand::SwapWeights { ratio, target_dtype } ->
+        if model.secondary_mmap.is_none():
+            respond(CommandResult::Rejected { reason: "NoSecondary" })
+            continue
+
+        if ratio <= 0.0 or ratio > 1.0:
+            respond(CommandResult::Rejected { reason: "InvalidRatio" })
+            continue
+
+        if target_dtype != DtypeTag::Q4_0:
+            // Phase 3 범위: Q4_0만 유효. 그 외 variant는 payload 호환성 확보용.
+            respond(CommandResult::Rejected { reason: "UnsupportedDtype" })
+            continue
+
+        let importance = engine.importance_table.as_deref()  // Option<&ImportanceTable>
+        let noise      = engine.quant_noise_table.as_ref()   // Option<&QuantNoiseTable>
+        let already    = engine.swap_state.already_swapped()
+
+        let layers = weight_swap_decider::decide(
+            ratio_max = ratio,
+            num_layers = model.num_decoder_layers,
+            importance = importance,
+            noise = noise,
+            already_swapped = already,
+            protected = [0, num_decoder_layers - 1],     // ENG-ALG-215
+        )
+
+        let dtype = dtype_tag_to_dtype(target_dtype)      // Q4_0 -> DType::Q4_0
+        let report = swap_executor::execute_swap(&model, &layers, dtype)
+
+        respond(CommandResult::Ok)                         // 상세 결과는 WeightSwapReport
+        send_separate(EngineMessage::WeightSwapReport(report))   // MSG-083
+```
+
+**SwapWeights Rejected 반환 조건 (명시)**:
+
+| 조건 | reason |
+|------|--------|
+| `model.secondary_mmap.is_none()` | `"NoSecondary"` (ENG-DAT-C09) |
+| `ratio <= 0.0` 또는 `ratio > 1.0` | `"InvalidRatio"` |
+| `target_dtype != DtypeTag::Q4_0` | `"UnsupportedDtype"` (Phase 3 범위 제약) |
+| 이미 모든 layer swap 완료 (needed=0) | `Ok` + 빈 report (reject 아님) |
+
+**교차 참조**:
+- `ResilienceAction::SwapWeights`(engine 내부 enum)와 `EngineCommand::SwapWeights`(shared enum)는 **서로 다른 타입**이다. Manager의 외부 결정은 `EngineCommand::SwapWeights`, engine 내부 `MemoryStrategy`가 `Level::Critical`에서 내리는 fallback 결정은 `ResilienceAction::SwapWeights`. 둘 다 같은 dispatch 루트(위 의사코드)로 귀결된다. 자세한 매핑은 arch/weight_swap.md §3에 있다.
+
+---
+
+#### 3.12.9 Layer Selection — importance × ε Bottom-k [ENG-ALG-215]
+
+**[ENG-ALG-215]** `WeightSwapDecider`는 Manager가 지정한 `ratio_max`(상한)를 decoder layer index 집합으로 변환한다. 선택 key는 `importance_i × ε_i` 오름차순이며, 이 조합이 최저인 layer들이 우선 swap 대상이 된다. 보호 layer(layer 0, 마지막 decoder layer)는 선택에서 항상 제외된다. *(MUST)*
+
+**전제**:
+- `QuantNoiseTable`(ENG-DAT-095)이 engine init에서 생성되어 있어야 한다. 없으면 ε 축은 사실상 상수 1.0 (`uniform_ones` fallback).
+- `ImportanceTable`(ENG-DAT 기존)은 `EngineCommand::RequestQcf`로 활성화된 직후 prefill에서 채워진다 (ENG-ALG-218). 없으면 uniform fallback 경로(ratio*N 균등 간격)로 내려간다.
+
+**알고리즘**:
+
+```
+function decide(ratio_max: f32,
+                num_layers: usize,
+                importance: Option<&ImportanceTable>,
+                noise: Option<&QuantNoiseTable>,
+                already_swapped: &HashSet<usize>,
+                protected: &[usize]) -> Vec<usize>:
+
+    // 1) 보호 layer 목록: 설계 규칙(layer 0, last) + caller 지정
+    let protect = protected.iter().copied()
+                    .chain([0, num_layers - 1])     // ENG-ALG-215 고정 규칙
+                    .collect::<HashSet<_>>()
+
+    // 2) 대상 개수
+    let target_count = (ratio_max * num_layers as f32).floor() as usize
+    let needed = target_count.saturating_sub(already_swapped.len())
+    if needed == 0: return Vec::new()
+
+    // 3) 후보 = 모든 layer - protected - already_swapped - ε가 NaN인 layer (INV-127)
+    let candidates: Vec<usize> = (0..num_layers)
+        .filter(|i| !protect.contains(i))
+        .filter(|i| !already_swapped.contains(i))
+        .filter(|i| noise.and_then(|t| t.epsilon(*i)).is_some() || noise.is_none())
+        .collect()
+
+    // 4) ε가 NaN인 layer는 후보에서 제외됨. noise.is_none()인 경우(테이블 부재)는
+    //    모든 non-protected/non-swapped layer가 통과 → ε=1.0으로 간주 (4단계 정렬에서 영향 無).
+
+    // 5) Key 계산 후 ascending sort
+    match importance:
+        Some(imp) =>
+            let key = |i| imp.score(i) * noise.and_then(|t| t.epsilon(i)).unwrap_or(1.0)
+            candidates.sort_by(|a, b| key(a).partial_cmp(&key(b)).unwrap_or(Ordering::Equal)
+                                         .then(a.cmp(&b)))    // tie → index asc
+            candidates.truncate(needed)
+        None =>
+            // Uniform fallback (재현성 보장, 랜덤 금지)
+            let selected = uniform_select_by_index(needed, &candidates)
+            return selected
+
+    return candidates
+```
+
+**보호 layer 결정 근거**:
+
+| 보호 | 근거 |
+|------|------|
+| Layer 0 | 임베딩 바로 뒤 attention 진입점. skip QCF 논문(ENG-ALG-048)과 동일 방침. |
+| 마지막 decoder layer (`num_layers - 1`) | LM head projection 직전. feature 표현 완성도에 가장 큰 영향. 동일 논문 근거. |
+
+**tie-breaking**: key(i) == key(j)일 때 **layer index 오름차순**. 재현성 보장 (seed/랜덤 금지).
+
+**Uniform fallback (importance 없을 때)**:
+
+```
+function uniform_select_by_index(needed: usize, candidates: &[usize]) -> Vec<usize>:
+    if needed >= candidates.len(): return candidates.to_vec()
+    // 균등 간격 선택
+    let stride = candidates.len() as f32 / needed as f32
+    let mut out = Vec::with_capacity(needed)
+    for k in 0..needed:
+        let idx = (k as f32 * stride).floor() as usize
+        out.push(candidates[idx])
+    out
+```
+
+**모델별 차이 없음**: ratio 기반이므로 Llama (16 layer - 2 protected = 14 candidate, ratio=0.5 → 8 select)와 Qwen (28 layer - 2 protected = 26 candidate, ratio=0.5 → 14 select) 자동 적응.
+
+**이전 ENG-ALG-213과의 관계**: ENG-ALG-213은 `SwapDecider`의 간단 버전으로 Phase 2에서 정의됐다. Phase 3에서 ENG-ALG-215가 이를 **대체**한다. ENG-ALG-213은 ENG-ALG-215의 uniform fallback 경로로 흡수되었다. (213 ID는 유효하되 의미는 "uniform fallback 하위 알고리즘"으로 축소)
+
+---
+
+#### 3.12.10 ε (Quantization Noise Factor) Computation [ENG-ALG-216]
+
+**[ENG-ALG-216]** ε 계산은 engine init에서 secondary mmap open 직후 eager하게 1회 수행된다. 각 decoder layer의 tensor별 Frobenius 상대 오차 제곱을 구해 layer 단위로 합산한다. *(MUST)*
+
+**수식**:
+
+```
+layer_i의 tensor set = { Q, K, V, O, gate, up, down, attn_norm, ffn_norm }
+// 단, norm tensor는 일반적으로 F32로 유지 → skip (quantize 대상이 아님)
+tensor_set_i = { Q_i, K_i, V_i, O_i, gate_i, up_i, down_i }
+
+for each tensor t in tensor_set_i:
+    W_primary      = load as f32 from primary mmap (dtype = default_dtype)
+    W_secondary_fp = dequantize(load from secondary mmap)   // Q4_0 → f32
+    num_t   = || W_primary - W_secondary_fp ||_F²            // Frobenius norm squared
+    denom_t = || W_primary ||_F²
+    ε_t = num_t / max(denom_t, ε_EPS)                        // ε_EPS = 1e-12
+
+// Layer 단위 합산
+ε_i = Σ_{t ∈ tensor_set_i} ε_t         // 단순 합 (weighted 가중치는 현재 없음)
+```
+
+**저장**: `QuantNoiseTable::per_layer[i] = ε_i` (ENG-DAT-095).
+
+**Dequantize 경로**:
+- Q4_0: 기존 `engine/src/backend/cpu_neon.rs` 또는 동등 경로의 block-level dequantize 재사용.
+- 계산은 **호스트 CPU**에서만 수행. GPU 버퍼 생성 전 단계.
+
+**실패 처리**:
+
+| 조건 | 처리 |
+|------|------|
+| tensor t의 shape mismatch (primary vs secondary) | loader가 이미 거부했을 것 (ENG-DAT-C10). 도달 불가. 도달하면 `ε_t = 1.0` fallback. |
+| dequantize 실패 (unlikely) | `ε_t = 1.0`, warn log. |
+| 개별 layer i의 모든 tensor 실패 | `ε_i = f32::NAN` → INV-127에 의해 decider에서 제외. |
+| 전체 실패 (secondary mmap 오류 등) | `QuantNoiseTable::uniform_ones(num_layers)`, `computed_at_init = false`. Engine 기동은 계속. |
+
+**성능 고려**:
+- Llama 3.2 1B: 16 layer × 7 tensor × 평균 ~18MiB = 약 2 GiB 순회. Frobenius는 덧셈/곱셈만 수행 → 최신 호스트 CPU에서 200~500ms 예상.
+- 5초 이상 예상 디바이스 (Android 저성능 기기)에서는 loader가 **progress log** 출력 권장 (layer 단위 진행률). *(SHOULD)*
+- 이 시간은 engine 기동 지연으로 흡수된다 (첫 prefill 이전).
+
+**교차 참조**:
+- 저장 구조: ENG-DAT-095 (`QuantNoiseTable`).
+- 소비처: ENG-ALG-215 (decider key).
+- 불변식: INV-127.
+
+---
+
+#### 3.12.11 QCF_swap Formula [ENG-ALG-217]
+
+**[ENG-ALG-217]** `compute_qcf_swap(swap_set, noise, importance)`는 주어진 layer swap 집합의 품질 비용을 `[0, 1]` 스칼라로 추정한다. Importance와 ε를 함께 가중한 분자/분모 정규화를 사용한다. *(MUST)*
+
+**수식**:
+
+```
+QCF_swap(swap_set)
+    = Σ_{i ∈ swap_set} importance_i × ε_i
+    ──────────────────────────────────────
+    Σ_{j ∈ all_decoder_layers} importance_j × ε_j
+```
+
+**정규화 기준 선택 근거** (두 대안 중):
+
+| 옵션 | 분모 | 특성 |
+|------|------|------|
+| (A) **채택** | `Σ_all importance × ε` | ratio=1.0 (전체 swap) 시 `QCF_swap = 1.0` 정확히 달성. ε 불균등에 대한 scale-invariance. |
+| (B) 기각 | `Σ_all importance` | ε ≠ 상수일 때 QCF가 1.0을 넘을 수 있음. ε의 절대 scale에 민감. |
+
+옵션 (A)를 채택하는 이유: Manager의 LinUCB 학습(INV-106~116)과 DPP cost function(MGR-DPP-010)이 `[0, 1]` 범위를 전제하므로, QCF_swap이 이 범위를 벗어나면 cost comparison이 왜곡된다. Scale-invariance도 importance table이 변동하더라도 비교 가능한 비율을 유지한다.
+
+**NaN/결측 처리**:
+
+- `ε_i`가 NaN (계산 실패)인 layer는 분모 합에서도 **제외**된다. 즉, 유효 layer만으로 정규화한다.
+- `importance_i`가 결측(ImportanceTable 없음)이면 `importance_i = 1.0`으로 간주 → 결과적으로 `QCF_swap = |swap_set| / |valid_layers|` (ε 가중만).
+- `ε_i = 0`인 layer (primary와 완전 일치, 이론상 가능하나 거의 발생 X)는 분자 기여 0, 분모 기여 0. 결과는 다른 layer 분으로 결정.
+
+**구현 위치 권장**:
+
+- `engine/src/core/qcf/` 디렉토리에 신규 파일 `quant_qcf.rs` 추가, 또는 `ImportanceTable`의 impl block에 추가.
+- 공개 함수 시그니처:
+  ```
+  pub fn compute_qcf_swap(
+      swap_set: &[usize],
+      noise: &QuantNoiseTable,
+      importance: Option<&ImportanceTable>,
+  ) -> f32
+  ```
+- Skip QCF(`compute_qcf`)와는 **별도 함수**이다. 수식 형태는 유사하나 ε 가중이 추가된 점이 본질적 차이.
+
+**불변식**:
+
+- `0.0 <= QCF_swap(S) <= 1.0` for any `S ⊆ valid_layers`.
+- `QCF_swap(∅) == 0.0`.
+- `QCF_swap(valid_layers) == 1.0`.
+- `S1 ⊆ S2 ⇒ QCF_swap(S1) <= QCF_swap(S2)` (단조성).
+
+**교차 참조**:
+- 데이터: ENG-DAT-095 (`QuantNoiseTable`).
+- 결정: ENG-ALG-215 (decider가 계산한 `swap_set`을 입력).
+- 응답: ENG-ALG-218 (`QcfEstimate`에 포함).
+
+---
+
+#### 3.12.12 On-Demand ImportanceCollector Injection [ENG-ALG-218]
+
+**[ENG-ALG-218]** `EngineCommand::RequestQcf`가 도착하면 engine은 **다음 prefill** 시작 시점에 `ImportanceCollector`를 layer loop에 주입하도록 플래그를 ON한다. 해당 prefill이 끝나면 테이블을 finalize하고 `EngineMessage::QcfEstimate`를 반드시 전송한다. *(MUST)*
+
+**기존 ENG-ALG-050과의 관계**:
+- ENG-ALG-050은 RequestQcf의 **KV cache 경로**(6종 action dry-run)를 정의한다.
+- ENG-ALG-218은 RequestQcf의 **weight swap 경로** 확장이다. 두 경로는 **같은 RequestQcf 도착에서 동시에 활성화**된다. 응답 `QcfEstimate`는 두 경로의 결과를 모두 포함한다 (KV action estimates + weight swap estimate).
+
+**흐름 (상태 머신)**:
+
+```
+states: Idle → Armed → Collecting → Finalizing → Idle
+
+on EngineCommand::RequestQcf received:
+    if state == Idle and engine.secondary_mmap.is_some():
+        collector_flag = Armed                      // 다음 prefill에서 주입
+        pending_request = Some(request)
+    elif state != Idle:
+        // 이미 진행 중인 측정이 있음. Re-arm은 하지 않음.
+        // 단, 기존 측정 완료 시 새로운 Request는 자동으로 다음 prefill에 armed.
+        pending_request.queue(request)
+
+on prefill_start:
+    if collector_flag == Armed:
+        importance_collector.active = true
+        collector_flag = Collecting
+        tail_target_token = prefill_last_token_idx
+    else:
+        importance_collector.active = false        // 평시 zero overhead
+
+on layer.forward() (prefill 중):
+    if importance_collector.active:
+        importance_collector.snapshot_before(x)
+        // ... layer forward ...
+        importance_collector.record_after(x, layer_id)
+    else:
+        // 평시: early return, 오버헤드 0
+
+on prefill_end:
+    if collector_flag == Collecting:
+        let table = importance_collector.finalize()    // ImportanceTable
+        engine.importance_table = Some(Arc::new(table))
+        importance_collector.active = false
+        collector_flag = Finalizing
+        build_and_send_qcf_estimate()                  // MSG-084
+        collector_flag = Idle
+        pending_request = None
+```
+
+**K=512 Fallback 규약**:
+- RequestQcf 도착 시점이 **decode 중**이고 다음 prefill까지의 대기 시간이 불확실한 경우:
+  - `K=512` 토큰 이내에 새 prefill이 시작되면 그 prefill의 tail에서 측정.
+  - `K=512` 토큰 초과 시 (장문 생성 등): engine은 **fallback 경로**로 내려간다.
+- Fallback 경로 선택:
+  1. **우선**: 현재 decode 토큰 중 최근 K=512개로 importance를 누적 측정 (sliding window 방식). 단, decode에서는 per-layer activation divergence 계산이 prefill보다 덜 정밀하다는 점을 문서화한다.
+  2. **차선**: 측정 실패를 Manager에 통지 (`QcfEstimate`에 `weight_swap: None`). Manager는 uniform decider fallback을 기대하면 된다.
+- 본 스펙은 **차선 (2)**를 기본으로 삼고, (1)은 추후 확장으로 남긴다. 이유: decode 중 ImportanceCollector 경로가 검증되지 않았고, forward 오버헤드 평가가 추가로 필요하기 때문.
+
+**prefill 길이가 K=512 미만일 때**:
+- Prefill 전체를 tail로 간주한다 (N=1 "last token" 정의 그대로). `tail_target_token = prefill_last_token`은 길이에 무관하게 유효.
+
+**QcfEstimate 응답 페이로드 확장**:
+
+기존 `QcfEstimate { estimates: HashMap<String, f32> }` (ENG-ALG-050)에 **weight swap 경로 필드**를 추가:
+
+```
+QcfEstimate {
+    estimates: HashMap<String, f32>,         // 기존 KV action estimates (ENG-ALG-050)
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    layer_swap: Option<LayerSwapEstimate>,   // 신규. 본 측정 경로의 결과.
+}
+
+LayerSwapEstimate {
+    per_layer_importance: Vec<f32>,          // 길이 = num_decoder_layers. 결측은 0.0.
+    per_layer_noise:      Vec<f32>,          // 길이 = num_decoder_layers. NaN 포함 가능.
+    qcf_swap_at_ratio:    HashMap<String, f32>,  // e.g. {"0.25": 0.12, "0.5": 0.34, "1.0": 1.0}
+}
+```
+
+- `qcf_swap_at_ratio`는 Manager LuaPolicy가 자주 쓰는 사전 계산 값 (0.25/0.5/1.0). Manager는 이 중 하나를 고르거나, `per_layer_importance + per_layer_noise`로 임의 ratio의 QCF_swap을 계산할 수 있다.
+- 기본 3개 값 외 Manager가 원하는 점은 `per_layer_*`로 직접 계산.
+
+**불변식**: INV-128 — `collector_flag == Armed or Collecting`인 상태로 prefill이 진행됐다면 **반드시** `QcfEstimate`를 송출하고 `Idle`로 복귀해야 한다. 누수(armed된 채 다음 RequestQcf가 와도 측정 없음) 금지.
+
+**교차 참조**:
+- 프로토콜: MSG-084 (QcfEstimate 확장), SEQ-095/096 (기존 RequestQcf 시퀀스) — 본 확장은 동일 시퀀스에서 payload만 추가.
+- 소비처: Manager LuaPolicy (ctx.qcf.layer_swap.*).
+- ImportanceCollector 기존 위치: `engine/src/core/qcf/layer_importance.rs` (ENG-ALG-030/048 경로 재사용).
+
+---
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.
