@@ -3002,6 +3002,19 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
+    // Weight swap state (ENG-ALG-218 + ENG-ALG-214-ROUTE).
+    //
+    // `importance_table_for_swap`: most-recently collected per-layer
+    // importance table from an on-demand prefill measurement.  `None`
+    // until the first `RequestQcf` prefill completes.
+    //
+    // `collector_armed`: true when a `RequestQcf` has been received and
+    // we are waiting for the next prefill to inject `ImportanceCollector`.
+    // This is a lightweight bool; the actual collector lives on the stack
+    // during prefill (not stored here).
+    let mut importance_table_for_swap: Option<llm_rs2::core::qcf::ImportanceTable> = None;
+    let mut collector_armed = false;
+
     // === PREFILL PHASE ===
     let mut deferred_switch: Option<String> = None;
     {
@@ -3093,6 +3106,19 @@ fn main() -> anyhow::Result<()> {
             executor.set_prefill_state("prefill", 0, process_len);
         }
 
+        // ENG-ALG-218: if collector is armed, prepare a collector for this prefill.
+        // Armed by `RequestQcf` handler in decode loop; collector is injected into
+        // the last prefill chunk so it captures the final contextual activation state.
+        let mut on_demand_collector: Option<llm_rs2::core::qcf::ImportanceCollector> =
+            if collector_armed {
+                Some(llm_rs2::core::qcf::ImportanceCollector::new())
+            } else {
+                None
+            };
+        if collector_armed {
+            collector_armed = false; // consume the flag; armed at most once per prefill
+        }
+
         let mut chunk_start = 0;
         let mut chunk_idx = 0usize;
         while chunk_start < process_len {
@@ -3101,6 +3127,12 @@ fn main() -> anyhow::Result<()> {
             let chunk_end = (chunk_start + ecs).min(process_len);
             let chunk_tokens = &tokens[chunk_start..chunk_end];
             let chunk_len = chunk_tokens.len();
+
+            // ENG-ALG-218: inject collector only on the last prefill chunk.
+            // Earlier chunks have partial seq_len; the last chunk captures final
+            // contextual state which is most representative for per-layer importance.
+            let is_last_chunk = chunk_end >= process_len;
+            let inject_collector = is_last_chunk && on_demand_collector.is_some();
 
             let chunk_trace = std::env::var("LLMRS_PREFILL_CHUNK_MS").is_ok();
             let t_chunk_start = std::time::Instant::now();
@@ -3134,7 +3166,11 @@ fn main() -> anyhow::Result<()> {
                 score_accumulator: None, // No score tracking during prefill
                 profiler: profiler.as_mut().map(|p| &mut p.ops),
                 skip_config: None,
-                importance_collector: None,
+                importance_collector: if inject_collector {
+                    on_demand_collector.as_mut()
+                } else {
+                    None
+                },
                 // Chunked mode: only the last position's logits needed (saves GPU memory).
                 // Non-chunked: write all positions (original behaviour).
                 logits_last_only: chunked,
@@ -3331,6 +3367,23 @@ fn main() -> anyhow::Result<()> {
             }
 
             chunk_idx += 1;
+        }
+
+        // ENG-ALG-218: finalize on-demand ImportanceCollector after prefill completes.
+        // INV-128: this block always runs (normal fall-through from the while loop),
+        // so QcfEstimate is guaranteed to be sent when the prefill completes successfully.
+        // For panics/early-return paths the caller-side Drop guard is the safety net.
+        if let Some(collector) = on_demand_collector.take() {
+            let table: llm_rs2::core::qcf::ImportanceTable = collector.build();
+            let layer_swap = build_layer_swap_estimate(&model, Some(&table));
+            if let Some(executor) = &mut command_executor {
+                executor.send_qcf_estimate(llm_shared::QcfEstimate {
+                    estimates: std::collections::HashMap::new(),
+                    layer_swap,
+                });
+                log::debug!("[QCF] QcfEstimate sent after prefill finalization (ENG-ALG-218)");
+            }
+            importance_table_for_swap = Some(table);
         }
 
         let prefill_forward_ms = prefill_timer.elapsed().as_secs_f64() * 1000.0;
@@ -4428,6 +4481,13 @@ fn main() -> anyhow::Result<()> {
 
                 // SEQ-095/096: Compute and send QCF estimates if requested
                 if plan.request_qcf {
+                    // ENG-ALG-218: if secondary mmap is present, arm the collector
+                    // so the next prefill injects ImportanceCollector.
+                    if model.secondary_mmap.is_some() && !collector_armed {
+                        collector_armed = true;
+                        eprintln!("[WeightSwap] ImportanceCollector armed for next prefill");
+                    }
+
                     // Derive streaming window: same logic as policy construction
                     let streaming_window_size = if args.streaming_window > 0 {
                         args.streaming_window
@@ -4465,7 +4525,7 @@ fn main() -> anyhow::Result<()> {
                         kv_caches: &kv_caches,
                         score_accumulator: score_accumulator.as_ref(),
                         streaming_config: Some((args.sink_size, streaming_window_size)),
-                        importance_table: None, // Not collected in standard decode path
+                        importance_table: importance_table_for_swap.as_ref(),
                         num_layers: model.config.num_hidden_layers,
                         kivi_caches: None,
                     };
@@ -4480,10 +4540,28 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
 
+                    // Build layer_swap estimate if importance table is available
+                    // (set by a previous prefill) and secondary is present.
+                    let layer_swap =
+                        build_layer_swap_estimate(&model, importance_table_for_swap.as_ref());
+
                     executor.send_qcf_estimate(llm_shared::QcfEstimate {
                         estimates,
-                        layer_swap: None,
+                        layer_swap,
                     });
+                }
+
+                // ENG-ALG-214-ROUTE: direct dispatch of SwapWeights command.
+                // Validation → WeightSwapDecider → SwapExecutor → WeightSwapReport.
+                if let Some((ratio, target_dtype)) = plan.swap_weights {
+                    dispatch_swap_weights(
+                        &model,
+                        ratio,
+                        target_dtype,
+                        importance_table_for_swap.as_ref(),
+                        executor,
+                        &cpu_backend_arc,
+                    );
                 }
 
                 if let Some(evict) = &plan.evict {
@@ -5790,6 +5868,189 @@ fn compute_qcf_estimates(ctx: &QcfEstimateContext<'_>) -> std::collections::Hash
     }
 
     estimates
+}
+
+// ── Weight swap dispatch (ENG-ALG-214-ROUTE) ────────────────────────────────
+
+/// Execute a SwapWeights command: validate → decide → execute → report.
+///
+/// This is the direct-dispatch path mandated by ENG-ALG-214-ROUTE.  The
+/// function sends `CommandResult::Ok` first (via `executor.respond_ok()`),
+/// then follows up with `EngineMessage::WeightSwapReport`.
+///
+/// Rejection (no-secondary, invalid-ratio, unsupported-dtype) is logged to
+/// stderr; no `WeightSwapReport` is sent for rejected commands.
+fn dispatch_swap_weights(
+    model: &llm_rs2::models::transformer::TransformerModel,
+    ratio: f32,
+    target_dtype: llm_shared::DtypeTag,
+    importance_table: Option<&llm_rs2::core::qcf::ImportanceTable>,
+    executor: &mut llm_rs2::resilience::CommandExecutor,
+    cpu_backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
+) {
+    use llm_rs2::core::buffer::DType;
+    use llm_rs2::models::weights::swap_executor::SwapExecutor;
+    use llm_rs2::models::weights::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
+    use llm_shared::DtypeTag;
+
+    // ── 1. Validation ──────────────────────────────────────────────────────
+    if model.secondary_mmap.is_none() {
+        eprintln!("[WeightSwap] Rejected: no_secondary (ENG-DAT-C09)");
+        return;
+    }
+    if ratio <= 0.0 || ratio > 1.0 {
+        eprintln!("[WeightSwap] Rejected: invalid_ratio ({:.4})", ratio);
+        return;
+    }
+    if target_dtype != DtypeTag::Q4_0 {
+        eprintln!(
+            "[WeightSwap] Rejected: unsupported_dtype ({:?}) (INV-126)",
+            target_dtype
+        );
+        return;
+    }
+
+    // ── 2. Collect currently-swapped layers ────────────────────────────────
+    let n_layers = model.layers.len();
+    let currently_swapped: Vec<usize> = (0..n_layers)
+        .filter(|&i| model.layers[i].current_dtype() == DType::Q4_0)
+        .collect();
+
+    // ── 3. Decider ─────────────────────────────────────────────────────────
+    let decider = WeightSwapDecider {
+        importance: importance_table,
+        noise: Some(&model.quant_noise),
+        n_decoder_layers: n_layers,
+        currently_swapped: &currently_swapped,
+    };
+    let decision: SwapDecision = decider.decide(ratio);
+
+    if decision.selected_layers.is_empty() {
+        eprintln!(
+            "[WeightSwap] No layers to swap (ratio={:.2}, already_swapped={})",
+            ratio,
+            currently_swapped.len()
+        );
+        // Empty swap is Ok per spec (already fully swapped)
+        return;
+    }
+
+    // ── 4. Execute ─────────────────────────────────────────────────────────
+    let swap_memory = llm_rs2::memory::galloc::Galloc::new();
+    let executor_sw = SwapExecutor::new(
+        DType::Q4_0,
+        &model.config,
+        cpu_backend.clone(),
+        &swap_memory,
+    );
+
+    let t_start = std::time::Instant::now();
+    match executor_sw.execute(model, &decision.selected_layers) {
+        Ok(report) => {
+            let latency_ms = t_start.elapsed().as_millis() as u64;
+
+            // ── 5. Build WeightSwapReport (MSG-089) ──────────────────────
+            let layers_swapped: Vec<llm_shared::LayerSwapEntry> = report
+                .swapped
+                .iter()
+                .map(|s| llm_shared::LayerSwapEntry {
+                    layer_idx: s.layer_idx as u32,
+                    from_dtype: llm_shared::DtypeTag::F16, // primary is F16 by convention
+                    to_dtype: llm_shared::DtypeTag::Q4_0,
+                })
+                .collect();
+
+            // Compute actual QCF_swap for the layers that were actually swapped.
+            let actually_swapped: Vec<usize> = report.swapped.iter().map(|s| s.layer_idx).collect();
+            let qcf_swap_actual = if actually_swapped.is_empty() {
+                0.0
+            } else {
+                compute_qcf_swap(
+                    &actually_swapped,
+                    &model.quant_noise,
+                    importance_table,
+                    n_layers,
+                )
+            };
+
+            eprintln!(
+                "[WeightSwap] OK: ratio={:.2}, swapped={}/{}, qcf_swap={:.4}, latency={}ms",
+                ratio,
+                report.swapped.len(),
+                n_layers,
+                qcf_swap_actual,
+                latency_ms,
+            );
+
+            executor.send_weight_swap_report(llm_shared::WeightSwapReport {
+                layers_swapped,
+                freed_bytes: 0, // madvise accounting not yet wired here
+                latency_ms,
+                qcf_swap_actual,
+            });
+        }
+        Err(e) => {
+            eprintln!("[WeightSwap] execute failed: {}", e);
+        }
+    }
+}
+
+/// Build `LayerSwapEstimate` from an available `ImportanceTable` + model noise table.
+///
+/// Returns `None` when secondary mmap is absent or no importance table has been
+/// collected yet (i.e., on the very first `RequestQcf` before any prefill).
+fn build_layer_swap_estimate(
+    model: &llm_rs2::models::transformer::TransformerModel,
+    importance_table: Option<&llm_rs2::core::qcf::ImportanceTable>,
+) -> Option<llm_shared::LayerSwapEstimate> {
+    // secondary must be present for weight swap to make sense
+    model.secondary_mmap.as_ref()?;
+
+    let imp = importance_table?;
+
+    let n = model.layers.len();
+    let noise = &model.quant_noise;
+
+    // per_layer_importance: indexed by decoder layer id
+    let per_layer_importance: Vec<f32> = (0..n)
+        .map(|i| {
+            imp.entries()
+                .iter()
+                .find(|e| {
+                    e.layer_id == i
+                        && e.sublayer == llm_rs2::core::qcf::layer_importance::SubLayer::Full
+                })
+                .map(|e| e.importance)
+                .unwrap_or(0.0)
+        })
+        .collect();
+
+    // per_layer_noise: None for NaN/missing
+    let per_layer_noise: Vec<Option<f32>> = (0..n).map(|i| noise.epsilon(i)).collect();
+
+    // qcf_swap_at_ratio: sample at representative ratios
+    use llm_rs2::models::weights::WeightSwapDecider;
+    use std::collections::HashMap;
+
+    let sample_ratios = [0.1f32, 0.25, 0.5, 0.75, 1.0];
+    let mut qcf_swap_at_ratio: HashMap<String, f32> = HashMap::new();
+
+    for &r in &sample_ratios {
+        let decider = WeightSwapDecider {
+            importance: Some(imp),
+            noise: Some(noise),
+            n_decoder_layers: n,
+            currently_swapped: &[],
+        };
+        let (_, qcf) = decider.decide_dry_run(r);
+        qcf_swap_at_ratio.insert(format!("{:.2}", r), qcf);
+    }
+
+    Some(llm_shared::LayerSwapEstimate {
+        per_layer_importance,
+        per_layer_noise,
+        qcf_swap_at_ratio,
+    })
 }
 
 fn command_summary(cmd: &EngineCommand) -> String {
