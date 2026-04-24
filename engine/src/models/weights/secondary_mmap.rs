@@ -114,17 +114,18 @@ pub struct LayerTensorSlice {
     pub tensors: HashMap<String, SecondaryTensorInfo>,
 }
 
-/// Handle to a secondary GGUF file kept alive for the lifetime of
-/// `TransformerWeights`. Carries the raw mmap plus the pre-parsed tensor
-/// index so Phase 2 can locate bytes in O(1) per tensor.
+/// Handle to a secondary GGUF file kept alive for the lifetime of the model.
+/// Carries the raw mmap plus the pre-parsed tensor index so Phase 2 can
+/// locate bytes in O(1) per tensor.
+///
+/// Cross-layer tensors (embedding, output_norm, output) are intentionally
+/// **not** indexed here (ENG-DAT-C11). Phase 1/2 only swap decoder block
+/// weights; the `cross_layer_offsets` stub was removed in Stage 2 cleanup.
 pub struct SecondaryMmap {
     /// Underlying GGUF parse (keeps mmap handle alive).
     pub gguf: GgufFile,
     /// Indexed by `layer_idx`. Length = num decoder layers.
     pub layer_index: Vec<LayerTensorSlice>,
-    /// Cross-layer tensors (embedding, output_norm, output) kept for metadata
-    /// checks. Phase 1 does not swap these (ENG-DAT-C11).
-    pub cross_layer_offsets: HashMap<String, SecondaryTensorInfo>,
     /// Source path, preserved for diagnostic messages.
     pub source_path: PathBuf,
 }
@@ -134,7 +135,6 @@ impl std::fmt::Debug for SecondaryMmap {
         f.debug_struct("SecondaryMmap")
             .field("source_path", &self.source_path)
             .field("num_layers", &self.layer_index.len())
-            .field("cross_layer_tensors", &self.cross_layer_offsets.len())
             .finish()
     }
 }
@@ -182,10 +182,10 @@ pub fn open_secondary(
 
     // Build per-layer slice index. We enumerate primary tensors to ensure the
     // secondary covers everything we may later swap; the reverse direction
-    // (secondary extras) is tolerated.
+    // (secondary extras) is tolerated. Cross-layer tensors (embedding, norms,
+    // lm_head) are intentionally skipped — they are never swapped (ENG-DAT-C11).
     let num_layers = primary_config.num_hidden_layers;
     let mut layer_index: Vec<LayerTensorSlice> = vec![LayerTensorSlice::default(); num_layers];
-    let mut cross_layer_offsets: HashMap<String, SecondaryTensorInfo> = HashMap::new();
 
     let tensor_data_offset = gguf.tensor_data_offset();
     for info in &gguf.tensors {
@@ -214,9 +214,8 @@ pub fn open_secondary(
             layer_index[layer_idx]
                 .tensors
                 .insert(subname.to_string(), slice_info);
-        } else {
-            cross_layer_offsets.insert(info.name.clone(), slice_info);
         }
+        // Cross-layer tensors are silently skipped (not indexed, ENG-DAT-C11).
     }
 
     // Validate shape match for decoder tensors present in the primary file.
@@ -244,7 +243,6 @@ pub fn open_secondary(
     Ok(SecondaryMmap {
         gguf,
         layer_index,
-        cross_layer_offsets,
         source_path: path.to_path_buf(),
     })
 }
