@@ -1018,7 +1018,7 @@ fn main() -> anyhow::Result<()> {
             || model
                 .layers
                 .first()
-                .map_or(false, |l| l.wq.dtype() == DType::Q4_0);
+                .is_some_and(|l| l.load_weights().wq.dtype() == DType::Q4_0);
         if actual_q4 {
             match model.prepare_noshuffle_buffers(&backend) {
                 Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
@@ -1029,8 +1029,10 @@ fn main() -> anyhow::Result<()> {
 
     // Check if model weights are on GPU (cl_mem accessible) — needed for CPU→GPU switch.
     #[cfg(feature = "opencl")]
-    let weights_on_gpu =
-        llm_rs2::backend::opencl::get_cl_mem(model.layers[0].wq.buffer().as_ref()).is_ok();
+    let weights_on_gpu = {
+        let layer0 = model.layers[0].load_weights();
+        llm_rs2::backend::opencl::get_cl_mem(layer0.wq.buffer().as_ref()).is_ok()
+    };
     #[cfg(not(feature = "opencl"))]
     let weights_on_gpu = false;
 
@@ -2037,7 +2039,8 @@ fn main() -> anyhow::Result<()> {
         // Attach partition workspace if tensor partition is active.
         // Use UnifiedBuffer (ALLOC_HOST_PTR, host-accessible + GPU-accessible) for partition
         // buffers so merge can use direct pointer access instead of read_buffer/write_buffer.
-        if let Some(ref ctx) = model.layers[0].partition_ctx {
+        let layer0_partition_probe = model.layers[0].load_weights();
+        if let Some(ref ctx) = layer0_partition_probe.partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, memory.as_ref());
 
             // Zero-copy residual: permanent-map ws.residual's UnifiedBuffer so the
@@ -2377,7 +2380,8 @@ fn main() -> anyhow::Result<()> {
                             eprintln!("[Prefill] Policy: yield_ms -> {}", v);
                         }
                         if let Some(v) = plan.prefill_cpu_chunk_size {
-                            if v > 0 && model.layers[0].wq.as_ptr().is_null() {
+                            let layer0_probe = model.layers[0].load_weights();
+                            if v > 0 && layer0_probe.wq.as_ptr().is_null() {
                                 eprintln!(
                                     "[Prefill] Policy: cpu_chunk_size={} rejected — weights not CPU-accessible. \
                                      Use --resilience-prealloc-switch or --prefill-cpu-chunk-size at CLI.",
@@ -3130,7 +3134,8 @@ fn main() -> anyhow::Result<()> {
                     eprintln!("[Prefill] Policy: yield_ms -> {}", v);
                 }
                 if let Some(v) = plan.prefill_cpu_chunk_size {
-                    if v > 0 && model.layers[0].wq.as_ptr().is_null() {
+                    let layer0_probe = model.layers[0].load_weights();
+                    if v > 0 && layer0_probe.wq.as_ptr().is_null() {
                         eprintln!(
                             "[Prefill] Policy: cpu_chunk_size={} rejected — weights not CPU-accessible. \
                              Use --resilience-prealloc-switch or --prefill-cpu-chunk-size at CLI.",
@@ -3496,7 +3501,8 @@ fn main() -> anyhow::Result<()> {
 
         // Attach partition workspace if tensor partition is active.
         // Use UnifiedBuffer (ALLOC_HOST_PTR) for zero-copy merge (see batch path above).
-        if let Some(ref ctx) = model.layers[0].partition_ctx {
+        let layer0_partition_probe = model.layers[0].load_weights();
+        if let Some(ref ctx) = layer0_partition_probe.partition_ctx {
             let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
 
             // Zero-copy residual (see line 1807 block for rationale).
@@ -3771,7 +3777,10 @@ fn main() -> anyhow::Result<()> {
         // `execute_plan` resetting `gpu_plan = None` for KV-resize
         // invalidation still takes the rebuild path on the next token.
         #[cfg(feature = "opencl")]
-        let partition_active_any = model.layers.iter().any(|l| l.partition_ctx.is_some());
+        let partition_active_any = model
+            .layers
+            .iter()
+            .any(|s| s.load_weights().partition_ctx.is_some());
         #[cfg(feature = "opencl")]
         let mut gpu_plan_sticky_disabled = partition_active_any && gpu_plan.is_none();
 
@@ -4599,8 +4608,12 @@ fn main() -> anyhow::Result<()> {
                 {
                     if ratio <= 0.0 || ratio >= 1.0 {
                         // Disable partition: clear partition_ctx from all layers
-                        for layer in &mut model.layers {
-                            layer.partition_ctx = None;
+                        // via atomic clone-and-swap (ArcSwap snapshot replace).
+                        for slot in &model.layers {
+                            let old = slot.load_weights();
+                            let mut new = (*old).clone();
+                            new.partition_ctx = None;
+                            slot.store_weights_same_dtype(Arc::new(new));
                         }
                         gen_ws.partition_ws = None;
                         eprintln!("[Partition] Disabled (ratio={})", ratio);
@@ -4617,8 +4630,11 @@ fn main() -> anyhow::Result<()> {
                         // so forward() skips the host staging / CPU matmul / merge
                         // path entirely. No lazy `map_weights_for_cpu` needed here
                         // because the CPU side is unused at this ratio.
-                        for layer in &mut model.layers {
-                            layer.partition_ctx = None;
+                        for slot in &model.layers {
+                            let old = slot.load_weights();
+                            let mut new = (*old).clone();
+                            new.partition_ctx = None;
+                            slot.store_weights_same_dtype(Arc::new(new));
                         }
                         gen_ws.partition_ws = None;
                         eprintln!(
@@ -4642,7 +4658,7 @@ fn main() -> anyhow::Result<()> {
                         // stall is logged for downstream TBT accounting.
                         let mut lazy_map_ok = true;
                         #[cfg(feature = "opencl")]
-                        if is_gpu && model.layers[0].wq.as_ptr().is_null() {
+                        if is_gpu && model.layers[0].load_weights().wq.as_ptr().is_null() {
                             let t0 = std::time::Instant::now();
                             match model.map_weights_for_cpu(&backend) {
                                 Ok(n) if n > 0 => eprintln!(
@@ -4669,7 +4685,8 @@ fn main() -> anyhow::Result<()> {
                                         n, ratio
                                     );
                                     // Reallocate workspace
-                                    if let Some(ref ctx) = model.layers[0].partition_ctx {
+                                    let layer0_probe = model.layers[0].load_weights();
+                                    if let Some(ref ctx) = layer0_probe.partition_ctx {
                                         let gpu_alloc =
                                             make_partition_gpu_alloc(&*backend, decode_mem);
                                         gen_ws.partition_ws = Some(Arc::new(PartitionWsCell::new(
@@ -4722,10 +4739,9 @@ fn main() -> anyhow::Result<()> {
                                     #[cfg(feature = "opencl")]
                                     if is_gpu {
                                         let actual_q4 = w_dtype == DType::Q4_0
-                                            || model
-                                                .layers
-                                                .first()
-                                                .is_some_and(|l| l.wq.dtype() == DType::Q4_0);
+                                            || model.layers.first().is_some_and(|l| {
+                                                l.load_weights().wq.dtype() == DType::Q4_0
+                                            });
                                         if actual_q4
                                             && let Some(ocl_be) = backend
                                                 .as_any()
@@ -4939,7 +4955,8 @@ fn main() -> anyhow::Result<()> {
                     let cli_ratio = args.tensor_partition;
                     if cli_ratio > 0.0 && cli_ratio < 1.0 {
                         // Restore to CLI partition ratio
-                        if !model.layers[0].wq.as_ptr().is_null()
+                        let layer0_probe = model.layers[0].load_weights();
+                        if !layer0_probe.wq.as_ptr().is_null()
                             && let Ok(n) =
                                 model.prepare_tensor_partition(cli_ratio, &cpu_backend_arc)
                         {
@@ -4951,7 +4968,8 @@ fn main() -> anyhow::Result<()> {
                             // in the GPU-only fast-path band; partition_ctx is then
                             // None and we must clear any stale workspace so forward()
                             // stays on the dense GPU path.
-                            if let Some(ref ctx) = model.layers[0].partition_ctx {
+                            let layer0_probe2 = model.layers[0].load_weights();
+                            if let Some(ref ctx) = layer0_probe2.partition_ctx {
                                 let gpu_alloc = make_partition_gpu_alloc(&*backend, decode_mem);
                                 if let Ok(ws) = PartitionWorkspace::new(
                                     ctx,
@@ -4979,9 +4997,12 @@ fn main() -> anyhow::Result<()> {
                             last_applied_partition_ratio = Some(cli_ratio);
                         }
                     } else {
-                        // CLI had no partition — disable
-                        for layer in &mut model.layers {
-                            layer.partition_ctx = None;
+                        // CLI had no partition — disable via ArcSwap clone-and-install
+                        for slot in &model.layers {
+                            let old = slot.load_weights();
+                            let mut new = (*old).clone();
+                            new.partition_ctx = None;
+                            slot.store_weights_same_dtype(Arc::new(new));
                         }
                         gen_ws.partition_ws = None;
                         executor.set_partition_ratio(0.0);

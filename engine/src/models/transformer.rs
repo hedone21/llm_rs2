@@ -13,6 +13,7 @@ use crate::layers::tensor_partition::PartitionContext;
 use crate::layers::transformer_layer::{LayerForwardArgs, TransformerLayer};
 use crate::layers::workspace::LayerWorkspace;
 use crate::models::config::{ModelArch, ModelConfig};
+use crate::models::weights::{LayerSlot, SecondaryMmap};
 
 #[cfg(feature = "opencl")]
 use crate::backend::opencl::plan::FullKernelPlan;
@@ -64,7 +65,22 @@ where
 
 pub struct TransformerModel {
     pub config: ModelConfig,
-    pub layers: Vec<TransformerLayer>,
+    /// Swap-aware decoder layer slots. Each slot wraps its weights behind an
+    /// `ArcSwap` so the forward path acquires a lock-free `Arc<TransformerLayer>`
+    /// snapshot per layer (INV-123). Mutation (partition install, backend
+    /// migration) uses `LayerSlot::rcu_weights` to clone-and-install atomically.
+    /// Spec: ENG-DAT-093.
+    pub layers: Vec<LayerSlot>,
+    /// Optional secondary GGUF handle retained for the entire model lifetime
+    /// (INV-125). `None` means the dynamic-swap path is disabled.
+    /// Phase 1 only populates and keeps the handle alive; Phase 2
+    /// `SwapExecutor` consumes it.
+    pub secondary_mmap: Option<Arc<SecondaryMmap>>,
+    /// Global swap generation counter (ENG-DAT-093). Declared in Phase 1,
+    /// bumped by Phase 2 `SwapExecutor`. Kept as an `Arc<AtomicU64>` so plan
+    /// builders / handlers that need generation-aware invalidation can share
+    /// the same counter.
+    pub ratio_generation: Arc<std::sync::atomic::AtomicU64>,
     /// embed_tokens is always kept on CPU for model loading.
     /// When the main backend is GPU, `gpu_embed_tokens` holds a device-side copy
     /// so that `gather_embed` can run entirely on the GPU without CPU round-trips.
@@ -140,7 +156,7 @@ impl TransformerModel {
     ) -> Result<Self> {
         use crate::models::loader::safetensors::SafetensorsSource;
         let source = SafetensorsSource::open(model_path, weight_dtype)?;
-        crate::models::loader::load_model(&source, backend, _memory)
+        crate::models::loader::load_model(&source, backend, _memory, None)
     }
 
     /// Load a model from a GGUF file.
@@ -152,9 +168,36 @@ impl TransformerModel {
         backend: Arc<dyn Backend>,
         memory: &dyn Memory,
     ) -> Result<Self> {
+        Self::load_gguf_with_secondary(model_path, None, backend, memory)
+    }
+
+    /// Load a primary GGUF plus an optional secondary GGUF reserved for
+    /// runtime weight swap (Phase 2). The secondary file is validated against
+    /// the primary metadata (ENG-DAT-C10) and its mmap handle is retained on
+    /// the model (INV-125); it is **not** consulted for the initial weight
+    /// install.
+    pub fn load_gguf_with_secondary(
+        primary_path: &str,
+        secondary_path: Option<&std::path::Path>,
+        backend: Arc<dyn Backend>,
+        memory: &dyn Memory,
+    ) -> Result<Self> {
+        use crate::models::loader::TensorSource;
         use crate::models::loader::gguf::GgufSource;
-        let source = GgufSource::open(std::path::Path::new(model_path))?;
-        crate::models::loader::load_model(&source, backend, memory)
+        use crate::models::weights::open_secondary;
+
+        let source = GgufSource::open(std::path::Path::new(primary_path))?;
+        let secondary_mmap = match secondary_path {
+            None => None,
+            Some(p) => {
+                let gguf = source.gguf_file();
+                let config = source.config();
+                let handle = open_secondary(p, config, gguf)
+                    .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
+                Some(Arc::new(handle))
+            }
+        };
+        crate::models::loader::load_model(&source, backend, memory, secondary_mmap)
     }
 
     /// Migrate all model weight tensors from CPU to GPU zero-copy memory.
@@ -200,52 +243,67 @@ impl TransformerModel {
             let buf: Arc<dyn Buffer> = Arc::new(ub);
             Ok(Tensor::new(t.shape().clone(), buf, gpu_backend.clone()))
         };
-        // Layer weights (always small — Q4 ~6MB, F16 ~16MB max per tensor)
-        macro_rules! migrate {
-            ($t:expr) => {
-                $t = migrate_one(&$t)?;
+        // Layer weights (always small — Q4 ~6MB, F16 ~16MB max per tensor).
+        // Each slot's inner `TransformerLayer` is cloned-and-mutated outside
+        // the ArcSwap, then installed in one atomic step. No forward can
+        // observe a half-migrated layer because the snapshot install is
+        // atomic (INV-123).
+        for slot in &self.layers {
+            let old = slot.load_weights();
+            let mut new = (*old).clone();
+            new.wq = migrate_one(&new.wq)?;
+            count += 1;
+            new.wk = migrate_one(&new.wk)?;
+            count += 1;
+            new.wv = migrate_one(&new.wv)?;
+            count += 1;
+            new.wo = migrate_one(&new.wo)?;
+            count += 1;
+            new.w_gate = migrate_one(&new.w_gate)?;
+            count += 1;
+            new.w_up = migrate_one(&new.w_up)?;
+            count += 1;
+            new.w_down = migrate_one(&new.w_down)?;
+            count += 1;
+            new.attention_norm = migrate_one(&new.attention_norm)?;
+            count += 1;
+            new.ffn_norm = migrate_one(&new.ffn_norm)?;
+            count += 1;
+            if let Some(ref mut bias) = new.qkv_bias {
+                bias.bq = migrate_one(&bias.bq)?;
                 count += 1;
-            };
+                bias.bk = migrate_one(&bias.bk)?;
+                count += 1;
+                bias.bv = migrate_one(&bias.bv)?;
+                count += 1;
+            }
+            if let Some(ref t) = new.q_norm {
+                new.q_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = new.k_norm {
+                new.k_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = new.pre_ffn_norm {
+                new.pre_ffn_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            if let Some(ref t) = new.post_ffn_norm {
+                new.post_ffn_norm = Some(migrate_one(t)?);
+                count += 1;
+            }
+            slot.store_weights_same_dtype(Arc::new(new));
         }
-        for layer in &mut self.layers {
-            migrate!(layer.wq);
-            migrate!(layer.wk);
-            migrate!(layer.wv);
-            migrate!(layer.wo);
-            migrate!(layer.w_gate);
-            migrate!(layer.w_up);
-            migrate!(layer.w_down);
-            migrate!(layer.attention_norm);
-            migrate!(layer.ffn_norm);
-            if let Some(ref mut bias) = layer.qkv_bias {
-                migrate!(bias.bq);
-                migrate!(bias.bk);
-                migrate!(bias.bv);
-            }
-            if let Some(ref t) = layer.q_norm {
-                layer.q_norm = Some(migrate_one(t)?);
-                count += 1;
-            }
-            if let Some(ref t) = layer.k_norm {
-                layer.k_norm = Some(migrate_one(t)?);
-                count += 1;
-            }
-            if let Some(ref t) = layer.pre_ffn_norm {
-                layer.pre_ffn_norm = Some(migrate_one(t)?);
-                count += 1;
-            }
-            if let Some(ref t) = layer.post_ffn_norm {
-                layer.post_ffn_norm = Some(migrate_one(t)?);
-                count += 1;
-            }
-        }
-        migrate!(self.norm);
+        self.norm = migrate_one(&self.norm)?;
+        count += 1;
         // lm_head + embed_tokens: may be large (>512MB for big vocab).
         // Migrate if possible, otherwise keep on CPU with fallback paths.
         let max_alloc = gpu_backend.max_single_alloc();
         if !self.lm_head_on_cpu {
             if self.lm_head.size() <= max_alloc {
-                migrate!(self.lm_head);
+                self.lm_head = migrate_one(&self.lm_head)?;
+                count += 1;
             } else {
                 self.lm_head_on_cpu = true;
             }
@@ -312,20 +370,33 @@ impl TransformerModel {
                 }
             };
         }
-        for layer in &mut self.layers {
-            map_weight!(layer.wq);
-            map_weight!(layer.wk);
-            map_weight!(layer.wv);
-            map_weight!(layer.wo);
-            map_weight!(layer.w_gate);
-            map_weight!(layer.w_up);
-            map_weight!(layer.w_down);
-            map_weight!(layer.attention_norm);
-            map_weight!(layer.ffn_norm);
+        // Weight slot migration uses clone-then-install so the ArcSwap sees a
+        // single atomic transition per slot (INV-123).
+        for slot in &self.layers {
+            let old = slot.load_weights();
+            let mut layer = (*old).clone();
+            macro_rules! map_slot_weight {
+                ($t:expr) => {
+                    let (new, changed) = map_one(&$t, gpu_backend)?;
+                    if changed {
+                        $t = new;
+                        count += 1;
+                    }
+                };
+            }
+            map_slot_weight!(layer.wq);
+            map_slot_weight!(layer.wk);
+            map_slot_weight!(layer.wv);
+            map_slot_weight!(layer.wo);
+            map_slot_weight!(layer.w_gate);
+            map_slot_weight!(layer.w_up);
+            map_slot_weight!(layer.w_down);
+            map_slot_weight!(layer.attention_norm);
+            map_slot_weight!(layer.ffn_norm);
             if let Some(ref mut bias) = layer.qkv_bias {
-                map_weight!(bias.bq);
-                map_weight!(bias.bk);
-                map_weight!(bias.bv);
+                map_slot_weight!(bias.bq);
+                map_slot_weight!(bias.bk);
+                map_slot_weight!(bias.bv);
             }
             if let Some(ref t) = layer.q_norm {
                 let (new, _) = map_one(t, gpu_backend)?;
@@ -347,6 +418,7 @@ impl TransformerModel {
                 layer.post_ffn_norm = Some(new);
                 count += 1;
             }
+            slot.store_weights_same_dtype(Arc::new(layer));
         }
         map_weight!(self.norm);
         if !self.lm_head_on_cpu {
@@ -396,22 +468,26 @@ impl TransformerModel {
             // must observe `Err(PlanInvalidated)` on its next execute() rather
             // than dispatch against cl_mem handles that no longer back the
             // active forward path. (INV-120)
-            for layer in &mut self.layers {
-                if let Some(ref ctx) = layer.partition_ctx {
+            for slot in &self.layers {
+                let old = slot.load_weights();
+                if let Some(ref ctx) = old.partition_ctx {
                     ctx.ratio_generation.fetch_add(1, Ordering::Release);
                 }
-                layer.partition_ctx = None;
+                let mut new = (*old).clone();
+                new.partition_ctx = None;
+                slot.store_weights_same_dtype(Arc::new(new));
             }
             return Ok(0);
         }
 
         let mut count = 0;
-        for layer in &mut self.layers {
+        for slot in &self.layers {
+            let old = slot.load_weights();
             // Reuse the existing Arc<AtomicU64> if a partition_ctx is already
             // installed so that plans built against the prior generation see
             // the bump. A fresh install starts at 0 — the first plan build
             // captures 0 and only misses when a subsequent re-split bumps it.
-            let prev_gen = layer
+            let prev_gen = old
                 .partition_ctx
                 .as_ref()
                 .map(|c| c.ratio_generation.clone());
@@ -420,13 +496,13 @@ impl TransformerModel {
             // gate/up split_row is on the ffn_hidden (out_dim) axis.
             // down split_col is on the ffn_hidden (in_dim) axis — same
             // logical dimension, so we reuse gate's split_row.
-            let gate = split_weight(&layer.w_gate, gpu_ratio, cpu_backend)?;
-            let up = split_weight(&layer.w_up, gpu_ratio, cpu_backend)?;
+            let gate = split_weight(&old.w_gate, gpu_ratio, cpu_backend)?;
+            let up = split_weight(&old.w_up, gpu_ratio, cpu_backend)?;
             debug_assert_eq!(
                 gate.split_row, up.split_row,
                 "gate/up split_row must match (same ffn_hidden, same gpu_ratio)",
             );
-            let down = split_weight_col(&layer.w_down, gate.split_row, cpu_backend)?;
+            let down = split_weight_col(&old.w_down, gate.split_row, cpu_backend)?;
             count += 3;
 
             // Bump the shared counter if this is a re-split; allocate a fresh
@@ -440,7 +516,8 @@ impl TransformerModel {
                 None => Arc::new(AtomicU64::new(0)),
             };
 
-            layer.partition_ctx = Some(PartitionContext {
+            let mut new = (*old).clone();
+            new.partition_ctx = Some(PartitionContext {
                 gpu_ratio,
                 cpu_backend: cpu_backend.clone(),
                 gate,
@@ -448,6 +525,7 @@ impl TransformerModel {
                 down,
                 ratio_generation: gen_arc,
             });
+            slot.store_weights_same_dtype(Arc::new(new));
         }
         Ok(count)
     }
@@ -500,7 +578,8 @@ impl TransformerModel {
             Ok(true)
         };
 
-        for layer in &self.layers {
+        for slot in &self.layers {
+            let layer = slot.load_weights();
             for weight in [
                 &layer.wq,
                 &layer.wk,
@@ -580,20 +659,34 @@ impl TransformerModel {
             };
         }
 
-        for layer in &mut self.layers {
-            migrate_w!(layer.wq);
-            migrate_w!(layer.wk);
-            migrate_w!(layer.wv);
-            migrate_w!(layer.wo);
-            migrate_w!(layer.w_gate);
-            migrate_w!(layer.w_up);
-            migrate_w!(layer.w_down);
-            migrate_n!(layer.attention_norm);
-            migrate_n!(layer.ffn_norm);
+        for slot in &self.layers {
+            let old = slot.load_weights();
+            let mut layer = (*old).clone();
+            layer.wq = migrate_weight(&layer.wq)?;
+            count += 1;
+            layer.wk = migrate_weight(&layer.wk)?;
+            count += 1;
+            layer.wv = migrate_weight(&layer.wv)?;
+            count += 1;
+            layer.wo = migrate_weight(&layer.wo)?;
+            count += 1;
+            layer.w_gate = migrate_weight(&layer.w_gate)?;
+            count += 1;
+            layer.w_up = migrate_weight(&layer.w_up)?;
+            count += 1;
+            layer.w_down = migrate_weight(&layer.w_down)?;
+            count += 1;
+            layer.attention_norm = migrate_norm(&layer.attention_norm)?;
+            count += 1;
+            layer.ffn_norm = migrate_norm(&layer.ffn_norm)?;
+            count += 1;
             if let Some(ref mut bias) = layer.qkv_bias {
-                migrate_n!(bias.bq);
-                migrate_n!(bias.bk);
-                migrate_n!(bias.bv);
+                bias.bq = migrate_norm(&bias.bq)?;
+                count += 1;
+                bias.bk = migrate_norm(&bias.bk)?;
+                count += 1;
+                bias.bv = migrate_norm(&bias.bv)?;
+                count += 1;
             }
             if let Some(ref t) = layer.q_norm {
                 layer.q_norm = Some(migrate_norm(t)?);
@@ -611,6 +704,7 @@ impl TransformerModel {
                 layer.post_ffn_norm = Some(migrate_norm(t)?);
                 count += 1;
             }
+            slot.store_weights_same_dtype(Arc::new(layer));
         }
 
         migrate_n!(self.norm);
@@ -679,8 +773,13 @@ impl TransformerModel {
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
 
-        // Iterate layers
-        for (i, layer) in self.layers.iter().enumerate() {
+        // Iterate layers. One `ArcSwap` snapshot load per layer (INV-123):
+        // the `layer_arc` local binding owns the full Arc for the duration of
+        // the forward call, so no further atomics touch the slot.
+        let num_layers = self.layers.len();
+        for (i, slot) in self.layers.iter().enumerate() {
+            let layer_arc = slot.load_weights();
+            let layer = &*layer_arc;
             let rope_theta = if is_gemma3 && is_local_layer(i, self.config.sliding_window_pattern) {
                 self.config
                     .rope_local_theta
@@ -713,7 +812,7 @@ impl TransformerModel {
                 layer_id: i,
                 skip_attn: false,
                 skip_mlp: false,
-                is_last_layer: i + 1 == self.layers.len(),
+                is_last_layer: i + 1 == num_layers,
             })?;
         }
 
@@ -851,8 +950,15 @@ impl TransformerModel {
         #[cfg(not(feature = "opencl"))]
         let gpu_score_active = false;
 
-        // 2. Iterate layers
-        for (i, layer) in self.layers.iter().enumerate() {
+        // 2. Iterate layers. Each slot provides an `ArcSwap` snapshot which is
+        // cloned into a local `Arc<TransformerLayer>` once per layer (INV-123);
+        // all subsequent tensor accesses within this layer's forward are on the
+        // snapshot, so a concurrent `SwapExecutor::swap_weights` (Phase 2)
+        // never observes a half-swapped layer.
+        let num_layers = self.layers.len();
+        for (i, slot) in self.layers.iter().enumerate() {
+            let layer_arc = slot.load_weights();
+            let layer = &*layer_arc;
             // GPU acc active -> GPU handles score collection internally in attention_gen.
             // CPU accumulator still needs need_scores=false to avoid redundant CPU path.
             let need_scores = if gpu_score_active {
@@ -935,7 +1041,7 @@ impl TransformerModel {
                         use_gelu_tanh: is_gemma3,
                         is_local_attn: is_local,
                         local_attn_window: self.config.sliding_window,
-                        is_last_layer: i + 1 == self.layers.len(),
+                        is_last_layer: i + 1 == num_layers,
                     })?;
                 }
             } else {
@@ -958,7 +1064,7 @@ impl TransformerModel {
                     use_gelu_tanh: is_gemma3,
                     is_local_attn: is_local,
                     local_attn_window: self.config.sliding_window,
-                    is_last_layer: i + 1 == self.layers.len(),
+                    is_last_layer: i + 1 == num_layers,
                 })?;
                 // Intra-token GPU yield hook (decode only, seq_len == 1).
                 crate::core::gpu_yield::maybe_yield_after_layer(&**backend, i, true);
@@ -1086,7 +1192,15 @@ impl TransformerModel {
         use crate::backend::opencl::plan::*;
         use crate::core::kv_cache::KVLayout;
 
-        let weight_dtype = self.layers[0].wq.dtype();
+        // Snapshot every layer's weights once and keep the Arcs alive for the
+        // duration of plan construction. The cl_mem references captured below
+        // rely on these Arcs remaining in scope (INV-123 snapshot semantics).
+        let layer_snaps: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+        if layer_snaps.is_empty() {
+            return None;
+        }
+        let weight_dtype = layer_snaps[0].wq.dtype();
         let is_f16 = weight_dtype == crate::core::buffer::DType::F16;
         let is_q4_0 = weight_dtype == crate::core::buffer::DType::Q4_0;
         // GPU plan supports F16 weights or Q4_0 with noshuffle SOA conversion
@@ -1097,7 +1211,7 @@ impl TransformerModel {
         // kernel_add_row_bias expects F32 bias buffers. If any layer has
         // a QKV bias that isn't F32, fall back to the legacy path.
         if self.config.has_qkv_bias {
-            for layer in &self.layers {
+            for layer in &layer_snaps {
                 if let Some(ref bias) = layer.qkv_bias {
                     if bias.bq.dtype() != crate::core::buffer::DType::F32
                         || bias.bk.dtype() != crate::core::buffer::DType::F32
@@ -1141,7 +1255,7 @@ impl TransformerModel {
         // For Q4_0 weights, verify noshuffle SOA entries are available.
         // If any weight lacks a q_img (noshuffle image), fall back to legacy path.
         if is_q4_0 {
-            let first_wq_key = cl!(self.layers[0].wq).as_ptr() as usize;
+            let first_wq_key = cl!(layer_snaps[0].wq).as_ptr() as usize;
             match ocl_backend.lookup_noshuffle_soa(first_wq_key) {
                 Some(e) if e.q_img.is_some() => {}
                 _ => return None,
@@ -1167,7 +1281,7 @@ impl TransformerModel {
         // Collect per-layer buffer handles
         let mut layer_bufs = Vec::new();
         let mut kv_bufs_vec = Vec::new();
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, layer) in layer_snaps.iter().map(|a| &**a).enumerate() {
             // Extract optional QKV bias cl_mem handles. Non-bias models
             // short-circuit this block with (None, None, None). For bias
             // models (e.g. Qwen2), the `cl!` macro returns None from the
@@ -1290,7 +1404,7 @@ impl TransformerModel {
         // Hybrid setup Arc: build_full_plan 호출 동안 cl_mem 참조가 유효해야
         // 하므로 local binding으로 lifetime을 확장한다. None이면 hybrid 비활성.
         let hybrid_setup_arc = {
-            let partition_active = self.layers.iter().any(|l| l.partition_ctx.is_some());
+            let partition_active = layer_snaps.iter().any(|l| l.partition_ctx.is_some());
             if partition_active {
                 None
             } else {
@@ -1353,8 +1467,7 @@ impl TransformerModel {
                 // segment uses `build_partitioned_layer_plan`; otherwise the
                 // legacy GPU-only FFN is used per layer. See arch A.6.1.
                 let mut any = false;
-                let v: Vec<Option<&PartitionContext>> = self
-                    .layers
+                let v: Vec<Option<&PartitionContext>> = layer_snaps
                     .iter()
                     .map(|l| {
                         let opt = l.partition_ctx.as_ref();
@@ -1365,8 +1478,7 @@ impl TransformerModel {
                 if any { Some(v) } else { None }
             },
             partition_workspace: ws.partition_ws.clone(),
-            partition_cpu_backend: self
-                .layers
+            partition_cpu_backend: layer_snaps
                 .iter()
                 .find_map(|l| l.partition_ctx.as_ref().map(|c| c.cpu_backend.clone())),
             partition_use_gelu_tanh: self.config.arch == crate::models::config::ModelArch::Gemma3,
@@ -1531,7 +1643,13 @@ impl TransformerModel {
         if self.config.has_qkv_bias {
             return None;
         }
-        if self.layers[0].wq.dtype() != crate::core::buffer::DType::F16 {
+        // Snapshot every layer once for the duration of plan construction.
+        let layer_snaps: Vec<Arc<TransformerLayer>> =
+            self.layers.iter().map(|s| s.load_weights()).collect();
+        if layer_snaps.is_empty() {
+            return None;
+        }
+        if layer_snaps[0].wq.dtype() != crate::core::buffer::DType::F16 {
             return None;
         }
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
@@ -1543,7 +1661,7 @@ impl TransformerModel {
         // KIVI plan does not yet support the cooperative tensor-partition FFN.
         // If any layer has a partition_ctx, decline the plan and let the
         // caller route to forward_gen.
-        if self.layers.iter().any(|l| l.partition_ctx.is_some()) {
+        if layer_snaps.iter().any(|l| l.partition_ctx.is_some()) {
             return None;
         }
 
@@ -1572,7 +1690,7 @@ impl TransformerModel {
 
         let mut layer_bufs = Vec::new();
         let mut kivi_kv_bufs_vec = Vec::new();
-        for (i, layer) in self.layers.iter().enumerate() {
+        for (i, layer) in layer_snaps.iter().map(|a| &**a).enumerate() {
             layer_bufs.push(LayerBufs {
                 wq: cl!(layer.wq),
                 wk: cl!(layer.wk),
@@ -1860,7 +1978,8 @@ impl TransformerModel {
             } else {
                 None
             };
-            self.layers[i].forward(LayerForwardArgs {
+            let layer_arc = self.layers[i].load_weights();
+            layer_arc.forward(LayerForwardArgs {
                 x: &mut x,
                 kv_cache: current,
                 start_pos,
@@ -2121,6 +2240,8 @@ mod tests {
             gpu_embed_tokens: None, // CPU-only model
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
+            secondary_mmap: None,
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
         (model, cpu_be)
     }
@@ -2267,6 +2388,8 @@ mod tests {
             gpu_embed_tokens: None,
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
+            secondary_mmap: None,
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Gather token 0 → should be [1.0, 1.0], then scale → [2.0, 2.0]
@@ -2377,6 +2500,8 @@ mod tests {
             gpu_embed_tokens: Some(gpu_embed),
             cpu_backend: None,
             preload_pool: std::sync::Mutex::new(None),
+            secondary_mmap: None,
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         // Gather tokens [1, 6]
@@ -2475,6 +2600,8 @@ mod tests {
             gpu_embed_tokens: Some(gpu_embed),
             cpu_backend: Some(cpu_be.clone()), // both set
             preload_pool: std::sync::Mutex::new(None),
+            secondary_mmap: None,
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         };
 
         let idx_buf = mem.alloc(4, DType::F32).unwrap();
