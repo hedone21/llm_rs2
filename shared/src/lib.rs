@@ -1,6 +1,24 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Dtype tag for wire-protocol use in SwapWeights command (MSG-082).
+///
+/// This enum is distinct from the engine-internal `DType` and exists only for
+/// IPC stability.  Only `Q4_0` is executable in Phase 3; the remaining
+/// variants are reserved for wire-format forward-compatibility with future
+/// phases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DtypeTag {
+    Q4_0,
+    #[doc = "Reserved — not supported by SwapExecutor as of Phase 3"]
+    F16,
+    #[doc = "Reserved"]
+    F32,
+    #[doc = "Reserved"]
+    Q8_0,
+}
+
 /// Common severity level shared by all signals.
 /// Ordered by severity: Normal < Warning < Critical < Emergency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -180,6 +198,14 @@ pub enum EngineCommand {
     LayerSkip { skip_ratio: f32 },
 
     // ── Memory domain ──
+    /// Swap decoder layer weights to secondary dtype (MSG-042, Weight Swap Phase 3).
+    ///
+    /// `ratio` is the **upper-bound** fraction of decoder layers to swap; the
+    /// engine uses `WeightSwapDecider` (ENG-ALG-215) to choose the exact set.
+    /// Only `target_dtype = Q4_0` is executable in Phase 3; other `DtypeTag`
+    /// variants are reserved and will be rejected with `"UnsupportedDtype"`
+    /// (INV-126).
+    SwapWeights { ratio: f32, target_dtype: DtypeTag },
     /// Evict KV cache entries using H2O (Heavy-Hitter Oracle) policy.
     KvEvictH2o { keep_ratio: f32 },
     /// Evict KV cache entries using sliding window policy.
@@ -915,6 +941,45 @@ mod tests {
         assert!(json.contains("\"type\":\"qcf_estimate\""));
         let back: EngineMessage = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, EngineMessage::QcfEstimate(_)));
+    }
+
+    #[test]
+    fn test_engine_command_serde_swap_weights() {
+        let cmd = EngineCommand::SwapWeights {
+            ratio: 0.5,
+            target_dtype: DtypeTag::Q4_0,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("\"type\":\"swap_weights\""));
+        assert!(json.contains("\"ratio\":0.5"));
+        assert!(json.contains("\"target_dtype\":\"q4_0\""));
+        let back: EngineCommand = serde_json::from_str(&json).unwrap();
+        match back {
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                assert!((ratio - 0.5).abs() < f32::EPSILON);
+                assert_eq!(target_dtype, DtypeTag::Q4_0);
+            }
+            _ => panic!("Expected SwapWeights"),
+        }
+    }
+
+    #[test]
+    fn test_dtype_tag_serde_reserved_roundtrip() {
+        // Reserved variants must survive a serde round-trip (wire compat).
+        for (tag, wire) in [
+            (DtypeTag::Q4_0, "\"q4_0\""),
+            (DtypeTag::F16, "\"f16\""),
+            (DtypeTag::F32, "\"f32\""),
+            (DtypeTag::Q8_0, "\"q8_0\""),
+        ] {
+            let json = serde_json::to_string(&tag).unwrap();
+            assert_eq!(json, wire, "wire value mismatch for {tag:?}");
+            let back: DtypeTag = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, tag);
+        }
     }
 
     #[test]
