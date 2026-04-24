@@ -1578,6 +1578,7 @@ impl CpuBackendAVX2 {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackendCommon;

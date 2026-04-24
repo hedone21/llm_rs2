@@ -201,11 +201,18 @@ pub struct CollectingSink {
 }
 
 #[cfg(test)]
-impl CollectingSink {
-    pub fn new() -> Self {
+impl Default for CollectingSink {
+    fn default() -> Self {
         Self {
             events: std::sync::Mutex::new(Vec::new()),
         }
+    }
+}
+
+#[cfg(test)]
+impl CollectingSink {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn events(&self) -> Vec<CacheEvent> {
@@ -410,9 +417,7 @@ mod tests {
     fn test_build_score_snapshot_sigma_distribution() {
         // 100 tokens: 90 with score=1.0, 10 with score=100.0
         let mut scores = vec![1.0f32; 100];
-        for i in 0..10 {
-            scores[i] = 100.0;
-        }
+        scores[..10].fill(100.0);
         let snap = build_score_snapshot(&scores, 100, 0, 50, 5).unwrap();
         // The 10 high-score tokens should be well above mean+1σ
         assert!(snap.above_1sigma_frac > 0.0);

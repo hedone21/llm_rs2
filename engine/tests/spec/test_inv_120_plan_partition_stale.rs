@@ -114,20 +114,16 @@ mod inv_120 {
         // 재시도 루프 시뮬레이션
         let counter = Arc::new(AtomicU64::new(1)); // 이미 bump된 상태
         let at_build: u64 = 0;
-        let mut handled = false;
-        loop {
-            match check_partition_generation(at_build, &counter) {
-                Ok(()) => {
-                    // 일치 — 정상 실행 경로
-                    break;
-                }
-                Err(PlanInvalidated) => {
-                    // PlanInvalidated 수신 → 재빌드 또는 forward_gen fallback
-                    handled = true;
-                    break; // 테스트에서는 재시도 대신 즉시 탈출
-                }
+        let handled = match check_partition_generation(at_build, &counter) {
+            Ok(()) => {
+                // 일치 — 정상 실행 경로
+                false
             }
-        }
+            Err(PlanInvalidated) => {
+                // PlanInvalidated 수신 → 재빌드 또는 forward_gen fallback
+                true
+            }
+        };
         assert!(
             handled,
             "PlanInvalidated를 받아 fallback 처리가 실행되어야 한다"

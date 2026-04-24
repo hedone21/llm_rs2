@@ -308,7 +308,7 @@ mod tests {
         let output = EvalOutput {
             results: vec![serde_json::json!({"id": "q1", "predicted": 0})],
             config: serde_json::json!({"kv_type": "f32"}),
-            wall_time_s: 3.14,
+            wall_time_s: 3.15,
             layer_skip_qcf: Some(0.25),
             layer_skip_qcf_normalized: Some(0.333),
             qcf_layer_skip: Some(0.5),

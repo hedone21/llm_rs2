@@ -12,7 +12,6 @@ use llm_shared::{CommandResult, EngineCommand, EngineDirective, EngineMessage, M
 use std::sync::mpsc;
 use std::time::Duration;
 
-
 /// PROTO-042: MockTransport 기반 연결 상태 전이 시뮬레이션
 ///
 /// CommandExecutor는 cmd_rx 채널을 통해 메시지를 수신한다.

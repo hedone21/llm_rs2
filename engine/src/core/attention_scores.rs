@@ -383,6 +383,7 @@ impl AttentionScoreAccumulator {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
 
@@ -1863,7 +1864,7 @@ mod tests {
         // Layer 0: valid scores (softmax-like, sum to ~1.0 per head)
         let mut scores_l0 = vec![0.0f32; n_heads_q * stride];
         for h in 0..n_heads_q {
-            scores_l0[h * stride + 0] = 0.4;
+            scores_l0[h * stride] = 0.4;
             scores_l0[h * stride + 1] = 0.3;
             scores_l0[h * stride + 2] = 0.2;
             scores_l0[h * stride + 3] = 0.1;
@@ -1875,7 +1876,7 @@ mod tests {
             acc.step_importance[0] > 0.0,
             "flat step_importance[0] should be > 0 after L0"
         );
-        let idx0 = 0 * max_seq + 0; // kv_h=0, t=0
+        let idx0 = 0usize; // kv_h=0, t=0 → 0 * max_seq = 0
         assert!(
             acc.head_step_importance[idx0] > 0.0,
             "head_step_importance[0] should be > 0 after L0"

@@ -570,6 +570,7 @@ fn l2_norm_diff(a: &[f32], b: &[f32]) -> f32 {
 // ── Tests ───────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::erasing_op)]
 mod tests {
     use super::*;
 
@@ -972,7 +973,7 @@ mod tests {
             // Head 0: linearly decreasing
             head_attn[0 * current_pos + t] = (current_pos - t) as f32;
             // Head 1: linearly increasing
-            head_attn[1 * current_pos + t] = (t + 1) as f32;
+            head_attn[current_pos + t] = (t + 1) as f32;
         }
 
         let params_flat = UnifiedQcfParams {

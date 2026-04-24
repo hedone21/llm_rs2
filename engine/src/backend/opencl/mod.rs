@@ -5443,6 +5443,7 @@ mod gpu_buffer_shift_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod noshuffle_tests {
     use super::*;
     use crate::core::shape::Shape;

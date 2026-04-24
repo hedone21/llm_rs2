@@ -574,6 +574,7 @@ pub fn compute_flush_aw_vopr(params: &FlushAwVoprParams, config: &QcfConfig) -> 
 }
 
 #[cfg(test)]
+#[allow(clippy::erasing_op)]
 mod tests {
     use super::*;
 
@@ -1112,8 +1113,8 @@ mod tests {
         // Q head 3: zero weights
         // GQA mean α for token 0 = (1 + 1 + 0 + 0) / 4 = 0.5
         let mut scores = vec![0.0f32; n_heads_q * stride];
-        scores[0 * stride + 0] = 1.0; // head 0, pos 0
-        scores[1 * stride + 0] = 1.0; // head 1, pos 0
+        scores[0 * stride] = 1.0; // head 0, pos 0
+        scores[stride] = 1.0; // head 1, pos 0
 
         let config = QcfConfig::default();
         let params = FlushAwqeParams {
@@ -1168,8 +1169,8 @@ mod tests {
         // Head 0: put all weight on token 0
         // Head 1: put all weight on token 31 (last token)
         let mut scores = vec![0.0f32; n_heads_q * stride];
-        scores[0 * stride + 0] = 1.0; // Q head 0 → token 0
-        scores[1 * stride + 31] = 1.0; // Q head 1 → token 31
+        scores[0 * stride] = 1.0; // Q head 0 → token 0
+        scores[stride + 31] = 1.0; // Q head 1 → token 31
 
         let config = QcfConfig::default();
         let params = FlushAwqeParams {

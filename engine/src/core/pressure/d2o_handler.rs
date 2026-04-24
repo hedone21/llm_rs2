@@ -757,6 +757,7 @@ fn scatter_reduce_q4(
 // ── Tests ────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::useless_vec)]
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;

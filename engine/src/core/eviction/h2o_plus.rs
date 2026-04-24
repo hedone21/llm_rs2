@@ -261,8 +261,8 @@ mod tests {
 
         let mut head_importance = vec![0.01f32; n_kv_heads * 100];
         // Different high-score tokens per head
-        head_importance[0 * 100 + 5] = 10.0; // KV0: tok5 high
-        head_importance[1 * 100 + 8] = 10.0; // KV1: tok8 high
+        head_importance[5] = 10.0; // KV0: tok5 high
+        head_importance[100 + 8] = 10.0; // KV1: tok8 high
 
         let flat = vec![1.0f32; 100];
 
@@ -287,8 +287,8 @@ mod tests {
 
         let mut head_importance = vec![0.01f32; n_kv_heads * 100];
         for i in 5..30 {
-            head_importance[0 * 100 + i] = (30 - i) as f32;
-            head_importance[1 * 100 + i] = (30 - i) as f32;
+            head_importance[i] = (30 - i) as f32;
+            head_importance[100 + i] = (30 - i) as f32;
         }
         let flat = vec![1.0f32; 100];
 
@@ -322,8 +322,8 @@ mod tests {
         }
 
         let mut head_importance = vec![0.01f32; n_kv_heads * 100];
-        head_importance[0 * 100 + 5] = 10.0;
-        head_importance[1 * 100 + 8] = 10.0;
+        head_importance[5] = 10.0;
+        head_importance[100 + 8] = 10.0;
         let flat = vec![1.0f32; 100];
 
         // target=10, keep=10, available=6, hh=3, recent=3
@@ -359,13 +359,13 @@ mod tests {
 
         let mut head_importance = vec![0.01f32; n_kv_heads * 100];
         // KV head 0: prefers tokens 5, 6, 7 (high scores)
-        head_importance[0 * 100 + 5] = 10.0;
-        head_importance[0 * 100 + 6] = 9.0;
-        head_importance[0 * 100 + 7] = 8.0;
+        head_importance[5] = 10.0;
+        head_importance[6] = 9.0;
+        head_importance[7] = 8.0;
         // KV head 1: prefers tokens 10, 11, 12 (high scores)
-        head_importance[1 * 100 + 10] = 10.0;
-        head_importance[1 * 100 + 11] = 9.0;
-        head_importance[1 * 100 + 12] = 8.0;
+        head_importance[100 + 10] = 10.0;
+        head_importance[100 + 11] = 9.0;
+        head_importance[100 + 12] = 8.0;
 
         let flat = vec![1.0f32; 100];
 
@@ -402,8 +402,8 @@ mod tests {
 
         let mut head_importance = vec![0.5f32; n_kv_heads * 100];
         for i in 4..20 {
-            head_importance[0 * 100 + i] = (20 - i) as f32;
-            head_importance[1 * 100 + i] = i as f32;
+            head_importance[i] = (20 - i) as f32;
+            head_importance[100 + i] = i as f32;
         }
         let flat = vec![1.0f32; 100];
 

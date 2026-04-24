@@ -181,6 +181,7 @@ impl EvictionPolicy for H2OPolicy {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::useless_vec)]
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
@@ -193,7 +194,7 @@ mod tests {
     fn make_cache(pos: usize) -> KVCache {
         let max_seq = 100;
         let backend = Arc::new(CpuBackend::new());
-        let buf_size = max_seq * 1 * 4 * 4; // max_seq * batch * heads * dim * sizeof(f32)
+        let buf_size = max_seq * 4 * 4; // max_seq * batch * heads * dim * sizeof(f32)
         let k = Tensor::new(
             Shape::new(vec![1, max_seq, 1, 4]),
             Arc::new(SharedBuffer::new(buf_size, DType::F32)),
@@ -301,9 +302,9 @@ mod tests {
         importance[5] = 10.0;
         importance[8] = 9.0;
         importance[12] = 8.0;
-        for i in 4..20 {
-            if importance[i] == 0.0 {
-                importance[i] = 0.01;
+        for imp in importance[4..20].iter_mut() {
+            if *imp == 0.0 {
+                *imp = 0.01;
             }
         }
 
@@ -353,8 +354,8 @@ mod tests {
         }
 
         let mut importance = vec![0.0f32; 100];
-        for i in 5..30 {
-            importance[i] = (30 - i) as f32;
+        for (idx, imp) in importance[5..30].iter_mut().enumerate() {
+            *imp = (25 - idx) as f32; // 30 - (i) where i starts at 5 → (30-5)-idx = 25-idx
         }
 
         // target_len=15, keep=15, available=15-5=10
@@ -401,9 +402,9 @@ mod tests {
         importance[5] = 10.0;
         importance[10] = 9.0;
         importance[7] = 8.0;
-        for i in 4..20 {
-            if importance[i] == 0.0 {
-                importance[i] = 0.01;
+        for imp in importance[4..20].iter_mut() {
+            if *imp == 0.0 {
+                *imp = 0.01;
             }
         }
 
@@ -1555,6 +1556,7 @@ mod tests {
     #[test]
     fn test_budget_calculation_exact_values() {
         // Verify exact budget allocation for multiple (keep_ratio, prefix, current, target) combos.
+        #[allow(dead_code)]
         struct Case {
             keep_ratio: f32,
             prefix: usize,

@@ -789,8 +789,10 @@ mod tests {
         let policy = Box::new(NoEvictionPolicy::new());
         let monitor = Box::new(AlwaysOkMonitor);
         let manager = CacheManager::new(policy, monitor, 0, 1.0);
-        let mut config = QcfConfig::default();
-        config.mode = QcfMode::Attn;
+        let config = QcfConfig {
+            mode: QcfMode::Attn,
+            ..Default::default()
+        };
         EvictionHook::new(
             manager,
             None,

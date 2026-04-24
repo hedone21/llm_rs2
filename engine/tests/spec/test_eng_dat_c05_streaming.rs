@@ -142,18 +142,16 @@ fn test_eng_dat_c05_05_available_actions_includes_streaming() {
     // Find heartbeat message
     let mut found = false;
     for _ in 0..5 {
-        if let Ok(msg) = resp_rx.try_recv() {
-            if let EngineMessage::Heartbeat(status) = msg {
-                assert!(
-                    status
-                        .available_actions
-                        .contains(&"kv_evict_streaming".to_string()),
-                    "Heartbeat available_actions must include kv_evict_streaming, got: {:?}",
-                    status.available_actions
-                );
-                found = true;
-                break;
-            }
+        if let Ok(EngineMessage::Heartbeat(status)) = resp_rx.try_recv() {
+            assert!(
+                status
+                    .available_actions
+                    .contains(&"kv_evict_streaming".to_string()),
+                "Heartbeat available_actions must include kv_evict_streaming, got: {:?}",
+                status.available_actions
+            );
+            found = true;
+            break;
         }
     }
     assert!(

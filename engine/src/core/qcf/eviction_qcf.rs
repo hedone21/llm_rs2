@@ -483,6 +483,7 @@ pub fn identify_evicted_sliding(
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::erasing_op)]
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
@@ -865,7 +866,7 @@ mod tests {
         // Token 1,2,3: V = [1,1,1,1]
         let mut v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
         for d in 0..head_dim {
-            v_data[0 * head_dim + d] = 10.0;
+            v_data[d] = 10.0; // position 0, head 0: offset = 0 * head_dim + d = d
         }
         for t in 1..num_tokens {
             for d in 0..head_dim {
@@ -977,7 +978,7 @@ mod tests {
                 v_data[0 * max_seq * head_dim + t * head_dim + d] = 1.0;
                 // Head 1
                 let val = if t == 0 { 10.0 } else { 1.0 };
-                v_data[1 * max_seq * head_dim + t * head_dim + d] = val;
+                v_data[max_seq * head_dim + t * head_dim + d] = val;
             }
         }
 
@@ -1109,7 +1110,7 @@ mod tests {
         let mut v_data = vec![0.0f32; max_seq * kv_heads * head_dim];
         for d in 0..head_dim {
             v_data[0 * head_dim + d] = 1.0;
-            v_data[1 * head_dim + d] = 1.0;
+            v_data[head_dim + d] = 1.0;
             v_data[2 * head_dim + d] = 10.0;
             v_data[3 * head_dim + d] = 10.0;
         }
@@ -1175,8 +1176,8 @@ mod tests {
         }
         // Head 1: token 0 high, token 1 low
         for d in 0..head_dim {
-            v_data[1 * max_seq * head_dim + 0 * head_dim + d] = 5.0;
-            v_data[1 * max_seq * head_dim + 1 * head_dim + d] = 1.0;
+            v_data[max_seq * head_dim + 0 * head_dim + d] = 5.0;
+            v_data[max_seq * head_dim + head_dim + d] = 1.0;
         }
 
         let cache =

@@ -270,7 +270,8 @@ mod tests {
         let counter = AtomicU64::new(0);
 
         unsafe fn add_work(ctx: *const u8, _chunk_id: usize) {
-            let c = &*(ctx as *const AtomicU64);
+            // SAFETY: ctx is a valid pointer to AtomicU64 for the duration of dispatch.
+            let c = unsafe { &*(ctx as *const AtomicU64) };
             c.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -286,7 +287,8 @@ mod tests {
         let results: Vec<AtomicU64> = (0..1000).map(|_| AtomicU64::new(0)).collect();
 
         unsafe fn mark_work(ctx: *const u8, chunk_id: usize) {
-            let results = &*(ctx as *const Vec<AtomicU64>);
+            // SAFETY: ctx is a valid pointer to Vec<AtomicU64> for the duration of dispatch.
+            let results = unsafe { &*(ctx as *const Vec<AtomicU64>) };
             results[chunk_id].fetch_add(1, Ordering::Relaxed);
         }
 
@@ -350,7 +352,8 @@ mod tests {
         let counter = AtomicU64::new(0);
 
         unsafe fn add_work(ctx: *const u8, _chunk_id: usize) {
-            let c = &*(ctx as *const AtomicU64);
+            // SAFETY: ctx is a valid pointer to AtomicU64 for the duration of dispatch.
+            let c = unsafe { &*(ctx as *const AtomicU64) };
             c.fetch_add(1, Ordering::Relaxed);
         }
 

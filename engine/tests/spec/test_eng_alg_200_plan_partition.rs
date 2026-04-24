@@ -1,13 +1,16 @@
 //! ENG-ALG-200 — GPU Plan × Tensor Partition 협업 통합 테스트
 //!
 //! 대응 spec: spec/32-engine-algorithms.md §3.11.1 [ENG-ALG-200]
+//!
 //! 대응 arch: arch/plan_partition_integration.md (전체)
 //!
 //! ## 시나리오
 //!
 //! Galaxy S25 / Qwen 2.5-1.5B Q4_0 / partition r=0.7에서:
+//!
 //! 1. plan 활성 (`LLMRS_PARTITION_PLAN=1`, default)
 //! 2. forward_gen fallback (`LLMRS_PARTITION_PLAN=0`)
+//!
 //! 두 경로의 decode 결과가 토큰 단위로 동일해야 한다 (greedy, 100 tokens).
 //!
 //! ## 검증 항목 (호스트 실행 가능)

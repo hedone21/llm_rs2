@@ -237,6 +237,7 @@ pub fn dequant_q4_k(data: &[u8], num_elements: usize) -> Vec<f32> {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::approx_constant)]
 mod tests {
     use super::*;
 
@@ -271,11 +272,15 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::useless_vec)]
     fn test_f32_to_f16_roundtrip() {
         let val = 2.5f32;
-        let bytes = val.to_le_bytes();
+        // Use Vec<f32> to guarantee 4-byte alignment for safe transmutation
+        let src_f32 = vec![val];
+        let bytes =
+            unsafe { std::slice::from_raw_parts(src_f32.as_ptr() as *const u8, src_f32.len() * 4) };
         let mut dst = [f16::from_f32(0.0); 1];
-        f32_to_f16_buf(&bytes, &mut dst, 1);
+        f32_to_f16_buf(bytes, &mut dst, 1);
         assert!((dst[0].to_f32() - 2.5).abs() < 0.01);
     }
 

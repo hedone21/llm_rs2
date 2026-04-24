@@ -391,6 +391,7 @@ pub struct LayerForwardArgs<'a, C: KVCacheOps = KVCache> {
 // Phase 1: Verify attention scores are post-softmax probabilities
 // ═══════════════════════════════════════════════════════════════════
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::unnecessary_literal_unwrap)]
 mod tests {
     use super::*;
     use crate::buffer::shared_buffer::SharedBuffer;
@@ -466,7 +467,7 @@ mod tests {
             // All values in [0, 1]
             for (t, &s) in head_scores.iter().enumerate() {
                 assert!(
-                    s >= 0.0 && s <= 1.0,
+                    (0.0..=1.0).contains(&s),
                     "Head {} token {} score = {} (must be in [0,1])",
                     h,
                     t,
@@ -552,7 +553,7 @@ mod tests {
             );
             for (t, &s) in head_scores.iter().enumerate() {
                 assert!(
-                    s >= 0.0 && s <= 1.0,
+                    (0.0..=1.0).contains(&s),
                     "F16 Head {} token {} score = {} (must be in [0,1])",
                     h,
                     t,

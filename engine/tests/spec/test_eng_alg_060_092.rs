@@ -3,6 +3,10 @@
 //! PiecewiseLinear 함수, DegradationEstimator d_max clamp / EMA correction,
 //! CachePressurePipeline 실행 로직, QuantizeHandler / SwapHandler / EvictionHandler.
 
+// `max_seq * 1 * 4 * 4` / `100 * 1 * 4 * 4` 계산식은 코드 가독성을 위해
+// kv_heads=1, head_dim=4, bytes_per_elem=4 항목을 명시적으로 표기함.
+#![allow(clippy::identity_op)]
+
 use llm_rs2::core::pressure::quantize_handler::QuantizeHandler;
 use llm_rs2::core::qcf::QcfMetric;
 use llm_rs2::core::qcf::estimator::{DegradationEstimator, PiecewiseLinear};

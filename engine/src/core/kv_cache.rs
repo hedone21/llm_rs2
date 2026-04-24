@@ -1509,14 +1509,14 @@ mod tests {
         assert_eq!(cache.current_pos(), 4);
 
         // ensure_capacity within current → no grow, returns false
-        assert_eq!(cache.ensure_capacity(3).unwrap(), false);
+        assert!(!cache.ensure_capacity(3).unwrap());
         assert_eq!(cache.capacity(), 4);
 
         // ensure_capacity exactly at boundary → no grow
-        assert_eq!(cache.ensure_capacity(4).unwrap(), false);
+        assert!(!cache.ensure_capacity(4).unwrap());
 
         // ensure_capacity beyond → grow, returns true
-        assert_eq!(cache.ensure_capacity(5).unwrap(), true);
+        assert!(cache.ensure_capacity(5).unwrap());
         assert!(cache.capacity() >= 5);
 
         // Data integrity after grow
@@ -1707,6 +1707,7 @@ mod tests {
         cache.k_buffer.as_slice::<f32>()[off]
     }
 
+    #[allow(dead_code)]
     fn hm_read_v(cache: &KVCache, pos: usize, head: usize) -> f32 {
         let off = cache.offset(pos, head);
         cache.v_buffer.as_slice::<f32>()[off]
@@ -2655,8 +2656,8 @@ mod tests {
         {
             let k_slice = cache.k_buffer.as_slice::<f32>();
             // Head 0 at pos 0 ← old pos 2 = 3.0; pos 1 ← old pos 3 = 4.0
-            assert_eq!(k_slice[0 * dim], 3.0, "head0 pos0 should be old pos2");
-            assert_eq!(k_slice[1 * dim], 4.0, "head0 pos1 should be old pos3");
+            assert_eq!(k_slice[0], 3.0, "head0 pos0 should be old pos2");
+            assert_eq!(k_slice[dim], 4.0, "head0 pos1 should be old pos3");
             // pos 2,3,4 ← old pos 7,8,9 (consecutive batch)
             assert_eq!(k_slice[2 * dim], 8.0, "head0 pos2 should be old pos7");
             assert_eq!(k_slice[3 * dim], 9.0, "head0 pos3 should be old pos8");

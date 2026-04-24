@@ -2668,9 +2668,7 @@ mod tests {
         // Build "GPU" embed table (same data, simulates GPU copy)
         let gpu_buf = mem.alloc(vocab * dim * 4, DType::F32).unwrap();
         {
-            let src = unsafe {
-                std::slice::from_raw_parts(embed_tokens.as_ptr() as *const u8, vocab * dim * 4)
-            };
+            let src = unsafe { std::slice::from_raw_parts(embed_tokens.as_ptr(), vocab * dim * 4) };
             let dst =
                 unsafe { std::slice::from_raw_parts_mut(gpu_buf.as_mut_ptr(), vocab * dim * 4) };
             dst.copy_from_slice(src);

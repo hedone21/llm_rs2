@@ -2461,6 +2461,7 @@ impl KVCacheOps for KiviCache {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop)]
 mod tests {
     use super::*;
     use crate::backend::cpu::CpuBackend;
@@ -3693,7 +3694,7 @@ mod tests {
     fn test_dryrun_qcf_full_residual_computes_actual_nmse() {
         let kv_heads = 1;
         let head_dim = 32;
-        let mut cache = KiviCache::new(kv_heads, head_dim, 128, 32);
+        let _cache = KiviCache::new(kv_heads, head_dim, 128, 32);
         // Fill exactly 32 tokens without flushing (the 32nd token triggers flush
         // during update, but estimate_dryrun_qcf is read-only and uses current res data).
         // We need to have 32 tokens in residual for NMSE. Use bits=4 and 64-token residual.
@@ -3707,7 +3708,7 @@ mod tests {
         assert_eq!(cache4.res_pos, 32);
         let qcf = cache4.estimate_dryrun_qcf();
         // Should compute actual NMSE (between 0.0 and 1.0, not a proxy)
-        assert!(qcf >= 0.0 && qcf <= 1.0, "qcf={qcf} out of range");
+        assert!((0.0..=1.0).contains(&qcf), "qcf={qcf} out of range");
         // Q4 NMSE should be < Q2 proxy (0.30) for typical data
         assert!(qcf < 0.30, "Q4 NMSE {qcf} should be < Q2 proxy 0.30");
     }

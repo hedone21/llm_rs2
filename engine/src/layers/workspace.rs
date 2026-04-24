@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(ws.q.shape().dims(), &[1, 1, 64]);
         assert_eq!(ws.k.shape().dims(), &[1, 1, 16]);
         assert_eq!(ws.gate.shape().dims(), &[1, 1, 128]);
-        assert_eq!(ws.scores.len(), 1 * 32); // 1 head * 32 max_seq
+        assert_eq!(ws.scores.len(), 32); // 1 head * 32 max_seq
     }
 
     #[test]

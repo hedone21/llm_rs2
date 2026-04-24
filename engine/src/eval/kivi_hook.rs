@@ -244,7 +244,7 @@ mod tests {
         assert_eq!(fields["qcf_kivi_flush_count"], 5);
 
         // After reset_caches
-        let mut cache2 = KiviCache::new(8, 64, 512, 32);
+        let cache2 = KiviCache::new(8, 64, 512, 32);
         hook.reset_caches(&mut [cache2]);
         assert_eq!(hook.flush_count, 0);
         assert_eq!(hook.qcf_kivi_legacy, 0.0);
@@ -292,7 +292,7 @@ mod tests {
     fn test_snapshot_and_restore_single_cache() {
         let hook = make_hook();
         let original = KiviCache::new(8, 64, 512, 32);
-        let snap = hook.snapshot(&[original.clone()]);
+        let snap = hook.snapshot(std::slice::from_ref(&original));
 
         // Modify a second copy then restore.
         let mut modified = vec![KiviCache::new(8, 64, 512, 32)];

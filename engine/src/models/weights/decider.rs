@@ -160,7 +160,7 @@ impl<'a> WeightSwapDecider<'a> {
 
 /// Compute QCF_swap for a given set of swapped layers (ENG-ALG-217).
 ///
-/// ```
+/// ```text
 /// QCF_swap(S) = Σ_{i ∈ S} importance_i × ε_i
 ///               ───────────────────────────────
 ///               Σ_{j ∈ all_valid} importance_j × ε_j

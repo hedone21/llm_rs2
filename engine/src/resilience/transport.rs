@@ -544,7 +544,7 @@ mod tests {
     #[test]
     fn test_mock_connect_always_ok() {
         let transport = MockTransport::from_messages(vec![]);
-        assert!(matches!(transport.rx.try_recv(), Err(_)));
+        assert!(transport.rx.try_recv().is_err());
     }
 
     #[test]

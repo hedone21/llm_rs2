@@ -734,7 +734,7 @@ mod tests {
     /// Fills with quantized data from sequential float values.
     fn make_q4_weight(out_dim: usize, in_dim: usize) -> Tensor {
         assert!(
-            in_dim % QK4_0 == 0,
+            in_dim.is_multiple_of(QK4_0),
             "in_dim must be divisible by 32 for Q4_0"
         );
         let blocks_per_row = in_dim / QK4_0;
@@ -743,7 +743,7 @@ mod tests {
 
         let memory = Galloc::new();
         let buf = memory.alloc(total_bytes, DType::Q4_0).unwrap();
-        let mut tensor = Tensor::new(Shape::new(vec![out_dim, in_dim]), buf, cpu_backend());
+        let tensor = Tensor::new(Shape::new(vec![out_dim, in_dim]), buf, cpu_backend());
 
         // Fill with quantized data
         let blocks = unsafe {
@@ -1626,7 +1626,7 @@ mod tests {
         // gpu_alloc stub (CPU memory works for the structural checks).
         let gpu_alloc =
             |bytes: usize, dtype: DType| -> anyhow::Result<Arc<dyn crate::core::buffer::Buffer>> {
-                Ok(cpu_mem.alloc(bytes, dtype)?)
+                cpu_mem.alloc(bytes, dtype)
             };
 
         let pw = PartitionWorkspace::new(

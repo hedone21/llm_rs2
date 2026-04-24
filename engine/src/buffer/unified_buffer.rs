@@ -228,8 +228,8 @@ mod tests {
         // We use catch_unwind to intercept this panic and convert it to an Err.
         let platform_result = panic::catch_unwind(|| {
             // Some ocl versions return Result from list(), others panic. We handle both.
-            let res = Platform::list();
-            res
+
+            Platform::list()
         });
 
         let platform_list = match platform_result {

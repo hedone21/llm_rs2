@@ -214,6 +214,7 @@ impl D2OVarianceCollector {
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(clippy::erasing_op)]
 mod tests {
     use super::*;
 
@@ -288,7 +289,7 @@ mod tests {
         }
         // head 1: slight spread
         for j in 0..seq_len {
-            c.column_sums[0][1 * seq_len + j] = j as f32;
+            c.column_sums[0][seq_len + j] = j as f32;
         }
         // head 2: bigger spread
         for j in 0..seq_len {
@@ -358,7 +359,7 @@ mod tests {
             assert!(*hh >= 0.0 && *rec >= 0.0, "layer {} has negative budget", i);
             let total = hh + rec;
             assert!(
-                total >= 0.01 && total <= 1.0,
+                (0.01..=1.0).contains(&total),
                 "layer {} total budget {} out of [0.01, 1.0]",
                 i,
                 total

@@ -194,6 +194,19 @@ impl QuantNoiseTable {
             computed_at_init: true,
         }
     }
+
+    /// Integration-test constructor: build a table with explicit ε values and
+    /// `computed_at_init = true`.
+    ///
+    /// Identical to `new_test` but accessible from integration test binaries
+    /// (outside the crate).  Prefer `uniform_ones` for production fallback paths.
+    #[doc(hidden)]
+    pub fn from_values(values: Vec<f32>) -> Self {
+        Self {
+            per_layer: values,
+            computed_at_init: true,
+        }
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────

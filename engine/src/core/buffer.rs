@@ -167,8 +167,8 @@ mod tests {
         assert_ne!(a, DType::F16);
         assert_ne!(DType::Q4_0, DType::Q4_1);
 
-        // Clone produces identical value
-        let c = a.clone();
+        // Copy produces identical value
+        let c = a;
         assert_eq!(a, c);
     }
 

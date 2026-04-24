@@ -223,7 +223,7 @@ mod tests {
         let backend = Arc::new(CpuBackend::new());
         (0..n_layers)
             .map(|_| {
-                let buf_size = max_seq * 1 * 4 * 4;
+                let buf_size = max_seq * 4 * 4;
                 let k = Tensor::new(
                     Shape::new(vec![1, max_seq, 1, 4]),
                     Arc::new(SharedBuffer::new(buf_size, DType::F32)),

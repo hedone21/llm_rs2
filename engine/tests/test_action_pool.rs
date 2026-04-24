@@ -51,6 +51,7 @@ fn make_seqmajor_cache(num_tokens: usize, kv_heads: usize, head_dim: usize) -> K
     cache
 }
 
+#[allow(dead_code)]
 fn make_headmajor_cache(num_tokens: usize, kv_heads: usize, head_dim: usize) -> KVCache {
     let max_seq = 256;
     let backend = Arc::new(CpuBackend::new());
@@ -221,7 +222,7 @@ fn test_throttle_plus_eviction_independence() {
 #[test]
 fn test_swap_then_continue() {
     // W2 offload: SwapHandler prunes cache, then inference can continue
-    let mut cache = make_seqmajor_cache(80, 1, 4);
+    let cache = make_seqmajor_cache(80, 1, 4);
     let handler = SwapHandler::new(0.5);
     let mut caches = vec![cache];
     let mut ctx = HandlerContext {
@@ -294,7 +295,7 @@ fn test_all_actions_data_flow() {
     let dir = std::env::temp_dir().join("llm_rs2_test_all_actions");
     let _ = std::fs::remove_dir_all(&dir);
     let mut store = DiskStore::new(dir.clone(), 0, 64).unwrap();
-    store.store(&vec![0u8; 64], &vec![0u8; 64], 1).unwrap();
+    store.store(&[0u8; 64], &[0u8; 64], 1).unwrap();
     assert_eq!(store.stored_tokens(), 1);
     let _ = std::fs::remove_dir_all(&dir);
 

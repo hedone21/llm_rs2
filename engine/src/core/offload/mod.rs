@@ -517,6 +517,7 @@ impl crate::core::kv_cache::PrefetchableCache for OffloadKVCache {
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_range_loop, clippy::too_many_arguments)]
 mod tests {
     use super::*;
     use crate::core::kv_cache::KVCacheOps;
@@ -1757,10 +1758,10 @@ mod tests {
 
                 // Layer loop
                 for i in 0..num_layers {
-                    if let Some(rx) = pending[i].take() {
-                        if let Ok(r) = rx.recv() {
-                            prefetch.record_preload(r.duration);
-                        }
+                    if let Some(rx) = pending[i].take()
+                        && let Ok(r) = rx.recv()
+                    {
+                        prefetch.record_preload(r.duration);
                     }
                     let far_idx = i + depth;
                     if far_idx < num_layers && pending[far_idx].is_none() {

@@ -1355,6 +1355,7 @@ mod tests {
             }
 
             // Tensor data (with alignment padding between tensors)
+            #[allow(clippy::never_loop)]
             for (i, _t) in self.tensors.iter().enumerate() {
                 // Pad to reach the expected offset
                 let expected_pos = tensor_offsets[i] as usize;

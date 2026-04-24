@@ -417,6 +417,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_equality_without_abs)]
     fn test_decay_factor_clamping() {
         // decay=0.0 -> factor=1.0 (no decay)
         assert!((1.0f32 - 0.0f32).clamp(0.0, 1.0) - 1.0 < f32::EPSILON);
