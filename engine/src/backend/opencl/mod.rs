@@ -148,6 +148,15 @@ pub fn get_cl_mem(buf: &dyn Buffer) -> Result<&ocl::core::Mem> {
     {
         return Ok(sb.cl_mem_ref());
     }
+    // NoshuffleWeightBuffer (SOA replacement for an AOS Q4_0 weight — holds
+    // q_buf/d_buf/q_img on behalf of the tensor). `cl_mem()` returns `d_buf`;
+    // the same address doubles as the noshuffle SOA registry key.
+    if let Some(ns) = buf
+        .as_any()
+        .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>()
+    {
+        return Ok(ns.d_buf());
+    }
     Err(anyhow!("Buffer is not an OpenCL buffer type"))
 }
 
@@ -6602,6 +6611,104 @@ mod noshuffle_tests {
             backend.lookup_noshuffle_soa(key_a).is_none(),
             "old key must remain evicted after re-registration"
         );
+    }
+
+    /// `NoshuffleWeightBuffer` must expose `d_buf` through `get_cl_mem()` so
+    /// that a weight tensor whose backing buffer was swapped post-SOA
+    /// conversion still produces a stable registry key — i.e. the key used
+    /// by `matmul_q4_0` (`b_buf.as_ptr() as usize`) resolves to the d_buf
+    /// address that `prepare_noshuffle_buffers(keep_original=false)` chose
+    /// when registering the entry.
+    #[test]
+    fn test_noshuffle_weight_buffer_key_stability() {
+        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        let ne01 = 4usize;
+        let ne00 = 64usize;
+        let blocks_per_row = ne00 / QK4_0;
+        let num_blocks = ne01 * blocks_per_row;
+
+        // Build one SOA conversion output against a dummy Q4_0 source.
+        let mut all_blocks = Vec::new();
+        for row in 0..ne01 {
+            for k in 0..blocks_per_row {
+                let d = (row + 1) as f32 * 0.1 + k as f32 * 0.01;
+                let mut quants = [0i8; 32];
+                for (j, q) in quants.iter_mut().enumerate() {
+                    *q = ((row * 100 + k * 32 + j) % 15) as i8 - 7;
+                }
+                all_blocks.push(make_q4_0_block(d, &quants));
+            }
+        }
+        let raw_bytes: Vec<u8> = all_blocks.iter().flat_map(|b| b.iter().copied()).collect();
+        let src_buf = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                backend.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                raw_bytes.len(),
+                None,
+            )
+            .unwrap()
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &backend.queue,
+                &src_buf,
+                true,
+                0,
+                &raw_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+        let (q_buf, d_buf, q_img) = backend
+            .convert_q4_0_to_noshuffle(&src_buf, num_blocks, ne00, ne01)
+            .unwrap();
+
+        // Snapshot the d_buf address — this is what `prepare_noshuffle_buffers`
+        // would register as the key when swapping in a placeholder.
+        let d_buf_key = d_buf.as_ptr() as usize;
+
+        // Register the entry under the d_buf key.
+        backend.register_noshuffle_soa(
+            d_buf_key,
+            NoshuffleSoaEntry {
+                q_buf: q_buf.clone(),
+                d_buf: d_buf.clone(),
+                q_img: q_img.as_ref().cloned(),
+                ne00,
+                ne01,
+            },
+        );
+
+        // Swap the AOS source away — the only thing keeping the SOA view
+        // alive is now the placeholder + registry entry.
+        drop(src_buf);
+
+        // Build the placeholder; it should expose `d_buf` through
+        // `get_cl_mem()` so the registry key resolves.
+        let placeholder = NoshuffleWeightBuffer::new(q_buf, d_buf, q_img, ne00, ne01, 1024);
+        let reported = get_cl_mem(&placeholder).unwrap();
+        assert_eq!(
+            reported.as_ptr() as usize,
+            d_buf_key,
+            "placeholder must return d_buf from cl_mem() — registry key stability invariant"
+        );
+        assert!(
+            backend.lookup_noshuffle_soa(d_buf_key).is_some(),
+            "entry keyed by d_buf address must remain reachable via placeholder"
+        );
+
+        backend.clear_noshuffle_soa_registry();
     }
 }
 

@@ -1061,7 +1061,18 @@ fn main() -> anyhow::Result<()> {
                      (decode uses standard Q4_0 GEMV fallback — correct but slower)"
                 );
             } else {
-                match model.prepare_noshuffle_buffers(&backend) {
+                // Keep the AOS cl_mem alive when any runtime path still needs
+                // CPU-accessible weights: resilience pre-warm, a non-GPU-only
+                // tensor partition, prefill CPU chunking, or plain lazy
+                // activation via `--enable-resilience`. In those cases
+                // `map_weights_for_cpu()` will either have already run (lines
+                // ~988 above) or will run on demand against the original AOS
+                // allocation. Dropping it would strand the fallback path.
+                let keep_for_cpu = args.resilience_prealloc_switch
+                    || cli_partition_needs_cpu_weights
+                    || args.prefill_cpu_chunk_size > 0
+                    || args.enable_resilience;
+                match model.prepare_noshuffle_buffers(&backend, keep_for_cpu) {
                     Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
                     Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
                 }
@@ -4778,7 +4789,19 @@ fn main() -> anyhow::Result<()> {
                                                 >()
                                         {
                                             ocl_be.clear_noshuffle_soa_registry();
-                                            match model.prepare_noshuffle_buffers(&backend) {
+                                            // Tensor partition runtime re-register:
+                                            // `map_weights_for_cpu()` above replaced the
+                                            // per-weight `UnifiedBuffer` with a CPU-mapped
+                                            // version, so we keep the AOS allocation
+                                            // alive — the partition path (and any CPU
+                                            // matmul fallback) dereferences the original
+                                            // cl_mem directly. `keep_original=true` stops
+                                            // `prepare_noshuffle_buffers` from swapping
+                                            // the tensor buffers out from under the
+                                            // caller.
+                                            match model
+                                                .prepare_noshuffle_buffers(&backend, true)
+                                            {
                                                 Ok(n) => eprintln!(
                                                     "[Partition] Re-registered Q4_0 noshuffle SOA: {} weight tensors",
                                                     n
