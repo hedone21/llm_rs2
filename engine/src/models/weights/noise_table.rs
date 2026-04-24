@@ -183,6 +183,17 @@ impl QuantNoiseTable {
     pub fn is_empty(&self) -> bool {
         self.per_layer.is_empty()
     }
+
+    /// Test-only constructor: build a table with arbitrary ε values and
+    /// `computed_at_init = true` so unit tests can exercise the scored path
+    /// without a real secondary mmap.
+    #[cfg(test)]
+    pub fn new_test(values: Vec<f32>) -> Self {
+        Self {
+            per_layer: values,
+            computed_at_init: true,
+        }
+    }
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
