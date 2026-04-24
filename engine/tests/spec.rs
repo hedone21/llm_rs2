@@ -62,15 +62,17 @@ mod test_eng_alg_200_plan_partition;
 #[path = "spec/test_inv_120_plan_partition_stale.rs"]
 mod test_inv_120_plan_partition_stale;
 
-// ── Weight Swap Phase 1 infrastructure (ENG-DAT-092/093/094, ENG-ALG-210) ──
+// ── Weight Swap Phase 1/2 infrastructure (ENG-DAT-092/094, ENG-ALG-210/211) ──
 // Runtime dynamic weight swap groundwork. Phase 1 exercises static shape +
-// `LayerSlot` atomic primitives; Phase 2 swap execution arrives separately.
+// `LayerSlot` atomic primitives; Phase 2 swap execution and handler pipeline.
+// Note: ENG-DAT-093 (TransformerWeights container) was removed in Stage 2
+// cleanup — replaced by flat fields directly on `TransformerModel`.
 #[path = "spec/test_eng_alg_210_initial_load.rs"]
 mod test_eng_alg_210_initial_load;
+#[path = "spec/test_eng_alg_211_weight_swap_handler.rs"]
+mod test_eng_alg_211_weight_swap_handler;
 #[path = "spec/test_eng_dat_092_layer_slot.rs"]
 mod test_eng_dat_092_layer_slot;
-#[path = "spec/test_eng_dat_093_transformer_weights.rs"]
-mod test_eng_dat_093_transformer_weights;
 #[path = "spec/test_eng_dat_094_secondary_mmap.rs"]
 mod test_eng_dat_094_secondary_mmap;
 #[path = "spec/test_inv_121_dynamic.rs"]

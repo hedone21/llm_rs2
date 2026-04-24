@@ -1,9 +1,12 @@
 //! ENG-ALG-210 — initial uniform load path.
 //!
 //! Phase 1 unit check: every `LayerSlot` starts at `default_dtype`, generation
-//! 0, and shares the same `Arc<SecondaryMmap>` handle as the root container
-//! (INV-125 structural guarantee). An end-to-end GGUF roundtrip is deferred
-//! to device tests because it requires fixture files.
+//! 0, and shares the same `Arc<SecondaryMmap>` handle (INV-125 structural
+//! guarantee). An end-to-end GGUF roundtrip is deferred to device tests
+//! because it requires fixture files.
+//!
+//! Note: `TransformerWeights` container (ENG-DAT-093) was removed in Stage 2
+//! cleanup. These tests verify `LayerSlot` invariants directly.
 
 use std::sync::Arc;
 
@@ -15,7 +18,7 @@ use llm_rs2::core::shape::Shape;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
 use llm_rs2::memory::galloc::Galloc;
-use llm_rs2::models::weights::{LayerSlot, TransformerWeights};
+use llm_rs2::models::weights::LayerSlot;
 
 fn dummy_tensor(be: &Arc<dyn Backend>, numel: usize) -> Tensor {
     let mem = Galloc::new();
@@ -56,16 +59,6 @@ fn initial_load_uniform_dtype_secondary_none() {
         assert_eq!(slot.generation(), 0);
         assert!(slot.secondary_mmap_handle().is_none());
     }
-
-    let tw = TransformerWeights::new(
-        slots,
-        Arc::new(dummy_tensor(&be, 32)),
-        Arc::new(dummy_tensor(&be, 4)),
-        Some(Arc::new(dummy_tensor(&be, 32))),
-        None,
-    );
-    assert!(tw.secondary_mmap.is_none());
-    assert_eq!(tw.ratio_generation(), 0);
 }
 
 #[test]
