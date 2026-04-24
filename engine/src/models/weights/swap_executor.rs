@@ -1,0 +1,486 @@
+//! `SwapExecutor` — Phase 2 runtime layer swap (ENG-ALG-211).
+//!
+//! The executor materialises a fresh `LayerWeights` snapshot from the
+//! secondary mmap for each target decoder layer and installs it into the
+//! corresponding `LayerSlot` via `ArcSwap::store`. A single
+//! `TransformerModel::ratio_generation` bump at the end of the batch
+//! triggers plan invalidation (INV-120) exactly once (ENG-ALG-211 step (e)).
+//!
+//! **Scope (Stage 1)**: uniform, index-based target selection only — QCF
+//! importance wiring lands in Phase 3 with `SwapDecider`.
+//!
+//! **Safety**: the executor is intended to run single-threaded relative to
+//! other writers. Readers (forward pass) acquire `Arc<LayerWeights>`
+//! snapshots on token entry (ENG-ALG-214-SNAP) and are therefore unaffected
+//! by concurrent swaps — INV-121/INV-123.
+//!
+//! Spec: ENG-ALG-211, ENG-DAT-092/093/094, INV-120/121/123/124/125.
+
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+use anyhow::Result;
+
+use crate::buffer::shared_buffer::SharedBuffer;
+use crate::core::backend::Backend;
+use crate::core::buffer::{Buffer, DType};
+use crate::core::memory::Memory;
+use crate::core::tensor::Tensor;
+use crate::layers::transformer_layer::TransformerLayer;
+use crate::models::config::ModelConfig;
+use crate::models::loader::gguf::{qk_permute_shape, unpermute_qk_rows};
+use crate::models::transformer::TransformerModel;
+use crate::models::weights::{LayerSlot, LayerWeights, SecondaryMmap};
+
+/// Errors surfaced by `SwapExecutor::execute`.
+#[derive(Debug)]
+pub enum SwapError {
+    /// A tensor expected by the secondary mmap index is missing.
+    SecondaryTensorMissing { layer: usize, subname: String },
+    /// Backend refused to allocate a host-side weight tensor.
+    BufferAllocationFailed { layer: usize, source: anyhow::Error },
+    /// Shape inferred from secondary dims does not match the primary layer.
+    ShapeMismatch {
+        layer: usize,
+        subname: String,
+        primary: Vec<usize>,
+        secondary: Vec<u64>,
+    },
+}
+
+impl std::fmt::Display for SwapError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SwapError::SecondaryTensorMissing { layer, subname } => write!(
+                f,
+                "secondary mmap: layer {layer} missing tensor '{subname}'"
+            ),
+            SwapError::BufferAllocationFailed { layer, source } => {
+                write!(f, "swap layer {layer}: buffer allocation failed: {source}")
+            }
+            SwapError::ShapeMismatch {
+                layer,
+                subname,
+                primary,
+                secondary,
+            } => write!(
+                f,
+                "swap layer {layer} tensor '{subname}': \
+                 shape mismatch (primary={primary:?}, secondary={secondary:?})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for SwapError {}
+
+/// Outcome of a single layer swap inside one batch.
+#[derive(Debug, Clone)]
+pub struct SwappedLayer {
+    pub layer_idx: usize,
+    pub from_dtype: DType,
+    pub to_dtype: DType,
+}
+
+/// Aggregated result of one `execute` batch (ENG-ALG-211 "SwapResult").
+#[derive(Debug, Clone, Default)]
+pub struct SwapReport {
+    /// Layers whose snapshot was atomically replaced.
+    pub swapped: Vec<SwappedLayer>,
+    /// Layers we intended to swap but skipped (already at target dtype or
+    /// outside the range / missing secondary handle).
+    pub skipped: Vec<usize>,
+    /// Wall clock for the full batch.
+    pub latency_ms: f64,
+    /// Value of `TransformerModel::ratio_generation` after the batch. `None`
+    /// when no actual swap happened (no bump — ENG-ALG-211 step (e) contract).
+    pub ratio_generation_after: Option<u64>,
+}
+
+/// Stateless executor. One instance per swap request is fine.
+pub struct SwapExecutor<'a> {
+    /// Target dtype for all layers in this batch. Fixed per batch because
+    /// ratio-based swap conceptually picks one secondary dtype per batch.
+    pub target_dtype: DType,
+    /// Model config — drives Q/K permutation gating (only Llama rearranges
+    /// at load time, mirroring `gguf.rs`).
+    pub config: &'a ModelConfig,
+    /// Where we land the fresh weight tensors (CPU for host tests, the
+    /// primary backend in production). Must match the existing layer's
+    /// backend so downstream kernels remain compatible.
+    pub backend: Arc<dyn Backend>,
+    /// Memory allocator paired with `backend`. Used for the permutation
+    /// fallback path when we have to materialise an owned buffer.
+    pub memory: &'a dyn Memory,
+}
+
+impl<'a> SwapExecutor<'a> {
+    /// Construct an executor. `target_dtype` is the dtype we are swapping
+    /// *to* (e.g. `Q4_0` for F16→Q4_0). Backend+memory must be consistent
+    /// with the slots we will touch.
+    pub fn new(
+        target_dtype: DType,
+        config: &'a ModelConfig,
+        backend: Arc<dyn Backend>,
+        memory: &'a dyn Memory,
+    ) -> Self {
+        Self {
+            target_dtype,
+            config,
+            backend,
+            memory,
+        }
+    }
+
+    /// Select uniform index-spaced target layers (Stage 1 fallback, ENG-ALG-212).
+    ///
+    /// Deterministic: `ceil(ratio * num_layers)` layers evenly spaced across
+    /// `[0, num_layers)`. Layers already at `target_dtype` are skipped by
+    /// `execute` itself (idempotent).
+    pub fn uniform_target_layers(ratio: f32, num_layers: usize) -> Vec<usize> {
+        if num_layers == 0 {
+            return Vec::new();
+        }
+        let clamped = ratio.clamp(0.0, 1.0);
+        let count = ((clamped * num_layers as f32).round() as usize).min(num_layers);
+        if count == 0 {
+            return Vec::new();
+        }
+        if count == num_layers {
+            return (0..num_layers).collect();
+        }
+        // Evenly spaced indices. For count==k and n layers, we use
+        // floor((i + 0.5) * n / k) which stays stable under tie breaks.
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let idx = ((i as f32 + 0.5) * num_layers as f32 / count as f32) as usize;
+            out.push(idx.min(num_layers - 1));
+        }
+        out.dedup();
+        out
+    }
+
+    /// Execute a swap batch. `target_layers` is the caller-chosen set of
+    /// decoder indices to convert. Out-of-range / already-swapped layers
+    /// are silently skipped (ENG-DAT-C08, ENG-ALG-211).
+    ///
+    /// Returns `SwapReport` describing what landed. On success,
+    /// `TransformerModel::ratio_generation` is bumped **exactly once** when
+    /// at least one layer was actually swapped (ENG-ALG-211 step (e)).
+    pub fn execute(
+        &self,
+        model: &TransformerModel,
+        target_layers: &[usize],
+    ) -> Result<SwapReport, SwapError> {
+        let start = Instant::now();
+        let mut report = SwapReport::default();
+
+        // ENG-DAT-C09: secondary handle absent → entire operation is a no-op.
+        let Some(secondary) = model.secondary_mmap.as_ref() else {
+            report.latency_ms = start.elapsed().as_secs_f64() * 1e3;
+            return Ok(report);
+        };
+
+        for &layer_idx in target_layers {
+            // ENG-DAT-C08: out-of-range silently skipped.
+            let Some(slot) = model.layers.get(layer_idx) else {
+                report.skipped.push(layer_idx);
+                continue;
+            };
+            // Idempotent: already at target dtype.
+            if slot.current_dtype() == self.target_dtype {
+                report.skipped.push(layer_idx);
+                continue;
+            }
+            // Secondary handle may have been stripped (no swap path). Treat
+            // as skip rather than error — matches ENG-DAT-C09 spirit when
+            // the per-slot handle was never installed.
+            if slot.secondary_mmap_handle().is_none() {
+                report.skipped.push(layer_idx);
+                continue;
+            }
+
+            let from_dtype = slot.current_dtype();
+            let new_layer = self.build_layer_from_mmap(secondary, slot, layer_idx)?;
+            let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
+
+            // Snapshot the old Arc so we can (a) inspect buffer ranges for
+            // madvise and (b) hold the strong_count check before dropping
+            // our local reference below.
+            let old = slot.load_weights();
+
+            // (c) Atomic install — INV-123. swap_weights bumps the per-slot
+            // debug generation as part of its contract.
+            slot.swap_weights(new_arc, self.target_dtype);
+
+            // (d) Best-effort page reclaim on the just-replaced primary
+            // pages. Only safe when we are the last holder; otherwise an
+            // in-flight forward still owns the old Arc and madvise would
+            // race. Stage 1 conservative policy: skip silently when
+            // strong_count > 1 and leave the OS to reclaim on final drop.
+            Self::madvise_if_exclusive(&old);
+            drop(old);
+
+            report.swapped.push(SwappedLayer {
+                layer_idx,
+                from_dtype,
+                to_dtype: self.target_dtype,
+            });
+        }
+
+        // (e) Single batch-level bump of the global ratio_generation counter.
+        // Empty swaps do NOT bump (ENG-ALG-211: "if !swapped.is_empty()").
+        if !report.swapped.is_empty() {
+            let new_gen = model.ratio_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            report.ratio_generation_after = Some(new_gen);
+        }
+
+        report.latency_ms = start.elapsed().as_secs_f64() * 1e3;
+        Ok(report)
+    }
+
+    /// Build a fresh `TransformerLayer` from the secondary mmap for the
+    /// given `layer_idx`, mirroring the primary loader's dtype handling and
+    /// Q/K permutation gating.
+    ///
+    /// Non-swap fields (partition context) are preserved from the current
+    /// snapshot so downstream tensor-partition state is retained.
+    fn build_layer_from_mmap(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        slot: &LayerSlot,
+        layer_idx: usize,
+    ) -> Result<TransformerLayer, SwapError> {
+        let old = slot.load_weights();
+
+        let wq = self.materialise_tensor(secondary, layer_idx, "attn_q.weight", &old.wq, true)?;
+        let wk = self.materialise_tensor(secondary, layer_idx, "attn_k.weight", &old.wk, true)?;
+        let wv = self.materialise_tensor(secondary, layer_idx, "attn_v.weight", &old.wv, true)?;
+        let wo =
+            self.materialise_tensor(secondary, layer_idx, "attn_output.weight", &old.wo, true)?;
+        let w_gate =
+            self.materialise_tensor(secondary, layer_idx, "ffn_gate.weight", &old.w_gate, true)?;
+        let w_up =
+            self.materialise_tensor(secondary, layer_idx, "ffn_up.weight", &old.w_up, true)?;
+        let w_down =
+            self.materialise_tensor(secondary, layer_idx, "ffn_down.weight", &old.w_down, true)?;
+
+        // Norms are typically F32. We re-read them from secondary to avoid
+        // relying on primary-lifetime buffers in the new snapshot. If the
+        // secondary omits a norm (unlikely for standard GGUFs), fall back
+        // to cloning the primary tensor — shape/dtype match is enforced by
+        // `open_secondary` metadata validation.
+        let attention_norm = self.clone_or_materialise_norm(
+            secondary,
+            layer_idx,
+            "attn_norm.weight",
+            &old.attention_norm,
+        )?;
+        let ffn_norm =
+            self.clone_or_materialise_norm(secondary, layer_idx, "ffn_norm.weight", &old.ffn_norm)?;
+
+        // Optional Gemma3 / Qwen norms — preserve existing tensors since
+        // they are not part of the swap target set for this stage.
+        Ok(TransformerLayer {
+            wq,
+            wk,
+            wv,
+            wo,
+            w_gate,
+            w_up,
+            w_down,
+            attention_norm,
+            ffn_norm,
+            qkv_bias: old.qkv_bias.clone(),
+            q_norm: old.q_norm.clone(),
+            k_norm: old.k_norm.clone(),
+            pre_ffn_norm: old.pre_ffn_norm.clone(),
+            post_ffn_norm: old.post_ffn_norm.clone(),
+            partition_ctx: old.partition_ctx.clone(),
+        })
+    }
+
+    /// Materialise one weight tensor from the secondary mmap, applying Q/K
+    /// row permutation when `subname` identifies a Llama Q/K weight.
+    fn materialise_tensor(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+        is_weight: bool,
+    ) -> Result<Tensor, SwapError> {
+        let info = secondary.layer_tensor(layer_idx, subname).ok_or_else(|| {
+            SwapError::SecondaryTensorMissing {
+                layer: layer_idx,
+                subname: subname.to_string(),
+            }
+        })?;
+
+        let shape = primary.shape().clone();
+        let expected_dims: Vec<usize> = primary.shape().dims().to_vec();
+        // Secondary dims are stored in reverse order (GGUF innermost-first).
+        let sec_rev: Vec<usize> = info.dims.iter().rev().map(|&d| d as usize).collect();
+        if sec_rev != expected_dims {
+            return Err(SwapError::ShapeMismatch {
+                layer: layer_idx,
+                subname: subname.to_string(),
+                primary: expected_dims,
+                secondary: info.dims.clone(),
+            });
+        }
+
+        // Raw bytes from the secondary mmap.
+        let data = secondary.tensor_bytes(info);
+
+        // Build a canonical GGUF tensor name for the permutation gate, so we
+        // reuse the same predicate as the primary loader without copying
+        // regex logic.
+        let canonical_name = format!("blk.{layer_idx}.{subname}");
+        let permuted_bytes: Option<Vec<u8>> =
+            if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
+                let total_rows = shape.dims()[0];
+                debug_assert_eq!(total_rows, n_head * head_dim);
+                if !data.len().is_multiple_of(total_rows) {
+                    return Err(SwapError::ShapeMismatch {
+                        layer: layer_idx,
+                        subname: subname.to_string(),
+                        primary: expected_dims,
+                        secondary: info.dims.clone(),
+                    });
+                }
+                let row_size_bytes = data.len() / total_rows;
+                Some(unpermute_qk_rows(data, n_head, head_dim, row_size_bytes))
+            } else {
+                None
+            };
+
+        // Always build an owned SharedBuffer on CPU first, then route
+        // through the existing copy_weight_from / copy_from paths to land on
+        // the final backend. This matches the loader's behaviour for
+        // permuted weights and avoids plumbing mmap buffer lifetimes into
+        // the slot (the secondary mmap Arc is the lifetime keeper, but
+        // keeping per-tensor views alive would complicate madvise).
+        let owned_bytes: Vec<u8> = permuted_bytes.unwrap_or_else(|| data.to_vec());
+        let shared_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(owned_bytes, info.dtype));
+
+        let cpu_backend: Arc<dyn Backend> =
+            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
+        let cpu_tensor = Tensor::new(shape.clone(), shared_buf, cpu_backend);
+
+        let is_cpu = self.backend.name().contains("CPU");
+        if is_cpu {
+            Ok(cpu_tensor)
+        } else if is_weight {
+            self.backend.copy_weight_from(&cpu_tensor).map_err(|e| {
+                SwapError::BufferAllocationFailed {
+                    layer: layer_idx,
+                    source: e,
+                }
+            })
+        } else {
+            self.backend
+                .copy_from(&cpu_tensor)
+                .map_err(|e| SwapError::BufferAllocationFailed {
+                    layer: layer_idx,
+                    source: e,
+                })
+        }
+    }
+
+    /// Materialise a norm tensor if present in the secondary file; otherwise
+    /// fall back to cloning the primary tensor. Norms are rarely stored
+    /// differently across GGUFs so the fallback is the common path.
+    fn clone_or_materialise_norm(
+        &self,
+        secondary: &Arc<SecondaryMmap>,
+        layer_idx: usize,
+        subname: &str,
+        primary: &Tensor,
+    ) -> Result<Tensor, SwapError> {
+        if secondary.layer_tensor(layer_idx, subname).is_some() {
+            self.materialise_tensor(secondary, layer_idx, subname, primary, false)
+        } else {
+            Ok(primary.clone())
+        }
+    }
+
+    /// Advise the kernel that the primary pages backing `old` can be
+    /// reclaimed. Safe only when we hold the last reference — otherwise an
+    /// in-flight forward still uses the tensor. Best-effort, never panics.
+    fn madvise_if_exclusive(old: &Arc<LayerWeights>) {
+        // strong_count is racy relative to readers that have not yet
+        // cloned the Arc, but any such reader must have observed the new
+        // snapshot (via `slot.load_weights()` after our `swap_weights`) to
+        // be newly entering the forward path. Readers that saw the old
+        // snapshot before the swap will keep strong_count > 1 here.
+        if Arc::strong_count(old) > 1 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            Self::madvise_tensor(&old.wq);
+            Self::madvise_tensor(&old.wk);
+            Self::madvise_tensor(&old.wv);
+            Self::madvise_tensor(&old.wo);
+            Self::madvise_tensor(&old.w_gate);
+            Self::madvise_tensor(&old.w_up);
+            Self::madvise_tensor(&old.w_down);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn madvise_tensor(t: &Tensor) {
+        // Only MmapBuffer-backed or host-managed buffers are amenable to
+        // MADV_DONTNEED. Arbitrary device-only cl_mem allocations return a
+        // null pointer and are skipped. See ENG-ALG-C05/C06.
+        let ptr = t.buffer().as_ptr();
+        if ptr.is_null() {
+            return;
+        }
+        let len = t.size();
+        if len == 0 {
+            return;
+        }
+        // Align to a page boundary to satisfy the madvise contract; trim
+        // head/tail partial pages rather than round out and stomp a sibling
+        // tensor.
+        let page = 4096usize;
+        let addr = ptr as usize;
+        let aligned = addr.div_ceil(page) * page;
+        let tail = (addr + len) & !(page - 1);
+        if tail <= aligned {
+            return;
+        }
+        let adv_len = tail - aligned;
+        // SAFETY: address range [aligned, aligned+adv_len) is a subset of
+        // [addr, addr+len) which is live for the lifetime of `t`. MADV_DONTNEED
+        // is a hint and failure is non-fatal.
+        unsafe {
+            let _ = libc::madvise(aligned as *mut libc::c_void, adv_len, libc::MADV_DONTNEED);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uniform_target_layers_matches_spec() {
+        // Spec ENG-ALG-213 uniform fallback shape: ceil(ratio * n) layers,
+        // evenly spaced. These are not-yet-plan-integration shape tests to
+        // guard against refactors that silently change the selection.
+        assert!(SwapExecutor::uniform_target_layers(0.0, 16).is_empty());
+        assert_eq!(
+            SwapExecutor::uniform_target_layers(1.0, 16).len(),
+            16,
+            "ratio=1.0 selects all layers"
+        );
+        assert_eq!(SwapExecutor::uniform_target_layers(0.25, 16).len(), 4);
+        assert_eq!(SwapExecutor::uniform_target_layers(0.5, 16).len(), 8);
+        // Degenerate size.
+        assert!(SwapExecutor::uniform_target_layers(0.5, 0).is_empty());
+    }
+}

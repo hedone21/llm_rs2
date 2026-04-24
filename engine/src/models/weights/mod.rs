@@ -9,10 +9,12 @@
 
 pub mod secondary_mmap;
 pub mod slot;
+pub mod swap_executor;
 pub mod transformer_weights;
 
 pub use secondary_mmap::{
     LayerTensorSlice, LoadError, SecondaryMmap, SecondaryTensorInfo, open_secondary,
 };
 pub use slot::{LayerSlot, LayerWeights};
+pub use swap_executor::{SwapError, SwapExecutor, SwapReport, SwappedLayer};
 pub use transformer_weights::TransformerWeights;
