@@ -406,5 +406,10 @@ pub fn load_model(
         gpu_embed_tokens,
         cpu_backend: stored_cpu_backend,
         preload_pool: std::sync::Mutex::new(None),
+        // ε table is initialized to empty here and populated by
+        // `TransformerModel::load_gguf_with_secondary` right after this
+        // call, or left as empty when the caller builds the model directly
+        // (e.g. tests). ENG-DAT-095, ENG-ALG-216.
+        quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
     })
 }

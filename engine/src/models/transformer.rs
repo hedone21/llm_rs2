@@ -107,6 +107,16 @@ pub struct TransformerModel {
     /// Lazily initialized on first `forward_into_offload` call.
     /// Uses `Mutex` for interior mutability (`forward_into_offload` takes `&self`).
     pub(crate) preload_pool: std::sync::Mutex<Option<PreloadPool>>,
+    /// Per-layer quantization noise factor table (ENG-DAT-095).
+    ///
+    /// Computed once at init via `QuantNoiseTable::new_from_frobenius` when a
+    /// secondary mmap is present (ENG-ALG-216).  `WeightSwapDecider` (Stage B)
+    /// reads this for importance × ε layer ranking.
+    ///
+    /// - `secondary_mmap == None`: `QuantNoiseTable::empty()` (len==0).
+    /// - Secondary present but all layers failed: `QuantNoiseTable::uniform_ones(n)`.
+    /// - Normal: `QuantNoiseTable::new_from_frobenius(...)` with `is_computed=true`.
+    pub quant_noise: Arc<crate::models::weights::QuantNoiseTable>,
 }
 
 pub struct TransformerModelForwardArgs<'a, C: KVCacheOps = KVCache> {
@@ -222,7 +232,13 @@ impl TransformerModel {
                 Some(Arc::new(handle))
             }
         };
-        let model = crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
+        let mut model =
+            crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
+
+        // ENG-ALG-216: eager ε computation immediately after secondary mmap open.
+        // `load_model` already stored the `Arc<SecondaryMmap>` on the model.
+        model.quant_noise = compute_quant_noise_for_model(&model);
+
         // LLMRS_MADV_DONTNEED: after all weights are loaded (and GPU-uploaded by
         // load_model), advise the kernel that the file page cache is expendable.
         // MmapBuffer tensors still hold Arc<Mmap> refs — the mapping stays valid —
@@ -2315,6 +2331,52 @@ impl TransformerModel {
     }
 }
 
+// ── ε computation helper ──────────────────────────────────────────────────────
+
+/// Build a `QuantNoiseTable` for the given model (ENG-ALG-216).
+///
+/// Called immediately after `load_model()` returns in `load_gguf_with_secondary`.
+/// When `model.secondary_mmap` is `None` the empty table is returned without
+/// log output.  On complete failure the fallback `uniform_ones` table is
+/// returned and a warning is emitted.
+fn compute_quant_noise_for_model(
+    model: &TransformerModel,
+) -> Arc<crate::models::weights::QuantNoiseTable> {
+    use crate::models::weights::QuantNoiseTable;
+
+    let secondary = match model.secondary_mmap.as_ref() {
+        Some(s) => s,
+        None => return Arc::new(QuantNoiseTable::empty()),
+    };
+
+    let n = model.layers.len();
+    if n == 0 {
+        log::warn!("ε calc: no decoder layers — returning empty QuantNoiseTable");
+        return Arc::new(QuantNoiseTable::empty());
+    }
+
+    let table = QuantNoiseTable::new_from_frobenius(model.layers.as_slice(), secondary);
+
+    if !table.is_computed() {
+        // new_from_frobenius returned with computed_at_init=false only
+        // when n==0, which we already handled above.
+        log::warn!("ε calc: new_from_frobenius returned fallback — using uniform_ones");
+        return Arc::new(QuantNoiseTable::uniform_ones(n));
+    }
+
+    // Check if all layers failed (all NaN) — ENG-ALG-216 "전체 실패" path.
+    let all_nan = table.as_slice().iter().all(|v| !v.is_finite());
+    if all_nan {
+        log::warn!(
+            "ε calc: all {} layers failed — falling back to uniform_ones",
+            n
+        );
+        Arc::new(QuantNoiseTable::uniform_ones(n))
+    } else {
+        Arc::new(table)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2391,6 +2453,7 @@ mod tests {
             preload_pool: std::sync::Mutex::new(None),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
         };
         (model, cpu_be)
     }
@@ -2539,6 +2602,7 @@ mod tests {
             preload_pool: std::sync::Mutex::new(None),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
         };
 
         // Gather token 0 → should be [1.0, 1.0], then scale → [2.0, 2.0]
@@ -2651,6 +2715,7 @@ mod tests {
             preload_pool: std::sync::Mutex::new(None),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
         };
 
         // Gather tokens [1, 6]
@@ -2751,6 +2816,7 @@ mod tests {
             preload_pool: std::sync::Mutex::new(None),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
         };
 
         let idx_buf = mem.alloc(4, DType::F32).unwrap();
