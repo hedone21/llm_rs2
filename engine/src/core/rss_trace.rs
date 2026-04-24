@@ -6,7 +6,11 @@
 //! Output format:
 //!   `[RSS] tag=<tag> VmRSS=<kb> RssFile=<kb> RssAnon=<kb> RssShmem=<kb> VmData=<kb> VmSize=<kb>`
 //!
-//! On non-Linux targets this is a no-op.
+//! `dump_smaps(tag)`: controlled by `LLMRS_DUMP_SMAPS_T1`. Copies
+//! `/proc/self/smaps` to a file under `LLMRS_DUMP_DIR` (default:
+//! `/data/local/tmp/llm_rs2/` on Android, `/tmp/` on Linux).
+//!
+//! On non-Linux/non-Android targets these are no-ops.
 
 use std::sync::OnceLock;
 
@@ -32,8 +36,8 @@ pub fn rss_trace(tag: &str) {
     rss_trace_impl(tag);
 }
 
-/// Linux implementation: parse `/proc/self/status` and emit one line.
-#[cfg(target_os = "linux")]
+/// Linux / Android implementation: parse `/proc/self/status` and emit one line.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn rss_trace_impl(tag: &str) {
     match read_proc_status() {
         Ok(fields) => {
@@ -54,15 +58,15 @@ fn rss_trace_impl(tag: &str) {
     }
 }
 
-/// Non-Linux stub: always no-op.
-#[cfg(not(target_os = "linux"))]
+/// Non-Linux/non-Android stub: always no-op.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 fn rss_trace_impl(_tag: &str) {}
 
 // ---------------------------------------------------------------------------
-// /proc/self/status parser (Linux only)
+// /proc/self/status parser (Linux and Android)
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 struct ProcStatusFields {
     vm_rss: u64,
     rss_file: u64,
@@ -72,7 +76,7 @@ struct ProcStatusFields {
     vm_size: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn read_proc_status() -> Result<ProcStatusFields, String> {
     let content = std::fs::read_to_string("/proc/self/status").map_err(|e| format!("read: {e}"))?;
 
@@ -114,3 +118,54 @@ fn read_proc_status() -> Result<ProcStatusFields, String> {
         vm_size,
     })
 }
+
+// ---------------------------------------------------------------------------
+// smaps dump (Linux and Android)
+// ---------------------------------------------------------------------------
+
+/// Copy `/proc/self/smaps` to a diagnostics file.
+///
+/// Controlled by `LLMRS_DUMP_SMAPS_T1` environment variable.
+/// Output directory: `LLMRS_DUMP_DIR` (default: `/data/local/tmp/llm_rs2/` on
+/// Android, `/tmp/` on Linux).
+///
+/// File name: `smaps_<tag>_<pid>_<timestamp_ms>.txt`
+///
+/// The Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
+/// On non-Linux/non-Android targets this is always a no-op.
+pub fn dump_smaps(tag: &str) {
+    dump_smaps_impl(tag);
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn dump_smaps_impl(tag: &str) {
+    let smaps_src = "/proc/self/smaps";
+
+    // Determine output directory: LLMRS_DUMP_DIR > OS default
+    let dump_dir = std::env::var("LLMRS_DUMP_DIR").unwrap_or_else(|_| {
+        if cfg!(target_os = "android") {
+            "/data/local/tmp/llm_rs2".to_string()
+        } else {
+            "/tmp".to_string()
+        }
+    });
+
+    // Ensure directory exists (best-effort; failure is non-fatal)
+    let _ = std::fs::create_dir_all(&dump_dir);
+
+    let pid = std::process::id();
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let filename = format!("smaps_{tag}_{pid}_{ts_ms}.txt");
+    let dest_path = format!("{dump_dir}/{filename}");
+
+    match std::fs::copy(smaps_src, &dest_path) {
+        Ok(bytes) => eprintln!("[smaps] dumped {bytes} bytes → {dest_path}"),
+        Err(e) => eprintln!("[smaps] dump failed tag={tag}: {e}"),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn dump_smaps_impl(_tag: &str) {}

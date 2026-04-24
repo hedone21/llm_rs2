@@ -5,10 +5,18 @@ use crate::core::memory::Memory;
 use anyhow::Result;
 use ocl::flags::MemFlags;
 use ocl::{Context, Queue};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 static KV_ALLOC_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// Returns `true` if `LLMRS_LOG_WEIGHT_VMA` is set.
+/// Cached after first call — no per-alloc env lookup.
+fn log_weight_vma_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("LLMRS_LOG_WEIGHT_VMA").is_ok())
+}
 
 pub struct OpenCLMemory {
     #[allow(dead_code)]
@@ -35,7 +43,30 @@ impl Memory for OpenCLMemory {
     fn alloc(&self, size: usize, dtype: DType) -> Result<Arc<dyn Buffer>> {
         let buffer: Arc<dyn Buffer> = if self.use_zero_copy {
             // Zero-copy shared memory (CPU-GPU accessible, but slower GPU kernels)
-            Arc::new(UnifiedBuffer::new(self.queue.clone(), size, dtype)?)
+            let ub = UnifiedBuffer::new(self.queue.clone(), size, dtype)?;
+            if log_weight_vma_enabled() {
+                // cl_mem pointer: obtained via cl_mem().as_ptr() on the Mem wrapper.
+                // host_ptr: map briefly to get the VMA address, then unmap immediately.
+                // The map/unmap here is diagnostic-only; it does not affect GPU-read state
+                // because the buffer is freshly allocated (no GPU writes in flight yet).
+                let cl_hex = ub
+                    .cl_mem()
+                    .map(|m| format!("{:#x}", m.as_ptr() as usize))
+                    .unwrap_or_else(|| "null".to_string());
+                let host_hex = match ub.map() {
+                    Ok(p) => {
+                        let s = format!("{p:p}");
+                        let _ = ub.unmap();
+                        s
+                    }
+                    Err(_) => "null".to_string(),
+                };
+                eprintln!(
+                    "[VMA] alloc path=zero_copy size={size} dtype={dtype:?} \
+                     cl_mem={cl_hex} host_ptr={host_hex}"
+                );
+            }
+            Arc::new(ub)
         } else {
             // Device-only memory (faster GPU kernels, requires explicit copies)
             let ocl_buffer = ocl::Buffer::<u8>::builder()
@@ -43,12 +74,18 @@ impl Memory for OpenCLMemory {
                 .flags(MemFlags::new().read_write())
                 .len(size)
                 .build()?;
-            Arc::new(OpenCLBuffer::new(
-                self.queue.clone(),
-                ocl_buffer,
-                size,
-                dtype,
-            )?)
+            let ob = OpenCLBuffer::new(self.queue.clone(), ocl_buffer, size, dtype)?;
+            if log_weight_vma_enabled() {
+                let cl_hex = ob
+                    .cl_mem()
+                    .map(|m| format!("{:#x}", m.as_ptr() as usize))
+                    .unwrap_or_else(|| "null".to_string());
+                eprintln!(
+                    "[VMA] alloc path=device_only size={size} dtype={dtype:?} \
+                     cl_mem={cl_hex} host_ptr=null"
+                );
+            }
+            Arc::new(ob)
         };
 
         {

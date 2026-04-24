@@ -14,7 +14,7 @@ use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
-use llm_rs2::core::rss_trace::rss_trace;
+use llm_rs2::core::rss_trace::{dump_smaps, rss_trace};
 use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -791,7 +791,7 @@ fn main() -> anyhow::Result<()> {
             // When resilience is enabled, force zero-copy memory so KV cache uses
             // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, host-accessible). This enables
             // zero-alloc UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
-            let effective_zero_copy = args.zero_copy
+            let mut effective_zero_copy = args.zero_copy
                 || args.resilience_prealloc_switch
                 || args.tensor_partition > 0.0
                 || args.prefill_cpu_chunk_size > 0
@@ -803,6 +803,24 @@ fn main() -> anyhow::Result<()> {
                     || args.enable_resilience)
             {
                 eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
+            }
+            // LLMRS_FORCE_DEVICE_ALLOC: RSS diagnostic flag.
+            // Forces effective_zero_copy=false so OpenCLMemory::alloc() creates
+            // OpenCLBuffer (READ_WRITE device-only) instead of UnifiedBuffer
+            // (CL_MEM_ALLOC_HOST_PTR).  This lets the Tester measure the RSS
+            // contribution of ALLOC_HOST_PTR vs device-only allocations.
+            //
+            // Independent from FORCE_DEVICE_ONLY (backend-level flag) — both can
+            // be set simultaneously to ensure all paths use device-only memory.
+            // When only LLMRS_FORCE_DEVICE_ALLOC is set, the primary alloc path
+            // (OpenCLMemory::alloc) goes device-only but any backend-level zero-copy
+            // overrides (e.g. --zero-copy CLI flag processed above) are suppressed.
+            if std::env::var("LLMRS_FORCE_DEVICE_ALLOC").is_ok() {
+                effective_zero_copy = false;
+                eprintln!(
+                    "[RSS-diag] LLMRS_FORCE_DEVICE_ALLOC set: effective_zero_copy forced to false \
+                     (primary memory = device-only)"
+                );
             }
             let gpu_mem: Arc<dyn Memory> =
                 Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
@@ -926,6 +944,11 @@ fn main() -> anyhow::Result<()> {
     };
     // T1: model weights loaded into memory (MmapBuffer + GPU copy if applicable).
     rss_trace("model_loaded");
+    // LLMRS_DUMP_SMAPS_T1: dump /proc/self/smaps at T1 for VMA analysis.
+    // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
+    if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
+        dump_smaps("T1_model_loaded");
+    }
 
     // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
     // Creates UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR) + mapped: single VMA,
