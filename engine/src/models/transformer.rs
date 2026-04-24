@@ -197,7 +197,15 @@ impl TransformerModel {
                 Some(Arc::new(handle))
             }
         };
-        crate::models::loader::load_model(&source, backend, memory, secondary_mmap)
+        let model = crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
+        // LLMRS_MADV_DONTNEED: after all weights are loaded (and GPU-uploaded by
+        // load_model), advise the kernel that the file page cache is expendable.
+        // MmapBuffer tensors still hold Arc<Mmap> refs — the mapping stays valid —
+        // but the OS can reclaim physical pages, reducing RssFile.
+        if std::env::var("LLMRS_MADV_DONTNEED").is_ok() {
+            source.madvise_dontneed();
+        }
+        Ok(model)
     }
 
     /// Migrate all model weight tensors from CPU to GPU zero-copy memory.
@@ -537,20 +545,50 @@ impl TransformerModel {
     /// backend's noshuffle SOA registry. After this, `matmul_q4_0()` will
     /// automatically dispatch to the noshuffle GEMV kernel for decode (m==1).
     ///
+    /// Additionally, unless the caller keeps the original AOS allocation
+    /// (`keep_original = true`, used when CPU-accessible weights are needed
+    /// for resilience `SwitchHw`, tensor partitioning, or prefill CPU chunks),
+    /// each weight tensor's backing `Arc<dyn Buffer>` is replaced by a
+    /// `NoshuffleWeightBuffer` that owns the SOA allocations, letting the
+    /// original AOS `cl_mem` drop (≈523 MiB reclaimed on Llama 3.2 1B Q4_0).
+    ///
     /// Returns the number of weight tensors converted.
     #[cfg(feature = "opencl")]
-    pub fn prepare_noshuffle_buffers(&self, backend: &Arc<dyn Backend>) -> Result<usize> {
+    pub fn prepare_noshuffle_buffers(
+        &mut self,
+        backend: &Arc<dyn Backend>,
+        keep_original: bool,
+    ) -> Result<usize> {
         use crate::backend::opencl::{NoshuffleSoaEntry, OpenCLBackend, get_cl_mem};
+        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
 
         let ocl_be = backend
             .as_any()
             .downcast_ref::<OpenCLBackend>()
             .ok_or_else(|| anyhow!("Not OpenCL backend"))?;
 
-        let mut count = 0;
+        // `LLMRS_KEEP_Q4_ORIGINAL=1` is an escape hatch for diagnostic
+        // comparisons — it forces the original AOS cl_mem to stay alive even
+        // when the caller would otherwise consent to swapping.
+        let env_keep = std::env::var("LLMRS_KEEP_Q4_ORIGINAL")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let swap_to_placeholder = !(keep_original || env_keep);
 
-        // Helper closure: convert one weight tensor if it is Q4_0 on GPU.
-        let process_weight = |tensor: &Tensor| -> Result<bool> {
+        let mut count = 0usize;
+        let mut swapped = 0usize;
+        let mut bytes_released: usize = 0;
+
+        // Convert one weight tensor in place. When `allow_swap` is true and
+        // the caller's closure returns `Some(bytes)` the tensor's buffer is
+        // replaced with a `NoshuffleWeightBuffer` owning the new SOA
+        // allocations; otherwise the original AOS cl_mem stays in the
+        // backend but the SOA entry is still registered for lookup.
+        //
+        // `allow_swap=false` for partition sub-slices — swapping a
+        // `ClSubBuffer` would also drop the parent full-weight allocation
+        // prematurely.
+        let mut process_weight = |tensor: &mut Tensor, allow_swap: bool| -> Result<bool> {
             if tensor.dtype() != DType::Q4_0 {
                 return Ok(false);
             }
@@ -560,11 +598,43 @@ impl TransformerModel {
             // Weight shape: [rows, cols] = [ne01, ne00]
             let (ne01, ne00) = (dims[0], dims[1]);
             let num_blocks = ne01 * ne00 / 32; // QK4_0 = 32
+            let original_bytes = tensor.size();
 
             let (q_buf, d_buf, q_img) =
                 ocl_be.convert_q4_0_to_noshuffle(cl_mem, num_blocks, ne00, ne01)?;
 
-            let key = cl_mem.as_ptr() as usize;
+            // Key choice: when we swap, the tensor's post-swap cl_mem will
+            // return `d_buf`, so the registry key *must* be the d_buf
+            // address for `matmul_q4_0`'s `b_buf.as_ptr() as usize` to hit.
+            // When we do not swap, key remains the original AOS cl_mem
+            // address so lookups on the pre-existing buffer still succeed.
+            let can_swap = allow_swap && swap_to_placeholder;
+            let key = if can_swap {
+                d_buf.as_ptr() as usize
+            } else {
+                cl_mem.as_ptr() as usize
+            };
+
+            if can_swap {
+                // Transfer SOA ownership into the tensor buffer. The old AOS
+                // `Arc<dyn Buffer>` drops when this closure returns, which in
+                // turn releases the original Q4_0 cl_mem.
+                let placeholder = Arc::new(NoshuffleWeightBuffer::new(
+                    // `ocl::core::Mem` impls `Clone` via `clRetainMemObject`
+                    // — the registry entry keeps its own reference below.
+                    q_buf.clone(),
+                    d_buf.clone(),
+                    q_img.as_ref().cloned(),
+                    ne00,
+                    ne01,
+                    original_bytes,
+                ));
+                let backend_arc = tensor.backend().clone();
+                *tensor = Tensor::new(tensor.shape().clone(), placeholder, backend_arc);
+                swapped += 1;
+                bytes_released = bytes_released.saturating_add(original_bytes);
+            }
+
             ocl_be.register_noshuffle_soa(
                 key,
                 NoshuffleSoaEntry {
@@ -579,17 +649,23 @@ impl TransformerModel {
         };
 
         for slot in &self.layers {
-            let layer = slot.load_weights();
+            // RCU pattern: clone the current LayerWeights snapshot, mutate the
+            // Tensor buffers in place (noshuffle swap replaces tensor.buffer),
+            // then publish the new Arc via store_weights_same_dtype. Readers
+            // that already hold a snapshot see the pre-swap tensors; the next
+            // load picks up the noshuffle-converted ones.
+            let snapshot = slot.load_weights();
+            let mut layer = (*snapshot).clone();
             for weight in [
-                &layer.wq,
-                &layer.wk,
-                &layer.wv,
-                &layer.wo,
-                &layer.w_gate,
-                &layer.w_up,
-                &layer.w_down,
+                &mut layer.wq,
+                &mut layer.wk,
+                &mut layer.wv,
+                &mut layer.wo,
+                &mut layer.w_gate,
+                &mut layer.w_up,
+                &mut layer.w_down,
             ] {
-                if process_weight(weight)? {
+                if process_weight(weight, true)? {
                     count += 1;
                 }
             }
@@ -600,20 +676,49 @@ impl TransformerModel {
             // build_partitioned_layer_plan). Register the sub-buffer cl_mems
             // here so the plan builder can look them up via the same key
             // scheme used for full weights.
-            if let Some(ref ctx) = layer.partition_ctx {
-                for weight in [&ctx.gate.gpu_slice, &ctx.up.gpu_slice, &ctx.down.gpu_slice] {
-                    if process_weight(weight)? {
+            //
+            // Partition slices live on `ClSubBuffer` whose cl_mem references
+            // a parent full-weight allocation — we cannot drop the parent
+            // without invalidating the sub-buffers, so keep `allow_swap=false`
+            // here and rely on the plan path's key matching the sub-buffer
+            // cl_mem address rather than the placeholder.
+            if let Some(ref mut ctx) = layer.partition_ctx {
+                for weight in [
+                    &mut ctx.gate.gpu_slice,
+                    &mut ctx.up.gpu_slice,
+                    &mut ctx.down.gpu_slice,
+                ] {
+                    if process_weight(weight, false)? {
                         count += 1;
                     }
                 }
             }
         }
 
-        // lm_head (only if on GPU)
-        if !self.lm_head_on_cpu && process_weight(&self.lm_head)? {
+        // lm_head (only if on GPU). Same swap rules as layer weights.
+        if !self.lm_head_on_cpu && process_weight(&mut self.lm_head, true)? {
             count += 1;
         }
 
+        if swapped > 0 {
+            eprintln!(
+                "[NoShuffle] Released original Q4_0 weights after SOA conversion \
+                 ({} tensors, ≈{:.1} MiB reclaimed)",
+                swapped,
+                bytes_released as f64 / (1024.0 * 1024.0)
+            );
+        } else if swap_to_placeholder {
+            eprintln!(
+                "[NoShuffle] SOA conversion done but no tensors swapped \
+                 (non-Q4_0 weights or partition-only run)"
+            );
+        } else {
+            eprintln!(
+                "[NoShuffle] Kept original Q4_0 weights alongside SOA \
+                 (keep_original={}, LLMRS_KEEP_Q4_ORIGINAL={})",
+                keep_original, env_keep
+            );
+        }
         eprintln!(
             "[Backend] Q4_0 noshuffle SOA prepared: {} weight tensors",
             count

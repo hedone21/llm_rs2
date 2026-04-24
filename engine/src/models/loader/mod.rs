@@ -272,6 +272,16 @@ pub fn load_model(
     let norm = source.load_tensor(&TensorId::FinalNorm, false, &backend, memory)?;
 
     // 4. lm_head
+    //
+    // LLMRS_SKIP_GPU_EMBED: RSS diagnostic flag (also checked in step 6 below).
+    // For tied-weight models (no separate lm_head tensor), the GPU upload happens
+    // here via `backend.copy_weight_from(&embed_tokens)`.  When the flag is set
+    // we force `lm_head_on_cpu = true` so the tensor stays on CPU — the decode
+    // path will fall through to the CPU fallback for the final logit matmul.
+    // NOTE: T2 measurement is still valid; T3+ decode may be slower or fail if
+    // the CPU fallback for lm_head matmul is not implemented.
+    // Labelled "RSS diag — tied-weight skip" for grep-ability.
+    let skip_gpu_embed = std::env::var("LLMRS_SKIP_GPU_EMBED").is_ok();
     let has_lm_head = source.has_tensor(&TensorId::LmHead);
     let (lm_head, lm_head_on_cpu) = if has_lm_head {
         (
@@ -286,6 +296,17 @@ pub fn load_model(
         );
         if is_cpu {
             (embed_tokens.clone(), false)
+        } else if skip_gpu_embed {
+            // RSS diag — tied-weight skip: keep lm_head on CPU.
+            // gpu_embed_tokens will be None (set in step 6) so the gather_embed
+            // fallback path is also exercised.  decode lm_head matmul uses the
+            // CPU-resident tensor; correctness depends on the model's lm_head
+            // matmul having a CPU fallback (check TransformerModel::forward_into).
+            eprintln!(
+                "[RSS-diag] LLMRS_SKIP_GPU_EMBED set: tied-weight lm_head kept on CPU \
+                 (lm_head_on_cpu=true). Decode correctness requires CPU lm_head matmul path."
+            );
+            (embed_tokens.clone(), true)
         } else {
             let embed_size = embed_tokens.size();
             let max_alloc = backend.max_single_alloc();
@@ -312,7 +333,26 @@ pub fn load_model(
     };
 
     // 6. GPU-side embed_tokens
-    let gpu_embed_tokens = if is_cpu {
+    //
+    // LLMRS_SKIP_GPU_EMBED: RSS diagnostic flag (skip_gpu_embed declared in step 4).
+    // When set, skip uploading embed_tokens to GPU (saves one ~30 MB GPU alloc
+    // for Llama 3.2 1B Q4_0). gather_embed() falls back to:
+    //   cpu_be.gather(embed_tokens) → backend.write_buffer()  (CPU→GPU per call)
+    // This is slower at runtime but lets Tester measure the RSS contribution of
+    // the GPU embed copy without changing any other logic.
+    // Fallback path exists in TransformerModel::gather_embed (lines 2018-2050):
+    // if gpu_embed_tokens is None but cpu_backend is Some, it reads indices to CPU,
+    // gathers on CPU, and uploads the result — correct but ~3-5x slower per token.
+    //
+    // For tied-weight models: lm_head GPU upload was already skipped in step 4.
+    // gpu_embed_tokens must remain None here too (cannot clone a CPU tensor as GPU).
+    if skip_gpu_embed && !is_cpu {
+        eprintln!(
+            "[RSS-diag] LLMRS_SKIP_GPU_EMBED set: skipping GPU embed_tokens upload \
+             (gather will use CPU→GPU fallback path)"
+        );
+    }
+    let gpu_embed_tokens = if is_cpu || skip_gpu_embed {
         None
     } else if !has_lm_head && !lm_head_on_cpu {
         // Tied weights with GPU lm_head: reuse (zero extra memory)

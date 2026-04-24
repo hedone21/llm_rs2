@@ -7,6 +7,8 @@ pub mod cuda_buffer;
 #[cfg(feature = "opencl")]
 pub mod madviseable_gpu_buffer;
 pub mod mmap_buffer;
+#[cfg(feature = "opencl")]
+pub mod noshuffle_weight_buffer;
 pub mod shared_buffer;
 pub mod slice_buffer;
 #[cfg(feature = "opencl")]

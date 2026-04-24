@@ -16,6 +16,7 @@ pub mod offload;
 pub mod pressure;
 pub mod qcf;
 pub mod quant;
+pub mod rss_trace;
 pub mod sampling;
 pub mod shape;
 pub mod skip_config;

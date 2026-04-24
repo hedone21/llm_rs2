@@ -14,6 +14,7 @@ use llm_rs2::core::kv_cache::{KVCache, KVLayout};
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::d2o_handler::{D2OConfig, D2OHandler};
 use llm_rs2::core::pressure::{CachePressurePipeline, PressureLevel, PressureStageConfig};
+use llm_rs2::core::rss_trace::{dump_smaps, rss_trace};
 use llm_rs2::core::sampling::{self, SamplingConfig};
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::sys_monitor::{LinuxSystemMonitor, NoOpMonitor};
@@ -616,6 +617,8 @@ fn make_partition_gpu_alloc<'a>(
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    // T0: process start, before CLI parsing or any allocation.
+    rss_trace("start");
 
     #[allow(unused_mut)]
     let mut args = Args::parse();
@@ -788,7 +791,7 @@ fn main() -> anyhow::Result<()> {
             // When resilience is enabled, force zero-copy memory so KV cache uses
             // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, host-accessible). This enables
             // zero-alloc UMA re-tag during GPU→CPU switch instead of 56MB GPU→CPU copy.
-            let effective_zero_copy = args.zero_copy
+            let mut effective_zero_copy = args.zero_copy
                 || args.resilience_prealloc_switch
                 || args.tensor_partition > 0.0
                 || args.prefill_cpu_chunk_size > 0
@@ -800,6 +803,24 @@ fn main() -> anyhow::Result<()> {
                     || args.enable_resilience)
             {
                 eprintln!("[Config] Forcing zero-copy memory for CPU-accessible buffers");
+            }
+            // LLMRS_FORCE_DEVICE_ALLOC: RSS diagnostic flag.
+            // Forces effective_zero_copy=false so OpenCLMemory::alloc() creates
+            // OpenCLBuffer (READ_WRITE device-only) instead of UnifiedBuffer
+            // (CL_MEM_ALLOC_HOST_PTR).  This lets the Tester measure the RSS
+            // contribution of ALLOC_HOST_PTR vs device-only allocations.
+            //
+            // Independent from FORCE_DEVICE_ONLY (backend-level flag) — both can
+            // be set simultaneously to ensure all paths use device-only memory.
+            // When only LLMRS_FORCE_DEVICE_ALLOC is set, the primary alloc path
+            // (OpenCLMemory::alloc) goes device-only but any backend-level zero-copy
+            // overrides (e.g. --zero-copy CLI flag processed above) are suppressed.
+            if std::env::var("LLMRS_FORCE_DEVICE_ALLOC").is_ok() {
+                effective_zero_copy = false;
+                eprintln!(
+                    "[RSS-diag] LLMRS_FORCE_DEVICE_ALLOC set: effective_zero_copy forced to false \
+                     (primary memory = device-only)"
+                );
             }
             let gpu_mem: Arc<dyn Memory> =
                 Arc::new(llm_rs2::backend::opencl::memory::OpenCLMemory::new(
@@ -921,6 +942,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         TransformerModel::load_with_dtype(model_path, backend.clone(), &*memory, w_dtype)?
     };
+    // T1: model weights loaded into memory (MmapBuffer + GPU copy if applicable).
+    rss_trace("model_loaded");
+    // LLMRS_DUMP_SMAPS_T1: dump /proc/self/smaps at T1 for VMA analysis.
+    // Tester pulls this file to analyse kgsl/ion/dmabuf VMA distribution.
+    if std::env::var("LLMRS_DUMP_SMAPS_T1").is_ok() {
+        dump_smaps("T1_model_loaded");
+    }
 
     // When CPU primary + GPU secondary: migrate weights to GPU zero-copy memory.
     // Creates UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR) + mapped: single VMA,
@@ -1012,6 +1040,13 @@ fn main() -> anyhow::Result<()> {
     // Q4_0 noshuffle SOA conversion: pre-convert all Q4_0 weights to Adreno-optimized
     // SOA layout. After this, matmul_q4_0 auto-dispatches to noshuffle GEMV for decode.
     // Check actual weight dtype (GGUF may load Q4_0 even when w_dtype=F16).
+    //
+    // LLMRS_SKIP_NOSHUFFLE_SOA: RSS diagnostic flag.
+    // When set, skip SOA conversion entirely (registry stays empty).
+    // matmul_q4_0() fallback path (engine/src/backend/opencl/mod.rs:1961):
+    //   lookup_noshuffle_soa() returns None → standard Q4_0 GEMV kernel runs.
+    // So decode still works, just slightly slower. RSS measurement is valid
+    // for all tokens when this flag is set.
     #[cfg(feature = "opencl")]
     if is_gpu {
         let actual_q4 = w_dtype == DType::Q4_0
@@ -1020,9 +1055,27 @@ fn main() -> anyhow::Result<()> {
                 .first()
                 .is_some_and(|l| l.load_weights().wq.dtype() == DType::Q4_0);
         if actual_q4 {
-            match model.prepare_noshuffle_buffers(&backend) {
-                Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
-                Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
+            if std::env::var("LLMRS_SKIP_NOSHUFFLE_SOA").is_ok() {
+                eprintln!(
+                    "[RSS-diag] LLMRS_SKIP_NOSHUFFLE_SOA set: skipping noshuffle SOA conversion \
+                     (decode uses standard Q4_0 GEMV fallback — correct but slower)"
+                );
+            } else {
+                // Keep the AOS cl_mem alive when any runtime path still needs
+                // CPU-accessible weights: resilience pre-warm, a non-GPU-only
+                // tensor partition, prefill CPU chunking, or plain lazy
+                // activation via `--enable-resilience`. In those cases
+                // `map_weights_for_cpu()` will either have already run (lines
+                // ~988 above) or will run on demand against the original AOS
+                // allocation. Dropping it would strand the fallback path.
+                let keep_for_cpu = args.resilience_prealloc_switch
+                    || cli_partition_needs_cpu_weights
+                    || args.prefill_cpu_chunk_size > 0
+                    || args.enable_resilience;
+                match model.prepare_noshuffle_buffers(&backend, keep_for_cpu) {
+                    Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
+                    Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
+                }
             }
         }
     }
@@ -3338,6 +3391,8 @@ fn main() -> anyhow::Result<()> {
 
         tokens.push(next_token_id);
         start_pos += process_len;
+        // T2: first forward pass (prefill) complete, KV cache filled.
+        rss_trace("prefill_done");
     }
 
     // Execute deferred SwitchHw (from prefill checkpoint).
@@ -4750,7 +4805,19 @@ fn main() -> anyhow::Result<()> {
                                                 >()
                                         {
                                             ocl_be.clear_noshuffle_soa_registry();
-                                            match model.prepare_noshuffle_buffers(&backend) {
+                                            // Tensor partition runtime re-register:
+                                            // `map_weights_for_cpu()` above replaced the
+                                            // per-weight `UnifiedBuffer` with a CPU-mapped
+                                            // version, so we keep the AOS allocation
+                                            // alive — the partition path (and any CPU
+                                            // matmul fallback) dereferences the original
+                                            // cl_mem directly. `keep_original=true` stops
+                                            // `prepare_noshuffle_buffers` from swapping
+                                            // the tensor buffers out from under the
+                                            // caller.
+                                            match model
+                                                .prepare_noshuffle_buffers(&backend, true)
+                                            {
                                                 Ok(n) => eprintln!(
                                                     "[Partition] Re-registered Q4_0 noshuffle SOA: {} weight tensors",
                                                     n
@@ -5166,6 +5233,13 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // T3 / T4: RSS snapshot after first and 16th decode tokens.
+            if decode_token_index == 0 {
+                rss_trace("decode_1");
+            } else if decode_token_index == 15 {
+                rss_trace("decode_16");
+            }
+
             if next_token_id == eos_id && !args.ignore_eos && std::env::var("IGNORE_EOS").is_err() {
                 break;
             }
@@ -5298,6 +5372,8 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // T5: normal exit — all allocations still live (model, KV caches, workspaces).
+    rss_trace("exit");
     Ok(())
 }
 
