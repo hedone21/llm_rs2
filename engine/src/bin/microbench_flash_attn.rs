@@ -364,6 +364,8 @@ mod bench {
         pub rms_norm_kernel: ocl::core::Kernel,
         /// SiLU mul kernel (kernel_silu_mul_simple)
         pub silu_mul_kernel: ocl::core::Kernel,
+        /// Dummy 1-element F32 buffer for score output arg (write_scores=0 시 미사용)
+        pub score_dummy_buf: Mem,
     }
 
     /// Cache-pollute 커널: streaming RW로 L2/SLC를 강제 eviction.
@@ -606,6 +608,16 @@ __kernel void pollute_stride(
         let mask_nb3 = mask_nb2;
         let mask_ne = 1i32;
 
+        // dummy score buffer (write_scores=0이면 미사용, 그러나 cl_mem은 valid 해야 함)
+        let score_dummy_buf = unsafe {
+            ocl::core::create_buffer::<_, f32>(
+                context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                1,
+                None,
+            )?
+        };
+
         // 두 kernel에 동일 정적 args 설정 — q_offset/n_kv/K-V strides/mask는 동적
         let setup_static = |k: &ocl::core::Kernel| -> anyhow::Result<()> {
             ocl::core::set_kernel_arg(k, 0, ArgVal::mem(&q_pool_buf))?;
@@ -646,6 +658,12 @@ __kernel void pollute_stride(
             Ok(())
         };
         setup_static(&our_kernel)?;
+        // args 40-43: score output (flash_attn_f32_f16.cl 커밋 3096de4에서 추가).
+        // llama.cpp 커널에는 해당 인자가 없으므로 our_kernel 에만 설정.
+        ocl::core::set_kernel_arg(&our_kernel, 40, ArgVal::mem(&score_dummy_buf))?;
+        ocl::core::set_kernel_arg(&our_kernel, 41, ArgVal::scalar(&0i32))?; // score_layer_offset
+        ocl::core::set_kernel_arg(&our_kernel, 42, ArgVal::scalar(&0i32))?; // score_stride
+        ocl::core::set_kernel_arg(&our_kernel, 43, ArgVal::scalar(&0i32))?; // write_scores=0 (no-op)
         setup_static(&llama_kernel)?;
 
         // Pollute buffer: POLLUTE_MAX_MB만큼 float4로 alloc. 초기값 non-zero.
@@ -870,6 +888,7 @@ __kernel void pollute_stride(
             kv_scatter_kernel,
             rms_norm_kernel,
             silu_mul_kernel,
+            score_dummy_buf,
         })
     }
 
