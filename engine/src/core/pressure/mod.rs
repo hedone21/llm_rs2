@@ -13,11 +13,13 @@ pub mod d2o_layer_alloc;
 pub mod eviction_handler;
 pub mod quantize_handler;
 pub mod swap_handler;
+pub mod weight_swap_handler;
 
 pub use d2o_handler::D2OHandler;
 pub use eviction_handler::{EvictionHandler, MIN_EVICT_TOKENS};
 pub use quantize_handler::QuantizeHandler;
 pub use swap_handler::SwapHandler;
+pub use weight_swap_handler::WeightSwapHandler;
 
 // ── Pressure level ─────────────────────────────────────────────────
 
@@ -74,6 +76,15 @@ pub enum ActionResult {
     Swapped { tokens_swapped: usize },
     /// KV data was recalled (restored) from secondary storage back into cache.
     Recalled { tokens_recalled: usize },
+    /// Decoder layer weights were swapped to a lower-precision dtype (weight swap).
+    WeightSwapped {
+        /// Number of layers whose weights were atomically replaced.
+        layers_changed: usize,
+        /// Estimated bytes freed (primary weight pages released via madvise).
+        freed_bytes: usize,
+        /// Wall-clock time for the full swap batch, in milliseconds.
+        duration_ms: f64,
+    },
 }
 
 impl ActionResult {
@@ -483,6 +494,14 @@ mod tests {
         assert!(ActionResult::Quantized.is_action());
         assert!(ActionResult::Swapped { tokens_swapped: 0 }.is_action());
         assert!(ActionResult::Recalled { tokens_recalled: 0 }.is_action());
+        assert!(
+            ActionResult::WeightSwapped {
+                layers_changed: 1,
+                freed_bytes: 0,
+                duration_ms: 0.0,
+            }
+            .is_action()
+        );
     }
 
     #[test]

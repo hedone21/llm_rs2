@@ -173,18 +173,39 @@ impl<'a> SwapExecutor<'a> {
         model: &TransformerModel,
         target_layers: &[usize],
     ) -> Result<SwapReport, SwapError> {
+        self.execute_on_slots(
+            model.layers.as_slice(),
+            model.secondary_mmap.as_ref(),
+            &model.ratio_generation,
+            target_layers,
+        )
+    }
+
+    /// Low-level execute that accepts raw slot/mmap/generation references.
+    ///
+    /// Called by `WeightSwapHandler` which holds these fields directly rather
+    /// than through a `&TransformerModel`. The semantics are identical to
+    /// `execute()`: ENG-ALG-211 batch swap with a single `ratio_generation`
+    /// bump at the end.
+    pub fn execute_on_slots(
+        &self,
+        layers: &[LayerSlot],
+        secondary_mmap: Option<&Arc<crate::models::weights::SecondaryMmap>>,
+        ratio_generation: &Arc<std::sync::atomic::AtomicU64>,
+        target_layers: &[usize],
+    ) -> Result<SwapReport, SwapError> {
         let start = Instant::now();
         let mut report = SwapReport::default();
 
         // ENG-DAT-C09: secondary handle absent → entire operation is a no-op.
-        let Some(secondary) = model.secondary_mmap.as_ref() else {
+        let Some(secondary) = secondary_mmap else {
             report.latency_ms = start.elapsed().as_secs_f64() * 1e3;
             return Ok(report);
         };
 
         for &layer_idx in target_layers {
             // ENG-DAT-C08: out-of-range silently skipped.
-            let Some(slot) = model.layers.get(layer_idx) else {
+            let Some(slot) = layers.get(layer_idx) else {
                 report.skipped.push(layer_idx);
                 continue;
             };
@@ -232,7 +253,7 @@ impl<'a> SwapExecutor<'a> {
         // (e) Single batch-level bump of the global ratio_generation counter.
         // Empty swaps do NOT bump (ENG-ALG-211: "if !swapped.is_empty()").
         if !report.swapped.is_empty() {
-            let new_gen = model.ratio_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let new_gen = ratio_generation.fetch_add(1, Ordering::SeqCst) + 1;
             report.ratio_generation_after = Some(new_gen);
         }
 
