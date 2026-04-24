@@ -565,7 +565,16 @@ pub(crate) fn ggml_type_to_dtype(ggml_type: u32) -> Result<DType> {
 ///
 /// Qwen2/Gemma3 GGUF converters do **not** apply this permute (they use the
 /// NEOX rope path directly), so this is gated to `ModelArch::Llama`.
-fn unpermute_qk_rows(src: &[u8], n_head: usize, head_dim: usize, row_size_bytes: usize) -> Vec<u8> {
+///
+/// Exposed as `pub(crate)` so the Phase 2 `SwapExecutor` can apply the same
+/// permutation when materialising a `TransformerLayer` from the secondary
+/// mmap — the loader path and the swap path must stay bit-identical.
+pub(crate) fn unpermute_qk_rows(
+    src: &[u8],
+    n_head: usize,
+    head_dim: usize,
+    row_size_bytes: usize,
+) -> Vec<u8> {
     debug_assert!(head_dim.is_multiple_of(2));
     let half = head_dim / 2;
     let total_rows = n_head * head_dim;
@@ -591,7 +600,10 @@ fn unpermute_qk_rows(src: &[u8], n_head: usize, head_dim: usize, row_size_bytes:
 /// Return `Some((n_head, head_dim))` if the tensor named `name` must be
 /// inverse-permuted on load for the given model config — i.e. a Llama-arch
 /// `blk.N.attn_q.weight` or `blk.N.attn_k.weight`. Otherwise `None`.
-fn qk_permute_shape(name: &str, config: &ModelConfig) -> Option<(usize, usize)> {
+///
+/// `pub(crate)` for the same reason as `unpermute_qk_rows` — the swap
+/// executor needs the exact same gating to decide whether to permute.
+pub(crate) fn qk_permute_shape(name: &str, config: &ModelConfig) -> Option<(usize, usize)> {
     use crate::models::config::ModelArch;
     if config.arch != ModelArch::Llama {
         return None;
