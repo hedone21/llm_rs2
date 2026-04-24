@@ -1,17 +1,21 @@
-//! ENG-ALG-211 Stage 2 — `WeightSwapHandler` pipeline integration.
+//! ENG-ALG-211 Stage 3 — `WeightSwapHandler` direct-dispatch interface.
 //!
-//! Tests that `WeightSwapHandler` implements `CachePressureHandler` correctly:
-//! - No-op at Normal / no-secondary-mmap conditions (ENG-DAT-C09).
-//! - Pressure-level → ratio mapping (Stage 2 placeholder table).
-//! - Handler name is "weight_swap".
-//! - `ActionResult::WeightSwapped` is an action (not NoOp).
+//! Phase 3 refactoring (ENG-ALG-214-ROUTE "1안"): `CachePressureHandler` trait
+//! impl was removed.  `WeightSwapHandler` is now a thin orchestrator that
+//! exposes `execute_swap(&[usize]) -> Result<ActionResult>` for use by
+//! `dispatch_swap_weights` in `generate.rs`.
+//!
+//! Tests cover:
+//! - No-op when target_layers is empty.
+//! - No-op when secondary_mmap is absent (ENG-DAT-C09).
+//! - No-op when zero-layer model + non-empty target_layers.
+//! - `ActionResult::WeightSwapped` is recognised as an action.
 //! - `SwapExecutor::uniform_target_layers` contract (ENG-ALG-212/213).
-//! - Pipeline ordering: WeightSwapHandler can be composed with other handlers.
 //!
-//! Full execute() path (layer slot + secondary mmap fixture) would require
+//! Full execute() path (layer slot + secondary mmap fixture) requires
 //! real GGUF fixture files → deferred to device integration tests.
 //!
-//! Spec: ENG-ALG-211, ENG-ALG-212, INV-121/123, WSWAP-2-HANDLER.
+//! Spec: ENG-ALG-211, ENG-ALG-212, ENG-ALG-214-ROUTE, INV-121/123, WSWAP-2-HANDLER.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -23,10 +27,7 @@ use llm_rs2::core::buffer::DType;
 use llm_rs2::core::kv_cache::KVCache;
 use llm_rs2::core::memory::Memory;
 use llm_rs2::core::pressure::weight_swap_handler::{WeightSwapHandler, WeightSwapModelRef};
-use llm_rs2::core::pressure::{
-    ActionResult, CachePressureHandler, CachePressurePipeline, HandlerContext, PressureLevel,
-    PressureStageConfig,
-};
+use llm_rs2::core::pressure::ActionResult;
 use llm_rs2::core::shape::Shape;
 use llm_rs2::core::tensor::Tensor;
 use llm_rs2::layers::transformer_layer::TransformerLayer;
@@ -127,90 +128,53 @@ fn make_kv_caches(n: usize) -> Vec<KVCache> {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-/// Handler name must be "weight_swap".
+/// execute_swap with empty target_layers → NoOp (ENG-ALG-214-ROUTE: no-op when needed=0).
 #[test]
-fn handler_name() {
+fn execute_swap_empty_target_is_noop() {
     let model_ref = make_model_ref_no_secondary(4);
     let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
     let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
-    assert_eq!(handler.name(), "weight_swap");
-}
-
-/// Normal pressure → NoOp (ratio = 0.0).
-#[test]
-fn normal_pressure_is_noop() {
-    let model_ref = make_model_ref_no_secondary(4);
-    let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
-    let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
-
-    let mut caches = make_kv_caches(2);
-    let mut ctx = HandlerContext {
-        caches: &mut caches,
-        importance: None,
-        head_importance: None,
-        n_kv_heads: 0,
-        pressure_level: PressureLevel::Normal,
-        mem_available: 0,
-        target_ratio: None,
-        qcf_sink: None,
-        layer_ratios: None,
-    };
-    let result = handler.handle(&mut ctx).unwrap();
+    let result = handler.execute_swap(&[]).unwrap();
     assert!(
         matches!(result, ActionResult::NoOp),
-        "Expected NoOp at Normal pressure, got {result:?}"
+        "Expected NoOp for empty target_layers, got {result:?}"
     );
 }
 
-/// No secondary mmap → NoOp regardless of pressure level.
+/// No secondary mmap → NoOp regardless of target_layers (ENG-DAT-C09).
 #[test]
-fn no_secondary_mmap_is_noop_at_critical() {
+fn no_secondary_mmap_is_noop() {
     let model_ref = make_model_ref_no_secondary(4);
     let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
     let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
-
-    let mut caches = make_kv_caches(1);
-    let mut ctx = HandlerContext {
-        caches: &mut caches,
-        importance: None,
-        head_importance: None,
-        n_kv_heads: 0,
-        pressure_level: PressureLevel::Critical,
-        mem_available: 0,
-        target_ratio: None,
-        qcf_sink: None,
-        layer_ratios: None,
-    };
-    let result = handler.handle(&mut ctx).unwrap();
-    // ENG-DAT-C09: secondary absent → the entire swap is a no-op.
+    let result = handler.execute_swap(&[0, 1, 2]).unwrap();
     assert!(
         matches!(result, ActionResult::NoOp),
-        "Expected NoOp (no secondary), got {result:?}"
+        "Expected NoOp (no secondary mmap), got {result:?}"
     );
 }
 
-/// Pressure-level → ratio mapping matches the Stage 2 placeholder table.
+/// Zero-layer model + non-empty target_layers → NoOp (secondary also absent).
 #[test]
-fn pressure_ratio_mapping() {
-    assert_eq!(
-        WeightSwapHandler::ratio_for_level(PressureLevel::Normal),
-        0.0
-    );
-    assert_eq!(
-        WeightSwapHandler::ratio_for_level(PressureLevel::Warning),
-        0.25
-    );
-    assert_eq!(
-        WeightSwapHandler::ratio_for_level(PressureLevel::Critical),
-        0.50
-    );
-    assert_eq!(
-        WeightSwapHandler::ratio_for_level(PressureLevel::Emergency),
-        0.75
+fn zero_layer_model_is_noop() {
+    let be = cpu_be();
+    let model_ref = Arc::new(WeightSwapModelRef {
+        layers: Arc::new(Vec::new()),
+        secondary_mmap: None,
+        ratio_generation: Arc::new(AtomicU64::new(0)),
+        config: minimal_model_config(),
+        backend: be,
+    });
+    let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+    let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
+    let result = handler.execute_swap(&[0]).unwrap();
+    assert!(
+        matches!(result, ActionResult::NoOp),
+        "Zero-layer model must return NoOp"
     );
 }
 
-/// `WeightSwapped` `ActionResult` variant is recognized as an action.
+/// `WeightSwapped` `ActionResult` variant is recognised as an action.
 #[test]
 fn weight_swapped_is_action() {
     let result = ActionResult::WeightSwapped {
@@ -224,73 +188,26 @@ fn weight_swapped_is_action() {
     );
 }
 
-/// Handler can be composed in a `CachePressurePipeline` alongside other handlers.
+/// `WeightSwapped` variant carries correct fields.
 #[test]
-fn handler_in_pipeline_composition() {
-    let model_ref = make_model_ref_no_secondary(4);
-    let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
-    let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
-
-    // Build a pipeline with WeightSwapHandler at Emergency level (last resort).
-    let pipeline = CachePressurePipeline::new(vec![PressureStageConfig {
-        min_level: PressureLevel::Emergency,
-        handler: Box::new(handler),
-    }]);
-
-    assert_eq!(pipeline.len(), 1);
-    assert!(pipeline.name().contains("weight_swap"));
-
-    // At Critical, the Emergency stage must not fire.
-    let mut caches = make_kv_caches(1);
-    let mut ctx = HandlerContext {
-        caches: &mut caches,
-        importance: None,
-        head_importance: None,
-        n_kv_heads: 0,
-        pressure_level: PressureLevel::Critical,
-        mem_available: 0,
-        target_ratio: None,
-        qcf_sink: None,
-        layer_ratios: None,
+fn weight_swapped_fields_roundtrip() {
+    let result = ActionResult::WeightSwapped {
+        layers_changed: 3,
+        freed_bytes: 2048,
+        duration_ms: 7.5,
     };
-    let results = pipeline.execute(&mut ctx).unwrap();
-    assert!(
-        results.is_empty(),
-        "WeightSwapHandler at Emergency must not fire at Critical pressure"
-    );
-}
-
-/// `WeightSwapModelRef` with zero layers → NoOp (no target layers).
-#[test]
-fn zero_layer_model_is_noop() {
-    let be = cpu_be();
-    let model_ref = Arc::new(WeightSwapModelRef {
-        layers: Arc::new(Vec::new()),
-        secondary_mmap: None,
-        ratio_generation: Arc::new(AtomicU64::new(0)),
-        config: minimal_model_config(),
-        backend: be,
-    });
-    let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
-    let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
-
-    let mut caches = make_kv_caches(0);
-    let mut ctx = HandlerContext {
-        caches: &mut caches,
-        importance: None,
-        head_importance: None,
-        n_kv_heads: 0,
-        pressure_level: PressureLevel::Emergency,
-        mem_available: 0,
-        target_ratio: None,
-        qcf_sink: None,
-        layer_ratios: None,
-    };
-    let result = handler.handle(&mut ctx).unwrap();
-    assert!(
-        matches!(result, ActionResult::NoOp),
-        "Zero-layer model must return NoOp"
-    );
+    match result {
+        ActionResult::WeightSwapped {
+            layers_changed,
+            freed_bytes,
+            duration_ms,
+        } => {
+            assert_eq!(layers_changed, 3);
+            assert_eq!(freed_bytes, 2048);
+            assert!((duration_ms - 7.5).abs() < 1e-6);
+        }
+        other => panic!("Unexpected variant: {other:?}"),
+    }
 }
 
 /// `uniform_target_layers` contract (ENG-ALG-212): idempotent, deduplicated,
@@ -314,4 +231,20 @@ fn uniform_target_layers_contract() {
     );
     // All indices in range.
     assert!(half.iter().all(|&i| i < 16));
+}
+
+/// Handler does not require kv_caches (pipeline path removed in Phase 3).
+/// Verifies execute_swap() signature accepts only target_layers, not HandlerContext.
+#[test]
+fn handler_api_is_direct_dispatch() {
+    let model_ref = make_model_ref_no_secondary(4);
+    let mem: Arc<dyn Memory> = Arc::new(Galloc::new());
+    let handler = WeightSwapHandler::new(model_ref, mem, DType::Q4_0);
+
+    // Direct dispatch: no HandlerContext, no PressureLevel needed.
+    // This verifies the Phase 3 "1안" contract that the handler is called
+    // via dispatch_swap_weights() in generate.rs, NOT via pipeline.
+    let _caches = make_kv_caches(1); // not used — proves API doesn't need them
+    let result = handler.execute_swap(&[]).unwrap();
+    assert!(matches!(result, ActionResult::NoOp));
 }
