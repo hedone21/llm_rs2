@@ -4,6 +4,22 @@
 
 ---
 
+## [P0] Weight Swap — Layer-Level Mixed Precision & Dynamic Swap
+- **Status**: TODO (Architect 판단 완료, Phase 분해 완료, 구현 대기)
+- **Sprint**: current
+- **Dependencies**: 없음 (Phase A 즉시 착수 가능)
+- **Description**: 메모리 극한 환경(Android 모바일)에서 layer별 dtype 혼용(F16/Q4_0) 및 동적 weight swap을 통해 PSS 감소. GGUF 두 벌 기반 설계 확정(커스텀 포맷 기각). Phase A(정적 mixed precision) → Phase B(동적 pressure-driven swap) → Phase C(커스텀 포맷, 연기) 순차 진행.
+- **Acceptance Criteria**:
+  - Phase A: Galaxy S25에서 PSS 100–150 MB 감소, tok/s 열화 < 5%, top-5 overlap > 95%
+  - Phase B: swap latency < 50 ms/layer, 동적 PSS 감소 확인, ROUGE-L > 0.8 vs F16-only
+- **상세 계획**: `.agent/todos/feat_weight_swap.md`
+- **이번 스프린트 최우선**: (1) WSWAP-A1 GGUF 두 벌 생성, (2) WSWAP-A2 `LoadConfig::per_layer_dtype` spec+구조체, (3) WSWAP-A3 GgufLoader 오버레이
+- **담당 권장**: Architect(spec) + Implementer(로더/CLI) + Senior Implementer(Phase B 리팩토링) + Tester(실측)
+- **측정 환경**: Galaxy S25 / Snapdragon 8 Elite / Llama 3.2 1B (F16+Q4_0 GGUF) / 6 threads
+- **작성일**: 2026-04-24
+
+---
+
 ## [P0] Long context CPU attention 최적화 — 4K에서 llama.cpp 대비 35% 수준
 - **Status**: TODO (설계+측정 완료, 구현 대기)
 - **Sprint**: next
