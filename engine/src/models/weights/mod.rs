@@ -1,16 +1,17 @@
-//! Swappable weight slot infrastructure (Phase 1 / Phase 2).
+//! Swappable weight slot infrastructure (Phase 1 / Phase 2 / Phase 3).
 //!
-//! Introduces `LayerSlot`, `LayerWeights`, `SecondaryMmap`, and
-//! `SwapExecutor` so Phase 2 can swap decoder layer weights atomically at
-//! runtime. The `TransformerWeights` container (ENG-DAT-093) was removed in
-//! Stage 2 cleanup — its fields are now flat on `TransformerModel` directly.
+//! Introduces `LayerSlot`, `LayerWeights`, `SecondaryMmap`, `SwapExecutor`,
+//! and `QuantNoiseTable` so Phase 3 can compute per-layer quantization noise
+//! factors and expose them to `WeightSwapDecider` (Stage B).
 //!
-//! Spec: ENG-DAT-090/092/094, ENG-ALG-210/211, INV-123/124/125.
+//! Spec: ENG-DAT-090/092/094/095, ENG-ALG-210/211/216, INV-123/124/125/127.
 
+pub mod noise_table;
 pub mod secondary_mmap;
 pub mod slot;
 pub mod swap_executor;
 
+pub use noise_table::QuantNoiseTable;
 pub use secondary_mmap::{
     LayerTensorSlice, LoadError, SecondaryMmap, SecondaryTensorInfo, open_secondary,
 };
