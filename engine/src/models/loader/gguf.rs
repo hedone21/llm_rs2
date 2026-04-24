@@ -450,6 +450,19 @@ fn needs_dequant_fallback(ggml_type: u32) -> bool {
     matches!(ggml_type, GGML_TYPE_Q4_K)
 }
 
+/// Does this GGUF tensor name refer to the token embedding or the lm_head
+/// (untied output projection)? Used to route these tensors through the F16
+/// dequant-target path instead of the default F32 so that the ~1 GiB F32
+/// GPU upload for 1B-class Llama models (vocab 128256 × hidden 2048) becomes
+/// a ~501 MiB F16 upload.
+///
+/// Names follow llama.cpp convert_hf_to_gguf.py:
+///   * `token_embd.weight`  — input embedding table
+///   * `output.weight`      — untied lm_head (absent for tied-weight models)
+fn is_embed_or_lm_head(name: &str) -> bool {
+    name == "token_embd.weight" || name == "output.weight"
+}
+
 /// Human-readable name for a ggml_type (for diagnostics).
 fn ggml_type_name(ggml_type: u32) -> &'static str {
     match ggml_type {
@@ -694,13 +707,25 @@ impl GgufSource {
 
         // Check if this is a type that needs dequantization to F32 at load time
         if needs_dequant_fallback(info.ggml_type) {
-            return self.load_with_dequant(
+            // RSS optimization: for embed/lm_head (token_embd.weight, output.weight)
+            // the Q4_K → F32 dequant path produces ~1 GiB for Llama 3.2 1B vocabs.
+            // Store as F16 instead (half the size, half-precision round only — the
+            // Q4_K super-block dequant still runs at full precision first, so no
+            // block-layout-change accuracy loss). Downstream `gather` (get_rows.cl
+            // F16 variant) and `matmul_transposed` (matmul_f16) already support F16.
+            let target_dtype = if is_embed_or_lm_head(name) {
+                DType::F16
+            } else {
+                DType::F32
+            };
+            return self.load_with_dequant_as(
                 info.ggml_type,
                 data,
                 num_elements,
                 shape,
                 is_weight,
                 backend,
+                target_dtype,
             );
         }
 
@@ -767,13 +792,20 @@ impl GgufSource {
         // Check if this is a type that needs dequantization to F32 at load time
         if needs_dequant_fallback(info.ggml_type) {
             let cpu_backend_arc: Arc<dyn Backend> = self.cpu_backend.clone() as Arc<dyn Backend>;
-            return self.load_with_dequant(
+            // See `load_raw` for the F16 path rationale (embed/lm_head RSS optimization).
+            let target_dtype = if is_embed_or_lm_head(name) {
+                DType::F16
+            } else {
+                DType::F32
+            };
+            return self.load_with_dequant_as(
                 info.ggml_type,
                 data,
                 num_elements,
                 shape,
                 is_weight,
                 &cpu_backend_arc,
+                target_dtype,
             );
         }
 
@@ -809,11 +841,26 @@ impl GgufSource {
         ))
     }
 
-    /// Dequantize a tensor with an unsupported quant type to F32 at load time.
+    /// Dequantize a tensor with an unsupported quant type and store it at the
+    /// requested dtype. Supports `DType::F32` (reference path) and
+    /// `DType::F16` (half-precision storage, used for embed/lm_head on Q4_0
+    /// models whose `token_embd.weight` is actually stored as Q4_K — see
+    /// `loader/mod.rs` embed/lm_head load sites).
     ///
-    /// This is a cold path used only for the rare tensors (e.g. token_embd)
-    /// that use K-quant types in otherwise Q4_0/Q8_0 files.
-    fn load_with_dequant(
+    /// F16 path:
+    /// 1. Dequant to `Vec<f32>` (unchanged cold path).
+    /// 2. Cast each element via `half::f16::from_f32` (round-to-nearest-even).
+    /// 3. Publish as `SharedBuffer` with `DType::F16`.
+    ///
+    /// Downstream `backend.copy_weight_from` allocates at F16 size (2 bytes
+    /// per element, half of the F32 path) — for Llama 3.2 1B embed this
+    /// drops the single ~1 GiB F32 GPU upload to ~501 MiB.
+    ///
+    /// Accuracy: half rounding only; the Q4_K super-block structure of the
+    /// source is preserved through the full-precision dequant step. No
+    /// re-quantization into a different block layout.
+    #[allow(clippy::too_many_arguments)]
+    fn load_with_dequant_as(
         &self,
         ggml_type: u32,
         data: &[u8],
@@ -821,11 +868,12 @@ impl GgufSource {
         shape: Shape,
         is_weight: bool,
         backend: &Arc<dyn Backend>,
+        target_dtype: DType,
     ) -> Result<Tensor> {
         let type_name = ggml_type_name(ggml_type);
         eprintln!(
-            "[GGUF] Dequantizing {} tensor ({} elements) to F32 at load time",
-            type_name, num_elements
+            "[GGUF] Dequantizing {} tensor ({} elements) to {:?} at load time",
+            type_name, num_elements, target_dtype
         );
 
         let f32_data = match ggml_type {
@@ -840,10 +888,30 @@ impl GgufSource {
             }
         };
 
-        // Convert Vec<f32> to Vec<u8> (zero-copy reinterpret)
-        let byte_data = f32_vec_to_u8(f32_data);
-        let buffer: Arc<dyn crate::core::buffer::Buffer> =
-            Arc::new(SharedBuffer::from_vec(byte_data, DType::F32));
+        let buffer: Arc<dyn crate::core::buffer::Buffer> = match target_dtype {
+            DType::F32 => {
+                // Zero-copy reinterpret the Vec<f32> as Vec<u8>.
+                let byte_data = f32_vec_to_u8(f32_data);
+                Arc::new(SharedBuffer::from_vec(byte_data, DType::F32))
+            }
+            DType::F16 => {
+                use half::f16;
+                // SAFETY: we own `f32_data` and consume it into a new Vec<u8>.
+                // Round-to-nearest-even half rounding is applied element-wise.
+                let mut bytes = Vec::<u8>::with_capacity(num_elements * 2);
+                for v in f32_data.into_iter() {
+                    let h = f16::from_f32(v);
+                    bytes.extend_from_slice(&h.to_bits().to_le_bytes());
+                }
+                Arc::new(SharedBuffer::from_vec(bytes, DType::F16))
+            }
+            other => {
+                return Err(anyhow!(
+                    "GGUF: load_with_dequant_as unsupported target dtype {:?}",
+                    other
+                ));
+            }
+        };
 
         let cpu_tensor = Tensor::new(shape, buffer, self.cpu_backend.clone() as Arc<dyn Backend>);
 
@@ -1632,19 +1700,23 @@ mod tests {
             cpu_backend: Arc::new(CpuBackend::new()),
         };
 
-        // Load through load_raw_cpu (the normal embed path)
+        // Load through load_raw_cpu (the normal embed path).
+        // Since 2026-04-24: embed/lm_head tensors that require dequant fallback
+        // are stored as F16 instead of F32 to halve the GPU upload size.
         let tensor = source
             .load_raw_cpu("token_embd.weight", false)
             .expect("Q4_K tensor should load via dequant fallback");
 
-        // Verify it was dequantized to F32
-        assert_eq!(tensor.buffer().dtype(), DType::F32);
+        // Verify it was dequantized to F16 (embed/lm_head RSS optimization).
+        assert_eq!(tensor.buffer().dtype(), DType::F16);
         assert_eq!(tensor.shape().numel(), 256);
 
         // Verify values: sub-blocks 0..3 => 1.0 * 1 * 5 = 5.0
-        let ptr = tensor.buffer().as_ptr() as *const f32;
+        // Half-precision rounding preserves small integers exactly.
+        let ptr = tensor.buffer().as_ptr() as *const u16;
         for i in 0..128 {
-            let v = unsafe { *ptr.add(i) };
+            let bits = unsafe { *ptr.add(i) };
+            let v = f16::from_bits(bits).to_f32();
             assert!(
                 (v - 5.0).abs() < 0.01,
                 "element {} = {}, expected 5.0",
@@ -1654,7 +1726,8 @@ mod tests {
         }
         // sub-blocks 4..7 => sc=0, so 0.0
         for i in 128..256 {
-            let v = unsafe { *ptr.add(i) };
+            let bits = unsafe { *ptr.add(i) };
+            let v = f16::from_bits(bits).to_f32();
             assert!(
                 (v - 0.0).abs() < 0.01,
                 "element {} = {}, expected 0.0",
@@ -1662,6 +1735,69 @@ mod tests {
                 v
             );
         }
+    }
+
+    #[test]
+    fn test_gguf_q4_k_dequant_non_embed_stays_f32() {
+        // Regression: the F16 storage path must only apply to embed/lm_head.
+        // All other Q4_K-stored tensors (should one appear in a hybrid GGUF)
+        // continue to use the F32 reference path so unrelated matmul/norm
+        // code paths are not affected by this optimization.
+        use half::f16;
+
+        // Same Q4_K super-block payload as `test_gguf_q4_k_dequant_load`.
+        let mut q4k_data = [0u8; 144];
+        let d_bits = f16::from_f32(1.0).to_bits().to_le_bytes();
+        q4k_data[0] = d_bits[0];
+        q4k_data[1] = d_bits[1];
+        for i in 0..4 {
+            q4k_data[4 + i] = 1;
+        }
+        for i in 0..128 {
+            q4k_data[16 + i] = 0x55;
+        }
+
+        let mut builder = GgufTestBuilder::new();
+        builder
+            .add_metadata_str("general.architecture", "llama")
+            .add_metadata_u32("llama.embedding_length", 256)
+            .add_metadata_u32("llama.block_count", 1)
+            .add_metadata_u32("llama.attention.head_count", 4)
+            .add_metadata_u32("llama.attention.head_count_kv", 2)
+            .add_metadata_u32("llama.feed_forward_length", 512)
+            .add_metadata_u32("llama.vocab_size", 256)
+            .add_metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .add_metadata_f32("llama.rope.freq_base", 10000.0)
+            .add_metadata_u32("llama.context_length", 2048)
+            // Use a non-embed tensor name: synthetic "some.other.weight".
+            .add_tensor("some.other.weight", &[256], GGML_TYPE_Q4_K, &q4k_data);
+        let bytes = builder.build();
+        let gguf = parse_from_bytes(&bytes).expect("parse");
+
+        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let source = GgufSource {
+            gguf,
+            config,
+            weight_dtype: DType::Q4_0,
+            cpu_backend: Arc::new(CpuBackend::new()),
+        };
+
+        let tensor = source
+            .load_raw_cpu("some.other.weight", false)
+            .expect("Q4_K tensor should load via dequant fallback");
+
+        // Non-embed Q4_K → F32 reference path (unchanged).
+        assert_eq!(tensor.buffer().dtype(), DType::F32);
+        assert_eq!(tensor.shape().numel(), 256);
+    }
+
+    #[test]
+    fn test_is_embed_or_lm_head() {
+        assert!(is_embed_or_lm_head("token_embd.weight"));
+        assert!(is_embed_or_lm_head("output.weight"));
+        assert!(!is_embed_or_lm_head("blk.0.attn_q.weight"));
+        assert!(!is_embed_or_lm_head("output_norm.weight"));
+        assert!(!is_embed_or_lm_head("token_embd.bias"));
     }
 
     #[test]
