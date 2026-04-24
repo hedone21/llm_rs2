@@ -213,21 +213,34 @@
   - `ActionResult::Swapped`에 per-layer latency 기록
 - **Notes**: MEMORY.md "Weight swap은 KV swap과 독립" 원칙. 개별 handler로 분리하되 Pipeline 내 순서는 Architect spec에 명시.
 
-## [P1] WSWAP-2-CLI-TRIGGER. 수동 swap 트리거 CLI (디버그 전용)
+## [P1] WSWAP-2-CLI-TRIGGER. 수동 swap 트리거 CLI (디버그 전용) + LoadConfig 시그니처 전환
 - **Status**: TODO
 - **Sprint**: current
 - **Dependencies**: WSWAP-2-HANDLER
 - **담당 권장**: Implementer
 - **Description**:
-  - `generate` 바이너리에 `--force-swap-ratio <0.0-1.0>` 디버그 플래그 추가 (optional, hidden)
-  - prefill 완료 후 즉시 (decode 시작 전) handler를 수동 호출하여 swap 발동
-  - layer importance는 임시로 uniform 또는 layer idx 기반 (정식 measurement은 Phase 3)
-  - 정식 배포 빌드에서는 `#[cfg(debug_assertions)]` 또는 feature flag로 보호
+  - **(A) `--force-swap-ratio` 디버그 플래그 추가**
+    - `generate` 바이너리에 `--force-swap-ratio <0.0-1.0>` 디버그 플래그 추가 (optional, hidden)
+    - prefill 완료 후 즉시 (decode 시작 전) handler를 수동 호출하여 swap 발동
+    - layer importance는 임시로 uniform 또는 layer idx 기반 (정식 measurement은 Phase 3)
+    - 정식 배포 빌드에서는 `#[cfg(debug_assertions)]` 또는 feature flag로 보호
+  - **(B) Loader 시그니처 `LoadConfig` 일괄 전환 (ENG-DAT-090 마감)**
+    - 현재 `load_gguf_with_secondary` 등 loader 엔트리는 `primary_path`, `default_dtype`, `Option<secondary_path>` 를 **낱개 파라미터**로 받는다. (Phase 1 shim)
+    - 이 커밋에서 공개 엔트리를 `pub fn load_model(config: LoadConfig) -> Result<TransformerModel, LoadError>` 단일 함수로 전환한다.
+    - CLI 파싱 → `LoadConfig` 구성 → `load_model` 호출의 단일 경로만 남긴다. 낱개 파라미터를 받는 기존 API는 제거.
+    - `generate.rs` 호출부 갱신, 내부 gguf.rs 헬퍼는 `LoadConfig`를 받거나 그대로 유지하되 공개 경계에서 통일.
+    - `--force-swap-ratio` 추가와 함께 묶는 이유: CLI 파라미터가 `LoadConfig` 사용 흐름과 동시에 등장하므로 한 번에 옮기는 편이 변경 표면적 최소.
+  - **(C) (선택) `TransformerWeights` 죽은 선언 / `SecondaryMmap::cross_layer_offsets` 정리**
+    - 본 커밋 또는 별도 cleanup 커밋에서 처리 가능. spec 반영 이미 완료(ENG-DAT-093/094).
+    - `engine/src/models/weights/transformer_weights.rs` 파일 및 `mod.rs`의 pub re-export 삭제.
+    - `SecondaryMmap`의 `cross_layer_offsets` 필드 및 populate 코드 삭제.
 - **Acceptance Criteria**:
   - `generate --model-path <f16> --model-path-secondary <q4_0> --force-swap-ratio 0.5` 실행 성공
   - swap 후 decode 진행 → 텍스트 생성 완료 (coherence 검증)
   - 플래그 없는 호출에 영향 없음
-- **Notes**: Phase 3에서 manager 연동 완료 후 이 플래그는 유지해도 되고 제거해도 됨 (테스트 유용성).
+  - `load_model(LoadConfig)` 단일 엔트리로 호출부 통일, 낱개 파라미터 버전 제거
+  - `cargo build --workspace` + `cargo clippy --workspace -- -D warnings` + `cargo test --workspace` 통과
+- **Notes**: Phase 3에서 manager 연동 완료 후 이 플래그는 유지해도 되고 제거해도 됨 (테스트 유용성). LoadConfig 전환은 **이 커밋 이전에는 시도하지 말 것** (Phase 1 범위 초과).
 
 ## [P1] WSWAP-2-TEST. Swap 정확성 테스트 스위트
 - **Status**: TODO

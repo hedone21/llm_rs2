@@ -656,6 +656,12 @@
 - Cross-layer tensor(embedding, final_norm, lm_head)는 항상 primary에서 로드된다. **Swap 대상이 아니다.**
 - Backend 무관. OpenCL 백엔드의 `rewrap_weights_for_dual_access()`는 swap 직후의 새 Buffer에 대해서도 동일 규칙으로 호출된다.
 
+**구현 전환 계획 (Loader 시그니처)**:
+
+- Phase 1(현재): `LoadConfig` struct는 선언만 완료된 상태이며, 실제 loader 엔트리(`load_gguf_with_secondary` 등)는 여전히 `primary_path`, `default_dtype`, `Option<secondary_path>` 를 **낱개 파라미터**로 받는다. Phase 1 범위에서는 struct 도입으로 인한 시그니처 변경을 보류한다.
+- Phase 2 `WSWAP-2-TRIGGER` 커밋(`--force-swap-ratio` CLI 추가) 시점에 loader 엔트리 포인트를 `load_model(config: LoadConfig) -> Result<TransformerWeights, LoadError>` 형태로 **일괄 전환**한다. 이 전환은 ENG-DAT-090 구현 완결의 일부이며, 전환 전까지는 Phase 1 shim 시그니처를 정답으로 취급한다.
+- 전환 후에는 CLI 파싱 → `LoadConfig` 구성 → `load_model` 호출의 단일 경로만 유효하며, 낱개 파라미터를 받는 API는 제거된다.
+
 **ENG-DAT-091 [DEPRECATED 2026-04-24]**: 구 TOML `LayerDtypeProfile` 스키마는 정적 per-layer profile 노선과 함께 폐기되었다. 동적 swap은 Manager 신호 기반이며 TOML 입력이 없다. `quantize_profile` 바이너리도 동시 폐기. ID는 재사용하지 않는다.
 
 ---
@@ -671,46 +677,108 @@
 | `current_dtype` | `DType` | 현재 slot이 보유한 weight dtype. 초기값은 `LoadConfig::default_dtype`. swap 후 secondary dtype으로 전환. `INV-124` 대상. |
 | `weights` | `Arc<LayerWeights>` 또는 동치 snapshot 타입 | Layer의 QKV/O/gate/up/down + attn_norm/ffn_norm tensor 묶음. **Lock-free snapshot 교체**가 핵심 요건. 기본 권장 구현은 `arc_swap::ArcSwap<LayerWeights>`. 대안은 `RwLock<Arc<LayerWeights>>` 또는 custom epoch 기반 swap. 최종 선택은 Senior Implementer PoC의 decode latency 측정 후 확정한다. |
 | `secondary_mmap_handle` | `Option<Arc<SecondaryMmap>>` | Secondary 파일의 mmap view. Layer 범위의 tensor slice 정보(offset+len+dtype)를 포함. `None`이면 이 layer는 swap 불가. |
-| `generation` | `AtomicU64` | swap 발생 시마다 1씩 증가. Forward 진입 시점의 값을 캡처하여 swap 도중 재진입을 감지한다. INV-120과 동일 패턴. |
+| `generation` | `AtomicU64` | **Debug/tracing 전용 카운터.** Swap 발생 시 `SwapExecutor`가 1씩 증가. Forward hot path, plan invalidation, 재진입 판정 등 **정확성 경로에서 절대 참조하지 않는다** — 이 목적에는 전역 `TransformerModel.ratio_generation`(ENG-DAT-093) 하나만 사용된다. per-slot `generation`은 관측/로그/테스트 보조로만 사용한다. |
 
 **후조건**:
-- Forward 읽기 경로는 `weights` snapshot을 `Arc::clone`으로 획득 후 사용. 진행 중 swap이 발생해도 해당 forward는 이전 snapshot을 계속 사용하고, **다음 layer 진입 시 최신 snapshot을 본다**.
-- `current_dtype`은 snapshot 교체와 **동일 원자 단계**에 갱신되어야 한다(INV-124).
+- Forward 읽기 경로는 `weights` snapshot을 `Arc::clone`으로 획득 후 사용 (per-token atomic snapshot 규약은 ENG-ALG-214 및 INV-121 참조). 진행 중 swap이 발생해도 해당 토큰은 이전 snapshot을 계속 사용하고, **다음 토큰 진입 시 최신 snapshot을 본다**.
+- `current_dtype`은 snapshot 교체와 **동일 원자 단계**에 갱신되어야 한다 (INV-124).
+- `generation` 증가 타이밍은 `weights.store()` 완료 직후이지만, forward/plan 경로는 이를 관찰하지 않으므로 느슨한 순서(`Relaxed`)로 충분하다.
+
+**3-counter 관계 (generation counters)**:
+
+| 카운터 | 스코프 | 증가 주체 | 증가 단위 | 관찰자 | 용도 |
+|--------|--------|-----------|-----------|--------|------|
+| `LayerSlot::generation` | per-slot | `SwapExecutor` | slot 단일 swap마다 +1 | tracing/로그/테스트 | **Debug 전용.** 정확성 경로 참조 금지. |
+| `TransformerModel.ratio_generation` (ENG-DAT-093, flat 필드) | global | `SwapExecutor` | batch 완료 후 **정확히 1회** +1 | `PartitionPlanContext`, plan 빌드 경로 | 전역 plan 재빌드 트리거 단일 소스. |
+| `PartitionPlanContext::ratio_generation` (INV-120 기존) | plan snapshot | Plan 빌드 시점 | Plan 빌드 시 `TransformerModel.ratio_generation` 값 캡처 | `PartitionStep::run` | Plan stale 감지. mismatch 시 `PlanInvalidated`. |
+
+교차 참조: INV-120, INV-121, INV-123.
 
 ---
 
-### 3.19 TransformerWeights — Slot Collection [ENG-DAT-093]
+### 3.19 TransformerWeights 배치 — `TransformerModel` 내부 flat 필드 [ENG-DAT-093]
 
-**[ENG-DAT-093]** `TransformerWeights`는 모델 전체의 per-layer slot과 cross-layer tensor, 공유 secondary mmap handle을 보관한다. *(MUST)*
+**[ENG-DAT-093]** 모델 전체의 per-layer slot, cross-layer tensor, 공유 secondary mmap handle, 전역 swap 세대 카운터는 `TransformerModel`(`engine/src/models/transformer.rs`)의 **flat 멤버 필드**로 배치된다. 별도의 `TransformerWeights` wrapper struct를 두지 않는다. *(MUST)*
 
-**필드**:
+**설계 결정 (2026-04-24 확정)**:
 
-| 필드 | 타입 | 설명 |
+- 이전 초안은 독립 struct `TransformerWeights { layers, embedding, final_norm, lm_head, secondary_mmap, ratio_generation }`를 가정했다.
+- 그러나 실제 `TransformerModel`은 이미 embedding / final_norm / lm_head 를 자체 필드로 보유하므로 독립 struct로 묶을 경우 **이중 소유 또는 중복 필드**가 발생한다.
+- Phase 1 구현은 이를 회피하기 위해 `TransformerWeights`를 파일(`engine/src/models/weights/transformer_weights.rs`)에 선언만 해 두고 실사용처가 0이며, 대신 `TransformerModel`에 `layers`, `secondary_mmap`, `ratio_generation` 을 직접 추가했다. **이 flat 배치가 정답으로 확정된다.**
+- 따라서 `engine/src/models/weights/transformer_weights.rs`의 `TransformerWeights` struct는 **죽은 추상화**이며, Phase 2 구현 진입 시 해당 파일 및 `mod.rs`의 pub re-export는 제거된다. 이름(`TransformerWeights`)은 폐기되지만 **식별자 `ENG-DAT-093`은 본 항목(flat 배치)으로 의미 승계**한다.
+
+**배치 요구사항**:
+
+`TransformerModel`(또는 동등한 최상위 모델 struct)은 swap 관련 다음 필드를 **모두 flat 멤버**로 보유한다. 필드 이름은 정확한 철자가 아닌 **역할**로 정의되며, 구현은 동등한 이름/타입을 사용할 수 있다.
+
+| 역할 | 타입 | 설명 |
 |------|------|------|
-| `layers` | `Vec<LayerSlot>` | Decoder block layer 목록. 길이 = `num_layers`. 순서는 layer index와 동일. |
-| `embedding` | `Arc<Tensor>` | 임베딩 테이블. **Swap 대상 아님**. `LoadConfig::default_dtype`으로 로드된 상태 유지. |
-| `final_norm` | `Arc<Tensor>` | 최종 RMSNorm weight. **Swap 대상 아님**. |
-| `lm_head` | `Option<Arc<Tensor>>` | 출력 projection. tie_word_embeddings 모델(Qwen 등)은 `None`이며 forward는 `embedding`을 재사용. **Swap 대상 아님**. |
-| `secondary_mmap` | `Option<Arc<SecondaryMmap>>` | Secondary 파일 mmap 소유권 핸들. 모든 `LayerSlot::secondary_mmap_handle`은 여기서 clone된 Arc를 공유. 생성자에서 1회 설정 후 모델 lifetime 동안 **drop 금지**(INV-125). |
-| `ratio_generation` | `AtomicU64` | 전체 swap 세대 카운터. `SwapExecutor`가 ratio 기반 다중 layer를 한 배치로 교체할 때 한 번 증가. Forward plan 재빌드 트리거 키 (ENG-ALG-200의 `ratio_generation`과 의미 통합). |
+| decoder layer slots | `Vec<LayerSlot>` | Decoder block layer 목록. 길이 = `num_layers`. 순서는 layer index와 동일. Swap 대상의 **유일한** 컬렉션이다. |
+| embedding | `Arc<Tensor>` 또는 동치 | 임베딩 테이블. **Swap 대상 아님**. `LoadConfig::default_dtype`으로 로드된 상태 유지. **기존 `TransformerModel` 필드 그대로 사용**. |
+| final_norm | `Arc<Tensor>` 또는 동치 | 최종 RMSNorm weight. **Swap 대상 아님**. 기존 필드 재사용. |
+| lm_head | `Option<Arc<Tensor>>` 또는 동치 | 출력 projection. tie_word_embeddings 모델(Qwen 등)은 `None`이며 forward는 embedding을 재사용. **Swap 대상 아님**. 기존 필드 재사용. |
+| secondary_mmap | `Option<Arc<SecondaryMmap>>` | Secondary 파일 mmap 소유권 핸들. 모든 `LayerSlot::secondary_mmap_handle`은 여기서 clone된 Arc를 공유. 생성자에서 1회 설정 후 모델 lifetime 동안 **drop 금지** (INV-125). |
+| ratio_generation | `AtomicU64` | **전역 swap 세대 카운터 (single source of truth).** `SwapExecutor`가 ratio 기반 다중 layer를 한 배치로 교체할 때 **배치 전체에 대해 정확히 1회** 증가 (ENG-ALG-211 참조). Plan 재빌드 트리거의 유일한 키 (INV-120, ENG-ALG-200과 의미 통합). |
+
+**구조 다이어그램**:
+
+```mermaid
+classDiagram
+    class TransformerModel {
+        +embedding: Arc~Tensor~
+        +final_norm: Arc~Tensor~
+        +lm_head: Option~Arc~Tensor~~
+        +layers: Vec~LayerSlot~
+        +secondary_mmap: Option~Arc~SecondaryMmap~~
+        +ratio_generation: AtomicU64
+        +forward_into(...)
+    }
+    class LayerSlot {
+        +current_dtype: AtomicDType
+        +weights: ArcSwap~LayerWeights~
+        +secondary_mmap_handle: Option~Arc~SecondaryMmap~~
+        +generation: AtomicU64 「debug only」
+    }
+    class SecondaryMmap {
+        +mmap: Mmap
+        +layer_index: Vec~LayerTensorSlice~
+    }
+    TransformerModel "1" *-- "N" LayerSlot : layers
+    TransformerModel "1" o-- "0..1" SecondaryMmap : secondary_mmap
+    LayerSlot "N" o-- "0..1" SecondaryMmap : secondary_mmap_handle (shared Arc)
+```
 
 **불변식**:
-- `secondary_mmap.is_some()` ⇒ `secondary_mmap` handle은 `TransformerWeights::drop()` 시점까지 살아있다 (INV-125).
-- 각 `LayerSlot::secondary_mmap_handle.is_some()` ⇒ 해당 Arc는 `TransformerWeights::secondary_mmap`과 동일 pointee.
+
+- `secondary_mmap.is_some()` ⇒ 해당 `Arc<SecondaryMmap>`는 `TransformerModel` drop 시점까지 살아있다 (INV-125). 모델이 이 Arc의 **최후 keeper**이다.
+- 각 `LayerSlot::secondary_mmap_handle.is_some()` ⇒ 해당 Arc는 `TransformerModel.secondary_mmap`과 동일 pointee.
+- `ratio_generation`은 **오직** `SwapExecutor`만 증가시키며, 배치 내 여러 layer를 교체하더라도 **배치당 정확히 1회** 증가한다 (개별 layer 단위 bump 금지). 교차 참조: ENG-ALG-211, INV-120, INV-123.
+
+**Arch 매핑**: `arch/weight_swap.md` §2.3 (컴포넌트 설명은 flat 배치 기준으로 작성됨).
 
 ---
 
 ### 3.20 SecondaryMmap — Layer Tensor View [ENG-DAT-094]
 
-**[ENG-DAT-094]** `SecondaryMmap`은 secondary GGUF 파일의 메모리 매핑과, layer별 tensor slice 인덱스를 보관하는 read-only 핸들이다. *(MUST)*
+**[ENG-DAT-094]** `SecondaryMmap`은 secondary GGUF 파일의 메모리 매핑과, **decoder block layer에 한정된** tensor slice 인덱스를 보관하는 read-only 핸들이다. *(MUST)*
+
+**Swap 범위 제약**:
+
+- Swap 대상은 **decoder block layer에 속한 tensor만**이다 (예: `blk.{i}.attn_*.weight`, `blk.{i}.ffn_*.weight`, `blk.{i}.*_norm.weight`).
+- Embedding, final_norm, lm_head 등 **cross-layer tensor는 swap 대상이 아니다** (ENG-DAT-C11 동일 취지). 따라서 `SecondaryMmap`은 이 영역에 대한 offset 정보를 **보관하지 않는다**.
+- Metadata 정합성 검증(n_layer / hidden_size / 등)은 loader가 primary/secondary 파일을 **읽는 시점**에 수행하며, 검증이 끝나면 관련 cross-layer offset은 폐기한다 — 런타임에 `SecondaryMmap`이 들고 있을 필요가 없다.
+- 향후 cross-layer tensor swap을 허용해야 한다면 **별도의 신규 필드/ID**로 재도입한다. 본 ID(ENG-DAT-094)의 범위는 decoder layer로 고정이다.
 
 **필드**:
 
 | 필드 | 타입 | 설명 |
 |------|------|------|
 | `mmap` | `memmap2::Mmap` 또는 동치 | Secondary 파일 전체 read-only mmap. |
-| `layer_index` | `Vec<LayerTensorSlice>` | 각 decoder layer에 속한 tensor들의 `(name, offset, len, dtype, shape)` 목록. GGUF header 파싱 1회로 구축. |
-| `cross_layer_offsets` | `HashMap<String, (u64, u64, DType)>` | 참고용. Swap 대상이 아니지만 metadata 검증에 사용. |
+| `layer_index` | `Vec<LayerTensorSlice>` | 각 decoder layer에 속한 tensor들의 `(name, offset, len, dtype, shape)` 목록. GGUF header 파싱 1회로 구축. 길이는 `num_layers`와 일치한다. |
+
+**폐기된 필드 (2026-04-24)**:
+
+- `cross_layer_offsets: HashMap<String, (u64, u64, DType)>` — Phase 1에서 populate만 되고 **read 경로가 0**이었다. Swap 범위가 decoder layer로 확정된 이상 런타임에 보관할 이유가 없다. Phase 2 구현 진입 시 필드와 채우는 코드를 함께 제거한다. 메타데이터 검증은 loader 로컬 변수로 충분하다.
 
 **의미론**:
 - `SwapExecutor`는 `layer_index[i]`를 조회해 해당 layer에 필요한 tensor의 raw byte slice를 얻고, Q/K permutation 등 primary loader와 동일한 후처리를 적용하여 새 `LayerWeights`를 생성한다.
@@ -742,9 +810,9 @@
 
 **[ENG-DAT-C10]** Primary와 secondary 가중치 파일의 모델 메타데이터(GGUF metadata의 `n_layer`, `n_head`, `n_kv_head`, `hidden_size`, `intermediate_size`, `head_dim`) 및 각 layer tensor의 shape은 모두 일치해야 한다. 불일치 시 loader는 에러 반환하고 swap 경로도 비활성화된다. *(MUST)*
 
-**[ENG-DAT-C11]** Cross-layer tensor(embedding, final_norm, lm_head)는 `TransformerWeights`의 swap 대상에서 제외된다. 이들의 dtype은 모델 lifetime 동안 `LoadConfig::default_dtype`으로 고정이다. *(MUST)*
+**[ENG-DAT-C11]** Cross-layer tensor(embedding, final_norm, lm_head)는 swap 대상에서 제외된다. 이들의 dtype은 모델 lifetime 동안 `LoadConfig::default_dtype`으로 고정이다. ENG-DAT-093 flat 배치에서 이 필드들은 `TransformerModel`의 기존 멤버 그대로 유지되며, `LayerSlot` 컬렉션에 포함되지 않는다. *(MUST)*
 
-**[ENG-DAT-C12]** `TransformerWeights::secondary_mmap`이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop될 수 없다. `LayerSlot::secondary_mmap_handle`의 모든 clone이 drop되어도 `TransformerWeights`가 최후 소유권을 보존한다. *(MUST)*
+**[ENG-DAT-C12]** `TransformerModel.secondary_mmap`(ENG-DAT-093 flat 필드)이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop될 수 없다. `LayerSlot::secondary_mmap_handle`의 모든 clone이 drop되어도 `TransformerModel`이 최후 소유권을 보존한다. *(MUST)*
 
 ## 6. Examples
 

@@ -229,15 +229,20 @@
 
 ### 3.13 Weight Swap Invariants [INV-121 ~ INV-125]
 
-2026-04-24 Dynamic Weight Swap (Manager 신호 기반 런타임 교체)의 불변식. 이전 Phase A 정적 노선은 **폐기**되었으며 `ENG-DAT-091` ID는 재사용 금지. 대응 명세: `32-engine-algorithms.md` 3.12 (ENG-ALG-210~214), `33-engine-data.md` 3.17~3.20 (ENG-DAT-090/092/093/094), `arch/weight_swap.md`.
+2026-04-24 Dynamic Weight Swap (Manager 신호 기반 런타임 교체)의 불변식. 이전 Phase A 정적 노선은 **폐기**되었으며 `ENG-DAT-091` ID는 재사용 금지. 대응 명세: `32-engine-algorithms.md` 3.12 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `33-engine-data.md` 3.17~3.20 (ENG-DAT-090/092/093/094), `arch/weight_swap.md`.
+
+**교차 참조**:
+- **INV-120** (Plan × Partition stale): `TransformerModel::ratio_generation`은 INV-120의 감지 키와 동일 소스이다. `SwapExecutor`가 batch 완료 후 정확히 1회 bump하여 plan invalidation을 일으킨다 (ENG-ALG-211 step (e)).
+- **INV-121 ↔ INV-123**: 토큰 경계 기반 per-token snapshot(INV-121)과 `ArcSwap::store` 단일 원자 단계(INV-123)는 **쌍으로** forward 비차단성을 보장한다. 한쪽만 성립해도 안전 보장 불충분.
+- **INV-122 ↔ INV-121**: dtype 혼합은 정상 상태이므로 INV-122의 수치 임계값은 "혼합 상태 자체"가 아닌 "혼합된 forward 결과의 근접성"에 적용된다.
 
 | ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
 |----|------|----------|---------|------|------|
-| INV-121 | 32-engine-algorithms 3.12.7 | `SwapExecutor`가 `LayerSlot`을 교체하는 구간에서 forward는 stale dtype 또는 half-swapped 상태를 관찰하지 않는다. `ArcSwap` + `generation` counter로 보장. | Correctness | test | INV-120과 동일 메커니즘 (ratio_generation) |
-| INV-122 | 32-engine-algorithms 3.12.6 | Dynamic swap 후 forward 결과는 primary baseline 대비 logit NMSE ≤ 0.01, top-5 overlap ≥ 0.9, top-1 match ratio ≥ 0.95를 충족한다. | Correctness | test | Llama/Qwen 양쪽, ratio 0.25/0.5/1.0 |
-| INV-123 | 32-engine-algorithms 3.12.2 | `SwapExecutor::execute_swap` 실행 중 forward 진입 시 lock-free로 기존 snapshot에 접근 가능. Swap은 `ArcSwap::swap` 한 단계로 완결되어 partial state를 외부에 노출하지 않는다. | Safety/Correctness | test | lock-free atomicity |
+| INV-121 | 32-engine-algorithms 3.12.7, ENG-ALG-214-SNAP | Forward 재진입 금지: 토큰 진입 시 per-layer `Arc<LayerWeights>` snapshot을 한 번 획득하고 토큰 내내 재사용. mid-token swap은 현재 토큰에 관찰 불가 (다음 토큰 경계부터 관측). stale/half-swapped 상태 관찰 0건. | Correctness | test | INV-120과 동일 메커니즘 (ratio_generation은 플랜 경로), per-token snapshot은 forward 경로 |
+| INV-122 | 32-engine-algorithms 3.12.6 | Dynamic swap 후 forward 결과는 primary baseline 대비 logit NMSE ≤ 0.01, top-5 overlap ≥ 0.9, top-1 match ratio ≥ 0.95를 충족한다. **layer 간 dtype 불균일(혼합 상태)은 본 설계의 정상 상태이며 불변식 위반이 아니다** — ratio 기반 swap의 본질이다. | Correctness | test | Llama/Qwen 양쪽, ratio 0.25/0.5/1.0. dtype mix allowed. |
+| INV-123 | 32-engine-algorithms 3.12.2 | Swap 단위는 `LayerSlot.weights.store()` 호출 1회이며 단일 원자 단계로 완결된다. 토큰 경계 밖(= forward가 snapshot을 재획득하지 않는 구간)에 발생한 swap은 **다음 토큰부터** 관측된다. Partial state(반만 교체된 snapshot 등)는 외부에 절대 노출되지 않는다. | Safety/Correctness | test | lock-free atomicity + per-token snapshot 경계 |
 | INV-124 | 33-engine-data 3.18 | `LayerSlot::current_dtype`의 값은 해당 slot이 현재 노출하는 `weights` snapshot의 실제 tensor dtype과 항상 일치한다. Swap 과정에서 `current_dtype` 갱신과 `weights` snapshot 교체는 동일 논리 단계에서 수행된다. | Correctness | test | dtype consistency |
-| INV-125 | 33-engine-data 3.19, 3.20 | `TransformerWeights::secondary_mmap`이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop되지 않는다. Swap 도중 mmap unmap 금지. 모델 lifetime 동안 생존 보장. | Safety | test | mmap lifetime |
+| INV-125 | 33-engine-data 3.19, 3.20 | `TransformerModel.secondary_mmap`(구 `TransformerWeights::secondary_mmap`)이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop되지 않는다. Swap 도중 mmap unmap 금지. 모델 lifetime 동안 생존 보장. | Safety | test | mmap lifetime. 보관 위치는 flat 배치(ENG-DAT-093)의 `TransformerModel` 필드. |
 
 ## 4. Alternative Behavior
 

@@ -1,9 +1,9 @@
 # Weight Swap — Dynamic Runtime Swap Architecture
 
-> **상태**: Draft v2 (전면 재작성 2026-04-24)
+> **상태**: Draft v3 (2026-04-24, Phase 1 구현 반영)
 > **작성**: 2026-04-24
 > **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, prefill-tail 측정, Arc snapshot 기반 lock-free 교체.
-> **대상 스펙**: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12 (ENG-ALG-210~214), `spec/41-invariants.md` §3.13 (INV-121~125).
+> **대상 스펙**: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `spec/41-invariants.md` §3.13 (INV-121~125).
 > **대상 모델**: Llama 3.2 1B (16 decoder layers, no tying), Qwen 2.5 1.5B (28 decoder layers, tying 가능).
 > **전제**: GGUF primary + GGUF secondary (dtype 다름). Safetensors는 부차 지원.
 
@@ -155,6 +155,55 @@ sequenceDiagram
 
 **Architectural invariant**: swap 대상은 **decoder block layer만**. 모델별 분기는 `num_layers`와 `lm_head` 유무로 완전 흡수되며, SwapExecutor/SwapDecider 로직 자체는 모델 공통.
 
+### 1.4 Per-token Atomic Snapshot 시점 (ENG-ALG-214-SNAP, INV-121)
+
+Forward pass와 SwapExecutor는 **토큰 경계**에서만 상호작용한다. 토큰 내부에서는 snapshot 교체가 관측되지 않는다.
+
+```mermaid
+sequenceDiagram
+    participant Fwd as Forward Loop<br/>(forward_into)
+    participant Slot as LayerSlot[i].weights<br/>(ArcSwap)
+    participant Exec as SwapExecutor
+    participant Plan as PartitionPlanContext<br/>(INV-120)
+
+    rect rgb(230, 245, 230)
+    Note over Fwd: Token N 시작 — per-token snapshot 획득 (INV-121)
+    loop for each layer i
+        Fwd->>Slot: load_full() → Arc_old
+        Slot-->>Fwd: Arc&lt;LayerWeights_old&gt;
+        Fwd->>Slot: current_dtype.load()
+        Slot-->>Fwd: DType_old
+    end
+    Fwd->>Plan: ratio_generation.load() → gen_0
+    end
+
+    rect rgb(255, 243, 224)
+    Note over Fwd,Exec: Token N 처리 중 — Swap 동시 발생 (mid-token)
+    par Forward 진행
+        Fwd->>Fwd: layer loop 실행<br/>(Arc_old snapshots 재사용)
+    and Swap 실행
+        Exec->>Slot: store(Arc&lt;LayerWeights_new&gt;)<br/>「INV-123: 단일 원자 단계」
+        Exec->>Slot: current_dtype.store(DType_new)<br/>「INV-124: 동일 논리 단계」
+        Exec->>Exec: (batch 계속)
+        Exec->>Plan: ratio_generation.fetch_add(1)<br/>「batch 완료 후 1회」
+    end
+    Note right of Fwd: Token N은 여전히 Arc_old 사용<br/>→ stale 관찰 0건 (INV-121)
+    end
+
+    rect rgb(230, 245, 230)
+    Note over Fwd: Token N+1 시작 — 새 snapshot 획득
+    Fwd->>Slot: load_full() → Arc_new
+    Slot-->>Fwd: Arc&lt;LayerWeights_new&gt;
+    Fwd->>Plan: ratio_generation.load() → gen_1
+    Note right of Plan: gen_1 != gen_0 → PlanInvalidated<br/>plan 재빌드 or forward_gen fallback
+    end
+```
+
+**핵심 규약**:
+- Token 진입 시 `load_full()`을 각 layer에 대해 1회 호출 → `Vec<Arc<LayerWeights>>` 생성. 토큰 내내 이 벡터만 참조한다.
+- 같은 토큰 내부에서 `slot.weights.*`를 **다시 읽지 않는다**. Mid-token swap이 발생해도 현재 토큰은 기존 snapshot으로 완주.
+- 토큰 경계에서만 새 snapshot이 관측된다. `ratio_generation` 값도 토큰 경계에서 재획득되며, plan 빌드 경로가 이 값으로 stale 판정을 수행한다.
+
 ## 2. 컴포넌트 상세
 
 ### 2.1 컴포넌트: `LoadConfig` (ENG-DAT-090)
@@ -173,9 +222,15 @@ pub struct LoadConfig {
     pub secondary_source: Option<PathBuf>,   // swap reservation only
 }
 // 전제 (pre): primary_source 존재 확인
-// 후조건 (post): secondary_source.is_some() ⇒ TransformerWeights::secondary_mmap.is_some() (INV-125)
+// 후조건 (post): secondary_source.is_some() ⇒ TransformerModel.secondary_mmap.is_some() (INV-125)
 //                모든 layer의 current_dtype == default_dtype (초기 상태)
 ```
+
+**구현 전환 일정 (Phase 1 → Phase 2)**:
+
+- **Phase 1 (현재)**: `LoadConfig` struct는 `engine/src/models/loader/mod.rs`에 **선언만** 되어 있으며, 실제 loader 엔트리(`load_gguf_with_secondary` 등)는 여전히 `primary_path: &Path`, `default_dtype: DType`, `Option<&Path>` 를 **낱개 파라미터**로 받는다. 이 shim 시그니처가 Phase 1의 정답이다.
+- **Phase 2 WSWAP-2-TRIGGER 커밋 (예정)**: `--force-swap-ratio` CLI 플래그 추가와 동반하여 loader 시그니처를 `pub fn load_model(config: LoadConfig) -> Result<TransformerModel, LoadError>` 단일 엔트리로 **일괄 전환**한다. CLI 파싱 → `LoadConfig` 구성 → `load_model` 호출이 유일한 경로가 된다.
+- **이유**: Phase 1에서 시그니처까지 바꾸면 master merge 충돌 표면적이 불필요하게 커진다. struct 선언 + secondary mmap 인프라까지만 마감하고, trigger 커밋에서 한 번에 옮긴다.
 
 ---
 
@@ -184,7 +239,7 @@ pub struct LoadConfig {
 **설계 결정**:
 - **ArcSwap 우선 권장**: `arc_swap::ArcSwap<LayerWeights>`는 lock-free snapshot 교체를 제공. Writer-serialized + reader-wait-free. Mutex 대비 forward hot path에서 zero contention.
 - **대안 허용**: `RwLock<Arc<LayerWeights>>` 또는 epoch 기반 custom swap도 INV-121~124 충족 시 허용. **최종 선택은 Senior Implementer PoC에서 decode latency로 결정**.
-- **generation counter는 layer-local**: `PartitionPlanContext::ratio_generation`(전역)과 독립. 둘 다 증가하나 관찰 지점이 다름.
+- **`generation` 필드는 debug/tracing 전용**: forward hot path, plan invalidation, 재진입 판정 등 **정확성 경로에서 절대 참조하지 않는다**. 전역 `TransformerModel::ratio_generation` 하나가 정확성 트리거의 유일한 소스이다 (3-counter 표 참조).
 
 **트레이드오프**:
 
@@ -200,32 +255,91 @@ pub struct LayerSlot {
     pub current_dtype: AtomicDType,          // or AtomicU8 wrapping DType discriminant
     pub weights: ArcSwap<LayerWeights>,      // 권장; 대안 허용
     pub secondary_mmap_handle: Option<Arc<SecondaryMmap>>,
-    pub generation: AtomicU64,
+    pub generation: AtomicU64,               // DEBUG/TRACING ONLY (not read by forward/plan)
 }
 // 전제: weights의 dtype == current_dtype (INV-124 불변)
-// 후조건: swap 후 generation += 1, 신규 weights와 current_dtype 원자 단위로 갱신
+// 후조건: swap 후 generation += 1 (로그/테스트용), 신규 weights와 current_dtype 원자 단위로 갱신
 ```
+
+#### 2.2.1 3-counter 관계 (generation counters)
+
+본 설계에는 이름이 비슷한 세 개의 generation counter가 존재한다. 역할을 혼동하면 plan 재빌드가 누락되거나 forward가 stale 상태에 빠질 수 있으므로 아래 표를 단일 근거로 삼는다.
+
+| 카운터 | 스코프 | 증가 주체 | 증가 단위 | 관찰자 | 용도 |
+|--------|--------|-----------|-----------|--------|------|
+| `LayerSlot::generation` | per-slot | `SwapExecutor` (step c) | slot 단일 swap마다 +1 | tracing/로그/테스트 | **Debug 전용**. 정확성 경로 참조 금지. |
+| `TransformerModel::ratio_generation` | global | `SwapExecutor` (step e) | **batch 완료 후 정확히 1회** | Plan 빌드 경로, `PartitionPlanContext` | 전역 plan 재빌드 트리거의 유일한 소스. |
+| `PartitionPlanContext::ratio_generation` (INV-120 기존) | plan snapshot | Plan 빌드 시점 | Plan 빌드 시 global 값 캡처 | `PartitionStep::run` | Plan stale 감지. mismatch 시 `PlanInvalidated`. |
+
+**규칙**:
+- `SwapExecutor`가 여러 layer를 한 batch로 교체할 때, per-layer loop에서는 `LayerSlot::generation`만 bump하고 전역 counter는 **건드리지 않는다**. batch 전체가 끝난 뒤 **단 한 번** `ratio_generation.fetch_add(1, SeqCst)` 를 호출한다 (ENG-ALG-211 step (e)).
+- Forward hot path는 토큰 진입 시 `ratio_generation`을 **읽지 않는다** (per-token snapshot 규약으로 충분하므로). Plan 빌드 시점에만 비교 대상으로 사용된다.
 
 ---
 
-### 2.3 컴포넌트: `TransformerWeights` (ENG-DAT-093)
+### 2.3 컴포넌트: Swap 필드는 `TransformerModel`의 flat 배치 (ENG-DAT-093)
 
-**설계 결정**:
-- **Cross-layer tensor 분리**: embedding/final_norm/lm_head는 `Arc<Tensor>`로 직접 보유. 이들은 swap 대상이 아니므로 `LayerSlot` 래핑 불필요.
-- **secondary_mmap은 최후 소유권**: `TransformerWeights`가 `Arc<SecondaryMmap>`의 "keeper". 모든 `LayerSlot::secondary_mmap_handle`은 여기서 clone된 Arc를 공유. INV-125를 구조적으로 보장.
-- **ratio_generation은 Plan 재빌드 트리거**: 기존 `PartitionPlanContext::ratio_generation`(INV-120)과 **의미 통합**. Plan stale 감지 메커니즘 단일화.
+**설계 결정 (2026-04-24 확정)**:
+- **별도의 `TransformerWeights` wrapper struct를 두지 않는다.** Swap 관련 필드는 모두 `TransformerModel`(`engine/src/models/transformer.rs`)의 flat 멤버로 배치한다.
+- 근거: `TransformerModel`은 이미 embedding/final_norm/lm_head를 자체 필드로 보유한다. 독립 struct로 묶을 경우 **이중 소유 또는 중복 필드**가 발생한다. Phase 1 구현에서 이를 회피하기 위해 `engine/src/models/weights/transformer_weights.rs`에 `TransformerWeights` struct를 선언만 해 두었으나 **실사용처가 0**이다 — 죽은 추상화이다.
+- Phase 2 구현 진입 시 `engine/src/models/weights/transformer_weights.rs` 파일 및 `mod.rs`의 pub re-export를 제거한다. 이름 `TransformerWeights`는 폐기되며, **식별자 `ENG-DAT-093`은 본 flat 배치로 의미 승계**된다.
+- **Cross-layer tensor 분리**: embedding/final_norm/lm_head는 `TransformerModel`의 기존 필드 그대로 사용. Swap 대상이 아니므로 `LayerSlot` 래핑 불필요.
+- **secondary_mmap은 최후 소유권**: `TransformerModel`이 `Arc<SecondaryMmap>`의 "keeper". 모든 `LayerSlot::secondary_mmap_handle`은 여기서 clone된 Arc를 공유. INV-125를 구조적으로 보장.
+- **ratio_generation은 Plan 재빌드 트리거의 단일 소스**: 기존 `PartitionPlanContext::ratio_generation`(INV-120)과 **의미 통합**. Plan stale 감지 메커니즘 단일화.
 
-**인터페이스**:
+**실구조 (Phase 1 구현 반영)**:
 ```rust
-pub struct TransformerWeights {
-    pub layers: Vec<LayerSlot>,
+// engine/src/models/transformer.rs
+pub struct TransformerModel {
+    // 기존 필드 (재사용)
     pub embedding: Arc<Tensor>,
     pub final_norm: Arc<Tensor>,
-    pub lm_head: Option<Arc<Tensor>>,   // tie_word_embeddings = true면 None
+    pub lm_head: Option<Arc<Tensor>>,
+
+    // Phase 1에서 추가된 swap 필드 (ENG-DAT-093 대응)
+    pub layers: Vec<LayerSlot>,
     pub secondary_mmap: Option<Arc<SecondaryMmap>>,
     pub ratio_generation: AtomicU64,
+
+    // ... 기타 기존 필드 ...
 }
 ```
+
+**구조 다이어그램**:
+
+```mermaid
+classDiagram
+    class TransformerModel {
+        +embedding: Arc~Tensor~
+        +final_norm: Arc~Tensor~
+        +lm_head: Option~Arc~Tensor~~
+        +layers: Vec~LayerSlot~
+        +secondary_mmap: Option~Arc~SecondaryMmap~~
+        +ratio_generation: AtomicU64
+        +forward_into(...)
+    }
+    class LayerSlot {
+        +current_dtype: AtomicDType
+        +weights: ArcSwap~LayerWeights~
+        +secondary_mmap_handle: Option~Arc~SecondaryMmap~~
+        +generation: AtomicU64 「debug only」
+    }
+    class SecondaryMmap {
+        +mmap: Mmap
+        +layer_index: Vec~LayerTensorSlice~
+    }
+    TransformerModel "1" *-- "N" LayerSlot : layers
+    TransformerModel "1" o-- "0..1" SecondaryMmap : secondary_mmap
+    LayerSlot "N" o-- "0..1" SecondaryMmap : secondary_mmap_handle (shared Arc)
+```
+
+**코드-스펙 차이 / Phase 1 구현 현황**:
+
+| 항목 | 상태 | 조치 |
+|------|------|------|
+| `TransformerModel`에 `layers: Vec<LayerSlot>`, `secondary_mmap`, `ratio_generation` flat 필드 | 구현 완료 | 유지 |
+| `engine/src/models/weights/transformer_weights.rs`의 `TransformerWeights` struct | 죽은 선언 (미사용) | **Phase 2 구현 진입 시 파일 및 pub re-export 삭제** (코드 수정은 Implementer 담당) |
+| `mod.rs`의 `pub use transformer_weights::*` | 미사용 re-export | Phase 2에서 함께 제거 |
 
 ---
 
@@ -235,18 +349,26 @@ pub struct TransformerWeights {
 - **Read-only mmap**: `memmap2::Mmap` (아님 `MmapMut`). 파일은 절대 수정 대상 아님.
 - **Layer tensor 인덱스 사전 구축**: open 시 GGUF header 1회 파싱으로 `layer_index: Vec<LayerTensorSlice>` 완성. 이후 lookup은 O(1).
 - **Lazy 접근**: mmap은 열려있지만 page-in은 커널이 first-touch 시 수행. `SwapExecutor` 첫 호출 시 IO가 발생.
+- **Swap 범위: decoder block layer로 고정**: embedding / final_norm / lm_head 등 cross-layer tensor는 swap 대상이 아니므로 `SecondaryMmap`도 이에 대한 offset 정보를 **보관하지 않는다**. 메타데이터 정합성은 loader가 open 시점에 로컬 변수로 확인하고 폐기한다.
 
 **인터페이스**:
 ```rust
 pub struct SecondaryMmap {
     pub mmap: memmap2::Mmap,
-    pub layer_index: Vec<LayerTensorSlice>,   // indexed by layer_idx
-    pub cross_layer_offsets: HashMap<String, (u64, u64, DType)>,
+    pub layer_index: Vec<LayerTensorSlice>,   // indexed by layer_idx, length == num_layers
+    // (cross_layer_offsets 필드는 제거됨 — Phase 1에서 populate만 되고 read 경로 없음)
 }
 pub struct LayerTensorSlice {
     pub tensors: HashMap<String /* subname */, (u64 /* offset */, u64 /* len */, DType, Vec<usize> /* shape */)>,
 }
 ```
+
+**코드-스펙 차이 / Phase 1 구현 현황**:
+
+| 항목 | 상태 | 조치 |
+|------|------|------|
+| `mmap`, `layer_index`, `metadata` 필드 | 구현 완료 | 유지 |
+| `cross_layer_offsets: HashMap<String, (u64, u64, DType)>` 필드 | **Phase 1에서 populate만 되고 read 경로 0** | **Phase 2 구현 진입 시 필드 및 채우는 코드 삭제** (코드 수정은 Implementer 담당). 향후 non-layer tensor swap 필요 시 별도 신규 필드/ID로 재도입. |
 
 ---
 
@@ -305,8 +427,35 @@ stateDiagram-v2
 
 **설계 결정**:
 - **Per-layer 순차 실행**: 병렬 swap은 madvise 힌트 충돌과 IO 스파이크 우려로 배제. 순차가 총 latency에 더 유리 (측정으로 재확인).
-- **Q/K permutation 재사용**: primary loader(`gguf.rs:514-534, 677-697`)의 permutation 함수를 `SwapExecutor`가 직접 호출. dtype에 무관하므로 분기 없음.
-- **madvise 2단계**: step (c) `ArcSwap::swap` 직후 old Arc에 잡힌 primary 페이지 힌트 전달. old가 forward에 잡혀 있으면 drop까지 지연되며, 최종 회수는 커널 판단.
+- **Q/K permutation 재사용**: primary loader의 permutation 함수를 `SwapExecutor`가 직접 호출. dtype에 무관하므로 분기 없음.
+- **madvise 2단계**: step (c) `ArcSwap::store` 직후 old Arc에 잡힌 primary 페이지 힌트 전달. old가 forward에 잡혀 있으면 drop까지 지연되며, 최종 회수는 커널 판단.
+- **`ratio_generation` bump는 batch 단위 1회**: per-layer loop 내부에서는 `LayerSlot::generation`(debug 전용)만 증가시키고, batch 전체 swap이 끝난 뒤 `TransformerModel::ratio_generation.fetch_add(1, SeqCst)` 를 **정확히 1회** 호출한다. 이 한 번의 bump가 plan invalidation의 유일한 trigger이다 (INV-120, 3-counter 표 참조).
+
+**처리 흐름**:
+
+```mermaid
+flowchart TD
+    START([execute_swap 진입]) --> CHECK_MMAP{secondary_mmap<br/>== Some?}
+    CHECK_MMAP -- No --> NOOP[NoOp 반환<br/>ENG-DAT-C09]
+    CHECK_MMAP -- Yes --> LOOP[for layer_idx in layers_to_swap]
+    LOOP --> SKIP{이미 target_dtype?}
+    SKIP -- Yes --> NEXT[다음 layer]
+    SKIP -- No --> BUILD[build_layer_from_mmap<br/>+ Q/K permutation]
+    BUILD --> STORE[slot.weights.store&lpar;new Arc&rpar;<br/>+ current_dtype.store&lpar;target&rpar;<br/>「동일 논리 단계, INV-124」]
+    STORE --> SLOT_GEN[slot.generation.fetch_add&lpar;1, Relaxed&rpar;<br/>「debug only」]
+    SLOT_GEN --> MADVISE[madvise&lpar;DONTNEED&rpar; on old Arc primary pages]
+    MADVISE --> NEXT
+    NEXT --> LOOP
+    LOOP -- loop done --> NONEMPTY{swapped non-empty?}
+    NONEMPTY -- Yes --> GLOBAL_BUMP[model.ratio_generation.fetch_add&lpar;1, SeqCst&rpar;<br/>「batch 완료 후 정확히 1회」]
+    NONEMPTY -- No --> DONE
+    GLOBAL_BUMP --> DONE([WeightSwapped 반환])
+    NOOP --> DONE
+
+    style STORE fill:#c8e6c9
+    style GLOBAL_BUMP fill:#fff3e0
+    style SLOT_GEN fill:#eeeeee
+```
 
 **예외 처리**:
 
@@ -317,6 +466,7 @@ stateDiagram-v2
 | 이미 swap된 layer | skip | ENG-ALG-211 |
 | permutation 실패 | panic (logic bug) | — |
 | madvise EINVAL | 로그 후 계속 (수치 결과는 유지) | ENG-ALG-C05 |
+| batch swap 결과가 비어있음 (전 layer skip) | `ratio_generation` **bump 생략** | ENG-ALG-211 |
 
 ---
 
@@ -400,5 +550,11 @@ pub enum ResilienceAction {
 
 ## 7. 변경 이력
 
+- **2026-04-24 (v3, Phase 1 구현 반영 + Spec 명확화 5건)**:
+  1. `TransformerWeights` struct 폐기, `TransformerModel` flat 배치로 재정의 (ENG-DAT-093 의미 승계, Phase 2에서 죽은 파일 제거).
+  2. Layer 간 dtype 혼합 = 정상 상태 명시. Per-token atomic snapshot 규약(ENG-ALG-214-SNAP, INV-121 재작성) 도입. Mermaid sequence diagram §1.4 추가.
+  3. `SecondaryMmap::cross_layer_offsets` 필드 제거 결정 + swap 범위 "decoder layer only" 제약 명시.
+  4. 3개 generation counter 역할 표 추가 (§2.2.1): `LayerSlot::generation` = debug only, `TransformerModel::ratio_generation` = 전역 plan 트리거 단일 소스 (batch 단위 1회 bump), `PartitionPlanContext::ratio_generation` = plan 빌드 snapshot. SwapExecutor Mermaid flow 갱신.
+  5. `LoadConfig` 전환 시점을 Phase 2 WSWAP-2-TRIGGER 커밋으로 확정 (§2.1).
 - **2026-04-24 (v2, 전면 재작성)**: 정적 per-layer mixed precision 노선 폐기. Manager 신호 기반 동적 swap으로 전환. ENG-DAT-091 + `quantize_profile` + `--layer-dtype-profile` 제거. LayerSlot/TransformerWeights/SecondaryMmap/WeightSwapHandler 신규. INV-123~125 추가.
 - 2026-04-24 (v1, 초안, **폐기**): Phase A 정적 per-layer mixed precision 설계. ENG-DAT-090/091, ENG-ALG-210, INV-121/122 초안.

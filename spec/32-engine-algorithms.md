@@ -1109,20 +1109,18 @@ function load_model(config: LoadConfig) -> TransformerWeights:
 **알고리즘**:
 
 ```
-function execute_swap(weights: &TransformerWeights,
+function execute_swap(model: &TransformerModel,        // flat 배치 (ENG-DAT-093)
                       layers_to_swap: &[usize],
                       target_dtype: DType) -> SwapResult:
-    if weights.secondary_mmap is None: return NoOp    // ENG-DAT-C09
-
-    // (a) Global generation bump — forward plan 재빌드 트리거
-    let new_gen = weights.ratio_generation.fetch_add(1, SeqCst) + 1
+    if model.secondary_mmap is None: return NoOp        // ENG-DAT-C09
 
     let mut swapped = Vec::new()
     let mut freed_total: u64 = 0
     let start_time = now()
 
+    // (a) Per-layer snapshot 교체. ratio_generation은 아직 건드리지 않는다.
     for layer_idx in layers_to_swap:
-        slot = &weights.layers[layer_idx]
+        slot = &model.layers[layer_idx]
         if slot.current_dtype == target_dtype: continue   // 이미 swap 완료 (ENG-DAT-C08)
         let mmap = slot.secondary_mmap_handle.as_ref().expect("C09 보증")
 
@@ -1130,15 +1128,22 @@ function execute_swap(weights: &TransformerWeights,
         new_weights = build_layer_from_mmap(mmap, layer_idx, target_dtype)
         assert new_weights.dtype == target_dtype
 
-        // (c) Atomic snapshot swap — forward는 old Arc 계속 사용 가능
-        let old = slot.weights.swap(Arc::new(new_weights))  // ArcSwap
-        slot.current_dtype.store_atomic(target_dtype)        // INV-124 페어
-        slot.generation.fetch_add(1, SeqCst)
+        // (c) Atomic snapshot swap — forward는 old Arc 계속 사용 가능 (INV-123)
+        //     current_dtype 갱신은 weights.store()와 동일 논리 단계 (INV-124)
+        let old = slot.weights.swap(Arc::new(new_weights))   // ArcSwap::store
+        slot.current_dtype.store_atomic(target_dtype)
+        slot.generation.fetch_add(1, Relaxed)                // debug/tracing only
 
         // (d) Primary 페이지 madvise — old가 drop되면 추가 회수
         freed_total += madvise_primary_pages(&old, layer_idx)
 
-        swapped.push((layer_idx, DType::from(old_dtype_captured), target_dtype))
+        swapped.push((layer_idx, old_dtype_captured, target_dtype))
+
+    // (e) Batch 전체 완료 후 전역 plan invalidation을 *정확히 1회* 트리거.
+    //     이 한 번의 bump가 PartitionPlanContext::ratio_generation과 mismatch를
+    //     유발하여 PartitionStep::run이 PlanInvalidated를 반환하게 만든다 (INV-120).
+    if !swapped.is_empty():
+        model.ratio_generation.fetch_add(1, SeqCst)
 
     return WeightSwapped {
         layers: swapped,
@@ -1148,9 +1153,11 @@ function execute_swap(weights: &TransformerWeights,
 ```
 
 **핵심 보증**:
-- **Forward 비차단**: step (c)의 `ArcSwap::swap`은 lock-free. 진행 중 forward pass는 swap 이전의 Arc를 계속 참조하여 완료. 다음 토큰부터 새 snapshot을 본다.
-- **Plan 재빌드**: `ratio_generation` 증가로 `PartitionStep::run`이 `PlanInvalidated`를 반환 (INV-120 재사용). Caller는 plan을 재빌드하거나 forward_gen으로 fallback.
+- **Forward 비차단 (INV-123)**: step (c)의 `ArcSwap::store`은 lock-free. 진행 중 forward pass는 swap 이전의 Arc를 계속 참조하여 완료. 상위 규약(ENG-ALG-214, INV-121)에 따라 **토큰 경계**에서 새 snapshot으로 전환된다 — 토큰 내부에서 old→new 혼합 관찰은 발생하지 않는다.
+- **Plan 재빌드 단일 트리거**: batch 전체에서 `ratio_generation`을 **정확히 1회** 증가시킨다 (step (e)). 개별 layer 교체마다 bump하지 않는다. mismatch 감지 시 `PartitionStep::run`이 `PlanInvalidated`를 반환한다 (INV-120 재사용). Caller는 plan을 재빌드하거나 forward_gen으로 fallback.
+- **Generation counter 역할 구분**: `LayerSlot::generation`은 debug/tracing 전용이며 정확성 경로 관찰자가 없다 (ENG-DAT-092 3-counter 표 참조). 전역 재빌드 트리거는 오직 `TransformerModel::ratio_generation`.
 - **Q/K permutation dtype 무관**: GGUF convention의 permutation은 byte-level reorder이므로 primary loader의 동일 로직을 재사용 가능. Llama/Qwen 양 모델에서 동일 경로.
+- **dtype 혼합은 정상**: 서로 다른 layer가 서로 다른 dtype을 보유하는 상태는 본 설계의 **정상 상태**이며 INV 위반이 아니다 (INV-122 참조).
 
 **madvise 정책**:
 - 기존 ENG-ALG-C05/C06 (page alignment, is_host_managed) 규칙 재사용.
@@ -1254,6 +1261,43 @@ function decide_layers(importance_scores: Option<&[f32]>,
 
 **배타성**: 기존 KV SwapHandler와 상호 배타 아님. 둘 다 동일 `HandlerContext`에서 순차 실행 가능 (pipeline 순서에 의존).
 
+##### 3.12.5.1 Forward Snapshot 규약 (per-token atomic snapshot)
+
+**[ENG-ALG-214-SNAP]** Forward pass는 각 토큰(prefill 토큰 1개 또는 decode 1 step)의 **진입 시점**에 모든 layer slot으로부터 현재 `Arc<LayerWeights>` snapshot을 **한 번만** 획득하여, 해당 토큰이 끝날 때까지 **동일한 snapshot 집합을 재사용**한다. 토큰 중간에 `slot.weights.load()`를 반복 호출해서는 안 된다. *(MUST)*
+
+**알고리즘 (의사코드)**:
+
+```
+function forward_token(model: &TransformerModel, token):
+    // (1) 토큰 진입 시 per-layer snapshot을 한 번 획득
+    let snapshots: Vec<Arc<LayerWeights>> =
+        model.layers.iter().map(|slot| slot.weights.load_full()).collect()
+    let dtypes: Vec<DType> =
+        model.layers.iter().map(|slot| slot.current_dtype.load_atomic()).collect()
+    let plan_gen: u64 = model.ratio_generation.load_atomic()
+
+    // (2) 이후 레이어 루프는 "snapshots / dtypes"만 참조하고 slot을 다시 읽지 않음
+    for layer_idx in 0..num_layers:
+        run_layer(&snapshots[layer_idx], dtypes[layer_idx], ...)
+
+    // (3) Plan 경로는 plan_gen을 ratio_generation과 비교해 stale 판정 (INV-120)
+```
+
+**보증 (per-token atomicity)**:
+- 같은 토큰 내부에서는 snapshot이 **절대 변하지 않는다**. SwapExecutor가 mid-token에 `ArcSwap::store`를 호출하더라도, 현재 처리 중인 토큰은 이미 `load_full()`로 잡아둔 `Arc`를 유지한다.
+- **토큰 경계**가 swap 관측 지점이다. 다음 토큰 진입 시 새 `load_full()`이 최신 snapshot을 본다.
+- 이 규약이 INV-121(stale/half-swapped 상태 관찰 금지)을 forward 측에서 충족시킨다. Swap 측의 대응 보증은 ENG-ALG-211 step (c)에 있다.
+
+**불변식 교차 참조**:
+- **INV-121**: swap 도중 forward는 stale/half-swapped 상태를 관찰하지 않는다.
+- **INV-123**: `ArcSwap::store`는 단일 원자 단계이며, partial state는 외부에 노출되지 않는다.
+- **INV-124**: snapshot 교체와 `current_dtype` 갱신은 동일 논리 단계 — 위 알고리즘의 `snapshots[i]`와 `dtypes[i]`는 layer i에 대해 일관된 상태 조합이다.
+- **INV-122**: dtype 혼합은 정상 상태이다 (layer i는 F16, layer i+1은 Q4_0이 허용되며, 본 규약은 이를 토큰 내내 안정적으로 유지한다).
+
+**적용 범위**:
+- Prefill 전체 / decode 전체 forward path (`TransformerModel::forward_into()` 및 내부 forward helper).
+- `PartitionStep::run`의 plan 빌드 시점에도 동일한 `ratio_generation` snapshot 규약이 적용된다 (INV-120 동작과 합치).
+
 #### 3.12.6 Mixed Precision Forward 정확성 [INV-122]
 
 **[INV-122]** 동적 swap으로 일부 decoder layer가 secondary dtype으로 교체된 이후의 forward 결과는 primary single-precision baseline 대비 다음 허용 오차 안에 있어야 한다. *(MUST)*
@@ -1287,14 +1331,18 @@ function decide_layers(importance_scores: Option<&[f32]>,
 
 #### 3.12.7 Forward 재진입 보호 [INV-121]
 
-**[INV-121]** `SwapExecutor`가 `LayerSlot`을 교체하는 구간에서 forward가 해당 layer에 진입해도 **stale dtype 또는 half-swapped 상태를 절대 관찰하지 않는다**. 구현은 `ArcSwap` + `AtomicU64 generation` 조합으로 보장한다. *(MUST)*
+**[INV-121]** Forward pass는 **토큰 진입 시점에 per-layer `Arc<LayerWeights>` snapshot 집합을 한 번 획득하고, 해당 토큰이 끝날 때까지 동일 snapshot 집합을 재사용**한다. `SwapExecutor`가 토큰 처리 중간에 `LayerSlot`을 교체하더라도 현재 토큰은 이전 snapshot으로 완주하며, 새 snapshot은 다음 토큰 경계부터만 관측된다. 결과적으로 forward는 **stale dtype 또는 half-swapped 상태를 절대 관찰하지 않는다**. *(MUST)*
 
 **보장 메커니즘**:
-1. Forward 진입 시 `slot.weights.load()`로 Arc snapshot을 획득 (lock-free).
-2. Swap은 `slot.weights.swap(new)`로 snapshot을 원자적으로 교체. `current_dtype`은 같은 단계에서 갱신 (INV-124).
-3. `generation` counter는 Plan 레벨의 stale 감지 키. `PartitionPlanContext`가 generation mismatch를 보면 `PlanInvalidated` 반환 (INV-120 재사용).
+1. **Forward 진입 (토큰 시작)**: 모든 layer에 대해 `slot.weights.load_full()` + `slot.current_dtype.load_atomic()`을 각 1회 호출하여 per-token snapshot 집합을 확보한다 (ENG-ALG-214-SNAP).
+2. **토큰 내부 실행**: 레이어 루프는 snapshot 집합만 참조하고 `slot.*`을 다시 읽지 않는다. 따라서 mid-token swap은 현재 토큰에 관찰 불가.
+3. **Swap 측 원자성**: `SwapExecutor`는 per-layer `ArcSwap::store` 단일 호출로 snapshot을 교체하며, 동일 논리 단계에서 `current_dtype`을 갱신한다 (INV-123, INV-124). Batch 전체 완료 후 `TransformerModel::ratio_generation`을 정확히 1회 bump하여 plan stale을 트리거한다 (INV-120 재사용).
+4. **Plan 재빌드 키**: `ratio_generation`은 Plan 레벨 stale 감지의 **유일한 단일 소스**이다. `LayerSlot::generation`은 debug/tracing 전용이며 이 판정에 참여하지 않는다 (ENG-DAT-092 3-counter 표).
 
-**검증 방법**: test. `tests/spec/test_inv_121_swap_reentrancy.rs`에서 swap×forward 동시 부하 (≥10K iterations)로 panic/stale/deadlock 0건 검증.
+**허용되는 상태**:
+- 서로 다른 layer가 서로 다른 dtype을 보유하는 혼합 상태는 **정상 상태**이다 (예: ratio=0.3이면 decoder layer의 30%만 secondary dtype, 나머지는 primary dtype). 이는 INV-122 위반이 아니다.
+
+**검증 방법**: test. `tests/spec/test_inv_121_swap_reentrancy.rs`에서 swap×forward 동시 부하 (≥10K iterations)로 panic/stale/deadlock/mid-token snapshot 재획득 0건 검증.
 
 ---
 

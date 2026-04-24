@@ -124,11 +124,11 @@
 
 | INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
 |-----|------|---------|------|-----------|
-| INV-121 | Swap 도중 forward는 stale/half-swapped 상태 관찰 금지. ArcSwap + generation 기반. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_121_swap_reentrancy.rs` |
-| INV-122 | Dynamic swap 후 forward: logit NMSE ≤ 0.01, top-5 overlap ≥ 0.9, top-1 match ≥ 0.95 (primary baseline 대비). Llama/Qwen 양쪽. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_122_mixed_precision.rs` |
-| INV-123 | SwapExecutor::execute_swap 실행 중 forward는 lock-free로 기존 snapshot에 접근 가능. Partial state 외부 노출 금지. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_123_swap_atomicity.rs` |
+| INV-121 | Forward 재진입 금지. 토큰 진입 시 per-layer Arc snapshot 1회 획득 + 토큰 내내 재사용. mid-token swap은 다음 토큰부터 관측. stale/half-swapped 관찰 0건. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_121_swap_reentrancy.rs` |
+| INV-122 | Dynamic swap 후 forward: logit NMSE ≤ 0.01, top-5 overlap ≥ 0.9, top-1 match ≥ 0.95 (primary baseline 대비). **layer 간 dtype 혼합은 정상 상태이며 위반 아님.** Llama/Qwen 양쪽. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_122_mixed_precision.rs` |
+| INV-123 | Swap 단위 = `LayerSlot.weights.store()` 1회 (단일 원자 단계). 토큰 경계 밖 swap은 다음 토큰부터 관측. Partial state 외부 노출 금지. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_123_swap_atomicity.rs` |
 | INV-124 | LayerSlot::current_dtype == weights snapshot의 실제 tensor dtype (swap 전후 항상 일치). | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_124_slot_dtype_consistency.rs` |
-| INV-125 | TransformerWeights::secondary_mmap이 Some인 동안 Arc<SecondaryMmap>은 drop되지 않는다. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_125_secondary_mmap_lifetime.rs` |
+| INV-125 | TransformerModel.secondary_mmap(구 TransformerWeights::secondary_mmap)이 Some인 동안 Arc<SecondaryMmap>은 drop되지 않는다. flat 배치 기준. | Safety | 🆕 미구현 | `engine/tests/spec/test_inv_125_secondary_mmap_lifetime.rs` |
 
 ---
 
@@ -243,10 +243,10 @@
 | ENG-ALG-051 | (B) | Unified QCF (attention output perturbation 통합 메트릭) | ⬜ | 미구현 |
 | ENG-ALG-200 | (A) | GPU Plan × Tensor Partition 협업 (PartitionStep, FfnVariant::Partitioned) | 🆕 미구현 | `tests/spec/eng_alg_200_plan_partition.rs` |
 | ENG-ALG-210 | (A) | 초기 uniform 로딩 + secondary mmap handle 예약 | 🆕 미구현 | `engine/tests/spec/test_eng_alg_210_initial_load.rs` |
-| ENG-ALG-211 | (A) | SwapExecutor 실행 알고리즘 (ArcSwap + permutation + madvise) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_211_swap_executor.rs` |
+| ENG-ALG-211 | (A) | SwapExecutor: per-layer ArcSwap + permutation + madvise + **batch 완료 후 ratio_generation 정확히 1회 bump**. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_211_swap_executor.rs` |
 | ENG-ALG-212 | (A) | On-demand ImportanceCollector 활성화 (prefill-tail + K=512 fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_212_importance_activation.rs` |
 | ENG-ALG-213 | (A) | SwapDecider 로직 (ratio × layer 수, uniform fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_213_swap_decider.rs` |
-| ENG-ALG-214 | (A) | WeightSwapHandler (CachePressureHandler 구현) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_214_weight_swap_handler.rs` |
+| ENG-ALG-214 | (A) | WeightSwapHandler (CachePressureHandler 구현) + per-token forward snapshot 규약 (214-SNAP) | 🆕 미구현 | `engine/tests/spec/test_eng_alg_214_weight_swap_handler.rs` |
 
 ## Engine Data
 
@@ -259,8 +259,8 @@
 | ENG-DAT-090 | (D) | LoadConfig primary/secondary_source 필드 (동적 swap 예약) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_090_load_config.rs` |
 | ENG-DAT-091 | (D) | **[DEPRECATED 2026-04-24]** LayerDtypeProfile TOML schema. ID 재사용 금지. | — | — |
 | ENG-DAT-092 | (D) | LayerSlot 구조 (current_dtype, weights Arc, secondary_mmap_handle, generation) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_092_layer_slot.rs` |
-| ENG-DAT-093 | (D) | TransformerWeights (Vec<LayerSlot>, secondary_mmap, ratio_generation) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_093_transformer_weights.rs` |
-| ENG-DAT-094 | (D) | SecondaryMmap (mmap + layer tensor index) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_094_secondary_mmap.rs` |
+| ENG-DAT-093 | (D) | TransformerModel flat 배치: layers(Vec<LayerSlot>) + secondary_mmap + ratio_generation + 기존 embedding/final_norm/lm_head. 별도 wrapper struct 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_093_transformer_weights.rs` |
+| ENG-DAT-094 | (D) | SecondaryMmap (mmap + decoder layer tensor index only). cross_layer_offsets 필드 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_094_secondary_mmap.rs` |
 
 ## Cross-cutting
 
