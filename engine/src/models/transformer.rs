@@ -171,6 +171,31 @@ impl TransformerModel {
         Self::load_gguf_with_secondary(model_path, None, backend, memory)
     }
 
+    /// Load a model from a `LoadConfig` (ENG-DAT-090).
+    ///
+    /// This is the canonical single-entry loader that supersedes the
+    /// individual `load_gguf` / `load_gguf_with_secondary` calls. The
+    /// `LoadConfig` bundles primary path, default dtype, and optional
+    /// secondary path so the caller never passes them as loose parameters.
+    ///
+    /// Only GGUF primary sources are supported; Safetensors callers continue
+    /// to use `load_with_dtype` directly.
+    pub fn load_from_config(
+        config: &crate::models::loader::LoadConfig,
+        backend: Arc<dyn Backend>,
+        memory: &dyn Memory,
+    ) -> Result<Self> {
+        Self::load_gguf_with_secondary(
+            config
+                .primary_source
+                .to_str()
+                .ok_or_else(|| anyhow!("primary_source path is not valid UTF-8"))?,
+            config.secondary_source.as_deref(),
+            backend,
+            memory,
+        )
+    }
+
     /// Load a primary GGUF plus an optional secondary GGUF reserved for
     /// runtime weight swap (Phase 2). The secondary file is validated against
     /// the primary metadata (ENG-DAT-C10) and its mmap handle is retained on
@@ -1330,13 +1355,12 @@ impl TransformerModel {
         // a QKV bias that isn't F32, fall back to the legacy path.
         if self.config.has_qkv_bias {
             for layer in &layer_snaps {
-                if let Some(ref bias) = layer.qkv_bias {
-                    if bias.bq.dtype() != crate::core::buffer::DType::F32
+                if layer.qkv_bias.as_ref().is_some_and(|bias| {
+                    bias.bq.dtype() != crate::core::buffer::DType::F32
                         || bias.bk.dtype() != crate::core::buffer::DType::F32
                         || bias.bv.dtype() != crate::core::buffer::DType::F32
-                    {
-                        return None;
-                    }
+                }) {
+                    return None;
                 }
             }
         }
