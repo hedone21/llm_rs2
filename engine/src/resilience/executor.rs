@@ -224,6 +224,14 @@ impl CommandExecutor {
         let _ = self.resp_tx.send(EngineMessage::QcfEstimate(qcf));
     }
 
+    /// Send weight swap completion report to Manager (MSG-089).
+    ///
+    /// Called by the generate.rs dispatch handler after a successful
+    /// `EngineCommand::SwapWeights` execution (ENG-ALG-214-ROUTE).
+    pub fn send_weight_swap_report(&self, report: llm_shared::WeightSwapReport) {
+        let _ = self.resp_tx.send(EngineMessage::WeightSwapReport(report));
+    }
+
     /// Notify executor that inference has started.
     pub fn set_running(&mut self) {
         self.engine_state = EngineState::Running;
@@ -1064,12 +1072,10 @@ mod tests {
         // Response와 Heartbeat가 순서대로 올 수 있음
         let mut found_heartbeat = false;
         for _ in 0..3 {
-            if let Ok(msg) = resp_rx.try_recv() {
-                if let EngineMessage::Heartbeat(status) = msg {
-                    assert!(status.active_actions.contains(&"throttle".to_string()));
-                    found_heartbeat = true;
-                    break;
-                }
+            if let Ok(EngineMessage::Heartbeat(status)) = resp_rx.try_recv() {
+                assert!(status.active_actions.contains(&"throttle".to_string()));
+                found_heartbeat = true;
+                break;
             }
         }
         assert!(
