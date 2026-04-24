@@ -731,6 +731,24 @@ impl GgufSource {
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
 
+        // RSS optimization: for embed/lm_head stored as F32 (llama.cpp's default
+        // for `token_embd.weight` on many Q4_0 builds), downcast to F16 at load
+        // time to halve the GPU upload. The Q4_K path above already handles the
+        // K-quant storage variant; this covers the F32 storage variant we see
+        // in the distributed `llama3.2-1b-q4_0.gguf`. Half rounding only, no
+        // block-layout change; downstream `gather` (get_rows.cl F16 variant) and
+        // `matmul_transposed` (matmul_f16) already support F16.
+        if info.ggml_type == GGML_TYPE_F32 && is_embed_or_lm_head(name) {
+            let cpu_tensor = self.load_f32_as_f16(name, data, num_elements, shape)?;
+            return if is_cpu {
+                Ok(cpu_tensor)
+            } else if is_weight {
+                backend.copy_weight_from(&cpu_tensor)
+            } else {
+                backend.copy_from(&cpu_tensor)
+            };
+        }
+
         // Llama Q/K weights must be inverse-permuted to undo llama.cpp's
         // convert_hf_to_gguf reshape — see `unpermute_qk_rows`. This path
         // allocates a fresh owned buffer; the zero-copy mmap fast path below
@@ -811,6 +829,11 @@ impl GgufSource {
 
         let dtype = ggml_type_to_dtype(info.ggml_type)?;
 
+        // See `load_raw` for the F32 → F16 embed/lm_head downcast rationale.
+        if info.ggml_type == GGML_TYPE_F32 && is_embed_or_lm_head(name) {
+            return self.load_f32_as_f16(name, data, num_elements, shape);
+        }
+
         // Llama Q/K weights must be inverse-permuted — see load_raw above.
         if let Some((n_head, head_dim)) = qk_permute_shape(name, &self.config) {
             let total_rows: usize = shape.dims()[0];
@@ -833,6 +856,69 @@ impl GgufSource {
         let buffer: Arc<dyn crate::core::buffer::Buffer> = Arc::new(unsafe {
             MmapBuffer::new(self.gguf.mmap.clone(), abs_offset, data.len(), dtype)
         });
+
+        Ok(Tensor::new(
+            shape,
+            buffer,
+            self.cpu_backend.clone() as Arc<dyn Backend>,
+        ))
+    }
+
+    /// Downcast an F32-stored embed/lm_head tensor to F16 at load time.
+    ///
+    /// Scope: this is NOT a general F32 → F16 path. It is gated by
+    /// `is_embed_or_lm_head(name)` in both `load_raw` and `load_raw_cpu`.
+    /// Other F32 tensors (norms, biases, any hidden-state activations that
+    /// would hypothetically be stored in F32) continue to use the zero-copy
+    /// `MmapBuffer` path unchanged.
+    ///
+    /// Rationale: on llama.cpp-generated `llama3.2-1b-q4_0.gguf`,
+    /// `token_embd.weight` is stored as F32 (2048 × 128256 ≈ 1.0 GiB). On an
+    /// ARM64 Android device the full F32 tensor is uploaded to GPU and the
+    /// mmap-backed host copy stays resident until eviction, which adds up to
+    /// a ~500 MiB RSS pressure point. Downcasting to F16 halves both the GPU
+    /// allocation and the owned host copy. Downstream `gather` (get_rows.cl
+    /// F16 variant) and `matmul_transposed` (mul_mv_f16) already support F16.
+    ///
+    /// Accuracy: single round-to-nearest-even half cast per element. The top-1
+    /// argmax on greedy decode matches F32 storage in our measurements; bit-
+    /// exactness is not expected because of the rounding.
+    fn load_f32_as_f16(
+        &self,
+        name: &str,
+        data: &[u8],
+        num_elements: usize,
+        shape: Shape,
+    ) -> Result<Tensor> {
+        use half::f16;
+
+        eprintln!(
+            "[GGUF] Downcasting {} tensor F32\u{2192}F16 at load time ({} elements)",
+            name, num_elements
+        );
+
+        ensure!(
+            data.len() == num_elements * 4,
+            "GGUF: F32 tensor '{}' has {} bytes but expected {} ({} elements × 4)",
+            name,
+            data.len(),
+            num_elements * 4,
+            num_elements
+        );
+
+        // F32 mmap bytes → F16 owned bytes. We do not require F32 alignment in
+        // the mmap (GGUF aligns tensor data to 32 B by default, but we stay
+        // defensive with `from_le_bytes`).
+        let mut bytes = Vec::<u8>::with_capacity(num_elements * 2);
+        for chunk in data.chunks_exact(4) {
+            let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            let h = f16::from_f32(v);
+            bytes.extend_from_slice(&h.to_bits().to_le_bytes());
+        }
+        debug_assert_eq!(bytes.len(), num_elements * 2);
+
+        let buffer: Arc<dyn crate::core::buffer::Buffer> =
+            Arc::new(SharedBuffer::from_vec(bytes, DType::F16));
 
         Ok(Tensor::new(
             shape,
@@ -1239,7 +1325,7 @@ mod tests {
             }
 
             // Tensor data (with alignment padding between tensors)
-            for (i, t) in self.tensors.iter().enumerate() {
+            for (i, _t) in self.tensors.iter().enumerate() {
                 // Pad to reach the expected offset
                 let expected_pos = tensor_offsets[i] as usize;
                 let current_data_pos = buf.len()
@@ -1808,5 +1894,128 @@ mod tests {
         assert!(!needs_dequant_fallback(GGML_TYPE_Q4_1));
         assert!(!needs_dequant_fallback(GGML_TYPE_Q8_0));
         assert!(needs_dequant_fallback(GGML_TYPE_Q4_K));
+    }
+
+    /// F32-stored `token_embd.weight` must be downcast to F16 at load time.
+    /// This is the actual storage format of llama.cpp-generated
+    /// `llama3.2-1b-q4_0.gguf` (confirmed via `gguf-dump`), so the Q4_K
+    /// dequant path alone does not achieve the RSS savings from commit
+    /// 11af06d. Regression guard for the F32 → F16 downcast added
+    /// 2026-04-24.
+    #[test]
+    fn test_gguf_f32_embed_downcasts_to_f16() {
+        use half::f16;
+
+        // 256 F32 values = 1024 bytes. Use a mix including non-integer
+        // reals to exercise the half rounding path, plus values that
+        // survive half rounding exactly.
+        let mut f32_bytes = Vec::<u8>::with_capacity(256 * 4);
+        for i in 0..256 {
+            // Deterministic pattern: 0.0, 0.5, 1.0, 1.5, ...
+            let v: f32 = (i as f32) * 0.5;
+            f32_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+
+        let mut builder = GgufTestBuilder::new();
+        builder
+            .add_metadata_str("general.architecture", "llama")
+            .add_metadata_u32("llama.embedding_length", 256)
+            .add_metadata_u32("llama.block_count", 1)
+            .add_metadata_u32("llama.attention.head_count", 4)
+            .add_metadata_u32("llama.attention.head_count_kv", 2)
+            .add_metadata_u32("llama.feed_forward_length", 512)
+            .add_metadata_u32("llama.vocab_size", 256)
+            .add_metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .add_metadata_f32("llama.rope.freq_base", 10000.0)
+            .add_metadata_u32("llama.context_length", 2048)
+            .add_tensor("token_embd.weight", &[256], GGML_TYPE_F32, &f32_bytes);
+        let bytes = builder.build();
+        let gguf = parse_from_bytes(&bytes).expect("parse");
+
+        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let source = GgufSource {
+            gguf,
+            config,
+            weight_dtype: DType::Q4_0,
+            cpu_backend: Arc::new(CpuBackend::new()),
+        };
+
+        let tensor = source
+            .load_raw_cpu("token_embd.weight", false)
+            .expect("F32 embed should load via F32 → F16 downcast path");
+
+        assert_eq!(
+            tensor.buffer().dtype(),
+            DType::F16,
+            "F32-stored embed must be downcast to F16 at load time"
+        );
+        assert_eq!(tensor.shape().numel(), 256);
+
+        // Byte size must be 512 (256 × 2), NOT 1024 (256 × 4). This is the
+        // RSS optimization the feature is named after.
+        assert_eq!(tensor.buffer().size(), 256 * 2);
+
+        // Spot-check values. 0.0, 0.5, 1.0, 1.5, ... are all exact in F16.
+        let ptr = tensor.buffer().as_ptr() as *const u16;
+        for i in 0..256 {
+            let expected = (i as f32) * 0.5;
+            let bits = unsafe { *ptr.add(i) };
+            let got = f16::from_bits(bits).to_f32();
+            assert_eq!(
+                got, expected,
+                "element {} mismatch: got {}, expected {}",
+                i, got, expected
+            );
+        }
+    }
+
+    /// F32-stored non-embed tensors must continue to use the zero-copy
+    /// `MmapBuffer` F32 path. The F16 downcast is strictly scoped to
+    /// embed/lm_head because it is the only place where (a) the tensor is
+    /// large enough to matter for RSS and (b) the downstream consumers
+    /// (`gather`, final matmul) have validated F16 kernels.
+    #[test]
+    fn test_gguf_f32_non_embed_stays_f32() {
+        let mut f32_bytes = Vec::<u8>::with_capacity(16 * 4);
+        for i in 0..16 {
+            f32_bytes.extend_from_slice(&(i as f32).to_le_bytes());
+        }
+
+        let mut builder = GgufTestBuilder::new();
+        builder
+            .add_metadata_str("general.architecture", "llama")
+            .add_metadata_u32("llama.embedding_length", 16)
+            .add_metadata_u32("llama.block_count", 1)
+            .add_metadata_u32("llama.attention.head_count", 4)
+            .add_metadata_u32("llama.attention.head_count_kv", 2)
+            .add_metadata_u32("llama.feed_forward_length", 32)
+            .add_metadata_u32("llama.vocab_size", 16)
+            .add_metadata_f32("llama.attention.layer_norm_rms_epsilon", 1e-5)
+            .add_metadata_f32("llama.rope.freq_base", 10000.0)
+            .add_metadata_u32("llama.context_length", 2048)
+            // Realistic F32 non-embed: a norm weight.
+            .add_tensor("blk.0.attn_norm.weight", &[16], GGML_TYPE_F32, &f32_bytes);
+        let bytes = builder.build();
+        let gguf = parse_from_bytes(&bytes).expect("parse");
+
+        let config = ModelConfig::from_gguf_metadata(&gguf).unwrap();
+        let source = GgufSource {
+            gguf,
+            config,
+            weight_dtype: DType::Q4_0,
+            cpu_backend: Arc::new(CpuBackend::new()),
+        };
+
+        let tensor = source
+            .load_raw_cpu("blk.0.attn_norm.weight", false)
+            .expect("F32 norm should load via zero-copy MmapBuffer path");
+
+        assert_eq!(
+            tensor.buffer().dtype(),
+            DType::F32,
+            "non-embed F32 tensors must stay F32 (no unscoped downcast)"
+        );
+        assert_eq!(tensor.shape().numel(), 16);
+        assert_eq!(tensor.buffer().size(), 16 * 4);
     }
 }
