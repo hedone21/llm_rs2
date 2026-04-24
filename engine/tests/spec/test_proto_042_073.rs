@@ -12,9 +12,6 @@ use llm_shared::{CommandResult, EngineCommand, EngineDirective, EngineMessage, M
 use std::sync::mpsc;
 use std::time::Duration;
 
-#[allow(dead_code)]
-#[path = "helpers.rs"]
-mod helpers;
 
 /// PROTO-042: MockTransport 기반 연결 상태 전이 시뮬레이션
 ///

@@ -324,7 +324,6 @@ mod tests {
 
     #[test]
     fn test_load_json() {
-        use std::io::Write;
         let dir = std::env::temp_dir().join("proxy_test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("calibration.json");

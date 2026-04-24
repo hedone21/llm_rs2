@@ -489,7 +489,6 @@ mod tests {
     use crate::buffer::shared_buffer::SharedBuffer;
     use crate::core::buffer::{Buffer, DType};
     use crate::core::kv_cache::KVLayout;
-    use crate::core::qcf::AggregationMode;
     use crate::core::shape::Shape;
     use crate::core::tensor::Tensor;
     use std::sync::Arc;

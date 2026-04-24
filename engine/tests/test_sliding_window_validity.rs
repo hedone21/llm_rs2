@@ -42,6 +42,7 @@ fn test_sliding_window_validity() {
     let mut start_pos: usize = 0; // Logical position (RoPE index)
     let total_steps = 150;
 
+    #[allow(clippy::explicit_counter_loop)]
     for _ in 0..total_steps {
         // Mock Forward:
         // In real generate.rs: model.forward calls rope(start_pos) then cache.update()

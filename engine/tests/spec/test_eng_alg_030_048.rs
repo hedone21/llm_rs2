@@ -250,8 +250,8 @@ fn test_eng_alg_045_nmse_block_q8() {
     use llm_rs2::core::quant::QKKV;
 
     let mut original = [0.0f32; QKKV];
-    for i in 0..QKKV {
-        original[i] = (i as f32) / QKKV as f32;
+    for (i, slot) in original.iter_mut().enumerate().take(QKKV) {
+        *slot = (i as f32) / QKKV as f32;
     }
 
     let nmse = compute_nmse_block(&original, 8, 1e-8);
@@ -264,8 +264,8 @@ fn test_eng_alg_045_nmse_block_q2() {
     use llm_rs2::core::quant::QKKV;
 
     let mut original = [0.0f32; QKKV];
-    for i in 0..QKKV {
-        original[i] = (i as f32) / QKKV as f32;
+    for (i, slot) in original.iter_mut().enumerate().take(QKKV) {
+        *slot = (i as f32) / QKKV as f32;
     }
 
     let nmse_q2 = compute_nmse_block(&original, 2, 1e-8);

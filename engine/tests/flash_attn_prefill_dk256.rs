@@ -96,6 +96,7 @@ fn make_inputs(
     (q, k, v)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_gpu_prefill(
     ocl_arc: &Arc<dyn Backend>,
     memory: &dyn Memory,
@@ -171,6 +172,7 @@ fn run_gpu_prefill(
     Some(out_vec)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cpu_reference(
     q: &[f32],
     k: &[f32],

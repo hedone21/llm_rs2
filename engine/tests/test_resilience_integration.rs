@@ -257,14 +257,9 @@ fn test_unix_socket_e2e() {
         if transport.connect().is_err() {
             return;
         }
-        loop {
-            match transport.recv() {
-                Ok(msg) => {
-                    if cmd_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok(msg) = transport.recv() {
+            if cmd_tx.send(msg).is_err() {
+                break;
             }
         }
     });
