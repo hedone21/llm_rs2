@@ -1703,6 +1703,33 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
                 cpu_chunk_size,
             }
         }
+        "swap_weights" => {
+            let ratio: f32 = entry.get("ratio")?;
+            // ratio must be in [0.0, 0.9]; clamp and warn on over-limit (ENG-ALG-214-ROUTE)
+            let ratio = if ratio > 0.9 {
+                log::warn!(
+                    "[LuaPolicy] swap_weights ratio {:.4} exceeds 0.9 limit — clamped to 0.9",
+                    ratio
+                );
+                0.9f32
+            } else {
+                ratio
+            };
+            let dtype_str: String = entry.get("dtype")?;
+            let target_dtype = match dtype_str.as_str() {
+                "q4_0" => llm_shared::DtypeTag::Q4_0,
+                other => {
+                    return Err(mlua::Error::external(format!(
+                        "swap_weights: unsupported dtype '{}', only 'q4_0' is valid",
+                        other
+                    )));
+                }
+            };
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            }
+        }
         unknown => {
             return Err(mlua::Error::external(format!(
                 "unknown action type: '{}'",
@@ -3411,6 +3438,97 @@ mod tests {
         assert!(
             policy.qcf_pending_at.is_none(),
             "1초 경과 후 pending_at이 소거되어야 한다"
+        );
+    }
+
+    // ── SwapWeights Lua binding tests (WSWAP-3-LUA) ──────────────────────────
+
+    /// Lua policy that emits swap_weights on Emergency memory pressure.
+    #[test]
+    fn test_lua_policy_emits_swap_weights_on_emergency() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "swap_weights",
+                    ratio = 0.50,
+                    dtype = "q4_0",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                assert!(
+                    (*ratio - 0.50).abs() < 1e-6,
+                    "ratio should be 0.50, got {ratio}"
+                );
+                assert_eq!(*target_dtype, llm_shared::DtypeTag::Q4_0);
+            }
+            other => panic!("Expected SwapWeights, got {other:?}"),
+        }
+    }
+
+    /// ratio > 0.9 is clamped to 0.9 (ENG-ALG-214-ROUTE upper limit).
+    #[test]
+    fn test_lua_policy_clamps_ratio_above_limit() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "swap_weights",
+                    ratio = 0.95,
+                    dtype = "q4_0",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SwapWeights { ratio, .. } => {
+                assert!(
+                    (*ratio - 0.9).abs() < 1e-6,
+                    "ratio should be clamped to 0.9, got {ratio}"
+                );
+            }
+            other => panic!("Expected SwapWeights, got {other:?}"),
+        }
+    }
+
+    /// Invalid dtype string must cause the action to be skipped (error, not panic).
+    #[test]
+    fn test_lua_policy_rejects_invalid_dtype_string() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "swap_weights",
+                    ratio = 0.50,
+                    dtype = "f32",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        // parse_single_action returns Err for unsupported dtype → action skipped, no panic
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert!(
+            cmds.is_empty(),
+            "invalid dtype must produce no commands (got {cmds:?})"
         );
     }
 
