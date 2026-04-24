@@ -19,6 +19,7 @@
 //! 실행되어 K/V가 cold-cache 상태로 밀려나는 효과를 흉내냄.
 //!   - Repeat28Pollute8  : 각 Q1 전 8MB streaming (LLC 일부 eviction)
 //!   - Repeat28Pollute32 : 각 Q1 전 32MB streaming (LLC 완전 eviction)
+//!
 //! production과 microbench 사이 Q1 slope 갭(microbench TIE, production 5.70 vs 7.32 μs/n_kv)이
 //! 주변 op의 캐시 thrashing으로 설명되는지 검증.
 //!
@@ -35,8 +36,9 @@
 //!   - Repeat28WithQKVRopeKv   : + kv_scatter
 //!   - Repeat28WithAttnFFN     : Q1 뒤 WO + rms_norm + gate/up + silu_mul + down
 //!   - Repeat28FullLayer       : 전체 layer chain (production 가장 유사)
-//!   140 Q4_0 weight buffers (28 layer × 5 matmul) 가 점유된 상태에서 측정하여
-//!   weight working-set 영향까지 재현.
+//!
+//! 140 Q4_0 weight buffers (28 layer × 5 matmul) 가 점유된 상태에서 측정하여
+//! weight working-set 영향까지 재현.
 //!
 //! 모든 variant × 2 layout × 4 n_kv → 12 조합 × MEASURE_ITERS = 30 measurements.
 
@@ -51,6 +53,9 @@ mod bench {
     use ocl::core::{ArgVal, Event, Mem, ProfilingInfo};
     use ocl::flags;
     use ocl::{Context, Device, Platform, Program, Queue};
+
+    /// (engine, layout, variant) → [(n_kv, median_us)]
+    type MeasureResults = Vec<(String, String, String, Vec<(i32, f64)>)>;
 
     // === 모델 파라미터 (Qwen 2.5-1.5B) ===
     pub const N_H_Q: usize = 12;
@@ -1130,6 +1135,7 @@ __kernel void pollute_stride(
         } else {
             None
         };
+        #[allow(clippy::needless_range_loop)]
         for i in 0..variant.num_dispatches {
             if variant.pollute_mb > 0 {
                 if variant.pollute_stride {
@@ -1284,12 +1290,12 @@ __kernel void pollute_stride(
     pub fn measure_matrix(
         state: &State,
         layouts: &[(&'static str, (u64, u64, u64))],
-    ) -> anyhow::Result<Vec<(String, String, String, Vec<(i32, f64)>)>> {
+    ) -> anyhow::Result<MeasureResults> {
         // header
         println!();
         println!("engine,layout,variant,n_kv,median_us,mean_us,min_us,max_us,iters");
 
-        let mut all_results: Vec<(String, String, String, Vec<(i32, f64)>)> = Vec::new();
+        let mut all_results: MeasureResults = Vec::new();
 
         // engine 외부 루프: 같은 KV 데이터/같은 dispatch params로 두 kernel 직접 비교
         for (engine_name, kernel) in &state.kernels {
@@ -1361,7 +1367,7 @@ __kernel void pollute_stride(
         Ok(all_results)
     }
 
-    pub fn print_slope_table(results: &[(String, String, String, Vec<(i32, f64)>)]) {
+    pub fn print_slope_table(results: &MeasureResults) {
         println!();
         println!("# Slope (μs / n_kv) per (engine, layout, variant) — least squares");
         println!("# engine,layout,variant,slope_us_per_n_kv,intercept_us");
@@ -1385,7 +1391,7 @@ __kernel void pollute_stride(
         (slope, intercept)
     }
 
-    pub fn print_cross_run_summary(results: &[(String, String, String, Vec<(i32, f64)>)]) {
+    pub fn print_cross_run_summary(results: &MeasureResults) {
         // (engine, variant) → slope (HeadMajor 만)
         let mut by_var: std::collections::BTreeMap<String, Vec<(String, f64)>> =
             std::collections::BTreeMap::new();

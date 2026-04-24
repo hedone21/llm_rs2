@@ -60,7 +60,7 @@ pub fn maybe_yield_after_layer(backend: &dyn Backend, layer_idx: usize, is_decod
     if every == 0 {
         return;
     }
-    if (layer_idx + 1) % every != 0 {
+    if !(layer_idx + 1).is_multiple_of(every) {
         return;
     }
     // flush + wait: kernels already dispatched must drain before the sleep

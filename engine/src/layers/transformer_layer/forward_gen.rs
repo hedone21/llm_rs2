@@ -1139,7 +1139,7 @@ impl TransformerLayer {
                     .unwrap_or(1)
             });
             let layer_count = SYNC_LAYER_COUNT.fetch_add(1, Ordering::Relaxed);
-            let skip_sync = sync_n > 1 && (layer_count % sync_n) != 0;
+            let skip_sync = sync_n > 1 && !layer_count.is_multiple_of(sync_n);
 
             let zcopy_residual = !ws.residual.as_ptr().is_null();
             // A1 async-read path: non-blocking enqueue of the residual DMA

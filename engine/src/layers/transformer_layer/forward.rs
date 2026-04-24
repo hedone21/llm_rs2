@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 /// Per-run deduplication set for GPU→CPU attention fallback warnings.
 /// Same (dtype, head_dim, reason) tuple is logged to stderr only once per process.
+#[allow(clippy::type_complexity)]
 static FALLBACK_WARNED: Mutex<Option<HashSet<(String, usize, &'static str)>>> = Mutex::new(None);
 
 /// Emit a one-time stderr warning for a GPU prefill → CPU attention fallback.

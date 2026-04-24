@@ -64,7 +64,7 @@ fn try_apply_queue_priority(
             ));
         }
     };
-    let flags_bits: u64 = queue_flags.map(|f| f.bits() as u64).unwrap_or(0);
+    let flags_bits: u64 = queue_flags.map(|f| f.bits()).unwrap_or(0);
     // Property list is zero-terminated: [name, value, name, value, …, 0].
     let mut props: Vec<u64> = Vec::with_capacity(5);
     if flags_bits != 0 {
@@ -75,8 +75,8 @@ fn try_apply_queue_priority(
     props.push(priority_val);
     props.push(0);
 
-    let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&context) as *mut std::ffi::c_void;
-    let dev_ptr = <Device as ClDeviceIdPtr>::as_ptr(&device) as *mut std::ffi::c_void;
+    let ctx_ptr = <&Context as ClContextPtr>::as_ptr(&context);
+    let dev_ptr = <Device as ClDeviceIdPtr>::as_ptr(&device);
     let mut err: i32 = 0;
     let raw =
         unsafe { clCreateCommandQueueWithProperties(ctx_ptr, dev_ptr, props.as_ptr(), &mut err) };

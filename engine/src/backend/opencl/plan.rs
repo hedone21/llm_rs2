@@ -2683,7 +2683,7 @@ pub fn build_layer_plan(config: &LayerPlanConfig) -> Result<LayerKernelPlan> {
     // -----------------------------------------------------------------------
     {
         // float4 path for dim divisible by 4 (all decoder arches).
-        let kernel_name = if dim % 4 == 0 {
+        let kernel_name = if dim.is_multiple_of(4) {
             "kernel_rms_norm_oop_f4"
         } else {
             "kernel_rms_norm_oop"
@@ -4105,7 +4105,7 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
 
     // Final RMSNorm (in-place on x)
     let final_norm = {
-        let kernel_name = if config.dim % 4 == 0 {
+        let kernel_name = if config.dim.is_multiple_of(4) {
             "kernel_rms_norm_opt_f4"
         } else {
             "kernel_rms_norm_opt"

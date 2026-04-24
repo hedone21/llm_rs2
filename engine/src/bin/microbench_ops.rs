@@ -750,6 +750,7 @@ mod bench {
     /// Kernel signature (decode, N=1 padded to 4):
     ///   args: (q, d, src1_image RGBA16F, dst f32, m=N, n=4, k=K, n_no_padding=1)
     ///   gws=[n_4, m_4, 1] = [1, N/4, 1],  lws=[1, 128, 1]  (subgroup 128)
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_llama_ab_bi(
         state: &State,
         kernel: &ocl::core::Kernel,
