@@ -21,6 +21,7 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use anyhow::Result;
+use llm_shared::DtypeTag;
 
 use crate::buffer::shared_buffer::SharedBuffer;
 use crate::core::backend::Backend;
@@ -47,6 +48,10 @@ pub enum SwapError {
         primary: Vec<usize>,
         secondary: Vec<u64>,
     },
+    /// Wire-protocol `DtypeTag` that has no engine-internal `DType` mapping
+    /// (reserved variants — INV-126). The variant name is included for
+    /// diagnostics.
+    UnsupportedDtype(DtypeTag),
 }
 
 impl std::fmt::Display for SwapError {
@@ -69,11 +74,30 @@ impl std::fmt::Display for SwapError {
                 "swap layer {layer} tensor '{subname}': \
                  shape mismatch (primary={primary:?}, secondary={secondary:?})"
             ),
+            SwapError::UnsupportedDtype(tag) => {
+                write!(
+                    f,
+                    "unsupported target dtype: {tag:?} (INV-126 reserved variant)"
+                )
+            }
         }
     }
 }
 
 impl std::error::Error for SwapError {}
+
+/// Map a wire-protocol [`DtypeTag`] to the engine-internal [`DType`] used by
+/// `SwapExecutor`. Returns `Err(SwapError::UnsupportedDtype)` for reserved
+/// variants that are not yet executable (INV-126).
+///
+/// Only `DtypeTag::Q4_0` is currently mapped; all other variants are reserved
+/// for forward-compat and will be rejected until engine support lands.
+pub fn dtype_tag_to_dtype(tag: DtypeTag) -> Result<DType, SwapError> {
+    match tag {
+        DtypeTag::Q4_0 => Ok(DType::Q4_0),
+        other => Err(SwapError::UnsupportedDtype(other)),
+    }
+}
 
 /// Outcome of a single layer swap inside one batch.
 #[derive(Debug, Clone)]
@@ -503,5 +527,53 @@ mod tests {
         assert_eq!(SwapExecutor::uniform_target_layers(0.5, 16).len(), 8);
         // Degenerate size.
         assert!(SwapExecutor::uniform_target_layers(0.5, 0).is_empty());
+    }
+
+    // INV-126: dtype_tag_to_dtype must accept Q4_0 and reject all reserved variants.
+
+    #[test]
+    fn dtype_tag_q4_0_maps_to_dtype_q4_0() {
+        let result = dtype_tag_to_dtype(DtypeTag::Q4_0);
+        assert!(
+            matches!(result, Ok(DType::Q4_0)),
+            "Q4_0 should be executable"
+        );
+    }
+
+    #[test]
+    fn dtype_tag_f16_is_unsupported() {
+        let result = dtype_tag_to_dtype(DtypeTag::F16);
+        assert!(
+            matches!(result, Err(SwapError::UnsupportedDtype(DtypeTag::F16))),
+            "F16 is reserved, must return UnsupportedDtype"
+        );
+    }
+
+    #[test]
+    fn dtype_tag_f32_is_unsupported() {
+        let result = dtype_tag_to_dtype(DtypeTag::F32);
+        assert!(
+            matches!(result, Err(SwapError::UnsupportedDtype(DtypeTag::F32))),
+            "F32 is reserved, must return UnsupportedDtype"
+        );
+    }
+
+    #[test]
+    fn dtype_tag_q8_0_is_unsupported() {
+        let result = dtype_tag_to_dtype(DtypeTag::Q8_0);
+        assert!(
+            matches!(result, Err(SwapError::UnsupportedDtype(DtypeTag::Q8_0))),
+            "Q8_0 is reserved, must return UnsupportedDtype"
+        );
+    }
+
+    #[test]
+    fn unsupported_dtype_error_display_contains_inv_126() {
+        let err = dtype_tag_to_dtype(DtypeTag::F16).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("INV-126"),
+            "Error message should reference INV-126, got: {msg}"
+        );
     }
 }

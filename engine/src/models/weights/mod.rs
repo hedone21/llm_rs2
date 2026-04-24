@@ -16,4 +16,4 @@ pub use secondary_mmap::{
     LayerTensorSlice, LoadError, SecondaryMmap, SecondaryTensorInfo, open_secondary,
 };
 pub use slot::{LayerSlot, LayerWeights};
-pub use swap_executor::{SwapError, SwapExecutor, SwapReport, SwappedLayer};
+pub use swap_executor::{SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype};
