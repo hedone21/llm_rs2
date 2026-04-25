@@ -1300,15 +1300,40 @@ function forward_token(model: &TransformerModel, token):
 
 #### 3.12.6 Mixed Precision Forward 정확성 [INV-122]
 
-**[INV-122]** 동적 swap으로 일부 decoder layer가 secondary dtype으로 교체된 이후의 forward 결과는 primary single-precision baseline 대비 다음 허용 오차 안에 있어야 한다. *(MUST)*
+**[INV-122]** 동적 swap으로 일부 decoder layer가 secondary dtype으로 교체된 이후의 forward 결과는, **primary single-precision baseline이 아닌, 같은 모델을 secondary dtype 단독으로 로드한 baseline(single-dtype baseline)** 대비 다음 두 조건을 모두 충족해야 한다. *(MUST)*
 
-**수치 기준** (권장 초기값, 실측 후 조정 여지):
+> **본 invariant의 본질 (Phase 4 측정 기반 재정의, 2026-04-25)**:
+> "swap 구현이 *추가* 정확성 손실을 만들지 않는다"가 INV-122의 진짜 책임이다.
+> 양자화 자체로 인한 노이즈는 dtype/모델 본질이며 swap 구현의 책임 범위 밖이다.
+> 따라서 임계값은 절대 수치(top-1 ≥ 0.95)가 아니라 **swap_mixed 결과와 single-dtype baseline 결과 사이의 차이(Δ)**로 정의된다.
 
-| 메트릭 | 허용 임계 | 측정 방법 |
-|--------|----------|----------|
-| **Logit NMSE** (last token) | ≤ 0.01 | `||logits_swapped − logits_primary||² / ||logits_primary||²`. Calibration prompt 평균. |
-| **Top-5 Overlap** | ≥ 0.9 | 마지막 토큰 top-5 ID overlap. |
-| **Top-1 Match Ratio** | ≥ 0.95 | Greedy 기준 32토큰 중 top-1 일치 비율. |
+**수치 기준 (v2, 실측 기반)**:
+
+| 메트릭 | 허용 임계 | 측정 방법 | 책임 |
+|--------|----------|----------|------|
+| **Logit NMSE** (top-K proxy) | ≤ 0.01 (절대값) | `||logits_swapped − logits_primary||² / ||logits_primary||²`, primary single-precision logits 기준. top-K 공통 token id 안에서 계산하므로 lower bound. | Logit value 보존. swap이 logit value scale을 망가뜨리지 않음을 보장. |
+| **Δ Top-1 Match (swap_mixed vs single-dtype baseline)** | ≤ 1.0 percentage points (= 0.01) | `mean_top1(ratio=R, mixed_swap) - mean_top1(secondary_dtype_only_baseline)` 절대값. 100+ prompt × ratio={0.25, 0.5, 0.75, 1.0} 평균. | swap 구현이 양자화 본질 노이즈 외 추가 ranking 변동을 발생시키지 않음. |
+
+> **NMSE 절대값을 유지하는 이유**: `top-K proxy` 측정에서도 lower bound가 ≤ 0.01이라는 사실은 logit value가 충분히 보존되어 있다는 약한 형태의 정확성 보증을 제공한다. 추후 vocab 전체 NMSE를 dump하는 옵션이 추가되면 동일 임계값을 더 강한 형태로 재적용한다.
+
+**Δ Top-1 Match 임계값(1.0 pp)의 근거** (Phase 4 측정, `results/data/weight_swap/phase_4_accuracy.md`):
+
+| ratio | top-1 (mixed swap) | top-1 (Q4_0 baseline) | Δ |
+|-------|--------------------|------------------------|---|
+| 1.00 (Llama 3.2 1B Q4_0 fully swap) | 0.6600 | 0.6567 | **+0.33 pp** |
+
+100 prompt 중 79개에서 token sequence 완전 일치. Imperfect prompt set 90% 이상이 동일 prompt(43/48 intersection). 양자화 본질 노이즈 영역(< 1%)에 명확히 위치. 임계값 1.0 pp는 측정 노이즈(≈0.5 pp 추정) 위에서 명백한 회귀를 검출 가능한 가장 빡빡한 값이다.
+
+**ratio별 검증 매트릭스** (Phase 4 실측 기반 단조 패턴):
+
+| ratio | 검증 baseline | 기대 동작 |
+|-------|--------------|----------|
+| 0.25 | F16 single-precision | swap 적은 layer만 secondary dtype → top-1 거의 F16과 일치 (실측 0.887). NMSE ≤ 0.01 충족. |
+| 0.50 | F16 single-precision | top-1 점진 하락 (실측 0.793). NMSE ≤ 0.01 충족. |
+| 0.75 | F16 single-precision | top-1 점진 하락 (실측 0.737). NMSE ≤ 0.01 충족. |
+| 1.00 | **secondary dtype 단독 (Q4_0 baseline)** | **Δ ≤ 1.0 pp** 강제. mixed=0.660, baseline=0.6567 → Δ=+0.33 pp PASS. |
+
+ratio=1.0은 모든 swap 대상 layer가 secondary dtype으로 교체되었으므로 single-dtype baseline과 비트 단위 동일에 가까워야 한다 (잔여 차이 = 보호 layer + embedding/lm_head/final_norm은 primary 유지에서 발생). Δ ≤ 1.0 pp는 이 잔여를 흡수하는 tolerance.
 
 **검증 대상 구성**:
 
@@ -1316,18 +1341,39 @@ function forward_token(model: &TransformerModel, token):
 |------|-------|--------------|
 | Llama 3.2 1B (16 layers) | 0.25 | 4 |
 | Llama 3.2 1B | 0.50 | 8 |
-| Llama 3.2 1B | 1.00 | 16 |
+| Llama 3.2 1B | 0.75 | 12 |
+| Llama 3.2 1B | 1.00 | 16 (Q4_0 baseline 비교 필수) |
 | Qwen 2.5 1.5B (28 layers) | 0.25 | 7 |
 | Qwen 2.5 1.5B | 0.50 | 14 |
-| Qwen 2.5 1.5B | 1.00 | 28 |
+| Qwen 2.5 1.5B | 1.00 | 28 (Q4_0 baseline 비교 필수) |
 
-**Calibration Prompt Set**: 최소 8 prompt, 각 ≥ 128 tokens prefill. `experiments/prompts/` 기존 자산 재활용.
+**Calibration Prompt Set**: 최소 100 prompt × 다양한 카테고리 (QA, NIAH filler, perplexity, synthetic fact-completion, short/medium 길이). 단일 source로 편중되지 않게 구성. `experiments/prompts/` + `benchmark_prompts.json` 기반.
+
+**Bimodal 분포 정성 정보 (rationale, 평가 set 설계 가이드)**:
+
+Phase 4 측정에서 per-prompt top-1 match는 **bimodal 분포**(perfect=1.0 또는 zero=0.0이 다수, partial은 소수)를 보였다. 이는 양자화 본질 특성으로, ranking이 흔들리는 prompt와 안 흔들리는 prompt가 명확히 구분된다.
+
+| Source | n | swap robustness | 설계 시사점 |
+|--------|---|-----------------|------------|
+| QA (Question→Answer 구조) | 10 | **Robust**. ratio=0.25에서 perfect (10/10). 강한 답변 신호가 양자화 노이즈를 흡수. | 정확성 회귀 검출에 둔감. 평가 set의 robustness 측정용. |
+| Synthetic fact-completion | 75 | 평균. ratio=1.0에서 0.66. | 평가 set의 mass term. |
+| NIAH filler / Short / Medium | 10 | **민감**. 짧고 ambiguous한 prompt → 양자화 노이즈가 ranking 변화로 이어짐. | 회귀 검출 sensitivity 측정용. |
+
+평가 set 구성 시 sensitive 카테고리(NIAH/Short)와 robust 카테고리(QA)를 모두 포함해야 한다. QA만 포함하면 swap 구현 회귀 감지력이 떨어지고, NIAH만 포함하면 정상 양자화 노이즈를 회귀로 오판할 수 있다.
 
 **실패 시 대응**:
-- ratio 0.25에서 임계 초과 → ImportanceCollector 기준을 재검토 (다른 metric 시도).
-- ratio 1.00 전체 swap에서도 임계 유지 실패 → secondary dtype 정밀도 상향 (e.g. Q8_0).
+- ratio 0.25에서 NMSE > 0.01 → swap 구현 버그 가능성. logit value 자체가 망가졌다는 신호. `SwapExecutor` 권한/permutation 점검.
+- ratio 1.00에서 Δ Top-1 > 1 pp → swap 구현 부수효과 (e.g. SOA 재변환 정확성 손실, KV cache 오염). 양자화 노이즈가 아닌 실제 회귀이므로 즉시 디버그.
+- 절대값 top-1이 낮은 것 자체는 INV-122 위반 아님 (양자화 한계).
 
-**검증 방법**: test. `tests/spec/test_inv_122_mixed_precision.rs` (이전 ID 유지, 내용 재작성).
+**비-목표 (out of scope)**:
+- 절대 정확성 임계값(top-1 ≥ 0.95 등)은 Q4_0 + 1B 모델에서 물리적으로 도달 불가하며 본 invariant의 책임 범위 밖이다 (`results/data/weight_swap/phase_4_accuracy.md` Q4_0 baseline 0.6567 참조). 정확성 회복은 더 정밀한 양자화(Q5/Q8)나 큰 모델로 해결하는 별도 문제이다.
+
+**개정 이력**:
+- v1 (2026-04-24): 초기 권장값 — Logit NMSE ≤ 0.01, Top-5 Overlap ≥ 0.9, Top-1 Match ≥ 0.95.
+- **v2 (2026-04-25)**: Phase 4 측정 기반 재정의. Q4_0 단독 baseline = top-1 0.6567로 측정되어 v1 임계값이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인됨. 책임 분리: NMSE는 절대값 유지, ranking은 single-dtype baseline 대비 Δ로 변경. **이전 임계값 / 변경 사유 / 측정 근거는 본 절의 표 + Bimodal 분석 절 참조.**
+
+**검증 방법**: test. `tests/spec/test_inv_122_mixed_precision.rs` (이전 ID 유지, 내용 재작성). 테스트는 (a) NMSE 절대값 ≤ 0.01, (b) Δ Top-1 ≤ 1 pp at ratio=1.0 두 조건을 강제한다. ratio<1.0의 절대 top-1 값은 informational logging으로만 기록한다.
 
 #### 3.12.7 Forward 재진입 보호 [INV-121]
 

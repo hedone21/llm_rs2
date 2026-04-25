@@ -239,11 +239,12 @@
 - **INV-120** (Plan × Partition stale): `TransformerModel::ratio_generation`은 INV-120의 감지 키와 동일 소스이다. `SwapExecutor`가 batch 완료 후 정확히 1회 bump하여 plan invalidation을 일으킨다 (ENG-ALG-211 step (e)).
 - **INV-121 ↔ INV-123**: 토큰 경계 기반 per-token snapshot(INV-121)과 `ArcSwap::store` 단일 원자 단계(INV-123)는 **쌍으로** forward 비차단성을 보장한다. 한쪽만 성립해도 안전 보장 불충분.
 - **INV-122 ↔ INV-121**: dtype 혼합은 정상 상태이므로 INV-122의 수치 임계값은 "혼합 상태 자체"가 아닌 "혼합된 forward 결과의 근접성"에 적용된다.
+- **INV-122 v2 임계값 책임 분리** (Phase 4 실측 기반, 2026-04-25): NMSE는 절대값(≤ 0.01)으로 swap이 logit value scale을 손상시키지 않음을 검증. Top-1 ranking은 secondary dtype 단독 baseline 대비 Δ ≤ 1.0 pp로 swap 구현이 양자화 본질 노이즈 외 추가 회귀를 만들지 않음을 검증. 절대 top-1 값(예: ≥ 0.95)은 dtype/모델 본질이며 swap의 책임 범위 밖이다. 측정 방법론은 `arch/weight_swap.md` §5.1 참조.
 
 | ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
 |----|------|----------|---------|------|------|
 | INV-121 | 32-engine-algorithms 3.12.7, ENG-ALG-214-SNAP | Forward 재진입 금지: 토큰 진입 시 per-layer `Arc<LayerWeights>` snapshot을 한 번 획득하고 토큰 내내 재사용. mid-token swap은 현재 토큰에 관찰 불가 (다음 토큰 경계부터 관측). stale/half-swapped 상태 관찰 0건. | Correctness | test | INV-120과 동일 메커니즘 (ratio_generation은 플랜 경로), per-token snapshot은 forward 경로 |
-| INV-122 | 32-engine-algorithms 3.12.6 | Dynamic swap 후 forward 결과는 primary baseline 대비 logit NMSE ≤ 0.01, top-5 overlap ≥ 0.9, top-1 match ratio ≥ 0.95를 충족한다. **layer 간 dtype 불균일(혼합 상태)은 본 설계의 정상 상태이며 불변식 위반이 아니다** — ratio 기반 swap의 본질이다. | Correctness | test | Llama/Qwen 양쪽, ratio 0.25/0.5/1.0. dtype mix allowed. |
+| INV-122 | 32-engine-algorithms 3.12.6 | Dynamic swap 결과의 정확성은 두 조건으로 강제된다: (1) primary baseline 대비 **logit NMSE ≤ 0.01** (절대값 유지), (2) ratio=1.0 mixed swap 결과의 mean top-1 match가 **secondary dtype 단독 baseline 대비 Δ ≤ 1.0 pp**. 절대 top-1/top-5 임계값은 dtype/모델 본질 노이즈이므로 본 invariant의 책임이 아니다. **layer 간 dtype 불균일(혼합 상태)은 정상 상태이며 위반이 아니다.** v2 (2026-04-25, Phase 4 실측 기반). | Correctness | test | Llama/Qwen, ratio 0.25/0.5/0.75/1.0. ratio=1.0은 single-dtype baseline 비교 필수. 100+ prompt 다중 카테고리. |
 | INV-123 | 32-engine-algorithms 3.12.2 | Swap 단위는 `LayerSlot.weights.store()` 호출 1회이며 단일 원자 단계로 완결된다. 토큰 경계 밖(= forward가 snapshot을 재획득하지 않는 구간)에 발생한 swap은 **다음 토큰부터** 관측된다. Partial state(반만 교체된 snapshot 등)는 외부에 절대 노출되지 않는다. | Safety/Correctness | test | lock-free atomicity + per-token snapshot 경계 |
 | INV-124 | 33-engine-data 3.18 | `LayerSlot::current_dtype`의 값은 해당 slot이 현재 노출하는 `weights` snapshot의 실제 tensor dtype과 항상 일치한다. Swap 과정에서 `current_dtype` 갱신과 `weights` snapshot 교체는 동일 논리 단계에서 수행된다. | Correctness | test | dtype consistency |
 | INV-125 | 33-engine-data 3.19, 3.20 | `TransformerModel.secondary_mmap`(구 `TransformerWeights::secondary_mmap`)이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop되지 않는다. Swap 도중 mmap unmap 금지. 모델 lifetime 동안 생존 보장. | Safety | test | mmap lifetime. 보관 위치는 flat 배치(ENG-DAT-093)의 `TransformerModel` 필드. |
@@ -334,6 +335,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-130은 Weight Swap Phase 3.6 (Noshuffle SOA registry coherence)에서 추가. 카테고리는 Correctness (디바이스 한정 silent correctness bug — crash/data-loss가 아니므로 Safety 아님).
 > INV-131은 Weight Swap Phase 3.7a (Adreno SOA 재변환 safety net)에서 추가. Correctness.
 > INV-132~134는 Weight Swap Phase 3.7b (AUF v0.1 포맷)에서 추가. INV-132는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-133/134는 Correctness.
+> INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 
 ### 5.2 검증 방법별 통계
 

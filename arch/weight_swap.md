@@ -1,6 +1,6 @@
 # Weight Swap — Dynamic Runtime Swap Architecture
 
-> **상태**: Draft v6 (2026-04-25, Phase 3.6 Noshuffle SOA coherence 통합 반영)
+> **상태**: Draft v7 (2026-04-25, Phase 4 정확성 측정 결과 INV-122 v2 반영, §5.1 측정 방법론 추가)
 > **작성**: 2026-04-24, **갱신**: 2026-04-25
 > **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택, plan 경로 lazy invalidation, GPU SOA registry 동기화.
 > **대상 스펙**:
@@ -729,6 +729,111 @@ pub enum ResilienceAction {
 | INV-122 충족 여부 | pass | pass | test_inv_122_mixed_precision.rs |
 
 실측 환경: Galaxy S25 (Android), OpenCL backend. `run_device.py -d s25` 경유. 6T 스레드 설정.
+
+### 5.1 INV-122 정확성 측정 방법론 (Phase 4 정립, 2026-04-25)
+
+INV-122 (`spec/32-engine-algorithms.md` §3.12.6 v2)의 두 조건을 측정하는 표준 방법론. Phase 4 측정 결과(`results/data/weight_swap/phase_4_accuracy.md`)에서 정립.
+
+#### 5.1.1 측정 baseline 두 가지
+
+| Baseline | 사용처 | 의미 |
+|----------|--------|------|
+| **Primary single-precision** (e.g. F16) | NMSE 측정 (조건 1) | swap이 logit value scale을 망가뜨리지 않는지 확인. ratio 전 영역에서 절대값 ≤ 0.01 강제. |
+| **Secondary dtype 단독 (Q4_0 baseline)** | Δ Top-1 측정 (조건 2, ratio=1.0 한정) | swap이 양자화 본질 노이즈 외 추가 ranking 변동을 발생시키지 않는지 확인. mixed=full swap이 single-dtype 단독 로드와 (보호 layer 차이를 제외하면) 사실상 동등해야 함. |
+
+Q4_0 baseline은 `--model-path <q4_0.gguf>` 단독 로드(`--secondary-source` 없음)로 같은 prompt set을 돌려 얻는다.
+
+#### 5.1.2 측정 절차 (Llama 3.2 1B 기준)
+
+```mermaid
+flowchart LR
+    PROMPTS[100 prompt set<br/>QA + SYN + NIAH + PPL + MED + SHORT]
+    REF[F16 ref run<br/>--model-path f16.gguf<br/>--greedy --num-tokens 4]
+    Q4REF[Q4_0 baseline run<br/>--model-path q4_0.gguf<br/>--greedy --num-tokens 4]
+    SWAPS[ratio R ∈ {0.25, 0.5, 0.75, 1.0}<br/>--model-path f16.gguf<br/>--secondary-source q4_0.gguf<br/>--force-swap-ratio R]
+
+    PROMPTS --> REF
+    PROMPTS --> Q4REF
+    PROMPTS --> SWAPS
+
+    REF -->|topK logits per token| AGG[Aggregate per (prompt, ratio):<br/>top-1 match, top-5 overlap, NMSE proxy]
+    Q4REF -->|topK logits per token| AGG
+    SWAPS -->|topK logits per token| AGG
+
+    AGG --> COND1{NMSE ≤ 0.01?<br/>「조건 1, 절대값」}
+    AGG --> COND2{Δ Top-1 ≤ 1 pp<br/>at ratio=1.0?<br/>「조건 2, vs Q4 baseline」}
+
+    COND1 -- Pass --> PASS[INV-122 PASS]
+    COND2 -- Pass --> PASS
+    COND1 -- Fail --> FAIL_NMSE[swap이 logit value scale 손상]
+    COND2 -- Fail --> FAIL_DELTA[swap 구현 부수효과]
+```
+
+#### 5.1.3 측정 핵심 산출물
+
+| 산출물 | 위치 |
+|--------|------|
+| Phase 4 raw logits (500 runs) | `/tmp/inv122_results/r_{ref,q4_baseline,0.25,0.5,0.75,1.0}/` (host) |
+| Phase 4 prompt set | `/tmp/inv122_prompts.jsonl` (host) |
+| Phase 4 보고서 | `results/data/weight_swap/phase_4_accuracy.md` |
+| 측정 스크립트 | `/tmp/inv122_measure_v2.sh`, `/tmp/inv122_q4_baseline.sh` |
+
+#### 5.1.4 NMSE 측정 한계와 정직성 표기
+
+현재 측정의 NMSE는 `--experiment-logits-topk 10`으로 추출한 top-K 안의 공통 token id에 대한 lower bound이다. 양자화 영향으로 ranking이 크게 바뀐 경우 공통 token id가 부족해 측정 누락 가능. 진정한 vocab 전체 NMSE 측정을 위해 향후 `--experiment-logits-full` 옵션 추가 검토.
+
+#### 5.1.5 Δ Top-1 임계값 1 pp의 근거
+
+| Δ Top-1 | 판정 |
+|---------|------|
+| < 1 pp  | (a) 본질적 양자화 노이즈 — swap 구현 영향 미미 → INV-122 PASS |
+| 1 ~ 5 pp | (회색) swap 부수효과 + 양자화 노이즈 혼합 → 디버그 권고 |
+| > 5 pp | (b) swap 구현 부수효과가 강한 신호 → INV-122 FAIL |
+
+Phase 4 (3.7a + 이슈 A/B fix `73f8675`) 실측 Δ = +0.33 pp로 (a) 영역에 위치. 측정 추가 증거: token sequence 79/100 일치, imperfect prompt set 90%+ intersection, bimodal 분포(perfect/zero/partial)도 거의 동일.
+
+#### 5.1.6 AUF (Phase 3.7b) 도입 후 재측정 가이드
+
+AUF는 SOA 재변환 비용 제거(속도/메모리)이며 정확성 회복 도구가 아니다. Phase 4 측정에서 swap 구현 부수효과가 0.33 pp로 미미함이 확인되어, AUF 도입 후에도 정확성은 거의 동일할 것이 예측된다.
+
+| 항목 | AUF 도입 후 기대 |
+|------|-------------------|
+| Q4_0 baseline (top-1 = 0.6567) | **불변** (양자화 본질 noise) |
+| ratio=1.0 mixed top-1 | 0.660 ± 0.01 (현재와 동일 수준) |
+| Δ Top-1 (ratio=1.0 mixed vs Q4 baseline) | **≤ 1 pp 유지** (회귀 검출용) |
+| NMSE | ≤ 0.01 유지 |
+
+**재측정 트리거**:
+1. AUF cache hit 경로가 도입되면 동일 100 prompt set으로 4 ratio + Q4 baseline 다시 실행.
+2. 결과를 `results/data/weight_swap/phase_4_accuracy_auf.md`로 별도 저장.
+3. Δ Top-1 > 1 pp이면 AUF SOA descriptor 검증 (정확성 회귀).
+4. Δ Top-1 ≤ 1 pp이면 PASS, AUF는 정확성 측면에서도 문제 없음 확정.
+
+#### 5.1.7 향후 확장 (out of Phase 4 scope)
+
+- Q5_K/Q8_0 secondary dtype baseline 측정 → 정확성 vs 메모리 곡선 작성. 1B 온디바이스 타겟에서 Q4_0 trade-off가 합리적이지만 8B+ 모델에서 재평가 필요.
+- 표준 평가 set (HumanEval, MMLU 등) 일부 추가하여 합성 prompt 비중(현재 75%) 축소.
+- vocab 전체 logit dump 옵션 추가 시 NMSE 임계값 재검토.
+
+---
+
+## 5.2 Phase 4 측정 changelog (2026-04-25)
+
+| Task | 산출물 | 핵심 수치 | 결과 |
+|------|--------|----------|------|
+| WSWAP-4-LATENCY | `results/data/weight_swap/phase_4_latency.md` | per-layer p50 ≈ 206 ms (ratio 무관 선형) | SLA(< 50 ms/layer) FAIL — Option β stage instrumentation 분기 권고 |
+| WSWAP-4-PSS | `results/data/weight_swap/phase_4_pss.md` | ΔPSS@ratio=1.0 = -843 MB (대부분 Pss_Shmem) | spec target ≥ 25% 충족 |
+| WSWAP-4-TBT | `results/data/weight_swap/phase_4_throughput.md` | F16 23.77 / Q4 61.30 / mixed 1.0 = 48.60 tok/s | swap 자체의 forward 성능 영향 측정 — TBT 증가 < 20% spec 충족 |
+| WSWAP-4-INV122 | `results/data/weight_swap/phase_4_accuracy.md` | Δ Top-1 (mixed=1.0 vs Q4 baseline) = +0.33 pp, NMSE ≤ 0.0062 | INV-122 v2 재정의 및 PASS — §3.12.6 spec 갱신 |
+
+**INV-122 spec v2 결정 (2026-04-25)**:
+- 이전 임계값 (top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 모델에서 물리적으로 도달 불가함이 확인됨 (Q4_0 단독 baseline = top-1 0.6567).
+- 새 임계값: NMSE ≤ 0.01 (절대값) + Δ Top-1 ≤ 1 pp (mixed=1.0 vs single-dtype baseline).
+- 책임 분리: 양자화 본질 노이즈는 dtype/모델 책임, swap 구현은 추가 회귀 만들지 않음만 책임.
+- 측정 방법론: §5.1 (본 문서) 참조. 100+ prompt × 4 ratio + Q4 baseline 표준화.
+- 측정 근거 raw data: `/tmp/inv122_results/r_{ref,q4_baseline,0.25,0.5,0.75,1.0}/` (host).
+- 영향받는 spec: `spec/32-engine-algorithms.md` §3.12.6, `spec/41-invariants.md` §3.13 INV-122 행 + 교차 참조 노트.
+- 영향받는 test: `engine/tests/spec/test_inv_122_mixed_precision.rs` — Implementer가 v2 임계값으로 갱신 필요 (placeholder 사용 시 즉시 PASS로 위장 가능, 실제 회귀 검출 불가).
 
 ---
 
