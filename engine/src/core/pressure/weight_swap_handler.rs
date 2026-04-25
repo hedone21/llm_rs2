@@ -130,8 +130,17 @@ mod tests {
     use crate::models::config::ModelConfig;
 
     fn make_minimal_config() -> ModelConfig {
-        // Write a minimal config.json to /tmp for test purposes.
-        let dir = std::path::PathBuf::from("/tmp/llm_rs2_weight_swap_handler_test");
+        // Use a unique per-call temp dir to avoid race conditions between parallel tests.
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let dir = std::path::PathBuf::from(format!(
+            "/tmp/llm_rs2_weight_swap_handler_test_{}_{:x}",
+            std::process::id(),
+            unique,
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let json = r#"{
             "hidden_size": 64,

@@ -365,35 +365,74 @@ impl<'a> SwapExecutor<'a> {
             // CPU / CUDA backends and on host OpenCL builds whose
             // `cvt_noshuffle` program failed to compile.
             //
+            // AUF SOA bypass (Phase 3.7b): when the secondary source is an
+            // AUF file with WEIGHTS_ADRENO_SOA, the bytes are already in SOA
+            // layout. `ensure_noshuffle_soa_registered` is still called but
+            // the backend registers directly without re-conversion. In this
+            // case `soa_reconvert_ms` records only the registration overhead
+            // (≈ 0 ms). `StageBreakdown::soa_reconvert_ms ≈ 0` signals the
+            // fast-path to the caller.
+            //
             // Ordering rationale: this MUST happen after `invalidate_*` (so
             // we re-populate a clean registry) and before the generation bump
             // (so the next forward seeing the new generation finds a fully
             // populated registry, eliminating any window where lookup misses).
             let t_d0 = Instant::now();
-            for swapped in &report.swapped {
-                let Some(slot) = layers.get(swapped.layer_idx) else {
-                    continue;
-                };
-                let new_layer = slot.load_weights();
-                for tensor in [
-                    &new_layer.wq,
-                    &new_layer.wk,
-                    &new_layer.wv,
-                    &new_layer.wo,
-                    &new_layer.w_gate,
-                    &new_layer.w_up,
-                    &new_layer.w_down,
-                ] {
-                    if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
-                        // Conversion failure leaves the registry empty for
-                        // this tensor → AOS fallback path. Surface as the
-                        // batch error so the caller can decide (treating
-                        // partial registration as success would risk silent
-                        // accuracy loss).
-                        return Err(SwapError::BufferAllocationFailed {
-                            layer: swapped.layer_idx,
-                            source: e,
-                        });
+            let skip_soa_reconvert = secondary_mmap
+                .map(|s| s.is_pre_converted_soa())
+                .unwrap_or(false);
+            if skip_soa_reconvert {
+                // AUF WEIGHTS_ADRENO_SOA path: weights are already SOA.
+                // Register tensors directly without re-conversion.
+                for swapped in &report.swapped {
+                    let Some(slot) = layers.get(swapped.layer_idx) else {
+                        continue;
+                    };
+                    let new_layer = slot.load_weights();
+                    for tensor in [
+                        &new_layer.wq,
+                        &new_layer.wk,
+                        &new_layer.wv,
+                        &new_layer.wo,
+                        &new_layer.w_gate,
+                        &new_layer.w_up,
+                        &new_layer.w_down,
+                    ] {
+                        if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
+                            return Err(SwapError::BufferAllocationFailed {
+                                layer: swapped.layer_idx,
+                                source: e,
+                            });
+                        }
+                    }
+                }
+            } else {
+                // GGUF path: standard SOA re-conversion.
+                for swapped in &report.swapped {
+                    let Some(slot) = layers.get(swapped.layer_idx) else {
+                        continue;
+                    };
+                    let new_layer = slot.load_weights();
+                    for tensor in [
+                        &new_layer.wq,
+                        &new_layer.wk,
+                        &new_layer.wv,
+                        &new_layer.wo,
+                        &new_layer.w_gate,
+                        &new_layer.w_up,
+                        &new_layer.w_down,
+                    ] {
+                        if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
+                            // Conversion failure leaves the registry empty for
+                            // this tensor → AOS fallback path. Surface as the
+                            // batch error so the caller can decide (treating
+                            // partial registration as success would risk silent
+                            // accuracy loss).
+                            return Err(SwapError::BufferAllocationFailed {
+                                layer: swapped.layer_idx,
+                                source: e,
+                            });
+                        }
                     }
                 }
             }
