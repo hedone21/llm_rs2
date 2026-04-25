@@ -231,7 +231,12 @@ impl ModelConfig {
             as usize;
         let vocab_size = gguf
             .get_u32(&format!("{prefix}.vocab_size"))
-            .unwrap_or(32000) as usize;
+            .map(|v| v as usize)
+            .or_else(|| match gguf.metadata.get("tokenizer.ggml.tokens") {
+                Some(crate::models::loader::gguf::GgufValue::Array(arr)) => Some(arr.len()),
+                _ => None,
+            })
+            .unwrap_or(32000);
         let rms_norm_eps = gguf
             .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5) as f64;
