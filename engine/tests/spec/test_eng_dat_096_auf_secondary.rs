@@ -229,3 +229,159 @@ fn auf_dtype_q4_0_maps_to_engine_q4_0() {
 fn len_of(s: &str) -> usize {
     s.len()
 }
+
+// ── Base-offset round-trip regression guard ───────────────────────────────────
+//
+// Verifies that `build_auf_secondary_from_view` stores section-local
+// variant_offsets correctly and that `tensor_bytes()` returns the exact
+// original bytes — catching the double-base-offset bug (abs_offset stored in
+// TensorInfo but then indexed into weights_bytes() which is already relative).
+//
+// Reproduces the panic:
+//   "range end index 701128704 out of range for slice of length 695377920"
+// that blocked Phase 4 measurement (2026-04-25).
+
+/// ENG-DAT-096 base-offset correctness: TensorIndex with two back-to-back
+/// tensor payloads → SecondaryMmap round-trip → tensor_bytes() byte-equal.
+///
+/// If the double-base bug regresses (writer stores abs_offset and reader adds
+/// weights_section_offset again), this test panics with an OOB slice index.
+#[test]
+fn auf_secondary_tensor_bytes_base_offset_round_trip() {
+    use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
+    use llm_rs2::auf::{AufMeta, BackendTag};
+    use llm_rs2::models::config::{ModelArch, ModelConfig};
+    use llm_rs2::models::weights::build_auf_secondary_from_view;
+    use std::path::Path;
+
+    // Two fake tensor payloads: distinct bytes so we can verify identity.
+    let tensor0: Vec<u8> = (0u8..=127).collect(); // 128 bytes  — attn_q layer 0
+    let tensor1: Vec<u8> = (128u8..=255).collect(); // 128 bytes — attn_k layer 0
+
+    // Build AUF with WEIGHTS_CPU_AOS payload = tensor0 || tensor1 (256 bytes total).
+    let weights_payload = {
+        let mut v = tensor0.clone();
+        v.extend_from_slice(&tensor1);
+        v
+    };
+
+    // TensorIndex: section-local offsets (0-based within weights payload).
+    let mut tag_buf = [0u8; 24];
+    tag_buf[..TAG_WEIGHTS_CPU_AOS.len()].copy_from_slice(TAG_WEIGHTS_CPU_AOS.as_bytes());
+    let tensor_index = TensorIndex {
+        variant_tags: vec![tag_buf],
+        entries: vec![
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![1, 128],
+                alignment: 64,
+                variant_offsets: vec![0], // section-local: starts at byte 0
+                variant_sizes: vec![128],
+            },
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnK.as_u32(),
+                dtype: TensorDType::F32.as_u32(),
+                shape: vec![1, 128],
+                alignment: 64,
+                variant_offsets: vec![128], // section-local: starts at byte 128
+                variant_sizes: vec![128],
+            },
+        ],
+    };
+
+    let auf_bytes = AufWriter::new(
+        AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: 1,
+            n_heads_q: 1,
+            n_kv_heads: 1,
+            head_dim: 128,
+            hidden_dim: 128,
+            ffn_dim: 256,
+            vocab_size: 2,
+            max_seq_len: 32,
+            rope_theta: 10000.0,
+            rotary_dim: 128,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+        },
+        make_tokenizer(),
+        [0u8; 32],
+        0,
+        0,
+    )
+    .with_tensor_index(tensor_index)
+    .add_weights_section(TAG_WEIGHTS_CPU_AOS, weights_payload)
+    .build()
+    .unwrap();
+
+    // Open AufView from bytes.
+    let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).unwrap();
+
+    // Confirm weights_range is non-trivially offset (i.e., section does not
+    // start at byte 0 — so a double-base would be observable).
+    let (ws_offset, ws_size) = view.weights_range.unwrap();
+    assert!(
+        ws_offset > 0,
+        "weights_section_offset should be >0 for any real AUF file; got {ws_offset}"
+    );
+    assert_eq!(ws_size, 256, "weights section should be 256 bytes");
+
+    // Build a minimal ModelConfig (1 layer, metadata mismatch check bypassed
+    // because build_auf_secondary_from_view skips check_auf_metadata).
+    let config = ModelConfig {
+        arch: ModelArch::Llama,
+        hidden_size: 128,
+        num_hidden_layers: 1,
+        num_attention_heads: 1,
+        num_key_value_heads: 1,
+        head_dim: 128,
+        intermediate_size: 256,
+        vocab_size: 2,
+        rms_norm_eps: 1e-5,
+        rope_theta: 10000.0,
+        has_qkv_bias: false,
+        tie_word_embeddings: false,
+        eos_token_id: 1,
+        weight_prefix: String::new(),
+        rope_local_theta: None,
+        sliding_window: None,
+        sliding_window_pattern: None,
+        query_pre_attn_scalar: None,
+        embed_scale: None,
+    };
+
+    // Build SecondaryMmap (exercises the fixed offset path).
+    let secondary = build_auf_secondary_from_view(
+        view,
+        &config,
+        Path::new("/fake/test.auf"),
+        BackendTag::CpuAos,
+    )
+    .expect("build_auf_secondary_from_view should succeed");
+
+    // Retrieve tensor descriptors and verify bytes — OOB panic here means
+    // double-base-offset bug has regressed.
+    let info_q = secondary
+        .layer_tensor(0, "attn_q.weight")
+        .expect("attn_q.weight must be present in layer 0");
+    let bytes_q = secondary.tensor_bytes(info_q);
+    assert_eq!(
+        bytes_q,
+        tensor0.as_slice(),
+        "attn_q bytes must match original tensor0"
+    );
+
+    let info_k = secondary
+        .layer_tensor(0, "attn_k.weight")
+        .expect("attn_k.weight must be present in layer 0");
+    let bytes_k = secondary.tensor_bytes(info_k);
+    assert_eq!(
+        bytes_k,
+        tensor1.as_slice(),
+        "attn_k bytes must match original tensor1"
+    );
+}

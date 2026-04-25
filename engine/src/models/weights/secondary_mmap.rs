@@ -503,6 +503,28 @@ fn open_secondary_auf(
     // Validate AUF metadata against primary model config (ENG-DAT-C10).
     check_auf_metadata(primary_config, &view.meta, path)?;
 
+    build_auf_secondary_from_view(view, primary_config, path, backend_tag)
+}
+
+/// Core logic for building an `AufSecondaryMmap` from a pre-parsed `AufView`.
+///
+/// Extracted for testability: callers (e.g. unit tests) can supply an
+/// `AufView` constructed directly from bytes via `open_from_bytes`, bypassing
+/// file I/O, while still exercising the full tensor-index → layer-index →
+/// tensor_bytes round-trip.
+///
+/// # Offset contract
+/// `TensorIndex::variant_offsets` entries are **section-local** (relative to the
+/// start of the WEIGHTS payload).  `AufView::weights_bytes()` already returns a
+/// slice that starts at the WEIGHTS section offset, so we store `var_offset`
+/// directly into `SecondaryTensorInfo::offset` — we must **not** add
+/// `weights_section_offset` again (that would cause a double-base OOB panic).
+pub fn build_auf_secondary_from_view(
+    view: crate::auf::AufView,
+    primary_config: &ModelConfig,
+    path: &Path,
+    backend_tag: crate::auf::BackendTag,
+) -> Result<SecondaryMmap, LoadError> {
     // Determine variant index for the selected backend.
     let weights_tag = backend_tag
         .weights_section_tag()
@@ -519,7 +541,10 @@ fn open_secondary_auf(
         })?;
 
     // WEIGHTS payload start within the mmap.
-    let (weights_section_offset, _weights_section_size) = view
+    // We only need to confirm weights_range is Some (invariant); the offset itself
+    // is NOT used for indexing — tensor_bytes() uses weights_bytes() which already
+    // slices from that offset.  variant_offsets in TensorIndex are section-local.
+    let (_weights_section_offset, _weights_section_size) = view
         .weights_range
         .expect("AufView::weights_range must be Some after open() with concrete backend_tag");
 
@@ -555,11 +580,12 @@ fn open_secondary_auf(
             continue;
         };
 
-        // Offset is section-local (relative to WEIGHTS payload start).
-        let abs_offset = weights_section_offset as usize + var_offset as usize;
-
+        // var_offset is section-local (relative to WEIGHTS payload start).
+        // weights_bytes() already returns a slice starting at weights_section_offset,
+        // so we store the section-local offset directly — do NOT add weights_section_offset
+        // again (that would cause a double-base panic on tensor_bytes()).
         let slice_info = SecondaryTensorInfo {
-            offset: abs_offset,
+            offset: var_offset as usize,
             len: var_size as usize,
             dtype,
             // AUF shape is stored in logical order (outermost first).

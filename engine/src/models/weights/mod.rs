@@ -15,7 +15,8 @@ pub mod swap_executor;
 pub use decider::{SwapDecision, WeightSwapDecider, compute_qcf_swap};
 pub use noise_table::QuantNoiseTable;
 pub use secondary_mmap::{
-    LayerTensorSlice, LoadError, SecondaryMmap, SecondaryTensorInfo, open_secondary,
+    LayerTensorSlice, LoadError, SecondaryMmap, SecondaryTensorInfo, build_auf_secondary_from_view,
+    open_secondary,
 };
 pub use slot::{LayerSlot, LayerWeights};
 pub use swap_executor::{SwapError, SwapExecutor, SwapReport, SwappedLayer, dtype_tag_to_dtype};
