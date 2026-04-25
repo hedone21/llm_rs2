@@ -1885,15 +1885,12 @@ fn main() -> anyhow::Result<()> {
 
         if !target_layers.is_empty() {
             let swap_memory = Galloc::new();
-            let executor = SwapExecutor::new(
-                LDType::Q4_0,
-                &model.config,
-                // Use CPU backend for the swap: weight tensors are materialised
-                // on CPU first, then the existing backend.copy_weight_from path
-                // routes them to GPU if needed (same as initial load).
-                cpu_backend_arc.clone(),
-                &swap_memory,
-            );
+            let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                .as_ref()
+                .cloned()
+                .unwrap_or_else(|| cpu_backend_arc.clone());
+            let executor =
+                SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
             match executor.execute(&model, &target_layers) {
                 Ok(report) => {
                     eprintln!(
