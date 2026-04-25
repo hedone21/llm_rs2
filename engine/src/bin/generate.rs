@@ -597,6 +597,16 @@ struct Args {
     /// Intended for offline testing and debug; not for production use.
     #[arg(long)]
     force_swap_ratio: Option<f32>,
+
+    /// Explicit path to tokenizer.json. When omitted, the tokenizer is
+    /// resolved automatically via the GGUF basename (e.g.
+    /// `<dir>/<stem>.tokenizer.json`, then `<dir>/<stem-without-quant>.tokenizer.json`,
+    /// then the legacy `<dir>/tokenizer.json` fallback). Required when
+    /// multiple models share the same directory (e.g. `/data/local/tmp/`)
+    /// because the legacy fallback can pick up a sibling model's tokenizer
+    /// and silently produce garbage outputs.
+    #[arg(long)]
+    tokenizer_path: Option<std::path::PathBuf>,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -1121,15 +1131,61 @@ fn main() -> anyhow::Result<()> {
     let weights_on_gpu = false;
 
     // 2. Tokenizer
-    let tokenizer_path = if is_gguf {
-        // GGUF is a single file; look for tokenizer.json in the same directory
-        let parent = std::path::Path::new(model_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        parent.join("tokenizer.json").to_string_lossy().into_owned()
+    //
+    // Resolution order:
+    //   1. `--tokenizer-path` if explicitly provided.
+    //   2. Safetensors layout (model_path is a directory): `<dir>/tokenizer.json`.
+    //   3. GGUF layout (model_path is a file): try in order
+    //        a. `<dir>/<stem>.tokenizer.json`              (e.g. qwen2.5-1.5b-f16.tokenizer.json)
+    //        b. `<dir>/<stem-stripped>.tokenizer.json`     (strip trailing `-f16` / `-q4_0` /
+    //                                                       `-q8_0` quant suffix; e.g.
+    //                                                       qwen2.5-1.5b.tokenizer.json)
+    //        c. `<dir>/tokenizer.json`                     (legacy single-tokenizer-per-dir)
+    //
+    // Step 3a/3b prevents a sibling model's tokenizer from being picked up
+    // when multiple GGUFs co-exist in the same directory (e.g. /data/local/tmp
+    // on Android, where both Llama and Qwen GGUFs share the path). The
+    // legacy fallback (3c) keeps existing single-model setups working.
+    let tokenizer_path: String = if let Some(p) = args.tokenizer_path.as_ref() {
+        p.to_string_lossy().into_owned()
+    } else if is_gguf {
+        let path = std::path::Path::new(model_path);
+        let parent = path.parent().unwrap_or(std::path::Path::new("."));
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        // Quant suffix list — keep in sync with `--weight-dtype` accepted values.
+        // Match is case-insensitive on the suffix itself but we preserve the
+        // original case of the surviving stem so file lookup matches the
+        // on-disk capitalisation (e.g. `Llama-3.2-1B-Instruct-f16.gguf` ->
+        // `Llama-3.2-1B-Instruct.tokenizer.json`).
+        const QUANT_SUFFIXES: &[&str] = &["-f16", "-f32", "-q4_0", "-q4_1", "-q8_0", "-q4_k"];
+        let stem_lower = stem.to_ascii_lowercase();
+        let stem_stripped: Option<String> = QUANT_SUFFIXES.iter().find_map(|suf| {
+            stem_lower
+                .strip_suffix(suf)
+                .map(|s| stem[..s.len()].to_string())
+        });
+        let candidates: Vec<std::path::PathBuf> = {
+            let mut v = Vec::with_capacity(3);
+            v.push(parent.join(format!("{stem}.tokenizer.json")));
+            if let Some(ref s) = stem_stripped {
+                v.push(parent.join(format!("{s}.tokenizer.json")));
+            }
+            v.push(parent.join("tokenizer.json"));
+            v
+        };
+        let chosen = candidates
+            .iter()
+            .find(|p| p.exists())
+            .cloned()
+            .unwrap_or_else(|| parent.join("tokenizer.json"));
+        chosen.to_string_lossy().into_owned()
     } else {
         format!("{}/tokenizer.json", model_path)
     };
+    eprintln!("[Tokenizer] {}", tokenizer_path);
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("Cannot load tokenizer from {}: {}", tokenizer_path, e))?;
 
