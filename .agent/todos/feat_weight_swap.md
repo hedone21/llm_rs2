@@ -27,15 +27,18 @@
 
 ## Phase 구조 요약
 
-| Phase | 내용 | 예상 작업 수 | 예상 기간 | 우선순위 |
-|-------|------|-----|----------|----------|
-| **1 — 인프라** | `LayerSlot` 구조, secondary 파일 mmap handle 보관, 기존 단일 dtype 초기 로드 경로 보존 (회귀 방지) | 5 | 5–7일 | P1 |
-| **2 — Swap 실행** | `WeightSwapHandler` + `SwapExecutor` + `ratio_generation` 재진입 차단. 수동 CLI/테스트 트리거 | 5 | 6–8일 | P1 |
-| **3 — Manager 연동** | `EngineCommand::SwapWeights{ratio, DtypeTag}` direct dispatch + `WeightSwapDecider` (importance×ε bottom-k) + `QuantNoiseTable` eager ε + on-demand `ImportanceCollector` 주입 + `QcfEstimate.layer_swap` 확장 + LuaPolicy | 7 | 7–9일 | P2 |
-| **3.5 — plan invalidation** | `_entry_ratio_generation` 배선 (weight swap → plan rebuild) — 독립 PR | 3 | 3–4일 | P3 |
-| **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | P2 |
+| Phase | 내용 | 예상 작업 수 | 예상 기간 | 상태 | 우선순위 |
+|-------|------|-----|----------|------|----------|
+| **1 — 인프라** | `LayerSlot` 구조, secondary 파일 mmap handle 보관, 기존 단일 dtype 초기 로드 경로 보존 (회귀 방지) | 5 | 5–7일 | DONE (2026-04-24, `07b8fa3`) | P1 |
+| **2 — Swap 실행** | `WeightSwapHandler` + `SwapExecutor` + `ratio_generation` 재진입 차단. 수동 CLI/테스트 트리거 | 5 | 6–8일 | DONE (2026-04-24, `07b8fa3`) | P1 |
+| **3 — Manager 연동** | `EngineCommand::SwapWeights{ratio, DtypeTag}` direct dispatch + `WeightSwapDecider` (importance×ε bottom-k) + `QuantNoiseTable` eager ε + on-demand `ImportanceCollector` 주입 + `QcfEstimate.layer_swap` 확장 + LuaPolicy | 7 | 7–9일 | DONE (2026-04-24, `07b8fa3`) | P2 |
+| **3.5 — plan invalidation 배선** | `_entry_ratio_generation` → `FullKernelPlan` plan rebuild 통합. PlanInvalidated lazy fallback. tensor_partition × swap 상호 배타 | 4 | 3–4일 | **CURRENT** | P1 |
+| **3.6 — Noshuffle SOA registry coherence** | SwapExecutor가 OpenCLBackend `noshuffle_soa_registry` invalidate 추가. Q4_0 swap 시 stale cl_mem key 제거 | 1 | 1–2일 | NEW | P1 |
+| **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | BLOCKED (3.5 + 3.6 머지 후) | P2 |
 
-**진행 순서 강제**: Phase 1 → 2 → 3 → 4. Phase 3.5는 Phase 3 완료 후 독립 처리.
+**진행 순서 강제**: Phase 1 → 2 → 3 → **3.5 → 3.6** → 4.
+- Phase 3.5와 3.6은 독립이지만 둘 다 Phase 4 디바이스 실측 진입 전 머지 필수.
+- 3.5는 plan rebuild 배선만 다룸. 3.6은 OpenCL backend의 SOA registry invalidation을 별도로 처리 (Architect 결정 DF-35-4).
 
 ---
 
@@ -58,15 +61,16 @@
 
 ---
 
-# Phase 1 — 인프라 (LayerSlot + Secondary mmap)
+# Phase 1 — 인프라 (LayerSlot + Secondary mmap) — DONE (2026-04-24, `07b8fa3`)
 
 > **목표**: `TransformerWeights`를 `LayerSlot` 기반으로 리팩토링하되 **단일 F16 경로가 기존과 동일**하게 동작. Secondary Q4_0 GGUF의 mmap handle만 보관 (lazy, forward 미사용).
 > **예상 기간**: 5–7일 (5개 작업)
 > **기대 효과**: swap의 토대. 단독으로는 PSS 감소 없음. 이 단계에서 성능 회귀가 없음을 확인한 후 Phase 2 진입.
+> **완료 요약**: spec 340 pass, clippy --all-targets clean. LayerSlot/SecondaryMmap/TransformerWeights 도입 완료. 자세한 내역은 MEMORY: `project_weight_swap_phase3_handoff.md` 참조.
 
 ## [P0] WSWAP-1-SPEC. Architect: Phase 1 Spec/Arch 재작성
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: 없음
 - **담당 권장**: Architect
 - **Description**:
@@ -85,8 +89,8 @@
 - **Notes**: spec-manage 스킬 사용. 이 작업 완료 전까지 Phase 1 구현 작업 착수 금지.
 
 ## [P0] WSWAP-1-SLOT. `LayerSlot` 구조 도입 + `TransformerWeights` 리팩토링
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-1-SPEC
 - **담당 권장**: Senior Implementer (Arc swap / 메모리 semantics)
 - **Description**:
@@ -103,8 +107,8 @@
 - **Notes**: **가장 큰 리스크 작업 (R-new-1)**. 착수 전 Architect와 설계 리뷰 필수. Arc 간접 참조 오버헤드 벤치 우선 확인. 이 작업이 회귀를 남기면 Phase 2/3 전체가 의미 없음.
 
 ## [P1] WSWAP-1-MMAP. Secondary GGUF mmap handle 보관 인프라
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-1-SLOT
 - **담당 권장**: Implementer
 - **Description**:
@@ -121,8 +125,8 @@
 - **Notes**: Android UFS 4.0에서 mmap은 page fault 시점까지 RSS 영향 없음. 평시 오버헤드 제로 원칙 준수.
 
 ## [P1] WSWAP-1-CLI. Secondary 파일 경로 CLI 최소화
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-1-MMAP
 - **담당 권장**: Implementer
 - **Description**:
@@ -137,8 +141,8 @@
 - **Notes**: `generate.rs:779` 확장자 분기 로직과 충돌 없도록. 기존 `--layer-dtype-profile` / `quantize_profile` 바이너리 삭제는 WSWAP-1-CLEANUP에서 처리.
 
 ## [P1] WSWAP-1-CLEANUP. 폐기 코드 제거 (정적 프로파일 경로)
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-1-SPEC, WSWAP-1-CLI
 - **담당 권장**: Implementer
 - **Description**:
@@ -154,15 +158,16 @@
 
 ---
 
-# Phase 2 — Swap 실행 (Handler + Executor + 재진입 차단)
+# Phase 2 — Swap 실행 (Handler + Executor + 재진입 차단) — DONE (2026-04-24, `07b8fa3`)
 
 > **목표**: `WeightSwapHandler` + `SwapExecutor` 구현. 수동 CLI/테스트 트리거로 F16 → Q4_0 layer swap이 bit-정확(target dtype 기준) / 안전하게 동작. Manager 연동 없이 내부 API만.
 > **예상 기간**: 6–8일 (5개 작업)
 > **기대 효과**: swap 경로 검증. 이 단계에서 정확성/동시성 안전성 확보 후 Phase 3에서 신호 연동.
+> **완료 요약**: SwapExecutor (a~e 단계) + ratio_generation 재진입 차단 + WeightSwapHandler + `--force-swap-ratio` CLI + LoadConfig 시그니처 통일 모두 완료.
 
 ## [P1] WSWAP-2-EXEC. `SwapExecutor` 구현 (Arc swap + madvise)
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-1-SLOT, WSWAP-1-MMAP
 - **담당 권장**: Senior Implementer (메모리 semantics, Arc swap, madvise FFI)
 - **Description**:
@@ -178,8 +183,8 @@
 - **Notes**: R-new-3. Android 커널 버전별 `MADV_DONTNEED` 동작 상이. `MADV_PAGEOUT` (Android Q+) 병행 검토. PSS 실측은 Phase 4에서.
 
 ## [P1] WSWAP-2-REENTRY. `ratio_generation` 재진입 차단
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-2-EXEC
 - **담당 권장**: Senior Implementer (동시성)
 - **Description**:
@@ -195,8 +200,8 @@
 - **Notes**: R-new-1 회귀 완화. Arc clone 경로가 forward hot loop에 있으므로 반드시 tok/s 측정.
 
 ## [P1] WSWAP-2-HANDLER. `WeightSwapHandler` + Pressure Pipeline 연결
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-2-EXEC, WSWAP-2-REENTRY
 - **담당 권장**: Implementer
 - **Description**:
@@ -215,8 +220,8 @@
 - **Notes**: MEMORY.md "Weight swap은 KV swap과 독립" 원칙. 개별 handler로 분리하되 Pipeline 내 순서는 Architect spec에 명시.
 
 ## [P1] WSWAP-2-CLI-TRIGGER. 수동 swap 트리거 CLI (디버그 전용) + LoadConfig 시그니처 전환
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-2-HANDLER
 - **담당 권장**: Implementer
 - **Description**:
@@ -244,8 +249,8 @@
 - **Notes**: Phase 3에서 manager 연동 완료 후 이 플래그는 유지해도 되고 제거해도 됨 (테스트 유용성). LoadConfig 전환은 **이 커밋 이전에는 시도하지 말 것** (Phase 1 범위 초과).
 
 ## [P1] WSWAP-2-TEST. Swap 정확성 테스트 스위트
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-2-HANDLER, WSWAP-2-CLI-TRIGGER
 - **담당 권장**: Tester (설계) + Implementer (구현)
 - **Description**:
@@ -262,17 +267,18 @@
 
 ---
 
-# Phase 3 — Manager 연동 (Direct dispatch + On-demand QCF + Decider)
+# Phase 3 — Manager 연동 (Direct dispatch + On-demand QCF + Decider) — DONE (2026-04-24, `07b8fa3`)
 
 > **목표**: `EngineCommand::SwapWeights { ratio, target_dtype }`가 실제 manager → engine IPC 경로를 타고 `WeightSwapDecider` + `SwapExecutor`를 발동. RequestQcf → 다음 prefill에서 `ImportanceCollector` 주입 → `QcfEstimate.layer_swap` 응답으로 manager 결정 피드백. ε(quantization noise)는 engine init에서 eager 계산.
 > **예상 기간**: 7–9일 (7개 작업)
 > **기대 효과**: 신호 기반 end-to-end 동작. Phase 4 실측의 전제.
 > **근거 스펙**: ENG-ALG-214-ROUTE, ENG-ALG-215~218, ENG-DAT-095, INV-126~128, MSG-042/082/088/089.
 > **라우팅 결정 (ENG-ALG-214-ROUTE)**: Pipeline 비경유. `generate.rs`의 command dispatch에서 직접 수신 → Decider → Executor.
+> **완료 요약**: 7개 task 모두 완료. spec 340 pass, clippy --all-targets clean.
 
 ## [P2] WSWAP-3-CMD. `EngineCommand::SwapWeights` + `DtypeTag` shared 프로토콜
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: Phase 2 완료
 - **담당 권장**: Implementer
 - **Description**:
@@ -293,8 +299,8 @@
 - **Notes**: MSG-080/081 ID는 사용하지 않음 (초안 단계 vacant, 실제 ID는 MSG-042/082/088/089).
 
 ## [P2] WSWAP-3-NOISE. `QuantNoiseTable` + ε eager 계산 (ENG-ALG-216)
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-1-MMAP (Phase 1 완료, secondary mmap)
 - **담당 권장**: Senior Implementer (dequantize + Frobenius 경로, CPU SIMD 활용 가능)
 - **Description**:
@@ -314,8 +320,8 @@
 - **Notes**: dequantize는 `engine/src/backend/cpu_neon.rs` 기존 Q4_0 경로 재사용. Init 1회 비용이므로 SIMD 최적화는 2차 고려. INV-127 근거.
 
 ## [P2] WSWAP-3-DECIDER. `WeightSwapDecider` 구현 (ENG-ALG-215)
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-3-NOISE, WSWAP-2-HANDLER
 - **담당 권장**: Implementer
 - **Description**:
@@ -347,8 +353,8 @@
 - **Notes**: ENG-ALG-213은 이 Decider의 uniform fallback 경로로 흡수됨.
 
 ## [P2] WSWAP-3-DISPATCH. `generate.rs` command dispatch (ENG-ALG-214-ROUTE + INV-126)
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-3-CMD, WSWAP-3-DECIDER
 - **담당 권장**: Implementer
 - **Description**:
@@ -375,8 +381,8 @@
 - **Notes**: engine-internal `ResilienceAction::SwapWeights`와 shared `EngineCommand::SwapWeights`는 서로 다른 타입. `MemoryStrategy`에서 내리는 fallback action도 이 dispatch helper로 귀결되어야 함.
 
 ## [P2] WSWAP-3-QCF. `RequestQcf` → On-demand `ImportanceCollector` 주입 (ENG-ALG-218)
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-3-NOISE, WSWAP-3-DECIDER
 - **담당 권장**: Implementer (QCF 경로) + Senior Implementer (hot path 영향 검토)
 - **Description**:
@@ -405,8 +411,8 @@
 - **Notes**: R-new-2 완화. prefill 경로 hot path에 분기 추가 → cold branch(early return) 유지.
 
 ## [P2] WSWAP-3-LUA. Manager LuaPolicy 정책 확장
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-3-CMD, WSWAP-3-DISPATCH
 - **담당 권장**: Implementer (Lua 바인딩)
 - **Description**:
@@ -425,8 +431,8 @@
 - **Notes**: Manager DPP/LinUCB와의 상호작용은 향후 작업 (Phase 5). 현재는 단순 기반 결정만.
 
 ## [P2] WSWAP-3-TEST. Phase 3 spec 테스트 + E2E 통합
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE
+- **Sprint**: done
 - **Dependencies**: WSWAP-3-DISPATCH, WSWAP-3-QCF, WSWAP-3-LUA
 - **담당 권장**: Tester (설계) + Implementer (구현)
 - **Description**:
@@ -454,56 +460,163 @@
 
 ---
 
-# Phase 3.5 — `_entry_ratio_generation` Plan Invalidation 배선 (Out-of-scope from Phase 3)
+# Phase 3.5 — `_entry_ratio_generation` Plan Invalidation 배선 (current sprint)
 
-> **독립 PR 단위로 분리**. 이유: tensor_partition plan.rs 구조 변경 가능성이 있어 Phase 3과 리스크 분리.
-> **arch 근거**: `arch/weight_swap.md` §6.
-> **전제**: Phase 3 완료.
+> **독립 PR 단위로 분리**. tensor_partition plan rebuild 통합 배선.
+> **전제**: Phase 1~3 완료(`07b8fa3`).
+> **머지 조건**: Phase 4 디바이스 실측 진입 전 필수.
+>
+> **결정사항 (사용자 확정 — 모두 Architect 권장안 채택, 2026-04-25)**
+> - **DF-35-1 (plan 비교 지점)**: `FullKernelPlan::execute()` 진입부 1회. Acquire load 1회 비교 후 본 경로 진행.
+> - **DF-35-2 (재빌드 주기)**: lazy. mismatch 시 `PlanInvalidated` 반환 → caller가 `forward_gen` fallback 후 다음 호출에 plan rebuild.
+> - **DF-35-3 (tensor_partition × swap)**: 상호 배타. swap 실행 시 `partition_ctx = None` 강제. 둘 다 plan을 무효화하므로 동시 활성은 정의되지 않은 동작.
+> - **DF-35-4 (선행 범위)**: Phase 3.5는 plan 무효화만. Noshuffle SOA registry invalidation은 별도 **WSWAP-3.6**으로 분리.
 
-## [P3] WSWAP-3.5-INVESTIGATE. plan.rs 구조 조사
+## [P1] WSWAP-3.5-SPEC. Architect: spec 문서 갱신 (ENG-ALG-219/220 + INV-129)
 - **Status**: TODO
-- **Sprint**: future
-- **Dependencies**: Phase 3 완료
-- **담당 권장**: Senior Implementer
-- **Description**:
-  - `engine/src/core/plan.rs` 또는 동등 경로의 `_entry_ratio_generation` 이름/정확한 위치 파악
-  - Capture 시점 (plan build 초기), 비교 시점 (`PartitionStep::run`), bump source(현재: tensor partition 경로) 조사
-  - Weight swap의 `ratio_generation` bump가 plan 재빌드를 트리거하는지 검증 테스트 작성
-  - 미동작 시 원인 분석 (counter 공유 여부, comparison 시점 등)
-- **Acceptance Criteria**:
-  - 조사 리포트 (`results/data/weight_swap/phase_3_5_investigation.md`)
-  - 재현 가능한 테스트 케이스 (weight swap → plan stale 감지 여부)
-- **Notes**: 구현 없이 조사 및 테스트만. 설계 문제 발견 시 WSWAP-3.5-DESIGN으로 진입.
-
-## [P3] WSWAP-3.5-DESIGN. Architect: 배선 설계
-- **Status**: TODO
-- **Sprint**: future
-- **Dependencies**: WSWAP-3.5-INVESTIGATE
+- **Sprint**: current
+- **Dependencies**: 없음 (선행 task)
 - **담당 권장**: Architect
+- **예상 기간**: 0.5일
 - **Description**:
-  - INVESTIGATE 결과를 근거로 plan invalidation 배선 설계
-  - 옵션:
-    1. Weight swap 경로도 같은 `ratio_generation` counter 사용 (현재 arch 전제) — bump 호출 위치만 추가
-    2. 별도 `weight_generation` counter 도입 + plan build에서 합산
-    3. Unified `PlanInvalidation` event 시스템 도입
-  - SOLID 원칙 리뷰 + spec ENG-ALG-200(기존 plan partition) 업데이트
+  - `spec/32-engine-algorithms.md`에 두 개 알고리즘 신설:
+    - `ENG-ALG-219` — Plan Generation Capture & Compare (build 시 `ratio_generation_at_build` 캡처, execute 진입 시 atomic Acquire load 1회 비교, mismatch → `PlanInvalidated` 반환)
+    - `ENG-ALG-220` — Plan Invalidation Lazy Rebuild Fallback (caller가 `PlanInvalidated` 수신 시 `forward_gen` 경로로 fallback 후 다음 forward 호출에서 plan을 lazy rebuild)
+  - `spec/41-invariants.md`에 `INV-129` 신설 — Plan ↔ Global Generation Coherence (plan 캡처 generation과 모델 현재 generation이 다르면 plan 사용 금지)
+  - `INV-120` (기존 partition generation 일관성)과의 관계 명시 — INV-120은 partition 경로 한정, INV-129는 global path 전반 (둘 다 trigger source일 수 있음)
+  - spec 문서의 알고리즘/불변식 카운트 갱신 (`spec/COVERAGE.md` 동기화)
 - **Acceptance Criteria**:
-  - 설계 문서 (`arch/plan_partition_integration.md` 업데이트 또는 신규 `arch/plan_invalidation.md`)
-  - 새 spec ID (필요 시) 할당
-  - 테스트 요구사항 작성
+  - ENG-ALG-219, ENG-ALG-220, INV-129 ID 할당 + 본문 작성
+  - INV-120 vs INV-129 비교/우선순위 표 작성
+  - `spec/COVERAGE.md`의 알고리즘/불변식 매핑 갱신
+  - DF-35-3 결정 (tensor_partition × swap 상호 배타)을 INV-129 또는 ENG-ALG-220 본문에 명시
+  - 스펙 테스트 요구사항 초안 (feedback_spec_tests_required.md 준수)
+- **Notes**: spec-manage 스킬 사용. 이 작업 완료 전까지 IMPL 착수 금지. WSWAP-3.5-ARCH와 일부 병행 가능하지만 ENG-ALG ID 발급은 이 작업이 먼저.
 
-## [P3] WSWAP-3.5-IMPL. 구현 + 테스트
+## [P1] WSWAP-3.5-ARCH. Architect: arch 문서 v5 §2.2.1 + cross-ref 추가
 - **Status**: TODO
-- **Sprint**: future
-- **Dependencies**: WSWAP-3.5-DESIGN
-- **담당 권장**: Senior Implementer (plan.rs 수정 위험 민감)
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.5-SPEC
+- **담당 권장**: Architect
+- **예상 기간**: 0.5일
 - **Description**:
-  - DESIGN 결과에 따라 배선 구현
-  - 신규 spec 테스트 추가
+  - `arch/weight_swap.md` v4 → v5
+    - 새 §2.2.1 "plan 경로 소비 규약" 서브섹션 추가
+    - 내용: `FullKernelPlan` 빌드 시 `ratio_generation_at_build` 캡처, execute 진입 시 단 1회 Acquire load, mismatch → caller `forward_gen` lazy fallback (DF-35-1, DF-35-2)
+    - DF-35-3 상호 배타 결정을 §3 dispatch flow에 반영 (swap 실행 시 partition_ctx 강제 None)
+  - `arch/plan_partition_integration.md` 부록 A.11 갱신
+    - ENG-ALG-219 cross-ref 추가
+    - INV-120(partition generation) ↔ INV-129(global generation) 비교표 (스코프, trigger source, 우선순위, 위반 시 동작)
+  - feedback_arch_component_centric.md 준수 (component-centric 서술)
+  - feedback_mermaid_diagrams.md 준수 (필요 시 Mermaid 시퀀스 다이어그램)
 - **Acceptance Criteria**:
-  - Weight swap 후 첫 forward에서 plan 재빌드 or forward_gen fallback 정확히 1회 트리거
-  - 기존 tensor partition 경로 회귀 없음
-  - 모든 기존 spec 테스트 통과
+  - `arch/weight_swap.md` 제목 줄에 v5 표기 + changelog 항목 추가
+  - §2.2.1 신설 + DF-35 결정 4건 모두 인용
+  - `arch/plan_partition_integration.md` A.11에 INV-120 vs INV-129 표 작성
+  - cross-ref ID는 spec과 정확히 일치
+- **Notes**: spec-manage 스킬 동기화. arch와 spec ID/조건이 완전히 일치해야 함.
+
+## [P1] WSWAP-3.5-TEST. Implementer: spec 테스트 신규 작성
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.5-SPEC, WSWAP-3.5-ARCH
+- **담당 권장**: Implementer
+- **예상 기간**: 1일
+- **Description**:
+  - `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` 신규
+  - 테스트 케이스:
+    1. **Basic stale detection**: mock으로 `ratio_generation.fetch_add(1)` 후 `plan.execute()` → `PlanInvalidated` 반환 확인
+    2. **Same generation pass**: ratio_generation 변동 없을 때 plan.execute() 정상 진행
+    3. **INV-120/INV-129 양방향 trigger interleaving**: tensor_partition rebuild trigger와 weight swap trigger가 교차 발생 시 둘 다 invalidation 감지
+    4. **INV-129 stale detection 단위 테스트**: plan 캡처 generation < 현재 generation → invalidation
+    5. **Lazy rebuild path**: PlanInvalidated 수신 후 caller가 forward_gen으로 fallback, 다음 호출에 새 plan 빌드되는 통합 시나리오 (mock backend)
+  - WSWAP-3.6 (SOA registry)과 분리하여 plan invalidation 단독 회귀 안전망 확보
+- **Acceptance Criteria**:
+  - 5개 케이스 모두 통과
+  - `cargo test --workspace` clean
+  - `cargo clippy --workspace -- -D warnings` clean
+  - feedback_spec_tests_required.md 준수: `tests/spec/` 배치, inline `#[cfg(test)]` 불충분
+  - 각 테스트 함수 docstring에 spec ID 명시
+- **Notes**: IMPL 작업과 병행 가능 — 테스트 먼저 빨갛게 작성한 뒤 IMPL이 초록으로 만드는 것을 권장(TDD 친화).
+
+## [P1] WSWAP-3.5-IMPL. Implementer: plan 캡처 + execute 비교 + dispatch 배선
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.5-SPEC, WSWAP-3.5-ARCH
+- **담당 권장**: Implementer
+- **예상 기간**: 1~2일
+- **Description**:
+  - **(A) FullKernelPlan 필드 추가** — `engine/src/backend/opencl/plan.rs::FullKernelPlan`
+    - `ratio_generation_at_build: u64`
+    - `ratio_generation_counter: Arc<AtomicU64>`
+    - `execute()` 진입부 1회 `counter.load(Ordering::Acquire)` → `ratio_generation_at_build`와 비교
+    - mismatch 시 `Err(PlanError::PlanInvalidated)` 반환 (또는 `Result<_, PlanInvalidated>` 형태)
+  - **(B) plan build 시 캡처** — `build_full_plan` 호출부에서 `model.ratio_generation.clone()` 캡처
+  - **(C) forward_into 배선** — `engine/src/models/transformer.rs::forward_into`
+    - 기존 `_entry_ratio_generation` 인자의 underscore 제거 → 정상 사용
+    - plan 경로로 `ratio_generation_counter` Arc 전달
+  - **(D) dispatch lazy fallback** — `engine/src/bin/generate.rs`
+    - `PlanInvalidated` 수신 시 forward_gen fallback (기존 tensor_partition stale 감지 패턴 재활용)
+    - 다음 호출에 plan rebuild trigger
+  - **(E) DF-35-3 상호 배타** — `SwapExecutor::execute_swap` 또는 `dispatch_swap_weights`
+    - swap 실행 시 `partition_ctx = None` 강제 (구조적으로 둘 다 plan invalidate, 동시 활성 정의되지 않음)
+    - clear에 대한 이벤트/로그 발행
+  - 기존 tensor_partition rebuild 경로 (INV-120) 회귀 없음 보장
+- **Acceptance Criteria**:
+  - WSWAP-3.5-TEST의 5개 케이스 통과
+  - 기존 spec 340 + 신규 케이스 합쳐 전체 pass
+  - `cargo build --workspace --release` clean
+  - `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` clean
+  - 호스트 generate 회귀 없음 (단순 prompt → 정상 토큰 생성)
+  - swap → 다음 forward에서 정확히 1회 PlanInvalidated → forward_gen fallback → 그 다음 forward에서 plan rebuild 발생 (event 또는 log로 검증)
+  - `--tensor-partition <r>` + swap 동시 시도 시 swap 직후 partition_ctx None 확인 (디버그 로그 또는 단위 테스트)
+- **Notes**: 가장 큰 위험 — plan.rs 시그니처 변경으로 호출부 다수 영향. plan 시그니처는 architect와 사전 합의된 형태 유지. forward 핫패스에 atomic load 1회 추가는 negligible (Acquire load는 ARM relaxed 기준 단일 dmb ld). 완료 후 자동 커밋 + `notify-send`.
+
+---
+
+# Phase 3.6 — Noshuffle SOA Registry Coherence (Phase 3.5와 독립)
+
+> **목표**: Q4_0 weight swap 시 OpenCLBackend의 `noshuffle_soa_registry` 무효화. 디바이스 한정 silent correctness bug 차단.
+> **전제**: Phase 3 완료. Phase 3.5와 병행 가능.
+> **머지 조건**: Phase 4 디바이스 실측 진입 전 필수.
+>
+> **배경**:
+> - OpenCLBackend의 `noshuffle_soa_registry`는 HashMap (key = `cl_mem` 포인터 주소).
+> - Q4_0 weight swap은 layer의 weight 버퍼를 새 `cl_mem`으로 교체하므로 기존 key가 stale이 됨.
+> - 현재 `SwapExecutor`는 이 registry를 invalidate하지 않음 → 다음 forward에서 stale entry 조회 시 silent garbage.
+> - 호스트 NVIDIA 백엔드에서는 fallback 경로가 다르므로 발현 안 됨. **디바이스(Adreno) 한정** correctness 이슈.
+
+## [P1] WSWAP-3.6-SOA. SwapExecutor가 OpenCL Noshuffle SOA registry invalidate
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: Phase 3 완료 (Phase 3.5와 독립적으로 진행 가능, Phase 4 진입 전 머지 필수)
+- **담당 권장**: Senior Implementer (`backend/opencl/` + cl_mem 수명관리 영역)
+- **예상 기간**: 1~2일
+- **Description**:
+  - **(A) Spec 신설** — `spec/41-invariants.md`에 `INV-130` 추가
+    - "Noshuffle SOA Registry Coherence": weight swap 후 OpenCLBackend의 noshuffle SOA registry는 stale `cl_mem` 키를 보유하지 않아야 한다. 모든 key는 현재 layer가 보유한 활성 buffer를 가리킨다.
+  - **(B) Backend API 노출** — `engine/src/backend/opencl/mod.rs`
+    - `clear_noshuffle_soa_registry()` 또는 `invalidate_noshuffle_soa_layer(layer_idx)` API 추가
+    - 후자가 우선(범위 좁음). 단 현재 구조상 layer→cl_mem 역인덱스가 없으면 전체 clear가 단순/안전
+  - **(C) SwapExecutor 호출 배선** — `engine/src/models/weights/swap_executor.rs` (또는 동등 경로)
+    - step e (Arc swap) 직전 또는 직후에 backend.clear_noshuffle_soa_registry() 호출
+    - 호출 시점은 forward 진입 가능 윈도우 직전이어야 함 (Architect와 사전 합의 권장)
+  - **(D) 자연 재등록 검증**
+    - 다음 forward → plan rebuild → noshuffle SOA 등록 경로 재진입 → 새 cl_mem 주소로 자연 재등록되는 흐름 확인
+  - **(E) 테스트** — `engine/tests/spec/test_inv_130_noshuffle_soa_coherence.rs` 신규
+    - mock OpenCLBackend로 swap 전후 registry 상태 검증
+    - 디바이스 실측은 Phase 4 (`WSWAP-4-LATENCY`/`WSWAP-4-PSS`와 통합 시나리오)
+- **Acceptance Criteria**:
+  - INV-130 spec 신설 + arch 문서(`arch/weight_swap.md`)에 cross-ref
+  - 호스트 단위 테스트 통과 (registry clear, swap 후 stale key 없음)
+  - 호스트 generate 회귀 없음 (CPU 백엔드 / OpenCL fallback 백엔드 모두)
+  - clippy clean, fmt clean
+  - SwapExecutor 호출 순서가 docstring에 명시 (Arc swap 시점과의 ordering)
+- **Notes**:
+  - **임팩트 우선순위**: 디바이스 silent correctness bug → Phase 4 실측 결과 신뢰성에 직결. 따라서 P1.
+  - Phase 3.5와 독립이지만 둘 다 Phase 4 진입 전 필수 머지. 진행 우선순위: 3.5와 병렬 처리 권장.
+  - Architect 사전 검토 권장 항목: registry per-layer invalidation API vs 전체 clear 트레이드오프.
+  - 완료 후 자동 커밋 + `notify-send`.
 
 ---
 
@@ -512,11 +625,12 @@
 > **목표**: Galaxy S25에서 PSS 감소량 / swap latency / TBT 영향 / INV-122 임계값을 실측하고 spec 값 조정.
 > **예상 기간**: 4–6일 (4개 작업)
 > **기대 효과**: production 적용 가능성 판단 + spec 값 확정.
+> **블로커**: Phase 3.5(plan invalidation) + Phase 3.6(SOA registry) 머지 후 진입.
 
 ## [P2] WSWAP-4-LATENCY. Swap latency 실측 (Galaxy S25)
-- **Status**: TODO
+- **Status**: BLOCKED
 - **Sprint**: next
-- **Dependencies**: Phase 3 완료
+- **Dependencies**: Phase 3.5 (WSWAP-3.5-IMPL) + Phase 3.6 (WSWAP-3.6-SOA) 머지 완료
 - **담당 권장**: Tester
 - **Description**:
   - `SwapExecutor` 내부 타임스탬프: (a) secondary slice 추출, (b) Q/K permutation, (c) LayerWeights 구성, (d) Arc swap, (e) madvise
@@ -582,20 +696,27 @@
 
 ---
 
-# 이번 스프린트 최우선 5개 작업 (PM 추천)
+# 이번 스프린트 최우선 5개 작업 (PM 추천, 2026-04-25 갱신)
 
-1. **WSWAP-1-SPEC** — Architect Spec/Arch 재작성 (Architect, 2–3일)
-   - 이유: 폐기된 정적 전제가 spec 여러 곳에 섞여 있음. 구현 착수 전 반드시 동적 노선 기준으로 재정리. `LayerSlot` 데이터 구조, `SwapWeights { ratio }` 메시지, on-demand `ImportanceCollector` 활성화 정책, fallback policy, INV 3종 신설 필요.
-2. **WSWAP-1-SLOT** — `LayerSlot` + `TransformerWeights` 리팩토링 (Senior Implementer, 3–4일)
-   - 이유: forward 경로 전체에 영향. R-new-1 (Arc 간접 참조 회귀) 완화 여부가 Phase 2/3 전체 의미를 결정. 이 작업이 회귀 없이 완료되어야 후속 진행 가치 있음.
-3. **WSWAP-1-MMAP** — Secondary GGUF mmap handle 인프라 (Implementer, 1–2일)
-   - 이유: SLOT 작업과 병행 가능. secondary 파일 open/shape 검증/lazy slice 메타데이터 준비.
-4. **WSWAP-1-CLEANUP** — 폐기 코드 제거 (Implementer, 0.5–1일)
-   - 이유: 정적 프로파일 경로(`quantize_profile`, `LayerDtypeProfile`, `--layer-dtype-profile`)를 명시적으로 삭제하여 잔여 혼선 방지. feat/weight 브랜치 정리 차원.
-5. **WSWAP-2-EXEC** — `SwapExecutor` 구현 (Senior Implementer, 3–4일)
-   - 이유: Phase 2의 핵심 단위. Arc swap + madvise + Q/K permutation을 단일 원자 연산으로 묶는 실행기. Phase 1 완료 직후 착수.
+> Phase 1~3는 `07b8fa3` 시점에 완료. 이번 스프린트는 Phase 3.5(plan invalidation 배선) + Phase 3.6(SOA registry coherence) 마무리에 집중.
 
-**스프린트 목표**: Phase 1 완료 + Phase 2의 `SwapExecutor` 착수. 즉 "LayerSlot 구조가 forward 회귀 없이 도입되고, Secondary mmap이 lazy로 붙으며, 수동 trigger로 swap이 동작"하는 상태까지.
+1. **WSWAP-3.5-SPEC** — Architect: ENG-ALG-219/220 + INV-129 신설 (Architect, 0.5일) [선행]
+   - 이유: ID 발급 + 본문이 있어야 ARCH/TEST/IMPL 모두 cross-ref 가능. 가장 먼저 처리.
+2. **WSWAP-3.5-ARCH** — Architect: arch v5 §2.2.1 + INV-120/INV-129 비교표 (Architect, 0.5일)
+   - 이유: SPEC과 동시 또는 직후. IMPL에 진입하기 전 component-centric 서술과 DF-35 결정 4건 모두 문서에 반영.
+3. **WSWAP-3.5-TEST** — Implementer: spec 테스트 5케이스 신규 (Implementer, 1일)
+   - 이유: SPEC/ARCH 완료 후 IMPL과 병행 가능. TDD 친화적으로 IMPL이 초록을 만드는 구조.
+4. **WSWAP-3.5-IMPL** — Implementer: plan 캡처 + execute 비교 + dispatch 배선 (Implementer, 1~2일)
+   - 이유: Phase 3.5의 핵심 구현. plan.rs 시그니처 변경 + forward_into 인자 underscore 제거 + lazy fallback + DF-35-3 상호 배타 강제.
+5. **WSWAP-3.6-SOA** — Senior Implementer: OpenCL Noshuffle SOA registry invalidation (Senior Implementer, 1~2일)
+   - 이유: 디바이스 한정 silent correctness bug. Phase 4 실측 신뢰성의 전제. Phase 3.5와 독립이라 병렬 처리 가능. INV-130 신설 + SwapExecutor 호출 배선 + 단위 테스트.
+
+**스프린트 목표**: Phase 3.5 + Phase 3.6 머지 → Phase 4 디바이스 실측 진입 가능 상태.
+
+**작업 순서 / 의존**:
+- 직렬: WSWAP-3.5-SPEC → WSWAP-3.5-ARCH → (WSWAP-3.5-TEST, WSWAP-3.5-IMPL 병렬) → 머지
+- 병렬: WSWAP-3.6-SOA는 Phase 3.5와 독립 진행 (Senior Implementer 별도 자원)
+- WSWAP-3.5-TEST와 WSWAP-3.5-IMPL은 같은 작업 묶음(IMPL이 TEST를 통과시킴) — TDD 방식 권장하나 강제는 아님
 
 ---
 
@@ -667,11 +788,14 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
 
 # 사용자 확인 필요한 미결 사항
 
-1. **Arc snapshot 구체 구현 선택**: `Arc<LayerSlot>` + `Mutex` vs `arc_swap::ArcSwap` vs custom generation-counter 방식. Senior Implementer가 WSWAP-1-SLOT 착수 전 PoC로 비교 측정 권장. 사용자 선호가 있으면 알려주세요.
-2. **Fallback policy의 K 값 (decode 중 신호 수신 시 강제 uniform 트리거 기준)**: 제안 K=512. 실제 사용 시나리오(장문 생성 vs 단문 응답)에 따라 조정 필요. Architect가 spec에서 결정하되 사용자 검토 요청.
-3. **`--force-swap-ratio` CLI 플래그 유지 범위**: 디버그 전용이지만 feat/weight merge 후에도 유지할지, Phase 4 완료 시 제거할지. 기본 제안: feature flag로 보호하여 유지 (현장 디버깅 용도).
-4. **KV swap handler와의 상호작용**: 현재 KV `SwapHandler`는 스텁 상태. Weight swap 우선으로 진행하되, 향후 KV swap 구현 시 handler 실행 순서 (weight 먼저 vs KV 먼저) 결정 필요. Architect가 spec에 기록.
-5. **Qwen 2.5 1.5B 포함 여부**: 기존 초안에서는 검증 대상이었으나 재설계 전제에는 Llama 3.2 1B만 명시. Phase 4 실측에 Qwen 포함 여부 확인 필요.
+> Phase 1~3 완료 시점에 1~2번 항목은 구현 선택지로 해소(`Arc<LayerSlot>` 채택, fallback K=512). 아래는 Phase 3.5 진입 이후 잔존 미결 항목.
+
+1. ~~**Arc snapshot 구체 구현 선택**~~ — `Arc<LayerSlot>` 채택 완료 (`07b8fa3`).
+2. ~~**Fallback policy의 K 값**~~ — K=512 채택 완료.
+3. **`--force-swap-ratio` CLI 플래그 유지 범위**: 디버그 전용이지만 feat/weight merge 후에도 유지할지, Phase 4 완료 시 제거할지. 기본 제안: feature flag로 보호하여 유지 (현장 디버깅 용도). **결정 보류**.
+4. **KV swap handler와의 상호작용**: 현재 KV `SwapHandler`는 스텁 상태. Weight swap 우선으로 진행하되, 향후 KV swap 구현 시 handler 실행 순서 (weight 먼저 vs KV 먼저) 결정 필요. Architect가 spec에 기록. **결정 보류**.
+5. **Qwen 2.5 1.5B 포함 여부**: 기존 초안에서는 검증 대상이었으나 재설계 전제에는 Llama 3.2 1B만 명시. Phase 4 실측에 Qwen 포함 여부 확인 필요. **결정 보류**.
+6. **Phase 3.6 SOA invalidation 범위**: per-layer entry 제거 vs 전체 clear 트레이드오프. Senior Implementer가 WSWAP-3.6-SOA 착수 시 backend 내부 데이터 구조 보고 결정 — registry 크기와 swap 빈도 비교해서 전체 clear가 단순/안전하면 후자 채택 권장. Architect 사전 검토 권장.
 
 ---
 
@@ -679,3 +803,5 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
 
 - 2026-04-24 (초안): Phase A/B/C 정적 설계 기반 작성.
 - 2026-04-24 (재작성): 사용자 의도 재확인 결과 **정적 프로파일 노선 전면 폐기**. 동적 swap 노선으로 Phase 1–4 구조 재설계. 폐기: `quantize_profile` 바이너리, `LayerDtypeProfile` TOML, `--layer-dtype-profile` CLI. 신규: `LayerSlot` + `SwapExecutor` + `WeightSwapHandler` + `SwapDecider` + `ResilienceAction::SwapWeights { ratio }`. QCF 측정은 prefill-tail 1회 + on-demand 플래그 모드. INV-122 유지, `ENG-DAT-091` 폐기.
+- 2026-04-24 (Phase 1~3 완료): 커밋 `07b8fa3`. spec 340 pass, clippy --all-targets clean. Phase 1~3 모든 task DONE 처리. handoff 메모: `project_weight_swap_phase3_handoff.md`.
+- 2026-04-25 (Phase 3.5 진입): 사용자 결정 DF-35-1~4 확정. 기존 Phase 3.5 placeholder(INVESTIGATE/DESIGN/IMPL) 폐기 후 4-task 구체화 — SPEC(ENG-ALG-219/220 + INV-129) → ARCH(weight_swap.md v5 §2.2.1 + plan_partition_integration.md A.11) → TEST(test_eng_alg_219_plan_invalidation.rs) → IMPL(FullKernelPlan 캡처/execute 비교, forward_into underscore 제거, lazy rebuild, DF-35-3 상호 배타). 신규 Phase 3.6 추가 — SOA(OpenCLBackend noshuffle_soa_registry invalidation, INV-130 신설). Phase 4는 3.5+3.6 머지 후 진입으로 BLOCKED 처리.
