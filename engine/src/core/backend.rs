@@ -549,6 +549,20 @@ pub trait Backend: Send + Sync {
         usize::MAX
     }
 
+    /// Invalidate backend-internal caches keyed by weight tensor `cl_mem`
+    /// addresses after a runtime weight swap (ENG-ALG-221 / INV-130).
+    ///
+    /// The OpenCL backend overrides this to clear
+    /// `noshuffle_soa_registry` (HashMap keyed by old `cl_mem` addresses).
+    /// `SwapExecutor::execute_on_slots` is contracted to call this exactly
+    /// once per non-empty swap batch — before bumping `ratio_generation` so
+    /// that the subsequent `FullKernelPlan` rebuild observes a clean slate
+    /// and re-registers SOA descriptors against the new cl_mem keys.
+    ///
+    /// Device-only: the Adreno noshuffle Q4_0 GEMV path is the sole consumer.
+    /// CPU / CUDA defaults are no-op. Callers may invoke unconditionally.
+    fn invalidate_noshuffle_soa_registry(&self) {}
+
     /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
     /// Default: CPU fallback (returns false).
     #[allow(unused_variables, clippy::too_many_arguments)]

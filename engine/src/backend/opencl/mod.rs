@@ -3514,6 +3514,15 @@ impl Backend for OpenCLBackend {
         self.max_mem_alloc_size
     }
 
+    /// ENG-ALG-221 / INV-130: drop every Q4_0 noshuffle SOA descriptor so the
+    /// next `FullKernelPlan` rebuild (triggered by the `SwapExecutor`'s
+    /// `ratio_generation` bump) re-registers against the new `cl_mem`
+    /// addresses. See `clear_noshuffle_soa_registry` doc for the underlying
+    /// mechanics. No-op on backends that never populated the registry.
+    fn invalidate_noshuffle_soa_registry(&self) {
+        self.clear_noshuffle_soa_registry();
+    }
+
     fn flash_attention_prefill(
         &self,
         q: &Tensor,
