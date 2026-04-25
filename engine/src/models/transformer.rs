@@ -1362,13 +1362,27 @@ impl TransformerModel {
         if layer_snaps.is_empty() {
             return None;
         }
-        let weight_dtype = layer_snaps[0].wq.dtype();
-        let is_f16 = weight_dtype == crate::core::buffer::DType::F16;
-        let is_q4_0 = weight_dtype == crate::core::buffer::DType::Q4_0;
-        // GPU plan supports F16 weights or Q4_0 with noshuffle SOA conversion
-        if !is_f16 && !is_q4_0 {
+        // ENG-ALG-219 / weight-swap: per-layer dtype tracking. A weight swap
+        // batch may leave the model in a *mixed* state (some layers F16, some
+        // Q4_0) — `uniform_target_layers` deliberately excludes layer 0 for
+        // ratio ≤ 0.5. Earlier the plan derived a single `is_q4_0` flag from
+        // layer 0 alone, which routed every Q4_0 layer through the F16 matmul
+        // kernel and produced silent garbage (Phase 3.7b ratio scan: ratios
+        // 0.10/0.20/0.25/0.50 stuck in invisible-token loop). The plan now
+        // accepts heterogeneous F16 + Q4_0 layers; per-layer noshuffle lookup
+        // selects the correct matmul step inside `build_layer_plan`.
+        //
+        // GPU plan supports F16 weights or Q4_0 with noshuffle SOA conversion.
+        // Reject the plan only when at least one layer has neither dtype.
+        if layer_snaps.iter().any(|l| {
+            let d = l.wq.dtype();
+            d != crate::core::buffer::DType::F16 && d != crate::core::buffer::DType::Q4_0
+        }) {
             return None;
         }
+        let any_q4_0 = layer_snaps
+            .iter()
+            .any(|l| l.wq.dtype() == crate::core::buffer::DType::Q4_0);
 
         // kernel_add_row_bias expects F32 bias buffers. If any layer has
         // a QKV bias that isn't F32, fall back to the legacy path.
@@ -1413,19 +1427,30 @@ impl TransformerModel {
             .as_any()
             .downcast_ref::<crate::backend::opencl::OpenCLBackend>()?;
 
-        // For Q4_0 weights, verify noshuffle SOA entries are available.
-        // If any weight lacks a q_img (noshuffle image), fall back to legacy path.
-        if is_q4_0 {
-            let first_wq_key = cl!(layer_snaps[0].wq).as_ptr() as usize;
-            match ocl_backend.lookup_noshuffle_soa(first_wq_key) {
+        // For each Q4_0 layer, verify the noshuffle SOA entry (with q_img)
+        // is available. Mixed-state batches install Q4_0 layers piecewise so
+        // the layer 0-only check that lived here previously was insufficient
+        // — if layer 0 stays F16 and layer 1 is freshly Q4_0, missing layer 1
+        // SOA must still abort the GPU plan and force the legacy path.
+        for layer in &layer_snaps {
+            if layer.wq.dtype() != crate::core::buffer::DType::Q4_0 {
+                continue;
+            }
+            let wq_key = cl!(layer.wq).as_ptr() as usize;
+            match ocl_backend.lookup_noshuffle_soa(wq_key) {
                 Some(e) if e.q_img.is_some() => {}
                 _ => return None,
             }
         }
 
-        // Helper: lookup noshuffle SOA entry and return NoshufflePlanEntry if available.
+        // Helper: lookup noshuffle SOA entry and return NoshufflePlanEntry if
+        // available. Per-tensor dtype gate — F16 weights legitimately have no
+        // SOA entry and must return None so `build_layer_plan` selects the
+        // F16 matmul step. Q4_0 weights with a missing entry also return
+        // None, but the per-layer abort above means we never reach this with
+        // an unregistered Q4_0 weight in production.
         let ns_entry = |tensor: &Tensor| -> Option<NoshufflePlanEntry<'_>> {
-            if !is_q4_0 {
+            if tensor.dtype() != crate::core::buffer::DType::Q4_0 {
                 return None;
             }
             let key = cl!(tensor).as_ptr() as usize;
@@ -1490,8 +1515,12 @@ impl TransformerModel {
             });
         }
 
-        // Build noshuffle GEMV programs if Q4_0 (compile per unique ne01 dimension).
-        let noshuffle_programs = if is_q4_0 {
+        // Build noshuffle GEMV programs whenever *any* layer is Q4_0
+        // (compile per unique ne01 dimension). In a heterogeneous F16+Q4_0
+        // mixed-state batch the F16 layers contribute no entries to the
+        // ne01 set; only the Q4_0 layers do, which is exactly what the
+        // noshuffle programs need to cover.
+        let noshuffle_programs = if any_q4_0 {
             // Collect unique ne01 values from all noshuffle entries — including
             // partition slice entries whose `ne01` (split_row or hidden_size)
             // typically differs from the full weight's ne01.
@@ -1689,11 +1718,19 @@ impl TransformerModel {
 
         match build_full_plan(&full_config) {
             Ok(plan) => {
+                // Mixed-state diagnostic: count Q4_0 layers explicitly so a
+                // partial swap shows up (e.g. "8/16 Q4_0 noshuffle") rather
+                // than collapsing to a single boolean.
+                let q4_0_count = layer_snaps
+                    .iter()
+                    .filter(|l| l.wq.dtype() == crate::core::buffer::DType::Q4_0)
+                    .count();
                 log::info!(
-                    "GPU kernel plan built ({} layers, capacity={}, q4_noshuffle={})",
+                    "GPU kernel plan built ({} layers, capacity={}, q4_noshuffle={}/{})",
                     self.layers.len(),
                     capacity,
-                    is_q4_0,
+                    q4_0_count,
+                    self.layers.len(),
                 );
                 Some(plan)
             }
@@ -1813,7 +1850,15 @@ impl TransformerModel {
         if layer_snaps.is_empty() {
             return None;
         }
-        if layer_snaps[0].wq.dtype() != crate::core::buffer::DType::F16 {
+        // KIVI plan currently only supports F16 weights. Reject if *any*
+        // layer is not F16 — a weight-swap batch may have flipped a subset of
+        // layers to Q4_0 while leaving layer 0 F16 (mixed state). Checking
+        // only layer 0 would silently dispatch the F16 matmul kernel against
+        // a Q4_0 buffer and produce garbage on the affected layers.
+        if layer_snaps
+            .iter()
+            .any(|l| l.wq.dtype() != crate::core::buffer::DType::F16)
+        {
             return None;
         }
         if backend.name() != "OpenCL" || kv_caches.is_empty() {
