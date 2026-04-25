@@ -327,6 +327,15 @@ impl<'a> SwapExecutor<'a> {
 
         // Optional Gemma3 / Qwen norms — preserve existing tensors since
         // they are not part of the swap target set for this stage.
+        //
+        // DF-35-3 (ENG-ALG-219): tensor_partition × weight swap are mutually
+        // exclusive. A weight swap installs new cl_mem handles for the weight
+        // buffers; any pre-existing PartitionContext still points at the OLD
+        // cl_mem slices and is therefore invalid after the swap. Force
+        // partition_ctx to None so the plan-path correctly falls back to the
+        // GPU-only FFN rather than dispatching a stale partition step.
+        // The caller (generate.rs) will reinstate partition via
+        // `prepare_tensor_partition` if `--tensor-partition` is active.
         Ok(TransformerLayer {
             wq,
             wk,
@@ -342,7 +351,7 @@ impl<'a> SwapExecutor<'a> {
             k_norm: old.k_norm.clone(),
             pre_ffn_norm: old.pre_ffn_norm.clone(),
             post_ffn_norm: old.post_ffn_norm.clone(),
-            partition_ctx: old.partition_ctx.clone(),
+            partition_ctx: None, // DF-35-3: cleared on swap (see above)
         })
     }
 
