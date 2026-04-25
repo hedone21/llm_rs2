@@ -918,6 +918,17 @@ pub struct FullKernelPlan {
     /// `GpuScoreAccumulator::reduce_layer` per layer and `end_step` after
     /// the final layer, mirroring the non-plan path in `transformer.rs`.
     pub writes_gpu_scores: bool,
+    /// ENG-ALG-219: `TransformerModel::ratio_generation` value captured at
+    /// `build_plan` time (Acquire load). `execute()` compares the live counter
+    /// against this snapshot; a mismatch means a weight swap occurred after
+    /// plan construction and the pre-bound cl_mem handles are potentially
+    /// stale. Returns `PlanInvalidated` so the caller can rebuild (INV-129).
+    pub ratio_generation_at_build: u64,
+    /// Shared global generation counter. Arc clone of
+    /// `TransformerModel::ratio_generation` kept alive for the plan's
+    /// lifetime — cheap clone, ensures the atomic is not dropped while this
+    /// plan is cached.
+    pub ratio_generation_counter: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Error indicating the plan's pre-bound arguments are stale.
@@ -937,6 +948,30 @@ impl std::error::Error for PlanInvalidated {}
 ///
 /// Returns `Err(PlanInvalidated)` when `counter.load(Acquire) != at_build`.
 pub fn check_partition_generation(
+    at_build: u64,
+    counter: &Arc<std::sync::atomic::AtomicU64>,
+) -> std::result::Result<(), PlanInvalidated> {
+    use std::sync::atomic::Ordering;
+    let live = counter.load(Ordering::Acquire);
+    if live != at_build {
+        Err(PlanInvalidated)
+    } else {
+        Ok(())
+    }
+}
+
+/// ENG-ALG-219 global ratio_generation check as a free function — usable from
+/// tests without constructing a full `FullKernelPlan`.
+///
+/// Compares `at_build` (captured at `build_plan` time from
+/// `TransformerModel::ratio_generation`) against the current atomic value.
+/// Returns `Err(PlanInvalidated)` when a weight swap has advanced the counter
+/// past the captured snapshot, indicating that the plan's pre-bound cl_mem
+/// handles may reference stale weight buffers (INV-129).
+///
+/// Atomic ordering: Acquire load, matching the Release in `SwapExecutor`'s
+/// `ratio_generation.fetch_add(1, SeqCst)`.
+pub fn check_global_generation(
     at_build: u64,
     counter: &Arc<std::sync::atomic::AtomicU64>,
 ) -> std::result::Result<(), PlanInvalidated> {
@@ -1191,13 +1226,23 @@ impl FullKernelPlan {
     /// Updates only dynamic args (start_pos, cache_seq_len, write_pos),
     /// then enqueues all kernels in a tight loop with minimal CPU intervention.
     ///
-    /// Returns `Err(PlanInvalidated)` if KV cache capacity changed.
+    /// Returns `Err(PlanInvalidated)` if KV cache capacity changed or if
+    /// `TransformerModel::ratio_generation` has advanced since plan build
+    /// (ENG-ALG-219 global weight-swap invalidation, INV-129).
     pub fn execute<C: crate::core::kv_cache::KVCacheOps>(
         &self,
         backend: &crate::backend::opencl::OpenCLBackend,
         start_pos: usize,
         kv_caches: &mut [C],
     ) -> std::result::Result<(), PlanInvalidated> {
+        // ENG-ALG-219: single Acquire load at entry — if a weight swap has
+        // bumped ratio_generation since build_plan, the pre-bound cl_mem
+        // handles may reference stale weight buffers (INV-129).
+        check_global_generation(
+            self.ratio_generation_at_build,
+            &self.ratio_generation_counter,
+        )?;
+
         let debug_sync = std::env::var("PLAN_DEBUG").is_ok();
         let op_trace = std::env::var_os("LLMRS_OP_TRACE").is_some();
         let queue = backend.queue.as_core();
@@ -3840,6 +3885,11 @@ pub struct FullPlanConfig<'a> {
     /// `transformer::build_plan` is responsible for enforcing that exclusion
     /// before populating this field.
     pub hybrid_attn: Option<HybridAttnPlanConfig<'a>>,
+    /// ENG-ALG-219: `TransformerModel::ratio_generation` Arc clone passed in
+    /// from `build_plan`. The plan builder captures the current value with
+    /// Acquire and stores both into `FullKernelPlan`. `execute()` uses this
+    /// for the global weight-swap invalidation check (INV-129).
+    pub ratio_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Plan-build config describing the currently-installed UMA hybrid setup.
@@ -4193,12 +4243,21 @@ pub fn build_full_plan(config: &FullPlanConfig) -> Result<FullKernelPlan> {
         None
     };
 
+    // ENG-ALG-219: capture global ratio_generation at build time (Acquire).
+    // Stored in the plan so execute() can detect weight swaps without a
+    // second Arc clone per token (just one atomic load per execute call).
+    use std::sync::atomic::Ordering;
+    let ratio_generation_at_build = config.ratio_generation.load(Ordering::Acquire);
+    let ratio_generation_counter = config.ratio_generation.clone();
+
     Ok(FullKernelPlan {
         layers,
         final_norm,
         lm_head,
         kv_capacity: config.kv_capacity,
         writes_gpu_scores: config.needs_attention_scores && config.gpu_score_buf.is_some(),
+        ratio_generation_at_build,
+        ratio_generation_counter,
     })
 }
 
@@ -4272,6 +4331,10 @@ pub struct KiviFullPlanConfig<'a> {
     pub is_nosub: bool,
     /// dtype of the lm_head weight — see doc on `FullPlanConfig::lm_head_dtype`.
     pub lm_head_dtype: crate::core::buffer::DType,
+    /// ENG-ALG-219: `TransformerModel::ratio_generation` Arc clone. Captured
+    /// at build time; stored in the resulting `FullKernelPlan` for global
+    /// weight-swap invalidation checks in `execute()` (INV-129).
+    pub ratio_generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Build a KIVI gather_update kernel step for K or V.
@@ -4774,6 +4837,11 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
         None
     };
 
+    // ENG-ALG-219: capture global ratio_generation at KIVI plan build time.
+    use std::sync::atomic::Ordering as KiviOrd;
+    let ratio_generation_at_build = config.ratio_generation.load(KiviOrd::Acquire);
+    let ratio_generation_counter = config.ratio_generation.clone();
+
     Ok(FullKernelPlan {
         layers,
         final_norm,
@@ -4782,5 +4850,7 @@ pub fn build_kivi_full_plan(config: &KiviFullPlanConfig) -> Result<FullKernelPla
         // KIVI plans never bind a GPU score accumulator; scores are collected
         // on the CPU path when KIVI is active.
         writes_gpu_scores: false,
+        ratio_generation_at_build,
+        ratio_generation_counter,
     })
 }
