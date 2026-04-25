@@ -45,7 +45,7 @@ pub use section::{
     TAG_WEIGHTS_CUDA_AOS,
 };
 pub use source_hash::{compute_source_hash, compute_source_hash_from_bytes};
-pub use stripper::strip_bytes;
+pub use stripper::{strip, strip_bytes};
 pub use tensor_index::{LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind};
 pub use tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
 pub use writer::AufWriter;

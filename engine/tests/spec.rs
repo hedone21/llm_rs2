@@ -108,6 +108,18 @@ mod test_inv_131_soa_reconversion;
 #[path = "spec/test_inv_132_134_auf.rs"]
 mod test_inv_132_134_auf;
 
+// ── ENG-DAT-096 AUF Secondary Mmap adaptor (WSWAP-3.7B-ENGINE) ──
+// AUF 분기 detection, is_pre_converted_soa 계약, tensor bytes 서빙,
+// SOA bypass 메커니즘 검증.
+#[path = "spec/test_eng_dat_096_auf_secondary.rs"]
+mod test_eng_dat_096_auf_secondary;
+
+// ── Weight Swap INV-122 v2 — Mixed Precision Forward 정확성 ──
+// cond1: NMSE ≤ 0.01 (F16 baseline 대비), cond2: Δ top-1 ≤ 1 pp (Q4_0 baseline 대비).
+// 환경변수 LLM_RS_TEST_MODEL_F16 / LLM_RS_TEST_MODEL_Q4 미설정 시 graceful skip.
+#[path = "spec/test_inv_122_mixed_precision.rs"]
+mod test_inv_122_mixed_precision;
+
 // ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
 // Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
 #[path = "spec/test_inv_126_dtype_reserved.rs"]
