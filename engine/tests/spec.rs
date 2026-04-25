@@ -89,6 +89,13 @@ mod test_inv_125_secondary_mmap_lifetime;
 #[path = "spec/test_eng_alg_219_plan_invalidation.rs"]
 mod test_eng_alg_219_plan_invalidation;
 
+// ── Weight Swap Phase 3.6 — ENG-ALG-221 noshuffle SOA registry coherence ──
+// SwapExecutor invalidates OpenCLBackend noshuffle_soa_registry before the
+// ratio_generation bump so FullKernelPlan rebuild re-registers against new
+// cl_mem keys (INV-130).
+#[path = "spec/test_inv_130_noshuffle_soa_coherence.rs"]
+mod test_inv_130_noshuffle_soa_coherence;
+
 // ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
 // Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
 #[path = "spec/test_inv_126_dtype_reserved.rs"]
