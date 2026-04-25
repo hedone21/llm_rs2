@@ -16,9 +16,9 @@
 //! ## 검증 항목
 //!
 //! - [A] swap 후 이전 cl_mem 주소가 registry에서 제거되고 새 주소가 등록된다
-//!       (INV-130 + INV-131 연계 흐름 mock 검증).
+//!   (INV-130 + INV-131 연계 흐름 mock 검증).
 //! - [B] swap이 일부 layer에만 적용될 때 swap 안 된 layer의 SOA entry가
-//!       clear 정책(전체 invalidate)에 의해 제거되고, swap된 layer만 재등록된다.
+//!   clear 정책(전체 invalidate)에 의해 제거되고, swap된 layer만 재등록된다.
 //! - [C] Q4_0 이외의 dtype에 대해서는 SOA 재변환이 no-op으로 처리된다.
 //! - [D] CPU backend에서 SOA 재변환 흐름이 no-op으로 처리된다 (Adreno 아닌 경우).
 //!

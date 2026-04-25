@@ -841,6 +841,308 @@ classDiagram
 - 소비처: ENG-ALG-215 (layer 선택), ENG-ALG-217 (QCF_swap 공식), ENG-ALG-218 (QcfEstimate 응답).
 - 불변식: INV-127 (NaN layer 제외), INV-128 (QcfEstimate payload 누수 금지).
 
+### 3.22 AUF (Argus Unified Format) v0.1 — Self-Contained Weight Asset [ENG-DAT-096]
+
+**[ENG-DAT-096]** `AUF`는 Weight Swap Phase 3.7에서 도입되는 **자립적(self-contained) 가중치 자산 포맷**이다. 단일 파일에 모델 메타데이터, tokenizer, tensor index, 그리고 backend별 사전 변환된 weight payload를 포함하며, GGUF 원본 없이도 Engine이 동작 가능하다. **multi-variant single file** 방식으로 모든 backend variant(Adreno SOA / CUDA AOS / CPU AOS)를 한 파일에 동시 보관할 수 있고, 배포 시 dead variant를 strip할 수 있다. *(MUST)*
+
+**파일 식별**:
+
+| 속성 | 값 |
+|------|-----|
+| 확장자 | `.auf` |
+| 권장 파일명 | `secondary.auf` (Phase 3.7 컨텍스트), 일반 사용은 임의의 `<name>.auf` |
+| Magic bytes | `"ARGUS_W\0"` (8B, ASCII + NUL) |
+| Endianness | **little-endian** (전 필드 공통, ARM/x86 모두 자연) |
+
+**파일 식별 근거**: `"ARGUS_W\0"`는 AviUtl filter `.auf`(Windows GUI 자산)와 byte-level로 구분된다. ARGUS_ prefix는 향후 Argus 프로젝트가 다른 자산 포맷을 추가할 경우의 namespace 예약이다.
+
+#### 3.22.1 헤더 (256B 고정) [ENG-DAT-096.1]
+
+헤더는 파일 시작 0 ~ 255 바이트 영역에 고정 배치된다. 모든 multi-byte 필드는 little-endian.
+
+| Offset | Size | Field | Type | 의미 |
+|--------|------|-------|------|------|
+| 0 | 8 | `magic` | `[u8; 8]` | `"ARGUS_W\0"` 고정 |
+| 8 | 2 | `format_major` | `u16` | breaking change 시 증가 (v0.1 = 0) |
+| 10 | 2 | `format_minor` | `u16` | additive 변경 시 증가 (v0.1 = 1) |
+| 12 | 2 | `format_patch` | `u16` | reserved (v0.1 = 0) |
+| 14 | 2 | `_pad0` | `u16` | 0으로 채움 |
+| 16 | 32 | `created_by` | `[u8; 32]` | UTF-8, 우측 NUL 패딩 (예: `"llm_rs2 v0.4.0"`) |
+| 48 | 32 | `source_hash` | `[u8; 32]` | 원본 GGUF의 sha256 (또는 hybrid hash, §3.22.6) |
+| 80 | 8 | `source_size` | `u64` | 원본 GGUF 파일 바이트 크기 |
+| 88 | 8 | `source_mtime` | `u64` | 원본 GGUF mtime (Unix epoch seconds) |
+| 96 | 8 | `capability_required` | `u64` | reader가 모르면 reject할 capability bit set |
+| 104 | 8 | `capability_optional` | `u64` | reader가 모르면 skip해도 안전한 capability bit set |
+| 112 | 4 | `section_count` | `u32` | section table 엔트리 수 |
+| 116 | 4 | `_pad1` | `u32` | 0으로 채움 |
+| 120 | 8 | `section_table_offset` | `u64` | section table 시작 byte offset |
+| 128 | 8 | `payload_start_offset` | `u64` | 모든 section payload는 이 offset 이상 |
+| 136 | 120 | `_reserved` | `[u8; 120]` | 0으로 채움. 향후 capability 또는 stable 헤더 필드 확장 영역 |
+
+**총 256 바이트**.
+
+**금지 사항**:
+- 헤더에 `device_tag` 또는 `backend_id` 필드를 두지 않는다. multi-variant 파일이므로 backend 식별자는 각 `WEIGHTS_*` section의 tag로 표현한다.
+- `_pad*` / `_reserved` 영역은 v0.1 reader가 0이 아닌 값을 만나면 **무시**한다 (forward compat). v0.1 writer는 반드시 0으로 채운다.
+
+#### 3.22.2 Section Table Entry (48B) [ENG-DAT-096.2]
+
+Section table은 `header.section_table_offset`에서 시작하여 `section_count × 48` 바이트를 점유한다.
+
+| Offset | Size | Field | Type | 의미 |
+|--------|------|-------|------|------|
+| 0 | 16 | `tag` | `[u8; 16]` | UTF-8 ASCII section 식별자, 우측 NUL 패딩 |
+| 16 | 8 | `offset` | `u64` | 파일 시작 기준 payload 시작 byte offset |
+| 24 | 8 | `size` | `u64` | payload 바이트 크기 |
+| 32 | 4 | `flags` | `u32` | section flag bit set (§3.22.3) |
+| 36 | 4 | `version` | `u32` | section 자체 버전. additive 변경 추적 |
+| 40 | 8 | `_reserved` | `[u8; 8]` | 0으로 채움 |
+
+**총 48 바이트**.
+
+**Tag 명명 규약**: 대문자 + 언더스코어. 16B 초과 금지. 미사용 영역은 NUL 패딩.
+
+#### 3.22.3 Section Flag bits [ENG-DAT-096.3]
+
+`flags: u32` 필드의 비트 정의. 미정의 비트는 0으로 설정.
+
+| Bit | Name | 의미 |
+|-----|------|------|
+| 0 | `SECTION_REQUIRED` | reader가 이 section을 인식하지 못하면 파일을 reject |
+| 1 | `SECTION_STRIPPABLE` | `auf-tool strip`이 안전하게 제거 가능 |
+| 2 | `SECTION_COMPRESSED` | payload가 zstd 등으로 압축됨 (v0.1에서는 reserved, 사용 금지) |
+| 3..31 | reserved | 0으로 설정. 향후 capability flag 후보. |
+
+**제약**:
+- `SECTION_REQUIRED`와 `SECTION_STRIPPABLE`은 동시에 1로 설정할 수 없다 (논리 모순). writer는 mutually exclusive 검증.
+- v0.1에서 `SECTION_COMPRESSED = 1`인 section을 만나면 reader는 fail-fast하고 "compressed sections not supported in format_minor=1" 에러를 반환.
+
+#### 3.22.4 Section 카탈로그 (v0.1) [ENG-DAT-096.4]
+
+v0.1 reader/writer가 인식하는 section tag 목록. 6개로 시작하며, capability flag 미사용으로도 모든 정보가 표현된다.
+
+| Tag | required | strippable | version (v0.1) | 내용 |
+|-----|----------|------------|----------------|------|
+| `META` | yes | no | 1 | 모델 architecture (qwen2/llama 등), `n_layers`, `n_heads_q`, `n_kv_heads`, `head_dim`, `hidden_dim`, `ffn_dim`, `vocab_size`, `max_seq_len`, RoPE config (`theta`, `rotary_dim`, `scaling`), RMSNorm `epsilon`. JSON-in-binary (UTF-8 JSON, `size`로 길이 명시). |
+| `TOKENIZER` | yes | no | 1 | vocab strings, BPE merges, special token IDs (`bos_id`, `eos_id`, `pad_id`, `unk_id`), chat template. 직렬화 형식: §3.22.7 (Architect 결정 권고 — GGUF tokens 그대로 보존 + 이진 헤더). |
+| `TENSOR_INDEX` | yes | no | 1 | layer index → `(kind, shape, dtype, alignment, payload_offset)` 매핑. payload_offset은 해당 layer의 weight가 자신의 `WEIGHTS_*` section 내에서 차지하는 위치(section-local). |
+| `WEIGHTS_ADRENO_SOA` | no | yes | 1 | Adreno noshuffle SOA layout. Q4_0 `q_buf`(uint8 quants) + `d_buf`(f16 scales) 분리, `q_img` image2d 정렬 hint 포함. Q/K permute 사전 적용. |
+| `WEIGHTS_CUDA_AOS` | no | yes | 1 | CUDA용 AOS layout. `block_q4_0 = (half d, uint8 qs[16])` (18B) 그대로 + 128B align padding + Q/K permute 사전 적용. |
+| `WEIGHTS_CPU_AOS` | no | yes | 1 | CPU용 AOS layout. block_q4_0 그대로 + 64B align (NEON dotprod cache line) + Q/K permute 사전 적용. |
+
+**Reader 의무**:
+- 자기 backend의 `WEIGHTS_*` section을 자동 lookup. 부재 시 fail-fast하며 다음 메시지를 반환한다 (정확한 wording은 arch가 결정): `"AUF does not contain WEIGHTS_<XXX> section. Run 'auf-tool repack --add WEIGHTS_<XXX>' to add it from source GGUF."` (cf. INV-133)
+- `META`/`TOKENIZER`/`TENSOR_INDEX` 중 하나라도 없으면 fail-fast.
+
+**Writer 의무**:
+- Mode B (self-contained) 생성 시 `META`/`TOKENIZER`/`TENSOR_INDEX`는 항상 포함.
+- `WEIGHTS_*` 중 최소 1개 이상 포함 (그렇지 않으면 useless asset). 권장은 build 시점에 모든 backend variant 포함.
+
+#### 3.22.5 무결성 / Alignment 규약 [ENG-DAT-096.5]
+
+**Alignment**:
+
+| 영역 | 최소 alignment | 근거 |
+|------|---------------|------|
+| 헤더 | 0 (파일 시작) | 고정 위치 |
+| Section table | 8B | u64 필드 정합 |
+| `META` payload | 8B | JSON 시작 |
+| `TOKENIZER` payload | 8B | 이진 헤더 정합 |
+| `TENSOR_INDEX` payload | 8B | u64 offset/size 정합 |
+| `WEIGHTS_*` payload | **64KB** (65536 B) | Linux/Android THP 친화 + 페이지 경계 자연 정렬. mmap 후 zero-copy device upload 시 효율 |
+
+**근거 (Architect 결정)**: 결정 권고 — 64KB. 4KB 표준 페이지보다 크지만, Linux 5.x+ 와 Android 14+의 THP(Transparent Huge Pages) 후보가 되고, Adreno 드라이버의 zero-copy `CL_MEM_USE_HOST_PTR` 시 페이지 정렬 요구도 만족한다. 평균 1B 모델 weight payload는 ~600 MB 이상이라 64KB 패딩 비용은 무시 가능. device-aware로 차등화하면 cross-device 호환이 깨진다.
+
+**Padding 규칙**:
+- 각 section payload 시작 직전까지 0으로 채움.
+- 헤더(256B) → section table(`section_count × 48B`) → 첫 payload offset(64KB align) → 이후 payload들은 각자 alignment 충족.
+
+**무결성 검증** (reader 진입 시 1회 수행):
+
+```
+for each section_entry in section_table:
+    require(section_entry.offset >= header.payload_start_offset)
+    require(section_entry.offset + section_entry.size <= file_size)
+
+for each pair (a, b) in section_table:
+    require(a.offset + a.size <= b.offset OR b.offset + b.size <= a.offset)
+    // 즉, 어떤 두 section도 byte range가 overlap 금지
+
+require(header.section_count * 48 + 256 + ... <= header.payload_start_offset)
+require(unique(section_entry.tag for section_entry in section_table))
+    // 동일 tag가 두 번 등장 금지
+```
+
+**INV-134 매핑**: 위 검증 절차가 INV-134(section offset/size 무결성)의 구현이다.
+
+#### 3.22.6 source_hash 알고리즘 [ENG-DAT-096.6]
+
+**선택지**:
+1. **Full sha256**: 원본 GGUF 파일 전체를 sha256으로 해시. 32 바이트.
+2. **Hybrid hash**: `sha256(size_le8 || mtime_le8 || head_8MB || tail_8MB)`. 큰 파일에서 빠른 검증.
+
+**Architect 결정 권고 — Hybrid hash 채택**.
+
+**근거**:
+- Llama 3.2 1B GGUF Q4_0은 ~700 MB, full sha256은 ARM CPU에서 1~2초 소요. Engine 기동 시 매번 검증한다면 사용자 응답성 저하.
+- Hybrid hash는 ~100ms 이내 완료, GGUF의 mmap layout 특성상 head(메타데이터+첫 layer) + tail(마지막 layer + checksum) 변경을 모두 감지.
+- 충돌 가능성: GGUF 중간 부분만 손상된 경우 hybrid hash가 통과할 수 있으나, **이는 위협 모델이 아니다** — AUF는 untrusted source 검증 도구가 아니라 "사용자가 의도한 그 GGUF에서 변환된 자산인가"의 확인 도구이다.
+- 참고: full sha256이 필요한 향후 capability는 `capability_optional` bit으로 추가 가능 (예: bit 0 = `SOURCE_HASH_FULL_SHA256`).
+
+**Hybrid 알고리즘** (확정):
+
+```
+function compute_source_hash(gguf_path) -> [u8; 32]:
+    let file_size = stat(gguf_path).size
+    let mtime = stat(gguf_path).mtime_seconds
+
+    let head_n = min(8 * 1024 * 1024, file_size)
+    let tail_n = min(8 * 1024 * 1024, file_size - head_n)
+
+    let head_bytes = read(gguf_path, 0, head_n)
+    let tail_bytes = read(gguf_path, file_size - tail_n, tail_n)
+
+    let mut hasher = Sha256::new()
+    hasher.update(file_size.to_le_bytes())          // 8 bytes
+    hasher.update(mtime.to_le_bytes())              // 8 bytes
+    hasher.update(head_bytes)
+    hasher.update(tail_bytes)
+    return hasher.finalize()
+```
+
+**파일이 head_n 미만인 경우** (테스트 fixture 등): tail_n = 0, head_n = file_size 전체로 fallback. 즉 full hash가 자동 적용됨.
+
+#### 3.22.7 TOKENIZER section 직렬화 [ENG-DAT-096.7]
+
+**Architect 결정 권고 — GGUF tokens 그대로 보존 + 경량 이진 헤더**.
+
+**근거**:
+- AUF는 GGUF의 derived asset이므로 tokenizer 의미를 변환하지 않고 보존하는 것이 가장 안전.
+- SentencePiece 별도 포맷 변환은 정보 손실 위험 (unicode 정규화, special token 처리 차이).
+- JSON-in-binary는 사람이 읽기 쉽지만 vocab=128K 수준에서 파일 크기가 6~10 MiB 증가.
+
+**구조**:
+
+```
+TOKENIZER section payload layout:
+[0..16):    magic = "ARGUS_TOK\0\0\0\0\0\0\0"  (16B)
+[16..20):   schema_version: u32 = 1
+[20..24):   tokenizer_kind: u32  (0 = bpe, 1 = unigram, 2..31 = reserved)
+[24..28):   vocab_size: u32
+[28..32):   merges_count: u32  (BPE only, 0이면 부재)
+[32..40):   special_tokens_offset: u64  (section-local)
+[40..48):   chat_template_offset: u64   (section-local, 0이면 부재)
+[48..56):   tokens_blob_offset: u64     (section-local)
+[56..64):   merges_blob_offset: u64     (section-local, 0이면 부재)
+[64..]:     payload (위 offset이 가리키는 영역)
+
+tokens_blob (u32 length-prefixed UTF-8 strings, vocab_size개):
+    for i in 0..vocab_size:
+        u32 byte_len  (little-endian)
+        [u8; byte_len]  // UTF-8
+
+merges_blob (BPE only, u32 length-prefixed pair, merges_count개):
+    for i in 0..merges_count:
+        u32 byte_len
+        [u8; byte_len]  // "AAA BBB" UTF-8 (space-separated pair)
+
+special_tokens (고정 12B):
+    bos_id: i32  (-1이면 미설정)
+    eos_id: i32
+    pad_id: i32
+    unk_id: i32  (cf. v0.2에서 확장 가능)
+
+chat_template:
+    u32 byte_len
+    [u8; byte_len]  // UTF-8 chat template string
+```
+
+**확장 정책**: `tokenizer_kind = 1` (unigram, SentencePiece 호환) 등은 v0.2 capability에서 정의. v0.1 reader는 `tokenizer_kind != 0`이면 reject (ARGUS_TOK schema_version=1 한정).
+
+#### 3.22.8 TENSOR_INDEX section 직렬화 [ENG-DAT-096.8]
+
+`TENSOR_INDEX`는 layer 단위로 weight tensor의 메타데이터를 보관한다. 각 entry는 다음을 포함한다:
+
+| 필드 | 타입 | 의미 |
+|------|------|------|
+| `layer_idx` | `u32` | decoder layer index. cross-layer tensor(embedding 등)는 `u32::MAX` 예약 |
+| `kind` | `u32` | tensor 종류 enum (0=attn_q, 1=attn_k, 2=attn_v, 3=attn_o, 4=ffn_gate, 5=ffn_up, 6=ffn_down, 7=attn_norm, 8=ffn_norm, 9=embedding, 10=final_norm, 11=lm_head, 12+ reserved) |
+| `dtype` | `u32` | DType enum (0=F32, 1=F16, 2=BF16, 3=Q4_0, 4=Q4_1, 5=Q8_0, 6=U8, 7+ reserved) |
+| `shape_rank` | `u32` | shape 차원 수 (보통 2) |
+| `shape` | `[u64; shape_rank]` | 차원 크기 |
+| `alignment` | `u64` | 이 tensor의 alignment 요구 (Adreno SOA: image2d width 정렬 등) |
+| `variant_offsets` | `[u64; N_variants]` | 각 backend variant의 section-local payload offset (없으면 `u64::MAX`) |
+| `variant_sizes` | `[u64; N_variants]` | 각 variant의 byte size |
+
+**`N_variants` 결정**: section table에서 `WEIGHTS_*` 가 등장한 순서대로 0..N. TENSOR_INDEX 자체에 `variant_count: u32` 헤더를 둔다.
+
+**구조**:
+
+```
+TENSOR_INDEX section payload layout:
+[0..16):    magic = "ARGUS_TIDX\0\0\0\0\0\0"  (16B)
+[16..20):   schema_version: u32 = 1
+[20..24):   variant_count: u32              // = N_variants
+[24..28):   tensor_count: u32
+[28..32):   _pad: u32
+[32..32+variant_count*16):
+            for i in 0..variant_count:
+                tag: [u8; 16]                // section table의 tag와 일치 ("WEIGHTS_ADRENO_SOA" 등)
+[그 이후]:   tensor entry 배열, 각 entry는 가변 길이 (shape_rank에 따라)
+```
+
+**Reader 사용**: 자기 backend의 `WEIGHTS_*` tag를 찾아 `variant_idx`를 결정 → 각 tensor entry에서 `variant_offsets[variant_idx]` / `variant_sizes[variant_idx]`로 payload locate.
+
+**Cross-layer tensor**: embedding/final_norm/lm_head 도 `TENSOR_INDEX`에 포함 (`layer_idx = u32::MAX`, `kind = 9/10/11`). Phase 3.7 시점에 이들이 swap 대상은 아니지만(ENG-DAT-C11), AUF는 self-contained 자산이므로 모두 보관해야 GGUF 의존을 끊을 수 있다.
+
+#### 3.22.9 의미론 / 운영 모드 [ENG-DAT-096.9]
+
+**Mode B (self-contained, 본 spec의 운영 모드)**:
+- AUF 단일 파일로 Engine 기동 가능. 원본 GGUF는 build 시점에만 필요하며 배포 시에는 부재해도 무방.
+- `META`/`TOKENIZER`/`TENSOR_INDEX` + 1개 이상의 `WEIGHTS_*`는 필수.
+- `source_hash`는 build 시점의 GGUF에서 계산되어 보존되며, 배포된 AUF에서는 검증 대상 GGUF가 부재할 수 있다 (§3.22.10 참조).
+
+**Selective Strip (B-2 + Strip)**:
+- Build 시점에 모든 backend variant를 포함시키고, 배포 시 target device에 맞는 variant만 남긴다.
+- Strip은 단순 file truncation이 아니라 **rewrite**: 유지할 section만 새 파일에 순서대로 write → section table offset 재계산 → header 갱신 → atomic rename.
+- `auf-tool strip --keep WEIGHTS_ADRENO_SOA` 형태로 호출. 자세한 절차는 `ENG-ALG-223` (32-engine-algorithms.md).
+
+**capability_optional 갱신**:
+- Strip 후 제거된 variant에 해당하는 capability bit이 있다면 `capability_optional`에서 해제한다.
+- v0.1에서는 backend variant를 capability bit으로 표현하지 않으므로 (section tag로 충분) 이 절차는 v0.1에서는 NoOp이다. 향후 capability 추가 시 활성화.
+
+#### 3.22.10 source_hash 검증 정책 (Mode B 한정) [ENG-DAT-096.10]
+
+**원칙**: AUF reader는 `source_hash`/`source_size`/`source_mtime`을 **불변 메타데이터**로 보관하지만, **자동 검증을 강제하지 않는다**.
+
+**근거**:
+- Mode B 배포 시 GGUF가 부재하므로 hybrid hash 재계산 불가.
+- 만약 GGUF가 동시에 존재하면 사용자가 명시적으로 `auf-tool verify --source <gguf> <auf>`로 일치를 확인할 수 있다.
+
+**Reader의 의무 (INV-132 매핑)**:
+- `magic` 불일치 → reject + 명확 메시지.
+- `format_major` 불일치 → reject + "AUF format_major=X but reader supports Y" 메시지.
+- `capability_required`의 알려지지 않은 비트가 set → reject + "Required capability bit N not understood" 메시지.
+- `source_hash` 자체는 informational. 사용자가 명시적 verify를 요청하지 않는 한 reject 사유가 아니다.
+
+#### 3.22.11 안정성 / 진화 정책 [ENG-DAT-096.11]
+
+**`format_major = 0` 기간 (v0.1, v0.2, ...)**:
+- **실험적**. forward/backward 호환성 보장 안 함.
+- v0.x → v0.(x+1) 변경 시 reader는 반드시 갱신되어야 함을 가정.
+- 사용 시 운영자에게 명시적 경고: "AUF format_major=0 is experimental".
+
+**v1.0 stable 선언 조건** (Architect 권고):
+1. Phase 4 디바이스 실측이 INV-122 통과한 상태로 머지됨.
+2. 최소 1개 이상의 디바이스 변종(예: CUDA AOS)이 추가되어 multi-variant 시나리오가 검증됨.
+3. `auf-tool` CLI가 stable 인터페이스로 사용된 기간 ≥ 4주.
+
+**v1.0 이후 호환성 규칙**:
+- `format_minor`만 증가 시: 기존 reader는 새 section을 무시하고 동작 (additive 변경).
+- `format_major` 증가 시: migration note 필수. `auf-tool migrate <old> <new>` 도구 제공 책임.
+
+---
+
 ## 4. Alternative Behavior
 
 해당 없음. 이 문서는 데이터 정의 문서이다. 데이터 처리의 대안 동작은 `32-engine-algorithms.md`에서 다룬다.
@@ -870,6 +1172,10 @@ classDiagram
 **[ENG-DAT-C11]** Cross-layer tensor(embedding, final_norm, lm_head)는 swap 대상에서 제외된다. 이들의 dtype은 모델 lifetime 동안 `LoadConfig::default_dtype`으로 고정이다. ENG-DAT-093 flat 배치에서 이 필드들은 `TransformerModel`의 기존 멤버 그대로 유지되며, `LayerSlot` 컬렉션에 포함되지 않는다. *(MUST)*
 
 **[ENG-DAT-C12]** `TransformerModel.secondary_mmap`(ENG-DAT-093 flat 필드)이 `Some`인 동안 해당 `Arc<SecondaryMmap>`은 drop될 수 없다. `LayerSlot::secondary_mmap_handle`의 모든 clone이 drop되어도 `TransformerModel`이 최후 소유권을 보존한다. *(MUST)*
+
+**[ENG-DAT-C13]** AUF v0.1 reader는 `format_major` 불일치, magic 불일치, 미인식 `capability_required` bit, required section 누락 중 어느 하나라도 발견하면 파일을 reject하고 panic 없이 명시적 에러를 반환한다. `source_hash` 불일치는 정보성 경고이며 reject 사유가 아니다 (Mode B 자립성 — INV-132). *(MUST)*
+
+**[ENG-DAT-C14]** AUF section 간 byte range overlap 금지. 모든 section은 `[header.payload_start_offset, file_size)` 내에 있어야 한다. tag는 unique. (INV-134 매핑) *(MUST)*
 
 ## 6. Examples
 

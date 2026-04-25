@@ -290,6 +290,47 @@ impl<'a> SwapExecutor<'a> {
             // captured the old generation.
             self.backend.invalidate_noshuffle_soa_registry();
 
+            // ENG-ALG-222 / INV-131 — Phase 3.7a: re-convert Q4_0 weights to
+            // SOA layout and register the entries against the new cl_mem
+            // addresses **before** the generation bump. Without this safety
+            // net the noshuffle GEMV kernel falls back to the AOS path on
+            // Adreno (verified silently incorrect — Phase 3.6 measurements
+            // showed only the first decoded token surviving). NoOp on
+            // CPU / CUDA backends and on host OpenCL builds whose
+            // `cvt_noshuffle` program failed to compile.
+            //
+            // Ordering rationale: this MUST happen after `invalidate_*` (so
+            // we re-populate a clean registry) and before the generation bump
+            // (so the next forward seeing the new generation finds a fully
+            // populated registry, eliminating any window where lookup misses).
+            for swapped in &report.swapped {
+                let Some(slot) = layers.get(swapped.layer_idx) else {
+                    continue;
+                };
+                let new_layer = slot.load_weights();
+                for tensor in [
+                    &new_layer.wq,
+                    &new_layer.wk,
+                    &new_layer.wv,
+                    &new_layer.wo,
+                    &new_layer.w_gate,
+                    &new_layer.w_up,
+                    &new_layer.w_down,
+                ] {
+                    if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
+                        // Conversion failure leaves the registry empty for
+                        // this tensor → AOS fallback path. Surface as the
+                        // batch error so the caller can decide (treating
+                        // partial registration as success would risk silent
+                        // accuracy loss).
+                        return Err(SwapError::BufferAllocationFailed {
+                            layer: swapped.layer_idx,
+                            source: e,
+                        });
+                    }
+                }
+            }
+
             let new_gen = ratio_generation.fetch_add(1, Ordering::SeqCst) + 1;
             report.ratio_generation_after = Some(new_gen);
         }

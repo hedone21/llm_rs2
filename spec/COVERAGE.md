@@ -1,6 +1,6 @@
 # INV Coverage Tracker
 
-> 전체: 70개 | ✅ 48 | ⬜ 4 | 🔶 17 (INV-130 추가, 2026-04-25 Weight Swap Phase 3.6 Noshuffle SOA coherence)
+> 전체: 74개 | ✅ 48 | ⬜ 8 | 🔶 17 (INV-131~134 추가, 2026-04-25 Weight Swap Phase 3.7 SOA re-conversion + AUF format)
 
 ## 범례
 
@@ -151,6 +151,17 @@
 |-----|------|---------|------|-----------|
 | INV-130 | Q4_0 weight swap으로 cl_mem이 교체되면 `OpenCLBackend::noshuffle_soa_registry`의 stale entry는 swap 직후 invalidate되어야 한다 (전체 clear 또는 per-layer 제거). 디바이스 한정 silent correctness bug. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_130_noshuffle_soa_coherence.rs` + 디바이스 동작 확인 (manual) |
 
+## Weight Swap × Phase 3.7 (INV-131 ~ INV-134, 2026-04-25 SOA 재변환 + AUF v0.1)
+
+> Phase 3.7a (SOA safety net) + 3.7b (AUF v0.1 self-contained format). 대응 명세: `33-engine-data.md` §3.22 (ENG-DAT-096), `32-engine-algorithms.md` 3.12.16~3.12.17 (ENG-ALG-222, ENG-ALG-223), `arch/auf_format.md`.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-131 | Q4_0 swap 후 첫 GPU matmul 직전, swap layer의 모든 Q4_0 weight cl_mem 주소가 noshuffle_soa_registry에 등록되어 있어야 한다 (AUF cache hit 또는 convert_aos_to_soa fallback). 디바이스 한정. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_131_soa_reconversion.rs` + 디바이스 manual |
+| INV-132 | AUF reader는 magic/format_major/미인식 capability_required 비트를 panic 없이 reject. 명시적 진단 메시지 + auf-tool 안내. source_hash 불일치는 reject 사유 아님 (Mode B). | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_132_auf_reader_reject.rs` |
+| INV-133 | AUF reader는 META, TOKENIZER, TENSOR_INDEX 그리고 자기 backend의 WEIGHTS_* section 부재 시 reject + repack 안내. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_133_auf_required_sections.rs` |
+| INV-134 | AUF section offset/size 무결성: file_size 내 + overlap 금지 + tag unique. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_134_auf_section_integrity.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -280,6 +291,8 @@
 | ENG-ALG-219 | (A) | `FullKernelPlan::execute()` 진입 1회 atomic load 비교 (`plan.ratio_generation_at_build` ↔ `model.ratio_generation`). mismatch 시 `PlanInvalidated`. INV-120과 OR 결합. tensor_partition × weight swap 상호 배타(DF-35-3). | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
 | ENG-ALG-220 | (A) | `forward_into` per-token entry에서 `entry_ratio_generation = model.ratio_generation.load(Acquire)` capture → plan에 전달 → 동일 토큰 내 재사용. mid-token swap은 다음 토큰부터 관측. INV-121 per-token snapshot과 동일 시점. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
 | ENG-ALG-221 | (A) | SwapExecutor batch 종료 직후 `OpenCLBackend::noshuffle_soa_registry` invalidate (전체 clear 또는 per-layer 제거). 다음 forward의 plan rebuild 경로에서 새 cl_mem 주소로 자연 재등록. **디바이스(Adreno 830) 한정 발현**, 호스트는 NoOp. ENG-ALG-211 step (e)와 동일 단계. | 🆕 미구현 | `engine/tests/spec/test_inv_130_noshuffle_soa_coherence.rs` + 디바이스 manual 검증 |
+| ENG-ALG-222 | (A) | Adreno SOA 재변환 safety net (Phase 3.7a). Q4_0 swap 후 AUF cache hit 시 SOA descriptor 등록, miss 시 `convert_aos_to_soa()` fallback. 디바이스 한정. | 🆕 미구현 | `engine/tests/spec/test_inv_131_soa_reconversion.rs` |
+| ENG-ALG-223 | (A) | AUF v0.1 reader/writer/stripper 알고리즘. Reader: header validate → section table → backend WEIGHTS_* lookup. Writer: GGUF parse → variant 변환 → atomic write. Stripper: relocatable rewrite. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_223_auf_io.rs` |
 
 ## Engine Data
 
@@ -295,6 +308,7 @@
 | ENG-DAT-093 | (D) | TransformerModel flat 배치: layers(Vec<LayerSlot>) + secondary_mmap + ratio_generation + 기존 embedding/final_norm/lm_head. 별도 wrapper struct 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_093_transformer_weights.rs` |
 | ENG-DAT-094 | (D) | SecondaryMmap (mmap + decoder layer tensor index only). cross_layer_offsets 필드 없음. | 🆕 미구현 | `engine/tests/spec/test_eng_dat_094_secondary_mmap.rs` |
 | ENG-DAT-095 | (D) | QuantNoiseTable (per-layer ε, eager 계산, NaN 결측 표기, uniform_ones fallback) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_095_quant_noise_table.rs` |
+| ENG-DAT-096 | (D) | AUF v0.1 self-contained format (header 256B, section table 48B/entry, META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* sections, hybrid source_hash, 64KB align) | 🆕 미구현 | `engine/tests/spec/test_eng_dat_096_auf_format.rs` |
 
 ## Cross-cutting
 

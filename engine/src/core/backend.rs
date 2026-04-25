@@ -563,6 +563,27 @@ pub trait Backend: Send + Sync {
     /// CPU / CUDA defaults are no-op. Callers may invoke unconditionally.
     fn invalidate_noshuffle_soa_registry(&self) {}
 
+    /// Adreno SOA 재변환 — Phase 3.7a (ENG-ALG-222 / INV-131).
+    ///
+    /// Q4_0 weight swap 직후, swap된 layer의 weight tensor에 대해 noshuffle
+    /// SOA descriptor를 backend의 noshuffle SOA registry에 등록한다.
+    /// `invalidate_noshuffle_soa_registry()`로 stale entry를 비운 직후 호출되어야
+    /// 하며, 다음 forward의 plan rebuild 진입 시점까지 모든 swap된 Q4_0 weight의
+    /// 새 `cl_mem` 주소가 등록되어 있어야 한다 (INV-131).
+    ///
+    /// **호출 의무**: Q4_0 dtype + GPU buffer일 때만 의미가 있다. 다른 dtype 혹은
+    /// CPU/CUDA backend, 그리고 Q4_0 noshuffle 커널이 컴파일되지 않은 OpenCL
+    /// 환경에서는 NoOp이다. 호출자는 dtype 분기 없이 단일 호출을 사용한다.
+    ///
+    /// **에러 처리**: SOA 변환 자체가 실패한 경우 `Err`를 반환하며, 호출자는
+    /// 해당 swap layer의 forward를 fallback (AOS GEMV)으로 진행할 수 있다.
+    /// AOS fallback은 정확도가 부족하므로 batch swap에서 첫 실패 시 즉시 중단을
+    /// 권장한다 (FullKernelPlan rebuild 시 lookup miss로 silent garbage).
+    #[allow(unused_variables)]
+    fn ensure_noshuffle_soa_registered(&self, tensor: &Tensor) -> Result<()> {
+        Ok(())
+    }
+
     /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
     /// Default: CPU fallback (returns false).
     #[allow(unused_variables, clippy::too_many_arguments)]

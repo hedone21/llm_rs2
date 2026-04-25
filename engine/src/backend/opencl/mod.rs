@@ -3523,6 +3523,82 @@ impl Backend for OpenCLBackend {
         self.clear_noshuffle_soa_registry();
     }
 
+    /// ENG-ALG-222 / INV-131: register a noshuffle SOA descriptor for the
+    /// given Q4_0 weight tensor. Adreno-only safety net — runs the same
+    /// `convert_q4_0_to_noshuffle()` pipeline as `prepare_noshuffle_buffers()`
+    /// but without swapping the tensor's backing buffer (the original AOS
+    /// `cl_mem` stays alive so the registry key matches both this lookup
+    /// path and any other consumer that holds the swap-installed tensor).
+    ///
+    /// Behaviour:
+    /// - Non-Q4_0 tensor: NoOp.
+    /// - Tensor without a GPU `cl_mem` (CPU buffer): NoOp.
+    /// - Q4_0 noshuffle conversion kernel unavailable (driver lacks the SOA
+    ///   path): NoOp — falls back to the standard Q4_0 GEMV path silently.
+    /// - Otherwise: convert to SOA, register against the AOS `cl_mem` key.
+    ///
+    /// Called from `SwapExecutor::execute_on_slots` after the per-batch
+    /// `clear_noshuffle_soa_registry()` and before the `ratio_generation`
+    /// bump.
+    fn ensure_noshuffle_soa_registered(&self, tensor: &Tensor) -> Result<()> {
+        // Q4_0 only — other dtypes have no noshuffle SOA path.
+        if tensor.dtype() != DType::Q4_0 {
+            return Ok(());
+        }
+
+        // Need a GPU cl_mem to convert. Tensors that landed on CPU are
+        // out of scope (this can occur in tests or when a swap target is
+        // routed through the CPU backend).
+        let Ok(cl_mem) = get_cl_mem(tensor.buffer().as_ref()) else {
+            return Ok(());
+        };
+
+        // The conversion kernel is gated on the cvt_noshuffle program
+        // compiling cleanly. If it is missing (driver-side build failure),
+        // fall back to the AOS GEMV path silently — `convert_q4_0_to_noshuffle`
+        // will surface the same error and we degrade rather than abort the
+        // entire swap.
+        if unsafe { (*self.kernels.get()).kernel_cvt_q4_0_noshuffle.is_none() } {
+            return Ok(());
+        }
+
+        let dims = tensor.shape().dims();
+        if dims.len() != 2 {
+            // Non-matmul Q4_0 tensors should not occur in the swap path
+            // (norms are F32, biases are F32). Skip defensively.
+            return Ok(());
+        }
+        let (ne01, ne00) = (dims[0], dims[1]);
+        // QK4_0 = 32. Number of Q4_0 blocks across the entire tensor.
+        if ne00 % 32 != 0 {
+            return Ok(());
+        }
+        let num_blocks = ne01 * ne00 / 32;
+
+        let (q_buf, d_buf, q_img) =
+            self.convert_q4_0_to_noshuffle(cl_mem, num_blocks, ne00, ne01)?;
+
+        // Key the registry by the AOS cl_mem address — the tensor that
+        // landed in `LayerSlot` after the swap returns this address through
+        // its `cl_mem()`, so `matmul_q4_0`'s `b_buf.as_ptr() as usize` will
+        // hit. We do *not* swap the tensor for a `NoshuffleWeightBuffer`
+        // here: that helper is paired with the model-load `prepare_noshuffle_
+        // buffers()` flow and assumes mutable access to the tensor. Phase
+        // 3.7a operates on already-installed `Arc<LayerWeights>` snapshots.
+        let key = cl_mem.as_ptr() as usize;
+        self.register_noshuffle_soa(
+            key,
+            NoshuffleSoaEntry {
+                q_buf,
+                d_buf,
+                q_img,
+                ne00,
+                ne01,
+            },
+        );
+        Ok(())
+    }
+
     fn flash_attention_prefill(
         &self,
         q: &Tensor,
@@ -6719,6 +6795,124 @@ mod noshuffle_tests {
         );
 
         backend.clear_noshuffle_soa_registry();
+    }
+
+    /// Phase 3.7a — ENG-ALG-222 / INV-131. After a Q4_0 weight swap the
+    /// `Backend::ensure_noshuffle_soa_registered()` trait entry point must
+    /// (a) clear the registry of any stale entry keyed by the old cl_mem
+    /// (Phase 3.6 path, exercised here as the precondition) and (b)
+    /// re-register a fresh SOA descriptor against the **new** cl_mem
+    /// address. The latter is the new safety net introduced by 3.7a.
+    ///
+    /// Test scope:
+    /// - Build a Q4_0 weight tensor as if it had just been installed by
+    ///   `SwapExecutor` (new cl_mem, no prior SOA entry).
+    /// - Confirm the registry has no entry yet.
+    /// - Call the trait method and confirm a new entry materialises keyed
+    ///   on the tensor's cl_mem address.
+    /// - Confirm idempotence — a second call replaces the entry without
+    ///   panic.
+    #[test]
+    fn test_swap_soa_reconversion_registers_new_entry() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // Sanity: the cvt kernel must be available for this test to be
+        // meaningful. On hosts where it is missing the trait method is a
+        // no-op and we cannot exercise the registration contract.
+        if unsafe { (*backend.kernels.get()).kernel_cvt_q4_0_noshuffle.is_none() } {
+            eprintln!("[SKIPPED] cvt_noshuffle kernel unavailable");
+            return;
+        }
+
+        // Mimic a freshly-swapped Q4_0 weight tensor. ne01 must be even
+        // for the noshuffle GEMV path; this matches the Q/K/V projection
+        // shapes in the production swap path.
+        let n = 8usize;
+        let k = 64usize;
+        let (tensor, _blocks) = make_q4_0_weight_tensor(&backend, n, k, 7);
+
+        let key_before = get_cl_mem(tensor.buffer().as_ref()).unwrap().as_ptr() as usize;
+
+        // Precondition: the registry has no entry for this address.
+        // Using a fresh tensor + cleared registry mirrors `SwapExecutor`'s
+        // ordering (clear → ensure_registered).
+        backend.clear_noshuffle_soa_registry();
+        assert!(
+            backend.lookup_noshuffle_soa(key_before).is_none(),
+            "registry must be empty for a brand-new Q4_0 swap-installed tensor"
+        );
+
+        // Phase 3.7a entry point.
+        let backend_dyn: &dyn Backend = backend.as_ref();
+        backend_dyn
+            .ensure_noshuffle_soa_registered(&tensor)
+            .expect("ensure_noshuffle_soa_registered must succeed for Q4_0 weight tensor");
+
+        let entry = backend
+            .lookup_noshuffle_soa(key_before)
+            .expect("INV-131: SOA descriptor must be registered against the new cl_mem");
+        assert_eq!(entry.ne00, k);
+        assert_eq!(entry.ne01, n);
+
+        // Idempotence — calling the safety net twice must not panic; the
+        // second call replaces the entry. (HashMap::insert overwrites.)
+        backend_dyn
+            .ensure_noshuffle_soa_registered(&tensor)
+            .expect("ensure_noshuffle_soa_registered must be idempotent");
+        assert!(
+            backend.lookup_noshuffle_soa(key_before).is_some(),
+            "entry must remain reachable after a redundant safety-net call"
+        );
+
+        // Cleanup so subsequent tests in this module observe a clean slate.
+        backend.clear_noshuffle_soa_registry();
+    }
+
+    /// INV-131: tensor types that are not Q4_0 (e.g. norms, F16 fallbacks)
+    /// must trip the trait method's NoOp branch — the registry should
+    /// remain empty and the call must not error.
+    #[test]
+    fn test_swap_soa_reconversion_non_q4_0_is_noop() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        // Build a tiny F32 tensor — no SOA conversion is defined for this
+        // dtype, so the trait method must early-return Ok(()).
+        let n_elems = 64usize;
+        let bytes = n_elems * 4;
+        let mem = memory::OpenCLMemory::new(backend.context.clone(), backend.queue.clone(), false);
+        let buf = mem.alloc(bytes, DType::F32).unwrap();
+        let tensor = Tensor::new(
+            Shape::new(vec![1, n_elems]),
+            buf,
+            backend.clone() as Arc<dyn Backend>,
+        );
+
+        backend.clear_noshuffle_soa_registry();
+
+        let backend_dyn: &dyn Backend = backend.as_ref();
+        backend_dyn
+            .ensure_noshuffle_soa_registered(&tensor)
+            .expect("non-Q4_0 tensor must be a NoOp, not an error");
+
+        // Registry must remain empty — non-Q4_0 tensors never produce
+        // a SOA entry.
+        let key = get_cl_mem(tensor.buffer().as_ref()).unwrap().as_ptr() as usize;
+        assert!(
+            backend.lookup_noshuffle_soa(key).is_none(),
+            "non-Q4_0 tensor must not populate the noshuffle SOA registry"
+        );
     }
 }
 

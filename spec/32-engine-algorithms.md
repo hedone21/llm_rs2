@@ -1890,6 +1890,356 @@ function SwapExecutor::execute_swap(layers_to_swap, target_dtype):
 
 ---
 
+---
+
+#### 3.12.16 Adreno SOA 재변환 — Phase 3.7a Runtime Safety Net [ENG-ALG-222]
+
+**[ENG-ALG-222]** Adreno OpenCL backend에서 Q4_0 weight swap 후, swap된 layer의 weight `cl_mem` 주소가 `OpenCLBackend::noshuffle_soa_registry`에 등록되어 있어야 한다. 이는 (a) swap 직후 `convert_aos_to_soa()`를 명시적으로 호출하여 SOA descriptor를 등록하거나, (b) AUF cache(ENG-ALG-223)를 통해 SOA payload가 사전 변환된 채 GPU로 업로드된 경우 cache hit 경로를 사용한다. AUF cache가 없으면 (a) 경로로 fallback한다. **이 알고리즘은 디바이스(Adreno) 한정으로 의미가 있으며 호스트 환경에서는 NoOp이다.** *(MUST)*
+
+**전제**:
+- Phase 3.6에서 `clear_noshuffle_soa_registry()`가 swap 직후 호출되어 stale entry가 제거된 상태이다 (ENG-ALG-221).
+- Adreno noshuffle GEMV kernel은 SOA layout(`q_buf` + `d_buf` + `q_img` image2d)을 입력으로 가정한다 (cf. `engine/kernels/mul_mv_q4_0_*.cl` 의 noshuffle 변형).
+- AOS 원본이 GPU에 업로드된 경우 noshuffle kernel은 매칭 SOA descriptor를 찾지 못해 일반 fallback kernel로 전환되며, 정확도 임계 미달 가능성이 있다 (Phase 3.6 실측 — "Paris" 첫 토큰만 정답, 후속 garbage).
+
+**문제 정의**:
+- Phase 3.6의 SOA registry invalidate는 stale 제거에는 충분하나, **새 SOA descriptor 등록**은 보장하지 않는다.
+- 다음 forward의 plan rebuild 시 noshuffle kernel 경로가 활성화되려면 새 cl_mem에 대한 SOA descriptor가 registry에 있어야 한다. 자연 재등록이 일어나지 않는 코드 경로(Adreno noshuffle weight buffer 초기화는 보통 모델 load 시점에만 수행됨)에서는 fallback kernel이 무한 사용된다.
+
+**알고리즘 (의사코드)**:
+
+```
+function ensure_noshuffle_soa_registered(backend: &OpenCLBackend,
+                                          slot: &LayerSlot,
+                                          new_weights: &LayerWeights) -> Result<()>:
+    if !backend.is_adreno() or !backend.has_noshuffle_kernel():
+        return Ok(())   // 호스트 또는 비-Adreno OpenCL → NoOp
+
+    for tensor_name in ["attn_q", "attn_k", "attn_v", "attn_o",
+                         "ffn_gate", "ffn_up", "ffn_down"]:
+        let tensor = new_weights.get(tensor_name)
+        if tensor.dtype() != DType::Q4_0:
+            continue   // Q4_0만 noshuffle SOA 대상
+
+        let cl_mem = tensor.buffer().cl_mem().expect("OpenCL backend")
+        let cl_mem_addr = cl_mem.as_ptr() as usize
+
+        // (a) AUF cache hit — 이미 SOA payload로 업로드됨
+        if let Some(soa_descriptor) = lookup_auf_cache(slot.layer_idx, tensor_name):
+            backend.register_noshuffle_soa(cl_mem_addr, soa_descriptor)
+            continue
+
+        // (b) Fallback: AOS → SOA 런타임 변환 후 등록
+        let soa_descriptor = backend.convert_aos_to_soa(tensor)?
+            // convert_aos_to_soa는 Q4_0 AOS bytes를 읽어 q_buf/d_buf 분리 + q_img 정렬 적용,
+            // 새 cl_mem들로 업로드하고 descriptor 반환.
+        backend.register_noshuffle_soa(cl_mem_addr, soa_descriptor)
+
+    Ok(())
+```
+
+**호출 시점**:
+- `SwapExecutor::execute_swap`의 step (e) 직후, 즉 `clear_noshuffle_soa_registry()` 호출과 `ratio_generation` bump 사이에 호출된다.
+- 또는 Phase 3.7a 단순 구현에서는 step (c) Arc swap 직후에 layer 단위로 즉시 호출 가능 (호출 순서는 implementation detail; correctness는 다음 forward 시점까지 등록만 완료되면 된다).
+
+**Phase 3.7a vs 3.7b 분기**:
+
+| 시나리오 | AUF cache 존재 | 동작 |
+|----------|---------------|------|
+| Phase 3.7a 단독 | No | (b) 경로만 사용. 모든 swap에서 런타임 SOA 변환 비용 발생. |
+| Phase 3.7b 통합 | Yes (auf-tool로 사전 생성) | (a) 경로 우선. 변환 비용 0. (b)는 cache miss 시 안전망. |
+
+**Latency 영향**:
+- (a) 경로: 거의 0 (descriptor lookup + registry insert).
+- (b) 경로: per-tensor Q4_0 reorder 비용. Llama 1B 한 layer 약 ~10 MB Q4_0, ARM CPU에서 ~50ms 예상. swap 자체 비용에 포함되어 사용자 응답성 저하는 미미.
+
+**불변식**:
+- INV-131: swap 후 첫 GPU matmul 직전 등록 완료 보장.
+- INV-130: stale entry 제거(ENG-ALG-221)와 신규 등록(본 항목)은 짝을 이룬다.
+
+**교차 참조**:
+- ENG-ALG-211 step (e): `ratio_generation` bump.
+- ENG-ALG-221: stale entry invalidate.
+- ENG-ALG-223: AUF reader가 SOA payload를 직접 GPU로 업로드하는 경로.
+- `OpenCLBackend::convert_aos_to_soa` (engine/src/backend/opencl/mod.rs) — 기존 모델 load 경로의 함수 재사용.
+
+---
+
+#### 3.12.17 AUF Reader / Writer / Stripper 알고리즘 [ENG-ALG-223]
+
+**[ENG-ALG-223]** AUF v0.1 (ENG-DAT-096) 파일의 read, write, strip, repack 절차를 정의한다. 본 알고리즘은 (1) Engine의 `secondary_mmap` 로딩 경로(reader), (2) `auf-tool build` 명령(writer), (3) `auf-tool strip` 명령(stripper), (4) `auf-tool repack` 명령(repacker)에 적용된다. *(MUST)*
+
+##### 3.12.17.1 Reader
+
+**입력**: AUF 파일 경로, 자기 backend 식별자(`adreno_soa` / `cuda_aos` / `cpu_aos`).
+**출력**: `(MetaInfo, Tokenizer, TensorIndex, Mmap)` 또는 명시적 에러.
+
+**의사코드**:
+
+```
+function auf_read(path: &Path, backend_tag: &str) -> Result<AufView>:
+    let mmap = Mmap::open_readonly(path)?
+    let bytes = &mmap[..]
+
+    // (1) Header 검증 (256B 고정)
+    require(bytes.len() >= 256)
+    let header = parse_header(&bytes[0..256])
+    require(header.magic == b"ARGUS_W\0")            // INV-132
+    require(header.format_major <= READER_MAX_FORMAT_MAJOR)   // INV-132
+    if header.format_major == 0:
+        emit_warning("AUF format_major=0 is experimental")
+
+    // (2) capability_required 검사
+    let unknown_required = header.capability_required & !READER_KNOWN_CAPABILITIES
+    require(unknown_required == 0, "Unknown required capability bits")  // INV-132
+
+    // (3) Section table 파싱
+    require(header.section_table_offset + header.section_count * 48 <= bytes.len())
+    let sections = parse_section_table(&bytes[header.section_table_offset..],
+                                        header.section_count)
+
+    // (4) Section 무결성 검증 (INV-134)
+    for s in &sections:
+        require(s.offset >= header.payload_start_offset)
+        require(s.offset + s.size <= bytes.len())
+    for (a, b) in pairs(&sections):
+        require(no_overlap(a, b))
+    require(unique_tags(&sections))
+
+    // (5) Required section 존재 확인 (INV-133)
+    let meta_section = find_section(&sections, "META").ok_or("META missing")?
+    let tok_section  = find_section(&sections, "TOKENIZER").ok_or("TOKENIZER missing")?
+    let tidx_section = find_section(&sections, "TENSOR_INDEX").ok_or("TENSOR_INDEX missing")?
+
+    let weights_tag = match backend_tag:
+        "adreno_soa" => "WEIGHTS_ADRENO_SOA"
+        "cuda_aos"   => "WEIGHTS_CUDA_AOS"
+        "cpu_aos"    => "WEIGHTS_CPU_AOS"
+        _ => return Err("Unsupported backend_tag")
+
+    let weights_section = find_section(&sections, weights_tag).ok_or_else(|| {
+        format!("AUF does not contain {}. Run 'auf-tool repack --add {}' \
+                 from source GGUF.", weights_tag, weights_tag)
+    })?
+
+    // (6) META, TOKENIZER, TENSOR_INDEX 파싱 (lazy 가능)
+    let meta = parse_meta_json(&bytes[meta_section.offset..][..meta_section.size])
+    let tokenizer = parse_tokenizer_blob(&bytes[tok_section.offset..][..tok_section.size])
+    let tensor_index = parse_tensor_index(&bytes[tidx_section.offset..][..tidx_section.size])
+
+    // (7) WEIGHTS_* section은 mmap 그대로 노출 (zero-copy 의도)
+    Ok(AufView {
+        header, sections, meta, tokenizer, tensor_index,
+        weights_payload: &bytes[weights_section.offset..][..weights_section.size],
+        mmap,  // lifetime 보장
+    })
+```
+
+**핵심 보증**:
+- mmap 기반 lazy access: `META` JSON은 작으므로 즉시 파싱하지만, `WEIGHTS_*` payload는 byte slice로만 노출하고 호출자가 layer 단위로 접근.
+- 에러 발생 시 panic 없이 `Result::Err`. 에러 메시지에 sections/format/required tag 정보를 포함하여 진단 친화.
+- INV-132 / INV-133 / INV-134의 모든 케이스가 reader에서 처리됨.
+
+##### 3.12.17.2 Writer
+
+**입력**: 원본 GGUF 경로, 출력 AUF 경로, 포함할 variant 목록 (`--variants <list>`).
+**출력**: AUF 파일.
+
+**의사코드**:
+
+```
+function auf_build(gguf_path: &Path,
+                   out_path: &Path,
+                   variants: &[VariantTag]) -> Result<()>:
+    // (1) GGUF 파싱 (기존 loader 재사용)
+    let gguf = parse_gguf(gguf_path)?
+
+    // (2) Source hash 계산 (hybrid, ENG-DAT-096.6)
+    let source_hash = compute_hybrid_source_hash(gguf_path)
+    let source_size = file_size(gguf_path)
+    let source_mtime = file_mtime(gguf_path)
+
+    // (3) META payload 직렬화 (JSON-in-binary)
+    let meta_json = serialize_meta_json(&gguf.metadata)
+
+    // (4) TOKENIZER payload 직렬화 (ENG-DAT-096.7)
+    let tokenizer_blob = serialize_tokenizer(&gguf.tokenizer)
+
+    // (5) Variants별 weight 변환
+    let mut variant_payloads = Vec::new()
+    for variant in variants:
+        let payload = match variant:
+            ADRENO_SOA => convert_to_adreno_soa(&gguf.layers)?  // q_buf/d_buf 분리, q_img 정렬, Q/K permute
+            CUDA_AOS   => convert_to_cuda_aos(&gguf.layers)?    // 18B block + 128B align + Q/K permute
+            CPU_AOS    => convert_to_cpu_aos(&gguf.layers)?     // 18B block + 64B align + Q/K permute
+        variant_payloads.push((variant, payload))
+
+    // (6) TENSOR_INDEX 직렬화 (ENG-DAT-096.8)
+    let tensor_index_blob = build_tensor_index(&gguf, &variant_payloads)
+
+    // (7) Section layout 결정
+    let mut sections = Vec::new()
+    let mut cursor = 256 + estimate_section_table_size(...)
+    cursor = align_up(cursor, 65536)   // payload_start_offset = 64KB align
+
+    let payload_start = cursor
+
+    sections.push(SectionEntry { tag: "META", offset: cursor, size: meta_json.len(),
+                                  flags: SECTION_REQUIRED, version: 1 })
+    cursor = align_up(cursor + meta_json.len(), 8)
+
+    sections.push(SectionEntry { tag: "TOKENIZER", offset: cursor, size: tokenizer_blob.len(),
+                                  flags: SECTION_REQUIRED, version: 1 })
+    cursor = align_up(cursor + tokenizer_blob.len(), 8)
+
+    sections.push(SectionEntry { tag: "TENSOR_INDEX", offset: cursor, size: tensor_index_blob.len(),
+                                  flags: SECTION_REQUIRED, version: 1 })
+    cursor = align_up(cursor + tensor_index_blob.len(), 65536)  // weights는 64KB align
+
+    for (variant, payload) in &variant_payloads:
+        sections.push(SectionEntry { tag: variant.weights_tag(),
+                                       offset: cursor, size: payload.len(),
+                                       flags: SECTION_STRIPPABLE, version: 1 })
+        cursor = align_up(cursor + payload.len(), 65536)
+
+    // (8) Header 작성
+    let header = AufHeader {
+        magic: *b"ARGUS_W\0",
+        format_major: 0, format_minor: 1, format_patch: 0,
+        created_by: pad_utf8("llm_rs2 vX.Y.Z", 32),
+        source_hash, source_size, source_mtime,
+        capability_required: 0, capability_optional: 0,
+        section_count: sections.len() as u32,
+        section_table_offset: 256,
+        payload_start_offset: payload_start,
+    }
+
+    // (9) 파일 write (header → section_table → padding → payload들)
+    let mut file = File::create_atomic(out_path)?
+    file.write(&header.serialize())                     // 256B
+    file.write(&serialize_section_table(&sections))     // section_count * 48B
+    file.pad_until(payload_start)
+    write_section(file, &sections[0], &meta_json)
+    write_section(file, &sections[1], &tokenizer_blob)
+    write_section(file, &sections[2], &tensor_index_blob)
+    for ((_, payload), entry) in zip(&variant_payloads, &sections[3..]):
+        write_section(file, entry, payload)
+    file.fsync()
+    file.atomic_rename(out_path)
+```
+
+**보증**:
+- atomic file replace: 부분 write 시 stale 파일 잔존 금지 (`tempfile + rename` 패턴).
+- section table은 paydload write 전에 offset이 모두 결정된 상태로 1회 write.
+- offset/size 무결성은 build 단계에서 자동 충족 (writer가 cursor 기반 단조 진행).
+
+##### 3.12.17.3 Stripper
+
+**입력**: 기존 AUF 경로, 유지할 section tag 목록 (`--keep <tags>`) 또는 제거 목록 (`--remove <tags>`).
+**출력**: 새 AUF 파일 (또는 in-place rewrite).
+
+**의사코드**:
+
+```
+function auf_strip(in_path: &Path, keep_tags: &[&str], no_backup: bool) -> Result<()>:
+    // (1) 기존 AUF 읽기
+    let view = auf_read(in_path, "any")?   // backend check 우회 모드
+
+    // (2) keep / remove 결정
+    let keep_set: HashSet<_> = keep_tags.iter().collect()
+    for s in &view.sections:
+        if has_flag(s.flags, SECTION_REQUIRED) and !keep_set.contains(s.tag):
+            return Err(format!("Cannot strip required section {}", s.tag))
+        if !has_flag(s.flags, SECTION_STRIPPABLE) and !keep_set.contains(s.tag):
+            return Err(format!("Section {} is not strippable", s.tag))
+
+    // (3) 백업 (default)
+    if !no_backup:
+        copy_file(in_path, in_path.with_extension("auf.bak"))
+
+    // (4) 새 파일 build (writer 경로 재사용, source_hash는 보존)
+    let new_path = in_path.with_extension("auf.tmp")
+    let new_sections: Vec<_> = view.sections.iter()
+        .filter(|s| keep_set.contains(s.tag))
+        .collect()
+
+    auf_rewrite_with_sections(&new_path,
+                               header_template = view.header,    // source_hash/created_by 보존
+                               sections = &new_sections,
+                               capability_optional_clear = removed_capability_bits(...))?
+
+    // (5) atomic rename
+    fs::rename(new_path, in_path)?
+    Ok(())
+```
+
+**Strip 의미** (재확인):
+- 단순 truncation **금지**: section table은 파일 시작 근처에 있고, 뒤쪽 section을 단순 truncate하면 중간 section의 offset은 유효하지만 file_size 검증 실패. 따라서 rewrite가 정답.
+- `capability_optional`: 제거된 variant에 해당하는 capability bit (v0.1에서는 N/A) 클리어.
+- atomic rename: POSIX `rename()`로 partial state 외부 노출 금지.
+
+##### 3.12.17.4 Repacker (선택, Phase 5)
+
+**입력**: 이전에 stripped된 AUF 경로, 원본 GGUF 경로, 추가할 variant tag.
+**출력**: 새 variant section을 추가한 AUF.
+
+**의사코드 골자**:
+
+```
+function auf_repack(stripped_auf: &Path,
+                    source_gguf: &Path,
+                    add_variants: &[VariantTag]) -> Result<()>:
+    let view = auf_read(stripped_auf, "any")?
+
+    // (1) source_hash 검증 (선택적이지만 repack에서는 필수)
+    let recomputed = compute_hybrid_source_hash(source_gguf)
+    require(recomputed == view.header.source_hash,
+            "GGUF source_hash mismatch — cannot repack from different source")
+
+    // (2) GGUF 파싱 → 추가 variant payload 생성
+    let gguf = parse_gguf(source_gguf)?
+    let new_payloads = add_variants.iter()
+        .map(|v| convert_to_variant(v, &gguf.layers))
+        .collect::<Result<Vec<_>>>()?
+
+    // (3) 새 section을 합쳐 rewrite (writer 경로 재사용)
+    let combined_sections = view.sections.clone() + new_section_entries
+    auf_rewrite_with_sections(&out_path, ...)
+    Ok(())
+```
+
+**Phase 3.7 범위**: Repacker는 후속 Phase 5로 미룬다. Phase 3.7의 auf-tool은 build/info/strip만 필수 구현.
+
+##### 3.12.17.5 source_hash 검증 정책
+
+- **Reader**: 자동 검증 안 함 (§3.22.10, ENG-DAT-096.10). 사용자가 `auf-tool verify --source <gguf> <auf>`로 명시 요청 시에만 비교.
+- **Repacker**: GGUF 입력이 있으므로 강제 검증. 불일치 시 fail-fast.
+- **Strip**: source_hash 보존. 같은 GGUF에서 다시 repack 가능하도록.
+
+##### 3.12.17.6 에러 처리 매트릭스
+
+| 시나리오 | 동작 | 메시지 예 |
+|---------|------|----------|
+| Magic 불일치 | reject | "Not an AUF file (magic mismatch)" |
+| `format_major > READER_MAX` | reject | "AUF format_major=2 but reader supports up to 1. Update llm_rs2." |
+| `capability_required` 미지원 비트 | reject | "AUF requires capability bit 5 (zstd compression) but reader does not support it" |
+| Required section 누락 | reject | "META section missing — file is not a valid AUF" |
+| 자기 backend의 `WEIGHTS_*` 누락 | reject + repack 안내 | "WEIGHTS_ADRENO_SOA missing. Run 'auf-tool repack --source <gguf> --add WEIGHTS_ADRENO_SOA <auf>'." |
+| Section overlap / 범위 초과 | reject | "Section TOKENIZER overlaps with TENSOR_INDEX (offset/size invalid)" |
+| Section flag 모순 (REQUIRED+STRIPPABLE) | reject | "Section X has contradictory flags REQUIRED+STRIPPABLE" |
+| `source_hash` 불일치 (verify 명령) | warning | "AUF source_hash differs from given GGUF — may be repacked from a different source" |
+
+**불변식 매핑**:
+- INV-132 (magic/format/source_hash): 위 행 1, 2, 3 + 마지막 행.
+- INV-133 (required section): 행 4, 5.
+- INV-134 (offset/size 무결성): 행 6.
+
+**교차 참조**:
+- ENG-DAT-096 (포맷 정의), ENG-DAT-C13/C14 (제약).
+- ENG-ALG-222 (AUF cache hit 경로 — reader가 SOA payload를 GPU로 업로드).
+- `arch/auf_format.md` (컴포넌트 매핑).
+
+---
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.
@@ -1919,6 +2269,10 @@ function SwapExecutor::execute_swap(layers_to_swap, target_dtype):
 **[ENG-ALG-C08]** CachePressurePipeline의 stage 실행 순서는 `min_level` 오름차순이다. *(MUST)*
 
 **[ENG-ALG-C09]** Per-layer weight loading(ENG-ALG-210)에서 Phase A는 로딩 완료 후 layer dtype의 런타임 변경을 허용하지 않는다. 동적 교체는 Phase B에서 도입되며 별도 불변식(INV-WSWAP-001, Phase B 예정)으로 규율된다. *(MUST)*
+
+**[ENG-ALG-C10]** AUF reader는 panic 없이 동작한다. 모든 무결성 위반은 `Result::Err`로 반환되며 진단용 메시지가 포함된다. (ENG-ALG-223 §3.12.17.6) *(MUST)*
+
+**[ENG-ALG-C11]** AUF writer는 atomic file replace를 사용한다 (`tempfile + rename`). 부분 write 상태가 외부에 노출되어서는 안 된다. (ENG-ALG-223 §3.12.17.2) *(MUST)*
 
 ## 6. Examples
 

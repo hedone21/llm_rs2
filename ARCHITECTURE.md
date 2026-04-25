@@ -1,6 +1,7 @@
 # Architecture
 
 > **상세 구현 가이드**: 이 프로젝트를 처음부터 구현하려면 [`docs/00_build_guide.md`](docs/00_build_guide.md)를 참조하세요. 설계 결정의 근거는 [`docs/01_design_rationale.md`](docs/01_design_rationale.md)에 있습니다.
+> **Weight Swap**: 동적 layer dtype 교체 (`arch/weight_swap.md`). Phase 3.7에서 AUF (Argus Unified Format, `.auf`) self-contained 자산 도입 — `arch/auf_format.md`, `docs/auf_tool_guide.md`.
 
 ## Overview
 

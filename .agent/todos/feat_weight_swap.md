@@ -32,13 +32,17 @@
 | **1 — 인프라** | `LayerSlot` 구조, secondary 파일 mmap handle 보관, 기존 단일 dtype 초기 로드 경로 보존 (회귀 방지) | 5 | 5–7일 | DONE (2026-04-24, `07b8fa3`) | P1 |
 | **2 — Swap 실행** | `WeightSwapHandler` + `SwapExecutor` + `ratio_generation` 재진입 차단. 수동 CLI/테스트 트리거 | 5 | 6–8일 | DONE (2026-04-24, `07b8fa3`) | P1 |
 | **3 — Manager 연동** | `EngineCommand::SwapWeights{ratio, DtypeTag}` direct dispatch + `WeightSwapDecider` (importance×ε bottom-k) + `QuantNoiseTable` eager ε + on-demand `ImportanceCollector` 주입 + `QcfEstimate.layer_swap` 확장 + LuaPolicy | 7 | 7–9일 | DONE (2026-04-24, `07b8fa3`) | P2 |
-| **3.5 — plan invalidation 배선** | `_entry_ratio_generation` → `FullKernelPlan` plan rebuild 통합. PlanInvalidated lazy fallback. tensor_partition × swap 상호 배타 | 4 | 3–4일 | **CURRENT** | P1 |
-| **3.6 — Noshuffle SOA registry coherence** | SwapExecutor가 OpenCLBackend `noshuffle_soa_registry` invalidate 추가. Q4_0 swap 시 stale cl_mem key 제거 | 1 | 1–2일 | NEW | P1 |
-| **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | BLOCKED (3.5 + 3.6 머지 후) | P2 |
+| **3.5 — plan invalidation 배선** | `_entry_ratio_generation` → `FullKernelPlan` plan rebuild 통합. PlanInvalidated lazy fallback. tensor_partition × swap 상호 배타 | 4 | 3–4일 | DONE (2026-04-25, `54017ed`) | P1 |
+| **3.6 — Noshuffle SOA registry coherence** | SwapExecutor가 OpenCLBackend `noshuffle_soa_registry` invalidate 추가. Q4_0 swap 시 stale cl_mem key 제거 | 1 | 1–2일 | DONE (2026-04-25, `54017ed`) | P1 |
+| **3.7a — SOA 재변환 safety net** | swap 직후 `convert_aos_to_soa()` + registry 등록. ENG-ALG-222, INV-131. Phase 3.6 후 발견된 "Paris 정답 + 후속 garbage" 해결. | 3 | 2~3일 | **CURRENT** | P1 |
+| **3.7b — AUF v0.1 self-contained format** | ARGUS_W magic + 256B header + section table. META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* sections. auf-tool CLI. ENG-DAT-096, ENG-ALG-223, INV-132~134. | 5 | 4~6일 | **CURRENT** | P1 |
+| **3.7c — UMA zero-copy** | AUF mmap → `CL_MEM_USE_HOST_PTR`. swap latency < 5ms/layer 목표. | 1 | 2~3일 | DEFERRED (Phase 5 가능) | P3 |
+| **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | BLOCKED (3.7a 머지 후) | P2 |
 
-**진행 순서 강제**: Phase 1 → 2 → 3 → **3.5 → 3.6** → 4.
-- Phase 3.5와 3.6은 독립이지만 둘 다 Phase 4 디바이스 실측 진입 전 머지 필수.
-- 3.5는 plan rebuild 배선만 다룸. 3.6은 OpenCL backend의 SOA registry invalidation을 별도로 처리 (Architect 결정 DF-35-4).
+**진행 순서 강제**: Phase 1 → 2 → 3 → 3.5 → 3.6 → **3.7a → 3.7b** → 4.
+- Phase 3.7a와 3.7b는 별도 PR로 분리 가능하지만, 3.7a는 Phase 4 진입 필수 머지 (INV-131 + Q4_0 swap 정확성).
+- 3.7b는 Phase 4와 병행 가능 — 3.7a로 정확성을 확보하고, 3.7b는 추후 latency 최적화 PR.
+- 3.7c는 3.7b + Phase 4 실측 후 latency 결과에 따라 결정.
 
 ---
 
@@ -587,8 +591,8 @@
 > - 호스트 NVIDIA 백엔드에서는 fallback 경로가 다르므로 발현 안 됨. **디바이스(Adreno) 한정** correctness 이슈.
 
 ## [P1] WSWAP-3.6-SOA. SwapExecutor가 OpenCL Noshuffle SOA registry invalidate
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE (2026-04-25, `54017ed` — Phase 3.6 완료. S25 실측 "Paris" 첫 토큰만 정답, 후속 garbage 발견 → Phase 3.7로 이행)
+- **Sprint**: done
 - **Dependencies**: Phase 3 완료 (Phase 3.5와 독립적으로 진행 가능, Phase 4 진입 전 머지 필수)
 - **담당 권장**: Senior Implementer (`backend/opencl/` + cl_mem 수명관리 영역)
 - **예상 기간**: 1~2일
@@ -620,12 +624,224 @@
 
 ---
 
+# Phase 3.7 — SOA 재변환 + AUF v0.1 self-contained format (current sprint)
+
+> **목표**: Phase 3.6 디바이스 실측에서 발견된 "swap 후 첫 토큰만 정답, 후속 garbage" 문제 해결.
+> - **3.7a (런타임 safety net)**: Q4_0 swap 시 `convert_aos_to_soa()` 명시 호출 + registry 등록.
+> - **3.7b (AUF 포맷)**: GGUF에서 빌드 시점에 모든 backend variant payload를 사전 변환하여 single self-contained `.auf` 파일에 보관.
+> - **3.7c (선택, Phase 5로 미룰 수 있음)**: UMA zero-copy `CL_MEM_USE_HOST_PTR` (Adreno 한정).
+>
+> **전제**: Phase 1~3.6 완료 (`54017ed`). S25 실측 "Paris" 정답 확인 후 후속 garbage. Spec 348 pass.
+>
+> **머지 조건**: 3.7a 단독으로도 Phase 4 디바이스 실측 진입 가능. 3.7b는 후속 머지로 진행 가능.
+>
+> **사용자 확정 결정 (2026-04-25)**:
+> - DF-37-1: AUF 운영 모드 = Mode B (self-contained). GGUF 없이 동작.
+> - DF-37-2: B-2 + Selective Strip — 빌드 시 모든 variants 포함, 배포 시 strip.
+> - DF-37-3: 3-tier 버저닝 = semver + capability flags + section table.
+> - DF-37-4: Magic = `"ARGUS_W\0"` (8B). format_major=0 기간은 실험적, v0.1로 시작.
+> - DF-37-5: Header 256B 고정. device_tag는 헤더가 아니라 `WEIGHTS_*` section tag로 표현.
+> - DF-37-6: Section payload alignment = 64KB (Linux/Android THP 친화). Architect 권고 채택.
+> - DF-37-7: source_hash 알고리즘 = hybrid (size + mtime + head/tail 8MB sha256). Architect 권고 채택.
+> - DF-37-8: auf-tool 위치 = `engine/src/bin/auf_tool.rs` (workspace 단순). Architect 권고 채택.
+> - DF-37-9: TOKENIZER 직렬화 = GGUF tokens 그대로 보존 + 경량 이진 헤더. Architect 권고 채택.
+> - DF-37-10: 자동 strip / 자동 cache 정책 = 도입 안 함. v0.2 이후 사용자 피드백 후 재결정.
+> - DF-37-11: Repacker (auf-tool repack) = Phase 3.7 범위 외. Phase 5로 미룸. v0.1 auf-tool은 build/info/strip/verify만.
+
+## Phase 3.7a — Adreno SOA 재변환 safety net
+
+### [P1] WSWAP-3.7A-SPEC. Architect: spec 문서 갱신 (ENG-ALG-222, INV-131)
+- **Status**: DONE (2026-04-25, 본 작업)
+- **Sprint**: current
+- **Dependencies**: Phase 3.6 완료
+- **담당 권장**: Architect
+- **예상 기간**: 0.5일
+- **Description**:
+  - `spec/32-engine-algorithms.md` §3.12.16 — ENG-ALG-222 신설 (Adreno SOA 재변환). AUF cache hit / convert_aos_to_soa fallback 분기.
+  - `spec/41-invariants.md` §3.16 — INV-131 신설 (swap 후 첫 GPU matmul 직전 SOA registry 등록 보장).
+  - `spec/COVERAGE.md` 갱신.
+  - `arch/weight_swap.md` 후속 갱신은 implementation 단계에서 Architect가 §2.2.4 추가 (현재 본 task에서는 spec/COVERAGE만).
+- **Acceptance Criteria**:
+  - ENG-ALG-222, INV-131 ID 할당 + 본문 작성. **DONE**.
+  - INV-130(stale 제거)와 INV-131(신규 등록)의 dual 관계 명시. **DONE**.
+- **Notes**: 본 architect task로 완료.
+
+### [P1] WSWAP-3.7A-IMPL. Implementer: SwapExecutor SOA 재변환 호출 배선
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.7A-SPEC
+- **담당 권장**: Senior Implementer (`backend/opencl/` + Q4_0 layout 영역)
+- **예상 기간**: 1~2일
+- **Description**:
+  - `engine/src/models/weights/swap_executor.rs` (또는 동등 경로): step (e) `clear_noshuffle_soa_registry()` 직후, 각 swap layer의 Q4_0 weight tensor에 대해:
+    - (1) AUF cache (Phase 3.7b 통합 시) lookup → hit이면 SOA descriptor 등록.
+    - (2) miss이면 `OpenCLBackend::convert_aos_to_soa(tensor)` 호출 → 새 cl_mem들로 SOA payload 업로드 → `register_noshuffle_soa(addr, descriptor)`.
+    - 호스트/CPU/CUDA 백엔드에서는 NoOp.
+  - 호출 시점: `ratio_generation` bump 직전 (다음 forward 진입 전 등록 완료 보장).
+  - tensor 종류: `attn_q`, `attn_k`, `attn_v`, `attn_o`, `ffn_gate`, `ffn_up`, `ffn_down` (norm은 Q4_0 아니므로 제외).
+- **Acceptance Criteria**:
+  - 호스트 generate 회귀 없음.
+  - 디바이스(S25) "Paris" + 후속 토큰 정상 — INV-131 충족.
+  - clippy clean, fmt clean.
+  - INV-122 임계 (logit NMSE ≤ 0.01, top-5 ≥ 0.9, top-1 ≥ 0.95) S25에서 통과.
+- **Notes**:
+  - 이 작업 단독으로도 Phase 4 진입 가능.
+  - 변환 비용은 매 swap마다 발생 (~50ms/layer 예상). AUF 도입(3.7b) 시 0으로 감소.
+
+### [P1] WSWAP-3.7A-TEST. Implementer: spec 테스트 신규 작성
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.7A-SPEC
+- **담당 권장**: Implementer
+- **예상 기간**: 0.5일
+- **Description**:
+  - `engine/tests/spec/test_inv_131_soa_reconversion.rs` 신규.
+  - 테스트 케이스:
+    1. **Mock Adreno SOA registry**: swap 전 layer X의 cl_mem이 등록되어 있고, swap 후 새 cl_mem이 등록되어 있는지 확인.
+    2. **Host backend NoOp**: registry 자체가 비어 있을 때 swap 시 panic 없음.
+    3. **Cache miss → convert_aos_to_soa fallback**: AUF cache 부재 시 fallback 호출 발생 검증 (mock).
+- **Acceptance Criteria**:
+  - 3개 케이스 통과.
+  - 디바이스 실측은 Phase 4 통합 시나리오에 포함 (manual).
+- **Notes**: feedback_spec_tests_required.md 준수.
+
+## Phase 3.7b — AUF v0.1 self-contained format
+
+### [P1] WSWAP-3.7B-SPEC. Architect: AUF v0.1 spec 신설
+- **Status**: DONE (2026-04-25, 본 작업)
+- **Sprint**: current
+- **Dependencies**: 없음
+- **담당 권장**: Architect
+- **예상 기간**: 1일
+- **Description**:
+  - `spec/33-engine-data.md` §3.22 — ENG-DAT-096 신설 (AUF v0.1 binary format).
+  - `spec/32-engine-algorithms.md` §3.12.17 — ENG-ALG-223 신설 (reader/writer/stripper 알고리즘).
+  - `spec/41-invariants.md` §3.16 — INV-132 ~ INV-134 신설.
+  - `arch/auf_format.md` 신규 (component-centric).
+  - `docs/auf_format_changelog.md` 신규.
+  - `docs/auf_tool_guide.md` 신규.
+- **Acceptance Criteria**: 모두 **DONE**.
+- **Notes**: 본 architect task로 완료.
+
+### [P1] WSWAP-3.7B-AUF-CRATE. Implementer: AUF reader/writer 모듈 신설
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.7B-SPEC
+- **담당 권장**: Implementer
+- **예상 기간**: 2~3일
+- **Description**:
+  - 모듈 위치 권고: `engine/src/auf/` (mod.rs + header.rs + section.rs + reader.rs + writer.rs + stripper.rs + variant_*.rs).
+  - 의존: `memmap2`, `sha2`, `serde_json` (META JSON), 기존 GGUF parser.
+  - `AufHeader::parse / serialize`, `SectionTable::parse / serialize / find / validate`.
+  - `auf_read(path, backend_tag) -> Result<AufView, AufError>` — reader.
+  - `auf_build(opts) -> Result<()>` — writer.
+  - `auf_strip(in_path, opts) -> Result<()>` — stripper.
+  - Variant 변환 함수: `variant_adreno_soa.rs`, `variant_cuda_aos.rs`, `variant_cpu_aos.rs`. 각각 GGUF layer tensor → variant payload byte vector.
+  - `AufError` enum: `Truncated`, `NotAuf`, `FormatTooNew`, `UnknownCapability`, `SectionOverlap`, `SectionOutOfBounds`, `RequiredMissing`, `WeightsMissing`, `IoError`, `JsonError` 등.
+  - **panic 금지** (ENG-ALG-C10): 모든 무결성 위반은 `Result::Err`.
+  - **atomic write** (ENG-ALG-C11): writer/stripper는 tempfile + rename.
+- **Acceptance Criteria**:
+  - 모듈 컴파일 + 단위 테스트 통과.
+  - 모든 INV-132/133/134 케이스에 대해 reader가 panic 없이 Err 반환.
+  - clippy clean, fmt clean.
+- **Notes**:
+  - Adreno SOA 변환은 기존 `OpenCLBackend::convert_aos_to_soa`의 정적 변환 로직을 재사용. 단, AUF writer는 GPU 미사용 (호스트에서 byte-level 변환).
+  - CUDA AOS 변환은 단순 padding (Q/K permute는 GGUF parser에 이미 적용된 경우 추가 변환 불요).
+  - 모듈 boundary: AUF는 GGUF에 의존하나 OpenCL backend에 의존하지 않는다 (AUF writer는 호스트 byte 변환만).
+
+### [P1] WSWAP-3.7B-CLI. Implementer: auf-tool CLI binary 신설
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.7B-AUF-CRATE
+- **담당 권장**: Implementer
+- **예상 기간**: 1~2일
+- **Description**:
+  - `engine/src/bin/auf_tool.rs` 신규.
+  - 서브커맨드: `build`, `info`, `strip`, `verify`. (`repack`은 미구현, "Phase 5 reserved" 메시지로 stub)
+  - 인자 파싱: 기존 generate.rs와 동일한 stdlib `std::env::args` 또는 `clap` (workspace 의존성 확인 후 결정).
+  - `build`: `--input`, `--output`, `--variants`, `[--created-by]`.
+  - `info`: positional path. stdout에 헤더 + section 목록 출력.
+  - `strip`: `--keep`, `[--no-backup]`, positional path.
+  - `verify`: `[--source]`, positional path.
+  - `--variants all`은 자동으로 `WEIGHTS_ADRENO_SOA,WEIGHTS_CUDA_AOS,WEIGHTS_CPU_AOS` 확장.
+  - 에러 메시지는 사용자 친화 (stderr + exit code != 0).
+- **Acceptance Criteria**:
+  - `auf-tool build` → `auf-tool info` → `auf-tool strip` → `auf-tool info` 라이프사이클이 호스트에서 정상 동작.
+  - 잘못된 입력에 대해 명확한 에러 메시지 + non-zero exit code.
+  - `auf-tool verify` 가 INV-132/133/134 모든 위반 케이스를 검출.
+  - clippy clean, fmt clean.
+- **Notes**:
+  - cargo workspace에서 `cargo build -p llm_rs2 --bin auf_tool`로 빌드 가능.
+  - Android 디바이스용 빌드 검증은 선택 사항 (workstation tool이 주 용도).
+
+### [P1] WSWAP-3.7B-ENGINE. Implementer: Engine `--secondary-source` AUF 지원
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.7B-AUF-CRATE
+- **담당 권장**: Implementer
+- **예상 기간**: 1일
+- **Description**:
+  - `engine/src/bin/generate.rs`: `--secondary-source <path>` 처리에서 확장자 분기:
+    - `.gguf` → 기존 GGUF loader.
+    - `.auf` → `auf_read(path, backend_tag)` 호출. backend_tag은 현재 backend로부터 도출.
+    - 그 외 → 에러.
+  - `engine/src/models/loader/mod.rs` 또는 `loader/auf.rs` 신규: AUF view → `SecondaryMmap` 어댑터. `LayerSlot::secondary_mmap_handle`로 연결.
+  - `SwapExecutor`가 AUF backed `SecondaryMmap`에서 layer payload를 읽을 때, payload는 이미 backend variant 형식이므로 추가 변환 불필요 — 직접 `Tensor::from_buffer`로 wrap.
+  - WSWAP-3.7A의 convert_aos_to_soa fallback 경로는 **AUF 미사용** 시에만 활성. AUF cache hit이면 등록만.
+- **Acceptance Criteria**:
+  - 호스트 CPU + AUF (CPU AOS) 시나리오: GGUF primary + AUF secondary로 swap 동작.
+  - 디바이스(S25) Adreno + AUF (ADRENO_SOA) 시나리오: swap 후 INV-122 통과 + 변환 비용 0 검증 (latency 측정).
+  - Self-contained 검증: AUF만으로 모델 메타데이터/tokenizer 로딩 확인 (Mode B).
+  - clippy clean, fmt clean.
+- **Notes**:
+  - Phase 3.7b 핵심 통합 작업. Mode B 자립성의 검증.
+  - 향후 primary GGUF도 AUF로 대체 가능하지만 v0.1 범위는 secondary only.
+
+### [P1] WSWAP-3.7B-TEST. Implementer: spec 테스트 신규 작성
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: WSWAP-3.7B-AUF-CRATE
+- **담당 권장**: Implementer
+- **예상 기간**: 1일
+- **Description**:
+  - `engine/tests/spec/test_eng_dat_096_auf_format.rs` 신규: header/section table round-trip serde.
+  - `engine/tests/spec/test_eng_alg_223_auf_io.rs` 신규: build/read/strip 라이프사이클.
+  - `engine/tests/spec/test_inv_132_auf_reader_reject.rs` 신규: magic/format/capability mismatch reject.
+  - `engine/tests/spec/test_inv_133_auf_required_sections.rs` 신규: META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* 누락 reject.
+  - `engine/tests/spec/test_inv_134_auf_section_integrity.rs` 신규: overlap/out-of-bounds/duplicate-tag reject.
+  - 테스트 fixture: 작은 mock GGUF (또는 byte buffer) → AUF build → reader 검증.
+- **Acceptance Criteria**:
+  - 5개 테스트 파일, 각 최소 3 케이스. 모두 통과.
+  - feedback_spec_tests_required.md 준수: `tests/spec/` 배치, inline `#[cfg(test)]` 불충분.
+  - 각 테스트 함수 docstring에 spec ID 명시.
+- **Notes**: TDD 친화 — IMPL 진입 전 또는 병행하여 작성.
+
+## Phase 3.7c (선택, Phase 5로 미룸 가능)
+
+### [P3] WSWAP-3.7C-UMA. UMA zero-copy `CL_MEM_USE_HOST_PTR` (Adreno 한정)
+- **Status**: DEFERRED
+- **Sprint**: backlog
+- **Dependencies**: WSWAP-3.7B-ENGINE
+- **담당 권장**: Senior Implementer
+- **예상 기간**: 2~3일 (실측 + 튜닝 포함)
+- **Description**:
+  - AUF mmap된 `WEIGHTS_ADRENO_SOA` payload를 그대로 `CL_MEM_USE_HOST_PTR`로 wrap하여 GPU에 전달.
+  - swap latency 추가 감소 + DRAM 사용량 감소.
+  - Adreno 드라이버의 페이지 핀 동작 검증 필요 (MEMORY.md `feedback_adreno_gpu_kernel_state_limit.md` 참조).
+- **Acceptance Criteria**:
+  - swap latency < 5ms/layer (Adreno UMA, 변환 비용 0 + 페이지 핀 0 가정).
+  - INV-122 통과 유지.
+- **Notes**:
+  - Phase 3.7c는 사용자 결정 — Phase 5로 미루는 것이 기본. AUF 도입(3.7a/3.7b) 후 latency가 50ms/layer 이하라면 미룰 수 있음.
+
+---
+
 # Phase 4 — 실측 / 튜닝 (Galaxy S25)
 
 > **목표**: Galaxy S25에서 PSS 감소량 / swap latency / TBT 영향 / INV-122 임계값을 실측하고 spec 값 조정.
 > **예상 기간**: 4–6일 (4개 작업)
 > **기대 효과**: production 적용 가능성 판단 + spec 값 확정.
-> **블로커**: Phase 3.5(plan invalidation) + Phase 3.6(SOA registry) 머지 후 진입.
+> **블로커**: Phase 3.5(plan invalidation) + Phase 3.6(SOA registry) + **Phase 3.7a(SOA 재변환 IMPL) 최소 머지 후 진입**. Phase 3.7b(AUF) 머지는 권장이지만 필수는 아님 — 3.7a 단독으로도 INV-122 통과 가능.
 
 ## [P2] WSWAP-4-LATENCY. Swap latency 실측 (Galaxy S25)
 - **Status**: BLOCKED
@@ -696,27 +912,35 @@
 
 ---
 
-# 이번 스프린트 최우선 5개 작업 (PM 추천, 2026-04-25 갱신)
+# 이번 스프린트 최우선 5개 작업 (PM 추천, 2026-04-25 Phase 3.7 갱신)
 
-> Phase 1~3는 `07b8fa3` 시점에 완료. 이번 스프린트는 Phase 3.5(plan invalidation 배선) + Phase 3.6(SOA registry coherence) 마무리에 집중.
+> Phase 1~3.6는 `54017ed` 시점에 완료. Phase 3.7-SPEC 산출물(spec/arch/docs 6개)은 Architect 본 작업으로 완료. 이번 스프린트는 Phase 3.7a (런타임 safety net) + Phase 3.7b (AUF 도입) IMPL 단계 진행.
 
-1. **WSWAP-3.5-SPEC** — Architect: ENG-ALG-219/220 + INV-129 신설 (Architect, 0.5일) [선행]
-   - 이유: ID 발급 + 본문이 있어야 ARCH/TEST/IMPL 모두 cross-ref 가능. 가장 먼저 처리.
-2. **WSWAP-3.5-ARCH** — Architect: arch v5 §2.2.1 + INV-120/INV-129 비교표 (Architect, 0.5일)
-   - 이유: SPEC과 동시 또는 직후. IMPL에 진입하기 전 component-centric 서술과 DF-35 결정 4건 모두 문서에 반영.
-3. **WSWAP-3.5-TEST** — Implementer: spec 테스트 5케이스 신규 (Implementer, 1일)
-   - 이유: SPEC/ARCH 완료 후 IMPL과 병행 가능. TDD 친화적으로 IMPL이 초록을 만드는 구조.
-4. **WSWAP-3.5-IMPL** — Implementer: plan 캡처 + execute 비교 + dispatch 배선 (Implementer, 1~2일)
-   - 이유: Phase 3.5의 핵심 구현. plan.rs 시그니처 변경 + forward_into 인자 underscore 제거 + lazy fallback + DF-35-3 상호 배타 강제.
-5. **WSWAP-3.6-SOA** — Senior Implementer: OpenCL Noshuffle SOA registry invalidation (Senior Implementer, 1~2일)
-   - 이유: 디바이스 한정 silent correctness bug. Phase 4 실측 신뢰성의 전제. Phase 3.5와 독립이라 병렬 처리 가능. INV-130 신설 + SwapExecutor 호출 배선 + 단위 테스트.
+1. **WSWAP-3.7A-IMPL** — Senior Implementer: SOA 재변환 호출 배선 (Senior Implementer, 1~2일) [최우선]
+   - 이유: Phase 3.6 후 발견된 디바이스 정확성 버그(Paris 정답 + 후속 garbage)의 즉각적 해결. AUF 의존 없이 단독 머지 가능. Phase 4 진입 전 필수.
+   - 산출물: `engine/src/models/weights/swap_executor.rs`에 convert_aos_to_soa 호출 + register_noshuffle_soa 등록. INV-122 디바이스 검증.
+2. **WSWAP-3.7A-TEST** — Implementer: SOA 재변환 spec 테스트 (Implementer, 0.5일)
+   - 이유: TDD 친화. IMPL과 병행 가능. mock OpenCLBackend로 cl_mem 등록 검증.
+3. **WSWAP-3.7B-AUF-CRATE** — Implementer: AUF reader/writer 모듈 신설 (Implementer, 2~3일)
+   - 이유: AUF v0.1 핵심 인프라. Header/SectionTable parse/serialize, AufReader/Writer/Stripper. CLI/Engine 연동의 토대.
+   - 의존: WSWAP-3.7B-SPEC (완료). 3.7A와 독립 진행 가능.
+4. **WSWAP-3.7B-CLI** — Implementer: auf-tool binary (Implementer, 1~2일)
+   - 이유: build/info/strip/verify 4개 서브커맨드. 워크스테이션 빌드 도구. Phase 3.7b의 사용자 인터페이스.
+   - 의존: WSWAP-3.7B-AUF-CRATE.
+5. **WSWAP-3.7B-ENGINE** — Implementer: Engine `--secondary-source` AUF 분기 (Implementer, 1일)
+   - 이유: Phase 3.7b 통합의 마무리. AUF cache hit 경로로 SOA 재변환 비용 0 검증.
+   - 의존: WSWAP-3.7B-AUF-CRATE + WSWAP-3.7A-IMPL (둘 다 완료된 후가 안전 — convert_aos_to_soa fallback 경로 검증을 위해).
 
-**스프린트 목표**: Phase 3.5 + Phase 3.6 머지 → Phase 4 디바이스 실측 진입 가능 상태.
+**스프린트 목표**:
+- 단기 (1주): Phase 3.7a 머지 → Phase 4 디바이스 실측 진입 가능.
+- 중기 (2~3주): Phase 3.7b 머지 → swap latency 추가 감소 + self-contained 자산 인프라.
 
 **작업 순서 / 의존**:
-- 직렬: WSWAP-3.5-SPEC → WSWAP-3.5-ARCH → (WSWAP-3.5-TEST, WSWAP-3.5-IMPL 병렬) → 머지
-- 병렬: WSWAP-3.6-SOA는 Phase 3.5와 독립 진행 (Senior Implementer 별도 자원)
-- WSWAP-3.5-TEST와 WSWAP-3.5-IMPL은 같은 작업 묶음(IMPL이 TEST를 통과시킴) — TDD 방식 권장하나 강제는 아님
+- 직렬: WSWAP-3.7A-IMPL (단독 가능) → Phase 4 진입 가능.
+- 직렬: WSWAP-3.7B-AUF-CRATE → (WSWAP-3.7B-CLI, WSWAP-3.7B-ENGINE) → WSWAP-3.7B-TEST.
+- 병렬: 3.7A 묶음과 3.7B 묶음은 코드 영역이 다르므로 독립 진행 권장 (Senior + Implementer 병행).
+
+**TEST 작업** (WSWAP-3.7A-TEST, WSWAP-3.7B-TEST)은 각각의 IMPL과 같은 sprint에서 병행 작성 (TDD 친화).
 
 ---
 
@@ -788,14 +1012,18 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
 
 # 사용자 확인 필요한 미결 사항
 
-> Phase 1~3 완료 시점에 1~2번 항목은 구현 선택지로 해소(`Arc<LayerSlot>` 채택, fallback K=512). 아래는 Phase 3.5 진입 이후 잔존 미결 항목.
+> Phase 1~3.6 완료 시점에 1~2, 6번 항목은 구현 선택지로 해소. 아래는 Phase 3.7 진입 이후 잔존 미결 항목.
 
 1. ~~**Arc snapshot 구체 구현 선택**~~ — `Arc<LayerSlot>` 채택 완료 (`07b8fa3`).
 2. ~~**Fallback policy의 K 값**~~ — K=512 채택 완료.
 3. **`--force-swap-ratio` CLI 플래그 유지 범위**: 디버그 전용이지만 feat/weight merge 후에도 유지할지, Phase 4 완료 시 제거할지. 기본 제안: feature flag로 보호하여 유지 (현장 디버깅 용도). **결정 보류**.
 4. **KV swap handler와의 상호작용**: 현재 KV `SwapHandler`는 스텁 상태. Weight swap 우선으로 진행하되, 향후 KV swap 구현 시 handler 실행 순서 (weight 먼저 vs KV 먼저) 결정 필요. Architect가 spec에 기록. **결정 보류**.
 5. **Qwen 2.5 1.5B 포함 여부**: 기존 초안에서는 검증 대상이었으나 재설계 전제에는 Llama 3.2 1B만 명시. Phase 4 실측에 Qwen 포함 여부 확인 필요. **결정 보류**.
-6. **Phase 3.6 SOA invalidation 범위**: per-layer entry 제거 vs 전체 clear 트레이드오프. Senior Implementer가 WSWAP-3.6-SOA 착수 시 backend 내부 데이터 구조 보고 결정 — registry 크기와 swap 빈도 비교해서 전체 clear가 단순/안전하면 후자 채택 권장. Architect 사전 검토 권장.
+6. ~~**Phase 3.6 SOA invalidation 범위**~~ — 전체 `clear_noshuffle_soa_registry()` 채택 완료 (`54017ed`).
+7. **Phase 3.7c UMA zero-copy 진입 시점**: AUF (3.7b) 머지 후 swap latency 측정 결과 50ms/layer 이하면 미루고, 초과하면 Phase 4 직후 우선 처리. **Phase 4 실측 결과 기반 결정**.
+8. **AUF Repacker 도입 시점**: Phase 5에서 도입 권장이나, 사용자 운영 중 strip 후 variant 추가 요구가 빈번하면 v0.2에서 우선 추가. **사용자 피드백 후 결정**.
+9. **AUF 자동 strip / 자동 cache 정책**: v0.1은 수동 strip만. 향후 사용자 피드백 후 결정 (DF-37-10).
+10. **AUF auf-tool 위치 (engine/src/bin vs 별도 crate)**: Architect 권고 = workspace 단순성 위해 `engine/src/bin/auf_tool.rs`. 단, v1.0 stable 후 binary 격리 필요성 재평가. **현재 결정 = engine 내부 bin**.
 
 ---
 
@@ -805,3 +1033,4 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
 - 2026-04-24 (재작성): 사용자 의도 재확인 결과 **정적 프로파일 노선 전면 폐기**. 동적 swap 노선으로 Phase 1–4 구조 재설계. 폐기: `quantize_profile` 바이너리, `LayerDtypeProfile` TOML, `--layer-dtype-profile` CLI. 신규: `LayerSlot` + `SwapExecutor` + `WeightSwapHandler` + `SwapDecider` + `ResilienceAction::SwapWeights { ratio }`. QCF 측정은 prefill-tail 1회 + on-demand 플래그 모드. INV-122 유지, `ENG-DAT-091` 폐기.
 - 2026-04-24 (Phase 1~3 완료): 커밋 `07b8fa3`. spec 340 pass, clippy --all-targets clean. Phase 1~3 모든 task DONE 처리. handoff 메모: `project_weight_swap_phase3_handoff.md`.
 - 2026-04-25 (Phase 3.5 진입): 사용자 결정 DF-35-1~4 확정. 기존 Phase 3.5 placeholder(INVESTIGATE/DESIGN/IMPL) 폐기 후 4-task 구체화 — SPEC(ENG-ALG-219/220 + INV-129) → ARCH(weight_swap.md v5 §2.2.1 + plan_partition_integration.md A.11) → TEST(test_eng_alg_219_plan_invalidation.rs) → IMPL(FullKernelPlan 캡처/execute 비교, forward_into underscore 제거, lazy rebuild, DF-35-3 상호 배타). 신규 Phase 3.6 추가 — SOA(OpenCLBackend noshuffle_soa_registry invalidation, INV-130 신설). Phase 4는 3.5+3.6 머지 후 진입으로 BLOCKED 처리.
+- 2026-04-25 (Phase 3.7 진입): 커밋 `54017ed`로 Phase 3.5/3.6 완료. S25 실측 swap 후 첫 토큰 "Paris" 정답 확인했으나 후속 토큰 garbage 발견 (Adreno noshuffle SOA 누락 부분 변환). Phase 3.7로 이행. 사용자 결정 DF-37-1~11 확정 — AUF (Argus Unified Format) v0.1 신설, Mode B (self-contained) 단일, B-2 multi-variant + selective strip, 3-tier 버저닝(semver + capability + section table), 256B 헤더, section table 48B/entry, hybrid source_hash, 64KB align, JSON-in-binary META, BPE tokenizer 보존. Phase 3.7a (런타임 SOA 재변환 safety net, ENG-ALG-222 + INV-131) + Phase 3.7b (AUF v0.1 + auf-tool CLI, ENG-DAT-096 + ENG-ALG-223 + INV-132~134) + Phase 3.7c (선택, UMA zero-copy, DEFERRED). Repacker는 Phase 5로 미룸. Architect 산출물 6개 + TODO 1개 작성 완료.

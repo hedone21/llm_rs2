@@ -41,6 +41,8 @@ spec/ 대응이 아닌 독립적인 feature 설계 문서:
 | `cpu_flash_decoding.md` | CPU Attention KV-Split 병렬화 (Step 2 — `attention_gen_f16_neon`) 설계 |
 | `clock_abstraction.md` | Manager `Clock` trait 추상화 (테스트 용이성, 시뮬레이터 시간 주입) |
 | `action_constraints.md` | Manager `ConstraintRegistry` 설계 — EngineCommand 조합 제약의 다층 방어 (Lua + Rust pipeline) |
+| `weight_swap.md` | Dynamic Weight Swap — ArcSwap snapshot, ratio_generation, Phase 1~3.6 통합 |
+| `auf_format.md` | AUF (Argus Unified Format) v0.1 — self-contained 가중치 자산 (Phase 3.7b) |
 
 ## 규칙
 
