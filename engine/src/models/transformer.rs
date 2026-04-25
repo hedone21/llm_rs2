@@ -1113,6 +1113,9 @@ impl TransformerModel {
         let num_layers = self.layers.len();
         let layer_snapshots: Vec<Arc<TransformerLayer>> =
             self.layers.iter().map(|s| s.load_weights()).collect();
+        // ENG-ALG-220: snapshot ratio_generation at forward entry. The plan path
+        // captures this at build_plan time; here it is used for future
+        // mid-forward swap detection hooks.
         let _entry_ratio_generation: u64 = self
             .ratio_generation
             .load(std::sync::atomic::Ordering::Acquire);
@@ -1679,6 +1682,9 @@ impl TransformerModel {
                     })
                 }
             }),
+            // ENG-ALG-219: pass the global ratio_generation counter so the
+            // plan can detect weight swaps at execute() entry (INV-129).
+            ratio_generation: self.ratio_generation.clone(),
         };
 
         match build_full_plan(&full_config) {
@@ -1929,6 +1935,8 @@ impl TransformerModel {
             use_native_attn: use_native,
             is_nosub: ocl_backend.is_nosub(),
             lm_head_dtype: self.lm_head.dtype(),
+            // ENG-ALG-219: pass ratio_generation for global invalidation check.
+            ratio_generation: self.ratio_generation.clone(),
         };
 
         match build_kivi_full_plan(&kivi_config) {
