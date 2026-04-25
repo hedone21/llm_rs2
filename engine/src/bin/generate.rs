@@ -1956,6 +1956,9 @@ fn main() -> anyhow::Result<()> {
                         num_layers,
                         report.latency_ms,
                     );
+                    if let Some(ref stages) = report.stage_breakdown {
+                        eprintln!("weight_swap stages: {}", stages.to_log_line());
+                    }
                 }
                 Err(e) => {
                     anyhow::bail!("--force-swap-ratio: swap failed: {}", e);
@@ -6034,6 +6037,9 @@ fn dispatch_swap_weights(
                 qcf_swap_actual,
                 latency_ms,
             );
+            if let Some(ref stages) = report.stage_breakdown {
+                eprintln!("[WeightSwap] stages: {}", stages.to_log_line());
+            }
 
             executor.send_weight_swap_report(llm_shared::WeightSwapReport {
                 layers_swapped,

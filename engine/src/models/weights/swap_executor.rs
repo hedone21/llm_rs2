@@ -107,6 +107,51 @@ pub struct SwappedLayer {
     pub to_dtype: DType,
 }
 
+/// Per-stage accumulated timings for one `execute` batch.
+///
+/// Collected via `Instant::now()` pairs at stage boundaries — µs-level
+/// overhead, negligible relative to the ms-scale operations measured.
+///
+/// Stage mapping (WSWAP-4-LATENCY-β):
+/// - `mmap_permute_ms` — (a) secondary slice + Q/K permutation + GPU upload
+///   (`build_layer_from_mmap`, per-layer accumulated)
+/// - `arc_swap_ms` — (b) `LayerSlot::swap_weights` atomic Arc store
+/// - `madvise_ms` — (c) `madvise(MADV_DONTNEED)` on replaced pages
+/// - `soa_reconvert_ms` — (d) `ensure_noshuffle_soa_registered` loop
+///   (Phase 3.7a, hypothesis: dominant bottleneck)
+/// - `gen_bump_ms` — (e) `invalidate_noshuffle_soa_registry` +
+///   `ratio_generation.fetch_add`
+#[derive(Debug, Clone, Default)]
+pub struct StageBreakdown {
+    /// (a) secondary mmap slice + Q/K permutation + GPU copy_weight_from
+    pub mmap_permute_ms: f64,
+    /// (b) `LayerSlot::swap_weights` Arc store (per-layer accumulated)
+    pub arc_swap_ms: f64,
+    /// (c) `madvise(MADV_DONTNEED)` (per-layer accumulated)
+    pub madvise_ms: f64,
+    /// (d) `ensure_noshuffle_soa_registered` SOA re-conversion loop
+    pub soa_reconvert_ms: f64,
+    /// (e) `invalidate_noshuffle_soa_registry` + `ratio_generation` bump
+    pub gen_bump_ms: f64,
+}
+
+impl StageBreakdown {
+    /// Format as a compact single-line string for stderr diagnostics.
+    ///
+    /// Example: `mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms soa_reconvert=45.6ms gen_bump=0.1ms`
+    pub fn to_log_line(&self) -> String {
+        format!(
+            "mmap_permute={:.1}ms arc_swap={:.1}ms madvise={:.1}ms \
+             soa_reconvert={:.1}ms gen_bump={:.1}ms",
+            self.mmap_permute_ms,
+            self.arc_swap_ms,
+            self.madvise_ms,
+            self.soa_reconvert_ms,
+            self.gen_bump_ms,
+        )
+    }
+}
+
 /// Aggregated result of one `execute` batch (ENG-ALG-211 "SwapResult").
 #[derive(Debug, Clone, Default)]
 pub struct SwapReport {
@@ -120,6 +165,10 @@ pub struct SwapReport {
     /// Value of `TransformerModel::ratio_generation` after the batch. `None`
     /// when no actual swap happened (no bump — ENG-ALG-211 step (e) contract).
     pub ratio_generation_after: Option<u64>,
+    /// Per-stage timing breakdown (WSWAP-4-LATENCY-β).
+    /// Always populated on a successful batch with at least one swapped layer;
+    /// `None` when the entire batch was a no-op (no secondary mmap).
+    pub stage_breakdown: Option<StageBreakdown>,
 }
 
 /// Stateless executor. One instance per swap request is fine.
@@ -227,6 +276,9 @@ impl<'a> SwapExecutor<'a> {
             return Ok(report);
         };
 
+        // WSWAP-4-LATENCY-β: per-stage accumulated timings.
+        let mut stages = StageBreakdown::default();
+
         for &layer_idx in target_layers {
             // ENG-DAT-C08: out-of-range silently skipped.
             let Some(slot) = layers.get(layer_idx) else {
@@ -247,7 +299,12 @@ impl<'a> SwapExecutor<'a> {
             }
 
             let from_dtype = slot.current_dtype();
+
+            // ── Stage (a): secondary mmap slice + Q/K permutation + GPU upload ──
+            let t_a0 = Instant::now();
             let new_layer = self.build_layer_from_mmap(secondary, slot, layer_idx)?;
+            stages.mmap_permute_ms += t_a0.elapsed().as_secs_f64() * 1e3;
+
             let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
 
             // Snapshot the old Arc so we can (a) inspect buffer ranges for
@@ -255,16 +312,21 @@ impl<'a> SwapExecutor<'a> {
             // our local reference below.
             let old = slot.load_weights();
 
-            // (c) Atomic install — INV-123. swap_weights bumps the per-slot
-            // debug generation as part of its contract.
+            // ── Stage (b): Atomic install — INV-123. swap_weights bumps the
+            // per-slot debug generation as part of its contract. ──────────────
+            let t_b0 = Instant::now();
             slot.swap_weights(new_arc, self.target_dtype);
+            stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
 
-            // (d) Best-effort page reclaim on the just-replaced primary
-            // pages. Only safe when we are the last holder; otherwise an
-            // in-flight forward still owns the old Arc and madvise would
-            // race. Stage 1 conservative policy: skip silently when
-            // strong_count > 1 and leave the OS to reclaim on final drop.
+            // ── Stage (c): Best-effort page reclaim on the just-replaced
+            // primary pages. Only safe when we are the last holder;
+            // otherwise an in-flight forward still owns the old Arc and
+            // madvise would race. Stage 1 conservative policy: skip silently
+            // when strong_count > 1 and leave the OS to reclaim on final
+            // drop. ────────────────────────────────────────────────────────────
+            let t_c0 = Instant::now();
             Self::madvise_if_exclusive(&old);
+            stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
             drop(old);
 
             report.swapped.push(SwappedLayer {
@@ -277,6 +339,7 @@ impl<'a> SwapExecutor<'a> {
         // (e) Single batch-level bump of the global ratio_generation counter.
         // Empty swaps do NOT bump (ENG-ALG-211: "if !swapped.is_empty()").
         if !report.swapped.is_empty() {
+            // ── Stage (e-pre): invalidate registry ───────────────────────────
             // ENG-ALG-221 / INV-130: invalidate the Adreno Q4_0 noshuffle SOA
             // registry before the generation bump so that the subsequent
             // `FullKernelPlan` rebuild (triggered by the bump via ENG-ALG-219)
@@ -288,8 +351,11 @@ impl<'a> SwapExecutor<'a> {
             // still-populated stale registry. The per-token `Arc<LayerWeights>`
             // snapshot (INV-121/123) already shields in-flight forwards that
             // captured the old generation.
+            let t_e0 = Instant::now();
             self.backend.invalidate_noshuffle_soa_registry();
+            stages.gen_bump_ms += t_e0.elapsed().as_secs_f64() * 1e3;
 
+            // ── Stage (d): SOA re-conversion ─────────────────────────────────
             // ENG-ALG-222 / INV-131 — Phase 3.7a: re-convert Q4_0 weights to
             // SOA layout and register the entries against the new cl_mem
             // addresses **before** the generation bump. Without this safety
@@ -303,6 +369,7 @@ impl<'a> SwapExecutor<'a> {
             // we re-populate a clean registry) and before the generation bump
             // (so the next forward seeing the new generation finds a fully
             // populated registry, eliminating any window where lookup misses).
+            let t_d0 = Instant::now();
             for swapped in &report.swapped {
                 let Some(slot) = layers.get(swapped.layer_idx) else {
                     continue;
@@ -330,9 +397,15 @@ impl<'a> SwapExecutor<'a> {
                     }
                 }
             }
+            stages.soa_reconvert_ms += t_d0.elapsed().as_secs_f64() * 1e3;
 
+            // ── Stage (e-post): ratio_generation bump ─────────────────────────
+            let t_e1 = Instant::now();
             let new_gen = ratio_generation.fetch_add(1, Ordering::SeqCst) + 1;
+            stages.gen_bump_ms += t_e1.elapsed().as_secs_f64() * 1e3;
             report.ratio_generation_after = Some(new_gen);
+
+            report.stage_breakdown = Some(stages);
         }
 
         report.latency_ms = start.elapsed().as_secs_f64() * 1e3;
