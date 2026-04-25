@@ -584,6 +584,63 @@ pub trait Backend: Send + Sync {
         Ok(())
     }
 
+    /// AUF SOA bypass — Phase 3.7b (ENG-DAT-096 / Phase 4 LATENCY-AUF).
+    ///
+    /// Register a *pre-converted* SOA (q_buf + d_buf) descriptor for a Q4_0
+    /// weight tensor without invoking the runtime `convert_q4_0_to_noshuffle`
+    /// pipeline. This is the fast-path equivalent of
+    /// `ensure_noshuffle_soa_registered` for AUF secondaries whose
+    /// `WEIGHTS_ADRENO_SOA` payload already contains:
+    ///   1. nibble bit-unshuffle (the work of `kernel_convert_block_q4_0_noshuffle`)
+    ///   2. ushort-level 2D transpose of the q nibbles buffer
+    ///   3. half-level 2D transpose of the d (scale) buffer
+    ///
+    /// applied at AUF build time (`auf_tool` `build_variant_payload`).
+    ///
+    /// `key_tensor` is the post-swap tensor whose `cl_mem` address is used as
+    /// the registry key — `lookup_noshuffle_soa` consumers (matmul_q4_0) read
+    /// the same address from `b_buf.as_ptr() as usize`. `q_bytes` and
+    /// `d_bytes` are the raw payload slices (zero-copy from the AUF mmap;
+    /// their lifetime is the AUF mmap, but the backend takes ownership of new
+    /// `cl_mem` buffers it allocates). `ne00` and `ne01` are the K and M
+    /// dimensions of the *logical* weight matrix (rows = ne01, cols = ne00).
+    ///
+    /// **Behaviour**:
+    /// - Non-Q4_0 tensor → NoOp (`Ok(())`).
+    /// - Tensor without GPU `cl_mem` (CPU buffer) → NoOp.
+    /// - Q4_0 noshuffle conversion kernel unavailable on this backend (driver
+    ///   missed the SOA program build) → NoOp; forward falls back to AOS GEMV
+    ///   silently.
+    /// - Otherwise → upload q_bytes / d_bytes into fresh `cl_mem` buffers,
+    ///   create the optional `image1d_buffer_t` view, and register against
+    ///   `key_tensor.cl_mem`.
+    ///
+    /// **Default**: NoOp. CPU / CUDA / host-OpenCL builds without the SOA
+    /// pipeline retain the GGUF re-conversion path through
+    /// `ensure_noshuffle_soa_registered`. The OpenCL backend overrides this
+    /// to perform the direct registration.
+    ///
+    /// **Contract**: caller invokes this once per Q4_0 weight tensor inside
+    /// the `AUF SOA bypass` branch of `SwapExecutor::execute_on_slots`,
+    /// after `invalidate_noshuffle_soa_registry()` and before the
+    /// `ratio_generation` bump.
+    #[allow(unused_variables, clippy::too_many_arguments)]
+    fn register_pre_converted_soa(
+        &self,
+        key_tensor: &Tensor,
+        q_bytes: &[u8],
+        d_bytes: &[u8],
+        ne00: usize,
+        ne01: usize,
+    ) -> Result<()> {
+        // Default: fall back to the GGUF re-conversion path.  This keeps CPU
+        // and CUDA backends safe in builds where AUF secondaries are loaded
+        // for diagnostic purposes — they never had a noshuffle SOA registry
+        // to populate, so the no-op default matches the existing
+        // `ensure_noshuffle_soa_registered` contract.
+        Ok(())
+    }
+
     /// GPU prefill flash attention. Returns Ok(true) if GPU dispatched, Ok(false) for CPU fallback.
     /// Default: CPU fallback (returns false).
     #[allow(unused_variables, clippy::too_many_arguments)]

@@ -3599,6 +3599,167 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
+    /// AUF SOA bypass (Phase 3.7b / Phase 4 LATENCY-AUF) — register a
+    /// pre-converted noshuffle SOA descriptor without re-running the
+    /// `convert_q4_0_to_noshuffle()` pipeline.
+    ///
+    /// Mirrors `ensure_noshuffle_soa_registered` short-circuits for non-Q4_0
+    /// tensors / CPU buffers / missing cvt program. When all preconditions
+    /// are met, allocates fresh `cl_mem` buffers for the SOA q/d payloads,
+    /// uploads `q_bytes`/`d_bytes` directly via `enqueue_write_buffer`, and
+    /// registers the entry against the post-swap tensor's `cl_mem` address.
+    ///
+    /// The `image1d_buffer_t` view over the q buffer is recreated locally
+    /// (driver-side, no host data copy). It silently falls back to `None` on
+    /// drivers that reject `image1d_buffer_t` (e.g. exceeding
+    /// `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE`).
+    fn register_pre_converted_soa(
+        &self,
+        key_tensor: &Tensor,
+        q_bytes: &[u8],
+        d_bytes: &[u8],
+        ne00: usize,
+        ne01: usize,
+    ) -> Result<()> {
+        // Q4_0 only.
+        if key_tensor.dtype() != DType::Q4_0 {
+            return Ok(());
+        }
+        // Need a GPU cl_mem to use as the registry key.
+        let Ok(cl_mem) = get_cl_mem(key_tensor.buffer().as_ref()) else {
+            return Ok(());
+        };
+        // Skip silently when the noshuffle SOA program failed to build —
+        // matches `ensure_noshuffle_soa_registered`'s degradation contract.
+        if unsafe { (*self.kernels.get()).kernel_cvt_q4_0_noshuffle.is_none() } {
+            return Ok(());
+        }
+
+        // Validate payload sizes against the expected SOA layout.
+        // QK4_0 = 32. Each block contributes 16 bytes to q and 2 bytes to d.
+        if !ne00.is_multiple_of(32) {
+            return Ok(());
+        }
+        let num_blocks = ne01 * ne00 / 32;
+        let expected_q = num_blocks * 16;
+        let expected_d = num_blocks * 2;
+        if q_bytes.len() != expected_q || d_bytes.len() != expected_d {
+            anyhow::bail!(
+                "AUF SOA payload size mismatch: ne00={}, ne01={}, expected q={} d={}, got q={} d={}",
+                ne00,
+                ne01,
+                expected_q,
+                expected_d,
+                q_bytes.len(),
+                d_bytes.len()
+            );
+        }
+
+        // Allocate device buffers and upload the pre-transposed SOA bytes
+        // verbatim. AUF builder is contracted to apply: (1) nibble unshuffle,
+        // (2) ushort-level 2D transpose of q, (3) half-level 2D transpose of
+        // d. Therefore the payload here is byte-identical to what
+        // `convert_q4_0_to_noshuffle` would produce; no further conversion is
+        // performed on this fast path.
+        let q_buf = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                expected_q,
+                None,
+            )?
+        };
+        let d_buf = unsafe {
+            ocl::core::create_buffer::<_, u16>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                num_blocks,
+                None,
+            )?
+        };
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &self.queue,
+                &q_buf,
+                true,
+                0,
+                q_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+            ocl::core::enqueue_write_buffer(
+                &self.queue,
+                &d_buf,
+                true,
+                0,
+                d_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        // Build the optional image1d_buffer_t view over q_buf — same
+        // signature as `convert_q4_0_to_noshuffle` step 4. Failure → None
+        // (the GEMV path falls back to plain buffer reads).
+        let cols_ushort = ne00 / 4;
+        let q_total_uint = (ne01 * cols_ushort) / 2;
+        let q_img = {
+            use ocl::core::{
+                ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat,
+                MemObjectType,
+            };
+            let q_img_fmt =
+                ImageFormat::new(ImageChannelOrder::R, ImageChannelDataType::UnsignedInt32);
+            let q_img_desc = ImageDescriptor::new(
+                MemObjectType::Image1dBuffer,
+                q_total_uint,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(q_buf.clone()),
+            );
+            // SAFETY: q_buf is a valid CL buffer with q_total_uint * 4 bytes;
+            // image1d_buffer_t is a read-only view over the same memory.
+            let result = unsafe {
+                ocl::core::create_image(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_ONLY,
+                    &q_img_fmt,
+                    &q_img_desc,
+                    None::<&[u32]>,
+                    None,
+                )
+            };
+            match result {
+                Ok(img) => Some(img),
+                Err(e) => {
+                    log::warn!(
+                        "AUF SOA bypass: image1d_buffer_t creation failed (ne01={}), \
+                         falling back to buffer path: {}",
+                        ne01,
+                        e
+                    );
+                    None
+                }
+            }
+        };
+
+        let key = cl_mem.as_ptr() as usize;
+        self.register_noshuffle_soa(
+            key,
+            NoshuffleSoaEntry {
+                q_buf,
+                d_buf,
+                q_img,
+                ne00,
+                ne01,
+            },
+        );
+        Ok(())
+    }
+
     fn flash_attention_prefill(
         &self,
         q: &Tensor,
