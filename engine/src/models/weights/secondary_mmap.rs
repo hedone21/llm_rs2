@@ -329,6 +329,43 @@ impl SecondaryMmap {
             SecondaryMmap::Auf(a) => a.is_pre_converted_soa,
         }
     }
+
+    /// Split a pre-converted SOA Q4_0 tensor payload into `(q_bytes, d_bytes)`.
+    ///
+    /// AUF builder (`auf_tool::build_variant_payload` for `WEIGHTS_ADRENO_SOA`)
+    /// packs each Q4_0 tensor as `q_buf` (`num_blocks * 16` bytes) followed by
+    /// `d_buf` (`num_blocks * 2` bytes), where `num_blocks = ne01 * ne00 / 32`.
+    /// Both buffers are pre-applied with the full conversion pipeline:
+    ///   1. nibble bit unshuffle (`kernel_convert_block_q4_0_noshuffle`)
+    ///   2. ushort-level 2D transpose of q
+    ///   3. half-level 2D transpose of d
+    ///
+    /// so the bytes can be uploaded directly into `cl_mem` and registered via
+    /// `Backend::register_pre_converted_soa` without further runtime conversion.
+    ///
+    /// Returns `None` for GGUF secondaries (no SOA section), or for tensors
+    /// whose dtype is not `Q4_0` (norms / non-quantised weights).
+    pub fn split_pre_converted_soa<'a>(
+        &'a self,
+        info: &SecondaryTensorInfo,
+    ) -> Option<(&'a [u8], &'a [u8])> {
+        if !self.is_pre_converted_soa() {
+            return None;
+        }
+        if info.dtype != DType::Q4_0 {
+            return None;
+        }
+        let bytes = self.tensor_bytes(info);
+        // Each Q4_0 block: 16 q-bytes + 2 d-bytes = 18 bytes total.
+        if !bytes.len().is_multiple_of(18) {
+            return None;
+        }
+        let num_blocks = bytes.len() / 18;
+        let q_len = num_blocks * 16;
+        let d_len = num_blocks * 2;
+        debug_assert_eq!(q_len + d_len, bytes.len());
+        Some((&bytes[..q_len], &bytes[q_len..q_len + d_len]))
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
