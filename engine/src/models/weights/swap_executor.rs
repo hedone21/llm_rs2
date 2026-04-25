@@ -277,6 +277,19 @@ impl<'a> SwapExecutor<'a> {
         // (e) Single batch-level bump of the global ratio_generation counter.
         // Empty swaps do NOT bump (ENG-ALG-211: "if !swapped.is_empty()").
         if !report.swapped.is_empty() {
+            // ENG-ALG-221 / INV-130: invalidate the Adreno Q4_0 noshuffle SOA
+            // registry before the generation bump so that the subsequent
+            // `FullKernelPlan` rebuild (triggered by the bump via ENG-ALG-219)
+            // re-registers SOA descriptors against the new `cl_mem` keys.
+            // No-op on CPU / CUDA backends (trait default).
+            //
+            // Ordering rationale: clear must precede the bump so any concurrent
+            // observer that takes the new generation cannot race against a
+            // still-populated stale registry. The per-token `Arc<LayerWeights>`
+            // snapshot (INV-121/123) already shields in-flight forwards that
+            // captured the old generation.
+            self.backend.invalidate_noshuffle_soa_registry();
+
             let new_gen = ratio_generation.fetch_add(1, Ordering::SeqCst) + 1;
             report.ratio_generation_after = Some(new_gen);
         }
