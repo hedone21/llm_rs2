@@ -1,11 +1,12 @@
 # Weight Swap — Dynamic Runtime Swap Architecture
 
-> **상태**: Draft v4 (2026-04-24, Phase 3 Manager 통합 반영)
-> **작성**: 2026-04-24
-> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택.
+> **상태**: Draft v5 (2026-04-25, Phase 3.5 Plan invalidation 통합 반영)
+> **작성**: 2026-04-24, **갱신**: 2026-04-25
+> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택, plan 경로 lazy invalidation.
 > **대상 스펙**:
 >   - Phase 1/2: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12.1~3.12.7 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `spec/41-invariants.md` §3.13 (INV-121~125).
 >   - Phase 3: `spec/33-engine-data.md` §3.21 (ENG-DAT-095), `spec/32-engine-algorithms.md` §3.12.8~3.12.12 (ENG-ALG-214-ROUTE, ENG-ALG-215~218), `spec/41-invariants.md` §3.13 (INV-126~128), `spec/11-protocol-messages.md` (MSG-042, 082, 088, 089).
+>   - **Phase 3.5 (NEW)**: `spec/32-engine-algorithms.md` §3.12.13~3.12.14 (ENG-ALG-219, ENG-ALG-220), `spec/41-invariants.md` §3.14 (INV-129).
 > **대상 모델**: Llama 3.2 1B (16 decoder layers, no tying), Qwen 2.5 1.5B (28 decoder layers, tying 가능).
 > **전제**: GGUF primary + GGUF secondary (dtype 다름). Safetensors는 부차 지원.
 
@@ -276,6 +277,81 @@ pub struct LayerSlot {
 **규칙**:
 - `SwapExecutor`가 여러 layer를 한 batch로 교체할 때, per-layer loop에서는 `LayerSlot::generation`만 bump하고 전역 counter는 **건드리지 않는다**. batch 전체가 끝난 뒤 **단 한 번** `ratio_generation.fetch_add(1, SeqCst)` 를 호출한다 (ENG-ALG-211 step (e)).
 - Forward hot path는 토큰 진입 시 `ratio_generation`을 **읽지 않는다** (per-token snapshot 규약으로 충분하므로). Plan 빌드 시점에만 비교 대상으로 사용된다.
+
+#### 2.2.2 Plan 경로 소비 규약 (Phase 3.5, ENG-ALG-219, ENG-ALG-220, INV-129)
+
+**핵심 변경 (v5, 2026-04-25)**: Phase 3에서 `SwapExecutor`가 `TransformerModel::ratio_generation`을 batch 단위 1회 bump하는 메커니즘은 정의되었으나, **plan 경로의 stale 감지 진입점**은 미정이었다 (Phase 3.5 OOS). v5에서 본 규약을 도입한다.
+
+**규약 4종**:
+
+1. **Build 시 snapshot**: `FullKernelPlan::build()`는 진입 시 `model.ratio_generation.load(Acquire)` 값을 plan struct의 `ratio_generation_at_build: u64` 필드에 기록한다.
+2. **Execute 시 1회 비교**: `FullKernelPlan::execute()`는 진입부에서 `model.ratio_generation.load(Acquire)`와 `self.ratio_generation_at_build`를 비교한다. mismatch 시 `Err(PlanError::PlanInvalidated)` 반환.
+3. **per-token 비용 = atomic load 1**: 비교는 토큰당 1회. layer 수나 step 수에 무관.
+4. **Lazy rebuild + forward_gen fallback**: Caller(`forward_into`)는 `PlanInvalidated` 수신 시 `forward_gen` 경로로 fallback (DF-35-2). 다음 토큰 진입 시 자연 재빌드.
+
+**상호 배타 (DF-35-3)**: weight swap이 활성화된 모델 인스턴스에서는 `FullKernelPlan` 빌드 시 `partition_ctx = None`으로 강제된다. tensor_partition × weight swap은 **상호 배타**이며 동시 활성을 지원하지 않는다.
+
+```mermaid
+flowchart TB
+    subgraph BUILD["Plan Build (per-token entry)"]
+        B1["model.ratio_generation.load(Acquire)<br/>→ G"]
+        B2["plan.ratio_generation_at_build = G"]
+        B3{"weight swap<br/>active?"}
+        B4["partition_ctx = None<br/>「DF-35-3」"]
+        B5["partition_ctx = Some(...)"]
+    end
+
+    subgraph EXEC["Plan Execute"]
+        E1["model.ratio_generation.load(Acquire)<br/>→ G_now"]
+        E2{"G_now ==<br/>plan.build?"}
+        E3["return Err(PlanInvalidated)<br/>「ENG-ALG-219, INV-129」"]
+        E4["execute steps..."]
+    end
+
+    subgraph CALLER["forward_into Caller"]
+        C1["match plan.execute()"]
+        C2["Err(PlanInvalidated)<br/>→ forward_gen fallback<br/>「DF-35-2」"]
+        C3["Ok(()) → use plan output"]
+    end
+
+    B1 --> B2
+    B2 --> B3
+    B3 -- Yes --> B4
+    B3 -- No --> B5
+    B4 --> E1
+    B5 --> E1
+    E1 --> E2
+    E2 -- mismatch --> E3
+    E2 -- match --> E4
+    E3 --> C1
+    E4 --> C1
+    C1 --> C2
+    C1 --> C3
+
+    style E3 fill:#ffcdd2
+    style B4 fill:#fff3e0
+```
+
+**INV-120과의 OR 결합**:
+
+| 검사 | 위치 | 검사 대상 | trigger 조건 |
+|------|------|----------|-------------|
+| INV-129 (전역) | `FullKernelPlan::execute()` 진입 1회 | `model.ratio_generation` | weight swap 또는 partition re-prep 모두 |
+| INV-120 (per-context) | `PartitionStep::run()` 진입마다 | `PartitionPlanContext.ratio_generation_at_build` | partition re-prep |
+
+두 검사는 **OR 결합**: 어느 하나라도 mismatch면 plan stale로 판정한다. weight swap만 발생한 경우 INV-129가 단독으로 catch (INV-120 컨텍스트는 변하지 않을 수 있음). partition re-prep만 발생한 경우 둘 다 catch (전역 카운터도 bump되므로) — redundancy는 안전 마진.
+
+**ENG-ALG-220 (`entry_ratio_generation` 소비)**:
+- `forward_into`는 토큰 진입 시 `entry_ratio_generation = model.ratio_generation.load(Acquire)`를 1회 capture (INV-121 per-token snapshot과 동일 시점).
+- 동일 토큰 내 plan 빌드 시 이 값을 plan에 전달 → `plan.ratio_generation_at_build = entry_ratio_generation`.
+- Mid-token swap이 발생해도 현재 토큰의 plan은 snapshot 값으로 비교한다 → mismatch catch → `forward_gen` fallback. layer Arc snapshot도 INV-121에 의해 토큰 내 재사용되므로 stale weights 노출 0건.
+
+**스펙 cross-ref**:
+- ENG-ALG-219: `FullKernelPlan` 진입 1회 atomic load 비교.
+- ENG-ALG-220: `entry_ratio_generation` 캡처 + plan 전달 의무.
+- INV-129: 전역 plan stale 감지 불변식.
+- INV-120: per-partition stale (별도, OR 결합).
+- INV-121: per-token forward snapshot (layer Arc).
 
 ---
 
@@ -837,33 +913,52 @@ Decider는 `already_swapped: &HashSet<usize>`를 입력받아 후보에서 **제
 
 ---
 
-## 6. Phase 3.5 Out-of-scope — `_entry_ratio_generation` Plan Invalidation
+## 6. Phase 3.5 In-scope — Plan Invalidation 통합 (2026-04-25 승격)
 
-Phase 3에서 `SwapExecutor`가 batch 완료 후 `TransformerModel::ratio_generation`을 bump한다 (ENG-ALG-211 step e). 이 bump는 `PartitionPlanContext::ratio_generation` snapshot과 비교되어 `PlanInvalidated`를 트리거한다 (INV-120). 문제는 **`_entry_ratio_generation`**(현재 이름은 구체 코드에서 확인 필요) 경로이다.
+> **상태 변경**: 이전 v4의 "Phase 3.5 Out-of-scope" 섹션은 v5에서 **In-scope로 승격**되었다. 본 섹션은 이미 §2.2.2에서 정의된 ENG-ALG-219 / ENG-ALG-220 / INV-129 규약의 작업 범위와 결정 근거를 정리한다.
 
-### 6.1 현재 상태
+### 6.1 결정 플래그 (DF-35-1 ~ DF-35-4)
 
-- `SetPartitionRatio` 경로는 `prepare_tensor_partition()` 내에서 `ratio_generation`을 bump하고, plan.rs의 `PartitionStep::run`에서 snapshot 비교로 stale을 감지한다.
-- Weight swap 경로도 동일 counter를 bump하지만, plan.rs의 `_entry_ratio_generation` 시작값 설정 로직(plan build 초기 시점의 캡처)이 swap 경로로 들어오는 이벤트에 대해 재빌드를 유발하는지는 **plan.rs 구조 조사가 필요**하다.
+| ID | 결정 | 채택안 | 근거 |
+|----|------|--------|------|
+| **DF-35-1** | Plan stale 감지 위치 | `FullKernelPlan::execute()` 진입 1회 atomic load 비교 | 토큰당 비용 atomic load 1회. layer/step 수에 무관. INV-120 per-partition 검사와 OR 결합. |
+| **DF-35-2** | Stale 감지 후 처리 | Lazy rebuild — `PlanInvalidated` 반환 → caller가 `forward_gen` fallback | 재빌드 비용을 토큰 경계로 흡수. 현재 토큰은 `forward_gen`으로 완주, 다음 토큰부터 새 plan. |
+| **DF-35-3** | tensor_partition × weight swap | **상호 배타** — swap 활성 시 `partition_ctx = None` 강제 | 두 메커니즘 동시 활성 시 plan invalidation 의미 모호 (어느 trigger 우선). race 윈도우 발생. |
+| **DF-35-4** | Phase 3.5 작업 범위 | (c) Plan invalidation만. Noshuffle SOA는 **WSWAP-3.6 별도 작업** | 리스크 분리. SOA 변경은 layer 레이아웃 전반에 영향. |
 
-### 6.2 Phase 3.5 작업 범위
+### 6.2 작업 범위 (Phase 3.5)
 
-1. `engine/src/core/plan.rs` 구조 조사 (`_entry_ratio_generation`의 capture 시점, 비교 시점).
-2. Weight swap 경로의 `ratio_generation` bump가 plan 재빌드로 이어지는지 검증 (단위 테스트).
-3. 미동작 시 배선 설계 (plan builder에 swap counter 전파 또는 통합 bump API).
-4. 구현 + 테스트.
+**In-scope**:
+1. `engine/src/core/plan.rs`의 `FullKernelPlan` struct에 `ratio_generation_at_build: u64` 필드 추가.
+2. `FullKernelPlan::build()` 진입에서 `model.ratio_generation.load(Acquire)` capture (ENG-ALG-220).
+3. `FullKernelPlan::execute()` 진입에서 atomic load 비교 + `PlanInvalidated` 반환 (ENG-ALG-219).
+4. `forward_into`에서 `PlanInvalidated` 수신 시 `forward_gen` fallback 분기 (DF-35-2).
+5. Weight swap 활성 인스턴스에서 partition_ctx 강제 None (DF-35-3).
+6. spec test: `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` (Implementer 작성).
 
-**Phase 3에서 하지 않는 것**:
-- plan.rs 구조 변경.
-- `_entry_ratio_generation` 이름 변경 또는 재설계.
-- `ratio_generation`을 multi-source bump하도록 API 수정.
+**Out-of-scope (Phase 3.5에서 하지 않는 것)**:
+- Noshuffle SOA / per-layer 메모리 레이아웃 변경 → **WSWAP-3.6**에서 별도 처리.
+- `ratio_generation`의 multi-source bump API 변경. 단일 source(SwapExecutor batch + partition prep)는 v3에서 정의된 채로 유지.
+- `forward_gen` 경로의 성능 최적화. fallback은 정합성 우선이며 성능은 다음 토큰의 plan 재빌드로 회수.
+- tensor_partition × weight swap 동시 활성 지원. **명시적 상호 배타**(DF-35-3).
 
-이 작업은 **독립 PR 단위**로 처리한다 (tensor_partition plan.rs 구조 변경 가능성이 있어 리스크 분리).
+### 6.3 cross-ref
+
+- 알고리즘: `spec/32-engine-algorithms.md` §3.12.13 (ENG-ALG-219), §3.12.14 (ENG-ALG-220).
+- 불변식: `spec/41-invariants.md` §3.14 (INV-129).
+- 컴포넌트 규약: 본 문서 §2.2.2.
+- 테스트: `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` (Phase 3.5 구현 단계).
 
 ---
 
 ## 7. 변경 이력
 
+- **2026-04-25 (v5, Phase 3.5 Plan invalidation 통합)**:
+  1. §2.2.2 "Plan 경로 소비 규약" 신규. ENG-ALG-219 / ENG-ALG-220 / INV-129 cross-ref.
+  2. §6 "Phase 3.5 Out-of-scope" → "Phase 3.5 In-scope"로 승격. 결정 플래그 DF-35-1~DF-35-4 채택안 명시.
+  3. 헤더 대상 스펙에 Phase 3.5 ID 추가 (ENG-ALG-219, 220 / INV-129).
+  4. tensor_partition × weight swap 상호 배타 결정(DF-35-3) 명문화. Noshuffle SOA는 WSWAP-3.6 별도 작업으로 분리(DF-35-4).
+  5. 본 작업은 plan invalidation만. layer 메모리 레이아웃 변경 미포함.
 - **2026-04-24 (v4, Phase 3 Manager 통합)**:
   1. §3 Manager 통합 신규 (E2E sequence, dispatch flowchart, routing 결정 근거, LuaPolicy shape).
   2. §4 ε 측정 (QuantNoiseTable eager 빌드, fallback 규약, 비용 표) 신규.

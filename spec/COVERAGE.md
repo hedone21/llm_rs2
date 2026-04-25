@@ -1,6 +1,6 @@
 # INV Coverage Tracker
 
-> 전체: 68개 | ✅ 48 | ⬜ 3 | 🔶 17 (INV-126/127/128 추가, 2026-04-24 Weight Swap Phase 3)
+> 전체: 69개 | ✅ 48 | ⬜ 3 | 🔶 17 (INV-129 추가, 2026-04-25 Weight Swap Phase 3.5 Plan invalidation)
 
 ## 범례
 
@@ -135,6 +135,14 @@
 | INV-127 | `QuantNoiseTable::epsilon(i).is_none()`(NaN 저장) layer는 `WeightSwapDecider`에서 제외. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_127_noise_nan_exclusion.rs` |
 | INV-128 | `ImportanceCollector`가 Armed/Collecting 상태로 prefill 완료 시 반드시 `QcfEstimate` 송출 + Idle 복귀. 누수 금지. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_128_qcf_collector_leak.rs` |
 
+## Weight Swap × Plan Invalidation (INV-129, 2026-04-25 Phase 3.5)
+
+> Phase 3.5에서 도입. `FullKernelPlan` 진입 1회 atomic load 비교 + INV-120(per-partition)과 OR 결합. tensor_partition × weight swap은 상호 배타(DF-35-3).
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-129 | `FullKernelPlan::execute()` 진입 시 `plan.ratio_generation_at_build` ↔ `model.ratio_generation` Acquire 비교, mismatch 시 `PlanInvalidated`. INV-120과 OR 결합. weight swap/partition re-prep 모두 trigger. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -261,6 +269,8 @@
 | ENG-ALG-216 | (A) | ε 계산: per-tensor Frobenius 상대 오차² 합산 → per-layer ε_i. Engine init eager. 실패 fallback 규약 | 🆕 미구현 | `engine/tests/spec/test_eng_alg_216_quant_noise_calc.rs` |
 | ENG-ALG-217 | (B) | QCF_swap 공식 = Σ_{i∈S} importance × ε / Σ_all importance × ε. `[0, 1]` 범위. 단조성. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_217_qcf_swap_formula.rs` |
 | ENG-ALG-218 | (E) | On-demand ImportanceCollector: RequestQcf → next prefill arm → finalize → QcfEstimate + K=512 fallback | 🆕 미구현 | `engine/tests/spec/test_eng_alg_218_importance_on_demand.rs` |
+| ENG-ALG-219 | (A) | `FullKernelPlan::execute()` 진입 1회 atomic load 비교 (`plan.ratio_generation_at_build` ↔ `model.ratio_generation`). mismatch 시 `PlanInvalidated`. INV-120과 OR 결합. tensor_partition × weight swap 상호 배타(DF-35-3). | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
+| ENG-ALG-220 | (A) | `forward_into` per-token entry에서 `entry_ratio_generation = model.ratio_generation.load(Acquire)` capture → plan에 전달 → 동일 토큰 내 재사용. mid-token swap은 다음 토큰부터 관측. INV-121 per-token snapshot과 동일 시점. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
 
 ## Engine Data
 

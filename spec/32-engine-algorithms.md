@@ -1702,6 +1702,133 @@ LayerSwapEstimate {
 
 ---
 
+#### 3.12.13 Plan Invalidation 통합 규칙 [ENG-ALG-219]
+
+**[ENG-ALG-219]** `FullKernelPlan`은 build 시점의 `TransformerModel::ratio_generation` 값을 `plan.ratio_generation_at_build` 필드에 캡처하고, `execute()` 진입부에서 현재 값과 `Acquire` load로 1회 비교하여 mismatch 시 `PlanInvalidated`를 반환한다. 이 검사는 `PartitionStep::run`의 per-context generation check (INV-120)와 **독립적**이며 OR로 결합된다. Weight swap(`SwapExecutor`의 batch 단위 `ratio_generation` bump, ENG-ALG-211 step (e)) 또는 partition re-prep(`SetPartitionRatio` 처리 중 partition snapshot 갱신) 중 어느 하나라도 trigger하면 plan은 stale로 판정된다. *(MUST)*
+
+**전제**:
+- `FullKernelPlan` 빌드 진입 시 호출자(`forward_into`의 prefill/decode 경로)는 build 직전 `TransformerModel::ratio_generation.load(Acquire)` 값을 plan에 전달한다.
+- `execute()`는 토큰당 1회 호출되므로 atomic load 비용은 토큰당 1회 (per-layer × per-step 비용 아님).
+
+**알고리즘 (의사코드)**:
+
+```
+struct FullKernelPlan {
+    ratio_generation_at_build: u64,    // build 시점 캡처값
+    // ... 기존 필드 (steps, partition_ctx, ...)
+}
+
+function FullKernelPlan::execute(model: &TransformerModel) -> Result<(), PlanError>:
+    // (1) 진입 1회 atomic load 비교 (ENG-ALG-219)
+    let current_gen = model.ratio_generation.load(Acquire)
+    if current_gen != self.ratio_generation_at_build:
+        return Err(PlanError::PlanInvalidated)
+
+    // (2) 기존 step loop (각 PartitionStep::run은 INV-120 per-context 검사 추가 수행)
+    for step in &self.steps:
+        step.run(model, ctx)?    // PlanInvalidated 가능 (INV-120)
+
+    return Ok(())
+```
+
+**OR 결합 의미**:
+
+| 경로 | 검사 위치 | 검사 대상 | trigger |
+|------|----------|----------|---------|
+| ENG-ALG-219 (본 항목) | `FullKernelPlan::execute()` 진입 1회 | `model.ratio_generation` | weight swap **또는** partition re-prep |
+| INV-120 (기존) | `PartitionStep::run()` 진입마다 | `PartitionPlanContext.ratio_generation_at_build` vs `PartitionContext.ratio_generation` | partition re-prep |
+
+**둘 중 하나라도 mismatch면 stale**: weight swap만 발생한 경우(INV-120 컨텍스트는 변하지 않을 수 있음) ENG-ALG-219가 단독으로 catch한다. partition re-prep만 발생한 경우 둘 다 catch (전역 카운터도 bump되므로). 이 redundancy는 안전 마진이며 비용은 per-token atomic load 1회.
+
+**Caller 의무 (Lazy Rebuild)**:
+- `PlanInvalidated` 수신 시 caller(`forward_into`)는 plan을 폐기하고 (a) plan 재빌드 또는 (b) `forward_gen` fallback을 선택한다.
+- 본 스펙은 **fallback (b)**를 기본 권장한다. 사유: 재빌드 비용이 token boundary 비용으로 흡수되며, 다음 토큰에서 자연 재빌드된다.
+- INV-129 참조.
+
+**상호 배타 제약 (DF-35-3)**:
+- Weight swap이 활성화된 모델 인스턴스에서는 `FullKernelPlan` 빌드 시 `partition_ctx = None`으로 강제된다. tensor_partition × weight swap은 **상호 배타**이며 동시 활성을 지원하지 않는다.
+- 사유: tensor_partition은 layer 단위 GPU/CPU 분할 실행을 가정하나, weight swap은 layer 단위 dtype 혼합 + 동적 교체를 도입한다. 두 메커니즘이 동시 활성일 때 partition 재준비와 swap 재준비의 race가 발생하며, plan invalidation 의미가 모호해진다(어느 trigger가 우선인가).
+- 결정 근거: WSWAP-3.5 결정 플래그 DF-35-3.
+
+**교차 참조**:
+- 데이터: `FullKernelPlan` 신규 필드 `ratio_generation_at_build` (Phase 3.5 구현 단계에서 plan 구조체에 추가).
+- 불변식: INV-120 (per-partition context), INV-129 (본 항목 검증).
+- 호출자: `forward_into`의 plan 빌드/실행 경로.
+
+---
+
+#### 3.12.14 `_entry_ratio_generation` 소비 의무 [ENG-ALG-220]
+
+**[ENG-ALG-220]** `forward_into`의 per-token snapshot 단계에서 기록한 `entry_ratio_generation` 값(토큰 진입 시점의 `TransformerModel::ratio_generation` snapshot)은 plan 경로에 전달되어야 하며, 동일 토큰 내에서 재사용된다. Mid-token swap이 발생해도 현재 토큰은 snapshot된 generation으로 완주한다. *(MUST)*
+
+**전제**:
+- `forward_into`는 토큰 진입 시 `entry_ratio_generation = model.ratio_generation.load(Acquire)`를 1회 캡처한다 (INV-121 per-token snapshot 규약과 동일 시점).
+- 동일 토큰 처리 중 `model.ratio_generation`이 mid-token swap으로 인해 bump되어도, 현재 토큰의 plan 경로는 **snapshot 값**으로 완주한다.
+
+**알고리즘 (의사코드)**:
+
+```
+function forward_into(model: &TransformerModel, ...):
+    // 토큰 진입 시 1회 snapshot (INV-121, INV-129 동일 시점)
+    let entry_ratio_generation = model.ratio_generation.load(Acquire)
+    let layer_snapshots: Vec<Arc<LayerWeights>> =
+        model.layers.iter().map(|s| s.weights.load_full()).collect()
+
+    // Plan 빌드 시 entry_ratio_generation 전달
+    let plan = FullKernelPlan::build(
+        model,
+        entry_ratio_generation,    // ratio_generation_at_build 필드로 저장
+        partition_ctx,             // weight swap 활성 시 None (DF-35-3)
+        ...
+    )
+
+    // Plan 실행 — execute() 내부에서 ENG-ALG-219 검사
+    match plan.execute(model):
+        Ok(()) => use plan output
+        Err(PlanInvalidated) =>
+            // Lazy rebuild 또는 forward_gen fallback (DF-35-2)
+            forward_gen(model, &layer_snapshots, ...)
+```
+
+**Mid-token swap 시나리오**:
+
+```
+T0: forward_into 진입
+    entry_ratio_generation = G   ← snapshot
+    layer_snapshots[i] = Arc_old (각 layer)
+    plan.ratio_generation_at_build = G
+
+T0+ε: 다른 스레드/handler가 SwapExecutor 호출
+    layer i의 Arc 교체
+    model.ratio_generation: G → G+1
+
+T0+δ: plan.execute() 진입
+    current_gen = G+1, build = G  → mismatch
+    PlanInvalidated 반환
+
+T0+δ': forward_gen fallback
+    layer_snapshots[i] = Arc_old 재사용 (per-token snapshot 유지, INV-121)
+    토큰 완주
+
+T1: 다음 토큰 진입
+    entry_ratio_generation = G+1   ← 새 snapshot
+    layer_snapshots[i] = Arc_new
+```
+
+**일관성 요구**:
+- 동일 토큰 내에서 plan 경로의 `ratio_generation_at_build`와 layer snapshot 획득 시점은 **동일 논리 단계**에 묶여야 한다.
+- 두 값이 분리된 시점에 captured되면 (e.g., snapshot 후 race 윈도우 내에 swap 발생), plan은 mismatch를 catch하지만 layer snapshot은 stale일 수 있다. 이는 INV-121에 의해 정상 처리됨 — snapshot이 "old Arc"이므로 stale weights는 외부 노출되지 않는다.
+- 다만 효율 측면에서 `model.ratio_generation.load(Acquire)`와 layer snapshot 루프는 **연속 실행**되어야 하며, 사이에 다른 IO/compute가 끼어들지 않는다.
+
+**불변식**: INV-121, INV-129.
+
+**교차 참조**:
+- INV-121 (per-token forward snapshot): layer 단위 Arc snapshot의 토큰 내 재사용.
+- INV-129 (plan stale detection): `entry_ratio_generation`을 plan에 전달하는 의무는 본 항목, 검증은 INV-129.
+- ENG-ALG-219: `execute()` 진입 atomic load 비교 알고리즘.
+
+---
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.
