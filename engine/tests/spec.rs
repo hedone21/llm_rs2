@@ -102,6 +102,12 @@ mod test_inv_130_noshuffle_soa_coherence;
 #[path = "spec/test_inv_131_soa_reconversion.rs"]
 mod test_inv_131_soa_reconversion;
 
+// ── Weight Swap Phase 3.7b — AUF v0.1 포맷 (INV-132~134, ENG-DAT-096, ENG-ALG-223) ──
+// AUF reader fail-fast (INV-132), required section (INV-133),
+// section offset/size 무결성 (INV-134), writer/stripper round-trip.
+#[path = "spec/test_inv_132_134_auf.rs"]
+mod test_inv_132_134_auf;
+
 // ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
 // Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
 #[path = "spec/test_inv_126_dtype_reserved.rs"]

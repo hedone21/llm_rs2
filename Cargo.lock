@@ -1092,6 +1092,7 @@ dependencies = [
  "safetensors",
  "serde",
  "serde_json",
+ "tempfile",
  "tokenizers",
  "zbus",
 ]
