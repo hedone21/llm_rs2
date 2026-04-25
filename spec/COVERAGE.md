@@ -1,6 +1,6 @@
 # INV Coverage Tracker
 
-> 전체: 69개 | ✅ 48 | ⬜ 3 | 🔶 17 (INV-129 추가, 2026-04-25 Weight Swap Phase 3.5 Plan invalidation)
+> 전체: 70개 | ✅ 48 | ⬜ 4 | 🔶 17 (INV-130 추가, 2026-04-25 Weight Swap Phase 3.6 Noshuffle SOA coherence)
 
 ## 범례
 
@@ -143,6 +143,14 @@
 |-----|------|---------|------|-----------|
 | INV-129 | `FullKernelPlan::execute()` 진입 시 `plan.ratio_generation_at_build` ↔ `model.ratio_generation` Acquire 비교, mismatch 시 `PlanInvalidated`. INV-120과 OR 결합. weight swap/partition re-prep 모두 trigger. | Safety/Correctness | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
 
+## Weight Swap × Noshuffle SOA Coherence (INV-130, 2026-04-25 Phase 3.6)
+
+> Phase 3.6에서 도입. SwapExecutor batch 종료 시 `OpenCLBackend::noshuffle_soa_registry` invalidate. **디바이스(Adreno 830) 한정 발현** — 호스트는 SOA registry가 비어 있어 관측 불가, 수동 디바이스 검증 필수.
+
+| INV | 설명 | 카테고리 | 상태 | 테스트 위치 |
+|-----|------|---------|------|-----------|
+| INV-130 | Q4_0 weight swap으로 cl_mem이 교체되면 `OpenCLBackend::noshuffle_soa_registry`의 stale entry는 swap 직후 invalidate되어야 한다 (전체 clear 또는 per-layer 제거). 디바이스 한정 silent correctness bug. | Correctness | 🆕 미구현 | `engine/tests/spec/test_inv_130_noshuffle_soa_coherence.rs` + 디바이스 동작 확인 (manual) |
+
 ---
 
 # Part II — 행위 명세 (PREFIX-NNN) 추적
@@ -271,6 +279,7 @@
 | ENG-ALG-218 | (E) | On-demand ImportanceCollector: RequestQcf → next prefill arm → finalize → QcfEstimate + K=512 fallback | 🆕 미구현 | `engine/tests/spec/test_eng_alg_218_importance_on_demand.rs` |
 | ENG-ALG-219 | (A) | `FullKernelPlan::execute()` 진입 1회 atomic load 비교 (`plan.ratio_generation_at_build` ↔ `model.ratio_generation`). mismatch 시 `PlanInvalidated`. INV-120과 OR 결합. tensor_partition × weight swap 상호 배타(DF-35-3). | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
 | ENG-ALG-220 | (A) | `forward_into` per-token entry에서 `entry_ratio_generation = model.ratio_generation.load(Acquire)` capture → plan에 전달 → 동일 토큰 내 재사용. mid-token swap은 다음 토큰부터 관측. INV-121 per-token snapshot과 동일 시점. | 🆕 미구현 | `engine/tests/spec/test_eng_alg_219_plan_invalidation.rs` |
+| ENG-ALG-221 | (A) | SwapExecutor batch 종료 직후 `OpenCLBackend::noshuffle_soa_registry` invalidate (전체 clear 또는 per-layer 제거). 다음 forward의 plan rebuild 경로에서 새 cl_mem 주소로 자연 재등록. **디바이스(Adreno 830) 한정 발현**, 호스트는 NoOp. ENG-ALG-211 step (e)와 동일 단계. | 🆕 미구현 | `engine/tests/spec/test_inv_130_noshuffle_soa_coherence.rs` + 디바이스 manual 검증 |
 
 ## Engine Data
 

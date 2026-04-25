@@ -1829,6 +1829,67 @@ T1: 다음 토큰 진입
 
 ---
 
+#### 3.12.15 Noshuffle SOA Registry Coherence on Swap [ENG-ALG-221]
+
+**[ENG-ALG-221]** `SwapExecutor`가 Q4_0 weight swap을 실행할 때, 교체 대상 layer에 해당하는 `OpenCLBackend::noshuffle_soa_registry` entry는 swap 이전에 또는 직후에 invalidate되어야 한다. 구체적 구현은 전체 `clear_noshuffle_soa_registry()` 호출 또는 per-layer key 기반 제거 중 선택한다. Invalidate 이후 다음 forward 진입 시 `FullKernelPlan` rebuild 경로(ENG-ALG-219)에서 새 cl_mem 주소로 자연 재등록된다. 본 invariant는 디바이스(Adreno) 한정으로 발현되며 호스트 환경에서는 SOA registry 자체가 비어 있어 관측 불가하다. *(MUST)*
+
+**전제**:
+- `OpenCLBackend::noshuffle_soa_registry`는 `cl_mem` 포인터 주소를 key로 사용하는 `HashMap`이다 (`engine/src/backend/opencl/mod.rs`의 registry 구현 참조).
+- Q4_0 weight tensor가 `LayerSlot::weights.store()`(`ArcSwap`)로 교체되면 새로운 `cl_mem`이 할당되며 옛 cl_mem 주소는 drop 후 재사용 가능한 상태가 된다.
+- `clear_noshuffle_soa_registry()` 헬퍼는 `OpenCLBackend`에 이미 존재한다 (전체 비움).
+
+**문제 정의**:
+- Swap 후 옛 cl_mem 주소를 key로 한 SOA registry entry는 **stale**이다. 새 cl_mem과 매칭되는 SOA descriptor가 없거나, 주소 재사용 시 잘못된 SOA descriptor가 매칭될 위험이 있다.
+- 호스트 환경에서는 OpenCL backend가 활성화되지 않거나 SOA registry가 비어 있어 발현되지 않는다 — **device-only silent correctness bug**.
+
+**알고리즘 (의사코드)**:
+
+```
+function SwapExecutor::execute_swap(layers_to_swap, target_dtype):
+    // ... 기존 per-layer loop (ENG-ALG-211 step (b)~(d)) ...
+    for layer_idx in layers_to_swap:
+        new_weights = build_layer_from_mmap(layer_idx, target_dtype)
+        slot[layer_idx].weights.store(Arc::new(new_weights))
+        slot[layer_idx].current_dtype.store(target_dtype)
+        slot[layer_idx].generation.fetch_add(1, Relaxed)
+        madvise_dontneed(old_arc.primary_pages)
+
+    if !swapped.is_empty():
+        // (1) SOA registry coherence (ENG-ALG-221)
+        backend.clear_noshuffle_soa_registry()    // 또는 per-layer key 제거
+
+        // (2) 전역 plan 무효화 (ENG-ALG-211 step (e))
+        model.ratio_generation.fetch_add(1, SeqCst)
+```
+
+**구현 전략 선택지**:
+
+| 전략 | 동작 | 장점 | 단점 |
+|------|------|------|------|
+| 전체 clear | `clear_noshuffle_soa_registry()` 1회 호출 | 단순. 1줄 추가. correctness 명확. | swap되지 않은 layer의 SOA descriptor도 비워져 첫 forward에서 재등록 비용 발생. |
+| Per-layer key 제거 | 교체된 layer의 cl_mem 주소들만 `HashMap::remove()` | 비-swap layer 영향 0. | swap 직전 옛 cl_mem 주소 목록을 수집해야 함. 구현 복잡도 증가. |
+
+**선택 기준**: Phase 3.6 구현 시 **측정 기반 결정**. 비-swap layer가 다수(ratio < 1.0)이고 첫 forward 재등록 비용이 유의미하면 per-layer 전략 채택. 대부분의 ratio (0.25/0.5)에서 swap 직후 첫 forward는 어차피 PlanInvalidated로 재빌드되므로 전체 clear의 추가 비용은 미미할 가능성이 높다.
+
+**관측 가능성**:
+- 호스트 환경: SOA registry 자체가 채워지지 않으므로 본 invariant는 NoOp. spec test는 "registry empty 상태에서 clear 호출이 panic 없이 완료되는가" 정도만 검증 가능.
+- 디바이스 (Adreno 830, S25): swap 직후 첫 decode가 garbage logits를 생성하면 INV-130 위반. 정상 swap 후에도 출력이 baseline과 정합한지 logit NMSE/top-1 match로 측정 (INV-122 sweep과 통합 가능).
+
+**예외 처리**:
+- `noshuffle_soa_registry` 자체가 빈 경우: clear는 NoOp, panic 없음.
+- Swap 결과가 비어 있음 (전 layer skip): SOA clear도 생략 (불필요한 cache invalidation 회피). `ratio_generation` bump 생략 규약(ENG-ALG-211)과 동일 분기.
+
+**불변식**: INV-130.
+
+**교차 참조**:
+- ENG-ALG-211 (SwapExecutor batch 흐름): step (e) `ratio_generation` bump와 동일 시점에 SOA clear 수행.
+- ENG-ALG-219 (Plan invalidation): SOA clear 후 다음 forward의 plan rebuild 경로에서 새 cl_mem 주소로 SOA 재등록.
+- INV-130: 본 알고리즘이 충족하는 불변식.
+- `OpenCLBackend::noshuffle_soa_registry` (engine/src/backend/opencl/mod.rs).
+- `OpenCLBackend::clear_noshuffle_soa_registry()` (engine/src/backend/opencl/mod.rs).
+
+---
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.

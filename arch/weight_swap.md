@@ -1,12 +1,13 @@
 # Weight Swap — Dynamic Runtime Swap Architecture
 
-> **상태**: Draft v5 (2026-04-25, Phase 3.5 Plan invalidation 통합 반영)
+> **상태**: Draft v6 (2026-04-25, Phase 3.6 Noshuffle SOA coherence 통합 반영)
 > **작성**: 2026-04-24, **갱신**: 2026-04-25
-> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택, plan 경로 lazy invalidation.
+> **범위**: Manager 신호 기반 동적 weight swap. 평시 제로 오버헤드, on-demand 측정, Arc snapshot 기반 lock-free 교체, Manager가 상한 ratio/Engine이 layer 선택, plan 경로 lazy invalidation, GPU SOA registry 동기화.
 > **대상 스펙**:
 >   - Phase 1/2: `spec/33-engine-data.md` §3.17~3.20 (ENG-DAT-090, 092, 093, 094), `spec/32-engine-algorithms.md` §3.12.1~3.12.7 (ENG-ALG-210~214, ENG-ALG-214-SNAP), `spec/41-invariants.md` §3.13 (INV-121~125).
 >   - Phase 3: `spec/33-engine-data.md` §3.21 (ENG-DAT-095), `spec/32-engine-algorithms.md` §3.12.8~3.12.12 (ENG-ALG-214-ROUTE, ENG-ALG-215~218), `spec/41-invariants.md` §3.13 (INV-126~128), `spec/11-protocol-messages.md` (MSG-042, 082, 088, 089).
->   - **Phase 3.5 (NEW)**: `spec/32-engine-algorithms.md` §3.12.13~3.12.14 (ENG-ALG-219, ENG-ALG-220), `spec/41-invariants.md` §3.14 (INV-129).
+>   - Phase 3.5: `spec/32-engine-algorithms.md` §3.12.13~3.12.14 (ENG-ALG-219, ENG-ALG-220), `spec/41-invariants.md` §3.14 (INV-129).
+>   - **Phase 3.6 (NEW)**: `spec/32-engine-algorithms.md` §3.12.15 (ENG-ALG-221), `spec/41-invariants.md` §3.15 (INV-130).
 > **대상 모델**: Llama 3.2 1B (16 decoder layers, no tying), Qwen 2.5 1.5B (28 decoder layers, tying 가능).
 > **전제**: GGUF primary + GGUF secondary (dtype 다름). Safetensors는 부차 지원.
 
@@ -352,6 +353,87 @@ flowchart TB
 - INV-129: 전역 plan stale 감지 불변식.
 - INV-120: per-partition stale (별도, OR 결합).
 - INV-121: per-token forward snapshot (layer Arc).
+
+#### 2.2.3 Noshuffle SOA Registry Coherence (Phase 3.6, ENG-ALG-221, INV-130)
+
+**핵심 변경 (v6, 2026-04-25)**: Phase 3.5의 plan invalidation은 `FullKernelPlan` 메타데이터의 stale 감지를 다루지만, **GPU 백엔드 내부의 layer-별 캐시 자료구조**는 별개 경로로 stale 상태가 된다. Q4_0 weight swap 시 `OpenCLBackend::noshuffle_soa_registry`(cl_mem 주소 key의 HashMap)는 `SwapExecutor`에 의해 갱신되지 않으므로 **silent correctness bug**의 원인이 된다. v6에서 본 규약을 도입한다.
+
+**문제 정의**:
+- `OpenCLBackend::noshuffle_soa_registry`는 `cl_mem` 포인터 주소를 key로 하는 `HashMap`이다. 각 entry는 Q4_0 layer weight tensor의 SOA(structure-of-arrays) 디스크립터를 보관한다 (`engine/src/backend/opencl/mod.rs`의 registry 정의 참조).
+- Q4_0 weight tensor가 `ArcSwap::store`로 교체되면 새 `cl_mem`이 할당된다. 옛 cl_mem은 drop되며 주소는 재사용 가능 풀로 돌아간다.
+- `SwapExecutor`가 SOA registry를 invalidate하지 않으면, 옛 주소 key의 entry는 **stale**이다. 새 cl_mem과 매칭되는 SOA descriptor가 없거나, 주소 재사용 시 잘못된 SOA descriptor가 매칭될 위험이 있다.
+- 호스트 환경: OpenCL backend가 비활성이거나 SOA registry가 비어 있어 발현 안 됨 → **device-only silent correctness bug**.
+- `OpenCLBackend::clear_noshuffle_soa_registry()` 헬퍼는 이미 `engine/src/backend/opencl/mod.rs`에 존재한다. 본 규약은 이를 SwapExecutor 경로에 연결하는 것이다.
+
+**규약 4종**:
+
+1. **Invalidate 시점**: `SwapExecutor::execute_swap`의 batch 종료 직후, `model.ratio_generation.fetch_add(1, SeqCst)`(ENG-ALG-211 step (e))과 동일 단계에서 SOA registry invalidate를 수행한다. 순서는 SOA invalidate → ratio_generation bump 또는 그 반대 모두 허용 (둘 다 batch 후 수행되며 forward는 다음 토큰 경계부터 새 snapshot을 본다).
+2. **Invalidate 단위 선택**: 전체 `clear_noshuffle_soa_registry()` 호출 또는 per-layer key 기반 제거 중 택일. Phase 3.6 구현 시 측정 기반 결정 (DF-36-2 참조).
+3. **빈 결과 처리**: swap 결과가 비어 있는 경우 (`swapped.is_empty()`) SOA invalidate도 생략. `ratio_generation` bump 생략 규약(ENG-ALG-211)과 동일 분기.
+4. **자연 재등록**: invalidate 이후 다음 forward에서 plan rebuild가 트리거되며(ENG-ALG-219로 PlanInvalidated 또는 forward_gen fallback), GPU matmul 경로가 새 cl_mem 주소로 SOA descriptor를 자연 재등록한다. SwapExecutor는 사전 등록을 시도하지 않는다.
+
+**구현 전략 트레이드오프**:
+
+| 전략 | 동작 | 장점 | 단점 |
+|------|------|------|------|
+| **전체 clear** (권장 default) | `backend.clear_noshuffle_soa_registry()` 1회 호출 | 단순. 1줄 추가. correctness 명확. SwapExecutor가 layer별 cl_mem 주소를 알 필요 없음. | 비-swap layer의 SOA descriptor도 비워져 첫 forward에서 모든 layer 재등록 비용 발생. ratio < 1.0 시 일부 비효율. |
+| **Per-layer key 제거** | 교체된 layer의 옛 cl_mem 주소 목록을 swap 직전 수집 → swap 후 `HashMap::remove()` | 비-swap layer 영향 0. 첫 forward 재등록 비용 최소. | 옛 cl_mem 주소 수집 로직 필요. SwapExecutor가 backend 내부 자료구조에 더 깊이 결합. |
+
+**선택 근거 (Phase 3.6 진입 시)**: 대부분 ratio (0.25/0.5)에서 swap 직후 첫 decode는 어차피 plan rebuild를 거치므로 **전체 clear**가 추가 비용 거의 없이 단순한 정답이다. ratio=0.25에서 비-swap layer 75%의 SOA 재등록 비용이 측정상 유의미할 때만 per-layer 전략을 검토한다. 결정은 디바이스(S25, Adreno 830)에서 logit NMSE 정확성과 swap-직후 TBT 두 메트릭으로 한다.
+
+**Mermaid 처리 흐름**:
+
+```mermaid
+flowchart TD
+    START([SwapExecutor::execute_swap]) --> LOOP[per-layer swap loop]
+    LOOP --> STORE[slot.weights.store new Arc<br/>+ current_dtype.store]
+    STORE --> SLOT_GEN[slot.generation += 1<br/>「debug only」]
+    SLOT_GEN --> MADV[madvise DONTNEED on old primary pages]
+    MADV --> NEXT[다음 layer]
+    NEXT --> LOOP
+    LOOP -- batch done --> NONEMPTY{swapped<br/>non-empty?}
+    NONEMPTY -- No --> DONE([WeightSwapped 반환])
+    NONEMPTY -- Yes --> SOA[backend.clear_noshuffle_soa_registry<br/>「ENG-ALG-221, INV-130」]
+    SOA --> GBUMP[model.ratio_generation += 1<br/>「ENG-ALG-211 step e」]
+    GBUMP --> DONE
+
+    Note1[다음 forward 진입 시:<br/>- INV-129 plan rebuild<br/>- GPU matmul 경로가<br/>  새 cl_mem으로 SOA 재등록]
+
+    DONE -.-> Note1
+
+    style SOA fill:#fff3e0
+    style GBUMP fill:#fff3e0
+```
+
+**예외 처리**:
+
+| 조건 | 처리 |
+|------|------|
+| `noshuffle_soa_registry`가 빈 상태 (호스트 환경 등) | clear는 NoOp, panic 없음. spec test에서 빈 registry clear 안전성을 검증. |
+| `clear_noshuffle_soa_registry()` 자체가 panic 위험 | 없음 — `HashMap::clear()` 기반의 단순 작업. lock 충돌 시에도 deadlock 가능성 없음(SwapExecutor는 forward와 토큰 경계로 분리). |
+| Swap 결과 빈 (전 layer skip) | SOA clear도 생략. 불필요한 cache invalidation 회피. |
+
+**호스트 vs 디바이스 관측 가능성**:
+
+| 환경 | SOA registry 상태 | 위반 시 결과 | 검증 방법 |
+|------|------------------|-------------|----------|
+| 호스트 (NVIDIA OpenCL 또는 CPU only) | 비어 있거나 사용 안 됨 | 발현 안 됨 — silent fallback | spec test로 "registry 비어 있을 때 clear 안전" 정도만 검증 |
+| 디바이스 (S25, Adreno 830) | 채워져 있음 | swap 직후 첫 decode가 garbage logits 생성 | 디바이스 실측: swap 후 logit NMSE / top-1 match (INV-122 sweep과 통합) + 수동 검증 |
+
+**결정 플래그 (DF-36-1, DF-36-2)**:
+
+| ID | 결정 | 채택안 | 근거 |
+|----|------|--------|------|
+| **DF-36-1** | Invalidate 시점 | SwapExecutor batch 종료 직후 (ratio_generation bump와 동일 단계) | 단일 진입점. forward와 시간적으로 분리되어 race 없음. |
+| **DF-36-2** | Invalidate 단위 | **전체 clear 권장 default**, per-layer는 측정 기반 선택지 | 대부분 ratio에서 plan rebuild가 어차피 발생. 단순성 우선. |
+
+**스펙 cross-ref**:
+- ENG-ALG-221: SwapExecutor batch 종료 후 SOA registry invalidate 알고리즘.
+- INV-130: 전역 SOA registry coherence 불변식 (디바이스 한정).
+- ENG-ALG-211: SwapExecutor batch 흐름 (step (e) ratio_generation bump와 동일 단계).
+- ENG-ALG-219 / INV-129: 다음 forward의 plan rebuild가 자연 재등록 경로를 트리거.
+- `OpenCLBackend::noshuffle_soa_registry` (engine/src/backend/opencl/mod.rs).
+- `OpenCLBackend::clear_noshuffle_soa_registry()` (engine/src/backend/opencl/mod.rs, 기존 헬퍼).
 
 ---
 
@@ -953,6 +1035,12 @@ Decider는 `already_swapped: &HashSet<usize>`를 입력받아 후보에서 **제
 
 ## 7. 변경 이력
 
+- **2026-04-25 (v6, Phase 3.6 Noshuffle SOA registry coherence)**:
+  1. §2.2.3 "Noshuffle SOA Registry Coherence" 신규. ENG-ALG-221 / INV-130 cross-ref.
+  2. SwapExecutor batch 종료 후 `OpenCLBackend::noshuffle_soa_registry` invalidate 의무 명문화. 전체 clear vs per-layer 트레이드오프 표 + Mermaid flow.
+  3. 결정 플래그 DF-36-1 (invalidate 시점 = batch 종료 직후), DF-36-2 (전체 clear 권장 default) 추가.
+  4. 헤더 대상 스펙에 Phase 3.6 ID 추가 (ENG-ALG-221 / INV-130).
+  5. 호스트 환경에서는 발현 불가하며 디바이스(Adreno 830) 실측 필수임을 명시.
 - **2026-04-25 (v5, Phase 3.5 Plan invalidation 통합)**:
   1. §2.2.2 "Plan 경로 소비 규약" 신규. ENG-ALG-219 / ENG-ALG-220 / INV-129 cross-ref.
   2. §6 "Phase 3.5 Out-of-scope" → "Phase 3.5 In-scope"로 승격. 결정 플래그 DF-35-1~DF-35-4 채택안 명시.

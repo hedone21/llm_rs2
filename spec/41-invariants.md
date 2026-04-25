@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) = 총 110개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) = 총 111개.
 
 ## 1. Purpose and Scope
 
@@ -263,6 +263,19 @@
 |----|------|----------|---------|------|------|
 | INV-129 | 32-engine-algorithms 3.12.13 (ENG-ALG-219) | `FullKernelPlan::execute()` 진입 시 `plan.ratio_generation_at_build`와 `TransformerModel::ratio_generation`(현재) 값을 `Acquire` load로 1회 비교한다. mismatch 시 `PlanInvalidated`를 반환하며 caller는 plan 재빌드 또는 `forward_gen` fallback을 수행한다. INV-120(per-partition context)과 **독립적**으로 동작하며 OR 결합된다. weight swap(ENG-ALG-211 step (e) bump) 및 partition re-prep 모두 trigger가 될 수 있다. | Safety/Correctness | runtime | AtomicU64 Acquire load 비교. Plan 경로 stale 감지의 전역 trigger. |
 
+### 3.15 Noshuffle SOA Registry Coherence [INV-130]
+
+2026-04-25 Weight Swap Phase 3.6 (`OpenCLBackend::noshuffle_soa_registry` × `SwapExecutor` 통합)의 불변식. 대응 명세: `32-engine-algorithms.md` 3.12.15 (ENG-ALG-221), `arch/weight_swap.md` §2.2.3.
+
+**교차 참조**:
+- **ENG-ALG-211** (SwapExecutor batch 흐름): step (e) `ratio_generation` bump와 동일 시점에 SOA registry invalidate가 수행된다.
+- **ENG-ALG-219 / INV-129** (Plan invalidation): SOA invalidate 후 다음 forward는 plan rebuild 경로를 거치며, rebuild 과정에서 새 cl_mem 주소로 SOA registry가 자연 재등록된다.
+- **본 invariant는 디바이스(Adreno 830) 한정**으로 발현된다. 호스트 환경에서는 SOA registry 자체가 사용되지 않아 위반이 관측 불가하다.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-130 | 32-engine-algorithms 3.12.15 (ENG-ALG-221) | Q4_0 weight swap으로 tensor.buffer(cl_mem)가 교체되는 경우, 교체된 layer의 `OpenCLBackend::noshuffle_soa_registry` entry는 stale 상태로 남아 있으면 안 된다. Swap 이후 해당 layer의 GPU matmul이 실행되기 전 invalidate(전체 clear 또는 per-layer key 제거)가 완료되어야 한다. 디바이스(Adreno 830) 한정으로 발현된다. | Correctness | runtime | HashMap entry removal. 호스트에서는 registry 비어 있어 NoOp. 디바이스 실측 필수. |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -291,22 +304,23 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 18 | 23% |
-| Correctness | 57 | 71% |
-| Performance | 2 | 3% |
+| Safety | 18 | 22% |
+| Correctness | 58 | 72% |
+| Performance | 2 | 2% |
 | Compatibility | 3 | 4% |
-| **합계** | **80** | **100%** |
+| **합계** | **81** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
 > INV-129는 Weight Swap Phase 3.5 (Plan × Weight Swap stale detection)에서 추가. 카테고리는 Safety/Correctness 양쪽이며, 통계는 Safety로 1회 카운트한다.
+> INV-130은 Weight Swap Phase 3.6 (Noshuffle SOA registry coherence)에서 추가. 카테고리는 Correctness (디바이스 한정 silent correctness bug — crash/data-loss가 아니므로 Safety 아님).
 
 ### 5.2 검증 방법별 통계
 
 | 검증 방법 | 주 검증 | 보조 검증 포함 | 설명 |
 |----------|---------|-------------|------|
 | static | 21 | 25 | Cargo 의존 구조, feature gate, trait bound, 코드 구조 |
-| runtime | 33 | 40 | assert, clamp, 조건 검사, AtomicU64 |
+| runtime | 34 | 41 | assert, clamp, 조건 검사, AtomicU64 |
 | test | 21 | 37 | 단위/통합/프로퍼티/장애 주입 테스트 |
 
 다수의 불변식이 2개 이상의 검증 방법을 병용한다.
