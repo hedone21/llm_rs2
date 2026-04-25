@@ -13,8 +13,9 @@
 //!    shape mismatch를 재현할 수 있는지.
 //! 4. dtype round-trip (Q4_0, F16, F32).
 
+use llm_rs2::auf::q4_0_aos_to_adreno_soa;
 use llm_rs2::auf::reader::open_from_bytes;
-use llm_rs2::auf::section::TAG_WEIGHTS_CPU_AOS;
+use llm_rs2::auf::section::{TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS};
 use llm_rs2::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex, TensorKind};
 use llm_rs2::auf::tokenizer::{AufTokenizer, TOKENIZER_KIND_BPE};
 use llm_rs2::auf::writer::AufWriter;
@@ -378,4 +379,149 @@ fn auf_e2e_multi_layer_shape_propagation() {
     let bytes1 = secondary.tensor_bytes(info1);
     assert_eq!(bytes1.len(), 8192);
     assert_eq!(bytes1[0], 0xBBu8);
+}
+
+// ── 테스트 5: AUF SOA bypass — split round-trip + size invariant ─────────────
+
+/// Phase 4 LATENCY-AUF / Phase 3.7b SOA bypass: AUF `WEIGHTS_ADRENO_SOA`
+/// payload (q_buf+d_buf concat)를 `SecondaryMmap::split_pre_converted_soa`로
+/// 분리했을 때 builder 출력과 byte-equal해야 한다. 디바이스 측정 진입 전
+/// SOA bytes 오해석으로 인한 정확성 회귀 (4차 차단의 원인)를 호스트에서
+/// 사전 차단하는 회귀 가드.
+#[test]
+fn auf_soa_bypass_split_matches_builder_output() {
+    // 4 rows × 64 cols → 8 Q4_0 blocks → AOS 144 bytes.
+    let ne00 = 64usize;
+    let ne01 = 4usize;
+    let n_blocks = ne01 * ne00 / 32;
+    let mut aos = Vec::with_capacity(n_blocks * 18);
+    for b in 0..n_blocks {
+        let s = (0x0100u16 + b as u16).to_le_bytes();
+        aos.extend_from_slice(&s);
+        for i in 0..16u8 {
+            aos.push(((b * 7 + i as usize) & 0xFF) as u8);
+        }
+    }
+    assert_eq!(aos.len(), n_blocks * 18);
+
+    let (q_expected, d_expected) = q4_0_aos_to_adreno_soa(&aos, ne00, ne01);
+    assert_eq!(q_expected.len() + d_expected.len(), aos.len());
+
+    let mut soa_payload = Vec::with_capacity(aos.len());
+    soa_payload.extend_from_slice(&q_expected);
+    soa_payload.extend_from_slice(&d_expected);
+
+    // Logical shape (outermost-first): [ne01, ne00] = [4, 64].
+    let auf_logical_shape: Vec<u64> = vec![ne01 as u64, ne00 as u64];
+    let payload_size = soa_payload.len() as u64;
+
+    let tensor_index = TensorIndex {
+        variant_tags: vec![tag_buf(TAG_WEIGHTS_ADRENO_SOA)],
+        entries: vec![TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnQ.as_u32(),
+            dtype: TensorDType::Q4_0.as_u32(),
+            shape: auf_logical_shape,
+            alignment: 64,
+            variant_offsets: vec![0],
+            variant_sizes: vec![payload_size],
+        }],
+    };
+
+    let auf_bytes = AufWriter::new(make_meta(1, 32, 64, 128), make_tokenizer(), [0u8; 32], 0, 0)
+        .with_tensor_index(tensor_index)
+        .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, soa_payload)
+        .build()
+        .expect("AUF build should succeed");
+
+    let view = open_from_bytes(auf_bytes, BackendTag::AdrenoSoa)
+        .expect("open_from_bytes with AdrenoSoa should succeed");
+    let config = make_config(1, 32, 64, 128);
+
+    let secondary = build_auf_secondary_from_view(
+        view,
+        &config,
+        Path::new("/fake/soa_bypass.auf"),
+        BackendTag::AdrenoSoa,
+    )
+    .expect("build_auf_secondary_from_view should succeed for SOA");
+
+    assert!(
+        secondary.is_pre_converted_soa(),
+        "SecondaryMmap should signal pre-converted SOA for AdrenoSoa variant"
+    );
+
+    let info = secondary
+        .layer_tensor(0, "attn_q.weight")
+        .expect("attn_q.weight must be present");
+    assert_eq!(info.dtype, DType::Q4_0);
+
+    // SOA bypass split round-trip
+    let (q_actual, d_actual) = secondary
+        .split_pre_converted_soa(info)
+        .expect("split_pre_converted_soa must return Some for Q4_0 SOA payload");
+    assert_eq!(
+        q_actual, q_expected,
+        "split q_bytes must match builder q_buf"
+    );
+    assert_eq!(
+        d_actual, d_expected,
+        "split d_bytes must match builder d_buf"
+    );
+
+    // Size invariant: q + d = original AOS size (block count × 18B).
+    assert_eq!(
+        q_actual.len() + d_actual.len(),
+        n_blocks * 18,
+        "AUF SOA payload length must equal AOS Q4_0 size — placeholder cl_mem assumption"
+    );
+}
+
+/// GGUF secondary는 SOA 변환을 적용하지 않으므로
+/// `split_pre_converted_soa`가 항상 `None`이어야 한다 (음성 가드).
+#[test]
+fn split_pre_converted_soa_returns_none_for_cpu_aos_variant() {
+    // CPU_AOS variant: payload는 raw AOS bytes 그대로.
+    let ne00 = 32usize;
+    let ne01 = 1usize;
+    let n_blocks = 1;
+    let mut aos = vec![0x10u8, 0x00];
+    for i in 0..16u8 {
+        aos.push(i);
+    }
+    assert_eq!(aos.len(), n_blocks * 18);
+
+    let tensor_index = TensorIndex {
+        variant_tags: vec![tag_buf(TAG_WEIGHTS_CPU_AOS)],
+        entries: vec![TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnQ.as_u32(),
+            dtype: TensorDType::Q4_0.as_u32(),
+            shape: vec![ne01 as u64, ne00 as u64],
+            alignment: 64,
+            variant_offsets: vec![0],
+            variant_sizes: vec![18],
+        }],
+    };
+
+    let auf_bytes = AufWriter::new(make_meta(1, 32, 64, 128), make_tokenizer(), [0u8; 32], 0, 0)
+        .with_tensor_index(tensor_index)
+        .add_weights_section(TAG_WEIGHTS_CPU_AOS, aos)
+        .build()
+        .expect("build OK");
+    let view = open_from_bytes(auf_bytes, BackendTag::CpuAos).expect("open OK");
+    let secondary = build_auf_secondary_from_view(
+        view,
+        &make_config(1, 32, 64, 128),
+        Path::new("/fake/cpu_aos.auf"),
+        BackendTag::CpuAos,
+    )
+    .expect("build OK");
+
+    assert!(!secondary.is_pre_converted_soa());
+    let info = secondary.layer_tensor(0, "attn_q.weight").expect("present");
+    assert!(
+        secondary.split_pre_converted_soa(info).is_none(),
+        "CPU_AOS variant must NOT expose SOA split (would corrupt forward path)"
+    );
 }
