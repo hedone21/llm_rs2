@@ -96,6 +96,12 @@ mod test_eng_alg_219_plan_invalidation;
 #[path = "spec/test_inv_130_noshuffle_soa_coherence.rs"]
 mod test_inv_130_noshuffle_soa_coherence;
 
+// ── Weight Swap Phase 3.7a — SOA Re-conversion safety net (INV-131) ──
+// ENG-ALG-222: clear → convert → register → ratio_generation bump 순서.
+// INV-131: swap 후 첫 GPU matmul 직전 새 cl_mem이 registry에 등록 완료.
+#[path = "spec/test_inv_131_soa_reconversion.rs"]
+mod test_inv_131_soa_reconversion;
+
 // ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
 // Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
 #[path = "spec/test_inv_126_dtype_reserved.rs"]
