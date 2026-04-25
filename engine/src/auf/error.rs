@@ -33,6 +33,10 @@ pub enum AufError {
     TokenizerFormat { detail: String },
     /// TENSOR_INDEX section 포맷이 잘못되었다.
     TensorIndexFormat { detail: String },
+    /// WEIGHTS_* section이 존재하지만 TENSOR_INDEX가 해당 variant를 cover하지 않는다.
+    ///
+    /// `auf-tool build`가 TensorIndex를 채우지 않았거나, 수동 조작으로 빈 인덱스가 주입된 경우.
+    TensorIndexMissingVariant { weights_tag: String },
     /// 기타 IO/파싱 에러.
     Io(std::io::Error),
     /// 기타 메시지 에러.
@@ -95,6 +99,12 @@ impl fmt::Display for AufError {
             AufError::TensorIndexFormat { detail } => {
                 write!(f, "TENSOR_INDEX section format error: {detail}")
             }
+            AufError::TensorIndexMissingVariant { weights_tag } => write!(
+                f,
+                "AUF file invariant violation: TENSOR_INDEX does not list variant '{}' — \
+                 empty index detected. Rebuild with 'auf-tool build'.",
+                weights_tag
+            ),
             AufError::Io(e) => write!(f, "AUF I/O error: {e}"),
             AufError::Other(msg) => write!(f, "AUF error: {msg}"),
         }

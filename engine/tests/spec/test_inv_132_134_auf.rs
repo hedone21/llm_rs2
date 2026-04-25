@@ -3,13 +3,15 @@
 /// INV-132: magic/format_major/capability_required 불일치 시 panic 없이 reject.
 /// INV-133: required section (META/TOKENIZER/TENSOR_INDEX) 누락 시 reject + backend WEIGHTS_* 누락 시 reject.
 /// INV-134: section offset/size 무결성 — payload_start_offset 미만 / 파일 범위 초과 / overlap / 중복 tag.
+/// INV-134.7~8: TENSOR_INDEX 내용 검증 — WEIGHTS_* 존재 시 variant_tags가 cover해야 함.
 ///
 /// spec: `spec/33-engine-data.md` §3.22 (ENG-DAT-096, ENG-DAT-C13, ENG-DAT-C14)
 ///       `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223)
 ///       `spec/41-invariants.md` §3.16 (INV-132~134)
 use llm_rs2::auf::{
-    AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_REQUIRED, SECTION_STRIPPABLE,
-    SectionEntry, SectionTable, TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE,
+    AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, LAYER_IDX_CROSS, SECTION_REQUIRED,
+    SECTION_STRIPPABLE, SectionEntry, SectionTable, TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS,
+    TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
 };
 
 // ── 헬퍼 ──────────────────────────────────────────────────────────────────
@@ -370,4 +372,108 @@ fn writer_stripper_reader_round_trip() {
     let wb = view.weights_bytes().unwrap();
     assert_eq!(wb.len(), 128);
     assert!(wb.iter().all(|&b| b == 2));
+}
+
+// ── INV-134.7~8: TENSOR_INDEX 내용 검증 ──────────────────────────────────
+
+/// INV-134.7: WEIGHTS_* section이 존재하고 TENSOR_INDEX의 variant_tags가 비어 있으면
+///            AufView의 tensor_index.variant_index_for_tag()가 None을 반환한다.
+///
+/// 이 상태는 SecondaryMmap이 lookup에 실패하는 원인이므로,
+/// 정상 build path에서는 TensorIndex가 반드시 해당 variant를 포함해야 한다.
+/// 테스트는 빈 TensorIndex를 주입한 AUF를 열었을 때 variant lookup 실패를 검증한다.
+#[test]
+fn inv134_7_empty_tensor_index_fails_variant_lookup() {
+    // 빈 TensorIndex로 AUF 빌드 (auf_tool build 버그 재현 케이스)
+    let bytes = AufWriter::new(make_meta(), make_tokenizer(), [0u8; 32], 0, 0)
+        .with_tensor_index(TensorIndex {
+            variant_tags: vec![],
+            entries: vec![],
+        })
+        .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, vec![0xABu8; 64])
+        .build()
+        .unwrap();
+
+    // open 자체는 성공 (reader는 TENSOR_INDEX 내용을 검증하지 않음)
+    let view = open(bytes, BackendTag::AdrenoSoa).unwrap();
+
+    // WEIGHTS_ADRENO_SOA section은 존재하지만 TENSOR_INDEX가 cover하지 않음
+    assert!(
+        view.weights_range.is_some(),
+        "weights section should be present"
+    );
+
+    // variant_index_for_tag는 None을 반환해야 함 — SecondaryMmap이 실패하는 원인
+    let idx = view
+        .tensor_index
+        .variant_index_for_tag(TAG_WEIGHTS_ADRENO_SOA);
+    assert!(
+        idx.is_none(),
+        "empty TENSOR_INDEX must not cover WEIGHTS_ADRENO_SOA, got Some({:?})",
+        idx
+    );
+}
+
+/// INV-134.8: 정상 build path에서 TensorIndex가 올바르게 채워지면 variant lookup 성공.
+///
+/// `TensorIndex`에 `TAG_WEIGHTS_ADRENO_SOA` variant를 포함시켜 round-trip 검증.
+#[test]
+fn inv134_8_populated_tensor_index_variant_lookup_succeeds() {
+    fn make_variant_tag_buf(s: &str) -> [u8; 24] {
+        let mut buf = [0u8; 24];
+        let b = s.as_bytes();
+        buf[..b.len().min(24)].copy_from_slice(&b[..b.len().min(24)]);
+        buf
+    }
+
+    let tensor_index = TensorIndex {
+        variant_tags: vec![make_variant_tag_buf(TAG_WEIGHTS_ADRENO_SOA)],
+        entries: vec![
+            TensorEntry {
+                layer_idx: LAYER_IDX_CROSS,
+                kind: TensorKind::Embedding.as_u32(),
+                dtype: TensorDType::Q4_0.as_u32(),
+                shape: vec![],
+                alignment: 64,
+                variant_offsets: vec![0],
+                variant_sizes: vec![32],
+            },
+            TensorEntry {
+                layer_idx: 0,
+                kind: TensorKind::AttnQ.as_u32(),
+                dtype: TensorDType::Q4_0.as_u32(),
+                shape: vec![],
+                alignment: 64,
+                variant_offsets: vec![32],
+                variant_sizes: vec![32],
+            },
+        ],
+    };
+
+    let bytes = AufWriter::new(make_meta(), make_tokenizer(), [0u8; 32], 0, 0)
+        .with_tensor_index(tensor_index)
+        .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, vec![0xCDu8; 64])
+        .build()
+        .unwrap();
+
+    let view = open(bytes, BackendTag::AdrenoSoa).unwrap();
+
+    // variant lookup 성공
+    let vi = view
+        .tensor_index
+        .variant_index_for_tag(TAG_WEIGHTS_ADRENO_SOA);
+    assert_eq!(
+        vi,
+        Some(0),
+        "populated TENSOR_INDEX must cover WEIGHTS_ADRENO_SOA"
+    );
+
+    // tensor entries 보존
+    assert_eq!(view.tensor_index.entries.len(), 2);
+    assert_eq!(view.tensor_index.entries[0].layer_idx, LAYER_IDX_CROSS);
+    assert_eq!(view.tensor_index.entries[1].layer_idx, 0);
+    assert_eq!(
+        view.tensor_index.entries[1].kind,
+        TensorKind::AttnQ.as_u32()
+    );
 }

@@ -13,7 +13,9 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 
 use llm_rs2::auf::stripper::strip;
-use llm_rs2::auf::tensor_index::TensorIndex;
+use llm_rs2::auf::tensor_index::{
+    LAYER_IDX_CROSS, TensorDType, TensorEntry, TensorIndex, TensorKind,
+};
 use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_STRIPPABLE,
     TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS, TOKENIZER_KIND_BPE,
@@ -415,10 +417,6 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         .created_by
         .unwrap_or_else(|| format!("llm_rs2 auf-tool v{}", env!("CARGO_PKG_VERSION")));
     writer = writer.with_created_by(&created_by);
-    writer = writer.with_tensor_index(TensorIndex {
-        variant_tags: Vec::new(),
-        entries: Vec::new(),
-    });
 
     // Q4_0 tensor raw bytes 추출 (공통, variant마다 재사용)
     // 순서: layer 0..N의 wq, wk, wv, wo, w_gate, w_up, w_down 순
@@ -430,6 +428,17 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     if !quiet {
         eprintln!(" {} tensors extracted", tensor_blobs.len());
     }
+
+    // TensorIndex 구성 (weights payload 추가 전에 offset 계산)
+    let tensor_index = build_tensor_index(&tensor_blobs, &variant_tags);
+    if !quiet {
+        eprintln!(
+            "[auf-tool] TensorIndex: {} variants, {} entries",
+            tensor_index.variant_tags.len(),
+            tensor_index.entries.len()
+        );
+    }
+    writer = writer.with_tensor_index(tensor_index);
 
     for &tag in &variant_tags {
         if !quiet {
@@ -615,6 +624,144 @@ fn build_variant_payload(blobs: &[(String, Vec<u8>)], tag: &str) -> Result<Vec<u
             Ok(out)
         }
         _ => bail!("Unknown variant tag: {}", tag),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TensorIndex 구성 헬퍼
+// ---------------------------------------------------------------------------
+
+/// blob 이름 → `(layer_idx, TensorKind)` 변환.
+///
+/// cross-layer tensor는 `LAYER_IDX_CROSS` 반환.
+/// 인식할 수 없는 이름은 `None` 반환.
+fn tensor_name_to_layer_kind(name: &str) -> Option<(u32, TensorKind)> {
+    // cross-layer tensors
+    match name {
+        "token_embd.weight" => return Some((LAYER_IDX_CROSS, TensorKind::Embedding)),
+        "output_norm.weight" => return Some((LAYER_IDX_CROSS, TensorKind::FinalNorm)),
+        "output.weight" => return Some((LAYER_IDX_CROSS, TensorKind::LmHead)),
+        _ => {}
+    }
+
+    // per-layer: "blk.<N>.<kind>"
+    let rest = name.strip_prefix("blk.")?;
+    let (idx_str, kind_str) = rest.split_once('.')?;
+    let layer_idx: u32 = idx_str.parse().ok()?;
+
+    let kind = match kind_str {
+        "attn_q.weight" => TensorKind::AttnQ,
+        "attn_k.weight" => TensorKind::AttnK,
+        "attn_v.weight" => TensorKind::AttnV,
+        "attn_output.weight" => TensorKind::AttnO,
+        "ffn_gate.weight" => TensorKind::FfnGate,
+        "ffn_up.weight" => TensorKind::FfnUp,
+        "ffn_down.weight" => TensorKind::FfnDown,
+        "attn_norm.weight" => TensorKind::AttnNorm,
+        "ffn_norm.weight" => TensorKind::FfnNorm,
+        _ => return None,
+    };
+
+    Some((layer_idx, kind))
+}
+
+/// blob bytes가 특정 variant에서 차지하는 payload 크기를 계산한다.
+///
+/// `build_variant_payload`와 동일한 변환 로직을 적용하되, 실제 데이터 복사 없이
+/// 크기만 반환한다.
+fn compute_variant_tensor_size(bytes: &[u8], tag: &str) -> usize {
+    match tag {
+        TAG_WEIGHTS_ADRENO_SOA => {
+            // Q4_0 SOA: q_buf(N*16) + d_buf(N*2) = N*18 = bytes.len() (불변)
+            // 비-Q4_0: 그대로
+            bytes.len()
+        }
+        TAG_WEIGHTS_CUDA_AOS => {
+            // 128B align-up
+            bytes.len().div_ceil(128) * 128
+        }
+        TAG_WEIGHTS_CPU_AOS => {
+            // 64B align-up
+            bytes.len().div_ceil(64) * 64
+        }
+        _ => bytes.len(),
+    }
+}
+
+/// blob bytes의 dtype을 추정한다.
+///
+/// Q4_0: 18B 배수 → `TensorDType::Q4_0`
+/// F16: 2B 배수 (기타) → `TensorDType::F16`
+/// 그 외: `TensorDType::F32`
+fn infer_dtype(bytes: &[u8]) -> TensorDType {
+    if bytes.len() >= 18 && bytes.len().is_multiple_of(18) {
+        TensorDType::Q4_0
+    } else if bytes.len().is_multiple_of(2) {
+        TensorDType::F16
+    } else {
+        TensorDType::F32
+    }
+}
+
+/// `extract_weight_blobs` 결과와 variant tag 목록으로 `TensorIndex`를 구성한다.
+///
+/// 각 variant마다 payload 내 tensor별 section-local offset을 추적하여
+/// `TensorEntry::variant_offsets`/`variant_sizes`를 채운다.
+fn build_tensor_index(blobs: &[(String, Vec<u8>)], variant_tags: &[&str]) -> TensorIndex {
+    let variant_count = variant_tags.len();
+
+    // variant_tags → [u8; 24] 배열 변환
+    let vt_bytes: Vec<[u8; 24]> = variant_tags
+        .iter()
+        .map(|tag| {
+            let mut buf = [0u8; 24];
+            let b = tag.as_bytes();
+            buf[..b.len().min(24)].copy_from_slice(&b[..b.len().min(24)]);
+            buf
+        })
+        .collect();
+
+    // variant별 현재 누적 offset (section-local, 0-based)
+    let mut variant_cursors: Vec<u64> = vec![0u64; variant_count];
+
+    let mut entries: Vec<TensorEntry> = Vec::with_capacity(blobs.len());
+
+    for (name, bytes) in blobs {
+        let Some((layer_idx, kind)) = tensor_name_to_layer_kind(name) else {
+            // 인식 불가 tensor: offset만 전진, entry 미등록
+            for (vi, &tag) in variant_tags.iter().enumerate() {
+                let sz = compute_variant_tensor_size(bytes, tag) as u64;
+                variant_cursors[vi] += sz;
+            }
+            continue;
+        };
+
+        let dtype = infer_dtype(bytes);
+
+        let mut variant_offsets = Vec::with_capacity(variant_count);
+        let mut variant_sizes = Vec::with_capacity(variant_count);
+
+        for (vi, &tag) in variant_tags.iter().enumerate() {
+            let sz = compute_variant_tensor_size(bytes, tag) as u64;
+            variant_offsets.push(variant_cursors[vi]);
+            variant_sizes.push(sz);
+            variant_cursors[vi] += sz;
+        }
+
+        entries.push(TensorEntry {
+            layer_idx,
+            kind: kind.as_u32(),
+            dtype: dtype.as_u32(),
+            shape: vec![], // shape 정보는 GGUF에서 별도 추출 필요; 현재는 비워둠
+            alignment: 64,
+            variant_offsets,
+            variant_sizes,
+        });
+    }
+
+    TensorIndex {
+        variant_tags: vt_bytes,
+        entries,
     }
 }
 
@@ -1007,6 +1154,45 @@ fn cmd_verify(args: VerifyArgs) -> Result<()> {
     }
     if found_variants.is_empty() {
         println!("  [INFO] No WEIGHTS_* variant sections present");
+    }
+
+    // TENSOR_INDEX 내용 검증: WEIGHTS_* section이 존재하면 TENSOR_INDEX가 cover해야 함
+    if !found_variants.is_empty() {
+        let ti = &view.tensor_index;
+        for &weights_tag in &found_variants {
+            let covered = ti.variant_index_for_tag(weights_tag).is_some();
+            let check_name = format!("TENSOR_INDEX covers variant: {weights_tag}");
+            if covered {
+                print_check(&check_name, true, "");
+            } else {
+                print_check(
+                    &check_name,
+                    false,
+                    &format!(
+                        "TENSOR_INDEX does not cover variant '{weights_tag}' — \
+                         empty index detected. Rebuild with 'auf-tool build'."
+                    ),
+                );
+                all_pass = false;
+            }
+        }
+
+        // tensor_count가 0이면 추가 경고
+        if ti.entries.is_empty() && !found_variants.is_empty() {
+            print_check(
+                "TENSOR_INDEX has entries (tensor_count > 0)",
+                false,
+                "TENSOR_INDEX has 0 entries but WEIGHTS_* sections exist — \
+                 rebuild required",
+            );
+            all_pass = false;
+        } else if !ti.entries.is_empty() {
+            print_check(
+                &format!("TENSOR_INDEX tensor_count={}", ti.entries.len()),
+                true,
+                "",
+            );
+        }
     }
 
     // source_hash 비교 (--source 옵션)
