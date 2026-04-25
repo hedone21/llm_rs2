@@ -114,6 +114,12 @@ mod test_inv_132_134_auf;
 #[path = "spec/test_eng_dat_096_auf_secondary.rs"]
 mod test_eng_dat_096_auf_secondary;
 
+// ── AUF end-to-end shape propagation sanity (ENG-ALG-223 / ENG-DAT-096) ──
+// auf_tool build → TensorEntry.shape 채움 → SecondaryMmap → swap_executor
+// shape 검증 통과 안전망. 디바이스 측정 전 호스트에서 동일 차단 조건 사전 발견.
+#[path = "spec/test_auf_e2e_sanity.rs"]
+mod test_auf_e2e_sanity;
+
 // ── Weight Swap INV-122 v2 — Mixed Precision Forward 정확성 ──
 // cond1: NMSE ≤ 0.01 (F16 baseline 대비), cond2: Δ top-1 ≤ 1 pp (Q4_0 baseline 대비).
 // 환경변수 LLM_RS_TEST_MODEL_F16 / LLM_RS_TEST_MODEL_Q4 미설정 시 graceful skip.

@@ -384,4 +384,24 @@ fn auf_secondary_tensor_bytes_base_offset_round_trip() {
         tensor1.as_slice(),
         "attn_k bytes must match original tensor1"
     );
+
+    // ── Shape & dtype preservation ───────────────────────────────────────────
+    // AUF shape stored in logical order (outermost-first): [1, 128].
+    // secondary_mmap reverses → SecondaryTensorInfo::dims = [128, 1] (innermost-first).
+    // swap_executor reverses back → [1, 128] for primary comparison.
+    // Verify dims round-trip: SecondaryTensorInfo::dims == reversed of logical shape.
+    let expected_dims_gguf_order: Vec<u64> = vec![128, 1]; // innermost-first
+    assert_eq!(
+        info_q.dims, expected_dims_gguf_order,
+        "attn_q dims in SecondaryTensorInfo should be innermost-first (reversed logical)"
+    );
+    assert_eq!(
+        info_k.dims, expected_dims_gguf_order,
+        "attn_k dims in SecondaryTensorInfo should be innermost-first (reversed logical)"
+    );
+
+    // dtype round-trip: F32 → engine DType::F32
+    use llm_rs2::core::buffer::DType;
+    assert_eq!(info_q.dtype, DType::F32, "attn_q dtype must be F32");
+    assert_eq!(info_k.dtype, DType::F32, "attn_k dtype must be F32");
 }

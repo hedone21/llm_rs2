@@ -473,20 +473,31 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// (tensor_name, raw_bytes_after_permute) 목록 추출.
+/// `(tensor_name, raw_bytes_after_permute, shape_logical)` 항목 타입.
+///
+/// `shape_logical`은 outermost-first (논리적 순서).
+type WeightBlob = (String, Vec<u8>, Vec<u64>);
+
+/// `WeightBlob` 목록 추출.
+///
+/// GGUF는 innermost-first로 dims를 저장하므로, 여기서 reverse하여 logical order로 반환한다.
+/// AUF TensorEntry.shape에는 logical order(outermost-first)로 저장하며,
+/// reader(`secondary_mmap.rs`)에서 다시 reverse하여 GGUF order로 복원한다.
 fn extract_weight_blobs(
     gguf: &llm_rs2::models::loader::gguf::GgufFile,
     config: &llm_rs2::models::config::ModelConfig,
     quiet: bool,
-) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut blobs: Vec<(String, Vec<u8>)> = Vec::new();
+) -> Result<Vec<WeightBlob>> {
+    let mut blobs: Vec<WeightBlob> = Vec::new();
 
     // cross-layer tensors
     let cross_names = ["token_embd.weight", "output_norm.weight", "output.weight"];
     for &name in &cross_names {
         if let Some(info) = gguf.find_tensor(name) {
             let data = gguf.tensor_data(info);
-            blobs.push((name.to_owned(), data.to_vec()));
+            // GGUF dims는 innermost-first → reversed = outermost-first (logical)
+            let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
+            blobs.push((name.to_owned(), data.to_vec(), shape_logical));
         }
     }
 
@@ -509,6 +520,8 @@ fn extract_weight_blobs(
             let name = format!("blk.{layer}.{kind}");
             if let Some(info) = gguf.find_tensor(&name) {
                 let raw = gguf.tensor_data(info);
+                // GGUF dims는 innermost-first → reversed = outermost-first (logical)
+                let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
 
                 // Q/K permute (Llama arch only, attn_q/attn_k)
                 let bytes = if let Some((n_head, head_dim)) = qk_permute_shape_local(&name, config)
@@ -520,7 +533,7 @@ fn extract_weight_blobs(
                     raw.to_vec()
                 };
 
-                blobs.push((name, bytes));
+                blobs.push((name, bytes, shape_logical));
             } else if !quiet && kind.ends_with(".weight") && !kind.contains("norm") {
                 // weight tensor 누락 경고 (norm은 없을 수 있음)
                 eprintln!("[auf-tool] Warning: tensor '{}' not found in GGUF", name);
@@ -584,13 +597,13 @@ fn unpermute_qk_rows_local(
 }
 
 /// 특정 variant tag에 맞는 payload 바이트열 생성.
-fn build_variant_payload(blobs: &[(String, Vec<u8>)], tag: &str) -> Result<Vec<u8>> {
+fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
     match tag {
         TAG_WEIGHTS_ADRENO_SOA => {
             // SOA: 모든 Q4_0 weight를 q_buf + d_buf 분리하여 연속 배치
             // 비-Q4_0 tensor (F16 norm 등)는 그대로 포함
             let mut out = Vec::new();
-            for (_name, bytes) in blobs {
+            for (_name, bytes, _shape) in blobs {
                 // Q4_0 식별: 블록 크기 18B (정확한 배수인지 확인)
                 if bytes.len() % 18 == 0 && bytes.len() >= 18 {
                     // Q4_0 SOA 변환
@@ -608,7 +621,7 @@ fn build_variant_payload(blobs: &[(String, Vec<u8>)], tag: &str) -> Result<Vec<u
         TAG_WEIGHTS_CUDA_AOS => {
             // AOS + 128B align
             let mut out = Vec::new();
-            for (_name, bytes) in blobs {
+            for (_name, bytes, _shape) in blobs {
                 let padded = q4_0_aos_with_align(bytes, 128);
                 out.extend_from_slice(&padded);
             }
@@ -617,7 +630,7 @@ fn build_variant_payload(blobs: &[(String, Vec<u8>)], tag: &str) -> Result<Vec<u
         TAG_WEIGHTS_CPU_AOS => {
             // AOS + 64B align (NEON dotprod)
             let mut out = Vec::new();
-            for (_name, bytes) in blobs {
+            for (_name, bytes, _shape) in blobs {
                 let padded = q4_0_aos_with_align(bytes, 64);
                 out.extend_from_slice(&padded);
             }
@@ -707,7 +720,8 @@ fn infer_dtype(bytes: &[u8]) -> TensorDType {
 ///
 /// 각 variant마다 payload 내 tensor별 section-local offset을 추적하여
 /// `TensorEntry::variant_offsets`/`variant_sizes`를 채운다.
-fn build_tensor_index(blobs: &[(String, Vec<u8>)], variant_tags: &[&str]) -> TensorIndex {
+/// `TensorEntry::shape`는 logical order (outermost-first)로 채운다.
+fn build_tensor_index(blobs: &[WeightBlob], variant_tags: &[&str]) -> TensorIndex {
     let variant_count = variant_tags.len();
 
     // variant_tags → [u8; 24] 배열 변환
@@ -726,7 +740,7 @@ fn build_tensor_index(blobs: &[(String, Vec<u8>)], variant_tags: &[&str]) -> Ten
 
     let mut entries: Vec<TensorEntry> = Vec::with_capacity(blobs.len());
 
-    for (name, bytes) in blobs {
+    for (name, bytes, shape_logical) in blobs {
         let Some((layer_idx, kind)) = tensor_name_to_layer_kind(name) else {
             // 인식 불가 tensor: offset만 전진, entry 미등록
             for (vi, &tag) in variant_tags.iter().enumerate() {
@@ -752,7 +766,8 @@ fn build_tensor_index(blobs: &[(String, Vec<u8>)], variant_tags: &[&str]) -> Ten
             layer_idx,
             kind: kind.as_u32(),
             dtype: dtype.as_u32(),
-            shape: vec![], // shape 정보는 GGUF에서 별도 추출 필요; 현재는 비워둠
+            // logical order (outermost-first): reader가 .rev()하여 GGUF innermost-first로 복원
+            shape: shape_logical.clone(),
             alignment: 64,
             variant_offsets,
             variant_sizes,
@@ -1192,6 +1207,35 @@ fn cmd_verify(args: VerifyArgs) -> Result<()> {
                 true,
                 "",
             );
+        }
+
+        // 각 TensorEntry.shape rank > 0 검증 (빈 shape = swap_executor 차단)
+        let mut all_shapes_ok = true;
+        for entry in &ti.entries {
+            if entry.shape.is_empty() {
+                let layer_str = if entry.layer_idx == u32::MAX {
+                    "cross".to_owned()
+                } else {
+                    entry.layer_idx.to_string()
+                };
+                print_check(
+                    &format!(
+                        "TensorEntry shape non-empty (layer={} kind={})",
+                        layer_str, entry.kind
+                    ),
+                    false,
+                    &format!(
+                        "entry layer={} kind={} has empty shape — \
+                         TensorEntry.shape must be populated. Rebuild with 'auf-tool build'.",
+                        layer_str, entry.kind
+                    ),
+                );
+                all_shapes_ok = false;
+                all_pass = false;
+            }
+        }
+        if all_shapes_ok && !ti.entries.is_empty() {
+            print_check("All TensorEntry shapes non-empty", true, "");
         }
     }
 
