@@ -26,6 +26,7 @@
 pub mod error;
 pub mod header;
 pub mod meta;
+pub mod q4_0_soa;
 pub mod reader;
 pub mod section;
 pub mod source_hash;
@@ -38,6 +39,7 @@ pub mod writer;
 pub use error::{AufError, AufResult};
 pub use header::{AufHeader, HEADER_SIZE, READER_MAX_FORMAT_MAJOR};
 pub use meta::AufMeta;
+pub use q4_0_soa::{QK4_0, q4_0_aos_to_adreno_soa, q4_0_aos_to_soa_unshuffled};
 pub use reader::{AufView, BackendTag, open};
 pub use section::{
     SECTION_COMPRESSED, SECTION_REQUIRED, SECTION_STRIPPABLE, SectionEntry, SectionTable, TAG_META,

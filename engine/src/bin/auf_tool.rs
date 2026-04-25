@@ -19,7 +19,7 @@ use llm_rs2::auf::tensor_index::{
 use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_STRIPPABLE,
     TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS, TOKENIZER_KIND_BPE,
-    compute_source_hash, open,
+    compute_source_hash, open, q4_0_aos_to_adreno_soa,
 };
 
 // ---------------------------------------------------------------------------
@@ -324,24 +324,19 @@ fn build_meta_from_gguf(gguf: &llm_rs2::models::loader::gguf::GgufFile) -> Resul
     })
 }
 
-/// Q4_0 블록 raw bytes를 SOA 형식(q_buf + d_buf)으로 변환한다.
-///
-/// GGUF Q4_0 블록 (18B per block, QK=32):
-///   [0..2)  d: f16 (scale)
-///   [2..18) qs: [u8; 16] (nibbles, 32 values packed)
-///
-/// SOA 출력:
-///   q_buf: 블록별 nibbles 연속 배치 (n_blocks * 16B)
-///   d_buf: 블록별 scale f16 연속 배치 (n_blocks * 2B)
+/// 레거시 호환을 위한 단순 분리 (transpose / unshuffle 없음). 새 코드에서는
+/// `llm_rs2::auf::q4_0_aos_to_adreno_soa`를 사용하라. 일부 단위 테스트가 이
+/// 헬퍼의 경계 동작을 그대로 사용하므로 보존한다.
+#[allow(dead_code)]
 fn q4_0_aos_to_soa(blocks: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    const BLOCK_SIZE: usize = 18; // 2 (f16 scale) + 16 (nibbles)
+    const BLOCK_SIZE: usize = 18;
     let n_blocks = blocks.len() / BLOCK_SIZE;
     let mut q_buf = Vec::with_capacity(n_blocks * 16);
     let mut d_buf = Vec::with_capacity(n_blocks * 2);
     for i in 0..n_blocks {
         let off = i * BLOCK_SIZE;
-        d_buf.extend_from_slice(&blocks[off..off + 2]); // f16 scale
-        q_buf.extend_from_slice(&blocks[off + 2..off + 18]); // nibbles
+        d_buf.extend_from_slice(&blocks[off..off + 2]);
+        q_buf.extend_from_slice(&blocks[off + 2..off + 18]);
     }
     (q_buf, d_buf)
 }
@@ -600,21 +595,42 @@ fn unpermute_qk_rows_local(
 fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
     match tag {
         TAG_WEIGHTS_ADRENO_SOA => {
-            // SOA: 모든 Q4_0 weight를 q_buf + d_buf 분리하여 연속 배치
-            // 비-Q4_0 tensor (F16 norm 등)는 그대로 포함
+            // SOA: 모든 Q4_0 weight를 (q_buf, d_buf)로 변환 + transpose하여 연속 배치.
+            // 비-Q4_0 tensor (F16 norm 등)는 그대로 포함.
+            //
+            // Q4_0 weight의 logical shape는 outermost-first `[ne01, ne00]` =
+            // `[rows, cols]`로 저장되어 있다 (`extract_weight_blobs` 참조).
+            // `q4_0_aos_to_adreno_soa`는 이 shape를 받아 `convert_q4_0_to_noshuffle`
+            // 와 동등한 (a) nibble unshuffle (b) ushort q transpose (c) half d
+            // transpose 를 빌드 타임에 적용한다. 결과 byte sequence는 backend의
+            // `register_pre_converted_soa`가 직접 cl_mem에 업로드 가능한 형태이다.
             let mut out = Vec::new();
-            for (_name, bytes, _shape) in blobs {
-                // Q4_0 식별: 블록 크기 18B (정확한 배수인지 확인)
-                if bytes.len() % 18 == 0 && bytes.len() >= 18 {
-                    // Q4_0 SOA 변환
-                    let (q_buf, d_buf) = q4_0_aos_to_soa(bytes);
-                    // q_buf 먼저, d_buf 다음 (section 내 연속)
-                    out.extend_from_slice(&q_buf);
-                    out.extend_from_slice(&d_buf);
-                } else {
-                    // F16/F32 tensor 그대로
-                    out.extend_from_slice(bytes);
+            for (name, bytes, shape) in blobs {
+                let is_q4_0 = bytes.len() % 18 == 0 && bytes.len() >= 18;
+                if is_q4_0 && shape.len() == 2 {
+                    let ne01 = shape[0] as usize; // rows
+                    let ne00 = shape[1] as usize; // cols (K dim)
+                    // Defensive guard — if shape × 18B/block does not match the
+                    // tensor byte count, fall back to byte-as-is so we do not
+                    // corrupt the payload. This branch should not trigger for
+                    // well-formed GGUF inputs.
+                    let expected = (ne01 * ne00 / 32) * 18;
+                    if expected == bytes.len() && ne00.is_multiple_of(32) {
+                        let (q_buf, d_buf) = q4_0_aos_to_adreno_soa(bytes, ne00, ne01);
+                        out.extend_from_slice(&q_buf);
+                        out.extend_from_slice(&d_buf);
+                        continue;
+                    }
+                    eprintln!(
+                        "[auf-tool] Warning: SOA shape guard rejected '{}' (shape={:?}, bytes={}); \
+                         emitting AOS bytes (forward path will fall back to AOS GEMV).",
+                        name,
+                        shape,
+                        bytes.len()
+                    );
                 }
+                // F16/F32 tensor (or shape-mismatch fallback): bytes as-is.
+                out.extend_from_slice(bytes);
             }
             Ok(out)
         }
