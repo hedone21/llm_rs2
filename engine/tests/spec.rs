@@ -84,6 +84,11 @@ mod test_inv_124_slot_dtype_consistency;
 #[path = "spec/test_inv_125_secondary_mmap_lifetime.rs"]
 mod test_inv_125_secondary_mmap_lifetime;
 
+// ── Weight Swap Phase 3.5 — ENG-ALG-219 global plan invalidation ──
+// FullKernelPlan::execute() global ratio_generation stale check (INV-129).
+#[path = "spec/test_eng_alg_219_plan_invalidation.rs"]
+mod test_eng_alg_219_plan_invalidation;
+
 // ── Weight Swap Phase 3 invariants (INV-126/127/128, WSWAP-3-TEST) ──
 // Stage C: LuaPolicy integration + Phase 3 invariant spec tests.
 #[path = "spec/test_inv_126_dtype_reserved.rs"]
