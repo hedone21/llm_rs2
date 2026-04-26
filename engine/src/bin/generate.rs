@@ -1117,6 +1117,17 @@ fn main() -> anyhow::Result<()> {
                     Ok(n) => eprintln!("[Backend] Noshuffle SOA prepared: {} weight tensors", n),
                     Err(e) => eprintln!("[Backend] Noshuffle preparation skipped: {}", e),
                 }
+                // WSWAP-5-TBT-DIAG: dump cl_mem footprint immediately after
+                // primary noshuffle prep so the Q4 baseline allocation
+                // pattern is recorded *before* any AUF SOA bypass swap path
+                // adds placeholder cl_mems on top.
+                #[cfg(feature = "opencl")]
+                if let Some(ocl_be) = backend
+                    .as_any()
+                    .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                {
+                    ocl_be.dump_cl_mem_diagnostics(" stage=after_noshuffle_prep");
+                }
             }
         }
     }
@@ -1958,6 +1969,16 @@ fn main() -> anyhow::Result<()> {
                     );
                     if let Some(ref stages) = report.stage_breakdown {
                         eprintln!("weight_swap stages: {}", stages.to_log_line());
+                    }
+                    // WSWAP-5-TBT-DIAG: dump cl_mem footprint right after the
+                    // forced swap so the post-swap allocation pattern can be
+                    // diffed against the `after_noshuffle_prep` snapshot.
+                    #[cfg(feature = "opencl")]
+                    if let Some(ocl_be) = backend
+                        .as_any()
+                        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+                    {
+                        ocl_be.dump_cl_mem_diagnostics(" stage=after_force_swap");
                     }
                 }
                 Err(e) => {
@@ -5552,6 +5573,16 @@ fn main() -> anyhow::Result<()> {
         {
             cu_be.dump_graph_counters();
         }
+    }
+    // WSWAP-5-TBT-DIAG: final cl_mem dump after the entire generation
+    // pipeline completes. Includes any growth that occurred during prefill /
+    // decode (KV cache grow-on-demand, plan-rebuild scratch, etc.).
+    #[cfg(feature = "opencl")]
+    if let Some(ocl_be) = backend
+        .as_any()
+        .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
+    {
+        ocl_be.dump_cl_mem_diagnostics(" stage=after_generate");
     }
     println!("TTFT: {:.2} ms", _ttft_ms);
     if !forward_ms_values.is_empty() {

@@ -456,6 +456,30 @@ pub struct OpenCLBackend {
     // opts in via `new_with_profile_events(true)`. Arc so both backend and
     // executor can hold a reference without lifetime gymnastics.
     gpu_self_meter: Option<Arc<OpenClEventGpuMeter>>,
+
+    // ── WSWAP-5-TBT-DIAG: cl_mem allocation diagnostics ──────────────────
+    // Counts cl_mem allocations per category (weight_q4_aos, weight_q4_soa_q,
+    // weight_q4_soa_d, weight_q4_soa_img, auf_placeholder, kv_cache,
+    // activation, ...) so we can compare the Q4 baseline cl_mem footprint
+    // against the AUF SOA bypass swap path. Activated by env var
+    // `LLMRS_CL_MEM_DIAG=1`. When disabled, all hooks are zero-cost
+    // (single bool check + early return).
+    cl_mem_diag_enabled: bool,
+    cl_mem_diag: UnsafeCell<HashMap<&'static str, ClMemDiagBucket>>,
+}
+
+/// Per-category cl_mem allocation bucket (WSWAP-5-TBT-DIAG).
+#[derive(Debug, Default, Clone)]
+pub struct ClMemDiagBucket {
+    /// Number of `clCreateBuffer` / `clCreateImage` calls observed.
+    pub count: usize,
+    /// Sum of `size` arguments passed to those calls (bytes).
+    pub total_bytes: usize,
+    /// Number of explicit release events observed (currently only registry
+    /// invalidations — destructor releases are not tracked).
+    pub releases: usize,
+    /// Sum of bytes released through the `releases` channel.
+    pub released_bytes: usize,
 }
 
 // SAFETY: OpenCLBackend is only accessed from the inference thread.
@@ -1371,7 +1395,101 @@ impl OpenCLBackend {
             } else {
                 None
             },
+            // WSWAP-5-TBT-DIAG: cl_mem allocation diagnostics.
+            cl_mem_diag_enabled: std::env::var("LLMRS_CL_MEM_DIAG")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            cl_mem_diag: UnsafeCell::new(HashMap::new()),
         })
+    }
+
+    // ── WSWAP-5-TBT-DIAG: cl_mem allocation diagnostics helpers ─────────
+    //
+    // Hooks called from buffer/image allocation sites and registry
+    // invalidations. All entry points short-circuit on
+    // `!cl_mem_diag_enabled` so production is zero-cost when the env var
+    // is unset. UnsafeCell is single-threaded inference access (same
+    // pattern as the other diagnostic UnsafeCells in this struct).
+
+    /// Returns true when `LLMRS_CL_MEM_DIAG=1` is set on backend creation.
+    /// Public so generate.rs can gate its dump invocations cheaply.
+    #[inline]
+    pub fn cl_mem_diag_enabled(&self) -> bool {
+        self.cl_mem_diag_enabled
+    }
+
+    /// Record a cl_mem (buffer or image) allocation under `category`.
+    /// `size` is the user-requested byte count.
+    #[inline]
+    pub fn record_cl_mem_alloc(&self, category: &'static str, size: usize) {
+        if !self.cl_mem_diag_enabled {
+            return;
+        }
+        // SAFETY: single-threaded inference access. Mirrors the contract
+        // documented on `noshuffle_soa_registry` etc.
+        let map = unsafe { &mut *self.cl_mem_diag.get() };
+        let entry = map.entry(category).or_default();
+        entry.count += 1;
+        entry.total_bytes += size;
+    }
+
+    /// Record an explicit cl_mem release under `category`. Currently only
+    /// the noshuffle SOA registry invalidation path emits these — generic
+    /// destructor drops are not instrumented.
+    #[inline]
+    pub fn record_cl_mem_release(&self, category: &'static str, size: usize) {
+        if !self.cl_mem_diag_enabled {
+            return;
+        }
+        let map = unsafe { &mut *self.cl_mem_diag.get() };
+        let entry = map.entry(category).or_default();
+        entry.releases += 1;
+        entry.released_bytes += size;
+    }
+
+    /// Snapshot the current cl_mem diagnostic buckets. Returns a sorted
+    /// `(category, bucket)` vector so consumer formatting is deterministic.
+    pub fn cl_mem_diag_snapshot(&self) -> Vec<(&'static str, ClMemDiagBucket)> {
+        if !self.cl_mem_diag_enabled {
+            return Vec::new();
+        }
+        let map = unsafe { &*self.cl_mem_diag.get() };
+        let mut out: Vec<(&'static str, ClMemDiagBucket)> =
+            map.iter().map(|(k, v)| (*k, v.clone())).collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
+    }
+
+    /// Dump the current cl_mem diagnostic buckets to stderr with `prefix`
+    /// prepended to each line. Aggregate totals (count + bytes) are
+    /// emitted on a final summary line. No-op when the diagnostic is off.
+    pub fn dump_cl_mem_diagnostics(&self, prefix: &str) {
+        if !self.cl_mem_diag_enabled {
+            return;
+        }
+        let snap = self.cl_mem_diag_snapshot();
+        let mut total_count: usize = 0;
+        let mut total_bytes: usize = 0;
+        let mut total_releases: usize = 0;
+        let mut total_released_bytes: usize = 0;
+        for (cat, b) in &snap {
+            eprintln!(
+                "[CL-MEM-DIAG]{prefix} {cat}: count={} alive_bytes={} (releases={} released_bytes={})",
+                b.count,
+                b.total_bytes.saturating_sub(b.released_bytes),
+                b.releases,
+                b.released_bytes
+            );
+            total_count += b.count;
+            total_bytes += b.total_bytes;
+            total_releases += b.releases;
+            total_released_bytes += b.released_bytes;
+        }
+        eprintln!(
+            "[CL-MEM-DIAG]{prefix} TOTAL: count={total_count} alive={} \
+             bytes={total_bytes} released={total_releases} released_bytes={total_released_bytes}",
+            total_count.saturating_sub(total_releases),
+        );
     }
 
     // ── Event-based per-op profiling helpers (--profile-events) ─────────
@@ -2099,6 +2217,28 @@ impl OpenCLBackend {
         // SAFETY: single-threaded inference access, matching the other
         // UnsafeCell-backed caches on this struct.
         let registry = unsafe { &mut *self.noshuffle_soa_registry.get() };
+        // WSWAP-5-TBT-DIAG: account for the cl_mem references the registry
+        // owns. Each `NoshuffleSoaEntry` carries q_buf / d_buf (and an
+        // optional q_img view). Counting these as releases lets the diag
+        // dump reflect the post-invalidation footprint accurately even
+        // when the swap path subsequently re-registers fresh buffers.
+        if self.cl_mem_diag_enabled {
+            for entry in registry.values() {
+                let q_bytes = (entry.ne00 / 32) * entry.ne01 * 16;
+                let d_bytes = (entry.ne00 / 32) * entry.ne01 * 2;
+                // We cannot tell here whether the entry came from the GGUF
+                // SOA path (`weight_q4_soa_*`) or the AUF SOA bypass
+                // (`auf_soa_*`); attribute releases to a single bucket so
+                // the dump signals "registry drop" without double-counting
+                // either source. Forensic detail is in the alloc-side
+                // counters.
+                self.record_cl_mem_release("noshuffle_registry_q", q_bytes);
+                self.record_cl_mem_release("noshuffle_registry_d", d_bytes);
+                if entry.q_img.is_some() {
+                    self.record_cl_mem_release("noshuffle_registry_img", q_bytes);
+                }
+            }
+        }
         registry.clear();
     }
 
@@ -2144,6 +2284,7 @@ impl OpenCLBackend {
                 None,
             )?
         };
+        self.record_cl_mem_alloc("weight_q4_soa_q", q_bytes);
 
         // dst_d: num_blocks * 2 bytes (one f16 per block)
         let dst_d = unsafe {
@@ -2154,6 +2295,7 @@ impl OpenCLBackend {
                 None,
             )?
         };
+        self.record_cl_mem_alloc("weight_q4_soa_d", num_blocks * 2);
 
         // Step 1: GPU SOA conversion (nibble rearrange, keeps row-major block order)
         unsafe {
@@ -2302,6 +2444,7 @@ impl OpenCLBackend {
                         q_total_uint,
                         ne01
                     );
+                    self.record_cl_mem_alloc("weight_q4_soa_img", q_total_uint * 4);
                     Some(img)
                 }
                 Err(e) => {
@@ -3333,6 +3476,20 @@ impl Backend for OpenCLBackend {
             self.use_zero_copy,
         );
         let buffer = memory.alloc(size, src.dtype())?;
+        // WSWAP-5-TBT-DIAG: classify the allocation by dtype. Q4_0 weights
+        // landing through `copy_from` (or its `copy_weight_from` default
+        // fall-through) come from the AUF placeholder path in
+        // `materialise_auf_soa_weight` — every byte of these is "wasted"
+        // because the GEMV kernel only reads the SOA registry q_buf/d_buf.
+        // Counting this category lets the dump expose AUF placeholder
+        // pressure separately from the SOA buffers proper.
+        let category = match src.dtype() {
+            DType::Q4_0 => "weight_q4_aos_copy",
+            DType::F16 => "weight_f16_copy",
+            DType::F32 => "weight_f32_copy",
+            _ => "weight_other_copy",
+        };
+        self.record_cl_mem_alloc(category, size);
 
         // Share the source tensor's backend (Arc clone = cheap reference count)
         // instead of creating a new backend + cloning 15 kernel objects.
@@ -3669,6 +3826,7 @@ impl Backend for OpenCLBackend {
                 None,
             )?
         };
+        self.record_cl_mem_alloc("auf_soa_q", expected_q);
         let d_buf = unsafe {
             ocl::core::create_buffer::<_, u16>(
                 self.context.as_core(),
@@ -3677,6 +3835,7 @@ impl Backend for OpenCLBackend {
                 None,
             )?
         };
+        self.record_cl_mem_alloc("auf_soa_d", num_blocks * 2);
         unsafe {
             ocl::core::enqueue_write_buffer(
                 &self.queue,
@@ -3733,7 +3892,10 @@ impl Backend for OpenCLBackend {
                 )
             };
             match result {
-                Ok(img) => Some(img),
+                Ok(img) => {
+                    self.record_cl_mem_alloc("auf_soa_img", q_total_uint * 4);
+                    Some(img)
+                }
                 Err(e) => {
                     log::warn!(
                         "AUF SOA bypass: image1d_buffer_t creation failed (ne01={}), \

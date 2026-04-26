@@ -1012,7 +1012,7 @@
 
 ## [P2] WSWAP-5-TBT-DIAG. ratio=1.0 mixed −20.7% TBT gap 진단 (cl_mem fragmentation 가설)
 
-- **Status**: IN_PROGRESS (2026-04-26, Senior Implementer 백그라운드 진행, Sprint B 시작)
+- **Status**: DONE (2026-04-26, Senior Implementer Sprint B 완료. 가설 (c) 복합 원인으로 판정. 후속 sprint 후보 3개 design note 작성. `results/data/weight_swap/phase_5_tbt_diag.md`)
 - **Sprint**: current
 - **Dependencies**: 없음 (Phase 4 측정 자산 활용)
 - **담당 권장**: Senior Implementer (OpenCL backend / cl_mem 통계 영역) + Tester (per-layer profiling)
