@@ -1085,35 +1085,49 @@
 
 ## [P2] WSWAP-5-PRIMARY-DROP. F16 primary cl_mem 145개 lifecycle audit + release
 
-- **Status**: IN_PROGRESS (2026-04-26, PLACEHOLDER-DROP 효과 부분적이어서 사용자 승인으로 진행)
+- **Status**: DONE (host-side, 2026-04-26)
 - **Sprint**: current
-- **Dependencies**: WSWAP-5-AUF-PLACEHOLDER-DROP — 결과 측정으로 추가 필요성 판단
+- **Dependencies**: WSWAP-5-AUF-PLACEHOLDER-DROP
 - **담당 권장**: Senior Implementer (lifecycle audit) + Architect (swap-back 정책 결정)
-- **추정 작업량**: M (3~5일)
+- **추정 작업량**: M → 실제 S (lifecycle audit가 swap-back 경로 부재 발견으로 단축)
 - **Description**:
   - **목적/배경**: ratio=1.0 mixed에서 F16 primary cl_mem 145개가 alive 상태 점유. 이미 사용 안 됨. 명시적 release 미구현.
-  - **scope (in)**:
-    - Lifecycle audit: F16 primary cl_mem alive에 의존하는 코드 전체 검사
-      - swap-back (Q4→F16 reverse) 경로
-      - INV-131 SOA 재변환 safety net (Phase 3.7a)
-      - QCF importance collection
-    - swap 완료 시점에 fully-swapped layer의 primary cl_mem 명시적 release
-    - swap-back 시 primary 재로드 비용 측정
-    - 정책 결정: "ratio=1.0에서만 release vs fully-swapped layer 단위로 release"
+  - **lifecycle audit 결과** (Senior Implementer):
+    - swap-back (Q4→F16) 경로 **부재 확인**: `dispatch_swap_weights`가 `target_dtype != Q4_0`을 INV-126으로 즉시 reject. 단방향 transition. → swap-back 정책 결정 불필요.
+    - INV-131 SOA 재변환 safety net: AUF SOA bypass에서는 primary 사용 안 함 (`materialise_auf_soa_weight`가 직접 NoshuffleWeightBuffer 생성). swap-back 부재로 GGUF 경로 재진입 가능성 0. → 영향 없음.
+    - QCF / `compute_quant_noise_for_model`: 모델 로드 시 1회 호출 (`load_gguf_with_secondary` line 240). swap 이후에는 호출되지 않음. → 영향 없음.
+    - Plan / FullKernelPlan: `build_plan` 시점에 `slot.load_weights()`로 현재 layer Arc 스냅샷을 얻고 `cl_mem` reference (`Mem` clone)만 retain. 새 generation에서 plan rebuild → 새 cl_mem retain → 구 plan drop → 구 retained_bufs drop → cl_mem 자동 release. → 의존성 없음.
+    - 결론: swapped layer의 primary cl_mem은 **완전히 dead weight**. embed_tokens / lm_head / output_norm / layer 0 / 마지막 layer는 protected (그대로 alive 유지 필수).
+  - **채택 정책: A (보수적, 즉시 release)**:
+    - 정책 B (시간 기반 grace period)는 swap-back 부재로 불필요.
+    - 정책 C (heuristic)는 결정론적 release보다 추가 가치 없음.
+  - **구현**:
+    - `LayerSlot::swap_weights` 시그니처 변경: `()` → `Arc<LayerWeights>` 반환. `ArcSwap::store(...)` → `ArcSwap::swap(...)` (`wait_for_readers` 보장 포함).
+    - `SwapExecutor::execute_on_slots` Stage (b/c) 재구성:
+      - 구: `let old = slot.load_weights(); slot.swap_weights(...); madvise_if_exclusive(&old); drop(old);` — `Arc::strong_count(&old)`가 transient hazard pointer로 인해 > 1로 보일 수 있어 madvise 우회됨 (Sprint B 측정에서 madvise=0.0ms 일관 → 우회 확인).
+      - 신: `let old = slot.swap_weights(...); match Arc::try_unwrap(old) { Ok(layer) => release_primary_weights(...), Err(arc) => madvise_if_exclusive(&arc) }`. swap이 wait_for_readers 후 단독 소유 보장 → try_unwrap 성공 → `drop(layer)` 시 모든 buffer Arc decrement → `OpenCLBuffer::drop`이 cl_mem release.
+    - `SwapExecutor::release_primary_weights`: 7개 weight tensor + 2개 norm + (옵션) bias/Gemma3 norm을 명시적 tally + drop. `record_swap_release(backend, count, bytes)` 호출 → `weight_swap_released` 진단 bucket에 기록 (LLMRS_CL_MEM_DIAG=1 시 dump 표시).
   - **scope (out)**:
-    - mmap GGUF 자체 release (이전 `acf01af`/`9795ab7`에서 일부 처리됨)
-    - PLACEHOLDER-DROP과 동시 진행 금지 (회귀 원인 분리 위해)
-- **Acceptance Criteria**:
-  - F16 primary cl_mem ratio=1.0에서 ≤ 16개 (또는 0개, lifecycle 결정에 따라)
-  - swap-back 정확성 회귀 없음
-  - INV-131 safety net 회귀 없음
+    - mmap GGUF 자체 release: 이전 sprint `acf01af`/`9795ab7`에서 처리됨.
+    - 디바이스 측정: 본 작업은 호스트 sanity까지. 디바이스 검증은 후속.
+- **Acceptance Criteria** (host-side):
+  - 호스트 sanity PASS (1048 lib + 392 spec PASS, 0 fail). ✅
+  - 신규 단위 테스트 2건:
+    - `slot_swap_weights_returns_previous_arc_uniquely_owned` — swap 후 strong_count==1, try_unwrap 성공. ✅
+    - `release_primary_weights_runs_destructors` — Weak ref 7개 모두 upgrade None (모든 buffer Arc 0 reach). ✅
+  - INV-121/123/131 모든 테스트 PASS — 동시성 / SOA 재변환 회귀 없음. ✅
+  - clippy clean (`cargo clippy --all-targets -- -D warnings`). ✅
+  - 리포트: `results/data/weight_swap/phase_5_primary_drop.md`. ✅
+- **디바이스 측정 acceptance** (TBD — 별도 sprint):
+  - F16 primary cl_mem ratio=1.0 mixed에서 ~16개 (embed/lm_head/norm/layer 0/마지막 layer)
   - Total alive bytes Q4 baseline (~2.0 GB) 수준 회복
-  - 추가 TBT 개선폭 측정
-  - 리포트: `results/data/weight_swap/phase_5_primary_drop.md`
+  - matmul_qkv μs/call 추가 감소 (Q4 baseline 437 µs 근접)
+  - Decode TBT 추가 회복 (Q4 baseline 16.37 ms/tok 근접)
+  - "Paris" 정답 + partial swap 회귀 없음
 - **Notes**:
-  - 사용자 결정 사항: PLACEHOLDER-DROP만으로 −20.7% gap 충분 해소되면 본 작업 보류 가능
-  - swap-back 비용 vs alive cl_mem 점유 trade-off
-  - 회귀 risk 중 — lifecycle 변경은 광범위
+  - swap-back 부재가 lifecycle audit 핵심 단순화. 정책 A 채택 외 옵션 없음.
+  - Sprint B 진단의 "madvise=0.0ms → strong_count > 1" 해석은 일부 오해. `OpenCLBuffer::as_ptr()`이 항상 null을 반환하므로 GPU buffer는 madvise가 항상 no-op (`madvise_tensor`의 ptr.is_null() 체크). 즉 madvise=0.0ms는 GPU buffer에 madvise 무효이기 때문이지, strong_count > 1 때문이 아님. 본 finding을 design note에 기록.
+  - 회귀 risk 낮음 (시그니처 변경 1건 + try_unwrap fallback 보장).
 
 ## [P3] WSWAP-5-KIVI-FALLBACK. KIVI plan mixed state legacy fallback 진단
 

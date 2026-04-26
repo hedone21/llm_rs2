@@ -332,27 +332,51 @@ impl<'a> SwapExecutor<'a> {
 
             let new_arc: Arc<LayerWeights> = Arc::new(new_layer);
 
-            // Snapshot the old Arc so we can (a) inspect buffer ranges for
-            // madvise and (b) hold the strong_count check before dropping
-            // our local reference below.
-            let old = slot.load_weights();
-
-            // ── Stage (b): Atomic install — INV-123. swap_weights bumps the
-            // per-slot debug generation as part of its contract. ──────────────
+            // ── Stage (b): Atomic install — INV-123. `swap_weights` now uses
+            // `ArcSwap::swap()` internally and returns the previous Arc after
+            // `wait_for_readers` has flushed any in-flight ArcSwap hazard
+            // pointers. The returned Arc is the only outstanding reference
+            // held by this dispatch path — readers from prior forward passes
+            // have already dropped their snapshots (the swap dispatcher runs
+            // strictly between forwards). ──────────────────────────────────────
             let t_b0 = Instant::now();
-            slot.swap_weights(new_arc, self.target_dtype);
+            let old = slot.swap_weights(new_arc, self.target_dtype);
             stages.arc_swap_ms += t_b0.elapsed().as_secs_f64() * 1e3;
 
-            // ── Stage (c): Best-effort page reclaim on the just-replaced
-            // primary pages. Only safe when we are the last holder;
-            // otherwise an in-flight forward still owns the old Arc and
-            // madvise would race. Stage 1 conservative policy: skip silently
-            // when strong_count > 1 and leave the OS to reclaim on final
-            // drop. ────────────────────────────────────────────────────────────
+            // ── Stage (c): Primary cl_mem release — WSWAP-5-PRIMARY-DROP.
+            //
+            // Take ownership of the inner `LayerWeights` from the returned
+            // Arc and drop the primary weight tensors explicitly. Each
+            // tensor's `Arc<dyn Buffer>` is then the unique owner of its
+            // backing `OpenCLBuffer`, so the destructor releases the
+            // underlying `cl_mem` immediately. This reclaims the F16
+            // primary 2.4 GB / 145 cl_mem footprint that previously stayed
+            // alive on Galaxy S25 ratio=1.0 mixed (`phase_5_tbt_diag.md`).
+            //
+            // Falls back to madvise-only when `Arc::try_unwrap` fails.
+            // The latter only happens if some other holder kept the Arc —
+            // none expected in production (forwards run sequentially against
+            // the dispatcher), but the fallback preserves correctness if a
+            // future caller ever holds a snapshot across a swap.
+            //
+            // ENG-ALG-211 step (c) refined; `Self::madvise_if_exclusive`
+            // remains the fallback path so MADV_DONTNEED still fires on
+            // mmap-backed primaries when we can't acquire unique ownership.
             let t_c0 = Instant::now();
-            Self::madvise_if_exclusive(&old);
+            match Arc::try_unwrap(old) {
+                Ok(layer) => {
+                    Self::release_primary_weights(&self.backend, layer);
+                }
+                Err(arc) => {
+                    // Non-exclusive ownership — best-effort reclaim only.
+                    // Records strong_count for diagnostics on the AOS / GGUF
+                    // path; the AUF SOA bypass path doesn't actually need
+                    // madvise (its primary cl_mem was the F16 GGUF copy
+                    // routed through `copy_weight_from`, not an mmap'd page).
+                    Self::madvise_if_exclusive(&arc);
+                }
+            }
             stages.madvise_ms += t_c0.elapsed().as_secs_f64() * 1e3;
-            drop(old);
 
             report.swapped.push(SwappedLayer {
                 layer_idx,
@@ -806,6 +830,87 @@ impl<'a> SwapExecutor<'a> {
         }
     }
 
+    /// WSWAP-5-PRIMARY-DROP: explicitly release the primary weight cl_mem
+    /// backing the `LayerWeights` we just displaced.
+    ///
+    /// `old_layer` is moved by value (consumed via `Arc::try_unwrap`), so
+    /// dropping it releases every owned `Arc<dyn Buffer>` whose refcount
+    /// reaches zero. For OpenCL backends this triggers the
+    /// `OpenCLBuffer::drop` destructor which calls `clReleaseMemObject` and
+    /// returns the GPU memory to the driver. For CPU backends this is a
+    /// regular heap free.
+    ///
+    /// Behaviour summary:
+    /// - On Adreno UMA + AUF SOA bypass at ratio=1.0: each swapped layer
+    ///   releases 7 F16 weight cl_mem (~17 MiB / layer for Llama 3.2 1B).
+    ///   Total: ~16 layers × 7 × 17 MiB ≈ 2.0 GiB returned.
+    /// - On CPU backend / host tests: heap free; behaviourally identical.
+    /// - Norms (`attention_norm`, `ffn_norm`) are intentionally also
+    ///   dropped — the new layer always materialises fresh norms either
+    ///   from the secondary mmap or by cloning, so the old ones are
+    ///   redundant. Optional Gemma3 norms (`q_norm`, `k_norm`,
+    ///   `pre_ffn_norm`, `post_ffn_norm`) and `qkv_bias` are also released;
+    ///   the new layer rebuilds them from the secondary or clones them.
+    ///
+    /// Diagnostic: emits a single `weight_swap_released` bucket count via
+    /// `record_cl_mem_release` so a `LLMRS_CL_MEM_DIAG=1` dump can confirm
+    /// the release path executed (replaces the implicit "destructor was
+    /// not instrumented" gap noted in `phase_5_tbt_diag.md`).
+    fn release_primary_weights(backend: &Arc<dyn Backend>, old_layer: LayerWeights) {
+        // Tally per-tensor sizes before drop so the diagnostic tracks the
+        // real reclaimed footprint regardless of which buffer concrete type
+        // backed each tensor (OpenCLBuffer / UnifiedBuffer / SharedBuffer /
+        // MmapBuffer / NoshuffleWeightBuffer).
+        let mut released_bytes: usize = 0;
+        let mut released_count: usize = 0;
+        let mut tally = |t: &Tensor| {
+            released_bytes += t.size();
+            released_count += 1;
+        };
+        tally(&old_layer.wq);
+        tally(&old_layer.wk);
+        tally(&old_layer.wv);
+        tally(&old_layer.wo);
+        tally(&old_layer.w_gate);
+        tally(&old_layer.w_up);
+        tally(&old_layer.w_down);
+        // Norms + biases are smaller but still counted so the dump reflects
+        // the full primary layer cost. Most paths will leave these on F32
+        // primaries (they aren't quantised in the secondary), so tracking
+        // is informational rather than load-bearing.
+        tally(&old_layer.attention_norm);
+        tally(&old_layer.ffn_norm);
+        if let Some(bias) = &old_layer.qkv_bias {
+            tally(&bias.bq);
+            tally(&bias.bk);
+            tally(&bias.bv);
+        }
+        if let Some(t) = &old_layer.q_norm {
+            tally(t);
+        }
+        if let Some(t) = &old_layer.k_norm {
+            tally(t);
+        }
+        if let Some(t) = &old_layer.pre_ffn_norm {
+            tally(t);
+        }
+        if let Some(t) = &old_layer.post_ffn_norm {
+            tally(t);
+        }
+        // Tensor partition state on the OLD layer points at obsolete cl_mem
+        // (the new layer uses `partition_ctx: None` per `build_layer_from_mmap`),
+        // so dropping `old_layer` here also reclaims any partition slice
+        // buffers — accounted under the same bucket for simplicity.
+
+        // Drop fires destructors on every Arc<dyn Buffer> whose refcount
+        // reaches zero. For OpenCL backends this is `clReleaseMemObject`.
+        drop(old_layer);
+
+        // Diagnostic charge — only OpenCLBackend exposes the diag hook;
+        // CPU/CUDA backends quietly skip via the `as_any` downcast.
+        record_swap_release(backend, released_count, released_bytes);
+    }
+
     /// Advise the kernel that the primary pages backing `old` can be
     /// reclaimed. Safe only when we hold the last reference — otherwise an
     /// in-flight forward still uses the tensor. Best-effort, never panics.
@@ -861,6 +966,41 @@ impl<'a> SwapExecutor<'a> {
             let _ = libc::madvise(aligned as *mut libc::c_void, adv_len, libc::MADV_DONTNEED);
         }
     }
+}
+
+/// WSWAP-5-PRIMARY-DROP: charge the OpenCL diagnostic counter for primary
+/// weight cl_mem released via `release_primary_weights`. NoOp on CPU /
+/// CUDA backends and on builds without `LLMRS_CL_MEM_DIAG=1`.
+///
+/// Records a single bucket entry `weight_swap_released` regardless of which
+/// concrete buffer type backed each tensor; the per-tensor classification
+/// already lives in the alloc-side counters (`weight_f16_copy`,
+/// `weight_q4_aos_copy`, etc.). The release-side tally lets a diag run
+/// produce a closed-loop "alloc - release" picture without per-destructor
+/// instrumentation (Sprint B `phase_5_tbt_diag.md` over-reported alive
+/// bytes because the dump only counted allocs).
+fn record_swap_release(backend: &Arc<dyn Backend>, count: usize, bytes: usize) {
+    if count == 0 {
+        return;
+    }
+    #[cfg(feature = "opencl")]
+    {
+        if let Some(ocl_be) = backend
+            .as_any()
+            .downcast_ref::<crate::backend::opencl::OpenCLBackend>()
+        {
+            // The diag bucket is keyed on a `&'static str`; we record one
+            // bucket entry per swap layer with the cumulative byte tally.
+            // `record_cl_mem_release` is a no-op when the env var is unset,
+            // so we don't pay a HashMap update per swap on production runs.
+            for _ in 0..count {
+                ocl_be.record_cl_mem_release("weight_swap_released", bytes / count);
+            }
+            return;
+        }
+    }
+    // CPU / CUDA / non-opencl builds: nothing to record.
+    let _ = (backend, bytes);
 }
 
 #[cfg(test)]
@@ -963,5 +1103,149 @@ mod tests {
         // see a missing field.
         let stages = StageBreakdown::default();
         assert_eq!(stages.prefault_ms, 0.0);
+    }
+
+    // ── WSWAP-5-PRIMARY-DROP: explicit primary cl_mem release ─────────────
+    //
+    // The Sprint C-2 contract is: after `LayerSlot::swap_weights` returns
+    // the previous Arc, the swap path can `try_unwrap` it deterministically
+    // so the tensor destructors fire and the primary `cl_mem` is reclaimed.
+    // The host-side proxy for this behaviour is the buffer Arc strong count:
+    // each old weight tensor's `Arc<dyn Buffer>` must reach refcount 1
+    // (the LayerWeights itself is the sole holder) when the swap path takes
+    // ownership. Combined with `Arc::try_unwrap` on the LayerWeights, this
+    // implies every backing buffer is uniquely owned by the dispatcher and
+    // its destructor will run on `drop(layer)`.
+
+    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::core::backend::Backend;
+    use crate::core::shape::Shape;
+    use crate::layers::transformer_layer::TransformerLayer;
+    use crate::models::weights::LayerSlot;
+    use std::sync::Arc;
+
+    fn build_test_layer(be: &Arc<dyn Backend>) -> TransformerLayer {
+        // Build a minimal `TransformerLayer` whose weight tensors each carry
+        // a fresh `Arc<dyn Buffer>` so we can probe refcounts after a swap.
+        let make = |sz: usize| -> Tensor {
+            let buf: Arc<dyn crate::core::buffer::Buffer> =
+                Arc::new(SharedBuffer::new(sz, DType::F32));
+            Tensor::new(Shape::new(vec![sz / 4]), buf, be.clone())
+        };
+        TransformerLayer {
+            wq: make(32),
+            wk: make(32),
+            wv: make(32),
+            wo: make(32),
+            w_gate: make(32),
+            w_up: make(32),
+            w_down: make(32),
+            attention_norm: make(8),
+            ffn_norm: make(8),
+            qkv_bias: None,
+            q_norm: None,
+            k_norm: None,
+            pre_ffn_norm: None,
+            post_ffn_norm: None,
+            partition_ctx: None,
+        }
+    }
+
+    #[test]
+    fn slot_swap_weights_returns_previous_arc_uniquely_owned() {
+        // ENG-ALG-211 step (b/c) refined contract: the returned Arc has
+        // refcount==1 (no extant snapshots, swap dispatcher runs strictly
+        // between forwards). `Arc::try_unwrap` therefore succeeds on the
+        // production path and the inner `LayerWeights` can be dropped to
+        // release every buffer Arc. This mirrors the WSWAP-5-PRIMARY-DROP
+        // primary cl_mem release semantics on the device.
+        let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let initial = Arc::new(build_test_layer(&be));
+        let slot = LayerSlot::new(
+            (*initial).clone(),
+            DType::F32,
+            None, // No secondary mmap; not exercised by this test.
+        );
+        // Capture the wq buffer Arc from the initial install.
+        let initial_wq_buf = Arc::clone(slot.load_weights().wq.buffer());
+        let initial_wq_count_before = Arc::strong_count(&initial_wq_buf);
+        drop(initial); // release builder snapshot — slot still holds one ref
+
+        // Pre-swap: slot holds one Arc<LayerWeights>; load_weights briefly
+        // borrows another, but we drop it immediately.
+        // After swap: returned Arc must be the only outstanding reference.
+        let new_layer = build_test_layer(&be);
+        let returned = slot.swap_weights(Arc::new(new_layer), DType::F32);
+        assert_eq!(
+            Arc::strong_count(&returned),
+            1,
+            "WSWAP-5-PRIMARY-DROP contract: swap_weights must return the \
+             previous Arc with strong_count==1 so the dispatcher can \
+             try_unwrap and release primary cl_mem deterministically",
+        );
+
+        // try_unwrap must succeed.
+        let inner = match Arc::try_unwrap(returned) {
+            Ok(layer) => layer,
+            Err(_) => panic!("Arc::try_unwrap must succeed on a uniquely-owned snapshot"),
+        };
+
+        // After try_unwrap and before drop, the wq buffer Arc has 2 refs
+        // (inner.wq.buffer + the local capture above).
+        let post_unwrap = Arc::strong_count(&initial_wq_buf);
+        assert_eq!(
+            post_unwrap, 2,
+            "buffer Arc held by both inner LayerWeights and the local capture"
+        );
+
+        // Drop inner — every buffer Arc decrements to 1 (only the local
+        // capture remains for `wq`). Other tensors had no external capture
+        // so their buffer Arcs go to 0 and the destructors run.
+        drop(inner);
+        assert_eq!(
+            Arc::strong_count(&initial_wq_buf),
+            1,
+            "after drop(inner): only the local probe holds the wq buffer; \
+             a real OpenCL buffer would now be reclaimed",
+        );
+        // initial_wq_count_before is informational; assert it sanity-checks.
+        assert!(initial_wq_count_before >= 1);
+    }
+
+    #[test]
+    fn release_primary_weights_runs_destructors() {
+        // Direct test of the SwapExecutor::release_primary_weights helper:
+        // dropping the LayerWeights must drop every contained Tensor and
+        // therefore decrement every buffer Arc. We verify by capturing weak
+        // references to the buffers and ensuring they all upgrade to None
+        // after the helper consumes the layer.
+        use std::sync::Weak;
+
+        let be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        let layer = build_test_layer(&be);
+        // Capture weak refs to the 7 weight buffers.
+        let weaks: Vec<Weak<dyn crate::core::buffer::Buffer>> = [
+            &layer.wq,
+            &layer.wk,
+            &layer.wv,
+            &layer.wo,
+            &layer.w_gate,
+            &layer.w_up,
+            &layer.w_down,
+        ]
+        .iter()
+        .map(|t| Arc::downgrade(t.buffer()))
+        .collect();
+
+        SwapExecutor::release_primary_weights(&be, layer);
+
+        for (i, w) in weaks.iter().enumerate() {
+            assert!(
+                w.upgrade().is_none(),
+                "WSWAP-5-PRIMARY-DROP: buffer {i} must be fully released \
+                 after release_primary_weights — Weak::upgrade returning \
+                 Some implies a lingering Arc reference",
+            );
+        }
     }
 }

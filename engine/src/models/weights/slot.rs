@@ -121,13 +121,23 @@ impl LayerSlot {
     /// occur within one logical step; we use Release ordering so any reader
     /// observing the new generation sees both the new Arc and the new dtype.
     ///
-    /// Phase 1 does not call this path; it is provided for downstream
-    /// component wiring and unit tests.
-    pub fn swap_weights(&self, new_weights: Arc<LayerWeights>, new_dtype: DType) {
+    /// Internally uses `ArcSwap::swap()` rather than `store()`: this returns
+    /// the previous `Arc<LayerWeights>` after `wait_for_readers` so the caller
+    /// can drop it deterministically — including the path that explicitly
+    /// reclaims the primary cl_mem (WSWAP-5-PRIMARY-DROP). The returned Arc
+    /// is the only outstanding reference held by the slot; in steady state
+    /// the caller observes `Arc::strong_count == 1` and can `try_unwrap`
+    /// to release primary buffers without waiting for the destructor chain.
+    pub fn swap_weights(
+        &self,
+        new_weights: Arc<LayerWeights>,
+        new_dtype: DType,
+    ) -> Arc<LayerWeights> {
         self.current_dtype
             .store(dtype_to_u8(new_dtype), Ordering::Release);
-        self.weights.store(new_weights);
+        let old = self.weights.swap(new_weights);
         self.generation.fetch_add(1, Ordering::Release);
+        old
     }
 
     /// Install fresh weights while preserving the current generation counter.
