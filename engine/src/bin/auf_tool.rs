@@ -529,21 +529,66 @@ const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
 const GGML_TYPE_Q4_0: u32 = 2;
 
+/// GGUF에서 lm_head를 식별하는 표준 이름 (untied / separate 모델).
+const LM_HEAD_SEPARATE_NAME: &str = "output.weight";
+
+/// GGUF에서 token embedding tensor 이름. tied embedding 모델 (Llama 3.2 1B/3B 등)에서
+/// lm_head source로 재사용된다.
+const LM_HEAD_TIED_SOURCE_NAME: &str = "token_embd.weight";
+
+/// 선택된 lm_head source 정보 (`select_lm_head_source` 반환).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LmHeadSource {
+    /// 실제 GGUF tensor 이름 (`output.weight` 또는 `token_embd.weight`).
+    source_name: &'static str,
+    /// `true`면 tied embedding 모델 (token_embd를 lm_head로 재사용).
+    is_tied: bool,
+}
+
+/// GGUF에 존재하는 tensor를 기반으로 lm_head source를 선택한다.
+///
+/// 우선순위:
+/// 1. `output.weight` 가 있으면 separate 모델 (Qwen, Llama 3 8B 등) → 그것을 사용.
+/// 2. 없으면 `token_embd.weight` 를 tied source로 재사용 (Llama 3.2 1B/3B 등).
+/// 3. 둘 다 없으면 `None` (entry 생성 불가).
+///
+/// 본 함수는 GgufFile 의존성 없이 boolean만 받아 결정하므로 단위 테스트가 용이하다.
+fn select_lm_head_source(has_separate: bool, has_token_embd: bool) -> Option<LmHeadSource> {
+    if has_separate {
+        Some(LmHeadSource {
+            source_name: LM_HEAD_SEPARATE_NAME,
+            is_tied: false,
+        })
+    } else if has_token_embd {
+        Some(LmHeadSource {
+            source_name: LM_HEAD_TIED_SOURCE_NAME,
+            is_tied: true,
+        })
+    } else {
+        None
+    }
+}
+
 /// `WeightBlob` 목록 추출 + lm_head Q4_0 사전 변환 (선택).
 ///
 /// GGUF는 innermost-first로 dims를 저장하므로, 여기서 reverse하여 logical order로 반환한다.
 /// AUF TensorEntry.shape에는 logical order(outermost-first)로 저장하며,
 /// reader(`secondary_mmap.rs`)에서 다시 reverse하여 GGUF order로 복원한다.
 ///
-/// `lm_head_mode`에 따라 `output.weight` (lm_head)을 다음과 같이 처리한다:
-/// - `Off`: GGUF에 존재하면 raw bytes를 그대로 추출 (기존 동작).
-/// - `On`/`Auto`: GGUF dtype 분기:
-///   - 이미 Q4_0이면 raw bytes를 그대로 추출 (variant payload는 layer weight와 동일하게 SOA/AOS).
-///   - F16/F32 → F32 dequantize → Q4_0 quantize → 변환된 18B/block bytes로 교체.
-///   - 그 외 dtype은 변환 미지원으로 Off 동작.
+/// `lm_head_mode`에 따라 lm_head를 다음과 같이 처리한다:
+/// - `Off`: separate model에서 `output.weight`이 존재하면 raw bytes를 그대로 추출
+///   (기존 동작). tied model에서는 lm_head entry 미생성 (v0.1.0 byte-level 호환).
+/// - `On`/`Auto`: lm_head source 선택:
+///   - separate model: `output.weight` 사용. dtype 분기:
+///     - 이미 Q4_0이면 raw bytes 그대로 동봉.
+///     - F16/F32 → F32 dequantize → Q4_0 quantize → 18B/block bytes로 교체.
+///     - 그 외 dtype은 변환 미지원으로 raw bytes 동봉 + bit 미설정.
+///   - tied model (Llama 3.2 1B 등): `token_embd.weight` 를 lm_head source로 재사용.
+///     동일 dtype 분기 적용. tied 케이스에서도 lm_head Q4_0 entry는 별도 GPU 버퍼
+///     (Sprint F의 `quantize_lm_head_to_q4_0()` 흐름)로 의미가 있다.
 ///
 /// 반환 튜플 두 번째 값은 lm_head Q4_0 entry가 *실제로* 추가/유지되었는지 (capability bit 2 set
-/// 결정에 사용). lm_head tensor 자체가 GGUF에 없거나(tied) Off 모드면 false.
+/// 결정에 사용). source가 둘 다 없거나 Off 모드면 false.
 fn extract_weight_blobs(
     gguf: &llm_rs2::models::loader::gguf::GgufFile,
     config: &llm_rs2::models::config::ModelConfig,
@@ -564,53 +609,146 @@ fn extract_weight_blobs(
         }
     }
 
-    // lm_head ("output.weight") — `lm_head_mode` 에 따라 분기.
-    let lm_head_name = "output.weight";
-    if let Some(info) = gguf.find_tensor(lm_head_name) {
-        let raw = gguf.tensor_data(info);
-        let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
-        let is_q4_0 = info.ggml_type == GGML_TYPE_Q4_0;
+    // lm_head — separate (`output.weight`) vs tied (`token_embd.weight` 재사용) 분기.
+    //
+    // Llama 3.2 1B 등 tied embedding 모델은 GGUF에 `output.weight`을 별도로 저장하지
+    // 않고 `token_embd.weight`과 weight를 공유한다. Sprint F의
+    // `quantize_lm_head_to_q4_0()`는 tied 모델에서도 별도 Q4_0 GPU 버퍼를 생성하여
+    // matmul 효율을 얻으므로, AUF builder도 동일하게 tied source로부터 lm_head Q4_0
+    // entry를 생성한다 (Sprint G-1-B fix, 2026-04-26).
+    let lm_head_source = select_lm_head_source(
+        gguf.find_tensor(LM_HEAD_SEPARATE_NAME).is_some(),
+        gguf.find_tensor(LM_HEAD_TIED_SOURCE_NAME).is_some(),
+    );
 
-        match lm_head_mode {
-            IncludeLmHeadMode::Off => {
-                // 기존 동작 — raw bytes (F16/F32/Q4_0 그대로). capability bit는 set하지 않음.
-                blobs.push((lm_head_name.to_owned(), raw.to_vec(), shape_logical));
+    if let Some(LmHeadSource {
+        source_name,
+        is_tied,
+    }) = lm_head_source
+    {
+        if lm_head_mode == IncludeLmHeadMode::Off {
+            // Off: separate 케이스에서만 raw bytes 동봉. tied에서는 entry 미생성
+            // (token_embd는 이미 cross-layer로 추가됨).
+            if !is_tied {
+                let info = gguf.find_tensor(source_name).expect("source exists");
+                let raw = gguf.tensor_data(info);
+                let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
+                blobs.push((
+                    LM_HEAD_SEPARATE_NAME.to_owned(),
+                    raw.to_vec(),
+                    shape_logical,
+                ));
             }
-            IncludeLmHeadMode::On | IncludeLmHeadMode::Auto => {
-                if is_q4_0 {
-                    // 이미 Q4_0 — quantize 불필요. AOS bytes를 그대로 동봉.
-                    if !quiet {
-                        eprintln!(
-                            "[auf-tool] lm_head: GGUF dtype is already Q4_0 ({} bytes), \
-                             entry included as-is",
-                            raw.len()
-                        );
-                    }
-                    blobs.push((lm_head_name.to_owned(), raw.to_vec(), shape_logical));
-                    lm_head_q4_0_present = true;
-                } else if info.ggml_type == GGML_TYPE_F16 || info.ggml_type == GGML_TYPE_F32 {
-                    // F16/F32 → F32 dequantize → Q4_0 quantize.
-                    let q4_bytes =
-                        quantize_lm_head_to_q4_0(raw, &shape_logical, info.ggml_type, quiet)?;
-                    blobs.push((lm_head_name.to_owned(), q4_bytes, shape_logical));
-                    lm_head_q4_0_present = true;
-                } else {
-                    // 미지원 dtype (Q4_K, Q8_0 등) — fallback: raw bytes + bit 미설정.
-                    if !quiet {
-                        eprintln!(
-                            "[auf-tool] Warning: lm_head dtype={} unsupported for Q4_0 quantize; \
-                             entry included as raw bytes (capability bit 2 not set)",
-                            info.ggml_type
-                        );
-                    }
-                    blobs.push((lm_head_name.to_owned(), raw.to_vec(), shape_logical));
+        } else {
+            // On / Auto: source dtype 분기. tied/separate 무관하게 동일 처리.
+            // 단, tied에서는 entry 이름은 항상 "output.weight" (lm_head 식별).
+            let info = gguf
+                .find_tensor(source_name)
+                .expect("source exists per match arm above");
+            let raw = gguf.tensor_data(info);
+
+            // tied 케이스: entry shape은 token_embd shape과 동일 (== [vocab_size, hidden_dim]).
+            // separate 케이스: source shape 그대로.
+            let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
+            let is_q4_0 = info.ggml_type == GGML_TYPE_Q4_0;
+            let dtype_str = match info.ggml_type {
+                GGML_TYPE_F32 => "F32",
+                GGML_TYPE_F16 => "F16",
+                GGML_TYPE_Q4_0 => "Q4_0",
+                _ => "other",
+            };
+            let source_label = if is_tied {
+                format!("{} (tied)", source_name)
+            } else {
+                source_name.to_owned()
+            };
+
+            // tied 안전망 — config.vocab_size / hidden_size와 일치 검증.
+            // tied 모델에서는 token_embd.weight = lm_head이므로 shape이 [vocab, hidden]임이
+            // 보장되어야 한다. 미일치 시 이후 quantize / GPU upload가 잘못된 cl_mem 크기를
+            // 만들어 silent corruption을 유발하므로 fail-fast.
+            if is_tied {
+                let expected_rows = config.vocab_size as u64;
+                let expected_cols = config.hidden_size as u64;
+                if shape_logical.len() != 2
+                    || shape_logical[0] != expected_rows
+                    || shape_logical[1] != expected_cols
+                {
+                    bail!(
+                        "tied lm_head source '{}' shape {:?} does not match config \
+                         [vocab_size={}, hidden_dim={}]",
+                        source_name,
+                        shape_logical,
+                        expected_rows,
+                        expected_cols
+                    );
+                }
+            }
+
+            if is_q4_0 {
+                // 이미 Q4_0 — quantize 불필요. AOS bytes를 그대로 동봉.
+                if !quiet {
+                    eprintln!(
+                        "[auf-tool] lm_head: source={}, dtype={}, raw {} bytes, \
+                         entry included as-is",
+                        source_label,
+                        dtype_str,
+                        raw.len()
+                    );
+                }
+                // tied: source는 token_embd지만 entry 이름은 lm_head 식별을 위해 output.weight.
+                blobs.push((
+                    LM_HEAD_SEPARATE_NAME.to_owned(),
+                    raw.to_vec(),
+                    shape_logical,
+                ));
+                lm_head_q4_0_present = true;
+            } else if info.ggml_type == GGML_TYPE_F16 || info.ggml_type == GGML_TYPE_F32 {
+                // F16/F32 → F32 dequantize → Q4_0 quantize.
+                if !quiet {
+                    eprintln!(
+                        "[auf-tool] lm_head: source={}, dtype={}, quantizing to Q4_0...",
+                        source_label, dtype_str,
+                    );
+                }
+                // Sprint F와 일치: tied/separate 무관하게 token_embd / output.weight raw bytes를
+                // F32 dequantize → quantize_q4_0. shape은 [rows=vocab, cols=hidden].
+                if shape_logical.len() != 2 {
+                    bail!(
+                        "lm_head source '{}' must be 2-D (got shape={:?})",
+                        source_name,
+                        shape_logical
+                    );
+                }
+                let q4_bytes =
+                    quantize_lm_head_to_q4_0(raw, &shape_logical, info.ggml_type, quiet)?;
+                blobs.push((LM_HEAD_SEPARATE_NAME.to_owned(), q4_bytes, shape_logical));
+                lm_head_q4_0_present = true;
+            } else {
+                // 미지원 dtype (Q4_K, Q8_0 등) — fallback: raw bytes + bit 미설정.
+                if !quiet {
+                    eprintln!(
+                        "[auf-tool] Warning: lm_head source={}, dtype={} (ggml_type={}) \
+                         unsupported for Q4_0 quantize; entry included as raw bytes \
+                         (capability bit 2 not set)",
+                        source_label, dtype_str, info.ggml_type
+                    );
+                }
+                // tied + 미지원 dtype 조합은 매우 드물고 (token_embd가 Q4_K 등) 엔진 path도
+                // 처리하지 않으므로 entry를 만들지 않는다.
+                if !is_tied {
+                    blobs.push((
+                        LM_HEAD_SEPARATE_NAME.to_owned(),
+                        raw.to_vec(),
+                        shape_logical,
+                    ));
                 }
             }
         }
     } else if lm_head_mode != IncludeLmHeadMode::Off && !quiet {
-        // tied embeddings — `output.weight` 가 GGUF에 없음.
+        // separate / tied 양쪽 모두 source가 없는 매우 드문 경우.
         eprintln!(
-            "[auf-tool] Note: GGUF has no 'output.weight' (tied embeddings). \
+            "[auf-tool] Note: GGUF has neither 'output.weight' nor 'token_embd.weight'; \
              lm_head Q4_0 entry skipped, capability bit 2 not set."
         );
     }
@@ -1821,6 +1959,84 @@ mod tests {
         assert_eq!(hdr.format_patch, 0);
         assert_eq!(hdr.capability_required, 0);
         assert_eq!(hdr.capability_optional, 0);
+    }
+
+    // ── Sprint G-1-B fix: tied embedding lm_head source ─────────────────────
+
+    #[test]
+    fn tied_model_uses_token_embd_as_lm_head_source() {
+        // Llama 3.2 1B: GGUF에 output.weight 없음 (tied) → token_embd.weight를
+        // lm_head source로 선택해야 한다. is_tied = true.
+        let src = select_lm_head_source(false, true).expect("tied source must be selected");
+        assert_eq!(src.source_name, LM_HEAD_TIED_SOURCE_NAME);
+        assert_eq!(src.source_name, "token_embd.weight");
+        assert!(src.is_tied);
+    }
+
+    #[test]
+    fn separate_model_uses_output_weight_as_lm_head_source() {
+        // Qwen / Llama 3 8B: GGUF에 output.weight 있음 → 그것을 source로 선택.
+        // is_tied = false. token_embd 존재 여부와 관계없이 separate 우선.
+        let src = select_lm_head_source(true, true).expect("separate source must be selected");
+        assert_eq!(src.source_name, LM_HEAD_SEPARATE_NAME);
+        assert_eq!(src.source_name, "output.weight");
+        assert!(!src.is_tied);
+
+        // token_embd 없어도 separate만 있으면 동작 (이론적 케이스).
+        let src2 = select_lm_head_source(true, false).expect("separate-only must work");
+        assert_eq!(src2.source_name, LM_HEAD_SEPARATE_NAME);
+        assert!(!src2.is_tied);
+    }
+
+    #[test]
+    fn no_lm_head_source_returns_none() {
+        // 둘 다 없는 안전망: None 반환.
+        let src = select_lm_head_source(false, false);
+        assert!(src.is_none());
+    }
+
+    #[test]
+    fn tied_model_quantize_deterministic() {
+        // tied 케이스에서 token_embd raw bytes (F16) → quantize_lm_head_to_q4_0
+        // 두 번 호출 시 byte-level identical 출력.
+        // separate 케이스와 동일 helper를 사용하므로 결정성이 자동으로 보장되지만,
+        // tied 시나리오에서도 명시적으로 검증한다 (Sprint G-1-B fix 회귀 방지).
+        use half::f16;
+
+        let rows: usize = 4; // vocab
+        let cols: usize = 64; // hidden, multiple of 32
+        // Pseudo-random F16 입력 (deterministic seed; tied source는 일반적으로 F16).
+        let f16_data: Vec<u16> = (0..rows * cols)
+            .map(|i| f16::from_f32(((i as f32) * 0.0173).cos()).to_bits())
+            .collect();
+        let raw_bytes: Vec<u8> = f16_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape: Vec<u64> = vec![rows as u64, cols as u64];
+
+        let out1 = quantize_lm_head_to_q4_0(&raw_bytes, &shape, GGML_TYPE_F16, true).unwrap();
+        let out2 = quantize_lm_head_to_q4_0(&raw_bytes, &shape, GGML_TYPE_F16, true).unwrap();
+        assert_eq!(
+            out1, out2,
+            "tied lm_head Q4_0 quantize must be deterministic"
+        );
+        assert_eq!(out1.len(), rows * cols / 32 * 18); // 8 blocks × 18B = 144B
+    }
+
+    #[test]
+    fn tied_model_lm_head_q4_0_dtype_check() {
+        // tied 케이스 quantize 결과의 size invariant: rows*cols / QK4_0 * 18.
+        // dtype 자체는 Vec<u8>지만, 크기로 Q4_0 layout (block 18B) 검증.
+        let rows: usize = 8;
+        let cols: usize = 32;
+        let f32_data: Vec<f32> = (0..rows * cols).map(|i| (i as f32) * 0.001 - 0.5).collect();
+        let raw: Vec<u8> = f32_data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape: Vec<u64> = vec![rows as u64, cols as u64];
+
+        let out = quantize_lm_head_to_q4_0(&raw, &shape, GGML_TYPE_F32, true).unwrap();
+        // 1 block per row × 8 rows = 8 blocks × 18B = 144B.
+        assert_eq!(out.len(), 8 * 18);
+        // Q4_0 block layout: 2B scale (f16) + 16B nibbles. 첫 block size 검증.
+        // (raw 데이터가 0 근처라 scale도 작은 f16. byte content 자체는 결정적이지만 비교는 size로 충분.)
+        assert!(out.len().is_multiple_of(18), "output must be multiple of 18B");
     }
 
     #[test]
