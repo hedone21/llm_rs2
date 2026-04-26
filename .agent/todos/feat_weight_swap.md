@@ -1085,8 +1085,8 @@
 
 ## [P2] WSWAP-5-PRIMARY-DROP. F16 primary cl_mem 145개 lifecycle audit + release
 
-- **Status**: TODO (PLACEHOLDER-DROP 결과 보고 후 진행 결정)
-- **Sprint**: next
+- **Status**: IN_PROGRESS (2026-04-26, PLACEHOLDER-DROP 효과 부분적이어서 사용자 승인으로 진행)
+- **Sprint**: current
 - **Dependencies**: WSWAP-5-AUF-PLACEHOLDER-DROP — 결과 측정으로 추가 필요성 판단
 - **담당 권장**: Senior Implementer (lifecycle audit) + Architect (swap-back 정책 결정)
 - **추정 작업량**: M (3~5일)
