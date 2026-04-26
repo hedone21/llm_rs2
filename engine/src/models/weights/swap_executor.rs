@@ -112,7 +112,11 @@ pub struct SwappedLayer {
 /// Collected via `Instant::now()` pairs at stage boundaries — µs-level
 /// overhead, negligible relative to the ms-scale operations measured.
 ///
-/// Stage mapping (WSWAP-4-LATENCY-β):
+/// Stage mapping (WSWAP-4-LATENCY-β + WSWAP-5-COLD-UNIFORM):
+/// - `prefault_ms` — (a-pre) WSWAP-5 batch-once `madvise(MADV_WILLNEED)` +
+///   page-touch warmup over the secondary mmap weights region. Charged once
+///   per `execute_on_slots` call (not per layer) so cold/warm runs are
+///   directly comparable.
 /// - `mmap_permute_ms` — (a) secondary slice + Q/K permutation + GPU upload
 ///   (`build_layer_from_mmap`, per-layer accumulated)
 /// - `arc_swap_ms` — (b) `LayerSlot::swap_weights` atomic Arc store
@@ -123,6 +127,10 @@ pub struct SwappedLayer {
 ///   `ratio_generation.fetch_add`
 #[derive(Debug, Clone, Default)]
 pub struct StageBreakdown {
+    /// (a-pre) WSWAP-5 prefault: `madvise(MADV_WILLNEED)` + page-touch warmup.
+    /// Single batch-level cost, NOT per layer. Stays at 0.0 on non-Linux
+    /// targets / on no-op secondaries (CPU host tests).
+    pub prefault_ms: f64,
     /// (a) secondary mmap slice + Q/K permutation + GPU copy_weight_from
     pub mmap_permute_ms: f64,
     /// (b) `LayerSlot::swap_weights` Arc store (per-layer accumulated)
@@ -138,11 +146,13 @@ pub struct StageBreakdown {
 impl StageBreakdown {
     /// Format as a compact single-line string for stderr diagnostics.
     ///
-    /// Example: `mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms soa_reconvert=45.6ms gen_bump=0.1ms`
+    /// Example:
+    /// `prefault=12.3ms mmap_permute=123.4ms arc_swap=0.1ms madvise=0.2ms soa_reconvert=45.6ms gen_bump=0.1ms`
     pub fn to_log_line(&self) -> String {
         format!(
-            "mmap_permute={:.1}ms arc_swap={:.1}ms madvise={:.1}ms \
+            "prefault={:.1}ms mmap_permute={:.1}ms arc_swap={:.1}ms madvise={:.1}ms \
              soa_reconvert={:.1}ms gen_bump={:.1}ms",
+            self.prefault_ms,
             self.mmap_permute_ms,
             self.arc_swap_ms,
             self.madvise_ms,
@@ -278,6 +288,21 @@ impl<'a> SwapExecutor<'a> {
 
         // WSWAP-4-LATENCY-β: per-stage accumulated timings.
         let mut stages = StageBreakdown::default();
+
+        // ── Stage (a-pre): WSWAP-5-COLD-UNIFORM prefault ─────────────────────
+        // Issue `madvise(MADV_WILLNEED)` + explicit page-touch warmup over the
+        // secondary mmap weights region exactly once per batch — before the
+        // per-layer copy loop. The cost (a few ms for ~700 MB on Adreno UFS)
+        // is paid up-front so subsequent `mmap_permute` reads always hit the
+        // page cache. Without this, the 5th measurement showed a per-run
+        // bimodal split (cold ~53 ms / warm ~36 ms per layer) driven entirely
+        // by mmap demand-paging on cold runs.
+        //
+        // Charged as a single batch-level stage (NOT per layer) so cold and
+        // warm runs are directly comparable. No-op on non-Linux targets.
+        let t_pre0 = Instant::now();
+        secondary.prefault();
+        stages.prefault_ms = t_pre0.elapsed().as_secs_f64() * 1e3;
 
         for &layer_idx in target_layers {
             // ENG-DAT-C08: out-of-range silently skipped.
@@ -927,5 +952,38 @@ mod tests {
             msg.contains("INV-126"),
             "Error message should reference INV-126, got: {msg}"
         );
+    }
+
+    #[test]
+    fn stage_breakdown_log_line_includes_prefault_stage() {
+        // WSWAP-5-COLD-UNIFORM: the stage breakdown log line must surface the
+        // prefault stage so device measurements can plot it next to the other
+        // stages. Refactors that drop the prefix will trip this guard.
+        let stages = StageBreakdown {
+            prefault_ms: 12.34,
+            mmap_permute_ms: 100.0,
+            arc_swap_ms: 0.5,
+            madvise_ms: 0.1,
+            soa_reconvert_ms: 50.0,
+            gen_bump_ms: 0.2,
+        };
+        let line = stages.to_log_line();
+        assert!(
+            line.starts_with("prefault=12.3ms"),
+            "log line must lead with prefault stage, got: {line}"
+        );
+        assert!(
+            line.contains("mmap_permute=100.0ms"),
+            "log line must contain mmap_permute stage, got: {line}"
+        );
+    }
+
+    #[test]
+    fn stage_breakdown_prefault_default_zero() {
+        // Default-constructed StageBreakdown (e.g. CPU host tests, no-op
+        // secondaries) must report prefault=0.0 so downstream parsers do not
+        // see a missing field.
+        let stages = StageBreakdown::default();
+        assert_eq!(stages.prefault_ms, 0.0);
     }
 }

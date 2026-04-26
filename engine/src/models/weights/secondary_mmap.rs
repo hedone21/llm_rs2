@@ -176,6 +176,12 @@ impl GgufSecondaryMmap {
         let end = info.offset + info.len;
         &self.gguf.mmap_data()[info.offset..end]
     }
+
+    /// See `SecondaryMmap::prefault`. Operates on the entire GGUF mmap.
+    fn prefault(&self) {
+        let bytes = self.gguf.mmap_data();
+        prefault_byte_range(bytes);
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -259,6 +265,15 @@ impl AufSecondaryMmap {
             .expect("AufSecondaryMmap: weights_bytes() must be Some (invariant)");
         &weights_bytes[info.offset..info.offset + info.len]
     }
+
+    /// See `SecondaryMmap::prefault`. Targets the WEIGHTS section bytes only —
+    /// META / TOKENIZER / TENSOR_INDEX are tiny and already touched during
+    /// `open()`.
+    fn prefault(&self) {
+        if let Some(weights_bytes) = self.view.weights_bytes() {
+            prefault_byte_range(weights_bytes);
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────
@@ -327,6 +342,32 @@ impl SecondaryMmap {
         match self {
             SecondaryMmap::Gguf(_) => false,
             SecondaryMmap::Auf(a) => a.is_pre_converted_soa,
+        }
+    }
+
+    /// Prefault the page cache for the swap-relevant byte ranges.
+    ///
+    /// **Why** — WSWAP-5-COLD-UNIFORM. 5차 측정에서 per-layer 양봉 분포
+    /// (cold ~53 ms, warm ~36 ms)의 주된 원인은 AUF mmap demand-paging.
+    /// 페이지가 OS 페이지 캐시에 없으면 첫 접근 시 page fault → 디스크 I/O가
+    /// `mmap_permute` stage 안에서 발생. 이 함수는 swap 시작 전 한 번 호출되어
+    /// 두 가지 작업을 수행한다:
+    ///
+    /// 1. **`madvise(MADV_WILLNEED)`** — 커널에 background prefetch 힌트.
+    /// 2. **explicit page-touch warmup** — 4 KiB step으로 첫 byte를 읽어
+    ///    명시적 page fault를 트리거하고 페이지 캐시를 채움. 컴파일러가
+    ///    최적화로 제거하지 못하도록 `read_volatile` 사용.
+    ///
+    /// Linux/Android에서만 동작 (target_os = "linux" / "android").
+    /// 기타 OS는 no-op. 호출 자체는 항상 안전하며 실패 시 silent.
+    ///
+    /// **Range** — `AufSecondaryMmap`은 WEIGHTS 영역만 prefault (정확히 swap
+    /// 대상 바이트). `GgufSecondaryMmap`은 mmap 전체를 prefault (GGUF는 weight
+    /// 영역만 격리하기 어렵고, 호스트 테스트 외 주 사용처가 없으므로 단순 처리).
+    pub fn prefault(&self) {
+        match self {
+            SecondaryMmap::Auf(a) => a.prefault(),
+            SecondaryMmap::Gguf(g) => g.prefault(),
         }
     }
 
@@ -722,6 +763,80 @@ fn parse_block_tensor_name(name: &str) -> Option<(usize, &str)> {
     Some((idx, &rest[dot + 1..]))
 }
 
+/// Prefault `bytes` so subsequent reads hit the page cache.
+///
+/// Linux/Android: `madvise(MADV_WILLNEED)` to schedule a kernel-side prefetch,
+/// followed by an explicit page-touch loop (one byte per 4 KiB) so the pages
+/// are forced into the resident set even when the kernel rejects the hint
+/// (page reclaim under pressure, kernel quirk, etc.).
+///
+/// Other targets: no-op. The function never panics and treats every step as
+/// best-effort (failure is silent).
+///
+/// **Bytewise read uses `read_volatile`** to prevent compilers from removing
+/// the loop as dead code.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn prefault_byte_range(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let ptr = bytes.as_ptr();
+    let len = bytes.len();
+
+    // (1) Page-aligned MADV_WILLNEED. Linux/Android require both addr and
+    // length to be page-aligned for madvise; we round addr down and length up
+    // (clamped to the slice boundary) to satisfy the contract.
+    let page = 4096usize;
+    let addr = ptr as usize;
+    let aligned_start = addr & !(page - 1);
+    let head_pad = addr - aligned_start;
+    let aligned_len = (head_pad + len).div_ceil(page) * page;
+    // SAFETY: madvise on a hint flag is non-fatal. The address range overlaps
+    // pages owned by the mmap caller, but we only request prefetch — no write,
+    // no remap. `bytes` outlives this call (caller contract).
+    unsafe {
+        let _ = libc::madvise(
+            aligned_start as *mut libc::c_void,
+            aligned_len,
+            libc::MADV_WILLNEED,
+        );
+    }
+
+    // (2) Explicit page-touch warmup. One volatile byte read per 4 KiB ensures
+    // the page is resident even if MADV_WILLNEED is silently dropped. The
+    // `read_volatile` prevents the optimiser from eliding the loop.
+    let mut sink: u8 = 0;
+    let mut off = 0usize;
+    while off < len {
+        // SAFETY: 0 <= off < len, ptr + off is in-bounds. read_volatile is
+        // sound for any byte (no alignment requirement on u8).
+        let v = unsafe { std::ptr::read_volatile(ptr.add(off)) };
+        // XOR-accumulate to a black-box variable so LLVM treats the read as
+        // observable. The value is otherwise discarded.
+        sink ^= v;
+        off += page;
+    }
+    // Touch the very last byte too (covers slices whose final page is partial
+    // and not stepped over by the loop).
+    if len > 0 {
+        // SAFETY: len-1 < len.
+        let v = unsafe { std::ptr::read_volatile(ptr.add(len - 1)) };
+        sink ^= v;
+    }
+    // Force the compiler to materialise `sink` so the volatile reads are not
+    // optimised away. `black_box` would be cleaner but is not in stable std
+    // for primitive sinks here; an inline asm-free alternative is to write
+    // the value into a memory location that escape-analyses out (but
+    // read_volatile by itself is already an observable side effect, so this
+    // line is defensive only).
+    std::hint::black_box(sink);
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn prefault_byte_range(_bytes: &[u8]) {
+    // No-op on non-Linux targets.
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Legacy accessor for GGUF GgufFile (used by swap_executor + transformer)
 // ──────────────────────────────────────────────────────────────────────────
@@ -747,6 +862,34 @@ impl SecondaryMmap {
 #[cfg(test)]
 mod tests {
     use super::parse_block_tensor_name;
+
+    #[test]
+    fn prefault_byte_range_handles_empty_slice() {
+        // Empty input must not call madvise / read past end. The function
+        // returns silently regardless of target OS.
+        super::prefault_byte_range(&[]);
+    }
+
+    #[test]
+    fn prefault_byte_range_touches_pages_without_panic() {
+        // 64 KiB anonymous buffer (16 pages). `prefault_byte_range` must
+        // accept arbitrary slice alignment, walk one byte per 4 KiB plus the
+        // last byte, and never panic. The volatile reads are observable but
+        // the data is stable (filled with a known pattern) so this also
+        // serves as a smoke test that the access stays in-bounds.
+        let buf = vec![0xA5u8; 64 * 1024];
+        super::prefault_byte_range(&buf);
+        // Sanity: data unchanged (prefault is read-only).
+        assert!(buf.iter().all(|&b| b == 0xA5));
+    }
+
+    #[test]
+    fn prefault_byte_range_handles_unaligned_slice() {
+        // Slice starting mid-page exercises the head-pad / round-up branch
+        // in the madvise alignment helper.
+        let buf = vec![0u8; 8192 + 17];
+        super::prefault_byte_range(&buf[17..]);
+    }
 
     #[test]
     fn parses_block_tensor_names() {
