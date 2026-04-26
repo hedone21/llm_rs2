@@ -1044,8 +1044,10 @@
 
 ## [P1] WSWAP-5-AUF-PLACEHOLDER-DROP. AUF SOA bypass placeholder cl_mem 112개 제거
 
-- **Status**: IN_PROGRESS (2026-04-26, Sprint B 후속, Senior Implementer 의뢰)
-- **Sprint**: current
+- **Status**: DONE (2026-04-26, `a4d29e8`, **목표 달성, 효과 부분적**)
+- **결과 요약**: placeholder cl_mem 112→**0**, Total alive 626→514 (−17.9%). matmul_qkv 534→513 μs (−3.9%), TBT 20.58→20.22 ms/tok (−1.7%, gap의 ~8%만 회복). Q4 baseline 16.37 ms/tok 대비 잔여 +23.5%. 부수 fix: dtype 가드 버그 (`primary.dtype()==Q4_0`이 F16→Q4 swap에서 false) 발견 + 수정. INV-131 safety net 회귀 0건. 호스트 sanity PASS, 정확성 PASS.
+- **Sprint**: closed
+- **결론**: 잔여 gap dominant는 F16 primary 145 cl_mem alive (2.47 GB) → PRIMARY-DROP 진행 필요
 - **Dependencies**: WSWAP-5-TBT-DIAG (DONE) — 진단 결과에 근거
 - **담당 권장**: Senior Implementer (`swap_executor.rs` materialise + LayerWeights 분기)
 - **추정 작업량**: S (1~2일)
