@@ -134,6 +134,26 @@ impl TransformerLayer {
             };
         }
 
+        // Sprint E: independent op-tracer (env-gated `LLMRS_FORWARD_GEN_OP_TRACE`).
+        // Runs alongside the legacy profiler so we can compare async dispatch
+        // overhead vs sync GPU-execution latency without fighting the existing
+        // `--profile` path. Zero overhead when env var unset.
+        macro_rules! tr_start {
+            () => {
+                crate::profile::op_trace::start()
+            };
+        }
+        macro_rules! tr_record {
+            ($t:expr, $kind:ident) => {
+                crate::profile::op_trace::record(
+                    $t,
+                    crate::profile::op_trace::OpKind::$kind,
+                    backend,
+                    is_gpu,
+                )
+            };
+        }
+
         let rms_norm_add_unit = args.rms_norm_add_unit;
         let use_gelu_tanh = args.use_gelu_tanh;
         let layer_idx = args.layer_idx;
@@ -150,6 +170,7 @@ impl TransformerLayer {
         // into a single `fused_norm_merge(x, prev_gpu, prev_staging, attn_norm, ws.residual, x)`
         // call. Residual `x` is updated in-place via the `residual_out` slot.
         let t = prof_start!();
+        let tr = tr_start!();
         let consumed_fused = if partition_fused
             && layer_idx > 0
             && ws.partition_prev_gpu_partial.is_some()
@@ -187,9 +208,11 @@ impl TransformerLayer {
             )?;
         }
         prof_record!(t, rms_norm);
+        tr_record!(tr, RmsNormAttn);
 
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
         let t = prof_start!();
+        let tr = tr_start!();
         #[cfg(target_arch = "aarch64")]
         let is_cpu_f16 = backend.name().contains("CPU") && self.wq.dtype() == DType::F16;
         #[cfg(target_arch = "aarch64")]
@@ -278,6 +301,7 @@ impl TransformerLayer {
             }
         }
         prof_record!(t, matmul_qkv);
+        tr_record!(tr, MatmulQkv);
 
         // QKV bias extension point
         if let Some(ref bias) = self.qkv_bias {
@@ -288,6 +312,7 @@ impl TransformerLayer {
 
         // 3. RoPE
         let t = prof_start!();
+        let tr = tr_start!();
         let q_dim = self.wq.shape().dims()[0];
         let k_dim = self.wk.shape().dims()[0];
         let n_heads_q = q_dim / head_dim;
@@ -325,9 +350,11 @@ impl TransformerLayer {
         backend.rope_inplace(&mut q_rope, start_pos, rope_theta)?;
         backend.rope_inplace(&mut k_rope, start_pos, rope_theta)?;
         prof_record!(t, rope);
+        tr_record!(tr, Rope);
 
         // 4. KV Cache Update - cast to target dtype if needed
         let t = prof_start!();
+        let tr = tr_start!();
         let kv_dtype = kv_cache.kv_dtype();
         use crate::core::kv_cache::KVLayout;
         if kv_dtype == DType::F16 && is_gpu && is_decode && kv_cache.layout() == KVLayout::HeadMajor
@@ -370,9 +397,11 @@ impl TransformerLayer {
             super::update_kv_cache(kv_cache, &k_rope, &ws.v, backend)?;
         }
         prof_record!(t, kv_update);
+        tr_record!(tr, KvUpdate);
 
         // 5. Attention - use GPU kernel for OpenCL
         let t = prof_start!();
+        let tr = tr_start!();
         let cache_seq_len = kv_cache.current_pos();
 
         // Sliding window attention (Gemma3 local layers):
@@ -1060,16 +1089,20 @@ impl TransformerLayer {
 
         // 6. Output Projection
         prof_record!(t, attention);
+        tr_record!(tr, Attention);
 
         let t = prof_start!();
+        let tr = tr_start!();
         // Decode wo: GPU-only (partition not applied to attention output in decode).
         set_label("matmul_wo");
         backend.matmul_transposed(&ws.out_attn, &self.wo, &mut ws.attn_out)?;
         clear_label();
         prof_record!(t, matmul_wo);
+        tr_record!(tr, MatmulWo);
 
         // 7+8. Post-attention residual + pre-FFN norm
         let t = prof_start!();
+        let tr = tr_start!();
         if rms_norm_add_unit {
             // Gemma3: apply post-attention norm (ffn_norm) to attn_out before residual add,
             // then fused add + pre_ffn_norm for FFN input.
@@ -1101,6 +1134,7 @@ impl TransformerLayer {
             )?;
         }
         prof_record!(t, rms_norm);
+        tr_record!(tr, RmsNormFfn);
 
         // 9. FFN — gate + up projections (3 paths: partition, fused NEON, generic)
         //
@@ -1110,6 +1144,7 @@ impl TransformerLayer {
         // on its own (ffn_hidden - split_col)-wide slice. The layer ends with a
         // single elementwise sum of two [1, 1, hidden] partials.
         let t = prof_start!();
+        let tr = tr_start!();
         let partition_active = self.partition_ctx.is_some() && ws.partition_ws.is_some();
         // SAFETY: `partition_ws` is an `Arc<UnsafeCell<PartitionWorkspace>>`
         // shared with the OpenCL plan path. Both forward_gen and the plan's
@@ -1589,6 +1624,7 @@ impl TransformerLayer {
             }
         }
         prof_record!(t, matmul_ffn);
+        tr_record!(tr, MatmulFfnGateUp);
 
         // silu_mul (GELU path) + down matmul: skipped when partition is active
         // (done per-slice inside the partition block above, merged into
@@ -1598,19 +1634,24 @@ impl TransformerLayer {
         if !partition_active {
             if use_gelu_tanh {
                 let t = prof_start!();
+                let tr = tr_start!();
                 backend.gelu_tanh_mul(&mut ws.gate, &ws.up)?;
                 prof_record!(t, silu_mul);
+                tr_record!(tr, SiluMul);
             }
 
             let t = prof_start!();
+            let tr = tr_start!();
             set_label("matmul_ffn");
             backend.matmul_transposed(&ws.gate, &self.w_down, &mut ws.down)?;
             clear_label();
             prof_record!(t, matmul_ffn);
+            tr_record!(tr, MatmulFfnDown);
         }
 
         // 10. Residual 2 — accumulate FFN result into x (skip connection)
         let t = prof_start!();
+        let tr = tr_start!();
         // Gemma3: apply post-FFN norm to FFN output before residual add.
         if let Some(ref pfn) = self.post_ffn_norm {
             backend.rms_norm(&mut ws.down, pfn, rms_norm_eps, true)?;
@@ -1627,6 +1668,7 @@ impl TransformerLayer {
             backend.add_assign(x, &ws.down)?;
         }
         prof_record!(t, add_assign);
+        tr_record!(tr, AddAssign);
 
         if let Some(ref mut p) = profiler {
             p.count += 1;

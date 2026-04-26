@@ -19,6 +19,7 @@
 pub mod cache;
 pub mod entropy;
 pub mod latency;
+pub mod op_trace;
 pub mod ops;
 pub mod scores;
 

@@ -644,6 +644,9 @@ fn make_partition_gpu_alloc<'a>(
 
 fn main() -> anyhow::Result<()> {
     env_logger::init();
+    // Sprint E forward_gen op-tracer: install atexit hook so the trace
+    // dumps even on Ctrl+C / early-return paths. No-op when env unset.
+    llm_rs2::profile::op_trace::install_atexit_once();
     // T0: process start, before CLI parsing or any allocation.
     rss_trace("start");
 
@@ -5594,6 +5597,10 @@ fn main() -> anyhow::Result<()> {
             1000.0 / avg_forward,
             forward_ms_values.len(),
         );
+        // Sprint E: flush the forward_gen op-tracer right after the Decode
+        // summary so the per-op breakdown sits next to the headline TBT in
+        // the log (atexit will fire too, but is moot once we already dumped).
+        llm_rs2::profile::op_trace::dump_and_reset();
         if forward_ms_values.len() >= 2 {
             let tail = &forward_ms_values[1..];
             let avg_tail: f64 = tail.iter().sum::<f64>() / tail.len() as f64;

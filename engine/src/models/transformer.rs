@@ -1026,6 +1026,14 @@ impl TransformerModel {
         let seq_len = input_tokens.shape().dims()[1];
         let hidden_size = self.config.hidden_size;
 
+        // Sprint E op-tracer: count this `forward_into` invocation as one
+        // token when running the decode path (seq_len == 1). Pre-fill is
+        // routed through `forward_prefill` and is not instrumented by the
+        // tracer, so we skip it here. No-op when the env gate is off.
+        if seq_len == 1 {
+            crate::profile::op_trace::note_forward_call();
+        }
+
         // 1. Embedding lookup
         // Use provided x_gen buffer if available and seq_len == 1
         let mut x = if seq_len == 1 {
@@ -1048,12 +1056,29 @@ impl TransformerModel {
             )
         };
 
-        // Embedding lookup: CPU gather + upload to backend buffer
+        // Embedding lookup: CPU gather + upload to backend buffer.
+        // Sprint E op-tracer: instrument the decode-only (`seq_len == 1`) path
+        // so the embedding-stage cost is comparable across configs. The
+        // tracer macros are no-ops when the env gate is off.
+        let is_gpu_for_trace = backend.is_gpu();
+        let tr_emb = if seq_len == 1 {
+            crate::profile::op_trace::start()
+        } else {
+            None
+        };
         self.gather_embed(input_tokens, &mut x, backend)?;
 
         // Gemma3: scale embeddings by sqrt(hidden_size)
         if let Some(scale) = self.config.embed_scale {
             backend.scale(&mut x, scale)?;
+        }
+        if seq_len == 1 {
+            crate::profile::op_trace::record(
+                tr_emb,
+                crate::profile::op_trace::OpKind::Embedding,
+                backend,
+                is_gpu_for_trace,
+            );
         }
 
         let is_gemma3 = self.config.arch == ModelArch::Gemma3;
@@ -1295,14 +1320,32 @@ impl TransformerModel {
         }
 
         // 3. Final Norm
+        let tr_fn = if seq_len == 1 {
+            crate::profile::op_trace::start()
+        } else {
+            None
+        };
         backend.rms_norm(
             &mut x,
             &self.norm,
             self.config.rms_norm_eps as f32,
             is_gemma3,
         )?;
+        if seq_len == 1 {
+            crate::profile::op_trace::record(
+                tr_fn,
+                crate::profile::op_trace::OpKind::FinalNorm,
+                backend,
+                is_gpu_for_trace,
+            );
+        }
 
         // 4. Head — optionally only compute last position's logits to save VRAM
+        let tr_lh = if seq_len == 1 {
+            crate::profile::op_trace::start()
+        } else {
+            None
+        };
         if args.logits_last_only && seq_len > 1 {
             // Extract last hidden state: x[..., seq_len-1, :] → [1, 1, hidden_size]
             let hidden_size = self.config.hidden_size;
@@ -1327,6 +1370,14 @@ impl TransformerModel {
             with_op_label(backend, "lm_head", || {
                 backend.matmul_transposed(&x, &self.lm_head, logits_out)
             })?;
+        }
+        if seq_len == 1 {
+            crate::profile::op_trace::record(
+                tr_lh,
+                crate::profile::op_trace::OpKind::LmHead,
+                backend,
+                is_gpu_for_trace,
+            );
         }
 
         // Synchronize before owned PrefillWorkspace drop — ensures all GPU kernels
