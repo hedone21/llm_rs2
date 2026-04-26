@@ -1393,21 +1393,22 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
   - Sprint F 측정값 회귀 방지: ratio scan {0.0, 0.25, 0.5, 0.75, 1.0} forward 정확성 PASS (mock backend, 호스트).
   - host fmt + clippy + tests PASS (`cargo fmt --all && cargo clippy --workspace -- -D warnings && cargo test --workspace`).
 
-- [~] **WSWAP-G1-F: 디바이스 측정 (Galaxy S25 R3CY408S5SB)** (Tester) — 호스트 빌드 완료, 디바이스 측정 대기
-  - [x] 신규 AUF (lm_head Q4_0 section 포함) build: `/tmp/auf_build/Llama-3.2-1B-Instruct.v011-tied.auf` (848 MB, format=v0.1.1, capability_opt=0x4, +141 MB lm_head entry). `auf_tool verify` PASS.
-  - [ ] device push (`/tmp/auf_build/Llama-3.2-1B-Instruct.v011-tied.auf` → S25 `/data/local/tmp/`).
-  - [ ] `--quantize-lm-head auto` model load 시간 측정: 기준 ~1.4s → ~0s 확인 (목표: ≥90% 감소).
-  - [ ] decode TBT 회귀 검증: Sprint F 측정 14.66 ms/tok 재현 또는 개선 (10% 이내 변동 허용).
-  - [ ] ratio scan {0.25, 0.5, 0.75, 1.0} 정확성 + TBT PASS (각 ratio에서 EMR / generated text quality Sprint F 동일 또는 개선).
-  - [ ] 메모리 측정 (PSS / RssShmem): Sprint F 회복량(+377 MB) 동일 또는 개선.
-  - [ ] 산출: `results/data/weight_swap/phase_6_g1_auf_lmhead.md` (load latency 표 + TBT 표 + 메모리 표).
+- [x] **WSWAP-G1-F: 디바이스 측정 (Galaxy S25 R3CY408S5SB)** (Tester, `8a0b600`) — 5/5 PASS
+  - [x] 신규 AUF v0.1.1 (G-1-F fix AOS lm_head): `/tmp/auf_build/Llama-3.2-1B-Instruct.v011-aos.auf` (810 MB, format=v0.1.1, capability_opt=0x4, md5=d085fc69...). `auf_tool verify` PASS.
+  - [x] device push + Android cross compile + generate 재배포.
+  - [x] **정확성 (CRITICAL)**: 4/4 ratio "Paris" 정답 (이전 G-1-F garbage 회복).
+  - [x] Load 시간: 1123 ms → 0 ms (>99% 감소, N=3).
+  - [x] TBT 14.81 ms/tok (Sprint F 14.66 ms/tok 대비 +1.0%, 목표 ±10% 내, N=3).
+  - [x] Ratio scan TBT 단조감소 31.05→25.81→24.19→18.57 ms/tok 패턴 일관.
+  - [x] 메모리 회귀 0% (deep stable VmRSS Δ=-0.02%).
+  - [x] 산출: `results/data/weight_swap/phase_6_g1_auf_lmhead.md` (전체 측정 자료 + 가설 검증 chain).
 
-- [x] **WSWAP-G1-G: 메모리 갱신 + spec/arch sync + 핸드오프** (메인 세션, 호스트 측)
-  - [x] MEMORY 갱신: `project_weight_swap_tbt_gap_root_cause.md` Sprint G-1 절 갱신 (G-1-B fix 검증/커밋, AUF v0.1.1 호스트 빌드 검증). `MEMORY.md` 인덱스 갱신 (Phase 6 디바이스 측정 대기).
-  - [x] `arch/auf_format.md` / `docs/auf_format_changelog.md`: G-1-A에서 sync 완료 (`32cb307`). 구현 결과 반영(tied 케이스 포함)은 spec 본문이 source-agnostic ('output.weight' entry라는 의미가 동일)이므로 추가 갱신 불필요.
-  - [x] `tests/spec/` 신규 INV 테스트: G-1-D/E에서 추가됨 (`test_inv_135_136_lm_head_auf.rs` 9 + `test_g1e_lm_head_integration.rs` 14). G-1-B fix는 추가로 `auf_tool` 단위 테스트 5개 (`tied_model_*`).
-  - [x] 변경 이력 entry: 본 TODO 파일 변경 이력에 G-1-A 분리 + G-1-B fix entry 추가.
-  - [ ] 자동 커밋 + `notify-send`: 본 호스트 측 마무리 진행 중.
+- [x] **WSWAP-G1-G: 메모리 갱신 + spec/arch sync + 핸드오프** (메인 세션) — 종결
+  - [x] MEMORY 갱신: `project_weight_swap_tbt_gap_root_cause.md` Sprint G-1 종결 갱신, `MEMORY.md` 인덱스 갱신 (Phase 6 종결).
+  - [x] `arch/auf_format.md` §2.5b 결정 3 / `docs/auf_format_changelog.md` v0.1.1 entry / `spec/41-invariants.md` §3.17 INV-135 v2: G-1-F fix 반영 (AOS layout, image 한계 설명, layer weight vs lm_head 차별화).
+  - [x] `tests/spec/` G-1-E 통합 테스트 14개 INV-135 v2로 갱신, auf_tool 단위 테스트 2개 신규 (`build_variant_payload_skips_soa_for_lm_head`, `_applies_soa_for_layer_weights`).
+  - [x] 변경 이력 entry: 본 TODO 파일 끝부분에 G-1-F fix entry.
+  - [x] 자동 커밋: `8a0b600 fix(auf): lm_head Q4_0 entry는 AOS layout으로 동봉 (G-1-F fix, INV-135 v2)` + 측정 markdown.
 
 **Acceptance**:
 - model load 비용 감소 측정: AUF에 lm_head Q4_0 포함 시 load 시점 quantize ~1.4s → ~0s (≥90% 감소).
@@ -1444,3 +1445,4 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
 - 2026-04-26 (Sprint G-1-A 완료, Architect): AUF v0.1.1 spec 결정 5건 확정. **결정 1 (Section 배치)**: 신규 section type 신설하지 않음. lm_head Q4_0 payload는 기존 `WEIGHTS_<backend>` 내부에 layer weight와 동일 layout으로 동봉. 근거: transformer.rs `prepare_noshuffle_buffers()` 분석 결과 lm_head Q4_0가 layer weight와 동일 SOA 변환 함수를 호출하며 layout 동일. **결정 2 (TENSOR_INDEX entry)**: 기존 `kind = 11(lm_head)` enum 재사용, dtype downgrade 결과 반영(`dtype=Q4_0`, shape=GGUF 원본). 별도 string name field 미도입. **결정 3 (source_hash)**: GGUF 전체 hybrid hash 재사용. lm_head 단일 hash 미도입. 근거: deterministic build → source_hash 일치 = lm_head 일치. **결정 4 (capability bit)**: `capability_optional` bit 2 = `LM_HEAD_PRECOMPUTED_Q4_0` 신설. 후방 호환 보장(optional이라 reject 사유 아님). **결정 5 (SOA 변환)**: target backend 분기 그대로 적용 — Adreno SOA, CUDA/CPU AOS. 산출: `arch/auf_format.md` v0.1.1 갱신, `docs/auf_format_changelog.md` v0.1.1 entry 추가, `spec/33-engine-data.md` ENG-DAT-096.12/.13 신설, `spec/41-invariants.md` INV-135/136 신설. format_patch 의미 명시(0=v0.1.0, 1=v0.1.1). 후방 호환 명시: 구 reader + 신 AUF, 신 reader + 구 AUF 양방향 모두 정상 동작. **G-1-B/C/D 진입 가능**.
 - 2026-04-26 (Sprint G-1-B/C/D/E 구현 + G-1-F 1차 측정): G-1-B(`d2407e2`) writer `--include-lm-head <on|off|auto>` CLI + AUF에 lm_head Q4_0 entry 작성. G-1-C(`67b2515`) reader `LmHeadPayload` + `AufView::lm_head_q4_0_payload()` accessor + INV-135/136 enforcement. G-1-D(`fcdb8e0`) model load 분기 (AUF entry 우선 → runtime fallback). G-1-E(`a0e9e76`) ADRENO_SOA payload layout mismatch fix — SOA bytes를 `alloc_pre_converted_soa_tensor()`로 NoshuffleWeightBuffer + registry 정상 처리. G-1-F 1차 디바이스 측정 시도 시 **Llama 3.2 1B는 tied embedding** 발견 — G-1-B가 `output.weight` 부재 시 skip → v0.1.1 AUF가 v0.1.0과 byte-identical → 측정 효과 없음.
 - 2026-04-26 (Sprint G-1-A 명세 분리 커밋 + G-1-B fix tied 모델, 검증/커밋 완료): G-1-A 명세를 별도 커밋(`32cb307`)으로 분리. G-1-B fix(`0f580f4`) tied embedding 모델에서 `token_embd.weight`를 lm_head source로 사용하도록 수정. **신설**: `LM_HEAD_SEPARATE_NAME`/`LM_HEAD_TIED_SOURCE_NAME` 상수, `LmHeadSource { source_name, is_tied }` struct, `select_lm_head_source(has_separate, has_token_embd) -> Option<LmHeadSource>` pure function (separate 우선, 없으면 tied). `extract_weight_blobs`에서 source 분기 + tied 안전망 (shape이 config [vocab_size, hidden_dim]과 불일치 시 fail-fast bail). Off 모드: tied에서는 entry 미생성 (v0.1.0 byte-level 호환 유지). 미지원 dtype + tied 조합도 entry 미생성. **테스트**: 5개 신규 단위 테스트 (`tied_model_uses_token_embd_as_lm_head_source`, `separate_model_uses_output_weight_as_lm_head_source`, `no_lm_head_source_returns_none`, `tied_model_quantize_deterministic`, `tied_model_lm_head_q4_0_dtype_check`). cargo fmt + clippy clean. auf_tool 25 PASS, INV-135/136 spec 9 PASS, G-1-E integration 14 PASS. **AUF v0.1.1 호스트 빌드 검증 PASS**: `/tmp/auf_build/Llama-3.2-1B-Instruct.v011-tied.auf` (848 MB, 0.79 GiB). 빌드 로그 `lm_head: source=token_embd.weight (tied), dtype=Q4_0, raw 147750912 bytes, entry included as-is` (token_embd가 이미 Q4_0이라 quantize 없이 raw 동봉). format=v0.1.1, capability_opt=0x4 (LM_HEAD_PRECOMPUTED_Q4_0), WEIGHTS_ADRENO_SOA 663.2 MB → 804.1 MB (+141 MB). `auf_tool verify` PASS. **G-1-G 호스트 측 마무리 완료**, G-1-F 디바이스 측정만 대기 (사용자 작업).
+- 2026-04-26 (**Sprint G-1 종결, G-1-F fix + 디바이스 5/5 PASS**): 커밋 `8a0b600`. **이슈**: 직전 G-1-F 디바이스 측정에서 v0.1.1 SOA path가 모든 ratio에서 garbage 출력 ("θα364.Edit-प AssemblyProduct..."). v0.1.0/Q4 baseline/F16은 모두 "Paris" 정답. **가설 검증**: lm_head shape [128256, 2048]의 SOA q_buf size = 32M texels로 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계 (Adreno ~16M) 초과. `image1d_buffer_t` 생성 실패 → q_img=None → forward의 m=1 SOA fast path가 standard GEMV로 fall through → `NoshuffleWeightBuffer::cl_mem()`가 d_buf만 노출하는데 standard GEMV는 AOS 18B/block 가정 → SOA scale buffer를 AOS layout으로 잘못 해석 → silent corruption. layer weight는 image 한계 안 (가장 큰 ffn_gate=2M texels)이라 정상. **Fix (INV-135 v2)**: lm_head는 image 한계로 어차피 SOA 빠른 path 사용 불가능 → 모든 backend variant에서 AOS 18B/block layout 동봉. writer `build_variant_payload` ADRENO_SOA 분기에 lm_head 예외 추가, reader `load_lm_head_from_auf` ADRENO_SOA SOA path 통째 제거 (모두 SharedBuffer<Q4_0> + copy_weight_from path). spec/arch/changelog G-1-F update 반영. 신규 단위 테스트 2 + G-1-E 통합 14 갱신. cargo fmt + clippy clean. **디바이스 측정 5/5 PASS**: 정확성 4/4 ratio "Paris" 정답 (이전 garbage 회복), Load 1123→0 ms (>99% 감소), TBT 14.81 ms/tok (Sprint F 14.66 대비 +1.0%, ±10% 내), Ratio scan 단조감소 31.05→25.81→24.19→18.57 ms/tok, 메모리 회귀 0% (Δ≤0.45%). 산출: `results/data/weight_swap/phase_6_g1_auf_lmhead.md`. **Sprint G-1 종결, Phase 6 완료**.
