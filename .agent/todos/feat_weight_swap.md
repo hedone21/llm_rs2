@@ -1042,6 +1042,77 @@
   - `--profile` 금지. wall-clock 기준 (`feedback_opencl_profile_events_cross_engine.md` 준수)
   - 진단 결과에 따라 후속 sprint는 P1로 승급 가능 (해소 implementation)
 
+## [P1] WSWAP-5-AUF-PLACEHOLDER-DROP. AUF SOA bypass placeholder cl_mem 112개 제거
+
+- **Status**: IN_PROGRESS (2026-04-26, Sprint B 후속, Senior Implementer 의뢰)
+- **Sprint**: current
+- **Dependencies**: WSWAP-5-TBT-DIAG (DONE) — 진단 결과에 근거
+- **담당 권장**: Senior Implementer (`swap_executor.rs` materialise + LayerWeights 분기)
+- **추정 작업량**: S (1~2일)
+- **Description**:
+  - **목적/배경**: TBT-DIAG에서 ratio=1.0 mixed의 −20.7% TBT gap 본질이 alive cl_mem 257개 (F16 primary 145 + AUF placeholder 112)임을 확정. matmul_qkv +22% (TLB cold). 본 작업은 placeholder 112개 제거.
+  - **현재 코드** (`swap_executor.rs:664-723` `materialise_auf_soa_weight`):
+    - AUF SOA bytes를 `copy_weight_from()`으로 GPU에 올림 → cl_mem 1개 신규 할당
+    - forward path는 이 cl_mem을 절대 안 읽음 (SOA registry의 q_buf/d_buf 사용)
+    - 단순히 LayerWeights.wq 같은 Tensor 슬롯 채우기용 placeholder
+  - **scope (in)**:
+    - LayerWeights에서 AUF SOA bypass 모드일 때 placeholder Tensor 생성 우회
+    - 옵션 후보:
+      - 1) `LayerWeights.w*: Option<Tensor>` (None이면 SOA registry key로 lookup)
+      - 2) lightweight stub Tensor (cl_mem 없이 metadata만)
+      - 3) Registry key 직접 보관 (`Either<Tensor, SoaRegistryKey>`)
+    - 권장: 옵션 2 (구조 변경 최소, forward path 변경 적음)
+    - INV-131 safety net 영향 점검 — placeholder가 fallback 시 필요한지 확인
+    - 진단 instrumentation (`LLMRS_CL_MEM_DIAG=1`) 활용하여 0개 검증
+  - **scope (out)**:
+    - F16 primary cl_mem 145개 제거 (PRIMARY-DROP 별도 sprint)
+    - AUF 포맷 변경
+    - SOA registry 자체 변경
+- **Acceptance Criteria**:
+  - AUF SOA bypass 모드(ratio=1.0 mixed)에서 placeholder cl_mem **0개** (`LLMRS_CL_MEM_DIAG=1` dump 검증)
+  - matmul_qkv μs/call 감소 (Q4 baseline 437 μs/call에 근접 목표, 부분 회복도 PASS)
+  - 정확성 회귀 없음 ("Paris" 가드, garbage 출력 없음)
+  - 호스트 sanity PASS (cargo test + clippy + fmt)
+  - INV-131 safety net 회귀 없음 (해당 spec test 통과)
+  - 디바이스 N≥3 측정으로 TBT 변화 정량
+  - 리포트: `results/data/weight_swap/phase_5_placeholder_drop.md` (또는 phase_5_tbt_diag.md에 §추가)
+- **Notes**:
+  - 효과 추정: matmul_qkv +22% 해소 시 −20.7% gap의 ~53% 회복
+  - Phase 4 핸드오프에서 "placeholder cl_mem 디버깅 함정" 으로 미리 표기됨 — 본 작업으로 해소
+  - 자동 커밋 + `notify-send`
+
+## [P2] WSWAP-5-PRIMARY-DROP. F16 primary cl_mem 145개 lifecycle audit + release
+
+- **Status**: TODO (PLACEHOLDER-DROP 결과 보고 후 진행 결정)
+- **Sprint**: next
+- **Dependencies**: WSWAP-5-AUF-PLACEHOLDER-DROP — 결과 측정으로 추가 필요성 판단
+- **담당 권장**: Senior Implementer (lifecycle audit) + Architect (swap-back 정책 결정)
+- **추정 작업량**: M (3~5일)
+- **Description**:
+  - **목적/배경**: ratio=1.0 mixed에서 F16 primary cl_mem 145개가 alive 상태 점유. 이미 사용 안 됨. 명시적 release 미구현.
+  - **scope (in)**:
+    - Lifecycle audit: F16 primary cl_mem alive에 의존하는 코드 전체 검사
+      - swap-back (Q4→F16 reverse) 경로
+      - INV-131 SOA 재변환 safety net (Phase 3.7a)
+      - QCF importance collection
+    - swap 완료 시점에 fully-swapped layer의 primary cl_mem 명시적 release
+    - swap-back 시 primary 재로드 비용 측정
+    - 정책 결정: "ratio=1.0에서만 release vs fully-swapped layer 단위로 release"
+  - **scope (out)**:
+    - mmap GGUF 자체 release (이전 `acf01af`/`9795ab7`에서 일부 처리됨)
+    - PLACEHOLDER-DROP과 동시 진행 금지 (회귀 원인 분리 위해)
+- **Acceptance Criteria**:
+  - F16 primary cl_mem ratio=1.0에서 ≤ 16개 (또는 0개, lifecycle 결정에 따라)
+  - swap-back 정확성 회귀 없음
+  - INV-131 safety net 회귀 없음
+  - Total alive bytes Q4 baseline (~2.0 GB) 수준 회복
+  - 추가 TBT 개선폭 측정
+  - 리포트: `results/data/weight_swap/phase_5_primary_drop.md`
+- **Notes**:
+  - 사용자 결정 사항: PLACEHOLDER-DROP만으로 −20.7% gap 충분 해소되면 본 작업 보류 가능
+  - swap-back 비용 vs alive cl_mem 점유 trade-off
+  - 회귀 risk 중 — lifecycle 변경은 광범위
+
 ## [P3] WSWAP-5-KIVI-FALLBACK. KIVI plan mixed state legacy fallback 진단
 
 - **Status**: TODO
