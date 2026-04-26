@@ -52,7 +52,7 @@
 - **TENSOR_INDEX `kind = 11(lm_head)` entry 의미 확장** (ENG-DAT-096.12 추가).
   - lm_head Q4_0 사전 변환 시 entry의 `dtype = Q4_0`, `shape = [vocab_size, hidden_dim]` (GGUF 원본 그대로), `variant_offsets`가 backend variant section 내부의 사전 변환 payload offset을 가리킨다.
   - cross-layer tensor의 `layer_idx = u32::MAX` 규칙은 그대로 적용.
-  - layout: layer weight와 동일 (Adreno SOA / CUDA AOS / CPU AOS).
+  - **layout (G-1-F update, INV-135 v2)**: lm_head Q4_0 entry는 모든 backend variant에서 **AOS 18B/block layout**으로 동봉된다. `WEIGHTS_ADRENO_SOA` section 내부에서도 lm_head는 SOA 변환을 적용하지 않는다 — `vocab × hidden / 8` texels의 `q_buf`가 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 거의 모든 디바이스에서 초과하여 image1d_buffer_t 생성이 실패하고 빠른 SOA path를 발동시킬 수 없기 때문이다 (Sprint G-1-F 디바이스 측정에서 garbage 출력 회귀로 확인됨). layer weight는 SOA 변환을 그대로 적용.
 - **결정성 요구사항** ENG-DAT-096.13 명시. 동일 GGUF + 동일 build option + 동일 host → byte-level 동일 AUF.
 
 ### Changed

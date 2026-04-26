@@ -573,7 +573,6 @@ impl TransformerModel {
         payload: &crate::auf::reader::LmHeadPayload<'_>,
         runtime_backend: &Arc<dyn Backend>,
     ) -> Result<()> {
-        use crate::auf::section::TAG_WEIGHTS_ADRENO_SOA;
         use crate::buffer::shared_buffer::SharedBuffer;
 
         let backend = runtime_backend.clone();
@@ -615,66 +614,25 @@ impl TransformerModel {
 
         let shape = self.lm_head.shape().clone();
 
-        // ── ADRENO_SOA path: split q_buf/d_buf, register NoshuffleWeightBuffer ──
+        // ── AOS path (모든 variant 공통, G-1-F fix) ──
         //
-        // payload.bytes = q_buf(N*16) || d_buf(N*2).  Matches the same layout
-        // produced by `build_variant_payload` (TAG_WEIGHTS_ADRENO_SOA) and
-        // consumed by `SecondaryMmap::split_pre_converted_soa`.
-        if payload.variant_tag == TAG_WEIGHTS_ADRENO_SOA && is_gpu && !self.lm_head_on_cpu {
-            let q_len = num_blocks * 16;
-            let d_len = num_blocks * 2;
-            debug_assert_eq!(q_len + d_len, expected_bytes);
-            let q_bytes = &payload.bytes[..q_len];
-            let d_bytes = &payload.bytes[q_len..q_len + d_len];
-
-            match backend.alloc_pre_converted_soa_tensor(
-                shape.clone(),
-                q_bytes,
-                d_bytes,
-                ne00,
-                ne01,
-            )? {
-                Some(soa_tensor) => {
-                    // Tied-weight handling (same as AOS path below).
-                    #[cfg(feature = "opencl")]
-                    {
-                        let old_lm_ptr = self.lm_head.buffer().as_ptr() as usize;
-                        let shares_with_embed = self
-                            .gpu_embed_tokens
-                            .as_ref()
-                            .map(|t| t.buffer().as_ptr() as usize == old_lm_ptr)
-                            .unwrap_or(false);
-                        if shares_with_embed {
-                            let fresh_embed = backend.copy_weight_from(&self.embed_tokens)?;
-                            self.gpu_embed_tokens = Some(fresh_embed);
-                        }
-                    }
-                    self.lm_head = soa_tensor;
-                    eprintln!(
-                        "[lm_head] loaded from AUF SOA payload ({} MB, {}×{}, variant={})",
-                        payload.bytes.len() / (1024 * 1024),
-                        ne01,
-                        ne00,
-                        payload.variant_tag,
-                    );
-                    return Ok(());
-                }
-                None => {
-                    // Backend SOA path unavailable (CPU or driver program missing).
-                    // Fall through to AOS SharedBuffer path with runtime re-conversion.
-                    eprintln!(
-                        "[lm_head] AUF ADRENO_SOA SOA alloc skipped (backend returned None); \
-                         falling back to AOS SharedBuffer + runtime re-conversion"
-                    );
-                }
-            }
-        }
-
-        // ── AOS path: CPU_AOS / CUDA_AOS (or ADRENO_SOA SOA alloc fallback) ──
+        // **G-1-F fix (INV-135 v2)**: lm_head Q4_0 entry는 모든 backend variant에서
+        // AOS 18B/block layout으로 동봉된다 (writer 측 `build_variant_payload`의
+        // TAG_WEIGHTS_ADRENO_SOA 분기에서 lm_head 예외 처리 참조).
         //
-        // payload.bytes for CPU_AOS/CUDA_AOS: raw AOS Q4_0 (18B/block, padded).
-        // For ADRENO_SOA fallback: bytes are actually SOA-packed — the backend's
-        // `ensure_noshuffle_soa_registered` will re-convert them at runtime.
+        // 이유: lm_head q_buf size는 vocab×hidden 차원으로 OpenCL
+        // `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 초과 (Llama 3.2 1B: 32M texels).
+        // `image1d_buffer_t` 생성 실패 → q_img=None → forward의 m=1 SOA path가
+        // standard GEMV로 fall through → SOA의 d_buf만 노출된 cl_mem을 AOS layout으로
+        // 잘못 해석 → silent corruption (Sprint G-1-F 디바이스 측정에서 garbage 토큰
+        // "θα364..." 출력으로 확인).
+        //
+        // 따라서 ADRENO_SOA section 내부에서도 lm_head는 AOS bytes로 동봉되며, reader
+        // 도 모든 variant에서 SharedBuffer<Q4_0> + `copy_weight_from` (Sprint F와
+        // 동등 path)로 처리한다. lm_head는 image 한계로 어차피 SOA 빠른 path 사용
+        // 불가능하므로 성능 손실 없음.
+        //
+        // payload.bytes = raw Q4_0 AOS (18B/block, alignment-padded). All variants.
         let bytes_owned: Vec<u8> = payload.bytes.to_vec();
         let cpu_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes_owned, DType::Q4_0));
         let cpu_backend: Arc<dyn Backend> = if let Some(ref cb) = self.cpu_backend {

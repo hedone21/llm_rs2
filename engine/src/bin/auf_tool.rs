@@ -928,8 +928,19 @@ fn unpermute_qk_rows_local(
 fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
     match tag {
         TAG_WEIGHTS_ADRENO_SOA => {
-            // SOA: 모든 Q4_0 weight를 (q_buf, d_buf)로 변환 + transpose하여 연속 배치.
+            // SOA: layer Q4_0 weight를 (q_buf, d_buf)로 변환 + transpose하여 연속 배치.
             // 비-Q4_0 tensor (F16 norm 등)는 그대로 포함.
+            //
+            // **lm_head 예외 (G-1-F fix, INV-135 v2)**: lm_head의 q_buf size는 vocab×hidden
+            // 차원 (Llama 3.2 1B: 32M texels)으로 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE`
+            // 한계를 거의 모든 디바이스에서 초과한다. 따라서 `image1d_buffer_t` 생성이
+            // 실패하여 빠른 SOA GEMV path를 발동시킬 수 없다. SOA 변환을 적용하면 reader
+            // 측이 SOA layout을 가정하지만 forward는 standard GEMV(AOS layout 가정)로
+            // 떨어져 silent corruption이 발생한다 (Sprint G-1-F 디바이스 측정에서 확인).
+            //
+            // 그러므로 lm_head Q4_0 entry는 ADRENO_SOA section 내부에서도 AOS 18B/block
+            // layout으로 동봉한다. reader는 `entry.kind == LmHead` 식별로 AOS path를
+            // 사용한다 (transformer.rs::load_lm_head_from_auf 참조).
             //
             // Q4_0 weight의 logical shape는 outermost-first `[ne01, ne00]` =
             // `[rows, cols]`로 저장되어 있다 (`extract_weight_blobs` 참조).
@@ -940,8 +951,9 @@ fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
             // 형태이다.
             let mut out = Vec::new();
             for (name, bytes, shape) in blobs {
+                let is_lm_head = name == LM_HEAD_SEPARATE_NAME;
                 let is_q4_0 = bytes.len() % 18 == 0 && bytes.len() >= 18;
-                if is_q4_0 && shape.len() == 2 {
+                if !is_lm_head && is_q4_0 && shape.len() == 2 {
                     let ne01 = shape[0] as usize; // rows
                     let ne00 = shape[1] as usize; // cols (K dim)
                     // Defensive guard — if shape × 18B/block does not match the
@@ -963,7 +975,8 @@ fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
                         bytes.len()
                     );
                 }
-                // F16/F32 tensor (or shape-mismatch fallback): bytes as-is.
+                // F16/F32 tensor, lm_head Q4_0 (image-limit exception),
+                // 또는 shape-mismatch fallback: bytes as-is.
                 out.extend_from_slice(bytes);
             }
             Ok(out)
@@ -2036,7 +2049,104 @@ mod tests {
         assert_eq!(out.len(), 8 * 18);
         // Q4_0 block layout: 2B scale (f16) + 16B nibbles. 첫 block size 검증.
         // (raw 데이터가 0 근처라 scale도 작은 f16. byte content 자체는 결정적이지만 비교는 size로 충분.)
-        assert!(out.len().is_multiple_of(18), "output must be multiple of 18B");
+        assert!(
+            out.len().is_multiple_of(18),
+            "output must be multiple of 18B"
+        );
+    }
+
+    // ── G-1-F fix: lm_head ADRENO_SOA AOS exception (INV-135 v2) ───────────────
+
+    /// `build_variant_payload(TAG_WEIGHTS_ADRENO_SOA, ...)` 호출 시 lm_head는 SOA
+    /// 변환을 skip하고 AOS bytes를 그대로 emit해야 한다 (image1d_buffer_t 한계 회피).
+    /// 다른 layer weight는 SOA 변환을 그대로 적용.
+    #[test]
+    fn build_variant_payload_skips_soa_for_lm_head() {
+        use llm_rs2::auf::q4_0_aos_to_adreno_soa;
+        use llm_rs2::auf::section::TAG_WEIGHTS_ADRENO_SOA;
+
+        // VOCAB=64, HIDDEN=128 → 64*128/32 = 256 blocks * 18B = 4608B.
+        const VOCAB: usize = 64;
+        const HIDDEN: usize = 128;
+        const NUM_BLOCKS: usize = VOCAB * HIDDEN / 32;
+        let lm_head_aos: Vec<u8> = (0..NUM_BLOCKS * 18).map(|i| (i % 256) as u8).collect();
+
+        // Layer weight (FFN gate) — 32×64 = 64 blocks.
+        const LAYER_ROWS: usize = 32;
+        const LAYER_COLS: usize = 64;
+        const LAYER_BLOCKS: usize = LAYER_ROWS * LAYER_COLS / 32;
+        let layer_aos: Vec<u8> = (0..LAYER_BLOCKS * 18)
+            .map(|i| ((i * 13 + 7) % 256) as u8)
+            .collect();
+
+        let blobs: Vec<WeightBlob> = vec![
+            (
+                "blk.0.ffn_gate.weight".to_owned(),
+                layer_aos.clone(),
+                vec![LAYER_ROWS as u64, LAYER_COLS as u64],
+            ),
+            (
+                "output.weight".to_owned(), // = LM_HEAD_SEPARATE_NAME, lm_head 식별
+                lm_head_aos.clone(),
+                vec![VOCAB as u64, HIDDEN as u64],
+            ),
+        ];
+
+        let payload = build_variant_payload(&blobs, TAG_WEIGHTS_ADRENO_SOA).unwrap();
+
+        // Layer weight 부분: SOA 변환 적용.
+        let (layer_q, layer_d) = q4_0_aos_to_adreno_soa(&layer_aos, LAYER_COLS, LAYER_ROWS);
+        let layer_soa_len = layer_q.len() + layer_d.len();
+        assert_eq!(
+            layer_soa_len,
+            LAYER_BLOCKS * 18,
+            "SOA total size = AOS total size invariant"
+        );
+        assert_eq!(&payload[..layer_q.len()], &layer_q[..]);
+        assert_eq!(
+            &payload[layer_q.len()..layer_q.len() + layer_d.len()],
+            &layer_d[..]
+        );
+
+        // lm_head 부분: AOS bytes 그대로 (SOA 변환 미적용).
+        let lm_head_start = layer_soa_len;
+        assert_eq!(
+            &payload[lm_head_start..lm_head_start + lm_head_aos.len()],
+            &lm_head_aos[..],
+            "lm_head must be emitted as raw AOS bytes (no SOA transform)"
+        );
+
+        // 총 byte 길이는 N*18 invariant 유지.
+        assert_eq!(payload.len(), layer_soa_len + lm_head_aos.len());
+    }
+
+    /// `build_variant_payload`는 layer weight (kind != lm_head)에 대해서는 SOA 변환을
+    /// 그대로 적용. 이는 G-1-F fix가 lm_head 한정 예외임을 검증.
+    #[test]
+    fn build_variant_payload_applies_soa_for_layer_weights() {
+        use llm_rs2::auf::q4_0_aos_to_adreno_soa;
+        use llm_rs2::auf::section::TAG_WEIGHTS_ADRENO_SOA;
+
+        const ROWS: usize = 32;
+        const COLS: usize = 64;
+        let aos: Vec<u8> = (0..ROWS * COLS / 32 * 18)
+            .map(|i| (i % 256) as u8)
+            .collect();
+
+        let blobs: Vec<WeightBlob> = vec![(
+            "blk.5.attn_v.weight".to_owned(),
+            aos.clone(),
+            vec![ROWS as u64, COLS as u64],
+        )];
+
+        let payload = build_variant_payload(&blobs, TAG_WEIGHTS_ADRENO_SOA).unwrap();
+        let (q, d) = q4_0_aos_to_adreno_soa(&aos, COLS, ROWS);
+
+        assert_eq!(&payload[..q.len()], &q[..]);
+        assert_eq!(&payload[q.len()..q.len() + d.len()], &d[..]);
+        assert_eq!(payload.len(), q.len() + d.len());
+        // SOA-converted bytes는 원본 AOS bytes와 다름이 정상 (sanity).
+        assert_ne!(&payload[..aos.len()], &aos[..]);
     }
 
     #[test]

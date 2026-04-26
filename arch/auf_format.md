@@ -423,7 +423,7 @@ flowchart LR
 
 2. **TENSOR_INDEX entry 재사용**. spec ENG-DAT-096.8에 이미 `kind = 11(lm_head)` enum이 정의되어 있다. 이 entry의 `dtype = Q4_0`, `shape = [vocab_size, hidden_dim]`(GGUF 원본 그대로), `variant_offsets[i]`가 backend variant section 내부의 lm_head payload offset을 가리킨다. cross-layer tensor의 `layer_idx = u32::MAX` 규칙은 그대로 적용.
 
-3. **SOA 변환 적용**: target backend가 `WEIGHTS_ADRENO_SOA`인 경우 lm_head Q4_0도 SOA layout (`q_buf` + `d_buf` 분리, `q_img` 정렬 hint)으로 사전 변환. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 AOS 18B block + alignment padding. layer weight와 동일한 variant convert 함수 재사용.
+3. **lm_head는 모든 variant에서 AOS 18B block layout** (G-1-F update, INV-135 v2). `WEIGHTS_ADRENO_SOA` section 내부에서도 lm_head는 SOA 변환을 적용하지 않고 raw GGUF Q4_0 bytes 그대로 동봉한다. **이유**: lm_head q_buf 크기(`vocab × hidden / 8` texels, Llama 3.2 1B에서 32M texels)가 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 거의 모든 디바이스에서 초과하여 `image1d_buffer_t` 생성이 실패하고, 빠른 SOA GEMV path(`m=1` decode)가 standard GEMV로 fall through하면서 SOA의 `d_buf`만 노출된 cl_mem을 AOS layout으로 잘못 해석 → garbage 출력 (Sprint G-1-F 디바이스 측정에서 확인됨). 따라서 lm_head는 image 한계로 인해 **빠른 SOA path를 사용할 수 없으며**, AOS 동봉이 정확성과 단순성 모두 충족시킨다. layer weight (`vocab × hidden`보다 훨씬 작음)는 SOA 변환을 그대로 적용. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 처음부터 AOS이므로 lm_head 처리는 일반 weight와 동일.
 
 4. **capability_optional bit 2 = `LM_HEAD_PRECOMPUTED_Q4_0`** 신설. reader는 bit 미인식 시 ignore (`capability_optional`의 의미상). 후방 호환 보장.
 
@@ -638,7 +638,7 @@ flowchart TB
         S1["META<br/>JSON (~2 KiB)<br/>required, not strippable"]
         S2["TOKENIZER<br/>~6 MiB BPE blob<br/>required, not strippable"]
         S3["TENSOR_INDEX<br/>~64 KiB tensor metadata<br/>kind=11 lm_head entry 포함<br/>required, not strippable"]
-        S4["WEIGHTS_ADRENO_SOA<br/>~700 MiB<br/>strippable<br/>q_buf + d_buf + image2d hint<br/>+ lm_head Q4_0 SOA (v0.1.1)"]
+        S4["WEIGHTS_ADRENO_SOA<br/>~700 MiB<br/>strippable<br/>q_buf + d_buf + image2d hint<br/>+ lm_head Q4_0 AOS (v0.1.1, INV-135 v2)"]
         S5["WEIGHTS_CUDA_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 128B align<br/>+ lm_head Q4_0 AOS (v0.1.1)"]
         S6["WEIGHTS_CPU_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 64B align<br/>+ lm_head Q4_0 AOS (v0.1.1)"]
         H --> T --> P0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6

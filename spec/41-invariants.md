@@ -300,6 +300,8 @@
 
 2026-04-26 Phase 6 Sprint G-1 (AUF v0.1.1, lm_head Q4_0 사전 변환)의 불변식. 대응 명세: `33-engine-data.md` §3.22.12 (ENG-DAT-096.12), §3.22.13 (ENG-DAT-096.13), `arch/auf_format.md` §2.5b.
 
+**G-1-F update (INV-135 v2, 2026-04-26)**: 디바이스 측정에서 AUF v0.1.1의 lm_head SOA layout 사용이 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계 초과로 silent corruption(garbage 출력)을 유발함이 확인되었다. Llama 3.2 1B의 lm_head q_buf(`vocab × hidden / 8` = 32M texels)는 Adreno OpenCL의 image1d_buffer_t 한계를 초과하여 `image` 생성이 실패하고, forward 측의 `m=1` SOA fast path가 standard GEMV로 fall through하면서 SOA의 `d_buf`만 노출된 cl_mem을 AOS layout으로 잘못 해석한다. 따라서 lm_head Q4_0 entry는 **모든 backend variant에서 AOS 18B/block layout으로 동봉**한다 (INV-135 v2).
+
 **교차 참조**:
 - **INV-132** (AUF reader rejection 의무): `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)는 미인식 시에도 reject 사유가 아니다 (optional). v0.1.0 reader가 v0.1.1 AUF를 읽어도 bit 2를 무시하고 정상 진입. INV-135/136은 신 reader(v0.1.1) 한정 의무.
 - **INV-133** (required section 존재 의무): lm_head Q4_0 payload는 별도 section이 아니라 기존 `WEIGHTS_<backend>` section 내부에 동봉되므로 INV-133의 6개 section 카탈로그는 그대로 유지된다.
@@ -308,7 +310,7 @@
 
 | ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
 |----|------|----------|---------|------|------|
-| INV-135 | 33-engine-data §3.22.12 (ENG-DAT-096.12), §3.22.6 (ENG-DAT-096.6) | AUF의 `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)가 1이면 TENSOR_INDEX에 `kind = 11(lm_head)`, `dtype = 3(Q4_0)`, `shape = [vocab_size, hidden_dim]` entry가 정확히 1개 존재해야 하며, 해당 entry의 shape이 model load 시점의 모델 config(`vocab_size`, `hidden_dim`)와 일치해야 한다. shape mismatch 시 reader는 reject + 명시 에러 반환. AUF 헤더의 `source_hash`(hybrid)는 lm_head Q4_0 payload의 implicit identity 역할을 한다 — build 결정성(ENG-DAT-096.13) 보장 하에 source_hash 일치는 lm_head Q4_0 일치를 함의한다. 별도 lm_head hash field는 도입하지 않는다. | Correctness | runtime, test | reader 진입 시 검증. shape mismatch는 다른 모델용 AUF가 잘못 사용된 케이스. |
+| INV-135 v2 | 33-engine-data §3.22.12 (ENG-DAT-096.12), §3.22.6 (ENG-DAT-096.6) | AUF의 `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)가 1이면 TENSOR_INDEX에 `kind = 11(lm_head)`, `dtype = 3(Q4_0)`, `shape = [vocab_size, hidden_dim]` entry가 정확히 1개 존재해야 하며, 해당 entry의 shape이 model load 시점의 모델 config(`vocab_size`, `hidden_dim`)와 일치해야 한다. **lm_head Q4_0 payload는 모든 backend variant에서 AOS 18B/block layout으로 동봉된다 (G-1-F fix)** — `WEIGHTS_ADRENO_SOA` section 내부에서도 lm_head는 SOA 변환을 적용하지 않고 raw GGUF Q4_0 bytes 그대로 보존한다. 이유: lm_head q_buf 크기(`vocab × hidden / 8` texels)가 `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 거의 모든 디바이스에서 초과하여 image1d_buffer_t 생성이 실패하고, 빠른 SOA path가 발동 불가능하므로 AOS layout이 의미 있다. shape mismatch 시 reader는 reject + 명시 에러 반환. AUF 헤더의 `source_hash`(hybrid)는 lm_head Q4_0 payload의 implicit identity 역할을 한다 — build 결정성(ENG-DAT-096.13) 보장 하에 source_hash 일치는 lm_head Q4_0 일치를 함의한다. 별도 lm_head hash field는 도입하지 않는다. | Correctness | runtime, test | reader 진입 시 검증. shape mismatch는 다른 모델용 AUF가 잘못 사용된 케이스. v1→v2: 2026-04-26 Sprint G-1-F garbage 출력 수정 (silent corruption). |
 | INV-136 | 33-engine-data §3.22.12 (ENG-DAT-096.12), `arch/auf_format.md` §2.5b | AUF의 `capability_optional` bit 2가 0이거나 AUF가 부재한 경우, model load는 기존 `quantize_lm_head_to_q4_0()` runtime fallback 경로로 정상 진행되어야 하며 lm_head dtype은 사용자 지정 `--quantize-lm-head` 값(`auto`/`none`/`q4_0`)에 따라 결정된다. `auto` + `--secondary-gguf`(또는 `--secondary-source`) 미설정 시 quantize skip(F16 유지). bit 0 시 AUF reader가 panic하거나 model load가 abort하면 안 된다. | Correctness | test | Sprint F 동작(v0.1.0 AUF + 신 코드) 보존. fallback 경로 회귀 방지. |
 
 ## 4. Alternative Behavior
