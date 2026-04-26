@@ -18,7 +18,7 @@ use crate::auf::section::{
     SectionTable, TAG_META, TAG_TENSOR_INDEX, TAG_TOKENIZER, TAG_WEIGHTS_ADRENO_SOA,
     TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS,
 };
-use crate::auf::tensor_index::TensorIndex;
+use crate::auf::tensor_index::{TensorDType, TensorIndex};
 use crate::auf::tokenizer::AufTokenizer;
 
 /// backend 식별자.
@@ -40,6 +40,25 @@ impl BackendTag {
             BackendTag::Any => None,
         }
     }
+}
+
+/// lm_head Q4_0 사전 변환 payload 뷰 (G-1-A spec, INV-135/136).
+///
+/// `AufView::lm_head_q4_0_payload()` 성공 시 반환되는 zero-copy 슬라이스 컨테이너.
+/// `bytes`는 backend variant section 내부의 lm_head payload를 직접 가리킨다.
+/// lifetime은 `AufView`에 귀속된다.
+#[derive(Debug)]
+pub struct LmHeadPayload<'a> {
+    /// backend variant section 내의 lm_head Q4_0 raw bytes (zero-copy).
+    pub bytes: &'a [u8],
+    /// `[vocab_size, hidden_dim]`.
+    pub shape: [usize; 2],
+    /// 항상 `TensorDType::Q4_0` (INV-135 보장).
+    pub dtype: TensorDType,
+    /// WEIGHTS section alignment (bytes). 현재는 65536 (64KB) 고정.
+    pub alignment: usize,
+    /// 이 payload가 추출된 backend variant tag.
+    pub variant_tag: &'static str,
 }
 
 /// AUF 파일 view — mmap 보유 + 파싱된 메타데이터 + WEIGHTS payload byte slice.
@@ -64,6 +83,141 @@ impl AufView {
     pub fn weights_bytes(&self) -> Option<&[u8]> {
         self.weights_range
             .map(|(offset, size)| &self._mmap[offset as usize..][..size as usize])
+    }
+
+    /// lm_head Q4_0 사전 변환 payload를 반환한다 (INV-135/136).
+    ///
+    /// 호출 시 `vocab_size` / `hidden_dim`은 model config의 값이어야 한다.
+    /// backend variant는 AufView를 `open()` 시 지정한 `BackendTag`에서 결정된다.
+    ///
+    /// # 반환값
+    ///
+    /// - `Ok(None)` — capability bit 2 = 0 (INV-136). 호출자는 runtime fallback
+    ///   (`quantize_lm_head_to_q4_0`) 을 사용한다.
+    /// - `Ok(Some(payload))` — entry 검증 통과, zero-copy bytes 반환.
+    /// - `Err(...)` — capability bit 2 = 1이지만 INV-135 위반 (entry 부재, dtype 불일치,
+    ///   shape 불일치, variant payload 부재).
+    ///
+    /// # Backend variant 분기
+    ///
+    /// `weights_range`가 `Some((offset, size))`이면 WEIGHTS section이 특정 backend variant에
+    /// 대해 열려 있으므로 `tensor_index.variant_index_for_tag(variant_tag)` 를 통해
+    /// 올바른 variant column을 선택한다. `BackendTag::Any`이면 weights_range=None이므로
+    /// 이 accessor를 사용해서는 안 된다 (strip 용도).
+    pub fn lm_head_q4_0_payload(
+        &self,
+        vocab_size: usize,
+        hidden_dim: usize,
+    ) -> AufResult<Option<LmHeadPayload<'_>>> {
+        // INV-136: bit 2 = 0 → None (runtime fallback).
+        if !self.header.has_lm_head_q4_0() {
+            return Ok(None);
+        }
+
+        // INV-135: bit 2 = 1이면 TENSOR_INDEX에 entry가 정확히 1개 존재해야 한다.
+        let entry = self
+            .tensor_index
+            .find_lm_head_entry()
+            .ok_or(AufError::LmHeadEntryMissing)?;
+
+        // dtype 검증 (Q4_0 = 3).
+        if entry.dtype != TensorDType::Q4_0.as_u32() {
+            return Err(AufError::LmHeadDtypeMismatch {
+                found_dtype: entry.dtype,
+            });
+        }
+
+        // shape 검증: entry.shape은 outermost-first [vocab_size, hidden_dim].
+        let expected_shape = [vocab_size as u64, hidden_dim as u64];
+        if entry.shape.len() != 2
+            || entry.shape[0] != expected_shape[0]
+            || entry.shape[1] != expected_shape[1]
+        {
+            return Err(AufError::LmHeadShapeMismatch {
+                expected: [vocab_size, hidden_dim],
+                found: entry.shape.clone(),
+            });
+        }
+
+        // backend variant 선택: weights_range가 Some인 경우에만 유효한 variant가 있다.
+        let (weights_offset, _weights_size) = self.weights_range.ok_or_else(|| {
+            AufError::Other(
+                "lm_head_q4_0_payload: BackendTag::Any does not support lm_head accessor"
+                    .to_owned(),
+            )
+        })?;
+
+        // variant tag 문자열 확인 (weights_range가 있으면 반드시 열린 variant가 있음).
+        // section_table에서 해당 offset의 tag를 역조회한다.
+        let variant_tag: &'static str = self.resolve_variant_tag(weights_offset)?;
+
+        let variant_idx = self
+            .tensor_index
+            .variant_index_for_tag(variant_tag)
+            .ok_or_else(|| AufError::LmHeadVariantPayloadMissing {
+                variant_tag: variant_tag.to_owned(),
+            })?;
+
+        let var_offset = entry
+            .variant_offsets
+            .get(variant_idx)
+            .copied()
+            .unwrap_or(u64::MAX);
+        let var_size = entry.variant_sizes.get(variant_idx).copied().unwrap_or(0);
+
+        if var_offset == u64::MAX || var_size == 0 {
+            return Err(AufError::LmHeadVariantPayloadMissing {
+                variant_tag: variant_tag.to_owned(),
+            });
+        }
+
+        // weights_bytes()는 WEIGHTS section의 section-local slice.
+        // var_offset은 section-local이므로 직접 인덱싱한다.
+        let weights_bytes = self
+            .weights_bytes()
+            .expect("weights_range Some implies weights_bytes Some");
+
+        let start = var_offset as usize;
+        let end = start + var_size as usize;
+        if end > weights_bytes.len() {
+            return Err(AufError::Other(format!(
+                "lm_head payload [{start}..{end}) exceeds WEIGHTS section size {}",
+                weights_bytes.len()
+            )));
+        }
+
+        Ok(Some(LmHeadPayload {
+            bytes: &weights_bytes[start..end],
+            shape: [vocab_size, hidden_dim],
+            dtype: TensorDType::Q4_0,
+            alignment: crate::auf::writer::WEIGHTS_ALIGNMENT as usize,
+            variant_tag,
+        }))
+    }
+
+    /// `weights_range.offset`으로 어떤 WEIGHTS variant tag가 열렸는지 역조회한다.
+    ///
+    /// section_table에서 offset이 일치하는 entry의 tag를 찾아 static str로 반환한다.
+    fn resolve_variant_tag(&self, weights_offset: u64) -> AufResult<&'static str> {
+        use crate::auf::section::{
+            TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS,
+        };
+        for e in &self.section_table.entries {
+            if e.offset == weights_offset {
+                let tag = e.tag();
+                return match tag {
+                    TAG_WEIGHTS_ADRENO_SOA => Ok(TAG_WEIGHTS_ADRENO_SOA),
+                    TAG_WEIGHTS_CUDA_AOS => Ok(TAG_WEIGHTS_CUDA_AOS),
+                    TAG_WEIGHTS_CPU_AOS => Ok(TAG_WEIGHTS_CPU_AOS),
+                    other => Err(AufError::Other(format!(
+                        "resolve_variant_tag: unknown WEIGHTS tag '{other}'"
+                    ))),
+                };
+            }
+        }
+        Err(AufError::Other(
+            "resolve_variant_tag: no section entry matches weights_range offset".to_owned(),
+        ))
     }
 
     /// mmap 전체 바이트 slice를 반환한다 (stripper 등 내부 용도).
@@ -296,5 +450,170 @@ mod tests {
             err,
             AufError::UnsupportedFormatMajor { found: 1, .. }
         ));
+    }
+
+    // ── lm_head Q4_0 accessor 테스트 (INV-135/136) ─────────────────────────
+
+    /// make_meta() 기준: vocab_size=10, hidden_dim=32.
+    /// Q4_0 blocks = 10 * (32/32) = 10. 각 18B → 총 180B.
+    const LM_HEAD_Q4_0_SIZE: usize = 10 * 18; // 180B
+
+    /// lm_head entry가 포함된 TENSOR_INDEX를 빌드한다.
+    fn make_lm_head_tensor_index(
+        weights_tag: &str,
+        lm_head_offset: u64,
+        lm_head_size: u64,
+        dtype: u32,
+        shape: Vec<u64>,
+    ) -> crate::auf::tensor_index::TensorIndex {
+        use crate::auf::tensor_index::{LAYER_IDX_CROSS, TensorEntry, TensorIndex, TensorKind};
+        let mut variant_tag = [0u8; 24];
+        let tag_bytes = weights_tag.as_bytes();
+        variant_tag[..tag_bytes.len().min(24)]
+            .copy_from_slice(&tag_bytes[..tag_bytes.len().min(24)]);
+        TensorIndex {
+            variant_tags: vec![variant_tag],
+            entries: vec![TensorEntry {
+                layer_idx: LAYER_IDX_CROSS,
+                kind: TensorKind::LmHead.as_u32(),
+                dtype,
+                shape,
+                alignment: 65536,
+                variant_offsets: vec![lm_head_offset],
+                variant_sizes: vec![lm_head_size],
+            }],
+        }
+    }
+
+    /// lm_head Q4_0 payload를 포함한 AUF 바이트를 빌드한다.
+    /// weights_payload = layer_weights + lm_head_payload (lm_head은 끝에 동봉).
+    fn build_auf_with_lm_head(
+        lm_head_bytes: &[u8],
+        weights_tag: &str,
+        dtype: u32,
+        shape: Vec<u64>,
+    ) -> Vec<u8> {
+        // layer dummy payload (32B) + lm_head payload가 뒤에 붙는다고 가정.
+        // lm_head_offset = layer_dummy_size (section-local).
+        let layer_dummy: Vec<u8> = vec![0xABu8; 32];
+        let lm_head_offset = layer_dummy.len() as u64;
+        let lm_head_size = lm_head_bytes.len() as u64;
+
+        let mut combined = layer_dummy;
+        combined.extend_from_slice(lm_head_bytes);
+
+        let tidx =
+            make_lm_head_tensor_index(weights_tag, lm_head_offset, lm_head_size, dtype, shape);
+        AufWriter::new(make_meta(), make_tokenizer(), [0u8; 32], 0, 0)
+            .with_lm_head_q4_0(true)
+            .with_tensor_index(tidx)
+            .add_weights_section(weights_tag, combined)
+            .build()
+            .unwrap()
+    }
+
+    /// INV-136: capability bit 2 = 0 (v0.1.0 AUF) → accessor Ok(None).
+    #[test]
+    fn lm_head_payload_bit2_zero_returns_none() {
+        let payload = vec![0u8; 128];
+        let bytes = build_auf_bytes(&payload, "WEIGHTS_CPU_AOS");
+        let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
+        // bit 2 = 0 (default)
+        assert!(!view.header.has_lm_head_q4_0());
+        let result = view.lm_head_q4_0_payload(10, 32).unwrap();
+        assert!(result.is_none(), "bit2=0 should return None");
+    }
+
+    /// INV-135 happy path: bit 2 = 1 + entry 정상 → Ok(Some(payload)).
+    #[test]
+    fn lm_head_payload_bit2_set_entry_ok() {
+        use crate::auf::tensor_index::TensorDType;
+        let lm_head_data: Vec<u8> = (0..LM_HEAD_Q4_0_SIZE as u8).collect();
+        let bytes = build_auf_with_lm_head(
+            &lm_head_data,
+            "WEIGHTS_CPU_AOS",
+            TensorDType::Q4_0.as_u32(),
+            vec![10, 32],
+        );
+        let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
+        assert!(view.header.has_lm_head_q4_0());
+
+        let payload = view
+            .lm_head_q4_0_payload(10, 32)
+            .unwrap()
+            .expect("expected Some(LmHeadPayload)");
+
+        assert_eq!(payload.shape, [10, 32]);
+        assert_eq!(payload.dtype, TensorDType::Q4_0);
+        assert_eq!(payload.bytes.len(), LM_HEAD_Q4_0_SIZE);
+        assert_eq!(payload.variant_tag, "WEIGHTS_CPU_AOS");
+        // bytes 정확성: lm_head_data와 일치
+        assert_eq!(payload.bytes, &lm_head_data[..]);
+    }
+
+    /// INV-135: bit 2 = 1이지만 TENSOR_INDEX에 lm_head entry 없음 → Err(LmHeadEntryMissing).
+    #[test]
+    fn lm_head_payload_entry_missing() {
+        // bit 2 = 1이지만 tensor_index는 빈 (lm_head entry 없음).
+        let empty_tidx = crate::auf::tensor_index::TensorIndex {
+            variant_tags: vec![[0u8; 24]],
+            entries: vec![],
+        };
+        let bytes = AufWriter::new(make_meta(), make_tokenizer(), [0u8; 32], 0, 0)
+            .with_lm_head_q4_0(true)
+            .with_tensor_index(empty_tidx)
+            .add_weights_section("WEIGHTS_CPU_AOS", vec![0u8; 64])
+            .build()
+            .unwrap();
+        let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
+        let err = view.lm_head_q4_0_payload(10, 32).unwrap_err();
+        assert!(
+            matches!(err, AufError::LmHeadEntryMissing),
+            "expected LmHeadEntryMissing, got: {err}"
+        );
+    }
+
+    /// INV-135: bit 2 = 1 + entry 존재 + dtype != Q4_0 → Err(LmHeadDtypeMismatch).
+    #[test]
+    fn lm_head_payload_dtype_mismatch() {
+        use crate::auf::tensor_index::TensorDType;
+        let lm_head_data = vec![0u8; LM_HEAD_Q4_0_SIZE];
+        let bytes = build_auf_with_lm_head(
+            &lm_head_data,
+            "WEIGHTS_CPU_AOS",
+            TensorDType::F16.as_u32(), // 잘못된 dtype
+            vec![10, 32],
+        );
+        let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
+        let err = view.lm_head_q4_0_payload(10, 32).unwrap_err();
+        assert!(
+            matches!(err, AufError::LmHeadDtypeMismatch { found_dtype: 1 }),
+            "expected LmHeadDtypeMismatch, got: {err}"
+        );
+    }
+
+    /// INV-135: bit 2 = 1 + entry 존재 + shape 불일치 → Err(LmHeadShapeMismatch).
+    #[test]
+    fn lm_head_payload_shape_mismatch() {
+        use crate::auf::tensor_index::TensorDType;
+        let lm_head_data = vec![0u8; LM_HEAD_Q4_0_SIZE];
+        let bytes = build_auf_with_lm_head(
+            &lm_head_data,
+            "WEIGHTS_CPU_AOS",
+            TensorDType::Q4_0.as_u32(),
+            vec![99, 32], // vocab_size=99 vs. expected 10
+        );
+        let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
+        let err = view.lm_head_q4_0_payload(10, 32).unwrap_err(); // vocab_size=10
+        assert!(
+            matches!(
+                err,
+                AufError::LmHeadShapeMismatch {
+                    expected: [10, 32],
+                    ..
+                }
+            ),
+            "expected LmHeadShapeMismatch, got: {err}"
+        );
     }
 }

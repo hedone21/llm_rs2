@@ -6,7 +6,19 @@ use crate::auf::error::{AufError, AufResult};
 /// reader가 지원하는 최대 format_major.
 pub const READER_MAX_FORMAT_MAJOR: u16 = 0;
 
-/// reader가 인식하는 capability bit set (v0.1에서는 모두 0).
+/// capability_optional bit 2: AUF에 lm_head Q4_0 사전 변환 entry가 포함됨 (v0.1.1+).
+///
+/// bit 2 = 1이면 TENSOR_INDEX에 `kind=11(lm_head), layer_idx=u32::MAX, dtype=Q4_0` 엔트리
+/// 가 정확히 1개 존재해야 한다 (INV-135). 없거나 부정합이면 reader는 `Result::Err`를 반환.
+/// bit 2 = 0 (또는 AUF 부재)이면 lm_head Q4_0 accessor는 `Ok(None)`을 반환 (INV-136).
+pub const CAPABILITY_BIT_LM_HEAD_Q4_0: u64 = 1 << 2;
+
+/// reader가 인식하는 capability bit set.
+///
+/// v0.1.0: 모두 0.
+/// v0.1.1: CAPABILITY_BIT_LM_HEAD_Q4_0 (bit 2) 추가 — optional capability이므로
+///   capability_optional에만 set, capability_required에는 set하지 않는다.
+///   따라서 구 reader (bit 2 미인식)는 lm_head accessor를 None으로 처리하고 안전하게 로드.
 pub const READER_KNOWN_CAPABILITIES: u64 = 0;
 
 /// AUF 헤더 magic bytes: `"ARGUS_W\0"`.
@@ -139,6 +151,29 @@ impl AufHeader {
             return Err(AufError::UnknownRequiredCapability { bit });
         }
         Ok(())
+    }
+
+    /// capability_optional bit 2 = 1인지 확인한다.
+    ///
+    /// `true`이면 이 AUF에 lm_head Q4_0 사전 변환 entry가 포함되어 있다 (INV-135).
+    /// `false`이면 lm_head accessor는 `Ok(None)`을 반환해야 한다 (INV-136).
+    pub fn has_lm_head_q4_0(&self) -> bool {
+        self.capability_optional & CAPABILITY_BIT_LM_HEAD_Q4_0 != 0
+    }
+
+    /// `LM_HEAD_PRECOMPUTED_Q4_0` capability bit를 설정/해제한다 (writer용).
+    ///
+    /// `enabled = true`: bit 2 set + format_patch = 1 (v0.1.1).
+    /// `enabled = false`: bit 2 clear + format_patch = 0 (v0.1.0 호환).
+    /// 다른 capability bit는 보존한다.
+    pub fn set_lm_head_q4_0_capability(&mut self, enabled: bool) {
+        if enabled {
+            self.capability_optional |= CAPABILITY_BIT_LM_HEAD_Q4_0;
+            self.format_patch = 1;
+        } else {
+            self.capability_optional &= !CAPABILITY_BIT_LM_HEAD_Q4_0;
+            self.format_patch = 0;
+        }
     }
 
     /// v0.1 기본 헤더를 생성한다 (writer 용도).

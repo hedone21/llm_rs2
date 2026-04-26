@@ -37,6 +37,17 @@ pub enum AufError {
     ///
     /// `auf-tool build`가 TensorIndex를 채우지 않았거나, 수동 조작으로 빈 인덱스가 주입된 경우.
     TensorIndexMissingVariant { weights_tag: String },
+    /// capability_optional bit 2 = 1이지만 TENSOR_INDEX에 lm_head Q4_0 엔트리가 없다 (INV-135).
+    LmHeadEntryMissing,
+    /// lm_head entry가 존재하지만 dtype이 Q4_0이 아니다 (INV-135).
+    LmHeadDtypeMismatch { found_dtype: u32 },
+    /// lm_head entry가 존재하지만 shape이 model config와 일치하지 않는다 (INV-135).
+    LmHeadShapeMismatch {
+        expected: [usize; 2],
+        found: Vec<u64>,
+    },
+    /// capability_optional bit 2 = 1이지만 lm_head entry에 해당 variant payload가 없다 (INV-135).
+    LmHeadVariantPayloadMissing { variant_tag: String },
     /// 기타 IO/파싱 에러.
     Io(std::io::Error),
     /// 기타 메시지 에러.
@@ -104,6 +115,27 @@ impl fmt::Display for AufError {
                 "AUF file invariant violation: TENSOR_INDEX does not list variant '{}' — \
                  empty index detected. Rebuild with 'auf-tool build'.",
                 weights_tag
+            ),
+            AufError::LmHeadEntryMissing => write!(
+                f,
+                "AUF invariant violation (INV-135): capability_optional bit 2 is set but \
+                 TENSOR_INDEX contains no lm_head entry (kind=11, layer_idx=u32::MAX, dtype=Q4_0)"
+            ),
+            AufError::LmHeadDtypeMismatch { found_dtype } => write!(
+                f,
+                "AUF invariant violation (INV-135): lm_head entry dtype={found_dtype} \
+                 (expected Q4_0=3)"
+            ),
+            AufError::LmHeadShapeMismatch { expected, found } => write!(
+                f,
+                "AUF invariant violation (INV-135): lm_head entry shape={found:?} \
+                 does not match model config [vocab_size={}, hidden_dim={}]",
+                expected[0], expected[1]
+            ),
+            AufError::LmHeadVariantPayloadMissing { variant_tag } => write!(
+                f,
+                "AUF invariant violation (INV-135): lm_head entry has no payload \
+                 for variant '{variant_tag}'"
             ),
             AufError::Io(e) => write!(f, "AUF I/O error: {e}"),
             AufError::Other(msg) => write!(f, "AUF error: {msg}"),

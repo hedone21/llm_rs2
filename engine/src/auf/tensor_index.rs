@@ -306,6 +306,16 @@ impl TensorIndex {
         out
     }
 
+    /// `kind=LmHead(11), layer_idx=u32::MAX` 조건을 만족하는 entry를 반환한다.
+    ///
+    /// G-1-A spec (INV-135): capability bit 2 = 1이면 이 entry가 정확히 1개 존재해야 한다.
+    /// 0개이면 `None` (호출자가 INV-135 에러로 처리), 2개 이상이면 첫 번째 반환 (spec 위반).
+    pub fn find_lm_head_entry(&self) -> Option<&TensorEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.kind == TensorKind::LmHead.as_u32() && e.layer_idx == LAYER_IDX_CROSS)
+    }
+
     /// backend variant tag 문자열로 variant index를 조회한다.
     pub fn variant_index_for_tag(&self, weights_tag: &str) -> Option<usize> {
         self.variant_tags.iter().position(|t| {

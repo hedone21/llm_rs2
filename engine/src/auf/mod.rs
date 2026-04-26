@@ -37,10 +37,10 @@ pub mod writer;
 
 // 편의 re-export
 pub use error::{AufError, AufResult};
-pub use header::{AufHeader, HEADER_SIZE, READER_MAX_FORMAT_MAJOR};
+pub use header::{AufHeader, CAPABILITY_BIT_LM_HEAD_Q4_0, HEADER_SIZE, READER_MAX_FORMAT_MAJOR};
 pub use meta::AufMeta;
 pub use q4_0_soa::{QK4_0, q4_0_aos_to_adreno_soa, q4_0_aos_to_soa_unshuffled};
-pub use reader::{AufView, BackendTag, open};
+pub use reader::{AufView, BackendTag, LmHeadPayload, open};
 pub use section::{
     SECTION_COMPRESSED, SECTION_REQUIRED, SECTION_STRIPPABLE, SectionEntry, SectionTable, TAG_META,
     TAG_TENSOR_INDEX, TAG_TOKENIZER, TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS,
