@@ -369,6 +369,181 @@ impl TransformerModel {
         Ok(count)
     }
 
+    /// Quantize the F16 lm_head tensor to Q4_0 in place.
+    ///
+    /// Sprint F (2026-04-26): TBT root-cause fix. F16 GGUF retains lm_head as
+    /// F16 (~524 MB on Llama 3.2 1B), while Q4 GGUF derives it from Q4_0
+    /// embed_tokens (~64 MB). On Adreno, an F16×F16 lm_head matmul costs
+    /// ~8.4 ms/call vs ~3.8 ms/call for F16×Q4_0 — a +4.6 ms/tok gap that
+    /// dominates the "ratio=1.0 mixed" TBT regression because lm_head is not
+    /// covered by the AUF swap registry (transformer layers only).
+    ///
+    /// Quantizing lm_head at load time (one-shot, ~hundreds of ms) recovers
+    /// the gap with zero per-token overhead. Embed_tokens stays F16 even on
+    /// tied-weight models — the gather/lookup path requires a non-quantized
+    /// dtype, and after this call lm_head becomes a separate Q4_0 tensor
+    /// (the original tied F16 buffer is preserved through `gpu_embed_tokens`
+    /// and `embed_tokens`).
+    ///
+    /// Behaviour:
+    /// - F16 lm_head present (CPU or GPU): dequantize to F32, requantize to
+    ///   Q4_0 blocks, build a fresh CPU Q4_0 SharedBuffer tensor, and upload
+    ///   to GPU via `backend.copy_weight_from()` when the active backend is
+    ///   GPU. Preserve `lm_head_on_cpu` semantics.
+    /// - lm_head already Q4_0: no-op (return Ok(false)).
+    /// - F32 lm_head: same path (skip dequant, quantize directly).
+    /// - vocab dim must be a multiple of 32 (Q4_0 block size). Most
+    ///   Llama-family vocabs satisfy this (Llama 3.2 1B vocab=128256).
+    ///
+    /// Returns `Ok(true)` if quantization happened, `Ok(false)` if lm_head
+    /// was already Q4_0 (or smaller-than-block dims; unsupported case).
+    ///
+    /// `runtime_backend` is the backend that owns lm_head's `cl_mem` (i.e. the
+    /// backend the model is currently running on). On GPU primary, callers
+    /// must pass the OpenCL/CUDA backend here — `Tensor::backend()` may still
+    /// point at the CPU loader because `copy_weight_from` preserves the
+    /// source tensor's backend reference.
+    pub fn quantize_lm_head_to_q4_0(&mut self, runtime_backend: &Arc<dyn Backend>) -> Result<bool> {
+        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::models::loader::convert::quantize_q4_0;
+        use half::f16;
+
+        // Already quantized — nothing to do.
+        if self.lm_head.dtype() == DType::Q4_0 {
+            return Ok(false);
+        }
+        // Q4_0 layout requires the inner dim to be a multiple of 32.
+        let dims = self.lm_head.shape().dims();
+        if dims.len() < 2 {
+            return Err(anyhow!(
+                "quantize_lm_head_to_q4_0: lm_head must be at least 2-D (got {:?})",
+                dims
+            ));
+        }
+        let cols = dims[dims.len() - 1];
+        let rows: usize = dims[..dims.len() - 1].iter().product();
+        if !cols.is_multiple_of(crate::core::quant::QK4_0) {
+            return Err(anyhow!(
+                "quantize_lm_head_to_q4_0: last dim ({}) is not a multiple of {} (Q4_0 block size)",
+                cols,
+                crate::core::quant::QK4_0,
+            ));
+        }
+
+        let backend = runtime_backend.clone();
+        let is_gpu = backend.name() == "OpenCL" || backend.name() == "cuda-embedded";
+        let numel = rows * cols;
+
+        // Step 1: read lm_head data into an F32 host buffer (dequantize as
+        // needed). For GPU-resident tensors with `as_ptr() == null` we route
+        // through `read_buffer`. For CPU-resident or mapped UnifiedBuffer
+        // tensors we read directly via the host pointer.
+        let mut f32_data = vec![0.0f32; numel];
+        let dtype_in = self.lm_head.dtype();
+        let bytes_in = self.lm_head.size();
+        let host_ptr = self.lm_head.as_ptr();
+        let mut bytes_buf = vec![0u8; bytes_in];
+        let src_bytes: &[u8] = if !host_ptr.is_null() {
+            // Safety: host_ptr is non-null and the buffer reports `bytes_in` valid bytes.
+            unsafe { std::slice::from_raw_parts(host_ptr, bytes_in) }
+        } else {
+            // Use the runtime backend (not Tensor::backend(), which may still
+            // point at the CPU loader for tied-weight uploads).
+            backend.read_buffer(&self.lm_head, &mut bytes_buf)?;
+            &bytes_buf
+        };
+        match dtype_in {
+            DType::F16 => {
+                let src_u16 =
+                    unsafe { std::slice::from_raw_parts(src_bytes.as_ptr() as *const u16, numel) };
+                for (i, &b) in src_u16.iter().enumerate() {
+                    f32_data[i] = f16::from_bits(b).to_f32();
+                }
+            }
+            DType::F32 => {
+                let src_f32 =
+                    unsafe { std::slice::from_raw_parts(src_bytes.as_ptr() as *const f32, numel) };
+                f32_data.copy_from_slice(src_f32);
+            }
+            DType::BF16 => {
+                let src_u16 =
+                    unsafe { std::slice::from_raw_parts(src_bytes.as_ptr() as *const u16, numel) };
+                for (i, &b) in src_u16.iter().enumerate() {
+                    f32_data[i] = half::bf16::from_bits(b).to_f32();
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "quantize_lm_head_to_q4_0: unsupported source dtype {:?}",
+                    other
+                ));
+            }
+        }
+
+        // Step 2: quantize to Q4_0 blocks.
+        let blocks = quantize_q4_0(&f32_data, rows, cols);
+        let block_bytes = std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        let total_bytes = blocks.len() * block_bytes;
+        // Convert Vec<BlockQ4_0> → Vec<u8> without allocating twice.
+        let mut bytes_out: Vec<u8> = Vec::with_capacity(total_bytes);
+        // Safety: BlockQ4_0 is `#[repr(C)]` with no padding; reading its bytes
+        // through `from_raw_parts` is well-defined.
+        let block_bytes_view =
+            unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, total_bytes) };
+        bytes_out.extend_from_slice(block_bytes_view);
+
+        // Step 3: build a CPU SharedBuffer Q4_0 tensor.
+        let cpu_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes_out, DType::Q4_0));
+        let cpu_shape = self.lm_head.shape().clone();
+        // Find a CPU backend reference. Prefer the model's stored cpu_backend,
+        // otherwise instantiate a fresh one. SharedBuffer is dtype-only — the
+        // backend is only used as a tag here.
+        let cpu_backend: Arc<dyn Backend> = if let Some(ref cb) = self.cpu_backend {
+            cb.clone()
+        } else if !is_gpu {
+            backend.clone()
+        } else {
+            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>
+        };
+        let cpu_tensor = Tensor::new(cpu_shape, cpu_buf, cpu_backend);
+
+        // Step 4: install. When the model runs on GPU and lm_head was on GPU,
+        // upload the new Q4_0 tensor through `copy_weight_from`. When lm_head
+        // was already on CPU (large-vocab fallback), keep it on CPU.
+        let new_lm_head = if is_gpu && !self.lm_head_on_cpu {
+            backend.copy_weight_from(&cpu_tensor)?
+        } else {
+            cpu_tensor
+        };
+
+        // Step 5: tied-weight handling. If `gpu_embed_tokens` previously
+        // shared the lm_head buffer (tied), we must keep an F16 copy alive
+        // for embed gathers — don't let it become Q4_0. Detect this by
+        // checking whether the stored gpu_embed_tokens still has the same
+        // cl_mem as the *old* lm_head; if so, replace it with a fresh F16
+        // upload from `embed_tokens` (CPU F16) before swapping lm_head.
+        #[cfg(feature = "opencl")]
+        if is_gpu {
+            let old_lm_ptr = self.lm_head.buffer().as_ptr() as usize;
+            let shares_with_embed = self
+                .gpu_embed_tokens
+                .as_ref()
+                .map(|t| t.buffer().as_ptr() as usize == old_lm_ptr)
+                .unwrap_or(false);
+            if shares_with_embed {
+                let fresh_embed = backend.copy_weight_from(&self.embed_tokens)?;
+                self.gpu_embed_tokens = Some(fresh_embed);
+            }
+        }
+
+        self.lm_head = new_lm_head;
+        eprintln!(
+            "[quantize_lm_head] {:?} → Q4_0 ({} → {} bytes, {} rows × {} cols)",
+            dtype_in, bytes_in, total_bytes, rows, cols,
+        );
+        Ok(true)
+    }
+
     /// Make GPU-primary weight buffers CPU-accessible by mapping UnifiedBuffers.
     ///
     /// When `--backend opencl` with `use_zero_copy=true`, `copy_from()` creates

@@ -1,0 +1,71 @@
+=== Q4 baseline (auto) ===
+--- run 1 ---
+Decode: 16.32 ms/tok (61.3 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 16.30 ms/tok (61.3 tok/s) [126 tokens] | tok[0]=17.67 ms
+Avg TBT: 17.77 ms (56.3 tokens/sec)
+--- run 2 ---
+Decode: 16.33 ms/tok (61.2 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 16.32 ms/tok (61.3 tok/s) [126 tokens] | tok[0]=17.13 ms
+Avg TBT: 17.90 ms (55.9 tokens/sec)
+--- run 3 ---
+Decode: 16.29 ms/tok (61.4 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 16.29 ms/tok (61.4 tok/s) [126 tokens] | tok[0]=16.66 ms
+Avg TBT: 17.84 ms (56.1 tokens/sec)
+
+=== Mixed AUF ratio=1.0 (auto) ===
+--- run 1 ---
+[Backend] Quantized lm_head → Q4_0 in 1683.6 ms (mode=auto)
+weight_swap: force ratio=1.00, swapped 16/16 layers in 497.9ms
+Decode: 14.53 ms/tok (68.8 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 14.50 ms/tok (69.0 tok/s) [126 tokens] | tok[0]=18.68 ms
+Avg TBT: 16.03 ms (62.4 tokens/sec)
+--- run 2 ---
+[Backend] Quantized lm_head → Q4_0 in 897.2 ms (mode=auto)
+weight_swap: force ratio=1.00, swapped 16/16 layers in 419.4ms
+Decode: 15.04 ms/tok (66.5 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 15.01 ms/tok (66.6 tok/s) [126 tokens] | tok[0]=18.64 ms
+Avg TBT: 17.51 ms (57.1 tokens/sec)
+--- run 3 ---
+[Backend] Quantized lm_head → Q4_0 in 1571.8 ms (mode=auto)
+weight_swap: force ratio=1.00, swapped 16/16 layers in 517.5ms
+Decode: 14.51 ms/tok (68.9 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 14.47 ms/tok (69.1 tok/s) [126 tokens] | tok[0]=18.90 ms
+Avg TBT: 16.02 ms (62.4 tokens/sec)
+
+=== Mixed AUF ratio=0.5 (auto) ===
+--- run 1 ---
+[Backend] Quantized lm_head → Q4_0 in 1627.4 ms (mode=auto)
+weight_swap: force ratio=0.50, swapped 8/16 layers in 307.8ms
+Decode: 26.28 ms/tok (38.1 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 26.24 ms/tok (38.1 tok/s) [126 tokens] | tok[0]=30.77 ms
+Avg TBT: 29.58 ms (33.8 tokens/sec)
+--- run 2 ---
+[Backend] Quantized lm_head → Q4_0 in 983.9 ms (mode=auto)
+weight_swap: force ratio=0.50, swapped 8/16 layers in 322.7ms
+Decode: 25.46 ms/tok (39.3 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 25.43 ms/tok (39.3 tok/s) [126 tokens] | tok[0]=29.71 ms
+Avg TBT: 27.35 ms (36.6 tokens/sec)
+--- run 3 ---
+[Backend] Quantized lm_head → Q4_0 in 1451.7 ms (mode=auto)
+weight_swap: force ratio=0.50, swapped 8/16 layers in 267.2ms
+Decode: 26.76 ms/tok (37.4 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 26.73 ms/tok (37.4 tok/s) [126 tokens] | tok[0]=30.48 ms
+Avg TBT: 29.93 ms (33.4 tokens/sec)
+
+=== Mixed AUF ratio=1.0 + --quantize-lm-head=none (regression) ===
+--- run 1 ---
+weight_swap: force ratio=1.00, swapped 16/16 layers in 659.6ms
+Decode: 21.08 ms/tok (47.4 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 21.03 ms/tok (47.6 tok/s) [126 tokens] | tok[0]=27.97 ms
+Avg TBT: 23.28 ms (43.0 tokens/sec)
+--- run 2 ---
+weight_swap: force ratio=1.00, swapped 16/16 layers in 457.6ms
+Decode: 21.47 ms/tok (46.6 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 21.44 ms/tok (46.6 tok/s) [126 tokens] | tok[0]=24.76 ms
+Avg TBT: 23.96 ms (41.7 tokens/sec)
+--- run 3 ---
+weight_swap: force ratio=1.00, swapped 16/16 layers in 575.7ms
+Decode: 20.41 ms/tok (49.0 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 20.37 ms/tok (49.1 tok/s) [126 tokens] | tok[0]=25.97 ms
+Avg TBT: 23.02 ms (43.4 tokens/sec)
+

@@ -261,6 +261,24 @@ struct Args {
     #[arg(long, default_value = "f16")]
     weight_dtype: String,
 
+    /// One-shot lm_head quantization at load time (`auto` | `none` | `q4_0`).
+    ///
+    /// Sprint F (2026-04-26): Recovers the +4.6 ms/tok Adreno gap that
+    /// dominates "ratio=1.0 mixed" weight-swap regressions. F16 GGUFs ship
+    /// lm_head as F16 (~524 MB), while Q4 GGUFs derive it from Q4_0
+    /// embed_tokens. Quantizing lm_head once at load time matches the Q4
+    /// baseline cost (~3.8 ms/call) without touching the AUF format.
+    /// Embed_tokens stays untouched even on tied-weight models. No-op if
+    /// lm_head is already Q4_0.
+    ///
+    /// `auto` (default): quantize when `--secondary-gguf` is set AND lm_head
+    /// is currently F16/F32 (production-safe — pure win, no regression on
+    /// Q4 baseline because lm_head is already Q4_0 there).
+    /// `q4_0`: force quantize regardless of secondary-gguf presence.
+    /// `none`: never quantize (legacy/diagnostic behaviour).
+    #[arg(long, default_value = "auto")]
+    quantize_lm_head: String,
+
     /// KV cache data type (f32, f16, or q4)
     #[arg(long, default_value = "f16")]
     kv_type: String,
@@ -1041,6 +1059,42 @@ fn main() -> anyhow::Result<()> {
             ),
             Ok(_) => {} // All weights already CPU-accessible
             Err(e) => eprintln!("[Backend] Weight mapping failed (switch may crash): {}", e),
+        }
+    }
+
+    // Sprint F (2026-04-26): one-shot lm_head Q4_0 quantization. Closes the
+    // F16-vs-Q4 lm_head matmul gap that drives the ratio=1.0 mixed weight-swap
+    // TBT regression. Runs once after weights are GPU-resident; embed_tokens
+    // stays untouched even on tied-weight models.
+    //
+    // `auto` (default): on when `--secondary-gguf` is set AND lm_head is
+    // not already Q4_0. Pure win for AUF/weight-swap users; no-op on Q4
+    // baseline (lm_head already Q4_0 → quantize_lm_head_to_q4_0 returns
+    // false). Skipped on plain F16-only runs to preserve legacy behaviour.
+    let qlm = args.quantize_lm_head.to_ascii_lowercase();
+    let do_quantize_lm_head = match qlm.as_str() {
+        "none" | "off" => false,
+        "auto" | "" => args.secondary_gguf.is_some(),
+        "q4_0" | "q4" => true,
+        other => anyhow::bail!(
+            "Unknown --quantize-lm-head value: {}. Use 'auto', 'none', or 'q4_0'.",
+            other
+        ),
+    };
+    if do_quantize_lm_head {
+        let t_q = std::time::Instant::now();
+        match model.quantize_lm_head_to_q4_0(&backend) {
+            Ok(true) => eprintln!(
+                "[Backend] Quantized lm_head → Q4_0 in {:.1} ms (mode={})",
+                t_q.elapsed().as_secs_f64() * 1000.0,
+                qlm
+            ),
+            Ok(false) => {
+                if qlm == "q4_0" || qlm == "q4" {
+                    eprintln!("[Backend] lm_head already Q4_0 — quantize skipped");
+                }
+            }
+            Err(e) => anyhow::bail!("--quantize-lm-head failed: {e}"),
         }
     }
 

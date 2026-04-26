@@ -1,0 +1,51 @@
+=== Q4 baseline ===
+--- run 1 ---
+Decode: 16.41 ms/tok (60.9 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 16.39 ms/tok (61.0 tok/s) [126 tokens] | tok[0]=18.42 ms
+Avg TBT: 18.01 ms (55.5 tokens/sec)
+--- run 2 ---
+Decode: 16.42 ms/tok (60.9 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 16.41 ms/tok (61.0 tok/s) [126 tokens] | tok[0]=17.67 ms
+Avg TBT: 18.02 ms (55.5 tokens/sec)
+--- run 3 ---
+Decode: 16.37 ms/tok (61.1 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 16.35 ms/tok (61.2 tok/s) [126 tokens] | tok[0]=18.88 ms
+Avg TBT: 17.80 ms (56.2 tokens/sec)
+
+=== Mixed C-2 baseline (lm_head=F16) ===
+--- run 1 ---
+weight_swap: force ratio=1.00, swapped 16/16 layers in 483.3ms
+Decode: 20.00 ms/tok (50.0 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 19.95 ms/tok (50.1 tok/s) [126 tokens] | tok[0]=26.94 ms
+Avg TBT: 21.94 ms (45.6 tokens/sec)
+--- run 2 ---
+weight_swap: force ratio=1.00, swapped 16/16 layers in 341.7ms
+Decode: 20.48 ms/tok (48.8 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 20.44 ms/tok (48.9 tok/s) [126 tokens] | tok[0]=25.32 ms
+Avg TBT: 22.16 ms (45.1 tokens/sec)
+--- run 3 ---
+weight_swap: force ratio=1.00, swapped 16/16 layers in 405.4ms
+Decode: 20.14 ms/tok (49.7 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 20.11 ms/tok (49.7 tok/s) [126 tokens] | tok[0]=24.05 ms
+Avg TBT: 21.50 ms (46.5 tokens/sec)
+
+=== Mixed C-2 + lm_head Q4_0 ===
+--- run 1 ---
+[Backend] Quantized lm_head → Q4_0 in 1521.4 ms
+weight_swap: force ratio=1.00, swapped 16/16 layers in 480.0ms
+Decode: 15.23 ms/tok (65.7 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 15.18 ms/tok (65.9 tok/s) [126 tokens] | tok[0]=21.54 ms
+Avg TBT: 18.48 ms (54.1 tokens/sec)
+--- run 2 ---
+[Backend] Quantized lm_head → Q4_0 in 820.2 ms
+weight_swap: force ratio=1.00, swapped 16/16 layers in 414.0ms
+Decode: 14.77 ms/tok (67.7 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 14.74 ms/tok (67.9 tok/s) [126 tokens] | tok[0]=18.50 ms
+Avg TBT: 16.53 ms (60.5 tokens/sec)
+--- run 3 ---
+[Backend] Quantized lm_head → Q4_0 in 1644.6 ms
+weight_swap: force ratio=1.00, swapped 16/16 layers in 435.8ms
+Decode: 14.52 ms/tok (68.9 tok/s) [127 tokens, forward only]
+Decode(excl tok[0]): 14.48 ms/tok (69.0 tok/s) [126 tokens] | tok[0]=18.63 ms
+Avg TBT: 15.96 ms (62.7 tokens/sec)
+
