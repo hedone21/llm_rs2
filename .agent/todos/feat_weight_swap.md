@@ -38,7 +38,7 @@
 | **3.7b — AUF v0.1 self-contained format** | ARGUS_W magic + 256B header + section table. META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* sections. auf-tool CLI. ENG-DAT-096, ENG-ALG-223, INV-132~134. | 5 | 4~6일 | **CURRENT** | P1 |
 | **3.7c — UMA zero-copy** | AUF mmap → `CL_MEM_USE_HOST_PTR`. swap latency < 5ms/layer 목표. | 1 | 2~3일 | DEFERRED (Phase 5 가능) | P3 |
 | **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | DONE (2026-04-26, `2900f5f`, border-line) | P2 |
-| **5 — Phase 4 후속 4개 sprint** | cold-path 균일화 / INV-122 full sweep / TBT gap 진단 / KIVI mixed fallback | 4 | 8–12일 | **CURRENT** | P1~P2 |
+| **5 — Phase 4 후속 sprint (Sprint A 종결, B 진행)** | Sprint A: COLD-UNIFORM(부분 충족 종결) + INV122-SWEEP(spec 위임) — 2026-04-26 완료. Sprint B: TBT-DIAG(진행중) + INV122-SPEC(진행중). C: KIVI fallback(대기) | 5 | 8–12일 | **CURRENT** | P1~P2 |
 
 **진행 순서 강제**: Phase 1 → 2 → 3 → 3.5 → 3.6 → **3.7a → 3.7b** → 4.
 - Phase 3.7a와 3.7b는 별도 PR로 분리 가능하지만, 3.7a는 Phase 4 진입 필수 머지 (INV-131 + Q4_0 swap 정확성).
@@ -924,8 +924,9 @@
 
 ## [P1] WSWAP-5-COLD-UNIFORM. cold-path 균일화 (mmap_permute 양봉 53/36 ms 해소)
 
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE (2026-04-26, `ca7aaeb`, **부분 충족 / 사용자 종결**)
+- **결과 요약**: per-layer p50 52.8→51.6 ms (3.2% 초과, 점진 개선). 변동 폭 ±25%→±13.6% (절반 감소). 적용 C(madvise+warmup), 1966 tests PASS. 본질 미충족(SLA <50ms / ±10% 둘 다 미달) 사유로 사용자 종결 결정 — 후속(C2 mlock / C3 async / C4 posix_fadvise)은 ROI 낮아 미진행.
+- **Sprint**: closed
 - **Dependencies**: 없음 (Phase 4 자산 활용)
 - **담당 권장**: Senior Implementer (`secondary_mmap.rs` + AUF mmap demand-paging 영역)
 - **추정 작업량**: M (3~5일)
@@ -954,8 +955,9 @@
 
 ## [P1] WSWAP-5-INV122-SWEEP. INV-122 full 100-prompt sweep
 
-- **Status**: TODO
-- **Sprint**: current
+- **Status**: DONE (2026-04-26, `6e1979d`, **측정 성공 / 임계값 FAIL → spec 조정**)
+- **결과 요약**: 500 runs (100 prompt × 5 ratio), wall-clock 69분, 정확성 회귀 0건. ratio=1.0에서 NMSE p50=0.00964 PASS / p95=0.03744 FAIL, Δtop-1=76.56pp FAIL. **본질 진단**: 32-token greedy decode 누적 drift로 단일-token 기준 임계값과 미스매치 (ratio=0.25에서도 Δtop-1=44.85pp). 사용자 결정 — 옵션 A(단일-token NMSE 재정의) 채택, Architect에게 spec 위임 (WSWAP-5-INV122-SPEC).
+- **Sprint**: closed
 - **Dependencies**: 없음 (Phase 4 자산 + 신규 AUF 활용)
 - **담당 권장**: Tester (측정) + Architect (spec 임계값 조정 시)
 - **추정 작업량**: S (1~2일, 측정 시간 제외)
@@ -980,9 +982,35 @@
   - V10 thermal isolation 준수
   - 100-prompt 측정은 디바이스 wall-clock 시간이 길 수 있음 — 필요 시 백그라운드 배치
 
+## [P1] WSWAP-5-INV122-SPEC. INV-122 v2.1 spec 재정의 (단일-token NMSE)
+
+- **Status**: IN_PROGRESS (2026-04-26, Architect 백그라운드 진행)
+- **Sprint**: current
+- **Dependencies**: WSWAP-5-INV122-SWEEP (DONE) — sweep 결과로 임계값-측정 미스매치 확정
+- **담당**: Architect (spec/arch 문서만, 코드 수정 없음)
+- **추정 작업량**: S (1일)
+- **Description**:
+  - Sprint A INV-122 sweep 결과 32-token decode 누적 drift로 단일-token 기준 임계값(NMSE ≤ 0.01, Δtop-1 ≤ 1pp)과 미스매치 발견
+  - 사용자 결정 — 옵션 A: 단일 next-token NMSE로 재정의 (학술 표준, Phase 4 mean=0.0062 자료 재사용)
+  - **scope**:
+    - spec/41-invariants.md INV-122 v2.1 갱신 (단일-token + 측정 protocol)
+    - spec/32-engine-algorithms.md §3.12.6 본문 갱신 (책임 분리: 단일-token vs decode window)
+    - arch/weight_swap.md §5.1 측정 방법론 보완 (decoupling principle)
+    - changelog 추가
+    - cross-reference 정합 검증 (`grep -r INV-122 spec/ arch/`)
+- **Acceptance Criteria**:
+  - spec INV-122 v2.1 단일-token 재정의 완료
+  - Phase 4 자료(mean=0.0062, +0.33pp)가 신 spec 기준 PASS임 명시
+  - cross-ref 정합
+  - 자동 커밋
+  - spec 테스트 코드 docstring 갱신은 후속 (Implementer 별도 위임 시 표시)
+- **Notes**:
+  - INV-131/132/133/134 (AUF 관련) 영향 없음
+  - 보조 metric (ROUGE-L, top-5 overlap) 임계값 게이트 아닌 회귀 보조용으로 명시
+
 ## [P2] WSWAP-5-TBT-DIAG. ratio=1.0 mixed −20.7% TBT gap 진단 (cl_mem fragmentation 가설)
 
-- **Status**: TODO
+- **Status**: IN_PROGRESS (2026-04-26, Senior Implementer 백그라운드 진행, Sprint B 시작)
 - **Sprint**: current
 - **Dependencies**: 없음 (Phase 4 측정 자산 활용)
 - **담당 권장**: Senior Implementer (OpenCL backend / cl_mem 통계 영역) + Tester (per-layer profiling)
