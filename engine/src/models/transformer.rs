@@ -548,18 +548,19 @@ impl TransformerModel {
     ///
     /// # Contract
     ///
-    /// `payload.bytes` is already SOA-converted (WEIGHTS_ADRENO_SOA) or AOS
-    /// (WEIGHTS_CPU_AOS / WEIGHTS_CUDA_AOS), as determined by the AUF writer
-    /// at build time. This function wraps the bytes into a Q4_0 SharedBuffer,
-    /// uploads to GPU via `copy_weight_from`, and installs it as `self.lm_head`.
+    /// `payload.bytes` layout depends on the backend variant:
     ///
-    /// For ADRENO_SOA, the payload follows the same q/d packing used by
-    /// `SecondaryMmap::split_pre_converted_soa`: `q_buf` (`num_blocks * 16` B)
-    /// followed by `d_buf` (`num_blocks * 2` B). The NoshuffleWeightBuffer
-    /// registration path is intentionally NOT taken here — the runtime SOA
-    /// registration happens lazily via `ensure_noshuffle_soa_registered` in the
-    /// normal weight-upload path. We treat the AUF bytes as AOS Q4_0 and let
-    /// the backend handle SOA re-registration on first use (same as Sprint F).
+    /// - **WEIGHTS_ADRENO_SOA**: bytes are `q_buf(N*16) || d_buf(N*2)` — the
+    ///   same packed SOA format produced by `q4_0_aos_to_adreno_soa` and
+    ///   consumed by `split_pre_converted_soa`. This function splits the bytes
+    ///   and delegates to `Backend::alloc_pre_converted_soa_tensor` (registers
+    ///   a `NoshuffleWeightBuffer` + noshuffle SOA registry entry). If the
+    ///   backend returns `None` (CPU / driver cvt program missing), falls back
+    ///   to the AOS SharedBuffer path with a runtime re-conversion warning.
+    ///
+    /// - **WEIGHTS_CPU_AOS / WEIGHTS_CUDA_AOS**: bytes are raw Q4_0 AOS
+    ///   (18B/block, alignment-padded). Wrapped as `SharedBuffer<Q4_0>` and
+    ///   uploaded via `copy_weight_from`.
     ///
     /// Tied-weight handling: same as `quantize_lm_head_to_q4_0` — if
     /// `gpu_embed_tokens` shared the old lm_head cl_mem, we replace it with a
@@ -572,6 +573,7 @@ impl TransformerModel {
         payload: &crate::auf::reader::LmHeadPayload<'_>,
         runtime_backend: &Arc<dyn Backend>,
     ) -> Result<()> {
+        use crate::auf::section::TAG_WEIGHTS_ADRENO_SOA;
         use crate::buffer::shared_buffer::SharedBuffer;
 
         let backend = runtime_backend.clone();
@@ -584,36 +586,97 @@ impl TransformerModel {
                 dims
             ));
         }
-        let cols = dims[dims.len() - 1];
-        let rows: usize = dims[..dims.len() - 1].iter().product();
+        // ne01 = rows (vocab_size), ne00 = cols (hidden_dim).
+        let ne00 = dims[dims.len() - 1]; // cols
+        let ne01: usize = dims[..dims.len() - 1].iter().product(); // rows
 
-        // Validate expected byte size against payload length.
-        // Q4_0: num_blocks = rows * (cols / 32), each block = 18 bytes.
-        if !cols.is_multiple_of(crate::core::quant::QK4_0) {
+        if !ne00.is_multiple_of(crate::core::quant::QK4_0) {
             return Err(anyhow!(
                 "load_lm_head_from_auf: last dim ({}) is not a multiple of {} (Q4_0 block size)",
-                cols,
+                ne00,
                 crate::core::quant::QK4_0,
             ));
         }
-        let num_blocks = rows * (cols / crate::core::quant::QK4_0);
+        let num_blocks = ne01 * (ne00 / crate::core::quant::QK4_0);
         let expected_bytes = num_blocks * std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+
+        // payload size must equal N * 18 in all variants (SOA total size = AOS total size).
         if payload.bytes.len() != expected_bytes {
             return Err(anyhow!(
-                "load_lm_head_from_auf: payload size mismatch (expected {} bytes for {}×{} Q4_0, got {} bytes)",
+                "load_lm_head_from_auf: payload size mismatch \
+                 (expected {} bytes for {}×{} Q4_0, got {} bytes, variant={})",
                 expected_bytes,
-                rows,
-                cols,
-                payload.bytes.len()
+                ne01,
+                ne00,
+                payload.bytes.len(),
+                payload.variant_tag,
             ));
         }
 
-        // Build a CPU Q4_0 SharedBuffer tensor from the AUF payload bytes.
-        // The payload is a zero-copy mmap slice; we copy it into an owned Vec
-        // for the SharedBuffer (avoids lifetime coupling to the mmap).
+        let shape = self.lm_head.shape().clone();
+
+        // ── ADRENO_SOA path: split q_buf/d_buf, register NoshuffleWeightBuffer ──
+        //
+        // payload.bytes = q_buf(N*16) || d_buf(N*2).  Matches the same layout
+        // produced by `build_variant_payload` (TAG_WEIGHTS_ADRENO_SOA) and
+        // consumed by `SecondaryMmap::split_pre_converted_soa`.
+        if payload.variant_tag == TAG_WEIGHTS_ADRENO_SOA && is_gpu && !self.lm_head_on_cpu {
+            let q_len = num_blocks * 16;
+            let d_len = num_blocks * 2;
+            debug_assert_eq!(q_len + d_len, expected_bytes);
+            let q_bytes = &payload.bytes[..q_len];
+            let d_bytes = &payload.bytes[q_len..q_len + d_len];
+
+            match backend.alloc_pre_converted_soa_tensor(
+                shape.clone(),
+                q_bytes,
+                d_bytes,
+                ne00,
+                ne01,
+            )? {
+                Some(soa_tensor) => {
+                    // Tied-weight handling (same as AOS path below).
+                    #[cfg(feature = "opencl")]
+                    {
+                        let old_lm_ptr = self.lm_head.buffer().as_ptr() as usize;
+                        let shares_with_embed = self
+                            .gpu_embed_tokens
+                            .as_ref()
+                            .map(|t| t.buffer().as_ptr() as usize == old_lm_ptr)
+                            .unwrap_or(false);
+                        if shares_with_embed {
+                            let fresh_embed = backend.copy_weight_from(&self.embed_tokens)?;
+                            self.gpu_embed_tokens = Some(fresh_embed);
+                        }
+                    }
+                    self.lm_head = soa_tensor;
+                    eprintln!(
+                        "[lm_head] loaded from AUF SOA payload ({} MB, {}×{}, variant={})",
+                        payload.bytes.len() / (1024 * 1024),
+                        ne01,
+                        ne00,
+                        payload.variant_tag,
+                    );
+                    return Ok(());
+                }
+                None => {
+                    // Backend SOA path unavailable (CPU or driver program missing).
+                    // Fall through to AOS SharedBuffer path with runtime re-conversion.
+                    eprintln!(
+                        "[lm_head] AUF ADRENO_SOA SOA alloc skipped (backend returned None); \
+                         falling back to AOS SharedBuffer + runtime re-conversion"
+                    );
+                }
+            }
+        }
+
+        // ── AOS path: CPU_AOS / CUDA_AOS (or ADRENO_SOA SOA alloc fallback) ──
+        //
+        // payload.bytes for CPU_AOS/CUDA_AOS: raw AOS Q4_0 (18B/block, padded).
+        // For ADRENO_SOA fallback: bytes are actually SOA-packed — the backend's
+        // `ensure_noshuffle_soa_registered` will re-convert them at runtime.
         let bytes_owned: Vec<u8> = payload.bytes.to_vec();
         let cpu_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes_owned, DType::Q4_0));
-        let cpu_shape = self.lm_head.shape().clone();
         let cpu_backend: Arc<dyn Backend> = if let Some(ref cb) = self.cpu_backend {
             cb.clone()
         } else if !is_gpu {
@@ -621,7 +684,7 @@ impl TransformerModel {
         } else {
             Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>
         };
-        let cpu_tensor = Tensor::new(cpu_shape, cpu_buf, cpu_backend);
+        let cpu_tensor = Tensor::new(shape, cpu_buf, cpu_backend);
 
         // Upload to GPU via copy_weight_from (same path as quantize_lm_head_to_q4_0).
         let new_lm_head = if is_gpu && !self.lm_head_on_cpu {
@@ -648,10 +711,10 @@ impl TransformerModel {
 
         self.lm_head = new_lm_head;
         eprintln!(
-            "[lm_head] loaded from AUF Q4_0 payload ({} bytes, {} rows × {} cols, variant={})",
-            payload.bytes.len(),
-            rows,
-            cols,
+            "[lm_head] loaded from AUF AOS payload ({} MB, {}×{}, variant={})",
+            payload.bytes.len() / (1024 * 1024),
+            ne01,
+            ne00,
             payload.variant_tag,
         );
         Ok(())
@@ -3225,5 +3288,161 @@ mod tests {
         for v in result {
             assert_eq!(*v, 102.0, "GPU path should take priority, expected 102.0");
         }
+    }
+
+    // ── load_lm_head_from_auf unit tests (Sprint G-1-E) ──────────────────────
+
+    /// Build a minimal TransformerModel with F16 lm_head (VOCAB×HIDDEN),
+    /// CPU backend only.
+    fn make_cpu_model_lm_head(vocab: usize, hidden: usize) -> (TransformerModel, Arc<dyn Backend>) {
+        use crate::buffer::shared_buffer::SharedBuffer;
+        use crate::memory::galloc::Galloc;
+        let cpu_be: Arc<dyn Backend> = Arc::new(CpuBackend::new());
+        let mem = Galloc::new();
+
+        // embed_tokens: F16, (vocab, hidden)
+        let embed_buf = mem.alloc(vocab * hidden * 2, DType::F16).unwrap();
+        let embed = Tensor::new(Shape::new(vec![vocab, hidden]), embed_buf, cpu_be.clone());
+
+        // norm: F32, (hidden,)
+        let norm_buf = mem.alloc(hidden * 4, DType::F32).unwrap();
+        let norm = Tensor::new(Shape::new(vec![hidden]), norm_buf, cpu_be.clone());
+
+        // lm_head: F16, (vocab, hidden) — will be replaced by load_lm_head_from_auf.
+        let lm_head_buf = Arc::new(SharedBuffer::new(vocab * hidden * 2, DType::F16));
+        let lm_head = Tensor::new(Shape::new(vec![vocab, hidden]), lm_head_buf, cpu_be.clone());
+
+        let config = ModelConfig {
+            vocab_size: vocab,
+            hidden_size: hidden,
+            num_hidden_layers: 0,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: hidden,
+            rms_norm_eps: 1e-5,
+            rope_theta: 500_000.0,
+            head_dim: hidden,
+            has_qkv_bias: false,
+            tie_word_embeddings: false,
+            eos_token_id: 2,
+            arch: crate::models::config::ModelArch::Llama,
+            rope_local_theta: None,
+            sliding_window: None,
+            sliding_window_pattern: None,
+            query_pre_attn_scalar: None,
+            embed_scale: None,
+            weight_prefix: String::new(),
+        };
+
+        let model = TransformerModel {
+            config,
+            layers: vec![],
+            embed_tokens: embed,
+            norm,
+            lm_head,
+            lm_head_on_cpu: false,
+            gpu_embed_tokens: None,
+            cpu_backend: None,
+            preload_pool: std::sync::Mutex::new(None),
+            secondary_mmap: None,
+            ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
+        };
+        (model, cpu_be)
+    }
+
+    /// G-1-E: load_lm_head_from_auf — CPU_AOS payload → dtype becomes Q4_0.
+    #[test]
+    fn load_lm_head_from_auf_cpu_aos_sets_q4_0_dtype() {
+        use crate::auf::reader::LmHeadPayload;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::TensorDType;
+
+        const VOCAB: usize = 64;
+        const HIDDEN: usize = 128;
+        const NUM_BLOCKS: usize = VOCAB * HIDDEN / 32;
+        let aos_bytes: Vec<u8> = (0..NUM_BLOCKS * 18).map(|i| i as u8).collect();
+
+        let (mut model, cpu_be) = make_cpu_model_lm_head(VOCAB, HIDDEN);
+        let payload = LmHeadPayload {
+            bytes: &aos_bytes,
+            shape: [VOCAB, HIDDEN],
+            dtype: TensorDType::Q4_0,
+            alignment: 65536,
+            variant_tag: TAG_WEIGHTS_CPU_AOS,
+        };
+
+        model.load_lm_head_from_auf(&payload, &cpu_be).unwrap();
+        assert_eq!(
+            model.lm_head.dtype(),
+            DType::Q4_0,
+            "lm_head dtype must be Q4_0 after AUF load"
+        );
+        assert_eq!(model.lm_head.size(), NUM_BLOCKS * 18);
+    }
+
+    /// G-1-E: load_lm_head_from_auf — size mismatch → Err.
+    #[test]
+    fn load_lm_head_from_auf_size_mismatch_err() {
+        use crate::auf::reader::LmHeadPayload;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::TensorDType;
+
+        const VOCAB: usize = 64;
+        const HIDDEN: usize = 128;
+        let wrong_bytes = vec![0u8; 100]; // clearly wrong size
+
+        let (mut model, cpu_be) = make_cpu_model_lm_head(VOCAB, HIDDEN);
+        let payload = LmHeadPayload {
+            bytes: &wrong_bytes,
+            shape: [VOCAB, HIDDEN],
+            dtype: TensorDType::Q4_0,
+            alignment: 65536,
+            variant_tag: TAG_WEIGHTS_CPU_AOS,
+        };
+
+        let result = model.load_lm_head_from_auf(&payload, &cpu_be);
+        assert!(result.is_err(), "size mismatch must return Err");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("payload size mismatch"),
+            "error must say 'payload size mismatch', got: {msg}"
+        );
+    }
+
+    /// G-1-E: load_lm_head_from_auf — bytes are preserved (CPU path).
+    #[test]
+    fn load_lm_head_from_auf_cpu_aos_bytes_preserved() {
+        use crate::auf::reader::LmHeadPayload;
+        use crate::auf::section::TAG_WEIGHTS_CPU_AOS;
+        use crate::auf::tensor_index::TensorDType;
+
+        const VOCAB: usize = 32;
+        const HIDDEN: usize = 64;
+        const NUM_BLOCKS: usize = VOCAB * HIDDEN / 32;
+        // Deterministic pattern.
+        let aos_bytes: Vec<u8> = (0..NUM_BLOCKS * 18)
+            .map(|i| ((i * 7 + 13) % 256) as u8)
+            .collect();
+
+        let (mut model, cpu_be) = make_cpu_model_lm_head(VOCAB, HIDDEN);
+        let payload = LmHeadPayload {
+            bytes: &aos_bytes,
+            shape: [VOCAB, HIDDEN],
+            dtype: TensorDType::Q4_0,
+            alignment: 65536,
+            variant_tag: TAG_WEIGHTS_CPU_AOS,
+        };
+
+        model.load_lm_head_from_auf(&payload, &cpu_be).unwrap();
+
+        // CPU path: SharedBuffer stores bytes directly.
+        let loaded =
+            unsafe { std::slice::from_raw_parts(model.lm_head.as_ptr(), model.lm_head.size()) };
+        assert_eq!(
+            loaded,
+            &aos_bytes[..],
+            "CPU_AOS: loaded bytes must match original AOS payload"
+        );
     }
 }

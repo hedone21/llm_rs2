@@ -126,6 +126,13 @@ mod test_auf_e2e_sanity;
 #[path = "spec/test_inv_135_136_lm_head_auf.rs"]
 mod test_inv_135_136_lm_head_auf;
 
+// ── Sprint G-1-E — AUF lm_head Q4_0 통합 정확성 검증 ──
+// 의문 1: ADRENO_SOA payload = q_buf||d_buf (SOA) layout 정합성.
+// 의문 2: payload.bytes.len() == N*18 (SOA 총 크기 = AOS 총 크기 불변).
+// Roundtrip, 후방 호환(INV-136), 숫자 정확성, SOA split 정합성.
+#[path = "spec/test_g1e_lm_head_integration.rs"]
+mod test_g1e_lm_head_integration;
+
 // ── Weight Swap INV-122 v2 — Mixed Precision Forward 정확성 ──
 // cond1: NMSE ≤ 0.01 (F16 baseline 대비), cond2: Δ top-1 ≤ 1 pp (Q4_0 baseline 대비).
 // 환경변수 LLM_RS_TEST_MODEL_F16 / LLM_RS_TEST_MODEL_Q4 미설정 시 graceful skip.
