@@ -37,7 +37,8 @@
 | **3.7a — SOA 재변환 safety net** | swap 직후 `convert_aos_to_soa()` + registry 등록. ENG-ALG-222, INV-131. Phase 3.6 후 발견된 "Paris 정답 + 후속 garbage" 해결. | 3 | 2~3일 | **CURRENT** | P1 |
 | **3.7b — AUF v0.1 self-contained format** | ARGUS_W magic + 256B header + section table. META/TOKENIZER/TENSOR_INDEX/WEIGHTS_* sections. auf-tool CLI. ENG-DAT-096, ENG-ALG-223, INV-132~134. | 5 | 4~6일 | **CURRENT** | P1 |
 | **3.7c — UMA zero-copy** | AUF mmap → `CL_MEM_USE_HOST_PTR`. swap latency < 5ms/layer 목표. | 1 | 2~3일 | DEFERRED (Phase 5 가능) | P3 |
-| **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | BLOCKED (3.7a 머지 후) | P2 |
+| **4 — 실측/튜닝** | Galaxy S25에서 PSS / swap latency / TBT 영향 실측, INV-122 임계값 조정 | 4 | 4–6일 | DONE (2026-04-26, `2900f5f`, border-line) | P2 |
+| **5 — Phase 4 후속 4개 sprint** | cold-path 균일화 / INV-122 full sweep / TBT gap 진단 / KIVI mixed fallback | 4 | 8–12일 | **CURRENT** | P1~P2 |
 
 **진행 순서 강제**: Phase 1 → 2 → 3 → 3.5 → 3.6 → **3.7a → 3.7b** → 4.
 - Phase 3.7a와 3.7b는 별도 PR로 분리 가능하지만, 3.7a는 Phase 4 진입 필수 머지 (INV-131 + Q4_0 swap 정확성).
@@ -842,10 +843,12 @@
 > **예상 기간**: 4–6일 (4개 작업)
 > **기대 효과**: production 적용 가능성 판단 + spec 값 확정.
 > **블로커**: Phase 3.5(plan invalidation) + Phase 3.6(SOA registry) + **Phase 3.7a(SOA 재변환 IMPL) 최소 머지 후 진입**. Phase 3.7b(AUF) 머지는 권장이지만 필수는 아님 — 3.7a 단독으로도 INV-122 통과 가능.
+>
+> **종결 (2026-04-26, HEAD `2900f5f`)**: SOA bypass 본격 구현 + 5차 디바이스 측정으로 per-layer p50 −74.4% (206→52.8 ms), soa_reconvert −90.1% (172→17 ms) 달성. 단 SLA <50 ms는 p50 5.7% 초과 border-line으로 사용자 수용. 잔여 4개 항목(cold-path 균일화 / INV-122 full sweep / TBT gap 진단 / KIVI mixed fallback)은 **Phase 5 별도 sprint**로 분리. 측정 자료: `results/data/weight_swap/phase_4_*.md`. 핸드오프: `project_weight_swap_phase4_handoff.md`.
 
 ## [P2] WSWAP-4-LATENCY. Swap latency 실측 (Galaxy S25)
-- **Status**: BLOCKED
-- **Sprint**: next
+- **Status**: DONE (2026-04-26, `2900f5f`, border-line)
+- **Sprint**: done
 - **Dependencies**: Phase 3.5 (WSWAP-3.5-IMPL) + Phase 3.6 (WSWAP-3.6-SOA) 머지 완료
 - **담당 권장**: Tester
 - **Description**:
@@ -860,8 +863,8 @@
 - **Notes**: R4 (Q/K permutation 비용) 여전히 유효. 측정 결과에 따라 "사전 permuted 파일 저장" 옵션 재검토.
 
 ## [P2] WSWAP-4-PSS. PSS 감소량 실측
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE (2026-04-26, `2900f5f`)
+- **Sprint**: done
 - **Dependencies**: WSWAP-4-LATENCY
 - **담당 권장**: Tester
 - **Description**:
@@ -876,8 +879,8 @@
 - **Notes**: Android 커널 버전 기록 필수. OnePlus/Pixel 디바이스에서도 sanity check (optional).
 
 ## [P2] WSWAP-4-TBT. TBT / 처리량 영향 측정
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: DONE (2026-04-26, `2900f5f`, gap 잔존)
+- **Sprint**: done
 - **Dependencies**: WSWAP-4-LATENCY
 - **담당 권장**: Tester
 - **Description**:
@@ -895,8 +898,8 @@
 - **Notes**: `--profile` 금지. `Decode: X ms/tok` 로그 라인 사용. V10 thermal isolation 준수.
 
 ## [P2] WSWAP-4-INV122. INV-122 임계값 실측 기반 조정
-- **Status**: TODO
-- **Sprint**: next
+- **Status**: PARTIAL (2026-04-26, greedy sanity 3건만; full sweep은 WSWAP-5-INV122-SWEEP로 이관)
+- **Sprint**: done
 - **Dependencies**: WSWAP-4-TBT
 - **담당 권장**: Tester (측정) + Architect (spec 업데이트)
 - **Description**:
@@ -909,6 +912,192 @@
   - `tests/spec/` 회귀 테스트 임계값 동기화
   - 리포트: `results/data/weight_swap/phase_4_accuracy.md`
 - **Notes**: QCF-PPL 상관은 기존에 증명됨 (KV eviction 정책) → PPL 별도 측정 불필요. QCF + forward 정확성만 측정.
+
+---
+
+# Phase 5 — Phase 4 후속 4개 sprint (2026-04-26 신설)
+
+> **목표**: Phase 4 종결 시점에 잔존한 4개 항목을 별도 sprint로 분리하여 처리. 각 항목은 독립 머지 가능하나 일부는 측정 자산을 공유.
+> **블로커**: Phase 4 종결 (`2900f5f`) — 해소됨.
+> **공통 자산**: 디바이스 신규 AUF (`Llama-3.2-1B-Instruct.auf`, sha256 `1a1ead0c...`, mtime 2026-04-26). 5-stage instrumentation (`engine/src/models/weights/swap_executor.rs`). 4차/5차 측정 결과 표 (`results/data/weight_swap/phase_4_*.md`).
+> **공통 측정 환경**: Galaxy S25 6T, V10 thermal isolation, `--profile` 미사용, wall-clock 기준.
+
+## [P1] WSWAP-5-COLD-UNIFORM. cold-path 균일화 (mmap_permute 양봉 53/36 ms 해소)
+
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (Phase 4 자산 활용)
+- **담당 권장**: Senior Implementer (`secondary_mmap.rs` + AUF mmap demand-paging 영역)
+- **추정 작업량**: M (3~5일)
+- **Description**:
+  - **목적/배경**: 5차 측정 per-layer 양봉 분포 (3 runs cold ~53 ms / 2 runs warm ~36 ms). SLA <50 ms p50 5.7% 초과의 직접 원인. AUF mmap demand-paging이 cold path에서 발생하는 것으로 추정 (`mmap_permute` stage가 5-stage instrumentation에서 가장 큰 변동 보임).
+  - **scope (in)**:
+    - 후보 A: `madvise(MADV_WILLNEED)` prefault — AUF mmap 직후 호출
+    - 후보 B: 명시적 warmup pass — swap 전 더미 read로 페이지 캐시 hit
+    - 후보 C: A+B 결합 + per-layer 단계 측정 재실행 비교
+    - 5-stage instrumentation 재활용하여 mmap_permute stage delta 정량화
+  - **scope (out)**:
+    - UMA zero-copy (Phase 3.7c 별도 trail)
+    - AUF 포맷 변경
+    - cl_mem 통합 작업 (WSWAP-5-TBT-DIAG 영역)
+- **Acceptance Criteria**:
+  - per-layer p50 < 50 ms (SLA 충족) **또는** cold/warm 변동 폭 < ±10%
+  - 5차 측정 대비 mmap_permute stage p50 단조 감소 (정량 표 갱신)
+  - INV-122 회귀 없음 (greedy sanity 통과)
+  - clippy clean, fmt clean
+  - 호스트 generate 회귀 없음
+  - 리포트: `results/data/weight_swap/phase_5_cold_path.md`
+- **Notes**:
+  - 참고 파일: `engine/src/models/weights/swap_executor.rs` (5-stage instrumentation), `engine/src/models/weights/secondary_mmap.rs`
+  - 자동 커밋 + `notify-send`.
+  - madvise는 Android 커널 버전별 동작 상이 가능 (R-new-3 참고). MADV_PAGEOUT/MADV_COLD와 혼동 주의.
+
+## [P1] WSWAP-5-INV122-SWEEP. INV-122 full 100-prompt sweep
+
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (Phase 4 자산 + 신규 AUF 활용)
+- **담당 권장**: Tester (측정) + Architect (spec 임계값 조정 시)
+- **추정 작업량**: S (1~2일, 측정 시간 제외)
+- **Description**:
+  - **목적/배경**: 5차 측정에서 time-budget으로 greedy sanity 3건만 진행. INV-122 v2 정식 acceptance 미충족.
+  - **scope (in)**:
+    - 100-prompt sweep으로 ratio=1.0 mixed AUF의 통계적 정확성 검증
+    - 측정: NMSE (logits), top-5 overlap, top-1 match, ROUGE-L (생성 텍스트)
+    - ratio={0.25, 0.5, 0.75, 1.0} 각각
+    - 4차/5차 결과 합본 표 작성 (`results/data/weight_swap/phase_4_accuracy.md`에 5th sweep 추가, 또는 `phase_5_accuracy.md` 신설)
+    - INV-122 v2 임계값(NMSE ≤ 0.01, Δtop-1 ≤ 1pp) 충족 여부 판정
+  - **scope (out)**:
+    - PPL 별도 측정 (QCF-PPL 상관 기존 증명)
+    - Qwen 등 타 모델 (Llama 3.2 1B 단일 타겟)
+- **Acceptance Criteria**:
+  - 100 prompt × 4 ratio 측정 완료
+  - NMSE ≤ 0.01 + Δtop-1 ≤ 1pp 통계적 검증 (ratio=1.0)
+  - 임계값 미달 시 spec/41-invariants.md INV-122 임계값 조정 PR 분리 (Architect 협업)
+  - 리포트: `results/data/weight_swap/phase_5_accuracy_sweep.md` 또는 `phase_4_accuracy.md` 5th sweep 섹션
+- **Notes**:
+  - 자산: 디바이스 신규 AUF (`Llama-3.2-1B-Instruct.auf`, sha256 `1a1ead0c...`, mtime 2026-04-26), `experiments/prompts/`
+  - V10 thermal isolation 준수
+  - 100-prompt 측정은 디바이스 wall-clock 시간이 길 수 있음 — 필요 시 백그라운드 배치
+
+## [P2] WSWAP-5-TBT-DIAG. ratio=1.0 mixed −20.7% TBT gap 진단 (cl_mem fragmentation 가설)
+
+- **Status**: TODO
+- **Sprint**: current
+- **Dependencies**: 없음 (Phase 4 측정 자산 활용)
+- **담당 권장**: Senior Implementer (OpenCL backend / cl_mem 통계 영역) + Tester (per-layer profiling)
+- **추정 작업량**: M (3~5일, 진단까지)
+- **Description**:
+  - **목적/배경**: ratio=1.0 mixed Decode TBT가 Q4 baseline 대비 −20.7% (느림). 가설: AUF SOA bypass에서도 16 layers × N tensors 별도 cl_mem 패턴이 attention slope를 증가시킬 가능성.
+  - **참고 메모**: `project_kv_fragmentation.md` — KV cache cl_mem fragmentation은 56개 별도 buffer가 HeadMajor attention slope +1.32 μs/n_kv 증가 (llama.cpp는 단일 cl_mem). 본 weight swap에서는 16 layers × N tensors 별도 cl_mem.
+  - **scope (in)**:
+    - AUF SOA path에서 cl_mem 개수 측정 (count + total bytes)
+    - steady-state attention timing per-layer profiling (TBT 분해)
+    - llama.cpp 단일 cl_mem 패턴과 비교 (reference)
+    - 가설 검증 결과 도출:
+      - (a) cl_mem fragmentation이 −20.7% gap의 주 원인 → 해소 sprint scope 정의 (후속)
+      - (b) 다른 원인 (예: register spill, scheduler overhead) → 원인 문서화
+  - **scope (out)**:
+    - 해소 구현 자체는 후속 sprint (이 sprint는 진단까지)
+    - cl_mem 통합 리팩토링 (별도 P1 sprint로 승급 시점에 결정)
+- **Acceptance Criteria**:
+  - cl_mem 개수 + 분포 표 (per-layer breakdown)
+  - per-layer attention timing 분해 (4차 baseline vs ratio=1.0 mixed)
+  - 가설 판정: fragmentation 주 원인 / 부분 원인 / 무관 중 하나로 결론
+  - 후속 sprint scope 1-2 페이지 design note (해소 방안 outline + 추정 effort)
+  - 리포트: `results/data/weight_swap/phase_5_tbt_diag.md`
+- **Notes**:
+  - 4차 측정 baseline은 `phase_4_*.md` 재활용
+  - llama.cpp cl_mem 패턴 참고: `reference_llama_cpp_source.md`
+  - `--profile` 금지. wall-clock 기준 (`feedback_opencl_profile_events_cross_engine.md` 준수)
+  - 진단 결과에 따라 후속 sprint는 P1로 승급 가능 (해소 implementation)
+
+## [P3] WSWAP-5-KIVI-FALLBACK. KIVI plan mixed state legacy fallback 진단
+
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음 (Phase 3.7a 발견 사항)
+- **담당 권장**: Implementer (plan path 영역) + Architect (legacy fallback 수용 결정 시)
+- **추정 작업량**: S (1~2일, 진단 + 결정)
+- **Description**:
+  - **목적/배경**: Phase 3.7a 부수 발견. mixed F16+Q4_0 state에서 KIVI plan path가 legacy fallback로 떨어짐. 정확성은 OK이나 성능 저하.
+  - **scope (in)**:
+    - 원인 진단: 어느 조건에서 plan path가 legacy fallback로 떨어지는지 (mixed state 감지 로직 / plan invalidation 트리거 / kernel selection)
+    - 영향 측정: legacy fallback의 TBT 영향 (현재 기본 ratio={0.25, 0.5, 1.0}에서)
+    - 결정:
+      - (a) plan path 수정 (mixed state 지원 추가)
+      - (b) legacy fallback 수용 + spec 명시
+    - 결정에 따라 후속 작업 정의 (수정 시 별도 sprint, 수용 시 본 sprint로 spec 갱신 마무리)
+  - **scope (out)**:
+    - plan path 대규모 리팩토링 (수정 결정 시 별도 sprint)
+    - KIVI 알고리즘 자체 변경
+- **Acceptance Criteria**:
+  - 원인 진단 1 페이지 design note (분기 조건 + 호출 stack)
+  - legacy fallback TBT 영향 정량 표
+  - 결정 (수정 / 수용) + 근거 기록
+  - 수용 결정 시: spec 갱신 PR (Architect 협업)
+  - 리포트: `results/data/weight_swap/phase_5_kivi_fallback.md` (또는 인라인 design note)
+- **Notes**:
+  - 참고: Phase 3.7 핸드오프 메모 (`project_weight_swap_phase37_handoff.md`)에 해당 기록 확인 필요
+  - 사용자 가치 낮음 (정확성 OK, 성능만 저하) → 우선순위 P3
+  - 4개 sprint 중 가장 후순위. 다른 3개 머지 후 진행 가능.
+
+---
+
+# Phase 5 우선순위 추천 (PM, 2026-04-26)
+
+> 4개 항목의 우선순위 ranking과 병행 가능 여부.
+
+## Ranking
+
+1. **WSWAP-5-COLD-UNIFORM (P1, 1순위)** — cold-path 균일화
+   - **사용자 가치**: 매우 높음. SLA <50 ms p50 5.7% 초과의 직접 해소. Phase 4 border-line acceptance를 정상 acceptance로 격상.
+   - **구현 risk**: 중. madvise/warmup은 표준 패턴이나 Android 커널 버전별 차이 존재 (R-new-3).
+   - **기존 측정 자료 활용도**: 매우 높음. 5-stage instrumentation + 5차 측정 표 그대로 재사용.
+   - **추정 effort**: M (3~5일).
+
+2. **WSWAP-5-INV122-SWEEP (P1, 2순위)** — INV-122 full sweep
+   - **사용자 가치**: 높음. Phase 4 정식 acceptance의 마지막 미충족 게이트. 통계적 정확성 보장.
+   - **구현 risk**: 낮음. 측정 작업이며 코드 변경 거의 없음.
+   - **기존 측정 자료 활용도**: 높음. 신규 AUF 디바이스 자산 + experiments/prompts 그대로 활용.
+   - **추정 effort**: S (1~2일, 디바이스 측정 시간 제외).
+
+3. **WSWAP-5-TBT-DIAG (P2, 3순위)** — TBT gap 진단
+   - **사용자 가치**: 중. ratio=1.0 mixed의 Decode 처리량 회복은 production 가치 있으나, ratio=1.0은 critical scenario 한정 → 우선순위 차순.
+   - **구현 risk**: 낮음 (진단까지). 해소 구현은 후속 sprint로 분리되어 risk 격리.
+   - **기존 측정 자료 활용도**: 높음. 4차 baseline + llama.cpp 비교 자료 그대로.
+   - **추정 effort**: M (3~5일, 진단까지).
+
+4. **WSWAP-5-KIVI-FALLBACK (P3, 4순위)** — KIVI mixed fallback
+   - **사용자 가치**: 낮음. 정확성 OK, 성능만 저하. 사용자 영향 제한적.
+   - **구현 risk**: 낮음 (진단까지).
+   - **기존 측정 자료 활용도**: 중. 별도 측정 필요.
+   - **추정 effort**: S (1~2일, 진단 + 결정).
+
+## 병행 가능 여부
+
+| 조합 | 병행 가능 | 근거 |
+|------|----------|------|
+| 1 + 2 | ✅ 권장 | 코드 영역 무관 (cold-path는 swap_executor/secondary_mmap, sweep은 측정 작업). 디바이스 측정 시간 슬롯이 겹칠 수 있으나 prompt set만 분리하면 동시 진행 가능. |
+| 1 + 3 | ✅ 가능 | cold-path는 mmap demand-paging, TBT-DIAG는 cl_mem fragmentation. 코드 영역 다름. 단 둘 다 디바이스 측정 자원 사용 → 시간 분할 필요. |
+| 2 + 3 | ✅ 가능 | 둘 다 측정 중심. 디바이스 시간 슬롯 분배만 필요. |
+| 1 + 4 | ✅ 가능 | 코드 영역 무관. KIVI는 plan path, cold-path는 mmap. |
+| 모든 항목 동시 | ⚠️ 비권장 | 디바이스 측정 자원 경합 + 결과 해석 시 변수 분리 어려움. 1+2 우선 진행 후 3+4 후속 권장. |
+
+## 권장 진행 순서
+
+```
+Sprint A (1주):  WSWAP-5-COLD-UNIFORM (Senior Impl)
+              + WSWAP-5-INV122-SWEEP (Tester)         ← 병행
+                ↓ 머지 후
+Sprint B (1주):  WSWAP-5-TBT-DIAG (Senior Impl + Tester)
+                ↓ 머지 후
+Sprint C (3일):  WSWAP-5-KIVI-FALLBACK (Implementer)
+```
+
+- Sprint A 완료 시점에 Phase 4 정식 acceptance 충족 가능 (SLA 50 ms 달성 + INV-122 v2 sweep 통과).
+- Sprint B 결과에 따라 cl_mem 통합 sprint를 P1로 승급 가능 (사용자 결정 사항).
+- Sprint C는 사용자 가치가 낮아 다른 feature 작업과 병행하거나 backlog로 미룰 수 있음.
 
 ---
 
@@ -1034,3 +1223,4 @@ Phase 1 진입 직전 Architect 작업 (WSWAP-1-SPEC 단일 작업으로 묶임)
 - 2026-04-24 (Phase 1~3 완료): 커밋 `07b8fa3`. spec 340 pass, clippy --all-targets clean. Phase 1~3 모든 task DONE 처리. handoff 메모: `project_weight_swap_phase3_handoff.md`.
 - 2026-04-25 (Phase 3.5 진입): 사용자 결정 DF-35-1~4 확정. 기존 Phase 3.5 placeholder(INVESTIGATE/DESIGN/IMPL) 폐기 후 4-task 구체화 — SPEC(ENG-ALG-219/220 + INV-129) → ARCH(weight_swap.md v5 §2.2.1 + plan_partition_integration.md A.11) → TEST(test_eng_alg_219_plan_invalidation.rs) → IMPL(FullKernelPlan 캡처/execute 비교, forward_into underscore 제거, lazy rebuild, DF-35-3 상호 배타). 신규 Phase 3.6 추가 — SOA(OpenCLBackend noshuffle_soa_registry invalidation, INV-130 신설). Phase 4는 3.5+3.6 머지 후 진입으로 BLOCKED 처리.
 - 2026-04-25 (Phase 3.7 진입): 커밋 `54017ed`로 Phase 3.5/3.6 완료. S25 실측 swap 후 첫 토큰 "Paris" 정답 확인했으나 후속 토큰 garbage 발견 (Adreno noshuffle SOA 누락 부분 변환). Phase 3.7로 이행. 사용자 결정 DF-37-1~11 확정 — AUF (Argus Unified Format) v0.1 신설, Mode B (self-contained) 단일, B-2 multi-variant + selective strip, 3-tier 버저닝(semver + capability + section table), 256B 헤더, section table 48B/entry, hybrid source_hash, 64KB align, JSON-in-binary META, BPE tokenizer 보존. Phase 3.7a (런타임 SOA 재변환 safety net, ENG-ALG-222 + INV-131) + Phase 3.7b (AUF v0.1 + auf-tool CLI, ENG-DAT-096 + ENG-ALG-223 + INV-132~134) + Phase 3.7c (선택, UMA zero-copy, DEFERRED). Repacker는 Phase 5로 미룸. Architect 산출물 6개 + TODO 1개 작성 완료.
+- 2026-04-26 (Phase 4 종결 + Phase 5 신설): 커밋 `2900f5f`로 Phase 4 종결. SOA bypass 본격 구현 + 5차 디바이스 측정으로 per-layer p50 −74.4% (206→52.8 ms), soa_reconvert −90.1% (172→17 ms) 달성. 단 SLA <50 ms는 p50 5.7% 초과 border-line으로 사용자 수용. Phase 4 작업 4개 상태 갱신 — WSWAP-4-LATENCY/PSS/TBT DONE, WSWAP-4-INV122 PARTIAL (full sweep은 WSWAP-5-INV122-SWEEP로 이관). Phase 5 신설하여 잔여 4개 항목을 별도 sprint로 분리: (1) WSWAP-5-COLD-UNIFORM (cold-path 균일화, P1, M), (2) WSWAP-5-INV122-SWEEP (100-prompt sweep, P1, S), (3) WSWAP-5-TBT-DIAG (cl_mem fragmentation 가설 진단, P2, M), (4) WSWAP-5-KIVI-FALLBACK (KIVI mixed legacy fallback, P3, S). 권장 진행 순서: Sprint A(1+2 병행) → Sprint B(3) → Sprint C(4). 핸드오프: `project_weight_swap_phase4_handoff.md`. 측정 자료: `results/data/weight_swap/phase_4_*.md`.
