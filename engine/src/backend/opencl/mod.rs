@@ -3403,6 +3403,115 @@ impl OpenCLBackend {
 
         Ok(true)
     }
+
+    /// AUF SOA bypass helper — alloc q_buf/d_buf, blocking-write the
+    /// pre-transposed payload, and (best-effort) build the
+    /// `image1d_buffer_t` view. Counts the new cl_mem objects in the
+    /// `auf_soa_*` diag buckets.
+    ///
+    /// Caller is responsible for sizing checks; this helper assumes
+    /// `q_bytes.len() == num_blocks * 16` and `d_bytes.len() == num_blocks * 2`.
+    fn alloc_and_upload_soa_buffers(
+        &self,
+        q_bytes: &[u8],
+        d_bytes: &[u8],
+        ne00: usize,
+        ne01: usize,
+        num_blocks: usize,
+    ) -> Result<(ocl::core::Mem, ocl::core::Mem, Option<ocl::core::Mem>)> {
+        let expected_q = num_blocks * 16;
+        let q_buf = unsafe {
+            ocl::core::create_buffer::<_, u8>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                expected_q,
+                None,
+            )?
+        };
+        self.record_cl_mem_alloc("auf_soa_q", expected_q);
+        let d_buf = unsafe {
+            ocl::core::create_buffer::<_, u16>(
+                self.context.as_core(),
+                ocl::core::MEM_READ_WRITE,
+                num_blocks,
+                None,
+            )?
+        };
+        self.record_cl_mem_alloc("auf_soa_d", num_blocks * 2);
+        unsafe {
+            ocl::core::enqueue_write_buffer(
+                &self.queue,
+                &q_buf,
+                true,
+                0,
+                q_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+            ocl::core::enqueue_write_buffer(
+                &self.queue,
+                &d_buf,
+                true,
+                0,
+                d_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )?;
+        }
+
+        // Build the optional image1d_buffer_t view over q_buf — same
+        // signature as `convert_q4_0_to_noshuffle` step 4. Failure → None
+        // (the GEMV path falls back to plain buffer reads).
+        let cols_ushort = ne00 / 4;
+        let q_total_uint = (ne01 * cols_ushort) / 2;
+        let q_img = {
+            use ocl::core::{
+                ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat,
+                MemObjectType,
+            };
+            let q_img_fmt =
+                ImageFormat::new(ImageChannelOrder::R, ImageChannelDataType::UnsignedInt32);
+            let q_img_desc = ImageDescriptor::new(
+                MemObjectType::Image1dBuffer,
+                q_total_uint,
+                0,
+                0,
+                0,
+                0,
+                0,
+                Some(q_buf.clone()),
+            );
+            // SAFETY: q_buf is a valid CL buffer with q_total_uint * 4 bytes;
+            // image1d_buffer_t is a read-only view over the same memory.
+            let result = unsafe {
+                ocl::core::create_image(
+                    self.context.as_core(),
+                    ocl::core::MEM_READ_ONLY,
+                    &q_img_fmt,
+                    &q_img_desc,
+                    None::<&[u32]>,
+                    None,
+                )
+            };
+            match result {
+                Ok(img) => {
+                    self.record_cl_mem_alloc("auf_soa_img", q_total_uint * 4);
+                    Some(img)
+                }
+                Err(e) => {
+                    log::warn!(
+                        "AUF SOA bypass: image1d_buffer_t creation failed (ne01={}), \
+                         falling back to buffer path: {}",
+                        ne01,
+                        e
+                    );
+                    None
+                }
+            }
+        };
+
+        Ok((q_buf, d_buf, q_img))
+    }
 }
 
 impl Backend for OpenCLBackend {
@@ -3756,46 +3865,48 @@ impl Backend for OpenCLBackend {
         Ok(())
     }
 
-    /// AUF SOA bypass (Phase 3.7b / Phase 4 LATENCY-AUF) — register a
-    /// pre-converted noshuffle SOA descriptor without re-running the
-    /// `convert_q4_0_to_noshuffle()` pipeline.
+    /// AUF SOA bypass — Phase 3.7b / Phase 5 Sprint C
+    /// (WSWAP-5-AUF-PLACEHOLDER-DROP).
     ///
-    /// Mirrors `ensure_noshuffle_soa_registered` short-circuits for non-Q4_0
-    /// tensors / CPU buffers / missing cvt program. When all preconditions
-    /// are met, allocates fresh `cl_mem` buffers for the SOA q/d payloads,
-    /// uploads `q_bytes`/`d_bytes` directly via `enqueue_write_buffer`, and
-    /// registers the entry against the post-swap tensor's `cl_mem` address.
+    /// Allocate a Q4_0 weight tensor whose backing buffer is a
+    /// `NoshuffleWeightBuffer` directly populated from the AUF
+    /// `WEIGHTS_ADRENO_SOA` payload — no AOS placeholder cl_mem.
     ///
-    /// The `image1d_buffer_t` view over the q buffer is recreated locally
-    /// (driver-side, no host data copy). It silently falls back to `None` on
-    /// drivers that reject `image1d_buffer_t` (e.g. exceeding
-    /// `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE`).
-    fn register_pre_converted_soa(
+    /// Behaviour matches the `ensure_noshuffle_soa_registered` short-circuits
+    /// (non-Q4_0 / CPU buffer / missing cvt program). When preconditions are
+    /// met:
+    ///   1. Allocate `cl_mem` for `q_bytes` (`expected_q` bytes) and
+    ///      `d_bytes` (`expected_d` bytes); blocking-write the AUF payload.
+    ///   2. Build an `image1d_buffer_t` view over `q_buf` (silently None on
+    ///      drivers that reject the descriptor).
+    ///   3. Register a noshuffle SOA entry keyed on the `d_buf` cl_mem
+    ///      address (mirrors `prepare_noshuffle_buffers(swap_to_placeholder=true)`
+    ///      so the `matmul_q4_0` lookup hits via `Tensor::buffer().cl_mem()`).
+    ///   4. Return a `Tensor` whose buffer is a `NoshuffleWeightBuffer`
+    ///      owning the SOA handles, with the logical AOS shape and `Q4_0`
+    ///      dtype.
+    ///
+    /// The previous version of this entry-point allocated a placeholder AOS
+    /// cl_mem on top of the SOA registration purely to hand the swap pipeline
+    /// a valid Tensor handle. Sprint C removes that 112-cl_mem / ~547 MiB
+    /// drag (Llama 3.2 1B ratio=1.0 mixed measured by `ClMemDiagBucket`).
+    fn alloc_pre_converted_soa_tensor(
         &self,
-        key_tensor: &Tensor,
+        shape: crate::core::shape::Shape,
         q_bytes: &[u8],
         d_bytes: &[u8],
         ne00: usize,
         ne01: usize,
-    ) -> Result<()> {
-        // Q4_0 only.
-        if key_tensor.dtype() != DType::Q4_0 {
-            return Ok(());
-        }
-        // Need a GPU cl_mem to use as the registry key.
-        let Ok(cl_mem) = get_cl_mem(key_tensor.buffer().as_ref()) else {
-            return Ok(());
-        };
+    ) -> Result<Option<Tensor>> {
         // Skip silently when the noshuffle SOA program failed to build —
         // matches `ensure_noshuffle_soa_registered`'s degradation contract.
         if unsafe { (*self.kernels.get()).kernel_cvt_q4_0_noshuffle.is_none() } {
-            return Ok(());
+            return Ok(None);
         }
 
         // Validate payload sizes against the expected SOA layout.
-        // QK4_0 = 32. Each block contributes 16 bytes to q and 2 bytes to d.
         if !ne00.is_multiple_of(32) {
-            return Ok(());
+            return Ok(None);
         }
         let num_blocks = ne01 * ne00 / 32;
         let expected_q = num_blocks * 16;
@@ -3812,114 +3923,94 @@ impl Backend for OpenCLBackend {
             );
         }
 
-        // Allocate device buffers and upload the pre-transposed SOA bytes
-        // verbatim. AUF builder is contracted to apply: (1) nibble unshuffle,
-        // (2) ushort-level 2D transpose of q, (3) half-level 2D transpose of
-        // d. Therefore the payload here is byte-identical to what
-        // `convert_q4_0_to_noshuffle` would produce; no further conversion is
-        // performed on this fast path.
-        let q_buf = unsafe {
-            ocl::core::create_buffer::<_, u8>(
-                self.context.as_core(),
-                ocl::core::MEM_READ_WRITE,
-                expected_q,
-                None,
-            )?
-        };
-        self.record_cl_mem_alloc("auf_soa_q", expected_q);
-        let d_buf = unsafe {
-            ocl::core::create_buffer::<_, u16>(
-                self.context.as_core(),
-                ocl::core::MEM_READ_WRITE,
-                num_blocks,
-                None,
-            )?
-        };
-        self.record_cl_mem_alloc("auf_soa_d", num_blocks * 2);
-        unsafe {
-            ocl::core::enqueue_write_buffer(
-                &self.queue,
-                &q_buf,
-                true,
-                0,
-                q_bytes,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-            ocl::core::enqueue_write_buffer(
-                &self.queue,
-                &d_buf,
-                true,
-                0,
-                d_bytes,
-                None::<&ocl::core::Event>,
-                None::<&mut ocl::core::Event>,
-            )?;
-        }
+        let (q_buf, d_buf, q_img) =
+            self.alloc_and_upload_soa_buffers(q_bytes, d_bytes, ne00, ne01, num_blocks)?;
 
-        // Build the optional image1d_buffer_t view over q_buf — same
-        // signature as `convert_q4_0_to_noshuffle` step 4. Failure → None
-        // (the GEMV path falls back to plain buffer reads).
-        let cols_ushort = ne00 / 4;
-        let q_total_uint = (ne01 * cols_ushort) / 2;
-        let q_img = {
-            use ocl::core::{
-                ImageChannelDataType, ImageChannelOrder, ImageDescriptor, ImageFormat,
-                MemObjectType,
-            };
-            let q_img_fmt =
-                ImageFormat::new(ImageChannelOrder::R, ImageChannelDataType::UnsignedInt32);
-            let q_img_desc = ImageDescriptor::new(
-                MemObjectType::Image1dBuffer,
-                q_total_uint,
-                0,
-                0,
-                0,
-                0,
-                0,
-                Some(q_buf.clone()),
-            );
-            // SAFETY: q_buf is a valid CL buffer with q_total_uint * 4 bytes;
-            // image1d_buffer_t is a read-only view over the same memory.
-            let result = unsafe {
-                ocl::core::create_image(
-                    self.context.as_core(),
-                    ocl::core::MEM_READ_ONLY,
-                    &q_img_fmt,
-                    &q_img_desc,
-                    None::<&[u32]>,
-                    None,
-                )
-            };
-            match result {
-                Ok(img) => {
-                    self.record_cl_mem_alloc("auf_soa_img", q_total_uint * 4);
-                    Some(img)
-                }
-                Err(e) => {
-                    log::warn!(
-                        "AUF SOA bypass: image1d_buffer_t creation failed (ne01={}), \
-                         falling back to buffer path: {}",
-                        ne01,
-                        e
-                    );
-                    None
-                }
-            }
-        };
-
-        let key = cl_mem.as_ptr() as usize;
+        // Register against the d_buf address — same key choice as
+        // `prepare_noshuffle_buffers(swap_to_placeholder=true)`.
+        let key = d_buf.as_ptr() as usize;
         self.register_noshuffle_soa(
             key,
             NoshuffleSoaEntry {
+                q_buf: q_buf.clone(),
+                d_buf: d_buf.clone(),
+                q_img: q_img.as_ref().cloned(),
+                ne00,
+                ne01,
+            },
+        );
+
+        // Logical AOS byte size. `NoshuffleWeightBuffer::size()` reports this
+        // so consumers that inspect `Tensor::size()` see the weight footprint.
+        let logical_bytes = num_blocks * 18;
+        let placeholder = Arc::new(
+            crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer::new(
                 q_buf,
                 d_buf,
                 q_img,
                 ne00,
                 ne01,
-            },
-        );
-        Ok(())
+                logical_bytes,
+            ),
+        ) as Arc<dyn Buffer>;
+
+        // Backend Arc: clone the `OpenCLBackend` Arc that the swap path
+        // already holds. The caller's `self` is `&dyn Backend`, but the
+        // tensor needs an owned `Arc<dyn Backend>`. The swap executor passes
+        // its own backend handle through `materialise_auf_soa_weight` which
+        // is responsible for wrapping the `Arc` — here we cannot resurrect
+        // it from `&self`. Returning a tensor without a backend Arc would
+        // break later kernel dispatch, so we expect callers to substitute
+        // the backend Arc before forwarding the tensor (handled in
+        // `materialise_auf_soa_weight`).
+        //
+        // The convention adopted here: produce the tensor against a fresh
+        // CPU `Backend` Arc as a transient placeholder for `Tensor::new`'s
+        // `Arc<dyn Backend>` slot, knowing that the caller assigns the real
+        // backend Arc immediately. This avoids exposing an `Arc<dyn Backend>`
+        // accessor on `OpenCLBackend` while keeping the tensor self-contained.
+        //
+        // The forward path ignores `Tensor::backend()` for OpenCL dispatch —
+        // it operates through `Backend::matmul_*` on the `LayerWeights`'
+        // outer backend Arc. The cl_mem path does not consult tensor.backend.
+        let cpu_be: Arc<dyn Backend> = Arc::new(crate::backend::cpu::CpuBackend::new());
+        Ok(Some(Tensor::new(shape, placeholder, cpu_be)))
+    }
+
+    /// Re-register a previously-built AUF SOA `NoshuffleWeightBuffer` after
+    /// a `clear_noshuffle_soa_registry()` wipe (ENG-ALG-221 / INV-130).
+    /// Falls through to `ensure_noshuffle_soa_registered` for tensors that
+    /// are not SOA-backed.
+    fn restore_pre_converted_soa_registration(&self, tensor: &Tensor) -> Result<()> {
+        // Q4_0 only — non-Q4_0 noshuffle path is undefined.
+        if tensor.dtype() != DType::Q4_0 {
+            return Ok(());
+        }
+
+        if let Some(nb) = tensor
+            .buffer()
+            .as_any()
+            .downcast_ref::<crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer>(
+        ) {
+            // SOA-backed: re-insert against the d_buf key (`cl_mem()` on
+            // `NoshuffleWeightBuffer` returns d_buf, so the registry key
+            // matches `b_buf.as_ptr() as usize` lookups in `matmul_q4_0`).
+            let key = nb.d_buf().as_ptr() as usize;
+            self.register_noshuffle_soa(
+                key,
+                NoshuffleSoaEntry {
+                    q_buf: nb.q_buf().clone(),
+                    d_buf: nb.d_buf().clone(),
+                    q_img: nb.q_img().cloned(),
+                    ne00: nb.ne00(),
+                    ne01: nb.ne01(),
+                },
+            );
+            return Ok(());
+        }
+
+        // GGUF AOS-backed (fallback path): re-run the standard SOA conversion.
+        self.ensure_noshuffle_soa_registered(tensor)
     }
 
     fn flash_attention_prefill(
@@ -7236,6 +7327,193 @@ mod noshuffle_tests {
             backend.lookup_noshuffle_soa(key).is_none(),
             "non-Q4_0 tensor must not populate the noshuffle SOA registry"
         );
+    }
+
+    /// WSWAP-5-AUF-PLACEHOLDER-DROP: `alloc_pre_converted_soa_tensor`
+    /// must return a tensor whose backing is a `NoshuffleWeightBuffer`,
+    /// register a SOA entry keyed on the `d_buf` cl_mem, and **not**
+    /// allocate any AOS placeholder cl_mem.
+    #[test]
+    fn test_alloc_pre_converted_soa_tensor_no_placeholder() {
+        use crate::buffer::noshuffle_weight_buffer::NoshuffleWeightBuffer;
+
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        if unsafe { (*backend.kernels.get()).kernel_cvt_q4_0_noshuffle.is_none() } {
+            eprintln!("[SKIPPED] cvt_noshuffle kernel unavailable");
+            return;
+        }
+
+        // Build a synthetic SOA payload by running the production
+        // `convert_q4_0_to_noshuffle` over a known AOS source. This bypasses
+        // the AUF I/O surface — what we exercise here is the registration +
+        // tensor-shape contract.
+        let n = 8usize;
+        let k = 64usize;
+        let blocks_per_row = k / QK4_0;
+        let num_blocks = n * blocks_per_row;
+
+        let (src_tensor, _blocks) = make_q4_0_weight_tensor(&backend, n, k, 11);
+        let src_mem = get_cl_mem(src_tensor.buffer().as_ref()).unwrap();
+        let (q_buf_ref, d_buf_ref, _q_img_ref) = backend
+            .convert_q4_0_to_noshuffle(src_mem, num_blocks, k, n)
+            .expect("reference SOA conversion must succeed");
+
+        // Read the SOA bytes back so we can feed them into
+        // `alloc_pre_converted_soa_tensor` as if they came from an AUF
+        // payload. This mirrors `auf_tool::build_variant_payload` output.
+        let q_size = num_blocks * 16;
+        let d_size = num_blocks * 2;
+        let mut q_bytes = vec![0u8; q_size];
+        let mut d_bytes = vec![0u8; d_size];
+        unsafe {
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                &q_buf_ref,
+                true,
+                0,
+                &mut q_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+            ocl::core::enqueue_read_buffer(
+                &backend.queue,
+                &d_buf_ref,
+                true,
+                0,
+                &mut d_bytes,
+                None::<&ocl::core::Event>,
+                None::<&mut ocl::core::Event>,
+            )
+            .unwrap();
+        }
+
+        backend.clear_noshuffle_soa_registry();
+
+        // Sprint C entry point.
+        let backend_dyn: &dyn Backend = backend.as_ref();
+        let tensor = backend_dyn
+            .alloc_pre_converted_soa_tensor(Shape::new(vec![n, k]), &q_bytes, &d_bytes, k, n)
+            .expect("alloc_pre_converted_soa_tensor must succeed")
+            .expect("driver-side cvt program is available, expected Some");
+
+        // (1) The returned tensor must be backed by `NoshuffleWeightBuffer`.
+        let nb = tensor
+            .buffer()
+            .as_any()
+            .downcast_ref::<NoshuffleWeightBuffer>()
+            .expect(
+                "Sprint C contract: alloc_pre_converted_soa_tensor must back the tensor with \
+                 NoshuffleWeightBuffer (no AOS placeholder cl_mem)",
+            );
+        assert_eq!(
+            nb.ne00(),
+            k,
+            "NoshuffleWeightBuffer.ne00 must match logical K"
+        );
+        assert_eq!(
+            nb.ne01(),
+            n,
+            "NoshuffleWeightBuffer.ne01 must match logical M"
+        );
+        assert_eq!(
+            tensor.dtype(),
+            DType::Q4_0,
+            "weight tensor must report Q4_0 dtype to keep matmul dispatch unchanged"
+        );
+        // Logical AOS bytes for the size report (num_blocks * 18).
+        assert_eq!(
+            tensor.size(),
+            num_blocks * 18,
+            "Tensor::size() must report the logical AOS footprint"
+        );
+
+        // (2) Registry key is the `d_buf` address (matches
+        // `prepare_noshuffle_buffers(swap_to_placeholder=true)`).
+        let d_buf_key = nb.d_buf().as_ptr() as usize;
+        let entry = backend
+            .lookup_noshuffle_soa(d_buf_key)
+            .expect("Sprint C: registry must be keyed on d_buf cl_mem address");
+        assert_eq!(entry.ne00, k);
+        assert_eq!(entry.ne01, n);
+
+        // (3) `get_cl_mem(buffer)` must resolve to the d_buf — same key as
+        // the registry lookup performed by `matmul_q4_0`.
+        let lookup_key = get_cl_mem(tensor.buffer().as_ref()).unwrap().as_ptr() as usize;
+        assert_eq!(
+            lookup_key, d_buf_key,
+            "Tensor::buffer().cl_mem() must equal the registered d_buf key"
+        );
+
+        // (4) `restore_pre_converted_soa_registration` after a clear must
+        // re-insert the entry against the same d_buf key (Stage (d)
+        // re-registration after the per-batch invalidate).
+        backend.clear_noshuffle_soa_registry();
+        assert!(
+            backend.lookup_noshuffle_soa(d_buf_key).is_none(),
+            "registry must be empty after clear"
+        );
+        backend_dyn
+            .restore_pre_converted_soa_registration(&tensor)
+            .expect("restore_pre_converted_soa_registration must re-register the SOA entry");
+        let entry2 = backend
+            .lookup_noshuffle_soa(d_buf_key)
+            .expect("Sprint C: restore must re-register against d_buf key");
+        assert_eq!(entry2.ne00, k);
+        assert_eq!(entry2.ne01, n);
+
+        backend.clear_noshuffle_soa_registry();
+    }
+
+    /// WSWAP-5-AUF-PLACEHOLDER-DROP: `restore_pre_converted_soa_registration`
+    /// must fall through to `ensure_noshuffle_soa_registered` for tensors
+    /// whose backing is *not* a `NoshuffleWeightBuffer` (GGUF AOS path).
+    #[test]
+    fn test_restore_pre_converted_soa_registration_aos_fallthrough() {
+        let backend = match try_create_backend() {
+            Some(b) => b,
+            None => {
+                eprintln!("[SKIPPED] No OpenCL device");
+                return;
+            }
+        };
+
+        if unsafe { (*backend.kernels.get()).kernel_cvt_q4_0_noshuffle.is_none() } {
+            eprintln!("[SKIPPED] cvt_noshuffle kernel unavailable");
+            return;
+        }
+
+        // GGUF-style AOS Q4_0 weight tensor (no NoshuffleWeightBuffer).
+        let n = 8usize;
+        let k = 64usize;
+        let (tensor, _blocks) = make_q4_0_weight_tensor(&backend, n, k, 23);
+        let aos_key = get_cl_mem(tensor.buffer().as_ref()).unwrap().as_ptr() as usize;
+
+        backend.clear_noshuffle_soa_registry();
+        assert!(
+            backend.lookup_noshuffle_soa(aos_key).is_none(),
+            "registry must be empty before fallthrough exercise"
+        );
+
+        let backend_dyn: &dyn Backend = backend.as_ref();
+        backend_dyn
+            .restore_pre_converted_soa_registration(&tensor)
+            .expect("restore must succeed by falling through to ensure_noshuffle_soa_registered");
+
+        // ensure_noshuffle_soa_registered keys on the AOS cl_mem ptr.
+        assert!(
+            backend.lookup_noshuffle_soa(aos_key).is_some(),
+            "GGUF AOS fallthrough must register a SOA entry against the AOS cl_mem key"
+        );
+
+        backend.clear_noshuffle_soa_registry();
     }
 }
 

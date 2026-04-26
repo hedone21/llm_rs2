@@ -603,7 +603,8 @@ fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
             // `q4_0_aos_to_adreno_soa`는 이 shape를 받아 `convert_q4_0_to_noshuffle`
             // 와 동등한 (a) nibble unshuffle (b) ushort q transpose (c) half d
             // transpose 를 빌드 타임에 적용한다. 결과 byte sequence는 backend의
-            // `register_pre_converted_soa`가 직접 cl_mem에 업로드 가능한 형태이다.
+            // `alloc_pre_converted_soa_tensor`가 직접 cl_mem에 업로드 가능한
+            // 형태이다.
             let mut out = Vec::new();
             for (name, bytes, shape) in blobs {
                 let is_q4_0 = bytes.len() % 18 == 0 && bytes.len() >= 18;

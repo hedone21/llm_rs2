@@ -407,32 +407,27 @@ impl<'a> SwapExecutor<'a> {
                 .map(|s| s.is_pre_converted_soa())
                 .unwrap_or(false);
             if skip_soa_reconvert {
-                // AUF WEIGHTS_ADRENO_SOA path: weights are already SOA-converted
-                // at AUF build time (auf_tool::build_variant_payload). For each
-                // swapped tensor we slice the AUF payload into (q_bytes,
-                // d_bytes) and call `register_pre_converted_soa`, which uploads
-                // the SOA buffers directly into fresh `cl_mem` and registers
-                // them against the post-swap weight tensor's `cl_mem` address.
-                // The runtime `convert_q4_0_to_noshuffle` pipeline (GPU kernel
-                // dispatch + dual CPU transposes) is bypassed entirely — this
-                // is the Phase 4 LATENCY-AUF acceptance criterion (target ≈ 0
-                // for stage `soa_reconvert_ms` on AUF batches).
-                let secondary_arc = secondary_mmap.expect("checked above by skip_soa_reconvert");
-                let weight_subnames = [
-                    "attn_q.weight",
-                    "attn_k.weight",
-                    "attn_v.weight",
-                    "attn_output.weight",
-                    "ffn_gate.weight",
-                    "ffn_up.weight",
-                    "ffn_down.weight",
-                ];
+                // AUF WEIGHTS_ADRENO_SOA path: weights are already SOA-backed
+                // at materialise time (`materialise_auf_soa_weight` →
+                // `Backend::alloc_pre_converted_soa_tensor`). The
+                // per-batch `invalidate_noshuffle_soa_registry()` above
+                // wiped every entry — including the just-built ones — so we
+                // re-register them here against the same `d_buf` keys via
+                // `restore_pre_converted_soa_registration`. Tensors whose
+                // buffer is *not* a `NoshuffleWeightBuffer` (e.g. AOS
+                // fallback inside `materialise_auf_soa_weight`) re-enter
+                // the GGUF SOA conversion path through the trait default.
+                //
+                // `soa_reconvert_ms` charge here is the registration cost
+                // only (~µs / tensor). No host-side conversion runs and no
+                // new cl_mem is allocated — this is the Phase 5 Sprint C
+                // (WSWAP-5-AUF-PLACEHOLDER-DROP) shape of the bypass path.
                 for swapped in &report.swapped {
                     let Some(slot) = layers.get(swapped.layer_idx) else {
                         continue;
                     };
                     let new_layer = slot.load_weights();
-                    let weight_tensors = [
+                    for tensor in [
                         &new_layer.wq,
                         &new_layer.wk,
                         &new_layer.wv,
@@ -440,43 +435,8 @@ impl<'a> SwapExecutor<'a> {
                         &new_layer.w_gate,
                         &new_layer.w_up,
                         &new_layer.w_down,
-                    ];
-                    for (tensor, subname) in weight_tensors.iter().zip(weight_subnames.iter()) {
-                        if tensor.dtype() != DType::Q4_0 {
-                            continue;
-                        }
-                        let Some(info) = secondary_arc.layer_tensor(swapped.layer_idx, subname)
-                        else {
-                            // Tensor missing from AUF index — surface as a
-                            // BufferAllocationFailed so callers see the same
-                            // error class as the GGUF path.
-                            return Err(SwapError::SecondaryTensorMissing {
-                                layer: swapped.layer_idx,
-                                subname: subname.to_string(),
-                            });
-                        };
-                        let Some((q_bytes, d_bytes)) = secondary_arc.split_pre_converted_soa(info)
-                        else {
-                            // Payload not splittable as SOA (non-Q4_0 bytes /
-                            // malformed length). Fall back to the AOS path
-                            // for this tensor.
-                            if let Err(e) = self.backend.ensure_noshuffle_soa_registered(tensor) {
-                                return Err(SwapError::BufferAllocationFailed {
-                                    layer: swapped.layer_idx,
-                                    source: e,
-                                });
-                            }
-                            continue;
-                        };
-                        // dims[0] = ne01 (rows), dims[1] = ne00 (cols).
-                        let dims = tensor.shape().dims();
-                        if dims.len() != 2 {
-                            continue;
-                        }
-                        let (ne01, ne00) = (dims[0], dims[1]);
-                        if let Err(e) = self
-                            .backend
-                            .register_pre_converted_soa(tensor, q_bytes, d_bytes, ne00, ne01)
+                    ] {
+                        if let Err(e) = self.backend.restore_pre_converted_soa_registration(tensor)
                         {
                             return Err(SwapError::BufferAllocationFailed {
                                 layer: swapped.layer_idx,
@@ -539,11 +499,15 @@ impl<'a> SwapExecutor<'a> {
     ///
     /// **AUF SOA fast path** (`secondary.is_pre_converted_soa()`):
     /// Q4_0 weights are routed through `materialise_auf_soa_weight` which
-    /// allocates a fresh GPU `cl_mem` of the AOS shape (key holder for the
-    /// noshuffle SOA registry) and uploads the pre-converted SOA bytes
-    /// **without** the AOS pipeline (no `unpermute_qk_rows`, no host-side
-    /// re-conversion). The actual SOA descriptor is registered later by
-    /// `Backend::register_pre_converted_soa` in `execute_on_slots` Stage (d).
+    /// delegates to `Backend::alloc_pre_converted_soa_tensor`. That call
+    /// allocates the SOA `q_buf`/`d_buf`/optional `q_img` cl_mem, uploads
+    /// the AUF payload, registers a noshuffle SOA entry keyed on the
+    /// `d_buf` address, and returns a tensor whose backing buffer is a
+    /// `NoshuffleWeightBuffer`. **No AOS placeholder cl_mem is allocated**
+    /// (Phase 5 Sprint C — WSWAP-5-AUF-PLACEHOLDER-DROP). The Stage (d)
+    /// `restore_pre_converted_soa_registration` re-registers the entry
+    /// after the per-batch `invalidate_noshuffle_soa_registry()` clear so
+    /// the ENG-ALG-221 ordering (clear → register → bump) is preserved.
     /// Non-Q4_0 layer tensors (none for the current swap target set) and
     /// non-OpenCL backends fall back to the AOS path.
     fn build_layer_from_mmap(
@@ -626,12 +590,19 @@ impl<'a> SwapExecutor<'a> {
         subname: &str,
         primary: &Tensor,
     ) -> Result<Tensor, SwapError> {
-        // AUF SOA fast path is OpenCL-only and Q4_0-only. Falling back through
+        // AUF SOA fast path is OpenCL-only and Q4_0-only. The dtype gate
+        // checks the *target* dtype (post-swap), not the primary — when
+        // swapping F16→Q4_0 the primary is F16 but the AUF SOA bypass
+        // applies (it converts the secondary's pre-baked SOA payload into a
+        // Q4_0 NoshuffleWeightBuffer). Falling back through
         // `materialise_tensor` for any mismatch keeps the host-test surface
         // (CPU backend, non-Q4_0 norms, etc.) on the original code path.
+        let secondary_info = secondary.layer_tensor(layer_idx, subname);
+        let secondary_dtype_is_q4_0 = secondary_info.is_some_and(|i| i.dtype == DType::Q4_0);
         if secondary.is_pre_converted_soa()
             && !self.backend.name().contains("CPU")
-            && primary.dtype() == DType::Q4_0
+            && self.target_dtype == DType::Q4_0
+            && secondary_dtype_is_q4_0
             && let Some(t) =
                 self.materialise_auf_soa_weight(secondary, layer_idx, subname, primary)?
         {
@@ -640,19 +611,25 @@ impl<'a> SwapExecutor<'a> {
         self.materialise_tensor(secondary, layer_idx, subname, primary, true)
     }
 
-    /// Build a key-holder GPU tensor for an AUF `WEIGHTS_ADRENO_SOA` Q4_0
-    /// weight without running the AOS materialisation pipeline.
+    /// Build a SOA-backed GPU tensor for an AUF `WEIGHTS_ADRENO_SOA` Q4_0
+    /// weight without running the AOS materialisation pipeline and without
+    /// allocating a placeholder AOS cl_mem.
     ///
-    /// The returned `Tensor` carries a fresh `cl_mem` allocation of the
-    /// expected AOS Q4_0 size (`num_blocks * 18` bytes). The data uploaded
-    /// into that buffer is the AUF SOA payload (`q_buf` followed by `d_buf`)
-    /// which happens to share the same total length — but the contents are
-    /// *not* a valid Q4_0 AOS layout and must **never** be consumed by an
-    /// AOS GEMV path. The buffer's `cl_mem` address is used by
-    /// `Backend::register_pre_converted_soa` as the registry key; the
-    /// noshuffle GEMV path looks up the entry through the same address and
-    /// reads the SOA `q_buf` / `d_buf` from the registry, never from the
-    /// underlying weight tensor.
+    /// The returned `Tensor` reports the logical AOS shape and `Q4_0` dtype
+    /// but its backing buffer is a `NoshuffleWeightBuffer` containing the
+    /// `q_buf` / `d_buf` (and optional `q_img`) cl_mem handles. The AUF
+    /// SOA payload (`q_bytes` || `d_bytes`) is uploaded directly into those
+    /// fresh GPU buffers via blocking `enqueue_write_buffer`; no AOS
+    /// placeholder is created (Phase 5 Sprint C
+    /// WSWAP-5-AUF-PLACEHOLDER-DROP — saves 112 cl_mem / ~547 MiB on
+    /// Llama 3.2 1B ratio=1.0 mixed).
+    ///
+    /// `Backend::alloc_pre_converted_soa_tensor` also registers a noshuffle
+    /// SOA entry against the `d_buf` cl_mem address so the per-layer
+    /// `matmul_q4_0` lookup hits in the steady state. The Stage (d)
+    /// `restore_pre_converted_soa_registration` re-installs the entry after
+    /// the per-batch `invalidate_noshuffle_soa_registry()` call so the
+    /// invariant ordering (clear → register → bump) is preserved.
     ///
     /// Returns `Ok(None)` when:
     /// - The tensor is missing from the secondary index (caller falls back
@@ -661,6 +638,9 @@ impl<'a> SwapExecutor<'a> {
     ///   size not divisible by 18).
     /// - The size guards inferred from the primary tensor shape do not match
     ///   the AUF payload (defensive — any mismatch triggers AOS fallback).
+    /// - The backend's `alloc_pre_converted_soa_tensor` returns `None`
+    ///   (CPU / non-OpenCL / driver-side cvt program missing) — caller
+    ///   falls back to `materialise_tensor`.
     fn materialise_auf_soa_weight(
         &self,
         secondary: &Arc<SecondaryMmap>,
@@ -684,43 +664,41 @@ impl<'a> SwapExecutor<'a> {
                 secondary: info.dims.clone(),
             });
         }
-        // Split AUF payload into q_buf / d_buf. None → fall back to AOS path.
-        let Some(_split) = secondary.split_pre_converted_soa(info) else {
+        // Split AUF payload into q_bytes / d_bytes. None → fall back to AOS path.
+        let Some((q_bytes, d_bytes)) = secondary.split_pre_converted_soa(info) else {
             return Ok(None);
         };
-        // The combined payload length must equal the AOS Q4_0 byte size for
-        // the placeholder upload contract to hold (`num_blocks * 18`). Any
-        // other size signals a malformed AUF — fall back so the AOS path can
-        // surface a regular `ShapeMismatch`.
-        let bytes = secondary.tensor_bytes(info);
+        // Total elem count must be QK4_0-aligned; the SOA upload contract
+        // requires exactly `num_blocks * 16` (q) + `num_blocks * 2` (d).
         let shape = primary.shape().clone();
-        let total_elems: usize = shape.dims().iter().product();
+        let dims = shape.dims();
+        if dims.len() != 2 {
+            return Ok(None);
+        }
+        let total_elems: usize = dims.iter().product();
         if !total_elems.is_multiple_of(32) {
             return Ok(None);
         }
-        let expected_aos_size = (total_elems / 32) * 18;
-        if bytes.len() != expected_aos_size {
+        // Logical: dims[0] = ne01 (rows), dims[1] = ne00 (cols).
+        let (ne01, ne00) = (dims[0], dims[1]);
+        let num_blocks = ne01 * ne00 / 32;
+        if q_bytes.len() != num_blocks * 16 || d_bytes.len() != num_blocks * 2 {
             return Ok(None);
         }
 
-        // Wrap the AUF SOA bytes (zero-copy from mmap) in a CPU-side buffer
-        // and route through `copy_weight_from`. This installs a fresh GPU
-        // `cl_mem` of the AOS size; the bytes inside are a placeholder
-        // (legal Q4_0 byte width but not a valid AOS layout). The forward
-        // path consumes the SOA registry entry — registered separately in
-        // Stage (d) — and never reads the AOS bytes here.
-        let shared_buf: Arc<dyn Buffer> =
-            Arc::new(SharedBuffer::from_vec(bytes.to_vec(), DType::Q4_0));
-        let cpu_backend: Arc<dyn Backend> =
-            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>;
-        let cpu_tensor = Tensor::new(shape.clone(), shared_buf, cpu_backend);
-        let device_tensor = self.backend.copy_weight_from(&cpu_tensor).map_err(|e| {
-            SwapError::BufferAllocationFailed {
+        // Delegate to the backend. This allocates two cl_mem (q_buf, d_buf)
+        // + optional image1d view, uploads the SOA bytes verbatim, registers
+        // a noshuffle SOA entry keyed on d_buf, and returns a tensor whose
+        // backing is a `NoshuffleWeightBuffer` owning the same handles. No
+        // placeholder AOS cl_mem is allocated.
+        let opt = self
+            .backend
+            .alloc_pre_converted_soa_tensor(shape, q_bytes, d_bytes, ne00, ne01)
+            .map_err(|e| SwapError::BufferAllocationFailed {
                 layer: layer_idx,
                 source: e,
-            }
-        })?;
-        Ok(Some(device_tensor))
+            })?;
+        Ok(opt)
     }
 
     /// Materialise one weight tensor from the secondary mmap, applying Q/K

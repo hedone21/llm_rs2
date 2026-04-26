@@ -382,7 +382,8 @@ impl SecondaryMmap {
     ///   3. half-level 2D transpose of d
     ///
     /// so the bytes can be uploaded directly into `cl_mem` and registered via
-    /// `Backend::register_pre_converted_soa` without further runtime conversion.
+    /// `Backend::alloc_pre_converted_soa_tensor` without further runtime
+    /// conversion.
     ///
     /// Returns `None` for GGUF secondaries (no SOA section), or for tensors
     /// whose dtype is not `Q4_0` (norms / non-quantised weights).
