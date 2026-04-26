@@ -854,6 +854,17 @@ impl SecondaryMmap {
             SecondaryMmap::Auf(_) => None,
         }
     }
+
+    /// Return the inner `AufView` reference, if this is an AUF secondary.
+    ///
+    /// Used by `generate.rs` lm_head load-path (Sprint G-1-D) to call
+    /// `AufView::lm_head_q4_0_payload()` without re-opening the file.
+    pub fn as_auf_view(&self) -> Option<&AufView> {
+        match self {
+            SecondaryMmap::Gguf(_) => None,
+            SecondaryMmap::Auf(a) => Some(&a.view),
+        }
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

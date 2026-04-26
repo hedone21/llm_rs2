@@ -544,6 +544,119 @@ impl TransformerModel {
         Ok(true)
     }
 
+    /// Load lm_head Q4_0 weights directly from an AUF payload (Sprint G-1-D).
+    ///
+    /// # Contract
+    ///
+    /// `payload.bytes` is already SOA-converted (WEIGHTS_ADRENO_SOA) or AOS
+    /// (WEIGHTS_CPU_AOS / WEIGHTS_CUDA_AOS), as determined by the AUF writer
+    /// at build time. This function wraps the bytes into a Q4_0 SharedBuffer,
+    /// uploads to GPU via `copy_weight_from`, and installs it as `self.lm_head`.
+    ///
+    /// For ADRENO_SOA, the payload follows the same q/d packing used by
+    /// `SecondaryMmap::split_pre_converted_soa`: `q_buf` (`num_blocks * 16` B)
+    /// followed by `d_buf` (`num_blocks * 2` B). The NoshuffleWeightBuffer
+    /// registration path is intentionally NOT taken here — the runtime SOA
+    /// registration happens lazily via `ensure_noshuffle_soa_registered` in the
+    /// normal weight-upload path. We treat the AUF bytes as AOS Q4_0 and let
+    /// the backend handle SOA re-registration on first use (same as Sprint F).
+    ///
+    /// Tied-weight handling: same as `quantize_lm_head_to_q4_0` — if
+    /// `gpu_embed_tokens` shared the old lm_head cl_mem, we replace it with a
+    /// fresh F16 upload before swapping lm_head.
+    ///
+    /// Returns `Ok(())` on success. On error (e.g. upload failed), the model
+    /// state is unchanged (install is the last step).
+    pub fn load_lm_head_from_auf(
+        &mut self,
+        payload: &crate::auf::reader::LmHeadPayload<'_>,
+        runtime_backend: &Arc<dyn Backend>,
+    ) -> Result<()> {
+        use crate::buffer::shared_buffer::SharedBuffer;
+
+        let backend = runtime_backend.clone();
+        let is_gpu = backend.name() == "OpenCL" || backend.name() == "cuda-embedded";
+
+        let dims = self.lm_head.shape().dims();
+        if dims.len() < 2 {
+            return Err(anyhow!(
+                "load_lm_head_from_auf: lm_head must be at least 2-D (got {:?})",
+                dims
+            ));
+        }
+        let cols = dims[dims.len() - 1];
+        let rows: usize = dims[..dims.len() - 1].iter().product();
+
+        // Validate expected byte size against payload length.
+        // Q4_0: num_blocks = rows * (cols / 32), each block = 18 bytes.
+        if !cols.is_multiple_of(crate::core::quant::QK4_0) {
+            return Err(anyhow!(
+                "load_lm_head_from_auf: last dim ({}) is not a multiple of {} (Q4_0 block size)",
+                cols,
+                crate::core::quant::QK4_0,
+            ));
+        }
+        let num_blocks = rows * (cols / crate::core::quant::QK4_0);
+        let expected_bytes = num_blocks * std::mem::size_of::<crate::core::quant::BlockQ4_0>();
+        if payload.bytes.len() != expected_bytes {
+            return Err(anyhow!(
+                "load_lm_head_from_auf: payload size mismatch (expected {} bytes for {}×{} Q4_0, got {} bytes)",
+                expected_bytes,
+                rows,
+                cols,
+                payload.bytes.len()
+            ));
+        }
+
+        // Build a CPU Q4_0 SharedBuffer tensor from the AUF payload bytes.
+        // The payload is a zero-copy mmap slice; we copy it into an owned Vec
+        // for the SharedBuffer (avoids lifetime coupling to the mmap).
+        let bytes_owned: Vec<u8> = payload.bytes.to_vec();
+        let cpu_buf: Arc<dyn Buffer> = Arc::new(SharedBuffer::from_vec(bytes_owned, DType::Q4_0));
+        let cpu_shape = self.lm_head.shape().clone();
+        let cpu_backend: Arc<dyn Backend> = if let Some(ref cb) = self.cpu_backend {
+            cb.clone()
+        } else if !is_gpu {
+            backend.clone()
+        } else {
+            Arc::new(crate::backend::cpu::CpuBackend::new()) as Arc<dyn Backend>
+        };
+        let cpu_tensor = Tensor::new(cpu_shape, cpu_buf, cpu_backend);
+
+        // Upload to GPU via copy_weight_from (same path as quantize_lm_head_to_q4_0).
+        let new_lm_head = if is_gpu && !self.lm_head_on_cpu {
+            backend.copy_weight_from(&cpu_tensor)?
+        } else {
+            cpu_tensor
+        };
+
+        // Tied-weight handling: if gpu_embed_tokens shared the old lm_head
+        // cl_mem, replace it with a fresh F16 embed upload.
+        #[cfg(feature = "opencl")]
+        if is_gpu {
+            let old_lm_ptr = self.lm_head.buffer().as_ptr() as usize;
+            let shares_with_embed = self
+                .gpu_embed_tokens
+                .as_ref()
+                .map(|t| t.buffer().as_ptr() as usize == old_lm_ptr)
+                .unwrap_or(false);
+            if shares_with_embed {
+                let fresh_embed = backend.copy_weight_from(&self.embed_tokens)?;
+                self.gpu_embed_tokens = Some(fresh_embed);
+            }
+        }
+
+        self.lm_head = new_lm_head;
+        eprintln!(
+            "[lm_head] loaded from AUF Q4_0 payload ({} bytes, {} rows × {} cols, variant={})",
+            payload.bytes.len(),
+            rows,
+            cols,
+            payload.variant_tag,
+        );
+        Ok(())
+    }
+
     /// Make GPU-primary weight buffers CPU-accessible by mapping UnifiedBuffers.
     ///
     /// When `--backend opencl` with `use_zero_copy=true`, `copy_from()` creates

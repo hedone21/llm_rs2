@@ -1062,40 +1062,143 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Sprint F (2026-04-26): one-shot lm_head Q4_0 quantization. Closes the
-    // F16-vs-Q4 lm_head matmul gap that drives the ratio=1.0 mixed weight-swap
-    // TBT regression. Runs once after weights are GPU-resident; embed_tokens
-    // stays untouched even on tied-weight models.
+    // Sprint F/G-1-D (2026-04-26): one-shot lm_head Q4_0 load.
     //
-    // `auto` (default): on when `--secondary-gguf` is set AND lm_head is
-    // not already Q4_0. Pure win for AUF/weight-swap users; no-op on Q4
-    // baseline (lm_head already Q4_0 → quantize_lm_head_to_q4_0 returns
-    // false). Skipped on plain F16-only runs to preserve legacy behaviour.
+    // Mode `auto` (default):
+    //   1. AUF secondary with lm_head Q4_0 entry (capability bit 2 = 1)
+    //      → zero-copy AUF path (~0 ms).
+    //   2. AUF capability bit 2 = 0, or non-AUF secondary present
+    //      → runtime quantize fallback (Sprint F, ~hundreds of ms).
+    //   3. No secondary at all → skip (preserve legacy F16 behaviour).
+    //
+    // Mode `q4_0`: force runtime quantize regardless of AUF entry (debug).
+    // Mode `none`/`off`: skip entirely (legacy F16).
     let qlm = args.quantize_lm_head.to_ascii_lowercase();
-    let do_quantize_lm_head = match qlm.as_str() {
-        "none" | "off" => false,
-        "auto" | "" => args.secondary_gguf.is_some(),
-        "q4_0" | "q4" => true,
+    match qlm.as_str() {
+        "none" | "off" => {
+            // F16 preserved — no action.
+        }
+        "auto" | "" => {
+            if args.secondary_gguf.is_some() {
+                // Try AUF lm_head entry first.
+                // Note: payload.bytes borrows model.secondary_mmap (mmap lifetime).
+                // We extract the bytes into an owned Vec before calling
+                // load_lm_head_from_auf (which mutably borrows model) to satisfy
+                // the borrow checker.
+                let vocab_size = model.config.vocab_size;
+                let hidden_size = model.config.hidden_size;
+                // Resolve AUF lm_head payload: (bytes_owned, shape, variant_tag, is_none_ok)
+                // or None (GGUF secondary).
+                enum LmHeadAufResolution {
+                    /// AUF entry found — owned bytes ready for load.
+                    Found {
+                        bytes: Vec<u8>,
+                        shape: [usize; 2],
+                        variant_tag: &'static str,
+                    },
+                    /// AUF present but no lm_head entry (bit 2 = 0).
+                    AbsentFallback,
+                    /// INV-135 violation.
+                    Error(llm_rs2::auf::AufError),
+                    /// Non-AUF secondary or no secondary.
+                    NotAuf,
+                }
+                let resolution = {
+                    match model
+                        .secondary_mmap
+                        .as_ref()
+                        .and_then(|sm| sm.as_auf_view())
+                        .map(|view| view.lm_head_q4_0_payload(vocab_size, hidden_size))
+                    {
+                        Some(Ok(Some(payload))) => LmHeadAufResolution::Found {
+                            bytes: payload.bytes.to_vec(),
+                            shape: payload.shape,
+                            variant_tag: payload.variant_tag,
+                        },
+                        Some(Ok(None)) => LmHeadAufResolution::AbsentFallback,
+                        Some(Err(e)) => LmHeadAufResolution::Error(e),
+                        None => LmHeadAufResolution::NotAuf,
+                    }
+                };
+
+                match resolution {
+                    LmHeadAufResolution::Found {
+                        bytes,
+                        shape,
+                        variant_tag,
+                    } => {
+                        // AUF path: lm_head Q4_0 entry found — load from owned bytes (~0 ms quantize).
+                        eprintln!(
+                            "[Backend] lm_head: loading from AUF Q4_0 entry (~0 ms quantize, variant={variant_tag})"
+                        );
+                        // Build a synthetic LmHeadPayload with owned bytes.
+                        let payload = llm_rs2::auf::LmHeadPayload {
+                            bytes: &bytes,
+                            shape,
+                            dtype: llm_rs2::auf::TensorDType::Q4_0,
+                            alignment: 65536,
+                            variant_tag,
+                        };
+                        model
+                            .load_lm_head_from_auf(&payload, &backend)
+                            .map_err(|e| {
+                                anyhow::anyhow!("--quantize-lm-head AUF load failed: {e}")
+                            })?;
+                    }
+                    LmHeadAufResolution::AbsentFallback => {
+                        // AUF present but no lm_head entry (bit 2 = 0, v0.1.0) → runtime fallback.
+                        eprintln!(
+                            "[Backend] lm_head: AUF entry absent (capability bit 2 = 0), runtime quantize"
+                        );
+                        let t_q = std::time::Instant::now();
+                        match model.quantize_lm_head_to_q4_0(&backend) {
+                            Ok(true) => eprintln!(
+                                "[Backend] Quantized lm_head → Q4_0 in {:.1} ms (mode=auto/runtime-fallback)",
+                                t_q.elapsed().as_secs_f64() * 1000.0,
+                            ),
+                            Ok(false) => {} // already Q4_0
+                            Err(e) => {
+                                anyhow::bail!("--quantize-lm-head runtime fallback failed: {e}")
+                            }
+                        }
+                    }
+                    LmHeadAufResolution::Error(e) => {
+                        // INV-135 violation (entry/dtype/shape mismatch) → fail-fast.
+                        anyhow::bail!("--quantize-lm-head AUF invariant violation (INV-135): {e}");
+                    }
+                    LmHeadAufResolution::NotAuf => {
+                        // Non-AUF secondary (GGUF) or no secondary at all → runtime quantize.
+                        let t_q = std::time::Instant::now();
+                        match model.quantize_lm_head_to_q4_0(&backend) {
+                            Ok(true) => eprintln!(
+                                "[Backend] Quantized lm_head → Q4_0 in {:.1} ms (mode=auto)",
+                                t_q.elapsed().as_secs_f64() * 1000.0,
+                            ),
+                            Ok(false) => {} // already Q4_0
+                            Err(e) => anyhow::bail!("--quantize-lm-head failed: {e}"),
+                        }
+                    }
+                }
+            }
+            // No secondary → skip (plain F16 run, legacy behaviour preserved).
+        }
+        "q4_0" | "q4" => {
+            // Forced runtime quantize — AUF entry ignored (regression / debug mode).
+            eprintln!("[Backend] lm_head: forced runtime quantize (AUF entry ignored, mode=q4_0)");
+            let t_q = std::time::Instant::now();
+            match model.quantize_lm_head_to_q4_0(&backend) {
+                Ok(true) => eprintln!(
+                    "[Backend] Quantized lm_head → Q4_0 in {:.1} ms (mode=q4_0)",
+                    t_q.elapsed().as_secs_f64() * 1000.0,
+                ),
+                Ok(false) => eprintln!("[Backend] lm_head already Q4_0 — quantize skipped"),
+                Err(e) => anyhow::bail!("--quantize-lm-head failed: {e}"),
+            }
+        }
         other => anyhow::bail!(
             "Unknown --quantize-lm-head value: {}. Use 'auto', 'none', or 'q4_0'.",
             other
         ),
-    };
-    if do_quantize_lm_head {
-        let t_q = std::time::Instant::now();
-        match model.quantize_lm_head_to_q4_0(&backend) {
-            Ok(true) => eprintln!(
-                "[Backend] Quantized lm_head → Q4_0 in {:.1} ms (mode={})",
-                t_q.elapsed().as_secs_f64() * 1000.0,
-                qlm
-            ),
-            Ok(false) => {
-                if qlm == "q4_0" || qlm == "q4" {
-                    eprintln!("[Backend] lm_head already Q4_0 — quantize skipped");
-                }
-            }
-            Err(e) => anyhow::bail!("--quantize-lm-head failed: {e}"),
-        }
     }
 
     // CUDA: migrate weights to pinned host memory for cuBLAS access.

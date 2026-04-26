@@ -120,6 +120,12 @@ mod test_eng_dat_096_auf_secondary;
 #[path = "spec/test_auf_e2e_sanity.rs"]
 mod test_auf_e2e_sanity;
 
+// ── Sprint G-1-D — INV-135/136 lm_head AUF load-path ──
+// AUF lm_head Q4_0 entry: bit2=0→None(INV-136), bit2=1+ok→Some, 위반→Err.
+// SecondaryMmap::as_auf_view() accessor + round-trip.
+#[path = "spec/test_inv_135_136_lm_head_auf.rs"]
+mod test_inv_135_136_lm_head_auf;
+
 // ── Weight Swap INV-122 v2 — Mixed Precision Forward 정확성 ──
 // cond1: NMSE ≤ 0.01 (F16 baseline 대비), cond2: Δ top-1 ≤ 1 pp (Q4_0 baseline 대비).
 // 환경변수 LLM_RS_TEST_MODEL_F16 / LLM_RS_TEST_MODEL_Q4 미설정 시 graceful skip.
