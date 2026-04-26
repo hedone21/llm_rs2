@@ -1085,7 +1085,7 @@
 
 ## [P2] WSWAP-5-PRIMARY-DROP. F16 primary cl_mem 145개 lifecycle audit + release
 
-- **Status**: DONE (host-side, 2026-04-26)
+- **Status**: DONE host-side (2026-04-26, `f407a70`)
 - **Sprint**: current
 - **Dependencies**: WSWAP-5-AUF-PLACEHOLDER-DROP
 - **담당 권장**: Senior Implementer (lifecycle audit) + Architect (swap-back 정책 결정)
