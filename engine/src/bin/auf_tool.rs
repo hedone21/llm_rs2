@@ -74,9 +74,44 @@ struct BuildArgs {
     #[arg(long, value_name = "STRING")]
     created_by: Option<String>,
 
+    /// lm_head Q4_0 사전 변환 (v0.1.1, Sprint G-1).
+    ///
+    /// - `auto` (기본값): GGUF lm_head dtype != Q4_0이면 quantize, 이미 Q4_0이면
+    ///   AOS bytes를 entry로 그대로 동봉.
+    /// - `on`: 강제 quantize (이미 Q4_0이면 AOS bytes 동봉).
+    /// - `off`: lm_head Q4_0 entry 미포함 (v0.1.0 byte-level 호환 출력,
+    ///   capability bit 2 = 0, format_patch = 0).
+    #[arg(long, value_name = "MODE", default_value = "auto")]
+    include_lm_head: String,
+
     /// 진행 로그 출력 억제
     #[arg(long)]
     quiet: bool,
+}
+
+/// `--include-lm-head` 모드.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncludeLmHeadMode {
+    /// lm_head Q4_0 entry 미포함 (v0.1.0 호환).
+    Off,
+    /// 강제 포함 (이미 Q4_0이면 그대로 동봉, F16/F32 → Q4_0 quantize).
+    On,
+    /// auto: GGUF lm_head dtype에 따라. 비-Q4_0 → quantize, Q4_0 → 그대로 동봉.
+    Auto,
+}
+
+impl IncludeLmHeadMode {
+    fn parse(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Ok(IncludeLmHeadMode::Auto),
+            "on" | "true" | "yes" | "1" => Ok(IncludeLmHeadMode::On),
+            "off" | "false" | "no" | "0" => Ok(IncludeLmHeadMode::Off),
+            other => bail!(
+                "Invalid --include-lm-head '{}'. Valid: auto, on, off",
+                other
+            ),
+        }
+    }
 }
 
 // ── info ──────────────────────────────────────────────────────────────────
@@ -357,6 +392,7 @@ fn q4_0_aos_with_align(blocks: &[u8], alignment: usize) -> Vec<u8> {
 fn cmd_build(args: BuildArgs) -> Result<()> {
     // 1) variant 파싱
     let variant_tags = parse_variants(&args.variants)?;
+    let lm_head_mode = IncludeLmHeadMode::parse(&args.include_lm_head)?;
     let quiet = args.quiet;
 
     if !quiet {
@@ -366,6 +402,7 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
             args.output.display()
         );
         eprintln!("[auf-tool] Variants: {:?}", variant_tags);
+        eprintln!("[auf-tool] include_lm_head: {:?}", lm_head_mode);
     }
 
     // 2) source_hash 계산
@@ -416,12 +453,24 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     // Q4_0 tensor raw bytes 추출 (공통, variant마다 재사용)
     // 순서: layer 0..N의 wq, wk, wv, wo, w_gate, w_up, w_down 순
     // permute가 필요한 wq/wk에는 unpermute_qk_rows 적용
+    // lm_head는 `lm_head_mode`에 따라 Q4_0 quantize 적용 (Sprint G-1).
     if !quiet {
         eprint!("[auf-tool] Extracting weight tensors...");
     }
-    let tensor_blobs = extract_weight_blobs(&gguf, &config, quiet)?;
+    let (tensor_blobs, lm_head_q4_0_present) =
+        extract_weight_blobs(&gguf, &config, lm_head_mode, quiet)?;
     if !quiet {
         eprintln!(" {} tensors extracted", tensor_blobs.len());
+    }
+
+    // capability_optional bit 2 설정 여부 결정 (Sprint G-1).
+    // - lm_head Q4_0 entry가 실제로 추가/유지된 경우만 set.
+    // - Off 모드 또는 tied 모델 (lm_head 없음)에서는 unset → v0.1.0 호환.
+    writer = writer.with_lm_head_q4_0(lm_head_q4_0_present);
+    if !quiet && lm_head_q4_0_present {
+        eprintln!(
+            "[auf-tool] LM_HEAD_PRECOMPUTED_Q4_0 capability bit 2 = 1 (format_patch=1, v0.1.1)"
+        );
     }
 
     // TensorIndex 구성 (weights payload 추가 전에 offset 계산)
@@ -473,27 +522,97 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
 /// `shape_logical`은 outermost-first (논리적 순서).
 type WeightBlob = (String, Vec<u8>, Vec<u64>);
 
-/// `WeightBlob` 목록 추출.
+/// GGUF ggml_type 코드 (subset, lm_head 분기에서 사용).
+///
+/// `gguf.rs`의 private 상수와 동일하지만 binary crate에서 접근할 수 없으므로 로컬에 둔다.
+const GGML_TYPE_F32: u32 = 0;
+const GGML_TYPE_F16: u32 = 1;
+const GGML_TYPE_Q4_0: u32 = 2;
+
+/// `WeightBlob` 목록 추출 + lm_head Q4_0 사전 변환 (선택).
 ///
 /// GGUF는 innermost-first로 dims를 저장하므로, 여기서 reverse하여 logical order로 반환한다.
 /// AUF TensorEntry.shape에는 logical order(outermost-first)로 저장하며,
 /// reader(`secondary_mmap.rs`)에서 다시 reverse하여 GGUF order로 복원한다.
+///
+/// `lm_head_mode`에 따라 `output.weight` (lm_head)을 다음과 같이 처리한다:
+/// - `Off`: GGUF에 존재하면 raw bytes를 그대로 추출 (기존 동작).
+/// - `On`/`Auto`: GGUF dtype 분기:
+///   - 이미 Q4_0이면 raw bytes를 그대로 추출 (variant payload는 layer weight와 동일하게 SOA/AOS).
+///   - F16/F32 → F32 dequantize → Q4_0 quantize → 변환된 18B/block bytes로 교체.
+///   - 그 외 dtype은 변환 미지원으로 Off 동작.
+///
+/// 반환 튜플 두 번째 값은 lm_head Q4_0 entry가 *실제로* 추가/유지되었는지 (capability bit 2 set
+/// 결정에 사용). lm_head tensor 자체가 GGUF에 없거나(tied) Off 모드면 false.
 fn extract_weight_blobs(
     gguf: &llm_rs2::models::loader::gguf::GgufFile,
     config: &llm_rs2::models::config::ModelConfig,
+    lm_head_mode: IncludeLmHeadMode,
     quiet: bool,
-) -> Result<Vec<WeightBlob>> {
+) -> Result<(Vec<WeightBlob>, bool)> {
     let mut blobs: Vec<WeightBlob> = Vec::new();
+    let mut lm_head_q4_0_present = false;
 
-    // cross-layer tensors
-    let cross_names = ["token_embd.weight", "output_norm.weight", "output.weight"];
-    for &name in &cross_names {
+    // cross-layer tensors. lm_head ("output.weight")은 모드에 따라 별도 처리.
+    let regular_cross = ["token_embd.weight", "output_norm.weight"];
+    for &name in &regular_cross {
         if let Some(info) = gguf.find_tensor(name) {
             let data = gguf.tensor_data(info);
             // GGUF dims는 innermost-first → reversed = outermost-first (logical)
             let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
             blobs.push((name.to_owned(), data.to_vec(), shape_logical));
         }
+    }
+
+    // lm_head ("output.weight") — `lm_head_mode` 에 따라 분기.
+    let lm_head_name = "output.weight";
+    if let Some(info) = gguf.find_tensor(lm_head_name) {
+        let raw = gguf.tensor_data(info);
+        let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
+        let is_q4_0 = info.ggml_type == GGML_TYPE_Q4_0;
+
+        match lm_head_mode {
+            IncludeLmHeadMode::Off => {
+                // 기존 동작 — raw bytes (F16/F32/Q4_0 그대로). capability bit는 set하지 않음.
+                blobs.push((lm_head_name.to_owned(), raw.to_vec(), shape_logical));
+            }
+            IncludeLmHeadMode::On | IncludeLmHeadMode::Auto => {
+                if is_q4_0 {
+                    // 이미 Q4_0 — quantize 불필요. AOS bytes를 그대로 동봉.
+                    if !quiet {
+                        eprintln!(
+                            "[auf-tool] lm_head: GGUF dtype is already Q4_0 ({} bytes), \
+                             entry included as-is",
+                            raw.len()
+                        );
+                    }
+                    blobs.push((lm_head_name.to_owned(), raw.to_vec(), shape_logical));
+                    lm_head_q4_0_present = true;
+                } else if info.ggml_type == GGML_TYPE_F16 || info.ggml_type == GGML_TYPE_F32 {
+                    // F16/F32 → F32 dequantize → Q4_0 quantize.
+                    let q4_bytes =
+                        quantize_lm_head_to_q4_0(raw, &shape_logical, info.ggml_type, quiet)?;
+                    blobs.push((lm_head_name.to_owned(), q4_bytes, shape_logical));
+                    lm_head_q4_0_present = true;
+                } else {
+                    // 미지원 dtype (Q4_K, Q8_0 등) — fallback: raw bytes + bit 미설정.
+                    if !quiet {
+                        eprintln!(
+                            "[auf-tool] Warning: lm_head dtype={} unsupported for Q4_0 quantize; \
+                             entry included as raw bytes (capability bit 2 not set)",
+                            info.ggml_type
+                        );
+                    }
+                    blobs.push((lm_head_name.to_owned(), raw.to_vec(), shape_logical));
+                }
+            }
+        }
+    } else if lm_head_mode != IncludeLmHeadMode::Off && !quiet {
+        // tied embeddings — `output.weight` 가 GGUF에 없음.
+        eprintln!(
+            "[auf-tool] Note: GGUF has no 'output.weight' (tied embeddings). \
+             lm_head Q4_0 entry skipped, capability bit 2 not set."
+        );
     }
 
     // per-layer tensors (모든 레이어)
@@ -536,7 +655,83 @@ fn extract_weight_blobs(
         }
     }
 
-    Ok(blobs)
+    Ok((blobs, lm_head_q4_0_present))
+}
+
+/// GGUF lm_head (F16 or F32) → F32 dequantize → Q4_0 quantize → 18B/block bytes.
+///
+/// `convert::quantize_q4_0`(layer weight도 동일하게 사용)을 재사용한다 — 신규 변환
+/// 함수 작성 금지 (Sprint G-1-A 결정). 결정성은 `quantize_q4_0`의 단순 max-abs scaling
+/// 루프가 부동소수점 reduction 순서를 고정하므로 호스트 결정적이다 (ENG-DAT-096.13).
+///
+/// 변환 시간을 stderr로 기록한다 (Sprint G-1 요구).
+fn quantize_lm_head_to_q4_0(
+    raw: &[u8],
+    shape_logical: &[u64],
+    ggml_type: u32,
+    quiet: bool,
+) -> Result<Vec<u8>> {
+    use llm_rs2::core::quant::{BlockQ4_0, QK4_0};
+    use llm_rs2::models::loader::convert::{f16_to_f32, quantize_q4_0};
+
+    if shape_logical.len() != 2 {
+        bail!("lm_head must be 2-D (got shape={:?})", shape_logical);
+    }
+    let rows = shape_logical[0] as usize; // outermost (vocab)
+    let cols = shape_logical[1] as usize; // innermost (hidden)
+    if !cols.is_multiple_of(QK4_0) {
+        bail!(
+            "lm_head inner dim ({}) is not a multiple of QK4_0 ({}); cannot quantize to Q4_0",
+            cols,
+            QK4_0
+        );
+    }
+    let numel = rows * cols;
+
+    let t0 = std::time::Instant::now();
+
+    // Step 1: dequantize to F32 host buffer.
+    let mut f32_data = vec![0.0f32; numel];
+    match ggml_type {
+        GGML_TYPE_F16 => {
+            f16_to_f32(raw, &mut f32_data, numel);
+        }
+        GGML_TYPE_F32 => {
+            // SAFETY: GGUF F32 is little-endian f32 array of length `numel`.
+            let src = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, numel) };
+            f32_data.copy_from_slice(src);
+        }
+        other => {
+            bail!(
+                "quantize_lm_head_to_q4_0: unsupported ggml_type={} (expected F16 or F32)",
+                other
+            );
+        }
+    }
+
+    // Step 2: quantize to Q4_0 blocks (layer weight와 동일 함수).
+    let blocks = quantize_q4_0(&f32_data, rows, cols);
+    let block_bytes_each = std::mem::size_of::<BlockQ4_0>(); // 18B
+    let total_bytes = blocks.len() * block_bytes_each;
+
+    // SAFETY: BlockQ4_0 is `#[repr(C)]` with size 18 (asserted at compile time
+    // in core::quant). Reading its bytes through `from_raw_parts` is well-defined.
+    let block_bytes_view =
+        unsafe { std::slice::from_raw_parts(blocks.as_ptr() as *const u8, total_bytes) };
+    let bytes_out = block_bytes_view.to_vec();
+
+    let elapsed = t0.elapsed();
+    if !quiet {
+        eprintln!(
+            "[auf-tool] lm_head Q4_0 quantize: {:.2}s, output {} MB ({}×{}, {} blocks)",
+            elapsed.as_secs_f64(),
+            total_bytes / (1024 * 1024),
+            rows,
+            cols,
+            blocks.len(),
+        );
+    }
+    Ok(bytes_out)
 }
 
 /// Llama Q/K weight 행 permute가 필요한지 판단하고 (n_head, head_dim) 반환.
@@ -842,7 +1037,15 @@ fn cmd_info(args: InfoArgs) -> Result<()> {
     println!("  source_size      : {} bytes", h.source_size);
     println!("  source_mtime     : {}", source_mtime_str);
     println!("  capability_req   : {:#018x}", h.capability_required);
-    println!("  capability_opt   : {:#018x}", h.capability_optional);
+    println!(
+        "  capability_opt   : {:#018x}{}",
+        h.capability_optional,
+        if h.has_lm_head_q4_0() {
+            " (LM_HEAD_PRECOMPUTED_Q4_0)"
+        } else {
+            ""
+        }
+    );
     println!("  section_count    : {}", h.section_count);
     println!(
         "  payload_start    : {:#x} ({})",
@@ -1443,6 +1646,181 @@ mod tests {
         assert!(s.contains("2026"), "Expected 2026 in '{}'", s);
         assert!(s.contains("04"), "Expected month 04 in '{}'", s);
         assert!(s.contains("25"), "Expected day 25 in '{}'", s);
+    }
+
+    #[test]
+    fn parse_include_lm_head_modes() {
+        assert_eq!(
+            IncludeLmHeadMode::parse("auto").unwrap(),
+            IncludeLmHeadMode::Auto
+        );
+        assert_eq!(
+            IncludeLmHeadMode::parse("AUTO").unwrap(),
+            IncludeLmHeadMode::Auto
+        );
+        assert_eq!(
+            IncludeLmHeadMode::parse("on").unwrap(),
+            IncludeLmHeadMode::On
+        );
+        assert_eq!(
+            IncludeLmHeadMode::parse("off").unwrap(),
+            IncludeLmHeadMode::Off
+        );
+        assert_eq!(
+            IncludeLmHeadMode::parse(" off ").unwrap(),
+            IncludeLmHeadMode::Off
+        );
+        assert!(IncludeLmHeadMode::parse("invalid").is_err());
+    }
+
+    #[test]
+    fn lm_head_q4_0_quantize_deterministic() {
+        // 같은 F32 입력으로 두 번 quantize 했을 때 byte-level 동일한지 확인.
+        // ENG-DAT-096.13 (writer 결정성) 핵심 invariant.
+        let rows = 4usize;
+        let cols = 64usize; // 2 blocks/row × 4 rows = 8 blocks → 144 bytes
+        let mut f32_buf = vec![0.0f32; rows * cols];
+        // pseudo-random 시퀀스 (deterministic seed).
+        for (i, v) in f32_buf.iter_mut().enumerate() {
+            *v = ((i as f32) * 0.0173).sin();
+        }
+        // F32 → little-endian byte slice.
+        let raw_bytes: Vec<u8> = f32_buf.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let shape: Vec<u64> = vec![rows as u64, cols as u64];
+
+        let out1 = quantize_lm_head_to_q4_0(&raw_bytes, &shape, GGML_TYPE_F32, true).unwrap();
+        let out2 = quantize_lm_head_to_q4_0(&raw_bytes, &shape, GGML_TYPE_F32, true).unwrap();
+        assert_eq!(out1, out2, "lm_head Q4_0 quantize must be deterministic");
+        // 8 blocks × 18B = 144B
+        assert_eq!(out1.len(), rows * cols / 32 * 18);
+    }
+
+    #[test]
+    fn lm_head_q4_0_quantize_rejects_non_q4_0_aligned_cols() {
+        let shape: Vec<u64> = vec![4, 17]; // 17 is not a multiple of 32
+        let raw = vec![0u8; 4 * 17 * 4];
+        let err = quantize_lm_head_to_q4_0(&raw, &shape, GGML_TYPE_F32, true).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("multiple of QK4_0"), "got: {msg}");
+    }
+
+    #[test]
+    fn lm_head_q4_0_quantize_rejects_unsupported_dtype() {
+        let shape: Vec<u64> = vec![1, 32];
+        let raw = vec![0u8; 32 * 4];
+        // GGML_TYPE_Q4_0 (already quantized) should NOT be re-quantized via this helper.
+        let err = quantize_lm_head_to_q4_0(&raw, &shape, GGML_TYPE_Q4_0, true).unwrap_err();
+        assert!(format!("{err}").contains("unsupported ggml_type"));
+    }
+
+    #[test]
+    fn writer_with_lm_head_q4_0_sets_bit2_and_patch() {
+        use llm_rs2::auf::header::CAPABILITY_BIT_LM_HEAD_Q4_0;
+        use llm_rs2::auf::{AufHeader, AufMeta, AufTokenizer, AufWriter};
+
+        let meta = AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: 1,
+            n_heads_q: 2,
+            n_kv_heads: 1,
+            head_dim: 4,
+            hidden_dim: 8,
+            ffn_dim: 16,
+            vocab_size: 3,
+            max_seq_len: 64,
+            rope_theta: 10000.0,
+            rotary_dim: 4,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+        };
+        let tok = AufTokenizer {
+            kind: TOKENIZER_KIND_BPE,
+            tokens: vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()],
+            merges: vec![],
+            bos_id: 0,
+            eos_id: 1,
+            pad_id: -1,
+            unk_id: -1,
+            chat_template: None,
+        };
+
+        // (1) with_lm_head_q4_0(true) → bit 2 set, format_patch = 1.
+        let bytes_on = AufWriter::new(meta.clone(), tok.clone(), [0u8; 32], 100, 200)
+            .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, vec![1u8; 64])
+            .with_lm_head_q4_0(true)
+            .build()
+            .unwrap();
+        let hdr_on = AufHeader::from_bytes(&bytes_on).unwrap();
+        assert_eq!(hdr_on.format_patch, 1);
+        assert_ne!(
+            hdr_on.capability_optional & CAPABILITY_BIT_LM_HEAD_Q4_0,
+            0,
+            "bit 2 must be set"
+        );
+        assert!(hdr_on.has_lm_head_q4_0());
+
+        // (2) with_lm_head_q4_0(false) (default) → bit 2 clear, format_patch = 0.
+        let bytes_off = AufWriter::new(meta, tok, [0u8; 32], 100, 200)
+            .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, vec![1u8; 64])
+            .build()
+            .unwrap();
+        let hdr_off = AufHeader::from_bytes(&bytes_off).unwrap();
+        assert_eq!(hdr_off.format_patch, 0);
+        assert_eq!(hdr_off.capability_optional & CAPABILITY_BIT_LM_HEAD_Q4_0, 0);
+        assert!(!hdr_off.has_lm_head_q4_0());
+    }
+
+    #[test]
+    fn writer_off_byte_level_compatible_with_v0_1_0() {
+        // INV-136 회귀 방지: Off 모드 (capability bit 2 = 0)에서 작성된 AUF 헤더는
+        // v0.1.0 출력과 동일한 format 필드를 가져야 한다 (format_patch=0, capability=0).
+        use llm_rs2::auf::{AufHeader, AufMeta, AufTokenizer, AufWriter};
+
+        let meta = AufMeta {
+            architecture: "llama".to_owned(),
+            n_layers: 1,
+            n_heads_q: 2,
+            n_kv_heads: 1,
+            head_dim: 4,
+            hidden_dim: 8,
+            ffn_dim: 16,
+            vocab_size: 3,
+            max_seq_len: 64,
+            rope_theta: 10000.0,
+            rotary_dim: 4,
+            rope_scaling: 1.0,
+            rms_norm_epsilon: 1e-5,
+        };
+        let tok = AufTokenizer {
+            kind: TOKENIZER_KIND_BPE,
+            tokens: vec![b"a".to_vec()],
+            merges: vec![],
+            bos_id: 0,
+            eos_id: 0,
+            pad_id: -1,
+            unk_id: -1,
+            chat_template: None,
+        };
+        // 명시적으로 false 호출 vs 기본값 모두 동일 결과여야 함.
+        let bytes_default = AufWriter::new(meta.clone(), tok.clone(), [0u8; 32], 100, 200)
+            .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, vec![0xAAu8; 64])
+            .build()
+            .unwrap();
+        let bytes_explicit_off = AufWriter::new(meta, tok, [0u8; 32], 100, 200)
+            .add_weights_section(TAG_WEIGHTS_ADRENO_SOA, vec![0xAAu8; 64])
+            .with_lm_head_q4_0(false)
+            .build()
+            .unwrap();
+        assert_eq!(
+            bytes_default, bytes_explicit_off,
+            "with_lm_head_q4_0(false) must match default"
+        );
+        let hdr = AufHeader::from_bytes(&bytes_default).unwrap();
+        assert_eq!(hdr.format_major, 0);
+        assert_eq!(hdr.format_minor, 1);
+        assert_eq!(hdr.format_patch, 0);
+        assert_eq!(hdr.capability_required, 0);
+        assert_eq!(hdr.capability_optional, 0);
     }
 
     #[test]

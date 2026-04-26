@@ -34,6 +34,11 @@ pub struct AufWriter {
     tensor_index: Option<TensorIndex>,
     /// 생성 도구 이름
     created_by: String,
+    /// lm_head Q4_0 사전 변환이 포함되었는지 (v0.1.1, Sprint G-1).
+    ///
+    /// `true`이면 `build()`에서 `capability_optional` bit 2 set + format_patch = 1.
+    /// `false`이면 v0.1.0 byte-level 호환 출력.
+    lm_head_q4_0_present: bool,
 }
 
 impl AufWriter {
@@ -53,7 +58,17 @@ impl AufWriter {
             weights_sections: Vec::new(),
             tensor_index: None,
             created_by: "llm_rs2 v0.1.0".to_owned(),
+            lm_head_q4_0_present: false,
         }
+    }
+
+    /// `LM_HEAD_PRECOMPUTED_Q4_0` capability를 선언한다 (v0.1.1, Sprint G-1).
+    ///
+    /// `true`이면 `build()`가 `capability_optional` bit 2 set + format_patch = 1.
+    /// `false` (기본값)이면 v0.1.0 호환 출력.
+    pub fn with_lm_head_q4_0(mut self, enabled: bool) -> Self {
+        self.lm_head_q4_0_present = enabled;
+        self
     }
 
     /// `created_by` 문자열 설정 (최대 32B).
@@ -166,7 +181,7 @@ impl AufWriter {
         let total_size = cursor; // 마지막 cursor가 파일 끝 (align-up 후)
 
         // (5) header 생성
-        let header = AufHeader::new_v01(
+        let mut header = AufHeader::new_v01(
             &self.created_by,
             self.source_hash,
             self.source_size,
@@ -175,6 +190,9 @@ impl AufWriter {
             section_table_offset,
             payload_start_offset,
         );
+        // v0.1.1 (Sprint G-1): lm_head Q4_0 사전 변환 capability 선언.
+        // 미선언 시 v0.1.0 byte-level 호환 (format_patch = 0, bit 2 = 0).
+        header.set_lm_head_q4_0_capability(self.lm_head_q4_0_present);
 
         // (6) 파일 바이트 조립
         let mut out: Vec<u8> = vec![0u8; total_size as usize];
