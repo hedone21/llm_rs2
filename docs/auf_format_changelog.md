@@ -38,6 +38,78 @@
 
 ---
 
+## v0.1.1 — 2026-04-26 (Sprint G-1: lm_head Q4_0 사전 변환)
+
+> **상태**: Experimental. `format_major = 0`이므로 forward/backward 호환성 보장 안 함.
+> **도입 컨텍스트**: Phase 6 Sprint G-1. Sprint F에서 lm_head F16→Q4_0 runtime quantize로 ratio=1.0 mixed weight-swap TBT 회귀(+24.7%) 회수 완료. 잔여 비용 = model load 시점 ~1.4 s quantize. 본 v0.1.1은 build 시점에 lm_head Q4_0 payload를 backend variant section에 동봉하여 cold-start latency 제거.
+> **호환성**: v0.1.0과 **byte-level 호환**. 신규 capability bit 2는 optional이므로 구 reader가 무시한다. 신 reader가 v0.1.0 AUF를 만나면 capability bit 2 = 0으로 판정하여 runtime quantize fallback 정상 동작. format_major / format_minor는 변경 없음 (additive 변경, patch 증가).
+
+### Added
+- **capability_optional bit 2 = `LM_HEAD_PRECOMPUTED_Q4_0`** 신설.
+  - 1: lm_head를 build 시점에 Q4_0으로 사전 quantize하여 backend variant section에 동봉.
+  - 0: lm_head는 GGUF 원본 dtype 그대로 (또는 backend variant section에 미포함).
+  - reader는 bit 0 시 runtime quantize fallback. bit 1 시 AUF section에서 직접 매핑.
+- **TENSOR_INDEX `kind = 11(lm_head)` entry 의미 확장** (ENG-DAT-096.12 추가).
+  - lm_head Q4_0 사전 변환 시 entry의 `dtype = Q4_0`, `shape = [vocab_size, hidden_dim]` (GGUF 원본 그대로), `variant_offsets`가 backend variant section 내부의 사전 변환 payload offset을 가리킨다.
+  - cross-layer tensor의 `layer_idx = u32::MAX` 규칙은 그대로 적용.
+  - layout: layer weight와 동일 (Adreno SOA / CUDA AOS / CPU AOS).
+- **결정성 요구사항** ENG-DAT-096.13 명시. 동일 GGUF + 동일 build option + 동일 host → byte-level 동일 AUF.
+
+### Changed
+- 기존 capability_optional bit position 권고 갱신:
+  - bit 2 = `LM_HEAD_PRECOMPUTED_Q4_0` (신규 할당).
+  - bit 3 = `UNIGRAM_TOKENIZER` (구 권고 bit 2에서 이동).
+- TENSOR_INDEX cross-layer tensor entry 의미를 "GGUF 원본 dtype 보존"에서 "build 시점 backend-specific dtype downgrade 결과"로 확장.
+
+### Removed / Deprecated
+- 없음.
+
+### Compatibility
+- **v0.1.0과 byte-level 호환**.
+  - 구 reader(v0.1.0) + 신 AUF(v0.1.1, bit 2 set): bit 2는 optional이므로 reject 사유 아님. 구 reader는 lm_head를 GGUF에서 다시 quantize하는 fallback 경로를 거치며 동작 정상 (cold-start latency 비용은 남는다).
+  - 신 reader(v0.1.1) + 구 AUF(v0.1.0, bit 2 = 0): runtime quantize fallback. Sprint F 동작 그대로 보존.
+- format_major / format_minor 변경 없음. format_patch만 증가.
+
+### Capability bits (snapshot — v0.1.1)
+
+| Field | Bit | Name | 의미 | 상태 |
+|-------|-----|------|------|------|
+| `capability_required` | 0..63 | (none) | 사용 안 함 | 모두 0 |
+| `capability_optional` | 0 | `SOURCE_HASH_FULL_SHA256` | reserved | 미할당 |
+| `capability_optional` | 1 | `IMAGE2D_PRECOMPUTED` | reserved | 미할당 |
+| `capability_optional` | 2 | `LM_HEAD_PRECOMPUTED_Q4_0` | lm_head Q4_0 사전 변환 | **v0.1.1 도입** |
+| `capability_optional` | 3..63 | (none) | reserved | 모두 0 |
+
+### Section catalog (snapshot — v0.1.1)
+
+v0.1.0과 동일 (6개 tag). lm_head Q4_0 payload는 신규 section을 만들지 않고 기존 `WEIGHTS_<backend>` 내부에 layer weight와 동일 layout으로 동봉.
+
+### Implementation notes
+- Writer (`auf-tool build`):
+  - 신규 옵션 `--include-lm-head <on|off|auto>` (default `auto`).
+  - `auto`: GGUF lm_head dtype이 Q4_0이 아니면 quantize.
+  - `on`: 강제 (이미 Q4_0이면 no-op).
+  - `off`: skip → v0.1.0 호환 출력, capability_optional bit 2 = 0.
+  - quantize는 `quantize_q4_0` 결정성 함수 사용. SOA 변환은 host에서 deterministic kernel.
+- Reader: `lm_head_q4_0_payload() -> Option<LmHeadPayload>` accessor 신설. capability bit 2 검사 + TENSOR_INDEX entry lookup.
+- model load 분기 (`transformer.rs`): AUF entry 우선 → 없으면 runtime quantize fallback (Sprint F 동작 보존).
+- Engine CLI `--quantize-lm-head` 의미 갱신:
+  - `auto` (default): AUF entry 우선 → 없으면 runtime quantize.
+  - `none`: F16 유지.
+  - `q4_0`: 강제 runtime quantize (AUF entry 무시, 회귀 비교용).
+
+### Source hash 정의
+- 변경 없음. AUF 헤더의 hybrid `source_hash`(GGUF 전체)를 그대로 재사용. lm_head 단일 tensor에 대한 별도 hash 미도입.
+- 근거: deterministic build이므로 source_hash 일치는 lm_head Q4_0 일치를 함의. Llama 3.2 1B 수준에서 GGUF tail 8 MB가 lm_head 영역을 거의 항상 포함하므로 hybrid hash로도 충분. 8 B+ 모델은 v0.x에서 그대로 유지(§3.22.6 채택 결정 시점부터의 한계 그대로). 향후 `SOURCE_HASH_FULL_SHA256` capability bit으로 보강 가능.
+
+### Tests required
+- AUF roundtrip: lm_head Q4_0 entry write → read → bytes 일치.
+- 후방 호환: v0.1.0 AUF + 신 reader → bit 2 = 0 → runtime fallback.
+- 결정성: 동일 GGUF → auf-tool 2회 실행 → byte-level 일치 (host 한정).
+- 신규 INV-135 (source_hash 일치) + INV-136 (fallback 정상 동작) 테스트.
+
+---
+
 ## v0.1.0 — 2026-04-25 (Initial Draft)
 
 > **상태**: Experimental. `format_major = 0`이므로 forward/backward 호환성 보장 안 함.

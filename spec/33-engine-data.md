@@ -841,9 +841,9 @@ classDiagram
 - 소비처: ENG-ALG-215 (layer 선택), ENG-ALG-217 (QCF_swap 공식), ENG-ALG-218 (QcfEstimate 응답).
 - 불변식: INV-127 (NaN layer 제외), INV-128 (QcfEstimate payload 누수 금지).
 
-### 3.22 AUF (Argus Unified Format) v0.1 — Self-Contained Weight Asset [ENG-DAT-096]
+### 3.22 AUF (Argus Unified Format) v0.1.1 — Self-Contained Weight Asset [ENG-DAT-096]
 
-**[ENG-DAT-096]** `AUF`는 Weight Swap Phase 3.7에서 도입되는 **자립적(self-contained) 가중치 자산 포맷**이다. 단일 파일에 모델 메타데이터, tokenizer, tensor index, 그리고 backend별 사전 변환된 weight payload를 포함하며, GGUF 원본 없이도 Engine이 동작 가능하다. **multi-variant single file** 방식으로 모든 backend variant(Adreno SOA / CUDA AOS / CPU AOS)를 한 파일에 동시 보관할 수 있고, 배포 시 dead variant를 strip할 수 있다. *(MUST)*
+**[ENG-DAT-096]** `AUF`는 Weight Swap Phase 3.7에서 도입되는 **자립적(self-contained) 가중치 자산 포맷**이다. 단일 파일에 모델 메타데이터, tokenizer, tensor index, 그리고 backend별 사전 변환된 weight payload를 포함하며, GGUF 원본 없이도 Engine이 동작 가능하다. **multi-variant single file** 방식으로 모든 backend variant(Adreno SOA / CUDA AOS / CPU AOS)를 한 파일에 동시 보관할 수 있고, 배포 시 dead variant를 strip할 수 있다. v0.1.1(2026-04-26)에서 lm_head Q4_0 사전 변환(§3.22.12)이 추가되었다. *(MUST)*
 
 **파일 식별**:
 
@@ -863,9 +863,9 @@ classDiagram
 | Offset | Size | Field | Type | 의미 |
 |--------|------|-------|------|------|
 | 0 | 8 | `magic` | `[u8; 8]` | `"ARGUS_W\0"` 고정 |
-| 8 | 2 | `format_major` | `u16` | breaking change 시 증가 (v0.1 = 0) |
-| 10 | 2 | `format_minor` | `u16` | additive 변경 시 증가 (v0.1 = 1) |
-| 12 | 2 | `format_patch` | `u16` | reserved (v0.1 = 0) |
+| 8 | 2 | `format_major` | `u16` | breaking change 시 증가 (v0.1.x = 0) |
+| 10 | 2 | `format_minor` | `u16` | additive section/schema 변경 시 증가 (v0.1.x = 1) |
+| 12 | 2 | `format_patch` | `u16` | capability bit 추가 등 byte-level 호환 변경 시 증가 (v0.1.0 = 0, v0.1.1 = 1) |
 | 14 | 2 | `_pad0` | `u16` | 0으로 채움 |
 | 16 | 32 | `created_by` | `[u8; 32]` | UTF-8, 우측 NUL 패딩 (예: `"llm_rs2 v0.4.0"`) |
 | 48 | 32 | `source_hash` | `[u8; 32]` | 원본 GGUF의 sha256 (또는 hybrid hash, §3.22.6) |
@@ -1095,6 +1095,8 @@ TENSOR_INDEX section payload layout:
 
 **Cross-layer tensor**: embedding/final_norm/lm_head 도 `TENSOR_INDEX`에 포함 (`layer_idx = u32::MAX`, `kind = 9/10/11`). Phase 3.7 시점에 이들이 swap 대상은 아니지만(ENG-DAT-C11), AUF는 self-contained 자산이므로 모두 보관해야 GGUF 의존을 끊을 수 있다.
 
+**lm_head dtype downgrade (v0.1.1, ENG-DAT-096.12 참조)**: TENSOR_INDEX의 cross-layer tensor entry는 **AUF build 시점에 backend-specific dtype downgrade가 적용된 결과**를 반영한다. 예를 들어 GGUF 원본의 lm_head가 F16일 때 build에서 `--include-lm-head-q4-0`(또는 default) 옵션으로 Q4_0 quantize한 경우, 해당 entry의 `dtype`은 Q4_0(=3), `shape`은 GGUF 원본 그대로(rows/cols 보존), `variant_offsets`는 backend variant section 내부의 사전 변환된 payload offset을 가리킨다. 이는 layer weight와 **동일한 variant 분기 규칙**(Adreno SOA / CUDA AOS / CPU AOS)을 따른다. dtype downgrade가 없는 build에서는 GGUF 원본 dtype이 그대로 보존된다.
+
 #### 3.22.9 의미론 / 운영 모드 [ENG-DAT-096.9]
 
 **Mode B (self-contained, 본 spec의 운영 모드)**:
@@ -1140,6 +1142,83 @@ TENSOR_INDEX section payload layout:
 **v1.0 이후 호환성 규칙**:
 - `format_minor`만 증가 시: 기존 reader는 새 section을 무시하고 동작 (additive 변경).
 - `format_major` 증가 시: migration note 필수. `auf-tool migrate <old> <new>` 도구 제공 책임.
+
+#### 3.22.12 lm_head Q4_0 사전 변환 (v0.1.1) [ENG-DAT-096.12]
+
+**[ENG-DAT-096.12]** Sprint G-1(Phase 6, 2026-04-26)에서 도입되는 추가 의미. AUF build 시점에 GGUF 원본의 `lm_head` (Llama 3.2 1B 기준 ~525 MB F16) 을 사전에 Q4_0으로 quantize 하여 backend variant section 내부에 **layer weight와 동일한 layout**으로 저장한다. Engine load 시점의 ~1.4 s runtime quantize 비용을 제거한다. *(MAY)*
+
+**설계 결정 (G-1-A 결정 사항 1, 5)**:
+
+- **별도 section type 신설하지 않음**. lm_head Q4_0 payload는 기존 `WEIGHTS_ADRENO_SOA` / `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS` section 내부에 layer weight와 함께 보관한다. 이유: (a) lm_head는 Adreno noshuffle SOA registry에 layer weight와 동일하게 등록되어 동일한 GEMV kernel(`matmul_q4_0` decode 경로)을 사용하므로 layout이 layer weight와 동일하다 (transformer.rs `prepare_noshuffle_buffers()` line 914-917). (b) 별도 section type 신설은 backend variant 카탈로그(현재 3종)를 6종으로 늘려 strip 정책 / capability bit / reader switch logic이 모두 두 배로 복잡해진다. (c) cross-layer tensor에 대한 entry는 이미 `TENSOR_INDEX`에 `layer_idx = u32::MAX`, `kind = 11(lm_head)`로 정의되어 있으므로, payload offset만 backend variant section의 적절한 위치를 가리키면 된다.
+
+- **SOA 변환 적용**: target backend가 `WEIGHTS_ADRENO_SOA`이면 lm_head Q4_0도 SOA layout(`q_buf` + `d_buf` 분리, `q_img` 정렬 hint)으로 사전 변환하여 저장한다. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`이면 AOS 18B block 그대로 저장한다. 이는 layer weight와 동일한 variant convert 함수를 재사용한다.
+
+**Tensor entry 명세 (G-1-A 결정 사항 2)**:
+
+| 필드 | 값 (lm_head Q4_0 사전 변환 시) | 비고 |
+|------|------------------------------|------|
+| `layer_idx` | `u32::MAX` | cross-layer tensor 표시 |
+| `kind` | `11` (`lm_head`) | ENG-DAT-096.8 카탈로그 그대로 |
+| `dtype` | `3` (`Q4_0`) | downgrade 결과 dtype |
+| `shape_rank` | `2` | `[vocab_size, hidden_dim]` |
+| `shape` | `[vocab_size, hidden_dim]` | GGUF 원본 그대로 (Llama 3.2 1B: `[128256, 2048]`) |
+| `alignment` | `64` (CPU/CUDA AOS) 또는 SOA image2d 정렬 요구치 | layer weight와 동일 변환 함수 출력 |
+| `variant_offsets[i]` | 해당 backend variant section 내부의 lm_head payload offset | SOA: q_buf/d_buf/q_img가 결합된 NoshuffleWeightBuffer 직렬화 형태 |
+| `variant_sizes[i]` | 해당 variant payload 바이트 크기 | SOA: q_buf+d_buf+(있을 시 q_img) 합산 |
+
+**Naming convention**: TENSOR_INDEX entry는 `kind = 11(lm_head)` enum value로 식별한다. GGUF 호환 명명(`output.weight` 또는 `lm_head.weight`)은 별도 string field로 보관하지 않는다 — `kind` enum이 의미를 충분히 표현한다. 향후 `name` string field 추가 시 v0.x additive 변경(format_minor++)으로 처리.
+
+**dtype downgrade 결정성 (G-1-A 결정 사항 5)**:
+
+- `quantize_q4_0(rows, cols)` 함수는 동일 입력 → 동일 출력 byte-level 일치를 보장한다 (절대값 round-half-to-even, 결정적 scale 계산). transformer.rs line 484가 사용하는 `models::loader::convert::quantize_q4_0`이 동일 함수.
+- SOA 변환(`convert_aos_to_soa`)은 GPU kernel이지만 deterministic (입력 동일 시 출력 byte-level 일치). 단 GPU device가 다른 경우 driver implementation 차이로 미세 차이 가능성이 있어, **결정성 검증은 동일 build host 환경에서만 보장**된다. 디바이스간 portability는 v0.x 검증 범위 외이며 v1.0에서 별도 conformance test 필요.
+- AUF build CLI 옵션 `--include-lm-head <on|off|auto>` (G-1-B에서 확정):
+  - `auto` (default ON 권장): GGUF lm_head dtype != Q4_0이면 quantize.
+  - `on`: 강제 quantize.
+  - `off`: skip (legacy AUF 호환).
+
+**Source hash 정의 (G-1-A 결정 사항 3)**:
+
+- AUF build의 `source_hash`(헤더 §3.22.6)는 **GGUF 전체 hybrid hash 그대로 재사용**한다. lm_head 단일 tensor에 대한 별도 hash field는 추가하지 않는다.
+- 근거: (a) lm_head Q4_0 payload는 `source_hash`로 식별된 GGUF로부터 deterministic build 한 결과이므로 source_hash 일치는 lm_head 일치를 함의한다. (b) 별도 hash는 reader 검증 분기를 늘리고, INV-132/133 수준을 유지하기 위해 추가 invariant가 필요하다 (cost > value). (c) 사용자가 명시 검증을 원하면 `auf-tool verify --source <gguf>`가 충분하다 (hybrid hash는 head/tail 8 MB 포함 — lm_head는 GGUF 끝부분에 위치하므로 tail 8 MB에 거의 항상 포함됨, 일반적 1B 모델 기준).
+- **edge case**: 8 B+ 모델에서 GGUF tail 8 MB 영역에 lm_head 일부만 포함될 가능성이 있으나, hybrid hash의 보호 수준은 v0.1 채택 결정 시점부터 명시된 한계이며 (§3.22.6 근거 항목) v0.1에서는 그대로 유지한다. 향후 `capability_optional` bit 0(`SOURCE_HASH_FULL_SHA256`)로 보강 가능.
+
+**Capability bit (G-1-A 결정 사항 4)**:
+
+- `capability_optional` bit 2: `LM_HEAD_PRECOMPUTED_Q4_0` (신규).
+  - 1: AUF build 시점에 lm_head를 Q4_0으로 사전 quantize하여 backend variant section에 포함시켰다.
+  - 0: lm_head는 backend variant section에 포함되지 않거나 GGUF 원본 dtype 그대로 포함되었다 (runtime quantize fallback 필요).
+- bit 정의는 backend variant 분기와 **독립적**이다. 즉 ratio가 1.0이거나 `WEIGHTS_*` 중 어떤 variant가 strip되어 있어도, `capability_optional` bit 2 = 1이면 살아 있는 variant section에 lm_head Q4_0 entry가 포함되어 있음을 의미한다.
+- **bit 위치 충돌 검사**: §3.22.11과 `arch/auf_format.md` §4.5의 미래 후보 표는 bit 1을 `IMAGE2D_PRECOMPUTED`(optional)에 배정하고 있으므로 bit 2가 다음 가용 슬롯이다. v0.1.0 → v0.1.1 변경에서 신규 bit 1개 추가.
+
+**Reader 동작 (capability bit 미존재 또는 0인 경우)**:
+
+- AUF reader는 capability_optional bit 2가 0이면 `lm_head_q4_0_payload()` accessor가 `Option::None`을 반환한다.
+- model load 분기(transformer.rs `quantize_lm_head_to_q4_0` 호출 site)는 None일 때 기존 runtime quantize fallback을 그대로 수행한다 (즉 동작 보존, INV-G1-A1).
+- bit 2 = 1이면 reader는 TENSOR_INDEX에서 `kind = 11`, `dtype = Q4_0` entry를 lookup하여 변환 없이 NoshuffleWeightBuffer / SharedBuffer Q4_0로 그대로 매핑한다.
+
+**후방 호환**:
+
+- 기존 v0.1.0 AUF (lm_head section 없음): capability_optional bit 2 = 0. 신 reader는 정상 fallback 동작 (capability_optional bit는 미인식해도 reject 사유가 아님).
+- 신 v0.1.1 AUF (lm_head section 포함): capability_optional bit 2 = 1. 구 reader(v0.1.0)는 bit 2를 인식하지 못하지만 capability_optional이므로 reject하지 않고 ignore. 구 reader는 lm_head를 GGUF에서 다시 quantize하는 fallback 경로를 거치므로 동작 정상 (단지 cold-start latency 비용이 남는다).
+
+#### 3.22.13 결정성 요구사항 [ENG-DAT-096.13]
+
+**[ENG-DAT-096.13]** AUF writer는 동일 GGUF 입력 + 동일 build option + 동일 host platform → byte-level 동일 AUF 출력을 보장한다. *(MUST)*
+
+이는 build 재현성, regression test, deploy 검증의 기반이다. ENG-DAT-096.12 (lm_head Q4_0 downgrade)도 본 결정성 요구의 적용 대상이다. 다음을 포함한다:
+
+- `quantize_q4_0` 결정성 (round-half-to-even, scale 계산 결정성).
+- SOA convert 결정성 (입력 동일 시 출력 동일, host platform 한정).
+- META JSON 직렬화 순서 결정성 (key ordering 또는 별도 설정).
+- TOKENIZER blob 직렬화 순서 결정성 (vocab index ordering).
+- TENSOR_INDEX entry 순서 결정성 (layer_idx 오름차순, layer 내부는 kind 오름차순).
+- 헤더의 `created_by` field가 사용자 정의 값을 받지 않는 경우 cargo `CARGO_PKG_VERSION` 그대로 (build 환경 변수 의존 금지).
+
+**미보장 범위** (out of scope, 향후 v1.0 conformance):
+
+- 다른 host platform 간 byte-level 일치 (Linux x86_64 vs Linux ARM64 cross-build 등).
+- GPU driver 차이로 인한 SOA convert kernel 출력 차이 (writer는 host에서만 build하므로 v0.1.1에서는 영향 없음. SOA convert kernel은 host용 OpenCL 또는 reference CPU impl로 수행).
 
 ---
 

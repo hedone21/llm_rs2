@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) = 총 115개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) = 총 117개.
 
 ## 1. Purpose and Scope
 
@@ -296,6 +296,21 @@
 | INV-133 | 33-engine-data §3.22.4 (ENG-DAT-096.4), 32-engine-algorithms 3.12.17.1 | AUF reader는 다음 section이 모두 존재할 것을 강제한다: `META`, `TOKENIZER`, `TENSOR_INDEX` (cross-cutting required) 그리고 reader의 backend에 해당하는 `WEIGHTS_*` (`WEIGHTS_ADRENO_SOA` / `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS` 중 하나). 누락 시 명시적 에러 + `auf-tool repack` 안내 메시지를 반환한다. | Correctness | runtime, test | reader 진입 시 검증. self-contained 보증의 핵심. |
 | INV-134 | 33-engine-data §3.22.5 (ENG-DAT-096.5), §3.22.4 (ENG-DAT-C14) | 모든 AUF section은 `[header.payload_start_offset, file_size)` 범위 내에 있어야 한다 (`section.offset >= payload_start_offset` 그리고 `section.offset + section.size <= file_size`). 어떤 두 section도 byte range가 overlap 금지. 동일 tag의 section은 최대 1회 등장. | Safety/Correctness | runtime, test | reader 진입 시 검증. writer는 build 시점에 자동 충족. |
 
+### 3.17 AUF lm_head Q4_0 사전 변환 [INV-135 ~ INV-136]
+
+2026-04-26 Phase 6 Sprint G-1 (AUF v0.1.1, lm_head Q4_0 사전 변환)의 불변식. 대응 명세: `33-engine-data.md` §3.22.12 (ENG-DAT-096.12), §3.22.13 (ENG-DAT-096.13), `arch/auf_format.md` §2.5b.
+
+**교차 참조**:
+- **INV-132** (AUF reader rejection 의무): `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)는 미인식 시에도 reject 사유가 아니다 (optional). v0.1.0 reader가 v0.1.1 AUF를 읽어도 bit 2를 무시하고 정상 진입. INV-135/136은 신 reader(v0.1.1) 한정 의무.
+- **INV-133** (required section 존재 의무): lm_head Q4_0 payload는 별도 section이 아니라 기존 `WEIGHTS_<backend>` section 내부에 동봉되므로 INV-133의 6개 section 카탈로그는 그대로 유지된다.
+- **INV-134** (section overlap 금지): lm_head payload는 동일 `WEIGHTS_<backend>` section 내부 layer weight payload와 byte range가 인접/연속이며 overlap 금지 의무는 그대로 적용된다.
+- **ENG-DAT-C11** (Cross-layer tensor swap 제외): lm_head는 본 invariant 추가 후에도 swap 대상이 아니다 (ratio_generation 무관, model load 시점 1회 매핑).
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-135 | 33-engine-data §3.22.12 (ENG-DAT-096.12), §3.22.6 (ENG-DAT-096.6) | AUF의 `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)가 1이면 TENSOR_INDEX에 `kind = 11(lm_head)`, `dtype = 3(Q4_0)`, `shape = [vocab_size, hidden_dim]` entry가 정확히 1개 존재해야 하며, 해당 entry의 shape이 model load 시점의 모델 config(`vocab_size`, `hidden_dim`)와 일치해야 한다. shape mismatch 시 reader는 reject + 명시 에러 반환. AUF 헤더의 `source_hash`(hybrid)는 lm_head Q4_0 payload의 implicit identity 역할을 한다 — build 결정성(ENG-DAT-096.13) 보장 하에 source_hash 일치는 lm_head Q4_0 일치를 함의한다. 별도 lm_head hash field는 도입하지 않는다. | Correctness | runtime, test | reader 진입 시 검증. shape mismatch는 다른 모델용 AUF가 잘못 사용된 케이스. |
+| INV-136 | 33-engine-data §3.22.12 (ENG-DAT-096.12), `arch/auf_format.md` §2.5b | AUF의 `capability_optional` bit 2가 0이거나 AUF가 부재한 경우, model load는 기존 `quantize_lm_head_to_q4_0()` runtime fallback 경로로 정상 진행되어야 하며 lm_head dtype은 사용자 지정 `--quantize-lm-head` 값(`auto`/`none`/`q4_0`)에 따라 결정된다. `auto` + `--secondary-gguf`(또는 `--secondary-source`) 미설정 시 quantize skip(F16 유지). bit 0 시 AUF reader가 panic하거나 model load가 abort하면 안 된다. | Correctness | test | Sprint F 동작(v0.1.0 AUF + 신 코드) 보존. fallback 경로 회귀 방지. |
+
 ## 4. Alternative Behavior
 
 ### 4.1 INV-022 D-Bus 예외
@@ -325,10 +340,10 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
 | Safety | 19 | 22% |
-| Correctness | 61 | 72% |
+| Correctness | 63 | 73% |
 | Performance | 2 | 2% |
-| Compatibility | 3 | 4% |
-| **합계** | **85** | **100%** |
+| Compatibility | 3 | 3% |
+| **합계** | **87** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
@@ -336,6 +351,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-130은 Weight Swap Phase 3.6 (Noshuffle SOA registry coherence)에서 추가. 카테고리는 Correctness (디바이스 한정 silent correctness bug — crash/data-loss가 아니므로 Safety 아님).
 > INV-131은 Weight Swap Phase 3.7a (Adreno SOA 재변환 safety net)에서 추가. Correctness.
 > INV-132~134는 Weight Swap Phase 3.7b (AUF v0.1 포맷)에서 추가. INV-132는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-133/134는 Correctness.
+> INV-135~136은 Phase 6 Sprint G-1 (AUF v0.1.1 lm_head Q4_0 사전 변환)에서 추가. 둘 다 Correctness — INV-135는 shape/identity 일치 검증, INV-136은 후방 호환 fallback 보존.
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 

@@ -1,9 +1,11 @@
 # AUF (Argus Unified Format) — Self-Contained Weight Asset Architecture
 
-> **상태**: Draft v0.1 (2026-04-25, Weight Swap Phase 3.7b 도입)
-> **대상 spec**: `spec/33-engine-data.md` §3.22 (ENG-DAT-096), `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223), `spec/41-invariants.md` §3.16 (INV-132~134).
-> **연관 작업**: Phase 3.7a (ENG-ALG-222 / INV-131) — runtime SOA 재변환 safety net. AUF 부재 시 fallback 경로로 사용.
-> **작성**: 2026-04-25.
+> **상태**: Draft v0.1.1 (2026-04-26, Sprint G-1 lm_head Q4_0 사전 변환 추가).
+> **대상 spec**: `spec/33-engine-data.md` §3.22 (ENG-DAT-096, .12, .13), `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223), `spec/41-invariants.md` §3.16 (INV-132~135).
+> **연관 작업**:
+> - Phase 3.7a (ENG-ALG-222 / INV-131) — runtime SOA 재변환 safety net. AUF 부재 시 fallback 경로로 사용.
+> - Phase 6 Sprint G-1 (ENG-DAT-096.12 / INV-135) — lm_head Q4_0 사전 변환으로 model load 시점 ~1.4 s runtime quantize 비용 제거.
+> **작성**: 2026-04-25 (v0.1), 2026-04-26 (v0.1.1).
 
 ---
 
@@ -386,6 +388,111 @@ flowchart LR
 
 단순히 file end를 truncate하면 section table에는 여전히 6 entries가 있고, 마지막 두 entries의 offset은 file_size를 넘어가게 되어 INV-134 위반. 따라서 **반드시 rewrite**.
 
+### 2.5b lm_head Q4_0 사전 변환 (v0.1.1, Sprint G-1)
+
+**역할**: AUF build 시점에 GGUF의 F16 lm_head를 Q4_0으로 사전 변환하여 backend variant section에 동봉. Engine load 시점 ~1.4 s runtime quantize 비용 제거.
+
+**설계 결정 근거 (Sprint G-1-A)**:
+
+```mermaid
+flowchart LR
+    A[GGUF lm_head<br/>F16, ~525 MB] --> B{build option<br/>--include-lm-head}
+    B -->|on / auto| C[F32 dequantize<br/>F16 → F32]
+    B -->|off| D[skip<br/>v0.1.0 호환]
+    C --> E[Q4_0 quantize<br/>quantize_q4_0]
+    E --> F{target backend<br/>variant}
+    F -->|ADRENO_SOA| G[convert_aos_to_soa<br/>q_buf + d_buf + q_img]
+    F -->|CUDA_AOS| H[18B block<br/>+ 128B align]
+    F -->|CPU_AOS| I[18B block<br/>+ 64B align]
+    G --> J[WEIGHTS_ADRENO_SOA<br/>section 내부<br/>layer weight와 동일 layout]
+    H --> K[WEIGHTS_CUDA_AOS<br/>section 내부]
+    I --> L[WEIGHTS_CPU_AOS<br/>section 내부]
+    J --> M[TENSOR_INDEX entry<br/>kind=11 lm_head, dtype=Q4_0<br/>variant_offsets]
+    K --> M
+    L --> M
+    M --> N[capability_optional<br/>bit 2 set]
+
+    style D fill:#ffe0b2
+    style M fill:#c8e6c9
+    style N fill:#c8e6c9
+```
+
+**핵심 결정**:
+
+1. **Section type 신설하지 않음**. lm_head Q4_0 payload는 기존 `WEIGHTS_<backend>` section 내부에 layer weight와 동일한 layout으로 동봉. 근거: lm_head는 transformer.rs `prepare_noshuffle_buffers()`(line 914-917)에서 layer weight와 **동일한 SOA 변환 함수**를 호출하므로 layout이 layer weight와 byte-level 동일하다. 별도 section type을 두면 strip / capability / reader switch logic이 두 배로 복잡해진다.
+
+2. **TENSOR_INDEX entry 재사용**. spec ENG-DAT-096.8에 이미 `kind = 11(lm_head)` enum이 정의되어 있다. 이 entry의 `dtype = Q4_0`, `shape = [vocab_size, hidden_dim]`(GGUF 원본 그대로), `variant_offsets[i]`가 backend variant section 내부의 lm_head payload offset을 가리킨다. cross-layer tensor의 `layer_idx = u32::MAX` 규칙은 그대로 적용.
+
+3. **SOA 변환 적용**: target backend가 `WEIGHTS_ADRENO_SOA`인 경우 lm_head Q4_0도 SOA layout (`q_buf` + `d_buf` 분리, `q_img` 정렬 hint)으로 사전 변환. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 AOS 18B block + alignment padding. layer weight와 동일한 variant convert 함수 재사용.
+
+4. **capability_optional bit 2 = `LM_HEAD_PRECOMPUTED_Q4_0`** 신설. reader는 bit 미인식 시 ignore (`capability_optional`의 의미상). 후방 호환 보장.
+
+5. **source_hash 재사용**. lm_head 단일 tensor 별도 hash 없음. AUF 헤더의 hybrid `source_hash`(GGUF 전체)가 일치하면 lm_head Q4_0 payload도 신뢰. v0.1 채택 결정에서 이미 hybrid hash가 부분 변조에 약함을 인지했고(spec §3.22.6 근거), lm_head는 GGUF tail 8 MB에 거의 항상 포함됨.
+
+**인터페이스 (개념)**:
+
+```rust
+// AUF reader (Sprint G-1-C 산출)
+pub struct AufView<'a> {
+    // 기존 필드들...
+    pub lm_head_precomputed_q4_0: bool,   // capability_optional bit 2 검사 결과
+}
+
+impl<'a> AufView<'a> {
+    /// post: capability_optional bit 2 = 1이고 TENSOR_INDEX에 kind=lm_head + dtype=Q4_0
+    /// entry가 존재하면 backend variant section 내부의 byte slice 반환.
+    /// 그 외(bit 0 또는 entry 미존재)는 None — caller는 runtime quantize fallback.
+    pub fn lm_head_q4_0_payload(&self) -> Option<LmHeadPayload<'a>>;
+}
+
+pub struct LmHeadPayload<'a> {
+    pub shape: [u64; 2],          // [vocab_size, hidden_dim]
+    pub alignment: u64,
+    pub bytes: &'a [u8],          // backend variant에 따라 SOA 또는 AOS 직렬화
+    pub variant_tag: VariantTag,  // 호출자가 SOA vs AOS 분기에 사용
+}
+```
+
+**model load 분기 (transformer.rs Sprint G-1-D 산출)**:
+
+```mermaid
+flowchart TD
+    A[model load 진입] --> B{secondary_source<br/>== Some?}
+    B -->|No| C[기존 quantize_lm_head_to_q4_0<br/>auto 분기 그대로]
+    B -->|Yes, AUF| D{auf_view<br/>.lm_head_q4_0_payload<br/>= Some?}
+    D -->|Yes| E[AUF section에서 직접 매핑<br/>NoshuffleWeightBuffer 또는<br/>SharedBuffer Q4_0<br/>runtime quantize SKIP]
+    D -->|No| F[runtime quantize<br/>~1.4s fallback]
+    C --> G[lm_head 준비 완료]
+    E --> G
+    F --> G
+
+    style E fill:#c8e6c9
+    style F fill:#ffe0b2
+```
+
+**예외 처리 / fallback**:
+
+| 케이스 | 동작 |
+|--------|------|
+| AUF에 capability bit 2 = 0 | runtime quantize fallback (Sprint F 동작 그대로) |
+| AUF에 bit 2 = 1이지만 `kind=lm_head` entry shape이 model config와 불일치 | reject + 명시 에러. AUF가 다른 model용. |
+| AUF에 bit 2 = 1이지만 `dtype != Q4_0` | reject + 명시 에러. capability bit 의미 위반. |
+| `--quantize-lm-head q4_0` 강제 (debug) | AUF entry 무시 + runtime quantize 강제 (회귀 비교용) |
+| `--quantize-lm-head none` | AUF entry도 사용하지 않고 lm_head F16 유지 |
+
+**결정성 요구사항 (ENG-DAT-096.13)**:
+
+- 동일 GGUF + 동일 build option + 동일 host → byte-level 동일 AUF 출력.
+- `quantize_q4_0`은 round-half-to-even로 결정성 보장.
+- SOA 변환은 host 환경에서 deterministic kernel(reference CPU 또는 host OpenCL)로 수행. 디바이스간 portability는 v0.1.x 범위 외이며 v1.0 conformance에서 별도 검증.
+
+**메모리/디스크 영향 (Llama 3.2 1B 기준)**:
+
+- F16 lm_head 보관 시 (v0.1.0): 525 MB (per backend variant).
+- Q4_0 lm_head 보관 시 (v0.1.1): 148 MB (per backend variant).
+- 디스크 절감: 377 MB / variant. 3-variant build 시 ~1.1 GB 절감.
+- model load 시간 절감: ~1.4 s (Galaxy S25 실측, Sprint F).
+
 ### 2.6 auf-tool CLI
 
 **역할**: AUF 자산을 만들고 검사하고 수정하는 사용자 인터페이스.
@@ -512,8 +619,9 @@ Llama 3.2 1B Q4_0 기준 대략적 크기 (실측 예상):
 | `SOURCE_HASH_FULL_SHA256` | source_hash가 hybrid 대신 full SHA256 | optional bit 0 |
 | `ZSTD_COMPRESSION` | section payload zstd 압축 | required bit 0 |
 | `IMAGE2D_PRECOMPUTED` | Adreno q_img가 device-specific texture format으로 사전 인코딩 | optional bit 1 |
+| `LM_HEAD_PRECOMPUTED_Q4_0` | lm_head 사전 Q4_0 양자화 (v0.1.1, **할당 완료**) | optional bit 2 |
 | `LORA_DELTAS` | section tag `LORA_<name>` 도입, multi-asset bundle | required bit 1 (Mode C) |
-| `UNIGRAM_TOKENIZER` | TOKENIZER가 SentencePiece unigram 지원 | optional bit 2 |
+| `UNIGRAM_TOKENIZER` | TOKENIZER가 SentencePiece unigram 지원 | optional bit 3 (구 권고 bit 2에서 변경) |
 
 ---
 
@@ -529,10 +637,10 @@ flowchart TB
         P0["[544..65536) Padding<br/>0x00 fill"]
         S1["META<br/>JSON (~2 KiB)<br/>required, not strippable"]
         S2["TOKENIZER<br/>~6 MiB BPE blob<br/>required, not strippable"]
-        S3["TENSOR_INDEX<br/>~64 KiB tensor metadata<br/>required, not strippable"]
-        S4["WEIGHTS_ADRENO_SOA<br/>~700 MiB<br/>strippable<br/>q_buf + d_buf + image2d hint"]
-        S5["WEIGHTS_CUDA_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 128B align"]
-        S6["WEIGHTS_CPU_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 64B align"]
+        S3["TENSOR_INDEX<br/>~64 KiB tensor metadata<br/>kind=11 lm_head entry 포함<br/>required, not strippable"]
+        S4["WEIGHTS_ADRENO_SOA<br/>~700 MiB<br/>strippable<br/>q_buf + d_buf + image2d hint<br/>+ lm_head Q4_0 SOA (v0.1.1)"]
+        S5["WEIGHTS_CUDA_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 128B align<br/>+ lm_head Q4_0 AOS (v0.1.1)"]
+        S6["WEIGHTS_CPU_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 64B align<br/>+ lm_head Q4_0 AOS (v0.1.1)"]
         H --> T --> P0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6
     end
 
@@ -646,6 +754,10 @@ auf-tool build
     --output <PATH>         AUF 출력
     --variants <list>       "all" 또는 comma-separated (예: WEIGHTS_ADRENO_SOA,WEIGHTS_CPU_AOS)
     [--created-by <STR>]    custom created_by (기본: "llm_rs2 v{CARGO_PKG_VERSION}")
+    [--include-lm-head <on|off|auto>]   lm_head Q4_0 사전 변환 (v0.1.1, default: auto)
+                                        auto: GGUF lm_head dtype != Q4_0이면 quantize
+                                        on:   강제 quantize (이미 Q4_0이면 no-op)
+                                        off:  skip (v0.1.0 호환 출력, capability bit 2 = 0)
 
 auf-tool info <PATH>        헤더 + section 목록 + capability flags 출력
 
