@@ -984,8 +984,10 @@
 
 ## [P1] WSWAP-5-INV122-SPEC. INV-122 v2.1 spec 재정의 (단일-token NMSE)
 
-- **Status**: IN_PROGRESS (2026-04-26, Architect 백그라운드 진행)
-- **Sprint**: current
+- **Status**: DONE (2026-04-26, `709bb51`)
+- **결과 요약**: spec/32 §3.12.6 재구성(§3.12.6.1~11), spec/41 INV-122 카탈로그 v2.1 라벨, arch/weight_swap v7→v8 §5.1 확장 + §5.1.0/§5.1.8 신설(decoupling principle). 임계값(NMSE ≤ 0.01, Δtop-1 ≤ 1pp) 변동 없이 측정 단위만 단일-token 고정. 32-token decode/ROUGE-L/top-5는 보조 sanity FYI. Phase 4 자료(mean=0.0062) 재사용 PASS 명시. cross-ref 정합 검증 완료.
+- **Sprint**: closed
+- **후속 위임**: Implementer — `engine/tests/spec/test_inv_122_mixed_precision.rs` docstring v2.1 명시 (코드 변경 없으면 docstring만)
 - **Dependencies**: WSWAP-5-INV122-SWEEP (DONE) — sweep 결과로 임계값-측정 미스매치 확정
 - **담당**: Architect (spec/arch 문서만, 코드 수정 없음)
 - **추정 작업량**: S (1일)
