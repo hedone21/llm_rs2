@@ -21,19 +21,6 @@ impl TransformerLayer {
         if args.skip_attn && args.skip_mlp {
             return Ok(());
         }
-        {
-            use std::sync::atomic::{AtomicBool, Ordering};
-            static DBG_ENTER: AtomicBool = AtomicBool::new(false);
-            if !DBG_ENTER.swap(true, Ordering::Relaxed) {
-                let has_part = args.ws.partition_ws.is_some();
-                println!(
-                    "[part-dbg] forward_gen entered, ws.partition_ws.is_some()={}",
-                    has_part
-                );
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-            }
-        }
 
         let _skip_attn = args.skip_attn;
         let _skip_mlp = args.skip_mlp;
