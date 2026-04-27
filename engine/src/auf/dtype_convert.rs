@@ -72,6 +72,95 @@ pub fn convert_tensor_dtype(
     }
 }
 
+/// `(dtype, bytes)` candidate 페어를 multi-dtype 모드로 생성한다.
+///
+/// AUF v0.2 multi-dtype writer가 각 tensor에 동봉할 candidate dtype 별 bytes를
+/// 결정하는 정책 함수. ENG-ALG-224 (`spec/32-engine-algorithms.md` §3.12.18.1)
+/// writer 의무 + ISSUE-E-1 회귀 격리 (Sprint F).
+///
+/// # Behavior
+///
+/// - `candidate_dtypes = None` (single-dtype, v0.1.x 호환): `src_dtype` 1개만 동봉.
+/// - `candidate_dtypes = Some(cands)` + `shape_logical.len() < 2`
+///   (1-D / scalar tensor, 예: RMSNorm weight): **`src_dtype` 1개만 동봉**.
+///   1-D tensor를 Q4_0 등 다른 dtype으로 quantize하면 의미적 garbage가 되어
+///   primary forward의 norm 경로에서 첫 token EOS를 유발한다 (Sprint E ISSUE-E-1).
+///   Reader 측 dtype filter도 1-D Q4 entry를 무비판적으로 선택하므로 writer 측에서
+///   엔트리 자체를 만들지 않는 것이 안전망.
+/// - `candidate_dtypes = Some(cands)` + `shape_logical.len() >= 2`: 각 dtype별로
+///   `convert_tensor_dtype`로 변환. 변환 실패 (Q4_0 cols % 32 != 0 등)는 해당 dtype
+///   skip + 경고 로그. 결과가 비면 src_dtype 1개라도 fallback 동봉.
+///
+/// # Determinism
+///
+/// 동일 (`src_bytes`, `src_dtype`, `shape_logical`, `candidate_dtypes`) 입력에 대해
+/// byte-identical 출력을 보장한다 (`convert_tensor_dtype`이 호스트 결정적이고,
+/// 본 함수는 입력 순회 외 비결정적 요소가 없다).
+///
+/// # Errors
+///
+/// 항상 `Ok(...)`를 반환한다 — 변환 실패는 silent skip + 경고. spec 테스트용으로
+/// `quiet=true`이면 경고도 억제.
+pub fn build_dtype_candidates(
+    name: &str,
+    src_bytes: &[u8],
+    src_dtype: TensorDType,
+    shape_logical: &[u64],
+    candidate_dtypes: Option<&[TensorDType]>,
+    quiet: bool,
+) -> AufResult<Vec<(TensorDType, Vec<u8>)>> {
+    let cands = match candidate_dtypes {
+        None => return Ok(vec![(src_dtype, src_bytes.to_vec())]),
+        Some(c) => c,
+    };
+
+    // ISSUE-E-1 fix (Sprint F): 1-D tensor (norm 등)는 src_dtype 1개만 동봉.
+    //
+    // RMSNorm weight (`*_norm.weight`)는 항상 1-D (shape rank=1)이며, primary forward
+    // 경로는 F16/F32만 사용한다. multi-dtype 모드에서 norm을 Q4_0으로 quantize한 entry를
+    // 동봉하면, F16 primary + `--secondary-dtype q4_0` swap 시 reader가 dtype filter로
+    // norm Q4 entry를 선택하여 1-D Q4_0 1152B (= 2048/32 × 18) bytes를 norm slot에 bind
+    // 한다. 이는 정상 F16 4096B 또는 F32 8192B와 dtype/size 불일치이며, primary forward
+    // 에서 RMSNorm scale가 garbage가 되어 첫 token이 EOS로 깨진다 (Sprint E ISSUE-E-1
+    // 디바이스 회귀).
+    //
+    // 1-D는 logical shape rank == 1로 식별한다 (이름 기반 휴리스틱보다 안정적).
+    // RoPE freqs / token_embd / lm_head은 모두 2-D 이상이므로 영향 없음.
+    if shape_logical.len() < 2 {
+        return Ok(vec![(src_dtype, src_bytes.to_vec())]);
+    }
+
+    let mut out: Vec<(TensorDType, Vec<u8>)> = Vec::with_capacity(cands.len());
+    for &dt in cands {
+        if dt == src_dtype {
+            out.push((dt, src_bytes.to_vec()));
+            continue;
+        }
+        // Q4_0 변환은 cols % 32 == 0이 필요. 만족 못하면 원본만 동봉하고 경고.
+        match convert_tensor_dtype(src_bytes, src_dtype, dt, shape_logical) {
+            Ok(bytes) => out.push((dt, bytes)),
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "[auf-tool] Warning: tensor '{}' dtype convert {:?}→{:?} failed: {}; \
+                         dropping this dtype candidate",
+                        name, src_dtype, dt, e
+                    );
+                }
+                // skip — 해당 dtype candidate은 이 tensor에서 누락. INV-137은 동일 (layer,kind)에
+                // 대해 모든 후보가 같은 shape이어야 한다는 제약일 뿐, dtype별 entry 수가 동일해야
+                // 한다는 의무는 없다 (정합성은 reader 측 lookup으로 보장).
+            }
+        }
+    }
+
+    if out.is_empty() {
+        // 모든 candidate이 reject되면 source 1개라도 fallback으로 보장.
+        out.push((src_dtype, src_bytes.to_vec()));
+    }
+    Ok(out)
+}
+
 /// outermost-first logical shape에서 (rows, cols)를 추출한다.
 ///
 /// 1-D tensor는 `[1, n]`으로 처리. 0-D / 3-D 이상은 거부.

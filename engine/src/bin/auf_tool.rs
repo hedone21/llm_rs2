@@ -19,7 +19,8 @@ use llm_rs2::auf::tensor_index::{
 use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_STRIPPABLE,
     TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS, TOKENIZER_KIND_BPE,
-    compute_source_hash, convert_tensor_dtype, open, q4_0_aos_to_adreno_soa,
+    build_dtype_candidates, compute_source_hash, convert_tensor_dtype, open,
+    q4_0_aos_to_adreno_soa,
 };
 
 // ---------------------------------------------------------------------------
@@ -1047,58 +1048,8 @@ fn ggml_type_to_tensor_dtype(ggml_type: u32) -> TensorDType {
     }
 }
 
-/// candidate dtype 목록을 받아 각 dtype별 bytes를 구성한다.
-///
-/// - `candidate_dtypes` = None (single-dtype 모드): source dtype 1개만, raw bytes 그대로.
-/// - `candidate_dtypes` = Some(...): 각 dtype에 대해 변환 (source dtype과 일치하면 zero-copy).
-///   dtype 순서는 caller가 지정한 그대로 유지 (TensorIndex 정렬은 INV-138 단계에서 적용).
-///
-/// shape rank가 0이거나 변환 불가능한 dtype 조합이면 에러.
-fn build_dtype_candidates(
-    name: &str,
-    src_bytes: &[u8],
-    src_dtype: TensorDType,
-    shape_logical: &[u64],
-    candidate_dtypes: Option<&[TensorDType]>,
-    quiet: bool,
-) -> Result<Vec<(TensorDType, Vec<u8>)>> {
-    let cands = match candidate_dtypes {
-        None => return Ok(vec![(src_dtype, src_bytes.to_vec())]),
-        Some(c) => c,
-    };
-
-    // shape rank 0 (scalar) 또는 변환 불가 dtype 조합은 source 1개만 동봉. caller가
-    // multi-dtype 모드를 강제하더라도 norm 등 1-D F16 tensor는 그대로 두는 것이 안전.
-    let mut out: Vec<(TensorDType, Vec<u8>)> = Vec::with_capacity(cands.len());
-    for &dt in cands {
-        if dt == src_dtype {
-            out.push((dt, src_bytes.to_vec()));
-            continue;
-        }
-        // Q4_0 변환은 cols % 32 == 0이 필요. 만족 못하면 원본만 동봉하고 경고.
-        match convert_tensor_dtype(src_bytes, src_dtype, dt, shape_logical) {
-            Ok(bytes) => out.push((dt, bytes)),
-            Err(e) => {
-                if !quiet {
-                    eprintln!(
-                        "[auf-tool] Warning: tensor '{}' dtype convert {:?}→{:?} failed: {}; \
-                         dropping this dtype candidate",
-                        name, src_dtype, dt, e
-                    );
-                }
-                // skip — 해당 dtype candidate은 이 tensor에서 누락. INV-137은 동일 (layer,kind)에
-                // 대해 모든 후보가 같은 shape이어야 한다는 제약일 뿐, dtype별 entry 수가 동일해야
-                // 한다는 의무는 없다 (정합성은 reader 측 lookup으로 보장).
-            }
-        }
-    }
-
-    if out.is_empty() {
-        // 모든 candidate이 reject되면 source 1개라도 fallback으로 보장.
-        out.push((src_dtype, src_bytes.to_vec()));
-    }
-    Ok(out)
-}
+// `build_dtype_candidates`는 `llm_rs2::auf::dtype_convert`에서 export된 라이브러리
+// 함수를 사용한다 (Sprint F ISSUE-E-1 fix로 외부 lib로 이동, spec 테스트 가능).
 
 /// GGUF lm_head (F16 or F32) → F32 dequantize → Q4_0 quantize → 18B/block bytes.
 ///

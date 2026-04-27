@@ -37,7 +37,7 @@ pub mod tokenizer;
 pub mod writer;
 
 // 편의 re-export
-pub use dtype_convert::convert_tensor_dtype;
+pub use dtype_convert::{build_dtype_candidates, convert_tensor_dtype};
 pub use error::{AufError, AufResult};
 pub use header::{
     AufHeader, CAPABILITY_BIT_LM_HEAD_Q4_0, CAPABILITY_BIT_MULTI_DTYPE, HEADER_SIZE,

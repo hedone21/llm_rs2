@@ -148,6 +148,13 @@ mod test_eng_alg_224_writer_multi_dtype;
 #[path = "spec/test_eng_alg_225_reader_dispatch.rs"]
 mod test_eng_alg_225_reader_dispatch;
 
+// ── AUF v0.2 Sprint F — ISSUE-E-1 hotfix 회귀 격리 ──
+// multi-dtype writer가 1-D tensor (RMSNorm 등)에 대해 Q4_0 변환을 적용하지 않도록
+// build_dtype_candidates가 src_dtype 1개만 반환하는지 검증. F16 primary +
+// `--secondary-dtype q4_0` swap 시 첫 token EOS 깨짐 회귀 방지.
+#[path = "spec/test_issue_e_1_multi_dtype_byte_path.rs"]
+mod test_issue_e_1_multi_dtype_byte_path;
+
 // ── Sprint G-1-E — AUF lm_head Q4_0 통합 정확성 검증 ──
 // 의문 1: ADRENO_SOA payload = q_buf||d_buf (SOA) layout 정합성.
 // 의문 2: payload.bytes.len() == N*18 (SOA 총 크기 = AOS 총 크기 불변).
