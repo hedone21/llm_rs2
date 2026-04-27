@@ -48,6 +48,26 @@ pub enum AufError {
     },
     /// capability_optional bit 2 = 1이지만 lm_head entry에 해당 variant payload가 없다 (INV-135).
     LmHeadVariantPayloadMissing { variant_tag: String },
+    /// 요청한 dtype의 entry가 TENSOR_INDEX에 없다 (ENG-ALG-225).
+    DtypeNotAvailable {
+        layer_idx: u32,
+        kind: u32,
+        dtype: u32,
+    },
+    /// backend와 dtype 조합이 호환되지 않는다 (Sprint D 함정 3: Adreno SOA × F16).
+    ///
+    /// Adreno SOA backend에서 F16 dtype secondary를 사용할 수 없다.
+    /// SOA layout은 Q4_0 전용이며, F16 weights에 대한 SOA 변환이 정의되지 않았다.
+    /// F16 secondary가 필요하다면 CPU_AOS 또는 CUDA_AOS backend로 전환하라.
+    BackendDtypeIncompatible { backend: String, dtype: String },
+    /// 단방향 swap 정합성 위반: primary=Q4_0인데 secondary=F16을 지정했다 (역방향 swap 차단).
+    ///
+    /// weight swap은 F16→Q4_0 단방향만 지원한다. primary가 이미 Q4_0인 경우
+    /// secondary로 F16을 사용하면 역방향(Q4_0→F16)이 되므로 거부된다.
+    ReverseSwapRejected {
+        primary_dtype: String,
+        secondary_dtype: String,
+    },
     /// 기타 IO/파싱 에러.
     Io(std::io::Error),
     /// 기타 메시지 에러.
@@ -136,6 +156,30 @@ impl fmt::Display for AufError {
                 f,
                 "AUF invariant violation (INV-135): lm_head entry has no payload \
                  for variant '{variant_tag}'"
+            ),
+            AufError::DtypeNotAvailable {
+                layer_idx,
+                kind,
+                dtype,
+            } => write!(
+                f,
+                "AUF tensor not available: layer_idx={layer_idx}, kind={kind}, dtype={dtype} \
+                 not found in TENSOR_INDEX (ENG-ALG-225)"
+            ),
+            AufError::BackendDtypeIncompatible { backend, dtype } => write!(
+                f,
+                "AUF backend/dtype incompatible: backend={backend} does not support dtype={dtype}. \
+                 Adreno SOA backend only supports Q4_0 secondary. \
+                 Use --backend cpu or switch to a non-SOA AUF variant."
+            ),
+            AufError::ReverseSwapRejected {
+                primary_dtype,
+                secondary_dtype,
+            } => write!(
+                f,
+                "AUF reverse swap rejected: primary={primary_dtype}, secondary={secondary_dtype}. \
+                 Weight swap only supports F16→Q4_0 direction. \
+                 primary=Q4_0 with secondary=F16 would be a reverse (Q4_0→F16) swap which is unsupported."
             ),
             AufError::Io(e) => write!(f, "AUF I/O error: {e}"),
             AufError::Other(msg) => write!(f, "AUF error: {msg}"),

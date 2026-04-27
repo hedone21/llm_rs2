@@ -29,6 +29,22 @@ use crate::auf::{
     tensor_index::{LAYER_IDX_CROSS, TensorDType, TensorKind},
 };
 
+/// CLI `--secondary-dtype` 값.
+///
+/// `generate.rs`가 파싱하여 `open_secondary_auf`에 전달한다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryDtypeChoice {
+    /// 자동 선택: primary와 다른 dtype candidate 1개를 META.default_dtype 또는
+    /// first-candidate 규칙으로 선택한다.
+    Auto,
+    /// F16을 명시 지정한다.
+    F16,
+    /// Q4_0을 명시 지정한다.
+    Q4_0,
+    /// F32를 명시 지정한다.
+    F32,
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Public error type
 // ──────────────────────────────────────────────────────────────────────────
@@ -65,6 +81,21 @@ pub enum LoadError {
 
     /// AUF file did not pass invariant checks (INV-132~134).
     AufInvariantViolation { detail: String },
+
+    /// Adreno SOA backend + F16 dtype 조합이 거부됨 (Sprint D 함정 3).
+    ///
+    /// Adreno SOA WEIGHTS section은 Q4_0 전용 SOA layout이므로 F16 dtype secondary
+    /// 로드를 지원하지 않는다. --secondary-dtype q4_0 또는 CPU/CUDA backend를 사용하라.
+    AdrenoSoaF16Rejected,
+
+    /// 단방향 swap 정합성 위반: primary=Q4_0, secondary=F16 (역방향 차단).
+    ReverseSwapRejected {
+        primary_dtype: String,
+        secondary_dtype: String,
+    },
+
+    /// 요청한 dtype이 AUF TENSOR_INDEX에 없다.
+    DtypeNotFound { dtype: String },
 }
 
 impl std::fmt::Display for LoadError {
@@ -99,6 +130,26 @@ impl std::fmt::Display for LoadError {
             LoadError::AufInvariantViolation { detail } => {
                 write!(f, "AUF file invariant violation: {detail}")
             }
+            LoadError::AdrenoSoaF16Rejected => write!(
+                f,
+                "Adreno SOA backend does not support F16 secondary dtype. \
+                 The SOA layout is Q4_0-only. \
+                 Use --secondary-dtype q4_0 or switch to a CPU/CUDA backend."
+            ),
+            LoadError::ReverseSwapRejected {
+                primary_dtype,
+                secondary_dtype,
+            } => write!(
+                f,
+                "Reverse swap rejected: primary={primary_dtype}, secondary={secondary_dtype}. \
+                 Weight swap only supports F16→Q4_0 direction. \
+                 Cannot use secondary=F16 when primary is already Q4_0."
+            ),
+            LoadError::DtypeNotFound { dtype } => write!(
+                f,
+                "Secondary dtype '{dtype}' not available in AUF TENSOR_INDEX. \
+                 Use --secondary-dtype auto or choose an available dtype."
+            ),
         }
     }
 }
@@ -430,8 +481,26 @@ pub fn open_secondary(
     primary_config: &ModelConfig,
     primary_gguf: &GgufFile,
 ) -> Result<SecondaryMmap, LoadError> {
+    open_secondary_with_dtype(
+        path,
+        primary_config,
+        primary_gguf,
+        SecondaryDtypeChoice::Auto,
+    )
+}
+
+/// `open_secondary`의 dtype 선택 파라미터 버전 (D-2, ENG-ALG-225).
+///
+/// AUF 파일인 경우 `secondary_dtype_choice`를 적용하여 dtype을 선택한다.
+/// GGUF 파일인 경우 `secondary_dtype_choice`는 무시된다 (GGUF는 단일 dtype 파일).
+pub fn open_secondary_with_dtype(
+    path: &Path,
+    primary_config: &ModelConfig,
+    primary_gguf: &GgufFile,
+    secondary_dtype_choice: SecondaryDtypeChoice,
+) -> Result<SecondaryMmap, LoadError> {
     if is_auf_path(path) {
-        open_secondary_auf(path, primary_config)
+        open_secondary_auf(path, primary_config, secondary_dtype_choice)
     } else {
         open_secondary_gguf(path, primary_config, primary_gguf)
     }
@@ -569,6 +638,7 @@ fn detect_backend_tag() -> BackendTag {
 fn open_secondary_auf(
     path: &Path,
     primary_config: &ModelConfig,
+    secondary_dtype_choice: SecondaryDtypeChoice,
 ) -> Result<SecondaryMmap, LoadError> {
     let backend_tag = detect_backend_tag();
 
@@ -582,7 +652,13 @@ fn open_secondary_auf(
     // Validate AUF metadata against primary model config (ENG-DAT-C10).
     check_auf_metadata(primary_config, &view.meta, path)?;
 
-    build_auf_secondary_from_view(view, primary_config, path, backend_tag)
+    build_auf_secondary_from_view(
+        view,
+        primary_config,
+        path,
+        backend_tag,
+        secondary_dtype_choice,
+    )
 }
 
 /// Core logic for building an `AufSecondaryMmap` from a pre-parsed `AufView`.
@@ -591,6 +667,24 @@ fn open_secondary_auf(
 /// `AufView` constructed directly from bytes via `open_from_bytes`, bypassing
 /// file I/O, while still exercising the full tensor-index → layer-index →
 /// tensor_bytes round-trip.
+///
+/// # Dtype 선택 정책 (ENG-ALG-225, Sprint D)
+///
+/// `secondary_dtype_choice`는 layer-index 구성 시 어느 dtype entry를 사용할지 결정한다:
+///
+/// 1. `SecondaryDtypeChoice::Auto` — primary와 다른 dtype candidate를 자동 선택.
+///    후보가 여럿이면 META.default_dtype을 우선 사용하고, 그래도 모호하면 첫 번째 candidate.
+/// 2. 명시 dtype (`F16`, `Q4_0`, `F32`) — 해당 dtype의 entry만 사용.
+///
+/// # Adreno SOA × F16 reject (Sprint D 함정 3)
+///
+/// `backend_tag = AdrenoSoa`인데 선택된 dtype이 F16이면 `LoadError::AdrenoSoaF16Rejected`를
+/// 반환한다. SOA layout은 Q4_0 전용이므로 F16 secondary는 지원되지 않는다.
+///
+/// # 단방향 swap 정합성 (Sprint D)
+///
+/// primary dtype이 Q4_0인데 secondary dtype이 F16이면 `LoadError::ReverseSwapRejected`를
+/// 반환한다. weight swap은 F16→Q4_0 단방향만 지원한다.
 ///
 /// # Offset contract
 /// `TensorIndex::variant_offsets` entries are **section-local** (relative to the
@@ -603,6 +697,7 @@ pub fn build_auf_secondary_from_view(
     primary_config: &ModelConfig,
     path: &Path,
     backend_tag: crate::auf::BackendTag,
+    secondary_dtype_choice: SecondaryDtypeChoice,
 ) -> Result<SecondaryMmap, LoadError> {
     // Determine variant index for the selected backend.
     let weights_tag = backend_tag
@@ -627,7 +722,112 @@ pub fn build_auf_secondary_from_view(
         .weights_range
         .expect("AufView::weights_range must be Some after open() with concrete backend_tag");
 
-    // Build per-layer slice index from TENSOR_INDEX entries.
+    // ── dtype 선택 정책 (ENG-ALG-225) ─────────────────────────────────────
+    // AUF TENSOR_INDEX에서 사용 가능한 dtype 집합을 수집한다.
+    // (layer_idx != LAYER_IDX_CROSS이고 해당 variant payload가 있는 entry 기준)
+    let available_dtypes: std::collections::BTreeSet<u32> = view
+        .tensor_index
+        .entries
+        .iter()
+        .filter(|e| {
+            if e.layer_idx == LAYER_IDX_CROSS {
+                return false;
+            }
+            let var_offset = e
+                .variant_offsets
+                .get(variant_idx)
+                .copied()
+                .unwrap_or(u64::MAX);
+            let var_size = e.variant_sizes.get(variant_idx).copied().unwrap_or(0);
+            var_offset != u64::MAX && var_size != 0
+        })
+        .map(|e| e.dtype)
+        .collect();
+
+    // 선택된 secondary dtype (TensorDType로 표현).
+    let selected_dtype: Option<TensorDType> = match secondary_dtype_choice {
+        SecondaryDtypeChoice::Auto => {
+            // primary dtype 결정 (ModelConfig에서는 직접 dtype을 노출하지 않으므로
+            // available_dtypes에서 primary가 아닌 candidate 자동 선택).
+            // primary는 일반적으로 F16이고 secondary는 Q4_0이지만,
+            // 명시적인 primary dtype이 없으므로 AUF 파일 내 후보 중
+            // META.default_dtype을 우선 사용한다.
+            let default_from_meta: Option<TensorDType> = view
+                .meta
+                .default_dtype
+                .as_deref()
+                .and_then(dtype_str_to_tensor_dtype_local);
+
+            if let Some(d) = default_from_meta {
+                if available_dtypes.contains(&d.as_u32()) {
+                    Some(d)
+                } else {
+                    // META.default_dtype이 available에 없으면 first candidate.
+                    available_dtypes
+                        .iter()
+                        .next()
+                        .and_then(|&u| TensorDType::from_u32(u))
+                }
+            } else {
+                // META.default_dtype 없음 → first candidate.
+                available_dtypes
+                    .iter()
+                    .next()
+                    .and_then(|&u| TensorDType::from_u32(u))
+            }
+        }
+        SecondaryDtypeChoice::F16 => {
+            if available_dtypes.contains(&TensorDType::F16.as_u32()) {
+                Some(TensorDType::F16)
+            } else {
+                return Err(LoadError::DtypeNotFound {
+                    dtype: "F16".to_string(),
+                });
+            }
+        }
+        SecondaryDtypeChoice::Q4_0 => {
+            if available_dtypes.contains(&TensorDType::Q4_0.as_u32()) {
+                Some(TensorDType::Q4_0)
+            } else {
+                return Err(LoadError::DtypeNotFound {
+                    dtype: "Q4_0".to_string(),
+                });
+            }
+        }
+        SecondaryDtypeChoice::F32 => {
+            if available_dtypes.contains(&TensorDType::F32.as_u32()) {
+                Some(TensorDType::F32)
+            } else {
+                return Err(LoadError::DtypeNotFound {
+                    dtype: "F32".to_string(),
+                });
+            }
+        }
+    };
+
+    // ── Adreno SOA × F16 reject (Sprint D 함정 3) ──────────────────────────
+    if backend_tag == BackendTag::AdrenoSoa && matches!(selected_dtype, Some(TensorDType::F16)) {
+        return Err(LoadError::AdrenoSoaF16Rejected);
+    }
+
+    // ── 단방향 swap 정합성 검증 (primary=Q4_0이면 secondary=F16 reject) ─────
+    // primary_config에는 dtype이 직접 없으므로 META.default_dtype이 Q4_0인 경우를 primary로 간주한다.
+    // 좀 더 정확한 방법: AUF의 모든 entry dtype 중 Q4_0만 있으면 primary=Q4_0 파일로 판단.
+    // 실용적으로는 available_dtypes에서 primary가 Q4_0 single이면서 secondary=F16이면 reject.
+    // (Sprint D spec: primary=Q4_0이면 secondary=F16 reject)
+    if let Some(TensorDType::F16) = selected_dtype {
+        // available_dtypes가 {Q4_0}만 있다면 primary=Q4_0 전용 파일 → 역방향 차단.
+        let only_q4_0 =
+            available_dtypes.len() == 1 && available_dtypes.contains(&TensorDType::Q4_0.as_u32());
+        if only_q4_0 {
+            return Err(LoadError::ReverseSwapRejected {
+                primary_dtype: "Q4_0".to_string(),
+                secondary_dtype: "F16".to_string(),
+            });
+        }
+    }
+
+    // ── TENSOR_INDEX → per-layer slice index 구성 ─────────────────────────
     let num_layers = primary_config.num_hidden_layers;
     let mut layer_index: Vec<LayerTensorSlice> = vec![LayerTensorSlice::default(); num_layers];
 
@@ -638,6 +838,13 @@ pub fn build_auf_secondary_from_view(
         }
         let layer_idx = entry.layer_idx as usize;
         if layer_idx >= num_layers {
+            continue;
+        }
+
+        // dtype 필터: selected_dtype이 Some인 경우 해당 dtype만 허용.
+        if let Some(sel) = selected_dtype
+            && entry.dtype != sel.as_u32()
+        {
             continue;
         }
 
@@ -685,6 +892,23 @@ pub fn build_auf_secondary_from_view(
         source_path: path.to_path_buf(),
         is_pre_converted_soa,
     }))
+}
+
+/// META.default_dtype / CLI dtype 문자열을 `TensorDType`으로 변환 (로컬 복사).
+///
+/// `reader.rs`의 `dtype_str_to_tensor_dtype`와 동일 로직이지만
+/// cross-crate 공유를 피하기 위해 module-local으로 유지한다.
+fn dtype_str_to_tensor_dtype_local(s: &str) -> Option<TensorDType> {
+    match s {
+        "F32" => Some(TensorDType::F32),
+        "F16" => Some(TensorDType::F16),
+        "BF16" => Some(TensorDType::BF16),
+        "Q4_0" => Some(TensorDType::Q4_0),
+        "Q4_1" => Some(TensorDType::Q4_1),
+        "Q8_0" => Some(TensorDType::Q8_0),
+        "U8" => Some(TensorDType::U8),
+        _ => None,
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────

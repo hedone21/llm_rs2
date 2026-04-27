@@ -142,6 +142,12 @@ mod test_inv_139_capability_bit3;
 #[path = "spec/test_eng_alg_224_writer_multi_dtype.rs"]
 mod test_eng_alg_224_writer_multi_dtype;
 
+// ── AUF v0.2 Sprint D — ENG-ALG-225 reader dtype dispatch ──
+// reader lookup_tensor precedence (명시 > default_dtype > first-match).
+// Adreno SOA × F16 reject, 단방향 swap 정합성, SwapExecutor 시그니처 unchanged.
+#[path = "spec/test_eng_alg_225_reader_dispatch.rs"]
+mod test_eng_alg_225_reader_dispatch;
+
 // ── Sprint G-1-E — AUF lm_head Q4_0 통합 정확성 검증 ──
 // 의문 1: ADRENO_SOA payload = q_buf||d_buf (SOA) layout 정합성.
 // 의문 2: payload.bytes.len() == N*18 (SOA 총 크기 = AOS 총 크기 불변).

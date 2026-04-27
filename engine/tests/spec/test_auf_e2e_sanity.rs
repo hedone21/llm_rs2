@@ -140,6 +140,7 @@ fn auf_e2e_shape_round_trip_matches_primary() {
         &config,
         Path::new("/fake/e2e_test.auf"),
         BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
     )
     .expect("build_auf_secondary_from_view should succeed");
 
@@ -202,6 +203,7 @@ fn auf_e2e_empty_shape_causes_mismatch() {
         &config,
         Path::new("/fake/e2e_empty_shape.auf"),
         BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
     )
     .expect("build should succeed even with empty shape");
 
@@ -271,6 +273,7 @@ fn auf_e2e_dtype_round_trip() {
             &config,
             Path::new("/fake/dtype_test.auf"),
             BackendTag::CpuAos,
+            llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
         )
         .expect("build should succeed");
 
@@ -344,6 +347,7 @@ fn auf_e2e_multi_layer_shape_propagation() {
         &config,
         Path::new("/fake/multi_layer.auf"),
         BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
     )
     .expect("build_auf_secondary_from_view should succeed");
 
@@ -444,6 +448,7 @@ fn auf_soa_bypass_split_matches_builder_output() {
         &config,
         Path::new("/fake/soa_bypass.auf"),
         BackendTag::AdrenoSoa,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
     )
     .expect("build_auf_secondary_from_view should succeed for SOA");
 
@@ -516,6 +521,7 @@ fn split_pre_converted_soa_returns_none_for_cpu_aos_variant() {
         &make_config(1, 32, 64, 128),
         Path::new("/fake/cpu_aos.auf"),
         BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
     )
     .expect("build OK");
 

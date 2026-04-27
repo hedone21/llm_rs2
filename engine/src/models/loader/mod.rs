@@ -46,6 +46,12 @@ pub struct LoadConfig {
     /// identical to the legacy behaviour and `SwapWeights` actions are
     /// no-ops. See ENG-DAT-C09.
     pub secondary_source: Option<PathBuf>,
+    /// Dtype selection for AUF-backed secondary files (ENG-ALG-225, Sprint D).
+    ///
+    /// Controls which dtype is selected from a multi-dtype AUF TENSOR_INDEX.
+    /// Ignored for GGUF secondaries. `Auto` is the default and selects
+    /// META.default_dtype or the first available candidate.
+    pub secondary_dtype_choice: crate::models::weights::SecondaryDtypeChoice,
 }
 
 /// Internal standard tensor identifier (format-agnostic).

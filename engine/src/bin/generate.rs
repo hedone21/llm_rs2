@@ -40,6 +40,39 @@ use llm_rs2::resilience::{
     CommandExecutor, EngineCommand, KVSnapshot, ManagerMessage, MessageLoop,
 };
 
+/// `--secondary-dtype` CLI 인수 값 (D-3, ENG-ALG-225).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryDtypeArg {
+    Auto,
+    F16,
+    Q4_0,
+    F32,
+}
+
+/// `--secondary-dtype` value_parser.
+fn parse_secondary_dtype(s: &str) -> Result<SecondaryDtypeArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(SecondaryDtypeArg::Auto),
+        "f16" => Ok(SecondaryDtypeArg::F16),
+        "q4_0" | "q4" => Ok(SecondaryDtypeArg::Q4_0),
+        "f32" => Ok(SecondaryDtypeArg::F32),
+        other => Err(format!(
+            "unknown secondary-dtype '{other}'. Valid values: auto, f16, q4_0, f32"
+        )),
+    }
+}
+
+impl From<SecondaryDtypeArg> for llm_rs2::models::weights::SecondaryDtypeChoice {
+    fn from(arg: SecondaryDtypeArg) -> Self {
+        match arg {
+            SecondaryDtypeArg::Auto => Self::Auto,
+            SecondaryDtypeArg::F16 => Self::F16,
+            SecondaryDtypeArg::Q4_0 => Self::Q4_0,
+            SecondaryDtypeArg::F32 => Self::F32,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -616,6 +649,21 @@ struct Args {
     #[arg(long)]
     force_swap_ratio: Option<f32>,
 
+    /// Secondary dtype selection for AUF-backed weight swap (ENG-ALG-225, Sprint D).
+    ///
+    /// Controls which dtype entry is selected from a multi-dtype AUF file:
+    ///   auto  — automatically select the best candidate dtype (default).
+    ///           If META.default_dtype is set, that is used; otherwise the first
+    ///           available candidate is picked.
+    ///   q4_0  — explicitly select Q4_0 entries.
+    ///   f16   — explicitly select F16 entries.
+    ///   f32   — explicitly select F32 entries.
+    ///
+    /// Ignored for GGUF-backed secondaries (GGUF files carry a single dtype).
+    /// Adreno SOA backend rejects f16 (SOA layout is Q4_0-only).
+    #[arg(long, default_value = "auto", value_parser = parse_secondary_dtype)]
+    secondary_dtype: SecondaryDtypeArg,
+
     /// Explicit path to tokenizer.json. When omitted, the tokenizer is
     /// resolved automatically via the GGUF basename (e.g.
     /// `<dir>/<stem>.tokenizer.json`, then `<dir>/<stem-without-quant>.tokenizer.json`,
@@ -999,6 +1047,7 @@ fn main() -> anyhow::Result<()> {
             primary_source: std::path::PathBuf::from(model_path),
             default_dtype: w_dtype,
             secondary_source: args.secondary_gguf.clone(),
+            secondary_dtype_choice: args.secondary_dtype.into(),
         };
         TransformerModel::load_from_config(&load_cfg, backend.clone(), &*memory)?
     } else {

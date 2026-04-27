@@ -18,7 +18,7 @@ use crate::auf::section::{
     SectionTable, TAG_META, TAG_TENSOR_INDEX, TAG_TOKENIZER, TAG_WEIGHTS_ADRENO_SOA,
     TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS,
 };
-use crate::auf::tensor_index::{TensorDType, TensorIndex};
+use crate::auf::tensor_index::{TensorDType, TensorEntry, TensorIndex};
 use crate::auf::tokenizer::AufTokenizer;
 
 /// backend 식별자.
@@ -59,6 +59,22 @@ pub struct LmHeadPayload<'a> {
     pub alignment: usize,
     /// 이 payload가 추출된 backend variant tag.
     pub variant_tag: &'static str,
+}
+
+/// META.default_dtype 문자열을 `TensorDType`으로 변환한다.
+///
+/// 알 수 없는 문자열이면 `None`을 반환한다 (graceful fallback).
+fn dtype_str_to_tensor_dtype(s: &str) -> Option<TensorDType> {
+    match s {
+        "F32" => Some(TensorDType::F32),
+        "F16" => Some(TensorDType::F16),
+        "BF16" => Some(TensorDType::BF16),
+        "Q4_0" => Some(TensorDType::Q4_0),
+        "Q4_1" => Some(TensorDType::Q4_1),
+        "Q8_0" => Some(TensorDType::Q8_0),
+        "U8" => Some(TensorDType::U8),
+        _ => None,
+    }
 }
 
 /// AUF 파일 view — mmap 보유 + 파싱된 메타데이터 + WEIGHTS payload byte slice.
@@ -193,6 +209,67 @@ impl AufView {
             alignment: crate::auf::writer::WEIGHTS_ALIGNMENT as usize,
             variant_tag,
         }))
+    }
+
+    /// ENG-ALG-225 precedence: 명시 dtype > META.default_dtype > first-match.
+    ///
+    /// `layer_idx` / `kind`에 해당하는 `TensorEntry`를 dtype 우선순위에 따라 조회한다.
+    ///
+    /// # Precedence (ENG-ALG-225)
+    ///
+    /// 1. `requested_dtype = Some(d)` — 해당 dtype의 entry를 명시 조회한다.
+    ///    존재하지 않으면 `AufError::DtypeNotAvailable`을 반환한다.
+    /// 2. `requested_dtype = None` + `META.default_dtype = Some(s)` — `s`를 파싱하여
+    ///    해당 dtype의 entry를 조회한다. 파싱 실패 또는 entry 부재 시 first-match로 fallback.
+    /// 3. `requested_dtype = None` + `META.default_dtype = None` — first-match (entries_for의 첫 번째).
+    ///
+    /// # Errors
+    ///
+    /// - `requested_dtype`이 명시되었지만 해당 entry가 없으면 `AufError::DtypeNotAvailable`.
+    /// - `(layer_idx, kind)` 자체에 entry가 0개이면 `AufError::DtypeNotAvailable`.
+    pub fn lookup_tensor(
+        &self,
+        layer_idx: u32,
+        kind: u32,
+        requested_dtype: Option<TensorDType>,
+    ) -> AufResult<&TensorEntry> {
+        if let Some(dtype) = requested_dtype {
+            // Precedence 1: 명시 dtype 조회.
+            self.tensor_index
+                .find_entry_by_dtype(layer_idx, kind, dtype.as_u32())
+                .ok_or(AufError::DtypeNotAvailable {
+                    layer_idx,
+                    kind,
+                    dtype: dtype.as_u32(),
+                })
+        } else {
+            let candidates = self.tensor_index.entries_for(layer_idx, kind);
+            if candidates.is_empty() {
+                return Err(AufError::DtypeNotAvailable {
+                    layer_idx,
+                    kind,
+                    dtype: u32::MAX,
+                });
+            }
+
+            // Precedence 2: META.default_dtype가 있으면 그 dtype을 시도한다.
+            if let Some(ref default_str) = self.meta.default_dtype {
+                let default_dtype_opt = dtype_str_to_tensor_dtype(default_str);
+                if let Some(default_dtype) = default_dtype_opt
+                    && let Some(entry) = self.tensor_index.find_entry_by_dtype(
+                        layer_idx,
+                        kind,
+                        default_dtype.as_u32(),
+                    )
+                {
+                    return Ok(entry);
+                }
+                // default_dtype 파싱 실패 또는 해당 entry 부재 → first-match fallback.
+            }
+
+            // Precedence 3: first-match.
+            Ok(candidates[0])
+        }
     }
 
     /// `weights_range.offset`으로 어떤 WEIGHTS variant tag가 열렸는지 역조회한다.

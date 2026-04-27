@@ -195,15 +195,38 @@ impl TransformerModel {
         backend: Arc<dyn Backend>,
         memory: &dyn Memory,
     ) -> Result<Self> {
-        Self::load_gguf_with_secondary(
-            config
-                .primary_source
-                .to_str()
-                .ok_or_else(|| anyhow!("primary_source path is not valid UTF-8"))?,
-            config.secondary_source.as_deref(),
-            backend,
-            memory,
-        )
+        use crate::models::loader::TensorSource;
+        use crate::models::loader::gguf::GgufSource;
+        use crate::models::weights::open_secondary_with_dtype;
+
+        let primary_path = config
+            .primary_source
+            .to_str()
+            .ok_or_else(|| anyhow!("primary_source path is not valid UTF-8"))?;
+
+        let source = GgufSource::open(std::path::Path::new(primary_path))?;
+        let secondary_mmap = match config.secondary_source.as_deref() {
+            None => None,
+            Some(p) => {
+                let gguf = source.gguf_file();
+                let model_config = source.config();
+                let handle =
+                    open_secondary_with_dtype(p, model_config, gguf, config.secondary_dtype_choice)
+                        .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
+                Some(Arc::new(handle))
+            }
+        };
+        let mut model =
+            crate::models::loader::load_model(&source, backend, memory, secondary_mmap)?;
+
+        // ENG-ALG-216: eager ε computation immediately after secondary mmap open.
+        model.quant_noise = compute_quant_noise_for_model(&model);
+
+        if std::env::var("LLMRS_MADV_DONTNEED").is_ok() {
+            source.madvise_dontneed();
+        }
+
+        Ok(model)
     }
 
     /// Load a primary GGUF plus an optional secondary GGUF reserved for

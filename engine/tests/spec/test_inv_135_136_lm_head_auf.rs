@@ -266,7 +266,14 @@ fn as_auf_view_returns_some_for_auf_secondary() {
     let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
     let config = make_model_config();
     let path = std::path::Path::new("dummy.auf");
-    let sm = build_auf_secondary_from_view(view, &config, path, BackendTag::CpuAos).unwrap();
+    let sm = build_auf_secondary_from_view(
+        view,
+        &config,
+        path,
+        BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
+    )
+    .unwrap();
     assert!(
         sm.as_auf_view().is_some(),
         "AUF secondary must return Some from as_auf_view()"
@@ -284,7 +291,14 @@ fn as_auf_view_lm_head_round_trip() {
     let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
     let config = make_model_config();
     let path = std::path::Path::new("dummy.auf");
-    let sm = build_auf_secondary_from_view(view, &config, path, BackendTag::CpuAos).unwrap();
+    let sm = build_auf_secondary_from_view(
+        view,
+        &config,
+        path,
+        BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
+    )
+    .unwrap();
 
     let auf_view = sm.as_auf_view().expect("should be AUF");
     let payload = auf_view
@@ -316,7 +330,14 @@ fn as_auf_view_none_for_gguf_via_enum_analysis() {
     let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
     let config = make_model_config();
     let path = std::path::Path::new("dummy.auf");
-    let sm = build_auf_secondary_from_view(view, &config, path, BackendTag::CpuAos).unwrap();
+    let sm = build_auf_secondary_from_view(
+        view,
+        &config,
+        path,
+        BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
+    )
+    .unwrap();
     assert!(sm.as_auf_view().is_some(), "Auf variant must return Some");
     // Gguf variant can only be constructed from a real file; the function body
     // `match self { Gguf(_) => None, Auf(a) => Some(&a.view) }` is verified by

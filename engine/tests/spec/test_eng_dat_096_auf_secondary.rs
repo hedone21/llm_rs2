@@ -362,6 +362,7 @@ fn auf_secondary_tensor_bytes_base_offset_round_trip() {
         &config,
         Path::new("/fake/test.auf"),
         BackendTag::CpuAos,
+        llm_rs2::models::weights::SecondaryDtypeChoice::Auto,
     )
     .expect("build_auf_secondary_from_view should succeed");
 
