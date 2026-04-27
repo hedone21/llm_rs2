@@ -673,6 +673,23 @@ struct Args {
     /// and silently produce garbage outputs.
     #[arg(long)]
     tokenizer_path: Option<std::path::PathBuf>,
+
+    /// Dump per-run QCF/NLL/swap_set as a single JSON file (schema_version 1).
+    ///
+    /// Activates the warmup-prefill workflow: before the main measurement
+    /// (--ppl or generation), a short prefill with N tokens collects the
+    /// per-layer ImportanceTable used by WeightSwapDecider for accurate
+    /// importance × ε bottom-k layer selection.
+    ///
+    /// When absent, all existing behavior is unchanged (--force-swap-ratio
+    /// still uses the uniform fallback path as before).
+    #[arg(long)]
+    qcf_dump: Option<std::path::PathBuf>,
+
+    /// Number of tokens for the warmup prefill that builds ImportanceTable.
+    /// Only used when `--qcf-dump` is set. Default: 256.
+    #[arg(long, default_value_t = 256)]
+    qcf_warmup_tokens: usize,
 }
 
 /// Create a GPU buffer allocator for tensor partition workspace.
@@ -2150,7 +2167,11 @@ fn main() -> anyhow::Result<()> {
     // ── Weight swap: --force-swap-ratio manual trigger ──────────────────────
     // Applied once before generation starts (prefill + decode).
     // Requires --secondary-gguf (validated above at model load time).
-    if let Some(ratio) = args.force_swap_ratio {
+    // When --qcf-dump is set, this block is skipped; the swap is deferred to
+    // the QCF dump workflow below (after warmup prefill builds ImportanceTable).
+    if args.qcf_dump.is_none()
+        && let Some(ratio) = args.force_swap_ratio
+    {
         use llm_rs2::core::buffer::DType as LDType;
         use llm_rs2::memory::galloc::Galloc;
         use llm_rs2::models::weights::swap_executor::SwapExecutor;
@@ -2377,10 +2398,167 @@ fn main() -> anyhow::Result<()> {
     }
 
     // ════════════════════════════════════════════════════════════
+    //  QCF DUMP WORKFLOW: Warmup prefill → ImportanceTable → Swap → Measure
+    //
+    //  When --qcf-dump is active, we insert a warmup prefill before the main
+    //  measurement to build an ImportanceTable for accurate WeightSwapDecider
+    //  (importance × ε bottom-k selection, ENG-ALG-215).
+    //
+    //  The workflow applies to both --ppl and generation modes.
+    //  When --qcf-dump is absent, all existing behavior is unchanged.
+    // ════════════════════════════════════════════════════════════
+
+    // Accumulated state produced by the QCF dump workflow.
+    // Only populated when args.qcf_dump.is_some().
+    let mut qcf_warmup_importance: Option<llm_rs2::core::qcf::ImportanceTable> = None;
+    let mut qcf_swap_decision: Option<llm_rs2::models::weights::decider::SwapDecision> = None;
+    let qcf_workflow_start = std::time::Instant::now();
+
+    if args.qcf_dump.is_some() && (args.ppl.is_some() || !prompt.is_empty()) {
+        use llm_rs2::core::buffer::DType as LDType;
+        use llm_rs2::core::qcf::ImportanceCollector;
+        use llm_rs2::memory::galloc::Galloc as WGalloc;
+        use llm_rs2::models::weights::decider::WeightSwapDecider;
+        use llm_rs2::models::weights::swap_executor::SwapExecutor;
+
+        let warmup_n = args.qcf_warmup_tokens.max(1);
+
+        // ── Step 1: build warmup token sequence ──────────────────────────────
+        // For PPL mode: first N tokens of the reference text.
+        // For generation mode: the prompt tokens (up to warmup_n).
+        let warmup_tokens: Vec<u32> = if let Some(ref ppl_path) = args.ppl {
+            let text = std::fs::read_to_string(ppl_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read PPL file for warmup: {}", e))?;
+            let enc = tokenizer
+                .encode(text.as_str(), true)
+                .map_err(|e| anyhow::anyhow!("Warmup tokenize error: {}", e))?;
+            enc.get_ids().iter().take(warmup_n).copied().collect()
+        } else {
+            let enc = tokenizer
+                .encode(prompt.as_str(), true)
+                .map_err(|e| anyhow::anyhow!("Warmup tokenize error: {}", e))?;
+            enc.get_ids().iter().take(warmup_n).copied().collect()
+        };
+
+        let actual_warmup_len = warmup_tokens.len();
+        if actual_warmup_len < 1 {
+            anyhow::bail!(
+                "--qcf-dump: warmup token sequence is empty (prompt or PPL text too short)"
+            );
+        }
+        eprintln!("[QCF-dump] Warmup prefill: {} tokens", actual_warmup_len);
+
+        // ── Step 2: warmup prefill with ImportanceCollector ───────────────────
+        let mut collector = ImportanceCollector::new();
+
+        {
+            let warmup_buf = WGalloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
+            unsafe {
+                let ptr = warmup_buf.as_mut_ptr() as *mut u32;
+                for (i, &id) in warmup_tokens.iter().enumerate() {
+                    *ptr.add(i) = id;
+                }
+            }
+            let cpu_warmup = Tensor::new(
+                Shape::new(vec![1, actual_warmup_len]),
+                warmup_buf,
+                Arc::new(CpuBackend::new()),
+            );
+            let warmup_input = backend.copy_from(&cpu_warmup)?;
+
+            let warmup_logits_buf = memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
+            let mut warmup_logits = Tensor::new(
+                Shape::new(vec![1, actual_warmup_len, vocab_size]),
+                warmup_logits_buf,
+                backend.clone(),
+            );
+
+            model.forward_into(TransformerModelForwardArgs {
+                input_tokens: &warmup_input,
+                start_pos: 0,
+                kv_caches: &mut kv_caches,
+                backend: &backend,
+                memory: memory.as_ref(),
+                logits_out: &mut warmup_logits,
+                x_gen: None,
+                workspace: None,
+                score_accumulator: None,
+                profiler: None,
+                skip_config: None,
+                importance_collector: Some(&mut collector),
+                logits_last_only: false,
+                variance_collector: None,
+                prefill_workspace: None,
+            })?;
+            backend.synchronize()?;
+        }
+
+        // ── Step 3: build ImportanceTable + reset KV cache ────────────────────
+        let imp_table = collector.build();
+        eprintln!(
+            "[QCF-dump] ImportanceTable built: {} entries",
+            imp_table.len()
+        );
+
+        // Reset KV cache: clear all positions so run_ppl / generation starts fresh.
+        for kv in kv_caches.iter_mut() {
+            kv.current_pos = 0;
+        }
+
+        // ── Step 4: swap with importance-guided decider ───────────────────────
+        if let Some(ratio) = args.force_swap_ratio {
+            let ratio = ratio.clamp(0.0, 1.0);
+            let decider = WeightSwapDecider {
+                importance: Some(&imp_table),
+                noise: Some(model.quant_noise.as_ref()),
+                n_decoder_layers: model.layers.len(),
+                currently_swapped: &[],
+            };
+            let decision = decider.decide(ratio);
+
+            if !decision.selected_layers.is_empty() {
+                let swap_memory = WGalloc::new();
+                let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| cpu_backend_arc.clone());
+                let executor =
+                    SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
+                match executor.execute(&model, &decision.selected_layers) {
+                    Ok(report) => {
+                        eprintln!(
+                            "[QCF-dump] Swap: ratio={:.2}, layers={}/{}, qcf_pred={:.4}, \
+                             fallback={}, latency={:.1}ms",
+                            ratio,
+                            report.swapped.len(),
+                            model.layers.len(),
+                            decision.qcf_swap_estimate,
+                            decision.fallback_used,
+                            report.latency_ms,
+                        );
+                    }
+                    Err(e) => {
+                        anyhow::bail!("[QCF-dump] swap failed: {}", e);
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[QCF-dump] Swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
+                    ratio
+                );
+            }
+
+            qcf_swap_decision = Some(decision);
+        }
+
+        qcf_warmup_importance = Some(imp_table);
+    }
+
+    // ════════════════════════════════════════════════════════════
     //  PPL MODE: Perplexity evaluation on reference text
     // ════════════════════════════════════════════════════════════
     if let Some(ref ppl_path) = args.ppl {
-        return run_ppl(
+        let ppl_result = run_ppl(
             &args,
             &model,
             &tokenizer,
@@ -2397,7 +2575,60 @@ fn main() -> anyhow::Result<()> {
             score_based_eviction,
             actual_protected_prefix,
             skip_config.as_ref(),
-        );
+        )?;
+
+        // --qcf-dump: write JSON after PPL measurement completes.
+        if let Some(ref dump_path) = args.qcf_dump {
+            use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+
+            let empty_swap: Vec<usize> = Vec::new();
+            let (swap_set, qcf_predicted, fallback_used) = if let Some(ref dec) = qcf_swap_decision
+            {
+                (
+                    dec.selected_layers.as_slice(),
+                    dec.qcf_swap_estimate,
+                    dec.fallback_used,
+                )
+            } else {
+                (empty_swap.as_slice(), 0.0f32, false)
+            };
+
+            let secondary_path_str = args.secondary_gguf.as_ref().and_then(|p| p.to_str());
+            let model_arch = if args.model_path.to_lowercase().contains("qwen") {
+                "qwen2"
+            } else {
+                "llama"
+            };
+            let total_wall = qcf_workflow_start.elapsed().as_secs_f64() + ppl_result.wall_time_s;
+
+            let ctx = QcfSwapDumpContext {
+                model_arch,
+                model_path: &args.model_path,
+                secondary_path: secondary_path_str,
+                primary_dtype: "F16",
+                secondary_dtype: "Q4_0",
+                num_layers: model.layers.len(),
+                force_swap_ratio: args.force_swap_ratio,
+                swap_set,
+                qcf_swap_predicted: qcf_predicted,
+                fallback_used,
+                importance_table: qcf_warmup_importance.as_ref(),
+                noise_table: Some(model.quant_noise.as_ref()),
+                ppl: Some(ppl_result.ppl),
+                avg_nll: Some(ppl_result.avg_nll),
+                n_eval_tokens: ppl_result.n_eval_tokens,
+                wall_time_s: total_wall,
+                warmup_tokens: args.qcf_warmup_tokens,
+                backend: &args.backend,
+                kv_type: &args.kv_type,
+                ppl_corpus: Some(ppl_path.as_str()),
+            };
+
+            dump_qcf_swap_json(dump_path, &ctx)?;
+            eprintln!("[QCF-dump] JSON written to {}", dump_path.display());
+        }
+
+        return Ok(());
     }
 
     // ════════════════════════════════════════════════════════════
@@ -5829,6 +6060,56 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    // --qcf-dump: write JSON for generation mode (ppl=null, avg_nll=null).
+    if let Some(ref dump_path) = args.qcf_dump {
+        use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+
+        let empty_swap: Vec<usize> = Vec::new();
+        let (swap_set, qcf_predicted, fallback_used) = if let Some(ref dec) = qcf_swap_decision {
+            (
+                dec.selected_layers.as_slice(),
+                dec.qcf_swap_estimate,
+                dec.fallback_used,
+            )
+        } else {
+            (empty_swap.as_slice(), 0.0f32, false)
+        };
+
+        let secondary_path_str = args.secondary_gguf.as_ref().and_then(|p| p.to_str());
+        let model_arch = if args.model_path.to_lowercase().contains("qwen") {
+            "qwen2"
+        } else {
+            "llama"
+        };
+        let total_wall = qcf_workflow_start.elapsed().as_secs_f64();
+
+        let ctx = QcfSwapDumpContext {
+            model_arch,
+            model_path: &args.model_path,
+            secondary_path: secondary_path_str,
+            primary_dtype: "F16",
+            secondary_dtype: "Q4_0",
+            num_layers: model.layers.len(),
+            force_swap_ratio: args.force_swap_ratio,
+            swap_set,
+            qcf_swap_predicted: qcf_predicted,
+            fallback_used,
+            importance_table: qcf_warmup_importance.as_ref(),
+            noise_table: Some(model.quant_noise.as_ref()),
+            ppl: None,
+            avg_nll: None,
+            n_eval_tokens: 0,
+            wall_time_s: total_wall,
+            warmup_tokens: args.qcf_warmup_tokens,
+            backend: &args.backend,
+            kv_type: &args.kv_type,
+            ppl_corpus: None,
+        };
+
+        dump_qcf_swap_json(dump_path, &ctx)?;
+        eprintln!("[QCF-dump] JSON written to {}", dump_path.display());
+    }
+
     // T5: normal exit — all allocations still live (model, KV caches, workspaces).
     rss_trace("exit");
     Ok(())
@@ -7897,6 +8178,14 @@ fn run_offload(
 //  eviction policy and collects proxy metrics during eviction events.
 // ════════════════════════════════════════════════════════════════
 
+/// Return value from `run_ppl` for use by the caller (e.g. `--qcf-dump`).
+struct PplResult {
+    ppl: f64,
+    avg_nll: f64,
+    n_eval_tokens: usize,
+    wall_time_s: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_ppl(
     args: &Args,
@@ -7915,7 +8204,7 @@ fn run_ppl(
     score_based_eviction: bool,
     protected_prefix: usize,
     skip_config: Option<&llm_rs2::core::skip_config::SkipConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<PplResult> {
     use llm_rs2::core::qcf::QcfConfig;
 
     // ── 1. Read and tokenize reference text ──
@@ -8315,6 +8604,7 @@ fn run_ppl(
     // ── 6. Output results ──
     let wall_time = overall_start.elapsed().as_secs_f64();
     let ppl = (total_nll / nll_count as f64).exp();
+    let avg_nll = total_nll / nll_count as f64;
     let tok_per_sec = nll_count as f64 / wall_time;
 
     // Compute summary stats from all eviction events (v3)
@@ -8370,7 +8660,12 @@ fn run_ppl(
         ppl, total_nll, nll_count, tok_per_sec, wall_time
     );
 
-    Ok(())
+    Ok(PplResult {
+        ppl,
+        avg_nll,
+        n_eval_tokens: nll_count,
+        wall_time_s: wall_time,
+    })
 }
 
 // ─────────────────────── Chat REPL mode ───────────────────────

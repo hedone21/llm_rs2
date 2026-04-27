@@ -1,0 +1,468 @@
+//! Layer-swap QCF dump tests (Phase 1 in zazzy-herding-bonbon plan).
+//!
+//! Validates `dump_qcf_swap_json` + `QcfSwapDumpContext` serialization behaviour.
+//! Covers schema round-trip, ratio boundary conditions, noise NaN exclusion,
+//! and null serialization for generation-mode (ppl/avg_nll absent).
+//!
+//! Decider correctness (importance × ε bottom-k sort, protected layers) is
+//! already covered by unit tests in decider.rs; here we focus on the dump
+//! mapping and JSON schema contract consumed by the external harness.
+//!
+//! Spec: Phase 1 (zazzy-herding-bonbon), ENG-ALG-215, ENG-ALG-217.
+
+use llm_rs2::core::qcf::layer_importance::{ImportanceEntry, ImportanceTable, SubLayer};
+use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+use llm_rs2::models::weights::QuantNoiseTable;
+
+// ── Fixture helpers ───────────────────────────────────────────────────────────
+
+fn make_importance(entries: Vec<(usize, f32, f32)>) -> ImportanceTable {
+    let entries = entries
+        .into_iter()
+        .map(|(id, imp, opr)| ImportanceEntry {
+            layer_id: id,
+            sublayer: SubLayer::Full,
+            importance: imp,
+            opr,
+        })
+        .collect();
+    ImportanceTable::from_entries(entries)
+}
+
+fn make_noise(vals: Vec<f32>) -> QuantNoiseTable {
+    QuantNoiseTable::from_values(vals)
+}
+
+/// Serialize ctx to a temp file and parse back as serde_json::Value.
+fn dump_and_parse(ctx: &QcfSwapDumpContext<'_>) -> serde_json::Value {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("qcf.json");
+    dump_qcf_swap_json(&path, ctx).expect("dump_qcf_swap_json should succeed");
+    let content = std::fs::read_to_string(&path).expect("read JSON");
+    serde_json::from_str(&content).expect("valid JSON")
+}
+
+// ── Test 1: schema round-trip ─────────────────────────────────────────────────
+
+/// All top-level keys from schema_version 1 must be present, with correct types.
+#[test]
+fn test_dump_schema_round_trip() {
+    let imp = make_importance(vec![(0, 0.42, 0.31), (1, 0.28, 0.19)]);
+    let noise = make_noise(vec![0.018, 0.022]);
+    let swap_set = vec![1usize];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama-3.2-1b-f16.gguf",
+        secondary_path: Some("models/llama-3.2-1b-mixed.auf"),
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 2,
+        force_swap_ratio: Some(0.33),
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.214,
+        fallback_used: false,
+        importance_table: Some(&imp),
+        noise_table: Some(&noise),
+        ppl: Some(12.34),
+        avg_nll: Some(2.51),
+        n_eval_tokens: 4096,
+        wall_time_s: 18.7,
+        warmup_tokens: 256,
+        backend: "cpu",
+        kv_type: "f16",
+        ppl_corpus: Some("experiments/prompts/prefill_4096.txt"),
+    };
+
+    let v = dump_and_parse(&ctx);
+
+    // schema_version
+    assert_eq!(v["schema_version"].as_u64().unwrap(), 1);
+    // string fields
+    assert_eq!(v["model_arch"].as_str().unwrap(), "llama");
+    assert_eq!(v["model_path"].as_str().unwrap(), "models/llama-3.2-1b-f16.gguf");
+    assert_eq!(v["secondary_path"].as_str().unwrap(), "models/llama-3.2-1b-mixed.auf");
+    assert_eq!(v["primary_dtype"].as_str().unwrap(), "F16");
+    assert_eq!(v["secondary_dtype"].as_str().unwrap(), "Q4_0");
+    // numeric fields
+    assert_eq!(v["num_layers"].as_u64().unwrap(), 2);
+    assert!((v["force_swap_ratio"].as_f64().unwrap() - 0.33).abs() < 1e-5);
+    assert_eq!(v["swap_count"].as_u64().unwrap(), 1);
+    assert!((v["qcf_swap_predicted"].as_f64().unwrap() - 0.214).abs() < 1e-4);
+    assert!(!v["fallback_used"].as_bool().unwrap());
+    // ppl / avg_nll
+    assert!((v["ppl"].as_f64().unwrap() - 12.34).abs() < 1e-5);
+    assert!((v["avg_nll"].as_f64().unwrap() - 2.51).abs() < 1e-5);
+    assert_eq!(v["n_eval_tokens"].as_u64().unwrap(), 4096);
+    assert!((v["wall_time_s"].as_f64().unwrap() - 18.7).abs() < 0.1);
+    assert_eq!(v["warmup_tokens"].as_u64().unwrap(), 256);
+    assert_eq!(v["backend"].as_str().unwrap(), "cpu");
+    assert_eq!(v["kv_type"].as_str().unwrap(), "f16");
+    assert_eq!(v["ppl_corpus"].as_str().unwrap(), "experiments/prompts/prefill_4096.txt");
+
+    // arrays
+    assert!(v["importance_table"].is_array());
+    assert_eq!(v["importance_table"].as_array().unwrap().len(), 2);
+    assert!(v["noise_table"].is_array());
+    assert_eq!(v["noise_table"].as_array().unwrap().len(), 2);
+
+    // swap_set array
+    let ss = v["swap_set"].as_array().unwrap();
+    assert_eq!(ss.len(), 1);
+    assert_eq!(ss[0].as_u64().unwrap(), 1);
+}
+
+// ── Test 2: ratio=0.0 → swap_count=0, qcf_swap_predicted=0 ──────────────────
+
+/// When force_swap_ratio=0 (baseline), swap_set is empty and qcf is 0.
+#[test]
+fn test_ratio_zero_swap_count_zero() {
+    let swap_set: Vec<usize> = vec![];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 16,
+        force_swap_ratio: Some(0.0),
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.0,
+        fallback_used: false,
+        importance_table: None,
+        noise_table: None,
+        ppl: Some(10.0),
+        avg_nll: Some(2.30),
+        n_eval_tokens: 512,
+        wall_time_s: 5.0,
+        warmup_tokens: 256,
+        backend: "cpu",
+        kv_type: "f32",
+        ppl_corpus: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+
+    assert_eq!(v["swap_count"].as_u64().unwrap(), 0);
+    assert_eq!(v["swap_set"].as_array().unwrap().len(), 0);
+    assert!((v["qcf_swap_predicted"].as_f64().unwrap()).abs() < 1e-8);
+    // secondary_path and ppl_corpus null
+    assert!(v["secondary_path"].is_null());
+    assert!(v["ppl_corpus"].is_null());
+}
+
+// ── Test 3: ratio=0.33 on 16L → swap_count=5, layer 0/last excluded ──────────
+
+/// With 16 layers and ratio=0.33, floor(0.33*16)=5 layers.
+/// WeightSwapDecider protects layer 0 and 15; selected must not contain them.
+#[test]
+fn test_ratio_033_skip_count_5_for_16l() {
+    use llm_rs2::models::weights::decider::WeightSwapDecider;
+
+    // Build a uniform importance + noise table for 16 layers.
+    let vals: Vec<f32> = (0..16).map(|_| 0.05f32).collect();
+    let noise = make_noise(vals.clone());
+    let imp_entries: Vec<(usize, f32, f32)> = (0..16).map(|i| (i, 0.1, 0.05)).collect();
+    let imp = make_importance(imp_entries);
+
+    let decider = WeightSwapDecider {
+        importance: Some(&imp),
+        noise: Some(&noise),
+        n_decoder_layers: 16,
+        currently_swapped: &[],
+    };
+    let decision = decider.decide(0.33);
+
+    // swap_count = floor(0.33 * 16) = 5
+    assert_eq!(
+        decision.selected_layers.len(),
+        5,
+        "expected 5 layers for ratio=0.33 on 16L"
+    );
+    // layer 0 and 15 must not be in the set
+    assert!(
+        !decision.selected_layers.contains(&0),
+        "layer 0 is protected"
+    );
+    assert!(
+        !decision.selected_layers.contains(&15),
+        "layer 15 (last) is protected"
+    );
+
+    // Now verify the dump reflects this correctly.
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 16,
+        force_swap_ratio: Some(0.33),
+        swap_set: &decision.selected_layers,
+        qcf_swap_predicted: decision.qcf_swap_estimate,
+        fallback_used: decision.fallback_used,
+        importance_table: None,
+        noise_table: None,
+        ppl: Some(12.0),
+        avg_nll: Some(2.48),
+        n_eval_tokens: 1024,
+        wall_time_s: 10.0,
+        warmup_tokens: 256,
+        backend: "cpu",
+        kv_type: "f16",
+        ppl_corpus: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+    assert_eq!(v["swap_count"].as_u64().unwrap(), 5);
+
+    let ss = v["swap_set"].as_array().unwrap();
+    let ss_vals: Vec<u64> = ss.iter().map(|x| x.as_u64().unwrap()).collect();
+    assert!(!ss_vals.contains(&0), "layer 0 must not be in dump swap_set");
+    assert!(!ss_vals.contains(&15), "layer 15 must not be in dump swap_set");
+}
+
+// ── Test 4: ratio=1.0 → capped at n_layers-2 (layer 0/last protected) ────────
+
+/// WeightSwapDecider with ratio=1.0 on a 16-layer model selects at most 14 layers
+/// (layer 0 and 15 are always protected), and fallback_used=false when tables are valid.
+#[test]
+fn test_ratio_one_caps_at_n_minus_2() {
+    use llm_rs2::models::weights::decider::WeightSwapDecider;
+
+    let vals: Vec<f32> = (0..16).map(|i| 0.01 * (i as f32 + 1.0)).collect();
+    let noise = make_noise(vals);
+    let imp_entries: Vec<(usize, f32, f32)> =
+        (0..16).map(|i| (i, 0.05 * (i as f32 + 1.0), 0.0)).collect();
+    let imp = make_importance(imp_entries);
+
+    let decider = WeightSwapDecider {
+        importance: Some(&imp),
+        noise: Some(&noise),
+        n_decoder_layers: 16,
+        currently_swapped: &[],
+    };
+    let decision = decider.decide(1.0);
+
+    // floor(1.0 * 16) = 16 target, but 14 candidates (0 and 15 excluded)
+    assert_eq!(
+        decision.selected_layers.len(),
+        14,
+        "ratio=1.0 on 16L should yield 14 (0 and last protected)"
+    );
+    assert!(!decision.fallback_used, "should not use fallback with valid tables");
+    assert!(!decision.selected_layers.contains(&0));
+    assert!(!decision.selected_layers.contains(&15));
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 16,
+        force_swap_ratio: Some(1.0),
+        swap_set: &decision.selected_layers,
+        qcf_swap_predicted: decision.qcf_swap_estimate,
+        fallback_used: decision.fallback_used,
+        importance_table: None,
+        noise_table: None,
+        ppl: Some(15.0),
+        avg_nll: Some(2.71),
+        n_eval_tokens: 512,
+        wall_time_s: 8.0,
+        warmup_tokens: 256,
+        backend: "cpu",
+        kv_type: "f16",
+        ppl_corpus: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+    assert_eq!(v["swap_count"].as_u64().unwrap(), 14);
+    assert!(!v["fallback_used"].as_bool().unwrap());
+}
+
+// ── Test 5: NaN ε → excluded from noise_table dump ───────────────────────────
+
+/// Layers with NaN epsilon must NOT appear in the noise_table array in the dump.
+#[test]
+fn test_nan_epsilon_excluded() {
+    // Layer 1 has NaN ε (INV-127)
+    let noise = make_noise(vec![0.02, f32::NAN, 0.04, 0.03]);
+    let swap_set: Vec<usize> = vec![];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 4,
+        force_swap_ratio: None,
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.0,
+        fallback_used: false,
+        importance_table: None,
+        noise_table: Some(&noise),
+        ppl: None,
+        avg_nll: None,
+        n_eval_tokens: 0,
+        wall_time_s: 0.0,
+        warmup_tokens: 256,
+        backend: "cpu",
+        kv_type: "f16",
+        ppl_corpus: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+    let nt = v["noise_table"].as_array().unwrap();
+
+    // Must have 3 entries (layer 1 excluded)
+    assert_eq!(nt.len(), 3, "NaN epsilon layer must be excluded from noise_table");
+
+    // Verify no entry has layer=1
+    let layer_ids: Vec<u64> = nt
+        .iter()
+        .map(|e| e["layer"].as_u64().unwrap())
+        .collect();
+    assert!(!layer_ids.contains(&1), "layer 1 (NaN ε) must not appear in noise_table");
+    assert!(layer_ids.contains(&0));
+    assert!(layer_ids.contains(&2));
+    assert!(layer_ids.contains(&3));
+}
+
+// ── Test 6: importance_table and noise_table fields include all valid layers ──
+
+/// When both tables are provided, importance_table and noise_table contain
+/// all valid entries with correct field names (layer, sublayer, importance, opr / epsilon).
+#[test]
+fn test_importance_noise_in_dump() {
+    let imp = make_importance(vec![
+        (0, 0.42, 0.31),
+        (1, 0.28, 0.19),
+        (2, 0.15, 0.10),
+    ]);
+    let noise = make_noise(vec![0.018, 0.022, 0.031]);
+    let swap_set = vec![2usize];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 3,
+        force_swap_ratio: Some(0.5),
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.3,
+        fallback_used: false,
+        importance_table: Some(&imp),
+        noise_table: Some(&noise),
+        ppl: Some(11.0),
+        avg_nll: Some(2.40),
+        n_eval_tokens: 512,
+        wall_time_s: 4.0,
+        warmup_tokens: 128,
+        backend: "cpu",
+        kv_type: "f16",
+        ppl_corpus: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+
+    // importance_table: 3 entries with required fields
+    let it = v["importance_table"].as_array().unwrap();
+    assert_eq!(it.len(), 3, "importance_table must have 3 entries for 3-layer model");
+    for entry in it {
+        assert!(entry["layer"].is_number(), "importance entry must have layer field");
+        assert!(entry["sublayer"].is_string(), "importance entry must have sublayer field");
+        assert!(entry["importance"].is_number(), "importance entry must have importance field");
+        assert!(entry["opr"].is_number(), "importance entry must have opr field");
+    }
+
+    // noise_table: 3 entries (all finite)
+    let nt = v["noise_table"].as_array().unwrap();
+    assert_eq!(nt.len(), 3, "noise_table must have 3 entries when all ε are finite");
+    for entry in nt {
+        assert!(entry["layer"].is_number(), "noise entry must have layer field");
+        assert!(entry["epsilon"].is_number(), "noise entry must have epsilon field");
+        let eps = entry["epsilon"].as_f64().unwrap();
+        assert!(eps.is_finite(), "epsilon must be finite in dump (NaN filtered)");
+    }
+
+    // Verify first entry values
+    let it0 = &it[0];
+    assert_eq!(it0["layer"].as_u64().unwrap(), 0);
+    assert!((it0["importance"].as_f64().unwrap() - 0.42).abs() < 1e-4);
+    assert!((it0["opr"].as_f64().unwrap() - 0.31).abs() < 1e-4);
+
+    let nt0 = &nt[0];
+    assert_eq!(nt0["layer"].as_u64().unwrap(), 0);
+    assert!((nt0["epsilon"].as_f64().unwrap() - 0.018).abs() < 1e-5);
+}
+
+// ── Test 7: ppl=None serializes as null (generation mode) ────────────────────
+
+/// In generation mode, ppl and avg_nll must serialize as JSON null, not be omitted.
+#[test]
+fn test_ppl_none_serializes_as_null() {
+    let swap_set: Vec<usize> = vec![3usize, 5usize];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 16,
+        force_swap_ratio: Some(0.25),
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.18,
+        fallback_used: false,
+        importance_table: None,
+        noise_table: None,
+        ppl: None,         // generation mode: no PPL
+        avg_nll: None,     // generation mode: no NLL
+        n_eval_tokens: 0,
+        wall_time_s: 3.0,
+        warmup_tokens: 256,
+        backend: "cuda",
+        kv_type: "f16",
+        ppl_corpus: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+
+    // ppl and avg_nll must be present as null (not missing)
+    assert!(
+        v.get("ppl").is_some(),
+        "ppl key must exist even when None (null, not omitted)"
+    );
+    assert!(
+        v["ppl"].is_null(),
+        "ppl must be JSON null in generation mode"
+    );
+    assert!(
+        v.get("avg_nll").is_some(),
+        "avg_nll key must exist even when None"
+    );
+    assert!(
+        v["avg_nll"].is_null(),
+        "avg_nll must be JSON null in generation mode"
+    );
+
+    // n_eval_tokens still serialized as 0
+    assert_eq!(v["n_eval_tokens"].as_u64().unwrap(), 0);
+
+    // importance_table and noise_table null when absent
+    assert!(v["importance_table"].is_null());
+    assert!(v["noise_table"].is_null());
+
+    // ppl_corpus null
+    assert!(v["ppl_corpus"].is_null());
+
+    // backend and kv_type
+    assert_eq!(v["backend"].as_str().unwrap(), "cuda");
+    assert_eq!(v["kv_type"].as_str().unwrap(), "f16");
+}

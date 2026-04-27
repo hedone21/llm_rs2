@@ -179,6 +179,12 @@ mod test_inv_128_collector_leak_guard;
 #[path = "spec/test_wswap_e2e_phase3.rs"]
 mod test_wswap_e2e_phase3;
 
+// ── Layer-swap QCF dump 인프라 (zazzy-herding-bonbon Phase 1) ──
+// dump_qcf_swap_json + QcfSwapDumpContext JSON schema 계약 검증.
+// 외부 harness(pact2026/experiments/scripts/)가 소비하는 JSON 포맷 안정성 보장.
+#[path = "spec/test_qcf_swap_dump.rs"]
+mod test_qcf_swap_dump;
+
 // ── SEQ 통합 테스트 ──
 #[path = "spec/test_seq_020_035.rs"]
 mod test_seq_020_035;
