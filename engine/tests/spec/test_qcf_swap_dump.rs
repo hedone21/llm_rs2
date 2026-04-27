@@ -80,8 +80,14 @@ fn test_dump_schema_round_trip() {
     assert_eq!(v["schema_version"].as_u64().unwrap(), 1);
     // string fields
     assert_eq!(v["model_arch"].as_str().unwrap(), "llama");
-    assert_eq!(v["model_path"].as_str().unwrap(), "models/llama-3.2-1b-f16.gguf");
-    assert_eq!(v["secondary_path"].as_str().unwrap(), "models/llama-3.2-1b-mixed.auf");
+    assert_eq!(
+        v["model_path"].as_str().unwrap(),
+        "models/llama-3.2-1b-f16.gguf"
+    );
+    assert_eq!(
+        v["secondary_path"].as_str().unwrap(),
+        "models/llama-3.2-1b-mixed.auf"
+    );
     assert_eq!(v["primary_dtype"].as_str().unwrap(), "F16");
     assert_eq!(v["secondary_dtype"].as_str().unwrap(), "Q4_0");
     // numeric fields
@@ -98,7 +104,10 @@ fn test_dump_schema_round_trip() {
     assert_eq!(v["warmup_tokens"].as_u64().unwrap(), 256);
     assert_eq!(v["backend"].as_str().unwrap(), "cpu");
     assert_eq!(v["kv_type"].as_str().unwrap(), "f16");
-    assert_eq!(v["ppl_corpus"].as_str().unwrap(), "experiments/prompts/prefill_4096.txt");
+    assert_eq!(
+        v["ppl_corpus"].as_str().unwrap(),
+        "experiments/prompts/prefill_4096.txt"
+    );
 
     // arrays
     assert!(v["importance_table"].is_array());
@@ -219,8 +228,14 @@ fn test_ratio_033_skip_count_5_for_16l() {
 
     let ss = v["swap_set"].as_array().unwrap();
     let ss_vals: Vec<u64> = ss.iter().map(|x| x.as_u64().unwrap()).collect();
-    assert!(!ss_vals.contains(&0), "layer 0 must not be in dump swap_set");
-    assert!(!ss_vals.contains(&15), "layer 15 must not be in dump swap_set");
+    assert!(
+        !ss_vals.contains(&0),
+        "layer 0 must not be in dump swap_set"
+    );
+    assert!(
+        !ss_vals.contains(&15),
+        "layer 15 must not be in dump swap_set"
+    );
 }
 
 // ── Test 4: ratio=1.0 → capped at n_layers-2 (layer 0/last protected) ────────
@@ -251,7 +266,10 @@ fn test_ratio_one_caps_at_n_minus_2() {
         14,
         "ratio=1.0 on 16L should yield 14 (0 and last protected)"
     );
-    assert!(!decision.fallback_used, "should not use fallback with valid tables");
+    assert!(
+        !decision.fallback_used,
+        "should not use fallback with valid tables"
+    );
     assert!(!decision.selected_layers.contains(&0));
     assert!(!decision.selected_layers.contains(&15));
 
@@ -319,14 +337,18 @@ fn test_nan_epsilon_excluded() {
     let nt = v["noise_table"].as_array().unwrap();
 
     // Must have 3 entries (layer 1 excluded)
-    assert_eq!(nt.len(), 3, "NaN epsilon layer must be excluded from noise_table");
+    assert_eq!(
+        nt.len(),
+        3,
+        "NaN epsilon layer must be excluded from noise_table"
+    );
 
     // Verify no entry has layer=1
-    let layer_ids: Vec<u64> = nt
-        .iter()
-        .map(|e| e["layer"].as_u64().unwrap())
-        .collect();
-    assert!(!layer_ids.contains(&1), "layer 1 (NaN ε) must not appear in noise_table");
+    let layer_ids: Vec<u64> = nt.iter().map(|e| e["layer"].as_u64().unwrap()).collect();
+    assert!(
+        !layer_ids.contains(&1),
+        "layer 1 (NaN ε) must not appear in noise_table"
+    );
     assert!(layer_ids.contains(&0));
     assert!(layer_ids.contains(&2));
     assert!(layer_ids.contains(&3));
@@ -338,11 +360,7 @@ fn test_nan_epsilon_excluded() {
 /// all valid entries with correct field names (layer, sublayer, importance, opr / epsilon).
 #[test]
 fn test_importance_noise_in_dump() {
-    let imp = make_importance(vec![
-        (0, 0.42, 0.31),
-        (1, 0.28, 0.19),
-        (2, 0.15, 0.10),
-    ]);
+    let imp = make_importance(vec![(0, 0.42, 0.31), (1, 0.28, 0.19), (2, 0.15, 0.10)]);
     let noise = make_noise(vec![0.018, 0.022, 0.031]);
     let swap_set = vec![2usize];
 
@@ -373,22 +391,51 @@ fn test_importance_noise_in_dump() {
 
     // importance_table: 3 entries with required fields
     let it = v["importance_table"].as_array().unwrap();
-    assert_eq!(it.len(), 3, "importance_table must have 3 entries for 3-layer model");
+    assert_eq!(
+        it.len(),
+        3,
+        "importance_table must have 3 entries for 3-layer model"
+    );
     for entry in it {
-        assert!(entry["layer"].is_number(), "importance entry must have layer field");
-        assert!(entry["sublayer"].is_string(), "importance entry must have sublayer field");
-        assert!(entry["importance"].is_number(), "importance entry must have importance field");
-        assert!(entry["opr"].is_number(), "importance entry must have opr field");
+        assert!(
+            entry["layer"].is_number(),
+            "importance entry must have layer field"
+        );
+        assert!(
+            entry["sublayer"].is_string(),
+            "importance entry must have sublayer field"
+        );
+        assert!(
+            entry["importance"].is_number(),
+            "importance entry must have importance field"
+        );
+        assert!(
+            entry["opr"].is_number(),
+            "importance entry must have opr field"
+        );
     }
 
     // noise_table: 3 entries (all finite)
     let nt = v["noise_table"].as_array().unwrap();
-    assert_eq!(nt.len(), 3, "noise_table must have 3 entries when all ε are finite");
+    assert_eq!(
+        nt.len(),
+        3,
+        "noise_table must have 3 entries when all ε are finite"
+    );
     for entry in nt {
-        assert!(entry["layer"].is_number(), "noise entry must have layer field");
-        assert!(entry["epsilon"].is_number(), "noise entry must have epsilon field");
+        assert!(
+            entry["layer"].is_number(),
+            "noise entry must have layer field"
+        );
+        assert!(
+            entry["epsilon"].is_number(),
+            "noise entry must have epsilon field"
+        );
         let eps = entry["epsilon"].as_f64().unwrap();
-        assert!(eps.is_finite(), "epsilon must be finite in dump (NaN filtered)");
+        assert!(
+            eps.is_finite(),
+            "epsilon must be finite in dump (NaN filtered)"
+        );
     }
 
     // Verify first entry values
@@ -422,8 +469,8 @@ fn test_ppl_none_serializes_as_null() {
         fallback_used: false,
         importance_table: None,
         noise_table: None,
-        ppl: None,         // generation mode: no PPL
-        avg_nll: None,     // generation mode: no NLL
+        ppl: None,     // generation mode: no PPL
+        avg_nll: None, // generation mode: no NLL
         n_eval_tokens: 0,
         wall_time_s: 3.0,
         warmup_tokens: 256,
