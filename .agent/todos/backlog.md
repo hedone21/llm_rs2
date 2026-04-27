@@ -29,6 +29,48 @@
 
 ---
 
+## [P1] QCF_kv 측정의 layer-0 단일 proxy → 모든 layer aggregate
+- **Status**: TODO
+- **Sprint**: next
+- **Dependencies**: 없음 ([P2] QCF 명명 rename과 독립적이지만 함께 진행 시 시너지)
+- **Description**: |
+  KV eviction 4종(`kv_evict_sliding`, `kv_evict_h2o`, `kv_evict_streaming`, `kv_merge_d2o`)이 `compute_qcf_estimates`(`engine/src/bin/generate.rs:6458`)에서 **layer 0의 KV cache 1개만** 측정하여 액션 대표값으로 보고한다(`let cache = &ctx.kv_caches[0];`, line 6485). 액션은 모든 layer의 KV에 적용되는데 측정은 1 layer만 하는 갭.
+
+  ### 도입 계보 (이 갭은 prototype 잔재)
+  - **4bff303** `feat(resilience): RequestQcf handler` — 최초 dry-run, 2개 액션, `kv_caches[0]` prototype
+  - **939190d** `feat(qcf): 6-action dry-run` — 단순 비율 공식 (`(current_pos - sink - window) / current_pos` 등). **layer-invariant**라 layer 0 == 임의 layer로 충분했음
+  - **10c179f5** `feat(qcf): unified QCF metric` — 실제 V buffer + α 사용 시작 (`‖O_b - O_a‖ / ‖O_b‖`). 이 순간부터 layer마다 α/V가 다르므로 **layer 0은 더 이상 대표값이 아님**. 그러나 prototype의 호출 구조(`kv_caches[0]`)를 그대로 유지.
+  - **3aef742** `fix: device-only KV guard` — 가드만 추가, layer 0 구조 유지
+
+  ### 갭이 가려진 이유
+  - KIVI는 `for cache in kivi_caches { ... avg }`로 자체 layer 평균(line 6625-6634)
+  - swap/skip은 `ImportanceTable`이 layer 차원을 자체 보유 → 자동 aggregate
+  - 결과: KV eviction 4종만 외톨이로 layer 0 prototype 유지, paper figure 정확성 검토 시 발견
+  - dry-run "estimate" 명명이 정밀도가 핵심이 아니라는 인상 (`generate.rs:6445`) + 매니저 정책의 **상대 ordering**이 보존되면 layer 0 proxy도 작동 → 실측 회귀 미발생
+
+  ### 권장 수정
+  4종 액션 처리부를 `for cache in ctx.kv_caches { compute_unified_qcf(...) }` 후 aggregate. aggregation 방식은 Mean(KIVI line 6633과 일관) 또는 RMS(`√(1/N · Σ_l ‖ΔO_l‖²/‖O_l‖²)`). Mean 권장 — 단순하고 KIVI와 통일.
+- **Acceptance Criteria**:
+  - 4종 액션(sliding/H2O/streaming/D2O)이 모든 `kv_caches` layer 순회 후 aggregate
+  - aggregation method = Mean (KIVI와 일관). RMS는 후속 옵션
+  - `compute_unified_qcf` 자체는 변경 없음 (1-layer 단위 유지)
+  - 측정 비용 ×N_layer 측정 — RequestQcf 응답 지연이 매니저 budget 내(현재 ms 수준 → ×16 layer = 수십 ms 예상) 검증
+  - 매니저 정책의 **상대 ordering**이 보존되는지 확인 (절대값 변화 시 `DegradationEstimator` calibration 곡선 재학습 검토)
+  - 신규 unit test: multi-layer 입력에서 layer-aware aggregation, layer 간 α/V 차이 반영 검증
+  - 단일 layer 입력 호환성 회귀 없음 (n_layers=1이면 기존 동작과 동등)
+  - `docs/qcf_taxonomy.md` §2.3 "측정 시점과 데이터" 표에 "Layer 차원 처리: Mean over all layers" 행 갱신
+  - 기존 spec 테스트 PASS 유지
+- **담당 권장**: Implementer (코드 수정 + 테스트), Tester (signal path 응답 지연 실측)
+- **Notes**: |
+  - 코드 위치: `engine/src/bin/generate.rs:6478~6616`
+  - `importance` / `ε` 는 영향 없음 (이미 frozen + 모든 layer 보유)
+  - paper figure(Figure 1)는 Layer i 단면 그림이라 측정 위치 자체는 정확. **본 갭은 "어느 layer를 측정하는가"의 차원**이며, 수정 후 figure 캡션 업데이트 불필요 (모든 layer 측정이 figure 의미와 일치)
+  - 행동 변화 시 매니저 정책의 cross-action 비교가 영향받을 수 있음 — `DegradationEstimator::with_defaults`(`engine/src/core/qcf/estimator.rs:71`) 곡선 검증 권장
+  - **paper 일관성**: 본 갭 미해소 시 Figure 1 캡션에 "(*) 현행 코드는 KV 4종만 layer 0 측정"을 명시해야 하지만, 코드 수정 진행 결정으로 그 각주는 불필요
+- **작성일**: 2026-04-27
+
+---
+
 ## [P0] Weight Swap — Layer-Level Mixed Precision & Dynamic Swap
 - **Status**: TODO (Architect 판단 완료, Phase 분해 완료, 구현 대기)
 - **Sprint**: current
