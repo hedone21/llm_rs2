@@ -25,6 +25,8 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 
 단일 transformer decoder layer 내부에서 두 패밀리가 각각 어디를 측정하는지 표시한 그림이다. `QCF_kv`는 attention block 내부의 한 점(O = Σα·V), `QCF_weight`는 (a) 레이어 입출력의 동적 비교(importance)와 (b) weight tensor 공간의 정적 비교(ε) 두 곳에서 측정한다.
 
+> **Note (Layer 차원 처리)**: 본 그림은 layer i 단면이며, 실제 코드의 layer 차원 처리는 액션마다 다르다. KV eviction 4종은 **layer 0 ad-hoc 경량 proxy**, KIVI/swap/skip은 모든 layer aggregate. 자세한 매핑은 §2.3 표 참조.
+
 ```
        x_in ──────────────────────────────●━━━━━━━ [W] x̄_in 캡처
         │                                 │       (mean-pool over T tokens)
@@ -282,6 +284,16 @@ O_h^{\text{after}} = \sum_{t=0}^{T-1} \alpha_h(t) \, Q^{-1}\bigl(Q(V(h, t); b)\b
 - **`α_h(t)`**: 해당 시점의 실제 attention scores. per-head slice가 사용 가능하면 사용, 그렇지 않으면 flat scores fallback (`unified_qcf.rs:99~129`).
 - **`V(h, t)`**: KV cache의 V 버퍼. F32/F16/Q4_0 모두 지원 (`VDataSource` enum, line 46).
 - **layout**: `KVLayout::HeadMajor` (production 고정). offset = `h · capacity · d_head + t · d_head` (`compute_v_offset` 헬퍼).
+- **Layer 차원 처리** (액션마다 다름):
+
+| 액션 | Layer 차원 처리 | 근거 |
+|---|---|---|
+| sliding/H2O/streaming/D2O eviction (4종) | **layer 0 ad-hoc proxy** (`generate.rs:6485` `kv_caches[0]`) | dry-run estimate의 상대 ordering이 매니저 정책 입력으로 충분. 모든 layer 측정 시 비용 ×N_layer ∈ signal path 응답 지연. 실효성 검증 후 의도적 단순화로 유지 (2026-04-27). |
+| KIVI quant | **모든 layer 평균** (`generate.rs:6625~6634`) | `KiviCache`가 layer-aware estimator(`estimate_dryrun_qcf`, `kivi_cache.rs:824`) 캡슐화. 외부 호출자 입장에서 평균이 추가 비용 거의 0. |
+| layer skip | **모든 layer entry sum 정규화** | `ImportanceTable::compute_qcf`(`layer_importance.rs:68`)가 정의상 모든 layer entry 사용. |
+| swap (참고: QCF_weight) | **모든 layer imp·ε 가중 sum** | `compute_qcf_swap`(`decider.rs:212~219`)가 정의상 전체 layer iterate. NaN ε layer만 제외. |
+
+KV eviction 4종의 layer 0 proxy는 prototype 잔재가 아니라 **의도된 ad-hoc 경량 proxy**로 결정됨. 매니저 정책의 상대 ordering이 보존되며 비용 ×N_layer를 회피. 자세한 결정 사유와 후속 검토 옵션은 `.agent/todos/backlog.md` `[P1] QCF_kv 측정의 layer-0 단일 proxy → 모든 layer aggregate` (CANCELLED) 참조.
 
 ### 2.4 출력 자료구조
 
@@ -499,3 +511,4 @@ pub struct QcfEstimate {
 |---|---|
 | 2026-04-27 | 초판 작성. 두 패밀리 정의, 7개 KV 액션 + swap + skip 수식 정리, 코드 위치 인덱스. |
 | 2026-04-27 | §1.1 Figure 1 (forward path 측정 위치), §1.2 Figure 2 (action → plane 매핑) 추가. 코드 위치 검증 표 동봉. |
+| 2026-04-27 | §1.1 Figure 1에 "Layer 차원 처리" Note 추가. §2.3에 액션별 Layer 차원 처리 표 추가 — KV eviction 4종은 layer 0 ad-hoc 경량 proxy(의도된 단순화)로 결정 명시. backlog `[P1]` CANCELLED. |
