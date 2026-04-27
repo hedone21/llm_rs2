@@ -33,6 +33,7 @@ fn make_meta_2layer() -> AufMeta {
         rotary_dim: 8,
         rope_scaling: 1.0,
         rms_norm_epsilon: 1e-5,
+        default_dtype: None,
     }
 }
 
@@ -307,6 +308,7 @@ fn auf_secondary_tensor_bytes_base_offset_round_trip() {
             rotary_dim: 128,
             rope_scaling: 1.0,
             rms_norm_epsilon: 1e-5,
+            default_dtype: None,
         },
         make_tokenizer(),
         [0u8; 32],

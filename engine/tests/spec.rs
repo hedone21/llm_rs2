@@ -126,6 +126,17 @@ mod test_auf_e2e_sanity;
 #[path = "spec/test_inv_135_136_lm_head_auf.rs"]
 mod test_inv_135_136_lm_head_auf;
 
+// ── AUF v0.2 Sprint B — INV-137~139 multi-dtype variant ──
+// INV-137: multi-dtype shape 일치 의무 + lm_head 포함.
+// INV-138: default_dtype 의무 + writer 안정 정렬 + dtype selection precedence.
+// INV-139: capability bit 3 의미 + v0.1.x ↔ v0.2 양방향 호환.
+#[path = "spec/test_inv_137_multi_dtype.rs"]
+mod test_inv_137_multi_dtype;
+#[path = "spec/test_inv_138_default_dtype.rs"]
+mod test_inv_138_default_dtype;
+#[path = "spec/test_inv_139_capability_bit3.rs"]
+mod test_inv_139_capability_bit3;
+
 // ── Sprint G-1-E — AUF lm_head Q4_0 통합 정확성 검증 ──
 // 의문 1: ADRENO_SOA payload = q_buf||d_buf (SOA) layout 정합성.
 // 의문 2: payload.bytes.len() == N*18 (SOA 총 크기 = AOS 총 크기 불변).

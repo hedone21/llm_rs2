@@ -356,6 +356,7 @@ fn build_meta_from_gguf(gguf: &llm_rs2::models::loader::gguf::GgufFile) -> Resul
         rotary_dim: config.head_dim as u32,
         rope_scaling: 1.0,
         rms_norm_epsilon: config.rms_norm_eps,
+        default_dtype: None, // v0.2 multi-dtype에서만 설정 (Sprint C에서 확장)
     })
 }
 
@@ -1883,6 +1884,7 @@ mod tests {
             rotary_dim: 4,
             rope_scaling: 1.0,
             rms_norm_epsilon: 1e-5,
+            default_dtype: None,
         };
         let tok = AufTokenizer {
             kind: TOKENIZER_KIND_BPE,
@@ -1941,6 +1943,7 @@ mod tests {
             rotary_dim: 4,
             rope_scaling: 1.0,
             rms_norm_epsilon: 1e-5,
+            default_dtype: None,
         };
         let tok = AufTokenizer {
             kind: TOKENIZER_KIND_BPE,
@@ -2167,6 +2170,7 @@ mod tests {
             rotary_dim: 4,
             rope_scaling: 1.0,
             rms_norm_epsilon: 1e-5,
+            default_dtype: None,
         };
         let tok = AufTokenizer {
             kind: TOKENIZER_KIND_BPE,

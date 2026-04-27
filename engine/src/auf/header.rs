@@ -13,13 +13,27 @@ pub const READER_MAX_FORMAT_MAJOR: u16 = 0;
 /// bit 2 = 0 (또는 AUF 부재)이면 lm_head Q4_0 accessor는 `Ok(None)`을 반환 (INV-136).
 pub const CAPABILITY_BIT_LM_HEAD_Q4_0: u64 = 1 << 2;
 
+/// capability_optional bit 3: AUF v0.2 multi-dtype variant (INV-139, ENG-DAT-097).
+///
+/// bit 3 = 1이면:
+///   - 동일 (`layer_idx`, `kind`) 쌍에 dtype이 다른 entry가 2개 이상 존재함.
+///   - META JSON에 `default_dtype` 필드가 의무적으로 존재해야 한다 (INV-138).
+///   - format_minor >= 2 이어야 한다 (INV-139).
+///   - v0.1.x reader는 이 bit를 인식하지 못하지만 `capability_optional`이므로 reject 사유가 아니다.
+///     first-match 규칙으로 default_dtype entry를 안전하게 로드한다 (INV-138 writer 정렬 보장).
+///
+/// bit 3 = 0이면 single-dtype 모드 (각 (`layer_idx`, `kind`)에 entry 1개씩).
+pub const CAPABILITY_BIT_MULTI_DTYPE: u64 = 1 << 3;
+
 /// reader가 인식하는 capability bit set.
 ///
-/// v0.1.0: 모두 0.
+/// v0.1.0: 모두 0 (READER_KNOWN_CAPABILITIES = 0).
 /// v0.1.1: CAPABILITY_BIT_LM_HEAD_Q4_0 (bit 2) 추가 — optional capability이므로
 ///   capability_optional에만 set, capability_required에는 set하지 않는다.
 ///   따라서 구 reader (bit 2 미인식)는 lm_head accessor를 None으로 처리하고 안전하게 로드.
-pub const READER_KNOWN_CAPABILITIES: u64 = 0;
+/// v0.2.0: CAPABILITY_BIT_MULTI_DTYPE (bit 3) 추가 — optional capability.
+///   capability_optional에만 set. v0.1.x reader는 무시하고 first-match로 fallback.
+pub const READER_KNOWN_CAPABILITIES: u64 = CAPABILITY_BIT_LM_HEAD_Q4_0 | CAPABILITY_BIT_MULTI_DTYPE;
 
 /// AUF 헤더 magic bytes: `"ARGUS_W\0"`.
 pub const AUF_MAGIC: &[u8; 8] = b"ARGUS_W\0";
@@ -161,6 +175,15 @@ impl AufHeader {
         self.capability_optional & CAPABILITY_BIT_LM_HEAD_Q4_0 != 0
     }
 
+    /// capability_optional bit 3 = 1인지 확인한다 (INV-139, ENG-DAT-097).
+    ///
+    /// `true`이면 이 AUF v0.2 AUF이며 동일 (`layer_idx`, `kind`)에 dtype이 다른 entry가
+    /// 존재한다. META JSON에 `default_dtype` 필드가 의무 존재 (INV-138).
+    /// `false`이면 single-dtype 모드 (v0.1.x 호환).
+    pub fn has_multi_dtype(&self) -> bool {
+        self.capability_optional & CAPABILITY_BIT_MULTI_DTYPE != 0
+    }
+
     /// `LM_HEAD_PRECOMPUTED_Q4_0` capability bit를 설정/해제한다 (writer용).
     ///
     /// `enabled = true`: bit 2 set + format_patch = 1 (v0.1.1).
@@ -173,6 +196,20 @@ impl AufHeader {
         } else {
             self.capability_optional &= !CAPABILITY_BIT_LM_HEAD_Q4_0;
             self.format_patch = 0;
+        }
+    }
+
+    /// `MULTI_DTYPE_VARIANTS` capability bit를 설정/해제한다 (writer용, INV-139).
+    ///
+    /// `enabled = true`: bit 3 set + format_minor = 2 (v0.2).
+    /// `enabled = false`: bit 3 clear. format_minor는 호출자가 별도 관리.
+    /// 다른 capability bit는 보존한다.
+    pub fn set_multi_dtype_capability(&mut self, enabled: bool) {
+        if enabled {
+            self.capability_optional |= CAPABILITY_BIT_MULTI_DTYPE;
+            self.format_minor = 2;
+        } else {
+            self.capability_optional &= !CAPABILITY_BIT_MULTI_DTYPE;
         }
     }
 
@@ -284,5 +321,115 @@ mod tests {
         let long_str = "a".repeat(100);
         let h = AufHeader::new_v01(&long_str, [0u8; 32], 0, 0, 0, 256, 65536);
         assert_eq!(&h.created_by, b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    }
+
+    /// B-2: CAPABILITY_BIT_MULTI_DTYPE 상수 값 검증.
+    #[test]
+    fn capability_bit_multi_dtype_is_bit3() {
+        assert_eq!(CAPABILITY_BIT_MULTI_DTYPE, 1 << 3);
+        assert_eq!(CAPABILITY_BIT_MULTI_DTYPE, 8u64);
+    }
+
+    /// B-2: READER_KNOWN_CAPABILITIES에 bit 2와 bit 3이 포함됨.
+    #[test]
+    fn reader_known_capabilities_includes_bit2_and_bit3() {
+        const { assert!(READER_KNOWN_CAPABILITIES & CAPABILITY_BIT_LM_HEAD_Q4_0 != 0) };
+        const { assert!(READER_KNOWN_CAPABILITIES & CAPABILITY_BIT_MULTI_DTYPE != 0) };
+        assert_eq!(
+            READER_KNOWN_CAPABILITIES,
+            (1 << 2) | (1 << 3),
+            "READER_KNOWN_CAPABILITIES must be exactly bit2|bit3"
+        );
+    }
+
+    /// B-2: has_multi_dtype() accessor.
+    #[test]
+    fn has_multi_dtype_accessor() {
+        let mut h = make_header();
+        assert!(!h.has_multi_dtype(), "bit 3 initially clear");
+        h.capability_optional |= CAPABILITY_BIT_MULTI_DTYPE;
+        assert!(h.has_multi_dtype(), "bit 3 set after OR");
+    }
+
+    /// B-2: set_multi_dtype_capability() writer helper — bit 3 set + format_minor = 2.
+    #[test]
+    fn set_multi_dtype_capability_sets_format_minor_2() {
+        let mut h = make_header();
+        assert_eq!(h.format_minor, 1);
+        h.set_multi_dtype_capability(true);
+        assert!(h.has_multi_dtype());
+        assert_eq!(
+            h.format_minor, 2,
+            "format_minor must be 2 when multi-dtype enabled"
+        );
+    }
+
+    /// B-2: set_multi_dtype_capability(false) — bit 3 clear, format_minor unchanged.
+    #[test]
+    fn set_multi_dtype_capability_clear() {
+        let mut h = make_header();
+        h.set_multi_dtype_capability(true);
+        h.set_multi_dtype_capability(false);
+        assert!(!h.has_multi_dtype());
+    }
+
+    /// B-2: format_minor 1 (v0.1.x) AUF는 validate() 통과.
+    #[test]
+    fn format_minor_1_is_valid() {
+        let mut h = make_header();
+        h.format_minor = 1;
+        assert!(h.validate().is_ok());
+    }
+
+    /// B-2: format_minor 2 (v0.2) AUF는 validate() 통과.
+    #[test]
+    fn format_minor_2_is_valid() {
+        let mut h = make_header();
+        h.set_multi_dtype_capability(true);
+        assert_eq!(h.format_minor, 2);
+        assert!(h.validate().is_ok());
+    }
+
+    /// B-2: bit 3 set + capability_required = 0 (optional) → validate PASS.
+    ///
+    /// bit 3는 capability_optional에만 set. READER_KNOWN_CAPABILITIES에 포함되므로
+    /// capability_required에 있어도 reject하지 않는다.
+    #[test]
+    fn bit3_optional_not_required() {
+        let mut h = make_header();
+        h.capability_optional |= CAPABILITY_BIT_MULTI_DTYPE;
+        h.capability_required = 0; // optional only
+        assert!(
+            h.validate().is_ok(),
+            "bit 3 in optional must not cause rejection"
+        );
+    }
+
+    /// B-2: capability_required bit 3가 set되어 있어도, READER_KNOWN_CAPABILITIES에 포함되므로 통과.
+    ///
+    /// READER_KNOWN_CAPABILITIES에 bit 3가 추가되었으므로 required에 set해도 reject하지 않는다.
+    #[test]
+    fn bit3_in_required_passes_because_known() {
+        let mut h = make_header();
+        h.capability_required = CAPABILITY_BIT_MULTI_DTYPE;
+        // bit 3는 이제 READER_KNOWN_CAPABILITIES에 포함되므로 알 수 없는 bit가 아님 → PASS
+        assert!(h.validate().is_ok());
+    }
+
+    /// B-2: round-trip with format_minor=2 + multi_dtype bit.
+    #[test]
+    fn round_trip_with_multi_dtype_capability() {
+        let mut h = make_header();
+        h.set_multi_dtype_capability(true);
+        h.set_lm_head_q4_0_capability(true);
+        let bytes = h.to_bytes();
+        let h2 = AufHeader::from_bytes(&bytes).unwrap();
+        assert!(h2.has_multi_dtype());
+        assert!(h2.has_lm_head_q4_0());
+        assert_eq!(h2.format_minor, 2);
+        assert_eq!(
+            h2.capability_optional,
+            CAPABILITY_BIT_LM_HEAD_Q4_0 | CAPABILITY_BIT_MULTI_DTYPE
+        );
     }
 }

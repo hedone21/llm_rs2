@@ -334,6 +334,33 @@ impl TensorIndex {
             })
             .collect()
     }
+
+    /// 동일 (`layer_idx`, `kind`)에 해당하는 모든 entry를 반환한다 (B-4, INV-137).
+    ///
+    /// AUF v0.2 multi-dtype 모드에서는 같은 (`layer_idx`, `kind`) 쌍에 dtype이 다른
+    /// entry가 여러 개 존재할 수 있다. 이 메서드는 모든 후보 entry를 순서대로 반환한다.
+    ///
+    /// AUF v0.1.x single-dtype 모드에서는 최대 1개를 반환한다.
+    pub fn entries_for(&self, layer_idx: u32, kind: u32) -> Vec<&TensorEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.layer_idx == layer_idx && e.kind == kind)
+            .collect()
+    }
+
+    /// 동일 (`layer_idx`, `kind`, `dtype`)에 해당하는 entry를 반환한다 (INV-137).
+    ///
+    /// multi-dtype 모드에서 특정 dtype의 entry를 명시적으로 조회한다.
+    pub fn find_entry_by_dtype(
+        &self,
+        layer_idx: u32,
+        kind: u32,
+        dtype: u32,
+    ) -> Option<&TensorEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.layer_idx == layer_idx && e.kind == kind && e.dtype == dtype)
+    }
 }
 
 #[cfg(test)]
@@ -425,5 +452,97 @@ mod tests {
         let bytes = e.to_bytes();
         let (e2, _) = TensorEntry::from_bytes(&bytes, 1).unwrap();
         assert_eq!(e2.layer_idx, u32::MAX);
+    }
+
+    /// B-4: entries_for() — 동일 (layer_idx, kind)의 multi-dtype entries 반환.
+    #[test]
+    fn entries_for_multi_dtype() {
+        // layer=0, kind=AttnQ에 Q4_0과 F16 두 entry 등록
+        let q4_entry = TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnQ.as_u32(),
+            dtype: TensorDType::Q4_0.as_u32(),
+            shape: vec![4096, 4096],
+            alignment: 64,
+            variant_offsets: vec![0],
+            variant_sizes: vec![1024],
+        };
+        let f16_entry = TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnQ.as_u32(),
+            dtype: TensorDType::F16.as_u32(),
+            shape: vec![4096, 4096],
+            alignment: 64,
+            variant_offsets: vec![1024],
+            variant_sizes: vec![2048],
+        };
+        let other_entry = TensorEntry {
+            layer_idx: 0,
+            kind: TensorKind::AttnK.as_u32(),
+            dtype: TensorDType::Q4_0.as_u32(),
+            shape: vec![4096, 4096],
+            alignment: 64,
+            variant_offsets: vec![3072],
+            variant_sizes: vec![1024],
+        };
+        let idx = TensorIndex {
+            variant_tags: vec![make_variant_tag("WEIGHTS_CPU_AOS")],
+            entries: vec![q4_entry, f16_entry, other_entry],
+        };
+
+        let entries = idx.entries_for(0, TensorKind::AttnQ.as_u32());
+        assert_eq!(entries.len(), 2, "must return both Q4_0 and F16 entries");
+        assert_eq!(entries[0].dtype, TensorDType::Q4_0.as_u32());
+        assert_eq!(entries[1].dtype, TensorDType::F16.as_u32());
+
+        // AttnK는 1개만
+        let k_entries = idx.entries_for(0, TensorKind::AttnK.as_u32());
+        assert_eq!(k_entries.len(), 1);
+
+        // 없는 (layer, kind) → 빈 vec
+        let empty = idx.entries_for(99, TensorKind::AttnQ.as_u32());
+        assert!(empty.is_empty());
+    }
+
+    /// B-4: find_entry_by_dtype() — 특정 dtype entry 조회.
+    #[test]
+    fn find_entry_by_dtype_works() {
+        let q4_entry = TensorEntry {
+            layer_idx: 1,
+            kind: TensorKind::FfnGate.as_u32(),
+            dtype: TensorDType::Q4_0.as_u32(),
+            shape: vec![8192, 4096],
+            alignment: 64,
+            variant_offsets: vec![0],
+            variant_sizes: vec![512],
+        };
+        let f16_entry = TensorEntry {
+            layer_idx: 1,
+            kind: TensorKind::FfnGate.as_u32(),
+            dtype: TensorDType::F16.as_u32(),
+            shape: vec![8192, 4096],
+            alignment: 64,
+            variant_offsets: vec![512],
+            variant_sizes: vec![1024],
+        };
+        let idx = TensorIndex {
+            variant_tags: vec![make_variant_tag("WEIGHTS_CPU_AOS")],
+            entries: vec![q4_entry, f16_entry],
+        };
+
+        let found_q4 =
+            idx.find_entry_by_dtype(1, TensorKind::FfnGate.as_u32(), TensorDType::Q4_0.as_u32());
+        assert!(found_q4.is_some());
+        assert_eq!(found_q4.unwrap().variant_sizes[0], 512);
+
+        let found_f16 =
+            idx.find_entry_by_dtype(1, TensorKind::FfnGate.as_u32(), TensorDType::F16.as_u32());
+        assert!(found_f16.is_some());
+        assert_eq!(found_f16.unwrap().variant_sizes[0], 1024);
+
+        // BF16은 없음
+        let not_found =
+            idx.find_entry_by_dtype(1, TensorKind::FfnGate.as_u32(), TensorDType::BF16.as_u32());
+        assert!(not_found.is_none());
     }
 }

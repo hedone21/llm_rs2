@@ -54,6 +54,7 @@ fn make_meta() -> AufMeta {
         rotary_dim: 8,
         rope_scaling: 1.0,
         rms_norm_epsilon: 1e-5,
+        default_dtype: None,
     }
 }
 

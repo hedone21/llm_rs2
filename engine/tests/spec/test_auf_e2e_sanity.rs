@@ -42,6 +42,7 @@ fn make_meta(n_layers: u32, head_dim: u32, hidden_dim: u32, ffn_dim: u32) -> Auf
         rotary_dim: head_dim,
         rope_scaling: 1.0,
         rms_norm_epsilon: 1e-5,
+        default_dtype: None,
     }
 }
 
