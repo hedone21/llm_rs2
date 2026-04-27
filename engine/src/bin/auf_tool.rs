@@ -19,7 +19,7 @@ use llm_rs2::auf::tensor_index::{
 use llm_rs2::auf::{
     AufError, AufMeta, AufTokenizer, AufWriter, BackendTag, SECTION_STRIPPABLE,
     TAG_WEIGHTS_ADRENO_SOA, TAG_WEIGHTS_CPU_AOS, TAG_WEIGHTS_CUDA_AOS, TOKENIZER_KIND_BPE,
-    compute_source_hash, open, q4_0_aos_to_adreno_soa,
+    compute_source_hash, convert_tensor_dtype, open, q4_0_aos_to_adreno_soa,
 };
 
 // ---------------------------------------------------------------------------
@@ -83,6 +83,23 @@ struct BuildArgs {
     ///   capability bit 2 = 0, format_patch = 0).
     #[arg(long, value_name = "MODE", default_value = "auto")]
     include_lm_head: String,
+
+    /// AUF v0.2 multi-dtype variant — 동봉할 dtype 목록 (Sprint C, INV-139).
+    ///
+    /// comma-separated. 예: `q4_0,f16` / `Q4_0,F16`.
+    /// 미지정 시 source dtype을 따른다 (v0.1.x single-dtype 동작).
+    /// 2개 이상 지정 시 capability_optional bit 3 자동 set + format_minor = 2.
+    /// 지원 dtype: `q4_0`, `f16`, `f32` (현재). bf16/q4_1/q8_0/u8은 dequant→requant
+    /// 파이프라인이 미구현이므로 reject.
+    #[arg(long, value_name = "LIST")]
+    dtypes: Option<String>,
+
+    /// AUF v0.2 multi-dtype variant — META.default_dtype 명시 (Sprint C, INV-138).
+    ///
+    /// `--dtypes`에 포함된 값이어야 한다. 미지정 시 `--dtypes`의 첫 번째 값.
+    /// 단일 dtype 모드(`--dtypes` 미지정 또는 1개)에서는 무시.
+    #[arg(long, value_name = "DTYPE")]
+    default_dtype: Option<String>,
 
     /// 진행 로그 출력 억제
     #[arg(long)]
@@ -209,6 +226,58 @@ fn parse_variants(variants_str: &str) -> Result<Vec<&'static str>> {
         bail!("--variants는 하나 이상의 variant를 지정해야 합니다");
     }
     Ok(tags)
+}
+
+/// dtype 문자열 → `TensorDType` 변환.
+///
+/// 대소문자 무관 + 일부 동의어 허용. 현재 변환 파이프라인이 지원하는 dtype에 한해 OK.
+fn parse_single_dtype(s: &str) -> Result<TensorDType> {
+    let upper = s.trim().to_ascii_uppercase();
+    match upper.as_str() {
+        "F32" => Ok(TensorDType::F32),
+        "F16" => Ok(TensorDType::F16),
+        "Q4_0" | "Q40" => Ok(TensorDType::Q4_0),
+        "BF16" | "Q4_1" | "Q41" | "Q8_0" | "Q80" | "U8" => bail!(
+            "dtype '{}' is not supported by AUF v0.2 multi-dtype writer (Sprint C). \
+             Supported: f32, f16, q4_0",
+            s
+        ),
+        other => bail!("Unknown dtype '{}'. Supported: f32, f16, q4_0", other),
+    }
+}
+
+/// `TensorDType` → 표준 문자열 (META.default_dtype 직렬화에 사용).
+fn dtype_to_meta_str(dt: TensorDType) -> &'static str {
+    match dt {
+        TensorDType::F32 => "F32",
+        TensorDType::F16 => "F16",
+        TensorDType::BF16 => "BF16",
+        TensorDType::Q4_0 => "Q4_0",
+        TensorDType::Q4_1 => "Q4_1",
+        TensorDType::Q8_0 => "Q8_0",
+        TensorDType::U8 => "U8",
+    }
+}
+
+/// `--dtypes` comma-separated 문자열 파싱. 빈 문자열 / 빈 항목 거부.
+///
+/// 중복 제거 (안정 순서 유지) — 같은 dtype을 여러 번 지정해도 1개만 유지.
+fn parse_dtypes(dtypes_str: &str) -> Result<Vec<TensorDType>> {
+    let mut out: Vec<TensorDType> = Vec::new();
+    for part in dtypes_str.split(',') {
+        let p = part.trim();
+        if p.is_empty() {
+            bail!("--dtypes contains empty entry: '{}'", dtypes_str);
+        }
+        let dt = parse_single_dtype(p)?;
+        if !out.contains(&dt) {
+            out.push(dt);
+        }
+    }
+    if out.is_empty() {
+        bail!("--dtypes must contain at least one dtype");
+    }
+    Ok(out)
 }
 
 /// tokenizer.json에서 AufTokenizer를 구성한다.
@@ -396,6 +465,42 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     let lm_head_mode = IncludeLmHeadMode::parse(&args.include_lm_head)?;
     let quiet = args.quiet;
 
+    // 2) dtype 후보 + default_dtype 파싱 (Sprint C-F).
+    //
+    // - `--dtypes` 미지정 (None): single-dtype 모드 = source dtype 그대로 동봉. v0.1.x 호환.
+    // - `--dtypes` 1개: capability bit 3 미설정 (single-dtype). dtype 변환은 강제되지만
+    //   format은 v0.1.x 그대로.
+    // - `--dtypes` 2개 이상: multi-dtype 모드 = capability bit 3 set + format_minor = 2.
+    let candidate_dtypes: Option<Vec<TensorDType>> = match &args.dtypes {
+        Some(s) => Some(parse_dtypes(s)?),
+        None => None,
+    };
+    let multi_dtype_enabled = candidate_dtypes
+        .as_ref()
+        .map(|v| v.len() >= 2)
+        .unwrap_or(false);
+
+    // default_dtype 결정 + validation.
+    let default_dtype: Option<TensorDType> = if let Some(cands) = &candidate_dtypes {
+        let dd = match &args.default_dtype {
+            Some(s) => parse_single_dtype(s)?,
+            None => cands[0],
+        };
+        if !cands.contains(&dd) {
+            bail!(
+                "--default-dtype {:?} must be one of --dtypes {:?}",
+                dd,
+                cands
+            );
+        }
+        Some(dd)
+    } else {
+        if args.default_dtype.is_some() {
+            bail!("--default-dtype requires --dtypes to be specified");
+        }
+        None
+    };
+
     if !quiet {
         eprintln!(
             "[auf-tool] Build: {} → {}",
@@ -404,9 +509,15 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         );
         eprintln!("[auf-tool] Variants: {:?}", variant_tags);
         eprintln!("[auf-tool] include_lm_head: {:?}", lm_head_mode);
+        if let Some(cands) = &candidate_dtypes {
+            eprintln!(
+                "[auf-tool] dtypes: {:?} (default={:?}, multi_dtype={})",
+                cands, default_dtype, multi_dtype_enabled
+            );
+        }
     }
 
-    // 2) source_hash 계산
+    // 3) source_hash 계산
     if !quiet {
         eprint!("[auf-tool] Computing source_hash...");
     }
@@ -416,7 +527,7 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         eprintln!(" done ({} bytes)", source_size);
     }
 
-    // 3) GGUF 파싱
+    // 4) GGUF 파싱
     if !quiet {
         eprint!("[auf-tool] Parsing GGUF...");
     }
@@ -426,24 +537,33 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         eprintln!(" {} tensors", gguf.tensors.len());
     }
 
-    // 4) AufMeta 구성
-    let meta =
+    // 5) AufMeta 구성 — multi-dtype이면 default_dtype 필드를 채운다 (INV-138).
+    let mut meta =
         build_meta_from_gguf(&gguf).map_err(|e| anyhow!("GGUF 메타데이터 추출 실패: {}", e))?;
+    if multi_dtype_enabled {
+        meta.default_dtype = default_dtype.map(|d| dtype_to_meta_str(d).to_owned());
+    }
     if !quiet {
         eprintln!(
-            "[auf-tool] Meta: arch={}, layers={}, vocab={}",
-            meta.architecture, meta.n_layers, meta.vocab_size
+            "[auf-tool] Meta: arch={}, layers={}, vocab={}{}",
+            meta.architecture,
+            meta.n_layers,
+            meta.vocab_size,
+            meta.default_dtype
+                .as_deref()
+                .map(|d| format!(", default_dtype={d}"))
+                .unwrap_or_default()
         );
     }
 
-    // 5) Tokenizer 구성
+    // 6) Tokenizer 구성
     let tokenizer = load_tokenizer_from_json(&args.tokenizer)?;
 
-    // 6) ModelConfig (Q/K permute shape 결정용)
+    // 7) ModelConfig (Q/K permute shape 결정용)
     let config = llm_rs2::models::config::ModelConfig::from_gguf_metadata(&gguf)
         .map_err(|e| anyhow!("ModelConfig 파싱 실패: {}", e))?;
 
-    // 7) weight payload 생성 (각 variant 별)
+    // 8) weight payload 생성 (각 variant 별)
     let mut writer = AufWriter::new(meta, tokenizer, source_hash, source_size, source_mtime);
 
     let created_by = args
@@ -455,13 +575,24 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     // 순서: layer 0..N의 wq, wk, wv, wo, w_gate, w_up, w_down 순
     // permute가 필요한 wq/wk에는 unpermute_qk_rows 적용
     // lm_head는 `lm_head_mode`에 따라 Q4_0 quantize 적용 (Sprint G-1).
+    // multi-dtype 모드에서는 candidate dtype별로 변환된 sub-bytes도 함께 채워진다.
     if !quiet {
         eprint!("[auf-tool] Extracting weight tensors...");
     }
-    let (tensor_blobs, lm_head_q4_0_present) =
-        extract_weight_blobs(&gguf, &config, lm_head_mode, quiet)?;
+    let (tensor_blobs, lm_head_q4_0_present) = extract_weight_blobs(
+        &gguf,
+        &config,
+        lm_head_mode,
+        candidate_dtypes.as_deref(),
+        quiet,
+    )?;
     if !quiet {
-        eprintln!(" {} tensors extracted", tensor_blobs.len());
+        let total_dtype_entries: usize = tensor_blobs.iter().map(|b| b.dtype_bytes.len()).sum();
+        eprintln!(
+            " {} tensors, {} dtype entries extracted",
+            tensor_blobs.len(),
+            total_dtype_entries
+        );
     }
 
     // capability_optional bit 2 설정 여부 결정 (Sprint G-1).
@@ -474,8 +605,15 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         );
     }
 
-    // TensorIndex 구성 (weights payload 추가 전에 offset 계산)
-    let tensor_index = build_tensor_index(&tensor_blobs, &variant_tags);
+    // capability_optional bit 3 설정 (Sprint C, INV-139). multi-dtype 모드에서만 set.
+    writer = writer.with_multi_dtype(multi_dtype_enabled);
+    if !quiet && multi_dtype_enabled {
+        eprintln!("[auf-tool] MULTI_DTYPE_VARIANTS capability bit 3 = 1 (format_minor=2, v0.2)");
+    }
+
+    // TensorIndex 구성 (weights payload 추가 전에 offset 계산).
+    // INV-138 정렬 키: default_dtype entry가 그룹 첫 번째에 오도록 안정 정렬.
+    let tensor_index = build_tensor_index(&tensor_blobs, &variant_tags, default_dtype);
     if !quiet {
         eprintln!(
             "[auf-tool] TensorIndex: {} variants, {} entries",
@@ -497,7 +635,7 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
         }
     }
 
-    // 8) Atomic write
+    // 9) Atomic write
     if !quiet {
         eprint!("[auf-tool] Writing {}...", args.output.display());
     }
@@ -518,10 +656,40 @@ fn cmd_build(args: BuildArgs) -> Result<()> {
     Ok(())
 }
 
-/// `(tensor_name, raw_bytes_after_permute, shape_logical)` 항목 타입.
+/// 한 tensor의 source-dtype-원본 정보 + dtype별 candidate bytes.
 ///
 /// `shape_logical`은 outermost-first (논리적 순서).
-type WeightBlob = (String, Vec<u8>, Vec<u64>);
+/// `source_dtype`은 GGUF에서 추출한 raw bytes의 dtype (Q/K permute 후에도 동일).
+/// `dtype_bytes`는 candidate dtype별 변환된 bytes (Sprint C-A 파이프라인).
+///   v0.1.x single-dtype 모드에서는 1개. v0.2 multi-dtype 모드에서는 ≥1개.
+#[derive(Debug, Clone)]
+struct WeightBlob {
+    name: String,
+    shape_logical: Vec<u64>,
+    /// GGUF source bytes의 dtype. 디버깅 / 로깅용으로만 사용 (실제 변환은 dtype_bytes 등록 시
+    /// build_dtype_candidates 안에서 처리).
+    #[allow(dead_code)]
+    source_dtype: TensorDType,
+    /// candidate dtype과 그 bytes — TensorIndex entry 정렬과 무관하게 stable order.
+    dtype_bytes: Vec<(TensorDType, Vec<u8>)>,
+}
+
+impl WeightBlob {
+    /// 단일 dtype (v0.1.x 호환) blob 구성. dtype은 source dtype을 따른다.
+    fn single(
+        name: String,
+        shape_logical: Vec<u64>,
+        source_dtype: TensorDType,
+        bytes: Vec<u8>,
+    ) -> Self {
+        WeightBlob {
+            name,
+            shape_logical,
+            source_dtype,
+            dtype_bytes: vec![(source_dtype, bytes)],
+        }
+    }
+}
 
 /// GGUF ggml_type 코드 (subset, lm_head 분기에서 사용).
 ///
@@ -570,7 +738,7 @@ fn select_lm_head_source(has_separate: bool, has_token_embd: bool) -> Option<LmH
     }
 }
 
-/// `WeightBlob` 목록 추출 + lm_head Q4_0 사전 변환 (선택).
+/// `WeightBlob` 목록 추출 + lm_head Q4_0 사전 변환 (선택) + multi-dtype 변환.
 ///
 /// GGUF는 innermost-first로 dims를 저장하므로, 여기서 reverse하여 logical order로 반환한다.
 /// AUF TensorEntry.shape에는 logical order(outermost-first)로 저장하며,
@@ -581,12 +749,14 @@ fn select_lm_head_source(has_separate: bool, has_token_embd: bool) -> Option<LmH
 ///   (기존 동작). tied model에서는 lm_head entry 미생성 (v0.1.0 byte-level 호환).
 /// - `On`/`Auto`: lm_head source 선택:
 ///   - separate model: `output.weight` 사용. dtype 분기:
-///     - 이미 Q4_0이면 raw bytes 그대로 동봉.
+///     - 이미 Q4_0이면 raw bytes 그대로 동봉 (그리고 multi-dtype 모드면 candidate dtype
+///       전부에 대해 추가 변환).
 ///     - F16/F32 → F32 dequantize → Q4_0 quantize → 18B/block bytes로 교체.
-///     - 그 외 dtype은 변환 미지원으로 raw bytes 동봉 + bit 미설정.
 ///   - tied model (Llama 3.2 1B 등): `token_embd.weight` 를 lm_head source로 재사용.
-///     동일 dtype 분기 적용. tied 케이스에서도 lm_head Q4_0 entry는 별도 GPU 버퍼
-///     (Sprint F의 `quantize_lm_head_to_q4_0()` 흐름)로 의미가 있다.
+///
+/// `candidate_dtypes`는 v0.2 multi-dtype 모드에서 동봉할 dtype 후보 목록. v0.1.x single-dtype
+/// 모드에서는 None — source dtype 1개만 동봉. lm_head는 multi-dtype 모드에서도 동일한
+/// dtype 후보 적용 (Sprint A' 옵션 B). Adreno SOA variant 내 layout 강제는 build_variant_payload에서.
 ///
 /// 반환 튜플 두 번째 값은 lm_head Q4_0 entry가 *실제로* 추가/유지되었는지 (capability bit 2 set
 /// 결정에 사용). source가 둘 다 없거나 Off 모드면 false.
@@ -594,6 +764,7 @@ fn extract_weight_blobs(
     gguf: &llm_rs2::models::loader::gguf::GgufFile,
     config: &llm_rs2::models::config::ModelConfig,
     lm_head_mode: IncludeLmHeadMode,
+    candidate_dtypes: Option<&[TensorDType]>,
     quiet: bool,
 ) -> Result<(Vec<WeightBlob>, bool)> {
     let mut blobs: Vec<WeightBlob> = Vec::new();
@@ -606,7 +777,21 @@ fn extract_weight_blobs(
             let data = gguf.tensor_data(info);
             // GGUF dims는 innermost-first → reversed = outermost-first (logical)
             let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
-            blobs.push((name.to_owned(), data.to_vec(), shape_logical));
+            let src_dtype = ggml_type_to_tensor_dtype(info.ggml_type);
+            let dtype_bytes = build_dtype_candidates(
+                name,
+                data,
+                src_dtype,
+                &shape_logical,
+                candidate_dtypes,
+                quiet,
+            )?;
+            blobs.push(WeightBlob {
+                name: name.to_owned(),
+                shape_logical,
+                source_dtype: src_dtype,
+                dtype_bytes,
+            });
         }
     }
 
@@ -634,10 +819,12 @@ fn extract_weight_blobs(
                 let info = gguf.find_tensor(source_name).expect("source exists");
                 let raw = gguf.tensor_data(info);
                 let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
-                blobs.push((
+                let src_dtype = ggml_type_to_tensor_dtype(info.ggml_type);
+                blobs.push(WeightBlob::single(
                     LM_HEAD_SEPARATE_NAME.to_owned(),
-                    raw.to_vec(),
                     shape_logical,
+                    src_dtype,
+                    raw.to_vec(),
                 ));
             }
         } else {
@@ -652,6 +839,7 @@ fn extract_weight_blobs(
             // separate 케이스: source shape 그대로.
             let shape_logical: Vec<u64> = info.dims.iter().rev().copied().collect();
             let is_q4_0 = info.ggml_type == GGML_TYPE_Q4_0;
+            let src_dtype = ggml_type_to_tensor_dtype(info.ggml_type);
             let dtype_str = match info.ggml_type {
                 GGML_TYPE_F32 => "F32",
                 GGML_TYPE_F16 => "F16",
@@ -687,7 +875,8 @@ fn extract_weight_blobs(
             }
 
             if is_q4_0 {
-                // 이미 Q4_0 — quantize 불필요. AOS bytes를 그대로 동봉.
+                // 이미 Q4_0 — quantize 불필요. AOS bytes를 그대로 동봉. multi-dtype 모드면
+                // candidate dtype별 추가 변환 (Q4_0 → F16 / F32 등).
                 if !quiet {
                     eprintln!(
                         "[auf-tool] lm_head: source={}, dtype={}, raw {} bytes, \
@@ -697,23 +886,30 @@ fn extract_weight_blobs(
                         raw.len()
                     );
                 }
+                let dtype_bytes = build_dtype_candidates(
+                    LM_HEAD_SEPARATE_NAME,
+                    raw,
+                    src_dtype,
+                    &shape_logical,
+                    candidate_dtypes,
+                    quiet,
+                )?;
                 // tied: source는 token_embd지만 entry 이름은 lm_head 식별을 위해 output.weight.
-                blobs.push((
-                    LM_HEAD_SEPARATE_NAME.to_owned(),
-                    raw.to_vec(),
+                blobs.push(WeightBlob {
+                    name: LM_HEAD_SEPARATE_NAME.to_owned(),
                     shape_logical,
-                ));
+                    source_dtype: src_dtype,
+                    dtype_bytes,
+                });
                 lm_head_q4_0_present = true;
             } else if info.ggml_type == GGML_TYPE_F16 || info.ggml_type == GGML_TYPE_F32 {
-                // F16/F32 → F32 dequantize → Q4_0 quantize.
+                // F16/F32 → F32 dequantize → Q4_0 quantize. multi-dtype 모드면 추가 dtype도 동봉.
                 if !quiet {
                     eprintln!(
                         "[auf-tool] lm_head: source={}, dtype={}, quantizing to Q4_0...",
                         source_label, dtype_str,
                     );
                 }
-                // Sprint F와 일치: tied/separate 무관하게 token_embd / output.weight raw bytes를
-                // F32 dequantize → quantize_q4_0. shape은 [rows=vocab, cols=hidden].
                 if shape_logical.len() != 2 {
                     bail!(
                         "lm_head source '{}' must be 2-D (got shape={:?})",
@@ -723,7 +919,34 @@ fn extract_weight_blobs(
                 }
                 let q4_bytes =
                     quantize_lm_head_to_q4_0(raw, &shape_logical, info.ggml_type, quiet)?;
-                blobs.push((LM_HEAD_SEPARATE_NAME.to_owned(), q4_bytes, shape_logical));
+
+                // multi-dtype 모드에서는 lm_head도 candidate dtype 후보 전체에 대해 동봉.
+                // single-dtype (legacy v0.1.x) 모드에서는 Q4_0 단일 (Sprint G-1 동작).
+                let dtype_bytes: Vec<(TensorDType, Vec<u8>)> = if let Some(cands) = candidate_dtypes
+                {
+                    let mut out: Vec<(TensorDType, Vec<u8>)> = Vec::with_capacity(cands.len());
+                    for &dt in cands {
+                        let bytes = if dt == TensorDType::Q4_0 {
+                            // 이미 quantize_lm_head_to_q4_0로 구한 결과 재사용.
+                            q4_bytes.clone()
+                        } else {
+                            // Q4_0이 아니면 source raw bytes에서 직접 변환 (F16/F32 → 다른 dtype).
+                            convert_tensor_dtype(raw, src_dtype, dt, &shape_logical)
+                                .map_err(|e| anyhow!("lm_head dtype convert: {}", e))?
+                        };
+                        out.push((dt, bytes));
+                    }
+                    out
+                } else {
+                    vec![(TensorDType::Q4_0, q4_bytes)]
+                };
+
+                blobs.push(WeightBlob {
+                    name: LM_HEAD_SEPARATE_NAME.to_owned(),
+                    shape_logical,
+                    source_dtype: src_dtype,
+                    dtype_bytes,
+                });
                 lm_head_q4_0_present = true;
             } else {
                 // 미지원 dtype (Q4_K, Q8_0 등) — fallback: raw bytes + bit 미설정.
@@ -735,13 +958,12 @@ fn extract_weight_blobs(
                         source_label, dtype_str, info.ggml_type
                     );
                 }
-                // tied + 미지원 dtype 조합은 매우 드물고 (token_embd가 Q4_K 등) 엔진 path도
-                // 처리하지 않으므로 entry를 만들지 않는다.
                 if !is_tied {
-                    blobs.push((
+                    blobs.push(WeightBlob::single(
                         LM_HEAD_SEPARATE_NAME.to_owned(),
-                        raw.to_vec(),
                         shape_logical,
+                        src_dtype,
+                        raw.to_vec(),
                     ));
                 }
             }
@@ -786,7 +1008,21 @@ fn extract_weight_blobs(
                     raw.to_vec()
                 };
 
-                blobs.push((name, bytes, shape_logical));
+                let src_dtype = ggml_type_to_tensor_dtype(info.ggml_type);
+                let dtype_bytes = build_dtype_candidates(
+                    &name,
+                    &bytes,
+                    src_dtype,
+                    &shape_logical,
+                    candidate_dtypes,
+                    quiet,
+                )?;
+                blobs.push(WeightBlob {
+                    name,
+                    shape_logical,
+                    source_dtype: src_dtype,
+                    dtype_bytes,
+                });
             } else if !quiet && kind.ends_with(".weight") && !kind.contains("norm") {
                 // weight tensor 누락 경고 (norm은 없을 수 있음)
                 eprintln!("[auf-tool] Warning: tensor '{}' not found in GGUF", name);
@@ -795,6 +1031,73 @@ fn extract_weight_blobs(
     }
 
     Ok((blobs, lm_head_q4_0_present))
+}
+
+/// GGUF ggml_type 코드 → `TensorDType`.
+///
+/// 미지원 dtype은 보수적으로 source dtype을 그대로 추정 (raw bytes 동봉용).
+fn ggml_type_to_tensor_dtype(ggml_type: u32) -> TensorDType {
+    match ggml_type {
+        GGML_TYPE_F32 => TensorDType::F32,
+        GGML_TYPE_F16 => TensorDType::F16,
+        GGML_TYPE_Q4_0 => TensorDType::Q4_0,
+        // 기타 (Q4_1 / Q8_0 / BF16 / U8 등) — convert_tensor_dtype은 거부하지만, 변환 없이
+        // single source dtype으로 단일 entry를 생성하면 raw bytes로 통과한다 (legacy 호환).
+        _ => TensorDType::F16, // placeholder — 실제 변환 시도 시 convert_tensor_dtype이 reject.
+    }
+}
+
+/// candidate dtype 목록을 받아 각 dtype별 bytes를 구성한다.
+///
+/// - `candidate_dtypes` = None (single-dtype 모드): source dtype 1개만, raw bytes 그대로.
+/// - `candidate_dtypes` = Some(...): 각 dtype에 대해 변환 (source dtype과 일치하면 zero-copy).
+///   dtype 순서는 caller가 지정한 그대로 유지 (TensorIndex 정렬은 INV-138 단계에서 적용).
+///
+/// shape rank가 0이거나 변환 불가능한 dtype 조합이면 에러.
+fn build_dtype_candidates(
+    name: &str,
+    src_bytes: &[u8],
+    src_dtype: TensorDType,
+    shape_logical: &[u64],
+    candidate_dtypes: Option<&[TensorDType]>,
+    quiet: bool,
+) -> Result<Vec<(TensorDType, Vec<u8>)>> {
+    let cands = match candidate_dtypes {
+        None => return Ok(vec![(src_dtype, src_bytes.to_vec())]),
+        Some(c) => c,
+    };
+
+    // shape rank 0 (scalar) 또는 변환 불가 dtype 조합은 source 1개만 동봉. caller가
+    // multi-dtype 모드를 강제하더라도 norm 등 1-D F16 tensor는 그대로 두는 것이 안전.
+    let mut out: Vec<(TensorDType, Vec<u8>)> = Vec::with_capacity(cands.len());
+    for &dt in cands {
+        if dt == src_dtype {
+            out.push((dt, src_bytes.to_vec()));
+            continue;
+        }
+        // Q4_0 변환은 cols % 32 == 0이 필요. 만족 못하면 원본만 동봉하고 경고.
+        match convert_tensor_dtype(src_bytes, src_dtype, dt, shape_logical) {
+            Ok(bytes) => out.push((dt, bytes)),
+            Err(e) => {
+                if !quiet {
+                    eprintln!(
+                        "[auf-tool] Warning: tensor '{}' dtype convert {:?}→{:?} failed: {}; \
+                         dropping this dtype candidate",
+                        name, src_dtype, dt, e
+                    );
+                }
+                // skip — 해당 dtype candidate은 이 tensor에서 누락. INV-137은 동일 (layer,kind)에
+                // 대해 모든 후보가 같은 shape이어야 한다는 제약일 뿐, dtype별 entry 수가 동일해야
+                // 한다는 의무는 없다 (정합성은 reader 측 lookup으로 보장).
+            }
+        }
+    }
+
+    if out.is_empty() {
+        // 모든 candidate이 reject되면 source 1개라도 fallback으로 보장.
+        out.push((src_dtype, src_bytes.to_vec()));
+    }
+    Ok(out)
 }
 
 /// GGUF lm_head (F16 or F32) → F32 dequantize → Q4_0 quantize → 18B/block bytes.
@@ -925,83 +1228,85 @@ fn unpermute_qk_rows_local(
     dst
 }
 
-/// 특정 variant tag에 맞는 payload 바이트열 생성.
-fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
+/// 특정 variant tag와 dtype에 맞는 단일 tensor sub-payload 바이트열 생성.
+///
+/// caller는 blob의 dtype별 bytes를 외부 루프에서 결정하고 이 함수에 명시적으로 전달한다.
+/// dtype별 sub-payload를 단조 cursor 배치로 직렬화하기 위함이다.
+///
+/// **Adreno SOA × layer weight Q4_0 케이스만 SOA 변환을 적용**한다.
+/// - lm_head는 dtype에 무관하게 AOS 18B/block layout 강제 (INV-135 v2 / Sprint G-1-F).
+///   Adreno OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계 초과로 image1d 빠른 path를
+///   사용할 수 없기 때문이다.
+/// - F16 / F32 dtype은 SOA 변환 불가 — bytes as-is + tag-specific alignment.
+///   Adreno SOA variant에서는 alignment 0 (no-op) 그대로 동봉.
+fn build_variant_tensor_bytes(
+    name: &str,
+    bytes: &[u8],
+    shape: &[u64],
+    dtype: TensorDType,
+    tag: &str,
+) -> Result<Vec<u8>> {
+    let is_lm_head = name == LM_HEAD_SEPARATE_NAME;
+
     match tag {
         TAG_WEIGHTS_ADRENO_SOA => {
-            // SOA: layer Q4_0 weight를 (q_buf, d_buf)로 변환 + transpose하여 연속 배치.
-            // 비-Q4_0 tensor (F16 norm 등)는 그대로 포함.
+            // Adreno SOA × Q4_0 layer weight: SOA transpose 적용. 그 외는 AOS bytes as-is.
             //
-            // **lm_head 예외 (G-1-F fix, INV-135 v2)**: lm_head의 q_buf size는 vocab×hidden
-            // 차원 (Llama 3.2 1B: 32M texels)으로 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE`
-            // 한계를 거의 모든 디바이스에서 초과한다. 따라서 `image1d_buffer_t` 생성이
-            // 실패하여 빠른 SOA GEMV path를 발동시킬 수 없다. SOA 변환을 적용하면 reader
-            // 측이 SOA layout을 가정하지만 forward는 standard GEMV(AOS layout 가정)로
-            // 떨어져 silent corruption이 발생한다 (Sprint G-1-F 디바이스 측정에서 확인).
-            //
-            // 그러므로 lm_head Q4_0 entry는 ADRENO_SOA section 내부에서도 AOS 18B/block
-            // layout으로 동봉한다. reader는 `entry.kind == LmHead` 식별로 AOS path를
-            // 사용한다 (transformer.rs::load_lm_head_from_auf 참조).
-            //
-            // Q4_0 weight의 logical shape는 outermost-first `[ne01, ne00]` =
-            // `[rows, cols]`로 저장되어 있다 (`extract_weight_blobs` 참조).
-            // `q4_0_aos_to_adreno_soa`는 이 shape를 받아 `convert_q4_0_to_noshuffle`
-            // 와 동등한 (a) nibble unshuffle (b) ushort q transpose (c) half d
-            // transpose 를 빌드 타임에 적용한다. 결과 byte sequence는 backend의
-            // `alloc_pre_converted_soa_tensor`가 직접 cl_mem에 업로드 가능한
-            // 형태이다.
-            let mut out = Vec::new();
-            for (name, bytes, shape) in blobs {
-                let is_lm_head = name == LM_HEAD_SEPARATE_NAME;
-                let is_q4_0 = bytes.len() % 18 == 0 && bytes.len() >= 18;
-                if !is_lm_head && is_q4_0 && shape.len() == 2 {
-                    let ne01 = shape[0] as usize; // rows
-                    let ne00 = shape[1] as usize; // cols (K dim)
-                    // Defensive guard — if shape × 18B/block does not match the
-                    // tensor byte count, fall back to byte-as-is so we do not
-                    // corrupt the payload. This branch should not trigger for
-                    // well-formed GGUF inputs.
-                    let expected = (ne01 * ne00 / 32) * 18;
-                    if expected == bytes.len() && ne00.is_multiple_of(32) {
-                        let (q_buf, d_buf) = q4_0_aos_to_adreno_soa(bytes, ne00, ne01);
-                        out.extend_from_slice(&q_buf);
-                        out.extend_from_slice(&d_buf);
-                        continue;
-                    }
-                    eprintln!(
-                        "[auf-tool] Warning: SOA shape guard rejected '{}' (shape={:?}, bytes={}); \
-                         emitting AOS bytes (forward path will fall back to AOS GEMV).",
-                        name,
-                        shape,
-                        bytes.len()
-                    );
+            // **Adreno SOA × F16 layer weight 정책 (INV-135 / Sprint C-D)**:
+            //   F16 (또는 F32) layer weight는 Adreno SOA variant에서는 SOA 변환을
+            //   적용하지 않는다. SOA layout은 Q4_0 quant block 단위에 의존하므로
+            //   F16/F32에 무의미하다. Reader는 backend tag = adreno_soa + dtype = F16
+            //   조합을 만나면 layer weight는 fallback (AOS F16 GEMV)으로 처리해야 한다.
+            //   본 writer는 sub-payload bytes를 그대로 동봉만 한다.
+            if !is_lm_head && dtype == TensorDType::Q4_0 && shape.len() == 2 {
+                let ne01 = shape[0] as usize; // rows
+                let ne00 = shape[1] as usize; // cols (K dim)
+                let expected = (ne01 * ne00 / QK4_0_LOCAL) * 18;
+                if expected == bytes.len() && ne00.is_multiple_of(QK4_0_LOCAL) {
+                    let (q_buf, d_buf) = q4_0_aos_to_adreno_soa(bytes, ne00, ne01);
+                    let mut out = Vec::with_capacity(q_buf.len() + d_buf.len());
+                    out.extend_from_slice(&q_buf);
+                    out.extend_from_slice(&d_buf);
+                    return Ok(out);
                 }
-                // F16/F32 tensor, lm_head Q4_0 (image-limit exception),
-                // 또는 shape-mismatch fallback: bytes as-is.
-                out.extend_from_slice(bytes);
+                eprintln!(
+                    "[auf-tool] Warning: SOA shape guard rejected '{}' (shape={:?}, bytes={}); \
+                     emitting AOS bytes (forward path will fall back to AOS GEMV).",
+                    name,
+                    shape,
+                    bytes.len()
+                );
             }
-            Ok(out)
+            // lm_head (image-limit), F16/F32 tensor, shape-mismatch fallback: bytes as-is.
+            Ok(bytes.to_vec())
         }
-        TAG_WEIGHTS_CUDA_AOS => {
-            // AOS + 128B align
-            let mut out = Vec::new();
-            for (_name, bytes, _shape) in blobs {
-                let padded = q4_0_aos_with_align(bytes, 128);
-                out.extend_from_slice(&padded);
-            }
-            Ok(out)
-        }
-        TAG_WEIGHTS_CPU_AOS => {
-            // AOS + 64B align (NEON dotprod)
-            let mut out = Vec::new();
-            for (_name, bytes, _shape) in blobs {
-                let padded = q4_0_aos_with_align(bytes, 64);
-                out.extend_from_slice(&padded);
-            }
-            Ok(out)
-        }
+        TAG_WEIGHTS_CUDA_AOS => Ok(q4_0_aos_with_align(bytes, 128)),
+        TAG_WEIGHTS_CPU_AOS => Ok(q4_0_aos_with_align(bytes, 64)),
         _ => bail!("Unknown variant tag: {}", tag),
     }
+}
+
+/// QK4_0 = 32 (binary crate에서 core::quant::QK4_0 직접 import 시 build script 회로 우려로
+/// 로컬 상수 사용).
+const QK4_0_LOCAL: usize = 32;
+
+/// 특정 variant tag에 맞는 payload 바이트열 생성 (dtype-aware multi-dtype).
+///
+/// 같은 variant 안에서 dtype별 sub-payload를 cursor 단조 배치한다. dtype 순서는
+/// blob.dtype_bytes의 등록 순서를 그대로 따른다 (caller가 INV-138 정렬 의무를 만족하도록
+/// 미리 정렬해야 하며, build_tensor_index는 동일 정렬을 적용한다).
+///
+/// dtype별 sub-payload는 `build_variant_tensor_bytes`로 변환된다.
+fn build_variant_payload(blobs: &[WeightBlob], tag: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    for blob in blobs {
+        for (dtype, bytes) in &blob.dtype_bytes {
+            let sub =
+                build_variant_tensor_bytes(&blob.name, bytes, &blob.shape_logical, *dtype, tag)?;
+            out.extend_from_slice(&sub);
+        }
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,39 +1349,18 @@ fn tensor_name_to_layer_kind(name: &str) -> Option<(u32, TensorKind)> {
 
 /// blob bytes가 특정 variant에서 차지하는 payload 크기를 계산한다.
 ///
-/// `build_variant_payload`와 동일한 변환 로직을 적용하되, 실제 데이터 복사 없이
-/// 크기만 반환한다.
+/// `build_variant_tensor_bytes`와 동일한 변환 로직을 적용하되, 실제 데이터 복사 없이
+/// 크기만 반환한다. SOA 변환은 byte 수를 변경하지 않으므로 입력 길이 그대로.
 fn compute_variant_tensor_size(bytes: &[u8], tag: &str) -> usize {
     match tag {
         TAG_WEIGHTS_ADRENO_SOA => {
-            // Q4_0 SOA: q_buf(N*16) + d_buf(N*2) = N*18 = bytes.len() (불변)
-            // 비-Q4_0: 그대로
+            // Q4_0 SOA: q_buf(N*16) + d_buf(N*2) = N*18 = bytes.len() (불변).
+            // F16/F32 / lm_head AOS / shape-mismatch fallback: bytes.len() 그대로.
             bytes.len()
         }
-        TAG_WEIGHTS_CUDA_AOS => {
-            // 128B align-up
-            bytes.len().div_ceil(128) * 128
-        }
-        TAG_WEIGHTS_CPU_AOS => {
-            // 64B align-up
-            bytes.len().div_ceil(64) * 64
-        }
+        TAG_WEIGHTS_CUDA_AOS => bytes.len().div_ceil(128) * 128,
+        TAG_WEIGHTS_CPU_AOS => bytes.len().div_ceil(64) * 64,
         _ => bytes.len(),
-    }
-}
-
-/// blob bytes의 dtype을 추정한다.
-///
-/// Q4_0: 18B 배수 → `TensorDType::Q4_0`
-/// F16: 2B 배수 (기타) → `TensorDType::F16`
-/// 그 외: `TensorDType::F32`
-fn infer_dtype(bytes: &[u8]) -> TensorDType {
-    if bytes.len() >= 18 && bytes.len().is_multiple_of(18) {
-        TensorDType::Q4_0
-    } else if bytes.len().is_multiple_of(2) {
-        TensorDType::F16
-    } else {
-        TensorDType::F32
     }
 }
 
@@ -1085,7 +1369,24 @@ fn infer_dtype(bytes: &[u8]) -> TensorDType {
 /// 각 variant마다 payload 내 tensor별 section-local offset을 추적하여
 /// `TensorEntry::variant_offsets`/`variant_sizes`를 채운다.
 /// `TensorEntry::shape`는 logical order (outermost-first)로 채운다.
-fn build_tensor_index(blobs: &[WeightBlob], variant_tags: &[&str]) -> TensorIndex {
+///
+/// **multi-dtype 모드 (Sprint C-E, INV-138)**: blob에 dtype이 여러 개면 dtype별로 entry를
+/// 추가한다. 그러나 같은 (layer_idx, kind) 그룹 안에서는 INV-138 정렬 키로 안정 정렬한다:
+/// `(layer_idx ASC, kind ASC, is_default DESC, dtype ASC)`. 이는 v0.1.x reader가 first-match로
+/// default_dtype을 자동 선택하도록 보장하는 호환 의무이다.
+///
+/// `default_dtype`이 None이면 single-dtype 모드 (각 blob에 dtype_bytes가 1개씩) — 정렬 키의
+/// is_default 컴포넌트는 무의미.
+///
+/// payload offset/size는 entry 정렬 후가 아니라 *blob.dtype_bytes의 등록 순서대로* 추적해야
+/// 한다 (build_variant_payload가 같은 순서로 sub-payload를 직렬화하기 때문). 따라서
+/// 정렬은 entry 자체에만 적용하고 offset/size는 blob 등록 순서로 채운 후, 정렬 후에 entry
+/// 안에서 그대로 보존된다.
+fn build_tensor_index(
+    blobs: &[WeightBlob],
+    variant_tags: &[&str],
+    default_dtype: Option<TensorDType>,
+) -> TensorIndex {
     let variant_count = variant_tags.len();
 
     // variant_tags → [u8; 24] 배열 변환
@@ -1102,41 +1403,52 @@ fn build_tensor_index(blobs: &[WeightBlob], variant_tags: &[&str]) -> TensorInde
     // variant별 현재 누적 offset (section-local, 0-based)
     let mut variant_cursors: Vec<u64> = vec![0u64; variant_count];
 
-    let mut entries: Vec<TensorEntry> = Vec::with_capacity(blobs.len());
+    let mut entries: Vec<TensorEntry> = Vec::new();
 
-    for (name, bytes, shape_logical) in blobs {
-        let Some((layer_idx, kind)) = tensor_name_to_layer_kind(name) else {
-            // 인식 불가 tensor: offset만 전진, entry 미등록
+    for blob in blobs {
+        let recognized = tensor_name_to_layer_kind(&blob.name);
+
+        for (dtype, bytes) in &blob.dtype_bytes {
+            // payload cursor는 항상 전진 (인식 불가한 tensor도 sub-payload는 직렬화됨).
+            let mut variant_offsets = Vec::with_capacity(variant_count);
+            let mut variant_sizes = Vec::with_capacity(variant_count);
             for (vi, &tag) in variant_tags.iter().enumerate() {
                 let sz = compute_variant_tensor_size(bytes, tag) as u64;
+                variant_offsets.push(variant_cursors[vi]);
+                variant_sizes.push(sz);
                 variant_cursors[vi] += sz;
             }
-            continue;
-        };
 
-        let dtype = infer_dtype(bytes);
+            // 인식 불가 tensor는 entry 미등록 (cursor만 전진).
+            let Some((layer_idx, kind)) = recognized else {
+                continue;
+            };
 
-        let mut variant_offsets = Vec::with_capacity(variant_count);
-        let mut variant_sizes = Vec::with_capacity(variant_count);
-
-        for (vi, &tag) in variant_tags.iter().enumerate() {
-            let sz = compute_variant_tensor_size(bytes, tag) as u64;
-            variant_offsets.push(variant_cursors[vi]);
-            variant_sizes.push(sz);
-            variant_cursors[vi] += sz;
+            entries.push(TensorEntry {
+                layer_idx,
+                kind: kind.as_u32(),
+                dtype: dtype.as_u32(),
+                // logical order (outermost-first): reader가 .rev()하여 GGUF innermost-first로 복원
+                shape: blob.shape_logical.clone(),
+                alignment: 64,
+                variant_offsets,
+                variant_sizes,
+            });
         }
-
-        entries.push(TensorEntry {
-            layer_idx,
-            kind: kind.as_u32(),
-            dtype: dtype.as_u32(),
-            // logical order (outermost-first): reader가 .rev()하여 GGUF innermost-first로 복원
-            shape: shape_logical.clone(),
-            alignment: 64,
-            variant_offsets,
-            variant_sizes,
-        });
     }
+
+    // INV-138 정렬: (layer_idx ASC, kind ASC, is_default DESC, dtype ASC).
+    // sort_by_key는 stable이므로 동일 key 내에서는 등록 순서 보존.
+    let default_u32 = default_dtype.map(|d| d.as_u32());
+    entries.sort_by_key(|e| {
+        // is_default DESC == "0이 먼저, 1이 나중" → bool을 그대로 ascending sort하려면 not 적용.
+        // is_default = (dtype == default_dtype) → DESC 정렬을 위해 !is_default를 키로 사용.
+        let not_default: u8 = match default_u32 {
+            Some(d) if e.dtype == d => 0,
+            _ => 1,
+        };
+        (e.layer_idx, e.kind, not_default, e.dtype)
+    });
 
     TensorIndex {
         variant_tags: vt_bytes,
@@ -1189,15 +1501,24 @@ fn cmd_info(args: InfoArgs) -> Result<()> {
     println!("  source_size      : {} bytes", h.source_size);
     println!("  source_mtime     : {}", source_mtime_str);
     println!("  capability_req   : {:#018x}", h.capability_required);
-    println!(
-        "  capability_opt   : {:#018x}{}",
-        h.capability_optional,
+    {
+        let mut caps = Vec::new();
         if h.has_lm_head_q4_0() {
-            " (LM_HEAD_PRECOMPUTED_Q4_0)"
-        } else {
-            ""
+            caps.push("LM_HEAD_PRECOMPUTED_Q4_0");
         }
-    );
+        if h.has_multi_dtype() {
+            caps.push("MULTI_DTYPE_VARIANTS");
+        }
+        let suffix = if caps.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", caps.join(" + "))
+        };
+        println!(
+            "  capability_opt   : {:#018x}{}",
+            h.capability_optional, suffix
+        );
+    }
     println!("  section_count    : {}", h.section_count);
     println!(
         "  payload_start    : {:#x} ({})",
@@ -1252,6 +1573,9 @@ fn cmd_info(args: InfoArgs) -> Result<()> {
     println!("  max_seq_len      : {}", m.max_seq_len);
     println!("  rope_theta       : {}", m.rope_theta);
     println!("  rms_norm_epsilon : {}", m.rms_norm_epsilon);
+    if let Some(dd) = &m.default_dtype {
+        println!("  default_dtype    : {}", dd);
+    }
     println!();
 
     // Tokenizer summary
@@ -1291,7 +1615,75 @@ fn cmd_info(args: InfoArgs) -> Result<()> {
     println!("TENSOR_INDEX:");
     println!("  variants         : {:?}", ti.variant_tag_strings());
     println!("  tensor_count     : {}", ti.entries.len());
+
+    // dtype 분포 — BTreeMap<dtype_str, count>를 사용해 결정적 출력 (HashMap 비결정성 회피).
+    {
+        use std::collections::BTreeMap;
+        let mut dtype_count: BTreeMap<&'static str, usize> = BTreeMap::new();
+        for e in &ti.entries {
+            let label = match TensorDType::from_u32(e.dtype) {
+                Some(TensorDType::F32) => "F32",
+                Some(TensorDType::F16) => "F16",
+                Some(TensorDType::BF16) => "BF16",
+                Some(TensorDType::Q4_0) => "Q4_0",
+                Some(TensorDType::Q4_1) => "Q4_1",
+                Some(TensorDType::Q8_0) => "Q8_0",
+                Some(TensorDType::U8) => "U8",
+                None => "?",
+            };
+            *dtype_count.entry(label).or_default() += 1;
+        }
+        if !dtype_count.is_empty() {
+            let parts: Vec<String> = dtype_count
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            println!("  dtype_dist       : {{{}}}", parts.join(", "));
+        }
+    }
+
+    // multi-dtype 그룹 — 동일 (layer_idx, kind)에 dtype이 2개 이상인 그룹 수.
+    if h.has_multi_dtype() {
+        use std::collections::BTreeMap;
+        let mut group_count: BTreeMap<(u32, u32), usize> = BTreeMap::new();
+        for e in &ti.entries {
+            *group_count.entry((e.layer_idx, e.kind)).or_default() += 1;
+        }
+        let multi_groups: usize = group_count.values().filter(|&&c| c >= 2).count();
+        println!(
+            "  multi_dtype_grps : {} (groups with >=2 dtype candidates)",
+            multi_groups
+        );
+    }
     println!();
+
+    // Variant × dtype × size matrix (multi-dtype 가시화).
+    if !ti.entries.is_empty() {
+        println!("Variant × Dtype Size Matrix:");
+        let variant_strs = ti.variant_tag_strings();
+        for (vi, vt) in variant_strs.iter().enumerate() {
+            use std::collections::BTreeMap;
+            let mut by_dtype: BTreeMap<&'static str, u64> = BTreeMap::new();
+            for e in &ti.entries {
+                if vi >= e.variant_sizes.len() {
+                    continue;
+                }
+                let label = match TensorDType::from_u32(e.dtype) {
+                    Some(TensorDType::F32) => "F32",
+                    Some(TensorDType::F16) => "F16",
+                    Some(TensorDType::Q4_0) => "Q4_0",
+                    _ => "other",
+                };
+                *by_dtype.entry(label).or_default() += e.variant_sizes[vi];
+            }
+            let parts: Vec<String> = by_dtype
+                .iter()
+                .map(|(k, v)| format!("{}={:.1}MB", k, *v as f64 / (1024.0 * 1024.0)))
+                .collect();
+            println!("  {:<26} {{{}}}", vt, parts.join(", "));
+        }
+        println!();
+    }
 
     // Variants present
     if variants_present.is_empty() {
@@ -1579,6 +1971,71 @@ fn cmd_verify(args: VerifyArgs) -> Result<()> {
                 true,
                 "",
             );
+        }
+
+        // INV-137: 동일 (layer_idx, kind) 그룹의 모든 dtype candidate은 동일 shape를 가져야 함.
+        // BTreeMap으로 결정적 순회 (HashMap 비결정성 회피).
+        if view.header.has_multi_dtype() {
+            use std::collections::BTreeMap;
+            let mut groups: BTreeMap<(u32, u32), Vec<&TensorEntry>> = BTreeMap::new();
+            for e in &ti.entries {
+                groups.entry((e.layer_idx, e.kind)).or_default().push(e);
+            }
+            let mut shape_ok = true;
+            for ((layer, kind), members) in &groups {
+                if members.len() < 2 {
+                    continue;
+                }
+                let first_shape = &members[0].shape;
+                for m in members.iter().skip(1) {
+                    if &m.shape != first_shape {
+                        let layer_str = if *layer == u32::MAX {
+                            "cross".to_owned()
+                        } else {
+                            layer.to_string()
+                        };
+                        print_check(
+                            &format!(
+                                "INV-137 multi-dtype shape match (layer={} kind={})",
+                                layer_str, kind
+                            ),
+                            false,
+                            &format!(
+                                "shape mismatch: dtype={} {:?} vs dtype={} {:?}",
+                                members[0].dtype, first_shape, m.dtype, m.shape
+                            ),
+                        );
+                        shape_ok = false;
+                        all_pass = false;
+                    }
+                }
+            }
+            if shape_ok {
+                print_check(
+                    "INV-137 multi-dtype shape consistency",
+                    true,
+                    "all groups have matching shapes",
+                );
+            }
+
+            // INV-138 (a): META.default_dtype 의무.
+            if view.meta.default_dtype.is_none() {
+                print_check(
+                    "INV-138 META.default_dtype required for multi-dtype",
+                    false,
+                    "MULTI_DTYPE_VARIANTS bit 3 set but META.default_dtype missing",
+                );
+                all_pass = false;
+            } else {
+                print_check(
+                    &format!(
+                        "INV-138 META.default_dtype = {}",
+                        view.meta.default_dtype.as_deref().unwrap_or("?")
+                    ),
+                    true,
+                    "",
+                );
+            }
         }
 
         // 각 TensorEntry.shape rank > 0 검증 (빈 shape = swap_executor 차단)
@@ -2083,15 +2540,17 @@ mod tests {
             .collect();
 
         let blobs: Vec<WeightBlob> = vec![
-            (
+            WeightBlob::single(
                 "blk.0.ffn_gate.weight".to_owned(),
-                layer_aos.clone(),
                 vec![LAYER_ROWS as u64, LAYER_COLS as u64],
+                TensorDType::Q4_0,
+                layer_aos.clone(),
             ),
-            (
+            WeightBlob::single(
                 "output.weight".to_owned(), // = LM_HEAD_SEPARATE_NAME, lm_head 식별
-                lm_head_aos.clone(),
                 vec![VOCAB as u64, HIDDEN as u64],
+                TensorDType::Q4_0,
+                lm_head_aos.clone(),
             ),
         ];
 
@@ -2136,10 +2595,11 @@ mod tests {
             .map(|i| (i % 256) as u8)
             .collect();
 
-        let blobs: Vec<WeightBlob> = vec![(
+        let blobs: Vec<WeightBlob> = vec![WeightBlob::single(
             "blk.5.attn_v.weight".to_owned(),
-            aos.clone(),
             vec![ROWS as u64, COLS as u64],
+            TensorDType::Q4_0,
+            aos.clone(),
         )];
 
         let payload = build_variant_payload(&blobs, TAG_WEIGHTS_ADRENO_SOA).unwrap();

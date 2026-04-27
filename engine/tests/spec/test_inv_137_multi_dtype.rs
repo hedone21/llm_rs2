@@ -113,9 +113,7 @@ fn inv137_multi_dtype_entries_both_lookable() {
         "capability bit 3 must be set"
     );
 
-    let candidates = view
-        .tensor_index
-        .entries_for(0, TensorKind::AttnQ.as_u32());
+    let candidates = view.tensor_index.entries_for(0, TensorKind::AttnQ.as_u32());
     assert_eq!(
         candidates.len(),
         2,
@@ -160,9 +158,7 @@ fn inv137_same_dtype_entries_returned_as_is() {
 
     let bytes = build_multi_dtype_auf(vec![e1, e2]);
     let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
-    let candidates = view
-        .tensor_index
-        .entries_for(0, TensorKind::AttnK.as_u32());
+    let candidates = view.tensor_index.entries_for(0, TensorKind::AttnK.as_u32());
     assert_eq!(candidates.len(), 2);
 }
 

@@ -57,17 +57,17 @@ fn build_base_auf() -> Vec<u8> {
 }
 
 /// capability_optional을 주어진 값으로 덮어쓴다.
-fn set_cap_opt(bytes: &mut Vec<u8>, value: u64) {
+fn set_cap_opt(bytes: &mut [u8], value: u64) {
     bytes[104..112].copy_from_slice(&value.to_le_bytes());
 }
 
 /// capability_required를 주어진 값으로 덮어쓴다.
-fn set_cap_req(bytes: &mut Vec<u8>, value: u64) {
+fn set_cap_req(bytes: &mut [u8], value: u64) {
     bytes[96..104].copy_from_slice(&value.to_le_bytes());
 }
 
 /// format_minor를 주어진 값으로 덮어쓴다.
-fn set_format_minor(bytes: &mut Vec<u8>, value: u16) {
+fn set_format_minor(bytes: &mut [u8], value: u16) {
     bytes[10..12].copy_from_slice(&value.to_le_bytes());
 }
 
@@ -83,10 +83,7 @@ fn inv139_reader_known_capabilities_includes_bit2_and_bit3() {
         CAPABILITY_BIT_LM_HEAD_Q4_0 | CAPABILITY_BIT_MULTI_DTYPE,
         "READER_KNOWN_CAPABILITIES must be bit2|bit3 = 0xC"
     );
-    assert_eq!(
-        READER_KNOWN_CAPABILITIES, 0xC,
-        "0xC = 0b1100 = bit2|bit3"
-    );
+    assert_eq!(READER_KNOWN_CAPABILITIES, 0xC, "0xC = 0b1100 = bit2|bit3");
 }
 
 // ── INV-139: bit 3 = 1 → reader가 인식하고 multi-dtype dispatch ──────────────
@@ -277,8 +274,14 @@ fn inv139_v01_auf_x_v02_reader_no_regression() {
 
     let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
     // v0.2 reader가 v0.1.x AUF를 정상 파싱
-    assert!(!view.header.has_multi_dtype(), "v0.1.x AUF must not have bit 3");
+    assert!(
+        !view.header.has_multi_dtype(),
+        "v0.1.x AUF must not have bit 3"
+    );
     assert_eq!(view.header.format_minor, 1);
-    assert!(view.meta.default_dtype.is_none(), "v0.1.x AUF has no default_dtype");
+    assert!(
+        view.meta.default_dtype.is_none(),
+        "v0.1.x AUF has no default_dtype"
+    );
     assert_eq!(view.meta.architecture, "llama");
 }

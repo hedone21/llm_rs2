@@ -39,6 +39,11 @@ pub struct AufWriter {
     /// `true`이면 `build()`에서 `capability_optional` bit 2 set + format_patch = 1.
     /// `false`이면 v0.1.0 byte-level 호환 출력.
     lm_head_q4_0_present: bool,
+    /// AUF v0.2 multi-dtype variant 모드 활성화 (Sprint C, INV-139).
+    ///
+    /// `true`이면 `build()`에서 `capability_optional` bit 3 set + format_minor = 2.
+    /// 이 값은 `cmd_build`가 `--dtypes`에 dtype을 2개 이상 지정한 경우 자동 활성화한다.
+    multi_dtype_enabled: bool,
 }
 
 impl AufWriter {
@@ -59,7 +64,17 @@ impl AufWriter {
             tensor_index: None,
             created_by: "llm_rs2 v0.1.0".to_owned(),
             lm_head_q4_0_present: false,
+            multi_dtype_enabled: false,
         }
+    }
+
+    /// AUF v0.2 `MULTI_DTYPE_VARIANTS` capability를 선언한다 (Sprint C, INV-139).
+    ///
+    /// `true`이면 `build()`가 `capability_optional` bit 3 set + format_minor = 2.
+    /// `false` (기본값)이면 single-dtype 모드 (v0.1.x 호환).
+    pub fn with_multi_dtype(mut self, enabled: bool) -> Self {
+        self.multi_dtype_enabled = enabled;
+        self
     }
 
     /// `LM_HEAD_PRECOMPUTED_Q4_0` capability를 선언한다 (v0.1.1, Sprint G-1).
@@ -193,6 +208,9 @@ impl AufWriter {
         // v0.1.1 (Sprint G-1): lm_head Q4_0 사전 변환 capability 선언.
         // 미선언 시 v0.1.0 byte-level 호환 (format_patch = 0, bit 2 = 0).
         header.set_lm_head_q4_0_capability(self.lm_head_q4_0_present);
+        // v0.2 (Sprint C, INV-139): multi-dtype variant capability 선언.
+        // 활성화 시 bit 3 set + format_minor = 2. 미활성화 시 v0.1.x 호환.
+        header.set_multi_dtype_capability(self.multi_dtype_enabled);
 
         // (6) 파일 바이트 조립
         let mut out: Vec<u8> = vec![0u8; total_size as usize];

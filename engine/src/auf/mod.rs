@@ -23,6 +23,7 @@
 /// - ENG-DAT-096 (`spec/33-engine-data.md` §3.22)
 /// - ENG-ALG-223 (`spec/32-engine-algorithms.md` §3.12.17)
 /// - INV-132~134 (`spec/41-invariants.md` §3.16)
+pub mod dtype_convert;
 pub mod error;
 pub mod header;
 pub mod meta;
@@ -36,6 +37,7 @@ pub mod tokenizer;
 pub mod writer;
 
 // 편의 re-export
+pub use dtype_convert::convert_tensor_dtype;
 pub use error::{AufError, AufResult};
 pub use header::{
     AufHeader, CAPABILITY_BIT_LM_HEAD_Q4_0, CAPABILITY_BIT_MULTI_DTYPE, HEADER_SIZE,

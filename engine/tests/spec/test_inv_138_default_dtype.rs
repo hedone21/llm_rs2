@@ -10,9 +10,8 @@
 ///       `spec/33-engine-data.md` §3.22.15 (ENG-DAT-098), §3.22.16 (ENG-DAT-099)
 ///       `spec/32-engine-algorithms.md` §3.12.18 (ENG-ALG-224)
 use llm_rs2::auf::{
-    AufMeta, AufTokenizer, AufWriter, BackendTag, CAPABILITY_BIT_MULTI_DTYPE,
-    TAG_WEIGHTS_CPU_AOS, TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind,
-    open_from_bytes,
+    AufMeta, AufTokenizer, AufWriter, BackendTag, CAPABILITY_BIT_MULTI_DTYPE, TAG_WEIGHTS_CPU_AOS,
+    TOKENIZER_KIND_BPE, TensorDType, TensorEntry, TensorIndex, TensorKind, open_from_bytes,
 };
 
 // ── 헬퍼 ──────────────────────────────────────────────────────────────────
@@ -160,9 +159,7 @@ fn inv138_default_dtype_entry_is_first_in_group() {
     let bytes = build_v02_auf(meta, vec![q4_first, f16_second]);
     let view = open_from_bytes(bytes, BackendTag::CpuAos).unwrap();
 
-    let entries = view
-        .tensor_index
-        .entries_for(0, TensorKind::AttnQ.as_u32());
+    let entries = view.tensor_index.entries_for(0, TensorKind::AttnQ.as_u32());
     assert_eq!(entries.len(), 2);
 
     // INV-138(b): first-match가 default_dtype(Q4_0)이어야 함

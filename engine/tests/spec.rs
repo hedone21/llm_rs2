@@ -137,6 +137,11 @@ mod test_inv_138_default_dtype;
 #[path = "spec/test_inv_139_capability_bit3.rs"]
 mod test_inv_139_capability_bit3;
 
+// ── AUF v0.2 Sprint C — ENG-ALG-224 multi-dtype writer ──
+// dequant→requant 결정성, INV-138 sort, capability bit 3 자동 활성화.
+#[path = "spec/test_eng_alg_224_writer_multi_dtype.rs"]
+mod test_eng_alg_224_writer_multi_dtype;
+
 // ── Sprint G-1-E — AUF lm_head Q4_0 통합 정확성 검증 ──
 // 의문 1: ADRENO_SOA payload = q_buf||d_buf (SOA) layout 정합성.
 // 의문 2: payload.bytes.len() == N*18 (SOA 총 크기 = AOS 총 크기 불변).
