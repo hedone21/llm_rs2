@@ -25,85 +25,76 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 
 단일 transformer decoder layer 내부에서 두 패밀리가 각각 어디를 측정하는지 표시한 그림이다. `QCF_kv`는 attention block 내부의 한 점(O = Σα·V), `QCF_weight`는 (a) 레이어 입출력의 동적 비교(importance)와 (b) weight tensor 공간의 정적 비교(ε) 두 곳에서 측정한다.
 
-> **Note (Layer 차원 처리)**: 본 그림은 **layer i 단면도**(i = 0, 1, …, N−1)이다. 좌측은 단일 layer 내부의 측정 위치, 우측 박스는 N 개 layer에 대해 각 양이 어떻게 합산되는지를 같이 표시한다. KV eviction 4종만 **layer 0 ad-hoc 경량 proxy**, 나머지는 모든 layer aggregate. 자세한 매핑은 §2.3 표 참조.
+> **Note (Layer 차원 처리)**: 본 그림은 layer i 단면이며, 실제 코드의 layer 차원 처리는 액션마다 다르다. KV eviction 4종은 **layer 0 ad-hoc 경량 proxy**, KIVI/swap/skip은 모든 layer aggregate. 자세한 매핑은 §2.3 표 참조.
 
 ```
-                         ┌────────────────────────────────────────┐
-                         │   Layer i 단면 (i = 0, 1, …, N−1)      │
-                         │   각 양은 N 개 layer에서 동일하게 측정 │
-                         └────────────────────────────────────────┘
+       x_in ──────────────────────────────●━━━━━━━ [W] x̄_in 캡처
+        │                                 │       (mean-pool over T tokens)
+        │                                 │       transformer.rs:1508
+        ▼                                 │
+   ╔═══════════════════════════════════╗  │
+   ║         ATTENTION BLOCK           ║  │  ┌─────────────────────────┐
+   ║                                   ║  │  │ [W] weight tensor 공간  │
+   ║   RMSNorm                         ║  │  │  (정적, 모델 로드 시 1회)│
+   ║      │                            ║  │  │                         │
+   ║      ▼                            ║  │  │  ε_t = ‖W_pri − W_sec‖²│
+   ║   QKV proj  (W_q, W_k, W_v) ◀━━━━━╫━━┿━━│           / ‖W_pri‖²    │
+   ║      │                            ║  │  │                         │
+   ║      ▼                            ║  │  │  ε_i = mean over        │
+   ║   RoPE + KV cache                 ║  │  │   {Q,K,V,O,gate,up,down}│
+   ║      │                            ║  │  │                         │
+   ║      ▼                            ║  │  │  조건: secondary = Q4_0 │
+   ║   softmax(QK^T/√d) · V            ║  │  │  *NaN ε layer 는 QCF_   │
+   ║      │                            ║  │  │   swap 의 분자/분모에서 │
+   ║      ▼                            ║  │  │   모두 제외 (INV-127)   │
+   ║   ╔══════╗                        ║  │  └─────────────────────────┘
+   ║   ║  O   ║◀━━━ [KV] QCF_kv 측정점 ║  │
+   ║   ║ Σα·V ║     ‖O_b − O_a‖₂      ║  │
+   ║   ╚══╤═══╝       / ‖O_b‖₂        ║  │
+   ║      │           per-head h ∈ KV  ║  │
+   ║      │           → aggregate      ║  │
+   ║      │           (Mean / Defensive║  │
+   ║      │            softmax)        ║  │
+   ║      ▼                            ║  │
+   ║   O proj  (W_o)            ◀━━━━━━╫━━┤
+   ╚══════╤════════════════════════════╝  │
+          │                               │
+          ●─── (+ residual from x_in)     │
+          │                               │
+          ▼                               │
+   ╔═══════════════════════════════════╗  │
+   ║         FFN BLOCK                 ║  │
+   ║                                   ║  │
+   ║   RMSNorm                         ║  │
+   ║      │                            ║  │
+   ║      ▼                            ║  │
+   ║   gate proj · up proj             ║  │
+   ║   (W_gate, W_up)           ◀━━━━━━╫━━┤
+   ║      │                            ║  │
+   ║      ▼                            ║  │
+   ║   SiLU · multiply                 ║  │
+   ║      │                            ║  │
+   ║      ▼                            ║  │
+   ║   down proj  (W_down)      ◀━━━━━━╫━━┘
+   ╚══════╤════════════════════════════╝
+          │
+          ●─── (+ residual)
+          │
+          ●━━━━━━ [W] x̄_out 캡처
+          │       importance_i = max(0, 1 − cos(x̄_in, x̄_out))
+          ▼       transformer.rs:1593
+       x_out
 
-    x_in ──┐
-           │
-           ●━━━━━━━━━━━━ [W] x̄_in 캡처 (mean-pool over T tokens)               ┌───────────────────────────────────┐
-           │           transformer.rs:1508                                       │     Layer Aggregation             │
-           │                                                                     │     (각 양이 layer 차원에서        │
-           ▼                                                                     │      어떻게 합산되는가)            │
-       ┌───────┐                                                                 ├───────────────────────────────────┤
-       │RMSNorm│                                                                 │                                   │
-       └───┬───┘                                                                 │  [KV] QCF_kv:                     │
-           ▼                                                                     │     per-layer q_i = ‖ΔO_i‖/‖O_i‖  │
-       ┌──────────┐                                                              │     (per-head, Mean / Defensive   │
-       │QKV proj  │ ◀── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐              │      softmax over heads)           │
-       │W_q W_k W_v│                                                │             │     ───────────────────────────   │
-       └────┬─────┘                                                 │             │                                   │
-            ▼                                                       │             │     QCF_kv = q_0                  │
-       ┌─────────┐                                                  │             │     ★ layer 0 ad-hoc 경량 proxy   │
-       │RoPE+ KV │                                                  │             │       — 의도된 단순화. 매니저     │
-       └────┬────┘                                                  │             │       정책의 상대 ordering 보존이 │
-            ▼                                                       │             │       검증됨 (2026-04-27, §2.3).   │
-   ┌────────────────┐                                               │             │                                   │
-   │softmax(QK^T/√d)│                                               │             │     예외: KIVI 만 모든 layer 평균 │
-   │      · V       │                                               │             │           (KiviCache 자체가       │
-   └────────┬───────┘                                               │             │            layer-aware)            │
-            ▼                                                       │             │                                   │
-        ╔═══════╗                                                   │             │  ─────────────────────────────    │
-        ║   O   ║━━━ [KV] QCF_kv 측정점 (per-head O)                 │             │                                   │
-        ║ Σα·V  ║     ‖O_b − O_a‖₂ / ‖O_b‖₂                         │             │  [W] QCF_weight (importance):     │
-        ╚═══╤═══╝     unified_qcf.rs:80                              │             │     importance_i = max(0,         │
-            ▼                                                       │             │       1 − cos(x̄_i^in, x̄_i^out))   │
-       ┌────────┐                                                   │             │     ───────────────────────────   │
-       │W_o proj│ ◀── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─┤              │                                   │
-       └────┬───┘                                                   │             │     QCF_skip(𝒮)                   │
-            │                                                       │             │       = Σ_{i∈𝒮} importance_i      │
-       (+ residual from x_in)                                       │             │         ─────────────────────     │
-            ▼                                                       │             │         Σ_{j∈ℰ} importance_j      │
-       ┌───────┐                                                    │             │     (모든 layer entry sum 정규화) │
-       │RMSNorm│                                                    │             │                                   │
-       └───┬───┘                                                    │             │  ─────────────────────────────    │
-            ▼                                                       │             │                                   │
-       ┌─────────────┐                                              │             │  [W] QCF_weight (ε):              │
-       │  FFN        │                                              │             │     ε_t = ‖W_pri − W_sec‖²_F      │
-       │ gate · up   │ ◀── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤              │            / ‖W_pri‖²_F           │
-       │ SiLU · ⊙    │                                              │             │     ε_i = mean over 7 tensors     │
-       │ down        │ ◀── ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┘              │     (조건: secondary = Q4_0)      │
-       │ W_g W_u W_d │                                                            │     ───────────────────────────   │
-       └────┬────────┘                                                            │                                   │
-            │                                                                     │     QCF_swap(𝒮)                   │
-       (+ residual)                                                               │       = Σ_{i∈𝒮} imp_i · ε_i        │
-            ▼                                                                     │         ─────────────────────     │
-            ●━━━━━━ [W] x̄_out 캡처                                                 │         Σ_{j∈𝒱} imp_j · ε_j        │
-            │   importance_i = max(0, 1 − cos(x̄_in, x̄_out))                      │     (NaN ε layer 제외, INV-127)   │
-            │   transformer.rs:1593                                                │                                   │
-            ▼                                                                     │  ─────────────────────────────    │
-          x_out                                                                   │                                   │
-                                                                                  │  공통: importance / ε 는 정적     │
-                                                                                  │       (warmup·load 시 1회).       │
-                                                                                  │       QCF_kv 만 RequestQcf 시점   │
-                                                                                  │       마다 동적 재계산.            │
-                                                                                  │                                   │
-                                                                                  └───────────────────────────────────┘
-
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ─────────────────────────────────────────────────────────────
   범례:
     ╔═╗  큼직한 sub-block (Attention / FFN)
-    ╔═╗  [KV] QCF_kv 측정점 — Attention block 내부 1점 (per-head O)
-         layer 차원: ★ layer 0 ad-hoc proxy (eviction 4종) / Mean (KIVI)
+    ╔═╗  [KV] QCF_kv 측정점 — Attention block 내부 1점
+         per-head O, aggregate over heads (Mean/Defensive softmax)
     ●    [W]  QCF_weight (importance) — 레이어 전체 입출력 비교
-         layer.forward() 직전·직후 hidden state mean-pool, 모든 layer entry 사용
-    ◀━━  [W]  QCF_weight (ε) — 7 weight tensor 정적 측정
-         secondary=Q4_0 조건, 모든 layer iterate, NaN layer 는 QCF_swap 제외
-  ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+         layer.forward() 직전·직후 hidden state mean-pool
+    ◀━━  [W]  QCF_weight (ε) — 7 개 weight tensor 정적 비교
+         secondary가 Q4_0 일 때만 계산, NaN layer 는 QCF_swap 제외
+  ─────────────────────────────────────────────────────────────
 ```
 
 코드 매핑 검증:
@@ -521,4 +512,3 @@ pub struct QcfEstimate {
 | 2026-04-27 | 초판 작성. 두 패밀리 정의, 7개 KV 액션 + swap + skip 수식 정리, 코드 위치 인덱스. |
 | 2026-04-27 | §1.1 Figure 1 (forward path 측정 위치), §1.2 Figure 2 (action → plane 매핑) 추가. 코드 위치 검증 표 동봉. |
 | 2026-04-27 | §1.1 Figure 1에 "Layer 차원 처리" Note 추가. §2.3에 액션별 Layer 차원 처리 표 추가 — KV eviction 4종은 layer 0 ad-hoc 경량 proxy(의도된 단순화)로 결정 명시. backlog `[P1]` CANCELLED. |
-| 2026-04-27 | §1.1 Figure 1을 단일 layer 단면 + 우측 "Layer Aggregation" 박스 동봉 버전으로 교체. 한 그림 안에 layer 차원 합산 식(QCF_kv = q_0 ad-hoc proxy / KIVI Mean / skip Σ-정규화 / swap imp·ε 가중 sum)을 모두 표기. |
