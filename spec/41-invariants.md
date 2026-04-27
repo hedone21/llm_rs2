@@ -3,7 +3,7 @@
 > **TL;DR**: llm_rs2 전체 스펙에 산재된 불변식(INV-*)을 한 곳에 수집하고,
 > 카테고리(Safety/Correctness/Performance/Compatibility)와
 > 검증 방법(static/runtime/test)으로 분류한다.
-> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) = 총 117개.
+> INV-001~076 (기존 59개) + INV-066~068 (CUDA 3개) + INV-080~085 (cross-cutting 6개) + INV-086~090 (LuaPolicy 5개, 2026-04) + INV-091~092 (Engine self-util 2개, 2026-04) + INV-093~105 (LuaPolicy DPP 13개, 2026-04) + INV-106~116 (LinUCB 11개, INV-113/114 제거; 9개 유효) + INV-117~119 (QCF × DPP 3개, 2026-04) + INV-120 (Plan × Partition 1개, 2026-04) + INV-121~125 (Dynamic Weight Swap Phase 1/2, 2026-04-24) + INV-126~128 (Weight Swap Phase 3 Manager 통합, 2026-04-24) + INV-129 (Weight Swap Phase 3.5 Plan invalidation, 2026-04-25) + INV-130 (Weight Swap Phase 3.6 Noshuffle SOA coherence, 2026-04-25) + INV-131~134 (Weight Swap Phase 3.7 SOA re-conversion + AUF format, 2026-04-25) + INV-135~136 (AUF lm_head Q4_0 사전 변환, Phase 6 Sprint G-1, 2026-04-26) + INV-137~139 (AUF v0.2 multi-dtype variant, 2026-04-27) = 총 120개.
 
 ## 1. Purpose and Scope
 
@@ -300,7 +300,9 @@
 
 2026-04-26 Phase 6 Sprint G-1 (AUF v0.1.1, lm_head Q4_0 사전 변환)의 불변식. 대응 명세: `33-engine-data.md` §3.22.12 (ENG-DAT-096.12), §3.22.13 (ENG-DAT-096.13), `arch/auf_format.md` §2.5b.
 
-**G-1-F update (INV-135 v2, 2026-04-26)**: 디바이스 측정에서 AUF v0.1.1의 lm_head SOA layout 사용이 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계 초과로 silent corruption(garbage 출력)을 유발함이 확인되었다. Llama 3.2 1B의 lm_head q_buf(`vocab × hidden / 8` = 32M texels)는 Adreno OpenCL의 image1d_buffer_t 한계를 초과하여 `image` 생성이 실패하고, forward 측의 `m=1` SOA fast path가 standard GEMV로 fall through하면서 SOA의 `d_buf`만 노출된 cl_mem을 AOS layout으로 잘못 해석한다. 따라서 lm_head Q4_0 entry는 **모든 backend variant에서 AOS 18B/block layout으로 동봉**한다 (INV-135 v2).
+**G-1-F update (INV-135 v2, 2026-04-26)**: 디바이스 측정에서 AUF v0.1.1의 lm_head SOA layout 사용이 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계 초과로 silent corruption(garbage 출력)을 유발함이 확인되었다. Llama 3.2 1B의 lm_head q_buf(`vocab × hidden / 8` = 32M texels)는 Adreno OpenCL의 image1d_buffer_t 한계를 초과하여 `image` 생성이 실패하고, forward 측의 `m=1` SOA fast path가 standard GEMV로 fall through하면서 SOA의 `d_buf`만 노출된 cl_mem을 AOS layout으로 잘못 해석한다. 따라서 lm_head entry는 **모든 backend variant에서 AOS 18B/block layout으로 동봉**한다 (INV-135 v2).
+
+**Sprint A' update (2026-04-27, v0.2)**: INV-135 v2의 의미가 분리된다. (1) **layout 의무**(Adreno SOA variant 안에서 AOS 강제)는 dtype-agnostic으로 유지되며, lm_head가 어떤 dtype(Q4_0/F16/...)이든 SOA 변환을 적용하지 않는다. (2) **dtype 단일성 의무**(Q4_0 single)는 폐기된다. lm_head도 layer weight와 동일하게 multi-dtype 후보 entry 그룹에 포함되어 dtype별 candidate가 다중 등장 가능하다. ENG-DAT-C16 갱신본과 INV-137 갱신본 참조.
 
 **교차 참조**:
 - **INV-132** (AUF reader rejection 의무): `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)는 미인식 시에도 reject 사유가 아니다 (optional). v0.1.0 reader가 v0.1.1 AUF를 읽어도 bit 2를 무시하고 정상 진입. INV-135/136은 신 reader(v0.1.1) 한정 의무.
@@ -310,8 +312,33 @@
 
 | ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
 |----|------|----------|---------|------|------|
-| INV-135 v2 | 33-engine-data §3.22.12 (ENG-DAT-096.12), §3.22.6 (ENG-DAT-096.6) | AUF의 `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)가 1이면 TENSOR_INDEX에 `kind = 11(lm_head)`, `dtype = 3(Q4_0)`, `shape = [vocab_size, hidden_dim]` entry가 정확히 1개 존재해야 하며, 해당 entry의 shape이 model load 시점의 모델 config(`vocab_size`, `hidden_dim`)와 일치해야 한다. **lm_head Q4_0 payload는 모든 backend variant에서 AOS 18B/block layout으로 동봉된다 (G-1-F fix)** — `WEIGHTS_ADRENO_SOA` section 내부에서도 lm_head는 SOA 변환을 적용하지 않고 raw GGUF Q4_0 bytes 그대로 보존한다. 이유: lm_head q_buf 크기(`vocab × hidden / 8` texels)가 `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 거의 모든 디바이스에서 초과하여 image1d_buffer_t 생성이 실패하고, 빠른 SOA path가 발동 불가능하므로 AOS layout이 의미 있다. shape mismatch 시 reader는 reject + 명시 에러 반환. AUF 헤더의 `source_hash`(hybrid)는 lm_head Q4_0 payload의 implicit identity 역할을 한다 — build 결정성(ENG-DAT-096.13) 보장 하에 source_hash 일치는 lm_head Q4_0 일치를 함의한다. 별도 lm_head hash field는 도입하지 않는다. | Correctness | runtime, test | reader 진입 시 검증. shape mismatch는 다른 모델용 AUF가 잘못 사용된 케이스. v1→v2: 2026-04-26 Sprint G-1-F garbage 출력 수정 (silent corruption). |
+| INV-135 v2 | 33-engine-data §3.22.12 (ENG-DAT-096.12), §3.22.6 (ENG-DAT-096.6) | AUF의 `capability_optional` bit 2(LM_HEAD_PRECOMPUTED_Q4_0)가 1이면 TENSOR_INDEX에 `kind = 11(lm_head)` entry가 적어도 1개 존재해야 하며, shape이 model load 시점의 모델 config(`vocab_size`, `hidden_dim`)와 일치해야 한다. **lm_head payload는 모든 backend variant에서 dtype-agnostic AOS 18B/block layout으로 동봉된다 (G-1-F fix + Sprint A' 일반화)** — `WEIGHTS_ADRENO_SOA` section 내부에서도 lm_head는 dtype에 무관하게(Q4_0이든 F16이든) SOA 변환을 적용하지 않고 AOS bytes 그대로 보존한다. 이유: lm_head q_buf 크기(`vocab × hidden / 8` texels 등 dtype별 환산)가 `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 거의 모든 디바이스에서 초과하여 image1d_buffer_t 생성이 실패하고, 빠른 SOA path가 발동 불가능하므로 AOS layout이 의미 있다. shape mismatch 시 reader는 reject + 명시 에러 반환. AUF 헤더의 `source_hash`(hybrid)는 lm_head payload의 implicit identity 역할을 한다 — build 결정성(ENG-DAT-096.13) 보장 하에 source_hash 일치는 lm_head 일치를 함의한다. 별도 lm_head hash field는 도입하지 않는다. **v0.2 multi-dtype 도입 후 (Sprint A' 반전)**: lm_head는 더 이상 single-dtype 분기가 아니며 layer weight와 동일하게 candidate dtype별 entry로 다중 등장 가능하다 (예: Q4_0 entry + F16 entry). 본 INV는 dtype 단일성을 요구하지 않으며 **layout 강제만 dtype-agnostic으로 적용된다** (ENG-DAT-C16 갱신본). | Correctness | runtime, test | reader 진입 시 검증. shape mismatch는 다른 모델용 AUF가 잘못 사용된 케이스. v1→v2: 2026-04-26 Sprint G-1-F garbage 출력 수정 (silent corruption). v0.2 Sprint A' (2026-04-27): lm_head dtype 단일 의무 폐기, layout 의무만 잔존 (dtype-agnostic AOS 강제). |
 | INV-136 | 33-engine-data §3.22.12 (ENG-DAT-096.12), `arch/auf_format.md` §2.5b | AUF의 `capability_optional` bit 2가 0이거나 AUF가 부재한 경우, model load는 기존 `quantize_lm_head_to_q4_0()` runtime fallback 경로로 정상 진행되어야 하며 lm_head dtype은 사용자 지정 `--quantize-lm-head` 값(`auto`/`none`/`q4_0`)에 따라 결정된다. `auto` + `--secondary-gguf`(또는 `--secondary-source`) 미설정 시 quantize skip(F16 유지). bit 0 시 AUF reader가 panic하거나 model load가 abort하면 안 된다. | Correctness | test | Sprint F 동작(v0.1.0 AUF + 신 코드) 보존. fallback 경로 회귀 방지. |
+
+### 3.18 AUF v0.2 Multi-dtype Variant Invariants [INV-137 ~ INV-139]
+
+2026-04-27 AUF v0.2 (multi-dtype variant)의 불변식. 대응 명세: `33-engine-data.md` §3.22.14 (ENG-DAT-097), §3.22.15 (ENG-DAT-098), §3.22.16 (ENG-DAT-099), `32-engine-algorithms.md` §3.12.18 (ENG-ALG-224, ENG-ALG-225), `arch/auf_format.md` §2.5c.
+
+**도입 컨텍스트**: AUF v0.1.x는 backend variant 다중성만 지원했다. v0.2는 동일 (backend, layer, kind) 쌍에 대해 여러 dtype 후보(예: Q4_0 + F16)를 한 AUF에 동시 보관할 수 있게 확장한다. dynamic weight swap의 secondary dtype payload를 GGUF 의존 없이 self-contained로 보관하기 위함. 단방향 swap 가정은 그대로 유지되며 SwapExecutor 인터페이스는 변경되지 않는다 (Q3, ENG-DAT-C17).
+
+**핵심 결정 (재확인, Sprint A' 반영)**:
+- Q1=B: section tag에 dtype suffix 안 넣음. TENSOR_INDEX entry-level dtype 필드 활용. SECTION_TAG_SIZE=24 / SectionEntry 48B layout 보존.
+- **Q2 (Sprint A' 반전)**: lm_head도 layer weight와 동일하게 multi-dtype 후보 entry 적용. dtype별 candidate entry(예: Q4_0 + F16) 다중 등장 가능. 단, INV-135 v2의 **layout 의무**(Adreno SOA variant 안에서 AOS 18B/block 강제)는 dtype에 무관하게 모든 lm_head entry에 적용된다. v0.1.1 시점의 "lm_head Q4_0 single dtype" 의미는 폐기됨.
+- Q5=B: capability_optional bit 3 = `MULTI_DTYPE_VARIANTS` 신설. format_major=0 그대로, format_minor 1→2 bump.
+- TensorIndex schema_version=1 보존 (v0.1.x reader 양방향 호환을 위해 schema bump 금지). entry 의미만 호환적으로 확장.
+
+**교차 참조**:
+- **INV-132** (AUF reader rejection 의무): `capability_optional` bit 3은 미인식 시에도 reject 사유가 아니다 (optional). v0.1.x reader가 v0.2 AUF를 읽어도 bit 3을 무시하고 first-match로 정상 진입.
+- **INV-133** (required section 카탈로그): multi-dtype 도입해도 6개 section tag 카탈로그는 불변. dtype은 section tag가 아닌 TENSOR_INDEX entry로 분기.
+- **INV-134** (section overlap 금지): dtype별 sub-payload는 동일 `WEIGHTS_<backend>` section 내부 인접 byte range로 배치되며 overlap 금지 의무는 그대로 적용된다.
+- **INV-135 v2** (lm_head AOS layout 의무, **dtype-agnostic**): v0.1.1에서는 lm_head Q4_0 single dtype + AOS layout 의미였으나, v0.2 Sprint A' 이후 **layout 의무만 잔존**한다. lm_head는 모든 candidate dtype 후보에 대해 multi-dtype entry로 등록 가능하지만, `WEIGHTS_ADRENO_SOA` variant section 안에서는 dtype에 무관하게 AOS 18B/block layout으로 동봉되어야 한다 (image1d_buffer_t 한계). ENG-DAT-C16 갱신본 참조.
+- **INV-122 v2.1** (단일-token 정확성 게이트): multi-dtype AUF로 swap된 경우에도 게이트 적용. dtype 변환 결정성(ENG-ALG-C12)이 보장되므로 게이트 통과 가능.
+
+| ID | 원본 | 한줄 요약 | 카테고리 | 검증 | 비고 |
+|----|------|----------|---------|------|------|
+| INV-137 | 33-engine-data §3.22.14 (ENG-DAT-097), ENG-DAT-C15 | AUF의 `capability_optional` bit 3(MULTI_DTYPE_VARIANTS)가 1이면, 동일 (`layer_idx`, `kind`)에 등록된 모든 dtype 후보 entry는 동일 `shape_rank`와 동일 `shape` 값을 가져야 한다. dtype은 byte representation을 바꾸지만 logical shape은 보존하기 때문이다. **lm_head(`kind = 11`)도 multi-dtype 후보 그룹에 포함**되어 layer weight와 동일하게 dtype별 candidate entry로 다중 등장 가능하며, 동일 shape 일치 의무가 그대로 적용된다 (Sprint A' 반전). lm_head SOA variant 내 layout 강제(AOS)는 본 INV의 검사 대상이 아니라 ENG-DAT-C16 / INV-135 v2의 별도 의무이다. 위반 시 reader는 `AufError::ShapeMismatch`로 reject. | Correctness | runtime, test | reader 진입 시 검증 + writer build 시 자동 충족. multi-dtype 일관성. lm_head 포함. |
+| INV-138 | 33-engine-data §3.22.15 (ENG-DAT-098), §3.22.16 (ENG-DAT-099), ENG-ALG-224 | AUF의 `capability_optional` bit 3 = 1이면, (a) META JSON에 `default_dtype` 필드가 반드시 존재해야 하며 그 값은 ENG-DAT-096.8의 dtype enum 중 하나여야 한다. (b) writer는 TENSOR_INDEX entries를 (`layer_idx` ASC, `kind` ASC, `is_default` DESC, `dtype` ASC)로 안정 정렬하여 default_dtype entry가 동일 (`layer_idx`, `kind`) 그룹의 가장 앞에 오도록 보장해야 한다. 이는 v0.1.x reader가 first-match 규칙으로 default_dtype을 자동 선택하도록 하는 호환 의무이다. (c) reader의 dtype selection precedence는 [호출자 명시 dtype → META.default_dtype → first-match] 순이다. 위반 시 reader는 `AufError::MalformedMeta { reason: "missing default_dtype with MULTI_DTYPE_VARIANTS" }` 또는 `AufError::DtypeNotAvailable`로 reject. | Correctness | runtime, test | writer 정렬 검증 + reader META 검증 + dispatch 정확성. v0.1.x reader 호환의 핵심. |
+| INV-139 | 33-engine-data §3.22.14 (ENG-DAT-097), §3.22.16 (ENG-DAT-099) | `capability_optional` bit 3 = `MULTI_DTYPE_VARIANTS`의 의미: 1 = "이 AUF에는 어딘가에 multi-dtype TENSOR_INDEX entry가 적어도 1쌍 존재하며, META에 `default_dtype`이 정의되어 있다". 0 = "single-dtype 모드이며 동일 (`layer_idx`, `kind`)에 entry가 1번씩만 등장한다". v0.1.x reader는 본 bit를 인식하지 못하지만 `capability_optional`이므로 reject 사유가 아니다 (INV-132와 호환). v0.1.x reader가 v0.2 AUF를 만나면 first-match 규칙으로 default_dtype 단일 모드로 안전하게 동작한다 (INV-138 writer 정렬 의무 덕분). format_minor 1(v0.1.x) ↔ 2(v0.2)는 bit 3 사용 여부와 정합되어야 한다 — bit 3 = 1이면 format_minor ≥ 2 필수, format_minor=2이지만 bit 3 = 0인 경우는 format_minor가 향후 다른 v0.2 변경을 위해 미리 bump된 케이스로 허용. | Correctness, Compatibility | runtime, test | bit 3 의미 + v0.1.x ↔ v0.2 reader 호환 매트릭스. |
 
 ## 4. Alternative Behavior
 
@@ -341,11 +368,11 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 
 | 카테고리 | 개수 | 비율 |
 |---------|------|------|
-| Safety | 19 | 22% |
-| Correctness | 63 | 73% |
+| Safety | 19 | 21% |
+| Correctness | 66 | 73% |
 | Performance | 2 | 2% |
-| Compatibility | 3 | 3% |
-| **합계** | **87** | **100%** |
+| Compatibility | 4 | 4% |
+| **합계** | **90** | **100%** |
 
 > **참고**: INV-113, INV-114는 v2.1.0에서 REMOVED (pessimistic safe set 제거). 카운트에서 제외.
 > INV-117~119는 v2.2.0 (QCF × DPP)에서 추가. INV-121~122는 Weight Swap Phase A에서 추가.
@@ -354,6 +381,7 @@ INV-025는 INV-024와 동일한 내용이다 (`len(results) == len(commands)`). 
 > INV-131은 Weight Swap Phase 3.7a (Adreno SOA 재변환 safety net)에서 추가. Correctness.
 > INV-132~134는 Weight Swap Phase 3.7b (AUF v0.1 포맷)에서 추가. INV-132는 Safety/Correctness 양쪽이며 Safety로 1회 카운트, INV-133/134는 Correctness.
 > INV-135~136은 Phase 6 Sprint G-1 (AUF v0.1.1 lm_head Q4_0 사전 변환)에서 추가. 둘 다 Correctness — INV-135는 shape/identity 일치 검증, INV-136은 후방 호환 fallback 보존.
+> INV-137~139는 AUF v0.2 multi-dtype variant (2026-04-27)에서 추가. INV-137/138은 Correctness, INV-139는 Correctness/Compatibility 양쪽이며 Compatibility로 1회 카운트한다 (v0.1.x ↔ v0.2 reader 호환 의무).
 > INV-122는 v2(2026-04-25, Phase 4 정확성 측정 기반)로 임계값 재정의. 이전 절대값(top-5 ≥ 0.9, top-1 ≥ 0.95)이 Q4_0 + 1B 환경에서 물리적으로 도달 불가함이 확인되어, NMSE ≤ 0.01 (절대) + Δ Top-1 ≤ 1 pp (vs single-dtype baseline)로 변경. ID/카운트는 변동 없음.
 > **INV-122 v2.1 (2026-04-26, Phase 5 Sprint A 진단 기반)**: 측정 단위를 **단일-token next-token logit**(prefill 종료 직후 첫 1개 logit)으로 명시적으로 고정. Sprint A 100-prompt × 4-ratio sweep에서 32-token decode 누적 drift로 ratio=0.25에서도 Δtop-1=44.85pp 관측 — 측정-임계값 미스매치 진단. 정확성 회귀(garbage 출력 등)는 0건. 임계값 자체(NMSE ≤ 0.01, Δ top-1 ≤ 1 pp)는 v2와 동일하나 측정 단위가 단일-token으로 고정. Decode window metric은 보조 sanity로 분리. ID/카운트는 변동 없음. Phase 4 자료(NMSE mean=0.0062, Δ top-1=+0.33pp)는 v2.1 기준으로도 PASS.
 
@@ -407,7 +435,7 @@ INV-002 (NEON ARM64 한정):
 
 ### 예시 3: Safety 카테고리 불변식 전체 목록
 
-Safety 카테고리 (18개) -- 위반 시 크래시/데이터 손실/하드웨어 손상 가능:
+Safety 카테고리 (19개) -- 위반 시 크래시/데이터 손실/하드웨어 손상 가능:
 
 | ID | 요약 |
 |----|------|

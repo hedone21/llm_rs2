@@ -841,9 +841,9 @@ classDiagram
 - 소비처: ENG-ALG-215 (layer 선택), ENG-ALG-217 (QCF_swap 공식), ENG-ALG-218 (QcfEstimate 응답).
 - 불변식: INV-127 (NaN layer 제외), INV-128 (QcfEstimate payload 누수 금지).
 
-### 3.22 AUF (Argus Unified Format) v0.1.1 — Self-Contained Weight Asset [ENG-DAT-096]
+### 3.22 AUF (Argus Unified Format) v0.2 — Self-Contained Weight Asset [ENG-DAT-096]
 
-**[ENG-DAT-096]** `AUF`는 Weight Swap Phase 3.7에서 도입되는 **자립적(self-contained) 가중치 자산 포맷**이다. 단일 파일에 모델 메타데이터, tokenizer, tensor index, 그리고 backend별 사전 변환된 weight payload를 포함하며, GGUF 원본 없이도 Engine이 동작 가능하다. **multi-variant single file** 방식으로 모든 backend variant(Adreno SOA / CUDA AOS / CPU AOS)를 한 파일에 동시 보관할 수 있고, 배포 시 dead variant를 strip할 수 있다. v0.1.1(2026-04-26)에서 lm_head Q4_0 사전 변환(§3.22.12)이 추가되었다. *(MUST)*
+**[ENG-DAT-096]** `AUF`는 Weight Swap Phase 3.7에서 도입되는 **자립적(self-contained) 가중치 자산 포맷**이다. 단일 파일에 모델 메타데이터, tokenizer, tensor index, 그리고 backend별 사전 변환된 weight payload를 포함하며, GGUF 원본 없이도 Engine이 동작 가능하다. **multi-variant single file** 방식으로 모든 backend variant(Adreno SOA / CUDA AOS / CPU AOS)를 한 파일에 동시 보관할 수 있고, 배포 시 dead variant를 strip할 수 있다. v0.1.1(2026-04-26)에서 lm_head Q4_0 사전 변환(§3.22.12)이 추가되었다. v0.2(2026-04-27)에서 동일 (backend, layer, kind) 쌍에 대해 여러 dtype 후보를 한 AUF에 동시 보관하는 **multi-dtype variant**(§3.22.14~§3.22.16)가 추가되었다. *(MUST)*
 
 **파일 식별**:
 
@@ -937,6 +937,11 @@ v0.1 reader/writer가 인식하는 section tag 목록. 6개로 시작하며, cap
 **Writer 의무**:
 - Mode B (self-contained) 생성 시 `META`/`TOKENIZER`/`TENSOR_INDEX`는 항상 포함.
 - `WEIGHTS_*` 중 최소 1개 이상 포함 (그렇지 않으면 useless asset). 권장은 build 시점에 모든 backend variant 포함.
+
+**v0.2 multi-dtype 도입 영향 (cross-reference §3.22.14)**:
+- v0.2의 multi-dtype variant 기능은 `WEIGHTS_*` section **카탈로그를 변경하지 않는다**. 새 dtype을 위한 별도 section tag를 신설하지 않으며 (예: `WEIGHTS_ADRENO_SOA_F16`은 신설 금지), 모든 dtype payload는 기존 `WEIGHTS_<backend>` section 내부에 함께 동봉된다.
+- TENSOR_INDEX entry가 multi-dtype을 표현한다 (§3.22.14, ENG-DAT-097). entry당 dtype은 1개이며, 동일 (layer_idx, kind) 쌍에 대해 dtype별로 별도 entry가 등장한다.
+- 위 6개 카탈로그 항목 + INV-133의 required section 목록은 v0.2에서도 그대로 유지된다.
 
 #### 3.22.5 무결성 / Alignment 규약 [ENG-DAT-096.5]
 
@@ -1097,6 +1102,8 @@ TENSOR_INDEX section payload layout:
 
 **lm_head dtype downgrade (v0.1.1, ENG-DAT-096.12 참조)**: TENSOR_INDEX의 cross-layer tensor entry는 **AUF build 시점에 backend-specific dtype downgrade가 적용된 결과**를 반영한다. 예를 들어 GGUF 원본의 lm_head가 F16일 때 build에서 `--include-lm-head-q4-0`(또는 default) 옵션으로 Q4_0 quantize한 경우, 해당 entry의 `dtype`은 Q4_0(=3), `shape`은 GGUF 원본 그대로(rows/cols 보존), `variant_offsets`는 backend variant section 내부의 사전 변환된 payload offset을 가리킨다. 이는 layer weight와 **동일한 variant 분기 규칙**(Adreno SOA / CUDA AOS / CPU AOS)을 따른다. dtype downgrade가 없는 build에서는 GGUF 원본 dtype이 그대로 보존된다.
 
+**Multi-dtype entry 의미 (v0.2, ENG-DAT-097 참조)**: 동일 (`layer_idx`, `kind`) 쌍에 대해 dtype이 다른 entry가 **여러 개** 등장할 수 있다. 예를 들어 layer 0의 attn_q에 대해 `dtype=Q4_0` entry와 `dtype=F16` entry가 동시 존재할 수 있으며, 각 entry의 `variant_offsets[i]`는 해당 backend variant section 내부의 dtype별 payload offset을 가리킨다. entry 개별의 binary layout은 §3.22.8 그대로 유지되며 (필드 순서, shape 표현, variant_offsets 의미 모두 불변), 다중 entry 등장 자체가 새로운 의미이다. 이는 **schema_version=1 안에서 호환적 확장**으로 처리되며 schema bump를 동반하지 않는다 — v0.1.x reader는 다중 entry 등장 시 §3.22.15(ENG-DAT-098)에서 정의하는 default_dtype 기반 disambiguation 또는 first-match 규칙으로 동작한다.
+
 #### 3.22.9 의미론 / 운영 모드 [ENG-DAT-096.9]
 
 **Mode B (self-contained, 본 spec의 운영 모드)**:
@@ -1202,23 +1209,129 @@ TENSOR_INDEX section payload layout:
 - 기존 v0.1.0 AUF (lm_head section 없음): capability_optional bit 2 = 0. 신 reader는 정상 fallback 동작 (capability_optional bit는 미인식해도 reject 사유가 아님).
 - 신 v0.1.1 AUF (lm_head section 포함): capability_optional bit 2 = 1. 구 reader(v0.1.0)는 bit 2를 인식하지 못하지만 capability_optional이므로 reject하지 않고 ignore. 구 reader는 lm_head를 GGUF에서 다시 quantize하는 fallback 경로를 거치므로 동작 정상 (단지 cold-start latency 비용이 남는다).
 
+**v0.2 multi-dtype 도입 시 lm_head 처리 (Sprint A' 결정 반영)**: AUF v0.2의 multi-dtype 의미(§3.22.14, ENG-DAT-097)는 lm_head에도 동일하게 적용된다. lm_head는 layer weight와 마찬가지로 dtype별 candidate entry로 등록될 수 있으며 (예: Q4_0 entry + F16 entry), reader의 dtype selection precedence(§3.22.15, ENG-DAT-098)는 lm_head에도 그대로 적용된다 — 호출자 명시 dtype → META.default_dtype → first-match 순.
+
+다만 INV-135 v2의 **layout 의무**는 dtype-agnostic으로 유지된다: `WEIGHTS_ADRENO_SOA` section 안에서 lm_head는 모든 dtype 후보에 대해 **AOS 18B/block layout**으로 동봉되며 SOA 변환을 적용하지 않는다. 근거는 v0.1.1과 동일 — lm_head q_buf 크기(`vocab × hidden / 8` texels)가 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 초과하여 image1d_buffer_t 생성이 실패하고 빠른 SOA path가 발동 불가능하기 때문이다 (Sprint G-1-F 측정). 따라서 dtype이 Q4_0이든 F16이든 lm_head SOA payload는 정확성이 깨진다 → AOS 강제. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 처음부터 AOS이므로 lm_head 처리는 일반 weight와 동일하며 dtype별 entry가 그대로 동봉된다.
+
+v0.1.1 시점의 "lm_head는 Q4_0 single dtype"이라는 결정은 v0.2 Sprint A'에서 **반전**된다. AOS layout 강제(INV-135 v2)는 그대로 유지되지만 dtype 단일성은 더 이상 요구되지 않는다. multi-dtype AUF에서 lm_head TENSOR_INDEX entry는 Q4_0 + F16(또는 다른 dtype) 다중으로 등장 가능하며, ENG-ALG-225 reader dispatch precedence가 그대로 적용된다.
+
 #### 3.22.13 결정성 요구사항 [ENG-DAT-096.13]
 
 **[ENG-DAT-096.13]** AUF writer는 동일 GGUF 입력 + 동일 build option + 동일 host platform → byte-level 동일 AUF 출력을 보장한다. *(MUST)*
 
-이는 build 재현성, regression test, deploy 검증의 기반이다. ENG-DAT-096.12 (lm_head Q4_0 downgrade)도 본 결정성 요구의 적용 대상이다. 다음을 포함한다:
+이는 build 재현성, regression test, deploy 검증의 기반이다. ENG-DAT-096.12 (lm_head Q4_0 downgrade) 및 ENG-DAT-097 (multi-dtype variant)도 본 결정성 요구의 적용 대상이다. 다음을 포함한다:
 
 - `quantize_q4_0` 결정성 (round-half-to-even, scale 계산 결정성).
+- F16 → F32 dequant 결정성 (bit-for-bit 변환, 외부 라이브러리 deterministic 호출 보장).
 - SOA convert 결정성 (입력 동일 시 출력 동일, host platform 한정).
-- META JSON 직렬화 순서 결정성 (key ordering 또는 별도 설정).
+- META JSON 직렬화 순서 결정성 (key ordering 또는 별도 설정). v0.2의 `default_dtype` 키는 기존 키 뒤에 append하여 byte prefix 보존.
 - TOKENIZER blob 직렬화 순서 결정성 (vocab index ordering).
-- TENSOR_INDEX entry 순서 결정성 (layer_idx 오름차순, layer 내부는 kind 오름차순).
+- TENSOR_INDEX entry 순서 결정성. v0.1.x: (`layer_idx` 오름차순, layer 내부는 `kind` 오름차순). v0.2 multi-dtype: (`layer_idx` ASC, `kind` ASC, `is_default` DESC, `dtype` ASC) 안정 정렬. 안정 정렬은 v0.1.x reader의 first-match가 default_dtype과 일치하도록 보장한다 (§3.22.15).
 - 헤더의 `created_by` field가 사용자 정의 값을 받지 않는 경우 cargo `CARGO_PKG_VERSION` 그대로 (build 환경 변수 의존 금지).
 
 **미보장 범위** (out of scope, 향후 v1.0 conformance):
 
 - 다른 host platform 간 byte-level 일치 (Linux x86_64 vs Linux ARM64 cross-build 등).
 - GPU driver 차이로 인한 SOA convert kernel 출력 차이 (writer는 host에서만 build하므로 v0.1.1에서는 영향 없음. SOA convert kernel은 host용 OpenCL 또는 reference CPU impl로 수행).
+
+#### 3.22.14 Multi-dtype Variant 의미 (v0.2) [ENG-DAT-097]
+
+**[ENG-DAT-097]** AUF v0.2에서 도입되는 의미. AUF build 시점에 동일 (`backend`, `layer_idx`, `kind`) 쌍에 대해 **여러 dtype 후보**(예: Q4_0, F16)를 한 파일에 동시 보관한다. dynamic weight swap의 후보 dtype 전체를 GGUF 의존 없이 self-contained AUF에 보관하기 위해 도입된다. *(MAY)*
+
+**도입 동기**:
+- v0.1.x에서는 swap의 secondary dtype은 GGUF 원본 또는 별도 GGUF에서 quantize되어야 했다. multi-dtype AUF는 secondary dtype payload도 self-contained로 보관하여 deploy 시 GGUF가 부재해도 dynamic swap 가능.
+- 단방향 swap 가정 (예: F16 → Q4_0 단방향, 역 swap 안 함) 하에서도 candidate dtype 양쪽이 모두 AUF 안에 있어야 swap이 의미 있다.
+
+**핵심 결정 (v0.2)**:
+
+1. **Section tag에 dtype suffix 안 넣음 (Q1=B 결정)**. `WEIGHTS_ADRENO_SOA_F16` 같은 신규 tag는 만들지 않는다. 모든 dtype payload는 기존 `WEIGHTS_<backend>` section 내부에 동봉된다. 이유: (a) section tag 카탈로그가 dtype 수만큼 곱하기로 늘어나면 strip / capability bit / reader switch logic이 폭발한다. (b) section table entry layout(`SECTION_TAG_SIZE = 24` byte 영역, §3.22.2의 48B entry)을 보존하여 v0.1.x reader가 tag를 그대로 파싱할 수 있다 (forward compat).
+
+2. **TENSOR_INDEX entry-level dtype 필드 활용 (Q1=B 결정)**. §3.22.8의 entry 스키마에 이미 존재하는 `dtype: u32` 필드를 dtype 분기 키로 사용한다. 동일 (layer_idx, kind) 쌍이 dtype별로 **여러 entry**로 등장한다. entry 자체의 binary layout은 변경되지 않으며, schema_version은 1 그대로 유지된다 (v0.1.x reader 양방향 호환을 위한 의도적 결정).
+
+3. **lm_head도 multi-dtype 후보 적용 (Sprint A' 결정)**. lm_head는 layer weight와 동일하게 dtype별 candidate entry로 등록 가능하다. 다만 INV-135 v2의 **layout 의무**(AOS 18B/block, `WEIGHTS_ADRENO_SOA` section 안에서도 SOA 변환 금지)는 dtype에 무관하게 모든 lm_head entry에 강제 적용된다. reader dispatch는 lm_head에 대해서도 §3.22.15(ENG-DAT-098)의 precedence(호출자 명시 → META.default_dtype → first-match)를 그대로 적용한다. v0.1.1 시점의 "lm_head Q4_0 single dtype" 결정은 본 v0.2 Sprint A'에서 반전되며, layout 강제만 잔존한다.
+
+4. **Capability bit 분리 (Q5=B 결정)**. multi-dtype 사용 여부는 신규 `capability_optional` bit 3 = `MULTI_DTYPE_VARIANTS`로 표현한다 (§3.22.16, ENG-DAT-099). reader는 bit 3을 인식하지 못해도 reject하지 않고 fallback 동작 (§3.22.15).
+
+5. **단방향 swap 가정 (Q3 결정)**. multi-dtype 도입은 SwapExecutor의 인터페이스(`engine/src/runtime/swap_executor.rs`)를 변경하지 않는다. AUF 내부에 candidate dtype 양쪽이 보관되어도, runtime swap 흐름은 기존 단방향(`primary → secondary`)을 그대로 유지한다. 양방향 swap은 본 spec 범위 밖이다 (v0.x 추후 capability에서 검토).
+
+6. **Format major/minor (Q5=B 결정)**. format_major=0 그대로 유지. format_minor는 1(v0.1.x)에서 2(v0.2)로 bump한다. format_patch는 0으로 리셋. 이유: capability_optional bit 신설은 의미적으로 minor 변경(additive 의미 확장)이며 v0.1.x patch 영역의 byte-level 호환 변경 범주를 넘어선다.
+
+**Per-(backend, layer, kind, dtype) 후보 표현**:
+
+| 시나리오 | TENSOR_INDEX 등장 entry 수 | capability_optional bit 3 |
+|---------|--------------------------|--------------------------|
+| 모든 layer가 Q4_0 단일 dtype (v0.1.x 등가) | 1 entry per (layer_idx, kind) | 0 |
+| 일부/전체 layer가 Q4_0 + F16 dual dtype | 2 entries per해당 (layer_idx, kind) | 1 |
+| 동일 layer가 Q4_0 단독, 다른 layer가 dual | 해당 layer만 2 entries | 1 (mixed) |
+
+bit 3 = 1이면 "이 AUF에는 어딘가에 multi-dtype entry가 적어도 1쌍 존재한다"를 의미한다. 모든 layer가 multi-dtype일 필요는 없다.
+
+**Required section 카탈로그 (INV-133)에 미치는 영향**: 없음. 6개 required/optional section tag 목록은 그대로 유지된다 (cf. §3.22.4 v0.2 multi-dtype 도입 영향 박스).
+
+#### 3.22.15 Dtype Selection Precedence (v0.2) [ENG-DAT-098]
+
+**[ENG-DAT-098]** Multi-dtype AUF에서 reader가 동일 (`layer_idx`, `kind`) 쌍의 여러 entry 중 어느 dtype을 선택할지 결정하는 규칙. *(MUST)*
+
+**Precedence (높음 → 낮음)**:
+
+1. **호출자 명시 dtype** (highest). reader API가 `(backend, dtype)` 튜플로 entry 조회를 요구하면 해당 dtype의 entry만 반환한다. 일치 entry가 없으면 fall-through.
+2. **META.default_dtype** (§3.22.16, ENG-DAT-099). 명시 dtype이 없으면 META section의 `default_dtype` 필드 값에 일치하는 entry를 반환한다. 일치 entry가 없으면 fall-through.
+3. **First-match in TENSOR_INDEX order** (lowest). 위 둘 모두 fall-through 시 TENSOR_INDEX에서 등장 순서가 가장 빠른 entry를 반환한다. 결정성을 위해 writer는 entry를 (`layer_idx ASC`, `kind ASC`, `dtype ASC`) 순서로 직렬화하며 (ENG-DAT-096.13 결정성), 이 순서가 first-match의 결정 기준이 된다.
+
+**v0.1.x reader 호환 동작**:
+- v0.1.x reader는 호출자가 dtype을 명시하지 않는다 (해당 API 없음). META의 `default_dtype` 필드는 v0.1.x reader가 무시한다 (§3.22.16에서 v0.1.x reader가 unknown JSON 키를 무시함을 보장).
+- 따라서 v0.1.x reader는 항상 **first-match in TENSOR_INDEX order**로 동작한다.
+- v0.2 writer는 v0.1.x reader 호환을 위해 META에 `default_dtype` 값을 채우고 **TENSOR_INDEX entry 순서를 default_dtype이 가장 먼저 오도록 정렬**해서 first-match가 default_dtype과 일치하도록 보장해야 한다 (INV-138 v0.1.x 호환 의무). 결정성 요구(ENG-DAT-096.13)와 충돌하지 않도록, 정렬 키는 (`layer_idx ASC`, `kind ASC`, `is_default DESC`, `dtype ASC`)로 명시 — `is_default` 부울이 첫 정렬 키 다음에 들어가도록 안정 정렬을 보장한다.
+
+**v0.2 reader 동작**:
+- bit 3 = 1이면 multi-dtype을 인식한다. `(backend, dtype)` API 또는 `default_dtype` API를 통해 dtype 분기.
+- bit 3 = 0이면 single-dtype 모드로 동작 (TENSOR_INDEX에 동일 (layer_idx, kind) 쌍이 1번씩만 등장한다고 가정).
+
+**Reader 의무**:
+- 호출자가 명시한 dtype 또는 default_dtype과 일치하는 entry가 없으면 명시적 에러 (`AufError::DtypeNotAvailable { layer, kind, requested, available: Vec<DType> }`)를 반환한다.
+- panic 금지. capability bit 3 미인식 reader도 first-match로 정상 진입.
+
+#### 3.22.16 META `default_dtype` 필드 (v0.2) [ENG-DAT-099]
+
+**[ENG-DAT-099]** AUF v0.2에서 META section JSON에 추가되는 필드. multi-dtype AUF의 default dtype을 표현한다. capability bit 3 = `MULTI_DTYPE_VARIANTS`(`capability_optional` bit 3) 신설과 짝을 이룬다. *(MAY)*
+
+**META JSON schema 확장**:
+
+```json
+{
+  "architecture": "llama",
+  "n_layers": 16,
+  "n_heads_q": 32,
+  "n_kv_heads": 8,
+  "head_dim": 64,
+  "hidden_dim": 2048,
+  "ffn_dim": 8192,
+  "vocab_size": 128256,
+  "max_seq_len": 2048,
+  "rope": { "theta": 500000.0, "rotary_dim": 64, "scaling": null },
+  "rmsnorm_epsilon": 1.0e-5,
+
+  "default_dtype": "Q4_0"
+}
+```
+
+`default_dtype` 값은 다음 중 하나의 string: `"F32"`, `"F16"`, `"BF16"`, `"Q4_0"`, `"Q4_1"`, `"Q8_0"`, `"U8"`. ENG-DAT-096.8의 dtype enum과 1:1 대응한다.
+
+**Writer 의무**:
+- `capability_optional` bit 3 = 1인 multi-dtype AUF는 META에 `default_dtype` 필드를 **반드시** 포함해야 한다 (INV-138).
+- bit 3 = 0인 single-dtype AUF는 `default_dtype` 필드를 **선택적**으로 포함할 수 있다. 부재 시 단일 dtype으로 추정.
+- v0.1.x 호환을 위해 META JSON 직렬화에서 `default_dtype` 키는 기존 키들 뒤에 추가하여 byte-level prefix를 유지한다.
+
+**Reader 의무**:
+- v0.2 reader: bit 3 = 1이면 META에서 `default_dtype` 파싱. 부재 또는 unknown 값이면 `AufError::MalformedMeta { reason: "missing default_dtype with MULTI_DTYPE_VARIANTS bit set" }` 반환.
+- v0.1.x reader: META의 `default_dtype` 필드는 unknown JSON 키이므로 무시 (serde의 `#[serde(unknown_fields = "ignore")]` 동등). 다만 기존 META JSON parser는 모르는 필드를 reject할 수 있으므로, v0.1.x writer는 본 필드를 **추가하지 않는 것이 안전**하다. v0.2 writer는 v0.1.x reader가 `default_dtype` 키를 만나도 reject하지 않는지 호환성 매트릭스에서 확인되어야 한다 (호환성 검증은 `arch/auf_format.md` §4.5).
+
+**v0.1.x reader 호환 fallback 보장**:
+- v0.1.x reader가 v0.2 AUF를 만났을 때, capability bit 3은 optional이므로 reject 사유가 아니다 (INV-132). 다만 multi-dtype TENSOR_INDEX entry가 등장하면 first-match로 진입한다. 이 first-match는 writer 측에서 (§3.22.15)의 정렬 규칙으로 default_dtype에 자연 정렬되도록 보장된다. 즉 v0.1.x reader는 multi-dtype AUF를 default_dtype 단일 모드로 안전하게 사용 가능하다 (INV-137).
+
+**Cross-reference**:
+- INV-137 (multi-dtype variant 일관성), INV-138 (default_dtype 의무), INV-139 (capability bit 3 의미).
+- ENG-ALG-224 (multi-dtype writer payload build), ENG-ALG-225 (multi-dtype reader dispatch).
 
 ---
 
@@ -1255,6 +1368,12 @@ TENSOR_INDEX section payload layout:
 **[ENG-DAT-C13]** AUF v0.1 reader는 `format_major` 불일치, magic 불일치, 미인식 `capability_required` bit, required section 누락 중 어느 하나라도 발견하면 파일을 reject하고 panic 없이 명시적 에러를 반환한다. `source_hash` 불일치는 정보성 경고이며 reject 사유가 아니다 (Mode B 자립성 — INV-132). *(MUST)*
 
 **[ENG-DAT-C14]** AUF section 간 byte range overlap 금지. 모든 section은 `[header.payload_start_offset, file_size)` 내에 있어야 한다. tag는 unique. (INV-134 매핑) *(MUST)*
+
+**[ENG-DAT-C15]** AUF v0.2 multi-dtype variant(`capability_optional` bit 3 = 1)에서, 동일 (`layer_idx`, `kind`)에 등록된 모든 dtype 후보 entry는 동일 `shape_rank`와 동일 `shape` 값을 가져야 한다. dtype 변환은 byte representation을 바꾸지만 logical shape은 보존하기 때문이다. 위반 시 reader는 `AufError::ShapeMismatch { layer, kind }`로 reject. (INV-137 매핑) *(MUST)*
+
+**[ENG-DAT-C16]** (Sprint A' 반전) AUF v0.2 multi-dtype variant 사용 시, lm_head(`kind = 11`)는 layer weight와 동일하게 multi-dtype 분기 대상에 **포함**된다. lm_head TENSOR_INDEX entry는 dtype별 candidate(예: Q4_0 + F16)로 다중 등장 가능하며, reader는 §3.22.15(ENG-DAT-098)의 dtype selection precedence를 lm_head에도 동일하게 적용한다. 다만 `WEIGHTS_ADRENO_SOA` variant section 안에서 lm_head는 **모든 dtype 후보에 대해 AOS 18B/block layout으로 동봉되어야 하며 SOA 변환을 적용해서는 안 된다**(INV-135 v2 layout 의무는 dtype-agnostic). 근거: lm_head q_buf 크기는 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 초과하여 image1d_buffer_t 생성이 실패하고 SOA fast path가 발동 불가하므로 dtype과 무관하게 SOA로 저장된 lm_head는 정확성이 깨진다. `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 처음부터 AOS이므로 lm_head 처리도 일반 weight와 동일하다. v0.1.1의 "lm_head Q4_0 single" 의미는 본 제약에서 폐기되었으며, dtype 단일성은 요구되지 않는다. SOA variant 안에서 lm_head entry가 SOA layout으로 동봉되어 있으면 reader는 `AufError::LmHeadSoaForbidden`(또는 동등한 명시 에러)로 reject한다. *(MUST)*
+
+**[ENG-DAT-C17]** AUF v0.2 writer는 SwapExecutor 인터페이스 변경을 동반하지 않는다. multi-dtype payload 양쪽이 AUF에 보관되어도 runtime swap은 단방향(`primary → secondary`) 가정을 유지한다. 양방향 swap은 본 spec 범위 밖이며 향후 별도 capability bit으로 표현된다. *(MUST)*
 
 ## 6. Examples
 

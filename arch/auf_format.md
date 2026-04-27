@@ -1,11 +1,12 @@
 # AUF (Argus Unified Format) — Self-Contained Weight Asset Architecture
 
-> **상태**: Draft v0.1.1 (2026-04-26, Sprint G-1 lm_head Q4_0 사전 변환 추가).
-> **대상 spec**: `spec/33-engine-data.md` §3.22 (ENG-DAT-096, .12, .13), `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223), `spec/41-invariants.md` §3.16 (INV-132~135).
+> **상태**: Draft v0.2 (2026-04-27, multi-dtype variant 추가).
+> **대상 spec**: `spec/33-engine-data.md` §3.22 (ENG-DAT-096, .12, .13, .14, .15, .16), `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223), §3.12.18 (ENG-ALG-224, ENG-ALG-225), `spec/41-invariants.md` §3.16~3.18 (INV-132~139).
 > **연관 작업**:
 > - Phase 3.7a (ENG-ALG-222 / INV-131) — runtime SOA 재변환 safety net. AUF 부재 시 fallback 경로로 사용.
 > - Phase 6 Sprint G-1 (ENG-DAT-096.12 / INV-135) — lm_head Q4_0 사전 변환으로 model load 시점 ~1.4 s runtime quantize 비용 제거.
-> **작성**: 2026-04-25 (v0.1), 2026-04-26 (v0.1.1).
+> - **v0.2 multi-quant** (ENG-DAT-097~099 / INV-137~139) — dynamic weight swap의 secondary dtype payload를 self-contained AUF로 보관하여 GGUF 의존을 제거. SwapExecutor 인터페이스는 변경되지 않음 (단방향 swap 가정).
+> **작성**: 2026-04-25 (v0.1), 2026-04-26 (v0.1.1), 2026-04-27 (v0.2).
 
 ---
 
@@ -74,6 +75,23 @@ flowchart LR
 - Unigram tokenizer (`tokenizer_kind = 1`).
 - Cross-asset bundling (LoRA delta, fine-tune snapshot 등) — Mode C.
 - 자동 strip / 자동 cache 정책 — 사용자 피드백 후 v0.2에서 결정.
+
+### 1.3b v0.2 컴포넌트 매핑 (multi-dtype variant)
+
+v0.2에서 신규/변경된 컴포넌트:
+
+| 컴포넌트 | v0.1.x 동작 | v0.2 변경 | 대응 spec |
+|---------|------------|----------|----------|
+| `AufHeader` | format_minor=1, capability_optional bits 0~2 | format_minor=2, bit 3 = `MULTI_DTYPE_VARIANTS` 신설 | ENG-DAT-099 |
+| `SectionTable` | 6개 tag 카탈로그 | 변경 없음 (dtype은 section tag로 표현 안 함, Q1=B 결정) | ENG-DAT-097 |
+| `TENSOR_INDEX` | 동일 (layer, kind)에 entry 1개 | 동일 (layer, kind)에 dtype별 entry N개 (schema_version=1 보존) | ENG-DAT-097 |
+| `META` JSON | 모델 메타데이터만 | `default_dtype` 필드 추가 (capability bit 3 = 1일 때 의무) | ENG-DAT-099 |
+| `AufView::lookup_tensor` | `(layer, kind)` 기반 단일 lookup | `(layer, kind, requested_dtype: Option<DType>)` 기반 dispatch + precedence | ENG-DAT-098, ENG-ALG-225 |
+| `AufWriter::auf_build` | 단일 dtype 변환 | dtype별 dequant/requant 파이프라인 + 안정 정렬 | ENG-ALG-224 |
+| `auf-tool build` CLI | `--variants` | `--variants` + `--dtypes` + `--default-dtype` | ENG-ALG-224, §7.1 |
+| `SwapExecutor` | primary/secondary byte slice 받음 | **변경 없음** (Q3 단방향 swap 가정, ENG-DAT-C17) | INV-137~139 |
+
+**lm_head 처리 (Sprint A' 반전)**: lm_head도 layer weight와 동일하게 multi-dtype 후보 entry로 등록 가능하다. multi-dtype AUF에서 lm_head TENSOR_INDEX entry는 dtype별 candidate(예: Q4_0 + F16)로 다중 등장하며, reader dispatch precedence(ENG-ALG-225)도 lm_head에 동일 적용된다. 다만 **INV-135 v2의 layout 의무**(Adreno SOA variant 안에서 AOS 18B/block 강제, image1d_buffer_t 한계로 인함)는 dtype-agnostic으로 유지되며 모든 dtype 후보 entry에 동일하게 적용된다. v0.1.1의 "lm_head Q4_0 single dtype" 결정은 폐기되었으며, layout 강제만 잔존한다 (§2.5b는 v0.1.1 시점 의미를 보존하고, §2.5c가 v0.2 Sprint A'의 일반화된 처리를 다룬다).
 
 ---
 
@@ -493,6 +511,145 @@ flowchart TD
 - 디스크 절감: 377 MB / variant. 3-variant build 시 ~1.1 GB 절감.
 - model load 시간 절감: ~1.4 s (Galaxy S25 실측, Sprint F).
 
+### 2.5c Multi-dtype Variant (v0.2)
+
+**역할**: AUF build 시점에 동일 (`backend`, `layer_idx`, `kind`) 쌍에 대해 여러 dtype 후보(예: Q4_0 + F16)를 한 파일에 동시 보관. dynamic weight swap의 secondary dtype payload를 self-contained로 보관하여 deploy 시 GGUF 의존을 제거. **Sprint A' 반전 이후 lm_head(`kind = 11`)도 multi-dtype 후보 그룹에 포함**되어, layer weight와 동일한 dispatch 흐름을 거친다 (ENG-DAT-C16 갱신본). 단, Adreno SOA variant section 내부에서 lm_head sub-payload는 dtype에 무관하게 AOS 18B/block layout으로 동봉되며, 이는 INV-135 v2 layout 의무가 dtype-agnostic으로 유지되기 때문이다.
+
+**핵심 결정 (이미 채택, 재검토 X)**:
+
+| 결정 | 채택 | 근거 요약 |
+|------|------|----------|
+| **Q1=B**: section tag에 dtype suffix 안 넣음 | TENSOR_INDEX entry-level dtype 필드 활용. SECTION_TAG_SIZE=24 / SectionEntry 48B layout 보존 | section tag 카탈로그 폭발 방지. v0.1.x reader가 tag를 그대로 파싱 가능 (forward compat). |
+| **Q2 (Sprint A' 반전)**: lm_head도 multi-dtype 후보 entry 적용 | lm_head는 layer weight와 동일하게 dtype별 candidate(Q4_0 + F16 등) 다중 entry 등록 가능. INV-135 v2 **layout 의무만 dtype-agnostic으로 유지** | lm_head는 image1d_buffer_t 한계로 SOA path 사용 불가 (G-1-F)이지만, AOS layout이라면 dtype 다양성은 정확성에 영향이 없다. self-contained dynamic swap이 lm_head에도 적용 가능하도록 single-dtype 의무를 폐기. swap 대상 여부와는 별개. |
+| **Q3**: 단방향 swap 가정 | SwapExecutor 인터페이스 변경 없음 | `primary → secondary` 단일 방향 흐름 유지. AUF 내부에 candidate 양쪽 보관해도 runtime swap은 unchanged. |
+| **Q5=B**: capability_optional bit 3 신설 + format_minor 1→2 | 의미적으로 minor change (additive 의미 확장). format_major=0 그대로 | v0.1.x reader가 bit 3을 무시하고 first-match로 정상 진입 (INV-132 호환). |
+| TensorIndex schema_version | 1 그대로 유지 | v0.1.x reader 양방향 호환 위해 schema bump 금지. entry 의미만 호환적 확장. |
+
+**처리 흐름 (writer)**:
+
+```mermaid
+flowchart LR
+    A[GGUF 원본<br/>source_dtype = Q4_0 or F16] --> B{candidate_dtypes<br/>요청}
+    B -->|--dtypes Q4_0,F16| C{각 dtype별<br/>변환 파이프라인}
+    C -->|src=Q4_0, tgt=Q4_0| D[identity]
+    C -->|src=Q4_0, tgt=F16| E[dequant Q4_0→F32<br/>→ cast to F16]
+    C -->|src=F16, tgt=Q4_0| F[dequant F16→F32<br/>→ quantize_q4_0]
+    C -->|src=F16, tgt=F16| G[identity]
+    D --> H[per-variant convert<br/>SOA / CUDA AOS / CPU AOS]
+    E --> H
+    F --> H
+    G --> H
+    H --> I[backend variant section<br/>내부 sub-payload 배치<br/>cursor 기반 단조]
+    I --> J[TENSOR_INDEX entries<br/>dtype별 N개 per layer×kind<br/>안정 정렬<br/>layer ASC, kind ASC,<br/>is_default DESC, dtype ASC]
+    J --> K[META JSON<br/>+ default_dtype 키 append]
+    K --> L[Header<br/>format_minor=2<br/>capability_optional bit 3=1]
+    L --> M[atomic write]
+
+    style M fill:#c8e6c9
+    style J fill:#bbdefb
+```
+
+**처리 흐름 (reader dispatch)**:
+
+```mermaid
+flowchart TD
+    A[AufView::lookup_tensor<br/>layer, kind, requested_dtype] --> B[filter TENSOR_INDEX<br/>by layer + kind]
+    B --> C{candidates<br/>비어있음?}
+    C -->|Yes| ZA[Err TensorNotFound]
+    C -->|No| D{requested_dtype<br/>== Some?}
+    D -->|Yes| E{matching entry<br/>존재?}
+    E -->|Yes| F[return entry]
+    E -->|No| ZB[Err DtypeNotAvailable<br/>+ available list]
+    D -->|No| G{capability bit 3<br/>= 1 AND<br/>multi-dtype 모드?}
+    G -->|Yes| H{META.default_dtype<br/>matching entry?}
+    H -->|Yes| F
+    H -->|No| I[fall-through]
+    G -->|No| I
+    I --> J[return candidates 0<br/>first-match by sort order]
+
+    style F fill:#c8e6c9
+    style ZA fill:#ffcdd2
+    style ZB fill:#ffcdd2
+```
+
+**v0.1.x reader 호환 동작 (중요)**:
+
+```mermaid
+flowchart LR
+    A[v0.1.x reader] --> B[v0.2 AUF 진입]
+    B --> C{capability_optional<br/>bit 3 인식?}
+    C -->|미인식| D[ignore<br/>optional이므로 reject 아님<br/>INV-132 호환]
+    D --> E{TENSOR_INDEX<br/>다중 entry per layer,kind?}
+    E -->|Yes| F[first-match 규칙 사용<br/>requested_dtype API 없음]
+    F --> G{writer 안정 정렬<br/>덕분에 첫 entry는<br/>default_dtype}
+    G --> H[default_dtype payload<br/>단일 모드로 안전 동작<br/>INV-138 writer 의무]
+
+    style H fill:#c8e6c9
+```
+
+**INV-138의 writer 정렬 의무**가 v0.1.x reader 호환의 핵심이다. writer가 entries를 (`layer_idx` ASC, `kind` ASC, `is_default` DESC, `dtype` ASC)로 안정 정렬하면, v0.1.x reader의 first-match가 자연스럽게 default_dtype과 일치하게 된다.
+
+**인터페이스 (개념, ENG-ALG-225 매핑)**:
+
+```rust
+pub struct TensorIndexEntry {
+    pub layer_idx: u32,
+    pub kind: u32,
+    pub dtype: u32,             // v0.2: 동일 (layer_idx, kind)에 dtype별로 여러 entry
+    pub shape_rank: u32,
+    pub shape: Vec<u64>,
+    pub alignment: u64,
+    pub variant_offsets: Vec<u64>,
+    pub variant_sizes: Vec<u64>,
+}
+
+impl<'a> AufView<'a> {
+    /// pre: layer_idx, kind는 valid.
+    /// post (v0.2): requested_dtype 명시 시 해당 dtype entry 반환,
+    ///              미명시 시 META.default_dtype → first-match 순.
+    /// post (v0.1.x reader compat): requested_dtype 매개변수 자체가 없으므로 항상 first-match.
+    /// INV-137: 동일 (layer, kind)의 모든 dtype entry는 동일 shape.
+    /// INV-138: writer는 entries를 안정 정렬하여 default_dtype이 그룹 첫 번째.
+    /// INV-139: capability_optional bit 3 의미 + v0.1.x ↔ v0.2 호환.
+    pub fn lookup_tensor(&self, layer_idx: u32, kind: u32,
+                          requested_dtype: Option<DType>) -> Result<&TensorIndexEntry, AufError>;
+
+    /// post: capability_optional bit 3 검사 결과
+    pub fn multi_dtype_enabled(&self) -> bool;
+}
+
+pub struct ModelMeta {
+    // 기존 필드들...
+    /// v0.2: capability bit 3 = 1일 때 의무. None이면 single-dtype 모드.
+    pub default_dtype: Option<DType>,
+}
+```
+
+**Variant 변환 모듈 확장 (ENG-ALG-224)**: `convert_to_<variant>_for_dtype(tensors, dtype)` 형태로 dtype 매개변수를 추가한다. 기존 `convert_to_adreno_soa(layers)` 등은 v0.1.x 호환을 위해 wrapper로 유지하거나 deprecate한다 (implementation 단계에서 결정).
+
+**예외 처리 / fallback**:
+
+| 케이스 | 동작 |
+|--------|------|
+| AUF에 capability bit 3 = 0 (single-dtype) | v0.1.x 동작 그대로. requested_dtype 무시 또는 single dtype 일치 검증. |
+| capability bit 3 = 1이지만 META에 `default_dtype` 부재 | reject (`AufError::MalformedMeta`). INV-138 위반. |
+| `requested_dtype` 명시했지만 해당 entry 부재 | reject (`AufError::DtypeNotAvailable`) + available list. |
+| 동일 (layer, kind, dtype) 쌍에 entry가 2개 이상 | reject (`AufError::DuplicateTensorEntry`). writer build 시점에 자동 충족. |
+| 동일 (layer, kind) 다중 dtype shape 불일치 | reject (`AufError::ShapeMismatch`). INV-137 위반. |
+| Adreno SOA variant 안에서 lm_head sub-payload가 SOA layout으로 동봉됨 | reject (`AufError::LmHeadSoaForbidden`). INV-135 v2 layout 의무 + ENG-DAT-C16 갱신본 위반. dtype에 무관하게 AOS 강제. |
+| lm_head 다중 dtype entry shape 불일치 | reject (`AufError::ShapeMismatch`). INV-137이 lm_head 포함하도록 갱신됨 (Sprint A'). |
+| v0.1.x reader가 v0.2 AUF 만남 | optional bit 3 무시 + first-match → default_dtype 단일 모드 (INV-139). |
+
+**메모리/디스크 영향 (Llama 3.2 1B 기준, dual-dtype 예시)**:
+
+- Q4_0 layer weights: ~700 MB / variant.
+- F16 layer weights: ~2.6 GB / variant (4x 크기).
+- lm_head Q4_0 AOS: ~148 MB / variant.
+- lm_head F16 AOS: ~525 MB / variant (Sprint A' 반전: F16 후보가 추가될 때 동봉됨).
+- Q4_0 + F16 dual-dtype 1 variant (lm_head dtype별 동봉 포함): ~3.3 GB + lm_head F16 추가 ~+260 MB ≈ ~3.6 GB.
+- Q4_0 + F16 dual-dtype 3 variants (Adreno + CUDA + CPU): ~10.7 GB. Strip 후 1 variant: ~3.6 GB.
+- 비교: GGUF Q4_0 (~700 MB) + GGUF F16 (~2.6 GB) 양쪽 보관 시 디스크 사용량과 유사. AUF의 우위는 self-contained 단일 파일 + dynamic swap secondary 즉시 사용 가능. lm_head F16 추가분 ~+260 MB는 lm_head dynamic dtype 선택의 비용.
+
 ### 2.6 auf-tool CLI
 
 **역할**: AUF 자산을 만들고 검사하고 수정하는 사용자 인터페이스.
@@ -612,7 +769,20 @@ Llama 3.2 1B Q4_0 기준 대략적 크기 (실측 예상):
 | 헤더 필드 의미 변경 | no | format_major++. migration tool 제공 의무. |
 | Magic 변경 | no | 별도 포맷으로 처리 (사실상 발생 안 함). |
 
-### 4.5 미래 capability 후보
+### 4.5 호환성 매트릭스 (v0.1.0 / v0.1.1 / v0.2 reader × AUF)
+
+| Reader \ AUF | v0.1.0 (single-dtype) | v0.1.1 (lm_head Q4_0 동봉) | v0.2 (multi-dtype) |
+|--------------|----------------------|---------------------------|---------------------|
+| **v0.1.0 reader** | OK | OK (bit 2 optional, ignore + runtime quantize fallback) | OK (bit 3 optional, ignore + first-match → default_dtype 단일 모드, INV-139) |
+| **v0.1.1 reader** | OK (bit 2 = 0, runtime fallback) | OK (lm_head Q4_0 직접 매핑) | OK (bit 3 optional, ignore + first-match → default_dtype 단일 모드, INV-139) |
+| **v0.2 reader** | OK (single-dtype 인식) | OK (single-dtype + lm_head precomputed) | OK (multi-dtype dispatch + lm_head precomputed) |
+
+**호환성 보장의 핵심**:
+- v0.1.x reader가 v0.2 AUF를 안전하게 사용 가능한 이유는 (1) `capability_optional` bit 3은 미인식 시 reject 사유 아님 (INV-132), (2) v0.2 writer가 INV-138 안정 정렬 의무를 지켜 first-match가 default_dtype과 일치하도록 보장, (3) META의 `default_dtype` 필드는 unknown JSON key로 v0.1.x reader가 무시 (단, JSON parser가 unknown_fields = ignore 동작이어야 함 — 본 의무는 implementation 검증 항목).
+- v0.2 writer가 v0.1.x reader 호환 출력을 만들려면 `--dtypes Q4_0` 단독 빌드 (single-dtype, bit 3 = 0)를 사용한다. 이는 v0.1.1과 byte-level 동일한 출력 (lm_head Q4_0 동봉 옵션은 별도).
+- **lm_head 호환 (Sprint A' 반전 후)**: v0.1.x reader가 v0.2 mixed.auf를 만났을 때, lm_head의 dtype별 candidate entry 중 first-match가 자연스럽게 `default_dtype`의 lm_head entry와 일치한다 (writer 안정 정렬 의무). 즉 v0.1.x reader는 multi-dtype lm_head AUF를 default_dtype 단일 lm_head 모드로 안전하게 사용한다. 단, v0.1.x reader는 INV-135 v2의 layout 의무(AOS 강제)를 알지 못하므로, writer는 default_dtype의 lm_head entry를 v0.1.1 호환 layout(Q4_0 AOS)으로 채워두는 것을 권장한다 — `default_dtype = Q4_0`이면 v0.1.1과 byte-level 동일.
+
+### 4.6 미래 capability 후보
 
 | 후보 | 용도 | bit position 권고 |
 |------|------|-------------------|
@@ -620,34 +790,63 @@ Llama 3.2 1B Q4_0 기준 대략적 크기 (실측 예상):
 | `ZSTD_COMPRESSION` | section payload zstd 압축 | required bit 0 |
 | `IMAGE2D_PRECOMPUTED` | Adreno q_img가 device-specific texture format으로 사전 인코딩 | optional bit 1 |
 | `LM_HEAD_PRECOMPUTED_Q4_0` | lm_head 사전 Q4_0 양자화 (v0.1.1, **할당 완료**) | optional bit 2 |
+| `MULTI_DTYPE_VARIANTS` | 동일 (layer, kind)에 dtype별 다중 entry (v0.2, **할당 완료**) | optional bit 3 |
 | `LORA_DELTAS` | section tag `LORA_<name>` 도입, multi-asset bundle | required bit 1 (Mode C) |
-| `UNIGRAM_TOKENIZER` | TOKENIZER가 SentencePiece unigram 지원 | optional bit 3 (구 권고 bit 2에서 변경) |
+| `UNIGRAM_TOKENIZER` | TOKENIZER가 SentencePiece unigram 지원 | optional bit 4 (구 권고 bit 3에서 이동) |
+| `BIDIRECTIONAL_SWAP` | 양방향 swap 가정 (v0.2 단방향 가정의 확장) | optional bit 5 (예약) |
 
 ---
 
 ## 5. 다이어그램 모음
 
-### 5.1 Multi-variant AUF 파일 layout
+### 5.1 Multi-variant AUF 파일 layout (v0.2 multi-dtype)
 
 ```mermaid
 flowchart TB
-    subgraph FILE["model.auf (multi-variant, post-build)"]
-        H["[0..256) Header<br/>magic ARGUS_W<br/>format=v0.1<br/>section_count=6<br/>section_table_offset=256<br/>payload_start_offset=65536"]
+    subgraph FILE["model.auf (multi-variant + multi-dtype, post-build)"]
+        H["[0..256) Header<br/>magic ARGUS_W<br/>format_major=0, format_minor=2<br/>section_count=6<br/>capability_optional bit 2=1 (lm_head)<br/>capability_optional bit 3=1 (multi-dtype)"]
         T["[256..544) SectionTable<br/>6 entries × 48B"]
         P0["[544..65536) Padding<br/>0x00 fill"]
-        S1["META<br/>JSON (~2 KiB)<br/>required, not strippable"]
+        S1["META<br/>JSON ~2 KiB<br/>+ default_dtype = Q4_0<br/>required, not strippable"]
         S2["TOKENIZER<br/>~6 MiB BPE blob<br/>required, not strippable"]
-        S3["TENSOR_INDEX<br/>~64 KiB tensor metadata<br/>kind=11 lm_head entry 포함<br/>required, not strippable"]
-        S4["WEIGHTS_ADRENO_SOA<br/>~700 MiB<br/>strippable<br/>q_buf + d_buf + image2d hint<br/>+ lm_head Q4_0 AOS (v0.1.1, INV-135 v2)"]
-        S5["WEIGHTS_CUDA_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 128B align<br/>+ lm_head Q4_0 AOS (v0.1.1)"]
-        S6["WEIGHTS_CPU_AOS<br/>~700 MiB<br/>strippable<br/>18B block + 64B align<br/>+ lm_head Q4_0 AOS (v0.1.1)"]
+        S3["TENSOR_INDEX<br/>~128 KiB tensor metadata<br/>per layer×kind: dtype별 N entries<br/>안정 정렬 default first<br/>kind=11 lm_head: dtype별 entry (Sprint A')<br/>required, not strippable"]
+        S4["WEIGHTS_ADRENO_SOA<br/>~3.6 GB strippable<br/>= Q4_0 sub-payload (~700 MB)<br/>+ F16 sub-payload (~2.6 GB)<br/>+ lm_head Q4_0 AOS (~148 MB)<br/>+ lm_head F16 AOS (~525 MB) — INV-135 v2 dtype-agnostic"]
+        S5["WEIGHTS_CUDA_AOS<br/>~3.6 GB strippable<br/>= Q4_0 + F16 sub-payloads<br/>+ lm_head dtype별 AOS sub-payloads"]
+        S6["WEIGHTS_CPU_AOS<br/>~3.6 GB strippable<br/>= Q4_0 + F16 sub-payloads<br/>+ lm_head dtype별 AOS sub-payloads"]
         H --> T --> P0 --> S1 --> S2 --> S3 --> S4 --> S5 --> S6
     end
 
+    style S3 fill:#fff3e0
     style S4 fill:#c8e6c9
     style S5 fill:#bbdefb
     style S6 fill:#ffe0b2
 ```
+
+**dtype별 sub-payload 배치 (단일 variant 내부, Sprint A' 일반화)**:
+
+```mermaid
+flowchart LR
+    subgraph SECTION["WEIGHTS_ADRENO_SOA section payload"]
+        Q4["Q4_0 layer-weight sub-payload<br/>per-layer offsets<br/>SOA layout"]
+        F16["F16 layer-weight sub-payload<br/>per-layer offsets<br/>SOA layout"]
+        LMHQ["lm_head Q4_0<br/>AOS layout<br/>(INV-135 v2 layout 의무)"]
+        LMHF["lm_head F16<br/>AOS layout<br/>(INV-135 v2 dtype-agnostic)"]
+        Q4 --> F16 --> LMHQ --> LMHF
+    end
+
+    TIDX["TENSOR_INDEX entries<br/>layer 0 attn_q dtype=Q4_0 → variant_offset[0] = 0x0...<br/>layer 0 attn_q dtype=F16 → variant_offset[0] = 0x29...<br/>...<br/>layer_idx=u32::MAX kind=11 lm_head dtype=Q4_0 → variant_offset[0] = 0xN0...<br/>layer_idx=u32::MAX kind=11 lm_head dtype=F16 → variant_offset[0] = 0xN1..."]
+    TIDX -.references.-> Q4
+    TIDX -.references.-> F16
+    TIDX -.references.-> LMHQ
+    TIDX -.references.-> LMHF
+
+    style Q4 fill:#c8e6c9
+    style F16 fill:#bbdefb
+    style LMHQ fill:#ffe0b2
+    style LMHF fill:#ffe0b2
+```
+
+lm_head는 Adreno SOA variant 안에서도 모든 dtype에 대해 AOS layout으로 동봉된다 (image1d_buffer_t 한계). dtype별 candidate가 layer weight와 동일하게 ENG-ALG-225 reader dispatch precedence(호출자 명시 → META.default_dtype → first-match)를 따라 lookup된다.
 
 ### 5.2 Strip 전후 비교
 
@@ -759,20 +958,44 @@ auf-tool build
                                         on:   강제 quantize (이미 Q4_0이면 no-op)
                                         off:  skip (v0.1.0 호환 출력, capability bit 2 = 0)
 
+    [--dtypes <list>]                   v0.2 multi-dtype variant. comma-separated.
+                                        (예: Q4_0,F16). default: 단일 dtype = GGUF source dtype.
+                                        2개 이상이면 capability_optional bit 3 set, format_minor=2.
+                                        지원 dtype: Q4_0, F16, F32 (Phase 1 범위).
+    [--default-dtype <DTYPE>]           v0.2 multi-dtype variant. META.default_dtype 값.
+                                        --dtypes에 포함된 값이어야 함. default: --dtypes 첫 번째.
+
 auf-tool info <PATH>        헤더 + section 목록 + capability flags 출력
+                            v0.2: TENSOR_INDEX entry의 dtype별 분포도 표시 (예: layer 0 attn_q: [Q4_0, F16])
 
 auf-tool strip <PATH>
     --keep <list>           유지할 section tag (comma-separated)
+    [--keep-dtype <DTYPE>]  v0.2: 특정 dtype의 entry만 유지하고 나머지 dtype payload 제거 (선택, Phase 5)
     [--no-backup]           기본은 .auf.bak 자동 생성
 
 auf-tool verify <PATH>
     [--source <GGUF>]       제공 시 source_hash 일치도 검증
+    [--check-shapes]        v0.2: multi-dtype entry 간 shape 일치 검증 (INV-137)
 
 auf-tool repack             [Phase 5로 미룸. v0.1에서는 미구현]
     --input <STRIPPED>
     --source <GGUF>
     --add <list>
     --output <PATH>
+```
+
+**v0.2 사용 예**:
+
+```sh
+# Q4_0 + F16 dual-dtype build (default = Q4_0)
+auf-tool build --input model.gguf --output model.auf \
+               --variants WEIGHTS_ADRENO_SOA \
+               --dtypes Q4_0,F16 --default-dtype Q4_0
+
+# v0.1.x 호환 build (single-dtype, capability bit 3 = 0)
+auf-tool build --input model.gguf --output model_legacy.auf \
+               --variants WEIGHTS_ADRENO_SOA \
+               --dtypes Q4_0
 ```
 
 ### 7.2 Engine CLI 통합
@@ -792,10 +1015,15 @@ auf-tool repack             [Phase 5로 미룸. v0.1에서는 미구현]
 | 항목 | 위치 |
 |------|------|
 | 포맷 정의 (binary layout) | `spec/33-engine-data.md` §3.22 (ENG-DAT-096) |
-| Reader/Writer/Stripper 알고리즘 | `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223) |
+| Reader/Writer/Stripper 알고리즘 (v0.1.x) | `spec/32-engine-algorithms.md` §3.12.17 (ENG-ALG-223) |
+| **Multi-dtype Writer/Reader 알고리즘 (v0.2)** | `spec/32-engine-algorithms.md` §3.12.18 (ENG-ALG-224, ENG-ALG-225) |
+| **Multi-dtype entry 의미 (v0.2)** | `spec/33-engine-data.md` §3.22.14 (ENG-DAT-097) |
+| **Dtype Selection Precedence (v0.2)** | `spec/33-engine-data.md` §3.22.15 (ENG-DAT-098) |
+| **META `default_dtype` 필드 (v0.2)** | `spec/33-engine-data.md` §3.22.16 (ENG-DAT-099) |
 | Adreno SOA 재변환 (3.7a) | `spec/32-engine-algorithms.md` §3.12.16 (ENG-ALG-222), `arch/weight_swap.md` |
 | Phase 3.6 SOA registry coherence | `spec/32-engine-algorithms.md` §3.12.15 (ENG-ALG-221), `arch/weight_swap.md` |
-| 무결성 불변식 | `spec/41-invariants.md` §3.16 (INV-131~134) |
+| 무결성 불변식 (v0.1.x) | `spec/41-invariants.md` §3.16~3.17 (INV-131~136) |
+| **Multi-dtype 불변식 (v0.2)** | `spec/41-invariants.md` §3.18 (INV-137~139) |
 | CLI 사용 가이드 | `docs/auf_tool_guide.md` |
 | 버전별 변경 이력 | `docs/auf_format_changelog.md` |
 | Phase 3.7 TODO | `.agent/todos/feat_weight_swap.md` |

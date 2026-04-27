@@ -2330,6 +2330,230 @@ function auf_repack(stripped_auf: &Path,
 
 ---
 
+#### 3.12.18 AUF v0.2 Multi-dtype Writer / Reader 알고리즘 [ENG-ALG-224, ENG-ALG-225]
+
+**목적**: AUF v0.2(ENG-DAT-097, ENG-DAT-098, ENG-DAT-099) multi-dtype variant의 writer/reader 알고리즘을 정의한다. v0.1.1 algorithms (ENG-ALG-223)을 단일 dtype 가정에서 multi-dtype 가정으로 호환적으로 확장한다.
+
+##### 3.12.18.1 Writer: dtype-aware variant payload build [ENG-ALG-224]
+
+**[ENG-ALG-224]** AUF v0.2 writer는 입력 GGUF의 dtype과 사용자가 요청한 candidate dtype 집합 간의 변환 파이프라인(dequant/requant/identity)을 결정하고, 각 dtype payload를 backend variant section 내부에 deterministic하게 직렬화한다. *(MUST)*
+
+**입력**:
+- 원본 GGUF 경로 (단일 또는 다중).
+- 출력 AUF 경로.
+- variant 목록 (예: `WEIGHTS_ADRENO_SOA WEIGHTS_CUDA_AOS WEIGHTS_CPU_AOS`).
+- 사용자 요청 candidate dtype 목록 (CLI 옵션 `--dtypes` 등, 예: `Q4_0,F16`).
+- default dtype (CLI `--default-dtype` 또는 GGUF 원본 dtype에서 추론).
+
+**출력**: AUF 파일. `capability_optional` bit 3 = 1, META에 `default_dtype` 포함, TENSOR_INDEX에 dtype별 entry 등장.
+
+**의사코드** (ENG-ALG-223 §3.12.17.2 writer 흐름의 multi-dtype 확장):
+
+```
+function auf_build_v0_2(gguf_path: &Path,
+                        out_path: &Path,
+                        variants: &[VariantTag],
+                        candidate_dtypes: &[DType],
+                        default_dtype: DType) -> Result<()>:
+    // (1) GGUF 파싱 (기존 loader 재사용)
+    let gguf = parse_gguf(gguf_path)?
+    let source_dtype = gguf.layer_dtype()      // 일반적으로 단일 (Q4_0 또는 F16)
+
+    // (2) candidate_dtypes 정합성 검사
+    require(candidate_dtypes.contains(&default_dtype),
+            "default_dtype must be one of candidate_dtypes")
+    require(candidate_dtypes.len() >= 1)
+    if candidate_dtypes.len() == 1:
+        // single-dtype path (v0.1.x 호환)
+        return auf_build_v0_1_1(gguf_path, out_path, variants)
+
+    // (3) dtype별 layer 표현 준비
+    //     변환 파이프라인:
+    //     - source_dtype == target: identity (그대로 사용)
+    //     - source = Q4_0, target = F16: dequant Q4_0 → F32 → cast F32 → F16
+    //     - source = F16, target = Q4_0: dequant F16 → F32 → quantize_q4_0
+    //     - source = F16, target = F16: identity
+    //     - 그 외 조합은 v0.2 범위 밖, 명시 에러
+    let mut layer_tensors_per_dtype: HashMap<DType, Vec<LayerTensor>> = HashMap::new()
+    for dt in candidate_dtypes:
+        let tensors = match (source_dtype, dt):
+            (Q4_0, Q4_0) | (F16, F16) => gguf.layers.clone()
+            (Q4_0, F16) => dequant_q4_0_then_cast_to_f16(&gguf.layers)?  // round-trip 결정성 보장
+            (F16, Q4_0) => dequant_f16_then_quantize_q4_0(&gguf.layers)? // quantize_q4_0 결정성 (ENG-DAT-096.13)
+            (Q4_0, F32) => dequant_q4_0_to_f32(&gguf.layers)?            // 결정성 보장
+            (F16, F32) => cast_f16_to_f32(&gguf.layers)?                 // bit-for-bit
+            other => return Err("Unsupported dtype conversion {:?} -> {:?}", other.0, other.1)
+        layer_tensors_per_dtype.insert(dt, tensors)
+
+    // (4) 각 (variant, dtype) 조합 payload 변환
+    //     별도 section을 만들지 않고 한 variant section 내부에 dtype별 sub-payload를 cursor 기반으로 배치
+    let mut variant_payloads: HashMap<VariantTag, VariantPayload> = HashMap::new()
+    for variant in variants:
+        let mut variant_buf = Vec::new()
+        let mut sub_offsets: HashMap<DType, Vec<u64>> = HashMap::new()  // dtype → per-layer offset
+        for dt in candidate_dtypes:
+            let tensors = &layer_tensors_per_dtype[dt]
+            let dtype_payload = match variant:
+                ADRENO_SOA => convert_to_adreno_soa_for_dtype(tensors, dt)?
+                CUDA_AOS   => convert_to_cuda_aos_for_dtype(tensors, dt)?
+                CPU_AOS    => convert_to_cpu_aos_for_dtype(tensors, dt)?
+            // dtype별 sub-payload offset 기록 (per layer)
+            sub_offsets.insert(dt, dtype_payload.per_layer_offsets.iter()
+                                                .map(|o| variant_buf.len() as u64 + o)
+                                                .collect())
+            variant_buf.extend(dtype_payload.bytes)
+            variant_buf.pad_to(64) // intra-variant alignment
+        variant_payloads.insert(variant, VariantPayload {
+            bytes: variant_buf,
+            sub_offsets,  // dtype → per-layer absolute offset within variant section
+        })
+
+    // (5) TENSOR_INDEX entry 생성: dtype × (layer, kind) 조합당 1 entry
+    //     순서 결정성: (layer_idx ASC, kind ASC, is_default DESC, dtype ASC) 안정 정렬
+    //     Sprint A' 반전: lm_head(kind=11)도 모든 candidate dtype에 대해 entry 등록.
+    //     단, Adreno SOA variant 안에서 lm_head sub-payload는 dtype-agnostic AOS layout (INV-135 v2).
+    let mut entries: Vec<TensorIndexEntry> = Vec::new()
+    for layer_idx in 0..gguf.n_layers:
+        for kind in all_kinds_for_layer(layer_idx):
+            for dt in candidate_dtypes:
+                if !applies_to(kind, dt):  // dtype 변환 자체가 무효한 조합만 제외 (예: BF16→Q4_0 미지원)
+                    continue
+                let mut variant_offsets = Vec::new()
+                let mut variant_sizes   = Vec::new()
+                for variant in variants:
+                    let off = variant_payloads[variant].sub_offsets[dt][layer_idx]
+                    let size = variant_payloads[variant].dtype_layer_size(dt, layer_idx)
+                    variant_offsets.push(off)
+                    variant_sizes.push(size)
+                entries.push(TensorIndexEntry {
+                    layer_idx, kind, dtype: dt,
+                    shape_rank: shape_rank_of(kind),
+                    shape: shape_of(kind, &gguf),
+                    alignment: alignment_of(variant, dt),  // variant별 동일 (variant_offsets에서 표현)
+                    variant_offsets, variant_sizes,
+                })
+    entries.sort_by_key(|e| (e.layer_idx, e.kind, !(e.dtype == default_dtype), e.dtype as u32))
+    // is_default DESC: default_dtype entry가 같은 (layer, kind) 그룹의 가장 앞에 옴 → v0.1.x reader first-match 호환
+
+    // (6) META JSON 직렬화 (default_dtype 추가)
+    let mut meta = gguf.metadata.clone()
+    meta.set("default_dtype", default_dtype.as_str())  // 기존 키 뒤에 append
+    let meta_json = serialize_meta_json_deterministic(&meta)
+
+    // (7) TENSOR_INDEX 직렬화 (schema_version=1 그대로, entry 의미만 확장)
+    let tensor_index_blob = serialize_tensor_index(&entries)
+
+    // (8) 나머지는 ENG-ALG-223 §3.12.17.2와 동일 (TOKENIZER, section table, header)
+    let header = AufHeader {
+        magic: *b"ARGUS_W\0",
+        format_major: 0, format_minor: 2, format_patch: 0,    // v0.2
+        capability_required: 0,
+        capability_optional: 1u64 << 3,                       // bit 3 = MULTI_DTYPE_VARIANTS
+        ...
+    }
+    write_atomic(out_path, header, sections, payloads)?
+    Ok(())
+```
+
+**INV-138 v0.1.x 호환 의무**: writer는 entries를 정렬할 때 default_dtype entry가 동일 (`layer_idx`, `kind`) 그룹의 첫 번째로 오도록 보장해야 한다. 이는 v0.1.x reader가 first-match 규칙으로 default_dtype payload를 자동 선택하도록 만든다.
+
+**lm_head 처리 (Sprint A' 반전, ENG-DAT-C16, INV-135 v2)**:
+- lm_head(`kind = 11`)는 layer weight와 동일하게 candidate dtype 전체에 대해 entry로 등록된다. 즉 GGUF 원본이 F16이고 `--dtypes Q4_0,F16`이면 lm_head는 dtype=F16 + dtype=Q4_0 양쪽으로 등록되며, 변환 함수는 `dequant_f16_then_quantize_q4_0` / identity를 그대로 사용한다 (layer weight와 동일 파이프라인).
+- **`WEIGHTS_ADRENO_SOA` section 안에서 lm_head sub-payload는 dtype에 무관하게 AOS 18B/block layout으로 동봉**된다. `convert_to_adreno_soa_for_dtype(tensors, dt)` 호출 시 lm_head tensor는 별도 분기로 SOA 변환을 건너뛰고 AOS bytes로 직렬화한다. 근거는 §3.22.12 (Sprint G-1-F): lm_head q_buf 크기가 OpenCL `CL_DEVICE_IMAGE_MAX_BUFFER_SIZE` 한계를 초과하여 image1d_buffer_t 생성이 실패하고 SOA fast path가 발동 불가하므로 dtype에 무관하게 정확성이 깨진다.
+- `WEIGHTS_CUDA_AOS` / `WEIGHTS_CPU_AOS`는 처음부터 AOS이므로 lm_head 처리는 일반 weight와 동일하며 dtype별 sub-payload가 그대로 직렬화된다.
+- Writer 의사코드 의무: `convert_to_adreno_soa_for_dtype` 내부에서 lm_head tensor에 대해 `if kind == LM_HEAD { return aos_bytes(tensor, dt) } else { return soa_bytes(tensor, dt) }` 분기를 거친다. 이 분기는 dtype-agnostic이며 모든 candidate dtype에 동일 적용된다.
+
+**결정성 (ENG-DAT-096.13)**:
+- `dequant_q4_0_then_cast_to_f16`: Q4_0 → F32 (deterministic dequant) → F16 (round-half-to-even cast). 결과 byte 결정.
+- `dequant_f16_then_quantize_q4_0`: F16 → F32 (bit-for-bit) → quantize_q4_0 (round-half-to-even). 결과 byte 결정.
+- entry 정렬 키는 안정 정렬을 보장하여 동일 입력 → 동일 직렬화 순서.
+- lm_head AOS 동봉(Adreno SOA variant 내부)도 결정성 함수만 사용한다. AOS 18B/block 직렬화는 GGUF source dtype이 같으면 byte-level 동일.
+
+##### 3.12.18.2 Reader: multi-dtype dispatch [ENG-ALG-225]
+
+**[ENG-ALG-225]** AUF v0.2 reader는 호출자가 `(backend, dtype)` 튜플을 명시하면 해당 dtype entry를 반환하고, 미명시 시 META의 `default_dtype` → first-match 순으로 fallback한다. **이 precedence는 layer weight 및 lm_head(`kind = 11`) 모두에 동일하게 적용된다 (Sprint A' 반전)**. lm_head는 더 이상 single-dtype 분기가 아니며, multi-dtype AUF에서 lm_head dtype별 candidate entry가 다중 등장하면 layer weight와 동일한 dispatch 흐름으로 lookup된다. 다만 reader는 SOA variant section에서 lm_head sub-payload가 AOS layout으로 동봉되었음을 전제하여 매핑한다 (INV-135 v2 layout 의무, ENG-DAT-C16). *(MUST)*
+
+**의사코드**:
+
+```
+fn lookup_tensor(view: &AufView,
+                 layer_idx: u32,
+                 kind: u32,
+                 requested_dtype: Option<DType>) -> Result<&TensorEntry>:
+    let multi_dtype_enabled = (view.header.capability_optional >> 3) & 1 == 1
+
+    let candidates: Vec<&TensorEntry> = view.tensor_index.entries.iter()
+        .filter(|e| e.layer_idx == layer_idx && e.kind == kind)
+        .collect()
+
+    if candidates.is_empty():
+        return Err(AufError::TensorNotFound { layer_idx, kind })
+
+    // Precedence (ENG-DAT-098):
+    // 1. 호출자 명시 dtype
+    if let Some(dt) = requested_dtype:
+        for e in &candidates:
+            if e.dtype == dt:
+                return Ok(e)
+        return Err(AufError::DtypeNotAvailable {
+            layer: layer_idx, kind,
+            requested: dt,
+            available: candidates.iter().map(|e| e.dtype).collect()
+        })
+
+    // 2. META.default_dtype (v0.2 multi-dtype only)
+    if multi_dtype_enabled:
+        let default = view.meta.default_dtype
+            .ok_or(AufError::MalformedMeta { reason: "missing default_dtype with MULTI_DTYPE_VARIANTS" })?
+        for e in &candidates:
+            if e.dtype == default:
+                return Ok(e)
+        // fall-through to first-match
+
+    // 3. First-match in TENSOR_INDEX order (ENG-DAT-098 lowest precedence)
+    Ok(candidates[0])
+```
+
+**v0.1.x reader 호환 동작 (참조)**:
+- v0.1.x reader는 `requested_dtype` 매개변수 자체가 없다. 위 의사코드의 step 2도 비활성화 (capability bit 3 미인식).
+- 따라서 v0.1.x reader는 항상 step 3 (first-match)으로 진입한다.
+- v0.2 writer가 INV-138 의무를 지키면 first-match가 default_dtype과 일치한다 → 호환 보장.
+
+##### 3.12.18.3 secondary_mmap 통합
+
+`AufView`는 dtype별 `weights_range`를 노출한다. 호출자(SwapExecutor 또는 model load)는 다음 두 단계로 진입한다:
+
+1. **Primary load 시점**: `lookup_tensor(layer, kind, requested_dtype = primary_dtype)` 호출. primary dtype payload 매핑.
+2. **Swap 발동 시점**: `lookup_tensor(layer, kind, requested_dtype = secondary_dtype)` 호출. secondary dtype payload 매핑.
+
+**SwapExecutor 인터페이스 변경 없음 (Q3 단방향 가정)**: SwapExecutor는 여전히 `primary_buf` / `secondary_buf` 두 개의 byte slice를 받아 swap을 수행한다. multi-dtype은 secondary_buf의 출처를 GGUF에서 AUF로 이동시킬 뿐, swap 흐름 자체는 ENG-ALG-211(SwapExecutor batch 흐름) 그대로이다.
+
+##### 3.12.18.4 에러 처리 매트릭스 (v0.2 추가분)
+
+| 시나리오 | 동작 | 메시지 예 |
+|---------|------|----------|
+| `requested_dtype` 미존재 (v0.2 reader) | reject | "Layer 5 attn_q dtype Q8_0 not available. Available: [Q4_0, F16]" |
+| `MULTI_DTYPE_VARIANTS` bit 1 set이지만 META에 `default_dtype` 부재 | reject | "AUF declares MULTI_DTYPE_VARIANTS but META lacks default_dtype" |
+| 동일 (layer, kind, dtype) 쌍에 대한 중복 entry | reject | "TENSOR_INDEX has duplicate entry for layer=5 kind=attn_q dtype=Q4_0" |
+| 동일 (layer, kind)의 다중 dtype entry shape 불일치 | reject | "Layer 5 attn_q has shape mismatch across dtypes (Q4_0=[2048,2048], F16=[2048,2049])" (ENG-DAT-C15) |
+| lm_head 다중 dtype entry shape 불일치 | reject | "lm_head has shape mismatch across dtypes" (INV-137이 lm_head 포함) |
+| Adreno SOA variant 안에서 lm_head sub-payload가 SOA layout으로 동봉됨 | reject | "lm_head must use AOS layout in WEIGHTS_ADRENO_SOA (INV-135 v2 / ENG-DAT-C16)" |
+| v0.1.x reader가 v0.2 AUF 만남, bit 3 인식 못함 | warning | "AUF capability bit 3 (MULTI_DTYPE_VARIANTS) not understood; using first-match" (optional이므로 reject 아님) |
+
+**불변식 매핑**:
+- INV-137 (multi-dtype variant 일관성, lm_head 포함): 행 4 (layer weight shape mismatch), 행 5 (lm_head shape mismatch).
+- INV-138 (default_dtype 의무 / writer 정렬): 행 2 (META 부재).
+- INV-135 v2 (lm_head AOS layout 강제, dtype-agnostic) + ENG-DAT-C16: 행 6 (Adreno SOA variant 안 lm_head SOA layout reject).
+- INV-139 (capability bit 3 의미): 행 7 (v0.1.x ignore).
+
+**교차 참조**:
+- ENG-DAT-097 (multi-dtype entry 의미), ENG-DAT-098 (selection precedence), ENG-DAT-099 (META default_dtype).
+- ENG-DAT-C15/C16/C17 (제약).
+- ENG-ALG-223 (v0.1.x writer/reader, 본 알고리즘이 호환 확장).
+- `arch/auf_format.md` (컴포넌트 매핑, §2.5b 결정 사항).
+
+---
+
 ## 4. Alternative Behavior
 
 **KIVI 비활성 (`--kivi` 미지정)**: KiviCache 대신 KVCache를 사용. flush cycle, bit transition, incremental dequant 모두 비적용. QCF의 NMSE/OPR/AWQE proxy도 비생성.
@@ -2363,6 +2587,10 @@ function auf_repack(stripped_auf: &Path,
 **[ENG-ALG-C10]** AUF reader는 panic 없이 동작한다. 모든 무결성 위반은 `Result::Err`로 반환되며 진단용 메시지가 포함된다. (ENG-ALG-223 §3.12.17.6) *(MUST)*
 
 **[ENG-ALG-C11]** AUF writer는 atomic file replace를 사용한다 (`tempfile + rename`). 부분 write 상태가 외부에 노출되어서는 안 된다. (ENG-ALG-223 §3.12.17.2) *(MUST)*
+
+**[ENG-ALG-C12]** AUF v0.2 multi-dtype writer는 dtype 변환에서 deterministic 함수만 사용한다 (`quantize_q4_0` round-half-to-even, F16↔F32 bit-for-bit cast, dequant Q4_0→F32 결정성). 비결정성 dtype 변환(예: stochastic rounding) 도입은 별도 `format_minor` bump가 필요하다. (ENG-ALG-224 §3.12.18.1, ENG-DAT-096.13) *(MUST)*
+
+**[ENG-ALG-C13]** AUF v0.2 reader의 dtype dispatch는 panic 없이 동작한다. dtype 부재, default_dtype 누락, shape mismatch, lm_head dtype 위반 등 모든 케이스는 명시적 `Result::Err`로 반환된다. (ENG-ALG-225 §3.12.18.4) *(MUST)*
 
 ## 6. Examples
 
