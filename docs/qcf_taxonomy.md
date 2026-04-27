@@ -21,6 +21,144 @@ QCF는 **손실성(lossy) 액션이 모델 품질에 미치는 비용**을 [0, 1
 
 두 패밀리는 분자/분모의 정의 공간이 달라 **raw 값으로 직접 비교할 수 없다**. cross-action 비교는 `DegradationEstimator`(§5)를 통해 ΔPPL(추정 perplexity 증가량)로 환산한 뒤 가능하다.
 
+### 1.1 Figure 1 — Measurement Locations on the Forward Path
+
+단일 transformer decoder layer 내부에서 두 패밀리가 각각 어디를 측정하는지 표시한 그림이다. `QCF_kv`는 attention block 내부의 한 점(O = Σα·V), `QCF_weight`는 (a) 레이어 입출력의 동적 비교(importance)와 (b) weight tensor 공간의 정적 비교(ε) 두 곳에서 측정한다.
+
+```
+       x_in ──────────────────────────────●━━━━━━━ [W] x̄_in 캡처
+        │                                 │       (mean-pool over T tokens)
+        │                                 │       transformer.rs:1508
+        ▼                                 │
+   ╔═══════════════════════════════════╗  │
+   ║         ATTENTION BLOCK           ║  │  ┌─────────────────────────┐
+   ║                                   ║  │  │ [W] weight tensor 공간  │
+   ║   RMSNorm                         ║  │  │  (정적, 모델 로드 시 1회)│
+   ║      │                            ║  │  │                         │
+   ║      ▼                            ║  │  │  ε_t = ‖W_pri − W_sec‖²│
+   ║   QKV proj  (W_q, W_k, W_v) ◀━━━━━╫━━┿━━│           / ‖W_pri‖²    │
+   ║      │                            ║  │  │                         │
+   ║      ▼                            ║  │  │  ε_i = mean over        │
+   ║   RoPE + KV cache                 ║  │  │   {Q,K,V,O,gate,up,down}│
+   ║      │                            ║  │  │                         │
+   ║      ▼                            ║  │  │  조건: secondary = Q4_0 │
+   ║   softmax(QK^T/√d) · V            ║  │  │  *NaN ε layer 는 QCF_   │
+   ║      │                            ║  │  │   swap 의 분자/분모에서 │
+   ║      ▼                            ║  │  │   모두 제외 (INV-127)   │
+   ║   ╔══════╗                        ║  │  └─────────────────────────┘
+   ║   ║  O   ║◀━━━ [KV] QCF_kv 측정점 ║  │
+   ║   ║ Σα·V ║     ‖O_b − O_a‖₂      ║  │
+   ║   ╚══╤═══╝       / ‖O_b‖₂        ║  │
+   ║      │           per-head h ∈ KV  ║  │
+   ║      │           → aggregate      ║  │
+   ║      │           (Mean / Defensive║  │
+   ║      │            softmax)        ║  │
+   ║      ▼                            ║  │
+   ║   O proj  (W_o)            ◀━━━━━━╫━━┤
+   ╚══════╤════════════════════════════╝  │
+          │                               │
+          ●─── (+ residual from x_in)     │
+          │                               │
+          ▼                               │
+   ╔═══════════════════════════════════╗  │
+   ║         FFN BLOCK                 ║  │
+   ║                                   ║  │
+   ║   RMSNorm                         ║  │
+   ║      │                            ║  │
+   ║      ▼                            ║  │
+   ║   gate proj · up proj             ║  │
+   ║   (W_gate, W_up)           ◀━━━━━━╫━━┤
+   ║      │                            ║  │
+   ║      ▼                            ║  │
+   ║   SiLU · multiply                 ║  │
+   ║      │                            ║  │
+   ║      ▼                            ║  │
+   ║   down proj  (W_down)      ◀━━━━━━╫━━┘
+   ╚══════╤════════════════════════════╝
+          │
+          ●─── (+ residual)
+          │
+          ●━━━━━━ [W] x̄_out 캡처
+          │       importance_i = max(0, 1 − cos(x̄_in, x̄_out))
+          ▼       transformer.rs:1593
+       x_out
+
+  ─────────────────────────────────────────────────────────────
+  범례:
+    ╔═╗  큼직한 sub-block (Attention / FFN)
+    ╔═╗  [KV] QCF_kv 측정점 — Attention block 내부 1점
+         per-head O, aggregate over heads (Mean/Defensive softmax)
+    ●    [W]  QCF_weight (importance) — 레이어 전체 입출력 비교
+         layer.forward() 직전·직후 hidden state mean-pool
+    ◀━━  [W]  QCF_weight (ε) — 7 개 weight tensor 정적 비교
+         secondary가 Q4_0 일 때만 계산, NaN layer 는 QCF_swap 제외
+  ─────────────────────────────────────────────────────────────
+```
+
+코드 매핑 검증:
+
+| 그림 요소 | 코드 위치 |
+|---|---|
+| `x̄_in` 캡처 (Attention block 진입 직전) | `engine/src/models/transformer.rs:1508~1511` (`snapshot_before` 호출이 `layer.forward()` 직전) |
+| `x̄_out` 캡처 (FFN block 출력 후) | `engine/src/models/transformer.rs:1593~1601` (`record_after` 호출이 `layer.forward()` 직후) |
+| `importance_i = max(0, 1 − cos)` | `engine/src/core/qcf/layer_importance.rs:219~220` |
+| `O = Σα·V`, per-head | `engine/src/core/qcf/unified_qcf.rs:92, 134~149` |
+| Head aggregation | `engine/src/core/qcf/mod.rs::aggregate_heads:108` |
+| `ε_t = ‖W_pri − W_sec‖²_F / ‖W_pri‖²_F` | `engine/src/models/weights/noise_table.rs:307~318` |
+| `ε_i = mean over 7 tensors` | `engine/src/models/weights/noise_table.rs:87~95, 109~134` |
+| secondary dtype 조건 | `engine/src/models/weights/noise_table.rs:228` (`if info.dtype != DType::Q4_0 → skip`) |
+| NaN ε layer 제외 | `engine/src/models/weights/noise_table.rs:131` (NaN 마킹) + `engine/src/models/weights/decider.rs:203~208` (분자/분모 filter) |
+
+### 1.2 Figure 2 — Action → Measurement Plane Mapping
+
+5개 KV 액션이 모두 `QCF_kv` 평면(attention output)으로 모이고, 2개 weight 액션이 모두 `QCF_weight` 평면(layer scalar)으로 모인다. 두 평면 사이는 단절되어 있어 cross-family 비교는 `DegradationEstimator`로 ΔPPL을 거쳐야만 가능하다.
+
+```
+   ┌─────────────────┐                              ┌─────────────────┐
+   │   KV Actions    │                              │ Weight Actions  │
+   └─────────────────┘                              └─────────────────┘
+
+  ┌─────────────────┐                              ┌─────────────────┐
+  │ Sliding evict   │──┐                        ┌──│ Weight swap     │
+  ├─────────────────┤  │                        │  │ (F16 → Q4_0)    │
+  │ H2O evict       │──┤                        │  ├─────────────────┤
+  ├─────────────────┤  │                        │  │ Layer skip      │
+  │ Streaming evict │──┼──▶ ╔══════════════╗   │  │ (SWIFT)         │
+  ├─────────────────┤  │    ║              ║   │  └────────┬────────┘
+  │ D2O merge       │──┤    ║   QCF_kv     ║   │           │
+  ├─────────────────┤  │    ║              ║   │           ▼
+  │ KIVI quant      │──┘    ║  ‖ΔO‖ / ‖O‖  ║   │   ╔══════════════╗
+  └─────────────────┘       ║  per-head    ║   │   ║  QCF_weight  ║
+                            ║  attn output ║   └──▶║              ║
+                            ╚══════╤═══════╝       ║  imp · ε     ║
+                                   │               ║  layer scalar║
+                                   │               ╚══════╤═══════╝
+                                   │                      │
+                                   │  ✗ raw 비교 불가     │
+                                   │   (측정 평면 다름)   │
+                                   │                      │
+                                   ▼                      ▼
+                          ┌───────────────────────────────────┐
+                          │    DegradationEstimator           │
+                          │    (per-action piecewise-linear)  │
+                          │                                   │
+                          │    QCF  ──▶  ΔPPL                 │
+                          └───────────────┬───────────────────┘
+                                          │
+                                          ▼
+                                  ╔═══════════════╗
+                                  ║   ΔPPL        ║ ◀── 유일한
+                                  ║ (공통 단위)   ║     cross-action
+                                  ╚═══════════════╝     비교 평면
+```
+
+핵심 메시지:
+
+1. KV 액션 5종 → `QCF_kv` 평면(attention output)에 모두 모임 → 패밀리 내부 raw 비교 가능.
+2. Weight 액션 2종 → `QCF_weight` 평면(layer scalar)에 모두 모임 → 패밀리 내부 raw 비교 가능.
+3. 두 평면 사이는 단절 — 직접 raw 비교 불가.
+4. cross-family 비교가 필요하면 `DegradationEstimator`(§5)로 ΔPPL 환산이 유일한 다리.
+
 ---
 
 ## 2. QCF_kv — KV 캐시 액션 패밀리
@@ -360,3 +498,4 @@ pub struct QcfEstimate {
 | 날짜 | 내용 |
 |---|---|
 | 2026-04-27 | 초판 작성. 두 패밀리 정의, 7개 KV 액션 + swap + skip 수식 정리, 코드 위치 인덱스. |
+| 2026-04-27 | §1.1 Figure 1 (forward path 측정 위치), §1.2 Figure 2 (action → plane 매핑) 추가. 코드 위치 검증 표 동봉. |
