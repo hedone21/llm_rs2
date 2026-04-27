@@ -21,6 +21,7 @@
    - [2.10 Prompt Batch (배치 추론)](#210-prompt-batch-배치-추론)
    - [2.11 Layer Skip (레이어 건너뛰기)](#211-layer-skip-레이어-건너뛰기)
    - [2.12 Chat (멀티턴 REPL / 소켓 IPC)](#212-chat-멀티턴-repl--소켓-ipc)
+   - [2.13 Weight Swap (AUF / Secondary GGUF)](#213-weight-swap-auf--secondary-gguf)
 3. [Manager 가이드](#3-manager-가이드)
    - [3.1 기본 실행](#31-기본-실행)
    - [3.2 Lua 정책 스크립팅](#32-lua-정책-스크립팅)
@@ -1209,6 +1210,121 @@ generate ... --chat \
 
 ---
 
+### 2.13 Weight Swap (AUF / Secondary GGUF)
+
+런타임에 decoder layer weight를 secondary 자산(다른 dtype)으로 교체하는 기능. Phase 2~Phase 6에서 단계적으로 도입되었다. **Sprint G-1 (2026-04-26) 종결** 기준으로 v0.1.1 AUF 포맷 + lm_head Q4_0 사전 변환을 지원한다.
+
+#### 2.13.1 무엇이고 언제 쓰는가
+
+| 입력 | 자산 | 비고 |
+|------|------|------|
+| Primary | `--model-path <X>.gguf` 또는 Safetensors 디렉토리 | 추론 시작 시 로드되는 모델 |
+| Secondary | `--secondary-gguf <Y>.gguf` 또는 `<Y>.auf` | swap 시점에 layer가 교체될 대안 dtype 자산 |
+
+**언제**:
+- Memory 압박/정확도 trade-off 실험 (Q4 ↔ F16 swap)
+- 디바이스 배포 — primary는 빠른 dtype, secondary는 정밀 dtype을 보관
+- Phase 6 mixed-mode benchmark — `--force-swap-ratio`로 전 layer를 secondary로 교체하여 baseline TBT 측정
+
+**확장자 자동 분기**: `.gguf`는 GGUF reader, `.auf`는 AUF reader (zero-copy mmap, backend variant 사전 변환). 기능적으로 동등하나 AUF는 디바이스 배포 시 GGUF 부재 환경에서도 동작.
+
+#### 2.13.2 핵심 CLI 플래그
+
+| 플래그 | 설명 |
+|--------|------|
+| `--secondary-gguf <PATH>` | secondary 자산 (`.gguf` 또는 `.auf`). 미지정 시 weight swap 경로 비활성. |
+| `--force-swap-ratio <FLOAT>` | 0.0–1.0. 추론 시작 직전에 decoder layer의 X 비율을 secondary로 교체. `--secondary-gguf` 필수. |
+| `--secondary-dtype <auto\|q4_0\|f16>` | v0.2 multi-quant AUF에서 swap 시 선택할 dtype. 기본 `auto` — AUF META `default_dtype` 우선, 없으면 TENSOR_INDEX first-match. 단일 dtype AUF (v0.1.x)에서는 무시됨. |
+| `--swap-dir <DIR>` | swap 시 mmap에 사용할 임시 디렉토리. 미지정 시 OS 기본. |
+| `--quantize-lm-head <auto\|q4_0\|none>` | 로드 시점 lm_head Q4_0 변환 (Sprint F). 기본 `auto` — `--secondary-gguf` 지정 + lm_head가 F16/F32일 때만 변환. |
+| `--tokenizer-path <PATH>` | tokenizer.json 경로. 같은 디렉토리에 sibling 모델이 있을 때 명시 권장 (자동 감지가 다른 tokenizer를 잡으면 garbage 출력). |
+
+#### 2.13.3 GGUF secondary 시나리오 (가장 단순)
+
+```bash
+# F16 primary + Q4_0 secondary, 50% layer swap
+./target/release/generate \
+  -m models/llama3.2-1b-f16.gguf \
+  --secondary-gguf models/llama3.2-1b-q4_0.gguf \
+  --force-swap-ratio 0.5 \
+  -b opencl --prompt "Hello" -n 50
+
+# 100% swap (mixed-mode baseline)
+./target/release/generate \
+  -m models/llama3.2-1b-f16.gguf \
+  --secondary-gguf models/llama3.2-1b-q4_0.gguf \
+  --force-swap-ratio 1.0 \
+  --quantize-lm-head q4_0 \
+  -b opencl --prompt "Hello" -n 50
+```
+
+> Adreno GPU에서 ratio=1.0 mixed 측정 시 `--quantize-lm-head q4_0`을 명시하면 Q4 baseline 비용에 맞춘다. `auto`는 `--secondary-gguf` 지정 시 자동 활성이지만, 명시적으로 강제하는 게 진단용으로 안전.
+
+#### 2.13.4 AUF secondary 시나리오 (디바이스 배포 권장)
+
+GGUF 두 개를 들고 다니는 대신 AUF 한 개로 통합. **권장 경로는 `scripts/convert_to_auf.sh`** — Safetensors/GGUF 입력에서 한 번에 AUF를 만든다 (auf_tool 빌드/호출, 중간 GGUF 정리, tokenizer 자동 탐색까지 포함).
+
+```bash
+# Safetensors → AUF (한 번에)
+scripts/convert_to_auf.sh \
+    --input  models/llama3.2-1b/ \
+    --output models/llama3.2-1b.auf \
+    --variants all
+
+# 이미 GGUF가 있으면 단계 1 건너뜀
+scripts/convert_to_auf.sh \
+    --input  models/llama3.2-1b-q4_0.gguf \
+    --output models/llama3.2-1b.auf \
+    --variants all
+
+# v0.2 multi-quant: Q4_0 + F16 동시 보관 (default = Q4_0)
+scripts/convert_to_auf.sh \
+    --input  models/llama3.2-1b-q4_0.gguf \
+    --output models/mixed.auf \
+    --variants all \
+    --dtypes q4_0,f16 \
+    --default-dtype q4_0
+```
+
+세부 옵션 (`--outtype`, `--include-lm-head`, `--keep-gguf` 등)은 `scripts/convert_to_auf.sh --help` 참조. 저수준 단계별 호출이 필요하면 `auf_tool` 바이너리를 직접 사용:
+
+```bash
+# 워크스테이션에서 1회 (수동 경로)
+cargo build --release -p llm_rs2 --bin auf_tool
+./target/release/auf_tool build \
+    --input     models/llama3.2-1b-q4_0.gguf \
+    --tokenizer models/llama3.2-1b/tokenizer.json \
+    --output    models/llama3.2-1b.auf \
+    --variants  all \
+    --include-lm-head auto
+
+# 디바이스에 push (디바이스 backend variant만 남기고 strip)
+./target/release/auf_tool strip \
+    --keep META,TOKENIZER,TENSOR_INDEX,WEIGHTS_ADRENO_SOA \
+    models/llama3.2-1b.auf
+adb push models/llama3.2-1b.auf /data/local/tmp/
+
+# 디바이스 추론 — AUF는 zero-copy mmap, GGUF 부재 환경에서도 동작
+adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
+  -m /data/local/tmp/models/llama3.2-1b-f16.gguf \
+  --secondary-gguf /data/local/tmp/llama3.2-1b.auf \
+  --force-swap-ratio 1.0 \
+  -b opencl --prompt 'Hello' -n 50"
+```
+
+상세 옵션 (`info`, `verify`, lm_head AOS 예외, 트러블슈팅): `docs/auf_tool_guide.md` 참조.
+
+#### 2.13.5 트러블슈팅
+
+- **`--force-swap-ratio requires --secondary-gguf`**: secondary 자산을 같이 지정해야 함.
+- **AUF 추론 시 garbage 출력 (lm_head 관련)**: AUF v0.1.0 (capability_opt=0)을 사용 중일 가능성. v0.1.1 AUF로 다시 build (`--include-lm-head auto`). 또는 이미 v0.1.1이지만 `WEIGHTS_ADRENO_SOA` 안에 lm_head가 SOA로 들어 있으면 Adreno image limit (~16M texels) 때문에 GEMV가 fall-through되어 발생. Sprint G-1-F fix(INV-135 v2) 이후 모든 variant에서 lm_head는 AOS로 동봉되므로 최신 toolchain으로 재빌드/재AUF build로 해결.
+- **TBT 측정 시 swap 비용 포함**: `Decode: X ms/tok` 로그는 swap 완료 이후의 정상 decode 비용. 초기 prefill 직전 `swap` 단계 비용은 stderr "WeightSwap..." 로그 참조.
+- **메모리 회수 부족**: Phase 4 Sprint C-1/2/3 이후 PRIMARY drop 자동화. `--force-swap-ratio < 1.0`이면 일부 primary layer 유지가 정상.
+
+세부 메커니즘과 실측: `arch/weight_swap.md`, `results/data/weight_swap/`.
+
+---
+
 ## 3. Manager 가이드
 
 ### 3.1 기본 실행
@@ -2268,3 +2384,14 @@ python scripts/run_device.py -d pixel --deploy-eval generate --prompt "Hello" -n
 | `--system-prompt` | — | 세션 시작 시 프리필되는 system 턴 문자열 |
 | `--chat-socket` | — | Unix domain socket 경로. newline-delimited 입력, 응답 바이트 스트리밍 + `0x04` EOT 종결 (Unix 전용) |
 | `--chat-tcp` | — | TCP listen 주소(예: `127.0.0.1:7878`, `127.0.0.1:0`). `--chat-socket`과 동시 사용 가능 |
+
+### Weight Swap (AUF / Secondary GGUF)
+
+| 플래그 | 기본값 | 설명 |
+|--------|--------|------|
+| `--secondary-gguf` | — | secondary 자산 경로 (`.gguf` 또는 `.auf`). 미지정 시 weight swap 비활성 |
+| `--force-swap-ratio` | — | 0.0–1.0. 추론 시작 직전 swap할 decoder layer 비율. `--secondary-gguf` 필수 |
+| `--secondary-dtype` | `auto` | v0.2 multi-quant AUF에서 swap 시 선택할 dtype (`auto` / `q4_0` / `f16`). `auto`는 AUF META `default_dtype` 우선 → first-match. 단일 dtype AUF (v0.1.x)에서는 무시됨 |
+| `--swap-dir` | — | swap mmap에 사용할 디렉토리 (미지정 시 OS 기본) |
+| `--quantize-lm-head` | `auto` | `auto` / `q4_0` / `none`. `auto`는 `--secondary-gguf` 지정 + lm_head F16/F32일 때만 Q4_0 변환 |
+| `--tokenizer-path` | 자동 감지 | tokenizer.json 경로. 디렉토리에 sibling 모델이 있으면 명시 권장 |
