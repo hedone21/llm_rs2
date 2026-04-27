@@ -2306,6 +2306,149 @@ fn main() -> anyhow::Result<()> {
     if args.eval_ll {
         let questions = load_eval_questions(&args, &prompt)?;
 
+        // ── QCF-dump prelude: --eval-ll + --qcf-dump + --force-swap-ratio ────
+        // When all three flags are active we run warmup prefill → ImportanceTable
+        // → WeightSwapDecider → SwapExecutor before the eval loop.  This mirrors
+        // the PPL/generation QCF-dump workflow (line ~2417) but uses the eval
+        // questions' prompt text instead of a corpus file for the warmup input.
+        let eval_ll_qcf_start = std::time::Instant::now();
+        let mut eval_ll_qcf_importance: Option<llm_rs2::core::qcf::ImportanceTable> = None;
+        let mut eval_ll_qcf_decision: Option<llm_rs2::models::weights::decider::SwapDecision> =
+            None;
+
+        if args.qcf_dump.is_some()
+            && let Some(force_ratio) = args.force_swap_ratio
+        {
+            use llm_rs2::core::buffer::DType as LDType;
+            use llm_rs2::core::qcf::ImportanceCollector;
+            use llm_rs2::memory::galloc::Galloc as WGalloc;
+            use llm_rs2::models::weights::decider::WeightSwapDecider;
+            use llm_rs2::models::weights::swap_executor::SwapExecutor;
+
+            let warmup_n = args.qcf_warmup_tokens.max(1);
+
+            // ── Step 1: build warmup token sequence from eval questions ───────
+            // Concatenate question prompt fields (separated by "\n\n") and take
+            // the first warmup_n tokens.  If fewer tokens are available, use
+            // whatever we have and emit a warning.
+            let warmup_ids = build_eval_ll_warmup_text(&questions, warmup_n, &tokenizer);
+
+            if warmup_ids.is_empty() {
+                // Soft failure: skip prelude instead of aborting the whole eval run.
+                eprintln!(
+                    "[QCF-dump] WARNING: eval-ll warmup token sequence is empty; \
+                     prelude skipped (swap will use uniform fallback)"
+                );
+            } else {
+                let actual_warmup_len = warmup_ids.len();
+                eprintln!(
+                    "[QCF-dump] eval-ll warmup prefill: {} tokens",
+                    actual_warmup_len
+                );
+
+                // ── Step 2: warmup prefill with ImportanceCollector ───────────
+                let mut collector = ImportanceCollector::new();
+                {
+                    let warmup_buf = WGalloc::new().alloc(actual_warmup_len * 4, DType::U8)?;
+                    unsafe {
+                        let ptr = warmup_buf.as_mut_ptr() as *mut u32;
+                        for (i, &id) in warmup_ids.iter().enumerate() {
+                            *ptr.add(i) = id;
+                        }
+                    }
+                    let cpu_warmup = Tensor::new(
+                        Shape::new(vec![1, actual_warmup_len]),
+                        warmup_buf,
+                        Arc::new(CpuBackend::new()),
+                    );
+                    let warmup_input = backend.copy_from(&cpu_warmup)?;
+
+                    let warmup_logits_buf =
+                        memory.alloc(actual_warmup_len * vocab_size * 4, DType::F32)?;
+                    let mut warmup_logits = Tensor::new(
+                        Shape::new(vec![1, actual_warmup_len, vocab_size]),
+                        warmup_logits_buf,
+                        backend.clone(),
+                    );
+
+                    model.forward_into(TransformerModelForwardArgs {
+                        input_tokens: &warmup_input,
+                        start_pos: 0,
+                        kv_caches: &mut kv_caches,
+                        backend: &backend,
+                        memory: memory.as_ref(),
+                        logits_out: &mut warmup_logits,
+                        x_gen: None,
+                        workspace: None,
+                        score_accumulator: None,
+                        profiler: None,
+                        skip_config: None,
+                        importance_collector: Some(&mut collector),
+                        logits_last_only: false,
+                        variance_collector: None,
+                        prefill_workspace: None,
+                    })?;
+                    backend.synchronize()?;
+                }
+
+                // ── Step 3: build ImportanceTable + reset KV cache ────────────
+                let imp_table = collector.build();
+                eprintln!(
+                    "[QCF-dump] eval-ll ImportanceTable built: {} entries",
+                    imp_table.len()
+                );
+                // Reset so the eval loop starts with a clean KV cache.
+                for kv in kv_caches.iter_mut() {
+                    kv.current_pos = 0;
+                }
+
+                // ── Step 4: swap with importance-guided decider ───────────────
+                let ratio = force_ratio.clamp(0.0, 1.0);
+                let decider = WeightSwapDecider {
+                    importance: Some(&imp_table),
+                    noise: Some(model.quant_noise.as_ref()),
+                    n_decoder_layers: model.layers.len(),
+                    currently_swapped: &[],
+                };
+                let decision = decider.decide(ratio);
+
+                if !decision.selected_layers.is_empty() {
+                    let swap_memory = WGalloc::new();
+                    let swap_backend: Arc<dyn Backend> = gpu_backend_arc
+                        .as_ref()
+                        .cloned()
+                        .unwrap_or_else(|| cpu_backend_arc.clone());
+                    let executor =
+                        SwapExecutor::new(LDType::Q4_0, &model.config, swap_backend, &swap_memory);
+                    match executor.execute(&model, &decision.selected_layers) {
+                        Ok(report) => {
+                            eprintln!(
+                                "[QCF-dump] eval-ll swap: ratio={:.2}, layers={}/{}, \
+                                 qcf_pred={:.4}, fallback={}, latency={:.1}ms",
+                                ratio,
+                                report.swapped.len(),
+                                model.layers.len(),
+                                decision.qcf_swap_estimate,
+                                decision.fallback_used,
+                                report.latency_ms,
+                            );
+                        }
+                        Err(e) => {
+                            anyhow::bail!("[QCF-dump] eval-ll swap failed: {}", e);
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "[QCF-dump] eval-ll swap: ratio={:.2} → 0 layers selected (qcf=0.0)",
+                        ratio
+                    );
+                }
+
+                eval_ll_qcf_decision = Some(decision);
+                eval_ll_qcf_importance = Some(imp_table);
+            }
+        }
+
         let ratio_mode = args.kv_budget_ratio > 0.0;
         let budget_mode = args.kv_budget > 0 || ratio_mode;
 
@@ -2378,6 +2521,58 @@ fn main() -> anyhow::Result<()> {
             &eval_config,
             skip_config.as_ref(),
         )?;
+
+        // ── QCF-dump JSON (eval-ll mode) ──────────────────────────────────────
+        if let Some(ref dump_path) = args.qcf_dump {
+            use llm_rs2::eval::qcf_helpers::{QcfSwapDumpContext, dump_qcf_swap_json};
+
+            let empty_swap: Vec<usize> = Vec::new();
+            let (swap_set, qcf_predicted, fallback_used) =
+                if let Some(ref dec) = eval_ll_qcf_decision {
+                    (
+                        dec.selected_layers.as_slice(),
+                        dec.qcf_swap_estimate,
+                        dec.fallback_used,
+                    )
+                } else {
+                    (empty_swap.as_slice(), 0.0f32, false)
+                };
+
+            let secondary_path_str = args.secondary_gguf.as_ref().and_then(|p| p.to_str());
+            let model_arch = if args.model_path.to_lowercase().contains("qwen") {
+                "qwen2"
+            } else {
+                "llama"
+            };
+            let total_wall = eval_ll_qcf_start.elapsed().as_secs_f64();
+
+            let ctx = QcfSwapDumpContext {
+                model_arch,
+                model_path: &args.model_path,
+                secondary_path: secondary_path_str,
+                primary_dtype: "F16",
+                secondary_dtype: "Q4_0",
+                num_layers: model.layers.len(),
+                force_swap_ratio: args.force_swap_ratio,
+                swap_set,
+                qcf_swap_predicted: qcf_predicted,
+                fallback_used,
+                importance_table: eval_ll_qcf_importance.as_ref(),
+                noise_table: Some(model.quant_noise.as_ref()),
+                ppl: None,
+                avg_nll: None,
+                n_eval_tokens: 0,
+                wall_time_s: total_wall,
+                warmup_tokens: args.qcf_warmup_tokens,
+                backend: &args.backend,
+                kv_type: &args.kv_type,
+                ppl_corpus: None,
+                eval_ll_output: Some(&output),
+            };
+
+            dump_qcf_swap_json(dump_path, &ctx)?;
+            eprintln!("[QCF-dump] eval-ll JSON written to {}", dump_path.display());
+        }
 
         let mut json_val = serde_json::from_str::<serde_json::Value>(&output.to_json()?)?;
         json_val["config"] = serde_json::json!({
@@ -2622,6 +2817,7 @@ fn main() -> anyhow::Result<()> {
                 backend: &args.backend,
                 kv_type: &args.kv_type,
                 ppl_corpus: Some(ppl_path.as_str()),
+                eval_ll_output: None,
             };
 
             dump_qcf_swap_json(dump_path, &ctx)?;
@@ -6104,6 +6300,7 @@ fn main() -> anyhow::Result<()> {
             backend: &args.backend,
             kv_type: &args.kv_type,
             ppl_corpus: None,
+            eval_ll_output: None,
         };
 
         dump_qcf_swap_json(dump_path, &ctx)?;
@@ -6818,6 +7015,56 @@ fn load_eval_questions(
         }
     }
     Ok(questions)
+}
+
+/// Build a warmup token sequence from the eval-ll question set.
+///
+/// Concatenates the `prompt` fields of the questions (separated by `"\n\n"`),
+/// tokenizes the result, and returns at most `max_tokens` token IDs.
+/// If fewer tokens are produced than requested, a warning is emitted but the
+/// function succeeds — the caller handles the reduced warmup gracefully.
+///
+/// Returns an empty Vec when tokenization fails entirely (non-fatal).
+fn build_eval_ll_warmup_text(
+    questions: &[llm_rs2::eval::EvalQuestion],
+    max_tokens: usize,
+    tokenizer: &tokenizers::Tokenizer,
+) -> Vec<u32> {
+    // Join question prompts.
+    let combined: String = questions
+        .iter()
+        .map(|q| q.prompt.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    if combined.is_empty() {
+        eprintln!("[QCF-dump] WARNING: all eval questions have empty prompts; warmup skipped");
+        return Vec::new();
+    }
+
+    let enc = match tokenizer.encode(combined.as_str(), true) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!(
+                "[QCF-dump] WARNING: warmup tokenize error: {}; warmup skipped",
+                e
+            );
+            return Vec::new();
+        }
+    };
+
+    let ids: Vec<u32> = enc.get_ids().iter().take(max_tokens).copied().collect();
+
+    if ids.len() < max_tokens {
+        eprintln!(
+            "[QCF-dump] WARNING: only {} warmup tokens available (requested {}); \
+             using all available tokens",
+            ids.len(),
+            max_tokens
+        );
+    }
+
+    ids
 }
 
 // ── KIVI + PPL mode: KiviCache-based perplexity evaluation ───────────────────

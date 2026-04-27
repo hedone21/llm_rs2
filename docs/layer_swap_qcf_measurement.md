@@ -5,6 +5,10 @@ AUF v0.2 multi-quant 기반 layer-swap의 **QCF_swap 예측치 vs 실제 NLL/품
 목차
 - [1. 측정 모델](#1-측정-모델)
 - [2. CLI 사용법](#2-cli-사용법)
+  - [2.1 새로 도입된 flag](#21-새로-도입된-flag-head-d460a77)
+  - [2.2 자동 워크플로우](#22-자동-워크플로우---qcf-dump-활성-시)
+  - [2.3 호출 예시](#23-호출-예시)
+  - [2.4 eval-ll 모드 (Spearman 상관 측정용)](#24-eval-ll-모드-spearman-상관-측정용)
 - [3. JSON dump 스키마](#3-json-dump-스키마)
 - [4. Sweep 매트릭스](#4-sweep-매트릭스)
 - [5. 분석 권장 통계](#5-분석-권장-통계)
@@ -101,6 +105,38 @@ AUF v0.2 multi-quant 기반 layer-swap의 **QCF_swap 예측치 vs 실제 NLL/품
 ```
 - `ppl`/`avg_nll` 필드는 `null`로 직렬화. 외부 harness가 generated text와 expected answer를 비교해 F1/EM/ROUGE를 별도 JSON에 기록.
 
+### 2.4 eval-ll 모드 (Spearman 상관 측정용)
+
+`--eval-ll + --eval-batch <jsonl> + --qcf-dump <PATH>` 조합으로 multiple-choice 또는 chunked NLL 측정:
+
+```bash
+./target/release/generate \
+  --model-path models/qwen2.5-1.5b-f16.gguf \
+  --secondary-gguf models/qwen2.5-1.5b-mixed.auf \
+  --secondary-dtype q4_0 \
+  --backend cuda --kv-type f16 --max-seq-len 4096 \
+  --eval-ll --eval-batch data/race_h_300q.jsonl \
+  --greedy --qcf-mode both \
+  --force-swap-ratio 0.33 \
+  --qcf-dump results/qwen1_5b_r0.33_race_h.json \
+  --qcf-warmup-tokens 256
+```
+
+**워크플로우**: `--eval-ll` 루프 진입 직전에 QCF prelude가 실행된다.
+
+1. 첫 N개 question의 prompt를 `\n\n`으로 연결 → tokenize → 첫 256 token 슬라이스 (warmup 입력)
+2. ImportanceCollector inject → warmup prefill → ImportanceTable 빌드
+3. KV cache 리셋 (eval 루프가 깨끗한 상태로 시작)
+4. WeightSwapDecider.decide(ratio) → SwapExecutor.execute()
+5. eval-ll 루프 실행 (이미 swap된 모델로 per-question NLL 계산)
+6. `dump_qcf_swap_json()` 호출 → `eval_ll_output` 필드 포함
+
+dump JSON에 `eval_ll_output.results`로 per-question choice_nlls가 포함된다. 외부 harness는 이를 baseline run의 NLL과 비교해 ΔNLL을 계산하고 `qcf_swap_predicted ↔ ΔNLL` Spearman ρ를 산출한다.
+
+**warmup 입력 부족 시**: 질문 수가 적어 warmup 토큰이 256 미만인 경우 warning을 출력하고 가능한 만큼만 사용한다 (실패하지 않음). warmup 입력이 완전히 비면 prelude를 스킵하고 uniform fallback swap으로 진행한다.
+
+**`--eval-ll` 전용 prelude 조건**: `--qcf-dump`와 `--force-swap-ratio`가 모두 설정된 경우에만 prelude가 활성화된다. 어느 하나만 있는 경우 기존 동작(swap 없는 eval-ll)과 동일하다.
+
 ---
 
 ## 3. JSON dump 스키마
@@ -132,7 +168,45 @@ AUF v0.2 multi-quant 기반 layer-swap의 **QCF_swap 예측치 vs 실제 NLL/품
   "warmup_tokens": 256,
   "backend": "cuda",
   "kv_type": "f16",
-  "ppl_corpus": "experiments/prompts/prefill_4096.txt"
+  "ppl_corpus": "experiments/prompts/prefill_4096.txt",
+  "eval_ll_output": null
+}
+```
+
+eval-ll 모드(`--eval-ll + --qcf-dump`)에서는 `eval_ll_output`이 아래와 같이 채워진다:
+
+```json
+{
+  "schema_version": 1,
+  "model_arch": "qwen2",
+  "model_path": "models/qwen2.5-1.5b-f16.gguf",
+  "secondary_path": "models/qwen2.5-1.5b-mixed.auf",
+  "primary_dtype": "F16",
+  "secondary_dtype": "Q4_0",
+  "num_layers": 28,
+  "force_swap_ratio": 0.33,
+  "swap_set": [2, 4, 6, 8, 10, 12, 14, 16, 19],
+  "swap_count": 9,
+  "qcf_swap_predicted": 0.318,
+  "fallback_used": false,
+  "importance_table": [...],
+  "noise_table": [...],
+  "ppl": null,
+  "avg_nll": null,
+  "n_eval_tokens": 0,
+  "wall_time_s": 42.3,
+  "warmup_tokens": 256,
+  "backend": "cuda",
+  "kv_type": "f16",
+  "ppl_corpus": null,
+  "eval_ll_output": {
+    "results": [
+      {"id": "race-h-001", "choice_nlls": [12.34, 11.89, 13.10, 14.55], "predicted_norm": 1, "predicted_raw": 1, "qcf_layer_skip": null},
+      {"id": "race-h-002", "choice_nlls": [9.10, 10.20, 8.70, 11.30], "predicted_norm": 2, "predicted_raw": 2, "qcf_layer_skip": null}
+    ],
+    "config": {"model": "models/qwen2.5-1.5b-f16.gguf", "eviction_policy": "none", ...},
+    "wall_time_s": 38.7
+  }
 }
 ```
 
@@ -157,6 +231,7 @@ AUF v0.2 multi-quant 기반 layer-swap의 **QCF_swap 예측치 vs 실제 NLL/품
 | `warmup_tokens` | int | `--qcf-warmup-tokens` 그대로 |
 | `backend`, `kv_type` | string | 측정 환경 메타 |
 | `ppl_corpus` | string \| null | `--ppl <path>` 그대로 |
+| `eval_ll_output` | object \| null | `--eval-ll` 모드에서 per-question NLL 결과. PPL/generation 모드에서는 null. `results`, `config`, `wall_time_s` 등 `EvalOutput` 전체를 포함 |
 
 ---
 

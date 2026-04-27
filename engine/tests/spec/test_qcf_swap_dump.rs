@@ -72,6 +72,7 @@ fn test_dump_schema_round_trip() {
         backend: "cpu",
         kv_type: "f16",
         ppl_corpus: Some("experiments/prompts/prefill_4096.txt"),
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -149,6 +150,7 @@ fn test_ratio_zero_swap_count_zero() {
         backend: "cpu",
         kv_type: "f32",
         ppl_corpus: None,
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -221,6 +223,7 @@ fn test_ratio_033_skip_count_5_for_16l() {
         backend: "cpu",
         kv_type: "f16",
         ppl_corpus: None,
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -294,6 +297,7 @@ fn test_ratio_one_caps_at_n_minus_2() {
         backend: "cpu",
         kv_type: "f16",
         ppl_corpus: None,
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -331,6 +335,7 @@ fn test_nan_epsilon_excluded() {
         backend: "cpu",
         kv_type: "f16",
         ppl_corpus: None,
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -385,6 +390,7 @@ fn test_importance_noise_in_dump() {
         backend: "cpu",
         kv_type: "f16",
         ppl_corpus: None,
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -477,6 +483,7 @@ fn test_ppl_none_serializes_as_null() {
         backend: "cuda",
         kv_type: "f16",
         ppl_corpus: None,
+        eval_ll_output: None,
     };
 
     let v = dump_and_parse(&ctx);
@@ -512,4 +519,166 @@ fn test_ppl_none_serializes_as_null() {
     // backend and kv_type
     assert_eq!(v["backend"].as_str().unwrap(), "cuda");
     assert_eq!(v["kv_type"].as_str().unwrap(), "f16");
+}
+
+// ── Test 8: eval_ll_output Some → included in JSON ───────────────────────────
+
+/// When eval_ll_output is Some, the JSON must contain an `eval_ll_output`
+/// field with at least the `results` array from the EvalOutput.
+#[test]
+fn test_eval_ll_output_some_included_in_json() {
+    use llm_rs2::eval::hook::MetricsSummary;
+    use llm_rs2::eval::output::EvalOutput;
+
+    let eval_output = EvalOutput {
+        results: vec![
+            serde_json::json!({
+                "id": "race-h-001",
+                "choice_nlls": [12.34_f32, 11.89_f32, 13.10_f32, 14.55_f32],
+                "predicted_norm": 1_i64,
+                "predicted_raw": 1_i64,
+                "qcf_layer_skip": serde_json::Value::Null,
+            }),
+            serde_json::json!({
+                "id": "race-h-002",
+                "choice_nlls": [9.1_f32, 10.2_f32, 8.7_f32, 11.3_f32],
+                "predicted_norm": 2_i64,
+                "predicted_raw": 2_i64,
+                "qcf_layer_skip": serde_json::Value::Null,
+            }),
+        ],
+        config: serde_json::json!({"model": "test", "eviction_policy": "none"}),
+        wall_time_s: 18.7,
+        metrics_summary: MetricsSummary::default(),
+        layer_importance: None,
+        layer_skip_qcf: None,
+        layer_skip_qcf_normalized: None,
+        qcf_layer_skip: None,
+        qcf_layer_skip_layers: None,
+    };
+
+    let swap_set = vec![1usize, 3usize, 5usize];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "qwen2",
+        model_path: "models/qwen2.5-1.5b-f16.gguf",
+        secondary_path: Some("models/qwen2.5-1.5b-mixed.auf"),
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 28,
+        force_swap_ratio: Some(0.33),
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.214,
+        fallback_used: false,
+        importance_table: None,
+        noise_table: None,
+        ppl: None,
+        avg_nll: None,
+        n_eval_tokens: 0,
+        wall_time_s: 18.7,
+        warmup_tokens: 256,
+        backend: "cuda",
+        kv_type: "f16",
+        ppl_corpus: None,
+        eval_ll_output: Some(&eval_output),
+    };
+
+    let v = dump_and_parse(&ctx);
+
+    // eval_ll_output must be present and be an object
+    let elo = &v["eval_ll_output"];
+    assert!(
+        elo.is_object(),
+        "eval_ll_output must be a JSON object when Some, got: {:?}",
+        elo
+    );
+
+    // results array must contain 2 items
+    let results = &elo["results"];
+    assert!(
+        results.is_array(),
+        "eval_ll_output.results must be an array"
+    );
+    assert_eq!(
+        results.as_array().unwrap().len(),
+        2,
+        "eval_ll_output.results must have 2 items"
+    );
+
+    // First result id matches
+    assert_eq!(
+        results[0]["id"].as_str().unwrap(),
+        "race-h-001",
+        "first result id must match"
+    );
+
+    // wall_time_s present
+    assert!(
+        elo["wall_time_s"].is_number(),
+        "eval_ll_output.wall_time_s must be a number"
+    );
+    assert!(
+        (elo["wall_time_s"].as_f64().unwrap() - 18.7).abs() < 0.1,
+        "wall_time_s value mismatch"
+    );
+
+    // ppl and avg_nll still null at the top level
+    assert!(
+        v["ppl"].is_null(),
+        "top-level ppl must be null in eval-ll mode"
+    );
+    assert!(
+        v["avg_nll"].is_null(),
+        "top-level avg_nll must be null in eval-ll mode"
+    );
+}
+
+// ── Test 9: eval_ll_output None → JSON field is null (not absent) ────────────
+
+/// When eval_ll_output is None (PPL / generation mode), `eval_ll_output` in the
+/// JSON must be present and serialize as JSON null (consistent with the policy
+/// that all top-level keys are always present in schema_version 1).
+#[test]
+fn test_eval_ll_output_none_serializes_as_null() {
+    let swap_set: Vec<usize> = vec![];
+
+    let ctx = QcfSwapDumpContext {
+        model_arch: "llama",
+        model_path: "models/llama.gguf",
+        secondary_path: None,
+        primary_dtype: "F16",
+        secondary_dtype: "Q4_0",
+        num_layers: 16,
+        force_swap_ratio: None,
+        swap_set: &swap_set,
+        qcf_swap_predicted: 0.0,
+        fallback_used: false,
+        importance_table: None,
+        noise_table: None,
+        ppl: Some(10.5),
+        avg_nll: Some(2.35),
+        n_eval_tokens: 2048,
+        wall_time_s: 6.0,
+        warmup_tokens: 256,
+        backend: "cpu",
+        kv_type: "f32",
+        ppl_corpus: Some("experiments/prompts/prefill_4096.txt"),
+        eval_ll_output: None,
+    };
+
+    let v = dump_and_parse(&ctx);
+
+    // eval_ll_output key must exist and be null
+    assert!(
+        v.get("eval_ll_output").is_some(),
+        "eval_ll_output key must be present even when None"
+    );
+    assert!(
+        v["eval_ll_output"].is_null(),
+        "eval_ll_output must be JSON null in PPL/generation mode"
+    );
+
+    // Confirm schema_version and other fields unaffected
+    assert_eq!(v["schema_version"].as_u64().unwrap(), 1);
+    assert!((v["ppl"].as_f64().unwrap() - 10.5).abs() < 1e-4);
 }

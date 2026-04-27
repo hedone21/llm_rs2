@@ -7,6 +7,7 @@
 //! QCF↔NLL measurement workflow (Phase 1, zazzy-herding-bonbon plan).
 
 use super::hook::MetricsSummary;
+use super::output::EvalOutput;
 use crate::core::qcf::QcfMetric;
 use crate::core::qcf::layer_importance::ImportanceTable;
 use crate::models::weights::QuantNoiseTable;
@@ -153,6 +154,12 @@ pub struct QcfSwapDumpContext<'a> {
     pub kv_type: &'a str,
     /// Path to the PPL reference corpus file (None in generation mode).
     pub ppl_corpus: Option<&'a str>,
+    /// EvalOutput from `--eval-ll` mode (per-question NLL summary).
+    ///
+    /// Set when `--eval-ll` and `--qcf-dump` are both active. None in PPL/generation mode.
+    /// The full `EvalOutput` is serialized as `eval_ll_output` in the JSON dump so the
+    /// external harness can compute `qcf_swap_predicted ↔ ΔNLL` Spearman ρ directly.
+    pub eval_ll_output: Option<&'a EvalOutput>,
 }
 
 /// Serialize a `QcfSwapDumpContext` to a JSON file (schema_version 1).
@@ -206,6 +213,15 @@ pub fn dump_qcf_swap_json(
         None => Value::Null,
     };
 
+    // eval_ll_output: serialize as JSON object when present, null otherwise.
+    let eval_ll_output_val: Value = match ctx.eval_ll_output {
+        Some(output) => {
+            let json_str = output.to_json().unwrap_or_else(|_| "null".to_string());
+            serde_json::from_str(&json_str).unwrap_or(Value::Null)
+        }
+        None => Value::Null,
+    };
+
     let doc = json!({
         "schema_version": 1,
         "model_arch": ctx.model_arch,
@@ -229,6 +245,7 @@ pub fn dump_qcf_swap_json(
         "backend": ctx.backend,
         "kv_type": ctx.kv_type,
         "ppl_corpus": ctx.ppl_corpus,
+        "eval_ll_output": eval_ll_output_val,
     });
 
     let json_str = serde_json::to_string_pretty(&doc)?;
