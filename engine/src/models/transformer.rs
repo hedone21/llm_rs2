@@ -1699,11 +1699,6 @@ impl TransformerModel {
         } else if self.lm_head_on_cpu {
             self.lm_head_matmul_cpu(&x, logits_out, backend)?;
         } else {
-            // CUDA Q4 prefill mtile path race: without this sync, lm_head
-            // Q4_0 prefill matmul produces non-deterministic logits (~50%
-            // of runs corrupt) when triggered via `--quantize-lm-head q4_0`
-            // or `--secondary-gguf` (auto-quantize). Isolated 2026-04-27.
-            backend.synchronize()?;
             with_op_label(backend, "lm_head", || {
                 backend.matmul_transposed(&x, &self.lm_head, logits_out)
             })?;

@@ -667,8 +667,15 @@ impl Backend for CudaBackend {
         let a_dtype = a.dtype();
         let b_dtype = b.dtype();
 
-        // Q4_0 weights always go through CPU fallback
+        // Q4_0 weights always go through CPU fallback. Sync first so the
+        // CPU read of `a`/`b` host pointers observes all in-flight GPU
+        // writes — the matching guard at the top of every other fallback
+        // path. Without it, `--cuda-sync-policy minimal` (default) skips
+        // the upstream Matmul sync and the fallback sees stale activations,
+        // producing non-deterministic Q4 prefill output (Bug A/B,
+        // 2026-04-27).
         if b_dtype == DType::Q4_0 || a_dtype == DType::Q4_0 {
+            self.maybe_sync_cat(SyncCat::FallbackPre)?;
             return cpu_fallback().matmul_transposed(a, b, out);
         }
 
