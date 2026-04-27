@@ -22,6 +22,7 @@
    - [2.11 Layer Skip (레이어 건너뛰기)](#211-layer-skip-레이어-건너뛰기)
    - [2.12 Chat (멀티턴 REPL / 소켓 IPC)](#212-chat-멀티턴-repl--소켓-ipc)
    - [2.13 Weight Swap (AUF / Secondary GGUF)](#213-weight-swap-auf--secondary-gguf)
+     - [2.13.5 QCF↔NLL 측정 (Spearman 상관관계)](#2135-qcfnll-측정-spearman-상관관계)
 3. [Manager 가이드](#3-manager-가이드)
    - [3.1 기본 실행](#31-기본-실행)
    - [3.2 Lua 정책 스크립팅](#32-lua-정책-스크립팅)
@@ -1238,6 +1239,8 @@ generate ... --chat \
 | `--swap-dir <DIR>` | swap 시 mmap에 사용할 임시 디렉토리. 미지정 시 OS 기본. |
 | `--quantize-lm-head <auto\|q4_0\|none>` | 로드 시점 lm_head Q4_0 변환 (Sprint F). 기본 `auto` — `--secondary-gguf` 지정 + lm_head가 F16/F32일 때만 변환. |
 | `--tokenizer-path <PATH>` | tokenizer.json 경로. 같은 디렉토리에 sibling 모델이 있을 때 명시 권장 (자동 감지가 다른 tokenizer를 잡으면 garbage 출력). |
+| `--qcf-dump <PATH>` | run 종료 시 QCF_swap / NLL / swap_set / importance·noise table을 단일 JSON으로 dump. 활성화 시 자동 워밍업 prefill (importance 기반 swap 결정) 흐름 진입. |
+| `--qcf-warmup-tokens <N>` | warmup prefill 길이. 기본 256. `--qcf-dump` 활성 시에만 사용. |
 
 #### 2.13.3 GGUF secondary 시나리오 (가장 단순)
 
@@ -1314,7 +1317,41 @@ adb shell "LD_LIBRARY_PATH=/data/local/tmp /data/local/tmp/generate \
 
 상세 옵션 (`info`, `verify`, lm_head AOS 예외, 트러블슈팅): `docs/auf_tool_guide.md` 참조.
 
-#### 2.13.5 트러블슈팅
+#### 2.13.5 QCF↔NLL 측정 (Spearman 상관관계)
+
+`--qcf-dump`로 swap된 layer set의 **QCF_swap 예측치**와 실제 **NLL/PPL 열화**를 단일 JSON에 함께 dump 가능. 외부 harness가 ratio sweep 후 Spearman ρ를 산출하는 용도. 자동 워크플로우:
+
+1. 첫 N개 토큰으로 warmup prefill (skip/swap 없음, ImportanceCollector inject)
+2. `WeightSwapDecider`가 `importance × ε` bottom-k로 swap_set 결정 (uniform fallback 회피)
+3. swap 실행 후 본 측정 (PPL / generation / eval-ll 모두 지원)
+4. JSON dump (schema_version=1)
+
+```bash
+# PPL 모드 (LongBench 같은 corpus)
+./target/release/generate \
+  -m models/qwen2.5-1.5b-f16.gguf \
+  --secondary-gguf models/qwen2.5-1.5b-mixed.auf \
+  --secondary-dtype q4_0 --force-swap-ratio 0.33 \
+  -b cuda --kv-type f16 --max-seq-len 4096 \
+  --ppl experiments/prompts/prefill_4096.txt \
+  --qcf-dump results/qwen1_5b_r0.33_ppl.json
+
+# eval-ll 모드 (RACE-h / NIAH per-question NLL)
+./target/release/generate \
+  -m models/qwen2.5-1.5b-f16.gguf \
+  --secondary-gguf models/qwen2.5-1.5b-mixed.auf \
+  --secondary-dtype q4_0 --force-swap-ratio 0.33 \
+  -b cuda --kv-type f16 --max-seq-len 4096 \
+  --eval-ll --eval-batch data/race_h_300q.jsonl \
+  --greedy --qcf-mode both \
+  --qcf-dump results/qwen1_5b_r0.33_race_h.json
+```
+
+eval-ll 모드 JSON에는 `eval_ll_output.results[i].choice_nlls`로 per-question NLL이 포함된다 — baseline run과 비교해 ΔNLL을 계산하고 `(qcf_swap_predicted, ΔNLL)` Spearman ρ로 산출.
+
+상세 가이드 (스키마 정의, 4 model × 4 ratio × 3 bench sweep 매트릭스, 분석 권장 통계): `docs/layer_swap_qcf_measurement.md`.
+
+#### 2.13.6 트러블슈팅
 
 - **`--force-swap-ratio requires --secondary-gguf`**: secondary 자산을 같이 지정해야 함.
 - **AUF 추론 시 garbage 출력 (lm_head 관련)**: AUF v0.1.0 (capability_opt=0)을 사용 중일 가능성. v0.1.1 AUF로 다시 build (`--include-lm-head auto`). 또는 이미 v0.1.1이지만 `WEIGHTS_ADRENO_SOA` 안에 lm_head가 SOA로 들어 있으면 Adreno image limit (~16M texels) 때문에 GEMV가 fall-through되어 발생. Sprint G-1-F fix(INV-135 v2) 이후 모든 variant에서 lm_head는 AOS로 동봉되므로 최신 toolchain으로 재빌드/재AUF build로 해결.
