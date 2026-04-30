@@ -684,6 +684,64 @@ pub enum ResilienceAction {
 
 ---
 
+### 2.9 컴포넌트: Manager 측 SwapWeights 통합 (lua_policy 직접 매핑 + hierarchical ActionId 경로)
+
+**설계 결정**: SwapWeights는 Manager에서 두 경로로 노출된다. 두 경로는 **동일한 IPC 명령**(`EngineCommand::SwapWeights { ratio, target_dtype }`)을 산출하지만 산출 단계와 정책 표면이 다르다. spec/23-manager-data.md MGR-DAT-040의 카탈로그가 두 경로에 대한 단일 진실원이다.
+
+| 경로 | 정의 위치 | 트리거 단계 | 정책 표면 | spec ID |
+|------|-----------|------------|-----------|---------|
+| **Lua 직접 매핑** (default) | `manager/src/lua_policy.rs::parse_single_action` "swap_weights" + `action_to_str` | Lua `decide()` 반환 테이블의 entry → 즉시 EngineCommand 변환 | `policy_default.lua` 내 lua 코드 | MGR-049, MGR-090 |
+| **Hierarchical ActionId** | `manager/src/types.rs::ActionId::SwapWeights` + ActionRegistry + parametrize + ActionCommand→EngineCommand 변환 | ActionSelector(MGR-ALG-030~037) → ActionCommand → EngineCommand | TOML `[policy.actions.swap_weights]` + parametrize 선형 보간 | MGR-DAT-040, MGR-DAT-054, MGR-ALG-036 |
+
+**왜 두 경로가 공존하는가**:
+- LuaPolicy(MGR-049)가 2026-04부터 default 정책 엔진이므로 lua_policy의 직접 매핑은 production hot path다.
+- HierarchicalPolicy(MGR-040~042)는 `--policy-engine hierarchical`로 선택되며, ActionRegistry/ReliefEstimator/ActionSelector를 거치는 학습형 경로다.
+- 두 경로는 정책 결정 알고리즘이 다르지만 IPC 출력 형태는 동일해야 한다(shared `EngineCommand::SwapWeights`만이 Engine과의 계약). Manager 코드 변경 시 두 경로를 항상 함께 점검한다.
+
+**정합 규칙**:
+1. **명령 동등성**: 동일 ratio·target_dtype 입력에 대해 두 경로가 산출하는 `EngineCommand::SwapWeights`는 비트 단위로 동일해야 한다. `target_dtype`은 현재 `Q4_0` 고정(다른 dtype은 lua_policy가 거부, hierarchical에서도 동일 거부 정책 적용).
+2. **Ratio clamp 일치**: lua_policy.rs에서 ratio > 0.9를 0.9로 clamp + 경고 로그(arch §2.8 ENG-ALG-214-ROUTE 정합). hierarchical 경로의 ParamRange(min=0.0, max=0.9, MGR-DAT-056)와 같은 상한이 적용된다. `parametrize`(MGR-ALG-035)가 [0.0, 0.9] 외 값을 산출할 수 없으므로, hierarchical 경로는 추가 clamp가 불필요하지만 변환 단계에서 안전 마진으로 한 번 더 clamp(MGR-ALG-036).
+3. **카탈로그 동기화**: 새 ActionId variant 추가/제거 시 다음 6 지점을 항상 함께 갱신:
+   - `manager/src/types.rs` ActionId enum (`hierarchical_types` 모듈) — 변형, `from_str`, `all`, `primary_domain`
+   - `manager/src/action_registry.rs::default_param_range`
+   - `manager/src/relief/linear.rs::action_to_key`, `default_relief`
+   - `manager/src/lua_policy.rs::action_to_str`, `parse_single_action`
+   - `spec/23-manager-data.md` MGR-DAT-040, MGR-DAT-054, MGR-DAT-056, MGR-DAT-060
+   - `spec/22-manager-algorithms.md` MGR-ALG-035 parametrize 표, MGR-ALG-036 변환 표
+4. **FeatureVector 인덱스**: 현재 FEATURE_DIM=13에는 SwapWeights 활성 인덱스가 없다(MGR-DAT-046 인덱스 7~12). 본 항목은 **호환성 보존**을 위해 v1에서 추가하지 않는다. 신규 ACTIVE_SWAP_WEIGHTS 인덱스를 도입하면 FEATURE_DIM 변경 → ReliefEstimator의 모든 LinearModel weight 차원 변경 → 기존 영속화 모델 invalid가 되므로, 도입은 별도 spec 변경(MGR-DAT-046, INV-046~049)을 거친다. v1에서는 SwapWeights 활성 정보를 ACTIVE_KV_QUANT(idx=12) 등에 우회 매핑하지 않는다(의미 충돌). 이로 인해 ReliefEstimator는 SwapWeights에 대해 활성/비활성 신호를 학습 입력으로 받지 못한다 — cold-start prior(MGR-DAT-060)에 의존하며 observe()는 정상 동작한다(상태 벡터에서 swap-specific 신호만 비어 있을 뿐).
+
+**Mermaid: 두 경로 비교**:
+
+```mermaid
+flowchart LR
+    subgraph LUA["Lua 직접 매핑 (default)"]
+        L1["policy_default.lua<br/>decide() 반환 테이블"]
+        L2["parse_single_action<br/>'swap_weights' + ratio + dtype"]
+        L3["clamp ratio to 0.9"]
+        L4["EngineCommand::SwapWeights"]
+        L1 --> L2 --> L3 --> L4
+    end
+
+    subgraph HIER["Hierarchical ActionId 경로"]
+        H1["ActionSelector<br/>(MGR-ALG-030~034)"]
+        H2["ActionCommand<br/>{ ActionId::SwapWeights, Apply{ratio} }"]
+        H3["parametrize<br/>(MGR-ALG-035)<br/>ratio = 0.9 - intensity*(0.9-0.0)"]
+        H4["MGR-ALG-036 변환<br/>+ ratio clamp + dtype=Q4_0"]
+        H5["EngineCommand::SwapWeights"]
+        H1 --> H2 --> H3 --> H4 --> H5
+    end
+
+    L4 -. 동일 IPC 명령 .-> H5
+    style LUA fill:#e1bee7
+    style HIER fill:#c8e6c9
+```
+
+**제약 / 미해결 항목**:
+- `target_dtype` 다중 지원 (F16↔Q4_0↔Q8_0 동적 선택)은 v1 범위 외. 추후 lua_policy + hierarchical 양쪽에서 동일 enum 표면을 추가할 때 함께 진행한다.
+- ActiveSwapWeights feature index 추가가 필요해지면 MGR-DAT-046 + ReliefEstimator 영속화 마이그레이션을 함께 spec한다(별도 작업).
+
+---
+
 ## 3. Config / CLI
 
 | 키/플래그 | 타입 | 기본값 | spec 근거 |
@@ -714,6 +772,9 @@ pub enum ResilienceAction {
 | SecondaryMmap lifetime 보장 | `engine/tests/spec/test_inv_125_secondary_mmap_lifetime.rs` | INV-125 |
 | SwapWeights serde round-trip | `shared/tests/spec/test_msg_080_swap_weights.rs` | MSG-080 |
 | EngineCommand SwapWeights 처리 | `shared/tests/spec/test_msg_081_swap_cmd.rs` | MSG-081 |
+| ActionId::SwapWeights 카탈로그 정합 (from_str/all/primary_domain) | `manager/tests/spec/test_mgr_dat_040_action_id_catalog.rs` | MGR-DAT-040 |
+| ActionRegistry default_param_range/default_relief에 swap_weights 포함 | `manager/tests/spec/test_mgr_dat_054_swap_weights_meta.rs` | MGR-DAT-054, MGR-DAT-056, MGR-DAT-060 |
+| Lua/hierarchical 경로 EngineCommand 동등성 | `manager/tests/spec/test_swap_weights_dual_path_equivalence.rs` | arch/weight_swap.md §2.9 |
 
 ---
 
