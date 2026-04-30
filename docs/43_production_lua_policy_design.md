@@ -602,9 +602,10 @@ pub fn reload_script(&mut self, path: &Path) -> anyhow::Result<()> {
     log::info!("Reloading Lua policy script from {}", path.display());
 
     // 1. 새 VM 생성 (new()의 초기화 로직 재사용)
+    // 2026-04-30: IO 허용으로 확장. OS/PACKAGE/DEBUG는 차단 유지 (MGR-049).
     let new_lua = unsafe {
         Lua::unsafe_new_with(
-            StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+            StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::IO,
             mlua::LuaOptions::default(),
         )
     };
