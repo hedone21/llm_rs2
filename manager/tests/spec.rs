@@ -60,6 +60,9 @@ mod test_mgr_dat_020_056;
 
 // ── 갭 테스트 (MGR-ALG / MGR-060 / MGR-DAT) ──
 #[cfg(feature = "hierarchical")]
+#[path = "spec/test_inv_016_swap_weights_no_exclusion.rs"]
+mod test_inv_016_swap_weights_no_exclusion;
+#[cfg(feature = "hierarchical")]
 #[path = "spec/test_mgr_060_061.rs"]
 mod test_mgr_060_061;
 #[cfg(feature = "hierarchical")]
@@ -69,11 +72,20 @@ mod test_mgr_alg_013a_016;
 #[path = "spec/test_mgr_dat_022_024.rs"]
 mod test_mgr_dat_022_024;
 #[cfg(feature = "hierarchical")]
+#[path = "spec/test_mgr_dat_040_action_id_catalog.rs"]
+mod test_mgr_dat_040_action_id_catalog;
+#[cfg(feature = "hierarchical")]
+#[path = "spec/test_mgr_dat_054_swap_weights_meta.rs"]
+mod test_mgr_dat_054_swap_weights_meta;
+#[cfg(feature = "hierarchical")]
 #[path = "spec/test_mgr_dat_d2o.rs"]
 mod test_mgr_dat_d2o;
 #[cfg(feature = "hierarchical")]
 #[path = "spec/test_mgr_dat_streaming.rs"]
 mod test_mgr_dat_streaming;
+#[cfg(feature = "hierarchical")]
+#[path = "spec/test_swap_weights_dual_path_equivalence.rs"]
+mod test_swap_weights_dual_path_equivalence;
 
 // ── SEQ 통합 테스트 ──
 #[cfg(feature = "hierarchical")]

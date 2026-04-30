@@ -234,6 +234,7 @@ fn test_seq_095_critical_steady_no_request_qcf() {
             ("kv_evict_sliding".to_string(), 0.3),
             ("kv_evict_h2o".to_string(), 0.4),
         ]),
+        layer_swap: None,
     };
     let _ = p.complete_qcf_selection(&qcf);
 
@@ -274,6 +275,7 @@ fn test_seq_097_complete_with_qcf_estimate() {
             ("kv_evict_h2o".to_string(), 0.3),
             ("layer_skip".to_string(), 0.8),
         ]),
+        layer_swap: None,
     };
 
     let result = p.complete_qcf_selection(&qcf);
@@ -306,6 +308,7 @@ fn test_seq_097_complete_without_pending_returns_none() {
     // pending 없이 바로 호출
     let qcf = QcfEstimate {
         estimates: HashMap::from([("kv_evict_sliding".to_string(), 0.3)]),
+        layer_swap: None,
     };
 
     let result = p.complete_qcf_selection(&qcf);
@@ -334,6 +337,7 @@ fn test_seq_097_qcf_values_override_default_cost() {
             ("kv_evict_h2o".to_string(), 0.01),
             ("layer_skip".to_string(), 0.01),
         ]),
+        layer_swap: None,
     };
 
     let result = p.complete_qcf_selection(&qcf_low_cost);

@@ -24,6 +24,7 @@ mod hierarchical_types {
         KvMergeD2o,
         KvQuantDynamic,
         LayerSkip,
+        SwapWeights,
     }
 
     impl ActionId {
@@ -40,6 +41,7 @@ mod hierarchical_types {
                 "kv_merge_d2o" => Some(ActionId::KvMergeD2o),
                 "kv_quant_dynamic" => Some(ActionId::KvQuantDynamic),
                 "layer_skip" => Some(ActionId::LayerSkip),
+                "swap_weights" => Some(ActionId::SwapWeights),
                 _ => None,
             }
         }
@@ -56,6 +58,7 @@ mod hierarchical_types {
                 ActionId::KvMergeD2o,
                 ActionId::KvQuantDynamic,
                 ActionId::LayerSkip,
+                ActionId::SwapWeights,
             ]
         }
 
@@ -68,7 +71,8 @@ mod hierarchical_types {
                 | ActionId::KvEvictH2o
                 | ActionId::KvEvictStreaming
                 | ActionId::KvMergeD2o
-                | ActionId::KvQuantDynamic => Domain::Memory,
+                | ActionId::KvQuantDynamic
+                | ActionId::SwapWeights => Domain::Memory,
             }
         }
     }

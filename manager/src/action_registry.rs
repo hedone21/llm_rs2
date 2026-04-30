@@ -146,6 +146,11 @@ fn default_param_range(id: ActionId) -> Option<ParamRange> {
             min: 0.0,
             max: 100.0,
         }),
+        ActionId::SwapWeights => Some(ParamRange {
+            param_name: "ratio".into(),
+            min: 0.0,
+            max: 0.9,
+        }),
         _ => None,
     }
 }
