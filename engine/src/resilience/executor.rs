@@ -161,6 +161,10 @@ pub struct CommandExecutor {
     // 직전 heartbeat 송출 시각. gpu_meter의 wall_elapsed 계산에 사용한다.
     // 첫 샘플은 new() 시각을 기준으로 하여 warm-up 구간을 자연스럽게 흡수.
     last_heartbeat_at: Instant,
+
+    // secondary GGUF/AUF 파일 존재 여부. true이면 swap_weights 액션이
+    // available_actions에 포함된다 (ENG-ST-032).
+    has_secondary: bool,
 }
 
 impl CommandExecutor {
@@ -211,7 +215,16 @@ impl CommandExecutor {
             proc_meter: ProcSelfMeter::new(),
             gpu_meter,
             last_heartbeat_at: now,
+            has_secondary: false,
         }
+    }
+
+    /// secondary GGUF/AUF 경로 존재 여부를 설정한다.
+    ///
+    /// `true`이면 이후 Heartbeat의 `available_actions`에 `"swap_weights"`가 포함된다.
+    /// generate.rs에서 모델 로드 직후, Capability 송출 전에 호출한다 (ENG-ST-032).
+    pub fn set_has_secondary(&mut self, has_secondary: bool) {
+        self.has_secondary = has_secondary;
     }
 
     /// Send initial capability report to Manager.
@@ -568,7 +581,11 @@ impl CommandExecutor {
             memory_lossy_min,
             state: self.engine_state,
             tokens_generated: self.tokens_generated,
-            available_actions: Self::compute_available_actions(&eviction_policy, &kv_dtype),
+            available_actions: Self::compute_available_actions(
+                &eviction_policy,
+                &kv_dtype,
+                self.has_secondary,
+            ),
             active_actions: self.active_actions.clone(),
             eviction_policy,
             kv_dtype,
@@ -600,7 +617,11 @@ impl CommandExecutor {
     }
 
     /// Compute available actions based on engine capabilities.
-    fn compute_available_actions(eviction_policy: &str, kv_dtype: &str) -> Vec<String> {
+    fn compute_available_actions(
+        eviction_policy: &str,
+        kv_dtype: &str,
+        has_secondary: bool,
+    ) -> Vec<String> {
         let mut actions = vec![
             "throttle".to_string(),
             "switch_hw".to_string(),
@@ -616,6 +637,10 @@ impl CommandExecutor {
         // KV quantization: only available with KIVI cache (q2/q4/q8)
         if kv_dtype.starts_with('q') {
             actions.push("kv_quant_dynamic".to_string());
+        }
+        // Weight swap: only available when a secondary GGUF/AUF is loaded (ENG-ST-032).
+        if has_secondary {
+            actions.push("swap_weights".to_string());
         }
         actions
     }

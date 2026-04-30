@@ -6,14 +6,20 @@
 //! - throttle, switch_hw, layer_skip: 항상 사용 가능
 //! - kv_evict_h2o, kv_evict_sliding: eviction_policy != "none"일 때만
 //! - kv_quant_dynamic: kv_dtype가 'q'로 시작할 때만 (KIVI cache)
+//! - swap_weights: secondary GGUF/AUF가 로드된 경우에만 (ENG-ST-032)
 
 use llm_rs2::resilience::{CommandExecutor, KVSnapshot};
 use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
 use std::sync::mpsc;
 use std::time::Duration;
 
-/// Heartbeat를 유도하여 available_actions를 확인하는 헬퍼
-fn get_available_actions(eviction_policy: &str, kv_dtype: &str) -> Vec<String> {
+/// Heartbeat를 유도하여 available_actions를 확인하는 헬퍼.
+/// `has_secondary`가 true이면 secondary GGUF/AUF 존재 시나리오를 시뮬레이션한다.
+fn get_available_actions_with_secondary(
+    eviction_policy: &str,
+    kv_dtype: &str,
+    has_secondary: bool,
+) -> Vec<String> {
     let (cmd_tx, cmd_rx) = mpsc::channel::<ManagerMessage>();
     let (resp_tx, resp_rx) = mpsc::channel::<EngineMessage>();
     let mut executor = CommandExecutor::new(
@@ -22,6 +28,7 @@ fn get_available_actions(eviction_policy: &str, kv_dtype: &str) -> Vec<String> {
         "cpu".to_string(),
         Duration::from_millis(1), // 매우 짧은 heartbeat 간격
     );
+    executor.set_has_secondary(has_secondary);
     executor.set_running();
 
     // heartbeat 간격 경과 대기
@@ -48,6 +55,11 @@ fn get_available_actions(eviction_policy: &str, kv_dtype: &str) -> Vec<String> {
     }
     drop(cmd_tx);
     panic!("No heartbeat received");
+}
+
+/// 편의 헬퍼: has_secondary=false (기존 동작 유지)
+fn get_available_actions(eviction_policy: &str, kv_dtype: &str) -> Vec<String> {
+    get_available_actions_with_secondary(eviction_policy, kv_dtype, false)
 }
 
 /// 기본 상태 (eviction_policy="none", kv_dtype="f16"):
@@ -160,4 +172,38 @@ fn test_eng_st_032_available_device_dependent() {
     let actions = get_available_actions("sliding", "q4");
     assert!(actions.contains(&"kv_evict_h2o".to_string()));
     assert!(actions.contains(&"kv_quant_dynamic".to_string()));
+}
+
+/// secondary 비활성: swap_weights가 available_actions에 포함되지 않아야 한다.
+#[test]
+fn test_eng_st_032_swap_weights_absent_without_secondary() {
+    let actions = get_available_actions_with_secondary("none", "f16", false);
+    assert!(
+        !actions.contains(&"swap_weights".to_string()),
+        "swap_weights should not be available when no secondary is loaded"
+    );
+}
+
+/// secondary 활성: swap_weights가 available_actions에 포함되어야 한다.
+#[test]
+fn test_eng_st_032_swap_weights_present_with_secondary() {
+    let actions = get_available_actions_with_secondary("none", "f16", true);
+    assert!(
+        actions.contains(&"swap_weights".to_string()),
+        "swap_weights should be available when secondary GGUF/AUF is loaded"
+    );
+    // 기본 액션들은 여전히 포함
+    assert!(actions.contains(&"throttle".to_string()));
+    assert!(actions.contains(&"switch_hw".to_string()));
+    assert!(actions.contains(&"layer_skip".to_string()));
+}
+
+/// secondary 활성 + eviction + KIVI 조합: 모든 액션이 동시에 등록되어야 한다.
+#[test]
+fn test_eng_st_032_swap_weights_combined_with_eviction_and_quant() {
+    let actions = get_available_actions_with_secondary("h2o", "q4", true);
+    assert!(actions.contains(&"swap_weights".to_string()));
+    assert!(actions.contains(&"kv_evict_h2o".to_string()));
+    assert!(actions.contains(&"kv_quant_dynamic".to_string()));
+    assert!(actions.contains(&"throttle".to_string()));
 }

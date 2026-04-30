@@ -1709,7 +1709,9 @@ fn parse_single_action(action_type: &str, entry: &Table) -> LuaResult<EngineComm
                 cpu_chunk_size,
             }
         }
-        "swap_weights" => {
+        // "precision_swap"은 Lua emit 입력에서만 인식되는 alias.
+        // Rust→Lua 직렬화(engine_command_type_name)는 "swap_weights"로 고정한다.
+        "swap_weights" | "precision_swap" => {
             let ratio: f32 = entry.get("ratio")?;
             // ratio must be in [0.0, 0.9]; clamp and warn on over-limit (ENG-ALG-214-ROUTE)
             let ratio = if ratio > 0.9 {
@@ -3536,6 +3538,74 @@ mod tests {
             cmds.is_empty(),
             "invalid dtype must produce no commands (got {cmds:?})"
         );
+    }
+
+    /// `precision_swap`은 `swap_weights`의 Lua emit alias로 동일한 EngineCommand를 생성해야 한다.
+    #[test]
+    fn test_lua_policy_precision_swap_alias() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "precision_swap",
+                    ratio = 0.50,
+                    dtype = "q4_0",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert_eq!(
+            cmds.len(),
+            1,
+            "precision_swap alias should produce exactly one command"
+        );
+        match &cmds[0] {
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                assert!(
+                    (*ratio - 0.50).abs() < 1e-6,
+                    "ratio should be 0.50, got {ratio}"
+                );
+                assert_eq!(*target_dtype, llm_shared::DtypeTag::Q4_0);
+            }
+            other => panic!("Expected SwapWeights from precision_swap alias, got {other:?}"),
+        }
+    }
+
+    /// `precision_swap` alias 경로에서도 ratio > 0.9 clamp가 동일하게 적용되어야 한다.
+    #[test]
+    fn test_lua_policy_precision_swap_alias_clamp() {
+        let script = create_temp_script(
+            r#"function decide(ctx)
+                return {{
+                    type = "precision_swap",
+                    ratio = 0.95,
+                    dtype = "q4_0",
+                }}
+            end"#,
+        );
+        let mut policy = LuaPolicy::with_system_clock(
+            script.path().to_str().unwrap(),
+            AdaptationConfig::default(),
+        )
+        .unwrap();
+        let cmds = policy.call_decide(&dummy_signal()).0;
+        assert_eq!(cmds.len(), 1);
+        match &cmds[0] {
+            EngineCommand::SwapWeights { ratio, .. } => {
+                assert!(
+                    (*ratio - 0.9).abs() < 1e-6,
+                    "precision_swap alias: ratio should be clamped to 0.9, got {ratio}"
+                );
+            }
+            other => panic!("Expected SwapWeights, got {other:?}"),
+        }
     }
 
     #[test]

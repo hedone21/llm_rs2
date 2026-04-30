@@ -1735,13 +1735,18 @@ fn main() -> anyhow::Result<()> {
             "[Resilience] Executor enabled — transport: {}",
             args.resilience_transport
         );
-        let executor = CommandExecutor::with_gpu_meter(
+        let mut executor = CommandExecutor::with_gpu_meter(
             cmd_rx,
             resp_tx,
             args.backend.clone(),
             heartbeat_interval,
             gpu_meter.clone(),
         );
+
+        // secondary 경로가 있으면 swap_weights 액션이 Heartbeat에도 포함되도록 설정.
+        // Capability와 Heartbeat 두 목록이 항상 같은 조건을 공유한다 (ENG-ST-032).
+        let has_secondary = args.secondary_gguf.is_some();
+        executor.set_has_secondary(has_secondary);
 
         // Send Capability as first message (SEQ-022).
         // available_actions 는 Heartbeat 와 동일하게 eviction_policy / kv_type 에서 파생.
@@ -1761,6 +1766,11 @@ fn main() -> anyhow::Result<()> {
             }
             if args.kv_type.starts_with('q') {
                 a.push("kv_quant_dynamic".to_string());
+            }
+            // secondary GGUF/AUF 존재 시 swap_weights 등록 (ENG-ST-032).
+            // Heartbeat의 compute_available_actions와 동일 조건을 공유한다.
+            if has_secondary {
+                a.push("swap_weights".to_string());
             }
             a
         };
