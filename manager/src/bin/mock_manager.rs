@@ -43,7 +43,7 @@ use anyhow::{Context, bail};
 use clap::Parser;
 use serde::Deserialize;
 
-use llm_shared::{EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
+use llm_shared::{DtypeTag, EngineCommand, EngineDirective, EngineMessage, ManagerMessage};
 
 // ── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -65,7 +65,7 @@ struct Args {
 
     /// Command to send (KvEvictSliding, KvEvictH2o, KvStreaming, KvMergeD2o,
     /// Throttle, SetTargetTbt, SwitchHw, KvQuantDynamic, LayerSkip,
-    /// SetPartitionRatio, SetPrefillPolicy,
+    /// SetPartitionRatio, SetPrefillPolicy, SwapWeights,
     /// Suspend, Resume, RestoreDefaults, RequestQcf).
     #[arg(long)]
     command: Option<String>,
@@ -126,6 +126,11 @@ struct Args {
     /// cpu_chunk_size for SetPrefillPolicy.
     #[arg(long)]
     cpu_chunk_size: Option<usize>,
+
+    /// target_dtype for SwapWeights (currently only "q4_0" is executable;
+    /// f16/f32/q8_0 are reserved wire-format variants).
+    #[arg(long)]
+    target_dtype: Option<String>,
 
     // ── D-Bus mode (legacy) ──
     /// Use D-Bus transport instead of Unix socket.
@@ -271,6 +276,8 @@ struct ScenarioCommand {
     yield_ms: Option<u32>,
     #[serde(default)]
     cpu_chunk_size: Option<usize>,
+    #[serde(default)]
+    target_dtype: Option<String>,
 }
 
 // ── Command construction ────────────────────────────────────────────────────
@@ -290,6 +297,7 @@ struct CommandParams<'a> {
     chunk_size: Option<usize>,
     yield_ms: Option<u32>,
     cpu_chunk_size: Option<usize>,
+    target_dtype: Option<&'a str>,
 }
 
 fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
@@ -369,6 +377,28 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
             yield_ms: params.yield_ms,
             cpu_chunk_size: params.cpu_chunk_size,
         }),
+        "SwapWeights" => {
+            let ratio = params
+                .ratio
+                .context("--ratio required for SwapWeights")?;
+            let dtype_str = params
+                .target_dtype
+                .context("--target-dtype required for SwapWeights")?;
+            let target_dtype = match dtype_str.to_ascii_lowercase().as_str() {
+                "q4_0" => DtypeTag::Q4_0,
+                "f16" => DtypeTag::F16,
+                "f32" => DtypeTag::F32,
+                "q8_0" => DtypeTag::Q8_0,
+                other => bail!(
+                    "SwapWeights: unsupported --target-dtype '{}', expected q4_0/f16/f32/q8_0",
+                    other
+                ),
+            };
+            Ok(EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            })
+        }
         "Suspend" => Ok(EngineCommand::Suspend),
         "Resume" => Ok(EngineCommand::Resume),
         "RestoreDefaults" => Ok(EngineCommand::RestoreDefaults),
@@ -665,6 +695,7 @@ fn run_single_command(
         chunk_size: args.chunk_size,
         yield_ms: args.yield_ms,
         cpu_chunk_size: args.cpu_chunk_size,
+        target_dtype: args.target_dtype.as_deref(),
     })?;
 
     let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
@@ -771,6 +802,7 @@ fn run_scenario(stream: &mut (impl Read + Write), path: &PathBuf) -> anyhow::Res
             chunk_size: entry.chunk_size,
             yield_ms: entry.yield_ms,
             cpu_chunk_size: entry.cpu_chunk_size,
+            target_dtype: entry.target_dtype.as_deref(),
         })?;
 
         let is_request_qcf = matches!(cmd, EngineCommand::RequestQcf);
@@ -1227,6 +1259,7 @@ mod tests {
             chunk_size: None,
             yield_ms: None,
             cpu_chunk_size: None,
+            target_dtype: None,
         }
     }
 
