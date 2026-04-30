@@ -633,13 +633,13 @@ impl LuaPolicy {
         exclusion_groups: HashMap<String, Vec<String>>,
         gpu_provider: SharedGpuProvider,
     ) -> anyhow::Result<Self> {
-        // Sandbox: only table + string + math (no io, os, debug, etc.)
-        // Safety: we intentionally restrict stdlib to TABLE | STRING | MATH.
-        // unsafe_new_with is required because mlua considers any stdlib subset
-        // potentially unsafe (e.g. missing debug library).
+        // Sandbox: TABLE | STRING | MATH | IO 허용. OS / PACKAGE / DEBUG 차단 (MGR-049).
+        // unsafe_new_with: mlua가 stdlib 부분 집합을 unsafe로 분류 (DEBUG 누락 때문).
+        // 운영자 신뢰 전제: IO 활성화로 정책 스크립트가 manager 권한으로 파일 RW 및
+        // io.popen 사용 가능. 신뢰되지 않은 스크립트를 --policy-script에 지정 금지.
         let lua = unsafe {
             Lua::unsafe_new_with(
-                StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+                StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::IO,
                 mlua::LuaOptions::default(),
             )
         };
@@ -742,6 +742,12 @@ impl LuaPolicy {
             HashMap::new(),
             gpu_provider,
         )
+    }
+
+    /// 내부 Lua VM에 대한 읽기 접근자 — 통합 테스트에서 globals 조회 전용 (MGR-049).
+    #[doc(hidden)]
+    pub fn lua(&self) -> &Lua {
+        &self.lua
     }
 
     /// QCF cache가 stale한지 확인 (비어있거나 TTL 초과 시 true).
@@ -1511,10 +1517,10 @@ impl PolicyStrategy for LuaPolicy {
     /// `self.lua`와 `self.script_path`를 교체한다. 실패 시 `self` 변경 없이 Err.
     fn reload_script(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
         // 1. 새 Lua VM 생성 (new()의 초기화 로직 복제)
-        // Safety: TABLE | STRING | MATH만 로드, I/O 없음.
+        // Safety: TABLE | STRING | MATH | IO 로드. OS/PACKAGE/DEBUG 차단 (MGR-049).
         let new_lua = unsafe {
             Lua::unsafe_new_with(
-                StdLib::TABLE | StdLib::STRING | StdLib::MATH,
+                StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::IO,
                 mlua::LuaOptions::default(),
             )
         };

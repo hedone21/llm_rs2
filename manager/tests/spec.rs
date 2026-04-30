@@ -106,3 +106,8 @@ mod test_mgr_alg_080_083_ewma_relief;
 // feature gate 없음 — LuaPolicy ctx.engine 노출 경로.
 #[path = "spec/test_mgr_dat_075_076_engine_util.rs"]
 mod test_mgr_dat_075_076_engine_util;
+
+// ── MGR-049: Lua sandbox IO 허용 + OS/PACKAGE/DEBUG 차단 ──
+#[cfg(feature = "lua")]
+#[path = "spec/test_mgr_049_lua_sandbox.rs"]
+mod test_mgr_049_lua_sandbox;
