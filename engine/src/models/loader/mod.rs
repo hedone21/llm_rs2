@@ -52,6 +52,12 @@ pub struct LoadConfig {
     /// Ignored for GGUF secondaries. `Auto` is the default and selects
     /// META.default_dtype or the first available candidate.
     pub secondary_dtype_choice: crate::models::weights::SecondaryDtypeChoice,
+    /// Layout (backend variant) selection for AUF-backed secondary files.
+    ///
+    /// `Auto`는 build feature로 결정한 preferred variant를 우선 시도하고,
+    /// 그게 AUF에 없으면 `CpuAos`로 폴백한다. `Aos`/`Soa`는 명시 강제.
+    /// switch_hw cpu / partition lazy-map과 함께 쓰려면 `Aos`가 필요하다.
+    pub secondary_layout_choice: crate::models::weights::SecondaryLayoutChoice,
 }
 
 /// Internal standard tensor identifier (format-agnostic).

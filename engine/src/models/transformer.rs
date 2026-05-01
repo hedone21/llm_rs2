@@ -197,7 +197,7 @@ impl TransformerModel {
     ) -> Result<Self> {
         use crate::models::loader::TensorSource;
         use crate::models::loader::gguf::GgufSource;
-        use crate::models::weights::open_secondary_with_dtype;
+        use crate::models::weights::open_secondary_with_options;
 
         let primary_path = config
             .primary_source
@@ -210,9 +210,14 @@ impl TransformerModel {
             Some(p) => {
                 let gguf = source.gguf_file();
                 let model_config = source.config();
-                let handle =
-                    open_secondary_with_dtype(p, model_config, gguf, config.secondary_dtype_choice)
-                        .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
+                let handle = open_secondary_with_options(
+                    p,
+                    model_config,
+                    gguf,
+                    config.secondary_dtype_choice,
+                    config.secondary_layout_choice,
+                )
+                .map_err(|e| anyhow!("secondary weight load failed: {e}"))?;
                 Some(Arc::new(handle))
             }
         };
@@ -725,9 +730,22 @@ impl TransformerModel {
         let mut count = 0;
 
         let map_one = |t: &Tensor, be: &Arc<dyn Backend>| -> Result<(Tensor, bool)> {
-            // Already CPU-accessible (mapped UnifiedBuffer, etc.) → just map if needed.
+            // Already CPU-accessible (e.g. mapped UnifiedBuffer, mmap-backed) → no-op.
             if !t.buffer().as_ptr().is_null() {
                 t.buffer().map_for_cpu()?; // no-op if already mapped
+                return Ok((t.clone(), false));
+            }
+            // UnifiedBuffer (CL_MEM_ALLOC_HOST_PTR, freshly allocated by
+            // `OpenCLMemory::alloc` from copy_weight_from / copy_from) starts
+            // unmapped, so `as_ptr()` returns null even though the underlying
+            // memory is host-pinned. Try `map_for_cpu()` first to lift the
+            // mapping in-place — this is the post-swap path: SwapExecutor's
+            // `materialise_tensor` lands an unmapped UnifiedBuffer in the
+            // LayerWeights snapshot, and a subsequent `--resilience-prealloc-
+            // switch` directive needs the host pointer back without paying
+            // the read_buffer + alloc cost below.
+            t.buffer().map_for_cpu()?;
+            if !t.buffer().as_ptr().is_null() {
                 return Ok((t.clone(), false));
             }
             // Device-only buffer (OpenCLBuffer): read to new UnifiedBuffer.

@@ -45,6 +45,30 @@ pub enum SecondaryDtypeChoice {
     F32,
 }
 
+/// CLI `--secondary-layout` 값. 어떤 weights variant로 swap 후 텐서를 만들지 결정한다.
+///
+/// AUF는 빌드 시 여러 backend variant(`WEIGHTS_ADRENO_SOA`, `WEIGHTS_CUDA_AOS`,
+/// `WEIGHTS_CPU_AOS`)를 동봉할 수 있다. 런타임에 어느 variant를 읽을지가
+/// 다음 trade-off를 결정한다:
+///
+/// - **SOA (Adreno noshuffle)**: GPU TBT 33~55% 빠름 (Adreno 830 측정). 대신
+///   `NoshuffleWeightBuffer`는 host pointer가 null이라 swap 후 `switch_hw cpu`
+///   / partition lazy-map / CPU forward는 모두 실패한다.
+/// - **AOS (CPU/CUDA AOS)**: GPU는 표준 Q4_0 GEMV (`mul_mat_q4_0_f32`) fallback.
+///   `UnifiedBuffer` (host-mapped) 백킹이라 swap 후에도 host pointer가 살아있어
+///   switch_hw cpu / partition / CPU forward 모두 자연 동작.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondaryLayoutChoice {
+    /// 자동: feature flag 기반 preferred variant (OpenCL→AdrenoSoa, CUDA→CudaAos,
+    /// 그 외→CpuAos). preferred variant가 AUF에 없으면 CpuAos로 폴백한다.
+    Auto,
+    /// 강제 AOS: AUF에 `WEIGHTS_CPU_AOS` 또는 (CUDA build에선) `WEIGHTS_CUDA_AOS`가
+    /// 있어야 한다. SOA fast path 우회 → GPU 성능 손실 대신 switch/partition 호환.
+    Aos,
+    /// 강제 SOA: OpenCL build 한정. `WEIGHTS_ADRENO_SOA`가 없으면 에러.
+    Soa,
+}
+
 // ──────────────────────────────────────────────────────────────────────────
 // Public error type
 // ──────────────────────────────────────────────────────────────────────────
@@ -396,6 +420,28 @@ impl SecondaryMmap {
         }
     }
 
+    /// Whether the secondary stores Q/K weights in their *post-unpermute*
+    /// (NEON-unfriendly, runtime-loaded) layout.
+    ///
+    /// - **GGUF** secondaries store Q/K rows in the GGUF on-disk permuted
+    ///   layout. Loaders (and `SwapExecutor::materialise_tensor`) call
+    ///   `unpermute_qk_rows` once before installing the tensor.
+    /// - **AUF** secondaries (both `WEIGHTS_ADRENO_SOA` and `WEIGHTS_CPU_AOS`
+    ///   variants) bake the unpermute step into `auf_tool::extract_weight_blobs`
+    ///   at build time, so the on-disk bytes are already unpermuted. Calling
+    ///   `unpermute_qk_rows` again at swap time would double-apply the
+    ///   permutation and produce garbage on the post-swap forward path
+    ///   (observed on Galaxy S25 Adreno after `--secondary-layout aos`).
+    ///
+    /// Returns `true` when the swap path must call `unpermute_qk_rows`,
+    /// `false` when the bytes are already in their final layout.
+    pub fn needs_qk_unpermute_at_swap(&self) -> bool {
+        match self {
+            SecondaryMmap::Gguf(_) => true,
+            SecondaryMmap::Auf(_) => false,
+        }
+    }
+
     /// Prefault the page cache for the swap-relevant byte ranges.
     ///
     /// **Why** — WSWAP-5-COLD-UNIFORM. 5차 측정에서 per-layer 양봉 분포
@@ -499,8 +545,30 @@ pub fn open_secondary_with_dtype(
     primary_gguf: &GgufFile,
     secondary_dtype_choice: SecondaryDtypeChoice,
 ) -> Result<SecondaryMmap, LoadError> {
+    open_secondary_with_options(
+        path,
+        primary_config,
+        primary_gguf,
+        secondary_dtype_choice,
+        SecondaryLayoutChoice::Auto,
+    )
+}
+
+/// `open_secondary`의 dtype + layout 선택 풀버전.
+pub fn open_secondary_with_options(
+    path: &Path,
+    primary_config: &ModelConfig,
+    primary_gguf: &GgufFile,
+    secondary_dtype_choice: SecondaryDtypeChoice,
+    secondary_layout_choice: SecondaryLayoutChoice,
+) -> Result<SecondaryMmap, LoadError> {
     if is_auf_path(path) {
-        open_secondary_auf(path, primary_config, secondary_dtype_choice)
+        open_secondary_auf(
+            path,
+            primary_config,
+            secondary_dtype_choice,
+            secondary_layout_choice,
+        )
     } else {
         open_secondary_gguf(path, primary_config, primary_gguf)
     }
@@ -635,12 +703,100 @@ fn detect_backend_tag() -> BackendTag {
     return BackendTag::CpuAos;
 }
 
-fn open_secondary_auf(
+/// Resolve the candidate `BackendTag` list to try in order, given the
+/// `SecondaryLayoutChoice`. For `Auto`, falls back to `CpuAos` if the
+/// preferred variant is missing from the AUF file.
+fn resolve_backend_tag_candidates(layout: SecondaryLayoutChoice) -> Vec<BackendTag> {
+    match layout {
+        SecondaryLayoutChoice::Auto => {
+            let preferred = detect_backend_tag();
+            if preferred == BackendTag::CpuAos {
+                vec![BackendTag::CpuAos]
+            } else {
+                // Try preferred first, fall back to CpuAos for AUFs that only
+                // bundle the AOS variant (built with `--variants cpu_aos`).
+                vec![preferred, BackendTag::CpuAos]
+            }
+        }
+        SecondaryLayoutChoice::Aos => {
+            // Force AOS. Prefer CudaAos on CUDA builds, CpuAos otherwise.
+            #[cfg(any(feature = "cuda", feature = "cuda-embedded"))]
+            return vec![BackendTag::CudaAos, BackendTag::CpuAos];
+            #[cfg(not(any(feature = "cuda", feature = "cuda-embedded")))]
+            vec![BackendTag::CpuAos]
+        }
+        SecondaryLayoutChoice::Soa => {
+            // Force SOA — only meaningful on OpenCL.
+            vec![BackendTag::AdrenoSoa]
+        }
+    }
+}
+
+/// Open an AUF-format secondary weight file directly (skips GGUF detection).
+///
+/// Public so integration tests can exercise the layout-fallback path without
+/// constructing a `GgufFile` placeholder. Production callers should use
+/// `open_secondary_with_options`, which dispatches GGUF vs AUF on extension.
+pub fn open_secondary_auf(
     path: &Path,
     primary_config: &ModelConfig,
     secondary_dtype_choice: SecondaryDtypeChoice,
+    secondary_layout_choice: SecondaryLayoutChoice,
 ) -> Result<SecondaryMmap, LoadError> {
-    let backend_tag = detect_backend_tag();
+    let candidates = resolve_backend_tag_candidates(secondary_layout_choice);
+    debug_assert!(
+        !candidates.is_empty(),
+        "resolve_backend_tag_candidates must return at least one tag"
+    );
+
+    // Try each candidate in order. On `WeightsSectionMissing`, fall through to
+    // the next candidate. Any other error short-circuits.
+    let mut last_missing: Option<crate::auf::AufError> = None;
+    let backend_tag = {
+        let mut chosen: Option<BackendTag> = None;
+        for tag in &candidates {
+            match crate::auf::reader::open(path, *tag) {
+                Ok(_view) => {
+                    chosen = Some(*tag);
+                    break;
+                }
+                Err(e @ crate::auf::AufError::WeightsSectionMissing { .. }) => {
+                    last_missing = Some(e);
+                    continue;
+                }
+                Err(e) => {
+                    return Err(LoadError::AufInvariantViolation {
+                        detail: format!("open AUF {}: {e}", path.display()),
+                    });
+                }
+            }
+        }
+        match chosen {
+            Some(t) => t,
+            None => {
+                let detail = match last_missing {
+                    Some(e) => format!(
+                        "AUF {} has none of the candidate variants {:?}: {e}",
+                        path.display(),
+                        candidates,
+                    ),
+                    None => format!("AUF {} variant probe yielded no result", path.display()),
+                };
+                return Err(LoadError::AufInvariantViolation { detail });
+            }
+        }
+    };
+
+    if backend_tag != detect_backend_tag()
+        && matches!(secondary_layout_choice, SecondaryLayoutChoice::Auto)
+    {
+        eprintln!(
+            "[Secondary] AUF lacks preferred variant {:?}; using {:?} (swap will use AOS path — \
+             switch_hw / partition compatible, GPU TBT may regress vs SOA)",
+            detect_backend_tag(),
+            backend_tag,
+        );
+    }
 
     // AUF open: full invariant pipeline (INV-132, INV-133, INV-134).
     let view = crate::auf::reader::open(path, backend_tag).map_err(|e| {

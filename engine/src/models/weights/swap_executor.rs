@@ -761,8 +761,18 @@ impl<'a> SwapExecutor<'a> {
         // Build a canonical GGUF tensor name for the permutation gate, so we
         // reuse the same predicate as the primary loader without copying
         // regex logic.
+        //
+        // GGUF secondaries store Q/K weights in the on-disk permuted layout —
+        // we must unpermute once. AUF secondaries (both WEIGHTS_ADRENO_SOA
+        // and WEIGHTS_CPU_AOS) bake the unpermute step into the build-time
+        // `auf_tool::extract_weight_blobs` pipeline, so the on-disk bytes are
+        // already unpermuted. Calling `unpermute_qk_rows` here again would
+        // double-apply the permutation and produce garbage on the post-swap
+        // forward path. The `secondary.needs_qk_unpermute_at_swap()` check
+        // distinguishes the two formats (Galaxy S25 Adreno + AOS variant
+        // observed regression: 2026-05-01).
         let canonical_name = format!("blk.{layer_idx}.{subname}");
-        let permuted_bytes: Option<Vec<u8>> =
+        let permuted_bytes: Option<Vec<u8>> = if secondary.needs_qk_unpermute_at_swap() {
             if let Some((n_head, head_dim)) = qk_permute_shape(&canonical_name, self.config) {
                 let total_rows = shape.dims()[0];
                 debug_assert_eq!(total_rows, n_head * head_dim);
@@ -778,7 +788,11 @@ impl<'a> SwapExecutor<'a> {
                 Some(unpermute_qk_rows(data, n_head, head_dim, row_size_bytes))
             } else {
                 None
-            };
+            }
+        } else {
+            // AUF: bytes already in the runtime layout — no transformation.
+            None
+        };
 
         // Always build an owned SharedBuffer on CPU first, then route
         // through the existing copy_weight_from / copy_from paths to land on

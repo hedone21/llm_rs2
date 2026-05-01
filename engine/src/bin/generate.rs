@@ -73,6 +73,41 @@ impl From<SecondaryDtypeArg> for llm_rs2::models::weights::SecondaryDtypeChoice 
     }
 }
 
+/// `--secondary-layout` CLI 인수 값.
+///
+/// AUF의 어떤 weights variant로 swap 후 텐서를 만들지 결정한다. 기본은
+/// `auto`로, 빌드 환경의 preferred variant(OpenCL→AdrenoSoa) 우선 + AUF에
+/// 그게 없으면 CpuAos로 폴백한다. `aos`는 강제로 CpuAos / CudaAos 사용해
+/// host pointer를 살려두므로 swap 후 `switch_hw cpu` / partition 호환이
+/// 가능하지만 GPU TBT가 SOA 대비 떨어진다 (Adreno 830 실측 33–55%).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecondaryLayoutArg {
+    Auto,
+    Aos,
+    Soa,
+}
+
+fn parse_secondary_layout(s: &str) -> Result<SecondaryLayoutArg, String> {
+    match s.to_lowercase().as_str() {
+        "auto" => Ok(SecondaryLayoutArg::Auto),
+        "aos" | "cpu_aos" | "cuda_aos" => Ok(SecondaryLayoutArg::Aos),
+        "soa" | "adreno_soa" => Ok(SecondaryLayoutArg::Soa),
+        other => Err(format!(
+            "unknown secondary-layout '{other}'. Valid values: auto, aos, soa"
+        )),
+    }
+}
+
+impl From<SecondaryLayoutArg> for llm_rs2::models::weights::SecondaryLayoutChoice {
+    fn from(arg: SecondaryLayoutArg) -> Self {
+        match arg {
+            SecondaryLayoutArg::Auto => Self::Auto,
+            SecondaryLayoutArg::Aos => Self::Aos,
+            SecondaryLayoutArg::Soa => Self::Soa,
+        }
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -664,6 +699,22 @@ struct Args {
     #[arg(long, default_value = "auto", value_parser = parse_secondary_dtype)]
     secondary_dtype: SecondaryDtypeArg,
 
+    /// AUF weights variant 선택 ("auto" | "aos" | "soa").
+    ///
+    /// `auto` (기본): feature flag 기반 preferred variant 우선 + AUF에 없으면
+    /// CpuAos 자동 폴백. OpenCL build에선 AdrenoSoa 우선.
+    ///
+    /// `aos`: 강제 AOS (`WEIGHTS_CPU_AOS` / `WEIGHTS_CUDA_AOS`). swap 후
+    /// `switch_hw cpu` / partition lazy-map / CPU forward가 정상 동작.
+    /// GPU TBT는 SOA 대비 30~50% 저하 (Adreno 830 실측).
+    ///
+    /// `soa`: 강제 SOA (`WEIGHTS_ADRENO_SOA`, OpenCL 전용). 가장 빠르지만
+    /// swap 후 host-pointer 부재로 switch_hw cpu / partition 호환 불가.
+    ///
+    /// GGUF secondary에선 무시됨.
+    #[arg(long, default_value = "auto", value_parser = parse_secondary_layout)]
+    secondary_layout: SecondaryLayoutArg,
+
     /// Explicit path to tokenizer.json. When omitted, the tokenizer is
     /// resolved automatically via the GGUF basename (e.g.
     /// `<dir>/<stem>.tokenizer.json`, then `<dir>/<stem-without-quant>.tokenizer.json`,
@@ -1065,6 +1116,7 @@ fn main() -> anyhow::Result<()> {
             default_dtype: w_dtype,
             secondary_source: args.secondary_gguf.clone(),
             secondary_dtype_choice: args.secondary_dtype.into(),
+            secondary_layout_choice: args.secondary_layout.into(),
         };
         TransformerModel::load_from_config(&load_cfg, backend.clone(), &*memory)?
     } else {
@@ -2219,6 +2271,28 @@ fn main() -> anyhow::Result<()> {
                         .downcast_ref::<llm_rs2::backend::opencl::OpenCLBackend>()
                     {
                         ocl_be.dump_cl_mem_diagnostics(" stage=after_force_swap");
+                    }
+                    // Post-swap CPU re-mapping (--secondary-layout aos +
+                    // --resilience-prealloc-switch). SwapExecutor's
+                    // `materialise_tensor` path lands an unmapped UnifiedBuffer
+                    // in the new LayerWeights snapshot; without this re-map the
+                    // next `switch_hw cpu` directive sees null host pointers
+                    // and segfaults on the first CPU forward. Idempotent and
+                    // cheap when no remap is needed (already-mapped tensors
+                    // short-circuit in `map_one`).
+                    #[cfg(feature = "opencl")]
+                    if is_gpu && args.resilience_prealloc_switch {
+                        match model.map_weights_for_cpu(&backend) {
+                            Ok(0) => {} // already mapped
+                            Ok(n) => eprintln!(
+                                "[Backend] Re-mapped {} weight tensors after force-swap (host pointer restored)",
+                                n
+                            ),
+                            Err(e) => eprintln!(
+                                "[Backend] Post-swap re-map failed: {} (switch_hw cpu may crash)",
+                                e
+                            ),
+                        }
                     }
                 }
                 Err(e) => {
@@ -5286,6 +5360,25 @@ fn main() -> anyhow::Result<()> {
                         gpu_backend_arc.as_ref(),
                         &cpu_backend_arc,
                     );
+                    // Post-swap CPU re-mapping (mirrors the --force-swap-ratio
+                    // path). When `--secondary-layout aos` is in effect, the
+                    // SwapExecutor's `materialise_tensor` lands an unmapped
+                    // UnifiedBuffer in the new LayerWeights; the next
+                    // `switch_hw cpu` directive needs the host pointer back.
+                    #[cfg(feature = "opencl")]
+                    if is_gpu && args.resilience_prealloc_switch {
+                        match model.map_weights_for_cpu(&backend) {
+                            Ok(0) => {}
+                            Ok(n) => eprintln!(
+                                "[Backend] Re-mapped {} weight tensors after SwapWeights (host pointer restored)",
+                                n
+                            ),
+                            Err(e) => eprintln!(
+                                "[Backend] Post-swap re-map failed: {} (switch_hw cpu may crash)",
+                                e
+                            ),
+                        }
+                    }
                 }
 
                 if let Some(evict) = &plan.evict {
