@@ -758,22 +758,36 @@ pub fn build_auf_secondary_from_view(
                 .as_deref()
                 .and_then(dtype_str_to_tensor_dtype_local);
 
+            // weight-dtype 우선순위: Q4_0 → F16 → BF16 → Q4_1 → Q8_0 → F32.
+            // F32는 일반적으로 norm 전용 dtype이므로 Auto 선택에서는 마지막으로
+            // 떨어뜨려야 한다. BTreeSet의 자연 정렬(F32=0이 최소)을 그대로 쓰면
+            // Q4_0 weight + F32 norm이 섞인 일반 single-dtype AUF에서 F32를
+            // 선택해 weight 텐서가 모두 필터링된다.
+            let weight_preference = [
+                TensorDType::Q4_0,
+                TensorDType::F16,
+                TensorDType::BF16,
+                TensorDType::Q4_1,
+                TensorDType::Q8_0,
+                TensorDType::F32,
+            ];
+            let pick_by_preference = || -> Option<TensorDType> {
+                weight_preference
+                    .iter()
+                    .copied()
+                    .find(|d| available_dtypes.contains(&d.as_u32()))
+            };
+
             if let Some(d) = default_from_meta {
                 if available_dtypes.contains(&d.as_u32()) {
                     Some(d)
                 } else {
-                    // META.default_dtype이 available에 없으면 first candidate.
-                    available_dtypes
-                        .iter()
-                        .next()
-                        .and_then(|&u| TensorDType::from_u32(u))
+                    // META.default_dtype이 available에 없으면 weight 우선 후보.
+                    pick_by_preference()
                 }
             } else {
-                // META.default_dtype 없음 → first candidate.
-                available_dtypes
-                    .iter()
-                    .next()
-                    .and_then(|&u| TensorDType::from_u32(u))
+                // META.default_dtype 없음 → weight 우선 후보.
+                pick_by_preference()
             }
         }
         SecondaryDtypeChoice::F16 => {

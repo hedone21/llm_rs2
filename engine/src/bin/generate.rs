@@ -5283,6 +5283,7 @@ fn main() -> anyhow::Result<()> {
                         target_dtype,
                         importance_table_for_swap.as_ref(),
                         executor,
+                        gpu_backend_arc.as_ref(),
                         &cpu_backend_arc,
                     );
                 }
@@ -6674,6 +6675,7 @@ fn dispatch_swap_weights(
     target_dtype: llm_shared::DtypeTag,
     importance_table: Option<&llm_rs2::core::qcf::ImportanceTable>,
     executor: &mut llm_rs2::resilience::CommandExecutor,
+    gpu_backend: Option<&std::sync::Arc<dyn llm_rs2::core::backend::Backend>>,
     cpu_backend: &std::sync::Arc<dyn llm_rs2::core::backend::Backend>,
 ) {
     use llm_rs2::core::buffer::DType;
@@ -6724,13 +6726,16 @@ fn dispatch_swap_weights(
     }
 
     // ── 4. Execute ─────────────────────────────────────────────────────────
+    // Resolve the swap backend to the *active* backend (GPU when available),
+    // not the CPU fallback. SwapExecutor branches on `backend.name()` to pick
+    // the AUF SOA fast path (`materialise_auf_soa_weight` →
+    // `NoshuffleWeightBuffer`); a CPU backend here forces the host fallback
+    // and lands `SharedBuffer`-backed weights into the model snapshot, which
+    // the next OpenCL `matmul_q4_0` rejects with "B is not OpenCL buffer".
     let swap_memory = llm_rs2::memory::galloc::Galloc::new();
-    let executor_sw = SwapExecutor::new(
-        DType::Q4_0,
-        &model.config,
-        cpu_backend.clone(),
-        &swap_memory,
-    );
+    let swap_backend: std::sync::Arc<dyn llm_rs2::core::backend::Backend> =
+        gpu_backend.cloned().unwrap_or_else(|| cpu_backend.clone());
+    let executor_sw = SwapExecutor::new(DType::Q4_0, &model.config, swap_backend, &swap_memory);
 
     let t_start = std::time::Instant::now();
     match executor_sw.execute(model, &decision.selected_layers) {
