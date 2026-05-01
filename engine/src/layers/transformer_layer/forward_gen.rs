@@ -200,10 +200,19 @@ impl TransformerLayer {
         // 2. QKV Projections from normalized x (ws.residual) — fused dispatch for F16 CPU
         let t = prof_start!();
         let tr = tr_start!();
+        // QKV fused dispatch via `fused_matmul_f16`/`fused_matmul_q4_0` was found
+        // to produce garbage decode output for Qwen2.5-1.5b on aarch64
+        // (Galaxy S25, both f16 and q4_0 GGUF). The fused functions return
+        // bit-identical row outputs vs three separate `backend.matmul_transposed`
+        // calls (the F16 path was verified at every layer), but downstream
+        // layers degenerate when QKV is computed via the fused dispatch. The
+        // FFN fused (gate+up, n_matmuls=2) does not exhibit the regression and
+        // remains active in the FFN block below. Force the non-fused path for
+        // QKV decode until the root cause is isolated.
         #[cfg(target_arch = "aarch64")]
-        let is_cpu_f16 = backend.name().contains("CPU") && self.wq.dtype() == DType::F16;
+        let is_cpu_f16 = false;
         #[cfg(target_arch = "aarch64")]
-        let is_cpu_q4 = backend.name().contains("CPU") && self.wq.dtype() == DType::Q4_0;
+        let is_cpu_q4 = false;
         #[cfg(not(target_arch = "aarch64"))]
         let is_cpu_f16 = false;
         #[cfg(not(target_arch = "aarch64"))]

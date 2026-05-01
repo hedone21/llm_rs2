@@ -3847,6 +3847,14 @@ pub unsafe fn fused_matmul_f16(
         chunk_offsets[i] = total_chunks;
         total_chunks += (n + rows_per_chunk - 1) / rows_per_chunk;
     }
+    // Sentinel: unused matmul slots route past `total_chunks` so the dispatch
+    // never falls through to them. `fused_gemv_chunk`'s `else` branch maps
+    // chunk_id ≥ chunk_offsets[2] to mat 2 — without this, n_matmuls<3 leaves
+    // chunk_offsets[1..n_matmuls..3] at 0 and chunks misroute into mat 2 with
+    // zero-length output, producing silent zero-fill.
+    for slot in chunk_offsets.iter_mut().skip(matmuls.len()) {
+        *slot = total_chunks;
+    }
 
     let ctx = FusedGemvCtx {
         a_ptr: a_data,
@@ -5328,6 +5336,9 @@ mod hybrid_partial_tests {
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use crate::buffer::shared_buffer::SharedBuffer;
+    use crate::core::shape::Shape;
+    use std::sync::Arc;
 
     /// Scalar F32 reference dot product (ground truth).
     fn ref_dot_f32(a_f16: &[half::f16], b_f16: &[half::f16]) -> f32 {
@@ -5492,6 +5503,150 @@ mod tests {
                 atol,
                 &format!("k={}", k),
             );
+        }
+    }
+
+    /// Test that `fused_matmul_f16` matches three separate matmul_transposed_f16
+    /// calls. Specifically targets the Qwen2.5-1.5b QKV pattern (n=1536,256,256
+    /// with k=1536) which exhibited garbage output on aarch64 NEON.
+    #[test]
+    fn test_fused_matmul_f16_matches_separate() {
+        let cpu = CpuBackendNeon::new();
+        // Qwen2.5-1.5b QKV decode: hidden=1536, q_dim=1536, kv_dim=256, head_dim=128
+        let cases: &[(usize, &[usize])] = &[
+            // (k, ns) — Qwen QKV
+            (1536, &[1536, 256, 256]),
+            // Llama 3.2 1B QKV
+            (2048, &[2048, 512, 512]),
+            // Qwen FFN gate+up (2 matmuls)
+            (1536, &[8960, 8960]),
+            // Single matmul (n_matmuls=1)
+            (1536, &[1536]),
+        ];
+
+        for (case_idx, (k, ns)) in cases.iter().enumerate() {
+            let k = *k;
+            let n_matmuls = ns.len();
+            // Generate input activation (F32, RMS-norm-like range).
+            // Wider range than F16-quantized to mimic production residual values.
+            let a_f32: Vec<f32> = (0..k)
+                .map(|i| {
+                    let mut state = (0xA0A0_u64 ^ (case_idx as u64) ^ (i as u64))
+                        .wrapping_mul(0x9E3779B97F4A7C15);
+                    state = (state ^ (state >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+                    state = (state ^ (state >> 27)).wrapping_mul(0x94D049BB133111EB);
+                    state ^= state >> 31;
+                    let u = ((state >> 11) as f64 / (1u64 << 53) as f64) as f32;
+                    -3.0 + u * 6.0
+                })
+                .collect();
+
+            // Generate weights (F16, small range).
+            let mut weights: Vec<Vec<half::f16>> = Vec::new();
+            for (i, &n) in ns.iter().enumerate() {
+                weights.push(gen_f16_vec(
+                    n * k,
+                    0xB0B0_u64 ^ (case_idx as u64) ^ (i as u64 * 17),
+                    -0.5,
+                    0.5,
+                ));
+            }
+
+            // Reference: scalar F32 dot per output row.
+            let mut expected: Vec<Vec<f32>> = Vec::new();
+            for (i, &n) in ns.iter().enumerate() {
+                let mut out = vec![0.0f32; n];
+                for j in 0..n {
+                    let row = &weights[i][j * k..(j + 1) * k];
+                    out[j] = a_f32
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(&a, &b)| a * b.to_f32())
+                        .sum();
+                }
+                expected.push(out);
+            }
+
+            // Test: fused_matmul_f16
+            let mut fused_outs: Vec<Vec<f32>> = ns.iter().map(|&n| vec![0.0f32; n]).collect();
+            unsafe {
+                let matmuls: Vec<(*const u16, *mut f32, usize)> = ns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &n)| {
+                        (
+                            weights[i].as_ptr() as *const u16,
+                            fused_outs[i].as_mut_ptr(),
+                            n,
+                        )
+                    })
+                    .collect();
+                fused_matmul_f16(a_f32.as_ptr(), k, &matmuls);
+            }
+
+            // Test: separate matmul_transposed_f16
+            let mut sep_outs: Vec<Vec<f32>> = ns.iter().map(|&n| vec![0.0f32; n]).collect();
+            for (i, &n) in ns.iter().enumerate() {
+                let a_tensor = Tensor::new(
+                    Shape::new(vec![1, k]),
+                    Arc::new(SharedBuffer::from_vec(
+                        a_f32
+                            .iter()
+                            .flat_map(|f| f.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F32,
+                    )),
+                    Arc::new(CpuBackendNeon::new()),
+                );
+                let b_tensor = Tensor::new(
+                    Shape::new(vec![n, k]),
+                    Arc::new(SharedBuffer::from_vec(
+                        weights[i]
+                            .iter()
+                            .flat_map(|h| h.to_le_bytes())
+                            .collect::<Vec<u8>>(),
+                        DType::F16,
+                    )),
+                    Arc::new(CpuBackendNeon::new()),
+                );
+                let mut out_tensor = Tensor::new(
+                    Shape::new(vec![1, n]),
+                    Arc::new(SharedBuffer::new(n * 4, DType::F32)),
+                    Arc::new(CpuBackendNeon::new()),
+                );
+                cpu.matmul_transposed(&a_tensor, &b_tensor, &mut out_tensor)
+                    .unwrap();
+                sep_outs[i].copy_from_slice(out_tensor.as_slice::<f32>());
+            }
+
+            // Compare fused vs separate (should be near-identical).
+            for (i, &n) in ns.iter().enumerate() {
+                let atol = 3e-3 * (k as f32).sqrt() + 1e-2;
+                assert_close(
+                    &fused_outs[i],
+                    &sep_outs[i],
+                    1e-2,
+                    atol,
+                    &format!(
+                        "case={} mat={} fused-vs-separate (k={}, n={}, n_matmuls={})",
+                        case_idx, i, k, n, n_matmuls
+                    ),
+                );
+            }
+            // Also compare fused vs scalar reference (catches both being wrong).
+            for (i, &n) in ns.iter().enumerate() {
+                let atol = 3e-3 * (k as f32).sqrt() + 1e-2;
+                assert_close(
+                    &fused_outs[i],
+                    &expected[i],
+                    2e-2,
+                    atol * 2.0,
+                    &format!(
+                        "case={} mat={} fused-vs-ref (k={}, n={}, n_matmuls={})",
+                        case_idx, i, k, n, n_matmuls
+                    ),
+                );
+            }
         }
     }
 
