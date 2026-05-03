@@ -105,8 +105,9 @@ pub struct TransformerModel {
     pub(crate) cpu_backend: Option<Arc<dyn Backend>>,
     /// Persistent thread pool for offload preload operations.
     /// Lazily initialized on first `forward_into_offload` call.
-    /// Uses `Mutex` for interior mutability (`forward_into_offload` takes `&self`).
-    pub(crate) preload_pool: std::sync::Mutex<Option<PreloadPool>>,
+    /// `OnceLock` allows interior mutability without lock contention on subsequent calls
+    /// (`forward_into_offload` takes `&self`).
+    pub(crate) preload_pool: std::sync::OnceLock<PreloadPool>,
     /// Per-layer quantization noise factor table (ENG-DAT-095).
     ///
     /// Computed once at init via `QuantNoiseTable::new_from_frobenius` when a
@@ -2499,9 +2500,11 @@ impl TransformerModel {
             self.layers.iter().map(|s| s.load_weights()).collect();
 
         // Lazy-init persistent thread pool (sized to max_depth for full concurrency).
-        // Mutex is locked once per token — zero contention.
-        let mut pool_guard = self.preload_pool.lock().unwrap();
-        let pool = pool_guard.get_or_insert_with(|| PreloadPool::new(prefetch.max_depth()));
+        // `get_or_init` runs the closure exactly once across all callers; subsequent
+        // calls are a single atomic load with no lock.
+        let pool = self
+            .preload_pool
+            .get_or_init(|| PreloadPool::new(prefetch.max_depth()));
 
         // 2. Synchronous initial preload: layers [0..depth)
         // Retained layers (preloaded=true) skip via early-return.
@@ -2886,7 +2889,7 @@ mod tests {
             lm_head_on_cpu: false,
             gpu_embed_tokens: None, // CPU-only model
             cpu_backend: None,
-            preload_pool: std::sync::Mutex::new(None),
+            preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
@@ -3035,7 +3038,7 @@ mod tests {
             lm_head_on_cpu: false,
             gpu_embed_tokens: None,
             cpu_backend: None,
-            preload_pool: std::sync::Mutex::new(None),
+            preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
@@ -3146,7 +3149,7 @@ mod tests {
             lm_head_on_cpu: false,
             gpu_embed_tokens: Some(gpu_embed),
             cpu_backend: None,
-            preload_pool: std::sync::Mutex::new(None),
+            preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
@@ -3247,7 +3250,7 @@ mod tests {
             lm_head_on_cpu: false,
             gpu_embed_tokens: Some(gpu_embed),
             cpu_backend: Some(cpu_be.clone()), // both set
-            preload_pool: std::sync::Mutex::new(None),
+            preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),
@@ -3324,7 +3327,7 @@ mod tests {
             lm_head_on_cpu: false,
             gpu_embed_tokens: None,
             cpu_backend: None,
-            preload_pool: std::sync::Mutex::new(None),
+            preload_pool: std::sync::OnceLock::new(),
             secondary_mmap: None,
             ratio_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             quant_noise: Arc::new(crate::models::weights::QuantNoiseTable::empty()),

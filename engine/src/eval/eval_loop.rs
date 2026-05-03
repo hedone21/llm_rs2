@@ -191,7 +191,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
         let prompt_enc = tokenizer
             .encode(question.prompt.as_str(), true)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
-        let prompt_ids: Vec<u32> = prompt_enc.get_ids().to_vec();
+        let prompt_ids: &[u32] = prompt_enc.get_ids();
         let prompt_len = prompt_ids.len();
 
         if prompt_len > max_seq_len {
@@ -226,7 +226,7 @@ pub fn run_eval_ll_generic<C: KVCacheOps>(
             memory,
             kv_caches,
             hook,
-            &prompt_ids,
+            prompt_ids,
             &mut decode_logits,
             &mut x_gen,
             &mut gen_ws,

@@ -411,7 +411,7 @@ pub fn load_model(
         lm_head_on_cpu,
         gpu_embed_tokens,
         cpu_backend: stored_cpu_backend,
-        preload_pool: std::sync::Mutex::new(None),
+        preload_pool: std::sync::OnceLock::new(),
         // ε table is initialized to empty here and populated by
         // `TransformerModel::load_gguf_with_secondary` right after this
         // call, or left as empty when the caller builds the model directly

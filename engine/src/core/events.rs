@@ -218,6 +218,13 @@ impl CollectingSink {
     pub fn events(&self) -> Vec<CacheEvent> {
         self.events.lock().unwrap().clone()
     }
+
+    /// Take all collected events, leaving the internal buffer empty.
+    /// Avoids the Vec clone cost of `events()` when the caller will not need
+    /// the sink to retain state (e.g. one-shot assertions).
+    pub fn drain_events(&self) -> Vec<CacheEvent> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +386,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_collecting_sink_drain_consumes_buffer() {
+        let sink = CollectingSink::new();
+        sink.emit(CacheEvent::EvictionCompleted {
+            policy: "h2o".to_string(),
+            tokens_removed: 5,
+            new_pos: 10,
+        });
+
+        let drained = sink.drain_events();
+        assert_eq!(drained.len(), 1);
+
+        // After drain, the sink is empty.
+        assert!(sink.events().is_empty());
+        assert!(sink.drain_events().is_empty());
     }
 
     #[test]
