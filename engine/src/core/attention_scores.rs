@@ -16,16 +16,10 @@ pub struct AttentionScoreAccumulator {
     /// Within a single decode step, each layer's score is aggregated here
     /// using MAX (per-layer independence), then flushed to `importance` in `end_step()`.
     step_importance: Vec<f32>,
-    /// Number of query heads in the model.
-    #[allow(dead_code)]
-    n_heads: usize,
     /// Maximum sequence length.
     max_seq_len: usize,
     /// Which layers to track. Empty means track all layers.
     tracked_layers: Vec<usize>,
-    /// Total number of layers in the model.
-    #[allow(dead_code)]
-    total_layers: usize,
     /// Exponential decay factor (0.0 = no decay, 1.0 = full decay).
     decay: f32,
     /// Whether accumulation is active.
@@ -56,7 +50,7 @@ pub struct AttentionScoreAccumulator {
 impl AttentionScoreAccumulator {
     pub fn new(
         max_seq_len: usize,
-        n_heads: usize,
+        _n_heads: usize,
         total_layers: usize,
         last_n_layers: usize,
         decay: f32,
@@ -70,10 +64,8 @@ impl AttentionScoreAccumulator {
         Self {
             importance: vec![0.0; max_seq_len],
             step_importance: vec![0.0; max_seq_len],
-            n_heads,
             max_seq_len,
             tracked_layers,
-            total_layers,
             decay: decay.clamp(0.0, 1.0),
             active: false,
             n_kv_heads: 0,
@@ -93,7 +85,7 @@ impl AttentionScoreAccumulator {
     /// Q-head scores are averaged within each GQA group.
     pub fn new_gqa(
         max_seq_len: usize,
-        n_heads: usize,
+        _n_heads: usize,
         n_kv_heads: usize,
         total_layers: usize,
         last_n_layers: usize,
@@ -109,10 +101,8 @@ impl AttentionScoreAccumulator {
         Self {
             importance: vec![0.0; max_seq_len],
             step_importance: vec![0.0; max_seq_len],
-            n_heads,
             max_seq_len,
             tracked_layers,
-            total_layers,
             decay: decay.clamp(0.0, 1.0),
             active: false,
             n_kv_heads,

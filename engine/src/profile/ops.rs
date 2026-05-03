@@ -1,3 +1,12 @@
+/// Compute `v / total * 100.0`, returning `0.0` when `total == 0`.
+fn pct_of(v: u64, total: u64) -> f64 {
+    if total > 0 {
+        v as f64 / total as f64 * 100.0
+    } else {
+        0.0
+    }
+}
+
 /// Per-operation profiler for forward_gen timing breakdown.
 /// Accumulates microseconds per operation across layers and tokens.
 #[derive(Default)]
@@ -87,13 +96,6 @@ impl PrefillOpProfiler {
     pub fn print_report(&self) {
         let total = self.total();
         let n = self.layer_count.max(1);
-        let pct = |v: u64| -> f64 {
-            if total > 0 {
-                v as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
         eprintln!(
             "\n[Profile/Prefill] Per-op breakdown ({} layers, {} CPU attn fallbacks):",
             n, self.cpu_fallback_count
@@ -109,7 +111,7 @@ impl PrefillOpProfiler {
                 name,
                 val,
                 val / n,
-                pct(*val)
+                pct_of(*val, total)
             );
         }
         eprintln!(
@@ -117,14 +119,14 @@ impl PrefillOpProfiler {
             "silu_mul",
             self.silu_mul,
             self.silu_mul / n,
-            pct(self.silu_mul)
+            pct_of(self.silu_mul, total)
         );
         eprintln!(
             "  {:<24} {:>10} {:>10} {:>7.1}%",
             "add_assign",
             self.add_assign,
             self.add_assign / n,
-            pct(self.add_assign)
+            pct_of(self.add_assign, total)
         );
         eprintln!("  {:<24} {:>10} {:>10}", "TOTAL", total, total / n);
     }
@@ -132,13 +134,6 @@ impl PrefillOpProfiler {
     pub fn to_json(&self) -> serde_json::Value {
         let total = self.total();
         let n = self.layer_count.max(1);
-        let pct = |v: u64| -> f64 {
-            if total > 0 {
-                v as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
 
         let mut breakdown = serde_json::Map::new();
         for (name, val) in &self.ops() {
@@ -147,7 +142,7 @@ impl PrefillOpProfiler {
                 serde_json::json!({
                     "total_us": val,
                     "avg_us": val / n,
-                    "pct": (pct(*val) * 10.0).round() / 10.0,
+                    "pct": (pct_of(*val, total) * 10.0).round() / 10.0,
                 }),
             );
         }
@@ -156,7 +151,7 @@ impl PrefillOpProfiler {
             serde_json::json!({
                 "total_us": self.silu_mul,
                 "avg_us": self.silu_mul / n,
-                "pct": (pct(self.silu_mul) * 10.0).round() / 10.0,
+                "pct": (pct_of(self.silu_mul, total) * 10.0).round() / 10.0,
             }),
         );
         breakdown.insert(
@@ -164,7 +159,7 @@ impl PrefillOpProfiler {
             serde_json::json!({
                 "total_us": self.add_assign,
                 "avg_us": self.add_assign / n,
-                "pct": (pct(self.add_assign) * 10.0).round() / 10.0,
+                "pct": (pct_of(self.add_assign, total) * 10.0).round() / 10.0,
             }),
         );
 
@@ -244,13 +239,6 @@ impl OpProfiler {
     pub fn print_report(&self) {
         let total = self.total();
         let n = if self.count > 0 { self.count } else { 1 };
-        let pct = |v: u64| -> f64 {
-            if total > 0 {
-                v as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
         eprintln!(
             "\n[Profile] Decode per-op breakdown (accumulated over {} layer-calls):",
             n
@@ -266,7 +254,7 @@ impl OpProfiler {
                 name,
                 val,
                 val / n,
-                pct(*val)
+                pct_of(*val, total)
             );
         }
         eprintln!("  {:<20} {:>10} {:>10}", "TOTAL", total, total / n,);
@@ -281,13 +269,6 @@ impl OpProfiler {
     pub fn to_json(&self) -> serde_json::Value {
         let total = self.total();
         let n = self.count.max(1);
-        let pct = |v: u64| -> f64 {
-            if total > 0 {
-                v as f64 / total as f64 * 100.0
-            } else {
-                0.0
-            }
-        };
 
         let mut breakdown = serde_json::Map::new();
         for (name, val) in &self.ops() {
@@ -296,7 +277,7 @@ impl OpProfiler {
                 serde_json::json!({
                     "total_us": val,
                     "avg_us": val / n,
-                    "pct": (pct(*val) * 10.0).round() / 10.0,
+                    "pct": (pct_of(*val, total) * 10.0).round() / 10.0,
                 }),
             );
         }
@@ -313,6 +294,19 @@ impl OpProfiler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_pct_of_zero_total_returns_zero() {
+        assert_eq!(pct_of(0, 0), 0.0);
+        assert_eq!(pct_of(100, 0), 0.0);
+    }
+
+    #[test]
+    fn test_pct_of_basic() {
+        assert!((pct_of(25, 100) - 25.0).abs() < f64::EPSILON);
+        assert!((pct_of(0, 100) - 0.0).abs() < f64::EPSILON);
+        assert!((pct_of(100, 100) - 100.0).abs() < f64::EPSILON);
+    }
 
     #[test]
     fn test_op_profiler_default_is_zero() {
