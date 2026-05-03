@@ -300,6 +300,20 @@ struct CommandParams<'a> {
     target_dtype: Option<&'a str>,
 }
 
+/// Parse a `--target-dtype` string into a `DtypeTag`.
+fn parse_dtype_tag(s: &str) -> anyhow::Result<DtypeTag> {
+    Ok(match s.to_ascii_lowercase().as_str() {
+        "q4_0" => DtypeTag::Q4_0,
+        "f16" => DtypeTag::F16,
+        "f32" => DtypeTag::F32,
+        "q8_0" => DtypeTag::Q8_0,
+        other => bail!(
+            "unsupported --target-dtype '{}', expected q4_0/f16/f32/q8_0",
+            other
+        ),
+    })
+}
+
 fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
     match params.name {
         "KvEvictSliding" => {
@@ -378,22 +392,11 @@ fn build_command(params: &CommandParams<'_>) -> anyhow::Result<EngineCommand> {
             cpu_chunk_size: params.cpu_chunk_size,
         }),
         "SwapWeights" => {
-            let ratio = params
-                .ratio
-                .context("--ratio required for SwapWeights")?;
+            let ratio = params.ratio.context("--ratio required for SwapWeights")?;
             let dtype_str = params
                 .target_dtype
                 .context("--target-dtype required for SwapWeights")?;
-            let target_dtype = match dtype_str.to_ascii_lowercase().as_str() {
-                "q4_0" => DtypeTag::Q4_0,
-                "f16" => DtypeTag::F16,
-                "f32" => DtypeTag::F32,
-                "q8_0" => DtypeTag::Q8_0,
-                other => bail!(
-                    "SwapWeights: unsupported --target-dtype '{}', expected q4_0/f16/f32/q8_0",
-                    other
-                ),
-            };
+            let target_dtype = parse_dtype_tag(dtype_str)?;
             Ok(EngineCommand::SwapWeights {
                 ratio,
                 target_dtype,
@@ -592,40 +595,40 @@ fn recv_blocking_with_timeout(
     }
 }
 
-/// Receive a `CommandResponse`, skipping any interleaved Heartbeat messages.
+/// Outcome of a `recv_until` selector: either the extracted target value, or
+/// the original message returned for logging.
 ///
-/// Engine's MessageLoop sends Heartbeats asynchronously, so one or more may
-/// arrive between our Directive and its Response. This helper logs and
-/// discards them until a Response is found or the timeout expires.
-fn recv_response_skip_heartbeats(
+/// `Skip` is intentionally larger than `Match`; this type only exists briefly
+/// inside the selector loop, so the size asymmetry is fine.
+#[allow(clippy::large_enum_variant)]
+enum Selected<T> {
+    Match(T),
+    Skip(EngineMessage),
+}
+
+/// Receive messages until `select` returns `Match`, logging and discarding any
+/// `Skip` variants. Returns `Ok(None)` on timeout.
+///
+/// Engine's MessageLoop sends Heartbeats and other side messages asynchronously,
+/// so one or more may arrive between our Directive and its Response. This helper
+/// centralises the skip-and-log logic so each caller only specifies which variant
+/// it actually wants.
+fn recv_until<T, F>(
     stream: &mut (impl Read + Write),
     timeout: Duration,
-) -> anyhow::Result<Option<llm_shared::CommandResponse>> {
+    waiting_for: &str,
+    mut select: F,
+) -> anyhow::Result<Option<T>>
+where
+    F: FnMut(EngineMessage) -> Selected<T>,
+{
     let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         match recv_message(stream)? {
-            Some(EngineMessage::Response(resp)) => return Ok(Some(resp)),
-            Some(EngineMessage::Heartbeat(status)) => {
-                println!(
-                    "[MockManager] (skipping heartbeat while waiting for Response: \
-                     kv_util={:.3}, tokens={})",
-                    status.kv_cache_utilization, status.tokens_generated,
-                );
-            }
-            Some(EngineMessage::QcfEstimate(_)) => {
-                println!("[MockManager] (unexpected QcfEstimate before Response, skipping)");
-            }
-            Some(EngineMessage::Capability(_)) => {
-                println!("[MockManager] (unexpected Capability after handshake, skipping)");
-            }
-            Some(EngineMessage::WeightSwapReport(r)) => {
-                println!(
-                    "[MockManager] (skipping WeightSwapReport while waiting for Response: \
-                     {} layers, freed={}B)",
-                    r.layers_swapped.len(),
-                    r.freed_bytes,
-                );
-            }
+            Some(msg) => match select(msg) {
+                Selected::Match(value) => return Ok(Some(value)),
+                Selected::Skip(skipped) => log_skipped(&skipped, waiting_for),
+            },
             None => {
                 // read timeout / would-block, retry
                 std::thread::sleep(Duration::from_millis(10));
@@ -635,45 +638,62 @@ fn recv_response_skip_heartbeats(
     Ok(None)
 }
 
-/// Receive a `QcfEstimate`, skipping any interleaved Heartbeat messages.
+fn log_skipped(msg: &EngineMessage, waiting_for: &str) {
+    match msg {
+        EngineMessage::Heartbeat(status) => {
+            println!(
+                "[MockManager] (skipping heartbeat while waiting for {}: \
+                 kv_util={:.3}, tokens={})",
+                waiting_for, status.kv_cache_utilization, status.tokens_generated,
+            );
+        }
+        EngineMessage::WeightSwapReport(r) => {
+            println!(
+                "[MockManager] (skipping WeightSwapReport while waiting for {}: \
+                 {} layers, freed={}B)",
+                waiting_for,
+                r.layers_swapped.len(),
+                r.freed_bytes,
+            );
+        }
+        EngineMessage::Capability(_) => {
+            println!("[MockManager] (unexpected Capability after handshake, skipping)");
+        }
+        EngineMessage::Response(resp) => {
+            println!(
+                "[MockManager] (unexpected Response seq_id={} while waiting for {}, skipping)",
+                resp.seq_id, waiting_for,
+            );
+        }
+        EngineMessage::QcfEstimate(_) => {
+            println!(
+                "[MockManager] (unexpected QcfEstimate while waiting for {}, skipping)",
+                waiting_for,
+            );
+        }
+    }
+}
+
+/// Receive a `CommandResponse`, skipping any interleaved side messages.
+fn recv_response_skip_heartbeats(
+    stream: &mut (impl Read + Write),
+    timeout: Duration,
+) -> anyhow::Result<Option<llm_shared::CommandResponse>> {
+    recv_until(stream, timeout, "Response", |msg| match msg {
+        EngineMessage::Response(resp) => Selected::Match(resp),
+        other => Selected::Skip(other),
+    })
+}
+
+/// Receive a `QcfEstimate`, skipping any interleaved side messages.
 fn recv_qcf_skip_heartbeats(
     stream: &mut (impl Read + Write),
     timeout: Duration,
 ) -> anyhow::Result<Option<llm_shared::QcfEstimate>> {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        match recv_message(stream)? {
-            Some(EngineMessage::QcfEstimate(est)) => return Ok(Some(est)),
-            Some(EngineMessage::Heartbeat(status)) => {
-                println!(
-                    "[MockManager] (skipping heartbeat while waiting for QcfEstimate: \
-                     kv_util={:.3}, tokens={})",
-                    status.kv_cache_utilization, status.tokens_generated,
-                );
-            }
-            Some(EngineMessage::Response(resp)) => {
-                println!(
-                    "[MockManager] (unexpected Response seq_id={} while waiting for QcfEstimate, skipping)",
-                    resp.seq_id,
-                );
-            }
-            Some(EngineMessage::Capability(_)) => {
-                println!("[MockManager] (unexpected Capability after handshake, skipping)");
-            }
-            Some(EngineMessage::WeightSwapReport(r)) => {
-                println!(
-                    "[MockManager] (skipping WeightSwapReport while waiting for QcfEstimate: \
-                     {} layers, freed={}B)",
-                    r.layers_swapped.len(),
-                    r.freed_bytes,
-                );
-            }
-            None => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-    }
-    Ok(None)
+    recv_until(stream, timeout, "QcfEstimate", |msg| match msg {
+        EngineMessage::QcfEstimate(est) => Selected::Match(est),
+        other => Selected::Skip(other),
+    })
 }
 
 fn run_single_command(
@@ -1131,17 +1151,6 @@ mod tests {
         stream.flush().unwrap();
     }
 
-    // Helper: receive a ManagerMessage from a stream (engine side)
-    #[allow(dead_code)]
-    fn engine_recv(stream: &mut UnixStream) -> ManagerMessage {
-        let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).unwrap();
-        let len = u32::from_be_bytes(len_buf) as usize;
-        let mut json_buf = vec![0u8; len];
-        stream.read_exact(&mut json_buf).unwrap();
-        serde_json::from_slice(&json_buf).unwrap()
-    }
-
     fn make_capability() -> EngineCapability {
         EngineCapability {
             available_devices: vec!["cpu".into(), "opencl".into()],
@@ -1153,7 +1162,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     fn make_heartbeat_status() -> EngineStatus {
         EngineStatus {
             active_device: "opencl".to_string(),
@@ -1454,6 +1462,87 @@ mod tests {
         }
     }
 
+    #[test]
+    fn build_command_swap_weights() {
+        let cmd = build_command(&CommandParams {
+            ratio: Some(0.5),
+            target_dtype: Some("q4_0"),
+            ..params("SwapWeights")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::SwapWeights {
+                ratio,
+                target_dtype,
+            } => {
+                assert!((ratio - 0.5).abs() < f32::EPSILON);
+                assert_eq!(target_dtype, DtypeTag::Q4_0);
+            }
+            _ => panic!("Expected SwapWeights"),
+        }
+    }
+
+    #[test]
+    fn build_command_swap_weights_uppercase_dtype() {
+        let cmd = build_command(&CommandParams {
+            ratio: Some(0.25),
+            target_dtype: Some("F16"),
+            ..params("SwapWeights")
+        })
+        .unwrap();
+        match cmd {
+            EngineCommand::SwapWeights { target_dtype, .. } => {
+                assert_eq!(target_dtype, DtypeTag::F16);
+            }
+            _ => panic!("Expected SwapWeights"),
+        }
+    }
+
+    #[test]
+    fn build_command_swap_weights_missing_ratio() {
+        let result = build_command(&CommandParams {
+            target_dtype: Some("q4_0"),
+            ..params("SwapWeights")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_command_swap_weights_missing_dtype() {
+        let result = build_command(&CommandParams {
+            ratio: Some(0.5),
+            ..params("SwapWeights")
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn build_command_swap_weights_invalid_dtype() {
+        let result = build_command(&CommandParams {
+            ratio: Some(0.5),
+            target_dtype: Some("bf16"),
+            ..params("SwapWeights")
+        });
+        assert!(result.is_err());
+    }
+
+    // ── parse_dtype_tag tests ────────────────────────────────────────────────
+
+    #[test]
+    fn parse_dtype_tag_known_variants() {
+        assert_eq!(parse_dtype_tag("q4_0").unwrap(), DtypeTag::Q4_0);
+        assert_eq!(parse_dtype_tag("Q4_0").unwrap(), DtypeTag::Q4_0);
+        assert_eq!(parse_dtype_tag("f16").unwrap(), DtypeTag::F16);
+        assert_eq!(parse_dtype_tag("F32").unwrap(), DtypeTag::F32);
+        assert_eq!(parse_dtype_tag("q8_0").unwrap(), DtypeTag::Q8_0);
+    }
+
+    #[test]
+    fn parse_dtype_tag_rejects_unknown() {
+        assert!(parse_dtype_tag("bf16").is_err());
+        assert!(parse_dtype_tag("").is_err());
+    }
+
     // ── validate_response tests ──────────────────────────────────────────────
 
     #[test]
@@ -1652,6 +1741,44 @@ mod tests {
         let result =
             recv_response_skip_heartbeats(&mut server, Duration::from_millis(200)).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn recv_response_skip_heartbeats_skips_weight_swap_report() {
+        use llm_shared::WeightSwapReport;
+
+        let (_dir, sock_path) = tmp_sock();
+        let listener = UnixListener::bind(&sock_path).unwrap();
+        let mut client = UnixStream::connect(&sock_path).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+
+        // Engine sends a WeightSwapReport (side message) before the Response.
+        // recv_until must skip it and still return the Response.
+        engine_send(
+            &mut client,
+            &EngineMessage::WeightSwapReport(WeightSwapReport {
+                layers_swapped: vec![],
+                freed_bytes: 0,
+                latency_ms: 1,
+                qcf_swap_actual: 0.0,
+            }),
+        );
+        engine_send(
+            &mut client,
+            &EngineMessage::Response(CommandResponse {
+                seq_id: 7,
+                results: vec![CommandResult::Ok],
+            }),
+        );
+
+        let resp = recv_response_skip_heartbeats(&mut server, Duration::from_secs(2))
+            .unwrap()
+            .expect("should receive Response");
+        assert_eq!(resp.seq_id, 7);
     }
 
     #[test]
